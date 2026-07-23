@@ -9,6 +9,12 @@ use super::*;
 /// Everything [`run_pump`](super::run_pump) needs from a successful connect + handshake.
 pub(super) struct HandshakeOut {
     pub(super) conn: quinn::Connection,
+    /// The dialing endpoint, kept alive for the session so the pump can FLUSH its
+    /// `CONNECTION_CLOSE` before the runtime is dropped ([`super::run_pump`]). Dropping it here
+    /// left nothing to drive the close onto the wire, so a deliberate quit reached the host as
+    /// silence — an 8 s idle timeout with no quit code, which the host reads as an unwanted
+    /// disconnect and lingers the display for.
+    pub(super) ep: quinn::Endpoint,
     pub(super) session: Session,
     pub(super) ctrl_send: quinn::SendStream,
     pub(super) ctrl_recv: io::MsgReader,
@@ -238,6 +244,7 @@ pub(super) async fn connect_and_handshake(args: &WorkerArgs) -> Result<Handshake
     match handshake.await {
         Ok((session, send, recv, negotiated, host_caps)) => Ok(HandshakeOut {
             conn,
+            ep,
             session,
             ctrl_send: send,
             ctrl_recv: recv,

@@ -149,11 +149,7 @@ impl VirtualDisplay for KwinDisplay {
             return;
         };
         // kscreen-doctor position syntax: `output.<name-or-id>.position.<x>,<y>`.
-        let ok = std::process::Command::new("kscreen-doctor")
-            .arg(format!("output.{output}.position.{x},{y}"))
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
+        let ok = kscreen_ok(&[format!("output.{output}.position.{x},{y}")]);
         if ok {
             tracing::info!(output, x, y, "KWin: placed output in the desktop layout");
         } else {
@@ -342,9 +338,7 @@ fn reenable_outputs(outputs: &[(String, String)]) {
         .iter()
         .map(|(name, _)| format!("output.{name}.enable"))
         .collect();
-    let _ = std::process::Command::new("kscreen-doctor")
-        .args(&enable_args)
-        .status();
+    let _ = kscreen_ok(&enable_args);
     // THEN re-assert each captured mode, best-effort — a bare re-enable lets KWin fall back to the
     // EDID-preferred mode (a 120 Hz panel returns at ~60 Hz); this restores the exact refresh. The
     // output is enabled now, so the mode set is valid; a rejected mode just leaves KWin's default.
@@ -354,9 +348,7 @@ fn reenable_outputs(outputs: &[(String, String)]) {
         .map(|(name, mode)| format!("output.{name}.mode.{mode}"))
         .collect();
     if !mode_args.is_empty() {
-        let _ = std::process::Command::new("kscreen-doctor")
-            .args(&mode_args)
-            .status();
+        let _ = kscreen_ok(&mode_args);
     }
     std::thread::sleep(Duration::from_millis(200));
     tracing::info!(reenabled = ?outputs, "KWin: restored the physical/bootstrap outputs at their captured modes (group empty)");
@@ -404,13 +396,37 @@ fn resolve_kscreen_addr(name: &str, w: u32, h: u32) -> String {
     fallback
 }
 
+/// Budget for one `kscreen-doctor` call.
+///
+/// It is a Wayland client of the very compositor it configures, so against a wedged KWin it blocks
+/// in its own connect and never returns — and these calls run on the session's stream thread, whose
+/// only way to end a session is to return. Generous next to a healthy call (tens of ms).
+const KSCREEN_BUDGET: Duration = Duration::from_secs(5);
+
+/// `kscreen-doctor <args>` run for its exit status, bounded by [`KSCREEN_BUDGET`]. A timeout reads
+/// as a failed apply — the same best-effort path a rejected argument already takes.
+fn kscreen_ok(args: &[String]) -> bool {
+    crate::proc::status_within(
+        std::process::Command::new("kscreen-doctor").args(args),
+        KSCREEN_BUDGET,
+    )
+    .map(|s| s.success())
+    .unwrap_or(false)
+}
+
+/// `kscreen-doctor -j` stdout, bounded by [`KSCREEN_BUDGET`]; `None` on any failure.
+fn kscreen_json_bytes() -> Option<Vec<u8>> {
+    crate::proc::output_within(
+        std::process::Command::new("kscreen-doctor").arg("-j"),
+        KSCREEN_BUDGET,
+    )
+    .ok()
+    .map(|o| o.stdout)
+}
+
 /// `kscreen-doctor -j` parsed, `None` on any failure.
 fn kscreen_json() -> Option<serde_json::Value> {
-    let out = std::process::Command::new("kscreen-doctor")
-        .arg("-j")
-        .output()
-        .ok()?;
-    serde_json::from_slice(&out.stdout).ok()
+    serde_json::from_slice(&kscreen_json_bytes()?).ok()
 }
 
 /// The `(width, height)` of an output's CURRENT mode from its `kscreen-doctor -j` entry.
@@ -545,13 +561,7 @@ fn pick_custom_mode<'a>(
 fn set_custom_refresh(width: u32, height: u32, hz: u32, output: &str) -> Option<(u32, u32, u32)> {
     let output = output.to_string();
     let mhz = hz.saturating_mul(1000);
-    let run = |arg: String| {
-        std::process::Command::new("kscreen-doctor")
-            .arg(arg)
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-    };
+    let run = |arg: String| kscreen_ok(&[arg]);
     // Install the mode only if the output doesn't already carry a usable one: kscreen-doctor
     // APPENDS to the output's custom-mode list and KWin PERSISTS that list per output name
     // (`kwinoutputconfig.json`, which is why the same per-slot name is reused across sessions) — so
@@ -710,14 +720,11 @@ fn output_current_mode_spec(o: &serde_json::Value) -> Option<String> {
 /// session's own output — so a 2nd `exclusive` session (with a distinct per-slot name) never disables
 /// the 1st session's live output. Parsed from `kscreen-doctor -j` (same source as [`read_active_mode`]).
 fn other_enabled_outputs() -> Vec<(String, String)> {
-    let out = match std::process::Command::new("kscreen-doctor")
-        .arg("-j")
-        .output()
-    {
-        Ok(o) => o,
-        Err(_) => return Vec::new(),
+    let out = match kscreen_json_bytes() {
+        Some(o) => o,
+        None => return Vec::new(),
     };
-    let doc: serde_json::Value = match serde_json::from_slice(&out.stdout) {
+    let doc: serde_json::Value = match serde_json::from_slice(&out) {
         Ok(d) => d,
         Err(_) => return Vec::new(),
     };
@@ -746,13 +753,10 @@ fn other_enabled_outputs() -> Vec<(String, String)> {
 /// then sets itself primary — the pre-group behavior). Recent kscreen marks the primary with
 /// `"priority": 1`; older builds used a `"primary": true` bool — accept either.
 fn a_managed_output_is_primary() -> bool {
-    let Ok(out) = std::process::Command::new("kscreen-doctor")
-        .arg("-j")
-        .output()
-    else {
+    let Some(out) = kscreen_json_bytes() else {
         return false;
     };
-    let Ok(doc) = serde_json::from_slice::<serde_json::Value>(&out.stdout) else {
+    let Ok(doc) = serde_json::from_slice::<serde_json::Value>(&out) else {
         return false;
     };
     doc.get("outputs")
@@ -777,13 +781,7 @@ fn a_managed_output_is_primary() -> bool {
 /// the keepalive to re-enable on teardown. Best-effort: on failure, streaming continues (just possibly
 /// showing only the wallpaper) rather than failing the session.
 fn apply_virtual_primary(ours: &str) -> Vec<(String, String)> {
-    let kscreen = |args: &[String]| {
-        std::process::Command::new("kscreen-doctor")
-            .args(args)
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-    };
+    let kscreen = |args: &[String]| kscreen_ok(args);
     // First-slot-wins (§6.1): only grab primary if no managed group member is primary yet — so a 2nd
     // exclusive session joins as a secondary monitor of the shared desktop instead of stealing the
     // shell off the 1st session's output. KWin usually then re-homes the desktop + disables the
@@ -815,11 +813,7 @@ fn apply_virtual_primary(ours: &str) -> Vec<(String, String)> {
 /// (don't disable the bootstrap/physical) — so the shell re-homes onto the streamed surface while a
 /// physical screen stays usable. Nothing to restore on teardown (we disabled nothing).
 fn apply_virtual_primary_only(ours: &str) {
-    let ok = std::process::Command::new("kscreen-doctor")
-        .arg(format!("output.{ours}.primary"))
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+    let ok = kscreen_ok(&[format!("output.{ours}.primary")]);
     if ok {
         tracing::info!("KWin: streamed output set primary (physical outputs kept)");
     } else {

@@ -58,6 +58,11 @@ pub(crate) fn emit_display_event(ev: DisplayEvent) {
 pub(crate) mod backend;
 pub use backend::{DisplayOwnership, VirtualDisplay, VirtualOutput};
 
+/// Time-bounded child-process helpers — every compositor query shells out, and an unbounded one
+/// can wedge the calling (session) thread forever.
+#[path = "vdisplay/proc.rs"]
+pub(crate) mod proc;
+
 /// Live-session detection + session-epoch + env retargeting (plan §W3).
 #[path = "vdisplay/session.rs"]
 pub(crate) mod session;

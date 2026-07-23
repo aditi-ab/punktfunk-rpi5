@@ -50,6 +50,9 @@ import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.LifecycleOwner
 import io.unom.punktfunk.kit.GamepadFeedback
 import io.unom.punktfunk.kit.GamepadRouter
 import io.unom.punktfunk.kit.deviceBodyVibrator
@@ -383,6 +386,26 @@ fun StreamScreen(handle: Long, micEnabled: Boolean, onDisconnect: () -> Unit) {
 
     // Back gesture = a deliberate exit → signal the quit so the host tears down now (no linger).
     BackHandler { NativeBridge.nativeDisconnectQuit(handle); onDisconnect() }
+
+    // Leaving the app (Home, task switch, screen off) MUST end the session. Android does not
+    // suspend a process for going to background, so without this the native worker kept running and
+    // its QUIC connection kept answering the host's keep-alives — the user was long gone but the
+    // host still saw a live client and held the session (and its display + encoder) open until the
+    // OS eventually reclaimed the process, which on a TV box is effectively never.
+    //
+    // Route it through `onDisconnect()` so the composable's `onDispose` above runs the one real
+    // teardown path. Deliberately NOT a `nativeDisconnectQuit`: backgrounding isn't a user "quit",
+    // so the host should linger the display and make coming straight back a fast reconnect.
+    DisposableEffect(handle) {
+        val lifecycle = (context as? LifecycleOwner)?.lifecycle
+        val obs = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_STOP) {
+                onDisconnect()
+            }
+        }
+        lifecycle?.addObserver(obs)
+        onDispose { lifecycle?.removeObserver(obs) }
+    }
 
     // Auto-engage pointer capture at stream start (setting on + a mouse actually present).
     // Delayed a beat: the grab needs window focus and the capture view attached.

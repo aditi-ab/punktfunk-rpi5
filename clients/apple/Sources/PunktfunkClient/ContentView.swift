@@ -144,14 +144,26 @@ struct ContentView: View {
         // tap uses, so trust policy / WoL / the approval sheet all come along. Never starts a
         // parallel session — this drives the one `model` ContentView owns.
         .onOpenURL { handleDeepLink($0) }
-        #if os(iOS)
-        // Background keep-alive driver (opt-in). Only .background/.active matter; .inactive (a
-        // transient peek) is ignored so the disconnect timer never starts for a Control-Center pull.
+        #if os(iOS) || os(tvOS)
+        // Backgrounding driver. Only .background/.active matter; .inactive (a transient peek) is
+        // ignored so neither branch fires for a Control-Center pull.
+        //
+        // Backgrounding MUST end the session one way or the other: the app keeps running while
+        // streaming (the `audio` background mode plus a live audio session), so its QUIC connection
+        // keeps answering the host's keep-alives with the user long gone — the host has no way to
+        // tell that apart from someone watching, and the session survived indefinitely. Either hold
+        // it under the opt-in keep-alive (bounded by that path's own auto-disconnect timer) or end
+        // it here.
         .onChange(of: scenePhase) { _, phase in
             switch phase {
             case .background:
-                if backgroundKeepAlive, model.phase == .streaming {
+                guard model.phase == .streaming else { break }
+                if backgroundKeepAlive {
                     model.enterBackground(timeoutMinutes: backgroundTimeoutMinutes)
+                } else {
+                    // Not deliberate: the user may come straight back, so let the host linger the
+                    // display for a fast reconnect instead of tearing it down.
+                    model.disconnect(deliberate: false)
                 }
             case .active:
                 model.exitBackground()
@@ -159,7 +171,11 @@ struct ContentView: View {
                 break
             }
         }
-        // Live Activity lifecycle, driven from the model's published state.
+        #endif
+        #if os(iOS)
+        // Live Activity lifecycle, driven from the model's published state. iPhone/iPad only —
+        // ActivityKit (and so `liveActivity`) does not exist on tvOS, which is why this stays in its
+        // own os(iOS) block rather than riding the backgrounding driver's.
         .onChange(of: model.phase) { _, phase in
             switch phase {
             case .streaming:

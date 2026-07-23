@@ -6,6 +6,15 @@
 
 use super::*;
 
+/// Budget for one `systemctl --user` / `dbus-update-activation-environment` call.
+///
+/// These talk to the session bus, and a bus that is itself restarting or wedged answers nothing —
+/// unbounded, that pinned the caller (on the host, the session's stream thread) forever. A restart
+/// of the portal units is the slowest legitimate case, hence the generous window; missing it just
+/// means the portal env settles late, which the callers already treat as best-effort.
+#[cfg(target_os = "linux")]
+const SYSTEMD_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// The **session epoch** — bumped whenever session detection observes a different compositor
 /// *instance*: an [`ActiveKind`] change, **or** a new compositor PID for the same kind (the
 /// Desktop→Game→Desktop bounce that brings up a fresh KWin/gamescope with an unrelated node-id space).
@@ -86,9 +95,15 @@ pub fn observe_session_instance(active: &ActiveSession) {
 /// via the next [`settle_desktop_portal`], so scrubbing on a bounce is harmless.)
 #[cfg(target_os = "linux")]
 fn scrub_desktop_manager_env() {
-    let _ = std::process::Command::new("systemctl")
-        .args(["--user", "unset-environment", "WAYLAND_DISPLAY", "DISPLAY"])
-        .status();
+    let _ = crate::proc::status_within(
+        std::process::Command::new("systemctl").args([
+            "--user",
+            "unset-environment",
+            "WAYLAND_DISPLAY",
+            "DISPLAY",
+        ]),
+        SYSTEMD_BUDGET,
+    );
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -499,40 +514,46 @@ pub fn settle_desktop_portal(chosen: Compositor) {
     ];
     // Push our (correct) env into the systemd --user manager + the D-Bus activation environment so a
     // re-activated portal/backend inherits the live session.
-    let _ = std::process::Command::new("systemctl")
-        .args(["--user", "import-environment"])
-        .args(VARS)
-        .status();
-    let _ = std::process::Command::new("dbus-update-activation-environment")
-        .arg("--systemd")
-        .args(VARS)
-        .status();
+    let _ = crate::proc::status_within(
+        std::process::Command::new("systemctl")
+            .args(["--user", "import-environment"])
+            .args(VARS),
+        SYSTEMD_BUDGET,
+    );
+    let _ = crate::proc::status_within(
+        std::process::Command::new("dbus-update-activation-environment")
+            .arg("--systemd")
+            .args(VARS),
+        SYSTEMD_BUDGET,
+    );
     // KWin input goes through the xdg RemoteDesktop portal; the frontend routes RemoteDesktop to a
     // backend by its OWN startup XDG_CURRENT_DESKTOP, so restart it (+ the KDE backend) to re-read
     // the now-live session, then let it settle before the injector reopens against it.
     if chosen == Compositor::Kwin {
-        let _ = std::process::Command::new("systemctl")
-            .args([
+        let _ = crate::proc::status_within(
+            std::process::Command::new("systemctl").args([
                 "--user",
                 "try-restart",
                 "xdg-desktop-portal-kde.service",
                 "xdg-desktop-portal.service",
-            ])
-            .status();
+            ]),
+            SYSTEMD_BUDGET,
+        );
         std::thread::sleep(std::time::Duration::from_millis(600));
     }
     // Hyprland capture rides the xdg ScreenCast portal serviced by xdph (G5): on a mid-stream switch
     // xdph may still hold the old session's Wayland/instance env, so restart it (+ the frontend) to
     // re-read the now-live session, mirroring the KWin settling above.
     if chosen == Compositor::Hyprland {
-        let _ = std::process::Command::new("systemctl")
-            .args([
+        let _ = crate::proc::status_within(
+            std::process::Command::new("systemctl").args([
                 "--user",
                 "try-restart",
                 "xdg-desktop-portal-hyprland.service",
                 "xdg-desktop-portal.service",
-            ])
-            .status();
+            ]),
+            SYSTEMD_BUDGET,
+        );
         std::thread::sleep(std::time::Duration::from_millis(600));
     }
     tracing::info!(

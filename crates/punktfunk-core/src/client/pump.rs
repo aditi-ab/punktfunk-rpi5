@@ -36,6 +36,7 @@ pub(super) async fn run_pump(args: WorkerArgs) {
     };
     let handshake::HandshakeOut {
         conn,
+        ep,
         session,
         ctrl_send,
         ctrl_recv,
@@ -192,4 +193,11 @@ pub(super) async fn run_pump(args: WorkerArgs) {
         0
     };
     conn.close(close_code.into(), b"client closed");
+    // Flush the CONNECTION_CLOSE before the runtime is dropped (the same discipline as the pairing
+    // + probe paths). `close` only queues the frame — the endpoint driver puts it on the wire, and
+    // this fn is the body of a `block_on` whose runtime is dropped the instant it returns, so
+    // without this the driver could simply never be polled again. The host then saw a deliberate
+    // quit as silence: no `QUIT_CLOSE_CODE`, an 8 s idle timeout, and the keep-alive linger meant
+    // for an UNWANTED disconnect. Bounded — a host already gone must not delay the client's exit.
+    let _ = tokio::time::timeout(std::time::Duration::from_millis(300), ep.wait_idle()).await;
 }

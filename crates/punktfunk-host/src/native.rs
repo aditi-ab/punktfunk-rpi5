@@ -392,11 +392,6 @@ pub(crate) async fn serve(
     );
 
     loop {
-        let permit = sem
-            .clone()
-            .acquire_owned()
-            .await
-            .expect("session semaphore is never closed");
         let incoming = match ep.accept().await {
             Some(i) => i,
             None => break, // endpoint closed
@@ -409,9 +404,18 @@ pub(crate) async fn serve(
             Ok(c) => c,
             Err(e) => {
                 tracing::warn!(error = %e, "QUIC accept failed");
-                continue; // `permit` drops here → slot freed; not counted toward max_sessions
+                continue; // not counted toward max_sessions
             }
         };
+        // Take the session slot only AFTER the handshake, so a full host still ACCEPTS the
+        // connection and the waiting client sees a live path (quinn's keep-alive holds it) instead
+        // of a silent dial timeout — previously the loop parked on this await before `accept()`, so
+        // a host at its concurrency cap looked simply unreachable.
+        let permit = sem
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("session semaphore is never closed");
         let peer = conn.remote_address();
         tracing::info!(%peer, "punktfunk/1 client connected");
         let opts = opts.clone();
@@ -485,6 +489,31 @@ pub(crate) async fn serve(
 /// The accept loop is sequential, so the control phase must be bounded — a client that
 /// connects and never finishes the handshake would otherwise wedge the host for everyone.
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long the stream thread may still run AFTER its session was told to stop before
+/// [`serve_session`] gives up waiting for it.
+///
+/// Must exceed every legitimate post-stop path so a slow-but-healthy teardown is never abandoned:
+/// the capture-loss rebuild budget is 40 s and one pipeline-build attempt can take ~10 s on a cold
+/// compositor, so 90 s leaves generous headroom.
+const STREAM_STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// How long teardown waits for the audio + input threads once the connection is closed. They exit
+/// promptly by construction (the audio loop checks `stop` every ≤5 s; the input thread's channel
+/// drops with the connection), so this only catches a genuine wedge.
+const SIDE_THREAD_JOIN_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Resolves once `stop` has been set for [`STREAM_STOP_GRACE`] — i.e. the session was told to end
+/// and its stream thread *still* hasn't returned.
+///
+/// Polled rather than notified: `stop` is a plain flag shared with blocking threads, and the poll
+/// only runs while a session is live (every 500 ms, one relaxed atomic load).
+async fn stop_overdue(stop: &AtomicBool) {
+    while !stop.load(Ordering::SeqCst) {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    tokio::time::sleep(STREAM_STOP_GRACE).await;
+}
 
 /// QUIC application error code the host closes with on a `mode_conflict = reject` admission refusal,
 /// carrying the human-readable busy reason (live mode + client label) the client surfaces. A distinct
@@ -1330,7 +1359,7 @@ async fn serve_session(
     let bringup_dp = bringup.clone();
     let resize_ms_dp = resize_ms.clone();
     let result: Result<()> = async {
-        tokio::task::spawn_blocking(move || -> Result<()> {
+        let stream_thread = tokio::task::spawn_blocking(move || -> Result<()> {
             // Bring up the (already-bound) data-plane socket. Default: hole-punch — wait briefly
             // for the client's punch, then stream to its OBSERVED source, so video traverses a
             // NAT / stateful inter-VLAN firewall (control + side planes ride the client-initiated
@@ -1444,9 +1473,34 @@ async fn serve_session(
                     }
                 }
             }
-        })
-        .await
-        .context("stream thread")??;
+        });
+        // `stop` is only ADVISORY: the stream thread observes it between iterations, so a call that
+        // blocks without a bound INSIDE one (a compositor CLI that never returns, a D-Bus round-trip
+        // on a stuck bus, a driver wait on a hung GPU) never reaches the check — and nothing else
+        // can end the session, because every teardown below runs only once this await resolves. That
+        // made one stuck syscall a permanent zombie: it kept its semaphore slot (four of them and the
+        // host stops accepting entirely), its admission entry (a later client gets "host busy"
+        // forever) and its stream marker, and even the console's Stop button — which just sets this
+        // same flag — could not clear it.
+        //
+        // So bound the wait: once the session HAS been told to stop, give the thread
+        // `STREAM_STOP_GRACE` to return, then stop waiting for it and let teardown run. The thread is
+        // detached, not killed (a blocking thread can't be cancelled in Rust) — it keeps its capturer
+        // and encoder until the stuck call returns, and its own guards unwind if it ever does. That
+        // is a leak, but a bounded one: the session's slot and admission entry come back, so the rest
+        // of the host keeps serving.
+        tokio::select! {
+            joined = stream_thread => joined.context("stream thread")??,
+            () = stop_overdue(&stop) => {
+                tracing::error!(
+                    grace_s = STREAM_STOP_GRACE.as_secs(),
+                    "stream thread has not returned since the session was stopped — abandoning it so \
+                     the session slot is freed. Its capture/encoder stay held until the stuck call \
+                     returns; this is a HOST WEDGE — please report it with the log above"
+                );
+                anyhow::bail!("stream thread wedged after stop");
+            }
+        }
         // Give the client a moment to drain before the close.
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         Ok(())
@@ -1462,13 +1516,25 @@ async fn serve_session(
         if result.is_ok() { 0u32 } else { 1u32 }.into(),
         if result.is_ok() { b"done" } else { b"error" },
     );
-    let _ = tokio::task::spawn_blocking(move || {
+    // Bounded, for the same reason the stream-thread wait is: the input thread exits only when the
+    // datagram task drops its channel, which the `conn.close()` above forces — but a join is the
+    // last unbounded await in teardown, and one stuck side thread must not hold the session's
+    // permit/admission entry (released when this fn returns) hostage.
+    let side_threads = tokio::task::spawn_blocking(move || {
         if let Some(h) = audio_handle {
             let _ = h.join();
         }
         let _ = input_handle.join();
-    })
-    .await;
+    });
+    if tokio::time::timeout(SIDE_THREAD_JOIN_GRACE, side_threads)
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            grace_s = SIDE_THREAD_JOIN_GRACE.as_secs(),
+            "audio/input threads did not exit after the connection closed — detaching them"
+        );
+    }
     // The capture (and our gamescope session's VirtualOutput) are gone by here. If this was the
     // host-managed gamescope path on a box that autologs into gaming mode (Bazzite default), put the
     // TV's gaming session back so it's the default when no one is streaming.
