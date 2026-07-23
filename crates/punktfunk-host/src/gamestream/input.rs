@@ -173,9 +173,19 @@ pub fn decode_pointer(plaintext: &[u8]) -> Option<SsPointer> {
     let p = &plaintext[4..];
     let magic = u32::from_le_bytes([p[4], p[5], p[6], p[7]]);
     let b = &p[8..];
+    // Coordinates must be finite (they feed the injectors' scaling); a forged NaN drops the
+    // packet whole.
     let f32at = |o: usize| -> Option<f32> {
         let v = f32::from_le_bytes([*b.get(o)?, *b.get(o + 1)?, *b.get(o + 2)?, *b.get(o + 3)?]);
         v.is_finite().then_some(v)
+    };
+    // pressureOrDistance is different: real clients ship NaN there to mean "unknown" (iPad
+    // fingers have no force sensor — observed live from VoidLink, which NaN'd every touch and
+    // a strict gate silently killed the whole plane). The spec's own unknown value is 0.0, so
+    // non-finite sanitizes to that instead of poisoning the packet.
+    let f32_pressure = |o: usize| -> Option<f32> {
+        let v = f32::from_le_bytes([*b.get(o)?, *b.get(o + 1)?, *b.get(o + 2)?, *b.get(o + 3)?]);
+        Some(if v.is_finite() { v } else { 0.0 })
     };
     match magic {
         // eventType, zero[1], rotation u16, pointerId u32, x, y, pressureOrDistance, areas.
@@ -185,7 +195,7 @@ pub fn decode_pointer(plaintext: &[u8]) -> Option<SsPointer> {
             pointer_id: u32::from_le_bytes([*b.get(4)?, *b.get(5)?, *b.get(6)?, *b.get(7)?]),
             x: f32at(8)?,
             y: f32at(12)?,
-            pressure_or_distance: f32at(16)?,
+            pressure_or_distance: f32_pressure(16)?,
         })),
         // eventType, toolType, penButtons, zero[1], x, y, pressureOrDistance, rotation u16,
         // tilt, zero2[1], areas.
@@ -195,7 +205,7 @@ pub fn decode_pointer(plaintext: &[u8]) -> Option<SsPointer> {
             buttons: *b.get(2)?,
             x: f32at(4)?,
             y: f32at(8)?,
-            pressure_or_distance: f32at(12)?,
+            pressure_or_distance: f32_pressure(12)?,
             rotation: u16::from_le_bytes([*b.get(16)?, *b.get(17)?]),
             tilt: *b.get(18)?,
         })),
@@ -323,6 +333,16 @@ mod tests {
         let mut nan = body.clone();
         nan[8..12].copy_from_slice(&f32::NAN.to_le_bytes());
         assert_eq!(decode_pointer(&wrap(0x5500_0002, &nan)), None);
+        // …but a NaN pressureOrDistance sanitizes to 0.0 ("unknown") instead of killing the
+        // packet — a REAL client convention, observed live: VoidLink NaN's the pressure of
+        // every iPad finger touch (no force sensor), and the strict gate silently disabled
+        // the whole touch plane.
+        let mut nan_pod = body.clone();
+        nan_pod[16..20].copy_from_slice(&f32::NAN.to_le_bytes());
+        match decode_pointer(&wrap(0x5500_0002, &nan_pod)) {
+            Some(SsPointer::Touch(t)) => assert_eq!(t.pressure_or_distance, 0.0),
+            other => panic!("NaN pressure must decode with pod=0.0, got {other:?}"),
+        }
         // Non-pointer magics fall through to the classic decoder.
         assert_eq!(
             decode_pointer(&wrap(MAGIC_MOUSE_REL_GEN5, &[0, 0, 0, 0])),
