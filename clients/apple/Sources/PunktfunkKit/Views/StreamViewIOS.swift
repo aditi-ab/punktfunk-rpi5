@@ -333,6 +333,13 @@ public final class StreamViewController: StreamViewControllerBase {
             guard self?.captureEnabled == true else { return }
             connection?.send(event)
         }
+        // Apple Pencil → the stylus plane, only against a pen-capable host (elsewhere the
+        // Pencil stays a finger, exactly as before). Same trust gate as touch.
+        streamView.penEnabled = connection.hostSupportsPen
+        streamView.onPenBatch = { [weak self, weak connection] batch in
+            guard self?.captureEnabled == true else { return }
+            connection?.sendPen(batch)
+        }
         // Indirect pointer (mouse/trackpad) WITHOUT a lock → absolute cursor + buttons + scroll.
         // While the scene is pointer-LOCKED the GCMouse path owns motion AND buttons AND scroll, so
         // the whole UIKit indirect path is gated off here (`gcMouseForwarding`). The trackpad and a
@@ -499,6 +506,8 @@ public final class StreamViewController: StreamViewControllerBase {
         // onTouchEvent can still deliver the button-up.
         streamView.resetTouchInput()
         streamView.onTouchEvent = nil
+        streamView.onPenBatch = nil // after reset — the pen's leave-range sample rides it
+        streamView.penEnabled = false
         streamView.onPointerMoveAbs = nil
         streamView.onPointerButton = nil
         streamView.onScroll = nil
@@ -692,6 +701,12 @@ final class StreamLayerUIView: UIView {
     /// Direct fingers / Pencil → wire events: real touches in passthrough mode, or the
     /// touch-driven mouse events (`TouchMouse`) in the trackpad/pointer modes.
     var onTouchEvent: ((PunktfunkInputEvent) -> Void)?
+    /// Apple Pencil → state-full pen sample batches (the stylus plane). Active only while
+    /// `penEnabled`; without it the Pencil stays on the finger path exactly as before.
+    var onPenBatch: (([PunktfunkPenSample]) -> Void)?
+    /// The host advertised `HOST_CAP_PEN`, so Pencil input splits out of the finger path onto
+    /// the pen plane — independent of the touch-input mode (drawing must not depend on it).
+    var penEnabled = false
     /// Indirect pointer (mouse/trackpad with no lock) → absolute cursor moves.
     var onPointerMoveAbs: ((HostPoint) -> Void)?
     /// Indirect-pointer buttons (GameStream ids: 1=left 3=right); `down` = press.
@@ -715,10 +730,21 @@ final class StreamLayerUIView: UIView {
     /// The finger route latched at gesture start — a Settings change mid-gesture applies to
     /// the NEXT touch, so one gesture never splits across input models.
     private var fingerRoute: TouchInputMode?
+    /// The Apple Pencil pipeline (contacts + hover + squeeze/tap → pen samples).
+    private lazy var pencil: PencilStream = {
+        let stream = PencilStream()
+        stream.send = { [weak self] batch in self?.onPenBatch?(batch) }
+        stream.videoNorm = { [weak self] point in
+            guard let h = self?.hostPoint(from: point) else { return nil }
+            return (Float(h.x) / Float(max(h.w - 1, 1)), Float(h.y) / Float(max(h.h - 1, 1)))
+        }
+        return stream
+    }()
 
     /// Release anything the touch-driven mouse holds and forget gesture state — session stop.
     func resetTouchInput() {
         touchMouse.reset()
+        pencil.reset() // leaves range → the host lifts anything still inked
         fingerRoute = nil
         setSoftKeyboardVisible(false) // a stream that's gone takes its keyboard with it
     }
@@ -755,6 +781,11 @@ final class StreamLayerUIView: UIView {
         scrollPan.allowedScrollTypesMask = .all
         scrollPan.allowedTouchTypes = []
         addGestureRecognizer(scrollPan)
+        // Pencil squeeze / double-tap → the pen plane's barrel buttons (no-op while
+        // `penEnabled` is false — PencilStream ignores interactions out of range).
+        let pencilInteraction = UIPencilInteraction()
+        pencilInteraction.delegate = pencil
+        addInteraction(pencilInteraction)
         #endif
         backgroundColor = .black
     }
@@ -779,16 +810,31 @@ final class StreamLayerUIView: UIView {
     private enum TouchKind { case down, move, up, cancel }
 
     /// Split a touch batch by kind: an INDIRECT POINTER (mouse/trackpad with no lock) drives
-    /// the host cursor as an absolute mouse; everything else (direct finger, Pencil) is a host
-    /// touch. Mixed batches are possible, so partition rather than branch on the first touch.
+    /// the host cursor as an absolute mouse; a Pencil goes to the pen plane when the host
+    /// supports it; everything else (direct finger — and the Pencil toward a pen-less host)
+    /// is a host touch. Mixed batches are possible, so partition rather than branch on the
+    /// first touch.
     private func route(_ touches: Set<UITouch>, event: UIEvent?, kind: TouchKind) {
         var fingers: Set<UITouch> = []
+        var pencilTouches: Set<UITouch> = []
         for touch in touches {
             if touch.type == .indirectPointer {
                 handleIndirectPointer(touch, event: event, kind: kind)
+            } else if penEnabled, touch.type == .pencil {
+                pencilTouches.insert(touch)
             } else {
                 fingers.insert(touch)
             }
+        }
+        if !pencilTouches.isEmpty {
+            let phase: PencilStream.Phase =
+                switch kind {
+                case .down: .down
+                case .move: .move
+                case .up: .up
+                case .cancel: .cancel
+                }
+            pencil.touches(pencilTouches, event: event, phase: phase, in: self)
         }
         if !fingers.isEmpty { forwardFingers(fingers, kind: kind) }
     }
@@ -861,8 +907,11 @@ final class StreamLayerUIView: UIView {
         }
     }
 
-    /// Button-less mouse/trackpad movement (no lock) → absolute cursor move.
+    /// Button-less mouse/trackpad movement (no lock) → absolute cursor move — unless it is a
+    /// hovering PENCIL (`zOffset > 0`) on a pen-capable host, which becomes in-range pen
+    /// samples (hover preview with distance/tilt/azimuth) instead of a cursor move.
     @objc private func handleHover(_ recognizer: UIHoverGestureRecognizer) {
+        if penEnabled, pencil.maybeHover(recognizer, in: self) { return }
         switch recognizer.state {
         case .began, .changed:
             if let h = hostPoint(from: recognizer.location(in: self)) { onPointerMoveAbs?(h) }

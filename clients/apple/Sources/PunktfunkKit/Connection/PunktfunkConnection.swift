@@ -387,8 +387,16 @@ public final class PunktfunkConnection {
 
     /// The host answered `HOST_CAP_CURSOR`: it stopped compositing the pointer and forwards
     /// shape/state on the cursor planes — the client MUST draw the cursor locally.
+    /// `0x08` — the bit moved when `HOST_CAP_TEXT_INPUT` claimed `0x04` on main; testing the
+    /// old bit would mistake a text-input-capable host (e.g. Windows) for a cursor grant.
     public var hostSupportsCursor: Bool {
-        hostCaps & 0x04 != 0
+        hostCaps & 0x08 != 0
+    }
+
+    /// The host injects full-fidelity stylus input (`HOST_CAP_PEN`) — the gate for splitting
+    /// Apple Pencil out of the touch path onto the pen plane (``sendPen(_:)``).
+    public var hostSupportsPen: Bool {
+        hostCaps & UInt8(PUNKTFUNK_HOST_CAP_PEN) != 0
     }
 
     /// One forwarded host-cursor shape (the cursor channel, ABI v11): straight-alpha RGBA,
@@ -1131,6 +1139,19 @@ public final class PunktfunkConnection {
         defer { abiLock.unlock() }
         guard let h = handle, !closeRequested else { return }
         _ = punktfunk_connection_send_input(h, &ev)
+    }
+
+    /// Send one stylus sample batch (≤ `PUNKTFUNK_PEN_BATCH_MAX`, oldest first) on the pen
+    /// plane. Gate on ``hostSupportsPen`` — the core refuses toward a host without the cap.
+    /// Thread-safe; silently dropped after close (input is lossy by design).
+    public func sendPen(_ samples: [PunktfunkPenSample]) {
+        guard !samples.isEmpty else { return }
+        abiLock.lock()
+        defer { abiLock.unlock() }
+        guard let h = handle, !closeRequested else { return }
+        samples.withUnsafeBufferPointer { buf in
+            _ = punktfunk_connection_send_pen(h, buf.baseAddress, UInt32(buf.count))
+        }
     }
 
     /// Signal a **deliberate** user-initiated quit before ``close()``: the connection closes with
