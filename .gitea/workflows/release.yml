@@ -393,6 +393,76 @@ jobs:
             -authenticationKeyID "${{ secrets.ASC_API_KEY_ID }}" \
             -authenticationKeyIssuerID "${{ secrets.ASC_API_ISSUER_ID }}"
 
+      - name: iOS — export .ipa (Gitea release + run artifact)
+        # The TestFlight step above uploads straight to App Store Connect (destination=upload) and
+        # leaves NO .ipa on disk. Re-export the SAME archive with destination=export to get an
+        # App Store distribution-signed .ipa for the Gitea release + the run artifacts. Same gate as
+        # that archive; a warn+skip (never fails the best-effort iOS leg) if the archive is absent,
+        # e.g. a workflow_dispatch with testflight=false. NOTE: an App Store-signed .ipa installs
+        # only via TestFlight/App Store, not by direct sideload — it's a release/archival artifact.
+        if: gitea.event_name != 'workflow_dispatch' || inputs.testflight == 'true'
+        id: ios_ipa
+        run: |
+          ARCHIVE="$RUNNER_TEMP/Punktfunk-ios.xcarchive"
+          if [ ! -d "$ARCHIVE" ]; then
+            echo "::warning::iOS archive not found — skipping .ipa export"
+            exit 0
+          fi
+          PROFILE="Punktfunk iOS App Store Distribution"
+          WIDGET_PROFILE="Punktfunk iOS Widgets App Store Distribution"
+          # destination=export writes the .ipa to -exportPath; otherwise identical manual signing to
+          # the upload plist (both profiles, Apple Distribution). No ASC key needed — no network.
+          cat > "$RUNNER_TEMP/export-appstore-ipa.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key><string>app-store-connect</string>
+            <key>destination</key><string>export</string>
+            <key>teamID</key><string>$TEAM_ID</string>
+            <key>signingStyle</key><string>manual</string>
+            <key>signingCertificate</key><string>Apple Distribution</string>
+            <key>provisioningProfiles</key>
+            <dict>
+              <key>io.unom.punktfunk</key><string>$PROFILE</string>
+              <key>io.unom.punktfunk.widgets</key><string>$WIDGET_PROFILE</string>
+            </dict>
+          </dict>
+          </plist>
+          EOF
+          DEVELOPER_DIR="$XCODE_DEV_DIR" xcodebuild -exportArchive \
+            -archivePath "$ARCHIVE" \
+            -exportOptionsPlist "$RUNNER_TEMP/export-appstore-ipa.plist" \
+            -exportPath "$RUNNER_TEMP/export-ipa"
+          SRC=$(ls "$RUNNER_TEMP/export-ipa/"*.ipa 2>/dev/null | head -1)
+          [ -n "$SRC" ] || { echo "::warning::no .ipa was produced by export"; exit 0; }
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          IPA="$GITHUB_WORKSPACE/dist/Punktfunk-$VERSION.ipa"
+          mv "$SRC" "$IPA"
+          echo "IPA=$IPA" >> "$GITHUB_ENV"
+          echo "ipa=dist/Punktfunk-$VERSION.ipa" >> "$GITHUB_OUTPUT"
+          echo "exported $IPA"
+
+      - name: Attach .ipa to the workflow run
+        if: steps.ios_ipa.outputs.ipa != ''
+        # v3, not v4: Gitea's artifact backend identifies as GHES, which upload-artifact@v4 refuses
+        # (same reason as android.yml / apple.yml). Download is a zip of the .ipa.
+        uses: actions/upload-artifact@v3
+        with:
+          name: punktfunk-ios-ipa
+          path: ${{ steps.ios_ipa.outputs.ipa }}
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Attach .ipa to the Gitea release (stable tags only)
+        if: startsWith(gitea.ref, 'refs/tags/v') && steps.ios_ipa.outputs.ipa != ''
+        env:
+          GITEA_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        run: |
+          . scripts/ci/gitea-release.sh
+          RID=$(ensure_release "$GITHUB_REF_NAME" "$GITHUB_REF_NAME" auto)
+          upsert_asset "$RID" "$IPA" "Punktfunk-$VERSION.ipa"
+
       - name: tvOS — archive + upload to TestFlight
         # Canary + stable, the same track as iOS/macOS — the tvOS xcframework slice is now built
         # on every apple push (above), so this matches the iOS step's gate exactly.
