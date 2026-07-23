@@ -150,6 +150,18 @@ pub enum SsPointer {
     Touch(SsTouch),
 }
 
+/// Whether this control plaintext carries a pointer magic ([`decode_pointer`]'s domain) —
+/// lets the caller tell "malformed pointer packet" (worth a warn) apart from "some other
+/// message" when `decode_pointer` returns `None`.
+pub fn is_pointer_magic(plaintext: &[u8]) -> bool {
+    plaintext.len() >= 12
+        && u16::from_le_bytes([plaintext[0], plaintext[1]]) == INPUT_DATA_TYPE
+        && matches!(
+            u32::from_le_bytes([plaintext[8], plaintext[9], plaintext[10], plaintext[11]]),
+            MAGIC_SS_TOUCH | MAGIC_SS_PEN
+        )
+}
+
 /// Decode a control plaintext into a pen/touch pointer event, or `None` for every other
 /// message (the caller then falls through to [`decode`]). Bounds- and sanity-checked like the
 /// rest of the plane: short bodies and non-finite floats (a forged NaN must never reach the

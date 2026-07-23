@@ -289,6 +289,14 @@ fn on_receive(
             let _ = inj_tx.send(ev);
         });
         return;
+    } else if super::input::is_pointer_magic(&pt) {
+        // A pointer magic that failed the body parse — a layout mismatch against this
+        // client, exactly what an on-glass "touch/pen does nothing" needs surfaced.
+        tracing::warn!(
+            len = pt.len(),
+            "gamestream: SS_TOUCH/SS_PEN packet failed to decode (malformed/unexpected layout)"
+        );
+        return;
     }
 
     let events = super::input::decode(&pt);

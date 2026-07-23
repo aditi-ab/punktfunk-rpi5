@@ -67,6 +67,9 @@ pub struct GsPointer {
     saw_hover: bool,
     /// Active forwarded touch ids, for `CANCEL_ALL` replay as per-id ups.
     touch_ids: Vec<u32>,
+    /// Whether this session's first SS_TOUCH was logged (the one observable breadcrumb an
+    /// on-glass "touch does nothing" report needs — every later stage logs its own failure).
+    touch_seen: bool,
 }
 
 impl GsPointer {
@@ -80,6 +83,7 @@ impl GsPointer {
             last: PenSample::default(),
             saw_hover: false,
             touch_ids: Vec::new(),
+            touch_seen: false,
         }
     }
 
@@ -199,6 +203,13 @@ impl GsPointer {
     }
 
     fn apply_touch(&mut self, t: &SsTouch, mut sink: impl FnMut(InputEvent)) {
+        if !self.touch_seen {
+            self.touch_seen = true;
+            tracing::info!(
+                event_type = t.event_type,
+                "gamestream: touch plane active (first SS_TOUCH from this client)"
+            );
+        }
         let ev = |kind: InputKind, id: u32, x: f32, y: f32| InputEvent {
             kind,
             _pad: [0; 3],
