@@ -223,8 +223,20 @@ pub fn pen_supported() -> bool {
     true
 }
 
-/// See the Linux variant — no pen injection off Linux yet (Windows PT_PEN is design P3).
-#[cfg(not(target_os = "linux"))]
+/// Windows: pen (and touch) inject via synthetic pointer devices — available on Win10 1809+,
+/// probed by actually creating (and immediately destroying) a PT_PEN device. Same
+/// `PUNKTFUNK_PEN=0` kill-switch as Linux. The probe result also stands in for PT_TOUCH
+/// (both APIs arrived together in 1809).
+#[cfg(target_os = "windows")]
+pub fn pen_supported() -> bool {
+    if std::env::var("PUNKTFUNK_PEN").as_deref() == Ok("0") {
+        return false;
+    }
+    pen::synthetic_pen_available()
+}
+
+/// See the Linux/Windows variants — no pen injection elsewhere.
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
 pub fn pen_supported() -> bool {
     false
 }
@@ -399,9 +411,15 @@ pub mod gamepad {
 #[cfg(target_os = "linux")]
 #[path = "inject/linux/pen.rs"]
 pub mod pen;
-/// Stub — pen injection needs the Linux uinput tablet (Windows PT_PEN is design P3);
+/// Windows: PT_PEN/PT_TOUCH synthetic pointer devices (design/pen-tablet-input.md §6).
+/// `pen::VirtualPen` here is the PT_PEN device; `pen::SyntheticTouch` backs the SendInput
+/// injector's wire-touch path.
+#[cfg(target_os = "windows")]
+#[path = "inject/windows/pointer_windows.rs"]
+pub mod pen;
+/// Stub — pen injection needs the Linux uinput tablet or Windows synthetic pointers;
 /// `pen_supported()` is false here, so no host advertises the cap and no batches arrive.
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
 pub mod pen {
     use anyhow::{bail, Result};
     pub struct VirtualPen;

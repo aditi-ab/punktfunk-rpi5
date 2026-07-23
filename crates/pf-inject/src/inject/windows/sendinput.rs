@@ -46,6 +46,11 @@ const XBUTTON2: u32 = 0x0002;
 
 pub struct SendInputInjector {
     desktop: Option<HDESK>,
+    /// PT_TOUCH synthetic device, created on the first wire-touch event (a session that never
+    /// touches never creates one). `None` after a failed create (pre-1809) — touch then stays
+    /// the historical no-op.
+    touch: Option<crate::pen::SyntheticTouch>,
+    touch_failed: bool,
 }
 
 // SAFETY: `SendInputInjector` holds only an `Option<HDESK>` (a desktop handle). The host creates
@@ -58,7 +63,11 @@ unsafe impl Send for SendInputInjector {}
 
 impl SendInputInjector {
     pub fn open() -> Result<Self> {
-        let mut me = Self { desktop: None };
+        let mut me = Self {
+            desktop: None,
+            touch: None,
+            touch_failed: false,
+        };
         me.reattach_input_desktop(); // best-effort
         tracing::info!("SendInput injector ready (Win32 KeyboardAndMouse)");
         Ok(me)
@@ -324,15 +333,33 @@ impl InputInjector for SendInputInjector {
                 }
                 self.send(&inputs)
             }
-            // Gamepad goes through the XUSB backend. Touch: no SendInput equivalent -> no-op.
+            // Gamepad goes through the XUSB backend.
             InputKind::GamepadButton
             | InputKind::GamepadAxis
             | InputKind::GamepadState
             | InputKind::GamepadRemove
-            | InputKind::GamepadArrival
-            | InputKind::TouchDown
-            | InputKind::TouchMove
-            | InputKind::TouchUp => Ok(()),
+            | InputKind::GamepadArrival => Ok(()),
+            // Wire touch → the PT_TOUCH synthetic pointer device (design/pen-tablet-input.md
+            // §6; closes the historical SendInput no-op). Lazily created — a session that never
+            // touches never creates one; a pre-1809 create failure latches back to the no-op.
+            InputKind::TouchDown | InputKind::TouchMove | InputKind::TouchUp => {
+                if self.touch.is_none() && !self.touch_failed {
+                    match crate::pen::SyntheticTouch::create() {
+                        Ok(t) => self.touch = Some(t),
+                        Err(e) => {
+                            self.touch_failed = true;
+                            tracing::warn!(
+                                error = %format!("{e:#}"),
+                                "touch: synthetic pointer unavailable — wire touch stays a no-op"
+                            );
+                        }
+                    }
+                }
+                if let Some(t) = self.touch.as_mut() {
+                    t.apply(event);
+                }
+                Ok(())
+            }
         }
     }
 }
