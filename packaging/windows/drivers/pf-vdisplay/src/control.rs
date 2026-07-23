@@ -165,9 +165,11 @@ unsafe fn add(request: WDFREQUEST) {
         // This WUDFHost's pid — where the host duplicates the sealed frame channel's handles INTO
         // (`ProcessSharingDisabled`: this process is exclusively ours and dies with the device).
         wudf_pid: std::process::id(),
-        // The target already carries an irrevocable hardware-cursor declare from an earlier
-        // session — a channel-less session must self-composite the pointer (§8.6 gap).
-        cursor_excluded: crate::monitor::target_declared(target_id) as u32,
+        // The ADAPTER already carries an irrevocable hardware-cursor declare from an earlier
+        // session — DWM's exclusion reaches every later monitor, not just the declaring target
+        // (on-glass 2026-07-23: declare on 259 left a fresh GameStream 257 cursor-less) — so a
+        // channel-less session must self-composite the pointer (§8.6 gap, adapter-wide).
+        cursor_excluded: crate::monitor::any_declared() as u32,
     };
     // Dual-size reply (the `cursor_excluded` tail ext): an un-upgraded host retrieves only the
     // legacy 20-byte buffer — write the prefix it asked for instead of failing its ADD.

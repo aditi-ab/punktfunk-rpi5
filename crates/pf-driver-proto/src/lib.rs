@@ -80,12 +80,13 @@ pub const fn interface_guid_fields() -> (u32, u16, u16, [u8; 8]) {
 /// and the desktop model gets exclusion + forwarding. Nothing existing changed; against a v5
 /// driver the unknown IOCTL fails and the host logs + keeps the declared-at-ADD behavior.
 /// v6 tail ext (no bump, the `AddRequest` luminance-tail discipline):
-/// [`control::AddReply::cursor_excluded`] — the driver reports whether the ADDed monitor's OS
-/// target already carries a hardware-cursor declare from an earlier session. A declare is
-/// IRREVOCABLE for the target's life (remote-desktop-sweep §8.6, proven on-glass): DWM never
-/// composites the software cursor back into that target's frames, and the sticky state survives
-/// monitor REMOVE→ADD because the host hands every client a STABLE target id. The host uses the
-/// flag to self-composite the pointer (GDI poller + blend) in sessions that never negotiate the
+/// [`control::AddReply::cursor_excluded`] — the driver reports whether its ADAPTER already
+/// carries a hardware-cursor declare from an earlier session. A declare is IRREVOCABLE
+/// (remote-desktop-sweep §8.6, proven on-glass) and its exclusion reaches EVERY later monitor of
+/// the adapter, not just the declaring target (on-glass 2026-07-23: a declare on one target left
+/// a different client's fresh target cursor-less): DWM never composites the software cursor back
+/// into any of the adapter's frames until the adapter resets. The host uses the flag to
+/// self-composite the pointer (GDI poller + blend) in sessions that never negotiate the
 /// cursor channel — without it those sessions are silently cursor-less. Both skews degrade
 /// cleanly: an old driver writes only the 20-byte reply prefix (host reads `0` = unknown/clean),
 /// an old host retrieves a 20-byte buffer (driver writes just the prefix).
@@ -217,9 +218,10 @@ pub mod control {
         /// `DuplicateHandle`, then [`IOCTL_SET_FRAME_CHANNEL`]). Reported per-ADD, not per-open, so a
         /// WUDFHost restart between sessions can never leave the host duplicating into a dead process.
         pub wudf_pid: u32,
-        /// Non-zero = this monitor's OS target already carries an IRREVOCABLE hardware-cursor
-        /// declare from an earlier session (remote-desktop-sweep §8.6): DWM excludes the pointer
-        /// from every frame on this target, forever, and a session without the cursor channel must
+        /// Non-zero = the ADAPTER already carries an IRREVOCABLE hardware-cursor declare from an
+        /// earlier session (remote-desktop-sweep §8.6; reach is adapter-wide, not per-target —
+        /// on-glass 2026-07-23): DWM excludes the pointer from every frame on every monitor until
+        /// the adapter resets, and a session without the cursor channel must
         /// self-composite (GDI poller + blend) or stream a cursor-less desktop. Appended after
         /// [`ADD_REPLY_LEGACY_SIZE`] under the same dual-size discipline as the `AddRequest`
         /// luminance tail: an un-upgraded driver writes only the legacy prefix (the host's

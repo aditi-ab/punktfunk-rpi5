@@ -200,15 +200,18 @@ fn cursor_forward_desired(target_id: u32) -> bool {
 }
 
 /// OS target ids on which `IddCxMonitorSetupHardwareCursor` ever SUCCEEDED. A declare is
-/// IRREVOCABLE for the target's life (no un-declare DDI; empty-caps re-setup is rejected; even a
-/// successful same-mode re-commit never brings DWM's composited pointer back — all proven
-/// on-glass, remote-desktop-sweep §8.6) and it survives monitor REMOVE→ADD because the host hands
-/// each client a STABLE target id. Reported back on every ADD
-/// ([`AddReply::cursor_excluded`](pf_driver_proto::control::AddReply)) so a session that never
-/// negotiates the cursor channel knows it must self-composite the pointer instead of streaming a
-/// cursor-less desktop. Never cleared: the state's true scope is this WUDFHost's life
-/// (`ProcessSharingDisabled` — the process, and with it the adapter and every sticky declare,
-/// dies on adapter reset), which is exactly when this static resets too. Bounded: ≤ 16 ids.
+/// IRREVOCABLE (no un-declare DDI; empty-caps re-setup is rejected; even a successful same-mode
+/// re-commit never brings DWM's composited pointer back — all proven on-glass,
+/// remote-desktop-sweep §8.6) and its EXCLUSION REACH IS THE WHOLE ADAPTER, not the declaring
+/// target: a declare on one target leaves every LATER monitor's frames pointer-free too, even a
+/// fresh never-declared target id (proven on-glass 2026-07-23: declare on 259, then a GameStream
+/// session's fresh 257 streamed a cursor-less desktop). ADD replies therefore report
+/// [`AddReply::cursor_excluded`](pf_driver_proto::control::AddReply) from [`any_declared`] —
+/// a session that never negotiates the cursor channel must self-composite the pointer instead
+/// of streaming a cursor-less desktop. Never cleared: the state's true scope is this WUDFHost's
+/// life (`ProcessSharingDisabled` — the process, and with it the adapter and every sticky
+/// declare, dies on adapter reset), which is exactly when this static resets too. Per-target
+/// ids are kept purely for the dbglog audit trail. Bounded: ≤ 16 ids.
 static DECLARED_TARGETS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
 
 /// Record a SUCCESSFUL hardware-cursor declare on `target_id` (see [`DECLARED_TARGETS`]).
@@ -220,12 +223,13 @@ fn mark_declared(target_id: u32) {
     }
 }
 
-/// True if `target_id` ever had a hardware cursor declared (see [`DECLARED_TARGETS`]).
-pub fn target_declared(target_id: u32) -> bool {
-    DECLARED_TARGETS
+/// True if ANY target ever had a hardware cursor declared in this WUDFHost's life — the
+/// adapter-wide exclusion reach (see [`DECLARED_TARGETS`]).
+pub fn any_declared() -> bool {
+    !DECLARED_TARGETS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .contains(&target_id)
+        .is_empty()
 }
 
 /// Record a departing monitor's advertised list for its id ([`MODE_HISTORY`]).
