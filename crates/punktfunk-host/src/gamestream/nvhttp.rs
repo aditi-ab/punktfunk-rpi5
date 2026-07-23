@@ -250,14 +250,9 @@ async fn h_cancel(
         tracing::warn!("cancel rejected — caller does not own the session");
         return xml(error_xml());
     }
-    *st.launch.lock().unwrap() = None;
-    // Quit semantics: stop the running media threads (they observe these flags) so the session
-    // actually ends — the virtual output/gamescope teardown follows via the capturer's RAII.
-    st.streaming
-        .store(false, std::sync::atomic::Ordering::SeqCst);
-    st.audio_streaming
-        .store(false, std::sync::atomic::Ordering::SeqCst);
-    tracing::info!("cancel — launch session cleared, streams stopping");
+    // Quit semantics: the shared full teardown (launch cleared + both media threads stop on
+    // their flags) — the virtual output/gamescope teardown follows via the capturer's RAII.
+    st.end_session("client /cancel");
     xml("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<root status_code=\"200\"><cancel>1</cancel></root>\n".to_string())
 }
 

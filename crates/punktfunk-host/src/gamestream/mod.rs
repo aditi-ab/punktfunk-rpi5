@@ -182,7 +182,46 @@ pub struct AppState {
     pub stats: Arc<crate::stats_recorder::StatsRecorder>,
 }
 
+/// Session-lost callback the media threads invoke when they detect the client is unreachable
+/// (a UDP send error): ends the WHOLE GameStream session via [`AppState::end_session`], not just
+/// the thread that noticed — video and audio otherwise stop independently and leave the launch
+/// state behind. Built by the RTSP PLAY handler (the one place with the `Arc<AppState>`).
+pub(crate) type OnSessionLost = Arc<dyn Fn() + Send + Sync>;
+
 impl AppState {
+    /// End the GameStream session as one unit: signal BOTH media threads to stop (they observe
+    /// their `streaming`/`audio_streaming` flags) and clear the launch + negotiated stream
+    /// config. Idempotent — safe to call from every "the client is gone" site.
+    ///
+    /// This is THE teardown for the compat plane. Anything less leaves a stale session behind:
+    /// a lingering `launch` 503-blocks a different client's `/launch` under
+    /// `mode_conflict = reject`, and a stale `streaming = true` makes a reconnect's RTSP PLAY
+    /// take its "stream already running" branch while the old threads still stream at the
+    /// vanished client's endpoint (no new threads are started — the reconnect gets no media).
+    /// Returns whether the video stream was live (for the caller's log line).
+    pub(crate) fn end_session(&self, reason: &str) -> bool {
+        use std::sync::atomic::Ordering;
+        let was_streaming = self.streaming.swap(false, Ordering::SeqCst);
+        let was_audio = self.audio_streaming.swap(false, Ordering::SeqCst);
+        let had_launch = self
+            .launch
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .is_some();
+        self.stream.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if was_streaming || was_audio || had_launch {
+            tracing::info!(
+                reason,
+                was_streaming,
+                was_audio,
+                had_launch,
+                "gamestream: session ended"
+            );
+        }
+        was_streaming
+    }
+
     /// Fresh control-plane state: no active session; the pairing allow-list is loaded from
     /// disk (pairings persist across restarts). `stats` is the shared recorder handed to both the
     /// mgmt API and the streaming loops.
@@ -426,6 +465,69 @@ pub(crate) fn save_paired(paired: &[Vec<u8>]) {
     if let Err(e) = std::fs::rename(&tmp, &path) {
         tracing::warn!(error = %e, "persisting pairings failed (rename)");
         let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+
+    fn test_state() -> AppState {
+        let host = Host {
+            hostname: "test-host".into(),
+            uniqueid: "deadbeef".into(),
+            local_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            http_port: HTTP_PORT,
+            https_port: HTTPS_PORT,
+        };
+        let identity = cert::ServerIdentity::ephemeral().expect("ephemeral identity");
+        let stats = crate::stats_recorder::StatsRecorder::new(std::env::temp_dir().join(format!(
+            "pf-gs-endsession-{}-{:p}",
+            std::process::id(),
+            &0u8 as *const u8
+        )));
+        AppState::new(host, identity, stats)
+    }
+
+    /// `end_session` is THE compat-plane teardown: one call must clear the whole session — both
+    /// media-thread flags, the launch, and the negotiated stream config — and be idempotent.
+    /// Guards the ENet-Disconnect / client-unreachable paths that previously stopped nothing
+    /// (the "session stays alive after the client disconnects" bug).
+    #[test]
+    fn end_session_clears_the_whole_session() {
+        use std::sync::atomic::Ordering;
+        let state = test_state();
+        state.streaming.store(true, Ordering::SeqCst);
+        state.audio_streaming.store(true, Ordering::SeqCst);
+        *state.launch.lock().unwrap() = Some(LaunchSession {
+            gcm_key: [0; 16],
+            rikeyid: 0,
+            width: 1920,
+            height: 1080,
+            fps: 60,
+            appid: 1,
+            peer_ip: None,
+            owner_fp: None,
+        });
+        *state.stream.lock().unwrap() = Some(stream::StreamConfig {
+            width: 1920,
+            height: 1080,
+            fps: 60,
+            packet_size: 1024,
+            bitrate_kbps: 20_000,
+            codec: crate::encode::Codec::H265,
+            min_fec: 0,
+            hdr: false,
+        });
+
+        assert!(state.end_session("test"), "video was live");
+        assert!(!state.streaming.load(Ordering::SeqCst));
+        assert!(!state.audio_streaming.load(Ordering::SeqCst));
+        assert!(state.launch.lock().unwrap().is_none());
+        assert!(state.stream.lock().unwrap().is_none());
+
+        // Idempotent: a second end (e.g. `/cancel` racing the ENet Disconnect) is a no-op.
+        assert!(!state.end_session("test again"));
     }
 }
 

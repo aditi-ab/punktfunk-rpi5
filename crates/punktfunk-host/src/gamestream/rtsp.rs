@@ -190,7 +190,9 @@ fn authorized_launch(state: &AppState, peer: Option<SocketAddr>) -> Option<Launc
     }
 }
 
-fn handle_request(req: &Request, state: &AppState, peer: Option<SocketAddr>) -> String {
+// `&Arc<AppState>` (not `&AppState`): PLAY hands the media threads a `'static` session-lost
+// callback, which needs an owned clone of the state.
+fn handle_request(req: &Request, state: &Arc<AppState>, peer: Option<SocketAddr>) -> String {
     match req.method.as_str() {
         "OPTIONS" => response(
             &req.cseq,
@@ -254,6 +256,15 @@ fn handle_request(req: &Request, state: &AppState, peer: Option<SocketAddr>) -> 
                 return response_status("401 Unauthorized", &req.cseq, &[], None);
             };
             let cfg = *state.stream.lock().unwrap();
+            // Client-unreachable teardown for the media threads: ends the WHOLE session (both
+            // planes + launch state), so one plane detecting the dead client can't leave the
+            // other streaming at it — or leave a stale launch to wedge the next connect.
+            let on_lost: super::OnSessionLost = {
+                let st = state.clone();
+                Arc::new(move || {
+                    st.end_session("client unreachable");
+                })
+            };
             match cfg {
                 Some(cfg) if !state.streaming.swap(true, Ordering::SeqCst) => {
                     // Resolve the launched catalog entry (session recipe) for the stream.
@@ -267,6 +278,7 @@ fn handle_request(req: &Request, state: &AppState, peer: Option<SocketAddr>) -> 
                         state.rfi_range.clone(),
                         state.video_cap.clone(),
                         state.stats.clone(),
+                        on_lost.clone(),
                     );
                 }
                 Some(_) => tracing::info!("RTSP PLAY — stream already running"),
@@ -283,6 +295,7 @@ fn handle_request(req: &Request, state: &AppState, peer: Option<SocketAddr>) -> 
                     ls.rikeyid,
                     *state.audio_params.lock().unwrap(),
                     state.audio_cap.clone(),
+                    on_lost,
                 );
             }
             response(&req.cseq, &[("Session", "DEADBEEFCAFE;timeout = 90")], None)

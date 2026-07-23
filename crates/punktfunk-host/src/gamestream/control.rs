@@ -83,10 +83,34 @@ pub fn spawn(state: Arc<AppState>) -> Result<()> {
                     match host.service() {
                         Ok(Some(event)) => match event {
                             Event::Connect { peer: p, .. } => {
-                                tracing::info!("control: client connected");
-                                peer = Some(p.id());
+                                // Track this peer as THE session peer only if it comes from the
+                                // `/launch` owner's IP (when captured — `None` falls back to
+                                // trusting the connect, the pre-teardown behavior). The tracked
+                                // peer's disconnect now ENDS the session, so an unauthenticated
+                                // LAN peer that connects+disconnects on 47999 must not be able to
+                                // steal the slot and tear a live session down. Same source-IP
+                                // bind the RTSP/media plane uses (security-review #4).
+                                let owner_ip = state.launch.lock().unwrap().and_then(|s| s.peer_ip);
+                                let from = p.address().map(|a| a.ip());
+                                if owner_ip.is_some() && from.is_some() && owner_ip != from {
+                                    tracing::warn!(
+                                        ?from,
+                                        "control: peer connected from a non-owner IP — ignoring"
+                                    );
+                                } else {
+                                    tracing::info!("control: client connected");
+                                    peer = Some(p.id());
+                                }
                             }
-                            Event::Disconnect { .. } => {
+                            Event::Disconnect { peer: p, .. } => {
+                                // Gate on the TRACKED session peer: a stray probe peer (or the
+                                // OLD peer's late timeout after a fast reconnect replaced it in
+                                // the Connect arm) must neither clobber the live session's input
+                                // state nor end its session.
+                                if peer != Some(p.id()) {
+                                    tracing::debug!("control: non-session peer disconnected");
+                                    continue;
+                                }
                                 tracing::info!("control: client disconnected");
                                 detected = None;
                                 decrypt_fails = 0;
@@ -97,6 +121,16 @@ pub fn spawn(state: Arc<AppState>) -> Result<()> {
                                 // uinput pen releases any held tool/tip kernel-side).
                                 pads = GamepadManager::new();
                                 pointer = super::pen::GsPointer::new();
+                                // The control stream is the session's liveness anchor — Moonlight
+                                // holds it for the whole stream, and ENet detects a vanished peer
+                                // via its reliable-ping timeout (~5–30 s), which ALSO lands here.
+                                // End the session: without this, a client that disconnects without
+                                // an explicit RTSP TEARDOWN / nvhttp `/cancel` (a network drop,
+                                // sleep, crash — or just a plain Moonlight quit, which sends
+                                // neither) left the media threads streaming at the dead endpoint
+                                // forever (a UDP send only errors on an ICMP port-unreachable) and
+                                // the stale launch/streaming state wedged every reconnect.
+                                state.end_session("control stream disconnected");
                             }
                             Event::Receive {
                                 channel_id, packet, ..

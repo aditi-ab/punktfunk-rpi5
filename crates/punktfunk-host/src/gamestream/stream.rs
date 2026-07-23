@@ -45,6 +45,7 @@ pub type RfiSlot = Arc<std::sync::Mutex<Option<(i64, i64)>>>;
 /// Spawn the video stream thread (idempotent via `running`). Stops when `running` clears.
 /// `force_idr` is set by the control stream on a client recovery request; `video_cap` holds
 /// the persistent capturer the thread borrows for the stream's duration.
+#[allow(clippy::too_many_arguments)]
 pub fn start(
     cfg: StreamConfig,
     app: Option<super::apps::AppEntry>,
@@ -53,6 +54,7 @@ pub fn start(
     rfi_range: RfiSlot,
     video_cap: CapturerSlot,
     stats: Arc<crate::stats_recorder::StatsRecorder>,
+    on_lost: super::OnSessionLost,
 ) {
     let _ = std::thread::Builder::new()
         .name("punktfunk-video".into())
@@ -103,6 +105,7 @@ pub fn start(
                 &rfi_range,
                 &video_cap,
                 &stats,
+                &on_lost,
             );
             // A clean return is a stop (RTSP teardown / cancel / client unreachable) → `quit`;
             // an error return is `error`. The compat plane can't tell a user stop from an idle
@@ -137,6 +140,8 @@ fn run(
     // Shared stats recorder for the web-console capture/graph. Threaded into `stream_body` (the
     // encode loop); per-frame sample emission is wired by a later pass.
     stats: &Arc<crate::stats_recorder::StatsRecorder>,
+    // Whole-session teardown for the send thread's client-unreachable detection.
+    on_lost: &super::OnSessionLost,
 ) -> Result<()> {
     // GameStream capture/encode thread: apply Windows session tuning (no-op off Windows).
     pf_frame::session_tuning::on_hot_thread();
@@ -252,6 +257,7 @@ fn run(
             rfi_range,
             stats,
             &client_label,
+            on_lost,
         );
     }
 
@@ -299,6 +305,7 @@ fn run(
         rfi_range,
         stats,
         &client_label,
+        on_lost,
     );
     capturer.set_active(false);
     *video_cap.lock().unwrap() = Some((capturer, cfg.hdr));
@@ -572,12 +579,15 @@ fn spawn_packetizer(
 /// shared [`send_pacing`](crate::send_pacing) policy at the GameStream parameterization: no
 /// microburst stage, a BOUNDED step count (≤ 12, chunk ≥ 16, see the policy's docs for the
 /// "send queue full" history that bound guards), each step ending in a sleep toward its slice
-/// of the fixed budget. On send failure (client gone) it clears `running`.
+/// of the fixed budget. On send failure (client gone) it ends the whole session via `on_lost` —
+/// not just this thread: audio would otherwise keep streaming at the dead endpoint and the stale
+/// launch state would wedge the next connect (see `AppState::end_session`).
 fn spawn_sender(
     sock: UdpSocket,
     rx: std::sync::mpsc::Receiver<PacketBatch>,
     frame_interval: Duration,
     running: Arc<AtomicBool>,
+    on_lost: super::OnSessionLost,
 ) -> Result<()> {
     std::thread::Builder::new()
         .name("punktfunk-send".into())
@@ -613,8 +623,9 @@ fn spawn_sender(
                     },
                 );
                 if let Err(e) = r {
-                    tracing::info!(error = %e, sent, "video: client unreachable — stopping stream");
+                    tracing::info!(error = %e, sent, "video: client unreachable — ending session");
                     running.store(false, Ordering::SeqCst);
+                    on_lost();
                     return;
                 }
             }
@@ -645,6 +656,8 @@ fn stream_body(
     stats: &Arc<crate::stats_recorder::StatsRecorder>,
     // Short client label (peer IP) seeded into the capture meta on the first armed registration.
     client_label: &str,
+    // Whole-session teardown, handed to the send thread's client-unreachable detection.
+    on_lost: &super::OnSessionLost,
 ) -> Result<()> {
     // The first frame establishes the authoritative size/format for the encoder.
     let mut frame = capturer.next_frame().context("capture first frame")?;
@@ -708,6 +721,7 @@ fn stream_body(
         batch_rx,
         Duration::from_secs_f64(1.0 / target_fps as f64),
         running.clone(),
+        on_lost.clone(),
     )?;
     let (raw_tx, raw_rx) = std::sync::mpsc::sync_channel::<RawFrame>(2);
     spawn_packetizer(raw_rx, batch_tx, pk, goodput.clone())?;
@@ -1075,6 +1089,7 @@ mod tests {
             rx,
             Duration::from_millis(8), // ~120fps frame interval
             running.clone(),
+            Arc::new(|| {}),
         )
         .unwrap();
 

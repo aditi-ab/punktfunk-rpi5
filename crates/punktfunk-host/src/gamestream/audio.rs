@@ -220,12 +220,13 @@ pub fn start(
     rikeyid: i32,
     params: AudioParams,
     audio_cap: AudioCapSlot,
+    on_lost: super::OnSessionLost,
 ) {
     let _ = std::thread::Builder::new()
         .name("punktfunk-audio".into())
         .spawn(move || {
             tracing::info!(?params, "audio stream starting");
-            if let Err(e) = run(&running, &gcm_key, rikeyid, params, &audio_cap) {
+            if let Err(e) = run(&running, &gcm_key, rikeyid, params, &audio_cap, &on_lost) {
                 tracing::error!(error = %format!("{e:#}"), "audio stream failed");
             }
             running.store(false, Ordering::SeqCst);
@@ -243,6 +244,7 @@ pub fn start(
     _rikeyid: i32,
     _params: AudioParams,
     _audio_cap: AudioCapSlot,
+    _on_lost: super::OnSessionLost,
 ) {
     tracing::error!("GameStream audio requires Linux (PipeWire) or Windows (WASAPI) + libopus");
     running.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -255,6 +257,7 @@ fn run(
     rikeyid: i32,
     params: AudioParams,
     audio_cap: &std::sync::Mutex<Option<Box<dyn AudioCapturer>>>,
+    on_lost: &super::OnSessionLost,
 ) -> Result<()> {
     let sock = UdpSocket::bind(("0.0.0.0", AUDIO_PORT)).context("bind audio UDP")?;
     // Grow SO_SNDBUF/RCVBUF; the opt-in DSCP/QoS tag happens after connect below (Windows
@@ -296,7 +299,7 @@ fn run(
         }
         None => audio::open_audio_capture(want).context("open audio capture")?,
     };
-    let result = audio_body(&mut *cap, &sock, gcm_key, rikeyid, params, running);
+    let result = audio_body(&mut *cap, &sock, gcm_key, rikeyid, params, running, on_lost);
     cap.idle(); // parked between sessions — release the routing claim (Linux stream sink)
     audio::park_audio_capture(audio_cap, cap); // drop on Windows (restores the default), keep on Linux
     result
@@ -355,6 +358,7 @@ impl SessionEncoder {
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
+#[allow(clippy::too_many_arguments)]
 fn audio_body(
     cap: &mut dyn AudioCapturer,
     sock: &UdpSocket,
@@ -362,6 +366,9 @@ fn audio_body(
     rikeyid: i32,
     params: AudioParams,
     running: &AtomicBool,
+    // Whole-session teardown for the client-unreachable send errors below — video would
+    // otherwise keep streaming at the dead endpoint (see `AppState::end_session`).
+    on_lost: &super::OnSessionLost,
 ) -> Result<()> {
     let layout = layout_for(&params);
     let mut enc = SessionEncoder::new(layout)?;
@@ -427,7 +434,8 @@ fn audio_body(
                 .encrypt_padded_vec_mut::<Pkcs7>(&out[..n]);
             let pkt = build_rtp(seq, timestamp, &ct);
             if sock.send(&pkt).is_err() {
-                tracing::info!(sent, "audio: client unreachable — stopping");
+                tracing::info!(sent, "audio: client unreachable — ending session");
+                on_lost();
                 return Ok(());
             }
             // Surround FEC: accumulate the encrypted payloads of the aligned 4-packet block;
@@ -449,7 +457,11 @@ fn audio_body(
                                 let fp =
                                     build_fec_rtp(rtp_seq, x as u8, fec_base_seq, fec_base_ts, par);
                                 if sock.send(&fp).is_err() {
-                                    tracing::info!(sent, "audio: client unreachable — stopping");
+                                    tracing::info!(
+                                        sent,
+                                        "audio: client unreachable — ending session"
+                                    );
+                                    on_lost();
                                     return Ok(());
                                 }
                             }
