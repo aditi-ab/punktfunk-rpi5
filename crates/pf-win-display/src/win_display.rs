@@ -928,14 +928,35 @@ pub unsafe fn isolate_displays_ccd(keep_target_ids: &[u32]) -> Option<SavedConfi
         // never calls ASSIGN_SWAPCHAIN, so the driver receives no frames. SDC_FORCE_MODE_ENUMERATION
         // forces the re-commit; SAVE_TO_DATABASE only in the sole-path case (matches prior behavior —
         // don't permanently rewrite the user's multi-display layout; the teardown restore handles it).
-        let mut flags = SDC_APPLY
-            | SDC_USE_SUPPLIED_DISPLAY_CONFIG
-            | SDC_ALLOW_CHANGES
-            | SDC_FORCE_MODE_ENUMERATION;
-        if others == 0 {
-            flags |= SDC_SAVE_TO_DATABASE;
-        }
-        let rc = SetDisplayConfig(Some(paths.as_slice()), Some(modes.as_slice()), flags);
+        let rc = if others > 0 && attempt >= 2 {
+            // ESCALATION (attempt 2+): supply ONLY the keep paths. Field-reported (AMD +
+            // pf-vdisplay): carrying the doomed path in the array — inactive, modes unpinned —
+            // gets the whole config rejected 0x57 on EVERY retry, so the loop alone never
+            // converged; the same host applies the keep-only shape rc=0 whenever the topology
+            // database has already made the virtual display sole. The final attempt also drops
+            // SDC_FORCE_MODE_ENUMERATION in case the driver rejects it combined with a real
+            // topology change — an actual path removal drives COMMIT_MODES on its own, so the
+            // re-commit rationale doesn't need the flag here.
+            let (kp, km) = keep_only_supplied(&paths, &modes);
+            let mut esc = SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES;
+            if attempt < 4 {
+                esc |= SDC_FORCE_MODE_ENUMERATION;
+            }
+            tracing::info!(
+                "display isolate (CCD): escalating to a keep-only supplied config (attempt {attempt}/4, paths {}→{}, modes {}→{})",
+                paths.len(), kp.len(), modes.len(), km.len()
+            );
+            SetDisplayConfig(Some(kp.as_slice()), Some(km.as_slice()), esc)
+        } else {
+            let mut flags = SDC_APPLY
+                | SDC_USE_SUPPLIED_DISPLAY_CONFIG
+                | SDC_ALLOW_CHANGES
+                | SDC_FORCE_MODE_ENUMERATION;
+            if others == 0 {
+                flags |= SDC_SAVE_TO_DATABASE;
+            }
+            SetDisplayConfig(Some(paths.as_slice()), Some(modes.as_slice()), flags)
+        };
         // A failed apply must be VISIBLE even when the verification below passes vacuously (nothing
         // else was active to deactivate — the lid-closed laptop case, where the success INFO used to
         // swallow rc=0x5): the re-commit above is load-bearing (COMMIT_MODES → ASSIGN_SWAPCHAIN),
@@ -960,6 +981,63 @@ pub unsafe fn isolate_displays_ccd(keep_target_ids: &[u32]) -> Option<SavedConfi
     }
     tracing::error!("display isolate (CCD): failed to isolate target set {keep_target_ids:?} after 4 attempts — a non-virtual display stayed active (field-reported exclusive-mode bug)");
     Some(saved)
+}
+
+/// Build the ESCALATED supplied config for [`isolate_displays_ccd`]: ONLY the paths still flagged
+/// ACTIVE (the keep set — the caller already cleared ACTIVE on every doomed path), with the mode
+/// table rebuilt to just the entries those paths reference (indexes remapped). Docs-wise the
+/// dropped inactive entries were declared ignored anyway ("Only the paths within this array that
+/// have the DISPLAYCONFIG_PATH_ACTIVE flag set are set"), so this shape asks for the identical
+/// topology — minus the array contents some driver/OS validation combos reject with 0x57.
+unsafe fn keep_only_supplied(
+    paths: &[DISPLAYCONFIG_PATH_INFO],
+    modes: &[DISPLAYCONFIG_MODE_INFO],
+) -> (Vec<DISPLAYCONFIG_PATH_INFO>, Vec<DISPLAYCONFIG_MODE_INFO>) {
+    let mut out_paths = Vec::new();
+    let mut out_modes = Vec::new();
+    // old mode index → new. Shared entries dedup through here: a clone-style pair references ONE
+    // source mode, and the docs require each source/target mode to appear in the table only once.
+    let mut remap = std::collections::HashMap::new();
+    for p in paths {
+        if p.flags & DISPLAYCONFIG_PATH_ACTIVE == 0 {
+            continue;
+        }
+        let mut q = *p;
+        q.sourceInfo.Anonymous.modeInfoIdx = remap_mode_idx(
+            q.sourceInfo.Anonymous.modeInfoIdx,
+            modes,
+            &mut out_modes,
+            &mut remap,
+        );
+        q.targetInfo.Anonymous.modeInfoIdx = remap_mode_idx(
+            q.targetInfo.Anonymous.modeInfoIdx,
+            modes,
+            &mut out_modes,
+            &mut remap,
+        );
+        out_paths.push(q);
+    }
+    (out_paths, out_modes)
+}
+
+/// Move `modes[old]` into `out` (once — `remap` dedups) and return its new index. INVALID and
+/// out-of-range indexes stay INVALID — `SDC_ALLOW_CHANGES` lets best-mode logic fill the gap.
+fn remap_mode_idx(
+    old: u32,
+    modes: &[DISPLAYCONFIG_MODE_INFO],
+    out: &mut Vec<DISPLAYCONFIG_MODE_INFO>,
+    remap: &mut std::collections::HashMap<u32, u32>,
+) -> u32 {
+    if old == DISPLAYCONFIG_PATH_MODE_IDX_INVALID {
+        return old;
+    }
+    let Some(m) = modes.get(old as usize) else {
+        return DISPLAYCONFIG_PATH_MODE_IDX_INVALID;
+    };
+    *remap.entry(old).or_insert_with(|| {
+        out.push(*m);
+        (out.len() - 1) as u32
+    })
 }
 
 /// The desktop-space rectangle `(x, y, w, h)` of `target_id`'s SOURCE — where this display's
