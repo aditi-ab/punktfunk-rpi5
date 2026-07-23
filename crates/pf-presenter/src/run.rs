@@ -773,12 +773,20 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
         // Cursor channel (M2): drain forwarded shape/state and drive the local OS cursor —
         // only meaningful in the desktop mouse model (capture's relative lock hides it).
         if let Some(st) = stream.as_mut() {
+            // Host-framebuffer px → window px: the aspect-fit factor the video is drawn at
+            // (same `min(surface/content)` as `finger_to_content`). The forwarded pointer is
+            // resampled by it so a high-DPI host's oversized bitmap lands sized to the streamed
+            // desktop rather than ballooning. 1:1 until the first frame gives `last_video`.
+            let fit_scale = st.last_video.map_or(1.0, |(vw, vh)| {
+                let (pw, ph) = window.size_in_pixels();
+                (pw as f32 / vw.max(1) as f32).min(ph as f32 / vh.max(1) as f32)
+            });
             if let (Some(chan), Some(c)) = (st.cursor_chan.as_mut(), st.connector.as_ref()) {
                 let desktop_active = st
                     .capture
                     .as_ref()
                     .is_some_and(|cap| cap.captured() && cap.desktop());
-                chan.pump(c, &mouse, desktop_active);
+                chan.pump(c, &mouse, desktop_active, fit_scale);
                 // §8 mid-stream render flip: tell the host who renders the pointer whenever
                 // the local model changes. Desktop-active = we draw it (host excludes +
                 // forwards); anything else — the capture model OR a released pointer — the
