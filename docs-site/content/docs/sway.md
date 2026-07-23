@@ -23,14 +23,19 @@ or [Fedora](/docs/fedora).
 
 ## host.env
 
-The host auto-detects a wlroots session, so you usually need nothing here. To force the backend, set
-these in `~/.config/punktfunk/host.env`:
+The host auto-detects a wlroots session, so the starter `~/.config/punktfunk/host.env` is one line:
 
 ```ini
-PUNKTFUNK_COMPOSITOR=wlroots      # aliases: sway, wlr, hyprland (all the wlroots family; the exact backend is auto-detected)
-PUNKTFUNK_INPUT_BACKEND=wlr
 PUNKTFUNK_VIDEO_SOURCE=virtual
 # GPU zero-copy capture→encode is ON by default; auto-falls back to CPU. Set PUNKTFUNK_ZEROCOPY=0 to force CPU.
+```
+
+To force the backend (CI/testing — note that pinning turns live-session auto-detection **off**, so
+the host stops following session switches):
+
+```ini
+PUNKTFUNK_COMPOSITOR=wlroots      # aliases: sway, wlr (the wlroots-proper family)
+PUNKTFUNK_INPUT_BACKEND=wlr
 ```
 
 See [Configuration](/docs/configuration) for the full reference.

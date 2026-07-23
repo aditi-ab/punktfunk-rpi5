@@ -2,15 +2,18 @@
 # GameStream/Moonlight-compat planes). For a SECURE native-only host (no plain-HTTP pairing / legacy
 # GCM nonce reuse — security-review #5/#9; native clients only), drop `--gamestream` from ExecStart.
 #
-# Install (against an already-running compositor session):
+# Install (against an already-running compositor session — the host auto-detects and follows it,
+# so host.env needs no backend config):
 #   mkdir -p ~/.config/systemd/user && cp scripts/punktfunk-host.service ~/.config/systemd/user/
-#   cp scripts/host.env.example ~/.config/punktfunk/host.env   # then edit for your backend
+#   cp scripts/host.env.example ~/.config/punktfunk/host.env   # defaults are right for a desktop
 #   systemctl --user daemon-reload && systemctl --user enable --now punktfunk-host
 #
-# Self-contained boot appliance (no login, no manual steps after boot):
+# Self-contained boot appliance (no login, no manual steps after boot). These routes PIN the
+# backend via PUNKTFUNK_COMPOSITOR — correct for a dedicated single-session box, but it turns off
+# live-session auto-detection, so never do it on a desktop that switches sessions (Game Mode etc.):
 #   - kwin backend (stream the Plasma desktop): also install + enable
-#     punktfunk-kde-session.service (it brings up the headless KWin session this After=s), and set
-#     PUNKTFUNK_COMPOSITOR=kwin + WAYLAND_DISPLAY=wayland-kde in host.env.
+#     punktfunk-kde-session.service (it brings up the headless KWin session this After=s), and use
+#     the shipped packaging/kde/host.env (pins kwin + WAYLAND_DISPLAY=wayland-kde on purpose).
 #   - gamescope backend (stream a nested app, no desktop): set PUNKTFUNK_COMPOSITOR=gamescope in
 #     host.env — the host spawns gamescope per session, so no kde-session unit is needed.
 #   Then `sudo loginctl enable-linger "$USER"` so user units start at boot, and reboot.

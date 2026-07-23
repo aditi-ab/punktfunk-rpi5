@@ -12,18 +12,19 @@ installed — see [Ubuntu](/docs/ubuntu), [Fedora](/docs/fedora), or [Arch](/doc
 
 ## host.env
 
-Write `~/.config/punktfunk/host.env` with the GNOME settings. The host auto-detects the compositor
-from your session, so the explicit `PUNKTFUNK_COMPOSITOR` is belt-and-braces:
+The host auto-detects the compositor from your live session on every connect, so the starter
+`~/.config/punktfunk/host.env` is one line:
 
 ```ini
-# ~/.config/punktfunk/host.env
-WAYLAND_DISPLAY=wayland-0
-XDG_CURRENT_DESKTOP=GNOME
-PUNKTFUNK_COMPOSITOR=mutter
+# ~/.config/punktfunk/host.env  (keys are case-sensitive)
 PUNKTFUNK_VIDEO_SOURCE=virtual
 # GPU zero-copy (dmabuf → CUDA → NVENC) is ON by default; auto-falls back to CPU. Set =0 to force CPU.
-PUNKTFUNK_INPUT_BACKEND=libei
 ```
+
+> **Don't set `PUNKTFUNK_COMPOSITOR`, `WAYLAND_DISPLAY`, or `XDG_CURRENT_DESKTOP` here.** Pinning
+> the compositor turns auto-detection **off** — per connect *and* mid-stream — so the host stops
+> following session switches, and stale session values point it at dead sockets. Forcing a backend
+> is a CI / dedicated-appliance posture, not desktop configuration.
 
 You must be on a **Wayland** session (not X11), and Mutter must be **≥ 48**. See the
 [Configuration reference](/docs/configuration) for every option.

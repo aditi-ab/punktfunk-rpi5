@@ -103,7 +103,22 @@ See [GNOME](/docs/gnome) for the GL/EGL userspace details.
 - KWin must be **≥ 6.5.6** (`kwin_wayland --version`); GNOME **≥ 48**; gamescope **≥ 3.16.22**. See
   [KDE](/docs/kde) for the KWin/Wayland requirement and [gamescope](/docs/gamescope) for the
   gamescope one.
-- Confirm `PUNKTFUNK_COMPOSITOR` in [`host.env`](/docs/configuration) matches your desktop.
+- If [`host.env`](/docs/configuration) sets `PUNKTFUNK_COMPOSITOR`, **remove it** — the host
+  auto-detects the live compositor, and the pin points it at one backend even when a different
+  session is live (it also disables Gaming ↔ Desktop following).
+
+## Session fails right after editing host.env
+
+- Keys are **case-sensitive**: `punktfunk_gamescope_attach=1` sets nothing — use the exact
+  uppercase names.
+- Hardcoded session anchors with the wrong uid (`XDG_RUNTIME_DIR=/run/user/1000` when `id -u`
+  isn't 1000) point the host at another user's PipeWire/D-Bus: audio errors like
+  `pw audio connect … Creation failed`, no capture, and clients reporting the host as
+  unreachable or asleep. **Delete both anchor lines** — a `systemctl --user` service doesn't need
+  them — or fix the uid.
+- `PUNKTFUNK_COMPOSITOR` pins the backend and disables Gaming ↔ Desktop following — remove it on
+  any box that switches sessions.
+- The env file is read at service start: `systemctl --user restart punktfunk-host` after edits.
 
 ## Capture fails: "Session creation inhibited" (GNOME)
 

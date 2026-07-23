@@ -85,11 +85,10 @@ cp /usr/share/punktfunk/host.env.bazzite ~/.config/punktfunk/host.env
 
 The template is deliberately minimal — it does **not** force a compositor, because the host
 auto-detects Gaming Mode (gamescope) vs Desktop (KWin) on every connect and follows the switch
-mid-stream. The only settings that matter are the session anchors (GPU zero-copy is on by default):
+mid-stream. No session anchors are needed either (a user service inherits the right runtime dir).
+The only settings that matter (GPU zero-copy is on by default):
 
 ```sh
-XDG_RUNTIME_DIR=/run/user/1000
-DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
 PUNKTFUNK_VIDEO_SOURCE=virtual
 # GPU zero-copy (dmabuf → CUDA → NVENC) is ON by default; auto-falls back to CPU. Set =0 to force CPU.
 PUNKTFUNK_GAMESCOPE_ATTACH=1    # Gaming Mode = attach to the box's own session (see below)
@@ -99,12 +98,13 @@ PUNKTFUNK_GAMESCOPE_ATTACH=1    # Gaming Mode = attach to the box's own session 
 
 For Gaming Mode there are two models (pick one; the shipped default is **attach**):
 
-- **Attach** (`PUNKTFUNK_GAMESCOPE_ATTACH=1`, the default) — the **box** owns its gamescope session,
-  the host attaches to whatever's live and never tears it down, and the streamed game-mode resolution
-  is the box's own gamescope mode. Switching Desktop ↔ Game is rock-solid.
-- **Managed** (`PUNKTFUNK_GAMESCOPE_MANAGED=1`, and remove the attach line) — the host launches its
-  **own** gamescope at the *client's* exact resolution and refresh. Client-mode-following, but there
-  must be no physical gaming session already running.
+- **Attach** (`PUNKTFUNK_GAMESCOPE_ATTACH=1`, the template's default) — the **box** owns its
+  gamescope session on its own display, and the host attaches to whatever's live without ever
+  tearing it down (a box-owned autologin session is restarted at the client's resolution on a
+  mismatch). Switching Desktop ↔ Game is rock-solid.
+- **Managed** (`PUNKTFUNK_GAMESCOPE_MANAGED=1`, and remove the attach line) — the host takes the
+  box's gamescope over and relaunches it **headless** at the *client's* exact resolution and
+  refresh — Game Mode on the virtual screen — restoring the box on idle.
 
 Full treatment: [Steam / gamescope → Attach vs managed](/docs/gamescope#attach-vs-managed).
 

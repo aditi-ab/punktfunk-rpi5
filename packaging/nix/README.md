@@ -168,14 +168,16 @@ Everything the RPM's `%install` + `%post` do, declaratively:
 
 ### Headless / appliance
 
-Set `autoStart = true`, enable lingering, and pick a backend in `settings`:
+Set `autoStart = true`, enable lingering, and — for a **dedicated single-session appliance** —
+pin a backend in `settings` (pinning `PUNKTFUNK_COMPOSITOR` disables live-session auto-detection,
+so leave it out on any box that switches between a desktop and Game Mode):
 
 ```nix
 services.punktfunk.host = {
   enable = true;
   autoStart = true;
   users = [ "streamer" ];
-  settings = { PUNKTFUNK_COMPOSITOR = "gamescope"; };  # or kwin/mutter/wlroots
+  settings = { PUNKTFUNK_COMPOSITOR = "gamescope"; };  # appliance-only; omit to auto-detect
 };
 users.users.streamer.linger = true;
 # For the gamescope/KWin backends extend the service PATH, e.g.:

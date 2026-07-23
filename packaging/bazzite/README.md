@@ -234,33 +234,25 @@ cp /usr/share/punktfunk/host.env.bazzite ~/.config/punktfunk/host.env
 The Bazzite template (`packaging/bazzite/host.env`) contains:
 
 ```sh
-XDG_RUNTIME_DIR=/run/user/1000
-DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
-
-# gamescope backend: spawned per session, no compositor login required.
-PUNKTFUNK_COMPOSITOR=gamescope
 PUNKTFUNK_VIDEO_SOURCE=virtual
-PUNKTFUNK_GAMESCOPE_APP=steam -gamepadui
-
-# gamescope hosts its own EIS input socket — input lands in the nested session.
-PUNKTFUNK_INPUT_BACKEND=gamescope
 
 # GPU zero-copy capture (dmabuf -> CUDA -> NVENC) is ON by default and auto-falls back to CPU if
 # unavailable. No need to set it. Set to 0 only to force the CPU path.
 # PUNKTFUNK_ZEROCOPY=0
 
 #RUST_LOG=info
+
+# Gaming Mode = ATTACH: the box owns its gamescope session; the host captures + follows it.
+PUNKTFUNK_GAMESCOPE_ATTACH=1
 ```
 
 **What each knob means and why these are the Bazzite defaults:**
 
 | Knob | Value | Meaning |
 |---|---|---|
-| `XDG_RUNTIME_DIR` / `DBUS_SESSION_BUS_ADDRESS` | `…/user/1000` | Session bus / runtime dir. **`1000` assumes your user is UID 1000** — change both if `id -u` says otherwise. |
-| `PUNKTFUNK_COMPOSITOR` | `gamescope` | **The Bazzite default.** The host spawns a **headless gamescope per session** at the client's exact resolution/refresh and captures its PipeWire node — so you need **no graphical desktop login** to stream. Bazzite ships gamescope, so this "just works." |
+| *(no compositor / no anchors)* | — | The host **auto-detects** the live session per connect (Gaming Mode gamescope vs the KDE desktop) and follows switches mid-stream; a `systemctl --user` service inherits the right `XDG_RUNTIME_DIR` and the host derives the bus itself. Pinning `PUNKTFUNK_COMPOSITOR` or hardcoding uid-1000 anchors only breaks this — leave them out. |
 | `PUNKTFUNK_VIDEO_SOURCE` | `virtual` | Create a per-client virtual output at the client's exact WxH@Hz (the flagship "native resolution, no scaling" mode), vs. `portal` which captures an existing monitor. |
-| `PUNKTFUNK_GAMESCOPE_APP` | `steam -gamepadui` | The command launched **inside** the nested gamescope — here, a SteamOS-style couch UI. Set it to whatever you want the session to run. |
-| `PUNKTFUNK_INPUT_BACKEND` | `gamescope` | Inject mouse/keyboard/gamepad into the nested gamescope via its own EIS socket. |
+| `PUNKTFUNK_GAMESCOPE_ATTACH` | `1` | Gaming Mode model: the **box** owns its gamescope session; the host attaches to whatever's live and never tears it down. Swap for `PUNKTFUNK_GAMESCOPE_MANAGED=1` to have the host relaunch the gaming session headless at the **client's** exact mode instead (see the template's comments). |
 | `PUNKTFUNK_ZEROCOPY` | `on` *(default)* | GPU zero-copy capture (dmabuf → CUDA → NVENC), on by default. Falls back to CPU automatically if unavailable; set `0` to force the CPU path. |
 | `RUST_LOG` | (commented) | Uncomment `RUST_LOG=info` for verbose logs while debugging. |
 
@@ -268,16 +260,14 @@ PUNKTFUNK_INPUT_BACKEND=gamescope
 games a virtual Sony DualSense (lightbar, adaptive triggers, touchpad, motion) instead of the
 default X-Box-360 pad. The feedback flows back to a real DualSense on the client.
 
-**Alternative — drive the full Plasma/GNOME desktop** instead of a nested gamescope (per the
-template's footer comment): switch to `PUNKTFUNK_COMPOSITOR=kwin` and
-`PUNKTFUNK_INPUT_BACKEND=libei`, and run the host **inside** a KDE session with `WAYLAND_DISPLAY` /
-`XDG_CURRENT_DESKTOP` set. The full knob list (FEC %, per-stage timing, etc.) is in
-`scripts/host.env.example` / `/usr/share/punktfunk/host.env.example`.
+**The Plasma desktop needs no extra config:** the same auto-detection streams the KDE Desktop
+session whenever that's what's live — no compositor pin, no `WAYLAND_DISPLAY` /
+`XDG_CURRENT_DESKTOP` (the host retargets those per connect). The full knob list (FEC %, per-stage
+timing, etc.) is in `scripts/host.env.example` / `/usr/share/punktfunk/host.env.example`.
 
-> The gamescope default is what makes Bazzite the easy path: it's a **headless, per-session**
-> compositor — no desktop login, no display manager, no `--drm` scanout. You don't need any of the
-> headless-KDE bring-up scripts (`scripts/headless/run-headless-kde.sh`) on Bazzite unless you
-> deliberately switch to the KWin backend.
+> Auto-detection is what makes Bazzite the easy path: the host follows the box between Gaming Mode
+> and the Desktop — even mid-stream — with a one-line config. You don't need any of the
+> headless-KDE bring-up scripts (`scripts/headless/run-headless-kde.sh`) on Bazzite.
 
 ---
 
@@ -474,8 +464,11 @@ desktop viewer.
   NVIDIA driver. The code falls back to CPU automatically; check the log for the fallback line and
   verify the `-nvidia` image / driver is healthy.
 
-- **Wrong UID in `host.env`.** `XDG_RUNTIME_DIR=/run/user/1000` and the bus path assume UID 1000. Run
-  `id -u`; if it's different, fix both lines or the host can't reach your session's PipeWire/D-Bus.
+- **Session anchors in `host.env`.** The template no longer sets `XDG_RUNTIME_DIR` /
+  `DBUS_SESSION_BUS_ADDRESS` — a `systemctl --user` service inherits the right values. If an older
+  config hardcodes them with the wrong uid (`/run/user/1000` when `id -u` isn't 1000), the host
+  points at another user's PipeWire/D-Bus and everything fails (`pw audio connect … Creation
+  failed`, no capture). Delete both lines, or fix the uid.
 
 - **Service `ExecStart` points at a missing path in `$HOME`.** The dev unit references
   `%h/punktfunk/target/release/...`. The RPM binary is `/usr/bin/punktfunk-host`. Override

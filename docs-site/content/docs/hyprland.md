@@ -19,14 +19,19 @@ or [Fedora](/docs/fedora).
 
 ## host.env
 
-The host auto-detects a Hyprland session, so you usually need nothing here. To force the backend, set
-these in `~/.config/punktfunk/host.env`:
+The host auto-detects a Hyprland session, so the starter `~/.config/punktfunk/host.env` is one line:
+
+```ini
+PUNKTFUNK_VIDEO_SOURCE=virtual
+# GPU zero-copy capture→encode is ON by default; auto-falls back to CPU. Set PUNKTFUNK_ZEROCOPY=0 to force CPU.
+```
+
+To force the backend (CI/testing — note that pinning turns live-session auto-detection **off**, so
+the host stops following session switches):
 
 ```ini
 PUNKTFUNK_COMPOSITOR=hyprland
 PUNKTFUNK_INPUT_BACKEND=wlr
-PUNKTFUNK_VIDEO_SOURCE=virtual
-# GPU zero-copy capture→encode is ON by default; auto-falls back to CPU. Set PUNKTFUNK_ZEROCOPY=0 to force CPU.
 ```
 
 See [Configuration](/docs/configuration) for the full reference.

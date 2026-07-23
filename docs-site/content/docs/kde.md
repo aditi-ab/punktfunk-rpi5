@@ -13,20 +13,30 @@ installed — see [Ubuntu](/docs/ubuntu), [Fedora](/docs/fedora), [Arch](/docs/a
 
 ## host.env
 
-A KDE starter `~/.config/punktfunk/host.env`:
+The host auto-detects your KWin session on every connect — including a box that switches between
+the Plasma desktop and Steam Game Mode — so the starter `~/.config/punktfunk/host.env` is one line:
 
 ```ini
-WAYLAND_DISPLAY=wayland-0
-XDG_CURRENT_DESKTOP=KDE
-PUNKTFUNK_COMPOSITOR=kwin
+# ~/.config/punktfunk/host.env  (keys are case-sensitive)
 PUNKTFUNK_VIDEO_SOURCE=virtual
 # GPU zero-copy (dmabuf → CUDA → NVENC) is ON by default; auto-falls back to CPU. Set =0 to force CPU.
-PUNKTFUNK_INPUT_BACKEND=libei
 ```
 
-The host auto-detects the running compositor on every connect, so most of this is optional — the
-values above are just what it resolves to on a KWin session. See the
-[Configuration reference](/docs/configuration) for every option.
+> **Don't set `PUNKTFUNK_COMPOSITOR`, `WAYLAND_DISPLAY`, or `XDG_CURRENT_DESKTOP` here.** Pinning
+> the compositor turns auto-detection **off** — per connect *and* mid-stream — so a switch to Game
+> Mode then kills the stream instead of being followed, and stale session values point the host at
+> dead sockets. Forcing a backend is for CI and dedicated appliances (the
+> [headless session](#headless-session) below ships a `host.env.kde` that pins on purpose).
+
+If the box switches between the desktop and Game Mode, also enable lingering — the host is a user
+service, and without linger the logout moment of a session switch tears it (and PipeWire) down
+mid-stream:
+
+```sh
+sudo loginctl enable-linger "$USER"
+```
+
+See the [Configuration reference](/docs/configuration) for every option.
 
 ## Use a Wayland session
 

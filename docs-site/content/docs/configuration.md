@@ -4,7 +4,8 @@ description: Every host.env setting and PUNKTFUNK_* environment variable — com
 ---
 
 The host reads its settings from **`~/.config/punktfunk/host.env`** (a simple `KEY=value` file, `#`
-starts a comment). On Windows the service reads **`%ProgramData%\punktfunk\host.env`** instead. Your
+starts a comment; keys are **case-sensitive** — `punktfunk_compositor` sets nothing, use the exact
+uppercase names). On Windows the service reads **`%ProgramData%\punktfunk\host.env`** instead. Your
 [setup guide](/docs/requirements) gives you a starting `host.env` for your desktop; this page is the
 full reference for every setting.
 
@@ -16,25 +17,24 @@ full reference for every setting.
 
 ## Session anchors
 
-These tell the host which desktop session to attach to. Your setup guide sets them for you; they're
-required when the host runs outside your interactive session (e.g. as a service).
+**Leave these unset on a normal setup.** Running as a `systemctl --user` service the host inherits
+the correct `XDG_RUNTIME_DIR` from systemd, derives the session bus from it, and **rewrites
+`WAYLAND_DISPLAY` / `XDG_CURRENT_DESKTOP` / `XDG_RUNTIME_DIR` / `DBUS_SESSION_BUS_ADDRESS` on every
+connect** to follow the active session (Gaming ↔ Desktop) — a value written here can only be
+redundant or stale.
 
-| Setting | What it does |
+| Setting | When to set it |
 |---|---|
-| `XDG_RUNTIME_DIR` | Your session's runtime dir (e.g. `/run/user/1000`). Always needed for a service. |
-| `DBUS_SESSION_BUS_ADDRESS` | Your session bus (e.g. `unix:path=/run/user/1000/bus`). Always needed for a service. |
-| `WAYLAND_DISPLAY` | The Wayland socket of your session (`wayland-0` for a normal desktop, `wayland-kde` for the headless-KDE unit). |
-| `XDG_CURRENT_DESKTOP` | Your desktop (`GNOME`, `KDE`). |
-
-On Linux the host **rewrites `WAYLAND_DISPLAY` / `XDG_CURRENT_DESKTOP` / `XDG_RUNTIME_DIR` /
-`DBUS_SESSION_BUS_ADDRESS` on every connect** to follow the active session (Gaming ↔ Desktop). Only
-`XDG_RUNTIME_DIR` and `DBUS_SESSION_BUS_ADDRESS` need to be pinned as trustworthy anchors.
+| `XDG_RUNTIME_DIR` | Only when the host runs **outside** a user service (ssh, cron): `/run/user/<your uid>` — check `id -u`. A copy-pasted `1000` on a box where that isn't your uid points the host at another user's (nonexistent) PipeWire/D-Bus, and **everything** fails (audio `Creation failed`, no capture, clients report the host unreachable). |
+| `DBUS_SESSION_BUS_ADDRESS` | Same cases only: `unix:path=/run/user/<your uid>/bus`. Otherwise derived automatically. |
+| `WAYLAND_DISPLAY` | Only the dedicated [headless-KDE appliance](/docs/kde#headless-session) (`wayland-kde`, set by its shipped `host.env.kde`). |
+| `XDG_CURRENT_DESKTOP` | Same — appliance-only. |
 
 ## Core
 
 | Setting | Values | Meaning |
 |---|---|---|
-| `PUNKTFUNK_COMPOSITOR` | `kwin` · `mutter` · `gamescope` · `wlroots` · `hyprland` (aliases: `kde`/`plasma`, `gnome`, `sway`/`wlr`) | Which backend creates the virtual display. `wlroots` is sway/River; `hyprland` is its own backend. **Leave unset to auto-detect;** set only to force one. |
+| `PUNKTFUNK_COMPOSITOR` | `kwin` · `mutter` · `gamescope` · `wlroots` · `hyprland` (aliases: `kde`/`plasma`, `gnome`, `sway`/`wlr`) | Which backend creates the virtual display. `wlroots` is sway/River; `hyprland` is its own backend. **Leave unset.** Setting it **pins** the backend and turns session-following **off** — per connect *and* mid-stream, so a Desktop ↔ Gaming switch kills the stream instead of being followed. For CI/tests and dedicated single-session appliances only. |
 | `PUNKTFUNK_VIDEO_SOURCE` | `virtual` · `portal` | `virtual` creates a per-client display at the client's exact mode (the normal choice). `portal` captures an existing monitor instead. |
 | `PUNKTFUNK_ZEROCOPY` | `1` · `0` *(default on)* | GPU zero-copy capture→encode (dmabuf → CUDA → NVENC, or D3D11 on Windows). **On by default** — no need to set it; it falls back to a CPU path automatically. Set `0` to force the CPU path. One exception: Windows **Intel/QSV** keeps the CPU path by default until zero-copy is validated on Intel hardware — set `1` to try it there. |
 | `PUNKTFUNK_INPUT_BACKEND` | `libei` · `gamescope` · `wlr` · `uinput` | How input is injected. `libei` for GNOME/KDE, `gamescope` for Bazzite/gamescope, `wlr` for Sway/wlroots **and Hyprland**. Auto-detected with the compositor. |
@@ -53,8 +53,8 @@ the full picture (and [Bazzite](/docs/bazzite) for that distro's specifics).
 
 | Setting | Values | Meaning |
 |---|---|---|
-| `PUNKTFUNK_GAMESCOPE_ATTACH` | `1` | **Attach** model: the box owns its gamescope session (you switch Gaming ↔ Desktop with the Steam UI); the host just captures whatever's live and never tears it down. Rock-solid; streamed resolution is the box's gamescope mode. |
-| `PUNKTFUNK_GAMESCOPE_MANAGED` | `1` | **Managed** model: the host tears the box's gamescope down on connect and launches its **own** at the *client's* exact resolution, restoring on idle. Client-mode-following, but doesn't coexist with a box-owned game-mode session. |
+| `PUNKTFUNK_GAMESCOPE_ATTACH` | `1` | **Attach** model: the box owns its gamescope session on its own display (you switch Gaming ↔ Desktop with the Steam UI); the host just captures whatever's live and never tears it down. A box-owned autologin session is restarted at the client's resolution on a mismatch; a foreign/bare gamescope streams at its own mode. |
+| `PUNKTFUNK_GAMESCOPE_MANAGED` | `1` | **Managed** model (the default where session infra is detected): the host takes the box's gamescope over and relaunches it **headless** at the *client's* exact resolution — Game Mode on the virtual screen — restoring the box on idle. |
 | `PUNKTFUNK_GAMESCOPE_SESSION` | `steam` | The host owns a `gamescope-session-plus` (Steam) session at the client's mode (headless appliance; no physical session running). |
 | `PUNKTFUNK_GAMESCOPE_NODE` | `auto` · node id | Discover + capture a **running** gamescope's PipeWire node at a fixed mode. Do **not** combine with `SESSION`. |
 | `PUNKTFUNK_GAMESCOPE_APP` | command | For an ad-hoc bare-gamescope session, the nested command to run (e.g. `vkcube`). |
