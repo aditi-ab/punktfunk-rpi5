@@ -355,11 +355,19 @@ class MainActivity : ComponentActivity() {
                 return true
             }
             when (event.keyCode) {
-                // A mouse back/forward button whose BUTTON_* press went unconsumed makes the
-                // framework synthesize a FALLBACK BACK — the button already went over the wire
-                // as X1/X2, and it must never yank the user out of the stream.
-                KeyEvent.KEYCODE_BACK ->
-                    if (event.flags and KeyEvent.FLAG_FALLBACK != 0) return true
+                // A mouse's back/forward buttons already go over the wire as X1/X2 via their
+                // BUTTON_* motion edges — but Android ALSO delivers them as key events: the input
+                // reader synthesizes KEYCODE_BACK/FORWARD (stamped SOURCE_MOUSE) unconditionally,
+                // and a view-level FALLBACK BACK appears when the BUTTON_* press goes unconsumed.
+                // Swallow every such duplicate or it doubles as Android navigation and yanks the
+                // user out of the stream. A remote/keyboard BACK is never mouse-sourced, so it
+                // still falls through to the BackHandler and exits.
+                KeyEvent.KEYCODE_BACK, KeyEvent.KEYCODE_FORWARD ->
+                    if (event.isFromSource(InputDevice.SOURCE_MOUSE) ||
+                        event.flags and KeyEvent.FLAG_FALLBACK != 0
+                    ) {
+                        return true
+                    }
                 // Leave these to the system even while streaming.
                 // (BACK above → BackHandler leaves the stream.)
                 KeyEvent.KEYCODE_VOLUME_UP,

@@ -13,6 +13,7 @@ import android.net.wifi.WifiManager
 import android.os.Build
 import android.text.InputType
 import android.util.Log
+import android.view.KeyEvent
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.view.View
@@ -559,9 +560,15 @@ private class KeyCaptureView(context: Context) : View(context) {
     var imeShown = false
         private set
 
-    override fun onCheckIsTextEditor(): Boolean = true
+    override fun onCheckIsTextEditor(): Boolean = imeShown
 
-    override fun onCreateInputConnection(outAttrs: EditorInfo): InputConnection {
+    override fun onCreateInputConnection(outAttrs: EditorInfo): InputConnection? {
+        // Only an editor while the user has SUMMONED the keyboard (gesture / remote toggle).
+        // This view holds focus for the whole stream (it's the capture anchor), and with an
+        // always-live editable connection the IME counts input as active on it — TV IMEs then
+        // pop their UI the moment a PHYSICAL keyboard key arrives. With no connection, hardware
+        // typing stays on the raw dispatchKeyEvent → Keymap → wire path and no keyboard appears.
+        if (!imeShown) return null
         outAttrs.imeOptions = EditorInfo.IME_FLAG_NO_EXTRACT_UI or
             EditorInfo.IME_FLAG_NO_FULLSCREEN or EditorInfo.IME_FLAG_NO_ENTER_ACTION
         return if (textHandle != 0L) {
@@ -580,10 +587,28 @@ private class KeyCaptureView(context: Context) : View(context) {
         imeShown = show
         if (show) {
             requestFocus()
+            // The view may already be focused from a null-connection state — restart so the
+            // framework re-queries onCreateInputConnection with the gate now open.
+            imm.restartInput(this)
             imm.showSoftInput(this, 0)
         } else {
             imm.hideSoftInputFromWindow(windowToken, 0)
+            imm.restartInput(this) // gate closed — drop the editable connection
         }
+    }
+
+    /**
+     * BACK while the summoned keyboard is up: the IME consumes it pre-IME to dismiss itself, so
+     * [setImeVisible] never hears about it — sync the gate here or a stale `imeShown` leaves the
+     * editable connection live and physical typing re-pops the keyboard.
+     */
+    override fun onKeyPreIme(keyCode: Int, event: KeyEvent): Boolean {
+        if (keyCode == KeyEvent.KEYCODE_BACK && imeShown && event.action == KeyEvent.ACTION_UP) {
+            imeShown = false
+            (context.getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager)
+                ?.restartInput(this)
+        }
+        return super.onKeyPreIme(keyCode, event)
     }
 }
 
