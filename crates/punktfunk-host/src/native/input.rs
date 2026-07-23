@@ -523,6 +523,87 @@ pub(super) enum ClientInput {
     Event(InputEvent),
     /// The 0xCC plane: touchpad contacts + motion samples.
     Rich(punktfunk_core::quic::RichInput),
+    /// The 0xCC/0x05 stylus plane: state-full pen sample batches, diffed into a per-session
+    /// virtual tablet (design/pen-tablet-input.md).
+    Pen(punktfunk_core::quic::PenBatch),
+}
+
+/// The per-session stylus lane: the core [`PenTracker`](punktfunk_core::quic::PenTracker)
+/// diffs state-full batches into transitions, applied to a lazily-created uinput tablet
+/// ([`crate::inject::pen::VirtualPen`]) — a session that never draws never creates a device,
+/// and the device dies with the session (kernel removes the tablet, apps see the pen unplug).
+struct PenSession {
+    tracker: punktfunk_core::quic::PenTracker,
+    dev: Option<crate::inject::pen::VirtualPen>,
+    /// Creation failed once — don't retry per batch (240 Hz of ioctl churn + log spam); the
+    /// tracker still consumes batches so its state stays coherent.
+    create_failed: bool,
+    last_rx: std::time::Instant,
+    /// Reused transition buffer (a batch yields at most a few).
+    out: Vec<punktfunk_core::quic::PenTransition>,
+}
+
+impl PenSession {
+    fn new() -> PenSession {
+        PenSession {
+            tracker: punktfunk_core::quic::PenTracker::default(),
+            dev: None,
+            create_failed: false,
+            last_rx: std::time::Instant::now(),
+            out: Vec::new(),
+        }
+    }
+
+    fn apply(&mut self, batch: &punktfunk_core::quic::PenBatch) {
+        self.last_rx = std::time::Instant::now();
+        if self.dev.is_none() && !self.create_failed {
+            match crate::inject::pen::VirtualPen::create() {
+                Ok(d) => self.dev = Some(d),
+                Err(e) => {
+                    // Shouldn't happen when the Welcome advertised HOST_CAP_PEN off the same
+                    // uinput probe — but permissions can change between then and first ink.
+                    self.create_failed = true;
+                    tracing::warn!(
+                        error = %format!("{e:#}"),
+                        "pen: virtual tablet creation failed — dropping pen input this session"
+                    );
+                }
+            }
+        }
+        self.out.clear();
+        self.tracker.apply(batch, &mut self.out);
+        if let Some(dev) = self.dev.as_mut() {
+            dev.apply_batch(&self.out);
+        }
+    }
+
+    /// The dead-client failsafe ([`PEN_TOUCH_TIMEOUT_MS`](punktfunk_core::quic::PEN_TOUCH_TIMEOUT_MS)):
+    /// clients repeat the last sample (≤100 ms) while the pen is in range — a stationary
+    /// touching pen included — so silence past the timeout means the client is gone, and the
+    /// host must not leave the stroke inked-down. Called every input-loop wake; the loop caps
+    /// its recv timeout at 100 ms while the pen is active so this actually gets to run.
+    fn check_timeout(&mut self) {
+        if self.tracker.is_active()
+            && self.last_rx.elapsed().as_millis()
+                >= punktfunk_core::quic::PEN_TOUCH_TIMEOUT_MS as u128
+        {
+            tracing::debug!("pen: sample stream went silent — force-releasing the stroke");
+            self.release_all();
+        }
+    }
+
+    /// Lift buttons/tip/proximity in order (a no-op when idle). Session end + the timeout.
+    fn release_all(&mut self) {
+        self.out.clear();
+        self.tracker.force_release(&mut self.out);
+        if let Some(dev) = self.dev.as_mut() {
+            dev.apply_batch(&self.out);
+        }
+    }
+
+    fn active(&self) -> bool {
+        self.tracker.is_active()
+    }
 }
 
 /// Default TTL stamped on a non-zero rumble envelope (0xCA v2): how long the client renders the
@@ -640,8 +721,17 @@ pub(super) fn input_thread(
     const MAX_HELD: usize = 256;
     let mut held_buttons: std::collections::HashSet<u32> = std::collections::HashSet::new();
     let mut held_keys: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut pen = PenSession::new();
     loop {
-        match rx.recv_timeout(pads.feedback_poll_interval()) {
+        // While a pen is in range/touching, wake at least every 100 ms so the stroke failsafe
+        // (PenSession::check_timeout) has real granularity against its 200 ms deadline.
+        let poll = if pen.active() {
+            pads.feedback_poll_interval()
+                .min(std::time::Duration::from_millis(100))
+        } else {
+            pads.feedback_poll_interval()
+        };
+        match rx.recv_timeout(poll) {
             // Rich input (touchpad / motion) is applied the moment it arrives; the single channel
             // wakes for gyro samples instead of making them wait out the feedback poll interval.
             Ok(ClientInput::Rich(rich)) => {
@@ -673,6 +763,9 @@ pub(super) fn input_thread(
                 }
                 pads.apply_rich(rich);
             }
+            // Stylus batches apply on arrival like rich input — the tracker synthesizes the
+            // transitions, the lazily-created virtual tablet renders them.
+            Ok(ClientInput::Pen(batch)) => pen.apply(&batch),
             Ok(ClientInput::Event(ev)) => match ev.kind {
                 InputKind::GamepadButton | InputKind::GamepadAxis => {
                     // A bad index / unknown axis just doesn't update a pad — fall through (no
@@ -774,6 +867,9 @@ pub(super) fn input_thread(
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
+        // Pen stroke failsafe: a silent sample stream past the deadline force-releases (see
+        // PenSession::check_timeout — clients heartbeat while the pen is down).
+        pen.check_timeout();
         // Service feedback every iteration (≤1 ms for Triton, ≤4 ms otherwise; games block on
         // EVIOCSFF, and HID handshakes must be answered promptly). Rumble → the universal 0xCA
         // plane; rich/raw HID feedback → 0xCD.
@@ -863,6 +959,9 @@ pub(super) fn input_thread(
             }
         }
     }
+    // Pen: lift anything still inked (buttons → tip → proximity), then the device dies with
+    // this thread (VirtualPen::drop → UI_DEV_DESTROY; apps see the tablet unplug).
+    pen.release_all();
     // Session ended (client gone). Release anything still held through the host-lifetime injector —
     // its EIS connection (and any implicit grab Mutter holds for our pressed button) outlives this
     // session, so without this a button pressed at disconnect stays latched and breaks clicks for

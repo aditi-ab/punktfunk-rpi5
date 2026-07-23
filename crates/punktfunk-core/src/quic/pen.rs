@@ -56,11 +56,13 @@ pub const PEN_SAMPLE_WIRE_LEN: usize = 21;
 /// `[0xCC][0x05][flags][count][u16 seq LE]` — bytes before the first sample.
 const PEN_HEADER_LEN: usize = 6;
 
-/// Host-side failsafe (design/pen-tablet-input.md §2): a tracker still touching after this many
-/// ms without a sample force-releases ([`PenTracker::force_release`]) — a client that died
-/// mid-stroke must not leave the host's virtual pen inked-down forever. Far above any real
-/// send cadence (a touching pen streams samples continuously), so it never fires on a live
-/// slow stroke.
+/// Host-side failsafe (design/pen-tablet-input.md §2): a tracker still in range after this
+/// many ms without a sample force-releases ([`PenTracker::force_release`]) — a client that
+/// died mid-stroke must not leave the host's virtual pen inked-down forever. This makes the
+/// **client heartbeat a wire contract**: capture APIs only fire on change, so a stationary
+/// pen is naturally silent — senders MUST repeat the last sample at least every ~100 ms while
+/// the pen is in range or touching (it re-decodes as pure Motion, harmless), keeping a live
+/// stationary stroke two heartbeats clear of the deadline.
 pub const PEN_TOUCH_TIMEOUT_MS: u32 = 200;
 
 /// Which end of the stylus (or which mapped mode) a sample describes. A tool *switch* while in

@@ -1094,11 +1094,13 @@
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Host-side failsafe (design/pen-tablet-input.md §2): a tracker still touching after this many
-// ms without a sample force-releases ([`PenTracker::force_release`]) — a client that died
-// mid-stroke must not leave the host's virtual pen inked-down forever. Far above any real
-// send cadence (a touching pen streams samples continuously), so it never fires on a live
-// slow stroke.
+// Host-side failsafe (design/pen-tablet-input.md §2): a tracker still in range after this
+// many ms without a sample force-releases ([`PenTracker::force_release`]) — a client that
+// died mid-stroke must not leave the host's virtual pen inked-down forever. This makes the
+// **client heartbeat a wire contract**: capture APIs only fire on change, so a stationary
+// pen is naturally silent — senders MUST repeat the last sample at least every ~100 ms while
+// the pen is in range or touching (it re-decodes as pure Motion, harmless), keeping a live
+// stationary stroke two heartbeats clear of the deadline.
 #define PEN_TOUCH_TIMEOUT_MS 200
 #endif
 

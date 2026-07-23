@@ -494,6 +494,15 @@ pub(super) async fn negotiate(
                 punktfunk_core::quic::HOST_CAP_CURSOR
             } else {
                 0
+            }
+            // Full-fidelity stylus (0xCC/0x05 pen batches → the per-session uinput tablet):
+            // Linux with /dev/uinput access, minus the PUNKTFUNK_PEN=0 kill-switch. Clients
+            // without the bit keep folding pen into touch/pointer (and NativeClient::send_pen
+            // refuses toward us if we don't set it).
+            | if crate::inject::pen_supported() {
+                punktfunk_core::quic::HOST_CAP_PEN
+            } else {
+                0
             },
         // The negotiated session AEAD (resolved above) + its 32-byte key toward a ChaCha
         // client; toward everyone else cipher 0 keeps the Welcome byte-identical to the

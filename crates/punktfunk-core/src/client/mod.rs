@@ -1091,6 +1091,11 @@ impl NativeClient {
     /// Best-effort like every datagram: a lost batch self-heals on the next one (the samples
     /// carry full state, the host diffs — see [`crate::quic::PenTracker`]).
     ///
+    /// **Heartbeat contract**: while the pen is in range or touching, repeat the last sample
+    /// at least every ~100 ms even when nothing changed (capture APIs are silent for a
+    /// stationary pen) — the host force-releases the stroke after
+    /// [`crate::quic::PEN_TOUCH_TIMEOUT_MS`] of silence as its dead-client failsafe.
+    ///
     /// Requires the host to have advertised [`crate::quic::HOST_CAP_PEN`]; toward an older
     /// host this returns `Unsupported` (embedders keep their pen-as-touch fallback instead of
     /// spraying 240 Hz datagrams the host drops unread).

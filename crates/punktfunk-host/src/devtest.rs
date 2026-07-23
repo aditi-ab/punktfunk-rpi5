@@ -8,6 +8,75 @@
 use anyhow::Context;
 use anyhow::Result;
 
+/// Draw a scripted stylus stroke through the REAL pen chain — wire-shaped samples → the core
+/// [`PenTracker`](punktfunk_core::quic::PenTracker) → the "Punktfunk Pen" uinput tablet — so
+/// full-fidelity pen injection is validated without any client (design/pen-tablet-input.md P1):
+/// hover in from the left, tip down, a sine stroke across the mapped output with a pressure
+/// ramp + tilt sweep, tip up, hover out. Observe in Krita/GIMP with a pressure brush, or
+/// `sudo libinput debug-events` (expect `TABLET_TOOL_PROXIMITY/TIP/AXIS`).
+#[cfg(target_os = "linux")]
+pub fn pen_test() -> Result<()> {
+    use punktfunk_core::quic::{
+        PenBatch, PenSample, PenTracker, PenTransition, PEN_IN_RANGE, PEN_TOUCHING,
+    };
+    use std::time::Duration;
+
+    let mut dev = crate::inject::pen::VirtualPen::create()?;
+    let mut tracker = PenTracker::default();
+    let mut out: Vec<PenTransition> = Vec::new();
+    // Compositors need a beat to enumerate the new evdev node before events count.
+    std::thread::sleep(Duration::from_secs(2));
+
+    let mut seq = 0u16;
+    let mut send = |tracker: &mut PenTracker, out: &mut Vec<PenTransition>, s: PenSample| {
+        out.clear();
+        tracker.apply(&PenBatch::new(seq, &[s]), out);
+        seq = seq.wrapping_add(1);
+        dev.apply_batch(out);
+    };
+
+    tracing::info!("pen-test: hover in, then a 3 s pressure-ramped sine stroke");
+    let hover = |x: f32| PenSample {
+        state: PEN_IN_RANGE,
+        x,
+        y: 0.5,
+        distance: 300,
+        ..Default::default()
+    };
+    for i in 0..20 {
+        send(&mut tracker, &mut out, hover(0.05 + i as f32 * 0.005));
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    const STEPS: u32 = 360;
+    for i in 0..=STEPS {
+        let t = i as f32 / STEPS as f32;
+        send(
+            &mut tracker,
+            &mut out,
+            PenSample {
+                state: PEN_IN_RANGE | PEN_TOUCHING,
+                x: 0.15 + 0.7 * t,
+                y: 0.5 + 0.2 * (t * std::f32::consts::TAU * 2.0).sin(),
+                // Ramp 10 % → 100 % so a pressure brush visibly widens along the stroke.
+                pressure: (6553.0 + 58982.0 * t) as u16,
+                distance: 0,
+                tilt_deg: 25 + (20.0 * t) as u8,
+                azimuth_deg: ((90.0 + 180.0 * t) as u16) % 360,
+                roll_deg: ((360.0 * t) as u16) % 360,
+                ..Default::default()
+            },
+        );
+        std::thread::sleep(Duration::from_millis(8));
+    }
+    for i in 0..10 {
+        send(&mut tracker, &mut out, hover(0.85 + i as f32 * 0.005));
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    send(&mut tracker, &mut out, PenSample::default()); // state 0 = out of range
+    tracing::info!("pen-test: done (stroke drawn, pen out of range) — device destroyed on exit");
+    Ok(())
+}
+
 /// Inject a scripted mouse + keyboard pattern through the session's input backend (libei on
 /// KWin/GNOME, wlr on Sway). Lets us validate input injection without a Moonlight client.
 #[cfg(target_os = "linux")]

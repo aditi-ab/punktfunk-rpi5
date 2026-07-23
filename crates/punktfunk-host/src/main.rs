@@ -307,6 +307,11 @@ fn real_main() -> Result<()> {
         // Standalone input-injection smoke test (no client needed): open the session's input
         // backend and inject a scripted mouse/keyboard pattern. Watch a focused app / `wev`.
         Some("input-test") => devtest::input_test(),
+        // Standalone stylus smoke test (no client needed): create the "Punktfunk Pen" virtual
+        // tablet and draw a pressure-ramped stroke through the real tracker→uinput chain.
+        // Watch in Krita/GIMP (pressure brush) or `libinput debug-events`.
+        #[cfg(target_os = "linux")]
+        Some("pen-test") => devtest::pen_test(),
         // Zero-copy FFI/GPU probe: init the EGL importer + CUDA context (no capture needed).
         #[cfg(target_os = "linux")]
         Some("zerocopy-probe") => zerocopy::probe(),

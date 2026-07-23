@@ -197,6 +197,38 @@ pub fn text_input_supported() -> bool {
     false
 }
 
+/// Whether this host can inject full-fidelity stylus input (`HOST_CAP_PEN` —
+/// design/pen-tablet-input.md): Linux only, via the [`pen::VirtualPen`] uinput tablet, so the
+/// probe is "can we open /dev/uinput" (the same permission the virtual gamepads need) plus the
+/// `PUNKTFUNK_PEN=0` operator kill-switch. Consulted at Welcome time; clients without the bit
+/// keep folding pen into touch/pointer. Windows PT_PEN synthetic pointers are the design's P3.
+#[cfg(target_os = "linux")]
+pub fn pen_supported() -> bool {
+    if std::env::var("PUNKTFUNK_PEN").as_deref() == Ok("0") {
+        return false;
+    }
+    // SAFETY: 'static NUL-terminated path literal; `open` returns a fresh fd (or -1) and
+    // retains nothing.
+    let fd = unsafe {
+        libc::open(
+            c"/dev/uinput".as_ptr(),
+            libc::O_RDWR | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return false;
+    }
+    // SAFETY: `fd >= 0` is the fd opened above, owned by no one else; closed exactly once here.
+    unsafe { libc::close(fd) };
+    true
+}
+
+/// See the Linux variant — no pen injection off Linux yet (Windows PT_PEN is design P3).
+#[cfg(not(target_os = "linux"))]
+pub fn pen_supported() -> bool {
+    false
+}
+
 #[path = "inject/service.rs"]
 mod service;
 pub use service::InjectorService;
@@ -360,6 +392,24 @@ pub mod gamepad {
         }
         pub fn handle(&mut self, _ev: &punktfunk_core::input::GamepadEvent) {}
         pub fn pump_rumble(&mut self, _send: impl FnMut(u16, u16, u16)) {}
+    }
+}
+/// Linux: the "Punktfunk Pen" uinput virtual tablet (design/pen-tablet-input.md §5) — the
+/// per-session stylus device the native pen plane injects through.
+#[cfg(target_os = "linux")]
+#[path = "inject/linux/pen.rs"]
+pub mod pen;
+/// Stub — pen injection needs the Linux uinput tablet (Windows PT_PEN is design P3);
+/// `pen_supported()` is false here, so no host advertises the cap and no batches arrive.
+#[cfg(not(target_os = "linux"))]
+pub mod pen {
+    use anyhow::{bail, Result};
+    pub struct VirtualPen;
+    impl VirtualPen {
+        pub fn create() -> Result<VirtualPen> {
+            bail!("no pen injection backend on this platform")
+        }
+        pub fn apply_batch(&mut self, _transitions: &[punktfunk_core::quic::PenTransition]) {}
     }
 }
 #[cfg(target_os = "linux")]

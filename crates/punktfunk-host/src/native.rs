@@ -1066,6 +1066,14 @@ async fn serve_session(
                 if rich_tx.send(ClientInput::Rich(rich)).is_err() {
                     break;
                 }
+            } else if let Some(pen) = punktfunk_core::quic::PenBatch::decode(&d) {
+                // 0xCC kind 0x05 — the stylus plane (RichInput::decode returns None for it by
+                // design; see punktfunk_core::quic::pen). Routed to the same input thread,
+                // which owns the per-session tracker + virtual tablet.
+                rich_count += 1;
+                if rich_tx.send(ClientInput::Pen(pen)).is_err() {
+                    break;
+                }
             } else if let Some(mut ev) = InputEvent::decode(&d) {
                 input_count += 1;
                 // Wire hygiene: KEY_FLAG_SEMANTIC_VK is an in-process tag (GameStream ingest

@@ -466,8 +466,12 @@ punktfunk_connection_send_pen(c, &s, 1);
 ```
 
 While hovering, send `PUNKTFUNK_PEN_IN_RANGE` samples (with `distance` if you have it); when the
-pen leaves range, send one final sample with `state = 0` so the host releases proximity —
-though a host-side timeout releases a vanished client's stroke regardless.
+pen leaves range, send one final sample with `state = 0` so the host releases proximity.
+
+**Heartbeat**: while the pen is in range or touching, repeat the last sample at least every
+~100 ms even when nothing changed — pen capture APIs are silent for a stationary pen, and the
+host force-releases the stroke after 200 ms without samples (its dead-client failsafe). Run a
+timer alongside your touch callbacks.
 
 ---
 
