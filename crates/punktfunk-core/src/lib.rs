@@ -106,7 +106,10 @@ pub use stats::Stats;
 /// (design/remote-desktop-sweep.md §8): the client's mouse-model chord tells the host who
 /// renders the pointer. Additive; rides the existing control stream (a new message TYPE, which
 /// pre-§8 hosts ignore), so [`WIRE_VERSION`] is unchanged.
-pub const ABI_VERSION: u32 = 12;
+/// v13: added `punktfunk_connection_send_pen` — the stylus wire plane
+/// (design/pen-tablet-input.md): a client sends `RICH_PEN` sample batches once the host
+/// advertises `HOST_CAP_PEN`. Additive and capability-gated, so [`WIRE_VERSION`] is unchanged.
+pub const ABI_VERSION: u32 = 13;
 
 /// The punktfunk/1 **wire** version — what `Hello`/`Welcome` carry and hosts equality-check.
 /// Deliberately its own constant: [`ABI_VERSION`] tracks the embeddable **C surface**
