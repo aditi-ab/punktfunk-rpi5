@@ -196,6 +196,11 @@ final class SessionModel: ObservableObject {
     /// Bounded auto-disconnect for a backgrounded keep-alive session. Fires on `.main`.
     private var backgroundTimer: DispatchSourceTimer?
 
+    /// Holds off display sleep (and, on macOS, the screen saver) for the life of a session —
+    /// nothing about watching a stream looks like user activity to the OS, least of all a
+    /// controller-only session. Acquired in `beginStreaming`, released in `disconnect`.
+    private let displaySleepGuard = DisplaySleepGuard()
+
     /// `allowTofu` gates the trust-on-first-use prompt for an unpinned host: it is only true
     /// when the host EXPLICITLY advertised `pair=optional` (rule 3a). For any other unpinned host
     /// — `pair=required`, a manually-typed host, or a discovered host with no/unknown `pair`
@@ -455,6 +460,8 @@ final class SessionModel: ObservableObject {
     func disconnect(deliberate: Bool = true) {
         statsTimer?.invalidate()
         statsTimer = nil
+        // No-op when this session never reached `.streaming` (a refused/aborted connect).
+        displaySleepGuard.release()
         // Drop any armed background keep-alive (incl. the timeout that just fired us).
         backgroundTimer?.cancel()
         backgroundTimer = nil
@@ -550,6 +557,7 @@ final class SessionModel: ObservableObject {
         // Input capture itself is owned by StreamView (engaged by the captureEnabled
         // flip this phase change causes, released/re-engaged by the user from there).
         phase = .streaming
+        displaySleepGuard.acquire()
         // Audio starts with streaming, not during the trust prompt — no host sound (or
         // mic uplink!) before the user trusted the host. Devices come from Settings;
         // "" = system default.
