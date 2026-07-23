@@ -223,7 +223,19 @@ public final class StreamLayerView: NSView {
     /// when the Welcome carried `HOST_CAP_CURSOR` (only sessions that advertised the client
     /// cap get it). Shapes cache by serial; state is latest-wins. Main-thread only.
     private var cursorChannelActive = false
-    private var hostCursors: [UInt32: NSCursor] = [:]
+    /// A forwarded host cursor shape, cached RAW (not as a finished `NSCursor`) so the pointer can be
+    /// (re)built at the CURRENT video-fit scale — see `scaledCursor`. The host forwards the bitmap in
+    /// host FRAMEBUFFER pixels, whose size tracks the host's display scaling (32 px at 100%, 96 px at
+    /// 300% DPI); scaling by the video fit keeps the pointer sized to the streamed desktop at any host
+    /// scaling instead of ballooning on a high-DPI host.
+    private struct HostCursorShape {
+        let cg: CGImage
+        let width: Int
+        let height: Int
+        let hotX: Int
+        let hotY: Int
+    }
+    private var hostCursors: [UInt32: HostCursorShape] = [:]
     private var cursorState: PunktfunkConnection.CursorStateEvent?
     /// Last `CursorRenderMode.clientDraws` told to the host (the §8 mid-stream render flip);
     /// nil = nothing sent yet. Edge-detected by [`reconcileCursorRender`] from the live mouse
@@ -500,8 +512,8 @@ public final class StreamLayerView: NSView {
             // video); hidden host pointer (or no shape yet) = invisible. Without the channel,
             // M1 behavior: invisible local cursor, the composited host cursor is the visible one.
             if cursorChannelActive, let st = cursorState, st.visible,
-               let host = hostCursors[st.serial] {
-                addCursorRect(bounds, cursor: host)
+               let shape = hostCursors[st.serial] {
+                addCursorRect(bounds, cursor: scaledCursor(shape))
             } else {
                 addCursorRect(bounds, cursor: Self.invisibleCursor)
             }
@@ -570,12 +582,12 @@ public final class StreamLayerView: NSView {
     }
 
     private func applyCursorShape(_ ev: PunktfunkConnection.CursorShapeEvent) {
-        guard let cursor = Self.makeCursor(ev) else {
+        guard let shape = Self.makeShape(ev) else {
             streamInputLog.warning("cursor shape rejected (\(ev.width)x\(ev.height)) — keeping the previous cursor")
             return
         }
         if hostCursors.count >= 64 { hostCursors.removeAll() } // degenerate host: reset
-        hostCursors[ev.serial] = cursor
+        hostCursors[ev.serial] = shape
         if cursorState?.serial == ev.serial {
             window?.invalidateCursorRects(for: self)
         }
@@ -597,8 +609,10 @@ public final class StreamLayerView: NSView {
         _ = (lastHint, hintOverride)
     }
 
-    /// Build an `NSCursor` from a forwarded straight-alpha RGBA shape.
-    private static func makeCursor(_ ev: PunktfunkConnection.CursorShapeEvent) -> NSCursor? {
+    /// Decode a forwarded straight-alpha RGBA shape into a CGImage + hotspot. The on-screen SIZE is
+    /// NOT baked in here — it is applied per-use in `scaledCursor` from the live video-fit scale, so
+    /// the same shape re-fits across window resizes / retina moves without a re-forward.
+    private static func makeShape(_ ev: PunktfunkConnection.CursorShapeEvent) -> HostCursorShape? {
         let (w, h) = (ev.width, ev.height)
         guard w > 0, h > 0, ev.rgba.count >= w * h * 4,
               let provider = CGDataProvider(data: ev.rgba as CFData),
@@ -609,10 +623,40 @@ public final class StreamLayerView: NSView {
                   provider: provider, decode: nil, shouldInterpolate: false,
                   intent: .defaultIntent)
         else { return nil }
-        let image = NSImage(cgImage: cg, size: NSSize(width: w, height: h))
-        return NSCursor(
-            image: image,
-            hotSpot: NSPoint(x: min(ev.hotX, w - 1), y: min(ev.hotY, h - 1)))
+        return HostCursorShape(
+            cg: cg, width: w, height: h,
+            hotX: min(ev.hotX, w - 1), hotY: min(ev.hotY, h - 1))
+    }
+
+    /// Points-per-host-pixel: the exact factor the video frame is aspect-fit into the view (the same
+    /// `AVMakeRect` fit `hostPoint`/`cgScreenPoint` use). The host forwards the pointer bitmap in host
+    /// framebuffer pixels — the mode we drive is in the client's BACKING pixels, so on retina this is
+    /// ~1/backingScale and the pointer lands at its TRUE size relative to the streamed desktop
+    /// (crisp, 1:1 with the video) rather than the 2×-inflated pixel-as-points it used to be. Because
+    /// the bitmap grows with the host's display scaling (96 px at 300% DPI), scaling by this is what
+    /// keeps a high-DPI host from forwarding a giant pointer. Falls back to 1 before the first
+    /// mode/layout.
+    private func cursorFitScale() -> CGFloat {
+        guard let connection else { return 1 }
+        let mode = connection.currentMode()
+        guard mode.width > 0, mode.height > 0, bounds.width > 0, bounds.height > 0 else { return 1 }
+        let fit = AVMakeRect(
+            aspectRatio: CGSize(width: Int(mode.width), height: Int(mode.height)), insideRect: bounds)
+        guard fit.width > 0 else { return 1 }
+        return fit.width / CGFloat(mode.width)
+    }
+
+    /// Build the `NSCursor` for a cached shape at the CURRENT video-fit scale (see `cursorFitScale`).
+    /// Both the image size and the hotspot scale together so the click point stays true.
+    private func scaledCursor(_ shape: HostCursorShape) -> NSCursor {
+        let scale = cursorFitScale()
+        let sw = max(1, (CGFloat(shape.width) * scale).rounded())
+        let sh = max(1, (CGFloat(shape.height) * scale).rounded())
+        let image = NSImage(cgImage: shape.cg, size: NSSize(width: sw, height: sh))
+        let hot = NSPoint(
+            x: min(CGFloat(shape.hotX) * scale, sw - 1),
+            y: min(CGFloat(shape.hotY) * scale, sh - 1))
+        return NSCursor(image: image, hotSpot: hot)
     }
 
     /// Host video px → CG GLOBAL screen coordinates (top-left origin, the
@@ -907,6 +951,11 @@ public final class StreamLayerView: NSView {
             let px = convertToBacking(bounds).size
             matchFollower?.noteSize(
                 widthPx: Int(px.width.rounded()), heightPx: Int(px.height.rounded()))
+        }
+        // The video-fit scale just changed (resize / retina move); rebuild the worn host pointer at
+        // the new scale so it tracks the video instead of freezing at its build-time size.
+        if captured, desktopMouse, cursorChannelActive {
+            window?.invalidateCursorRects(for: self)
         }
     }
 
