@@ -408,6 +408,16 @@ pub struct IddPushCapturer {
     /// shared slot) destroys the driver's cursor worker — the section here survives, so the
     /// channel is re-delivered on ring recreates.
     cursor_sender: Option<crate::CursorChannelSender>,
+    /// The cursor-render flip sender (`IOCTL_SET_CURSOR_FORWARD`) — the secure-desktop guard's
+    /// actuator. UAC/Winlogon render only through the OS's software-cursor path (its default on
+    /// every mode commit); with our hardware cursor declared (and re-declared on every
+    /// swap-chain assign) that path never comes back, and the secure desktop never presents —
+    /// the stream freezes on the last normal-desktop frame for the whole UAC/lock interaction.
+    /// [`Self::poll_secure_desktop`] flips the declare off/on at the secure-desktop edges.
+    cursor_forward: Option<crate::CursorForwardSender>,
+    /// The secure-desktop guard's edge state: `true` = the poller reports a secure input
+    /// desktop and the declare is currently stood down.
+    secure_active: bool,
     /// The CAPTURE mouse model is active — the HOST composites the pointer into the frame
     /// (see cursor_blend.rs for why DWM cannot: a declared IddCx hardware cursor is forever).
     composite_cursor: bool,
@@ -657,7 +667,6 @@ impl IddPushCapturer {
     /// instead of tearing the display down (audit §5.1 — no more 20 s black bail). "Failure" includes the
     /// driver not attaching to the ring within a few seconds (e.g. a hybrid-GPU render mismatch).
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     pub fn open(
         target: WinCaptureTarget,
         preferred: Option<(u32, u32, u32)>,
@@ -667,6 +676,7 @@ impl IddPushCapturer {
         keepalive: Box<dyn Send>,
         sender: crate::FrameChannelSender,
         cursor_sender: Option<crate::CursorChannelSender>,
+        cursor_forward: Option<crate::CursorForwardSender>,
     ) -> std::result::Result<Self, (anyhow::Error, Box<dyn Send>)> {
         // The stall-attribution listener (idempotent): started with the first IDD-push capturer so
         // the stall log can correlate DWM holes with OS display events for the session's lifetime.
@@ -679,6 +689,7 @@ impl IddPushCapturer {
             pyrowave,
             sender,
             cursor_sender,
+            cursor_forward,
         ) {
             Ok(mut me) => {
                 me._keepalive = keepalive;
@@ -697,6 +708,7 @@ impl IddPushCapturer {
         pyrowave: bool,
         sender: crate::FrameChannelSender,
         cursor_sender: Option<crate::CursorChannelSender>,
+        cursor_forward: Option<crate::CursorForwardSender>,
     ) -> Result<Self> {
         // The ring MUST live on the adapter the driver's swap-chain renders on. Primary: the
         // selected render GPU — the same pick SET_RENDER_ADAPTER pinned the driver to at monitor
@@ -720,6 +732,7 @@ impl IddPushCapturer {
             luid,
             sender.clone(),
             cursor_sender.clone(),
+            cursor_forward.clone(),
         ) {
             Ok(me) => Ok(me),
             Err(e) => {
@@ -754,6 +767,7 @@ impl IddPushCapturer {
                     drv,
                     sender,
                     cursor_sender,
+                    cursor_forward,
                 )
                 .context("IDD-push rebind to the driver's reported render adapter")
             }
@@ -770,6 +784,7 @@ impl IddPushCapturer {
         luid: LUID,
         sender: crate::FrameChannelSender,
         cursor_sender: Option<crate::CursorChannelSender>,
+        cursor_forward: Option<crate::CursorForwardSender>,
     ) -> Result<Self> {
         let (pw, ph, _hz) = preferred
             .context("IDD push needs the negotiated mode (WxH) to size the shared ring")?;
@@ -1046,6 +1061,17 @@ impl IddPushCapturer {
                     .unwrap_or((0, 0, i32::MAX, i32::MAX));
                 cursor_poll::CursorPoller::spawn(target.target_id, rect)
             });
+            // Heal the driver's persisted cursor-forward state: a session that died on the
+            // secure desktop (client drops at the lock screen — the common case) leaves the
+            // per-target desired state `false`, and the NEXT session's channel delivery would
+            // adopt UNdeclared (the exact cross-session composite trap of §8.6). A fresh
+            // session always starts declared; the secure-desktop guard re-disables if the
+            // secure desktop is (still) up, via its first `poll_secure_desktop` edge.
+            if let (Some(_), Some(fwd)) = (cursor_shared.as_ref(), cursor_forward.as_ref()) {
+                if let Err(e) = fwd(true) {
+                    tracing::debug!("cursor-forward reset at open failed (pre-v6 driver?): {e:#}");
+                }
+            }
 
             tracing::info!(
                 target_id = target.target_id,
@@ -1108,6 +1134,8 @@ impl IddPushCapturer {
                 cursor_shared,
                 cursor_poll,
                 cursor_sender,
+                cursor_forward,
+                secure_active: false,
                 composite_cursor: composite_forced,
                 composite_forced,
                 cursor_blend: None,
@@ -1883,8 +1911,71 @@ impl IddPushCapturer {
         Some((tex, srv))
     }
 
+    /// The secure-desktop guard (the 0.18.0 UAC/Winlogon regression). UAC consent and Winlogon
+    /// live on the SECURE desktop, which the OS renders through the software-cursor path — its
+    /// per-mode-commit default. With this session's IddCx hardware cursor declared (and
+    /// re-declared by the driver on every swap-chain assign), that path never materialises, the
+    /// secure desktop never presents into our swap-chain, and the stream freezes on the last
+    /// normal-desktop frame for the entire UAC/lock interaction. On the poller's secure edge:
+    /// stand the declare down (`SET_CURSOR_FORWARD` off — the driver stops its per-assign
+    /// re-declare — plus the host facade's forced same-mode re-commit that actualises the
+    /// software cursor); on dismissal, re-declare. Runs on the capture/encode thread every tick
+    /// (it must keep running while frames are stalled — that is exactly the state it exits).
+    fn poll_secure_desktop(&mut self) {
+        let Some(fwd) = self.cursor_forward.as_ref() else {
+            return;
+        };
+        // Sessions with a declare possibly in play: the channel session that declared it, and
+        // the forced-composite session whose (reused) driver monitor may still run an earlier
+        // session's cursor worker. A plain session on a clean target has no poller — no guard.
+        if self.cursor_shared.is_none() && !self.composite_forced {
+            return;
+        }
+        let secure = self
+            .cursor_poll
+            .as_ref()
+            .is_some_and(|p| p.secure_desktop());
+        if secure == self.secure_active {
+            return;
+        }
+        self.secure_active = secure;
+        if secure {
+            tracing::info!(
+                target_id = self.target_id,
+                "secure desktop (UAC/Winlogon) active — standing the IddCx hardware-cursor \
+                 declare down so the OS software-cursor path can render it"
+            );
+            if let Err(e) = fwd(false) {
+                tracing::warn!(
+                    "secure-desktop cursor-forward stand-down failed (secure content may stay \
+                     invisible this session): {e:#}"
+                );
+            }
+        } else {
+            tracing::info!(
+                target_id = self.target_id,
+                "secure desktop dismissed — restoring the cursor render model"
+            );
+            // Re-declare only for the session that RUNS the cursor channel; a forced-composite
+            // session never wanted the declare (leaving the driver's desired state off also
+            // stops a reused worker's per-assign re-declares for good — the next channel
+            // session's open-time reset re-arms it).
+            if self.cursor_shared.is_some() {
+                if let Err(e) = fwd(true) {
+                    tracing::warn!(
+                        "secure-desktop cursor-forward re-enable failed (client-drawn cursor \
+                         may double with a composited one): {e:#}"
+                    );
+                }
+            }
+        }
+    }
+
     fn try_consume(&mut self) -> Result<Option<CapturedFrame>> {
         self.log_driver_status_once();
+        // The secure-desktop guard first: while UAC/Winlogon is up there may be NO fresh frames
+        // at all — this edge is what brings them back.
+        self.poll_secure_desktop();
         // Follow the display: a "Use HDR" flip recreates the ring at the matching format.
         self.poll_display_hdr();
         // Recover-or-drop (GB1): if a descriptor change triggered a recreate but no fresh frame has resumed
@@ -2486,6 +2577,16 @@ fn warn_444_hdr_downgrade_once() {
 
 impl Drop for IddPushCapturer {
     fn drop(&mut self) {
+        // A channel session ending while the secure-desktop guard is engaged must not leave the
+        // driver's per-target desired state off — the next session's channel delivery would
+        // adopt UNdeclared and silently run the composite model (§8.6's cross-session trap).
+        // The open-time reset also covers this (host-crash case); this is the orderly-teardown
+        // belt.
+        if self.secure_active && self.cursor_shared.is_some() {
+            if let Some(fwd) = self.cursor_forward.as_ref() {
+                let _ = fwd(true);
+            }
+        }
         self.slots.clear();
         // The shared header section (`MappedSection`), the frame-ready `event` (`OwnedHandle`) and the
         // broker's WUDFHost process handle free themselves via RAII (unmap view, then close handle) —

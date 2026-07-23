@@ -300,6 +300,21 @@ pub fn control_device_handle() -> Option<HANDLE> {
     VDM.get().and_then(VirtualDisplayManager::device_handle)
 }
 
+/// Re-commit the CURRENT display config under the manager `state` lock (the sole-topology-mutator
+/// contract of [`force_mode_reenumeration`]). The secure-desktop guard's actuator: the OS only
+/// reverts a path to its software-cursor default ON a mode commit, so standing the hardware-cursor
+/// declare down (`IOCTL_SET_CURSOR_FORWARD` off) needs this nudge for UAC/Winlogon to actually
+/// render. `false` (no-op) before the first backend open — no monitors exist to re-commit for.
+pub fn force_recommit() -> bool {
+    let Some(m) = VDM.get() else {
+        return false;
+    };
+    let _guard = m.state.lock().unwrap();
+    // SAFETY: `force_mode_reenumeration`'s contract is "call under the manager `state` lock";
+    // held above. The call reads + re-applies the current CCD config over owned locals.
+    unsafe { pf_win_display::win_display::force_mode_reenumeration() }
+}
+
 /// Best-effort "is this WUDFHost pid still alive?" — the monitor-liveness probe for the JOIN path.
 /// `OpenProcess` failing (pid reaped) or the process being signaled ⇒ dead. Pid reuse could
 /// theoretically alias a fresh process and read "alive"; the joining session then just retries into

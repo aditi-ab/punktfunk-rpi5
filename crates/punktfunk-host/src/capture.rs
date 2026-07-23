@@ -175,6 +175,36 @@ pub fn capture_virtual_output(
             },
         ) as pf_capture::CursorChannelSender
     });
+    // The secure-desktop guard's actuator (`IOCTL_SET_CURSOR_FORWARD`): the capturer flips the
+    // driver's hardware-cursor declare off while UAC/Winlogon is up (the secure desktop renders
+    // only through the OS's software-cursor path) and back on at dismissal. The stand-down needs
+    // the same-mode re-commit that actualises the software-cursor default — driven here because
+    // topology commits belong under the vdisplay manager's lock, which pf-capture cannot take.
+    // Built for EVERY session (not just `want.hw_cursor`): a channel-less session can reuse a
+    // driver monitor whose cursor worker (an earlier session's) is still live and re-declaring —
+    // the flip is the only way to stop it; on a never-declared target the driver answers
+    // NOT_FOUND, which the capturer logs and ignores.
+    let target_id = target.target_id;
+    let cursor_forward: Option<pf_capture::CursorForwardSender> = Some({
+        std::sync::Arc::new(move |enable: bool| {
+            let req = pf_driver_proto::control::SetCursorForwardRequest {
+                target_id,
+                enable: enable as u32,
+            };
+            // SAFETY: `control_raw` is the pf-vdisplay control handle resolved above; it is
+            // never closed for the process lifetime (`send_cursor_forward`'s precondition).
+            unsafe {
+                crate::vdisplay::driver::send_cursor_forward(
+                    windows::Win32::Foundation::HANDLE(control_raw as *mut core::ffi::c_void),
+                    &req,
+                )?;
+            }
+            if !enable {
+                crate::vdisplay::manager::force_recommit();
+            }
+            Ok(())
+        }) as pf_capture::CursorForwardSender
+    });
     pf_capture::open_idd_push(
         target,
         pref,
@@ -184,6 +214,7 @@ pub fn capture_virtual_output(
         keep,
         sender,
         cursor_sender,
+        cursor_forward,
     )
     .map_err(|(e, _keep)| e.context("IDD-push capture open (no fallback)"))
 }

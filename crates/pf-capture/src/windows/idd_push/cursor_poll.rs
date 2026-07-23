@@ -29,8 +29,8 @@ use windows::Win32::Graphics::Gdi::{
     BI_RGB, DIB_RGB_COLORS, HBITMAP, HDC,
 };
 use windows::Win32::System::StationsAndDesktops::{
-    CloseDesktop, OpenInputDesktop, SetThreadDesktop, DESKTOP_ACCESS_FLAGS, DESKTOP_CONTROL_FLAGS,
-    HDESK,
+    CloseDesktop, GetUserObjectInformationW, OpenInputDesktop, SetThreadDesktop,
+    DESKTOP_ACCESS_FLAGS, DESKTOP_CONTROL_FLAGS, HDESK, UOI_NAME,
 };
 use windows::Win32::UI::HiDpi::{
     SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
@@ -63,6 +63,11 @@ struct Shape {
 pub(super) struct CursorPoller {
     slot: Arc<Mutex<Option<pf_frame::CursorOverlay>>>,
     stop: Arc<AtomicBool>,
+    /// The input desktop is a SECURE desktop (Winlogon — UAC consent / lock / logon). Classified
+    /// on every reattach; the capturer polls it to stand the IddCx hardware-cursor declare down
+    /// while the secure desktop needs the software-cursor path to render (see
+    /// `IddPushCapturer::poll_secure_desktop`).
+    secure: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -75,7 +80,11 @@ impl CursorPoller {
     const INTERVAL: Duration = Duration::from_millis(4);
     /// Unconditional input-desktop reattach cadence — catches secure-desktop (UAC/lock) switches
     /// without a failure signal (`GetCursorInfo` on a stale desktop *succeeds* with stale data).
-    const REATTACH: Duration = Duration::from_secs(2);
+    /// 250 ms, not the original 2 s: the reattach now also feeds [`Self::secure_desktop`], which
+    /// gates when the secure desktop becomes VISIBLE in the stream (the hardware-cursor
+    /// stand-down) — a 2 s freeze at every UAC prompt is user-visible, ~4 `OpenInputDesktop`
+    /// syscalls/s are not.
+    const REATTACH: Duration = Duration::from_millis(250);
 
     /// Spawn the poller for the virtual display `target_id`. `rect` = the target's desktop rect
     /// (`source_desktop_rect` order: x, y, w, h) — cursor positions are desktop-global; the
@@ -84,20 +93,32 @@ impl CursorPoller {
     pub(super) fn spawn(target_id: u32, rect: (i32, i32, i32, i32)) -> Self {
         let slot: Arc<Mutex<Option<pf_frame::CursorOverlay>>> = Arc::new(Mutex::new(None));
         let stop = Arc::new(AtomicBool::new(false));
-        let (slot_t, stop_t) = (slot.clone(), stop.clone());
+        let secure = Arc::new(AtomicBool::new(false));
+        let (slot_t, stop_t, secure_t) = (slot.clone(), stop.clone(), secure.clone());
         let thread = std::thread::Builder::new()
             .name("pf-cursor-poll".into())
-            .spawn(move || run(target_id, rect, &slot_t, &stop_t))
+            .spawn(move || run(target_id, rect, &slot_t, &stop_t, &secure_t))
             .ok();
         if thread.is_none() {
             tracing::warn!("cursor poller thread spawn failed — cursor falls back to driver shm");
         }
-        Self { slot, stop, thread }
+        Self {
+            slot,
+            stop,
+            secure,
+            thread,
+        }
     }
 
     /// The latest overlay snapshot (`None` until the first successful shape rasterisation).
     pub(super) fn read(&self) -> Option<pf_frame::CursorOverlay> {
         self.slot.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// Whether the input desktop is currently a SECURE desktop (UAC consent / Winlogon lock or
+    /// logon). Latched by the poll thread on its reattach cadence (≤ [`Self::REATTACH`] stale).
+    pub(super) fn secure_desktop(&self) -> bool {
+        self.secure.load(Ordering::Relaxed)
     }
 
     /// Whether the worker thread is (still) alive — `false` degrades the capturer to the shm read.
@@ -121,6 +142,7 @@ fn run(
     rect: (i32, i32, i32, i32),
     slot: &Mutex<Option<pf_frame::CursorOverlay>>,
     stop: &AtomicBool,
+    secure: &AtomicBool,
 ) {
     // Physical-pixel coordinates on this thread regardless of the process's DPI awareness:
     // `rect` comes from CCD (always physical), and a DPI-virtualized `GetCursorInfo` position
@@ -130,7 +152,8 @@ fn run(
     let _ = unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
 
     let mut desktop = DesktopBinding::default();
-    desktop.reattach(); // best-effort: already on winsta0\default if this fails
+    // best-effort: already on winsta0\default if this fails
+    publish_secure(secure, desktop.reattach());
     let mut last_attach = Instant::now();
 
     let mut shape: Option<Shape> = None;
@@ -143,7 +166,7 @@ fn run(
         std::thread::sleep(CursorPoller::INTERVAL);
         if last_attach.elapsed() >= CursorPoller::REATTACH {
             last_attach = Instant::now();
-            desktop.reattach();
+            publish_secure(secure, desktop.reattach());
         }
 
         let mut ci = CURSORINFO {
@@ -155,7 +178,7 @@ fn run(
         if unsafe { GetCursorInfo(&mut ci) }.is_err() {
             // Desktop went away under us (secure-desktop switch mid-call) — rebind and retry
             // next tick; the slot keeps its last snapshot meanwhile.
-            desktop.reattach();
+            publish_secure(secure, desktop.reattach());
             last_attach = Instant::now();
             continue;
         }
@@ -218,13 +241,25 @@ fn run(
     }
 }
 
+/// Store a reattach's secure-desktop verdict (`None` = classification unavailable — keep the
+/// previous state rather than flapping the capturer's hardware-cursor stand-down).
+fn publish_secure(secure: &AtomicBool, verdict: Option<bool>) {
+    if let Some(s) = verdict {
+        secure.store(s, Ordering::Relaxed);
+    }
+}
+
 /// The thread's owned input-desktop handle — the [`SendInputInjector`] reattach model
 /// (`pf-inject` sendinput.rs): keep the current binding, swap on demand, close exactly once.
 #[derive(Default)]
 struct DesktopBinding(Option<HDESK>);
 
 impl DesktopBinding {
-    fn reattach(&mut self) {
+    /// Rebind to the CURRENT input desktop. Returns whether that desktop is a SECURE one
+    /// (`UOI_NAME` != "Default": "Winlogon" during UAC consent / lock / logon) — `None` when the
+    /// input desktop could not be opened, in which case the binding (and the caller's secure
+    /// state) stays put.
+    fn reattach(&mut self) -> Option<bool> {
         const GENERIC_ALL: u32 = 0x1000_0000;
         // SAFETY: `OpenInputDesktop`/`SetThreadDesktop`/`CloseDesktop` take only by-value args.
         // `OpenInputDesktop` yields an owned `HDESK` only on `Ok`; it is either installed (and the
@@ -238,6 +273,7 @@ impl DesktopBinding {
                 DESKTOP_ACCESS_FLAGS(GENERIC_ALL),
             ) {
                 Ok(h) => {
+                    let secure = desktop_is_secure(h);
                     if SetThreadDesktop(h).is_ok() {
                         if let Some(old) = self.0.replace(h) {
                             let _ = CloseDesktop(old);
@@ -245,11 +281,38 @@ impl DesktopBinding {
                     } else {
                         let _ = CloseDesktop(h);
                     }
+                    Some(secure)
                 }
-                Err(_) => { /* not privileged for this desktop; stay put */ }
+                Err(_) => None, // not privileged for this desktop; stay put
             }
         }
     }
+}
+
+/// `UOI_NAME` of `h` != "Default" — i.e. the input desktop is Winlogon (UAC consent / lock /
+/// logon) or a screen-saver desktop, both of which need the OS's software-cursor render path.
+/// Unnameable desktops read as NOT secure: the only in-contract failure is a too-small buffer,
+/// and misreading secure-as-normal merely keeps today's behavior for a beat.
+fn desktop_is_secure(h: HDESK) -> bool {
+    let mut name = [0u16; 64]; // "Default"/"Winlogon"/"Screen-saver" all fit with room to spare
+    let mut needed = 0u32;
+    // SAFETY: `h` is the live desktop handle the caller just opened; `name`/`needed` are live
+    // out-params sized exactly as passed; the call writes at most `nlength` bytes.
+    let ok = unsafe {
+        GetUserObjectInformationW(
+            windows::Win32::Foundation::HANDLE(h.0),
+            UOI_NAME,
+            Some(name.as_mut_ptr().cast()),
+            (name.len() * 2) as u32,
+            Some(&mut needed),
+        )
+    };
+    if ok.is_err() {
+        return false;
+    }
+    let len = name.iter().position(|&c| c == 0).unwrap_or(name.len());
+    let name = String::from_utf16_lossy(&name[..len]);
+    !name.eq_ignore_ascii_case("Default")
 }
 
 impl Drop for DesktopBinding {

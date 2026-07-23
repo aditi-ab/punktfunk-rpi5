@@ -405,6 +405,16 @@ pub type CursorChannelSender = std::sync::Arc<
     dyn Fn(&pf_driver_proto::control::SetCursorChannelRequest) -> Result<()> + Send + Sync,
 >;
 
+/// The mid-stream cursor-render flip (`IOCTL_SET_CURSOR_FORWARD`, proto v6) as a host-facade
+/// closure — same contract as [`CursorChannelSender`]. `bool` = declare the IddCx hardware
+/// cursor (`true`) or stand it down (`false`; the host facade additionally forces the same-mode
+/// re-commit that actualises the OS's software-cursor default). The capturer drives this from
+/// its secure-desktop watch: UAC/Winlogon render only through the software-cursor path, so a
+/// path pinned to the hardware cursor never presents them (the 0.18.0 secure-desktop
+/// regression).
+#[cfg(target_os = "windows")]
+pub type CursorForwardSender = std::sync::Arc<dyn Fn(bool) -> Result<()> + Send + Sync>;
+
 // One-time PipeWire library init, shared by the video (portal) and audio capture threads.
 #[cfg(target_os = "linux")]
 pub mod pwinit;
@@ -491,6 +501,7 @@ pub fn open_idd_push(
     keepalive: Box<dyn Send>,
     sender: FrameChannelSender,
     cursor_sender: Option<CursorChannelSender>,
+    cursor_forward: Option<CursorForwardSender>,
 ) -> std::result::Result<Box<dyn Capturer>, (anyhow::Error, Box<dyn Send>)> {
     idd_push::IddPushCapturer::open(
         target,
@@ -501,6 +512,7 @@ pub fn open_idd_push(
         keepalive,
         sender,
         cursor_sender,
+        cursor_forward,
     )
     .map(|c| Box::new(c) as Box<dyn Capturer>)
 }
