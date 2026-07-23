@@ -1454,6 +1454,10 @@ async fn serve_session(
     // Streamed-AU capability: the client's reassembler accepts sentinel-headed streamed blocks,
     // so a chunked encoder session may ship an AU's early FEC blocks while its tail encodes.
     let streamed_au = hello.video_caps & punktfunk_core::quic::VIDEO_CAP_STREAMED_AU != 0;
+    // Multi-slice capability: the client's DECODER accepts AUs carrying several slice NALs, so
+    // the encoder may keep its multi-slice default (§7 LN1). Absent ⇒ single-slice frames —
+    // TV-SoC decoders (Amlogic: Chromecast with Google TV) wedge the device on multi-slice AUs.
+    let multi_slice = hello.video_caps & punktfunk_core::quic::VIDEO_CAP_MULTI_SLICE != 0;
     let stats_dp = stats; // data-plane handle to the shared stats recorder
                           // Short label for web-console stats captures: the client's cert-fingerprint prefix, else its
                           // peer IP (no fingerprint = anonymous TOFU/--open client).
@@ -1571,6 +1575,7 @@ async fn serve_session(
                         cursor_client_draws: cursor_client_draws_dp,
                         probe_seq,
                         streamed_au,
+                        multi_slice,
                         stats: stats_dp,
                         client_label,
                         client_name,

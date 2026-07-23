@@ -31,6 +31,12 @@ pub struct StreamConfig {
     /// Drives the capturer's proactive advanced-color enable; the encoder picks Main10 from the captured
     /// (P010) frame format. Always `false` on a non-HDR host, so the SDR path is unchanged.
     pub hdr: bool,
+    /// Client's `x-nv-video[0].videoEncoderSlicesPerFrame` — the per-frame slice count its
+    /// decoder wants (moonlight-common-c requests 1 for every HARDWARE decoder and 4 only for
+    /// software slice-threading). Honored as the encoder's slicing ceiling: hardware TV decoders
+    /// (Amlogic — Chromecast with Google TV) wedge the whole device on multi-slice AUs they
+    /// never asked for (the 0.17.0 4-slice-default field regression). Absent ⇒ 1.
+    pub slices: u32,
 }
 
 /// A pooled capturer plus the three properties reuse must match on — its HDR-ness, its
@@ -1040,6 +1046,8 @@ fn stream_body(
         // True only when THIS session's capture negotiated cursor-as-metadata — which the
         // callers grant only where the resolved backend composites (`cursor_blend_capable`).
         cursor_blend,
+        // The client's requested slices-per-frame (its DECODER's ceiling) — see `StreamConfig`.
+        cfg.slices,
     )
     .context("open video encoder for stream")?;
     // Tell the encoder how deep the capturer lets it pipeline. Without this an in-place backend
@@ -1212,6 +1220,7 @@ fn stream_body(
                     gs_bit_depth(frame.format),
                     encode::ChromaFormat::Yuv420, // GameStream stays 4:2:0
                     cursor_blend,                 // same capture cursor mode — see the first open
+                    cfg.slices,                   // client slicing ceiling — see the first open
                 )
                 .context("reopen encoder after rebuild")?;
                 // A rebuilt encoder starts unconfigured — same reason as the first open above.

@@ -174,6 +174,13 @@ pub fn open_video(
     // The session may hand this encoder cursor bitmaps to composite (cursor-as-metadata
     // captures). Backends whose fast path can't blend (Vulkan EFC RGB-direct) key off it.
     cursor_blend: bool,
+    // Ceiling on the per-frame slice count this session's CLIENT decoder accepts: 1 =
+    // single-slice only (the safe default toward decoders that never asked — Amlogic TV SoCs
+    // wedge on multi-slice AUs), a Moonlight `videoEncoderSlicesPerFrame` request, or 32 (= no
+    // client-side limit) for a `VIDEO_CAP_MULTI_SLICE` punktfunk/1 client. Backends that split
+    // frames (Linux direct-NVENC, §7 LN1) clamp their default against it;
+    // `PUNKTFUNK_NVENC_SLICES` stays the explicit operator override in both directions.
+    max_slices: u32,
 ) -> Result<Box<dyn Encoder>> {
     let (inner, backend) = open_video_backend(
         codec,
@@ -186,6 +193,7 @@ pub fn open_video(
         bit_depth,
         chroma,
         cursor_blend,
+        max_slices,
     )?;
     // Record what this session encodes on (the mgmt API's "currently used GPU"): the backend label
     // is reported by `open_video_backend` from the branch that ACTUALLY opened — not re-derived by
@@ -337,6 +345,7 @@ fn open_video_backend_linux(
     bit_depth: u8,
     chroma: ChromaFormat,
     cursor_blend: bool,
+    max_slices: u32,
 ) -> Result<(Box<dyn Encoder>, &'static str)> {
     // A NEGOTIATED PyroWave session (client advertised + preferred it, plan §3) routes
     // straight to that backend — the PUNKTFUNK_ENCODER pref below stays a lab override.
@@ -446,6 +455,7 @@ fn open_video_backend_linux(
             bit_depth,
             chroma,
             cursor_blend,
+            max_slices,
         )
         .map(|e| (e, "nvenc"))
     };
@@ -562,8 +572,11 @@ fn open_video_backend(
     bit_depth: u8,
     chroma: ChromaFormat,
     cursor_blend: bool,
+    max_slices: u32,
 ) -> Result<(Box<dyn Encoder>, &'static str)> {
-    let _ = cursor_blend; // consumed only by the Linux vulkan-encode + direct-NVENC arms below
+    // Consumed only by the Linux vulkan-encode + direct-NVENC arms below (max_slices: the
+    // direct-NVENC arm — the one backend that splits frames).
+    let _ = (cursor_blend, max_slices);
     validate_dimensions(codec, width, height)?;
     // Refresh/fps must be positive and sane: fps feeds the encoder time_base (`Rational(1, fps)`)
     // and the pts→ns conversion (`pts * 1e9 / fps`), so 0 builds a 1/0 rational / divides by zero.
@@ -600,6 +613,7 @@ fn open_video_backend(
             bit_depth,
             chroma,
             cursor_blend,
+            max_slices,
         )
     }
     #[cfg(target_os = "windows")]
@@ -816,6 +830,7 @@ fn open_video_backend(
             cuda,
             bit_depth,
             chroma,
+            max_slices,
         );
         anyhow::bail!("video encode requires Linux or Windows")
     }
@@ -840,14 +855,16 @@ fn open_nvenc_probed(
     bit_depth: u8,
     chroma: ChromaFormat,
     cursor_blend: bool,
+    max_slices: u32,
 ) -> Result<Box<dyn Encoder>> {
+    // Consumed by the direct-SDK arm below.
     #[cfg(not(feature = "nvenc"))]
-    let _ = cursor_blend; // consumed by the direct-SDK arm below
-                          // Direct-SDK NVENC (design/linux-direct-nvenc.md): the DEFAULT on NVIDIA, and only for a CUDA
-                          // capture payload (it registers CUDADEVICEPTR inputs — a CPU/dmabuf frame can't feed it, so those
-                          // keep the libav path; and `cuda` is false on AMD/Intel, so they stay on VAAPI). Set
-                          // PUNKTFUNK_NVENC_DIRECT=0 to fall back to libav. It self-clamps the bitrate internally (its own
-                          // level-ceiling binary search at session open), so it skips the probe-loop stepping below.
+    let _ = (cursor_blend, max_slices);
+    // Direct-SDK NVENC (design/linux-direct-nvenc.md): the DEFAULT on NVIDIA, and only for a CUDA
+    // capture payload (it registers CUDADEVICEPTR inputs — a CPU/dmabuf frame can't feed it, so those
+    // keep the libav path; and `cuda` is false on AMD/Intel, so they stay on VAAPI). Set
+    // PUNKTFUNK_NVENC_DIRECT=0 to fall back to libav. It self-clamps the bitrate internally (its own
+    // level-ceiling binary search at session open), so it skips the probe-loop stepping below.
     #[cfg(feature = "nvenc")]
     if cuda && nvenc_direct_enabled() {
         tracing::info!(
@@ -865,6 +882,7 @@ fn open_nvenc_probed(
             bit_depth,
             chroma,
             cursor_blend,
+            max_slices,
         )?) as Box<dyn Encoder>);
     }
     // The silent-degrade trap: a build without `--features nvenc` compiles the direct-SDK
@@ -2317,6 +2335,7 @@ mod tests {
             8,
             ChromaFormat::Yuv420,
             false,
+            4,
         )
         .expect("software arm must open GPU-free");
         assert_eq!(label, "software");
@@ -2335,6 +2354,7 @@ mod tests {
             8,
             ChromaFormat::Yuv420,
             false,
+            4,
         ) {
             // `expect_err` needs `Ok: Debug` and `Box<dyn Encoder>` isn't — match instead.
             Ok(_) => panic!("software emits H.264 only; an H.265 session must be refused"),

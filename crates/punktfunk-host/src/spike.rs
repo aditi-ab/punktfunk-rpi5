@@ -150,6 +150,7 @@ pub fn run(opts: Options) -> Result<()> {
         8,                            // spike synthetic harness: 8-bit
         encode::ChromaFormat::Yuv420, // ...and 4:2:0
         false,                        // synthetic frames carry no cursor
+        4,                            // no client decoder — keep the backend's multi-slice default
     )
     .context("open encoder")?;
 

@@ -45,11 +45,14 @@ pub(super) fn codec_guid(codec: Codec) -> nv::GUID {
 /// Resolved per-frame slice count for a session (latency plan §7 LN1, Phase 3): the
 /// `PUNKTFUNK_NVENC_SLICES` env override wins (1..=32; **1 = the explicit single-slice
 /// escape**, needed now that a backend can default higher), else the backend's
-/// `default_slices` — 4 on Linux direct-NVENC since the Phase-3 default-on, 1 everywhere else
-/// (the Windows async path is deliberately untouched). H.264/HEVC only (AV1 partitions via
-/// tiles). ONE parse shared by the config author ([`apply_low_latency_config`] via
-/// [`LowLatencyConfig::slices`]) and the Linux backend's chunked-poll arming, so the two can
-/// never disagree about whether a session is multi-slice.
+/// `default_slices` — on Linux direct-NVENC the Phase-3 default of 4 CLAMPED to the session's
+/// negotiated client-decoder ceiling (`VIDEO_CAP_MULTI_SLICE` / GameStream's
+/// `videoEncoderSlicesPerFrame` — a client that never asked stays single-slice: Amlogic TV
+/// SoCs wedge on multi-slice AUs), 1 everywhere else (the Windows async path is deliberately
+/// untouched). H.264/HEVC only (AV1 partitions via tiles). ONE parse shared by the config
+/// author ([`apply_low_latency_config`] via [`LowLatencyConfig::slices`]) and the Linux
+/// backend's chunked-poll arming, so the two can never disagree about whether a session is
+/// multi-slice.
 pub(super) fn resolve_slices(codec: Codec, default_slices: u32) -> u32 {
     if !matches!(codec, Codec::H264 | Codec::H265) {
         return 1;

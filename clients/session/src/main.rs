@@ -240,11 +240,17 @@ mod session_main {
             audio_channels: settings.audio_channels,
             preferred_codec: settings.preferred_codec(),
             // HDR off = don't advertise 10-bit/HDR at all; the host then never upgrades.
-            video_caps: if settings.hdr_enabled {
-                punktfunk_core::quic::VIDEO_CAP_10BIT | punktfunk_core::quic::VIDEO_CAP_HDR
-            } else {
-                0
-            },
+            // MULTI_SLICE is decoder truth for THIS embedder: every desktop decode stack
+            // (FFmpeg software, VAAPI, D3D11VA, Vulkan Video) handles AUs carrying several
+            // slice NALs, so the host may keep its multi-slice low-latency default (§7 LN1).
+            // The mobile/TV embedders must NOT copy this blindly — Amlogic MediaCodec wedges
+            // on multi-slice AUs (see `VIDEO_CAP_MULTI_SLICE`), so they advertise per-decoder.
+            video_caps: punktfunk_core::quic::VIDEO_CAP_MULTI_SLICE
+                | if settings.hdr_enabled {
+                    punktfunk_core::quic::VIDEO_CAP_10BIT | punktfunk_core::quic::VIDEO_CAP_HDR
+                } else {
+                    0
+                },
             // No portable Wayland/X11 display-volume query yet, so the host keeps its EDID
             // defaults for Linux clients; `PUNKTFUNK_CLIENT_PEAK_NITS` (read in the session
             // pump) pins one manually.

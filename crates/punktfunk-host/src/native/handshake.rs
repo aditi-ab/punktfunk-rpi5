@@ -579,6 +579,10 @@ pub(super) async fn negotiate(
             // The bit the Welcome just advertised — read back rather than recomputed, so the
             // prepared display and the session wiring cannot disagree with it.
             let cursor_fw = welcome.host_caps & punktfunk_core::quic::HOST_CAP_CURSOR != 0;
+            // Same bit the data plane's SessionContext reads — the prepared plan and the
+            // session wiring must agree on the slicing ceiling (an encoder rebuilt from the
+            // prepared plan with a DIFFERENT max_slices would change the wire shape mid-flow).
+            let multi_slice = hello.video_caps & punktfunk_core::quic::VIDEO_CAP_MULTI_SLICE != 0;
             let (mode, shard_payload) = (hello.mode, welcome.shard_payload);
             // "Automatic" — `bitrate_kbps` above is the host's own answer for `mode`, so the build
             // may re-resolve it if the source turns out to deliver a different size. Sampled here
@@ -594,6 +598,7 @@ pub(super) async fn negotiate(
                         client_identity,
                         client_hdr,
                         cursor_fw,
+                        multi_slice,
                         bitrate_kbps,
                         bitrate_auto,
                         bit_depth,

@@ -55,6 +55,19 @@ pub const VIDEO_CAP_STREAMED_AU: u8 = 0x20;
 /// performance choice — both AEADs are full-strength, and Hello/Welcome ride the pinned-TLS
 /// control channel, so there is no downgrade surface.
 pub const VIDEO_CAP_CHACHA20: u8 = 0x40;
+/// [`Hello::video_caps`] bit: the client's decoder accepts **multi-slice access units** — H.264/
+/// HEVC frames carrying several slice NALs (latency plan §7 LN1: the encoder splits frames so
+/// sub-frame readback can ship early slices while the tail encodes). Decoder-level, so the
+/// EMBEDDER sets it from what its decode stack actually handles: the desktop clients' FFmpeg/
+/// D3D11VA/Vulkan-video decoders are fine, but mobile/TV MediaCodec is per-SoC — Amlogic HEVC
+/// decoders (Chromecast with Google TV, Fire TV) wedge the whole DEVICE on multi-slice frames
+/// (the 0.17.0 field regression: the 4-slice Linux default froze streams on first frame and
+/// watchdog-rebooted the CCwGTV), which is exactly why Moonlight requests 1 slice per frame for
+/// every hardware decoder. The host defaults to >1 slice ONLY toward a client that sets this
+/// bit (`PUNKTFUNK_NVENC_SLICES` stays the explicit operator override in both directions);
+/// every other client gets single-slice frames — the pre-0.17 wire shape. NOTE: this takes the
+/// video_caps byte's last free bit — the next video cap needs a second byte (ABI bump).
+pub const VIDEO_CAP_MULTI_SLICE: u8 = 0x80;
 
 /// [`Welcome::host_caps`] bit: the host applies [`InputKind::GamepadState`]
 /// (crate::input::InputKind::GamepadState) snapshot events — full per-pad state with a reorder

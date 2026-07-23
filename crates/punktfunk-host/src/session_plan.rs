@@ -132,6 +132,13 @@ pub struct SessionPlan {
     /// redundant work producing a SECOND pointer. Resolved by [`cursor_blend_for`]'s sibling so
     /// the two answers cannot disagree.
     pub gamescope_cursor: bool,
+    /// Ceiling on the encoder's per-frame slice count, from the client's
+    /// [`VIDEO_CAP_MULTI_SLICE`](punktfunk_core::quic::VIDEO_CAP_MULTI_SLICE): 32 (= no
+    /// client-side limit, the backend picks its own multi-slice default, §7 LN1) when the bit is
+    /// set, 1 (single-slice frames — the pre-0.17 wire shape TV-SoC decoders like Amlogic
+    /// require) when it isn't. Applied to EVERY encoder this plan opens (initial + all rebuilds)
+    /// so the slicing can never change shape across a mode/bitrate/stall rebuild.
+    pub max_slices: u32,
 }
 
 impl SessionPlan {
@@ -143,6 +150,7 @@ impl SessionPlan {
         codec: crate::encode::Codec,
         cursor_blend: bool,
         cursor_forward: bool,
+        multi_slice: bool,
     ) -> Self {
         SessionPlan {
             capture: CaptureBackend::resolve(),
@@ -158,6 +166,7 @@ impl SessionPlan {
             // Set by the resolve callers (they know the compositor); default off keeps every
             // non-gamescope plan unchanged.
             gamescope_cursor: false,
+            max_slices: if multi_slice { 32 } else { 1 },
         }
     }
 

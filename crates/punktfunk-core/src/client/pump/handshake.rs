@@ -136,6 +136,9 @@ pub(super) async fn connect_and_handshake(args: &WorkerArgs) -> Result<Handshake
                 // video frame indexes. STREAMED_AU the same way: the shared reassembler accepts
                 // sentinel-headed streamed blocks (retro-validated at the final block), so the host
                 // may overlap a multi-slice encode's tail with packetize/FEC/pacing.
+                // VIDEO_CAP_MULTI_SLICE must NOT join this unconditional set: it is DECODER
+                // truth (Amlogic MediaCodec wedges on multi-slice AUs — the 0.17.0 Chromecast
+                // regression), so only the embedder can set it, per its decode stack.
                 video_caps: video_caps
                     | crate::quic::VIDEO_CAP_HOST_TIMING
                     | crate::quic::VIDEO_CAP_PROBE_SEQ

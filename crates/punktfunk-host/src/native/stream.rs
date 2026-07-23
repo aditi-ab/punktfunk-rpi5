@@ -992,6 +992,12 @@ pub(super) struct SessionContext {
     /// AU's FEC blocks under sentinel headers as the slices complete instead of waiting for the
     /// whole AU. `false` = older client — chunks (if any) are drained whole-AU, zero wire change.
     pub(super) streamed_au: bool,
+    /// The client advertised [`punktfunk_core::quic::VIDEO_CAP_MULTI_SLICE`]: its decoder
+    /// accepts multi-slice AUs, so the session's encoder may keep its multi-slice default
+    /// (§7 LN1 — becomes [`SessionPlan::max_slices`](crate::session_plan::SessionPlan)).
+    /// `false` = single-slice frames, the pre-0.17 wire shape TV-SoC decoders (Amlogic —
+    /// Chromecast with Google TV) require to not wedge.
+    pub(super) multi_slice: bool,
     /// Shared streaming-stats recorder. The capture loop reads `is_armed()` per frame to decide
     /// whether to measure the per-stage split; the send thread builds + pushes the aggregated
     /// `StatsSample` at its 2 s boundary.
@@ -1092,6 +1098,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
             ctx.bit_depth,
         ),
         ctx.cursor_forward,
+        ctx.multi_slice,
     );
     // gamescope: the XFixes cursor source feeds the host-side composite (Phase C) — unless the
     // spawned gamescope paints the pointer into its node itself, in which case the reader would
@@ -1141,6 +1148,8 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
         cursor_client_draws,
         probe_seq,
         streamed_au,
+        // Already folded into `plan.max_slices` by the resolve above — nothing below reads it.
+        multi_slice: _,
         stats,
         client_label,
         client_name,
@@ -2044,6 +2053,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                     bit_depth,
                     plan.chroma,
                     plan.cursor_blend,
+                    plan.max_slices,
                 ) {
                     Ok(mut new_enc) => {
                         // The fresh encoder may have clamped to its codec-level ceiling —
@@ -3393,6 +3403,7 @@ fn try_inplace_resize(
         bit_depth,
         plan.chroma,
         plan.cursor_blend,
+        plan.max_slices,
     ) {
         Ok(e) => e,
         Err(e) => {
@@ -3450,6 +3461,7 @@ pub(super) fn prepare_display(
     client_identity: Option<[u8; 32]>,
     client_hdr: Option<punktfunk_core::quic::HdrMeta>,
     cursor_forward: bool,
+    multi_slice: bool,
     bitrate_kbps: u32,
     // Passed through to [`build_pipeline`] — see its parameter of the same name.
     bitrate_auto: bool,
@@ -3478,6 +3490,7 @@ pub(super) fn prepare_display(
             bit_depth,
         ),
         cursor_forward,
+        multi_slice,
     );
     plan.gamescope_cursor =
         crate::session_plan::gamescope_cursor_for(compositor == pf_vdisplay::Compositor::Gamescope);
@@ -3899,6 +3912,7 @@ fn build_pipeline(
         bit_depth,
         plan.chroma,
         plan.cursor_blend,
+        plan.max_slices,
     )
     .context("open video encoder")?;
     if let Some(t) = trace {

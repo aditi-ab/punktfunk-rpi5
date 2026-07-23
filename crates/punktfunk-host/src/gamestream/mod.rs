@@ -627,6 +627,7 @@ mod session_tests {
             codec: crate::encode::Codec::H265,
             min_fec: 0,
             hdr: false,
+            slices: 1, // the no-request default — hardware decoders get single-slice AUs
         });
 
         assert!(state.end_session("test"), "video was live");

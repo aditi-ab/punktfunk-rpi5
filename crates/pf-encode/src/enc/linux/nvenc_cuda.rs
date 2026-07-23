@@ -795,10 +795,17 @@ pub struct NvencCudaEncoder {
     /// [`stream_ordered_requested`]). The per-frame gate additionally requires `pending` empty.
     stream_ordered: bool,
     /// Slice count the live session was configured with ([`resolve_slices`] — env override,
-    /// else the Linux direct-NVENC default of 4 since Phase 3; 1 = the preset's single slice).
+    /// else the Linux direct-NVENC default of 4 since Phase 3 clamped to
+    /// [`max_slices`](Self::max_slices); 1 = the preset's single slice).
     /// Chunked poll needs ≥ 2 to have boundaries to cut at. Latched at init, consumed by
     /// `build_config` (so an in-place reconfigure presents the same slicing).
     slices: u32,
+    /// Ceiling on the per-frame slice count the session's CLIENT decoder accepts (from
+    /// negotiation: `VIDEO_CAP_MULTI_SLICE`, or GameStream's `videoEncoderSlicesPerFrame`).
+    /// 1 = single-slice only — the safe shape toward decoders that never asked (Amlogic TV
+    /// SoCs wedge on multi-slice AUs). Clamps the Phase-3 default; the explicit
+    /// `PUNKTFUNK_NVENC_SLICES` env override still wins in both directions.
+    max_slices: u32,
     /// `NV_ENC_CAPS_SUPPORT_SUBFRAME_READBACK` from the caps probe — gates the DEFAULT-on
     /// sub-frame arming (an unsupported GPU must not have `enableSubFrameWrite` forced into its
     /// init params, which could fail the session open). `PUNKTFUNK_NVENC_SUBFRAME=1` overrides.
@@ -847,6 +854,7 @@ impl NvencCudaEncoder {
         bit_depth: u8,
         chroma: ChromaFormat,
         cursor_blend: bool,
+        max_slices: u32,
     ) -> Result<Self> {
         // The runtime `.so` load is the real "is NVENC possible here" gate: fail the open with a
         // clear reason instead of an opaque session error on the first frame.
@@ -895,6 +903,8 @@ impl NvencCudaEncoder {
             io_stream: ptr::null_mut(),
             stream_ordered: false,
             slices: 1,
+            // A zero from a misbehaving caller must not zero the resolver's default arithmetic.
+            max_slices: max_slices.max(1),
             subframe_cap: false,
             subframe_on: false,
             subframe_forced: false,
@@ -1094,9 +1104,14 @@ impl NvencCudaEncoder {
         // every Linux direct-NVENC session, resolved HERE (before the session opens) so the
         // config author, the init params and the chunked-poll latch all agree; the caps probe
         // gates the sub-frame default so a GPU without SUBFRAME_READBACK never has it forced
-        // into its init params. PUNKTFUNK_NVENC_SLICES=1 / PUNKTFUNK_NVENC_SUBFRAME=0 are the
-        // escapes.
-        self.slices = resolve_slices(self.codec, 4);
+        // into its init params. The Phase-3 default is CLAMPED to the session's negotiated
+        // `max_slices` — the client-decoder ceiling (`VIDEO_CAP_MULTI_SLICE`, or GameStream's
+        // `videoEncoderSlicesPerFrame`): a client that never asked for multi-slice AUs gets
+        // single-slice frames, because TV-SoC decoders (Amlogic — Chromecast with Google TV)
+        // wedge the whole device on frames carrying several slice NALs (the 0.17.0 field
+        // regression). PUNKTFUNK_NVENC_SLICES / PUNKTFUNK_NVENC_SUBFRAME stay the explicit
+        // operator overrides in both directions.
+        self.slices = resolve_slices(self.codec, 4.min(self.max_slices));
         self.subframe_on = resolve_subframe(self.subframe_cap);
         self.subframe_forced = subframe_env_forced();
         tracing::info!(
@@ -1105,6 +1120,8 @@ impl NvencCudaEncoder {
             yuv444 = self.yuv444_supported,
             subframe_readback = subframe != 0,
             dynamic_slice = dyn_slice != 0,
+            slices = self.slices,
+            max_slices = self.max_slices,
             max = %format!("{wmax}x{hmax}"),
             "NVENC (Linux direct) capabilities probed"
         );
@@ -2559,6 +2576,7 @@ mod tests {
             8,
             ChromaFormat::Yuv420,
             false,
+            4,
         )
         .expect("open NVENC CUDA session");
 
@@ -2657,6 +2675,7 @@ mod tests {
                 10,
                 ChromaFormat::Yuv420,
                 false,
+                4,
             )
             .expect("open NVENC CUDA session");
 
@@ -2737,6 +2756,7 @@ mod tests {
             10,
             ChromaFormat::Yuv420,
             true, // cursor_blend: bring up the Vulkan slot ring + the 10-bit blend
+            4,
         )
         .expect("open NVENC CUDA session");
         let cursor = |serial: u64, x: i32, y: i32| pf_frame::CursorOverlay {
@@ -2802,6 +2822,7 @@ mod tests {
             8,
             ChromaFormat::Yuv444,
             false,
+            4,
         )
         .expect("open NVENC CUDA 4:4:4 session");
 
@@ -2848,6 +2869,7 @@ mod tests {
             8,
             ChromaFormat::Yuv420,
             false,
+            4,
         )
         .expect("open NVENC CUDA session");
 
@@ -2906,6 +2928,7 @@ mod tests {
             8,
             ChromaFormat::Yuv420,
             false,
+            4,
         ) else {
             eprintln!(
                 "skipping rfi_declines_impossible_ranges: NVENC unavailable (no NVIDIA driver)"
@@ -2933,6 +2956,7 @@ mod tests {
             8,
             ChromaFormat::Yuv420,
             false,
+            4,
         )
         .expect("open NVENC CUDA encoder")
     }
@@ -2968,6 +2992,7 @@ mod tests {
                 8,
                 ChromaFormat::Yuv420,
                 false,
+                4,
             )
             .expect("open");
             for f in 0..4u32 {
@@ -3106,6 +3131,7 @@ mod tests {
             8,
             ChromaFormat::Yuv420,
             false,
+            4,
         )
         .expect("open NVENC CUDA session");
         let frame = nv12_frame(W, H, 0);
@@ -3149,6 +3175,7 @@ mod tests {
             8,
             ChromaFormat::Yuv420,
             true, // cursor_blend: bring up the Vulkan slot ring + blend
+            4,
         )
         .expect("open NVENC CUDA session");
         let cursor = |serial: u64, x: i32, y: i32| pf_frame::CursorOverlay {
@@ -3227,6 +3254,7 @@ mod tests {
             8,
             ChromaFormat::Yuv420,
             false,
+            4,
         )
         .expect("open NVENC CUDA session");
         // Steady sync frames first (stream-ordered mode).
@@ -3307,6 +3335,7 @@ mod tests {
             8,
             ChromaFormat::Yuv420,
             false,
+            4,
         )
         .expect("open NVENC CUDA session");
 
@@ -3413,6 +3442,7 @@ mod tests {
             8,
             ChromaFormat::Yuv420,
             false,
+            4,
         )
         .expect("open NVENC CUDA session");
 
@@ -3481,6 +3511,49 @@ mod tests {
             .expect("submit plain-poll frame");
         let au = enc.poll().expect("poll").expect("AU");
         assert!(!au.data.is_empty());
+    }
+
+    /// ON-HARDWARE (RTX box `.21`): a session whose CLIENT ceiling is 1 slice (`max_slices` from
+    /// negotiation — no cap bit / Moonlight `videoEncoderSlicesPerFrame:1`, the Chromecast field
+    /// regression's fix) must encode single-slice frames with chunked poll disarmed, with NO env
+    /// knobs involved. Run with `--test-threads=1` (env vars are process-global).
+    #[test]
+    #[ignore = "requires an NVIDIA GPU + driver — run manually on the RTX box (.21)"]
+    fn nvenc_cuda_single_slice_client_ceiling() {
+        const W: u32 = 1920;
+        const H: u32 = 1080;
+        // The ceiling under test is the negotiated one, not the operator override.
+        std::env::remove_var("PUNKTFUNK_NVENC_SLICES");
+        std::env::remove_var("PUNKTFUNK_NVENC_SUBFRAME");
+        pf_zerocopy::cuda::make_current().expect("shared CUDA context current");
+        let mut enc = NvencCudaEncoder::open(
+            Codec::H265,
+            PixelFormat::Nv12,
+            W,
+            H,
+            60,
+            20_000_000,
+            true,
+            8,
+            ChromaFormat::Yuv420,
+            false,
+            1, // the client never advertised multi-slice tolerance
+        )
+        .expect("open NVENC CUDA session");
+        for i in 0..4u32 {
+            let frame = nv12_frame(W, H, i);
+            enc.submit_indexed(&frame, i).expect("submit");
+            assert_eq!(
+                enc.slices, 1,
+                "a 1-slice client ceiling must clamp the Phase-3 default"
+            );
+            assert!(
+                !enc.supports_chunked_poll(),
+                "single-slice sessions have no boundaries — chunked poll must stay disarmed"
+            );
+            let au = enc.poll().expect("poll").expect("one AU per sync frame");
+            assert!(!au.data.is_empty(), "frame {i} produced an empty AU");
+        }
     }
 
     /// ON-HARDWARE (RTX box `.21`): the Phase-3 default-on ESCAPES — `PUNKTFUNK_NVENC_SLICES=1`

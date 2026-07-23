@@ -556,6 +556,17 @@ fn stream_config(map: &HashMap<String, String>) -> Option<StreamConfig> {
     let min_fec = parse_u("x-nv-vqos[0].fec.minRequiredFecPackets")
         .unwrap_or(2)
         .min(16) as u8;
+    // The client's requested per-frame slice count (moonlight-common-c SdpGenerator.c:
+    // `videoEncoderSlicesPerFrame`) — 1 for every HARDWARE decoder, 4 only for software
+    // decoders (slice-threading). Honor it as the encoder's slicing ceiling: GFE/Sunshine
+    // encode what was asked, and hardware TV decoders (Amlogic — Chromecast with Google TV)
+    // wedge the whole DEVICE on multi-slice AUs they never requested — the 0.17.0 field
+    // regression, where the Linux direct-NVENC 4-slice default (§7 LN1) ignored this key and
+    // froze + watchdog-rebooted CCwGTV clients on the first frame. Absent or out-of-range
+    // (attacker-controlled pre-auth input) ⇒ 1, the universally-safe single-slice shape.
+    let slices = parse_u("x-nv-video[0].videoEncoderSlicesPerFrame")
+        .filter(|n| (1..=32).contains(n))
+        .unwrap_or(1);
     Some(StreamConfig {
         width,
         height,
@@ -565,6 +576,7 @@ fn stream_config(map: &HashMap<String, String>) -> Option<StreamConfig> {
         codec,
         min_fec,
         hdr,
+        slices,
     })
 }
 
@@ -724,6 +736,30 @@ mod tests {
                 stream_config(&map).is_some(),
                 "in-range packetSize {ok} must be accepted"
             );
+        }
+    }
+
+    /// `videoEncoderSlicesPerFrame` is honored as the encoder's slicing ceiling: Moonlight sends
+    /// 1 for every hardware decoder (Amlogic TV SoCs wedge on multi-slice AUs — the 0.17.0
+    /// Chromecast regression) and 4 for software decoders. Absent or out-of-range (pre-auth,
+    /// attacker-controlled) must fall back to the universally-safe 1, never reject the session.
+    #[test]
+    fn announce_slices_per_frame() {
+        // Absent (very old client) → single-slice.
+        assert_eq!(stream_config(&announce(&[])).unwrap().slices, 1);
+        // The two real Moonlight values pass through verbatim.
+        for want in ["1", "4"] {
+            let map = announce(&[("x-nv-video[0].videoEncoderSlicesPerFrame", want)]);
+            assert_eq!(
+                stream_config(&map).unwrap().slices,
+                want.parse::<u32>().unwrap()
+            );
+        }
+        // Garbage / out-of-range degrades to 1 (still streams — this key must never kill a session).
+        for bad in ["0", "33", "999999", "-1", "x"] {
+            let map = announce(&[("x-nv-video[0].videoEncoderSlicesPerFrame", bad)]);
+            let cfg = stream_config(&map).expect("session must still negotiate");
+            assert_eq!(cfg.slices, 1, "slicesPerFrame {bad} must degrade to 1");
         }
     }
 
