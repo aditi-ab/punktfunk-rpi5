@@ -40,12 +40,14 @@ _urlencode() { python3 -c 'import urllib.parse,sys;print(urllib.parse.quote(sys.
 #   else print nothing. This file is the single source of truth for a stable release's body
 #   (authored as part of the version bump, before the tag is pushed — see docs/releases/README.md),
 #   so the Gitea release is born WITH its notes instead of being PATCHed noteless-then-late.
-#   Resolves relative to this script (scripts/ci/ -> repo root); canary/rc tags have no such file,
-#   which is intended (they get no curated body).
+#   canary/rc tags have no such file, which is intended (they get no curated body).
+#
+#   Resolved relative to CWD: every caller sources this as `. scripts/ci/gitea-release.sh` from the
+#   repo root, so the notes are always docs/releases/<tag>.md from here. Do NOT use ${BASH_SOURCE[0]}
+#   — the deb + decky attach steps run under POSIX sh (dash), where an array subscript is a fatal
+#   "Bad substitution" (it silently broke the v0.19.0 deb/decky release-attach).
 _release_notes_path() {
-  local root notes
-  root="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/../.." && pwd)"
-  notes="$root/docs/releases/$1.md"
+  local notes="docs/releases/$1.md"
   [ -f "$notes" ] && printf '%s' "$notes"
 }
 
