@@ -35,6 +35,20 @@ for a in json.load(sys.stdin):
 }
 _urlencode() { python3 -c 'import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1],safe=""))' "$1"; }
 
+# _release_notes_path TAG
+#   Print the path of the in-repo release notes for TAG (docs/releases/<TAG>.md) IFF it exists,
+#   else print nothing. This file is the single source of truth for a stable release's body
+#   (authored as part of the version bump, before the tag is pushed — see docs/releases/README.md),
+#   so the Gitea release is born WITH its notes instead of being PATCHed noteless-then-late.
+#   Resolves relative to this script (scripts/ci/ -> repo root); canary/rc tags have no such file,
+#   which is intended (they get no curated body).
+_release_notes_path() {
+  local root notes
+  root="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/../.." && pwd)"
+  notes="$root/docs/releases/$1.md"
+  [ -f "$notes" ] && printf '%s' "$notes"
+}
+
 # ensure_release TAG NAME PRERELEASE [TARGET_COMMITISH]
 #   Idempotently create (or fetch) the release for TAG; prints its numeric id on stdout.
 #   PRERELEASE is "true", "false", or "auto" — auto marks it a prerelease iff TAG carries a
@@ -49,12 +63,25 @@ ensure_release() {
     case "$tag" in *-*) prerelease=true ;; *) prerelease=false ;; esac
   fi
   api="$(_gitea_api)"
-  if [ -n "$target" ]; then
-    body=$(printf '{"tag_name":"%s","name":"%s","prerelease":%s,"target_commitish":"%s"}' \
-             "$tag" "$name" "$prerelease" "$target")
-  else
-    body=$(printf '{"tag_name":"%s","name":"%s","prerelease":%s}' "$tag" "$name" "$prerelease")
-  fi
+  # Build the create payload with python3 so the (multi-line, quote-bearing) release body from
+  # docs/releases/<tag>.md is JSON-escaped correctly. Whichever workflow wins the create race thus
+  # sets the body ATOMICALLY at creation; the losers 409 and fall through to the fetch-by-tag path
+  # below (which never touches the body). No notes file (canary/rc) -> no body key -> empty body.
+  local notes; notes="$(_release_notes_path "$tag")"
+  body=$(TAG="$tag" NAME="$name" PRERELEASE="$prerelease" TARGET="$target" NOTES_FILE="$notes" \
+    python3 - <<'PY'
+import json, os
+d = {"tag_name": os.environ["TAG"], "name": os.environ["NAME"],
+     "prerelease": os.environ["PRERELEASE"] == "true"}
+if os.environ.get("TARGET"):
+    d["target_commitish"] = os.environ["TARGET"]
+nf = os.environ.get("NOTES_FILE") or ""
+if nf:
+    with open(nf, encoding="utf-8") as f:
+        d["body"] = f.read()
+print(json.dumps(d))
+PY
+)
   # Try to create. On any failure (almost always "release already exists"), fall back to
   # fetching it by tag. Either path MUST yield an id, or we error loudly — so a 401/scope
   # problem can't masquerade as a successful no-op.
@@ -92,4 +119,24 @@ upsert_asset() {
     -H "Authorization: token ${GITEA_TOKEN:?}" \
     -F "attachment=@$file"
   echo "gitea-release: uploaded '$name' -> release $rid"
+}
+
+# apply_release_notes RELEASE_ID TAG
+#   Force the release body to match docs/releases/<TAG>.md (the source of truth), if that file
+#   exists — a no-op otherwise. PATCHes ONLY the body, so name/prerelease/assets are preserved
+#   (Gitea has no partial-update footgun here; sending just {"body":...} leaves everything else).
+#   ensure_release already seeds the body at creation; this exists so the announce step can
+#   re-assert the file over the live release right before publishing — covering the case where the
+#   notes file was edited after the release object was first created (e.g. a tag re-point).
+apply_release_notes() {
+  local rid="${1:?release id}" tag="${2:?tag}" api notes payload
+  notes="$(_release_notes_path "$tag")"
+  [ -n "$notes" ] || { echo "gitea-release: no docs/releases/$tag.md — leaving body as-is"; return 0; }
+  api="$(_gitea_api)"
+  payload=$(NOTES_FILE="$notes" python3 -c \
+    'import json,os;print(json.dumps({"body":open(os.environ["NOTES_FILE"],encoding="utf-8").read()}))')
+  curl -fsS -o /dev/null -X PATCH "$api/releases/$rid" \
+    -H "Authorization: token ${GITEA_TOKEN:?}" -H 'Content-Type: application/json' \
+    -d "$payload"
+  echo "gitea-release: synced release $rid body from $notes"
 }

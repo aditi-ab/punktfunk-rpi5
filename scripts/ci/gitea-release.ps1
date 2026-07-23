@@ -40,6 +40,11 @@ function Ensure-GiteaRelease {
   $api = _GiteaApi; $h = _GiteaHeaders
   $payload = @{ tag_name = $Tag; name = $Name; prerelease = $pre }
   if ($TargetCommitish) { $payload.target_commitish = $TargetCommitish }
+  # Seed the body from docs/releases/<Tag>.md (the source of truth) so a Windows job winning the
+  # create race is born WITH its notes, exactly like the bash twin. Missing file (canary/rc) -> no
+  # body key. $PSScriptRoot is scripts/ci; walk up two levels to the repo root.
+  $notes = Join-Path (Split-Path (Split-Path $PSScriptRoot -Parent) -Parent) "docs/releases/$Tag.md"
+  if (Test-Path $notes) { $payload.body = Get-Content -Raw -Encoding utf8 $notes }
   try {
     $r = Invoke-RestMethod -Method Post -Uri "$api/releases" -Headers $h `
            -ContentType 'application/json' -Body ($payload | ConvertTo-Json -Compress)

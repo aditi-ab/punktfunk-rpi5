@@ -1,0 +1,39 @@
+# Announce a stable release to the Discord #releases channel.
+#
+# This is the deliberate "go" step for a release. Release notes live in the repo at
+# docs/releases/<tag>.md and are seeded into the Gitea release body at creation by the build
+# workflows (scripts/ci/gitea-release.sh), so the release is never noteless. Once every
+# platform's CI is green for a tag, dispatch this workflow with that tag: it re-asserts the notes
+# file over the live release and posts a formatted embed to #releases.
+#
+# Manual on purpose — pressing "go" is the quality gate that says "all platforms built, notes are
+# final, tell the community." It is NOT wired to the tag push, so a half-built or failed release
+# is never announced. Stable-only: a -rc/pre-release tag is refused unless allow_prerelease=true.
+#
+# Requires the repo secret DISCORD_RELEASE_WEBHOOK (the #releases channel webhook URL); GITEA auth
+# reuses REGISTRY_TOKEN like the other release workflows.
+name: announce
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to announce (e.g. v0.18.0)"
+        required: true
+      allow_prerelease:
+        description: "Announce even if the tag is a pre-release (-rc)"
+        required: false
+        default: "false"
+
+jobs:
+  announce:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Post release announcement to Discord
+        env:
+          GITEA_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+          DISCORD_RELEASE_WEBHOOK: ${{ secrets.DISCORD_RELEASE_WEBHOOK }}
+          ALLOW_PRERELEASE: ${{ inputs.allow_prerelease }}
+        run: bash scripts/ci/discord-announce.sh "${{ inputs.tag }}"
