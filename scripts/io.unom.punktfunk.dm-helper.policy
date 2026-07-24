@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1.0/policyconfig.dtd">
+<policyconfig>
+  <vendor>Punktfunk</vendor>
+  <vendor_url>https://punktfunk.unom.io</vendor_url>
+
+  <!-- Stop/restore the box's display manager for a managed gamescope takeover. The helper derives
+       the unit from the display-manager.service symlink itself (no caller-chosen units), so this
+       grant is scoped to the box's own local-seat session lifecycle — the same class of operation
+       these distros already authorize for their session switcher (e.g. Nobara's
+       os-session-select, allow_any). allow_any because the host commonly runs sessionless (a
+       lingering user unit, no polkit agent), where interactive auth can never be answered. -->
+  <action id="io.unom.punktfunk.dm-helper">
+    <description>Stop or restore the display manager for a Punktfunk stream</description>
+    <message>Authentication is required to switch the display manager for a Punktfunk stream</message>
+    <defaults>
+      <allow_any>yes</allow_any>
+      <allow_inactive>yes</allow_inactive>
+      <allow_active>yes</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/libexec/punktfunk/pf-dm-helper</annotate>
+  </action>
+</policyconfig>

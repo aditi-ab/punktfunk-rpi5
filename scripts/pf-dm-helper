@@ -1,0 +1,39 @@
+#!/bin/sh
+# Privileged display-manager verbs for the punktfunk managed gamescope takeover.
+#
+# On DM-autologin boxes whose display manager does not survive a masked session unit (Nobara's
+# plasmalogin, unknown DMs), taking the Gaming Mode session over means stopping the display
+# manager for the length of the stream and restarting it afterwards — root-only operations. The
+# host invokes this helper via pkexec under its own polkit action
+# (io.unom.punktfunk.dm-helper.policy, installed by the packages), the same mechanism these
+# distros use for their own session switching (Nobara's os-session-select).
+#
+# The unit is NEVER caller-controlled: it is derived here from the display-manager.service alias
+# symlink, so the polkit grant's blast radius is exactly "the box's own display manager" — a
+# local-seat operation, not arbitrary unit management.
+set -eu
+
+dm_unit() {
+  target=$(readlink /etc/systemd/system/display-manager.service) || {
+    echo "pf-dm-helper: no display-manager.service alias — no display manager to manage" >&2
+    exit 1
+  }
+  basename "$target"
+}
+
+case "${1-}" in
+  stop)
+    exec systemctl stop "$(dm_unit)"
+    ;;
+  restore)
+    dm=$(dm_unit)
+    # reset-failed first: a relogin loop may have tripped the unit's start limit, and a plain
+    # restart would be refused until the accounting is cleared.
+    systemctl reset-failed "$dm" 2>/dev/null || :
+    exec systemctl restart "$dm"
+    ;;
+  *)
+    echo "usage: pf-dm-helper stop|restore" >&2
+    exit 2
+    ;;
+esac

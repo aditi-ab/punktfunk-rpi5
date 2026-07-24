@@ -40,8 +40,16 @@ depends on the display manager driving the autologin:
 
 - **SDDM** (Bazzite, SteamOS): handled automatically — no setup.
 - **plasmalogin** (Nobara) and other display managers: the host must stop the display manager
-  itself for the length of the stream and restart it afterwards, which needs privilege. Allow it
-  with a polkit rule (adjust the unit and user names to your box):
+  itself for the length of the stream and restart it afterwards, which needs privilege. The
+  packages ship that privilege: a root helper (`/usr/libexec/punktfunk/pf-dm-helper`) behind its
+  own polkit action (`io.unom.punktfunk.dm-helper`), invoked automatically when the plain
+  `systemctl` verbs are denied — no setup. The helper only stops/restores the unit the
+  `display-manager.service` symlink points at, the same class of local-seat operation these
+  distros already authorize for their own session switcher (Nobara's `os-session-select`).
+
+  Installed from a tarball, or prefer not to ship the `allow_any` action? Remove the `.policy`
+  file and use a polkit rule scoped to your user instead (adjust the unit and user names to your
+  box) — the host tries the plain verbs first, so the rule takes precedence:
 
   ```js
   // /etc/polkit-1/rules.d/49-punktfunk-dm.rules
@@ -54,15 +62,16 @@ depends on the display manager driving the autologin:
   });
   ```
 
-  Without the rule the host degrades safely: it **attaches** to the live Gaming Mode session
-  instead (Game Mode stays on the box's display, mirrored to the client) rather than risk the
-  display manager. If the display-manager restart ever loses its privilege mid-restore,
-  `PUNKTFUNK_RECOVER_SESSION_CMD` (see [Configuration](/docs/configuration)) is fired as the
-  fallback.
+  With no privilege path at all the host degrades safely: it **attaches** to the live Gaming Mode
+  session instead (Game Mode stays on the box's display at the box's own resolution, mirrored to
+  the client — if your monitor stays on and the stream runs at the desktop's resolution, this is
+  what happened; check the host log for "managed takeover unavailable"). If the display-manager
+  restart ever loses its privilege mid-restore, `PUNKTFUNK_RECOVER_SESSION_CMD` (see
+  [Configuration](/docs/configuration)) is fired as the fallback.
 
-  With the rule in place the **in-stream session switch round-trips** in managed mode: Steam's
-  "Switch to Desktop" inside the streamed Game Mode returns the box to its desktop session and the
-  stream follows it there; the desktop's "Return to Gaming Mode" switches it forward again.
+  With the takeover authorized the **in-stream session switch round-trips** in managed mode:
+  Steam's "Switch to Desktop" inside the streamed Game Mode returns the box to its desktop session
+  and the stream follows it there; the desktop's "Return to Gaming Mode" switches it forward again.
 
 ## Session following
 

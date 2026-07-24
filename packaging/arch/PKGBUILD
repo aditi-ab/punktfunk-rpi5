@@ -129,6 +129,14 @@ package_punktfunk-host() {
   install -Dm0755 "$T/punktfunk-host"                 "$pkgdir/usr/bin/punktfunk-host"
   # /dev/uinput + /dev/uhid -> input group (virtual gamepads + DualSense UHID)
   install -Dm0644 "$R/scripts/60-punktfunk.rules"     "$pkgdir/usr/lib/udev/rules.d/60-punktfunk.rules"
+  # Managed gamescope takeover on DM-autologin boxes: root helper + polkit action so the host can
+  # stop/restore the display manager for the stream. Arch has no /usr/libexec — install under
+  # /usr/lib/punktfunk and rewrite the policy's exec.path annotation to match (the host probes both).
+  install -Dm0755 "$R/scripts/pf-dm-helper"           "$pkgdir/usr/lib/punktfunk/pf-dm-helper"
+  install -Dm0644 "$R/scripts/io.unom.punktfunk.dm-helper.policy" \
+    "$pkgdir/usr/share/polkit-1/actions/io.unom.punktfunk.dm-helper.policy"
+  sed -i 's#/usr/libexec/punktfunk/pf-dm-helper#/usr/lib/punktfunk/pf-dm-helper#' \
+    "$pkgdir/usr/share/polkit-1/actions/io.unom.punktfunk.dm-helper.policy"
   # vhci-hcd autoload — usbip transport for the virtual Steam Deck pad (Steam only adopts USB pads)
   install -Dm0644 "$R/scripts/punktfunk-modules.conf" "$pkgdir/usr/lib/modules-load.d/punktfunk.conf"
   # 32 MB UDP socket buffers (send-side headroom at high bitrate)

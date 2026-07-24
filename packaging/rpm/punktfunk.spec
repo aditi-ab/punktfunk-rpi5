@@ -249,6 +249,12 @@ install -Dm0755 target/release/punktfunk-host %{buildroot}%{_bindir}/punktfunk-h
 # udev rule — /dev/uinput access for virtual gamepads (input group).
 install -Dm0644 scripts/60-punktfunk.rules %{buildroot}%{_udevrulesdir}/60-punktfunk.rules
 
+# Managed gamescope takeover on DM-autologin boxes (Nobara's plasmalogin): a root helper + polkit
+# action let the host stop/restore the display manager for the stream without a hand-installed
+# polkit rule. The helper derives the DM unit itself — callers can't name arbitrary units.
+install -Dm0755 scripts/pf-dm-helper %{buildroot}%{_libexecdir}/punktfunk/pf-dm-helper
+install -Dm0644 scripts/io.unom.punktfunk.dm-helper.policy %{buildroot}%{_datadir}/polkit-1/actions/io.unom.punktfunk.dm-helper.policy
+
 # vhci-hcd autoload — the usbip transport that makes the virtual Steam Deck controller a
 # real USB device (Steam Input only adopts those; the UHID fallback is invisible to Steam).
 install -Dm0644 scripts/punktfunk-modules.conf %{buildroot}%{_prefix}/lib/modules-load.d/punktfunk.conf
@@ -383,6 +389,9 @@ install -Dm0644 scripts/punktfunk-scripting.service %{buildroot}%{_userunitdir}/
 %{_bindir}/punktfunk-host
 %{_bindir}/punktfunk-tray
 %{_udevrulesdir}/60-punktfunk.rules
+%dir %{_libexecdir}/punktfunk
+%{_libexecdir}/punktfunk/pf-dm-helper
+%{_datadir}/polkit-1/actions/io.unom.punktfunk.dm-helper.policy
 %{_prefix}/lib/modules-load.d/punktfunk.conf
 %{_prefix}/lib/sysctl.d/99-punktfunk-net.conf
 %{_prefix}/lib/firewalld/services/punktfunk-gamestream.xml

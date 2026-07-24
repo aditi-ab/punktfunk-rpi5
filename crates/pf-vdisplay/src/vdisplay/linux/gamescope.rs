@@ -1139,16 +1139,65 @@ fn dm_survives_masked_unit(dm: &str) -> bool {
     dm == "sddm.service"
 }
 
-/// Stop the display manager for a takeover on a mask-fragile DM flavor. Plain `systemctl stop` on
-/// the SYSTEM bus — succeeds as root or under an operator polkit rule scoped to the DM unit (see
-/// docs); fails cleanly otherwise ("interactive authentication required"), in which case the
-/// caller degrades to attach.
-fn try_stop_display_manager(dm: &str) -> bool {
-    Command::new("systemctl")
-        .args(["stop", dm])
+/// The packaged privileged fallback for the display-manager takeover verbs: a root helper behind
+/// its own polkit action (`io.unom.punktfunk.dm-helper`, `allow_any` — the mechanism these
+/// distros use for their own session switcher, e.g. Nobara's `os-session-select`), so the managed
+/// takeover works out of the box on mask-fragile DM flavors with no hand-installed polkit rule.
+/// The helper derives the DM unit from the `display-manager.service` symlink itself, so this
+/// process never gets to name an arbitrary unit across the privilege boundary. Two layouts: the
+/// rpm/deb `libexec` path (what the shipped policy annotates) and Arch's `/usr/lib/<pkg>` (its
+/// PKGBUILD rewrites the annotation to match).
+const DM_HELPER_PATHS: &[&str] = &[
+    "/usr/libexec/punktfunk/pf-dm-helper",
+    "/usr/lib/punktfunk/pf-dm-helper",
+];
+
+/// Run the packaged DM helper (`stop` | `restore`) via pkexec. `false` when the helper isn't
+/// installed (tarball/old package), pkexec is missing, or polkit denies the action.
+fn dm_helper(verb: &str) -> bool {
+    let Some(helper) = DM_HELPER_PATHS
+        .iter()
+        .find(|p| std::path::Path::new(p).exists())
+    else {
+        return false;
+    };
+    Command::new("pkexec")
+        .arg(helper)
+        .arg(verb)
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+/// Stop the display manager for a takeover on a mask-fragile DM flavor. Plain `systemctl stop` on
+/// the SYSTEM bus first — succeeds as root or under an operator polkit rule scoped to the DM unit
+/// (see docs); fails cleanly otherwise ("interactive authentication required") — then the
+/// packaged pkexec helper. `false` means no privilege path exists and the caller degrades to
+/// attach.
+fn try_stop_display_manager(dm: &str) -> bool {
+    let direct = Command::new("systemctl")
+        .args(["stop", dm])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    direct || dm_helper("stop")
+}
+
+/// Restore the display manager: `reset-failed` (a relogin loop may have tripped the unit's start
+/// limit, and a plain restart is refused until the accounting clears) + `restart` — its autologin
+/// session Exec brings the box's own session back up. Plain system-bus verbs first (root / an
+/// operator polkit rule), then the packaged pkexec helper, whose `restore` verb performs the same
+/// two steps as root.
+fn restore_display_manager(dm: &str) -> bool {
+    let _ = Command::new("systemctl")
+        .args(["reset-failed", dm])
+        .status();
+    let direct = Command::new("systemctl")
+        .args(["restart", dm])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    direct || dm_helper("restore")
 }
 
 /// The distro's session-switch helper (ChimeraOS/Nobara layout). Its USER pass records the
@@ -1219,10 +1268,13 @@ fn honor_session_select_switch(dm: String) {
     clear_takeover();
     *MANAGED_SESSION.lock().unwrap_or_else(|e| e.into_inner()) = None;
     stop_session(SESSION_UNIT); // dead already (the switch shut its Steam down) — clear the unit
-    let _ = Command::new("systemctl")
-        .args(["reset-failed", &dm])
-        .status();
-    let _ = Command::new("systemctl").args(["start", &dm]).status();
+    if !restore_display_manager(&dm) {
+        tracing::warn!(
+            %dm,
+            "gamescope: display-manager start was denied — the desktop switch may need a manual \
+             `systemctl restart` of the DM"
+        );
+    }
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
         let active = Command::new("systemctl")
@@ -1343,8 +1395,10 @@ fn stop_autologin_sessions() -> Result<()> {
         if !try_stop_display_manager(&dm) {
             bail!(
                 "the box's gaming session is driven by {dm}, which does not survive a masked \
-                 session unit, and stopping it needs privilege — install the punktfunk \
-                 display-manager polkit rule (see docs) to enable the managed takeover"
+                 session unit, and stopping it needs privilege — the packaged pf-dm-helper \
+                 polkit action is missing or was denied (reinstall the punktfunk package, or \
+                 install the display-manager polkit rule from the docs) so the managed takeover \
+                 is unavailable"
             );
         }
         tracing::info!(
@@ -1668,14 +1722,7 @@ fn do_restore_tv_session() {
     // (`reset-failed` clears the relogin start-limit accounting, then `restart`); its autologin
     // session Exec starts the gamescope unit itself.
     if let Some(dm) = dm {
-        let _ = Command::new("systemctl")
-            .args(["reset-failed", &dm])
-            .status();
-        let restart = Command::new("systemctl")
-            .args(["restart", &dm])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
+        let restart = restore_display_manager(&dm);
         if restart {
             tracing::info!(%dm, "restored the display manager (its autologin brings gaming mode back)");
         } else if crate::try_recover_session() {
