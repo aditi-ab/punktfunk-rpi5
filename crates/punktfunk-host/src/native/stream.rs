@@ -1453,6 +1453,10 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
     const DEPTH_ESCALATE: u32 = 20;
     const DEPTH_BEHIND_CAP: u32 = 60;
     const DEPTH_WARMUP_FRAMES: u64 = 60;
+    // Half the escalate threshold: ~10 net behind-frames is already solid "the encoder, not the
+    // network, is the bottleneck" evidence — enough to flag `cadence_degraded` (the control task
+    // then refuses bitrate CLIMBS) well before the session pays a latency escalation for it.
+    const DEPTH_DEGRADE: u32 = 10;
     while !stop.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
         // Mid-stream session switch (the box flipped Gaming↔Desktop): rebuild the WHOLE backend in
         // place — a different compositor at the SAME client mode — keeping the Session + send thread
@@ -1691,15 +1695,49 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
         while let Ok(k) = bitrate_rx.try_recv() {
             want_kbps = Some(k);
         }
+        // Known-ceiling pre-clamp (§ABR overdrive): once the encoder's codec-level ceiling is
+        // known, resolve an over-asking request HERE — a request that clamps to the rate we're
+        // already at then skips the whole apply, where the pre-fix path bounced every overshoot
+        // off the driver into a full rebuild + IDR (~0.6 s each, four in one logged minute).
+        // (The control task clamps its acks from the same atomic; this covers requests already
+        // in flight when the ceiling was discovered.)
+        if let Some(k) = want_kbps.as_mut() {
+            let ceiling = encoder_ceiling_kbps.load(Ordering::Relaxed);
+            if ceiling != 0 && *k > ceiling {
+                tracing::info!(
+                    requested_kbps = *k,
+                    ceiling_kbps = ceiling,
+                    "bitrate request clamped to the known encoder ceiling"
+                );
+                *k = ceiling;
+            }
+        }
         if let Some(new_kbps) = want_kbps.filter(|&k| k != bitrate_kbps) {
             if enc.reconfigure_bitrate(new_kbps as u64 * 1000) {
+                // Adopt the encoder's post-clamp truth, not the request: it feeds the send
+                // pacer, the console/mgmt view and the control task's acks, and a short apply
+                // teaches the ceiling used above.
+                let applied_kbps = enc
+                    .applied_bitrate_bps()
+                    .map(|b| (b / 1000) as u32)
+                    .filter(|&k| k > 0)
+                    .unwrap_or(new_kbps);
                 tracing::info!(
                     from_kbps = bitrate_kbps,
-                    to_kbps = new_kbps,
+                    to_kbps = applied_kbps,
+                    requested_kbps = new_kbps,
                     "encoder bitrate reconfigured in place (adaptive bitrate — no IDR)"
                 );
-                bitrate_kbps = new_kbps;
-                live_bitrate.store(new_kbps, Ordering::Relaxed);
+                if applied_kbps < new_kbps {
+                    encoder_ceiling_kbps.store(applied_kbps, Ordering::Relaxed);
+                }
+                if applied_kbps < bitrate_kbps {
+                    // Down-step: the behind-cadence backlog was scored against the old,
+                    // heavier rate — clean slate so it can't feed a false escalation.
+                    behind_score = 0;
+                }
+                bitrate_kbps = applied_kbps;
+                live_bitrate.store(applied_kbps, Ordering::Relaxed);
                 // Same encoder, same stream: the in-flight AUs and the wire-index prediction
                 // stay valid — no inflight forfeit, no IDR-cooldown anchor.
             } else {
@@ -1719,9 +1757,17 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                     plan.cursor_blend,
                 ) {
                     Ok(mut new_enc) => {
+                        // The fresh encoder may have clamped to its codec-level ceiling —
+                        // adopt (and record) ITS rate, not the request; see the in-place arm.
+                        let applied_kbps = new_enc
+                            .applied_bitrate_bps()
+                            .map(|b| (b / 1000) as u32)
+                            .filter(|&k| k > 0)
+                            .unwrap_or(new_kbps);
                         tracing::info!(
                             from_kbps = bitrate_kbps,
-                            to_kbps = new_kbps,
+                            to_kbps = applied_kbps,
+                            requested_kbps = new_kbps,
                             "encoder rebuilt at new bitrate (adaptive bitrate)"
                         );
                         if let Some(c) = plan.wire_chunk {
@@ -1731,8 +1777,11 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                         // directly so an ABR rebuild re-establishes the bound immediately.)
                         new_enc.set_input_ring_depth(capturer.pipeline_depth().max(1));
                         enc = new_enc;
-                        bitrate_kbps = new_kbps;
-                        live_bitrate.store(new_kbps, Ordering::Relaxed);
+                        if applied_kbps < new_kbps {
+                            encoder_ceiling_kbps.store(applied_kbps, Ordering::Relaxed);
+                        }
+                        bitrate_kbps = applied_kbps;
+                        live_bitrate.store(applied_kbps, Ordering::Relaxed);
                         // The owed AUs died with the old encoder — same bookkeeping as a
                         // mode-switch rebuild; the fresh encoder opens on an IDR, so anchor the
                         // IDR cooldown too.
@@ -1740,6 +1789,11 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                         last_au_at = std::time::Instant::now();
                         encoder_resets = 0;
                         last_forced_idr = Some(std::time::Instant::now());
+                        // The rebuild stall itself (~0.6 s ≈ 70 missed deadlines at 120 fps,
+                        // 3.5× the escalate threshold) must not feed the contention
+                        // escalation — clean slate + re-run the warmup before judging again.
+                        behind_score = 0;
+                        depth_frames = 0;
                     }
                     Err(e) => {
                         tracing::warn!(error = %format!("{e:#}"), to_kbps = new_kbps,
@@ -2573,6 +2627,12 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                 } else {
                     behind_score.saturating_sub(1)
                 };
+                // Export "encode can't hold cadence" for the control task's climb refusal.
+                // Stored BEFORE the escalate check: the firing iteration writes `true`, and a
+                // final-stage escalation freezes this whole block (the guard above goes false)
+                // — so an escalated session stays flagged, which is exactly right: its climb
+                // headroom is spent until something (a down-step, de-escalation) changes.
+                cadence_degraded.store(behind_score >= DEPTH_DEGRADE, Ordering::Relaxed);
                 if behind_score >= DEPTH_ESCALATE {
                     if cur_depth < max_depth {
                         cur_depth = max_depth;

@@ -22,10 +22,10 @@ pub(super) async fn run(
     live_reconfig_ok: bool,
     adaptive_fec: bool,
     session_bitrate_kbps: u32,
-    /// Encoder-truth bridge (data plane → here, §ABR overdrive): the encoder's live applied rate,
-    /// its discovered codec-level ceiling (0 = unknown), and the "encode can't hold cadence"
-    /// flag. Read at `SetBitrate`-resolve time so the ack — the base the client's controller
-    /// climbs from — never promises a rate the encoder won't run at.
+    // Encoder-truth bridge (data plane → here, §ABR overdrive): the encoder's live applied rate,
+    // its discovered codec-level ceiling (0 = unknown), and the "encode can't hold cadence"
+    // flag. Read at `SetBitrate`-resolve time so the ack — the base the client's controller
+    // climbs from — never promises a rate the encoder won't run at.
     live_bitrate: Arc<AtomicU32>,
     encoder_ceiling_kbps: Arc<AtomicU32>,
     cadence_degraded: Arc<AtomicBool>,
