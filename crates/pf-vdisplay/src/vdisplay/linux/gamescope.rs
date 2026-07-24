@@ -68,6 +68,25 @@ static STOPPED_AUTOLOGIN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(
 /// master — live-proven on the Nobara repro VM 2026-07-24).
 static STOPPED_DM: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
+/// mtime of the `steamos-session-select` sentinel at managed-session launch — the baseline the
+/// in-stream "Switch to Desktop" detector compares against. Steam's session-select script writes
+/// `~/.config/steamos-session-select` unconditionally in its USER pass, before any of its
+/// display-manager checks — so it advances even under a DM-stop takeover, where the script's
+/// config-rewrite tail is a silent no-op (every write branch is gated on the DM *running*;
+/// diagnosed live on the Nobara repro VM 2026-07-24). An advanced mtime after a capture loss is
+/// therefore the one durable trace of the user's switch request.
+static SESSION_SELECT_BASELINE: std::sync::Mutex<Option<std::time::SystemTime>> =
+    std::sync::Mutex::new(None);
+
+/// When [`honor_session_select_switch`] last ran. While recent, a managed (re)launch is refused —
+/// the rebuild loop would otherwise race the booting desktop back into game mode (gamescope+Steam
+/// come up faster than KWin, and a delivering managed pipeline ends the rebuild's re-detection).
+static SWITCH_HONORED_AT: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+
+/// How long after honoring an in-stream desktop switch the managed path refuses to relaunch,
+/// giving the DM's desktop session time to come up so re-detection follows it instead.
+const SWITCH_HONOR_GRACE: Duration = Duration::from_secs(120);
+
 /// A pending debounced TV-session restore: the instant [`do_restore_tv_session`] should fire after
 /// the last client disconnect. A reconnect inside the window clears it (and reuses the still-warm
 /// managed session), so we never stop+relaunch gamescope per connect — that per-connect teardown is
@@ -187,6 +206,9 @@ pub fn restore_takeover_on_startup() {
     *STOPPED_AUTOLOGIN.lock().unwrap_or_else(|e| e.into_inner()) = state.stopped_autologin;
     *STEAMOS_TOOK_OVER.lock().unwrap_or_else(|e| e.into_inner()) = state.steamos;
     *STOPPED_DM.lock().unwrap_or_else(|e| e.into_inner()) = state.stopped_dm;
+    // Re-baseline the session-select sentinel: after a crash-restore the launch-time baseline is
+    // gone, and a long-existing sentinel file must not read as a fresh in-stream switch request.
+    record_session_select_baseline();
     // A generous grace so a client reconnecting right after the restart cancels it (create_managed_session
     // clears PENDING_RESTORE) and keeps the streamed session rather than bouncing to gaming mode.
     *PENDING_RESTORE.lock().unwrap_or_else(|e| e.into_inner()) =
@@ -343,6 +365,40 @@ fn create_managed_session(client: &str, mode: Mode) -> Result<VirtualOutput> {
     if steamos_session_present() {
         return create_managed_session_steamos(mode);
     }
+    // In-stream "Switch to Desktop" under a DM-stop takeover: the user's session-select inside
+    // the streamed game mode advanced the sentinel, but its config rewrite was a silent no-op
+    // (every write branch needs the DM running, and the takeover stopped it) — so without this,
+    // the capture loss it caused would just relaunch game mode ("thrown back in", field-tested
+    // 2026-07-24). Honor the request instead: restore the DM and replay the switch.
+    let dm_takeover = STOPPED_DM.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if let Some(dm) = dm_takeover {
+        if session_select_requested() {
+            *STOPPED_DM.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            honor_session_select_switch(dm);
+            return Err(anyhow!(
+                "the user switched the box to the desktop session — display manager restored; \
+                 re-detection follows the desktop compositor as it comes up"
+            ));
+        }
+    }
+    // Post-honor grace: while the selected desktop boots, a managed relaunch would win the race
+    // (gamescope+Steam start faster than KWin) and a delivering pipeline ends the rebuild's
+    // re-detection — right back in game mode. A live box-owned game-mode unit supersedes the
+    // grace: the user already switched back, so managed may proceed.
+    let honor_pending = SWITCH_HONORED_AT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_some_and(|t| t.elapsed() < SWITCH_HONOR_GRACE);
+    if honor_pending {
+        if running_autologin_gamescope_unit().is_some() {
+            *SWITCH_HONORED_AT.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        } else {
+            return Err(anyhow!(
+                "waiting for the desktop session the user selected — refusing to relaunch game \
+                 mode (re-detection follows the desktop once it's up)"
+            ));
+        }
+    }
     // Attach-only rebuild probe: reuse a live same-mode session, but NEVER stop/relaunch box
     // sessions — right after a capture loss the caller's session detection can be stale, and a
     // destructive rebuild here would fight the session the user just switched to.
@@ -429,6 +485,9 @@ fn create_managed_session(client: &str, mode: Mode) -> Result<VirtualOutput> {
             return Err(e);
         }
     };
+    // Baseline the session-select sentinel NOW: only a write from INSIDE this session (the user's
+    // "Switch to Desktop") should read as a switch request, not the one that led here.
+    record_session_select_baseline();
     point_injector_at_eis();
     *guard = Some(SessionState {
         width: mode.width,
@@ -1090,6 +1149,135 @@ fn try_stop_display_manager(dm: &str) -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+/// The distro's session-switch helper (ChimeraOS/Nobara layout). Its USER pass records the
+/// sentinel + self-pkexecs (authorized `allow_any` by the distro's own polkit action policy, so
+/// it works from our sessionless context); its ROOT pass rewrites the DM autologin config — but
+/// only while the DM is RUNNING, which is why the takeover must restart the DM before calling it.
+const OS_SESSION_SELECT: &str = "/usr/libexec/os-session-select";
+
+/// The sentinel Steam's `steamos-session-select` writes in its user pass
+/// (`~/.config/steamos-session-select`) — see [`SESSION_SELECT_BASELINE`].
+fn session_select_sentinel() -> Option<std::path::PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    Some(
+        std::path::Path::new(&home)
+            .join(".config")
+            .join("steamos-session-select"),
+    )
+}
+
+/// Current mtime of the session-select sentinel (`None` when it doesn't exist yet).
+fn session_select_mtime() -> Option<std::time::SystemTime> {
+    let path = session_select_sentinel()?;
+    std::fs::metadata(path).ok()?.modified().ok()
+}
+
+/// Record the sentinel baseline at managed-session launch, so a LATER write (the user's in-stream
+/// "Switch to Desktop") is distinguishable from the switch that led into this session.
+fn record_session_select_baseline() {
+    *SESSION_SELECT_BASELINE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = session_select_mtime();
+}
+
+/// Did a session-select run inside the managed session since its launch (sentinel newer than the
+/// recorded baseline, or newly created)? Inside a managed game session the only switch Steam
+/// offers is TO the desktop, so an advanced sentinel reads as that request.
+fn session_select_requested() -> bool {
+    let baseline = *SESSION_SELECT_BASELINE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    match (baseline, session_select_mtime()) {
+        (Some(base), Some(now)) => now > base,
+        (None, Some(_)) => true, // created during the session
+        _ => false,
+    }
+}
+
+/// Honor the user's in-stream "Switch to Desktop" under a DM-stop takeover. The OS flow was a
+/// silent no-op (the switch script's config rewrite requires a running DM, which the takeover
+/// stopped), so replay it with the DM up — every verb live-validated on the Nobara repro VM:
+/// 1. consume the takeover and start the DM (its autologin heads back into game mode briefly —
+///    the config still names it);
+/// 2. run the distro's own `os-session-select desktop` as the user (its internal pkexec is
+///    `allow_any`-authorized), which rewrites the DM autologin config to the desktop session;
+/// 3. stop the autologin gamescope unit — the login session exits, and `Relogin=true` relogs
+///    into the now-selected desktop.
+///
+/// The caller then refuses managed relaunches for [`SWITCH_HONOR_GRACE`] so the capture-loss
+/// re-detection follows the desktop compositor once it's up instead of racing it.
+fn honor_session_select_switch(dm: String) {
+    tracing::info!(
+        %dm,
+        "gamescope: in-stream session-select detected — restoring the display manager and \
+         switching the box to the desktop session"
+    );
+    // Consume the takeover state up front: from here on the box is the DM's again.
+    std::mem::take(&mut *STOPPED_AUTOLOGIN.lock().unwrap_or_else(|e| e.into_inner()));
+    clear_takeover();
+    *MANAGED_SESSION.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    stop_session(SESSION_UNIT); // dead already (the switch shut its Steam down) — clear the unit
+    let _ = Command::new("systemctl")
+        .args(["reset-failed", &dm])
+        .status();
+    let _ = Command::new("systemctl").args(["start", &dm]).status();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        let active = Command::new("systemctl")
+            .args(["is-active", &dm])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "active")
+            .unwrap_or(false);
+        if active {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    // Rewrite the autologin session via the distro's own switch helper (needs the DM running).
+    // Absent/failing helper degrades to a plain DM restore — the box lands back in game mode on
+    // glass and the stream follows that instead (no black screen either way).
+    if std::path::Path::new(OS_SESSION_SELECT).exists() {
+        match Command::new(OS_SESSION_SELECT).arg("desktop").status() {
+            Ok(s) if s.success() => {
+                // The relogin only fires when the CURRENT (game-mode) login session exits: wait
+                // for its autologin unit to come up, then stop it. Never mask here — the mask is
+                // what start-limit-kills this DM flavor.
+                let deadline = Instant::now() + Duration::from_secs(15);
+                loop {
+                    if let Some(unit) = running_autologin_gamescope_unit() {
+                        systemctl_user(&["stop", &unit]);
+                        tracing::info!(
+                            %unit,
+                            "gamescope: desktop selected — stopped the game-mode session so the \
+                             DM relogs into the desktop"
+                        );
+                        break;
+                    }
+                    if Instant::now() >= deadline {
+                        tracing::warn!(
+                            "gamescope: game-mode session never appeared after the DM restart — \
+                             the desktop switch may need a manual session exit"
+                        );
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(500));
+                }
+            }
+            other => tracing::warn!(
+                status = ?other,
+                "gamescope: os-session-select failed — leaving the box in its configured session"
+            ),
+        }
+    } else {
+        tracing::warn!(
+            "gamescope: no {OS_SESSION_SELECT} on this box — restored the DM into its configured \
+             session instead of switching to the desktop"
+        );
+    }
+    record_session_select_baseline();
+    *SWITCH_HONORED_AT.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
 }
 
 /// Stop every autologin gaming-mode session (`gamescope-session-plus@*.service`) so its

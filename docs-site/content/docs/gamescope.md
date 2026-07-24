@@ -60,6 +60,10 @@ depends on the display manager driving the autologin:
   `PUNKTFUNK_RECOVER_SESSION_CMD` (see [Configuration](/docs/configuration)) is fired as the
   fallback.
 
+  With the rule in place the **in-stream session switch round-trips** in managed mode: Steam's
+  "Switch to Desktop" inside the streamed Game Mode returns the box to its desktop session and the
+  stream follows it there; the desktop's "Return to Gaming Mode" switches it forward again.
+
 ## Session following
 
 `PUNKTFUNK_SESSION_WATCH` follows a Gaming ↔ Desktop switch **mid-stream** — the host rebuilds the
