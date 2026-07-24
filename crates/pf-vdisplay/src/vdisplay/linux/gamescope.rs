@@ -61,6 +61,13 @@ static MANAGED_SESSION: std::sync::Mutex<Option<SessionState>> = std::sync::Mute
 /// (single-instance), so [`schedule_restore_tv_session`] can restart them when the client disconnects.
 static STOPPED_AUTOLOGIN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
+/// The display-manager unit we stopped for the takeover on a mask-fragile DM flavor (Nobara's
+/// `plasmalogin` — see [`dm_survives_masked_unit`]), so the restore brings the box back via
+/// `reset-failed` + `restart` of the DM instead of a `--user start` of the gamescope unit (which
+/// cannot work there: without a DM login session there is no seat, so gamescope never gets DRM
+/// master — live-proven on the Nobara repro VM 2026-07-24).
+static STOPPED_DM: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
 /// A pending debounced TV-session restore: the instant [`do_restore_tv_session`] should fire after
 /// the last client disconnect. A reconnect inside the window clears it (and reuses the still-warm
 /// managed session), so we never stop+relaunch gamescope per connect — that per-connect teardown is
@@ -115,6 +122,10 @@ struct TakeoverState {
     stopped_autologin: Vec<String>,
     /// Whether we took over SteamOS's `gamescope-session.target` (restore = remove drop-in + restart).
     steamos: bool,
+    /// The display-manager unit we stopped on a mask-fragile DM flavor (restore = `reset-failed` +
+    /// `restart` of the DM). `default` so takeover files from older hosts still parse.
+    #[serde(default)]
+    stopped_dm: Option<String>,
 }
 
 /// Path of the persisted [`TakeoverState`], under `$XDG_RUNTIME_DIR` (per-user, 0700, tmpfs — cleared
@@ -133,8 +144,9 @@ fn persist_takeover() {
             .unwrap_or_else(|e| e.into_inner())
             .clone(),
         steamos: *STEAMOS_TOOK_OVER.lock().unwrap_or_else(|e| e.into_inner()),
+        stopped_dm: STOPPED_DM.lock().unwrap_or_else(|e| e.into_inner()).clone(),
     };
-    if state.stopped_autologin.is_empty() && !state.steamos {
+    if state.stopped_autologin.is_empty() && !state.steamos && state.stopped_dm.is_none() {
         clear_takeover();
         return;
     }
@@ -162,17 +174,19 @@ pub fn restore_takeover_on_startup() {
         clear_takeover();
         return;
     };
-    if state.stopped_autologin.is_empty() && !state.steamos {
+    if state.stopped_autologin.is_empty() && !state.steamos && state.stopped_dm.is_none() {
         clear_takeover();
         return;
     }
     tracing::warn!(
         units = ?state.stopped_autologin,
         steamos = state.steamos,
+        stopped_dm = ?state.stopped_dm,
         "gamescope: found a stranded takeover from a previous host instance — scheduling TV restore"
     );
     *STOPPED_AUTOLOGIN.lock().unwrap_or_else(|e| e.into_inner()) = state.stopped_autologin;
     *STEAMOS_TOOK_OVER.lock().unwrap_or_else(|e| e.into_inner()) = state.steamos;
+    *STOPPED_DM.lock().unwrap_or_else(|e| e.into_inner()) = state.stopped_dm;
     // A generous grace so a client reconnecting right after the restart cancels it (create_managed_session
     // clears PENDING_RESTORE) and keeps the streamed session rather than bouncing to gaming mode.
     *PENDING_RESTORE.lock().unwrap_or_else(|e| e.into_inner()) =
@@ -263,7 +277,10 @@ impl VirtualDisplay for GamescopeDisplay {
                                    // A3 takeover machinery (recorded in STOPPED_AUTOLOGIN + persisted; restarted on session end via
                                    // schedule_restore_tv_session). Non-Steam launches don't conflict, so they skip this.
         if self.cmd.as_deref().is_some_and(is_steam_launch) {
-            stop_autologin_sessions();
+            // A dedicated launch NEEDS Steam's single instance — no attach degrade exists here, so
+            // a mask-fragile-DM box without takeover privilege fails with the actionable error.
+            stop_autologin_sessions()
+                .context("dedicated Steam launch needs the box's gaming session freed")?;
             // B1b: a Steam running in a plain DESKTOP session (GNOME/KDE) holds the instance just
             // the same, and the autologin stop above can't see it — free it too, or fail loudly.
             free_desktop_steam()?;
@@ -353,7 +370,28 @@ fn create_managed_session(client: &str, mode: Mode) -> Result<VirtualOutput> {
     // Bazzite default — `gamescope-session-plus@ogui-steam` on the TV), that session holds Steam and
     // renders to the TV's native mode, which we'd capture instead of the client's. Free Steam by
     // stopping it; [`schedule_restore_tv_session`] (on disconnect) brings it back after a debounce.
-    stop_autologin_sessions();
+    // On a mask-fragile-DM box without the privilege to stop the DM, the takeover would destabilize
+    // the seat — degrade to ATTACH instead: mirror the box's own live game-mode session (capture +
+    // inject, no lifecycle ownership), which needs no takeover at all.
+    if let Err(e) = stop_autologin_sessions() {
+        tracing::warn!(
+            error = %format!("{e:#}"),
+            "gamescope: managed takeover unavailable — degrading to ATTACH (mirroring the box's \
+             own game-mode session)"
+        );
+        let node_id = ensure_box_gamescope_mode(mode)?;
+        point_injector_at_eis();
+        return Ok(VirtualOutput {
+            node_id,
+            remote_fd: None,
+            preferred_mode: Some((mode.width, mode.height, mode.refresh_hz)),
+            keepalive: Box::new(()),
+            ownership: DisplayOwnership::External,
+            reused_gen: None,
+            pool_gen: None,
+            expect_exact_dims: false,
+        });
+    }
     // B1b: a desktop-session Steam (outside any gamescope unit) also holds the single instance and
     // would make the managed session's own Steam exit at birth. The managed session's Steam itself
     // is exempt (it lives in the SESSION_UNIT cgroup), so the same-mode reuse below is unaffected.
@@ -379,7 +417,18 @@ fn create_managed_session(client: &str, mode: Mode) -> Result<VirtualOutput> {
     }
     // (Re)launch at the new mode. `launch_session` stops the old unit by name first, so there is
     // exactly one gamescope `Video/Source` node for discovery.
-    let node_id = launch_session(client, SESSION_UNIT, mode)?;
+    let node_id = match launch_session(client, SESSION_UNIT, mode) {
+        Ok(id) => id,
+        Err(e) => {
+            // The takeover already happened (autologin units stopped, possibly the DM down) — arm
+            // the restore now, or a failed launch strands the box sessionless until a host
+            // restart. Policy-timed; a quick client retry cancels it and relaunches warm.
+            // MANAGED_SESSION must be released first: the scheduler reads it (orphan detection).
+            drop(guard);
+            schedule_restore_tv_session();
+            return Err(e);
+        }
+    };
     point_injector_at_eis();
     *guard = Some(SessionState {
         width: mode.width,
@@ -807,6 +856,38 @@ fn ensure_box_gamescope_mode(mode: Mode) -> Result<u32> {
             return Ok(node);
         }
     }
+    // Attach-only rebuild probe (parity with both managed paths — this gap was the attach-path
+    // stale-detection hazard): right after a capture loss the caller's session detection can be
+    // stale, and a set-environment + unit restart here would fight the session the user just
+    // switched to. Mirror whatever live node exists at its own mode; refuse otherwise.
+    if crate::rebuild_probe_active() {
+        if let Some(node) = find_gamescope_node() {
+            tracing::info!(
+                node,
+                "gamescope: attach-only rebuild probe — mirroring the live node at its own mode"
+            );
+            return Ok(node);
+        }
+        return Err(anyhow!(
+            "no live gamescope node — attach-only rebuild probe refuses to restart the box's \
+             session (re-detection follows the live session)"
+        ));
+    }
+    // A box driving a PHYSICAL display is mirrored at its own mode, never re-moded: the re-mode
+    // restart is the headless-box model (no panel ⇒ the game-mode resolution is ours to set);
+    // on-glass it would flip the user's own screen to the client's resolution — and on a
+    // DM-session-driven box (Nobara) the unit restart bounces the login session with it.
+    if physical_display_connected() {
+        if let Some(node) = find_gamescope_node() {
+            tracing::info!(
+                node,
+                client_w = mode.width,
+                client_h = mode.height,
+                "gamescope: box drives a physical display — attaching at its own mode (no re-mode)"
+            );
+            return Ok(node);
+        }
+    }
     let Some(unit) = running_autologin_gamescope_unit() else {
         // No box-owned autologin session to reconfigure (a bare/foreign gamescope): attach to
         // whatever node exists, accepting its resolution.
@@ -972,17 +1053,64 @@ fn unmask_unit(unit: &str) {
         .status();
 }
 
+/// The unit name of the display manager driving this box's graphical logins, from the
+/// `display-manager.service` alias symlink (the Fedora/Arch/openSUSE convention every
+/// gamescope-session distro follows). `None` when no DM is installed (a box that boots straight
+/// into a user session — getty autologin / an enabled user unit).
+fn display_manager_unit() -> Option<String> {
+    display_manager_unit_under(std::path::Path::new("/etc/systemd/system"))
+}
+
+/// [`display_manager_unit`] against an arbitrary root (the unit-testable core).
+fn display_manager_unit_under(base: &std::path::Path) -> Option<String> {
+    let target = std::fs::read_link(base.join("display-manager.service")).ok()?;
+    target.file_name().map(|n| n.to_string_lossy().into_owned())
+}
+
+/// Does this display manager's autologin loop SURVIVE the gamescope unit being masked? Only SDDM is
+/// proven to (Bazzite/SteamOS `Relogin=true` — the mask is what stops its relogin from restarting
+/// the unit mid-stream, diagnosed live on .181 2026-07-07; a failing autologin leaves sddm itself
+/// running). Nobara's `plasmalogin` (KDE's SDDM successor) is proven FATAL: against a masked unit
+/// its session Exec fails instantly, `Relogin=true` retries, and `plasmalogin.service` trips
+/// systemd's start limit within ~1 s — the DM dies and the box is a permanent black screen that
+/// only a root `reset-failed` + `restart` recovers (live-proven on the Nobara repro VM
+/// 2026-07-24). Unknown DMs are treated as fragile: the fragile path degrades gracefully, a wrong
+/// "safe" kills the seat.
+fn dm_survives_masked_unit(dm: &str) -> bool {
+    dm == "sddm.service"
+}
+
+/// Stop the display manager for a takeover on a mask-fragile DM flavor. Plain `systemctl stop` on
+/// the SYSTEM bus — succeeds as root or under an operator polkit rule scoped to the DM unit (see
+/// docs); fails cleanly otherwise ("interactive authentication required"), in which case the
+/// caller degrades to attach.
+fn try_stop_display_manager(dm: &str) -> bool {
+    Command::new("systemctl")
+        .args(["stop", dm])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
 /// Stop every autologin gaming-mode session (`gamescope-session-plus@*.service`) so its
 /// single-instance Steam is free for our own host-managed session. Records the units so
 /// [`schedule_restore_tv_session`] can restart them on disconnect. Our own session is the transient
 /// `punktfunk-gamescope` unit (not a `@`-instance), so it's never matched here. No-op when nothing
-/// is autologged in (e.g. a box that boots headless). Each unit is **masked first** ([`mask_unit`] —
-/// SDDM's `Relogin=true` would otherwise restart it instantly), then torn down with **SIGKILL**
-/// ([`kill_unit`]) to avoid the F44 GPU-context leak that the autologin's SIGTERM stop triggers.
-/// Matches every loaded instance, not just `running` ones — under the SDDM relogin churn the unit
-/// flaps through `activating`/`failed` between cycles, and an unmasked flapping unit re-enters the
-/// fight the moment the supervisor restarts it.
-fn stop_autologin_sessions() {
+/// is autologged in (e.g. a box that boots headless).
+///
+/// The teardown is DM-flavor-aware ([`dm_survives_masked_unit`]):
+/// * **SDDM / no DM**: each unit is **masked first** ([`mask_unit`] — SDDM's `Relogin=true` would
+///   otherwise restart it instantly), then torn down with **SIGKILL** ([`kill_unit`]) to avoid the
+///   F44 GPU-context leak that the autologin's SIGTERM stop triggers. Matches every loaded
+///   instance, not just `running` ones — under the SDDM relogin churn the unit flaps through
+///   `activating`/`failed` between cycles, and an unmasked flapping unit re-enters the fight the
+///   moment the supervisor restarts it.
+/// * **Mask-fragile DM** (Nobara's `plasmalogin`, unknown DMs): masking start-limit-kills the DM
+///   itself (permanent black screen), so instead **stop the DM** — no supervisor left to relogin —
+///   then SIGKILL the units unmasked. Needs privilege (root / an operator polkit rule); without it
+///   nothing is touched and the error tells the caller to degrade to ATTACH (mirror the box's own
+///   session) rather than destabilize the seat.
+fn stop_autologin_sessions() -> Result<()> {
     let Ok(out) = Command::new("systemctl")
         .args([
             "--user",
@@ -995,26 +1123,65 @@ fn stop_autologin_sessions() {
         ])
         .output()
     else {
-        return;
+        return Ok(());
     };
-    let mut stopped = Vec::new();
-    for line in String::from_utf8_lossy(&out.stdout).lines() {
-        if let Some(unit) = line.split_whitespace().next() {
-            if unit.starts_with("gamescope-session-plus@") && unit.ends_with(".service") {
-                mask_unit(unit); // block the SDDM relogin loop from restarting it mid-stream
-                kill_unit(unit); // SIGKILL teardown — avoid the F44 GPU-context leak
-                tracing::info!(
-                    unit,
-                    "freed Steam: masked + SIGKILL-stopped the autologin gaming session for this stream"
-                );
-                stopped.push(unit.to_string());
-            }
+    // `(unit, ACTIVE state)` — the `--plain` columns are UNIT LOAD ACTIVE SUB DESCRIPTION.
+    let listed: Vec<(String, String)> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| {
+            let mut cols = l.split_whitespace();
+            let unit = cols.next()?;
+            let active = cols.nth(1).unwrap_or("");
+            (unit.starts_with("gamescope-session-plus@") && unit.ends_with(".service"))
+                .then(|| (unit.to_string(), active.to_string()))
+        })
+        .collect();
+    if listed.is_empty() {
+        return Ok(()); // nothing autologged in — Steam is already free
+    }
+    let dm = display_manager_unit();
+    let mask_safe = dm.as_deref().is_none_or(dm_survives_masked_unit);
+    if !mask_safe {
+        // Only a LIVE instance holds Steam / justifies touching the DM. A loaded-but-inactive
+        // leftover (the box switched back to the desktop earlier) must not stop the DM — that
+        // would kill the user's live desktop to free nothing.
+        if !listed
+            .iter()
+            .any(|(_, active)| matches!(active.as_str(), "active" | "activating"))
+        {
+            return Ok(());
         }
+        let dm = dm.expect("!is_none_or ⇒ Some");
+        if !try_stop_display_manager(&dm) {
+            bail!(
+                "the box's gaming session is driven by {dm}, which does not survive a masked \
+                 session unit, and stopping it needs privilege — install the punktfunk \
+                 display-manager polkit rule (see docs) to enable the managed takeover"
+            );
+        }
+        tracing::info!(
+            %dm,
+            "freed Steam: stopped the display manager for this stream (mask-fragile DM flavor)"
+        );
+        *STOPPED_DM.lock().unwrap_or_else(|e| e.into_inner()) = Some(dm);
     }
-    if !stopped.is_empty() {
-        *STOPPED_AUTOLOGIN.lock().unwrap_or_else(|e| e.into_inner()) = stopped;
-        persist_takeover(); // A3: survive a host crash mid-stream
+    let units: Vec<String> = listed.into_iter().map(|(u, _)| u).collect();
+    let mut stopped = Vec::new();
+    for unit in units {
+        if mask_safe {
+            mask_unit(&unit); // block the SDDM relogin loop from restarting it mid-stream
+        }
+        kill_unit(&unit); // SIGKILL teardown — avoid the F44 GPU-context leak
+        tracing::info!(
+            %unit,
+            masked = mask_safe,
+            "freed Steam: stopped the autologin gaming session for this stream"
+        );
+        stopped.push(unit);
     }
+    *STOPPED_AUTOLOGIN.lock().unwrap_or_else(|e| e.into_inner()) = stopped;
+    persist_takeover(); // A3: survive a host crash mid-stream
+    Ok(())
 }
 
 /// How long a desktop Steam gets to honor `steam -shutdown` before the spawn fails. Steam tears
@@ -1159,7 +1326,16 @@ pub fn schedule_restore_tv_session() {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .is_empty()
-        && !*STEAMOS_TOOK_OVER.lock().unwrap_or_else(|e| e.into_inner());
+        && !*STEAMOS_TOOK_OVER.lock().unwrap_or_else(|e| e.into_inner())
+        && STOPPED_DM.lock().unwrap_or_else(|e| e.into_inner()).is_none()
+        // A managed session that took nothing over (started beside a live desktop — e.g. a client
+        // gamescope pin on a KDE box) still owns the transient SESSION_UNIT: without this arm it
+        // was ORPHANED forever after disconnect ("closing the app does not end the session",
+        // field report 2026-07-24) — the restore stops it even with no autologin to bring back.
+        && MANAGED_SESSION
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_none();
     if nothing_to_restore {
         return; // nothing was taken over → nothing to restore (also the non-managed path)
     }
@@ -1254,8 +1430,24 @@ fn do_restore_tv_session() {
         }
     }
     let units = std::mem::take(&mut *STOPPED_AUTOLOGIN.lock().unwrap_or_else(|e| e.into_inner()));
-    if units.is_empty() {
-        return; // nothing was stolen → nothing to restore (also the non-Bazzite path)
+    let dm = std::mem::take(&mut *STOPPED_DM.lock().unwrap_or_else(|e| e.into_inner()));
+    if units.is_empty() && dm.is_none() {
+        // Nothing was stolen — but a managed session that started BESIDE a live desktop (client
+        // gamescope pin on a KDE box) still owns the transient unit; stop it so it doesn't run
+        // orphaned forever after the disconnect. No-op when the unit isn't running.
+        if MANAGED_SESSION
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .is_some()
+        {
+            stop_session(SESSION_UNIT);
+            tracing::info!(
+                "gamescope: stopped the idle managed session (nothing was taken over — no box \
+                 session to restore)"
+            );
+        }
+        return;
     }
     clear_takeover(); // A3: takeover consumed — drop the persisted crash-restore marker
     stop_session(SESSION_UNIT); // our gamescope/Steam session, so Steam is free for the autologin
@@ -1266,16 +1458,52 @@ fn do_restore_tv_session() {
     }
     *MANAGED_SESSION.lock().unwrap_or_else(|e| e.into_inner()) = None;
     // Only bring the gaming autologin BACK if the box is still meant to be in gaming mode. If the
-    // user switched to a desktop session (KDE/GNOME/wlroots) in the meantime, don't yank them back
-    // to gaming — leave the desktop alone. (We still stopped our idle managed session above.)
+    // user switched to a desktop session (KDE/GNOME/wlroots/Hyprland) in the meantime, don't yank
+    // them back to gaming — leave the desktop alone. (We still stopped our idle managed session
+    // above.)
     use super::ActiveKind;
     if matches!(
         super::detect_active_session().kind,
-        ActiveKind::DesktopKde | ActiveKind::DesktopGnome | ActiveKind::DesktopWlroots
+        ActiveKind::DesktopKde
+            | ActiveKind::DesktopGnome
+            | ActiveKind::DesktopWlroots
+            | ActiveKind::DesktopHyprland
     ) {
         tracing::info!(
             "gamescope: a desktop session is active — not restoring the TV gaming session"
         );
+        return;
+    }
+    // Mask-fragile-DM takeover: the gamescope unit CANNOT be `--user start`ed back — without a DM
+    // login session there is no seat, so gamescope never gets DRM master (unit goes `failed`,
+    // screen stays black — live-proven on the Nobara repro VM). Restore the DM instead
+    // (`reset-failed` clears the relogin start-limit accounting, then `restart`); its autologin
+    // session Exec starts the gamescope unit itself.
+    if let Some(dm) = dm {
+        let _ = Command::new("systemctl")
+            .args(["reset-failed", &dm])
+            .status();
+        let restart = Command::new("systemctl")
+            .args(["restart", &dm])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if restart {
+            tracing::info!(%dm, "restored the display manager (its autologin brings gaming mode back)");
+        } else if crate::try_recover_session() {
+            tracing::warn!(
+                %dm,
+                "display-manager restart lost its privilege — fired PUNKTFUNK_RECOVER_SESSION_CMD \
+                 to bring the session back"
+            );
+        } else {
+            tracing::error!(
+                %dm,
+                "could not restart the display manager and no PUNKTFUNK_RECOVER_SESSION_CMD is \
+                 configured — the box has no graphical session until someone runs \
+                 `systemctl reset-failed {dm} && systemctl restart {dm}` as root"
+            );
+        }
         return;
     }
     for unit in units {
@@ -1641,9 +1869,34 @@ impl Drop for GamescopeProc {
 #[cfg(test)]
 mod tests {
     use super::{
-        cgroup_is_punktfunk_owned, connected_connector_under, is_steam_launch,
-        shape_dedicated_command,
+        cgroup_is_punktfunk_owned, connected_connector_under, display_manager_unit_under,
+        dm_survives_masked_unit, is_steam_launch, shape_dedicated_command,
     };
+
+    #[test]
+    fn display_manager_flavor_detection() {
+        let base = std::env::temp_dir().join(format!("pf-dm-scan-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        // No alias symlink (no DM installed — getty autologin boxes) → None.
+        assert_eq!(display_manager_unit_under(&base), None);
+        // The Fedora-style alias symlink resolves to its target's basename (read_link, not
+        // canonicalize — the target needn't exist on the build box).
+        std::os::unix::fs::symlink(
+            "/usr/lib/systemd/system/plasmalogin.service",
+            base.join("display-manager.service"),
+        )
+        .unwrap();
+        assert_eq!(
+            display_manager_unit_under(&base).as_deref(),
+            Some("plasmalogin.service")
+        );
+        // Only SDDM is proven to survive a masked session unit; plasmalogin start-limit-kills
+        // itself (live-proven), and unknown DMs default to fragile.
+        assert!(dm_survives_masked_unit("sddm.service"));
+        assert!(!dm_survives_masked_unit("plasmalogin.service"));
+        assert!(!dm_survives_masked_unit("gdm.service"));
+        std::fs::remove_dir_all(&base).unwrap();
+    }
 
     #[test]
     fn connector_status_scan() {

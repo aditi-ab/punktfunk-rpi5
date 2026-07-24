@@ -107,6 +107,21 @@ See [GNOME](/docs/gnome) for the GL/EGL userspace details.
   auto-detects the live compositor, and the pin points it at one backend even when a different
   session is live (it also disables Gaming ↔ Desktop following).
 
+## The screen stays black after switching to Game Mode (Nobara)
+
+On distros whose Game Mode is display-manager autologin under **plasmalogin** (Nobara), a managed
+takeover from a host **0.19.1 or older** could kill the display manager: it trips systemd's start
+limit and the box stays black until someone restarts it. Recover from a VT (Ctrl+Alt+F3) or SSH:
+
+```sh
+systemctl --user unmask --runtime 'gamescope-session-plus@*.service'
+sudo systemctl reset-failed plasmalogin && sudo systemctl restart plasmalogin
+```
+
+Current hosts detect the display-manager flavor and never mask the session unit there — see
+[gamescope → autologin display managers](/docs/gamescope) for the polkit rule that enables the full
+managed takeover on these boxes (without it the host mirrors Game Mode instead).
+
 ## Session fails right after editing host.env
 
 - Keys are **case-sensitive**: `punktfunk_gamescope_attach=1` sets nothing — use the exact

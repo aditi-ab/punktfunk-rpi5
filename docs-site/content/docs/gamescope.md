@@ -24,13 +24,41 @@ that has gamescope session infrastructure (Bazzite, SteamOS, Nobara) gets **mana
 - **Attach** (`PUNKTFUNK_GAMESCOPE_ATTACH=1`) — the **box** owns its gamescope session and decides
   Gaming vs Desktop via the normal Steam UI. Game Mode stays on the box's own (physical) display;
   the host attaches to whatever's live and never tears it down, so switching Desktop ↔ Game is
-  rock-solid and disconnecting leaves the box where it was. When the session is the box's own
-  autologin unit, the host restarts it at the **client's** resolution on a mismatch; a foreign or
-  bare gamescope is streamed at its own mode.
+  rock-solid and disconnecting leaves the box where it was. When the box is **headless** (no
+  display connected) and the session is its own autologin unit, the host restarts it at the
+  **client's** resolution on a mismatch; a box driving a physical display — and any foreign or
+  bare gamescope — is streamed at its own mode.
 - **Managed** (the infra-detected default; force with `PUNKTFUNK_GAMESCOPE_MANAGED=1`) — the host
   takes the box's gamescope session over and relaunches it **headless** at the *client's* exact
   resolution and refresh — Game Mode runs on the virtual screen, physical displays drop out of it —
   restoring the box on idle after disconnect.
+
+### Nobara and other autologin display managers
+
+The managed takeover has to stop the box's Gaming Mode session to free Steam. How it does that
+depends on the display manager driving the autologin:
+
+- **SDDM** (Bazzite, SteamOS): handled automatically — no setup.
+- **plasmalogin** (Nobara) and other display managers: the host must stop the display manager
+  itself for the length of the stream and restart it afterwards, which needs privilege. Allow it
+  with a polkit rule (adjust the unit and user names to your box):
+
+  ```js
+  // /etc/polkit-1/rules.d/49-punktfunk-dm.rules
+  polkit.addRule(function(action, subject) {
+      if (action.id == "org.freedesktop.systemd1.manage-units" &&
+          action.lookup("unit") == "plasmalogin.service" &&
+          subject.user == "YOUR_USER") {
+          return polkit.Result.YES;
+      }
+  });
+  ```
+
+  Without the rule the host degrades safely: it **attaches** to the live Gaming Mode session
+  instead (Game Mode stays on the box's display, mirrored to the client) rather than risk the
+  display manager. If the display-manager restart ever loses its privilege mid-restore,
+  `PUNKTFUNK_RECOVER_SESSION_CMD` (see [Configuration](/docs/configuration)) is fired as the
+  fallback.
 
 ## Session following
 
@@ -58,7 +86,7 @@ a model. See the full [Configuration reference](/docs/configuration) for every o
 
 | Setting | Values | Meaning |
 |---|---|---|
-| `PUNKTFUNK_GAMESCOPE_ATTACH` | `1` | **Attach** model: the box owns its gamescope session (on its own display); the host captures whatever's live and never tears it down. A box-owned autologin session is restarted at the client's resolution on a mismatch; a foreign/bare gamescope streams at its own mode. |
+| `PUNKTFUNK_GAMESCOPE_ATTACH` | `1` | **Attach** model: the box owns its gamescope session (on its own display); the host captures whatever's live and never tears it down. On a **headless** box the box-owned autologin session is restarted at the client's resolution on a mismatch; a box driving a physical display, and any foreign/bare gamescope, streams at its own mode. |
 | `PUNKTFUNK_GAMESCOPE_MANAGED` | `1` | **Managed** model (the default where session infra is detected): the host takes the box's gamescope over and relaunches it headless at the client's exact mode, restoring on idle. |
 | `PUNKTFUNK_GAMESCOPE_SESSION` | `steam` | The host owns a `gamescope-session-plus` (Steam) session at the client's mode — a headless appliance with no physical session running. |
 | `PUNKTFUNK_GAMESCOPE_NODE` | `auto` · node id | Discover and capture a **running** gamescope's PipeWire node at a fixed mode. Do **not** combine with `SESSION`. |

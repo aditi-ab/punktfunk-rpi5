@@ -100,8 +100,9 @@ For Gaming Mode there are two models (pick one; the shipped default is **attach*
 
 - **Attach** (`PUNKTFUNK_GAMESCOPE_ATTACH=1`, the template's default) — the **box** owns its
   gamescope session on its own display, and the host attaches to whatever's live without ever
-  tearing it down (a box-owned autologin session is restarted at the client's resolution on a
-  mismatch). Switching Desktop ↔ Game is rock-solid.
+  tearing it down (on a headless box, a box-owned autologin session is restarted at the client's
+  resolution on a mismatch; with a display connected it streams at the box's own mode). Switching
+  Desktop ↔ Game is rock-solid.
 - **Managed** (`PUNKTFUNK_GAMESCOPE_MANAGED=1`, and remove the attach line) — the host takes the
   box's gamescope over and relaunches it **headless** at the *client's* exact resolution and
   refresh — Game Mode on the virtual screen — restoring the box on idle.

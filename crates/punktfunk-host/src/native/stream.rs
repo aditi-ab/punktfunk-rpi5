@@ -1940,6 +1940,15 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                 // connected, frozen on the last frame, and the stream resumes when the new output
                 // appears — no reconnect.
                 const REBUILD_BUDGET: std::time::Duration = std::time::Duration::from_secs(40);
+                // A managed/attach gamescope (re)launch legitimately takes up to 45 s — the Steam
+                // Big Picture cold start that `launch_session`/`ensure_box_gamescope_mode` poll
+                // for — so the 40 s budget used to expire INSIDE the first attempt (a single-shot
+                // failure ending the session even when a second, warm attempt would have
+                // succeeded). Give gamescope-targeted rebuilds room for two full launch attempts;
+                // desktop compositors keep the tighter budget. Checked per iteration because the
+                // loop retargets `compositor` as re-detection follows the box.
+                const GAMESCOPE_REBUILD_BUDGET: std::time::Duration =
+                    std::time::Duration::from_secs(100);
                 // Attach-only holdoff: for the first seconds after a capture loss the session
                 // detection can be STALE (the new session isn't up yet), and a rebuild acting on
                 // a stale "Gaming" answer restarts gamescope-session.target — which on SteamOS
@@ -1948,7 +1957,24 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                 // scope: attach to live outputs only, never stop/relaunch/take over sessions.
                 const PROBE_HOLDOFF: std::time::Duration = std::time::Duration::from_secs(4);
                 let loss_at = std::time::Instant::now();
-                let rebuild_deadline = loss_at + REBUILD_BUDGET;
+                // An explicit PUNKTFUNK_COMPOSITOR pin disables the re-detection below — the
+                // stream cannot follow a session switch. When the live session no longer matches
+                // the pin, say so loudly ONCE per loss: this rebuild can only retry the pinned
+                // backend and will die at the budget (the "mid-stream switch to game mode kills
+                // the stream" field reports all traced back to a stale pin).
+                if pf_host_config::config().compositor.is_some() {
+                    let active = crate::vdisplay::detect_active_session();
+                    if crate::vdisplay::compositor_for_kind(active.kind) != Some(compositor) {
+                        tracing::warn!(
+                            pinned = compositor.id(),
+                            live = ?active.kind,
+                            "capture lost while PUNKTFUNK_COMPOSITOR pins the backend and the \
+                             live session no longer matches it — the pin disables \
+                             session-following, so this rebuild can only retry the pinned \
+                             backend; remove the pin to let the stream follow session switches"
+                        );
+                    }
+                }
                 let (new_cap, new_enc, new_frame, new_interval, new_node_id, new_display_gen) = loop {
                     // Follow the active session unless an explicit PUNKTFUNK_COMPOSITOR pin forbids
                     // retargeting (then we stick to the pinned backend and just rebuild it).
@@ -2021,8 +2047,13 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                     ) {
                         Ok(p) => break p,
                         Err(e2) => {
+                            let budget = if compositor == crate::vdisplay::Compositor::Gamescope {
+                                GAMESCOPE_REBUILD_BUDGET
+                            } else {
+                                REBUILD_BUDGET
+                            };
                             if stop.load(Ordering::SeqCst)
-                                || std::time::Instant::now() >= rebuild_deadline
+                                || std::time::Instant::now() >= loss_at + budget
                             {
                                 return Err(e2)
                                     .context("capture lost — no compositor came up within the rebuild budget");
