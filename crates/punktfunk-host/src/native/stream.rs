@@ -909,6 +909,20 @@ pub(super) struct SessionContext {
     pub(super) compositor: crate::vdisplay::Compositor,
     /// Negotiated encoder bitrate (kbps).
     pub(super) bitrate_kbps: u32,
+    /// The encoder's live APPLIED rate (kbps) — shared with the send pacer, the web console, the
+    /// mgmt registry AND the control task (which acks climbs against it). The encode loop stores
+    /// `Encoder::applied_bitrate_bps` here after every apply, so everything downstream tracks
+    /// what the ASIC really targets, not what was requested (§ABR overdrive).
+    pub(super) live_bitrate: Arc<AtomicU32>,
+    /// The encoder's discovered codec-level bitrate ceiling (kbps; 0 = none discovered): written
+    /// when an apply comes back short, read by this loop (pre-clamp incoming requests — a
+    /// request already AT the ceiling then costs nothing) and by the control task (truthful
+    /// acks from the first post-discovery request).
+    pub(super) encoder_ceiling_kbps: Arc<AtomicU32>,
+    /// "Encode can't hold the frame cadence" (the escalation leaky bucket is elevated, or the
+    /// session escalated): while set, the control task refuses bitrate CLIMBS — the network
+    /// isn't the bottleneck, feeding the encoder more bits deepens the miss.
+    pub(super) cadence_degraded: Arc<AtomicBool>,
     /// The client asked for "Automatic" (`Hello::bitrate_kbps == 0`), so `bitrate_kbps` came from
     /// the host's codec-aware default. For PyroWave that default is the ~1.6 bpp operating point of
     /// the NEGOTIATED MODE (`resolve_bitrate_kbps_for`) — a mid-stream mode switch re-resolves it
@@ -1035,6 +1049,9 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
         bitrate_rx,
         compositor,
         mut bitrate_kbps,
+        live_bitrate,
+        encoder_ceiling_kbps,
+        cadence_degraded,
         bitrate_auto,
         bit_depth,
         // The resolved chroma is already captured in `plan` (above); ignore the duplicate here.
@@ -1254,9 +1271,9 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
     // The bounded channel applies backpressure (the encode thread blocks if the send falls behind,
     // so frames slow down rather than a dropped frame freezing the infinite-GOP stream).
     let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<SendMsg>(3);
-    // Live encoder bitrate, shared with the send thread's stats sample: a mid-stream adaptive
-    // bitrate change (bitrate_rx below) updates it so the console shows the actual target.
-    let live_bitrate = Arc::new(AtomicU32::new(bitrate_kbps));
+    // `live_bitrate` (SessionContext) is shared with the send thread's stats sample AND the
+    // control task: a mid-stream adaptive bitrate change (bitrate_rx below) stores the
+    // encoder-APPLIED rate, so the console, pacer and climb-refusal acks all see the truth.
     // Live session mode, same pattern (H3): a mid-stream mode switch (reconfig below) updates it so
     // a stats capture armed after a resize registers the real mode. Seeded with the refresh the
     // initial build actually achieved (`interval_hz`), not the request — KWin may cap a virtual

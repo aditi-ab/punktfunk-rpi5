@@ -37,8 +37,9 @@
 #![deny(clippy::undocumented_unsafe_blocks)]
 
 use super::nvenc_core::{
-    apply_low_latency_config, build_init_params, codec_guid, resolve_slices, resolve_subframe,
-    LowLatencyConfig, NvStatusExt, RFI_DPB,
+    apply_low_latency_config, build_init_params, cached_ceiling, codec_guid, resolve_slices,
+    resolve_split_mode, resolve_subframe, store_ceiling, CeilingKey, LowLatencyConfig, NvStatusExt,
+    RFI_DPB,
 };
 use super::nvenc_status;
 use super::{ChromaFormat, Codec, EncodedFrame, Encoder, EncoderCaps};
@@ -754,6 +755,27 @@ impl NvencD3d11Encoder {
         Ok(cfg)
     }
 
+    /// This session config's identity in the process-lifetime bitrate-ceiling cache
+    /// (`nvenc_core::{cached_ceiling, store_ceiling}`). GPU identity is the selected render
+    /// adapter's LUID — the adapter the capturer's device (and so this session) lives on; `0`
+    /// when unresolved. Best effort by design: the cache is advisory, a colliding identity costs
+    /// one failed open + re-search, never a wrong session.
+    fn ceiling_key(&self, split_mode: u32) -> CeilingKey {
+        let gpu = pf_gpu::resolve_render_adapter_luid()
+            .map(|l| ((l.HighPart as u32 as u64) << 32) | l.LowPart as u64)
+            .unwrap_or(0);
+        CeilingKey {
+            gpu,
+            codec: self.codec,
+            width: self.width,
+            height: self.height,
+            fps: self.fps,
+            bit_depth: self.bit_depth,
+            chroma_444: self.chroma_444,
+            split_mode,
+        }
+    }
+
     /// Open + configure + initialize ONE NVENC session at `bitrate` (bps) and `split_mode`. Returns
     /// the session handle, or destroys it and returns the error. NVENC has no re-init after a failed
     /// `initialize_encoder`, so the bitrate-clamp search in `init_session` calls this once per probe.
@@ -834,43 +856,14 @@ impl NvencD3d11Encoder {
             // gets the highest the GPU can actually do, not a coarse fraction of it.
             const FLOOR_BPS: u64 = 10_000_000;
             let requested_bps = self.bitrate_bps;
-            // 2-way NVENC split-frame encoding (Ada dual-NVENC) — the high-pixel-rate throughput lever
-            // the Linux host enables via libavcodec `split_encode_mode`. A single Ada NVENC session tops
-            // out ~0.8 Gpix/s, so at high motion a 5K@240 (1.77 Gpix/s) frame takes ~8 ms to encode and
-            // the rate caps ~125 fps; splitting across both engines roughly halves that. Force 2-way
-            // above ~1 Gpix/s (matching encode/linux.rs), AUTO below (the ~2% BD-rate cost isn't worth
-            // it at low pixel rates). Env override PUNKTFUNK_SPLIT_ENCODE = 0/disable | 1/auto | 2 | 3.
-            // HEVC/AV1 only; the init-failure fallback below disables it if a codec/config rejects it.
+            // 2-way NVENC split-frame encoding (Ada dual-NVENC) — the high-pixel-rate throughput lever.
+            // A single Ada NVENC session tops out ~0.8-1 Gpix/s, so at high motion a 5K@240
+            // (1.77 Gpix/s) frame takes ~8 ms to encode and the rate caps ~125 fps; splitting across
+            // both engines roughly halves that. Shared selector — see [`resolve_split_mode`] for the
+            // precedence (env override / the measured Main10 don't-split rule / pixel rate).
+            // The init-failure fallback below disables it if a codec/config rejects it.
             let pixel_rate = self.width as u64 * self.height as u64 * self.fps.max(1) as u64;
-            let mut split_mode: u32 = match std::env::var("PUNKTFUNK_SPLIT_ENCODE").ok().as_deref()
-            {
-                Some("0") | Some("disable") => {
-                    nv::NV_ENC_SPLIT_ENCODE_MODE::NV_ENC_SPLIT_DISABLE_MODE as u32
-                }
-                Some("1") | Some("auto") => {
-                    nv::NV_ENC_SPLIT_ENCODE_MODE::NV_ENC_SPLIT_AUTO_FORCED_MODE as u32
-                }
-                Some("3") => nv::NV_ENC_SPLIT_ENCODE_MODE::NV_ENC_SPLIT_THREE_FORCED_MODE as u32,
-                Some("2") => nv::NV_ENC_SPLIT_ENCODE_MODE::NV_ENC_SPLIT_TWO_FORCED_MODE as u32,
-                // Main10 (10-bit / HDR): 2-way split is measurably SLOWER on Ada — at 5120x1440@240
-                // Main10, forced-2 took 7.6 ms/frame (~131 fps) vs 2.8 ms (~357 fps) single-engine
-                // (the split/merge overhead dominates for 10-bit). A single Ada NVENC engine already
-                // handles 5K@240 Main10 well under the 4.17 ms budget, so DON'T split — splitting was
-                // the "broken animations in HDR" (the stream capped at ~131 fps). Env still overrides.
-                _ if self.bit_depth >= 10 => {
-                    nv::NV_ENC_SPLIT_ENCODE_MODE::NV_ENC_SPLIT_DISABLE_MODE as u32
-                }
-                _ if pixel_rate > 1_000_000_000 => {
-                    nv::NV_ENC_SPLIT_ENCODE_MODE::NV_ENC_SPLIT_TWO_FORCED_MODE as u32
-                }
-                _ => nv::NV_ENC_SPLIT_ENCODE_MODE::NV_ENC_SPLIT_AUTO_MODE as u32,
-            };
-            tracing::debug!(
-                split_mode,
-                bit_depth = self.bit_depth,
-                pixel_rate,
-                "NVENC split-encode mode selected"
-            );
+            let split_mode: u32 = resolve_split_mode(self.bit_depth, pixel_rate);
             // Find the highest bitrate the GPU's codec LEVEL accepts and CLAMP to it. NVENC rejects
             // `initialize_encoder` (InvalidParam) when the bitrate exceeds the level ceiling (e.g. a
             // 1 Gbps request on HEVC). Strategy: try the requested rate; if the only problem is a forced
@@ -884,39 +877,69 @@ impl NvencD3d11Encoder {
             // built in the right mode from the start.
             let use_async = self.async_supported && async_retrieve_requested();
 
-            let mut probe = self.try_open_session(device, requested_bps, split_mode, use_async);
+            // Ceiling cache (process lifetime, `nvenc_core`): a prior clamp search already found
+            // this config's max accepted rate — open straight AT the ceiling instead of paying
+            // the ~6-open binary search (and its session churn) on every ABR overshoot.
+            let mut target_bps = requested_bps;
+            if let Some(ceiling) = cached_ceiling(&self.ceiling_key(split_mode)) {
+                if requested_bps > ceiling {
+                    tracing::info!(
+                        requested_mbps = requested_bps / 1_000_000,
+                        ceiling_mbps = ceiling / 1_000_000,
+                        "NVENC: requested bitrate above the cached codec-level ceiling — opening \
+                         at the ceiling"
+                    );
+                    target_bps = ceiling;
+                }
+            }
+
+            let mut probe = self.try_open_session(device, target_bps, split_mode, use_async);
+            // The cache is advisory: a stale entry (driver change, identity collision) must not
+            // wedge the open — retry the requested rate and let the search below rediscover.
+            if probe.is_err() && target_bps < requested_bps {
+                target_bps = requested_bps;
+                probe = self.try_open_session(device, requested_bps, split_mode, use_async);
+            }
             // Disambiguate a forced-split rejection from a bitrate-cap rejection: retry once at the
             // requested rate with split disabled — if THAT succeeds, split was the problem, not bitrate.
             // ANY non-disabled mode can be the rejection — AUTO included: AV1 rejects the whole
             // init with INVALID_PARAM on drivers/configs where auto split isn't valid for it,
             // which then masqueraded as a bitrate cap and failed "even at the floor".
+            // `used_split` tracks the mode sessions ACTUALLY open with from here on — it feeds
+            // `self.split_mode` (a reconfigure must re-present it) and the ceiling-cache key.
+            let mut used_split = split_mode;
             let split_on =
                 split_mode != nv::NV_ENC_SPLIT_ENCODE_MODE::NV_ENC_SPLIT_DISABLE_MODE as u32;
             if probe.is_err() && split_on {
                 let no_split = nv::NV_ENC_SPLIT_ENCODE_MODE::NV_ENC_SPLIT_DISABLE_MODE as u32;
-                if let Ok(e) = self.try_open_session(device, requested_bps, no_split, use_async) {
+                if let Ok(e) = self.try_open_session(device, target_bps, no_split, use_async) {
                     tracing::warn!("NVENC: split-encode rejected by codec/config — disabled");
-                    split_mode = no_split;
+                    used_split = no_split;
                     probe = Ok(e);
                 }
             }
 
             let enc = match probe {
                 Ok(enc) => {
-                    self.bitrate_bps = requested_bps;
+                    self.bitrate_bps = target_bps;
                     enc
                 }
+                // Only a parameter/caps rejection means "the bitrate is above the codec-level
+                // ceiling". A transient failure (busy engine, session limit, OOM, device loss,
+                // version skew) must propagate — a search steered by it would discover, and
+                // cache, a bogus ceiling.
+                Err(e) if !nvenc_status::is_param_rejection(&e) => return Err(e),
                 Err(_) => {
                     // Requested bitrate exceeds the codec-level ceiling — binary-search the max accepted.
                     // `lo` is the highest known-good rate (FLOOR is assumed to fit), `hi` the lowest
                     // rejected; `best` holds the live session at `lo` so we end up with the clamped one.
                     let mut lo = FLOOR_BPS;
-                    let mut hi = requested_bps;
+                    let mut hi = target_bps;
                     let mut best: *mut c_void = ptr::null_mut();
                     let mut best_bps = 0u64;
                     while hi > lo + CLAMP_TOL_BPS {
                         let mid = lo + (hi - lo) / 2;
-                        match self.try_open_session(device, mid, split_mode, use_async) {
+                        match self.try_open_session(device, mid, used_split, use_async) {
                             Ok(e) => {
                                 if !best.is_null() {
                                     let _ = (api().destroy_encoder)(best);
@@ -925,7 +948,15 @@ impl NvencD3d11Encoder {
                                 best_bps = mid;
                                 lo = mid;
                             }
-                            Err(_) => hi = mid,
+                            Err(e) if nvenc_status::is_param_rejection(&e) => hi = mid,
+                            Err(e) => {
+                                // Environmental mid-search failure: don't let it shrink the
+                                // search — release the partial result and propagate.
+                                if !best.is_null() {
+                                    let _ = (api().destroy_encoder)(best);
+                                }
+                                return Err(e);
+                            }
                         }
                     }
                     if best.is_null() {
@@ -933,14 +964,19 @@ impl NvencD3d11Encoder {
                         // trying split-disabled in case a forced split (not the bitrate) is the blocker.
                         let no_split =
                             nv::NV_ENC_SPLIT_ENCODE_MODE::NV_ENC_SPLIT_DISABLE_MODE as u32;
-                        best = self
-                            .try_open_session(device, FLOOR_BPS, split_mode, use_async)
-                            .or_else(|_| {
-                                self.try_open_session(device, FLOOR_BPS, no_split, use_async)
-                            })
-                            .context(
-                                "NVENC initialize_encoder rejected even at the floor bitrate",
-                            )?;
+                        best = match self.try_open_session(device, FLOOR_BPS, used_split, use_async)
+                        {
+                            Ok(e) => e,
+                            Err(_) => {
+                                let e = self
+                                    .try_open_session(device, FLOOR_BPS, no_split, use_async)
+                                    .context(
+                                    "NVENC initialize_encoder rejected even at the floor bitrate",
+                                )?;
+                                used_split = no_split;
+                                e
+                            }
+                        };
                         best_bps = FLOOR_BPS;
                     }
                     tracing::warn!(
@@ -948,21 +984,19 @@ impl NvencD3d11Encoder {
                         clamped_mbps = best_bps / 1_000_000,
                         "NVENC: requested bitrate above the GPU codec-level ceiling — clamped to the max accepted"
                     );
+                    store_ceiling(self.ceiling_key(used_split), best_bps);
                     self.bitrate_bps = best_bps;
                     best
                 }
             };
             self.encoder = enc;
-            // Session init params a later `reconfigure_bitrate` must re-present verbatim. (Best
-            // effort: the floor fallback above may have succeeded split-disabled without updating
-            // `split_mode` — a reconfigure then presents the forced mode, NVENC rejects it, and
-            // the caller's rebuild fallback covers the mismatch.)
-            self.split_mode = split_mode;
+            // Session init params a later `reconfigure_bitrate` must re-present verbatim.
+            self.split_mode = used_split;
             self.session_async = use_async;
             // Session-budget accounting (Stage W3): record what this open holds so admission can
             // decline a parallel display the hardware can't afford. Weighted by the FINAL split
             // mode (a split session occupies one hardware session per engine).
-            self.session_units = split_mode_units(split_mode);
+            self.session_units = split_mode_units(used_split);
             LIVE_SESSION_UNITS.fetch_add(self.session_units, std::sync::atomic::Ordering::Relaxed);
             // (The clamp path above already logs the requested→clamped bitrate at warn; no second
             // info line for the same event here.)
@@ -1552,6 +1586,15 @@ impl Encoder for NvencD3d11Encoder {
             self.bitrate_bps = bps;
             return true;
         }
+        // Cached codec-level ceiling: clamp the target BEFORE the driver call, so a known
+        // overshoot retargets to the ceiling IN PLACE instead of bouncing off the driver into
+        // the caller's full-rebuild fallback (an IDR plus ~half a second of session churn per
+        // ABR overshoot on the pre-cache path). The caller reads the clamp back through
+        // [`Encoder::applied_bitrate_bps`].
+        let bps = match cached_ceiling(&self.ceiling_key(self.split_mode)) {
+            Some(ceiling) => bps.min(ceiling),
+            None => bps,
+        };
         // SAFETY: `inited` ⟹ `self.encoder` is the live session and this runs on the encode
         // thread between submit/poll (`nvEncReconfigureEncoder` is a submit-side call, the
         // sanctioned side of the two-thread async split — the retrieve thread only ever locks
@@ -1598,6 +1641,12 @@ impl Encoder for NvencD3d11Encoder {
                 }
             }
         }
+    }
+
+    fn applied_bitrate_bps(&self) -> Option<u64> {
+        // `bitrate_bps` is the post-clamp truth: the open path's ceiling search and the
+        // reconfigure path's cache clamp both write what the session ACTUALLY targets.
+        Some(self.bitrate_bps)
     }
 
     fn flush(&mut self) -> Result<()> {

@@ -22,6 +22,13 @@ pub(super) async fn run(
     live_reconfig_ok: bool,
     adaptive_fec: bool,
     session_bitrate_kbps: u32,
+    /// Encoder-truth bridge (data plane → here, §ABR overdrive): the encoder's live applied rate,
+    /// its discovered codec-level ceiling (0 = unknown), and the "encode can't hold cadence"
+    /// flag. Read at `SetBitrate`-resolve time so the ack — the base the client's controller
+    /// climbs from — never promises a rate the encoder won't run at.
+    live_bitrate: Arc<AtomicU32>,
+    encoder_ceiling_kbps: Arc<AtomicU32>,
+    cadence_degraded: Arc<AtomicBool>,
     fec_target_ctl: Arc<AtomicU8>,
     reconfig_tx: std::sync::mpsc::Sender<punktfunk_core::Mode>,
     keyframe_tx: std::sync::mpsc::Sender<()>,
@@ -161,7 +168,31 @@ pub(super) async fn run(
                         );
                         session_bitrate_kbps
                     } else {
-                        resolve_bitrate_kbps(req.bitrate_kbps)
+                        let mut r = resolve_bitrate_kbps(req.bitrate_kbps);
+                        // Encoder truth (§ABR overdrive): the ack below is the base the
+                        // client's controller climbs from, so it must not promise past the
+                        // encoder's discovered codec-level ceiling — the pre-fix path acked
+                        // 1.01 Gbps while the ASIC ran 794 Mbps, and the controller climbed
+                        // from the phantom number forever (a ~0.6 s rebuild + IDR per step).
+                        let ceiling = encoder_ceiling_kbps.load(Ordering::Relaxed);
+                        if ceiling != 0 && r > ceiling {
+                            r = ceiling;
+                        }
+                        // Climb refusal while encode can't hold cadence: on a fat LAN no
+                        // network signal ever stops the climb, and past the compute knee more
+                        // bits only deepen the miss. Resolve a CLIMB to the current applied
+                        // rate (descents pass — they're the cure); the short ack teaches the
+                        // client controller its ceiling.
+                        let live = live_bitrate.load(Ordering::Relaxed);
+                        if cadence_degraded.load(Ordering::Relaxed) && live != 0 && r > live {
+                            tracing::info!(
+                                requested_kbps = req.bitrate_kbps,
+                                held_kbps = live,
+                                "bitrate climb refused — encode is behind cadence"
+                            );
+                            r = live;
+                        }
+                        r
                     };
                     tracing::debug!(
                         requested_kbps = req.bitrate_kbps,

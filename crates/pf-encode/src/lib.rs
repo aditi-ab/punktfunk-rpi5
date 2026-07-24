@@ -243,6 +243,12 @@ impl Encoder for TrackedEncoder {
     fn reconfigure_bitrate(&mut self, bps: u64) -> bool {
         self.inner.reconfigure_bitrate(bps)
     }
+    // Forwarded (the same trap class as `set_wire_chunking`): the unforwarded default `None`
+    // would tell the session loop "no encoder truth here" and it would keep pacing/acking the
+    // requested rate even where NVENC clamped to the codec-level ceiling.
+    fn applied_bitrate_bps(&self) -> Option<u64> {
+        self.inner.applied_bitrate_bps()
+    }
     fn flush(&mut self) -> Result<()> {
         self.inner.flush()
     }

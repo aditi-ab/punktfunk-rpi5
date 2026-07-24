@@ -67,6 +67,155 @@ pub(super) fn resolve_subframe(default_on: bool) -> bool {
     }
 }
 
+/// Resolved NVENC split-frame encode mode for a session — ONE selector shared by the Windows and
+/// Linux direct-SDK backends (they had drifted into byte-identical duplicates, one of which
+/// logged and one didn't). Precedence:
+/// 1. `PUNKTFUNK_SPLIT_ENCODE` = `0`/`disable` | `1`/`auto` (AUTO_FORCED) | `2` | `3` — operator
+///    override, always wins.
+/// 2. 10-bit → DISABLE: 2-way split is measurably SLOWER on Ada for Main10 — at 5120×1440@240
+///    forced-2 took 7.6 ms/frame (~131 fps) vs 2.8 ms (~357 fps) single-engine (the split/merge
+///    overhead dominates), and a single engine handles 5K@240 Main10 well under budget. This was
+///    the "broken animations in HDR" cap at ~131 fps.
+/// 3. Pixel rate ≥ [`super::SPLIT_FORCE_PIXEL_RATE`] → force 2-way (AUTO never engages below
+///    ~2112 px height, so 4K120 must be forced onto the second engine).
+/// 4. Else AUTO (the ~2% BD-rate split cost isn't worth it at low pixel rates).
+///
+/// The caller still owns the rejection fallback (retry split-disabled) — a codec/config that
+/// rejects the chosen mode downgrades at open, not here.
+pub(super) fn resolve_split_mode(bit_depth: u8, pixel_rate: u64) -> u32 {
+    use nv::NV_ENC_SPLIT_ENCODE_MODE as M;
+    let mode = match std::env::var("PUNKTFUNK_SPLIT_ENCODE").ok().as_deref() {
+        Some("0") | Some("disable") => M::NV_ENC_SPLIT_DISABLE_MODE as u32,
+        Some("1") | Some("auto") => M::NV_ENC_SPLIT_AUTO_FORCED_MODE as u32,
+        Some("3") => M::NV_ENC_SPLIT_THREE_FORCED_MODE as u32,
+        Some("2") => M::NV_ENC_SPLIT_TWO_FORCED_MODE as u32,
+        _ if bit_depth >= 10 => M::NV_ENC_SPLIT_DISABLE_MODE as u32,
+        _ if pixel_rate >= super::SPLIT_FORCE_PIXEL_RATE => M::NV_ENC_SPLIT_TWO_FORCED_MODE as u32,
+        _ => M::NV_ENC_SPLIT_AUTO_MODE as u32,
+    };
+    tracing::debug!(
+        split_mode = mode,
+        bit_depth,
+        pixel_rate,
+        "NVENC split-encode mode selected"
+    );
+    mode
+}
+
+/// One session config's identity for the process-lifetime bitrate-ceiling cache
+/// ([`cached_ceiling`]/[`store_ceiling`]). Everything the driver's codec-level validation keys
+/// off: the GPU (different NVENC generations have different level ceilings), dims/fps (the luma
+/// rate selects the level), depth/chroma (they select the profile) and the split mode the
+/// sessions ACTUALLY opened with (a split session budgets per engine).
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) struct CeilingKey {
+    /// GPU identity — Linux: the process-global shared `CUcontext` pointer; Windows: the render
+    /// adapter LUID (0 when unresolved). Best effort: the cache is advisory (see
+    /// [`cached_ceiling`]), so a colliding identity costs one failed open + re-search, never a
+    /// wrong session.
+    pub gpu: u64,
+    pub codec: Codec,
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
+    pub bit_depth: u8,
+    pub chroma_444: bool,
+    pub split_mode: u32,
+}
+
+fn ceilings() -> &'static std::sync::Mutex<std::collections::HashMap<CeilingKey, u64>> {
+    static CEILINGS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<CeilingKey, u64>>,
+    > = std::sync::OnceLock::new();
+    CEILINGS.get_or_init(Default::default)
+}
+
+/// The codec-level bitrate ceiling (bps) a previous clamp search discovered for `key` this
+/// process lifetime, if any. ADVISORY: the consumer must treat a failed open at the cached value
+/// as a stale entry (fall back to the full search, which rewrites it via [`store_ceiling`]) —
+/// that self-healing is what lets the key's GPU identity be best-effort. What this buys: an ABR
+/// overshoot on a config whose ceiling is already known opens (or in-place reconfigures) straight
+/// AT the ceiling instead of re-running the ~6-open binary search and its ~half-second of session
+/// churn per rebuild.
+pub(super) fn cached_ceiling(key: &CeilingKey) -> Option<u64> {
+    ceilings().lock().unwrap().get(key).copied()
+}
+
+/// Record the clamp search's discovered max accepted bitrate (bps) for `key`.
+pub(super) fn store_ceiling(key: CeilingKey, bps: u64) {
+    ceilings().lock().unwrap().insert(key, bps);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nv::NV_ENC_SPLIT_ENCODE_MODE as M;
+
+    // These assume PUNKTFUNK_SPLIT_ENCODE is unset (CI); an operator override deliberately wins.
+
+    #[test]
+    fn split_forces_two_way_at_4k120() {
+        // The regression this threshold constant exists for: 3840×2160×120 = 995,328,000 sat
+        // 0.47% under the old `> 1_000_000_000` gate and stayed AUTO — pinned ~107 fps on a
+        // 4090 because AUTO never engages at 2160 px height.
+        let four_k_120 = 3840u64 * 2160 * 120;
+        assert_eq!(
+            resolve_split_mode(8, four_k_120),
+            M::NV_ENC_SPLIT_TWO_FORCED_MODE as u32
+        );
+    }
+
+    #[test]
+    fn split_leaves_1440p240_auto() {
+        // 884.7 Mpix/s is comfortably single-engine — the threshold move must not drag it in.
+        let qhd_240 = 2560u64 * 1440 * 240;
+        assert_eq!(
+            resolve_split_mode(8, qhd_240),
+            M::NV_ENC_SPLIT_AUTO_MODE as u32
+        );
+    }
+
+    #[test]
+    fn split_disabled_for_10bit_even_at_high_pixel_rate() {
+        // The measured Main10 rule: split/merge overhead dominates 10-bit on Ada (7.6 ms forced-2
+        // vs 2.8 ms single-engine at 5K240) — 10-bit precedes the pixel-rate arm.
+        let five_k_240 = 5120u64 * 1440 * 240;
+        assert_eq!(
+            resolve_split_mode(10, five_k_240),
+            M::NV_ENC_SPLIT_DISABLE_MODE as u32
+        );
+    }
+
+    #[test]
+    fn ceiling_cache_round_trips_and_keys_precisely() {
+        let key = CeilingKey {
+            gpu: 0xB0B0,
+            codec: Codec::H265,
+            width: 3840,
+            height: 2160,
+            fps: 120,
+            bit_depth: 8,
+            chroma_444: false,
+            split_mode: M::NV_ENC_SPLIT_TWO_FORCED_MODE as u32,
+        };
+        assert_eq!(cached_ceiling(&key), None);
+        store_ceiling(key, 794_000_000);
+        assert_eq!(cached_ceiling(&key), Some(794_000_000));
+        // Any config-identity change is a different ceiling — a miss, never a wrong clamp.
+        assert_eq!(cached_ceiling(&CeilingKey { fps: 60, ..key }), None);
+        assert_eq!(
+            cached_ceiling(&CeilingKey {
+                split_mode: M::NV_ENC_SPLIT_DISABLE_MODE as u32,
+                ..key
+            }),
+            None
+        );
+        // A re-search overwrites (the advisory-cache stale-entry path).
+        store_ceiling(key, 620_000_000);
+        assert_eq!(cached_ceiling(&key), Some(620_000_000));
+    }
+}
+
 /// Reference-frame DPB depth when RFI is supported (Apollo uses 5). A deeper DPB lets an invalidated
 /// reference fall back to an older still-valid frame instead of a full IDR; `numRefL0 = 1` keeps each
 /// P-frame single-reference for low latency. Also the window the backends' `invalidate_ref_frames`

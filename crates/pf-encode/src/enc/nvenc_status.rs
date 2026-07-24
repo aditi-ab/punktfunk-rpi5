@@ -72,9 +72,41 @@ pub(super) fn explain(status: nv::NVENCSTATUS) -> String {
     }
 }
 
+/// Typed root of a failed NVENC entry-point call: carries the raw status so callers can classify
+/// the failure class, not just print it — the bitrate-clamp search must only read a
+/// parameter/caps rejection as "above the codec-level ceiling"; a transient failure shrinking the
+/// search would discover (and cache) a bogus ceiling. Recover it through an `anyhow` chain with
+/// `err.downcast_ref::<NvCallError>()` (see [`is_param_rejection`]).
+#[derive(Debug)]
+pub(super) struct NvCallError(pub(super) nv::NVENCSTATUS);
+
+impl std::fmt::Display for NvCallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?} — {}", self.0, explain(self.0))
+    }
+}
+
+impl std::error::Error for NvCallError {}
+
+/// Whether `err` is an NVENC parameter/capability rejection: the driver understood the request
+/// and says THIS config is not encodable — the clamp search's "bitrate above the ceiling"
+/// evidence. Everything else (busy engine, session limit, OOM, device loss, version skew) is
+/// environmental and must propagate instead of steering the search.
+pub(super) fn is_param_rejection(err: &anyhow::Error) -> bool {
+    matches!(
+        err.downcast_ref::<NvCallError>(),
+        Some(NvCallError(
+            nv::NVENCSTATUS::NV_ENC_ERR_INVALID_PARAM
+                | nv::NVENCSTATUS::NV_ENC_ERR_UNSUPPORTED_PARAM
+                | nv::NVENCSTATUS::NV_ENC_ERR_UNIMPLEMENTED,
+        ))
+    )
+}
+
 /// Build an actionable `anyhow::Error` for a failed NVENC entry-point call. `call` names the API
-/// (e.g. `"open_encode_session_ex"`); the message carries both the raw status and its real-world
-/// cause, so triage never again reads a version mismatch as "(no NVIDIA GPU?)".
+/// (e.g. `"open_encode_session_ex"`); the chain carries both the raw status and its real-world
+/// cause, so triage never again reads a version mismatch as "(no NVIDIA GPU?)". The
+/// [`NvCallError`] root keeps the status downcastable for failure-class checks.
 pub(super) fn call_err(call: &str, status: nv::NVENCSTATUS) -> anyhow::Error {
-    anyhow::anyhow!("NVENC {call} failed: {status:?} — {}", explain(status))
+    anyhow::Error::new(NvCallError(status)).context(format!("NVENC {call} failed"))
 }

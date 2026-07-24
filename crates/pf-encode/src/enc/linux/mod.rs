@@ -439,15 +439,19 @@ impl NvencEncoder {
         }
 
         // Split-frame encode across both NVENC engines (GB203 has 2) when the pixel rate exceeds
-        // a single engine's HEVC capacity (~1 Gpix/s); e.g. 5120x1440@240 = 1.77 Gpix/s needs it,
-        // @120 = 0.88 Gpix/s does not. HEVC/AV1 only (not H.264). AUTO won't engage below ~2112px
+        // a single engine's HEVC capacity; e.g. 5120x1440@240 = 1.77 Gpix/s needs it, @120
+        // (0.88 Gpix/s) does not. HEVC/AV1 only (not H.264). AUTO won't engage below ~2112px
         // height, so we force `2`; below the threshold we leave it AUTO (split costs ~2% BD-rate).
-        // Output is standard HEVC — transparent to the client. Override with PUNKTFUNK_SPLIT_ENCODE.
+        // Threshold shared with the direct-SDK selector ([`super::SPLIT_FORCE_PIXEL_RATE`] — set
+        // so 4K120 = 995.3 Mpix/s forces, which `> 1e9` famously missed by 0.47%). Output is
+        // standard HEVC — transparent to the client. Override with PUNKTFUNK_SPLIT_ENCODE.
         let pix_rate = width as u64 * height as u64 * fps as u64;
         let split = std::env::var("PUNKTFUNK_SPLIT_ENCODE").ok();
         match split.as_deref() {
             Some(mode) => opts.set("split_encode_mode", mode),
-            None if matches!(codec, Codec::H265 | Codec::Av1) && pix_rate > 1_000_000_000 => {
+            None if matches!(codec, Codec::H265 | Codec::Av1)
+                && pix_rate >= super::SPLIT_FORCE_PIXEL_RATE =>
+            {
                 opts.set("split_encode_mode", "2");
                 tracing::info!(
                     pix_rate,

@@ -112,7 +112,7 @@ impl AuChunk {
 }
 
 /// Codec selection negotiated with the client.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Codec {
     H264,
     H265,
@@ -399,6 +399,16 @@ pub trait Encoder: Send {
     fn reconfigure_bitrate(&mut self, _bps: u64) -> bool {
         false
     }
+    /// The bitrate (bps) the encoder is ACTUALLY running at (or will open at, for a lazily-opened
+    /// backend) — the encoder-side truth after any internal clamp, e.g. the direct-NVENC
+    /// codec-level ceiling search. The session loop reads this after every open/reconfigure and
+    /// stores IT, not the requested rate, as the live bitrate — so the send pacer, the console
+    /// and the client controller's ack all track what the ASIC really targets (a controller fed
+    /// the requested rate keeps climbing from a phantom base, §ABR overdrive). `None` (the
+    /// default) = the backend doesn't track an applied rate; the caller keeps the requested one.
+    fn applied_bitrate_bps(&self) -> Option<u64> {
+        None
+    }
     /// Wire-chunk the encoder's AUs at the session's shard payload size (the PyroWave
     /// datagram-aligned mode, plan §4.4): every `shard_payload` window of the emitted AU
     /// starts a fresh self-delimiting codec packet, zero-padded to the window — so a lost
@@ -451,6 +461,17 @@ impl Codec {
         }
     }
 }
+
+/// Pixel rate (luma samples/s) at or above which NVENC split-frame encoding is FORCED 2-way —
+/// one number shared by the direct-SDK selector (`nvenc_core::resolve_split_mode`) and the libav
+/// `split_encode_mode` option author (`linux::NvencEncoder`), so the two paths can never disagree
+/// about which modes split. A single NVENC engine tops out ~1 Gpix/s on HEVC, and AUTO doesn't
+/// engage below ~2112 px height, so the sessions that need the second engine must be forced. Set
+/// BELOW 1 Gpix/s deliberately: 4K120 — the mode this threshold exists for — is 3840×2160×120 =
+/// 995,328,000, which a `> 1_000_000_000` gate missed by 0.47% and left on AUTO (pinned ~107 fps
+/// on a 4090). 950 M keeps margin for fractional refresh rates while leaving 1440p240 (884.7 M,
+/// comfortably single-engine) on AUTO.
+pub const SPLIT_FORCE_PIXEL_RATE: u64 = 950_000_000;
 
 /// `PUNKTFUNK_VBV_FRAMES` — HRD/VBV size in frame intervals (default 1.0, the strict low-latency
 /// shape every backend ships: each frame must fit its rate share, keeping frame sizes uniform for

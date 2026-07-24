@@ -985,6 +985,18 @@ async fn serve_session(
     // full IDR when the encoder supports it (native-AMF LTR / Windows NVENC).
     let (rfi_tx, rfi_rx) = std::sync::mpsc::channel::<(u32, u32)>();
     let (bitrate_tx, bitrate_rx) = std::sync::mpsc::channel::<u32>();
+    // Encoder-truth bridge, data plane → control task (§ABR overdrive). The encode loop publishes
+    // here; the control task reads at `SetBitrate`-resolve time, so the ack the client's
+    // controller climbs from tracks what the encoder ACTUALLY does, not what was asked:
+    // - `live_bitrate`: the encoder's applied rate (kbps) — also the send pacer's/console's view.
+    // - `encoder_ceiling_kbps`: the discovered codec-level ceiling (0 = none discovered yet);
+    //   resolves land at min(policy clamp, ceiling), so overshoots stop costing rebuilds.
+    // - `cadence_degraded`: encode can't hold the frame cadence — a climb is refused (acked at
+    //   the current rate); the network isn't the bottleneck, more bits are anti-medicine.
+    // Plain atomics, not a channel: only the freshest value matters, and only at resolve time.
+    let live_bitrate = Arc::new(AtomicU32::new(welcome.bitrate_kbps));
+    let encoder_ceiling_kbps = Arc::new(AtomicU32::new(0));
+    let cadence_degraded = Arc::new(AtomicBool::new(false));
     let (probe_tx, probe_rx) = std::sync::mpsc::channel::<ProbeRequest>();
     let (probe_result_tx, probe_result_rx) = tokio::sync::mpsc::unbounded_channel::<ProbeResult>();
     // Mode-switch outcome, data plane → control task (same pattern as `probe_result_tx`): the accept
@@ -1036,6 +1048,9 @@ async fn serve_session(
         live_reconfig_ok,
         adaptive_fec,
         session_bitrate_kbps,
+        live_bitrate.clone(),
+        encoder_ceiling_kbps.clone(),
+        cadence_degraded.clone(),
         fec_target_ctl,
         reconfig_tx,
         keyframe_tx,
@@ -1429,6 +1444,9 @@ async fn serve_session(
                         bitrate_rx,
                         compositor,
                         bitrate_kbps,
+                        live_bitrate,
+                        encoder_ceiling_kbps,
+                        cadence_degraded,
                         bitrate_auto,
                         bit_depth,
                         chroma,
