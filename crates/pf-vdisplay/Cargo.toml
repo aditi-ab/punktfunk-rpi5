@@ -45,6 +45,9 @@ futures-util = "0.3"
 wayland-client = "0.31"
 wayland-scanner = "0.31"
 wayland-backend = "0.3"
+# wayland-scanner emits `bitflags::bitflags!` for the KDE output-device protocol's bitfield enums
+# (kde-output-device-v2 `capability`/`flags`); needs the crate in scope (kwin_output_mgmt.rs).
+bitflags = "2"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 # The host<->driver wire contract for the pf-vdisplay IddCx backend (control IOCTLs + Pod structs).

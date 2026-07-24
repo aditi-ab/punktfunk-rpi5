@@ -89,6 +89,11 @@ pub struct KwinDisplay {
     /// [`apply_position`](VirtualDisplay::apply_position) addresses OUR output even while a
     /// superseded same-name sibling is still alive.
     last_name: Option<String>,
+    /// The RESOLVED `kde_output_device_v2` UUID of the last `create`'s output, when the in-process
+    /// output-management path handled the topology. A stable per-output id (unlike the shared name),
+    /// so [`apply_position`](VirtualDisplay::apply_position) and restore address exactly OUR output
+    /// across a supersede — preferred over `last_name`, which is only the kscreen-doctor fallback.
+    our_uuid: Option<String>,
     /// The topology-restore action the last `create` prepared (re-enable the outputs an `exclusive`
     /// topology disabled), pending pickup by the registry via [`take_topology_restore`] — so the
     /// physical is re-enabled only when the display GROUP's last member drops (§6.1), not this session's.
@@ -113,6 +118,48 @@ impl Drop for KwinDisplay {
 impl KwinDisplay {
     pub fn new() -> Result<Self> {
         Ok(KwinDisplay::default())
+    }
+
+    /// Apply the effective display topology for the just-created output `our_prefix` (current size
+    /// `dims`), preferring the in-process `kde_output_management_v2` path and falling back to
+    /// `kscreen-doctor` if the compositor doesn't answer in budget or the management global is
+    /// absent. Records the output's UUID (in-process) or kscreen address (fallback) for
+    /// [`apply_position`](VirtualDisplay::apply_position), and returns the disabled outputs (each
+    /// `(name, "WxH@Hz")`) for the group teardown restore. `Extend`/`Auto` disable nothing.
+    fn apply_topology(
+        &mut self,
+        name: &str,
+        our_prefix: &str,
+        dims: (u32, u32),
+    ) -> Vec<(String, String)> {
+        use crate::kwin_output_mgmt::TopologyKind;
+        use crate::policy::Topology;
+        let topology = crate::effective_topology();
+        let kind = match topology {
+            Topology::Exclusive => TopologyKind::Exclusive,
+            Topology::Primary => TopologyKind::Primary,
+            Topology::Extend | Topology::Auto => return Vec::new(),
+        };
+        // In-process over Wayland — immune to whatever wedges the standalone kscreen-doctor.
+        let outcome = crate::kwin_output_mgmt::apply_topology(our_prefix, dims.0, dims.1, kind);
+        if outcome.handled {
+            self.our_uuid = outcome.our_uuid;
+            return outcome.disabled;
+        }
+        // Fallback: kscreen-doctor — resolve our address the old way, then shell out the topology.
+        tracing::info!(
+            "KWin topology: kde_output_management unavailable — kscreen-doctor fallback"
+        );
+        let addr = resolve_kscreen_addr(name, dims.0, dims.1);
+        self.last_name = Some(addr.clone());
+        match topology {
+            Topology::Exclusive => apply_virtual_primary(&addr),
+            Topology::Primary => {
+                apply_virtual_primary_only(&addr);
+                Vec::new()
+            }
+            Topology::Extend | Topology::Auto => Vec::new(),
+        }
     }
 }
 
@@ -142,8 +189,15 @@ impl VirtualDisplay for KwinDisplay {
     }
 
     fn apply_position(&mut self, x: i32, y: i32) {
-        // `last_name` holds the RESOLVED kscreen address (numeric output id, or the
-        // `Virtual-<name>` fallback) — never re-derive from the name: during a supersede two
+        // Prefer the in-process path: address OUR output by its stable UUID (supersede-robust) over
+        // kde_output_management_v2 — immune to a wedged kscreen-doctor backend (see kwin_output_mgmt).
+        if let Some(uuid) = self.our_uuid.clone() {
+            if crate::kwin_output_mgmt::set_position(&uuid, x, y) {
+                return;
+            }
+        }
+        // Fallback: kscreen-doctor. `last_name` holds the RESOLVED kscreen address (numeric output id,
+        // or the `Virtual-<name>` fallback) — never re-derive from the name: during a supersede two
         // outputs share it and the command would hit the old one (see `create`).
         let Some(output) = self.last_name.clone() else {
             return;
@@ -227,17 +281,10 @@ impl VirtualDisplay for KwinDisplay {
             embedded_pointer = !self.hw_cursor,
             "KWin virtual output ready"
         );
-        // ⚠️ ADDRESS BY NUMERIC KSCREEN ID, NEVER BY NAME: a supersede (mode switch) creates the
-        // replacement output — SAME per-slot name, deliberately, for KWin's per-name config
-        // persistence — while the superseded sibling is still alive (create-before-drop). Every
-        // name-addressed kscreen command then hits the FIRST match = the OLD output: on-glass this
-        // resized the LIVE session's display out from under it (wrong-res/black), read back the
-        // OLD output as "custom mode applied", made the OLD output primary, and positioned it —
-        // while the new output never left its birth mode and the capturer's dims gate starved.
-        // Resolve OUR output's kscreen id once (match: managed-prefix name AND current mode ==
-        // the just-created birth size; newest id wins), and use it for every kscreen operation.
-        let mut addr = resolve_kscreen_addr(&name, width, birth_h);
-        self.last_name = Some(addr.clone()); // for apply_position (registry-driven §6.2 layout)
+        // Topology + positioning address OUR output by its kde_output_management UUID (resolved
+        // in-process in `apply_topology`, supersede-robust) — no early kscreen-doctor resolve, so
+        // the 60 Hz path never shells out. Only the >60 Hz custom-mode install below still uses
+        // kscreen-doctor (its in-process port — set_custom_modes/add_cvt — is a follow-up).
         let mut expect_exact_dims = false;
         // The size the output actually ENDS UP at — the request, unless KWin's CVT generator had to
         // shrink the width to the cell grain (see `CVT_H_GRANULARITY`). Reported as the output's
@@ -245,6 +292,14 @@ impl VirtualDisplay for KwinDisplay {
         // encoder opens against, so a CVT-aligned mode flows end-to-end instead of starving.
         let mut final_dims = (width, height);
         let achieved_hz = if want_high {
+            // ⚠️ ADDRESS BY NUMERIC KSCREEN ID, NEVER BY NAME: a supersede (mode switch) creates the
+            // replacement output — SAME per-slot name, deliberately, for KWin's per-name config
+            // persistence — while the superseded sibling is still alive (create-before-drop). A
+            // name-addressed kscreen command would hit the FIRST match = the OLD output. Resolve OUR
+            // output's kscreen id (managed-prefix name AND current mode == the birth size; newest id
+            // wins) for the custom-mode install, and keep it as the kscreen-doctor position fallback.
+            let addr = resolve_kscreen_addr(&name, width, birth_h);
+            self.last_name = Some(addr.clone());
             let active = set_custom_refresh(width, height, mode.refresh_hz, &addr);
             // Accept only an active mode that IS our custom one: the exact requested height, and a
             // width at or just below the request (a CVT alignment). That also proves the output
@@ -275,8 +330,6 @@ impl VirtualDisplay for KwinDisplay {
                     let (nid, st) = spawn_vout(width, height)?;
                     node_id = nid;
                     stop = st;
-                    addr = resolve_kscreen_addr(&name, width, height);
-                    self.last_name = Some(addr.clone());
                     tracing::info!(
                         node_id,
                         width,
@@ -293,16 +346,17 @@ impl VirtualDisplay for KwinDisplay {
         // `Primary` makes it the primary output but keeps the bootstrap/physical outputs enabled;
         // `Exclusive` makes it the SOLE desktop (others disabled, restored on teardown) — so
         // plasmashell + windows land on the streamed surface, not the headless `kwin --virtual`
-        // bootstrap output. Read from the policy (replacing the PUNKTFUNK_KWIN_VIRTUAL_PRIMARY boolean).
-        use crate::policy::Topology;
-        let disabled = match crate::effective_topology() {
-            Topology::Exclusive => apply_virtual_primary(&addr),
-            Topology::Primary => {
-                apply_virtual_primary_only(&addr);
-                Vec::new() // nothing disabled → nothing to restore
-            }
-            Topology::Extend | Topology::Auto => Vec::new(),
-        };
+        // bootstrap output. Applied over kde_output_management_v2 in-process (immune to a wedged
+        // kscreen-doctor backend; see `apply_topology`), with a kscreen-doctor fallback. `disabled`
+        // is the physical/bootstrap outputs, each `(name, "WxH@Hz")`, to restore on teardown.
+        let our_prefix = format!("Virtual-{name}");
+        let disabled = self.apply_topology(&name, &our_prefix, final_dims);
+        // A plain managed name is enough for apply_position's kscreen-doctor fallback when the
+        // in-process UUID path isn't set (single-output sessions are unambiguous; a supersede uses
+        // the UUID path instead). `want_high` already set `last_name` to the resolved kscreen id.
+        if self.last_name.is_none() {
+            self.last_name = Some(our_prefix);
+        }
         // Per-group restore (§6.1): DON'T bind the re-enable to this session's keepalive (a per-session
         // `StopGuard` restore would re-enable the physical the moment the FIRST of several exclusive
         // sessions drops — under a still-live sibling). Instead stash it as a closure the registry lifts
@@ -310,7 +364,12 @@ impl VirtualDisplay for KwinDisplay {
         // that display's output is reclaimed, so KWin never sees zero outputs). Empty ⇒ nothing to restore.
         self.pending_restore = (!disabled.is_empty()).then(|| {
             let disabled = disabled.clone();
-            Box::new(move || reenable_outputs(&disabled)) as Box<dyn FnOnce() + Send>
+            // In-process first; fall back to kscreen-doctor if the compositor doesn't answer in budget.
+            Box::new(move || {
+                if !crate::kwin_output_mgmt::reenable_outputs(&disabled) {
+                    reenable_outputs_kscreen(&disabled);
+                }
+            }) as Box<dyn FnOnce() + Send>
         });
         // Layout position (§6.2) is applied by the registry via `apply_position` right after create
         // (it owns the display group, so it computes auto-row / manual placement over the whole group).
@@ -324,10 +383,12 @@ impl VirtualDisplay for KwinDisplay {
     }
 }
 
-/// Re-enable the outputs an `exclusive` topology disabled (bootstrap / physical), so KWin re-homes onto
-/// them. Called by the registry when the display group's last member is torn down (design §6.1), BEFORE
-/// that member's output is reclaimed — so KWin is never momentarily left with zero enabled outputs.
-fn reenable_outputs(outputs: &[(String, String)]) {
+/// Re-enable the outputs an `exclusive` topology disabled (bootstrap / physical) via `kscreen-doctor`
+/// — the fallback for the in-process [`crate::kwin_output_mgmt::reenable_outputs`], run by the restore
+/// closure only when the in-process path reports the compositor didn't answer. Called by the registry
+/// when the display group's last member is torn down (design §6.1), BEFORE that member's output is
+/// reclaimed — so KWin is never momentarily left with zero enabled outputs.
+fn reenable_outputs_kscreen(outputs: &[(String, String)]) {
     if outputs.is_empty() {
         return;
     }
@@ -823,8 +884,9 @@ fn apply_virtual_primary_only(ours: &str) {
 
 /// Dropping this releases the KWin virtual output: it flips the keepalive thread's `stop`, which
 /// drops the Wayland connection and makes KWin reclaim the output. The topology **restore** is no
-/// longer bound here — it moved to the registry's display group (§6.1, [`reenable_outputs`]), which
-/// runs it once when the group's last member drops, BEFORE this keepalive is dropped.
+/// longer bound here — it moved to the registry's display group (§6.1, restored in-process via
+/// [`crate::kwin_output_mgmt::reenable_outputs`], `kscreen-doctor` fallback), which runs it once when
+/// the group's last member drops, BEFORE this keepalive is dropped.
 struct StopGuard {
     stop: Arc<AtomicBool>,
 }

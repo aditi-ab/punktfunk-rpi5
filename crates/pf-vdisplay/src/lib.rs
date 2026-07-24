@@ -445,6 +445,13 @@ mod hyprland;
 #[path = "vdisplay/linux/kwin.rs"]
 mod kwin;
 
+// In-process KDE output management (kde_output_management_v2) — the topology path that used to shell
+// out to `kscreen-doctor`, driven over the compositor's own Wayland instead so it can't be wedged by
+// a stuck libkscreen/kscreen-KDED backend. Consumed by `kwin` (best-effort, with kscreen fallback).
+#[cfg(target_os = "linux")]
+#[path = "vdisplay/linux/kwin_output_mgmt.rs"]
+mod kwin_output_mgmt;
+
 #[cfg(target_os = "windows")]
 #[path = "vdisplay/windows/manager.rs"]
 pub mod manager;
