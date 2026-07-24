@@ -413,57 +413,6 @@ impl NvencEncoder {
             None
         };
 
-        // CPU CSC paths: build the packed-RGB → planar swscale (no rescale) into the encoder's
-        // input frame. Two users: 4:4:4 (RGB→YUV444P, BT.709, range per the flag) and HDR
-        // (X2RGB10/X2BGR10→P010, BT.2020 limited — the PQ transfer is per-channel and rides
-        // through the matrix untouched). Skipped on the zero-copy path (`cuda`): the worker's GPU
-        // convert already delivers ready CUDA frames — no CPU pixels exist to scale.
-        let sws_csc = if (want_444 || want_hdr10) && !cuda {
-            let src_av = pixel_to_av(sws_src_pixel(format)?);
-            let dst_av = pixel_to_av(nvenc_pixel);
-            // SAFETY: `sws_getContext` allocates a swscale context for the given src/dst dims + pixel
-            // formats. Both dims are the encoder's positive `width`/`height` as `c_int`; `src_av` is a
-            // valid `AVPixelFormat` (from the `sws_src_pixel`-validated packed-RGB source), the dst is
-            // YUV444P (4:4:4) or P010LE (HDR). The trailing filter/param pointers are null = "use
-            // defaults" (documented as accepted). No Rust memory is borrowed; the returned pointer is
-            // null-checked below.
-            let sws = unsafe {
-                ffi::sws_getContext(
-                    width as c_int,
-                    height as c_int,
-                    src_av,
-                    width as c_int,
-                    height as c_int,
-                    dst_av,
-                    SWS_POINT,
-                    ptr::null_mut(),
-                    ptr::null_mut(),
-                    ptr::null(),
-                )
-            };
-            if sws.is_null() {
-                bail!("sws_getContext(RGB→{nvenc_pixel:?}) failed");
-            }
-            // SAFETY: `sws` is the non-null context from the call above (null-checked). The
-            // coefficient tables from `sws_getCoefficients` (ITU-709 for 4:4:4, BT.2020 NCL for HDR
-            // — matching the VUI written above) are process-lifetime libswscale statics, reused for
-            // src+dst matrices; `sws_setColorspaceDetails` only reads them and writes scalar CSC
-            // settings into `sws` (dstRange matches the VUI: 0 = limited, 1 = the
-            // PUNKTFUNK_444_FULLRANGE experiment; HDR is always limited). No Rust memory is passed.
-            unsafe {
-                let cs = ffi::sws_getCoefficients(if want_hdr10 {
-                    super::libav::SWS_CS_BT2020
-                } else {
-                    SWS_CS_ITU709
-                });
-                let dst_range = i32::from(full_range_444);
-                ffi::sws_setColorspaceDetails(sws, cs, 1, cs, dst_range, 0, 1 << 16, 1 << 16);
-            }
-            Some(sws)
-        } else {
-            None
-        };
-
         // Low-latency NVENC tuning (plan §7 / linux-setup doc).
         let mut opts = Dictionary::new();
         opts.set("preset", "p1"); // fastest
@@ -548,6 +497,65 @@ impl NvencEncoder {
                 "NVENC intra-refresh recovery active (no periodic IDR; wave heals loss)"
             );
         }
+
+        // Built HERE, below the fallible encoder open, NOT above it. `sws_getContext` returns a raw
+        // pointer whose only free is `Drop for NvencEncoder` — and `Drop` needs a CONSTRUCTED
+        // `Self`, which does not exist on `open`'s early returns (the intra-refresh-unsupported
+        // retry, which recurses into `Self::open`, and the plain error return). Creating the
+        // context above them leaked one per failed attempt, and `open_nvenc_probed`'s EINVAL
+        // bitrate ladder calls `open` up to ~10 times, so a host stepping its bitrate down leaked a
+        // context per step. Nothing between here and the `Ok(NvencEncoder { … })` below can return,
+        // so this placement makes the leak unrepresentable rather than merely unlikely.
+        // CPU CSC paths: build the packed-RGB → planar swscale (no rescale) into the encoder's
+        // input frame. Two users: 4:4:4 (RGB→YUV444P, BT.709, range per the flag) and HDR
+        // (X2RGB10/X2BGR10→P010, BT.2020 limited — the PQ transfer is per-channel and rides
+        // through the matrix untouched). Skipped on the zero-copy path (`cuda`): the worker's GPU
+        // convert already delivers ready CUDA frames — no CPU pixels exist to scale.
+        let sws_csc = if (want_444 || want_hdr10) && !cuda {
+            let src_av = pixel_to_av(sws_src_pixel(format)?);
+            let dst_av = pixel_to_av(nvenc_pixel);
+            // SAFETY: `sws_getContext` allocates a swscale context for the given src/dst dims + pixel
+            // formats. Both dims are the encoder's positive `width`/`height` as `c_int`; `src_av` is a
+            // valid `AVPixelFormat` (from the `sws_src_pixel`-validated packed-RGB source), the dst is
+            // YUV444P (4:4:4) or P010LE (HDR). The trailing filter/param pointers are null = "use
+            // defaults" (documented as accepted). No Rust memory is borrowed; the returned pointer is
+            // null-checked below.
+            let sws = unsafe {
+                ffi::sws_getContext(
+                    width as c_int,
+                    height as c_int,
+                    src_av,
+                    width as c_int,
+                    height as c_int,
+                    dst_av,
+                    SWS_POINT,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    ptr::null(),
+                )
+            };
+            if sws.is_null() {
+                bail!("sws_getContext(RGB→{nvenc_pixel:?}) failed");
+            }
+            // SAFETY: `sws` is the non-null context from the call above (null-checked). The
+            // coefficient tables from `sws_getCoefficients` (ITU-709 for 4:4:4, BT.2020 NCL for HDR
+            // — matching the VUI written above) are process-lifetime libswscale statics, reused for
+            // src+dst matrices; `sws_setColorspaceDetails` only reads them and writes scalar CSC
+            // settings into `sws` (dstRange matches the VUI: 0 = limited, 1 = the
+            // PUNKTFUNK_444_FULLRANGE experiment; HDR is always limited). No Rust memory is passed.
+            unsafe {
+                let cs = ffi::sws_getCoefficients(if want_hdr10 {
+                    super::libav::SWS_CS_BT2020
+                } else {
+                    SWS_CS_ITU709
+                });
+                let dst_range = i32::from(full_range_444);
+                ffi::sws_setColorspaceDetails(sws, cs, 1, cs, dst_range, 0, 1 << 16, 1 << 16);
+            }
+            Some(sws)
+        } else {
+            None
+        };
 
         let frame = if cuda {
             None
