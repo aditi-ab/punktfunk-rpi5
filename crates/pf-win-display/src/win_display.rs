@@ -939,7 +939,7 @@ pub unsafe fn isolate_displays_ccd(keep_target_ids: &[u32]) -> Option<SavedConfi
     // live topology each attempt and re-apply until ONLY the keep set is active. Secure-desktop
     // correctness depends on this — the lock screen must not land on a stray panel while we stream.
     for attempt in 1..=4u32 {
-        let (mut paths, modes) = query_active_config()?;
+        let (mut paths, mut modes) = query_active_config()?;
         let mut others = 0u32;
         for p in paths.iter_mut() {
             if keep_target_ids.contains(&p.targetInfo.id) {
@@ -961,6 +961,13 @@ pub unsafe fn isolate_displays_ccd(keep_target_ids: &[u32]) -> Option<SavedConfi
                 others += 1;
             }
         }
+        // The doomed display may have HELD the desktop origin (the physical is primary in the
+        // single-slot exclusive case): re-anchor the kept sources so the supplied config still
+        // contains a primary — an origin-less desktop is rejected 0x57 no matter which array
+        // shape carries it (see `anchor_kept_sources_at_origin`).
+        if others > 0 {
+            anchor_kept_sources_at_origin(&paths, &mut modes);
+        }
         // Commit the config. Even when nothing needed deactivating we re-commit: a legacy mode-set does
         // NOT drive the IddCx adapter's EVT_IDD_CX_ADAPTER_COMMIT_MODES, and without COMMIT_MODES the OS
         // never calls ASSIGN_SWAPCHAIN, so the driver receives no frames. SDC_FORCE_MODE_ENUMERATION
@@ -969,11 +976,11 @@ pub unsafe fn isolate_displays_ccd(keep_target_ids: &[u32]) -> Option<SavedConfi
         // The supplied shape is decided (and its escalation announced) ONCE, outside the write, so a
         // wrong-desktop retry re-issues the identical config instead of logging the escalation twice.
         let keep_only = (others > 0 && attempt >= 2).then(|| {
-            // ESCALATION (attempt 2+): supply ONLY the keep paths. Field-reported (AMD +
-            // pf-vdisplay): carrying the doomed path in the array — inactive, modes unpinned —
-            // gets the whole config rejected 0x57 on EVERY retry, so the loop alone never
-            // converged; the same host applies the keep-only shape rc=0 whenever the topology
-            // database has already made the virtual display sole. The final attempt also drops
+            // ESCALATION (attempt 2+): supply ONLY the keep paths. Kept as belt-and-braces —
+            // the field 0x57 this was built for turned out to be the missing desktop origin
+            // (see `anchor_kept_sources_at_origin`), which rejected BOTH shapes identically;
+            // but should some other validator still choke on the full array, the minimal
+            // shape is the best last word. The final attempt also drops
             // SDC_FORCE_MODE_ENUMERATION in case the driver rejects it combined with a real
             // topology change — an actual path removal drives COMMIT_MODES on its own, so the
             // re-commit rationale doesn't need the flag here.
@@ -1023,7 +1030,18 @@ pub unsafe fn isolate_displays_ccd(keep_target_ids: &[u32]) -> Option<SavedConfi
         tracing::warn!("display isolate (CCD): {survivors} display(s) STILL active after attempt {attempt}/4 (deactivated {others}, rc={rc:#x}) — re-querying + retrying");
         std::thread::sleep(std::time::Duration::from_millis(250));
     }
-    tracing::error!("display isolate (CCD): failed to isolate target set {keep_target_ids:?} after 4 attempts — a non-virtual display stayed active (field-reported exclusive-mode bug)");
+    // Name the survivors instead of assuming their kind — the field logs showed this path fire
+    // with a sibling VIRTUAL display as the survivor (linger-expiry shrink), where the old
+    // "a non-virtual display stayed active" wording sent the triage the wrong way.
+    let survivors: Vec<String> = target_inventory()
+        .iter()
+        .filter(|t| t.active && !keep_target_ids.contains(&t.target_id))
+        .map(|t| format!("{} {} \"{}\"", t.target_id, t.tech, t.friendly))
+        .collect();
+    tracing::error!(
+        "display isolate (CCD): failed to isolate target set {keep_target_ids:?} after 4 attempts — still active: [{}] (field-reported exclusive-mode bug)",
+        survivors.join(", ")
+    );
     Some(saved)
 }
 
@@ -1082,6 +1100,60 @@ fn remap_mode_idx(
         out.push(*m);
         (out.len() - 1) as u32
     })
+}
+
+/// A committable desktop must still contain a PRIMARY — a source pinned exactly at the origin
+/// `(0,0)`. Deactivating the display that held the origin (the physical, in the exclusive
+/// topology) while the kept virtual stays pinned at its EXTEND offset supplies an origin-less
+/// desktop, and Windows rejects that wholesale with 0x57 ERROR_INVALID_PARAMETER no matter the
+/// array shape — the field box failed identically with the doomed path carried inactive AND with
+/// the keep-only escalation, yet the very same call converged rc=0 whenever a kept member already
+/// sat at `(0,0)`; the origin was the real variable all along. Translate the kept sources RIGIDLY
+/// (relative arrangement preserved) so the top-left-most lands exactly on the origin. A set that
+/// already covers `(0,0)` is left untouched, so a plain re-commit stays byte-identical and a
+/// user's negative-coordinate multi-monitor layout is never rearranged.
+unsafe fn anchor_kept_sources_at_origin(
+    paths: &[DISPLAYCONFIG_PATH_INFO],
+    modes: &mut [DISPLAYCONFIG_MODE_INFO],
+) {
+    // Unique source-mode entries of the still-ACTIVE (kept) paths — clone-style pairs share one,
+    // and a shared entry must be translated once.
+    let mut idxs: Vec<usize> = Vec::new();
+    for p in paths {
+        if p.flags & DISPLAYCONFIG_PATH_ACTIVE == 0 {
+            continue;
+        }
+        let idx = p.sourceInfo.Anonymous.modeInfoIdx as usize;
+        let Some(m) = modes.get(idx) else { continue };
+        if m.infoType == DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE && !idxs.contains(&idx) {
+            idxs.push(idx);
+        }
+    }
+    let positions: Vec<(i32, i32)> = idxs
+        .iter()
+        .map(|&i| {
+            let pos = modes[i].Anonymous.sourceMode.position;
+            (pos.x, pos.y)
+        })
+        .collect();
+    if positions.contains(&(0, 0)) {
+        return; // the kept set already holds the primary — don't touch a valid layout
+    }
+    // Lexicographic min over the actual positions — the anchor IS one of the kept sources, so
+    // after translation one source sits exactly at (0,0), which is what the validator wants.
+    let Some((ax, ay)) = positions.iter().copied().min() else {
+        return; // no pinned kept sources — placement is the OS's (SDC_ALLOW_CHANGES), nothing to anchor
+    };
+    for &i in &idxs {
+        let sm = &mut modes[i].Anonymous.sourceMode;
+        sm.position.x -= ax;
+        sm.position.y -= ay;
+    }
+    tracing::info!(
+        "display isolate (CCD): kept source(s) re-anchored onto the desktop origin (primary) — the doomed display held (0,0) delta=({},{})",
+        -ax,
+        -ay
+    );
 }
 
 /// The desktop-space rectangle `(x, y, w, h)` of `target_id`'s SOURCE — where this display's
@@ -1315,5 +1387,23 @@ pub unsafe fn restore_displays_ccd(saved: &SavedConfig) {
             "display isolate (CCD): topology restore failed rc={rc:#x}{} — physical displays may be left deactivated",
             sdc_access_denied_hint(rc)
         );
+    }
+    // GUARANTEE the desk is never left all-dark. The saved config can be unappliable (field
+    // rc=0x64a ERROR_BAD_CONFIGURATION: it pinned a virtual target incarnation that was since
+    // removed) or even apply rc=0 yet re-light nothing (snapshotted while an earlier failed
+    // teardown had the physicals off — the poisoned-snapshot chain from the field logs). Either
+    // way, if no external physical panel is active after the apply while at least one is
+    // connected, fall back to the OS database EXTEND preset, which re-activates every connected
+    // display. Internal panels deliberately don't count as lit-able here — a closed clamshell
+    // lid must not be forced back on.
+    let (connected, lit) = target_inventory()
+        .iter()
+        .filter(|t| t.external_physical)
+        .fold((0u32, 0u32), |(c, a), t| (c + 1, a + u32::from(t.active)));
+    if connected > 0 && lit == 0 {
+        tracing::warn!(
+            "display isolate (CCD): no external physical display active after the restore (rc={rc:#x}, connected={connected}) — forcing the EXTEND preset so the desk is not left dark"
+        );
+        force_extend_topology();
     }
 }
