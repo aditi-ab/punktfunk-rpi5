@@ -5,9 +5,11 @@
 //! VA surface). One [`Encoder`] trait, selected in [`open_video`]. Extracted into a subsystem crate
 //! (plan §W6): depends on the shared frame vocabulary (`pf-frame`) + zero-copy plumbing
 //! (`pf-zerocopy`), never on capture — the capture→encode edge is one-way.
-// Scaffold: some backend paths + trait defaults are defined ahead of the per-feature build that
-// uses them (mirrors the host crate root's allow before the extraction).
-#![allow(dead_code)]
+// NOTE: no crate-wide `#![allow(dead_code)]`. It was inherited from the pre-extraction host crate
+// root as scaffolding for backend paths defined ahead of the build that used them, but a census
+// across every feature combination on both platforms found it was hiding exactly two items — so it
+// bought nothing and blinded the crate to future rot. Genuinely test-only helpers carry
+// `#[cfg(test)]` instead.
 // Every unsafe block in this module tree carries a `// SAFETY:` proof; enforce it (unsafe-proof
 // program). As a parent module this also covers the child modules (windows/linux backends).
 #![deny(clippy::undocumented_unsafe_blocks)]

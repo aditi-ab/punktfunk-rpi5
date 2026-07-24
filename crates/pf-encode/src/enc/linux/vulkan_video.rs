@@ -524,7 +524,9 @@ impl VulkanVideoEncoder {
     /// `open` with the RGB-direct request explicit instead of read from the env — the smoke
     /// tests use this (env mutation races parallel tests). `want_rgb` engages the RGB-direct
     /// source only if [`probe_rgb_direct`] also passes; otherwise the session opens on the CSC
-    /// path with the verdict logged.
+    /// path with the verdict logged. Test-only: the production entry point is [`Self::open`],
+    /// which resolves `want_rgb` from the env + the `cursor_blend` hint.
+    #[cfg(test)]
     pub(crate) fn open_opts(
         codec: Codec,
         width: u32,

@@ -2760,6 +2760,10 @@ mod tests {
     }
 
     /// The `p`-quantile of `samples` (µs), sorting in place. `0` when empty.
+    /// Gated like its only caller, the `amf-qsv`-only §5.2 latency A/B below — otherwise a
+    /// `--features nvenc,qsv` build compiles this helper with the benchmark cfg'd out and trips
+    /// `dead_code` (which the crate root no longer blanket-allows).
+    #[cfg(feature = "amf-qsv")]
     fn percentile(samples: &mut [u128], p: f64) -> u128 {
         if samples.is_empty() {
             return 0;
@@ -2778,6 +2782,8 @@ mod tests {
     /// so its submit→AU is the bare ASIC time. The last ~2 unflushed frames on the ffmpeg path
     /// are left unmeasured (dropped with the encoder) so every recorded sample is a genuine paced
     /// submit→AU.
+    /// Gated like its only caller (see [`percentile`]).
+    #[cfg(feature = "amf-qsv")]
     #[allow(clippy::too_many_arguments)]
     fn drive_and_measure(
         enc: &mut dyn Encoder,

@@ -39,11 +39,6 @@ use super::libav::{
 };
 use ffmpeg::ffi; // = ffmpeg_sys_next
 
-/// `fourcc(a,b,c,d)` — DRM FourCC packing (`a | b<<8 | c<<16 | d<<24`).
-const fn fourcc(a: u8, b: u8, c: u8, d: u8) -> u32 {
-    (a as u32) | ((b as u32) << 8) | ((c as u32) << 16) | ((d as u32) << 24)
-}
-
 /// The render node a VAAPI/DRM device should open, from [`pf_gpu::linux_render_node`]: a
 /// matched web-console GPU preference pins it, else `PUNKTFUNK_RENDER_NODE`, else the single-GPU
 /// default.
