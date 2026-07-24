@@ -51,6 +51,7 @@ const IDM_RESTART: usize = 0x0104;
 const IDM_LOGS: usize = 0x0105;
 const IDM_EXIT: usize = 0x0106;
 const IDM_PAIRING: usize = 0x0107;
+const IDM_DISPLAYS: usize = 0x0108;
 
 /// Icon resource ordinals (embedded by build.rs).
 fn icon_ordinal(status: &TrayStatus) -> u16 {
@@ -73,8 +74,9 @@ struct App {
     taskbar_created: u32,
     /// `punktfunk-host.exe` next to this exe (the installer lays both in `{app}`).
     host_exe: Option<std::path::PathBuf>,
-    /// The console answered the poller's live loopback probe — the "Open web console" entry is
-    /// shown iff opening it would actually work (repo-run consoles included, stopped ones not).
+    /// The console answered the poller's live loopback probe. Drives the label of the (always
+    /// present) "Open web console" entry, and whether a left-click on the icon opens the console
+    /// or falls back to showing the menu.
     web_console: AtomicBool,
     web_port: u16,
 }
@@ -305,14 +307,24 @@ fn show_menu(hwnd: HWND) {
         };
         add(IDM_HEADER, &status.headline(), true);
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+        // The console entry is ALWAYS here — it is the reason most people open this menu, and
+        // left-clicking the icon is not a discoverable substitute. When the loopback probe says
+        // the console isn't answering the label says so, rather than the entry vanishing.
         if app().web_console.load(Ordering::SeqCst) {
             add(IDM_OPEN_WEB, "Open web console", false);
-            let _ = SetMenuDefaultItem(menu, IDM_OPEN_WEB as u32, 0);
-            if status.pairing_attention() {
-                add(IDM_PAIRING, "Approve pairing request…", false);
-            }
-            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+        } else {
+            add(IDM_OPEN_WEB, "Open web console (not responding)", false);
         }
+        let _ = SetMenuDefaultItem(menu, IDM_OPEN_WEB as u32, 0);
+        if status.pairing_attention() {
+            add(IDM_PAIRING, "Approve pairing request…", false);
+        }
+        match status.kept_displays() {
+            0 => {}
+            1 => add(IDM_DISPLAYS, "Release kept display…", false),
+            n => add(IDM_DISPLAYS, &format!("Release {n} kept displays…"), false),
+        }
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         if can_control {
             if startable {
                 add(IDM_START, "Start host", false);
@@ -385,8 +397,13 @@ fn elevate_service(hwnd: HWND, verb: &str) {
     }
 }
 
-fn open_web_console(hwnd: HWND) {
-    shell_open(hwnd, &format!("https://localhost:{}", app().web_port));
+/// Open the web console at `path` ("" = dashboard). Deep links land the operator on the page the
+/// menu entry promised — the pairing queue, the virtual displays — instead of the dashboard.
+fn open_web_console(hwnd: HWND, path: &str) {
+    shell_open(
+        hwnd,
+        &format!("https://localhost:{}/{path}", app().web_port),
+    );
 }
 
 fn open_logs(hwnd: HWND) {
@@ -416,7 +433,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 WM_CONTEXTMENU => show_menu(hwnd),
                 x if x == NIN_SELECT || x == NIN_KEYSELECT => {
                     if app.web_console.load(Ordering::SeqCst) {
-                        open_web_console(hwnd);
+                        open_web_console(hwnd, "");
                     } else {
                         show_menu(hwnd);
                     }
@@ -427,8 +444,9 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
         }
         WM_COMMAND => {
             match (wparam.0) & 0xffff {
-                IDM_OPEN_WEB => open_web_console(hwnd),
-                IDM_PAIRING => open_web_console(hwnd),
+                IDM_OPEN_WEB => open_web_console(hwnd, ""),
+                IDM_PAIRING => open_web_console(hwnd, "pairing"),
+                IDM_DISPLAYS => open_web_console(hwnd, "displays"),
                 IDM_START => elevate_service(hwnd, "start"),
                 IDM_STOP => elevate_service(hwnd, "stop"),
                 IDM_RESTART => elevate_service(hwnd, "restart"),

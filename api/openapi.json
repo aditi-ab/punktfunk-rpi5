@@ -5106,7 +5106,7 @@
         "properties": {
           "audio_streaming": {
             "type": "boolean",
-            "description": "True while the audio stream thread is running."
+            "description": "True while audio is streaming on either plane (same rule as `video_streaming`)."
           },
           "conflicts": {
             "type": "array",
@@ -5150,7 +5150,7 @@
               },
               {
                 "$ref": "#/components/schemas/SessionInfo",
-                "description": "The active launch session (set by Moonlight's `/launch`, cleared on cancel/stop)."
+                "description": "The active session: GameStream's launch (Moonlight `/launch`) when present, else the first\nlive native session. `null` when nothing is streaming."
               }
             ]
           },
@@ -5160,7 +5160,7 @@
           },
           "video_streaming": {
             "type": "boolean",
-            "description": "True while the video stream thread is running."
+            "description": "True while video is streaming on EITHER plane: the GameStream media pipeline, or a live\nnative (punktfunk/1) session — the default plane, invisible in the GameStream flag alone."
           }
         }
       },

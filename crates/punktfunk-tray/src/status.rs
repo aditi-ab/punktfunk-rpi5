@@ -75,7 +75,7 @@ impl TrayStatus {
             TrayStatus::Degraded => "punktfunk host — running (status unavailable)".into(),
             TrayStatus::Error(e) => format!("punktfunk host — failed ({e})"),
             TrayStatus::Running(s) => {
-                let base = match (&s.session, s.video_streaming) {
+                let base = match (&s.session, self.is_streaming()) {
                     (Some(sess), true) => format!(
                         "punktfunk host {} — streaming {}×{}@{}",
                         s.version, sess.width, sess.height, sess.fps
@@ -113,8 +113,23 @@ impl TrayStatus {
         matches!(self, TrayStatus::Running(s) if !s.conflicts.is_empty())
     }
 
+    /// A client is streaming: the host's flag, OR a live session in the summary.
+    ///
+    /// The session is checked too because a host from before the `get_local_summary` fix raised
+    /// `video_streaming` from the GameStream plane only — through a whole session on the native
+    /// (default) plane it said false while still reporting that session's mode, which is what left
+    /// the tray sitting at "idle" mid-stream. This keeps a newer tray honest against such a host.
     pub fn is_streaming(&self) -> bool {
-        matches!(self, TrayStatus::Running(s) if s.video_streaming)
+        matches!(self, TrayStatus::Running(s) if s.video_streaming || s.session.is_some())
+    }
+
+    /// Virtual displays held with no live session (lingering/pinned) — offered as a one-click
+    /// release in the menu, since holding one can also be keeping physical monitors dark.
+    pub fn kept_displays(&self) -> u32 {
+        match self {
+            TrayStatus::Running(s) => s.kept_displays,
+            _ => 0,
+        }
     }
 
     /// A pairing attempt is waiting on the operator (shown as an extra menu entry).
@@ -156,9 +171,11 @@ struct Shared {
 
 impl Poller {
     /// Spawn the poll thread; `on_change(status, console_up)` fires (from that thread) whenever
-    /// either changes. `console_up` is a live loopback probe of the web console on `web_port` —
-    /// ground truth for the "Open web console" menu entry (a layout sniff would miss consoles run
-    /// from a repo checkout, and shows a dead entry while an installed console is still starting).
+    /// either changes. `console_up` is a live loopback probe of the web console on `web_port`. It
+    /// annotates the "Open web console" entry ("not responding") rather than hiding it: the entry
+    /// is the tray's most-wanted action, and a menu that silently drops it — because the console
+    /// was still starting, or the probe timed out — is indistinguishable from a tray that never
+    /// had one.
     pub fn spawn(
         mgmt_addr: String,
         mgmt_port: u16,
@@ -203,6 +220,10 @@ fn poll_loop(
     // When the summary became unreachable while the service was running (grace anchor).
     // Runs for the process lifetime (the tray exits by process exit; nothing to unwind).
     let mut unreachable_since: Option<Instant> = None;
+    // Consecutive failed console probes. One miss is not "down": the console is a bun/Nitro SSR
+    // whose cold first render can outrun this agent's 2 s timeout, and a menu entry that changes
+    // its label every few seconds reads as broken.
+    let mut console_misses = 0u32;
     loop {
         let svc = probe_service();
         let summary = if svc == ServiceState::Running {
@@ -219,7 +240,13 @@ fn poll_loop(
         };
         let grace_expired = unreachable_since.is_some_and(|t| t.elapsed() >= START_GRACE);
         let status = map_status(&svc, summary, grace_expired);
-        let console_up = probe_console(&agent, &console_url);
+        let console_up = if probe_console(&agent, &console_url) {
+            console_misses = 0;
+            true
+        } else {
+            console_misses += 1;
+            console_misses < 2
+        };
         if last.as_ref() != Some(&(status.clone(), console_up)) {
             on_change(status.clone(), console_up);
             last = Some((status, console_up));
@@ -476,6 +503,32 @@ mod tests {
         assert!(TrayStatus::Degraded
             .headline()
             .contains("status unavailable"));
+    }
+
+    /// A live session means streaming even if the host's flag says otherwise — a host from before
+    /// the `get_local_summary` fix only raised `video_streaming` for the GameStream plane, so a
+    /// native session showed as "idle" with its own mode printed next to it.
+    #[test]
+    fn a_live_session_reads_as_streaming_without_the_flag() {
+        let mut s = summary(true);
+        s.video_streaming = false; // pre-fix host, native session
+        let st = TrayStatus::Running(s);
+        assert!(st.is_streaming());
+        assert_eq!(
+            st.headline(),
+            "punktfunk host 0.5.1 — streaming 2560×1440@120"
+        );
+        // No session and no flag is still idle.
+        assert!(!TrayStatus::Running(summary(false)).is_streaming());
+    }
+
+    #[test]
+    fn kept_displays_are_reported_for_the_release_action() {
+        assert_eq!(TrayStatus::Running(summary(false)).kept_displays(), 0);
+        let mut s = summary(false);
+        s.kept_displays = 2;
+        assert_eq!(TrayStatus::Running(s).kept_displays(), 2);
+        assert_eq!(TrayStatus::Degraded.kept_displays(), 0);
     }
 
     #[test]

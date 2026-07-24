@@ -286,11 +286,74 @@ async fn health_is_open_and_versioned() {
     assert_eq!(body["abi_version"], punktfunk_core::ABI_VERSION);
 }
 
+/// Serializes the tests that read (or write) the process-global live-session registry
+/// ([`crate::session_status`]): a session registered by one test would otherwise make a
+/// concurrently running one see a stream it never started.
+static SESSION_REGISTRY_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// A `/local/summary` request from a loopback peer (the tray's own).
+fn summary_req() -> axum::http::Request<Body> {
+    let mut req = get_req("/api/v1/local/summary");
+    req.extensions_mut()
+        .insert(PeerAddr("127.0.0.1:40000".parse().unwrap()));
+    req
+}
+
+/// Registers a stand-in live native session; the returned guard removes it on drop.
+fn fake_native_session(
+    width: u32,
+    height: u32,
+    fps: u32,
+) -> crate::session_status::LiveSessionGuard {
+    let packed = ((width as u64) << 32) | ((height as u64) << 16) | fps as u64;
+    crate::session_status::register(
+        Arc::new(std::sync::atomic::AtomicU64::new(packed)),
+        Arc::new(std::sync::atomic::AtomicU32::new(20_000)),
+        Codec::H265,
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        "test-client".into(),
+        false,
+        Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        Arc::new(std::sync::atomic::AtomicU32::new(0)),
+    )
+}
+
+/// A native (punktfunk/1) session — the DEFAULT plane — must read as streaming in the tray's
+/// summary. The GameStream `streaming` flag stays false throughout such a session, and reading it
+/// alone left the tray showing "idle" (with the idle icon) for the whole stream: exactly the blind
+/// spot `/status` was fixed for in [`crate::session_status`], which `/local/summary` still had.
+#[tokio::test]
+async fn local_summary_reports_a_native_session_as_streaming() {
+    let _serial = SESSION_REGISTRY_LOCK.lock().await;
+    let app = test_app(test_state(), None);
+
+    let (status, body) = send(&app, summary_req()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["video_streaming"], false);
+    assert_eq!(body["session"], serde_json::Value::Null);
+
+    let session = fake_native_session(3840, 2160, 120);
+    let (_, body) = send(&app, summary_req()).await;
+    assert_eq!(body["video_streaming"], true, "native session: {body}");
+    assert_eq!(body["audio_streaming"], true, "native session: {body}");
+    assert_eq!(body["session"]["width"], 3840);
+    assert_eq!(body["session"]["height"], 2160);
+    assert_eq!(body["session"]["fps"], 120);
+
+    // Session over → back to idle.
+    drop(session);
+    let (_, body) = send(&app, summary_req()).await;
+    assert_eq!(body["video_streaming"], false);
+    assert_eq!(body["session"], serde_json::Value::Null);
+}
+
 /// The tray's `/local/summary` is unauthenticated for LOOPBACK peers only — a LAN peer is
 /// rejected even though the route needs no bearer token, and the body never carries secret
 /// material (no PIN values, no fingerprints, no device names — counts/booleans only).
 #[tokio::test]
 async fn local_summary_is_loopback_only_and_non_sensitive() {
+    let _serial = SESSION_REGISTRY_LOCK.lock().await;
     let np = Arc::new(
         crate::native_pairing::NativePairing::load_with(
             Some(std::env::temp_dir().join(format!("pf-mgmt-summary-{}.json", std::process::id()))),
@@ -600,6 +663,7 @@ async fn compositors_lists_all_backends_with_flags() {
 
 #[tokio::test]
 async fn status_reflects_runtime_state() {
+    let _serial = SESSION_REGISTRY_LOCK.lock().await;
     let state = test_state();
     let app = test_app(state.clone(), None);
 
@@ -756,6 +820,8 @@ async fn stop_session_clears_runtime_state() {
 
 #[tokio::test]
 async fn idr_requires_an_active_stream() {
+    // A live native session (registered by a sibling test) is an active stream to this route.
+    let _serial = SESSION_REGISTRY_LOCK.lock().await;
     let state = test_state();
     let app = test_app(state.clone(), None);
     let post = || {

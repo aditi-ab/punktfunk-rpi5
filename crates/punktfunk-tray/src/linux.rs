@@ -15,8 +15,8 @@ use crate::status::{self, Poller, TrayStatus};
 struct HostTray {
     status: TrayStatus,
     web_port: u16,
-    /// The console answered the poller's live loopback probe — the "Open web console" entry is
-    /// shown iff opening it would actually work (repo-run consoles included, stopped ones not).
+    /// The console answered the poller's live loopback probe — labels the (always present) "Open
+    /// web console" entry; it never hides it.
     web_console: bool,
     /// Filled right after `spawn` (the poller needs the tray handle first) — lets menu actions
     /// force an immediate re-poll instead of waiting out the cadence.
@@ -33,8 +33,10 @@ impl HostTray {
         }
     }
 
-    fn open_console(&self) {
-        let url = format!("https://127.0.0.1:{}", self.web_port);
+    /// Open the web console at `path` ("" = dashboard). Deep links land the operator on the page
+    /// the menu entry promised — the pairing queue, the virtual displays.
+    fn open_console(&self, path: &str) {
+        let url = format!("https://127.0.0.1:{}/{path}", self.web_port);
         let _ = std::process::Command::new("xdg-open").arg(url).spawn();
     }
 }
@@ -107,17 +109,33 @@ impl ksni::Tray for HostTray {
             }
             .into(),
             MenuItem::Separator,
+            // Always present — it is the reason most people open this menu. When the loopback
+            // probe says the console isn't answering, the label says so rather than the entry
+            // disappearing (a menu missing its main action reads as a broken tray).
             StandardItem {
-                label: "Open web console".into(),
-                visible: self.web_console,
-                activate: Box::new(|t: &mut Self| t.open_console()),
+                label: if self.web_console {
+                    "Open web console".to_string()
+                } else {
+                    "Open web console (not responding)".to_string()
+                },
+                activate: Box::new(|t: &mut Self| t.open_console("")),
                 ..Default::default()
             }
             .into(),
             StandardItem {
                 label: "Approve pairing request…".into(),
-                visible: self.web_console && self.status.pairing_attention(),
-                activate: Box::new(|t: &mut Self| t.open_console()),
+                visible: self.status.pairing_attention(),
+                activate: Box::new(|t: &mut Self| t.open_console("pairing")),
+                ..Default::default()
+            }
+            .into(),
+            StandardItem {
+                label: match self.status.kept_displays() {
+                    1 => "Release kept display…".to_string(),
+                    n => format!("Release {n} kept displays…"),
+                },
+                visible: self.status.kept_displays() > 0,
+                activate: Box::new(|t: &mut Self| t.open_console("displays")),
                 ..Default::default()
             }
             .into(),

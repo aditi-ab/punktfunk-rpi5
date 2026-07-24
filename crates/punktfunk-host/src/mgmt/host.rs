@@ -150,11 +150,13 @@ pub(crate) struct StreamInfo {
 pub(crate) struct LocalSummary {
     /// Host version (mirrors `/health`).
     version: String,
-    /// True while the video stream thread is running.
+    /// True while video is streaming on EITHER plane: the GameStream media pipeline, or a live
+    /// native (punktfunk/1) session — the default plane, invisible in the GameStream flag alone.
     video_streaming: bool,
-    /// True while the audio stream thread is running.
+    /// True while audio is streaming on either plane (same rule as `video_streaming`).
     audio_streaming: bool,
-    /// The active launch session (set by Moonlight's `/launch`, cleared on cancel/stop).
+    /// The active session: GameStream's launch (Moonlight `/launch`) when present, else the first
+    /// live native session. `null` when nothing is streaming.
     session: Option<SessionInfo>,
     /// Number of pinned (paired) GameStream client certificates.
     paired_clients: u32,
@@ -391,26 +393,27 @@ pub(crate) async fn get_status(State(st): State<Arc<MgmtState>>) -> Json<Runtime
     )
 )]
 pub(crate) async fn get_local_summary(State(st): State<Arc<MgmtState>>) -> Json<LocalSummary> {
+    // Native punktfunk/1 plane (the DEFAULT plane; GameStream is opt-in) — read ONCE and used for
+    // both the session card and the streaming flags below.
+    let native = crate::session_status::snapshot();
     // GameStream launch, else the first live native session — so the tray reflects a native session
     // too (same GameStream-only blind spot the Dashboard `/status` had; see `session_status`).
     let session = st
         .app
         .launch
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .map(|l| SessionInfo {
             width: l.width,
             height: l.height,
             fps: l.fps,
         })
         .or_else(|| {
-            crate::session_status::snapshot()
-                .first()
-                .map(|s| SessionInfo {
-                    width: s.width,
-                    height: s.height,
-                    fps: s.fps,
-                })
+            native.first().map(|s| SessionInfo {
+                width: s.width,
+                height: s.height,
+                fps: s.fps,
+            })
         });
     let (native_paired_clients, pending_approvals) = st
         .native
@@ -419,8 +422,10 @@ pub(crate) async fn get_local_summary(State(st): State<Arc<MgmtState>>) -> Json<
         .unwrap_or((0, 0));
     Json(LocalSummary {
         version: env!("PUNKTFUNK_VERSION").into(),
-        video_streaming: st.app.streaming.load(Ordering::SeqCst),
-        audio_streaming: st.app.audio_streaming.load(Ordering::SeqCst),
+        // Either plane counts, like `/status`: reading only the GameStream flags made the tray say
+        // "idle" (and wear the idle icon) through an entire native session.
+        video_streaming: st.app.streaming.load(Ordering::SeqCst) || !native.is_empty(),
+        audio_streaming: st.app.audio_streaming.load(Ordering::SeqCst) || !native.is_empty(),
         session,
         paired_clients: st
             .app
