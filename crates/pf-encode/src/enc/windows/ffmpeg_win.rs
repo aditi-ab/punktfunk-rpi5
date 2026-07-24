@@ -95,6 +95,13 @@ struct AVD3D11VAFramesContext {
 /// AMD AMF vs Intel QSV — the two libavcodec vendor backends this module covers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WinVendor {
+    /// Benchmark-only, as the module header explains: native AMF replaced the libavcodec AMF path
+    /// in production, and the only remaining CONSTRUCTOR is the `#[cfg(feature = "amf-qsv")]`
+    /// latency A/B in `amf.rs` — the measurement that justifies the native backend existing. That
+    /// is test code, so the *lib* target constructs it nowhere and `dead_code` fires on it (the
+    /// crate root no longer blanket-allows that). Kept deliberately rather than deleted; the arms
+    /// below are what the benchmark drives.
+    #[allow(dead_code)]
     Amf,
     Qsv,
 }
@@ -277,6 +284,11 @@ pub fn probe_can_encode_444(_vendor: WinVendor, _codec: Codec) -> bool {
     false
 }
 
+/// Gated to the builds that can actually reach it: `lib.rs`'s only caller sits under
+/// `cfg(all(not(feature = "qsv"), feature = "amf-qsv"))`, because with the native VPL backend
+/// compiled in it is `qsv::probe_can_encode` that answers. So in the SHIPPED Windows combo
+/// (`nvenc,amf-qsv,qsv`) this function has no caller at all.
+#[cfg(not(feature = "qsv"))]
 pub fn probe_can_encode(vendor: WinVendor, codec: Codec) -> bool {
     // Deliberately NOT pinned to the selected render adapter (unlike `nvenc::probe_can_encode_444`):
     // the system-input probe passes no hwdevice, and the AMF/QSV runtimes only ever bind their own
