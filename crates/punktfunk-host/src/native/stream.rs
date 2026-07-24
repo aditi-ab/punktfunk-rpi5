@@ -1457,6 +1457,22 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
     // network, is the bottleneck" evidence — enough to flag `cadence_degraded` (the control task
     // then refuses bitrate CLIMBS) well before the session pays a latency escalation for it.
     const DEPTH_DEGRADE: u32 = 10;
+    // De-escalation (the escalate-and-hold v1's missing half): a sustained clean run at the
+    // escalated setting (~5 s at 120 fps, every frame on cadence) earns ONE attempt at winding
+    // back — reverse order of the escalation, pipelined retrieve first (its rebuild restores
+    // sub-frame streaming and the IO-stream binding), then capture depth back to 1. Each
+    // attempt costs the wind-back rebuild's IDR, so attempts are paced by an exponential
+    // backoff (1 → 5 → 25 min, capped) — a workload that genuinely needs the escalation
+    // converges to keeping it, but NEVER a permanent latch: a latch plus the ABR sawtooth
+    // pinned sessions at the floor with the escalation stuck.
+    const DEESCALATE_CLEAN_FRAMES: u32 = 600;
+    const DEESCALATE_BACKOFF_START: std::time::Duration = std::time::Duration::from_secs(60);
+    const DEESCALATE_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(25 * 60);
+    let mut pipelined_active = false;
+    let mut deescalating = false;
+    let mut ahead_run: u32 = 0;
+    let mut deescalate_not_before: Option<std::time::Instant> = None;
+    let mut deescalate_backoff = DEESCALATE_BACKOFF_START;
     while !stop.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
         // Mid-stream session switch (the box flipped Gaming↔Desktop): rebuild the WHOLE backend in
         // place — a different compositor at the SAME client mode — keeping the Session + send thread
@@ -1794,6 +1810,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                         // escalation — clean slate + re-run the warmup before judging again.
                         behind_score = 0;
                         depth_frames = 0;
+                        ahead_run = 0;
                     }
                     Err(e) => {
                         tracing::warn!(error = %format!("{e:#}"), to_kbps = new_kbps,
@@ -2618,7 +2635,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
         // two-thread lock moves the encode wait off this loop so capture/submit keep cadence,
         // at ~one tick of AU latency. `enc.set_pipelined` may decline (unsupported backend or
         // an explicit PUNKTFUNK_NVENC_ASYNC=0); either way it is asked exactly once.
-        if idd_adaptive_enabled() && (cur_depth < max_depth || !pipeline_asked) {
+        if idd_adaptive_enabled() {
             depth_frames += 1;
             if depth_frames > DEPTH_WARMUP_FRAMES {
                 let behind = std::time::Instant::now() >= next;
@@ -2627,34 +2644,89 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                 } else {
                     behind_score.saturating_sub(1)
                 };
+                let escalated = cur_depth > 1 || pipelined_active || deescalating;
                 // Export "encode can't hold cadence" for the control task's climb refusal.
-                // Stored BEFORE the escalate check: the firing iteration writes `true`, and a
-                // final-stage escalation freezes this whole block (the guard above goes false)
-                // — so an escalated session stays flagged, which is exactly right: its climb
-                // headroom is spent until something (a down-step, de-escalation) changes.
-                cadence_degraded.store(behind_score >= DEPTH_DEGRADE, Ordering::Relaxed);
-                if behind_score >= DEPTH_ESCALATE {
+                // An escalated session stays flagged even with the bucket drained: its climb
+                // headroom is spent, and letting climbs resume would saw against the
+                // escalation and starve the de-escalation clean run below.
+                cadence_degraded.store(
+                    escalated || behind_score >= DEPTH_DEGRADE,
+                    Ordering::Relaxed,
+                );
+                if deescalating {
+                    // A requested wind-back completes at the encoder's drained safe point —
+                    // poll it (the call is a cheap latch check until then).
+                    if !enc.set_pipelined(false) {
+                        deescalating = false;
+                        pipelined_active = false;
+                        // Re-arm the ask: a future sustained overrun may escalate again (the
+                        // backoff below paces how soon another wind-back may follow it).
+                        pipeline_asked = false;
+                        tracing::info!(
+                            "encoder pipelined retrieve de-escalated — sync retrieve (and \
+                             sub-frame streaming, where armed) restored; re-monitoring cadence"
+                        );
+                        // The wind-back rebuild's own stall must not re-escalate on the spot.
+                        behind_score = 0;
+                        depth_frames = 0;
+                        ahead_run = 0;
+                    }
+                } else if behind_score >= DEPTH_ESCALATE
+                    && (cur_depth < max_depth || !pipeline_asked)
+                {
                     if cur_depth < max_depth {
                         cur_depth = max_depth;
                         tracing::info!(
                             depth = cur_depth,
                             "IDD pipeline depth escalated — encode can't hold cadence at depth-1 \
-                             (GPU contention); pipelining for the rest of the session (latency \
+                             (GPU contention); pipelining until cadence holds clean (latency \
                              trade for throughput)"
                         );
                     } else {
                         pipeline_asked = true;
-                        if enc.set_pipelined(true) {
+                        pipelined_active = enc.set_pipelined(true);
+                        if pipelined_active {
                             tracing::info!(
                                 "encoder pipelined retrieve escalated — encode can't hold \
                                  cadence and the capturer has no depth to give; the encode wait \
-                                 moves off the loop for the rest of the session (latency trade \
+                                 moves off the loop until cadence holds clean (latency trade \
                                  for throughput)"
                             );
                         }
                     }
                     // Give the action time to take effect before judging again.
                     behind_score = 0;
+                    ahead_run = 0;
+                } else if escalated {
+                    // De-escalation: a sustained every-frame-on-cadence run at the escalated
+                    // setting is the evidence the contention passed (a lower ABR rate, the
+                    // game scene lightened) — wind back in reverse order, paced by the
+                    // exponential backoff (see the consts above).
+                    ahead_run = if behind { 0 } else { ahead_run + 1 };
+                    if ahead_run >= DEESCALATE_CLEAN_FRAMES
+                        && deescalate_not_before.is_none_or(|t| std::time::Instant::now() >= t)
+                    {
+                        ahead_run = 0;
+                        deescalate_not_before =
+                            Some(std::time::Instant::now() + deescalate_backoff);
+                        deescalate_backoff = (deescalate_backoff * 5).min(DEESCALATE_BACKOFF_MAX);
+                        if pipelined_active {
+                            tracing::info!(
+                                "cadence held clean while escalated — winding the pipelined \
+                                 retrieve back (latency recovery; costs one IDR)"
+                            );
+                            deescalating = true;
+                        } else if cur_depth > 1 {
+                            cur_depth = 1;
+                            tracing::info!(
+                                depth = cur_depth,
+                                "IDD pipeline depth de-escalated — cadence held clean at the \
+                                 escalated depth (latency recovery)"
+                            );
+                            behind_score = 0;
+                            depth_frames = 0;
+                        }
+                    }
                 }
             }
         }

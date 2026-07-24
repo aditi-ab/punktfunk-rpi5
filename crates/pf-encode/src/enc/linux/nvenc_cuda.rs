@@ -596,6 +596,12 @@ pub struct NvencCudaEncoder {
     /// (escalate-and-hold, like the depth escalation); the switch itself happens at the next
     /// safe point via [`maybe_engage_async`](Self::maybe_engage_async).
     want_async: bool,
+    /// A de-escalation request ([`Encoder::set_pipelined(false)`]) waiting for its safe point:
+    /// the next drained moment tears the session down and lazily re-inits SYNC (IO-stream
+    /// binding and sub-frame chunking re-arm at that re-init). Distinct from `!want_async` —
+    /// an operator-forced async session (`PUNKTFUNK_NVENC_ASYNC=1`) also has `want_async`
+    /// false, and a de-escalation must never tear THAT down.
+    want_sync: bool,
     /// Boxed `CUstream` the session's IO-stream binding points at (`NvEncSetIOCudaStreams` takes
     /// POINTERS to `CUstream`, and this struct moves — the pointee needs a stable heap address for
     /// the session's lifetime). Null when stream-ordering is off; freed in `teardown` AFTER the
@@ -703,6 +709,7 @@ impl NvencCudaEncoder {
             last_rfi_range: None,
             async_rt: None,
             want_async: false,
+            want_sync: false,
             io_stream: ptr::null_mut(),
             stream_ordered: false,
             slices: 1,
@@ -732,6 +739,29 @@ impl NvencCudaEncoder {
                 "NVENC pipelined-retrieve escalation: rebuilding the session without the \
                  IO-stream binding (stream-ordered submit and two-thread retrieve are mutually \
                  exclusive); next frame opens with an IDR"
+            );
+        }
+    }
+
+    /// [`maybe_engage_async`](Self::maybe_engage_async)'s inverse — wind the escalated pipelined
+    /// retrieve back at a safe point: nothing in flight, then a clean session rebuild whose lazy
+    /// SYNC re-init restores the IO-stream binding and re-arms sub-frame chunking (the two
+    /// latency features the escalation traded away). No-op until
+    /// [`want_sync`](Self::want_sync) is set and `pending` drains.
+    fn maybe_disengage_async(&mut self) {
+        if !self.want_sync || self.async_rt.is_none() || !self.pending.is_empty() {
+            return;
+        }
+        self.want_sync = false;
+        if self.inited {
+            // SAFETY: encode thread, `pending` empty ⇒ no encode in flight (and nothing queued
+            // to the retrieve thread); `teardown` joins the retrieve thread and handles exactly
+            // this live-session state — the next submit lazily re-inits sync.
+            unsafe { self.teardown() };
+            tracing::info!(
+                "NVENC pipelined-retrieve de-escalation: rebuilding the session with the sync \
+                 retrieve (IO-stream binding and sub-frame chunking restored); next frame opens \
+                 with an IDR"
             );
         }
     }
@@ -1471,9 +1501,10 @@ impl Encoder for NvencCudaEncoder {
                 "Linux direct-NVENC needs a CUDA frame (FramePayload::Cuda); got a CPU/dmabuf frame"
             ),
         };
-        // A pending pipelined-retrieve escalation engages here, at the submit-side safe point
-        // (nothing in flight after the previous poll drained).
+        // A pending pipelined-retrieve escalation — or de-escalation — engages here, at the
+        // submit-side safe point (nothing in flight after the previous poll drained).
         self.maybe_engage_async();
+        self.maybe_disengage_async();
         // Re-init on a size change (the capturer can return at a different resolution after a mode
         // switch). Format changes (NV12↔YUV444) likewise re-init.
         let new_fmt = buffer_format(buf);
@@ -1781,12 +1812,25 @@ impl Encoder for NvencCudaEncoder {
 
     fn set_pipelined(&mut self, on: bool) -> bool {
         if !on {
-            // v1 is escalate-and-hold (no de-escalation), mirroring the depth escalation.
+            // De-escalation (the v2 of escalate-and-hold): latch the wind-back intent; the
+            // switch itself happens at the next drained safe point
+            // ([`maybe_disengage_async`](Self::maybe_disengage_async)) — the caller polls
+            // this same method until it reports inactive.
+            if async_retrieve_env() == Some(true) {
+                // Operator pinned async on — de-escalation must not undo an explicit choice.
+                return self.want_async || self.async_rt.is_some();
+            }
+            if self.want_async || self.async_rt.is_some() {
+                self.want_async = false;
+                self.want_sync = true;
+                self.maybe_disengage_async();
+            }
             return self.want_async || self.async_rt.is_some();
         }
         if async_retrieve_env() == Some(false) {
             return false; // operator veto: PUNKTFUNK_NVENC_ASYNC=0 means NEVER
         }
+        self.want_sync = false; // latest intent wins — cancel a pending wind-back
         if !self.want_async && self.async_rt.is_none() {
             self.want_async = true;
             self.maybe_engage_async();

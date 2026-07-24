@@ -352,8 +352,15 @@ pub trait Encoder: Send {
     /// encoder analog of the capturer depth escalation: AUs ride ~one loop tick behind (`poll`
     /// may return `None` while an encode is in flight) in exchange for capture/submit no longer
     /// serializing on the encode wait. Returns whether pipelined retrieve is (now) active; the
-    /// switch may be deferred to the next safe point internally. `false` from the default impl =
-    /// unsupported — the session loop stops asking. De-escalation is a v2 item everywhere.
+    /// switch may be deferred to the next safe point internally. `set_pipelined(true)` returning
+    /// `false` (the default impl) = unsupported — the session loop stops asking.
+    ///
+    /// `set_pipelined(false)` requests the wind-back (de-escalation, latency recovery): the
+    /// backend restores its sync-retrieve mode — and the latency features that mode carries
+    /// (IO-stream binding, sub-frame chunking) — at its next safe point, usually via a session
+    /// rebuild whose first frame is an IDR. The return is still "is pipelined retrieve active":
+    /// the caller polls until it reads `false`. Backends that never escalate return `false`
+    /// trivially. An operator pin (`PUNKTFUNK_NVENC_ASYNC=1`) refuses the wind-back.
     fn set_pipelined(&mut self, _on: bool) -> bool {
         false
     }
