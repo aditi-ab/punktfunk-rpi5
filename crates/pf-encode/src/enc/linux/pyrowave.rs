@@ -227,12 +227,19 @@ impl PyroWaveEncoder {
         if !chroma.is_444() && (width % 2 != 0 || height % 2 != 0) {
             bail!("pyrowave 4:2:0 needs even dimensions (got {width}x{height})");
         }
-        if chroma.is_444() && !crate::pyrowave_mode_fits_rdo(width, height, true) {
-            // The negotiator downgrades these modes to 4:2:0 pre-Welcome; refuse if one
-            // slips through (e.g. the lab override) rather than wrap the RDO block index.
+        // Checked against the chroma actually being opened, NOT hardcoded 4:4:4. The 4:2:0 block
+        // count is ~half of 4:4:4's but still unbounded (8192×6144 4:2:0 = 73728 > u16::MAX), and
+        // the negotiator's 4:4:4 → 4:2:0 downgrade hands oversized modes to this open AS 4:2:0 —
+        // so a `chroma.is_444()`-gated check is skipped exactly when it is needed. Wrapping the
+        // index lets the resolve over-credit and `packetize` overshoot our bitstream buffer
+        // (its own bounds `assert` is compiled out by the Release vendored build).
+        // `validate_dimensions` rejects the impossible-at-any-chroma modes earlier; this is the
+        // 4:4:4-specific half plus defence in depth for the lab override.
+        if !crate::pyrowave_mode_fits_rdo(width, height, chroma.is_444()) {
             bail!(
-                "pyrowave 4:4:4 at {width}x{height} exceeds the rate controller's 16-bit \
-                 block index (see pyrowave-sys patches/0002 note) — use 4:2:0 at this size"
+                "pyrowave {} at {width}x{height} exceeds the rate controller's 16-bit block \
+                 index (see pyrowave-sys patches/0002 note) — lower the resolution",
+                if chroma.is_444() { "4:4:4" } else { "4:2:0" }
             );
         }
         // SAFETY: `open_inner` only issues Vulkan/pyrowave calls whose preconditions it

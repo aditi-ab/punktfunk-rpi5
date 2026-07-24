@@ -454,6 +454,26 @@ pub fn validate_dimensions(codec: Codec, width: u32, height: u32) -> Result<()> 
              (use HEVC/AV1 above 4096, or lower the client resolution)"
         );
     }
+    // PyroWave's vendored rate controller packs the 32×32 block index into the low 16 bits of
+    // `RDOperation::block_offset_saving` (pyrowave-sys `patches/0002-rdo-saving-clamp.patch`).
+    // Past `u16::MAX` blocks the index collides with the `saving` field, the resolve over-credits,
+    // and the emitted payload can overshoot the buffer `pyrowave_encoder_packetize` writes into —
+    // whose only bounds check is an `assert` that the Release (NDEBUG) vendored build compiles out.
+    // So this is a hard cap, not a quality knob.
+    //
+    // Checked against 4:2:0, the *most permissive* chroma: a mode that cannot fit even there can
+    // fit no PyroWave session at all, so it belongs at this single chokepoint (which both the
+    // negotiator and `open_video_backend` run) rather than only in the per-backend opens. 4:4:4
+    // has twice the block count and is checked again at open, where the real chroma is known —
+    // and the negotiator's 4:4:4 → 4:2:0 downgrade means an oversized mode arrives at the encoder
+    // as 4:2:0, which is exactly the case the old open-time guard skipped.
+    #[cfg(feature = "pyrowave")]
+    if codec == Codec::PyroWave && !crate::pyrowave_mode_fits_rdo(width, height, false) {
+        anyhow::bail!(
+            "invalid PyroWave resolution {width}x{height}: exceeds the rate controller's 16-bit \
+             block index (pyrowave-sys patches/0002) — lower the client resolution"
+        );
+    }
     Ok(())
 }
 
@@ -475,6 +495,26 @@ mod tests {
         assert!(validate_dimensions(Codec::H264, 4096, 4096).is_ok()); // exactly at the limit
         assert!(validate_dimensions(Codec::H264, 4098, 2160).is_err());
         assert!(validate_dimensions(Codec::H264, 3840, 4098).is_err());
+    }
+
+    /// PyroWave's hard cap is the rate controller's 16-bit block index, not just
+    /// `max_dimension()`. Checked at 4:2:0 (the most permissive chroma), because a mode that
+    /// cannot fit there cannot fit at any chroma — and because the negotiator's 4:4:4 → 4:2:0
+    /// downgrade delivers oversized modes to the encoder AS 4:2:0. HEVC/AV1 at the same
+    /// dimensions must stay unaffected.
+    #[cfg(feature = "pyrowave")]
+    #[test]
+    fn pyrowave_rejects_modes_past_the_rdo_block_index() {
+        // Fits: 8K 4:2:0 is 49125 blocks.
+        assert!(validate_dimensions(Codec::PyroWave, 7680, 4320).is_ok());
+        // Does not fit at 4:2:0 (73728 / 98304 blocks) — must be refused even though both are
+        // within `Codec::PyroWave.max_dimension()` (8192).
+        assert!(validate_dimensions(Codec::PyroWave, 8192, 6144).is_err());
+        assert!(validate_dimensions(Codec::PyroWave, 8192, 8192).is_err());
+        // The same modes remain legal for the H.26x/AV1 codecs, which have no such rate
+        // controller — the cap must not leak across codecs.
+        assert!(validate_dimensions(Codec::H265, 8192, 8192).is_ok());
+        assert!(validate_dimensions(Codec::Av1, 8192, 6144).is_ok());
     }
 
     #[test]

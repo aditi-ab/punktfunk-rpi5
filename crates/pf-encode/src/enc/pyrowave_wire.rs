@@ -246,6 +246,17 @@ mod tests {
         assert!(block_count_32x32(3840, 2160, true) <= u16::MAX as u32);
         assert!(block_count_32x32(7680, 4320, true) > u16::MAX as u32);
         assert!(block_count_32x32(7680, 4320, false) <= u16::MAX as u32);
+        // …and 4:2:0 wraps it too, just later — the hole the old 4:4:4-only open guard left.
+        // `Codec::max_dimension()` allows PyroWave 8192px per axis, so these modes were
+        // reachable from a client-requested `mode=WxHxFPS`, and the negotiator's 4:4:4 → 4:2:0
+        // downgrade routed oversized modes straight into the unguarded branch.
+        // `validate_dimensions` now rejects them against this 4:2:0 count.
+        assert_eq!(block_count_32x32(8192, 6144, false), 73728);
+        assert_eq!(block_count_32x32(8192, 8192, false), 98304);
+        assert!(block_count_32x32(8192, 6144, false) > u16::MAX as u32);
+        assert!(block_count_32x32(8192, 8192, false) > u16::MAX as u32);
+        // The largest 4:2:0 mode that still fits, for the boundary the validator enforces.
+        assert!(block_count_32x32(7680, 4320, false) <= u16::MAX as u32);
     }
 
     #[test]

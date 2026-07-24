@@ -189,12 +189,15 @@ impl PyroWaveEncoder {
         if !chroma444 && (width % 2 != 0 || height % 2 != 0) {
             bail!("pyrowave 4:2:0 needs even dimensions (got {width}x{height})");
         }
-        if chroma444 && !crate::pyrowave_mode_fits_rdo(width, height, true) {
-            // The negotiator downgrades these modes to 4:2:0 pre-Welcome; refuse if one
-            // slips through (e.g. the lab override) rather than wrap the RDO block index.
+        // Checked against the chroma actually being opened, NOT hardcoded 4:4:4 — see the Linux
+        // twin (`enc/linux/pyrowave.rs`) for the full rationale: the negotiator's 4:4:4 → 4:2:0
+        // downgrade hands oversized modes to this open AS 4:2:0, so the old `chroma444`-gated
+        // check was skipped exactly when it was needed.
+        if !crate::pyrowave_mode_fits_rdo(width, height, chroma444) {
             bail!(
-                "pyrowave 4:4:4 at {width}x{height} exceeds the rate controller's 16-bit \
-                 block index (see pyrowave-sys patches/0002 note) — use 4:2:0 at this size"
+                "pyrowave {} at {width}x{height} exceeds the rate controller's 16-bit block \
+                 index (see pyrowave-sys patches/0002 note) — lower the resolution",
+                if chroma444 { "4:4:4" } else { "4:2:0" }
             );
         }
         let fps = fps.max(1);
