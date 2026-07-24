@@ -3,7 +3,6 @@
 //! up the data-plane [`Session`]. A typed application close from the host surfaces as
 //! [`PunktfunkError::Rejected`] instead of the generic transport error.
 
-use super::super::*;
 use super::*;
 
 /// Everything [`run_pump`](super::run_pump) needs from a successful connect + handshake.

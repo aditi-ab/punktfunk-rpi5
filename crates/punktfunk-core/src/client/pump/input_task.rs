@@ -9,7 +9,6 @@
 //! Keyboard/mouse/touch events pass through unchanged; an older host (no caps bit) keeps
 //! getting the legacy per-transition gamepad events.
 
-use super::super::*;
 use super::*;
 
 pub(super) async fn run(
