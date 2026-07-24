@@ -70,6 +70,7 @@ pub mod management {
 
 use device::kde_output_device_mode_v2::{Event as ModeEvent, KdeOutputDeviceModeV2 as DeviceMode};
 use device::kde_output_device_v2::{Event as DeviceEvent, KdeOutputDeviceV2 as OutputDevice};
+use management::kde_mode_list_v2::KdeModeListV2 as ModeList;
 use management::kde_output_configuration_v2::{
     Event as ConfigEvent, KdeOutputConfigurationV2 as OutputConfig,
 };
@@ -92,6 +93,11 @@ const OP_BUDGET: Duration = Duration::from_secs(3);
 
 /// Poll slice while waiting on the Wayland fd (matches the keepalive loop's cadence in `kwin.rs`).
 const POLL_MS: i32 = 100;
+
+/// KWin's CVT generator aligns a custom mode's width DOWN to a multiple of this (libxcvt's cell
+/// grain), so the mode it builds for a `set_custom_modes` request may be a few px narrower than
+/// asked — matches `kwin::CVT_H_GRANULARITY`. Used when matching the generated mode back.
+const CVT_H_GRANULARITY: u32 = 8;
 
 /// Which topology to apply once our output is resolved.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -193,6 +199,19 @@ impl Dispatch<OutputManagement, ()> for State {
         _: &mut Self,
         _: &OutputManagement,
         _: management::kde_output_management_v2::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+// A client-built custom-mode list has no events; it just needs a Dispatch impl to be created.
+impl Dispatch<ModeList, ()> for State {
+    fn event(
+        _: &mut Self,
+        _: &ModeList,
+        _: management::kde_mode_list_v2::Event,
         _: &(),
         _: &Connection,
         _: &QueueHandle<Self>,
@@ -395,6 +414,16 @@ impl Session {
             .create_configuration(&qh, ())
     }
 
+    /// A fresh (empty) `kde_mode_list_v2` on this connection, for a `set_custom_modes` request.
+    fn new_mode_list(&self) -> ModeList {
+        let qh = self.queue.handle();
+        self.state
+            .management
+            .as_ref()
+            .unwrap()
+            .create_mode_list(&qh, ())
+    }
+
     /// `apply()` the config and pump until `applied`/`failed` or the deadline. Returns the verdict
     /// (`true` applied, `false` failed/timeout).
     fn apply(&mut self, config: &OutputConfig, deadline: Instant) -> bool {
@@ -543,6 +572,139 @@ pub(crate) fn apply_topology(
         disabled,
         handled: true,
     }
+}
+
+/// Install + select a `want_w`×`want_h`@`want_hz` custom mode on the just-created virtual output
+/// (name starts with `our_prefix`, currently at its sacrificial birth size `birth_w`×`birth_h`) —
+/// entirely over `kde_output_management_v2`, the in-process replacement for the `kscreen-doctor`
+/// `addCustomMode` + `mode` shell-out (`set_custom_refresh`).
+///
+/// `set_custom_modes` hands KWin a one-entry mode list; KWin generates the CVT timing (so the width
+/// may align DOWN — see [`CVT_H_GRANULARITY`]) and adds the mode. We then SELECT it, which changes
+/// the output's size and triggers the screencast stream's renegotiation to the real refresh (the
+/// sacrificial-birth mechanism in `kwin::create`). Returns the ACTIVE mode read back after selection
+/// (Hz rounded), or `None` if management is absent, the output/generated mode never appeared, or an
+/// apply didn't confirm — the caller then falls back to `kscreen-doctor`. `set_custom_modes` REPLACES
+/// the custom list (idempotent across reconnects — no per-connect list growth), and it is `since 18`,
+/// so pre-6.6 KWin without it simply takes the `None` → kscreen-doctor path.
+pub(crate) fn set_custom_mode(
+    our_prefix: &str,
+    birth_w: u32,
+    birth_h: u32,
+    want_w: u32,
+    want_h: u32,
+    want_hz: u32,
+) -> Option<(u32, u32, u32)> {
+    let mut sess = Session::open()?;
+    let deadline = Instant::now() + OP_BUDGET;
+
+    // `set_custom_modes` is `since 18`; calling it on an older bound management object is a protocol
+    // error, so bail to the kscreen-doctor fallback there (pre-6.6 KWin). Our bound version is
+    // `min(advertised, MGMT_MAX)`.
+    if sess.state.mgmt_name_version.map(|(_, v)| v).unwrap_or(0) < 18 {
+        return None;
+    }
+
+    // Resolve our output at its birth size (newest global wins a supersede).
+    let our_proxy = sess
+        .state
+        .devices
+        .values()
+        .filter(|d| {
+            d.name.as_deref().is_some_and(|n| n.starts_with(our_prefix))
+                && sess.current_dims(d).map(|(w, h, _)| (w, h)) == Some((birth_w, birth_h))
+        })
+        .max_by_key(|d| d.global)
+        .and_then(|d| d.proxy.clone())?;
+    let our_key = our_proxy.id();
+
+    let want_mhz = want_hz.saturating_mul(1000);
+    // A generated mode IS our custom one iff: exact height, width at/just-below the request (a CVT
+    // alignment), and refresh within 1 Hz — which excludes the sacrificial 60 Hz birth mode.
+    let mode_matches = move |st: &State, mid: &ObjectId| -> bool {
+        st.mode_dims.get(mid).is_some_and(|&(w, h, mhz)| {
+            h == want_h
+                && w <= want_w
+                && want_w - w < CVT_H_GRANULARITY
+                && (mhz as i64 - want_mhz as i64).abs() <= 1000
+        })
+    };
+
+    // Build a one-entry custom-mode list (full blanking, like kscreen-doctor's `.full`) and install it.
+    let mode_list = sess.new_mode_list();
+    mode_list.set_resolution(want_w, want_h);
+    mode_list.set_refresh_rate(want_mhz);
+    mode_list.set_reduced_blanking(0);
+    mode_list.add_mode();
+    let config = sess.new_config();
+    config.set_custom_modes(&our_proxy, &mode_list);
+    let installed = sess.apply(&config, deadline);
+    config.destroy();
+    mode_list.destroy();
+    if !installed {
+        return None;
+    }
+
+    // Wait for KWin to generate the mode and advertise it on the output.
+    let found = |st: &State| -> bool {
+        st.devices
+            .get(&our_key)
+            .is_some_and(|d| d.modes.iter().any(|(mid, _)| mode_matches(st, mid)))
+    };
+    if !sess.pump_until(deadline, found) {
+        tracing::warn!(
+            want_w,
+            want_h,
+            want_hz,
+            "KWin output management: generated custom mode never appeared — kscreen-doctor fallback"
+        );
+        return None;
+    }
+
+    // Grab the generated mode's proxy, then select it (this is what changes the size).
+    let mode_proxy = {
+        let dev = sess.state.devices.get(&our_key)?;
+        dev.modes
+            .iter()
+            .find(|(mid, _)| mode_matches(&sess.state, mid))
+            .map(|(_, p)| p.clone())?
+    };
+    let config = sess.new_config();
+    config.mode(&our_proxy, &mode_proxy);
+    let selected = sess.apply(&config, deadline);
+    config.destroy();
+    if !selected {
+        return None;
+    }
+
+    // Read back the active mode after selection — the size that really landed paces the encoder.
+    let want_dims = sess
+        .state
+        .mode_dims
+        .get(&mode_proxy.id())
+        .map(|&(w, h, _)| (w, h));
+    let landed = |st: &State| -> bool {
+        st.devices
+            .get(&our_key)
+            .and_then(|d| d.current_mode.as_ref())
+            .and_then(|mid| st.mode_dims.get(mid))
+            .map(|&(w, h, _)| (w, h))
+            == want_dims
+    };
+    sess.pump_until(deadline, landed);
+    let dev = sess.state.devices.get(&our_key)?;
+    let (cw, ch, cmhz) = sess.current_dims(dev)?;
+    let hz = ((cmhz as f64) / 1000.0).round() as u32;
+    tracing::info!(
+        want_w,
+        want_h,
+        want_hz,
+        active_w = cw,
+        active_h = ch,
+        active_hz = hz,
+        "KWin output management: custom mode installed + selected (in-process)"
+    );
+    Some((cw, ch, hz.max(1)))
 }
 
 /// Re-enable outputs by name at their captured `WxH@Hz` modes (teardown), in-process. Returns

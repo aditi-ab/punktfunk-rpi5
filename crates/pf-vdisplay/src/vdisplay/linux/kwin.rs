@@ -264,12 +264,12 @@ impl VirtualDisplay for KwinDisplay {
         // on virtual outputs since KWin 6.6) then changes the SIZE, and the first buffers recorded
         // after the consumer connects trigger KWin's resize → a renegotiation to that mode. The
         // capturer holds frames until that lands (`expect_exact_dims`), so the pipeline never
-        // builds against the birth mode. First cut shells out to kscreen-doctor; the in-process
-        // kde_output_management_v2 client is a follow-up. `set_custom_refresh` reads back what
-        // KWin *actually* gave — both the rate (so the encoder paces to the real source) and the
-        // size, which KWin's CVT generator may have aligned down (see `CVT_H_GRANULARITY`). At
-        // ≤60 Hz there's nothing to install — the output is born at the real size and 60 Hz is the
-        // offer anyway.
+        // builds against the birth mode. The install/select runs in-process over
+        // kde_output_management_v2 (`kwin_output_mgmt::set_custom_mode`), with kscreen-doctor
+        // (`set_custom_refresh`) as the fallback; either reads back what KWin *actually* gave — both
+        // the rate (so the encoder paces to the real source) and the size, which KWin's CVT
+        // generator may have aligned down (see `CVT_H_GRANULARITY`). At ≤60 Hz there's nothing to
+        // install — the output is born at the real size and 60 Hz is the offer anyway.
         let want_high = mode.refresh_hz > 60;
         let birth_h = if want_high { height + 16 } else { height };
         let (mut node_id, mut stop) = spawn_vout(width, birth_h)?;
@@ -283,8 +283,8 @@ impl VirtualDisplay for KwinDisplay {
         );
         // Topology + positioning address OUR output by its kde_output_management UUID (resolved
         // in-process in `apply_topology`, supersede-robust) — no early kscreen-doctor resolve, so
-        // the 60 Hz path never shells out. Only the >60 Hz custom-mode install below still uses
-        // kscreen-doctor (its in-process port — set_custom_modes/add_cvt — is a follow-up).
+        // the path never shells out. `Virtual-<name>` is the name KWin exposes our output as.
+        let our_prefix = format!("Virtual-{name}");
         let mut expect_exact_dims = false;
         // The size the output actually ENDS UP at — the request, unless KWin's CVT generator had to
         // shrink the width to the cell grain (see `CVT_H_GRANULARITY`). Reported as the output's
@@ -292,15 +292,27 @@ impl VirtualDisplay for KwinDisplay {
         // encoder opens against, so a CVT-aligned mode flows end-to-end instead of starving.
         let mut final_dims = (width, height);
         let achieved_hz = if want_high {
-            // ⚠️ ADDRESS BY NUMERIC KSCREEN ID, NEVER BY NAME: a supersede (mode switch) creates the
-            // replacement output — SAME per-slot name, deliberately, for KWin's per-name config
-            // persistence — while the superseded sibling is still alive (create-before-drop). A
-            // name-addressed kscreen command would hit the FIRST match = the OLD output. Resolve OUR
-            // output's kscreen id (managed-prefix name AND current mode == the birth size; newest id
-            // wins) for the custom-mode install, and keep it as the kscreen-doctor position fallback.
-            let addr = resolve_kscreen_addr(&name, width, birth_h);
-            self.last_name = Some(addr.clone());
-            let active = set_custom_refresh(width, height, mode.refresh_hz, &addr);
+            // >60 Hz needs the real high-refresh custom mode installed + selected (sacrificial-birth,
+            // see above). In-process over kde_output_management_v2 first (no kscreen-doctor); fall
+            // back to the kscreen-doctor shell-out on pre-6.6 KWin (no `set_custom_modes`) or if the
+            // compositor doesn't answer in budget.
+            let active = crate::kwin_output_mgmt::set_custom_mode(
+                &our_prefix,
+                width,
+                birth_h,
+                width,
+                height,
+                mode.refresh_hz,
+            )
+            .or_else(|| {
+                // ⚠️ ADDRESS BY NUMERIC KSCREEN ID, NEVER BY NAME: a supersede reuses the per-slot
+                // name while the superseded sibling is still alive, so a name-addressed kscreen
+                // command hits the OLD output. Resolve our kscreen id for the shell-out install +
+                // keep it as apply_position's kscreen fallback.
+                let addr = resolve_kscreen_addr(&name, width, birth_h);
+                self.last_name = Some(addr.clone());
+                set_custom_refresh(width, height, mode.refresh_hz, &addr)
+            });
             // Accept only an active mode that IS our custom one: the exact requested height, and a
             // width at or just below the request (a CVT alignment). That also proves the output
             // left the sacrificial birth size, so the recording stream will renegotiate to it.
@@ -349,7 +361,6 @@ impl VirtualDisplay for KwinDisplay {
         // bootstrap output. Applied over kde_output_management_v2 in-process (immune to a wedged
         // kscreen-doctor backend; see `apply_topology`), with a kscreen-doctor fallback. `disabled`
         // is the physical/bootstrap outputs, each `(name, "WxH@Hz")`, to restore on teardown.
-        let our_prefix = format!("Virtual-{name}");
         let disabled = self.apply_topology(&name, &our_prefix, final_dims);
         // A plain managed name is enough for apply_position's kscreen-doctor fallback when the
         // in-process UUID path isn't set (single-output sessions are unambiguous; a supersede uses
