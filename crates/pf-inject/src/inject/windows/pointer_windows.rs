@@ -41,9 +41,8 @@ use windows::Win32::UI::Input::Pointer::{
     POINTER_FLAG_UPDATE, POINTER_INFO, POINTER_PEN_INFO, POINTER_TOUCH_INFO,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetSystemMetrics, PEN_FLAG_BARREL, PEN_FLAG_ERASER, PEN_FLAG_INVERTED, PEN_FLAG_NONE,
-    PEN_MASK_PRESSURE, PEN_MASK_ROTATION, PEN_MASK_TILT_X, PEN_MASK_TILT_Y, PT_PEN, PT_TOUCH,
-    SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, TOUCH_FLAG_NONE,
+    PEN_FLAG_BARREL, PEN_FLAG_ERASER, PEN_FLAG_INVERTED, PEN_FLAG_NONE, PEN_MASK_PRESSURE,
+    PEN_MASK_ROTATION, PEN_MASK_TILT_X, PEN_MASK_TILT_Y, PT_PEN, PT_TOUCH, TOUCH_FLAG_NONE,
     TOUCH_MASK_NONE,
 };
 
@@ -149,22 +148,14 @@ unsafe fn inject_following_desktop(
 /// Windows pen pressure is 0..1024 (vs the wire's full-scale u16).
 const WIN_PEN_PRESSURE_MAX: u32 = 1024;
 
-/// Map a normalized [0,1] coordinate pair onto virtual-desktop pixels — the same surface the
-/// SendInput absolute mouse targets, so pen, touch, and pointer all land identically.
+/// Map a normalized [0,1] coordinate pair onto desktop pixels over the STREAMED output's rect
+/// ([`crate::stream_target`]) — the surface the SendInput absolute mouse targets too, so pen,
+/// touch, and pointer all land identically. The wire normalizes over the streamed display's
+/// frame, not the desktop: mapping over the whole virtual desktop is only right when they
+/// coincide (Exclusive topology — the fallback when no stream target is live).
 fn to_screen(x: f32, y: f32) -> POINT {
-    // SAFETY: `GetSystemMetrics` takes a constant index and reads global metrics; no memory in.
-    let (vx, vy, vw, vh) = unsafe {
-        (
-            GetSystemMetrics(SM_XVIRTUALSCREEN),
-            GetSystemMetrics(SM_YVIRTUALSCREEN),
-            GetSystemMetrics(SM_CXVIRTUALSCREEN).max(1),
-            GetSystemMetrics(SM_CYVIRTUALSCREEN).max(1),
-        )
-    };
-    POINT {
-        x: vx + (x.clamp(0.0, 1.0) * (vw - 1) as f32) as i32,
-        y: vy + (y.clamp(0.0, 1.0) * (vh - 1) as f32) as i32,
-    }
+    let (px, py) = crate::stream_target::map_normalized(x as f64, y as f64);
+    POINT { x: px, y: py }
 }
 
 /// An owned `HSYNTHETICPOINTERDEVICE` (destroyed exactly once on drop).

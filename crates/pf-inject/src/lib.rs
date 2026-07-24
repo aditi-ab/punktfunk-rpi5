@@ -417,6 +417,16 @@ pub mod pen;
 #[cfg(target_os = "windows")]
 #[path = "inject/windows/pointer_windows.rs"]
 pub mod pen;
+/// Windows: the streamed output's desktop rect that every absolute coordinate (pen, touch,
+/// absolute mouse) maps into — published by the host at capture bring-up, resolved through the
+/// CCD source rect (the cursor-readback poller's resolver, so both directions agree). Mapping
+/// over the whole virtual desktop instead is the Extend-topology offset bug the pen exposed
+/// (design/pen-tablet-input.md).
+#[cfg(target_os = "windows")]
+#[path = "inject/windows/stream_target.rs"]
+pub mod stream_target;
+#[cfg(target_os = "windows")]
+pub use stream_target::set_stream_target;
 /// Stub — pen injection needs the Linux uinput tablet or Windows synthetic pointers;
 /// `pen_supported()` is false here, so no host advertises the cap and no batches arrive.
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]

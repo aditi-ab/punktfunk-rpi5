@@ -1,6 +1,6 @@
 //! Windows input injection via `SendInput` (Win32 KeyboardAndMouse) — the Windows analogue of
-//! [`super::wlr`]: absolute mouse normalized to the virtual desktop, relative mouse for games,
-//! scancode keyboard, scroll, buttons. Survives UAC/lock desktop switches with Sunshine's
+//! [`super::wlr`]: absolute mouse mapped over the streamed output's rect
+//! ([`crate::stream_target`]), relative mouse for games, scancode keyboard, scroll, buttons. Survives UAC/lock desktop switches with Sunshine's
 //! retry-on-failure model: the thread stays bound to its desktop and only reattaches
 //! (`OpenInputDesktop`/`SetThreadDesktop`) when `SendInput` reports a short write (the input
 //! desktop switched) — no per-event reattach overhead.
@@ -32,14 +32,10 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK,
     MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, VIRTUAL_KEY,
 };
-use windows::Win32::UI::WindowsAndMessaging::{
-    GetForegroundWindow, GetSystemMetrics, GetWindowThreadProcessId, SM_CXVIRTUALSCREEN,
-    SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
-};
+use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 
 use super::InputInjector;
 
-const ABS_MAX: f64 = 65535.0; // SendInput absolute coords are 0..65535 over the chosen surface.
 const GENERIC_ALL: u32 = 0x1000_0000;
 const XBUTTON1: u32 = 0x0001;
 const XBUTTON2: u32 = 0x0002;
@@ -165,13 +161,16 @@ impl InputInjector for SendInputInjector {
                 if w == 0 || h == 0 {
                     return Ok(()); // contract: drop zero extent
                 }
-                let (_vx, _vy, vw, vh) = virtual_desktop_rect();
-                // One virtual output spanning the virtual desktop: map client (0..w,0..h) -> 0..65535.
+                // Client (0..w,0..h) → the STREAMED output's desktop rect
+                // ([`crate::stream_target`]; the whole virtual desktop only as fallback) →
+                // 0..65535 over the virtual desktop for MOUSEEVENTF_VIRTUALDESK. Mapping over
+                // the desktop alone is the Extend-topology offset bug the pen plane exposed
+                // (design/pen-tablet-input.md): correct only when the streamed display IS the
+                // whole desktop.
                 let cx = (event.x.clamp(0, w as i32)) as f64 / w as f64;
                 let cy = (event.y.clamp(0, h as i32)) as f64 / h as f64;
-                let ax = (cx * ABS_MAX).round() as i32;
-                let ay = (cy * ABS_MAX).round() as i32;
-                let _ = (vw, vh); // virtual-desktop rect reserved for multi-output mapping
+                let px = crate::stream_target::map_normalized(cx, cy);
+                let (ax, ay) = crate::stream_target::desktop_px_to_virtualdesk(px);
                 let mi = MOUSEINPUT {
                     dx: ax,
                     dy: ay,
@@ -375,19 +374,6 @@ fn key(ki: KEYBDINPUT) -> INPUT {
     INPUT {
         r#type: INPUT_KEYBOARD,
         Anonymous: INPUT_0 { ki },
-    }
-}
-
-fn virtual_desktop_rect() -> (i32, i32, i32, i32) {
-    // SAFETY: each `GetSystemMetrics` takes a single by-value `SYSTEM_METRICS_INDEX` constant and
-    // returns an `i32`; it dereferences no pointer and has no side effects — FFI-`unsafe` only.
-    unsafe {
-        (
-            GetSystemMetrics(SM_XVIRTUALSCREEN),
-            GetSystemMetrics(SM_YVIRTUALSCREEN),
-            GetSystemMetrics(SM_CXVIRTUALSCREEN),
-            GetSystemMetrics(SM_CYVIRTUALSCREEN),
-        )
     }
 }
 

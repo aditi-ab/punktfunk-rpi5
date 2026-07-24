@@ -2981,6 +2981,7 @@ dependencies = [
  "pf-driver-proto",
  "pf-host-config",
  "pf-paths",
+ "pf-win-display",
  "punktfunk-core",
  "reis",
  "tokio",

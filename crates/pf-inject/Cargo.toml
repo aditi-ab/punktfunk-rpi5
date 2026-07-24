@@ -48,6 +48,9 @@ xkbcommon = "0.8"
 usbip-sim = { path = "../punktfunk-host/vendor/usbip-sim" }
 
 [target.'cfg(target_os = "windows")'.dependencies]
+# The streamed-output desktop rect (CCD source rect) absolute input maps into — the same
+# resolver the cursor-readback poller uses, so inject and readback always agree.
+pf-win-display = { path = "../pf-win-display" }
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Security",
