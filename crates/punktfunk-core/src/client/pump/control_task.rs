@@ -24,6 +24,10 @@ pub(super) struct ControlTask {
     /// Host cursor shapes ([`CursorShape`], sent on pointer-bitmap change) → the embedder's
     /// shape plane ([`NativeClient::next_cursor_shape`]).
     pub(super) cursor_shape_tx: std::sync::mpsc::SyncSender<crate::quic::CursorShape>,
+    /// Bumped on every ACCEPTED mode switch (the `clock_gen` pattern): the pump watches it and
+    /// resets the bitrate controller's mode-scoped learned state — the encoder ceiling / compute
+    /// knee it was taught belong to the OLD mode.
+    pub(super) mode_gen: Arc<AtomicU32>,
 }
 
 impl ControlTask {
@@ -40,6 +44,7 @@ impl ControlTask {
             clock_gen,
             clip_event_tx,
             cursor_shape_tx,
+            mode_gen,
         } = self;
         // Mid-stream clock re-sync (see [`ClockResync`]): a batch runs every
         // CLOCK_RESYNC_INTERVAL and whenever the pump asks (CtrlRequest::ClockResync after
@@ -88,6 +93,7 @@ impl ControlTask {
                     if let Ok(ack) = Reconfigured::decode(&msg) {
                         if ack.accepted {
                             *mode_slot.lock().unwrap() = ack.mode;
+                            mode_gen.fetch_add(1, Ordering::Relaxed);
                             tracing::info!(mode = ?ack.mode, "host accepted mode switch");
                         } else {
                             tracing::warn!(active = ?ack.mode, "host rejected mode switch");

@@ -19,6 +19,12 @@ pub(super) struct DataPump {
     pub(super) clock_offset: Arc<std::sync::atomic::AtomicI64>,
     pub(super) clock_gen: Arc<AtomicU32>,
     pub(super) decode_lat: Arc<Mutex<DecodeLatAcc>>,
+    /// Host encode-stage latency window accumulator (the ABR encode signal — see
+    /// [`super::super::frame_channel::EncodeLatAcc`]); fed by the datagram task.
+    pub(super) encode_lat: Arc<Mutex<super::super::frame_channel::EncodeLatAcc>>,
+    /// Accepted-mode-switch generation (control task bumps): a change resets the controller's
+    /// mode-scoped learned state ([`BitrateController::on_mode_switch`]).
+    pub(super) mode_gen: Arc<AtomicU32>,
     pub(super) frames_dropped: Arc<std::sync::atomic::AtomicU64>,
     pub(super) fec_recovered: Arc<std::sync::atomic::AtomicU64>,
     pub(super) bitrate_ack: Arc<Mutex<Option<u32>>>,
@@ -41,6 +47,8 @@ impl DataPump {
             clock_offset: pump_clock_offset,
             clock_gen: pump_clock_gen,
             decode_lat: pump_decode_lat,
+            encode_lat: pump_encode_lat,
+            mode_gen: pump_mode_gen,
             frames_dropped,
             fec_recovered,
             bitrate_ack,
@@ -127,6 +135,7 @@ impl DataPump {
         let mut clock_detector_armed = true;
         let mut resync_wanted = false;
         let mut seen_clock_gen = pump_clock_gen.load(Ordering::Relaxed);
+        let mut seen_mode_gen = pump_mode_gen.load(Ordering::Relaxed);
         // Standing-latency bleed (see StandingLatency): the third detector, for the small,
         // constant, loss-free OWD elevation the two jump-to-live detectors deliberately
         // tolerate (< QUEUE_HIGH frames, < FLUSH_LATENCY behind) — a sub-frame standing
@@ -338,9 +347,15 @@ impl DataPump {
                         );
                     }
                 }
-                // Adaptive bitrate: drain any host ack first (its clamp is authoritative), then
-                // feed the controller this window's congestion signals; a decision becomes a
-                // SetBitrate on the control stream.
+                // Adaptive bitrate: an accepted mode switch first (it invalidates the
+                // mode-scoped learned state), then drain any host ack (its clamp is
+                // authoritative), then feed the controller this window's congestion signals; a
+                // decision becomes a SetBitrate on the control stream.
+                let mg = pump_mode_gen.load(Ordering::Relaxed);
+                if mg != seen_mode_gen {
+                    seen_mode_gen = mg;
+                    abr.on_mode_switch();
+                }
                 if let Some(acked) = bitrate_ack.lock().unwrap().take() {
                     abr.on_ack(acked);
                 }
@@ -356,6 +371,14 @@ impl DataPump {
                     *acc = DecodeLatAcc::default();
                     (count > 0).then(|| (sum / count as u64) as i64)
                 };
+                // Same drain for the host-encode window (0xCF `encode_us` via the datagram
+                // task) — `None` on an old host that doesn't send stage timings.
+                let encode_mean_us = {
+                    let mut acc = pump_encode_lat.lock().unwrap();
+                    let (sum, count) = (acc.sum_us, acc.count);
+                    *acc = Default::default();
+                    (count > 0).then(|| (sum / count as u64) as i64)
+                };
                 // The window's ACTUAL delivered throughput — what the pipeline really carried, vs
                 // the target it was allowed. Wire bytes (headers + FEC) slightly overstate the
                 // media rate the decoder ingests; acceptable for the climb gate / proven-mark
@@ -369,17 +392,19 @@ impl DataPump {
                     loss_ppm,
                     owd_mean_us,
                     decode_mean_us,
+                    encode_mean_us,
                     actual_kbps,
                     flush_in_window,
                 ) {
                     // Log the window's signals alongside the decision so an on-glass session can
-                    // tell a decode-driven re-target (the new signal — decode_mean_us elevated with
+                    // tell a decode-/encode-driven re-target (the new signals — elevated with
                     // loss/OWD flat) from a network-driven one.
                     tracing::info!(
                         kbps,
                         loss_ppm,
                         owd_mean_us = owd_mean_us.unwrap_or(-1),
                         decode_mean_us = decode_mean_us.unwrap_or(-1),
+                        encode_mean_us = encode_mean_us.unwrap_or(-1),
                         actual_kbps,
                         flushed = flush_in_window,
                         "adaptive bitrate: requesting encoder re-target"

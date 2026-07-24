@@ -224,6 +224,20 @@ pub(crate) struct DecodeLatAcc {
     pub(crate) count: u32,
 }
 
+/// Host encode-stage latency accumulator — [`DecodeLatAcc`]'s mirror for the HOST side of the
+/// pipeline. The datagram task adds one sample per 0xCF `HostStages::encode_us` (host encoder
+/// submit → bitstream ready) and the pump drains a window mean into
+/// [`crate::abr::BitrateController::on_window`]'s encode signal. Host encode time was measured,
+/// shipped and drawn on the overlay, but never an ABR input — which is how a fat-LAN Automatic
+/// session drove the encoder past its compute knee with nothing to stop it (§ABR overdrive).
+/// Its own accumulator rather than the overlay's `host_timing` channel: that channel is a lossy
+/// `try_send` the embedder may never drain, and the controller must not depend on it.
+#[derive(Default)]
+pub(crate) struct EncodeLatAcc {
+    pub(crate) sum_us: u64,
+    pub(crate) count: u32,
+}
+
 /// The pre-decode video hand-off from the data-plane pump to the embedder. Unlike the side planes
 /// (self-contained samples that drop the newest on overflow), video AUs are reference-chained under the
 /// host's infinite GOP: dropping ANY frame mid-stream corrupts every dependent frame until the next

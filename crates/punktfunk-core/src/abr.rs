@@ -13,7 +13,13 @@
 //!   its rolling baseline: standing queue growth, the *pre-loss* signature of a saturated link
 //!   (bufferbloat) — this is the early-warning signal loss-based control lacks;
 //! - **a jump-to-live flush** — the pump discarded its backlog, the strongest "we were behind"
-//!   evidence there is.
+//!   evidence there is;
+//! - **host-encode-latency rise** — the host's per-AU 0xCF `encode_us` climbing above its rolling
+//!   baseline: the ENCODER falling behind its frame budget (the compute knee), the one failure a
+//!   fat LAN never surfaces as loss/OWD/decode. Paired with the host's own climb refusal (a
+//!   behind-cadence host acks climbs at the current rate) and short-ack cap learning
+//!   ([`BitrateController::on_ack`]), this is what stops an Automatic session from driving the
+//!   encoder off a cliff the network could carry.
 //!
 //! AIMD shape: a SEVERE window (an unrecoverable frame, a flush, ≥6 % loss, or a decode-latency
 //! excursion far past baseline) backs off ×0.7 immediately; ordinary congestion
@@ -94,6 +100,25 @@ const UTILIZATION_DEN: u64 = 4;
 /// cap always leaves ≥ ~12 % of climbing room — the two gates can't deadlock.
 const PROVEN_HEADROOM_NUM: u32 = 3;
 const PROVEN_HEADROOM_DEN: u32 = 2;
+/// How far the window's mean HOST-ENCODE latency (the 0xCF `HostStages::encode_us` the host
+/// already ships per AU) may rise above its rolling baseline before the window is bad. This is
+/// the down-driver for the ENCODER's compute knee — the failure loss/OWD/decode are all blind
+/// to: on a fat LAN the controller can climb to a rate the link carries fine but the ASIC
+/// can't encode inside the frame budget (4K120 HEVC at ~800 Mbps ≈ 9.3 ms against 8.33), and
+/// the only symptom is encode time. Baseline-RELATIVE on purpose: an escalated host reports
+/// encode_us inflated by its retrieve-queue depth (~a frame), so an absolute budget threshold
+/// would read permanently-red and drive the rate to the floor; a rise above the session's own
+/// baseline survives that offset. ~half a 120 Hz frame budget of standing rise is real.
+const ENCODE_RISE_US: i64 = 4_000;
+/// Host-encode latency this far above baseline (≈1.5 × a 120 Hz budget) is SEVERE — the encode
+/// queue is growing past the knee; skip the two-window confirmation.
+const ENCODE_SEVERE_US: i64 = 12_000;
+/// Clean windows parked at the learned [`host cap`](BitrateController::host_cap_kbps) before
+/// re-probing above it (~60 s at the 750 ms tick). A cadence-refusal cap is scene-dependent
+/// evidence, not a spec limit — without a re-probe, one heavy scene would cap the whole
+/// session. A still-standing limit just re-teaches itself in two short acks, which the host
+/// pre-clamps without touching the encoder — the re-probe costs no rebuild, no IDR.
+const CAP_REPROBE_WINDOWS: u32 = 80;
 /// Rolling window (in 750 ms report windows, ~30 s) whose minimum mean is the OWD baseline.
 /// Long enough to remember the uncongested floor, short enough to follow genuine path changes.
 const BASELINE_WINDOWS: usize = 40;
@@ -121,6 +146,27 @@ pub(crate) struct BitrateController {
     /// keeping-up baseline. Empty on embedders that don't report decode latency (the decode
     /// signal is then simply absent — identical to the pre-decode-signal behavior).
     decode_means: VecDeque<i64>,
+    /// Recent window mean host-encode latencies (µs, from the 0xCF datagrams); rolling-min
+    /// baseline like the decode signal. Cleared whenever OUR OWN rate decrease changes the
+    /// encode regime (see [`on_ack`](Self::on_ack)) and on a mode switch.
+    encode_means: VecDeque<i64>,
+    /// The host-taught rate cap (§ABR overdrive): latched when the host acks BELOW what we
+    /// asked twice consecutively at the same value — its encoder's codec-level ceiling, or a
+    /// climb refusal while host encode can't hold cadence. Kept apart from `ceiling_kbps` so
+    /// the probe-measured link authority survives a mode switch's reset. Slowly re-probed
+    /// ([`CAP_REPROBE_WINDOWS`]) so scene-dependent evidence can't cap the session forever.
+    host_cap_kbps: Option<u32>,
+    /// The rate the last [`request`](Self::request) asked for — the reference an ack is judged
+    /// short against. Taken (not kept) by the ack, so one request is judged at most once.
+    last_requested_kbps: Option<u32>,
+    /// Consecutive short-ack streak: the value and how many times in a row it was acked. Two
+    /// identical short acks latch [`host_cap_kbps`](Self::host_cap_kbps) — one can be a
+    /// transient (a failed host rebuild keeping the old rate); the host's resolves are
+    /// deterministic min()s, so a persistent limit reproduces exactly.
+    short_ack_kbps: u32,
+    short_acks: u32,
+    /// Clean windows spent parked at the learned cap (the re-probe clock).
+    cap_probe_windows: u32,
     /// Proven throughput: the session's highest windowed ACTUAL delivered rate seen with flat
     /// decode latency — the known-good high-water mark climbs are bounded against. Never decays;
     /// shrinking capacity (thermals, a heavier scene) is the reactive decode signal's job. On
@@ -147,6 +193,12 @@ impl BitrateController {
             probing: true,
             owd_means: VecDeque::with_capacity(BASELINE_WINDOWS),
             decode_means: VecDeque::with_capacity(BASELINE_WINDOWS),
+            encode_means: VecDeque::with_capacity(BASELINE_WINDOWS),
+            host_cap_kbps: None,
+            last_requested_kbps: None,
+            short_ack_kbps: 0,
+            short_acks: 0,
+            cap_probe_windows: 0,
             proven_kbps: 0,
             bad_windows: 0,
             clean_windows: 0,
@@ -168,22 +220,68 @@ impl BitrateController {
 
     /// The host's [`crate::quic::BitrateChanged`] ack: its clamp is authoritative for what the
     /// encoder now targets, and any ack proves the host renegotiates (resets the silence counter).
+    ///
+    /// A SHORT ack (below what we asked) is the host telling us about a limit the network
+    /// signals can't see — its encoder's codec-level ceiling, or a climb refusal while encode
+    /// can't hold cadence. Two consecutive short acks at the SAME value latch it as
+    /// [`host_cap_kbps`](Self::host_cap_kbps), stopping the AIMD sawtooth from re-poking a
+    /// limit the host already refused; ONE is not enough — a failed host rebuild also acks
+    /// short once, and latching a transient would cap the session on a hiccup.
     pub(crate) fn on_ack(&mut self, kbps: u32) {
         if kbps > 0 {
+            if kbps < self.current_kbps {
+                // Our own decrease changes the encode-time regime (less work per frame; on an
+                // escalated host the queue offset shifts too) — judging the new regime against
+                // the old baseline would train-fire the encode down-driver. Re-seed it.
+                self.encode_means.clear();
+            }
+            if let Some(req) = self.last_requested_kbps.take() {
+                if kbps < req {
+                    if self.short_ack_kbps == kbps {
+                        self.short_acks += 1;
+                    } else {
+                        self.short_ack_kbps = kbps;
+                        self.short_acks = 1;
+                    }
+                    if self.short_acks >= 2 && self.host_cap_kbps.is_none_or(|c| kbps < c) {
+                        tracing::info!(
+                            cap_kbps = kbps,
+                            "adaptive bitrate: host cap learned (encoder ceiling or cadence \
+                             refusal) — climbs stop here until it lifts"
+                        );
+                        self.host_cap_kbps = Some(kbps.max(self.floor_kbps));
+                        self.cap_probe_windows = 0;
+                    }
+                } else {
+                    self.short_acks = 0;
+                }
+            }
             self.current_kbps = kbps;
         }
         self.unacked = 0;
+    }
+
+    /// An accepted mode switch: the encoder's ceiling and compute knee are properties of the
+    /// MODE (4K120 caps where 1080p60 never would) — drop the mode-scoped learned state. The
+    /// probe-measured `ceiling_kbps` (a LINK property) survives.
+    pub(crate) fn on_mode_switch(&mut self) {
+        self.host_cap_kbps = None;
+        self.short_acks = 0;
+        self.cap_probe_windows = 0;
+        self.encode_means.clear();
     }
 
     /// Feed one report window; returns the rate to request now, if any. `dropped` = frames that
     /// went FEC-unrecoverable in the window, `loss_ppm` the window's [`crate::quic::LossReport`]
     /// figure, `owd_mean_us` the window's mean skew-corrected capture→received latency (`None`
     /// without a clock handshake), `decode_mean_us` the window's mean client decode-stage latency
-    /// (`None` on an embedder that doesn't report it — the signal is then absent), `actual_kbps`
-    /// the window's ACTUAL delivered throughput (wire bytes received ÷ window — what the pipeline
-    /// really carried, as opposed to the target it was allowed; feeds the utilization climb gate
-    /// and the proven-throughput high-water mark), `flushed` = the pump's jump-to-live fired in
-    /// the window.
+    /// (`None` on an embedder that doesn't report it — the signal is then absent),
+    /// `encode_mean_us` the window's mean HOST encode-stage latency (from the per-AU 0xCF
+    /// datagrams; `None` on an old host that doesn't send them), `actual_kbps` the window's
+    /// ACTUAL delivered throughput (wire bytes received ÷ window — what the pipeline really
+    /// carried, as opposed to the target it was allowed; feeds the utilization climb gate and
+    /// the proven-throughput high-water mark), `flushed` = the pump's jump-to-live fired in the
+    /// window.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn on_window(
         &mut self,
@@ -192,6 +290,7 @@ impl BitrateController {
         loss_ppm: u32,
         owd_mean_us: Option<i64>,
         decode_mean_us: Option<i64>,
+        encode_mean_us: Option<i64>,
         actual_kbps: u32,
         flushed: bool,
     ) -> Option<u32> {
@@ -242,6 +341,23 @@ impl BitrateController {
             }
             None => (false, false),
         };
+        // Host-encode latency: the same rolling-min-baseline treatment, measuring the HOST'S
+        // encoder — the compute-knee down-driver (see [`ENCODE_RISE_US`]). This is the only
+        // signal that can push an already-too-high rate back under the knee: the host refuses
+        // further climbs while behind cadence, but nothing else ever DESCENDS on a clean LAN.
+        let (encode_bad, encode_severe) = match encode_mean_us {
+            Some(mean) => {
+                let base = self.encode_means.iter().min().copied();
+                let bad = base.is_some_and(|b| mean > b + ENCODE_RISE_US);
+                let severe = base.is_some_and(|b| mean > b + ENCODE_SEVERE_US);
+                if self.encode_means.len() == BASELINE_WINDOWS {
+                    self.encode_means.pop_front();
+                }
+                self.encode_means.push_back(mean);
+                (bad, severe)
+            }
+            None => (false, false),
+        };
         // The proven-throughput high-water mark: this window's delivered rate is now demonstrably
         // digestible (decode latency stayed flat while it was carried). Loss doesn't disqualify —
         // the bytes that DID arrive still went through the decoder; what loss means for the rate
@@ -253,8 +369,9 @@ impl BitrateController {
         // deep decode-latency excursion) or loss far past any blip — one window is enough.
         // Ordinary congestion (heavy-but-recoverable loss, an OWD rise, a decode-latency rise)
         // still needs two consecutive windows.
-        let severe = dropped > 0 || flushed || loss_ppm >= SEVERE_LOSS_PPM || decode_severe;
-        let bad = severe || loss_ppm >= HEAVY_LOSS_PPM || owd_bad || decode_bad;
+        let severe =
+            dropped > 0 || flushed || loss_ppm >= SEVERE_LOSS_PPM || decode_severe || encode_severe;
+        let bad = severe || loss_ppm >= HEAVY_LOSS_PPM || owd_bad || decode_bad || encode_bad;
         if bad {
             self.bad_windows += 1;
             self.clean_windows = 0;
@@ -263,6 +380,29 @@ impl BitrateController {
         } else {
             self.clean_windows += 1;
             self.bad_windows = 0;
+        }
+        // The learned host cap re-probe (see [`CAP_REPROBE_WINDOWS`]): after ~60 s of clean
+        // windows parked at the cap, lift it one step (+12.5 %, ceiling-bounded) so a
+        // scene-dependent refusal can't quietly cap the whole session — a still-standing limit
+        // just re-latches from the next pair of short acks, at zero encoder cost.
+        if let Some(cap) = self.host_cap_kbps {
+            if bad {
+                self.cap_probe_windows = 0;
+            } else if self.current_kbps >= cap.saturating_sub(cap / 16) {
+                self.cap_probe_windows += 1;
+                if self.cap_probe_windows >= CAP_REPROBE_WINDOWS {
+                    self.cap_probe_windows = 0;
+                    let lifted = cap.saturating_add(cap / 8).min(self.ceiling_kbps);
+                    if lifted > cap {
+                        tracing::debug!(
+                            from_kbps = cap,
+                            to_kbps = lifted,
+                            "adaptive bitrate: re-probing above the learned host cap"
+                        );
+                        self.host_cap_kbps = Some(lifted);
+                    }
+                }
+            }
         }
         let cooled = self
             .last_change
@@ -284,10 +424,14 @@ impl BitrateController {
         // utilized window after a long-enough clean run climbs immediately.
         let utilized =
             actual_kbps as u64 * UTILIZATION_DEN >= self.current_kbps as u64 * UTILIZATION_NUM;
-        let cap = self
+        // The effective ceiling folds in the host-taught cap: the probe measured the LINK, but
+        // the host's short acks measured the ENCODER — whichever binds first is the limit.
+        let eff_ceiling = self
             .ceiling_kbps
+            .min(self.host_cap_kbps.unwrap_or(u32::MAX));
+        let cap = eff_ceiling
             .min(self.proven_kbps.saturating_mul(PROVEN_HEADROOM_NUM) / PROVEN_HEADROOM_DEN);
-        if self.current_kbps < self.ceiling_kbps && utilized && cap > self.current_kbps {
+        if self.current_kbps < eff_ceiling && utilized && cap > self.current_kbps {
             // Slow start: double on every cooled clean window until the first congestion signal
             // (this is how an Automatic session reaches a probe-measured ceiling in seconds).
             // Congestion avoidance: +~6 % after a sustained clean run.
@@ -308,6 +452,7 @@ impl BitrateController {
     fn request(&mut self, kbps: u32, now: Instant) -> Option<u32> {
         self.last_change = Some(now);
         self.unacked += 1;
+        self.last_requested_kbps = Some(kbps);
         // `current_kbps` is NOT updated here — the host's ack is authoritative. A lost/ignored
         // request just recomputes from the same base next time (and counts toward MAX_UNACKED).
         Some(kbps)
@@ -331,7 +476,16 @@ mod tests {
     fn run_clean(c: &mut BitrateController, start: Instant, from: u32, n: u32) -> Option<u32> {
         let mut out = None;
         for i in from..from + n {
-            out = c.on_window(ticks(start, i), 0, 0, Some(10_000), None, 1_000_000, false);
+            out = c.on_window(
+                ticks(start, i),
+                0,
+                0,
+                Some(10_000),
+                None,
+                None,
+                1_000_000,
+                false,
+            );
             if out.is_some() {
                 return out;
             }
@@ -345,7 +499,7 @@ mod tests {
         let mut c = BitrateController::new(0);
         let now = Instant::now();
         assert_eq!(
-            c.on_window(now, 5, 900_000, Some(500_000), None, 1_000_000, true),
+            c.on_window(now, 5, 900_000, Some(500_000), None, None, 1_000_000, true),
             None
         );
     }
@@ -356,22 +510,58 @@ mod tests {
         let start = Instant::now();
         // Heavy-but-recoverable loss (2–6 %) is ORDINARY: one window is a blip — no reaction.
         assert_eq!(
-            c.on_window(ticks(start, 0), 0, 25_000, None, None, 1_000_000, false),
+            c.on_window(
+                ticks(start, 0),
+                0,
+                25_000,
+                None,
+                None,
+                None,
+                1_000_000,
+                false
+            ),
             None
         );
         // The second consecutive bad window backs off ×0.7.
         assert_eq!(
-            c.on_window(ticks(start, 1), 0, 25_000, None, None, 1_000_000, false),
+            c.on_window(
+                ticks(start, 1),
+                0,
+                25_000,
+                None,
+                None,
+                None,
+                1_000_000,
+                false
+            ),
             Some(14_000)
         );
         c.on_ack(14_000);
         // Still bad after the cooldown → another ×0.7 step from the ACKED rate.
         assert_eq!(
-            c.on_window(ticks(start, 6), 0, 25_000, None, None, 1_000_000, false),
+            c.on_window(
+                ticks(start, 6),
+                0,
+                25_000,
+                None,
+                None,
+                None,
+                1_000_000,
+                false
+            ),
             None
         ); // bad #1 again
         assert_eq!(
-            c.on_window(ticks(start, 7), 0, 25_000, None, None, 1_000_000, false),
+            c.on_window(
+                ticks(start, 7),
+                0,
+                25_000,
+                None,
+                None,
+                None,
+                1_000_000,
+                false
+            ),
             Some(9_800)
         );
     }
@@ -382,19 +572,28 @@ mod tests {
         let mut c = BitrateController::new(20_000);
         let start = Instant::now();
         assert_eq!(
-            c.on_window(ticks(start, 0), 1, 0, None, None, 1_000_000, false),
+            c.on_window(ticks(start, 0), 1, 0, None, None, None, 1_000_000, false),
             Some(14_000)
         );
         // …and so does a jump-to-live flush.
         let mut c = BitrateController::new(20_000);
         assert_eq!(
-            c.on_window(ticks(start, 0), 0, 0, None, None, 1_000_000, true),
+            c.on_window(ticks(start, 0), 0, 0, None, None, None, 1_000_000, true),
             Some(14_000)
         );
         // …and ≥6 % window loss.
         let mut c = BitrateController::new(20_000);
         assert_eq!(
-            c.on_window(ticks(start, 0), 0, 80_000, None, None, 1_000_000, false),
+            c.on_window(
+                ticks(start, 0),
+                0,
+                80_000,
+                None,
+                None,
+                None,
+                1_000_000,
+                false
+            ),
             Some(14_000)
         );
     }
@@ -404,18 +603,18 @@ mod tests {
         let mut c = BitrateController::new(20_000);
         let start = Instant::now();
         assert_eq!(
-            c.on_window(ticks(start, 0), 1, 0, None, None, 1_000_000, false),
+            c.on_window(ticks(start, 0), 1, 0, None, None, None, 1_000_000, false),
             Some(14_000)
         );
         c.on_ack(14_000);
         // A severe window INSIDE the 1.5 s cooldown (tick 1 = 750 ms) → held; at the cooldown
         // boundary (tick 2 = 1.5 s) it fires.
         assert_eq!(
-            c.on_window(ticks(start, 1), 1, 0, None, None, 1_000_000, false),
+            c.on_window(ticks(start, 1), 1, 0, None, None, None, 1_000_000, false),
             None
         );
         assert_eq!(
-            c.on_window(ticks(start, 2), 1, 0, None, None, 1_000_000, false),
+            c.on_window(ticks(start, 2), 1, 0, None, None, None, 1_000_000, false),
             Some(9_800)
         );
     }
@@ -426,17 +625,17 @@ mod tests {
         let start = Instant::now();
         // ×0.7 of 6000 = 4200 < floor → clamped to 5000.
         assert_eq!(
-            c.on_window(ticks(start, 0), 1, 0, None, None, 1_000_000, false),
+            c.on_window(ticks(start, 0), 1, 0, None, None, None, 1_000_000, false),
             Some(5_000)
         );
         c.on_ack(5_000);
         // At the floor, further bad windows request nothing.
         assert_eq!(
-            c.on_window(ticks(start, 6), 1, 0, None, None, 1_000_000, false),
+            c.on_window(ticks(start, 6), 1, 0, None, None, None, 1_000_000, false),
             None
         );
         assert_eq!(
-            c.on_window(ticks(start, 7), 1, 0, None, None, 1_000_000, false),
+            c.on_window(ticks(start, 7), 1, 0, None, None, None, 1_000_000, false),
             None
         );
     }
@@ -446,7 +645,7 @@ mod tests {
         let mut c = BitrateController::new(20_000);
         let start = Instant::now();
         assert_eq!(
-            c.on_window(ticks(start, 0), 1, 0, None, None, 1_000_000, false),
+            c.on_window(ticks(start, 0), 1, 0, None, None, None, 1_000_000, false),
             Some(14_000)
         );
         c.on_ack(14_000);
@@ -469,9 +668,16 @@ mod tests {
         // Every cooled clean window doubles until the ceiling caps the climb, then quiet.
         let mut got = Vec::new();
         for i in 0..14 {
-            if let Some(k) =
-                c.on_window(ticks(start, i), 0, 0, Some(10_000), None, 1_000_000, false)
-            {
+            if let Some(k) = c.on_window(
+                ticks(start, i),
+                0,
+                0,
+                Some(10_000),
+                None,
+                None,
+                1_000_000,
+                false,
+            ) {
                 c.on_ack(k);
                 got.push(k);
             }
@@ -485,20 +691,47 @@ mod tests {
         c.set_ceiling(300_000);
         let start = Instant::now();
         assert_eq!(
-            c.on_window(ticks(start, 0), 0, 0, Some(10_000), None, 1_000_000, false),
+            c.on_window(
+                ticks(start, 0),
+                0,
+                0,
+                Some(10_000),
+                None,
+                None,
+                1_000_000,
+                false
+            ),
             Some(40_000)
         );
         c.on_ack(40_000);
         // Severe window → immediate ×0.7, and slow start is over.
         assert_eq!(
-            c.on_window(ticks(start, 2), 1, 0, Some(10_000), None, 1_000_000, false),
+            c.on_window(
+                ticks(start, 2),
+                1,
+                0,
+                Some(10_000),
+                None,
+                None,
+                1_000_000,
+                false
+            ),
             Some(28_000)
         );
         c.on_ack(28_000);
         // Clean again — but the next climb is additive, after the 6-window clean run.
         let mut next = None;
         for i in 3..12 {
-            next = c.on_window(ticks(start, i), 0, 0, Some(10_000), None, 1_000_000, false);
+            next = c.on_window(
+                ticks(start, i),
+                0,
+                0,
+                Some(10_000),
+                None,
+                None,
+                1_000_000,
+                false,
+            );
             if next.is_some() {
                 assert!(i >= 8, "additive climb must wait for the clean run");
                 break;
@@ -512,7 +745,7 @@ mod tests {
         let mut c = BitrateController::new(0);
         c.set_ceiling(1_000_000);
         assert_eq!(
-            c.on_window(Instant::now(), 0, 0, None, None, 1_000_000, false),
+            c.on_window(Instant::now(), 0, 0, None, None, None, 1_000_000, false),
             None
         );
         let mut c = BitrateController::new(20_000);
@@ -527,17 +760,44 @@ mod tests {
         // Establish a ~10 ms baseline over a few clean windows.
         for i in 0..4 {
             assert_eq!(
-                c.on_window(ticks(start, i), 0, 0, Some(10_000), None, 1_000_000, false),
+                c.on_window(
+                    ticks(start, i),
+                    0,
+                    0,
+                    Some(10_000),
+                    None,
+                    None,
+                    1_000_000,
+                    false
+                ),
                 None
             );
         }
         // Delay climbs 40 ms above baseline with ZERO loss — bufferbloat. Two windows → back off.
         assert_eq!(
-            c.on_window(ticks(start, 4), 0, 0, Some(50_000), None, 1_000_000, false),
+            c.on_window(
+                ticks(start, 4),
+                0,
+                0,
+                Some(50_000),
+                None,
+                None,
+                1_000_000,
+                false
+            ),
             None
         );
         assert_eq!(
-            c.on_window(ticks(start, 5), 0, 0, Some(52_000), None, 1_000_000, false),
+            c.on_window(
+                ticks(start, 5),
+                0,
+                0,
+                Some(52_000),
+                None,
+                None,
+                1_000_000,
+                false
+            ),
             Some(14_000)
         );
     }
@@ -557,6 +817,7 @@ mod tests {
                     0,
                     Some(10_000),
                     Some(8_000),
+                    None,
                     1_000_000,
                     false
                 ),
@@ -572,6 +833,7 @@ mod tests {
                 0,
                 Some(10_000),
                 Some(38_000),
+                None,
                 1_000_000,
                 false
             ),
@@ -584,6 +846,7 @@ mod tests {
                 0,
                 Some(10_000),
                 Some(40_000),
+                None,
                 1_000_000,
                 false
             ),
@@ -605,6 +868,7 @@ mod tests {
                 0,
                 Some(10_000),
                 Some(8_000),
+                None,
                 1_000_000,
                 false
             ),
@@ -620,6 +884,7 @@ mod tests {
                 0,
                 Some(10_000),
                 Some(38_000),
+                None,
                 1_000_000,
                 false
             ),
@@ -634,6 +899,7 @@ mod tests {
                 0,
                 Some(10_000),
                 Some(40_000),
+                None,
                 1_000_000,
                 false
             ),
@@ -657,6 +923,7 @@ mod tests {
                     0,
                     Some(10_000),
                     Some(8_000),
+                    None,
                     2_000,
                     false
                 ),
@@ -673,6 +940,7 @@ mod tests {
                 0,
                 Some(10_000),
                 Some(8_000),
+                None,
                 18_000,
                 false
             ),
@@ -696,6 +964,7 @@ mod tests {
                 0,
                 Some(10_000),
                 Some(8_000),
+                None,
                 20_000,
                 false
             ),
@@ -710,6 +979,7 @@ mod tests {
                 0,
                 Some(10_000),
                 Some(8_000),
+                None,
                 30_000,
                 false
             ),
@@ -732,6 +1002,7 @@ mod tests {
                 0,
                 Some(10_000),
                 Some(8_000),
+                None,
                 20_000,
                 false
             ),
@@ -741,7 +1012,16 @@ mod tests {
         // A long calm stretch (2 % utilization, decoder idle): the controller stays silent.
         for i in 2..30 {
             assert_eq!(
-                c.on_window(ticks(start, i), 0, 0, Some(10_000), Some(4_000), 600, false),
+                c.on_window(
+                    ticks(start, i),
+                    0,
+                    0,
+                    Some(10_000),
+                    Some(4_000),
+                    None,
+                    600,
+                    false
+                ),
                 None
             );
         }
@@ -761,6 +1041,7 @@ mod tests {
                     0,
                     Some(10_000),
                     Some(8_000),
+                    None,
                     1_000_000,
                     false
                 ),
@@ -776,11 +1057,241 @@ mod tests {
                 0,
                 Some(10_000),
                 Some(60_000),
+                None,
                 1_000_000,
                 false
             ),
             Some(14_000)
         );
+    }
+
+    #[test]
+    fn two_identical_short_acks_latch_the_host_cap() {
+        // The 4K120 field failure: the encoder ceilings at ~794 Mbps while the link carries
+        // more — the host acks short. TWO identical short acks teach the cap; climbs then stop
+        // poking a limit the host already refused (the rebuild-storm driver).
+        let mut c = BitrateController::new(400_000);
+        c.set_ceiling(1_400_000);
+        let start = Instant::now();
+        assert_eq!(run_clean(&mut c, start, 0, 1), Some(800_000));
+        // First short ack: current follows (authoritative), but one short ack is not a cap.
+        c.on_ack(794_000);
+        assert!(c.host_cap_kbps.is_none());
+        // The next climb overshoots again and is short-acked at the SAME value: latch.
+        assert_eq!(run_clean(&mut c, start, 10, 1), Some(1_400_000));
+        c.on_ack(794_000);
+        assert_eq!(c.host_cap_kbps, Some(794_000));
+        // Parked AT the learned cap, nothing left to climb to — no more requests.
+        assert_eq!(run_clean(&mut c, start, 20, 12), None);
+    }
+
+    #[test]
+    fn one_short_ack_is_a_transient_not_a_cap() {
+        // A failed host rebuild acks short once (it kept the old rate) — latching THAT would
+        // cap the session on a driver hiccup. The streak must survive only identical repeats.
+        let mut c = BitrateController::new(400_000);
+        c.set_ceiling(1_400_000);
+        let start = Instant::now();
+        assert_eq!(run_clean(&mut c, start, 0, 1), Some(800_000));
+        c.on_ack(400_000); // rebuild failed, host kept the old rate
+        assert!(c.host_cap_kbps.is_none());
+        // The retry applies fully: streak broken, still no cap, full authority kept.
+        assert_eq!(run_clean(&mut c, start, 10, 1), Some(800_000));
+        c.on_ack(800_000);
+        assert!(c.host_cap_kbps.is_none());
+    }
+
+    #[test]
+    fn mode_switch_clears_the_learned_cap() {
+        let mut c = BitrateController::new(400_000);
+        c.set_ceiling(1_400_000);
+        let start = Instant::now();
+        assert_eq!(run_clean(&mut c, start, 0, 1), Some(800_000));
+        c.on_ack(794_000);
+        assert_eq!(run_clean(&mut c, start, 10, 1), Some(1_400_000));
+        c.on_ack(794_000);
+        assert_eq!(c.host_cap_kbps, Some(794_000));
+        // 4K120's ceiling means nothing at the new mode — the cap must not survive the switch
+        // (the probe-measured link ceiling does).
+        c.on_mode_switch();
+        assert!(c.host_cap_kbps.is_none());
+        assert_eq!(c.ceiling_kbps, 1_400_000);
+    }
+
+    #[test]
+    fn learned_cap_reprobes_after_a_sustained_clean_run() {
+        // A cadence-refusal cap is scene evidence, not a spec limit: after ~60 s parked clean
+        // at the cap, lift one step so a one-time heavy scene can't cap the session forever. A
+        // still-standing limit just re-latches from the next short-ack pair, at zero cost.
+        let mut c = BitrateController::new(400_000);
+        c.set_ceiling(1_400_000);
+        let start = Instant::now();
+        assert_eq!(run_clean(&mut c, start, 0, 1), Some(800_000));
+        c.on_ack(794_000);
+        assert_eq!(run_clean(&mut c, start, 10, 1), Some(1_400_000));
+        c.on_ack(794_000);
+        assert_eq!(c.host_cap_kbps, Some(794_000));
+        for i in 0..CAP_REPROBE_WINDOWS {
+            let _ = c.on_window(
+                ticks(start, 20 + i),
+                0,
+                0,
+                Some(10_000),
+                None,
+                None,
+                1_000_000,
+                false,
+            );
+        }
+        assert_eq!(c.host_cap_kbps, Some(794_000 + 794_000 / 8));
+    }
+
+    #[test]
+    fn host_encode_latency_rise_backs_off() {
+        // The compute knee: link pristine, client decoder fine — only HOST encode time moves
+        // (the 4K120 case: ~9.3 ms against an 8.33 ms budget shows up nowhere else). Two risen
+        // windows → ×0.7, exactly like an OWD/decode rise.
+        let mut c = BitrateController::new(20_000);
+        let start = Instant::now();
+        for i in 0..4 {
+            assert_eq!(
+                c.on_window(
+                    ticks(start, i),
+                    0,
+                    0,
+                    Some(10_000),
+                    None,
+                    Some(7_000),
+                    1_000_000,
+                    false
+                ),
+                None
+            );
+        }
+        assert_eq!(
+            c.on_window(
+                ticks(start, 4),
+                0,
+                0,
+                Some(10_000),
+                None,
+                Some(11_500),
+                1_000_000,
+                false
+            ),
+            None
+        );
+        assert_eq!(
+            c.on_window(
+                ticks(start, 6),
+                0,
+                0,
+                Some(10_000),
+                None,
+                Some(12_000),
+                1_000_000,
+                false
+            ),
+            Some(14_000)
+        );
+    }
+
+    #[test]
+    fn deep_encode_excursion_is_severe() {
+        // Encode time shooting ≈1.5 frame budgets over baseline = the queue is growing past
+        // the knee right now — no two-window confirmation.
+        let mut c = BitrateController::new(20_000);
+        let start = Instant::now();
+        for i in 0..4 {
+            assert_eq!(
+                c.on_window(
+                    ticks(start, i),
+                    0,
+                    0,
+                    Some(10_000),
+                    None,
+                    Some(7_000),
+                    1_000_000,
+                    false
+                ),
+                None
+            );
+        }
+        assert_eq!(
+            c.on_window(
+                ticks(start, 4),
+                0,
+                0,
+                Some(10_000),
+                None,
+                Some(20_000),
+                1_000_000,
+                false
+            ),
+            Some(14_000)
+        );
+    }
+
+    #[test]
+    fn rate_decrease_rebases_the_encode_baseline() {
+        // After OUR OWN decrease the encode regime legitimately changes (less work per frame;
+        // an escalated host's reported encode_us also carries a queue offset) — the old
+        // baseline must not train-fire repeated backoffs down to the floor.
+        let mut c = BitrateController::new(20_000);
+        let start = Instant::now();
+        for i in 0..4 {
+            let _ = c.on_window(
+                ticks(start, i),
+                0,
+                0,
+                Some(10_000),
+                None,
+                Some(7_000),
+                1_000_000,
+                false,
+            );
+        }
+        let _ = c.on_window(
+            ticks(start, 4),
+            0,
+            0,
+            Some(10_000),
+            None,
+            Some(12_000),
+            1_000_000,
+            false,
+        );
+        assert_eq!(
+            c.on_window(
+                ticks(start, 6),
+                0,
+                0,
+                Some(10_000),
+                None,
+                Some(12_500),
+                1_000_000,
+                false
+            ),
+            Some(14_000)
+        );
+        // The decrease applies → rebase. The new regime's ~15 ms means (an escalated host's
+        // queue offset) would be far over the OLD 7 ms baseline, but must now read clean.
+        c.on_ack(14_000);
+        for i in 8..11 {
+            assert_eq!(
+                c.on_window(
+                    ticks(start, i),
+                    0,
+                    0,
+                    Some(10_000),
+                    None,
+                    Some(15_000),
+                    1_000_000,
+                    false
+                ),
+                None
+            );
+        }
     }
 
     #[test]
@@ -791,7 +1302,7 @@ mod tests {
         let mut i = 0;
         // Keep every window bad and never ack: exactly MAX_UNACKED requests, then silence.
         while i < 60 {
-            if c.on_window(ticks(start, i), 1, 0, None, None, 1_000_000, false)
+            if c.on_window(ticks(start, i), 1, 0, None, None, None, 1_000_000, false)
                 .is_some()
             {
                 sent += 1;

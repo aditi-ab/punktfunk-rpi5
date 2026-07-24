@@ -112,6 +112,12 @@ pub(super) async fn run_pump(args: WorkerArgs) {
     // Adaptive bitrate ack slot: the control task parks the latest BitrateChanged here; the
     // pump's controller drains it on its report tick (`take()` — an ack is consumed once).
     let bitrate_ack: Arc<Mutex<Option<u32>>> = Arc::new(Mutex::new(None));
+    // Host-encode-latency accumulator (the ABR encode signal, see [`EncodeLatAcc`]): the
+    // datagram task adds one sample per 0xCF; the pump drains a window mean per report tick.
+    let encode_lat = Arc::new(Mutex::new(super::frame_channel::EncodeLatAcc::default()));
+    // Bumped by the control task on every accepted mode switch (the `clock_gen` pattern): the
+    // pump resets the controller's mode-scoped learned state (host cap, encode baseline).
+    let mode_gen = Arc::new(AtomicU32::new(0));
 
     // Control task (see [`control_task`]): the handshake stream stays open for mid-stream
     // renegotiation, speed tests, clock re-sync, and clipboard metadata.
@@ -128,6 +134,7 @@ pub(super) async fn run_pump(args: WorkerArgs) {
             clock_gen: clock_gen.clone(),
             clip_event_tx: clip_event_tx.clone(),
             cursor_shape_tx,
+            mode_gen: mode_gen.clone(),
         }
         .run(),
     );
@@ -141,6 +148,7 @@ pub(super) async fn run_pump(args: WorkerArgs) {
         hidout_tx,
         hdr_meta_tx,
         host_timing_tx,
+        encode_lat.clone(),
         cursor_state_tx,
     ));
 
@@ -176,6 +184,8 @@ pub(super) async fn run_pump(args: WorkerArgs) {
         clock_offset,
         clock_gen,
         decode_lat,
+        encode_lat,
+        mode_gen,
         frames_dropped,
         fec_recovered,
         bitrate_ack,

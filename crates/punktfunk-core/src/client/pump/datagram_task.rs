@@ -14,6 +14,9 @@ pub(super) async fn run(
     hidout_tx: std::sync::mpsc::SyncSender<crate::quic::HidOutput>,
     hdr_meta_tx: std::sync::mpsc::SyncSender<crate::quic::HdrMeta>,
     host_timing_tx: std::sync::mpsc::SyncSender<crate::quic::HostTiming>,
+    // The ABR encode signal's accumulator (see [`EncodeLatAcc`]) — fed HERE, not off
+    // `host_timing_tx`: that channel is the overlay's, lossy and embedder-drained.
+    encode_lat: Arc<Mutex<super::super::frame_channel::EncodeLatAcc>>,
     cursor_state_tx: std::sync::mpsc::SyncSender<crate::quic::CursorState>,
 ) {
     // Per-pad reorder gate for v2 rumble envelopes (the seq analog of the host's gamepad-state
@@ -74,6 +77,11 @@ pub(super) async fn run(
             }
             Some(&crate::quic::HOST_TIMING_MAGIC) => {
                 if let Some(t) = crate::quic::decode_host_timing_datagram(&d) {
+                    if let Some(s) = &t.stages {
+                        let mut acc = encode_lat.lock().unwrap();
+                        acc.sum_us += s.encode_us as u64;
+                        acc.count += 1;
+                    }
                     let _ = host_timing_tx.try_send(t);
                 }
             }
