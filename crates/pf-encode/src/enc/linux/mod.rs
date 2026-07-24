@@ -180,7 +180,6 @@ pub struct NvencEncoder {
     /// This session opened as full-chroma 4:4:4 (FREXT) — via either input path.
     want_444: bool,
     src_format: PixelFormat,
-    expand: bool,
     width: u32,
     height: u32,
     fps: u32,
@@ -507,11 +506,23 @@ impl NvencEncoder {
         // context per step. Nothing between here and the `Ok(NvencEncoder { … })` below can return,
         // so this placement makes the leak unrepresentable rather than merely unlikely.
         // CPU CSC paths: build the packed-RGB → planar swscale (no rescale) into the encoder's
-        // input frame. Two users: 4:4:4 (RGB→YUV444P, BT.709, range per the flag) and HDR
+        // input frame. THREE users: 4:4:4 (RGB→YUV444P, BT.709, range per the flag), HDR
         // (X2RGB10/X2BGR10→P010, BT.2020 limited — the PQ transfer is per-channel and rides
-        // through the matrix untouched). Skipped on the zero-copy path (`cuda`): the worker's GPU
-        // convert already delivers ready CUDA frames — no CPU pixels exist to scale.
-        let sws_csc = if (want_444 || want_hdr10) && !cuda {
+        // through the matrix untouched), and the packed 3-bpp expand (RGB24/BGR24→rgb0/bgr0).
+        //
+        // The expand used to be a hand-written per-pixel loop in `submit_cpu`: `w*h` iterations,
+        // each building two bounds-checked sub-slices for a 3-byte copy — a shape LLVM will not
+        // vectorise into the byte shuffle it is, on the COMMON CPU path (the portal and wlroots
+        // both commonly fixate packed 24-bit RGB, and pf-capture offers it first). swscale's
+        // packed-RGB expanders are SIMD, the sibling VAAPI backend already routes RGB24/BGR24
+        // through them, and this file already owned the context lifecycle — so the change is net
+        // subtractive. The three are mutually exclusive by construction: `expand` is only ever
+        // true on the packed-RGB 4:2:0 path (see `nvenc_pixel`/`expand` above), never with
+        // `want_444`, so one context serves whichever applies.
+        //
+        // Skipped on the zero-copy path (`cuda`): the worker's GPU convert already delivers ready
+        // CUDA frames — no CPU pixels exist to scale.
+        let sws_csc = if (want_444 || want_hdr10 || expand) && !cuda {
             let src_av = pixel_to_av(sws_src_pixel(format)?);
             let dst_av = pixel_to_av(nvenc_pixel);
             // SAFETY: `sws_getContext` allocates a swscale context for the given src/dst dims + pixel
@@ -537,20 +548,27 @@ impl NvencEncoder {
             if sws.is_null() {
                 bail!("sws_getContext(RGB→{nvenc_pixel:?}) failed");
             }
-            // SAFETY: `sws` is the non-null context from the call above (null-checked). The
-            // coefficient tables from `sws_getCoefficients` (ITU-709 for 4:4:4, BT.2020 NCL for HDR
-            // — matching the VUI written above) are process-lifetime libswscale statics, reused for
-            // src+dst matrices; `sws_setColorspaceDetails` only reads them and writes scalar CSC
-            // settings into `sws` (dstRange matches the VUI: 0 = limited, 1 = the
-            // PUNKTFUNK_444_FULLRANGE experiment; HDR is always limited). No Rust memory is passed.
-            unsafe {
-                let cs = ffi::sws_getCoefficients(if want_hdr10 {
-                    super::libav::SWS_CS_BT2020
-                } else {
-                    SWS_CS_ITU709
-                });
-                let dst_range = i32::from(full_range_444);
-                ffi::sws_setColorspaceDetails(sws, cs, 1, cs, dst_range, 0, 1 << 16, 1 << 16);
+            // Colour math applies to the CSC users ONLY. The expand is a pure byte shuffle —
+            // packed 3-bpp RGB/BGR to the same channels in 4 bytes, `nvenc_pixel` being `rgb0`/
+            // `bgr0` — and NVENC does the RGB→YUV itself downstream. Handing it a matrix + range
+            // here would silently range-convert every packed-RGB session, which is exactly what the
+            // module header promises does not happen ("no colour math").
+            if want_444 || want_hdr10 {
+                // SAFETY: `sws` is the non-null context from the call above (null-checked). The
+                // coefficient tables from `sws_getCoefficients` (ITU-709 for 4:4:4, BT.2020 NCL for
+                // HDR — matching the VUI written above) are process-lifetime libswscale statics,
+                // reused for src+dst matrices; `sws_setColorspaceDetails` only reads them and writes
+                // scalar CSC settings into `sws` (dstRange matches the VUI: 0 = limited, 1 = the
+                // PUNKTFUNK_444_FULLRANGE experiment; HDR is always limited). No Rust memory is passed.
+                unsafe {
+                    let cs = ffi::sws_getCoefficients(if want_hdr10 {
+                        super::libav::SWS_CS_BT2020
+                    } else {
+                        SWS_CS_ITU709
+                    });
+                    let dst_range = i32::from(full_range_444);
+                    ffi::sws_setColorspaceDetails(sws, cs, 1, cs, dst_range, 0, 1 << 16, 1 << 16);
+                }
             }
             Some(sws)
         } else {
@@ -569,7 +587,6 @@ impl NvencEncoder {
             sws_csc,
             want_444,
             src_format: format,
-            expand,
             width,
             height,
             fps,
@@ -703,8 +720,10 @@ impl NvencEncoder {
             bytes.len(),
             src_row * h
         );
-        // 4:4:4: swscale the packed RGB straight into the planar YUV444P input frame (BT.709 limited),
-        // then send it — no byte-expand. The 4:2:0 RGB path (below) feeds NVENC packed RGB directly.
+        // swscale the packed RGB straight into the encoder's input frame, then send it. Serves all
+        // three CSC users (see `open`): 4:4:4 → planar YUV444P, HDR → P010, and the packed 3-bpp
+        // expand → `rgb0`/`bgr0`. The remaining branch below is the 4-bpp source, which needs no
+        // conversion at all — just a row copy honouring the destination stride.
         if let Some(sws) = self.sws_csc {
             let frame = self
                 .frame
@@ -713,10 +732,13 @@ impl NvencEncoder {
             // SAFETY: `format == self.src_format` and `bytes.len() >= src_row * h` (the `ensure!`s
             // above), so `sws_scale` reads `h` rows of `src_row` bytes from `src_data[0] = bytes`
             // (packed RGB is single-plane; the other src planes are null/0) — all in bounds. `sws` is
-            // the non-null context built in `open`. The dst is `frame`'s underlying `AVFrame`: its
-            // `data`/`linesize` in-struct arrays were sized for YUV444P by `VideoFrame::new`, and the
-            // 3 planes are each `width`×`height`. All pointers are live locals for this synchronous
-            // call; the encoder runs only on this thread (`unsafe impl Send`), so no aliasing/race.
+            // the non-null context built in `open`. The dst is `frame`'s underlying `AVFrame`, whose
+            // `data`/`linesize` in-struct arrays were sized by `VideoFrame::new` for the very
+            // `nvenc_pixel` this context was built to output — 3 planes of `width`×`height` for
+            // YUV444P, 2 for P010, 1 packed plane for `rgb0`/`bgr0` — so swscale writes exactly the
+            // planes it allocated, at the strides it reports. All pointers are live locals for this
+            // synchronous call; the encoder runs only on this thread (`unsafe impl Send`), so no
+            // aliasing/race.
             unsafe {
                 let dst_av = frame.as_mut_ptr();
                 let src_data: [*const u8; 4] =
@@ -732,7 +754,7 @@ impl NvencEncoder {
                     (*dst_av).linesize.as_ptr(),
                 );
                 if r < 0 {
-                    bail!("sws_scale(RGB→YUV444P) failed ({r})");
+                    bail!("sws_scale(CPU CSC → encoder input) failed ({r})");
                 }
             }
             frame.set_pts(Some(pts));
@@ -741,7 +763,7 @@ impl NvencEncoder {
             } else {
                 ffmpeg::picture::Type::None
             });
-            self.enc.send_frame(frame).context("send_frame(444)")?;
+            self.enc.send_frame(frame).context("send_frame(swscale)")?;
             return Ok(());
         }
         let frame = self
@@ -750,18 +772,9 @@ impl NvencEncoder {
             .context("CPU frame missing (encoder opened in CUDA mode)")?;
         let stride = frame.stride(0); // dst is 4-bpp, aligned
         let dst = frame.data_mut(0);
-        if self.expand {
-            // packed 3-bpp RGB/BGR → 4-bpp *0 (copy 3 bytes, zero the pad byte)
-            for y in 0..h {
-                let s = &bytes[y * src_row..y * src_row + src_row];
-                let drow = &mut dst[y * stride..y * stride + w * 4];
-                for x in 0..w {
-                    drow[x * 4..x * 4 + 3].copy_from_slice(&s[x * 3..x * 3 + 3]);
-                    drow[x * 4 + 3] = 0;
-                }
-            }
-        } else {
-            // 4-bpp → 4-bpp, honoring the (possibly larger) dst stride
+        {
+            // 4-bpp → 4-bpp, honoring the (possibly larger) dst stride. The 3-bpp expand that used
+            // to live here as a per-pixel loop is now swscale's job (see the branch above).
             for y in 0..h {
                 dst[y * stride..y * stride + src_row]
                     .copy_from_slice(&bytes[y * src_row..y * src_row + src_row]);
