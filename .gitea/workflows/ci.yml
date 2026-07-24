@@ -61,6 +61,43 @@ jobs:
       - name: Test (unit + loopback + proptest + C ABI harness)
         run: cargo test --workspace --locked
 
+      # The GPU encode backends are OFF by default, so every step above compiles ~none of them:
+      # `nvenc` gates enc/linux/nvenc_cuda.rs (+ nvenc_core/nvenc_status) and `vulkan-encode` gates
+      # enc/linux/vulkan_video.rs (+ the vendored vk_av1_encode/vk_valve_rgb bindings) — ~8,150
+      # lines carrying ~70 `unsafe` blocks. Their ONLY prior CI coverage was deb.yml's
+      # `cargo build`, where warnings are not errors, so pf-encode's own
+      # `#![deny(clippy::undocumented_unsafe_blocks)]` — the crate's stated unsafe-proof gate —
+      # was never actually enforced on them. (`pyrowave` needs no extra step: punktfunk-host has
+      # `default = ["pyrowave"]`, so the steps above already cover it.)
+      #
+      # `--all-targets` is load-bearing, not decoration: without it the feature-gated
+      # `#[cfg(test)]` modules are never compiled, which is exactly how all ten
+      # `NvencCudaEncoder::open` call sites in nvenc_cuda.rs's tests drifted to the wrong arity
+      # (E0061 x10) without any job noticing.
+      #
+      # GPU-free: every test needing real hardware is `#[ignore]`d, and NVENC/CUDA resolve their
+      # entry points at RUNTIME (dlopen), so the test binary links without a driver present.
+      # (On MSVC the same crate link-imports those symbols instead, which is why windows-host.yml
+      # can only type-check these tests via clippy — see the note there.)
+      #
+      # Scoped to `-p pf-encode` with ITS OWN feature names: punktfunk-host has no code gated on
+      # `nvenc`/`vulkan-encode` (its only `cfg(feature)` sites are the two `pyrowave` ones in
+      # capture.rs, and pyrowave is default-on, so the steps above already cover them). Going
+      # through `--features punktfunk-host/...` would force punktfunk-host into the selection and
+      # re-run its entire test suite a second time for no extra coverage.
+      #
+      # `pyrowave` is listed explicitly even though it is punktfunk-host's default: selecting only
+      # `-p pf-encode` takes the host out of the resolution, and pf-encode's own default is empty.
+      # Naming it keeps this the SHIPPED Linux feature set — deb.yml builds
+      # `--features punktfunk-host/nvenc,punktfunk-host/vulkan-encode` WITHOUT
+      # `--no-default-features`, so the .deb carries nvenc + vulkan-encode + pyrowave together, and
+      # that combination is what deserves the lint.
+      - name: Clippy + test the feature-gated Linux encode backends
+        run: |
+          cargo clippy -p pf-encode --all-targets --locked \
+            --features nvenc,vulkan-encode,pyrowave -- -D warnings
+          cargo test -p pf-encode --locked --features nvenc,vulkan-encode,pyrowave
+
       - name: C ABI harness (standalone link proof)
         run: bash crates/punktfunk-core/tests/c/run.sh
 

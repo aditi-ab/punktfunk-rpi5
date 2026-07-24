@@ -50,6 +50,23 @@ on:
       # builds — without these, encoder changes only reached this workflow via Cargo.lock luck.
       - 'crates/pf-encode/**'
       - 'crates/libvpl-sys/**'
+      # …and the rest of the W6 subsystem crates this build compiles. pf-encode was listed while
+      # the crates it speaks (pf-frame's CapturedFrame/PixelFormat/dxgi vocabulary, pf-gpu's
+      # adapter selection, pf-zerocopy, pf-host-config) were not, so a change that broke the
+      # Windows host through one of THEM reached main with no Windows build at all — the same
+      # Cargo.lock-luck gap the two lines above were added to close.
+      - 'crates/pf-frame/**'
+      - 'crates/pf-gpu/**'
+      - 'crates/pf-zerocopy/**'
+      - 'crates/pf-host-config/**'
+      - 'crates/pf-capture/**'
+      - 'crates/pf-win-display/**'
+      - 'crates/pf-vdisplay/**'
+      - 'crates/pf-inject/**'
+      - 'crates/pf-paths/**'
+      - 'crates/pf-driver-proto/**'
+      - 'crates/pf-clipboard/**'
+      - 'crates/pyrowave-sys/**'
       - 'packaging/windows/**'
       - 'scripts/windows/**'
       - 'web/**'
@@ -154,8 +171,23 @@ jobs:
         # build minutes earlier). Linting in release reuses those native build-script artifacts (no
         # openh264 rebuild), and keeps everything in one C:\t\release tree. Same reason
         # pf-vkhdr-layer's clippy below runs --release.
+        #
+        # pf-encode is linted SEPARATELY with --all-targets so its Windows `#[cfg(test)]` modules
+        # are type-checked — the AMF C-ABI layout assertions (`variant_layout_matches_c` and
+        # friends, which are the only guard on a hand-mirrored vtable ABI), the QSV tests, and the
+        # PyroWave-Windows smoke test. The host lint above cannot cover them: `-p punktfunk-host`
+        # only builds pf-encode as a dependency, so its test targets are never compiled, and that
+        # blind spot is what let the Linux twin's tests rot to the wrong arity unnoticed.
+        # NOTE: clippy (a check, no link step) is deliberately the vehicle here — `cargo test`
+        # with `nvenc` cannot LINK on MSVC: nvidia-video-codec-sdk link-imports
+        # NvEncodeAPICreateInstance / NvEncodeAPIGetMaxSupportedVersion, which resolve only against
+        # the driver's import lib. (On Linux the same crate dlopens them, so ci.yml can and does
+        # run the tests there.) Running them here would need an `--features amf-qsv,qsv` build
+        # without `nvenc`, i.e. a third full dep tree on a runner that already trips C1069 — not
+        # worth it while ci.yml executes the same tests.
         run: |
           cargo clippy --release -p punktfunk-host --features nvenc,amf-qsv,qsv -- -D warnings; if ($LASTEXITCODE) { throw "host clippy" }
+          cargo clippy --release -p pf-encode --all-targets --features nvenc,amf-qsv,qsv -- -D warnings; if ($LASTEXITCODE) { throw "pf-encode clippy" }
           cargo clippy --release -p punktfunk-tray -- -D warnings; if ($LASTEXITCODE) { throw "tray clippy" }
 
       - name: Build + lint the HDR Vulkan layer (pf-vkhdr-layer)
