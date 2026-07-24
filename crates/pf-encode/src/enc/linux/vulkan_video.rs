@@ -221,6 +221,92 @@ impl NativeProfileStack {
 
 /// The Vulkan codec-operation bit for our codec selection (shared by open and the per-import
 /// profile rebuilds — the two must agree, profile identity is by value).
+/// The physical device + encode queue family a session runs on: the FIRST device exposing a
+/// `VIDEO_ENCODE` queue family that advertises `codec_op` (llvmpipe advertises none, so it drops
+/// out implicitly). Shared by [`VulkanVideoEncoder::open_inner`] and [`probe_encode_support`].
+///
+/// # Safety
+/// `instance` must be a live `ash::Instance` and `devices` handles enumerated from it.
+unsafe fn find_encode_device(
+    instance: &ash::Instance,
+    devices: &[vk::PhysicalDevice],
+    codec_op: vk::VideoCodecOperationFlagsKHR,
+) -> Option<(vk::PhysicalDevice, u32)> {
+    for &pd in devices {
+        let qf_len = instance.get_physical_device_queue_family_properties2_len(pd);
+        let mut video = vec![vk::QueueFamilyVideoPropertiesKHR::default(); qf_len];
+        let mut qf = vec![vk::QueueFamilyProperties2::default(); qf_len];
+        for i in 0..qf_len {
+            qf[i].p_next = &mut video[i] as *mut _ as *mut c_void;
+        }
+        instance.get_physical_device_queue_family_properties2(pd, &mut qf);
+        for i in 0..qf_len {
+            if qf[i]
+                .queue_family_properties
+                .queue_flags
+                .contains(vk::QueueFlags::VIDEO_ENCODE_KHR)
+                && video[i].video_codec_operations.contains(codec_op)
+            {
+                return Some((pd, i as u32));
+            }
+        }
+    }
+    None
+}
+
+/// Can this GPU + driver open a Vulkan Video **encode** session for `codec` at all?
+///
+/// This is the verdict the native-NV12 capture negotiation needs BEFORE it commits
+/// ([`crate::linux_native_nv12_ok`]): once the producer hands over two-plane NV12 there is no VAAPI
+/// fallback — libav would import it as packed RGB — so [`crate::open_video`] deliberately makes
+/// that open-failure fatal, and a Mesa built without `VK_KHR_video_encode_h265` therefore kills the
+/// session at its first frame instead of streaming on VAAPI.
+///
+/// Deliberately the FIRST check `open_inner` performs and hard-fails on, and nothing more: the same
+/// [`find_encode_device`] scan, run against the same codec op. That makes it provably no stricter
+/// than the open, so a failure here can only ever name a session that would have died anyway — it
+/// can never talk a working host out of the fast path. It is also cheap: one instance plus
+/// physical-device queries, no logical device, no video session, no VRAM. The later stages
+/// (`create_device`, `create_video_session`, the capability query) can still fail for reasons this
+/// does not model; those keep the session on the packed-RGB negotiation the ordinary way, because
+/// the capture format is only committed once this said yes.
+///
+/// Probed PER CODEC, not once: `codec_op_for` selects a different queue-family bit for AV1, and
+/// HEVC-encode-without-AV1-encode is the common VCN/ANV configuration.
+pub(crate) fn probe_encode_support(codec: Codec) -> Result<(), &'static str> {
+    if !matches!(codec, Codec::H265 | Codec::Av1) {
+        return Err("the Vulkan Video backend encodes HEVC + AV1 only");
+    }
+    let codec_op = codec_op_for(codec == Codec::Av1);
+    // SAFETY: creates one Vulkan instance and issues only physical-device queries against it, then
+    // destroys it on EVERY path below before returning — no handle derived from it escapes, and
+    // nothing outside this call observes it. `Entry::load` only dlopens the loader (a missing
+    // libvulkan returns `Err`), touching no process state the rest of the crate relies on.
+    // `find_encode_device` gets a live instance and handles enumerated from it, as it requires.
+    unsafe {
+        let Ok(entry) = ash::Entry::load() else {
+            return Err("no Vulkan loader");
+        };
+        let app = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_3);
+        let Ok(instance) = entry.create_instance(
+            &vk::InstanceCreateInfo::default().application_info(&app),
+            None,
+        ) else {
+            return Err("vkCreateInstance failed");
+        };
+        let found = match instance.enumerate_physical_devices() {
+            Ok(devices) => find_encode_device(&instance, &devices, codec_op).is_some(),
+            Err(_) => false,
+        };
+        instance.destroy_instance(None);
+        if found {
+            Ok(())
+        } else {
+            Err("no VK_KHR_video_encode queue for this codec on any device")
+        }
+    }
+}
+
 fn codec_op_for(av1: bool) -> vk::VideoCodecOperationFlagsKHR {
     if av1 {
         vk::VideoCodecOperationFlagsKHR::from_raw(
@@ -604,34 +690,13 @@ impl VulkanVideoEncoder {
 
         let vq_inst = ash::khr::video_queue::Instance::new(&entry, &instance);
 
-        // pick the physical device + encode queue family (skip llvmpipe)
-        let (pd, encode_family) = {
-            let mut found = None;
-            for pd in instance.enumerate_physical_devices()? {
-                let qf_len = instance.get_physical_device_queue_family_properties2_len(pd);
-                let mut video = vec![vk::QueueFamilyVideoPropertiesKHR::default(); qf_len];
-                let mut qf = vec![vk::QueueFamilyProperties2::default(); qf_len];
-                for i in 0..qf_len {
-                    qf[i].p_next = &mut video[i] as *mut _ as *mut c_void;
-                }
-                instance.get_physical_device_queue_family_properties2(pd, &mut qf);
-                for i in 0..qf_len {
-                    if qf[i]
-                        .queue_family_properties
-                        .queue_flags
-                        .contains(vk::QueueFlags::VIDEO_ENCODE_KHR)
-                        && video[i].video_codec_operations.contains(codec_op)
-                    {
-                        found = Some((pd, i as u32));
-                        break;
-                    }
-                }
-                if found.is_some() {
-                    break;
-                }
-            }
-            found.context("no VK_KHR_video_encode queue for the requested codec on any device")?
-        };
+        // pick the physical device + encode queue family (skip llvmpipe). The scan itself lives in
+        // [`find_encode_device`] so the negotiation-time probe asks the SAME question this open
+        // asks — a probe that MIRRORS a dispatch goes stale the first time the dispatch grows a
+        // case, which is the failure `open_video`'s backend-label note already records.
+        let (pd, encode_family) =
+            find_encode_device(&instance, &instance.enumerate_physical_devices()?, codec_op)
+                .context("no VK_KHR_video_encode queue for the requested codec on any device")?;
         let mem_props = instance.get_physical_device_memory_properties(pd);
 
         // a compute queue family for the CSC (usually family 0) + its timestamp support (the

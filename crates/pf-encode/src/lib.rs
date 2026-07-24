@@ -855,24 +855,73 @@ fn vulkan_encode_enabled() -> bool {
 /// negotiation (`OutputFormat::nv12_native` → `ZeroCopyPolicy::native_nv12_session`), which
 /// then PREFERS gamescope's producer-side NV12 pod (default-on; `PUNKTFUNK_PIPEWIRE_NV12=0`
 /// escapes at the capture gate).
+///
+/// This verdict is load-bearing in a way the other capability helpers are not: once the producer
+/// has been asked for two-plane NV12 there is **no fallback**. [`open_video`] deliberately makes a
+/// failed Vulkan open FATAL for an NV12 capture rather than degrading to libav VAAPI, because VAAPI
+/// would import that buffer as packed RGB and stream silent garbage. So a wrong `true` here does
+/// not cost quality — it kills the session at its first frame. Hence the real device probe below,
+/// and hence the conjuncts are ordered cheapest-first so it only runs when everything else already
+/// said yes.
 #[cfg(target_os = "linux")]
 pub fn linux_native_nv12_ok(codec: Codec) -> bool {
     #[cfg(feature = "vulkan-encode")]
     {
         matches!(codec, Codec::H265 | Codec::Av1)
             && vulkan_encode_enabled()
-            // NVENC/PyroWave prefs never open the Vulkan Video backend; every other pref
-            // (auto/vaapi/amd/intel/vulkan) tries it first on AMD/Intel — see [`open_video`].
-            && !matches!(
-                pf_host_config::config().encoder_pref.as_str(),
-                "nvenc" | "nvidia" | "cuda" | "pyrowave"
-            )
+            // Which backend this host actually resolves to. This used to be a denylist of the
+            // EXPLICIT prefs that skip Vulkan Video ("nvenc"|"nvidia"|"cuda"|"pyrowave"), which
+            // silently missed the one that matters: the DEFAULT `encoder_pref` is `""`, and `""`
+            // resolves to `auto`, which on an NVIDIA box opens NVENC. So a stock NVIDIA host passed
+            // this gate. `linux_zero_copy_is_vaapi` layers the pref on top of the same auto decision
+            // `open_video` makes, which is exactly what the note on `linux_auto_is_vaapi` says a
+            // capability probe must consult — and it is what the downstream consumer of this very
+            // verdict already uses to pick its zero-copy path.
+            && linux_zero_copy_is_vaapi()
+            // …and only then ask the GPU. Ordered last on purpose: it opens a Vulkan instance.
+            && vulkan_encode_available(codec)
     }
     #[cfg(not(feature = "vulkan-encode"))]
     {
         let _ = codec;
         false
     }
+}
+
+/// Can this GPU + driver actually open a Vulkan Video **encode** session for `codec`? Cached per
+/// (selected GPU, codec) — the [`can_encode_10bit`] idiom, with the probe run outside the lock.
+///
+/// Only [`linux_native_nv12_ok`] consults this, and only for the no-fallback decision described
+/// there. It is deliberately NOT wired into [`open_video`]'s dispatch: that path already degrades
+/// to VAAPI on a failed open for every non-NV12 capture, so making it pay for a probe would buy
+/// nothing. Prediction and truth stay separate — the probe answers "would it open", the open itself
+/// reports what actually did.
+#[cfg(all(target_os = "linux", feature = "vulkan-encode"))]
+fn vulkan_encode_available(codec: Codec) -> bool {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<HashMap<(String, &'static str), bool>>> = OnceLock::new();
+    let key = (pf_gpu::selection_key(), codec.label());
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(v) = cache.lock().unwrap().get(&key) {
+        return *v;
+    }
+    let verdict = vulkan_video::probe_encode_support(codec);
+    let ok = verdict.is_ok();
+    match &verdict {
+        Ok(()) => tracing::info!(
+            ?codec,
+            "Vulkan Video encode probed OK — producer-native NV12 capture is eligible"
+        ),
+        Err(why) => tracing::info!(
+            ?codec,
+            why = *why,
+            "Vulkan Video encode unavailable — keeping the packed-RGB capture negotiation \
+             (the native-NV12 path has no VAAPI fallback)"
+        ),
+    }
+    cache.lock().unwrap().insert(key, ok);
+    ok
 }
 
 /// Cheap, side-effect-free NVIDIA-presence probe for the `auto` backend selector: the NVIDIA
