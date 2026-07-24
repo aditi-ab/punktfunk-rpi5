@@ -340,9 +340,19 @@ pub(crate) fn is_available() -> bool {
 /// against PipeWire ≥ 1.6 (a loop-lock bug) and a stuck link head-blocks the whole daemon.
 const MIN_GAMESCOPE: (u32, u32, u32) = (3, 16, 22);
 
-/// Best-effort: warn loudly if the installed gamescope is older than [`MIN_GAMESCOPE`]. Parsing
-/// failures are silent (don't block a possibly-fine custom build) — this is a diagnostic, not a
-/// gate. Returns the parsed version when it could read one.
+/// First gamescope that paints the Steam overlay (Shift+Tab / Quick Access Menu) into its built-in
+/// PipeWire node. `paint_pipewire()` is a *separate, reduced* composite from the display scanout;
+/// the overlay-window paint (gated on the consumer negotiating `gamescope_focus_appid == 0`, which
+/// we do by never advertising that property — see the capturer's EnumFormat builders) first ships
+/// in 3.16.23 (gamescope commits `ccd62074` + `f8b33d38`). Below this the overlay is *never* in the
+/// node, so it cannot appear in the stream no matter what the host does. The cursor and
+/// external-overlay / notification layers are excluded on *every* version (handled host-side).
+const MIN_GAMESCOPE_OVERLAY: (u32, u32, u32) = (3, 16, 23);
+
+/// Best-effort: warn if the installed gamescope is older than [`MIN_GAMESCOPE`] (capture is
+/// unreliable) or than [`MIN_GAMESCOPE_OVERLAY`] (capture works but the Steam overlay can't reach
+/// the stream). Parsing failures are silent (don't block a possibly-fine custom build) — this is a
+/// diagnostic, not a gate. Returns the parsed version when it could read one.
 pub(super) fn check_gamescope_version() -> Option<(u32, u32, u32)> {
     let out = Command::new("gamescope").arg("--version").output().ok()?;
     // gamescope prints the version banner to stderr on some builds, stdout on others.
@@ -359,6 +369,18 @@ pub(super) fn check_gamescope_version() -> Option<(u32, u32, u32)> {
             "gamescope is older than the minimum for reliable headless capture — expect a \
              capture deadlock against PipeWire ≥ 1.6 (a wedged link head-blocks the daemon); \
              upgrade gamescope or use PUNKTFUNK_COMPOSITOR=kwin|mutter"
+        );
+    } else if ver < MIN_GAMESCOPE_OVERLAY {
+        // Capture is fine; the Steam overlay just won't be in the frame gamescope hands us.
+        tracing::warn!(
+            found = %format!("{}.{}.{}", ver.0, ver.1, ver.2),
+            min = %format!(
+                "{}.{}.{}",
+                MIN_GAMESCOPE_OVERLAY.0, MIN_GAMESCOPE_OVERLAY.1, MIN_GAMESCOPE_OVERLAY.2
+            ),
+            "gamescope is older than the first version that paints the Steam overlay (Shift+Tab / \
+             Quick Access Menu) into its PipeWire node — the overlay will be absent from the \
+             stream until you upgrade gamescope (the cursor is composited host-side regardless)"
         );
     }
     Some(ver)
@@ -379,7 +401,7 @@ fn parse_version(text: &str) -> Option<(u32, u32, u32)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_version, steam_appid_from_launch, MIN_GAMESCOPE};
+    use super::{parse_version, steam_appid_from_launch, MIN_GAMESCOPE, MIN_GAMESCOPE_OVERLAY};
 
     #[test]
     fn parses_steam_appid_from_launch() {
@@ -424,5 +446,16 @@ mod tests {
         assert!(parse_version("gamescope version 3.16.20").unwrap() < MIN_GAMESCOPE);
         assert!(parse_version("gamescope version 3.16.22").unwrap() >= MIN_GAMESCOPE);
         assert!(parse_version("gamescope version 3.17.0").unwrap() >= MIN_GAMESCOPE);
+    }
+
+    #[test]
+    fn overlay_threshold_brackets_the_fix() {
+        // 3.16.22 captures fine but predates the overlay-in-pipewire paint — it sits in the
+        // "capture works, overlay absent" window `[MIN_GAMESCOPE, MIN_GAMESCOPE_OVERLAY)`, which is
+        // exactly the `else if` warn arm; 3.16.23 is the first to include the overlay.
+        assert!(parse_version("gamescope version 3.16.22").unwrap() >= MIN_GAMESCOPE);
+        assert!(parse_version("gamescope version 3.16.22").unwrap() < MIN_GAMESCOPE_OVERLAY);
+        assert!(parse_version("gamescope version 3.16.23").unwrap() >= MIN_GAMESCOPE_OVERLAY);
+        assert!(parse_version("gamescope version 3.16.25").unwrap() >= MIN_GAMESCOPE_OVERLAY);
     }
 }

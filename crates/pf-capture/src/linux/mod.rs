@@ -2652,6 +2652,18 @@ mod pipewire {
             build_default_format_obj(preferred)
         };
 
+        // gamescope trap — the Steam overlay's presence in the stream is decided HERE by omission:
+        // gamescope's `paint_pipewire()` composites the overlay (Shift+Tab / Quick Access Menu) into
+        // the node it hands us ONLY when the consumer-negotiated `gamescope_focus_appid` is 0 — the
+        // default, and the "mirror the focused window + overlay" branch (gamescope ≥ 3.16.23; see
+        // `MIN_GAMESCOPE_OVERLAY`). None of the EnumFormat pods below advertise the
+        // `SPA_FORMAT_VIDEO_gamescope_focus_appid` property, so gamescope reads 0 and paints the
+        // overlay for us for free. DO NOT add a non-zero focus-appid (e.g. to "isolate the game" in a
+        // dedicated session) — that flips gamescope into the Remote-Play branch that deliberately
+        // drops the overlay (and all host chrome) back out of the capture. The cursor, external
+        // overlay (MangoHUD), and notifications are excluded from the node on EVERY gamescope
+        // version and are composited host-side instead (see `xfixes_cursor.rs`).
+        //
         // When zero-copy is on, offer ONLY a BGRx dmabuf format with our EGL-importable modifiers
         // (offering shm too makes the compositor pick shm). The modifier list is advertised with
         // DONT_FIXATE so the compositor's allocator chooses one; we re-emit the fixated format in
