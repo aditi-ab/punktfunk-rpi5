@@ -2165,6 +2165,7 @@ mod tests {
             true,
             8,
             ChromaFormat::Yuv420,
+            false,
         )
         .expect("open NVENC CUDA session");
 
@@ -2241,6 +2242,7 @@ mod tests {
             true,
             8,
             ChromaFormat::Yuv444,
+            false,
         )
         .expect("open NVENC CUDA 4:4:4 session");
 
@@ -2286,6 +2288,7 @@ mod tests {
             true,
             8,
             ChromaFormat::Yuv420,
+            false,
         )
         .expect("open NVENC CUDA session");
 
@@ -2343,6 +2346,7 @@ mod tests {
             true,
             8,
             ChromaFormat::Yuv420,
+            false,
         ) else {
             eprintln!(
                 "skipping rfi_declines_impossible_ranges: NVENC unavailable (no NVIDIA driver)"
@@ -2369,6 +2373,7 @@ mod tests {
             true,
             8,
             ChromaFormat::Yuv420,
+            false,
         )
         .expect("open NVENC CUDA encoder")
     }
@@ -2403,6 +2408,7 @@ mod tests {
                 true,
                 8,
                 ChromaFormat::Yuv420,
+                false,
             )
             .expect("open");
             for f in 0..4u32 {
@@ -2540,6 +2546,7 @@ mod tests {
             true,
             8,
             ChromaFormat::Yuv420,
+            false,
         )
         .expect("open NVENC CUDA session");
         let frame = nv12_frame(W, H, 0);
@@ -2581,6 +2588,7 @@ mod tests {
             true,
             8,
             ChromaFormat::Yuv420,
+            false,
         )
         .expect("open NVENC CUDA session");
         // Steady sync frames first (stream-ordered mode).
@@ -2660,6 +2668,7 @@ mod tests {
             true,
             8,
             ChromaFormat::Yuv420,
+            false,
         )
         .expect("open NVENC CUDA session");
 
@@ -2765,6 +2774,7 @@ mod tests {
             true,
             8,
             ChromaFormat::Yuv420,
+            false,
         )
         .expect("open NVENC CUDA session");
 
