@@ -151,8 +151,14 @@ fn sws_src(format: PixelFormat) -> Result<Pixel> {
 }
 
 /// Does this captured format imply a 10-bit encode (P010 / Rgb10a2)?
-fn is_10bit_format(format: PixelFormat, bit_depth: u8) -> bool {
-    bit_depth >= 10 || matches!(format, PixelFormat::P010 | PixelFormat::Rgb10a2)
+///
+/// Depth follows the PIXELS, not the negotiated `bit_depth` — see
+/// [`crate::ten_bit_input`] for why, and for the failure this shape used to produce here in
+/// particular: a 10-bit-negotiated session over an 8-bit capture built a P010 encoder whose every
+/// `submit_d3d11` then failed the depth check below, forever, with `reset()` unable to help
+/// because the rebuild re-derived the same wrong answer.
+fn is_10bit_format(format: PixelFormat) -> bool {
+    matches!(format, PixelFormat::P010 | PixelFormat::Rgb10a2)
 }
 
 /// Build the FFmpeg encoder context shared by both inner paths: name, mode, low-latency RC,
@@ -350,7 +356,7 @@ impl SystemInner {
         bitrate_bps: u64,
         bit_depth: u8,
     ) -> Result<Self> {
-        let ten_bit = is_10bit_format(format, bit_depth);
+        let ten_bit = crate::ten_bit_input(format, bit_depth);
         let sw_av = if ten_bit {
             ffi::AVPixelFormat::AV_PIX_FMT_P010LE
         } else {
@@ -472,7 +478,10 @@ impl SystemInner {
         pts: i64,
         idr: bool,
     ) -> Result<()> {
-        let fmt_10 = matches!(format, PixelFormat::P010 | PixelFormat::Rgb10a2);
+        // Same predicate the encoder was built from (`ten_bit_input`), so this can only fire on a
+        // genuine MID-STREAM depth change — never, as it used to, on every frame of a session that
+        // merely negotiated 10-bit over an 8-bit capture.
+        let fmt_10 = is_10bit_format(format);
         anyhow::ensure!(
             fmt_10 == self.ten_bit,
             "captured format {format:?} bit-depth changed under the encoder (built {}-bit)",
@@ -851,7 +860,7 @@ impl ZeroCopyInner {
         bit_depth: u8,
         device: &ID3D11Device,
     ) -> Result<Self> {
-        let ten_bit = is_10bit_format(format, bit_depth);
+        let ten_bit = crate::ten_bit_input(format, bit_depth);
         let sw_av = if ten_bit {
             ffi::AVPixelFormat::AV_PIX_FMT_P010LE
         } else {

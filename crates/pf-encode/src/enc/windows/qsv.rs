@@ -774,7 +774,12 @@ impl QsvEncoder {
         if codec == Codec::Av1 && !probe_can_encode(Codec::Av1) {
             bail!("this GPU/driver declined AV1 encode (DG2/Arc or MTL+ required) — QSV probe");
         }
-        let ten_bit = bit_depth >= 10 || matches!(format, PixelFormat::P010 | PixelFormat::Rgb10a2);
+        // Depth follows the delivered pixels, not the negotiated depth ([`crate::ten_bit_input`]).
+        // With the old `bit_depth >= 10 || …` shape a 10-bit-negotiated session over an 8-bit
+        // capture derived `expected = P010` and hit the bail below, ending the session at open —
+        // and taking the ffmpeg fallback with it, since that path had the same defect in a worse
+        // form (it accepted the open and then failed every frame).
+        let ten_bit = crate::ten_bit_input(format, bit_depth);
         if ten_bit && codec == Codec::H264 {
             bail!("native QSV: 10-bit is HEVC/AV1-only (H.264 High10 is not negotiated)");
         }

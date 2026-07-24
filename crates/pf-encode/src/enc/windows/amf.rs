@@ -1272,7 +1272,11 @@ impl AmfEncoder {
         if codec == Codec::Av1 && !probe_can_encode(Codec::Av1) {
             bail!("this GPU/driver declined AV1 encode (RDNA3+ required) — native AMF probe");
         }
-        let ten_bit = bit_depth >= 10 || matches!(format, PixelFormat::P010 | PixelFormat::Rgb10a2);
+        // Depth follows the delivered pixels, not the negotiated depth ([`crate::ten_bit_input`]).
+        // With the old `bit_depth >= 10 || …` shape a 10-bit-negotiated session over an 8-bit
+        // capture derived `expected = P010`, tripped the format check below and ended the session
+        // at open — on exactly the configuration the capturer had already downgraded on purpose.
+        let ten_bit = crate::ten_bit_input(format, bit_depth);
         // Zero-copy by construction: the input ring is NV12/P010 fed by same-format
         // CopySubresourceRegion. Any other capture format (Bgra/Rgb10a2 video-processor fallback,
         // CPU frames) has no native input path — and since Phase 3 no ffmpeg readback to degrade

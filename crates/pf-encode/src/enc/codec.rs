@@ -7,6 +7,45 @@
 use anyhow::Result;
 use pf_frame::CapturedFrame;
 
+/// Whether an encoder fed `format` must be built 10-bit — decided by **the pixels that actually
+/// arrive**, never by the negotiated `bit_depth`.
+///
+/// The three Windows backends each derived this as `bit_depth >= 10 || matches!(format, P010 |
+/// Rgb10a2)`, i.e. the *negotiated* depth could force a 10-bit encoder over an 8-bit capture. That
+/// combination is not hypothetical: a client advertises 10-bit, the handshake negotiates
+/// `bit_depth = 10`, and then enabling advanced colour on the IDD virtual display fails — at which
+/// point the capturer says so and delivers 8-bit NV12 anyway (`pf-capture`'s idd_push logs "10-bit
+/// HDR was negotiated but enabling advanced color on the virtual display FAILED — encoding 8-bit
+/// SDR"). Every backend then lost the session, each in its own way: native AMF and native QSV
+/// `bail!` at open because the format does not match the P010 they derived, and the libavcodec
+/// path accepted the open and then failed EVERY submit forever (its per-frame depth check
+/// recomputes from the frame, which never matches), where `reset()` could not help because the
+/// rebuild re-derived the same wrong depth.
+///
+/// Following the pixels keeps the stream alive and, more importantly, keeps it HONEST: the depth
+/// also selects the colour signalling (BT.2020 PQ vs BT.709) and the staging surface format, so an
+/// 8-bit capture now yields an 8-bit stream that says it is SDR — which is what the capturer
+/// already reported it is sending. The negotiated depth remains an upper bound; the session label
+/// may still claim HDR, and that mismatch belongs to the negotiation, not to the encoder.
+/// Windows-only: the three backends that derive an encoder depth from a capture live there
+/// (native AMF, native QSV, libavcodec AMF/QSV). The Linux backends take the depth from the
+/// negotiated `bit_depth` alone because their capture formats carry it unambiguously.
+#[cfg(target_os = "windows")]
+pub(crate) fn ten_bit_input(format: pf_frame::PixelFormat, negotiated_depth: u8) -> bool {
+    use pf_frame::PixelFormat;
+    let ten = matches!(format, PixelFormat::P010 | PixelFormat::Rgb10a2);
+    if negotiated_depth >= 10 && !ten {
+        tracing::warn!(
+            ?format,
+            negotiated_depth,
+            "session negotiated 10-bit but the capturer delivers an 8-bit format — encoding 8-bit \
+             SDR (the stream's colour signalling follows the pixels; check whether advanced colour \
+             failed to enable on the virtual display)"
+        );
+    }
+    ten
+}
+
 /// An encoded access unit (one NAL/AU) to hand to `punktfunk_core` for FEC + packetization.
 /// `data` is in-band Annex-B (the encoder is opened without a global header), so each
 /// keyframe carries its own VPS/SPS/PPS — the bytes are both a playable elementary
