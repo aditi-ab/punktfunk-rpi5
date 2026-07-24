@@ -12,6 +12,11 @@ Description=punktfunk management web console
 # web-init generates the login password; the host writes the mgmt token. Order after both.
 After=punktfunk-web-init.service punktfunk-host.service
 Wants=punktfunk-web-init.service
+# Retry indefinitely while the host is still writing the mgmt token + identity cert. Without this,
+# systemd's default rate limit (5 starts / 10 s) plus RestartSec=2 gives up permanently after ~10 s
+# - so a console enabled before the host's first run stayed dead until someone restarted it by hand
+# (the same defect the Windows PunktfunkWeb task had).
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple

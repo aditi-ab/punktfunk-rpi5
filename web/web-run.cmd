@@ -18,16 +18,21 @@ set "CERTFILE=%PFDATA%\cert.pem"
 set "KEYFILE=%PFDATA%\key.pem"
 
 rem The host's `serve` writes the mgmt token + identity cert on first run. Until they exist the proxy
-rem has no credential and no TLS material, so fail and let restart-on-failure retry (mirrors the
-rem installed launcher / Linux unit) rather than silently serving plain HTTP.
-if not exist "%TOKENFILE%" (
-  echo [punktfunk-web] mgmt token not present yet at "%TOKENFILE%" - waiting for the host service.
+rem has no credential and no TLS material, so WAIT for them (mirrors the installed launcher) rather
+rem than silently serving plain HTTP - see scripts\windows\web-run.cmd for why waiting here beats
+rem exiting 1 and relying on the task's restart-on-failure. ~5 min at 2 s, then give up.
+set /a PFWAITS=0
+:pfwait
+if exist "%TOKENFILE%" if exist "%CERTFILE%" goto pfready
+if %PFWAITS% GEQ 150 (
+  echo [punktfunk-web] gave up waiting for "%TOKENFILE%" + "%CERTFILE%" - is the punktfunk host running?
   exit /b 1
 )
-if not exist "%CERTFILE%" (
-  echo [punktfunk-web] host identity cert not present yet at "%CERTFILE%" - waiting for the host service.
-  exit /b 1
-)
+if %PFWAITS%==0 echo [punktfunk-web] waiting for the host to write the mgmt token + identity cert...
+set /a PFWAITS+=1
+ping -n 3 127.0.0.1 >nul 2>&1
+goto pfwait
+:pfready
 
 rem Both files are single KEY=VALUE lines: PUNKTFUNK_MGMT_TOKEN=... and PUNKTFUNK_UI_PASSWORD=... .
 rem Split on the first '=' and import each into the environment.

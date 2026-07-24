@@ -16,17 +16,26 @@ set "CERTFILE=%PFDATA%\cert.pem"
 set "KEYFILE=%PFDATA%\key.pem"
 
 rem The host's `serve` writes the mgmt token + its identity cert/key on first run. Until they exist
-rem we have no credential and no TLS material, so fail and let the task's restart-on-failure retry
-rem (mirrors the Linux unit's Restart=on-failure waiting for the host to create them) rather than
-rem silently downgrading to plain HTTP.
-if not exist "%TOKENFILE%" (
-  echo [punktfunk-web] mgmt token not present yet at "%TOKENFILE%" - waiting for the host service.
+rem we have no credential and no TLS material, so WAIT rather than silently downgrading to plain HTTP.
+rem
+rem Wait in-process instead of exiting 1 and hoping the task's restart-on-failure retries: Task
+rem Scheduler does not reliably restart on a plain non-zero exit code, so a console that started
+rem before the host finished writing those files (the token lands at argument parse, the cert only
+rem after the RSA-2048 keygen) used to stay down until the next reboot. ~5 min at 2 s, then give up
+rem so a genuinely broken install still surfaces as a failed task rather than one that runs forever.
+rem `timeout` needs a console this task does not have, so `ping -n 3` is the 2-second sleep.
+set /a PFWAITS=0
+:pfwait
+if exist "%TOKENFILE%" if exist "%CERTFILE%" goto pfready
+if %PFWAITS% GEQ 150 (
+  echo [punktfunk-web] gave up waiting for "%TOKENFILE%" + "%CERTFILE%" - is the punktfunk host service running?
   exit /b 1
 )
-if not exist "%CERTFILE%" (
-  echo [punktfunk-web] host identity cert not present yet at "%CERTFILE%" - waiting for the host service.
-  exit /b 1
-)
+if %PFWAITS%==0 echo [punktfunk-web] waiting for the host service to write the mgmt token + identity cert...
+set /a PFWAITS+=1
+ping -n 3 127.0.0.1 >nul 2>&1
+goto pfwait
+:pfready
 
 rem Both files are single KEY=VALUE lines (LF), written 0600/ACL'd: PUNKTFUNK_MGMT_TOKEN=... and
 rem PUNKTFUNK_UI_PASSWORD=... . Split on the first '=' and import each into the environment.
