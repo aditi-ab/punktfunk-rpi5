@@ -1636,25 +1636,6 @@ impl Encoder for NvencCudaEncoder {
                     }
                 } else {
                     self.cursor_blend_warned = false;
-                    // TEMP KWin composite probe (DROP BEFORE MERGE): prove the blend dispatches
-                    // and with what geometry.
-                    {
-                        use std::sync::atomic::{AtomicU64, Ordering as ProbeOrd};
-                        static PROBE_BLEND: AtomicU64 = AtomicU64::new(0);
-                        let n = PROBE_BLEND.fetch_add(1, ProbeOrd::Relaxed) + 1;
-                        if n == 1 || n % 512 == 0 {
-                            tracing::info!(
-                                n,
-                                fmt = ?self.buffer_fmt,
-                                ov_x = ov.x,
-                                ov_y = ov.y,
-                                ov_w = ov.w,
-                                ov_h = ov.h,
-                                visible = ov.visible,
-                                "cursor blend probe: vulkan dispatch submitted"
-                            );
-                        }
-                    }
                 }
             } else if !self.cursor_blend_warned {
                 self.cursor_blend_warned = true;
