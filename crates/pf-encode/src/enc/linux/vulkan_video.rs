@@ -540,7 +540,7 @@ pub struct VulkanVideoEncoder {
     // Per-buffer dmabuf-import cache, keyed by (st_dev, st_ino) — PipeWire cycles a small fixed pool,
     // so each underlying buffer is imported ONCE and reused (no per-frame VkImage create/import/destroy).
     // Imports are read-only per frame, so the ring shares them (concurrent frames read distinct buffers).
-    import_cache: Vec<(u64, u64, vk::Image, vk::DeviceMemory, vk::ImageView)>,
+    import_cache: Vec<CachedImport>,
 
     // --- in-flight frame ring (pipelining) ---
     frames: Vec<Frame>,         // per-slot private resources
@@ -1654,8 +1654,22 @@ impl VulkanVideoEncoder {
             // frame imports fresh (as before) but is still owned by the cache and freed on evict/Drop.
             (u64::MAX, self.enc_count)
         };
-        if let Some(&(_, _, img, _, view)) = self.import_cache.iter().find(|e| (e.0, e.1) == key) {
-            return Ok((img, view, false));
+        if let Some(pos) = self.import_cache.iter().position(|e| e.key == key) {
+            let e = &self.import_cache[pos];
+            if e.extent == (cw, ch) {
+                return Ok((e.img, e.view, false));
+            }
+            // Key hit, wrong extent: the (st_dev, st_ino) now names a different allocation than
+            // the one imported. Unreachable while every submit path guards frame-vs-session
+            // dimensions first — but the cache must never hand out a stale-sized image if a
+            // future path forgets, so evict and fall through to a fresh import. In-flight frames
+            // may still read the old image (same hazard as the FIFO eviction below), so idle the
+            // device before destroying. At most once per reallocation.
+            let _ = self.device.device_wait_idle();
+            let e = self.import_cache.remove(pos);
+            self.device.destroy_image_view(e.view, None);
+            self.device.destroy_image(e.img, None);
+            self.device.free_memory(e.mem, None);
         }
         // Feed pf-zerocopy's raw-dmabuf degrade latch (wired for the libav path in 3efbe416):
         // a deterministic import refusal repeats identically forever, and the latch — capture
@@ -1690,12 +1704,18 @@ impl VulkanVideoEncoder {
             let _ = self.device.device_wait_idle();
         }
         while self.import_cache.len() >= IMPORT_CACHE_CAP {
-            let (_, _, oi, om, ov) = self.import_cache.remove(0);
-            self.device.destroy_image_view(ov, None);
-            self.device.destroy_image(oi, None);
-            self.device.free_memory(om, None);
+            let e = self.import_cache.remove(0);
+            self.device.destroy_image_view(e.view, None);
+            self.device.destroy_image(e.img, None);
+            self.device.free_memory(e.mem, None);
         }
-        self.import_cache.push((key.0, key.1, img, mem, view));
+        self.import_cache.push(CachedImport {
+            key,
+            extent: (cw, ch),
+            img,
+            mem,
+            view,
+        });
         // Fires once per distinct pool buffer then goes quiet in steady state — the signal the cache
         // is hitting (a per-frame log here would mean inode keying failed and we're re-importing).
         tracing::debug!(
@@ -2006,6 +2026,20 @@ impl VulkanVideoEncoder {
         }
 
         // ---- 2. RGB source -> compute_cmd: prep barriers + CSC + copy into nv12_src ----
+        // The CSC twin of the sibling guards (native NV12, RGB-direct's two arms, every other
+        // backend's submit): the shader samples the source with clamped 1:1 texelFetch, so a
+        // mismatched frame doesn't fault — it silently streams a cropped/edge-padded picture.
+        // Refuse it into the encoder-rebuild path instead.
+        if frame.width != self.render_w || frame.height != self.render_h {
+            bail!(
+                "vulkan-encode (csc): frame {}x{} != mode {}x{} — refusing a mismatched CSC \
+                 source",
+                frame.width,
+                frame.height,
+                self.render_w,
+                self.render_h
+            );
+        }
         let dev = self.device.clone(); // cheap handle clone -> lets us also call &mut self helpers
         dev.begin_command_buffer(
             compute_cmd,
@@ -3794,9 +3828,58 @@ impl Encoder for VulkanVideoEncoder {
     fn reset(&mut self) -> bool {
         // Abandon everything in flight: wait the GPU idle, discard unread slots + queued output, and
         // restart GOP/DPB state so the next frame is a fresh IDR.
-        // SAFETY: `device_wait_idle` guarantees no slot's fence is still pending before we drop them.
+        //
+        // The wait is BOUNDED, like every other wait on this thread (`ENCODE_FENCE_TIMEOUT_NS`,
+        // same reasoning): reset() runs precisely because something upstream looks wedged, and an
+        // untimed `device_wait_idle` would park the recovery path on the suspect device until the
+        // kernel's GPU reset — if that ever comes. A timeout means the GPU really is wedged:
+        // report "no in-place rebuild" so the caller ends the session with a real error instead.
+        // (`Drop` still waits unbounded — teardown must be memory-safe even against a wedged
+        // device, and by then the session is already over.)
+        let fences: Vec<vk::Fence> = self
+            .in_flight
+            .iter()
+            .map(|&s| self.frames[s].fence)
+            .collect();
+        if !fences.is_empty() {
+            // SAFETY: every in-flight slot's fence was submitted with its batch (`enqueue` pushes
+            // only after a successful submit), and we hold `&mut self`.
+            match unsafe {
+                self.device
+                    .wait_for_fences(&fences, true, ENCODE_FENCE_TIMEOUT_NS)
+            } {
+                Ok(()) => {}
+                Err(e) => {
+                    tracing::error!(
+                        error = ?e,
+                        "vulkan-encode: in-flight work did not go idle within {} ms — GPU or \
+                         driver wedged; in-place rebuild abandoned",
+                        ENCODE_FENCE_TIMEOUT_NS / 1_000_000
+                    );
+                    return false;
+                }
+            }
+        }
+        // The fences cover the encode queue, and each encode waited its slot's `csc_sem`, so the
+        // paired compute batches are done too. The residual — a compute batch whose encode-queue
+        // submit failed (so it was never fenced or enqueued) — is what this sweep-up covers; it
+        // is instant unless that rare orphan is itself wedged (then the kernel's GPU reset bounds
+        // it, as before). An error here is a lost device: no rebuild on top of that.
+        // SAFETY: waiting this encoder's own device idle under `&mut self`.
+        if unsafe { self.device.device_wait_idle() }.is_err() {
+            return false;
+        }
+        // Drop the dmabuf import cache while the device is provably idle (the only safe point
+        // outside teardown): whatever wedged the GPU may be a capture-side reallocation, and the
+        // rebuilt stream must re-import from live buffers rather than trust images imported for
+        // the old pool.
+        // SAFETY: device idle (waits above); each entry is owned by the cache, destroyed once.
         unsafe {
-            let _ = self.device.device_wait_idle();
+            for e in std::mem::take(&mut self.import_cache) {
+                self.device.destroy_image_view(e.view, None);
+                self.device.destroy_image(e.img, None);
+                self.device.free_memory(e.mem, None);
+            }
         }
         self.in_flight.clear();
         self.pending.clear();
@@ -3857,6 +3940,17 @@ impl Encoder for VulkanVideoEncoder {
     }
 }
 
+/// One cached dmabuf import (see `import_cached`): keyed by `(st_dev, st_ino)`, carrying the
+/// extent it was imported at — a key hit must also prove the cached image still matches the
+/// caller's frame — plus the owning Vulkan objects.
+struct CachedImport {
+    key: (u64, u64),
+    extent: (u32, u32),
+    img: vk::Image,
+    mem: vk::DeviceMemory,
+    view: vk::ImageView,
+}
+
 /// Every destructible Vulkan object the encoder owns, with the one `Drop` that destroys them in
 /// dependency order. Both teardown paths run through it so they cannot drift:
 ///
@@ -3874,7 +3968,7 @@ struct VkTeardown {
     // infallible), so device-level objects can only exist once both are `Some`.
     device: Option<ash::Device>,
     vq_dev: Option<ash::khr::video_queue::Device>,
-    import_cache: Vec<(u64, u64, vk::Image, vk::DeviceMemory, vk::ImageView)>,
+    import_cache: Vec<CachedImport>,
     frames: Vec<Frame>,
     compute_pool: vk::CommandPool,
     cmd_pool: vk::CommandPool,
@@ -3933,10 +4027,10 @@ impl Drop for VkTeardown {
         unsafe {
             if let Some(device) = self.device.take() {
                 let _ = device.device_wait_idle();
-                for (_, _, img, mem, view) in std::mem::take(&mut self.import_cache) {
-                    device.destroy_image_view(view, None);
-                    device.destroy_image(img, None);
-                    device.free_memory(mem, None);
+                for e in std::mem::take(&mut self.import_cache) {
+                    device.destroy_image_view(e.view, None);
+                    device.destroy_image(e.img, None);
+                    device.free_memory(e.mem, None);
                 }
                 // Per-frame ring resources (command buffers, descriptor sets freed with their pools).
                 for f in std::mem::take(&mut self.frames) {

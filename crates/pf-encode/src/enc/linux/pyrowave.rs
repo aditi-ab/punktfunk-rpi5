@@ -372,6 +372,10 @@ pub struct PyroWaveEncoder {
     cmd_pool: vk::CommandPool,
     cmd: vk::CommandBuffer,
     fence: vk::Fence,
+    /// True between a successful `queue_submit` and its successful fence wait — i.e. exactly when
+    /// GPU work may still be executing. `reset()` keys its bounded wait on this: a never-submitted
+    /// fence would otherwise read as "wedged" (fences start unsignaled).
+    gpu_pending: bool,
 
     // --- state ---
     width: u32,
@@ -614,6 +618,7 @@ impl PyroWaveEncoder {
             cmd_pool: vk::CommandPool::null(),
             cmd: vk::CommandBuffer::null(),
             fence: vk::Fence::null(),
+            gpu_pending: false,
             width: w,
             height: h,
             fps,
@@ -1399,8 +1404,10 @@ impl PyroWaveEncoder {
             let _ = dev.reset_command_buffer(self.cmd, vk::CommandBufferResetFlags::empty());
             return Err(e);
         }
+        self.gpu_pending = true;
         dev.wait_for_fences(&[self.fence], true, 5_000_000_000)
             .context("pyrowave encode fence")?;
+        self.gpu_pending = false;
 
         // ---- packetize ----
         // Dense (default): boundary = whole buffer → the AU is exactly one pyrowave packet.
@@ -1492,8 +1499,35 @@ impl Encoder for PyroWaveEncoder {
     fn reset(&mut self) -> bool {
         // Cheap in-place rebuild: recreate only the pyrowave encoder object — there is no
         // rate-control history or reference state worth preserving (plan §4.3).
-        // SAFETY: the device is idle for this encoder's work (submit waits its fence) and the
-        // pyrowave device outlives the encoder object being swapped.
+        //
+        // Bounded wait first: the only work possibly still executing is the one submitted frame
+        // whose synchronous fence wait timed out (`gpu_pending`). Re-wait it under the same 5 s
+        // cap as `encode_frame` — an untimed `device_wait_idle` here would park the recovery
+        // thread on the exact device it suspects is wedged, until the kernel's GPU reset, if
+        // ever. If the fence still won't signal, destroying the pyrowave encoder under live GPU
+        // work would be a use-after-free, so report "no in-place rebuild" and let the session
+        // surface a real error (`Drop`'s unbounded idle covers teardown, where blocking on the
+        // kernel is acceptable).
+        if self.gpu_pending {
+            // SAFETY: waiting this encoder's own fence under `&mut self`.
+            if unsafe {
+                self.device
+                    .wait_for_fences(&[self.fence], true, 5_000_000_000)
+            }
+            .is_err()
+            {
+                tracing::error!(
+                    "pyrowave: in-flight encode did not complete within the reset budget — GPU \
+                     or driver wedged; in-place rebuild abandoned"
+                );
+                self.pending.clear();
+                return false;
+            }
+            self.gpu_pending = false;
+        }
+        // SAFETY: the device is idle for this encoder's work (the fence wait above, or no submit
+        // outstanding) — this sweep-up is instant — and the pyrowave device outlives the encoder
+        // object being swapped.
         unsafe {
             self.device.device_wait_idle().ok();
             pw::pyrowave_encoder_destroy(self.pw_enc);
