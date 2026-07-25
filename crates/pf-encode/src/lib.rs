@@ -78,13 +78,34 @@ impl Codec {
                 ) {
                     return punktfunk_core::quic::CODEC_H264;
                 }
+                // A pref that FORCES the raw Vulkan Video backend can only ever serve what that
+                // backend encodes: `open_video_backend`'s `vulkan` arm bails outright for anything
+                // that is not HEVC/AV1 ("the Vulkan Video encoder supports HEVC + AV1; the session
+                // negotiated {codec:?}"). Advertising H.264 there let a client negotiate it and die
+                // at encoder open. Without the `vulkan-encode` feature that arm cannot open at all,
+                // so the pref advertises nothing.
+                //
+                // This is a CEILING intersected with the device probe below, never a replacement
+                // for it: pinning a static HEVC|AV1 would ADD AV1 on the AMD/Intel hosts whose probe
+                // currently withholds it (pre-RDNA3, pre-Arc), i.e. it would re-create this very bug
+                // for a different codec. Intersecting can only narrow.
+                let pref_ceiling: u8 = match pf_host_config::config().encoder_pref.as_str() {
+                    "vulkan" | "vulkan-video" => {
+                        if cfg!(feature = "vulkan-encode") {
+                            punktfunk_core::quic::CODEC_HEVC | punktfunk_core::quic::CODEC_AV1
+                        } else {
+                            0
+                        }
+                    }
+                    _ => GPU_SUPERSET,
+                };
                 if linux_zero_copy_is_vaapi() {
                     if let Some(m) = vaapi_codec_support().wire_mask() {
-                        return m;
+                        return m & pref_ceiling;
                     }
                 }
                 // NVENC (static superset, like GameStream) — or an empty VAAPI probe (see above).
-                GPU_SUPERSET
+                GPU_SUPERSET & pref_ceiling
             }
             #[cfg(target_os = "windows")]
             {
