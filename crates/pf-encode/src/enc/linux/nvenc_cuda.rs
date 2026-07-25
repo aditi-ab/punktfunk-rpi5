@@ -1840,6 +1840,8 @@ impl Encoder for NvencCudaEncoder {
 
     fn caps(&self) -> EncoderCaps {
         EncoderCaps {
+            // Composites `frame.cursor` via the SPIR-V blend over the Vulkan-allocated input slot.
+            blends_cursor: true,
             supports_rfi: self.rfi_supported,
             supports_hdr_metadata: self.hdr,
             chroma_444: self.chroma_444,

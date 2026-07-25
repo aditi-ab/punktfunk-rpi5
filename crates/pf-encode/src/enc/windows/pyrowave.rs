@@ -681,6 +681,8 @@ impl Encoder for PyroWaveEncoder {
         // after the caps() default was written — a hardcoded `default()` here mis-reports a 4:4:4
         // open as 4:2:0 and fires a spurious "chroma disagrees with the negotiated Welcome" warn).
         EncoderCaps {
+            // The Windows capturer composites the pointer itself; this backend never reads it.
+            blends_cursor: false,
             chroma_444: self.chroma444,
             ..EncoderCaps::default()
         }

@@ -177,6 +177,23 @@ pub fn open_video(
             },
         }
     };
+    // The session asked for a composited pointer; say so loudly if the backend that actually opened
+    // cannot deliver one. `cursor_blend` was a REQUEST with no answer for most of this crate's life
+    // (`let _ = cursor_blend;` below), and the result was a stream with no mouse cursor and nothing
+    // in the logs — confirmed on the VAAPI dmabuf path and the libav-NVENC CUDA path.
+    //
+    // A warning is deliberately all this does. `open_video` cannot re-plan capture, so refusing here
+    // would only trade a missing pointer for a dead session; the host owns `plan.cursor_blend` and is
+    // the only layer that can fall back to capturer-side compositing. This makes the condition
+    // visible and queryable (`EncoderCaps::blends_cursor`) so that decision can be made upstream.
+    if cursor_blend && !inner.caps().blends_cursor {
+        tracing::warn!(
+            backend,
+            "session negotiated a composited cursor but this encode backend does not blend \
+             CapturedFrame::cursor — the pointer will be MISSING from the stream unless the \
+             capturer composites it"
+        );
+    }
     Ok(Box::new(TrackedEncoder {
         inner,
         _session: pf_gpu::session_begin(gpu),

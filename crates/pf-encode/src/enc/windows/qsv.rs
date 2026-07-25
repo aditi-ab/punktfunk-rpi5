@@ -1407,6 +1407,8 @@ impl Encoder for QsvEncoder {
 
     fn caps(&self) -> EncoderCaps {
         EncoderCaps {
+            // As Windows NVENC: the capturer composites; this backend never reads `frame.cursor`.
+            blends_cursor: false,
             supports_rfi: self.ltr_active,
             // In-band mastering/CLL at IDR (HEVC prefix SEI / AV1 metadata OBU); AVC sessions
             // are never HDR.

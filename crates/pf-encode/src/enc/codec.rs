@@ -294,6 +294,19 @@ pub struct EncoderCaps {
     /// `USER_FLAG_RECOVERY_POINT` on every Nth emitted AU, re-phased at each IDR). 0 when intra-refresh
     /// is off. Only consulted when [`intra_refresh_recovery`](Self::intra_refresh_recovery) is set.
     pub intra_refresh_period: u32,
+    /// The encoder composites [`CapturedFrame::cursor`] into the picture it encodes.
+    ///
+    /// `open_video`'s `cursor_blend` argument is a REQUEST, and for most of this crate's life it was
+    /// nothing else: `lib.rs` literally did `let _ = cursor_blend;` and only three backends ever read
+    /// `frame.cursor`. So a session could ask for a composited pointer, get a backend that silently
+    /// discards it, and stream with no mouse cursor at all — the confirmed symptom on the VAAPI
+    /// dmabuf path and the libav-NVENC CUDA path.
+    ///
+    /// This makes the answer queryable instead of assumed. It is deliberately a plain fact about the
+    /// encoder, not a policy: what to DO when a session wants blending and the backend cannot is the
+    /// host's call, since only the host can re-plan capture (fall back to capturer-side compositing).
+    /// `open_video` can only warn, which it does.
+    pub blends_cursor: bool,
 }
 
 /// A hardware encoder. One per session; runs on the encode thread.

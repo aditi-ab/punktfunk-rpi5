@@ -3308,6 +3308,11 @@ impl Encoder for VulkanVideoEncoder {
     fn caps(&self) -> EncoderCaps {
         EncoderCaps {
             supports_rfi: true,
+            // Only the CSC path composites the metadata cursor (`prep_cursor` feeds the compute
+            // shader). The RGB-direct/EFC front-end and the native-NV12 source have no compositing
+            // stage at all — both merely warn once that the pointer is being dropped — so this is
+            // the encoder's real answer, not a static one.
+            blends_cursor: self.rgb.is_none() && !self.native_nv12,
             ..Default::default()
         }
     }

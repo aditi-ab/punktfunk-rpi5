@@ -2426,6 +2426,8 @@ impl Encoder for AmfEncoder {
 
     fn caps(&self) -> EncoderCaps {
         EncoderCaps {
+            // As Windows NVENC: the capturer composites; this backend never reads `frame.cursor`.
+            blends_cursor: false,
             // LTR-RFI: AMD's reference invalidation is the user long-term-reference path (mark a
             // frame, force a later one to re-reference it). True only when the live driver accepted
             // the LTR slots at open — otherwise loss recovery falls back to a full IDR.

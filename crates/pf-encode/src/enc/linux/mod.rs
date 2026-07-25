@@ -620,6 +620,9 @@ impl NvencEncoder {
 impl Encoder for NvencEncoder {
     fn caps(&self) -> super::EncoderCaps {
         super::EncoderCaps {
+            // libav NVENC hands the frame straight to the encoder — `frame.cursor` is never read,
+            // so a cursor-as-metadata session loses its pointer on this backend (audit finding).
+            blends_cursor: false,
             // 4:4:4 iff this session opened FREXT — the CPU swscale path or the zero-copy GPU
             // convert. RFI/HDR-SEI stay unsupported on libavcodec NVENC (the trait defaults).
             chroma_444: self.want_444,

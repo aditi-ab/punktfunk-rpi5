@@ -1209,6 +1209,8 @@ impl Encoder for PyroWaveEncoder {
         // hardcoded `default()` here mis-reports a 4:4:4 open as 4:2:0 and fires a spurious
         // "chroma disagrees with the negotiated Welcome" warn.
         EncoderCaps {
+            // The wavelet CSC composites the metadata cursor.
+            blends_cursor: true,
             chroma_444: self.chroma444,
             ..EncoderCaps::default()
         }
