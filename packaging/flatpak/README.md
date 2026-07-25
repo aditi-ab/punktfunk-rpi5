@@ -125,6 +125,32 @@ curl -fsS --user "enricobuehler:$REGISTRY_TOKEN" \
 > home-worker-2 has no flatpak and no passwordless sudo to install it — so the Deck or the
 > privileged CI container are the only two viable build sites.
 
+### aarch64
+
+The manifest builds for aarch64 as well as x86_64. Two things are architecture-specific, and both
+are now expressed properly rather than hardcoded:
+
+* **`PKG_CONFIG_PATH`** contains the runtime's multiarch directory. flatpak-builder does *not*
+  shell-expand `env` values, so `${FLATPAK_ARCH}` would be taken literally — a `build-options.arch`
+  override supplies the aarch64 string instead, inheriting everything else.
+* **The prebuilt Skia archive** is per-target and pinned by sha256. There are now two `type: file`
+  sources discriminated by `only-arches`, both landing on the same `dest-filename`, so
+  `SKIA_BINARIES_URL` stays one literal path. Upstream publishes the aarch64 archive under the
+  same skia commit hash and the same resolved-feature key (`pdf-textlayout-vulkan`), so on a
+  skia-safe bump update both URLs and both hashes together.
+
+```sh
+ARCH=aarch64 bash packaging/flatpak/build-flatpak.sh
+# -> dist/punktfunk-client-<version>-aarch64.flatpak
+```
+
+`ARCH` defaults to this machine's, and the bundle name now carries the architecture so an x86_64
+and an aarch64 build can coexist in `dist/`. This is **not** a cross-compile: flatpak-builder runs
+the build in a sandbox for the target arch, so building aarch64 anywhere but an arm64 machine
+needs qemu binfmt and is very slow. Not yet verified end to end — the manifest is correct by
+construction and the Skia hash was checked against the published archive, but no aarch64 flatpak
+has been built.
+
 ## Manifest
 
 [`io.unom.Punktfunk.yml`](io.unom.Punktfunk.yml). Runtime `org.gnome.Platform//50`

@@ -121,6 +121,14 @@ build-options:
     LIBCLANG_PATH: /usr/lib/sdk/llvm20/lib
     # mold (shipped in rust-stable) speeds the ~450-crate link on the Deck APU.
     RUSTFLAGS: -C link-arg=-fuse-ld=mold
+  # The multiarch directory in PKG_CONFIG_PATH is per-architecture, and flatpak-builder does NOT
+  # shell-expand `env` values — so ${FLATPAK_ARCH} would be taken literally. An `arch` override is
+  # the supported way to vary it; everything else above is inherited. Only the runtime's own
+  # /usr/lib/<triple> changes, so aarch64 differs from x86_64 in exactly this one string.
+  arch:
+    aarch64:
+      env:
+        PKG_CONFIG_PATH: /app/lib/pkgconfig:/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/lib/pkgconfig
 
 modules:
   # ---------------------------------------------------------------------------------------
@@ -240,7 +248,18 @@ modules:
       # crate's pinned skia commit + target + resolved features — when bumping skia-safe, build
       # the workspace once locally and take the new name from
       # target/release/build/skia-bindings-*/out/.cache/, then update url + sha256 together.
+      # One entry per architecture, selected by `only-arches`; both land on the SAME
+      # dest-filename, so SKIA_BINARIES_URL above stays a single literal path. The upstream
+      # release publishes the aarch64 archive under the same skia commit hash and the same
+      # resolved-feature key, so the two stay in lockstep on a skia-safe bump — take both new
+      # names and sha256s together.
       - type: file
+        only-arches: [x86_64]
         url: https://github.com/rust-skia/skia-binaries/releases/download/0.87.0/skia-binaries-e551f334ad5cbdf43abf-x86_64-unknown-linux-gnu-pdf-textlayout-vulkan.tar.gz
         sha256: b46e7061e6b9df792025acaf9b8b90180224c7cec63f4c3ce09af7ddddb8abfa
+        dest-filename: skia-binaries.tar.gz
+      - type: file
+        only-arches: [aarch64]
+        url: https://github.com/rust-skia/skia-binaries/releases/download/0.87.0/skia-binaries-e551f334ad5cbdf43abf-aarch64-unknown-linux-gnu-pdf-textlayout-vulkan.tar.gz
+        sha256: 6994fb993064d7d4fff00bf7c79544ffc881bb5441b6768b31cc088540f4bef7
         dest-filename: skia-binaries.tar.gz

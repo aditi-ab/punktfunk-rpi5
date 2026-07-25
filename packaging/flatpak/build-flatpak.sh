@@ -16,6 +16,12 @@
 #                      iteration, non-reproducible). Default: offline (regenerates cargo-sources).
 #   BUILDER=...        override the flatpak-builder invocation (default: auto-detect host
 #                      flatpak-builder, else `flatpak run org.flatpak.Builder`).
+#   ARCH=...           target architecture (default: this machine's). `aarch64` builds the arm64
+#                      client — the manifest carries the per-arch PKG_CONFIG_PATH and the matching
+#                      prebuilt Skia archive. NOTE this is not a cross-compile: flatpak-builder
+#                      runs the build inside a sandbox for that arch, so building aarch64 on an
+#                      x86_64 box needs qemu binfmt registered and is very slow. Run it on an
+#                      arm64 machine.
 set -euo pipefail
 
 ROOTDIR="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -25,7 +31,11 @@ APP_ID="io.unom.Punktfunk"
 MANIFEST="packaging/flatpak/io.unom.Punktfunk.yml"
 VERSION="${VERSION:-$(git describe --tags --always --dirty 2>/dev/null || echo 0.0.1-dev)}"
 VERSION="${VERSION#v}"
-BUNDLE="dist/punktfunk-client-${VERSION}.flatpak"
+# `flatpak --default-arch` reports flatpak's own name for this machine (x86_64 / aarch64).
+ARCH="${ARCH:-$(flatpak --default-arch 2>/dev/null || uname -m)}"
+# Arch-suffixed so an x86_64 and an aarch64 bundle can sit in dist/ together instead of the
+# second silently overwriting the first. (CI composes its own published filename.)
+BUNDLE="dist/punktfunk-client-${VERSION}-${ARCH}.flatpak"
 
 # --- pick a flatpak-builder (host binary, or the org.flatpak.Builder flatpak on the Deck) ---
 if [ -n "${BUILDER:-}" ]; then
@@ -72,18 +82,19 @@ else
 fi
 
 # --- build into a local ostree repo, then export a single-file bundle --------------------
-echo "==> flatpak-builder ($APP_ID, version $VERSION)"
+echo "==> flatpak-builder ($APP_ID, version $VERSION, arch $ARCH)"
 # --default-branch=stable matches CI / the hosted repo ref, so a locally-built install can also
 # track flatpak.unom.io. build-bundle must then be told the branch (else it defaults to `master`).
 "${FPB[@]}" --user --force-clean --disable-rofiles-fuse \
   --default-branch=stable \
+  --arch="$ARCH" \
   --install-deps-from=flathub \
   "${EXTRA_ARGS[@]}" \
   --repo="$ROOTDIR/.flatpak-repo" \
   "$ROOTDIR/.flatpak-build" "$MANIFEST"
 
 mkdir -p dist
-flatpak build-bundle "$ROOTDIR/.flatpak-repo" "$BUNDLE" "$APP_ID" stable
+flatpak build-bundle --arch="$ARCH" "$ROOTDIR/.flatpak-repo" "$BUNDLE" "$APP_ID" stable
 echo "built $BUNDLE"
 ls -lh "$BUNDLE"
 echo
