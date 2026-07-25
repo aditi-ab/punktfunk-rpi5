@@ -70,6 +70,24 @@ fn apply_hdr(base: u32, hdr: bool) -> u32 {
 /// negotiates a codec the encoder can't open. NVENC and the GPU-less software path keep the
 /// Moonlight-validated static superset. HDR (Main10) is layered on by [`codec_mode_support`].
 fn base_codec_mode_support() -> u32 {
+    // A GPU-less host encodes H.264 and nothing else (openh264), so advertising the superset made
+    // Moonlight negotiate HEVC/AV1 and the session then died at encoder open with "the software
+    // encoder emits H.264 only". `pf_encode::Codec::host_wire_caps` — the native plane's twin of
+    // this function — has gated on exactly this since it was written; this one never did.
+    //
+    // Deliberately a local gate rather than delegating wholesale to `host_wire_caps()`: that would
+    // be the drift-proof shape, but on Windows it re-runs the DXGI adapter enumeration several
+    // times per `/serverinfo` GET (the probe helpers each sample it), and this endpoint is polled.
+    // The software case is a plain config read, so it costs nothing here. (Follow-up worth doing:
+    // the static `MaxLumaPixelsHEVC` in the XML above still advertises an HEVC limit even when the
+    // mask drops HEVC — harmless, since Moonlight gates on the mask, but it is a second and now
+    // inconsistent advertisement.)
+    if matches!(
+        pf_host_config::config().encoder_pref.as_str(),
+        "software" | "sw" | "openh264"
+    ) {
+        return super::SCM_H264;
+    }
     #[cfg(target_os = "linux")]
     if crate::encode::linux_zero_copy_is_vaapi() {
         if let Some(m) = probed_mask(crate::encode::vaapi_codec_support()) {
