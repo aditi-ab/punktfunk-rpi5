@@ -1610,4 +1610,64 @@ mod tests {
         };
         assert_eq!(none.wire_mask(), None);
     }
+
+    /// WP7.7 guard (the cheap half): every `Encoder` trait method must be explicitly forwarded by
+    /// `TrackedEncoder`. A defaulted trait method that isn't forwarded silently no-ops through the
+    /// wrapper — the trap has bitten three times (`set_wire_chunking`'s §4.4 chunking probe,
+    /// `set_pipelined`'s LN3 escalation, `applied_bitrate_bps`'s ABR truth), and every Phase 7
+    /// consolidation that adds a trait method re-arms it. Source-text parse, not reflection: both
+    /// blocks are top-level rustfmt items, so each ends at the first column-0 `}` and every method
+    /// name sits on a line starting `fn ` (a wrapped signature still carries the name there).
+    #[test]
+    fn tracked_encoder_forwards_every_trait_method() {
+        fn item_block<'a>(src: &'a str, marker: &str) -> &'a str {
+            let start = src
+                .find(marker)
+                .unwrap_or_else(|| panic!("marker {marker:?} not found — update this guard"));
+            let body = &src[start..];
+            let end = body
+                .find("\n}")
+                .unwrap_or_else(|| panic!("no column-0 close brace after {marker:?}"));
+            &body[..end]
+        }
+        fn fn_names(block: &str) -> std::collections::BTreeSet<&str> {
+            block
+                .lines()
+                .map(str::trim_start)
+                .filter(|l| !l.starts_with("//"))
+                .filter_map(|l| l.strip_prefix("fn "))
+                .map(|rest| {
+                    rest.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                        .next()
+                        .expect("split yields at least one item")
+                })
+                .collect()
+        }
+        // `find` takes the FIRST occurrence: the real impl precedes this test's own copy of the
+        // marker string in the included source.
+        let trait_fns = fn_names(item_block(
+            include_str!("enc/codec.rs"),
+            "pub trait Encoder: Send {",
+        ));
+        let impl_fns = fn_names(item_block(
+            include_str!("lib.rs"),
+            "impl Encoder for TrackedEncoder {",
+        ));
+        assert!(
+            trait_fns.len() >= 12,
+            "only {} trait methods parsed — the extraction markers have rotted, fix the parse \
+             before trusting this guard",
+            trait_fns.len()
+        );
+        let missing: Vec<_> = trait_fns.difference(&impl_fns).collect();
+        assert!(
+            missing.is_empty(),
+            "Encoder methods NOT forwarded by TrackedEncoder: {missing:?} — the host loop only \
+             ever holds the wrapped box, so an unforwarded default silently disables the feature \
+             for every session. Forward each one in `impl Encoder for TrackedEncoder`."
+        );
+        // The reverse direction (impl fn absent from the trait) is a compile error, so equality
+        // here is pure belt-and-braces against a parse regression.
+        assert_eq!(trait_fns, impl_fns);
+    }
 }
