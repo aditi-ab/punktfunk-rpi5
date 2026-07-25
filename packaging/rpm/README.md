@@ -123,3 +123,24 @@ docker run --rm -v "$PWD:/src" -w /src punktfunk-fedora-rpm \
 
 A plain `rpmbuild`/COPR build with no `pf_version`/`pf_release` defines produces `0.3.0-1` (the
 spec defaults).
+
+### aarch64 — the client RPM
+
+The **client** builds for aarch64; the **host** does not (its encode stack is NVENC/QSV/AMF, all
+x86). `PF_WITHOUT_HOST=1` drops the host binary, the tray, the headless-session data, the
+firewalld services and the main package's `%files`, leaving exactly one RPM: `punktfunk-client`.
+Omitting the main `%files` is what keeps rpm from emitting an empty `punktfunk` next to it.
+
+This is **not** a cross-compile — `%build` runs cargo for the host architecture, so run it on an
+arm64 machine (or an emulated arm64 container, which is very slow):
+
+```sh
+docker build --platform linux/arm64 -f ci/fedora-rpm.Dockerfile -t punktfunk-fedora-rpm-arm64 ci
+docker run --rm --platform linux/arm64 -v "$PWD:/src" -w /src punktfunk-fedora-rpm-arm64 \
+  bash -lc 'git config --global --add safe.directory /src && \
+            PF_VERSION=0.0.1 PF_WITHOUT_HOST=1 bash packaging/rpm/build-rpm.sh'
+# -> dist/punktfunk-client-0.0.1-1.fcNN.aarch64.rpm
+```
+
+`PF_WITHOUT_HOST=1` works on x86_64 too, if you only want the client RPM. The flag is orthogonal
+to the architecture; it is just that aarch64 has no other option.

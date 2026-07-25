@@ -19,6 +19,11 @@ WEB_OPT=()
 # requirement as web; default off so a bare `rpmbuild`/COPR still works.
 SCRIPTING_OPT=()
 [ "${PF_WITH_SCRIPTING:-0}" = "1" ] && SCRIPTING_OPT=(--with scripting)
+# PF_WITHOUT_HOST=1 drops the host binary, the tray and the main package, leaving only
+# punktfunk-client. This is what an aarch64 build uses: the client is portable, the host's encode
+# stack (NVENC/QSV/AMF) is x86. Harmless on x86_64 too, if you only want the client RPM.
+HOST_OPT=()
+[ "${PF_WITHOUT_HOST:-0}" = "1" ] && HOST_OPT=(--without host)
 ROOTDIR="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOTDIR"
 
@@ -39,7 +44,7 @@ git archive --format=tar.gz --prefix="punktfunk-${PF_VERSION}/" \
 # undefined cuStreamCreateWithPriority/cuMemcpy2DAsync_v2/…; this regen supersedes it.) Defining
 # extra unused symbols is harmless; a missing one fails the link. Only when /usr/lib64 is writable
 # (CI image runs as root) — COPR/mock provides the real cuda-cudart-devel stub instead.
-if [ "$(id -u)" = 0 ] && [ -d /usr/lib64 ]; then
+if [ "${PF_WITHOUT_HOST:-0}" != "1" ] && [ "$(id -u)" = 0 ] && [ -d /usr/lib64 ]; then
   CU_SYMS="$(grep -rhoE '\bcu[A-Z][A-Za-z0-9_]*' crates/punktfunk-host/src/ | sort -u || true)"
   if [ -n "$CU_SYMS" ]; then
     STUB_C="$(mktemp --suffix=.c)"
@@ -55,7 +60,7 @@ fi
 # resolves them from RPMs. Our builder image provides the toolchain via rustup (so
 # rust-toolchain.toml's pinned channel works) and the -devel libs via dnf, neither of which
 # rpmbuild's RPM-level check sees — skip it; a genuinely missing dep fails the compile/link.
-rpmbuild -bb --nodeps "${WEB_OPT[@]}" "${SCRIPTING_OPT[@]}" \
+rpmbuild -bb --nodeps "${WEB_OPT[@]}" "${SCRIPTING_OPT[@]}" "${HOST_OPT[@]}" \
   --define "_topdir $TOP" \
   --define "pf_version ${PF_VERSION}" \
   --define "pf_release ${PF_RELEASE}" \
@@ -63,6 +68,12 @@ rpmbuild -bb --nodeps "${WEB_OPT[@]}" "${SCRIPTING_OPT[@]}" \
 
 mkdir -p dist
 find "$TOP/RPMS" -name '*.rpm' -exec cp -v {} dist/ \;
-echo "== Requires (must NOT contain libcuda) =="
-rpm -qp --requires dist/punktfunk-${PF_VERSION}-*.rpm 2>/dev/null | grep -iE 'cuda|nvidia' \
-  && echo "  !! NVIDIA/CUDA leak !!" || echo "  clean"
+# The libcuda leak check applies to the HOST package (the only thing that links the driver); a
+# client-only build has no such package to inspect.
+if [ "${PF_WITHOUT_HOST:-0}" = "1" ]; then
+  echo "== client-only build: no host RPM, libcuda check not applicable =="
+else
+  echo "== Requires (must NOT contain libcuda) =="
+  rpm -qp --requires dist/punktfunk-${PF_VERSION}-*.rpm 2>/dev/null | grep -iE 'cuda|nvidia' \
+    && echo "  !! NVIDIA/CUDA leak !!" || echo "  clean"
+fi

@@ -31,10 +31,10 @@ URL:            https://git.unom.io/unom/punktfunk
 # COPR SCM builds provide the checkout; for a tarball build, drop a git archive here:
 Source0:        %{name}-%{version}.tar.gz
 
-# punktfunk-host is Linux-only and links system FFmpeg/PipeWire/Opus. x86_64 only for now: encode
-# is NVENC (desktop NVIDIA) and no aarch64 build is produced/published by CI — claiming aarch64
-# here would advertise an arch we never ship. Re-add aarch64 once there's an arm64 build leg.
-ExclusiveArch:  x86_64
+# punktfunk-host is Linux-only and links system FFmpeg/PipeWire/Opus. The HOST is x86_64 only —
+# its encode stack is NVENC/QSV/AMF — but the CLIENT builds and runs fine on aarch64, so the spec
+# accepts both arches and `--without host` (below) selects the client-only build.
+ExclusiveArch:  x86_64 aarch64
 
 # The zerocopy FFI links the NVIDIA driver's libcuda.so.1; rpm's auto-dep generator would turn
 # that into a hard Requires on libcuda.so.1 (and we never want to pin the driver — NVENC/EGL come
@@ -54,6 +54,14 @@ ExclusiveArch:  x86_64
 # image has bun and builds with `--with scripting`, so the Gitea RPM registry carries it. Mirrors the
 # Debian punktfunk-scripting .deb.
 %bcond_with scripting
+
+# The HOST half of this spec (the punktfunk package itself + the tray). ON by default, so an
+# ordinary x86_64 build is unchanged. `--without host` drops the host binary, the tray, the
+# headless-session data, the firewalld services and the main %%files section entirely, leaving
+# only punktfunk-client — which is what an aarch64 build produces, since the host's encode stack
+# (NVENC/QSV/AMF) is x86 and the client's is not. Omitting the main %%files is what stops rpm
+# from emitting an empty `punktfunk` package alongside the client.
+%bcond_without host
 
 # --- Build toolchain ---------------------------------------------------------
 BuildRequires:  cargo
@@ -211,14 +219,21 @@ export PUNKTFUNK_BUILD_VERSION="%{version}-%{release}"
 # with real RFI (clean P-frame recovery anchor via DPB reference slots; design/linux-vulkan-video-encode.md).
 # Pure Rust `ash` (no new lib / no link-time dep); default on for HEVC (PUNKTFUNK_VULKAN_ENCODE=0 opts
 # back to libav VAAPI), and a failed open falls back to VAAPI so unsupported devices degrade gracefully.
+%if %{with host}
 cargo build --release --locked --features punktfunk-host/nvenc,punktfunk-host/vulkan-encode \
   -p punktfunk-host -p punktfunk-client-linux -p punktfunk-client-session
+%else
+# Client-only (aarch64): no host crate, so none of the encode features apply.
+cargo build --release --locked -p punktfunk-client-linux -p punktfunk-client-session
+%endif
 # The status tray in its OWN cargo invocation — load-bearing, not tidiness. Cargo unifies features
 # across everything in one build, so co-building the tray with the host pulls the host's
 # ashpd -> zbus/tokio onto the tray's shared zbus; the tray (ksni async-io + blocking, no tokio
 # runtime by design) then panics at startup ("there is no reactor running, must be called from the
 # context of a Tokio 1.x runtime"). Built alone, its zbus stays on async-io. (Same split the .deb does.)
+%if %{with host}
 cargo build --release --locked -p punktfunk-tray
+%endif
 
 %if %{with web}
 # Management web console: build the Nitro SSR bundle with bun (the `bun` preset + our Bun.serve
@@ -243,6 +258,7 @@ fi
 %endif
 
 %install
+%if %{with host}
 # Binary
 install -Dm0755 target/release/punktfunk-host %{buildroot}%{_bindir}/punktfunk-host
 
@@ -294,6 +310,7 @@ for sz in 22x22 48x48; do
     install -Dm0644 "$png" %{buildroot}%{_datadir}/icons/hicolor/$sz/apps/"$(basename "$png")"
   done
 done
+%endif
 
 # --- client subpackage ---
 install -Dm0755 target/release/punktfunk-client %{buildroot}%{_bindir}/punktfunk-client
@@ -311,6 +328,7 @@ install -Dm0644 scripts/70-punktfunk-client.rules \
 install -Dm0644 scripts/99-punktfunk-client-net.conf \
                 %{buildroot}%{_prefix}/lib/sysctl.d/99-punktfunk-client-net.conf
 
+%if %{with host}
 # Headless session helpers + example config + OpenAPI doc (reference material).
 install -d %{buildroot}%{_datadir}/%{name}/headless
 install -Dm0755 scripts/headless/run-headless-kde.sh   %{buildroot}%{_datadir}/%{name}/headless/run-headless-kde.sh
@@ -344,6 +362,7 @@ install -Dm0644 packaging/linux/punktfunk-native.xml \
 # Web console opener (TCP 47992) — only meaningful with the web subpackage, opened deliberately.
 install -Dm0644 packaging/linux/punktfunk-web.xml \
                 %{buildroot}%{_prefix}/lib/firewalld/services/punktfunk-web.xml
+%endif
 
 %if %{with web}
 # --- web console subpackage (punktfunk-web) ---
@@ -383,6 +402,7 @@ chmod 0755 %{buildroot}%{_bindir}/punktfunk-scripting
 install -Dm0644 scripts/punktfunk-scripting.service %{buildroot}%{_userunitdir}/punktfunk-scripting.service
 %endif
 
+%if %{with host}
 %files
 %license LICENSE-MIT LICENSE-APACHE THIRD-PARTY-NOTICES.txt
 %doc README.md packaging/README.md
@@ -407,6 +427,7 @@ install -Dm0644 scripts/punktfunk-scripting.service %{buildroot}%{_userunitdir}/
 %config(noreplace) /etc/gamescope-session-plus/sessions.d/steam
 %dir %{_datadir}/%{name}
 %{_datadir}/%{name}/*
+%endif
 
 %files client
 %license LICENSE-MIT LICENSE-APACHE THIRD-PARTY-NOTICES.txt
@@ -450,6 +471,7 @@ udevadm trigger --subsystem-match=hidraw 2>/dev/null || :
 # rpm-ostree it takes effect on the next boot into the layered deployment).
 sysctl -p %{_prefix}/lib/sysctl.d/99-punktfunk-client-net.conf >/dev/null 2>&1 || :
 
+%if %{with host}
 %post
 # Reload udev so /dev/uinput picks up the new rule without a reboot (best-effort).
 udevadm control --reload-rules 2>/dev/null || :
@@ -474,6 +496,7 @@ if command -v punktfunk-host >/dev/null 2>&1; then
         echo "$conflict"
     fi
 fi
+%endif
 
 %if %{with web}
 %post web
