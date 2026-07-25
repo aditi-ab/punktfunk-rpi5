@@ -1620,7 +1620,12 @@ impl VulkanVideoEncoder {
         } else {
             (src_w, src_h)
         };
-        let need = (iw * ih * 4) as u64;
+        // Widened BEFORE the multiply, not after: `(iw * ih * 4) as u64` multiplied in u32 and
+        // widened the result, so it agreed with the usize slice length below only while
+        // `iw * ih <= 2^30`. The 8192 dimension cap leaves 16x of margin, but the padded-write arm
+        // now sizes a raw-pointer slice from these numbers, and `read_slot` already applies exactly
+        // this discipline to driver-reported sizes for exactly this reason.
+        let need = iw as u64 * ih as u64 * 4;
         if self.frames[slot]
             .cpu_img
             .map(|(_, _, _, f, iw, ih)| (f, iw, ih))
@@ -1699,26 +1704,28 @@ impl VulkanVideoEncoder {
         }
         let (_, m, _) = self.frames[slot].cpu_stage.unwrap();
         // RGB-direct sessions upload the image the ENCODER reads directly, so an undersized
-        // source (unaligned mode) must be padded here — rows/columns duplicated from the edge,
-        // matching the CSC shader's clamped reads (and record_pad_blit's GPU-side equivalent).
-        // The CSC path keeps the raw copy: its shader clamps at sample time.
-        let padded_owned: Vec<u8>;
-        let upload: &[u8] = if self.rgb.is_some() && (src_w != w || src_h != h) {
+        // source (unaligned mode) must be padded — rows/columns duplicated from the edge, matching
+        // the CSC shader's clamped reads (and `record_pad_blit`'s GPU-side equivalent). The CSC
+        // path keeps the raw copy: its shader clamps at sample time, and it DELIBERATELY supports a
+        // source smaller than the encode extent — so none of the guards below may be hoisted out of
+        // this branch, they are only sound because `self.rgb.is_some()`.
+        //
+        // Every fallible step stays ABOVE the map: an error raised between `map_memory` and
+        // `unmap_memory` would strand the mapping for the life of this slot's staging buffer.
+        let pad = if self.rgb.is_some() && (src_w != w || src_h != h) {
             let (sw, sh) = (src_w as usize, src_h as usize);
-            let (dw, dh) = (w as usize, h as usize);
-            if bytes.len() < sw * sh * 4 {
-                bail!(
-                    "vulkan-encode (rgb-direct): CPU frame {}x{} needs {} bytes, got {}",
-                    src_w,
-                    src_h,
-                    sw * sh * 4,
-                    bytes.len()
-                );
+            // A zero axis makes `sh - 1` below underflow. It cannot arrive from a real capturer,
+            // but refusing it by name is what lets the padding write be infallible under the map.
+            if src_w == 0 || src_h == 0 {
+                bail!("vulkan-encode (rgb-direct): CPU frame has a zero axis ({src_w}x{src_h})");
             }
-            // The padding loop below only ever GROWS the source into the aligned extent. A source
+            // Extent FIRST, deliberately: the payload-length check below multiplies `sw * sh * 4`
+            // in usize on caller-supplied dimensions, so bounding them against the encode extent
+            // first is what keeps that multiply from overflowing on a garbage frame header.
+            // The padding write below only ever GROWS the source into the aligned extent. A source
             // larger than the encode extent is a contract violation (the Dmabuf arms already bail
-            // on it) and would panic here on the row `copy_from_slice`, so refuse it by name
-            // instead of unwinding out of the encode thread with an index message.
+            // on it) and would panic on the row `copy_from_slice`, so refuse it by name instead of
+            // unwinding out of the encode thread with an index message.
             if src_w > w || src_h > h {
                 bail!(
                     "vulkan-encode (rgb-direct): CPU frame {}x{} exceeds the encode extent {}x{} \
@@ -1729,26 +1736,68 @@ impl VulkanVideoEncoder {
                     h
                 );
             }
-            let mut out = vec![0u8; dw * dh * 4];
-            for y in 0..dh {
-                let sy = y.min(sh - 1);
-                let srow = &bytes[sy * sw * 4..][..sw * 4];
-                let drow = &mut out[y * dw * 4..][..dw * 4];
-                drow[..sw * 4].copy_from_slice(srow);
-                let mut last = [0u8; 4];
-                last.copy_from_slice(&srow[(sw - 1) * 4..]);
-                for x in sw..dw {
-                    drow[x * 4..(x + 1) * 4].copy_from_slice(&last);
-                }
+            if bytes.len() < sw * sh * 4 {
+                bail!(
+                    "vulkan-encode (rgb-direct): CPU frame {}x{} needs {} bytes, got {}",
+                    src_w,
+                    src_h,
+                    sw * sh * 4,
+                    bytes.len()
+                );
             }
-            padded_owned = out;
-            &padded_owned
+            // The `unsafe` slice below is sized from `(w, h)` while the staging buffer is sized
+            // from `need`. That equality is the precondition of the whole write, so CHECK it —
+            // here, above the map, in release. It was a `debug_assert!` below the map, which was
+            // wrong twice over: it made the one guard on the slice length vanish in the builds that
+            // ship, and a fired assert would have unwound past `unmap_memory` and stranded the
+            // mapping for the life of the slot (the next frame's `map_memory` then violates
+            // VUID-vkMapMemory-memory-00678). Unreachable under the 8192 dimension cap either way —
+            // but "every fallible step stays above the map" has to be true, not nearly true.
+            let dst_len = (w as usize)
+                .checked_mul(h as usize)
+                .and_then(|n| n.checked_mul(4))
+                .filter(|&n| n as u64 == need)
+                .context("vulkan-encode (rgb-direct): staging buffer is not the encode extent")?;
+            Some((sw, sh, dst_len))
         } else {
-            bytes
+            None
         };
         let p = dev.map_memory(m, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())? as *mut u8;
-        let n = upload.len().min(need as usize);
-        std::ptr::copy_nonoverlapping(upload.as_ptr(), p, n);
+        match pad {
+            // WP6.2(a): build the padded frame STRAIGHT into the staging memory. This used to
+            // allocate and zero-fill a whole padded frame every submit (8 MB at 1080p — 4K UHD is
+            // 64x16-aligned and never reaches this branch; the big case is an ultrawide like
+            // 3440x1440 -> 3456x1440, ~20 MB) and then memcpy it in here — with the zero-fill
+            // entirely dead, because the loop writes every byte of every row. Now: no per-frame
+            // allocation, no zero-fill, no page-fault storm over a fresh mapping, and one
+            // full-frame copy instead of two. Nothing reads back from `dst`, so writing into
+            // (possibly write-combined) host memory costs nothing extra — the row source is always
+            // `bytes`, never the destination.
+            Some((sw, sh, dst_len)) => {
+                let (dw, dh) = (w as usize, h as usize);
+                // SAFETY: `dst_len == dw * dh * 4 == need`, checked above the map, and the staging
+                // buffer is only kept when its size is >= `need`, so the mapping covers this slice.
+                // `make_host_buffer` allocates HOST_COHERENT memory, so the writes need no explicit
+                // flush before the transfer submitted below reads them. The guards above make every
+                // index here in-bounds by construction.
+                let dst = std::slice::from_raw_parts_mut(p, dst_len);
+                for y in 0..dh {
+                    let sy = y.min(sh - 1);
+                    let srow = &bytes[sy * sw * 4..][..sw * 4];
+                    let drow = &mut dst[y * dw * 4..][..dw * 4];
+                    drow[..sw * 4].copy_from_slice(srow);
+                    let mut last = [0u8; 4];
+                    last.copy_from_slice(&srow[(sw - 1) * 4..]);
+                    for x in sw..dw {
+                        drow[x * 4..(x + 1) * 4].copy_from_slice(&last);
+                    }
+                }
+            }
+            None => {
+                let n = bytes.len().min(need as usize);
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, n);
+            }
+        }
         dev.unmap_memory(m);
         Ok(self.frames[slot].cpu_img.unwrap().2)
     }
