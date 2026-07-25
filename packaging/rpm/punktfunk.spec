@@ -83,9 +83,19 @@ BuildRequires:  pkgconfig(opus)
 # FFmpeg dev headers with NVENC — from RPM Fusion (ffmpeg-devel), NOT ffmpeg-free.
 # Version-agnostic: ffmpeg-sys-next auto-detects the installed FFmpeg, so this builds
 # against FFmpeg 7.x (libavcodec 61, e.g. Fedora 43 / Bazzite) or 8.x (libavcodec 62).
+# ALL SEVEN modules, not just the three we call directly: `ffmpeg-next` is pulled with default
+# features, so its `-sys` build script pkg-config-probes codec/device/filter/format/util/
+# resampling/scaling and panics on the first one missing. RPM Fusion's ffmpeg-devel ships the lot
+# in one package, which hid the gap — on a box where these resolve to Fedora's split
+# libav*-free-devel packages instead, dnf installed only the three named here and the build died
+# in ffmpeg-sys-next's build.rs on `libavfilter`.
 BuildRequires:  pkgconfig(libavcodec)
+BuildRequires:  pkgconfig(libavdevice)
+BuildRequires:  pkgconfig(libavfilter)
 BuildRequires:  pkgconfig(libavformat)
 BuildRequires:  pkgconfig(libavutil)
+BuildRequires:  pkgconfig(libswresample)
+BuildRequires:  pkgconfig(libswscale)
 # Zero-copy GPU path: src/zerocopy/ links libGL + libgbm (mesa) via hand-rolled FFI.
 BuildRequires:  pkgconfig(gl)
 BuildRequires:  pkgconfig(gbm)
