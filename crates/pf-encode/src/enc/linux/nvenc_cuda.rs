@@ -870,6 +870,9 @@ impl NvencCudaEncoder {
                 e,
             ));
         }
+        // The handshake with the kernel module just succeeded — from here on, an
+        // `NV_ENC_ERR_INVALID_VERSION` in this process cannot be a driver version skew.
+        nvenc_status::note_session_opened();
         let wmax = self.get_cap(enc, nv::NV_ENC_CAPS::NV_ENC_CAPS_WIDTH_MAX);
         let hmax = self.get_cap(enc, nv::NV_ENC_CAPS::NV_ENC_CAPS_HEIGHT_MAX);
         let yuv444 = self.get_cap(enc, nv::NV_ENC_CAPS::NV_ENC_CAPS_SUPPORT_YUV444_ENCODE);
@@ -1067,6 +1070,7 @@ impl NvencCudaEncoder {
             }
             return Err(nvenc_status::call_err("open_encode_session_ex", e));
         }
+        nvenc_status::note_session_opened();
 
         let mut cfg = match self.build_config(enc, bitrate) {
             Ok(cfg) => cfg,

@@ -1488,7 +1488,9 @@ mod nvenc;
 #[path = "enc/linux/nvenc_cuda.rs"]
 mod nvenc_cuda;
 // Actionable `NVENCSTATUS` → cause mapping shared by both direct-NVENC backends, so a failed
-// session open logs "update/reboot the driver" instead of the old misleading "(no NVIDIA GPU?)".
+// session open names its real cause instead of the old misleading "(no NVIDIA GPU?)" — including
+// splitting the two opposite failures the driver reports as the SAME `INVALID_VERSION` (a genuine
+// driver skew vs. this process's driver state going bad after a session already opened).
 #[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "nvenc"))]
 #[path = "enc/nvenc_status.rs"]
 mod nvenc_status;

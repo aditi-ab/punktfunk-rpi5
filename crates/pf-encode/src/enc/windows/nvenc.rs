@@ -642,6 +642,9 @@ impl NvencD3d11Encoder {
                 e,
             ));
         }
+        // The handshake with the kernel-mode driver just succeeded — from here on, an
+        // `NV_ENC_ERR_INVALID_VERSION` in this process cannot be a driver version skew.
+        nvenc_status::note_session_opened();
         let wmax = self.get_cap(enc, nv::NV_ENC_CAPS::NV_ENC_CAPS_WIDTH_MAX);
         let hmax = self.get_cap(enc, nv::NV_ENC_CAPS::NV_ENC_CAPS_HEIGHT_MAX);
         let ten_bit = self.get_cap(enc, nv::NV_ENC_CAPS::NV_ENC_CAPS_SUPPORT_10BIT_ENCODE);
@@ -802,6 +805,7 @@ impl NvencD3d11Encoder {
             }
             return Err(nvenc_status::call_err("open_encode_session_ex", e));
         }
+        nvenc_status::note_session_opened();
 
         let mut cfg = match self.build_config(enc, bitrate) {
             Ok(cfg) => cfg,
@@ -1788,6 +1792,9 @@ fn probe_encode_cap(codec: Codec, cap: nv::NV_ENC_CAPS) -> bool {
             }
             return false;
         }
+        // Availability probe, but a real session open all the same: it proves the driver accepted
+        // this build's version word, which is what rules a skew out later (see `nvenc_status`).
+        nvenc_status::note_session_opened();
         let mut param = nv::NV_ENC_CAPS_PARAM {
             version: nv::NV_ENC_CAPS_PARAM_VER,
             capsToQuery: cap,
