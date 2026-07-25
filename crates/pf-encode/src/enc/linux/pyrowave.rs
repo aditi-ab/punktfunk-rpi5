@@ -75,22 +75,9 @@ pub(crate) fn capture_modifiers(fourcc: u32) -> Vec<u64> {
         ) else {
             return Vec::new();
         };
-        // Same device selection as `open_inner`: the first real GPU with graphics+compute.
-        let pd = instance
-            .enumerate_physical_devices()
-            .unwrap_or_default()
-            .into_iter()
-            .find(|&pd| {
-                instance.get_physical_device_properties(pd).device_type
-                    != vk::PhysicalDeviceType::CPU
-                    && instance
-                        .get_physical_device_queue_family_properties(pd)
-                        .iter()
-                        .any(|q| {
-                            q.queue_flags
-                                .contains(vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE)
-                        })
-            });
+        // The SAME device selection `open_inner` uses — these modifiers are what the capturer
+        // will allocate against, so the two must never diverge (see `select_physical_device`).
+        let pd = select_physical_device(&instance).ok().map(|p| p.pd);
         let mods = pd
             .map(|pd| {
                 let mut list = vk::DrmFormatModifierPropertiesListEXT::default();
@@ -117,6 +104,198 @@ pub(crate) fn capture_modifiers(fourcc: u32) -> Vec<u64> {
         instance.destroy_instance(None);
         mods
     }
+}
+
+/// The render node whose owner the WP4.5 observability line names alongside the picked device:
+/// `PUNKTFUNK_RENDER_NODE` (the house DRM-node override) else `/dev/dri/renderD128`.
+/// **Log-only** — see [`select_physical_device`] for why no oracle, this one included, is
+/// allowed to CHANGE the selection.
+fn capture_anchor_node() -> std::path::PathBuf {
+    std::env::var("PUNKTFUNK_RENDER_NODE")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("/dev/dri/renderD128"))
+}
+
+/// `(major, minor)` of a device node, split the way `VkPhysicalDeviceDrmPropertiesEXT` reports
+/// its render node (glibc `gnu_dev_major`/`gnu_dev_minor` encoding).
+fn node_rdev(path: &std::path::Path) -> Option<(i64, i64)> {
+    use std::os::unix::fs::MetadataExt;
+    let rdev = std::fs::metadata(path).ok()?.rdev();
+    let major = ((rdev >> 8) & 0xfff) | ((rdev >> 32) & !0xfffu64);
+    let minor = (rdev & 0xff) | ((rdev >> 12) & !0xffu64);
+    Some((major as i64, minor as i64))
+}
+
+/// The node's PCI address `(domain, bus, device, function)` from sysfs — the
+/// `VK_EXT_pci_bus_info` fallback for drivers without `VK_EXT_physical_device_drm`.
+fn node_pci_address(path: &std::path::Path) -> Option<(u32, u32, u32, u32)> {
+    let node = path.file_name()?.to_str()?;
+    let dev = std::fs::canonicalize(format!("/sys/class/drm/{node}/device")).ok()?;
+    let addr = dev.file_name()?.to_str()?; // e.g. "0000:01:00.0"
+    let (rest, func) = addr.rsplit_once('.')?;
+    let mut parts = rest.split(':');
+    let domain = u32::from_str_radix(parts.next()?, 16).ok()?;
+    let bus = u32::from_str_radix(parts.next()?, 16).ok()?;
+    let device = u32::from_str_radix(parts.next()?, 16).ok()?;
+    Some((domain, bus, device, u32::from_str_radix(func, 16).ok()?))
+}
+
+/// The Vulkan features pyrowave's encoder documents as required (pyrowave.h): shaderInt16,
+/// storageBuffer8BitAccess, timeline semaphores, subgroup size control (1.3 core);
+/// shaderFloat16 is optional. Checked AFTER selection, as it always was — folding it into the
+/// selection predicate was considered for WP4.5 and rejected: a fall-through to a non-display
+/// GPU can strand the session on a device that cannot import the capturer's buffers, which
+/// feeds the process-wide raw-dmabuf latch, while the hard `bail!` is an immediate,
+/// diagnosable, latch-free failure the session layer renegotiates around.
+///
+/// # Safety
+/// `instance` must be live; issues only physical-device feature queries.
+unsafe fn missing_features(instance: &ash::Instance, pd: vk::PhysicalDevice) -> Vec<&'static str> {
+    let mut have12 = vk::PhysicalDeviceVulkan12Features::default();
+    let mut have13 = vk::PhysicalDeviceVulkan13Features::default();
+    let mut have2 = vk::PhysicalDeviceFeatures2::default()
+        .push_next(&mut have12)
+        .push_next(&mut have13);
+    instance.get_physical_device_features2(pd, &mut have2);
+    [
+        (have2.features.shader_int16 == vk::TRUE, "shaderInt16"),
+        (
+            have12.storage_buffer8_bit_access == vk::TRUE,
+            "storageBuffer8BitAccess",
+        ),
+        (have12.timeline_semaphore == vk::TRUE, "timelineSemaphore"),
+        (
+            have13.subgroup_size_control == vk::TRUE,
+            "subgroupSizeControl",
+        ),
+        (
+            have13.compute_full_subgroups == vk::TRUE,
+            "computeFullSubgroups",
+        ),
+        (have13.synchronization2 == vk::TRUE, "synchronization2"),
+    ]
+    .iter()
+    .filter(|(ok, _)| !ok)
+    .map(|(_, n)| *n)
+    .collect()
+}
+
+/// Does `pd` own the anchor render node? `VK_EXT_physical_device_drm`'s render major/minor is
+/// the primary identity (unique per GPU — it disambiguates twin-model GPUs that
+/// `(vendor, device)` cannot); `VK_EXT_pci_bus_info` against the node's sysfs PCI address is the
+/// fallback. A device advertising neither extension never matches.
+///
+/// # Safety
+/// `instance` must be live; issues only physical-device property queries.
+unsafe fn device_owns_node(
+    instance: &ash::Instance,
+    pd: vk::PhysicalDevice,
+    rdev: Option<(i64, i64)>,
+    pci: Option<(u32, u32, u32, u32)>,
+) -> bool {
+    let exts = instance
+        .enumerate_device_extension_properties(pd)
+        .unwrap_or_default();
+    let has_ext =
+        |name: &std::ffi::CStr| exts.iter().any(|e| e.extension_name_as_c_str() == Ok(name));
+    if let Some((major, minor)) = rdev {
+        if has_ext(ash::ext::physical_device_drm::NAME) {
+            let mut drm = vk::PhysicalDeviceDrmPropertiesEXT::default();
+            let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut drm);
+            instance.get_physical_device_properties2(pd, &mut p2);
+            return drm.has_render == vk::TRUE
+                && drm.render_major == major
+                && drm.render_minor == minor;
+        }
+    }
+    if let Some((domain, bus, device, function)) = pci {
+        if has_ext(ash::ext::pci_bus_info::NAME) {
+            let mut pcip = vk::PhysicalDevicePCIBusInfoPropertiesEXT::default();
+            let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut pcip);
+            instance.get_physical_device_properties2(pd, &mut p2);
+            return pcip.pci_domain == domain
+                && pcip.pci_bus == bus
+                && pcip.pci_device == device
+                && pcip.pci_function == function;
+        }
+    }
+    false
+}
+
+/// The physical device this backend will run on.
+struct PickedDevice {
+    pd: vk::PhysicalDevice,
+    /// Index of a graphics+compute queue family on `pd` (pyrowave requires a graphics-capable
+    /// queue in the device create info; the CSC + codec run on it).
+    family: u32,
+    vendor_id: u32,
+    device_id: u32,
+}
+
+/// Pick pyrowave's physical device: the first non-CPU Vulkan device with a graphics+compute
+/// family — **the pre-WP4.5 behaviour, kept by decision after two withdrawn attempts to
+/// "fix" it**. What this function must never become:
+///
+/// - **Not `pf_gpu::selected_gpu()`** (withdrawn attempt #1): its Linux auto arm answers "the
+///   NVIDIA GPU" whenever `/dev/nvidiactl` exists, regardless of which GPU the capture pipeline
+///   runs on. On an Intel-compositor + NVIDIA-present laptop that moves the encoder onto the
+///   one GPU that CANNOT import the compositor's dmabufs → five same-device rebuilds → the
+///   process-wide raw-dmabuf latch degrades every later session to CPU capture, permanently.
+/// - **Not the `/dev/dri/renderD128` render node** (withdrawn attempt #2, this session): render
+///   minors are driver-BIND-ORDER artifacts, not display topology. On the common
+///   AMD-iGPU + NVIDIA-display desktop (in-tree amdgpu binds before out-of-tree nvidia),
+///   renderD128 is the idle iGPU while the compositor allocates on NVIDIA — anchoring there
+///   deterministically picks a device that cannot import the capturer's buffers and trips the
+///   same latch, with a success-looking log. The loader's first-device order is an
+///   ICD-manifest lottery, but on that desktop class it usually lands on the NVIDIA device —
+///   i.e. the status quo is accidentally right exactly where the anchor is deterministically
+///   wrong.
+///
+/// The only correct oracle is *evidence of which device allocated the capture buffers* —
+/// producer identity from the actual capture negotiation, threaded per session into this open.
+/// That is real plumbing (capture and encode negotiate in different crates today) and belongs
+/// to a change that can be measured on a hybrid rig; until then the selection stays put and
+/// `open_inner` logs the picked device beside the house's two guesses so a field report can
+/// finally SHOW a wrong-device topology instead of leaving it invisible.
+///
+/// ⚠ Shared by [`capture_modifiers`] and `open_inner` on purpose, and it must stay that way:
+/// `capture_modifiers` advertises the DRM modifiers the CAPTURER then allocates for. If the two
+/// disagreed about the device, capture would hand the encoder buffers it cannot import. Both
+/// call sites being pure functions of the (process-stable) Vulkan device list is what makes the
+/// agreement hold across an in-place resize's encoder re-open, which does NOT renegotiate
+/// capture.
+///
+/// # Safety
+/// `instance` must be live; only physical-device property/queue queries are issued against it.
+unsafe fn select_physical_device(instance: &ash::Instance) -> Result<PickedDevice> {
+    for pd in instance.enumerate_physical_devices()? {
+        let props = instance.get_physical_device_properties(pd);
+        if props.device_type == vk::PhysicalDeviceType::CPU {
+            continue; // skip llvmpipe
+        }
+        let Some(family) = instance
+            .get_physical_device_queue_family_properties(pd)
+            .iter()
+            .position(|q| {
+                q.queue_flags
+                    .contains(vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE)
+            })
+        else {
+            continue;
+        };
+        return Ok(PickedDevice {
+            pd,
+            family: family as u32,
+            vendor_id: props.vendor_id,
+            device_id: props.device_id,
+        });
+    }
+    Err(anyhow::anyhow!(
+        "no Vulkan GPU with a graphics+compute queue"
+    ))
 }
 
 fn pw_check(r: pw::pyrowave_result, what: &str) -> Result<()> {
@@ -292,62 +471,65 @@ impl PyroWaveEncoder {
         // SAFETY: plain physical-device queries on the live instance just created, and a
         // `create_device` whose create-infos are pinned in `hold` for the call's duration.
         let selected = (|| unsafe {
-            // Pick the first real GPU with a graphics+compute family (pyrowave requires a
-            // graphics-capable queue in the device create info; the CSC + codec run on it).
-            let (pd, family) = {
-                let mut found = None;
-                for pd in instance.enumerate_physical_devices()? {
-                    let props = instance.get_physical_device_properties(pd);
-                    if props.device_type == vk::PhysicalDeviceType::CPU {
-                        continue; // skip llvmpipe
-                    }
-                    let fam = instance
-                        .get_physical_device_queue_family_properties(pd)
-                        .iter()
-                        .position(|q| {
-                            q.queue_flags
-                                .contains(vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE)
-                        });
-                    if let Some(f) = fam {
-                        found = Some((pd, f as u32));
-                        break;
-                    }
+            // The SAME selector `capture_modifiers` uses, so the two can never disagree about
+            // the device (see `select_physical_device` — including why the selection itself is
+            // deliberately unchanged by WP4.5).
+            let picked = select_physical_device(&instance)?;
+            let (pd, family) = (picked.pd, picked.family);
+            // WP4.5, observability half (log-only BY DECISION — two selection "fixes" were
+            // withdrawn after review; the rationale lives on `select_physical_device`): one
+            // greppable line naming the picked device beside the house's two guesses at the
+            // right one. On a multi-GPU host a wrong-device session used to be completely
+            // invisible — a field report showed only downstream import failures. NO arm of this
+            // is a WARN on purpose: a mismatch between these fields is not evidence of a wrong
+            // pick (on an AMD-iGPU + NVIDIA-display desktop the loader's first device is right
+            // and renderD128 is wrong; on the hybrid laptop it is the reverse), and a warning
+            // that fires forever on healthy hosts only teaches people to ignore warnings.
+            let anchor = capture_anchor_node();
+            let anchor_owner = {
+                let rdev = node_rdev(&anchor);
+                let pci = node_pci_address(&anchor);
+                if rdev.is_none() && pci.is_none() {
+                    "unresolved".to_string()
+                } else {
+                    instance
+                        .enumerate_physical_devices()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .find(|&o| device_owns_node(&instance, o, rdev, pci))
+                        .map(|o| {
+                            let p = instance.get_physical_device_properties(o);
+                            format!("{:04x}:{:04x}", p.vendor_id, p.device_id)
+                        })
+                        .unwrap_or_else(|| "unmatched".to_string())
                 }
-                found.context("no Vulkan GPU with a graphics+compute queue")?
             };
+            let selected_gpu = pf_gpu::selected_gpu()
+                .map(|s| format!("{:04x}:{:04x}", s.info.vendor_id, s.info.device_id))
+                .unwrap_or_else(|| "none".to_string());
+            tracing::info!(
+                vendor_id = format_args!("{:04x}", picked.vendor_id),
+                device_id = format_args!("{:04x}", picked.device_id),
+                anchor = %anchor.display(),
+                anchor_owner = %anchor_owner,
+                selected_gpu = %selected_gpu,
+                "pyrowave: encoding on the first usable Vulkan GPU (a wrong-device report on a \
+                 multi-GPU host needs these fields)"
+            );
 
-            // Feature gate — pyrowave's documented encoder requirements (pyrowave.h): shaderInt16,
-            // storageBuffer8BitAccess, subgroup size control (1.3 core); shaderFloat16 is optional.
+            // Feature gate — pyrowave's documented encoder requirements; the re-query below
+            // reads back the optionals mirrored into the device create-info (shaderFloat16,
+            // vulkanMemoryModel, maintenance4).
+            let missing = missing_features(&instance, pd);
+            if !missing.is_empty() {
+                bail!("GPU lacks pyrowave-required Vulkan features: {missing:?}");
+            }
             let mut have12 = vk::PhysicalDeviceVulkan12Features::default();
             let mut have13 = vk::PhysicalDeviceVulkan13Features::default();
             let mut have2 = vk::PhysicalDeviceFeatures2::default()
                 .push_next(&mut have12)
                 .push_next(&mut have13);
             instance.get_physical_device_features2(pd, &mut have2);
-            let missing: Vec<&str> = [
-                (have2.features.shader_int16 == vk::TRUE, "shaderInt16"),
-                (
-                    have12.storage_buffer8_bit_access == vk::TRUE,
-                    "storageBuffer8BitAccess",
-                ),
-                (have12.timeline_semaphore == vk::TRUE, "timelineSemaphore"),
-                (
-                    have13.subgroup_size_control == vk::TRUE,
-                    "subgroupSizeControl",
-                ),
-                (
-                    have13.compute_full_subgroups == vk::TRUE,
-                    "computeFullSubgroups",
-                ),
-                (have13.synchronization2 == vk::TRUE, "synchronization2"),
-            ]
-            .iter()
-            .filter(|(ok, _)| !ok)
-            .map(|(_, n)| *n)
-            .collect();
-            if !missing.is_empty() {
-                bail!("GPU lacks pyrowave-required Vulkan features: {missing:?}");
-            }
 
             hold._feat2.features.shader_int16 = vk::TRUE;
             hold._v12.storage_buffer8_bit_access = vk::TRUE;
