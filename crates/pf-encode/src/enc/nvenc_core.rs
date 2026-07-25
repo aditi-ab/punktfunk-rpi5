@@ -153,6 +153,82 @@ mod tests {
 
     // These assume PUNKTFUNK_SPLIT_ENCODE is unset (CI); an operator override deliberately wins.
 
+    /// `encodeCodecConfig` is a C union, so the HEVC 4:4:4 arm must be codec-gated or it stamps
+    /// `hevcConfig` bytes onto another codec's config. Before the gate this branch was reached on
+    /// ANY codec with `chroma_444 && full_chroma_input` and stayed non-UB only because `lib.rs`
+    /// degrades 4:4:4 for non-HEVC — a two-file invariant with nothing asserting it.
+    ///
+    /// It also had to stop swallowing the per-codec bit-depth arm: this is an `if`/`else if`, so a
+    /// non-HEVC 4:4:4 session used to take the HEVC branch and get NEITHER 4:4:4 nor its own 10-bit
+    /// setup. AV1 asserts the depth it actually needs.
+    fn low_latency_cfg(codec: Codec, chroma_444: bool, bit_depth: u8) -> LowLatencyConfig {
+        LowLatencyConfig {
+            codec,
+            bitrate: 20_000_000,
+            fps: 60,
+            custom_vbv: false,
+            chroma_444,
+            full_chroma_input: true,
+            bit_depth,
+            av1_input_depth_minus8: 0,
+            hdr: false,
+            rfi_supported: false,
+            slices: 0,
+        }
+    }
+
+    #[test]
+    fn hevc_444_still_takes_the_frext_path() {
+        // `NV_ENC_CONFIG` must NOT be `mem::zeroed` — `frameFieldMode`/`mvPrecision` are C enums
+        // whose discriminants start at 1, so all-zero is not a valid value and Rust's own
+        // zero-init check aborts the process. Production seeds it the same way, from `Default`
+        // (then overwrites from the driver's preset).
+        // SAFETY: `apply_low_latency_config` only writes into the caller's config (union writes
+        // included) and makes no driver calls, so this is pure in-memory work.
+        let cfg = unsafe {
+            let mut cfg = nv::NV_ENC_CONFIG {
+                version: nv::NV_ENC_CONFIG_VER,
+                ..Default::default()
+            };
+            apply_low_latency_config(&mut cfg, low_latency_cfg(Codec::H265, true, 10));
+            cfg
+        };
+        assert_eq!(cfg.profileGUID, nv::NV_ENC_HEVC_PROFILE_FREXT_GUID);
+        // SAFETY: an HEVC session's union arm is `hevcConfig` — the one this path wrote.
+        unsafe {
+            assert_eq!(cfg.encodeCodecConfig.hevcConfig.chromaFormatIDC(), 3);
+            assert_eq!(cfg.encodeCodecConfig.hevcConfig.pixelBitDepthMinus8(), 2);
+        }
+    }
+
+    #[test]
+    fn av1_never_takes_the_hevc_444_union_write() {
+        // SAFETY: as above — pure in-memory config authoring, no driver involvement.
+        let cfg = unsafe {
+            let mut cfg = nv::NV_ENC_CONFIG {
+                version: nv::NV_ENC_CONFIG_VER,
+                ..Default::default()
+            };
+            apply_low_latency_config(&mut cfg, low_latency_cfg(Codec::Av1, true, 10));
+            cfg
+        };
+        // The HEVC FREXT profile GUID on an AV1 session is an INVALID_PARAM at open.
+        assert_ne!(
+            cfg.profileGUID,
+            nv::NV_ENC_HEVC_PROFILE_FREXT_GUID,
+            "4:4:4 on AV1 must not stamp the HEVC FREXT profile"
+        );
+        // ...and the AV1 arm must still have run, which the old if/else-if skipped entirely.
+        // SAFETY: an AV1 session's union arm is `av1Config`.
+        unsafe {
+            assert_eq!(
+                cfg.encodeCodecConfig.av1Config.pixelBitDepthMinus8(),
+                2,
+                "AV1 10-bit setup was swallowed by the HEVC 4:4:4 branch"
+            );
+        }
+    }
+
     #[test]
     fn split_forces_two_way_at_4k120() {
         // The regression this threshold constant exists for: 3840×2160×120 = 995,328,000 sat
@@ -368,7 +444,27 @@ pub(super) unsafe fn apply_low_latency_config(cfg: &mut nv::NV_ENC_CONFIG, c: Lo
     // profile) takes precedence and composes with 10-bit (Main 4:4:4 10); it needs a full-chroma-
     // capable input. Otherwise 10-bit selects Main10 (HEVC) or the AV1 output depth — stamping the
     // HEVC Main10 GUID onto an AV1 session is an INVALID_PARAM, so bit depth is set PER CODEC.
-    if c.chroma_444 && c.full_chroma_input {
+    // `encodeCodecConfig` is a C UNION, so the `hevcConfig` writes below are only meaningful on an
+    // HEVC session — on an H.264 or AV1 one they reinterpret that codec's own config bytes. The
+    // codec test is therefore load-bearing, not defensive: without it this branch was gated purely
+    // on `chroma_444 && full_chroma_input` and stayed non-UB only because `lib.rs` degrades 4:4:4
+    // for non-HEVC codecs. That was a two-file invariant with nothing asserting it, on the path
+    // BOTH direct-NVENC backends take.
+    //
+    // Being a codec test also fixes a second, quieter bug in the same shape: this is an
+    // `if`/`else if`, so a non-HEVC session that somehow arrived with `chroma_444` set took this
+    // branch and skipped the per-codec bit-depth arm entirely — ending up with neither HEVC 4:4:4
+    // (wrong for it) nor its own 10-bit configuration (simply missing). Non-HEVC now falls through
+    // to the arm that knows what to do with it.
+    let want_444 = c.chroma_444 && c.full_chroma_input;
+    if want_444 && c.codec != Codec::H265 {
+        tracing::warn!(
+            codec = ?c.codec,
+            "4:4:4 requested on a non-HEVC NVENC session — ignoring it (Range Extensions are \
+             HEVC-only); the negotiator should have degraded this to 4:2:0 before the open"
+        );
+    }
+    if want_444 && c.codec == Codec::H265 {
         cfg.profileGUID = nv::NV_ENC_HEVC_PROFILE_FREXT_GUID;
         cfg.encodeCodecConfig.hevcConfig.set_chromaFormatIDC(3);
         if c.bit_depth == 10 {
