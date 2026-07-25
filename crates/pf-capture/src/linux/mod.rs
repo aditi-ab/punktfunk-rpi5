@@ -2191,7 +2191,15 @@ mod pipewire {
         // consumer imports raw dmabufs itself — the VAAPI backend (libva import + GPU CSC) or a
         // PyroWave session (the wavelet encoder's own Vulkan device, any vendor) → hand the raw
         // dmabuf straight to the encoder.
-        let vaapi_passthrough = zerocopy && !force_shm && importer.is_none() && raw_passthrough;
+        //
+        // ...unless the encoder already proved it cannot import them here. A driver that refuses
+        // the compositor's buffers refuses them identically on every retry, so without this the
+        // session died on its first frame and every reconnect repeated it. The latch (set by the
+        // encode side after consecutive import failures) is what turns that into one bad session
+        // followed by a working, if slower, host.
+        let raw_dmabuf_off = raw_passthrough && pf_zerocopy::raw_dmabuf_import_disabled();
+        let vaapi_passthrough =
+            zerocopy && !force_shm && importer.is_none() && raw_passthrough && !raw_dmabuf_off;
         // Producer-side NV12 (default-on; PUNKTFUNK_PIPEWIRE_NV12=0 escapes): gamescope offers a
         // one-fd LINEAR NV12 image when the consumer asks — its compositor pass does the RGB→YUV,
         // and the Vulkan Video encoder imports the buffer as its encode source directly (no host
@@ -2248,6 +2256,12 @@ mod pipewire {
         if force_shm {
             tracing::info!(
                 "capture: PUNKTFUNK_FORCE_SHM — race-free SHM download path (no dmabuf, no zero-copy)"
+            );
+        } else if raw_dmabuf_off {
+            tracing::warn!(
+                "zero-copy raw-dmabuf passthrough disabled after repeated encoder import failures \
+                 — capturing CPU frames instead (this host's GPU driver would not import the \
+                 compositor's buffers)"
             );
         } else if zerocopy && !want_dmabuf {
             tracing::warn!("zero-copy: no importable dmabuf modifiers — using CPU path");

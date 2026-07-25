@@ -1025,8 +1025,18 @@ impl DmabufInner {
                 ffi::AV_BUFFERSRC_FLAG_KEEP_REF as c_int,
             );
             ffi::av_frame_free(&mut drm);
+            // These two stages ARE the import: the push hands libav our DRM-PRIME descriptor, and
+            // the pull is where `hwmap` actually maps it into a VA surface (and `scale_vaapi` runs
+            // the CSC). A failure here means this driver would not take this compositor's dmabuf —
+            // which no encoder rebuild can fix — so tell the process-wide latch, and capture
+            // negotiates CPU frames from the next session on. `avcodec_send_frame` below is
+            // deliberately NOT counted: that one is the encoder stalling, which the in-place
+            // rebuild above us exists to recover, and disabling zero-copy over it would be a
+            // permanent penalty for a transient fault.
             if r < 0 {
-                bail!("av_buffersrc_add_frame failed ({r})");
+                let e = format!("av_buffersrc_add_frame failed ({r})");
+                pf_zerocopy::note_raw_dmabuf_import_failure(&e);
+                bail!("{e}");
             }
             t_push = t0.elapsed();
             let mut nv12 = ffi::av_frame_alloc();
@@ -1036,8 +1046,11 @@ impl DmabufInner {
             let r = ffi::av_buffersink_get_frame(self.sink, nv12);
             if r < 0 {
                 ffi::av_frame_free(&mut nv12);
-                bail!("av_buffersink_get_frame failed ({r})");
+                let e = format!("av_buffersink_get_frame failed ({r})");
+                pf_zerocopy::note_raw_dmabuf_import_failure(&e);
+                bail!("{e}");
             }
+            pf_zerocopy::note_raw_dmabuf_import_ok();
             t_pull = t0.elapsed() - t_push;
             (*nv12).pts = pts;
             (*nv12).pict_type = if idr {

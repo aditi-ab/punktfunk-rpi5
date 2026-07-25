@@ -232,6 +232,48 @@ pub fn gpu_import_disabled() -> bool {
     GPU_IMPORT_DISABLED.load(Ordering::Relaxed)
 }
 
+/// The same idea for the OTHER zero-copy half: consecutive failures to import a raw dmabuf in the
+/// encoder (VAAPI's libva import, PyroWave's Vulkan one) with no successful frame in between.
+///
+/// That import can fail for reasons no retry can fix — a driver that will not take what the
+/// compositor allocates. The encode-stall recovery above it cannot tell the difference, so it
+/// rebuilt the identical failing encoder five times and then ended the video session, on every
+/// connection, forever: a hybrid Intel/NVIDIA laptop reporting `vaCreateSurfaces` →
+/// `VA_STATUS_ERROR_ALLOCATION_FAILED` on its first frame could not stream at all until its
+/// operator found `PUNKTFUNK_ZEROCOPY=0` by hand. The host already knows how to encode that
+/// machine — capture just has to stop handing it dmabufs. Latching here is what makes the next
+/// session negotiate CPU frames on its own.
+static RAW_DMABUF_FAILURE_STREAK: AtomicU32 = AtomicU32::new(0);
+static RAW_DMABUF_DISABLED: AtomicBool = AtomicBool::new(false);
+/// Below the encoder's own rebuild budget, so the latch is set before the session it doomed ends.
+const RAW_DMABUF_FAILURE_LATCH: u32 = 3;
+
+/// Record an encoder-side raw-dmabuf import failure. Latches the process-wide disable after
+/// [`RAW_DMABUF_FAILURE_LATCH`] consecutive failures.
+pub fn note_raw_dmabuf_import_failure(reason: &str) {
+    let streak = RAW_DMABUF_FAILURE_STREAK.fetch_add(1, Ordering::Relaxed) + 1;
+    if streak >= RAW_DMABUF_FAILURE_LATCH && !RAW_DMABUF_DISABLED.swap(true, Ordering::Relaxed) {
+        tracing::error!(
+            streak,
+            reason,
+            "zero-copy raw-dmabuf passthrough disabled for this host process: the encoder failed \
+             to import the compositor's dmabuf {streak} times in a row — captures fall back to the \
+             CPU path (slower, but this host could not stream at all otherwise)"
+        );
+    }
+}
+
+/// Record a raw dmabuf that imported and encoded — resets the failure streak.
+pub fn note_raw_dmabuf_import_ok() {
+    RAW_DMABUF_FAILURE_STREAK.store(0, Ordering::Relaxed);
+}
+
+/// True once repeated encoder import failures latched the raw-dmabuf passthrough off (see
+/// [`note_raw_dmabuf_import_failure`]).
+pub fn raw_dmabuf_import_disabled() -> bool {
+    RAW_DMABUF_DISABLED.load(Ordering::Relaxed)
+}
+
 /// DRM FourCC for a packed 32-bit format name (little-endian, e.g. `b"XR24"`).
 const fn fourcc(c: &[u8; 4]) -> u32 {
     (c[0] as u32) | ((c[1] as u32) << 8) | ((c[2] as u32) << 16) | ((c[3] as u32) << 24)
