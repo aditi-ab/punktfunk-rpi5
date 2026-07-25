@@ -37,9 +37,9 @@
 #![deny(clippy::undocumented_unsafe_blocks)]
 
 use super::nvenc_core::{
-    apply_low_latency_config, build_init_params, cached_ceiling, codec_guid, resolve_slices,
-    resolve_split_mode, resolve_subframe, store_ceiling, CeilingKey, LowLatencyConfig, NvStatusExt,
-    RFI_DPB,
+    apply_low_latency_config, build_init_params, cached_ceiling, codec_guid, plan_range_recovery,
+    resolve_slices, resolve_split_mode, resolve_subframe, store_ceiling, CeilingKey,
+    LowLatencyConfig, NvStatusExt, RangePlan,
 };
 use super::nvenc_status;
 use super::{ChromaFormat, Codec, EncodedFrame, Encoder, EncoderCaps};
@@ -1679,61 +1679,56 @@ impl Encoder for NvencD3d11Encoder {
     }
 
     fn invalidate_ref_frames(&mut self, first: i64, last: i64) -> bool {
-        // No live session, the GPU can't invalidate, or a nonsense range → caller forces a full IDR.
-        // (NVENC handles are single-threaded; this runs on the encode thread, like submit/poll.)
-        if self.encoder.is_null() || !self.rfi_supported || first < 0 || first > last {
+        // No live session or the GPU can't invalidate → caller forces a full IDR. (NVENC handles
+        // are single-threaded; this runs on the encode thread, like submit/poll.) Everything else
+        // — range validity, covering-range dedup, the DPB window, the clamp — is
+        // `nvenc_core::plan_range_recovery`, one policy for both direct-NVENC backends.
+        if self.encoder.is_null() || !self.rfi_supported {
             return false;
         }
-        // Already invalidated a covering range for this loss event — no new driver calls needed,
-        // no IDR. RE-ARM the anchor though: the client re-asking means the previous recovery
-        // anchor AU may itself have been lost, and the next frame is just as clean a re-anchor
-        // (it too references only valid frames).
-        if let Some((pf, pl)) = self.last_rfi_range {
-            if first >= pf && last <= pl {
+        match plan_range_recovery(first, last, self.frame_idx, self.last_rfi_range) {
+            // Already invalidated a covering range for this loss event — no new driver calls
+            // needed, no IDR. RE-ARM the anchor though: the client re-asking means the previous
+            // recovery anchor AU may itself have been lost, and the next frame is just as clean a
+            // re-anchor (it too references only valid frames).
+            RangePlan::Covered => {
                 self.pending_anchor = true;
-                return true;
+                true
             }
-        }
-        // `frame_idx` is the NEXT timestamp to assign, so the last encoded frame is `frame_idx - 1`
-        // and the DPB holds `[frame_idx - RFI_DPB, frame_idx - 1]`. A lost frame older than that
-        // can't be invalidated, so the only correct recovery is an IDR.
-        let oldest_in_dpb = self.frame_idx - RFI_DPB as i64;
-        if first < oldest_in_dpb {
-            return false;
-        }
-        // Clamp to frames we've actually encoded (don't invalidate a timestamp we never assigned).
-        let last = last.min(self.frame_idx - 1);
-        if first > last {
-            return false;
-        }
-        // Each input's `inputTimeStamp` is `frame_idx`, which `submit_indexed` pins to the WIRE
-        // frame index the AU carries — so the client's lost-frame range maps 1:1 onto the
-        // timestamps NVENC invalidates here, and stays 1:1 across encoder rebuilds/resets (an
-        // internal counter would desync on the first adaptive-bitrate rebuild and RFI would then
-        // clamp every range into first > last, silently degrading to IDR-only forever).
-        // SAFETY: `invalidate_ref_frames` is a function pointer from the runtime-loaded `EncodeApi` table.
-        // `self.encoder` was checked non-null at the top of this fn and is the live session; this runs
-        // on the encode thread (like submit/poll), so there is no concurrent NVENC use. Each `ts` was
-        // clamped to `[oldest_in_dpb, frame_idx - 1]` above, so it names a frame still in the session's
-        // DPB; the call passes only that `u64` timestamp (no struct), so there is no struct-size or
-        // lifetime concern.
-        unsafe {
-            for ts in first..=last {
-                if (api().invalidate_ref_frames)(self.encoder, ts as u64)
-                    .nv_ok()
-                    .is_err()
-                {
-                    return false; // any failure → fall back to IDR
+            RangePlan::Decline => false,
+            RangePlan::Invalidate { first, last } => {
+                // Each input's `inputTimeStamp` is `frame_idx`, which `submit_indexed` pins to the
+                // WIRE frame index the AU carries — so the client's lost-frame range maps 1:1 onto
+                // the timestamps NVENC invalidates here, and stays 1:1 across encoder
+                // rebuilds/resets (an internal counter would desync on the first adaptive-bitrate
+                // rebuild and RFI would then clamp every range into first > last, silently
+                // degrading to IDR-only forever).
+                // SAFETY: `invalidate_ref_frames` is a function pointer from the runtime-loaded
+                // `EncodeApi` table. `self.encoder` was checked non-null at the top of this fn and
+                // is the live session; this runs on the encode thread (like submit/poll), so there
+                // is no concurrent NVENC use. The plan clamped each `ts` to
+                // `[oldest_in_dpb, frame_idx - 1]`, so it names a frame still in the session's
+                // DPB; the call passes only that `u64` timestamp (no struct), so there is no
+                // struct-size or lifetime concern.
+                unsafe {
+                    for ts in first..=last {
+                        if (api().invalidate_ref_frames)(self.encoder, ts as u64)
+                            .nv_ok()
+                            .is_err()
+                        {
+                            return false; // any failure → fall back to IDR
+                        }
+                    }
                 }
+                self.last_rfi_range = Some((first, last));
+                // The next submitted frame is the first one encoded after the invalidation — the
+                // clean re-anchor P-frame. Arm the tag so its AU ships with `recovery_anchor` and
+                // the client lifts its post-loss freeze on it (instead of waiting ~1 s for the
+                // cooldown-suppressed IDR fallback).
+                self.pending_anchor = true;
+                true
             }
         }
-        self.last_rfi_range = Some((first, last));
-        // The next submitted frame is the first one encoded after the invalidation — the clean
-        // re-anchor P-frame. Arm the tag so its AU ships with `recovery_anchor` and the client
-        // lifts its post-loss freeze on it (instead of waiting ~1 s for the cooldown-suppressed
-        // IDR fallback).
-        self.pending_anchor = true;
-        true
     }
 
     fn poll(&mut self) -> Result<Option<EncodedFrame>> {

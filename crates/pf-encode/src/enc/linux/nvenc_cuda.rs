@@ -61,9 +61,9 @@
 #![deny(clippy::undocumented_unsafe_blocks)]
 
 use super::nvenc_core::{
-    apply_low_latency_config, build_init_params, cached_ceiling, codec_guid, resolve_slices,
-    resolve_split_mode, resolve_subframe, store_ceiling, CeilingKey, LowLatencyConfig, NvStatusExt,
-    RFI_DPB,
+    apply_low_latency_config, build_init_params, cached_ceiling, codec_guid, plan_range_recovery,
+    resolve_slices, resolve_split_mode, resolve_subframe, store_ceiling, CeilingKey,
+    LowLatencyConfig, NvStatusExt, RangePlan,
 };
 use super::nvenc_status;
 use super::{AuChunk, ChromaFormat, Codec, EncodedFrame, Encoder, EncoderCaps};
@@ -1847,48 +1847,46 @@ impl Encoder for NvencCudaEncoder {
     }
 
     fn invalidate_ref_frames(&mut self, first: i64, last: i64) -> bool {
-        if self.encoder.is_null() || !self.rfi_supported || first < 0 || first > last {
+        // Range validity, covering-range dedup, DPB window and clamp all live in
+        // `nvenc_core::plan_range_recovery` — one policy for both direct-NVENC backends; only the
+        // session gate and the driver loop are this backend's.
+        if self.encoder.is_null() || !self.rfi_supported {
             return false;
         }
-        // Already invalidated a covering range for this loss event — re-arm the anchor (the previous
-        // anchor AU may itself have been lost) but skip the driver calls.
-        if let Some((pf, pl)) = self.last_rfi_range {
-            if first >= pf && last <= pl {
+        match plan_range_recovery(first, last, self.frame_idx, self.last_rfi_range) {
+            // Already invalidated a covering range for this loss event — re-arm the anchor (the
+            // previous anchor AU may itself have been lost) but skip the driver calls.
+            RangePlan::Covered => {
                 self.pending_anchor = true;
-                return true;
+                true
             }
-        }
-        // The DPB holds `[frame_idx - RFI_DPB, frame_idx - 1]`; a lost frame older than that can't be
-        // invalidated, so the only correct recovery is an IDR.
-        let oldest_in_dpb = self.frame_idx - RFI_DPB as i64;
-        if first < oldest_in_dpb {
-            return false;
-        }
-        let last = last.min(self.frame_idx - 1);
-        if first > last {
-            return false;
-        }
-        // Each input's `inputTimeStamp` is the WIRE frame index (pinned by `submit_indexed`), so the
-        // client's lost-frame range maps 1:1 onto the timestamps NVENC invalidates here.
-        // SAFETY: `invalidate_ref_frames` is a function pointer from the runtime table; `self.encoder`
-        // was checked non-null and is the live session; this runs on the encode thread (no concurrent
-        // NVENC use). Each `ts` is clamped to `[oldest_in_dpb, frame_idx - 1]`, naming a frame still
-        // in the DPB; the call passes only that `u64` (no struct).
-        unsafe {
-            for ts in first..=last {
-                if (api().invalidate_ref_frames)(self.encoder, ts as u64)
-                    .nv_ok()
-                    .is_err()
-                {
-                    return false;
+            RangePlan::Decline => false,
+            RangePlan::Invalidate { first, last } => {
+                // Each input's `inputTimeStamp` is the WIRE frame index (pinned by
+                // `submit_indexed`), so the client's lost-frame range maps 1:1 onto the timestamps
+                // NVENC invalidates here.
+                // SAFETY: `invalidate_ref_frames` is a function pointer from the runtime table;
+                // `self.encoder` was checked non-null and is the live session; this runs on the
+                // encode thread (no concurrent NVENC use). The plan clamped each `ts` to
+                // `[oldest_in_dpb, frame_idx - 1]`, naming a frame still in the DPB; the call
+                // passes only that `u64` (no struct).
+                unsafe {
+                    for ts in first..=last {
+                        if (api().invalidate_ref_frames)(self.encoder, ts as u64)
+                            .nv_ok()
+                            .is_err()
+                        {
+                            return false;
+                        }
+                    }
                 }
+                self.last_rfi_range = Some((first, last));
+                // The next submitted frame is the clean re-anchor — arm the tag so its AU ships
+                // with `recovery_anchor` and the client lifts its post-loss freeze on it.
+                self.pending_anchor = true;
+                true
             }
         }
-        self.last_rfi_range = Some((first, last));
-        // The next submitted frame is the clean re-anchor — arm the tag so its AU ships with
-        // `recovery_anchor` and the client lifts its post-loss freeze on it.
-        self.pending_anchor = true;
-        true
     }
 
     fn poll(&mut self) -> Result<Option<EncodedFrame>> {

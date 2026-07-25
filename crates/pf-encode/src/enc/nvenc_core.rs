@@ -294,9 +294,157 @@ mod tests {
 
 /// Reference-frame DPB depth when RFI is supported (Apollo uses 5). A deeper DPB lets an invalidated
 /// reference fall back to an older still-valid frame instead of a full IDR; `numRefL0 = 1` keeps each
-/// P-frame single-reference for low latency. Also the window the backends' `invalidate_ref_frames`
-/// paths check against (`frame_idx - RFI_DPB` = the oldest frame still in the DPB).
+/// P-frame single-reference for low latency. Also the window [`plan_range_recovery`] checks against
+/// (`next_ts - RFI_DPB` = the oldest frame still in the DPB).
 pub(super) const RFI_DPB: u32 = 5;
+
+/// One loss event's recovery decision for the timestamp-range RFI both direct-NVENC backends run
+/// (the range half of WP7.2's policy extraction; the slot half — AMF/QSV/Vulkan — is
+/// `crate::rfi`). The mechanism (the per-timestamp `nvEncInvalidateRefFrames` loop, the
+/// `last_rfi_range`/`pending_anchor` stores, the null-handle/`rfi_supported` gate) stays in each
+/// backend.
+pub(super) enum RangePlan {
+    /// The last successful invalidation already covers this range — no new driver calls, no IDR.
+    /// The caller must still RE-ARM its recovery anchor: the client re-asking means the previous
+    /// anchor AU may itself have been lost, and the next frame is just as clean a re-anchor.
+    Covered,
+    /// Invalidate `first..=last` (the CLAMPED range — this is also what the caller must record in
+    /// `last_rfi_range` on success, exactly as the inline code stored the post-clamp values).
+    Invalidate { first: i64, last: i64 },
+    /// Recovery without an IDR is impossible (nonsense range, loss older than the DPB, or a range
+    /// entirely in the future) — the caller returns `false` and its (coalesced) keyframe path
+    /// recovers. Deliberately NOT paired with any state clearing: neither twin touches
+    /// `pending_anchor` on decline (matching Vulkan's decline, opposite of AMF/QSV's
+    /// `pending_force` clear — see `crate::rfi`'s module doc before "harmonizing").
+    Decline,
+}
+
+/// The range-RFI policy, extracted verbatim from the two backends' `invalidate_ref_frames` (they
+/// were hand-copied twins). Step order is load-bearing and pinned by tests:
+///
+/// 1. nonsense range (`first < 0 || first > last`) → [`RangePlan::Decline`];
+/// 2. covering-range dedup — checked with the UNCLAMPED `last`, BEFORE the DPB window, so a
+///    covered re-ask never touches the driver even when the range has since left the DPB;
+/// 3. DPB window: `first < next_ts - RFI_DPB` → Decline (a lost frame older than the DPB cannot
+///    be invalidated; the only correct recovery is an IDR);
+/// 4. clamp `last` to `next_ts - 1` (never invalidate a timestamp never assigned); an inverted
+///    range after the clamp (loss entirely in the future — a prediction desync) → Decline.
+///
+/// `next_ts` is the backend's `frame_idx`: the NEXT timestamp to assign, which `submit_indexed`
+/// pins to the wire frame index — so the client's lost-frame range maps 1:1 onto the timestamps
+/// the driver invalidates, across every rebuild/reset. Note `teardown()` clears `last_rfi_range`
+/// but NOT `frame_idx`, so a post-reset call legitimately sees a stale-high `next_ts` with a
+/// `None` range — the same view the inline code had.
+pub(super) fn plan_range_recovery(
+    first: i64,
+    last: i64,
+    next_ts: i64,
+    last_rfi_range: Option<(i64, i64)>,
+) -> RangePlan {
+    if first < 0 || first > last {
+        return RangePlan::Decline;
+    }
+    if let Some((pf, pl)) = last_rfi_range {
+        if first >= pf && last <= pl {
+            return RangePlan::Covered;
+        }
+    }
+    let oldest_in_dpb = next_ts - RFI_DPB as i64;
+    if first < oldest_in_dpb {
+        return RangePlan::Decline;
+    }
+    let last = last.min(next_ts - 1);
+    if first > last {
+        return RangePlan::Decline;
+    }
+    RangePlan::Invalidate { first, last }
+}
+
+#[cfg(test)]
+mod range_policy_tests {
+    use super::{plan_range_recovery, RangePlan, RFI_DPB};
+
+    /// Convenience: the plan with no prior invalidation recorded.
+    fn plan(first: i64, last: i64, next_ts: i64) -> RangePlan {
+        plan_range_recovery(first, last, next_ts, None)
+    }
+
+    #[test]
+    fn nonsense_ranges_decline() {
+        assert!(matches!(plan(-1, 5, 100), RangePlan::Decline));
+        assert!(matches!(plan(7, 5, 100), RangePlan::Decline));
+    }
+
+    #[test]
+    fn covering_range_dedups_partial_overlap_does_not() {
+        let prior = Some((90i64, 95i64));
+        // Exact cover and sub-range → Covered. This pins EXISTING behavior, including that a
+        // covered range survives a forced IDR with zero driver calls (nothing clears
+        // `last_rfi_range` on a keyframe) — a recorded fact, not an endorsement.
+        assert!(matches!(
+            plan_range_recovery(90, 95, 100, prior),
+            RangePlan::Covered
+        ));
+        assert!(matches!(
+            plan_range_recovery(92, 94, 100, prior),
+            RangePlan::Covered
+        ));
+        // Partial overlap re-invalidates the FULL new range (next_ts = 98 keeps the window open:
+        // oldest_in_dpb = 93; at next_ts = 100 the same range would age out and Decline instead).
+        assert!(matches!(
+            plan_range_recovery(93, 97, 98, prior),
+            RangePlan::Invalidate {
+                first: 93,
+                last: 97
+            }
+        ));
+    }
+
+    /// The covering check runs BEFORE the DPB window: a covered re-ask stays Covered (no driver
+    /// calls needed) even when the range has since aged out of the DPB.
+    #[test]
+    fn covered_is_checked_before_the_dpb_window() {
+        let prior = Some((10i64, 12i64));
+        assert!(matches!(
+            plan_range_recovery(10, 12, 100, prior),
+            RangePlan::Covered
+        ));
+        // ...whereas the same range with no prior invalidation is outside the window → Decline.
+        assert!(matches!(plan(10, 12, 100), RangePlan::Decline));
+    }
+
+    #[test]
+    fn dpb_window_boundary() {
+        let next_ts = 100i64;
+        let oldest = next_ts - RFI_DPB as i64; // 95: the oldest timestamp still in the DPB
+        assert!(matches!(
+            plan(oldest, oldest, next_ts),
+            RangePlan::Invalidate { .. }
+        ));
+        assert!(matches!(
+            plan(oldest - 1, oldest, next_ts),
+            RangePlan::Decline
+        ));
+    }
+
+    /// `last` clamps to `next_ts - 1` (the newest encoded frame); the Invalidate carries the
+    /// CLAMPED value — which is also what the caller records in `last_rfi_range`.
+    #[test]
+    fn clamps_to_newest_encoded() {
+        assert!(matches!(
+            plan(98, 150, 100),
+            RangePlan::Invalidate {
+                first: 98,
+                last: 99
+            }
+        ));
+        // A range entirely in the future inverts under the clamp → Decline (prediction desync).
+        assert!(matches!(plan(100, 150, 100), RangePlan::Decline));
+        // Fresh session (`frame_idx == 0`): window passes (oldest = -5) but the clamp gives
+        // last = -1 < first → Decline. The inline code behaved identically.
+        assert!(matches!(plan(0, 3, 0), RangePlan::Decline));
+    }
+}
 
 /// The per-session knobs both direct-NVENC backends feed [`apply_low_latency_config`]. `Copy` so the
 /// backend fills it from `self` at the call. The two input-format fields bridge the only real
