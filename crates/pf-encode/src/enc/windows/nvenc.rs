@@ -386,12 +386,24 @@ fn async_retrieve_requested() -> bool {
 /// the ring textures in place, so in-flight depth beyond the ring lets the capturer overwrite a
 /// frame mid-encode: visual corruption, not UB). IDD-push rings are sized around
 /// `PUNKTFUNK_IDD_DEPTH`; raise both together if deeper pipelining is needed.
+///
+/// Read from the environment **once per process** (WP6.1): `submit` consults this on EVERY frame —
+/// both arms of the `cap` match, in sync mode too, where the result is then discarded because the
+/// backpressure loop short-circuits on `async_rt`. Memoizing rather than latching into a session
+/// field is deliberate: the composed `cap` also folds in `input_ring_depth`, which
+/// `set_input_ring_depth` may change after open, and freezing that half would reintroduce the
+/// in-place-overwrite bug the ring term exists to prevent. Nothing in the workspace mutates this
+/// variable at runtime, so memoizing a process-constant read is behaviour-preserving by
+/// construction.
 fn async_inflight_cap() -> usize {
-    std::env::var("PUNKTFUNK_NVENC_ASYNC_DEPTH")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(4)
-        .clamp(2, POOL - 1)
+    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("PUNKTFUNK_NVENC_ASYNC_DEPTH")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .unwrap_or(4)
+            .clamp(2, POOL - 1)
+    })
 }
 
 /// One in-flight encode handed to the retrieve thread: the output bitstream to lock once its

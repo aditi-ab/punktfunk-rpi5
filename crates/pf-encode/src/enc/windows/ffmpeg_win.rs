@@ -134,6 +134,44 @@ fn zerocopy_enabled(vendor: WinVendor) -> bool {
         .unwrap_or(matches!(vendor, WinVendor::Amf))
 }
 
+/// Upper bound on `PUNKTFUNK_FFWIN_POLL_MS`. This knob spins the **encode thread** waiting for an
+/// AU, so a value past one frame period is already self-defeating and a full second is far beyond
+/// anything an operator would set on purpose. The clamp is also what makes the µs conversion
+/// below provably overflow-free.
+///
+/// The reachable hazard is a slipped digit, not the overflow: pre-clamp, `PUNKTFUNK_FFWIN_POLL_MS=
+/// 100000000` was a **27.7-hour** spin with no overflow anywhere near it.
+const MAX_POLL_SPIN_MS: u64 = 1_000;
+
+/// Bounded post-submit spin for [`FfmpegWinEncoder::poll`], in microseconds (0 = off, the default
+/// and the correct choice on every VCN measured so far).
+///
+/// Read from the environment **once per process** (WP6.1): `poll` runs once per encode tick, and
+/// this was an unconditional `env::var` + parse on it.
+///
+/// ⚠ The audit proposed `saturating_mul` for the µs conversion. It is still the wrong fix, but for
+/// a reason worth stating precisely, because the obvious one is false: `Duration::from_micros(
+/// u64::MAX)` is only ~1.8e13 seconds, six orders of magnitude below `Duration`'s `u64::MAX`-second
+/// ceiling, so `Instant::now() + Duration::from_micros(u64::MAX)` does **not** overflow and does
+/// **not** panic (measured, both with and without debug assertions). What it does instead is set a
+/// deadline ~584,000 years out, and the loop below only exits on `Packet`/`Eof` — and this
+/// function's own doc explains that a spin here *provably never* produces the owed AU on the
+/// measured hardware. So `saturating_mul` converts a bad value into a **permanently wedged encode
+/// thread**: a hang, not a panic. Clamping the parsed value first removes the bad value entirely.
+///
+/// (For the record on the pre-clamp behaviour: the workspace sets no `overflow-checks` in
+/// `[profile.release]`, so `ms * 1000` wrapped silently in release and panicked only in debug.)
+fn poll_spin_cap_us() -> u64 {
+    static CAP_US: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *CAP_US.get_or_init(|| {
+        std::env::var("PUNKTFUNK_FFWIN_POLL_MS")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .map(|ms| ms.min(MAX_POLL_SPIN_MS) * 1000)
+            .unwrap_or(0) // default: no spin — the libavcodec AMF buffer can't be spun out
+    })
+}
+
 /// The swscale *source* pixel format for a captured packed-RGB/BGR layout (8-bit BGRA fallback only).
 fn sws_src(format: PixelFormat) -> Result<Pixel> {
     Ok(match format {
@@ -1332,11 +1370,7 @@ impl Encoder for FfmpegWinEncoder {
             Some(Inner::ZeroCopy(z)) => &mut z.enc,
             None => return Ok(None),
         };
-        let cap_us = std::env::var("PUNKTFUNK_FFWIN_POLL_MS")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .map(|ms| ms * 1000)
-            .unwrap_or(0); // default: no spin — the libavcodec AMF buffer can't be spun out
+        let cap_us = poll_spin_cap_us();
         let deadline = (cap_us > 0 && self.in_flight > 0)
             .then(|| std::time::Instant::now() + std::time::Duration::from_micros(cap_us));
         loop {

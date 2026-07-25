@@ -269,13 +269,19 @@ fn async_retrieve_requested() -> bool {
 
 /// Max encodes in flight in two-thread mode (`PUNKTFUNK_NVENC_ASYNC_DEPTH`, default 4, clamped
 /// `2..=POOL-1` — a bitstream must never be reused mid-encode, and the input ring is the same
-/// depth). Mirrors the Windows knob exactly.
+/// depth). Mirrors the Windows knob exactly, memoization included: this is the backpressure
+/// **loop condition** in `submit`, so an engaged two-thread session re-read the environment once
+/// per spin. The default session never pays it (the condition short-circuits on `async_rt`), which
+/// is why the audit's severity ranking for this site was inverted — but an escalated one did.
 fn async_inflight_cap() -> usize {
-    std::env::var("PUNKTFUNK_NVENC_ASYNC_DEPTH")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(4)
-        .clamp(2, POOL - 1)
+    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("PUNKTFUNK_NVENC_ASYNC_DEPTH")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .unwrap_or(4)
+            .clamp(2, POOL - 1)
+    })
 }
 
 /// Stream-ordered submit (`PUNKTFUNK_NVENC_STREAM_ORDERED`, default ON; `0` = the pre-existing
