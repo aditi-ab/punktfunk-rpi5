@@ -897,11 +897,27 @@ fn open_nvenc_probed(
             }
             // EINVAL = above this GPU's level ceiling → step down. Any other failure (no GPU,
             // bad mode, OOM) is real — surface it rather than masking it with bitrate retries.
-            Err(e) if format!("{e:#}").contains("Invalid argument") => last = Some(e),
+            Err(e) if nvenc_open_einval(&e) => last = Some(e),
             Err(e) => return Err(e),
         }
     }
     Err(last.unwrap_or_else(|| anyhow::anyhow!("encoder open failed at every probed bitrate")))
+}
+
+/// Whether a libav NVENC open failed with EINVAL — the "bitrate above this GPU's level ceiling"
+/// signal [`open_nvenc_probed`]'s ladder steps down on. Typed: the root `ffmpeg::Error` survives
+/// the `anyhow` context chain, so match it there instead of substring-matching the English
+/// strerror rendering of the whole chain — which also fired on any OTHER wrapped EINVAL (e.g. a
+/// CUDA-context errno) and steered the ladder on failures that have nothing to do with bitrate.
+#[cfg(target_os = "linux")]
+fn nvenc_open_einval(e: &anyhow::Error) -> bool {
+    use ffmpeg_next as ffmpeg;
+    matches!(
+        e.downcast_ref::<ffmpeg::Error>(),
+        Some(ffmpeg::Error::Other {
+            errno: ffmpeg::util::error::EINVAL
+        })
+    )
 }
 
 /// Whether the direct-SDK NVENC path is active. **Default ON** — on-glass validated 2026-07-12:

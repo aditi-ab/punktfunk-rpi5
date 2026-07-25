@@ -468,7 +468,15 @@ impl NvencEncoder {
             // sessions) and reopen this session without intra-refresh; any other failure — and
             // any failure when IR wasn't requested — propagates untouched (the bitrate probe
             // keys on EINVAL, which must not trip the latch).
-            Err(e) if intra_refresh && format!("{e:#}").contains("Function not implemented") => {
+            Err(e)
+                if intra_refresh
+                    && matches!(
+                        e,
+                        ffmpeg::Error::Other {
+                            errno: ffmpeg::util::error::ENOSYS
+                        }
+                    ) =>
+            {
                 tracing::warn!(
                     encoder = name,
                     "NVENC intra-refresh not supported by this GPU — falling back to IDR-only \
