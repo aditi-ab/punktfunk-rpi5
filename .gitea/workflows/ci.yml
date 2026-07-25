@@ -108,6 +108,53 @@ jobs:
           git diff --exit-code include/punktfunk_core.h \
             || (echo "include/punktfunk_core.h is stale — commit the regenerated header" && exit 1)
 
+  # The client stack cross-checked for aarch64. NOT an artifact job — deb.yml ships those —
+  # this exists so a portability defect fails here instead of surfacing in a release build or
+  # on a user's board. It earns its runtime: the bug that motivated it (a Vulkan extension
+  # array typed `*const i8`, where `c_char` is signed on x86_64 and UNSIGNED on aarch64)
+  # compiled cleanly on every target CI built at the time.
+  #
+  # Client crates only, listed explicitly: the host's encode stack is x86 (NVENC/QSV/AMF) and
+  # `--workspace` would drag it in. Runs in the cross image (amd64 toolchain + arm64 sysroot,
+  # ci/rust-ci-arm64cross.Dockerfile) on the ordinary runner — no arm64 runner involved.
+  rust-arm64:
+    runs-on: ubuntu-24.04
+    container:
+      image: git.unom.io/unom/punktfunk-rust-ci-arm64cross:latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache keys
+        run: echo "rustc=$(rustc --version | cut -d' ' -f2)" >> "$GITHUB_ENV"
+      - uses: actions/cache@v4
+        with:
+          path: |
+            /usr/local/cargo/registry
+            /usr/local/cargo/git
+          key: cargo-home-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-home-
+      - uses: actions/cache@v4
+        with:
+          path: target
+          # Its OWN prefix: aarch64 artifacts must never share the amd64 jobs' target cache.
+          key: cargo-target-arm64-v1-${{ env.rustc }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-target-arm64-v1-${{ env.rustc }}-
+
+      - name: Clippy for aarch64 (deny warnings)
+        run: |
+          cargo clippy --target aarch64-unknown-linux-gnu --all-targets --locked \
+            -p punktfunk-core -p pf-client-core -p pf-presenter -p pf-console-ui \
+            -p punktfunk-client-session -p punktfunk-client-linux \
+            -- -D warnings
+
+      # The minimal embedded build — no Skia, no PyroWave — is what a small image installs, so
+      # it has to keep compiling on its own, not just as a subset of the default features.
+      - name: Build the session binary, minimal features
+        run: |
+          cargo build --release --target aarch64-unknown-linux-gnu --locked \
+            -p punktfunk-client-session --no-default-features
+
   web:
     runs-on: ubuntu-24.04
     container:

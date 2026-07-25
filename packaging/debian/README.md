@@ -171,3 +171,25 @@ docker run --rm -v "$PWD:/src" -w /src pf-noble \
 
 `BUNDLE_FFMPEG=1` needs `patchelf` and an FFmpeg install at `FFMPEG_PREFIX` (default `/opt/ffmpeg`,
 which the noble image provides).
+
+### The arm64 client `.deb`
+
+The **client** also ships for arm64 (`punktfunk-client_<version>_arm64.deb`, published to the same
+apt distribution — the registry keys pool entries by architecture, so an arm64 box needs no extra
+configuration). There is no arm64 **host** package: the Linux host encodes with NVENC/QSV/AMF, all
+x86.
+
+It is cross-compiled on an ordinary amd64 machine in `ci/rust-ci-arm64cross.Dockerfile` — the
+rust-ci toolchain plus an Ubuntu ports arm64 multiarch sysroot. No arm64 runner is involved:
+
+```sh
+docker build -f ci/rust-ci-arm64cross.Dockerfile -t pf-arm64cross .   # repo-root context
+docker run --rm -v "$PWD:/w" -w /w pf-arm64cross \
+  bash -lc 'VERSION=0.0.1 ARCH=arm64 TARGET=aarch64-unknown-linux-gnu \
+              bash packaging/debian/build-client-deb.sh'
+```
+
+`TARGET` moves the binaries to `target/<triple>/release`; `ARCH` sets the package's
+`Architecture:` field. Set both — one without the other builds an amd64 binary into a package
+labelled arm64, or vice versa. `dpkg-shlibdeps` reads the arm64 sonames straight out of the
+multiarch sysroot, so `Depends:` comes out right with no manual list.
