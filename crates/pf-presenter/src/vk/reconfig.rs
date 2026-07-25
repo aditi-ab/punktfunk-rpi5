@@ -3,8 +3,33 @@
 use super::setup::pick_formats;
 use super::{OverlayPipe, Presenter};
 use crate::csc::CscPass;
-use anyhow::{Context as _, Result};
+use anyhow::{anyhow, Context as _, Result};
 use ash::vk;
+
+/// Extra guidance appended to a swapchain-creation failure when SDL is on the KMSDRM backend —
+/// i.e. a compositor-less kiosk/embedded run, where the bare Vulkan error is close to useless.
+///
+/// Measured on an NVIDIA proprietary + KMSDRM box: SDL opens the card, Vulkan enumerates the GPU
+/// *and* the display (`VK_KHR_display` reports the connected HDMI connector), then
+/// `vkCreateSwapchainKHR` returns ERROR_INITIALIZATION_FAILED — as root, with `nvidia_drm.modeset`
+/// on, on a card no compositor was using. So it is neither permissions nor DRM master: NVIDIA's
+/// direct-to-display path wants the display leased (`vkAcquireDrmDisplayEXT`) and SDL's KMSDRM
+/// surface path does not do that for it. Empty on every other backend, where the message would be
+/// noise.
+fn kmsdrm_swapchain_hint() -> String {
+    let kmsdrm = std::env::var("SDL_VIDEODRIVER").is_ok_and(|v| v.eq_ignore_ascii_case("kmsdrm"));
+    if !kmsdrm {
+        return String::new();
+    }
+    let card = std::env::var("PUNKTFUNK_DRM_CARD").unwrap_or_else(|_| "unset".into());
+    format!(
+        " — under SDL_VIDEODRIVER=kmsdrm (PUNKTFUNK_DRM_CARD={card}). Check, in order: the card \
+         has a CONNECTED connector (`cat /sys/class/drm/card*-*/status`); nothing else holds DRM \
+         master on it (a running compositor does — pin another card with PUNKTFUNK_DRM_CARD=<n>); \
+         and the driver is Mesa. NVIDIA's proprietary direct-display path is known to fail here \
+         even as root with a display Vulkan can enumerate."
+    )
+}
 
 impl Presenter {
     /// (Re)build the swapchain for the window's current pixel size. Also the resize path.
@@ -66,8 +91,8 @@ impl Presenter {
             .present_mode(self.present_mode)
             .clipped(true)
             .old_swapchain(old);
-        let swapchain =
-            unsafe { self.swap_d.create_swapchain(&info, None) }.context("vkCreateSwapchainKHR")?;
+        let swapchain = unsafe { self.swap_d.create_swapchain(&info, None) }
+            .map_err(|e| anyhow!("vkCreateSwapchainKHR: {e}{}", kmsdrm_swapchain_hint()))?;
         // The old swapchain and everything tied to its images dies NOW: the fence
         // quiesce covered our own command buffers, the queue drain above covered the
         // presentation engine's semaphore waits — nothing can still reference them.

@@ -360,6 +360,28 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
     // identity and the session window gets the default-Wayland icon (the Linux analog of
     // the AppUserModelID adoption above).
     sdl3::hint::set("SDL_APP_ID", "io.unom.Punktfunk");
+    // `PUNKTFUNK_DRM_CARD=<n>` → SDL's KMSDRM device index, for a compositor-less (kiosk/embedded)
+    // run. SDL enumerates /dev/dri/card* and takes the first one it can open, which on a
+    // multi-GPU box is regularly the WRONG one: measured on a two-card machine it chose the card
+    // a live compositor already held DRM master on and failed at swapchain creation, while the
+    // idle card with the connected display sat unused. There is no reliable way to pick from
+    // inside the process (detecting "already mastered" needs the ioctl that taking master IS), so
+    // this stays an explicit operator choice rather than fragile auto-detection.
+    // Ignored unless the kmsdrm backend is actually in use.
+    if let Ok(card) = std::env::var("PUNKTFUNK_DRM_CARD") {
+        if card.chars().all(|c| c.is_ascii_digit()) && !card.is_empty() {
+            tracing::info!(
+                card,
+                "PUNKTFUNK_DRM_CARD: pinning SDL's KMSDRM device index"
+            );
+            sdl3::hint::set("SDL_KMSDRM_DEVICE_INDEX", &card);
+        } else {
+            tracing::warn!(
+                card,
+                "PUNKTFUNK_DRM_CARD must be a card NUMBER (e.g. 0) — ignoring"
+            );
+        }
+    }
     let sdl = sdl3::init().context("SDL init")?;
     let video = sdl.video().context("SDL video")?;
     let events = sdl.event().context("SDL events")?;
