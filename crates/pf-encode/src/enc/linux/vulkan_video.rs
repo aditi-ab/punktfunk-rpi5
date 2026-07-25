@@ -437,6 +437,13 @@ struct Frame {
     // GPU timestamps around the CSC batch (`PUNKTFUNK_PERF` only; null otherwise): [0]=batch
     // start, [1]=batch end — splits the fence wait into "compute CSC+copies" vs "ASIC encode".
     ts_pool: vk::QueryPool,
+    // Whether the submission currently in this slot actually reset AND wrote `ts_pool`. A pool
+    // existing is NOT proof that it was written: `with_ts` arms the pool for the CSC and
+    // padded-RGB paths, but the padded-RGB path's CPU-upload arm records its own command buffer
+    // and writes no timestamps. Reading an unreset/unwritten query with `WAIT` is undefined —
+    // RADV happens to fail the read rather than block, another driver may hang — so `read_slot`
+    // consults this instead of `ts_pool != null`.
+    ts_written: bool,
     bs_buf: vk::Buffer,
     bs_mem: vk::DeviceMemory,
     bs_ptr: BsPtr, // persistent mapping of bs_mem (see BsPtr)
@@ -456,7 +463,18 @@ struct Frame {
     nv12_mem: vk::DeviceMemory,
     nv12_view: vk::ImageView,
     // CPU-input staging (lazily sized; only the software-capture / smoke-test path uses it).
-    cpu_img: Option<(vk::Image, vk::DeviceMemory, vk::ImageView, vk::Format)>,
+    // Keyed on (format, width, height) — NOT format alone. The CSC arm sizes this image to the
+    // SOURCE frame while `cmd_copy_buffer_to_image` uses the CURRENT frame's extent, so a
+    // same-format size change against a format-only key copies past the allocation (confirmed on
+    // RADV as VUID-vkCmdCopyBufferToImage-imageSubresource-07971, with `submit` still returning Ok).
+    cpu_img: Option<(
+        vk::Image,
+        vk::DeviceMemory,
+        vk::ImageView,
+        vk::Format,
+        u32,
+        u32,
+    )>,
     cpu_stage: Option<(vk::Buffer, vk::DeviceMemory, u64)>,
     // Per-slot cursor overlay (cursor-as-metadata): a fixed CURSOR_MAX² RGBA8 sampled image (bound
     // once at binding 3) + host staging. Re-uploaded only when the bitmap changes (`cursor_serial`);
@@ -581,6 +599,18 @@ pub struct VulkanVideoEncoder {
     enc_count: u64, // total frames encoded — drives the DPB ring cursor
     auto_wire: i64, // fallback wire index when submit() (not submit_indexed) is used
     first_frame: bool, // needs RESET + DPB layout transition + CBR install + IDR
+    /// Whether the SESSION OBJECT currently has a non-default rate-control mode installed.
+    ///
+    /// Deliberately NOT `!first_frame`. `first_frame` means "this frame must issue RESET + install
+    /// CBR + quality", which is true both at open and after a mid-stream [`Encoder::reset`] — but
+    /// `vkCmdBeginVideoCodingKHR` must declare the rate-control state the session ACTUALLY has at
+    /// that moment, and a `reset()` does not touch the session object: the CBR installed before it
+    /// is still current when the next frame begins its coding scope. Keying the declaration on
+    /// `first_frame` therefore omitted it after every reset, which RADV's validation reports as
+    /// VUID-vkCmdBeginVideoCodingKHR-pBeginInfo-08253 ("no VkVideoEncodeRateControlInfoKHR ... but
+    /// the currently set mode is CBR"). Set once the install actually happens, and only cleared by
+    /// building a new session.
+    rc_installed: bool,
     force_kf: bool, // request_keyframe / non-recoverable loss -> next frame is IDR
     pending_loss: Option<i64>, // invalidate_ref_frames(first) -> recover on next frame
     pending: VecDeque<EncodedFrame>,
@@ -1272,6 +1302,9 @@ impl VulkanVideoEncoder {
             enc_count: 0,
             auto_wire: 0,
             first_frame: true,
+            // No rate control installed on a brand-new session: its mode is DEFAULT until the
+            // first frame's control command, so frame 0 must NOT declare one at begin-coding.
+            rc_installed: false,
             force_kf: false,
             pending_loss: None,
             pending: VecDeque::new(),
@@ -1546,8 +1579,12 @@ impl VulkanVideoEncoder {
             (src_w, src_h)
         };
         let need = (iw * ih * 4) as u64;
-        if self.frames[slot].cpu_img.map(|(_, _, _, f)| f) != Some(fmt) {
-            if let Some((i, m, v, _)) = self.frames[slot].cpu_img.take() {
+        if self.frames[slot]
+            .cpu_img
+            .map(|(_, _, _, f, iw, ih)| (f, iw, ih))
+            != Some((fmt, iw, ih))
+        {
+            if let Some((i, m, v, ..)) = self.frames[slot].cpu_img.take() {
                 dev.destroy_image_view(v, None);
                 dev.destroy_image(i, None);
                 dev.free_memory(m, None);
@@ -1590,7 +1627,7 @@ impl VulkanVideoEncoder {
                     vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST,
                 )?
             };
-            self.frames[slot].cpu_img = Some((i, m, v, fmt));
+            self.frames[slot].cpu_img = Some((i, m, v, fmt, iw, ih));
         }
         if self.frames[slot]
             .cpu_stage
@@ -1638,6 +1675,20 @@ impl VulkanVideoEncoder {
                     src_h,
                     sw * sh * 4,
                     bytes.len()
+                );
+            }
+            // The padding loop below only ever GROWS the source into the aligned extent. A source
+            // larger than the encode extent is a contract violation (the Dmabuf arms already bail
+            // on it) and would panic here on the row `copy_from_slice`, so refuse it by name
+            // instead of unwinding out of the encode thread with an index message.
+            if src_w > w || src_h > h {
+                bail!(
+                    "vulkan-encode (rgb-direct): CPU frame {}x{} exceeds the encode extent {}x{} \
+                     — the RGB-direct source must fit inside the aligned encode size",
+                    src_w,
+                    src_h,
+                    w,
+                    h
                 );
             }
             let mut out = vec![0u8; dw * dh * 4];
@@ -1768,9 +1819,12 @@ impl VulkanVideoEncoder {
         // PUNKTFUNK_PERF: bracket the whole compute batch (import barriers + cursor prep + CSC
         // dispatch + plane copies) with timestamps — read back in `read_slot` as `csc_us`, the
         // half of the fence wait that is NOT the ASIC encode.
+        self.frames[slot].ts_written = false;
         if self.ts_period_ns > 0.0 {
             dev.cmd_reset_query_pool(compute_cmd, ts_pool, 0, 2);
             dev.cmd_write_timestamp2(compute_cmd, vk::PipelineStageFlags2::NONE, ts_pool, 0);
+            // This batch resets the pool and closes it below, so `read_slot` may read it.
+            self.frames[slot].ts_written = true;
         }
 
         // Cursor-as-metadata: refresh this slot's cursor image (only when the bitmap changed) and
@@ -2358,6 +2412,10 @@ impl VulkanVideoEncoder {
             );
         }
         let padded = self.rgb.as_ref().is_some_and(|r| r.padded);
+        // Only the padded Dmabuf arm below records timestamps (via `record_pad_blit`); the
+        // CPU-upload arm records its own command buffer and writes none. Default to "not written"
+        // so `read_slot` can never read an unreset query — see `Frame::ts_written`.
+        self.frames[slot].ts_written = false;
         let (src_img, src_view, acquire, compute_active) = match &frame.payload {
             FramePayload::Dmabuf(d) if !padded => {
                 // Defense in depth for the OOB class the alignment gate closes at open: the
@@ -2419,6 +2477,8 @@ impl VulkanVideoEncoder {
                     ts_pool,
                     &[(vk::ImageAspectFlags::COLOR, 1)],
                 )?;
+                // `record_pad_blit` reset and wrote both timestamps when PERF is armed.
+                self.frames[slot].ts_written = self.ts_period_ns > 0.0;
                 // The staging image ends the blit in GENERAL with the csc_sem ordering the
                 // hand-off — exactly the CscGeneral acquire contract.
                 (pad_img, pad_view, SrcAcquire::CscGeneral, true)
@@ -2544,6 +2604,10 @@ impl VulkanVideoEncoder {
         self.poc = poc + 1;
         self.enc_count += 1;
         self.first_frame = false;
+        // The frame just recorded carried the RESET + CBR install (that is what `first_frame`
+        // gated), so from here on the session HAS a non-default rate-control mode — and unlike
+        // `first_frame` this survives `reset()`, because a reset does not rebuild the session.
+        self.rc_installed = true;
         self.force_kf = false;
         if let Some(nb) = self.pending_bitrate.take() {
             // The retarget control command is recorded (execution follows submission order): the
@@ -2815,9 +2879,11 @@ impl VulkanVideoEncoder {
             .video_session(self.session)
             .video_session_parameters(self.params)
             .reference_slots(begin_slots);
-        if !self.first_frame {
+        // Declare the session's ACTUAL current rate-control state, not "not the first frame" —
+        // a mid-stream `reset()` re-arms `first_frame` while the session keeps its installed CBR.
+        if self.rc_installed {
             begin.p_next = rc_ptr;
-        } // CBR is current state after frame 0's control
+        }
         (self.vq_dev.fp().cmd_begin_video_coding_khr)(cmd, &begin);
         if self.first_frame {
             // RESET + CBR install + explicit quality level. Without ENCODE_QUALITY_LEVEL, RADV
@@ -2950,7 +3016,6 @@ impl VulkanVideoEncoder {
         lr.FrameRestorationType =
             [h::StdVideoAV1FrameRestorationType_STD_VIDEO_AV1_FRAME_RESTORATION_TYPE_NONE; 3];
 
-        let seg: h::StdVideoAV1Segmentation = std::mem::zeroed();
         let gm: h::StdVideoAV1GlobalMotion = std::mem::zeroed();
 
         // Order hints of the 8 physical reference buffers (DPB slots), 0 where empty.
@@ -2969,6 +3034,14 @@ impl VulkanVideoEncoder {
         pic_flags.set_show_frame(1);
         if independent {
             pic_flags.set_error_resilient_mode(1);
+        }
+        // AV1 IGNORES render_width/height_minus_1 unless this flag says the render size differs
+        // from the coded frame size. We always wrote the render size (below) but never the flag, so
+        // at any mode that needed 64x16 alignment the decoder fell back to the CODED size and the
+        // client displayed our alignment padding — e.g. 1080p arriving as 1088 rows, the bottom 8
+        // being duplicated edge pixels.
+        if self.render_w != self.width || self.render_h != self.height {
+            pic_flags.set_render_and_frame_size_different(1);
         }
         let mut std_pic: av1::StdVideoEncodeAV1PictureInfo = std::mem::zeroed();
         std_pic.flags = pic_flags;
@@ -2998,7 +3071,10 @@ impl VulkanVideoEncoder {
         std_pic.pLoopFilter = &loop_filter;
         std_pic.pCDEF = &cdef;
         std_pic.pLoopRestoration = &lr;
-        std_pic.pSegmentation = &seg;
+        // pSegmentation MUST be NULL for an AV1 encode operation
+        // (VUID-vkCmdEncodeVideoKHR-pStdPictureInfo-10350). It used to point at a zeroed
+        // segmentation struct, which RADV's validation rejects on every frame; `std_pic` is
+        // zeroed, so leaving it unset is both spec-correct and the same "segmentation disabled".
         std_pic.pGlobalMotion = &gm;
 
         // ---- KHR picture info ----
@@ -3015,7 +3091,11 @@ impl VulkanVideoEncoder {
             } else {
                 av1::RC_GROUP_PREDICTIVE
             },
-            constant_q_index: quant.base_q_idx as u32,
+            // MUST be zero whenever the rate control mode is not DISABLED
+            // (VUID-vkCmdEncodeVideoKHR-constantQIndex-10320) — this session installs CBR, so the
+            // driver owns Q. Passing `base_q_idx` here was rejected by validation on every frame;
+            // the value still reaches the encoder through `pQuantization` for the header.
+            constant_q_index: 0,
             p_std_picture_info: &std_pic,
             reference_name_slot_indices: if is_idr {
                 [-1; av1::MAX_VIDEO_AV1_REFERENCES_PER_FRAME]
@@ -3105,7 +3185,8 @@ impl VulkanVideoEncoder {
             .video_session(self.session)
             .video_session_parameters(self.params)
             .reference_slots(begin_slots);
-        if !self.first_frame {
+        // See the h265 twin: declare what the session actually has, not `!first_frame`.
+        if self.rc_installed {
             begin.p_next = rc_ptr;
         }
         (self.vq_dev.fp().cmd_begin_video_coding_khr)(cmd, &begin);
@@ -3211,6 +3292,7 @@ impl VulkanVideoEncoder {
         // remaining host fence wait as pure VCN time; queueing and synchronization remain in it.
         if self.ts_period_ns > 0.0
             && f.ts_pool != vk::QueryPool::null()
+            && f.ts_written
             && self.perf_at.elapsed() >= std::time::Duration::from_secs(2)
         {
             let mut ts = [0u64; 2];
@@ -3561,7 +3643,7 @@ impl Drop for VkTeardown {
                         device.destroy_image(img, None);
                         device.free_memory(mem, None);
                     }
-                    if let Some((i, m, v, _)) = f.cpu_img {
+                    if let Some((i, m, v, ..)) = f.cpu_img {
                         device.destroy_image_view(v, None);
                         device.destroy_image(i, None);
                         device.free_memory(m, None);
@@ -4753,6 +4835,86 @@ mod tests {
         if let Some(aus) = run_smoke_opts(Codec::Av1, true) {
             dump_smoke(&aus, "rgb.obu");
         }
+    }
+
+    /// A CPU-capture source that CHANGES SIZE mid-session must not copy past the cached staging
+    /// image. `ensure_cpu_rgb` keys that image on (format, width, height); when it was keyed on
+    /// format alone the image kept the FIRST frame's size while `cmd_copy_buffer_to_image` used the
+    /// current frame's extent, so a same-format size increase wrote out of bounds — and `submit`
+    /// still returned `Ok`, so nothing upstream noticed.
+    ///
+    /// The out-of-bounds copy is only *observable* through the Vulkan validation layers, so run this
+    /// as: `VK_LOADER_LAYERS_ENABLE='*validation*' cargo test ... -- --ignored`. Confirmed on RADV
+    /// PHOENIX 2026-07-25: 8 x VUID-vkCmdCopyBufferToImage-imageSubresource-07971 before the fix
+    /// ("extent.width (512) exceeds imageSubresource width extent (128)"), zero after.
+    #[test]
+    #[ignore = "needs a real VK_KHR_video_encode_h265 device; meaningful only under validation layers"]
+    fn vulkan_cpu_img_survives_a_source_size_change() {
+        // CSC mode (rgb=false) — that is the arm where the image is sized to the SOURCE frame.
+        let mut enc = VulkanVideoEncoder::open_opts(Codec::H265, 512, 512, 60, 10_000_000, false)
+            .expect("open");
+        // `cpu_img` is cached PER RING SLOT, so the small frames must first populate every slot;
+        // only when the ring wraps does a slot holding a 128x128 image get a 512x512 copy.
+        eprintln!("phase 1: 8x 128x128 — populates every ring slot with a 128x128 cpu_img");
+        for i in 0..8u64 {
+            enc.submit_indexed(
+                &cpu_frame(128, 128, i * 16_666_667, [40, 40, 200, 255]),
+                i as u32,
+            )
+            .expect("submit small");
+            while enc.poll().expect("poll").is_some() {}
+        }
+        eprintln!("phase 2: 8x 512x512 — SAME format, so each slot REUSES its 128x128 image");
+        for i in 8..16u64 {
+            let r = enc.submit_indexed(
+                &cpu_frame(512, 512, i * 16_666_667, [200, 40, 40, 255]),
+                i as u32,
+            );
+            r.expect("submit after the source grew");
+            while matches!(enc.poll(), Ok(Some(_))) {}
+        }
+        let _ = enc.flush();
+        while matches!(enc.poll(), Ok(Some(_))) {}
+        eprintln!("done — under validation layers this run must report ZERO VUID errors");
+    }
+
+    /// A mid-stream [`Encoder::reset`] must not change what `vkCmdBeginVideoCodingKHR` declares
+    /// about the session's rate-control state. `reset()` re-arms `first_frame` (the next frame
+    /// re-issues RESET + install), but it does NOT rebuild the session, so the CBR installed
+    /// earlier is still the session's current mode when that frame opens its coding scope —
+    /// which is why the declaration keys on `rc_installed`, not `!first_frame`.
+    ///
+    /// Only the validation layers can see the mismatch, so run as:
+    /// `VK_LOADER_LAYERS_ENABLE='*validation*' cargo test ... -- --ignored`. Confirmed on RADV
+    /// PHOENIX 2026-07-25: VUID-vkCmdBeginVideoCodingKHR-pBeginInfo-08253 before the fix ("no
+    /// VkVideoEncodeRateControlInfoKHR ... but the currently set mode is CBR"), zero after.
+    #[test]
+    #[ignore = "needs a real VK_KHR_video_encode_h265 device; meaningful only under validation layers"]
+    fn vulkan_reset_keeps_the_declared_rate_control_state() {
+        let (w, h) = (256u32, 256u32);
+        let mut enc =
+            VulkanVideoEncoder::open_opts(Codec::H265, w, h, 60, 10_000_000, false).expect("open");
+        eprintln!("phase 1: 4 frames (installs CBR on frame 0)");
+        for i in 0..4u64 {
+            enc.submit_indexed(
+                &cpu_frame(w, h, i * 16_666_667, [40, 40, 200, 255]),
+                i as u32,
+            )
+            .expect("submit");
+            while enc.poll().expect("poll").is_some() {}
+        }
+        eprintln!("phase 2: reset() mid-stream");
+        assert!(enc.reset(), "reset should succeed");
+        eprintln!("phase 3: 4 more frames — first one re-declares state as if fresh");
+        for i in 4..8u64 {
+            enc.submit_indexed(
+                &cpu_frame(w, h, i * 16_666_667, [200, 40, 40, 255]),
+                i as u32,
+            )
+            .expect("submit after reset");
+            while enc.poll().expect("poll").is_some() {}
+        }
+        eprintln!("done — under validation layers this run must report ZERO VUID errors");
     }
 
     /// `PUNKTFUNK_VULKAN_RGB_DIRECT` accepts the same spellings as every sibling knob, trimmed.
