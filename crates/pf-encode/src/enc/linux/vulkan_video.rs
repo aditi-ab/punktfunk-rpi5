@@ -76,11 +76,22 @@ fn quality_request() -> u32 {
 /// default: ON wherever the probe passes, EXCEPT sessions that may need the CSC's cursor
 /// blend (see [`VulkanVideoEncoder::open`]). `=0` disables outright; `=1` forces it even on
 /// cursor-blend sessions (the pointer will be missing from the stream); unset = the default.
+///
+/// Parses like every sibling knob (`matches!(v.trim(), …)`): anything unrecognised — including
+/// an empty value and a value that is only whitespace — falls back to the default rather than
+/// being read as a force-on. The old `v == "0"` test made `"0 "` mean the *opposite* of what the
+/// operator wrote, and turned a typo into a forced RGB-direct session with no cursor.
 fn rgb_request() -> Option<bool> {
-    match std::env::var("PUNKTFUNK_VULKAN_RGB_DIRECT") {
-        Ok(v) if v == "0" => Some(false),
-        Ok(_) => Some(true),
-        Err(_) => None,
+    parse_rgb_request(std::env::var("PUNKTFUNK_VULKAN_RGB_DIRECT").ok().as_deref())
+}
+
+/// The pure half of [`rgb_request`], so the accepted spellings are testable without mutating the
+/// process environment (which no parallel test can do safely).
+fn parse_rgb_request(raw: Option<&str>) -> Option<bool> {
+    match raw?.trim() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
     }
 }
 
@@ -4454,7 +4465,7 @@ unsafe fn build_parameters_av1(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_h265_rps_s0, pick_recovery_slot, VulkanVideoEncoder};
+    use super::{build_h265_rps_s0, parse_rgb_request, pick_recovery_slot, VulkanVideoEncoder};
     use crate::{Codec, Encoder};
     use pf_frame::{CapturedFrame, FramePayload, PixelFormat};
 
@@ -4741,6 +4752,28 @@ mod tests {
     fn vulkan_smoke_rgb_av1() {
         if let Some(aus) = run_smoke_opts(Codec::Av1, true) {
             dump_smoke(&aus, "rgb.obu");
+        }
+    }
+
+    /// `PUNKTFUNK_VULKAN_RGB_DIRECT` accepts the same spellings as every sibling knob, trimmed.
+    #[test]
+    fn rgb_direct_knob_accepts_the_house_spellings() {
+        for on in ["1", "true", "yes", "on", " 1", "1 ", "\ton\n"] {
+            assert_eq!(parse_rgb_request(Some(on)), Some(true), "{on:?}");
+        }
+        for off in ["0", "false", "no", "off", " 0", "0 ", "\toff\n"] {
+            assert_eq!(parse_rgb_request(Some(off)), Some(false), "{off:?}");
+        }
+    }
+
+    /// Unset, empty and unrecognised values all mean "use the default" — never a force-on. The
+    /// pre-fix parse read anything-but-`"0"` as a force, so a trailing space on `PUNKTFUNK_...=0 `
+    /// silently enabled the very path the operator was disabling, cursor and all.
+    #[test]
+    fn rgb_direct_knob_never_force_enables_on_an_unrecognised_value() {
+        assert_eq!(parse_rgb_request(None), None);
+        for junk in ["", "   ", "2", "maybe", "0x0", "enabled"] {
+            assert_eq!(parse_rgb_request(Some(junk)), None, "{junk:?}");
         }
     }
 }
