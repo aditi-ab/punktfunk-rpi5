@@ -264,6 +264,112 @@ fn split_mode_units(split_mode: u32) -> u32 {
     }
 }
 
+/// Serializes every `nvEncOpenEncodeSessionEx` in this process against [`reap_parked_sessions`].
+/// The reap retry-destroys handles whose driver-side state is unknown; if it overlapped an open,
+/// the driver could hand the NEW session the recycled address of the zombie being destroyed and
+/// the reap would destroy a live session. Held across `init_session`'s whole open sequence
+/// (including its caps probe and bitrate-clamp search) and around the standalone caps probes.
+/// Admission (`can_open_another_session`) never takes it — that stays a lock-free atomic load.
+static DRIVER_SESSION_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// A session whose `destroy_encoder` failed with an AMBIGUOUS status (see
+/// [`nvenc_status::destroy_proves_no_session`]): the driver may still hold its concurrent-session
+/// slot, so its units stay charged in [`LIVE_SESSION_UNITS`] (fail-closed for admission) and the
+/// handle is parked here for [`reap_parked_sessions`] to retry. The retry is what keeps a
+/// TRANSIENT failure (wedge episode a TDR later cleared) from poisoning the budget until a host
+/// restart, while a genuine driver leak keeps failing the retry and stays correctly charged.
+struct ParkedSession {
+    enc: usize,
+    units: u32,
+    /// Pins the D3D11 device the session was opened against. Teardown drops the texture
+    /// registrations (the only other refs), and the reinit-on-device-change path parks exactly
+    /// when the old device is on its way out — without this, the reap's late `destroy_encoder`
+    /// could touch a freed device.
+    _device: Option<ID3D11Device>,
+}
+
+// SAFETY: the COM ref is the only non-Send field. The D3D11 device is free-threaded (capture
+// creates it without `D3D11_CREATE_DEVICE_SINGLETHREADED` — see pf-frame/src/dxgi.rs), we never
+// call methods on it from here, and dropping (Release) a free-threaded COM object from another
+// thread is sound. The raw `enc` handle is only ever passed back to `destroy_encoder` under
+// [`PARKED`]'s lock with [`DRIVER_SESSION_GATE`] held — single-threaded access in practice.
+unsafe impl Send for ParkedSession {}
+
+static PARKED: std::sync::Mutex<Vec<ParkedSession>> = std::sync::Mutex::new(Vec::new());
+
+/// Park a session whose destroy failed ambiguously. Units are NOT refunded — they keep counting
+/// against admission until a reap proves the slot free. Bounded: once parked units would exceed
+/// the session cap the oldest entry ages out WITH a refund (a repeated wedge-rebuild loop would
+/// otherwise grow this without limit, and by then the driver has almost certainly been through
+/// the reset that reclaims the early handles anyway).
+fn park_session(enc: usize, units: u32, device: Option<ID3D11Device>) {
+    let mut parked = PARKED.lock().unwrap_or_else(|p| p.into_inner());
+    while !parked.is_empty() && parked.iter().map(|z| z.units).sum::<u32>() + units > session_cap()
+    {
+        let old = parked.remove(0);
+        LIVE_SESSION_UNITS.fetch_sub(old.units, std::sync::atomic::Ordering::Relaxed);
+        tracing::warn!(
+            enc = old.enc,
+            units = old.units,
+            "NVENC parked-session graveyard full — aging out the oldest entry (units refunded)"
+        );
+    }
+    parked.push(ParkedSession {
+        enc,
+        units,
+        _device: device,
+    });
+}
+
+/// Retry `destroy_encoder` on every parked session and refund the units of each one that now
+/// succeeds (or fails with a session-gone status — same proof). Runs from `init_session` on the
+/// encode thread, NEVER from admission (a wedged driver would block the admission registry lock).
+///
+/// # Safety
+/// Caller must hold [`DRIVER_SESSION_GATE`] and there must be NO live NVENC session in the
+/// process (checked here: live units == parked units). Under those two conditions no live session
+/// can alias a recycled handle address, and no concurrent open can be handed one mid-reap. The
+/// residual assumption — documented, unprovable from the SDK — is that a FAILED destroy leaves
+/// the handle itself intact for a later retry; NVENC documents no retry semantics either way.
+unsafe fn reap_parked_sessions() {
+    let mut parked = PARKED.lock().unwrap_or_else(|p| p.into_inner());
+    if parked.is_empty() {
+        return;
+    }
+    let parked_units: u32 = parked.iter().map(|z| z.units).sum();
+    if LIVE_SESSION_UNITS.load(std::sync::atomic::Ordering::Relaxed) != parked_units {
+        return; // a live session exists somewhere — its address space is off limits
+    }
+    parked.retain(
+        |z| match (api().destroy_encoder)(z.enc as *mut c_void).nv_ok() {
+            Ok(()) => {
+                tracing::info!(
+                    enc = z.enc,
+                    units = z.units,
+                    "NVENC parked session reclaimed — retry-destroy succeeded, budget refunded"
+                );
+                LIVE_SESSION_UNITS.fetch_sub(z.units, std::sync::atomic::Ordering::Relaxed);
+                false
+            }
+            Err(e) if nvenc_status::destroy_proves_no_session(e) => {
+                tracing::info!(
+                    enc = z.enc,
+                    units = z.units,
+                    status = ?e,
+                    "NVENC parked session gone on the driver side — budget refunded"
+                );
+                LIVE_SESSION_UNITS.fetch_sub(z.units, std::sync::atomic::Ordering::Relaxed);
+                false
+            }
+            Err(e) => {
+                tracing::debug!(enc = z.enc, status = ?e,
+                    "NVENC parked session still refuses destroy — units stay charged");
+                true
+            }
+        },
+    );
+}
+
 /// Whether the operator asked for the two-thread async retrieve (`PUNKTFUNK_NVENC_ASYNC` truthy).
 /// Combined with the GPU's `NV_ENC_CAPS_ASYNC_ENCODE_SUPPORT` in `init_session`. Opt-in until
 /// on-glass validated; note an async-rejecting config surfaces as a failed session open — unset
@@ -324,7 +430,23 @@ fn retrieve_loop(
     done_tx: mpsc::Sender<RetrieveDone>,
 ) {
     pf_frame::thread_qos::boost_thread_priority(false);
+    // Wedged-vs-routine drain (WP5.2b). Teardown drops the job sender and joins this thread, so
+    // every queued job is WAITED for (never abandoned — abandoning converts the routine drain
+    // into destroy/unmap/close-while-encoding). But on a wedged session that used to cost the
+    // full 5 s PER queued job: up to `cap x 5 s` on the encode thread, and the stall-recovery
+    // ladder rebuilds the session several times per episode, paying it each rebuild. The wedge
+    // evidence lives right here — a completion wait that burned its full budget — so after one
+    // full-budget timeout later jobs get a short slice instead. A first timeout is already
+    // encoder-fatal (its Err reaches `absorb_done` before any later completion is handed out,
+    // and the host tears the session down), so short-slicing behind an established wedge changes
+    // only how long teardown blocks, never an outcome. A successful wait resets the latch, which
+    // keeps a transient GPU stall from cascading short slices into false timeouts. (NVENC does
+    // not document completion ordering across in-flight frames; nothing here relies on it —
+    // FIFO only sharpens the latency bound.)
+    const WEDGED_DRAIN_WAIT_MS: u32 = 250;
+    let mut wedged = false;
     while let Ok(job) = work_rx.recv() {
+        let wait_ms = if wedged { WEDGED_DRAIN_WAIT_MS } else { 5000 };
         // SAFETY: `job.event` is one of the auto-reset events `init_session` created and
         // registered for exactly this session, and `job.bs` one of its pool bitstreams; both stay
         // valid until `teardown`, which joins this thread first. `WaitForSingleObject` takes the
@@ -335,9 +457,13 @@ fn retrieve_loop(
         // Lock/unlock from a secondary thread while the encode thread submits is the NVENC
         // guide's documented threading model.
         let result = unsafe {
-            if WaitForSingleObject(HANDLE(job.event as *mut c_void), 5000) != WAIT_OBJECT_0 {
-                Err("NVENC completion event timeout (5s) — encoder wedged?".to_string())
+            if WaitForSingleObject(HANDLE(job.event as *mut c_void), wait_ms) != WAIT_OBJECT_0 {
+                wedged = true;
+                Err(format!(
+                    "NVENC completion event timeout ({wait_ms} ms) — encoder wedged?"
+                ))
             } else {
+                wedged = false;
                 let mut lock = nv::NV_ENC_LOCK_BITSTREAM {
                     version: nv::NV_ENC_LOCK_BITSTREAM_VER,
                     outputBitstream: job.bs as *mut c_void,
@@ -473,6 +599,11 @@ pub struct NvencD3d11Encoder {
     /// device on a desktop switch (normal ↔ Winlogon secure); when a frame carries a new device we
     /// tear down and re-init NVENC against it.
     init_device: *mut c_void,
+    /// COM ref pinning that device while the session lives. `init_device` alone pins nothing, and
+    /// `teardown` releases the texture registrations (the only other refs) BEFORE destroying the
+    /// session — worse, a failed destroy parks the session handle for a later retry, which must
+    /// never outlive the device it references. Moved into the [`ParkedSession`] on that path.
+    init_device_com: Option<ID3D11Device>,
     /// The hardware-session units THIS encoder holds against [`LIVE_SESSION_UNITS`] (1 plain, 2–3
     /// under forced split-encode — a split session occupies one session per engine). `0` while no
     /// session is open; set by `init_session`, returned by `teardown`.
@@ -546,6 +677,7 @@ impl NvencD3d11Encoder {
             session_async: false,
             last_rfi_range: None,
             init_device: ptr::null_mut(),
+            init_device_com: None,
             session_units: 0,
         })
     }
@@ -592,18 +724,41 @@ impl NvencD3d11Encoder {
         for &bs in &self.bitstreams {
             let _ = (api().destroy_bitstream_buffer)(self.encoder, bs);
         }
-        // A destroy failure means the driver may still hold this session's slot (the concurrent-
-        // session cap is per process and only a restart clears a leak) — make it visible instead
-        // of silently discarding the status.
-        if let Err(e) = (api().destroy_encoder)(self.encoder).nv_ok() {
-            tracing::warn!(
-                status = ?e,
-                "NVENC destroy_encoder failed at teardown — the driver may have leaked this \
-                 session's slot toward the concurrent-session cap"
-            );
+        // Session-budget truth (see LIVE_SESSION_UNITS): refund only on PROOF the driver released
+        // the slot — a successful destroy, or a failure whose status says the session/device no
+        // longer exists on the driver side (a TDR reclaims every session with the context). The
+        // old unconditional refund made the counter drift low on real leaks (over-admitting
+        // parallel displays); the opposite extreme — a permanent charge on ANY failure — let one
+        // transient wedge episode poison admission until a host restart. Ambiguous failures
+        // instead PARK the handle with its units still charged (fail-closed), and
+        // `reap_parked_sessions` retries the destroy once no session is live, so the charge lasts
+        // exactly as long as the driver keeps refusing — which is the definition of still-leaked.
+        let dev_pin = self.init_device_com.take();
+        match (api().destroy_encoder)(self.encoder).nv_ok() {
+            Ok(()) => {
+                LIVE_SESSION_UNITS
+                    .fetch_sub(self.session_units, std::sync::atomic::Ordering::Relaxed);
+            }
+            Err(e) if nvenc_status::destroy_proves_no_session(e) => {
+                tracing::warn!(
+                    status = ?e,
+                    "NVENC destroy_encoder failed, but the status proves the driver holds no \
+                     session (device gone/reset) — budget refunded"
+                );
+                LIVE_SESSION_UNITS
+                    .fetch_sub(self.session_units, std::sync::atomic::Ordering::Relaxed);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    status = ?e,
+                    units = self.session_units,
+                    "NVENC destroy_encoder failed ambiguously — the driver may still hold this \
+                     session's slot; parking the handle (units stay charged until a reap-destroy \
+                     proves the slot free)"
+                );
+                park_session(self.encoder as usize, self.session_units, dev_pin);
+            }
         }
-        // Return this session's units to the budget (see LIVE_SESSION_UNITS).
-        LIVE_SESSION_UNITS.fetch_sub(self.session_units, std::sync::atomic::Ordering::Relaxed);
         self.session_units = 0;
         self.regs.clear(); // drops the texture clones, releasing our refs
         self.bitstreams.clear();
@@ -863,6 +1018,15 @@ impl NvencD3d11Encoder {
 
     /// Lazily create the session on the first frame's D3D11 device (so capture + encode share it).
     fn init_session(&mut self, device: &ID3D11Device) -> Result<()> {
+        // Serialize this whole open sequence (caps probe + bitrate-clamp search + charge) against
+        // every other open and against the zombie reap — see DRIVER_SESSION_GATE. Cold path:
+        // sessions open on a stream start or a device-change rebuild, never per frame.
+        let _gate = DRIVER_SESSION_GATE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        // SAFETY: gate held (no open can be handed a recycled zombie address mid-reap) and the
+        // reap itself re-checks that no live session exists before touching any parked handle.
+        unsafe { reap_parked_sessions() };
         // SAFETY: every call below goes through a function pointer resolved once from the
         // runtime-loaded [`EncodeApi`] table (`api()`, gated in `open`), or through this type's own
         // `unsafe fn`s whose contract is met here. `query_caps`/`try_open_session` receive `device`,
@@ -1019,6 +1183,9 @@ impl NvencD3d11Encoder {
                 }
             };
             self.encoder = enc;
+            // Pin the device for the session's lifetime — and for a parked afterlife if the
+            // eventual destroy fails (see `ParkedSession::_device`).
+            self.init_device_com = Some(device.clone());
             // Session init params a later `reconfigure_bitrate` must re-present verbatim.
             self.split_mode = used_split;
             self.session_async = use_async;
@@ -1049,6 +1216,12 @@ impl NvencD3d11Encoder {
                 for _ in 0..POOL {
                     let ev = CreateEventW(None, false, false, PCWSTR::null())
                         .context("CreateEvent (NVENC completion)")?;
+                    // Push BEFORE registering: a failed registration propagates out of
+                    // `init_session` into submit's teardown call, and only handles that made it
+                    // into `self.events` get closed there — pushing after the fallible call
+                    // leaked the Win32 event on every registration failure. Teardown's
+                    // unregister of the one never-registered event is a harmless error return.
+                    self.events.push(ev.0 as usize);
                     let mut ep = nv::NV_ENC_EVENT_PARAMS {
                         version: nv::NV_ENC_EVENT_PARAMS_VER,
                         completionEvent: ev.0,
@@ -1057,7 +1230,6 @@ impl NvencD3d11Encoder {
                     (api().register_async_event)(enc, &mut ep)
                         .nv_ok()
                         .map_err(|e| nvenc_status::call_err("register_async_event", e))?;
-                    self.events.push(ev.0 as usize);
                 }
                 let (work_tx, work_rx) = mpsc::sync_channel::<RetrieveJob>(POOL);
                 let (done_tx, done_rx) = mpsc::channel::<RetrieveDone>();
@@ -1751,6 +1923,11 @@ pub fn probe_can_encode_10bit(codec: Codec) -> bool {
 /// on any failure (no loadable NVENC, no device, failed open) — the honest answer for a
 /// capability that couldn't be confirmed.
 fn probe_encode_cap(codec: Codec, cap: nv::NV_ENC_CAPS) -> bool {
+    // Same exclusion as `init_session`: this opens a real (throwaway) session, so it must never
+    // overlap a zombie reap that could be destroying the very address the driver hands us.
+    let _gate = DRIVER_SESSION_GATE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     use windows::Win32::Foundation::HMODULE;
     use windows::Win32::Graphics::Direct3D::{
         D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_11_0,

@@ -161,6 +161,30 @@ pub(super) fn call_err(call: &str, status: nv::NVENCSTATUS) -> anyhow::Error {
     anyhow::Error::new(NvCallError(status)).context(format!("NVENC {call} failed"))
 }
 
+/// Whether a FAILED `nvEncDestroyEncoder` status PROVES the driver holds no session for the
+/// handle — i.e. the per-process concurrent-session slot is not consumed, so the session's budget
+/// units can be refunded immediately. These are the statuses the driver returns when the session
+/// or its device no longer exists on its side (a TDR/device removal reclaims every session with
+/// the context). Everything else — `GENERIC`, `ENCODER_BUSY`, OOM, ... — is AMBIGUOUS: the slot
+/// may genuinely still be held, so the caller must park the handle fail-closed (units stay
+/// charged) and let a later retry-destroy produce the proof. Splitting on proof is what keeps the
+/// session budget from drifting low on failures (over-admitting parallel displays) WITHOUT letting
+/// one transient wedge episode permanently poison admission until a host restart.
+///
+/// Used by the Windows D3D11 backend's teardown accounting; the Linux CUDA backend has no session
+/// budget (parallel-display admission is a Windows feature), so there this exists for the unit
+/// tests only.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub(super) fn destroy_proves_no_session(status: nv::NVENCSTATUS) -> bool {
+    matches!(
+        status,
+        nv::NVENCSTATUS::NV_ENC_ERR_DEVICE_NOT_EXIST
+            | nv::NVENCSTATUS::NV_ENC_ERR_INVALID_ENCODERDEVICE
+            | nv::NVENCSTATUS::NV_ENC_ERR_INVALID_PTR
+            | nv::NVENCSTATUS::NV_ENC_ERR_ENCODER_NOT_INITIALIZED
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -204,5 +228,38 @@ mod tests {
             explain(nv::NVENCSTATUS::NV_ENC_ERR_OUT_OF_MEMORY),
             "the GPU is out of memory"
         );
+    }
+
+    /// Destroy-failure classification: session-gone statuses refund; everything ambiguous parks.
+    /// The split is the load-bearing part of the session-budget accounting — a wrong `true`
+    /// under-counts (over-admits parallel displays), a wrong `false` merely defers the refund to
+    /// a reap retry.
+    #[test]
+    fn destroy_classification_refunds_only_on_proof() {
+        for gone in [
+            nv::NVENCSTATUS::NV_ENC_ERR_DEVICE_NOT_EXIST,
+            nv::NVENCSTATUS::NV_ENC_ERR_INVALID_ENCODERDEVICE,
+            nv::NVENCSTATUS::NV_ENC_ERR_INVALID_PTR,
+            nv::NVENCSTATUS::NV_ENC_ERR_ENCODER_NOT_INITIALIZED,
+        ] {
+            assert!(
+                destroy_proves_no_session(gone),
+                "{gone:?} proves no session"
+            );
+        }
+        for ambiguous in [
+            nv::NVENCSTATUS::NV_ENC_ERR_GENERIC,
+            nv::NVENCSTATUS::NV_ENC_ERR_ENCODER_BUSY,
+            nv::NVENCSTATUS::NV_ENC_ERR_OUT_OF_MEMORY,
+            nv::NVENCSTATUS::NV_ENC_ERR_INVALID_PARAM,
+            // INVALID_DEVICE sounds like the gone class but is also what a transiently-confused
+            // driver returns — deliberately fail-closed (park + retry), not refunded.
+            nv::NVENCSTATUS::NV_ENC_ERR_INVALID_DEVICE,
+        ] {
+            assert!(
+                !destroy_proves_no_session(ambiguous),
+                "{ambiguous:?} must park fail-closed"
+            );
+        }
     }
 }
