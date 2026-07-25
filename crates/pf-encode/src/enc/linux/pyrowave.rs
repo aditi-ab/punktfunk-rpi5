@@ -917,6 +917,40 @@ impl PyroWaveEncoder {
         );
         let dev = self.device.clone();
         let (w, h) = (self.width, self.height);
+        // The frame must be exactly the session's mode (WP4.5). PyroWave applies NO alignment —
+        // `width`/`height` are the negotiated mode verbatim — so any mismatch is a bug somewhere,
+        // and until now it was a SILENT one: the frame was encoded edge-smeared or cropped.
+        //
+        // Every other Linux backend already refuses exactly this, with this shape, in `submit`:
+        // libav-NVENC (`linux/mod.rs`), VAAPI (`linux/vaapi.rs`) and openh264 (`sw.rs`) all carry
+        // the same `ensure!`. PyroWave was the only one that didn't. (`vulkan_video.rs` bails in
+        // its Dmabuf arms only — its CSC path and its CPU arm do not — so it is the weaker
+        // precedent, not the model.)
+        //
+        // Mostly this is a wrong-picture bug rather than a memory-safety one: `rgb2yuv.comp`
+        // clamps every fetch with `min(p, textureSize - 1)` and the CPU arm uploads
+        // `min(len, need)` into a session-sized image. But it also closes a narrow real hazard —
+        // `import_cached` keys on `(st_dev, st_ino)` and returns the cached `VkImage` on a hit
+        // WITHOUT rechecking the extent, and unlike the capture side it is never cleared on a
+        // renegotiation. A dmabuf inode recycled across a SHRINKING renegotiation would hand the
+        // encoder an image sized for the old, larger allocation. After this check every frame
+        // reaching that cache has the session's dimensions, so the size-change route is closed.
+        //
+        // ⚠ A mismatch is NOT always transient. A compositor-initiated PipeWire renegotiation
+        // updates the capturer's size in place and signals nothing the encode loop reads, so this
+        // can be a permanent new steady state — and `reset()` reopens at the SAME dimensions by
+        // construction, so the host's five-reset budget cannot fix it (≈3.1 s of frozen stream,
+        // then the session ends). That is still better than shipping a smeared picture forever,
+        // but the real fix is for the host to treat this error as a PIPELINE rebuild rather than
+        // an encoder reset. Filed; not this commit.
+        if frame.width != w || frame.height != h {
+            bail!(
+                "pyrowave: frame {}x{} != session mode {w}x{h} — refusing a mismatched encode \
+                 source",
+                frame.width,
+                frame.height
+            );
+        }
         // Everything from `begin` through `queue_submit` runs in one closure whose error arm
         // resets `self.cmd`. On every arm inside it the reset is LEGAL: a mid-recording failure
         // leaves RECORDING, a failed `end` leaves INVALID, a failed `queue_submit` enqueued
@@ -1685,6 +1719,48 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// WP4.5: a frame that is not the session's mode must be REFUSED, not encoded. PyroWave
+    /// applies no alignment, so a mismatch can only be a stale frame from a renegotiated mode —
+    /// and the failure is silent without this check (`rgb2yuv.comp` clamps its fetches and the CPU
+    /// arm uploads `min(len, need)`), so it ships an edge-smeared or cropped picture rather than
+    /// erroring. Both directions, since undersized and oversized smear in opposite ways. The
+    /// session must still be usable afterwards: the refusal happens before anything is recorded,
+    /// so a correctly-sized frame right after must encode normally.
+    #[test]
+    #[ignore = "needs a real Vulkan 1.3 compute device (run on a GPU host, not the build box)"]
+    fn pyrowave_refuses_a_frame_that_is_not_the_mode() {
+        let (w, h) = (256u32, 256u32);
+        let mut enc =
+            PyroWaveEncoder::open(w, h, 60, 40_000_000, crate::ChromaFormat::Yuv420).expect("open");
+        for (fw, fh) in [(w - 2, h), (w, h - 2), (w + 2, h + 2)] {
+            let err = enc
+                .submit(&cpu_frame(fw, fh, 0, [200, 40, 40, 255]))
+                .expect_err("a frame that is not the mode must be refused");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("session mode"),
+                "the refusal must name the mismatch, got: {msg}"
+            );
+        }
+        // A refusal must enqueue NOTHING. Checked before the good frame, because `pending` is a
+        // queue: asserting `is_some()` after a successful submit would pass even if the three
+        // refusals had each pushed an AU, and would then be measuring the wrong one.
+        assert!(
+            enc.poll().expect("poll").is_none(),
+            "a refused frame must not enqueue an AU"
+        );
+        enc.submit(&cpu_frame(w, h, 16_666_667, [40, 200, 40, 255]))
+            .expect("a correctly-sized frame after a refusal must still encode");
+        assert!(
+            enc.poll().expect("poll").is_some(),
+            "the session must survive the refusals"
+        );
+        assert!(
+            enc.poll().expect("poll").is_none(),
+            "exactly one AU for one accepted frame"
+        );
     }
 
     /// WP5.1: a failed dmabuf import must leak neither the dup'd fd nor the VkImage. Drives
