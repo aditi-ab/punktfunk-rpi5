@@ -47,6 +47,15 @@ pub const PRIMARY_REF_NONE: u8 = 7;
 /// `VK_VIDEO_ENCODE_AV1_SUPERBLOCK_SIZE_128_BIT_KHR` (bit 1 of the superblock-size flags).
 pub const SUPERBLOCK_SIZE_128: u32 = 0x2;
 
+// `VkVideoEncodeAV1CapabilityFlagBitsKHR` — the two that decide whether the encode source may be a
+// different size from the declared frame. Both absent on RADV PHOENIX.
+/// Without this, the source's `codedExtent` MUST equal the sequence header's
+/// `max_frame_{width,height}_minus_1 + 1` (`VUID-vkCmdEncodeVideoKHR-flags-10324`).
+pub const CAPABILITY_FRAME_SIZE_OVERRIDE: u32 = 0x0000_0008;
+/// Without this, EVERY reference slot's `codedExtent` MUST equal the source's
+/// (`VUID-vkCmdEncodeVideoKHR-flags-10325`).
+pub const CAPABILITY_MOTION_VECTOR_SCALING: u32 = 0x0000_0010;
+
 // `VkVideoEncodeAV1PredictionModeKHR`
 pub const PREDICTION_MODE_INTRA_ONLY: i32 = 0;
 pub const PREDICTION_MODE_SINGLE_REFERENCE: i32 = 1;

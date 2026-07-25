@@ -1053,7 +1053,23 @@ impl VulkanVideoEncoder {
         // matching true-size codedExtent, programs the VCN with firmware padding so the source
         // is never read past its extent. The CSC/RGB paths keep the app-aligned convention
         // (their sources genuinely cover the aligned extent).
-        let (hdr_w, hdr_h) = if native_nv12 { (rw, rh) } else { (w, h) };
+        // AV1 + RGB true-extent joins the true-size camp for the same reason: true-extent shrinks
+        // `srcPictureResource.codedExtent` to the render size, and AV1 forbids the sequence header
+        // (`flags-10324`) or the reference slots (`flags-10325`) disagreeing with the source unless
+        // the GPU advertises FRAME_SIZE_OVERRIDE / MOTION_VECTOR_SCALING — RADV PHOENIX advertises
+        // neither. Rather than give up the EFC fast path, make all three agree at the RENDER size:
+        // the coded frame genuinely IS the visible size (an unpadded coded size is valid on this
+        // hardware), so nothing codes alignment padding at all and the reference slots follow the
+        // source extent below.
+        //
+        // HEVC deliberately stays on the app-aligned convention: it has no equivalent constraint
+        // (its crop rides the conformance window) and that path is the validated one.
+        let (hdr_w, hdr_h) =
+            if native_nv12 || (av1 && rgb_cfg.as_ref().is_some_and(|c| c.true_extent)) {
+                (rw, rh)
+            } else {
+                (w, h)
+            };
         let (params, header, frame_prefix) = if av1 {
             build_parameters_av1(
                 &device,
@@ -3040,7 +3056,7 @@ impl VulkanVideoEncoder {
         // at any mode that needed 64x16 alignment the decoder fell back to the CODED size and the
         // client displayed our alignment padding — e.g. 1080p arriving as 1088 rows, the bottom 8
         // being duplicated edge pixels.
-        if self.render_w != self.width || self.render_h != self.height {
+        if self.render_w != src_extent.width || self.render_h != src_extent.height {
             pic_flags.set_render_and_frame_size_different(1);
         }
         let mut std_pic: av1::StdVideoEncodeAV1PictureInfo = std::mem::zeroed();
@@ -3107,8 +3123,13 @@ impl VulkanVideoEncoder {
         };
 
         // ---- setup (reconstruct into) + reference (read from) DPB slots ----
+        // DPB slots carry the SOURCE extent, not the aligned one. Without
+        // MOTION_VECTOR_SCALING every reference slot's `codedExtent` must equal the source's
+        // (`VUID-vkCmdEncodeVideoKHR-flags-10325`), and in true-extent mode the source is the
+        // render size. `src_extent` already collapses to `ext2d` whenever true-extent is off, so
+        // this is a no-op for every other configuration.
         let setup_res = vk::VideoPictureResourceInfoKHR::default()
-            .coded_extent(ext2d)
+            .coded_extent(src_extent)
             .image_view_binding(self.dpb_views[setup_idx]);
         let mut setup_ref_std: av1::StdVideoEncodeAV1ReferenceInfo = std::mem::zeroed();
         setup_ref_std.frame_type = std_pic.frame_type;
@@ -3128,7 +3149,7 @@ impl VulkanVideoEncoder {
         begin_setup.p_next = &setup_dpb as *const _ as *const c_void;
 
         let ref_res = vk::VideoPictureResourceInfoKHR::default()
-            .coded_extent(ext2d)
+            .coded_extent(src_extent)
             .image_view_binding(self.dpb_views[ref_slot]);
         let mut ref_ref_std: av1::StdVideoEncodeAV1ReferenceInfo = std::mem::zeroed();
         ref_ref_std.frame_type = if self.slot_poc[ref_slot] == 0 {
