@@ -519,9 +519,20 @@ fn build_params(cfg: &EncodeConfig) -> ParamSet {
         }
         b.WhitePointX = m.white_point[0];
         b.WhitePointY = m.white_point[1];
-        // Units diverge on the max: VPL wants whole cd/m² (HdrMeta carries 0.0001 cd/m²); the
-        // min is 0.0001 cd/m² on both sides.
-        b.MaxDisplayMasteringLuminance = m.max_display_mastering_luminance / 10_000;
+        // BOTH luminance fields are 0.0001 cd/m² here — do NOT scale the max.
+        //
+        // The `/10_000` this used to carry followed the VPL header's *video-processing* unit
+        // (whole cd/m², which is right for VPP), but on the ENCODE path the runtime passes these
+        // straight into the ITU-T H.265 Annex D mastering-display SEI, whose unit is 0.0001 cd/m².
+        // Dividing therefore under-reported peak brightness by 10,000x. Confirmed in a real
+        // bitstream on Intel UHD 750 (2026-07-25): SEI 137 carried
+        // max_display_mastering_luminance = 1000, i.e. **0.1 nits** for a 1000-nit display, while
+        // the undivided min = 500 (0.05 nits) was correct — the asymmetry was the tell. A client
+        // tone-mapping against 0.1 nits crushes the image.
+        //
+        // Unscaled also matches every sibling: `MinDisplayMasteringLuminance` right below,
+        // `pf_frame::hdr::hevc_mastering_display_sei`, and the AMF backend.
+        b.MaxDisplayMasteringLuminance = m.max_display_mastering_luminance;
         b.MinDisplayMasteringLuminance = m.min_display_mastering_luminance;
         b
     });
@@ -690,13 +701,17 @@ impl Inner {
     }
 
     fn take_bs(&mut self) -> Box<BsBuf> {
-        match self.bs_pool.pop() {
-            Some(mut b) => {
+        // Pooled buffers were sized by whatever `bs_bytes` was when they were allocated. A bitrate
+        // retarget raises the driver's worst-case AU size, so a recycled buffer can be SMALLER than
+        // the current requirement — hand those back to the allocator instead of letting the runtime
+        // write an AU into a short buffer.
+        while let Some(mut b) = self.bs_pool.pop() {
+            if b.mfx.MaxLength as usize >= self.bs_bytes {
                 b.recycle();
-                b
+                return b;
             }
-            None => BsBuf::new(self.bs_bytes),
         }
+        BsBuf::new(self.bs_bytes)
     }
 }
 
@@ -1582,6 +1597,38 @@ impl Encoder for QsvEncoder {
             );
             self.bitrate_bps = old;
             return false;
+        }
+        // Re-read the driver's worst-case AU size. `Reset` re-derives `BufferSizeInKB` from the new
+        // rate, and a step-up can raise it well above what `init_encode` computed — leaving
+        // `bs_bytes` (and every buffer already in the pool) sized for the OLD, lower bitrate. This
+        // mirrors `init_encode`, which asks the same question post-Init; `take_bs` drops any pooled
+        // buffer that is now too small.
+        // SAFETY: `session` is live on this thread and drained above; `got` and its (empty) ext
+        // chain outlive the synchronous call.
+        let refreshed = unsafe {
+            let mut got: vpl::mfxVideoParam = std::mem::zeroed();
+            let sts = vpl::MFXVideoENCODE_GetVideoParam(session, &mut got);
+            (sts >= vpl::MFX_ERR_NONE).then(|| {
+                let m = &mut got.__bindgen_anon_1.mfx;
+                let mult = m.BRCParamMultiplier.max(1) as usize;
+                let kb = enc_of(m).BufferSizeInKB as usize;
+                (kb * mult * 1000).max(256 * 1024)
+            })
+        };
+        match (refreshed, self.inner.as_mut()) {
+            (Some(bytes), Some(inner)) if bytes > inner.bs_bytes => {
+                tracing::debug!(
+                    old_bytes = inner.bs_bytes,
+                    new_bytes = bytes,
+                    mbps = bps / 1_000_000,
+                    "QSV retarget raised the worst-case AU size — resizing the bitstream pool"
+                );
+                inner.bs_bytes = bytes;
+            }
+            (None, _) => tracing::warn!(
+                "QSV retarget: GetVideoParam failed, keeping the previous AU buffer size"
+            ),
+            _ => {}
         }
         true
     }

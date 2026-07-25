@@ -388,6 +388,12 @@ pub struct NvencD3d11Encoder {
     /// `NV_ENC_CAPS_SUPPORT_YUV444_ENCODE` (cleared in `query_caps` on a card that lacks it) and on an
     /// RGB input format (NV12/P010 capture can't reconstruct 4:4:4). HEVC-only.
     chroma_444: bool,
+    /// What the SESSION NEGOTIATED, before any per-init downgrade. `chroma_444` above is the
+    /// EFFECTIVE value for the session currently open and is cleared whenever the capturer hands us
+    /// subsampled YUV — which used to overwrite the negotiation itself, so a capturer that went
+    /// back to RGB (HDR toggle, capture-path switch) could never recover 4:4:4 for the rest of the
+    /// stream. Keeping the request separate lets every re-init recompute the effective value.
+    chroma_444_requested: bool,
     /// `NV_ENC_CAPS_SUPPORT_YUV444_ENCODE` from the caps probe — whether this GPU can 4:4:4 encode at
     /// all. `chroma_444` is forced off when this is false (graceful downgrade to 4:2:0).
     yuv444_supported: bool,
@@ -395,6 +401,17 @@ pub struct NvencD3d11Encoder {
     /// `ABGR10` input format + the BT.2020/PQ colour VUI. Derived per-frame from the capture format
     /// (HDR can toggle mid-session); a change re-inits the session.
     hdr: bool,
+    /// The HDR state the CAPTURE FORMAT asks for, independent of whether this GPU can serve it.
+    ///
+    /// `hdr` above is the effective value and `query_caps` clears it on a card without 10-bit
+    /// encode. `submit` re-derives the requested value from every frame's pixel format, so
+    /// comparing that against the post-downgrade `hdr` made them disagree permanently: a P010
+    /// capturer on such a GPU reported "HDR changed" on EVERY frame and tore down and rebuilt the
+    /// whole session each time. The re-init trigger compares against THIS instead.
+    hdr_requested: bool,
+    /// Latched when `query_caps` finds no 10-bit encode support, so the downgrade is remembered
+    /// across re-inits instead of being rediscovered (and re-warned) every session.
+    hdr_unsupported: bool,
     /// The source's static HDR mastering metadata (from the capturer's `GetDesc1`), emitted as
     /// in-band SEI (`mastering_display_colour_volume` + `content_light_level_info`) on each keyframe
     /// when `hdr`. `None` = unknown → no SEI (the VUI still signals BT.2020 PQ). Set per-frame via
@@ -505,6 +522,9 @@ impl NvencD3d11Encoder {
             bit_depth,
             // 4:4:4 is HEVC-only; the GPU-support gate is applied in `query_caps`.
             chroma_444: chroma.is_444() && codec == Codec::H265,
+            chroma_444_requested: chroma.is_444() && codec == Codec::H265,
+            hdr_requested: false,
+            hdr_unsupported: false,
             yuv444_supported: false,
             hdr: false,
             hdr_meta: None,
@@ -672,7 +692,12 @@ impl NvencD3d11Encoder {
         }
         // Degrade gracefully rather than fail: no 10-bit encode on this card → 8-bit SDR.
         if self.bit_depth >= 10 && ten_bit == 0 {
-            tracing::warn!("NVENC: this GPU can't 10-bit encode — falling back to 8-bit SDR");
+            if !self.hdr_unsupported {
+                tracing::warn!("NVENC: this GPU can't 10-bit encode — falling back to 8-bit SDR");
+            }
+            // Latched: `submit` compares the frame's REQUESTED hdr against `hdr_requested`, not
+            // against this cleared value, so a 10-bit capturer no longer re-inits every frame.
+            self.hdr_unsupported = true;
             self.bit_depth = 8;
             self.hdr = false;
         }
@@ -1124,7 +1149,11 @@ impl Encoder for NvencD3d11Encoder {
         let dev_raw = frame.device.as_raw();
         let size_changed =
             self.inited && (self.width != captured.width || self.height != captured.height);
-        let hdr_changed = self.inited && self.hdr != hdr;
+        // Compare against what was REQUESTED last init, not the effective `self.hdr`: on a GPU
+        // without 10-bit encode `query_caps` clears `self.hdr`, so comparing it against a P010
+        // capturer's perpetual `hdr = true` reported a change on every single frame and tore the
+        // session down and rebuilt it each time.
+        let hdr_changed = self.inited && self.hdr_requested != hdr;
         if self.inited && (self.init_device != dev_raw || size_changed || hdr_changed) {
             tracing::info!(
                 device_changed = self.init_device != dev_raw,
@@ -1145,7 +1174,13 @@ impl Encoder for NvencD3d11Encoder {
             // Adopt the current frame size + colour so the encoder always matches the capturer output.
             self.width = captured.width;
             self.height = captured.height;
+            self.hdr_requested = hdr;
+            // Effective until `query_caps` says otherwise (it clears this on a card without 10-bit).
             self.hdr = hdr;
+            // Recompute the EFFECTIVE 4:4:4 from the negotiation on every init. This used to read
+            // (and overwrite) `chroma_444` itself, so the first subsampled-YUV frame permanently
+            // demoted the session — 4:4:4 never returned even when the capturer went back to RGB.
+            self.chroma_444 = self.chroma_444_requested;
             // Pick the NVENC input format from the captured pixel format. YUV (NV12/P010) is the
             // video-processor path — NVENC encodes it natively (no internal RGB→YUV, which is a hidden
             // 3D/compute step that would fight a GPU-saturating game). RGB (ARGB/ABGR10) is the legacy
@@ -1171,9 +1206,11 @@ impl Encoder for NvencD3d11Encoder {
             };
             // 4:4:4 honesty: the FREXT/chromaFormatIDC=3 config engages only on an RGB input (a
             // subsampled NV12/P010 source can't reconstruct full chroma). If the capturer handed
-            // native YUV despite a 4:4:4 negotiation, this session encodes 4:2:0 — clear the flag
-            // NOW so `caps().chroma_444` (and native's post-open cross-check) reports what
-            // the stream really carries instead of silently claiming full chroma.
+            // native YUV despite a 4:4:4 negotiation, THIS session encodes 4:2:0 — clear the
+            // effective flag now so `caps().chroma_444` (and native's post-open cross-check)
+            // reports what the stream really carries instead of silently claiming full chroma.
+            // Only the effective value is cleared: `chroma_444_requested` keeps the negotiation, so
+            // a later re-init on an RGB capture recovers 4:4:4 instead of being stuck at 4:2:0.
             if self.chroma_444
                 && !matches!(
                     self.buffer_fmt,

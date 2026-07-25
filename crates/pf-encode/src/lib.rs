@@ -657,8 +657,17 @@ fn open_video_backend(
                 // Phase 4 after the field-silence gate.
                 #[cfg(feature = "qsv")]
                 {
-                    let ffmpeg_forced = std::env::var("PUNKTFUNK_QSV_FFMPEG")
-                        .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+                    // Trimmed like every sibling knob, so `"1 "` from a shell script or a `.env`
+                    // line takes effect instead of silently doing nothing. Case-insensitivity is
+                    // kept deliberately — this knob already accepted `TRUE` via
+                    // `eq_ignore_ascii_case`, and the bare house `matches!` would have dropped
+                    // that spelling; widening to `yes`/`on` only adds accepted values.
+                    let ffmpeg_forced = std::env::var("PUNKTFUNK_QSV_FFMPEG").is_ok_and(|v| {
+                        matches!(
+                            v.trim().to_ascii_lowercase().as_str(),
+                            "1" | "true" | "yes" | "on"
+                        )
+                    });
                     if !ffmpeg_forced {
                         match qsv::QsvEncoder::open(
                             codec,
