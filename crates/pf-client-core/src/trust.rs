@@ -212,6 +212,40 @@ pub fn persist_host(name: &str, addr: &str, port: u16, fp_hex: &str, paired: boo
     let _ = known.save();
 }
 
+/// This machine's name — the label a host files this client under in its paired-devices list.
+/// `/etc/hostname` first (the answer on any Linux box, and the only one available in a minimal
+/// build with no GTK to ask), then the usual environment fallbacks.
+pub fn device_name() -> String {
+    #[cfg(target_os = "linux")]
+    if let Ok(s) = std::fs::read_to_string("/etc/hostname") {
+        let s = s.trim();
+        if !s.is_empty() {
+            return s.to_string();
+        }
+    }
+    std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "This device".into())
+}
+
+/// Drop an fp-less placeholder entry for `addr:port`. A host added by address before any
+/// ceremony (`--add-host` with no `--fp`) is stored keyed by address with an empty fingerprint;
+/// once pairing yields the real one, [`persist_host`] writes a second, fp-keyed entry — so the
+/// placeholder has to go or the host list shows the same box twice. No-op (and no disk write)
+/// when there is none, which is the usual case.
+pub fn forget_placeholder(addr: &str, port: u16) {
+    let mut known = KnownHosts::load();
+    let before = known.hosts.len();
+    known
+        .hosts
+        .retain(|h| !(h.fp_hex.is_empty() && h.addr == addr && h.port == port));
+    if known.hosts.len() != before {
+        let _ = known.save();
+    }
+}
+
 /// Learn/refresh a saved host's Wake-on-LAN MAC(s) from its live advert (called while the host
 /// is online, matched by fingerprint or address). No-op — and no disk write — when unchanged, so
 /// the hosts page can call it on every discovery tick without churning the store.

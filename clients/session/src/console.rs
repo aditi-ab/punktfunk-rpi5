@@ -105,7 +105,7 @@ pub fn run(target: Option<&str>) -> u8 {
     };
 
     let opts = ConsoleOptions {
-        device_name: device_name(),
+        device_name: trust::device_name(),
         deck: is_steam_deck(),
     };
     let (overlay, handles) = match SkiaOverlay::console(opts, entry) {
@@ -249,22 +249,6 @@ pub fn run(target: Option<&str>) -> u8 {
             crate::session_main::EXIT_PRESENTER_FAILED
         }
     }
-}
-
-/// The machine's name — what the host lists this client as after pairing.
-fn device_name() -> String {
-    #[cfg(target_os = "linux")]
-    if let Ok(s) = std::fs::read_to_string("/etc/hostname") {
-        let s = s.trim();
-        if !s.is_empty() {
-            return s.to_string();
-        }
-    }
-    std::env::var("COMPUTERNAME")
-        .or_else(|_| std::env::var("HOSTNAME"))
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "This device".into())
 }
 
 fn host_display_name(name: &str, addr: &str) -> String {

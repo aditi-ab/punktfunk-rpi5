@@ -5,8 +5,9 @@
 //! One stream session per invocation: `--connect host[:port]` (+ `--fp HEX`,
 //! `--launch id`, `--fullscreen`), exits when the session ends. Reads the same identity
 //! / known-hosts / settings stores as the desktop shell on each OS — the GTK client
-//! (`punktfunk-client`) on Linux, the WinUI client on Windows — so pairing there (or
-//! via the shell's headless `--pair`) makes this binary connect silently.
+//! (`punktfunk-client`) on Linux, the WinUI client on Windows — so pairing on either side
+//! makes the other connect silently. `--pair <PIN> --connect host` runs the ceremony here,
+//! with no window and no toolkit, for machines that have only a shell.
 //!
 //! Stdout is the machine interface (the shell↔session contract): `{"ready":true}` after
 //! the first presented frame, `stats:` lines per 1 s window, one `{"error": …}` /
@@ -59,6 +60,54 @@ mod session_main {
         let v = arg_value("--window-pos")?;
         let (x, y) = v.split_once(',')?;
         Some((x.trim().parse().ok()?, y.trim().parse().ok()?))
+    }
+
+    /// `--pair <PIN> --connect host[:port]` — the SPAKE2 PIN ceremony with no window, no GTK
+    /// and no console UI, so a machine that has only SSH can be enrolled: an embedded/kiosk
+    /// client, a headless box, an image being provisioned. Writes the verified host into the
+    /// same known-hosts store `--connect` reads, so pairing here is exactly what makes the
+    /// later stream connect silently.
+    ///
+    /// Deliberately identical in shape and output to `punktfunk-client --pair` (which stays
+    /// the desktop route) — the difference is only that this binary carries no toolkit, so it
+    /// is the one a minimal image installs. Present in the `--no-default-features` build too:
+    /// enrolment must not be the reason an embedded image has to pull in Skia.
+    fn headless_pair(pin: &str) -> u8 {
+        let Some(target) = arg_value("--connect") else {
+            eprintln!("--pair requires --connect host[:port]");
+            return EXIT_CONNECT_FAILED;
+        };
+        let (addr, port) = parse_host_port(&target);
+        // The label the HOST files this client under. A headless box has nobody to ask, so
+        // the hostname is the only name that will mean anything in the paired-devices list.
+        let name = arg_value("--name").unwrap_or_else(trust::device_name);
+
+        let identity = match trust::load_or_create_identity() {
+            Ok(i) => i,
+            Err(e) => {
+                eprintln!("client identity: {e:#}");
+                return EXIT_CONNECT_FAILED;
+            }
+        };
+        match trust::pair_with_host(&addr, port, &identity, pin, &name) {
+            Ok(fp) => {
+                let fp_hex = trust::hex(&fp);
+                trust::persist_host(
+                    &arg_value("--host-label").unwrap_or_else(|| addr.clone()),
+                    &addr,
+                    port,
+                    &fp_hex,
+                    true,
+                );
+                trust::forget_placeholder(&addr, port);
+                println!("paired {addr}:{port} fp={fp_hex}");
+                0
+            }
+            Err(e) => {
+                eprintln!("pairing failed: {} ({e:?})", trust::pair_error_message(&e));
+                EXIT_TRUST_REJECTED
+            }
+        }
     }
 
     /// `host[:port]`, port defaulting to the native 9777.
@@ -312,6 +361,13 @@ mod session_main {
             };
         }
 
+        // `--pair <PIN>`: enrol this machine against a host and exit. Sits with the other
+        // non-streaming subcommands, above every graphics call — the box doing this may have
+        // no display at all.
+        if let Some(pin) = arg_value("--pair") {
+            return headless_pair(&pin);
+        }
+
         // Before any Vulkan call: make RADV expose its video-decode queue + extensions so the
         // decoder's `auto` path prefers Vulkan Video over VAAPI (Steam Deck, and any gated RADV).
         // Windows drivers (NVIDIA/AMD Adrenalin) expose theirs unconditionally.
@@ -369,12 +425,14 @@ mod session_main {
             eprintln!(
                 "usage: punktfunk-session --connect host[:port] [--fp HEX] [--launch id] [--fullscreen]\n\
                  \x20      punktfunk-session --browse [host[:port]] [--mgmt PORT] [--fullscreen] [--json-status]\n\
+                 \x20      punktfunk-session --pair <PIN> --connect host[:port] [--name LABEL]\n\
                  \n\
                  Streams from a paired punktfunk host in a Vulkan window. --browse opens the\n\
                  gamepad console instead: bare --browse is the host list (discovery, PIN\n\
                  pairing, settings, wake-on-LAN); with a target it opens that host's game\n\
                  library. --connect never dials a host it has no pinned fingerprint for —\n\
-                 pair in the console or via `punktfunk-client --pair <PIN> --connect …`."
+                 enrol with --pair (no display needed), in the console, or from the desktop\n\
+                 client."
             );
             return EXIT_CONNECT_FAILED;
         };
@@ -406,7 +464,7 @@ mod session_main {
                 "error",
                 &format!(
                     "no pinned fingerprint for {addr}:{port} — pair first \
-                     (punktfunk-client --pair <PIN> --connect {addr}:{port}) or pass --fp HEX"
+                     (punktfunk-session --pair <PIN> --connect {addr}:{port}) or pass --fp HEX"
                 ),
                 Some(true),
             );

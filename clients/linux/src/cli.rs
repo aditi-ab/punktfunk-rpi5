@@ -3,7 +3,7 @@
 //! scenes.
 
 use crate::app::AppModel;
-use crate::trust::{KnownHost, KnownHosts};
+use crate::trust::{forget_placeholder, KnownHost, KnownHosts};
 use crate::ui_hosts::{ConnectRequest, HostsMsg};
 use gtk::glib;
 use gtk::prelude::*;
@@ -250,18 +250,6 @@ fn probe_all(hosts: &[KnownHost]) -> Vec<bool> {
         hosts.iter().map(|h| (h.addr.clone(), h.port)).collect(),
         PROBE_TIMEOUT,
     )
-}
-
-/// Drop an fp-less placeholder for `addr:port` (see `headless_pair`). No-op when none exists.
-fn forget_placeholder(addr: &str, port: u16) {
-    let mut known = KnownHosts::load();
-    let before = known.hosts.len();
-    known
-        .hosts
-        .retain(|h| !(h.fp_hex.is_empty() && h.addr == addr && h.port == port));
-    if known.hosts.len() != before {
-        let _ = known.save();
-    }
 }
 
 /// `--list-hosts [--probe]` — the saved known-hosts store as JSON (the store the Decky plugin
