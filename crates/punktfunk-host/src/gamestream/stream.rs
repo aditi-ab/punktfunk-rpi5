@@ -757,6 +757,16 @@ fn stream_body(
     // dead source can't loop forever — it ends the stream after the cap, falling back to a reconnect.
     const MAX_REBUILDS: u32 = 5;
     let mut rebuilds: u32 = 0;
+    // Encode-stall recovery, the GameStream twin of the native path's ladder (native/stream.rs,
+    // `reset_stalled_encoder`): a submit/poll failure or a silent stall rebuilds the encoder in
+    // place — bounded — instead of ending the stream. The backends deliberately turn a wedged
+    // GPU into a bounded error so the caller can do exactly this; without the ladder here, every
+    // such error cost a Moonlight client a full disconnect/reconnect. `last_au_at` feeds the
+    // silent-wedge watchdog below (backends whose non-blocking poll returns `None` forever
+    // instead of erroring); every received AU clears the reset budget.
+    const MAX_ENCODER_RESETS: u32 = 5;
+    let mut encoder_resets: u32 = 0;
+    let mut last_au_at = Instant::now();
 
     // Coalesce forced keyframes. Under loss Moonlight spams IDR/RFI requests; on an encoder without
     // RFI (VAAPI/AMD — `supports_rfi=false`) each one becomes a full IDR, so an un-coalesced request
@@ -866,9 +876,10 @@ fn stream_body(
         // Honor a client recovery request. Prefer reference-frame invalidation (the encoder
         // re-references an older still-valid frame — no costly IDR spike); if the encoder can't
         // invalidate (range too old, or no NVENC RFI) it returns false and we force a keyframe.
-        // A prior pipeline drop needs a fresh keyframe to re-anchor the reference chain (see below).
+        // A prior pipeline drop needs a fresh keyframe to re-anchor the reference chain (see
+        // below). Consumed only when the keyframe is actually EMITTED (in the coalesce gate) —
+        // read-and-clear here let the gate swallow the request for good.
         let mut want_keyframe = recover_after_drop;
-        recover_after_drop = false;
         if let Some((first, last)) = rfi_range.lock().unwrap().take() {
             // Prefer reference-frame invalidation when the encoder supports it (no costly IDR
             // spike); otherwise — or if the range is too old to invalidate — fall back to a keyframe.
@@ -898,12 +909,48 @@ fn stream_body(
             if emit {
                 enc.request_keyframe();
                 last_keyframe = Some(now);
+                // A drop-recovery request is satisfied by an EMITTED keyframe, not by being
+                // read: coalesced away it would be lost — never retried — leaving duplicate wire
+                // indices in the encoder's reference table for a later RFI to anchor on (the
+                // stale-anchor case rfi.rs exists to prevent). Keep it armed until this point.
+                recover_after_drop = false;
             } else {
                 tracing::debug!("video: keyframe request coalesced (IDR still in flight)");
             }
         }
-        enc.submit_indexed(&frame, au_seq.wrapping_add(enc_inflight))
-            .context("encoder submit")?;
+        if let Err(e) = enc.submit_indexed(&frame, au_seq.wrapping_add(enc_inflight)) {
+            // The input half of an encode stall (see native/stream.rs): rebuild the encoder in
+            // place instead of ending the stream. A backend without an in-place rebuild
+            // (`reset` = false) or an exhausted budget still fails the session, with the cause.
+            encoder_resets += 1;
+            if encoder_resets > MAX_ENCODER_RESETS || !enc.reset() {
+                tracing::error!(
+                    error = %format!("{e:#}"),
+                    resets = encoder_resets,
+                    "encoder did not recover after repeated in-place rebuilds — ending the \
+                     stream (see the error above for the cause)"
+                );
+                return Err(e).context("encoder submit");
+            }
+            // The owed AUs died with the discarded encoder state; numbering restarts at `au_seq`,
+            // and the rebuilt encoder's reference state is empty so the reused predictions meet
+            // no stale bookkeeping (same reasoning as the capture rebuild above). The IDR
+            // bypasses the coalesce gate: a rebuilt encoder MUST resync the client.
+            enc_inflight = 0;
+            enc.request_keyframe();
+            last_keyframe = Some(Instant::now());
+            last_au_at = Instant::now();
+            tracing::warn!(error = %format!("{e:#}"), reset = encoder_resets,
+                max = MAX_ENCODER_RESETS,
+                "encoder submit failed — encoder rebuilt in place, forcing an IDR");
+            // Real backoff between attempts, not a frame period: five instant retries burn out
+            // inside one driver hiccup (the native ladder's 2026-07 field lesson).
+            let backoff =
+                frame_interval.max(Duration::from_millis(100u64 << (encoder_resets - 1).min(4)));
+            next_frame = Instant::now() + backoff;
+            std::thread::sleep(backoff);
+            continue;
+        }
         enc_inflight = enc_inflight.wrapping_add(1);
         let t_enc = tick.elapsed();
 
@@ -914,7 +961,19 @@ fn stream_body(
         // stamped with its wire frameIndex here (`au_seq + position`); the numbering only
         // ADVANCES if the batch is actually enqueued below (a dropped batch consumes none).
         let mut aus: Vec<(Vec<u8>, FrameType, u32)> = Vec::new();
-        while let Some(au) = enc.poll().context("encoder poll")? {
+        // A poll error is the output half of an encode stall (e.g. a bounded fence timeout from
+        // a wedged GPU) — carry it to the shared stall recovery below, after the AUs already
+        // drained are handed off, instead of killing the session outright.
+        let mut poll_err: Option<anyhow::Error> = None;
+        loop {
+            let au = match enc.poll() {
+                Ok(Some(au)) => au,
+                Ok(None) => break,
+                Err(e) => {
+                    poll_err = Some(e);
+                    break;
+                }
+            };
             let ft = if au.keyframe {
                 FrameType::Idr
             } else {
@@ -923,6 +982,9 @@ fn stream_body(
             let idx = au_seq.wrapping_add(aus.len() as u32);
             aus.push((au.data, ft, idx));
             enc_inflight = enc_inflight.saturating_sub(1);
+            // Every AU proves the encoder is alive.
+            last_au_at = Instant::now();
+            encoder_resets = 0;
         }
         let t_pkt = tick.elapsed();
 
@@ -950,6 +1012,37 @@ fn stream_body(
                     break; // packetizer/sender exited (client gone)
                 }
             }
+        }
+        // Encode-stall recovery, the poll half (mirrors the native path's watchdog): an explicit
+        // poll error, or no AU within the window while frames are owed — the silent wedge, where
+        // a non-blocking poll returns `None` forever and nothing else ever errors. The window
+        // scales with the frame interval so low-fps modes can't false-trip.
+        let stall_window = Duration::from_secs(2).max(frame_interval * 8);
+        if poll_err.is_some() || (enc_inflight > 0 && last_au_at.elapsed() >= stall_window) {
+            let why = match &poll_err {
+                Some(e) => format!("poll failed: {e:#}"),
+                None => format!(
+                    "no AU for {} ms with {} frame(s) owed",
+                    last_au_at.elapsed().as_millis(),
+                    enc_inflight
+                ),
+            };
+            encoder_resets += 1;
+            if encoder_resets > MAX_ENCODER_RESETS || !enc.reset() {
+                return Err(poll_err.unwrap_or_else(|| anyhow::anyhow!("{why}")))
+                    .context("encoder stalled — in-place rebuild unavailable or exhausted");
+            }
+            enc_inflight = 0;
+            enc.request_keyframe();
+            last_keyframe = Some(Instant::now());
+            last_au_at = Instant::now();
+            tracing::warn!(reset = encoder_resets, max = MAX_ENCODER_RESETS, %why,
+                "encode stall detected — encoder rebuilt in place, forcing an IDR");
+            let backoff =
+                frame_interval.max(Duration::from_millis(100u64 << (encoder_resets - 1).min(4)));
+            next_frame = Instant::now() + backoff;
+            std::thread::sleep(backoff);
+            continue;
         }
         if measure {
             let t_send = tick.elapsed();
