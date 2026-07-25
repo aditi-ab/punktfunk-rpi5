@@ -51,6 +51,24 @@ pub struct OpenH264Encoder {
 // whole value to that thread is therefore sound — there is no concurrent access to the handle.
 unsafe impl Send for OpenH264Encoder {}
 
+/// openh264's own ceiling: level 5.2, so 3840x2160 landscape or 2160x3840 portrait.
+///
+/// The long edge may reach 3840 and the short edge 2160 — the rule is orientation-aware, not a
+/// per-axis `w <= 3840 && h <= 2160`, so a portrait 2160x3840 session is legal.
+const OPENH264_MAX_LONG_EDGE: u32 = 3840;
+const OPENH264_MAX_SHORT_EDGE: u32 = 2160;
+
+/// Whether the bundled openh264 can encode this resolution at all.
+///
+/// Mirrors the check inside the crate we ship (openh264 0.9.3, `encoder.rs` `reinit`). That check
+/// runs on the FIRST ENCODE, not at encoder construction — so without this gate a too-large mode
+/// opens perfectly and then fails *every* submit, and the session connects and never delivers a
+/// frame. `Codec::max_dimension` does not cover it: it is keyed on the codec, and H.264 legitimately
+/// reaches 4096 on every hardware backend — this ceiling belongs to the software backend alone.
+fn openh264_supports_dimensions(width: u32, height: u32) -> bool {
+    width.max(height) <= OPENH264_MAX_LONG_EDGE && width.min(height) <= OPENH264_MAX_SHORT_EDGE
+}
+
 impl OpenH264Encoder {
     pub fn open(
         format: PixelFormat,
@@ -59,7 +77,16 @@ impl OpenH264Encoder {
         fps: u32,
         bitrate_bps: u64,
     ) -> Result<Self> {
-        // validate_dimensions() ran in open_video: even, non-zero, <= 4096.
+        // validate_dimensions() ran in open_video: even, non-zero, <= 4096. That leaves modes this
+        // encoder cannot serve (e.g. a legal 4096-wide H.264 mode), so refuse them here — at the
+        // open, where the caller still gets a real error — rather than at every submit.
+        ensure!(
+            openh264_supports_dimensions(width, height),
+            "openh264 cannot encode {width}x{height}: the software encoder tops out at \
+             {OPENH264_MAX_LONG_EDGE}x{OPENH264_MAX_SHORT_EDGE} (or \
+             {OPENH264_MAX_SHORT_EDGE}x{OPENH264_MAX_LONG_EDGE} portrait) — lower the client \
+             resolution, or use a host with a hardware encoder"
+        );
         let bps: u32 = bitrate_bps.try_into().unwrap_or(u32::MAX);
         let cfg = EncoderConfig::new()
             .usage_type(UsageType::ScreenContentRealTime)
@@ -335,5 +362,41 @@ mod tests {
             .windows(5)
             .any(|w| w[0] == 0 && w[1] == 0 && w[2] == 0 && w[3] == 1 && (w[4] & 0x1f) == 7);
         assert!(has_sps, "IDR must carry an SPS NAL (type 7)");
+    }
+
+    /// The modes the software encoder can actually serve — including the portrait orientation,
+    /// which a naive per-axis `w <= 3840 && h <= 2160` would wrongly reject.
+    #[test]
+    fn openh264_accepts_up_to_4k_in_either_orientation() {
+        assert!(openh264_supports_dimensions(1920, 1080));
+        assert!(openh264_supports_dimensions(3840, 2160));
+        assert!(openh264_supports_dimensions(2160, 3840));
+        assert!(openh264_supports_dimensions(1080, 1920));
+    }
+
+    /// Modes `validate_dimensions` lets through (H.264 legitimately reaches 4096 on hardware) but
+    /// openh264 rejects on the first encode. Catching them at open is the whole point of the gate:
+    /// otherwise the session opens and then fails every single submit.
+    #[test]
+    fn openh264_rejects_modes_that_would_fail_on_first_submit() {
+        // 4096-wide is legal H.264 and passes `Codec::max_dimension`, but exceeds the long edge.
+        assert!(!openh264_supports_dimensions(4096, 2160));
+        assert!(!openh264_supports_dimensions(2160, 4096));
+        // Long edge is fine, short edge is not (e.g. an ultrawide-tall composite desktop).
+        assert!(!openh264_supports_dimensions(3840, 2400));
+        assert!(!openh264_supports_dimensions(2400, 3840));
+    }
+
+    /// A too-large mode must fail at `open`, not silently at every `submit`.
+    #[test]
+    fn open_refuses_a_mode_openh264_cannot_encode() {
+        // Matched rather than `expect_err`: `OpenH264Encoder` is not `Debug` (it wraps a raw C
+        // handle), so `expect_err` would not compile.
+        let err = match OpenH264Encoder::open(PixelFormat::Bgra, 4096, 2160, 60, 20_000_000) {
+            Ok(_) => panic!("4096x2160 exceeds openh264's long-edge ceiling and must be refused"),
+            Err(e) => e,
+        };
+        let msg = format!("{err:#}");
+        assert!(msg.contains("openh264 cannot encode 4096x2160"), "{msg}");
     }
 }
