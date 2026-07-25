@@ -448,6 +448,20 @@ pub trait Encoder: Send {
     fn set_input_ring_depth(&mut self, _depth: usize) {}
     /// Signal end-of-stream. After this, drain the remaining AUs with [`poll`](Self::poll)
     /// until it returns `None` — NVENC buffers frames internally even at `delay=0`.
+    ///
+    /// **The two production encode loops deliberately do not call this**, and that is not an
+    /// oversight to be "fixed" by a later sweep. Both reach their exit only after the transport is
+    /// already gone (the client disconnected, or the session was stopped), so the AUs a flush would
+    /// recover have nowhere to go — while flushing is the one call on this trait that can BLOCK on a
+    /// wedged encoder, on precisely the teardown path a stopped session needs to complete promptly.
+    /// The Linux direct-SDK NVENC backend makes that concrete: its retrieve-thread join is untimed
+    /// (see the note in `enc/linux/nvenc_cuda.rs`), so a flush there could hang a session that is
+    /// already ending.
+    ///
+    /// It is kept rather than deleted because it does have real consumers: the `spike` dev
+    /// subcommand, which encodes a FINITE clip and genuinely wants the tail, and the `#[ignore]`d
+    /// hardware smoke tests across the backends, which assert the drain contract on real GPUs.
+    /// Those are finite-stream users; a live session is not one.
     fn flush(&mut self) -> Result<()>;
 }
 
