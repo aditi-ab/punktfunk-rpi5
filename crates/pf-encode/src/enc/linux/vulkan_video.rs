@@ -551,9 +551,34 @@ pub struct VulkanVideoEncoder {
     cmd_pool: vk::CommandPool,
     compute_pool: vk::CommandPool,
 
-    // --- rate control (CBR), rebuilt-safe ---
+    // --- rate control, rebuilt-safe ---
     bitrate: u64,
     fps: u32,
+    /// Rate-control mode for every RC site, resolved ONCE at open from
+    /// `VkVideoEncodeCapabilitiesKHR::rateControlModes` (previously hardcoded CBR with no
+    /// capability check at all): VBR when the driver advertises it, else CBR. Always paired with
+    /// `average_bitrate == max_bitrate`, so VBR here is not "spend less on average" — it is CBR's
+    /// exact ceiling minus the *stuffing*: CBR must keep the CPB from overflowing on underspent
+    /// frames and Vulkan exposes no filler-suppression control (AMF's `filler_data=false` /
+    /// NVENC's default-off have no VK equivalent), measured on the 780M as 97 % filler NALs under
+    /// a tight CBR window. VBR permits the underspend, so a tight window only ever BOUNDS a
+    /// complex frame (WP6.3).
+    rc_mode: vk::VideoEncodeRateControlModeFlagsKHR,
+    /// HRD window `(virtualBufferSizeInMs, initialVirtualBufferSizeInMs)`: the house ~1-frame
+    /// window ([`crate::vbv_window_ms`], `PUNKTFUNK_VBV_FRAMES` scales it) under VBR, the legacy
+    /// loose `(1000, 500)` under the CBR fallback — where tightening it is the measured 36×
+    /// filler regression, so the status quo is kept deliberately. Latched into a field rather
+    /// than recomputed at each of the four `VideoEncodeRateControlInfoKHR` sites on purpose: two
+    /// of them DECLARE the session's current rate-control state to `vkCmdBeginVideoCodingKHR` and
+    /// two INSTALL it, and the spec requires the declaration to match what is installed at
+    /// execution time (`VUID-vkCmdBeginVideoCodingKHR-pBeginInfo-08254`). One latched value
+    /// cannot drift; four independent computations can.
+    vbv_ms: (u32, u32),
+    /// `VkVideoEncodeCapabilitiesKHR::maxBitrate`, the other field this struct's query used to
+    /// drop on the floor. Bounds `bitrate` at open and every retarget (the spec bounds every
+    /// layer's bitrates by it; an ABR climb on a low-cap driver would otherwise sail past it).
+    /// A driver reporting 0 means "not filled in" — treated as unbounded.
+    hw_max_bitrate: u64,
     /// Resolved encode quality level (see [`quality_request`]) — installed via the first frame's
     /// `ENCODE_QUALITY_LEVEL` control and baked into the session-parameters object (the spec
     /// requires the two to match).
@@ -603,7 +628,7 @@ pub struct VulkanVideoEncoder {
     poc: i32,       // monotonic HEVC picture-order-count (reused as AV1 order_hint counter)
     enc_count: u64, // total frames encoded — drives the DPB ring cursor
     auto_wire: i64, // fallback wire index when submit() (not submit_indexed) is used
-    first_frame: bool, // needs RESET + DPB layout transition + CBR install + IDR
+    first_frame: bool, // needs RESET + DPB layout transition + rate-control install + IDR
     /// Whether the SESSION OBJECT currently has a non-default rate-control mode installed.
     ///
     /// Deliberately NOT `!first_frame`. `first_frame` means "this frame must issue RESET + install
@@ -882,6 +907,11 @@ impl VulkanVideoEncoder {
         let std_hdr = caps.std_header_version;
         let min_bs_align = caps.min_bitstream_buffer_size_alignment.max(1);
         let max_quality_levels = enc_caps.max_quality_levels;
+        let rate_control_modes = enc_caps.rate_control_modes;
+        let hw_max_bitrate = match enc_caps.max_bitrate {
+            0 => u64::MAX, // not filled in — treat as unbounded
+            n => n,
+        };
         let av1_superblock128 = av1 && (av1_caps.superblock_sizes & av1b::SUPERBLOCK_SIZE_128 != 0);
         // Resolve the encode quality level against the profile's cap (spec: valid levels are
         // 0..maxQualityLevels, ordered fastest→best; maxQualityLevels >= 1 always). INFO so field
@@ -892,6 +922,80 @@ impl VulkanVideoEncoder {
             max_quality_levels,
             "vulkan-encode: quality level (0 = fastest preset; PUNKTFUNK_VULKAN_QUALITY overrides)"
         );
+        // WP6.3: rate-control mode + HRD window, from the capability bits this query used to
+        // ignore. VBR — always with average == max, i.e. capped at the target — is what stops
+        // CBR's bit-stuffing: a calm CBR stream overflows the CPB once the initial fill drains
+        // and the driver must then pad EVERY frame to the exact rate share, forever (measured on
+        // the 780M: 97.5 % HEVC / 99.6 % AV1 filler over a calm 64-frame run — under the shipped
+        // 1000 ms window, not just a tight one; the earlier "loose CBR = no filler" reading came
+        // from an 8-frame smoke shorter than the fill-drain time). Vulkan exposes no
+        // filler-suppression control, so the MODE is the only lever. The tight house window
+        // rides along as the driver's RC input, but measured on RADV it does NOT bound complex
+        // frames (burst A/B byte-identical against 1000 ms CBR — on this silicon the window had
+        // no measurable effect on frame sizes; the MODE alone decided the stuffing), so no
+        // pacing claim is made for it. A CBR-only driver keeps
+        // the legacy loose (1000 ms, 500 ms) window on purpose: tightening it under CBR just
+        // starts the stuffing ~30 frames earlier.
+        let vbr_advertised =
+            rate_control_modes.contains(vk::VideoEncodeRateControlModeFlagsKHR::VBR);
+        if !vbr_advertised
+            && !rate_control_modes.contains(vk::VideoEncodeRateControlModeFlagsKHR::CBR)
+        {
+            // Every real encode driver advertises CBR and/or VBR; one with neither would need
+            // the DEFAULT-mode no-layer shape this backend does not speak. Keep CBR (the
+            // pre-WP6.3 behaviour) but say so — this WARN firing names a driver worth knowing.
+            tracing::warn!(
+                modes = rate_control_modes.as_raw(),
+                "vulkan-encode: driver advertises neither CBR nor VBR — installing CBR anyway \
+                 (pre-existing behaviour; may fail validation on this driver)"
+            );
+        }
+        // `PUNKTFUNK_VULKAN_RC=cbr|vbr`: field escape hatch + on-box A/B control (two prior
+        // versions of this rate-control shape were withdrawn after review — a rebuild-free
+        // fallback is cheap insurance). `vbr` is a request, honoured only when advertised;
+        // anything else means auto.
+        let vbr = match std::env::var("PUNKTFUNK_VULKAN_RC")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "cbr" => false,
+            _ => vbr_advertised,
+        };
+        let (rc_mode, vbv_ms) = if vbr {
+            (
+                vk::VideoEncodeRateControlModeFlagsKHR::VBR,
+                crate::vbv_window_ms(fps),
+            )
+        } else {
+            (
+                vk::VideoEncodeRateControlModeFlagsKHR::CBR,
+                (1000u32, 500u32),
+            )
+        };
+        // INFO because the mode and window used to be hardwired constants — a field log has to be
+        // able to say which shape a session actually ran.
+        tracing::info!(
+            rc_mode = if vbr { "VBR (capped at target)" } else { "CBR" },
+            vbv_window_ms = vbv_ms.0,
+            vbv_initial_ms = vbv_ms.1,
+            fps,
+            hw_max_bitrate,
+            "vulkan-encode: rate control (VBR when the driver offers it — CBR must stuff filler \
+             on calm content; PUNKTFUNK_VULKAN_RC overrides, PUNKTFUNK_VBV_FRAMES scales the VBR \
+             window)"
+        );
+        let bitrate = if bitrate > hw_max_bitrate {
+            tracing::warn!(
+                requested = bitrate,
+                cap = hw_max_bitrate,
+                "vulkan-encode: requested bitrate exceeds the driver's maxBitrate — clamping"
+            );
+            hw_max_bitrate
+        } else {
+            bitrate
+        };
         // logical device: encode + compute queues + video extensions (AV1 ext name is raw — ash lacks it)
         let mut dev_exts = vec![
             ash::khr::video_queue::NAME.as_ptr(),
@@ -1308,6 +1412,9 @@ impl VulkanVideoEncoder {
             compute_pool,
             bitrate,
             fps,
+            rc_mode,
+            vbv_ms,
+            hw_max_bitrate,
             quality_level,
             ts_period_ns,
             perf_at: std::time::Instant::now(),
@@ -1829,15 +1936,15 @@ impl VulkanVideoEncoder {
         let nv12_view = self.frames[slot].nv12_view;
 
         // ---- 1. decide frame type + reference (RFI) ----
-        // Mid-stream rate retarget (`reconfigure_bitrate`): a first frame installs its RC state
-        // fresh (RESET + ENCODE_RATE_CONTROL in the record fns), so a pending rate folds straight
-        // into it; mid-stream it stays pending — the record fns emit an ENCODE_RATE_CONTROL
-        // control command against the declared current state, and step 5 promotes it.
-        if self.first_frame {
-            if let Some(nb) = self.pending_bitrate.take() {
-                self.bitrate = nb;
-            }
-        }
+        // A pending rate retarget (`reconfigure_bitrate`) stays PENDING through recording on
+        // every path: the record fns declare the session's current state at begin-coding and
+        // install the pending rate via ENCODE_RATE_CONTROL (folded into the first frame's RESET
+        // install, or a standalone mid-stream control), and step 5 promotes it. Promoting it
+        // here instead — which the first-frame path used to do — made the begin declaration name
+        // a rate the session had not installed whenever a `reset()` preceded this frame
+        // (`rc_installed` survives a reset; the session object keeps the OLD rate): a one-frame
+        // VUID-vkCmdBeginVideoCodingKHR-pBeginInfo-08254 violation on exactly the frames where
+        // an ABR retarget and the stall watchdog coincide.
         let mut is_idr = self.first_frame || self.force_kf;
         let mut ref_slot = self.prev_slot;
         let mut recovery = false;
@@ -2737,8 +2844,13 @@ impl VulkanVideoEncoder {
         self.prev_slot = setup_idx;
         self.poc = poc + 1;
         self.enc_count += 1;
+        // The record fns key the RESET-install fold on `first_frame`, NOT on `is_idr` — a
+        // forced-keyframe or loss-forced IDR mid-stream installs a pending retarget via the
+        // standalone ENCODE_RATE_CONTROL like any other mid-stream frame. Capture the flag
+        // before clearing it so the telemetry below reports which install path actually ran.
+        let was_first_frame = self.first_frame;
         self.first_frame = false;
-        // The frame just recorded carried the RESET + CBR install (that is what `first_frame`
+        // The frame just recorded carried the RESET + rate-control install (what `first_frame`
         // gated), so from here on the session HAS a non-default rate-control mode — and unlike
         // `first_frame` this survives `reset()`, because a reset does not rebuild the session.
         self.rc_installed = true;
@@ -2749,7 +2861,8 @@ impl VulkanVideoEncoder {
             self.bitrate = nb;
             tracing::debug!(
                 mbps = nb / 1_000_000,
-                "vulkan-encode: rate control retargeted in place (no IDR)"
+                folded_into_reset = was_first_frame,
+                "vulkan-encode: rate control retargeted"
             );
         }
     }
@@ -2986,7 +3099,10 @@ impl VulkanVideoEncoder {
         let begin_i = [begin_setup];
         let enc_refs = [ref_enc];
 
-        // CBR rate control (chained manually; push_next would clobber rc.p_next)
+        // Rate control (chained manually; push_next would clobber rc.p_next). Mode + window are
+        // the values latched at open (see the `rc_mode`/`vbv_ms` field docs); this struct DECLARES
+        // the session's CURRENT state (`self.bitrate`) — never a pending retarget, which is only
+        // what the install below moves to (VUID-vkCmdBeginVideoCodingKHR-pBeginInfo-08254).
         let rc_layer = [vk::VideoEncodeRateControlLayerInfoKHR::default()
             .average_bitrate(self.bitrate)
             .max_bitrate(self.bitrate)
@@ -2999,10 +3115,10 @@ impl VulkanVideoEncoder {
             .consecutive_b_frame_count(0)
             .sub_layer_count(1);
         let mut rc = vk::VideoEncodeRateControlInfoKHR::default()
-            .rate_control_mode(vk::VideoEncodeRateControlModeFlagsKHR::CBR)
+            .rate_control_mode(self.rc_mode)
             .layers(&rc_layer)
-            .virtual_buffer_size_in_ms(1000)
-            .initial_virtual_buffer_size_in_ms(500);
+            .virtual_buffer_size_in_ms(self.vbv_ms.0)
+            .initial_virtual_buffer_size_in_ms(self.vbv_ms.1);
         rc.p_next = &h265_rc as *const _ as *const c_void;
         let rc_ptr = &rc as *const _ as *const c_void;
 
@@ -3020,15 +3136,35 @@ impl VulkanVideoEncoder {
         }
         (self.vq_dev.fp().cmd_begin_video_coding_khr)(cmd, &begin);
         if self.first_frame {
-            // RESET + CBR install + explicit quality level. Without ENCODE_QUALITY_LEVEL, RADV
-            // never sends the VCN a preset op at all (the firmware default preset runs);
+            // RESET + rate-control install + explicit quality level. Without ENCODE_QUALITY_LEVEL,
+            // RADV never sends the VCN a preset op at all (the firmware default preset runs);
             // installing it makes the preset deterministic on every driver and selects the
             // fastest tier by default (see `quality_request`). The quality struct chains ahead
             // of the rate-control state — the spec requires a quality-level change to carry
             // ENCODE_RATE_CONTROL, which the RESET install provides anyway.
+            //
+            // The install moves to the EFFECTIVE rate — a pending retarget folds in HERE, not
+            // into `self.bitrate` before recording. After a mid-stream `reset()` the session
+            // still HAS the old rate (a reset never touches the session object), and the begin
+            // above must declare that old rate; promoting the pending rate first made the
+            // declaration name a rate the session had not installed — a one-frame
+            // VUID-...-08254 violation on exactly the frames where ABR retarget and the stall
+            // watchdog coincide. `post_submit_bookkeeping` promotes after recording.
+            let nb = self.pending_bitrate.unwrap_or(self.bitrate);
+            let install_layer = [vk::VideoEncodeRateControlLayerInfoKHR::default()
+                .average_bitrate(nb)
+                .max_bitrate(nb)
+                .frame_rate_numerator(self.fps)
+                .frame_rate_denominator(1)];
+            let mut install_rc = vk::VideoEncodeRateControlInfoKHR::default()
+                .rate_control_mode(self.rc_mode)
+                .layers(&install_layer)
+                .virtual_buffer_size_in_ms(self.vbv_ms.0)
+                .initial_virtual_buffer_size_in_ms(self.vbv_ms.1);
+            install_rc.p_next = &h265_rc as *const _ as *const c_void;
             let mut q =
                 vk::VideoEncodeQualityLevelInfoKHR::default().quality_level(self.quality_level);
-            q.p_next = rc_ptr;
+            q.p_next = &install_rc as *const _ as *const c_void;
             let mut ctrl = vk::VideoCodingControlInfoKHR::default().flags(
                 vk::VideoCodingControlFlagsKHR::RESET
                     | vk::VideoCodingControlFlagsKHR::ENCODE_RATE_CONTROL
@@ -3039,7 +3175,7 @@ impl VulkanVideoEncoder {
         } else if let Some(nb) = self.pending_bitrate {
             // Mid-stream retarget (`reconfigure_bitrate`): `begin` above declared the session's
             // CURRENT rate-control state (the spec requires the match); this control command
-            // installs the NEW rate — the same CBR shape with only the bitrate moved. No RESET,
+            // installs the NEW rate — the same shape with only the bitrate moved. No RESET,
             // no IDR: the DPB and reference chain carry straight on. `record_submit` promotes
             // `nb` into `self.bitrate` after recording, so later begins declare the new state.
             let rc_layer2 = [vk::VideoEncodeRateControlLayerInfoKHR::default()
@@ -3048,10 +3184,10 @@ impl VulkanVideoEncoder {
                 .frame_rate_numerator(self.fps)
                 .frame_rate_denominator(1)];
             let mut rc2 = vk::VideoEncodeRateControlInfoKHR::default()
-                .rate_control_mode(vk::VideoEncodeRateControlModeFlagsKHR::CBR)
+                .rate_control_mode(self.rc_mode)
                 .layers(&rc_layer2)
-                .virtual_buffer_size_in_ms(1000)
-                .initial_virtual_buffer_size_in_ms(500);
+                .virtual_buffer_size_in_ms(self.vbv_ms.0)
+                .initial_virtual_buffer_size_in_ms(self.vbv_ms.1);
             rc2.p_next = &h265_rc as *const _ as *const c_void;
             let mut ctrl = vk::VideoCodingControlInfoKHR::default()
                 .flags(vk::VideoCodingControlFlagsKHR::ENCODE_RATE_CONTROL);
@@ -3293,7 +3429,9 @@ impl VulkanVideoEncoder {
         let begin_i = [begin_setup];
         let enc_refs = [ref_enc];
 
-        // ---- CBR rate control (generic layer + AV1 codec info chained manually) ----
+        // ---- rate control (generic layer + AV1 codec info chained manually) ----
+        // Mode + window are the values latched at open; this struct DECLARES the session's
+        // CURRENT state (`self.bitrate`) — see the HEVC twin for the 08254 state discipline.
         let rc_layer = [vk::VideoEncodeRateControlLayerInfoKHR::default()
             .average_bitrate(self.bitrate)
             .max_bitrate(self.bitrate)
@@ -3309,10 +3447,10 @@ impl VulkanVideoEncoder {
             temporal_layer_count: 1,
         };
         let mut rc = vk::VideoEncodeRateControlInfoKHR::default()
-            .rate_control_mode(vk::VideoEncodeRateControlModeFlagsKHR::CBR)
+            .rate_control_mode(self.rc_mode)
             .layers(&rc_layer)
-            .virtual_buffer_size_in_ms(1000)
-            .initial_virtual_buffer_size_in_ms(500);
+            .virtual_buffer_size_in_ms(self.vbv_ms.0)
+            .initial_virtual_buffer_size_in_ms(self.vbv_ms.1);
         rc.p_next = &av1_rc as *const _ as *const c_void;
         let rc_ptr = &rc as *const _ as *const c_void;
 
@@ -3330,15 +3468,24 @@ impl VulkanVideoEncoder {
         }
         (self.vq_dev.fp().cmd_begin_video_coding_khr)(cmd, &begin);
         if self.first_frame {
-            // RESET + CBR install + explicit quality level. Without ENCODE_QUALITY_LEVEL, RADV
-            // never sends the VCN a preset op at all (the firmware default preset runs);
-            // installing it makes the preset deterministic on every driver and selects the
-            // fastest tier by default (see `quality_request`). The quality struct chains ahead
-            // of the rate-control state — the spec requires a quality-level change to carry
-            // ENCODE_RATE_CONTROL, which the RESET install provides anyway.
+            // RESET + rate-control install + explicit quality level — see the HEVC twin for both
+            // disciplines: why ENCODE_QUALITY_LEVEL is explicit, and why the install (not the
+            // declaration) is what a pending retarget folds into (VUID-...-08254).
+            let nb = self.pending_bitrate.unwrap_or(self.bitrate);
+            let install_layer = [vk::VideoEncodeRateControlLayerInfoKHR::default()
+                .average_bitrate(nb)
+                .max_bitrate(nb)
+                .frame_rate_numerator(self.fps)
+                .frame_rate_denominator(1)];
+            let mut install_rc = vk::VideoEncodeRateControlInfoKHR::default()
+                .rate_control_mode(self.rc_mode)
+                .layers(&install_layer)
+                .virtual_buffer_size_in_ms(self.vbv_ms.0)
+                .initial_virtual_buffer_size_in_ms(self.vbv_ms.1);
+            install_rc.p_next = &av1_rc as *const _ as *const c_void;
             let mut q =
                 vk::VideoEncodeQualityLevelInfoKHR::default().quality_level(self.quality_level);
-            q.p_next = rc_ptr;
+            q.p_next = &install_rc as *const _ as *const c_void;
             let mut ctrl = vk::VideoCodingControlInfoKHR::default().flags(
                 vk::VideoCodingControlFlagsKHR::RESET
                     | vk::VideoCodingControlFlagsKHR::ENCODE_RATE_CONTROL
@@ -3356,10 +3503,10 @@ impl VulkanVideoEncoder {
                 .frame_rate_numerator(self.fps)
                 .frame_rate_denominator(1)];
             let mut rc2 = vk::VideoEncodeRateControlInfoKHR::default()
-                .rate_control_mode(vk::VideoEncodeRateControlModeFlagsKHR::CBR)
+                .rate_control_mode(self.rc_mode)
                 .layers(&rc_layer2)
-                .virtual_buffer_size_in_ms(1000)
-                .initial_virtual_buffer_size_in_ms(500);
+                .virtual_buffer_size_in_ms(self.vbv_ms.0)
+                .initial_virtual_buffer_size_in_ms(self.vbv_ms.1);
             rc2.p_next = &av1_rc as *const _ as *const c_void;
             let mut ctrl = vk::VideoCodingControlInfoKHR::default()
                 .flags(vk::VideoCodingControlFlagsKHR::ENCODE_RATE_CONTROL);
@@ -3660,9 +3807,31 @@ impl Encoder for VulkanVideoEncoder {
     fn reconfigure_bitrate(&mut self, bps: u64) -> bool {
         // The RC block is re-declared on every recorded frame, so the retarget is just a staged
         // rate: the next `record_submit` emits an ENCODE_RATE_CONTROL control command carrying it
-        // — no session churn, no IDR. Same floor as `open` (a 0-rate CBR layer is rejected).
-        self.pending_bitrate = Some(bps.max(1_000_000));
+        // — no session churn, no IDR. Same floor as `open` (a 0-rate layer is rejected) and the
+        // same driver ceiling (the spec bounds every layer's bitrates by the profile's
+        // `maxBitrate`; an ABR climb must not sail past it). Any clamp here is visible to the
+        // session loop through `applied_bitrate_bps`, so the controller climbs from the real
+        // rate, not the requested one.
+        let clamped = bps.max(1_000_000).min(self.hw_max_bitrate);
+        if clamped < bps {
+            tracing::debug!(
+                requested = bps,
+                cap = self.hw_max_bitrate,
+                "vulkan-encode: retarget clamped to the driver's maxBitrate"
+            );
+        }
+        self.pending_bitrate = Some(clamped);
         true
+    }
+
+    fn applied_bitrate_bps(&self) -> Option<u64> {
+        // The encoder-side truth after the `hw_max_bitrate` clamp (open + retarget). Without
+        // this, a clamped retarget leaves the session loop trusting the REQUESTED rate: the
+        // send pacer drains at a phantom rate, the ceiling cache never learns, and the client
+        // controller climbs from a base the ASIC never targets (§ABR overdrive — the trait doc
+        // names this exact trap). A pending retarget is reported as applied: the very next
+        // recorded frame installs it, and callers read this right after `reconfigure_bitrate`.
+        Some(self.pending_bitrate.unwrap_or(self.bitrate))
     }
 
     fn flush(&mut self) -> Result<()> {
@@ -5116,10 +5285,15 @@ mod tests {
     /// earlier is still the session's current mode when that frame opens its coding scope —
     /// which is why the declaration keys on `rc_installed`, not `!first_frame`.
     ///
-    /// Only the validation layers can see the mismatch, so run as:
+    /// Phase 2 also stages a `reconfigure_bitrate` BEFORE the reset — the pending rate survives
+    /// a reset by design, and the post-reset first frame used to promote it into the begin
+    /// declaration before the session had installed it (`VUID-...-08254`, the `<declared> !=
+    /// <current>` sibling of the 08253 case below).
+    ///
+    /// Only the validation layers can see either mismatch, so run as:
     /// `VK_LOADER_LAYERS_ENABLE='*validation*' cargo test ... -- --ignored`. Confirmed on RADV
-    /// PHOENIX 2026-07-25: VUID-vkCmdBeginVideoCodingKHR-pBeginInfo-08253 before the fix ("no
-    /// VkVideoEncodeRateControlInfoKHR ... but the currently set mode is CBR"), zero after.
+    /// PHOENIX: 08253 before its fix, zero after (2026-07-25); and with this retarget phase,
+    /// exactly one 08254 on the pre-fix build vs zero on the fixed one (same day, same box).
     #[test]
     #[ignore = "needs a real VK_KHR_video_encode_h265 device; meaningful only under validation layers"]
     fn vulkan_reset_keeps_the_declared_rate_control_state() {
@@ -5135,9 +5309,16 @@ mod tests {
             .expect("submit");
             while enc.poll().expect("poll").is_some() {}
         }
-        eprintln!("phase 2: reset() mid-stream");
+        eprintln!("phase 2: reconfigure_bitrate() then reset() — the 08254 coincidence");
+        // The ABR retarget and the stall watchdog live in the same encode loop and correlate
+        // (congestion is when you retarget AND when the encoder wedges), so the pending rate
+        // must survive the reset — and the NEXT frame's begin must still declare the OLD rate,
+        // because a reset never touches the session object. Promoting the pending rate before
+        // recording declared the new rate ahead of its install:
+        // VUID-vkCmdBeginVideoCodingKHR-pBeginInfo-08254, one frame, exactly here.
+        assert!(enc.reconfigure_bitrate(20_000_000), "retarget should stage");
         assert!(enc.reset(), "reset should succeed");
-        eprintln!("phase 3: 4 more frames — first one re-declares state as if fresh");
+        eprintln!("phase 3: 4 more frames — first one re-declares the OLD rate, installs the NEW");
         for i in 4..8u64 {
             enc.submit_indexed(
                 &cpu_frame(w, h, i * 16_666_667, [200, 40, 40, 255]),

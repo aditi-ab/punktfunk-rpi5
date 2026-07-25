@@ -520,6 +520,35 @@ pub(crate) fn vbv_frames_env() -> f64 {
         .unwrap_or(1.0)
 }
 
+/// The same HRD/VBV window as [`vbv_frames_env`], expressed the way the Vulkan Video encode API
+/// wants it: `(virtualBufferSizeInMs, initialVirtualBufferSizeInMs)`.
+///
+/// Every other backend states the window in **bits** (`bitrate / fps × frames`); Vulkan states it
+/// in **milliseconds**. `vulkan_video.rs` consumes this ONLY when the driver advertises VBR
+/// (WP6.3): a tight window under CBR makes the driver stuff underspent frames with filler NALs up
+/// to the exact rate share — measured 97 % filler on the 780M — because CBR must keep the CPB from
+/// overflowing and Vulkan exposes no filler-suppression control. VBR permits the underspend, so
+/// the tight window only ever *bounds* a complex frame.
+///
+/// The initial fill stays at half the window, preserving the RATIO the hardcoded (1000, 500)
+/// pair had — the direct-NVENC house shape uses a FULL-window initial fill instead; measured on
+/// RADV the difference is inert (the firmware showed no window sensitivity at all). Both
+/// VUIDs on `VkVideoEncodeRateControlInfoKHR`'s window fields are satisfied by construction: the
+/// window clamps to `>= 1` so it is non-zero, and `window / 2 <= window` always
+/// (`VUID-...-08358` is `<=`, relaxed in Vulkan 1.3.299).
+///
+/// Carries its only caller's gate: `vulkan_video.rs` is the sole ms-form consumer, and with the
+/// crate-wide `allow(dead_code)` gone (WP0.3) an item unused in ANY feature combination is a hard
+/// error — this is dead on every Windows leg.
+#[cfg(all(target_os = "linux", feature = "vulkan-encode"))]
+pub(crate) fn vbv_window_ms(fps: u32) -> (u32, u32) {
+    let frames = vbv_frames_env();
+    let ms = (frames * 1000.0 / fps.max(1) as f64).round();
+    // `f64 as u32` saturates at the bounds in Rust, so an absurd `PUNKTFUNK_VBV_FRAMES` cannot wrap.
+    let window = (ms as u32).max(1);
+    (window, window / 2)
+}
+
 /// Validate a requested encode resolution before we allocate buffers or open NVENC. Rejects
 /// zero/odd-sized and out-of-range modes with a clear error instead of letting buffer math
 /// overflow or the encoder open fail with an opaque NVENC code. A client can request any
@@ -574,6 +603,31 @@ pub fn validate_dimensions(codec: Codec, width: u32, height: u32) -> Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// WP6.3. The window VUIDs on `VkVideoEncodeRateControlInfoKHR` are the whole contract of
+    /// this helper, and both are edge cases: the window must be non-zero (a high-refresh mode
+    /// rounds a sub-1 ms window down to nothing) and the initial fill must be at most the window
+    /// (`<=` — `VUID-...-08358` was relaxed in 1.3.299). Env-free so it pins the default shape —
+    /// the scaled cases belong to whoever sets `PUNKTFUNK_VBV_FRAMES`. Carries the helper's own
+    /// cfg gate (see its note), so it runs on the Linux `vulkan-encode` leg.
+    #[cfg(all(target_os = "linux", feature = "vulkan-encode"))]
+    #[test]
+    fn vbv_window_is_about_one_frame_and_always_legal() {
+        // The house default is ~1 frame interval, not the 1000 ms the Vulkan backend hardwired.
+        assert_eq!(vbv_window_ms(60).0, 17); // 16.67 ms
+        assert_eq!(vbv_window_ms(30).0, 33);
+        assert_eq!(vbv_window_ms(240).0, 4);
+        for fps in [1, 24, 30, 60, 120, 144, 240, 480, 1000, 4000, u32::MAX] {
+            let (window, initial) = vbv_window_ms(fps);
+            assert!(window > 0, "virtualBufferSizeInMs must be > 0 (fps {fps})");
+            assert!(
+                initial <= window,
+                "initialVirtualBufferSizeInMs must be <= virtualBufferSizeInMs (fps {fps})"
+            );
+        }
+        // fps 0 must not divide by zero — `open` clamps, but the helper is called directly too.
+        assert!(vbv_window_ms(0).0 > 0);
+    }
 
     #[test]
     fn rejects_zero_and_odd_dimensions() {
