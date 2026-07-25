@@ -1508,6 +1508,20 @@ mod nvenc_status;
 #[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "nvenc"))]
 #[path = "enc/nvenc_core.rs"]
 mod nvenc_core;
+// The slot-family RFI recovery policy (WP7.2) shared by native AMF, native QSV and Vulkan Video —
+// the taint sweep + pre-loss anchor pick extracted from three hand-copies that had already
+// diverged once (the fecbec2d sweep predates the Vulkan backend's carve-out and was never ported
+// to it until a later fix). Policy only: every mechanism (LTR bitfield, RefListCtrl, DPB slot
+// table) stays in its backend. cfg = the union of the callers': amf.rs is featureless on Windows,
+// vulkan_video needs `vulkan-encode` on Linux — and each ITEM inside is live under the module's
+// whole cfg because `plan_slot_recovery` delegates to `pick_anchor` (dead_code is an item lint;
+// module-granular reasoning is how a Windows-dead helper reaches main).
+#[cfg(any(
+    target_os = "windows",
+    all(target_os = "linux", feature = "vulkan-encode")
+))]
+#[path = "enc/rfi.rs"]
+mod rfi;
 // Shared libavcodec glue (`pixel_to_av`, swscale consts) for the three libav backends — Linux
 // NVENC + VAAPI and Windows AMF/QSV — so the byte-identical pieces live once (plan §2.2, Tier 2).
 #[cfg(any(target_os = "linux", all(target_os = "windows", feature = "amf-qsv")))]

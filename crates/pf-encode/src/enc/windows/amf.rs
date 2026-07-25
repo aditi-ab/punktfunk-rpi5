@@ -2373,31 +2373,27 @@ impl Encoder for AmfEncoder {
         if !self.ltr_active || first < 0 || first > last {
             return false;
         }
-        // Taint sweep BEFORE picking the anchor: an LTR marked at-or-after the loss start was
-        // encoded inside the client's corrupt window — the client either never received it or
-        // decoded it against a broken reference chain. Serving it as "known-good" on a LATER
-        // loss ships corruption as the recovery anchor (and every subsequent mark re-samples
-        // it). Dropped slots stay dropped; the cadence re-marks a clean frame within ~1/4 s.
-        for marked in self.ltr_slots.iter_mut() {
-            if marked.is_some_and(|idx| idx >= first) {
+        // The taint-sweep + anchor-pick POLICY lives in `rfi::plan_slot_recovery` (one decision
+        // shared with QSV and Vulkan Video); this backend's mechanism is: distrust = clear the
+        // mirror slot (dropped slots stay dropped; the cadence re-marks a clean frame within
+        // ~1/4 s). `ltr_slots` store the WIRE frame index of the marked frame (`submit_indexed`
+        // pins `frame_idx` to it per submission), so they compare directly against the client's
+        // `first` — and stay comparable across encoder rebuilds/resets, where an internal counter
+        // would make the pre-loss check vacuous and risk force-referencing an LTR marked INSIDE
+        // the lost range.
+        let view: Vec<(usize, i64)> = self
+            .ltr_slots
+            .iter()
+            .enumerate()
+            .filter_map(|(s, m)| m.map(|w| (s, w)))
+            .collect();
+        let plan = super::rfi::plan_slot_recovery(&view, first);
+        for (slot, marked) in self.ltr_slots.iter_mut().enumerate() {
+            if plan.tainted & (1 << slot) != 0 {
                 *marked = None;
             }
         }
-        // Pick the newest LTR strictly OLDER than the loss: the most recent known-good reference the
-        // client still holds, so re-referencing it costs the least (smallest recovery-frame residual).
-        // `ltr_slots` store the WIRE frame index of the marked frame (`submit_indexed` pins
-        // `frame_idx` to it per submission), so they compare directly against the client's `first`
-        // — and stay comparable across encoder rebuilds/resets, where an internal counter would
-        // make this check vacuous and risk force-referencing an LTR marked INSIDE the lost range.
-        let mut best: Option<(usize, i64)> = None;
-        for (slot, marked) in self.ltr_slots.iter().enumerate() {
-            if let Some(idx) = *marked {
-                if idx < first && best.is_none_or(|(_, b)| idx > b) {
-                    best = Some((slot, idx));
-                }
-            }
-        }
-        match best {
+        match plan.anchor {
             Some((slot, ltr_frame)) => {
                 // Queue the force for the next submit; that frame ships tagged `recovery_anchor`.
                 self.pending_force = Some(slot);

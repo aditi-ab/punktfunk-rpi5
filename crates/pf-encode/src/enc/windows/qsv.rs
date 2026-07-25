@@ -1416,36 +1416,30 @@ impl Encoder for QsvEncoder {
         if !self.ltr_active || first < 0 || first > last {
             return false;
         }
-        // Taint sweep BEFORE picking the anchor: an LTR marked at-or-after the loss start was
-        // encoded inside the client's corrupt window — the client either never received it or
-        // decoded it against a broken reference chain. Serving it as "known-good" on a LATER
-        // loss ships corruption as the recovery anchor, and every subsequent mark re-samples
-        // the soup — the sustained-loss field failure where the picture never healed. Dropped
-        // slots stay dropped; the cadence re-marks a clean frame within ~1/4 s.
-        //
-        // Mark tainted rather than clearing: `ltr_slots` mirrors the HARDWARE DPB, and nulling an
-        // entry issues no VPL call — the frame stays marked long-term in the encoder. Clearing it
-        // made the rejection list below (which iterates the post-sweep mirror and only names `Some`
-        // slots) silently SKIP the one entry the sweep exists to distrust, so the recovery frame
-        // could still predict from it. With two slots the "exactly one swept" case is the modal
-        // one, and it was the broken one.
-        for (slot, marked) in self.ltr_slots.iter().enumerate() {
-            if marked.is_some_and(|idx| idx >= first) {
-                self.ltr_tainted[slot] = true;
+        // The taint-sweep + anchor-pick POLICY lives in `rfi::plan_slot_recovery` (one decision
+        // shared with AMF and Vulkan Video). This backend's mechanism: distrust is a SEPARATE
+        // `ltr_tainted` flag, never a cleared mirror slot — `ltr_slots` mirrors the HARDWARE DPB,
+        // and nulling an entry issues no VPL call, so the frame stays marked long-term in the
+        // encoder. Clearing it made the rejection list below (which iterates the mirror and only
+        // names `Some` slots) silently SKIP the one entry the sweep exists to distrust, so the
+        // recovery frame could still predict from it. With two slots the "exactly one swept" case
+        // is the modal one, and it was the broken one. The `!ltr_tainted` view filter below is
+        // what persists that distrust across loss events (this call's taints are excluded from
+        // this call's anchor by the policy itself).
+        let view: Vec<(usize, i64)> = self
+            .ltr_slots
+            .iter()
+            .enumerate()
+            .filter(|&(slot, _)| !self.ltr_tainted[slot])
+            .filter_map(|(s, m)| m.map(|w| (s, w)))
+            .collect();
+        let plan = super::rfi::plan_slot_recovery(&view, first);
+        for (slot, tainted) in self.ltr_tainted.iter_mut().enumerate() {
+            if plan.tainted & (1 << slot) != 0 {
+                *tainted = true;
             }
         }
-        let mut best: Option<(usize, i64)> = None;
-        for (slot, marked) in self.ltr_slots.iter().enumerate() {
-            if self.ltr_tainted[slot] {
-                continue; // still in the DPB, but encoded inside the corrupt window
-            }
-            if let Some(idx) = *marked {
-                if idx < first && best.is_none_or(|(_, b)| idx > b) {
-                    best = Some((slot, idx));
-                }
-            }
-        }
-        match best {
+        match plan.anchor {
             Some((slot, ltr_frame)) => {
                 self.pending_force = Some(slot);
                 tracing::info!(
