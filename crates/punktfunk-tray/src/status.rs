@@ -37,11 +37,6 @@ pub struct Summary {
     /// host that doesn't send it deserializes as 0.
     #[serde(default)]
     pub kept_displays: u32,
-    /// Other Moonlight-compatible hosts (Sunshine/Apollo/…) the host detected on this machine at
-    /// startup — side-by-side use is unsupported. `#[serde(default)]` so an older host omitting it
-    /// deserializes as empty.
-    #[serde(default)]
-    pub conflicts: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, serde::Deserialize)]
@@ -74,43 +69,24 @@ impl TrayStatus {
             TrayStatus::Starting => "punktfunk host — starting…".into(),
             TrayStatus::Degraded => "punktfunk host — running (status unavailable)".into(),
             TrayStatus::Error(e) => format!("punktfunk host — failed ({e})"),
-            TrayStatus::Running(s) => {
-                let base = match (&s.session, self.is_streaming()) {
-                    (Some(sess), true) => format!(
-                        "punktfunk host {} — streaming {}×{}@{}",
-                        s.version, sess.width, sess.height, sess.fps
-                    ),
-                    (_, true) => format!("punktfunk host {} — streaming", s.version),
-                    // Idle, but surface a kept (lingering/pinned) display: it — and, under an
-                    // exclusive topology, your physical monitors — is being held. Release it from
-                    // the console.
-                    _ if s.kept_displays > 0 => format!(
-                        "punktfunk host {} — idle · {} display{} kept",
-                        s.version,
-                        s.kept_displays,
-                        if s.kept_displays == 1 { "" } else { "s" }
-                    ),
-                    _ => format!("punktfunk host {} — idle", s.version),
-                };
-                // A conflicting Moonlight host (Sunshine/Apollo/…) is the loudest thing to say —
-                // side-by-side use is unsupported, so lead the tooltip with it.
-                if s.conflicts.is_empty() {
-                    base
-                } else {
-                    format!("⚠ conflicting host: {} — {base}", s.conflicts.join(", "))
-                }
-            }
+            TrayStatus::Running(s) => match (&s.session, self.is_streaming()) {
+                (Some(sess), true) => format!(
+                    "punktfunk host {} — streaming {}×{}@{}",
+                    s.version, sess.width, sess.height, sess.fps
+                ),
+                (_, true) => format!("punktfunk host {} — streaming", s.version),
+                // Idle, but surface a kept (lingering/pinned) display: it — and, under an
+                // exclusive topology, your physical monitors — is being held. Release it from
+                // the console.
+                _ if s.kept_displays > 0 => format!(
+                    "punktfunk host {} — idle · {} display{} kept",
+                    s.version,
+                    s.kept_displays,
+                    if s.kept_displays == 1 { "" } else { "s" }
+                ),
+                _ => format!("punktfunk host {} — idle", s.version),
+            },
         }
-    }
-
-    /// The host detected another Moonlight-compatible host (Sunshine/Apollo/…) on this machine —
-    /// unsupported side-by-side. Drives the Linux (ksni) backend's `NeedsAttention` state; the
-    /// Windows backend surfaces the same conflict through the tooltip `headline()` instead (it has
-    /// no distinct attention icon), so this accessor is unused there — allow it per-platform rather
-    /// than gate the shared API out.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    pub fn has_conflicts(&self) -> bool {
-        matches!(self, TrayStatus::Running(s) if !s.conflicts.is_empty())
     }
 
     /// A client is streaming: the host's flag, OR a live session in the summary.
@@ -433,7 +409,6 @@ mod tests {
             pin_pending: false,
             pending_approvals: 0,
             kept_displays: 0,
-            conflicts: Vec::new(),
         }
     }
 
@@ -476,15 +451,20 @@ mod tests {
         }
     }
 
+    /// Conflicting-host detection is deliberately NOT a tray concern: "installed" is not
+    /// "running", and an always-on ⚠ over a merely-present Sunshine cried wolf. The host still
+    /// detects and reports it (startup log, `detect-conflicts`, the mgmt summary) — the tray just
+    /// ignores that field, which it must keep tolerating on the wire.
     #[test]
-    fn conflicts_drive_attention_and_lead_the_tooltip() {
-        let mut s = summary(false);
-        assert!(!TrayStatus::Running(s.clone()).has_conflicts());
-        s.conflicts = vec!["Sunshine (running)".into(), "Apollo".into()];
-        let st = TrayStatus::Running(s);
-        assert!(st.has_conflicts());
-        let head = st.headline();
-        assert!(head.starts_with("⚠ conflicting host: Sunshine (running), Apollo"));
+    fn a_summary_carrying_conflicts_still_deserializes_and_is_ignored() {
+        let json = r#"{"version":"0.5.1","video_streaming":false,"audio_streaming":false,
+            "session":null,"paired_clients":1,"native_paired_clients":2,"pin_pending":false,
+            "pending_approvals":0,"kept_displays":0,"conflicts":["Sunshine (installed)"]}"#;
+        let s: Summary = serde_json::from_str(json).expect("unknown fields are ignored");
+        assert_eq!(
+            TrayStatus::Running(s).headline(),
+            "punktfunk host 0.5.1 — idle"
+        );
     }
 
     #[test]

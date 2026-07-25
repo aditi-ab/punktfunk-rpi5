@@ -53,7 +53,7 @@ impl ksni::Tray for HostTray {
     fn status(&self) -> ksni::Status {
         match &self.status {
             TrayStatus::Error(_) => ksni::Status::NeedsAttention,
-            s if s.pairing_attention() || s.has_conflicts() => ksni::Status::NeedsAttention,
+            s if s.pairing_attention() => ksni::Status::NeedsAttention,
             _ => ksni::Status::Active,
         }
     }
