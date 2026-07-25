@@ -6,11 +6,12 @@
 //! queue under the device's [`QueueLock`], fence-waited (sub-ms — Phase-0 measured
 //! 0.067 ms GPU at 1080p on the RTX 5070 Ti).
 //!
-//! Output: three separate R8 planes (Y full-res, Cb/Cr half-res) — the decode path
-//! requires STORAGE usage and IDENTITY/R swizzles, so the encoder's two-component
-//! RG8 trick is not allowed here (pyrowave.h validation). The presenter samples them
-//! with its planar CSC variant (BT.709 limited — the codec's fixed colour contract,
-//! there is no VUI). A small ring of plane-sets keeps a decode from overwriting the set
+//! Output: three separate single-component planes (Y full-res; Cb/Cr half-res, or
+//! full-res on a 4:4:4 session) — R8, or R16 UNORM on a 10-bit session — the decode
+//! path requires STORAGE usage and IDENTITY/R swizzles, so the encoder's two-component
+//! RG trick is not allowed here (pyrowave.h validation). The presenter samples them
+//! with its planar CSC variant (colour per the negotiated `ColorInfo` — the wavelet
+//! bitstream carries no VUI). A small ring of plane-sets keeps a decode from overwriting the set
 //! the presenter is still sampling; the synchronous fence bounds decode-side reuse and
 //! the ring depth covers present-side latency (≤ 1–2 frames in this pipeline).
 //!
@@ -222,9 +223,10 @@ unsafe extern "C" fn queue_unlock_cb(ud: *mut c_void) {
     unsafe { (*(ud as *const crate::video::QueueLock)).unlock() }
 }
 
-/// One decoded PyroWave frame: three R8 plane images on the presenter's device, GENERAL
-/// layout, decode-complete (the decoder fence-waits before handing it over). `slot`
-/// identifies the ring entry; the images/views live as long as the decoder.
+/// One decoded PyroWave frame: three single-component plane images (R8, or R16 on a
+/// 10-bit session) on the presenter's device, GENERAL layout, decode-complete (the
+/// decoder fence-waits before handing it over). `slot` identifies the ring entry; the
+/// images/views live as long as the decoder.
 pub struct PyroWavePlanarFrame {
     /// Raw `VkImageView`s (Y, Cb, Cr) for the presenter's planar CSC sampling.
     pub views: [u64; 3],
@@ -252,7 +254,8 @@ struct RetiredRing {
     retired_at: Instant,
 }
 
-/// One decode-output plane: R8, storage (decode writes) + sampled (presenter CSC).
+/// One decode-output plane (`fmt` = R8, or R16 on a 10-bit session): storage (decode
+/// writes) + sampled (presenter CSC).
 unsafe fn make_plane(
     device: &ash::Device,
     mem_props: &vk::PhysicalDeviceMemoryProperties,
@@ -539,7 +542,8 @@ impl PyroWaveDecoder {
             return Err(e);
         }
 
-        // Plane-set ring: 3 × R8, storage (decode writes) + sampled (presenter CSC).
+        // Plane-set ring: 3 single-component planes (R8; R16 on a 10-bit session),
+        // storage (decode writes) + sampled (presenter CSC).
         let mem_props = instance.get_physical_device_memory_properties(
             vk::PhysicalDevice::from_raw(vkd.physical_device as u64),
         );
@@ -873,12 +877,26 @@ impl PyroWaveDecoder {
             &vk::DependencyInfo::default().image_memory_barriers(&pre),
         );
 
+        // The declared format/extent MUST equal the ring image's real ones: pyrowave wraps
+        // our VkImage under `image_format` and vkCreateImageView's its storage view with
+        // `view_format` (pyrowave_c.cpp `WrappedViewBuffers::wrap` — its own
+        // `pyrowave_image_get_image_view` helper fills both from the image itself).
+        // Declaring R8 over a 10-bit session's R16_UNORM planes is an invalid view the
+        // driver executes anyway: its addressing covers half the surface, so decoded 8-bit
+        // codes fuse pairwise into 16-bit texels (structured garbage) and the never-written
+        // remainder samples as all-plane zeros (saturated green) — the 2026-07 AMD-client
+        // field report. Same discipline for chroma extents: a 4:4:4 ring is full-res.
+        let fmt = if self.hdr16 {
+            pw::VkFormat_VK_FORMAT_R16_UNORM
+        } else {
+            pw::VkFormat_VK_FORMAT_R8_UNORM
+        };
         let plane = |img: vk::Image, w: u32, h: u32| pw::pyrowave_image_view {
             image: img.as_raw() as usize as pw::VkImage,
             width: w,
             height: h,
-            image_format: pw::VkFormat_VK_FORMAT_R8_UNORM,
-            view_format: pw::VkFormat_VK_FORMAT_R8_UNORM,
+            image_format: fmt,
+            view_format: fmt,
             mip_level: 0,
             layer: 0,
             aspect: pw::VkImageAspectFlagBits_VK_IMAGE_ASPECT_COLOR_BIT,
@@ -886,11 +904,16 @@ impl PyroWaveDecoder {
             layout: pw::VkImageLayout_VK_IMAGE_LAYOUT_GENERAL,
         };
         let (w, h) = (self.width, self.height);
+        let (cw, ch) = if self.chroma444 {
+            (w, h)
+        } else {
+            (w / 2, h / 2)
+        };
         let buffers = pw::pyrowave_gpu_buffers {
             planes: [
                 plane(self.ring[slot].imgs[0], w, h),
-                plane(self.ring[slot].imgs[1], w / 2, h / 2),
-                plane(self.ring[slot].imgs[2], w / 2, h / 2),
+                plane(self.ring[slot].imgs[1], cw, ch),
+                plane(self.ring[slot].imgs[2], cw, ch),
             ],
         };
         pw::pyrowave_device_set_command_buffer(
