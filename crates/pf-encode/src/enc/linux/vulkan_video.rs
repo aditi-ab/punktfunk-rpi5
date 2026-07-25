@@ -10,7 +10,10 @@
 //! The AV1 encode structs our pinned `ash 0.38` predates are vendored in `vk_av1_encode.rs`.
 #![allow(clippy::too_many_arguments)]
 
-use super::vk_util::{color_range, find_mem, make_plain_image, make_view, pixel_to_vk};
+use super::vk_util::{
+    color_range, find_mem, import_failure_feeds_latch, make_host_buffer, make_plain_image,
+    make_view, normalize_cpu_rgb, pixel_to_vk,
+};
 use crate::{Codec, EncodedFrame, Encoder, EncoderCaps};
 use anyhow::{bail, Context, Result};
 use ash::vk;
@@ -560,6 +563,8 @@ pub struct VulkanVideoEncoder {
     /// separately from the host's fence wait; 0.0 means disabled or unsupported.
     ts_period_ns: f64,
     perf_at: std::time::Instant,
+    /// Reused 3→4 expansion buffer for 24-bpp CPU payloads (`vk_util::normalize_cpu_rgb`).
+    cpu_expand: Vec<u8>,
     /// RGB-direct (EFC) session config — `Some` ⇒ the session's picture format is BGRA, frames
     /// are handed to the encoder as RGB (dmabuf import or CPU upload) and the VCN front-end does
     /// the CSC; `None` ⇒ the compute-CSC path. Fixed per session (the picture format is baked
@@ -1306,6 +1311,7 @@ impl VulkanVideoEncoder {
             quality_level,
             ts_period_ns,
             perf_at: std::time::Instant::now(),
+            cpu_expand: Vec::new(),
             rgb: rgb_cfg,
             native_nv12,
             warned_cursor: false,
@@ -1545,7 +1551,27 @@ impl VulkanVideoEncoder {
         if let Some(&(_, _, img, _, view)) = self.import_cache.iter().find(|e| (e.0, e.1) == key) {
             return Ok((img, view, false));
         }
-        let (img, mem, view) = self.import_dmabuf(d, cw, ch)?;
+        // Feed pf-zerocopy's raw-dmabuf degrade latch (wired for the libav path in 3efbe416):
+        // a deterministic import refusal repeats identically forever, and the latch — capture
+        // negotiates CPU delivery from the next session — is its only recovery; the CPU path
+        // serves every format capture produces (`normalize_cpu_rgb`). Excluded: transient
+        // allocation OOM (`import_failure_feeds_latch`), and native-NV12 sessions entirely — an
+        // NV12-layout quirk should cost the NV12 preference, not ALL dmabuf capture, and that
+        // narrower response doesn't exist yet (noted in the phase-5 handoff as follow-up).
+        let (img, mem, view) = match self.import_dmabuf(d, cw, ch) {
+            Ok(t) => {
+                if !self.native_nv12 {
+                    pf_zerocopy::note_raw_dmabuf_import_ok();
+                }
+                t
+            }
+            Err(e) => {
+                if !self.native_nv12 && import_failure_feeds_latch(&e) {
+                    pf_zerocopy::note_raw_dmabuf_import_failure(&format!("{e:#}"));
+                }
+                return Err(e);
+            }
+        };
         // Bound the cache; evict oldest (FIFO). A stable PipeWire pool never trips this in steady state
         // (all imports resident); it only cycles across a pool change (which also rebuilds the session).
         // Up to `ring_depth - 1` submitted frames may still be executing against a cached image
@@ -1631,7 +1657,16 @@ impl VulkanVideoEncoder {
                     &mut plist,
                     &fams,
                 )?;
-                let v = make_view(&dev, i, fmt, 0)?;
+                // `make_video_image` unwinds internally, but a view failure here leaked the
+                // image+memory pair it had just handed over.
+                let v = match make_view(&dev, i, fmt, 0) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        dev.destroy_image(i, None);
+                        dev.free_memory(m, None);
+                        return Err(e);
+                    }
+                };
                 (i, m, v)
             } else {
                 make_plain_image(
@@ -1654,25 +1689,12 @@ impl VulkanVideoEncoder {
                 dev.destroy_buffer(b, None);
                 dev.free_memory(m, None);
             }
-            let buf = dev.create_buffer(
-                &vk::BufferCreateInfo::default()
-                    .size(need)
-                    .usage(vk::BufferUsageFlags::TRANSFER_SRC),
-                None,
+            let (buf, mem) = make_host_buffer(
+                &dev,
+                &self.mem_props,
+                need,
+                vk::BufferUsageFlags::TRANSFER_SRC,
             )?;
-            let req = dev.get_buffer_memory_requirements(buf);
-            let mem = dev.allocate_memory(
-                &vk::MemoryAllocateInfo::default()
-                    .allocation_size(req.size)
-                    .memory_type_index(find_mem(
-                        &self.mem_props,
-                        req.memory_type_bits,
-                        vk::MemoryPropertyFlags::HOST_VISIBLE
-                            | vk::MemoryPropertyFlags::HOST_COHERENT,
-                    )),
-                None,
-            )?;
-            dev.bind_buffer_memory(buf, mem, 0)?;
             self.frames[slot].cpu_stage = Some((buf, mem, need));
         }
         let (_, m, _) = self.frames[slot].cpu_stage.unwrap();
@@ -1832,121 +1854,153 @@ impl VulkanVideoEncoder {
             &vk::CommandBufferBeginInfo::default()
                 .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
         )?;
-        // PUNKTFUNK_PERF: bracket the whole compute batch (import barriers + cursor prep + CSC
-        // dispatch + plane copies) with timestamps — read back in `read_slot` as `csc_us`, the
-        // half of the fence wait that is NOT the ASIC encode.
-        self.frames[slot].ts_written = false;
-        if self.ts_period_ns > 0.0 {
-            dev.cmd_reset_query_pool(compute_cmd, ts_pool, 0, 2);
-            dev.cmd_write_timestamp2(compute_cmd, vk::PipelineStageFlags2::NONE, ts_pool, 0);
-            // This batch resets the pool and closes it below, so `read_slot` may read it.
-            self.frames[slot].ts_written = true;
-        }
-
-        // Cursor-as-metadata: refresh this slot's cursor image (only when the bitmap changed) and
-        // get the shader push constant. Recorded into `compute_cmd` before the CSC dispatch samples it.
-        let cursor_pc = self.prep_cursor(slot, compute_cmd, frame.cursor.as_ref())?;
-
-        let rgb_view = match &frame.payload {
-            FramePayload::Dmabuf(d) => {
-                // Reuse the per-buffer import (PipeWire cycles a small pool) — no per-frame VkImage
-                // create/import/destroy. The producer wrote new content out-of-band, so still acquire
-                // from FOREIGN each frame; a fresh import starts UNDEFINED (preserves modifier-tiled
-                // data), a cached one is already SHADER_READ_ONLY_OPTIMAL.
-                let (img, view, fresh) = self.import_cached(d, frame.width, frame.height)?;
-                // First import: acquire from the foreign producer (UNDEFINED preserves the modifier-tiled
-                // bytes). Cached re-read: we still own it, so no queue-family transfer — just a visibility
-                // barrier so the shader read sees the content the producer wrote out-of-band this frame
-                // (single-GPU coherent; the capture layer guarantees the buffer is ready at hand-off).
-                let (old, src_qf, dst_qf) = if fresh {
-                    (
-                        vk::ImageLayout::UNDEFINED,
-                        vk::QUEUE_FAMILY_FOREIGN_EXT,
-                        self.compute_family,
-                    )
-                } else {
-                    (
-                        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                        vk::QUEUE_FAMILY_IGNORED,
-                        vk::QUEUE_FAMILY_IGNORED,
-                    )
-                };
-                let acq = vk::ImageMemoryBarrier2::default()
-                    .src_stage_mask(vk::PipelineStageFlags2::NONE)
-                    .src_access_mask(vk::AccessFlags2::NONE)
-                    .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
-                    .dst_access_mask(vk::AccessFlags2::SHADER_READ)
-                    .old_layout(old)
-                    .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                    .src_queue_family_index(src_qf)
-                    .dst_queue_family_index(dst_qf)
-                    .image(img)
-                    .subresource_range(color_range(0));
-                dev.cmd_pipeline_barrier2(
-                    compute_cmd,
-                    &vk::DependencyInfo::default().image_memory_barriers(&[acq]),
-                );
-                view
+        // The fallible recording prefix (cursor prep, dmabuf import, CPU staging) runs in one
+        // closure whose error arm resets `compute_cmd`: an early return used to leave the buffer
+        // RECORDING, and the next frame's `begin` on a RECORDING buffer violates
+        // VUID-vkBeginCommandBuffer-commandBuffer-00049 — the pool's implicit reset covers only
+        // INITIAL/EXECUTABLE/INVALID. Never PENDING here: nothing is submitted until stage 4, so
+        // the error-arm reset is legal on every path.
+        let prefix = (|| -> Result<([i32; 4], vk::ImageView)> {
+            // PUNKTFUNK_PERF: bracket the whole compute batch (import barriers + cursor prep + CSC
+            // dispatch + plane copies) with timestamps — read back in `read_slot` as `csc_us`, the
+            // half of the fence wait that is NOT the ASIC encode.
+            self.frames[slot].ts_written = false;
+            if self.ts_period_ns > 0.0 {
+                dev.cmd_reset_query_pool(compute_cmd, ts_pool, 0, 2);
+                dev.cmd_write_timestamp2(compute_cmd, vk::PipelineStageFlags2::NONE, ts_pool, 0);
+                // This batch resets the pool and closes it below, so `read_slot` may read it.
+                self.frames[slot].ts_written = true;
             }
-            FramePayload::Cpu(bytes) => {
-                let fmt = pixel_to_vk(frame.format).context("unsupported CPU pixel format")?;
-                let view = self.ensure_cpu_rgb(slot, fmt, bytes, frame.width, frame.height)?;
-                let (img, ..) = self.frames[slot].cpu_img.unwrap();
-                let (stage, ..) = self.frames[slot].cpu_stage.unwrap();
-                let to_dst = vk::ImageMemoryBarrier2::default()
-                    .src_stage_mask(vk::PipelineStageFlags2::NONE)
-                    .src_access_mask(vk::AccessFlags2::NONE)
-                    .dst_stage_mask(vk::PipelineStageFlags2::ALL_TRANSFER)
-                    .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-                    .old_layout(vk::ImageLayout::UNDEFINED)
-                    .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .image(img)
-                    .subresource_range(color_range(0));
-                dev.cmd_pipeline_barrier2(
-                    compute_cmd,
-                    &vk::DependencyInfo::default().image_memory_barriers(&[to_dst]),
-                );
-                dev.cmd_copy_buffer_to_image(
-                    compute_cmd,
-                    stage,
-                    img,
-                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                    &[vk::BufferImageCopy::default()
-                        .image_subresource(
-                            vk::ImageSubresourceLayers::default()
-                                .aspect_mask(vk::ImageAspectFlags::COLOR)
-                                .layer_count(1),
+
+            // Cursor-as-metadata: refresh this slot's cursor image (only when the bitmap changed)
+            // and get the shader push constant. Recorded into `compute_cmd` before the CSC
+            // dispatch samples it.
+            let cursor_pc = self.prep_cursor(slot, compute_cmd, frame.cursor.as_ref())?;
+
+            let rgb_view = match &frame.payload {
+                FramePayload::Dmabuf(d) => {
+                    // Reuse the per-buffer import (PipeWire cycles a small pool) — no per-frame VkImage
+                    // create/import/destroy. The producer wrote new content out-of-band, so still acquire
+                    // from FOREIGN each frame; a fresh import starts UNDEFINED (preserves modifier-tiled
+                    // data), a cached one is already SHADER_READ_ONLY_OPTIMAL.
+                    let (img, view, fresh) = self.import_cached(d, frame.width, frame.height)?;
+                    // First import: acquire from the foreign producer (UNDEFINED preserves the modifier-tiled
+                    // bytes). Cached re-read: we still own it, so no queue-family transfer — just a visibility
+                    // barrier so the shader read sees the content the producer wrote out-of-band this frame
+                    // (single-GPU coherent; the capture layer guarantees the buffer is ready at hand-off).
+                    let (old, src_qf, dst_qf) = if fresh {
+                        (
+                            vk::ImageLayout::UNDEFINED,
+                            vk::QUEUE_FAMILY_FOREIGN_EXT,
+                            self.compute_family,
                         )
-                        // The staging buffer holds the REAL frame tightly packed and the image
-                        // is source-sized (see ensure_cpu_rgb) — an aligned-size extent here
-                        // sheared rows against the packed buffer and left garbage rows at
-                        // unaligned modes.
-                        .image_extent(vk::Extent3D {
-                            width: frame.width,
-                            height: frame.height,
-                            depth: 1,
-                        })],
-                );
-                let to_read = vk::ImageMemoryBarrier2::default()
-                    .src_stage_mask(vk::PipelineStageFlags2::ALL_TRANSFER)
-                    .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-                    .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
-                    .dst_access_mask(vk::AccessFlags2::SHADER_READ)
-                    .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                    .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .image(img)
-                    .subresource_range(color_range(0));
-                dev.cmd_pipeline_barrier2(
-                    compute_cmd,
-                    &vk::DependencyInfo::default().image_memory_barriers(&[to_read]),
-                );
-                view
+                    } else {
+                        (
+                            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                            vk::QUEUE_FAMILY_IGNORED,
+                            vk::QUEUE_FAMILY_IGNORED,
+                        )
+                    };
+                    let acq = vk::ImageMemoryBarrier2::default()
+                        .src_stage_mask(vk::PipelineStageFlags2::NONE)
+                        .src_access_mask(vk::AccessFlags2::NONE)
+                        .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                        .dst_access_mask(vk::AccessFlags2::SHADER_READ)
+                        .old_layout(old)
+                        .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                        .src_queue_family_index(src_qf)
+                        .dst_queue_family_index(dst_qf)
+                        .image(img)
+                        .subresource_range(color_range(0));
+                    dev.cmd_pipeline_barrier2(
+                        compute_cmd,
+                        &vk::DependencyInfo::default().image_memory_barriers(&[acq]),
+                    );
+                    view
+                }
+                FramePayload::Cpu(bytes) => {
+                    // 24-bpp Rgb/Bgr expands 3→4 first (see `normalize_cpu_rgb`) — refusing it here
+                    // used to kill the session at its first frame, and the RGB-direct padding branch
+                    // in `ensure_cpu_rgb` does 4-bpp index math on the raw bytes, so the expansion
+                    // must happen BEFORE any of it sees the payload.
+                    let mut scratch = std::mem::take(&mut self.cpu_expand);
+                    let (norm_fmt, norm_bytes) =
+                        normalize_cpu_rgb(frame.format, bytes, &mut scratch, false);
+                    let fmt = pixel_to_vk(norm_fmt).context("unsupported CPU pixel format");
+                    let view = match fmt {
+                        Ok(f) => {
+                            self.ensure_cpu_rgb(slot, f, norm_bytes, frame.width, frame.height)
+                        }
+                        Err(e) => Err(e),
+                    };
+                    self.cpu_expand = scratch;
+                    let view = view?;
+                    let (img, ..) = self.frames[slot].cpu_img.unwrap();
+                    let (stage, ..) = self.frames[slot].cpu_stage.unwrap();
+                    let to_dst = vk::ImageMemoryBarrier2::default()
+                        .src_stage_mask(vk::PipelineStageFlags2::NONE)
+                        .src_access_mask(vk::AccessFlags2::NONE)
+                        .dst_stage_mask(vk::PipelineStageFlags2::ALL_TRANSFER)
+                        .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                        .old_layout(vk::ImageLayout::UNDEFINED)
+                        .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .image(img)
+                        .subresource_range(color_range(0));
+                    dev.cmd_pipeline_barrier2(
+                        compute_cmd,
+                        &vk::DependencyInfo::default().image_memory_barriers(&[to_dst]),
+                    );
+                    dev.cmd_copy_buffer_to_image(
+                        compute_cmd,
+                        stage,
+                        img,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        &[vk::BufferImageCopy::default()
+                            .image_subresource(
+                                vk::ImageSubresourceLayers::default()
+                                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                                    .layer_count(1),
+                            )
+                            // The staging buffer holds the REAL frame tightly packed and the image
+                            // is source-sized (see ensure_cpu_rgb) — an aligned-size extent here
+                            // sheared rows against the packed buffer and left garbage rows at
+                            // unaligned modes.
+                            .image_extent(vk::Extent3D {
+                                width: frame.width,
+                                height: frame.height,
+                                depth: 1,
+                            })],
+                    );
+                    let to_read = vk::ImageMemoryBarrier2::default()
+                        .src_stage_mask(vk::PipelineStageFlags2::ALL_TRANSFER)
+                        .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                        .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                        .dst_access_mask(vk::AccessFlags2::SHADER_READ)
+                        .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                        .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .image(img)
+                        .subresource_range(color_range(0));
+                    dev.cmd_pipeline_barrier2(
+                        compute_cmd,
+                        &vk::DependencyInfo::default().image_memory_barriers(&[to_read]),
+                    );
+                    view
+                }
+                _ => bail!("vulkan-encode: unsupported FramePayload (need Dmabuf or Cpu RGB)"),
+            };
+            Ok((cursor_pc, rgb_view))
+        })();
+        let (cursor_pc, rgb_view) = match prefix {
+            Ok(v) => v,
+            Err(e) => {
+                // SAFETY-ADJACENT: RECORDING (never submitted in this fn yet), pool allows reset.
+                let _ = dev.reset_command_buffer(compute_cmd, vk::CommandBufferResetFlags::empty());
+                return Err(e);
             }
-            _ => bail!("vulkan-encode: unsupported FramePayload (need Dmabuf or Cpu RGB)"),
         };
         self.bind_rgb(csc_set, rgb_view);
 
@@ -2500,8 +2554,23 @@ impl VulkanVideoEncoder {
                 (pad_img, pad_view, SrcAcquire::CscGeneral, true)
             }
             FramePayload::Cpu(bytes) => {
-                let fmt = pixel_to_vk(frame.format).context("unsupported CPU pixel format")?;
-                let view = self.ensure_cpu_rgb(slot, fmt, bytes, frame.width, frame.height)?;
+                // 24-bpp Rgb/Bgr expands 3→4 BEFORE the staging/padding math (which is all
+                // 4-bpp) — see `normalize_cpu_rgb`. BGRA-forced: this image is the ENCODE
+                // source, and the session's `pictureFormat` is B8G8R8A8, so an R-first source
+                // violates VUID-vkCmdEncodeVideoKHR-pEncodeInfo-08207 (caught on RADV by
+                // `vulkan_smoke_rgb_cpu24`; true for plain `Rgbx` CPU sources before the 24-bpp
+                // work too). This arm's `begin_command_buffer` comes AFTER the fallible steps,
+                // so no reset-on-error wrap is needed here.
+                let mut scratch = std::mem::take(&mut self.cpu_expand);
+                let (norm_fmt, norm_bytes) =
+                    normalize_cpu_rgb(frame.format, bytes, &mut scratch, true);
+                let fmt = pixel_to_vk(norm_fmt).context("unsupported CPU pixel format");
+                let view = match fmt {
+                    Ok(f) => self.ensure_cpu_rgb(slot, f, norm_bytes, frame.width, frame.height),
+                    Err(e) => Err(e),
+                };
+                self.cpu_expand = scratch;
+                let view = view?;
                 let (img, ..) = self.frames[slot].cpu_img.expect("ensure_cpu_rgb built it");
                 let (stage, ..) = self.frames[slot]
                     .cpu_stage
@@ -4855,6 +4924,99 @@ mod tests {
     fn vulkan_smoke_rgb_av1() {
         if let Some(aus) = run_smoke_opts(Codec::Av1, true) {
             dump_smoke(&aus, "rgb.obu");
+        }
+    }
+
+    /// 24-bpp packed CPU frame (`PixelFormat::Rgb`/`Bgr` — the PipeWire portal's CPU
+    /// negotiation). `rgb` is (r, g, b) regardless of `fmt`'s byte order.
+    fn cpu_frame_24(w: u32, h: u32, pts_ns: u64, rgb: [u8; 3], fmt: PixelFormat) -> CapturedFrame {
+        let px = match fmt {
+            PixelFormat::Rgb => [rgb[0], rgb[1], rgb[2]],
+            PixelFormat::Bgr => [rgb[2], rgb[1], rgb[0]],
+            _ => unreachable!("24-bpp helper"),
+        };
+        let mut buf = vec![0u8; (w * h * 3) as usize];
+        for p in buf.chunks_exact_mut(3) {
+            p.copy_from_slice(&px);
+        }
+        CapturedFrame {
+            width: w,
+            height: h,
+            pts_ns,
+            format: fmt,
+            payload: FramePayload::Cpu(buf),
+            cursor: None,
+        }
+    }
+
+    /// Drive one whole 24-bpp CPU session (WP5.4: served via `normalize_cpu_rgb`, not refused).
+    /// Frames alternate Rgb/Bgr, which also crosses the staging image's format re-key each
+    /// frame. Returns the AUs; colour truth is checked out-of-band (the dump + ffmpeg bars
+    /// recipe from WP1.4) — in-tree the load-bearing assertions are that every submit encodes
+    /// and, on-glass, that the validation layers stay silent through the expand + upload.
+    fn run_smoke_cpu24(rgb_direct: bool) -> Option<Vec<crate::EncodedFrame>> {
+        let env_dim = |k: &str, d: u32| {
+            std::env::var(k)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(d)
+        };
+        let (w, h) = (env_dim("PF_SMOKE_W", 256), env_dim("PF_SMOKE_H", 256));
+        let mut enc = VulkanVideoEncoder::open_opts(Codec::H265, w, h, 60, 10_000_000, rgb_direct)
+            .expect("open");
+        if rgb_direct && enc.rgb.is_none() {
+            eprintln!("run_smoke_cpu24: RGB-direct unavailable on this driver — skipping");
+            return None;
+        }
+        let colors: [[u8; 3]; 4] = [[200, 40, 40], [40, 200, 40], [40, 40, 200], [200, 200, 40]];
+        let mut aus: Vec<crate::EncodedFrame> = Vec::new();
+        for i in 0..8usize {
+            let fmt = if i % 2 == 0 {
+                PixelFormat::Rgb
+            } else {
+                PixelFormat::Bgr
+            };
+            let frame = cpu_frame_24(w, h, i as u64 * 16_666_667, colors[i / 2], fmt);
+            enc.submit_indexed(&frame, i as u32).expect("submit 24-bpp");
+            while let Some(au) = enc.poll().expect("poll") {
+                aus.push(au);
+            }
+        }
+        enc.flush().expect("flush");
+        while let Some(au) = enc.poll().expect("poll") {
+            aus.push(au);
+        }
+        assert_eq!(aus.len(), 8, "one AU per 24-bpp frame");
+        assert!(aus[0].keyframe, "frame 0 must be IDR");
+        Some(aus)
+    }
+
+    /// WP5.4 smoke — 24-bpp CPU frames through the CSC path.
+    #[test]
+    #[ignore = "needs a real VK_KHR_video_encode_h265 device (run on the RADV host, not the build box)"]
+    fn vulkan_smoke_cpu_rgb24() {
+        let aus = run_smoke_cpu24(false).expect("CSC mode never soft-skips");
+        if let Ok(home) = std::env::var("HOME") {
+            let full: Vec<u8> = aus.iter().flat_map(|a| a.data.iter().copied()).collect();
+            let p = format!("{home}/vkenc-host-smoke-cpu24.h265");
+            let _ = std::fs::write(&p, &full);
+            eprintln!("vulkan_smoke_cpu_rgb24: wrote {p} ({} bytes)", full.len());
+        }
+    }
+
+    /// WP5.4 smoke, RGB-direct twin — the expanded R8G8B8A8/B8G8R8A8 image IS the encode source
+    /// here, so this also answers whether the EFC profile accepts an RGBA-order source on this
+    /// hardware (critique F7: unverified until run). Soft-skips without the VALVE extension.
+    #[test]
+    #[ignore = "needs VK_VALVE_video_encode_rgb_conversion (RADV >= Mesa 26.0 on EFC hardware)"]
+    fn vulkan_smoke_rgb_cpu24() {
+        if let Some(aus) = run_smoke_cpu24(true) {
+            if let Ok(home) = std::env::var("HOME") {
+                let full: Vec<u8> = aus.iter().flat_map(|a| a.data.iter().copied()).collect();
+                let p = format!("{home}/vkenc-host-smoke-rgb-cpu24.h265");
+                let _ = std::fs::write(&p, &full);
+                eprintln!("vulkan_smoke_rgb_cpu24: wrote {p} ({} bytes)", full.len());
+            }
         }
     }
 

@@ -23,7 +23,10 @@
 //! `PUNKTFUNK_ENCODER=pyrowave` and logs that loudly.
 // Every unsafe block in this module carries a `// SAFETY:` proof (parent module enforces it).
 
-use super::vk_util::{color_range, find_mem, import_rgb_dmabuf, make_plain_image, pixel_to_vk};
+use super::vk_util::{
+    color_range, import_failure_feeds_latch, import_rgb_dmabuf, make_host_buffer, make_plain_image,
+    normalize_cpu_rgb, pixel_to_vk,
+};
 use crate::{EncodedFrame, Encoder, EncoderCaps};
 use anyhow::{bail, Context, Result};
 use ash::vk;
@@ -184,6 +187,8 @@ pub struct PyroWaveEncoder {
     // CPU-input staging (software capture / smoke tests), lazily (re)created on format change.
     cpu_img: Option<(vk::Image, vk::DeviceMemory, vk::ImageView, vk::Format)>,
     cpu_stage: Option<(vk::Buffer, vk::DeviceMemory, u64)>,
+    /// Reused 3→4 expansion buffer for 24-bpp CPU payloads (`vk_util::normalize_cpu_rgb`).
+    cpu_expand: Vec<u8>,
 
     cmd_pool: vk::CommandPool,
     cmd: vk::CommandBuffer,
@@ -279,95 +284,170 @@ impl PyroWaveEncoder {
             .create_instance(&hold.instance_ci, None)
             .context("create instance")?;
 
-        // Pick the first real GPU with a graphics+compute family (pyrowave requires a
-        // graphics-capable queue in the device create info; the CSC + codec run on it).
-        let (pd, family) = {
-            let mut found = None;
-            for pd in instance.enumerate_physical_devices()? {
-                let props = instance.get_physical_device_properties(pd);
-                if props.device_type == vk::PhysicalDeviceType::CPU {
-                    continue; // skip llvmpipe
+        // Between `create_instance` and `create_device` the only live resource is the instance,
+        // so this whole stretch runs as one fallible block with a single manual destroy on its
+        // error arm. From the device on, a partially-constructed `Self` (below) makes the
+        // existing `Drop` the sole unwind path — these used to be a dozen `?`s that each leaked
+        // everything created before them.
+        // SAFETY: plain physical-device queries on the live instance just created, and a
+        // `create_device` whose create-infos are pinned in `hold` for the call's duration.
+        let selected = (|| unsafe {
+            // Pick the first real GPU with a graphics+compute family (pyrowave requires a
+            // graphics-capable queue in the device create info; the CSC + codec run on it).
+            let (pd, family) = {
+                let mut found = None;
+                for pd in instance.enumerate_physical_devices()? {
+                    let props = instance.get_physical_device_properties(pd);
+                    if props.device_type == vk::PhysicalDeviceType::CPU {
+                        continue; // skip llvmpipe
+                    }
+                    let fam = instance
+                        .get_physical_device_queue_family_properties(pd)
+                        .iter()
+                        .position(|q| {
+                            q.queue_flags
+                                .contains(vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE)
+                        });
+                    if let Some(f) = fam {
+                        found = Some((pd, f as u32));
+                        break;
+                    }
                 }
-                let fam = instance
-                    .get_physical_device_queue_family_properties(pd)
-                    .iter()
-                    .position(|q| {
-                        q.queue_flags
-                            .contains(vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE)
-                    });
-                if let Some(f) = fam {
-                    found = Some((pd, f as u32));
-                    break;
-                }
+                found.context("no Vulkan GPU with a graphics+compute queue")?
+            };
+
+            // Feature gate — pyrowave's documented encoder requirements (pyrowave.h): shaderInt16,
+            // storageBuffer8BitAccess, subgroup size control (1.3 core); shaderFloat16 is optional.
+            let mut have12 = vk::PhysicalDeviceVulkan12Features::default();
+            let mut have13 = vk::PhysicalDeviceVulkan13Features::default();
+            let mut have2 = vk::PhysicalDeviceFeatures2::default()
+                .push_next(&mut have12)
+                .push_next(&mut have13);
+            instance.get_physical_device_features2(pd, &mut have2);
+            let missing: Vec<&str> = [
+                (have2.features.shader_int16 == vk::TRUE, "shaderInt16"),
+                (
+                    have12.storage_buffer8_bit_access == vk::TRUE,
+                    "storageBuffer8BitAccess",
+                ),
+                (have12.timeline_semaphore == vk::TRUE, "timelineSemaphore"),
+                (
+                    have13.subgroup_size_control == vk::TRUE,
+                    "subgroupSizeControl",
+                ),
+                (
+                    have13.compute_full_subgroups == vk::TRUE,
+                    "computeFullSubgroups",
+                ),
+                (have13.synchronization2 == vk::TRUE, "synchronization2"),
+            ]
+            .iter()
+            .filter(|(ok, _)| !ok)
+            .map(|(_, n)| *n)
+            .collect();
+            if !missing.is_empty() {
+                bail!("GPU lacks pyrowave-required Vulkan features: {missing:?}");
             }
-            found.context("no Vulkan GPU with a graphics+compute queue")?
+
+            hold._feat2.features.shader_int16 = vk::TRUE;
+            hold._v12.storage_buffer8_bit_access = vk::TRUE;
+            hold._v12.timeline_semaphore = vk::TRUE;
+            hold._v12.shader_float16 = have12.shader_float16; // optional, enable when present
+            hold._v12.vulkan_memory_model = have12.vulkan_memory_model;
+            hold._v12.vulkan_memory_model_device_scope = have12.vulkan_memory_model_device_scope;
+            hold._v13.subgroup_size_control = vk::TRUE;
+            hold._v13.compute_full_subgroups = vk::TRUE;
+            hold._v13.synchronization2 = vk::TRUE;
+            hold._v13.maintenance4 = have13.maintenance4;
+            hold._feat2.p_next = &mut *hold._v12 as *mut _ as *mut std::ffi::c_void;
+            hold._v12.p_next = &mut *hold._v13 as *mut _ as *mut std::ffi::c_void;
+
+            hold._queue_ci[0] = vk::DeviceQueueCreateInfo::default().queue_family_index(family);
+            hold._queue_ci[0].queue_count = 1;
+            hold._queue_ci[0].p_queue_priorities = hold._queue_prio.as_ptr();
+            hold.device_ci.p_next = &*hold._feat2 as *const _ as *const std::ffi::c_void;
+            hold.device_ci.queue_create_info_count = 1;
+            hold.device_ci.p_queue_create_infos = hold._queue_ci.as_ptr();
+            hold.device_ci.enabled_extension_count = hold._dev_exts.len() as u32;
+            hold.device_ci.pp_enabled_extension_names = hold._dev_exts.as_ptr();
+
+            let device = instance
+                .create_device(pd, &hold.device_ci, None)
+                .context("create device")?;
+            Ok((pd, family, device))
+        })();
+        let (pd, family, device) = match selected {
+            Ok(v) => v,
+            Err(e) => {
+                instance.destroy_instance(None);
+                return Err(e);
+            }
         };
-        let mem_props = instance.get_physical_device_memory_properties(pd);
-
-        // Feature gate — pyrowave's documented encoder requirements (pyrowave.h): shaderInt16,
-        // storageBuffer8BitAccess, subgroup size control (1.3 core); shaderFloat16 is optional.
-        let mut have12 = vk::PhysicalDeviceVulkan12Features::default();
-        let mut have13 = vk::PhysicalDeviceVulkan13Features::default();
-        let mut have2 = vk::PhysicalDeviceFeatures2::default()
-            .push_next(&mut have12)
-            .push_next(&mut have13);
-        instance.get_physical_device_features2(pd, &mut have2);
-        let missing: Vec<&str> = [
-            (have2.features.shader_int16 == vk::TRUE, "shaderInt16"),
-            (
-                have12.storage_buffer8_bit_access == vk::TRUE,
-                "storageBuffer8BitAccess",
-            ),
-            (have12.timeline_semaphore == vk::TRUE, "timelineSemaphore"),
-            (
-                have13.subgroup_size_control == vk::TRUE,
-                "subgroupSizeControl",
-            ),
-            (
-                have13.compute_full_subgroups == vk::TRUE,
-                "computeFullSubgroups",
-            ),
-            (have13.synchronization2 == vk::TRUE, "synchronization2"),
-        ]
-        .iter()
-        .filter(|(ok, _)| !ok)
-        .map(|(_, n)| *n)
-        .collect();
-        if !missing.is_empty() {
-            bail!("GPU lacks pyrowave-required Vulkan features: {missing:?}");
-        }
-
-        hold._feat2.features.shader_int16 = vk::TRUE;
-        hold._v12.storage_buffer8_bit_access = vk::TRUE;
-        hold._v12.timeline_semaphore = vk::TRUE;
-        hold._v12.shader_float16 = have12.shader_float16; // optional, enable when present
-        hold._v12.vulkan_memory_model = have12.vulkan_memory_model;
-        hold._v12.vulkan_memory_model_device_scope = have12.vulkan_memory_model_device_scope;
-        hold._v13.subgroup_size_control = vk::TRUE;
-        hold._v13.compute_full_subgroups = vk::TRUE;
-        hold._v13.synchronization2 = vk::TRUE;
-        hold._v13.maintenance4 = have13.maintenance4;
-        hold._feat2.p_next = &mut *hold._v12 as *mut _ as *mut std::ffi::c_void;
-        hold._v12.p_next = &mut *hold._v13 as *mut _ as *mut std::ffi::c_void;
-
-        hold._queue_ci[0] = vk::DeviceQueueCreateInfo::default().queue_family_index(family);
-        hold._queue_ci[0].queue_count = 1;
-        hold._queue_ci[0].p_queue_priorities = hold._queue_prio.as_ptr();
-        hold.device_ci.p_next = &*hold._feat2 as *const _ as *const std::ffi::c_void;
-        hold.device_ci.queue_create_info_count = 1;
-        hold.device_ci.p_queue_create_infos = hold._queue_ci.as_ptr();
-        hold.device_ci.enabled_extension_count = hold._dev_exts.len() as u32;
-        hold.device_ci.pp_enabled_extension_names = hold._dev_exts.as_ptr();
-
-        let device = instance
-            .create_device(pd, &hold.device_ci, None)
-            .context("create device")?;
         let queue = device.get_device_queue(family, 0);
         let ext_fd = ash::khr::external_memory_fd::Device::new(&instance, &device);
+        let mem_props = instance.get_physical_device_memory_properties(pd);
 
-        // ---- hand the device to pyrowave (create-infos stay pinned in `hold`) ----
+        // Construct `Self` NOW, every not-yet-created resource at its null value, and assign
+        // into it as resources come up. Any `?` from here drops `me`, and the existing `Drop`
+        // tears down exactly the prefix that exists: it `device_wait_idle()`s first, null-guards
+        // `pw_enc` (`pyrowave_encoder_destroy` dereferences before deleting),
+        // `pyrowave_device_destroy(null)` is a plain `delete nullptr` (pyrowave_c.cpp) and
+        // every `vkDestroy*`/`vkFree*` of a VK_NULL_HANDLE is the spec-defined no-op. One
+        // teardown path serves both the error unwind and the normal drop, so an open-path leak
+        // is unrepresentable rather than guarded (the c4c78129 shape, applied to ~20 resources).
+        let mut me = Self {
+            _entry: entry,
+            instance,
+            device,
+            ext_fd,
+            queue,
+            family,
+            mem_props,
+            _hold: hold,
+            pw_dev: std::ptr::null_mut(),
+            pw_enc: std::ptr::null_mut(),
+            csc_pipe: vk::Pipeline::null(),
+            csc_layout: vk::PipelineLayout::null(),
+            csc_dsl: vk::DescriptorSetLayout::null(),
+            csc_pool: vk::DescriptorPool::null(),
+            csc_set: vk::DescriptorSet::null(),
+            sampler: vk::Sampler::null(),
+            y_img: vk::Image::null(),
+            y_mem: vk::DeviceMemory::null(),
+            y_view: vk::ImageView::null(),
+            uv_img: vk::Image::null(),
+            uv_mem: vk::DeviceMemory::null(),
+            uv_view: vk::ImageView::null(),
+            cursor_img: vk::Image::null(),
+            cursor_mem: vk::DeviceMemory::null(),
+            cursor_view: vk::ImageView::null(),
+            cursor_stage: vk::Buffer::null(),
+            cursor_stage_mem: vk::DeviceMemory::null(),
+            cursor_serial: u64::MAX,
+            cursor_ready: false,
+            import_cache: Vec::new(),
+            cpu_img: None,
+            cpu_stage: None,
+            cpu_expand: Vec::new(),
+            cmd_pool: vk::CommandPool::null(),
+            cmd: vk::CommandBuffer::null(),
+            fence: vk::Fence::null(),
+            width: w,
+            height: h,
+            fps,
+            chroma444,
+            frame_budget: budget_for(bitrate, fps),
+            wire_chunk: None,
+            bitstream: Vec::new(),
+            pending: VecDeque::new(),
+            frame_count: 0,
+        };
+
+        // ---- hand the device to pyrowave (create-infos stay pinned in `me._hold` — pyrowave
+        //      retains the pointers for the device's lifetime, and the Boxes' heap data does
+        //      not move when `Self` does) ----
         let mut queue_info = pw::pyrowave_device_create_queue_info {
-            queue: queue.as_raw() as pw::VkQueue,
+            queue: me.queue.as_raw() as pw::VkQueue,
             familyIndex: family,
             index: 0,
         };
@@ -380,13 +460,13 @@ impl PyroWaveEncoder {
                     *const c_char,
                 ) -> Option<unsafe extern "system" fn()>,
                 unsafe extern "C" fn(pw::VkInstance, *const c_char) -> pw::PFN_vkVoidFunction,
-            >(entry.static_fn().get_instance_proc_addr)),
-            instance: instance.handle().as_raw() as usize as pw::VkInstance,
+            >(me._entry.static_fn().get_instance_proc_addr)),
+            instance: me.instance.handle().as_raw() as usize as pw::VkInstance,
             physical_device: pd.as_raw() as usize as pw::VkPhysicalDevice,
-            device: device.handle().as_raw() as usize as pw::VkDevice,
-            instance_create_info: &*hold.instance_ci as *const vk::InstanceCreateInfo
+            device: me.device.handle().as_raw() as usize as pw::VkDevice,
+            instance_create_info: &*me._hold.instance_ci as *const vk::InstanceCreateInfo
                 as *const pw::VkInstanceCreateInfo,
-            device_create_info: &*hold.device_ci as *const vk::DeviceCreateInfo
+            device_create_info: &*me._hold.device_ci as *const vk::DeviceCreateInfo
                 as *const pw::VkDeviceCreateInfo,
             queue_info: &mut queue_info,
             queue_info_count: 1,
@@ -396,17 +476,16 @@ impl PyroWaveEncoder {
             queue_unlock_callback: None,
             userdata: std::ptr::null_mut(),
         };
-        let mut pw_dev: pw::pyrowave_device = std::ptr::null_mut();
         pw_check(
-            pw::pyrowave_create_device(&create, &mut pw_dev),
+            pw::pyrowave_create_device(&create, &mut me.pw_dev),
             "create_device",
         )?;
         // Our explicit command buffers live on a compute-capable family.
         let _ =
-            pw::pyrowave_device_set_queue_type(pw_dev, pw::VkQueueFlagBits_VK_QUEUE_COMPUTE_BIT);
+            pw::pyrowave_device_set_queue_type(me.pw_dev, pw::VkQueueFlagBits_VK_QUEUE_COMPUTE_BIT);
 
         let einfo = pw::pyrowave_encoder_create_info {
-            device: pw_dev,
+            device: me.pw_dev,
             width: w as i32,
             height: h as i32,
             chroma: if chroma444 {
@@ -415,38 +494,41 @@ impl PyroWaveEncoder {
                 pw::pyrowave_chroma_subsampling_PYROWAVE_CHROMA_SUBSAMPLING_420
             },
         };
-        let mut pw_enc: pw::pyrowave_encoder = std::ptr::null_mut();
-        if let Err(e) = pw_check(
-            pw::pyrowave_encoder_create(&einfo, &mut pw_enc),
+        pw_check(
+            pw::pyrowave_encoder_create(&einfo, &mut me.pw_enc),
             "encoder_create",
-        ) {
-            pw::pyrowave_device_destroy(pw_dev);
-            return Err(e);
-        }
+        )?;
 
         // ---- CSC planes: full-res R8 luma + RG8 chroma (half-res for 4:2:0, full-res for
         //      4:4:4), storage-written by the CSC and sampled directly by pyrowave (R/G view
         //      swizzles synthesize Cb/Cr) ----
+        let device = me.device.clone(); // cheap fn-table clone; lets `me.*` assignments interleave
         let (cw, ch) = if chroma444 { (w, h) } else { (w / 2, h / 2) };
         let (y_img, y_mem, y_view) = make_plain_image(
             &device,
-            &mem_props,
+            &me.mem_props,
             vk::Format::R8_UNORM,
             w,
             h,
             vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED,
         )?;
+        me.y_img = y_img;
+        me.y_mem = y_mem;
+        me.y_view = y_view;
         let (uv_img, uv_mem, uv_view) = make_plain_image(
             &device,
-            &mem_props,
+            &me.mem_props,
             vk::Format::R8G8_UNORM,
             cw,
             ch,
             vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED,
         )?;
+        me.uv_img = uv_img;
+        me.uv_mem = uv_mem;
+        me.uv_view = uv_view;
 
         // ---- CSC compute pipeline (same shader + layout as vulkan_video.rs) ----
-        let sampler = device.create_sampler(
+        me.sampler = device.create_sampler(
             &vk::SamplerCreateInfo::default()
                 .mag_filter(vk::Filter::NEAREST)
                 .min_filter(vk::Filter::NEAREST)
@@ -474,17 +556,17 @@ impl PyroWaveEncoder {
             sb(2, vk::DescriptorType::STORAGE_IMAGE),
             sb(3, vk::DescriptorType::COMBINED_IMAGE_SAMPLER), // cursor overlay
         ];
-        let csc_dsl = device.create_descriptor_set_layout(
+        me.csc_dsl = device.create_descriptor_set_layout(
             &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
             None,
         )?;
-        let dsls = [csc_dsl];
+        let dsls = [me.csc_dsl];
         // Push constant: cursor {ivec2 origin, ivec2 size} = 16 bytes (matches the shared CSC shader).
         let pc_ranges = [vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::COMPUTE)
             .offset(0)
             .size(16)];
-        let csc_layout = device.create_pipeline_layout(
+        me.csc_layout = device.create_pipeline_layout(
             &vk::PipelineLayoutCreateInfo::default()
                 .set_layouts(&dsls)
                 .push_constant_ranges(&pc_ranges),
@@ -494,16 +576,19 @@ impl PyroWaveEncoder {
             .stage(vk::ShaderStageFlags::COMPUTE)
             .module(shader)
             .name(c"main");
-        let csc_pipe = device
-            .create_compute_pipelines(
-                vk::PipelineCache::null(),
-                &[vk::ComputePipelineCreateInfo::default()
-                    .layout(csc_layout)
-                    .stage(stage)],
-                None,
-            )
-            .map_err(|(_, e)| e)?[0];
+        let pipe_res = device.create_compute_pipelines(
+            vk::PipelineCache::null(),
+            &[vk::ComputePipelineCreateInfo::default()
+                .layout(me.csc_layout)
+                .stage(stage)],
+            None,
+        );
+        // The module is consumed by pipeline creation either way — destroy it BEFORE `?`ing the
+        // result, or the failure arm leaks it (it lives in no field). On failure the batch-of-1
+        // out array is all VK_NULL_HANDLE per spec, so the discarded Err-arm vec holds nothing —
+        // a future multi-entry batch could not assume that.
         device.destroy_shader_module(shader, None);
+        me.csc_pipe = pipe_res.map_err(|(_, e)| e)?[0];
 
         let pool_sizes = [
             vk::DescriptorPoolSize::default()
@@ -514,69 +599,62 @@ impl PyroWaveEncoder {
                 .ty(vk::DescriptorType::STORAGE_IMAGE)
                 .descriptor_count(2),
         ];
-        let csc_pool = device.create_descriptor_pool(
+        me.csc_pool = device.create_descriptor_pool(
             &vk::DescriptorPoolCreateInfo::default()
                 .max_sets(1)
                 .pool_sizes(&pool_sizes),
             None,
         )?;
-        let csc_set = device.allocate_descriptor_sets(
+        me.csc_set = device.allocate_descriptor_sets(
             &vk::DescriptorSetAllocateInfo::default()
-                .descriptor_pool(csc_pool)
+                .descriptor_pool(me.csc_pool)
                 .set_layouts(&dsls),
         )?[0];
         // Cursor overlay: fixed CURSOR_MAX² RGBA8 sampled image + host staging (bound at binding 3).
         let (cursor_img, cursor_mem, cursor_view) = make_plain_image(
             &device,
-            &mem_props,
+            &me.mem_props,
             vk::Format::R8G8B8A8_UNORM,
             CURSOR_MAX,
             CURSOR_MAX,
             vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST,
         )?;
-        let cursor_stage = device.create_buffer(
-            &vk::BufferCreateInfo::default()
-                .size((CURSOR_MAX * CURSOR_MAX * 4) as u64)
-                .usage(vk::BufferUsageFlags::TRANSFER_SRC),
-            None,
+        me.cursor_img = cursor_img;
+        me.cursor_mem = cursor_mem;
+        me.cursor_view = cursor_view;
+        let (cursor_stage, cursor_stage_mem) = make_host_buffer(
+            &device,
+            &me.mem_props,
+            (CURSOR_MAX * CURSOR_MAX * 4) as u64,
+            vk::BufferUsageFlags::TRANSFER_SRC,
         )?;
-        let cs_req = device.get_buffer_memory_requirements(cursor_stage);
-        let cursor_stage_mem = device.allocate_memory(
-            &vk::MemoryAllocateInfo::default()
-                .allocation_size(cs_req.size)
-                .memory_type_index(find_mem(
-                    &mem_props,
-                    cs_req.memory_type_bits,
-                    vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-                )),
-            None,
-        )?;
-        device.bind_buffer_memory(cursor_stage, cursor_stage_mem, 0)?;
+        me.cursor_stage = cursor_stage;
+        me.cursor_stage_mem = cursor_stage_mem;
         // Bindings 1/2 (Y, UV storage targets) + 3 (cursor sampler) are fixed for the encoder's life.
         let yi = [vk::DescriptorImageInfo::default()
-            .image_view(y_view)
+            .image_view(me.y_view)
             .image_layout(vk::ImageLayout::GENERAL)];
         let uvi = [vk::DescriptorImageInfo::default()
-            .image_view(uv_view)
+            .image_view(me.uv_view)
             .image_layout(vk::ImageLayout::GENERAL)];
         let curi = [vk::DescriptorImageInfo::default()
-            .sampler(sampler)
-            .image_view(cursor_view)
+            .sampler(me.sampler)
+            .image_view(me.cursor_view)
             .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
         device.update_descriptor_sets(
             &[
                 vk::WriteDescriptorSet::default()
-                    .dst_set(csc_set)
+                    .dst_set(me.csc_set)
                     .dst_binding(1)
                     .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
                     .image_info(&yi),
                 vk::WriteDescriptorSet::default()
-                    .dst_set(csc_set)
+                    .dst_set(me.csc_set)
                     .dst_binding(2)
                     .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
                     .image_info(&uvi),
                 vk::WriteDescriptorSet::default()
-                    .dst_set(csc_set)
+                    .dst_set(me.csc_set)
                     .dst_binding(3)
                     .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                     .image_info(&curi),
@@ -584,76 +662,30 @@ impl PyroWaveEncoder {
             &[],
         );
 
-        let cmd_pool = device.create_command_pool(
+        me.cmd_pool = device.create_command_pool(
             &vk::CommandPoolCreateInfo::default()
                 .queue_family_index(family)
                 .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER),
             None,
         )?;
-        let cmd = device.allocate_command_buffers(
+        me.cmd = device.allocate_command_buffers(
             &vk::CommandBufferAllocateInfo::default()
-                .command_pool(cmd_pool)
+                .command_pool(me.cmd_pool)
                 .level(vk::CommandBufferLevel::PRIMARY)
                 .command_buffer_count(1),
         )?[0];
-        let fence = device.create_fence(&vk::FenceCreateInfo::default(), None)?;
+        me.fence = device.create_fence(&vk::FenceCreateInfo::default(), None)?;
 
-        let frame_budget = budget_for(bitrate, fps);
-        let props = instance.get_physical_device_properties(pd);
+        let props = me.instance.get_physical_device_properties(pd);
         tracing::info!(
             gpu = %props.device_name_as_c_str().unwrap_or(c"?").to_string_lossy(),
             mode = %format!("{w}x{h}@{fps}"),
-            budget_kib = frame_budget / 1024,
+            budget_kib = me.frame_budget / 1024,
             chroma = if chroma444 { "4:4:4" } else { "4:2:0" },
             "PyroWave encoder open (intra-only wavelet, BT.709 limited)"
         );
 
-        Ok(Self {
-            _entry: entry,
-            instance,
-            device,
-            ext_fd,
-            queue,
-            family,
-            mem_props,
-            _hold: hold,
-            pw_dev,
-            pw_enc,
-            csc_pipe,
-            csc_layout,
-            csc_dsl,
-            csc_pool,
-            csc_set,
-            sampler,
-            y_img,
-            y_mem,
-            y_view,
-            uv_img,
-            uv_mem,
-            uv_view,
-            cursor_img,
-            cursor_mem,
-            cursor_view,
-            cursor_stage,
-            cursor_stage_mem,
-            cursor_serial: u64::MAX,
-            cursor_ready: false,
-            import_cache: Vec::new(),
-            cpu_img: None,
-            cpu_stage: None,
-            cmd_pool,
-            cmd,
-            fence,
-            width: w,
-            height: h,
-            fps,
-            chroma444,
-            frame_budget,
-            wire_chunk: None,
-            bitstream: Vec::new(),
-            pending: VecDeque::new(),
-            frame_count: 0,
-        })
+        Ok(me)
     }
 
     /// Point CSC binding 0 at this frame's RGB view.
@@ -798,8 +830,25 @@ impl PyroWaveEncoder {
         if let Some(&(_, _, img, _, view)) = self.import_cache.iter().find(|e| (e.0, e.1) == key) {
             return Ok((img, view, false));
         }
+        // Feed pf-zerocopy's raw-dmabuf degrade latch (the one 3efbe416 wired for the libav
+        // path): a driver that deterministically refuses what the compositor allocates refuses
+        // it identically forever, and only the latch — which flips capture to CPU delivery from
+        // the next session — recovers the host. The CPU path serves every format capture
+        // negotiates (24-bpp included, see `normalize_cpu_rgb`), so the degrade lands somewhere
+        // that works. Transient allocation OOM is excluded (`import_failure_feeds_latch`).
         let (img, mem, view) =
-            import_rgb_dmabuf(&self.device, &self.ext_fd, &self.mem_props, d, cw, ch)?;
+            match import_rgb_dmabuf(&self.device, &self.ext_fd, &self.mem_props, d, cw, ch) {
+                Ok(t) => {
+                    pf_zerocopy::note_raw_dmabuf_import_ok();
+                    t
+                }
+                Err(e) => {
+                    if import_failure_feeds_latch(&e) {
+                        pf_zerocopy::note_raw_dmabuf_import_failure(&format!("{e:#}"));
+                    }
+                    return Err(e);
+                }
+            };
         while self.import_cache.len() >= IMPORT_CACHE_CAP {
             let (_, _, oi, om, ov) = self.import_cache.remove(0);
             self.device.destroy_image_view(ov, None);
@@ -840,25 +889,12 @@ impl PyroWaveEncoder {
                 dev.destroy_buffer(b, None);
                 dev.free_memory(m, None);
             }
-            let buf = dev.create_buffer(
-                &vk::BufferCreateInfo::default()
-                    .size(need)
-                    .usage(vk::BufferUsageFlags::TRANSFER_SRC),
-                None,
+            let (buf, mem) = make_host_buffer(
+                &dev,
+                &self.mem_props,
+                need,
+                vk::BufferUsageFlags::TRANSFER_SRC,
             )?;
-            let req = dev.get_buffer_memory_requirements(buf);
-            let mem = dev.allocate_memory(
-                &vk::MemoryAllocateInfo::default()
-                    .allocation_size(req.size)
-                    .memory_type_index(find_mem(
-                        &self.mem_props,
-                        req.memory_type_bits,
-                        vk::MemoryPropertyFlags::HOST_VISIBLE
-                            | vk::MemoryPropertyFlags::HOST_COHERENT,
-                    )),
-                None,
-            )?;
-            dev.bind_buffer_memory(buf, mem, 0)?;
             self.cpu_stage = Some((buf, mem, need));
         }
         let (_, m, _) = self.cpu_stage.unwrap();
@@ -881,244 +917,272 @@ impl PyroWaveEncoder {
         );
         let dev = self.device.clone();
         let (w, h) = (self.width, self.height);
-        dev.begin_command_buffer(
-            self.cmd,
-            &vk::CommandBufferBeginInfo::default()
-                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-        )?;
+        // Everything from `begin` through `queue_submit` runs in one closure whose error arm
+        // resets `self.cmd`. On every arm inside it the reset is LEGAL: a mid-recording failure
+        // leaves RECORDING, a failed `end` leaves INVALID, a failed `queue_submit` enqueued
+        // nothing — never PENDING (the pool carries RESET_COMMAND_BUFFER). Failures AFTER the
+        // closure (the fence wait, packetize) must NOT reset: a fence timeout leaves the buffer
+        // PENDING, where a reset violates VUID-vkResetCommandBuffer-commandBuffer-00045 — those
+        // paths propagate untouched and the recovery (`reset()`/`Drop`) `device_wait_idle()`s
+        // before anything touches `cmd`; a buffer that completed its one-time submit is INVALID,
+        // which the next `begin` may implicitly reset.
+        let record_and_submit = (|| -> Result<()> {
+            dev.begin_command_buffer(
+                self.cmd,
+                &vk::CommandBufferBeginInfo::default()
+                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+            )?;
 
-        // Cursor-as-metadata: refresh the cursor image (only when the bitmap changed) + get the
-        // shader push constant. Recorded into `self.cmd` before the CSC dispatch samples binding 3.
-        let cursor_pc = self.prep_cursor(frame.cursor.as_ref())?;
+            // Cursor-as-metadata: refresh the cursor image (only when the bitmap changed) + get the
+            // shader push constant. Recorded into `self.cmd` before the CSC dispatch samples binding 3.
+            let cursor_pc = self.prep_cursor(frame.cursor.as_ref())?;
 
-        // ---- ingest RGB (same barrier discipline as vulkan_video.rs) ----
-        let rgb_view = match &frame.payload {
-            FramePayload::Dmabuf(d) => {
-                let (img, view, fresh) = self.import_cached(d, frame.width, frame.height)?;
-                let (old, src_qf, dst_qf) = if fresh {
-                    (
-                        vk::ImageLayout::UNDEFINED,
-                        vk::QUEUE_FAMILY_FOREIGN_EXT,
-                        self.family,
-                    )
-                } else {
-                    (
-                        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                        vk::QUEUE_FAMILY_IGNORED,
-                        vk::QUEUE_FAMILY_IGNORED,
-                    )
-                };
-                let acq = vk::ImageMemoryBarrier2::default()
-                    .src_stage_mask(vk::PipelineStageFlags2::NONE)
-                    .src_access_mask(vk::AccessFlags2::NONE)
-                    .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
-                    .dst_access_mask(vk::AccessFlags2::SHADER_READ)
-                    .old_layout(old)
-                    .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                    .src_queue_family_index(src_qf)
-                    .dst_queue_family_index(dst_qf)
-                    .image(img)
-                    .subresource_range(color_range(0));
-                dev.cmd_pipeline_barrier2(
-                    self.cmd,
-                    &vk::DependencyInfo::default().image_memory_barriers(&[acq]),
-                );
-                view
-            }
-            FramePayload::Cpu(bytes) => {
-                let fmt = pixel_to_vk(frame.format).context("unsupported CPU pixel format")?;
-                let view = self.ensure_cpu_rgb(fmt, bytes)?;
-                let (img, ..) = self.cpu_img.unwrap();
-                let (stage, ..) = self.cpu_stage.unwrap();
-                let to_dst = vk::ImageMemoryBarrier2::default()
-                    .src_stage_mask(vk::PipelineStageFlags2::NONE)
-                    .src_access_mask(vk::AccessFlags2::NONE)
-                    .dst_stage_mask(vk::PipelineStageFlags2::ALL_TRANSFER)
-                    .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-                    .old_layout(vk::ImageLayout::UNDEFINED)
-                    .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                    .image(img)
-                    .subresource_range(color_range(0));
-                dev.cmd_pipeline_barrier2(
-                    self.cmd,
-                    &vk::DependencyInfo::default().image_memory_barriers(&[to_dst]),
-                );
-                dev.cmd_copy_buffer_to_image(
-                    self.cmd,
-                    stage,
-                    img,
-                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                    &[vk::BufferImageCopy::default()
-                        .image_subresource(
-                            vk::ImageSubresourceLayers::default()
-                                .aspect_mask(vk::ImageAspectFlags::COLOR)
-                                .layer_count(1),
+            // ---- ingest RGB (same barrier discipline as vulkan_video.rs) ----
+            let rgb_view = match &frame.payload {
+                FramePayload::Dmabuf(d) => {
+                    let (img, view, fresh) = self.import_cached(d, frame.width, frame.height)?;
+                    let (old, src_qf, dst_qf) = if fresh {
+                        (
+                            vk::ImageLayout::UNDEFINED,
+                            vk::QUEUE_FAMILY_FOREIGN_EXT,
+                            self.family,
                         )
-                        .image_extent(vk::Extent3D {
-                            width: w,
-                            height: h,
-                            depth: 1,
-                        })],
-                );
-                let to_read = vk::ImageMemoryBarrier2::default()
-                    .src_stage_mask(vk::PipelineStageFlags2::ALL_TRANSFER)
-                    .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                    } else {
+                        (
+                            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                            vk::QUEUE_FAMILY_IGNORED,
+                            vk::QUEUE_FAMILY_IGNORED,
+                        )
+                    };
+                    let acq = vk::ImageMemoryBarrier2::default()
+                        .src_stage_mask(vk::PipelineStageFlags2::NONE)
+                        .src_access_mask(vk::AccessFlags2::NONE)
+                        .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                        .dst_access_mask(vk::AccessFlags2::SHADER_READ)
+                        .old_layout(old)
+                        .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                        .src_queue_family_index(src_qf)
+                        .dst_queue_family_index(dst_qf)
+                        .image(img)
+                        .subresource_range(color_range(0));
+                    dev.cmd_pipeline_barrier2(
+                        self.cmd,
+                        &vk::DependencyInfo::default().image_memory_barriers(&[acq]),
+                    );
+                    view
+                }
+                FramePayload::Cpu(bytes) => {
+                    // 24-bpp Rgb/Bgr expands 3→4 first (see `normalize_cpu_rgb`) — refusing it here
+                    // used to kill the session at its first frame with no fallback.
+                    let mut scratch = std::mem::take(&mut self.cpu_expand);
+                    let (norm_fmt, norm_bytes) =
+                        normalize_cpu_rgb(frame.format, bytes, &mut scratch, false);
+                    let fmt = pixel_to_vk(norm_fmt).context("unsupported CPU pixel format");
+                    let view = match fmt {
+                        Ok(f) => self.ensure_cpu_rgb(f, norm_bytes),
+                        Err(e) => Err(e),
+                    };
+                    self.cpu_expand = scratch;
+                    let view = view?;
+                    let (img, ..) = self.cpu_img.unwrap();
+                    let (stage, ..) = self.cpu_stage.unwrap();
+                    let to_dst = vk::ImageMemoryBarrier2::default()
+                        .src_stage_mask(vk::PipelineStageFlags2::NONE)
+                        .src_access_mask(vk::AccessFlags2::NONE)
+                        .dst_stage_mask(vk::PipelineStageFlags2::ALL_TRANSFER)
+                        .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                        .old_layout(vk::ImageLayout::UNDEFINED)
+                        .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                        .image(img)
+                        .subresource_range(color_range(0));
+                    dev.cmd_pipeline_barrier2(
+                        self.cmd,
+                        &vk::DependencyInfo::default().image_memory_barriers(&[to_dst]),
+                    );
+                    dev.cmd_copy_buffer_to_image(
+                        self.cmd,
+                        stage,
+                        img,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        &[vk::BufferImageCopy::default()
+                            .image_subresource(
+                                vk::ImageSubresourceLayers::default()
+                                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                                    .layer_count(1),
+                            )
+                            .image_extent(vk::Extent3D {
+                                width: w,
+                                height: h,
+                                depth: 1,
+                            })],
+                    );
+                    let to_read = vk::ImageMemoryBarrier2::default()
+                        .src_stage_mask(vk::PipelineStageFlags2::ALL_TRANSFER)
+                        .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                        .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                        .dst_access_mask(vk::AccessFlags2::SHADER_READ)
+                        .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                        .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                        .image(img)
+                        .subresource_range(color_range(0));
+                    dev.cmd_pipeline_barrier2(
+                        self.cmd,
+                        &vk::DependencyInfo::default().image_memory_barriers(&[to_read]),
+                    );
+                    view
+                }
+                _ => bail!("pyrowave: unsupported FramePayload (need Dmabuf or Cpu RGB)"),
+            };
+            self.bind_rgb(rgb_view);
+
+            // y/uv -> GENERAL for the CSC's storage writes (discard prior contents — the previous
+            // frame's encode already completed under our synchronous fence, which is also the
+            // "execution barrier before writing to images" pyrowave's contract asks for).
+            let to_general = |img| {
+                vk::ImageMemoryBarrier2::default()
+                    .src_stage_mask(vk::PipelineStageFlags2::NONE)
+                    .src_access_mask(vk::AccessFlags2::NONE)
                     .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
-                    .dst_access_mask(vk::AccessFlags2::SHADER_READ)
-                    .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                    .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                    .dst_access_mask(vk::AccessFlags2::SHADER_WRITE)
+                    .old_layout(vk::ImageLayout::UNDEFINED)
+                    .new_layout(vk::ImageLayout::GENERAL)
                     .image(img)
-                    .subresource_range(color_range(0));
-                dev.cmd_pipeline_barrier2(
-                    self.cmd,
-                    &vk::DependencyInfo::default().image_memory_barriers(&[to_read]),
-                );
-                view
+                    .subresource_range(color_range(0))
+            };
+            dev.cmd_pipeline_barrier2(
+                self.cmd,
+                &vk::DependencyInfo::default()
+                    .image_memory_barriers(&[to_general(self.y_img), to_general(self.uv_img)]),
+            );
+            dev.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, self.csc_pipe);
+            dev.cmd_bind_descriptor_sets(
+                self.cmd,
+                vk::PipelineBindPoint::COMPUTE,
+                self.csc_layout,
+                0,
+                &[self.csc_set],
+                &[],
+            );
+            let mut pc_bytes = [0u8; 16];
+            for (i, v) in cursor_pc.iter().enumerate() {
+                pc_bytes[i * 4..i * 4 + 4].copy_from_slice(&v.to_ne_bytes());
             }
-            _ => bail!("pyrowave: unsupported FramePayload (need Dmabuf or Cpu RGB)"),
-        };
-        self.bind_rgb(rgb_view);
-
-        // y/uv -> GENERAL for the CSC's storage writes (discard prior contents — the previous
-        // frame's encode already completed under our synchronous fence, which is also the
-        // "execution barrier before writing to images" pyrowave's contract asks for).
-        let to_general = |img| {
-            vk::ImageMemoryBarrier2::default()
-                .src_stage_mask(vk::PipelineStageFlags2::NONE)
-                .src_access_mask(vk::AccessFlags2::NONE)
-                .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
-                .dst_access_mask(vk::AccessFlags2::SHADER_WRITE)
-                .old_layout(vk::ImageLayout::UNDEFINED)
-                .new_layout(vk::ImageLayout::GENERAL)
-                .image(img)
-                .subresource_range(color_range(0))
-        };
-        dev.cmd_pipeline_barrier2(
-            self.cmd,
-            &vk::DependencyInfo::default()
-                .image_memory_barriers(&[to_general(self.y_img), to_general(self.uv_img)]),
-        );
-        dev.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, self.csc_pipe);
-        dev.cmd_bind_descriptor_sets(
-            self.cmd,
-            vk::PipelineBindPoint::COMPUTE,
-            self.csc_layout,
-            0,
-            &[self.csc_set],
-            &[],
-        );
-        let mut pc_bytes = [0u8; 16];
-        for (i, v) in cursor_pc.iter().enumerate() {
-            pc_bytes[i * 4..i * 4 + 4].copy_from_slice(&v.to_ne_bytes());
-        }
-        dev.cmd_push_constants(
-            self.cmd,
-            self.csc_layout,
-            vk::ShaderStageFlags::COMPUTE,
-            0,
-            &pc_bytes,
-        );
-        // 4:2:0: one invocation per 2x2 luma block (per chroma sample); 4:4:4: per pixel.
-        if self.chroma444 {
-            dev.cmd_dispatch(self.cmd, w.div_ceil(8), h.div_ceil(8), 1);
-        } else {
-            dev.cmd_dispatch(self.cmd, (w / 2).div_ceil(8), (h / 2).div_ceil(8), 1);
-        }
-
-        // CSC storage writes -> pyrowave's sampled reads (images stay GENERAL — the layout
-        // pyrowave's GPU-buffer contract accepts without transitions).
-        let to_sampled = |img| {
-            vk::ImageMemoryBarrier2::default()
-                .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
-                .src_access_mask(vk::AccessFlags2::SHADER_WRITE)
-                .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
-                .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
-                .old_layout(vk::ImageLayout::GENERAL)
-                .new_layout(vk::ImageLayout::GENERAL)
-                .image(img)
-                .subresource_range(color_range(0))
-        };
-        dev.cmd_pipeline_barrier2(
-            self.cmd,
-            &vk::DependencyInfo::default()
-                .image_memory_barriers(&[to_sampled(self.y_img), to_sampled(self.uv_img)]),
-        );
-
-        // ---- pyrowave encode, recorded into OUR command buffer ----
-        let plane = |image: vk::Image,
-                     pw_w: u32,
-                     pw_h: u32,
-                     fmt: pw::VkFormat,
-                     swizzle: pw::VkComponentSwizzle| {
-            pw::pyrowave_image_view {
-                image: image.as_raw() as usize as pw::VkImage,
-                width: pw_w,
-                height: pw_h,
-                image_format: fmt,
-                view_format: fmt,
-                mip_level: 0,
-                layer: 0,
-                aspect: pw::VkImageAspectFlagBits_VK_IMAGE_ASPECT_COLOR_BIT,
-                swizzle,
-                layout: pw::VkImageLayout_VK_IMAGE_LAYOUT_GENERAL,
+            dev.cmd_push_constants(
+                self.cmd,
+                self.csc_layout,
+                vk::ShaderStageFlags::COMPUTE,
+                0,
+                &pc_bytes,
+            );
+            // 4:2:0: one invocation per 2x2 luma block (per chroma sample); 4:4:4: per pixel.
+            if self.chroma444 {
+                dev.cmd_dispatch(self.cmd, w.div_ceil(8), h.div_ceil(8), 1);
+            } else {
+                dev.cmd_dispatch(self.cmd, (w / 2).div_ceil(8), (h / 2).div_ceil(8), 1);
             }
-        };
-        let r8 = pw::VkFormat_VK_FORMAT_R8_UNORM;
-        let rg8 = pw::VkFormat_VK_FORMAT_R8G8_UNORM;
-        let buffers = pw::pyrowave_gpu_buffers {
-            planes: [
-                plane(
-                    self.y_img,
-                    w,
-                    h,
-                    r8,
-                    pw::VkComponentSwizzle_VK_COMPONENT_SWIZZLE_IDENTITY,
-                ),
-                // Two-component chroma image: view swizzles R/G synthesize the Cb/Cr planes
-                // (the documented NV12-style hand-off, pyrowave.h `pyrowave_gpu_buffers`).
-                // The view extent is the chroma IMAGE's own mip0 extent (it's a separate
-                // image, not a planar aspect): half-res for 4:2:0, full-res for 4:4:4.
-                plane(
-                    self.uv_img,
-                    if self.chroma444 { w } else { w / 2 },
-                    if self.chroma444 { h } else { h / 2 },
-                    rg8,
-                    pw::VkComponentSwizzle_VK_COMPONENT_SWIZZLE_R,
-                ),
-                plane(
-                    self.uv_img,
-                    if self.chroma444 { w } else { w / 2 },
-                    if self.chroma444 { h } else { h / 2 },
-                    rg8,
-                    pw::VkComponentSwizzle_VK_COMPONENT_SWIZZLE_G,
-                ),
-            ],
-        };
-        let rc = pw::pyrowave_rate_control {
-            maximum_bitstream_size: self.frame_budget,
-        };
-        pw::pyrowave_device_set_command_buffer(
-            self.pw_dev,
-            self.cmd.as_raw() as usize as pw::VkCommandBuffer,
-        );
-        let enc_res = pw::pyrowave_encoder_encode_gpu_synchronous(
-            self.pw_enc,
-            std::ptr::null(),
-            std::ptr::null(),
-            &buffers,
-            &rc,
-        );
-        pw::pyrowave_device_set_command_buffer(self.pw_dev, std::ptr::null_mut());
-        pw_check(enc_res, "encode_gpu_synchronous")?;
 
-        dev.end_command_buffer(self.cmd)?;
-        dev.reset_fences(&[self.fence])?;
-        let cmds = [self.cmd];
-        dev.queue_submit(
-            self.queue,
-            &[vk::SubmitInfo::default().command_buffers(&cmds)],
-            self.fence,
-        )?;
+            // CSC storage writes -> pyrowave's sampled reads (images stay GENERAL — the layout
+            // pyrowave's GPU-buffer contract accepts without transitions).
+            let to_sampled = |img| {
+                vk::ImageMemoryBarrier2::default()
+                    .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                    .src_access_mask(vk::AccessFlags2::SHADER_WRITE)
+                    .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                    .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
+                    .old_layout(vk::ImageLayout::GENERAL)
+                    .new_layout(vk::ImageLayout::GENERAL)
+                    .image(img)
+                    .subresource_range(color_range(0))
+            };
+            dev.cmd_pipeline_barrier2(
+                self.cmd,
+                &vk::DependencyInfo::default()
+                    .image_memory_barriers(&[to_sampled(self.y_img), to_sampled(self.uv_img)]),
+            );
+
+            // ---- pyrowave encode, recorded into OUR command buffer ----
+            let plane = |image: vk::Image,
+                         pw_w: u32,
+                         pw_h: u32,
+                         fmt: pw::VkFormat,
+                         swizzle: pw::VkComponentSwizzle| {
+                pw::pyrowave_image_view {
+                    image: image.as_raw() as usize as pw::VkImage,
+                    width: pw_w,
+                    height: pw_h,
+                    image_format: fmt,
+                    view_format: fmt,
+                    mip_level: 0,
+                    layer: 0,
+                    aspect: pw::VkImageAspectFlagBits_VK_IMAGE_ASPECT_COLOR_BIT,
+                    swizzle,
+                    layout: pw::VkImageLayout_VK_IMAGE_LAYOUT_GENERAL,
+                }
+            };
+            let r8 = pw::VkFormat_VK_FORMAT_R8_UNORM;
+            let rg8 = pw::VkFormat_VK_FORMAT_R8G8_UNORM;
+            let buffers = pw::pyrowave_gpu_buffers {
+                planes: [
+                    plane(
+                        self.y_img,
+                        w,
+                        h,
+                        r8,
+                        pw::VkComponentSwizzle_VK_COMPONENT_SWIZZLE_IDENTITY,
+                    ),
+                    // Two-component chroma image: view swizzles R/G synthesize the Cb/Cr planes
+                    // (the documented NV12-style hand-off, pyrowave.h `pyrowave_gpu_buffers`).
+                    // The view extent is the chroma IMAGE's own mip0 extent (it's a separate
+                    // image, not a planar aspect): half-res for 4:2:0, full-res for 4:4:4.
+                    plane(
+                        self.uv_img,
+                        if self.chroma444 { w } else { w / 2 },
+                        if self.chroma444 { h } else { h / 2 },
+                        rg8,
+                        pw::VkComponentSwizzle_VK_COMPONENT_SWIZZLE_R,
+                    ),
+                    plane(
+                        self.uv_img,
+                        if self.chroma444 { w } else { w / 2 },
+                        if self.chroma444 { h } else { h / 2 },
+                        rg8,
+                        pw::VkComponentSwizzle_VK_COMPONENT_SWIZZLE_G,
+                    ),
+                ],
+            };
+            let rc = pw::pyrowave_rate_control {
+                maximum_bitstream_size: self.frame_budget,
+            };
+            pw::pyrowave_device_set_command_buffer(
+                self.pw_dev,
+                self.cmd.as_raw() as usize as pw::VkCommandBuffer,
+            );
+            let enc_res = pw::pyrowave_encoder_encode_gpu_synchronous(
+                self.pw_enc,
+                std::ptr::null(),
+                std::ptr::null(),
+                &buffers,
+                &rc,
+            );
+            pw::pyrowave_device_set_command_buffer(self.pw_dev, std::ptr::null_mut());
+            pw_check(enc_res, "encode_gpu_synchronous")?;
+
+            dev.end_command_buffer(self.cmd)?;
+            dev.reset_fences(&[self.fence])?;
+            let cmds = [self.cmd];
+            dev.queue_submit(
+                self.queue,
+                &[vk::SubmitInfo::default().command_buffers(&cmds)],
+                self.fence,
+            )?;
+            Ok(())
+        })();
+        if let Err(e) = record_and_submit {
+            // SAFETY: on every closure error arm the buffer is RECORDING/INVALID/EXECUTABLE —
+            // never PENDING (nothing was enqueued) — and the pool allows the reset.
+            let _ = dev.reset_command_buffer(self.cmd, vk::CommandBufferResetFlags::empty());
+            return Err(e);
+        }
         dev.wait_for_fences(&[self.fence], true, 5_000_000_000)
             .context("pyrowave encode fence")?;
 
@@ -1182,25 +1246,14 @@ impl PyroWaveEncoder {
 impl Encoder for PyroWaveEncoder {
     fn submit(&mut self, frame: &CapturedFrame) -> Result<()> {
         // SAFETY: single-threaded encoder; `encode_frame` records/submits on handles this
-        // struct owns and waits its own fence before touching results.
-        let r = unsafe { self.encode_frame(frame) };
-        if r.is_err() {
-            // `encode_frame` opens the recording window early and has several fallible steps
-            // inside it (cursor prep, dmabuf import, format mapping, the CPU-RGB staging path,
-            // an unsupported-payload bail, and the encode call itself). Every one returns with
-            // `self.cmd` still RECORDING, and nothing downstream repairs it — there is exactly
-            // one `begin_command_buffer` in this file and `reset()`/`Drop` never touch `cmd` —
-            // so the NEXT frame would call `begin` on a recording buffer, which is invalid usage.
-            // Legal here on every path: the pool carries RESET_COMMAND_BUFFER and the buffer is
-            // not pending (we never reached the submit, or the submit itself failed).
-            // SAFETY: `self.cmd` is owned by this encoder and, on these paths, not in flight.
-            unsafe {
-                let _ = self
-                    .device
-                    .reset_command_buffer(self.cmd, vk::CommandBufferResetFlags::empty());
-            }
-        }
-        r
+        // struct owns and waits its own fence before touching results. Command-buffer state on
+        // failure is `encode_frame`'s own business now: its record-and-submit closure resets the
+        // buffer on every pre-submit failure, and its post-submit failures (fence timeout —
+        // buffer possibly PENDING) deliberately do NOT reset, because that violates
+        // VUID-vkResetCommandBuffer-commandBuffer-00045; the blanket reset that used to live
+        // here fired on exactly that path. Recovery (`reset()`/`Drop`) waits the device idle
+        // before anything touches `cmd` again.
+        unsafe { self.encode_frame(frame) }
     }
 
     fn caps(&self) -> EncoderCaps {
@@ -1295,6 +1348,12 @@ impl Drop for PyroWaveEncoder {
     fn drop(&mut self) {
         // SAFETY: owned handles, destroyed exactly once, GPU idled first; pyrowave objects go
         // before the VkDevice they borrow (encoder before device, per pyrowave.h).
+        // This is also `open_inner`'s ONLY unwind path: it constructs `Self` right after
+        // `create_device` with every later resource at its null value and assigns as they come
+        // up, so on a failed open this runs against a partial prefix. That is sound because
+        // `pyrowave_device_destroy(null)` is a bare `delete nullptr` (pyrowave_c.cpp — safe
+        // no-op) and every `vkDestroy*`/`vkFree*` of VK_NULL_HANDLE is the spec-defined no-op;
+        // `pw_enc` is the one null-UNSAFE destroy and carries its own guard below.
         unsafe {
             self.device.device_wait_idle().ok();
             // Null when a failed `reset()` already destroyed it — `pyrowave_encoder_destroy`
@@ -1578,6 +1637,112 @@ mod tests {
     /// `Chroma444` pyrowave objects, verified by upstream's own 4:4:4 CPU decode. The
     /// busy-card leg then drives the rate controller at the ~2.6 bpp operating point —
     /// exactly the regime that overran upstream's 4:2:0-sized payload staging before
+    /// 24-bpp packed CPU frame (`PixelFormat::Rgb`/`Bgr`) — what the PipeWire portal negotiates
+    /// when dmabuf delivery is off. `rgb` is given as (r, g, b) regardless of `fmt`'s byte order.
+    fn cpu_frame_24(w: u32, h: u32, pts_ns: u64, rgb: [u8; 3], fmt: PixelFormat) -> CapturedFrame {
+        let px = match fmt {
+            PixelFormat::Rgb => [rgb[0], rgb[1], rgb[2]],
+            PixelFormat::Bgr => [rgb[2], rgb[1], rgb[0]],
+            _ => unreachable!("24-bpp helper"),
+        };
+        let mut buf = vec![0u8; (w * h * 3) as usize];
+        for p in buf.chunks_exact_mut(3) {
+            p.copy_from_slice(&px);
+        }
+        CapturedFrame {
+            width: w,
+            height: h,
+            pts_ns,
+            format: fmt,
+            payload: FramePayload::Cpu(buf),
+            cursor: None,
+        }
+    }
+
+    /// WP5.4: 24-bpp CPU payloads are SERVED (3→4 expand, `vk_util::normalize_cpu_rgb`), not
+    /// refused — the refusal used to kill the session at its first frame with no fallback.
+    /// Channel order is the load-bearing assertion: an expand that swaps R/B or misplaces the
+    /// pad byte moves the decoded chroma means by tens of codes.
+    #[test]
+    #[ignore = "needs a real Vulkan 1.3 compute device (run on a GPU host, not the build box)"]
+    fn pyrowave_smoke_cpu_rgb24() {
+        let (w, h) = (256u32, 256u32);
+        let mut enc =
+            PyroWaveEncoder::open(w, h, 60, 40_000_000, crate::ChromaFormat::Yuv420).expect("open");
+        let colors: [[u8; 3]; 3] = [[200, 40, 40], [40, 200, 40], [40, 40, 200]];
+        for fmt in [PixelFormat::Rgb, PixelFormat::Bgr] {
+            for (i, c) in colors.iter().enumerate() {
+                enc.submit(&cpu_frame_24(w, h, i as u64 * 16_666_667, *c, fmt))
+                    .expect("submit 24-bpp");
+                let au = enc.poll().expect("poll").expect("one AU per frame");
+                // SAFETY: test-only FFI into the vendored decoder with locally-owned buffers.
+                let (ym, cbm, crm) = unsafe { decode_plane_means(w, h, &au.data, false) };
+                let (ye, cbe, cre) = bt709([c[2], c[1], c[0], 255]);
+                assert!(
+                    (ym - ye).abs() < 3.0 && (cbm - cbe).abs() < 3.0 && (crm - cre).abs() < 3.0,
+                    "{fmt:?} frame {i}: decoded plane means (Y {ym:.1}, Cb {cbm:.1}, Cr {crm:.1}) \
+                     vs expected (Y {ye:.1}, Cb {cbe:.1}, Cr {cre:.1})"
+                );
+            }
+        }
+    }
+
+    /// WP5.1: a failed dmabuf import must leak neither the dup'd fd nor the VkImage. Drives
+    /// `vk_util::import_rgb_dmabuf` DIRECTLY — not `import_cached` — so the deliberate failures
+    /// cannot feed pf-zerocopy's raw-dmabuf degrade latch (which never un-latches by design).
+    /// Two failure shapes alternate: a garbage DRM modifier fails at `create_image` (the OwnedFd
+    /// drops), and a LINEAR memfd — not a real dmabuf — fails at `allocate_memory` (the error arm
+    /// drops it). Before the OwnedFd rework each failure leaked one fd, observable right here.
+    #[test]
+    #[ignore = "needs a real Vulkan 1.3 compute device (run on a GPU host, not the build box)"]
+    fn import_failure_leaks_no_fds() {
+        use std::os::fd::FromRawFd;
+        let enc = PyroWaveEncoder::open(64, 64, 60, 5_000_000, crate::ChromaFormat::Yuv420)
+            .expect("open");
+        let memfd_frame = |modifier: u64| {
+            // SAFETY: plain memfd_create; the fresh descriptor is immediately owned below.
+            let raw = unsafe { libc::memfd_create(c"pf-import-leak".as_ptr(), 0) };
+            assert!(raw >= 0, "memfd_create failed");
+            // SAFETY: `raw` is a freshly-created descriptor this closure owns.
+            let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
+            // SAFETY: sizing the owned memfd so an mmap-happy driver sees real pages.
+            unsafe { libc::ftruncate(fd.as_raw_fd(), 64 * 64 * 4) };
+            pf_frame::DmabufFrame {
+                fd,
+                fourcc: 0x3432_5258, // XR24 — maps, so the failure lands PAST the fourcc gate
+                modifier,
+                plane1: None,
+                offset: 0,
+                stride: 64 * 4,
+            }
+        };
+        let fd_count = || std::fs::read_dir("/proc/self/fd").expect("procfs").count();
+        // Warm any lazily-opened driver/loader descriptors before taking the baseline.
+        for modifier in [u64::MAX - 1, 0] {
+            let d = memfd_frame(modifier);
+            // SAFETY: live device/ext_fd/mem_props owned by `enc`; the frame is locally owned.
+            let _ =
+                unsafe { import_rgb_dmabuf(&enc.device, &enc.ext_fd, &enc.mem_props, &d, 64, 64) };
+        }
+        let baseline = fd_count();
+        for i in 0..32 {
+            let modifier = if i % 2 == 0 { u64::MAX - 1 } else { 0 };
+            let d = memfd_frame(modifier);
+            // SAFETY: as above.
+            let r =
+                unsafe { import_rgb_dmabuf(&enc.device, &enc.ext_fd, &enc.mem_props, &d, 64, 64) };
+            assert!(
+                r.is_err(),
+                "a memfd/garbage-modifier import must fail (iteration {i})"
+            );
+        }
+        assert_eq!(
+            fd_count(),
+            baseline,
+            "fd count drifted across 32 failed imports — the unwind leaks"
+        );
+    }
+
     /// `patches/0001-payload-data-444-sizing.patch` (the Phase-0 finding): it must stay
     /// within budget, decode, and be run-to-run deterministic (the overrun was not).
     #[test]
