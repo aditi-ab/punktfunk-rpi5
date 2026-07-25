@@ -7,6 +7,18 @@ use anyhow::Result;
 use ash::vk;
 use pf_frame::PixelFormat;
 
+/// Whether a device extension is in an enumerated properties list — the gate both Vulkan encode
+/// backends use before enabling `VK_EXT_queue_family_foreign` (Phase 8: the FOREIGN queue-family
+/// barriers were used without the extension ever being enabled; `pf-presenter/dmabuf.rs` is the
+/// in-repo precedent that enables it).
+pub(super) fn ext_advertised(exts: &[vk::ExtensionProperties], name: &std::ffi::CStr) -> bool {
+    exts.iter().any(|e| {
+        // SAFETY: `extension_name` is a spec-guaranteed NUL-terminated UTF-8 byte array inside
+        // the driver-filled `VkExtensionProperties` (VK_MAX_EXTENSION_NAME_SIZE bound).
+        unsafe { std::ffi::CStr::from_ptr(e.extension_name.as_ptr()) == name }
+    })
+}
+
 pub(crate) fn color_range(layer: u32) -> vk::ImageSubresourceRange {
     vk::ImageSubresourceRange {
         aspect_mask: vk::ImageAspectFlags::COLOR,
@@ -398,6 +410,24 @@ pub(crate) unsafe fn make_plain_image(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ext_advertised_matches_exact_name() {
+        let mut e = ash::vk::ExtensionProperties::default();
+        let name = b"VK_EXT_queue_family_foreign\0";
+        for (i, b) in name.iter().enumerate() {
+            e.extension_name[i] = *b as std::ffi::c_char;
+        }
+        let exts = [ash::vk::ExtensionProperties::default(), e];
+        assert!(super::ext_advertised(
+            &exts,
+            ash::ext::queue_family_foreign::NAME
+        ));
+        assert!(!super::ext_advertised(
+            &exts[..1],
+            ash::ext::queue_family_foreign::NAME
+        ));
+    }
+
     use super::*;
 
     /// CSC mode (`bgra_target = false`): the 3→4 expand is a pure byte shuffle — no channel

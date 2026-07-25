@@ -314,7 +314,9 @@ struct DeviceHold {
     instance_ci: Box<vk::InstanceCreateInfo<'static>>,
     _queue_prio: Box<[f32; 1]>,
     _queue_ci: Box<[vk::DeviceQueueCreateInfo<'static>; 1]>,
-    _dev_exts: Box<[*const c_char; 3]>,
+    // A plain Vec (not Box<[_; N]> like its siblings): Phase 8 pushes queue_family_foreign
+    // conditionally. The heap buffer as_ptr() feeds device_ci is move-stable like the Boxes.
+    _dev_exts: Vec<*const c_char>,
     _feat2: Box<vk::PhysicalDeviceFeatures2<'static>>,
     _v12: Box<vk::PhysicalDeviceVulkan12Features<'static>>,
     _v13: Box<vk::PhysicalDeviceVulkan13Features<'static>>,
@@ -329,6 +331,9 @@ pub struct PyroWaveEncoder {
     ext_fd: ash::khr::external_memory_fd::Device,
     queue: vk::Queue,
     family: u32,
+    /// `src` family for the fresh-dmabuf acquire barrier: FOREIGN when the extension is
+    /// enabled, else the core EXTERNAL substitute (Phase 8 — see `open_inner`).
+    foreign_qfi: u32,
     mem_props: vk::PhysicalDeviceMemoryProperties,
     _hold: DeviceHold,
 
@@ -452,11 +457,11 @@ impl PyroWaveEncoder {
             instance_ci: Box::new(vk::InstanceCreateInfo::default()),
             _queue_prio: Box::new([1.0f32]),
             _queue_ci: Box::new([vk::DeviceQueueCreateInfo::default()]),
-            _dev_exts: Box::new([
+            _dev_exts: vec![
                 ash::khr::external_memory_fd::NAME.as_ptr(),
                 ash::ext::external_memory_dma_buf::NAME.as_ptr(),
                 ash::ext::image_drm_format_modifier::NAME.as_ptr(),
-            ]),
+            ],
             _feat2: Box::new(vk::PhysicalDeviceFeatures2::default()),
             _v12: Box::new(vk::PhysicalDeviceVulkan12Features::default()),
             _v13: Box::new(vk::PhysicalDeviceVulkan13Features::default()),
@@ -548,6 +553,28 @@ impl PyroWaveEncoder {
             hold._feat2.p_next = &mut *hold._v12 as *mut _ as *mut std::ffi::c_void;
             hold._v12.p_next = &mut *hold._v13 as *mut _ as *mut std::ffi::c_void;
 
+            // VK_EXT_queue_family_foreign (Phase 8): the fresh-import acquire barrier names
+            // FOREIGN as src — enable the extension when advertised (`pf-presenter/dmabuf.rs`
+            // precedent), else fall back to the core QUEUE_FAMILY_EXTERNAL substitute. Must be
+            // pushed BEFORE the count/as_ptr wiring below.
+            let dev_ext_props = instance
+                .enumerate_device_extension_properties(pd)
+                .unwrap_or_default();
+            let foreign_qfi = if crate::vk_util::ext_advertised(
+                &dev_ext_props,
+                ash::ext::queue_family_foreign::NAME,
+            ) {
+                hold._dev_exts
+                    .push(ash::ext::queue_family_foreign::NAME.as_ptr());
+                vk::QUEUE_FAMILY_FOREIGN_EXT
+            } else {
+                tracing::warn!(
+                    "pyrowave: VK_EXT_queue_family_foreign not advertised — dmabuf acquires \
+                     use the core QUEUE_FAMILY_EXTERNAL substitute (no fleet hardware takes \
+                     this arm; report it)"
+                );
+                vk::QUEUE_FAMILY_EXTERNAL
+            };
             hold._queue_ci[0] = vk::DeviceQueueCreateInfo::default().queue_family_index(family);
             hold._queue_ci[0].queue_count = 1;
             hold._queue_ci[0].p_queue_priorities = hold._queue_prio.as_ptr();
@@ -560,9 +587,9 @@ impl PyroWaveEncoder {
             let device = instance
                 .create_device(pd, &hold.device_ci, None)
                 .context("create device")?;
-            Ok((pd, family, device))
+            Ok((pd, family, device, foreign_qfi))
         })();
-        let (pd, family, device) = match selected {
+        let (pd, family, device, foreign_qfi) = match selected {
             Ok(v) => v,
             Err(e) => {
                 instance.destroy_instance(None);
@@ -588,6 +615,7 @@ impl PyroWaveEncoder {
             ext_fd,
             queue,
             family,
+            foreign_qfi,
             mem_props,
             _hold: hold,
             pw_dev: std::ptr::null_mut(),
@@ -1163,11 +1191,7 @@ impl PyroWaveEncoder {
                 FramePayload::Dmabuf(d) => {
                     let (img, view, fresh) = self.import_cached(d, frame.width, frame.height)?;
                     let (old, src_qf, dst_qf) = if fresh {
-                        (
-                            vk::ImageLayout::UNDEFINED,
-                            vk::QUEUE_FAMILY_FOREIGN_EXT,
-                            self.family,
-                        )
+                        (vk::ImageLayout::UNDEFINED, self.foreign_qfi, self.family)
                     } else {
                         (
                             vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,

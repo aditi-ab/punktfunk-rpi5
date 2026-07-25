@@ -508,6 +508,12 @@ pub struct VulkanVideoEncoder {
     compute_queue: vk::Queue,
     encode_family: u32,
     compute_family: u32,
+    /// The queue family the dmabuf-acquire barriers name as `src`: `QUEUE_FAMILY_FOREIGN_EXT`
+    /// when `VK_EXT_queue_family_foreign` is advertised+enabled (Phase 8 — the barriers used it
+    /// without the enable, tolerated by RADV), else the core-1.1 `QUEUE_FAMILY_EXTERNAL`
+    /// conservative substitute (adds a same-driver precondition FOREIGN doesn't have — the
+    /// pragmatic fallback for devices that were never valid targets before).
+    foreign_qfi: u32,
     mem_props: vk::PhysicalDeviceMemoryProperties,
 
     // --- codec ---
@@ -995,6 +1001,24 @@ impl VulkanVideoEncoder {
         } else {
             bitrate
         };
+        // VK_EXT_queue_family_foreign: enable when advertised so the dmabuf-acquire barriers'
+        // FOREIGN src family is spec-legal (Phase 8; `pf-presenter/dmabuf.rs` precedent). The
+        // rgb probe's enumerate is a probe-local (and skipped on native-NV12), so this is a
+        // fresh open-time query.
+        let dev_ext_props = instance
+            .enumerate_device_extension_properties(pd)
+            .unwrap_or_default();
+        let foreign_ok =
+            crate::vk_util::ext_advertised(&dev_ext_props, ash::ext::queue_family_foreign::NAME);
+        let foreign_qfi = if foreign_ok {
+            vk::QUEUE_FAMILY_FOREIGN_EXT
+        } else {
+            tracing::warn!(
+                "VK_EXT_queue_family_foreign not advertised — dmabuf acquires use the core \
+                 QUEUE_FAMILY_EXTERNAL substitute (this arm has no fleet hardware; report it)"
+            );
+            vk::QUEUE_FAMILY_EXTERNAL
+        };
         // logical device: encode + compute queues + video extensions (AV1 ext name is raw — ash lacks it)
         let mut dev_exts = vec![
             ash::khr::video_queue::NAME.as_ptr(),
@@ -1010,6 +1034,9 @@ impl VulkanVideoEncoder {
         ];
         if rgb_cfg.is_some() {
             dev_exts.push(vrgb::EXTENSION_NAME.as_ptr());
+        }
+        if foreign_ok {
+            dev_exts.push(ash::ext::queue_family_foreign::NAME.as_ptr());
         }
         let prio = [1.0f32];
         let mut qcis = vec![vk::DeviceQueueCreateInfo::default()
@@ -1383,6 +1410,7 @@ impl VulkanVideoEncoder {
             encode_queue,
             compute_queue,
             encode_family,
+            foreign_qfi,
             compute_family,
             mem_props,
             codec,
@@ -2083,7 +2111,7 @@ impl VulkanVideoEncoder {
                     let (old, src_qf, dst_qf) = if fresh {
                         (
                             vk::ImageLayout::UNDEFINED,
-                            vk::QUEUE_FAMILY_FOREIGN_EXT,
+                            self.foreign_qfi,
                             self.compute_family,
                         )
                     } else {
@@ -2432,7 +2460,7 @@ impl VulkanVideoEncoder {
                 .dst_access_mask(vk::AccessFlags2::TRANSFER_READ)
                 .old_layout(vk::ImageLayout::UNDEFINED)
                 .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-                .src_queue_family_index(vk::QUEUE_FAMILY_FOREIGN_EXT)
+                .src_queue_family_index(self.foreign_qfi)
                 .dst_queue_family_index(self.compute_family)
         } else {
             vk::ImageMemoryBarrier2::default()
@@ -2973,7 +3001,7 @@ impl VulkanVideoEncoder {
                 .src_stage_mask(vk::PipelineStageFlags2::NONE)
                 .src_access_mask(vk::AccessFlags2::NONE)
                 .old_layout(vk::ImageLayout::UNDEFINED)
-                .src_queue_family_index(vk::QUEUE_FAMILY_FOREIGN_EXT)
+                .src_queue_family_index(self.foreign_qfi)
                 .dst_queue_family_index(self.encode_family),
             SrcAcquire::DmabufCached => src_base
                 .src_stage_mask(vk::PipelineStageFlags2::NONE)
