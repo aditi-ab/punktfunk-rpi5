@@ -11,7 +11,7 @@ use crate::dmabuf;
 use anyhow::{anyhow, bail, Context as _, Result};
 use ash::vk;
 use ash::vk::Handle as _;
-use std::ffi::CString;
+use std::ffi::{c_char, CString};
 
 impl Presenter {
     /// Bring up instance → surface → device → swapchain over an SDL window.
@@ -40,7 +40,10 @@ impl Presenter {
             .iter()
             .map(|e| CString::new(e.as_str()).unwrap())
             .collect();
-        let ext_ptrs: Vec<*const i8> = ext_cstrings.iter().map(|e| e.as_ptr()).collect();
+        // `c_char`, not `i8`: plain `char` is SIGNED on x86_64 but UNSIGNED on aarch64, so a
+        // hardcoded `*const i8` compiles on the desktop targets and fails to match ash's
+        // `&[*const c_char]` on ARM.
+        let ext_ptrs: Vec<*const c_char> = ext_cstrings.iter().map(|e| e.as_ptr()).collect();
         let instance = unsafe {
             entry.create_instance(
                 &vk::InstanceCreateInfo::default()
