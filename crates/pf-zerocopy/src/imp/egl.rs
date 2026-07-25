@@ -34,6 +34,62 @@ const EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT: egl::Attrib = 0x3444;
 mod gl;
 use gl::*;
 
+/// PCI vendor id of the only GPU this importer can drive — everything below it ends in a CUDA
+/// context. Same constant the Vulkan bridge selects its physical device by.
+const PCI_VENDOR_NVIDIA: u32 = 0x10de;
+
+/// The NVIDIA DRM render node: `PUNKTFUNK_ZEROCOPY_RENDER_NODE` > the first `/dev/dri/renderD*`
+/// whose sysfs PCI vendor is NVIDIA > `/dev/dri/renderD128`.
+///
+/// The fallback used to be the *whole* selection, which quietly assumed NVIDIA owns the first
+/// render node. On a hybrid laptop it does not — the iGPU is bound first, so `renderD128` is
+/// Intel, and this importer opened a Mesa GBM display, asked it for a pbuffer-capable OpenGL
+/// config (Mesa's GBM platform only ever advertises window-capable ones), got none, and reported
+/// "no EGL config for OpenGL" on a machine whose NVIDIA EGL stack was working perfectly. Pick the
+/// device by what it *is*.
+///
+/// Deliberately a local scan rather than a `pf_gpu` dependency: this crate is a leaf (the import
+/// worker is its own process, spawned for fault isolation), and `pf_gpu::linux_render_node` answers
+/// a different question anyway — it follows the operator's VAAPI/GPU *preference*, which may well
+/// name the iGPU. The answer needed here is not "which GPU should we use" but "where is CUDA".
+fn nvidia_render_node() -> std::path::PathBuf {
+    use std::path::{Path, PathBuf};
+    if let Some(p) = std::env::var_os("PUNKTFUNK_ZEROCOPY_RENDER_NODE").filter(|s| !s.is_empty()) {
+        return PathBuf::from(p);
+    }
+    // No NVIDIA node found — sysfs may simply not be mounted (a container without /sys). Keep the
+    // historical guess; the CUDA context below is what actually fails if this host has no NVIDIA.
+    nvidia_render_node_in(Path::new("/dev/dri"), Path::new("/sys/class/drm"))
+        .unwrap_or_else(|| PathBuf::from("/dev/dri/renderD128"))
+}
+
+/// The scan half of [`nvidia_render_node`], parameterized on its two roots so a test can pin the
+/// sysfs shape it depends on (`<sys_class_drm>/renderD129/device/vendor` holding `0x10de`). Nodes
+/// are visited in name order so the choice is stable across boots.
+fn nvidia_render_node_in(
+    dri: &std::path::Path,
+    sys_class_drm: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    let mut nodes: Vec<std::ffi::OsString> = std::fs::read_dir(dri)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .map(|e| e.file_name())
+                .filter(|n| n.as_encoded_bytes().starts_with(b"renderD"))
+                .collect()
+        })
+        .unwrap_or_default();
+    nodes.sort();
+    nodes
+        .into_iter()
+        .find(|node| {
+            std::fs::read_to_string(sys_class_drm.join(node).join("device").join("vendor"))
+                .ok()
+                .and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
+                == Some(PCI_VENDOR_NVIDIA)
+        })
+        .map(|node| dri.join(node))
+}
+
 /// Per-size GL machinery to blit a dmabuf EGLImage into a CUDA-registrable `GL_RGBA8` texture.
 struct GlBlit {
     program: u32,
@@ -528,13 +584,15 @@ impl EglImporter {
         // GBM platform on the NVIDIA render node: this ties the EGLDisplay (and its GL contexts)
         // to the same DRM device CUDA-GL interop associates with, which the EGL device platform
         // did not (cuGraphicsGLRegisterImage rejected device-platform GL textures).
-        let path = std::ffi::CString::new("/dev/dri/renderD128").unwrap();
-        // SAFETY: `path` is a live local `CString` (built from a string with no interior NUL, so it
+        let node = nvidia_render_node();
+        let path = std::ffi::CString::new(node.as_os_str().as_encoded_bytes())
+            .with_context(|| format!("render node path {} has an interior NUL", node.display()))?;
+        // SAFETY: `path` is a live local `CString` (its constructor rejected interior NULs, so it
         // is NUL-terminated); `path.as_ptr()` is a valid pointer to that buffer which outlives this
         // synchronous `open`. `open` only reads the path and returns a new fd (or -1); it neither
         // retains the pointer nor writes through it, so there is no aliasing or lifetime hazard.
         let render_fd = unsafe { libc::open(path.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
-        ensure!(render_fd >= 0, "open /dev/dri/renderD128 for GBM");
+        ensure!(render_fd >= 0, "open {} for GBM", node.display());
         // SAFETY: `render_fd` is the live DRM render-node fd just returned by `open` and checked
         // `>= 0`. `gbm_create_device` (libgbm, linked above) builds a `gbm_device` over that fd and
         // returns a `*mut gbm_device` (or null); it borrows but does not take ownership of the fd,
@@ -546,7 +604,7 @@ impl EglImporter {
             // and no `EglImporter` exists yet to close it again, so this `close` runs exactly once on
             // the live `render_fd`, releasing it before the error return. No double-close.
             unsafe { libc::close(render_fd) };
-            anyhow::bail!("gbm_create_device failed");
+            anyhow::bail!("gbm_create_device failed on {}", node.display());
         }
 
         // SAFETY: `Egl::load_required` dlopens the system libEGL and binds its entry points,
@@ -568,7 +626,7 @@ impl EglImporter {
                 &[egl::ATTRIB_NONE],
             )
         }
-        .context("eglGetPlatformDisplay(GBM) on the NVIDIA render node")?;
+        .with_context(|| format!("eglGetPlatformDisplay(GBM) on {}", node.display()))?;
         egl.initialize(display).context("eglInitialize")?;
 
         let exts = egl
@@ -590,20 +648,46 @@ impl EglImporter {
         egl.bind_api(egl::OPENGL_API)
             .context("eglBindAPI(OpenGL)")?;
         // The default EGL_SURFACE_TYPE in eglChooseConfig is WINDOW_BIT, which a headless device
-        // display has none of — request a pbuffer-capable config (we run surfaceless anyway).
-        let config = egl
-            .choose_first_config(
-                display,
-                &[
-                    egl::SURFACE_TYPE,
-                    egl::PBUFFER_BIT,
-                    egl::RENDERABLE_TYPE,
-                    egl::OPENGL_BIT,
-                    egl::NONE,
-                ],
-            )
+        // display has none of — ask for a pbuffer-capable config first (NVIDIA's GBM platform has
+        // them, and this is the request every working host has been served for a year).
+        //
+        // Then fall back to no surface-type constraint at all, because a config's surface type is
+        // irrelevant to us: we never create an EGLSurface, we `eglMakeCurrent` surfaceless. Mesa's
+        // GBM platform advertises ONLY window-capable configs (gbm_surface is the whole point of
+        // the platform there), so the pbuffer request finds nothing on any Mesa device — which is
+        // how a hybrid host that landed on the iGPU reported "no EGL config for OpenGL" while its
+        // NVIDIA EGL stack was fine. The node is picked correctly now; this keeps the failure from
+        // being fatal (and unreadable) if some other driver makes the same choice Mesa did.
+        let want_pbuffer = [
+            egl::SURFACE_TYPE,
+            egl::PBUFFER_BIT,
+            egl::RENDERABLE_TYPE,
+            egl::OPENGL_BIT,
+            egl::NONE,
+        ];
+        let any_surface = [egl::RENDERABLE_TYPE, egl::OPENGL_BIT, egl::NONE];
+        let config = match egl
+            .choose_first_config(display, &want_pbuffer)
             .context("eglChooseConfig")?
-            .context("no EGL config for OpenGL")?;
+        {
+            Some(c) => c,
+            None => {
+                tracing::debug!(
+                    node = %node.display(),
+                    "no pbuffer-capable OpenGL EGL config — retrying without a surface-type \
+                     constraint (we run surfaceless)"
+                );
+                egl.choose_first_config(display, &any_surface)
+                    .context("eglChooseConfig (no surface-type constraint)")?
+                    .with_context(|| {
+                        format!(
+                            "no EGL config for OpenGL on {} — this display serves no \
+                             OpenGL-renderable config at all",
+                            node.display()
+                        )
+                    })?
+            }
+        };
         let gl_ctx = egl
             .create_context(
                 display,
@@ -637,6 +721,7 @@ impl EglImporter {
         // `eglCreateImage(EGL_LINUX_DMA_BUF_EXT)` requires as its context argument later.
         let no_ctx = unsafe { egl::Context::from_ptr(egl::NO_CONTEXT) };
         tracing::info!(
+            node = %node.display(),
             "zero-copy EGL importer ready (GBM platform + GL texture interop, dma_buf_import + modifiers)"
         );
         Ok(EglImporter {
@@ -1085,5 +1170,71 @@ impl Drop for EglImporter {
             // that borrowed it has been destroyed. No double-close or use-after-close.
             unsafe { libc::close(self.render_fd) };
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    /// A fake `/dev/dri` + `/sys/class/drm` pair: every `(node, vendor)` gets a device node file
+    /// and, when `vendor` is `Some`, the sysfs `device/vendor` that identifies it.
+    fn fixture(nodes: &[(&str, Option<&str>)]) -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let dri = tmp.path().join("dev/dri");
+        let sys = tmp.path().join("sys/class/drm");
+        std::fs::create_dir_all(&dri).unwrap();
+        for (node, vendor) in nodes {
+            std::fs::write(dri.join(node), b"").unwrap();
+            if let Some(v) = vendor {
+                let dev = sys.join(node).join("device");
+                std::fs::create_dir_all(&dev).unwrap();
+                std::fs::write(dev.join("vendor"), v).unwrap();
+            }
+        }
+        (tmp, dri, sys)
+    }
+
+    /// The hybrid-laptop case this selection exists for: the iGPU is bound first, so the NVIDIA
+    /// GPU is NOT renderD128 — which is what the old hardcoded path assumed.
+    #[test]
+    fn picks_the_nvidia_node_not_the_first_one() {
+        let (_t, dri, sys) = fixture(&[
+            ("renderD128", Some("0x8086\n")),
+            ("renderD129", Some("0x10de\n")),
+        ]);
+        assert_eq!(
+            nvidia_render_node_in(&dri, &sys),
+            Some(dri.join("renderD129"))
+        );
+    }
+
+    /// No NVIDIA GPU (or no readable sysfs) ⇒ no answer, and the caller keeps the historical
+    /// `/dev/dri/renderD128` guess rather than inventing one.
+    #[test]
+    fn no_nvidia_node_yields_nothing() {
+        let (_t, dri, sys) = fixture(&[("renderD128", Some("0x8086\n")), ("renderD129", None)]);
+        assert_eq!(nvidia_render_node_in(&dri, &sys), None);
+        // Missing roots entirely (a container without /sys, or without /dev/dri).
+        assert_eq!(
+            nvidia_render_node_in(Path::new("/nonexistent/dri"), &sys),
+            None
+        );
+    }
+
+    /// Ignore card/control nodes, and visit render nodes in name order so a two-NVIDIA host picks
+    /// the same one every boot.
+    #[test]
+    fn scans_render_nodes_only_and_in_order() {
+        let (_t, dri, sys) = fixture(&[
+            ("card0", Some("0x10de\n")),
+            ("renderD130", Some("0x10de\n")),
+            ("renderD129", Some("0x10de\n")),
+        ]);
+        assert_eq!(
+            nvidia_render_node_in(&dri, &sys),
+            Some(dri.join("renderD129"))
+        );
     }
 }
