@@ -949,7 +949,8 @@ impl DmabufInner {
         //    `Box` puts it on the heap with a unique owner.
         //  * `dmabuf.fd.as_raw_fd()` is the fd of the caller's `&DmabufFrame`, which owns it for the
         //    whole synchronous `submit`; we describe one object/layer/plane from its
-        //    fourcc/modifier/offset/stride and pass `object.size = 0` (ffmpeg queries the real size).
+        //    fourcc/modifier/offset/stride and its `lseek`-queried size. `libc::lseek` on that live
+        //    fd only reads the description's size and returns it (or -1); it touches no Rust memory.
         //  * `av_frame_alloc` → `drm` (null-checked); we set its scalar fields and
         //    `hw_frames_ctx = av_buffer_ref(self.drm_frames)` (new ref of the live owned ctx).
         //  * `data[0] = Box::into_raw(desc)` transfers the box into the frame; `buf[0] =
@@ -965,7 +966,17 @@ impl DmabufInner {
             let mut desc: Box<ffi::AVDRMFrameDescriptor> = Box::new(std::mem::zeroed());
             desc.nb_objects = 1;
             desc.objects[0].fd = dmabuf.fd.as_raw_fd();
-            desc.objects[0].size = 0;
+            // The object's REAL size, not 0. libav does not query it for us — both of its import
+            // paths hand this value straight to libva, as `prime_desc.objects[i].size` on the
+            // PRIME_2 path and `buffer_desc.data_size` on the legacy fallback — so a 0 told every
+            // VA driver the backing object was empty and left it to work the real size out itself.
+            // The drivers this has run on (radeonsi, modern Intel iHD) do; a Gen9 Intel host
+            // answered `vaCreateSurfaces` with VA_STATUS_ERROR_ALLOCATION_FAILED on every single
+            // frame. `lseek(SEEK_END)` is the standard dma-buf size query — the same one the
+            // Vulkan bridge already uses on these fds (`pf_zerocopy::imp::vulkan`). If a kernel
+            // refuses it, keep the old 0 rather than drop a frame we could still have encoded.
+            let obj_size = libc::lseek(dmabuf.fd.as_raw_fd(), 0, libc::SEEK_END);
+            desc.objects[0].size = if obj_size > 0 { obj_size as _ } else { 0 };
             desc.objects[0].format_modifier = dmabuf.modifier;
             desc.nb_layers = 1;
             desc.layers[0].format = self.fourcc;
