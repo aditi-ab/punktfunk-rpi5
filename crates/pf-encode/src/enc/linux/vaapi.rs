@@ -28,11 +28,12 @@ use ffmpeg::format::Pixel;
 use ffmpeg::{codec, encoder, Dictionary};
 use ffmpeg_next as ffmpeg;
 use pf_frame::{CapturedFrame, DmabufFrame, FramePayload, PixelFormat};
+use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::os::fd::AsRawFd;
 use std::os::raw::c_int;
 use std::ptr;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 use super::libav::{
     apply_low_latency_rc, pixel_to_av, poll_encoder, PollOutcome, SWS_CS_ITU709, SWS_POINT,
@@ -66,21 +67,38 @@ fn vaapi_sws_src(format: PixelFormat) -> Result<Pixel> {
     })
 }
 
-/// Which VAAPI entrypoint mode opened successfully, cached per codec (index = [`lp_idx`]):
-/// 0 = unknown, 1 = default (full-feature `EncSlice`), 2 = low-power (`EncSliceLP`/VDEnc).
-/// Modern Intel (Gen12+/Arc) removed the full-feature encode entrypoints, so the default open
-/// fails there and only `low_power=1` works; AMD (radeonsi) is the reverse. Caching the resolved
-/// mode lets later sessions/probes skip the known-failing attempt (and its libav error spew).
-static LP_MODE: [AtomicU8; 3] = [AtomicU8::new(0), AtomicU8::new(0), AtomicU8::new(0)];
+/// Which VAAPI entrypoint mode opened successfully: 1 = default (full-feature `EncSlice`),
+/// 2 = low-power (`EncSliceLP`/VDEnc). Modern Intel (Gen12+/Arc) removed the full-feature encode
+/// entrypoints, so the default open fails there and only `low_power=1` works; AMD (radeonsi) is the
+/// reverse. Caching the resolved mode lets later sessions/probes skip the known-failing attempt
+/// (and its libav error spew).
+///
+/// Keyed on **(render node, codec, bit depth)**, and every part of that key is load-bearing:
+///
+/// * The render node, because the entrypoint is a property of the DEVICE libva opens — and
+///   `render_node()` follows the web-console GPU preference. This used to be a process-global array
+///   keyed by codec alone, which made it a session-killer rather than a staleness bug: once a mode
+///   is latched the open tries exactly ONE mode and the `[false, true]` fallback is gone. Latch
+///   low-power on an Intel Arc, switch the preference to an AMD dGPU, and every VAAPI open there
+///   passes `low_power=1` — which radeonsi rejects — with no full-feature retry, for the process
+///   lifetime: the probe reports all-false AND the session's own encoder open fails.
+///   Keyed on the node rather than `pf_gpu::selection_key()` on purpose — the node is literally what
+///   `render_node()` hands libva, so key and device cannot describe different GPUs.
+/// * The bit depth, because Main10 and 8-bit can resolve to different entrypoints on the same
+///   device; one shared slot let an 8-bit answer pin the 10-bit open (HDR under-advertisement).
+static LP_MODE: OnceLock<Mutex<HashMap<LpKey, u8>>> = OnceLock::new();
 
-fn lp_idx(codec: Codec) -> usize {
-    match codec {
-        Codec::H264 => 0,
-        Codec::H265 => 1,
-        Codec::Av1 => 2,
-        // Guarded by the open_video dispatch: PyroWave never opens the VAAPI backend.
-        Codec::PyroWave => unreachable!("PyroWave has no VAAPI encoder"),
-    }
+/// (render-node path, codec label, 10-bit) — see [`LP_MODE`].
+type LpKey = (String, &'static str, bool);
+
+/// The [`LP_MODE`] key for this device/codec/depth. `render_node()` is re-read rather than cached
+/// so a GPU-preference change is picked up on the next open.
+fn lp_key(codec: Codec, ten_bit: bool) -> LpKey {
+    (
+        render_node().to_string_lossy().into_owned(),
+        codec.label(),
+        ten_bit,
+    )
 }
 
 /// `PUNKTFUNK_VAAPI_LOW_POWER` pins the entrypoint mode (`1` = low-power only, `0` = full-feature
@@ -111,11 +129,16 @@ unsafe fn open_vaapi_encoder(
     frames_ref: *mut ffi::AVBufferRef,
     ten_bit: bool,
 ) -> Result<encoder::video::Encoder> {
-    let idx = lp_idx(codec);
+    let key = lp_key(codec, ten_bit);
+    let cached = LP_MODE
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .map(|m| m.get(&key).copied().unwrap_or(0))
+        .unwrap_or(0);
     let modes: &[bool] = match low_power_override() {
         Some(true) => &[true],
         Some(false) => &[false],
-        None => match LP_MODE[idx].load(Ordering::Relaxed) {
+        None => match cached {
             1 => &[false],
             2 => &[true],
             _ => &[false, true],
@@ -135,7 +158,9 @@ unsafe fn open_vaapi_encoder(
             lp,
         ) {
             Ok(enc) => {
-                LP_MODE[idx].store(if lp { 2 } else { 1 }, Ordering::Relaxed);
+                if let Ok(mut m) = LP_MODE.get_or_init(|| Mutex::new(HashMap::new())).lock() {
+                    m.insert(key.clone(), if lp { 2 } else { 1 });
+                }
                 if lp {
                     tracing::info!(
                         encoder = codec.vaapi_name(),
