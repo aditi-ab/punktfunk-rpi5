@@ -149,6 +149,14 @@ if (process.argv.includes("--list")) {
 	process.exit(0);
 }
 
+// Park the process instead of spinning it. `Effect.runFork` registers NOTHING with the event
+// loop — the keep-alive timer lives in `Runtime.makeRunMain`, which we deliberately don't use
+// (our shutdown is the bespoke two-signal one below) — and a bun process whose only pending work
+// is an unresolved promise BUSY-SPINS rather than blocking. With units running there is usually a
+// socket or timer to park on, but in the documented no-op state (no scripts, no plugins) there is
+// nothing at all: field report 2026-07-25 had it pinning a full core indefinitely, `strace`
+// showing a bare `clock_gettime` loop and nothing else. One idle handle is the whole fix.
+const keepAlive = setInterval(() => {}, 2 ** 31 - 1);
 const fiber = Effect.runFork(runner(options));
 let stopping = false;
 const shutdown = (signal: string) => {
@@ -161,3 +169,4 @@ process.on("SIGINT", () => shutdown("SIGINT"));
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 
 await Effect.runPromise(Fiber.await(fiber));
+clearInterval(keepAlive); // every unit ended on its own — let the process exit
