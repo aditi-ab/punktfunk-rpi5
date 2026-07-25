@@ -904,6 +904,58 @@ impl Drop for NvencEncoder {
     }
 }
 
+/// Serialises the save → `AV_LOG_FATAL` → restore window that every capability probe opens around
+/// an encoder open it *expects* to fail.
+///
+/// libav's log level is one process-global `int`, and the probes race each other for real: the
+/// NVENC and VAAPI 4:4:4/10-bit probes are reached from `/serverinfo` and from session bring-up.
+/// Two overlapping save/restore pairs interleave as get(INFO) → get(FATAL) → set(INFO) →
+/// set(FATAL), and the process is then pinned at `AV_LOG_FATAL` for good — every later libav
+/// diagnostic silently dropped, which is precisely the logging you want when a stream later fails
+/// to open. The probes run process-once and already cost a real encoder open, so serialising them
+/// costs nothing measurable.
+static LIBAV_LOG_LEVEL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// RAII quiet-window over libav's global log level: drops it to `AV_LOG_FATAL` on construction and
+/// restores the previous level on drop, holding [`LIBAV_LOG_LEVEL`] for the whole window.
+///
+/// Callers must have completed `ffmpeg::init()` first. Not re-entrant — no probe may construct a
+/// second guard while holding one (none do; the probe bodies only reach encoder-open helpers).
+/// `pub(crate)` so the VAAPI probes share the one lock: they race the NVENC probes on the same
+/// global.
+pub(crate) struct QuietLibavLog {
+    prev: c_int,
+    // Held for the lifetime of the guard. `Drop for QuietLibavLog` runs before the struct's fields
+    // are dropped, so the restore below still happens under the lock.
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl QuietLibavLog {
+    pub(crate) fn new() -> Self {
+        // Poison-tolerant: a probe that panicked mid-window already restored the level via `Drop`,
+        // and refusing the lock forever afterwards would be a worse outcome than proceeding.
+        let lock = LIBAV_LOG_LEVEL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // SAFETY: libav is initialized by the caller; `av_log_{get,set}_level` only read/write the
+        // global int level (no pointer args) and are always sound post-init.
+        let prev = unsafe {
+            let p = ffi::av_log_get_level();
+            ffi::av_log_set_level(ffi::AV_LOG_FATAL);
+            p
+        };
+        Self { prev, _lock: lock }
+    }
+}
+
+impl Drop for QuietLibavLog {
+    fn drop(&mut self) {
+        // SAFETY: restore the saved global level (scalar arg, no pointers); libav was initialized
+        // before this guard was constructed.
+        unsafe { ffi::av_log_set_level(self.prev) };
+    }
+}
+
 /// Probe whether this NVIDIA GPU + driver + libavcodec can actually encode HEVC **4:4:4** (Range
 /// Extensions). Opens a tiny real `hevc_nvenc` 4:4:4 session — the exact path [`NvencEncoder::open`]
 /// takes for a live 4:4:4 stream — and reports whether it succeeded. HEVC-only; the result is cached
@@ -917,14 +969,9 @@ pub fn probe_can_encode_444(codec: Codec) -> bool {
         return false;
     }
     // Quiet ffmpeg's open error on a GPU that lacks 4:4:4 — the probe failing is an expected outcome.
-    // SAFETY: libav initialized above; `av_log_{get,set}_level` only read/write the global int level
-    // (no pointer args) and are always sound post-init.
-    let prev = unsafe {
-        let p = ffi::av_log_get_level();
-        ffi::av_log_set_level(ffi::AV_LOG_FATAL);
-        p
-    };
-    let ok = NvencEncoder::open(
+    // Held until the function returns, so the level is restored after the open either way.
+    let _quiet = QuietLibavLog::new();
+    NvencEncoder::open(
         codec,
         PixelFormat::Bgra,
         640,
@@ -935,10 +982,7 @@ pub fn probe_can_encode_444(codec: Codec) -> bool {
         8,
         ChromaFormat::Yuv444,
     )
-    .is_ok();
-    // SAFETY: restore the saved global log level (scalar arg, no pointers).
-    unsafe { ffi::av_log_set_level(prev) };
-    ok
+    .is_ok()
 }
 
 /// Probe whether this NVIDIA GPU + driver + libavcodec can actually encode 10-bit (HEVC Main10 /
@@ -954,14 +998,9 @@ pub fn probe_can_encode_10bit(codec: Codec) -> bool {
         return false;
     }
     // Quiet ffmpeg's open error on a GPU that lacks 10-bit — the probe failing is an expected outcome.
-    // SAFETY: libav initialized above; `av_log_{get,set}_level` only read/write the global int level
-    // (no pointer args) and are always sound post-init.
-    let prev = unsafe {
-        let p = ffi::av_log_get_level();
-        ffi::av_log_set_level(ffi::AV_LOG_FATAL);
-        p
-    };
-    let ok = NvencEncoder::open(
+    // Held until the function returns, so the level is restored after the open either way.
+    let _quiet = QuietLibavLog::new();
+    NvencEncoder::open(
         codec,
         PixelFormat::X2Rgb10,
         640,
@@ -972,10 +1011,7 @@ pub fn probe_can_encode_10bit(codec: Codec) -> bool {
         10,
         ChromaFormat::Yuv420,
     )
-    .is_ok();
-    // SAFETY: restore the saved global log level (scalar arg, no pointers).
-    unsafe { ffi::av_log_set_level(prev) };
-    ok
+    .is_ok()
 }
 
 #[cfg(test)]

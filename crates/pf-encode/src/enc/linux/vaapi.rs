@@ -273,20 +273,20 @@ pub fn probe_can_encode(codec: Codec) -> bool {
     if ffmpeg::init().is_err() {
         return false;
     }
-    // SAFETY: `ffmpeg::init()` returned Ok above, so libav is initialized. `av_log_get_level`/
-    // `av_log_set_level` only read/write libav's global integer log level (no pointer args) and are
-    // always sound to call post-init. `VaapiHw::new` (an `unsafe fn`) builds a VAAPI device + NV12
-    // frames pool from the literal NV12/640x480/pool=2 args and hands back a RAII handle that unrefs
-    // both `AVBufferRef`s on drop. `open_vaapi_encoder` (an `unsafe fn`) borrows `hw.device_ref`/
-    // `hw.frames_ref` — the two non-null refs `VaapiHw::new` just created — and `av_buffer_ref`s them
-    // into the encoder; `hw` is a live local for the whole match arm, so the borrows outlive the
-    // synchronous call, and both `hw` and the probe encoder are dropped (RAII) when the arm ends.
+    // A missing VA device (non-VAAPI host, GPU-less CI) is an expected probe outcome — quiet
+    // ffmpeg's "No VA display found" error for the probe. Held until the function returns, so the
+    // level is restored after the open either way. Shares one lock with the NVENC probes, which
+    // race this one on the same libav global (see [`crate::linux::QuietLibavLog`]).
+    let _quiet = crate::linux::QuietLibavLog::new();
+    // SAFETY: `ffmpeg::init()` returned Ok above, so libav is initialized. `VaapiHw::new` (an
+    // `unsafe fn`) builds a VAAPI device + NV12 frames pool from the literal NV12/640x480/pool=2
+    // args and hands back a RAII handle that unrefs both `AVBufferRef`s on drop.
+    // `open_vaapi_encoder` (an `unsafe fn`) borrows `hw.device_ref`/`hw.frames_ref` — the two
+    // non-null refs `VaapiHw::new` just created — and `av_buffer_ref`s them into the encoder; `hw`
+    // is a live local for the whole match arm, so the borrows outlive the synchronous call, and
+    // both `hw` and the probe encoder are dropped (RAII) when the arm ends.
     unsafe {
-        // A missing VA device (non-VAAPI host, GPU-less CI) is an expected probe outcome — quiet
-        // ffmpeg's "No VA display found" error for the probe, then restore the level.
-        let prev = ffi::av_log_get_level();
-        ffi::av_log_set_level(ffi::AV_LOG_FATAL);
-        let ok = match VaapiHw::new(ffi::AVPixelFormat::AV_PIX_FMT_NV12, 640, 480, 2) {
+        match VaapiHw::new(ffi::AVPixelFormat::AV_PIX_FMT_NV12, 640, 480, 2) {
             Ok(hw) => open_vaapi_encoder(
                 codec,
                 640,
@@ -299,9 +299,7 @@ pub fn probe_can_encode(codec: Codec) -> bool {
             )
             .is_ok(),
             Err(_) => false,
-        };
-        ffi::av_log_set_level(prev);
-        ok
+        }
     }
 }
 
@@ -317,18 +315,17 @@ pub fn probe_can_encode_10bit(codec: Codec) -> bool {
     if ffmpeg::init().is_err() {
         return false;
     }
-    // SAFETY: `ffmpeg::init()` returned Ok above, so libav is initialized. `av_log_{get,set}_level`
-    // only read/write libav's global integer log level (no pointer args). `VaapiHw::new` (an
+    // A missing VA device / no Main10 entrypoint is an expected probe outcome — quiet ffmpeg's
+    // error for the probe. Held until the function returns, so the level is restored after the open
+    // either way, and shared with the other probes (see [`crate::linux::QuietLibavLog`]).
+    let _quiet = crate::linux::QuietLibavLog::new();
+    // SAFETY: `ffmpeg::init()` returned Ok above, so libav is initialized. `VaapiHw::new` (an
     // `unsafe fn`) builds a VAAPI device + P010 frames pool from the literal args and hands back a
     // RAII handle; `open_vaapi_encoder` (an `unsafe fn`) borrows `hw.device_ref`/`hw.frames_ref` —
     // the two non-null refs `VaapiHw::new` just created, live locals for the whole match arm — and
     // `av_buffer_ref`s them into the probe encoder. Both `hw` and the encoder drop (RAII) at arm end.
     unsafe {
-        // A missing VA device / no Main10 entrypoint is an expected probe outcome — quiet ffmpeg's
-        // error for the probe, then restore the level.
-        let prev = ffi::av_log_get_level();
-        ffi::av_log_set_level(ffi::AV_LOG_FATAL);
-        let ok = match VaapiHw::new(ffi::AVPixelFormat::AV_PIX_FMT_P010LE, 640, 480, 2) {
+        match VaapiHw::new(ffi::AVPixelFormat::AV_PIX_FMT_P010LE, 640, 480, 2) {
             Ok(hw) => open_vaapi_encoder(
                 codec,
                 640,
@@ -341,9 +338,7 @@ pub fn probe_can_encode_10bit(codec: Codec) -> bool {
             )
             .is_ok(),
             Err(_) => false,
-        };
-        ffi::av_log_set_level(prev);
-        ok
+        }
     }
 }
 
