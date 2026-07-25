@@ -538,14 +538,25 @@ public final class StreamLayerView: NSView {
         }
     }
 
-    /// Tell the host who renders the pointer (the §8 mid-stream render flip): we draw it only
-    /// while the DESKTOP model is engaged (the local OS cursor wears the host shape); under
-    /// the capture model — and while released — the host composites it into the video (full
-    /// fidelity, the pre-channel look). One edge-detected reconciler, called from every
+    /// Tell the host who renders the pointer (the §8 mid-stream render flip). The host may
+    /// composite one into the video ONLY while we are holding a grabbed, hidden pointer — the
+    /// capture model, engaged. That is the one state with no local cursor on screen.
+    ///
+    /// Every other state leaves a normal OS cursor visible over the video: the desktop model
+    /// draws it wearing the host's shape, and a RELEASED view shows the plain arrow. A
+    /// host-composited pointer then appears *underneath* it as a second cursor — and, because a
+    /// released view forwards no motion, one that never moves. On glass that reads as a frozen
+    /// duplicate stuck wherever the host pointer was last left (verified: `client_draws=false
+    /// blended=true live=(-1, 622)` — parked on the streamed output's left edge while the user
+    /// moved their own cursor around freely).
+    ///
+    /// So "released" counts as WE draw it: the host stops compositing, the client keeps
+    /// receiving shape/state over the channel (the forwarder only ticks on this side of the
+    /// flip), and re-engaging is seamless. One edge-detected reconciler, called from every
     /// transition (chord, engage/release, session start).
     private func reconcileCursorRender() {
         guard cursorChannelActive, let connection else { return }
-        let clientDraws = captured && desktopMouse
+        let clientDraws = !captured || desktopMouse
         guard sentClientDraws != clientDraws else { return }
         sentClientDraws = clientDraws
         connection.setCursorRender(clientDraws: clientDraws)
