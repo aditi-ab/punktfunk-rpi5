@@ -70,6 +70,25 @@ makepkg -si
 # …add the web console too (needs bun / bun-bin):
 PF_WITH_WEB=1 PF_SRCDIR="$(git rev-parse --show-toplevel)" makepkg -f --holdver
 ```
+
+### aarch64 (Arch Linux ARM) — the client
+
+The PKGBUILD declares `arch=('x86_64' 'aarch64')`. On aarch64 it builds the **client only** —
+`pkgname` drops `punktfunk-host`, so makepkg never enters the host's build or package path, and
+`build()` skips the host/tray cargo invocations and their NVENC/Vulkan-encode features. The host
+stays x86-only because its encode stack (NVENC/QSV/AMF) is.
+
+Nothing else changes — run the same command on an Arch Linux ARM box:
+
+```sh
+cd packaging/arch
+PF_SRCDIR="$(git rev-parse --show-toplevel)" makepkg -f --holdver
+# -> punktfunk-client-<ver>-<rel>-aarch64.pkg.tar.zst   (no punktfunk-host package)
+```
+
+There is no cross-compile path here: makepkg builds for `CARCH`, so this wants a real aarch64
+Arch machine (or an emulated Arch Linux ARM container, which is slow). Unlike the deb, it has
+**not** been verified end to end yet — there is no official arm64 Arch container to test in.
 Then the standard first-run (printed by the install scriptlet):
 ```sh
 sudo usermod -aG input "$USER"          # virtual gamepads; re-login after

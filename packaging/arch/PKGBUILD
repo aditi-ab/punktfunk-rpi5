@@ -19,13 +19,24 @@ pkgbase=punktfunk
 # host+client with no JS tooling — mirroring the RPM spec's `%bcond_with web` / `%bcond_with
 # scripting` (off by default). Set PF_WITH_WEB=1 / PF_WITH_SCRIPTING=1 to also build them (each
 # appends its pkgname + bun to makedepends below).
-pkgname=('punktfunk-host' 'punktfunk-client')
+# aarch64 (Arch Linux ARM) is CLIENT-ONLY — see the `arch` note below. Dropping the host from
+# `pkgname` (rather than giving package_punktfunk-host a per-package arch) is what keeps makepkg
+# from entering the host's build/package path at all, and mirrors how PF_WITH_WEB extends this
+# array further down.
+if [ "${CARCH:-x86_64}" = 'aarch64' ]; then
+  pkgname=('punktfunk-client')
+else
+  pkgname=('punktfunk-host' 'punktfunk-client')
+fi
 # CI (.gitea/workflows/arch.yml) drives the version: stable tags -> X.Y.Z-1, main pushes ->
 # X.Y.Z-0.<run#> in the separate punktfunk-canary repo (mirrors the RPM's 0.ciN release; pkgrel
 # allows only digits+dots, so the run number carries the monotonic ordering).
 pkgver="${PF_PKGVER:-0.7.0}"
 pkgrel="${PF_PKGREL:-1}"
-arch=('x86_64')
+# The CLIENT builds and runs on aarch64 (Arch Linux ARM); the HOST does not — its encode stack is
+# NVENC/QSV/AMF, all x86. On aarch64 the split below drops punktfunk-host from `pkgname`, so
+# makepkg builds only the client and never tries to compile the host crate.
+arch=('x86_64' 'aarch64')
 url="https://git.unom.io/unom/punktfunk"
 license=('MIT OR Apache-2.0')
 # !lto: makepkg's `lto` option injects -flto=auto into CFLAGS; aws-lc-sys (rustls' crypto)
@@ -83,6 +94,10 @@ build() {
   # real RFI (clean P-frame recovery anchor via DPB reference slots; design/linux-vulkan-video-encode.md).
   # Pure Rust `ash` (no new lib, no link-time deps); default on for HEVC (PUNKTFUNK_VULKAN_ENCODE=0
   # opts back to libav VAAPI), and a failed open falls back to VAAPI so unsupported devices are safe.
+  if [ "$CARCH" = 'aarch64' ]; then
+    # Client-only: no host crate, so none of the encode features below apply.
+    cargo build --release --locked -p punktfunk-client-linux -p punktfunk-client-session
+  else
   cargo build --release --locked --features punktfunk-host/nvenc,punktfunk-host/vulkan-encode \
     -p punktfunk-host -p punktfunk-client-linux -p punktfunk-client-session
   # The status tray in its OWN cargo invocation — load-bearing, not tidiness. Cargo unifies features
@@ -91,6 +106,7 @@ build() {
   # runtime by design) then panics at startup ("there is no reactor running, must be called from the
   # context of a Tokio 1.x runtime"). Built alone, its zbus stays on async-io. (Same split the .deb does.)
   cargo build --release --locked -p punktfunk-tray
+  fi
   # Management web console (opt-in): the Nitro `bun`-preset .output bundle (Bun.serve TLS),
   # built AND run with bun.
   if [ "${PF_WITH_WEB:-0}" = 1 ]; then
