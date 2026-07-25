@@ -686,6 +686,13 @@ fn stream_body(
         true,
     )
     .context("open video encoder for stream")?;
+    // Tell the encoder how deep the capturer lets it pipeline. Without this an in-place backend
+    // (Windows direct-NVENC, which encodes the capturer's textures with no CopyResource) bounds
+    // itself by an env cap instead of the ring it is actually reading, and the capturer rotates a
+    // texture out from under a live encode — torn/mixed frames, never an error. The backend now
+    // also fails safe when nobody tells it, but pass the REAL depth: `idd_depth` is configurable
+    // and a deeper ring is free pipelining the fallback would forfeit.
+    enc.set_input_ring_depth(capturer.pipeline_depth().max(1));
     // FEC overhead percent (Sunshine default 20). Override with PUNKTFUNK_FEC_PCT (0 = data-only).
     let fec_pct: u8 = std::env::var("PUNKTFUNK_FEC_PCT")
         .ok()
@@ -841,6 +848,8 @@ fn stream_body(
                     true,                         // metadata-cursor capture — see the first open
                 )
                 .context("reopen encoder after rebuild")?;
+                // A rebuilt encoder starts unconfigured — same reason as the first open above.
+                enc.set_input_ring_depth(capturer.pipeline_depth().max(1));
                 supports_rfi = enc.caps().supports_rfi;
                 enc.request_keyframe();
                 last_keyframe = Some(Instant::now());

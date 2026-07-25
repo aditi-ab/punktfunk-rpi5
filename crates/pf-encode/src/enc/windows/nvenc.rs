@@ -1215,9 +1215,23 @@ impl Encoder for NvencD3d11Encoder {
         // despite this comment previously claiming otherwise. Since this backend encodes the
         // capturer's textures in place, exceeding the capturer's declared `pipeline_depth` lets it
         // rotate a texture out from under a live encode — torn frames, silently.
+        // FAIL SAFE when nobody told us. `set_input_ring_depth` is a defaulted trait method, so a
+        // caller that forgets it fails SILENTLY — and one did: the GameStream loop opens an encoder
+        // (`gamestream/stream.rs`) and never calls it, while the Windows IDD-push capturer declares a
+        // ring of 2 and `async_inflight_cap()` defaults to 4. That let a Moonlight session pipeline
+        // four encodes against a two-texture ring, i.e. exactly the in-place overwrite this cap
+        // exists to prevent, as torn/mixed frames and never an error.
+        //
+        // Guarding at the single point of CONSUMPTION rather than at each call site is deliberate:
+        // it covers every present and future caller, including ones that have not been written yet,
+        // whereas plumbing the setter into N loops only fixes the N sites someone remembered. An
+        // unknown ring is treated as the shallowest one any capturer in this tree declares, so the
+        // unconfigured path degrades to less pipelining — a latency cost, not corruption. Callers
+        // that DO configure it are unaffected.
+        const UNCONFIGURED_RING_DEPTH: usize = 2;
         let cap = match self.input_ring_depth {
             Some(d) => async_inflight_cap().min(d.max(1)),
-            None => async_inflight_cap(),
+            None => async_inflight_cap().min(UNCONFIGURED_RING_DEPTH),
         };
         while self.async_rt.is_some() && self.pending.len() >= cap {
             let done = {
@@ -1414,6 +1428,8 @@ impl Encoder for NvencD3d11Encoder {
         // RFI is probed once at open (`rfi_supported`); HDR SEI rides keyframes whenever the
         // session is in HDR mode. Both are the real capabilities the session glue routes on.
         EncoderCaps {
+            // The Windows capture path composites the pointer; this backend never reads `frame.cursor`.
+            blends_cursor: false,
             supports_rfi: self.rfi_supported,
             // In-band mastering/CLL is attached as keyframe SEI on HEVC/H.264 only — AV1 carries
             // it in METADATA OBUs (`HDR_MDCV`/`HDR_CLL`), which this backend doesn't emit yet
