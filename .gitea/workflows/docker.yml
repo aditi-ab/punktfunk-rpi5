@@ -2,6 +2,7 @@
 #   punktfunk-web      — management console (web/Dockerfile, repo-root context)
 #   punktfunk-docs     — documentation site (docs-site/Dockerfile)
 #   punktfunk-rust-ci  — Rust CI builder image consumed by ci.yml
+#   punktfunk-rust-ci-arm64cross — the above + an arm64 sysroot, for the aarch64 client legs
 #   punktfunk-fedora-rpm — Fedora 43 builder image consumed by rpm.yml (Bazzite RPM)
 # Host and clients are intentionally NOT containerized (see CLAUDE.md "What's left").
 #
@@ -79,6 +80,41 @@ jobs:
           docker push "$REGISTRY/$OWNER/${{ matrix.image }}:sha-${GITHUB_SHA::8}"
           docker push "$REGISTRY/$OWNER/${{ matrix.image }}:latest"
           case "$GITHUB_REF" in refs/tags/v*) docker push "$REGISTRY/$OWNER/${{ matrix.image }}:${GITHUB_REF_NAME}" ;; esac
+
+  # The aarch64 CROSS builder — a SEPARATE job because it is `FROM punktfunk-rust-ci:latest`
+  # and so must not race the matrix entry that publishes that base. Consumed by the arm64
+  # client legs in deb.yml/rpm.yml/arch.yml. Root context: it needs rust-toolchain.toml to
+  # install the target against the toolchain the workspace actually pins.
+  build-push-arm64cross:
+    runs-on: ubuntu-24.04
+    needs: build-push
+    timeout-minutes: 45
+    env:
+      IMAGE: punktfunk-rust-ci-arm64cross
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Login to registry
+        run: |
+          echo "${{ secrets.REGISTRY_TOKEN }}" \
+            | docker login "$REGISTRY" -u enricobuehler --password-stdin
+
+      - name: Build
+        run: |
+          EXTRA=""
+          case "$GITHUB_REF" in refs/tags/v*) EXTRA="-t $REGISTRY/$OWNER/$IMAGE:${GITHUB_REF_NAME}" ;; esac
+          docker build --pull \
+            -f ci/rust-ci-arm64cross.Dockerfile \
+            -t "$REGISTRY/$OWNER/$IMAGE:latest" \
+            -t "$REGISTRY/$OWNER/$IMAGE:sha-${GITHUB_SHA::8}" \
+            $EXTRA \
+            .
+
+      - name: Push
+        run: |
+          docker push "$REGISTRY/$OWNER/$IMAGE:sha-${GITHUB_SHA::8}"
+          docker push "$REGISTRY/$OWNER/$IMAGE:latest"
+          case "$GITHUB_REF" in refs/tags/v*) docker push "$REGISTRY/$OWNER/$IMAGE:${GITHUB_REF_NAME}" ;; esac
 
   # Deploy the docs site to unom-1, the DMZ services VM website/cms also deploy to
   # (docs.punktfunk.unom.io via Caddy on home-reverse-proxy-1 -> :3220). Same secret set

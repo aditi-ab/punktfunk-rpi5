@@ -7,24 +7,40 @@
 # the package names the target boxes ship. The client links no NVIDIA libs — no filter
 # needed.
 #
-# Usage: VERSION=0.0.1~ci42.gdeadbee [ARCH=amd64] bash packaging/debian/build-client-deb.sh
+# Usage: VERSION=0.0.1~ci42.gdeadbee [ARCH=amd64] [TARGET=<rust triple>] \
+#          bash packaging/debian/build-client-deb.sh
 # Output: dist/punktfunk-client_<version>_<arch>.deb
+#
+# TARGET cross-compiles (and moves the binaries under target/<triple>/release). Set it
+# together with ARCH — e.g. ARCH=arm64 TARGET=aarch64-unknown-linux-gnu inside the
+# ci/rust-ci-arm64cross.Dockerfile image, which carries the matching :arm64 sysroot.
 set -euo pipefail
 
 VERSION="${VERSION:?set VERSION (e.g. 0.0.1 or 0.0.1~ci42.gdeadbee)}"
 ARCH="${ARCH:-amd64}"
+TARGET="${TARGET:-}"
 PKG="punktfunk-client"
 CRATE="punktfunk-client-linux"
 ROOTDIR="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOTDIR"
 
-BIN="target/release/$PKG"
+# Cargo drops a cross build under target/<triple>/release, a native one straight in
+# target/release.
+if [ -n "$TARGET" ]; then
+  OUTDIR="target/$TARGET/release"
+  CARGO_TARGET_ARGS=(--target "$TARGET")
+else
+  OUTDIR="target/release"
+  CARGO_TARGET_ARGS=()
+fi
+
+BIN="$OUTDIR/$PKG"
 # The Vulkan/Skia session streamer the shell execs for a connect — shipped alongside the shell
 # (the shell resolves it as its /usr/bin sibling), or desktop streaming breaks.
-SESSION_BIN="target/release/punktfunk-session"
+SESSION_BIN="$OUTDIR/punktfunk-session"
 if [ ! -x "$BIN" ] || [ ! -x "$SESSION_BIN" ]; then
-  echo "==> building $CRATE + punktfunk-client-session (release)"
-  cargo build --release --locked -p "$CRATE" -p punktfunk-client-session
+  echo "==> building $CRATE + punktfunk-client-session (release${TARGET:+ for $TARGET})"
+  cargo build --release --locked "${CARGO_TARGET_ARGS[@]}" -p "$CRATE" -p punktfunk-client-session
 fi
 
 STAGE="$(mktemp -d)"

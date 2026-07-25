@@ -1,9 +1,12 @@
-# Root build context is used only by web/Dockerfile, which needs web/ and
-# api/openapi.json. Allowlist those; keep everything else (target/, .git, crates)
-# out of the context upload.
+# The root build context is used by web/Dockerfile (which needs web/ and
+# api/openapi.json) and by ci/rust-ci-arm64cross.Dockerfile (which needs the toolchain
+# pin). Allowlist those; keep everything else (target/, .git, crates) out of the
+# context upload.
 *
 !web
 !api/openapi.json
+!rust-toolchain.toml
+!ci/pf-host-cc
 web/node_modules
 web/.output
 web/dist

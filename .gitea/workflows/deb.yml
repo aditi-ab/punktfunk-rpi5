@@ -1,9 +1,13 @@
 # Build the punktfunk .debs and publish them to Gitea's Debian package registry, so Ubuntu
-# boxes get new builds via `apt update && apt upgrade`. Two jobs, both publishing to the same
+# boxes get new builds via `apt update && apt upgrade`. Three jobs, all publishing to the same
 # apt distribution/component:
 #
 #   build-publish       — client + web + scripting, on the Ubuntu 26.04 rust-ci image (the client
 #                         needs 24.04-absent libs: SDL3, GTK4 ≥ 4.20).
+#   build-publish-client-arm64
+#                       — the same client package for arm64, CROSS-compiled on the same amd64
+#                         runner in the rust-ci-arm64cross image. No host counterpart: the Linux
+#                         host's encode stack is x86 (NVENC/QSV/AMF).
 #   build-publish-host  — the HOST, on the Ubuntu 24.04 rust-ci-noble image with a from-source
 #                         FFmpeg 8 BUNDLED into the .deb. This lowers the host's glibc floor to 2.39
 #                         and removes the hard `Depends: libavcodec62`, so the ONE host .deb installs
@@ -260,6 +264,97 @@ jobs:
           echo "published host to $OWNER/debian $DISTRIBUTION/$COMPONENT"
 
       - name: Attach the host .deb to the Gitea release (stable tags only)
+        if: startsWith(gitea.ref, 'refs/tags/v')
+        env:
+          GITEA_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        run: |
+          . scripts/ci/gitea-release.sh
+          RID=$(ensure_release "$GITHUB_REF_NAME" "$GITHUB_REF_NAME" auto)
+          for DEB in dist/*.deb; do
+            upsert_asset "$RID" "$DEB"
+          done
+
+  # ---------------------------------------------------------------------------------------------
+  # The aarch64 CLIENT .deb. Cross-compiled on the ordinary amd64 runner in the
+  # punktfunk-rust-ci-arm64cross image (the rust-ci toolchain + an arm64 multiarch sysroot — see
+  # ci/rust-ci-arm64cross.Dockerfile); there is no arm64 runner in the fleet and none is needed.
+  # Client only, by decision: the Linux host encodes with NVENC/QSV/AMF, all x86.
+  # Publishes to the same distribution/component as the amd64 jobs — the apt registry keys pool
+  # entries by arch, so `apt` on an arm64 box picks this one up with no client-side configuration.
+  build-publish-client-arm64:
+    runs-on: ubuntu-24.04
+    container:
+      image: git.unom.io/unom/punktfunk-rust-ci-arm64cross:latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      # Byte-identical to build-publish's version step (pf-version.sh is deterministic per
+      # commit), so the arm64 package always shares the amd64 version line.
+      - name: Version + channel
+        run: |
+          eval "$(bash scripts/ci/pf-version.sh)"
+          SHORT=$(echo "$GITHUB_SHA" | cut -c1-8)
+          case "$GITHUB_REF" in
+            refs/tags/v*) V="${GITHUB_REF_NAME#v}"; DIST=stable ;;
+            *)            V="${PF_BASE}~ci${GITHUB_RUN_NUMBER}.g${SHORT}"; DIST=canary ;;
+          esac
+          echo "VERSION=$V" >> "$GITHUB_ENV"
+          echo "DISTRIBUTION=$DIST" >> "$GITHUB_ENV"
+          echo "package version $V -> apt distribution '$DIST' (arm64)"
+
+      # dpkg-shlibdeps + dpkg-deb. The arm64 link deps themselves are the cross image's whole
+      # point and are already baked in; python3 is for scripts/ci/gitea-release.sh.
+      - name: dpkg-dev
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends dpkg-dev python3
+
+      - name: Cache keys
+        run: echo "rustc=$(rustc --version | cut -d' ' -f2)" >> "$GITHUB_ENV"
+      - uses: actions/cache@v4
+        with:
+          path: |
+            /usr/local/cargo/registry
+            /usr/local/cargo/git
+          key: cargo-home-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-home-
+      - uses: actions/cache@v4
+        with:
+          path: target
+          # Its OWN key — these are aarch64 artifacts under target/aarch64-unknown-linux-gnu/
+          # and must never share the amd64 jobs' target cache.
+          key: cargo-target-arm64-v1-${{ env.rustc }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-target-arm64-v1-${{ env.rustc }}-
+
+      - name: Build the arm64 client .deb
+        env:
+          PUNKTFUNK_BUILD_VERSION: ${{ env.VERSION }}   # stamped into the binaries (build.rs)
+        run: |
+          git config --global --add safe.directory "$PWD"
+          ARCH=arm64 TARGET=aarch64-unknown-linux-gnu \
+            bash packaging/debian/build-client-deb.sh
+          # Fail here rather than shipping an amd64 binary under an arm64 package name.
+          readelf -h target/aarch64-unknown-linux-gnu/release/punktfunk-session \
+            | grep -q AArch64 || { echo "ERROR: session binary is not AArch64"; exit 1; }
+
+      - name: Publish to the Gitea apt registry
+        env:
+          TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        run: |
+          for DEB in dist/*.deb; do
+            echo "uploading $DEB"
+            NAME=$(dpkg-deb -f "$DEB" Package)
+            VER=$(dpkg-deb -f "$DEB" Version)
+            ARCH=$(dpkg-deb -f "$DEB" Architecture)
+            curl -fsS -o /dev/null --user "enricobuehler:$TOKEN" -X DELETE \
+              "https://$REGISTRY/api/packages/$OWNER/debian/pool/$DISTRIBUTION/$COMPONENT/$NAME/$VER/$ARCH" || true
+            curl -fsS --user "enricobuehler:$TOKEN" --upload-file "$DEB" \
+              "https://$REGISTRY/api/packages/$OWNER/debian/pool/$DISTRIBUTION/$COMPONENT/upload"
+          done
+          echo "published arm64 client to $OWNER/debian $DISTRIBUTION/$COMPONENT"
+
+      - name: Attach the arm64 .deb to the Gitea release (stable tags only)
         if: startsWith(gitea.ref, 'refs/tags/v')
         env:
           GITEA_TOKEN: ${{ secrets.REGISTRY_TOKEN }}

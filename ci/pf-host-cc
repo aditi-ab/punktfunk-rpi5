@@ -1,0 +1,45 @@
+#!/bin/bash
+# Host-side C compiler wrapper for the aarch64 cross image (ci/rust-ci-arm64cross.Dockerfile).
+#
+# Why this exists: ffmpeg-sys-next's build script compiles a probe it intends to RUN — it
+# executes the binary to read the libav* version macros — so it forces `.target(HOST)` with
+# the comment "don't cross-compile this", but still hands that host compile the TARGET's
+# pkg-config include paths. `-I/usr/include/aarch64-linux-gnu` then shadows the host's own
+# multiarch libc headers and the x86 compiler dies inside bits/math-vector.h on NEON/SVE
+# types it has never heard of.
+#
+# Prepending the host's multiarch dir does NOT fix it: GCC drops a `-I` that duplicates a
+# directory already on its system include path (keeping it in the original, later position),
+# so the arm64 dir stays in front. The reliable fix is to remove the target include dirs from
+# the host compile entirely — the probe only wants FFmpeg's version macros, and the amd64
+# libav*-dev headers are installed and on the default search path, at the same version (both
+# come from this Ubuntu release).
+#
+# Scope: only ever invoked as CC for the HOST triple (CC_x86_64_unknown_linux_gnu). Target
+# compiles go to aarch64-linux-gnu-gcc and never pass through here.
+set -euo pipefail
+
+declare -a out=()
+while (($#)); do
+  case "$1" in
+  # `-I dir` as two arguments — the form cc's Command building and ffmpeg-sys both emit.
+  -I)
+    if [[ ${2-} == *aarch64-linux-gnu* ]]; then
+      shift 2
+      continue
+    fi
+    out+=("$1" "${2-}")
+    shift 2
+    ;;
+  # `-Idir` glued into one argument.
+  -I*aarch64-linux-gnu*)
+    shift
+    ;;
+  *)
+    out+=("$1")
+    shift
+    ;;
+  esac
+done
+
+exec /usr/bin/cc "${out[@]}"
