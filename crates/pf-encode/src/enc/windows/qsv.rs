@@ -898,7 +898,8 @@ impl QsvEncoder {
         if sts > vpl::MFX_ERR_NONE {
             tracing::debug!(status = sts_name(sts), "QSV Init returned a warning");
         }
-        let ir_active = cfg.intra_refresh && set.co2.is_some();
+        // Whether we ASKED for intra-refresh. Not the same as getting it — confirmed below.
+        let ir_requested = cfg.intra_refresh && set.co2.is_some();
         // The driver's own answer for the worst-case AU size.
         // SAFETY: `session` is live; `got` and its (empty) ext chain outlive the call.
         let bs_bytes = unsafe {
@@ -911,6 +912,57 @@ impl QsvEncoder {
             let mult = m.BRCParamMultiplier.max(1) as usize;
             let kb = enc_of(m).BufferSizeInKB as usize;
             (kb * mult * 1000).max(256 * 1024)
+        };
+        // Intra-refresh HONESTY: ask the driver what it actually installed instead of trusting that
+        // it took what we sent. Both `Query` and `Init` can return MFX_WRN_INCOMPATIBLE_VIDEO_PARAM
+        // — a WARNING, which the code above accepts — while silently dropping the wave. Confirmed
+        // on Intel UHD 750 (2026-07-25): H.264 reports exactly that, `GetVideoParam` comes back with
+        // `IntRefType = 0`, and `ir_active` still claimed true. H.265 on the same GPU is genuinely
+        // active, so this is per-codec and cannot be decided statically.
+        //
+        // That lie is not cosmetic: `ir_active` feeds `EncoderCaps::intra_refresh`, so the session
+        // advertises gradual refresh to the client and then never emits it — the client stops
+        // requesting the IDRs it would otherwise have asked for on loss, and a lost frame is
+        // concealed instead of repaired.
+        //
+        // Deliberately a SEPARATE, best-effort query rather than a buffer chained onto the
+        // `BufferSizeInKB` call above (which is what the audit finding suggested): that value is
+        // load-bearing for every bitstream allocation, and a runtime that dislikes the chained
+        // buffer would take it down with the readback. A failure here costs only the verdict, and
+        // is resolved conservatively.
+        let ir_active = if ir_requested {
+            // SAFETY: `session` is live on this thread; `got` and `co2_out` (with `ptrs` holding the
+            // only reference to it) all outlive the synchronous call, and the runtime writes back
+            // only into the buffer whose header we stamped.
+            let confirmed = unsafe {
+                let mut got: vpl::mfxVideoParam = std::mem::zeroed();
+                let mut co2_out: vpl::mfxExtCodingOption2 = std::mem::zeroed();
+                co2_out.Header.BufferId = vpl::MFX_EXTBUFF_CODING_OPTION2 as u32;
+                co2_out.Header.BufferSz = std::mem::size_of::<vpl::mfxExtCodingOption2>() as u32;
+                let mut ptrs: [*mut vpl::mfxExtBuffer; 1] = [&mut co2_out.Header as *mut _];
+                got.ExtParam = ptrs.as_mut_ptr();
+                got.NumExtParam = 1;
+                let sts = vpl::MFXVideoENCODE_GetVideoParam(session, &mut got);
+                if sts < vpl::MFX_ERR_NONE {
+                    tracing::debug!(
+                        status = sts_name(sts),
+                        "QSV: could not read back CodingOption2 — trusting the intra-refresh request"
+                    );
+                    true
+                } else {
+                    co2_out.IntRefType != 0
+                }
+            };
+            if !confirmed {
+                tracing::warn!(
+                    codec = ?cfg.codec,
+                    "QSV silently dropped intra-refresh (GetVideoParam reports IntRefType=0) — \
+                     advertising it OFF so the client keeps asking for IDRs on loss"
+                );
+            }
+            confirmed
+        } else {
+            false
         };
         Ok((ltr_active, ir_active, bs_bytes))
     }
