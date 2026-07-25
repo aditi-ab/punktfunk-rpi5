@@ -1813,9 +1813,11 @@ pub unsafe extern "C" fn punktfunk_generate_identity(
             return PunktfunkStatus::InvalidArg;
         }
         unsafe {
-            std::ptr::copy_nonoverlapping(cert.as_ptr(), cert_pem_out as *mut u8, cert.len());
+            // `.cast()`, not `as *mut u8`: `c_char` is i8 on x86_64 but u8 on aarch64, so the
+            // `as` form is a REQUIRED conversion on one and a no-op clippy rejects on the other.
+            std::ptr::copy_nonoverlapping(cert.as_ptr(), cert_pem_out.cast::<u8>(), cert.len());
             *cert_pem_out.add(cert.len()) = 0;
-            std::ptr::copy_nonoverlapping(key.as_ptr(), key_pem_out as *mut u8, key.len());
+            std::ptr::copy_nonoverlapping(key.as_ptr(), key_pem_out.cast::<u8>(), key.len());
             *key_pem_out.add(key.len()) = 0;
         }
         PunktfunkStatus::Ok
