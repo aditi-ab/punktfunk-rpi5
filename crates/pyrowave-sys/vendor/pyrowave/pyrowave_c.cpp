@@ -592,6 +592,21 @@ pyrowave_result pyrowave_image_create(const pyrowave_image_create_info *info, py
 	if (!img)
 		return PYROWAVE_ERROR_FAILED_EXTERNAL_HANDLE;
 
+	// PUNKTFUNK (patch 0006): consume the imported by-reference NT handle exactly here, at the
+	// API's success boundary — the allocator no longer closes it (see memory_allocator.cpp).
+	// This pins pyrowave.h's documented contract ("take ownership and close the HANDLE on
+	// import") to mean ON SUCCESS, matching pyrowave_sync_object_create's semantics: on ANY
+	// failure return the caller still owns the handle and can close it unconditionally.
+	// By-reference NT-handle imports never transfer ownership at the Vulkan level (the
+	// implementation keeps its own reference), so a post-create close here is always legal.
+#ifdef _WIN32
+	if (info->external_handle &&
+	    ExternalHandle::memory_handle_type_imports_by_reference(info->handle_type))
+	{
+		::CloseHandle(reinterpret_cast<HANDLE>(info->external_handle));
+	}
+#endif
+
 	auto *image = new pyrowave_image_opaque();
 	image->device = &device;
 	image->img = std::move(img);

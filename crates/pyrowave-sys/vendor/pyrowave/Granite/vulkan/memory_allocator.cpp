@@ -732,16 +732,15 @@ bool DeviceAllocator::internal_allocate(
 		res = table->vkAllocateMemory(device->get_device(), &info, nullptr, &device_memory);
 	}
 
-	// If we're importing, make sure we consume the native handle.
-	if (external && bool(*external) &&
-	    ExternalHandle::memory_handle_type_imports_by_reference(external->memory_handle_type))
-	{
-#ifdef _WIN32
-		::CloseHandle(external->handle);
-#else
-		::close(external->handle);
-#endif
-	}
+	// PUNKTFUNK (patch 0006): the consume of by-reference native handles used to happen HERE,
+	// unconditionally — success AND failure of the first vkAllocateMemory. That made the caller's
+	// failure contract ambiguous (an allocate-stage failure had already closed the handle while a
+	// create/find_memory_type failure had not), and the block-recycling retry loop below re-ran
+	// vkAllocateMemory with import_info still pointing at the just-closed handle. The consume now
+	// lives at the API commit point (pyrowave_c.cpp: pyrowave_image_create's success return), so
+	// the allocator never closes a caller's handle and retries import a still-open handle.
+	// (fd-type imports were never affected: memory_handle_type_imports_by_reference excludes
+	// OPAQUE_FD/DMA_BUF, whose ownership vkAllocateMemory itself transfers on success.)
 
 	if (res == VK_SUCCESS)
 	{

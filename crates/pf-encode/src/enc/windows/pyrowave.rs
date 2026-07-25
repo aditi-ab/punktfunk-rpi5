@@ -297,8 +297,10 @@ impl PyroWaveEncoder {
     /// Import one capturer plane D3D11 texture (`R8_UNORM` Y or `R8G8_UNORM` CbCr) into pyrowave's
     /// Vulkan device. Creates a fresh shared NT handle from the texture (the capturer marked the ring
     /// `SHARED | SHARED_NTHANDLE`); `pyrowave_image_create` takes ownership of the handle and closes
-    /// it on import. Single/two-component textures import reliably on NVIDIA at any size — unlike a
-    /// planar NV12 — so no MUTABLE_FORMAT / planar-layout workaround is involved.
+    /// it on SUCCESSFUL import only (pyrowave-sys patch 0006 — same contract as the fence import in
+    /// [`Self::import_fence`]), so this fn closes it on every failure return. Single/two-component
+    /// textures import reliably on NVIDIA at any size — unlike a planar NV12 — so no
+    /// MUTABLE_FORMAT / planar-layout workaround is involved.
     ///
     /// # Safety
     /// `texture` must be a live `ID3D11Texture2D` of format `vk_format`, sized `w`×`h`, created
@@ -349,7 +351,11 @@ impl PyroWaveEncoder {
         };
         let mut image: pw::pyrowave_image = std::ptr::null_mut();
         if let Err(e) = pw_check(pw::pyrowave_image_create(&info, &mut image), "image_create") {
-            // pyrowave only closes the handle on a SUCCESSFUL import — close it ourselves on failure.
+            // pyrowave consumes the handle ONLY on a successful import (pyrowave-sys patch 0006
+            // pinned this at the API's success boundary) — so on EVERY failure return the handle
+            // is still ours and this close is the single one. Before the patch, an
+            // allocate-stage failure inside Granite had already closed it and this was a double
+            // close of a possibly-recycled handle value.
             let _ = CloseHandle(handle);
             return Err(e);
         }
@@ -419,7 +425,9 @@ impl PyroWaveEncoder {
             pw::pyrowave_sync_object_create(&info, &mut sync),
             "sync_object_create",
         ) {
-            // pyrowave only closes the handle on a SUCCESSFUL import — close the dup on failure.
+            // pyrowave only closes the handle on a SUCCESSFUL import (Granite's semaphore import
+            // has always had these semantics; patch 0006 made the image import match) — close
+            // the dup on failure.
             let _ = CloseHandle(dup);
             return Err(e);
         }
