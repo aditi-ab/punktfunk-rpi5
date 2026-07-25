@@ -448,7 +448,17 @@ impl NvencEncoder {
         let pix_rate = width as u64 * height as u64 * fps as u64;
         let split = std::env::var("PUNKTFUNK_SPLIT_ENCODE").ok();
         match split.as_deref() {
-            Some(mode) => opts.set("split_encode_mode", mode),
+            // The operator arm gains the codec gate the auto arm always had (Phase 8): split
+            // "is not applicable to H264" per nvEncodeAPI.h, and h264_nvenc has no such AVOption
+            // — setting it would fail the open on a leftover dict entry.
+            Some(mode) if matches!(codec, Codec::H265 | Codec::Av1) => {
+                opts.set("split_encode_mode", mode)
+            }
+            Some(_) => tracing::warn!(
+                codec = codec.nvenc_name(),
+                "PUNKTFUNK_SPLIT_ENCODE ignored — split encoding is not applicable to H.264 \
+                 (nvEncodeAPI.h)"
+            ),
             None if matches!(codec, Codec::H265 | Codec::Av1)
                 && pix_rate >= super::SPLIT_FORCE_PIXEL_RATE =>
             {

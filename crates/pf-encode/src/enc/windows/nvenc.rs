@@ -38,8 +38,8 @@
 
 use super::nvenc_core::{
     apply_low_latency_config, build_init_params, cached_ceiling, codec_guid, plan_range_recovery,
-    resolve_slices, resolve_split_mode, resolve_subframe, store_ceiling, CeilingKey,
-    LowLatencyConfig, NvStatusExt, RangePlan,
+    resolve_slices, resolve_split_mode, resolve_split_subframe, resolve_subframe, store_ceiling,
+    CeilingKey, LowLatencyConfig, NvStatusExt, RangePlan,
 };
 use super::nvenc_status;
 use super::{ChromaFormat, Codec, EncodedFrame, Encoder, EncoderCaps};
@@ -603,6 +603,11 @@ pub struct NvencD3d11Encoder {
     /// `reconfigure_bitrate` must present the SAME init params as the open (only the config's
     /// rate fields may move). Meaningless while `inited` is false.
     split_mode: u32,
+    /// The session's arbitrated sub-frame state ([`resolve_split_subframe`] at open) — recorded
+    /// so reconfigure presents EXACTLY the init params the session opened with (an env re-read
+    /// there could flip `enableSubFrameWrite` mid-session, and would re-log the arbitration on
+    /// every ABR retarget).
+    subframe_on: bool,
     session_async: bool,
     /// The last reference-frame range we invalidated — dedupes repeated RFI requests for the same
     /// loss event (the client resends until it sees recovery).
@@ -686,6 +691,7 @@ impl NvencD3d11Encoder {
             rfi_supported: false,
             custom_vbv: false,
             split_mode: nv::NV_ENC_SPLIT_ENCODE_MODE::NV_ENC_SPLIT_DISABLE_MODE as u32,
+            subframe_on: false,
             session_async: false,
             last_rfi_range: None,
             init_device: ptr::null_mut(),
@@ -980,6 +986,7 @@ impl NvencD3d11Encoder {
         bitrate: u64,
         split_mode: u32,
         enable_async: bool,
+        subframe: bool,
     ) -> Result<*mut c_void> {
         let mut params = nv::NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS {
             version: nv::NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER,
@@ -1014,9 +1021,10 @@ impl NvencD3d11Encoder {
             &mut cfg,
             split_mode,
             enable_async,
-            // Windows: env opt-in only ("1"), never a default — and build_init_params
-            // additionally refuses it on an async session.
-            resolve_subframe(false),
+            // Windows: env opt-in only ("1"), never a default; arbitrated against split by the
+            // caller (resolve_split_subframe) — and build_init_params additionally refuses it
+            // on an async session.
+            subframe,
         );
 
         match (api().initialize_encoder)(enc, &mut init).nv_ok() {
@@ -1069,6 +1077,11 @@ impl NvencD3d11Encoder {
             // The init-failure fallback below disables it if a codec/config rejects it.
             let pixel_rate = self.width as u64 * self.height as u64 * self.fps.max(1) as u64;
             let split_mode: u32 = resolve_split_mode(self.bit_depth, pixel_rate);
+            // Split × sub-frame arbitration (Phase 8) before the ladder/ceiling key. On Windows
+            // sub-frame is env-opt-in only, so resolved == forced by construction.
+            let subframe_req = resolve_subframe(false);
+            let (split_mode, subframe_req) =
+                resolve_split_subframe(self.codec, split_mode, subframe_req, subframe_req);
             // Find the highest bitrate the GPU's codec LEVEL accepts and CLAMP to it. NVENC rejects
             // `initialize_encoder` (InvalidParam) when the bitrate exceeds the level ceiling (e.g. a
             // 1 Gbps request on HEVC). Strategy: try the requested rate; if the only problem is a forced
@@ -1098,12 +1111,19 @@ impl NvencD3d11Encoder {
                 }
             }
 
-            let mut probe = self.try_open_session(device, target_bps, split_mode, use_async);
+            let mut probe =
+                self.try_open_session(device, target_bps, split_mode, use_async, subframe_req);
             // The cache is advisory: a stale entry (driver change, identity collision) must not
             // wedge the open — retry the requested rate and let the search below rediscover.
             if probe.is_err() && target_bps < requested_bps {
                 target_bps = requested_bps;
-                probe = self.try_open_session(device, requested_bps, split_mode, use_async);
+                probe = self.try_open_session(
+                    device,
+                    requested_bps,
+                    split_mode,
+                    use_async,
+                    subframe_req,
+                );
             }
             // Disambiguate a forced-split rejection from a bitrate-cap rejection: retry once at the
             // requested rate with split disabled — if THAT succeeds, split was the problem, not bitrate.
@@ -1117,7 +1137,9 @@ impl NvencD3d11Encoder {
                 split_mode != nv::NV_ENC_SPLIT_ENCODE_MODE::NV_ENC_SPLIT_DISABLE_MODE as u32;
             if probe.is_err() && split_on {
                 let no_split = nv::NV_ENC_SPLIT_ENCODE_MODE::NV_ENC_SPLIT_DISABLE_MODE as u32;
-                if let Ok(e) = self.try_open_session(device, target_bps, no_split, use_async) {
+                if let Ok(e) =
+                    self.try_open_session(device, target_bps, no_split, use_async, subframe_req)
+                {
                     tracing::warn!("NVENC: split-encode rejected by codec/config — disabled");
                     used_split = no_split;
                     probe = Ok(e);
@@ -1144,7 +1166,13 @@ impl NvencD3d11Encoder {
                     let mut best_bps = 0u64;
                     while hi > lo + CLAMP_TOL_BPS {
                         let mid = lo + (hi - lo) / 2;
-                        match self.try_open_session(device, mid, used_split, use_async) {
+                        match self.try_open_session(
+                            device,
+                            mid,
+                            used_split,
+                            use_async,
+                            subframe_req,
+                        ) {
                             Ok(e) => {
                                 if !best.is_null() {
                                     let _ = (api().destroy_encoder)(best);
@@ -1169,12 +1197,23 @@ impl NvencD3d11Encoder {
                         // trying split-disabled in case a forced split (not the bitrate) is the blocker.
                         let no_split =
                             nv::NV_ENC_SPLIT_ENCODE_MODE::NV_ENC_SPLIT_DISABLE_MODE as u32;
-                        best = match self.try_open_session(device, FLOOR_BPS, used_split, use_async)
-                        {
+                        best = match self.try_open_session(
+                            device,
+                            FLOOR_BPS,
+                            used_split,
+                            use_async,
+                            subframe_req,
+                        ) {
                             Ok(e) => e,
                             Err(_) => {
                                 let e = self
-                                    .try_open_session(device, FLOOR_BPS, no_split, use_async)
+                                    .try_open_session(
+                                        device,
+                                        FLOOR_BPS,
+                                        no_split,
+                                        use_async,
+                                        subframe_req,
+                                    )
                                     .context(
                                     "NVENC initialize_encoder rejected even at the floor bitrate",
                                 )?;
@@ -1200,6 +1239,7 @@ impl NvencD3d11Encoder {
             self.init_device_com = Some(device.clone());
             // Session init params a later `reconfigure_bitrate` must re-present verbatim.
             self.split_mode = used_split;
+            self.subframe_on = subframe_req;
             self.session_async = use_async;
             // Session-budget accounting (Stage W3): record what this open holds so admission can
             // decline a parallel display the hardware can't afford. Weighted by the FINAL split
@@ -1855,7 +1895,10 @@ impl Encoder for NvencD3d11Encoder {
                     &mut cfg,
                     self.split_mode,
                     self.session_async,
-                    resolve_subframe(false),
+                    // The SESSION's recorded state, not a fresh env read: reconfigure must
+                    // present exactly the init params the open arbitrated (an env re-read could
+                    // flip enableSubFrameWrite mid-session — the Linux latch invariant).
+                    self.subframe_on,
                 ),
                 ..Default::default()
             };

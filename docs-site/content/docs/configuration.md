@@ -143,7 +143,8 @@ notes for context.
 | Setting | Values | Meaning |
 |---|---|---|
 | `PUNKTFUNK_GSO` | `1` · `0` | UDP Generic Segmentation Offload on the send path (coalesce a frame's packets into kernel super-buffers) — cuts send CPU ~30%, but its line-rate packet trains can cost delivered throughput on constrained links (measured on a 2.5GbE hop). Off by default until send pacing spaces the super-buffers; set `1` to opt in (auto-falls back to `sendmmsg` on kernels/paths without support). |
-| `PUNKTFUNK_SPLIT_ENCODE` | `0`/`disable` · `1`/`auto` · `2` · `3` | NVENC N-way split-encode for very high pixel rates (5K@240). `auto` picks automatically above ~1 Gpix/s. |
+| `PUNKTFUNK_SPLIT_ENCODE` | `0`/`disable` · `1`/`auto` · `2` · `3` | NVENC N-way split-encode for very high pixel rates (5K@240). `auto` picks automatically above ~1 Gpix/s. H.264 never splits (not applicable per the SDK); on HEVC a *forced* split disables sub-frame readback (mutually unsupported) — set `0` to choose sub-frame instead. |
+| `PUNKTFUNK_NVENC_SUBFRAME` | `0` · `1` | NVENC sub-frame (slice-level) readback for lower latency on sync sessions. Default: on where the GPU supports it (Linux direct NVENC). `0` = never; `1` = force. On HEVC it yields to a forced split-encode (the SDK documents the pair unsupported). |
 | `PUNKTFUNK_GPU_PRIORITY_CLASS` | `off` · `normal` · `high` · `realtime` · `auto` | **(Windows)** GPU scheduling priority for capture/encode under a GPU-saturating game. Default `auto` (starts `high`, upgrades to `realtime` when it's safe — e.g. HAGS off); `high` pins the static pre-gate behaviour; `realtime` is the strongest lever but can freeze NVENC on some setups. |
 | `PUNKTFUNK_IDD_DEPTH` | `N` (default `2`) | **(Windows)** IDD-push pipeline depth. `1` cuts latency once GPU priority is raised; higher smooths a contended GPU. |
 

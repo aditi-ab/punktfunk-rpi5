@@ -62,8 +62,8 @@
 
 use super::nvenc_core::{
     apply_low_latency_config, build_init_params, cached_ceiling, codec_guid, plan_range_recovery,
-    resolve_slices, resolve_split_mode, resolve_subframe, store_ceiling, CeilingKey,
-    LowLatencyConfig, NvStatusExt, RangePlan,
+    resolve_slices, resolve_split_mode, resolve_split_subframe, resolve_subframe, store_ceiling,
+    subframe_env_forced, CeilingKey, LowLatencyConfig, NvStatusExt, RangePlan,
 };
 use super::nvenc_status;
 use super::{AuChunk, ChromaFormat, Codec, EncodedFrame, Encoder, EncoderCaps};
@@ -629,6 +629,10 @@ pub struct NvencCudaEncoder {
     /// [`subframe_cap`](Self::subframe_cap)); consumed by every `build_init_params` call so the
     /// open and the in-place reconfigure present identical init params.
     subframe_on: bool,
+    /// Whether `PUNKTFUNK_NVENC_SUBFRAME=1` was EXPLICITLY forced — latched with `subframe_on`
+    /// (same invariant: open and reconfigure must present identical init params, so no env
+    /// re-reads after `query_caps`). Only consumed by [`resolve_split_subframe`]'s log severity.
+    subframe_forced: bool,
     /// Sub-frame chunked poll armed for the live session (§7 LN1 Phase 1): multi-slice +
     /// sub-frame readback configured AND sync retrieve at init. See [`Encoder::poll_chunk`].
     subframe_chunks: bool,
@@ -721,6 +725,7 @@ impl NvencCudaEncoder {
             slices: 1,
             subframe_cap: false,
             subframe_on: false,
+            subframe_forced: false,
             subframe_chunks: false,
             chunk: None,
         })
@@ -921,6 +926,7 @@ impl NvencCudaEncoder {
         // escapes.
         self.slices = resolve_slices(self.codec, 4);
         self.subframe_on = resolve_subframe(self.subframe_cap);
+        self.subframe_forced = subframe_env_forced();
         tracing::info!(
             rfi = self.rfi_supported,
             custom_vbv = self.custom_vbv,
@@ -1136,6 +1142,16 @@ impl NvencCudaEncoder {
             // [`resolve_split_mode`] for the precedence (env override / 10-bit / pixel rate).
             let pixel_rate = self.width as u64 * self.height as u64 * self.fps.max(1) as u64;
             let split_mode: u32 = resolve_split_mode(self.bit_depth, pixel_rate);
+            // Split × sub-frame arbitration (Phase 8) BEFORE the ladder, the ceiling key and the
+            // chunked-poll latch — all three must see the post-arbitration truth (a drop inside
+            // build_init_params would leave poll_chunk busy-polling its whole budget per AU).
+            let (split_mode, subframe_on) = resolve_split_subframe(
+                self.codec,
+                split_mode,
+                self.subframe_on,
+                self.subframe_forced,
+            );
+            self.subframe_on = subframe_on;
             const CLAMP_TOL_BPS: u64 = 20_000_000;
 
             // Ceiling cache (process lifetime, `nvenc_core`): a prior clamp search already found

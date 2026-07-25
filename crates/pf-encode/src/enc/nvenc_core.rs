@@ -102,6 +102,141 @@ pub(super) fn resolve_split_mode(bit_depth: u8, pixel_rate: u64) -> u32 {
     mode
 }
 
+/// Whether the operator EXPLICITLY forced sub-frame readback on (`PUNKTFUNK_NVENC_SUBFRAME=1`)
+/// — the log-severity input to [`resolve_split_subframe`]: a forced knob being overridden
+/// deserves a `warn`, a default being tuned an `info`. Callers LATCH this once next to their
+/// resolved subframe state (an env re-read at reconfigure would violate the "open and
+/// reconfigure present identical init params" invariant).
+/// Linux-cfg'd like its ONLY caller (the `nvenc_cuda` query_caps latch) — Windows sessions have
+/// `subframe == forced` by construction (env opt-in only) and never consult this; without the
+/// cfg it is dead code on every Windows leg (item-level dead_code, the recurring trap).
+#[cfg(target_os = "linux")]
+pub(super) fn subframe_env_forced() -> bool {
+    matches!(
+        std::env::var("PUNKTFUNK_NVENC_SUBFRAME").as_deref(),
+        Ok("1")
+    )
+}
+
+/// The split-encode × sub-frame arbitration (Phase 8; verified against `nvEncodeAPI.h`'s own
+/// `splitEncodeMode` doc, not folklore):
+/// - **H.264**: split "is not applicable" — hard-DISABLE the mode so the written config, the
+///   ceiling-cache key, the split diagnostic log and the rejection-retry all stay truthful (the
+///   retry used to re-open a byte-identical session after an H.264 "split rejection").
+/// - **HEVC**: split is "not supported if … subframe mode" — when WE force split
+///   (TWO/THREE/AUTO_FORCED, e.g. the 4K120 throughput requirement), sub-frame yields. Under
+///   plain AUTO the driver arbitrates — the shipped fleet state (1080p–1440p240 all run
+///   AUTO+subframe); keying on `!= DISABLE` here would have disarmed the Phase-3 chunked-poll
+///   feature fleet-wide.
+/// - **AV1**: both legal (sub-frame is per-tile; split is constrained only by
+///   output-into-vidmem, which we never use) — untouched.
+///
+/// Returns the `(split_mode, subframe)` to ACTUALLY configure. The caller must store BOTH back
+/// (the chunked-poll latch and `CeilingKey` key on them) — a silent in-params drop would leave
+/// `poll_chunk` busy-polling its full budget every AU (`numSlices` stays 0 without
+/// `reportSliceOffsets`, so neither loop exit ever fires).
+pub(super) fn resolve_split_subframe(
+    codec: Codec,
+    split_mode: u32,
+    subframe: bool,
+    subframe_forced: bool,
+) -> (u32, bool) {
+    use nv::NV_ENC_SPLIT_ENCODE_MODE as M;
+    if codec == Codec::H264 {
+        return (M::NV_ENC_SPLIT_DISABLE_MODE as u32, subframe);
+    }
+    let split_forced = split_mode == M::NV_ENC_SPLIT_TWO_FORCED_MODE as u32
+        || split_mode == M::NV_ENC_SPLIT_THREE_FORCED_MODE as u32
+        || split_mode == M::NV_ENC_SPLIT_AUTO_FORCED_MODE as u32;
+    if codec == Codec::H265 && split_forced && subframe {
+        if subframe_forced {
+            tracing::warn!(
+                split_mode,
+                "HEVC forced split-encode and PUNKTFUNK_NVENC_SUBFRAME=1 are mutually \
+                 unsupported (nvEncodeAPI.h) — sub-frame readback disabled for this session; \
+                 set PUNKTFUNK_SPLIT_ENCODE=0 to choose sub-frame instead"
+            );
+        } else {
+            tracing::info!(
+                split_mode,
+                "HEVC forced split-encode supersedes default-on sub-frame readback (mutually \
+                 unsupported per nvEncodeAPI.h; split is the 4K120 throughput lever) — set \
+                 PUNKTFUNK_SPLIT_ENCODE=0 to choose sub-frame instead"
+            );
+        }
+        return (split_mode, false);
+    }
+    (split_mode, subframe)
+}
+
+#[cfg(test)]
+mod split_subframe_tests {
+    use super::{resolve_split_subframe, Codec};
+    use nvidia_video_codec_sdk::sys::nvEncodeAPI::NV_ENC_SPLIT_ENCODE_MODE as M;
+
+    const AUTO: u32 = M::NV_ENC_SPLIT_AUTO_MODE as u32;
+    const TWO: u32 = M::NV_ENC_SPLIT_TWO_FORCED_MODE as u32;
+    const AUTO_F: u32 = M::NV_ENC_SPLIT_AUTO_FORCED_MODE as u32;
+    const DISABLE: u32 = M::NV_ENC_SPLIT_DISABLE_MODE as u32;
+
+    /// THE FLEET CASE: plain AUTO + default-on sub-frame must pass through untouched — the
+    /// driver arbitrates. Keying the rule on `!= DISABLE` would disarm sub-frame on every
+    /// default Linux HEVC session (AUTO == 0 is the resolver's fallthrough).
+    #[test]
+    fn hevc_auto_keeps_subframe() {
+        assert_eq!(
+            resolve_split_subframe(Codec::H265, AUTO, true, false),
+            (AUTO, true)
+        );
+    }
+
+    #[test]
+    fn hevc_forced_split_drops_subframe() {
+        assert_eq!(
+            resolve_split_subframe(Codec::H265, TWO, true, false),
+            (TWO, false)
+        );
+        assert_eq!(
+            resolve_split_subframe(Codec::H265, AUTO_F, true, true),
+            (AUTO_F, false)
+        );
+        // No sub-frame to drop → nothing changes.
+        assert_eq!(
+            resolve_split_subframe(Codec::H265, TWO, false, false),
+            (TWO, false)
+        );
+        // Explicitly disabled split → sub-frame kept (the documented escape).
+        assert_eq!(
+            resolve_split_subframe(Codec::H265, DISABLE, true, true),
+            (DISABLE, true)
+        );
+    }
+
+    /// H.264: split "is not applicable" (nvEncodeAPI.h) — hard-DISABLE regardless of the
+    /// resolved mode; sub-frame (H.264 slices) is unaffected.
+    #[test]
+    fn h264_split_hard_disabled() {
+        assert_eq!(
+            resolve_split_subframe(Codec::H264, TWO, true, false),
+            (DISABLE, true)
+        );
+        assert_eq!(
+            resolve_split_subframe(Codec::H264, AUTO, false, false),
+            (DISABLE, false)
+        );
+    }
+
+    /// AV1: both features are legal together (per-tile sub-frame; split constrained only by
+    /// output-into-vidmem) — the arbitration must not touch it.
+    #[test]
+    fn av1_untouched() {
+        assert_eq!(
+            resolve_split_subframe(Codec::Av1, TWO, true, true),
+            (TWO, true)
+        );
+    }
+}
+
 /// One session config's identity for the process-lifetime bitrate-ceiling cache
 /// ([`cached_ceiling`]/[`store_ceiling`]). Everything the driver's codec-level validation keys
 /// off: the GPU (different NVENC generations have different level ceilings), dims/fps (the luma
