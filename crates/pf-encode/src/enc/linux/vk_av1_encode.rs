@@ -498,3 +498,366 @@ pub struct StdVideoEncodeAV1OperatingPointInfo {
 pub fn stype(raw: i32) -> vk::StructureType {
     vk::StructureType::from_raw(raw)
 }
+
+// ---------- ABI layout guard ----------
+//
+// These structs are hand-copied and handed to the driver through raw `p_next` chains, so nothing in
+// the type system relates them to the C definitions any more: an edit that inserts, drops, widens or
+// re-pads a field is not a compile error, it is the driver reading our bytes at the wrong offsets.
+// The assertions below are the missing compile error. They are `const` rather than `#[cfg(test)]`
+// (the shape `amf.rs` uses) so they hold in every build, including the shipped one, and on any
+// target this module compiles for.
+//
+// What they catch: a changed field width, an inserted or removed field, a changed array length, a
+// padding assumption that only holds on one target. What they CANNOT catch: swapping two fields of
+// the same type — offsets are unchanged. That case is only caught by reading the registry, so the
+// field order here was diffed against `vulkan_core.h` and `vk_video/vulkan_video_codec_av1std_encode.h`
+// (Vulkan-Headers `main`, 2026-07-25) when these assertions were written, along with every `ST_*`,
+// flag-bit and enum value above; the bitfield member order is pinned by the test module below.
+//
+// Deliberately duplicated in `vk_valve_rgb.rs` rather than shared: both modules exist to be deleted
+// wholesale once `ash` ships these bindings, and a shared helper would make deleting one break the
+// other.
+macro_rules! assert_abi_layout {
+    ($t:ty { size: $size:expr, align: $align:expr $(, $field:ident @ $off:expr)* $(,)? }) => {
+        const _: () = {
+            assert!(
+                ::core::mem::size_of::<$t>() == $size,
+                concat!(stringify!($t), ": size does not match the C ABI")
+            );
+            assert!(
+                ::core::mem::align_of::<$t>() == $align,
+                concat!(stringify!($t), ": alignment does not match the C ABI")
+            );
+            $(assert!(
+                ::core::mem::offset_of!($t, $field) == $off,
+                concat!(stringify!($t), ".", stringify!($field), ": offset does not match the C ABI")
+            );)*
+        };
+    };
+}
+
+// Std encode structs. The three `*Flags` types are a single C `uint32_t` of bitfields, so only their
+// size and alignment are layout-checkable here; their member order is covered by `abi_tests`.
+assert_abi_layout!(StdVideoEncodeAV1PictureInfoFlags { size: 4, align: 4 });
+
+assert_abi_layout!(StdVideoEncodeAV1PictureInfo {
+    size: 152, align: 8,
+    flags @ 0,
+    frame_type @ 4,
+    frame_presentation_time @ 8,
+    current_frame_id @ 12,
+    order_hint @ 16,
+    primary_ref_frame @ 17,
+    refresh_frame_flags @ 18,
+    coded_denom @ 19,
+    render_width_minus_1 @ 20,
+    render_height_minus_1 @ 22,
+    interpolation_filter @ 24,
+    TxMode @ 28,
+    delta_q_res @ 32,
+    delta_lf_res @ 33,
+    ref_order_hint @ 34,
+    ref_frame_idx @ 42,
+    reserved1 @ 49,
+    delta_frame_id_minus_1 @ 52,
+    pTileInfo @ 80,
+    pQuantization @ 88,
+    pSegmentation @ 96,
+    pLoopFilter @ 104,
+    pCDEF @ 112,
+    pLoopRestoration @ 120,
+    pGlobalMotion @ 128,
+    pExtensionHeader @ 136,
+    pBufferRemovalTimes @ 144,
+});
+
+assert_abi_layout!(StdVideoEncodeAV1ReferenceInfoFlags { size: 4, align: 4 });
+
+assert_abi_layout!(StdVideoEncodeAV1ReferenceInfo {
+    size: 24, align: 8,
+    flags @ 0,
+    RefFrameId @ 4,
+    frame_type @ 8,
+    OrderHint @ 12,
+    reserved1 @ 13,
+    pExtensionHeader @ 16,
+});
+
+assert_abi_layout!(StdVideoEncodeAV1ExtensionHeader {
+    size: 2, align: 1,
+    temporal_id @ 0,
+    spatial_id @ 1,
+});
+
+assert_abi_layout!(StdVideoEncodeAV1OperatingPointInfoFlags { size: 4, align: 4 });
+
+assert_abi_layout!(StdVideoEncodeAV1OperatingPointInfo {
+    size: 20, align: 4,
+    flags @ 0,
+    operating_point_idc @ 4,
+    seq_level_idx @ 6,
+    seq_tier @ 7,
+    decoder_buffer_delay @ 8,
+    encoder_buffer_delay @ 12,
+    initial_display_delay_minus_1 @ 16,
+});
+
+// KHR extension structs.
+assert_abi_layout!(VideoEncodeAV1ProfileInfoKHR {
+    size: 24, align: 8,
+    s_type @ 0,
+    p_next @ 8,
+    std_profile @ 16,
+});
+
+assert_abi_layout!(PhysicalDeviceVideoEncodeAV1FeaturesKHR {
+    size: 24, align: 8,
+    s_type @ 0,
+    p_next @ 8,
+    video_encode_av1 @ 16,
+});
+
+assert_abi_layout!(VideoEncodeAV1CapabilitiesKHR {
+    size: 128, align: 8,
+    s_type @ 0,
+    p_next @ 8,
+    flags @ 16,
+    max_level @ 20,
+    coded_picture_alignment @ 24,
+    max_tiles @ 32,
+    min_tile_size @ 40,
+    max_tile_size @ 48,
+    superblock_sizes @ 56,
+    max_single_reference_count @ 60,
+    single_reference_name_mask @ 64,
+    max_unidirectional_compound_reference_count @ 68,
+    max_unidirectional_compound_group1_reference_count @ 72,
+    unidirectional_compound_reference_name_mask @ 76,
+    max_bidirectional_compound_reference_count @ 80,
+    max_bidirectional_compound_group1_reference_count @ 84,
+    max_bidirectional_compound_group2_reference_count @ 88,
+    bidirectional_compound_reference_name_mask @ 92,
+    max_temporal_layer_count @ 96,
+    max_spatial_layer_count @ 100,
+    max_operating_points @ 104,
+    min_q_index @ 108,
+    max_q_index @ 112,
+    prefers_gop_remaining_frames @ 116,
+    requires_gop_remaining_frames @ 120,
+    std_syntax_flags @ 124,
+});
+
+assert_abi_layout!(VideoEncodeAV1SessionParametersCreateInfoKHR {
+    size: 48, align: 8,
+    s_type @ 0,
+    p_next @ 8,
+    p_std_sequence_header @ 16,
+    p_std_decoder_model_info @ 24,
+    std_operating_point_count @ 32,
+    p_std_operating_points @ 40,
+});
+
+assert_abi_layout!(VideoEncodeAV1PictureInfoKHR {
+    size: 80, align: 8,
+    s_type @ 0,
+    p_next @ 8,
+    prediction_mode @ 16,
+    rate_control_group @ 20,
+    constant_q_index @ 24,
+    p_std_picture_info @ 32,
+    reference_name_slot_indices @ 40,
+    primary_reference_cdf_only @ 68,
+    generate_obu_extension_header @ 72,
+});
+
+assert_abi_layout!(VideoEncodeAV1DpbSlotInfoKHR {
+    size: 24, align: 8,
+    s_type @ 0,
+    p_next @ 8,
+    p_std_reference_info @ 16,
+});
+
+assert_abi_layout!(VideoEncodeAV1RateControlInfoKHR {
+    size: 40, align: 8,
+    s_type @ 0,
+    p_next @ 8,
+    flags @ 16,
+    gop_frame_count @ 20,
+    key_frame_period @ 24,
+    consecutive_bipredictive_frame_count @ 28,
+    temporal_layer_count @ 32,
+});
+
+assert_abi_layout!(VideoEncodeAV1QIndexKHR {
+    size: 12, align: 4,
+    intra_q_index @ 0,
+    predictive_q_index @ 4,
+    bipredictive_q_index @ 8,
+});
+
+assert_abi_layout!(VideoEncodeAV1FrameSizeKHR {
+    size: 12, align: 4,
+    intra_frame_size @ 0,
+    predictive_frame_size @ 4,
+    bipredictive_frame_size @ 8,
+});
+
+assert_abi_layout!(VideoEncodeAV1RateControlLayerInfoKHR {
+    size: 64, align: 8,
+    s_type @ 0,
+    p_next @ 8,
+    use_min_q_index @ 16,
+    min_q_index @ 20,
+    use_max_q_index @ 32,
+    max_q_index @ 36,
+    use_max_frame_size @ 48,
+    max_frame_size @ 52,
+});
+
+assert_abi_layout!(VideoEncodeAV1GopRemainingFrameInfoKHR {
+    size: 32, align: 8,
+    s_type @ 0,
+    p_next @ 8,
+    use_gop_remaining_frames @ 16,
+    gop_remaining_intra @ 20,
+    gop_remaining_predictive @ 24,
+    gop_remaining_bipredictive @ 28,
+});
+
+assert_abi_layout!(VideoEncodeAV1SessionCreateInfoKHR {
+    size: 24, align: 8,
+    s_type @ 0,
+    p_next @ 8,
+    use_max_level @ 16,
+    max_level @ 20,
+});
+
+#[cfg(test)]
+mod abi_tests {
+    use super::*;
+
+    /// Assert that `set` lights exactly one bit of the flags word, at `bit`.
+    fn sets_only_bit(
+        storage: __BindgenBitfieldUnit<[u8; 4]>,
+        name: &str,
+        bit: usize,
+        expected_width: usize,
+    ) {
+        for probe in 0..32 {
+            let want = probe >= bit && probe < bit + expected_width;
+            assert_eq!(
+                storage.get_bit(probe),
+                want,
+                "`{name}` should occupy bit(s) {bit}..{}, but bit {probe} disagrees",
+                bit + expected_width
+            );
+        }
+    }
+
+    /// A C bitfield allocates its members from bit 0 upward in declaration order, so the setter for
+    /// the Nth member of `StdVideoEncodeAV1PictureInfoFlags` must write bit N. The array below is
+    /// the member list of `vulkan_video_codec_av1std_encode.h` **in declaration order** — so this
+    /// pins the hand-copied bit indices to the header rather than merely to themselves. A silent
+    /// renumbering here would make the driver read, say, `use_superres` where we meant
+    /// `render_and_frame_size_different`.
+    #[test]
+    fn picture_info_flag_setters_follow_the_c_declaration_order() {
+        #[allow(clippy::type_complexity)]
+        let members: [(&str, fn(&mut StdVideoEncodeAV1PictureInfoFlags)); 29] = [
+            ("error_resilient_mode", |f| f.set_error_resilient_mode(1)),
+            ("disable_cdf_update", |f| f.set_disable_cdf_update(1)),
+            ("use_superres", |f| f.set_use_superres(1)),
+            ("render_and_frame_size_different", |f| {
+                f.set_render_and_frame_size_different(1)
+            }),
+            ("allow_screen_content_tools", |f| {
+                f.set_allow_screen_content_tools(1)
+            }),
+            ("is_filter_switchable", |f| f.set_is_filter_switchable(1)),
+            ("force_integer_mv", |f| f.set_force_integer_mv(1)),
+            ("frame_size_override_flag", |f| {
+                f.set_frame_size_override_flag(1)
+            }),
+            ("buffer_removal_time_present_flag", |f| {
+                f.set_buffer_removal_time_present_flag(1)
+            }),
+            ("allow_intrabc", |f| f.set_allow_intrabc(1)),
+            ("frame_refs_short_signaling", |f| {
+                f.set_frame_refs_short_signaling(1)
+            }),
+            ("allow_high_precision_mv", |f| {
+                f.set_allow_high_precision_mv(1)
+            }),
+            ("is_motion_mode_switchable", |f| {
+                f.set_is_motion_mode_switchable(1)
+            }),
+            ("use_ref_frame_mvs", |f| f.set_use_ref_frame_mvs(1)),
+            ("disable_frame_end_update_cdf", |f| {
+                f.set_disable_frame_end_update_cdf(1)
+            }),
+            ("allow_warped_motion", |f| f.set_allow_warped_motion(1)),
+            ("reduced_tx_set", |f| f.set_reduced_tx_set(1)),
+            ("skip_mode_present", |f| f.set_skip_mode_present(1)),
+            ("delta_q_present", |f| f.set_delta_q_present(1)),
+            ("delta_lf_present", |f| f.set_delta_lf_present(1)),
+            ("delta_lf_multi", |f| f.set_delta_lf_multi(1)),
+            ("segmentation_enabled", |f| f.set_segmentation_enabled(1)),
+            ("segmentation_update_map", |f| {
+                f.set_segmentation_update_map(1)
+            }),
+            ("segmentation_temporal_update", |f| {
+                f.set_segmentation_temporal_update(1)
+            }),
+            ("segmentation_update_data", |f| {
+                f.set_segmentation_update_data(1)
+            }),
+            ("UsesLr", |f| f.set_UsesLr(1)),
+            ("usesChromaLr", |f| f.set_usesChromaLr(1)),
+            ("show_frame", |f| f.set_show_frame(1)),
+            ("showable_frame", |f| f.set_showable_frame(1)),
+        ];
+
+        for (bit, (name, set)) in members.into_iter().enumerate() {
+            let mut flags = StdVideoEncodeAV1PictureInfoFlags {
+                _bitfield_align_1: [],
+                _bitfield_1: __BindgenBitfieldUnit::new([0u8; 4]),
+            };
+            set(&mut flags);
+            sets_only_bit(flags._bitfield_1, name, bit, 1);
+        }
+    }
+
+    /// `reserved : 3` closes out the word — bits 29..32. Checking it is what proves the 29 members
+    /// above are the *whole* list: a dropped member would shift `reserved` down and fail here.
+    #[test]
+    fn picture_info_reserved_occupies_the_top_three_bits() {
+        let mut flags = StdVideoEncodeAV1PictureInfoFlags {
+            _bitfield_align_1: [],
+            _bitfield_1: __BindgenBitfieldUnit::new([0u8; 4]),
+        };
+        flags.set_reserved(0b111);
+        sets_only_bit(flags._bitfield_1, "reserved", 29, 3);
+    }
+
+    /// The same invariant for the two-member reference-info flags word.
+    #[test]
+    fn reference_info_flag_setters_follow_the_c_declaration_order() {
+        #[allow(clippy::type_complexity)]
+        let members: [(&str, fn(&mut StdVideoEncodeAV1ReferenceInfoFlags)); 2] = [
+            ("disable_frame_end_update_cdf", |f| {
+                f.set_disable_frame_end_update_cdf(1)
+            }),
+            ("segmentation_enabled", |f| f.set_segmentation_enabled(1)),
+        ];
+
+        for (bit, (name, set)) in members.into_iter().enumerate() {
+            let mut flags = StdVideoEncodeAV1ReferenceInfoFlags {
+                _bitfield_align_1: [],
+                _bitfield_1: __BindgenBitfieldUnit::new([0u8; 4]),
+            };
+            set(&mut flags);
+            sets_only_bit(flags._bitfield_1, name, bit, 1);
+        }
+    }
+}

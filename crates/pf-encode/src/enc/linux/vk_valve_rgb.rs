@@ -80,3 +80,74 @@ pub struct VideoEncodeSessionRgbConversionCreateInfoVALVE {
 pub fn stype(raw: i32) -> vk::StructureType {
     vk::StructureType::from_raw(raw)
 }
+
+// ---------- ABI layout guard ----------
+//
+// These structs are hand-copied from the registry and handed to the driver through raw `p_next`
+// chains, so nothing in the type system relates them to the C definitions any more: an edit that
+// inserts, drops, widens or re-pads a field is not a compile error, it is the driver reading our
+// bytes at the wrong offsets. The assertions below are the missing compile error. They are `const`
+// rather than `#[cfg(test)]` (the shape `amf.rs` uses) so they hold in every build, including the
+// shipped one, and on any target this module compiles for.
+//
+// What they catch: a changed field width, an inserted or removed field, a changed array length, a
+// padding assumption that only holds on one target. What they CANNOT catch: swapping two fields of
+// the same type — offsets are unchanged. That case is only caught by reading the registry, so the
+// field order here was diffed against `vulkan_core.h` (Vulkan-Headers `main`, 2026-07-25) when
+// these assertions were written, along with every `ST_*` and flag-bit value above.
+//
+// Deliberately duplicated in `vk_av1_encode.rs` rather than shared: both modules exist to be
+// deleted wholesale once `ash` ships these bindings, and a shared helper would make deleting one
+// break the other.
+macro_rules! assert_abi_layout {
+    ($t:ty { size: $size:expr, align: $align:expr $(, $field:ident @ $off:expr)* $(,)? }) => {
+        const _: () = {
+            assert!(
+                ::core::mem::size_of::<$t>() == $size,
+                concat!(stringify!($t), ": size does not match the C ABI")
+            );
+            assert!(
+                ::core::mem::align_of::<$t>() == $align,
+                concat!(stringify!($t), ": alignment does not match the C ABI")
+            );
+            $(assert!(
+                ::core::mem::offset_of!($t, $field) == $off,
+                concat!(stringify!($t), ".", stringify!($field), ": offset does not match the C ABI")
+            );)*
+        };
+    };
+}
+
+assert_abi_layout!(PhysicalDeviceVideoEncodeRgbConversionFeaturesVALVE {
+    size: 24, align: 8,
+    s_type @ 0,
+    p_next @ 8,
+    video_encode_rgb_conversion @ 16,
+});
+
+assert_abi_layout!(VideoEncodeRgbConversionCapabilitiesVALVE {
+    size: 32, align: 8,
+    s_type @ 0,
+    p_next @ 8,
+    rgb_models @ 16,
+    rgb_ranges @ 20,
+    x_chroma_offsets @ 24,
+    y_chroma_offsets @ 28,
+});
+
+assert_abi_layout!(VideoEncodeProfileRgbConversionInfoVALVE {
+    size: 24, align: 8,
+    s_type @ 0,
+    p_next @ 8,
+    perform_encode_rgb_conversion @ 16,
+});
+
+assert_abi_layout!(VideoEncodeSessionRgbConversionCreateInfoVALVE {
+    size: 32, align: 8,
+    s_type @ 0,
+    p_next @ 8,
+    rgb_model @ 16,
+    rgb_range @ 20,
+    x_chroma_offset @ 24,
+    y_chroma_offset @ 28,
+});
