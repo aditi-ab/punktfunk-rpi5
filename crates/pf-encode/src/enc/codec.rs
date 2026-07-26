@@ -249,9 +249,16 @@ impl Codec {
     }
 }
 
-/// Static capabilities an [`Encoder`] declares so the session glue routes loss-recovery and HDR
-/// plumbing by *query* rather than relying on a method's no-op/`false` default. Cheap `Copy`; fixed
-/// for the session (an HDR toggle re-initialises the encoder — re-query if that matters).
+/// Static capabilities an [`Encoder`] declares so the session glue routes loss-recovery and
+/// cursor plumbing by *query* rather than relying on a method's no-op/`false` default. Cheap
+/// `Copy`; fixed for the session (an HDR toggle re-initialises the encoder — re-query if that
+/// matters).
+///
+/// (There is deliberately NO `supports_hdr_metadata` cap: in-band HDR SEI/OBU embedding needs no
+/// host-side routing — every first-party client reads the static grade exclusively out-of-band
+/// (the native 0xCE datagram / the GameStream 0x010e control message), both planes send it
+/// unconditionally, and the in-band grade is a decoder-side bonus for stock clients. A cap field
+/// nothing reads is a contract nobody honors; it was deleted after shipping write-only.)
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct EncoderCaps {
     /// The encoder can perform real reference-frame invalidation — i.e.
@@ -261,10 +268,6 @@ pub struct EncoderCaps {
     /// AMF (user-LTR force-reference, when the driver accepted the LTR slots at open). The
     /// libavcodec paths (Linux NVENC, VAAPI, QSV) can't express it and always keyframe.
     pub supports_rfi: bool,
-    /// The encoder emits in-band HDR mastering/CLL SEI from [`set_hdr_meta`](Encoder::set_hdr_meta).
-    /// When `false`, `set_hdr_meta` is a no-op and no in-band grade reaches the client. Only the
-    /// Windows direct-NVENC path attaches it today.
-    pub supports_hdr_metadata: bool,
     /// The opened encoder is actually producing a full-chroma 4:4:4 (`chroma_format_idc = 3`) stream.
     /// `false` on every 4:2:0 session (the default) and on a backend that declined 4:4:4. Set by the
     /// NVENC backends (Linux + Windows). The chroma is committed to the wire (`Welcome::chroma_format`)
@@ -304,8 +307,11 @@ pub struct EncoderCaps {
     ///
     /// This makes the answer queryable instead of assumed. It is deliberately a plain fact about the
     /// encoder, not a policy: what to DO when a session wants blending and the backend cannot is the
-    /// host's call, since only the host can re-plan capture (fall back to capturer-side compositing).
-    /// `open_video` can only warn, which it does.
+    /// host's call, since only the host can re-plan capture. That call is wired now — the
+    /// negotiation consults the pre-open mirror ([`cursor_blend_capable`](crate::cursor_blend_capable))
+    /// to gate the cursor channel and to keep capture on embedded-cursor / CSC-capable shapes for
+    /// any backend that can't blend; `open_video`'s post-open check remains as the backstop for
+    /// open-time fallbacks the plan can't see.
     pub blends_cursor: bool,
 }
 
@@ -333,11 +339,10 @@ pub trait Encoder: Send {
         let _ = wire_index;
         self.submit(frame)
     }
-    /// This encoder's static [capabilities](EncoderCaps) (RFI, HDR SEI), so the session glue can
-    /// route by query rather than rely on the no-op/`false` defaults of
-    /// [`invalidate_ref_frames`](Self::invalidate_ref_frames) / [`set_hdr_meta`](Self::set_hdr_meta).
-    /// Default: no optional capabilities (the SDR / libavcodec backends) — only the direct-NVENC
-    /// path overrides it.
+    /// This encoder's static [capabilities](EncoderCaps) (RFI, intra-refresh, chroma, cursor
+    /// blending), so the session glue can route by query rather than rely on the no-op/`false`
+    /// defaults of methods like [`invalidate_ref_frames`](Self::invalidate_ref_frames).
+    /// Default: no optional capabilities (the software / libavcodec backends).
     fn caps(&self) -> EncoderCaps {
         EncoderCaps::default()
     }
@@ -345,10 +350,12 @@ pub trait Encoder: Send {
     /// reference-frame-invalidation request). Default: no-op.
     fn request_keyframe(&mut self) {}
     /// Set the source's static HDR mastering metadata (from the capturer). An HDR encoder emits it
-    /// as in-band SEI (`mastering_display_colour_volume` + `content_light_level_info`) on each
-    /// keyframe so any decoder — including stock Moonlight — tone-maps from the source's real grade.
-    /// Default: no-op (SDR encoders / libavcodec paths that don't attach it yet). Cheap to call
-    /// every frame; only the direct-NVENC path consumes it.
+    /// in-band (HEVC/H.264 `mastering_display_colour_volume` + `content_light_level_info` SEI, or
+    /// AV1 metadata OBUs) on keyframes so a stock decoder — e.g. stock Moonlight — tone-maps from
+    /// the source's real grade. Default: no-op (SDR encoders / paths that don't attach it).
+    /// Cheap to call every frame; consumed by Windows direct-NVENC, native AMF, and native QSV.
+    /// Every first-party client reads the grade out-of-band (the 0xCE datagram) regardless, so
+    /// this is a bonus for stock decoders, never the primary channel.
     fn set_hdr_meta(&mut self, _meta: Option<punktfunk_core::quic::HdrMeta>) {}
     /// Invalidate a contiguous range of previously-encoded reference frames (client frame numbers
     /// — WIRE frame indexes, the domain [`submit_indexed`](Self::submit_indexed) pins the encoder's

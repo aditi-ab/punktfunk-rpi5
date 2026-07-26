@@ -1690,17 +1690,14 @@ impl Encoder for NvencD3d11Encoder {
     }
 
     fn caps(&self) -> EncoderCaps {
-        // RFI is probed once at open (`rfi_supported`); HDR SEI rides keyframes whenever the
-        // session is in HDR mode. Both are the real capabilities the session glue routes on.
+        // RFI is probed once at open (`rfi_supported`) — the real capability the session glue
+        // routes on. (In-band HDR SEI needs no cap: it rides keyframes on HEVC/H.264 HDR
+        // sessions — see `submit` — and every first-party client reads the grade out-of-band
+        // via the 0xCE datagram regardless.)
         EncoderCaps {
             // The Windows capture path composites the pointer; this backend never reads `frame.cursor`.
             blends_cursor: false,
             supports_rfi: self.rfi_supported,
-            // In-band mastering/CLL is attached as keyframe SEI on HEVC/H.264 only — AV1 carries
-            // it in METADATA OBUs (`HDR_MDCV`/`HDR_CLL`), which this backend doesn't emit yet
-            // (see `submit`); the grade still reaches punktfunk clients out-of-band via the 0xCE
-            // datagram. Don't claim a capability the AV1 path doesn't have.
-            supports_hdr_metadata: self.hdr && self.codec != Codec::Av1,
             // Reflects what the session actually configured (cleared in `query_caps` if the GPU lacks
             // YUV444 encode), so the glue can confirm 4:4:4 vs the negotiated request.
             chroma_444: self.chroma_444,

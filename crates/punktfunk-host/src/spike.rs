@@ -94,7 +94,9 @@ pub fn run(opts: Options) -> Result<()> {
                 want_hdr,
                 "spike source: xdg ScreenCast portal (live monitor)"
             );
-            capture::open_portal_monitor(want_hdr).context("open portal capturer")?
+            // Embedded cursor: the spike passes `cursor_blend = false` to its encoder open, so
+            // a metadata pointer would be composited by nothing.
+            capture::open_portal_monitor(want_hdr, false).context("open portal capturer")?
         }
         Source::KwinVirtual => {
             let compositor = crate::vdisplay::detect().unwrap_or(crate::vdisplay::Compositor::Kwin);

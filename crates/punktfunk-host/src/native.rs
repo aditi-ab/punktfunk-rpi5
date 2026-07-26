@@ -1012,9 +1012,10 @@ async fn serve_session(
     // just never fires then.
     let (cursor_shape_tx, cursor_shape_rx) =
         tokio::sync::mpsc::unbounded_channel::<punktfunk_core::quic::CursorShape>();
-    // Negotiated cursor forwarding: MUST match the HOST_CAP_CURSOR bit the Welcome advertised
-    // (handshake::cursor_forward is the single predicate both read).
-    let cursor_forward = handshake::cursor_forward(hello.client_caps, compositor);
+    // Negotiated cursor forwarding: the HOST_CAP_CURSOR bit the Welcome advertised, read back
+    // rather than recomputed (`handshake::cursor_forward` computed it once, with the encoder
+    // blend-capability gate — re-running it here could drift, and would re-probe).
+    let cursor_forward = welcome.host_caps & punktfunk_core::quic::HOST_CAP_CURSOR != 0;
     // Who renders the pointer RIGHT NOW (client `CursorRenderMode`, flipped live by the mouse-
     // model chord): `true` = client draws (exclude + forward), `false` = host composites (the
     // capture model). Starts true — the pre-message behavior for cap sessions. Control task

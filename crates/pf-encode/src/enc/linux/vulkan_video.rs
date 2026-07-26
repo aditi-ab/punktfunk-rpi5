@@ -76,9 +76,11 @@ fn quality_request() -> u32 {
 /// (design/vulkan-rgb-direct-encode.md): the captured RGB frame is the encode source and the
 /// VCN EFC front-end does the 709-narrow CSC inline — no compute CSC, no plane copies, one
 /// queue submit per frame (unaligned modes go through the padded-copy staging blit). B2
-/// default: ON wherever the probe passes, EXCEPT sessions that may need the CSC's cursor
-/// blend (see [`VulkanVideoEncoder::open`]). `=0` disables outright; `=1` forces it even on
-/// cursor-blend sessions (the pointer will be missing from the stream); unset = the default.
+/// default: ON wherever the probe passes, EXCEPT sessions that need the CSC's cursor blend
+/// (see [`VulkanVideoEncoder::open`]). `=0` disables outright; `=1` forces it on non-cursor
+/// sessions; unset = the default. A cursor-blend session IGNORES `=1` — EFC cannot composite
+/// the pointer, and the caps-aware negotiation promised the client a composited one, so the
+/// pointer outranks the lab pin (the open logs the override).
 ///
 /// Parses like every sibling knob (`matches!(v.trim(), …)`): anything unrecognised — including
 /// an empty value and a value that is only whitespace — falls back to the default rather than
@@ -614,10 +616,6 @@ pub struct VulkanVideoEncoder {
     /// GPU reset (those paths keep their aligned-size sources/staging).
     native_nv12: bool,
 
-    /// One-shot warning latch: a cursor bitmap arrived on an RGB-direct or native-NV12 session
-    /// (neither has a compositing stage — the cursor will be missing from the stream until the
-    /// CSC path is used).
-    warned_cursor: bool,
     /// A [`reconfigure_bitrate`](Encoder::reconfigure_bitrate) rate not yet installed in the video
     /// session. The next `record_submit` emits an `ENCODE_RATE_CONTROL` control command carrying it
     /// (mid-stream) or folds it into the first frame's RESET+RC install, then promotes it into
@@ -671,7 +669,16 @@ impl VulkanVideoEncoder {
         cursor_blend: bool,
     ) -> Result<Self> {
         let native_nv12 = format == PixelFormat::Nv12;
-        let want_rgb = !native_nv12 && rgb_request().unwrap_or(!cursor_blend);
+        // A cursor-blend session must keep the compute-CSC path — the only arm with the cursor
+        // blend — so it outranks an explicit RGB-direct pin (EFC cannot composite; the
+        // negotiation promised the client a composited pointer).
+        if cursor_blend && rgb_request() == Some(true) {
+            tracing::info!(
+                "PUNKTFUNK_VULKAN_RGB_DIRECT=1 ignored for this session — it composites the \
+                 pointer, which the EFC front-end cannot; using the compute-CSC path"
+            );
+        }
+        let want_rgb = !native_nv12 && !cursor_blend && rgb_request().unwrap_or(true);
         Self::open_opts_inner(
             codec,
             width,
@@ -1448,7 +1455,6 @@ impl VulkanVideoEncoder {
             cpu_expand: Vec::new(),
             rgb: rgb_cfg,
             native_nv12,
-            warned_cursor: false,
             pending_bitrate: None,
             width: w,
             height: h,
@@ -2621,17 +2627,10 @@ impl VulkanVideoEncoder {
                 d.modifier
             );
         }
-        // No compositing stage exists here (like RGB-direct/EFC): gamescope embeds its pointer
-        // in the produced pixels, but any other NV12 producer's metadata cursor would be lost —
-        // say so once instead of silently.
-        if frame.cursor.is_some() && !self.warned_cursor {
-            self.warned_cursor = true;
-            tracing::warn!(
-                "cursor bitmap on a native-NV12 session — nothing composites it; the cursor \
-                 will be missing from the stream (unset PUNKTFUNK_PIPEWIRE_NV12 for \
-                 metadata-cursor captures)"
-            );
-        }
+        // No compositing stage exists here (like RGB-direct/EFC) — and none is needed: the
+        // session plan negotiates native NV12 only for a non-cursor-blend session
+        // (`SessionPlan::output_format` gates `nv12_native` on `!cursor_blend`), so no cursor
+        // bitmap ever reaches this arm. Gamescope embeds its pointer in the produced pixels.
         let dev = self.device.clone();
         let cmd = self.frames[slot].cmd;
         let fence = self.frames[slot].fence;
@@ -2691,16 +2690,9 @@ impl VulkanVideoEncoder {
         let query_pool = self.frames[slot].query_pool;
         let bs_buf = self.frames[slot].bs_buf;
         let ts_pool = self.frames[slot].ts_pool;
-        // EFC cannot composite the cursor bitmap the metadata-cursor captures hand us — say so
-        // once instead of silently losing the pointer (gamescope, the flagship, embeds it).
-        if frame.cursor.is_some() && !self.warned_cursor {
-            self.warned_cursor = true;
-            tracing::warn!(
-                "cursor bitmap on an RGB-direct session — EFC cannot composite it; the cursor \
-                 will be missing from the stream (unset PUNKTFUNK_VULKAN_RGB_DIRECT for \
-                 metadata-cursor captures)"
-            );
-        }
+        // EFC cannot composite a cursor bitmap — and never has to: `open` refuses the RGB-direct
+        // shape for a cursor-blend session (the pin override above), so no cursor bitmap ever
+        // reaches this arm. Gamescope, the flagship, embeds its pointer in the produced pixels.
         let padded = self.rgb.as_ref().is_some_and(|r| r.padded);
         // Only the padded Dmabuf arm below records timestamps (via `record_pad_blit`); the
         // CPU-upload arm records its own command buffer and writes none. Default to "not written"
@@ -4486,44 +4478,50 @@ mod tests {
         }
     }
 
-    /// A CPU-capture source that CHANGES SIZE mid-session must not copy past the cached staging
-    /// image. `ensure_cpu_rgb` keys that image on (format, width, height); when it was keyed on
-    /// format alone the image kept the FIRST frame's size while `cmd_copy_buffer_to_image` used the
-    /// current frame's extent, so a same-format size increase wrote out of bounds — and `submit`
-    /// still returned `Ok`, so nothing upstream noticed.
-    ///
-    /// The out-of-bounds copy is only *observable* through the Vulkan validation layers, so run this
-    /// as: `VK_LOADER_LAYERS_ENABLE='*validation*' cargo test ... -- --ignored`. Confirmed on RADV
-    /// PHOENIX 2026-07-25: 8 x VUID-vkCmdCopyBufferToImage-imageSubresource-07971 before the fix
-    /// ("extent.width (512) exceeds imageSubresource width extent (128)"), zero after.
+    /// The CSC arm REFUSES a source that doesn't match the session mode (the e3354b6d guard —
+    /// the check every sibling arm always had; a clamped-texelFetch mismatch used to stream a
+    /// silently cropped/edge-padded picture). This test previously DROVE mismatched sizes through
+    /// the lenient arm to exercise the per-slot `cpu_img` staging across a size change (the
+    /// format-only-keyed cache wrote out of bounds while `submit` returned `Ok`); the guard makes
+    /// that scenario unrepresentable through `submit`, structurally retiring the hazard — the
+    /// size-keyed staging from that fix stays as belt-and-braces. What's left to pin:
+    /// refusal in BOTH directions, and that a refused submit does not WEDGE the session — the
+    /// bail happens after step 1's frame-type bookkeeping, so "the next well-sized frame still
+    /// encodes" is a real property, not a formality (the host routes the error to its
+    /// encoder-rebuild path and the session must be able to continue if that path retries).
     #[test]
     #[ignore = "needs a real VK_KHR_video_encode_h265 device; meaningful only under validation layers"]
-    fn vulkan_cpu_img_survives_a_source_size_change() {
-        // CSC mode (rgb=false) — that is the arm where the image is sized to the SOURCE frame.
+    fn vulkan_csc_refuses_a_mismatched_source() {
+        // CSC mode (rgb=false) — the arm the guard covers.
         let mut enc = VulkanVideoEncoder::open_opts(Codec::H265, 512, 512, 60, 10_000_000, false)
             .expect("open");
-        // `cpu_img` is cached PER RING SLOT, so the small frames must first populate every slot;
-        // only when the ring wraps does a slot holding a 128x128 image get a 512x512 copy.
-        eprintln!("phase 1: 8x 128x128 — populates every ring slot with a 128x128 cpu_img");
-        for i in 0..8u64 {
+        enc.submit_indexed(&cpu_frame(512, 512, 0, [40, 40, 200, 255]), 0)
+            .expect("well-sized baseline");
+        while enc.poll().expect("poll").is_some() {}
+        // Smaller AND larger both refuse — the guard is equality on the MODE (render size), not
+        // a ceiling; the render-vs-CODED padding tolerance lives in the direct arms, untouched.
+        let e = enc
+            .submit_indexed(&cpu_frame(128, 128, 16_666_667, [200, 40, 40, 255]), 1)
+            .expect_err("smaller source must refuse");
+        assert!(e.to_string().contains("mismatched"), "{e:#}");
+        let e = enc
+            .submit_indexed(&cpu_frame(640, 640, 33_333_334, [200, 40, 40, 255]), 2)
+            .expect_err("larger source must refuse");
+        assert!(e.to_string().contains("mismatched"), "{e:#}");
+        // The refusals must not wedge the session: a well-sized frame still encodes and an AU
+        // still comes out the other end.
+        let mut got_au = false;
+        for i in 3..11u64 {
             enc.submit_indexed(
-                &cpu_frame(128, 128, i * 16_666_667, [40, 40, 200, 255]),
+                &cpu_frame(512, 512, i * 16_666_667, [40, 200, 40, 255]),
                 i as u32,
             )
-            .expect("submit small");
-            while enc.poll().expect("poll").is_some() {}
+            .expect("well-sized after refusal");
+            while let Ok(Some(_)) = enc.poll() {
+                got_au = true;
+            }
         }
-        eprintln!("phase 2: 8x 512x512 — SAME format, so each slot REUSES its 128x128 image");
-        for i in 8..16u64 {
-            let r = enc.submit_indexed(
-                &cpu_frame(512, 512, i * 16_666_667, [200, 40, 40, 255]),
-                i as u32,
-            );
-            r.expect("submit after the source grew");
-            while matches!(enc.poll(), Ok(Some(_))) {}
-        }
-        let _ = enc.flush();
-        while matches!(enc.poll(), Ok(Some(_))) {}
+        assert!(got_au, "no AU after the refused submits — session wedged");
         eprintln!("done — under validation layers this run must report ZERO VUID errors");
     }
 

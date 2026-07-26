@@ -515,15 +515,25 @@ pub mod synthetic_nv12;
 /// `want_hdr` offers the GNOME 50+ HDR formats (10-bit PQ/BT.2020 dmabufs) instead of the SDR
 /// set — pass it only when the mirrored monitor is actually in HDR mode (the host probes
 /// DisplayConfig) or the negotiation runs into its 10 s timeout and latches the SDR downgrade.
-/// The [`ZeroCopyPolicy`] carries the pre-resolved encode-backend facts (the one-way edge).
+/// `want_metadata_cursor` asks for cursor-as-metadata (`SPA_META_Cursor`) — pass it only when
+/// the session's encode path composites `CapturedFrame::cursor` (the host consults
+/// `pf-encode`'s `cursor_blend_capable`); otherwise the portal EMBEDS the pointer so it is
+/// never silently lost. The [`ZeroCopyPolicy`] carries the pre-resolved encode-backend facts
+/// (the one-way edge).
 #[cfg(target_os = "linux")]
 pub fn open_portal_monitor(
     anchored: bool,
     want_hdr: bool,
+    want_metadata_cursor: bool,
     policy: ZeroCopyPolicy,
 ) -> Result<Box<dyn Capturer>> {
-    linux::PortalCapturer::open(anchored, want_hdr && !hdr_capture_failed(), policy)
-        .map(|c| Box::new(c) as Box<dyn Capturer>)
+    linux::PortalCapturer::open(
+        anchored,
+        want_hdr && !hdr_capture_failed(),
+        want_metadata_cursor,
+        policy,
+    )
+    .map(|c| Box::new(c) as Box<dyn Capturer>)
 }
 
 /// Open the Linux portal capturer bound to an already-created virtual output's PipeWire node. The

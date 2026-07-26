@@ -66,8 +66,14 @@ fn zero_copy_policy(
 /// Open a live capturer for a client-sized monitor via the xdg ScreenCast portal. `want_hdr`
 /// offers the GNOME 50+ 10-bit PQ/BT.2020 formats (pass it only when the session negotiated HDR
 /// AND the mirrored monitor is in HDR mode — see [`pf_capture::gnome_hdr_monitor_active`]).
+/// `want_metadata_cursor` asks for cursor-as-metadata — pass it only when the session's encode
+/// backend composites `CapturedFrame::cursor` (`encode::cursor_blend_capable`); otherwise the
+/// portal embeds the pointer, so no backend × cursor-mode combination streams cursorless.
 #[cfg(target_os = "linux")]
-pub fn open_portal_monitor(want_hdr: bool) -> Result<Box<dyn Capturer>> {
+pub fn open_portal_monitor(
+    want_hdr: bool,
+    want_metadata_cursor: bool,
+) -> Result<Box<dyn Capturer>> {
     // On RemoteDesktop-capable desktops (KWin/GNOME) anchor ScreenCast to a RemoteDesktop
     // session so it inherits that grant headlessly; wlroots/Sway has no RemoteDesktop portal,
     // so use a plain ScreenCast session there.
@@ -76,11 +82,19 @@ pub fn open_portal_monitor(want_hdr: bool) -> Result<Box<dyn Capturer>> {
     // passthrough is virtual-output-only; the global encoder-pref lever still applies inside.
     // Native NV12 stays off too: the mirror path doesn't resolve the codec here, and the desktop
     // compositors it mirrors (GNOME/KWin) don't produce NV12 anyway.
-    pf_capture::open_portal_monitor(anchored, want_hdr, zero_copy_policy(false, false))
+    pf_capture::open_portal_monitor(
+        anchored,
+        want_hdr,
+        want_metadata_cursor,
+        zero_copy_policy(false, false),
+    )
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn open_portal_monitor(_want_hdr: bool) -> Result<Box<dyn Capturer>> {
+pub fn open_portal_monitor(
+    _want_hdr: bool,
+    _want_metadata_cursor: bool,
+) -> Result<Box<dyn Capturer>> {
     anyhow::bail!("portal capture requires Linux (xdg-desktop-portal + PipeWire)")
 }
 

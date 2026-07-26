@@ -104,9 +104,13 @@ pub struct SessionPlan {
     /// AUs stay shard-aligned across mode/bitrate/stall rebuilds. `None` for the H.26x codecs.
     pub wire_chunk: Option<usize>,
     /// The session may hand the encoder cursor bitmaps to composite (cursor-as-metadata
-    /// captures — every non-gamescope compositor; gamescope embeds the pointer itself).
-    /// Encoders whose fast path cannot blend (the Vulkan EFC RGB-direct source) stay on their
-    /// blending path when this is set, so the pointer never silently vanishes from the stream.
+    /// captures). Set via [`cursor_blend_for`] — the single platform rule — so it is `true` only
+    /// where the ENCODER is the compositing stage (Linux cursor-forward and gamescope sessions);
+    /// Windows is always `false` (the IDD capturer composites the pointer itself). Encoders
+    /// whose fast path cannot blend (the Vulkan EFC RGB-direct source, native NV12) stay off
+    /// those shapes when this is set — see [`Self::output_format`] and
+    /// `encode::cursor_blend_capable`, the pre-open mirror that gates the cursor channel — so
+    /// the pointer never silently vanishes from the stream.
     pub cursor_blend: bool,
     /// The session negotiated the cursor-forward channel (M2/M2c): the client draws the pointer
     /// locally, so `cursor_blend` is off AND (on Windows) the capturer sets the driver's
@@ -198,13 +202,15 @@ impl SessionPlan {
             // Producer-native NV12 (gamescope) is consumable only by the Linux Vulkan Video
             // backend — resolved HERE from the plan's codec so the capturer never reaches back
             // into encode (the same one-way edge as `gpu` above). BUT the native-NV12 encode path
-            // has no CSC stage to fold the cursor into (it assumes gamescope embeds its pointer,
-            // which it does NOT into the PipeWire node) — so a gamescope-cursor session (Phase C)
-            // must capture RGB instead, routing to the compute-CSC / VkSlotBlend blend that draws
-            // `frame.cursor`. Costs the RGB→NV12 CSC we'd otherwise skip; the native-NV12 cursor
-            // blend is the perf-preserving follow-up.
+            // has no CSC stage to fold the cursor into — so ANY cursor-compositing session
+            // (gamescope Phase C, whose XFixes pointer is absent from the PipeWire node, AND a
+            // cursor-forward session, whose capture-mouse flip needs the host composite on
+            // demand) must capture RGB instead, routing to the compute-CSC / VkSlotBlend blend
+            // that draws `frame.cursor`. Costs the RGB→NV12 CSC we'd otherwise skip; the
+            // native-NV12 cursor blend is the perf-preserving follow-up. (`cursor_blend`
+            // subsumes `gamescope_cursor` — see [`cursor_blend_for`].)
             #[cfg(target_os = "linux")]
-            nv12_native: crate::encode::linux_native_nv12_ok(self.codec) && !self.gamescope_cursor,
+            nv12_native: crate::encode::linux_native_nv12_ok(self.codec) && !self.cursor_blend,
             #[cfg(not(target_os = "linux"))]
             nv12_native: false,
         }
@@ -215,6 +221,26 @@ impl SessionPlan {
 /// IDD-push in Session 0). The Windows SYSTEM-host + user-session WGC relay was removed with DDA/WGC.
 pub(crate) fn resolve_topology() -> SessionTopology {
     SessionTopology::SingleProcess
+}
+
+/// THE rule for [`SessionPlan::cursor_blend`], shared by every resolve caller (initial plan and
+/// the mid-stream compositor re-gate) so they can't drift:
+/// * **Linux**: the encoder is the compositing stage — blend for a cursor-forward session (the
+///   capture-mouse flip needs the host composite on demand) and for gamescope (its capture
+///   carries no pointer at all; the XFixes-sourced cursor must be drawn into the video).
+/// * **Windows**: never — the IDD capturer composites the pointer itself (`cursor_blend.rs` /
+///   DWM), and no Windows encode backend reads `frame.cursor`. Asking the encoder anyway made
+///   `open_video`'s blends-cursor backstop fire spuriously on every cursor-channel session.
+pub(crate) fn cursor_blend_for(cursor_forward: bool, gamescope: bool) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        let _ = (cursor_forward, gamescope);
+        false
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        cursor_forward || gamescope
+    }
 }
 
 #[cfg(target_os = "windows")]

@@ -94,21 +94,150 @@ type LpKey = (String, &'static str, bool);
 /// The [`LP_MODE`] key for this device/codec/depth. `render_node()` is re-read rather than cached
 /// so a GPU-preference change is picked up on the next open.
 fn lp_key(codec: Codec, ten_bit: bool) -> LpKey {
-    (
-        render_node().to_string_lossy().into_owned(),
-        codec.label(),
-        ten_bit,
-    )
+    lp_key_for(&render_node().to_string_lossy(), codec, ten_bit)
+}
+
+/// [`lp_key`] with the render node explicit (device-free for the unit tests). Every part of the
+/// key is load-bearing — see [`LP_MODE`] for the two field-motivated bugs (node: cross-GPU
+/// session-killer; depth: HDR under-advertisement).
+fn lp_key_for(node: &str, codec: Codec, ten_bit: bool) -> LpKey {
+    (node.to_owned(), codec.label(), ten_bit)
 }
 
 /// `PUNKTFUNK_VAAPI_LOW_POWER` pins the entrypoint mode (`1` = low-power only, `0` = full-feature
 /// only); unset → try full-feature first, fall back to low-power.
 fn low_power_override() -> Option<bool> {
-    match std::env::var("PUNKTFUNK_VAAPI_LOW_POWER").ok()?.trim() {
+    parse_low_power(&std::env::var("PUNKTFUNK_VAAPI_LOW_POWER").ok()?)
+}
+
+/// [`low_power_override`]'s value grammar (device-free for the unit tests). Anything outside the
+/// two literal sets means "no pin" — the `[full-feature, low-power]` ladder runs.
+fn parse_low_power(raw: &str) -> Option<bool> {
+    match raw.trim() {
         "1" | "true" | "yes" | "on" => Some(true),
         "0" | "false" | "no" | "off" => Some(false),
         _ => None,
     }
+}
+
+/// The entrypoint modes to attempt, in order (`false` = full-feature `EncSlice`, `true` =
+/// low-power VDEnc): an operator pin tries exactly that one; a cached resolution ([`LP_MODE`]:
+/// 1 = full-feature, 2 = low-power) skips the known-failing attempt; anything else runs the full
+/// ladder — full-feature first so AMD's first-try open stays byte-for-byte unchanged. Never
+/// empty: [`open_vaapi_encoder`] relies on at least one attempt running.
+fn entrypoint_ladder(pin: Option<bool>, cached: u8) -> &'static [bool] {
+    match pin {
+        Some(true) => &[true],
+        Some(false) => &[false],
+        None => match cached {
+            1 => &[false],
+            2 => &[true],
+            _ => &[false, true],
+        },
+    }
+}
+
+/// The [`LP_MODE`] value a successful open latches (1 = full-feature, 2 = low-power). Paired with
+/// [`entrypoint_ladder`], which maps it back to the single-mode retry list.
+fn latched_mode(low_power: bool) -> u8 {
+    if low_power {
+        2
+    } else {
+        1
+    }
+}
+
+/// The VUI colour metadata the encoder signals for the session's depth.
+struct Vui {
+    colorspace: ffi::AVColorSpace,
+    range: ffi::AVColorRange,
+    primaries: ffi::AVColorPrimaries,
+    trc: ffi::AVColorTransferCharacteristic,
+}
+
+/// 10-bit HDR: BT.2020 primaries + SMPTE-2084 (PQ) transfer, limited range — matches the P010 the
+/// CSC produces (swscale BT.2020 on the CPU path; `scale_vaapi` pinned to bt2020 on the zero-copy
+/// path); the client decoder auto-detects PQ from the VUI. SDR: we hand the encoder BT.709
+/// *limited* NV12 (swscale CSC on the CPU path; `scale_vaapi` pinned to
+/// `out_color_matrix=bt709:out_range=limited` on the zero-copy path, with the full-range RGB input
+/// tagged), so signal that VUI — else the client decoder washes the picture out.
+fn vui_for(ten_bit: bool) -> Vui {
+    if ten_bit {
+        Vui {
+            colorspace: ffi::AVColorSpace::AVCOL_SPC_BT2020_NCL,
+            range: ffi::AVColorRange::AVCOL_RANGE_MPEG,
+            primaries: ffi::AVColorPrimaries::AVCOL_PRI_BT2020,
+            trc: ffi::AVColorTransferCharacteristic::AVCOL_TRC_SMPTE2084,
+        }
+    } else {
+        Vui {
+            colorspace: ffi::AVColorSpace::AVCOL_SPC_BT709,
+            range: ffi::AVColorRange::AVCOL_RANGE_MPEG,
+            primaries: ffi::AVColorPrimaries::AVCOL_PRI_BT709,
+            trc: ffi::AVColorTransferCharacteristic::AVCOL_TRC_BT709,
+        }
+    }
+}
+
+/// The explicit `profile` option for this codec/depth, or `None` to let the encoder derive it.
+/// HEVC Main10 is pinned explicitly so the depth is never silently dropped (`hevc_vaapi` would
+/// derive it from the P010 surfaces, but a derivation can regress quietly); 10-bit AV1 is
+/// input-driven — no profile knob — and every 8-bit open keeps the encoder default.
+fn explicit_profile(codec: Codec, ten_bit: bool) -> Option<&'static str> {
+    (ten_bit && codec == Codec::H265).then_some("main10")
+}
+
+/// `PUNKTFUNK_VAAPI_ASYNC_DEPTH` grammar: 1..=8 accepted verbatim; unset, junk, and out-of-range
+/// values all resolve to depth 1 — the lowest-latency structure (see the `async_depth` note at the
+/// call site for why 1 is the default and what depth ≥ 2 trades).
+fn async_depth(raw: Option<&str>) -> u32 {
+    raw.and_then(|s| s.parse::<u32>().ok())
+        .filter(|d| (1..=8).contains(d))
+        .unwrap_or(1)
+}
+
+/// The `scale_vaapi` filter args for the session's depth. The VPP's output colour is pinned to
+/// exactly what the encoder's VUI signals ([`vui_for`]) — without the explicit options the
+/// conversion matrix is whatever the driver defaults to for an unspecified output (Mesa: BT.601),
+/// a hue shift against the signaled VUI. (The PQ transfer is per-channel and rides through the
+/// matrix untouched.)
+fn scale_vaapi_args(ten_bit: bool) -> &'static CStr {
+    if ten_bit {
+        c"format=p010:out_color_matrix=bt2020:out_range=limited"
+    } else {
+        c"format=nv12:out_color_matrix=bt709:out_range=limited"
+    }
+}
+
+/// What a (captured format, negotiated bit depth) pair resolves to at open. 10-bit rides on the
+/// captured PIXELS, not the negotiated depth — see [`crate::ten_bit_input`] for the failure the
+/// reverse shape produces.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DepthResolution {
+    /// PQ-graded 10-bit frames on a non-10-bit session: refuse the open, so PQ content is never
+    /// mislabeled BT.709.
+    RefuseMislabeledPq,
+    /// 10-bit negotiated but the capture stayed SDR: honestly encode 8-bit (with a warning).
+    SdrDowngrade,
+    /// Format and negotiated depth agree.
+    Agreed,
+}
+
+/// See [`DepthResolution`].
+fn resolve_depth(format: PixelFormat, bit_depth: u8) -> DepthResolution {
+    if format.is_hdr_rgb10() && bit_depth != 10 {
+        DepthResolution::RefuseMislabeledPq
+    } else if bit_depth == 10 && !format.is_hdr_rgb10() {
+        DepthResolution::SdrDowngrade
+    } else {
+        DepthResolution::Agreed
+    }
+}
+
+/// Whether a codec is even eligible for the 10-bit probe: PyroWave answers 10-bit support on its
+/// own path (no VAAPI involved), and a codec without a 10-bit profile can never pass.
+fn ten_bit_probe_eligible(codec: Codec) -> bool {
+    codec.supports_10bit() && codec != Codec::PyroWave
 }
 
 /// Open the VAAPI encoder, resolving the entrypoint mode: try the full-feature entrypoint first
@@ -135,15 +264,7 @@ unsafe fn open_vaapi_encoder(
         .lock()
         .map(|m| m.get(&key).copied().unwrap_or(0))
         .unwrap_or(0);
-    let modes: &[bool] = match low_power_override() {
-        Some(true) => &[true],
-        Some(false) => &[false],
-        None => match cached {
-            1 => &[false],
-            2 => &[true],
-            _ => &[false, true],
-        },
-    };
+    let modes: &[bool] = entrypoint_ladder(low_power_override(), cached);
     let mut first_err = None;
     for &lp in modes {
         match open_vaapi_encoder_mode(
@@ -159,7 +280,7 @@ unsafe fn open_vaapi_encoder(
         ) {
             Ok(enc) => {
                 if let Ok(mut m) = LP_MODE.get_or_init(|| Mutex::new(HashMap::new())).lock() {
-                    m.insert(key.clone(), if lp { 2 } else { 1 });
+                    m.insert(key.clone(), latched_mode(lp));
                 }
                 if lp {
                     tracing::info!(
@@ -216,32 +337,18 @@ unsafe fn open_vaapi_encoder_mode(
     apply_low_latency_rc(&mut video, fps, bitrate_bps);
     let raw = video.as_mut_ptr();
     (*raw).gop_size = i32::MAX; // no periodic IDR (forced-IDR via pict_type=I on RFI)
-    if ten_bit {
-        // HDR10: BT.2020 primaries + SMPTE-2084 (PQ) transfer, limited range — matches the P010
-        // the CSC produces (swscale BT.2020 on the CPU path; scale_vaapi pinned to bt2020 on the
-        // zero-copy path). The client decoder auto-detects PQ from the VUI.
-        (*raw).colorspace = ffi::AVColorSpace::AVCOL_SPC_BT2020_NCL;
-        (*raw).color_range = ffi::AVColorRange::AVCOL_RANGE_MPEG;
-        (*raw).color_primaries = ffi::AVColorPrimaries::AVCOL_PRI_BT2020;
-        (*raw).color_trc = ffi::AVColorTransferCharacteristic::AVCOL_TRC_SMPTE2084;
-    } else {
-        // We hand the encoder BT.709 *limited* NV12 (swscale CSC on the CPU path; scale_vaapi pinned
-        // to `out_color_matrix=bt709:out_range=limited` on the zero-copy path, with the full-range
-        // RGB input tagged), so signal that VUI — else the client decoder washes the picture out.
-        (*raw).colorspace = ffi::AVColorSpace::AVCOL_SPC_BT709;
-        (*raw).color_range = ffi::AVColorRange::AVCOL_RANGE_MPEG;
-        (*raw).color_primaries = ffi::AVColorPrimaries::AVCOL_PRI_BT709;
-        (*raw).color_trc = ffi::AVColorTransferCharacteristic::AVCOL_TRC_BT709;
-    }
+    let vui = vui_for(ten_bit);
+    (*raw).colorspace = vui.colorspace;
+    (*raw).color_range = vui.range;
+    (*raw).color_primaries = vui.primaries;
+    (*raw).color_trc = vui.trc;
     (*raw).pix_fmt = ffi::AVPixelFormat::AV_PIX_FMT_VAAPI;
     (*raw).hw_device_ctx = ffi::av_buffer_ref(device_ref);
     (*raw).hw_frames_ctx = ffi::av_buffer_ref(frames_ref);
 
     let mut opts = Dictionary::new();
-    if ten_bit && codec == Codec::H265 {
-        // HEVC Main10. `hevc_vaapi` derives it from the P010 surfaces, but pin it explicitly so
-        // the depth is never silently dropped. (10-bit AV1 is input-driven — no profile knob.)
-        opts.set("profile", "main10");
+    if let Some(profile) = explicit_profile(codec, ten_bit) {
+        opts.set("profile", profile);
     }
     // async_depth=1: `send_frame` blocks until THIS frame's ASIC encode completes — the lowest
     // latency structure libavcodec's vaapi_encode offers. Measured on the 780M at 1440p60: depth 1
@@ -251,11 +358,7 @@ unsafe fn open_vaapi_encoder_mode(
     // where depth 2 restores throughput at that one-frame cost. NOTE: the per-frame block tracks
     // GPU CLOCKS — a paced 60 fps trickle lets the VCN downclock (~8 ms/frame vs ~4.4 ms hot);
     // see `gpuclocks` for the session clock pin that removes the ramp tax.
-    let depth = std::env::var("PUNKTFUNK_VAAPI_ASYNC_DEPTH")
-        .ok()
-        .and_then(|s| s.parse::<u32>().ok())
-        .filter(|d| (1..=8).contains(d))
-        .unwrap_or(1);
+    let depth = async_depth(std::env::var("PUNKTFUNK_VAAPI_ASYNC_DEPTH").ok().as_deref());
     opts.set("async_depth", &depth.to_string());
     if low_power {
         opts.set("low_power", "1"); // VDEnc — the only encode entrypoint on modern Intel
@@ -309,7 +412,7 @@ pub fn probe_can_encode(codec: Codec) -> bool {
 /// ([`crate::can_encode_10bit`]), so a non-Main10 GPU resolves every session to 8-bit SDR before
 /// the Welcome (honest downgrade).
 pub fn probe_can_encode_10bit(codec: Codec) -> bool {
-    if !codec.supports_10bit() || codec == Codec::PyroWave {
+    if !ten_bit_probe_eligible(codec) {
         return false;
     }
     if ffmpeg::init().is_err() {
@@ -834,24 +937,7 @@ impl DmabufInner {
             }
             init!(src, ptr::null(), "buffer");
             init!(hwmap, c"mode=read".as_ptr(), "hwmap");
-            // Pin the VPP's output colour to what the encoder's VUI signals (BT.709 limited SDR,
-            // or BT.2020 limited P010 for HDR — the PQ transfer is per-channel and rides through
-            // the matrix untouched). Without the explicit options the conversion matrix is
-            // whatever the driver defaults to for an unspecified output (Mesa: BT.601) — a hue
-            // shift against the signaled VUI.
-            if ten_bit {
-                init!(
-                    scale,
-                    c"format=p010:out_color_matrix=bt2020:out_range=limited".as_ptr(),
-                    "scale_vaapi"
-                );
-            } else {
-                init!(
-                    scale,
-                    c"format=nv12:out_color_matrix=bt709:out_range=limited".as_ptr(),
-                    "scale_vaapi"
-                );
-            }
+            init!(scale, scale_vaapi_args(ten_bit).as_ptr(), "scale_vaapi");
             init!(sink, ptr::null(), "buffersink");
 
             let link = |a: *mut ffi::AVFilterContext, b: *mut ffi::AVFilterContext| -> c_int {
@@ -1143,21 +1229,18 @@ impl VaapiEncoder {
         chroma: super::ChromaFormat,
     ) -> Result<Self> {
         // 10-bit rides on the captured format: an HDR capture (X2RGB10/X2BGR10) opens the P010 /
-        // Main10 / PQ-VUI variant of whichever inner path the first frame selects. A 10-bit
-        // request whose capture stayed SDR honestly encodes 8-bit; the reverse (PQ frames on an
-        // 8-bit session) is refused so PQ content is never mislabeled BT.709.
-        if format.is_hdr_rgb10() && bit_depth != 10 {
-            bail!(
+        // Main10 / PQ-VUI variant of whichever inner path the first frame selects.
+        match resolve_depth(format, bit_depth) {
+            DepthResolution::RefuseMislabeledPq => bail!(
                 "captured 10-bit HDR frames ({format:?}) on an {bit_depth}-bit VAAPI session — \
                  refusing to mislabel PQ content"
-            );
-        }
-        if bit_depth == 10 && !format.is_hdr_rgb10() {
-            tracing::warn!(
+            ),
+            DepthResolution::SdrDowngrade => tracing::warn!(
                 bit_depth,
                 ?format,
                 "10-bit requested but the capture stayed SDR — encoding 8-bit"
-            );
+            ),
+            DepthResolution::Agreed => {}
         }
         // VAAPI 4:4:4 is deferred (see `probe_can_encode_444`): no validated AMD/Intel hardware in the
         // lab exposes a HEVC 4:4:4 encode entrypoint, and the probe returns false so the host never
@@ -1305,5 +1388,263 @@ impl Encoder for VaapiEncoder {
             None => {}
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The operator pin tries exactly one mode; a cached resolution ([`LP_MODE`]) tries only the
+    /// mode that worked; anything else runs the full ladder, full-feature FIRST — AMD's first-try
+    /// open must stay byte-for-byte unchanged.
+    #[test]
+    fn entrypoint_ladder_orders_and_pins() {
+        assert_eq!(entrypoint_ladder(None, 0), &[false, true]);
+        assert_eq!(entrypoint_ladder(None, 1), &[false]);
+        assert_eq!(entrypoint_ladder(None, 2), &[true]);
+        // A corrupt/unknown cache value degrades to the full ladder, never to a wrong pin.
+        assert_eq!(entrypoint_ladder(None, 77), &[false, true]);
+        // The pin beats the cache in BOTH directions — what makes PUNKTFUNK_VAAPI_LOW_POWER a
+        // real escape hatch from a stale latch.
+        for cached in [0u8, 1, 2, 77] {
+            assert_eq!(entrypoint_ladder(Some(true), cached), &[true]);
+            assert_eq!(entrypoint_ladder(Some(false), cached), &[false]);
+        }
+    }
+
+    /// The latch round-trip: what a successful open stores makes the NEXT open attempt exactly
+    /// the mode that worked (the "skip the known-failing attempt and its libav error spew"
+    /// contract — and, per [`LP_MODE`], the shape that must never cross devices or depths).
+    #[test]
+    fn latch_round_trip_pins_the_resolved_mode() {
+        for lp in [false, true] {
+            assert_eq!(entrypoint_ladder(None, latched_mode(lp)), &[lp]);
+        }
+    }
+
+    /// `PUNKTFUNK_VAAPI_LOW_POWER` grammar: the two lowercase literal sets pin; anything else —
+    /// including uppercase — means "no pin" (the ladder runs). Case-sensitivity is pinned as
+    /// shipped behavior.
+    #[test]
+    fn low_power_grammar() {
+        for s in ["1", "true", "yes", "on", " on ", "yes\n"] {
+            assert_eq!(parse_low_power(s), Some(true), "{s:?}");
+        }
+        for s in ["0", "false", "no", "off", " off "] {
+            assert_eq!(parse_low_power(s), Some(false), "{s:?}");
+        }
+        for s in ["", "2", "TRUE", "On", "enabled", "low_power"] {
+            assert_eq!(parse_low_power(s), None, "{s:?}");
+        }
+    }
+
+    /// Every part of the LP_MODE key is load-bearing (see the [`LP_MODE`] field comments): the
+    /// node (a GPU-preference switch must re-resolve — the old codec-only key was a
+    /// session-killer), the codec, and the depth (an 8-bit answer must never pin the 10-bit open —
+    /// the HDR under-advertisement).
+    #[test]
+    fn lp_key_separates_node_codec_and_depth() {
+        let base = lp_key_for("/dev/dri/renderD128", Codec::H265, false);
+        assert_ne!(base, lp_key_for("/dev/dri/renderD129", Codec::H265, false));
+        assert_ne!(base, lp_key_for("/dev/dri/renderD128", Codec::H264, false));
+        assert_ne!(base, lp_key_for("/dev/dri/renderD128", Codec::H265, true));
+    }
+
+    /// `PUNKTFUNK_VAAPI_ASYNC_DEPTH` grammar: 1..=8 verbatim; unset, junk, zero, and past-the-cap
+    /// all resolve to the lowest-latency depth 1.
+    #[test]
+    fn async_depth_grammar() {
+        assert_eq!(async_depth(None), 1);
+        assert_eq!(async_depth(Some("1")), 1);
+        assert_eq!(async_depth(Some("2")), 2);
+        assert_eq!(async_depth(Some("8")), 8);
+        assert_eq!(async_depth(Some("0")), 1);
+        assert_eq!(async_depth(Some("9")), 1);
+        assert_eq!(async_depth(Some("-1")), 1);
+        assert_eq!(async_depth(Some("fast")), 1);
+    }
+
+    /// The swscale source map: packed RGB/BGR and the GNOME 50+ HDR 2:10:10:10 layouts convert;
+    /// planar/video formats are refused (the CPU path is a packed-RGB fallback, not a general
+    /// converter).
+    #[test]
+    fn sws_src_accepts_packed_rgb_only() {
+        assert_eq!(vaapi_sws_src(PixelFormat::Bgrx).unwrap(), Pixel::BGRZ);
+        assert_eq!(vaapi_sws_src(PixelFormat::Rgbx).unwrap(), Pixel::RGBZ);
+        assert_eq!(vaapi_sws_src(PixelFormat::Bgra).unwrap(), Pixel::BGRA);
+        assert_eq!(vaapi_sws_src(PixelFormat::Rgba).unwrap(), Pixel::RGBA);
+        assert_eq!(vaapi_sws_src(PixelFormat::Rgb).unwrap(), Pixel::RGB24);
+        assert_eq!(vaapi_sws_src(PixelFormat::Bgr).unwrap(), Pixel::BGR24);
+        assert_eq!(
+            vaapi_sws_src(PixelFormat::X2Rgb10).unwrap(),
+            Pixel::X2RGB10LE
+        );
+        assert_eq!(
+            vaapi_sws_src(PixelFormat::X2Bgr10).unwrap(),
+            Pixel::X2BGR10LE
+        );
+        for f in [
+            PixelFormat::Nv12,
+            PixelFormat::P010,
+            PixelFormat::Rgb10a2,
+            PixelFormat::Yuv444,
+        ] {
+            assert!(vaapi_sws_src(f).is_err(), "{f:?} must be refused");
+        }
+    }
+
+    /// VUI ↔ CSC agreement: the signaled VUI and the zero-copy VPP's pinned output colour must
+    /// name the SAME matrix/range per depth — a mismatch is exactly the Mesa-BT.601 hue shift the
+    /// pin exists to prevent.
+    #[test]
+    fn vui_and_scale_args_agree_per_depth() {
+        let sdr = vui_for(false);
+        assert!(matches!(sdr.colorspace, ffi::AVColorSpace::AVCOL_SPC_BT709));
+        assert!(matches!(sdr.range, ffi::AVColorRange::AVCOL_RANGE_MPEG));
+        assert!(matches!(
+            sdr.primaries,
+            ffi::AVColorPrimaries::AVCOL_PRI_BT709
+        ));
+        assert!(matches!(
+            sdr.trc,
+            ffi::AVColorTransferCharacteristic::AVCOL_TRC_BT709
+        ));
+        let args = scale_vaapi_args(false).to_str().unwrap();
+        for needle in ["format=nv12", "out_color_matrix=bt709", "out_range=limited"] {
+            assert!(
+                args.contains(needle),
+                "SDR scale args miss {needle}: {args}"
+            );
+        }
+
+        let hdr = vui_for(true);
+        assert!(matches!(
+            hdr.colorspace,
+            ffi::AVColorSpace::AVCOL_SPC_BT2020_NCL
+        ));
+        assert!(matches!(hdr.range, ffi::AVColorRange::AVCOL_RANGE_MPEG));
+        assert!(matches!(
+            hdr.primaries,
+            ffi::AVColorPrimaries::AVCOL_PRI_BT2020
+        ));
+        assert!(matches!(
+            hdr.trc,
+            ffi::AVColorTransferCharacteristic::AVCOL_TRC_SMPTE2084
+        ));
+        let args = scale_vaapi_args(true).to_str().unwrap();
+        for needle in [
+            "format=p010",
+            "out_color_matrix=bt2020",
+            "out_range=limited",
+        ] {
+            assert!(
+                args.contains(needle),
+                "HDR scale args miss {needle}: {args}"
+            );
+        }
+    }
+
+    /// The honest-downgrade table at open: PQ pixels demand a 10-bit session (refused otherwise —
+    /// PQ content must never be mislabeled BT.709); a 10-bit session over SDR pixels downgrades
+    /// honestly to 8-bit; agreement passes both ways.
+    #[test]
+    fn depth_resolution_table() {
+        use DepthResolution::*;
+        assert_eq!(resolve_depth(PixelFormat::X2Rgb10, 8), RefuseMislabeledPq);
+        assert_eq!(resolve_depth(PixelFormat::X2Bgr10, 8), RefuseMislabeledPq);
+        assert_eq!(resolve_depth(PixelFormat::Bgrx, 10), SdrDowngrade);
+        assert_eq!(resolve_depth(PixelFormat::Bgrx, 8), Agreed);
+        assert_eq!(resolve_depth(PixelFormat::X2Rgb10, 10), Agreed);
+        assert_eq!(resolve_depth(PixelFormat::X2Bgr10, 10), Agreed);
+    }
+
+    /// Main10 is pinned explicitly for 10-bit HEVC ONLY: 10-bit AV1 is input-driven (no profile
+    /// knob), and every 8-bit open keeps the encoder's default profile.
+    #[test]
+    fn explicit_profile_is_hevc_main10_only() {
+        assert_eq!(explicit_profile(Codec::H265, true), Some("main10"));
+        assert_eq!(explicit_profile(Codec::H265, false), None);
+        assert_eq!(explicit_profile(Codec::Av1, true), None);
+        assert_eq!(explicit_profile(Codec::Av1, false), None);
+        assert_eq!(explicit_profile(Codec::H264, true), None);
+        assert_eq!(explicit_profile(Codec::H264, false), None);
+    }
+
+    /// The 10-bit probe gate: HEVC and AV1 are probe-eligible; H.264 (no 10-bit path here) and
+    /// PyroWave (answers 10-bit on its own path, no VAAPI involved) are refused before any device
+    /// is touched — this is what keeps the probe safe on GPU-less CI.
+    #[test]
+    fn ten_bit_probe_gate() {
+        assert!(ten_bit_probe_eligible(Codec::H265));
+        assert!(ten_bit_probe_eligible(Codec::Av1));
+        assert!(!ten_bit_probe_eligible(Codec::H264));
+        assert!(!ten_bit_probe_eligible(Codec::PyroWave));
+    }
+
+    /// Probe smoke on real silicon: H.264 VAAPI encode opens on every supported AMD/Intel GPU;
+    /// the narrower codecs are printed, not asserted (device-dependent). Build anywhere, run on a
+    /// VAAPI host:
+    ///   cargo test -p pf-encode --no-run
+    ///   <host> target/debug/deps/pf_encode-<hash> --ignored --nocapture vaapi_probe_smoke
+    #[test]
+    #[ignore = "needs a real VAAPI device (run on an AMD/Intel host, not the build box)"]
+    fn vaapi_probe_smoke() {
+        assert!(
+            probe_can_encode(Codec::H264),
+            "H.264 VAAPI encode should open on any supported AMD/Intel GPU"
+        );
+        for codec in [Codec::H265, Codec::Av1] {
+            eprintln!("probe_can_encode({codec:?}) = {}", probe_can_encode(codec));
+            eprintln!(
+                "probe_can_encode_10bit({codec:?}) = {}",
+                probe_can_encode_10bit(codec)
+            );
+        }
+    }
+
+    /// CPU-path encode round-trip on real silicon: open → BGRX frames → poll AUs → the first AU
+    /// is the IDR. Exercises the swscale CSC, the VA surface upload, and the entrypoint ladder
+    /// end-to-end (same recipe as [`vaapi_probe_smoke`]).
+    #[test]
+    #[ignore = "needs a real VAAPI device (run on an AMD/Intel host, not the build box)"]
+    fn vaapi_cpu_encode_smoke() {
+        let (w, h) = (256u32, 256u32);
+        let mut enc = VaapiEncoder::open(
+            Codec::H264,
+            PixelFormat::Bgrx,
+            w,
+            h,
+            30,
+            2_000_000,
+            8,
+            crate::ChromaFormat::Yuv420,
+        )
+        .expect("open");
+        let mut aus = Vec::new();
+        for i in 0..30u32 {
+            let mut buf = vec![0u8; (w * h * 4) as usize];
+            for px in buf.chunks_exact_mut(4) {
+                px.copy_from_slice(&[(i * 8) as u8, 0x40, 0xC0, 0xFF]);
+            }
+            let frame = CapturedFrame {
+                width: w,
+                height: h,
+                pts_ns: u64::from(i) * 33_333_333,
+                format: PixelFormat::Bgrx,
+                payload: FramePayload::Cpu(buf),
+                cursor: None,
+            };
+            enc.submit(&frame).expect("submit");
+            while let Some(au) = enc.poll().expect("poll") {
+                aus.push(au);
+            }
+        }
+        enc.flush().expect("flush");
+        while let Some(au) = enc.poll().expect("poll") {
+            aus.push(au);
+        }
+        assert!(!aus.is_empty(), "no AUs out of 30 submitted frames");
+        assert!(aus[0].keyframe, "the first AU must be the IDR");
     }
 }

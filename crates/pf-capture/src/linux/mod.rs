@@ -233,7 +233,15 @@ impl PortalCapturer {
     /// RemoteDesktop grant and never raises a separate ScreenCast dialog; `false` uses a plain
     /// ScreenCast session (wlroots, which has no RemoteDesktop portal). `want_hdr` offers the
     /// GNOME 50+ HDR formats (10-bit PQ/BT.2020, dmabuf-only) instead of the SDR set.
-    pub fn open(anchored: bool, want_hdr: bool, policy: ZeroCopyPolicy) -> Result<PortalCapturer> {
+    /// `want_metadata_cursor` picks the cursor mode — `true` asks for `SPA_META_Cursor` (this
+    /// session's encode path composites it), `false` asks the compositor to EMBED the pointer; see
+    /// `portal::choose_cursor_mode`.
+    pub fn open(
+        anchored: bool,
+        want_hdr: bool,
+        want_metadata_cursor: bool,
+        policy: ZeroCopyPolicy,
+    ) -> Result<PortalCapturer> {
         // Portal handshake (async) on its own thread; hands back the PW fd + node id.
         let (setup_tx, setup_rx) = std::sync::mpsc::channel::<Result<(OwnedFd, u32), String>>();
         // Teardown plumbing (see `PortalSession`): `quit_rx` parks the thread once the handshake is
@@ -244,9 +252,9 @@ impl PortalCapturer {
             .name("punktfunk-portal".into())
             .spawn(move || {
                 if anchored {
-                    portal_thread_remote_desktop(setup_tx, quit_rx)
+                    portal_thread_remote_desktop(setup_tx, quit_rx, want_metadata_cursor)
                 } else {
-                    portal_thread(setup_tx, quit_rx)
+                    portal_thread(setup_tx, quit_rx, want_metadata_cursor)
                 }
                 // After the runtime has been dropped inside the fn above, so a successful
                 // `recv_timeout` in `Drop` means the zbus connection is really gone. Covers the
