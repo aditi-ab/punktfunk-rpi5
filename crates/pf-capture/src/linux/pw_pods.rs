@@ -1,0 +1,366 @@
+//! The PipeWire `EnumFormat` / `Buffers` / `Meta` param pods the capture stream offers, and the
+//! `Pod` serializer they all end in.
+//!
+//! Split out of `linux/pipewire.rs` (sweep Phase 5.2) because it is the crate's WIRE surface: what
+//! these builders put in a pod is what the compositor intersects against, and a missing property is
+//! not a compile error but a link that silently stalls in `negotiating`. Nothing here touches the
+//! stream, the buffers or the frames — every function is a pure `facts -> Vec<u8>`.
+
+use anyhow::{Context, Result};
+use pipewire as pw;
+use pw::spa;
+use spa::param::video::VideoFormat;
+
+pub(super) fn serialize_pod(obj: pw::spa::pod::Object) -> Result<Vec<u8>> {
+    Ok(pw::spa::pod::serialize::PodSerializer::serialize(
+        std::io::Cursor::new(Vec::new()),
+        &pw::spa::pod::Value::Object(obj),
+    )
+    .context("serialize pod")?
+    .0
+    .into_inner())
+}
+
+/// Build a LINEAR/modifier DMA-BUF `EnumFormat` pod. Packed BGRx is the existing import path;
+/// NV12 is gamescope's producer-side RGB→YUV path (opt-in during bring-up).
+pub(super) fn build_dmabuf_format(
+    format: VideoFormat,
+    modifiers: &[u64],
+    preferred: Option<(u32, u32, u32)>,
+) -> Result<Vec<u8>> {
+    let (dw, dh, dhz) = preferred.unwrap_or((1920, 1080, 60));
+    use pw::spa::param::format::{FormatProperties, MediaSubtype, MediaType};
+    let mut obj = pw::spa::pod::object!(
+        pw::spa::utils::SpaTypes::ObjectParamFormat,
+        pw::spa::param::ParamType::EnumFormat,
+        pw::spa::pod::property!(FormatProperties::MediaType, Id, MediaType::Video),
+        pw::spa::pod::property!(FormatProperties::MediaSubtype, Id, MediaSubtype::Raw),
+        pw::spa::pod::property!(FormatProperties::VideoFormat, Id, format),
+        pw::spa::pod::property!(
+            FormatProperties::VideoSize,
+            Choice,
+            Range,
+            Rectangle,
+            pw::spa::utils::Rectangle {
+                width: dw,
+                height: dh
+            },
+            pw::spa::utils::Rectangle {
+                width: 1,
+                height: 1
+            },
+            pw::spa::utils::Rectangle {
+                width: 8192,
+                height: 8192
+            }
+        ),
+        pw::spa::pod::property!(
+            FormatProperties::VideoFramerate,
+            Choice,
+            Range,
+            Fraction,
+            pw::spa::utils::Fraction { num: dhz, denom: 1 },
+            pw::spa::utils::Fraction { num: 0, denom: 1 },
+            pw::spa::utils::Fraction { num: 240, denom: 1 }
+        ),
+    );
+    if format == VideoFormat::NV12 {
+        obj.properties.push(pw::spa::pod::Property {
+            key: pw::spa::sys::SPA_FORMAT_VIDEO_colorMatrix,
+            flags: pw::spa::pod::PropertyFlags::MANDATORY,
+            value: pw::spa::pod::Value::Id(pw::spa::utils::Id(
+                pw::spa::sys::SPA_VIDEO_COLOR_MATRIX_BT709,
+            )),
+        });
+        obj.properties.push(pw::spa::pod::Property {
+            key: pw::spa::sys::SPA_FORMAT_VIDEO_colorRange,
+            flags: pw::spa::pod::PropertyFlags::MANDATORY,
+            value: pw::spa::pod::Value::Id(pw::spa::utils::Id(
+                pw::spa::sys::SPA_VIDEO_COLOR_RANGE_16_235,
+            )),
+        });
+    }
+    obj.properties.push(pw::spa::pod::Property {
+        key: pw::spa::sys::SPA_FORMAT_VIDEO_modifier,
+        flags: pw::spa::pod::PropertyFlags::MANDATORY,
+        value: pw::spa::pod::Value::Choice(pw::spa::pod::ChoiceValue::Long(
+            pw::spa::utils::Choice(
+                pw::spa::utils::ChoiceFlags::empty(),
+                pw::spa::utils::ChoiceEnum::Enum {
+                    default: modifiers[0] as i64,
+                    alternatives: modifiers.iter().map(|&m| m as i64).collect(),
+                },
+            ),
+        )),
+    });
+    serialize_pod(obj)
+}
+
+/// Build one GNOME 50+ HDR format pod: `format` (xRGB_210LE / xBGR_210LE) as a LINEAR-only
+/// dmabuf with **MANDATORY** BT.2020 primaries + SMPTE ST.2084 (PQ) transfer-function props —
+/// the exact colorimetry Mutter's monitor stream advertises while the mirrored monitor is in
+/// HDR mode (its HDR pods carry the same props MANDATORY, so both sides must speak them for
+/// the intersection to exist; an SDR or pre-50 producer can never match this pod).
+///
+/// LINEAR-only because every 10-bit consumer we have reads the buffer without a de-tile pass:
+/// the CPU path mmaps it, and the VAAPI passthrough imports it into a VA surface. The tiled
+/// EGL de-tile blit renders into an 8-bit `GL_RGBA8` texture — it would silently crush the
+/// depth — so tiled modifiers are deliberately NOT advertised (a zero-copy 10-bit de-tile is
+/// the follow-up). SHM is excluded entirely: Mutter's SHM record path paints 8-bit ARGB32
+/// regardless of the negotiated format.
+/// `SPA_VIDEO_TRANSFER_SMPTE2084` (PQ) — spelled out rather than taken from `pw::spa::sys`
+/// because libspa only grew the constant with the BT2020_10/SMPTE2084/ARIB_STD_B67 block, and
+/// the distro builders (Ubuntu 24.04 noble for the .deb) ship headers predating it — bindgen
+/// then emits no such constant and the host fails to compile there, even though the code never
+/// runs on those systems (the HDR path needs GNOME 50+).
+///
+/// 14 is the enum's position in `spa/param/video/color.h` and is wire ABI, not a private
+/// detail: SPA mirrors GStreamer's `GstVideoTransferFunction`, where that block was added
+/// together, so the value is identical on every libspa that has the symbol at all. On one that
+/// doesn't, PipeWire simply fails to intersect this format offer and the session negotiates
+/// SDR — the same outcome as not offering HDR.
+const SPA_VIDEO_TRANSFER_SMPTE2084: u32 = 14;
+
+pub(super) fn build_hdr_dmabuf_format(
+    format: VideoFormat,
+    preferred: Option<(u32, u32, u32)>,
+) -> Result<Vec<u8>> {
+    let (dw, dh, dhz) = preferred.unwrap_or((1920, 1080, 60));
+    use pw::spa::param::format::{FormatProperties, MediaSubtype, MediaType};
+    let mut obj = pw::spa::pod::object!(
+        pw::spa::utils::SpaTypes::ObjectParamFormat,
+        pw::spa::param::ParamType::EnumFormat,
+        pw::spa::pod::property!(FormatProperties::MediaType, Id, MediaType::Video),
+        pw::spa::pod::property!(FormatProperties::MediaSubtype, Id, MediaSubtype::Raw),
+        pw::spa::pod::property!(FormatProperties::VideoFormat, Id, format),
+        pw::spa::pod::property!(
+            FormatProperties::VideoSize,
+            Choice,
+            Range,
+            Rectangle,
+            pw::spa::utils::Rectangle {
+                width: dw,
+                height: dh
+            },
+            pw::spa::utils::Rectangle {
+                width: 1,
+                height: 1
+            },
+            pw::spa::utils::Rectangle {
+                width: 8192,
+                height: 8192
+            }
+        ),
+        pw::spa::pod::property!(
+            FormatProperties::VideoFramerate,
+            Choice,
+            Range,
+            Fraction,
+            pw::spa::utils::Fraction { num: dhz, denom: 1 },
+            pw::spa::utils::Fraction { num: 0, denom: 1 },
+            pw::spa::utils::Fraction { num: 240, denom: 1 }
+        ),
+    );
+    obj.properties.push(pw::spa::pod::Property {
+        key: pw::spa::sys::SPA_FORMAT_VIDEO_modifier,
+        flags: pw::spa::pod::PropertyFlags::MANDATORY,
+        value: pw::spa::pod::Value::Long(0), // DRM_FORMAT_MOD_LINEAR
+    });
+    obj.properties.push(pw::spa::pod::Property {
+        key: pw::spa::sys::SPA_FORMAT_VIDEO_transferFunction,
+        flags: pw::spa::pod::PropertyFlags::MANDATORY,
+        value: pw::spa::pod::Value::Id(pw::spa::utils::Id(SPA_VIDEO_TRANSFER_SMPTE2084)),
+    });
+    obj.properties.push(pw::spa::pod::Property {
+        key: pw::spa::sys::SPA_FORMAT_VIDEO_colorPrimaries,
+        flags: pw::spa::pod::PropertyFlags::MANDATORY,
+        value: pw::spa::pod::Value::Id(pw::spa::utils::Id(
+            pw::spa::sys::SPA_VIDEO_COLOR_PRIMARIES_BT2020,
+        )),
+    });
+    serialize_pod(obj)
+}
+
+/// The default (shm/CPU-path) format offer: raw video in any encoder-mappable layout, any
+/// size, any framerate (0/1 = variable allowed — gamescope fixates exactly that).
+pub(super) fn build_default_format_obj(preferred: Option<(u32, u32, u32)>) -> pw::spa::pod::Object {
+    let (dw, dh, dhz) = preferred.unwrap_or((1920, 1080, 60));
+    pw::spa::pod::object!(
+        pw::spa::utils::SpaTypes::ObjectParamFormat,
+        pw::spa::param::ParamType::EnumFormat,
+        pw::spa::pod::property!(
+            pw::spa::param::format::FormatProperties::MediaType,
+            Id,
+            pw::spa::param::format::MediaType::Video
+        ),
+        pw::spa::pod::property!(
+            pw::spa::param::format::FormatProperties::MediaSubtype,
+            Id,
+            pw::spa::param::format::MediaSubtype::Raw
+        ),
+        // Offer the layouts the encoder can map to an NVENC input format. wlroots
+        // commonly fixates packed RGB (3 bpp); other compositors offer 4 bpp. Only
+        // these are requested, so negotiation fails loudly rather than handing us a
+        // format we'd misinterpret.
+        pw::spa::pod::property!(
+            pw::spa::param::format::FormatProperties::VideoFormat,
+            Choice,
+            Enum,
+            Id,
+            VideoFormat::RGB,
+            VideoFormat::RGB,
+            VideoFormat::BGR,
+            VideoFormat::RGBx,
+            VideoFormat::BGRx,
+            VideoFormat::RGBA,
+            VideoFormat::BGRA,
+        ),
+        pw::spa::pod::property!(
+            pw::spa::param::format::FormatProperties::VideoSize,
+            Choice,
+            Range,
+            Rectangle,
+            pw::spa::utils::Rectangle {
+                width: dw,
+                height: dh
+            },
+            pw::spa::utils::Rectangle {
+                width: 1,
+                height: 1
+            },
+            pw::spa::utils::Rectangle {
+                width: 8192,
+                height: 8192
+            }
+        ),
+        pw::spa::pod::property!(
+            pw::spa::param::format::FormatProperties::VideoFramerate,
+            Choice,
+            Range,
+            Fraction,
+            pw::spa::utils::Fraction { num: dhz, denom: 1 },
+            pw::spa::utils::Fraction { num: 0, denom: 1 },
+            pw::spa::utils::Fraction { num: 240, denom: 1 }
+        ),
+    )
+}
+
+/// Build a Buffers param for the CPU path accepting anything mappable: MemPtr, MemFd, and
+/// DmaBuf. The DmaBuf bit matters for producers like gamescope whose format intersection
+/// lands on their modifier-bearing (LINEAR) pod: they then offer *only* DmaBuf buffers, and
+/// without this bit the buffer-type intersection is empty and the link silently stalls in
+/// "negotiating". A LINEAR dmabuf is mmap-able by MAP_BUFFERS, so the CPU de-pad copy works.
+pub(super) fn build_mappable_buffers() -> Result<Vec<u8>> {
+    serialize_pod(pw::spa::pod::Object {
+        type_: pw::spa::utils::SpaTypes::ObjectParamBuffers.as_raw(),
+        id: pw::spa::param::ParamType::Buffers.as_raw(),
+        properties: vec![pw::spa::pod::Property {
+            key: pw::spa::sys::SPA_PARAM_BUFFERS_dataType,
+            flags: pw::spa::pod::PropertyFlags::empty(),
+            value: pw::spa::pod::Value::Int(
+                (1i32 << pw::spa::sys::SPA_DATA_MemPtr)
+                    | (1i32 << pw::spa::sys::SPA_DATA_MemFd)
+                    | (1i32 << pw::spa::sys::SPA_DATA_DmaBuf),
+            ),
+        }],
+    })
+}
+
+/// Build a Buffers param for a TRUE SHM path: MemPtr + MemFd only, NO DmaBuf. Forces the
+/// producer to download into mappable memory (Mutter's `glReadPixels`), which orders against its
+/// render — so the frame is complete and current by construction. This is the only race-free
+/// capture of Mutter's virtual monitor on NVIDIA: the compositor renders straight into the buffer
+/// pool, NVIDIA attaches no implicit dmabuf fence (verified: `EXPORT_SYNC_FILE` waited=false) and
+/// can't produce an explicit sync_fd, so any dmabuf read (zero-copy OR mmap) races the render and
+/// flashes the buffer's previous frame. Excluding DmaBuf is what makes the difference vs.
+/// `build_mappable_buffers` (which still let Mutter hand dmabufs).
+pub(super) fn build_shm_only_buffers() -> Result<Vec<u8>> {
+    serialize_pod(pw::spa::pod::Object {
+        type_: pw::spa::utils::SpaTypes::ObjectParamBuffers.as_raw(),
+        id: pw::spa::param::ParamType::Buffers.as_raw(),
+        properties: vec![pw::spa::pod::Property {
+            key: pw::spa::sys::SPA_PARAM_BUFFERS_dataType,
+            flags: pw::spa::pod::PropertyFlags::empty(),
+            value: pw::spa::pod::Value::Int(
+                (1i32 << pw::spa::sys::SPA_DATA_MemPtr) | (1i32 << pw::spa::sys::SPA_DATA_MemFd),
+            ),
+        }],
+    })
+}
+
+/// Build a Buffers param requesting dmabuf-only buffers.
+pub(super) fn build_dmabuf_buffers() -> Result<Vec<u8>> {
+    serialize_pod(pw::spa::pod::Object {
+        type_: pw::spa::utils::SpaTypes::ObjectParamBuffers.as_raw(),
+        id: pw::spa::param::ParamType::Buffers.as_raw(),
+        properties: vec![pw::spa::pod::Property {
+            key: pw::spa::sys::SPA_PARAM_BUFFERS_dataType,
+            flags: pw::spa::pod::PropertyFlags::empty(),
+            value: pw::spa::pod::Value::Int(1i32 << pw::spa::sys::SPA_DATA_DmaBuf),
+        }],
+    })
+}
+
+/// Request the compositor attach `SPA_META_Cursor` to each buffer, so the pointer travels as
+/// metadata (position + an occasional bitmap) instead of being burned into the frame. Paired
+/// with the portal's `CursorMode::Metadata`; producers that don't support it simply don't
+/// attach it (harmless). Size is a range up to a 256×256 bitmap — bigger than any real cursor.
+pub(super) fn build_cursor_meta_param() -> Result<Vec<u8>> {
+    fn meta_size(w: u32, h: u32) -> i32 {
+        (std::mem::size_of::<spa::sys::spa_meta_cursor>()
+            + std::mem::size_of::<spa::sys::spa_meta_bitmap>()
+            + (w as usize * h as usize * 4)) as i32
+    }
+    serialize_pod(pw::spa::pod::Object {
+        type_: pw::spa::utils::SpaTypes::ObjectParamMeta.as_raw(),
+        id: pw::spa::param::ParamType::Meta.as_raw(),
+        properties: vec![
+            pw::spa::pod::Property {
+                key: pw::spa::sys::SPA_PARAM_META_type,
+                flags: pw::spa::pod::PropertyFlags::empty(),
+                value: pw::spa::pod::Value::Id(pw::spa::utils::Id(spa::sys::SPA_META_Cursor)),
+            },
+            pw::spa::pod::Property {
+                key: pw::spa::sys::SPA_PARAM_META_size,
+                flags: pw::spa::pod::PropertyFlags::empty(),
+                value: pw::spa::pod::Value::Choice(pw::spa::pod::ChoiceValue::Int(
+                    pw::spa::utils::Choice(
+                        pw::spa::utils::ChoiceFlags::empty(),
+                        // The max must cover the producer's offer or the Meta param silently
+                        // fails to negotiate and NO buffer ever carries the meta region:
+                        // Mutter offers a FIXED `SPA_POD_Int(CURSOR_META_SIZE(384, 384))`
+                        // (meta-screen-cast-stream-src.c, GNOME 50) — a 256² max made the
+                        // intersection empty, which cost the whole Linux cursor channel
+                        // on-glass. 1024² is headroom, not an allocation: the negotiated
+                        // region follows the producer's value.
+                        pw::spa::utils::ChoiceEnum::Range {
+                            default: meta_size(64, 64),
+                            min: meta_size(1, 1),
+                            max: meta_size(1024, 1024),
+                        },
+                    ),
+                )),
+            },
+        ],
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    /// Pin our hand-written PQ transfer id against the real libspa binding. We can't take the
+    /// constant from `pw::spa::sys` directly (older distro headers don't export it — see
+    /// [`super::SPA_VIDEO_TRANSFER_SMPTE2084`]), so assert the two agree wherever the symbol
+    /// DOES exist. Any libspa that renumbers the enum fails this instead of silently tagging
+    /// the HDR offer with the wrong transfer function.
+    ///
+    /// Only builds where tests are compiled — the .deb/.rpm builders run plain `cargo build`,
+    /// so this never reintroduces the compile failure it exists to prevent.
+    #[test]
+    fn pq_transfer_id_matches_libspa() {
+        assert_eq!(
+            super::SPA_VIDEO_TRANSFER_SMPTE2084,
+            super::pw::spa::sys::SPA_VIDEO_TRANSFER_SMPTE2084,
+            "libspa renumbered spa_video_transfer_function — update the hardcoded PQ id"
+        );
+    }
+}

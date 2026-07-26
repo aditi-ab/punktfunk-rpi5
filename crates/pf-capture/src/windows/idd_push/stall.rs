@@ -31,6 +31,10 @@ pub(super) struct StallWatch {
     /// The last [`Self::RECENT`] fresh-frame instants (pre-gap history for the activity gate).
     recent: std::collections::VecDeque<Instant>,
     cadence: pf_frame::metronome::Metronome,
+    /// Stalls seen this session, and how many had a coinciding OS display event — the discriminator
+    /// [`Self::report`] uses. They were capturer fields that nothing outside the report touched.
+    seen: u32,
+    with_os_events: u32,
 }
 
 impl StallWatch {
@@ -48,6 +52,8 @@ impl StallWatch {
         Self {
             recent: std::collections::VecDeque::with_capacity(Self::RECENT + 1),
             cadence: pf_frame::metronome::Metronome::new(),
+            seen: 0,
+            with_os_events: 0,
         }
     }
 
@@ -78,5 +84,79 @@ impl StallWatch {
             gap,
             metronomic: self.cadence.note(now),
         })
+    }
+    /// Log a detected stall, correlate it against OS display events, and — once the cadence turns
+    /// metronomic — name the class of disturbance and its cures.
+    ///
+    /// Lives here rather than in `try_consume` (sweep Phase 5.4): it is ~65 lines of log prose plus
+    /// a running tally, all of it about stalls and none of it about consuming a frame, in a function
+    /// that runs per frame. `now` is the instant of the frame that ENDED the stall — the same one
+    /// passed to [`Self::note_fresh`] — which is what bounds the event-correlation window.
+    pub(super) fn report(&mut self, stall: &Stall, now: Instant) {
+        // OS display events inside the gap (plus a lead-in margin: the event that CAUSED the
+        // hole lands just before DWM stops delivering) — the attribution that turns "DWM
+        // stopped composing" into "…because Windows re-enumerated SAMSUNG on HDMI".
+        let window = stall.gap + Duration::from_millis(300);
+        let events = now
+            .checked_sub(window)
+            .map(|from| pf_win_display::display_events::events_between(from, now))
+            .unwrap_or_default();
+        self.seen = self.seen.saturating_add(1);
+        if !events.is_empty() {
+            self.with_os_events = self.with_os_events.saturating_add(1);
+        }
+        // debug (not warn): a single hole also happens when content legitimately pauses;
+        // the reportable signal is the metronomic cycle below. Mounjay-class triage runs
+        // at debug level, and the web-console debug ring captures these.
+        tracing::debug!(
+            gap_ms = stall.gap.as_millis() as u64,
+            os_display_events = %pf_win_display::display_events::summarize(&events),
+            "IDD-push capture stall — the desktop was composing at speed, then DWM \
+             delivered no frame for the gap; the present path stalled below capture"
+        );
+        if let Some(period) = stall.metronomic {
+            let suspects = pf_win_display::display_events::connected_inactive_externals();
+            let suspects = if suspects.is_empty() {
+                "none".to_string()
+            } else {
+                suspects.join(", ")
+            };
+            let correlated = format!("{}/{}", self.with_os_events, self.seen);
+            // Half-or-more of the stalls carrying a coinciding OS event = the reaction
+            // cascade is OS-visible; otherwise the disturbance never surfaces above the
+            // driver. Different classes, different cures — say which one this box has.
+            if self.with_os_events * 2 >= self.seen {
+                tracing::warn!(
+                    period_s = format!("{:.2}", period.as_secs_f64()),
+                    os_correlated = correlated,
+                    connected_inactive = %suspects,
+                    "capture stalls are METRONOMIC and coincide with Windows monitor \
+                     hot-plug/re-enumeration events — a connected display (or its \
+                     cable/switch/AVR) re-probes the link on a timer and Windows re-reacts \
+                     each time. Cures, best-first: that display's OSD 'auto input \
+                     scan/detect' OFF (and on TVs: instant-on/quick-start + CEC off), \
+                     unplug its cable at the GPU, an HPD-holding adapter/dummy plug, or \
+                     keep it active while streaming; the pnp_disable_monitors policy axis \
+                     suppresses the Windows-side reaction (see connected_inactive for the \
+                     suspects)"
+                );
+            } else {
+                tracing::warn!(
+                    period_s = format!("{:.2}", period.as_secs_f64()),
+                    os_correlated = correlated,
+                    connected_inactive = %suspects,
+                    "capture stalls are METRONOMIC with NO coinciding OS display event — \
+                     the disturbance is BELOW Windows: the GPU driver servicing a \
+                     connected-but-asleep sink (standby HPD/DDC/link probing), \
+                     display-poller software (the SteelSeries-GG/SignalRGB class — \
+                     correlate 'slow display-descriptor poll' lines), or the DWM present \
+                     clock (try a different refresh rate). If connected_inactive lists a \
+                     display, its standby probing is the prime suspect: unplug it at the \
+                     GPU, disable its OSD auto input scan (TVs: instant-on/quick-start + \
+                     CEC off), use an HPD-holding adapter/dummy, or keep it active while \
+                     streaming"
+                );
+            }
+        }
     }
 }

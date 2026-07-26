@@ -26,6 +26,11 @@ use pf_frame::DmabufFrame;
 /// (drop-oldest), so a stalled consumer costs the intermediate frames and is still handed the
 /// freshest one.
 pub trait Capturer: Send {
+    // ---- Frames -----------------------------------------------------------------------------
+    // `next_frame` blocks for one; `try_latest` is the steady-state non-blocking read;
+    // `wait_arrival` + `supports_arrival_wait` are the frame-driven trigger that replaces a
+    // free-running tick.
+
     fn next_frame(&mut self) -> Result<CapturedFrame>;
 
     /// [`next_frame`](Self::next_frame) with a caller-chosen first-frame budget instead of the
@@ -63,11 +68,18 @@ pub trait Capturer: Send {
     /// following `try_latest`.
     fn wait_arrival(&mut self, _deadline: std::time::Instant) {}
 
+    // ---- Lifecycle --------------------------------------------------------------------------
+    // Whether the capturer is being used right now, and whether it can still be used at all.
+
     /// Gate expensive per-frame work so the capturer can be kept alive (reused) between
-    /// streams without burning CPU. The portal capturer skips the de-pad copy while inactive;
-    /// the default is a no-op (synthetic sources are produced on demand). Set `true` for the
-    /// duration of a stream, `false` when it ends.
-    fn set_active(&self, _active: bool) {}
+    /// streams without burning CPU. The portal capturer skips the de-pad copy while inactive and
+    /// flushes its frame mailbox on `false`; the default is a no-op (synthetic sources are produced
+    /// on demand). Set `true` for the duration of a stream, `false` when it ends.
+    ///
+    /// `&mut self`: it mutates capturer state, and every caller owns the capturer. It took `&self`
+    /// only because the flag happened to be an `Arc<AtomicBool>` — an implementation detail leaking
+    /// into the contract, and one the mailbox flush this now also does would not have shared.
+    fn set_active(&mut self, _active: bool) {}
 
     /// Whether this capturer can still produce frames — the gate a caller that POOLS capturers
     /// across streams must consult before reusing one.
@@ -86,6 +98,9 @@ pub trait Capturer: Send {
     fn is_alive(&self) -> bool {
         true
     }
+
+    // ---- Cursor -----------------------------------------------------------------------------
+    // The out-of-band pointer: where it is, who draws it, and (Linux/gamescope) where to read it.
 
     /// The capture source's LIVE cursor state, when it arrives out-of-band from the frames
     /// (the Windows IddCx hardware-cursor channel). Polled by the encode loop every tick and
@@ -116,6 +131,8 @@ pub trait Capturer: Send {
     #[cfg(target_os = "linux")]
     fn attach_gamescope_cursor(&mut self, _targets: GamescopeCursorTargets) {}
 
+    // ---- Stream properties ------------------------------------------------------------------
+
     /// The source's static HDR mastering metadata (SMPTE ST.2086 + content light level), when the
     /// capturer can read it from the output (Windows `IDXGIOutput6::GetDesc1`). `None` = unknown /
     /// SDR / a backend that doesn't expose it (the default — Linux capture has no HDR path yet).
@@ -135,10 +152,18 @@ pub trait Capturer: Send {
         1
     }
 
+    // ---- Host-initiated resize --------------------------------------------------------------
+    // These two are ONE operation split in half and must be implemented together: a backend that
+    // returns `Some` from `capture_target_id` is promising `resize_output` works, and one that
+    // implements `resize_output` without the identity leaves the caller no way to check that the
+    // display it just reconfigured is still this capturer's. Both defaults decline.
+
     /// The OS display-target id this capturer is bound to (Windows IDD-push), so the resize path
     /// can verify the display it just reconfigured is STILL the one this capturer serves (an
     /// in-place resize keeps the target; a re-arrival fallback mints a new one, which needs a
     /// fresh capturer). `None` = the backend has no such identity (every non-IDD backend).
+    ///
+    /// PAIRED with [`resize_output`](Self::resize_output) — see the cluster note above.
     fn capture_target_id(&self) -> Option<u32> {
         None
     }
@@ -149,6 +174,8 @@ pub trait Capturer: Send {
     /// EXTERNAL changes only) and no teardown: the capture pipeline and its send thread survive;
     /// only the encoder is swapped by the caller once the first new-size frame arrives. Returns
     /// `true` when handled; `false` (the default) routes the caller to the full-rebuild path.
+    ///
+    /// PAIRED with [`capture_target_id`](Self::capture_target_id) — see the cluster note above.
     fn resize_output(&mut self, _width: u32, _height: u32) -> bool {
         false
     }

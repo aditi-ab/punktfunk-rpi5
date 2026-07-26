@@ -436,7 +436,7 @@ fn open_gs_virtual_source(
     // capturer follows the display). No-op on Linux: virtual-output capture is SDR-only upstream
     // (Mutter RecordVirtual), and `host_hdr_capable` therefore keeps `cfg.hdr` false for this
     // source — the Linux HDR path is the portal monitor mirror (`video_source=portal`).
-    let capturer = capture::capture_virtual_output(
+    let mut capturer = capture::capture_virtual_output(
         vout,
         capture::OutputFormat::resolve(cfg.hdr, crate::encode::resolved_backend_is_gpu()),
         crate::session_plan::CaptureBackend::resolve(),
