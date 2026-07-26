@@ -188,7 +188,7 @@ pub fn spawn(state: Arc<AppState>) -> Result<()> {
                         // Only sealable once the client's scheme is known; without it, fall through
                         // to the bare disconnect rather than send a packet it can't read.
                         if let (Some(scheme), Some(key)) = (detected, last_key) {
-                            let pt = termination_plaintext(&scheme);
+                            let pt = termination_plaintext();
                             let wire = encrypt_control(&key, &scheme, host_seq, &pt);
                             host_seq = host_seq.wrapping_add(1);
                             if let Err(e) = host.peer_mut(pid).send(0, &Packet::reliable(&wire[..]))
@@ -614,25 +614,28 @@ fn hdr_mode_plaintext(enabled: bool, m: &HdrMeta) -> Vec<u8> {
 ///
 /// Verified against moonlight-common-c `ControlStream.c` (master, 2026-07-26):
 ///
-/// * **Type** is table-dependent, and the client picks the table from what we negotiated:
-///   `packetTypesGen7[IDX_TERMINATION] = 0x0100`, `packetTypesGen7Enc[…] = 0x0109`. We advertise no
-///   encryption support, so a legacy-nonce client is on the plain table; a V2 client is on the
-///   encrypted one. Sending the wrong one is merely ignored, but then we are back to a bare
-///   disconnect — so derive it rather than guess.
+/// * **Type `0x0109`**, from `packetTypesGen7Enc[IDX_TERMINATION]`. Which table the client reads is
+///   decided by ONE thing — the version we advertise:
+///   `encryptedControlStream = APP_VERSION_AT_LEAST(7, 1, 431)`, and
+///   [`super::APP_VERSION`] is exactly `7.1.431`. So every client is on the encrypted table, where
+///   termination is `0x0109`; the plain table's `0x0100` would be ignored.
+///
+///   This is *not* the same axis as [`NonceKind`], which only describes how the GCM nonce is built.
+///   Deriving the type from the nonce scheme looks reasonable and is wrong — it sent `0x0100` to a
+///   client reading the encrypted table, which ignored it silently and reported the session as `-1`
+///   (on glass, .173). The HDR message could never have caught this: `0x010e` in both tables.
 /// * **Payload** is a big-endian `u32` reason (the ≥6-byte "extended" branch; the short branch is a
 ///   little-endian `u16`, which is GFE's older shape).
 /// * **`0x80030023`** is `NVST_DISCONN_SERVER_TERMINATED_CLOSED`, which the client maps to
 ///   `ML_ERROR_GRACEFUL_TERMINATION` *provided it has seen a frame* — true for any real session,
 ///   and the reason this reads as "the app quit" rather than an error.
-fn termination_plaintext(scheme: &Scheme) -> Vec<u8> {
+fn termination_plaintext() -> Vec<u8> {
+    /// `packetTypesGen7Enc[IDX_TERMINATION]` — see the version gate above.
+    const TERMINATION: u16 = 0x0109;
     /// `NVST_DISCONN_SERVER_TERMINATED_CLOSED` — a deliberate, graceful host-side end.
     const GRACEFUL: u32 = 0x8003_0023;
-    let ty: u16 = match scheme.nonce {
-        NonceKind::V2 { .. } => 0x0109,
-        NonceKind::LegacyLowByte | NonceKind::Legacy16Seq { .. } => 0x0100,
-    };
     let mut pt = Vec::with_capacity(8);
-    pt.extend_from_slice(&ty.to_le_bytes());
+    pt.extend_from_slice(&TERMINATION.to_le_bytes());
     pt.extend_from_slice(&4u16.to_le_bytes()); // length = the reason that follows
     pt.extend_from_slice(&GRACEFUL.to_be_bytes()); // big-endian: the extended branch
     pt
@@ -745,31 +748,32 @@ mod tests {
     /// failed test. Pinned against moonlight-common-c `ControlStream.c`.
     #[test]
     fn termination_plaintext_wire_layout() {
-        let legacy = super::Scheme {
-            key_rev: false,
-            nonce: super::NonceKind::LegacyLowByte,
-            tag_first: true,
-            aad: super::Aad::None,
-        };
-        let pt = super::termination_plaintext(&legacy);
+        let pt = super::termination_plaintext();
         assert_eq!(pt.len(), 8);
-        // We advertise no encryption, so this client is on `packetTypesGen7`.
-        assert_eq!(&pt[0..2], &0x0100u16.to_le_bytes());
+        // The ENCRYPTED table's entry — which is the one every client reads, see below.
+        assert_eq!(&pt[0..2], &0x0109u16.to_le_bytes());
         assert_eq!(&pt[2..4], &4u16.to_le_bytes());
-        // The reason is BIG-endian — the client's >=6-byte "extended" branch.
+        // The reason is BIG-endian: the client's >=6-byte "extended" branch.
         assert_eq!(&pt[4..8], &0x8003_0023u32.to_be_bytes());
+    }
 
-        // A V2-nonce client reads the encrypted table instead, where termination moved to 0x0109.
-        let v2 = super::Scheme {
-            nonce: super::NonceKind::V2 {
-                seq_be: false,
-                marker: [b'C', b'C'],
-            },
-            ..legacy
-        };
-        assert_eq!(
-            &super::termination_plaintext(&v2)[0..2],
-            &0x0109u16.to_le_bytes()
+    /// The termination type above is only correct because of the version we advertise:
+    /// moonlight-common-c sets `encryptedControlStream = APP_VERSION_AT_LEAST(7, 1, 431)`, and that
+    /// alone decides whether the client reads `packetTypesGen7Enc` (termination `0x0109`) or
+    /// `packetTypesGen7` (`0x0100`). Drop below that version and the message silently stops being
+    /// understood — the stream would end as an error again, with nothing failing here to say why.
+    #[test]
+    fn advertised_version_keeps_the_client_on_the_encrypted_packet_table() {
+        let q: Vec<i32> = super::super::APP_VERSION
+            .split('.')
+            .map(|p| p.parse().unwrap_or(0))
+            .collect();
+        let at_least = q[0] > 7 || (q[0] == 7 && (q[1] > 1 || (q[1] == 1 && q[2] >= 431)));
+        assert!(
+            at_least,
+            "APP_VERSION {} is below 7.1.431, so clients read the PLAIN packet table and \
+             termination must become 0x0100",
+            super::super::APP_VERSION
         );
     }
 
