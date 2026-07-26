@@ -116,6 +116,14 @@ export const SessionGameCard: FC = () => {
 										{m.session_game_always_warning()}
 									</p>
 								)}
+								{/* Shown for every option, including "leave it running": on a nested
+								    gamescope launch the game IS inside the streamed display, so the
+								    display's own keep-alive outranks anything chosen here — verified
+								    on glass (.41), where a deliberate stop ended the game under
+								    `keep`. Worded so a non-gamescope host reads it and moves on. */}
+								<p className="max-w-prose text-xs text-muted-foreground">
+									{m.session_game_nested_note()}
+								</p>
 							</Field>
 
 							{(server.game_on_session_end ?? "keep") === "always" && (

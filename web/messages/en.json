@@ -413,5 +413,6 @@
 	"session_game_grace": "Reconnect window",
 	"session_game_grace_help": "How long a client that vanished has to come back before its game is closed. The console shows the countdown, and reconnecting cancels it.",
 	"session_game_saved": "Session and game settings saved",
-	"session_game_inert": "This host has no way to launch games, so these settings do nothing here"
+	"session_game_inert": "This host has no way to launch games, so these settings do nothing here",
+	"session_game_nested_note": "On a gamescope game session the game runs *inside* the streamed display, so it lives exactly as long as that display does — which is what Keep alive above decides, not this setting. A deliberate Stop tears that display down at once and takes the game with it, whichever option you pick here."
 }

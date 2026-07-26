@@ -413,5 +413,6 @@
 	"session_game_grace": "Zeitfenster für die Rückkehr",
 	"session_game_grace_help": "Wie lange ein verschwundener Client Zeit hat zurückzukommen, bevor sein Spiel geschlossen wird. Die Konsole zeigt den Countdown; eine neue Verbindung bricht ihn ab.",
 	"session_game_saved": "Sitzungs- und Spieleinstellungen gespeichert",
-	"session_game_inert": "Dieser Host kann keine Spiele starten – hier bewirken diese Einstellungen nichts"
+	"session_game_inert": "Dieser Host kann keine Spiele starten – hier bewirken diese Einstellungen nichts",
+	"session_game_nested_note": "In einer gamescope-Spielsitzung läuft das Spiel *innerhalb* der gestreamten Anzeige und lebt daher genau so lange wie diese – das entscheidet „Offen halten“ oben, nicht diese Einstellung. Ein bewusstes Stoppen reißt die Anzeige sofort ab und nimmt das Spiel mit, egal was du hier wählst."
 }

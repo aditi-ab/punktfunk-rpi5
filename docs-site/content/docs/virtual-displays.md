@@ -179,6 +179,23 @@ shutdown — and only forces the issue after ten seconds of being ignored.
 > (5 minutes). A display set to **Forever** stays up regardless of what happens to the game — a
 > pinned display is a deliberate "this box is a game host" choice, and closing a game doesn't undo it.
 
+### On a gamescope session, the display has the final say
+
+When a launch gets its **own gamescope** — a dedicated game session, the usual setup on a Steam Deck
+or a Bazzite couch box — the game runs *inside* the streamed display. So it lives exactly as long as
+that display does, and **Keep alive decides that, not the setting above**:
+
+| you disconnect by | what happens to the game |
+|---|---|
+| pressing **Stop** (or the console's stop) | the display tears down at once — keep-alive is deliberately skipped for a real stop — and the game goes with it, even on *Leave it running* |
+| dropping out (network, sleep) | the display lingers for your keep-alive window, then tears down; the game ends with it |
+| dropping out, keep-alive **Forever** | the display is pinned, so the game genuinely survives — and *Always close it* still ends it when the reconnect window closes |
+
+So on a gamescope box, "leave the game running after I disconnect" means **keep-alive Forever** (or a
+window long enough to come back in), not just this setting. On a desktop session — KWin, GNOME, Sway —
+the game is an ordinary process next to your desktop and none of this applies; the setting above is
+the whole story.
+
 ### Automation
 
 The host publishes `game.running` and `game.exited` events (the latter says whether the player quit
