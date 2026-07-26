@@ -181,18 +181,47 @@ jobs:
         # test targets are never compiled anywhere, and that blind spot is what let the Linux twin's
         # tests rot to the wrong arity unnoticed. pf-capture has no cargo features, so it needs no
         # feature juggling and pulls in no extra dep tree.
-        # NOTE: clippy (a check, no link step) is deliberately the vehicle here — `cargo test`
-        # with `nvenc` cannot LINK on MSVC: nvidia-video-codec-sdk link-imports
-        # NvEncodeAPICreateInstance / NvEncodeAPIGetMaxSupportedVersion, which resolve only against
-        # the driver's import lib. (On Linux the same crate dlopens them, so ci.yml can and does
-        # run the tests there.) Running them here would need an `--features amf-qsv,qsv` build
-        # without `nvenc`, i.e. a third full dep tree on a runner that already trips C1069 — not
-        # worth it while ci.yml executes the same tests.
+        # NOTE: for the HOST and pf-encode, clippy (a check, no link step) is deliberately the
+        # vehicle — `cargo test` with `nvenc` cannot LINK on MSVC: nvidia-video-codec-sdk
+        # link-imports NvEncodeAPICreateInstance / NvEncodeAPIGetMaxSupportedVersion, which resolve
+        # only against the driver's import lib. (On Linux the same crate dlopens them, so ci.yml can
+        # and does run the tests there.) Running them here would need an `--features amf-qsv,qsv`
+        # build without `nvenc`, i.e. a third full dep tree on a runner that already trips C1069 —
+        # not worth it while ci.yml executes the same tests.
+        #
+        # That reasoning does NOT extend to pf-capture: it has no encoder dependency at all
+        # (`cargo tree -p pf-capture` lists no nvidia/ffmpeg/libvpl/pyrowave), so its test binary
+        # links against nothing this runner lacks, and it reuses the release artifacts the steps
+        # above already built. Its Windows `#[test]`s — StallWatch, the f16 conversions, the cursor
+        # truth table, the IDD generation masking — are Windows-only code that NO other job can
+        # execute, so linting them was leaving real coverage on the table. See the run step below.
         run: |
           cargo clippy --release -p punktfunk-host --features nvenc,amf-qsv,qsv -- -D warnings; if ($LASTEXITCODE) { throw "host clippy" }
           cargo clippy --release -p pf-encode --all-targets --features nvenc,amf-qsv,qsv -- -D warnings; if ($LASTEXITCODE) { throw "pf-encode clippy" }
           cargo clippy --release -p pf-capture --all-targets -- -D warnings; if ($LASTEXITCODE) { throw "pf-capture clippy" }
           cargo clippy --release -p punktfunk-tray -- -D warnings; if ($LASTEXITCODE) { throw "tray clippy" }
+
+      - name: Test (pf-capture, Windows)
+        shell: pwsh
+        # The only Rust tests that RUN on Windows CI. pf-capture's `#[cfg(target_os = "windows")]`
+        # test modules cover code no Linux job compiles, let alone executes: 19 declared, of which
+        # 18 execute here — the IDD-push StallWatch state machine and ring-generation masking
+        # (idd_push.rs), the cursor shape→wire truth table (idd_push/cursor_poll.rs), and
+        # `f32_to_f16` including the rounding-carry / saturation edges the HDR P010 path depends on
+        # (dxgi/selftest.rs). All 18 are pure — no Win32, no device, no desktop. The 19th,
+        # `hdr_p010_selftest_intel_1080_live`, is `#[ignore]`d because it needs a real Intel
+        # adapter; it stays a manual `-- --ignored` run on the validation boxes. Until this step
+        # the whole set was type-checked by the clippy line above and nothing more.
+        #
+        # --release for the same reason as the clippy step: it reuses C:\t\release instead of
+        # spawning a second debug dep tree (the C1069 disk-exhaustion trigger). If this step ever
+        # starts tripping C1069 anyway, record THAT here rather than quietly dropping the step.
+        #
+        # The link question this step turns on was settled empirically before it was added: the same
+        # command was run on a Windows dev box against a workspace checkout and linked + executed
+        # cleanly, building in ~51 s off an existing release target dir.
+        run: |
+          cargo test --release -p pf-capture; if ($LASTEXITCODE) { throw "pf-capture tests" }
 
       - name: Build + lint the HDR Vulkan layer (pf-vkhdr-layer)
         shell: pwsh
