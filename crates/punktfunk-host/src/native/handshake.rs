@@ -267,6 +267,12 @@ pub(super) async fn negotiate(
     // *monitor* streams only — the GameStream portal-mirror path uses that; see
     // `gamestream::host_hdr_capable`), so a Linux native session honestly stays 8-bit SDR even
     // though `can_encode_10bit` now probes true on a Main10-capable GPU.
+    //
+    // That `false` is also why this plane needs no equivalent of the GameStream path's
+    // `pf_capture::hdr_capture_failed()` check (rtsp.rs): that latch is a fact about the PORTAL
+    // capturer's HDR offer, and the native plane captures a virtual output instead — it never
+    // reaches the portal path, and on Linux it never negotiates 10-bit at all. Revisit both halves
+    // together if Mutter ever gains HDR for RecordVirtual streams.
     let capture_supports_hdr = crate::capture::capturer_supports_hdr();
     // The GPU probe may open a tiny encoder on first use, so run it off the reactor like the
     // 4:4:4 probe below (blocking probes → spawn_blocking), short-circuited behind the cheap

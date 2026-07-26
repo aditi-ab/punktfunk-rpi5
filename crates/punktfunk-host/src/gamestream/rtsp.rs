@@ -450,6 +450,25 @@ fn stream_config(map: &HashMap<String, String>) -> Option<StreamConfig> {
         );
         hdr = false;
     }
+    // Second half of the same live gate: the process-wide HDR-capture latch. The colour-mode probe
+    // above only says the monitor is in BT.2100 RIGHT NOW — it says nothing about whether the
+    // portal will actually hand us the 10-bit PQ formats. Once a `want_hdr` negotiation has failed
+    // (the monitor left HDR mode between probe and negotiation, NVIDIA EGL not listing LINEAR for
+    // XR30, a pre-50 Mutter), `pf_capture::open_portal_monitor` permanently drops the HDR OFFER and
+    // captures SDR. Without this check we'd keep telling the client HDR while capturing and
+    // encoding SDR: it renders an SDR picture through PQ — washed out, wrong gamut, no error
+    // anywhere — and because the latch is sticky until host restart, every reconnect repeats it.
+    // Consulted here rather than folded into `host_hdr_capable` for the same reason as the probe
+    // above: that fn is the STATIC serverinfo capability, and this is a live per-session fact.
+    #[cfg(target_os = "linux")]
+    if hdr && pf_capture::hdr_capture_failed() {
+        tracing::warn!(
+            "client requested HDR and a monitor is in BT.2100 (HDR) colour mode, but an earlier \
+             HDR capture negotiation on this host failed — the capturer offers SDR only for the \
+             rest of the process lifetime, so streaming 8-bit SDR (restart the host to retry HDR)"
+        );
+        hdr = false;
+    }
     // The client's requested CSC (moonlight-common-c SdpGenerator.c: `encoderCscMode =
     // (colorspace << 1) | fullRange` — colorspace 0=Rec601, 1=Rec709, 2=Rec2020). Moonlight
     // renderers configure their YUV→RGB from this REQUESTED value (not the bitstream VUI), so a
