@@ -1,5 +1,6 @@
 ;/*++
-; punktfunk virtual DualSense — UMDF2 HID minidriver INF (M0 spike).
+; punktfunk virtual PlayStation/Valve pads — UMDF2 HID minidriver INF (M0 spike).
+; One package, four hardware ids: DualSense, DualShock 4, DualSense Edge, Steam Deck.
 ; Adapted from the WDK vhidmini2 UMDF2 sample (VhidminiUm.inx).
 ; Depends on MsHidUmdf.inf (build >= 22000).
 ; Install: devgen /add /hardwareid "root\pf_dualsense"  (after pnputil /add-driver /install)
@@ -27,10 +28,19 @@ pf_dualsense.dll=1
 [pf.NT$ARCH$.10.0...22000]
 ; Hardware ids: `root\pf_dualsense` for a root-enumerated devnode (devgen/devcon tests); `pf_dualsense`
 ; for the host's SwDeviceCreate'd DualSense (the `root\` prefix is reserved for root enumeration, so
-; SwDeviceCreate rejects it with E_INVALIDARG); `pf_dualshock4` / `pf_dualsenseedge` for the host's
-; virtual DualShock 4 / DualSense Edge — the same driver binds all of them and serves the matching
-; identity per the device_type byte the host stamps into shared memory.
-%DeviceDesc%=pfDualSense, root\pf_dualsense, pf_dualsense, pf_dualshock4, pf_dualsenseedge, pf_steamdeck
+; SwDeviceCreate rejects it with E_INVALIDARG); `pf_dualshock4` / `pf_dualsenseedge` / `pf_steamdeck`
+; for the host's other virtual pads — ONE driver binds all of them (every model line below installs
+; the same `pfDualSense` section) and serves the matching HID identity per the device_type byte the
+; host stamps into shared memory.
+;
+; Each id carries its OWN description: Device Manager reads this string, and a single shared
+; "Virtual DualSense" made an emulated DualShock 4 look like the controller-type setting had been
+; ignored. The HID layer (VID/PID, report descriptor, product string) was always per-type; this
+; makes the human-readable name agree with it.
+%DeviceDesc%=pfDualSense, root\pf_dualsense, pf_dualsense
+%DeviceDescDS4%=pfDualSense, pf_dualshock4
+%DeviceDescEdge%=pfDualSense, pf_dualsenseedge
+%DeviceDescDeck%=pfDualSense, pf_steamdeck
 
 [pfDualSense.NT]
 CopyFiles=UMDriverCopy
@@ -78,4 +88,9 @@ ProviderString     ="punktfunk"
 ManufacturerString ="punktfunk"
 ClassName          ="HID device"
 Disk_Description   ="punktfunk DualSense Installation Disk"
+; One per hardware id — these are what Device Manager shows. Keep them aligned with the product
+; strings the driver serves per device_type (src/lib.rs `on_get_string`).
 DeviceDesc         ="punktfunk Virtual DualSense"
+DeviceDescDS4      ="punktfunk Virtual DualShock 4"
+DeviceDescEdge     ="punktfunk Virtual DualSense Edge"
+DeviceDescDeck     ="punktfunk Virtual Steam Deck Controller"

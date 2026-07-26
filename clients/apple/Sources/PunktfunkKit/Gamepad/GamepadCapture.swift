@@ -57,9 +57,11 @@ public final class GamepadCapture {
         let pad: UInt32
         /// The controller KIND declared to the host (GamepadArrival) when the slot opened — the
         /// user's explicit "Controller type" setting when they picked one, else the detected
-        /// kind (`GamepadManager.declaredKind(for:)`). NOT the physical pad's kind: local
-        /// feedback keys off the live `GCController` subclass instead, so an emulated type never
-        /// costs a DualSense its lightbar or adaptive triggers.
+        /// kind (`GamepadManager.declaredKind(for:)`). NOT the physical pad's kind: local feedback
+        /// keys off the live `GCController` subclass instead, so whatever the host DOES send is
+        /// applied natively to the pad in the user's hands. What the host sends is bounded by the
+        /// emulated type, though — a virtual DualShock 4 has no adaptive-trigger reports in its
+        /// protocol, so emulating one gives those up by construction (rumble + lightbar remain).
         let pref: PunktfunkConnection.GamepadType
         var buttons: UInt32 = 0
         var axes: [Int32] = [0, 0, 0, 0, 0, 0]
