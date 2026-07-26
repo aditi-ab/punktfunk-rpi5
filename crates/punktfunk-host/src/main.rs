@@ -338,7 +338,15 @@ fn real_main() -> Result<()> {
             // adapter, which may not be the one that encodes).
             let mut size = (64u32, 64u32);
             let mut vendor = None;
-            for a in args.iter().skip(2) {
+            // `args` starts AT the subcommand (main builds it with `env::args().skip(1)`), so the
+            // optional arguments begin at index 1 — cf. `args.get(1)` in the `service` arm. This
+            // read `skip(2)` and so silently swallowed the first optional argument: the documented
+            // `hdr-p010-selftest 1920x1080 nvidia` picked up the vendor but ran at the 64x64
+            // DEFAULT, and a size-only invocation parsed nothing at all and still printed PASS.
+            // The size is the whole point of the flag — 1080 is not 16-aligned and takes a
+            // different driver path — so the self-test was passing on the one geometry that
+            // exercises the least.
+            for a in args.iter().skip(1) {
                 match a.as_str() {
                     "intel" => vendor = Some(0x8086),
                     "nvidia" => vendor = Some(0x10de),
