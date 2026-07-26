@@ -56,14 +56,20 @@ const GameRow: FC<{
 	const waiting = game.state === "grace";
 	return (
 		<div className="flex items-center gap-3">
-			<div className="h-16 w-11 shrink-0 overflow-hidden rounded bg-muted">
-				{art && (
+			{/* Fixed slot so rows line up whether or not a title has a cover. Plenty won't: an
+			    operator-typed command has no catalog entry behind it, a custom entry may carry no
+			    art, and nothing does until `/library` has loaded — an empty box reads as broken, so
+			    the placeholder says "game" instead of nothing. */}
+			<div className="flex h-16 w-11 shrink-0 items-center justify-center overflow-hidden rounded bg-muted">
+				{art ? (
 					<img
 						src={art}
 						alt=""
 						loading="lazy"
 						className="size-full object-cover"
 					/>
+				) : (
+					<Gamepad2 className="size-5 text-muted-foreground/60" />
 				)}
 			</div>
 			<div className="min-w-0 flex-1">
