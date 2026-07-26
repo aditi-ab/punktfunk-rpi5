@@ -1246,13 +1246,19 @@ mod tests {
         let shared = lease.shared();
         assert!(matches!(shared.kind(), LeaseKind::Child));
 
-        // Seen running on the first poll, because the host holds the child.
-        std::thread::sleep(Duration::from_millis(1_500));
-        assert_eq!(shared.state(), GameState::Running, "should be running");
+        // This script `exec`s a binary OUTSIDE the install dir, so neither the image path nor the
+        // command line carries the directory: the host's own child is the only signal there is.
+        // Which means the shim window gates it — a live child that might still turn out to be a
+        // launcher is not called the game until that window has passed. Waiting it out is the point
+        // of the assertion, not an accident of timing.
+        std::thread::sleep(SHIM_WINDOW + Duration::from_millis(1_500));
+        assert_eq!(
+            shared.state(),
+            GameState::Running,
+            "a child that outlives the shim window IS the game"
+        );
         assert_eq!(EXITS.load(Ordering::SeqCst), 0, "nothing has exited yet");
 
-        // Past the shim window, so its exit counts as the game's rather than a launcher handing off.
-        std::thread::sleep(SHIM_WINDOW);
         terminate(shared.clone(), "test asked");
 
         // The ladder asks politely first; `sleep` dies on SIGTERM, so this resolves well inside the
