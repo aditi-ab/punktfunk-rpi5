@@ -21,10 +21,10 @@ use pf_frame::{CapturedFrame, FramePayload, PixelFormat};
 #[cfg(target_os = "linux")]
 use pf_frame::DmabufFrame;
 
-/// Produces frames from a captured output. Lives on its own thread, feeding the encoder
-/// over a bounded channel that never blocks the compositor — the Linux portal's is drop-**newest**
-/// (a full channel discards the ARRIVING frame; `linux/mod.rs`'s `try_send`), so under a consumer
-/// stall the encoder is handed the stalest queued frame.
+/// Produces frames from a captured output. Lives on its own thread, handing frames over without
+/// ever blocking the compositor — the Linux portal publishes into a one-deep OVERWRITING slot
+/// (drop-oldest), so a stalled consumer costs the intermediate frames and is still handed the
+/// freshest one.
 pub trait Capturer: Send {
     fn next_frame(&mut self) -> Result<CapturedFrame>;
 
@@ -56,10 +56,11 @@ pub trait Capturer: Send {
     /// Block until a FRESH frame is available via [`try_latest`](Self::try_latest) or
     /// `deadline` passes — the encode loop's frame-driven wait (latency plan T1.1): waking on
     /// the compositor's publish instead of sampling at a free-running tick deletes the
-    /// sample-and-hold (~half a frame interval on average). Must NOT consume the frame (the
-    /// loop's `try_latest` call does); backends buffer internally where the arrival channel
-    /// can't be peeked. Only called when [`supports_arrival_wait`](Self::supports_arrival_wait)
-    /// is `true`; errors surface at the following `try_latest`.
+    /// sample-and-hold (~half a frame interval on average). Must NOT consume the frame — the
+    /// loop's `try_latest` call does that — so a backend implements this by waiting on a wakeup
+    /// and then PEEKING its hand-off slot. Only called when
+    /// [`supports_arrival_wait`](Self::supports_arrival_wait) is `true`; errors surface at the
+    /// following `try_latest`.
     fn wait_arrival(&mut self, _deadline: std::time::Instant) {}
 
     /// Gate expensive per-frame work so the capturer can be kept alive (reused) between

@@ -34,16 +34,32 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+/// The frame hand-off from the PipeWire thread to the consumer: a ONE-DEEP slot the producer
+/// OVERWRITES, i.e. genuinely drop-**oldest**.
+///
+/// This was a `sync_channel(8)` fed by `try_send`, which is drop-**newest**: with the consumer
+/// stalled the queue filled and every fresh frame was discarded, so `next_frame` then handed back
+/// the OLDEST of eight stale frames (`try_latest` drained to the newest of them, which is no better
+/// — it is still the frame from the moment the queue filled). Shrinking the bound would not fix
+/// that; only overwriting does. `SyncSender` cannot pop, so the queue is replaced outright.
+///
+/// A one-deep slot is also the right resource shape: a queued [`CapturedFrame`] can own a dup'd
+/// dmabuf fd or a CUDA buffer, so a backlog of eight pinned eight compositor buffers.
+type FrameSlot = Arc<std::sync::Mutex<Option<CapturedFrame>>>;
+
 /// Live monitor capturer backed by the portal + PipeWire threads. Kept alive (reused) across
 /// streams — [`set_active`](Capturer::set_active) gates the per-frame de-pad copy so it costs
 /// almost nothing between streams while the screencast session stays up (instant reconnect,
 /// and no second session to conflict with).
 pub struct PortalCapturer {
-    frames: Receiver<CapturedFrame>,
-    /// A frame [`wait_arrival`](Capturer::wait_arrival) received while blocking (the channel
-    /// can't be peeked, so the wait must consume) — always the FIRST candidate the next
-    /// `try_latest`/`next_frame` considers, before draining anything newer off the channel.
-    pending: Option<CapturedFrame>,
+    /// THE frame the PipeWire thread produced most recently and the consumer has not taken yet.
+    /// See [`FrameSlot`] for why this is a one-deep overwriting slot rather than a queue.
+    slot: FrameSlot,
+    /// Wakeup edges from the producer (one `()` per publish, best-effort). The SLOT is the truth —
+    /// this only un-blocks a waiter, so a coalesced edge loses nothing. Also the producer-liveness
+    /// signal: its sender dies with the PipeWire thread, so `Disconnected` here means the thread
+    /// ended.
+    wake: Receiver<()>,
     active: Arc<AtomicBool>,
     /// Set true once the PipeWire stream agrees a video format. Read in [`next_frame`]'s timeout
     /// branch to tell "format never negotiated" (modifier/format mismatch) apart from "negotiated
@@ -258,7 +274,10 @@ impl PortalCapturer {
 /// activation flag the per-frame copy gates on, a "format negotiated" flag (timeout diagnostics),
 /// a quit sender that stops the loop, and the thread's join handle (synchronous teardown).
 struct PwHandles {
-    frames: Receiver<CapturedFrame>,
+    /// See [`FrameSlot`] / [`PortalCapturer::slot`].
+    slot: FrameSlot,
+    /// See [`PortalCapturer::wake`].
+    wake: Receiver<()>,
     active: Arc<AtomicBool>,
     negotiated: Arc<AtomicBool>,
     streaming: Arc<AtomicBool>,
@@ -288,8 +307,8 @@ impl PwHandles {
         portal: Option<PortalSession>,
     ) -> PortalCapturer {
         PortalCapturer {
-            frames: self.frames,
-            pending: None,
+            slot: self.slot,
+            wake: self.wake,
             active: self.active,
             negotiated: self.negotiated,
             streaming: self.streaming,
@@ -338,8 +357,12 @@ fn spawn_pipewire(
     // gamescope fixates its own — gating those would starve legitimate first frames).
     expect_exact_dims: bool,
 ) -> Result<PwHandles> {
-    // Frames flow from the pipewire thread over a small bounded channel.
-    let (frame_tx, frame_rx) = sync_channel::<CapturedFrame>(8);
+    // Frames hand over through the one-deep overwriting mailbox (see `FrameSlot`); the channel
+    // carries only wakeup EDGES, so depth 1 is exactly right — a coalesced edge loses nothing
+    // because the slot, not the channel, holds the frame.
+    let slot: FrameSlot = Arc::new(std::sync::Mutex::new(None));
+    let slot_cb = slot.clone();
+    let (wake_tx, wake_rx) = sync_channel::<()>(1);
     let active = Arc::new(AtomicBool::new(false));
     let active_cb = active.clone();
     let negotiated = Arc::new(AtomicBool::new(false));
@@ -393,7 +416,8 @@ fn spawn_pipewire(
             if let Err(e) = pipewire::pipewire_thread(
                 fd,
                 node_id,
-                frame_tx,
+                slot_cb,
+                wake_tx,
                 active_cb,
                 negotiated_cb,
                 streaming_cb,
@@ -413,7 +437,8 @@ fn spawn_pipewire(
         })
         .context("spawn pipewire thread")?;
     Ok(PwHandles {
-        frames: frame_rx,
+        slot,
+        wake: wake_rx,
         active,
         negotiated,
         streaming,
@@ -459,19 +484,25 @@ impl Capturer for PortalCapturer {
     }
 
     fn wait_arrival(&mut self, deadline: std::time::Instant) {
-        // Frame-driven trigger (latency plan T1.1): block on the PipeWire channel until the
-        // compositor delivers a frame or the deadline passes. The channel can't be peeked, so
-        // the received frame is stashed in `pending` — `try_latest` starts from it and still
-        // drains anything newer. A broken/ended stream just returns; the following
-        // `try_latest` surfaces the error through its existing paths.
-        if self.pending.is_some() || self.broken.load(Ordering::Relaxed) {
+        // Frame-driven trigger (latency plan T1.1): block until the compositor delivers a frame or
+        // the deadline passes. Now that the hand-off is a peekable slot this honours the trait's
+        // "must NOT consume" contract directly — it observes the slot and leaves the frame for
+        // `try_latest`, so the `pending` stash the old un-peekable channel forced no longer exists.
+        // A broken/ended stream just returns; the following `try_latest` surfaces the error.
+        if self.broken.load(Ordering::Relaxed) {
             return;
         }
-        let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) else {
-            return;
-        };
-        if let Ok(f) = self.frames.recv_timeout(left) {
-            self.pending = Some(f);
+        loop {
+            if self.slot.lock().is_ok_and(|s| s.is_some()) {
+                return;
+            }
+            let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) else {
+                return;
+            };
+            // Timeout OR a dead producer: either way stop waiting and let `try_latest` classify.
+            if self.wake.recv_timeout(left).is_err() {
+                return;
+            }
         }
     }
 
@@ -483,18 +514,24 @@ impl Capturer for PortalCapturer {
                 self.node_id
             ));
         }
-        // Drain to the newest queued frame without blocking; `None` means the compositor
-        // hasn't produced a new frame since last call (static/idle desktop). A frame
-        // `wait_arrival` stashed is the oldest candidate — anything on the channel is newer.
-        let mut latest = self.pending.take();
+        // Take the newest frame, if any; `None` means the compositor hasn't produced one since the
+        // last call (static/idle desktop). Wakeup edges are drained first — they are pure edges, so
+        // stale ones must not make the next `wait_arrival` return early — and `Disconnected` there
+        // is how a dead PipeWire thread surfaces (a frame it left behind is still served first).
+        let mut producer_gone = false;
         loop {
-            match self.frames.try_recv() {
-                Ok(frame) => latest = Some(frame),
+            match self.wake.try_recv() {
+                Ok(()) => continue,
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
-                    return Err(anyhow!("PipeWire capture thread ended"))
+                    producer_gone = true;
+                    break;
                 }
             }
+        }
+        let latest = self.take_frame();
+        if producer_gone && latest.is_none() {
+            return Err(anyhow!("PipeWire capture thread ended"));
         }
         if latest.is_some() || self.streaming.load(Ordering::Relaxed) {
             // A frame arrived, or the source is alive but idle (static desktop) — normal. Clear any
@@ -523,6 +560,15 @@ impl Capturer for PortalCapturer {
 
     fn set_active(&self, active: bool) {
         self.active.store(active, Ordering::Relaxed);
+        if !active {
+            // Flush the mailbox on stream end (L10): a reused capturer used to open the NEXT stream
+            // by handing over the PREVIOUS session's last frame — wrong content, and stamped with a
+            // `pts_ns` from before the new stream's clock. `active == false` also stops the producer
+            // publishing, so nothing refills it until the next `set_active(true)`.
+            if let Ok(mut slot) = self.slot.lock() {
+                *slot = None;
+            }
+        }
     }
 
     /// All three of this backend's terminal states, checked without consuming a frame — every one
@@ -577,17 +623,30 @@ impl PortalCapturer {
                     self.node_id
                 ));
             }
-            if let Some(f) = self.pending.take() {
-                return Ok(f); // a wait_arrival stash outranks the channel (it's older)
+            // The slot before the wakeup: a publish that coalesced its edge (or landed while we were
+            // not waiting) is still visible here.
+            if let Some(f) = self.take_frame() {
+                return Ok(f);
             }
             let slice = Duration::from_millis(500)
                 .min(deadline.saturating_duration_since(std::time::Instant::now()));
-            match self.frames.recv_timeout(slice) {
-                Ok(frame) => return Ok(frame),
+            match self.wake.recv_timeout(slice) {
+                Ok(()) => continue, // a publish happened — the loop re-reads the slot
                 Err(RecvTimeoutError::Timeout) if std::time::Instant::now() < deadline => continue,
-                Err(e) => return self.next_frame_timed_out(e, budget),
+                Err(e) => {
+                    // A last frame can be sitting in the slot even as the producer exits.
+                    if let Some(f) = self.take_frame() {
+                        return Ok(f);
+                    }
+                    return self.next_frame_timed_out(e, budget);
+                }
             }
         }
+    }
+
+    /// Take the mailbox's frame, if the producer has published one since the last take.
+    fn take_frame(&self) -> Option<CapturedFrame> {
+        self.slot.lock().ok().and_then(|mut s| s.take())
     }
 
     /// The [`frame_within`](Self::frame_within) budget expired (or the thread ended) — turn it
@@ -1088,7 +1147,10 @@ mod pipewire {
         format: Option<PixelFormat>,
         /// Negotiated DRM format modifier (for dmabuf import); 0 = LINEAR.
         modifier: u64,
-        tx: SyncSender<CapturedFrame>,
+        /// The one-deep frame mailbox (see [`super::FrameSlot`]) + its wakeup sender. Written
+        /// through [`UserData::publish`], never directly.
+        slot: super::FrameSlot,
+        wake: SyncSender<()>,
         /// When false (no active stream), skip the de-pad copy — the buffer is just released.
         active: Arc<AtomicBool>,
         /// Set once a video format is agreed (`param_changed`), so a first-frame timeout can tell
@@ -1143,6 +1205,23 @@ mod pipewire {
         /// into the first-frame-timeout retry loop; the promised renegotiation normally lands
         /// within a frame or two).
         gate_since: Option<std::time::Instant>,
+    }
+
+    impl UserData {
+        /// Hand `frame` to the consumer as THE latest, OVERWRITING any frame it has not taken yet
+        /// (drop-oldest — see [`super::FrameSlot`]), then poke the wakeup edge.
+        ///
+        /// Never blocks the PipeWire loop, which is the hard constraint here: this runs inside
+        /// `.process`, so blocking would stall the compositor's stream. Both operations are
+        /// best-effort — a full wakeup channel means an edge is already pending (nothing lost, the
+        /// slot is the truth), and a poisoned mutex is unreachable in practice (the only critical
+        /// sections are a `take` and this store).
+        fn publish(&self, frame: CapturedFrame) {
+            if let Ok(mut slot) = self.slot.lock() {
+                *slot = Some(frame);
+            }
+            let _ = self.wake.try_send(());
+        }
     }
 
     /// Everything the zero-copy negotiation decision depends on, gathered at ONE point in time.
@@ -1728,19 +1807,20 @@ mod pipewire {
             _ => return,
         }
         // SAFETY: `bmp_off + size_of::<spa_meta_bitmap>() <= region_size` (checked directly above),
-        // so the header is fully in bounds; the producer places it aligned as before.
-        let bmp = unsafe { data.add(bmp_off) as *const spa::sys::spa_meta_bitmap };
-        // SAFETY: `bmp` is the in-bounds `spa_meta_bitmap` header validated just above; reading its
-        // scalar fields is sound.
-        let (vfmt, bw, bh, stride, pix_off) = unsafe {
-            (
-                (*bmp).format,
-                (*bmp).size.width,
-                (*bmp).size.height,
-                (*bmp).stride.max(0) as usize,
-                (*bmp).offset as usize,
-            )
-        };
+        // so the header is fully in bounds for a read of that many bytes. `read_unaligned` is
+        // REQUIRED, not defensive: `bmp_off` is producer-written and nothing in the SPA contract or
+        // in this function establishes that `data + bmp_off` meets `spa_meta_bitmap`'s alignment —
+        // the previous field reads through an aligned `*const` asserted an invariant the code never
+        // proved. The struct is `Copy` POD, so one unaligned read yields an owned, aligned local.
+        let bmp =
+            unsafe { (data.add(bmp_off) as *const spa::sys::spa_meta_bitmap).read_unaligned() };
+        let (vfmt, bw, bh, stride, pix_off) = (
+            bmp.format,
+            bmp.size.width,
+            bmp.size.height,
+            bmp.stride.max(0) as usize,
+            bmp.offset as usize,
+        );
         // Ignore empty or implausibly large bitmaps (the meta-size request covers <= 1024×1024;
         // real cursors are ≤96px — the cursor channel downscales >120px for the wire anyway).
         if bw == 0 || bh == 0 || bw > 1024 || bh > 1024 {
@@ -2029,7 +2109,7 @@ mod pipewire {
                                 .duration_since(UNIX_EPOCH)
                                 .map(|d| d.as_nanos() as u64)
                                 .unwrap_or(0);
-                            let _ = ud.tx.try_send(CapturedFrame {
+                            ud.publish(CapturedFrame {
                                 width: w as u32,
                                 height: h as u32,
                                 pts_ns,
@@ -2148,7 +2228,7 @@ mod pipewire {
                                 .duration_since(UNIX_EPOCH)
                                 .map(|d| d.as_nanos() as u64)
                                 .unwrap_or(0);
-                            let _ = ud.tx.try_send(CapturedFrame {
+                            ud.publish(CapturedFrame {
                                 width: w as u32,
                                 height: h as u32,
                                 pts_ns,
@@ -2211,7 +2291,14 @@ mod pipewire {
         let data_type = d.type_();
         // fd-backed buffer (MemFd SHM, or DmaBuf)? Capture the fd before `data()` borrows `d`.
         let raw_fd = d.fd();
-        let (size, offset, stride) = {
+        // `mapoffset` is where THIS spa_data's region begins inside the fd — non-zero for a pooled
+        // producer that carves every buffer out of one shared fd. PipeWire's own MAP_BUFFERS slice
+        // already starts there, but our self-mmap below maps the fd from 0, so that path must add it
+        // (see `region_off`). Reading it without it made the self-mmap path index the WRONG buffer,
+        // and the `needed > avail` guard could not catch that: `avail` came from the whole-fd
+        // mapping, so it was large enough for any single buffer's span.
+        let map_off = d.as_raw().mapoffset as usize;
+        let (size, chunk_off, stride) = {
             let c = d.chunk();
             (
                 c.size() as usize,
@@ -2220,6 +2307,21 @@ mod pipewire {
             )
         };
         let Some(fmt) = ud.format else { return }; // unsupported/not negotiated
+                                                   // The de-pad below assumes ONE packed plane of `bytes_per_pixel` bytes. `bytes_per_pixel`'s
+                                                   // catch-all answers 4 for NV12, so a producer-native NV12 buffer (stride ≈ w, two planes)
+                                                   // computed `row = 4w` and always tripped the `stride < row` guard below — blaming the
+                                                   // PRODUCER's stride for a host limitation. NV12 cannot be de-padded on this path at all
+                                                   // (the second plane is not even in `datas[0]`'s span), so say so honestly. It only arrives
+                                                   // here if a native-NV12 negotiation happens without the zero-copy passthrough that is
+                                                   // supposed to consume it, which is a host bug, not a producer one.
+        if matches!(fmt, PixelFormat::Nv12) {
+            warn_once(
+                "negotiated producer-native NV12 but this capture fell back to the CPU de-pad path, \
+                 which handles single-plane packed formats only — frames dropped (the NV12 offer is \
+                 only valid under the raw-dmabuf passthrough that imports it directly)",
+            );
+            return;
+        }
         let bpp = fmt.bytes_per_pixel();
         let row = w * bpp;
         let stride = if stride == 0 { row } else { stride };
@@ -2254,9 +2356,16 @@ mod pipewire {
         let _mapping; // keeps a manual mmap alive for the copy below
                       // Prefer our own fstat-sized mmap of the fd; fall back to PipeWire's MAP_BUFFERS slice
                       // (and finally drop) so an fd PipeWire could map but we can't never silently over-reads.
+                      //
+                      // `fd_len` is REQUIRED, not preferred: it used to fall back to
+                      // `offset + needed`, i.e. a length invented from producer-controlled geometry.
+                      // That defeated the whole point of the fstat (the "buffer smaller than the
+                      // frame span" guard compares against exactly the number the producer just
+                      // supplied) and could map — and then read — past the end of the object, which
+                      // is a SIGBUS, not an `Err`. Without a real length we decline to self-map and
+                      // let PipeWire's own slice serve, which is bounded by construction.
         let self_mapped: Option<&[u8]> = if raw_fd > 0 {
-            let map_len = fd_len.unwrap_or(offset + needed);
-            match DmabufMap::new(raw_fd as i32, map_len) {
+            match fd_len.and_then(|map_len| DmabufMap::new(raw_fd as i32, map_len)) {
                 Some(m) => {
                     _mapping = m;
                     // SAFETY: `_mapping` is the `DmabufMap` just stored; its `ptr`/`len` come from a
@@ -2276,19 +2385,28 @@ mod pipewire {
         } else {
             None
         };
-        let buf: &[u8] = if let Some(b) = self_mapped {
-            b
+        // Which base `chunk.offset` is relative to differs by path: our self-mmap starts at fd
+        // offset 0, so this spa_data's region begins at `mapoffset`; PipeWire's MAP_BUFFERS slice
+        // already begins there. Checked add — both halves are producer-controlled.
+        let (buf, region_off): (&[u8], usize) = if let Some(b) = self_mapped {
+            match map_off.checked_add(chunk_off) {
+                Some(off) => (b, off),
+                None => {
+                    warn_once("mapoffset + chunk offset overflows — frames dropped");
+                    return;
+                }
+            }
         } else if let Some(data) = d.data() {
-            data
+            (data, chunk_off)
         } else {
             warn_once("buffer has no mappable data — frames dropped");
             return;
         };
-        // Need stride*(h-1)+row valid bytes within [offset, offset+size).
-        if offset > buf.len() {
+        // Need stride*(h-1)+row valid bytes within [region_off, region_off+size).
+        if region_off > buf.len() {
             return;
         }
-        let avail = buf.len() - offset;
+        let avail = buf.len() - region_off;
         {
             // One-time geometry dump — makes a new compositor/GPU's buffer layout visible in the
             // logs (the kind of mismatch that crashed xdpw MemFd capture before the self-mmap fix).
@@ -2296,7 +2414,7 @@ mod pipewire {
             static ONCE: AtomicBool = AtomicBool::new(true);
             if ONCE.swap(false, Ordering::Relaxed) {
                 tracing::info!(
-                    stride, size, offset, buf_len = buf.len(), needed,
+                    stride, size, chunk_off, map_off, region_off, buf_len = buf.len(), needed,
                     data_type = ?data_type, fd_len = ?fd_len, self_mapped = self_mapped.is_some(),
                     "capture CPU de-pad geometry (first frame)"
                 );
@@ -2306,7 +2424,7 @@ mod pipewire {
             warn_once("buffer smaller than frame span — frames dropped");
             return;
         }
-        let region = &buf[offset..offset + size.min(avail)];
+        let region = &buf[region_off..region_off + size.min(avail)];
         // De-pad into a tightly-packed buffer (chunk stride may exceed w*bpp).
         let mut tight = vec![0u8; row * h];
         for y in 0..h {
@@ -2329,15 +2447,18 @@ mod pipewire {
             // Already composited inline into `tight` above — nothing for the encoder to blend.
             cursor: None,
         };
-        // Drop if the encoder is behind — never block the pipewire loop.
-        let _ = ud.tx.try_send(frame);
+        // Overwrite whatever the consumer has not taken yet — never block the pipewire loop.
+        ud.publish(frame);
     }
 
     #[allow(clippy::too_many_arguments)]
     pub fn pipewire_thread(
         fd: Option<OwnedFd>,
         node_id: u32,
-        tx: SyncSender<CapturedFrame>,
+        // The frame mailbox + its wakeup sender (see `super::FrameSlot`): publishing OVERWRITES,
+        // so a stalled consumer costs the intermediate frames, never the freshest one.
+        slot: super::FrameSlot,
+        wake: SyncSender<()>,
         active: Arc<AtomicBool>,
         negotiated: Arc<AtomicBool>,
         streaming: Arc<AtomicBool>,
@@ -2517,7 +2638,8 @@ mod pipewire {
             info: VideoInfoRaw::default(),
             format: None,
             modifier: 0,
-            tx,
+            slot,
+            wake,
             active,
             negotiated,
             streaming,
