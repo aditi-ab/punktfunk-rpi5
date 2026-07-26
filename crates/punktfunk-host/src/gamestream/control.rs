@@ -78,6 +78,10 @@ pub fn spawn(state: Arc<AppState>) -> Result<()> {
             // One-shot latch for the HDR-mode control message (0x010e); re-armed on Disconnect.
             let mut hdr_sent = false;
             let mut peer: Option<PeerID> = None;
+            // The session's GCM key, remembered from the last tick it was live. Ending a session
+            // clears `launch` — and the key lives there — so without this copy the one message that
+            // has to go out *because* the session ended could no longer be sealed.
+            let mut last_key: Option<[u8; 16]> = None;
             loop {
                 loop {
                     match host.service() {
@@ -165,19 +169,37 @@ pub fn spawn(state: Arc<AppState>) -> Result<()> {
                 // it lands when the user quits, which is exactly where "the game exited" should
                 // leave them.
                 //
+                // Merely dropping the peer is not enough either: the client reports that as a
+                // connection error (`-1` on glass, .173), because an ENet disconnect on its own is
+                // indistinguishable from the host falling over. The protocol has a word for this —
+                // a TERMINATION control message — so send that first and let the disconnect follow.
+                //
                 // `end_session` clears `launch`, so a tracked peer with no launch behind it *is*
                 // the ended session. Clearing `peer` first makes this fire once; the real
                 // `Disconnect` event that follows then takes the non-session-peer branch, which is
                 // why this arm repeats that branch's per-connection cleanup.
                 if let Some(pid) = peer {
-                    if state
+                    let ended = state
                         .launch
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
-                        .is_none()
-                    {
-                        tracing::info!("control: the session ended — disconnecting the client");
-                        host.peer_mut(pid).disconnect(0);
+                        .is_none();
+                    if ended {
+                        // Only sealable once the client's scheme is known; without it, fall through
+                        // to the bare disconnect rather than send a packet it can't read.
+                        if let (Some(scheme), Some(key)) = (detected, last_key) {
+                            let pt = termination_plaintext(&scheme);
+                            let wire = encrypt_control(&key, &scheme, host_seq, &pt);
+                            host_seq = host_seq.wrapping_add(1);
+                            if let Err(e) = host.peer_mut(pid).send(0, &Packet::reliable(&wire[..]))
+                            {
+                                tracing::warn!(error = ?e, "control: termination send failed");
+                            }
+                        }
+                        tracing::info!("control: the session ended — telling the client");
+                        // `disconnect_later` flushes the queued termination first; a plain
+                        // `disconnect` would race it off the wire and land us back at "-1".
+                        host.peer_mut(pid).disconnect_later(0);
                         peer = None;
                         detected = None;
                         decrypt_fails = 0;
@@ -203,6 +225,10 @@ pub fn spawn(state: Arc<AppState>) -> Result<()> {
                 // use the native punktfunk/1 plane (correct per-direction nonces + seq-as-AAD).
                 if let (Some(pid), Some(scheme)) = (peer, detected) {
                     let key = state.launch.lock().unwrap().map(|s| s.gcm_key);
+                    // Remember it for the teardown message (see `last_key`).
+                    if key.is_some() {
+                        last_key = key;
+                    }
                     if let Some(key) = key {
                         let mut out: Vec<Vec<u8>> = Vec::new();
                         // One-shot HDR-mode signal (type 0x010e / Sunshine `IDX_HDR_MODE`) once the
@@ -579,6 +605,39 @@ fn hdr_mode_plaintext(enabled: bool, m: &HdrMeta) -> Vec<u8> {
     pt
 }
 
+/// Build the host→client TERMINATION control plaintext — "the session is over, on purpose".
+///
+/// Without it, ending a session host-side is invisible on the wire: the media threads simply stop,
+/// which the client cannot tell from a host that fell over, so it either sits on its last frame or
+/// (once we disconnect the peer) reports a connection error. This is the message that makes it a
+/// clean end, and the client returns to its app list.
+///
+/// Verified against moonlight-common-c `ControlStream.c` (master, 2026-07-26):
+///
+/// * **Type** is table-dependent, and the client picks the table from what we negotiated:
+///   `packetTypesGen7[IDX_TERMINATION] = 0x0100`, `packetTypesGen7Enc[…] = 0x0109`. We advertise no
+///   encryption support, so a legacy-nonce client is on the plain table; a V2 client is on the
+///   encrypted one. Sending the wrong one is merely ignored, but then we are back to a bare
+///   disconnect — so derive it rather than guess.
+/// * **Payload** is a big-endian `u32` reason (the ≥6-byte "extended" branch; the short branch is a
+///   little-endian `u16`, which is GFE's older shape).
+/// * **`0x80030023`** is `NVST_DISCONN_SERVER_TERMINATED_CLOSED`, which the client maps to
+///   `ML_ERROR_GRACEFUL_TERMINATION` *provided it has seen a frame* — true for any real session,
+///   and the reason this reads as "the app quit" rather than an error.
+fn termination_plaintext(scheme: &Scheme) -> Vec<u8> {
+    /// `NVST_DISCONN_SERVER_TERMINATED_CLOSED` — a deliberate, graceful host-side end.
+    const GRACEFUL: u32 = 0x8003_0023;
+    let ty: u16 = match scheme.nonce {
+        NonceKind::V2 { .. } => 0x0109,
+        NonceKind::LegacyLowByte | NonceKind::Legacy16Seq { .. } => 0x0100,
+    };
+    let mut pt = Vec::with_capacity(8);
+    pt.extend_from_slice(&ty.to_le_bytes());
+    pt.extend_from_slice(&4u16.to_le_bytes()); // length = the reason that follows
+    pt.extend_from_slice(&GRACEFUL.to_be_bytes()); // big-endian: the extended branch
+    pt
+}
+
 /// Seal a host→client control message, mirroring the client's `detected` scheme with the
 /// direction flipped: V2 nonces use marker `H?` (host-originated) instead of `C?`; legacy
 /// nonces keep their construction with our own independent `seq` counter. Wire layout matches
@@ -678,6 +737,40 @@ mod tests {
         assert_eq!(decode_rfi_range(&[0x01, 0x03, 0x00, 0x00]), None); // header only, no body
         assert_eq!(decode_rfi_range(&rfi_msg(-1, 9)), None); // negative first
         assert_eq!(decode_rfi_range(&rfi_msg(9, 4)), None); // last < first
+    }
+
+    /// The termination plaintext is what turns "the host went quiet" into "the app quit" on the
+    /// client. Getting the type from the wrong table, or the reason's byte order wrong, is silently
+    /// ignored by the client — which reads on glass as a frozen stream or a `-1` error, not as a
+    /// failed test. Pinned against moonlight-common-c `ControlStream.c`.
+    #[test]
+    fn termination_plaintext_wire_layout() {
+        let legacy = super::Scheme {
+            key_rev: false,
+            nonce: super::NonceKind::LegacyLowByte,
+            tag_first: true,
+            aad: super::Aad::None,
+        };
+        let pt = super::termination_plaintext(&legacy);
+        assert_eq!(pt.len(), 8);
+        // We advertise no encryption, so this client is on `packetTypesGen7`.
+        assert_eq!(&pt[0..2], &0x0100u16.to_le_bytes());
+        assert_eq!(&pt[2..4], &4u16.to_le_bytes());
+        // The reason is BIG-endian — the client's >=6-byte "extended" branch.
+        assert_eq!(&pt[4..8], &0x8003_0023u32.to_be_bytes());
+
+        // A V2-nonce client reads the encrypted table instead, where termination moved to 0x0109.
+        let v2 = super::Scheme {
+            nonce: super::NonceKind::V2 {
+                seq_be: false,
+                marker: [b'C', b'C'],
+            },
+            ..legacy
+        };
+        assert_eq!(
+            &super::termination_plaintext(&v2)[0..2],
+            &0x0109u16.to_le_bytes()
+        );
     }
 
     /// The HDR-mode plaintext must match what moonlight-common-c parses: `[u16 type=0x010e]
