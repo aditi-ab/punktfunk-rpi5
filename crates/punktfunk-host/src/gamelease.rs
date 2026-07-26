@@ -465,7 +465,19 @@ fn watch(shared: Arc<LeaseShared>, mut child: Option<std::process::Child>, on_ex
 
         // The child being alive counts as the game running for a `Child` lease, so a title with no
         // detect signals is still fully tracked.
-        let child_alive = matches!(kind, LeaseKind::Child) && child.is_some();
+        //
+        // But a launcher that is about to hand off and exit looks *exactly* like the game for its
+        // first few seconds. When the store gave us signals to recognize the real game by, wait out
+        // the shim window before believing this child is it — otherwise the lease leaves this phase
+        // on its very first poll, the reclassification above never gets to run, and the hand-off
+        // that follows is read as the game exiting. On Linux that ended a session ~7 s after
+        // launching any Steam title, before the game had even started (on glass, .41).
+        //
+        // With no signals the child is all we have, so it still counts immediately: a custom command
+        // is tracked exactly as before.
+        let child_alive = matches!(kind, LeaseKind::Child)
+            && child.is_some()
+            && (shared.spec.is_empty() || spawned_at.elapsed() >= SHIM_WINDOW);
         let live = scanner.find(&shared.spec, shared.launch_stamp);
         if !live.is_empty() || child_alive {
             known = live.clone();
@@ -1133,6 +1145,59 @@ mod tests {
         // An id nobody is waiting on ends nothing.
         assert_eq!(end_pending(Some("steam:99999")), 0);
         assert_eq!(readopt(Some("fp-151"), Some(b)), 1);
+    }
+
+    /// A launcher that hands off and exits must never be mistaken for the game.
+    ///
+    /// This is the `steam steam://rungameid/…` shape: the host spawns a launcher as its own child,
+    /// the launcher tells the already-running Steam to start the game and exits within a couple of
+    /// seconds, and the game itself appears later (or, here, never). Ending the session on that exit
+    /// is the failure this guards — it killed Linux Steam launches ~7 s in, before the game started.
+    ///
+    /// The spec deliberately matches nothing: what is asserted is that a *quick, successful* child
+    /// exit is treated as a hand-off to wait out, not as the game being gone.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_launcher_that_hands_off_and_exits_is_not_the_game_exiting() {
+        use std::sync::atomic::AtomicUsize;
+
+        static EXITS: AtomicUsize = AtomicUsize::new(0);
+        EXITS.store(0, Ordering::SeqCst);
+        let child = std::process::Command::new("/bin/true")
+            .spawn()
+            .expect("spawn the fake launcher");
+        let lease = open(
+            LeaseRequest {
+                game: GameRef {
+                    id: Some("steam:999001".into()),
+                    store: Some("steam".into()),
+                    title: "Handoff".into(),
+                },
+                client: "test".into(),
+                plane: crate::events::Plane::Native,
+                // A real signal that no process will ever match — the game never shows up.
+                spec: DetectSpec::steam(999_001),
+                nested: false,
+                child: Some((child, false)),
+                launch_stamp: None,
+            },
+            Box::new(|| {
+                EXITS.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+        // Past the shim window plus the exit-confirmation window: comfortably longer than the buggy
+        // path took to declare the game gone.
+        std::thread::sleep(SHIM_WINDOW + EXIT_CONFIRM + Duration::from_secs(2));
+        assert_eq!(
+            EXITS.load(Ordering::SeqCst),
+            0,
+            "a launcher handing off must not end the session"
+        );
+        assert_ne!(
+            lease.shared().state(),
+            GameState::Exited,
+            "the game never ran, so it cannot have exited"
+        );
     }
 
     /// The whole point of the module, against a real process: a `Child` lease sees its game running,

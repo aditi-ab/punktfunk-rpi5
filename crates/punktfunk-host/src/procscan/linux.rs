@@ -542,8 +542,14 @@ mod tests {
         // it from there. (A wrapper script that `exec`s something outside the directory would leave no
         // trace of the directory in either the image path or the command line — worth knowing, and the
         // reason a copied binary is the honest fixture here.)
+        //
+        // It has to keep the name `sleep`. Modern coreutils (uutils on Ubuntu 25.10+, busybox
+        // elsewhere) is a MULTI-CALL binary that dispatches on `argv[0]`: copied to any other name it
+        // prints "unknown program" and exits instantly, leaving nothing in `/proc` to find — which
+        // looks exactly like the matcher being broken. That cost a CI red, green on a distro with a
+        // standalone `sleep` and failing on one without.
         let td = tempfile::tempdir().expect("tempdir");
-        let game = td.path().join("game");
+        let game = td.path().join("sleep");
         std::fs::copy("/bin/sleep", &game).expect("copy a stand-in game binary");
         let s = Scanner::system();
         let before = s.now_stamp().expect("real /proc/uptime is readable");
