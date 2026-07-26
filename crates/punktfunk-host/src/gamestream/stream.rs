@@ -595,14 +595,12 @@ fn open_gs_virtual_source(
     };
     let mut vd = crate::vdisplay::open(compositor).context("open virtual display")?;
     // Carry the resolved launch command on the backend instance (per-session) rather than a
-    // process-global env var, so concurrent sessions can't stomp each other's launch target. On
-    // Linux resolve a library-id selection to its command too, so gamescope's bare spawn nests a
-    // library title exactly like an apps.json command (it previously nested only `cmd`, silently
-    // dropping library picks).
-    #[cfg(target_os = "linux")]
+    // process-global env var, so concurrent sessions can't stomp each other's launch target. It is
+    // the RESOLVED command, so gamescope's bare spawn nests a library title exactly like an
+    // apps.json command (it previously nested only `cmd`, silently dropping library picks). Off
+    // Linux this is a no-op backend-side, and a library title resolves to no command at all — the
+    // interactive-session spawner launches it by id instead.
     vd.set_launch_command(launch.and_then(|t| t.command.clone()));
-    #[cfg(not(target_os = "linux"))]
-    vd.set_launch_command(app.and_then(|a| a.cmd.clone()));
     // Serialize with the punktfunk/1 plane's IDD-push setup dance (Goal-1 §2.5). A GameStream
     // connect used to skip it entirely, so it could ADD/reconfigure the shared monitor while a
     // native session was mid-build (and vice versa), and its sealed-channel delivery would replace

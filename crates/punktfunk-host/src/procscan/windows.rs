@@ -292,6 +292,42 @@ mod tests {
         ));
     }
 
+    /// The operator-supplied fallback ([`DetectSpec::process_name`]): the image's own file name and
+    /// nothing else — never a path that merely contains the name.
+    #[test]
+    fn process_name_matches_the_image_name_only() {
+        assert!(same_name(
+            Path::new(r"C:\Games\Hades\Hades.exe"),
+            "hades.exe"
+        ));
+        assert!(same_name(
+            Path::new(r"C:\Games\Hades\Hades.exe"),
+            " Hades.exe "
+        ));
+        // A longer name that starts the same way is a different program.
+        assert!(!same_name(
+            Path::new(r"C:\Games\Hades\HadesLauncher.exe"),
+            "Hades.exe"
+        ));
+        // A directory called the same thing doesn't qualify its contents.
+        assert!(!same_name(
+            Path::new(r"C:\Games\Hades.exe\other.exe"),
+            "Hades.exe"
+        ));
+
+        // …and it reaches the live scan, which the `find` early-return would otherwise skip.
+        let me = std::env::current_exe().expect("current exe");
+        let name = me.file_name().and_then(|n| n.to_str()).expect("exe name");
+        let spec = DetectSpec {
+            process_name: Some(name.to_ascii_uppercase()),
+            ..Default::default()
+        };
+        assert!(Scanner::system()
+            .find(&spec, None)
+            .iter()
+            .any(|p| p.pid == std::process::id()));
+    }
+
     #[test]
     fn a_spec_with_no_path_signal_matches_nothing() {
         // No reaper and no environment reading on Windows: an appid-only or env-only spec has nothing
