@@ -153,6 +153,23 @@ export const library: GameEntry[] = [
 		art: noArt,
 		launch: null,
 	},
+	// An emulated title with the metadata fields filled — exercises the platform
+	// badge (non-PC) and the year in the caption.
+	{
+		id: "custom:sotc",
+		store: "custom",
+		title: "Shadow of the Colossus",
+		art: noArt,
+		launch: null,
+		platform: "PS2",
+		developer: "Team Ico",
+		publisher: "Sony Computer Entertainment",
+		release_year: 2005,
+		genres: ["Adventure"],
+		tags: ["favorite"],
+		region: "PAL",
+		players: 1,
+	},
 ];
 
 // --- Performance (stats) page ------------------------------------------------

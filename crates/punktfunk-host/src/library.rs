@@ -85,6 +85,57 @@ pub struct LaunchSpec {
     pub value: String,
 }
 
+/// Descriptive metadata for a title — everything a richer library UI (details pane, platform
+/// filter, couch-pick badges) renders beyond the poster. Every field is optional and defaults to
+/// absent, so pre-metadata catalogs, providers, and clients keep working unchanged. The struct is
+/// `#[serde(flatten)]`-ed into [`GameEntry`] / the custom-store shapes: one definition, a flat
+/// wire shape everywhere.
+///
+/// Values are free-form display strings, not enums — emulation sources (RomM, EmuDeck, Playnite)
+/// each have their own vocabulary and the host has no business normalizing it.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, ToSchema)]
+pub struct GameMeta {
+    /// The system the title runs on — `"PS2"`, `"Xbox 360"`, `"SNES"`, … Installed-store
+    /// scanners stamp `"PC"`; `GET /library?platform=` filters on it (case-insensitive).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(example = "PS2")]
+    pub platform: Option<String>,
+    /// Short blurb for a details pane.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub developer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publisher: Option<String>,
+    /// Year of first release — the granularity metadata sources reliably agree on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(example = 2001)]
+    pub release_year: Option<u16>,
+    /// Genre taxonomy from the metadata source (`"RPG"`, `"Platformer"`, …).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub genres: Vec<String>,
+    /// Free-form organizational labels (`"co-op"`, `"kids"`, `"finished"`, …).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    /// Release region — emulation-relevant (`"NTSC-U"`, `"PAL"`, `"NTSC-J"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+    /// Maximum simultaneous (local) players.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub players: Option<u8>,
+}
+
+impl GameMeta {
+    /// The one field an installed-store scanner can assert about its own titles: they run on this
+    /// host, i.e. on a PC. Everything else stays absent (the launchers' local files don't carry it).
+    pub(crate) fn pc() -> Self {
+        GameMeta {
+            platform: Some("PC".into()),
+            ..Default::default()
+        }
+    }
+}
+
 /// One title in the unified library, regardless of which store it came from.
 #[derive(Clone, Debug, Serialize, ToSchema)]
 pub struct GameEntry {
@@ -113,6 +164,9 @@ pub struct GameEntry {
     #[serde(skip)]
     #[schema(ignore)]
     pub detect: DetectSpec,
+    /// Descriptive metadata, flattened — see [`GameMeta`].
+    #[serde(flatten)]
+    pub meta: GameMeta,
 }
 
 /// A store that contributes titles to the library. The trait is the extension point for future

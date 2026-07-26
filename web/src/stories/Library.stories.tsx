@@ -13,6 +13,15 @@ const emptyForm = {
 	header: "",
 	logo: "",
 	command: "",
+	platform: "",
+	description: "",
+	developer: "",
+	publisher: "",
+	releaseYear: "",
+	genres: "",
+	tags: "",
+	region: "",
+	players: "",
 };
 
 // The overview grid and the add/edit form are separate components now, so the stories

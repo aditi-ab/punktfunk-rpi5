@@ -62,6 +62,10 @@ pub struct GameEntry {
     pub title: String,
     #[serde(default)]
     pub art: Artwork,
+    /// The system the title runs on (`"PC"`, `"PS2"`, …) — free-form display string from the
+    /// host's flattened `GameMeta`; the rest of the metadata is not decoded until a UI needs it.
+    #[serde(default)]
+    pub platform: Option<String>,
 }
 
 /// Errors surfaced to the UI so it can guide setup (the common case is "not paired yet").
@@ -280,7 +284,7 @@ mod tests {
     fn game_entry_decodes_the_wire_shape() {
         // The exact shape mgmt.rs serializes (optional art fields omitted, launch ignored).
         let json = r#"[
-            {"id":"steam:570","store":"steam","title":"Dota 2",
+            {"id":"steam:570","store":"steam","title":"Dota 2","platform":"PC",
              "art":{"portrait":"/api/v1/library/art/steam:570/portrait"},
              "launch":{"kind":"steam_appid","value":"570"}},
             {"id":"custom:abc","store":"custom","title":"My Emu","art":{}}
@@ -288,7 +292,12 @@ mod tests {
         let games: Vec<GameEntry> = serde_json::from_str(json).unwrap();
         assert_eq!(games.len(), 2);
         assert_eq!(games[0].id, "steam:570");
+        assert_eq!(games[0].platform.as_deref(), Some("PC"));
         assert!(games[1].art.portrait.is_none());
+        assert!(
+            games[1].platform.is_none(),
+            "pre-metadata hosts still parse"
+        );
     }
 
     #[test]

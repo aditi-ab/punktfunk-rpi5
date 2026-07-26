@@ -37,6 +37,9 @@ pub struct CustomEntry {
     /// the host would otherwise lose the game the moment the shim returns.
     #[serde(default, skip_serializing_if = "DetectHint::is_empty")]
     pub detect: DetectHint,
+    /// Descriptive metadata (platform, description, …), flattened — see [`GameMeta`].
+    #[serde(flatten)]
+    pub meta: GameMeta,
 }
 
 /// Request body to create or replace a custom entry (no `id` — the host owns it).
@@ -53,6 +56,10 @@ pub struct CustomInput {
     /// How to recognize this title's process — see [`CustomEntry::detect`].
     #[serde(default)]
     pub detect: DetectHint,
+    /// Descriptive metadata (platform, description, …), flattened — see [`GameMeta`]. Replaced
+    /// wholesale on update, like `art`: an edit must round-trip every field it wants kept.
+    #[serde(flatten)]
+    pub meta: GameMeta,
 }
 
 /// One title in a provider's declarative reconcile payload (RFC §8): [`CustomInput`] plus the
@@ -74,6 +81,9 @@ pub struct ProviderEntryInput {
     /// through the provider's own client still end its session when the player quits.
     #[serde(default)]
     pub detect: DetectHint,
+    /// Descriptive metadata (platform, description, …), flattened — see [`GameMeta`].
+    #[serde(flatten)]
+    pub meta: GameMeta,
 }
 
 impl From<CustomEntry> for GameEntry {
@@ -98,6 +108,7 @@ impl From<CustomEntry> for GameEntry {
             launch: c.launch,
             provider: c.provider,
             detect,
+            meta: c.meta,
         }
     }
 }
@@ -188,6 +199,7 @@ pub fn add_custom(input: CustomInput) -> Result<CustomEntry> {
         provider: None,
         external_id: None,
         detect: input.detect,
+        meta: input.meta,
     };
     entries.push(entry.clone());
     save_custom(&entries)?;
@@ -210,6 +222,7 @@ pub fn update_custom(id: &str, input: CustomInput) -> Result<MutateOutcome<Custo
     slot.launch = input.launch;
     slot.prep = input.prep;
     slot.detect = input.detect;
+    slot.meta = input.meta;
     let updated = slot.clone();
     save_custom(&entries)?;
     emit_changed("manual");
@@ -305,6 +318,7 @@ fn reconcile_entries(
             provider: Some(provider.to_string()),
             external_id: Some(input.external_id),
             detect: input.detect,
+            meta: input.meta,
         });
     }
     // `existing`'s leftovers are the orphans — deliberately dropped (declarative reconcile).
@@ -383,6 +397,7 @@ mod tests {
             provider: None,
             external_id: None,
             detect: DetectHint::default(),
+            meta: GameMeta::default(),
         }
     }
 
@@ -394,6 +409,7 @@ mod tests {
             launch: None,
             prep: Vec::new(),
             detect: DetectHint::default(),
+            meta: GameMeta::default(),
         }
     }
 
@@ -407,8 +423,43 @@ mod tests {
         let mut e = manual("def456", "Synced");
         e.provider = Some("romm".into());
         e.external_id = Some("rom-1".into());
+        e.meta.platform = Some("PS2".into());
         let g: GameEntry = e.into();
         assert_eq!(g.provider.as_deref(), Some("romm"));
+        assert_eq!(g.meta.platform.as_deref(), Some("PS2"));
+    }
+
+    /// The metadata contract on the wire and on disk: fields serialize FLAT (no `meta` nesting —
+    /// clients and plugins see `platform` beside `title`), absent fields vanish entirely, and a
+    /// pre-metadata `library.json` / payload still parses (all-optional).
+    #[test]
+    fn meta_is_flat_and_optional_on_the_wire() {
+        let mut e = manual("abc123", "Shadow of the Colossus");
+        e.meta = GameMeta {
+            platform: Some("PS2".into()),
+            release_year: Some(2005),
+            genres: vec!["Adventure".into()],
+            ..Default::default()
+        };
+        let v = serde_json::to_value(&e).unwrap();
+        assert_eq!(v["platform"], "PS2");
+        assert_eq!(v["release_year"], 2005);
+        assert_eq!(v["genres"][0], "Adventure");
+        assert!(v.get("meta").is_none(), "flattened, not nested");
+        assert!(v.get("description").is_none(), "absent fields are omitted");
+        assert!(v.get("tags").is_none(), "empty lists are omitted");
+
+        // A pre-metadata entry (what an existing library.json holds) still deserializes.
+        let old = r#"{"id":"abc","title":"Old"}"#;
+        let e: CustomEntry = serde_json::from_str(old).unwrap();
+        assert!(e.meta.platform.is_none());
+
+        // And a provider payload can carry the fields flat, next to `title` (RFC §8 shape).
+        let payload = r#"{"external_id":"rom-1","title":"OoT","platform":"N64",
+                          "region":"NTSC-U","players":1,"tags":["kids"]}"#;
+        let p: ProviderEntryInput = serde_json::from_str(payload).unwrap();
+        assert_eq!(p.meta.platform.as_deref(), Some("N64"));
+        assert_eq!(p.meta.players, Some(1));
     }
 
     /// The RFC §8 contract in one walk: add keeps ids stable across re-syncs, updates flow,

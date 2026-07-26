@@ -22,6 +22,17 @@ interface FormState {
 	header: string;
 	logo: string;
 	command: string;
+	// Details — the flattened GameMeta fields; numbers and lists are kept as the raw
+	// text the user typed and only parsed on submit.
+	platform: string;
+	description: string;
+	developer: string;
+	publisher: string;
+	releaseYear: string;
+	genres: string;
+	tags: string;
+	region: string;
+	players: string;
 }
 
 const emptyForm: FormState = {
@@ -31,6 +42,15 @@ const emptyForm: FormState = {
 	header: "",
 	logo: "",
 	command: "",
+	platform: "",
+	description: "",
+	developer: "",
+	publisher: "",
+	releaseYear: "",
+	genres: "",
+	tags: "",
+	region: "",
+	players: "",
 };
 
 function formFrom(entry: GameEntry): FormState {
@@ -41,16 +61,37 @@ function formFrom(entry: GameEntry): FormState {
 		header: entry.art.header ?? "",
 		logo: entry.art.logo ?? "",
 		command: entry.launch?.kind === "command" ? entry.launch.value : "",
+		platform: entry.platform ?? "",
+		description: entry.description ?? "",
+		developer: entry.developer ?? "",
+		publisher: entry.publisher ?? "",
+		releaseYear: entry.release_year?.toString() ?? "",
+		genres: entry.genres?.join(", ") ?? "",
+		tags: entry.tags?.join(", ") ?? "",
+		region: entry.region ?? "",
+		players: entry.players?.toString() ?? "",
 	};
 }
 
 /** Map the form to the API body — only attach `launch` when a command was given. `update_custom`
- * REPLACES the whole `art`, so every field the form knows must round-trip (else editing a game with
- * a `logo` would silently drop it). */
+ * REPLACES the whole entry (art AND the metadata fields), so every field the form knows must
+ * round-trip (else editing a game with a `logo` or a `platform` would silently drop it). */
 function toInput(f: FormState): CustomInput {
 	const trim = (s: string) => {
 		const t = s.trim();
 		return t ? t : undefined;
+	};
+	// "RPG, Platformer" → ["RPG", "Platformer"]; empty input → omitted entirely.
+	const list = (s: string) => {
+		const items = s
+			.split(",")
+			.map((x) => x.trim())
+			.filter(Boolean);
+		return items.length ? items : undefined;
+	};
+	const int = (s: string) => {
+		const n = Number.parseInt(s.trim(), 10);
+		return Number.isFinite(n) ? n : undefined;
 	};
 	const command = f.command.trim();
 	return {
@@ -62,6 +103,15 @@ function toInput(f: FormState): CustomInput {
 			logo: trim(f.logo),
 		},
 		launch: command ? { kind: "command", value: command } : null,
+		platform: trim(f.platform),
+		description: trim(f.description),
+		developer: trim(f.developer),
+		publisher: trim(f.publisher),
+		release_year: int(f.releaseYear),
+		genres: list(f.genres),
+		tags: list(f.tags),
+		region: trim(f.region),
+		players: int(f.players),
 	};
 }
 
@@ -101,6 +151,32 @@ export const GameFormSection: FC<{
 	);
 };
 
+/** One labeled text input bound to a FormState key — the form is a stack of these. */
+const Field: FC<{
+	id: keyof FormState;
+	label: string;
+	value: string;
+	onChange: (value: string) => void;
+	help?: string;
+	type?: string;
+	required?: boolean;
+}> = ({ id, label, value, onChange, help, type, required }) => (
+	<div className="space-y-2">
+		<Label htmlFor={`lib-${id}`}>{label}</Label>
+		<Input
+			id={`lib-${id}`}
+			type={type}
+			inputMode={
+				type === "url" ? "url" : type === "number" ? "numeric" : undefined
+			}
+			required={required}
+			value={value}
+			onChange={(e) => onChange(e.target.value)}
+		/>
+		{help && <p className="text-xs text-muted-foreground">{help}</p>}
+	</div>
+);
+
 /**
  * The add/edit form card. Owns only its own field state (re-seeded per mount — the
  * parent keys it by target); reports a ready-to-send `CustomInput` on submit.
@@ -113,6 +189,8 @@ export const GameForm: FC<{
 	isSaving: boolean;
 }> = ({ initial, mode, onSubmit, onCancel, isSaving }) => {
 	const [form, setForm] = useState<FormState>(initial);
+	const set = (key: keyof FormState) => (value: string) =>
+		setForm((f) => ({ ...f, [key]: value }));
 
 	const handleSubmit = (e: FormEvent) => {
 		e.preventDefault();
@@ -138,74 +216,121 @@ export const GameForm: FC<{
 			</CardHeader>
 			<CardContent>
 				<form onSubmit={handleSubmit} className="space-y-4">
-					<div className="space-y-2">
-						<Label htmlFor="lib-title">{m.library_field_title()}</Label>
-						<Input
-							id="lib-title"
-							required
-							value={form.title}
-							onChange={(e) =>
-								setForm((f) => ({ ...f, title: e.target.value }))
-							}
-						/>
-					</div>
-					<div className="space-y-2">
-						<Label htmlFor="lib-portrait">{m.library_field_portrait()}</Label>
-						<Input
-							id="lib-portrait"
-							type="url"
-							inputMode="url"
-							value={form.portrait}
-							onChange={(e) =>
-								setForm((f) => ({ ...f, portrait: e.target.value }))
-							}
-						/>
-					</div>
-					<div className="space-y-2">
-						<Label htmlFor="lib-hero">{m.library_field_hero()}</Label>
-						<Input
-							id="lib-hero"
-							type="url"
-							inputMode="url"
-							value={form.hero}
-							onChange={(e) => setForm((f) => ({ ...f, hero: e.target.value }))}
-						/>
-					</div>
-					<div className="space-y-2">
-						<Label htmlFor="lib-header">{m.library_field_header()}</Label>
-						<Input
-							id="lib-header"
-							type="url"
-							inputMode="url"
-							value={form.header}
-							onChange={(e) =>
-								setForm((f) => ({ ...f, header: e.target.value }))
-							}
-						/>
-					</div>
-					<div className="space-y-2">
-						<Label htmlFor="lib-logo">{m.library_field_logo()}</Label>
-						<Input
-							id="lib-logo"
-							type="url"
-							inputMode="url"
-							value={form.logo}
-							onChange={(e) => setForm((f) => ({ ...f, logo: e.target.value }))}
-						/>
-					</div>
-					<div className="space-y-2">
-						<Label htmlFor="lib-command">{m.library_field_command()}</Label>
-						<Input
-							id="lib-command"
-							value={form.command}
-							onChange={(e) =>
-								setForm((f) => ({ ...f, command: e.target.value }))
-							}
-						/>
-						<p className="text-xs text-muted-foreground">
-							{m.library_field_command_help()}
+					<Field
+						id="title"
+						label={m.library_field_title()}
+						value={form.title}
+						onChange={set("title")}
+						required
+					/>
+					<Field
+						id="portrait"
+						label={m.library_field_portrait()}
+						value={form.portrait}
+						onChange={set("portrait")}
+						type="url"
+					/>
+					<Field
+						id="hero"
+						label={m.library_field_hero()}
+						value={form.hero}
+						onChange={set("hero")}
+						type="url"
+					/>
+					<Field
+						id="header"
+						label={m.library_field_header()}
+						value={form.header}
+						onChange={set("header")}
+						type="url"
+					/>
+					<Field
+						id="logo"
+						label={m.library_field_logo()}
+						value={form.logo}
+						onChange={set("logo")}
+						type="url"
+					/>
+					<Field
+						id="command"
+						label={m.library_field_command()}
+						value={form.command}
+						onChange={set("command")}
+						help={m.library_field_command_help()}
+					/>
+					<fieldset className="space-y-4 border-t pt-2">
+						<legend className="sr-only">{m.library_details_legend()}</legend>
+						<p
+							aria-hidden
+							className="text-sm font-medium text-muted-foreground"
+						>
+							{m.library_details_legend()}
 						</p>
-					</div>
+						<Field
+							id="platform"
+							label={m.library_field_platform()}
+							value={form.platform}
+							onChange={set("platform")}
+							help={m.library_field_platform_help()}
+						/>
+						<Field
+							id="description"
+							label={m.library_field_description()}
+							value={form.description}
+							onChange={set("description")}
+						/>
+						<div className="grid grid-cols-2 gap-4">
+							<Field
+								id="developer"
+								label={m.library_field_developer()}
+								value={form.developer}
+								onChange={set("developer")}
+							/>
+							<Field
+								id="publisher"
+								label={m.library_field_publisher()}
+								value={form.publisher}
+								onChange={set("publisher")}
+							/>
+						</div>
+						<div className="grid grid-cols-2 gap-4">
+							<Field
+								id="releaseYear"
+								label={m.library_field_release_year()}
+								value={form.releaseYear}
+								onChange={set("releaseYear")}
+								type="number"
+							/>
+							<Field
+								id="players"
+								label={m.library_field_players()}
+								value={form.players}
+								onChange={set("players")}
+								type="number"
+							/>
+						</div>
+						<Field
+							id="region"
+							label={m.library_field_region()}
+							value={form.region}
+							onChange={set("region")}
+							help={m.library_field_region_help()}
+						/>
+						<Field
+							id="genres"
+							label={m.library_field_genres()}
+							value={form.genres}
+							onChange={set("genres")}
+							help={m.library_field_genres_help()}
+						/>
+						<Field
+							id="tags"
+							label={m.library_field_tags()}
+							value={form.tags}
+							onChange={set("tags")}
+							help={m.library_field_tags_help()}
+						/>
+					</fieldset>
 					<div className="flex gap-2">
 						<Button type="submit" disabled={isSaving || !form.title.trim()}>
 							{mode === "edit" ? m.library_save() : m.library_create()}

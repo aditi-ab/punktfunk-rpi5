@@ -965,13 +965,22 @@
           "library"
         ],
         "summary": "List the game library",
-        "description": "Every installed-store title (Steam, read from the host's local files — no Steam API key)\nmerged with the user's custom entries, sorted by title. Artwork fields are URLs the client\nfetches directly (the public Steam CDN for Steam titles). `?provider=` narrows to the\nentries a given external provider owns.",
+        "description": "Every installed-store title (Steam, read from the host's local files — no Steam API key)\nmerged with the user's custom entries, sorted by title. Artwork fields are URLs the client\nfetches directly (the public Steam CDN for Steam titles). `?provider=` narrows to the\nentries a given external provider owns; `?platform=` to one platform (case-insensitive —\ninstalled-store titles are `PC`, custom/provider entries carry whatever was authored).",
         "operationId": "getLibrary",
         "parameters": [
           {
             "name": "provider",
             "in": "query",
             "description": "Only entries owned by this external provider",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "platform",
+            "in": "query",
+            "description": "Only entries on this platform (case-insensitive, e.g. `PS2`)",
             "required": false,
             "schema": {
               "type": "string"
@@ -4012,95 +4021,111 @@
         }
       },
       "CustomEntry": {
-        "type": "object",
-        "description": "A user-added title, persisted in the hardened host config dir's `library.json` (see\n[`custom_path`]). Same shape the API returns and the web console edits.",
-        "required": [
-          "id",
-          "title"
-        ],
-        "properties": {
-          "art": {
-            "$ref": "#/components/schemas/Artwork"
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/GameMeta",
+            "description": "Descriptive metadata (platform, description, …), flattened — see [`GameMeta`]."
           },
-          "detect": {
-            "$ref": "#/components/schemas/DetectHint",
-            "description": "How to recognize this title's process once it is running (design §9) — the one thing a\nprovider knows that the host cannot work out for itself.\n\nOptional: without it the entry is still tracked by the child the host spawns for it, which\ncovers every command that stays in the foreground. It earns its keep for a command that hands\noff and exits — a launcher script, a `flatpak run`, a front-end that starts an emulator — where\nthe host would otherwise lose the game the moment the shim returns."
-          },
-          "external_id": {
-            "type": [
-              "string",
-              "null"
+          {
+            "type": "object",
+            "required": [
+              "id",
+              "title"
             ],
-            "description": "The provider's own stable key for this title — the reconcile diff key, so the\nhost-assigned `id` stays stable across reconciles. Present iff `provider` is."
-          },
-          "id": {
-            "type": "string",
-            "description": "Host-assigned, stable for the life of the entry (the `{id}` in the CRUD path)."
-          },
-          "launch": {
-            "oneOf": [
-              {
-                "type": "null"
+            "properties": {
+              "art": {
+                "$ref": "#/components/schemas/Artwork"
               },
-              {
-                "$ref": "#/components/schemas/LaunchSpec"
+              "detect": {
+                "$ref": "#/components/schemas/DetectHint",
+                "description": "How to recognize this title's process once it is running (design §9) — the one thing a\nprovider knows that the host cannot work out for itself.\n\nOptional: without it the entry is still tracked by the child the host spawns for it, which\ncovers every command that stays in the foreground. It earns its keep for a command that hands\noff and exits — a launcher script, a `flatpak run`, a front-end that starts an emulator — where\nthe host would otherwise lose the game the moment the shim returns."
+              },
+              "external_id": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "The provider's own stable key for this title — the reconcile diff key, so the\nhost-assigned `id` stays stable across reconciles. Present iff `provider` is."
+              },
+              "id": {
+                "type": "string",
+                "description": "Host-assigned, stable for the life of the entry (the `{id}` in the CRUD path)."
+              },
+              "launch": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/LaunchSpec"
+                  }
+                ]
+              },
+              "prep": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/PrepCmd"
+                },
+                "description": "Per-title prep/undo steps (RFC §6): each `do` runs before this title launches, each\n`undo` at session end in reverse order (see [`crate::hooks::run_prep`])."
+              },
+              "provider": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "The external provider owning this entry (RFC §8), set ONLY by the provider reconcile\nAPI — `None` = a manual entry, which no provider operation ever touches, and which the\nmanual CRUD alone may edit (the converse holds too: manual CRUD refuses provider-owned\nentries, so ownership is never ambiguous)."
+              },
+              "title": {
+                "type": "string"
               }
-            ]
-          },
-          "prep": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/PrepCmd"
-            },
-            "description": "Per-title prep/undo steps (RFC §6): each `do` runs before this title launches, each\n`undo` at session end in reverse order (see [`crate::hooks::run_prep`])."
-          },
-          "provider": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "The external provider owning this entry (RFC §8), set ONLY by the provider reconcile\nAPI — `None` = a manual entry, which no provider operation ever touches, and which the\nmanual CRUD alone may edit (the converse holds too: manual CRUD refuses provider-owned\nentries, so ownership is never ambiguous)."
-          },
-          "title": {
-            "type": "string"
+            }
           }
-        }
+        ],
+        "description": "A user-added title, persisted in the hardened host config dir's `library.json` (see\n[`custom_path`]). Same shape the API returns and the web console edits."
       },
       "CustomInput": {
-        "type": "object",
-        "description": "Request body to create or replace a custom entry (no `id` — the host owns it).",
-        "required": [
-          "title"
-        ],
-        "properties": {
-          "art": {
-            "$ref": "#/components/schemas/Artwork"
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/GameMeta",
+            "description": "Descriptive metadata (platform, description, …), flattened — see [`GameMeta`]. Replaced\nwholesale on update, like `art`: an edit must round-trip every field it wants kept."
           },
-          "detect": {
-            "$ref": "#/components/schemas/DetectHint",
-            "description": "How to recognize this title's process — see [`CustomEntry::detect`]."
-          },
-          "launch": {
-            "oneOf": [
-              {
-                "type": "null"
+          {
+            "type": "object",
+            "required": [
+              "title"
+            ],
+            "properties": {
+              "art": {
+                "$ref": "#/components/schemas/Artwork"
               },
-              {
-                "$ref": "#/components/schemas/LaunchSpec"
+              "detect": {
+                "$ref": "#/components/schemas/DetectHint",
+                "description": "How to recognize this title's process — see [`CustomEntry::detect`]."
+              },
+              "launch": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/LaunchSpec"
+                  }
+                ]
+              },
+              "prep": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/PrepCmd"
+                },
+                "description": "Per-title prep/undo steps — commands run as the host user; operator-privileged config."
+              },
+              "title": {
+                "type": "string"
               }
-            ]
-          },
-          "prep": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/PrepCmd"
-            },
-            "description": "Per-title prep/undo steps — commands run as the host user; operator-privileged config."
-          },
-          "title": {
-            "type": "string"
+            }
           }
-        }
+        ],
+        "description": "Request body to create or replace a custom entry (no `id` — the host owns it)."
       },
       "CustomPreset": {
         "type": "object",
@@ -4750,48 +4775,129 @@
         ]
       },
       "GameEntry": {
-        "type": "object",
-        "description": "One title in the unified library, regardless of which store it came from.",
-        "required": [
-          "id",
-          "store",
-          "title",
-          "art"
-        ],
-        "properties": {
-          "art": {
-            "$ref": "#/components/schemas/Artwork"
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/GameMeta",
+            "description": "Descriptive metadata, flattened — see [`GameMeta`]."
           },
-          "id": {
-            "type": "string",
-            "description": "Stable, store-qualified id: `steam:<appid>` or `custom:<id>`.",
-            "example": "steam:570"
-          },
-          "launch": {
-            "oneOf": [
-              {
-                "type": "null"
+          {
+            "type": "object",
+            "required": [
+              "id",
+              "store",
+              "title",
+              "art"
+            ],
+            "properties": {
+              "art": {
+                "$ref": "#/components/schemas/Artwork"
               },
-              {
-                "$ref": "#/components/schemas/LaunchSpec",
-                "description": "How the host would launch it, when known."
+              "id": {
+                "type": "string",
+                "description": "Stable, store-qualified id: `steam:<appid>` or `custom:<id>`.",
+                "example": "steam:570"
+              },
+              "launch": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/LaunchSpec",
+                    "description": "How the host would launch it, when known."
+                  }
+                ]
+              },
+              "provider": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "The external provider owning this entry (custom-store entries synced by a provider\nplugin, RFC §8) — `None` for installed-store titles and manual custom entries. The\nconsole uses it for attribution; `GET /library?provider=` filters on it."
+              },
+              "store": {
+                "type": "string",
+                "description": "Which store surfaced it: `\"steam\"` or `\"custom\"`.",
+                "example": "steam"
+              },
+              "title": {
+                "type": "string"
               }
-            ]
-          },
-          "provider": {
+            }
+          }
+        ],
+        "description": "One title in the unified library, regardless of which store it came from."
+      },
+      "GameMeta": {
+        "type": "object",
+        "description": "Descriptive metadata for a title — everything a richer library UI (details pane, platform\nfilter, couch-pick badges) renders beyond the poster. Every field is optional and defaults to\nabsent, so pre-metadata catalogs, providers, and clients keep working unchanged. The struct is\n`#[serde(flatten)]`-ed into [`GameEntry`] / the custom-store shapes: one definition, a flat\nwire shape everywhere.\n\nValues are free-form display strings, not enums — emulation sources (RomM, EmuDeck, Playnite)\neach have their own vocabulary and the host has no business normalizing it.",
+        "properties": {
+          "description": {
             "type": [
               "string",
               "null"
             ],
-            "description": "The external provider owning this entry (custom-store entries synced by a provider\nplugin, RFC §8) — `None` for installed-store titles and manual custom entries. The\nconsole uses it for attribution; `GET /library?provider=` filters on it."
+            "description": "Short blurb for a details pane."
           },
-          "store": {
-            "type": "string",
-            "description": "Which store surfaced it: `\"steam\"` or `\"custom\"`.",
-            "example": "steam"
+          "developer": {
+            "type": [
+              "string",
+              "null"
+            ]
           },
-          "title": {
-            "type": "string"
+          "genres": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Genre taxonomy from the metadata source (`\"RPG\"`, `\"Platformer\"`, …)."
+          },
+          "platform": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The system the title runs on — `\"PS2\"`, `\"Xbox 360\"`, `\"SNES\"`, … Installed-store\nscanners stamp `\"PC\"`; `GET /library?platform=` filters on it (case-insensitive).",
+            "example": "PS2"
+          },
+          "players": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Maximum simultaneous (local) players.",
+            "minimum": 0
+          },
+          "publisher": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "region": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Release region — emulation-relevant (`\"NTSC-U\"`, `\"PAL\"`, `\"NTSC-J\"`)."
+          },
+          "release_year": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Year of first release — the granularity metadata sources reliably agree on.",
+            "example": 2001,
+            "minimum": 0
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Free-form organizational labels (`\"co-op\"`, `\"kids\"`, `\"finished\"`, …)."
           }
         }
       },
@@ -6003,45 +6109,53 @@
         }
       },
       "ProviderEntryInput": {
-        "type": "object",
-        "description": "One title in a provider's declarative reconcile payload (RFC §8): [`CustomInput`] plus the\nprovider's required stable key.",
-        "required": [
-          "external_id",
-          "title"
-        ],
-        "properties": {
-          "art": {
-            "$ref": "#/components/schemas/Artwork"
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/GameMeta",
+            "description": "Descriptive metadata (platform, description, …), flattened — see [`GameMeta`]."
           },
-          "detect": {
-            "$ref": "#/components/schemas/DetectHint",
-            "description": "How to recognize this title's process — see [`CustomEntry::detect`]. A provider that knows its\ntitles' install directories (Playnite does) should send them: it is what lets a game launched\nthrough the provider's own client still end its session when the player quits."
-          },
-          "external_id": {
-            "type": "string",
-            "description": "The provider's stable id for this title (the reconcile diff key)."
-          },
-          "launch": {
-            "oneOf": [
-              {
-                "type": "null"
+          {
+            "type": "object",
+            "required": [
+              "external_id",
+              "title"
+            ],
+            "properties": {
+              "art": {
+                "$ref": "#/components/schemas/Artwork"
               },
-              {
-                "$ref": "#/components/schemas/LaunchSpec"
+              "detect": {
+                "$ref": "#/components/schemas/DetectHint",
+                "description": "How to recognize this title's process — see [`CustomEntry::detect`]. A provider that knows its\ntitles' install directories (Playnite does) should send them: it is what lets a game launched\nthrough the provider's own client still end its session when the player quits."
+              },
+              "external_id": {
+                "type": "string",
+                "description": "The provider's stable id for this title (the reconcile diff key)."
+              },
+              "launch": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/LaunchSpec"
+                  }
+                ]
+              },
+              "prep": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/PrepCmd"
+                },
+                "description": "Per-title prep/undo steps — commands run as the host user; operator-privileged config."
+              },
+              "title": {
+                "type": "string"
               }
-            ]
-          },
-          "prep": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/PrepCmd"
-            },
-            "description": "Per-title prep/undo steps — commands run as the host user; operator-privileged config."
-          },
-          "title": {
-            "type": "string"
+            }
           }
-        }
+        ],
+        "description": "One title in a provider's declarative reconcile payload (RFC §8): [`CustomInput`] plus the\nprovider's required stable key."
       },
       "ProviderRemoved": {
         "type": "object",

@@ -8,6 +8,8 @@ use axum::http::header;
 pub(crate) struct LibraryQuery {
     /// Only entries owned by this external provider (RFC §8).
     provider: Option<String>,
+    /// Only entries on this platform (case-insensitive).
+    platform: Option<String>,
 }
 
 /// List the game library
@@ -15,7 +17,8 @@ pub(crate) struct LibraryQuery {
 /// Every installed-store title (Steam, read from the host's local files — no Steam API key)
 /// merged with the user's custom entries, sorted by title. Artwork fields are URLs the client
 /// fetches directly (the public Steam CDN for Steam titles). `?provider=` narrows to the
-/// entries a given external provider owns.
+/// entries a given external provider owns; `?platform=` to one platform (case-insensitive —
+/// installed-store titles are `PC`, custom/provider entries carry whatever was authored).
 #[utoipa::path(
     get,
     path = "/library",
@@ -23,6 +26,7 @@ pub(crate) struct LibraryQuery {
     operation_id = "getLibrary",
     params(
         ("provider" = Option<String>, Query, description = "Only entries owned by this external provider"),
+        ("platform" = Option<String>, Query, description = "Only entries on this platform (case-insensitive, e.g. `PS2`)"),
     ),
     responses(
         (status = OK, description = "Unified library across all stores", body = [crate::library::GameEntry]),
@@ -35,6 +39,14 @@ pub(crate) async fn get_library(
     let mut games = crate::library::all_games();
     if let Some(provider) = q.provider.filter(|p| !p.is_empty()) {
         games.retain(|g| g.provider.as_deref() == Some(provider.as_str()));
+    }
+    if let Some(platform) = q.platform.filter(|p| !p.is_empty()) {
+        games.retain(|g| {
+            g.meta
+                .platform
+                .as_deref()
+                .is_some_and(|p| p.eq_ignore_ascii_case(&platform))
+        });
     }
     // Rewrite provider entries' local-file art into host art-proxy URLs so a client fetches covers
     // from the host (a provider like Playnite stores on-host paths; the payload stays tiny at any

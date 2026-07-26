@@ -84,6 +84,7 @@ fn lutris_games(db: &Path) -> rusqlite::Result<Vec<GameEntry>> {
     for (id, slug, name, directory) in rows.flatten() {
         games.push(GameEntry {
             provider: None,
+            meta: GameMeta::pc(),
             id: format!("lutris:{id}"),
             store: "lutris".into(),
             title: name,

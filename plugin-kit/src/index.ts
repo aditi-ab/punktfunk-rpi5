@@ -21,6 +21,7 @@ export { type CacheStore, makeCacheStore } from "./cache-store.js";
 export {
 	Artwork,
 	DetectHint,
+	GameMeta,
 	LaunchSpec,
 	PrepStep,
 	ProviderClient,

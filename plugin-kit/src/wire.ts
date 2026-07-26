@@ -46,6 +46,29 @@ export const DetectHint = Schema.Struct({
 });
 export type DetectHint = typeof DetectHint.Type;
 
+/** Descriptive metadata, flat on the wire beside `title` (mirrors the host's flattened
+ * `GameMeta`). All fields optional; values are free-form display strings — the host does not
+ * normalize platform/genre vocabularies. */
+export const GameMeta = Schema.Struct({
+	/** The system the title runs on — `"PS2"`, `"Xbox 360"`, `"SNES"`, … */
+	platform: Schema.optionalKey(Schema.NullOr(Schema.String)),
+	/** Short blurb for a details pane. */
+	description: Schema.optionalKey(Schema.NullOr(Schema.String)),
+	developer: Schema.optionalKey(Schema.NullOr(Schema.String)),
+	publisher: Schema.optionalKey(Schema.NullOr(Schema.String)),
+	/** Year of first release. */
+	release_year: Schema.optionalKey(Schema.NullOr(Schema.Number)),
+	/** Genre taxonomy from the metadata source (`"RPG"`, `"Platformer"`, …). */
+	genres: Schema.optionalKey(Schema.Array(Schema.String)),
+	/** Free-form organizational labels (`"co-op"`, `"kids"`, …). */
+	tags: Schema.optionalKey(Schema.Array(Schema.String)),
+	/** Release region — `"NTSC-U"`, `"PAL"`, `"NTSC-J"`. */
+	region: Schema.optionalKey(Schema.NullOr(Schema.String)),
+	/** Maximum simultaneous (local) players. */
+	players: Schema.optionalKey(Schema.NullOr(Schema.Number)),
+});
+export type GameMeta = typeof GameMeta.Type;
+
 export const ProviderEntry = Schema.Struct({
 	external_id: Schema.String,
 	title: Schema.String,
@@ -53,5 +76,6 @@ export const ProviderEntry = Schema.Struct({
 	launch: Schema.optionalKey(Schema.NullOr(LaunchSpec)),
 	prep: Schema.optionalKey(Schema.Array(PrepStep)),
 	detect: Schema.optionalKey(DetectHint),
+	...GameMeta.fields,
 });
 export type ProviderEntry = typeof ProviderEntry.Type;

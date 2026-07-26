@@ -65,13 +65,20 @@ export const GameCard: FC<GameCardProps> = ({
 						{game.title}
 					</div>
 				)}
-				<div className="absolute left-2 top-2">
+				<div className="absolute left-2 top-2 flex flex-wrap gap-1">
 					<Badge
 						variant={isCustom ? "secondary" : "outline"}
 						className="bg-background/80 backdrop-blur"
 					>
 						{storeLabel(game.store)}
 					</Badge>
+					{/* Platform badge — "PC" is implied by every installed store, so only
+					    non-PC platforms (the emulation case) earn a second badge. */}
+					{game.platform && game.platform.toUpperCase() !== "PC" && (
+						<Badge variant="outline" className="bg-background/80 backdrop-blur">
+							{game.platform}
+						</Badge>
+					)}
 				</div>
 				{isCustom && (
 					<div className="absolute right-2 top-2 flex gap-1 opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100">
@@ -102,6 +109,11 @@ export const GameCard: FC<GameCardProps> = ({
 				title={game.title}
 			>
 				{game.title}
+				{game.release_year != null && (
+					<span className="ml-1.5 font-normal text-muted-foreground">
+						{game.release_year}
+					</span>
+				)}
 			</div>
 		</Card>
 	);

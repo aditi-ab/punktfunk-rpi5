@@ -70,6 +70,7 @@ fn xbox_games() -> Vec<GameEntry> {
             let art = cached_art(&id).unwrap_or_default();
             games.push(GameEntry {
                 provider: None,
+                meta: GameMeta::pc(),
                 id,
                 store: "xbox".into(),
                 title,
