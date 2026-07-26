@@ -156,7 +156,7 @@ pub struct LeaseShared {
     spec: DetectSpec,
     /// Seconds-since-boot at launch: the floor for adopting a process (`None` = the uptime clock was
     /// unreadable, so no start-time filtering is possible and only signals are used).
-    launch_uptime: Option<f64>,
+    launch_stamp: Option<f64>,
     /// The child the host spawned for this launch, when it spawned one ([`LeaseKind::Child`]).
     /// Cleared once that child is reaped.
     child: Mutex<Option<OwnedChild>>,
@@ -254,15 +254,15 @@ pub struct LeaseRequest {
     /// Seconds-since-boot from **before** the launch ([`launch_clock`]): the floor for adopting a
     /// process, which is what keeps a copy of the game the player already had open from being
     /// mistaken for this session's. `None` disables the filter (no readable uptime clock).
-    pub launch_uptime: Option<f64>,
+    pub launch_stamp: Option<f64>,
 }
 
 /// The reference instant for adopting this launch's processes, in seconds since boot. Call it
-/// **before** anything spawns; see [`LeaseRequest::launch_uptime`].
+/// **before** anything spawns; see [`LeaseRequest::launch_stamp`].
 pub fn launch_clock() -> Option<f64> {
     #[cfg(target_os = "linux")]
     {
-        crate::procscan::Scanner::system().uptime()
+        crate::procscan::launch_stamp()
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -284,7 +284,7 @@ pub fn open(req: LeaseRequest, on_exit: OnExit) -> GameLease {
         spec,
         nested,
         child,
-        launch_uptime,
+        launch_stamp,
     } = req;
 
     let kind = if nested {
@@ -310,7 +310,7 @@ pub fn open(req: LeaseRequest, on_exit: OnExit) -> GameLease {
         state: AtomicU8::new(GameState::Launching as u8),
         cancel: Arc::new(AtomicBool::new(false)),
         spec,
-        launch_uptime,
+        launch_stamp,
         child: Mutex::new(owned),
         terminating: AtomicBool::new(false),
         created_ms: now_ms(),
@@ -366,14 +366,14 @@ fn spawn_watcher(
     if matches!(shared.kind, LeaseKind::Nested) && shared.spec.is_empty() {
         return None;
     }
-    #[cfg(not(target_os = "linux"))]
+    // Platforms with no matcher at all (macOS has no launch path either) keep a lease for the status
+    // surface, but nothing polls it.
+    #[cfg(not(any(target_os = "linux", windows)))]
     {
-        // Windows lands in phase 2 (Job Objects + Toolhelp matching); until then a lease exists for
-        // the status surface but nothing polls.
         let _ = (child, on_exit);
         return None;
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     {
         std::thread::Builder::new()
             .name("pf1-gamelease".into())
@@ -383,12 +383,21 @@ fn spawn_watcher(
 }
 
 /// The watch loop: wait for the game to appear, then for it to go away.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 fn watch(shared: Arc<LeaseShared>, mut child: Option<std::process::Child>, on_exit: OnExit) {
     let scanner = crate::procscan::Scanner::system();
     let cancelled = || shared.cancel.load(Ordering::Relaxed);
     let spawned_at = Instant::now();
     let mut kind = shared.kind.clone();
+
+    // The game's processes as last seen. Phase 2 re-verifies these rather than re-scanning the whole
+    // process table each second: `alive` costs one query per known process, while `find` costs one per
+    // process on the box (and on Windows that means an `OpenProcess` each). A full re-scan still
+    // happens the moment they all vanish, which is what catches a game that re-execs into a new pid.
+    //
+    // Deliberately uninitialized: the only way out of phase 1 and into phase 2 is the branch that
+    // assigns it, so an initial value would be dead.
+    let mut known: Vec<crate::procscan::ProcRef>;
 
     // ---- Phase 1: wait for the game to show up. ----
     let start_deadline = spawned_at + START_GRACE;
@@ -458,8 +467,9 @@ fn watch(shared: Arc<LeaseShared>, mut child: Option<std::process::Child>, on_ex
         // The child being alive counts as the game running for a `Child` lease, so a title with no
         // detect signals is still fully tracked.
         let child_alive = matches!(kind, LeaseKind::Child) && child.is_some();
-        let live = scanner.find(&shared.spec, shared.launch_uptime);
+        let live = scanner.find(&shared.spec, shared.launch_stamp);
         if !live.is_empty() || child_alive {
+            known = live.clone();
             shared.was_running.store(true, Ordering::Relaxed);
             shared.last_seen_ms.store(now_ms(), Ordering::Relaxed);
             shared.set_state(GameState::Running);
@@ -487,6 +497,7 @@ fn watch(shared: Arc<LeaseShared>, mut child: Option<std::process::Child>, on_ex
 
     // ---- Phase 2: wait for it to go away, confirmed across a window. ----
     let mut gone_since: Option<Instant> = None;
+    let mut vetoed = false;
     loop {
         if cancelled() {
             return;
@@ -502,22 +513,47 @@ fn watch(shared: Arc<LeaseShared>, mut child: Option<std::process::Child>, on_ex
             }
         }
         let child_alive = matches!(kind, LeaseKind::Child) && child.is_some();
-        // Re-scan rather than only re-checking known pids: a game that re-execs (a launcher stub
-        // becoming the real binary, an engine relaunching itself) keeps the same identity.
-        let live = scanner.find(&shared.spec, shared.launch_uptime);
+        // Cheap first: are the processes we already know about still there? Only when none of them is
+        // do we pay for a full scan — which is also what notices a game that re-exec'd into a new pid
+        // (a launcher stub becoming the real binary, an engine relaunching itself).
+        let live = {
+            let still = scanner.alive(&known);
+            if still.is_empty() {
+                scanner.find(&shared.spec, shared.launch_stamp)
+            } else {
+                still
+            }
+        };
         if !live.is_empty() || child_alive {
+            known = live;
             gone_since = None;
+            vetoed = false;
             shared.last_seen_ms.store(now_ms(), Ordering::Relaxed);
         } else if gone_since.get_or_insert_with(Instant::now).elapsed() >= EXIT_CONFIRM {
-            finish(&shared, &on_exit, "the game exited");
-            return;
+            // Last check before ending a session: does anything outside the process scan still think
+            // the game is up? Only a veto, never a reason to call it running — see
+            // `procscan::running_hint`. The failure mode of honoring it is a stream that stays up.
+            if crate::procscan::running_hint(&shared.spec) == Some(true) {
+                if !vetoed {
+                    vetoed = true;
+                    tracing::info!(
+                        title = %shared.game.title,
+                        "no game processes found, but its launcher still reports it running — not \
+                         ending the session"
+                    );
+                }
+                gone_since = None;
+            } else {
+                finish(&shared, &on_exit, "the game exited");
+                return;
+            }
         }
         std::thread::sleep(POLL);
     }
 }
 
 /// Record the exit and, unless the host itself ended the game, run the session-ending action.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 fn finish(shared: &Arc<LeaseShared>, on_exit: &OnExit, why: &str) {
     shared.set_state(GameState::Exited);
     let terminated = shared.is_terminating();
@@ -621,6 +657,8 @@ fn terminate_blocking(shared: &LeaseShared) {
         LeaseKind::Child | LeaseKind::Matched => {
             #[cfg(target_os = "linux")]
             unix_term_ladder(shared);
+            #[cfg(windows)]
+            windows_term_ladder(shared);
         }
         LeaseKind::Untracked => {}
     }
@@ -653,7 +691,7 @@ fn unix_term_ladder(shared: &LeaseShared) {
         // Re-scan and re-verify immediately before signalling, so a pid recycled since the last
         // sweep is never hit.
         scanner
-            .alive(&scanner.find(&shared.spec, shared.launch_uptime))
+            .alive(&scanner.find(&shared.spec, shared.launch_stamp))
             .into_iter()
             // SAFETY: as above, for a single pid just re-verified to be the process we adopted.
             .filter(|p| unsafe { libc::kill(p.pid as i32, sig) == 0 })
@@ -673,7 +711,7 @@ fn unix_term_ladder(shared: &LeaseShared) {
     while Instant::now() < deadline {
         std::thread::sleep(POLL);
         let still = scanner
-            .alive(&scanner.find(&shared.spec, shared.launch_uptime))
+            .alive(&scanner.find(&shared.spec, shared.launch_stamp))
             .len();
         // Signal 0 only probes for existence — the child (or its group) is gone once it fails.
         let child_gone = !signal_child(0);
@@ -683,6 +721,52 @@ fn unix_term_ladder(shared: &LeaseShared) {
         }
     }
     let killed = signal_all(libc::SIGKILL);
+    tracing::warn!(
+        title = %shared.game.title,
+        killed,
+        grace_s = TERM_GRACE.as_secs(),
+        "the game did not close when asked — killed it"
+    );
+}
+
+/// Windows: ask the game's windows to close, wait, then terminate what's left.
+///
+/// Same shape as the Unix ladder, different primitives — and one structural difference: the host never
+/// holds a child here. Every Windows launch goes through a launcher or the shell
+/// (`steam://`, `com.epicgames.launcher://`, `shell:AppsFolder\…`), so the game is always recognized
+/// rather than owned, and the pid set comes entirely from the matcher.
+#[cfg(windows)]
+fn windows_term_ladder(shared: &LeaseShared) {
+    let scanner = crate::procscan::Scanner::system();
+    let live = || scanner.alive(&scanner.find(&shared.spec, shared.launch_stamp));
+
+    let pids: Vec<u32> = live().into_iter().map(|p| p.pid).collect();
+    if pids.is_empty() {
+        tracing::info!(title = %shared.game.title, "the game is already gone — nothing to end");
+        return;
+    }
+    // Polite first: a `WM_CLOSE` is what clicking the window's X does, so the game runs its own
+    // shutdown and can save.
+    let asked = crate::game_term::request_close(&pids);
+    tracing::debug!(
+        title = %shared.game.title,
+        windows_asked = asked,
+        procs = pids.len(),
+        grace_s = TERM_GRACE.as_secs(),
+        "asked the game to close"
+    );
+    let deadline = Instant::now() + TERM_GRACE;
+    while Instant::now() < deadline {
+        std::thread::sleep(POLL);
+        if live().is_empty() {
+            tracing::info!(title = %shared.game.title, "the game closed when asked");
+            return;
+        }
+    }
+    // Re-verify (pid, creation time) one last time, then insist. Windows recycles pids briskly, so the
+    // list handed to `kill` must be freshly checked rather than the one gathered above.
+    let remaining: Vec<u32> = live().into_iter().map(|p| p.pid).collect();
+    let killed = crate::game_term::kill(&remaining);
     tracing::warn!(
         title = %shared.game.title,
         killed,
@@ -886,7 +970,7 @@ mod tests {
             nested,
             child: None,
             // No start-time floor: these leases are never matched against real processes.
-            launch_uptime: None,
+            launch_stamp: None,
         }
     }
 
@@ -1023,7 +1107,7 @@ mod tests {
         let td = tempfile::tempdir().expect("tempdir");
         let script = td.path().join("game.sh");
         std::fs::write(&script, "#!/bin/sh\nexec sleep 30\n").unwrap();
-        let launch_uptime = launch_clock();
+        let launch_stamp = launch_clock();
         let child = std::process::Command::new("/bin/sh")
             .arg(&script)
             .process_group(0)
@@ -1044,7 +1128,7 @@ mod tests {
                 spec: DetectSpec::dir(td.path()),
                 nested: false,
                 child: Some((child, true)),
-                launch_uptime,
+                launch_stamp,
             },
             Box::new(|| {
                 EXITS.fetch_add(1, Ordering::SeqCst);

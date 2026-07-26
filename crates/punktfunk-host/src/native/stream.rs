@@ -1115,7 +1115,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
     // therefore before a bare-spawn gamescope's nested child) exists, because a reading taken after
     // the launch would reject the very process it is meant to find. Erring early is the safe
     // direction: it can only ever include more of our own launch, never a copy from before it.
-    let launch_uptime = crate::gamelease::launch_clock();
+    let launch_stamp = crate::gamelease::launch_clock();
     // Streamed-AU wire mode: the client's cap AND the host escape hatch (`PUNKTFUNK_STREAMED_AU=0`
     // reverts to whole-AU sends without touching the encoder's slicing knobs). The third gate —
     // whether the ENCODER actually chunks — is dynamic (`supports_chunked_poll`, per AU).
@@ -1318,7 +1318,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                 spec: target.detect.clone(),
                 nested,
                 child,
-                launch_uptime,
+                launch_stamp,
             },
             on_exit,
         )
