@@ -1,6 +1,8 @@
 import Section from "@unom/ui/section";
 import { MonitorPlay, RefreshCw, Video, Volume2, ZapOff } from "lucide-react";
 import type { FC, ReactNode } from "react";
+import type { ActiveGame } from "@/api/gen/model/activeGame";
+import type { GameEntry } from "@/api/gen/model/gameEntry";
 import type { RuntimeStatus } from "@/api/gen/model/runtimeStatus";
 import { QueryState } from "@/components/query-state";
 import { Badge } from "@/components/ui/badge";
@@ -8,14 +10,27 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import type { Loadable } from "@/lib/query";
 import { m } from "@/paraglide/messages";
+import { RunningGames } from "./RunningGames";
 
 export const DashboardView: FC<{
 	status: Loadable<RuntimeStatus>;
+	library?: GameEntry[];
 	onStopSession: () => void;
 	onRequestIdr: () => void;
+	onEndGame: (game: ActiveGame) => void;
 	isStopping: boolean;
 	isRequestingIdr: boolean;
-}> = ({ status, onStopSession, onRequestIdr, isStopping, isRequestingIdr }) => {
+	isEndingGame: boolean;
+}> = ({
+	status,
+	library,
+	onStopSession,
+	onRequestIdr,
+	onEndGame,
+	isStopping,
+	isRequestingIdr,
+	isEndingGame,
+}) => {
 	const s = status.data;
 	return (
 		<Section maxWidth={false}>
@@ -60,6 +75,15 @@ export const DashboardView: FC<{
 									</CardContent>
 								</Card>
 							</div>
+
+							{/* Above the session card: a game the host is about to close is the most
+							    time-sensitive thing on this page. */}
+							<RunningGames
+								games={s.games}
+								library={library}
+								onEnd={onEndGame}
+								isEnding={isEndingGame}
+							/>
 
 							<Card>
 								<CardHeader className="flex flex-col items-start gap-3 space-y-0 sm:flex-row sm:items-center sm:justify-between">

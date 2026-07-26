@@ -58,6 +58,17 @@ export const statusActive: RuntimeStatus = {
 		min_fec: 5,
 		packet_size: 1392,
 	},
+	games: [
+		{
+			session_id: 1,
+			client: "Living room TV",
+			app_id: "steam:1145360",
+			title: "Hades",
+			store: "steam",
+			plane: "native",
+			state: "running",
+		},
+	],
 };
 
 export const statusIdle: RuntimeStatus = {
@@ -68,6 +79,26 @@ export const statusIdle: RuntimeStatus = {
 	active_sessions: 0,
 	session: null,
 	stream: null,
+	games: [],
+};
+
+/**
+ * Idle, but a game its client walked away from is still running — on a countdown to being closed.
+ * The state the running-game card exists for.
+ */
+export const statusGrace: RuntimeStatus = {
+	...statusIdle,
+	games: [
+		{
+			client: "Living room TV",
+			app_id: "steam:1145360",
+			title: "Hades",
+			store: "steam",
+			plane: "native",
+			state: "grace",
+			grace_remaining_s: 252,
+		},
+	],
 };
 
 export const pairedClients: PairedClient[] = [
