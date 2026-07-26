@@ -39,6 +39,25 @@ jobs:
         working-directory: plugin-kit
         run: bun install --frozen-lockfile --ignore-scripts
 
+      # bun 1.3 installs a `file:` dependency by copying its DIRECTORIES but symlinking each
+      # top-level FILE to itself — `node_modules/@punktfunk/host/package.json -> package.json`, a
+      # dangling self-reference. `dist/` therefore arrives intact while the manifest that points at
+      # it does not, so module resolution dies at the first step and every `@punktfunk/host` import
+      # reads as "cannot find module". Replacing the tree with a real copy is the whole fix; drop
+      # this step once bun links `file:` deps correctly again.
+      - name: Repair the file: dependency (bun 1.3 self-symlink)
+        working-directory: plugin-kit
+        run: |
+          # -f follows the link, so this is true only when the manifest actually resolves.
+          if test -f node_modules/@punktfunk/host/package.json; then
+            echo "bun linked it correctly — this step can go"
+          else
+            rm -rf node_modules/@punktfunk/host
+            cp -R ../sdk node_modules/@punktfunk/host
+          fi
+          test -f node_modules/@punktfunk/host/package.json
+          test -f node_modules/@punktfunk/host/dist/index.d.ts
+
       - name: Typecheck
         working-directory: plugin-kit
         run: bun run typecheck
