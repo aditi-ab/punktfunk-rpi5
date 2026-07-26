@@ -347,6 +347,155 @@ pub(super) fn build_cursor_meta_param() -> Result<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// The `SPA_PARAM_BUFFERS_dataType` bitmask a serialized Buffers pod carries.
+    ///
+    /// A deliberately literal SPA reader rather than a heuristic scan: an object property is
+    /// `{ key: u32, flags: u32, value: spa_pod }` and a `spa_pod` is `{ size: u32, type: u32, body }`,
+    /// so the `i32` sits exactly 16 bytes past the key — and the intervening `size` word is itself
+    /// `4`, which is why "find the first plausible-looking int" reads the wrong field.
+    fn buffers_data_type(pod: &[u8]) -> i32 {
+        let key = spa::sys::SPA_PARAM_BUFFERS_dataType.to_ne_bytes();
+        let at = pod
+            .windows(4)
+            .position(|w| w == key)
+            .expect("dataType key present in the Buffers pod");
+        let word = |off: usize| u32::from_ne_bytes(pod[off..off + 4].try_into().unwrap());
+        assert_eq!(word(at + 8), 4, "dataType's value pod should be 4 bytes");
+        assert_eq!(
+            word(at + 12),
+            spa::sys::SPA_TYPE_Int,
+            "dataType's value pod should be an Int"
+        );
+        i32::from_ne_bytes(pod[at + 16..at + 20].try_into().unwrap())
+    }
+
+    const MEM_PTR: i32 = 1 << spa::sys::SPA_DATA_MemPtr;
+    const MEM_FD: i32 = 1 << spa::sys::SPA_DATA_MemFd;
+    const DMABUF: i32 = 1 << spa::sys::SPA_DATA_DmaBuf;
+
+    /// The three Buffers pods differ ONLY in this bitmask, and each bit is load-bearing:
+    /// `build_mappable_buffers` must include DmaBuf or gamescope's modifier-bearing pod wins the
+    /// format intersection and the BUFFER intersection is then empty (a link stuck in
+    /// "negotiating"); `build_shm_only_buffers` must EXCLUDE it or Mutter hands dmabufs and the
+    /// race-free download path is not race-free; `build_dmabuf_buffers` must exclude the mappable
+    /// types or an HDR session can be handed a MemFd buffer, which Mutter paints 8-bit ARGB32
+    /// regardless of the negotiated 10-bit format.
+    #[test]
+    fn each_buffers_pod_requests_exactly_its_own_data_types() {
+        assert_eq!(
+            buffers_data_type(&build_mappable_buffers().unwrap()),
+            MEM_PTR | MEM_FD | DMABUF,
+            "the CPU path must accept mappable dmabufs too"
+        );
+        assert_eq!(
+            buffers_data_type(&build_shm_only_buffers().unwrap()),
+            MEM_PTR | MEM_FD,
+            "PUNKTFUNK_FORCE_SHM must exclude DmaBuf"
+        );
+        assert_eq!(
+            buffers_data_type(&build_dmabuf_buffers().unwrap()),
+            DMABUF,
+            "the zero-copy/HDR path must exclude SHM"
+        );
+    }
+
+    /// Every pod builder must produce a pod libspa will accept back — a serializer that silently
+    /// emitted a malformed object would fail only at negotiation, on a live compositor.
+    #[test]
+    fn every_pod_round_trips_through_pod_from_bytes() {
+        let mut pods: Vec<(&str, Vec<u8>)> = vec![
+            ("mappable buffers", build_mappable_buffers().unwrap()),
+            ("shm-only buffers", build_shm_only_buffers().unwrap()),
+            ("dmabuf buffers", build_dmabuf_buffers().unwrap()),
+            ("cursor meta", build_cursor_meta_param().unwrap()),
+            (
+                "default format",
+                serialize_pod(build_default_format_obj(None)).unwrap(),
+            ),
+            (
+                "dmabuf BGRx",
+                build_dmabuf_format(VideoFormat::BGRx, &[0, 1, 2], Some((1920, 1080, 60))).unwrap(),
+            ),
+            (
+                "dmabuf NV12",
+                build_dmabuf_format(VideoFormat::NV12, &[0], Some((1280, 720, 60))).unwrap(),
+            ),
+            (
+                "hdr xRGB",
+                build_hdr_dmabuf_format(VideoFormat::xRGB_210LE, None).unwrap(),
+            ),
+            (
+                "hdr xBGR",
+                build_hdr_dmabuf_format(VideoFormat::xBGR_210LE, Some((3840, 2160, 120))).unwrap(),
+            ),
+        ];
+        for (name, bytes) in &mut pods {
+            assert!(!bytes.is_empty(), "{name} serialized to nothing");
+            assert_eq!(bytes.len() % 8, 0, "{name} is not 8-byte aligned/padded");
+            assert!(
+                spa::pod::Pod::from_bytes(bytes).is_some(),
+                "{name} did not parse back as a pod"
+            );
+        }
+    }
+
+    /// The HDR pods carry BOTH colorimetry properties MANDATORY — Mutter's HDR pods do the same, so
+    /// the intersection only exists if we speak them. Dropping either would negotiate an SDR-labelled
+    /// 10-bit stream (or nothing at all).
+    #[test]
+    fn the_hdr_pods_carry_mandatory_pq_and_bt2020() {
+        for fmt in [VideoFormat::xRGB_210LE, VideoFormat::xBGR_210LE] {
+            let pod = build_hdr_dmabuf_format(fmt, None).unwrap();
+            for (name, key) in [
+                (
+                    "transferFunction",
+                    spa::sys::SPA_FORMAT_VIDEO_transferFunction,
+                ),
+                ("colorPrimaries", spa::sys::SPA_FORMAT_VIDEO_colorPrimaries),
+                ("modifier", spa::sys::SPA_FORMAT_VIDEO_modifier),
+            ] {
+                assert!(
+                    pod.windows(4).any(|w| w == key.to_ne_bytes()),
+                    "{fmt:?} pod is missing {name}"
+                );
+            }
+            // The PQ id and BT.2020 id must both appear as values.
+            assert!(
+                pod.windows(4)
+                    .any(|w| w == SPA_VIDEO_TRANSFER_SMPTE2084.to_ne_bytes()),
+                "{fmt:?} pod does not carry the PQ transfer id"
+            );
+            assert!(
+                pod.windows(4)
+                    .any(|w| w == spa::sys::SPA_VIDEO_COLOR_PRIMARIES_BT2020.to_ne_bytes()),
+                "{fmt:?} pod does not carry BT.2020 primaries"
+            );
+        }
+    }
+
+    /// An NV12 offer pins BT.709 limited so gamescope's producer-side RGB→YUV shader matches OUR
+    /// bitstream colorimetry; the packed-RGB offer must NOT carry those (it is not YUV).
+    #[test]
+    fn only_the_nv12_offer_pins_the_colour_matrix() {
+        let nv12 = build_dmabuf_format(VideoFormat::NV12, &[0], None).unwrap();
+        let bgrx = build_dmabuf_format(VideoFormat::BGRx, &[0], None).unwrap();
+        for (name, key) in [
+            ("colorMatrix", spa::sys::SPA_FORMAT_VIDEO_colorMatrix),
+            ("colorRange", spa::sys::SPA_FORMAT_VIDEO_colorRange),
+        ] {
+            assert!(
+                nv12.windows(4).any(|w| w == key.to_ne_bytes()),
+                "NV12 offer is missing {name}"
+            );
+            assert!(
+                !bgrx.windows(4).any(|w| w == key.to_ne_bytes()),
+                "packed-RGB offer should not pin {name}"
+            );
+        }
+    }
+
     /// Pin our hand-written PQ transfer id against the real libspa binding. We can't take the
     /// constant from `pw::spa::sys` directly (older distro headers don't export it — see
     /// [`super::SPA_VIDEO_TRANSFER_SMPTE2084`]), so assert the two agree wherever the symbol

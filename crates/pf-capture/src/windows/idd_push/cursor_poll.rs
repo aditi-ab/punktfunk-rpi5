@@ -402,15 +402,13 @@ fn convert(ii: &ICONINFO) -> Option<(Vec<u8>, u32, u32)> {
             let color = read_bitmap_32(dc, ii.hbmColor)?;
             let (w, h) = (color.w as u32, color.h as u32);
             let mut rgba = bgra_to_rgba(&color.bgra);
-            if rgba.chunks_exact(4).all(|p| p[3] == 0) {
+            if alpha_is_empty(&rgba) {
                 // Alpha-less color cursor: transparency lives in the AND mask.
                 let mask = read_bitmap_32(dc, ii.hbmMask)?;
                 if mask.w != color.w || mask.h < color.h {
                     return None;
                 }
-                for (px, m) in rgba.chunks_exact_mut(4).zip(mask.bgra.chunks_exact(4)) {
-                    px[3] = if m[0] != 0 { 0 } else { 0xFF }; // mask white (AND=1) = transparent
-                }
+                apply_and_mask_alpha(&mut rgba, &mask.bgra);
             }
             Some((rgba, w, h))
         } else {
@@ -419,42 +417,8 @@ fn convert(ii: &ICONINFO) -> Option<(Vec<u8>, u32, u32)> {
                 return None;
             }
             let (w, h) = (mask.w as usize, (mask.h / 2) as usize);
-            let row = w * 4;
-            let (and_plane, xor_plane) = mask.bgra.split_at(h * row);
-            let mut rgba = vec![0u8; w * h * 4];
-            let mut invert = vec![false; w * h];
-            for i in 0..w * h {
-                let (a, x) = (and_plane[i * 4] != 0, xor_plane[i * 4] != 0);
-                let px = &mut rgba[i * 4..i * 4 + 4];
-                match (a, x) {
-                    (false, false) => px.copy_from_slice(&[0, 0, 0, 0xFF]),
-                    (false, true) => px.copy_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]),
-                    (true, false) => {} // transparent (already zeroed)
-                    (true, true) => {
-                        px.copy_from_slice(&[0, 0, 0, 0xFF]);
-                        invert[i] = true;
-                    }
-                }
-            }
-            // White outline around invert regions so the (now black) shape survives dark
-            // backgrounds: any transparent 8-neighbor of an invert pixel turns opaque white.
-            for y in 0..h as i32 {
-                for x in 0..w as i32 {
-                    if !invert[(y * w as i32 + x) as usize] {
-                        continue;
-                    }
-                    for (dx, dy) in NEIGHBORS {
-                        let (nx, ny) = (x + dx, y + dy);
-                        if nx < 0 || ny < 0 || nx >= w as i32 || ny >= h as i32 {
-                            continue;
-                        }
-                        let o = (ny * w as i32 + nx) as usize * 4;
-                        if rgba[o + 3] == 0 {
-                            rgba[o..o + 4].copy_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]);
-                        }
-                    }
-                }
-            }
+            let (and_plane, xor_plane) = mask.bgra.split_at(h * w * 4);
+            let rgba = mono_planes_to_rgba(and_plane, xor_plane, w, h);
             Some((rgba, w as u32, h as u32))
         }
     })();
@@ -535,4 +499,205 @@ fn bgra_to_rgba(bgra: &[u8]) -> Vec<u8> {
         px.swap(0, 2);
     }
     out
+}
+
+/// Whether a 32bpp RGBA buffer's alpha channel is entirely zero — the "old-style cursor with no
+/// alpha" test, whose transparency lives in the AND mask instead ([`apply_and_mask_alpha`]).
+fn alpha_is_empty(rgba: &[u8]) -> bool {
+    rgba.chunks_exact(4).all(|p| p[3] == 0)
+}
+
+/// Take alpha from an expanded AND mask: mask WHITE (AND bit 1) means transparent, black opaque.
+/// `mask_bgra` is the 32bpp expansion `GetDIBits` produces from the 1bpp mask, so any non-zero
+/// channel byte is "set".
+fn apply_and_mask_alpha(rgba: &mut [u8], mask_bgra: &[u8]) {
+    for (px, m) in rgba.chunks_exact_mut(4).zip(mask_bgra.chunks_exact(4)) {
+        px[3] = if m[0] != 0 { 0 } else { 0xFF };
+    }
+}
+
+/// The monochrome-cursor truth table, plus the white outline that makes an INVERT region legible.
+///
+/// A monochrome `HCURSOR` has no colour bitmap: `hbmMask` is DOUBLE height — the AND plane over the
+/// XOR plane — and the pair encodes four states (the WebRTC/Chromium table):
+///
+/// | AND | XOR | meaning     | straight-alpha result                    |
+/// |-----|-----|-------------|------------------------------------------|
+/// | 0   | 0   | black       | opaque black                             |
+/// | 0   | 1   | white       | opaque white                             |
+/// | 1   | 0   | transparent | fully transparent                        |
+/// | 1   | 1   | INVERT dst  | opaque black + a grown white outline     |
+///
+/// INVERT is unrepresentable in straight alpha (it is a per-pixel XOR against whatever is behind
+/// it), so it becomes opaque black and every TRANSPARENT 8-neighbour of an invert pixel is turned
+/// opaque white. That outline is what keeps the text I-beam — which is almost entirely invert
+/// pixels — legible over dark content; the earlier translucent-grey stand-in did not.
+///
+/// Extracted from `convert`'s GDI plumbing (sweep Phase 6.6) so the table is testable: the caller
+/// needs a live `HCURSOR` and a screen DC, this needs two byte slices.
+fn mono_planes_to_rgba(and_plane: &[u8], xor_plane: &[u8], w: usize, h: usize) -> Vec<u8> {
+    let mut rgba = vec![0u8; w * h * 4];
+    let mut invert = vec![false; w * h];
+    for i in 0..w * h {
+        let (a, x) = (and_plane[i * 4] != 0, xor_plane[i * 4] != 0);
+        let px = &mut rgba[i * 4..i * 4 + 4];
+        match (a, x) {
+            (false, false) => px.copy_from_slice(&[0, 0, 0, 0xFF]),
+            (false, true) => px.copy_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]),
+            (true, false) => {} // transparent (already zeroed)
+            (true, true) => {
+                px.copy_from_slice(&[0, 0, 0, 0xFF]);
+                invert[i] = true;
+            }
+        }
+    }
+    for y in 0..h as i32 {
+        for x in 0..w as i32 {
+            if !invert[(y * w as i32 + x) as usize] {
+                continue;
+            }
+            for (dx, dy) in NEIGHBORS {
+                let (nx, ny) = (x + dx, y + dy);
+                if nx < 0 || ny < 0 || nx >= w as i32 || ny >= h as i32 {
+                    continue;
+                }
+                let o = (ny * w as i32 + nx) as usize * 4;
+                if rgba[o + 3] == 0 {
+                    rgba[o..o + 4].copy_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]);
+                }
+            }
+        }
+    }
+    rgba
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Expand a 1-bit-per-pixel plane (as `GetDIBits` does) into the 32bpp form the converters read:
+    /// any non-zero channel byte means "bit set".
+    fn plane(bits: &[u8]) -> Vec<u8> {
+        bits.iter()
+            .flat_map(|&b| {
+                let v = if b != 0 { 0xFF } else { 0 };
+                [v, v, v, 0]
+            })
+            .collect()
+    }
+
+    fn px(rgba: &[u8], i: usize) -> [u8; 4] {
+        rgba[i * 4..i * 4 + 4].try_into().unwrap()
+    }
+
+    const OPAQUE_BLACK: [u8; 4] = [0, 0, 0, 0xFF];
+    const OPAQUE_WHITE: [u8; 4] = [0xFF, 0xFF, 0xFF, 0xFF];
+    const TRANSPARENT: [u8; 4] = [0, 0, 0, 0];
+
+    /// All four AND/XOR states, in one 4×1 row — the table `mono_planes_to_rgba` documents.
+    #[test]
+    fn the_monochrome_truth_table_is_exact() {
+        //          (0,0) black  (0,1) white  (1,0) transparent  (1,1) invert
+        let and = plane(&[0, 0, 1, 1]);
+        let xor = plane(&[0, 1, 0, 1]);
+        let out = mono_planes_to_rgba(&and, &xor, 4, 1);
+        assert_eq!(px(&out, 0), OPAQUE_BLACK, "AND=0 XOR=0 ⇒ black");
+        assert_eq!(px(&out, 1), OPAQUE_WHITE, "AND=0 XOR=1 ⇒ white");
+        // Pixel 2 is transparent by the table, but it is an 8-neighbour of the invert pixel at 3,
+        // so the outline claims it — that IS the documented behaviour.
+        assert_eq!(
+            px(&out, 2),
+            OPAQUE_WHITE,
+            "outline grows into adjacent transparency"
+        );
+        assert_eq!(px(&out, 3), OPAQUE_BLACK, "AND=1 XOR=1 ⇒ black + outline");
+    }
+
+    /// Transparency survives when there is no invert pixel next to it.
+    #[test]
+    fn transparent_pixels_stay_transparent_without_an_invert_neighbour() {
+        let and = plane(&[1, 1, 1, 1]);
+        let xor = plane(&[0, 0, 0, 0]);
+        let out = mono_planes_to_rgba(&and, &xor, 4, 1);
+        for i in 0..4 {
+            assert_eq!(px(&out, i), TRANSPARENT, "pixel {i}");
+        }
+    }
+
+    /// The outline grows into all eight neighbours, and only into TRANSPARENT ones — it must not
+    /// repaint a black or white shape pixel.
+    #[test]
+    fn the_invert_outline_covers_eight_neighbours_and_overwrites_nothing() {
+        // 3×3, invert at the centre, everything else transparent.
+        let and = plane(&[1, 1, 1, 1, 1, 1, 1, 1, 1]);
+        let mut xor = plane(&[0; 9]);
+        for b in &mut xor[4 * 4..4 * 4 + 3] {
+            *b = 0xFF; // centre pixel's XOR bit
+        }
+        let out = mono_planes_to_rgba(&and, &xor, 3, 3);
+        assert_eq!(px(&out, 4), OPAQUE_BLACK, "the invert pixel itself");
+        for i in [0, 1, 2, 3, 5, 6, 7, 8] {
+            assert_eq!(px(&out, i), OPAQUE_WHITE, "neighbour {i} outlined");
+        }
+
+        // Now surround it with BLACK shape pixels (AND=0, XOR=0): the outline must leave them alone.
+        let and = plane(&[0, 0, 0, 0, 1, 0, 0, 0, 0]);
+        let out = mono_planes_to_rgba(&and, &xor, 3, 3);
+        for i in [0, 1, 2, 3, 5, 6, 7, 8] {
+            assert_eq!(
+                px(&out, i),
+                OPAQUE_BLACK,
+                "neighbour {i} must not be repainted"
+            );
+        }
+    }
+
+    /// The outline must clip at the bitmap edges rather than wrap to the opposite side.
+    #[test]
+    fn the_outline_clips_at_the_edges() {
+        // 2×2 with the invert at (0, 0): only (1,0), (0,1) and (1,1) can be outlined.
+        let and = plane(&[1, 1, 1, 1]);
+        let mut xor = plane(&[0; 4]);
+        for b in &mut xor[0..3] {
+            *b = 0xFF;
+        }
+        let out = mono_planes_to_rgba(&and, &xor, 2, 2);
+        assert_eq!(px(&out, 0), OPAQUE_BLACK);
+        for i in [1, 2, 3] {
+            assert_eq!(px(&out, i), OPAQUE_WHITE, "in-bounds neighbour {i}");
+        }
+    }
+
+    // ---- the alpha-less colour path ---------------------------------------------------------
+
+    #[test]
+    fn an_empty_alpha_channel_is_detected() {
+        assert!(alpha_is_empty(&[1, 2, 3, 0, 4, 5, 6, 0]));
+        assert!(!alpha_is_empty(&[1, 2, 3, 0, 4, 5, 6, 1]));
+        assert!(alpha_is_empty(&[]), "no pixels ⇒ vacuously empty");
+    }
+
+    /// Mask WHITE (AND bit 1) = transparent, black = opaque — and the colour bytes are untouched.
+    #[test]
+    fn the_and_mask_supplies_alpha_for_an_alpha_less_cursor() {
+        let mut rgba = vec![
+            10, 20, 30, 0, // pixel 0
+            40, 50, 60, 0, // pixel 1
+        ];
+        let mask = plane(&[1, 0]); // pixel 0 masked out, pixel 1 kept
+        apply_and_mask_alpha(&mut rgba, &mask);
+        assert_eq!(px(&rgba, 0), [10, 20, 30, 0], "masked ⇒ transparent");
+        assert_eq!(px(&rgba, 1), [40, 50, 60, 0xFF], "unmasked ⇒ opaque");
+    }
+
+    /// A mask with FEWER pixels than the colour bitmap must not panic — `zip` stops at the shorter
+    /// side, leaving the tail at whatever alpha it had (the caller has already required
+    /// `mask.h >= color.h`, so this is the belt).
+    #[test]
+    fn a_short_mask_does_not_panic() {
+        let mut rgba = vec![1, 2, 3, 0, 4, 5, 6, 0, 7, 8, 9, 0];
+        apply_and_mask_alpha(&mut rgba, &plane(&[0]));
+        assert_eq!(px(&rgba, 0), [1, 2, 3, 0xFF]);
+        assert_eq!(px(&rgba, 1), [4, 5, 6, 0]);
+    }
 }

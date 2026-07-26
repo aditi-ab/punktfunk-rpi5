@@ -156,27 +156,14 @@ pub(super) fn update_cursor_meta(cursor: &mut CursorState, spa_buf: *mut spa::sy
     }
     let row = bw as usize * 4;
     let stride = if stride < row { row } else { stride };
-    // `span` is the exact byte extent the strided loop reads: `stride·(bh-1) + row`. Compute it
-    // with checked arithmetic (a producer stride near `i32::MAX` would otherwise overflow) and
-    // require the whole pixel block `[bmp_off + pix_off, +span)` to lie inside the region before
-    // fabricating the slice — this is the check whose absence made the read go out of bounds.
-    let span = match stride
-        .checked_mul(bh as usize - 1)
-        .and_then(|v| v.checked_add(row))
-    {
-        Some(s) => s,
-        None => return,
+    let Some(extent) = bitmap_extent(bmp_off, pix_off, stride, row, bh as usize, region_size)
+    else {
+        return;
     };
-    match bmp_off
-        .checked_add(pix_off)
-        .and_then(|v| v.checked_add(span))
-    {
-        Some(end) if end <= region_size => {}
-        _ => return,
-    }
-    // SAFETY: `bmp_off + pix_off + span <= region_size` (checked directly above), so the slice
-    // is fully within the producer's meta region; `span` is exactly the strided loop's extent.
-    let src = unsafe { std::slice::from_raw_parts(data.add(bmp_off + pix_off), span) };
+    // SAFETY: `bitmap_extent` returned `Some`, which means (see its contract) the whole range
+    // `[bmp_off + pix_off, +len)` lies inside `region_size` and `len` is EXACTLY the extent the
+    // strided loop below reads. `data` is the producer's meta-region base, live for this callback.
+    let src = unsafe { std::slice::from_raw_parts(data.add(extent.start), extent.len()) };
     let mut rgba = vec![0u8; bw as usize * bh as usize * 4];
     for y in 0..bh as usize {
         for x in 0..bw as usize {
@@ -193,6 +180,40 @@ pub(super) fn update_cursor_meta(cursor: &mut CursorState, spa_buf: *mut spa::sy
     cursor.bw = bw;
     cursor.bh = bh;
     cursor.serial = cursor.serial.wrapping_add(1);
+}
+
+/// The byte range inside the producer's cursor-meta region that a `bh`-row, `row`-wide,
+/// `stride`-strided bitmap at `bmp_off + pix_off` occupies — or `None` when it does not fit, or when
+/// any of the arithmetic overflows.
+///
+/// THE bound on `update_cursor_meta`. Every input except `region_size` is producer-written, and
+/// `region_size` is the real byte size of the meta region libspa handed us (which is why the caller
+/// takes `spa_buffer_find_meta` rather than `find_meta_data`). Without this check the offsets drive
+/// out-of-bounds pointer arithmetic and an oversized `slice::from_raw_parts` — an OOB read that
+/// SIGSEGVs inside the PipeWire `.process` callback, where `catch_unwind` cannot help. A stride near
+/// `i32::MAX` is enough to overflow the multiply on its own, so every step is checked.
+///
+/// `len()` of the returned range is EXACTLY `stride·(bh−1) + row`: the last row contributes only its
+/// `row` visible bytes, not a full stride, so a bitmap that ends flush against the region's end is
+/// accepted rather than rejected by a padding byte that is never read.
+///
+/// Extracted (sweep Phase 6.1) purely so it can be tested — the caller is unreachable without a live
+/// compositor.
+fn bitmap_extent(
+    bmp_off: usize,
+    pix_off: usize,
+    stride: usize,
+    row: usize,
+    bh: usize,
+    region_size: usize,
+) -> Option<std::ops::Range<usize>> {
+    if bh == 0 || row == 0 || stride < row {
+        return None;
+    }
+    let span = stride.checked_mul(bh - 1)?.checked_add(row)?;
+    let start = bmp_off.checked_add(pix_off)?;
+    let end = start.checked_add(span)?;
+    (end <= region_size).then_some(start..end)
 }
 
 /// Destination channel byte offsets (R,G,B) and bytes-per-pixel for a packed-RGB `PixelFormat`,
@@ -305,5 +326,309 @@ pub(super) fn composite_cursor(
             tight[di + gi] = blend(tight[di + gi], sg);
             tight[di + bi] = blend(tight[di + bi], sb);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A solid-colour cursor state at `(x, y)`, `w`×`h`, alpha `a`.
+    fn cursor(x: i32, y: i32, w: u32, h: u32, rgb: (u8, u8, u8), a: u8) -> CursorState {
+        let mut px = Vec::with_capacity((w * h * 4) as usize);
+        for _ in 0..w * h {
+            px.extend_from_slice(&[rgb.0, rgb.1, rgb.2, a]);
+        }
+        CursorState {
+            visible: true,
+            x,
+            y,
+            rgba: Arc::new(px),
+            bw: w,
+            bh: h,
+            serial: 1,
+            hot_x: 0,
+            hot_y: 0,
+        }
+    }
+
+    // ---- bitmap_extent: the guard whose absence SIGSEGVs uncatchably -------------------------
+
+    #[test]
+    fn bitmap_extent_accepts_a_bitmap_that_fits() {
+        // 4×2 RGBA, tightly packed: 32 bytes at offset 0.
+        assert_eq!(bitmap_extent(0, 0, 16, 16, 2, 32), Some(0..32));
+        // …and the same bitmap behind a header + pixel offset.
+        assert_eq!(bitmap_extent(24, 8, 16, 16, 2, 64), Some(32..64));
+    }
+
+    #[test]
+    fn bitmap_extent_charges_the_last_row_only_its_visible_bytes() {
+        // stride 32, row 16, 3 rows ⇒ 32*2 + 16 = 80, NOT 96. A bitmap ending flush against the
+        // region must be accepted: the trailing stride padding is never read.
+        assert_eq!(bitmap_extent(0, 0, 32, 16, 3, 80), Some(0..80));
+        assert_eq!(bitmap_extent(0, 0, 32, 16, 3, 79), None, "one byte short");
+    }
+
+    #[test]
+    fn bitmap_extent_rejects_anything_past_the_region() {
+        assert_eq!(bitmap_extent(0, 0, 16, 16, 2, 31), None);
+        // An offset alone can push it out.
+        assert_eq!(bitmap_extent(1, 0, 16, 16, 2, 32), None);
+        assert_eq!(bitmap_extent(0, 1, 16, 16, 2, 32), None);
+        // A region of zero accepts nothing.
+        assert_eq!(bitmap_extent(0, 0, 16, 16, 1, 0), None);
+    }
+
+    /// The producer picks `stride` and both offsets, so each is an overflow vector on its own.
+    #[test]
+    fn bitmap_extent_survives_hostile_arithmetic() {
+        // stride × (bh-1) overflows.
+        assert_eq!(bitmap_extent(0, 0, usize::MAX, 16, 3, usize::MAX), None);
+        // span + row overflows. Needs ≥2 rows so `stride·(bh−1)` is already at the ceiling: with a
+        // SINGLE row `stride·0 == 0`, and even a `usize::MAX`-wide row is then arithmetically in
+        // range — which is correct rather than a miss, since the caller has already capped `bw` at
+        // 1024 and `row` is therefore ≤ 4096.
+        assert_eq!(
+            bitmap_extent(0, 0, usize::MAX, usize::MAX, 2, usize::MAX),
+            None
+        );
+        // bmp_off + pix_off overflows.
+        assert_eq!(bitmap_extent(usize::MAX, 1, 16, 16, 1, usize::MAX), None);
+        // start + span overflows.
+        assert_eq!(
+            bitmap_extent(usize::MAX - 8, 0, 16, 16, 1, usize::MAX),
+            None
+        );
+        // A near-i32::MAX stride — the case the SAFETY comment calls out — must not wrap.
+        assert_eq!(bitmap_extent(0, 0, i32::MAX as usize, 16, 1024, 4096), None);
+    }
+
+    #[test]
+    fn bitmap_extent_rejects_degenerate_geometry() {
+        assert_eq!(bitmap_extent(0, 0, 16, 16, 0, 4096), None, "zero rows");
+        assert_eq!(bitmap_extent(0, 0, 16, 0, 2, 4096), None, "zero-width row");
+        assert_eq!(bitmap_extent(0, 0, 8, 16, 2, 4096), None, "stride < row");
+    }
+
+    // ---- composite_cursor: clipping, alpha, and every layout --------------------------------
+
+    /// Read pixel `(x, y)`'s (R, G, B) out of a packed frame, honouring the layout's byte order.
+    fn px_rgb(buf: &[u8], w: usize, x: usize, y: usize, fmt: PixelFormat) -> (u8, u8, u8) {
+        let (ri, gi, bi, bpp) = dst_offsets(fmt).expect("packed layout");
+        let i = (y * w + x) * bpp;
+        (buf[i + ri], buf[i + gi], buf[i + bi])
+    }
+
+    #[test]
+    fn every_packed_layout_lands_the_colour_in_its_own_channels() {
+        for fmt in [
+            PixelFormat::Bgrx,
+            PixelFormat::Bgra,
+            PixelFormat::Rgbx,
+            PixelFormat::Rgba,
+            PixelFormat::Rgb,
+            PixelFormat::Bgr,
+        ] {
+            let bpp = dst_offsets(fmt).unwrap().3;
+            let (w, h) = (4usize, 4usize);
+            let mut buf = vec![0u8; w * h * bpp];
+            // Opaque pure red at (1, 1).
+            composite_cursor(&mut buf, w, h, fmt, &cursor(1, 1, 1, 1, (255, 0, 0), 255));
+            assert_eq!(px_rgb(&buf, w, 1, 1, fmt), (255, 0, 0), "{fmt:?}");
+            // Nothing else moved.
+            assert_eq!(px_rgb(&buf, w, 0, 0, fmt), (0, 0, 0), "{fmt:?}");
+            assert_eq!(px_rgb(&buf, w, 2, 1, fmt), (0, 0, 0), "{fmt:?}");
+        }
+    }
+
+    #[test]
+    fn a_cursor_hanging_off_every_edge_is_clipped_not_wrapped() {
+        let (w, h, fmt) = (4usize, 4usize, PixelFormat::Bgrx);
+        // Top-left: only the bottom-right quarter of a 2×2 lands, at (0, 0).
+        let mut buf = vec![0u8; w * h * 4];
+        composite_cursor(
+            &mut buf,
+            w,
+            h,
+            fmt,
+            &cursor(-1, -1, 2, 2, (10, 20, 30), 255),
+        );
+        assert_eq!(px_rgb(&buf, w, 0, 0, fmt), (10, 20, 30));
+        assert_eq!(px_rgb(&buf, w, 1, 0, fmt), (0, 0, 0));
+        assert_eq!(px_rgb(&buf, w, 0, 1, fmt), (0, 0, 0));
+        // Bottom-right: only the top-left quarter lands, at (3, 3).
+        let mut buf = vec![0u8; w * h * 4];
+        composite_cursor(&mut buf, w, h, fmt, &cursor(3, 3, 2, 2, (10, 20, 30), 255));
+        assert_eq!(px_rgb(&buf, w, 3, 3, fmt), (10, 20, 30));
+        assert_eq!(px_rgb(&buf, w, 2, 3, fmt), (0, 0, 0));
+        // Fully outside in each direction: the frame is untouched.
+        for pos in [(-2, 0), (0, -2), (4, 0), (0, 4), (-9, -9), (99, 99)] {
+            let mut buf = vec![0u8; w * h * 4];
+            composite_cursor(
+                &mut buf,
+                w,
+                h,
+                fmt,
+                &cursor(pos.0, pos.1, 2, 2, (255, 255, 255), 255),
+            );
+            assert!(buf.iter().all(|&b| b == 0), "drew something at {pos:?}");
+        }
+    }
+
+    #[test]
+    fn transparent_and_hidden_cursors_draw_nothing() {
+        let (w, h, fmt) = (2usize, 2usize, PixelFormat::Bgrx);
+        // Alpha 0 — every pixel skipped.
+        let mut buf = vec![0u8; w * h * 4];
+        composite_cursor(&mut buf, w, h, fmt, &cursor(0, 0, 2, 2, (255, 255, 255), 0));
+        assert!(buf.iter().all(|&b| b == 0));
+        // `visible: false` — the whole blit is skipped.
+        let mut c = cursor(0, 0, 2, 2, (255, 255, 255), 255);
+        c.visible = false;
+        let mut buf = vec![0u8; w * h * 4];
+        composite_cursor(&mut buf, w, h, fmt, &c);
+        assert!(buf.iter().all(|&b| b == 0));
+        // No bitmap yet — likewise.
+        let mut c = cursor(0, 0, 2, 2, (255, 255, 255), 255);
+        c.rgba = Arc::new(Vec::new());
+        let mut buf = vec![0u8; w * h * 4];
+        composite_cursor(&mut buf, w, h, fmt, &c);
+        assert!(buf.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn half_alpha_blends_toward_the_destination() {
+        let (w, h, fmt) = (1usize, 1usize, PixelFormat::Bgrx);
+        // dst = white, src = black at 50% ⇒ mid grey (integer blend: (0*128 + 255*127)/255 = 127).
+        let mut buf = vec![255u8; w * h * 4];
+        composite_cursor(&mut buf, w, h, fmt, &cursor(0, 0, 1, 1, (0, 0, 0), 128));
+        assert_eq!(px_rgb(&buf, w, 0, 0, fmt), (127, 127, 127));
+    }
+
+    /// A layout the CPU blit cannot address must be declined, not mis-blitted.
+    #[test]
+    fn unsupported_layouts_are_declined() {
+        assert!(dst_offsets(PixelFormat::Nv12).is_none());
+        assert!(dst_offsets(PixelFormat::Yuv444).is_none());
+        let (w, h) = (2usize, 2usize);
+        let mut buf = vec![0u8; w * h * 4];
+        composite_cursor(
+            &mut buf,
+            w,
+            h,
+            PixelFormat::Nv12,
+            &cursor(0, 0, 2, 2, (255, 255, 255), 255),
+        );
+        assert!(buf.iter().all(|&b| b == 0), "NV12 must not be blitted");
+    }
+
+    // ---- composite_cursor_rgb10: the 10-bit unpack/repack round trip -------------------------
+
+    /// Pack an `x:R:G:B` (`X2Rgb10`) pixel — R at bit 20, G at 10, B at 0 — the way a producer does.
+    fn pack_x2rgb10(r: u32, g: u32, b: u32) -> [u8; 4] {
+        (0xC000_0000 | (r << 20) | (g << 10) | b).to_le_bytes()
+    }
+
+    #[test]
+    fn the_10bit_path_round_trips_an_untouched_pixel() {
+        // Alpha 0 ⇒ the blend is skipped entirely, so the packed pixel must come back bit-identical
+        // (including the top two bits, which are alpha and must survive the repack).
+        for (r, g, b) in [(0, 0, 0), (1023, 1023, 1023), (940, 64, 512), (1, 2, 3)] {
+            let src = pack_x2rgb10(r, g, b);
+            let mut buf = src.to_vec();
+            composite_cursor(
+                &mut buf,
+                1,
+                1,
+                PixelFormat::X2Rgb10,
+                &cursor(0, 0, 1, 1, (255, 255, 255), 0),
+            );
+            assert_eq!(buf, src, "({r},{g},{b}) was modified by a zero-alpha blend");
+        }
+    }
+
+    #[test]
+    fn the_10bit_path_writes_the_right_channel_at_the_right_shift() {
+        // Opaque pure red, 8-bit 255 → 10-bit 1023 (the `v<<2 | v>>6` expansion).
+        let mut buf = pack_x2rgb10(0, 0, 0).to_vec();
+        composite_cursor(
+            &mut buf,
+            1,
+            1,
+            PixelFormat::X2Rgb10,
+            &cursor(0, 0, 1, 1, (255, 0, 0), 255),
+        );
+        let v = u32::from_le_bytes(buf[..4].try_into().unwrap());
+        assert_eq!((v >> 20) & 0x3ff, 1023, "R");
+        assert_eq!((v >> 10) & 0x3ff, 0, "G");
+        assert_eq!(v & 0x3ff, 0, "B");
+        assert_eq!(v & 0xc000_0000, 0xc000_0000, "alpha bits preserved");
+
+        // X2Bgr10 puts R at bit 0 and B at 20 — the SAME cursor must land in the other end.
+        let mut buf = pack_x2rgb10(0, 0, 0).to_vec();
+        composite_cursor(
+            &mut buf,
+            1,
+            1,
+            PixelFormat::X2Bgr10,
+            &cursor(0, 0, 1, 1, (255, 0, 0), 255),
+        );
+        let v = u32::from_le_bytes(buf[..4].try_into().unwrap());
+        assert_eq!(v & 0x3ff, 1023, "R at bit 0 for x:B:G:R");
+        assert_eq!((v >> 20) & 0x3ff, 0, "B untouched");
+    }
+
+    #[test]
+    fn the_10bit_path_clips_like_the_8bit_one() {
+        let (w, h) = (2usize, 2usize);
+        let mut buf: Vec<u8> = (0..w * h).flat_map(|_| pack_x2rgb10(0, 0, 0)).collect();
+        let before = buf.clone();
+        // Entirely off-frame.
+        composite_cursor(
+            &mut buf,
+            w,
+            h,
+            PixelFormat::X2Rgb10,
+            &cursor(-5, -5, 2, 2, (255, 255, 255), 255),
+        );
+        assert_eq!(buf, before);
+        // Straddling the top-left corner: only (0, 0) is written.
+        composite_cursor(
+            &mut buf,
+            w,
+            h,
+            PixelFormat::X2Rgb10,
+            &cursor(-1, -1, 2, 2, (255, 255, 255), 255),
+        );
+        let p0 = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+        let p1 = u32::from_le_bytes(buf[4..8].try_into().unwrap());
+        assert_eq!((p0 >> 20) & 0x3ff, 1023);
+        assert_eq!((p1 >> 20) & 0x3ff, 0);
+    }
+
+    // ---- decode_bitmap_pixel: the producer's byte order ------------------------------------
+
+    #[test]
+    fn each_bitmap_format_is_decoded_to_straight_rgba() {
+        let s = [1u8, 2, 3, 4];
+        assert_eq!(
+            decode_bitmap_pixel(spa::sys::SPA_VIDEO_FORMAT_RGBA, &s),
+            (1, 2, 3, 4)
+        );
+        assert_eq!(
+            decode_bitmap_pixel(spa::sys::SPA_VIDEO_FORMAT_BGRA, &s),
+            (3, 2, 1, 4)
+        );
+        assert_eq!(
+            decode_bitmap_pixel(spa::sys::SPA_VIDEO_FORMAT_ARGB, &s),
+            (2, 3, 4, 1)
+        );
+        assert_eq!(
+            decode_bitmap_pixel(spa::sys::SPA_VIDEO_FORMAT_ABGR, &s),
+            (4, 3, 2, 1)
+        );
+        // An unknown 4-byte format reads as RGBA rather than being rejected — documented behaviour.
+        assert_eq!(decode_bitmap_pixel(0xdead_beef, &s), (1, 2, 3, 4));
     }
 }

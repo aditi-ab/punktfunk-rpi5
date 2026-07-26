@@ -1829,6 +1829,61 @@ mod tests {
     use super::stall::Stall;
     use super::*;
 
+    /// W14: the mint must stay inside the publish token's 24-bit generation field, and must skip 0.
+    ///
+    /// `IDD_GENERATION` is a full `u32` while `FrameToken` carries 24 bits and `unpack` MASKS what it
+    /// reads, so an unmasked `self.generation` stops matching any token past 2²⁴ recreates and
+    /// `try_consume`'s `tok.generation != self.generation` becomes permanently true — every frame
+    /// rejected, forever. The counter is parked just below the boundary here so the wrap is what gets
+    /// exercised, not the happy path. (Same-module access to the private static; no capturer is
+    /// running, and no other test touches it.)
+    #[test]
+    fn the_ring_generation_survives_the_publish_token() {
+        IDD_GENERATION.store(frame::FrameToken::GENERATION_MASK - 2, Ordering::Relaxed);
+        let mut seen = Vec::new();
+        for _ in 0..8 {
+            let g = next_generation();
+            assert_ne!(g, 0, "0 also means the cleared-`latest` sentinel");
+            assert_eq!(
+                g & frame::FrameToken::GENERATION_MASK,
+                g,
+                "generation {g} does not fit the token's field"
+            );
+            // The round trip `try_consume` actually performs.
+            let tok = frame::FrameToken {
+                generation: g,
+                seq: 12345,
+                slot: 2,
+            };
+            let back = frame::FrameToken::unpack(tok.pack());
+            assert_eq!(back.generation, g, "generation lost in the token");
+            assert_eq!(back.seq, 12345, "seq lost in the token");
+            assert_eq!(back.slot, 2, "slot lost in the token");
+            seen.push(g);
+        }
+        // The wrap really happened (we started 2 below the mask), and produced no duplicate 0.
+        assert!(
+            seen.contains(&frame::FrameToken::GENERATION_MASK),
+            "{seen:?}"
+        );
+        assert!(
+            seen.iter().any(|&g| g < 8),
+            "the counter should have wrapped: {seen:?}"
+        );
+    }
+
+    /// The 0 sentinel `recreate_ring` stores must be REJECTED by the generation compare, whatever
+    /// the live generation is — that is what stops a consume from the unwritten new ring.
+    #[test]
+    fn the_cleared_latest_sentinel_never_matches_a_live_generation() {
+        let cleared = frame::FrameToken::unpack(0);
+        assert_eq!(cleared.generation, 0);
+        assert_eq!(cleared.seq, 0);
+        for g in [1u32, 2, 0x7F_FFFF, frame::FrameToken::GENERATION_MASK] {
+            assert_ne!(cleared.generation, g, "sentinel matched generation {g}");
+        }
+    }
+
     /// Feed a [`StallWatch`] fresh frames at the given offsets (ms from a common origin) and
     /// return what each `note_fresh` produced.
     fn watch_run(offsets_ms: &[u64]) -> Vec<Option<Stall>> {
