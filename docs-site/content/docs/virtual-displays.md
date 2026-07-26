@@ -136,13 +136,54 @@ Per-backend support:
   refresh**, with just the game inside. The game boots straight in — no Steam Big Picture to navigate,
   no game-mode desktop. Steam titles launch with the client hidden (`steam -silent`); non-Steam titles
   start almost instantly (gamescope up in ~1 s, then the game's own boot). Combined with **keep alive**,
-  the game keeps running when you disconnect and you re-attach straight back into it; when you quit the
-  game, the session ends cleanly and your client returns to its library.
+  the game keeps running when you disconnect and you re-attach straight back into it.
 
 Dedicated needs `gamescope` installed on the host; if it isn't, a launch falls back to **Auto**
 routing. This axis is independent of the preset — pick it under Host → *Virtual displays*. On a box
 that's already in Steam game mode, a dedicated Steam launch frees game mode's Steam first and restores
 it when the session ends. (GameStream / Moonlight launches follow the same routing.)
+
+## When a game ends, and when a session does
+
+A streaming session and the game the host launched for it can share a fate. Two switches, under
+Host → *Virtual displays* → **When a game or a session ends**. They apply to every store and both
+protocols — and only ever to a game **this host launched for the session**: a game you started
+yourself is never touched.
+
+### When the game exits
+
+**End the session** (default). Quit the game and your client goes back to its own library instead of
+staring at your desktop. This is what a dedicated game session has always done; it now works on
+every path — your live KDE/GNOME/Sway desktop, an attached gamescope, and Moonlight.
+
+**Keep streaming** if you stream the desktop and treat the game as incidental.
+
+### When the session ends
+
+Whether stopping — or losing — a session also closes the game.
+
+- **Leave it running** (default). Nothing is ever closed. Disconnect, and the game plays on for when
+  you come back.
+- **Close it on Stop** — closing the client, or pressing *Stop* in the console, closes the game.
+  A network drop does not: you get your game back when you reconnect.
+- **Always close it** — a drop closes it too, but only after a **reconnect window** (5 minutes by
+  default). Reconnect inside the window and nothing happens; the console shows the countdown while
+  it runs, with an **End now** button if you'd rather not wait.
+
+Closing a game costs whatever it hadn't saved, which is why nothing closes by default. The host asks
+first — a polite close, the same thing clicking the window's X does, so the game runs its own
+shutdown — and only forces the issue after ten seconds of being ignored.
+
+> **Keep alive and this setting are different clocks.** Keep-alive decides how long the *display*
+> outlives a disconnect (10 s by default); the reconnect window decides how long the *game* does
+> (5 minutes). A display set to **Forever** stays up regardless of what happens to the game — a
+> pinned display is a deliberate "this box is a game host" choice, and closing a game doesn't undo it.
+
+### Automation
+
+The host publishes `game.running` and `game.exited` events (the latter says whether the player quit
+it or the host closed it), so a hook or plugin can react without polling. See
+[Automation](/docs/automation).
 
 ## Persistent scaling
 

@@ -25,6 +25,8 @@ and nothing you configure here runs anywhere near the streaming path.
 | `client.connected` / `client.disconnected` | a client session is admitted / goes away | device name, cert fingerprint, plane (`native`/`gamestream`); disconnect adds `reason`: `quit` (user stop), `timeout` (vanished), `error` |
 | `session.started` / `session.ended` | an A/V session registers / ends | session id, client label, mode (`3840x2160@120`), HDR |
 | `stream.started` / `stream.stopped` | video actually starts / stops | mode, HDR, client name, launched app id/title (when one was requested), plane |
+| `game.running` | a launched game's own process is seen running (not merely its launcher) | app id, title, store, client, plane |
+| `game.exited` | a launched game is gone | the same, plus `reason`: `exited` (the player quit it) or `terminated` (the host closed it, per your [session⇄game settings](/docs/virtual-displays#when-a-game-ends-and-when-a-session-does)) |
 | `pairing.pending` | an unpaired device knocks (once per device, not per retry) | device name, fingerprint, plane |
 | `pairing.completed` / `pairing.denied` | a pairing is approved+stored / denied | device name, fingerprint, plane |
 | `display.created` / `display.released` | a virtual display is minted / kept displays are released | backend + mode / count |
@@ -123,6 +125,29 @@ best-effort, even if the session crashed:
 ```
 
 A `do` that fails logs, keeps going, and its own `undo` is skipped (it never took effect).
+
+## Reacting to a game, not a stream
+
+`stream.stopped` tells you the *stream* ended; `game.exited` tells you the *game* did. They are
+often the same moment, but not always — a desktop stream has no game at all, and a stream can
+outlive its game if you turned off "end the session when the game exits".
+
+If you have been polling the host to work out when a game finished, you don't need to any more:
+
+```json
+{ "hooks": [
+    { "on": "game.running", "run": "~/.config/punktfunk/scripts/game-up.sh" },
+    { "on": "game.exited",  "run": "~/.config/punktfunk/scripts/game-down.sh" }
+] }
+```
+
+Both carry the title in `PF_EVENT_GAME_TITLE` / `PF_EVENT_GAME_APP`, and `game.exited` adds
+`PF_EVENT_REASON` so a script can tell "the player quit" (`exited`) from "the host closed it"
+(`terminated`) — worth checking before you, say, power the TV off.
+
+Ending the session yourself when a game exits needs no script at all: it is the default behavior,
+under Host → *Virtual displays* →
+[When a game or a session ends](/docs/virtual-displays#when-a-game-ends-and-when-a-session-does).
 
 ## The event stream (`GET /api/v1/events`)
 
