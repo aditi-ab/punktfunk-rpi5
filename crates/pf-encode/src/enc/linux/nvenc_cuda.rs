@@ -1613,14 +1613,22 @@ impl Encoder for NvencCudaEncoder {
         // `async_rt` must be absent too: in two-thread mode the frame may be recycled right after
         // submit returns while the stream still holds its copy (belt-and-braces — an escalated
         // session was rebuilt without the binding, so `stream_ordered` is false there anyway).
-        // Cursor-bearing frames additionally force the CPU-synced path: the Vulkan blend sits
-        // between the CUDA copy and the encode, and its cross-API ordering is fence/CPU-
-        // established, not stream-ordered. Frames without a cursor (games hide it; client-draws
-        // sessions strip it) keep the stream-ordered fast path untouched.
-        let ordered = self.stream_ordered
-            && self.async_rt.is_none()
-            && self.pending.is_empty()
-            && captured.cursor.is_none();
+        let base_ordered =
+            self.stream_ordered && self.async_rt.is_none() && self.pending.is_empty();
+        // Cursor-bearing frames stay on the fast path when the blend itself can be stream-
+        // ordered: the Vulkan dispatch waits/advances a timeline semaphore CUDA also holds, so
+        // copy→blend→encode orders entirely on-device (`VkSlotBlend::blend_ref_ordered`). Where
+        // that isn't available (no timeline export, or the ring fell back to plain CUDA slots)
+        // a cursor forces the CPU-synced path: the blend's cross-API ordering is then fence/CPU-
+        // established, sitting between the copy and the encode. That slow path is why cursor
+        // frames USED to be gated out entirely — under gamescope the compositor re-attaches the
+        // live pointer to EVERY frame, and the per-frame CPU syncs (exposed to the running
+        // game's GPU load) capped a 120 fps session near 80 (submit p50 ~10 ms).
+        let cursor_ordered = base_ordered
+            && captured.cursor.is_some()
+            && matches!(self.ring[slot].surface, SlotSurface::Vk(_))
+            && self.vk_blend.as_ref().is_some_and(|vk| vk.ordered_ready());
+        let ordered = base_ordered && (captured.cursor.is_none() || cursor_ordered);
         let t0 = std::time::Instant::now();
 
         // Copy the captured buffer into this slot's input surface before encoding it.
@@ -1629,29 +1637,45 @@ impl Encoder for NvencCudaEncoder {
 
         // Cursor-as-metadata: blend the overlay into this slot's OWNED input surface via the
         // SPIR-V compute pass (a dispatch over the cursor's rect — never the compositor's
-        // dmabuf). Cursor-bearing frames forced `ordered = false` above, so the CUDA copy has
-        // completed before the Vulkan dispatch and the fence-waited dispatch completes before
-        // the encode below — the cross-API ordering is CPU-established. Any failure degrades to
-        // no cursor, never a dropped frame.
+        // dmabuf). On the `cursor_ordered` path the enqueued copy, the dispatch, and the encode
+        // are ordered on-device through the timeline semaphore (no CPU sync — see the gate
+        // above). Otherwise `ordered` is false: the CUDA copy completed before the Vulkan
+        // dispatch and the fence-waited dispatch completes before the encode below — the
+        // cross-API ordering is CPU-established. Any failure degrades to no cursor, never a
+        // dropped frame (a failed ordered blend leaves the copy→encode stream ordering intact).
         if let Some(ov) = &captured.cursor {
             if let (Some(vk), SlotSurface::Vk(vref)) =
                 (self.vk_blend.as_mut(), &self.ring[slot].surface)
             {
                 if self.cursor_serial != ov.serial {
+                    // Quiesces any in-flight ordered blend internally before touching the
+                    // staging buffer (bitmap changes are rare — shape flips).
                     vk.upload_cursor(ov.rgba.as_slice(), ov.w, ov.h);
                     self.cursor_serial = ov.serial;
                 }
                 // surfW = content width; the blend derives plane strides from the slot's luma
                 // height. Cursor pixels past the content land in cropped padding rows — harmless.
-                let r = vk.blend_ref(
-                    vref,
-                    slot_fmt_of(self.buffer_fmt),
-                    self.width,
-                    ov.w,
-                    ov.h,
-                    ov.x,
-                    ov.y,
-                );
+                let r = if cursor_ordered {
+                    vk.blend_ref_ordered(
+                        vref,
+                        slot_fmt_of(self.buffer_fmt),
+                        self.width,
+                        ov.w,
+                        ov.h,
+                        ov.x,
+                        ov.y,
+                    )
+                } else {
+                    vk.blend_ref(
+                        vref,
+                        slot_fmt_of(self.buffer_fmt),
+                        self.width,
+                        ov.w,
+                        ov.h,
+                        ov.x,
+                        ov.y,
+                    )
+                };
                 if let Err(e) = r {
                     if !self.cursor_blend_warned {
                         self.cursor_blend_warned = true;
@@ -1686,7 +1710,9 @@ impl Encoder for NvencCudaEncoder {
         // stack-local and outlives the synchronous `encode_picture`. The input surface for `slot` was
         // just filled by the device→device copy — either synchronized (blocking mode) or ordered
         // before this encode by the session's IO-stream binding (`ordered` — same stream, see the
-        // gate above) — and is not overwritten until this slot is reused POOL submits later, by
+        // gate above; on the `cursor_ordered` path the blend's writes are likewise ordered before
+        // the encode, via the timeline-semaphore wait `blend_ref_ordered` enqueued on that same
+        // stream) — and is not overwritten until this slot is reused POOL submits later, by
         // which time this encode was polled (POOL ≥ in-flight depth; in ordered mode the poll's
         // blocking lock additionally proves the enqueued copy completed).
         unsafe {
@@ -2670,6 +2696,85 @@ mod tests {
         assert!(
             !enc.io_stream.is_null(),
             "the boxed CUstream must be held while armed"
+        );
+    }
+
+    /// ON-HARDWARE (RTX box `.21`): cursor-bearing frames must KEEP the stream-ordered fast
+    /// path — the gamescope 80-fps-on-a-120-session fix. With the timeline-semaphore blend
+    /// available, `submit` takes `blend_ref_ordered` (the ticket advances by 2 per frame)
+    /// instead of the CPU-synced fence-wait blend, and AUs keep flowing — including across a
+    /// cursor-bitmap change (exercises the upload quiesce) and per-frame position moves.
+    #[test]
+    #[ignore = "requires an NVIDIA GPU + driver — run manually on the RTX box (.21)"]
+    fn nvenc_cuda_cursor_blend_stream_ordered() {
+        const W: u32 = 1280;
+        const H: u32 = 720;
+        pf_zerocopy::cuda::make_current().expect("shared CUDA context current");
+        // Respect an explicit operator opt-out (or two-thread mode) rather than fail.
+        if !stream_ordered_requested() || async_retrieve_requested() {
+            println!("skipped: stream-ordered submit disabled by env");
+            return;
+        }
+        let mut enc = NvencCudaEncoder::open(
+            Codec::H265,
+            PixelFormat::Nv12,
+            W,
+            H,
+            60,
+            8_000_000,
+            true,
+            8,
+            ChromaFormat::Yuv420,
+            true, // cursor_blend: bring up the Vulkan slot ring + blend
+        )
+        .expect("open NVENC CUDA session");
+        let cursor = |serial: u64, x: i32, y: i32| pf_frame::CursorOverlay {
+            x,
+            y,
+            w: 32,
+            h: 32,
+            rgba: std::sync::Arc::new(vec![0xFF; 32 * 32 * 4]),
+            serial,
+            hot_x: 0,
+            hot_y: 0,
+            visible: true,
+        };
+        let mut aus = 0usize;
+        for i in 0..6u32 {
+            let mut frame = nv12_frame(W, H, i);
+            // Bitmap serial flips at frame 3 (upload quiesce over in-flight ordered blends);
+            // the position moves every frame (push-constant path).
+            frame.cursor = Some(cursor(
+                if i < 3 { 1 } else { 2 },
+                40 + i as i32 * 9,
+                60 + i as i32 * 5,
+            ));
+            enc.submit_indexed(&frame, i).expect("submit cursor frame");
+            while enc.poll().expect("poll").is_some() {
+                aus += 1;
+            }
+        }
+        assert_eq!(aus, 6, "every cursor frame must deliver an AU");
+        assert!(
+            enc.stream_ordered,
+            "IO-stream binding must arm on a default-env session"
+        );
+        let vk = enc
+            .vk_blend
+            .as_ref()
+            .expect("Vulkan slot blend must come up on an RTX box");
+        assert!(
+            vk.ordered_ready(),
+            "timeline semaphore must export to CUDA on this driver"
+        );
+        assert_eq!(
+            vk.ordered_ticket(),
+            12,
+            "all 6 cursor blends must take the ordered path (2 timeline values each)"
+        );
+        println!(
+            "nvenc_cuda cursor stream-ordered: 6 cursor AUs, ticket={}",
+            vk.ordered_ticket()
         );
     }
 

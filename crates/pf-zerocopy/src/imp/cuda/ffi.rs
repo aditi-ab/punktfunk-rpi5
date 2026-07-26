@@ -20,6 +20,7 @@ pub type CUdeviceptr = u64;
 pub type CUgraphicsResource = *mut c_void;
 pub type CUarray = *mut c_void;
 pub type CUexternalMemory = *mut c_void; // opaque CUextMemory_st*
+pub type CUexternalSemaphore = *mut c_void; // opaque CUextSemaphore_st*
 
 /// `CUmemorytype` (cuda.h): HOST=1, DEVICE=2, ARRAY=3, UNIFIED=4.
 pub const CU_MEMORYTYPE_DEVICE: c_uint = 2;
@@ -84,6 +85,60 @@ pub struct CUDA_EXTERNAL_MEMORY_BUFFER_DESC {
 
 pub const CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD: c_uint = 1;
 
+/// `CUDA_EXTERNAL_SEMAPHORE_HANDLE_DESC` (cuda.h, 64-bit layout). Same union-flattening as the
+/// memory desc above: `handle` is a union whose largest member is the win32 two-pointer struct
+/// (16 bytes, align 8); for the fd-carrying types only the first 4 bytes (the `int fd`) are read.
+/// No `size` field — a semaphore has none.
+#[repr(C)]
+#[derive(Default)]
+pub struct CUDA_EXTERNAL_SEMAPHORE_HANDLE_DESC {
+    pub type_: c_uint, // CU_EXTERNAL_SEMAPHORE_HANDLE_TYPE_TIMELINE_SEMAPHORE_FD = 9
+    pub(crate) _pad: u32,
+    pub handle: [u64; 2], // union { int fd; {void*,void*} win32; const void* nvSciSyncObj }
+    pub flags: c_uint,
+    pub(crate) reserved: [c_uint; 16],
+    pub(crate) _pad2: u32,
+}
+
+/// `CUDA_EXTERNAL_SEMAPHORE_SIGNAL_PARAMS` (cuda.h, 64-bit layout), flattened: `params` nests
+/// `fence.value` (the only member we set — the timeline value to signal), the `nvSciSync` union,
+/// `keyedMutex.key`, then 12 reserved words; `flags` + 16 reserved words follow. 144 bytes total
+/// (layout-asserted in `super`'s tests).
+#[repr(C)]
+#[derive(Default)]
+pub struct CUDA_EXTERNAL_SEMAPHORE_SIGNAL_PARAMS {
+    pub value: u64, // params.fence.value — the timeline value this signal sets
+    pub(crate) _nv_sci_sync: u64,
+    pub(crate) _keyed_mutex_key: u64,
+    pub(crate) _params_reserved: [c_uint; 12],
+    pub flags: c_uint,
+    pub(crate) reserved: [c_uint; 16],
+    pub(crate) _pad: u32,
+}
+
+/// `CUDA_EXTERNAL_SEMAPHORE_WAIT_PARAMS` (cuda.h, 64-bit layout), flattened like the signal
+/// params. The C `keyedMutex` member is `{ u64 key; u32 timeoutMs; }` — size 16 with tail
+/// padding, hence the explicit pad word before the 10 reserved words. 144 bytes total.
+#[repr(C)]
+#[derive(Default)]
+pub struct CUDA_EXTERNAL_SEMAPHORE_WAIT_PARAMS {
+    pub value: u64, // params.fence.value — wait until the timeline reaches this value
+    pub(crate) _nv_sci_sync: u64,
+    pub(crate) _keyed_mutex_key: u64,
+    pub(crate) _keyed_mutex_timeout: c_uint,
+    pub(crate) _keyed_mutex_pad: u32,
+    pub(crate) _params_reserved: [c_uint; 10],
+    pub flags: c_uint,
+    pub(crate) reserved: [c_uint; 16],
+    pub(crate) _pad: u32,
+}
+
+/// `CUexternalSemaphoreHandleType` (cuda.h): a Vulkan **timeline** semaphore exported as an
+/// OPAQUE_FD (`vkGetSemaphoreFdKHR`). Needs driver ≥ 460 (CUDA 11.2) — far below the NVENC 12.1
+/// floor this backend already requires, so import failure means "driver refused", not "too old
+/// to try".
+pub const CU_EXTERNAL_SEMAPHORE_HANDLE_TYPE_TIMELINE_SEMAPHORE_FD: c_uint = 9;
+
 /// `CUipcMemHandle` (cuda.h): an opaque 64-byte struct identifying a device allocation across
 /// processes. Produced by `cuIpcGetMemHandle` in the exporting process, consumed by
 /// `cuIpcOpenMemHandle` in the importer — passed **by value**, matching the C
@@ -139,6 +194,23 @@ pub(crate) struct CudaApi {
         *const CUDA_EXTERNAL_MEMORY_BUFFER_DESC,
     ) -> CUresult,
     cuDestroyExternalMemory: unsafe extern "C" fn(CUexternalMemory) -> CUresult,
+    cuImportExternalSemaphore: unsafe extern "C" fn(
+        *mut CUexternalSemaphore,
+        *const CUDA_EXTERNAL_SEMAPHORE_HANDLE_DESC,
+    ) -> CUresult,
+    cuDestroyExternalSemaphore: unsafe extern "C" fn(CUexternalSemaphore) -> CUresult,
+    cuSignalExternalSemaphoresAsync: unsafe extern "C" fn(
+        *const CUexternalSemaphore,
+        *const CUDA_EXTERNAL_SEMAPHORE_SIGNAL_PARAMS,
+        c_uint,
+        CUstream,
+    ) -> CUresult,
+    cuWaitExternalSemaphoresAsync: unsafe extern "C" fn(
+        *const CUexternalSemaphore,
+        *const CUDA_EXTERNAL_SEMAPHORE_WAIT_PARAMS,
+        c_uint,
+        CUstream,
+    ) -> CUresult,
     cuIpcGetMemHandle: unsafe extern "C" fn(*mut CUipcMemHandle, CUdeviceptr) -> CUresult,
     cuIpcOpenMemHandle: unsafe extern "C" fn(*mut CUdeviceptr, CUipcMemHandle, c_uint) -> CUresult,
     cuIpcCloseMemHandle: unsafe extern "C" fn(CUdeviceptr) -> CUresult,
@@ -206,6 +278,14 @@ pub(crate) fn cuda_api() -> Option<&'static CudaApi> {
                     .get(b"cuExternalMemoryGetMappedBuffer\0")
                     .ok()?,
                 cuDestroyExternalMemory: *lib.get(b"cuDestroyExternalMemory\0").ok()?,
+                // External-semaphore interop (the stream-ordered cursor blend): all four are
+                // CUDA 10.0 entry points, far older than anything else this table requires.
+                cuImportExternalSemaphore: *lib.get(b"cuImportExternalSemaphore\0").ok()?,
+                cuDestroyExternalSemaphore: *lib.get(b"cuDestroyExternalSemaphore\0").ok()?,
+                cuSignalExternalSemaphoresAsync: *lib
+                    .get(b"cuSignalExternalSemaphoresAsync\0")
+                    .ok()?,
+                cuWaitExternalSemaphoresAsync: *lib.get(b"cuWaitExternalSemaphoresAsync\0").ok()?,
                 cuIpcGetMemHandle: *lib.get(b"cuIpcGetMemHandle\0").ok()?,
                 // CUDA 11 renamed the entry point (per-thread-stream ABI split); every modern
                 // driver exports `_v2`, but accept the unsuffixed one too (same signature).
@@ -378,6 +458,43 @@ pub(crate) unsafe fn cuExternalMemoryGetMappedBuffer(
 pub(crate) unsafe fn cuDestroyExternalMemory(ext_mem: CUexternalMemory) -> CUresult {
     match cuda_api() {
         Some(a) => (a.cuDestroyExternalMemory)(ext_mem),
+        None => CU_ERROR_NOT_LOADED,
+    }
+}
+pub(crate) unsafe fn cuImportExternalSemaphore(
+    ext_sem_out: *mut CUexternalSemaphore,
+    sem_handle_desc: *const CUDA_EXTERNAL_SEMAPHORE_HANDLE_DESC,
+) -> CUresult {
+    match cuda_api() {
+        Some(a) => (a.cuImportExternalSemaphore)(ext_sem_out, sem_handle_desc),
+        None => CU_ERROR_NOT_LOADED,
+    }
+}
+pub(crate) unsafe fn cuDestroyExternalSemaphore(ext_sem: CUexternalSemaphore) -> CUresult {
+    match cuda_api() {
+        Some(a) => (a.cuDestroyExternalSemaphore)(ext_sem),
+        None => CU_ERROR_NOT_LOADED,
+    }
+}
+pub(crate) unsafe fn cuSignalExternalSemaphoresAsync(
+    ext_sems: *const CUexternalSemaphore,
+    params: *const CUDA_EXTERNAL_SEMAPHORE_SIGNAL_PARAMS,
+    count: c_uint,
+    stream: CUstream,
+) -> CUresult {
+    match cuda_api() {
+        Some(a) => (a.cuSignalExternalSemaphoresAsync)(ext_sems, params, count, stream),
+        None => CU_ERROR_NOT_LOADED,
+    }
+}
+pub(crate) unsafe fn cuWaitExternalSemaphoresAsync(
+    ext_sems: *const CUexternalSemaphore,
+    params: *const CUDA_EXTERNAL_SEMAPHORE_WAIT_PARAMS,
+    count: c_uint,
+    stream: CUstream,
+) -> CUresult {
+    match cuda_api() {
+        Some(a) => (a.cuWaitExternalSemaphoresAsync)(ext_sems, params, count, stream),
         None => CU_ERROR_NOT_LOADED,
     }
 }

@@ -262,6 +262,15 @@ unsafe fn copy_async(copy: &CUDA_MEMCPY2D, what: &str) -> Result<()> {
     ck(cuMemcpy2DAsync_v2(copy, copy_stream()), what)
 }
 
+/// Block until everything enqueued on THIS THREAD's copy stream completed — the shared tail of
+/// the multi-plane blocking copies (stream FIFO: one sync after the last enqueue covers every
+/// plane, where the per-plane `copy_blocking` paid one exposed CPU wait EACH — and under a
+/// game's GPU load each exposed wait eats scheduling latency). The shared context must be
+/// current.
+unsafe fn sync_copy_stream() -> Result<()> {
+    ck(cuStreamSynchronize(copy_stream()), "cuStreamSynchronize")
+}
+
 /// `copy_blocking` when `sync`, else `copy_async` — the shared tail of the public `copy_*_to_device`
 /// helpers, whose `sync: false` mode carries `copy_async`'s source-lifetime contract.
 unsafe fn copy_issue(copy: &CUDA_MEMCPY2D, what: &str, sync: bool) -> Result<()> {
@@ -985,17 +994,24 @@ pub fn copy_nv12_to_device(
         Height: h / 2,
         ..Default::default()
     };
-    // SAFETY: two unsafe `copy_issue` device→device copies; the caller must have the shared
-    // context current (documented). `&y`/`&uv` are live local `CUDA_MEMCPY2D`s outliving each
-    // enqueue. All four device pointers are valid: `src.ptr`/`src_uv_ptr` come from a live
-    // NV12 `DeviceBuffer` (its `.uv` presence was checked via `ok_or_else`), `y_dst`/`uv_dst` are
-    // the caller's live NVENC surface planes; the luma copy is `w`×`h`, the chroma copy
-    // `(w/2)*2`×`h/2`, each within its planes; `sync: false` shifts the source-lifetime obligation
-    // to the caller (documented above). Wrappers → live table.
+    // SAFETY: two unsafe `copy_async` device→device enqueues + an optional stream sync; the
+    // caller must have the shared context current (documented). `&y`/`&uv` are live local
+    // `CUDA_MEMCPY2D`s outliving each enqueue. All four device pointers are valid:
+    // `src.ptr`/`src_uv_ptr` come from a live NV12 `DeviceBuffer` (its `.uv` presence was
+    // checked via `ok_or_else`), `y_dst`/`uv_dst` are the caller's live NVENC surface planes;
+    // the luma copy is `w`×`h`, the chroma copy `(w/2)*2`×`h/2`, each within its planes. With
+    // `sync` the single trailing stream sync covers both enqueues (FIFO) before we return — the
+    // same completion guarantee as the old per-plane blocking copies at half the exposed waits;
+    // `sync: false` shifts the source-lifetime obligation to the caller (documented above).
+    // Wrappers → live table.
     unsafe {
-        copy_issue(&y, "cuMemcpy2DAsync_v2(nv12 Y dev->dev)", sync)?;
-        copy_issue(&uv, "cuMemcpy2DAsync_v2(nv12 UV dev->dev)", sync)
+        copy_async(&y, "cuMemcpy2DAsync_v2(nv12 Y dev->dev)")?;
+        copy_async(&uv, "cuMemcpy2DAsync_v2(nv12 UV dev->dev)")?;
+        if sync {
+            sync_copy_stream()?;
+        }
     }
+    Ok(())
 }
 
 /// Copy our imported stacked-YUV444 [`DeviceBuffer`] into NVENC's three-plane CUDA surface
@@ -1024,13 +1040,19 @@ pub fn copy_yuv444_to_device(
             Height: h,
             ..Default::default()
         };
-        // SAFETY: unsafe `copy_issue` device→device copy; the caller must have the shared
+        // SAFETY: unsafe `copy_async` device→device enqueue; the caller must have the shared
         // context current (documented). `&copy` is a live local outliving the enqueue;
         // `src.ptr + pitch·h·i` stays within the live 3·H-row stacked allocation (`yuv444`
         // checked above), `dst_ptr`/`dst_pitch` is the caller's live NVENC plane; `w`×`h` fits
-        // both; `sync: false` shifts the source-lifetime obligation to the caller (documented
-        // above). Wrapper → live table.
-        unsafe { copy_issue(&copy, "cuMemcpy2DAsync_v2(yuv444 plane dev->dev)", sync)? };
+        // both. Completion is the trailing stream sync below (`sync`) or the caller's
+        // stream-ordering obligation (`sync: false`, documented above). Wrapper → live table.
+        unsafe { copy_async(&copy, "cuMemcpy2DAsync_v2(yuv444 plane dev->dev)")? };
+    }
+    if sync {
+        // SAFETY: one stream sync after the last enqueue covers all three planes (FIFO) — the
+        // same completion guarantee as the old per-plane blocking copies at a third of the
+        // exposed waits. Context current per the caller's contract. Wrapper → live table.
+        unsafe { sync_copy_stream()? };
     }
     Ok(())
 }
@@ -1169,6 +1191,101 @@ impl Drop for ExternalDmabuf {
     }
 }
 
+/// A Vulkan **timeline** semaphore imported as a CUDA external semaphore — the cross-API ordering
+/// primitive for the stream-ordered cursor blend (`vkslot.rs`): CUDA [`signal`](Self::signal)s a
+/// value on this thread's copy stream once the input copy is enqueued, the Vulkan blend waits for
+/// and then advances the timeline on its queue, and CUDA [`wait`](Self::wait)s that advanced
+/// value before the encode — all ordering on-device, no CPU sync anywhere. One imported handle
+/// per [`VkSlotBlend`](super::vkslot::VkSlotBlend); values are monotonic for its lifetime.
+pub struct ExternalSemaphore {
+    sem: CUexternalSemaphore,
+}
+
+// SAFETY: `CUexternalSemaphore` is an opaque driver handle with no thread affinity (the driver
+// API allows use from any thread with the context current). It is uniquely owned here, used from
+// the encode thread but moved with its `VkSlotBlend`, and destroyed exactly once in `Drop` —
+// `Send` (not `Sync`) matches that single-thread-at-a-time use, like `ExternalDmabuf`.
+unsafe impl Send for ExternalSemaphore {}
+
+impl ExternalSemaphore {
+    /// Import a Vulkan timeline semaphore exported as an OPAQUE_FD (`vkGetSemaphoreFdKHR`). The
+    /// fd is handed over: the driver owns it on success, we close it on failure. The shared
+    /// context must be current.
+    pub fn import_owned_timeline_fd(fd: i32) -> Result<ExternalSemaphore> {
+        let mut desc = CUDA_EXTERNAL_SEMAPHORE_HANDLE_DESC {
+            type_: CU_EXTERNAL_SEMAPHORE_HANDLE_TYPE_TIMELINE_SEMAPHORE_FD,
+            ..Default::default()
+        };
+        desc.handle[0] = fd as u32 as u64; // union member `int fd` (little-endian low bytes)
+        let mut sem: CUexternalSemaphore = std::ptr::null_mut();
+        // SAFETY: `cuImportExternalSemaphore` reads `&desc`, a live local `#[repr(C)]`
+        // `CUDA_EXTERNAL_SEMAPHORE_HANDLE_DESC` (layout-asserted below) outliving the synchronous
+        // call: `type_` is TIMELINE_SEMAPHORE_FD and `handle[0]` holds the fd in the union's
+        // `int fd` low bytes. `&mut sem` is a live null-init out-param the driver writes the
+        // imported handle into. Distinct locals → no aliasing. Wrapper → live table (caller holds
+        // the context current).
+        let r = unsafe { cuImportExternalSemaphore(&mut sem, &desc) };
+        if r != 0 {
+            // SAFETY: import failed (`r != 0`), so the driver did NOT take ownership of `fd`; we
+            // still own it and close it exactly once here. `libc::close` acts on the integer alone.
+            unsafe { libc::close(fd) };
+            bail!("cuImportExternalSemaphore failed ({r}) — timeline-semaphore fd export/import unsupported?");
+        }
+        Ok(ExternalSemaphore { sem })
+    }
+
+    /// Enqueue a signal that sets the timeline to `value` once all prior work on THIS THREAD's
+    /// copy stream (the stream `copy_stream_handle` exposes) completes. No CPU wait.
+    pub fn signal(&self, value: u64) -> Result<()> {
+        let params = CUDA_EXTERNAL_SEMAPHORE_SIGNAL_PARAMS {
+            value,
+            ..Default::default()
+        };
+        // SAFETY: `self.sem` is the live imported handle (this struct only exists after a
+        // successful import; destroyed only in `Drop`). `&self.sem`/`&params` are live locals the
+        // synchronous enqueue reads (count 1); the driver retains no pointer into Rust memory.
+        // The stream is this thread's live copy stream. Wrapper → live table (context current).
+        unsafe {
+            ck(
+                cuSignalExternalSemaphoresAsync(&self.sem, &params, 1, copy_stream()),
+                "cuSignalExternalSemaphoresAsync",
+            )
+        }
+    }
+
+    /// Enqueue a wait: work enqueued on THIS THREAD's copy stream after this call runs only once
+    /// the timeline reaches `value`. No CPU wait.
+    pub fn wait(&self, value: u64) -> Result<()> {
+        let params = CUDA_EXTERNAL_SEMAPHORE_WAIT_PARAMS {
+            value,
+            ..Default::default()
+        };
+        // SAFETY: same contract as `signal` — live handle, live locals across the synchronous
+        // enqueue, this thread's live copy stream. Wrapper → live table (context current).
+        unsafe {
+            ck(
+                cuWaitExternalSemaphoresAsync(&self.sem, &params, 1, copy_stream()),
+                "cuWaitExternalSemaphoresAsync",
+            )
+        }
+    }
+}
+
+impl Drop for ExternalSemaphore {
+    fn drop(&mut self) {
+        // SAFETY: `self.sem` is the valid imported handle this struct exclusively owns, destroyed
+        // exactly once here. The shared context is made current first because drop may run off
+        // the import thread (`VkSlotBlend` teardown quiesces the GPU before dropping, so no
+        // enqueued signal/wait still references the semaphore). Result ignored (best-effort).
+        unsafe {
+            if let Some(c) = CONTEXT.get() {
+                let _ = cuCtxSetCurrent(c.0);
+            }
+            let _ = cuDestroyExternalSemaphore(self.sem);
+        }
+    }
+}
+
 /// Copy a pitched span starting at `src_ptr` (e.g. an [`ExternalDmabuf`] mapping at the chunk
 /// offset) into `dst`. The shared context must be current on this thread.
 pub fn copy_pitched_to_buffer(
@@ -1241,5 +1358,33 @@ pub fn copy_pitched_nv12_to_buffer(
     unsafe {
         copy_blocking(&y, "cuMemcpy2DAsync_v2(ext->dev nv12 Y)")?;
         copy_blocking(&uv, "cuMemcpy2DAsync_v2(ext->dev nv12 UV)")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::mem::{offset_of, size_of};
+
+    /// The external-semaphore param structs are hand-flattened from cuda.h unions — assert the
+    /// layout against the C definitions so a transcription slip fails in CI, not in the driver.
+    #[test]
+    fn external_semaphore_struct_layouts_match_cuda_h() {
+        // CUDA_EXTERNAL_SEMAPHORE_HANDLE_DESC: type(4)+pad(4)+union(16)+flags(4)+reserved(64) = 96.
+        assert_eq!(size_of::<CUDA_EXTERNAL_SEMAPHORE_HANDLE_DESC>(), 96);
+        assert_eq!(offset_of!(CUDA_EXTERNAL_SEMAPHORE_HANDLE_DESC, handle), 8);
+        assert_eq!(offset_of!(CUDA_EXTERNAL_SEMAPHORE_HANDLE_DESC, flags), 24);
+
+        // CUDA_EXTERNAL_SEMAPHORE_SIGNAL_PARAMS: params{fence(8)+nvSciSync(8)+keyedMutex(8)+
+        // reserved[12](48)} = 72, flags at 72, reserved[16] → 144 total.
+        assert_eq!(size_of::<CUDA_EXTERNAL_SEMAPHORE_SIGNAL_PARAMS>(), 144);
+        assert_eq!(offset_of!(CUDA_EXTERNAL_SEMAPHORE_SIGNAL_PARAMS, value), 0);
+        assert_eq!(offset_of!(CUDA_EXTERNAL_SEMAPHORE_SIGNAL_PARAMS, flags), 72);
+
+        // CUDA_EXTERNAL_SEMAPHORE_WAIT_PARAMS: params{fence(8)+nvSciSync(8)+keyedMutex(16,
+        // tail-padded)+reserved[10](40)} = 72, flags at 72, reserved[16] → 144 total.
+        assert_eq!(size_of::<CUDA_EXTERNAL_SEMAPHORE_WAIT_PARAMS>(), 144);
+        assert_eq!(offset_of!(CUDA_EXTERNAL_SEMAPHORE_WAIT_PARAMS, value), 0);
+        assert_eq!(offset_of!(CUDA_EXTERNAL_SEMAPHORE_WAIT_PARAMS, flags), 72);
     }
 }

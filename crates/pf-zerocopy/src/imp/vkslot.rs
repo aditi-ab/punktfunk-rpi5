@@ -12,11 +12,24 @@
 //!
 //! The direct-SDK NVENC encoder allocates its input ring through [`VkSlotBlend::alloc_slot`]
 //! instead of `cuMemAllocPitch`: same contiguous layouts (`InputSurface` docs), but the memory is
-//! Vulkan external memory both APIs address. Per cursor-bearing frame the encoder CPU-syncs its
-//! CUDA copy, then [`VkSlotBlend::blend`] dispatches the compute blend over the cursor's
-//! rectangle and fence-waits — the same coherence ceremony [`super::vulkan::VkBridge`] ships for
-//! its CSC (fence-ordered cross-API access on NVIDIA, no queue-family transfer needed). Frames
-//! without a cursor never touch Vulkan, keeping the stream-ordered fast path intact.
+//! Vulkan external memory both APIs address.
+//!
+//! Cursor-bearing frames blend one of two ways:
+//!
+//! * **Stream-ordered** ([`blend_ref_ordered`](VkSlotBlend::blend_ref_ordered), the fast path
+//!   when the driver exports a timeline semaphore to CUDA): the encoder enqueues its CUDA copy
+//!   with no CPU sync, CUDA signals the shared timeline on the copy stream, the blend submission
+//!   waits for and then advances it on the Vulkan queue, and CUDA waits the advanced value
+//!   before the encode — the whole copy→blend→encode chain orders on-device, so a visible
+//!   cursor costs the submit path nothing. (Before this, EVERY cursor frame took the CPU-synced
+//!   path below; under gamescope — which composites the pointer into every frame — that
+//!   serialized submit behind the game's GPU load and capped a 120 fps session near 80.)
+//! * **CPU-synced** ([`blend_ref`](VkSlotBlend::blend_ref), the fallback when timeline bring-up
+//!   failed): the encoder blocks on its CUDA copy, the blend fence-waits — the same coherence
+//!   ceremony [`super::vulkan::VkBridge`] ships for its CSC (fence-ordered cross-API access on
+//!   NVIDIA, no queue-family transfer needed).
+//!
+//! Frames without a cursor never touch Vulkan at all.
 //!
 //! Falls back cleanly: if bring-up fails the encoder allocates plain CUDA surfaces and composite
 //! mode degrades to no cursor (warned once) — never a failed session.
@@ -87,12 +100,36 @@ pub struct VkSlotRef {
 }
 
 /// One allocated slot's backing objects, freed together in reverse order (CUDA mapping first).
+/// Each slot carries its own command buffer + descriptor set so ordered blends can be in flight
+/// on several slots at once (the shared-single-set design raced the next recording against a
+/// still-executing submission); the set's bindings are written once here — the slot buffer never
+/// changes and the cursor staging buffer is shared.
 struct SlotAlloc {
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
     /// CUDA's import of the exported OPAQUE_FD — must drop BEFORE the Vulkan memory is freed.
     cuda: cuda::ExternalDmabuf,
-    size: u64,
+    cmd: vk::CommandBuffer,
+    desc: vk::DescriptorSet,
+}
+
+/// The cross-API ordering state for stream-ordered blends: one Vulkan timeline semaphore,
+/// exported as an OPAQUE_FD and imported into CUDA. `None` when the driver lacks timeline
+/// semaphores or the export/import failed — blends then stay CPU-synced ([`VkSlotBlend::blend_ref`]).
+struct Timeline {
+    sem: vk::Semaphore,
+    /// `vkWaitSemaphoresKHR` — the CPU-side quiesce for cursor-bitmap uploads and teardown
+    /// (the 1.1 device gets the entry point from `VK_KHR_timeline_semaphore`).
+    ts: ash::khr::timeline_semaphore::Device,
+    /// CUDA's import; its `signal`/`wait` enqueue on the encode thread's copy stream.
+    cuda: cuda::ExternalSemaphore,
+    /// Last timeline value handed out (monotonic for the device's lifetime, never reused —
+    /// each ordered blend consumes two: copy-done, then blend-done).
+    ticket: u64,
+    /// Last blend-done value an ACCEPTED `vkQueueSubmit` will signal — what upload/teardown
+    /// quiesce on. Only advanced on submit success: a value from a failed submit would never
+    /// be signaled and a quiesce on it would time out.
+    last_blend: u64,
 }
 
 /// 28-byte push-constant block matching `cursor_blend.comp`'s `Push`.
@@ -114,14 +151,12 @@ pub struct VkSlotBlend {
     ext_fd: ash::khr::external_memory_fd::Device,
     queue: vk::Queue,
     cmd_pool: vk::CommandPool,
-    cmd: vk::CommandBuffer,
     fence: vk::Fence,
     mem_props: vk::PhysicalDeviceMemoryProperties,
     shader: vk::ShaderModule,
     desc_layout: vk::DescriptorSetLayout,
     pipe_layout: vk::PipelineLayout,
     desc_pool: vk::DescriptorPool,
-    desc_set: vk::DescriptorSet,
     /// One pipeline per [`SlotFormat`], indexed by `mode()` (spec constant).
     pipelines: [vk::Pipeline; 3],
     /// Host-visible cursor bitmap staging (CURSOR_MAX²·4, tight rows), persistently mapped.
@@ -129,6 +164,8 @@ pub struct VkSlotBlend {
     cur_mem: vk::DeviceMemory,
     cur_map: *mut u8,
     slots: Vec<SlotAlloc>,
+    /// Stream-ordered blend support (`None` = CPU-synced blends only). See [`Timeline`].
+    timeline: Option<Timeline>,
 }
 
 // SAFETY: raw Vulkan handles + a persistently-mapped pointer, all uniquely owned by this struct
@@ -182,14 +219,44 @@ impl VkSlotBlend {
             let qci = [vk::DeviceQueueCreateInfo::default()
                 .queue_family_index(qf)
                 .queue_priorities(&prio)];
-            let exts = [ash::khr::external_memory_fd::NAME.as_ptr()];
-            let device = match instance.create_device(
-                phys,
-                &vk::DeviceCreateInfo::default()
-                    .queue_create_infos(&qci)
-                    .enabled_extension_names(&exts),
-                None,
-            ) {
+            // Timeline-semaphore export to CUDA (the stream-ordered blend) is optional: probe the
+            // device extensions + feature bit and enable them only where present, so a driver
+            // without them still gets a working (CPU-synced) blend device. NVIDIA has shipped
+            // both extensions since ~2019; the probe is for exotic/legacy stacks.
+            let want_timeline = {
+                let have_exts = instance
+                    .enumerate_device_extension_properties(phys)
+                    .map(|props| {
+                        let has = |name: &std::ffi::CStr| {
+                            props
+                                .iter()
+                                .any(|p| p.extension_name_as_c_str().is_ok_and(|n| n == name))
+                        };
+                        has(ash::khr::timeline_semaphore::NAME)
+                            && has(ash::khr::external_semaphore_fd::NAME)
+                    })
+                    .unwrap_or(false);
+                have_exts && {
+                    let mut tl = vk::PhysicalDeviceTimelineSemaphoreFeatures::default();
+                    let mut f2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut tl);
+                    instance.get_physical_device_features2(phys, &mut f2);
+                    tl.timeline_semaphore == vk::TRUE
+                }
+            };
+            let mut exts = vec![ash::khr::external_memory_fd::NAME.as_ptr()];
+            if want_timeline {
+                exts.push(ash::khr::timeline_semaphore::NAME.as_ptr());
+                exts.push(ash::khr::external_semaphore_fd::NAME.as_ptr());
+            }
+            let mut tl_enable =
+                vk::PhysicalDeviceTimelineSemaphoreFeatures::default().timeline_semaphore(true);
+            let mut dci = vk::DeviceCreateInfo::default()
+                .queue_create_infos(&qci)
+                .enabled_extension_names(&exts);
+            if want_timeline {
+                dci = dci.push_next(&mut tl_enable);
+            }
+            let device = match instance.create_device(phys, &dci, None) {
                 Ok(d) => d,
                 Err(e) => {
                     instance.destroy_instance(None);
@@ -207,27 +274,90 @@ impl VkSlotBlend {
                 ext_fd,
                 queue,
                 cmd_pool: vk::CommandPool::null(),
-                cmd: vk::CommandBuffer::null(),
                 fence: vk::Fence::null(),
                 mem_props,
                 shader: vk::ShaderModule::null(),
                 desc_layout: vk::DescriptorSetLayout::null(),
                 pipe_layout: vk::PipelineLayout::null(),
                 desc_pool: vk::DescriptorPool::null(),
-                desc_set: vk::DescriptorSet::null(),
                 pipelines: [vk::Pipeline::null(); 3],
                 cur_buf: vk::Buffer::null(),
                 cur_mem: vk::DeviceMemory::null(),
                 cur_map: std::ptr::null_mut(),
                 slots: Vec::new(),
+                timeline: None,
             };
             me.init_objects(qf).inspect_err(|_| {
                 // `Drop` runs the same teardown and tolerates the nulls left by a partial init.
             })?;
+            if want_timeline {
+                // Non-fatal: any failure (export refused, CUDA import refused) leaves
+                // `timeline` None and blends CPU-synced — never a failed bring-up.
+                if let Err(e) = me.init_timeline() {
+                    tracing::info!(
+                        error = %format!("{e:#}"),
+                        "cursor blend timeline export unavailable — blends stay CPU-synced"
+                    );
+                }
+            }
             tracing::info!(
+                stream_ordered = me.timeline.is_some(),
                 "Vulkan slot blend ready (exportable NVENC inputs + SPIR-V cursor blend)"
             );
             Ok(me)
+        }
+    }
+
+    /// Bring up the [`Timeline`]: create an exportable timeline semaphore, export its OPAQUE_FD,
+    /// import it into CUDA. Only called when the device was created with the timeline extensions.
+    fn init_timeline(&mut self) -> Result<()> {
+        // SAFETY: ash calls on the live `self.device` with builder infos from locals outliving
+        // each synchronous call. The semaphore is destroyed on every failure path after its
+        // creation; the exported fd is owned by `import_owned_timeline_fd` (the driver takes it
+        // on success, it closes it on failure). The shared CUDA context is current: the encoder
+        // brings this device up from its encode thread with the context established.
+        unsafe {
+            let mut type_ci = vk::SemaphoreTypeCreateInfo::default()
+                .semaphore_type(vk::SemaphoreType::TIMELINE)
+                .initial_value(0);
+            let mut export = vk::ExportSemaphoreCreateInfo::default()
+                .handle_types(vk::ExternalSemaphoreHandleTypeFlags::OPAQUE_FD);
+            let sem = self
+                .device
+                .create_semaphore(
+                    &vk::SemaphoreCreateInfo::default()
+                        .push_next(&mut type_ci)
+                        .push_next(&mut export),
+                    None,
+                )
+                .context("create timeline semaphore")?;
+            let sem_fd = ash::khr::external_semaphore_fd::Device::new(&self.instance, &self.device);
+            let fd = match sem_fd.get_semaphore_fd(
+                &vk::SemaphoreGetFdInfoKHR::default()
+                    .semaphore(sem)
+                    .handle_type(vk::ExternalSemaphoreHandleTypeFlags::OPAQUE_FD),
+            ) {
+                Ok(f) => f,
+                Err(e) => {
+                    self.device.destroy_semaphore(sem, None);
+                    return Err(e).context("vkGetSemaphoreFdKHR(timeline)");
+                }
+            };
+            let cuda_sem = match cuda::ExternalSemaphore::import_owned_timeline_fd(fd) {
+                Ok(c) => c,
+                Err(e) => {
+                    self.device.destroy_semaphore(sem, None);
+                    return Err(e);
+                }
+            };
+            self.timeline = Some(Timeline {
+                sem,
+                ts: ash::khr::timeline_semaphore::Device::new(&self.instance, &self.device),
+                cuda: cuda_sem,
+                ticket: 0,
+                last_blend: 0,
+            });
+            Ok(())
         }
     }
 
@@ -246,14 +376,6 @@ impl VkSlotBlend {
                     None,
                 )
                 .context("create command pool")?;
-            self.cmd = d
-                .allocate_command_buffers(
-                    &vk::CommandBufferAllocateInfo::default()
-                        .command_pool(self.cmd_pool)
-                        .level(vk::CommandBufferLevel::PRIMARY)
-                        .command_buffer_count(1),
-                )
-                .context("allocate command buffer")?[0];
             self.fence = d
                 .create_fence(&vk::FenceCreateInfo::default(), None)
                 .context("create fence")?;
@@ -320,25 +442,21 @@ impl VkSlotBlend {
                     None,
                 )
                 .context("create pipeline layout")?;
+            // Per-slot sets (one per ring slot, written once at `alloc_slot`; freed by
+            // `free_slots` on ring rebuilds, hence FREE_DESCRIPTOR_SET). 64 is comfortably
+            // above any ring depth (the encoder's POOL is 8).
             let pool_sizes = [vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(2)];
+                .descriptor_count(128)];
             self.desc_pool = d
                 .create_descriptor_pool(
                     &vk::DescriptorPoolCreateInfo::default()
-                        .max_sets(1)
+                        .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET)
+                        .max_sets(64)
                         .pool_sizes(&pool_sizes),
                     None,
                 )
                 .context("create descriptor pool")?;
-            let dls = [self.desc_layout];
-            self.desc_set = d
-                .allocate_descriptor_sets(
-                    &vk::DescriptorSetAllocateInfo::default()
-                        .descriptor_pool(self.desc_pool)
-                        .set_layouts(&dls),
-                )
-                .context("allocate descriptor set")?[0];
 
             // The shader + one pipeline per MODE (spec constant 0).
             if CURSOR_SPV.len() % 4 != 0 {
@@ -465,6 +583,59 @@ impl VkSlotBlend {
                     return Err(e).context("cuImportExternalMemory(slot OPAQUE_FD)");
                 }
             };
+            // The slot's own descriptor set + command buffer (see `SlotAlloc`). Bindings are
+            // written once here: binding 0 is this slot's buffer (immutable for its lifetime),
+            // binding 1 the shared cursor staging buffer.
+            let dls = [self.desc_layout];
+            let desc = match d.allocate_descriptor_sets(
+                &vk::DescriptorSetAllocateInfo::default()
+                    .descriptor_pool(self.desc_pool)
+                    .set_layouts(&dls),
+            ) {
+                Ok(s) => s[0],
+                Err(e) => {
+                    drop(ext); // CUDA's view of the memory goes first
+                    d.free_memory(memory, None);
+                    d.destroy_buffer(buffer, None);
+                    return Err(e).context("allocate slot descriptor set");
+                }
+            };
+            let surf_info = [vk::DescriptorBufferInfo::default()
+                .buffer(buffer)
+                .offset(0)
+                .range(size)];
+            let cur_info = [vk::DescriptorBufferInfo::default()
+                .buffer(self.cur_buf)
+                .offset(0)
+                .range((CURSOR_MAX * CURSOR_MAX * 4) as u64)];
+            let writes = [
+                vk::WriteDescriptorSet::default()
+                    .dst_set(desc)
+                    .dst_binding(0)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(&surf_info),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(desc)
+                    .dst_binding(1)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(&cur_info),
+            ];
+            d.update_descriptor_sets(&writes, &[]);
+            let cmd = match d.allocate_command_buffers(
+                &vk::CommandBufferAllocateInfo::default()
+                    .command_pool(self.cmd_pool)
+                    .level(vk::CommandBufferLevel::PRIMARY)
+                    .command_buffer_count(1),
+            ) {
+                Ok(c) => c[0],
+                Err(e) => {
+                    let _ = d.free_descriptor_sets(self.desc_pool, &[desc]);
+                    drop(ext); // CUDA's view of the memory goes first
+                    d.free_memory(memory, None);
+                    d.destroy_buffer(buffer, None);
+                    return Err(e).context("allocate slot command buffer");
+                }
+            };
             let r = VkSlotRef {
                 ptr: ext.ptr,
                 pitch: pitch as usize,
@@ -475,7 +646,8 @@ impl VkSlotBlend {
                 buffer,
                 memory,
                 cuda: ext,
-                size,
+                cmd,
+                desc,
             });
             Ok(r)
         }
@@ -485,12 +657,26 @@ impl VkSlotBlend {
     /// first (field order in [`SlotAlloc`] frees `cuda` via its own `Drop` before we free the VK
     /// objects explicitly here).
     pub fn free_slots(&mut self) {
+        // Ordered blends return with their work still on the queue — quiesce before freeing the
+        // buffers/sets it references. `device_wait_idle` (not a timeline wait) so a submission
+        // whose CUDA copy-done signal never fired is still covered; this tiny device idles in
+        // microseconds outside that pathological case. CPU-synced blends need nothing (they
+        // fence-wait before returning), so a `None` timeline skips it.
+        if self.timeline.is_some() && !self.slots.is_empty() {
+            // SAFETY: single-threaded owner; no other thread touches this device or its queue.
+            unsafe {
+                let _ = self.device.device_wait_idle();
+            }
+        }
         for s in self.slots.drain(..) {
             drop(s.cuda); // CUDA's view of the memory goes first
-                          // SAFETY: `buffer`/`memory` were created in `alloc_slot`, are uniquely owned by the
-                          // drained `SlotAlloc`, and are destroyed exactly once here. No queue work can be
-                          // in flight: every `blend` fence-waits before returning.
+                          // SAFETY: `buffer`/`memory`/`cmd`/`desc` were created in `alloc_slot`, are uniquely
+                          // owned by the drained `SlotAlloc`, and are destroyed exactly once here. No queue
+                          // work is in flight: CPU-synced blends fence-wait before returning, and ordered
+                          // blends were quiesced by the `device_wait_idle` above.
             unsafe {
+                let _ = self.device.free_descriptor_sets(self.desc_pool, &[s.desc]);
+                self.device.free_command_buffers(self.cmd_pool, &[s.cmd]);
                 self.device.destroy_buffer(s.buffer, None);
                 self.device.free_memory(s.memory, None);
             }
@@ -498,19 +684,186 @@ impl VkSlotBlend {
     }
 
     /// Upload the cursor RGBA (`cw*ch*4`, tight rows) into the mapped staging buffer. Call only
-    /// when the bitmap changes; position moves are push constants.
+    /// when the bitmap changes; position moves are push constants. Quiesces any in-flight
+    /// ordered blend first (bitmap changes are rare — pointer-shape flips — so the occasional
+    /// bounded CPU wait here is the trade that keeps the per-frame path sync-free).
     pub fn upload_cursor(&mut self, rgba: &[u8], cw: u32, ch: u32) {
+        if let Some(t) = &self.timeline {
+            if t.last_blend > 0 {
+                let sems = [t.sem];
+                let values = [t.last_blend];
+                // SAFETY: `t.sem` is the live timeline semaphore; the wait info's arrays are
+                // locals outliving the synchronous call. `last_blend` only holds values an
+                // accepted submit will signal, so the wait terminates (the timeout is the
+                // backstop for a wedged queue — then we proceed and risk one torn cursor
+                // bitmap, never UB: the staging buffer stays alive regardless).
+                let r = unsafe {
+                    t.ts.wait_semaphores(
+                        &vk::SemaphoreWaitInfo::default()
+                            .semaphores(&sems)
+                            .values(&values),
+                        1_000_000_000,
+                    )
+                };
+                if let Err(e) = r {
+                    tracing::warn!(
+                        error = ?e,
+                        "cursor upload quiesce failed — proceeding (a torn cursor bitmap for \
+                         one frame at worst)"
+                    );
+                }
+            }
+        }
         let cw = cw.min(CURSOR_MAX);
         let ch = ch.min(CURSOR_MAX);
         let len = (cw * ch * 4) as usize;
         let len = len.min(rgba.len());
         // SAFETY: `cur_map` is the live persistent mapping of the CURSOR_MAX²·4 host-coherent
         // allocation (created in `init_objects`, unmapped only in `Drop`); `len` is clamped to
-        // both the source slice and the buffer capacity. No blend is in flight (every `blend`
-        // fence-waits before returning), so no GPU read races this host write.
+        // both the source slice and the buffer capacity. No blend reads race this host write:
+        // CPU-synced blends fence-wait before returning, and ordered blends were quiesced via
+        // the timeline wait above.
         unsafe {
             std::ptr::copy_nonoverlapping(rgba.as_ptr(), self.cur_map, len);
         }
+    }
+
+    /// Stream-ordered blends available: the timeline semaphore was exported to CUDA at bring-up,
+    /// so [`blend_ref_ordered`](Self::blend_ref_ordered) can order copy→blend→encode on-device.
+    pub fn ordered_ready(&self) -> bool {
+        self.timeline.is_some()
+    }
+
+    /// Last timeline value handed out (0 = no ordered blend submitted yet) — test observability
+    /// for "did the ordered path actually run".
+    pub fn ordered_ticket(&self) -> u64 {
+        self.timeline.as_ref().map_or(0, |t| t.ticket)
+    }
+
+    /// Push constants + dispatch geometry for one blend (must match cursor_blend.comp): ARGB =
+    /// per cursor px; NV12/YUV444 = per word-aligned 4-px span × (2-row blocks | rows). `None`
+    /// when the clamped cursor rect is empty (nothing to dispatch).
+    fn blend_geometry(
+        slot: &VkSlotRef,
+        fmt: SlotFormat,
+        surf_w: u32,
+        cw: u32,
+        ch: u32,
+        ox: i32,
+        oy: i32,
+    ) -> Option<(Push, u32, u32)> {
+        let cw = cw.min(CURSOR_MAX);
+        let ch = ch.min(CURSOR_MAX);
+        if cw == 0 || ch == 0 {
+            return None;
+        }
+        let push = Push {
+            pitch: slot.pitch as u32,
+            surf_w,
+            surf_h: slot.height,
+            cur_w: cw,
+            cur_h: ch,
+            ox,
+            oy,
+        };
+        let (gx, gy) = match fmt {
+            SlotFormat::Argb => (cw.div_ceil(8), ch.div_ceil(8)),
+            _ => {
+                let x0 = (ox >> 2) << 2;
+                let spans = ((ox + cw as i32) - x0 + 3).div_euclid(4).max(1) as u32;
+                let rows = match fmt {
+                    SlotFormat::Nv12 => ch.div_ceil(2),
+                    _ => ch,
+                };
+                (spans.div_ceil(8), rows.div_ceil(8))
+            }
+        };
+        Some((push, gx, gy))
+    }
+
+    /// Record the blend (barriers + bind + push constants + dispatch) into `id`'s own command
+    /// buffer and return it, ready for submission.
+    ///
+    /// # Safety
+    /// The slot's previous submission must have completed: sync blends fence-wait before
+    /// returning; ordered blends rely on the encoder's ring-reuse discipline (a slot is reused
+    /// only after its encode — GPU-ordered after its blend — was polled).
+    unsafe fn record_blend(
+        &self,
+        id: usize,
+        fmt: SlotFormat,
+        push: &Push,
+        gx: u32,
+        gy: u32,
+    ) -> Result<vk::CommandBuffer> {
+        let alloc = self
+            .slots
+            .get(id)
+            .ok_or_else(|| anyhow!("bad slot id {id}"))?;
+        let d = &self.device;
+        let cmd = alloc.cmd;
+        d.begin_command_buffer(
+            cmd,
+            &vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+        )
+        .context("begin blend cmd")?;
+        // CUDA wrote the frame into this memory outside Vulkan's view — make it visible to
+        // the shader (external-memory coherence ceremony; NVIDIA honors this with the
+        // fence/semaphore ordering alone, the barrier is the spec-shaped belt-and-braces).
+        let acquire = [vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)];
+        d.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::TOP_OF_PIPE,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::DependencyFlags::empty(),
+            &acquire,
+            &[],
+            &[],
+        );
+        d.cmd_bind_pipeline(
+            cmd,
+            vk::PipelineBindPoint::COMPUTE,
+            self.pipelines[fmt.mode() as usize],
+        );
+        d.cmd_bind_descriptor_sets(
+            cmd,
+            vk::PipelineBindPoint::COMPUTE,
+            self.pipe_layout,
+            0,
+            &[alloc.desc],
+            &[],
+        );
+        let bytes = std::slice::from_raw_parts(
+            (push as *const Push) as *const u8,
+            std::mem::size_of::<Push>(),
+        );
+        d.cmd_push_constants(
+            cmd,
+            self.pipe_layout,
+            vk::ShaderStageFlags::COMPUTE,
+            0,
+            bytes,
+        );
+        d.cmd_dispatch(cmd, gx.max(1), gy.max(1), 1);
+        // Release the shader's writes so the downstream CUDA/NVENC reads (fence- or
+        // semaphore-ordered) see them.
+        let release = [vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+            .dst_access_mask(vk::AccessFlags::MEMORY_READ)];
+        d.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+            vk::DependencyFlags::empty(),
+            &release,
+            &[],
+            &[],
+        );
+        d.end_command_buffer(cmd).context("end blend cmd")?;
+        Ok(cmd)
     }
 
     /// Blend the uploaded cursor into `slot` at `(ox, oy)`: record, submit, fence-wait. The
@@ -528,129 +881,20 @@ impl VkSlotBlend {
         ox: i32,
         oy: i32,
     ) -> Result<()> {
-        let alloc = self
-            .slots
-            .get(slot.id)
-            .ok_or_else(|| anyhow!("bad slot id {}", slot.id))?;
-        let cw = cw.min(CURSOR_MAX);
-        let ch = ch.min(CURSOR_MAX);
-        if cw == 0 || ch == 0 {
+        let Some((push, gx, gy)) = Self::blend_geometry(slot, fmt, surf_w, cw, ch, ox, oy) else {
             return Ok(());
-        }
-        let push = Push {
-            pitch: slot.pitch as u32,
-            surf_w,
-            surf_h: slot.height,
-            cur_w: cw,
-            cur_h: ch,
-            ox,
-            oy,
         };
-        // Dispatch geometry (must match cursor_blend.comp): ARGB = per cursor px; NV12/YUV444 =
-        // per word-aligned 4-px span × (2-row blocks | rows).
-        let (gx, gy) = match fmt {
-            SlotFormat::Argb => (cw.div_ceil(8), ch.div_ceil(8)),
-            _ => {
-                let x0 = (ox >> 2) << 2;
-                let spans = ((ox + cw as i32) - x0 + 3).div_euclid(4).max(1) as u32;
-                let rows = match fmt {
-                    SlotFormat::Nv12 => ch.div_ceil(2),
-                    _ => ch,
-                };
-                (spans.div_ceil(8), rows.div_ceil(8))
-            }
-        };
-        // SAFETY: single-threaded record/submit/wait on handles this struct owns. The descriptor
-        // update is safe because no prior submission is in flight (every blend fence-waits and
-        // the fence is reset before reuse). Buffer infos and barrier structs are locals outliving
-        // their synchronous calls. The dispatch's shader accesses stay in-bounds by the shader's
-        // own guards (surfW/surfH/curW/curH from `push`) against the slot allocation sized in
-        // `alloc_slot` for exactly that geometry.
+        // SAFETY: single-threaded record/submit/wait on handles this struct owns. The slot's
+        // previous submission completed (`record_blend`'s contract: this path fence-waits every
+        // blend, and an earlier ORDERED blend on this slot finished before the encoder reused it
+        // — ring-reuse discipline). Submit-info arrays are locals outliving the synchronous
+        // calls. The dispatch's shader accesses stay in-bounds by the shader's own guards
+        // (surfW/surfH/curW/curH from `push`) against the slot allocation sized in `alloc_slot`
+        // for exactly that geometry.
         unsafe {
             let d = &self.device;
-            let surf_info = [vk::DescriptorBufferInfo::default()
-                .buffer(alloc.buffer)
-                .offset(0)
-                .range(alloc.size)];
-            let cur_info = [vk::DescriptorBufferInfo::default()
-                .buffer(self.cur_buf)
-                .offset(0)
-                .range((CURSOR_MAX * CURSOR_MAX * 4) as u64)];
-            let writes = [
-                vk::WriteDescriptorSet::default()
-                    .dst_set(self.desc_set)
-                    .dst_binding(0)
-                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                    .buffer_info(&surf_info),
-                vk::WriteDescriptorSet::default()
-                    .dst_set(self.desc_set)
-                    .dst_binding(1)
-                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                    .buffer_info(&cur_info),
-            ];
-            d.update_descriptor_sets(&writes, &[]);
-
-            d.begin_command_buffer(
-                self.cmd,
-                &vk::CommandBufferBeginInfo::default()
-                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-            )
-            .context("begin blend cmd")?;
-            // CUDA wrote the frame into this memory outside Vulkan's view — make it visible to
-            // the shader (external-memory coherence ceremony; NVIDIA honors this with the fence
-            // ordering alone, the barrier is the spec-shaped belt-and-braces).
-            let acquire = [vk::MemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
-                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)];
-            d.cmd_pipeline_barrier(
-                self.cmd,
-                vk::PipelineStageFlags::TOP_OF_PIPE,
-                vk::PipelineStageFlags::COMPUTE_SHADER,
-                vk::DependencyFlags::empty(),
-                &acquire,
-                &[],
-                &[],
-            );
-            d.cmd_bind_pipeline(
-                self.cmd,
-                vk::PipelineBindPoint::COMPUTE,
-                self.pipelines[fmt.mode() as usize],
-            );
-            d.cmd_bind_descriptor_sets(
-                self.cmd,
-                vk::PipelineBindPoint::COMPUTE,
-                self.pipe_layout,
-                0,
-                &[self.desc_set],
-                &[],
-            );
-            let bytes = std::slice::from_raw_parts(
-                (&push as *const Push) as *const u8,
-                std::mem::size_of::<Push>(),
-            );
-            d.cmd_push_constants(
-                self.cmd,
-                self.pipe_layout,
-                vk::ShaderStageFlags::COMPUTE,
-                0,
-                bytes,
-            );
-            d.cmd_dispatch(self.cmd, gx.max(1), gy.max(1), 1);
-            // Release the shader's writes so the post-fence CUDA/NVENC reads see them.
-            let release = [vk::MemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                .dst_access_mask(vk::AccessFlags::MEMORY_READ)];
-            d.cmd_pipeline_barrier(
-                self.cmd,
-                vk::PipelineStageFlags::COMPUTE_SHADER,
-                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-                vk::DependencyFlags::empty(),
-                &release,
-                &[],
-                &[],
-            );
-            d.end_command_buffer(self.cmd).context("end blend cmd")?;
-            let cmds = [self.cmd];
+            let cmd = self.record_blend(slot.id, fmt, &push, gx, gy)?;
+            let cmds = [cmd];
             let submit = [vk::SubmitInfo::default().command_buffers(&cmds)];
             d.queue_submit(self.queue, &submit, self.fence)
                 .context("submit blend")?;
@@ -660,11 +904,121 @@ impl VkSlotBlend {
         }
         Ok(())
     }
+
+    /// Stream-ordered blend — no CPU sync anywhere (the fix for cursor frames serializing the
+    /// NVENC submit path). The caller has ENQUEUED (not synced) its CUDA frame copy on this
+    /// thread's copy stream; this method then
+    /// 1. enqueues a CUDA signal of `copy_done` on that stream (fires once the copy completes),
+    /// 2. submits the blend waiting `copy_done` and signaling `blend_done` on the Vulkan queue,
+    /// 3. enqueues a CUDA wait of `blend_done` — so later stream work (the encode, via the
+    ///    session's IO-stream binding) orders after the blend's writes.
+    ///
+    /// Timeline values are fresh per call and never reused. Failure leaves no dangling waiter:
+    /// the CUDA wait is enqueued only after the submit was accepted, and an orphaned CUDA
+    /// signal is legal (timeline signals may skip values — a later, larger signal satisfies
+    /// any waiter).
+    #[allow(clippy::too_many_arguments)] // same unpacked kernel args as `blend_ref`
+    pub fn blend_ref_ordered(
+        &mut self,
+        slot: &VkSlotRef,
+        fmt: SlotFormat,
+        surf_w: u32,
+        cw: u32,
+        ch: u32,
+        ox: i32,
+        oy: i32,
+    ) -> Result<()> {
+        let Some((push, gx, gy)) = Self::blend_geometry(slot, fmt, surf_w, cw, ch, ox, oy) else {
+            return Ok(());
+        };
+        let (copy_done, blend_done, sem) = {
+            let t = self
+                .timeline
+                .as_mut()
+                .ok_or_else(|| anyhow!("ordered blend without timeline support"))?;
+            t.ticket += 2;
+            (t.ticket - 1, t.ticket, t.sem)
+        };
+        // Signal FIRST: if this fails nothing was submitted and the fresh values are simply
+        // skipped. (The reverse order could wedge the queue — a submitted blend waiting on a
+        // copy-done signal that never got enqueued.)
+        self.timeline
+            .as_ref()
+            .expect("checked above")
+            .cuda
+            .signal(copy_done)
+            .context("cuSignalExternalSemaphoresAsync (copy done)")?;
+        // SAFETY: single-threaded record/submit on handles this struct owns. The slot's previous
+        // submission completed (`record_blend`'s contract — ring-reuse discipline, see above).
+        // All submit-info arrays and the timeline-submit chain are locals outliving the
+        // synchronous `queue_submit`. No fence: completion is observed through the timeline
+        // (the encode polls it via the CUDA wait below; teardown quiesces via
+        // `device_wait_idle`).
+        unsafe {
+            let cmd = self.record_blend(slot.id, fmt, &push, gx, gy)?;
+            let cmds = [cmd];
+            let wait_sems = [sem];
+            let wait_vals = [copy_done];
+            let wait_stages = [vk::PipelineStageFlags::COMPUTE_SHADER];
+            let sig_sems = [sem];
+            let sig_vals = [blend_done];
+            let mut tsi = vk::TimelineSemaphoreSubmitInfo::default()
+                .wait_semaphore_values(&wait_vals)
+                .signal_semaphore_values(&sig_vals);
+            let submit = [vk::SubmitInfo::default()
+                .command_buffers(&cmds)
+                .wait_semaphores(&wait_sems)
+                .wait_dst_stage_mask(&wait_stages)
+                .signal_semaphores(&sig_sems)
+                .push_next(&mut tsi)];
+            self.device
+                .queue_submit(self.queue, &submit, vk::Fence::null())
+                .context("submit ordered blend")?;
+        }
+        let t = self.timeline.as_mut().expect("checked above");
+        // Only now: `blend_done` WILL be signaled, so quiesces may rely on it.
+        t.last_blend = blend_done;
+        if let Err(e) = t.cuda.wait(blend_done) {
+            // The blend is in flight but the encode would no longer order after it — restore
+            // the ordering with a bounded CPU wait (the CPU-synced path's cost, once). The
+            // frame still composites correctly.
+            let sems = [t.sem];
+            let values = [blend_done];
+            // SAFETY: live timeline semaphore; wait-info arrays are locals outliving the
+            // synchronous call; `blend_done` was accepted for signaling just above, so the
+            // wait terminates (timeout backstops a wedged queue).
+            let r = unsafe {
+                t.ts.wait_semaphores(
+                    &vk::SemaphoreWaitInfo::default()
+                        .semaphores(&sems)
+                        .values(&values),
+                    1_000_000_000,
+                )
+            };
+            tracing::warn!(
+                error = %format!("{e:#}"),
+                cpu_wait = ?r,
+                "ordered cursor blend: CUDA-side wait enqueue failed — ordering restored with \
+                 a CPU wait this frame"
+            );
+        }
+        Ok(())
+    }
 }
 
 impl Drop for VkSlotBlend {
     fn drop(&mut self) {
         self.free_slots();
+        if let Some(t) = self.timeline.take() {
+            drop(t.cuda); // CUDA's import of the semaphore goes first (mirrors the slot order)
+                          // SAFETY: `sem` was created in `init_timeline`, is uniquely owned, and is destroyed
+                          // exactly once here. No submission still references it: ordered blends only exist
+                          // alongside allocated slots, and `free_slots` just quiesced (device_wait_idle) any
+                          // in-flight work before this point.
+            unsafe {
+                self.device.destroy_semaphore(t.sem, None);
+            }
+        }
         // SAFETY: every handle below was created in `new`/`init_objects` (or is null from a
         // partial init — Vulkan destroy/free calls are defined no-ops on null handles) and is
         // uniquely owned; each is destroyed exactly once here, pipelines/layouts/pools before the
