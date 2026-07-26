@@ -34,6 +34,16 @@ pub(super) fn keep_alive_forever() -> bool {
         .unwrap_or(false)
 }
 
+/// Cadence of the exclusive-topology re-assert watchdog (`PUNKTFUNK_EXCLUSIVE_REASSERT_MS`,
+/// default 2000, `0` disables — the pre-watchdog behavior). Why it exists: a verified isolate is
+/// not durable — see `VirtualDisplayManager::ensure_exclusive_watch` in the parent module.
+pub(super) fn exclusive_reassert_ms() -> u64 {
+    std::env::var("PUNKTFUNK_EXCLUSIVE_REASSERT_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2_000)
+}
+
 /// The effective display topology for a freshly-created monitor (never `Auto`): the console policy's
 /// [`effective_topology`](crate::effective_topology) when configured, else the legacy
 /// `PUNKTFUNK_NO_ISOLATE` env knob (`Extend`) / `Exclusive` (today's default). `Extend` leaves the IDD

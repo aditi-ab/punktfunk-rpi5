@@ -1786,6 +1786,49 @@ impl Capturer for IddPushCapturer {
         }
         true
     }
+
+    fn recreate_ring_in_place(&mut self) -> bool {
+        // Same-mode ring recreate (trait doc: swap-chain bounce recovery) — deliberately NOT
+        // routed through `resize_output`, whose same-size fast path would no-op exactly the
+        // case this exists for. Same recover-or-drop arming as the resize recreate.
+        //
+        // Restart OS presentation FIRST: the eviction's topology commit leaves DWM not
+        // presenting to this display, so a re-attached ring would only ever receive the
+        // driver's stash (measured: new_fps=0 forever after the re-attach). CDS_RESET forces a
+        // real mode-set at the CURRENT mode — the same lever bring-up's ADD path relies on —
+        // and the ring recreate below then re-attaches after that churn, not before it.
+        // SAFETY: `resolve_gdi_name` runs the CCD query FFI over a `Copy` target id (owned
+        // return) — same contract as every sibling call in this file.
+        match unsafe { pf_win_display::win_display::resolve_gdi_name(self.target_id) } {
+            Some(gdi) => {
+                if !pf_win_display::win_display::force_mode_reset(&gdi) {
+                    tracing::warn!(
+                        target_id = self.target_id,
+                        "IDD push: presentation-restart mode reset failed — re-attaching anyway"
+                    );
+                }
+            }
+            None => tracing::warn!(
+                target_id = self.target_id,
+                "IDD push: no GDI name for the presentation-restart mode reset — re-attaching \
+                 anyway"
+            ),
+        }
+        tracing::info!(
+            target_id = self.target_id,
+            mode = format!("{}x{}", self.width, self.height),
+            "IDD push: same-mode ring recreate — re-running the driver attach handshake"
+        );
+        self.recovering_since.get_or_insert_with(Instant::now);
+        if let Err(e) = self.recreate_ring(self.display_hdr, self.width, self.height) {
+            tracing::warn!(
+                error = %format!("{e:#}"),
+                "IDD push: same-mode ring recreate failed"
+            );
+            return false;
+        }
+        true
+    }
 }
 
 /// A 4:4:4 session while the display is HDR: there is no 10-bit full-chroma source (the FP16

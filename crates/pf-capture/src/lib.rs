@@ -179,6 +179,20 @@ pub trait Capturer: Send {
     fn resize_output(&mut self, _width: u32, _height: u32) -> bool {
         false
     }
+
+    /// Recreate the delivery ring at the CURRENT mode and re-run the driver attach handshake —
+    /// the recovery half of a swap-chain bounce the descriptor poller cannot see: an
+    /// exclusive-topology eviction (the vdisplay re-assert watchdog) is a real topology change,
+    /// so the OS drives COMMIT_MODES on the live virtual display too and the driver's swap-chain
+    /// is recreated while this capturer keeps waiting on the old ring attachment — frames stop
+    /// with an unchanged descriptor (same mode, same HDR), so the two-strike debounce never
+    /// trips. Arms the same recover-or-drop window as a real resize, so a driver that cannot
+    /// re-attach still fails the session cleanly. Returns `true` when handled; `false` (the
+    /// default) means the backend has no in-place ring recovery and the caller should treat the
+    /// pipeline as unrecoverable in place.
+    fn recreate_ring_in_place(&mut self) -> bool {
+        false
+    }
 }
 
 /// A deterministic moving test pattern (BGRx). Lets the spike exercise the encode → file →

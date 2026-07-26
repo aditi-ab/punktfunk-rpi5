@@ -43,9 +43,9 @@ use windows::Win32::Devices::Display::{
 };
 use windows::Win32::Foundation::POINTL;
 use windows::Win32::Graphics::Gdi::{
-    ChangeDisplaySettingsExW, EnumDisplaySettingsW, CDS_TEST, CDS_UPDATEREGISTRY, DEVMODEW,
-    DISP_CHANGE_FAILED, DISP_CHANGE_SUCCESSFUL, DM_BITSPERPEL, DM_DISPLAYFREQUENCY, DM_PELSHEIGHT,
-    DM_PELSWIDTH, ENUM_CURRENT_SETTINGS, ENUM_DISPLAY_SETTINGS_MODE,
+    ChangeDisplaySettingsExW, EnumDisplaySettingsW, CDS_RESET, CDS_TEST, CDS_UPDATEREGISTRY,
+    DEVMODEW, DISP_CHANGE_FAILED, DISP_CHANGE_SUCCESSFUL, DM_BITSPERPEL, DM_DISPLAYFREQUENCY,
+    DM_PELSHEIGHT, DM_PELSWIDTH, ENUM_CURRENT_SETTINGS, ENUM_DISPLAY_SETTINGS_MODE,
 };
 
 use punktfunk_core::Mode;
@@ -540,6 +540,50 @@ pub unsafe fn sdr_white_level_scale(target_id: u32) -> Option<f32> {
 /// mode the driver didn't advertise just leaves the default instead of erroring the session.
 // pub so vdisplay::pf_vdisplay can reuse this backend-neutral CCD/GDI mode-set helper
 // (a pf-vdisplay monitor's GDI name is a real OS device name, so it works unchanged).
+/// Force a REAL mode-set at the output's CURRENT mode — `CDS_RESET` applies even when nothing
+/// changed (a plain re-apply of the same mode is treated as a no-op by the OS). This is the
+/// presentation-restart hammer for a virtual display DWM silently stopped composing to after an
+/// exclusive-eviction topology commit: measured on-glass, the eviction's forced re-commit
+/// reassigned the swap-chain and the ring re-attach delivered the driver's stashed frame, but the
+/// source's new-frame rate stayed 0 forever — only a real mode-set (the lever bring-up's ADD path
+/// relies on via [`set_active_mode`]) makes the OS present again. Same input-desktop retry as the
+/// mode-set proper. Returns `true` when the reset applied.
+pub fn force_mode_reset(gdi_name: &str) -> bool {
+    let wname: Vec<u16> = gdi_name.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut dm = DEVMODEW {
+        dmSize: size_of::<DEVMODEW>() as u16,
+        ..Default::default()
+    };
+    // SAFETY: `wname` is a live NUL-terminated UTF-16 device name and `&mut dm` a live DEVMODEW
+    // out-param with `dmSize` set; the synchronous query only reads the name and fills `dm`.
+    let ok =
+        unsafe { EnumDisplaySettingsW(PCWSTR(wname.as_ptr()), ENUM_CURRENT_SETTINGS, &mut dm) }
+            .as_bool();
+    if !ok {
+        tracing::warn!("{gdi_name}: force_mode_reset — no current mode to re-apply");
+        return false;
+    }
+    // SAFETY: same liveness as the query above; CDS_RESET re-applies the identical mode, the two
+    // trailing args are null, and the API only reads its inputs. The input-desktop retry mirrors
+    // `set_active_mode` (a CDS write off the input desktop is refused with DISP_CHANGE_FAILED).
+    let rc = crate::input_desktop::retry_on_input_desktop(
+        |rc| *rc == DISP_CHANGE_FAILED,
+        || unsafe {
+            ChangeDisplaySettingsExW(PCWSTR(wname.as_ptr()), Some(&dm), None, CDS_RESET, None)
+        },
+    );
+    if rc != DISP_CHANGE_SUCCESSFUL {
+        tracing::warn!(
+            result = rc.0,
+            "{gdi_name}: force_mode_reset rejected ({})",
+            disp_change_reason(rc.0)
+        );
+        return false;
+    }
+    tracing::info!("{gdi_name}: forced same-mode reset applied (presentation restart)");
+    true
+}
+
 pub fn set_active_mode(gdi_name: &str, mode: Mode) {
     let wname: Vec<u16> = gdi_name.encode_utf16().chain(std::iter::once(0)).collect();
 
@@ -1044,6 +1088,14 @@ pub unsafe fn isolate_displays_ccd(keep_target_ids: &[u32]) -> Option<SavedConfi
     );
     Some(saved)
 }
+
+// (A "gentle" eviction variant — deactivate the stray paths WITHOUT `SDC_FORCE_MODE_ENUMERATION`,
+// kept paths supplied verbatim — was tried for the re-assert watchdog and REMOVED: on-glass it
+// still bounced the live virtual display's swap-chain (a real topology change drives COMMIT_MODES
+// on its own) AND additionally left the OS not presenting to the virtual display — capture
+// received one stashed frame and then nothing. Eviction therefore always goes through
+// [`isolate_displays_ccd`], whose forced re-commit restarts presentation, and the SESSION pairs it
+// with an in-place capture re-attach; see the vdisplay manager's re-assert watchdog.)
 
 /// Build the ESCALATED supplied config for [`isolate_displays_ccd`]: ONLY the paths still flagged
 /// ACTIVE (the keep set — the caller already cleared ACTIVE on every doomed path), with the mode

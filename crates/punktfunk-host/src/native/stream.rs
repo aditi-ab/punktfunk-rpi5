@@ -1377,6 +1377,11 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
     let mut cur_mode = mode;
     const MAX_CAPTURE_REBUILDS: u32 = 5;
     let mut capture_rebuilds: u32 = 0;
+    // Exclusive-topology eviction generation last seen (Windows IDD-push; see the recovery block
+    // in the loop): the vdisplay watchdog bumps it on every eviction, each of which drives
+    // COMMIT_MODES on the live IDD path and orphans this pipeline's capture ring.
+    #[cfg(target_os = "windows")]
+    let mut seen_reassert_gen = crate::vdisplay::manager::topology_reassert_gen();
     // Encode-stall watchdog: AMF/QSV (and async NVENC) poll non-blocking, so a wedged driver
     // shows up as poll() returning None forever while submits keep succeeding — `inflight` grows,
     // no AU ever reaches the send thread, and the client freezes on the last frame with nothing
@@ -1605,6 +1610,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                     plan,
                     &quit,
                     resize_trace.as_ref(),
+                    false,
                 );
             #[cfg(not(target_os = "windows"))]
             let fast_done = false;
@@ -1699,6 +1705,55 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                 encoder_resets = 0;
                 last_forced_idr = Some(std::time::Instant::now()); // fresh encoder opens on an IDR — anchor the cooldown
                 resize_trace.finish("pipeline_rebuilt");
+            }
+        }
+        // Exclusive-topology eviction recovery (Windows IDD-push): the vdisplay watchdog just
+        // evicted a display that crept back into the "exclusive" desktop, via the full isolate —
+        // its forced re-commit restarts OS presentation to the virtual display (a gentle
+        // supplied-config eviction left capture one stashed frame and then nothing, on-glass),
+        // but it also hands the live IDD path a fresh swap-chain while this pipeline's ring
+        // keeps waiting on the old attachment; with an unchanged descriptor the poller's
+        // two-strike debounce never trips, so frames would just stop. Rebuild the capture
+        // attachment in place at the CURRENT mode (same-mode ring recreate + driver re-attach +
+        // fresh encoder — the resize fast path's cost). If even that fails, end the session with
+        // a clear error: the client's reconnect rebuilds from scratch, which beats streaming a
+        // frozen image forever.
+        #[cfg(target_os = "windows")]
+        if plan.capture == crate::session_plan::CaptureBackend::IddPush {
+            let reassert_gen = crate::vdisplay::manager::topology_reassert_gen();
+            if reassert_gen != seen_reassert_gen {
+                seen_reassert_gen = reassert_gen;
+                tracing::info!(
+                    "exclusive-topology eviction bounced the virtual display's modes — rebuilding \
+                     the capture attachment in place at the current mode"
+                );
+                let trace = crate::bringup::Trace::start("reassert-recover", resize_ms.clone());
+                if try_inplace_resize(
+                    &mut vd,
+                    &mut capturer,
+                    &mut enc,
+                    &mut frame,
+                    &mut interval,
+                    cur_mode,
+                    bitrate_kbps,
+                    bit_depth,
+                    plan,
+                    &quit,
+                    trace.as_ref(),
+                    true,
+                ) {
+                    // The owed AUs died with the old encoder — same bookkeeping as a resize.
+                    inflight.clear();
+                    last_au_at = std::time::Instant::now();
+                    encoder_resets = 0;
+                    last_forced_idr = Some(std::time::Instant::now());
+                    trace.finish("pipeline_rebuilt");
+                } else {
+                    return Err(anyhow!(
+                        "exclusive-topology eviction recovery failed — ending the session for a \
+                         clean reconnect (a fresh bring-up re-attaches capture)"
+                    ));
+                }
             }
         }
         // Adaptive bitrate: drain to the NEWEST requested rate (the client's controller may step
@@ -2859,6 +2914,10 @@ fn try_inplace_resize(
     plan: crate::session_plan::SessionPlan,
     quit: &Arc<AtomicBool>,
     trace: &crate::bringup::Trace,
+    // Same-mode swap-chain recovery (the exclusive re-assert bounced the IDD's modes): recreate
+    // the ring even though the size is unchanged — `resize_output`'s same-size fast path would
+    // no-op exactly the case being recovered.
+    recover_ring: bool,
 ) -> bool {
     let Some(cur_target) = capturer.capture_target_id() else {
         return false; // not an IDD-push capturer — nothing to reuse
@@ -2889,7 +2948,12 @@ fn try_inplace_resize(
         );
         return false;
     }
-    if !capturer.resize_output(new_mode.width, new_mode.height) {
+    let ring_ok = if recover_ring {
+        capturer.recreate_ring_in_place()
+    } else {
+        capturer.resize_output(new_mode.width, new_mode.height)
+    };
+    if !ring_ok {
         return false;
     }
     trace.mark("ring_recreated");
@@ -2915,6 +2979,38 @@ fn try_inplace_resize(
                 return false;
             }
         }
+    };
+    // Liveness gate for the eviction recovery: the driver re-delivers its STASH on re-attach, so
+    // the first frame proves only the ring — not that the OS resumed presenting (measured: the
+    // stash arrives in ~50 ms, then new_fps=0 forever). Require a SECOND, newer present — the
+    // forced mode reset just triggered a full redraw, so a live display produces one promptly —
+    // before declaring recovery; a stash-only re-attach must FAIL so the caller ends the session
+    // cleanly (a reconnect's fresh bring-up always recovers) instead of streaming a frozen frame.
+    let new_frame = if recover_ring {
+        let first_pts = new_frame.pts_ns;
+        let live_deadline = std::time::Instant::now() + std::time::Duration::from_millis(1500);
+        loop {
+            match capturer.try_latest() {
+                Ok(Some(f)) if f.pts_ns != first_pts => break f,
+                Ok(_) => {
+                    if std::time::Instant::now() >= live_deadline {
+                        tracing::warn!(
+                            "eviction recovery: ring re-attached but only the stashed frame \
+                             arrived — the OS is not presenting; failing the in-place recovery"
+                        );
+                        return false;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(e) => {
+                    tracing::warn!(error = %format!("{e:#}"),
+                        "eviction recovery: capture failed while waiting for a live frame");
+                    return false;
+                }
+            }
+        }
+    } else {
+        new_frame
     };
     trace.mark("first_new_frame");
     // Fresh encoder at the delivered size — the one component that can't follow a resolution

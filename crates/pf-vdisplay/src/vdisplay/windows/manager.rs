@@ -159,6 +159,10 @@ struct GroupState {
     /// PnP instance ids of monitor devnodes the EXPERIMENTAL `pnp_disable_monitors` axis disabled at
     /// the group's first isolate — last-member teardown re-enables them BEFORE the CCD restore.
     pnp_disabled: Vec<String>,
+    /// Whether `ccd_saved` was captured by an EXCLUSIVE isolate (vs `Primary`, which also
+    /// snapshots but deliberately keeps the physical displays active) — gates the re-assert
+    /// watchdog, which must never "fix" a Primary group's lit panels. Cleared with the restore.
+    ccd_exclusive: bool,
 }
 
 /// The manager's guarded state: the slot map + the (single) group record. One lock for both — every
@@ -183,7 +187,8 @@ impl MgrInner {
 }
 
 /// The single device-level watchdog pinger, running while ANY slot lives (any IOCTL bumps the driver
-/// watchdog, so one thread serves N monitors).
+/// watchdog, so one thread serves N monitors). Also reused as the stop+join pair for the
+/// exclusive-topology re-assert watchdog (same lifecycle shape).
 struct Pinger {
     stop: Arc<AtomicBool>,
     thread: JoinHandle<()>,
@@ -240,6 +245,10 @@ pub struct VirtualDisplayManager {
     idd_session_stops: Mutex<std::collections::HashMap<u32, Arc<AtomicBool>>>,
     /// The device-level watchdog [`Pinger`], running while any slot lives.
     pinger: Mutex<Option<Pinger>>,
+    /// The exclusive-topology re-assert watchdog (same stop+join shape as [`Pinger`]), running
+    /// while an EXCLUSIVE group isolate is live — a verified isolate is not durable on hybrid
+    /// boxes (see [`Self::ensure_exclusive_watch`]).
+    exclusive_watch: Mutex<Option<Pinger>>,
     // The per-client stable monitor-id map is now the process-wide `super::identity::global()`
     // (shared with the Linux KWin backend's per-slot naming — never same-process). A monitor CREATE
     // resolves the client's id via `identity::resolve_slot`, so it keeps the same EDID serial + IddCx
@@ -247,6 +256,19 @@ pub struct VirtualDisplayManager {
 }
 
 static VDM: OnceLock<VirtualDisplayManager> = OnceLock::new();
+
+/// Bumped on every exclusive-topology EVICTION the re-assert watchdog performs. An eviction is a
+/// real topology change, and the OS drives COMMIT_MODES on every live path for those — the IDD
+/// display's swap-chain is recreated driver-side while the session's capture ring keeps waiting
+/// on the old attachment, so frames stop silently (on-glass: panel evicted, stream frozen). The
+/// manager can only announce; the SESSION owns the ring + encoder — stream loops sample this at
+/// start and rebuild their capture attachment in place when it advances.
+static TOPOLOGY_REASSERT_GEN: AtomicU64 = AtomicU64::new(0);
+
+/// The current exclusive-eviction generation (see [`TOPOLOGY_REASSERT_GEN`]).
+pub fn topology_reassert_gen() -> u64 {
+    TOPOLOGY_REASSERT_GEN.load(Ordering::Relaxed)
+}
 
 /// Initialise the process-wide manager with `driver` (the chosen backend) and return it. Idempotent: the
 /// first backend to call wins (the host runs one backend per process), so a later call ignores its driver.
@@ -262,6 +284,7 @@ pub(crate) fn init(driver: Box<dyn VdisplayDriver>) -> &'static VirtualDisplayMa
         setup_lock: Mutex::new(()),
         idd_session_stops: Mutex::new(std::collections::HashMap::new()),
         pinger: Mutex::new(None),
+        exclusive_watch: Mutex::new(None),
     })
 }
 
@@ -775,6 +798,130 @@ impl VirtualDisplayManager {
         }
     }
 
+    /// Start the exclusive-topology re-assert watchdog (idempotent). A verified
+    /// [`isolate_displays_ccd`] is NOT durable: the isolated topology is deliberately not saved to
+    /// the CCD database (teardown must restore the user's layout), so any later topology
+    /// re-resolution — our own post-isolate resize/HDR commit, the deactivated panel's own driver,
+    /// display-poller software — can bring the stored layout back. Field-proven on a hybrid
+    /// Intel+NVIDIA box (`.221`): seconds after the commit-time verify reported "sole active
+    /// desktop", CCD showed the internal panel ACTIVE again beside the virtual display, and the
+    /// host never noticed. That silently un-does exclusive mode: cursor + windows can land
+    /// off-stream, and the secure desktop / lock screen can land on the physical panel.
+    ///
+    /// The watchdog re-queries every [`knobs::exclusive_reassert_ms`] and, when a non-managed
+    /// display crept back, evicts it via the full [`isolate_displays_ccd`] — the forced
+    /// re-commit is required (it restarts OS presentation to the virtual display), and the
+    /// swap-chain bounce it causes is healed by the SESSION's in-place capture re-attach, keyed
+    /// off [`topology_reassert_gen`]. Each cycle takes the state lock via `try_lock` —
+    /// teardown stops+joins this thread while HOLDING the state lock, so a blocking `lock()` here
+    /// would deadlock; a contended cycle just skips (the slot transition that owns the lock
+    /// re-isolates itself). The sleep is sliced so that stop+join is bounded by ~250 ms, not a
+    /// full cycle.
+    fn ensure_exclusive_watch(&'static self) {
+        let interval = Duration::from_millis(knobs::exclusive_reassert_ms());
+        if interval.is_zero() {
+            return; // knob 0 = disabled (the pre-watchdog behavior)
+        }
+        let mut guard = self.exclusive_watch.lock().unwrap();
+        if guard.is_some() {
+            return;
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_t = stop.clone();
+        let thread = thread::Builder::new()
+            .name("vdisplay-exclusive-watch".into())
+            .spawn(move || {
+                // Consecutive cycles that found (and evicted) a non-managed display — resets when a
+                // cycle comes up clean, so an actor that re-adds the panel every few minutes logs a
+                // WARN each time, while one fighting every cycle escalates once and then goes quiet.
+                let mut fighting = 0u32;
+                'watch: loop {
+                    let mut slept = Duration::ZERO;
+                    while slept < interval {
+                        if stop_t.load(Ordering::Relaxed) {
+                            break 'watch;
+                        }
+                        let slice = Duration::from_millis(250).min(interval - slept);
+                        thread::sleep(slice);
+                        slept += slice;
+                    }
+                    let Ok(inner) = vdm().state.try_lock() else {
+                        continue;
+                    };
+                    if inner.group.ccd_saved.is_none() || !inner.group.ccd_exclusive {
+                        continue; // no exclusive isolate live right now
+                    }
+                    let keep = inner.target_ids();
+                    if keep.is_empty() {
+                        continue;
+                    }
+                    // SAFETY: `count_other_active` runs the CCD QueryDisplayConfig FFI over a
+                    // borrowed slice of `Copy` target ids (owned result), under the `state` lock
+                    // (`inner` guard held to the end of this iteration).
+                    let survivors = unsafe { count_other_active(&keep) }.unwrap_or(0);
+                    if survivors == 0 {
+                        if fighting > 0 {
+                            tracing::info!(
+                                reasserts = fighting,
+                                "exclusive topology stable again — no non-managed display active"
+                            );
+                        }
+                        fighting = 0;
+                        continue;
+                    }
+                    fighting += 1;
+                    match fighting {
+                        1..=3 => tracing::warn!(
+                            survivors,
+                            round = fighting,
+                            "exclusive topology lost — a non-managed display re-activated after \
+                             the verified isolate (hybrid-GPU driver / display-poller software \
+                             restoring the saved layout?); re-asserting the isolate"
+                        ),
+                        4 => tracing::error!(
+                            survivors,
+                            "exclusive topology keeps being re-activated (4 consecutive \
+                             re-asserts) — something on this host is fighting the isolate; \
+                             continuing to re-assert every cycle, further rounds log at DEBUG"
+                        ),
+                        _ => tracing::debug!(
+                            survivors,
+                            round = fighting,
+                            "re-asserting exclusive topology"
+                        ),
+                    }
+                    // SAFETY: `isolate_displays_ccd` drives the CCD query/apply FFI over a
+                    // borrowed slice of `Copy` target ids, under the `state` lock — the sole
+                    // topology mutator. The returned snapshot is discarded (the group restores
+                    // the FIRST member's). The FULL isolate on purpose — its forced re-commit
+                    // (SDC_FORCE_MODE_ENUMERATION → COMMIT_MODES → ASSIGN_SWAPCHAIN) is
+                    // load-bearing here exactly as at first isolate: after the eviction's
+                    // topology change the OS stops presenting to the virtual display until a
+                    // forced mode re-commit restarts it (on-glass: a gentle supplied-config
+                    // eviction left capture receiving ONE stashed frame and then nothing).
+                    let _ = unsafe { isolate_displays_ccd(&keep) };
+                    // That same forced re-commit hands the live IDD path a fresh swap-chain,
+                    // orphaning the session's capture ring — announce it so the session rebuilds
+                    // its capture attachment (same-mode ring recreate + driver re-attach + fresh
+                    // encoder) instead of silently streaming a frozen frame. The two halves are
+                    // a pair: eviction restarts presentation, the session re-attaches capture.
+                    TOPOLOGY_REASSERT_GEN.fetch_add(1, Ordering::Relaxed);
+                }
+            })
+            .expect("spawn vdisplay-exclusive-watch");
+        *guard = Some(Pinger { stop, thread });
+    }
+
+    /// Stop + join the exclusive-topology watchdog (the group's exclusive isolate is being
+    /// restored). Safe under the state lock: the watchdog only ever `try_lock`s it, and its sliced
+    /// sleep bounds the join by ~250 ms.
+    fn stop_exclusive_watch(&self) {
+        if let Some(w) = self.exclusive_watch.lock().unwrap().take() {
+            w.stop.store(true, Ordering::Relaxed);
+            let _ = w.thread.join();
+        }
+    }
+
     /// Arrange the live slots' desktop origins (design §6.2: the pure `vdisplay/layout.rs` engine —
     /// `auto-row` default, console `manual` pins win) and commit them in one CCD apply. No-ops for a
     /// single member (it sits at the origin), so the single-display path issues no positioning at
@@ -997,6 +1144,12 @@ impl VirtualDisplayManager {
                                             added.target_id,
                                         );
                                 }
+                            }
+                            // The verified isolate above is not durable — watch and re-assert
+                            // while the exclusive group lives (see `ensure_exclusive_watch`).
+                            inner.group.ccd_exclusive = inner.group.ccd_saved.is_some();
+                            if inner.group.ccd_exclusive {
+                                self.ensure_exclusive_watch();
                             }
                         } else {
                             // Grown set: re-isolate so the fresh member joins the composited set
@@ -1413,6 +1566,10 @@ impl VirtualDisplayManager {
             // (stopped FIRST, as the per-monitor pinger was), and the group's topology restore runs
             // — first-in captured it, last-out restores it (design §6.1).
             self.stop_pinger();
+            // The exclusive re-assert watchdog must be gone BEFORE the restore below — it would
+            // read the restored (multi-display) topology as "lost exclusivity" and re-fight it.
+            // (Belt-and-braces: its cycles also gate on `ccd_exclusive`, cleared below.)
+            self.stop_exclusive_watch();
             // EXPERIMENTAL `pnp_disable_monitors` restore: re-enable the devnodes FIRST and let
             // them re-arrive, so a CCD restore below re-activates paths whose monitors exist
             // again (a disabled devnode would leave the restored path modeless/EDID-less).
@@ -1425,6 +1582,7 @@ impl VirtualDisplayManager {
             }
             // Re-attach detached display(s) BEFORE the REMOVE so the box is never left with zero
             // displays.
+            inner.group.ccd_exclusive = false;
             if let Some(saved) = inner.group.ccd_saved.take() {
                 restore_displays_ccd(&saved);
                 // EXPERIMENTAL `ddc_power_off` wake: the restore re-activated the physical paths, and
