@@ -28,12 +28,11 @@ use windows::Win32::Graphics::Direct3D11::{
     ID3D11RenderTargetView, ID3D11SamplerState, ID3D11ShaderResourceView, ID3D11Texture2D,
     ID3D11VertexShader, D3D11_BIND_CONSTANT_BUFFER, D3D11_BIND_RENDER_TARGET,
     D3D11_BIND_SHADER_RESOURCE, D3D11_BUFFER_DESC, D3D11_COMPARISON_NEVER, D3D11_CPU_ACCESS_READ,
-    D3D11_CPU_ACCESS_WRITE, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_FILTER_MIN_MAG_MIP_POINT,
-    D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_MAP_WRITE_DISCARD,
-    D3D11_RENDER_TARGET_VIEW_DESC, D3D11_RENDER_TARGET_VIEW_DESC_0, D3D11_RTV_DIMENSION_TEXTURE2D,
-    D3D11_SAMPLER_DESC, D3D11_SDK_VERSION, D3D11_SUBRESOURCE_DATA, D3D11_TEX2D_RTV,
-    D3D11_TEXTURE2D_DESC, D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_USAGE_DEFAULT, D3D11_USAGE_DYNAMIC,
-    D3D11_USAGE_STAGING, D3D11_VIEWPORT,
+    D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_FILTER_MIN_MAG_MIP_POINT, D3D11_MAPPED_SUBRESOURCE,
+    D3D11_MAP_READ, D3D11_RENDER_TARGET_VIEW_DESC, D3D11_RENDER_TARGET_VIEW_DESC_0,
+    D3D11_RTV_DIMENSION_TEXTURE2D, D3D11_SAMPLER_DESC, D3D11_SDK_VERSION, D3D11_SUBRESOURCE_DATA,
+    D3D11_TEX2D_RTV, D3D11_TEXTURE2D_DESC, D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_USAGE_DEFAULT,
+    D3D11_USAGE_IMMUTABLE, D3D11_USAGE_STAGING, D3D11_VIEWPORT,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT, DXGI_FORMAT_P010, DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R16G16_UNORM,
@@ -371,12 +370,19 @@ pub(crate) struct HdrP010Converter {
     ps_y: ID3D11PixelShader,
     ps_uv: ID3D11PixelShader,
     sampler: ID3D11SamplerState,
-    /// Constant buffer for the chroma pass (inv_src texel size). 16 bytes.
+    /// Constant buffer for the chroma pass: `inv_src` = (1/srcW, 1/srcH), 16 bytes. IMMUTABLE and
+    /// filled at construction — it depends only on the source size, and the converter is already
+    /// rebuilt whenever the mode changes. It used to be a DYNAMIC buffer that `convert` Mapped,
+    /// wrote and Unmapped on EVERY HDR frame, inside the ring slot's keyed-mutex hold, with the
+    /// `Map`'s failure silently ignored (leaving the pass reading a stale/garbage texel size).
     cbuf: ID3D11Buffer,
 }
 
 impl HdrP010Converter {
-    pub(crate) unsafe fn new(device: &ID3D11Device) -> Result<Self> {
+    /// `w`/`h` are the SOURCE dimensions this converter's chroma pass will sample, baked into the
+    /// immutable constant buffer. Rebuild the converter if they change (the IDD capturer's
+    /// `recreate_ring` already drops it).
+    pub(crate) unsafe fn new(device: &ID3D11Device, w: u32, h: u32) -> Result<Self> {
         // SAFETY: every call is a `?`-checked D3D11 method on the live `device` borrow, over
         // fully-initialized stack descriptors and live `Option` out-params; `compile_shader` receives
         // `s!()` literals (its contract). Each created COM interface owns its own reference, and no
@@ -409,15 +415,23 @@ impl HdrP010Converter {
             };
             let mut sampler = None;
             device.CreateSamplerState(&sd, Some(&mut sampler))?;
+            // `inv_src` never changes for a given source size — build the buffer IMMUTABLE with its
+            // contents, so the chroma pass needs no per-frame Map (and has no unchecked failure).
+            let inv_src: [f32; 4] = [1.0 / w.max(1) as f32, 1.0 / h.max(1) as f32, 0.0, 0.0];
             let cbd = D3D11_BUFFER_DESC {
                 ByteWidth: 16, // float2 inv_src + float2 pad
-                Usage: D3D11_USAGE_DYNAMIC,
+                Usage: D3D11_USAGE_IMMUTABLE,
                 BindFlags: D3D11_BIND_CONSTANT_BUFFER.0 as u32,
-                CPUAccessFlags: D3D11_CPU_ACCESS_WRITE.0 as u32,
+                CPUAccessFlags: 0,
                 ..Default::default()
             };
+            let init = D3D11_SUBRESOURCE_DATA {
+                pSysMem: inv_src.as_ptr().cast(),
+                SysMemPitch: 0,
+                SysMemSlicePitch: 0,
+            };
             let mut cbuf = None;
-            device.CreateBuffer(&cbd, None, Some(&mut cbuf))?;
+            device.CreateBuffer(&cbd, Some(&init), Some(&mut cbuf))?;
             Ok(Self {
                 vs: vs.context("p010 vs")?,
                 ps_y: ps_y.context("p010 y ps")?,
@@ -431,7 +445,11 @@ impl HdrP010Converter {
     /// Create a per-plane RTV of the P010 texture `dst` with the given single-plane `format`
     /// (`R16_UNORM` for plane 0 luma, `R16G16_UNORM` for plane 1 chroma). The plane is selected by the
     /// view format (planar-RTV semantics); MipSlice 0.
-    unsafe fn plane_rtv(
+    ///
+    /// Called ONCE PER OUT-RING SLOT by the owner of the P010 textures, not per frame — see
+    /// [`Self::convert`]. Fails when the driver rejects a planar RTV, which is the one hard
+    /// requirement of this whole path (a D3D11.3+ runtime plus driver support).
+    pub(crate) unsafe fn plane_rtv(
         device: &ID3D11Device,
         dst: &ID3D11Texture2D,
         format: DXGI_FORMAT,
@@ -461,40 +479,29 @@ impl HdrP010Converter {
         }
     }
 
-    /// Convert `src_srv` (FP16 scRGB, WxH) into `dst` (a `DXGI_FORMAT_P010` texture with
-    /// `BIND_RENDER_TARGET`). Two opaque passes: full-res luma → plane 0, half-res chroma → plane 1.
-    /// `w`/`h` are the full luma dimensions (must be even). Returns `Err` if a plane RTV can't be
-    /// created (driver) so the caller can fall back to the R10 path.
+    /// Convert `src_srv` (FP16 scRGB, WxH) into a `DXGI_FORMAT_P010` texture through the two plane
+    /// RTVs the CALLER built for it ([`Self::plane_rtv`]): full-res luma → `y_rtv` (plane 0),
+    /// half-res chroma → `uv_rtv` (plane 1). `w`/`h` are the full luma dimensions (must be even) and
+    /// must match the `w`/`h` this converter was constructed with.
+    ///
+    /// Takes the views rather than creating them: two `CreateRenderTargetView`s per frame — plus a
+    /// Map/Unmap of a never-changing 16-byte constant buffer — was pure per-frame cost inside the
+    /// ring slot's keyed-mutex hold, i.e. time the DRIVER spent blocked on that slot. Both are
+    /// lifetime-of-mode facts: the views belong to the out-ring slot (built in `ensure_out_ring`),
+    /// the buffer to this converter, which is already rebuilt on every mode change.
     pub(crate) unsafe fn convert(
         &self,
-        device: &ID3D11Device,
         ctx: &ID3D11DeviceContext,
         src_srv: &ID3D11ShaderResourceView,
-        dst: &ID3D11Texture2D,
+        y_rtv: &ID3D11RenderTargetView,
+        uv_rtv: &ID3D11RenderTargetView,
         w: u32,
         h: u32,
     ) -> Result<()> {
-        // SAFETY: all D3D11 work runs on the caller's live `device`/`ctx` borrows (`ctx` is the
-        // owning capture thread's immediate context), and `plane_rtv` receives that same device. The
-        // `copy_nonoverlapping` writes `cb.len()` `f32`s into `mapped.pData` — the pointer the
-        // immediately preceding `Map` of `self.cbuf` returned, a 16-byte (4×`f32`) DYNAMIC constant
-        // buffer — inside the `is_ok()` arm only, before the paired `Unmap`. Every `OMSet*`/`PSSet*`/
-        // `RSSetViewports`/`Draw` takes borrowed slices of live locals or clones of live interfaces.
+        // SAFETY: all D3D11 work runs on the caller's live `ctx` borrow (the owning capture thread's
+        // immediate context) over borrowed slices of fully-initialized locals (the viewports) and
+        // clones of the caller's live SRV/RTVs. No raw pointers and no mapping on this path.
         unsafe {
-            let y_rtv = Self::plane_rtv(device, dst, DXGI_FORMAT_R16_UNORM)?;
-            let uv_rtv = Self::plane_rtv(device, dst, DXGI_FORMAT_R16G16_UNORM)?;
-
-            // Update the chroma constant buffer (inverse source texel size).
-            let cb: [f32; 4] = [1.0 / w as f32, 1.0 / h as f32, 0.0, 0.0];
-            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-            if ctx
-                .Map(&self.cbuf, 0, D3D11_MAP_WRITE_DISCARD, 0, Some(&mut mapped))
-                .is_ok()
-            {
-                std::ptr::copy_nonoverlapping(cb.as_ptr(), mapped.pData as *mut f32, cb.len());
-                ctx.Unmap(&self.cbuf, 0);
-            }
-
             // Shared pipeline state.
             ctx.OMSetBlendState(None, None, 0xffff_ffff); // opaque overwrite
             ctx.VSSetShader(&self.vs, None);
@@ -937,8 +944,10 @@ pub fn hdr_p010_convert_bars_on_luid(
             .context("CreateTexture2D(P010 bars dst)")?;
         let p010 = p010.context("null p010 tex")?;
 
-        let conv = HdrP010Converter::new(&device)?;
-        conv.convert(&device, &context, &src_srv, &p010, w, h)?;
+        let conv = HdrP010Converter::new(&device, w, h)?;
+        let y_rtv = HdrP010Converter::plane_rtv(&device, &p010, DXGI_FORMAT_R16_UNORM)?;
+        let uv_rtv = HdrP010Converter::plane_rtv(&device, &p010, DXGI_FORMAT_R16G16_UNORM)?;
+        conv.convert(&context, &src_srv, &y_rtv, &uv_rtv, w, h)?;
         Ok((device, p010))
     }
 }
@@ -1130,8 +1139,10 @@ pub fn hdr_p010_selftest_at(w: u32, h: u32, vendor: Option<u32>) -> Result<()> {
             .context("CreateTexture2D(P010 dst)")?;
         let p010 = p010.context("null p010 tex")?;
 
-        let conv = HdrP010Converter::new(&device)?;
-        conv.convert(&device, &context, &src_srv, &p010, W, H)?;
+        let conv = HdrP010Converter::new(&device, W, H)?;
+        let y_rtv = HdrP010Converter::plane_rtv(&device, &p010, DXGI_FORMAT_R16_UNORM)?;
+        let uv_rtv = HdrP010Converter::plane_rtv(&device, &p010, DXGI_FORMAT_R16G16_UNORM)?;
+        conv.convert(&context, &src_srv, &y_rtv, &uv_rtv, W, H)?;
 
         // Staging copy of the whole P010 texture (both planes), MAP_READ.
         let stage_desc = D3D11_TEXTURE2D_DESC {
@@ -1399,8 +1410,14 @@ impl VideoConverter {
             let out_cs = DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709;
             vctx.VideoProcessorSetStreamColorSpace1(&vp, 0, in_cs);
             vctx.VideoProcessorSetOutputColorSpace1(&vp, out_cs);
-            // One frame in, one frame out — no interpolation/auto-processing.
+            // Progressive: one frame in, one frame out — no deinterlace, no frame-rate conversion.
             vctx.VideoProcessorSetStreamFrameFormat(&vp, 0, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE);
+            // …and no vendor "auto processing" either. Its documented DEFAULT is ENABLED, so until
+            // now the comment above claimed something only this call delivers: denoise, edge
+            // enhancement and whatever else the driver folds in were free to run inside every SDR
+            // `VideoProcessorBlt` — on the desktop-capture hot path, altering the pixels we encode
+            // and costing video-engine time nobody asked for.
+            vctx.VideoProcessorSetStreamAutoProcessingMode(&vp, 0, false);
 
             Ok(Self {
                 vdev,

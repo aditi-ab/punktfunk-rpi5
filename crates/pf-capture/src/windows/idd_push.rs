@@ -165,6 +165,19 @@ struct HostSlot {
     srv: ID3D11ShaderResourceView,
 }
 
+/// One host out-ring slot: the NVENC/AMF/QSV encode-input texture, plus — when the output format is
+/// P010 — the two per-plane RTVs the HDR shader passes render through.
+///
+/// The views live HERE, built once with the slot, because they are a property of the texture and the
+/// mode, not of the frame: `HdrP010Converter::convert` used to create both on EVERY HDR frame, inside
+/// the ring slot's keyed-mutex hold, so the driver sat blocked on that slot while we allocated views.
+struct OutSlot {
+    tex: ID3D11Texture2D,
+    /// `(luma R16_UNORM, chroma R16G16_UNORM)` plane views. `None` for NV12/BGRA outputs, which the
+    /// video processor or a plain `CopyResource` writes without an RTV of ours.
+    p010: Option<(ID3D11RenderTargetView, ID3D11RenderTargetView)>,
+}
+
 /// One PyroWave output-ring slot: the two SEPARATE shareable plane textures the wavelet encoder
 /// imports (design/pyrowave-windows-host-zerocopy.md) plus their RTVs (the [`BgraToYuvPlanes`] CSC
 /// renders into them). Y is full-res `R8_UNORM`, CbCr is half-res `R8G8_UNORM`; both are
@@ -572,7 +585,7 @@ pub struct IddPushCapturer {
     /// NV12 (SDR, BT.709 limited) or P010 (HDR, BT.2020 PQ limited), so NVENC takes native YUV and skips
     /// its internal RGB→YUV CSC on the SM/3D engine the game saturates (plan §5.A). Rebuilt on a
     /// display-mode flip. Built lazily.
-    out_ring: Vec<ID3D11Texture2D>,
+    out_ring: Vec<OutSlot>,
     out_idx: usize,
     /// BGRA slot → NV12 (BT.709 limited) on the dedicated D3D11 VIDEO engine, used while the display is
     /// SDR — keeps the colour-convert OFF the contended 3D/compute engine. Built lazily; rebuilt on a
@@ -1188,7 +1201,7 @@ impl IddPushCapturer {
                 "IDD push(host): created sealed ring + delivered the channel; waiting for the driver \
                  to attach + publish"
             );
-            let me = Self {
+            let mut me = Self {
                 device,
                 context,
                 target_id: target.target_id,
@@ -1256,6 +1269,10 @@ impl IddPushCapturer {
                 // it back to the caller for the DDA fallback (audit §5.1).
                 _keepalive: Box::new(()),
             };
+            // The HDR SDR-white reference for the composited cursor, queried ONCE here rather than
+            // from the blend (which holds the ring slot's keyed mutex — see
+            // `refresh_sdr_white_scale`). No-op on an SDR composition.
+            me.refresh_sdr_white_scale();
             // Bounded wait for the driver to ATTACH to the ring AND publish a first frame. An attach
             // failure (DRV_STATUS_TEX_FAIL) or an attach-but-no-frames (a game left the display in a
             // format/size the ring can't match) becomes an open failure the caller falls back from (→ DDA),
@@ -1626,6 +1643,9 @@ impl IddPushCapturer {
             let _ = deliver_cursor_channel(&self.broker, self.target_id, cs, send);
         }
         self.blend_scratch = None; // ring geometry/format changed — rebuild at next blend
+                                   // The HDR SDR-white reference belongs to the mode we just moved to. Queried HERE, not from
+                                   // the blend, which holds the ring slot's keyed mutex (see `refresh_sdr_white_scale`).
+        self.refresh_sdr_white_scale();
         self.last_slot = None; // old-ring slot indices are meaningless now
         self.last_seq = 0;
         self.out_ring.clear(); // the output format changed → rebuild lazily at the new format
@@ -1768,11 +1788,23 @@ impl IddPushCapturer {
             // `&desc` is a fully-initialized stack `D3D11_TEXTURE2D_DESC`, the data arg is `None` (no
             // initial data), and `Some(&mut t)` is a live out-parameter the call fills. `?` rejects a failed
             // HRESULT before `t` is unwrapped, and the created texture belongs to `self.device`.
+            // `plane_rtv` is `unsafe` for the same COM reason and takes that same device plus the
+            // texture we just made; a driver that rejects planar RTVs fails HERE, at ring build, which
+            // is where such a failure belongs (it used to surface on the first frame).
             unsafe {
                 self.device
                     .CreateTexture2D(&desc, None, Some(&mut t))
                     .context("CreateTexture2D(IDD out ring)")?;
-                self.out_ring.push(t.context("null out-ring texture")?);
+                let tex = t.context("null out-ring texture")?;
+                let p010 = if format == DXGI_FORMAT_P010 {
+                    Some((
+                        HdrP010Converter::plane_rtv(&self.device, &tex, DXGI_FORMAT_R16_UNORM)?,
+                        HdrP010Converter::plane_rtv(&self.device, &tex, DXGI_FORMAT_R16G16_UNORM)?,
+                    ))
+                } else {
+                    None
+                };
+                self.out_ring.push(OutSlot { tex, p010 });
             }
         }
         Ok(())
@@ -1872,7 +1904,8 @@ impl IddPushCapturer {
                 // SAFETY: `HdrP010Converter::new` is `unsafe` (it compiles D3D11 shaders + creates
                 // resources); we pass a live borrow of `self.device`, the device the converter's resources
                 // belong to, and `?` propagates any failure before the converter is stored.
-                self.hdr_p010_conv = Some(unsafe { HdrP010Converter::new(&self.device)? });
+                self.hdr_p010_conv =
+                    Some(unsafe { HdrP010Converter::new(&self.device, self.width, self.height)? });
             }
         } else if self.want_444 {
             // Full-chroma passthrough — no conversion resources to build.
@@ -1995,6 +2028,32 @@ impl IddPushCapturer {
         self.cursor_shared.as_mut().and_then(|c| c.read())
     }
 
+    /// Refresh [`Self::sdr_white_scale`] — where DWM places SDR white on this HDR desktop, which the
+    /// composited cursor must match or it renders visibly dark (~2.5× at the Windows default).
+    ///
+    /// Called at open and after every ring recreate, NEVER from the blend. `sdr_white_level_scale` is
+    /// a CCD query that contends the display-config lock — the exact contention `DescriptorPoller`'s
+    /// doc says must stay off the frame path — and it used to run inside `prepare_blend_scratch`,
+    /// which holds the ring slot's KEYED MUTEX: the driver's publisher sat blocked on that slot for
+    /// the duration of a display-config round-trip. "Only on scratch rebuilds" is not the same as
+    /// harmless when the thing being blocked is the producer. A failed query keeps the prior value.
+    fn refresh_sdr_white_scale(&mut self) {
+        if !self.display_hdr {
+            return;
+        }
+        // SAFETY: `sdr_white_level_scale` is an `unsafe fn` running a read-only CCD query over owned
+        // local buffers; the `Copy` target id crosses by value and it returns an owned value.
+        let queried = unsafe { pf_win_display::win_display::sdr_white_level_scale(self.target_id) };
+        self.sdr_white_scale = queried.unwrap_or(self.sdr_white_scale);
+        tracing::info!(
+            target_id = self.target_id,
+            queried = ?queried,
+            applied = self.sdr_white_scale,
+            "cursor composite: HDR SDR-white scale (1.0 = 80 nits; None = query failed — keeping \
+             the prior value)"
+        );
+    }
+
     /// The (serial, x, y, visible) of the CURRENT live cursor — the composite-regen change key.
     /// `None` while no source has a shape yet.
     fn cursor_blend_key(&mut self) -> Option<(u64, i32, i32, bool)> {
@@ -2019,7 +2078,7 @@ impl IddPushCapturer {
         // take a fully-initialized stack descriptor plus live out-params and are `.ok()`-checked before
         // use; `CopyResource` moves between our own scratch and the caller's live slot texture, which
         // share format and size by construction (the scratch is rebuilt whenever the ring geometry
-        // changes). `sdr_white_level_scale` is a read-only CCD query over owned locals.
+        // changes).
         unsafe {
             let fmt = self.ring_format();
             // (Re)build the scratch at the current ring geometry.
@@ -2059,25 +2118,10 @@ impl IddPushCapturer {
                     });
                 match built {
                     Some((t, v)) => {
+                        // `sdr_white_scale` is NOT queried here — see `refresh_sdr_white_scale`:
+                        // this runs while the ring slot's keyed mutex is held, and a CCD
+                        // display-config round-trip has no business blocking the driver's publisher.
                         self.blend_scratch = Some((t, v, self.width, self.height, fmt));
-                        if self.display_hdr {
-                            // Where DWM places SDR white on this HDR desktop — the composited
-                            // cursor must match or it reads dark (~2.5x at the Windows default).
-                            // Queried only here: scratch rebuilds are rare, and the CCD query
-                            // contends on the display-config lock, which must stay OFF the
-                            // per-frame path.
-                            // Safety: read-only CCD query over owned locals (within unsafe fn).
-                            let queried =
-                                pf_win_display::win_display::sdr_white_level_scale(self.target_id);
-                            self.sdr_white_scale = queried.unwrap_or(self.sdr_white_scale);
-                            tracing::info!(
-                                target_id = self.target_id,
-                                queried = ?queried,
-                                applied = self.sdr_white_scale,
-                                "cursor composite: HDR SDR-white scale (1.0 = 80 nits; None = \
-                                 query failed — keeping the prior value)"
-                            );
-                        }
                     }
                     None => {
                         if !self.cursor_blend_failed {
@@ -2309,7 +2353,8 @@ impl IddPushCapturer {
         } else {
             self.ensure_out_ring()?;
             self.ensure_converter()?;
-            (Some(self.out_ring[i].clone()), None)
+            let s = &self.out_ring[i];
+            (Some((s.tex.clone(), s.p010.clone())), None)
         };
         let (_, pf) = self.out_format();
         let ring_len = if self.pyrowave {
@@ -2360,14 +2405,10 @@ impl IddPushCapturer {
                     // HDR: FP16 slot SRV → P010 (BT.2020 PQ) via the shader; NVENC takes native P010.
                     if let Some(conv) = self.hdr_p010_conv.as_ref() {
                         let src = blended.as_ref().map(|(_, srv)| srv).unwrap_or(&slot_srv);
-                        conv.convert(
-                            &self.device,
-                            &self.context,
-                            src,
-                            out.as_ref().expect("out ring"),
-                            self.width,
-                            self.height,
-                        )?;
+                        let (_, rtvs) = out.as_ref().expect("out ring");
+                        // The slot's P010 plane views, built once in `ensure_out_ring`.
+                        let (y_rtv, uv_rtv) = rtvs.as_ref().expect("P010 out slot has plane RTVs");
+                        conv.convert(&self.context, src, y_rtv, uv_rtv, self.width, self.height)?;
                     }
                 } else if self.want_444 {
                     // SDR 4:4:4: pass the BGRA slot through untouched — NVENC ingests full-chroma
@@ -2375,12 +2416,12 @@ impl IddPushCapturer {
                     // copy-engine move; the slot releases back to the driver immediately.
                     let src = blended.as_ref().map(|(t, _)| t).unwrap_or(&slot_tex);
                     self.context
-                        .CopyResource(out.as_ref().expect("out ring"), src);
+                        .CopyResource(&out.as_ref().expect("out ring").0, src);
                 } else {
                     // SDR: BGRA slot → NV12 on the VIDEO engine; NVENC takes native NV12, no SM-side CSC.
                     if let Some(conv) = self.video_conv.as_ref() {
                         let src = blended.as_ref().map(|(t, _)| t).unwrap_or(&slot_tex);
-                        conv.convert(src, out.as_ref().expect("out ring"))?;
+                        conv.convert(src, &out.as_ref().expect("out ring").0)?;
                     }
                 }
             }
@@ -2394,7 +2435,7 @@ impl IddPushCapturer {
         if let Some((y, _, cbcr, _)) = pyro_slot.as_ref() {
             self.pyro_last = Some((y.clone(), cbcr.clone()));
         } else {
-            self.last_present = Some((out.as_ref().expect("out ring").clone(), pf));
+            self.last_present = Some((out.as_ref().expect("out ring").0.clone(), pf));
         }
         let now = Instant::now();
         if regen {
@@ -2493,7 +2534,7 @@ impl IddPushCapturer {
                 }),
             )
         } else {
-            (out.expect("out ring texture"), None)
+            (out.expect("out ring texture").0, None)
         };
         Ok(Some(CapturedFrame {
             width: self.width,
@@ -2555,7 +2596,7 @@ impl IddPushCapturer {
             });
         }
         let (src, pf) = self.last_present.clone()?;
-        let dst = self.out_ring.get(i)?.clone();
+        let dst = self.out_ring.get(i)?.tex.clone();
         // SAFETY: GPU copy on the owning thread's immediate context; src/dst are our out-ring textures of
         // identical format/size (src is a previous out-ring slot; dst the next).
         unsafe {
