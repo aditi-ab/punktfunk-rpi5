@@ -72,14 +72,16 @@ fn heroic_games(path: &Path, runner: &str, key: &str) -> anyhow::Result<Vec<Game
         {
             continue; // the cache also lists owned-but-not-installed titles
         }
-        let install_ok = g
+        // The install dir doubles as this title's detect signal (Heroic hands off to
+        // legendary/gogdl/nile, so the host never sees the game's own process any other way).
+        let install_path = g
             .get("install")
             .and_then(|i| i.get("install_path"))
             .and_then(|p| p.as_str())
-            .is_some_and(|p| Path::new(p).is_dir());
-        if !install_ok {
+            .filter(|p| Path::new(p).is_dir());
+        let Some(install_path) = install_path else {
             continue;
-        }
+        };
         let Some(app_name) = g
             .get("app_name")
             .and_then(|v| v.as_str())
@@ -115,6 +117,11 @@ fn heroic_games(path: &Path, runner: &str, key: &str) -> anyhow::Result<Vec<Game
                 kind: "heroic".into(),
                 value: format!("{runner}:{app_name}"),
             }),
+            // The install dir is the reliable signal. `HEROIC_APP_NAME` is also stamped on the game's
+            // env by Heroic's launch path; it is carried as a second, cheap signal (a union — if a
+            // Heroic version doesn't set it, the install dir still matches).
+            detect: DetectSpec::dir(install_path)
+                .with_env("HEROIC_APP_NAME", Some(app_name.to_string())),
         });
     }
     Ok(games)

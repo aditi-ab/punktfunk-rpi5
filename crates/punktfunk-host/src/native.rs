@@ -1303,24 +1303,43 @@ async fn serve_session(
     // to its shell command HERE against the host's own library — a client can only ever pick an
     // existing title, never send a command — and the data plane runs it per-backend (nested into a
     // bare-spawn gamescope, or spawned into the live session once capture is up).
+    // ONE library lookup for the whole session: enumerating the installed stores touches every
+    // launcher's on-disk metadata, and the data plane needs three things out of it — what to run, what
+    // to call the title, and how to recognize its process once a launcher has handed off
+    // (design/session-game-lifetime.md §4).
+    let launch_target =
+        hello
+            .launch
+            .as_deref()
+            .and_then(|id| match crate::library::resolve_launch(id) {
+                Some(t) => {
+                    tracing::info!(
+                        launch_id = id,
+                        title = %t.game.title,
+                        command = t.command.as_deref().unwrap_or("-"),
+                        "resolved library launch for this session"
+                    );
+                    Some(t)
+                }
+                None => {
+                    tracing::warn!(
+                        launch_id = id,
+                        "client requested a launch id not in this host's library — ignoring"
+                    );
+                    None
+                }
+            });
     #[cfg(target_os = "windows")]
-    let launch_for_dp = hello.launch.clone();
+    let launch_for_dp = launch_target.as_ref().and(hello.launch.clone());
     #[cfg(not(target_os = "windows"))]
-    let launch_for_dp = hello.launch.as_deref().and_then(|id| {
-        match crate::library::launch_command(id) {
-            Some(cmd) => {
-                tracing::info!(launch_id = id, command = %cmd, "resolved library launch for this session");
-                Some(cmd)
-            }
-            None => {
-                tracing::warn!(
-                    launch_id = id,
-                    "client requested a launch id not in this host's library — ignoring"
-                );
-                None
-            }
-        }
-    });
+    let launch_for_dp = launch_target.as_ref().and_then(|t| t.command.clone());
+    // A client reconnecting inside its game's reconnect window takes the game back: nothing is ended,
+    // and this session adopts it. Matched on (this client, this title) so it can only ever reclaim its
+    // own game.
+    if let Some(target) = launch_target.as_ref() {
+        let fp = punktfunk_core::quic::endpoint::peer_fingerprint(&conn).map(hex::encode);
+        crate::gamelease::readopt(fp.as_deref(), target.game.id.as_deref());
+    }
     // Per-title prep steps (RFC §6) for a launched CUSTOM library title: run synchronously
     // before the data plane starts (so before the display opens and the title spawns); the
     // guard's drop — any serve_session exit — runs the undos in reverse, best-effort.
@@ -1466,6 +1485,7 @@ async fn serve_session(
                         stats: stats_dp,
                         client_label,
                         launch: launch_for_dp,
+                        launch_target,
                         client_hdr,
                         bringup: bringup_dp,
                         resize_ms: resize_ms_dp,

@@ -26,6 +26,58 @@ pub fn launch_command(id: &str) -> Option<String> {
     command_for(&spec)
 }
 
+/// Everything a session needs about the title it is launching, resolved in **one** library scan:
+/// what to run, what to call it, and how to recognize it once it is running.
+///
+/// Enumerating the library touches every installed store's on-disk metadata, so the launch path
+/// resolves this once at handshake time and threads it into the data plane rather than looking the
+/// same id up again per use.
+pub struct LaunchTarget {
+    /// Identity for the status surface and the `game.*` events.
+    pub game: crate::gamelease::GameRef,
+    /// How to recognize the running game ([`DetectSpec`]); empty when the store offers nothing.
+    pub detect: DetectSpec,
+    /// The resolved shell command. `Some` on Linux (where the host runs it); `None` on Windows,
+    /// which launches by library id through the interactive-session spawner instead.
+    pub command: Option<String>,
+}
+
+/// Resolve a store-qualified library id (as sent by a client in `Hello::launch`) against the host's
+/// **own** library. `None` = unknown id, or — on Linux — a title with no runnable recipe.
+///
+/// This is the single lookup: the client sends only an id, and everything the session does with the
+/// title afterwards comes from what the host itself knows about it.
+pub fn resolve_launch(id: &str) -> Option<LaunchTarget> {
+    let entry = all_games().into_iter().find(|g| g.id == id)?;
+    let game = crate::gamelease::GameRef {
+        id: Some(entry.id.clone()),
+        store: Some(entry.store.clone()),
+        title: entry.title.clone(),
+    };
+    #[cfg(not(windows))]
+    {
+        // Linux runs the command itself, so a title without one has nothing to launch — same answer
+        // (and same warning path) as before this resolution existed.
+        let command = entry.launch.as_ref().and_then(command_for)?;
+        Some(LaunchTarget {
+            game,
+            detect: entry.detect,
+            command: Some(command),
+        })
+    }
+    #[cfg(windows)]
+    {
+        // Windows resolves the concrete process at launch time (`launch_title`), which is also where
+        // a missing recipe is reported — so an entry with no Windows recipe still yields a target and
+        // the existing warning fires there.
+        Some(LaunchTarget {
+            game,
+            detect: entry.detect,
+            command: None,
+        })
+    }
+}
+
 /// Map a resolved [`LaunchSpec`] to its shell command (pure — the unit-testable core of
 /// [`launch_command`], split out so the appid-validation can be tested without a Steam install).
 #[cfg(not(windows))]
@@ -172,6 +224,21 @@ pub fn launch_gamestream_library(id: &str) -> Result<()> {
     launch_title(id)
 }
 
+/// The child a session launch produced.
+///
+/// Handed back to the caller so the game's lifetime can be tracked
+/// (design/session-game-lifetime.md) instead of the process being forgotten the moment it starts.
+#[cfg(target_os = "linux")]
+pub struct SpawnedLaunch {
+    pub child: std::process::Child,
+    /// Whether the child leads its own process group — true for the plain session spawn in [`launch_session_command`], which
+    /// deliberately creates one so the whole wrapper tree can be signalled as a unit. False for the
+    /// gamescope-session spawn, which shares the host's group (see
+    /// [`crate::gamelease::OwnedChild::group_leader`]: a non-leader must never be signalled by
+    /// negative pid).
+    pub group_leader: bool,
+}
+
 /// Launch a resolved shell command into the **live Linux session** for the session's compositor —
 /// the one launch entry point shared by the native (punktfunk/1) and GameStream planes, called
 /// AFTER capture is up so the app renders onto the streamed output. The command is host-resolved
@@ -190,18 +257,29 @@ pub fn launch_gamestream_library(id: &str) -> Result<()> {
 /// * **gamescope (bare spawn)** — not routed here: the command was nested into the fresh gamescope
 ///   via `set_launch_command` (the caller gates on `vdisplay::launch_is_nested`).
 #[cfg(target_os = "linux")]
-pub fn launch_session_command(compositor: crate::vdisplay::Compositor, cmd: &str) -> Result<()> {
+pub fn launch_session_command(
+    compositor: crate::vdisplay::Compositor,
+    cmd: &str,
+) -> Result<SpawnedLaunch> {
+    use std::os::unix::process::CommandExt;
     let cmd = cmd.trim();
     anyhow::ensure!(!cmd.is_empty(), "empty command");
-    let child = match compositor {
+    let (child, group_leader) = match compositor {
         crate::vdisplay::Compositor::Gamescope => {
-            crate::vdisplay::launch_into_gamescope_session(cmd)?
+            (crate::vdisplay::launch_into_gamescope_session(cmd)?, false)
         }
-        _ => std::process::Command::new("sh")
-            .arg("-c")
-            .arg(cmd)
-            .spawn()
-            .context("spawn launch command")?,
+        _ => (
+            std::process::Command::new("sh")
+                .arg("-c")
+                .arg(cmd)
+                // Its own process group, so ending this game later signals the shell *and* the game
+                // it exec'd or forked — the whole tree the host started — and nothing else. Also
+                // detaches it from any signal the host's own group receives.
+                .process_group(0)
+                .spawn()
+                .context("spawn launch command")?,
+            true,
+        ),
     };
     tracing::info!(
         command = %cmd,
@@ -209,7 +287,10 @@ pub fn launch_session_command(compositor: crate::vdisplay::Compositor, cmd: &str
         compositor = compositor.id(),
         "launched app into the live session"
     );
-    Ok(())
+    Ok(SpawnedLaunch {
+        child,
+        group_leader,
+    })
 }
 
 /// Resolve the launch command for a session app selection on Linux: a store-qualified library id

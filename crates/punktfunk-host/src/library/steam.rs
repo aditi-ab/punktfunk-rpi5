@@ -17,25 +17,32 @@ impl LibraryProvider for SteamProvider {
     }
 
     fn list(&self) -> Vec<GameEntry> {
-        let mut by_appid: std::collections::BTreeMap<u32, String> = Default::default();
+        let mut by_appid: std::collections::BTreeMap<u32, Installed> = Default::default();
         for steamapps in steam_library_dirs() {
-            for (appid, name) in scan_manifests(&steamapps) {
-                by_appid.entry(appid).or_insert(name); // first library wins; dedups shared appids
+            for app in scan_manifests(&steamapps) {
+                // First library wins; dedups appids present in several libraries.
+                by_appid.entry(app.appid).or_insert(app);
             }
         }
         let mut games: Vec<GameEntry> = by_appid
-            .into_iter()
-            .filter(|(appid, name)| !is_steam_tool(*appid, name))
-            .map(|(appid, title)| GameEntry {
+            .into_values()
+            .filter(|app| !is_steam_tool(app.appid, &app.name))
+            .map(|app| GameEntry {
                 provider: None,
-                id: format!("steam:{appid}"),
+                id: format!("steam:{}", app.appid),
                 store: "steam".into(),
-                title,
-                art: steam_art(appid),
+                art: steam_art(app.appid),
                 launch: Some(LaunchSpec {
                     kind: "steam_appid".into(),
-                    value: appid.to_string(),
+                    value: app.appid.to_string(),
                 }),
+                // The appid alone is authoritative on Linux (Steam's launch reaper); the install dir
+                // is what the Windows matcher — which has no reaper to watch — keys off instead.
+                detect: match app.install_dir {
+                    Some(dir) => DetectSpec::steam(app.appid).with_dir(dir),
+                    None => DetectSpec::steam(app.appid),
+                },
+                title: app.name,
             })
             .collect();
         // Non-Steam shortcuts have no `appmanifest` — [`scan_manifests`] can't see them, so the
@@ -274,8 +281,17 @@ fn vdf_value<'a>(line: &'a str, key: &str) -> Option<&'a str> {
     Some(&after[..after.find('"')?])
 }
 
-/// Scan a `steamapps` dir for `appmanifest_*.acf` files → (appid, name) of installed titles.
-fn scan_manifests(steamapps: &Path) -> Vec<(u32, String)> {
+/// One installed Steam title, as read from its `appmanifest_<appid>.acf`.
+struct Installed {
+    appid: u32,
+    name: String,
+    /// `<steamapps>/common/<installdir>`, when the manifest names one and it exists on disk — the
+    /// game's own files, used to recognize its processes ([`DetectSpec::install_dir`]).
+    install_dir: Option<PathBuf>,
+}
+
+/// Scan a `steamapps` dir for `appmanifest_*.acf` files → the installed titles it describes.
+fn scan_manifests(steamapps: &Path) -> Vec<Installed> {
     let Ok(rd) = std::fs::read_dir(steamapps) else {
         return Vec::new();
     };
@@ -290,7 +306,17 @@ fn scan_manifests(steamapps: &Path) -> Vec<(u32, String)> {
             let appid = text.lines().find_map(|l| vdf_value(l.trim(), "appid"));
             let name = text.lines().find_map(|l| vdf_value(l.trim(), "name"));
             if let (Some(Ok(appid)), Some(name)) = (appid.map(str::parse::<u32>), name) {
-                out.push((appid, name.to_string()));
+                // `installdir` is a bare folder name relative to this library's `common/`.
+                let install_dir = text
+                    .lines()
+                    .find_map(|l| vdf_value(l.trim(), "installdir"))
+                    .map(|d| steamapps.join("common").join(d))
+                    .filter(|p| p.is_dir());
+                out.push(Installed {
+                    appid,
+                    name: name.to_string(),
+                    install_dir,
+                });
             }
         }
     }
@@ -318,6 +344,9 @@ struct Shortcut {
     appid: u32,
     /// Display name (`AppName`).
     name: String,
+    /// The shortcut's target (`Exe`), as stored — Steam quotes it. This *is* the game (a shortcut
+    /// points straight at it, with no launcher in between), so it doubles as the detect signal.
+    exe: String,
     /// Whether Steam has this shortcut hidden from the library (`IsHidden`) — we honor that.
     hidden: bool,
 }
@@ -361,7 +390,20 @@ fn shortcut_entry(sc: Shortcut) -> Option<GameEntry> {
             kind: "steam_appid".into(),
             value: shortcut_gameid(sc.appid).to_string(),
         }),
+        detect: shortcut_detect(&sc.exe),
     })
+}
+
+/// Detect signals for a non-Steam shortcut: its `Exe` target is the game itself, so the executable
+/// (and its folder, which catches a launcher script that execs a sibling binary) identifies it. Steam
+/// stores the target quoted and may include trailing arguments; only an existing absolute path is
+/// asserted — a guess would be worse than no tracking at all.
+fn shortcut_detect(exe: &str) -> DetectSpec {
+    let mut spec = crate::library::spec_from_command(exe);
+    if let Some(dir) = spec.exe.as_deref().and_then(Path::parent) {
+        spec.install_dir = Some(dir.to_path_buf());
+    }
+    spec
 }
 
 /// Every `userdata/<id>/config/shortcuts.vdf` under each Steam root — one file per Steam account
@@ -489,6 +531,7 @@ fn parse_one_shortcut(buf: &[u8], pos: &mut usize) -> Option<Shortcut> {
     Some(Shortcut {
         appid,
         name,
+        exe,
         hidden,
     })
 }
@@ -704,6 +747,7 @@ mod tests {
         let sc = Shortcut {
             appid: 2_456_789_012,
             name: "My Emulator".into(),
+            exe: "\"/opt/emu/run.sh\"".into(),
             hidden: false,
         };
         let entry = shortcut_entry(sc).unwrap();

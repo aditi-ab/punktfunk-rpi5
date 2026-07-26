@@ -52,6 +52,9 @@ fn gog_games() -> Vec<GameEntry> {
         // Art (public api.gog.com) is resolved off the hot path by the background warmer; read
         // whatever it has cached (title-only until warmed).
         let art = cached_art(&id).unwrap_or_default();
+        // GOG launches the game's exe directly (no Galaxy), so the host owns the process and the
+        // spec is only the fallback for a stub launcher that hands off; both signals are exact here.
+        let detect = DetectSpec::exe(&exe).with_dir(&path);
         out.push(GameEntry {
             provider: None,
             id,
@@ -62,6 +65,7 @@ fn gog_games() -> Vec<GameEntry> {
                 kind: "gog".into(),
                 value: format!("{exe}\t{args}\t{workdir}"),
             }),
+            detect,
         });
     }
     out

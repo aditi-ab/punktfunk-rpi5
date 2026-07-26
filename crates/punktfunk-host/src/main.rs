@@ -41,6 +41,9 @@ mod encode {
     pub(crate) use pf_encode::*;
 }
 mod events;
+// The lifetime of a launched game: whether it is running, when it exits (which can end the session),
+// and how to end it (which a session ending can ask for) — design/session-game-lifetime.md.
+mod gamelease;
 mod gamestream;
 #[cfg(target_os = "linux")]
 #[path = "linux/gpuclocks.rs"]
@@ -66,11 +69,17 @@ mod native;
 mod native_pairing;
 mod pipeline;
 mod plugins;
+// Finding a launched game's processes from its store's detect signals — the read side of the
+// session⇄game lifetime binding (design/session-game-lifetime.md §4).
+#[cfg(target_os = "linux")]
+mod procscan;
 mod send_pacing;
 #[cfg(target_os = "windows")]
 #[path = "windows/service.rs"]
 mod service;
 mod session_plan;
+// Operator policy for the session⇄game lifetime binding (`session-settings.json`).
+mod session_settings;
 mod session_status;
 mod sleep_inhibit;
 mod spike;

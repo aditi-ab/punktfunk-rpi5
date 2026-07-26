@@ -110,6 +110,33 @@ pub struct StreamRef {
     pub plane: Plane,
 }
 
+/// A launched game, as the `game.*` events see it.
+#[derive(Serialize, Deserialize, ToSchema, Clone, Debug)]
+pub struct GameRefPayload {
+    /// Store-qualified library id (`steam:570`). Absent for an operator-typed GameStream
+    /// `apps.json` command, which has no library entry behind it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app: Option<String>,
+    /// Display title.
+    pub title: String,
+    /// Which store surfaced it (`steam`, `heroic`, `custom`, …), when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub store: Option<String>,
+    /// Client-supplied device name of the session that launched it; may be empty.
+    pub client: String,
+    pub plane: Plane,
+}
+
+/// Why a launched game is no longer running.
+#[derive(Serialize, Deserialize, ToSchema, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum GameEndReason {
+    /// The player quit it (or it crashed) — the host did not ask.
+    Exited,
+    /// The host ended it, per the session⇄game lifetime policy.
+    Terminated,
+}
+
 /// A device in the pairing flow.
 #[derive(Serialize, Deserialize, ToSchema, Clone, Debug)]
 pub struct DeviceRef {
@@ -140,6 +167,17 @@ pub enum EventKind {
     StreamStarted { stream: StreamRef },
     #[serde(rename = "stream.stopped")]
     StreamStopped { stream: StreamRef },
+    /// A launched game was confirmed running — fires once per launch, after the host has actually
+    /// seen the game's process (not merely spawned its launcher).
+    #[serde(rename = "game.running")]
+    GameRunning { game: GameRefPayload },
+    /// A launched game is gone. `reason` distinguishes the player quitting from the host ending it
+    /// per the lifetime policy.
+    #[serde(rename = "game.exited")]
+    GameExited {
+        game: GameRefPayload,
+        reason: GameEndReason,
+    },
     #[serde(rename = "pairing.pending")]
     PairingPending { device: DeviceRef },
     #[serde(rename = "pairing.completed")]
@@ -196,6 +234,8 @@ impl EventKind {
             EventKind::SessionEnded { .. } => "session.ended",
             EventKind::StreamStarted { .. } => "stream.started",
             EventKind::StreamStopped { .. } => "stream.stopped",
+            EventKind::GameRunning { .. } => "game.running",
+            EventKind::GameExited { .. } => "game.exited",
             EventKind::PairingPending { .. } => "pairing.pending",
             EventKind::PairingCompleted { .. } => "pairing.completed",
             EventKind::PairingDenied { .. } => "pairing.denied",
@@ -224,6 +264,9 @@ impl EventKind {
             EventKind::StreamStarted { stream } | EventKind::StreamStopped { stream } => {
                 Some(&stream.client)
             }
+            EventKind::GameRunning { game } | EventKind::GameExited { game, .. } => {
+                Some(&game.client)
+            }
             EventKind::PairingPending { device }
             | EventKind::PairingCompleted { device }
             | EventKind::PairingDenied { device } => Some(&device.name),
@@ -251,6 +294,9 @@ impl EventKind {
             EventKind::StreamStarted { stream } | EventKind::StreamStopped { stream } => {
                 Some(stream.plane)
             }
+            EventKind::GameRunning { game } | EventKind::GameExited { game, .. } => {
+                Some(game.plane)
+            }
             EventKind::PairingPending { device }
             | EventKind::PairingCompleted { device }
             | EventKind::PairingDenied { device } => Some(device.plane),
@@ -263,6 +309,11 @@ impl EventKind {
         match self {
             EventKind::StreamStarted { stream } | EventKind::StreamStopped { stream } => {
                 stream.app.as_deref()
+            }
+            // A `game.*` event without a library id came from an operator-typed command; its title
+            // is the only handle a hook filter has, so fall back to it rather than matching nothing.
+            EventKind::GameRunning { game } | EventKind::GameExited { game, .. } => {
+                game.app.as_deref().or(Some(&game.title))
             }
             _ => None,
         }
@@ -522,6 +573,84 @@ mod tests {
             serde_json::to_string(&ev).unwrap(),
             r#"{"seq":3,"ts_ms":1700000000000,"schema":1,"kind":"plugins.changed","id":"rom-manager"}"#
         );
+
+        let ev = HostEvent {
+            seq: 5,
+            ts_ms: 1_700_000_000_000,
+            schema: 1,
+            kind: EventKind::GameRunning {
+                game: GameRefPayload {
+                    app: Some("steam:570".into()),
+                    title: "Dota 2".into(),
+                    store: Some("steam".into()),
+                    client: "Living Room TV".into(),
+                    plane: Plane::Native,
+                },
+            },
+        };
+        assert_eq!(
+            serde_json::to_string(&ev).unwrap(),
+            r#"{"seq":5,"ts_ms":1700000000000,"schema":1,"kind":"game.running","game":{"app":"steam:570","title":"Dota 2","store":"steam","client":"Living Room TV","plane":"native"}}"#
+        );
+
+        // A game the host ended itself, and one with no library entry behind it (an operator-typed
+        // GameStream command) — the optional ids are omitted, not nulled.
+        let ev = HostEvent {
+            seq: 6,
+            ts_ms: 1_700_000_000_000,
+            schema: 1,
+            kind: EventKind::GameExited {
+                game: GameRefPayload {
+                    app: None,
+                    title: "Big Picture".into(),
+                    store: None,
+                    client: String::new(),
+                    plane: Plane::Gamestream,
+                },
+                reason: GameEndReason::Terminated,
+            },
+        };
+        assert_eq!(
+            serde_json::to_string(&ev).unwrap(),
+            r#"{"seq":6,"ts_ms":1700000000000,"schema":1,"kind":"game.exited","game":{"title":"Big Picture","client":"","plane":"gamestream"},"reason":"terminated"}"#
+        );
+    }
+
+    /// The `game.*` events must be reachable by the same hook/SSE filters as every other kind — a
+    /// filterable event nobody can select is not a feature.
+    #[test]
+    fn game_events_are_filterable() {
+        let running = EventKind::GameRunning {
+            game: GameRefPayload {
+                app: Some("steam:570".into()),
+                title: "Dota 2".into(),
+                store: Some("steam".into()),
+                client: "Deck".into(),
+                plane: Plane::Native,
+            },
+        };
+        assert_eq!(running.name(), "game.running");
+        assert!(kind_matches("game.*", running.name()));
+        assert!(kind_matches("game.running", running.name()));
+        assert!(!kind_matches("gamestream.*", running.name()));
+        assert_eq!(running.client_name(), Some("Deck"));
+        assert_eq!(running.plane(), Some(Plane::Native));
+        assert_eq!(running.app(), Some("steam:570"));
+
+        // With no library id, the title is the filterable handle — otherwise an `apps.json` launch
+        // would be unmatchable by app.
+        let exited = EventKind::GameExited {
+            game: GameRefPayload {
+                app: None,
+                title: "Big Picture".into(),
+                store: None,
+                client: String::new(),
+                plane: Plane::Gamestream,
+            },
+            reason: GameEndReason::Exited,
+        };
+        assert_eq!(exited.app(), Some("Big Picture"));
+        assert_eq!(exited.fingerprint(), None);
     }
 
     #[test]

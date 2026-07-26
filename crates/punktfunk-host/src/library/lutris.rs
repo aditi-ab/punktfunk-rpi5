@@ -55,20 +55,33 @@ fn lutris_games(db: &Path) -> rusqlite::Result<Vec<GameEntry>> {
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
         )?
     };
-    let mut stmt = conn.prepare(
-        "SELECT id, slug, name FROM games \
+    // `directory` (the game's install dir — our detect signal) is not load-bearing for the library, so
+    // a pga.db schema without it must not cost the whole Lutris store: try the richer query first and
+    // fall back to the historical one on any prepare error.
+    const SELECT_WITH_DIR: &str = "SELECT id, slug, name, directory FROM games \
          WHERE installed = 1 AND name IS NOT NULL AND name <> '' \
-         ORDER BY name COLLATE NOCASE",
-    )?;
+         ORDER BY name COLLATE NOCASE";
+    const SELECT_PLAIN: &str = "SELECT id, slug, name, NULL FROM games \
+         WHERE installed = 1 AND name IS NOT NULL AND name <> '' \
+         ORDER BY name COLLATE NOCASE";
+    let mut stmt = match conn.prepare(SELECT_WITH_DIR) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e, "lutris pga.db has no `directory` column — listing without \
+                 install dirs (game-exit detection unavailable for Lutris titles)");
+            conn.prepare(SELECT_PLAIN)?
+        }
+    };
     let rows = stmt.query_map([], |row| {
         Ok((
             row.get::<_, i64>(0)?,
             row.get::<_, Option<String>>(1)?,
             row.get::<_, String>(2)?,
+            row.get::<_, Option<String>>(3)?,
         ))
     })?;
     let mut games = Vec::new();
-    for (id, slug, name) in rows.flatten() {
+    for (id, slug, name, directory) in rows.flatten() {
         games.push(GameEntry {
             provider: None,
             id: format!("lutris:{id}"),
@@ -79,6 +92,12 @@ fn lutris_games(db: &Path) -> rusqlite::Result<Vec<GameEntry>> {
                 kind: "lutris_id".into(),
                 value: id.to_string(),
             }),
+            // Lutris stamps no per-game env marker we can rely on, so the install dir is the whole
+            // recipe; a game with none (an emulator entry pointing at a bare ROM) stays untracked.
+            detect: directory
+                .filter(|d| !d.trim().is_empty())
+                .map(DetectSpec::dir)
+                .unwrap_or_default(),
         });
     }
     Ok(games)

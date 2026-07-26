@@ -88,6 +88,16 @@ fn epic_entry(
     } else {
         app_name.clone()
     };
+    // Detect signals: the manifest's own `LaunchExecutable` (relative to the install dir) is exact
+    // when present; the install dir covers the rest (Epic hands off to its launcher, so the host
+    // never owns the game's process).
+    let detect = match s("LaunchExecutable")
+        .map(|rel| Path::new(install).join(rel))
+        .filter(|p| p.is_file())
+    {
+        Some(exe) => DetectSpec::exe(exe).with_dir(install),
+        None => DetectSpec::dir(install),
+    };
     Some(GameEntry {
         provider: None,
         id: format!("epic:{app_name}"),
@@ -98,6 +108,7 @@ fn epic_entry(
             kind: "epic".into(),
             value,
         }),
+        detect,
     })
 }
 

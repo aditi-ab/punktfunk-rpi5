@@ -879,6 +879,30 @@ fn session_watcher_loop(tx: std::sync::mpsc::Sender<SessionSwitch>, stop: Arc<At
     }
 }
 
+/// Applies the end-game-on-session-end policy when the session's video loop exits, whichever way it
+/// exits (`return`, `?`, a `break` out of the loop, panic-unwind) — the same RAII shape the per-title
+/// prep/undo guard uses, for the same reason: teardown paths are many and easy to miss one of.
+///
+/// Reading `quit` at **drop** time is the point: it is what distinguishes a client that deliberately
+/// stopped (or an operator who did) from one that merely vanished, and that distinction is the whole
+/// safety story for `Always` — a vanish gets a reconnect window, a deliberate stop does not.
+struct GameLifetime {
+    lease: crate::gamelease::GameLease,
+    quit: Arc<AtomicBool>,
+    /// Hex client fingerprint, so a reconnecting client can reclaim its own game and nothing else.
+    fingerprint: Option<String>,
+}
+
+impl Drop for GameLifetime {
+    fn drop(&mut self) {
+        crate::gamelease::on_session_end(
+            &self.lease,
+            self.quit.load(Ordering::SeqCst),
+            self.fingerprint.as_deref(),
+        );
+    }
+}
+
 /// All per-session inputs for [`virtual_stream`], bundled so the session entry
 /// is one moved value instead of a 13-positional-argument `#[allow(too_many_arguments)]` signature
 /// (Goal-1 stage 4, plan §2.4). Everything is **owned** — the receivers move in (`virtual_stream` is their
@@ -988,6 +1012,10 @@ pub(super) struct SessionContext {
     /// command already resolved against the host's own library — nested into gamescope's bare spawn
     /// via `set_launch_command`, or spawned into the live session once capture is up.
     pub(super) launch: Option<String>,
+    /// Identity + detection metadata for the launched title, resolved once at handshake time
+    /// alongside `launch`. `None` when nothing was launched. Drives the game's lifetime — its exit
+    /// can end this session, and this session ending can end it (design/session-game-lifetime.md).
+    pub(super) launch_target: Option<crate::library::LaunchTarget>,
     /// The client display's HDR colour volume (`Hello::display_hdr`; `None` = older client / SDR).
     /// Threaded into the vdisplay backend before `create` (→ the pf-vdisplay EDID's CTA HDR block,
     /// so host apps tone-map to the client's real panel) and preferred over the generic baseline
@@ -1077,10 +1105,17 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
         stats,
         client_label,
         launch,
+        launch_target,
         client_hdr,
         bringup,
         resize_ms,
     } = ctx;
+    // Reference point for adopting the launched game's processes: anything the host will call "this
+    // session's game" has to have started after this instant. Taken HERE, before the display (and
+    // therefore before a bare-spawn gamescope's nested child) exists, because a reading taken after
+    // the launch would reject the very process it is meant to find. Erring early is the safe
+    // direction: it can only ever include more of our own launch, never a copy from before it.
+    let launch_uptime = crate::gamelease::launch_clock();
     // Streamed-AU wire mode: the client's cap AND the host escape hatch (`PUNKTFUNK_STREAMED_AU=0`
     // reverts to whole-AU sends without touching the encoder's slicing knobs). The third gate —
     // whether the ENCODER actually chunks — is dynamic (`supports_chunked_poll`, per AU).
@@ -1211,54 +1246,93 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
         }
     }
     #[cfg(target_os = "linux")]
-    if let Some(cmd) = launch.as_deref() {
-        if crate::vdisplay::launch_is_nested(compositor) {
+    let spawned_launch = match launch.as_deref() {
+        Some(cmd) if crate::vdisplay::launch_is_nested(compositor) => {
             tracing::info!(command = %cmd, "launch nested into the per-session gamescope");
-        } else if let Err(e) = crate::library::launch_session_command(compositor, cmd) {
-            tracing::warn!(command = %cmd, error = %e, "could not launch requested title into the session");
+            None
         }
-    }
+        Some(cmd) => match crate::library::launch_session_command(compositor, cmd) {
+            Ok(spawned) => Some(spawned),
+            Err(e) => {
+                tracing::warn!(command = %cmd, error = %e, "could not launch requested title into the session");
+                None
+            }
+        },
+        None => None,
+    };
     #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     let _ = &launch;
 
-    // Dedicated Steam launch: end the stream cleanly when the LAUNCHED GAME exits. The node-death
-    // check in the capture-loss branch below can't see this for Steam — the nested `steam` is the
-    // resident client and stays up after a game quits, so gamescope (and its node) never dies and the
-    // stream would sit on a hidden Steam session forever. Watch the game process directly (Steam's
-    // `SteamLaunch AppId=<id>` reaper, whose lifetime == the game's) and close with APP_EXITED when
-    // it's gone, so a launcher client returns to its library. Non-Steam nested launches keep the
-    // node-death path (gamescope's child IS the game). Cancelled via `stop` when the session ends for
-    // another reason first; the thread self-terminates, so we don't join it.
-    #[cfg(target_os = "linux")]
-    let _game_watch = launch
-        .as_deref()
-        .filter(|_| crate::vdisplay::launch_is_nested(compositor))
-        .and_then(crate::vdisplay::steam_appid_from_launch)
-        .map(|appid| {
+    // The launched game's lifetime, in both directions (design/session-game-lifetime.md):
+    //
+    // * **its exit ends this session** — so a client returns to its library instead of sitting on a
+    //   hidden launcher or a bare desktop. This generalizes what used to be a Steam-and-gamescope-only
+    //   watch: the game is now recognized from whatever its store told us (appid, install dir, exe,
+    //   env marker), which covers every compositor and every store. The node-death check in the
+    //   capture-loss branch below stays as the backstop for a nested launch we can't otherwise see.
+    // * **this session ending can end it** — never by default; only when the operator asked, and for
+    //   a mere disconnect only after a reconnect window (`_game_life`'s drop, below).
+    let game_lease = launch_target.as_ref().map(|target| {
+        #[cfg(target_os = "linux")]
+        let nested = crate::vdisplay::launch_is_nested(compositor);
+        #[cfg(not(target_os = "linux"))]
+        let nested = false;
+        #[cfg(target_os = "linux")]
+        let child = spawned_launch.map(|s| (s.child, s.group_leader));
+        #[cfg(not(target_os = "linux"))]
+        let child = None;
+
+        let on_exit: crate::gamelease::OnExit = {
             let conn = conn.clone();
             let stop = stop.clone();
             let quit = quit.clone();
-            std::thread::Builder::new()
-                .name("pf1-gamewatch".into())
-                .spawn(move || {
-                    if crate::vdisplay::watch_steam_game_exit(appid, &stop) {
-                        tracing::info!(
-                            appid,
-                            "dedicated Steam game exited — ending the session cleanly (APP_EXITED)"
-                        );
-                        // Close FIRST so APP_EXITED is the winning close code (quinn keeps the first
-                        // application close), then set the flags: `quit` skips the display lease's
-                        // keep-alive linger and `stop` wakes the encode/send loops out.
-                        conn.close(
-                            punktfunk_core::quic::APP_EXITED_CLOSE_CODE.into(),
-                            b"game exited",
-                        );
-                        quit.store(true, Ordering::SeqCst);
-                        stop.store(true, Ordering::SeqCst);
-                    }
-                })
-                .ok()
-        });
+            Box::new(move || {
+                // Read the setting at fire time, so flipping it mid-session takes effect. The lease
+                // itself keeps running either way — the status surface still reports the game.
+                if !crate::session_settings::get().session_on_game_exit {
+                    tracing::info!(
+                        "the launched game exited, but ending the session on game exit is off — \
+                         leaving the stream up"
+                    );
+                    return;
+                }
+                tracing::info!(
+                    "the launched game exited — ending the session cleanly (APP_EXITED)"
+                );
+                // Close FIRST so APP_EXITED is the winning close code (quinn keeps the first
+                // application close), then set the flags: `quit` skips the display lease's
+                // keep-alive linger and `stop` wakes the encode/send loops out.
+                conn.close(
+                    punktfunk_core::quic::APP_EXITED_CLOSE_CODE.into(),
+                    b"game exited",
+                );
+                quit.store(true, Ordering::SeqCst);
+                stop.store(true, Ordering::SeqCst);
+            })
+        };
+        crate::gamelease::open(
+            crate::gamelease::LeaseRequest {
+                game: target.game.clone(),
+                client: client_label.clone(),
+                plane: crate::events::Plane::Native,
+                spec: target.detect.clone(),
+                nested,
+                child,
+                launch_uptime,
+            },
+            on_exit,
+        )
+    });
+    let game_shared = game_lease.as_ref().map(|l| l.shared());
+    // Declared here so it drops *after* the live-session registration below (reverse declaration
+    // order): `session.ended` fires first, then the game policy runs — the order an operator reading
+    // the log expects. The fingerprint is what lets a reconnecting client reclaim its own game and
+    // nothing else.
+    let _game_life = game_lease.map(|lease| GameLifetime {
+        lease,
+        quit: quit.clone(),
+        fingerprint: endpoint::peer_fingerprint(&conn).map(hex::encode),
+    });
 
     let perf = pf_host_config::config().perf;
     // Microburst cap (applied in send_loop/paced_submit): a frame ≤ the cap bursts out
@@ -1329,17 +1403,19 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
     // (`GET /status`) shows the native stream — resolution/fps/codec/bitrate resolve live from the
     // same handles a mid-stream mode switch / adaptive-bitrate change updates. The guard clears the
     // entry when this loop exits (return / `?` / panic), so the Dashboard tracks the session's life.
-    let _live_session = crate::session_status::register(
-        live_mode.clone(),
-        live_bitrate.clone(),
-        plan.codec,
-        stop.clone(),
-        force_idr.clone(),
-        client_label,
-        plan.hdr,
-        bringup.total_slot(),
-        resize_ms.clone(),
-    );
+    let _live_session = crate::session_status::register(crate::session_status::Registration {
+        mode: live_mode.clone(),
+        bitrate_kbps: live_bitrate.clone(),
+        codec: plan.codec,
+        stop: stop.clone(),
+        quit: quit.clone(),
+        force_idr: force_idr.clone(),
+        client: client_label,
+        hdr: plan.hdr,
+        ttff_ms: bringup.total_slot(),
+        last_resize_ms: resize_ms.clone(),
+        game: game_shared,
+    });
 
     // Mid-stream session-switch watcher (opt-in via PUNKTFUNK_SESSION_WATCH; never under an explicit
     // PUNKTFUNK_COMPOSITOR pin). It self-baselines and signals the loop below to swap the backend in
@@ -2057,8 +2133,13 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                 // write-only variable under `-D warnings` (the `let _ = &launch` idiom above).
                 #[cfg(not(target_os = "linux"))]
                 let _ = &cur_node_id;
+                // Backstop for a nested launch the lease can't recognize (no detect signals): a
+                // bare-spawn gamescope exits with its child, so its node staying gone means the game
+                // quit. Honors the same operator setting as the lease's own exit path — with
+                // end-session-on-game-exit off, a lost capture is just a rebuild.
                 #[cfg(target_os = "linux")]
                 if launch.is_some()
+                    && crate::session_settings::get().session_on_game_exit
                     && crate::vdisplay::launch_is_nested(compositor)
                     && crate::vdisplay::dedicated_game_exited(cur_node_id)
                 {

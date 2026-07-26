@@ -78,6 +78,9 @@ fn xbox_games() -> Vec<GameEntry> {
                     kind: "aumid".into(),
                     value: format!("{pfn}!{app_id}"),
                 }),
+                // AUMID activation goes through the shell, so the host never owns the process: the
+                // title's `Content` dir (which holds the game's binaries) is the detect signal.
+                detect: DetectSpec::dir(title_dir.join("Content")),
             });
         }
     }

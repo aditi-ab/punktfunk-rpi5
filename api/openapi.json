@@ -665,6 +665,58 @@
         }
       }
     },
+    "/api/v1/game/end": {
+      "post": {
+        "tags": [
+          "session"
+        ],
+        "summary": "End a launched game",
+        "description": "Ends a game whose session has already gone and which is waiting out its reconnect window — the\nconsole's \"End now\" for a game the host is about to close anyway. `app_id` picks one title; omit it\nto end every waiting game.\n\nThis does **not** touch a game whose session is still live: ending that is session management\n(`DELETE /session`), and how the game is treated then follows the operator's policy.",
+        "operationId": "endGame",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EndGameRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "How many waiting games were ended",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EndGameResult"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "No game is waiting to be ended",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/gpus": {
       "get": {
         "tags": [
@@ -2226,7 +2278,7 @@
           "session"
         ],
         "summary": "Stop the active session",
-        "description": "Kicks the connected client: stops the video/audio stream threads and clears the launch\nstate. Idempotent — succeeds even when nothing is streaming.",
+        "description": "Kicks the connected client: stops the video/audio stream threads and clears the launch\nstate. Idempotent — succeeds even when nothing is streaming.\n\nCounts as a **deliberate** stop, exactly like a client pressing Stop: the display skips its\nkeep-alive linger, and the end-game-on-session-end policy (if the operator enabled one) applies.",
         "operationId": "stopSession",
         "responses": {
           "204": {
@@ -2269,6 +2321,98 @@
           },
           "409": {
             "description": "No active video stream",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/session/settings": {
+      "get": {
+        "tags": [
+          "session"
+        ],
+        "summary": "Session⇄game lifetime settings",
+        "description": "Whether a launched game's exit ends the streaming session, and whether a session ending ends the\ngame (with the reconnect window that protects a dropped client's unsaved progress). See\n`design/session-game-lifetime.md`.",
+        "operationId": "getSessionSettings",
+        "responses": {
+          "200": {
+            "description": "Stored settings + which axes this build enforces",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionSettingsState"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "session"
+        ],
+        "summary": "Set the session⇄game lifetime settings",
+        "description": "Persists the settings (clamped) and applies them from the next decision — including to a session\nthat is already streaming, since the policy is read when a session ends rather than when it starts.",
+        "operationId": "setSessionSettings",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SessionSettings"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Settings stored; the new state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionSettingsState"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed settings body",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Settings could not be persisted",
             "content": {
               "application/json": {
                 "schema": {
@@ -3251,6 +3395,67 @@
   },
   "components": {
     "schemas": {
+      "ActiveGame": {
+        "type": "object",
+        "description": "One launched game, for the console's running-game card.",
+        "required": [
+          "client",
+          "title",
+          "plane",
+          "state"
+        ],
+        "properties": {
+          "app_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Store-qualified library id (`steam:570`) — the key the console matches against `GET /library`\nto show box art. Absent for an operator-typed GameStream command."
+          },
+          "client": {
+            "type": "string",
+            "description": "Client-supplied device name of the session that launched it; may be empty."
+          },
+          "grace_remaining_s": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Seconds until this game is ended — only present on a `grace` row.",
+            "minimum": 0
+          },
+          "plane": {
+            "$ref": "#/components/schemas/Plane",
+            "description": "`native` or `gamestream`."
+          },
+          "session_id": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The session streaming it; `null` for a game waiting out its reconnect window.",
+            "minimum": 0
+          },
+          "state": {
+            "type": "string",
+            "description": "`launching` (launched, not seen running yet), `running`, `exited`, or `grace` (its session is\ngone and it will be ended when the reconnect window closes).",
+            "example": "running"
+          },
+          "store": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Which store surfaced it (`steam`, `heroic`, `custom`, …), when known."
+          },
+          "title": {
+            "type": "string",
+            "description": "Display title."
+          }
+        }
+      },
       "ApiActiveGpu": {
         "type": "object",
         "description": "The GPU live sessions are encoding on right now.",
@@ -4126,6 +4331,33 @@
           }
         }
       },
+      "EndGameRequest": {
+        "type": "object",
+        "description": "Request body for `endGame`.",
+        "properties": {
+          "app_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Store-qualified library id (`steam:570`) to end; omit to end every waiting game."
+          }
+        }
+      },
+      "EndGameResult": {
+        "type": "object",
+        "description": "Result of an `endGame`.",
+        "required": [
+          "ended"
+        ],
+        "properties": {
+          "ended": {
+            "type": "integer",
+            "description": "How many waiting games were ended.",
+            "minimum": 0
+          }
+        }
+      },
       "EventKind": {
         "oneOf": [
           {
@@ -4237,6 +4469,48 @@
               },
               "stream": {
                 "$ref": "#/components/schemas/StreamRef"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "A launched game was confirmed running — fires once per launch, after the host has actually\nseen the game's process (not merely spawned its launcher).",
+            "required": [
+              "game",
+              "kind"
+            ],
+            "properties": {
+              "game": {
+                "$ref": "#/components/schemas/GameRefPayload"
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "game.running"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "A launched game is gone. `reason` distinguishes the player quitting from the host ending it\nper the lifetime policy.",
+            "required": [
+              "game",
+              "reason",
+              "kind"
+            ],
+            "properties": {
+              "game": {
+                "$ref": "#/components/schemas/GameRefPayload"
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "game.exited"
+                ]
+              },
+              "reason": {
+                "$ref": "#/components/schemas/GameEndReason"
               }
             }
           },
@@ -4432,6 +4706,14 @@
         ],
         "description": "The event catalog (RFC §4). Serialized internally tagged as `\"kind\": \"<domain>.<verb>\"`,\nflattened into [`HostEvent`]. **Additive-only** within [`SCHEMA_VERSION`]."
       },
+      "GameEndReason": {
+        "type": "string",
+        "description": "Why a launched game is no longer running.",
+        "enum": [
+          "exited",
+          "terminated"
+        ]
+      },
       "GameEntry": {
         "type": "object",
         "description": "One title in the unified library, regardless of which store it came from.",
@@ -4475,6 +4757,51 @@
           },
           "title": {
             "type": "string"
+          }
+        }
+      },
+      "GameOnSessionEnd": {
+        "type": "string",
+        "description": "What to do with the launched game when its session ends.",
+        "enum": [
+          "keep",
+          "on_quit",
+          "always"
+        ]
+      },
+      "GameRefPayload": {
+        "type": "object",
+        "description": "A launched game, as the `game.*` events see it.",
+        "required": [
+          "title",
+          "client",
+          "plane"
+        ],
+        "properties": {
+          "app": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Store-qualified library id (`steam:570`). Absent for an operator-typed GameStream\n`apps.json` command, which has no library entry behind it."
+          },
+          "client": {
+            "type": "string",
+            "description": "Client-supplied device name of the session that launched it; may be empty."
+          },
+          "plane": {
+            "$ref": "#/components/schemas/Plane"
+          },
+          "store": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Which store surfaced it (`steam`, `heroic`, `custom`, …), when known."
+          },
+          "title": {
+            "type": "string",
+            "description": "Display title."
           }
         }
       },
@@ -5732,7 +6059,8 @@
           "audio_streaming",
           "pin_pending",
           "paired_clients",
-          "active_sessions"
+          "active_sessions",
+          "games"
         ],
         "properties": {
           "active_sessions": {
@@ -5744,6 +6072,13 @@
           "audio_streaming": {
             "type": "boolean",
             "description": "True while the audio stream thread is running."
+          },
+          "games": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ActiveGame"
+            },
+            "description": "Every launched game the host is tracking: one row per live session that launched a title, plus\nany game whose session has ended and which is waiting out its reconnect window before being\nended (`state: \"grace\"`). Empty when nothing was launched — a plain desktop stream has no game."
           },
           "paired_clients": {
             "type": "integer",
@@ -5911,6 +6246,57 @@
           "mode": {
             "type": "string",
             "description": "Negotiated mode, `WxH@Hz` (e.g. `\"3840x2160@120\"`)."
+          }
+        }
+      },
+      "SessionSettings": {
+        "type": "object",
+        "description": "The persisted settings.",
+        "properties": {
+          "disconnect_grace_seconds": {
+            "type": "integer",
+            "format": "int32",
+            "description": "How long a vanished client has to reconnect before `Always` ends its game. Ignored by the\nother two policies.",
+            "minimum": 0
+          },
+          "game_on_session_end": {
+            "$ref": "#/components/schemas/GameOnSessionEnd",
+            "description": "End the launched game when the session ends. See [`GameOnSessionEnd`]."
+          },
+          "session_on_game_exit": {
+            "type": "boolean",
+            "description": "End the streaming session when the launched game exits."
+          },
+          "version": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          }
+        }
+      },
+      "SessionSettingsState": {
+        "type": "object",
+        "description": "The session⇄game lifetime settings, plus which axes this build acts on.",
+        "required": [
+          "settings",
+          "configured",
+          "enforced"
+        ],
+        "properties": {
+          "configured": {
+            "type": "boolean",
+            "description": "Whether an operator has ever saved these settings (`false` ⇒ `settings` are the defaults)."
+          },
+          "enforced": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Which fields this build actually enforces. Empty on a platform with no launch path (macOS),\nso the console can say so instead of offering a switch that does nothing."
+          },
+          "settings": {
+            "$ref": "#/components/schemas/SessionSettings",
+            "description": "The stored settings (or the built-in defaults when this host has never been configured)."
           }
         }
       },

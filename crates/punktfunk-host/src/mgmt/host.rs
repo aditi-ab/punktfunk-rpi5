@@ -112,6 +112,38 @@ pub(crate) struct RuntimeStatus {
     /// The active stream's parameters — RTSP-negotiated for GameStream, or the live native session's
     /// mode/codec/bitrate. `null` when nothing is streaming.
     stream: Option<StreamInfo>,
+    /// Every launched game the host is tracking: one row per live session that launched a title, plus
+    /// any game whose session has ended and which is waiting out its reconnect window before being
+    /// ended (`state: "grace"`). Empty when nothing was launched — a plain desktop stream has no game.
+    games: Vec<ActiveGame>,
+}
+
+/// One launched game, for the console's running-game card.
+#[derive(Serialize, ToSchema)]
+pub(crate) struct ActiveGame {
+    /// The session streaming it; `null` for a game waiting out its reconnect window.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_id: Option<u64>,
+    /// Client-supplied device name of the session that launched it; may be empty.
+    client: String,
+    /// Store-qualified library id (`steam:570`) — the key the console matches against `GET /library`
+    /// to show box art. Absent for an operator-typed GameStream command.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    app_id: Option<String>,
+    /// Display title.
+    title: String,
+    /// Which store surfaced it (`steam`, `heroic`, `custom`, …), when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    store: Option<String>,
+    /// `native` or `gamestream`.
+    plane: crate::events::Plane,
+    /// `launching` (launched, not seen running yet), `running`, `exited`, or `grace` (its session is
+    /// gone and it will be ended when the reconnect window closes).
+    #[schema(example = "running")]
+    state: String,
+    /// Seconds until this game is ended — only present on a `grace` row.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    grace_remaining_s: Option<u64>,
 }
 
 /// Client-requested launch parameters (key material is never exposed here).
@@ -373,6 +405,19 @@ pub(crate) async fn get_status(State(st): State<Arc<MgmtState>>) -> Json<Runtime
         active_sessions: native.len() as u32 + u32::from(gs_video),
         session,
         stream,
+        games: crate::session_status::games()
+            .into_iter()
+            .map(|g| ActiveGame {
+                session_id: g.session_id,
+                client: g.client,
+                app_id: g.app_id,
+                title: g.title,
+                store: g.store,
+                plane: g.plane,
+                state: g.state.to_string(),
+                grace_remaining_s: g.grace_remaining_s,
+            })
+            .collect(),
     })
 }
 

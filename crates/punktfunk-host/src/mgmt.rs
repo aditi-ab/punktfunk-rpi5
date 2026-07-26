@@ -214,6 +214,11 @@ fn api_router_parts() -> (Router<Arc<MgmtState>>, utoipa::openapi::OpenApi) {
                 .routes(routes!(native::deny_pending_device))
                 .routes(routes!(session::stop_session))
                 .routes(routes!(session::request_idr))
+                .routes(routes!(
+                    session::get_session_settings,
+                    session::set_session_settings
+                ))
+                .routes(routes!(session::end_game))
                 .routes(routes!(library::get_library))
                 .routes(routes!(library::list_library_scanners))
                 .routes(routes!(library::set_library_scanner))

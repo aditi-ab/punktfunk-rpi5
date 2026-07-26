@@ -61,6 +61,16 @@ pub struct ProviderEntryInput {
 
 impl From<CustomEntry> for GameEntry {
     fn from(c: CustomEntry) -> Self {
+        // A custom/provider entry is spawned by the host itself, so its own child process is the
+        // primary lifetime signal; this is the fallback for a command that hands off and exits (a
+        // launcher script, a `flatpak run`). An absolute exe in the command line is the only thing
+        // safe to infer — providers can supply richer signals explicitly (design §9, phase 4).
+        let detect = c
+            .launch
+            .as_ref()
+            .filter(|l| l.kind == "command")
+            .map(|l| crate::library::spec_from_command(&l.value))
+            .unwrap_or_default();
         GameEntry {
             id: format!("custom:{}", c.id),
             store: "custom".into(),
@@ -68,6 +78,7 @@ impl From<CustomEntry> for GameEntry {
             art: c.art,
             launch: c.launch,
             provider: c.provider,
+            detect,
         }
     }
 }

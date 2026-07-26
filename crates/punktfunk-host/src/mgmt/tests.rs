@@ -306,17 +306,20 @@ fn fake_native_session(
     fps: u32,
 ) -> crate::session_status::LiveSessionGuard {
     let packed = ((width as u64) << 32) | ((height as u64) << 16) | fps as u64;
-    crate::session_status::register(
-        Arc::new(std::sync::atomic::AtomicU64::new(packed)),
-        Arc::new(std::sync::atomic::AtomicU32::new(20_000)),
-        Codec::H265,
-        Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        "test-client".into(),
-        false,
-        Arc::new(std::sync::atomic::AtomicU32::new(0)),
-        Arc::new(std::sync::atomic::AtomicU32::new(0)),
-    )
+    crate::session_status::register(crate::session_status::Registration {
+        mode: Arc::new(std::sync::atomic::AtomicU64::new(packed)),
+        bitrate_kbps: Arc::new(std::sync::atomic::AtomicU32::new(20_000)),
+        codec: Codec::H265,
+        stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        quit: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        force_idr: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        client: "test-client".into(),
+        hdr: false,
+        ttff_ms: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        last_resize_ms: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        // No launch: a desktop stream, which must show no game row.
+        game: None,
+    })
 }
 
 /// A native (punktfunk/1) session — the DEFAULT plane — must read as streaming in the tray's

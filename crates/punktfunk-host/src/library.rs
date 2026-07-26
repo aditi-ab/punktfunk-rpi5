@@ -22,6 +22,7 @@ pub(crate) use utoipa::ToSchema;
 
 mod art;
 mod custom;
+mod detect;
 #[cfg(windows)]
 mod epic;
 #[cfg(windows)]
@@ -38,6 +39,7 @@ mod xbox;
 
 pub use art::*;
 pub use custom::*;
+pub use detect::*;
 #[cfg(windows)]
 pub use epic::*;
 #[cfg(windows)]
@@ -102,6 +104,15 @@ pub struct GameEntry {
     /// console uses it for attribution; `GET /library?provider=` filters on it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
+    /// How to recognize this title's process(es) once it is running ([`DetectSpec`]) — filled in by
+    /// each provider from paths it already read while scanning.
+    ///
+    /// **Host-internal: never serialized.** It names local filesystem paths, so it stays out of both
+    /// the catalog JSON the client renders and the OpenAPI schema; it rides here only so the
+    /// providers that already hold this data don't have to be re-scanned.
+    #[serde(skip)]
+    #[schema(ignore)]
+    pub detect: DetectSpec,
 }
 
 /// A store that contributes titles to the library. The trait is the extension point for future

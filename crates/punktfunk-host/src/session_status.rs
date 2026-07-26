@@ -33,6 +33,10 @@ struct LiveSession {
     codec: Codec,
     /// The session's teardown flag ([`stop_all`] → mgmt `DELETE /session`).
     stop: Arc<AtomicBool>,
+    /// The session's *deliberate*-stop flag ([`stop_all_quit`]). Distinct from `stop`: it marks the
+    /// teardown as intended rather than a drop, which is what skips the display's keep-alive linger
+    /// and what the end-game-on-session-end policy keys off.
+    quit: Arc<AtomicBool>,
     /// One-shot force-keyframe flag ([`force_idr_all`] → mgmt `POST /session/idr`); the encode loop
     /// drains it alongside a client's decode-recovery keyframe request.
     force_idr: Arc<AtomicBool>,
@@ -45,6 +49,9 @@ struct LiveSession {
     ttff_ms: Arc<AtomicU32>,
     /// Most recent completed mid-stream resize (reconfigure → pipeline rebuilt), ms; 0 = none yet.
     last_resize_ms: Arc<AtomicU32>,
+    /// The launched game's lease, when this session launched a title — so `/status` can report what
+    /// is actually running and the console can show it (design/session-game-lifetime.md §8a).
+    game: Option<Arc<crate::gamelease::LeaseShared>>,
 }
 
 /// A resolved read of one live session, for the `/status` view.
@@ -82,21 +89,49 @@ fn session_ref(s: &LiveSession) -> crate::events::SessionRef {
     }
 }
 
+/// What [`register`] needs to publish a session. A named struct rather than a positional argument
+/// list: half of these are same-typed `Arc<Atomic…>` handles, so a transposed pair would compile
+/// cleanly and quietly report the wrong number on the Dashboard.
+pub struct Registration {
+    /// Packed `w:16|h:16|hz:16` ([`crate::native::pack_mode`]); updated on a mode switch.
+    pub mode: Arc<AtomicU64>,
+    /// Live encoder target (kbps); updated on an adaptive-bitrate change.
+    pub bitrate_kbps: Arc<AtomicU32>,
+    pub codec: Codec,
+    /// Teardown flag ([`stop_all`]).
+    pub stop: Arc<AtomicBool>,
+    /// Deliberate-stop flag ([`stop_all_quit`]).
+    pub quit: Arc<AtomicBool>,
+    /// One-shot force-keyframe flag ([`force_idr_all`]).
+    pub force_idr: Arc<AtomicBool>,
+    /// Short client label (cert-fingerprint prefix / peer IP).
+    pub client: String,
+    pub hdr: bool,
+    /// Bring-up total slot (hello → first packet), ms.
+    pub ttff_ms: Arc<AtomicU32>,
+    /// Most recent mid-stream resize total, ms.
+    pub last_resize_ms: Arc<AtomicU32>,
+    /// The launched game's lease, when this session launched a title.
+    pub game: Option<Arc<crate::gamelease::LeaseShared>>,
+}
+
 /// Registers a live native session; the returned guard removes it on drop (session end).
 /// Emits the `session.started` lifecycle event; the guard's drop emits `session.ended` — RAII,
 /// so every exit path (return, `?`, panic-unwind) pairs them.
-#[allow(clippy::too_many_arguments)]
-pub fn register(
-    mode: Arc<AtomicU64>,
-    bitrate_kbps: Arc<AtomicU32>,
-    codec: Codec,
-    stop: Arc<AtomicBool>,
-    force_idr: Arc<AtomicBool>,
-    client: String,
-    hdr: bool,
-    ttff_ms: Arc<AtomicU32>,
-    last_resize_ms: Arc<AtomicU32>,
-) -> LiveSessionGuard {
+pub fn register(reg: Registration) -> LiveSessionGuard {
+    let Registration {
+        mode,
+        bitrate_kbps,
+        codec,
+        stop,
+        quit,
+        force_idr,
+        client,
+        hdr,
+        ttff_ms,
+        last_resize_ms,
+        game,
+    } = reg;
     let id = next_id();
     let session = LiveSession {
         id,
@@ -104,11 +139,13 @@ pub fn register(
         bitrate_kbps,
         codec,
         stop,
+        quit,
         force_idr,
         client,
         hdr,
         ttff_ms,
         last_resize_ms,
+        game,
     };
     crate::events::emit(crate::events::EventKind::SessionStarted {
         session: session_ref(&session),
@@ -167,10 +204,85 @@ pub fn snapshot() -> Vec<SessionSnapshot> {
         .collect()
 }
 
-/// Signals every live native session to tear down (mgmt `DELETE /session`). Best-effort: the video
-/// + send loops observe the flag and exit, ending the stream; the guard then clears the entry.
+/// One launched game, as `/status` reports it.
+pub struct GameSnapshot {
+    /// The session streaming it, or `None` for a game whose session is gone and which is waiting out
+    /// its reconnect window.
+    pub session_id: Option<u64>,
+    pub client: String,
+    pub app_id: Option<String>,
+    pub title: String,
+    pub store: Option<String>,
+    pub plane: crate::events::Plane,
+    /// `launching` / `running` / `exited`, or `grace` for a game on its reconnect window.
+    pub state: &'static str,
+    /// Seconds left before the game is ended, for a `grace` row.
+    pub grace_remaining_s: Option<u64>,
+}
+
+/// Every launched game the host currently knows about: the live sessions' games first, then any game
+/// whose session has ended and which is waiting out its reconnect window before being ended.
+///
+/// The two sources are deliberately separate — a grace-pending game has no session to attribute it
+/// to, and hiding it would make "the host is about to close my game" invisible in the UI.
+pub fn games() -> Vec<GameSnapshot> {
+    let mut out: Vec<GameSnapshot> = registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter_map(|s| {
+            let g = s.game.as_ref()?;
+            Some(GameSnapshot {
+                session_id: Some(s.id),
+                client: g.client.clone(),
+                app_id: g.game.id.clone(),
+                title: g.game.title.clone(),
+                store: g.game.store.clone(),
+                plane: g.plane,
+                state: g.state().as_str(),
+                grace_remaining_s: None,
+            })
+        })
+        .collect();
+    out.extend(
+        crate::gamelease::pending_snapshot()
+            .into_iter()
+            .map(|(g, remaining)| GameSnapshot {
+                session_id: None,
+                client: g.client.clone(),
+                app_id: g.game.id.clone(),
+                title: g.game.title.clone(),
+                store: g.game.store.clone(),
+                plane: g.plane,
+                state: "grace",
+                grace_remaining_s: Some(remaining),
+            }),
+    );
+    out
+}
+
+/// Signals every live native session to tear down. Best-effort: the video + send loops observe the
+/// flag and exit, ending the stream; the guard then clears the entry.
+///
+/// This is the *drop*-flavored stop — the session ends, but nothing treats it as intended. Prefer
+/// [`stop_all_quit`] for an operator action.
 pub fn stop_all() {
     for s in registry().lock().unwrap().iter() {
+        s.stop.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Signals every live native session to tear down **deliberately** (mgmt `DELETE /session`, the
+/// console's and a plugin's Stop).
+///
+/// An operator pressing Stop is a decision, and the host now says so: `quit` before `stop` makes the
+/// teardown look exactly like a client's own Stop, so the display skips its keep-alive linger and the
+/// end-game-on-session-end policy sees an intent rather than a network drop. (Before this, a
+/// management stop was indistinguishable from a client vanishing, which left the display lingering
+/// for a session nobody was coming back to.)
+pub fn stop_all_quit() {
+    for s in registry().lock().unwrap().iter() {
+        s.quit.store(true, Ordering::SeqCst);
         s.stop.store(true, Ordering::SeqCst);
     }
 }
