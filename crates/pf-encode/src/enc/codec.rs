@@ -307,8 +307,11 @@ pub struct EncoderCaps {
     ///
     /// This makes the answer queryable instead of assumed. It is deliberately a plain fact about the
     /// encoder, not a policy: what to DO when a session wants blending and the backend cannot is the
-    /// host's call, since only the host can re-plan capture (fall back to capturer-side compositing).
-    /// `open_video` can only warn, which it does.
+    /// host's call, since only the host can re-plan capture. That call is wired now — the
+    /// negotiation consults the pre-open mirror ([`cursor_blend_capable`](crate::cursor_blend_capable))
+    /// to gate the cursor channel and to keep capture on embedded-cursor / CSC-capable shapes for
+    /// any backend that can't blend; `open_video`'s post-open check remains as the backstop for
+    /// open-time fallbacks the plan can't see.
     pub blends_cursor: bool,
 }
 

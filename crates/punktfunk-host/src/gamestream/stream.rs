@@ -33,10 +33,14 @@ pub struct StreamConfig {
     pub hdr: bool,
 }
 
+/// A pooled capturer plus the two PipeWire-negotiation-time properties reuse must match on —
+/// its HDR-ness and its metadata-cursor mode; a mismatch on either needs a fresh screencast
+/// session (see `AppState::video_cap`).
+pub type PooledCapturer = (Box<dyn Capturer>, bool, bool);
+
 /// Slot for the persistent screen capturer, shared with the control plane and reused across
-/// streams so a reconnect doesn't open a second (conflicting) screencast session. The `bool` is
-/// the pooled capturer's HDR-ness (see `AppState::video_cap`).
-pub type CapturerSlot = Arc<std::sync::Mutex<Option<(Box<dyn Capturer>, bool)>>>;
+/// streams so a reconnect doesn't open a second (conflicting) screencast session.
+pub type CapturerSlot = Arc<std::sync::Mutex<Option<PooledCapturer>>>;
 
 /// A pending client reference-frame-invalidation range (lost `firstFrame..=lastFrame`), set by the
 /// control plane and drained by the video thread (see [`AppState::rfi_range`](super::AppState)).
@@ -136,7 +140,7 @@ fn run(
     running: &Arc<AtomicBool>,
     force_idr: &AtomicBool,
     rfi_range: &std::sync::Mutex<Option<(i64, i64)>>,
-    video_cap: &std::sync::Mutex<Option<(Box<dyn Capturer>, bool)>>,
+    video_cap: &std::sync::Mutex<Option<PooledCapturer>>,
     // Shared stats recorder for the web-console capture/graph. Threaded into `stream_body` (the
     // encode loop); per-frame sample emission is wired by a later pass.
     stats: &Arc<crate::stats_recorder::StatsRecorder>,
@@ -250,6 +254,12 @@ fn run(
         return stream_body(
             &mut capturer,
             Some(&rebuild),
+            // The virtual-output source never selects cursor-as-metadata (`set_hw_cursor` is
+            // never called → the compositor EMBEDS the pointer where it can), so the encoder
+            // is handed nothing to composite. gamescope remains the pointerless residual —
+            // its capture carries no cursor either way (the native plane's XFixes source is
+            // not wired on this plane).
+            false,
             &sock,
             cfg,
             running,
@@ -266,13 +276,34 @@ fn run(
     // pooled capturer's HDR-ness matching this stream's negotiated `cfg.hdr` — the depth is a
     // PipeWire-negotiation-time property of the screencast session, so an HDR↔SDR change needs a
     // fresh session (same pattern as the audio capturer's channel-count gate).
+    // Cursor-as-metadata only where the encode backend this session resolves to composites
+    // `frame.cursor` (the caps-aware negotiation — mirror of the native plane's); otherwise ask
+    // the portal to EMBED the pointer so no backend × cursor-mode combination streams
+    // cursorless. Synthetic frames carry no pointer either way.
+    let metadata_cursor = {
+        #[cfg(target_os = "linux")]
+        {
+            // Same CUDA-payload prediction SessionPlan/`handshake::cursor_forward` make:
+            // the NVIDIA resolution plus the zero-copy master switch.
+            let cuda_planned =
+                !crate::encode::linux_zero_copy_is_vaapi() && crate::zerocopy::enabled();
+            crate::encode::cursor_blend_capable(cfg.codec, cuda_planned, cfg.hdr)
+        }
+        #[cfg(not(target_os = "linux"))]
+        false
+    };
     let pooled = match video_cap.lock().unwrap().take() {
-        Some((c, was_hdr)) if was_hdr == cfg.hdr => Some(c),
-        Some((c, was_hdr)) => {
+        Some((c, was_hdr, was_meta)) if was_hdr == cfg.hdr && was_meta == metadata_cursor => {
+            Some(c)
+        }
+        Some((c, was_hdr, was_meta)) => {
             tracing::info!(
                 was_hdr,
                 want_hdr = cfg.hdr,
-                "video source: pooled capturer depth mismatch — opening a fresh screencast session"
+                was_metadata_cursor = was_meta,
+                want_metadata_cursor = metadata_cursor,
+                "video source: pooled capturer depth/cursor-mode mismatch — opening a fresh \
+                 screencast session"
             );
             drop(c);
             None
@@ -285,8 +316,13 @@ fn run(
             c
         }
         None if pf_host_config::config().video_source.as_deref() == Some("portal") => {
-            tracing::info!(hdr = cfg.hdr, "video source: portal desktop capture");
-            capture::open_portal_monitor(cfg.hdr).context("open portal capturer")?
+            tracing::info!(
+                hdr = cfg.hdr,
+                metadata_cursor,
+                "video source: portal desktop capture"
+            );
+            capture::open_portal_monitor(cfg.hdr, metadata_cursor)
+                .context("open portal capturer")?
         }
         None => {
             tracing::info!("video source: synthetic test pattern");
@@ -298,6 +334,7 @@ fn run(
     let result = stream_body(
         &mut capturer,
         None,
+        metadata_cursor,
         &sock,
         cfg,
         running,
@@ -308,7 +345,7 @@ fn run(
         on_lost,
     );
     capturer.set_active(false);
-    *video_cap.lock().unwrap() = Some((capturer, cfg.hdr));
+    *video_cap.lock().unwrap() = Some((capturer, cfg.hdr, metadata_cursor));
     result
 }
 
@@ -646,6 +683,10 @@ fn stream_body(
     // Re-open the video source on capture loss (virtual-display path → follow a Desktop<->Game switch);
     // `None` for the portal/synthetic source, which has nothing to re-detect (propagate the error).
     rebuild: Option<&dyn Fn() -> Result<Box<dyn Capturer>>>,
+    // The capture hands the encoder cursor bitmaps to composite (cursor-as-metadata negotiated
+    // because the resolved backend blends — see the callers). `false` = the pointer is embedded
+    // in the pixels (or absent), so the encoder is asked to composite nothing.
+    cursor_blend: bool,
     sock: &UdpSocket,
     cfg: StreamConfig,
     running: &Arc<AtomicBool>,
@@ -681,9 +722,9 @@ fn stream_body(
         // GameStream/Moonlight stays 4:2:0 — stock Moonlight clients can't decode 4:4:4, and the
         // Windows IDD-push capturer can't yet deliver full-chroma frames. 4:4:4 is punktfunk/1-native only.
         encode::ChromaFormat::Yuv420,
-        // Desktop monitor capture negotiates cursor-as-metadata where available — the encoder
-        // may be handed cursor bitmaps to composite.
-        true,
+        // True only when THIS session's capture negotiated cursor-as-metadata — which the
+        // callers grant only where the resolved backend composites (`cursor_blend_capable`).
+        cursor_blend,
     )
     .context("open video encoder for stream")?;
     // Tell the encoder how deep the capturer lets it pipeline. Without this an in-place backend
@@ -855,7 +896,7 @@ fn stream_body(
                     frame.is_cuda(),
                     gs_bit_depth(frame.format),
                     encode::ChromaFormat::Yuv420, // GameStream stays 4:2:0
-                    true,                         // metadata-cursor capture — see the first open
+                    cursor_blend,                 // same capture cursor mode — see the first open
                 )
                 .context("reopen encoder after rebuild")?;
                 // A rebuilt encoder starts unconfigured — same reason as the first open above.

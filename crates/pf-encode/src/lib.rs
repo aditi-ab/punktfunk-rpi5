@@ -203,14 +203,15 @@ pub fn open_video(
         }
     };
     // The session asked for a composited pointer; say so loudly if the backend that actually opened
-    // cannot deliver one. `cursor_blend` was a REQUEST with no answer for most of this crate's life
-    // (`let _ = cursor_blend;` below), and the result was a stream with no mouse cursor and nothing
-    // in the logs — confirmed on the VAAPI dmabuf path and the libav-NVENC CUDA path.
-    //
-    // A warning is deliberately all this does. `open_video` cannot re-plan capture, so refusing here
-    // would only trade a missing pointer for a dead session; the host owns `plan.cursor_blend` and is
-    // the only layer that can fall back to capturer-side compositing. This makes the condition
-    // visible and queryable (`EncoderCaps::blends_cursor`) so that decision can be made upstream.
+    // cannot deliver one. Since the negotiation became caps-aware ([`cursor_blend_capable`] gates
+    // the cursor channel, and the session plan keeps cursor sessions off the native-NV12/RGB-direct
+    // shapes), no PLANNED path reaches this: capture negotiates embedded-cursor mode wherever the
+    // resolved backend can't blend. What remains reachable is the open-time divergence the plan
+    // cannot see — a Vulkan Video open failing back to VAAPI mid-`open_amd_intel`, and the
+    // gamescope residual (gamescope has no embedded mode, so a never-blending backend there —
+    // H.264→VAAPI, software — still streams cursorless). This is the backstop that keeps those
+    // honest in the logs; `open_video` cannot re-plan capture, so a warning is deliberately all
+    // it does.
     if cursor_blend && !inner.caps().blends_cursor {
         tracing::warn!(
             backend,
@@ -989,6 +990,87 @@ pub fn linux_native_nv12_ok(codec: Codec) -> bool {
     }
 }
 
+/// Whether the encode backend this session will resolve to composites [`CapturedFrame::cursor`]
+/// ([`EncoderCaps::blends_cursor`]) — answered BEFORE capture opens, so the host plans cursor
+/// delivery honestly instead of discovering a cursorless stream after the fact (the
+/// `blends_cursor` audit finding): a blend-capable backend takes cursor-as-metadata capture
+/// (pointer-free frames + host composite on demand — the cursor channel's contract); for
+/// anything else the host must have the compositor EMBED the pointer. The sibling verdict of
+/// [`linux_native_nv12_ok`], threaded into the same negotiation.
+///
+/// `cuda_planned` is the caller's prediction of a CUDA capture payload (NVIDIA + zero-copy — the
+/// prediction `SessionPlan` already makes); `ten_bit` the negotiated depth. Both shift the
+/// dispatch: a CPU payload keeps NVIDIA on libav NVENC (no blend), and a 10-bit HDR session
+/// skips Vulkan Video for libav VAAPI's P010/Main10 wiring (no blend).
+#[cfg(target_os = "linux")]
+pub fn cursor_blend_capable(codec: Codec, cuda_planned: bool, ten_bit: bool) -> bool {
+    // A negotiated PyroWave session routes to that backend before the pref is consulted
+    // (`open_video_backend_linux`), and its wavelet CSC composites the metadata cursor.
+    if codec == Codec::PyroWave {
+        return true;
+    }
+    let direct_nvenc = {
+        #[cfg(feature = "nvenc")]
+        {
+            nvenc_direct_enabled()
+        }
+        #[cfg(not(feature = "nvenc"))]
+        {
+            false
+        }
+    };
+    let vulkan_csc = {
+        // The compute-CSC arm — the one that blends. Eligibility mirrors `open_amd_intel`;
+        // the device probe runs last (it opens a Vulkan instance, cached per GPU+codec).
+        #[cfg(feature = "vulkan-encode")]
+        {
+            matches!(codec, Codec::H265 | Codec::Av1)
+                && vulkan_encode_enabled()
+                && vulkan_encode_available(codec)
+        }
+        #[cfg(not(feature = "vulkan-encode"))]
+        {
+            false
+        }
+    };
+    let backend = resolve_linux_backend(
+        pf_host_config::config().encoder_pref.as_str(),
+        linux_auto_is_vaapi,
+        cuda_planned,
+    );
+    cursor_blend_capable_for(backend, cuda_planned, ten_bit, direct_nvenc, vulkan_csc)
+}
+
+/// The dispatch-mirroring core of [`cursor_blend_capable`], device-free for the unit tests.
+/// `direct_nvenc` = the direct-SDK NVENC path is compiled in and enabled; `vulkan_csc` = the
+/// Vulkan Video compute-CSC arm (the one that blends) is compiled in, enabled, and
+/// device-supported for the session's codec.
+#[cfg(target_os = "linux")]
+fn cursor_blend_capable_for(
+    backend: Option<LinuxBackend>,
+    cuda_planned: bool,
+    ten_bit: bool,
+    direct_nvenc: bool,
+    vulkan_csc: bool,
+) -> bool {
+    match backend {
+        // The wavelet CSC composites the metadata cursor (`linux/pyrowave.rs`).
+        Some(LinuxBackend::Pyrowave) => true,
+        // Only the direct-SDK arm blends (VkSlotBlend), and it only takes CUDA payloads —
+        // a CPU-payload session stays on libav NVENC, which cannot blend.
+        Some(LinuxBackend::Nvenc) => cuda_planned && direct_nvenc,
+        // The Vulkan Video compute-CSC path blends; a 10-bit HDR session skips it for libav
+        // VAAPI (no blend). The session plan keeps a cursor-blend session off the native-NV12
+        // and RGB-direct shapes (`SessionPlan::output_format` / `VulkanVideoEncoder::open`),
+        // so CSC eligibility IS the answer.
+        Some(LinuxBackend::AmdIntel) | Some(LinuxBackend::Vulkan) => !ten_bit && vulkan_csc,
+        // CPU frames: the capturer composites the metadata cursor inline before the encoder
+        // runs, but the ENCODER blends nothing — the cursor channel's on-demand composite
+        // contract can't be honored. Report the encoder's truth.
+        Some(LinuxBackend::Software) | None => false,
+    }
+}
+
 /// Can this GPU + driver actually open a Vulkan Video **encode** session for `codec`? Cached per
 /// (selected GPU, codec) — the [`can_encode_10bit`] idiom, with the probe run outside the lock.
 ///
@@ -1752,6 +1834,72 @@ mod tests {
             av1: false,
         };
         assert_eq!(none.wire_mask(), None);
+    }
+
+    /// The cursor-blend capability mirror, arm by arm — the table the caps-aware negotiation
+    /// (cursor channel grant, metadata-vs-embedded capture) stands on. Each row names the arm's
+    /// blending stage or the reason there is none.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cursor_blend_capability_mirrors_the_dispatch() {
+        use LinuxBackend::*;
+        // PyroWave: the wavelet CSC composites, always.
+        assert!(cursor_blend_capable_for(
+            Some(Pyrowave),
+            false,
+            false,
+            false,
+            false
+        ));
+        // NVIDIA: only the direct-SDK arm blends (VkSlotBlend), and only for CUDA payloads.
+        assert!(cursor_blend_capable_for(
+            Some(Nvenc),
+            true,
+            false,
+            true,
+            false
+        ));
+        assert!(
+            !cursor_blend_capable_for(Some(Nvenc), false, false, true, false),
+            "a CPU payload stays on libav NVENC, which cannot blend"
+        );
+        assert!(
+            !cursor_blend_capable_for(Some(Nvenc), true, false, false, false),
+            "PUNKTFUNK_NVENC_DIRECT=0 (or a build without the feature) is the libav path"
+        );
+        // AMD/Intel: the Vulkan Video compute-CSC arm blends; VAAPI never does.
+        assert!(cursor_blend_capable_for(
+            Some(AmdIntel),
+            false,
+            false,
+            false,
+            true
+        ));
+        assert!(
+            !cursor_blend_capable_for(Some(AmdIntel), false, false, false, false),
+            "no eligible Vulkan CSC arm (H.264, PUNKTFUNK_VULKAN_ENCODE=0, unsupported \
+             device) resolves to libav VAAPI, which cannot blend"
+        );
+        assert!(
+            !cursor_blend_capable_for(Some(AmdIntel), false, true, false, true),
+            "a 10-bit HDR session skips Vulkan Video for VAAPI's P010 wiring — no blend"
+        );
+        assert!(cursor_blend_capable_for(
+            Some(Vulkan),
+            false,
+            false,
+            false,
+            true
+        ));
+        // Software / unknown pref: CPU frames; the encoder blends nothing.
+        assert!(!cursor_blend_capable_for(
+            Some(Software),
+            false,
+            false,
+            true,
+            true
+        ));
+        assert!(!cursor_blend_capable_for(None, false, false, true, true));
     }
 
     /// WP7.7 guard (the cheap half): every `Encoder` trait method must be explicitly forwarded by

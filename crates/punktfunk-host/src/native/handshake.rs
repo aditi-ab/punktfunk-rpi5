@@ -12,31 +12,46 @@ use super::*;
 /// the client asked ([`CLIENT_CAP_CURSOR`](punktfunk_core::quic::CLIENT_CAP_CURSOR)) AND the
 /// capture path can deliver cursor metadata separately from the frame — the Linux portal
 /// `SPA_META_Cursor` path (not gamescope, whose capture paints no cursor at all), or Windows
-/// with a proto-v5 pf-vdisplay driver (the IddCx hardware-cursor channel, M2c). THE single
-/// predicate: the Welcome's `HOST_CAP_CURSOR` bit and the session's forwarding/blend-off
-/// wiring both read it, so they can never disagree.
+/// with a proto-v5 pf-vdisplay driver (the IddCx hardware-cursor channel, M2c) — AND, on
+/// Linux, the encode backend this session resolves to can composite the pointer on demand
+/// (`encode::cursor_blend_capable`): the channel's capture-mouse flip (`CursorRenderMode`,
+/// `client_draws = false`) makes the HOST draw the pointer, and on Linux the encoder is that
+/// compositing stage — granting the channel over a backend that can't blend (libav
+/// VAAPI/NVENC, software) shipped a cursorless stream on every capture-mode flip. Denied, the
+/// session keeps the pre-channel path: the compositor EMBEDS the pointer and the client never
+/// draws — never cursorless, never doubled. THE single predicate: the Welcome's
+/// `HOST_CAP_CURSOR` bit is computed from it, and the session wiring reads that bit back.
 pub(super) fn cursor_forward(
     client_caps: u8,
     compositor: Option<crate::vdisplay::Compositor>,
+    codec: crate::encode::Codec,
+    bit_depth: u8,
 ) -> bool {
     if client_caps & punktfunk_core::quic::CLIENT_CAP_CURSOR == 0 {
         return false;
     }
     #[cfg(target_os = "linux")]
     {
+        // CUDA-payload prediction — the same one `SessionPlan` makes: the NVIDIA resolution
+        // plus the zero-copy master switch. It decides direct-SDK NVENC (blends) vs libav
+        // NVENC (doesn't) inside the capability mirror.
+        let cuda_planned = !crate::encode::linux_zero_copy_is_vaapi() && crate::zerocopy::enabled();
         compositor.is_some_and(|c| c != crate::vdisplay::Compositor::Gamescope)
+            && crate::encode::cursor_blend_capable(codec, cuda_planned, bit_depth == 10)
     }
     #[cfg(target_os = "windows")]
     {
         // Windows (M2c): the pf-vdisplay driver must speak the v5 hardware-cursor channel —
         // DWM composites the pointer into the IDD frame otherwise, and forwarding a second
-        // copy would double it. The probe latches by opening the control device once.
-        let _ = compositor;
+        // copy would double it. The probe latches by opening the control device once. The
+        // encoder is deliberately NOT consulted: the IDD capturer itself composites on the
+        // capture-mouse flip (`set_cursor_forward`), so no Windows encode backend blends.
+        let _ = (compositor, codec, bit_depth);
         crate::vdisplay::manager::hw_cursor_capable()
     }
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {
-        let _ = compositor;
+        let _ = (compositor, codec, bit_depth);
         false
     }
 }
@@ -488,9 +503,10 @@ pub(super) async fn negotiate(
                 0
             }
             // Cursor channel granted (client asked + this capture path can deliver cursor
-            // metadata out of the frame) — the client turns its local renderer on ONLY when
-            // it sees this bit, and serve_session wires forwarding from the same predicate.
-            | if cursor_forward(hello.client_caps, compositor) {
+            // metadata out of the frame + the resolved encoder can composite on the
+            // capture-mouse flip) — the client turns its local renderer on ONLY when it sees
+            // this bit, and serve_session wires forwarding by reading the bit back.
+            | if cursor_forward(hello.client_caps, compositor, codec, bit_depth) {
                 punktfunk_core::quic::HOST_CAP_CURSOR
             } else {
                 0
@@ -536,9 +552,9 @@ pub(super) async fn negotiate(
             let (ctx_tx, ctx_rx) = std::sync::mpsc::sync_channel::<SessionContext>(1);
             let client_identity = endpoint::peer_fingerprint(conn);
             let client_hdr = hello.display_hdr;
-            // Same predicate the Welcome's HOST_CAP_CURSOR bit used — the prepared display and
-            // the session wiring must agree with what we just advertised.
-            let cursor_fw = cursor_forward(hello.client_caps, Some(comp));
+            // The bit the Welcome just advertised — read back rather than recomputed, so the
+            // prepared display and the session wiring cannot disagree with it.
+            let cursor_fw = welcome.host_caps & punktfunk_core::quic::HOST_CAP_CURSOR != 0;
             let (mode, shard_payload) = (hello.mode, welcome.shard_payload);
             let trace = bringup.clone();
             std::thread::Builder::new()

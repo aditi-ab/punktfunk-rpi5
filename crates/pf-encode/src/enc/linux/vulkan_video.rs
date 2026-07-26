@@ -76,9 +76,11 @@ fn quality_request() -> u32 {
 /// (design/vulkan-rgb-direct-encode.md): the captured RGB frame is the encode source and the
 /// VCN EFC front-end does the 709-narrow CSC inline — no compute CSC, no plane copies, one
 /// queue submit per frame (unaligned modes go through the padded-copy staging blit). B2
-/// default: ON wherever the probe passes, EXCEPT sessions that may need the CSC's cursor
-/// blend (see [`VulkanVideoEncoder::open`]). `=0` disables outright; `=1` forces it even on
-/// cursor-blend sessions (the pointer will be missing from the stream); unset = the default.
+/// default: ON wherever the probe passes, EXCEPT sessions that need the CSC's cursor blend
+/// (see [`VulkanVideoEncoder::open`]). `=0` disables outright; `=1` forces it on non-cursor
+/// sessions; unset = the default. A cursor-blend session IGNORES `=1` — EFC cannot composite
+/// the pointer, and the caps-aware negotiation promised the client a composited one, so the
+/// pointer outranks the lab pin (the open logs the override).
 ///
 /// Parses like every sibling knob (`matches!(v.trim(), …)`): anything unrecognised — including
 /// an empty value and a value that is only whitespace — falls back to the default rather than
@@ -614,10 +616,6 @@ pub struct VulkanVideoEncoder {
     /// GPU reset (those paths keep their aligned-size sources/staging).
     native_nv12: bool,
 
-    /// One-shot warning latch: a cursor bitmap arrived on an RGB-direct or native-NV12 session
-    /// (neither has a compositing stage — the cursor will be missing from the stream until the
-    /// CSC path is used).
-    warned_cursor: bool,
     /// A [`reconfigure_bitrate`](Encoder::reconfigure_bitrate) rate not yet installed in the video
     /// session. The next `record_submit` emits an `ENCODE_RATE_CONTROL` control command carrying it
     /// (mid-stream) or folds it into the first frame's RESET+RC install, then promotes it into
@@ -671,7 +669,16 @@ impl VulkanVideoEncoder {
         cursor_blend: bool,
     ) -> Result<Self> {
         let native_nv12 = format == PixelFormat::Nv12;
-        let want_rgb = !native_nv12 && rgb_request().unwrap_or(!cursor_blend);
+        // A cursor-blend session must keep the compute-CSC path — the only arm with the cursor
+        // blend — so it outranks an explicit RGB-direct pin (EFC cannot composite; the
+        // negotiation promised the client a composited pointer).
+        if cursor_blend && rgb_request() == Some(true) {
+            tracing::info!(
+                "PUNKTFUNK_VULKAN_RGB_DIRECT=1 ignored for this session — it composites the \
+                 pointer, which the EFC front-end cannot; using the compute-CSC path"
+            );
+        }
+        let want_rgb = !native_nv12 && !cursor_blend && rgb_request().unwrap_or(true);
         Self::open_opts_inner(
             codec,
             width,
@@ -1448,7 +1455,6 @@ impl VulkanVideoEncoder {
             cpu_expand: Vec::new(),
             rgb: rgb_cfg,
             native_nv12,
-            warned_cursor: false,
             pending_bitrate: None,
             width: w,
             height: h,
@@ -2621,17 +2627,10 @@ impl VulkanVideoEncoder {
                 d.modifier
             );
         }
-        // No compositing stage exists here (like RGB-direct/EFC): gamescope embeds its pointer
-        // in the produced pixels, but any other NV12 producer's metadata cursor would be lost —
-        // say so once instead of silently.
-        if frame.cursor.is_some() && !self.warned_cursor {
-            self.warned_cursor = true;
-            tracing::warn!(
-                "cursor bitmap on a native-NV12 session — nothing composites it; the cursor \
-                 will be missing from the stream (unset PUNKTFUNK_PIPEWIRE_NV12 for \
-                 metadata-cursor captures)"
-            );
-        }
+        // No compositing stage exists here (like RGB-direct/EFC) — and none is needed: the
+        // session plan negotiates native NV12 only for a non-cursor-blend session
+        // (`SessionPlan::output_format` gates `nv12_native` on `!cursor_blend`), so no cursor
+        // bitmap ever reaches this arm. Gamescope embeds its pointer in the produced pixels.
         let dev = self.device.clone();
         let cmd = self.frames[slot].cmd;
         let fence = self.frames[slot].fence;
@@ -2691,16 +2690,9 @@ impl VulkanVideoEncoder {
         let query_pool = self.frames[slot].query_pool;
         let bs_buf = self.frames[slot].bs_buf;
         let ts_pool = self.frames[slot].ts_pool;
-        // EFC cannot composite the cursor bitmap the metadata-cursor captures hand us — say so
-        // once instead of silently losing the pointer (gamescope, the flagship, embeds it).
-        if frame.cursor.is_some() && !self.warned_cursor {
-            self.warned_cursor = true;
-            tracing::warn!(
-                "cursor bitmap on an RGB-direct session — EFC cannot composite it; the cursor \
-                 will be missing from the stream (unset PUNKTFUNK_VULKAN_RGB_DIRECT for \
-                 metadata-cursor captures)"
-            );
-        }
+        // EFC cannot composite a cursor bitmap — and never has to: `open` refuses the RGB-direct
+        // shape for a cursor-blend session (the pin override above), so no cursor bitmap ever
+        // reaches this arm. Gamescope, the flagship, embeds its pointer in the produced pixels.
         let padded = self.rgb.as_ref().is_some_and(|r| r.padded);
         // Only the padded Dmabuf arm below records timestamps (via `record_pad_blit`); the
         // CPU-upload arm records its own command buffer and writes none. Default to "not written"

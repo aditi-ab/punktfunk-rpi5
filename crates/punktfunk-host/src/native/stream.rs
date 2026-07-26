@@ -1022,8 +1022,13 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
         // pointer compositor-EMBEDDED (`vd.set_hw_cursor(false)` → no cursor metadata, nothing to
         // blend), keeping the zero-cost pre-channel path. gamescope is the exception (Phase C):
         // it can't embed the pointer, so the host ALWAYS composites the XFixes-sourced cursor —
-        // the blend must be built for every gamescope session.
-        ctx.compositor == pf_vdisplay::Compositor::Gamescope || ctx.cursor_forward,
+        // the blend must be built for every gamescope session. (`cursor_forward` is already
+        // blend-gated: `handshake::cursor_forward` grants the channel only where
+        // `encode::cursor_blend_capable` says the resolved backend composites.)
+        crate::session_plan::cursor_blend_for(
+            ctx.cursor_forward,
+            ctx.compositor == pf_vdisplay::Compositor::Gamescope,
+        ),
         ctx.cursor_forward,
     );
     // gamescope: the XFixes cursor source feeds the always-on composite (Phase C). Set after
@@ -2098,8 +2103,10 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                                         // capture-mode channel); a switch AWAY restores the prior
                                         // gating. `plan` is `Copy` — this is the value the rebuild
                                         // (and its `build_pipeline` attach) reads.
-                                        plan.cursor_blend = plan.cursor_forward
-                                            || c == crate::vdisplay::Compositor::Gamescope;
+                                        plan.cursor_blend = crate::session_plan::cursor_blend_for(
+                                            plan.cursor_forward,
+                                            c == crate::vdisplay::Compositor::Gamescope,
+                                        );
                                         plan.gamescope_cursor =
                                             c == crate::vdisplay::Compositor::Gamescope;
                                         gamescope_composite =
@@ -2987,7 +2994,10 @@ pub(super) fn prepare_display(
         // non-gamescope sessions get the pointer compositor-EMBEDDED, nothing to blend; the
         // mid-stream `CursorRenderMode` flip strips/keeps `frame.cursor` per tick for channel
         // sessions). gamescope (Phase C) can't embed → always composites the XFixes cursor.
-        compositor == pf_vdisplay::Compositor::Gamescope || cursor_forward,
+        crate::session_plan::cursor_blend_for(
+            cursor_forward,
+            compositor == pf_vdisplay::Compositor::Gamescope,
+        ),
         cursor_forward,
     );
     plan.gamescope_cursor = compositor == pf_vdisplay::Compositor::Gamescope;

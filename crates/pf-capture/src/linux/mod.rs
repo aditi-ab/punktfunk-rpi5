@@ -105,16 +105,21 @@ impl PortalCapturer {
     /// RemoteDesktop grant and never raises a separate ScreenCast dialog; `false` uses a plain
     /// ScreenCast session (wlroots, which has no RemoteDesktop portal). `want_hdr` offers the
     /// GNOME 50+ HDR formats (10-bit PQ/BT.2020, dmabuf-only) instead of the SDR set.
-    pub fn open(anchored: bool, want_hdr: bool, policy: ZeroCopyPolicy) -> Result<PortalCapturer> {
+    pub fn open(
+        anchored: bool,
+        want_hdr: bool,
+        want_metadata_cursor: bool,
+        policy: ZeroCopyPolicy,
+    ) -> Result<PortalCapturer> {
         // Portal handshake (async) on its own thread; hands back the PW fd + node id.
         let (setup_tx, setup_rx) = std::sync::mpsc::channel::<Result<(OwnedFd, u32), String>>();
         thread::Builder::new()
             .name("punktfunk-portal".into())
             .spawn(move || {
                 if anchored {
-                    portal_thread_remote_desktop(setup_tx)
+                    portal_thread_remote_desktop(setup_tx, want_metadata_cursor)
                 } else {
-                    portal_thread(setup_tx)
+                    portal_thread(setup_tx, want_metadata_cursor)
                 }
             })
             .context("spawn portal thread")?;
@@ -647,19 +652,23 @@ pub fn gnome_hdr_monitor_active() -> bool {
     }
 }
 
-/// Pick the ScreenCast cursor mode from what the backend advertises (`AvailableCursorModes`),
-/// preferring **cursor-as-metadata**: the compositor keeps its cheap hardware cursor plane and
-/// ships the pointer as PipeWire `SPA_META_Cursor` metadata (position + an occasional bitmap),
-/// which the consumer composites itself. That avoids forcing the producer to burn the cursor into
-/// every frame — the `Embedded` mode — which on gamescope would defeat its HW cursor plane. Falls
-/// back to `Embedded`, then `Hidden`, and (if the property query fails, e.g. an older portal)
-/// keeps the prior `Embedded` behavior so the cursor is never silently lost.
+/// Pick the ScreenCast cursor mode from what the backend advertises (`AvailableCursorModes`).
+/// With `want_metadata` the ladder prefers **cursor-as-metadata**: the compositor keeps its cheap
+/// hardware cursor plane and ships the pointer as PipeWire `SPA_META_Cursor` metadata (position +
+/// an occasional bitmap), which the consumer composites itself — avoiding the producer burning the
+/// cursor into every frame (`Embedded`), which on gamescope would defeat its HW cursor plane.
+/// Without it — the session's encode path has no compositing stage for a metadata cursor
+/// (`pf-encode`'s `cursor_blend_capable` said the resolved backend can't blend) — the ladder
+/// prefers `Embedded`, so the pointer is in the pixels instead of in metadata nothing would draw.
+/// Both ladders fall through to the other mode, then `Hidden`; a failed property query (an older
+/// portal) keeps the prior `Embedded` behavior so the cursor is never silently lost.
 async fn choose_cursor_mode(
     proxy: &ashpd::desktop::screencast::Screencast,
+    want_metadata: bool,
 ) -> ashpd::desktop::screencast::CursorMode {
     use ashpd::desktop::screencast::CursorMode;
     match proxy.available_cursor_modes().await {
-        Ok(avail) if avail.contains(CursorMode::Metadata) => {
+        Ok(avail) if want_metadata && avail.contains(CursorMode::Metadata) => {
             tracing::info!(
                 ?avail,
                 "ScreenCast: requesting cursor-as-metadata (SPA_META_Cursor)"
@@ -667,11 +676,29 @@ async fn choose_cursor_mode(
             CursorMode::Metadata
         }
         Ok(avail) if avail.contains(CursorMode::Embedded) => {
-            tracing::info!(
-                ?avail,
-                "ScreenCast: cursor metadata unavailable — requesting Embedded cursor"
-            );
+            if want_metadata {
+                tracing::info!(
+                    ?avail,
+                    "ScreenCast: cursor metadata unavailable — requesting Embedded cursor"
+                );
+            } else {
+                tracing::info!(
+                    ?avail,
+                    "ScreenCast: requesting Embedded cursor (this session's encoder does not \
+                     composite a metadata cursor)"
+                );
+            }
             CursorMode::Embedded
+        }
+        Ok(avail) if avail.contains(CursorMode::Metadata) => {
+            // Embedded wanted but not offered. Metadata still beats Hidden: the CPU capture
+            // path composites `SPA_META_Cursor` inline, so part of the matrix keeps a pointer.
+            tracing::warn!(
+                ?avail,
+                "ScreenCast: Embedded cursor not advertised — requesting cursor-as-metadata \
+                 (only CPU-path frames will composite it)"
+            );
+            CursorMode::Metadata
         }
         Ok(avail) => {
             tracing::warn!(
@@ -692,7 +719,10 @@ async fn choose_cursor_mode(
 
 /// The portal handshake: connect ScreenCast, select a single monitor, start, open the
 /// PipeWire remote, hand the fd + node id back, then keep the session alive.
-fn portal_thread(setup_tx: std::sync::mpsc::Sender<Result<(OwnedFd, u32), String>>) {
+fn portal_thread(
+    setup_tx: std::sync::mpsc::Sender<Result<(OwnedFd, u32), String>>,
+    want_metadata_cursor: bool,
+) {
     use ashpd::desktop::screencast::{Screencast, SelectSourcesOptions, SourceType};
     use ashpd::desktop::PersistMode;
     use ashpd::enumflags2::BitFlags;
@@ -722,7 +752,7 @@ fn portal_thread(setup_tx: std::sync::mpsc::Sender<Result<(OwnedFd, u32), String
                 .create_session(Default::default())
                 .await
                 .context("create_session")?;
-            let cursor_mode = choose_cursor_mode(&proxy).await;
+            let cursor_mode = choose_cursor_mode(&proxy, want_metadata_cursor).await;
             proxy
                 .select_sources(
                     &session,
@@ -781,7 +811,10 @@ fn portal_thread(setup_tx: std::sync::mpsc::Sender<Result<(OwnedFd, u32), String
 /// path — also covers screen capture, with no separate ScreenCast dialog (which has no such
 /// bypass). Yields the same PipeWire fd + node id as the standalone path; the consumer is
 /// identical.
-fn portal_thread_remote_desktop(setup_tx: std::sync::mpsc::Sender<Result<(OwnedFd, u32), String>>) {
+fn portal_thread_remote_desktop(
+    setup_tx: std::sync::mpsc::Sender<Result<(OwnedFd, u32), String>>,
+    want_metadata_cursor: bool,
+) {
     use ashpd::desktop::remote_desktop::{DeviceType, RemoteDesktop, SelectDevicesOptions};
     use ashpd::desktop::screencast::{Screencast, SelectSourcesOptions, SourceType};
     use ashpd::desktop::PersistMode;
@@ -826,7 +859,7 @@ fn portal_thread_remote_desktop(setup_tx: std::sync::mpsc::Sender<Result<(OwnedF
                 .context("select_devices")?
                 .response()
                 .context("select_devices rejected")?;
-            let cursor_mode = choose_cursor_mode(&screencast).await;
+            let cursor_mode = choose_cursor_mode(&screencast, want_metadata_cursor).await;
             screencast
                 .select_sources(
                     &session,
