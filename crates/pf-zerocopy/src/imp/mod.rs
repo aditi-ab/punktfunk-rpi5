@@ -36,17 +36,6 @@ fn flag(name: &str) -> bool {
     flag_opt(name).unwrap_or(false)
 }
 
-/// One-shot downgrade latch: a VAAPI-passthrough capture whose dmabuf-only offer never negotiated
-/// (the compositor can't allocate a LINEAR BGRx dmabuf) flips this, so the encode loop's pipeline
-/// rebuild lands on the CPU offer instead of failing the same negotiation forever. Only consulted
-/// when `PUNKTFUNK_ZEROCOPY` is unset — an explicit `=1` keeps forcing the dmabuf offer.
-static VAAPI_DMABUF_FAILED: AtomicBool = AtomicBool::new(false);
-
-/// Record that the VAAPI LINEAR-dmabuf offer failed negotiation (see [`VAAPI_DMABUF_FAILED`]).
-pub fn note_vaapi_dmabuf_failed() {
-    VAAPI_DMABUF_FAILED.store(true, Ordering::Relaxed);
-}
-
 /// True when `PUNKTFUNK_ZEROCOPY` is explicitly truthy — the operator forced the dmabuf offer, so
 /// a failed negotiation keeps erroring loudly instead of silently downgrading to the CPU path.
 pub fn vaapi_dmabuf_forced() -> bool {
@@ -64,11 +53,16 @@ pub fn vaapi_dmabuf_forced() -> bool {
 /// capture when no importer/importable modifier is available and latches the import off after
 /// repeated worker deaths. `PUNKTFUNK_ZEROCOPY=0` opts out; `PUNKTFUNK_FORCE_SHM` forces the
 /// race-free SHM path.
+///
+/// This is the GLOBAL switch and nothing but the env var moves it. It used to fall back to
+/// `!VAAPI_DMABUF_FAILED`, a latch a capture-side dmabuf *negotiation* timeout set — which made one
+/// failed LINEAR-dmabuf negotiation disable zero-copy for EVERY later session on the host,
+/// including the NVENC EGL→CUDA path that shares none of the failing machinery (and, because the
+/// raw-passthrough offer is also taken for PyroWave sessions on any vendor, one PyroWave timeout on
+/// an NVIDIA box did it). That downgrade now uses the correctly-scoped
+/// [`note_raw_dmabuf_negotiation_failed`], which gates only the raw-passthrough offer.
 pub fn enabled() -> bool {
-    match flag_opt("PUNKTFUNK_ZEROCOPY") {
-        Some(v) => v,
-        None => !VAAPI_DMABUF_FAILED.load(Ordering::Relaxed),
-    }
+    flag_opt("PUNKTFUNK_ZEROCOPY").unwrap_or(true)
 }
 
 /// Whether the tiled-GL zero-copy path converts to NV12 on the GPU and feeds NVENC native YUV —
@@ -266,6 +260,27 @@ pub fn note_raw_dmabuf_import_failure(reason: &str) {
 /// Record a raw dmabuf that imported and encoded — resets the failure streak.
 pub fn note_raw_dmabuf_import_ok() {
     RAW_DMABUF_FAILURE_STREAK.store(0, Ordering::Relaxed);
+}
+
+/// Latch the raw-dmabuf passthrough off because its dmabuf-only *offer never negotiated* — the
+/// CAPTURE-side counterpart to [`note_raw_dmabuf_import_failure`]'s encoder-side streak. One
+/// timeout is conclusive for this offer (a compositor that cannot allocate the requested
+/// LINEAR/modifier BGRx dmabuf refuses it identically on every retry), so there is no streak to
+/// count: the next capture skips the passthrough and negotiates SHM/CPU instead of re-running the
+/// same 10 s timeout on every reconnect.
+///
+/// Scoped deliberately. This used to be `note_vaapi_dmabuf_failed`, which fed [`enabled`] and so
+/// disabled ALL zero-copy host-wide — see [`enabled`]. `RAW_DMABUF_DISABLED` gates only the
+/// raw-passthrough decision, so the EGL→CUDA importer that a later NVENC session builds is
+/// untouched.
+pub fn note_raw_dmabuf_negotiation_failed() {
+    if !RAW_DMABUF_DISABLED.swap(true, Ordering::Relaxed) {
+        tracing::warn!(
+            "zero-copy raw-dmabuf passthrough disabled for this host process: the compositor never \
+             accepted the dmabuf-only capture offer, so later captures negotiate the CPU path \
+             instead of repeating that timeout (the EGL→CUDA import path is NOT affected)"
+        );
+    }
 }
 
 /// True once repeated encoder import failures latched the raw-dmabuf passthrough off (see

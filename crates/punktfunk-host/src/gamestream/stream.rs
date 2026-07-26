@@ -308,7 +308,23 @@ fn run(
         on_lost,
     );
     capturer.set_active(false);
-    *video_cap.lock().unwrap() = Some((capturer, cfg.hdr));
+    // Re-pool ONLY a capturer that can still produce frames. Every terminal state of the portal
+    // backend is sticky (`Capturer::is_alive`): a dead zerocopy-import worker, an exited PipeWire
+    // thread, or a compositor that went away all make the NEXT stream fail at exactly the same
+    // point — and this path has no rebuild closure (unlike the virtual-output path above), so a
+    // re-admitted dead capturer wedged GameStream portal video permanently, at 10 s per reconnect
+    // attempt. Dropping it instead costs one fresh screencast session on the next connect. Note
+    // `result` may already be `Err` here, which is itself that signal.
+    if result.is_ok() && capturer.is_alive() {
+        *video_cap.lock().unwrap() = Some((capturer, cfg.hdr));
+    } else {
+        tracing::info!(
+            stream_failed = result.is_err(),
+            capturer_alive = capturer.is_alive(),
+            "video source: retiring the pooled capturer — the next stream opens a fresh screencast \
+             session"
+        );
+    }
     result
 }
 

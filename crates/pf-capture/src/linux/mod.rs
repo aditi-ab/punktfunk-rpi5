@@ -2,7 +2,7 @@
 //!
 //! Two dedicated threads, because both stacks are tied to their thread:
 //!   * **portal thread** drives the async ashpd handshake on a multi-thread tokio runtime
-//!     (control plane — never the per-frame path), then parks on a pending future so the
+//!     (control plane — never the per-frame path), then parks on a oneshot receiver so the
 //!     `proxy` + its zbus connection stay alive (the cast is torn down when that connection
 //!     drops; ashpd's `Session` has no `Drop`);
 //!   * **pipewire thread** owns the (`!Send`) MainLoop/Stream and pumps frames.
@@ -11,11 +11,12 @@
 //! frames leave the pipewire thread over a bounded channel. The authoritative frame size
 //! comes from the negotiated PipeWire format, not the portal's size hint.
 //!
-//! Cleanup: the pipewire thread is stopped deterministically — [`PortalCapturer`]'s `Drop`
-//! sends a pipewire `channel` quit and joins the thread, so dropping a capturer (session end,
-//! or a retried/failed pipeline build) releases its EGL importer / CUDA context promptly
-//! instead of leaking it to process exit. The portal thread (when used) still parks on its zbus
-//! connection until process exit.
+//! Cleanup: BOTH threads are stopped deterministically — [`PortalCapturer`]'s `Drop` sends a
+//! pipewire `channel` quit and joins that thread (releasing its EGL importer / CUDA context
+//! promptly instead of leaking it to process exit), and [`PortalSession`]'s `Drop` fires the
+//! portal thread's quit oneshot and waits, bounded, for it to unwind — which drops the zbus
+//! connection and so ENDS the compositor's ScreenCast session. Dropping a capturer (session end,
+//! or a retried/failed pipeline build) therefore leaves nothing behind on either side.
 
 // Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
 #![deny(clippy::undocumented_unsafe_blocks)]
@@ -67,10 +68,13 @@ pub struct PortalCapturer {
     /// motion on a static desktop; the frame-attached overlay alone goes stale between damage
     /// frames (the same gap the Windows IddCx channel fills, and why the tick prefers LIVE).
     cursor_live: Arc<std::sync::Mutex<Option<pf_frame::CursorOverlay>>>,
-    /// True when this capture runs the VAAPI dmabuf passthrough (a LINEAR-dmabuf-only offer). If
-    /// that offer never negotiates, [`next_frame`](Capturer::next_frame)'s timeout branch latches
-    /// the process-wide downgrade ([`pf_zerocopy::note_vaapi_dmabuf_failed`]) so the pipeline
-    /// rebuild retries on the CPU offer instead of failing identically forever.
+    /// True when this capture runs the raw-dmabuf passthrough offer (VAAPI backend, or ANY vendor on
+    /// a PyroWave session). Taken verbatim from the ONE
+    /// [`NegotiationPlan`](pipewire::NegotiationPlan) the thread also consumes — never re-derived
+    /// here, which is what let this bool drift from the thread's real decision. If the offer never
+    /// negotiates, [`next_frame`](Capturer::next_frame)'s timeout branch latches the scoped
+    /// downgrade ([`pf_zerocopy::note_raw_dmabuf_negotiation_failed`]) so the pipeline rebuild
+    /// retries on the CPU offer instead of failing identically forever.
     vaapi_dmabuf: bool,
     /// This capture ran the HDR (10-bit PQ/BT.2020 dmabuf) offer — see [`Self::open`]'s
     /// `want_hdr`. Read by the negotiation-timeout diagnosis (a failed HDR offer latches the
@@ -92,12 +96,60 @@ pub struct PortalCapturer {
     /// is, releasing the compositor-side output via the keepalive's own `Drop`. `None` for the
     /// portal source (its session ends with the portal thread's zbus connection).
     _keepalive: Option<Box<dyn Send>>,
+    /// The portal control-plane thread's teardown handles ([`PortalSession`]). `Some` only on the
+    /// [`open`](Self::open) path; `None` for a virtual-output capturer (no portal thread). Held
+    /// purely for its `Drop` (like `_keepalive`) — that is what ends the compositor's screencast.
+    _portal: Option<PortalSession>,
     /// The gamescope XFixes cursor reader (remote-desktop-sweep Phase C), when this capturer
     /// serves a gamescope node. `Some` after
     /// [`attach_gamescope_cursor`](Capturer::attach_gamescope_cursor); its `Drop` stops the reader
     /// thread, so it lives exactly as long as the capturer. `None` on the portal path (its cursor
     /// comes from `SPA_META_Cursor`).
     _gs_cursor: Option<xfixes_cursor::XFixesCursorSource>,
+}
+
+/// Teardown handles for the portal control-plane thread. Firing `quit` un-parks
+/// `portal_thread`(`_remote_desktop`), so `rt.block_on` returns, the tokio runtime and the zbus
+/// connection drop — and **dropping that connection is what ends the compositor's ScreenCast
+/// session** (ashpd's `Session` has no `Drop`). Without this the thread parked forever on
+/// `future::pending()`, so every dropped portal capturer permanently leaked a thread, a 2-worker
+/// runtime, a zbus connection AND a live screencast: a GameStream HDR↔SDR reconnect drops the
+/// pooled capturer and opens a fresh session, so the sessions accumulated — the exact "second
+/// conflicting screencast" the capturer pooling exists to prevent.
+struct PortalSession {
+    /// Un-parks the portal thread. `Option` so `Drop` can take (and thereby fire) it; dropping the
+    /// sender without a send resolves the receiver with `Err`, which the thread treats identically.
+    quit: Option<tokio::sync::oneshot::Sender<()>>,
+    /// Signalled by the spawned closure after the runtime has been dropped — lets `Drop` bound its
+    /// wait instead of blocking on `join()` behind a wedged D-Bus round-trip.
+    done: Receiver<()>,
+    join: Option<thread::JoinHandle<()>>,
+}
+
+impl Drop for PortalSession {
+    fn drop(&mut self) {
+        // Un-park the thread, then wait — BOUNDED — for it to unwind. The bound matters because the
+        // thread may be inside a D-Bus round-trip against a wedged portal, and teardown runs on the
+        // session path: an unbounded `join()` there would hang the host, not just leak. On timeout
+        // we detach (the thread owns only its own runtime + connection and exits on its own once the
+        // call returns), having at least fired the quit.
+        drop(self.quit.take()); // send-or-drop: both resolve the receiver
+        let joinable = match self.done.recv_timeout(Duration::from_millis(750)) {
+            Ok(()) => true,
+            Err(_) => {
+                tracing::warn!(
+                    "portal thread did not unwind within 750ms — detaching it (the compositor's \
+                     ScreenCast session may linger until the host exits)"
+                );
+                false
+            }
+        };
+        if let Some(join) = self.join.take() {
+            if joinable {
+                let _ = join.join(); // returns immediately: `done` already fired
+            }
+        }
+    }
 }
 
 impl PortalCapturer {
@@ -108,16 +160,29 @@ impl PortalCapturer {
     pub fn open(anchored: bool, want_hdr: bool, policy: ZeroCopyPolicy) -> Result<PortalCapturer> {
         // Portal handshake (async) on its own thread; hands back the PW fd + node id.
         let (setup_tx, setup_rx) = std::sync::mpsc::channel::<Result<(OwnedFd, u32), String>>();
-        thread::Builder::new()
+        // Teardown plumbing (see `PortalSession`): `quit_rx` parks the thread once the handshake is
+        // done, `done_tx` reports that it has fully unwound.
+        let (quit_tx, quit_rx) = tokio::sync::oneshot::channel::<()>();
+        let (done_tx, done_rx) = sync_channel::<()>(1);
+        let join = thread::Builder::new()
             .name("punktfunk-portal".into())
             .spawn(move || {
                 if anchored {
-                    portal_thread_remote_desktop(setup_tx)
+                    portal_thread_remote_desktop(setup_tx, quit_rx)
                 } else {
-                    portal_thread(setup_tx)
+                    portal_thread(setup_tx, quit_rx)
                 }
+                // After the runtime has been dropped inside the fn above, so a successful
+                // `recv_timeout` in `Drop` means the zbus connection is really gone. Covers the
+                // early-return paths too (a runtime that failed to build).
+                let _ = done_tx.send(());
             })
             .context("spawn portal thread")?;
+        let portal = PortalSession {
+            quit: Some(quit_tx),
+            done: done_rx,
+            join: Some(join),
+        };
 
         let (fd, node_id) = match setup_rx.recv_timeout(Duration::from_secs(20)) {
             Ok(Ok(v)) => v,
@@ -130,6 +195,8 @@ impl PortalCapturer {
             "ScreenCast portal session started; connecting PipeWire"
         );
         // This portal path (GameStream / monitor capture) is always 4:2:0, so allow zero-copy as before.
+        // NOTE the `?`: on a PipeWire-spawn failure `portal` drops here, which fires the quit sender
+        // and tears the just-created screencast session down instead of stranding it.
         Ok(spawn_pipewire(
             Some(fd),
             node_id,
@@ -140,7 +207,7 @@ impl PortalCapturer {
             policy,
             false,
         )?
-        .into_capturer(node_id, None))
+        .into_capturer(node_id, None, Some(portal)))
     }
 
     /// Build a capturer from an already-created virtual output's PipeWire node. The host facade
@@ -181,7 +248,9 @@ impl PortalCapturer {
             policy,
             expect_exact_dims,
         )?
-        .into_capturer(node_id, Some(keepalive)))
+        // No portal thread on this path: the node belongs to a virtual output the caller created,
+        // and `keepalive` is what releases it.
+        .into_capturer(node_id, Some(keepalive), None))
     }
 }
 
@@ -210,8 +279,14 @@ struct PwHandles {
 
 impl PwHandles {
     /// Assemble a [`PortalCapturer`] around these handles. `node_id` is carried for diagnostics;
-    /// `keepalive` owns the virtual output (drops after the PipeWire thread is joined).
-    fn into_capturer(self, node_id: u32, keepalive: Option<Box<dyn Send>>) -> PortalCapturer {
+    /// `keepalive` owns the virtual output (drops after the PipeWire thread is joined); `portal`
+    /// carries the control-plane thread's teardown handles on the [`PortalCapturer::open`] path.
+    fn into_capturer(
+        self,
+        node_id: u32,
+        keepalive: Option<Box<dyn Send>>,
+        portal: Option<PortalSession>,
+    ) -> PortalCapturer {
         PortalCapturer {
             frames: self.frames,
             pending: None,
@@ -228,6 +303,7 @@ impl PwHandles {
             quit: Some(self.quit),
             join: Some(self.join),
             _keepalive: keepalive,
+            _portal: portal,
             _gs_cursor: None,
         }
     }
@@ -293,12 +369,24 @@ fn spawn_pipewire(
     } else {
         want_hdr
     };
-    // Mirror of the thread's `vaapi_passthrough` decision (deterministic from here: on a VAAPI
-    // backend or a PyroWave session the EGL→CUDA importer is never built) — kept on the capturer
-    // so `next_frame`'s negotiation-timeout branch knows a failed negotiation was the raw-dmabuf
-    // passthrough offer.
-    let vaapi_dmabuf =
-        zerocopy && !force_shm && (policy.backend_is_vaapi || policy.pyrowave_session);
+    // THE negotiation decision, resolved once here and handed to the thread — no mirror (L3/F1).
+    // Every environment/latch read the decision depends on happens at this single point.
+    let plan = pipewire::negotiation_plan(pipewire::NegotiationInputs {
+        zerocopy,
+        force_shm,
+        want_hdr,
+        want_444,
+        backend_is_vaapi: policy.backend_is_vaapi,
+        pyrowave_session: policy.pyrowave_session,
+        native_nv12_session: policy.native_nv12_session,
+        raw_dmabuf_import_disabled: pf_zerocopy::raw_dmabuf_import_disabled(),
+        gpu_import_disabled: pf_zerocopy::gpu_import_disabled(),
+        // Default ON; `PUNKTFUNK_PIPEWIRE_NV12=0` (or any falsy spelling — the shared parser, not a
+        // bare `!= "0"` string compare) restores the packed-RGB negotiation.
+        native_nv12_env_on: pf_host_config::env_on("PUNKTFUNK_PIPEWIRE_NV12").unwrap_or(true),
+    });
+    // The capturer's timeout diagnosis reads the SAME resolved bool the thread acts on.
+    let vaapi_dmabuf = plan.vaapi_passthrough;
     let join = thread::Builder::new()
         .name("punktfunk-pipewire".into())
         .spawn(move || {
@@ -312,7 +400,7 @@ fn spawn_pipewire(
                 broken_cb,
                 hdr_negotiated_cb,
                 cursor_live_cb,
-                zerocopy,
+                plan,
                 want_444,
                 want_hdr,
                 preferred,
@@ -437,6 +525,22 @@ impl Capturer for PortalCapturer {
         self.active.store(active, Ordering::Relaxed);
     }
 
+    /// All three of this backend's terminal states, checked without consuming a frame — every one
+    /// of them is sticky, so an `Err` from `next_frame`/`try_latest` here is permanent:
+    ///   * `broken` — the zero-copy GPU import is irrecoverably gone for this stream (worker death,
+    ///     or a tiled-import failure streak). Never cleared.
+    ///   * the PipeWire thread has exited (its `Drop`-less death is otherwise indistinguishable from
+    ///     an idle desktop: the frame channel just goes quiet, and `streaming` keeps its last value).
+    ///   * the stream left `Streaming` for good — the compositor or virtual output went away.
+    ///
+    /// A static desktop stays `Streaming` (it simply sends no buffers), so an idle-but-healthy
+    /// capture is never reported dead.
+    fn is_alive(&self) -> bool {
+        !self.broken.load(Ordering::Relaxed)
+            && self.streaming.load(Ordering::Relaxed)
+            && self.join.as_ref().is_some_and(|j| !j.is_finished())
+    }
+
     /// Generic HDR10 mastering metadata once the stream negotiated a 10-bit PQ format. Mutter
     /// exposes no per-monitor mastering volume through the screencast, so this is the standard
     /// HDR10 default block (BT.2020 primaries, D65 white, 1000 / 0.005 cd/m², CLL unknown) — the
@@ -522,15 +626,20 @@ impl PortalCapturer {
                         self.node_id
                     ))
                 } else if self.vaapi_dmabuf && !pf_zerocopy::vaapi_dmabuf_forced() {
-                    // The LINEAR-dmabuf-only offer (VAAPI passthrough default) was never accepted.
-                    // Latch the process-wide downgrade so the encode loop's pipeline rebuild
-                    // retries on the CPU offer instead of failing this same negotiation forever.
-                    pf_zerocopy::note_vaapi_dmabuf_failed();
+                    // The dmabuf-only raw-passthrough offer was never accepted. Latch the
+                    // downgrade so the encode loop's pipeline rebuild retries on the CPU offer
+                    // instead of failing this same negotiation forever. The latch is SCOPED to the
+                    // raw-passthrough decision: it used to be `note_vaapi_dmabuf_failed`, which fed
+                    // `pf_zerocopy::enabled()` and therefore dropped every later session on this
+                    // host — NVENC's EGL→CUDA path included — to CPU capture. Since this offer is
+                    // also the PyroWave one (any vendor), a single PyroWave negotiation timeout was
+                    // enough to do that.
+                    pf_zerocopy::note_raw_dmabuf_negotiation_failed();
                     Err(anyhow!(
                         "no PipeWire frame within {within}s (node {}): the compositor never \
-                         accepted the LINEAR-dmabuf offer (VAAPI zero-copy) — downgrading this \
-                         host to the CPU capture path; the pipeline rebuild will renegotiate \
-                         without dmabuf",
+                         accepted the dmabuf-only offer (raw-dmabuf passthrough) — downgrading \
+                         THIS path to CPU capture for the rest of the process; the pipeline \
+                         rebuild will renegotiate without dmabuf",
                         self.node_id
                     ))
                 } else {
@@ -691,8 +800,12 @@ async fn choose_cursor_mode(
 }
 
 /// The portal handshake: connect ScreenCast, select a single monitor, start, open the
-/// PipeWire remote, hand the fd + node id back, then keep the session alive.
-fn portal_thread(setup_tx: std::sync::mpsc::Sender<Result<(OwnedFd, u32), String>>) {
+/// PipeWire remote, hand the fd + node id back, then keep the session alive until `quit_rx`
+/// resolves (the capturer's `Drop` — see [`PortalSession`]).
+fn portal_thread(
+    setup_tx: std::sync::mpsc::Sender<Result<(OwnedFd, u32), String>>,
+    quit_rx: tokio::sync::oneshot::Receiver<()>,
+) {
     use ashpd::desktop::screencast::{Screencast, SelectSourcesOptions, SourceType};
     use ashpd::desktop::PersistMode;
     use ashpd::enumflags2::BitFlags;
@@ -762,9 +875,9 @@ fn portal_thread(setup_tx: std::sync::mpsc::Sender<Result<(OwnedFd, u32), String
 
             // Keep `proxy` + `session` (and the underlying zbus connection) alive for the
             // capture; the cast is torn down when the connection drops (ashpd's `Session`
-            // has no `Drop`), which here happens at process exit.
+            // has no `Drop`) — which now happens when this park returns, not at process exit.
             let _keep_alive = (&proxy, &session);
-            std::future::pending::<()>().await;
+            let _ = quit_rx.await;
             Ok(())
         }
         .await;
@@ -773,6 +886,10 @@ fn portal_thread(setup_tx: std::sync::mpsc::Sender<Result<(OwnedFd, u32), String
             let _ = err_tx.send(Err(format!("{e:#}")));
         }
     });
+    // Drop the runtime HERE, before the caller signals completion: shutting the 2 workers down is
+    // what finishes releasing the zbus connection, so a `done` signal sent after this means the
+    // compositor-side session is really gone (see `PortalSession::drop`).
+    drop(rt);
 }
 
 /// Combined RemoteDesktop+ScreenCast portal setup (KWin/GNOME). ScreenCast sources are selected
@@ -780,8 +897,11 @@ fn portal_thread(setup_tx: std::sync::mpsc::Sender<Result<(OwnedFd, u32), String
 /// pre-authorized headlessly via the `kde-authorized` permission, exactly like the libei input
 /// path — also covers screen capture, with no separate ScreenCast dialog (which has no such
 /// bypass). Yields the same PipeWire fd + node id as the standalone path; the consumer is
-/// identical.
-fn portal_thread_remote_desktop(setup_tx: std::sync::mpsc::Sender<Result<(OwnedFd, u32), String>>) {
+/// identical, as is the `quit_rx` teardown park (see [`PortalSession`]).
+fn portal_thread_remote_desktop(
+    setup_tx: std::sync::mpsc::Sender<Result<(OwnedFd, u32), String>>,
+    quit_rx: tokio::sync::oneshot::Receiver<()>,
+) {
     use ashpd::desktop::remote_desktop::{DeviceType, RemoteDesktop, SelectDevicesOptions};
     use ashpd::desktop::screencast::{Screencast, SelectSourcesOptions, SourceType};
     use ashpd::desktop::PersistMode;
@@ -861,9 +981,10 @@ fn portal_thread_remote_desktop(setup_tx: std::sync::mpsc::Sender<Result<(OwnedF
                 .send(Ok((fd, node_id)))
                 .map_err(|_| anyhow!("capturer dropped before setup completed"))?;
 
-            // Keep the proxies + session (and their zbus connection) alive for the capture.
+            // Keep the proxies + session (and their zbus connection) alive for the capture, until
+            // the capturer's `Drop` fires the quit channel.
             let _keep_alive = (&remote, &screencast, &session);
-            std::future::pending::<()>().await;
+            let _ = quit_rx.await;
             Ok(())
         }
         .await;
@@ -872,6 +993,8 @@ fn portal_thread_remote_desktop(setup_tx: std::sync::mpsc::Sender<Result<(OwnedF
             let _ = err_tx.send(Err(format!("{e:#}")));
         }
     });
+    // See `portal_thread`: drop the runtime before the caller's completion signal.
+    drop(rt);
 }
 
 mod pipewire {
@@ -1020,6 +1143,120 @@ mod pipewire {
         /// into the first-frame-timeout retry loop; the promised renegotiation normally lands
         /// within a frame or two).
         gate_since: Option<std::time::Instant>,
+    }
+
+    /// Everything the zero-copy negotiation decision depends on, gathered at ONE point in time.
+    /// Split out from [`pipewire_thread`]'s prologue so the decision is a pure function of these
+    /// facts — testable, and consumable by both the thread and `spawn_pipewire` (see
+    /// [`NegotiationPlan`]).
+    #[derive(Debug, Clone, Copy)]
+    pub(super) struct NegotiationInputs {
+        /// `allow_zerocopy && pf_zerocopy::enabled()`.
+        pub zerocopy: bool,
+        /// `PUNKTFUNK_FORCE_SHM` — the race-free download path.
+        pub force_shm: bool,
+        /// This session offers the 10-bit PQ/BT.2020 formats.
+        pub want_hdr: bool,
+        /// This session negotiated full-chroma 4:4:4.
+        pub want_444: bool,
+        /// [`ZeroCopyPolicy::backend_is_vaapi`].
+        pub backend_is_vaapi: bool,
+        /// [`ZeroCopyPolicy::pyrowave_session`].
+        pub pyrowave_session: bool,
+        /// [`ZeroCopyPolicy::native_nv12_session`].
+        pub native_nv12_session: bool,
+        /// `pf_zerocopy::raw_dmabuf_import_disabled()` — the scoped raw-passthrough latch.
+        pub raw_dmabuf_import_disabled: bool,
+        /// `pf_zerocopy::gpu_import_disabled()` — repeated import-worker deaths.
+        pub gpu_import_disabled: bool,
+        /// `PUNKTFUNK_PIPEWIRE_NV12` (default ON) — allow the producer-side NV12 preference.
+        pub native_nv12_env_on: bool,
+    }
+
+    /// The resolved zero-copy negotiation decision — **one resolver, consumed by the PipeWire thread
+    /// AND by `spawn_pipewire`.**
+    ///
+    /// `spawn_pipewire` used to hand-mirror `vaapi_passthrough` so the capturer's
+    /// negotiation-timeout branch could tell which offer had failed, and the copy drifted: it omitted
+    /// `raw_dmabuf_import_disabled`, so after that latch fired the mirror still said "raw
+    /// passthrough" while the thread had already fallen back — and the timeout branch then latched a
+    /// downgrade for an offer it had not made. Deriving both consumers from this struct is what makes
+    /// that class of drift unrepresentable rather than merely fixed (same shape as WP7.6's single
+    /// Linux encode-backend resolver).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) struct NegotiationPlan {
+        /// Build the EGL→CUDA importer for this capture.
+        pub build_importer: bool,
+        /// Hand raw dmabufs straight to the encoder instead of importing to CUDA.
+        pub vaapi_passthrough: bool,
+        /// Offer gamescope's producer-side NV12 pod ahead of packed RGB.
+        pub prefer_native_nv12: bool,
+        /// Carried through so [`want_dmabuf`](Self::want_dmabuf) needs no second copy of it.
+        pub force_shm: bool,
+        /// Diagnostic: this capture WOULD have taken the raw passthrough, but its scoped latch is
+        /// set (the encoder repeatedly failed to import, or a previous negotiation timed out).
+        pub raw_dmabuf_latched: bool,
+        /// Diagnostic: this capture WOULD have built the EGL→CUDA importer, but repeated
+        /// import-worker deaths latched the GPU import off.
+        pub gpu_import_latched: bool,
+    }
+
+    /// Resolve the negotiation plan. **Pure** — every environment read is already in `i`.
+    ///
+    /// The four invariants this encodes were previously prose-only comments spread across the
+    /// prologue; `negotiation_plan_invariants` in the tests below pins each one:
+    ///   1. HDR never builds the EGL→CUDA importer (its de-tile blit is 8-bit RGBA8 → silent depth
+    ///      loss); the HDR consumers are the CPU mmap path and the raw passthrough.
+    ///   2. 4:4:4 never prefers producer NV12 (a 4:4:4 session must not be subsampled).
+    ///   3. Producer-native NV12 only on a `native_nv12_session` under an active raw passthrough
+    ///      (libav VAAPI would misread the two-plane buffer; the CUDA importer expects packed RGB).
+    ///   4. The raw passthrough is off whenever its own latch has fired.
+    pub(super) fn negotiation_plan(i: NegotiationInputs) -> NegotiationPlan {
+        // The frames' consumer imports raw dmabufs itself: the VAAPI backend (libva import + GPU
+        // CSC) or a PyroWave session (the wavelet encoder's own Vulkan device, any vendor).
+        let raw_passthrough = i.backend_is_vaapi || i.pyrowave_session;
+        // Building the EGL→CUDA importer would waste a CUDA probe under a raw passthrough — or
+        // worse, succeed and produce CUDA payloads only NVENC can consume. HDR is excluded by
+        // invariant 1. `gpu_import_disabled` is the repeated-worker-death latch (a wedged GPU stack
+        // must not crash-loop).
+        let build_importer =
+            i.zerocopy && !raw_passthrough && !i.want_hdr && !i.gpu_import_disabled;
+        // Note there is no `importer.is_none()` term, unlike the expression this replaces: it was
+        // redundant (`build_importer` already excludes `raw_passthrough`, so the importer is
+        // necessarily absent here) and it is what made the decision look impure — the reason
+        // `spawn_pipewire` "had to" mirror it by hand.
+        let vaapi_passthrough =
+            i.zerocopy && !i.force_shm && raw_passthrough && !i.raw_dmabuf_import_disabled;
+        let prefer_native_nv12 = i.native_nv12_env_on
+            && i.native_nv12_session
+            && i.backend_is_vaapi
+            && vaapi_passthrough
+            && !i.pyrowave_session
+            && !i.want_444
+            && !i.want_hdr;
+        NegotiationPlan {
+            build_importer,
+            vaapi_passthrough,
+            prefer_native_nv12,
+            force_shm: i.force_shm,
+            raw_dmabuf_latched: i.zerocopy
+                && !i.force_shm
+                && raw_passthrough
+                && i.raw_dmabuf_import_disabled,
+            gpu_import_latched: i.zerocopy
+                && !raw_passthrough
+                && !i.want_hdr
+                && i.gpu_import_disabled,
+        }
+    }
+
+    impl NegotiationPlan {
+        /// Whether to request dmabuf buffers. Not part of the plan proper: it depends on whether the
+        /// importer actually CONSTRUCTED (`have_importer` — a GPU/driver fact) and on the modifier
+        /// list that construction yielded.
+        pub(super) fn want_dmabuf(&self, have_importer: bool, modifiers: &[u64]) -> bool {
+            (have_importer || self.vaapi_passthrough) && !modifiers.is_empty() && !self.force_shm
+        }
     }
 
     /// Consecutive tiled-import failures (worker alive, e.g. a per-buffer `EGL_BAD_MATCH`) before
@@ -2109,7 +2346,9 @@ mod pipewire {
         // LIVE cursor publisher (see `PortalCapturer::cursor_live`): refreshed from every
         // dequeued buffer's cursor meta, frames or not.
         cursor_live: Arc<std::sync::Mutex<Option<pf_frame::CursorOverlay>>>,
-        zerocopy: bool,
+        // THE zero-copy negotiation decision, resolved once by `spawn_pipewire` (which consumes the
+        // same struct for the capturer's timeout diagnosis) — never re-derived here.
+        plan: NegotiationPlan,
         // 4:4:4 session: tiled dmabufs take the worker's planar-YUV444 GPU convert.
         want_444: bool,
         // HDR session: offer ONLY the 10-bit PQ/BT.2020 formats as LINEAR dmabufs (see
@@ -2147,75 +2386,35 @@ mod pipewire {
                 .context("pw connect (default daemon)")?,
         };
 
-        // Build the GPU importer up front — normally the ISOLATED worker process
-        // (design/zerocopy-worker-isolation.md), so a driver fault on a dying compositor's
-        // dmabuf kills the worker, not this host. If it fails, log and fall back to the CPU path
-        // (we simply won't request dmabuf below). Skipped entirely when the frames go to the
-        // raw-dmabuf passthrough — the encode backend is VAAPI, or the SESSION encodes PyroWave
-        // (its Vulkan device imports raw dmabufs on any vendor): building the importer there
-        // would waste a CUDA probe — or worse, succeed and produce CUDA payloads only NVENC can
-        // consume. Also skipped once repeated worker deaths latched the import off (a wedged GPU
-        // stack must not crash-loop).
+        // The negotiation decision arrives pre-resolved in `plan` (see `negotiation_plan`): what to
+        // build, which offer to make, and whether to prefer producer NV12. Nothing here re-derives
+        // any of it — that duplication is what F1/L3 was.
         let backend_is_vaapi = policy.backend_is_vaapi;
-        let raw_passthrough = backend_is_vaapi || policy.pyrowave_session;
-        // HDR never builds the EGL→CUDA importer: its de-tile blit renders into 8-bit RGBA8,
-        // which would silently crush the 10-bit depth. The HDR consumers are the CPU mmap path
-        // (LINEAR de-pad → X2Rgb10 CPU frames) and the VAAPI raw-dmabuf passthrough.
-        let mut importer = if zerocopy && !raw_passthrough && !want_hdr {
-            if pf_zerocopy::gpu_import_disabled() {
-                tracing::warn!(
-                    "zero-copy GPU import disabled after repeated import-worker deaths — using CPU path"
-                );
-                None
-            } else {
-                match pf_zerocopy::Importer::new_for_capture() {
-                    Ok(i) => Some(i),
-                    Err(e) => {
-                        tracing::warn!(error = %format!("{e:#}"), "zero-copy import unavailable — using CPU path");
-                        None
-                    }
+        let force_shm = plan.force_shm;
+        let vaapi_passthrough = plan.vaapi_passthrough;
+        let prefer_native_nv12 = plan.prefer_native_nv12;
+        // Build the GPU importer — normally the ISOLATED worker process
+        // (design/zerocopy-worker-isolation.md), so a driver fault on a dying compositor's dmabuf
+        // kills the worker, not this host. If construction fails, log and fall back to the CPU path
+        // (we simply won't request dmabuf below); `plan.build_importer` already encodes WHEN to try
+        // at all (not under a raw passthrough, not for HDR, not once repeated worker deaths latched
+        // the import off — see `negotiation_plan`).
+        if plan.gpu_import_latched {
+            tracing::warn!(
+                "zero-copy GPU import disabled after repeated import-worker deaths — using CPU path"
+            );
+        }
+        let mut importer = if plan.build_importer {
+            match pf_zerocopy::Importer::new_for_capture() {
+                Ok(i) => Some(i),
+                Err(e) => {
+                    tracing::warn!(error = %format!("{e:#}"), "zero-copy import unavailable — using CPU path");
+                    None
                 }
             }
         } else {
             None
         };
-        // PUNKTFUNK_FORCE_SHM=1 forces the race-free download path (SHM, no dmabuf) — a manual
-        // escape hatch, mainly for Mutter+NVIDIA: that combo has no implicit dmabuf fence, so
-        // zero-copy capture can in principle race the compositor's render and show stale frames.
-        // Zero-copy is the Mutter+NVIDIA default (no unconditional override) since live retesting
-        // found no visible staleness; set this if you do see flashing/stale content on such a
-        // host. KWin/gamescope don't need it (they blit into the buffer, so no read-before-render
-        // race).
-        let force_shm = std::env::var("PUNKTFUNK_FORCE_SHM").as_deref() == Ok("1");
-        // Raw-dmabuf zero-copy passthrough: zero-copy on, no EGL→CUDA importer, and the frames'
-        // consumer imports raw dmabufs itself — the VAAPI backend (libva import + GPU CSC) or a
-        // PyroWave session (the wavelet encoder's own Vulkan device, any vendor) → hand the raw
-        // dmabuf straight to the encoder.
-        //
-        // ...unless the encoder already proved it cannot import them here. A driver that refuses
-        // the compositor's buffers refuses them identically on every retry, so without this the
-        // session died on its first frame and every reconnect repeated it. The latch (set by the
-        // encode side after consecutive import failures) is what turns that into one bad session
-        // followed by a working, if slower, host.
-        let raw_dmabuf_off = raw_passthrough && pf_zerocopy::raw_dmabuf_import_disabled();
-        let vaapi_passthrough =
-            zerocopy && !force_shm && importer.is_none() && raw_passthrough && !raw_dmabuf_off;
-        // Producer-side NV12 (default-on; PUNKTFUNK_PIPEWIRE_NV12=0 escapes): gamescope offers a
-        // one-fd LINEAR NV12 image when the consumer asks — its compositor pass does the RGB→YUV,
-        // and the Vulkan Video encoder imports the buffer as its encode source directly (no host
-        // CSC at all). `native_nv12_session` restricts this to sessions whose encoder can ingest
-        // it (Linux vulkan-encode H265/AV1 — never H264/libav-VAAPI, GameStream-resolve, or
-        // PyroWave, whose Vulkan compute CSC ingests packed RGB only). Raw passthrough is
-        // required because the CUDA importer expects packed RGB, and 4:4:4/HDR must not be
-        // silently subsampled/downconverted. Non-NV12 compositors (KWin/GNOME) simply match the
-        // packed-RGB fallback pod.
-        let prefer_native_nv12 = std::env::var("PUNKTFUNK_PIPEWIRE_NV12").as_deref() != Ok("0")
-            && policy.native_nv12_session
-            && backend_is_vaapi
-            && vaapi_passthrough
-            && !policy.pyrowave_session
-            && !want_444
-            && !want_hdr;
         if prefer_native_nv12 {
             tracing::info!(
                 "zero-copy: preferring gamescope producer-side NV12 LINEAR DMA-BUF (no host \
@@ -2251,19 +2450,20 @@ mod pipewire {
                 "zero-copy: advertising the PyroWave device's Vulkan-importable dmabuf modifiers"
             );
         }
-        let want_dmabuf =
-            (importer.is_some() || vaapi_passthrough) && !modifiers.is_empty() && !force_shm;
+        // The one runtime-dependent half of the decision (see `NegotiationPlan::want_dmabuf`): it
+        // needs the modifier list the importer's construction actually yielded.
+        let want_dmabuf = plan.want_dmabuf(importer.is_some(), &modifiers);
         if force_shm {
             tracing::info!(
                 "capture: PUNKTFUNK_FORCE_SHM — race-free SHM download path (no dmabuf, no zero-copy)"
             );
-        } else if raw_dmabuf_off {
+        } else if plan.raw_dmabuf_latched {
             tracing::warn!(
-                "zero-copy raw-dmabuf passthrough disabled after repeated encoder import failures \
-                 — capturing CPU frames instead (this host's GPU driver would not import the \
-                 compositor's buffers)"
+                "zero-copy raw-dmabuf passthrough disabled for this host process (repeated encoder \
+                 import failures, or a previous dmabuf negotiation timeout) — capturing CPU frames \
+                 instead"
             );
-        } else if zerocopy && !want_dmabuf {
+        } else if !want_dmabuf && (plan.build_importer || plan.vaapi_passthrough) {
             tracing::warn!("zero-copy: no importable dmabuf modifiers — using CPU path");
         } else if vaapi_passthrough {
             // The raw-passthrough advertisement. Covers the PyroWave case too: its extra
@@ -2288,6 +2488,8 @@ mod pipewire {
             // zero-copy path), so this genuinely IS the CPU capture path: a VAAPI session then pays
             // three full-frame CPU touches (mmap de-pad + swscale RGB→NV12 + surface upload) —
             // make the silent fallback visible.
+            // The `raw_dmabuf_latched` arm above catches the latched downgrade, so by here zero-copy
+            // is off at the source: the env var, or the session's own output format.
             tracing::warn!(
                 "VAAPI encode with the CPU capture path (per-frame de-pad + swscale CSC + \
                  upload) — zero-copy is off for this capture ({}); clear PUNKTFUNK_ZEROCOPY to \
@@ -2295,8 +2497,7 @@ mod pipewire {
                 if std::env::var_os("PUNKTFUNK_ZEROCOPY").is_some() {
                     "PUNKTFUNK_ZEROCOPY is set falsy"
                 } else {
-                    "a latched downgrade after a failed dmabuf negotiation, or this session's \
-                     output format asked for CPU frames"
+                    "this session's output format asked for CPU frames"
                 }
             );
         }
@@ -2772,6 +2973,232 @@ mod pipewire {
 
     #[cfg(test)]
     mod tests {
+        use super::{negotiation_plan, NegotiationInputs};
+
+        /// A healthy NVENC session: zero-copy on, no latches, SDR 4:2:0, non-VAAPI backend.
+        fn nvenc() -> NegotiationInputs {
+            NegotiationInputs {
+                zerocopy: true,
+                force_shm: false,
+                want_hdr: false,
+                want_444: false,
+                backend_is_vaapi: false,
+                pyrowave_session: false,
+                native_nv12_session: false,
+                raw_dmabuf_import_disabled: false,
+                gpu_import_disabled: false,
+                native_nv12_env_on: true,
+            }
+        }
+
+        /// A gamescope-style VAAPI session that CAN take producer-native NV12.
+        fn vaapi_native_nv12() -> NegotiationInputs {
+            NegotiationInputs {
+                backend_is_vaapi: true,
+                native_nv12_session: true,
+                ..nvenc()
+            }
+        }
+
+        /// The four invariants that were prose-only comments in `pipewire_thread`'s prologue.
+        #[test]
+        fn negotiation_plan_invariants() {
+            // 1. HDR NEVER builds the EGL→CUDA importer — its de-tile blit is 8-bit RGBA8, so an
+            //    importer here would silently crush the 10-bit depth.
+            for want_444 in [false, true] {
+                let p = negotiation_plan(NegotiationInputs {
+                    want_hdr: true,
+                    want_444,
+                    ..nvenc()
+                });
+                assert!(!p.build_importer, "HDR must not build the importer");
+            }
+            // …on every backend, including the ones that take the raw passthrough.
+            assert!(
+                !negotiation_plan(NegotiationInputs {
+                    want_hdr: true,
+                    ..vaapi_native_nv12()
+                })
+                .build_importer
+            );
+
+            // 2. 4:4:4 never prefers producer NV12 (a 4:4:4 session must not be subsampled).
+            let p = negotiation_plan(NegotiationInputs {
+                want_444: true,
+                ..vaapi_native_nv12()
+            });
+            assert!(!p.prefer_native_nv12, "4:4:4 must not take NV12");
+            // Nor does HDR (no 10-bit NV12 path).
+            assert!(
+                !negotiation_plan(NegotiationInputs {
+                    want_hdr: true,
+                    ..vaapi_native_nv12()
+                })
+                .prefer_native_nv12
+            );
+
+            // 3. Producer-native NV12 needs a `native_nv12_session` AND an active raw passthrough:
+            //    libav VAAPI would misread the two-plane buffer, and the CUDA importer expects
+            //    packed RGB.
+            assert!(negotiation_plan(vaapi_native_nv12()).prefer_native_nv12);
+            assert!(
+                !negotiation_plan(NegotiationInputs {
+                    native_nv12_session: false,
+                    ..vaapi_native_nv12()
+                })
+                .prefer_native_nv12,
+                "a session whose encoder can't ingest NV12 must never be offered it"
+            );
+            assert!(
+                !negotiation_plan(NegotiationInputs {
+                    force_shm: true,
+                    ..vaapi_native_nv12()
+                })
+                .prefer_native_nv12,
+                "no passthrough (force_shm) ⇒ no native NV12"
+            );
+            // A PyroWave session takes the passthrough but its CSC ingests packed RGB only.
+            assert!(
+                !negotiation_plan(NegotiationInputs {
+                    pyrowave_session: true,
+                    ..vaapi_native_nv12()
+                })
+                .prefer_native_nv12
+            );
+
+            // 4. The pyrowave-modifier extension (and the passthrough generally) is off whenever
+            //    the raw-dmabuf latch has fired.
+            let p = negotiation_plan(NegotiationInputs {
+                raw_dmabuf_import_disabled: true,
+                ..vaapi_native_nv12()
+            });
+            assert!(!p.vaapi_passthrough, "latched ⇒ no raw passthrough");
+            assert!(!p.prefer_native_nv12);
+            assert!(p.raw_dmabuf_latched, "…and the operator gets told why");
+        }
+
+        /// The drift F1 was about: `spawn_pipewire` derived `vaapi_passthrough` by hand and its copy
+        /// omitted the raw-dmabuf latch, so after that latch fired the capturer believed it had made
+        /// the passthrough offer while the thread had already fallen back — and a timeout then
+        /// latched a downgrade for an offer nobody made. With one resolver the two cannot disagree,
+        /// so this pins the property that made the mirror wrong: the latch MUST move the decision.
+        #[test]
+        fn the_raw_dmabuf_latch_moves_the_passthrough_decision() {
+            for pyrowave in [false, true] {
+                let base = NegotiationInputs {
+                    backend_is_vaapi: !pyrowave,
+                    pyrowave_session: pyrowave,
+                    ..nvenc()
+                };
+                assert!(negotiation_plan(base).vaapi_passthrough);
+                assert!(
+                    !negotiation_plan(NegotiationInputs {
+                        raw_dmabuf_import_disabled: true,
+                        ..base
+                    })
+                    .vaapi_passthrough
+                );
+            }
+        }
+
+        /// A PyroWave session on an NVIDIA box takes the raw passthrough (the wavelet encoder's own
+        /// Vulkan device imports dmabufs on any vendor) and therefore must NOT also build the
+        /// EGL→CUDA importer — whose payloads only NVENC can consume.
+        #[test]
+        fn a_pyrowave_session_passes_through_without_a_cuda_importer() {
+            let p = negotiation_plan(NegotiationInputs {
+                pyrowave_session: true,
+                ..nvenc()
+            });
+            assert!(p.vaapi_passthrough);
+            assert!(!p.build_importer);
+        }
+
+        /// `force_shm` is the race-free download path: no passthrough, and `want_dmabuf` stays false
+        /// even with an importer and a full modifier list.
+        #[test]
+        fn force_shm_wins_over_every_dmabuf_path() {
+            let p = negotiation_plan(NegotiationInputs {
+                force_shm: true,
+                ..vaapi_native_nv12()
+            });
+            assert!(!p.vaapi_passthrough);
+            assert!(!p.want_dmabuf(true, &[0, 1, 2]));
+            // …and an SHM-forced NVENC session may still build the importer (it just won't be fed
+            // dmabufs), which is why `want_dmabuf` — not `build_importer` — is the gate.
+            let p = negotiation_plan(NegotiationInputs {
+                force_shm: true,
+                ..nvenc()
+            });
+            assert!(p.build_importer);
+            assert!(!p.want_dmabuf(true, &[0]));
+        }
+
+        /// `want_dmabuf` needs a real modifier list: an importer that constructed but advertised
+        /// nothing importable falls back to the CPU path.
+        #[test]
+        fn want_dmabuf_needs_both_a_consumer_and_a_modifier() {
+            let p = negotiation_plan(nvenc());
+            assert!(p.want_dmabuf(true, &[0]));
+            assert!(!p.want_dmabuf(true, &[]), "no modifiers ⇒ CPU path");
+            assert!(
+                !p.want_dmabuf(false, &[0]),
+                "importer failed to construct and no passthrough ⇒ CPU path"
+            );
+            // The passthrough needs no importer at all.
+            let p = negotiation_plan(vaapi_native_nv12());
+            assert!(p.want_dmabuf(false, &[0]));
+        }
+
+        /// The GPU-import death latch stops the importer being rebuilt, and says so.
+        #[test]
+        fn the_gpu_import_death_latch_skips_the_importer() {
+            let p = negotiation_plan(NegotiationInputs {
+                gpu_import_disabled: true,
+                ..nvenc()
+            });
+            assert!(!p.build_importer);
+            assert!(p.gpu_import_latched);
+            // It is NOT reported for a capture that would never have built one anyway (HDR, or a
+            // raw passthrough) — that would misdirect the operator.
+            assert!(
+                !negotiation_plan(NegotiationInputs {
+                    gpu_import_disabled: true,
+                    want_hdr: true,
+                    ..nvenc()
+                })
+                .gpu_import_latched
+            );
+            assert!(
+                !negotiation_plan(NegotiationInputs {
+                    gpu_import_disabled: true,
+                    ..vaapi_native_nv12()
+                })
+                .gpu_import_latched
+            );
+        }
+
+        /// Zero-copy off ⇒ nothing at all: no importer, no passthrough, no NV12 preference.
+        #[test]
+        fn zerocopy_off_disables_every_branch() {
+            for i in [
+                NegotiationInputs {
+                    zerocopy: false,
+                    ..nvenc()
+                },
+                NegotiationInputs {
+                    zerocopy: false,
+                    ..vaapi_native_nv12()
+                },
+            ] {
+                let p = negotiation_plan(i);
+                assert!(!p.build_importer);
+                assert!(!p.vaapi_passthrough);
+                assert!(!p.prefer_native_nv12);
+                assert!(!p.want_dmabuf(false, &[0]));
+            }
+        }
+
         /// Pin our hand-written PQ transfer id against the real libspa binding. We can't take the
         /// constant from `pw::spa::sys` directly (older distro headers don't export it — see
         /// [`super::SPA_VIDEO_TRANSFER_SMPTE2084`]), so assert the two agree wherever the symbol

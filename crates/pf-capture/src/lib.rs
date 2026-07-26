@@ -68,6 +68,24 @@ pub trait Capturer: Send {
     /// duration of a stream, `false` when it ends.
     fn set_active(&self, _active: bool) {}
 
+    /// Whether this capturer can still produce frames — the gate a caller that POOLS capturers
+    /// across streams must consult before reusing one.
+    ///
+    /// Some backends have TERMINAL states that are only observable by trying to consume a frame:
+    /// the Linux portal capturer's zero-copy poison flag, a dead PipeWire thread, and a source that
+    /// never returns to `Streaming` are all sticky, and each makes every subsequent
+    /// [`next_frame`](Self::next_frame) / [`try_latest`](Self::try_latest) fail — for that backend
+    /// an `Err` from either is terminal, never transient. A pool that re-admits such a capturer
+    /// wedges the next session permanently (it re-fails at the same point, every reconnect), which
+    /// is why this predicate exists rather than leaving callers to infer liveness from an error they
+    /// have often already discarded.
+    ///
+    /// `true` (the default) for backends with no such state: the synthetic sources, and the Windows
+    /// IDD-push capturer, whose failures already end the session through its own rebuild path.
+    fn is_alive(&self) -> bool {
+        true
+    }
+
     /// The capture source's LIVE cursor state, when it arrives out-of-band from the frames
     /// (the Windows IddCx hardware-cursor channel). Polled by the encode loop every tick and
     /// preferred over `CapturedFrame::cursor` — with a hardware cursor, pointer-only moves

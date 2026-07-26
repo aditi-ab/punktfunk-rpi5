@@ -34,6 +34,28 @@
 
 use std::sync::OnceLock;
 
+/// Whether a `PUNKTFUNK_*` env var reads as ON, or `None` when it is unset — the host's
+/// **explicit-off** grammar: `0` / `false` / `off` / `no` (trimmed, case-insensitive) are off and ANY
+/// other value is on, so a presence-style `=1` keeps working. Every "default ON" knob below shares
+/// it.
+///
+/// Exported because callers in other crates need the SAME grammar. A hand-rolled
+/// `var(k).as_deref() != Ok("0")` accepts `"0 "` (trailing space, trivially produced by a systemd
+/// drop-in or a shell heredoc) and `"false"` as ON — the bug class of ed525c4c, and the reason
+/// `PUNKTFUNK_PIPEWIRE_NV12` in pf-capture now routes through here.
+///
+/// Note this is deliberately NOT the grammar `pf-zerocopy` uses for its own flags (truthy:
+/// `1|true|yes|on`, everything else off) — see the module docs: independent features that share a
+/// name prefix.
+pub fn env_on(name: &str) -> Option<bool> {
+    std::env::var(name).ok().map(|s| {
+        !matches!(
+            s.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        )
+    })
+}
+
 /// Resolved host configuration. Holds the genuinely-constant operator/dispatch knobs (see module docs for
 /// what is deliberately excluded). Fields read on only one platform are kept alive cross-platform by the
 /// derived `Debug` impl, so the parser can stay a single platform-neutral function.
@@ -128,42 +150,16 @@ impl HostConfig {
             idd_depth: val("PUNKTFUNK_IDD_DEPTH")
                 .and_then(|s| s.parse::<usize>().ok())
                 .unwrap_or(2),
-            zerocopy: val("PUNKTFUNK_ZEROCOPY").map(|s| {
-                !matches!(
-                    s.trim().to_ascii_lowercase().as_str(),
-                    "0" | "false" | "off" | "no"
-                )
-            }),
+            zerocopy: env_on("PUNKTFUNK_ZEROCOPY"),
             // Default ON, explicit-off grammar (mirrors `four_four_four`: the client's HDR setting
             // is the real per-session switch; the encode probe keeps incapable GPUs honest at 8-bit).
-            ten_bit: val("PUNKTFUNK_10BIT")
-                .map(|s| {
-                    !matches!(
-                        s.trim().to_ascii_lowercase().as_str(),
-                        "0" | "false" | "off" | "no"
-                    )
-                })
-                .unwrap_or(true),
+            ten_bit: env_on("PUNKTFUNK_10BIT").unwrap_or(true),
             // Default ON, explicit-off grammar (the client's own 4:4:4 setting — default OFF —
             // is the real switch; see the field doc).
-            four_four_four: val("PUNKTFUNK_444")
-                .map(|s| {
-                    !matches!(
-                        s.trim().to_ascii_lowercase().as_str(),
-                        "0" | "false" | "off" | "no"
-                    )
-                })
-                .unwrap_or(true),
+            four_four_four: env_on("PUNKTFUNK_444").unwrap_or(true),
             // Default ON, explicit-off grammar (the client's VIDEO_CAP_CHACHA20 bit is the real
             // per-session switch; see the field doc).
-            chacha20: val("PUNKTFUNK_CHACHA20")
-                .map(|s| {
-                    !matches!(
-                        s.trim().to_ascii_lowercase().as_str(),
-                        "0" | "false" | "off" | "no"
-                    )
-                })
-                .unwrap_or(true),
+            chacha20: env_on("PUNKTFUNK_CHACHA20").unwrap_or(true),
             perf: flag("PUNKTFUNK_PERF"),
             video_source: val("PUNKTFUNK_VIDEO_SOURCE"),
             compositor: val("PUNKTFUNK_COMPOSITOR"),
