@@ -4486,44 +4486,50 @@ mod tests {
         }
     }
 
-    /// A CPU-capture source that CHANGES SIZE mid-session must not copy past the cached staging
-    /// image. `ensure_cpu_rgb` keys that image on (format, width, height); when it was keyed on
-    /// format alone the image kept the FIRST frame's size while `cmd_copy_buffer_to_image` used the
-    /// current frame's extent, so a same-format size increase wrote out of bounds — and `submit`
-    /// still returned `Ok`, so nothing upstream noticed.
-    ///
-    /// The out-of-bounds copy is only *observable* through the Vulkan validation layers, so run this
-    /// as: `VK_LOADER_LAYERS_ENABLE='*validation*' cargo test ... -- --ignored`. Confirmed on RADV
-    /// PHOENIX 2026-07-25: 8 x VUID-vkCmdCopyBufferToImage-imageSubresource-07971 before the fix
-    /// ("extent.width (512) exceeds imageSubresource width extent (128)"), zero after.
+    /// The CSC arm REFUSES a source that doesn't match the session mode (the e3354b6d guard —
+    /// the check every sibling arm always had; a clamped-texelFetch mismatch used to stream a
+    /// silently cropped/edge-padded picture). This test previously DROVE mismatched sizes through
+    /// the lenient arm to exercise the per-slot `cpu_img` staging across a size change (the
+    /// format-only-keyed cache wrote out of bounds while `submit` returned `Ok`); the guard makes
+    /// that scenario unrepresentable through `submit`, structurally retiring the hazard — the
+    /// size-keyed staging from that fix stays as belt-and-braces. What's left to pin:
+    /// refusal in BOTH directions, and that a refused submit does not WEDGE the session — the
+    /// bail happens after step 1's frame-type bookkeeping, so "the next well-sized frame still
+    /// encodes" is a real property, not a formality (the host routes the error to its
+    /// encoder-rebuild path and the session must be able to continue if that path retries).
     #[test]
     #[ignore = "needs a real VK_KHR_video_encode_h265 device; meaningful only under validation layers"]
-    fn vulkan_cpu_img_survives_a_source_size_change() {
-        // CSC mode (rgb=false) — that is the arm where the image is sized to the SOURCE frame.
+    fn vulkan_csc_refuses_a_mismatched_source() {
+        // CSC mode (rgb=false) — the arm the guard covers.
         let mut enc = VulkanVideoEncoder::open_opts(Codec::H265, 512, 512, 60, 10_000_000, false)
             .expect("open");
-        // `cpu_img` is cached PER RING SLOT, so the small frames must first populate every slot;
-        // only when the ring wraps does a slot holding a 128x128 image get a 512x512 copy.
-        eprintln!("phase 1: 8x 128x128 — populates every ring slot with a 128x128 cpu_img");
-        for i in 0..8u64 {
+        enc.submit_indexed(&cpu_frame(512, 512, 0, [40, 40, 200, 255]), 0)
+            .expect("well-sized baseline");
+        while enc.poll().expect("poll").is_some() {}
+        // Smaller AND larger both refuse — the guard is equality on the MODE (render size), not
+        // a ceiling; the render-vs-CODED padding tolerance lives in the direct arms, untouched.
+        let e = enc
+            .submit_indexed(&cpu_frame(128, 128, 16_666_667, [200, 40, 40, 255]), 1)
+            .expect_err("smaller source must refuse");
+        assert!(e.to_string().contains("mismatched"), "{e:#}");
+        let e = enc
+            .submit_indexed(&cpu_frame(640, 640, 33_333_334, [200, 40, 40, 255]), 2)
+            .expect_err("larger source must refuse");
+        assert!(e.to_string().contains("mismatched"), "{e:#}");
+        // The refusals must not wedge the session: a well-sized frame still encodes and an AU
+        // still comes out the other end.
+        let mut got_au = false;
+        for i in 3..11u64 {
             enc.submit_indexed(
-                &cpu_frame(128, 128, i * 16_666_667, [40, 40, 200, 255]),
+                &cpu_frame(512, 512, i * 16_666_667, [40, 200, 40, 255]),
                 i as u32,
             )
-            .expect("submit small");
-            while enc.poll().expect("poll").is_some() {}
+            .expect("well-sized after refusal");
+            while let Ok(Some(_)) = enc.poll() {
+                got_au = true;
+            }
         }
-        eprintln!("phase 2: 8x 512x512 — SAME format, so each slot REUSES its 128x128 image");
-        for i in 8..16u64 {
-            let r = enc.submit_indexed(
-                &cpu_frame(512, 512, i * 16_666_667, [200, 40, 40, 255]),
-                i as u32,
-            );
-            r.expect("submit after the source grew");
-            while matches!(enc.poll(), Ok(Some(_))) {}
-        }
-        let _ = enc.flush();
-        while matches!(enc.poll(), Ok(Some(_))) {}
+        assert!(got_au, "no AU after the refused submits — session wedged");
         eprintln!("done — under validation layers this run must report ZERO VUID errors");
     }
 
