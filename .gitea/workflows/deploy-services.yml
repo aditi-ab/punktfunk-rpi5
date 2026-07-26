@@ -99,3 +99,41 @@ jobs:
             mkdir -p ~/unom-flatpak/site/repo
             cd ~/unom-flatpak
             docker compose -f compose.production.yml up -d
+
+  winget:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Sync winget source compose + server
+        uses: appleboy/scp-action@917f8b81dfc1ccd331fef9e2d61bdc6c8be94634 # v0.1.7
+        with:
+          host: ${{ inputs.deploy_host || secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          port: ${{ secrets.DEPLOY_PORT }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          # Land all three flat in ~/unom-winget/ (drop the packaging/winget/server/ prefix).
+          source: "packaging/winget/server/compose.production.yml,packaging/winget/server/server.mjs,packaging/winget/server/handler.mjs"
+          target: "~/unom-winget"
+          strip_components: 3
+          overwrite: true
+
+      - name: Start winget REST source
+        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2 # v1.2.5
+        with:
+          host: ${{ inputs.deploy_host || secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          port: ${{ secrets.DEPLOY_PORT }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          script: |
+            set -euo pipefail
+            # ./data/data.json is NOT shipped by this workflow — windows-host.yml rsyncs it on each
+            # stable tag (same content/config split as the flatpak repo). Ensure the bind-mount
+            # source exists so the container starts; it serves 503 until the first catalogue lands.
+            mkdir -p ~/unom-winget/data
+            cd ~/unom-winget
+            docker compose -f compose.production.yml up -d
+            # Surface a missing catalogue here rather than letting winget report "no package found".
+            sleep 3
+            curl -fsS http://127.0.0.1:3240/healthz || echo "NOTE: no catalogue yet - publish a stable tag to populate it"

@@ -359,3 +359,82 @@ jobs:
           foreach ($f in @($env:HOST_SETUP_PATH, $env:HOST_CER_PATH)) {
             if ($f -and (Test-Path $f)) { Upsert-GiteaAsset -ReleaseId $rid -File $f }
           }
+
+      # winget manifests for the release just attached above. Runs AFTER the attach step so the
+      # InstallerUrl the manifest pins is already live — winget validates the URL + hash, and a
+      # manifest published ahead of its artifact is a hard 404 for every client that picks it up.
+      # Stable tags only: winget pins one immutable artifact per version, so the rolling `canary/`
+      # alias has nothing it could point at.
+      - name: Emit + attach winget manifests (stable tags only)
+        if: startsWith(gitea.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GITEA_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        run: |
+          & scripts/ci/winget-manifest.ps1 `
+            -Version $env:HOST_VERSION -InstallerPath $env:HOST_SETUP_PATH -OutDir C:\t\out\winget
+          . scripts/ci/gitea-release.ps1
+          $rid = Ensure-GiteaRelease -Tag $env:GITHUB_REF_NAME -Name $env:GITHUB_REF_NAME -Prerelease 'auto'
+          foreach ($f in (Get-ChildItem C:\t\out\winget -Filter *.yaml)) {
+            Upsert-GiteaAsset -ReleaseId $rid -File $f.FullName
+          }
+
+  # Republish the winget REST source on unom-1 once the release above carries its manifests.
+  #
+  # A separate Linux job, not another step in `package`: the deploy actions are Docker-based and do
+  # not run on a Windows runner. `needs: package` also gives the ordering that matters — build-data
+  # reads the manifests from the release, so it must not run before they are attached.
+  winget-source:
+    needs: package
+    if: startsWith(gitea.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      # build-data re-derives the WHOLE catalogue from the releases rather than appending this one,
+      # so the result cannot drift and re-running any tag reproduces it byte for byte.
+      - name: Build + test the source catalogue
+        working-directory: packaging/winget/server
+        run: |
+          set -euo pipefail
+          npm install --no-audit --no-fund
+          node build-data.mjs --out data/data.json
+          # A wrong response SHAPE does not fail loudly — winget just reports "no package found".
+          # Gate on the suite before anything reaches the box.
+          node test.mjs
+
+      # Content only. server.mjs/handler.mjs/compose land via deploy-services.yml, matching how the
+      # flatpak repo's content and config deploy on separate paths.
+      - name: Ship the catalogue to unom-1
+        uses: appleboy/scp-action@917f8b81dfc1ccd331fef9e2d61bdc6c8be94634 # v0.1.7
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          port: ${{ secrets.DEPLOY_PORT }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          source: "packaging/winget/server/data/data.json"
+          target: "~/unom-winget/data"
+          strip_components: 4
+          overwrite: true
+
+      # No restart: server.mjs reloads on mtime change. This only proves the new catalogue is the
+      # one actually being served, and fails the release if it is not.
+      - name: Verify the served catalogue
+        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2 # v1.2.5
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          port: ${{ secrets.DEPLOY_PORT }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          script: |
+            set -euo pipefail
+            curl -fsS http://127.0.0.1:3240/healthz
+            echo
+            curl -fsS -X POST http://127.0.0.1:3240/manifestSearch \
+              -H 'content-type: application/json' -d '{"FetchAllManifests":true}' \
+              | grep -q "${GITHUB_REF_NAME#v}" \
+              || { echo "served catalogue does not contain ${GITHUB_REF_NAME#v}"; exit 1; }
+            echo "winget source serving ${GITHUB_REF_NAME#v}"
+        env:
+          GITHUB_REF_NAME: ${{ gitea.ref_name }}

@@ -1,0 +1,116 @@
+# winget manifests — Windows host
+
+The reviewed source of truth for the `unom.PunktfunkHost` winget package. Everything except
+`PackageVersion` / `InstallerUrl` / `InstallerSha256` / `ReleaseNotesUrl` is edited **here**;
+`scripts/ci/winget-manifest.ps1` only substitutes those four per release, so the switches,
+agreements and installation notes stay under normal code review.
+
+| File | Purpose |
+| --- | --- |
+| `unom.PunktfunkHost.yaml` | Version manifest — ties the other two together. |
+| `unom.PunktfunkHost.installer.yaml` | Installer type, scope, silent switches, `ProductCode`, URL + hash. |
+| `unom.PunktfunkHost.locale.en-US.yaml` | User-facing metadata, `Agreements`, `InstallationNotes`. |
+
+## Why these choices
+
+- **`InstallerType: inno`, `Scope: machine`, `ElevationRequirement: elevatesSelf`.** The host
+  registers a SYSTEM service, installs drivers and opens firewall ports; `PrivilegesRequired=admin`
+  in the `.iss` means Setup raises its own UAC prompt. There is no per-user scope.
+- **`ProductCode: {7C9E6A52-…}_is1`** — Inno's ARP key is `<AppId>_is1`. This is what correlates an
+  installed host with the package for `winget list` / `winget upgrade`. **It must track `AppId` in
+  `packaging/windows/punktfunk-host.iss`** — if that GUID ever changes, change it here too or
+  upgrades silently stop being detected.
+- **`interactive` is in `InstallModes`.** `winget install unom.PunktfunkHost --interactive` runs the
+  full existing wizard: every task checkbox, the web-console password page, the VB-CABLE notice.
+  Nothing about the installer changes to support it.
+- **No `/MERGETASKS` in the silent switches.** A silent install deliberately takes the *same* task
+  defaults the wizard shows, so the product does not differ by install channel — a per-channel
+  default is a support trap ("it works when I install it by hand"). The disclosures the wizard puts
+  on screen are carried by `Agreements` instead, which winget shows *before* install and requires
+  the user to accept.
+- **`UpgradeBehavior: install`** — Inno upgrades in place (`UsePreviousAppDir=yes`). Uninstalling
+  first would run the `[UninstallRun]` service + driver teardown between versions.
+
+## Opting out of individual tasks
+
+Inno's `/MERGETASKS` takes `!` prefixes to deselect a default-checked task. Use `--override`
+(replaces winget's switches) rather than `--custom` (appends — you would end up with two
+`/MERGETASKS` on one command line):
+
+```powershell
+winget install unom.PunktfunkHost --override "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP- /MERGETASKS=!gamestream"
+```
+
+Task names: `installdriver`, `installgamepad`, `installaudiocable`, `installhdrlayer`,
+`gamestream`, `allowpublicfw`, `startservice`, `trayicon`.
+
+## Two installer behaviours that exist for this path
+
+Both are in `packaging/windows/punktfunk-host.iss` and both also fix pre-existing bugs on the
+plain double-click upgrade path:
+
+- **`InitializeSetup` uses `SuppressibleMsgBox`, not `MsgBox`.** A plain `MsgBox` ignores
+  `/SUPPRESSMSGBOXES` and displays even under `/VERYSILENT` — an unattended install on a box that
+  already runs Sunshine/Apollo would block on an invisible modal dialog. Suppressed it returns
+  `IDNO`, so that install aborts (Setup exits non-zero) rather than proceeding into the unsupported
+  dual-host state.
+- **`GamestreamParam` is fresh-install-only.** On an upgrade the flag is omitted entirely, which
+  `service install` reads as "keep host.env as-is". Passing an explicit on/off would rewrite
+  `PUNKTFUNK_HOST_CMD` whenever it still holds either canonical value — so a silent upgrade, where
+  no wizard carries the old choice forward, would flip a user's GameStream setting with nothing on
+  screen.
+- **`PublicFwParam` is fresh-install-only too**, and `--allow-public-network` is now tri-state
+  (`=on` / `=off` / absent → keep the recorded choice, resolved from the `fw-allow-public` marker in
+  `windows/service.rs`). This task is default-*unchecked*, so without the change a silent upgrade
+  would have silently **revoked** a Public-network opt-in the user made once. The bare
+  `--allow-public-network` form still means `on` for existing scripts; a malformed value is a hard
+  error rather than a fall-through, since a typo'd opt-*out* must never resolve to "keep Public
+  open".
+
+## Release flow
+
+`.gitea/workflows/windows-host.yml` runs on stable `v*` tags only, **after** the installer is
+attached to the Gitea release — winget validates the URL and hash, so a manifest must never be
+published ahead of its artifact:
+
+```powershell
+scripts/ci/winget-manifest.ps1 -Version 0.19.2 `
+  -InstallerPath C:\t\out\punktfunk-host-setup-0.19.2.exe -OutDir C:\t\out\winget
+```
+
+The generated trio is attached to the same release. Canary builds are excluded: winget pins one
+immutable artifact per version, so the rolling `canary/` alias has nothing it could point at.
+
+## Validating a change
+
+```powershell
+winget validate --manifest packaging\winget
+winget install --manifest packaging\winget          # local install from the manifest
+```
+
+For a throwaway check, `winget-pkgs`' `Tools\SandboxTest.ps1` runs a manifest in Windows Sandbox.
+Note the host needs a real GPU and installs drivers, so a Sandbox run exercises the *manifest*
+(download, hash, switches, ARP correlation) rather than a working stream.
+
+## Publishing
+
+Through **our own REST source** on unom-1 — see [`server/`](server/README.md). It sits alongside the
+docs (3220) and flatpak (3230) services, behind the same edge Caddy; `windows-host.yml` rebuilds and
+ships its catalogue on every stable tag, so releasing is one pipeline with no manual step.
+
+```powershell
+winget source add -n punktfunk https://winget.punktfunk.unom.io -t Microsoft.Rest   # elevated, once
+winget install unom.PunktfunkHost
+```
+
+These manifests stay in winget-pkgs' own format rather than a bespoke one, so submitting upstream
+later is a copy, not a rewrite. Two things would need attention on that path: the signing note
+below, and `Agreements` being verified-developers-only in the community repo.
+
+> **Signing.** The installer is currently signed with a self-signed cert (`CN=unom`, subject ==
+> issuer) and ships a `.cer` users import manually. winget does not sign anything; it downloads and
+> runs the same binary, so SmartScreen behaves exactly as it does for a browser download. That is a
+> pre-existing condition rather than something winget introduces — but the community repo
+> (`microsoft/winget-pkgs`) gates on it via its `Binary-Validation-Error` /
+> `Validation-Defender-Error` checks, so a submission there needs a publicly-trusted cert (Azure
+> Trusted Signing is the cheap path). A self-hosted source has no such gate.

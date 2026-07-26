@@ -1,0 +1,53 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.6.0.schema.json
+#
+# Installer manifest for the Windows host (packaging/windows/punktfunk-host.iss -> Inno Setup 6).
+#
+# The host is a machine-wide, elevated install: it registers a SYSTEM service, installs the
+# pf-vdisplay + gamepad drivers, and opens firewall ports. There is no per-user scope.
+PackageIdentifier: unom.PunktfunkHost
+PackageVersion: 0.19.2
+
+InstallerType: inno
+Scope: machine
+# PrivilegesRequired=admin in the .iss -> Setup raises its own UAC prompt.
+ElevationRequirement: elevatesSelf
+# Windows 11 22H2 floor: pf-vdisplay is built against IddCx 1.10 with no runtime downgrade, so on
+# anything older the device fails to start with Code 10 (see the MinVersion gate in the .iss).
+MinimumOSVersion: 10.0.22621.0
+
+InstallModes:
+  # interactive keeps the FULL wizard — every task checkbox, the web-console password page, and the
+  # VB-CABLE notice text. `winget install unom.PunktfunkHost --interactive`.
+  - interactive
+  - silent
+  - silentWithProgress
+
+InstallerSwitches:
+  # Spelled out rather than relying on winget's built-in `inno` defaults, so the unattended
+  # behaviour is reviewable here. No /MERGETASKS: a silent install deliberately takes the SAME
+  # task defaults the wizard shows, so the product does not differ by install channel. The
+  # disclosures the wizard puts on screen are carried by Agreements/InstallationNotes in the
+  # locale manifest instead.
+  #
+  # To opt out of individual tasks, callers use Inno's ! negation via --override, e.g.
+  #   winget install unom.PunktfunkHost --override "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP- /MERGETASKS=!gamestream"
+  # Task names: installdriver, installgamepad, installaudiocable, installhdrlayer,
+  #             gamestream, allowpublicfw, startservice, trayicon
+  Silent: /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-
+  SilentWithProgress: /SILENT /SUPPRESSMSGBOXES /NORESTART /SP-
+  Log: /LOG="|LOGPATH|"
+
+# Inno writes its ARP entry under <AppId>_is1; this is what correlates an installed host with the
+# package for `winget list` / `winget upgrade`. Must track AppId in the .iss.
+ProductCode: '{7C9E6A52-1F4B-4E8D-A3C7-2B5D8F1E0A93}_is1'
+# Inno upgrades in place (UsePreviousAppDir=yes) — do not uninstall first, that would run the
+# [UninstallRun] service/driver teardown between versions.
+UpgradeBehavior: install
+
+Installers:
+  - Architecture: x64
+    InstallerUrl: https://git.unom.io/unom/punktfunk/releases/download/v0.19.2/punktfunk-host-setup-0.19.2.exe
+    InstallerSha256: 96964117125BFD5AC4556987DAFAA3966A4A57BBC29C838803857852D595BF4D
+
+ManifestType: installer
+ManifestVersion: 1.6.0

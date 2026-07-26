@@ -1,0 +1,72 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.6.0.schema.json
+PackageIdentifier: unom.PunktfunkHost
+PackageVersion: 0.19.2
+PackageLocale: en-US
+
+Publisher: unom
+PublisherUrl: https://git.unom.io/unom/punktfunk
+PublisherSupportUrl: https://git.unom.io/unom/punktfunk/issues
+PackageName: Punktfunk Host
+PackageUrl: https://docs.punktfunk.unom.io/docs/windows-host
+License: MIT OR Apache-2.0
+LicenseUrl: https://git.unom.io/unom/punktfunk/src/branch/main/LICENSE-MIT
+Copyright: Copyright (c) unom
+ShortDescription: Low-latency game-streaming host — stream your PC's games to any Punktfunk or Moonlight client.
+Description: |-
+  Punktfunk Host turns a Windows 11 PC into a low-latency game-streaming server. It captures the
+  desktop or a dedicated virtual display, encodes with NVENC / AMF / QSV / Vulkan, and streams over
+  its native QUIC protocol to Punktfunk clients on Windows, macOS, iOS, tvOS, Android and Linux —
+  or over GameStream to stock Moonlight clients.
+
+  The installer bundles the pf-vdisplay virtual display driver (native-resolution and HDR streaming
+  without a physical monitor), virtual DualSense / DualShock 4 / Xbox 360 gamepads, and a web
+  management console served on port 47992.
+Moniker: punktfunk-host
+Tags:
+  - game-streaming
+  - remote-desktop
+  - moonlight
+  - gamestream
+  - streaming
+  - remote-play
+ReleaseNotesUrl: https://git.unom.io/unom/punktfunk/src/branch/main/docs/releases/v0.19.2.md
+Documentations:
+  - DocumentLabel: Windows Host Setup
+    DocumentUrl: https://docs.punktfunk.unom.io/docs/windows-host
+
+# Shown BEFORE download/install; the user must accept or the install does not proceed. This is what
+# carries — on the unattended path, where no wizard page is on screen — the disclosures the wizard
+# puts in its task text. VB-Audio's bundling grant specifically requires the end user to see
+# VB-CABLE's origin + donationware status at install time.
+Agreements:
+  - AgreementLabel: Bundled virtual audio (VB-CABLE by VB-Audio)
+    Agreement: >-
+      Punktfunk's streaming microphone uses VB-CABLE by VB-Audio (www.vb-cable.com), which this
+      installer bundles and installs. VB-CABLE is donationware — all participations welcome. It is
+      redistributed under VB-Audio's bundling grant; the full notice is installed to
+      %ProgramFiles%\punktfunk\licenses\VB-CABLE-NOTICE.txt.
+    AgreementUrl: https://vb-audio.com/Cable/
+  - AgreementLabel: GameStream (Moonlight) compatibility is enabled by default
+    Agreement: >-
+      The default install enables GameStream so stock Moonlight clients can connect. GameStream uses
+      legacy plain-HTTP pairing and is intended for trusted LANs only. To install without it, use
+      --override "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP- /MERGETASKS=!gamestream", or run
+      --interactive and clear the GameStream checkbox. It can also be changed later via
+      PUNKTFUNK_HOST_CMD in %ProgramData%\punktfunk\host.env.
+    AgreementUrl: https://docs.punktfunk.unom.io/docs/windows-host
+
+# Displayed after the install completes. The console password is generated per install, so it can
+# only be pointed at, never printed here — this text is fixed at publish time.
+InstallationNotes: |-
+  Web management console:  https://<this-PC>:47992
+    The login password was generated during installation and is stored in
+    %ProgramData%\punktfunk\web-password  (edit that file to change it).
+
+  Configuration:  %ProgramData%\punktfunk\host.env
+  Logs:           %ProgramData%\punktfunk\logs\
+
+  The host service starts automatically at boot. `punktfunk-host` is on the machine PATH — run
+  `punktfunk-host service status` from an elevated prompt to check it.
+
+ManifestType: defaultLocale
+ManifestVersion: 1.6.0

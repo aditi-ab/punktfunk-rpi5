@@ -1,0 +1,15 @@
+{
+  "name": "punktfunk-winget-source",
+  "private": true,
+  "type": "module",
+  "description": "winget REST source for the Punktfunk Windows host (read path only).",
+  "scripts": {
+    "build": "node build-data.mjs --out data/data.json",
+    "build:local": "node build-data.mjs --local .. --out data/data.json",
+    "test": "node test.mjs",
+    "start": "node server.mjs"
+  },
+  "devDependencies": {
+    "yaml": "^2.5.0"
+  }
+}

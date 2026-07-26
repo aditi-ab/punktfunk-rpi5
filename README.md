@@ -96,7 +96,7 @@ Windows host also ships as a signed installer (all-vendor: NVIDIA, AMD, Intel).
 | **Bazzite / Fedora Atomic** (systemd-sysext) | `sudo bash punktfunk-sysext.sh install` *(no layering, no reboot; rpm-ostree + bootc also supported)* | [Bazzite](https://docs.punktfunk.unom.io/docs/bazzite) |
 | **Fedora** (dnf) | `dnf install punktfunk punktfunk-web` *(after adding the repo)* | [Fedora — KDE](https://docs.punktfunk.unom.io/docs/fedora-kde) |
 | **Arch / Steam Deck** (pacman / sysext) | `pacman -Sy punktfunk-host` *(binary repo)* · sysext `.raw` *(SteamOS)* | [packaging/arch](packaging/arch/README.md) |
-| **Windows** (11 22H2+, x64) | signed `setup.exe` from the package registry | [Windows Host](https://docs.punktfunk.unom.io/docs/windows-host) |
+| **Windows** (11 22H2+, x64) | `winget install unom.PunktfunkHost` *(after `winget source add -n punktfunk https://winget.punktfunk.unom.io -t Microsoft.Rest`)* · or the signed `setup.exe` from the package registry | [Windows Host](https://docs.punktfunk.unom.io/docs/windows-host) · [packaging/winget](packaging/winget/README.md) |
 
 `punktfunk-host` is the streaming host; `punktfunk-web` is the browser console (pairing + status).
 After install, run `punktfunk-host serve` inside your desktop session (the secure native default;
