@@ -66,6 +66,11 @@ struct CudaHw {
 
 impl CudaHw {
     /// Build a CUDA hwdevice wrapping `cu_ctx` and a frames pool (`sw_format` = `pixel`).
+    ///
+    /// The `bail!`s below format raw AVERROR ints eagerly BY DESIGN — do not convert them to
+    /// typed errors: `open_nvenc_probed`'s bitrate ladder steps down on a typed EINVAL
+    /// (`nvenc_open_einval`), and a hwdevice/hwframes EINVAL is a config error no bitrate can
+    /// fix — enrolling it would burn ~10 doomed encoder opens before surfacing the real failure.
     unsafe fn new(cu_ctx: *mut std::ffi::c_void, sw_format: Pixel, w: u32, h: u32) -> Result<Self> {
         let mut device_ref = ffi::av_hwdevice_ctx_alloc(ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_CUDA);
         if device_ref.is_null() {

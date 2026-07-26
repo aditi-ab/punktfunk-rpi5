@@ -1814,6 +1814,38 @@ mod tests {
         assert_eq!(trait_fns, impl_fns);
     }
 
+    /// The typed-EINVAL classifier the bitrate ladder keys on (Phase 8): the `ffmpeg::Error`
+    /// must survive `with_context` layers as a downcastable source — pinned here because the
+    /// entire ladder's step-down behavior rests on it, and an eager `format!` anywhere between
+    /// `open_with` and the ladder would silently break it (the ladder would stop stepping and
+    /// 4K sessions would surface errors instead of degrading).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nvenc_open_einval_survives_context_layers() {
+        use ffmpeg_next as ffmpeg;
+        let e = anyhow::Error::from(ffmpeg::Error::Other {
+            errno: ffmpeg::util::error::EINVAL,
+        })
+        .context("open hevc_nvenc (3840x2160@120, 400000000 bps)")
+        .context("outer");
+        assert!(nvenc_open_einval(&e));
+        // ENOSYS (or any other errno) must not step the ladder.
+        let e = anyhow::Error::from(ffmpeg::Error::Other {
+            errno: ffmpeg::util::error::ENOSYS,
+        })
+        .context("open");
+        assert!(!nvenc_open_einval(&e));
+    }
+
+    /// The phrase WITHOUT the type no longer classifies — the fragility that was removed: the
+    /// old string match trusted any error whose rendering contained "Invalid argument".
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nvenc_open_einval_ignores_untyped_text() {
+        let e = anyhow::anyhow!("driver said: Invalid argument (not a typed libav errno)");
+        assert!(!nvenc_open_einval(&e));
+    }
+
     /// WP7.6: the resolver's full alias table, pinned. The panicking closure is the laziness
     /// contract — an explicit pref must resolve WITHOUT running the auto probe (`/serverinfo`
     /// polls through the mirrors; `gamestream/serverinfo.rs` litigated exactly that cost).
