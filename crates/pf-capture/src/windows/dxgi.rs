@@ -65,7 +65,10 @@ unsafe extern "system" fn hybrid_query_hook(gpu_preference: *mut u32) -> i32 {
     if gpu_preference.is_null() {
         return 0xC000_000Du32 as i32; // STATUS_INVALID_PARAMETER
     }
-    *gpu_preference = 3; // D3DKMT_GPU_PREFERENCE_STATE_UNSPECIFIED
+    // SAFETY: win32u's contract for this export — the caller (DXGI) passes a writable `*mut u32`
+    // out-param — and the null case has just been rejected above, so this is an in-bounds,
+    // 4-aligned single-word store into the caller's live local.
+    unsafe { *gpu_preference = 3 }; // D3DKMT_GPU_PREFERENCE_STATE_UNSPECIFIED
     0 // STATUS_SUCCESS
 }
 
@@ -161,36 +164,49 @@ pub fn install_gpu_pref_hook() {
     });
 }
 
+/// Compile one HLSL entry point. Returns the bytecode blob's bytes.
+///
+/// # Safety
+/// `entry` and `target` must be valid NUL-terminated ASCII pointers (an `s!()` literal at every
+/// call site); `src` is a plain Rust `&str`, read only for the duration of the call.
 pub(crate) unsafe fn compile_shader(src: &str, entry: PCSTR, target: PCSTR) -> Result<Vec<u8>> {
-    let mut blob: Option<ID3DBlob> = None;
-    let mut errs: Option<ID3DBlob> = None;
-    let r = D3DCompile(
-        src.as_ptr() as *const c_void,
-        src.len(),
-        PCSTR::null(),
-        None,
-        None,
-        entry,
-        target,
-        0,
-        0,
-        &mut blob,
-        Some(&mut errs),
-    );
-    if r.is_err() {
-        let msg = errs
-            .as_ref()
-            .map(|e| {
-                let p = e.GetBufferPointer() as *const u8;
-                String::from_utf8_lossy(std::slice::from_raw_parts(p, e.GetBufferSize()))
-                    .to_string()
-            })
-            .unwrap_or_default();
-        bail!("D3DCompile failed: {msg}");
+    // SAFETY: `D3DCompile` reads `src.as_ptr()` for exactly `src.len()` bytes (a live `&str` that
+    // outlives the synchronous call) plus the two caller-supplied NUL-terminated `PCSTR`s (per the
+    // contract above); `&mut blob` / `Some(&mut errs)` are live out-params. Both
+    // `slice::from_raw_parts` calls pair a blob's OWN `GetBufferPointer` with its OWN
+    // `GetBufferSize` while that blob is still alive, and the slice is copied
+    // (`to_string` / `to_vec`) before it goes out of scope.
+    unsafe {
+        let mut blob: Option<ID3DBlob> = None;
+        let mut errs: Option<ID3DBlob> = None;
+        let r = D3DCompile(
+            src.as_ptr() as *const c_void,
+            src.len(),
+            PCSTR::null(),
+            None,
+            None,
+            entry,
+            target,
+            0,
+            0,
+            &mut blob,
+            Some(&mut errs),
+        );
+        if r.is_err() {
+            let msg = errs
+                .as_ref()
+                .map(|e| {
+                    let p = e.GetBufferPointer() as *const u8;
+                    String::from_utf8_lossy(std::slice::from_raw_parts(p, e.GetBufferSize()))
+                        .to_string()
+                })
+                .unwrap_or_default();
+            bail!("D3DCompile failed: {msg}");
+        }
+        let blob = blob.context("no shader blob")?;
+        let p = blob.GetBufferPointer() as *const u8;
+        Ok(std::slice::from_raw_parts(p, blob.GetBufferSize()).to_vec())
     }
-    let blob = blob.context("no shader blob")?;
-    let p = blob.GetBufferPointer() as *const u8;
-    Ok(std::slice::from_raw_parts(p, blob.GetBufferSize()).to_vec())
 }
 
 /// Fullscreen-triangle vertex shader for the HDR conversion pass (3 verts, no input layout).
@@ -322,49 +338,55 @@ pub(crate) struct HdrP010Converter {
 
 impl HdrP010Converter {
     pub(crate) unsafe fn new(device: &ID3D11Device) -> Result<Self> {
-        // Inline the shared HLSL (D3DCompile has no include handler wired here). The two PS sources
-        // carry a `#include_common` marker we substitute before compiling.
-        let y_src = HDR_P010_Y_PS.replace("#include_common", HDR_P010_COMMON);
-        let uv_src = HDR_P010_UV_PS.replace("#include_common", HDR_P010_COMMON);
-        let vsb = compile_shader(HDR_VS, s!("main"), s!("vs_5_0"))?;
-        let yb = compile_shader(&y_src, s!("main"), s!("ps_5_0"))?;
-        let uvb = compile_shader(&uv_src, s!("main"), s!("ps_5_0"))?;
-        let mut vs = None;
-        device.CreateVertexShader(&vsb, None, Some(&mut vs))?;
-        let mut ps_y = None;
-        device.CreatePixelShader(&yb, None, Some(&mut ps_y))?;
-        let mut ps_uv = None;
-        device.CreatePixelShader(&uvb, None, Some(&mut ps_uv))?;
-        let sd = D3D11_SAMPLER_DESC {
-            // POINT: the Y pass samples a single texel centre exactly, and the UV pass does its OWN
-            // 2x2 box average via 4 explicit taps at texel centres (offset half a texel). Point
-            // sampling keeps each tap exact; the averaging is in the shader, not the sampler.
-            Filter: D3D11_FILTER_MIN_MAG_MIP_POINT,
-            AddressU: D3D11_TEXTURE_ADDRESS_CLAMP,
-            AddressV: D3D11_TEXTURE_ADDRESS_CLAMP,
-            AddressW: D3D11_TEXTURE_ADDRESS_CLAMP,
-            ComparisonFunc: D3D11_COMPARISON_NEVER,
-            MaxLOD: f32::MAX,
-            ..Default::default()
-        };
-        let mut sampler = None;
-        device.CreateSamplerState(&sd, Some(&mut sampler))?;
-        let cbd = D3D11_BUFFER_DESC {
-            ByteWidth: 16, // float2 inv_src + float2 pad
-            Usage: D3D11_USAGE_DYNAMIC,
-            BindFlags: D3D11_BIND_CONSTANT_BUFFER.0 as u32,
-            CPUAccessFlags: D3D11_CPU_ACCESS_WRITE.0 as u32,
-            ..Default::default()
-        };
-        let mut cbuf = None;
-        device.CreateBuffer(&cbd, None, Some(&mut cbuf))?;
-        Ok(Self {
-            vs: vs.context("p010 vs")?,
-            ps_y: ps_y.context("p010 y ps")?,
-            ps_uv: ps_uv.context("p010 uv ps")?,
-            sampler: sampler.context("p010 sampler")?,
-            cbuf: cbuf.context("p010 cbuf")?,
-        })
+        // SAFETY: every call is a `?`-checked D3D11 method on the live `device` borrow, over
+        // fully-initialized stack descriptors and live `Option` out-params; `compile_shader` receives
+        // `s!()` literals (its contract). Each created COM interface owns its own reference, and no
+        // raw pointer outlives the call that produced it.
+        unsafe {
+            // Inline the shared HLSL (D3DCompile has no include handler wired here). The two PS sources
+            // carry a `#include_common` marker we substitute before compiling.
+            let y_src = HDR_P010_Y_PS.replace("#include_common", HDR_P010_COMMON);
+            let uv_src = HDR_P010_UV_PS.replace("#include_common", HDR_P010_COMMON);
+            let vsb = compile_shader(HDR_VS, s!("main"), s!("vs_5_0"))?;
+            let yb = compile_shader(&y_src, s!("main"), s!("ps_5_0"))?;
+            let uvb = compile_shader(&uv_src, s!("main"), s!("ps_5_0"))?;
+            let mut vs = None;
+            device.CreateVertexShader(&vsb, None, Some(&mut vs))?;
+            let mut ps_y = None;
+            device.CreatePixelShader(&yb, None, Some(&mut ps_y))?;
+            let mut ps_uv = None;
+            device.CreatePixelShader(&uvb, None, Some(&mut ps_uv))?;
+            let sd = D3D11_SAMPLER_DESC {
+                // POINT: the Y pass samples a single texel centre exactly, and the UV pass does its OWN
+                // 2x2 box average via 4 explicit taps at texel centres (offset half a texel). Point
+                // sampling keeps each tap exact; the averaging is in the shader, not the sampler.
+                Filter: D3D11_FILTER_MIN_MAG_MIP_POINT,
+                AddressU: D3D11_TEXTURE_ADDRESS_CLAMP,
+                AddressV: D3D11_TEXTURE_ADDRESS_CLAMP,
+                AddressW: D3D11_TEXTURE_ADDRESS_CLAMP,
+                ComparisonFunc: D3D11_COMPARISON_NEVER,
+                MaxLOD: f32::MAX,
+                ..Default::default()
+            };
+            let mut sampler = None;
+            device.CreateSamplerState(&sd, Some(&mut sampler))?;
+            let cbd = D3D11_BUFFER_DESC {
+                ByteWidth: 16, // float2 inv_src + float2 pad
+                Usage: D3D11_USAGE_DYNAMIC,
+                BindFlags: D3D11_BIND_CONSTANT_BUFFER.0 as u32,
+                CPUAccessFlags: D3D11_CPU_ACCESS_WRITE.0 as u32,
+                ..Default::default()
+            };
+            let mut cbuf = None;
+            device.CreateBuffer(&cbd, None, Some(&mut cbuf))?;
+            Ok(Self {
+                vs: vs.context("p010 vs")?,
+                ps_y: ps_y.context("p010 y ps")?,
+                ps_uv: ps_uv.context("p010 uv ps")?,
+                sampler: sampler.context("p010 sampler")?,
+                cbuf: cbuf.context("p010 cbuf")?,
+            })
+        }
     }
 
     /// Create a per-plane RTV of the P010 texture `dst` with the given single-plane `format`
@@ -375,15 +397,19 @@ impl HdrP010Converter {
         dst: &ID3D11Texture2D,
         format: DXGI_FORMAT,
     ) -> Result<ID3D11RenderTargetView> {
-        let desc = D3D11_RENDER_TARGET_VIEW_DESC {
-            Format: format,
-            ViewDimension: D3D11_RTV_DIMENSION_TEXTURE2D,
-            Anonymous: D3D11_RENDER_TARGET_VIEW_DESC_0 {
-                Texture2D: D3D11_TEX2D_RTV { MipSlice: 0 },
-            },
-        };
-        let mut rtv: Option<ID3D11RenderTargetView> = None;
-        device
+        // SAFETY: one `?`-checked `CreateRenderTargetView` on the live `device` borrow, with a
+        // fully-initialized `D3D11_RENDER_TARGET_VIEW_DESC` local whose address is taken only for the
+        // duration of the synchronous call, plus a live `Option` out-param.
+        unsafe {
+            let desc = D3D11_RENDER_TARGET_VIEW_DESC {
+                Format: format,
+                ViewDimension: D3D11_RTV_DIMENSION_TEXTURE2D,
+                Anonymous: D3D11_RENDER_TARGET_VIEW_DESC_0 {
+                    Texture2D: D3D11_TEX2D_RTV { MipSlice: 0 },
+                },
+            };
+            let mut rtv: Option<ID3D11RenderTargetView> = None;
+            device
             .CreateRenderTargetView(
                 dst,
                 Some(&desc as *const D3D11_RENDER_TARGET_VIEW_DESC),
@@ -392,7 +418,8 @@ impl HdrP010Converter {
             .with_context(|| {
                 format!("CreateRenderTargetView(P010 plane, format={format:?}) — driver may not support planar RTVs")
             })?;
-        rtv.context("p010 plane rtv null")
+            rtv.context("p010 plane rtv null")
+        }
     }
 
     /// Convert `src_srv` (FP16 scRGB, WxH) into `dst` (a `DXGI_FORMAT_P010` texture with
@@ -408,62 +435,70 @@ impl HdrP010Converter {
         w: u32,
         h: u32,
     ) -> Result<()> {
-        let y_rtv = Self::plane_rtv(device, dst, DXGI_FORMAT_R16_UNORM)?;
-        let uv_rtv = Self::plane_rtv(device, dst, DXGI_FORMAT_R16G16_UNORM)?;
+        // SAFETY: all D3D11 work runs on the caller's live `device`/`ctx` borrows (`ctx` is the
+        // owning capture thread's immediate context), and `plane_rtv` receives that same device. The
+        // `copy_nonoverlapping` writes `cb.len()` `f32`s into `mapped.pData` — the pointer the
+        // immediately preceding `Map` of `self.cbuf` returned, a 16-byte (4×`f32`) DYNAMIC constant
+        // buffer — inside the `is_ok()` arm only, before the paired `Unmap`. Every `OMSet*`/`PSSet*`/
+        // `RSSetViewports`/`Draw` takes borrowed slices of live locals or clones of live interfaces.
+        unsafe {
+            let y_rtv = Self::plane_rtv(device, dst, DXGI_FORMAT_R16_UNORM)?;
+            let uv_rtv = Self::plane_rtv(device, dst, DXGI_FORMAT_R16G16_UNORM)?;
 
-        // Update the chroma constant buffer (inverse source texel size).
-        let cb: [f32; 4] = [1.0 / w as f32, 1.0 / h as f32, 0.0, 0.0];
-        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-        if ctx
-            .Map(&self.cbuf, 0, D3D11_MAP_WRITE_DISCARD, 0, Some(&mut mapped))
-            .is_ok()
-        {
-            std::ptr::copy_nonoverlapping(cb.as_ptr(), mapped.pData as *mut f32, cb.len());
-            ctx.Unmap(&self.cbuf, 0);
+            // Update the chroma constant buffer (inverse source texel size).
+            let cb: [f32; 4] = [1.0 / w as f32, 1.0 / h as f32, 0.0, 0.0];
+            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+            if ctx
+                .Map(&self.cbuf, 0, D3D11_MAP_WRITE_DISCARD, 0, Some(&mut mapped))
+                .is_ok()
+            {
+                std::ptr::copy_nonoverlapping(cb.as_ptr(), mapped.pData as *mut f32, cb.len());
+                ctx.Unmap(&self.cbuf, 0);
+            }
+
+            // Shared pipeline state.
+            ctx.OMSetBlendState(None, None, 0xffff_ffff); // opaque overwrite
+            ctx.VSSetShader(&self.vs, None);
+            ctx.PSSetShaderResources(0, Some(&[Some(src_srv.clone())]));
+            ctx.PSSetSamplers(0, Some(&[Some(self.sampler.clone())]));
+            ctx.IASetInputLayout(None);
+            ctx.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+
+            // --- LUMA pass: full-res, plane 0 ---
+            let vp_y = D3D11_VIEWPORT {
+                TopLeftX: 0.0,
+                TopLeftY: 0.0,
+                Width: w as f32,
+                Height: h as f32,
+                MinDepth: 0.0,
+                MaxDepth: 1.0,
+            };
+            ctx.RSSetViewports(Some(&[vp_y]));
+            ctx.OMSetRenderTargets(Some(&[Some(y_rtv.clone())]), None);
+            ctx.PSSetShader(&self.ps_y, None);
+            ctx.Draw(3, 0);
+            ctx.OMSetRenderTargets(Some(&[None]), None);
+
+            // --- CHROMA pass: half-res, plane 1 ---
+            let vp_uv = D3D11_VIEWPORT {
+                TopLeftX: 0.0,
+                TopLeftY: 0.0,
+                Width: (w / 2) as f32,
+                Height: (h / 2) as f32,
+                MinDepth: 0.0,
+                MaxDepth: 1.0,
+            };
+            ctx.RSSetViewports(Some(&[vp_uv]));
+            ctx.OMSetRenderTargets(Some(&[Some(uv_rtv.clone())]), None);
+            ctx.PSSetShader(&self.ps_uv, None);
+            ctx.PSSetConstantBuffers(0, Some(&[Some(self.cbuf.clone())]));
+            ctx.Draw(3, 0);
+
+            // Unbind for the next frame's re-RTV / NVENC read.
+            ctx.OMSetRenderTargets(Some(&[None]), None);
+            ctx.PSSetShaderResources(0, Some(&[None]));
+            Ok(())
         }
-
-        // Shared pipeline state.
-        ctx.OMSetBlendState(None, None, 0xffff_ffff); // opaque overwrite
-        ctx.VSSetShader(&self.vs, None);
-        ctx.PSSetShaderResources(0, Some(&[Some(src_srv.clone())]));
-        ctx.PSSetSamplers(0, Some(&[Some(self.sampler.clone())]));
-        ctx.IASetInputLayout(None);
-        ctx.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-
-        // --- LUMA pass: full-res, plane 0 ---
-        let vp_y = D3D11_VIEWPORT {
-            TopLeftX: 0.0,
-            TopLeftY: 0.0,
-            Width: w as f32,
-            Height: h as f32,
-            MinDepth: 0.0,
-            MaxDepth: 1.0,
-        };
-        ctx.RSSetViewports(Some(&[vp_y]));
-        ctx.OMSetRenderTargets(Some(&[Some(y_rtv.clone())]), None);
-        ctx.PSSetShader(&self.ps_y, None);
-        ctx.Draw(3, 0);
-        ctx.OMSetRenderTargets(Some(&[None]), None);
-
-        // --- CHROMA pass: half-res, plane 1 ---
-        let vp_uv = D3D11_VIEWPORT {
-            TopLeftX: 0.0,
-            TopLeftY: 0.0,
-            Width: (w / 2) as f32,
-            Height: (h / 2) as f32,
-            MinDepth: 0.0,
-            MaxDepth: 1.0,
-        };
-        ctx.RSSetViewports(Some(&[vp_uv]));
-        ctx.OMSetRenderTargets(Some(&[Some(uv_rtv.clone())]), None);
-        ctx.PSSetShader(&self.ps_uv, None);
-        ctx.PSSetConstantBuffers(0, Some(&[Some(self.cbuf.clone())]));
-        ctx.Draw(3, 0);
-
-        // Unbind for the next frame's re-RTV / NVENC read.
-        ctx.OMSetRenderTargets(Some(&[None]), None);
-        ctx.PSSetShaderResources(0, Some(&[None]));
-        Ok(())
     }
 }
 
@@ -604,33 +639,37 @@ pub(crate) struct BgraToYuvPlanes {
 
 impl BgraToYuvPlanes {
     pub(crate) unsafe fn new(device: &ID3D11Device, hdr: bool, chroma444: bool) -> Result<Self> {
-        let (y_src, uv_src) = match (hdr, chroma444) {
-            (false, false) => (PYRO_Y_PS.to_string(), PYRO_UV_PS.to_string()),
-            (false, true) => (PYRO_Y_PS.to_string(), PYRO_UV444_PS.to_string()),
-            (true, false) => (
-                PYRO_HDR_Y_PS.replace("#include_common", PYRO_HDR_COMMON),
-                PYRO_HDR_UV_PS.replace("#include_common", PYRO_HDR_COMMON),
-            ),
-            (true, true) => (
-                PYRO_HDR_Y_PS.replace("#include_common", PYRO_HDR_COMMON),
-                PYRO_HDR_UV444_PS.replace("#include_common", PYRO_HDR_COMMON),
-            ),
-        };
-        let vsb = compile_shader(HDR_VS, s!("main"), s!("vs_5_0"))?;
-        let yb = compile_shader(&y_src, s!("main"), s!("ps_5_0"))?;
-        let uvb = compile_shader(&uv_src, s!("main"), s!("ps_5_0"))?;
-        let mut vs = None;
-        device.CreateVertexShader(&vsb, None, Some(&mut vs))?;
-        let mut ps_y = None;
-        device.CreatePixelShader(&yb, None, Some(&mut ps_y))?;
-        let mut ps_uv = None;
-        device.CreatePixelShader(&uvb, None, Some(&mut ps_uv))?;
-        Ok(Self {
-            vs: vs.context("pyro vs")?,
-            ps_y: ps_y.context("pyro y ps")?,
-            ps_uv: ps_uv.context("pyro uv ps")?,
-            chroma444,
-        })
+        // SAFETY: as `HdrP010Converter::new` — `?`-checked D3D11 shader creation on the live
+        // `device` borrow, with `s!()` literals into `compile_shader` and live out-params.
+        unsafe {
+            let (y_src, uv_src) = match (hdr, chroma444) {
+                (false, false) => (PYRO_Y_PS.to_string(), PYRO_UV_PS.to_string()),
+                (false, true) => (PYRO_Y_PS.to_string(), PYRO_UV444_PS.to_string()),
+                (true, false) => (
+                    PYRO_HDR_Y_PS.replace("#include_common", PYRO_HDR_COMMON),
+                    PYRO_HDR_UV_PS.replace("#include_common", PYRO_HDR_COMMON),
+                ),
+                (true, true) => (
+                    PYRO_HDR_Y_PS.replace("#include_common", PYRO_HDR_COMMON),
+                    PYRO_HDR_UV444_PS.replace("#include_common", PYRO_HDR_COMMON),
+                ),
+            };
+            let vsb = compile_shader(HDR_VS, s!("main"), s!("vs_5_0"))?;
+            let yb = compile_shader(&y_src, s!("main"), s!("ps_5_0"))?;
+            let uvb = compile_shader(&uv_src, s!("main"), s!("ps_5_0"))?;
+            let mut vs = None;
+            device.CreateVertexShader(&vsb, None, Some(&mut vs))?;
+            let mut ps_y = None;
+            device.CreatePixelShader(&yb, None, Some(&mut ps_y))?;
+            let mut ps_uv = None;
+            device.CreatePixelShader(&uvb, None, Some(&mut ps_uv))?;
+            Ok(Self {
+                vs: vs.context("pyro vs")?,
+                ps_y: ps_y.context("pyro y ps")?,
+                ps_uv: ps_uv.context("pyro uv ps")?,
+                chroma444,
+            })
+        }
     }
 
     /// Convert `src_srv` (BGRA slot for SDR / scRGB FP16 slot for HDR, WxH) → `y_rtv` (full-res Y
@@ -646,47 +685,52 @@ impl BgraToYuvPlanes {
         w: u32,
         h: u32,
     ) -> Result<()> {
-        ctx.OMSetBlendState(None, None, 0xffff_ffff); // opaque overwrite
-        ctx.VSSetShader(&self.vs, None);
-        ctx.PSSetShaderResources(0, Some(&[Some(src_srv.clone())]));
-        ctx.IASetInputLayout(None);
-        ctx.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        // SAFETY: D3D11 state-setting plus two `Draw`s on the caller's live immediate-context
+        // borrow, over borrowed slices of fully-initialized locals (the viewports) and clones of the
+        // caller's live SRV/RTVs. No raw pointers and no mapping on this path.
+        unsafe {
+            ctx.OMSetBlendState(None, None, 0xffff_ffff); // opaque overwrite
+            ctx.VSSetShader(&self.vs, None);
+            ctx.PSSetShaderResources(0, Some(&[Some(src_srv.clone())]));
+            ctx.IASetInputLayout(None);
+            ctx.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 
-        // LUMA pass: full-res → the R8 Y texture.
-        ctx.RSSetViewports(Some(&[D3D11_VIEWPORT {
-            TopLeftX: 0.0,
-            TopLeftY: 0.0,
-            Width: w as f32,
-            Height: h as f32,
-            MinDepth: 0.0,
-            MaxDepth: 1.0,
-        }]));
-        ctx.OMSetRenderTargets(Some(&[Some(y_rtv.clone())]), None);
-        ctx.PSSetShader(&self.ps_y, None);
-        ctx.Draw(3, 0);
-        ctx.OMSetRenderTargets(Some(&[None]), None);
+            // LUMA pass: full-res → the R8 Y texture.
+            ctx.RSSetViewports(Some(&[D3D11_VIEWPORT {
+                TopLeftX: 0.0,
+                TopLeftY: 0.0,
+                Width: w as f32,
+                Height: h as f32,
+                MinDepth: 0.0,
+                MaxDepth: 1.0,
+            }]));
+            ctx.OMSetRenderTargets(Some(&[Some(y_rtv.clone())]), None);
+            ctx.PSSetShader(&self.ps_y, None);
+            ctx.Draw(3, 0);
+            ctx.OMSetRenderTargets(Some(&[None]), None);
 
-        // CHROMA pass: half-res (4:2:0) or full-res (4:4:4) → the CbCr texture.
-        let (cw, ch) = if self.chroma444 {
-            (w, h)
-        } else {
-            (w / 2, h / 2)
-        };
-        ctx.RSSetViewports(Some(&[D3D11_VIEWPORT {
-            TopLeftX: 0.0,
-            TopLeftY: 0.0,
-            Width: cw as f32,
-            Height: ch as f32,
-            MinDepth: 0.0,
-            MaxDepth: 1.0,
-        }]));
-        ctx.OMSetRenderTargets(Some(&[Some(cbcr_rtv.clone())]), None);
-        ctx.PSSetShader(&self.ps_uv, None);
-        ctx.Draw(3, 0);
+            // CHROMA pass: half-res (4:2:0) or full-res (4:4:4) → the CbCr texture.
+            let (cw, ch) = if self.chroma444 {
+                (w, h)
+            } else {
+                (w / 2, h / 2)
+            };
+            ctx.RSSetViewports(Some(&[D3D11_VIEWPORT {
+                TopLeftX: 0.0,
+                TopLeftY: 0.0,
+                Width: cw as f32,
+                Height: ch as f32,
+                MinDepth: 0.0,
+                MaxDepth: 1.0,
+            }]));
+            ctx.OMSetRenderTargets(Some(&[Some(cbcr_rtv.clone())]), None);
+            ctx.PSSetShader(&self.ps_uv, None);
+            ctx.Draw(3, 0);
 
-        ctx.OMSetRenderTargets(Some(&[None]), None);
-        ctx.PSSetShaderResources(0, Some(&[None]));
-        Ok(())
+            ctx.OMSetRenderTargets(Some(&[None]), None);
+            ctx.PSSetShaderResources(0, Some(&[None]));
+            Ok(())
+        }
     }
 }
 
@@ -1264,49 +1308,57 @@ impl VideoConverter {
         height: u32,
         scrgb_input: bool,
     ) -> Result<Self> {
-        let vdev: ID3D11VideoDevice = device.cast().context("device -> ID3D11VideoDevice")?;
-        let vctx: ID3D11VideoContext1 = context.cast().context("context -> ID3D11VideoContext1")?;
-        let rate = DXGI_RATIONAL {
-            Numerator: 240,
-            Denominator: 1,
-        };
-        let desc = D3D11_VIDEO_PROCESSOR_CONTENT_DESC {
-            InputFrameFormat: D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
-            InputFrameRate: rate,
-            InputWidth: width,
-            InputHeight: height,
-            OutputFrameRate: rate,
-            OutputWidth: width,
-            OutputHeight: height,
-            Usage: D3D11_VIDEO_USAGE_PLAYBACK_NORMAL,
-        };
-        let enumr = vdev
-            .CreateVideoProcessorEnumerator(&desc)
-            .context("CreateVideoProcessorEnumerator")?;
-        let vp = vdev
-            .CreateVideoProcessor(&enumr, 0)
-            .context("CreateVideoProcessor")?;
+        // SAFETY: the `cast()`s and the `?`-checked video-device factory calls run on the caller's
+        // live `device`/`context` borrows; `&desc` is a fully-initialized stack
+        // `D3D11_VIDEO_PROCESSOR_CONTENT_DESC` read only for the duration of the call, and the
+        // colour-space/frame-format setters take the just-created processor by borrow plus plain
+        // enum values.
+        unsafe {
+            let vdev: ID3D11VideoDevice = device.cast().context("device -> ID3D11VideoDevice")?;
+            let vctx: ID3D11VideoContext1 =
+                context.cast().context("context -> ID3D11VideoContext1")?;
+            let rate = DXGI_RATIONAL {
+                Numerator: 240,
+                Denominator: 1,
+            };
+            let desc = D3D11_VIDEO_PROCESSOR_CONTENT_DESC {
+                InputFrameFormat: D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
+                InputFrameRate: rate,
+                InputWidth: width,
+                InputHeight: height,
+                OutputFrameRate: rate,
+                OutputWidth: width,
+                OutputHeight: height,
+                Usage: D3D11_VIDEO_USAGE_PLAYBACK_NORMAL,
+            };
+            let enumr = vdev
+                .CreateVideoProcessorEnumerator(&desc)
+                .context("CreateVideoProcessorEnumerator")?;
+            let vp = vdev
+                .CreateVideoProcessor(&enumr, 0)
+                .context("CreateVideoProcessor")?;
 
-        // Full-range RGB in → studio-range BT.709 NV12 out. Input gamma follows the ring format:
-        // scRGB linear (G10) for the FP16 HDR ring, sRGB (G22) for the 8-bit BGRA SDR ring. The
-        // output is always BT.709 SDR (the video processor tone-maps the scRGB case).
-        let in_cs = if scrgb_input {
-            DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709
-        } else {
-            DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709
-        };
-        let out_cs = DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709;
-        vctx.VideoProcessorSetStreamColorSpace1(&vp, 0, in_cs);
-        vctx.VideoProcessorSetOutputColorSpace1(&vp, out_cs);
-        // One frame in, one frame out — no interpolation/auto-processing.
-        vctx.VideoProcessorSetStreamFrameFormat(&vp, 0, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE);
+            // Full-range RGB in → studio-range BT.709 NV12 out. Input gamma follows the ring format:
+            // scRGB linear (G10) for the FP16 HDR ring, sRGB (G22) for the 8-bit BGRA SDR ring. The
+            // output is always BT.709 SDR (the video processor tone-maps the scRGB case).
+            let in_cs = if scrgb_input {
+                DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709
+            } else {
+                DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709
+            };
+            let out_cs = DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709;
+            vctx.VideoProcessorSetStreamColorSpace1(&vp, 0, in_cs);
+            vctx.VideoProcessorSetOutputColorSpace1(&vp, out_cs);
+            // One frame in, one frame out — no interpolation/auto-processing.
+            vctx.VideoProcessorSetStreamFrameFormat(&vp, 0, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE);
 
-        Ok(Self {
-            vdev,
-            vctx,
-            enumr,
-            vp,
-        })
+            Ok(Self {
+                vdev,
+                vctx,
+                enumr,
+                vp,
+            })
+        }
     }
 
     /// Convert `input` (BGRA or scRGB FP16) → `output` (NV12 or P010) on the video engine. Views are
@@ -1316,47 +1368,54 @@ impl VideoConverter {
         input: &ID3D11Texture2D,
         output: &ID3D11Texture2D,
     ) -> Result<()> {
-        let in_desc = D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC {
-            FourCC: 0,
-            ViewDimension: D3D11_VPIV_DIMENSION_TEXTURE2D,
-            Anonymous: D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0 {
-                Texture2D: D3D11_TEX2D_VPIV {
-                    MipSlice: 0,
-                    ArraySlice: 0,
+        // SAFETY: both view creations are `?`-checked calls on `self.vdev` with fully-initialized
+        // stack descriptors and live out-params. `stream.pInputSurface` is a `ManuallyDrop` of the
+        // input view just created: `VideoProcessorBlt` only BORROWS it (a COM in-param never transfers
+        // ownership), and the explicit `into_inner` drop below releases that reference exactly once on
+        // both the success and the failure path. `slice::from_ref(&stream)` borrows the live local.
+        unsafe {
+            let in_desc = D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC {
+                FourCC: 0,
+                ViewDimension: D3D11_VPIV_DIMENSION_TEXTURE2D,
+                Anonymous: D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0 {
+                    Texture2D: D3D11_TEX2D_VPIV {
+                        MipSlice: 0,
+                        ArraySlice: 0,
+                    },
                 },
-            },
-        };
-        let mut in_view: Option<ID3D11VideoProcessorInputView> = None;
-        self.vdev
-            .CreateVideoProcessorInputView(input, &self.enumr, &in_desc, Some(&mut in_view))
-            .context("CreateVideoProcessorInputView")?;
+            };
+            let mut in_view: Option<ID3D11VideoProcessorInputView> = None;
+            self.vdev
+                .CreateVideoProcessorInputView(input, &self.enumr, &in_desc, Some(&mut in_view))
+                .context("CreateVideoProcessorInputView")?;
 
-        let out_desc = D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC {
-            ViewDimension: D3D11_VPOV_DIMENSION_TEXTURE2D,
-            Anonymous: D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0 {
-                Texture2D: D3D11_TEX2D_VPOV { MipSlice: 0 },
-            },
-        };
-        let mut out_view: Option<ID3D11VideoProcessorOutputView> = None;
-        self.vdev
-            .CreateVideoProcessorOutputView(output, &self.enumr, &out_desc, Some(&mut out_view))
-            .context("CreateVideoProcessorOutputView")?;
-        let out_view = out_view.context("null output view")?;
+            let out_desc = D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC {
+                ViewDimension: D3D11_VPOV_DIMENSION_TEXTURE2D,
+                Anonymous: D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0 {
+                    Texture2D: D3D11_TEX2D_VPOV { MipSlice: 0 },
+                },
+            };
+            let mut out_view: Option<ID3D11VideoProcessorOutputView> = None;
+            self.vdev
+                .CreateVideoProcessorOutputView(output, &self.enumr, &out_desc, Some(&mut out_view))
+                .context("CreateVideoProcessorOutputView")?;
+            let out_view = out_view.context("null output view")?;
 
-        let stream = D3D11_VIDEO_PROCESSOR_STREAM {
-            Enable: true.into(),
-            pInputSurface: std::mem::ManuallyDrop::new(in_view),
-            ..Default::default()
-        };
-        let blt =
-            self.vctx
-                .VideoProcessorBlt(&self.vp, &out_view, 0, std::slice::from_ref(&stream));
-        // COM in-params never transfer ownership: the Blt only borrowed the input view, and the
-        // struct's `ManuallyDrop` field suppressed its release — drop it by hand, success or not.
-        // (Skipping this leaked one view + its UMD allocation PER CONVERTED FRAME — the SDR hot
-        // path; D3D11 defers the actual destruction until the GPU is done with the blit.)
-        drop(std::mem::ManuallyDrop::into_inner(stream.pInputSurface));
-        blt.context("VideoProcessorBlt")
+            let stream = D3D11_VIDEO_PROCESSOR_STREAM {
+                Enable: true.into(),
+                pInputSurface: std::mem::ManuallyDrop::new(in_view),
+                ..Default::default()
+            };
+            let blt =
+                self.vctx
+                    .VideoProcessorBlt(&self.vp, &out_view, 0, std::slice::from_ref(&stream));
+            // COM in-params never transfer ownership: the Blt only borrowed the input view, and the
+            // struct's `ManuallyDrop` field suppressed its release — drop it by hand, success or not.
+            // (Skipping this leaked one view + its UMD allocation PER CONVERTED FRAME — the SDR hot
+            // path; D3D11 defers the actual destruction until the GPU is done with the blit.)
+            drop(std::mem::ManuallyDrop::into_inner(stream.pInputSurface));
+            blt.context("VideoProcessorBlt")
+        }
     }
 }
 

@@ -140,13 +140,17 @@ impl Capturer for SyntheticNv12Capturer {
 /// # Safety
 /// Calls DXGI factory/adapter enumeration; returns owned COM objects or an error.
 unsafe fn resolve_render_adapter() -> Result<IDXGIAdapter1> {
-    let factory: IDXGIFactory4 = CreateDXGIFactory1().context("CreateDXGIFactory1")?;
-    if let Some(luid) = pf_gpu::resolve_render_adapter_luid() {
-        if let Ok(a) = factory.EnumAdapterByLuid::<IDXGIAdapter1>(luid) {
-            return Ok(a);
+    // SAFETY: three `?`/`Ok`-checked DXGI enumeration calls over owned locals — the factory is
+    // created here and the adapters it returns own their own COM references. No raw pointers.
+    unsafe {
+        let factory: IDXGIFactory4 = CreateDXGIFactory1().context("CreateDXGIFactory1")?;
+        if let Some(luid) = pf_gpu::resolve_render_adapter_luid() {
+            if let Ok(a) = factory.EnumAdapterByLuid::<IDXGIAdapter1>(luid) {
+                return Ok(a);
+            }
         }
+        factory.EnumAdapters1(0).context("EnumAdapters1(0)")
     }
-    factory.EnumAdapters1(0).context("EnumAdapters1(0)")
 }
 
 /// Create an NV12 `Texture2D` with the given usage/CPU-access/bind flags.
@@ -177,8 +181,12 @@ unsafe fn create_nv12(
         ..Default::default()
     };
     let mut tex: Option<ID3D11Texture2D> = None;
-    device
-        .CreateTexture2D(&desc, None, Some(&mut tex))
-        .context("CreateTexture2D(NV12)")?;
+    // SAFETY: one `?`-checked `CreateTexture2D` on the live `device` borrow (per the contract
+    // above), with a fully-initialized stack descriptor and a live `Option` out-param.
+    unsafe {
+        device
+            .CreateTexture2D(&desc, None, Some(&mut tex))
+            .context("CreateTexture2D(NV12)")?;
+    }
     tex.context("CreateTexture2D returned a null NV12 texture")
 }

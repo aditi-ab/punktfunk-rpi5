@@ -172,12 +172,15 @@ jobs:
         # openh264 rebuild), and keeps everything in one C:\t\release tree. Same reason
         # pf-vkhdr-layer's clippy below runs --release.
         #
-        # pf-encode is linted SEPARATELY with --all-targets so its Windows `#[cfg(test)]` modules
-        # are type-checked — the AMF C-ABI layout assertions (`variant_layout_matches_c` and
-        # friends, which are the only guard on a hand-mirrored vtable ABI), the QSV tests, and the
-        # PyroWave-Windows smoke test. The host lint above cannot cover them: `-p punktfunk-host`
-        # only builds pf-encode as a dependency, so its test targets are never compiled, and that
-        # blind spot is what let the Linux twin's tests rot to the wrong arity unnoticed.
+        # pf-encode and pf-capture are linted SEPARATELY with --all-targets so their Windows
+        # `#[cfg(test)]` modules are type-checked — pf-encode's AMF C-ABI layout assertions
+        # (`variant_layout_matches_c` and friends, which are the only guard on a hand-mirrored
+        # vtable ABI), the QSV tests, the PyroWave-Windows smoke test; pf-capture's `StallWatch`
+        # tests, the DXGI HDR self-tests and the cursor-conversion tables. The host lint above
+        # cannot cover them: `-p punktfunk-host` only builds those crates as dependencies, so their
+        # test targets are never compiled anywhere, and that blind spot is what let the Linux twin's
+        # tests rot to the wrong arity unnoticed. pf-capture has no cargo features, so it needs no
+        # feature juggling and pulls in no extra dep tree.
         # NOTE: clippy (a check, no link step) is deliberately the vehicle here — `cargo test`
         # with `nvenc` cannot LINK on MSVC: nvidia-video-codec-sdk link-imports
         # NvEncodeAPICreateInstance / NvEncodeAPIGetMaxSupportedVersion, which resolve only against
@@ -188,6 +191,7 @@ jobs:
         run: |
           cargo clippy --release -p punktfunk-host --features nvenc,amf-qsv,qsv -- -D warnings; if ($LASTEXITCODE) { throw "host clippy" }
           cargo clippy --release -p pf-encode --all-targets --features nvenc,amf-qsv,qsv -- -D warnings; if ($LASTEXITCODE) { throw "pf-encode clippy" }
+          cargo clippy --release -p pf-capture --all-targets -- -D warnings; if ($LASTEXITCODE) { throw "pf-capture clippy" }
           cargo clippy --release -p punktfunk-tray -- -D warnings; if ($LASTEXITCODE) { throw "tray clippy" }
 
       - name: Build + lint the HDR Vulkan layer (pf-vkhdr-layer)

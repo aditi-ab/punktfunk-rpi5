@@ -582,21 +582,28 @@ unsafe impl Send for IddPushCapturer {}
 /// 2026-07-03), so it cannot dup the handles out either. History: `Global\`-named + world-openable
 /// (`WD`, security-review 2026-06-28 #5) → SY+LS-scoped → nameless → now SY-only. `psd` must outlive
 /// `sa`. See `design/idd-push-security.md`.
-unsafe fn shared_object_sa() -> Result<(SECURITY_ATTRIBUTES, PSECURITY_DESCRIPTOR)> {
-    let mut psd = PSECURITY_DESCRIPTOR::default();
-    ConvertStringSecurityDescriptorToSecurityDescriptorW(
-        w!("D:P(A;;GA;;;SY)"),
-        SDDL_REVISION_1,
-        &mut psd,
-        None,
-    )
-    .context("build SDDL for IDD-push shared objects")?;
-    let sa = SECURITY_ATTRIBUTES {
-        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
-        lpSecurityDescriptor: psd.0,
-        bInheritHandle: false.into(),
-    };
-    Ok((sa, psd))
+fn shared_object_sa() -> Result<(SECURITY_ATTRIBUTES, PSECURITY_DESCRIPTOR)> {
+    // SAFETY: `ConvertStringSecurityDescriptorToSecurityDescriptorW` reads the `w!()` literal
+    // and writes the descriptor it allocates into the live local `psd`; `?` rejects a failure
+    // before `psd` is read. The `SECURITY_ATTRIBUTES` returned alongside merely CARRIES `psd.0` as
+    // a raw pointer — keeping the two paired (and freeing the descriptor) is the caller's unsafe
+    // business, so this fn itself has no precondition to state and needs no `unsafe` marker.
+    unsafe {
+        let mut psd = PSECURITY_DESCRIPTOR::default();
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            w!("D:P(A;;GA;;;SY)"),
+            SDDL_REVISION_1,
+            &mut psd,
+            None,
+        )
+        .context("build SDDL for IDD-push shared objects")?;
+        let sa = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: psd.0,
+            bInheritHandle: false.into(),
+        };
+        Ok((sa, psd))
+    }
 }
 
 impl IddPushCapturer {
@@ -610,56 +617,64 @@ impl IddPushCapturer {
         h: u32,
         format: DXGI_FORMAT,
     ) -> Result<Vec<HostSlot>> {
-        let (sa, _psd) = shared_object_sa()?;
-        let mut slots = Vec::new();
-        for _ in 0..RING_LEN {
-            let desc = D3D11_TEXTURE2D_DESC {
-                Width: w,
-                Height: h,
-                MipLevels: 1,
-                ArraySize: 1,
-                // Match the OS-composed swap-chain surfaces so the driver's CopyResource into the slot +
-                // its format-guard both succeed.
-                Format: format,
-                SampleDesc: DXGI_SAMPLE_DESC {
-                    Count: 1,
-                    Quality: 0,
-                },
-                Usage: D3D11_USAGE_DEFAULT,
-                BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
-                CPUAccessFlags: 0,
-                MiscFlags: (D3D11_RESOURCE_MISC_SHARED_NTHANDLE.0
-                    | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX.0) as u32,
-            };
-            let mut tex: Option<ID3D11Texture2D> = None;
-            device
-                .CreateTexture2D(&desc, None, Some(&mut tex))
-                .context("CreateTexture2D(IDD-push ring slot)")?;
-            let tex = tex.context("null ring texture")?;
-            let res1: IDXGIResource1 = tex.cast()?;
-            let shared = res1
-                .CreateSharedHandle(
-                    Some(&sa as *const SECURITY_ATTRIBUTES),
-                    DXGI_SHARED_RESOURCE_RW,
-                    PCWSTR::null(), // UNNAMED — reachable only through the broker's duplicate
-                )
-                .context("CreateSharedHandle(IDD-push ring slot)")?;
-            // Own the shared handle so the slot's `Drop` closes it via RAII (was a manual `CloseHandle`).
-            let shared = OwnedHandle::from_raw_handle(shared.0 as _);
-            let mutex: IDXGIKeyedMutex = tex.cast()?;
-            let mut srv: Option<ID3D11ShaderResourceView> = None;
-            device
-                .CreateShaderResourceView(&tex, None, Some(&mut srv))
-                .context("CreateShaderResourceView(IDD-push ring slot)")?;
-            let srv = srv.context("null slot srv")?;
-            slots.push(HostSlot {
-                tex,
-                mutex,
-                shared,
-                srv,
-            });
+        // SAFETY: every D3D11/DXGI call is `?`-checked on the live `device` borrow, over
+        // fully-initialized stack descriptors and live out-params; `&sa` stays valid for the whole loop
+        // because `_psd`, the security descriptor backing it, is held in scope alongside.
+        // `OwnedHandle::from_raw_handle` adopts the handle `CreateSharedHandle` JUST minted for this
+        // slot — a unique, still-open NT handle owned by this process — making the slot its sole owner.
+        unsafe {
+            let (sa, _psd) = shared_object_sa()?;
+            let mut slots = Vec::new();
+            for _ in 0..RING_LEN {
+                let desc = D3D11_TEXTURE2D_DESC {
+                    Width: w,
+                    Height: h,
+                    MipLevels: 1,
+                    ArraySize: 1,
+                    // Match the OS-composed swap-chain surfaces so the driver's CopyResource into the slot +
+                    // its format-guard both succeed.
+                    Format: format,
+                    SampleDesc: DXGI_SAMPLE_DESC {
+                        Count: 1,
+                        Quality: 0,
+                    },
+                    Usage: D3D11_USAGE_DEFAULT,
+                    BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
+                    CPUAccessFlags: 0,
+                    MiscFlags: (D3D11_RESOURCE_MISC_SHARED_NTHANDLE.0
+                        | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX.0)
+                        as u32,
+                };
+                let mut tex: Option<ID3D11Texture2D> = None;
+                device
+                    .CreateTexture2D(&desc, None, Some(&mut tex))
+                    .context("CreateTexture2D(IDD-push ring slot)")?;
+                let tex = tex.context("null ring texture")?;
+                let res1: IDXGIResource1 = tex.cast()?;
+                let shared = res1
+                    .CreateSharedHandle(
+                        Some(&sa as *const SECURITY_ATTRIBUTES),
+                        DXGI_SHARED_RESOURCE_RW,
+                        PCWSTR::null(), // UNNAMED — reachable only through the broker's duplicate
+                    )
+                    .context("CreateSharedHandle(IDD-push ring slot)")?;
+                // Own the shared handle so the slot's `Drop` closes it via RAII (was a manual `CloseHandle`).
+                let shared = OwnedHandle::from_raw_handle(shared.0 as _);
+                let mutex: IDXGIKeyedMutex = tex.cast()?;
+                let mut srv: Option<ID3D11ShaderResourceView> = None;
+                device
+                    .CreateShaderResourceView(&tex, None, Some(&mut srv))
+                    .context("CreateShaderResourceView(IDD-push ring slot)")?;
+                let srv = srv.context("null slot srv")?;
+                slots.push(HostSlot {
+                    tex,
+                    mutex,
+                    shared,
+                    srv,
+                });
+            }
+            Ok(slots)
         }
-        Ok(slots)
     }
 
     /// Open the IDD-push capturer. On success the caller's `keepalive` is attached (the capturer owns the
@@ -1739,46 +1754,52 @@ impl IddPushCapturer {
     /// Runs on the owning capture/encode thread that holds the immediate context; forms no lasting
     /// borrow of `self`'s COM objects.
     unsafe fn pyro_fence_signal(&mut self) -> Result<Option<(Option<isize>, u64)>> {
-        if !self.pyrowave {
-            return Ok(None);
-        }
-        if self.pyro_fence.is_none() {
-            let dev5: ID3D11Device5 = self
-                .device
+        // SAFETY: per the contract above this runs on the owning capture/encode thread, which holds
+        // the immediate context. Every call is a `?`-checked COM method on `self`'s live device or
+        // context (or on a `cast()` of one), and `CreateSharedHandle` yields a fresh NT handle whose
+        // raw value is only STORED here — never dereferenced, and never closed on this path.
+        unsafe {
+            if !self.pyrowave {
+                return Ok(None);
+            }
+            if self.pyro_fence.is_none() {
+                let dev5: ID3D11Device5 = self
+                    .device
+                    .cast()
+                    .context("ID3D11Device -> ID3D11Device5 (shared fence)")?;
+                // windows-rs returns COM interfaces via an out-param (unlike the HANDLE-returning
+                // CreateSharedHandle below).
+                let mut fence_out: Option<ID3D11Fence> = None;
+                dev5.CreateFence(0, D3D11_FENCE_FLAG_SHARED, &mut fence_out)
+                    .context("CreateFence(D3D11_FENCE_FLAG_SHARED)")?;
+                let fence = fence_out.context("null D3D11 fence")?;
+                // GENERIC_ALL (0x1000_0000) — the access the pyrowave interop test hands the handle.
+                let handle: HANDLE = fence
+                    .CreateSharedHandle(None, 0x1000_0000, PCWSTR::null())
+                    .context("ID3D11Fence::CreateSharedHandle")?;
+                self.pyro_fence = Some(fence);
+                self.pyro_fence_handle = Some(handle.0 as isize);
+                self.pyro_fence_value = 0;
+            }
+            self.pyro_fence_value += 1;
+            let value = self.pyro_fence_value;
+            let ctx4: ID3D11DeviceContext4 = self
+                .context
                 .cast()
-                .context("ID3D11Device -> ID3D11Device5 (shared fence)")?;
-            // windows-rs returns COM interfaces via an out-param (unlike the HANDLE-returning
-            // CreateSharedHandle below).
-            let mut fence_out: Option<ID3D11Fence> = None;
-            dev5.CreateFence(0, D3D11_FENCE_FLAG_SHARED, &mut fence_out)
-                .context("CreateFence(D3D11_FENCE_FLAG_SHARED)")?;
-            let fence = fence_out.context("null D3D11 fence")?;
-            // GENERIC_ALL (0x1000_0000) — the access the pyrowave interop test hands the handle.
-            let handle: HANDLE = fence
-                .CreateSharedHandle(None, 0x1000_0000, PCWSTR::null())
-                .context("ID3D11Fence::CreateSharedHandle")?;
-            self.pyro_fence = Some(fence);
-            self.pyro_fence_handle = Some(handle.0 as isize);
-            self.pyro_fence_value = 0;
+                .context("ID3D11DeviceContext -> ID3D11DeviceContext4 (fence signal)")?;
+            {
+                let fence = self.pyro_fence.as_ref().expect("fence just created");
+                ctx4.Signal(fence, value)
+                    .context("ID3D11 fence Signal after convert")?;
+            }
+            // Submit the queued convert + signal so the encoder's Vulkan timeline wait can resolve.
+            self.context.Flush();
+            // Pass the persistent shared handle EVERY frame (not once): the encoder can be rebuilt on a
+            // client mode-switch, and a rebuilt encoder needs to re-import the fence into its fresh Vulkan
+            // device. The encoder imports only when it has no timeline yet (and DUPLICATES the handle so
+            // this original stays valid for the next rebuild).
+            Ok(Some((self.pyro_fence_handle, value)))
         }
-        self.pyro_fence_value += 1;
-        let value = self.pyro_fence_value;
-        let ctx4: ID3D11DeviceContext4 = self
-            .context
-            .cast()
-            .context("ID3D11DeviceContext -> ID3D11DeviceContext4 (fence signal)")?;
-        {
-            let fence = self.pyro_fence.as_ref().expect("fence just created");
-            ctx4.Signal(fence, value)
-                .context("ID3D11 fence Signal after convert")?;
-        }
-        // Submit the queued convert + signal so the encoder's Vulkan timeline wait can resolve.
-        self.context.Flush();
-        // Pass the persistent shared handle EVERY frame (not once): the encoder can be rebuilt on a
-        // client mode-switch, and a rebuilt encoder needs to re-import the fence into its fresh Vulkan
-        // device. The encoder imports only when it has no timeline yet (and DUPLICATES the handle so
-        // this original stays valid for the next rebuild).
-        Ok(Some((self.pyro_fence_handle, value)))
     }
 
     /// The (serial, x, y, visible) of the CURRENT polled cursor — the composite-regen change
@@ -1803,112 +1824,120 @@ impl IddPushCapturer {
         &mut self,
         slot_tex: &ID3D11Texture2D,
     ) -> Option<(ID3D11Texture2D, ID3D11ShaderResourceView)> {
-        let fmt = self.ring_format();
-        // (Re)build the scratch at the current ring geometry.
-        let stale = self
-            .blend_scratch
-            .as_ref()
-            .is_none_or(|(_, _, w, h, f)| (*w, *h, *f) != (self.width, self.height, fmt));
-        if stale {
-            self.blend_scratch = None;
-            let desc = D3D11_TEXTURE2D_DESC {
-                Width: self.width,
-                Height: self.height,
-                MipLevels: 1,
-                ArraySize: 1,
-                Format: fmt,
-                SampleDesc: DXGI_SAMPLE_DESC {
-                    Count: 1,
-                    Quality: 0,
-                },
-                Usage: D3D11_USAGE_DEFAULT,
-                BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
-                ..Default::default()
-            };
-            let mut tex: Option<ID3D11Texture2D> = None;
-            let built = self
-                .device
-                .CreateTexture2D(&desc, None, Some(&mut tex))
-                .ok()
-                .and(tex)
-                .and_then(|t| {
-                    let mut srv: Option<ID3D11ShaderResourceView> = None;
-                    self.device
-                        .CreateShaderResourceView(&t, None, Some(&mut srv))
-                        .ok()
-                        .and(srv)
-                        .map(|v| (t, v))
-                });
-            match built {
-                Some((t, v)) => {
-                    self.blend_scratch = Some((t, v, self.width, self.height, fmt));
-                    if self.display_hdr {
-                        // Where DWM places SDR white on this HDR desktop — the composited
-                        // cursor must match or it reads dark (~2.5x at the Windows default).
-                        // Queried only here: scratch rebuilds are rare, and the CCD query
-                        // contends on the display-config lock, which must stay OFF the
-                        // per-frame path.
-                        // Safety: read-only CCD query over owned locals (within unsafe fn).
-                        let queried =
-                            pf_win_display::win_display::sdr_white_level_scale(self.target_id);
-                        self.sdr_white_scale = queried.unwrap_or(self.sdr_white_scale);
-                        tracing::info!(
-                            target_id = self.target_id,
-                            queried = ?queried,
-                            applied = self.sdr_white_scale,
-                            "cursor composite: HDR SDR-white scale (1.0 = 80 nits; None = \
-                             query failed — keeping the prior value)"
-                        );
-                    }
-                }
-                None => {
-                    if !self.cursor_blend_failed {
-                        self.cursor_blend_failed = true;
-                        tracing::warn!(
-                            "cursor blend scratch creation failed — capture-model frames stay \
-                             pointer-less this session"
-                        );
-                    }
-                    return None;
-                }
-            }
-        }
-        let (tex, srv, ..) = self.blend_scratch.as_ref().expect("just ensured");
-        let (tex, srv) = (tex.clone(), srv.clone());
-        self.context.CopyResource(&tex, slot_tex);
-        // Blend the pointer (visible shapes only; hidden = the copy alone is the frame).
-        let overlay = self.cursor_poll.as_ref().and_then(|p| p.read());
-        self.last_blend_key = overlay.as_ref().map(|o| (o.serial, o.x, o.y, o.visible));
-        if let Some(ov) = overlay.filter(|o| o.visible) {
-            if self.cursor_blend.is_none() && !self.cursor_blend_failed {
-                match cursor_blend::CursorBlendPass::new(&self.device) {
-                    Ok(p) => self.cursor_blend = Some(p),
-                    Err(e) => {
-                        self.cursor_blend_failed = true;
-                        tracing::warn!(
-                            "cursor blend pass build failed — capture-model frames stay \
-                             pointer-less this session: {e:#}"
-                        );
-                    }
-                }
-            }
-            if let Some(pass) = self.cursor_blend.as_mut() {
-                // FP16 ring = scRGB linear composition (HDR): linearize the sRGB shape and
-                // scale it to the target's SDR white so it matches the desktop around it.
-                let scale = if self.display_hdr {
-                    self.sdr_white_scale
-                } else {
-                    0.0
+        // SAFETY: per the contract above, D3D11 calls on the owning thread's device + immediate
+        // context while the slot's keyed mutex is held. `CreateTexture2D`/`CreateShaderResourceView`
+        // take a fully-initialized stack descriptor plus live out-params and are `.ok()`-checked before
+        // use; `CopyResource` moves between our own scratch and the caller's live slot texture, which
+        // share format and size by construction (the scratch is rebuilt whenever the ring geometry
+        // changes). `sdr_white_level_scale` is a read-only CCD query over owned locals.
+        unsafe {
+            let fmt = self.ring_format();
+            // (Re)build the scratch at the current ring geometry.
+            let stale = self
+                .blend_scratch
+                .as_ref()
+                .is_none_or(|(_, _, w, h, f)| (*w, *h, *f) != (self.width, self.height, fmt));
+            if stale {
+                self.blend_scratch = None;
+                let desc = D3D11_TEXTURE2D_DESC {
+                    Width: self.width,
+                    Height: self.height,
+                    MipLevels: 1,
+                    ArraySize: 1,
+                    Format: fmt,
+                    SampleDesc: DXGI_SAMPLE_DESC {
+                        Count: 1,
+                        Quality: 0,
+                    },
+                    Usage: D3D11_USAGE_DEFAULT,
+                    BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
+                    ..Default::default()
                 };
-                if let Err(e) = pass.blend(&self.device, &self.context, &tex, &ov, scale) {
-                    if !self.cursor_blend_failed {
-                        self.cursor_blend_failed = true;
-                        tracing::warn!("cursor blend draw failed — pointer-less frames: {e:#}");
+                let mut tex: Option<ID3D11Texture2D> = None;
+                let built = self
+                    .device
+                    .CreateTexture2D(&desc, None, Some(&mut tex))
+                    .ok()
+                    .and(tex)
+                    .and_then(|t| {
+                        let mut srv: Option<ID3D11ShaderResourceView> = None;
+                        self.device
+                            .CreateShaderResourceView(&t, None, Some(&mut srv))
+                            .ok()
+                            .and(srv)
+                            .map(|v| (t, v))
+                    });
+                match built {
+                    Some((t, v)) => {
+                        self.blend_scratch = Some((t, v, self.width, self.height, fmt));
+                        if self.display_hdr {
+                            // Where DWM places SDR white on this HDR desktop — the composited
+                            // cursor must match or it reads dark (~2.5x at the Windows default).
+                            // Queried only here: scratch rebuilds are rare, and the CCD query
+                            // contends on the display-config lock, which must stay OFF the
+                            // per-frame path.
+                            // Safety: read-only CCD query over owned locals (within unsafe fn).
+                            let queried =
+                                pf_win_display::win_display::sdr_white_level_scale(self.target_id);
+                            self.sdr_white_scale = queried.unwrap_or(self.sdr_white_scale);
+                            tracing::info!(
+                                target_id = self.target_id,
+                                queried = ?queried,
+                                applied = self.sdr_white_scale,
+                                "cursor composite: HDR SDR-white scale (1.0 = 80 nits; None = \
+                                 query failed — keeping the prior value)"
+                            );
+                        }
+                    }
+                    None => {
+                        if !self.cursor_blend_failed {
+                            self.cursor_blend_failed = true;
+                            tracing::warn!(
+                                "cursor blend scratch creation failed — capture-model frames stay \
+                             pointer-less this session"
+                            );
+                        }
+                        return None;
                     }
                 }
             }
+            let (tex, srv, ..) = self.blend_scratch.as_ref().expect("just ensured");
+            let (tex, srv) = (tex.clone(), srv.clone());
+            self.context.CopyResource(&tex, slot_tex);
+            // Blend the pointer (visible shapes only; hidden = the copy alone is the frame).
+            let overlay = self.cursor_poll.as_ref().and_then(|p| p.read());
+            self.last_blend_key = overlay.as_ref().map(|o| (o.serial, o.x, o.y, o.visible));
+            if let Some(ov) = overlay.filter(|o| o.visible) {
+                if self.cursor_blend.is_none() && !self.cursor_blend_failed {
+                    match cursor_blend::CursorBlendPass::new(&self.device) {
+                        Ok(p) => self.cursor_blend = Some(p),
+                        Err(e) => {
+                            self.cursor_blend_failed = true;
+                            tracing::warn!(
+                                "cursor blend pass build failed — capture-model frames stay \
+                             pointer-less this session: {e:#}"
+                            );
+                        }
+                    }
+                }
+                if let Some(pass) = self.cursor_blend.as_mut() {
+                    // FP16 ring = scRGB linear composition (HDR): linearize the sRGB shape and
+                    // scale it to the target's SDR white so it matches the desktop around it.
+                    let scale = if self.display_hdr {
+                        self.sdr_white_scale
+                    } else {
+                        0.0
+                    };
+                    if let Err(e) = pass.blend(&self.device, &self.context, &tex, &ov, scale) {
+                        if !self.cursor_blend_failed {
+                            self.cursor_blend_failed = true;
+                            tracing::warn!("cursor blend draw failed — pointer-less frames: {e:#}");
+                        }
+                    }
+                }
+            }
+            Some((tex, srv))
         }
-        Some((tex, srv))
     }
 
     /// The secure-desktop guard (the 0.18.0 UAC/Winlogon regression). UAC consent and Winlogon
