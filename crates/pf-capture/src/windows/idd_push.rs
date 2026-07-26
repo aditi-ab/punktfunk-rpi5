@@ -32,8 +32,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use windows::core::{w, Interface, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
-    DuplicateHandle, DUPLICATE_CLOSE_SOURCE, DUPLICATE_HANDLE_OPTIONS, DUPLICATE_SAME_ACCESS,
-    HANDLE, INVALID_HANDLE_VALUE, LUID, POINT, WAIT_OBJECT_0,
+    DuplicateHandle, LocalFree, DUPLICATE_CLOSE_SOURCE, DUPLICATE_HANDLE_OPTIONS,
+    DUPLICATE_SAME_ACCESS, HANDLE, HLOCAL, INVALID_HANDLE_VALUE, LUID, POINT, WAIT_OBJECT_0,
 };
 use windows::Win32::Graphics::Direct3D11::{
     ID3D11Device, ID3D11Device5, ID3D11DeviceContext, ID3D11DeviceContext4, ID3D11Fence,
@@ -100,6 +100,23 @@ const OUT_RING: usize = 3;
 /// a stale-ring publish and the driver detects a recreate. (With unnamed textures there is no name
 /// collision to avoid — the generation's remaining job is the recreate/stale-publish handshake.)
 static IDD_GENERATION: AtomicU32 = AtomicU32::new(1);
+
+/// Mint the next ring generation: masked to [`frame::FrameToken::GENERATION_MASK`] and never `0`.
+///
+/// [`IDD_GENERATION`] is a full `u32`, but the publish token carries only 24 bits of it and
+/// `FrameToken::unpack` masks what it reads — so an unmasked `self.generation` stops matching ANY
+/// token past 2²⁴ recreates and `try_consume`'s `tok.generation != self.generation` becomes
+/// permanently true: every frame rejected, forever. `0` is skipped because it is also the
+/// cleared-`latest` sentinel [`IddPushCapturer::recreate_ring`] stores. Latent — 2²⁴ recreates is a
+/// long session — but the invariant belongs at the single mint point, not in the comparison.
+fn next_generation() -> u32 {
+    loop {
+        let g = IDD_GENERATION.fetch_add(1, Ordering::Relaxed) & frame::FrameToken::GENERATION_MASK;
+        if g != 0 {
+            return g;
+        }
+    }
+}
 
 fn now_ns() -> u64 {
     SystemTime::now()
@@ -438,6 +455,9 @@ pub struct IddPushCapturer {
     /// composite mode then degrades to pointer-less frames (warned once).
     cursor_blend: Option<cursor_blend::CursorBlendPass>,
     cursor_blend_failed: bool,
+    /// Sticky: [`Self::live_cursor`] has fallen back to the driver's shm section. The two sources
+    /// keep independent serial namespaces, so once crossed we never go back (see there).
+    cursor_shm_latched: bool,
     /// The frame-sized blend scratch (slot copy + cursor quad): texture + SRV + (w, h, fmt)
     /// it was built for — rebuilt when the ring geometry changes.
     blend_scratch: Option<(
@@ -475,6 +495,9 @@ pub struct IddPushCapturer {
     /// Windows mid-session. Drives the ring format (HDR → FP16 surfaces, SDR → BGRA) and the conversion.
     /// Polled in the capture loop; a change recreates the ring (see [`Self::recreate_ring`]).
     display_hdr: bool,
+    /// One-shot latch for [`Self::poll_display_hdr`]'s "could not pin the negotiated depth" error —
+    /// the poller samples every ~250 ms, and a display that refuses the flip refuses it every time.
+    hdr_pin_warned: bool,
     /// The session negotiated full-chroma 4:4:4: while the display is SDR the BGRA slot passes
     /// THROUGH (a plain copy into the out ring, no NV12 VideoConverter) so NVENC gets full-chroma
     /// RGB and CSCs to 4:4:4 itself — measured on-glass: `chromaFormatIDC=3` + ARGB input yields
@@ -494,10 +517,13 @@ pub struct IddPushCapturer {
     /// PyroWave: the shared D3D11 timeline fence (created lazily on the first frame, `SHARED` flag).
     /// The capturer `Signal`s it after each frame's GPU convert; the encoder's Vulkan side waits it.
     pyro_fence: Option<ID3D11Fence>,
-    /// PyroWave: the fence's persistent shared NT handle (raw), passed on EVERY frame. The encoder
-    /// DUPLICATEs + imports it as a Vulkan timeline semaphore whenever it has none (first frame or
-    /// after an encoder rebuild), so this original stays valid across rebuilds.
-    pyro_fence_handle: Option<isize>,
+    /// PyroWave: the fence's persistent shared NT handle, passed (as a raw value) on EVERY frame. The
+    /// encoder DUPLICATEs + imports it as a Vulkan timeline semaphore whenever it has none (first
+    /// frame or after an encoder rebuild), so this original must stay valid across rebuilds — hence
+    /// one handle for the capturer's whole life. An [`OwnedHandle`] so it is CLOSED when the capturer
+    /// drops; it used to be a bare `isize` that nothing ever closed, leaking one NT handle per
+    /// PyroWave session. Closing ours cannot disturb the encoder: it holds its own duplicate.
+    pyro_fence_handle: Option<OwnedHandle>,
     /// PyroWave: the monotonically increasing fence value (one `Signal` per emitted frame).
     pyro_fence_value: u64,
     /// PyroWave: the separate-plane output ring (Y R8 + CbCr R8G8 shareable textures + RTVs), used
@@ -587,29 +613,60 @@ unsafe impl Send for IddPushCapturer {}
 /// confirmed unreachable regardless: a LocalService token is DACL-denied `OpenProcess` on the WUDFHost
 /// (`PROCESS_DUP_HANDLE`/`VM_READ`/even `QUERY_LIMITED` → ACCESS_DENIED, tested on the RTX box
 /// 2026-07-03), so it cannot dup the handles out either. History: `Global\`-named + world-openable
-/// (`WD`, security-review 2026-06-28 #5) → SY+LS-scoped → nameless → now SY-only. `psd` must outlive
-/// `sa`. See `design/idd-push-security.md`.
-fn shared_object_sa() -> Result<(SECURITY_ATTRIBUTES, PSECURITY_DESCRIPTOR)> {
-    // SAFETY: `ConvertStringSecurityDescriptorToSecurityDescriptorW` reads the `w!()` literal
-    // and writes the descriptor it allocates into the live local `psd`; `?` rejects a failure
-    // before `psd` is read. The `SECURITY_ATTRIBUTES` returned alongside merely CARRIES `psd.0` as
-    // a raw pointer — keeping the two paired (and freeing the descriptor) is the caller's unsafe
-    // business, so this fn itself has no precondition to state and needs no `unsafe` marker.
-    unsafe {
+/// (`WD`, security-review 2026-06-28 #5) → SY+LS-scoped → nameless → now SY-only. See
+/// `design/idd-push-security.md`.
+///
+/// RAII, because the descriptor is a `LocalAlloc` the caller must `LocalFree` and the previous
+/// `(SECURITY_ATTRIBUTES, PSECURITY_DESCRIPTOR)` tuple never did — leaking it twice per open (once
+/// for the header section, once for the frame-ready event) and again on every ring recreate. Pairing
+/// them in one owner also enforces the "descriptor must outlive the attributes" rule structurally:
+/// `sa.lpSecurityDescriptor` points at the allocation and [`as_ptr`](Self::as_ptr) only lends a
+/// borrow, so the attributes cannot escape this value's lifetime. Moving the struct is fine — the
+/// pointer targets the heap allocation, not a field.
+struct SharedObjectSa {
+    sa: SECURITY_ATTRIBUTES,
+    psd: PSECURITY_DESCRIPTOR,
+}
+
+impl SharedObjectSa {
+    fn new() -> Result<Self> {
         let mut psd = PSECURITY_DESCRIPTOR::default();
-        ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            w!("D:P(A;;GA;;;SY)"),
-            SDDL_REVISION_1,
-            &mut psd,
-            None,
-        )
-        .context("build SDDL for IDD-push shared objects")?;
-        let sa = SECURITY_ATTRIBUTES {
-            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
-            lpSecurityDescriptor: psd.0,
-            bInheritHandle: false.into(),
-        };
-        Ok((sa, psd))
+        // SAFETY: `ConvertStringSecurityDescriptorToSecurityDescriptorW` reads the `w!()` literal and
+        // writes the descriptor it allocates into the live local `psd`; `?` rejects a failure before
+        // `psd` is read.
+        unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                w!("D:P(A;;GA;;;SY)"),
+                SDDL_REVISION_1,
+                &mut psd,
+                None,
+            )
+            .context("build SDDL for IDD-push shared objects")?;
+        }
+        Ok(Self {
+            sa: SECURITY_ATTRIBUTES {
+                nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: psd.0,
+                bInheritHandle: false.into(),
+            },
+            psd,
+        })
+    }
+
+    /// The `SECURITY_ATTRIBUTES` to hand a create call, borrowed from this owner.
+    fn as_ptr(&self) -> *const SECURITY_ATTRIBUTES {
+        &self.sa
+    }
+}
+
+impl Drop for SharedObjectSa {
+    fn drop(&mut self) {
+        // SAFETY: `psd` is the descriptor `ConvertStringSecurityDescriptorToSecurityDescriptorW`
+        // allocated for this value and nothing else owns it; `LocalFree` releases it exactly once
+        // (this `Drop` runs once, and `as_ptr` only ever lends a borrow of `sa`).
+        unsafe {
+            let _ = LocalFree(Some(HLOCAL(self.psd.0)));
+        }
     }
 }
 
@@ -630,7 +687,7 @@ impl IddPushCapturer {
         // `OwnedHandle::from_raw_handle` adopts the handle `CreateSharedHandle` JUST minted for this
         // slot — a unique, still-open NT handle owned by this process — making the slot its sole owner.
         unsafe {
-            let (sa, _psd) = shared_object_sa()?;
+            let sa = SharedObjectSa::new()?;
             let mut slots = Vec::new();
             for _ in 0..RING_LEN {
                 let desc = D3D11_TEXTURE2D_DESC {
@@ -660,7 +717,7 @@ impl IddPushCapturer {
                 let res1: IDXGIResource1 = tex.cast()?;
                 let shared = res1
                     .CreateSharedHandle(
-                        Some(&sa as *const SECURITY_ATTRIBUTES),
+                        Some(sa.as_ptr()),
                         DXGI_SHARED_RESOURCE_RW,
                         PCWSTR::null(), // UNNAMED — reachable only through the broker's duplicate
                     )
@@ -838,11 +895,12 @@ impl IddPushCapturer {
         // SAFETY: one block over the whole ring setup; every operation in it is sound:
         // - `set_advanced_color`/`advanced_color_enabled` are `unsafe fn`s taking only a copy of the plain
         //   `u32` target id; they read/flip CCD display config and return owned values, borrowing nothing.
-        // - `CreateDXGIFactory1`, `EnumAdapterByLuid`, `make_device`, `shared_object_sa`, `CreateFileMappingW`,
-        //   `MapViewOfFile`, `CreateEventW`, and `create_ring_slots` are all `?`-checked, so every returned
-        //   interface/handle/view is non-error before use; `&sa`/`&adapter`/`&device` are live borrows that
-        //   outlive each synchronous call, and `sa.lpSecurityDescriptor` stays valid because its backing
-        //   `_psd` is held in scope for the whole block.
+        // - `CreateDXGIFactory1`, `EnumAdapterByLuid`, `make_device`, `SharedObjectSa::new`,
+        //   `CreateFileMappingW`, `MapViewOfFile`, `CreateEventW`, and `create_ring_slots` are all
+        //   `?`-checked, so every returned interface/handle/view is non-error before use;
+        //   `sa.as_ptr()`/`&adapter`/`&device` are live borrows that outlive each synchronous call, and
+        //   `sa.lpSecurityDescriptor` stays valid because the owning `SharedObjectSa` is held in scope
+        //   for the whole block (and frees the descriptor on the way out).
         // - The header mapping is created AND viewed at `bytes == size_of::<SharedHeader>().max(64)`; the
         //   view's null is checked (`bail!` on failure, after which the owned `map` closes the mapping). The
         //   OS view base is page-aligned, so `section.ptr::<SharedHeader>()` is suitably aligned for a
@@ -934,10 +992,12 @@ impl IddPushCapturer {
             // SDR unconditionally: `client_10bit` gates HDR so a client that advertised SDR-only is
             // never handed a PQ stream, even if a physical display forces HDR on (the descriptor
             // poller re-asserts OFF; PyroWave's format guard/stash absorbs any lingering FP16 compose).
-            let display_hdr = client_10bit
-                && (enabled_hdr
-                    || pf_win_display::win_display::advanced_color_enabled(target.target_id)
-                        .unwrap_or(false));
+            // Keep the raw observation so Downgrade point D below can say whether the read reported
+            // OFF or failed outright — "we asked, it said no" and "we could not tell" have different
+            // causes and different fixes.
+            let observed_hdr =
+                pf_win_display::win_display::advanced_color_enabled(target.target_id);
+            let display_hdr = client_10bit && (enabled_hdr || observed_hdr.unwrap_or(false));
             // Downgrade point D (design/hdr-10bit-default-and-av1.md item 2d): the session was
             // NEGOTIATED 10-bit (the client was told HDR in the Welcome), but the virtual display
             // could not enable advanced color — the ring sizes SDR and the encoder will emit 8-bit
@@ -946,9 +1006,14 @@ impl IddPushCapturer {
             if client_10bit && !display_hdr {
                 tracing::error!(
                     target = target.target_id,
+                    want_hdr = true,
+                    set_advanced_color_returned = enabled_hdr,
+                    observed_hdr = ?observed_hdr,
                     "IDD push: 10-bit HDR was negotiated but enabling advanced color on the \
                      virtual display FAILED — encoding 8-bit SDR while the client was told HDR \
-                     (check the display driver / Windows HDR support on this box)"
+                     (check the display driver / Windows HDR support on this box). \
+                     observed_hdr=Some(false) ⇒ the display reports advanced colour OFF after the \
+                     set; None ⇒ the CCD read itself failed"
                 );
             }
             let ring_fmt = if display_hdr {
@@ -966,13 +1031,13 @@ impl IddPushCapturer {
                 .context("EnumAdapterByLuid(render adapter) for IDD push")?;
             let (device, context) = make_device(&adapter).context("make_device for IDD push")?;
 
-            let (sa, _psd) = shared_object_sa()?;
+            let sa = SharedObjectSa::new()?;
             let bytes = std::mem::size_of::<SharedHeader>().max(64);
 
             // Header — UNNAMED (the sealed channel: the driver gets a duplicated handle, not a name).
             let map = CreateFileMappingW(
                 INVALID_HANDLE_VALUE,
-                Some(&sa),
+                Some(sa.as_ptr()),
                 PAGE_READWRITE,
                 0,
                 bytes as u32,
@@ -992,7 +1057,7 @@ impl IddPushCapturer {
                 bail!("MapViewOfFile failed for IDD-push header"); // `map` drops → mapping closed
             }
             let section = MappedSection { handle: map, view };
-            let generation = IDD_GENERATION.fetch_add(1, Ordering::Relaxed);
+            let generation = next_generation();
             let header = section.ptr::<SharedHeader>();
             std::ptr::write_bytes(header.cast::<u8>(), 0, bytes);
             (*header).version = VERSION;
@@ -1012,7 +1077,7 @@ impl IddPushCapturer {
             (*header).target_id = target.target_id;
 
             // Frame-ready event (auto-reset) — UNNAMED, like everything on this channel.
-            let event = CreateEventW(Some(&sa), false, false, PCWSTR::null())
+            let event = CreateEventW(Some(sa.as_ptr()), false, false, PCWSTR::null())
                 .context("CreateEvent(IDD-push)")?;
             let event = OwnedHandle::from_raw_handle(event.0 as _);
 
@@ -1054,22 +1119,32 @@ impl IddPushCapturer {
                     }
                     Err(e) => {
                         tracing::warn!(
-                            "cursor section creation failed (composited cursor stays): {e:#}"
+                            "cursor section creation failed — the driver will not declare a \
+                             hardware cursor, so this session cannot forward the pointer: {e:#}"
                         );
                         None
                     }
                 }
             });
-            // No channel this session, but the target's sticky declare (an EARLIER session's —
+            // No LIVE channel this session, but the target's sticky declare (an EARLIER session's —
             // irrevocable, §8.6) keeps DWM's frames pointer-free with no client drawing either:
             // the only visible pointer is the one composited here, so force composite mode on.
-            let composite_forced = target.cursor_excluded && cursor_sender.is_none();
+            //
+            // Gated on `cursor_shared`, NOT on `cursor_sender`. §8.6's rationale is "this session has
+            // no cursor CHANNEL", and the delivery just above is explicitly allowed to fail
+            // non-fatally — which is precisely the state that needs this rescue, yet the
+            // `cursor_sender.is_none()` test was the one state that skipped it: the host negotiated a
+            // channel, failed to create or deliver it, and then declined to composite, leaving a
+            // cursor-excluded target with NO pointer at all.
+            let composite_forced = target.cursor_excluded && cursor_shared.is_none();
             if composite_forced {
                 tracing::info!(
                     target_id = target.target_id,
+                    negotiated_channel = cursor_sender.is_some(),
                     "target carries an irrevocable hardware-cursor declare from an earlier \
-                     desktop-mode session and this session has no cursor channel — the host \
-                     composites the pointer into frames (forced, for the session's life)"
+                     desktop-mode session and this session has no LIVE cursor channel — the host \
+                     composites the pointer into frames (forced, for the session's life). \
+                     negotiated_channel=true ⇒ one was negotiated but its creation/delivery failed"
                 );
             }
             // The GDI shape poller rides the SAME gate as the delivered channel: with the driver's
@@ -1127,6 +1202,7 @@ impl IddPushCapturer {
                 generation,
                 client_10bit,
                 display_hdr,
+                hdr_pin_warned: false,
                 want_444,
                 pyrowave,
                 pyro_fence: None,
@@ -1168,6 +1244,7 @@ impl IddPushCapturer {
                 composite_forced,
                 cursor_blend: None,
                 cursor_blend_failed: false,
+                cursor_shm_latched: false,
                 blend_scratch: None,
                 last_blend_key: None,
                 last_slot: None,
@@ -1236,17 +1313,9 @@ impl IddPushCapturer {
             // log_driver_status_once).
             let st = unsafe { (*self.header).driver_status };
             if st == DRV_STATUS_TEX_FAIL {
-                // SAFETY: as above — in-bounds, aligned word reads of best-effort diagnostic fields
-                // through the owned, live header mapping; no reference into the shared region is formed.
                 // The driver wrote its render LUID BEFORE attempting the texture opens
                 // (frame_transport.rs step 2), so it is valid here.
-                let (detail, lo, hi) = unsafe {
-                    (
-                        (*self.header).driver_status_detail,
-                        (*self.header).driver_render_luid_low,
-                        (*self.header).driver_render_luid_high,
-                    )
-                };
+                let (_, detail, lo, hi) = self.driver_diag();
                 // Typed so `open_inner` can rebind the ring to the driver's adapter once.
                 return Err(anyhow::Error::new(AttachTexFail {
                     detail,
@@ -1375,18 +1444,7 @@ impl IddPushCapturer {
         if self.status_logged {
             return;
         }
-        // SAFETY: four in-bounds, aligned reads of the live, owned shared-header mapping. The driver writes
-        // these `u32`/`i32` diagnostic fields cross-process, but aligned word reads can't tear and these are
-        // best-effort status (the real handshake is the atomic `magic`/`latest`); no `&`/`&mut` reference
-        // into the shared region is formed.
-        let (status, detail, lo, hi) = unsafe {
-            (
-                (*self.header).driver_status,
-                (*self.header).driver_status_detail,
-                (*self.header).driver_render_luid_low,
-                (*self.header).driver_render_luid_high,
-            )
-        };
+        let (status, detail, lo, hi) = self.driver_diag();
         if status == 0 {
             return;
         }
@@ -1448,13 +1506,39 @@ impl IddPushCapturer {
         }
     }
 
-    /// The ring (shared-texture) format, matched to the display's composition format: FP16 when the
-    /// display is HDR, BGRA when SDR.
-    fn ring_format(&self) -> DXGI_FORMAT {
-        if self.display_hdr {
+    /// The ring (shared-texture) format for a given HDR state: FP16 when the display composes in
+    /// advanced colour, BGRA when SDR. Taken by value so [`Self::recreate_ring`] can size the new
+    /// slots for the INCOMING state before committing it (see there).
+    fn ring_format_for(hdr: bool) -> DXGI_FORMAT {
+        if hdr {
             DXGI_FORMAT_R16G16B16A16_FLOAT
         } else {
             DXGI_FORMAT_B8G8R8A8_UNORM
+        }
+    }
+
+    /// The ring format for the display's CURRENT HDR state.
+    fn ring_format(&self) -> DXGI_FORMAT {
+        Self::ring_format_for(self.display_hdr)
+    }
+
+    /// The driver's four best-effort diagnostic words from the shared header:
+    /// `(driver_status, detail, render_luid_low, render_luid_high)`.
+    ///
+    /// SAFETY (once, for all callers): `self.header` points into the live, owned shared-header
+    /// mapping (page-aligned, sized `>= size_of::<SharedHeader>()`), so each field read is in-bounds
+    /// and aligned, and no reference into the shared region is formed. The driver writes these
+    /// cross-process, but an aligned word read cannot tear and these are best-effort DIAGNOSTICS —
+    /// the real handshake is the atomic `magic`/`latest`.
+    fn driver_diag(&self) -> (u32, u32, u32, i32) {
+        // SAFETY: see the doc comment above.
+        unsafe {
+            (
+                (*self.header).driver_status,
+                (*self.header).driver_status_detail,
+                (*self.header).driver_render_luid_low,
+                (*self.header).driver_render_luid_high,
+            )
         }
     }
 
@@ -1464,17 +1548,22 @@ impl IddPushCapturer {
     /// self-contained handle set the driver owns); clears the header's `latest` so we don't consume a
     /// stale slot from the old ring; drops the conversion textures so they rebuild at the new format.
     fn recreate_ring(&mut self, new_display_hdr: bool, new_w: u32, new_h: u32) -> Result<()> {
-        self.display_hdr = new_display_hdr;
-        self.width = new_w;
-        self.height = new_h;
-        let fmt = self.ring_format();
-        let new_gen = IDD_GENERATION.fetch_add(1, Ordering::Relaxed);
+        // BUILD FIRST, COMMIT AFTER. `create_ring_slots` is fallible — VRAM pressure at a large new
+        // mode, which is exactly when resizes happen — and the geometry used to be committed BEFORE
+        // it ran. A failed recreate then left the capturer emitting frames stamped with the NEW
+        // width/height/format against the OLD ring, the old generation and an unchanged header:
+        // nothing downstream could detect the mismatch, because every field it would compare against
+        // had already been moved. Nothing below this line fails.
+        let fmt = Self::ring_format_for(new_display_hdr);
         // SAFETY: `create_ring_slots` is an `unsafe fn` (it makes D3D11/DXGI COM calls); we pass a live
         // borrow of `self.device` (the capturer's own device, on which the slots are created) plus plain
         // `u32`/`DXGI_FORMAT` values, and `?` propagates any failure before the slots are used. Every
         // returned slot's texture + keyed mutex belongs to that same `self.device`.
-        let new_slots =
-            unsafe { Self::create_ring_slots(&self.device, self.width, self.height, fmt)? };
+        let new_slots = unsafe { Self::create_ring_slots(&self.device, new_w, new_h, fmt)? };
+        self.display_hdr = new_display_hdr;
+        self.width = new_w;
+        self.height = new_h;
+        let new_gen = next_generation();
         // SAFETY: `self.header` is the live, owned shared-header mapping (page-aligned, sized for a
         // `SharedHeader`). The `latest`/`generation` stores go through `addr_of!`-formed field pointers (no
         // references) of correctly-aligned `u64`/`u32` fields, valid for `AtomicU64`/`AtomicU32`; the
@@ -1491,12 +1580,23 @@ impl IddPushCapturer {
             (*self.header).dxgi_format = fmt.0 as u32;
             (*self.header).width = new_w;
             (*self.header).height = new_h;
+            // Clear the driver's diagnostic words too. `wait_for_attach` — the ONLY classifier of
+            // TEX_FAIL/BIND_FAIL and the only source of the render-LUID rebind — runs at open only,
+            // so a recreate's re-attach is never classified; a stale `DRV_STATUS_OPENED` left over
+            // from the previous generation then made a FAILED re-attach look healthy, and the
+            // recover-or-drop bail below reported nothing at all while the driver's real diagnosis
+            // sat unread in the header. Cleared, these fields describe THIS generation's attach,
+            // which is what that bail now prints.
+            (*self.header).driver_status = DRV_STATUS_NONE;
+            (*self.header).driver_status_detail = 0;
             // Publish the new generation LAST (Release): when the driver observes it (Acquire) the new
             // textures already exist and the format is already updated.
             std::sync::atomic::fence(Ordering::Release);
             (*(std::ptr::addr_of!((*self.header).generation) as *const AtomicU32))
                 .store(new_gen, Ordering::Release);
         }
+        // …and let `log_driver_status_once` report the new generation's attach (or its failure).
+        self.status_logged = false;
         self.slots = new_slots; // drops the old slots → closes their shared handles + SRVs
         self.generation = new_gen;
         // Deliver the new generation's channel. The driver's old publisher sees the generation bump
@@ -1567,15 +1667,46 @@ impl IddPushCapturer {
         // An HDR-negotiated H.26x session is NOT pinned — it still follows a host "Use HDR" flip in
         // either direction (its encoder re-inits on the depth change).
         if (self.pyrowave || !self.client_10bit) && now.hdr != self.client_10bit {
-            // SAFETY: `set_advanced_color` is `unsafe` (CCD DisplayConfig calls); it takes a plain
-            // `u32` target id + bool, forms no lasting borrow, and returns a bool.
-            unsafe {
-                let _ = pf_win_display::win_display::set_advanced_color(
-                    self.target_id,
-                    self.client_10bit,
+            let want = self.client_10bit;
+            // OBSERVE the flip; never assert it. This used to discard `set_advanced_color`'s `bool`
+            // and then write `now.hdr = self.client_10bit` — substituting the DESIRED state for the
+            // observed one, which broke in both directions on a display that cannot be flipped
+            // (the state this file already logs as "Downgrade point D" at open):
+            //   - want HDR, display stays SDR: the fabricated `true` differed from `current`, so two
+            //     samples drove `recreate_ring(true, …)` and rebuilt the ring FP16 while the driver
+            //     composed 8-bit BGRA. Every publish was then dropped by the driver's format guard,
+            //     `recovering_since` expired, and `try_consume` bailed — a permanent 3-second
+            //     reconnect loop.
+            //   - want SDR, display stays HDR: the fabricated `false` MATCHED `current`, so no
+            //     recreate ever fired and the ring stayed BGRA against an FP16 composition. Same
+            //     dropped-publish outcome, silently.
+            // Reading back immediately can catch a flip that has not settled yet; that costs one
+            // debounce cycle (the poller re-samples in ~250 ms) and never a wrong ring, which is why
+            // this does not block the frame path on a settle poll the way `open_on` does.
+            // SAFETY: both are `unsafe fn`s over CCD DisplayConfig; each takes a copy of the plain
+            // `u32` target id (plus a `bool`), forms no lasting borrow, and returns an owned value.
+            let requested =
+                unsafe { pf_win_display::win_display::set_advanced_color(self.target_id, want) };
+            // SAFETY: as above — a read-only CCD query over a copy of the plain `u32` target id.
+            let observed =
+                unsafe { pf_win_display::win_display::advanced_color_enabled(self.target_id) };
+            // A failed READ is not evidence of a failed flip — keep the poller's sample then.
+            now.hdr = observed.unwrap_or(now.hdr);
+            if now.hdr != want && !self.hdr_pin_warned {
+                self.hdr_pin_warned = true;
+                tracing::error!(
+                    target_id = self.target_id,
+                    want_hdr = want,
+                    observed_hdr = ?observed,
+                    set_advanced_color_returned = requested,
+                    pyrowave = self.pyrowave,
+                    client_10bit = self.client_10bit,
+                    "IDD push: could not pin the display to the NEGOTIATED depth — following what \
+                     it actually composes instead (a physical display forcing HDR, or a driver that \
+                     refuses the flip). The stream's depth will not match the negotiation; the \
+                     encoder's caps cross-check reports the truth to the client"
                 );
             }
-            now.hdr = self.client_10bit;
         }
         let current = DisplayDescriptor {
             hdr: self.display_hdr,
@@ -1794,7 +1925,11 @@ impl IddPushCapturer {
                     .CreateSharedHandle(None, 0x1000_0000, PCWSTR::null())
                     .context("ID3D11Fence::CreateSharedHandle")?;
                 self.pyro_fence = Some(fence);
-                self.pyro_fence_handle = Some(handle.0 as isize);
+                // `handle` is the shared NT handle `CreateSharedHandle` just minted for this fence —
+                // a unique, still-open handle owned by this process — so `OwnedHandle` becomes its
+                // sole owner and closes it exactly once, when the capturer drops. (Inside this fn's
+                // `unsafe` scope; see its SAFETY block.)
+                self.pyro_fence_handle = Some(OwnedHandle::from_raw_handle(handle.0 as _));
                 self.pyro_fence_value = 0;
             }
             self.pyro_fence_value += 1;
@@ -1814,17 +1949,56 @@ impl IddPushCapturer {
             // client mode-switch, and a rebuilt encoder needs to re-import the fence into its fresh Vulkan
             // device. The encoder imports only when it has no timeline yet (and DUPLICATES the handle so
             // this original stays valid for the next rebuild).
-            Ok(Some((self.pyro_fence_handle, value)))
+            Ok(Some((
+                self.pyro_fence_handle
+                    .as_ref()
+                    .map(|h| h.as_raw_handle() as isize),
+                value,
+            )))
         }
     }
 
-    /// The (serial, x, y, visible) of the CURRENT polled cursor — the composite-regen change
-    /// key. `None` while the poller has no shape yet (or isn't running).
-    fn cursor_blend_key(&self) -> Option<(u64, i32, i32, bool)> {
-        self.cursor_poll
-            .as_ref()
-            .and_then(|p| p.read())
-            .map(|o| (o.serial, o.x, o.y, o.visible))
+    /// THE live cursor overlay for this session — the single source every consumer reads
+    /// ([`Capturer::cursor`], [`Self::cursor_blend_key`], [`Self::prepare_blend_scratch`]).
+    ///
+    /// A LIVE poller wins, even while it still reports `None` (pre-first-shape); the driver's shm
+    /// section serves only a poller that failed to start or died. The choice is LATCHED for the
+    /// session because the two sources maintain INDEPENDENT serial namespaces: interleaving them
+    /// mid-session hands the client two different shapes under one serial and poisons its shape
+    /// cache. So once the shm has been used, the poller is not re-adopted.
+    ///
+    /// One function because the three consumers disagreed: `cursor()` degraded poller→shm correctly,
+    /// but the BLEND path — `cursor_blend_key` and `prepare_blend_scratch`, the only consumer that
+    /// matters in the composite model, since the Windows encode loop never attaches `frame.cursor` —
+    /// read `cursor_poll` directly with no `alive()` check and no shm fallback. The documented
+    /// fallback and the spawn-failure warning were both untrue for exactly those sessions: a dead
+    /// poller meant pointer-less frames, not a degraded pointer.
+    fn live_cursor(&mut self) -> Option<pf_frame::CursorOverlay> {
+        if !self.cursor_shm_latched {
+            if let Some(p) = &self.cursor_poll {
+                if p.alive() {
+                    return p.read();
+                }
+            }
+            // The poller is gone (or never started) and we are about to read the shm — latch, so a
+            // poller that somehow reports alive again cannot re-cross the serial namespaces.
+            if self.cursor_shared.is_some() {
+                self.cursor_shm_latched = true;
+                tracing::warn!(
+                    target_id = self.target_id,
+                    "cursor: the GDI shape poller is not running — degrading to the driver's \
+                     hardware-cursor shm section for the rest of the session (alpha-only shapes: \
+                     monochrome/masked cursors will look wrong)"
+                );
+            }
+        }
+        self.cursor_shared.as_mut().and_then(|c| c.read())
+    }
+
+    /// The (serial, x, y, visible) of the CURRENT live cursor — the composite-regen change key.
+    /// `None` while no source has a shape yet.
+    fn cursor_blend_key(&mut self) -> Option<(u64, i32, i32, bool)> {
+        self.live_cursor().map(|o| (o.serial, o.x, o.y, o.visible))
     }
 
     /// Composite the pointer for this convert: ensure the frame-sized blend scratch, copy the
@@ -1921,7 +2095,10 @@ impl IddPushCapturer {
             let (tex, srv) = (tex.clone(), srv.clone());
             self.context.CopyResource(&tex, slot_tex);
             // Blend the pointer (visible shapes only; hidden = the copy alone is the frame).
-            let overlay = self.cursor_poll.as_ref().and_then(|p| p.read());
+            // Through `live_cursor`, so a dead poller degrades to the shm section HERE too — this
+            // is the path that actually draws the pointer in the composite model, and the one that
+            // used to read the poller unconditionally.
+            let overlay = self.live_cursor();
             self.last_blend_key = overlay.as_ref().map(|o| (o.serial, o.x, o.y, o.visible));
             if let Some(ov) = overlay.filter(|o| o.visible) {
                 if self.cursor_blend.is_none() && !self.cursor_blend_failed {
@@ -2028,9 +2205,18 @@ impl IddPushCapturer {
         // session cleanly (the loop's `?` ends it → the client reconnects) rather than freeze forever.
         if let Some(since) = self.recovering_since {
             if since.elapsed() > Duration::from_secs(3) {
+                // Say WHY, from the driver's own evidence. `recreate_ring` cleared these fields, so
+                // whatever they hold now is this generation's re-attach — the one nothing else
+                // classifies (`wait_for_attach` runs at open only). Without it this bail was a bare
+                // "could not recover", and the driver's real diagnosis (a TEX_FAIL render-adapter
+                // mismatch, say, with the adapter it actually renders on) was sitting unread.
+                let (st, detail, lo, hi) = self.driver_diag();
                 bail!(
                     "IDD-push: display descriptor changed and the ring could not recover within 3s — \
-                     dropping the session so the client reconnects"
+                     dropping the session so the client reconnects. This generation's re-attach: \
+                     driver_status={st} detail=0x{detail:08x} driver_render_luid={hi:08x}:{lo:08x} \
+                     (0=never attached, 1=attached but published nothing, 2=could not open our \
+                     textures — render-adapter mismatch, 4=refused the ring↔monitor binding)"
                 );
             }
             // Same idle-desktop stall as the open-time attach gate: after a mid-session ring
@@ -2459,15 +2645,7 @@ fn deliver_cursor_channel(
 
 impl Capturer for IddPushCapturer {
     fn cursor(&mut self) -> Option<pf_frame::CursorOverlay> {
-        // A LIVE poller is the sole source — even while it still reports `None` (pre-first-shape):
-        // falling back to the shm mid-session would interleave two serial namespaces and poison
-        // the client's shape cache. The shm read only serves a poller that failed to start/died.
-        if let Some(p) = &self.cursor_poll {
-            if p.alive() {
-                return p.read();
-            }
-        }
-        self.cursor_shared.as_mut().and_then(|c| c.read())
+        self.live_cursor()
     }
 
     fn set_cursor_forward(&mut self, on: bool) {
@@ -2507,17 +2685,7 @@ impl Capturer for IddPushCapturer {
                 return Ok(f);
             }
             if Instant::now() > deadline {
-                // SAFETY: four in-bounds, aligned reads of the live, owned shared-header mapping — the same
-                // best-effort diagnostic fields as `log_driver_status_once` (aligned word reads can't tear;
-                // no reference into the shared region is formed).
-                let (st, detail, lo, hi) = unsafe {
-                    (
-                        (*self.header).driver_status,
-                        (*self.header).driver_status_detail,
-                        (*self.header).driver_render_luid_low,
-                        (*self.header).driver_render_luid_high,
-                    )
-                };
+                let (st, detail, lo, hi) = self.driver_diag();
                 bail!(
                     "no IDD-push frame within 20s (target {}) — driver_status={st} detail=0x{detail:08x} \
                      driver_render_luid={hi:08x}:{lo:08x}. 0=driver never attached (swap-chain not \

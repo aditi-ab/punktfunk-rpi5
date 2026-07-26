@@ -196,8 +196,13 @@ impl CursorBlendPass {
                 {
                     std::ptr::copy_nonoverlapping(cb.as_ptr(), mapped.pData as *mut f32, cb.len());
                     ctx.Unmap(&self.cbuf, 0);
+                    // Cache ONLY on a successful upload. Caching unconditionally meant one transient
+                    // `Map` failure wedged the HDR/SDR cursor scale for the rest of the session: the
+                    // buffer still held the OLD value while this believed it held the new one, and
+                    // no later call would retry. On failure the cache is left alone and the next
+                    // blend tries again — a stale scale for a frame instead of forever.
+                    self.cbuf_scale = Some(linear_scale);
                 }
-                self.cbuf_scale = Some(linear_scale);
             }
             let mut rtv: Option<ID3D11RenderTargetView> = None;
             device

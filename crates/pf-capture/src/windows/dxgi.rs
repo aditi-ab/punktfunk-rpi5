@@ -1300,7 +1300,15 @@ fn f32_to_f16(v: f32) -> u16 {
         let half_exp = (exp as u16) << 10;
         let half_mant = (mant >> 13) as u16;
         let round = ((mant >> 12) & 1) as u16;
-        sign | half_exp | (half_mant + round)
+        // ADD, never OR. `half_mant + round` can carry out of the 10-bit mantissa (all ones, then
+        // rounded up), and that carry must INCREMENT the exponent — which is exactly what an
+        // IEEE-754 round-to-nearest overflow means. `sign | half_exp | (…)` instead ORed it into bit
+        // 10, so for every ODD biased exponent (bit 10 already set) the carry vanished and the
+        // result came back a factor of ~2 low: `f32_to_f16(1.9998779) → 0x3C00 = 1.0`,
+        // `0.49996948 → 0.25`. Only values one ULP below a power of two are affected — which is
+        // precisely what a gradient test pattern is full of, so this made `hdr-p010-selftest` FAIL a
+        // correct shader. The subnormal branch above was already additive.
+        sign | (half_exp + half_mant + round)
     }
 }
 
@@ -1459,6 +1467,86 @@ impl VideoConverter {
             drop(std::mem::ManuallyDrop::into_inner(stream.pInputSurface));
             blt.context("VideoProcessorBlt")
         }
+    }
+}
+
+#[cfg(test)]
+mod f16_tests {
+    use super::f32_to_f16;
+
+    /// Round-trip through the reference conversion the rest of the test uses as an oracle.
+    fn f16_to_f32(h: u16) -> f32 {
+        let sign = if h & 0x8000 != 0 { -1.0f32 } else { 1.0 };
+        let exp = ((h >> 10) & 0x1f) as i32;
+        let mant = (h & 0x3ff) as f32;
+        match exp {
+            0 => sign * mant * 2f32.powi(-24), // subnormal
+            31 => sign * f32::INFINITY,        // our encoder never emits NaN
+            e => sign * (1.0 + mant / 1024.0) * 2f32.powi(e - 15),
+        }
+    }
+
+    /// W7: the rounding carry out of the mantissa must INCREMENT the exponent. The composition used
+    /// `sign | half_exp | (half_mant + round)`, which swallowed that carry for every odd biased
+    /// exponent — a silent factor-of-2 error on exactly the values a gradient test pattern is full
+    /// of, which made `hdr-p010-selftest` fail a correct shader.
+    #[test]
+    fn a_rounding_carry_increments_the_exponent() {
+        // The plan's canonical case: biased exponent 127 (2^0) with a mantissa that rounds up out
+        // of 10 bits ⇒ 2.0 = 0x4000, NOT 1.0 = 0x3C00.
+        assert_eq!(f32_to_f16(f32::from_bits((127 << 23) | 0x7FF000)), 0x4000);
+        // The two measured regressions, by value.
+        assert_eq!(
+            f32_to_f16(1.9998779),
+            0x4000,
+            "1.9998779 must not read as 1.0"
+        );
+        assert_eq!(
+            f32_to_f16(0.49996948),
+            0x3800,
+            "0.49996948 must not read as 0.25"
+        );
+        // …and an EVEN biased exponent, where the bug happened to be invisible (bit 10 clear), so
+        // the fix must not change it.
+        assert_eq!(f32_to_f16(f32::from_bits((128 << 23) | 0x7FF000)), 0x4400); // → 4.0
+    }
+
+    #[test]
+    fn the_constants_the_selftest_uploads_are_exact() {
+        assert_eq!(f32_to_f16(0.0), 0x0000);
+        assert_eq!(f32_to_f16(-0.0), 0x8000);
+        assert_eq!(f32_to_f16(1.0), 0x3C00);
+        assert_eq!(f32_to_f16(-1.0), 0xBC00);
+        assert_eq!(f32_to_f16(0.5), 0x3800);
+        assert_eq!(f32_to_f16(2.0), 0x4000);
+        assert_eq!(f32_to_f16(4.0), 0x4400);
+    }
+
+    /// Every HDR scRGB value the self-test patterns use must survive the round trip to within one
+    /// f16 ULP — the property the P010 comparison actually depends on.
+    #[test]
+    fn hdr_scrgb_values_round_trip_within_one_ulp() {
+        for &v in &[
+            0.0f32, 0.25, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 0.1, 0.3, 0.7, 1.9998779, 0.49996948, 2.5,
+            3.999, 0.001,
+        ] {
+            let back = f16_to_f32(f32_to_f16(v));
+            // One ULP at this magnitude: f16 carries 11 significand bits.
+            let ulp = (v.abs() / 1024.0).max(2f32.powi(-24));
+            assert!(
+                (back - v).abs() <= ulp,
+                "{v} round-tripped to {back} (ulp {ulp})"
+            );
+        }
+    }
+
+    #[test]
+    fn out_of_range_magnitudes_saturate_rather_than_wrap() {
+        // Above f16's max finite (65504) our encoder reports Inf; below its subnormal floor, ±0.
+        assert_eq!(f32_to_f16(1.0e30), 0x7C00);
+        assert_eq!(f32_to_f16(-1.0e30), 0xFC00);
+        assert_eq!(f32_to_f16(1.0e-30), 0x0000);
+        assert_eq!(f32_to_f16(-1.0e-30), 0x8000);
     }
 }
 

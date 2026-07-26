@@ -86,10 +86,18 @@ impl CursorPoller {
     /// syscalls/s are not.
     const REATTACH: Duration = Duration::from_millis(250);
 
-    /// Spawn the poller for the virtual display `target_id`. `rect` = the target's desktop rect
+    /// Spawn the poller for the virtual display `target_id`. `rect` SEEDS the target's desktop rect
     /// (`source_desktop_rect` order: x, y, w, h) — cursor positions are desktop-global; the
     /// overlay wants frame-relative, and a pointer outside the rect reports `visible: false`
     /// (per-output semantics, matching the driver shm path and the Linux portal).
+    ///
+    /// A SEED, not the value: the poll thread re-queries the rect on its [`Self::REATTACH`] cadence.
+    /// It used to be captured once here and used forever for BOTH the desktop→frame offset and the
+    /// `in_rect` test, while both mid-session mode-change paths (`resize_output` and
+    /// `poll_display_hdr` → `recreate_ring`) keep the same poller — so after an in-place resize the
+    /// pointer was clipped to the OLD rect and offset by a stale origin. Re-querying on the poll
+    /// thread is what keeps the CCD call off the capture/encode thread, which is the whole reason
+    /// this poller exists (see `DescriptorPoller`).
     pub(super) fn spawn(target_id: u32, rect: (i32, i32, i32, i32)) -> Self {
         let slot: Arc<Mutex<Option<pf_frame::CursorOverlay>>> = Arc::new(Mutex::new(None));
         let stop = Arc::new(AtomicBool::new(false));
@@ -139,7 +147,7 @@ impl Drop for CursorPoller {
 /// The poll loop. Owns the thread's input-desktop binding and the shape cache.
 fn run(
     target_id: u32,
-    rect: (i32, i32, i32, i32),
+    mut rect: (i32, i32, i32, i32),
     slot: &Mutex<Option<pf_frame::CursorOverlay>>,
     stop: &AtomicBool,
     secure: &AtomicBool,
@@ -167,6 +175,28 @@ fn run(
         if last_attach.elapsed() >= CursorPoller::REATTACH {
             last_attach = Instant::now();
             publish_secure(secure, desktop.reattach());
+            // …and re-read the target's desktop rect on the same cadence: a mid-session resize (or
+            // an HDR recreate, or the user moving this display in the desktop arrangement) changes
+            // BOTH the origin the position is made relative to and the extent `in_rect` tests
+            // against, and this poller outlives all of them. `None` keeps the last good value — a
+            // transient CCD failure must not park the pointer at a `(0, 0, 0, 0)` rect, which would
+            // report every position invisible.
+            //
+            // SAFETY: `source_desktop_rect` is an `unsafe fn` running the read-only CCD
+            // `QueryDisplayConfig` over owned local buffers; the `Copy` target id crosses by value
+            // and it returns owned `(x, y, w, h)` values, borrowing nothing.
+            let fresh = unsafe { pf_win_display::win_display::source_desktop_rect(target_id) };
+            if let Some(fresh) = fresh {
+                if fresh != rect {
+                    tracing::info!(
+                        target_id,
+                        from = ?rect,
+                        to = ?fresh,
+                        "cursor poller: target desktop rect changed — re-basing pointer positions"
+                    );
+                    rect = fresh;
+                }
+            }
         }
 
         let mut ci = CURSORINFO {
