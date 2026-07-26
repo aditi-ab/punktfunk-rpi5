@@ -260,14 +260,13 @@ pub struct LeaseRequest {
 /// The reference instant for adopting this launch's processes, in seconds since boot. Call it
 /// **before** anything spawns; see [`LeaseRequest::launch_stamp`].
 pub fn launch_clock() -> Option<f64> {
-    #[cfg(target_os = "linux")]
-    {
-        crate::procscan::launch_stamp()
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        None
-    }
+    // Delegate unconditionally: `procscan::launch_stamp` already answers `None` on a platform with
+    // no matcher. Gating this on Linux here silently disabled the start-time floor on Windows —
+    // `find(spec, None)` skips the filter entirely — so a copy of the game the player already had
+    // open was adopted and then ended with the session (caught on glass, .173: Steam focused a
+    // running instance instead of starting one, and the lease took it). The Windows matcher is
+    // exactly where that rule matters most, since the host is SYSTEM and can see every process.
+    crate::procscan::launch_stamp()
 }
 
 /// What the watcher does when it concludes the game has exited.
@@ -1204,6 +1203,20 @@ mod tests {
             EXITS.load(Ordering::SeqCst),
             0,
             "a host-requested end must not fire the session-ending action"
+        );
+    }
+
+    /// Wherever the host can match processes at all, a launch MUST have a reference instant to
+    /// match them against — it is the only thing standing between this feature and ending a copy of
+    /// the game the player already had open. `None` here doesn't fail loudly; it silently turns the
+    /// filter off ([`crate::procscan::Scanner::find`] skips it), so nothing downstream can notice.
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn a_launch_always_gets_a_reference_instant_to_adopt_against() {
+        assert!(
+            launch_clock().is_some(),
+            "no launch reference on a platform that matches processes — every pre-existing \
+             instance of a title would be adoptable, and endable"
         );
     }
 
