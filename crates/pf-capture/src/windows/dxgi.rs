@@ -40,11 +40,19 @@ use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT_R16_UNORM, DXGI_SAMPLE_DESC,
 };
 
-/// How many times DXGI has actually called our hooked `NtGdiDdDDIGetCachedHybridQueryValue`. If this
-/// stays 0 while DDA churns with ACCESS_LOST, the hook is NOT on DXGI's GPU-preference path on this
-/// build (so reparenting can't be the cause — look at composition/independent-flip instead). >0 with
-/// continuing churn means the hook fires but reparenting isn't the trigger here.
+/// How many times DXGI has actually called our hooked `NtGdiDdDDIGetCachedHybridQueryValue`.
+/// Reported by [`hybrid_hook_hits`] on every IDD-push open, which is the first point at which DXGI
+/// has been exercised (factory → `EnumAdapterByLuid` → device). The patch-readback check in
+/// [`install_gpu_pref_hook`] proves the BYTES landed; only this counter proves DXGI actually
+/// reaches the export on this build — so `0` here means the hook is inert and a
+/// reparenting-flavoured symptom (see [`install_gpu_pref_hook`]) has some other cause.
 static HYBRID_HOOK_HITS: AtomicU64 = AtomicU64::new(0);
+
+/// See [`HYBRID_HOOK_HITS`] — surfaced in the IDD-push open log so a dead hook is visible in the
+/// field instead of being a silent write-only counter.
+pub(crate) fn hybrid_hook_hits() -> u64 {
+    HYBRID_HOOK_HITS.load(Ordering::Relaxed)
+}
 
 // kernel32 — declared directly so we don't pull the whole Win32_System_Diagnostics_Debug feature for
 // one call. FlushInstructionCache serializes the i-cache after the inline patch: the patch is written
@@ -75,11 +83,19 @@ unsafe extern "system" fn hybrid_query_hook(gpu_preference: *mut u32) -> i32 {
 /// The win32u GPU-preference hook (the same technique Apollo applies, reimplemented here from the
 /// documented DDI — no GPL source copied). On a HYBRID-GPU box DXGI resolves a GPU preference
 /// (registry + power settings + the hybrid-adapter DDI) and REPARENTS outputs onto the chosen render
-/// GPU — which constantly invalidates Desktop Duplication (DXGI_ERROR_ACCESS_LOST 0x887A0026, the
-/// freeze/churn observed on the RTX 4090 + AMD iGPU box; `SET_RENDER_ADAPTER` is ignored there). Faking
-/// a cached preference of UNSPECIFIED makes DXGI skip the resolution, so the output is NOT reparented
-/// and DDA stays stable on one adapter (this is what makes Apollo's DDA work on this hardware).
-/// Installed once, before the first DXGI factory/enumeration; lasts the process lifetime (like Apollo).
+/// GPU, ignoring `SET_RENDER_ADAPTER` (observed on the RTX 4090 + AMD iGPU box). Faking a cached
+/// preference of UNSPECIFIED makes DXGI skip that resolution, so an output is NOT reparented and
+/// stays on one adapter.
+///
+/// **Why it is still installed now that DXGI Desktop Duplication is gone:** the IDD-push ring and
+/// the driver's swap-chain must live on the SAME adapter, and the host pins that with
+/// `SET_RENDER_ADAPTER` at monitor ADD (see `idd_push::open_inner`). A DXGI reparent moves the
+/// virtual output off the pinned GPU behind the host's back — which surfaces as the driver's
+/// `DRV_STATUS_TEX_FAIL` ("could not open our textures — render-adapter mismatch") and costs a
+/// ring rebind. So the hook's job changed from "keep DDA on one adapter" to "keep the VIRTUAL
+/// DISPLAY on the adapter we pinned"; the mechanism is unchanged. Installed once from
+/// `main.rs`, before the virtual-display setup creates the first DXGI factory; lasts the process
+/// lifetime. [`hybrid_hook_hits`] reports whether DXGI ever actually calls it.
 pub fn install_gpu_pref_hook() {
     use std::sync::Once;
     static HOOK: Once = Once::new();
@@ -103,25 +119,38 @@ pub fn install_gpu_pref_hook() {
             GetAwarenessFromDpiAwarenessContext, GetThreadDpiAwarenessContext,
             SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
         };
-        // Per-monitor-v2 DPI awareness — REQUIRED for IDXGIOutput5::DuplicateOutput1 (without it the
-        // call returns E_ACCESSDENIED forever, forcing the legacy DuplicateOutput path). Matches
-        // Apollo's startup. SetProcessDpiAwarenessContext fails with E_ACCESS_DENIED if awareness was
-        // already set (manifest / earlier call) — log the outcome AND the effective awareness so a
-        // 100% DuplicateOutput1 E_ACCESSDENIED is diagnosable instead of silent.
+        // Per-monitor-v2 DPI awareness. It was originally set here because
+        // `IDXGIOutput5::DuplicateOutput1` returns E_ACCESSDENIED without it; DDA is gone, but the
+        // awareness still matters — an UNAWARE/SYSTEM-aware process gets DPI-VIRTUALIZED window and
+        // cursor coordinates, while every geometry the host computes comes from CCD in PHYSICAL
+        // pixels (`source_desktop_rect`, `desktop_bounds`). Mixing the two mis-aims the compose
+        // kick's `SetCursorPos` and the cursor-blend placement on any scaled display. Set here
+        // because this is the earliest process-wide hook point. `SetProcessDpiAwarenessContext`
+        // fails with E_ACCESS_DENIED if awareness was already set (manifest / earlier call) — log
+        // the outcome AND the effective awareness so a mis-scaled pointer is diagnosable.
         match SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) {
             Ok(()) => tracing::info!("DPI awareness set: PER_MONITOR_AWARE_V2"),
             Err(e) => tracing::warn!(error = ?e,
-                "SetProcessDpiAwarenessContext failed (already set?) — DuplicateOutput1 may E_ACCESSDENIED"),
+                "SetProcessDpiAwarenessContext failed (already set?) — cursor/desktop coordinates \
+                 may be DPI-virtualized against the host's physical-pixel CCD geometry"),
         }
-        // 0=UNAWARE 1=SYSTEM 2=PER_MONITOR(_V2). DuplicateOutput1 needs 2.
+        // 0=UNAWARE 1=SYSTEM 2=PER_MONITOR(_V2). Physical-pixel coordinates need 2.
         let awareness = GetAwarenessFromDpiAwarenessContext(GetThreadDpiAwarenessContext()).0;
-        tracing::info!(awareness, "effective DPI awareness (need 2=PER_MONITOR for DuplicateOutput1)");
+        tracing::info!(
+            awareness,
+            "effective DPI awareness (need 2=PER_MONITOR for physical-pixel coordinates)"
+        );
         let Ok(lib) = LoadLibraryA(s!("win32u.dll")) else {
-            tracing::warn!("GPU-pref hook: win32u.dll not loadable — skipping (DDA may churn on hybrid GPUs)");
+            tracing::warn!(
+                "GPU-pref hook: win32u.dll not loadable — skipping (on a hybrid-GPU box DXGI may \
+                 reparent the virtual display off the pinned render adapter → TEX_FAIL rebinds)"
+            );
             return;
         };
         let Some(target) = GetProcAddress(lib, s!("NtGdiDdDDIGetCachedHybridQueryValue")) else {
-            tracing::warn!("GPU-pref hook: NtGdiDdDDIGetCachedHybridQueryValue not exported — skipping");
+            tracing::warn!(
+                "GPU-pref hook: NtGdiDdDDIGetCachedHybridQueryValue not exported — skipping"
+            );
             return;
         };
         let target = target as usize as *mut u8;
@@ -135,7 +164,14 @@ pub fn install_gpu_pref_hook() {
         patch[10] = 0xFF;
         patch[11] = 0xE0; // jmp rax
         let mut old = PAGE_PROTECTION_FLAGS(0);
-        if VirtualProtect(target as *const c_void, 12, PAGE_EXECUTE_READWRITE, &mut old).is_err() {
+        if VirtualProtect(
+            target as *const c_void,
+            12,
+            PAGE_EXECUTE_READWRITE,
+            &mut old,
+        )
+        .is_err()
+        {
             tracing::warn!("GPU-pref hook: VirtualProtect failed — skipping");
             return;
         }
@@ -153,12 +189,15 @@ pub fn install_gpu_pref_hook() {
         std::ptr::copy_nonoverlapping(target, readback.as_mut_ptr(), 12);
         if readback == patch {
             tracing::info!(
-                "GPU-pref hook installed + verified (win32u hybrid-query -> UNSPECIFIED): reparenting disabled"
+                "GPU-pref hook installed + verified (win32u hybrid-query -> UNSPECIFIED): DXGI \
+                 output reparenting disabled. Whether DXGI actually CALLS it shows up as \
+                 hybrid_hook_hits on the IDD-push open line."
             );
         } else {
             tracing::error!(
                 want = %format!("{patch:02x?}"), got = %format!("{readback:02x?}"),
-                "GPU-pref hook patch did NOT land — hook is DEAD (DXGI will still reparent → ACCESS_LOST churn)"
+                "GPU-pref hook patch did NOT land — hook is DEAD (on a hybrid-GPU box DXGI can \
+                 still reparent the virtual display off the pinned render adapter)"
             );
         }
     });
@@ -775,22 +814,6 @@ fn p010_reference(r: f64, g: f64, b: f64) -> (f64, f64, f64) {
     (yc, cbc, crc)
 }
 
-/// Colour self-test for [`HdrP010Converter`] (the `hdr-p010-selftest` subcommand): create a hardware
-/// D3D11 device, upload a known scRGB FP16 pattern, run the P010 shader passes, read the Y (plane 0)
-/// and UV (plane 1) planes back from a staging copy, and compare against the [`p010_reference`] f64
-/// math. The ONLY validation we have without green-screening a live HDR stream. PASS if max abs error
-/// Y ≤ 4 codes, U/V ≤ 5 codes (rounding + chroma averaging). Prints a per-colour table + PASS/FAIL.
-#[cfg(target_os = "windows")]
-pub fn hdr_p010_selftest() -> Result<()> {
-    hdr_p010_selftest_at(64, 64, None)
-}
-
-/// [`hdr_p010_selftest`] at an arbitrary even size and (optionally) on a specific GPU vendor
-/// (PCI vendor id, e.g. `0x8086` Intel / `0x10de` NVIDIA / `0x1002` AMD). The size matters on
-/// top of the 64×64 default because the field sessions run at capture resolutions whose height
-/// is NOT 16-aligned (1080 → the encoder's align16 pool seam) and a driver may treat the planar
-/// RTVs differently at real sizes; the vendor pin matters on dual-GPU boxes where the default
-/// adapter is not the one the session encodes on.
 /// Test support (used by pf-encode's live e2e): the 8 sRGB colour bars (white/yellow/cyan/green/
 /// magenta/red/blue/black, sRGB 1.0 = scRGB 1.0 = 80 nits) as a w×h FP16 scRGB texture on the
 /// adapter with `luid`, converted through the REAL [`HdrP010Converter`] into a P010 texture with
@@ -920,6 +943,18 @@ pub fn hdr_p010_convert_bars_on_luid(
     }
 }
 
+/// Colour self-test for [`HdrP010Converter`] (the `hdr-p010-selftest` subcommand): create a hardware
+/// D3D11 device, upload a known scRGB FP16 pattern, run the P010 shader passes, read the Y (plane 0)
+/// and UV (plane 1) planes back from a staging copy, and compare against the [`p010_reference`] f64
+/// math. The ONLY validation we have without green-screening a live HDR stream. PASS if max abs error
+/// Y ≤ 4 codes, U/V ≤ 5 codes (rounding + chroma averaging). Prints a per-colour table + PASS/FAIL.
+///
+/// `w`/`h` must be even and non-zero. Run it at the FIELD capture size, not a toy one: sessions run
+/// at resolutions whose height is not 16-aligned (1080 → the encoder's align16 pool seam) and a
+/// driver may treat the planar RTVs differently at real sizes. `vendor` pins the adapter by PCI
+/// vendor id (`0x8086` Intel / `0x10de` NVIDIA / `0x1002` AMD) — it matters on dual-GPU boxes where
+/// the default adapter is not the one the session encodes on. The chosen adapter is always printed,
+/// because a PASS only means anything for the GPU it actually ran on.
 #[cfg(target_os = "windows")]
 pub fn hdr_p010_selftest_at(w: u32, h: u32, vendor: Option<u32>) -> Result<()> {
     use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_UNKNOWN};
@@ -1286,8 +1321,15 @@ use windows::Win32::Graphics::Dxgi::Common::{
 /// D3D11 **Video Processor** colour/format converter — runs on the GPU's dedicated VIDEO engine, NOT
 /// the 3D engine, so the per-frame RGB→YUV conversion does not contend with a GPU-saturating game (the
 /// HDR pixel-shader path and NVENC's internal RGB→YUV both use the 3D/compute engine, which an AAA
-/// title pins at ~100%). Output is NV12 (SDR, BT.709 studio-range) or P010 (HDR, BT.2020 PQ
-/// studio-range) — NVENC's native YUV inputs, so it encodes them with no further conversion.
+/// title pins at ~100%). Output is **always NV12, BT.709 studio-range** — one of NVENC's native YUV
+/// inputs, so it encodes with no further conversion.
+///
+/// It does NOT produce P010/BT.2020 PQ: [`VideoConverter::new`] pins the output colour space to
+/// `YCBCR_STUDIO_G22_LEFT_P709` unconditionally, and NVIDIA's video processor cannot do RGB→P010 at
+/// all (it renders green) — the HDR path is [`HdrP010Converter`]'s shader instead. The `scrgb_input`
+/// arm of `new` is likewise the only part of the HDR story here (an FP16 desktop tone-mapped DOWN to
+/// 8-bit BT.709), and it currently has no caller: `idd_push::ensure_converter` builds this converter
+/// only on the SDR/BGRA path and always passes `false`.
 pub(crate) struct VideoConverter {
     vdev: ID3D11VideoDevice,
     vctx: ID3D11VideoContext1,
@@ -1361,7 +1403,8 @@ impl VideoConverter {
         }
     }
 
-    /// Convert `input` (BGRA or scRGB FP16) → `output` (NV12 or P010) on the video engine. Views are
+    /// Convert `input` (BGRA, or scRGB FP16 for a converter built with `scrgb_input`) → `output`
+    /// (NV12, BT.709 studio-range — see the type doc: never P010) on the video engine. Views are
     /// created per call (cheap relative to the Blt) so the input texture can vary frame to frame.
     pub(crate) unsafe fn convert(
         &self,

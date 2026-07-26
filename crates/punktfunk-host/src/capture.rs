@@ -16,7 +16,7 @@ pub use pf_capture::{
     capturer_supports_444, capturer_supports_hdr, Capturer, FastSyntheticCapturer,
     SyntheticCapturer,
 };
-// `crate::capture::dxgi::{install_gpu_pref_hook, hdr_p010_selftest}` (main.rs subcommands) and
+// `crate::capture::dxgi::{install_gpu_pref_hook, hdr_p010_selftest_at}` (main.rs subcommands) and
 // `crate::capture::synthetic_nv12` resolve through pf-capture's Windows modules.
 #[cfg(target_os = "windows")]
 pub use pf_capture::{dxgi, synthetic_nv12};

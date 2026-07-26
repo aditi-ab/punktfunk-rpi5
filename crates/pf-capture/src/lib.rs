@@ -22,7 +22,9 @@ use pf_frame::{CapturedFrame, FramePayload, PixelFormat};
 use pf_frame::DmabufFrame;
 
 /// Produces frames from a captured output. Lives on its own thread, feeding the encoder
-/// over a bounded drop-oldest channel (never block the compositor).
+/// over a bounded channel that never blocks the compositor — the Linux portal's is drop-**newest**
+/// (a full channel discards the ARRIVING frame; `linux/mod.rs`'s `try_send`), so under a consumer
+/// stall the encoder is handed the stalest queued frame.
 pub trait Capturer: Send {
     fn next_frame(&mut self) -> Result<CapturedFrame>;
 
@@ -66,11 +68,6 @@ pub trait Capturer: Send {
     /// duration of a stream, `false` when it ends.
     fn set_active(&self, _active: bool) {}
 
-    /// The source's static HDR mastering metadata (SMPTE ST.2086 + content light level), when the
-    /// capturer can read it from the output (Windows `IDXGIOutput6::GetDesc1`). `None` = unknown /
-    /// SDR / a backend that doesn't expose it (the default — Linux capture has no HDR path yet).
-    /// The stream loop forwards this to the encoder (in-band SEI) and the client (`0xCE` datagram),
-    /// so the two stay a single source of truth. May change mid-session if the source is regraded.
     /// The capture source's LIVE cursor state, when it arrives out-of-band from the frames
     /// (the Windows IddCx hardware-cursor channel). Polled by the encode loop every tick and
     /// preferred over `CapturedFrame::cursor` — with a hardware cursor, pointer-only moves
@@ -99,6 +96,11 @@ pub trait Capturer: Send {
     /// no-op: every non-gamescope capturer already has a cursor source.
     fn attach_gamescope_cursor(&mut self, _targets: Vec<(String, Option<String>)>) {}
 
+    /// The source's static HDR mastering metadata (SMPTE ST.2086 + content light level), when the
+    /// capturer can read it from the output (Windows `IDXGIOutput6::GetDesc1`). `None` = unknown /
+    /// SDR / a backend that doesn't expose it (the default — Linux capture has no HDR path yet).
+    /// The stream loop forwards this to the encoder (in-band SEI) and the client (`0xCE` datagram),
+    /// so the two stay a single source of truth. May change mid-session if the source is regraded.
     fn hdr_meta(&self) -> Option<punktfunk_core::quic::HdrMeta> {
         None
     }

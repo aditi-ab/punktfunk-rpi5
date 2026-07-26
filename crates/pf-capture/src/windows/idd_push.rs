@@ -234,9 +234,16 @@ impl Drop for KeyedMutexGuard<'_> {
 /// desktop region (always true single-display), two net-zero 1 px relative moves (the historical
 /// behavior, pointer ends exactly where it started); when it sits on a SIBLING display, jump the
 /// cursor to the target's center and straight back (`SetCursorPos` ×2 — each absolute move dirties
-/// the cursor layer of the display it lands on, so the target composes at least one frame; the
-/// round trip is sub-millisecond and throttled). Best-effort — injection can be unavailable on the
-/// secure desktop, where a fresh compose just happened anyway.
+/// the cursor layer of the display it lands on, so the target composes at least one frame).
+/// Best-effort — injection can be unavailable on the secure desktop, where a fresh compose just
+/// happened anyway.
+///
+/// **COST:** the sibling-display branch SLEEPS 35 ms on the calling thread between the two
+/// `SetCursorPos`es. The dwell is load-bearing (see the comment at that branch: a sub-tick
+/// jump-and-return never dirties anything), but the caller is the capture/encode thread, so a kick
+/// on that branch costs ~2 frames of latency at 60 Hz. Every call site is a first-frame or
+/// post-recreate recovery window where no frames are flowing anyway, and the global 50 ms throttle
+/// plus the callers' own 600–800 ms schedules bound how often it can happen.
 ///
 /// **HID-first**: when the host has registered [`HID_COMPOSE_KICK`] (the resident pf-mouse virtual
 /// HID pointer), the kick goes through it INSTEAD of the `SendInput` paths below. A report from a
@@ -1097,6 +1104,12 @@ impl IddPushCapturer {
                 client_10bit,
                 want_444,
                 ring_fp16 = display_hdr,
+                // Whether DXGI ever reached the win32u GPU-preference hook. By this point the
+                // factory + `EnumAdapterByLuid` + `make_device` above have exercised DXGI, so a
+                // 0 here means the hook is inert on this build — the first thing to check if a
+                // hybrid-GPU box keeps reporting TEX_FAIL render-adapter mismatches
+                // (`dxgi::install_gpu_pref_hook`).
+                hybrid_hook_hits = crate::dxgi::hybrid_hook_hits(),
                 "IDD push(host): created sealed ring + delivered the channel; waiting for the driver \
                  to attach + publish"
             );
@@ -1273,6 +1286,9 @@ impl IddPushCapturer {
                     "IDD push: no first frame after attach delivery — falling back to a synthetic \
                      compose kick (stash-capable drivers republish instantly; old driver?)"
                 );
+                // May BLOCK this thread ~35 ms (the cursor-on-a-sibling-display branch — see
+                // `kick_dwm_compose`'s COST note). Fine here: we are inside the open-time
+                // first-frame gate, so no frames are flowing yet.
                 kick_dwm_compose(self.target_id);
                 next_kick = Instant::now() + Duration::from_millis(800);
             }
@@ -2022,7 +2038,11 @@ impl IddPushCapturer {
             // never sees a frame and the 3 s recover-or-drop above kills a healthy session. A
             // stash-capable driver republishes its retained frame at the re-attach, so this kick
             // is the legacy-driver fallback here too. Nudge DWM (rate-limited) once the natural
-            // post-recreate compose (and the stash republish) has had its chance.
+            // post-recreate compose (and the stash republish) has had its chance. This is the ONE
+            // call site on the live frame path: the kick may BLOCK this (capture/encode) thread
+            // ~35 ms on its cursor-on-a-sibling-display branch (see `kick_dwm_compose`'s COST
+            // note) — acceptable only because we are already ≥600 ms into a recovery window with
+            // no frames arriving, and the 800 ms schedule below bounds the repeat rate.
             if since.elapsed() > Duration::from_millis(600)
                 && self.last_kick.elapsed() > Duration::from_millis(800)
             {

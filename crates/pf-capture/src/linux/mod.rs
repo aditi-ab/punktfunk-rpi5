@@ -2265,29 +2265,38 @@ mod pipewire {
             );
         } else if zerocopy && !want_dmabuf {
             tracing::warn!("zero-copy: no importable dmabuf modifiers — using CPU path");
-        } else if vaapi_passthrough && policy.pyrowave_modifiers.is_empty() {
+        } else if vaapi_passthrough {
+            // The raw-passthrough advertisement. Covers the PyroWave case too: its extra
+            // Vulkan-importable modifiers were appended (and logged) just above, so this arm must
+            // NOT be gated on `pyrowave_modifiers.is_empty()` — that gate is what dropped a fully
+            // zero-copy PyroWave session through to the CPU-path warning below (L11).
             tracing::info!(
                 native_nv12_preferred = prefer_native_nv12,
-                "zero-copy: advertising LINEAR DMA-BUF for encoder import (native NV12 first \
-                 when enabled, packed RGB fallback)"
+                modifier_count = modifiers.len(),
+                pyrowave_extended = !policy.pyrowave_modifiers.is_empty(),
+                "zero-copy: advertising DMA-BUF modifiers for direct encoder import (LINEAR \
+                 always; native NV12 first when enabled, packed RGB fallback)"
             );
-        } else if want_dmabuf && !vaapi_passthrough {
+        } else if want_dmabuf {
             tracing::info!(
                 count = modifiers.len(),
                 sample = ?&modifiers[..modifiers.len().min(6)],
                 "zero-copy: advertising EGL-importable dmabuf modifiers"
             );
         } else if backend_is_vaapi && policy.backend_is_gpu {
-            // A VAAPI session on the CPU path pays three full-frame CPU touches (mmap de-pad +
-            // swscale RGB→NV12 + surface upload) — make the silent fallback visible.
+            // Reached only when no dmabuf is advertised at all (every arm above rules out a
+            // zero-copy path), so this genuinely IS the CPU capture path: a VAAPI session then pays
+            // three full-frame CPU touches (mmap de-pad + swscale RGB→NV12 + surface upload) —
+            // make the silent fallback visible.
             tracing::warn!(
                 "VAAPI encode with the CPU capture path (per-frame de-pad + swscale CSC + \
-                 upload) — zero-copy was disabled ({}); clear PUNKTFUNK_ZEROCOPY to restore \
-                 the dmabuf default",
+                 upload) — zero-copy is off for this capture ({}); clear PUNKTFUNK_ZEROCOPY to \
+                 restore the dmabuf default",
                 if std::env::var_os("PUNKTFUNK_ZEROCOPY").is_some() {
                     "PUNKTFUNK_ZEROCOPY is set falsy"
                 } else {
-                    "downgraded after a failed dmabuf negotiation"
+                    "a latched downgrade after a failed dmabuf negotiation, or this session's \
+                     output format asked for CPU frames"
                 }
             );
         }
@@ -2679,10 +2688,13 @@ mod pipewire {
         // version and are composited host-side instead (see `xfixes_cursor.rs`).
         //
         // When zero-copy is on, offer ONLY a BGRx dmabuf format with our EGL-importable modifiers
-        // (offering shm too makes the compositor pick shm). The modifier list is advertised with
-        // DONT_FIXATE so the compositor's allocator chooses one; we re-emit the fixated format in
-        // `param_changed` (the two-step DMA-BUF handshake). Otherwise offer the multi-format shm
-        // pod and let MAP_BUFFERS map it. An HDR session replaces ALL of this with the two 10-bit
+        // (offering shm too makes the compositor pick shm). The modifier list goes out as a plain
+        // MANDATORY `ChoiceEnum::Enum` and the producer fixates one of the alternatives directly —
+        // this is NOT the two-step DONT_FIXATE handshake (libspa 0.9's `ChoiceFlags` cannot express
+        // `SPA_POD_PROP_FLAG_DONT_FIXATE`, and `param_changed` only READS the fixated format, it
+        // re-emits nothing). Worth revisiting if a multi-modifier offer is ever seen to fail
+        // negotiation on a compositor that needs the allocator round-trip. Otherwise offer the
+        // multi-format shm pod and let MAP_BUFFERS map it. An HDR session replaces ALL of this with the two 10-bit
         // PQ pods (LINEAR dmabuf, MANDATORY colorimetry — see `build_hdr_dmabuf_format`): offering
         // SDR alongside would make the producer pick its earlier-listed SDR format, and the
         // negotiation-timeout path latches the process-wide SDR downgrade if nothing matches.
@@ -2751,7 +2763,9 @@ mod pipewire {
             )
             .context("pw stream connect")?;
 
-        // Blocks this thread, pumping frame callbacks until process exit.
+        // Blocks this thread, pumping frame callbacks until the capturer's `Drop` fires the quit
+        // channel attached above (`_quit_attach` → `quit_loop.quit()`), at which point `run()`
+        // returns and the thread unwinds — releasing the importer / CUDA context deterministically.
         mainloop.run();
         Ok(())
     }
