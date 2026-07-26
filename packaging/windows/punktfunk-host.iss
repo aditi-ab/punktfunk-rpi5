@@ -88,12 +88,12 @@
 
 [Setup]
 AppId={{7C9E6A52-1F4B-4E8D-A3C7-2B5D8F1E0A93}
-AppName=punktfunk host
+AppName=Punktfunk Host
 AppVersion={#MyAppVersion}
 AppPublisher=unom
 AppPublisherURL=https://git.unom.io/unom/punktfunk
 DefaultDirName={autopf}\punktfunk
-DefaultGroupName=punktfunk
+DefaultGroupName=Punktfunk
 DisableProgramGroupPage=yes
 UsePreviousAppDir=yes
 PrivilegesRequired=admin
@@ -123,7 +123,7 @@ WizardStyle=modern
 SetupIconFile={#BrandingDir}\punktfunk.ico
 WizardImageFile={#BrandingDir}\wizard-image-*.bmp
 WizardSmallImageFile={#BrandingDir}\wizard-small-*.bmp
-UninstallDisplayName=punktfunk host {#MyAppVersion}
+UninstallDisplayName=Punktfunk Host {#MyAppVersion}
 ; The branded multi-size .ico (installed below). The host exe now embeds the same icon + a
 ; "Punktfunk Host" FileDescription (build.rs winresource) for Task Manager/Explorer; the file
 ; copy stays as the uninstall-entry icon.
@@ -140,7 +140,7 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 ; Shown when MinVersion rejects the OS — name the actual requirement instead of Inno's generic
 ; "requires Windows version 10.0.22621" (users on Windows 10 LTSC hit this; see the pf-vdisplay
 ; IddCx 1.10 note at MinVersion above).
-WinVersionTooLowError=punktfunk host requires Windows 11 22H2 (build 22621) or newer.%n%nIts virtual display driver needs the IddCx 1.10 framework, which is not available on older Windows — including all editions of Windows 10 (LTSC too) and Windows 11 21H2.
+WinVersionTooLowError=Punktfunk Host requires Windows 11 22H2 (build 22621) or newer.%n%nIts virtual display driver needs the IddCx 1.10 framework, which is not available on older Windows — including all editions of Windows 10 (LTSC too) and Windows 11 21H2.
 
 [Tasks]
 #ifdef WithDriver
@@ -160,18 +160,18 @@ Name: "installhdrlayer"; Description: "Install the HDR Vulkan layer (lets Vulkan
 #endif
 ; Host-config choice, applied via `service install --gamestream=on|off` (writes PUNKTFUNK_HOST_CMD
 ; in host.env; a hand-customized value is left alone). Checked = the Moonlight-compatible unified
-; host (the common Windows setup); unchecked = the secure native-only host (punktfunk clients only).
+; host (the common Windows setup); unchecked = the secure native-only host (Punktfunk clients only).
 Name: "gamestream"; Description: "Enable GameStream (Moonlight) compatibility - lets stock Moonlight clients connect (uses legacy plain-HTTP pairing; for trusted LANs)"
 ; Firewall scope, forwarded as `--allow-public-network` to `service install` / `web setup`. Unchecked
 ; (default) = accept connections on Private + Domain networks only (the trusted-network profiles
 ; punktfunk is meant for). Check ONLY for a network you trust that Windows classifies as Public (e.g.
 ; some headless / no-gateway LAN setups) - it opens the streaming + console ports on Public too.
 Name: "allowpublicfw"; Description: "Allow connections on Public networks (only for a trusted network Windows marks as Public)"; Flags: unchecked
-Name: "startservice"; Description: "Start the punktfunk host service now (also starts on every boot)"
+Name: "startservice"; Description: "Start the Punktfunk Host service now (also starts on every boot)"
 ; The per-user status tray (punktfunk-tray.exe): shows running/stopped/failed at a glance and
 ; offers open-console / start / stop / restart without a terminal. HKLM Run = every user who signs
 ; in to this host box gets one (each session keeps exactly one via a Local\ mutex).
-Name: "trayicon"; Description: "Show the punktfunk status icon in the notification area at sign-in"
+Name: "trayicon"; Description: "Show the Punktfunk status icon in the notification area at sign-in"
 
 [Files]
 Source: "{#BinDir}\punktfunk-host.exe"; DestDir: "{app}"; Flags: ignoreversion
@@ -280,15 +280,15 @@ Filename: "powershell.exe"; \
 ; service install records current_exe() as the SCM binPath, so it must run from {app}, not {tmp}.
 ; --gamestream=on|off carries the wizard's GameStream task choice into host.env's PUNKTFUNK_HOST_CMD.
 Filename: "{app}\punktfunk-host.exe"; Parameters: "service install {code:GamestreamParam}{code:PublicFwParam}"; WorkingDir: "{app}"; \
-  StatusMsg: "Registering the punktfunk host service..."; Flags: runhidden waituntilterminated
+  StatusMsg: "Registering the Punktfunk Host service..."; Flags: runhidden waituntilterminated
 Filename: "{app}\punktfunk-host.exe"; Parameters: "service start"; WorkingDir: "{app}"; \
-  StatusMsg: "Starting the punktfunk host service..."; Flags: runhidden waituntilterminated; Tasks: startservice
+  StatusMsg: "Starting the Punktfunk Host service..."; Flags: runhidden waituntilterminated; Tasks: startservice
 #ifdef WithWeb
 ; Provision the console AFTER the host service is up (so the mgmt token exists): write the ACL'd
 ; login password, register the PunktfunkWeb scheduled task (boot, SYSTEM, restart-on-failure),
 ; open TCP 47992, and start it. {code:WebSetupParams} appends -PasswordFile only on a fresh install.
 Filename: "{app}\punktfunk-host.exe"; Parameters: "web setup {code:WebSetupParams}{code:PublicFwParam}"; WorkingDir: "{app}"; \
-  StatusMsg: "Setting up the punktfunk web console..."; Flags: runhidden waituntilterminated
+  StatusMsg: "Setting up the Punktfunk web console..."; Flags: runhidden waituntilterminated
 #endif
 #ifdef WithScripting
 ; Register the plugin/script runner's scheduled task (boot, restart-on-failure) but leave it
@@ -302,7 +302,7 @@ Filename: "{app}\punktfunk-host.exe"; Parameters: "web setup {code:WebSetupParam
 ; in the command, so no Inno {{ }} escaping needed.
 Filename: "powershell.exe"; \
   Parameters: "-NoProfile -ExecutionPolicy Bypass -Command ""$a=New-ScheduledTaskAction -Execute '{app}\scripting\scripting-run.cmd'; $t=New-ScheduledTaskTrigger -AtStartup; $p=New-ScheduledTaskPrincipal -UserId 'LocalService' -LogonType ServiceAccount; $s=New-ScheduledTaskSettingsSet -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries; Register-ScheduledTask -TaskName PunktfunkScripting -Action $a -Trigger $t -Principal $p -Settings $s -Force -ErrorAction SilentlyContinue | Out-Null; Disable-ScheduledTask -TaskName PunktfunkScripting -ErrorAction SilentlyContinue | Out-Null"""; \
-  StatusMsg: "Registering the punktfunk script runner (disabled; opt-in)..."; Flags: runhidden waituntilterminated
+  StatusMsg: "Registering the Punktfunk script runner (disabled; opt-in)..."; Flags: runhidden waituntilterminated
 #endif
 ; Launch the status tray as the SIGNED-IN user (not the elevated install user) right away, so the
 ; icon appears without waiting for the next sign-in.
@@ -341,6 +341,19 @@ Filename: "powershell.exe"; \
 #endif
 
 [Code]
+{ Captured in InitializeSetup - BEFORE [Run] calls `service install`, which creates host.env. True on
+  a first-ever install, False on an upgrade. Gates the install-time-only CONFIG choices (see
+  GamestreamParam): a silent run has no wizard on screen, so every task checkbox falls back to its
+  script default. Re-applying those defaults on an upgrade would overwrite a setting the user chose
+  on an earlier run, with nothing shown. `winget upgrade` runs us exactly that way. }
+var
+  FreshHostInstall: Boolean;
+
+function HostEnvPath: String;
+begin
+  Result := ExpandConstant('{commonappdata}\punktfunk\host.env');
+end;
+
 { True if another Moonlight-compatible streaming host is installed - by its SCM service key or its
   Program Files directory. Sunshine and its forks all register a "<Name>Service" and install under
   Program Files, so a registry + directory probe catches them without enumerating processes (which
@@ -359,6 +372,8 @@ var
   Found: String;
 begin
   Result := True;
+  { Record the fresh-vs-upgrade verdict while host.env still reflects the PREVIOUS run. }
+  FreshHostInstall := not FileExists(HostEnvPath);
   Found := '';
   if StreamHostPresent('SunshineService', 'Sunshine') then Found := Found + '    - Sunshine' + #13#10;
   if StreamHostPresent('ApolloService', 'Apollo') then Found := Found + '    - Apollo' + #13#10;
@@ -366,7 +381,12 @@ begin
   if StreamHostPresent('VibepolloService', 'Vibepollo') then Found := Found + '    - Vibepollo' + #13#10;
   if StreamHostPresent('LuminalShineService', 'LuminalShine') then Found := Found + '    - LuminalShine' + #13#10;
   if Found <> '' then
-    Result := MsgBox(
+    { SuppressibleMsgBox, NOT MsgBox: a plain MsgBox ignores /SUPPRESSMSGBOXES and displays even
+      under /VERYSILENT - i.e. an unattended install (winget) would block on a modal dialog with no
+      wizard on screen and nobody to click it. Suppressed, this returns Default = IDNO, so a silent
+      install onto a box that already runs Sunshine/Apollo ABORTS (Setup exits non-zero) instead of
+      proceeding into the unsupported dual-host state the message describes. }
+    Result := SuppressibleMsgBox(
       'Another game-streaming host is already installed on this PC:' + #13#10#13#10 + Found + #13#10 +
       'Running Punktfunk alongside Sunshine / Apollo / other Moonlight-compatible hosts is NOT ' +
       'supported. They bind the same GameStream network ports (47984, 47989, 47998-48010) and ' +
@@ -374,15 +394,24 @@ begin
       'already in use" errors and capture glitches.' + #13#10#13#10 +
       'Stop and uninstall the other host before using Punktfunk.' + #13#10#13#10 +
       'Continue with the installation anyway?',
-      mbConfirmation, MB_YESNO or MB_DEFBUTTON2) = IDYES;
+      mbConfirmation, MB_YESNO or MB_DEFBUTTON2, IDNO) = IDYES;
 end;
 
 { The GameStream task choice, forwarded to `service install` (which writes host.env's
   PUNKTFUNK_HOST_CMD - only if it is unset or still one of the two canonical values, so a
-  hand-customized command line survives upgrades). }
+  hand-customized command line survives upgrades).
+
+  FRESH INSTALL ONLY. On an upgrade the flag is omitted entirely, which `service install` reads as
+  "keep host.env as-is" (windows/service.rs: "None = flag absent, keep host.env as-is"). Passing an
+  explicit on/off would rewrite PUNKTFUNK_HOST_CMD whenever it still holds either canonical value -
+  so a user who chose GameStream ON, then upgraded with the task unchecked (which is what EVERY
+  silent run does, since there is no wizard to carry the old choice forward), would have it turned
+  OFF with nothing on screen. Only a hand-edited command line survived that. }
 function GamestreamParam(Param: String): String;
 begin
-  if WizardIsTaskSelected('gamestream') then
+  if not FreshHostInstall then
+    Result := ''
+  else if WizardIsTaskSelected('gamestream') then
     Result := '--gamestream=on'
   else
     Result := '--gamestream=off';
@@ -392,13 +421,21 @@ end;
   (default = Private/Domain only). Forwarded to both `service install` and `web setup`. Returns a
   LEADING SPACE so it concatenates after the preceding code-substitution param without a gap.
   (Do NOT write a literal code-constant token in this comment: Inno's brace comments do not nest,
-  so its closing brace would end the comment early and break the [Code] parse.) }
+  so its closing brace would end the comment early and break the [Code] parse.)
+
+  FRESH INSTALL ONLY, for the same reason as GamestreamParam: on an upgrade the flag is omitted and
+  both `service install` and `web setup` resolve the scope from the marker the previous install
+  recorded. Re-applying the task default would re-scope the firewall on every upgrade - and since
+  this task is default-UNCHECKED, a silent upgrade would silently REVOKE a Public opt-in the user
+  made once. The explicit =on/=off form is used so a fresh install still states its choice. }
 function PublicFwParam(Param: String): String;
 begin
-  if WizardIsTaskSelected('allowpublicfw') then
-    Result := ' --allow-public-network'
+  if not FreshHostInstall then
+    Result := ''
+  else if WizardIsTaskSelected('allowpublicfw') then
+    Result := ' --allow-public-network=on'
   else
-    Result := '';
+    Result := ' --allow-public-network=off';
 end;
 
 #ifdef WithWeb
@@ -443,7 +480,7 @@ var
 begin
   FreshWebInstall := not FileExists(WebPasswordPath);
   WebPwPage := CreateInputQueryPage(wpSelectTasks,
-    'Web console', 'Set the punktfunk web console login password',
+    'Web console', 'Set the Punktfunk web console login password',
     'The management console is served on https://this-computer:47992 and is login-gated. Keep the ' +
     'secure password generated below (it is shown again on the final page) or enter your own - you ' +
     'can change it later in %ProgramData%\punktfunk\web-password.');

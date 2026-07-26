@@ -718,8 +718,9 @@ fn install(args: &[String]) -> Result<()> {
     // Firewall scope: Domain + Private by default; `--allow-public-network` opts into Public too.
     // Persist the choice (so the startup warning respects an opt-in) and re-scope idempotently —
     // remove any prior rules first so an upgrade tightens the scope instead of leaving a stale
-    // all-profiles rule behind the new one.
-    let allow_public = allow_public_network(args);
+    // all-profiles rule behind the new one. With the flag absent (every upgrade) this resolves to
+    // the previously recorded choice, so the rewrite below is a no-op rather than a silent reset.
+    let allow_public = allow_public_network(args)?;
     set_fw_public_marker(allow_public);
     remove_firewall_rules();
     add_firewall_rules(allow_public);
@@ -889,10 +890,37 @@ pub(crate) fn firewall_profile_arg(allow_public: bool) -> &'static str {
     }
 }
 
-/// The `--allow-public-network` install opt-in (the installer's "Allow connections on Public
-/// networks" task forwards it). Absent = the secure default (Domain + Private only).
-pub(crate) fn allow_public_network(args: &[String]) -> bool {
-    args.iter().any(|a| a == "--allow-public-network")
+/// Resolve the Public-network firewall scope for this install/upgrade (the installer's "Allow
+/// connections on Public networks" task forwards the flag).
+///
+/// Tri-state, mirroring `--gamestream=on|off`:
+///   * `--allow-public-network` or `=on`  -> `true`  — explicit opt-in. The bare form is kept for
+///     back-compat with existing scripts and docs that pass it that way.
+///   * `--allow-public-network=off`       -> `false` — explicit opt-out.
+///   * absent                             -> whatever the previous install recorded.
+///
+/// The absent case is what makes an UPGRADE non-destructive. A silent upgrade (`winget upgrade`)
+/// has no wizard to carry the old checkbox forward, so the installer omits the flag entirely on an
+/// upgrade and the recorded choice stands. Re-applying the task default instead would quietly
+/// re-scope the firewall on every upgrade, undoing an opt-in the user made once. On a first-ever
+/// install there is no marker, so absence resolves to the secure default (Domain + Private only).
+///
+/// Strict on the value: a typo'd `=of` must NOT fall through to the marker, because the marker may
+/// say `true` — i.e. a mistyped opt-OUT would silently leave Public open.
+pub(crate) fn allow_public_network(args: &[String]) -> Result<bool> {
+    for a in args {
+        if let Some(v) = a.strip_prefix("--allow-public-network") {
+            return match v {
+                "" | "=on" => Ok(true),
+                "=off" => Ok(false),
+                _ => bail!(
+                    "--allow-public-network must be 'on' or 'off' (got '{}')",
+                    v.trim_start_matches('=')
+                ),
+            };
+        }
+    }
+    Ok(fw_public_marker().exists())
 }
 
 /// Inbound firewall rules for the streaming + mgmt ports (best-effort; logs but never fails the

@@ -403,7 +403,7 @@ fn web_setup(args: &[String]) -> Result<()> {
     //    only with `--allow-public-network`. Delete any prior rule first so an upgrade re-scopes it
     //    instead of stacking a second (possibly all-profiles) rule behind the new one.
     let fw_profile =
-        crate::service::firewall_profile_arg(crate::service::allow_public_network(args));
+        crate::service::firewall_profile_arg(crate::service::allow_public_network(args)?);
     run_quiet(
         "netsh",
         &[
