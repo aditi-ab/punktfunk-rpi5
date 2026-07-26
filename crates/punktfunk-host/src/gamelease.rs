@@ -335,6 +335,13 @@ pub fn open(req: LeaseRequest, on_exit: OnExit) -> GameLease {
     }
 
     let watcher = spawn_watcher(shared.clone(), child, on_exit);
+    if watcher.is_none() {
+        // Nothing is polling this lease (no signals to poll, or a platform without a matcher yet), so
+        // its state will never advance on its own. Report it as running rather than leaving the
+        // console showing "launching" forever: the host did just launch it, and with no watcher it is
+        // making no claim about noticing the exit. The row disappears when the session ends.
+        shared.set_state(GameState::Running);
+    }
     GameLease { shared, watcher }
 }
 
@@ -564,9 +571,20 @@ pub fn terminate(shared: Arc<LeaseShared>, why: &'static str) {
     }
     tracing::info!(title = %shared.game.title, reason = why, "ending the launched game");
     let name = "pf1-gameterm".to_string();
-    let _ = std::thread::Builder::new()
-        .name(name)
-        .spawn(move || terminate_blocking(&shared));
+    let _ = std::thread::Builder::new().name(name).spawn(move || {
+        terminate_blocking(&shared);
+        // A lease whose session is still up has a live watcher, which reports the exit itself
+        // (with the right reason) once it confirms the game is gone. A lease whose session has
+        // already ended — every grace expiry and every `POST /game/end` — has no watcher left, so
+        // this is the only place its exit can be reported from.
+        if shared.cancel.load(Ordering::Relaxed) {
+            shared.set_state(GameState::Exited);
+            crate::events::emit(crate::events::EventKind::GameExited {
+                game: game_event_ref(&shared),
+                reason: crate::events::GameEndReason::Terminated,
+            });
+        }
+    });
 }
 
 /// The ladder itself. Separate so it can be driven synchronously from a test.
@@ -575,9 +593,24 @@ fn terminate_blocking(shared: &LeaseShared) {
         // gamescope owns the game: releasing the display tears the nested session — and therefore
         // the game — down. One mechanism for both, so a kept display can't outlive an ended game.
         LeaseKind::Nested => {
-            // The same force-release the `/display/release` endpoint performs. It refuses displays
-            // with live sessions, so this only ever retires the *kept* display this ended session
-            // left behind — which is exactly the one still holding the game.
+            // The same force-release the `/display/release` endpoint performs: gamescope exits with
+            // its display and takes its nested game with it. It refuses displays that still have live
+            // sessions, so this only reaches the *kept* display this ended session left behind.
+            //
+            // But it is not slot-targeted — it retires every kept display — and a lease has no handle
+            // on which one is its own. So while anyone else is streaming, leave it alone: the cost of
+            // being wrong here is disturbing an unrelated client, and the cost of doing nothing is a
+            // game that keeps running, which is also the default everywhere else.
+            let others = crate::session_status::count();
+            if others > 0 {
+                tracing::info!(
+                    live_sessions = others,
+                    title = %shared.game.title,
+                    "not releasing kept displays to end this game — another session is streaming and \
+                     the release is not per-display"
+                );
+                return;
+            }
             let released = crate::vdisplay::registry::release(None);
             tracing::info!(
                 released,

@@ -192,11 +192,16 @@ impl Scanner {
                 }
             }
             if let Some(dir) = install_dir {
+                // Require a path separator after the directory, so an install dir of `/games/x` is
+                // not satisfied by an unrelated `/games/xyz/…` argument. (The image-path check above
+                // needs no such care — `Path::starts_with` already compares whole components.)
                 let needle = dir.as_os_str().as_encoded_bytes();
-                for arg in cmdline.split(|&b| b == 0) {
-                    if arg.starts_with(needle) {
-                        return true;
-                    }
+                let under_dir = |arg: &[u8]| {
+                    arg.strip_prefix(needle)
+                        .is_some_and(|rest| rest.first() == Some(&b'/'))
+                };
+                if cmdline.split(|&b| b == 0).any(under_dir) {
+                    return true;
                 }
             }
             if let Some(want) = exe {
@@ -373,6 +378,26 @@ mod tests {
         assert_eq!(
             pids(s.find(&DetectSpec::dir("/games/hades"), None)),
             vec![10, 11]
+        );
+    }
+
+    #[test]
+    fn install_dir_does_not_match_a_sibling_with_the_same_prefix() {
+        // `/games/x` must not adopt a process running out of `/games/xyz` — a real hazard when one
+        // library folder's name is a prefix of another's.
+        let td = fake_proc_root(
+            1000.0,
+            &[
+                FakeProc::new(90, 50_000).exe("/games/xyz/other"),
+                FakeProc::new(91, 50_000).cmdline(&["wrapper", "/games/xyz/other"]),
+            ],
+        );
+        let s = scanner(td.path());
+        assert!(s.find(&DetectSpec::dir("/games/x"), None).is_empty());
+        // The genuine directory still matches, by image path and by argument.
+        assert_eq!(
+            pids(s.find(&DetectSpec::dir("/games/xyz"), None)),
+            vec![90, 91]
         );
     }
 
