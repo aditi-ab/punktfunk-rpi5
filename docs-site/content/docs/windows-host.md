@@ -85,7 +85,9 @@ and enter the PIN on your [client](/docs/clients). The host's own management API
 The service reads `%ProgramData%\punktfunk\host.env`. The defaults work out of the box; common knobs:
 
 - `PUNKTFUNK_ENCODER=auto` — `auto` picks NVENC/AMF/QSV by GPU vendor. Force one with `nvenc`, `amf`,
-  `qsv`, or `sw` (software).
+  `qsv`, or `sw` (software). On a multi-GPU box the [web console's GPU preference](/docs/web-console)
+  wins: a forced backend whose vendor doesn't match the selected GPU is ignored (the host logs a
+  warning) — remove the stale line rather than fighting it.
 - `PUNKTFUNK_HOST_CMD` — the service runs `serve --gamestream` by default (native punktfunk/1 **plus**
   the GameStream/Moonlight-compat planes). Set it to `serve` for a **secure native-only** host with no
   GameStream surface (GameStream pairs over plain HTTP and uses weaker legacy encryption — trusted LAN

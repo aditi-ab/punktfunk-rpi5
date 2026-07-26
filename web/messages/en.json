@@ -56,6 +56,8 @@
 	"gpu_none": "No GPUs detected.",
 	"gpu_missing_warning": "The preferred GPU “{name}” is not present — automatic selection is used instead.",
 	"gpu_env_note": "PUNKTFUNK_RENDER_ADAPTER={value} pins the GPU while in automatic mode.",
+	"gpu_encoder_pin_note": "PUNKTFUNK_ENCODER={value} pins the encoder backend.",
+	"gpu_encoder_pin_warning": "PUNKTFUNK_ENCODER={value} pins a {vendor} encoder, but the next session's GPU is “{name}” — remove the stale pin from host.env.",
 	"host_displays": "Virtual displays",
 	"host_displays_help": "How virtual displays are created, kept alive, and arranged. Pick a preset, or choose Custom to set options directly. A change applies to the next session.",
 	"display_config_title": "Configuration",

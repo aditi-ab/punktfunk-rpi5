@@ -66,6 +66,11 @@ pub(crate) struct GpuState {
     /// `PUNKTFUNK_RENDER_ADAPTER` (the host.env pin), when set — it applies while `mode` is
     /// `auto`; a manual preference overrides it.
     env_override: Option<String>,
+    /// `PUNKTFUNK_ENCODER` (the host.env encoder pin), when set to something other than `auto`
+    /// (e.g. `qsv`, `nvenc`, `amf`, `software`). A pin whose vendor contradicts the selected
+    /// GPU is overridden at session open — the adapter wins — so the console can warn that the
+    /// pin is stale rather than letting the selection look broken.
+    encoder_pin: Option<String>,
     /// The GPU the next session will use.
     selected: Option<ApiSelectedGpu>,
     /// The GPU live sessions use right now (absent while nothing is streaming).
@@ -143,8 +148,33 @@ pub(crate) fn gpu_state() -> GpuState {
             .render_adapter
             .clone()
             .filter(|s| !s.is_empty()),
+        encoder_pin: encoder_pin_of(&pf_host_config::config().encoder_pref),
         selected,
         active,
+    }
+}
+
+/// The `PUNKTFUNK_ENCODER` value worth surfacing to the console: `None` for unset/empty and for
+/// an explicit `auto` (both mean "derive from the selected adapter" — nothing is pinned).
+fn encoder_pin_of(pref: &str) -> Option<String> {
+    match pref {
+        "" | "auto" => None,
+        pin => Some(pin.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Only a real pin surfaces to the console — the `auto` spellings pin nothing, and showing
+    /// them would put a permanent scary note under every default install's GPU card.
+    #[test]
+    fn encoder_pin_surfaces_only_real_pins() {
+        assert_eq!(encoder_pin_of(""), None);
+        assert_eq!(encoder_pin_of("auto"), None);
+        assert_eq!(encoder_pin_of("qsv"), Some("qsv".into()));
+        assert_eq!(encoder_pin_of("software"), Some("software".into()));
     }
 }
 

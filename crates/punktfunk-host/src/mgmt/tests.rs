@@ -1234,6 +1234,13 @@ async fn gpu_endpoints_list_and_validate() {
     assert_eq!(s, StatusCode::OK);
     assert!(b["gpus"].is_array());
     assert!(b["mode"].is_string());
+    // The host.env encoder pin is part of the schema (null when nothing is pinned) — the
+    // console warns off it when a pin contradicts the selected GPU (the pin is overridden at
+    // session open, and without this field the selection would just look broken).
+    assert!(
+        b.as_object().unwrap().contains_key("encoder_pin"),
+        "listGpus must carry encoder_pin"
+    );
 
     // Unknown mode → 400.
     let (s, _) = send(

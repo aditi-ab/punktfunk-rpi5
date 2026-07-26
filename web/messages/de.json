@@ -56,6 +56,8 @@
 	"gpu_none": "Keine GPUs erkannt.",
 	"gpu_missing_warning": "Die bevorzugte GPU „{name}“ ist nicht vorhanden — stattdessen wird automatisch gewählt.",
 	"gpu_env_note": "PUNKTFUNK_RENDER_ADAPTER={value} bindet die GPU im Automatikmodus.",
+	"gpu_encoder_pin_note": "PUNKTFUNK_ENCODER={value} bindet das Encoder-Backend.",
+	"gpu_encoder_pin_warning": "PUNKTFUNK_ENCODER={value} bindet einen {vendor}-Encoder, aber die GPU der nächsten Sitzung ist „{name}“ — die veraltete Bindung sollte aus host.env entfernt werden.",
 	"host_displays": "Virtuelle Displays",
 	"host_displays_help": "Wie virtuelle Displays erstellt, aktiv gehalten und angeordnet werden. Wähle eine Voreinstellung oder „Benutzerdefiniert“, um Optionen direkt zu setzen. Eine Änderung gilt ab der nächsten Sitzung.",
 	"display_config_title": "Konfiguration",

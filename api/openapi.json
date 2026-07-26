@@ -10,7 +10,7 @@
       "name": "MIT OR Apache-2.0",
       "identifier": "MIT OR Apache-2.0"
     },
-    "version": "0.18.0"
+    "version": "0.19.2"
   },
   "paths": {
     "/api/v1/clients": {
@@ -4505,6 +4505,13 @@
                 "description": "The GPU live sessions use right now (absent while nothing is streaming)."
               }
             ]
+          },
+          "encoder_pin": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`PUNKTFUNK_ENCODER` (the host.env encoder pin), when set to something other than `auto`\n(e.g. `qsv`, `nvenc`, `amf`, `software`). A pin whose vendor contradicts the selected\nGPU is overridden at session open — the adapter wins — so the console can warn that the\npin is stale rather than letting the selection look broken."
           },
           "env_override": {
             "type": [

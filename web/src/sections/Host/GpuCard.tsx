@@ -39,6 +39,49 @@ const fmtVram = (mb: number) =>
 	mb >= 1024 ? `${Math.round(mb / 1024)} GiB` : `${mb} MiB`;
 
 /**
+ * The vendor an explicit `PUNKTFUNK_ENCODER` pin can open on (display name) — the console mirror
+ * of the host's backend→vendor table. Vendor-agnostic pins (software) and unknown/multi-vendor
+ * spellings (vaapi, vulkan, pyrowave) map to nothing: no conflict to warn about.
+ */
+const encoderPinVendor: Record<string, string> = {
+	nvenc: "NVIDIA",
+	nvidia: "NVIDIA",
+	cuda: "NVIDIA",
+	hw: "NVIDIA",
+	amf: "AMD",
+	amd: "AMD",
+	qsv: "Intel",
+	intel: "Intel",
+};
+
+/**
+ * The host.env encoder pin, surfaced so a conflicting GPU choice doesn't just look broken: amber
+ * when the pin's vendor contradicts the next session's GPU (the host overrides the pin at session
+ * open — the stale pin should be removed), a muted note otherwise.
+ */
+const EncoderPinNote: FC<{ state: GpuState; pin: string }> = ({
+	state,
+	pin,
+}) => {
+	const vendor = encoderPinVendor[pin];
+	const conflicting =
+		vendor && state.selected && state.selected.vendor !== vendor.toLowerCase();
+	return conflicting && state.selected ? (
+		<p className="text-sm text-amber-600 dark:text-amber-500">
+			{m.gpu_encoder_pin_warning({
+				value: pin,
+				vendor,
+				name: state.selected.name,
+			})}
+		</p>
+	) : (
+		<p className="text-xs text-muted-foreground">
+			{m.gpu_encoder_pin_note({ value: pin })}
+		</p>
+	);
+};
+
+/**
  * GPU list in the compositors-card style: per-GPU badges for the manual pick ("Preferred"), what
  * the next session will use ("Next session"), and what live sessions encode on right now
  * ("In use · NVENC"), plus an Automatic/Prefer control pair.
@@ -139,6 +182,7 @@ export const GpuCard: FC<{
 							{m.gpu_env_note({ value: s.env_override })}
 						</p>
 					)}
+					{s?.encoder_pin && <EncoderPinNote state={s} pin={s.encoder_pin} />}
 				</QueryState>
 			</CardContent>
 		</Card>
