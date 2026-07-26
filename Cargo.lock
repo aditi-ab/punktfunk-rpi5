@@ -3048,6 +3048,7 @@ dependencies = [
  "wayland-client",
  "wayland-scanner",
  "windows 0.62.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "x11rb",
 ]
 
 [[package]]

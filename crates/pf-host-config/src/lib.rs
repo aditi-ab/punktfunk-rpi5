@@ -115,6 +115,14 @@ pub struct HostConfig {
     /// injected pointer. Default OFF: it forces relative mode, which breaks absolute-pointer titles
     /// and menus, so it's opt-in per host until validated on-glass.
     pub gamescope_grab_cursor: bool,
+    /// `PUNKTFUNK_GAMESCOPE_SPLASH` — run the host's built-in splash client inside every bare
+    /// headless gamescope spawn. gamescope only composites (and only then pushes a PipeWire capture
+    /// buffer) when a client paints, and a dedicated Steam launch paints NOTHING
+    /// for the whole Steam bootstrap — so without the splash a fresh spawn's capture starves: format
+    /// negotiated, zero buffers, first-frame timeout, and every retry kills the booting Steam and
+    /// starts over (the "fresh gamescope output never delivers frames" field failure). Default ON;
+    /// explicit-off grammar (`=0` disables, the on-glass A/B + emergency escape hatch).
+    pub gamescope_splash: bool,
     /// `PUNKTFUNK_RECOVER_SESSION_CMD` — operator hook fired (debounced) when a client connects while NO
     /// graphical session is live for this uid: the state a compositor crash leaves behind (gnome-shell
     /// SIGSEGV → GDM greeter, whose auto-login is once-per-boot, so the box would otherwise need a walk-up
@@ -177,6 +185,9 @@ impl HostConfig {
                     "1" | "true" | "yes" | "on"
                 )
             }),
+            // Default ON, explicit-off grammar: the splash is what makes a fresh bare spawn deliver
+            // its first frames at all; `=0` is the A/B + escape hatch.
+            gamescope_splash: env_on("PUNKTFUNK_GAMESCOPE_SPLASH").unwrap_or(true),
             recover_session_cmd: val("PUNKTFUNK_RECOVER_SESSION_CMD")
                 .filter(|s| !s.trim().is_empty()),
             on_connect_cmd: val("PUNKTFUNK_ON_CONNECT_CMD").filter(|s| !s.trim().is_empty()),

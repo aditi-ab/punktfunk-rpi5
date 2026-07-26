@@ -425,6 +425,16 @@ pub fn effective_topology() -> policy::Topology {
 #[path = "vdisplay/linux/gamescope.rs"]
 mod gamescope;
 
+/// Entry point for the hidden `gamescope-splash` host subcommand: the tiny X11 client every bare
+/// gamescope spawn backgrounds beside its nested app, so the fresh compositor composites — and its
+/// PipeWire node delivers frames — from the first second instead of starving the first-frame wait
+/// while the nested Steam bootstrap paints nothing (see `vdisplay/linux/gamescope/splash.rs`).
+/// Blocks for the session's lifetime; gamescope's reaper tears it down with the session.
+#[cfg(target_os = "linux")]
+pub fn gamescope_splash_client() -> anyhow::Result<()> {
+    gamescope::splash_run()
+}
+
 // Platform-neutral per-client stable display-id map (Stage 3): Windows seeds the monitor EDID +
 // ConnectorIndex from the id; KWin names its output from it. `allow(dead_code)` because only Windows
 // consumes it in non-test code today — the KWin wiring is the next Stage-3 step.

@@ -21,6 +21,8 @@ use std::time::{Duration, Instant};
 
 #[path = "gamescope/discovery.rs"]
 mod discovery;
+#[path = "gamescope/splash.rs"]
+mod splash;
 use discovery::{
     check_gamescope_version, find_gamescope_eis_socket, find_gamescope_node,
     gamescope_node_present, poll_managed_node, wait_for_node,
@@ -29,6 +31,7 @@ pub(crate) use discovery::{
     game_session_exited, is_available, steam_appid_from_launch, wait_for_steam_game_exit,
     SteamGameWatch,
 };
+pub(crate) use splash::run as splash_run;
 
 /// The gamescope virtual-display driver. Three modes by env, in precedence order:
 /// * `PUNKTFUNK_GAMESCOPE_SESSION=<client>` — host-MANAGE a `gamescope-session-plus` session
@@ -1963,11 +1966,6 @@ pub fn ei_socket_file() -> std::path::PathBuf {
     crate::with_env_lock(pf_paths::gamescope_ei_socket_file)
 }
 
-/// Shape a resolved launch command for a bare-spawn gamescope session. A Steam URI launch
-/// (`steam steam://rungameid/<id>`, produced by `library::command_for`) gets `-silent` inserted so
-/// the game is the gamescope focus with no Steam client window to navigate
-/// (`design/gamemode-and-dedicated-sessions.md` §5.3). Operator-typed custom commands and non-Steam
-/// launches are returned unchanged. Idempotent (never double-inserts `-silent`). Pure + unit-tested.
 /// Does this resolved launch command start Steam (`steam … steam://…`)? Such a launch needs Steam's
 /// single instance free before a dedicated spawn (B1). Pure + unit-tested.
 fn is_steam_launch(cmd: &str) -> bool {
@@ -1975,12 +1973,21 @@ fn is_steam_launch(cmd: &str) -> bool {
     it.next() == Some("steam") && cmd.contains("steam://")
 }
 
+/// Shape a resolved launch command for a bare-spawn gamescope session. A Steam URI launch
+/// (`steam steam://rungameid/<id>`, produced by `library::command_for`) gets `-gamepadui` inserted
+/// so the nested Steam is Big Picture — the identity gamescope's `--steam` integration is built
+/// around (it's what SteamOS/Bazzite game mode runs): the boot shows the gamepad UI instead of the
+/// desktop Steam client window (field report 2026-07-27: the desktop UI flashing through the
+/// stream "looks bad"), and gamescope's focus rules already prefer the game window over the Steam
+/// UI appid, which is what the previous `-silent` shaping was working around. Operator-typed
+/// custom commands and non-Steam launches are returned unchanged. Idempotent (never
+/// double-inserts). Pure + unit-tested.
 fn shape_dedicated_command(app: &str) -> String {
     let mut it = app.split_whitespace();
     if it.next() == Some("steam") {
         let rest: Vec<&str> = it.collect();
-        if !rest.contains(&"-silent") && rest.iter().any(|t| t.starts_with("steam://")) {
-            return format!("steam -silent {}", rest.join(" "));
+        if !rest.contains(&"-gamepadui") && rest.iter().any(|t| t.starts_with("steam://")) {
+            return format!("steam -gamepadui {}", rest.join(" "));
         }
     }
     app.to_string()
@@ -2016,7 +2023,11 @@ fn add_bare_gamescope_args(
 /// game/GL app for actual content, e.g. `steam -gamepadui` for the SteamOS-like session).
 /// stdout/stderr go to `log` (this spawn's per-instance log, A5). The app is launched through a tiny
 /// shell wrapper that relays gamescope's `LIBEI_SOCKET` (set for its children) to [`ei_socket_file`]
-/// so the input injector can connect to gamescope's EIS server from outside.
+/// so the input injector can connect to gamescope's EIS server from outside — and (unless
+/// `PUNKTFUNK_GAMESCOPE_SPLASH=0`) backgrounds the host's splash client first, so the fresh
+/// compositor has a painting window from the first second: gamescope pushes capture buffers only
+/// when it composites, and a nested Steam bootstrap paints nothing until the gamepad UI's first
+/// frame — far longer than any first-frame budget (see `gamescope/splash.rs`).
 fn spawn(w: u32, h: u32, hz: u32, cmd: Option<&str>, log: &std::path::Path) -> Result<Child> {
     // A non-empty per-session command (set via `set_launch_command`) wins; else the
     // `PUNKTFUNK_GAMESCOPE_APP` env var (the documented manual fallback); else a no-op that keeps
@@ -2033,8 +2044,9 @@ fn spawn(w: u32, h: u32, hz: u32, cmd: Option<&str>, log: &std::path::Path) -> R
     // cursor-grab flag below.
     let game_launch = app.is_some();
     let app = app.unwrap_or_else(|| "sleep infinity".to_string());
-    // Dedicated-launch command shaping (Part B): a Steam URI runs with `-silent` so the game is the
-    // gamescope focus with no Steam client window to navigate.
+    // Dedicated-launch command shaping (Part B): a Steam URI runs with `-gamepadui` so the nested
+    // Steam is Big Picture — the identity gamescope's `--steam` mode is built around — instead of
+    // the desktop client window.
     let app = shape_dedicated_command(&app);
     let relay = ei_socket_file();
     let _ = std::fs::remove_file(&relay); // stale socket path from a previous session
@@ -2047,29 +2059,37 @@ fn spawn(w: u32, h: u32, hz: u32, cmd: Option<&str>, log: &std::path::Path) -> R
     // cursor, which some FPS titles never signal over the injected pointer — grabbing fixes mouselook.
     // Default OFF (it forces relative mode, which would break absolute-pointer games/menus).
     let grab_cursor = game_launch && pf_host_config::config().gamescope_grab_cursor;
+    // The splash client (see `gamescope/splash.rs`): without a painting client gamescope pushes NO
+    // capture buffers, and a nested Steam bootstrap paints nothing for far longer than any
+    // first-frame budget — so every bare spawn backgrounds the host's own splash beside the nested
+    // app. Skipped only via the PUNKTFUNK_GAMESCOPE_SPLASH=0 escape hatch (or if the host can't
+    // name its own executable, where the old starve-prone behaviour is still better than no spawn).
+    let splash_exe = pf_host_config::config()
+        .gamescope_splash
+        .then(std::env::current_exe)
+        .and_then(|r| {
+            r.map_err(|e| tracing::warn!(error = %e, "gamescope: current_exe failed — no splash"))
+                .ok()
+        });
     let mut cmd = Command::new("gamescope");
     add_bare_gamescope_args(&mut cmd, w, h, hz, steam_mode, grab_cursor);
-    cmd.args([
-        "sh",
-        "-c",
-        &format!(
-            "printf %s \"$LIBEI_SOCKET\" > '{}'; exec \"$@\"",
-            relay.display()
-        ),
-        "sh",
-    ])
-    .args(app.split_whitespace())
-    // Prefer the NVIDIA GL vendor for the nested session (harmless on a pure-NVIDIA box).
-    .env("__GLX_VENDOR_LIBRARY_NAME", "nvidia")
-    // A HEADLESS gamescope must never attach to a parent compositor. A host (re)started after
-    // a desktop login inherits the user manager's DISPLAY/WAYLAND_DISPLAY — and a stale
-    // WAYLAND_DISPLAY (e.g. a leftover `wayland-kde` in the manager env from a past session)
-    // makes gamescope 3.16 exit at startup with "Failed to connect to wayland socket" before
-    // its PipeWire node ever appears (observed 2026-07-14; the boot-started host never saw the
-    // bug because it predates any login's env import). gamescope exports its own DISPLAY /
-    // GAMESCOPE_WAYLAND_DISPLAY to the nested app, so the child loses nothing.
-    .env_remove("DISPLAY")
-    .env_remove("WAYLAND_DISPLAY");
+    let script = nested_wrapper_script(&relay, splash_exe.is_some());
+    cmd.args(["sh", "-c", &script, "sh"]);
+    if let Some(exe) = &splash_exe {
+        cmd.arg(exe);
+    }
+    cmd.args(app.split_whitespace())
+        // Prefer the NVIDIA GL vendor for the nested session (harmless on a pure-NVIDIA box).
+        .env("__GLX_VENDOR_LIBRARY_NAME", "nvidia")
+        // A HEADLESS gamescope must never attach to a parent compositor. A host (re)started after
+        // a desktop login inherits the user manager's DISPLAY/WAYLAND_DISPLAY — and a stale
+        // WAYLAND_DISPLAY (e.g. a leftover `wayland-kde` in the manager env from a past session)
+        // makes gamescope 3.16 exit at startup with "Failed to connect to wayland socket" before
+        // its PipeWire node ever appears (observed 2026-07-14; the boot-started host never saw the
+        // bug because it predates any login's env import). gamescope exports its own DISPLAY /
+        // GAMESCOPE_WAYLAND_DISPLAY to the nested app, so the child loses nothing.
+        .env_remove("DISPLAY")
+        .env_remove("WAYLAND_DISPLAY");
     if let Ok(logf) = std::fs::File::create(log) {
         if let Ok(log2) = logf.try_clone() {
             cmd.stdout(Stdio::from(logf)).stderr(Stdio::from(log2));
@@ -2077,9 +2097,32 @@ fn spawn(w: u32, h: u32, hz: u32, cmd: Option<&str>, log: &std::path::Path) -> R
     } else {
         cmd.stdout(Stdio::null()).stderr(Stdio::null());
     }
-    tracing::info!(w, h, hz, steam_mode, %app, log = %log.display(), "spawning gamescope (headless)");
+    tracing::info!(
+        w, h, hz, steam_mode,
+        splash = splash_exe.is_some(),
+        %app,
+        log = %log.display(),
+        "spawning gamescope (headless)"
+    );
     cmd.spawn()
         .context("spawn gamescope (is it installed? `apt install gamescope`)")
+}
+
+/// The nested-command wrapper script for a bare spawn: relay gamescope's `LIBEI_SOCKET` to the
+/// injector's file, optionally background the splash client (`"$1"` is the host executable — passed
+/// as an argv so its path never needs shell-escaping), then exec the real app. Pure + unit-tested.
+fn nested_wrapper_script(relay: &std::path::Path, with_splash: bool) -> String {
+    if with_splash {
+        format!(
+            "printf %s \"$LIBEI_SOCKET\" > '{}'; \"$1\" gamescope-splash & shift; exec \"$@\"",
+            relay.display()
+        )
+    } else {
+        format!(
+            "printf %s \"$LIBEI_SOCKET\" > '{}'; exec \"$@\"",
+            relay.display()
+        )
+    }
 }
 
 /// Owns the spawned gamescope process (and its per-instance log, A5); killing it tears the virtual
@@ -2105,8 +2148,23 @@ impl Drop for GamescopeProc {
 mod tests {
     use super::{
         cgroup_is_punktfunk_owned, connected_connector_under, display_manager_unit_under,
-        dm_survives_masked_unit, is_steam_launch, shape_dedicated_command,
+        dm_survives_masked_unit, is_steam_launch, nested_wrapper_script, shape_dedicated_command,
     };
+
+    #[test]
+    fn nested_wrapper_script_shapes() {
+        let relay = std::path::Path::new("/run/user/1000/pf-ei");
+        // Plain: relay + exec, no splash machinery.
+        let plain = nested_wrapper_script(relay, false);
+        assert!(plain.contains("/run/user/1000/pf-ei"));
+        assert!(plain.ends_with("exec \"$@\""));
+        assert!(!plain.contains("gamescope-splash"));
+        // Splash: `"$1"` is the host exe (an argv, never shell-interpolated), backgrounded and
+        // shifted away so `exec "$@"` still runs the untouched app tokens.
+        let splash = nested_wrapper_script(relay, true);
+        assert!(splash.contains("\"$1\" gamescope-splash &"));
+        assert!(splash.contains("shift; exec \"$@\""));
+    }
 
     #[test]
     fn display_manager_flavor_detection() {
@@ -2169,15 +2227,15 @@ mod tests {
 
     #[test]
     fn dedicated_command_shaping() {
-        // Steam URI → -silent inserted so the game is the gamescope focus.
+        // Steam URI → -gamepadui inserted so the nested Steam is Big Picture (not the desktop UI).
         assert_eq!(
             shape_dedicated_command("steam steam://rungameid/570"),
-            "steam -silent steam://rungameid/570"
+            "steam -gamepadui steam://rungameid/570"
         );
-        // Idempotent: an already-silent command is left alone.
+        // Idempotent: an already-gamepadui command is left alone.
         assert_eq!(
-            shape_dedicated_command("steam -silent steam://rungameid/570"),
-            "steam -silent steam://rungameid/570"
+            shape_dedicated_command("steam -gamepadui steam://rungameid/570"),
+            "steam -gamepadui steam://rungameid/570"
         );
         // Non-Steam launches and operator custom commands are untouched.
         assert_eq!(shape_dedicated_command("vkcube"), "vkcube");

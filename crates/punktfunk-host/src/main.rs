@@ -333,6 +333,11 @@ fn real_main() -> Result<()> {
         // names the inherited socketpair end.
         #[cfg(target_os = "linux")]
         Some("zerocopy-worker") => zerocopy::worker::run_from_args(&args[1..]),
+        // Hidden: the splash client every bare gamescope spawn backgrounds beside its nested app,
+        // so a fresh headless gamescope composites (and its PipeWire node delivers frames) from
+        // the first second — never run by hand; it needs a gamescope session's DISPLAY.
+        #[cfg(target_os = "linux")]
+        Some("gamescope-splash") => vdisplay::gamescope_splash_client(),
         // NV12 colour self-test (no display/capture needed): convert a known RGBA pattern to NV12
         // on the GPU and compare against a BT.709 limited-range reference. Validates the Tier 2A
         // `PUNKTFUNK_NV12` convert is colour-correct. Prints PASS/FAIL + max Y/U/V error.
