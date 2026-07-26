@@ -154,6 +154,38 @@ pub fn spawn(state: Arc<AppState>) -> Result<()> {
                         }
                     }
                 }
+                // A session can also end from the HOST side: the launched game exited, the operator
+                // stopped it, or `/cancel` arrived on another connection. Tearing the media threads
+                // down is *silence*, not a signal — Moonlight holds this control stream for the
+                // whole session, so with no word from us it sits on its last frame until its own
+                // timeout eventually fires. The client froze instead of ending (on-glass, .173).
+                //
+                // Disconnecting the peer is how it learns. Moonlight treats a control-stream
+                // disconnect as the session being over and returns to its app list — the same place
+                // it lands when the user quits, which is exactly where "the game exited" should
+                // leave them.
+                //
+                // `end_session` clears `launch`, so a tracked peer with no launch behind it *is*
+                // the ended session. Clearing `peer` first makes this fire once; the real
+                // `Disconnect` event that follows then takes the non-session-peer branch, which is
+                // why this arm repeats that branch's per-connection cleanup.
+                if let Some(pid) = peer {
+                    if state
+                        .launch
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .is_none()
+                    {
+                        tracing::info!("control: the session ended — disconnecting the client");
+                        host.peer_mut(pid).disconnect(0);
+                        peer = None;
+                        detected = None;
+                        decrypt_fails = 0;
+                        hdr_sent = false;
+                        pads = GamepadManager::new();
+                        pointer = super::pen::GsPointer::new();
+                    }
+                }
                 // Service the pads' force-feedback protocol every tick (games block inside
                 // EVIOCSFF until answered) and relay mixed rumble levels to the client.
                 //
