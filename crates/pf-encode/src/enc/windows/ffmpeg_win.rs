@@ -129,9 +129,13 @@ impl WinVendor {
 /// open-failure fallback only catches *setup* errors; a derive that opens but maps wrong would
 /// corrupt silently, so it stays opt-in per the probe-never-assume rule).
 fn zerocopy_enabled(vendor: WinVendor) -> bool {
-    pf_host_config::config()
-        .zerocopy
-        .unwrap_or(matches!(vendor, WinVendor::Amf))
+    zerocopy_active(pf_host_config::config().zerocopy, vendor)
+}
+
+/// The pure half of [`zerocopy_enabled`]: an operator override wins; unset resolves to the
+/// per-vendor default (AMF on, QSV off — see the validation status above).
+fn zerocopy_active(override_: Option<bool>, vendor: WinVendor) -> bool {
+    override_.unwrap_or(matches!(vendor, WinVendor::Amf))
 }
 
 /// Upper bound on `PUNKTFUNK_FFWIN_POLL_MS`. This knob spins the **encode thread** waiting for an
@@ -164,12 +168,17 @@ const MAX_POLL_SPIN_MS: u64 = 1_000;
 fn poll_spin_cap_us() -> u64 {
     static CAP_US: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *CAP_US.get_or_init(|| {
-        std::env::var("PUNKTFUNK_FFWIN_POLL_MS")
-            .ok()
-            .and_then(|s| s.trim().parse::<u64>().ok())
-            .map(|ms| ms.min(MAX_POLL_SPIN_MS) * 1000)
-            .unwrap_or(0) // default: no spin — the libavcodec AMF buffer can't be spun out
+        parse_poll_spin_cap_us(std::env::var("PUNKTFUNK_FFWIN_POLL_MS").ok().as_deref())
     })
+}
+
+/// The pure half of [`poll_spin_cap_us`]: parse, clamp to [`MAX_POLL_SPIN_MS`] BEFORE the µs
+/// conversion (the ordering the doc above proves is load-bearing), and default to 0 — no spin,
+/// the libavcodec AMF buffer can't be spun out.
+fn parse_poll_spin_cap_us(raw: Option<&str>) -> u64 {
+    raw.and_then(|s| s.trim().parse::<u64>().ok())
+        .map(|ms| ms.min(MAX_POLL_SPIN_MS) * 1000)
+        .unwrap_or(0)
 }
 
 /// The swscale *source* pixel format for a captured packed-RGB/BGR layout (8-bit BGRA fallback only).
@@ -204,6 +213,86 @@ fn sws_src(format: PixelFormat) -> Result<Pixel> {
 /// because the rebuild re-derived the same wrong answer.
 fn is_10bit_format(format: PixelFormat) -> bool {
     matches!(format, PixelFormat::P010 | PixelFormat::Rgb10a2)
+}
+
+/// Which lane the system-memory path routes a captured D3D11 format through. Device-free — the
+/// routing DECISION, split from the D3D11 copies so it is testable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReadbackRoute {
+    /// Same-format `CopyResource` + plane-by-plane copy (NV12/P010 from the video processor).
+    Yuv,
+    /// BGRA staging + swscale BGRA→NV12 — the 8-bit fallback when the capturer's video
+    /// processor latched off.
+    Bgra,
+    /// R10G10B10A2 staging + swscale X2BGR10→P010 — the HDR twin of that fallback.
+    Rgb10,
+}
+
+/// Route a captured format, guarding the mid-stream depth change first: the predicate matches
+/// what the encoder was built from (`ten_bit_input`), so the guard can only fire on a GENUINE
+/// depth change under the encoder — never, as it used to, on every frame of a session that
+/// merely negotiated 10-bit over an 8-bit capture (see [`is_10bit_format`]).
+fn readback_route(format: PixelFormat, ten_bit: bool) -> Result<ReadbackRoute> {
+    anyhow::ensure!(
+        is_10bit_format(format) == ten_bit,
+        "captured format {format:?} bit-depth changed under the encoder (built {}-bit)",
+        if ten_bit { 10 } else { 8 }
+    );
+    Ok(match format {
+        PixelFormat::Nv12 | PixelFormat::P010 => ReadbackRoute::Yuv,
+        PixelFormat::Bgra | PixelFormat::Bgrx => ReadbackRoute::Bgra,
+        PixelFormat::Rgb10a2 => ReadbackRoute::Rgb10,
+        other => {
+            bail!("ffmpeg_win system path cannot read back captured D3D11 format {other:?}")
+        }
+    })
+}
+
+/// The vendor-specific low-latency option set for [`open_win_encoder`], pure so the latency
+/// contract is pinned by tests. Unknown private options are ignored by `avcodec_open2` (left in
+/// the dict), so vendor/codec-specific keys are safe to set unconditionally.
+fn vendor_opts(vendor: WinVendor, amf_usage: &str) -> Vec<(&'static str, String)> {
+    match vendor {
+        WinVendor::Amf => vec![
+            // Field-tuning override (ultralowlatency | lowlatency | lowlatency_high_quality |
+            // transcoding): AMF usage presets bundle driver-side pipeline behavior that varies
+            // by VCN generation/driver — measured on-box rather than assumed.
+            ("usage", amf_usage.to_owned()),
+            ("rc", "cbr".into()),
+            // Streaming is latency-first: `speed` trims per-frame motion-estimation depth — the
+            // difference between ~encode-time and ~frame-budget on iGPU-class VCN (matches the
+            // low-latency preset choice on the NVENC path).
+            ("quality", "speed".into()),
+            ("preanalysis", "false".into()),
+            ("enforce_hrd", "true".into()),
+            // AMF low-latency submission mode (FFmpeg ≥ 6.1; unknown-option-ignored on older).
+            ("latency", "true".into()),
+            // Never B-frames: h264_amf defaults >0 on RDNA3+ HW that supports them, and each
+            // B-frame is a full frame period of added latency. (HEVC VCN has none; ignored there.)
+            ("bf", "0".into()),
+            // VPS/SPS/PPS on each IDR (clean mid-stream join) — HEVC/AV1 only; ignored elsewhere.
+            ("header_insertion_mode", "idr".into()),
+        ],
+        WinVendor::Qsv => vec![
+            ("preset", "veryfast".into()),
+            ("async_depth", "1".into()), // bound in-flight frames — the big QSV latency lever
+            ("low_power", "1".into()),   // VDEnc fixed-function path (lower latency)
+            ("look_ahead", "0".into()),  // (h264_qsv only; ignored on hevc/av1)
+            ("forced_idr", "1".into()),  // a forced key frame becomes a real IDR
+            ("scenario", "displayremoting".into()),
+        ],
+    }
+}
+
+/// Bind flags on the FFmpeg-allocated zero-copy pool. AMF reads it as encoder input
+/// (RENDER_TARGET + SHADER_RESOURCE, matching the video-processor output); QSV maps it as an mfx
+/// surface (DECODER | VIDEO_ENCODER). The `CopySubresourceRegion` into the pool works with any
+/// usable DEFAULT-usage texture regardless.
+fn pool_bind_flags(vendor: WinVendor) -> u32 {
+    match vendor {
+        WinVendor::Amf => (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
+        WinVendor::Qsv => (D3D11_BIND_DECODER.0 | D3D11_BIND_VIDEO_ENCODER.0) as u32,
+    }
 }
 
 /// Build the FFmpeg encoder context shared by both inner paths: name, mode, low-latency RC,
@@ -266,40 +355,11 @@ unsafe fn open_win_encoder(
         (*raw).hw_frames_ctx = ffi::av_buffer_ref(frames_ref);
     }
 
-    // Low-latency tuning. Unknown private options are ignored by avcodec_open2 (left in the dict),
-    // so vendor-specific keys are safe to set unconditionally.
+    // Low-latency tuning — the per-vendor contract lives in `vendor_opts` (pure, test-pinned).
     let mut opts = Dictionary::new();
-    match vendor {
-        WinVendor::Amf => {
-            // Field-tuning override (ultralowlatency | lowlatency | lowlatency_high_quality |
-            // transcoding): AMF usage presets bundle driver-side pipeline behavior that varies by
-            // VCN generation/driver — measured on-box rather than assumed.
-            let usage =
-                std::env::var("PUNKTFUNK_AMF_USAGE").unwrap_or_else(|_| "ultralowlatency".into());
-            opts.set("usage", &usage);
-            opts.set("rc", "cbr");
-            // Streaming is latency-first: `speed` trims per-frame motion-estimation depth — the
-            // difference between ~encode-time and ~frame-budget on iGPU-class VCN (matches the
-            // low-latency preset choice on the NVENC path).
-            opts.set("quality", "speed");
-            opts.set("preanalysis", "false");
-            opts.set("enforce_hrd", "true");
-            // AMF low-latency submission mode (FFmpeg ≥ 6.1; unknown-option-ignored on older).
-            opts.set("latency", "true");
-            // Never B-frames: h264_amf defaults >0 on RDNA3+ HW that supports them, and each
-            // B-frame is a full frame period of added latency. (HEVC VCN has none; ignored there.)
-            opts.set("bf", "0");
-            // VPS/SPS/PPS on each IDR (clean mid-stream join) — HEVC/AV1 only; ignored elsewhere.
-            opts.set("header_insertion_mode", "idr");
-        }
-        WinVendor::Qsv => {
-            opts.set("preset", "veryfast");
-            opts.set("async_depth", "1"); // bound in-flight frames — the big QSV latency lever
-            opts.set("low_power", "1"); // VDEnc fixed-function path (lower latency)
-            opts.set("look_ahead", "0"); // (h264_qsv only; ignored on hevc/av1)
-            opts.set("forced_idr", "1"); // a forced key frame becomes a real IDR
-            opts.set("scenario", "displayremoting");
-        }
+    let usage = std::env::var("PUNKTFUNK_AMF_USAGE").unwrap_or_else(|_| "ultralowlatency".into());
+    for (k, v) in vendor_opts(vendor, &usage) {
+        opts.set(k, &v);
     }
     video
         .open_with(opts)
@@ -528,22 +588,10 @@ impl SystemInner {
         pts: i64,
         idr: bool,
     ) -> Result<()> {
-        // Same predicate the encoder was built from (`ten_bit_input`), so this can only fire on a
-        // genuine MID-STREAM depth change — never, as it used to, on every frame of a session that
-        // merely negotiated 10-bit over an 8-bit capture.
-        let fmt_10 = is_10bit_format(format);
-        anyhow::ensure!(
-            fmt_10 == self.ten_bit,
-            "captured format {format:?} bit-depth changed under the encoder (built {}-bit)",
-            if self.ten_bit { 10 } else { 8 }
-        );
-        match format {
-            PixelFormat::Nv12 | PixelFormat::P010 => self.readback_yuv(frame, pts, idr),
-            PixelFormat::Bgra | PixelFormat::Bgrx => self.readback_bgra(frame, pts, idr),
-            PixelFormat::Rgb10a2 => self.readback_rgb10(frame, pts, idr),
-            other => {
-                bail!("ffmpeg_win system path cannot read back captured D3D11 format {other:?}")
-            }
+        match readback_route(format, self.ten_bit)? {
+            ReadbackRoute::Yuv => self.readback_yuv(frame, pts, idr),
+            ReadbackRoute::Bgra => self.readback_bgra(frame, pts, idr),
+            ReadbackRoute::Rgb10 => self.readback_rgb10(frame, pts, idr),
         }
     }
 
@@ -921,14 +969,7 @@ impl ZeroCopyInner {
         } else {
             PixelFormat::Nv12
         };
-        // Bind flags on the FFmpeg-allocated pool. AMF reads it as encoder input (RENDER_TARGET +
-        // SHADER_RESOURCE, matching the video-processor output); QSV maps it as an mfx surface
-        // (DECODER | VIDEO_ENCODER). The CopySubresourceRegion into the pool works with any usable
-        // DEFAULT-usage texture regardless.
-        let bind_flags = match vendor {
-            WinVendor::Amf => (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
-            WinVendor::Qsv => (D3D11_BIND_DECODER.0 | D3D11_BIND_VIDEO_ENCODER.0) as u32,
-        };
+        let bind_flags = pool_bind_flags(vendor);
         const POOL: c_int = 8;
         // SAFETY: `D3d11Hw::new` wraps the capturer's `device` as a D3D11VA hwdevice (handing FFmpeg an
         // owned AddRef of it, balanced by FFmpeg's teardown Release) and builds an owned
@@ -1400,5 +1441,195 @@ impl Encoder for FfmpegWinEncoder {
             None => {}
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Zero-copy default matrix: the operator override wins in both directions; unset resolves
+    /// AMF on (on-glass validated) and QSV off (opt-in until validated on Intel glass — the
+    /// probe-never-assume rule).
+    #[test]
+    fn zerocopy_default_is_per_vendor_and_override_wins() {
+        assert!(zerocopy_active(None, WinVendor::Amf));
+        assert!(!zerocopy_active(None, WinVendor::Qsv));
+        for vendor in [WinVendor::Amf, WinVendor::Qsv] {
+            assert!(zerocopy_active(Some(true), vendor));
+            assert!(!zerocopy_active(Some(false), vendor));
+        }
+    }
+
+    /// `PUNKTFUNK_FFWIN_POLL_MS` grammar: default 0 (no spin), verbatim ms → µs inside the clamp,
+    /// and the clamp applies BEFORE the µs conversion — the slipped-digit value that used to be a
+    /// 27.7-hour spin resolves to the 1 s cap, not a wedged encode thread.
+    #[test]
+    fn poll_spin_cap_clamps_before_the_us_conversion() {
+        assert_eq!(parse_poll_spin_cap_us(None), 0);
+        assert_eq!(parse_poll_spin_cap_us(Some("0")), 0);
+        assert_eq!(parse_poll_spin_cap_us(Some("5")), 5_000);
+        assert_eq!(parse_poll_spin_cap_us(Some(" 12 ")), 12_000);
+        assert_eq!(
+            parse_poll_spin_cap_us(Some("100000000")),
+            MAX_POLL_SPIN_MS * 1000
+        );
+        assert_eq!(
+            parse_poll_spin_cap_us(Some(&u64::MAX.to_string())),
+            MAX_POLL_SPIN_MS * 1000
+        );
+        assert_eq!(parse_poll_spin_cap_us(Some("junk")), 0);
+        assert_eq!(parse_poll_spin_cap_us(Some("-1")), 0);
+    }
+
+    /// The swscale source map: packed RGB/BGR converts; every YUV/10-bit layout is refused (the
+    /// swscale lane is the 8-bit BGRA fallback, not a general converter — the Linux HDR formats
+    /// are listed explicitly so a `PixelFormat` addition re-breaks the match on purpose).
+    #[test]
+    fn sws_src_accepts_packed_rgb_only() {
+        assert_eq!(sws_src(PixelFormat::Bgrx).unwrap(), Pixel::BGRZ);
+        assert_eq!(sws_src(PixelFormat::Rgbx).unwrap(), Pixel::RGBZ);
+        assert_eq!(sws_src(PixelFormat::Bgra).unwrap(), Pixel::BGRA);
+        assert_eq!(sws_src(PixelFormat::Rgba).unwrap(), Pixel::RGBA);
+        assert_eq!(sws_src(PixelFormat::Rgb).unwrap(), Pixel::RGB24);
+        assert_eq!(sws_src(PixelFormat::Bgr).unwrap(), Pixel::BGR24);
+        for f in [
+            PixelFormat::Nv12,
+            PixelFormat::P010,
+            PixelFormat::Rgb10a2,
+            PixelFormat::Yuv444,
+            PixelFormat::X2Rgb10,
+            PixelFormat::X2Bgr10,
+        ] {
+            assert!(sws_src(f).is_err(), "{f:?} must be refused");
+        }
+    }
+
+    /// The readback routing table, and its depth guard: NV12/P010 take the plane copy, the
+    /// video-processor fallbacks take their swscale lanes, a depth CHANGE under the encoder is
+    /// refused (in both directions), and depth-consistent routing never trips the guard.
+    #[test]
+    fn readback_routing_and_depth_guard() {
+        assert_eq!(
+            readback_route(PixelFormat::Nv12, false).unwrap(),
+            ReadbackRoute::Yuv
+        );
+        assert_eq!(
+            readback_route(PixelFormat::P010, true).unwrap(),
+            ReadbackRoute::Yuv
+        );
+        assert_eq!(
+            readback_route(PixelFormat::Bgra, false).unwrap(),
+            ReadbackRoute::Bgra
+        );
+        assert_eq!(
+            readback_route(PixelFormat::Bgrx, false).unwrap(),
+            ReadbackRoute::Bgra
+        );
+        assert_eq!(
+            readback_route(PixelFormat::Rgb10a2, true).unwrap(),
+            ReadbackRoute::Rgb10
+        );
+        // Mid-stream depth changes — the genuine error the guard exists for.
+        assert!(readback_route(PixelFormat::P010, false).is_err());
+        assert!(readback_route(PixelFormat::Rgb10a2, false).is_err());
+        assert!(readback_route(PixelFormat::Nv12, true).is_err());
+        assert!(readback_route(PixelFormat::Bgra, true).is_err());
+        // A format neither lane can read back.
+        assert!(readback_route(PixelFormat::Yuv444, false).is_err());
+    }
+
+    /// The 10-bit predicate follows the PIXELS (P010/Rgb10a2), not the negotiated depth — see
+    /// `ten_bit_input` for the forever-failing-session shape the reverse produced here.
+    #[test]
+    fn ten_bit_follows_the_pixels() {
+        assert!(is_10bit_format(PixelFormat::P010));
+        assert!(is_10bit_format(PixelFormat::Rgb10a2));
+        assert!(!is_10bit_format(PixelFormat::Nv12));
+        assert!(!is_10bit_format(PixelFormat::Bgra));
+        assert!(!is_10bit_format(PixelFormat::Bgrx));
+    }
+
+    /// The QSV low-latency contract, pinned: these five knobs are the difference between
+    /// display-remoting latency and transcode behavior — a silent regression here changes every
+    /// Intel Windows session.
+    #[test]
+    fn qsv_opts_pin_the_latency_contract() {
+        let opts = vendor_opts(WinVendor::Qsv, "ignored");
+        let get = |k: &str| {
+            opts.iter()
+                .find(|(key, _)| *key == k)
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(get("async_depth"), Some("1"));
+        assert_eq!(get("low_power"), Some("1"));
+        assert_eq!(get("look_ahead"), Some("0"));
+        assert_eq!(get("forced_idr"), Some("1"));
+        assert_eq!(get("scenario"), Some("displayremoting"));
+        assert_eq!(get("preset"), Some("veryfast"));
+        assert_eq!(get("usage"), None, "AMF-only knob must not leak into QSV");
+    }
+
+    /// The AMF (benchmark-comparator) contract: usage passes through, B-frames are pinned OFF
+    /// (each one is a full frame period of latency on RDNA3+), and the low-latency submission
+    /// mode + IDR header insertion are requested.
+    #[test]
+    fn amf_opts_pin_no_bframes_and_the_usage_passthrough() {
+        let opts = vendor_opts(WinVendor::Amf, "lowlatency");
+        let get = |k: &str| {
+            opts.iter()
+                .find(|(key, _)| *key == k)
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(get("usage"), Some("lowlatency"));
+        assert_eq!(get("bf"), Some("0"));
+        assert_eq!(get("rc"), Some("cbr"));
+        assert_eq!(get("quality"), Some("speed"));
+        assert_eq!(get("latency"), Some("true"));
+        assert_eq!(get("header_insertion_mode"), Some("idr"));
+        assert_eq!(get("preanalysis"), Some("false"));
+        assert_eq!(get("enforce_hrd"), Some("true"));
+    }
+
+    /// The zero-copy pool's bind flags per vendor — AMF's encoder-input shape vs QSV's mfx
+    /// surface shape (a wrong flag set fails `av_hwframe_ctx_init`, or worse, opens and maps
+    /// wrong).
+    #[test]
+    fn pool_bind_flags_per_vendor() {
+        assert_eq!(
+            pool_bind_flags(WinVendor::Amf),
+            (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32
+        );
+        assert_eq!(
+            pool_bind_flags(WinVendor::Qsv),
+            (D3D11_BIND_DECODER.0 | D3D11_BIND_VIDEO_ENCODER.0) as u32
+        );
+    }
+
+    /// The libavcodec encoder-name dispatch (name-selected — the codec id would pick the
+    /// software encoder).
+    #[test]
+    fn encoder_names_dispatch_by_vendor() {
+        assert_eq!(WinVendor::Qsv.encoder_name(Codec::H264), "h264_qsv");
+        assert_eq!(WinVendor::Qsv.encoder_name(Codec::H265), "hevc_qsv");
+        assert_eq!(WinVendor::Qsv.encoder_name(Codec::Av1), "av1_qsv");
+        assert_eq!(WinVendor::Amf.encoder_name(Codec::H265), "hevc_amf");
+    }
+
+    /// Probe smoke: resolve the QSV probe on this machine without crashing — `false` on a box
+    /// without the Intel runtime is a valid outcome; the value is printed, not asserted. Only
+    /// compiled in the `amf-qsv`-without-`qsv` combo (the shipped combo answers via native VPL).
+    /// Run on the Windows CI runner:
+    ///   cargo test -p pf-encode --no-default-features --features amf-qsv -- --ignored ffmpeg_win
+    #[cfg(not(feature = "qsv"))]
+    #[test]
+    #[ignore = "needs a real FFmpeg runtime probe (run on the Windows CI runner, not a dev box)"]
+    fn ffmpeg_win_probe_smoke() {
+        for codec in [Codec::H264, Codec::H265, Codec::Av1] {
+            eprintln!(
+                "probe_can_encode(Qsv, {codec:?}) = {}",
+                probe_can_encode(WinVendor::Qsv, codec)
+            );
+        }
     }
 }
