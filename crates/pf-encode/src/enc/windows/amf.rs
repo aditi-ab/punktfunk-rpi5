@@ -2014,9 +2014,6 @@ impl Encoder for AmfEncoder {
             // frame, force a later one to re-reference it). True only when the live driver accepted
             // the LTR slots at open — otherwise loss recovery falls back to a full IDR.
             supports_rfi: self.ltr_active,
-            // In-band mastering/CLL via `*InHDRMetadata` (HEVC SEI / AV1 metadata OBU); AVC has
-            // no such property (and no HDR sessions negotiate H.264).
-            supports_hdr_metadata: self.ten_bit && self.props.hdr_metadata.is_some(),
             // Permanent: VCN hardware does not encode 4:4:4.
             chroma_444: false,
             // True only when `PUNKTFUNK_INTRA_REFRESH` asked for the wave AND the live driver
@@ -2715,10 +2712,6 @@ mod tests {
             }
         };
         enc.set_hdr_meta(Some(sample_hdr_meta()));
-        assert!(
-            enc.caps().supports_hdr_metadata,
-            "HEVC 10-bit reports HDR SEI capability"
-        );
         let mut aus: Vec<EncodedFrame> = Vec::new();
         for i in 0..6 {
             let frame = CapturedFrame {

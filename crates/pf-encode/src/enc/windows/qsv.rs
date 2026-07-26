@@ -1471,9 +1471,6 @@ impl Encoder for QsvEncoder {
             // As Windows NVENC: the capturer composites; this backend never reads `frame.cursor`.
             blends_cursor: false,
             supports_rfi: self.ltr_active,
-            // In-band mastering/CLL at IDR (HEVC prefix SEI / AV1 metadata OBU); AVC sessions
-            // are never HDR.
-            supports_hdr_metadata: self.ten_bit && self.codec != Codec::H264,
             chroma_444: false,
             intra_refresh: self.ir_active,
             // Unvalidated on-glass — the host keeps the IDR recovery path until then.
