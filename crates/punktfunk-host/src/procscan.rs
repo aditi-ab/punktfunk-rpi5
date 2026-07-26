@@ -517,6 +517,58 @@ mod tests {
         assert!(s.alive(&[gone]).is_empty());
     }
 
+    /// Everything above runs against a fixture tree, which proves the parsing but not that the
+    /// parsing describes this kernel. This one scans the **real** `/proc` for a process it just
+    /// started — the only version of this test that would notice `/proc/<pid>/stat` field ordering,
+    /// the uid check, or the uptime clock being wrong on a real box.
+    #[test]
+    fn finds_a_real_process_it_just_started() {
+        // A real game's *binary* lives under its install dir, which is what makes the install-dir
+        // recipe work. So the stand-in must too: copy a long-running binary into the directory and run
+        // it from there. (A wrapper script that `exec`s something outside the directory would leave no
+        // trace of the directory in either the image path or the command line — worth knowing, and the
+        // reason a copied binary is the honest fixture here.)
+        let td = tempfile::tempdir().expect("tempdir");
+        let game = td.path().join("game");
+        std::fs::copy("/bin/sleep", &game).expect("copy a stand-in game binary");
+        let s = Scanner::system();
+        let before = s.uptime().expect("real /proc/uptime is readable");
+
+        let mut child = std::process::Command::new(&game)
+            .arg("20")
+            .spawn()
+            .expect("spawn the fake game");
+        // Give it a moment to be visible in /proc.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        let found = s.find(&DetectSpec::dir(td.path()), Some(before));
+        assert!(
+            found.iter().any(|p| p.pid == child.id()),
+            "scanning the real /proc did not find pid {} under {}; found {found:?}",
+            child.id(),
+            td.path().display()
+        );
+        // The same process is still alive when re-verified by (pid, start time).
+        assert!(!s.alive(&found).is_empty());
+        // The exact-exe recipe finds it too, on the same live process.
+        assert!(s
+            .find(&DetectSpec::exe(&game), Some(before))
+            .iter()
+            .any(|p| p.pid == child.id()));
+
+        // A launch reference AFTER this process started must exclude it — the rule that keeps a
+        // pre-existing copy of a game from being adopted, checked against a real start time.
+        let after = s.uptime().unwrap() + 60.0;
+        assert!(s.find(&DetectSpec::dir(td.path()), Some(after)).is_empty());
+
+        let _ = child.kill();
+        let _ = child.wait();
+        // Once it is gone and reaped, neither the scan nor the liveness re-check sees it.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(s.find(&DetectSpec::dir(td.path()), Some(before)).is_empty());
+        assert!(s.alive(&found).is_empty());
+    }
+
     #[test]
     fn parses_uptime_and_hostile_comm() {
         let td = fake_proc_root(4321.5, &[FakeProc::new(80, 1234)]);

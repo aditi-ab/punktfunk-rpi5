@@ -1007,6 +1007,77 @@ mod tests {
         assert_eq!(readopt(Some("fp-151"), Some(b)), 1);
     }
 
+    /// The whole point of the module, against a real process: a `Child` lease sees its game running,
+    /// notices when it exits, and reports that exit exactly once.
+    ///
+    /// Ignored by default because it must outlive [`SHIM_WINDOW`] to prove the game was not mistaken
+    /// for a launcher shim, and then wait out [`EXIT_CONFIRM`] — about 12 s. Run it on a Linux box
+    /// with `cargo test -p punktfunk-host -- --ignored gamelease`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "drives a real process for ~12s (shim window + exit confirmation)"]
+    fn a_real_child_is_tracked_from_running_to_exited() {
+        use std::os::unix::process::CommandExt;
+        use std::sync::atomic::AtomicUsize;
+
+        let td = tempfile::tempdir().expect("tempdir");
+        let script = td.path().join("game.sh");
+        std::fs::write(&script, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        let launch_uptime = launch_clock();
+        let child = std::process::Command::new("/bin/sh")
+            .arg(&script)
+            .process_group(0)
+            .spawn()
+            .expect("spawn the fake game");
+
+        static EXITS: AtomicUsize = AtomicUsize::new(0);
+        EXITS.store(0, Ordering::SeqCst);
+        let lease = open(
+            LeaseRequest {
+                game: GameRef {
+                    id: Some("custom:live".into()),
+                    store: Some("custom".into()),
+                    title: "Live Child".into(),
+                },
+                client: "test".into(),
+                plane: crate::events::Plane::Native,
+                spec: DetectSpec::dir(td.path()),
+                nested: false,
+                child: Some((child, true)),
+                launch_uptime,
+            },
+            Box::new(|| {
+                EXITS.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+        let shared = lease.shared();
+        assert!(matches!(shared.kind(), LeaseKind::Child));
+
+        // Seen running on the first poll, because the host holds the child.
+        std::thread::sleep(Duration::from_millis(1_500));
+        assert_eq!(shared.state(), GameState::Running, "should be running");
+        assert_eq!(EXITS.load(Ordering::SeqCst), 0, "nothing has exited yet");
+
+        // Past the shim window, so its exit counts as the game's rather than a launcher handing off.
+        std::thread::sleep(SHIM_WINDOW);
+        terminate(shared.clone(), "test asked");
+
+        // The ladder asks politely first; `sleep` dies on SIGTERM, so this resolves well inside the
+        // termination grace, and the watcher then confirms it gone.
+        let deadline = Instant::now() + TERM_GRACE + EXIT_CONFIRM + Duration::from_secs(4);
+        while Instant::now() < deadline && shared.state() != GameState::Exited {
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        assert_eq!(shared.state(), GameState::Exited, "the game should be gone");
+        // The host asked for this exit, so it must NOT also end the session — that is the difference
+        // between "the player quit" and "we closed it".
+        assert_eq!(
+            EXITS.load(Ordering::SeqCst),
+            0,
+            "a host-requested end must not fire the session-ending action"
+        );
+    }
+
     #[test]
     fn state_strings_are_stable() {
         // These reach the API and the console; renaming one is a wire change.
