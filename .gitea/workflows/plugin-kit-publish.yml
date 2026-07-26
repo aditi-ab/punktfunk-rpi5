@@ -45,7 +45,7 @@ jobs:
       # it does not, so module resolution dies at the first step and every `@punktfunk/host` import
       # reads as "cannot find module". Replacing the tree with a real copy is the whole fix; drop
       # this step once bun links `file:` deps correctly again.
-      - name: Repair the file: dependency (bun 1.3 self-symlink)
+      - name: "Repair the file: dependency (bun 1.3 self-symlink)"
         working-directory: plugin-kit
         run: |
           # -f follows the link, so this is true only when the manifest actually resolves.
