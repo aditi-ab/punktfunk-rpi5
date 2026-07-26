@@ -108,12 +108,13 @@ pub trait Capturer: Send {
 
     /// Attach a gamescope cursor source (remote-desktop-sweep Phase C). gamescope paints no
     /// `SPA_META_Cursor`, so [`cursor`](Self::cursor)'s slot stays empty — this hands the Linux
-    /// portal capturer gamescope's nested Xwayland `(DISPLAY, XAUTHORITY)` targets (it may run
-    /// several — one per `--xwayland-count`) so it reads the pointer shape/position over X11
-    /// (XFixes + QueryPointer), following whichever display is focused, and publishes it into that
-    /// same slot. Called once, after the capturer is built, only for gamescope sessions. Default
-    /// no-op: every non-gamescope capturer already has a cursor source.
-    fn attach_gamescope_cursor(&mut self, _targets: Vec<(String, Option<String>)>) {}
+    /// portal capturer a way to reach gamescope's nested Xwaylands (it may run several — one per
+    /// `--xwayland-count`) so it reads the pointer shape/position over X11 (XFixes +
+    /// QueryPointer), following whichever display is focused, and publishes it into that same slot.
+    /// Called once, after the capturer is built, only for gamescope sessions. Default no-op: every
+    /// non-gamescope capturer already has a cursor source.
+    #[cfg(target_os = "linux")]
+    fn attach_gamescope_cursor(&mut self, _targets: GamescopeCursorTargets) {}
 
     /// The source's static HDR mastering metadata (SMPTE ST.2086 + content light level), when the
     /// capturer can read it from the output (Windows `IDXGIOutput6::GetDesc1`). `None` = unknown /
@@ -321,6 +322,23 @@ pub struct ZeroCopyPolicy {
     /// which allocates tiled-only, still negotiates zero-copy). Empty otherwise.
     pub pyrowave_modifiers: Vec<u64>,
 }
+
+/// Discovers gamescope's nested Xwayland cursor targets — `(DISPLAY, XAUTHORITY)`, one per
+/// `--xwayland-count` — for [`Capturer::attach_gamescope_cursor`].
+///
+/// A CLOSURE, not the `Vec` it used to be, and re-run on a slow cadence by the cursor worker. The
+/// snapshot was taken once, before the game launched: gamescope creates a second Xwayland for the
+/// game but only advertises the FIRST in any child's environ, so the game's display was invisible to
+/// discovery — and when the connected (Big Picture) display then reported "gamescope is not drawing
+/// the pointer here", the source blanked the cursor for the whole game session, which is the exact
+/// regression the module doc says it fixed. A provider also lets the worker retry a display that
+/// died, and lets a stream that starts BEFORE the game converge instead of staying cursorless.
+///
+/// Built by the host facade (it wraps `pf_vdisplay::gamescope_xwayland_cursor_targets`), exactly
+/// like [`FrameChannelSender`] — so the capture→host edge stays one-way.
+#[cfg(target_os = "linux")]
+pub type GamescopeCursorTargets =
+    std::sync::Arc<dyn Fn() -> Vec<(String, Option<String>)> + Send + Sync>;
 
 #[cfg(target_os = "linux")]
 pub fn capturer_supports_444(_encoder_ingests_rgb_444: bool) -> bool {

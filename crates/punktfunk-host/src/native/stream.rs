@@ -3248,20 +3248,23 @@ fn build_pipeline(
     let mut capturer =
         crate::capture::capture_virtual_output(vout, plan.output_format(), plan.capture)
             .context("capture virtual output")?;
-    // gamescope (Phase C): gamescope paints no `SPA_META_Cursor`, so hand the capturer gamescope's
-    // nested Xwayland — it reads the pointer over X11 (XFixes shape + QueryPointer position) and
-    // feeds `cursor()`, which the encode loop composites. A failed discovery/connect leaves the
-    // stream cursorless (today's behaviour); non-gamescope plans skip this entirely.
+    // gamescope (Phase C): gamescope paints no `SPA_META_Cursor`, so hand the capturer a way to
+    // reach gamescope's nested Xwaylands — it reads the pointer over X11 (XFixes shape +
+    // QueryPointer position) and feeds `cursor()`, which the encode loop composites.
+    // Non-gamescope plans skip this entirely.
+    //
+    // A PROVIDER, not the discovered list: gamescope creates the game's Xwayland when the game
+    // launches and advertises only the FIRST in any child's environ, so a list captured here misses
+    // it — and the cursor source would then blank the pointer for the whole game session (it asks
+    // the connected display "are you drawing the pointer?" and gets "no"). The source re-runs this
+    // every couple of seconds, so a stream that starts before the game converges, and a display
+    // that dies is retried. Same one-way-edge shape as the Windows channel senders: the closure
+    // wraps the host's discovery, and pf-capture never reaches back into pf-vdisplay.
     #[cfg(target_os = "linux")]
     if plan.gamescope_cursor {
-        let targets = pf_vdisplay::gamescope_xwayland_cursor_targets();
-        if targets.is_empty() {
-            tracing::warn!(
-                "gamescope cursor: no nested Xwayland discovered — no in-video pointer this session"
-            );
-        } else {
-            capturer.attach_gamescope_cursor(targets);
-        }
+        capturer.attach_gamescope_cursor(std::sync::Arc::new(
+            pf_vdisplay::gamescope_xwayland_cursor_targets,
+        ));
     }
     if let Some(t) = trace {
         t.mark("capture_attached");

@@ -99,6 +99,10 @@ pub struct PortalCapturer {
     /// Set once the stream negotiated one of the 10-bit PQ formats (`param_changed`), i.e. frames
     /// really are PQ/BT.2020 — drives [`hdr_meta`](Capturer::hdr_meta).
     hdr_negotiated: Arc<AtomicBool>,
+    /// The NEGOTIATED frame size, packed `(w << 32) | h`; `0` until `param_changed` runs. Written by
+    /// the PipeWire thread, read by the gamescope XFixes cursor source, which must map root-space
+    /// pointer coordinates into FRAME space (gamescope's `-w/-h` and `-W/-H` are independent knobs).
+    frame_size: Arc<std::sync::atomic::AtomicU64>,
     /// The PipeWire node this capturer consumes — surfaced in error messages for diagnosis.
     node_id: u32,
     /// Stops the PipeWire loop on teardown (sent in `Drop`). Without it a dropped or failed
@@ -292,6 +296,8 @@ struct PwHandles {
     hdr_negotiated: Arc<AtomicBool>,
     /// See [`PortalCapturer::cursor_live`].
     cursor_live: Arc<std::sync::Mutex<Option<pf_frame::CursorOverlay>>>,
+    /// See [`PortalCapturer::frame_size`].
+    frame_size: Arc<std::sync::atomic::AtomicU64>,
     quit: ::pipewire::channel::Sender<()>,
     join: thread::JoinHandle<()>,
 }
@@ -318,6 +324,7 @@ impl PwHandles {
             hdr_offer: self.hdr_offer,
             hdr_negotiated: self.hdr_negotiated,
             cursor_live: self.cursor_live,
+            frame_size: self.frame_size,
             node_id,
             quit: Some(self.quit),
             join: Some(self.join),
@@ -375,6 +382,8 @@ fn spawn_pipewire(
     let hdr_negotiated_cb = hdr_negotiated.clone();
     let cursor_live = Arc::new(std::sync::Mutex::new(None::<pf_frame::CursorOverlay>));
     let cursor_live_cb = cursor_live.clone();
+    let frame_size = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let frame_size_cb = frame_size.clone();
     // pipewire's own cross-thread channel: the receiver attaches to the loop and quits it; the
     // sender lives on the capturer and fires in its `Drop`. Absolute `::pipewire` path — the
     // inner `mod pipewire` shadows the crate name at this scope.
@@ -424,6 +433,7 @@ fn spawn_pipewire(
                 broken_cb,
                 hdr_negotiated_cb,
                 cursor_live_cb,
+                frame_size_cb,
                 plan,
                 want_444,
                 want_hdr,
@@ -447,6 +457,7 @@ fn spawn_pipewire(
         hdr_offer: want_hdr,
         hdr_negotiated,
         cursor_live,
+        frame_size,
         quit: quit_tx,
         join,
     })
@@ -465,14 +476,18 @@ impl Capturer for PortalCapturer {
         self.cursor_live.lock().ok().and_then(|slot| slot.clone())
     }
 
-    fn attach_gamescope_cursor(&mut self, targets: Vec<(String, Option<String>)>) {
+    fn attach_gamescope_cursor(&mut self, targets: crate::GamescopeCursorTargets) {
         // gamescope paints no `SPA_META_Cursor`, so `cursor_live` would stay empty. Spawn the
         // XFixes reader to publish gamescope's pointer into that SAME slot — `cursor()` above then
-        // serves it and the encode loop composites it, exactly like the portal path. It connects
-        // to every nested Xwayland and follows the focused one's pointer. A failure (no Xwayland /
-        // no XFixes) logs and leaves the slot empty = today's cursorless gamescope.
-        self._gs_cursor =
-            xfixes_cursor::XFixesCursorSource::spawn(targets, Arc::clone(&self.cursor_live));
+        // serves it and the encode loop composites it, exactly like the portal path. It connects to
+        // every nested Xwayland the provider reports, RE-RUNS the provider so a game's Xwayland
+        // that appears later is adopted, and follows whichever one gamescope draws the pointer on.
+        // `frame_size` lets it map root-space coordinates into frame space.
+        self._gs_cursor = xfixes_cursor::XFixesCursorSource::spawn(
+            targets,
+            Arc::clone(&self.cursor_live),
+            Arc::clone(&self.frame_size),
+        );
     }
 
     fn next_frame_within(&mut self, budget: Duration) -> Result<CapturedFrame> {
@@ -1193,6 +1208,8 @@ mod pipewire {
         /// LIVE overlay slot shared with [`super::PortalCapturer::cursor_live`] — refreshed after
         /// every `update_cursor_meta`, including from cursor-only buffers that never become frames.
         cursor_live: Arc<std::sync::Mutex<Option<pf_frame::CursorOverlay>>>,
+        /// See [`super::PortalCapturer::frame_size`] — published from `param_changed`.
+        frame_size: Arc<std::sync::atomic::AtomicU64>,
         /// `Some((w, h))` while the producer's negotiated size is a sacrificial birth mode and a
         /// renegotiation to these dims is guaranteed (KWin virtual outputs — kwin.rs `create`):
         /// `.process` skips whole buffers until the negotiated size matches, then clears this
@@ -2467,6 +2484,9 @@ mod pipewire {
         // LIVE cursor publisher (see `PortalCapturer::cursor_live`): refreshed from every
         // dequeued buffer's cursor meta, frames or not.
         cursor_live: Arc<std::sync::Mutex<Option<pf_frame::CursorOverlay>>>,
+        // The negotiated frame size, published for the gamescope cursor source (see
+        // `super::PortalCapturer::frame_size`).
+        frame_size: Arc<std::sync::atomic::AtomicU64>,
         // THE zero-copy negotiation decision, resolved once by `spawn_pipewire` (which consumes the
         // same struct for the capturer's timeout diagnosis) — never re-derived here.
         plan: NegotiationPlan,
@@ -2654,6 +2674,7 @@ mod pipewire {
             dbg_log_n: 0,
             cursor: CursorState::default(),
             cursor_live,
+            frame_size,
             expect_dims: if expect_exact_dims {
                 preferred.map(|(w, h, _)| (w, h))
             } else {
@@ -2718,6 +2739,12 @@ mod pipewire {
                         imp.clear_cache();
                     }
                     let sz = ud.info.size();
+                    // Publish the negotiated size for the gamescope cursor source's root→frame
+                    // scaling (`xfixes_cursor::scale_to_frame`); a renegotiation updates it.
+                    ud.frame_size.store(
+                        (u64::from(sz.width) << 32) | u64::from(sz.height),
+                        Ordering::Relaxed,
+                    );
                     ud.format = map_format(ud.info.format());
                     ud.modifier = ud.info.modifier();
                     // HDR: the 10-bit PQ formats are only ever offered with MANDATORY BT.2020/PQ
