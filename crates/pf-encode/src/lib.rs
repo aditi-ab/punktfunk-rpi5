@@ -608,26 +608,23 @@ fn open_video_backend(
                       // NVIDIA → NVENC (direct SDK), AMD → AMF, Intel → QSV (both libavcodec), else → software
                       // H.264. `auto` (the default) resolves from the selected render adapter's vendor.
         let backend = windows_resolved_backend();
-        // With `auto` the backend is derived from the selected GPU, so this can only fire when an
-        // explicit PUNKTFUNK_ENCODER contradicts the GPU the pipeline sits on (e.g. `nvenc` forced
-        // while the web-console preference pins the Intel iGPU) — the open below will then fail on
-        // a wrong-vendor device; say why up front instead of leaving an opaque encoder error.
-        if let Some(sel) = pf_gpu::selected_gpu() {
-            let mismatched = match backend {
-                WindowsBackend::Nvenc => sel.info.vendor_id != pf_gpu::VENDOR_NVIDIA,
-                WindowsBackend::Amf => sel.info.vendor_id != pf_gpu::VENDOR_AMD,
-                WindowsBackend::Qsv => sel.info.vendor_id != pf_gpu::VENDOR_INTEL,
-                WindowsBackend::Software => false,
-            };
-            if mismatched {
-                tracing::warn!(
-                    adapter = sel.info.name,
-                    ?backend,
-                    "encoder backend does not match the selected GPU's vendor (explicit \
-                     PUNKTFUNK_ENCODER conflicting with the GPU preference?) — the encoder \
-                     open will likely fail on this device"
-                );
-            }
+        // An explicit PUNKTFUNK_ENCODER pin contradicting the selected GPU's vendor was just
+        // overridden by the adapter-derived backend (`resolve_windows_backend`) — honoring it
+        // could only fail, and used to feed the reset ladder five futile rebuilds per connect
+        // (an unrecoverable session + client reconnect loop on hybrid boxes). Warn per session
+        // open so the stale pin gets removed from host.env.
+        if windows_pinned_backend().is_some_and(|pin| pin != backend) {
+            tracing::warn!(
+                adapter = pf_gpu::selected_gpu()
+                    .map(|s| s.info.name)
+                    .as_deref()
+                    .unwrap_or("?"),
+                pinned = %pf_host_config::config().encoder_pref,
+                using = ?backend,
+                "explicit PUNKTFUNK_ENCODER pin does not match the selected GPU's vendor — the \
+                 pin is overridden (remove it from host.env, or point the GPU preference at the \
+                 pinned vendor's adapter)"
+            );
         }
         match backend {
             WindowsBackend::Nvenc => {
@@ -1469,6 +1466,23 @@ pub fn can_encode_10bit(_codec: Codec) -> bool {
     false
 }
 
+/// Marker in an encoder error's `anyhow` context chain: the failure is a deterministic
+/// consequence of the session's configuration, so an in-place rebuild retry can never succeed
+/// (e.g. the backend binding to a wrong-vendor adapter — the same wall on every attempt). The
+/// stream loop's reset ladder downcasts for this and ends the session immediately with the
+/// carried cause instead of burning its rebuild budget first. Attach with
+/// `anyhow::Error::new(TerminalEncoderError).context("the actual cause")`.
+#[derive(Clone, Copy, Debug)]
+pub struct TerminalEncoderError;
+
+impl std::fmt::Display for TerminalEncoderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("deterministic configuration error — an encoder rebuild cannot fix this")
+    }
+}
+
+impl std::error::Error for TerminalEncoderError {}
+
 // ---------------------------------------------------------------------------------------------
 // Windows backend selection (the analogue of the Linux nvidia_present / linux_zero_copy_is_vaapi
 // logic). NVIDIA → NVENC, AMD → AMF, Intel → QSV; `auto` (default) reads the vendor of the
@@ -1476,7 +1490,8 @@ pub fn can_encode_10bit(_codec: Codec) -> bool {
 // backend always matches the GPU the capture ring and virtual display sit on.
 // ---------------------------------------------------------------------------------------------
 
-#[cfg(target_os = "windows")]
+// Un-gated (unlike everything else in this section): the pure reconciliation half below is
+// platform-agnostic so its decision table is unit-tested on every CI leg, not just Windows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WindowsBackend {
     Nvenc,
@@ -1493,24 +1508,77 @@ enum GpuVendor {
     Intel,
 }
 
-/// Resolve the active Windows encode backend from `PUNKTFUNK_ENCODER` (`auto` → the selected
-/// render adapter's vendor). Shared by [`open_video`] and the GameStream codec advertisement so
-/// both agree.
+/// The PCI vendor a Windows hardware backend can open on (`None` for the vendor-agnostic
+/// software encoder). Capture ring, virtual display, and encoder share ONE adapter, so a backend
+/// whose vendor differs from the selected GPU's can never open — the table the pin-vs-preference
+/// reconciliation in [`resolve_windows_backend`] stands on.
+pub fn windows_backend_vendor_id(backend: WindowsBackend) -> Option<u32> {
+    match backend {
+        WindowsBackend::Nvenc => Some(pf_gpu::VENDOR_NVIDIA),
+        WindowsBackend::Amf => Some(pf_gpu::VENDOR_AMD),
+        WindowsBackend::Qsv => Some(pf_gpu::VENDOR_INTEL),
+        WindowsBackend::Software => None,
+    }
+}
+
+/// Pure half of [`windows_resolved_backend`]: reconcile an explicit `PUNKTFUNK_ENCODER` pin with
+/// the selected render adapter. A hardware pin whose vendor contradicts the selected GPU is
+/// OVERRIDDEN by the adapter-derived backend (`derived`, evaluated lazily) — honoring it can only
+/// produce a deterministically-failing session, observed on a hybrid box as a stale `qsv` pin vs.
+/// a console NVIDIA preference: five futile in-place rebuilds, session end, client reconnect,
+/// forever. The console preference is the newer, user-visible, per-box intent; the pin is usually
+/// a stale provisioning artifact — [`open_video`] warns loudly whenever a pin loses. The software
+/// pin has no vendor and is always honored; with no selected GPU there is nothing to reconcile
+/// against, so a pin is trusted as-is.
+pub fn resolve_windows_backend(
+    pinned: Option<WindowsBackend>,
+    selected_vendor_id: Option<u32>,
+    derived: impl FnOnce() -> WindowsBackend,
+) -> WindowsBackend {
+    match (pinned, selected_vendor_id) {
+        (None, _) => derived(),
+        (Some(pin), Some(vendor)) => match windows_backend_vendor_id(pin) {
+            Some(required) if required != vendor => derived(),
+            _ => pin,
+        },
+        (Some(pin), None) => pin,
+    }
+}
+
+/// The explicit `PUNKTFUNK_ENCODER` pin as a backend — `None` for `auto`, unset, and unknown
+/// spellings (which all mean "derive from the selected adapter's vendor").
 #[cfg(target_os = "windows")]
-pub fn windows_resolved_backend() -> WindowsBackend {
+fn windows_pinned_backend() -> Option<WindowsBackend> {
     // Resolved ONCE in HostConfig (Goal-1) — was re-read from PUNKTFUNK_ENCODER on every call.
     match pf_host_config::config().encoder_pref.as_str() {
-        "nvenc" | "hw" | "nvidia" | "cuda" => WindowsBackend::Nvenc,
-        "amf" | "amd" => WindowsBackend::Amf,
-        "qsv" | "intel" => WindowsBackend::Qsv,
-        "sw" | "software" | "openh264" => WindowsBackend::Software,
-        _ => match windows_gpu_vendor() {
-            Some(GpuVendor::Nvidia) => WindowsBackend::Nvenc,
-            Some(GpuVendor::Amd) => WindowsBackend::Amf,
-            Some(GpuVendor::Intel) => WindowsBackend::Qsv,
-            None => WindowsBackend::Software,
-        },
+        "nvenc" | "hw" | "nvidia" | "cuda" => Some(WindowsBackend::Nvenc),
+        "amf" | "amd" => Some(WindowsBackend::Amf),
+        "qsv" | "intel" => Some(WindowsBackend::Qsv),
+        "sw" | "software" | "openh264" => Some(WindowsBackend::Software),
+        _ => None,
     }
+}
+
+/// Resolve the active Windows encode backend from `PUNKTFUNK_ENCODER` (`auto` → the selected
+/// render adapter's vendor; an explicit pin contradicting that vendor is overridden — see
+/// [`resolve_windows_backend`]). Shared by [`open_video`] and the GameStream codec advertisement
+/// so both agree.
+#[cfg(target_os = "windows")]
+pub fn windows_resolved_backend() -> WindowsBackend {
+    let pinned = windows_pinned_backend();
+    // The selected vendor is only consulted to reconcile a pin — skipping the query keeps the
+    // common auto path at ONE inventory walk (the one inside `windows_gpu_vendor`).
+    let selected = if pinned.is_some() {
+        pf_gpu::selected_gpu().map(|s| s.info.vendor_id)
+    } else {
+        None
+    };
+    resolve_windows_backend(pinned, selected, || match windows_gpu_vendor() {
+        Some(GpuVendor::Nvidia) => WindowsBackend::Nvenc,
+        Some(GpuVendor::Amd) => WindowsBackend::Amf,
+        Some(GpuVendor::Intel) => WindowsBackend::Qsv,
+        None => WindowsBackend::Software,
+    })
 }
 
 /// True if the session's resolved encode backend produces GPU-resident frames (so the capturer should
@@ -1808,6 +1876,63 @@ pub fn pyrowave_mode_fits_rdo(_width: u32, _height: u32, _chroma444: bool) -> bo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The pin-vs-adapter reconciliation table (`resolve_windows_backend`): an explicit
+    /// `PUNKTFUNK_ENCODER` pin whose vendor contradicts the selected GPU must be overridden by
+    /// the adapter-derived backend — never "pin + proceed", which fed the reset ladder a
+    /// deterministic failure (the hybrid-box `qsv` pin × console NVIDIA preference loop).
+    #[test]
+    fn encoder_pin_reconciles_against_the_selected_adapter() {
+        use WindowsBackend::*;
+        let derived = |b: WindowsBackend| move || b;
+        let unreachable = || -> WindowsBackend { panic!("derived must not be consulted") };
+        // The repro: pinned qsv, console-selected NVIDIA → NVENC (the un-pinned path's answer).
+        assert_eq!(
+            resolve_windows_backend(Some(Qsv), Some(pf_gpu::VENDOR_NVIDIA), derived(Nvenc)),
+            Nvenc
+        );
+        // A pin matching the selected vendor is honored without deriving.
+        assert_eq!(
+            resolve_windows_backend(Some(Qsv), Some(pf_gpu::VENDOR_INTEL), unreachable),
+            Qsv
+        );
+        // No selected GPU → nothing to reconcile against; the pin is trusted as-is.
+        assert_eq!(
+            resolve_windows_backend(Some(Nvenc), None, unreachable),
+            Nvenc
+        );
+        // The software pin has no vendor: honored on any adapter.
+        assert_eq!(
+            resolve_windows_backend(Some(Software), Some(pf_gpu::VENDOR_NVIDIA), unreachable),
+            Software
+        );
+        // No pin (`auto`/unset) → always the adapter-derived backend.
+        assert_eq!(
+            resolve_windows_backend(None, Some(pf_gpu::VENDOR_AMD), derived(Amf)),
+            Amf
+        );
+        assert_eq!(
+            resolve_windows_backend(None, None, derived(Software)),
+            Software
+        );
+    }
+
+    /// The terminal-marker contract the stream loop's reset ladder relies on: a
+    /// [`TerminalEncoderError`] attached at the failure site must stay downcastable through the
+    /// context layers added on the way up (a `format!`/stringify on any layer would break it).
+    #[test]
+    fn terminal_encoder_error_survives_the_context_chain() {
+        use anyhow::Context as _;
+        let site: anyhow::Error = anyhow::Error::new(TerminalEncoderError)
+            .context("capture device's adapter is not an Intel VPL implementation");
+        let bubbled = Err::<(), _>(site)
+            .context("QSV lazy bring-up")
+            .context("encoder submit")
+            .unwrap_err();
+        assert!(bubbled.downcast_ref::<TerminalEncoderError>().is_some());
+        // The operator-facing rendering leads with the actual cause, not the marker.
+        assert!(format!("{bubbled:#}").contains("not an Intel VPL implementation"));
+    }
 
     /// The probed-capability → wire-bitfield mapping the native codec advertisement is built from.
     #[cfg(any(target_os = "linux", target_os = "windows"))]

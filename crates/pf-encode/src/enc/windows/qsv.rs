@@ -313,11 +313,15 @@ fn create_session(target_luid: Option<[u8; 8]>) -> Result<(Loader, Session, (u16
         .unwrap_or(&impls[0]);
     if let Some(want) = target_luid {
         if !(chosen.luid_valid && chosen.luid == want) {
-            bail!(
+            // Static configuration mismatch — the capture adapter has no Intel VPL
+            // implementation, so every rebuild re-hits this same wall. The terminal marker
+            // makes the stream loop end the session at once instead of spending its reset
+            // budget (5 futile rebuilds, then an opaque loop as the client reconnects).
+            return Err(anyhow::Error::new(super::TerminalEncoderError).context(
                 "capture device's adapter is not an Intel VPL implementation (hybrid box? \
-                 point PUNKTFUNK_RENDER_ADAPTER / the web-console GPU preference at the Intel \
-                 adapter for a QSV session)"
-            );
+                     point PUNKTFUNK_RENDER_ADAPTER / the web-console GPU preference at the \
+                     Intel adapter for a QSV session)",
+            ));
         }
     }
     // SAFETY: `loader.0` is live; `MFXCreateSession` fills `session` only on success and the

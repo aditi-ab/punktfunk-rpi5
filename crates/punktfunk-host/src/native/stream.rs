@@ -2329,6 +2329,19 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
         // assign next. The RFI backends pin their frame numbering to it.
         let wire_index = au_seq.wrapping_add(inflight.len() as u32);
         if let Err(e) = enc.submit_indexed(&frame, wire_index) {
+            // A typed-terminal error is a deterministic configuration failure — the identical
+            // wall on every attempt, so rebuilds can't help. End the session at once with the
+            // carried cause (observed: a stale PUNKTFUNK_ENCODER pin vs. the selected adapter
+            // burned all 5 rebuilds per connect while the client reconnected forever).
+            if e.downcast_ref::<crate::encode::TerminalEncoderError>()
+                .is_some()
+            {
+                tracing::error!(
+                    error = %format!("{e:#}"),
+                    "encoder failed with a deterministic configuration error — ending the video \
+                     session without rebuild attempts (see the error for the remedy)");
+                return Err(e).context("encoder submit");
+            }
             // The input half of an encode stall: once the driver stops draining AUs, libavcodec's
             // one-frame buffer fills and avcodec_send_frame starts failing (EAGAIN) — the same
             // wedge the watchdog below catches, seen from submit. Rebuild the encoder in place
