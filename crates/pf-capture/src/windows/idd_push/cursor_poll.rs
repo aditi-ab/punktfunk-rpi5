@@ -85,6 +85,10 @@ impl CursorPoller {
     /// stand-down) — a 2 s freeze at every UAC prompt is user-visible, ~4 `OpenInputDesktop`
     /// syscalls/s are not.
     const REATTACH: Duration = Duration::from_millis(250);
+    /// Cadence of the same-handle extent re-probe (see the [`run`] loop). Display-scale changes are
+    /// human/OS-timescale events and the probe reads dimensions only — no pixel copy — so 4 Hz is
+    /// both ample and negligible, and a ≤250 ms lag on the pointer's size is imperceptible.
+    const EXTENT_PROBE: Duration = Duration::from_millis(250);
 
     /// Spawn the poller for the virtual display `target_id`. `rect` SEEDS the target's desktop rect
     /// (`source_desktop_rect` order: x, y, w, h) — cursor positions are desktop-global; the
@@ -169,6 +173,7 @@ fn run(
     let mut failed_handle: isize = 0; // don't re-rasterise a failing handle every tick
     let mut serial: u64 = 0;
     let mut logged_live = false;
+    let mut last_extent = Instant::now();
 
     while !stop.load(Ordering::Relaxed) {
         std::thread::sleep(CursorPoller::INTERVAL);
@@ -221,6 +226,42 @@ fn run(
         // bitmap to have been seen. v1: animated cursors publish their first frame (the OBS
         // behavior); frame cycling via DrawIconEx istep is a known follow-up.
         let handle = ci.hCursor.0 as isize;
+
+        // …but the handle alone CANNOT see a re-render. Windows rebuilds the system cursors at a
+        // new size whenever the scale under the pointer changes — crossing to a differently-scaled
+        // monitor, or a monitor's own scale settling after a mode change (a fresh virtual display
+        // is created at the RECOMMENDED scale and gets the client's saved `PerMonitorSettings`
+        // override a beat later) — while the SHARED handle stays put for the session's life (the
+        // arrow is 0x10003 throughout). Keyed on the handle alone the cache latched whatever size
+        // the pointer happened to have when the poller started and never let go: a session that
+        // sampled inside that pre-settle window forwarded — and composited — a 96 px pointer over
+        // a 100 % desktop until it ended, which is exactly the "cursor is 3× too big while
+        // everything else is fine" report. Re-read the bitmap's EXTENT on a slow cadence
+        // (dimensions only, no pixel copy) and drop the cache when it moved.
+        if showing && handle != 0 && handle == cached_handle {
+            if last_extent.elapsed() >= CursorPoller::EXTENT_PROBE {
+                last_extent = Instant::now();
+                if let (Some(now), Some(s)) = (cursor_extent(ci.hCursor), shape.as_ref()) {
+                    if now != (s.w, s.h) {
+                        tracing::info!(
+                            target_id,
+                            "cursor: the pointer bitmap resized under a stable handle \
+                             ({}x{} -> {}x{}) — re-rasterising (the scale under the pointer moved)",
+                            s.w,
+                            s.h,
+                            now.0,
+                            now.1
+                        );
+                        cached_handle = 0; // re-rasterise below, on this same tick
+                    }
+                }
+            }
+        } else {
+            // A handle change re-rasterises on its own — hold the probe off so it can't fire on
+            // the very next tick against a shape that is current by construction.
+            last_extent = Instant::now();
+        }
+
         if showing && handle != 0 && handle != cached_handle && handle != failed_handle {
             match rasterize(ci.hCursor) {
                 Some((rgba, w, h, hot_x, hot_y)) => {
@@ -384,6 +425,57 @@ fn rasterize(hcursor: windows::Win32::UI::WindowsAndMessaging::HCURSOR) -> Raste
 }
 
 type RasterOut = Option<(Vec<u8>, u32, u32, u32, u32)>;
+
+/// The CURRENT bitmap extent of `hcursor` — exactly the `(w, h)` [`convert`] would derive, without
+/// the pixel read. Feeds the poll loop's staleness check (a re-render keeps the handle, see there).
+/// `None` on any failure, which the caller reads as "no verdict" and keeps its cached shape.
+fn cursor_extent(hcursor: windows::Win32::UI::WindowsAndMessaging::HCURSOR) -> Option<(u32, u32)> {
+    // CopyIcon first, for the reason `rasterize` does it: the owning process can destroy its
+    // HCURSOR between GetCursorInfo and the reads below; the copy is ours.
+    // SAFETY: `HICON(hcursor.0)` reinterprets the cursor handle as an icon handle (cursors ARE
+    // icons in user32); CopyIcon yields an owned HICON destroyed below.
+    let icon = unsafe { CopyIcon(HICON(hcursor.0)) }.ok()?;
+    let mut ii = ICONINFO::default();
+    // SAFETY: `ii` is a live out-param. On Ok it hands us COPIES of the mask/color bitmaps — both
+    // deleted below (GDI-handle leak otherwise).
+    let got = unsafe { GetIconInfo(icon, &mut ii) };
+    // Mirrors `convert`'s two families: a color cursor's extent is its color bitmap's; a
+    // monochrome one's mask carries the AND plane OVER the XOR plane, so its height is doubled.
+    let extent = got.is_ok().then_some(()).and_then(|()| {
+        if !ii.hbmColor.is_invalid() {
+            bitmap_extent(ii.hbmColor)
+        } else {
+            let (w, h) = bitmap_extent(ii.hbmMask)?;
+            (h >= 2 && h % 2 == 0).then_some((w, h / 2))
+        }
+    });
+    // SAFETY: deleting the two bitmap copies GetIconInfo returned (null-safe: DeleteObject on a
+    // null HGDIOBJ fails harmlessly) and the icon copy — each exactly once.
+    unsafe {
+        let _ = DeleteObject(ii.hbmColor.into());
+        let _ = DeleteObject(ii.hbmMask.into());
+        let _ = DestroyIcon(icon);
+    }
+    extent
+}
+
+/// A GDI bitmap's dimensions, under [`read_bitmap_32`]'s sanity caps so the two agree on what a
+/// plausible cursor is — a bitmap `rasterize` would reject must not read here as a size CHANGE.
+fn bitmap_extent(hbm: HBITMAP) -> Option<(u32, u32)> {
+    let mut bm = BITMAP::default();
+    // SAFETY: `bm` is a live out-param sized exactly as passed; GetObjectW only writes into it.
+    let n = unsafe {
+        GetObjectW(
+            hbm.into(),
+            std::mem::size_of::<BITMAP>() as i32,
+            Some((&mut bm as *mut BITMAP).cast()),
+        )
+    };
+    if n == 0 || bm.bmWidth <= 0 || bm.bmHeight <= 0 || bm.bmWidth > 512 || bm.bmHeight > 1024 {
+        return None;
+    }
+    Some((bm.bmWidth as u32, bm.bmHeight as u32))
+}
 
 /// Convert the ICONINFO bitmaps to straight RGBA. Two families:
 /// - color (`hbmColor` set): 32bpp BGRA; if the alpha channel is entirely empty (old-style
