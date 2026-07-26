@@ -205,12 +205,14 @@ pub(super) async fn negotiate(
             // (gamescope available) gets its own headless gamescope spawn at the client mode. Gate on
             // whether the launch id actually RESOLVES to a command in the host's library — an unknown
             // id must fall back to normal auto routing, not a blank "sleep infinity" gamescope
-            // (review #9). (dedicated is Linux-only; the resolver is the non-Windows launch_command.)
+            // (review #9). (dedicated is Linux-only, and only there does `resolve_launch` carry a
+            // command — on Windows the concrete process is resolved at launch time instead.)
             #[cfg(not(target_os = "windows"))]
             let has_resolvable_launch = hello
                 .launch
                 .as_deref()
-                .and_then(crate::library::launch_command)
+                .and_then(crate::library::resolve_launch)
+                .and_then(|t| t.command)
                 .is_some();
             #[cfg(target_os = "windows")]
             let has_resolvable_launch = false;

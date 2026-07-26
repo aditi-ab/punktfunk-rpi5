@@ -201,6 +201,11 @@ async fn h_launch(
                 session.height = h;
                 session.fps = f;
             }
+            // A new session starts undecided: whatever ended the last one says nothing about this
+            // one (see `AppState::quit`). The game this launch reclaims — if this client left one
+            // waiting out its reconnect window — is reprieved by the stream thread, which resolves
+            // the title anyway and so needs no second library scan here.
+            st.quit.store(false, std::sync::atomic::Ordering::SeqCst);
             *st.launch.lock().unwrap() = Some(session);
             tracing::info!(
                 w = session.width,
@@ -250,9 +255,12 @@ async fn h_cancel(
         tracing::warn!("cancel rejected — caller does not own the session");
         return xml(error_xml());
     }
-    // Quit semantics: the shared full teardown (launch cleared + both media threads stop on
-    // their flags) — the virtual output/gamescope teardown follows via the capturer's RAII.
-    st.end_session("client /cancel");
+    // Quit semantics, and now literally so: `/cancel` is Moonlight's "Quit App" — a decision, not a
+    // drop. The shared full teardown (launch cleared + both media threads stop on their flags) runs
+    // with the session's quit flag set, so the virtual display skips its keep-alive linger and the
+    // end-game-on-session-end policy treats this as the operator asking. The virtual
+    // output/gamescope teardown follows via the capturer's RAII.
+    st.quit_session("client /cancel");
     xml("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<root status_code=\"200\"><cancel>1</cancel></root>\n".to_string())
 }
 

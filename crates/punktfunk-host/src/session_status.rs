@@ -220,10 +220,38 @@ pub struct GameSnapshot {
     pub grace_remaining_s: Option<u64>,
 }
 
-/// Every launched game the host currently knows about: the live sessions' games first, then any game
-/// whose session has ended and which is waiting out its reconnect window before being ended.
+/// The compat plane's launched game, while it has one.
 ///
-/// The two sources are deliberately separate — a grace-pending game has no session to attribute it
+/// GameStream sessions are not in the live-session registry above — that registry holds the native
+/// loop's own `Arc` handles (mode, bitrate, the stop/quit flags), none of which the compat plane has.
+/// It is single-session by construction (one `AppState.launch`), so one slot is the whole story, and
+/// this is what keeps a Moonlight client's game visible on the Dashboard alongside a native one.
+fn gs_game() -> &'static Mutex<Option<Arc<crate::gamelease::LeaseShared>>> {
+    static SLOT: OnceLock<Mutex<Option<Arc<crate::gamelease::LeaseShared>>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(None))
+}
+
+/// Publish the compat plane's game for the status surface; the returned guard retracts it when the
+/// stream loop exits by any path (the plane's counterpart to [`LiveSessionGuard`]).
+pub fn publish_gamestream_game(shared: Arc<crate::gamelease::LeaseShared>) -> GamestreamGameGuard {
+    *gs_game().lock().unwrap_or_else(|e| e.into_inner()) = Some(shared);
+    GamestreamGameGuard
+}
+
+/// Clears the compat plane's published game on drop.
+pub struct GamestreamGameGuard;
+
+impl Drop for GamestreamGameGuard {
+    fn drop(&mut self) {
+        *gs_game().lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+}
+
+/// Every launched game the host currently knows about: the live sessions' games first, then the
+/// compat plane's, then any game whose session has ended and which is waiting out its reconnect
+/// window before being ended.
+///
+/// The sources are deliberately separate — a grace-pending game has no session to attribute it
 /// to, and hiding it would make "the host is about to close my game" invisible in the UI.
 pub fn games() -> Vec<GameSnapshot> {
     let mut out: Vec<GameSnapshot> = registry()
@@ -244,6 +272,24 @@ pub fn games() -> Vec<GameSnapshot> {
             })
         })
         .collect();
+    out.extend(
+        gs_game()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|g| GameSnapshot {
+                // The compat plane has no session id to attribute it to; the console tells it from a
+                // grace row by the state, which is never `grace` while a session is streaming it.
+                session_id: None,
+                client: g.client.clone(),
+                app_id: g.game.id.clone(),
+                title: g.game.title.clone(),
+                store: g.game.store.clone(),
+                plane: g.plane,
+                state: g.state().as_str(),
+                grace_remaining_s: None,
+            }),
+    );
     out.extend(
         crate::gamelease::pending_snapshot()
             .into_iter()
@@ -292,5 +338,59 @@ pub fn stop_all_quit() {
 pub fn force_idr_all() {
     for s in registry().lock().unwrap().iter() {
         s.force_idr.store(true, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A Moonlight client's game has no live-session entry to hang off, so without the compat-plane
+    /// slot it would be missing from `/status` entirely — the Dashboard would show a stream with no
+    /// game while one was plainly running. Publishing must also be strictly scoped to the stream: the
+    /// row has to vanish with the guard, or a finished session leaves a ghost game on the console.
+    #[test]
+    fn a_gamestream_game_is_visible_only_while_its_stream_runs() {
+        let id = "steam:1701";
+        let mine = || {
+            games()
+                .into_iter()
+                .find(|g| g.app_id.as_deref() == Some(id))
+        };
+
+        let lease = crate::gamelease::open(
+            crate::gamelease::LeaseRequest {
+                game: crate::gamelease::GameRef {
+                    id: Some(id.to_string()),
+                    store: Some("steam".into()),
+                    title: "Test Title".into(),
+                },
+                client: "192.0.2.7".into(),
+                plane: crate::events::Plane::Gamestream,
+                // No signals: an inert lease, so no watcher thread races this test's assertions.
+                spec: crate::library::DetectSpec::default(),
+                nested: false,
+                child: None,
+                launch_stamp: None,
+            },
+            Box::new(|| {}),
+        );
+        assert!(mine().is_none(), "not published yet");
+
+        {
+            let _pub = publish_gamestream_game(lease.shared());
+            let row = mine().expect("the compat plane's game is reported");
+            assert_eq!(
+                row.session_id, None,
+                "no live-session entry to attribute it to"
+            );
+            assert_eq!(row.plane, crate::events::Plane::Gamestream);
+            assert_eq!(row.client, "192.0.2.7");
+            assert_eq!(row.title, "Test Title");
+            // Never `grace` while the stream is up — that state is what the console keys its
+            // countdown and "End now" off.
+            assert_ne!(row.state, "grace");
+        }
+        assert!(mine().is_none(), "the row goes with the stream");
     }
 }

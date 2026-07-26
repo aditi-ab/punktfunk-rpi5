@@ -46,6 +46,21 @@ pub type CapturerSlot = Arc<std::sync::Mutex<Option<PooledCapturer>>>;
 /// control plane and drained by the video thread (see [`AppState::rfi_range`](super::AppState)).
 pub type RfiSlot = Arc<std::sync::Mutex<Option<(i64, i64)>>>;
 
+/// What the stream thread needs to give the launched game a lifetime
+/// (design/session-game-lifetime.md). Bundled because the three only exist together — the control
+/// plane builds them from the live `AppState` at RTSP PLAY, and the stream thread is where they are
+/// spent.
+pub struct GameLifetime {
+    /// The session's deliberate-quit flag ([`super::AppState::quit`]), read when the stream ends: a
+    /// decision may end the game, a drop gets a reconnect window first.
+    pub quit: Arc<AtomicBool>,
+    /// Hex cert fingerprint of the paired client that owns the launch, so only it can reclaim its own
+    /// game. `None` when the peer cert couldn't be read.
+    pub fingerprint: Option<String>,
+    /// Ends the whole session, deliberately — the action for "the launched game exited".
+    pub on_game_exit: super::OnSessionLost,
+}
+
 /// Spawn the video stream thread (idempotent via `running`). Stops when `running` clears.
 /// `force_idr` is set by the control stream on a client recovery request; `video_cap` holds
 /// the persistent capturer the thread borrows for the stream's duration.
@@ -59,6 +74,7 @@ pub fn start(
     video_cap: CapturerSlot,
     stats: Arc<crate::stats_recorder::StatsRecorder>,
     on_lost: super::OnSessionLost,
+    life: GameLifetime,
 ) {
     let _ = std::thread::Builder::new()
         .name("punktfunk-video".into())
@@ -110,6 +126,7 @@ pub fn start(
                 &video_cap,
                 &stats,
                 &on_lost,
+                &life,
             );
             // A clean return is a stop (RTSP teardown / cancel / client unreachable) → `quit`;
             // an error return is `error`. The compat plane can't tell a user stop from an idle
@@ -146,6 +163,8 @@ fn run(
     stats: &Arc<crate::stats_recorder::StatsRecorder>,
     // Whole-session teardown for the send thread's client-unreachable detection.
     on_lost: &super::OnSessionLost,
+    // The launched game's lifetime wiring (quit flag, launch owner, game-exit teardown).
+    life: &GameLifetime,
 ) -> Result<()> {
     // GameStream capture/encode thread: apply Windows session tuning (no-op off Windows).
     pf_frame::session_tuning::on_hot_thread();
@@ -185,6 +204,29 @@ fn run(
     // `video_cap`, since a reconnect at a different resolution needs a freshly-sized output; the
     // output is released when this capturer drops at stream end (RAII via its keepalive).
     if pf_host_config::config().video_source.as_deref() == Some("virtual") {
+        // Reference point for adopting the launched game's processes: anything the host will call
+        // "this session's game" has to have started after this instant. Taken HERE — before the prep
+        // steps, before the source (a bare-spawn gamescope nests the game inside it), before the
+        // launch — because a reading taken later would reject the very process it is meant to find.
+        // Erring early can only ever include more of our own launch, never a copy from before it.
+        let launch_stamp = crate::gamelease::launch_clock();
+        // Everything the host knows about the title being launched, resolved in ONE library scan:
+        // what to run, what to call it, and how to recognize it once it is up.
+        let target = resolve_gs_app(app);
+        // Moonlight has no session resume, so a client coming back for a game it left behind does it
+        // by launching the title again. Reprieve that game before anything starts, so the copy the
+        // player is about to be handed isn't killed out from under them when the old window closes.
+        if let Some(t) = target.as_ref() {
+            let reprieved =
+                crate::gamelease::readopt(life.fingerprint.as_deref(), t.game.id.as_deref());
+            if reprieved > 0 {
+                tracing::info!(
+                    reprieved,
+                    title = %t.game.title,
+                    "gamestream: this client came back for its game — keeping it"
+                );
+            }
+        }
         // Per-app prep steps (RFC §6): the entry's own `prep` plus a custom library title's,
         // run synchronously BEFORE the virtual output opens or anything launches (an HDR
         // toggle / sink switch must land first — and gamescope's nested launch happens inside
@@ -204,7 +246,8 @@ fn run(
         // exactly like the native plane), create a virtual output at the client mode, and capture it.
         // Re-runnable: the encode loop calls it again on a mid-stream capture loss to FOLLOW a
         // Desktop<->Game switch.
-        let (mut capturer, compositor) = open_gs_virtual_source(cfg, app)?;
+        let (mut capturer, compositor) =
+            open_gs_virtual_source(cfg, app, target.as_ref(), &life.quit)?;
         tracing::info!(
             ?compositor,
             app = ?app.map(|a| &a.title),
@@ -221,36 +264,105 @@ fn run(
         // existing title, never inject a command). An apps.json entry instead carries an
         // operator-typed `cmd`. Library id wins when both are set.
         #[cfg(windows)]
-        {
-            if let Some(lib_id) = app.and_then(|a| a.library_id.as_deref()) {
-                if let Err(e) = crate::library::launch_gamestream_library(lib_id) {
-                    tracing::warn!(library_id = lib_id, error = %e, "gamestream: could not launch library title");
-                }
-            } else if let Some(cmd) = app
-                .and_then(|a| a.cmd.as_deref())
-                .filter(|c| !c.trim().is_empty())
-            {
-                if let Err(e) = crate::library::launch_gamestream_command(cmd) {
-                    tracing::warn!(command = %cmd, error = %e, "gamestream: could not launch app");
-                }
+        if let Some(t) = target.as_ref() {
+            // A library title launches by its store-qualified id (the interactive-session spawner
+            // resolves the store's own recipe); an operator-typed command runs as itself.
+            let launched = match (t.game.id.as_deref(), t.command.as_deref()) {
+                (Some(id), _) => crate::library::launch_gamestream_library(id),
+                (None, Some(cmd)) => crate::library::launch_gamestream_command(cmd),
+                (None, None) => Ok(()),
+            };
+            if let Err(e) = launched {
+                tracing::warn!(title = %t.game.title, error = %e, "gamestream: could not launch app");
             }
         }
+        // Linux keeps the spawned child rather than dropping it: it is the primary liveness signal
+        // for a title whose store told us nothing else, and the handle the termination ladder
+        // signals. A gamescope bare spawn already nested the command (`set_launch_command` in the
+        // source open), so launching again would start it twice.
         #[cfg(target_os = "linux")]
-        if !crate::vdisplay::launch_is_nested(compositor) {
-            if let Some(cmd) = crate::library::resolve_session_launch(
-                app.and_then(|a| a.library_id.as_deref()),
-                app.and_then(|a| a.cmd.as_deref()),
-            ) {
-                if let Err(e) = crate::library::launch_session_command(compositor, &cmd) {
+        let spawned_launch = match target.as_ref().and_then(|t| t.command.as_deref()) {
+            Some(_) if crate::vdisplay::launch_is_nested(compositor) => None,
+            Some(cmd) => match crate::library::launch_session_command(compositor, cmd) {
+                Ok(spawned) => Some(spawned),
+                Err(e) => {
                     tracing::warn!(command = %cmd, error = %e, "gamestream: could not launch app");
+                    None
                 }
-            }
-        }
+            },
+            None => None,
+        };
+
+        // The launched game's lifetime, in both directions (design/session-game-lifetime.md) — the
+        // compat plane's half of what the native plane already does:
+        //
+        // * **its exit ends the session**, so Moonlight returns to its app list instead of leaving
+        //   the player on a bare desktop or a hidden launcher.
+        // * **this session ending can end it** — never by default; only when the operator asked, and
+        //   for a mere drop only after a reconnect window (the guard's drop). Moonlight can't resume
+        //   a session, but the window still protects unsaved progress on a network blip, and a
+        //   relaunch of the same title reclaims the game (above).
+        let _game_life = target.as_ref().map(|t| {
+            #[cfg(target_os = "linux")]
+            let nested = crate::vdisplay::launch_is_nested(compositor);
+            #[cfg(not(target_os = "linux"))]
+            let nested = false;
+            #[cfg(target_os = "linux")]
+            let child = spawned_launch.map(|s| (s.child, s.group_leader));
+            #[cfg(not(target_os = "linux"))]
+            let child = None;
+
+            let on_exit: crate::gamelease::OnExit = {
+                let on_game_exit = life.on_game_exit.clone();
+                Box::new(move || {
+                    // Read the setting at fire time, so flipping it mid-session takes effect. The
+                    // lease itself keeps running either way — the status surface still reports the
+                    // game.
+                    if !crate::session_settings::get().session_on_game_exit {
+                        tracing::info!(
+                            "the launched game exited, but ending the session on game exit is off — \
+                             leaving the stream up"
+                        );
+                        return;
+                    }
+                    tracing::info!("the launched game exited — ending the session");
+                    // Deliberate: the player finished. The display skips its keep-alive linger and
+                    // the launch state is cleared, so Moonlight's next `/launch` starts cleanly.
+                    on_game_exit();
+                })
+            };
+            let lease = crate::gamelease::open(
+                crate::gamelease::LeaseRequest {
+                    game: t.game.clone(),
+                    // RTSP carries no client device name, so the peer IP is the best label there is
+                    // (the same one the stats capture uses).
+                    client: client_label.clone(),
+                    plane: crate::events::Plane::Gamestream,
+                    spec: t.detect.clone(),
+                    nested,
+                    child,
+                    launch_stamp,
+                },
+                on_exit,
+            );
+            // Declared first so it drops first: the console loses the live row before the policy
+            // below can replace it with a `grace` one, rather than briefly showing both.
+            let published = crate::session_status::publish_gamestream_game(lease.shared());
+            (
+                published,
+                crate::gamelease::SessionGuard::new(
+                    lease,
+                    life.quit.clone(),
+                    life.fingerprint.clone(),
+                ),
+            )
+        });
         // Rebuild closure: re-open the source on a mid-stream capture loss, RE-DETECTING the live
         // compositor — so a Desktop<->Game switch (at the client's fixed mode) is FOLLOWED in place
         // without a Moonlight reconnect. (A resolution change can't be followed mid-stream on
         // GameStream — WxH is locked at ANNOUNCE — but a session toggle keeps the negotiated mode.)
-        let rebuild = || open_gs_virtual_source(cfg, app).map(|(c, _)| c);
+        let rebuild =
+            || open_gs_virtual_source(cfg, app, target.as_ref(), &life.quit).map(|(c, _)| c);
         return stream_body(
             &mut capturer,
             Some(&rebuild),
@@ -366,6 +478,64 @@ fn run(
     result
 }
 
+/// What the compat plane resolved about the app a client launched: identity for the lease, the status
+/// surface and the `game.*` events; the signals that recognize the running game; and the command to
+/// run it.
+struct GsApp {
+    game: crate::gamelease::GameRef,
+    detect: crate::library::DetectSpec,
+    /// The resolved shell command. `Some` on Linux, which runs it itself; `None` for a Windows
+    /// library title, which launches by id through the interactive-session spawner instead.
+    command: Option<String>,
+}
+
+/// Resolve a `/launch`ed catalog entry against the host's **own** library — the client sends only an
+/// appid, and everything the session does with the title afterwards comes from what the host knows
+/// about it.
+///
+/// A library pick carries its store's detect signals. An operator-typed `apps.json` command has no
+/// library entry behind it, so its title is the whole identity and its own first token — when that is
+/// an absolute executable — the only signal there is; the host spawns it directly anyway, so the child
+/// is the primary tracking either way. `None` = nothing to launch (Desktop, or an unresolvable entry).
+fn resolve_gs_app(app: Option<&super::apps::AppEntry>) -> Option<GsApp> {
+    let app = app?;
+    if let Some(id) = app.library_id.as_deref() {
+        match crate::library::resolve_launch(id) {
+            Some(t) => {
+                return Some(GsApp {
+                    game: t.game,
+                    detect: t.detect,
+                    command: t.command,
+                })
+            }
+            // Same fallback (and same warning) the plain command resolution has always had, so a
+            // client picking a stale title sees why nothing started.
+            None => tracing::warn!(
+                launch_id = id,
+                "requested launch id not in this host's library (or no launch recipe) — ignoring"
+            ),
+        }
+    }
+    let cmd = app
+        .cmd
+        .as_deref()
+        .map(str::trim)
+        .filter(|c| !c.is_empty())?;
+    Some(GsApp {
+        game: crate::gamelease::GameRef {
+            id: None,
+            store: None,
+            title: if app.title.trim().is_empty() {
+                cmd.to_string()
+            } else {
+                app.title.clone()
+            },
+        },
+        detect: crate::library::spec_from_command(cmd),
+        command: Some(cmd.to_string()),
+    })
+}
+
 /// Open the virtual-display video source for a GameStream session: pick the LIVE compositor + normalize
 /// the session env (apply_session_env/apply_input_env — gamescope ATTACH/resize, KWin/Mutter
 /// retargeting) exactly like the native plane (native.rs resolve_compositor), create a virtual
@@ -377,6 +547,12 @@ fn run(
 fn open_gs_virtual_source(
     cfg: StreamConfig,
     app: Option<&super::apps::AppEntry>,
+    // The resolved title (see [`resolve_gs_app`]) — its command is what a bare-spawn gamescope nests
+    // and what decides whether this session is a dedicated game session at all. Resolved once by the
+    // caller, so a mid-stream rebuild can't re-resolve to something different.
+    launch: Option<&GsApp>,
+    // The session's deliberate-quit flag, handed to the display's keep-alive lease.
+    quit: &Arc<AtomicBool>,
 ) -> Result<(Box<dyn Capturer>, crate::vdisplay::Compositor)> {
     let compositor = if let Some(c) = app.and_then(|a| a.compositor) {
         c
@@ -403,11 +579,7 @@ fn open_gs_virtual_source(
             // id / apps.json command), under `game_session=dedicated` with gamescope available, gets its
             // own headless gamescope spawn at the client mode — same routing as the native plane. Gate on
             // the resolved command so an unresolvable entry falls back to auto routing (review #9).
-            let has_launch = crate::library::resolve_session_launch(
-                app.and_then(|a| a.library_id.as_deref()),
-                app.and_then(|a| a.cmd.as_deref()),
-            )
-            .is_some();
+            let has_launch = launch.and_then(|t| t.command.as_deref()).is_some();
             if crate::vdisplay::wants_dedicated_game_session(has_launch) {
                 crate::vdisplay::apply_input_env(crate::vdisplay::Compositor::Gamescope, true);
                 crate::vdisplay::Compositor::Gamescope
@@ -428,10 +600,7 @@ fn open_gs_virtual_source(
     // library title exactly like an apps.json command (it previously nested only `cmd`, silently
     // dropping library picks).
     #[cfg(target_os = "linux")]
-    vd.set_launch_command(crate::library::resolve_session_launch(
-        app.and_then(|a| a.library_id.as_deref()),
-        app.and_then(|a| a.cmd.as_deref()),
-    ));
+    vd.set_launch_command(launch.and_then(|t| t.command.clone()));
     #[cfg(not(target_os = "linux"))]
     vd.set_launch_command(app.and_then(|a| a.cmd.clone()));
     // Serialize with the punktfunk/1 plane's IDD-push setup dance (Goal-1 §2.5). A GameStream
@@ -461,10 +630,11 @@ fn open_gs_virtual_source(
             height: cfg.height,
             refresh_hz: cfg.fps,
         },
-        // GameStream's deliberate quit is the Moonlight "Quit App" (nvhttp `h_cancel`), not a QUIC
-        // close code — wiring it to skip-linger is a follow-up, so this path keeps normal keep-alive
-        // (a fresh, never-set flag).
-        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        // GameStream's deliberate quit is the Moonlight "Quit App" (nvhttp `h_cancel`), the
+        // management stop, or the launched game exiting — not a QUIC close code. All three set the
+        // session's quit flag ([`super::AppState::quit`]), so the display skips its keep-alive linger
+        // for a stop the way it does on the native plane, and only a real drop lingers.
+        quit.clone(),
         None, // fresh session — no display superseded
     )
     .context("create virtual output at client resolution")?;
@@ -1228,6 +1398,49 @@ fn stream_body(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn entry(title: &str, cmd: Option<&str>) -> super::super::apps::AppEntry {
+        super::super::apps::AppEntry {
+            id: 1,
+            title: title.to_string(),
+            compositor: None,
+            cmd: cmd.map(str::to_string),
+            library_id: None,
+            prep: Vec::new(),
+        }
+    }
+
+    /// What the compat plane decides to track. The negative cases are the load-bearing ones: a
+    /// Desktop entry launches nothing, so it must take no lease at all — the feature has to stay
+    /// completely inert for a plain desktop stream.
+    #[test]
+    fn only_an_entry_that_launches_something_gets_tracked() {
+        // Nothing selected (no `/launch` app) → nothing to track.
+        assert!(resolve_gs_app(None).is_none());
+        // Desktop: a title with no command and no library id.
+        assert!(resolve_gs_app(Some(&entry("Desktop", None))).is_none());
+        // A blank command is the same as none.
+        assert!(resolve_gs_app(Some(&entry("Blank", Some("   ")))).is_none());
+
+        // An operator-typed apps.json command: no library entry behind it, so the title is the whole
+        // identity and there is no store-qualified id for the console to match box art on.
+        let t = resolve_gs_app(Some(&entry(
+            "Steam Big Picture",
+            Some("  steam -gamepadui  "),
+        )))
+        .expect("a command entry is tracked");
+        assert_eq!(t.command.as_deref(), Some("steam -gamepadui"));
+        assert_eq!(t.game.id, None);
+        assert_eq!(t.game.store, None);
+        assert_eq!(t.game.title, "Steam Big Picture");
+        // `steam` is a PATH lookup, not an absolute executable, so nothing is asserted about the
+        // process — the host's own child is what tracks it (see `library::spec_from_command`).
+        assert!(t.detect.is_empty());
+
+        // A titleless entry still shows up as something a human can read.
+        let t = resolve_gs_app(Some(&entry("", Some("/opt/game/run")))).expect("tracked");
+        assert_eq!(t.game.title, "/opt/game/run");
+    }
 
     /// End-to-end check of the send thread: batches pushed on the channel arrive, complete and
     /// byte-identical, at a peer socket via the paced sendmmsg path.

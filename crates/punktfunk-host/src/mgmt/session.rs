@@ -22,7 +22,7 @@ use std::sync::atomic::Ordering;
     )
 )]
 pub(crate) async fn stop_session(State(st): State<Arc<MgmtState>>) -> StatusCode {
-    let was_streaming = st.app.end_session("management API stop");
+    let was_streaming = st.app.quit_session("management API stop");
     // Native plane: the GameStream teardown above doesn't reach it (it runs its own loops off the shared
     // session registry), so signal every live native session to tear down too.
     let native = crate::session_status::count();

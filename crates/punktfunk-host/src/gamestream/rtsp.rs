@@ -279,6 +279,20 @@ fn handle_request(req: &Request, state: &Arc<AppState>, peer: Option<SocketAddr>
                         state.video_cap.clone(),
                         state.stats.clone(),
                         on_lost.clone(),
+                        // The launched game's lifetime wiring. A game *exiting* is a deliberate end
+                        // (the player finished) — the same distinction the native plane draws with
+                        // its close code, and what the end-game-on-session-end policy keys off at
+                        // teardown.
+                        stream::GameLifetime {
+                            quit: state.quit.clone(),
+                            fingerprint: ls.owner_fp.map(hex::encode),
+                            on_game_exit: {
+                                let st = state.clone();
+                                Arc::new(move || {
+                                    st.quit_session("game exited");
+                                })
+                            },
+                        },
                     );
                 }
                 Some(_) => tracing::info!("RTSP PLAY — stream already running"),

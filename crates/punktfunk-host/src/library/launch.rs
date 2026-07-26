@@ -8,24 +8,6 @@ use super::*;
 #[cfg(windows)]
 use super::{epic::epic_launch_uri, gog::gog_spawn};
 
-/// Resolve a store-qualified library id (as sent by a client in `Hello::launch`) to the shell
-/// command the host should run for it — looked up in the host's OWN library so a client can only
-/// pick an existing title, never inject a command. `None` = unknown id, no launch recipe, or a
-/// malformed Steam appid.
-///
-/// **Linux only**: the resolved command is run nested inside the per-session gamescope. On Windows
-/// there is no gamescope to nest into; the host launches a title into the interactive user session
-/// via [`launch_title`] instead.
-///
-/// - `steam_appid` → `steam steam://rungameid/<appid>` (appid validated as digits).
-/// - `command` → the stored command verbatim. This string comes from the host's own custom store
-///   (added by the host operator via the admin UI), never from the client, so it is trusted.
-#[cfg(not(windows))]
-pub fn launch_command(id: &str) -> Option<String> {
-    let spec = all_games().into_iter().find(|g| g.id == id)?.launch?;
-    command_for(&spec)
-}
-
 /// Everything a session needs about the title it is launching, resolved in **one** library scan:
 /// what to run, what to call it, and how to recognize it once it is running.
 ///
@@ -42,11 +24,17 @@ pub struct LaunchTarget {
     pub command: Option<String>,
 }
 
-/// Resolve a store-qualified library id (as sent by a client in `Hello::launch`) against the host's
-/// **own** library. `None` = unknown id, or — on Linux — a title with no runnable recipe.
+/// Resolve a store-qualified library id (as sent by a client in `Hello::launch`, or carried on a
+/// GameStream catalog entry) against the host's **own** library — so a client can only pick an
+/// existing title, never inject a command. `None` = unknown id, or — on Linux — a title with no
+/// runnable recipe.
 ///
-/// This is the single lookup: the client sends only an id, and everything the session does with the
-/// title afterwards comes from what the host itself knows about it.
+/// This is the single lookup, shared by both planes: the client sends only an id, and everything the
+/// session does with the title afterwards comes from what the host itself knows about it.
+///
+/// **Linux**: the resolved command is run by the host (nested into a per-session gamescope, or
+/// spawned into the live session). **Windows** has no gamescope to nest into and resolves the
+/// concrete process at launch time instead, via [`launch_title`].
 pub fn resolve_launch(id: &str) -> Option<LaunchTarget> {
     let entry = all_games().into_iter().find(|g| g.id == id)?;
     let game = crate::gamelease::GameRef {
@@ -79,7 +67,11 @@ pub fn resolve_launch(id: &str) -> Option<LaunchTarget> {
 }
 
 /// Map a resolved [`LaunchSpec`] to its shell command (pure — the unit-testable core of
-/// [`launch_command`], split out so the appid-validation can be tested without a Steam install).
+/// [`resolve_launch`], split out so the appid-validation can be tested without a Steam install).
+///
+/// - `steam_appid` → `steam steam://rungameid/<appid>` (appid validated as digits).
+/// - `command` → the stored command verbatim. This string comes from the host's own custom store
+///   (added by the host operator via the admin UI), never from the client, so it is trusted.
 #[cfg(not(windows))]
 fn command_for(spec: &LaunchSpec) -> Option<String> {
     match spec.kind.as_str() {
@@ -99,7 +91,7 @@ fn command_for(spec: &LaunchSpec) -> Option<String> {
 }
 
 /// Windows: launch a store-qualified library id into the **interactive user session** — the Windows
-/// analogue of the Linux gamescope-nested [`launch_command`]. The id is resolved against the host's
+/// analogue of the Linux gamescope-nested [`resolve_launch`]. The id is resolved against the host's
 /// OWN library (the client never sends a command), mapped to a concrete process by
 /// [`windows_launch_for`], and spawned via [`crate::interactive::spawn_in_active_session`].
 ///
@@ -218,7 +210,7 @@ pub fn launch_gamestream_command(cmd: &str) -> Result<()> {
 /// on the `AppEntry`, resolved from the numeric Moonlight appid) into the interactive Windows user
 /// session ([`launch_title`]). The id is resolved against the host's OWN library, so a client can
 /// only ever pick an existing title — never inject a command. Linux resolves the id via
-/// [`launch_command`] and goes through [`launch_session_command`] instead.
+/// [`resolve_launch`] and goes through [`launch_session_command`] instead.
 #[cfg(windows)]
 pub fn launch_gamestream_library(id: &str) -> Result<()> {
     launch_title(id)
@@ -242,7 +234,7 @@ pub struct SpawnedLaunch {
 /// Launch a resolved shell command into the **live Linux session** for the session's compositor —
 /// the one launch entry point shared by the native (punktfunk/1) and GameStream planes, called
 /// AFTER capture is up so the app renders onto the streamed output. The command is host-resolved
-/// (a library id via [`launch_command`], or an operator-typed apps.json/custom command) — never a
+/// (a library id via [`resolve_launch`], or an operator-typed apps.json/custom command) — never a
 /// client-sent string. Best-effort by contract: a failure leaves the user on the (streamed)
 /// desktop/session rather than tearing the stream down.
 ///
@@ -291,26 +283,6 @@ pub fn launch_session_command(
         child,
         group_leader,
     })
-}
-
-/// Resolve the launch command for a session app selection on Linux: a store-qualified library id
-/// (from either plane) wins, else the operator-typed command. `None` = nothing to launch (or an
-/// unknown/recipe-less id — warned, so a client picking a stale title sees why nothing started).
-#[cfg(target_os = "linux")]
-pub fn resolve_session_launch(library_id: Option<&str>, command: Option<&str>) -> Option<String> {
-    if let Some(id) = library_id {
-        match launch_command(id) {
-            Some(cmd) => return Some(cmd),
-            None => tracing::warn!(
-                launch_id = id,
-                "requested launch id not in this host's library (or no launch recipe) — ignoring"
-            ),
-        }
-    }
-    command
-        .map(str::trim)
-        .filter(|c| !c.is_empty())
-        .map(str::to_string)
 }
 
 #[cfg(test)]

@@ -879,30 +879,6 @@ fn session_watcher_loop(tx: std::sync::mpsc::Sender<SessionSwitch>, stop: Arc<At
     }
 }
 
-/// Applies the end-game-on-session-end policy when the session's video loop exits, whichever way it
-/// exits (`return`, `?`, a `break` out of the loop, panic-unwind) — the same RAII shape the per-title
-/// prep/undo guard uses, for the same reason: teardown paths are many and easy to miss one of.
-///
-/// Reading `quit` at **drop** time is the point: it is what distinguishes a client that deliberately
-/// stopped (or an operator who did) from one that merely vanished, and that distinction is the whole
-/// safety story for `Always` — a vanish gets a reconnect window, a deliberate stop does not.
-struct GameLifetime {
-    lease: crate::gamelease::GameLease,
-    quit: Arc<AtomicBool>,
-    /// Hex client fingerprint, so a reconnecting client can reclaim its own game and nothing else.
-    fingerprint: Option<String>,
-}
-
-impl Drop for GameLifetime {
-    fn drop(&mut self) {
-        crate::gamelease::on_session_end(
-            &self.lease,
-            self.quit.load(Ordering::SeqCst),
-            self.fingerprint.as_deref(),
-        );
-    }
-}
-
 /// All per-session inputs for [`virtual_stream`], bundled so the session entry
 /// is one moved value instead of a 13-positional-argument `#[allow(too_many_arguments)]` signature
 /// (Goal-1 stage 4, plan §2.4). Everything is **owned** — the receivers move in (`virtual_stream` is their
@@ -1328,10 +1304,12 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
     // order): `session.ended` fires first, then the game policy runs — the order an operator reading
     // the log expects. The fingerprint is what lets a reconnecting client reclaim its own game and
     // nothing else.
-    let _game_life = game_lease.map(|lease| GameLifetime {
-        lease,
-        quit: quit.clone(),
-        fingerprint: endpoint::peer_fingerprint(&conn).map(hex::encode),
+    let _game_life = game_lease.map(|lease| {
+        crate::gamelease::SessionGuard::new(
+            lease,
+            quit.clone(),
+            endpoint::peer_fingerprint(&conn).map(hex::encode),
+        )
     });
 
     let perf = pf_host_config::config().perf;

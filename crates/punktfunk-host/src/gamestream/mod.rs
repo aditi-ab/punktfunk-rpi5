@@ -156,6 +156,15 @@ pub struct AppState {
     pub audio_params: std::sync::Mutex<audio::AudioParams>,
     /// True while the video stream thread is running (also its keep-running flag).
     pub streaming: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Whether the current session is ending **deliberately** — the compat plane's answer to the
+    /// native plane's `QUIT_CODE` close, which RTSP has no equivalent of.
+    ///
+    /// Set by the three things that mean "this is over": the client's `/cancel` (Moonlight's Quit
+    /// App), the management API's stop, and the launched game exiting. An ENet vanish or an
+    /// unreachable client leaves it clear — those are drops, and the difference decides whether the
+    /// virtual display skips its keep-alive linger and whether the end-game policy sees an intent or
+    /// a network blip. Cleared by `/launch`, which is where a session begins.
+    pub quit: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// True while the audio stream thread is running (also its keep-running flag).
     pub audio_streaming: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Set by the control stream when the client requests an IDR / invalidates reference
@@ -222,6 +231,17 @@ impl AppState {
         was_streaming
     }
 
+    /// End the session as a **decision** rather than a drop: mark it deliberate, then tear it down.
+    ///
+    /// This is what a client's `/cancel`, the management stop, and a launched game's exit all use.
+    /// The flag is read by the virtual display's keep-alive lease (skip the linger — nobody is coming
+    /// back) and, at the video thread's teardown, by the end-game-on-session-end policy (which gives a
+    /// mere drop a reconnect window first). See [`AppState::quit`].
+    pub(crate) fn quit_session(&self, reason: &str) -> bool {
+        self.quit.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.end_session(reason)
+    }
+
     /// Fresh control-plane state: no active session; the pairing allow-list is loaded from
     /// disk (pairings persist across restarts). `stats` is the shared recorder handed to both the
     /// mgmt API and the streaming loops.
@@ -239,6 +259,7 @@ impl AppState {
             stream: std::sync::Mutex::new(None),
             audio_params: std::sync::Mutex::new(audio::AudioParams::default()),
             streaming: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            quit: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             audio_streaming: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             force_idr: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             rfi_range: std::sync::Arc::new(std::sync::Mutex::new(None)),
@@ -528,6 +549,32 @@ mod session_tests {
 
         // Idempotent: a second end (e.g. `/cancel` racing the ENet Disconnect) is a no-op.
         assert!(!state.end_session("test again"));
+    }
+
+    /// The compat plane has no close code, so the difference between "the player stopped" and "the
+    /// client vanished" lives entirely in this flag — and it decides whether a display lingers and
+    /// whether an operator's end-game policy sees a decision or a network blip. A teardown that
+    /// forgets to set it silently downgrades a deliberate stop to a drop.
+    #[test]
+    fn quit_marks_a_teardown_deliberate_and_a_plain_end_does_not() {
+        use std::sync::atomic::Ordering;
+        let state = test_state();
+        assert!(
+            !state.quit.load(Ordering::SeqCst),
+            "a fresh session is undecided"
+        );
+
+        // A drop (ENet vanish / unreachable client) must leave it clear.
+        state.streaming.store(true, Ordering::SeqCst);
+        state.end_session("client unreachable");
+        assert!(!state.quit.load(Ordering::SeqCst));
+
+        // `/cancel`, the management stop and a game exiting all go through `quit_session`.
+        state.streaming.store(true, Ordering::SeqCst);
+        assert!(state.quit_session("client /cancel"), "video was live");
+        assert!(state.quit.load(Ordering::SeqCst));
+        // …and it still performs the full teardown.
+        assert!(!state.streaming.load(Ordering::SeqCst));
     }
 }
 

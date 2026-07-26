@@ -950,6 +950,51 @@ pub fn on_session_end(lease: &GameLease, deliberate: bool, fingerprint: Option<&
     }
 }
 
+/// Applies [`on_session_end`] when a session's stream loop exits, whichever way it exits (`return`,
+/// `?`, a `break` out of the loop, a panic-unwind) — the same RAII shape the per-title prep/undo
+/// guard uses, for the same reason: teardown paths are many and easy to miss one of.
+///
+/// Reading `quit` at **drop** time is the point: it is what distinguishes a client that deliberately
+/// stopped (or an operator who did) from one that merely vanished, and that distinction is the whole
+/// safety story for [`GameOnSessionEnd::Always`](crate::session_settings::GameOnSessionEnd::Always) —
+/// a vanish gets a reconnect window, a deliberate stop does not.
+///
+/// Both planes use it, so "the session ended" means the same thing to a game whichever way the client
+/// was talking to the host.
+pub struct SessionGuard {
+    lease: GameLease,
+    quit: Arc<AtomicBool>,
+    /// Hex client fingerprint, so a reconnecting client can reclaim its own game and nothing else.
+    fingerprint: Option<String>,
+}
+
+impl SessionGuard {
+    /// Bind `lease` to the calling session's lifetime. `quit` is the session's deliberate-stop flag,
+    /// read at drop; `fingerprint` identifies the client allowed to reclaim the game on reconnect.
+    pub fn new(lease: GameLease, quit: Arc<AtomicBool>, fingerprint: Option<String>) -> Self {
+        Self {
+            lease,
+            quit,
+            fingerprint,
+        }
+    }
+
+    /// The lease's shared state, for the status surface.
+    pub fn shared(&self) -> Arc<LeaseShared> {
+        self.lease.shared()
+    }
+}
+
+impl Drop for SessionGuard {
+    fn drop(&mut self) {
+        on_session_end(
+            &self.lease,
+            self.quit.load(Ordering::SeqCst),
+            self.fingerprint.as_deref(),
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
