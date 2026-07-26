@@ -45,7 +45,7 @@ export default definePluginKit({
 | `HostClient`, `PluginInfo` | the `pf` facade as services (`request` = the skew-safe untyped seam) |
 | `makeConfigService` | Schema-driven config: raw shape on disk, defaults ONLY in the Schema (`withDecodingDefaultKey` + `encodingStrategy: "omit"`), atomic writes, world-writable refusal, `changes` stream |
 | `makeCacheStore` | disposable derived state (corrupt/absent → empty, write-through) |
-| `ProviderClient` + wire schemas | typed library-provider reconcile over the untyped wire |
+| `ProviderClient` + wire schemas | typed library-provider reconcile over the untyped wire — including the optional `detect` hint (see below) |
 | `makeSyncEngine` | poll + fs-watch + debounce + single-flight coalescing + fingerprint skip + status feed |
 | `serveUi` / `httpApiEnv` | an `effect/unstable/httpapi` HttpApi behind the SDK's `servePluginUi`, core-only layers |
 | `sseRoute` | the status SSE endpoint (httpapi has no event-stream media type) |
@@ -53,6 +53,27 @@ export default definePluginKit({
 | `loggingLayer` | runner-journal line format |
 | `@punktfunk/plugin-kit/react` | browser glue: `createPluginRouter` (path→hash→fallback deep-link restore + `pf-ui:navigate`), `resolvePluginBase`, `useIsEmbedded`, `ResultGate`, `sseAtom` |
 | `@punktfunk/plugin-kit/theme.css` | the console's violet identity for plugin UIs (import first in your Tailwind entry) |
+
+## Telling the host how to recognize a running title (`detect`)
+
+A `ProviderEntry` may carry an optional `detect` hint:
+
+```ts
+{ external_id: "playnite:9f2…", title: "Hades",
+  launch: { kind: "command", value: "playnite://playnite/start/9f2…" },
+  detect: { install_dir: "D:\\Games\\Hades" } }
+```
+
+It is what lets the host tell that the *game* has exited — which ends the streaming session, so the
+player's client returns to its library instead of showing a bare desktop — and what lets an operator
+who opted into it end the game when the session ends.
+
+Omit it and nothing breaks: the host tracks the process it spawns for your launch command. It matters
+when that command **hands off and exits** — a launcher client, `flatpak run`, a front-end that starts
+an emulator — because then there is nothing left for the host to watch, and both behaviors go quiet
+for that title. Send whatever you genuinely know; `install_dir` is the one to send if you send only
+one, since any process running from under it counts as the game. The host never lets a hint override
+what it worked out itself, and never adopts a process that was already running before the launch.
 
 ## Publishing
 

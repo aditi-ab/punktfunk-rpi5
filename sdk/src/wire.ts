@@ -43,6 +43,22 @@ export const DeviceRef = S.Struct({
 });
 export type DeviceRef = S.Schema.Type<typeof DeviceRef>;
 
+/** A launched game, as the `game.*` events identify it. */
+export const GameRef = S.Struct({
+	/** Store-qualified library id (`steam:570`). Absent for an operator-typed GameStream command. */
+	app: S.optional(S.String),
+	title: S.String,
+	store: S.optional(S.String),
+	/** Client-supplied device name of the session that launched it; may be empty. */
+	client: S.String,
+	plane: Plane,
+});
+export type GameRef = S.Schema.Type<typeof GameRef>;
+
+/** Why a launched game is no longer running. */
+export const GameEndReason = S.Literals(["exited", "terminated"]);
+export type GameEndReason = S.Schema.Type<typeof GameEndReason>;
+
 /** The `{seq, ts_ms, schema}` envelope every event carries. */
 const envelope = {
 	seq: S.Number,
@@ -80,6 +96,26 @@ export const StreamStopped = S.Struct({
 	...envelope,
 	kind: S.Literal("stream.stopped"),
 	stream: StreamRef,
+});
+/**
+ * A launched game's process was seen running — not merely its launcher spawned. Fires once per
+ * session that launched a title.
+ */
+export const GameRunning = S.Struct({
+	...envelope,
+	kind: S.Literal("game.running"),
+	game: GameRef,
+});
+/**
+ * A launched game is gone. `reason` separates the player quitting (`exited` — which is what ends the
+ * streaming session, when that is enabled) from the host ending it per the lifetime policy
+ * (`terminated`).
+ */
+export const GameExited = S.Struct({
+	...envelope,
+	kind: S.Literal("game.exited"),
+	game: GameRef,
+	reason: GameEndReason,
 });
 export const PairingPending = S.Struct({
 	...envelope,
@@ -131,6 +167,8 @@ export const HostEvent = S.Union([
 	SessionEnded,
 	StreamStarted,
 	StreamStopped,
+	GameRunning,
+	GameExited,
 	PairingPending,
 	PairingCompleted,
 	PairingDenied,

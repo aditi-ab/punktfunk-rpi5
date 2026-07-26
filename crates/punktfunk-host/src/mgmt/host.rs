@@ -207,6 +207,13 @@ pub(crate) struct LocalSummary {
     /// the tray/console surface them so the clash is visible before pairing silently fails.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     conflicts: Vec<String>,
+    /// Launched games the host is tracking, as compact labels (`Hades`, `Hades (closing in 4:12)`).
+    ///
+    /// The countdown form is the one that matters: it means the game's client is gone and the host
+    /// will end the game when the window closes — something a user at the machine should be able to
+    /// see (and stop) without opening the console. Empty when nothing was launched.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    games: Vec<String>,
 }
 
 /// Liveness probe
@@ -489,5 +496,12 @@ pub(crate) async fn get_local_summary(State(st): State<Arc<MgmtState>>) -> Json<
         // Cached at `serve` startup (empty when nothing was detected / never scanned) — no per-poll
         // process enumeration.
         conflicts: crate::detect::summary_labels(crate::detect::snapshot()),
+        games: crate::session_status::games()
+            .into_iter()
+            .map(|g| match g.grace_remaining_s {
+                Some(left) => format!("{} (closing in {}:{:02})", g.title, left / 60, left % 60),
+                None => g.title,
+            })
+            .collect(),
     })
 }

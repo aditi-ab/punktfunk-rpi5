@@ -45,6 +45,15 @@ pub struct DetectSpec {
     /// The game's install directory — the universal recipe. A process whose image path (or, for
     /// Proton/Wine, whose command line) sits under this directory is part of the game.
     pub install_dir: Option<PathBuf>,
+    /// The game's executable **file name** (`Hades.exe`, `retroarch`), matched case-insensitively
+    /// against a process's image name and nothing else.
+    ///
+    /// The weakest signal here, and the only one an operator supplies by hand
+    /// ([`super::DetectHint`]): a bare name says nothing about *which* copy is running. It is offered
+    /// because the entries that need it — an emulator launched through a front-end, a game whose
+    /// launcher relocates it — often expose nothing sharper, and because "started after this launch"
+    /// still bounds it: a copy the player already had open is never adopted.
+    pub process_name: Option<String>,
 }
 
 impl DetectSpec {
@@ -54,6 +63,7 @@ impl DetectSpec {
             && self.env_marker.is_none()
             && self.exe.is_none()
             && self.install_dir.is_none()
+            && self.process_name.is_none()
     }
 
     /// Just a Steam appid (the manifest path; art/shortcut scanning fills the rest).
@@ -94,6 +104,77 @@ impl DetectSpec {
             value,
         });
         self
+    }
+
+    /// Fill in whatever this spec doesn't already know from an operator/provider hint.
+    ///
+    /// The host's own findings win: a hint is a fallback for a title the scanners couldn't pin down,
+    /// never a way to redirect the matcher away from what the store actually reported.
+    pub fn or_hint(mut self, hint: &DetectHint) -> Self {
+        let from = Self::from(hint);
+        self.install_dir = self.install_dir.or(from.install_dir);
+        self.exe = self.exe.or(from.exe);
+        self.process_name = self.process_name.or(from.process_name);
+        self
+    }
+}
+
+/// What an operator (or a provider plugin) can tell the host about recognizing a title — the wire
+/// half of [`DetectSpec`], and the only part of it that is ever accepted from outside.
+///
+/// Deliberately a **subset**: the store-derived signals (a Steam appid, a launcher's environment
+/// marker) are things the host discovers for itself and would be meaningless — or dangerous — to take
+/// on someone's word. What is left is what a provider genuinely knows and the host cannot guess: where
+/// the title is installed, which executable is the game, what the process is called. All three are
+/// optional; supplying none is the same as supplying no hint at all.
+///
+/// Never returned by the catalog API — see the module docs on why detect data does not cross the wire
+/// outbound.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct DetectHint {
+    /// Where the title is installed. Any process running from under this directory is part of the
+    /// game — the universal recipe, and the one worth supplying if you supply only one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub install_dir: Option<String>,
+    /// The game's own executable, as an absolute path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exe: Option<String>,
+    /// The executable's file name (`Hades.exe`), when its location isn't fixed. Weakest of the three
+    /// — see [`DetectSpec::process_name`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_name: Option<String>,
+}
+
+impl DetectHint {
+    /// Whether the hint says anything at all (all-empty is treated as absent).
+    pub fn is_empty(&self) -> bool {
+        self.trimmed().is_none()
+    }
+
+    /// The hint with blank fields dropped, or `None` if nothing is left. Console text inputs and
+    /// hand-written plugin payloads both produce `""` for "not set", and an empty install dir would
+    /// otherwise match *every* process on the box.
+    fn trimmed(&self) -> Option<(Option<&str>, Option<&str>, Option<&str>)> {
+        fn f(s: &Option<String>) -> Option<&str> {
+            s.as_deref().map(str::trim).filter(|v| !v.is_empty())
+        }
+        let (dir, exe, name) = (f(&self.install_dir), f(&self.exe), f(&self.process_name));
+        (dir.is_some() || exe.is_some() || name.is_some()).then_some((dir, exe, name))
+    }
+}
+
+/// A provider's hint becomes a spec — the one inbound path into [`DetectSpec`].
+impl From<&DetectHint> for DetectSpec {
+    fn from(h: &DetectHint) -> Self {
+        let Some((install_dir, exe, process_name)) = h.trimmed() else {
+            return Self::default();
+        };
+        Self {
+            install_dir: install_dir.map(PathBuf::from),
+            exe: exe.map(PathBuf::from),
+            process_name: process_name.map(str::to_string),
+            ..Default::default()
+        }
     }
 }
 
@@ -179,6 +260,61 @@ mod tests {
             Some(me.as_path())
         );
         assert!(spec_from_command("   ").is_empty());
+    }
+
+    /// A hint is operator/plugin input, so the blank-field case is the norm, not an edge: a console
+    /// form and a hand-written plugin payload both send `""` for "not set". An empty install dir that
+    /// reached the matcher would prefix-match every process on the box — and this feature can end
+    /// processes.
+    #[test]
+    fn a_blank_hint_says_nothing() {
+        assert!(DetectHint::default().is_empty());
+        let blank = DetectHint {
+            install_dir: Some("".into()),
+            exe: Some("   ".into()),
+            process_name: Some("\t".into()),
+        };
+        assert!(blank.is_empty());
+        assert!(DetectSpec::from(&blank).is_empty(), "nothing to match on");
+
+        let hint = DetectHint {
+            install_dir: Some("  /games/quail  ".into()),
+            exe: None,
+            process_name: Some("quail".into()),
+        };
+        assert!(!hint.is_empty());
+        let spec = DetectSpec::from(&hint);
+        assert_eq!(spec.install_dir.as_deref(), Some(Path::new("/games/quail")));
+        assert_eq!(spec.process_name.as_deref(), Some("quail"));
+        assert_eq!(spec.exe, None);
+    }
+
+    /// The host's own findings outrank a hint. A provider that guessed wrong (or a stale export)
+    /// must not be able to point the matcher — and therefore the termination ladder — at something
+    /// other than what the store itself reported.
+    #[test]
+    fn a_hint_only_fills_gaps() {
+        let found = DetectSpec::dir("/games/real");
+        let hint = DetectHint {
+            install_dir: Some("/games/wrong".into()),
+            exe: Some("/games/real/run".into()),
+            process_name: None,
+        };
+        let merged = found.or_hint(&hint);
+        assert_eq!(
+            merged.install_dir.as_deref(),
+            Some(Path::new("/games/real")),
+            "the store's own answer stands"
+        );
+        assert_eq!(
+            merged.exe.as_deref(),
+            Some(Path::new("/games/real/run")),
+            "but a field the store had nothing for is filled in"
+        );
+        // Nothing found + nothing hinted stays untrackable.
+        assert!(DetectSpec::default()
+            .or_hint(&DetectHint::default())
+            .is_empty());
     }
 
     #[test]

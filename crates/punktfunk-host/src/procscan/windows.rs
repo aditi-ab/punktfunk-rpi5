@@ -62,9 +62,9 @@ impl Scanner {
     /// Every process matching any of `spec`'s signals, restricted to those that started at or after
     /// `min_start` (seconds on the [`Self::now_stamp`] timeline; `None` disables the filter).
     pub fn find(&self, spec: &DetectSpec, min_start: Option<f64>) -> Vec<ProcRef> {
-        // Only the path-based signals exist on Windows: no reaper argv, no readable environment. A spec
-        // carrying neither must match *nothing* — falling through would scan on an empty predicate.
-        if spec.exe.is_none() && spec.install_dir.is_none() {
+        // Only the image-based signals exist on Windows: no reaper argv, no readable environment. A
+        // spec carrying none must match *nothing* — falling through would scan on an empty predicate.
+        if spec.exe.is_none() && spec.install_dir.is_none() && spec.process_name.is_none() {
             return Vec::new();
         }
         let exe = spec
@@ -91,7 +91,13 @@ impl Scanner {
                 }
             }
             let hit = exe.as_deref().is_some_and(|w| same_path(&image, w))
-                || dir.as_deref().is_some_and(|d| under_dir(&image, d));
+                || dir.as_deref().is_some_and(|d| under_dir(&image, d))
+                // The operator-supplied fallback: the image's file name alone. Windows paths are
+                // case-insensitive anyway, so this matches the platform rather than relaxing anything.
+                || spec
+                    .process_name
+                    .as_deref()
+                    .is_some_and(|w| same_name(&image, w));
             if hit {
                 out.push(ProcRef { pid, start });
             }
@@ -232,6 +238,16 @@ fn under_dir(image: &Path, dir: &Path) -> bool {
         return false;
     };
     rest.starts_with('\\') || rest.starts_with('/')
+}
+
+/// Is `image`'s file name `want`? The operator-supplied [`DetectSpec::process_name`] fallback: a bare
+/// name, compared against the image's last component only, so `Hades.exe` never matches a path that
+/// merely contains it.
+fn same_name(image: &Path, want: &str) -> bool {
+    image
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.eq_ignore_ascii_case(want.trim()))
 }
 
 fn eq_ignore_case(a: &Path, b: &Path) -> bool {

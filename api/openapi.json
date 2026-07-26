@@ -4022,6 +4022,10 @@
           "art": {
             "$ref": "#/components/schemas/Artwork"
           },
+          "detect": {
+            "$ref": "#/components/schemas/DetectHint",
+            "description": "How to recognize this title's process once it is running (design §9) — the one thing a\nprovider knows that the host cannot work out for itself.\n\nOptional: without it the entry is still tracked by the child the host spawns for it, which\ncovers every command that stays in the foreground. It earns its keep for a command that hands\noff and exits — a launcher script, a `flatpak run`, a front-end that starts an emulator — where\nthe host would otherwise lose the game the moment the shim returns."
+          },
           "external_id": {
             "type": [
               "string",
@@ -4071,6 +4075,10 @@
         "properties": {
           "art": {
             "$ref": "#/components/schemas/Artwork"
+          },
+          "detect": {
+            "$ref": "#/components/schemas/DetectHint",
+            "description": "How to recognize this title's process — see [`CustomEntry::detect`]."
           },
           "launch": {
             "oneOf": [
@@ -4137,6 +4145,33 @@
           },
           "name": {
             "type": "string"
+          }
+        }
+      },
+      "DetectHint": {
+        "type": "object",
+        "description": "What an operator (or a provider plugin) can tell the host about recognizing a title — the wire\nhalf of [`DetectSpec`], and the only part of it that is ever accepted from outside.\n\nDeliberately a **subset**: the store-derived signals (a Steam appid, a launcher's environment\nmarker) are things the host discovers for itself and would be meaningless — or dangerous — to take\non someone's word. What is left is what a provider genuinely knows and the host cannot guess: where\nthe title is installed, which executable is the game, what the process is called. All three are\noptional; supplying none is the same as supplying no hint at all.\n\nNever returned by the catalog API — see the module docs on why detect data does not cross the wire\noutbound.",
+        "properties": {
+          "exe": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The game's own executable, as an absolute path."
+          },
+          "install_dir": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Where the title is installed. Any process running from under this directory is part of the\ngame — the universal recipe, and the one worth supplying if you supply only one."
+          },
+          "process_name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The executable's file name (`Hades.exe`), when its location isn't fixed. Weakest of the three\n— see [`DetectSpec::process_name`]."
           }
         }
       },
@@ -5449,6 +5484,13 @@
             },
             "description": "Other Moonlight-compatible hosts (Sunshine/Apollo/…) detected on this machine at startup —\nrunning one alongside Punktfunk is unsupported. Compact labels (e.g. `Sunshine (running)`);\nthe tray/console surface them so the clash is visible before pairing silently fails."
           },
+          "games": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Launched games the host is tracking, as compact labels (`Hades`, `Hades (closing in 4:12)`).\n\nThe countdown form is the one that matters: it means the game's client is gone and the host\nwill end the game when the window closes — something a user at the machine should be able to\nsee (and stop) without opening the console. Empty when nothing was launched."
+          },
           "kept_displays": {
             "type": "integer",
             "format": "int32",
@@ -5970,6 +6012,10 @@
         "properties": {
           "art": {
             "$ref": "#/components/schemas/Artwork"
+          },
+          "detect": {
+            "$ref": "#/components/schemas/DetectHint",
+            "description": "How to recognize this title's process — see [`CustomEntry::detect`]. A provider that knows its\ntitles' install directories (Playnite does) should send them: it is what lets a game launched\nthrough the provider's own client still end its session when the player quits."
           },
           "external_id": {
             "type": "string",

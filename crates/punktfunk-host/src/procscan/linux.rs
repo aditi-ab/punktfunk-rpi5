@@ -147,6 +147,19 @@ impl Scanner {
                 return true;
             }
         }
+        // A bare executable name, the operator-supplied fallback. Case-insensitive because it is typed
+        // by hand and the cost of a case mismatch (the game is never recognized) far outweighs the
+        // cost of a case collision (two differently-cased binaries, both started since this launch).
+        if let Some(want) = spec.process_name.as_deref() {
+            let named = image
+                .as_deref()
+                .and_then(|i| i.file_name())
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.eq_ignore_ascii_case(want));
+            if named {
+                return true;
+            }
+        }
 
         // The command line covers what the image can't: a Proton/Wine title's image is the *runtime*
         // (`…/proton`, `wine64-preloader`), and the game only appears as an argument; Steam's launch
@@ -357,6 +370,29 @@ mod tests {
             pids(s.find(&DetectSpec::dir("/games/hades"), None)),
             vec![10, 11]
         );
+    }
+
+    /// The operator-supplied fallback ([`DetectSpec::process_name`]): the image's own file name and
+    /// nothing else — never a directory that happens to be called the same, and never a process whose
+    /// path merely contains the name.
+    #[test]
+    fn matches_a_bare_process_name_against_the_image_name_only() {
+        let td = fake_proc_root(
+            1000.0,
+            &[
+                FakeProc::new(20, 50_000).exe("/opt/retroarch/bin/RetroArch"),
+                FakeProc::new(21, 50_000).exe("/usr/bin/retroarch-assets-helper"),
+                FakeProc::new(22, 50_000).exe("/home/p/retroarch/launcher.sh"),
+            ],
+        );
+        let s = scanner(td.path());
+        let spec = DetectSpec {
+            process_name: Some("retroarch".into()),
+            ..Default::default()
+        };
+        // Case-insensitive (the name is typed by hand), but a whole-name match: neither the
+        // longer-named helper nor the script living in a `retroarch/` directory qualifies.
+        assert_eq!(pids(s.find(&spec, None)), vec![20]);
     }
 
     #[test]

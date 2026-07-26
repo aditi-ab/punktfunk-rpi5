@@ -20,6 +20,7 @@ export { type ConfigService, makeConfigService } from "./config.js";
 export { type CacheStore, makeCacheStore } from "./cache-store.js";
 export {
 	Artwork,
+	DetectHint,
 	LaunchSpec,
 	PrepStep,
 	ProviderClient,

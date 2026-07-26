@@ -28,6 +28,15 @@ pub struct CustomEntry {
     /// host-assigned `id` stays stable across reconciles. Present iff `provider` is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_id: Option<String>,
+    /// How to recognize this title's process once it is running (design §9) — the one thing a
+    /// provider knows that the host cannot work out for itself.
+    ///
+    /// Optional: without it the entry is still tracked by the child the host spawns for it, which
+    /// covers every command that stays in the foreground. It earns its keep for a command that hands
+    /// off and exits — a launcher script, a `flatpak run`, a front-end that starts an emulator — where
+    /// the host would otherwise lose the game the moment the shim returns.
+    #[serde(default, skip_serializing_if = "DetectHint::is_empty")]
+    pub detect: DetectHint,
 }
 
 /// Request body to create or replace a custom entry (no `id` — the host owns it).
@@ -41,6 +50,9 @@ pub struct CustomInput {
     /// Per-title prep/undo steps — commands run as the host user; operator-privileged config.
     #[serde(default)]
     pub prep: Vec<crate::hooks::PrepCmd>,
+    /// How to recognize this title's process — see [`CustomEntry::detect`].
+    #[serde(default)]
+    pub detect: DetectHint,
 }
 
 /// One title in a provider's declarative reconcile payload (RFC §8): [`CustomInput`] plus the
@@ -57,20 +69,27 @@ pub struct ProviderEntryInput {
     /// Per-title prep/undo steps — commands run as the host user; operator-privileged config.
     #[serde(default)]
     pub prep: Vec<crate::hooks::PrepCmd>,
+    /// How to recognize this title's process — see [`CustomEntry::detect`]. A provider that knows its
+    /// titles' install directories (Playnite does) should send them: it is what lets a game launched
+    /// through the provider's own client still end its session when the player quits.
+    #[serde(default)]
+    pub detect: DetectHint,
 }
 
 impl From<CustomEntry> for GameEntry {
     fn from(c: CustomEntry) -> Self {
         // A custom/provider entry is spawned by the host itself, so its own child process is the
-        // primary lifetime signal; this is the fallback for a command that hands off and exits (a
-        // launcher script, a `flatpak run`). An absolute exe in the command line is the only thing
-        // safe to infer — providers can supply richer signals explicitly (design §9, phase 4).
+        // primary lifetime signal; the spec is the fallback for a command that hands off and exits (a
+        // launcher script, a `flatpak run`). An absolute exe in the command line is all that can be
+        // *inferred*; anything sharper has to be stated, which is what `detect` is for (design §9).
+        // The inferred exe wins where both exist — it is derived from the very command being run.
         let detect = c
             .launch
             .as_ref()
             .filter(|l| l.kind == "command")
             .map(|l| crate::library::spec_from_command(&l.value))
-            .unwrap_or_default();
+            .unwrap_or_default()
+            .or_hint(&c.detect);
         GameEntry {
             id: format!("custom:{}", c.id),
             store: "custom".into(),
@@ -168,6 +187,7 @@ pub fn add_custom(input: CustomInput) -> Result<CustomEntry> {
         prep: input.prep,
         provider: None,
         external_id: None,
+        detect: input.detect,
     };
     entries.push(entry.clone());
     save_custom(&entries)?;
@@ -189,6 +209,7 @@ pub fn update_custom(id: &str, input: CustomInput) -> Result<MutateOutcome<Custo
     slot.art = input.art;
     slot.launch = input.launch;
     slot.prep = input.prep;
+    slot.detect = input.detect;
     let updated = slot.clone();
     save_custom(&entries)?;
     emit_changed("manual");
@@ -283,6 +304,7 @@ fn reconcile_entries(
             prep: input.prep,
             provider: Some(provider.to_string()),
             external_id: Some(input.external_id),
+            detect: input.detect,
         });
     }
     // `existing`'s leftovers are the orphans — deliberately dropped (declarative reconcile).
@@ -360,6 +382,7 @@ mod tests {
             prep: Vec::new(),
             provider: None,
             external_id: None,
+            detect: DetectHint::default(),
         }
     }
 
@@ -370,6 +393,7 @@ mod tests {
             art: Artwork::default(),
             launch: None,
             prep: Vec::new(),
+            detect: DetectHint::default(),
         }
     }
 
