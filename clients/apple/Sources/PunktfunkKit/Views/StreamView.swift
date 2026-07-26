@@ -236,6 +236,13 @@ public final class StreamLayerView: NSView {
         let hotY: Int
     }
     private var hostCursors: [UInt32: HostCursorShape] = [:]
+    /// The last shape actually worn. State (`0xD0`, a per-frame datagram) announces a new serial the
+    /// moment the host QUEUES its bitmap on the reliable control stream, so the client routinely
+    /// knows a serial before it holds the pixels — and the shape ring drops the NEWEST under burst
+    /// (`CURSOR_SHAPE_QUEUE`), which the host never re-sends because it only sends on a serial
+    /// CHANGE. Both leave `hostCursors[serial]` empty; wearing the previous pointer through that
+    /// gap degrades it to a briefly-stale shape instead of blinking the pointer out of existence.
+    private var lastWornShape: HostCursorShape?
     private var cursorState: PunktfunkConnection.CursorStateEvent?
     /// Last `CursorRenderMode.clientDraws` told to the host (the §8 mid-stream render flip);
     /// nil = nothing sent yet. Edge-detected by [`reconcileCursorRender`] from the live mouse
@@ -509,10 +516,19 @@ public final class StreamLayerView: NSView {
     override public func resetCursorRects() {
         if captured && desktopMouse {
             // Cursor channel active: wear the HOST's pointer shape (it is no longer in the
-            // video); hidden host pointer (or no shape yet) = invisible. Without the channel,
-            // M1 behavior: invisible local cursor, the composited host cursor is the visible one.
+            // video); a HIDDEN host pointer (or nothing seen yet at all) = invisible. Without the
+            // channel, M1 behavior: invisible local cursor, the composited host cursor is the
+            // visible one.
+            //
+            // A visible pointer whose announced serial has no bitmap yet falls back to the last
+            // worn shape (see `lastWornShape`) rather than to `invisibleCursor`. That case is
+            // routine, not degenerate — state outruns its bitmap on every single shape change —
+            // and treating it as "hide the pointer" made the pointer VANISH over anything whose
+            // shape arrived late or got dropped, with no recovery until the next change. Only
+            // `st.visible == false` may hide the pointer; a missing bitmap may not.
             if cursorChannelActive, let st = cursorState, st.visible,
-               let shape = hostCursors[st.serial] {
+               let shape = hostCursors[st.serial] ?? lastWornShape {
+                lastWornShape = shape
                 addCursorRect(bounds, cursor: scaledCursor(shape))
             } else {
                 addCursorRect(bounds, cursor: Self.invisibleCursor)
@@ -583,6 +599,8 @@ public final class StreamLayerView: NSView {
 
     private func applyCursorShape(_ ev: PunktfunkConnection.CursorShapeEvent) {
         guard let shape = Self.makeShape(ev) else {
+            // Truthful only because `resetCursorRects` falls back to `lastWornShape`: before that,
+            // a rejection here left the announced serial with no bitmap and HID the pointer.
             streamInputLog.warning("cursor shape rejected (\(ev.width)x\(ev.height)) — keeping the previous cursor")
             return
         }

@@ -36,8 +36,13 @@ pub(crate) const HOST_TIMING_QUEUE: usize = 512;
 pub(crate) const CLIP_EVENT_QUEUE: usize = 32;
 
 /// Cursor-shape plane depth (control-stream [`crate::quic::CursorShape`], one per pointer-bitmap
-/// change — human-paced). Overflow drops the newest (try_send); the next shape change or a
-/// serial mismatch against `0xD0` state heals it visually within a shape-change period.
+/// change — human-paced, but bursty: crossing a toolbar flips arrow/I-beam/hand/resize several
+/// times a second, and every flip mints a fresh serial and a fresh bitmap). Overflow drops the
+/// newest (try_send) and the host does NOT re-send it — it only sends on a serial CHANGE — so the
+/// dropped serial stays un-backed until the pointer changes shape again. Embedders must therefore
+/// hold their last worn shape when `hostCursors[serial]` misses rather than hiding the pointer
+/// (the Apple client's `lastWornShape`); healing is bounded by the next shape change, not by this
+/// ring.
 pub(crate) const CURSOR_SHAPE_QUEUE: usize = 8;
 
 /// Cursor-state plane depth (`0xD0`, one datagram per captured frame). Latest-wins state — the
