@@ -55,7 +55,11 @@ public final class GamepadCapture {
         /// Wire pad index (GamepadManager's stable lowest-free assignment), threaded onto every
         /// event this controller sends — the low byte of `flags`.
         let pad: UInt32
-        /// The controller KIND declared to the host (GamepadArrival) when the slot opened.
+        /// The controller KIND declared to the host (GamepadArrival) when the slot opened — the
+        /// user's explicit "Controller type" setting when they picked one, else the detected
+        /// kind (`GamepadManager.declaredKind(for:)`). NOT the physical pad's kind: local
+        /// feedback keys off the live `GCController` subclass instead, so an emulated type never
+        /// costs a DualSense its lightbar or adaptive triggers.
         let pref: PunktfunkConnection.GamepadType
         var buttons: UInt32 = 0
         var axes: [Int32] = [0, 0, 0, 0, 0, 0]
@@ -166,7 +170,7 @@ public final class GamepadCapture {
     private func openSlot(_ dc: GamepadManager.DiscoveredController) {
         guard let pad = manager.padIndex(for: dc), let ext = dc.controller.extendedGamepad else { return }
         let c = dc.controller
-        let slot = Slot(controller: c, pad: UInt32(pad), pref: dc.kind)
+        let slot = Slot(controller: c, pad: UInt32(pad), pref: manager.declaredKind(for: dc))
         slots.append(slot)
 
         ext.valueChangedHandler = { [weak self, weak slot] g, _ in
@@ -192,9 +196,12 @@ public final class GamepadCapture {
             }
         }
         // Declare this pad's controller KIND before any of its input, so the host builds a
-        // matching virtual device (mixed types — pad 0 a DualSense, pad 1 an Xbox pad). The core
-        // re-sends it a few times against datagram loss; an older host ignores it and uses the
-        // session-default kind. Then wake the host pad (pads are created lazily from the first
+        // matching virtual device — the user's chosen type when they picked one, else per-pad
+        // detection (mixed types — pad 0 a DualSense, pad 1 an Xbox pad). This declaration is
+        // what the host actually builds from, so it MUST carry an explicit setting; the
+        // handshake's session default is only the fallback for a pad that never declares. The
+        // core re-sends it a few times against datagram loss; an older host ignores it and uses
+        // the session-default kind. Then wake the host pad (pads are created lazily from the first
         // event; a DualSense's UHID handshake + initial lightbar write only start then).
         connection.send(.gamepadArrival(pref: slot.pref.rawValue, pad: slot.pad))
         connection.send(.gamepadAxis(GamepadWire.axisLSX, value: 0, pad: slot.pad))

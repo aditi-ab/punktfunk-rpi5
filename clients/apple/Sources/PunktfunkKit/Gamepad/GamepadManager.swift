@@ -131,13 +131,40 @@ public final class GamepadManager: ObservableObject {
         GCController.stopWirelessControllerDiscovery()
     }
 
+    /// The user's controller-type choice AS CHOSEN (not resolved) for the session being dialed —
+    /// adopted by `resolveType` and read back by `declaredKind(for:)`. `.auto` = detect per pad.
+    public private(set) var typeSetting: PunktfunkConnection.GamepadType = .auto
+
+    /// The kind to DECLARE to the host for one forwarded controller (its `GamepadArrival`).
+    /// An explicit setting wins for every pad — the handshake's session default alone does NOT
+    /// stick, because a current host honors the per-pad arrival over it (punktfunk-host's
+    /// `Pads::set_kind`), so a client that declared only the detected kind here would silently
+    /// undo the user's choice. `.auto` keeps per-pad detection, which is what makes a mixed
+    /// session (pad 0 a DualSense, pad 1 an Xbox pad) honest.
+    public func declaredKind(
+        for controller: DiscoveredController
+    ) -> PunktfunkConnection.GamepadType {
+        Self.declaredKind(setting: typeSetting, detected: controller.kind)
+    }
+
+    /// The pure fold behind `declaredKind(for:)` (pf-client-core's `declared_kind`).
+    nonisolated static func declaredKind(
+        setting: PunktfunkConnection.GamepadType,
+        detected: PunktfunkConnection.GamepadType
+    ) -> PunktfunkConnection.GamepadType {
+        setting == .auto ? detected : setting
+    }
+
     /// Connect-time resolution of the user's controller-type setting: an explicit choice
     /// wins; `.auto` matches the virtual pad to the active physical controller (DualSense →
     /// DualSense, DualShock 4 → DualShock 4, an Xbox pad → Xbox One, anything else → Xbox
-    /// 360); no controller at all defers to the host.
+    /// 360); no controller at all defers to the host. Called once per dial with the RAW setting,
+    /// which it also adopts for `declaredKind(for:)` so the handshake default and every pad's
+    /// arrival can never disagree about an explicit choice.
     public func resolveType(
         setting: PunktfunkConnection.GamepadType
     ) -> PunktfunkConnection.GamepadType {
+        typeSetting = setting
         guard setting == .auto else { return setting }
         // Refresh from the LIVE controller list first. `active` is otherwise only populated by the
         // async `.GCControllerDidConnect` notification, so at connect time it can still be nil even

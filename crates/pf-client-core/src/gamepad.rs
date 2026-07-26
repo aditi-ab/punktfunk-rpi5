@@ -299,6 +299,23 @@ fn pref_for_type(t: sdl3::gamepad::GamepadType) -> GamepadPref {
     }
 }
 
+/// The kind a slot DECLARES to the host ([`InputKind::GamepadArrival`]) given the user's
+/// controller-type `setting` and the pad's `physical` kind: an explicit setting emulates that pad
+/// for every slot, `Auto` keeps per-pad detection (what makes a mixed session honest).
+///
+/// This has to be applied per pad and not just in the Hello: the host builds each virtual device
+/// from that pad's arrival and only falls back to the session default for a pad that never
+/// declares one, so a client that always declared the detected kind would silently undo the
+/// setting the moment a controller connected. The physical kind is still what the LOCAL feedback
+/// paths use (DualSense raw effects, the Deck rumble keep-alive) — those talk to the controller in
+/// the user's hands, not the one the host is pretending to have.
+fn declared_kind(setting: GamepadPref, physical: GamepadPref) -> GamepadPref {
+    match setting {
+        GamepadPref::Auto => physical,
+        explicit => explicit,
+    }
+}
+
 /// Best-effort "this machine is a Steam Deck". The Gaming-Mode env short-circuits; desktop
 /// mode falls back to DMI (Valve board, Jupiter = LCD / Galileo = OLED — readable inside the
 /// flatpak sandbox). Cached: the answer can't change while we run.
@@ -318,6 +335,7 @@ enum Ctl {
     Attach(Arc<NativeClient>),
     Detach,
     Pin(Option<String>),
+    KindOverride(GamepadPref),
     MenuMode(bool),
     MenuRumble(MenuPulse),
 }
@@ -450,6 +468,18 @@ impl GamepadService {
     /// the pad disconnecting: it re-applies the moment a matching controller shows up again.
     pub fn set_pinned(&self, key: Option<String>) {
         let _ = self.ctl.send(Ctl::Pin(key));
+    }
+
+    /// Adopt the user's explicit controller-type setting for the session about to start
+    /// (`GamepadPref::Auto` = detect per pad, the default).
+    ///
+    /// This is NOT redundant with the session default in the Hello: a current host honors a pad's
+    /// [`InputKind::GamepadArrival`] over the session default, so a client that declared only the
+    /// detected kind would silently undo the setting the moment a controller connected. Call it
+    /// before [`Self::attach`] — slots declare their kind at open time and the host does not
+    /// hot-swap a device that already exists.
+    pub fn set_kind_override(&self, pref: GamepadPref) {
+        let _ = self.ctl.send(Ctl::KindOverride(pref));
     }
 
     pub fn attach(&self, connector: Arc<NativeClient>) {
@@ -691,6 +721,10 @@ struct Worker {
     /// connected pads, so it survives restarts and disconnects. A pin forwards ONLY that pad
     /// (an explicit single-player choice); Automatic forwards every real controller.
     pinned: Option<String>,
+    /// The user's explicit "controller type" setting ([`GamepadService::set_kind_override`]);
+    /// `Auto` = per-pad detection. Applied at slot open to the kind DECLARED to the host, never
+    /// to [`Slot::pref`] — the local feedback paths must keep reading the physical pad.
+    kind_override: GamepadPref,
     attached: Option<Arc<NativeClient>>,
     /// Raises the UI escape signal; the escape chord fires it once per press.
     escape_tx: async_channel::Sender<()>,
@@ -886,6 +920,7 @@ impl Worker {
             Some(p) => p.pref,
             None => GamepadPref::Xbox360,
         };
+        let declared = declared_kind(self.kind_override, pref);
         match self.subsystem.open(sdl3::sys::joystick::SDL_JoystickID(id)) {
             Ok(pad) => {
                 let mut slot = Slot::new(id, index, pref, pad);
@@ -895,7 +930,13 @@ impl Worker {
                 // re-sends it a few times against datagram loss; an older host ignores it and
                 // uses the session-default kind.
                 if let Some(c) = &self.attached {
-                    send(c, InputKind::GamepadArrival, pref.to_u8() as u32, 0, index);
+                    send(
+                        c,
+                        InputKind::GamepadArrival,
+                        declared.to_u8() as u32,
+                        0,
+                        index,
+                    );
                     // Declare the actuator's quirks to the shared rumble policy engine. ALWAYS
                     // set (defaults for a well-behaved pad): wire indices are reused within a
                     // connection, so a Deck slot that closes must not leave its keepalive quirk
@@ -911,7 +952,13 @@ impl Worker {
                     };
                     c.set_rumble_quirks(index as u16, quirks);
                 }
-                tracing::info!(id, index, pref = ?pref, "gamepad forwarding (slot opened)");
+                tracing::info!(
+                    id,
+                    index,
+                    pref = ?pref,
+                    declared = ?declared,
+                    "gamepad forwarding (slot opened)"
+                );
                 self.slots.push(slot);
             }
             Err(e) => tracing::warn!(id, error = %e, "gamepad open failed"),
@@ -1219,6 +1266,7 @@ impl Worker {
                     self.pinned = key;
                     self.refresh_active();
                 }
+                Ok(Ctl::KindOverride(pref)) => self.kind_override = pref,
                 Ok(Ctl::MenuMode(on)) => {
                     self.menu_mode = on;
                     if on {
@@ -1558,6 +1606,7 @@ impl Worker {
             menu_open: None,
             order: Vec::new(),
             pinned: None,
+            kind_override: GamepadPref::Auto,
             attached: None,
             escape_tx,
             disconnect_tx,
@@ -1821,6 +1870,38 @@ mod slot_tests {
         let mut but_seven = all.clone();
         but_seven.retain(|&i| i != 7);
         assert_eq!(lowest_free_index(&but_seven), Some(7));
+    }
+
+    #[test]
+    fn an_explicit_setting_is_what_every_pad_declares() {
+        // The regression this pins: the setting used to reach the Hello only, and each pad's
+        // arrival then re-declared the DETECTED kind — which the host honors over the session
+        // default, so "emulate my DualSense as a DualShock 4" produced a DualSense.
+        assert_eq!(
+            declared_kind(GamepadPref::DualShock4, GamepadPref::DualSense),
+            GamepadPref::DualShock4
+        );
+        // Every physical pad in a mixed session follows the one explicit choice.
+        for physical in [
+            GamepadPref::DualSense,
+            GamepadPref::Xbox360,
+            GamepadPref::SwitchPro,
+            GamepadPref::SteamDeck,
+        ] {
+            assert_eq!(
+                declared_kind(GamepadPref::Xbox360, physical),
+                GamepadPref::Xbox360
+            );
+        }
+        // Automatic keeps per-pad detection — otherwise a mixed session collapses to one type.
+        assert_eq!(
+            declared_kind(GamepadPref::Auto, GamepadPref::DualSense),
+            GamepadPref::DualSense
+        );
+        assert_eq!(
+            declared_kind(GamepadPref::Auto, GamepadPref::SteamDeck),
+            GamepadPref::SteamDeck
+        );
     }
 
     #[test]

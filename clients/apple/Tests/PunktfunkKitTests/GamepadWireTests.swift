@@ -119,6 +119,25 @@ final class GamepadWireTests: XCTestCase {
         XCTAssertEqual(GamepadWire.maxPads, 16)
     }
 
+    func testAnExplicitControllerTypeIsWhatEveryPadDeclares() {
+        // The regression this pins: the "Controller type" setting reached the Hello only, and each
+        // pad's arrival then re-declared the DETECTED kind — which the host honors over the
+        // session default, so "emulate my DualSense as a DualShock 4" produced a DualSense.
+        // (pf-client-core's `declared_kind` test is the same table.)
+        XCTAssertEqual(
+            GamepadManager.declaredKind(setting: .dualShock4, detected: .dualSense), .dualShock4)
+        // Every physical pad in a mixed session follows the one explicit choice.
+        for detected: PunktfunkConnection.GamepadType in [
+            .dualSense, .xbox360, .switchPro, .dualSenseEdge,
+        ] {
+            XCTAssertEqual(
+                GamepadManager.declaredKind(setting: .xbox360, detected: detected), .xbox360)
+        }
+        // Automatic keeps per-pad detection — otherwise a mixed session collapses to one type.
+        XCTAssertEqual(GamepadManager.declaredKind(setting: .auto, detected: .dualSense), .dualSense)
+        XCTAssertEqual(GamepadManager.declaredKind(setting: .auto, detected: .switchPro), .switchPro)
+    }
+
     func testTouchpadConversionCorners() {
         // GC ±1 with +y up → wire 0...65535 with origin top-left, +y down.
         let topLeft = GamepadWire.touchpad(x: -1, y: 1)

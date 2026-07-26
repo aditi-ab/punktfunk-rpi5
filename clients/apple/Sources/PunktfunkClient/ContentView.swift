@@ -990,7 +990,9 @@ struct ContentView: View {
                 rawValue: UInt32(clamping: gamepadType)) ?? .auto)
         if let name = ProcessInfo.processInfo.environment["PUNKTFUNK_REMOTE_GAMEPAD"],
            let g = PunktfunkConnection.GamepadType(name: name) {
-            pad = g
+            // Back through resolveType so the lever is adopted as the session's setting: the
+            // per-pad arrivals declare it too, which is what the host actually builds from.
+            pad = GamepadManager.shared.resolveType(setting: g)
         }
         var bitrate = UInt32(clamping: bitrateKbps)
         if let kbps = ProcessInfo.processInfo.environment["PUNKTFUNK_BITRATE_KBPS"],

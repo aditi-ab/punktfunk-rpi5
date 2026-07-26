@@ -204,9 +204,17 @@ mod session_main {
             mode,
             compositor: CompositorPref::from_name(&settings.compositor)
                 .unwrap_or(CompositorPref::Auto),
-            gamepad: match GamepadPref::from_name(&settings.gamepad) {
-                Some(GamepadPref::Auto) | None => gamepad.auto_pref(),
-                Some(explicit) => explicit,
+            gamepad: {
+                // The setting AS CHOSEN goes to the pad service too, not just the Hello: the host
+                // builds each virtual pad from that pad's arrival and only falls back to this
+                // session default for a pad that never declares one, so an explicit choice that
+                // stopped here would be undone the moment a controller connected.
+                let chosen = GamepadPref::from_name(&settings.gamepad).unwrap_or(GamepadPref::Auto);
+                gamepad.set_kind_override(chosen);
+                match chosen {
+                    GamepadPref::Auto => gamepad.auto_pref(),
+                    explicit => explicit,
+                }
             },
             bitrate_kbps: settings.bitrate_kbps,
             audio_channels: settings.audio_channels,
