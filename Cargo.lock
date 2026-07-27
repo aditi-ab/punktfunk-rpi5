@@ -1021,6 +1021,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "display-disturb"
+version = "0.20.0"
+dependencies = [
+ "windows 0.62.2 (registry+https://github.com/rust-lang/crates.io-index)",
+]
+
+[[package]]
 name = "displaydoc"
 version = "0.2.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
