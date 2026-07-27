@@ -33,6 +33,12 @@ pub struct FrameCtx<'a> {
     /// Swapchain size in pixels — the overlay renders 1:1.
     pub width: u32,
     pub height: u32,
+    /// UI scale for the stream chrome: the window's display scale (DPI × the display's content
+    /// scale — `1.0` at 96 dpi / 100 %), times the `PUNKTFUNK_OSD_SCALE` preference. Because the
+    /// overlay renders in *physical* pixels, a fixed-pixel OSD shrinks as panel density rises —
+    /// unreadable at 14 px on a 4K laptop at 200 %. Every chrome metric is multiplied by this.
+    /// Sanitized and clamped by the run loop (`overlay_scale`), so it is always finite and > 0.
+    pub scale: f32,
     /// Multi-line stats OSD (top-left panel); `None` = hidden.
     pub stats: Option<&'a str>,
     /// The capture hint (bottom-center pill, "click to capture…"); `None` = hidden.

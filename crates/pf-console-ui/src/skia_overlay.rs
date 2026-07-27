@@ -48,12 +48,36 @@ struct Drawn {
     height: u32,
     stats: Option<String>,
     hint: Option<String>,
+    /// The UI scale this was drawn at, in percent — part of the damage key so dragging the window
+    /// to a differently-scaled monitor re-renders the chrome at the new size instead of keeping
+    /// the stale one (the text is identical, so nothing else here would notice).
+    scale_pct: u16,
     /// The start banner's alpha, quantized — a fade step is a redraw, steady is not.
     banner_step: u8,
     /// The resize scrim's spinner phase, quantized — a nonzero, ever-changing step while a
     /// mid-stream resize is in flight forces the per-frame redraw the spinner needs; `0`
     /// when no resize is showing (so a still stream stays damage-free).
     resize_step: u16,
+}
+
+/// The stream chrome's base metrics, in pixels at 100 % scale (96 dpi). Everything here is
+/// multiplied by `FrameCtx::scale` before it is drawn: the overlay composites into the swapchain
+/// 1:1 in PHYSICAL pixels, so on a 4K panel at 200 % an unscaled 14 px OSD renders at half its
+/// intended physical size — legible on a 1080p monitor, a squint on a HiDPI laptop.
+mod base {
+    /// The monospace OSD/hint/label size. Also the size the shared `Font` is built at, so the
+    /// scale factor below is exactly the multiplier applied to it.
+    pub const FONT_PX: f32 = 14.0;
+    /// Top-left inset of the stats panel.
+    pub const OSD_MARGIN: f32 = 12.0;
+    /// Stats-panel inner padding and corner radius.
+    pub const OSD_PAD_X: f32 = 10.0;
+    pub const OSD_PAD_Y: f32 = 8.0;
+    pub const OSD_RADIUS: f32 = 8.0;
+    /// Hint/banner pill padding and its gap from the bottom edge.
+    pub const PILL_PAD_X: f32 = 14.0;
+    pub const PILL_PAD_Y: f32 = 8.0;
+    pub const PILL_BOTTOM: f32 = 24.0;
 }
 
 /// Where the console starts (the session binary's `--browse` forms).
@@ -221,7 +245,7 @@ impl Overlay for SkiaOverlay {
             skia_safe::FontStyle::normal(),
         )
         .context("no monospace typeface (fontconfig alias or system family)")?;
-        self.font = Some(Font::new(typeface, 14.0));
+        self.font = Some(Font::new(typeface, base::FONT_PX));
         self.fonts = Some(crate::theme::build_fonts()?);
 
         self.gpu = Some(Gpu {
@@ -360,11 +384,15 @@ impl Overlay for SkiaOverlay {
             self.drawn = Drawn::default(); // forget content so re-show re-renders
             return Ok(None);
         }
+        // 1 % granularity: fine enough that no real display scale is rounded into another, coarse
+        // enough that float noise on the same monitor can't churn the damage gate every frame.
+        let scale = ctx.scale.clamp(0.5, 4.0);
         let want = Drawn {
             width: ctx.width,
             height: ctx.height,
             stats: ctx.stats.map(str::to_owned),
             hint: ctx.hint.map(str::to_owned),
+            scale_pct: (scale * 100.0).round() as u16,
             banner_step,
             resize_step,
         };
@@ -387,16 +415,20 @@ impl Overlay for SkiaOverlay {
 
         let canvas = slot.surface.canvas();
         canvas.clear(Color4f::new(0.0, 0.0, 0.0, 0.0));
+        // Each drawer re-derives the face at its own (fit-clamped) size rather than the canvas
+        // being transformed: Skia hints and rasterizes glyphs at the requested size, so this
+        // stays crisp where a magnified 14 px bitmap would be mush. Only on a damage redraw —
+        // a steady stream re-renders nothing at all.
         let font = self.font.as_ref().expect("init ran");
         // The resize scrim sits UNDER the OSD/hint so those stay legible over it.
         if let Some(phase) = resize_phase {
-            draw_resize_scrim(canvas, font, ctx.width, ctx.height, phase);
+            draw_resize_scrim(canvas, font, ctx.width, ctx.height, phase, scale);
         }
         if let Some(stats) = &want.stats {
-            draw_osd_panel(canvas, font, stats, 12.0, 12.0);
+            draw_osd_panel(canvas, font, stats, ctx.width, scale);
         }
         if let Some(hint) = &want.hint {
-            draw_hint_pill(canvas, font, hint, ctx.width, ctx.height, 1.0);
+            draw_hint_pill(canvas, font, hint, ctx.width, ctx.height, 1.0, scale);
         } else if banner_step > 0 {
             // The start banner: the leave/stats shortcuts, fading out on its own —
             // discoverable without the stats overlay, gone before it annoys.
@@ -408,6 +440,7 @@ impl Overlay for SkiaOverlay {
                     ctx.width,
                     ctx.height,
                     banner_alpha as f32,
+                    scale,
                 );
             }
         }
@@ -543,25 +576,61 @@ impl SkiaOverlay {
     }
 }
 
-/// The stats OSD: a translucent rounded panel, one text line per `\n` (the GTK OSD's
-/// look, minus the toolkit).
-fn draw_osd_panel(canvas: &Canvas, font: &Font, text: &str, x: f32, y: f32) {
+/// The chrome face at `scale`. `with_size` only fails on a nonsensical size (the caller clamps),
+/// in which case the unscaled face is still better than no text.
+fn chrome_font(font: &Font, scale: f32) -> Font {
+    font.with_size(base::FONT_PX * scale)
+        .unwrap_or_else(|| font.clone())
+}
+
+/// Shrink `scale` until a box of `width_at_scale` (which must be linear in the scale — every
+/// chrome metric is) fits in `budget`. Scaling text up by the display's DPI is only an
+/// improvement while the result still fits the window: the capture hint is a ~150-character line
+/// that already spans most of a 1280 px window at 100 %, so at 200 % it would run off both edges
+/// and lose its ends. Fitting keeps it whole, just smaller than the nominal scale.
+fn fit_scale(scale: f32, width_at_scale: f32, budget: f32) -> f32 {
+    if width_at_scale > budget && width_at_scale > 0.0 {
+        (scale * budget / width_at_scale).max(0.1)
+    } else {
+        scale
+    }
+}
+
+/// The stats OSD: a translucent rounded panel in the top-left, one text line per `\n` (the GTK
+/// OSD's look, minus the toolkit), sized for the display's UI `scale`.
+fn draw_osd_panel(canvas: &Canvas, base_font: &Font, text: &str, width: u32, scale: f32) {
+    let lines: Vec<&str> = text.lines().collect();
+    // Panel width is linear in the scale, so measuring once at the requested scale is enough to
+    // solve for the scale that keeps the Detailed tier's long lines inside the window instead of
+    // running them past the right edge on a HiDPI display.
+    let width_at = |s: f32| {
+        let font = chrome_font(base_font, s);
+        let widest = lines
+            .iter()
+            .map(|l| font.measure_str(l, None).0)
+            .fold(0.0f32, f32::max);
+        widest + 2.0 * (base::OSD_PAD_X + base::OSD_MARGIN) * s
+    };
+    let scale = fit_scale(scale, width_at(scale), width as f32);
+    let font = chrome_font(base_font, scale);
+
     let (_, metrics) = font.metrics();
     let line_h = metrics.descent - metrics.ascent + metrics.leading;
-    let lines: Vec<&str> = text.lines().collect();
     let widest = lines
         .iter()
         .map(|l| font.measure_str(l, None).0)
         .fold(0.0f32, f32::max);
-    let (pad_x, pad_y) = (10.0, 8.0);
+    let (pad_x, pad_y) = (base::OSD_PAD_X * scale, base::OSD_PAD_Y * scale);
+    let (x, y) = (base::OSD_MARGIN * scale, base::OSD_MARGIN * scale);
     let panel = Rect::from_xywh(
         x,
         y,
         widest + 2.0 * pad_x,
         line_h * lines.len() as f32 + 2.0 * pad_y,
     );
+    let radius = base::OSD_RADIUS * scale;
     canvas.draw_rrect(
-        RRect::new_rect_xy(panel, 8.0, 8.0),
+        RRect::new_rect_xy(panel, radius, radius),
         &Paint::new(Color4f::new(0.0, 0.0, 0.0, 0.62), None),
     );
     let text_paint = Paint::new(Color4f::new(1.0, 1.0, 1.0, 0.92), None);
@@ -569,7 +638,7 @@ fn draw_osd_panel(canvas: &Canvas, font: &Font, text: &str, x: f32, y: f32) {
         canvas.draw_str(
             line,
             Point::new(x + pad_x, y + pad_y - metrics.ascent + line_h * i as f32),
-            font,
+            &font,
             &text_paint,
         );
     }
@@ -581,7 +650,16 @@ fn draw_osd_panel(canvas: &Canvas, font: &Font, text: &str, x: f32, y: f32) {
 /// window. This is the presenter's analog of the Apple client's blur overlay: the overlay
 /// composites its own RGBA quad and cannot sample the video to blur it, so an opaque scrim
 /// hides the stretched in-between frame instead (same intent, one draw).
-fn draw_resize_scrim(canvas: &Canvas, font: &Font, width: u32, height: u32, phase: f64) {
+fn draw_resize_scrim(
+    canvas: &Canvas,
+    base_font: &Font,
+    width: u32,
+    height: u32,
+    phase: f64,
+    scale: f32,
+) {
+    // Short, centered label — it always fits, so it just takes the display scale as-is.
+    let font = &chrome_font(base_font, scale);
     let (wf, hf) = (width as f32, height as f32);
     canvas.draw_rect(
         Rect::from_wh(wf, hf),
@@ -602,16 +680,33 @@ fn draw_resize_scrim(canvas: &Canvas, font: &Font, width: u32, height: u32, phas
     );
 }
 
-/// The capture hint / start banner: a centered pill near the bottom edge.
-fn draw_hint_pill(canvas: &Canvas, font: &Font, text: &str, width: u32, height: u32, alpha: f32) {
+/// The capture hint / start banner: a centered pill near the bottom edge. `scale` = the display's
+/// UI scale (the text size already rides in `font`).
+fn draw_hint_pill(
+    canvas: &Canvas,
+    base_font: &Font,
+    text: &str,
+    width: u32,
+    height: u32,
+    alpha: f32,
+    scale: f32,
+) {
+    // The capture hint is one long line that already fills most of a 1280 px window at 100 %;
+    // scaled by a 2× display it would overrun both edges, so fit it to the window (a 4 % gutter
+    // keeps it off the very edge).
+    let pill_w =
+        |s: f32| chrome_font(base_font, s).measure_str(text, None).0 + 2.0 * base::PILL_PAD_X * s;
+    let scale = fit_scale(scale, pill_w(scale), width as f32 * 0.96);
+    let font = &chrome_font(base_font, scale);
+
     let (_, metrics) = font.metrics();
     let line_h = metrics.descent - metrics.ascent;
     let text_w = font.measure_str(text, None).0;
-    let (pad_x, pad_y) = (14.0, 8.0);
+    let (pad_x, pad_y) = (base::PILL_PAD_X * scale, base::PILL_PAD_Y * scale);
     let w = text_w + 2.0 * pad_x;
     let h = line_h + 2.0 * pad_y;
     let x = (width as f32 - w) / 2.0;
-    let y = height as f32 - h - 24.0;
+    let y = height as f32 - h - base::PILL_BOTTOM * scale;
     canvas.draw_rrect(
         RRect::new_rect_xy(Rect::from_xywh(x, y, w, h), h / 2.0, h / 2.0),
         &Paint::new(Color4f::new(0.0, 0.0, 0.0, 0.62 * alpha), None),

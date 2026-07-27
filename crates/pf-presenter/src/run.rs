@@ -420,6 +420,15 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
         println!("{{\"ready\":true}}");
     }
 
+    // Operator preference on top of the display's own DPI scale — for a TV across the room, or to
+    // shrink chrome that a compositor reports an aggressive scale for. Read once (a preference,
+    // not session state); the DPI part is re-read per frame.
+    let osd_scale_pref = std::env::var("PUNKTFUNK_OSD_SCALE")
+        .ok()
+        .and_then(|s| s.trim().parse::<f32>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .unwrap_or(1.0);
+
     let mut overlay = opts.overlay.take();
     if let Some(o) = overlay.as_mut() {
         if let Err(e) = o.init(&presenter.shared_device()) {
@@ -1148,6 +1157,10 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
             let ctx = FrameCtx {
                 width: pw,
                 height: ph,
+                // Re-read per frame, not once at startup: dragging the window to a second monitor
+                // with a different scale (or changing the scale setting live) updates this, and the
+                // overlay's damage gate picks the new value up on the next redraw.
+                scale: overlay_scale(window.display_scale(), osd_scale_pref),
                 stats,
                 hint,
                 resizing,
@@ -1810,6 +1823,27 @@ fn content_to_window(
     (lx as f32, ly as f32)
 }
 
+/// The overlay chrome's UI scale (`FrameCtx::scale`): SDL's window display scale — DPI × the
+/// display's content scale, `1.0` at 96 dpi / 100 % — times the `PUNKTFUNK_OSD_SCALE` preference.
+///
+/// Sanitizing is not paranoia: `SDL_GetWindowDisplayScale` returns `0.0` when it cannot resolve the
+/// window's display (a headless/offscreen driver, or racing a monitor hotplug), and a 0 multiplier
+/// would collapse the OSD to an invisible zero-size panel — worse than the un-scaled chrome it
+/// replaces. The 4× ceiling keeps a bogus scale from covering the stream.
+fn overlay_scale(display_scale: f32, pref: f32) -> f32 {
+    let base = if display_scale.is_finite() && display_scale > 0.0 {
+        display_scale
+    } else {
+        1.0
+    };
+    let pref = if pref.is_finite() && pref > 0.0 {
+        pref
+    } else {
+        1.0
+    };
+    (base * pref).clamp(0.5, 4.0)
+}
+
 /// The presenter's share of the unified stats window — folded into each printed line.
 #[derive(Default)]
 struct PresentedWindow {
@@ -1906,6 +1940,28 @@ fn stats_text(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn overlay_scale_follows_dpi_and_survives_a_bogus_display() {
+        // 100 % / 96 dpi is the identity — the chrome keeps the size it always had.
+        assert_eq!(overlay_scale(1.0, 1.0), 1.0);
+        // The common HiDPI settings pass straight through.
+        assert_eq!(overlay_scale(1.5, 1.0), 1.5);
+        assert_eq!(overlay_scale(2.0, 1.0), 2.0);
+        // PUNKTFUNK_OSD_SCALE multiplies the display's own scale, it doesn't replace it.
+        assert_eq!(overlay_scale(2.0, 1.25), 2.5);
+        // SDL reports 0.0 when it can't resolve the window's display (offscreen driver, or
+        // racing a hotplug) — that must NOT collapse the panel to nothing.
+        assert_eq!(overlay_scale(0.0, 1.0), 1.0);
+        assert_eq!(overlay_scale(f32::NAN, 1.0), 1.0);
+        assert_eq!(overlay_scale(-2.0, 1.0), 1.0);
+        // A garbage preference degrades to "just the DPI", never to zero.
+        assert_eq!(overlay_scale(1.5, 0.0), 1.5);
+        assert_eq!(overlay_scale(1.5, f32::NAN), 1.5);
+        // Clamped both ways so nothing can hide the OSD or bury the stream under it.
+        assert_eq!(overlay_scale(1.0, 100.0), 4.0);
+        assert_eq!(overlay_scale(1.0, 0.01), 0.5);
+    }
 
     #[test]
     fn content_to_window_inverts_the_letterbox() {

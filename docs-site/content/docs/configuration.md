@@ -167,6 +167,7 @@ A few knobs are read by the native **clients**, not the host:
 | Setting | Values | Meaning |
 |---|---|---|
 | `PUNKTFUNK_DECODER` | `software` · `vaapi` · `vulkan` (Linux) · `d3d11va` (Windows) | Force the decode path. Default auto-selects hardware per vendor (Linux: VAAPI on Intel/AMD, Vulkan Video on NVIDIA and the Steam Deck; Windows: Vulkan Video on NVIDIA/AMD, D3D11VA on Intel and others) with a software fallback. |
+| `PUNKTFUNK_OSD_SCALE` | multiplier, e.g. `1.5` *(default `1`)* | Size of the in-stream overlay — the stats OSD, the capture hint and the start banner. They already follow your display's scaling setting (200 % display → twice the pixels), so set this only to nudge that: bigger for a TV across the room, smaller if your compositor reports an aggressive scale. Clamped to 0.5×–4×, and a line that would run off the screen is shrunk to fit. |
 
 ## Bitrate
 
