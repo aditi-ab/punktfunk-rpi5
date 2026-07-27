@@ -438,3 +438,9 @@ jobs:
             echo "winget source serving ${GITHUB_REF_NAME#v}"
         env:
           GITHUB_REF_NAME: ${{ gitea.ref_name }}
+        # `env:` populates the RUNNER's environment; this action runs `script` on the REMOTE
+        # host, which inherits nothing from it. `envs:` is the action's own allow-list of names
+        # to forward into the remote shell — without it `set -u` aborted at the first expansion
+        # ("GITHUB_REF_NAME: unbound variable") and the step failed on every tag, after the
+        # catalogue had already shipped correctly.
+        envs: GITHUB_REF_NAME
