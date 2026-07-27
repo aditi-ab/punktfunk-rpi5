@@ -199,6 +199,9 @@ fn is_management_cli(args: &[String]) -> bool {
         | Some("openapi")
         | Some("library")
         | Some("detect-conflicts")
+        // Reads the compositor's output list and exits — none of the host-startup work applies,
+        // and it must not re-run the pin's own startup report while printing that same list.
+        | Some("list-monitors")
         | Some("-h")
         | Some("--help")
         | Some("help")
@@ -456,6 +459,51 @@ fn real_main() -> Result<()> {
             let compositor = vdisplay::detect()?;
             vdisplay::probe(compositor).with_context(|| format!("{compositor:?} not ready"))?;
             println!("{compositor:?} ready");
+            Ok(())
+        }
+        // List the host's physical monitors — the connector names `PUNKTFUNK_CAPTURE_MONITOR`
+        // takes. An operator configuring an unattended host has to learn those names from
+        // somewhere, and "curl the management API before the host is configured" is not it.
+        #[cfg(target_os = "linux")]
+        Some("list-monitors") => {
+            let compositor = vdisplay::detect()?;
+            let monitors = vdisplay::monitors::list(compositor)
+                .with_context(|| format!("enumerate monitors on {compositor:?}"))?;
+            if monitors.is_empty() {
+                println!("{compositor:?}: no monitors");
+                return Ok(());
+            }
+            let pinned = pf_host_config::config().capture_monitor.as_deref();
+            println!("{compositor:?}:");
+            for m in &monitors {
+                let mut tags = Vec::new();
+                if m.primary {
+                    tags.push("primary");
+                }
+                if !m.enabled {
+                    tags.push("disabled");
+                }
+                if m.managed {
+                    tags.push("punktfunk virtual display");
+                }
+                if pinned.is_some_and(|p| p.eq_ignore_ascii_case(&m.connector)) {
+                    tags.push("PINNED (PUNKTFUNK_CAPTURE_MONITOR)");
+                }
+                println!(
+                    "  {:<12} {:>13} at +{},+{}  scale {}  {}{}",
+                    m.connector,
+                    m.mode_label(),
+                    m.x,
+                    m.y,
+                    m.scale,
+                    m.description,
+                    if tags.is_empty() {
+                        String::new()
+                    } else {
+                        format!("  [{}]", tags.join(", "))
+                    }
+                );
+            }
             Ok(())
         }
         // Create a virtual DualSense via UHID and exercise it (validation, no streaming session).
@@ -780,6 +828,8 @@ USAGE:
     punktfunk-host openapi                    print the management API's OpenAPI document (codegen)
     punktfunk-host punktfunk1-host [OPTIONS]  native punktfunk/1 host (QUIC control + UDP data plane)
     punktfunk-host probe-compositor           exit 0 iff the compositor is up + ready (bringup gate)
+    punktfunk-host list-monitors              list the host's physical monitors (Linux) — the
+                                              connector names PUNKTFUNK_CAPTURE_MONITOR takes
     punktfunk-host spike [OPTIONS]            capture→encode→file pipeline spike (dev tool)
 
 SERVE OPTIONS:

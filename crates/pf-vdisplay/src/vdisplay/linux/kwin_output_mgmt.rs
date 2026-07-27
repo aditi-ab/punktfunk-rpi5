@@ -493,15 +493,13 @@ pub(crate) fn list_monitors() -> anyhow::Result<Vec<crate::monitors::PhysicalMon
         .filter_map(|d| {
             let connector = d.name.clone()?;
             let dims = session.current_dims(d);
-            let label = match (d.make.as_deref(), d.model.as_deref()) {
-                (Some(make), Some(model)) if !make.is_empty() || !model.is_empty() => {
-                    format!("{make} {model}").trim().to_string()
-                }
-                _ => connector.clone(),
-            };
             Some(crate::monitors::PhysicalMonitor {
                 managed: connector.starts_with(MANAGED_PREFIX),
-                description: label,
+                description: crate::monitors::describe(
+                    d.make.as_deref().unwrap_or(""),
+                    d.model.as_deref().unwrap_or(""),
+                    &connector,
+                ),
                 // A disabled output has no current mode — report 0s rather than inventing one.
                 width: dims.map(|d| d.0).unwrap_or(0),
                 height: dims.map(|d| d.1).unwrap_or(0),

@@ -840,14 +840,9 @@ pub(crate) fn list_monitors() -> Result<Vec<crate::monitors::PhysicalMonitor>> {
             let (w, h, refresh) = current_mode_full(&state, connector)
                 .map(|(_id, w, h, hz)| (w.max(0) as u32, h.max(0) as u32, (hz * 1000.0) as u32))
                 .unwrap_or((0, 0, 0));
-            let label = format!("{vendor} {product}");
             crate::monitors::PhysicalMonitor {
                 connector: connector.clone(),
-                description: if label.trim().is_empty() {
-                    connector.clone()
-                } else {
-                    label.trim().to_string()
-                },
+                description: crate::monitors::describe(vendor, product, connector),
                 width: w,
                 height: h,
                 refresh_mhz: refresh,

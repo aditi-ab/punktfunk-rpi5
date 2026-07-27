@@ -47,6 +47,29 @@ pub struct PhysicalMonitor {
     pub managed: bool,
 }
 
+/// Build the picker label from a compositor's make/model, falling back to the connector.
+///
+/// Compositors fill unknown fields with the literal string `"Unknown"` rather than leaving them
+/// empty (seen on-glass: sway reports `"Unknown Unknown"` for a headless output), so treat that as
+/// absent too — a picker row reading "Unknown Unknown" is worse than one reading "DP-1".
+pub(crate) fn describe(make: &str, model: &str, connector: &str) -> String {
+    let known = |s: &str| {
+        let s = s.trim();
+        !s.is_empty() && !s.eq_ignore_ascii_case("unknown")
+    };
+    let label = [make, model]
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| known(s))
+        .collect::<Vec<_>>()
+        .join(" ");
+    if label.is_empty() {
+        connector.to_string()
+    } else {
+        label
+    }
+}
+
 impl PhysicalMonitor {
     /// `1920x1080@60` — for logs and pickers.
     pub fn mode_label(&self) -> String {
@@ -161,6 +184,18 @@ mod tests {
     fn a_miss_with_no_monitors_says_so() {
         let err = resolve(&[], "DP-1").unwrap_err().to_string();
         assert!(err.contains("no monitors at all"), "{err}");
+    }
+
+    /// Compositors write the literal "Unknown" instead of leaving make/model empty (sway does it
+    /// for headless outputs), so a picker must not end up showing "Unknown Unknown".
+    #[test]
+    fn describe_falls_back_to_the_connector_for_empty_or_unknown_fields() {
+        assert_eq!(describe("ACME", "U2720Q", "DP-1"), "ACME U2720Q");
+        assert_eq!(describe("Unknown", "Unknown", "HEADLESS-1"), "HEADLESS-1");
+        assert_eq!(describe("", "", "DP-1"), "DP-1");
+        // A half-known pair keeps the half that means something.
+        assert_eq!(describe("Unknown", "U2720Q", "DP-1"), "U2720Q");
+        assert_eq!(describe("  ", "unknown", "DP-2"), "DP-2");
     }
 
     #[test]

@@ -289,12 +289,13 @@ pub(crate) fn list_monitors() -> Result<Vec<crate::monitors::PhysicalMonitor>> {
         .filter_map(|m| {
             let connector = m.get("name")?.as_str()?.to_string();
             let num = |k: &str| m.get(k).and_then(|v| v.as_i64()).unwrap_or(0);
-            let description = m
-                .get("description")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.trim().is_empty())
-                .unwrap_or(&connector)
-                .to_string();
+            // Hyprland's `description` is already a "make model (connector)" string; treat it as
+            // the make and let the shared helper drop it when it is empty/Unknown.
+            let description = crate::monitors::describe(
+                m.get("description").and_then(|v| v.as_str()).unwrap_or(""),
+                "",
+                &connector,
+            );
             Some(crate::monitors::PhysicalMonitor {
                 connector,
                 description,

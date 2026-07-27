@@ -207,20 +207,29 @@ fn swaymsg(args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// Current output names from `swaymsg -t get_outputs` (JSON).
-fn output_names() -> Result<Vec<String>> {
+/// Run a swaymsg **query** (`-t <kind> --raw`) and parse its JSON.
+///
+/// ⚠️ Deliberately NOT [`swaymsg`]: that helper inserts `--` so its arguments are read as a sway
+/// *command*, which is right for `create_output` and wrong for a query — `-t` after `--` comes back
+/// as `Unknown/invalid command '-t'` (caught on-glass writing the monitor enumeration).
+fn swaymsg_query(kind: &str) -> Result<serde_json::Value> {
     let out = Command::new("swaymsg")
-        .args(["-t", "get_outputs", "--raw"])
+        .args(["-t", kind, "--raw"])
         .output()
         .context("run swaymsg (is sway installed?)")?;
     if !out.status.success() {
         bail!(
-            "swaymsg -t get_outputs failed: {}",
+            "swaymsg -t {kind} failed: {}",
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
     let raw = String::from_utf8_lossy(&out.stdout).into_owned();
-    let outputs: serde_json::Value = serde_json::from_str(&raw).context("parse get_outputs")?;
+    serde_json::from_str(&raw).with_context(|| format!("parse {kind}"))
+}
+
+/// Current output names from `swaymsg -t get_outputs` (JSON).
+fn output_names() -> Result<Vec<String>> {
+    let outputs = swaymsg_query("get_outputs")?;
     Ok(outputs
         .as_array()
         .context("get_outputs: not an array")?
@@ -235,8 +244,7 @@ fn output_names() -> Result<Vec<String>> {
 /// post-transform) — what `crate::monitors` documents. An inactive output has no `current_mode`, so
 /// its mode reads as zeros rather than a guess.
 pub(crate) fn list_monitors() -> Result<Vec<crate::monitors::PhysicalMonitor>> {
-    let raw = swaymsg(&["-t", "get_outputs", "--raw"])?;
-    let parsed: serde_json::Value = serde_json::from_str(&raw).context("parse get_outputs")?;
+    let parsed = swaymsg_query("get_outputs")?;
     let mut out: Vec<_> = parsed
         .as_array()
         .context("get_outputs: not an array")?
@@ -256,13 +264,12 @@ pub(crate) fn list_monitors() -> Result<Vec<crate::monitors::PhysicalMonitor>> {
                     .unwrap_or(0)
             };
             let str_field = |k: &str| o.get(k).and_then(|v| v.as_str()).unwrap_or("").trim();
-            let label = format!("{} {}", str_field("make"), str_field("model"));
             Some(crate::monitors::PhysicalMonitor {
-                description: if label.trim().is_empty() {
-                    connector.clone()
-                } else {
-                    label.trim().to_string()
-                },
+                description: crate::monitors::describe(
+                    str_field("make"),
+                    str_field("model"),
+                    &connector,
+                ),
                 width: mode("width").max(0) as u32,
                 height: mode("height").max(0) as u32,
                 // sway reports `refresh` in mHz already.
