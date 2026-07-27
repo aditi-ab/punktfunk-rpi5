@@ -8,6 +8,18 @@
 #   cp scripts/host.env.example ~/.config/punktfunk/host.env   # defaults are right for a desktop
 #   systemctl --user daemon-reload && systemctl --user enable --now punktfunk-host
 #
+# On that desktop-login route, ALSO install scripts/punktfunk-host-desktop-session.conf as a drop-in:
+# it binds the host to graphical-session.target, so a Plasma/GNOME restart restarts the host instead
+# of leaving it holding a dead Wayland socket + portal connection (the PartOf= below only covers the
+# appliance route, where we start the compositor ourselves). The drop-in's header has the commands.
+#
+# The host does NOT need the login shell's environment: it detects the live session itself per
+# connect and derives WAYLAND_DISPLAY, XDG_RUNTIME_DIR, DBUS_SESSION_BUS_ADDRESS, XDG_CURRENT_DESKTOP,
+# HYPRLAND_INSTANCE_SIGNATURE and SWAYSOCK from the running compositor (vdisplay::apply_session_env).
+# So host.env carries policy, not session plumbing, and `systemctl --user import-environment` is not
+# a prerequisite — the host pushes the live values into the manager env itself when a session switch
+# needs the portal to re-read them.
+#
 # Self-contained boot appliance (no login, no manual steps after boot). These routes PIN the
 # backend via PUNKTFUNK_COMPOSITOR — correct for a dedicated single-session box, but it turns off
 # live-session auto-detection, so never do it on a desktop that switches sessions (Game Mode etc.):

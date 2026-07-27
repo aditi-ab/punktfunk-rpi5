@@ -67,6 +67,12 @@ install -Dm0644 scripts/punktfunk-host.service     "$STAGE/usr/lib/systemd/user/
 # /usr/bin. Rewrite it so a fresh apt install (no hand-rolled unit) starts the installed binary.
 sed -i 's#%h/punktfunk/target/release/punktfunk-host#/usr/bin/punktfunk-host#' \
     "$STAGE/usr/lib/systemd/user/punktfunk-host.service"
+# Optional drop-in for a DESKTOP-LOGIN host: binds the host to graphical-session.target so a
+# Plasma/GNOME restart restarts it instead of leaving it on a dead compositor connection. Shipped
+# under /usr/share (NOT as an active drop-in) because it is wrong for the appliance route — the
+# operator copies it into ~/.config/systemd/user/punktfunk-host.service.d/ when they want it.
+install -Dm0644 scripts/punktfunk-host-desktop-session.conf \
+    "$STAGE/usr/share/punktfunk-host/punktfunk-host-desktop-session.conf"
 # Optional headless KWin session unit (the kwin --virtual appliance), as the RPM/Arch ship.
 # Repoint its ExecStart from the dev source tree to the packaged script. NOT enabled by default.
 install -Dm0644 scripts/punktfunk-kde-session.service "$STAGE/usr/lib/systemd/user/punktfunk-kde-session.service"

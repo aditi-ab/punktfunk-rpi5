@@ -284,6 +284,11 @@ install -Dm0644 scripts/punktfunk-host.service %{buildroot}%{_userunitdir}/punkt
 # The source unit's ExecStart points at the dev source tree; a packaged install has the binary at
 # %{_bindir}. Rewrite it so a fresh install (no hand-rolled unit) starts the installed binary.
 sed -i 's#%h/punktfunk/target/release/punktfunk-host#%{_bindir}/punktfunk-host#' %{buildroot}%{_userunitdir}/punktfunk-host.service
+# Optional drop-in for a DESKTOP-LOGIN host: binds the host to graphical-session.target so a
+# Plasma/GNOME restart restarts it instead of leaving it on a dead compositor connection. Shipped
+# under %{_datadir}/%{name} (NOT as an active drop-in) because it is wrong for the appliance route —
+# the operator copies it into ~/.config/systemd/user/punktfunk-host.service.d/ when they want it.
+install -Dm0644 scripts/punktfunk-host-desktop-session.conf %{buildroot}%{_datadir}/%{name}/punktfunk-host-desktop-session.conf
 
 # Optional headless KDE session unit (the kwin streaming appliance): brings up `kwin --virtual` on
 # wayland-kde via the packaged run-headless-kde.sh, so the host's kwin backend has a session whose
