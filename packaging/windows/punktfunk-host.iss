@@ -354,15 +354,31 @@ begin
   Result := ExpandConstant('{commonappdata}\punktfunk\host.env');
 end;
 
-{ True if another Moonlight-compatible streaming host is installed - by its SCM service key or its
-  Program Files directory. Sunshine and its forks all register a "<Name>Service" and install under
-  Program Files, so a registry + directory probe catches them without enumerating processes (which
-  pure Pascal can't do cleanly). }
-function StreamHostPresent(SvcKey, DirName: String): Boolean;
+{ True if another Moonlight-compatible streaming host is not merely present but will actually RUN.
+  Sunshine and its forks register a "<Name>Service"; `Start` is that service's start type
+  (REG_DWORD): 0 boot, 1 system, 2 automatic, 3 manual, 4 disabled. Only 0-2 come up on their own,
+  and only a host that comes up can take the GameStream ports or load a second virtual-display
+  driver - which is the entire content of the warning below.
+
+  DELIBERATELY NARROWER than it was. The old probe also counted the service key existing at ANY
+  start type, plus a bare Program Files\<Name> directory - so a disabled service, or a leftover folder
+  from an uninstall, read as a live conflict. Combined with the silent-install default of IDNO that
+  aborted setup, and a field report followed within hours of 0.20.0: `winget install
+  unom.PunktfunkHost` failed with exit code 1 (0x8A150006) on a box whose Sunshine was not running.
+  Nothing about a dormant install can clash, and the tray reached the same conclusion in this same
+  release (3e782852 dropped its always-on warning over a merely-INSTALLED Sunshine as a false
+  alarm) - the two surfaces now agree.
+
+  A host running as a plain user process rather than a service is not detected here, by choice:
+  that cannot be seen from pure Pascal, it is a runtime condition rather than an install-time one,
+  and the host already reports it where it belongs (the `punktfunk::detect` startup warning, the
+  `detect-conflicts` subcommand, and /api/v1/local/summary). }
+function StreamHostEnabled(SvcKey: String): Boolean;
+var
+  StartType: Cardinal;
 begin
-  Result := RegKeyExists(HKLM, 'SYSTEM\CurrentControlSet\Services\' + SvcKey)
-    or DirExists(ExpandConstant('{commonpf}\' + DirName))
-    or DirExists(ExpandConstant('{commonpf32}\' + DirName));
+  Result := RegQueryDWordValue(HKLM, 'SYSTEM\CurrentControlSet\Services\' + SvcKey, 'Start', StartType)
+    and (StartType <= 2);
 end;
 
 { Runs before any wizard page - the earliest point we can warn. Detect a conflicting host and let
@@ -375,11 +391,11 @@ begin
   { Record the fresh-vs-upgrade verdict while host.env still reflects the PREVIOUS run. }
   FreshHostInstall := not FileExists(HostEnvPath);
   Found := '';
-  if StreamHostPresent('SunshineService', 'Sunshine') then Found := Found + '    - Sunshine' + #13#10;
-  if StreamHostPresent('ApolloService', 'Apollo') then Found := Found + '    - Apollo' + #13#10;
-  if StreamHostPresent('VibeshineService', 'Vibeshine') then Found := Found + '    - Vibeshine' + #13#10;
-  if StreamHostPresent('VibepolloService', 'Vibepollo') then Found := Found + '    - Vibepollo' + #13#10;
-  if StreamHostPresent('LuminalShineService', 'LuminalShine') then Found := Found + '    - LuminalShine' + #13#10;
+  if StreamHostEnabled('SunshineService') then Found := Found + '    - Sunshine' + #13#10;
+  if StreamHostEnabled('ApolloService') then Found := Found + '    - Apollo' + #13#10;
+  if StreamHostEnabled('VibeshineService') then Found := Found + '    - Vibeshine' + #13#10;
+  if StreamHostEnabled('VibepolloService') then Found := Found + '    - Vibepollo' + #13#10;
+  if StreamHostEnabled('LuminalShineService') then Found := Found + '    - LuminalShine' + #13#10;
   if Found <> '' then
     { SuppressibleMsgBox, NOT MsgBox: a plain MsgBox ignores /SUPPRESSMSGBOXES and displays even
       under /VERYSILENT - i.e. an unattended install (winget) would block on a modal dialog with no
@@ -387,12 +403,15 @@ begin
       install onto a box that already runs Sunshine/Apollo ABORTS (Setup exits non-zero) instead of
       proceeding into the unsupported dual-host state the message describes. }
     Result := SuppressibleMsgBox(
-      'Another game-streaming host is already installed on this PC:' + #13#10#13#10 + Found + #13#10 +
+      { NB: keep #13#10 off the START of a line - ISPP reads a leading '#' as a preprocessor
+        directive and aborts the compile with "Unknown preprocessor directive". }
+      'Another game-streaming host is installed on this PC and set to start automatically:' + #13#10#13#10 + Found + #13#10 +
       'Running Punktfunk alongside Sunshine / Apollo / other Moonlight-compatible hosts is NOT ' +
       'supported. They bind the same GameStream network ports (47984, 47989, 47998-48010) and ' +
       'install a conflicting virtual-display driver, which causes pairing failures, "address ' +
       'already in use" errors and capture glitches.' + #13#10#13#10 +
-      'Stop and uninstall the other host before using Punktfunk.' + #13#10#13#10 +
+      'Stop and disable its service (or uninstall it) before using Punktfunk. A host that is ' +
+      'installed but disabled does not clash and is not reported here.' + #13#10#13#10 +
       'Continue with the installation anyway?',
       mbConfirmation, MB_YESNO or MB_DEFBUTTON2, IDNO) = IDYES;
 end;
