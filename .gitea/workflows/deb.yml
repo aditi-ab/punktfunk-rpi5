@@ -234,11 +234,18 @@ jobs:
           git config --global --add safe.directory "$PWD"
           # Same features the old combined build used: --nvenc (direct-SDK NVENC, real RFI on NVIDIA;
           # NVENC/CUDA is dlopen'd — no link dep, so this image needs no libcuda stub) + --vulkan-encode
-          # (raw VK_KHR_video_encode_h265 on AMD/Intel, pure ash). punktfunk-tray also ships in the host
-          # .deb (build-deb.sh builds+installs it). ffmpeg-sys-next links the image's bundled FFmpeg 8
-          # via PKG_CONFIG_PATH (set in rust-ci-noble).
+          # (raw VK_KHR_video_encode_h265 on AMD/Intel, pure ash). ffmpeg-sys-next links the image's
+          # bundled FFmpeg 8 via PKG_CONFIG_PATH (set in rust-ci-noble).
+          #
+          # punktfunk-tray is deliberately NOT in this invocation — build-deb.sh builds it separately,
+          # and that split is load-bearing (see the identical note in the RPM spec / Arch PKGBUILD):
+          # cargo unifies features across one build, so co-building the tray with the host pulls the
+          # host's ashpd -> zbus/tokio onto the tray's shared zbus and the tray panics at every launch
+          # with "there is no reactor running, must be called from the context of a Tokio 1.x runtime".
+          # It WAS listed here, which is why only the .deb shipped a crashing tray while the RPM and
+          # Arch packages — which already split it — were fine.
           cargo build --release --locked --features punktfunk-host/nvenc,punktfunk-host/vulkan-encode \
-            -p punktfunk-host -p punktfunk-tray
+            -p punktfunk-host
 
       - name: Build host .deb (FFmpeg bundled)
         # BUNDLE_FFMPEG=1 copies the image's /opt/ffmpeg libav* into the package and repoints the

@@ -193,7 +193,12 @@ The `${package}/share/punktfunk-host/headless/` helpers (KDE/Sway session script
 
 ```sh
 nix develop        # pinned toolchain (rust-toolchain.toml) + all system libs
-cargo build --release -p punktfunk-host -p punktfunk-client-linux -p punktfunk-client-session -p punktfunk-tray
+cargo build --release -p punktfunk-host -p punktfunk-client-linux -p punktfunk-client-session
+# The tray gets its OWN invocation — co-building it with the host unifies the host's
+# ashpd -> zbus/tokio onto the tray's zbus (which runs ksni's async-io executor, no tokio runtime),
+# and the resulting binary panics at launch: "there is no reactor running, must be called from the
+# context of a Tokio 1.x runtime". Same split the .deb / RPM / Arch packaging does.
+cargo build --release -p punktfunk-tray
 ```
 
 The shell exports `PF_FFVK_VULKAN_INCLUDE` (Vulkan headers for pf-ffvk bindgen) and an
@@ -218,8 +223,12 @@ The shell exports `PF_FFVK_VULKAN_INCLUDE` (Vulkan headers for pf-ffvk bindgen) 
   host would pull the host's `ashpd → zbus/tokio` onto the tray's shared `zbus`, and the tray then
   panics at startup (`there is no reactor running, must be called from the context of a Tokio 1.x
   runtime`). Building it as a separate `-p punktfunk-tray` invocation keeps its `zbus` on async-io;
-  the host package copies the resulting binary into its `$out`. (The deb/rpm/arch builds co-build the
-  two in one `cargo build`, so they share this latent crash on Linux — a separate fix.)
+  the host package copies the resulting binary into its `$out`. (The rpm/arch builds split it the same
+  way. The **.deb did not**, despite its sibling comments claiming otherwise: `deb.yml` co-built
+  `-p punktfunk-host -p punktfunk-tray`, and `build-deb.sh`'s own standalone build was skipped because
+  the poisoned artifact already existed — so this shipped as a real crash-at-launch on Debian/Ubuntu,
+  not a latent one. Fixed 2026-07-27: the workflow no longer co-builds it and `build-deb.sh` now
+  rebuilds it unconditionally.)
 - **The bun packages (`punktfunk-web`, `punktfunk-scripting`) — their `bun install` deps hashes.**
   Both build their `node_modules` in a *fixed-output derivation* (`bun install` needs the network +
   the read-public `@unom` npm registry). Each `outputHash` (in `packaging/nix/packages.nix`) is

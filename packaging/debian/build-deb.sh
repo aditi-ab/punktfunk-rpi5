@@ -39,10 +39,16 @@ if [ ! -x "$BIN" ]; then
   PUNKTFUNK_BUILD_VERSION="$VERSION" cargo build --release -p "$PKG" --locked   # stamp --version (build.rs)
 fi
 TRAY_BIN="target/release/punktfunk-tray"
-if [ ! -x "$TRAY_BIN" ]; then
-  echo "==> building punktfunk-tray (release)"
-  cargo build --release -p punktfunk-tray --locked
-fi
+# ALWAYS built here, in its OWN cargo invocation — load-bearing, not tidiness, and deliberately not
+# skipped when the artifact already exists. Cargo unifies features across everything in one build,
+# so a caller that co-built the tray with the host (the .deb workflow used to) leaves behind a
+# binary whose zbus took the host's ashpd -> zbus/tokio while the tray runs ksni's async-io
+# executor with no tokio runtime by design — it then panics at every launch with "there is no
+# reactor running, must be called from the context of a Tokio 1.x runtime". Skipping the rebuild is
+# exactly how that binary shipped. Building it alone keeps its zbus on async-io; cargo no-ops this
+# when the existing artifact was already resolved that way, and rebuilds it when it wasn't.
+echo "==> building punktfunk-tray (release, own invocation — see comment above)"
+cargo build --release -p punktfunk-tray --locked
 
 STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT
