@@ -89,6 +89,11 @@ extern "C" fn driver_add(_driver: WDFDRIVER, mut init: PWDFDEVICE_INIT) -> NTSTA
     cfg.EvtIddCxMonitorSetGammaRamp = Some(callbacks::set_gamma_ramp);
     cfg.EvtIddCxMonitorAssignSwapChain = Some(callbacks::assign_swap_chain);
     cfg.EvtIddCxMonitorUnassignSwapChain = Some(callbacks::unassign_swap_chain);
+    // DDC fail-fast (stall-immunity): monitor-control software polls the virtual monitor's DDC —
+    // in exclusive topology it is the ONLY monitor. These answer every probe with an immediate
+    // STATUS_NOT_SUPPORTED instead of whatever slow path an unregistered interface takes.
+    cfg.EvtIddCxMonitorI2CTransmit = Some(callbacks::monitor_i2c_transmit);
+    cfg.EvtIddCxMonitorI2CReceive = Some(callbacks::monitor_i2c_receive);
     cfg.EvtIddCxDeviceIoControl = Some(callbacks::device_io_control);
 
     // SAFETY: init is the framework device-init; cfg is fully populated + sized. (Links IddCxStub.)

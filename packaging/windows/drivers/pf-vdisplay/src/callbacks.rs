@@ -375,3 +375,30 @@ pub unsafe extern "C" fn device_io_control(
     // SAFETY: `request` is the framework-provided WDFREQUEST; `control::dispatch` completes it exactly once.
     unsafe { crate::control::dispatch(request, ioctl_code) };
 }
+
+/// DDC/CI transmit toward the virtual monitor — refuse INSTANTLY (stall-immunity: DDC fail-fast).
+///
+/// In exclusive topology the virtual display is the ONLY monitor on the desktop, so
+/// monitor-control software (the Twinkle Tray / PowerToys PowerDisplay / Monitorian class) aims
+/// its entire DDC traffic — brightness polls, capabilities-string requests — at THIS monitor.
+/// There is no bus and no sink here; the only wrong answer is a slow one (a timeout-shaped
+/// failure occupies win32k's physical-monitor path, serialized per monitor, for its full
+/// duration). Registering the pair pins every probe's cost to one immediate
+/// `STATUS_NOT_SUPPORTED`. EDID needs no equivalent: the OS serves descriptor queries from the
+/// blob supplied at monitor creation without calling the driver.
+pub unsafe extern "C" fn monitor_i2c_transmit(
+    _monitor: iddcx::IDDCX_MONITOR,
+    _p_in: *const iddcx::IDARG_IN_I2C_TRANSMIT,
+) -> NTSTATUS {
+    crate::STATUS_NOT_SUPPORTED
+}
+
+/// DDC/CI receive from the virtual monitor — same contract as [`monitor_i2c_transmit`]. (The
+/// receive DDI has no out-arg at the callback — data would flow back through an async completion;
+/// a synchronous failure return refuses the whole transaction, which is exactly the point.)
+pub unsafe extern "C" fn monitor_i2c_receive(
+    _monitor: iddcx::IDDCX_MONITOR,
+    _p_in: *const iddcx::IDARG_IN_I2C_RECEIVE,
+) -> NTSTATUS {
+    crate::STATUS_NOT_SUPPORTED
+}
