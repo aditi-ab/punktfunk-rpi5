@@ -32,6 +32,7 @@ use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
+use wayland_client::protocol::wl_output::{self, WlOutput};
 use wayland_client::protocol::wl_registry::{self, WlRegistry};
 use wayland_client::{Connection, Dispatch, Proxy, QueueHandle};
 
@@ -914,6 +915,10 @@ struct State {
     node_id: Option<u32>,
     failed: Option<String>,
     closed: bool,
+    /// Every `wl_output` KWin advertises, keyed by the proxy, with its connector name once the
+    /// `name` event arrives. Only the monitor-mirror path ([`stream_existing_output`]) needs these
+    /// — `stream_output` takes a `wl_output` object, so the connector has to be resolved to one.
+    outputs: Vec<(WlOutput, Option<String>)>,
 }
 
 impl Dispatch<WlRegistry, ()> for State {
@@ -934,6 +939,34 @@ impl Dispatch<WlRegistry, ()> for State {
             if interface == Screencast::interface().name {
                 let v = version.min(MAX_VERSION);
                 state.screencast = Some(registry.bind::<Screencast, _, _>(name, v, qh, ()));
+            } else if interface == WlOutput::interface().name {
+                // v4 is where `wl_output.name` (the connector) arrives; bind at least that when the
+                // compositor offers it, else bind what it has and let the resolve fail loudly
+                // rather than mirroring an unidentifiable head.
+                let v = version.min(WL_OUTPUT_MAX_VERSION);
+                let out = registry.bind::<WlOutput, _, _>(name, v, qh, ());
+                state.outputs.push((out, None));
+            }
+        }
+    }
+}
+
+/// `wl_output` version we bind at: 4 brings the `name` event carrying the connector
+/// (`DP-1`, …) — the only way to tell KWin's outputs apart on this connection.
+const WL_OUTPUT_MAX_VERSION: u32 = 4;
+
+impl Dispatch<WlOutput, ()> for State {
+    fn event(
+        state: &mut Self,
+        output: &WlOutput,
+        event: wl_output::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let wl_output::Event::Name { name } = event {
+            if let Some(slot) = state.outputs.iter_mut().find(|(o, _)| o == output) {
+                slot.1 = Some(name);
             }
         }
     }
@@ -988,6 +1021,50 @@ fn virtual_output_thread(
     }
 }
 
+/// Start recording the existing KWin output named `connector` (the monitor-mirror path), returning
+/// its PipeWire node id and the keepalive whose drop stops the recording.
+///
+/// `hw_cursor` selects the pointer mode exactly as the virtual-output path does: metadata for a
+/// cursor-channel session, embedded otherwise, so the cursor behaves the same whichever source a
+/// session is on.
+pub(crate) fn stream_existing_output(
+    connector: &str,
+    hw_cursor: bool,
+) -> Result<(u32, Box<dyn Send>)> {
+    let pointer_mode = if hw_cursor {
+        POINTER_METADATA
+    } else {
+        POINTER_EMBEDDED
+    };
+    let (setup_tx, setup_rx) = std::sync::mpsc::channel::<Result<u32, String>>();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_thread = stop.clone();
+    let connector_thread = connector.to_string();
+    thread::Builder::new()
+        .name("punktfunk-kwin-mirror".into())
+        .spawn(move || {
+            if let Err(e) = run_existing(&connector_thread, pointer_mode, &setup_tx, &stop_thread) {
+                let _ = setup_tx.send(Err(format!("{e:#}")));
+            }
+        })
+        .context("spawn KWin monitor-mirror thread")?;
+    let node_id = match setup_rx.recv_timeout(Duration::from_secs(20)) {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => bail!("KWin monitor mirror failed: {e}"),
+        Err(_) => bail!("timed out recording the KWin output {connector:?}"),
+    };
+    Ok((node_id, Box::new(StopOnDrop(stop)) as Box<dyn Send>))
+}
+
+/// Stops the mirror thread (and thus the recording) when the capturer drops it.
+struct StopOnDrop(Arc<AtomicBool>);
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
 /// Readiness probe: connect to the KWin Wayland socket, roundtrip the registry, and confirm
 /// the privileged `zkde_screencast` global is actually advertised. This is exactly what
 /// [`run`] needs before it can create a virtual output, so a session-bringup script can poll
@@ -1017,6 +1094,106 @@ pub fn probe() -> Result<()> {
 /// [`probe`] checks, surfaced as a bool for compositor enumeration.
 pub fn is_available() -> bool {
     probe().is_ok()
+}
+
+/// Stream an **existing** KWin output — the monitor-mirror path
+/// (`design/per-monitor-portal-capture.md` L1). Same privileged global and the same thread/keepalive
+/// shape as the virtual-output path; `stream_output` simply takes a `wl_output` instead of minting
+/// one, so there is no dialog, no portal, and no chooser: the connector name IS the selection.
+///
+/// Returns the PipeWire node id. The thread parks until `stop`, holding the Wayland connection that
+/// is the cast's lifetime — dropping it stops the recording and leaves the monitor untouched (we
+/// never created it, so there is nothing to tear down; §7.1).
+fn run_existing(
+    connector: &str,
+    pointer_mode: u32,
+    setup_tx: &Sender<Result<u32, String>>,
+    stop: &AtomicBool,
+) -> Result<()> {
+    let conn = Connection::connect_to_env()
+        .context("connect to KWin Wayland (is WAYLAND_DISPLAY set to the KWin socket?)")?;
+    let mut queue = conn.new_event_queue();
+    let qh = queue.handle();
+    let _registry = conn.display().get_registry(&qh, ());
+
+    let mut state = State::default();
+    // Two roundtrips: the first processes the globals (binding screencast + every wl_output), the
+    // second drains each output's property burst — the `name` event we resolve the connector by.
+    queue.roundtrip(&mut state).context("registry roundtrip")?;
+    queue
+        .roundtrip(&mut state)
+        .context("wl_output property roundtrip")?;
+
+    let screencast = state.screencast.clone().ok_or_else(|| {
+        anyhow!(
+            "KWin does not expose zkde_screencast_unstable_v1 to this client — install the host's \
+             .desktop (io.unom.Punktfunk.Host.desktop, X-KDE-Wayland-Interfaces) and re-login so \
+             KWin authorizes it, or run KWin with KWIN_WAYLAND_NO_PERMISSION_CHECKS=1 (headless test)"
+        )
+    })?;
+
+    // Resolve the connector to a bound wl_output. A miss is a hard error naming what IS there:
+    // mirroring some other monitor because the requested one is unplugged shows the operator a
+    // screen they did not ask for, which is worse than a session that refuses with a reason.
+    let named: Vec<&str> = state
+        .outputs
+        .iter()
+        .filter_map(|(_, n)| n.as_deref())
+        .collect();
+    let output = state
+        .outputs
+        .iter()
+        .find(|(_, n)| n.as_deref() == Some(connector))
+        .or_else(|| {
+            state.outputs.iter().find(|(_, n)| {
+                n.as_deref()
+                    .is_some_and(|n| n.eq_ignore_ascii_case(connector))
+            })
+        })
+        .map(|(o, _)| o.clone())
+        .ok_or_else(|| {
+            if named.is_empty() {
+                anyhow!(
+                    "KWin advertised no named wl_output (needs wl_output v4 for the connector \
+                     name) — cannot mirror {connector:?}"
+                )
+            } else {
+                anyhow!(
+                    "KWin has no output named {connector:?} — it has: {}",
+                    named.join(", ")
+                )
+            }
+        })?;
+
+    let stream = screencast.stream_output(&output, pointer_mode, &qh, ());
+    tracing::info!(
+        connector,
+        embedded_pointer = pointer_mode != POINTER_METADATA,
+        "KWin: recording an existing output; awaiting PipeWire node"
+    );
+
+    let node_id = loop {
+        queue
+            .blocking_dispatch(&mut state)
+            .context("wayland dispatch (awaiting created)")?;
+        if let Some(node) = state.node_id {
+            break node;
+        }
+        if let Some(e) = state.failed.take() {
+            bail!("stream_output failed: {e}");
+        }
+        if state.closed {
+            bail!("KWin closed the stream before it was created");
+        }
+    };
+    setup_tx
+        .send(Ok(node_id))
+        .map_err(|_| anyhow!("monitor-mirror opener went away"))?;
+
+    park_until_stopped(&conn, &mut queue, &mut state, stop, connector, node_id)?;
+    stream.close();
+    let _ = conn.flush();
+    Ok(())
 }
 
 fn run(
@@ -1080,15 +1257,31 @@ fn run(
         .send(Ok(node_id))
         .map_err(|_| anyhow!("virtual-output opener went away"))?;
 
-    // Keep the connection (and thus the virtual output) alive until told to stop, observing
-    // `closed`. blocking_dispatch can't be interrupted, so poll the connection fd with a short
-    // timeout so `stop` is honored within ~200 ms.
+    park_until_stopped(&conn, &mut queue, &mut state, stop, name, node_id)?;
+
+    // Best-effort clean teardown; dropping the connection also makes KWin reclaim the output.
+    stream.close();
+    let _ = conn.flush();
+    Ok(())
+}
+
+/// Keep the connection (and thus the stream) alive until told to stop, observing `closed`.
+/// `blocking_dispatch` can't be interrupted, so poll the connection fd with a short timeout and
+/// honor `stop` within ~200 ms. Shared by the virtual-output and monitor-mirror paths — for a
+/// virtual output this connection IS the output's lifetime; for a mirror it is only the
+/// recording's, and the monitor itself is untouched either way.
+fn park_until_stopped(
+    conn: &Connection,
+    queue: &mut wayland_client::EventQueue<State>,
+    state: &mut State,
+    stop: &AtomicBool,
+    output: &str,
+    node_id: u32,
+) -> Result<()> {
     while !stop.load(Ordering::Relaxed) {
-        queue
-            .dispatch_pending(&mut state)
-            .context("dispatch_pending")?;
+        queue.dispatch_pending(state).context("dispatch_pending")?;
         if state.closed {
-            tracing::warn!(output = %name, node_id, "KWin closed the virtual-output stream");
+            tracing::warn!(output = %output, node_id, "KWin closed the screencast stream");
             break;
         }
         conn.flush().context("wayland flush")?;
@@ -1110,10 +1303,6 @@ fn run(
             let _ = guard.read();
         } // else: timeout or signal — drop the guard, re-check `stop`
     }
-
-    // Best-effort clean teardown; dropping the connection also makes KWin reclaim the output.
-    stream.close();
-    let _ = conn.flush();
     Ok(())
 }
 

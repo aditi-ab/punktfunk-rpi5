@@ -231,26 +231,42 @@ fn real_main() -> Result<()> {
         );
     }
 
-    // Report a `PUNKTFUNK_CAPTURE_MONITOR` pin at startup — the operator sets it in a host.env and
-    // then has no session to watch, so this is the only place a typo can surface. It is deliberately
-    // loud about not being enforced yet: a knob that is parsed but inert must SAY so, or a silent
-    // "it didn't work" reads as a bug.
+    // Resolve a `PUNKTFUNK_CAPTURE_MONITOR` pin at startup: report it (the operator sets it in a
+    // host.env and then has no session to watch, so this is where a typo has to surface), and aim
+    // absolute input at that head.
+    //
+    // The anchor is set HERE rather than inside the mirror backend for two reasons: pf-vdisplay must
+    // not depend on pf-inject (its crate doc), and the anchor is a host-level pin anyway — the
+    // injector is host-lifetime and shared by every concurrent session, so there is nothing
+    // per-session to track (`design/per-monitor-portal-capture.md` §7.2).
     #[cfg(target_os = "linux")]
     if !management_cli {
         if let Some(want) = pf_host_config::config().capture_monitor.as_deref() {
             match pf_vdisplay::detect().and_then(pf_vdisplay::monitors::list) {
                 Ok(ms) => match pf_vdisplay::monitors::resolve(&ms, want) {
-                    Ok(m) => tracing::info!(
-                        connector = %m.connector,
-                        description = %m.description,
-                        mode = %m.mode_label(),
-                        at = %format!("+{}+{}", m.x, m.y),
-                        "PUNKTFUNK_CAPTURE_MONITOR names this monitor — NOTE: per-monitor capture \
-                         is not implemented yet, so sessions still use the normal display path"
-                    ),
+                    Ok(m) => {
+                        // Match the libei region by the head's ORIGIN: two monitors can share a
+                        // size — and a mirrored head's region is not the client's size at all — so
+                        // size matching would put the pointer on the wrong screen.
+                        pf_inject::set_absolute_anchor(Some(pf_inject::AbsoluteAnchor {
+                            origin: Some((m.x, m.y)),
+                            mapping_id: None,
+                        }));
+                        tracing::info!(
+                            connector = %m.connector,
+                            description = %m.description,
+                            mode = %m.mode_label(),
+                            at = %format!("+{}+{}", m.x, m.y),
+                            "PUNKTFUNK_CAPTURE_MONITOR: sessions will mirror this monitor (no \
+                             virtual display) and absolute input is anchored to it"
+                        );
+                    }
+                    // Left unanchored on purpose: a pin that resolves to nothing must not aim input
+                    // at a guess. The session's own `create` fails with the same reason.
                     Err(e) => tracing::warn!(
                         error = %e,
-                        "PUNKTFUNK_CAPTURE_MONITOR names no monitor on this host"
+                        "PUNKTFUNK_CAPTURE_MONITOR names no monitor on this host — sessions will \
+                         fail to start until it is corrected or unset"
                     ),
                 },
                 Err(e) => tracing::warn!(

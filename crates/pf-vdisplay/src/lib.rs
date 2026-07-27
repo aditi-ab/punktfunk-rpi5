@@ -289,7 +289,19 @@ pub fn rebuild_probe_active() -> bool {
 }
 
 /// Open the virtual-display driver for `compositor`.
+///
+/// A `PUNKTFUNK_CAPTURE_MONITOR` pin routes to the **mirror** backend instead: the host streams
+/// that physical head and creates no virtual display at all. Deliberately resolved here, at the one
+/// place every session opens a display, so the pin can't be honored on one plane and ignored on
+/// another — it is a host-wide setting (`design/per-monitor-portal-capture.md` §5.3).
 pub fn open(compositor: Compositor) -> Result<Box<dyn VirtualDisplay>> {
+    #[cfg(target_os = "linux")]
+    if let Some(connector) = pf_host_config::config().capture_monitor.as_deref() {
+        return Ok(Box::new(mirror::MirrorDisplay::new(
+            compositor,
+            connector.to_string(),
+        )?));
+    }
     #[cfg(target_os = "linux")]
     {
         match compositor {
@@ -365,6 +377,14 @@ pub mod policy;
 // `design/per-monitor-portal-capture.md` §5.1.
 #[path = "vdisplay/monitors.rs"]
 pub mod monitors;
+
+// The monitor-mirror backend: stream a head the compositor ALREADY has (the
+// `PUNKTFUNK_CAPTURE_MONITOR` pin) instead of creating one. Implements `VirtualDisplay` so the
+// session machinery is unchanged, but reports `DisplayOwnership::External` so none of the
+// virtual-display lifecycle policy is applied to someone else's monitor.
+#[cfg(target_os = "linux")]
+#[path = "vdisplay/mirror.rs"]
+mod mirror;
 
 // The pure per-display lifecycle state machine (refcount + linger + pin), platform-neutral and
 // property-tested; the registry executes the side effects its transitions dictate.
