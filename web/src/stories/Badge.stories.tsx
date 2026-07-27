@@ -5,6 +5,7 @@ const VARIANTS = [
 	"default",
 	"secondary",
 	"success",
+	"warning",
 	"destructive",
 	"outline",
 ] as const;

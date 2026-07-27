@@ -56,6 +56,9 @@
 	--primary-foreground: #ffffff;
 
 	--success: oklch(0.6 0.14 160);
+	/* Amber — "needs your attention but nothing is broken" (unsaved edits), the badge
+	   counterpart of the inline amber warning text. */
+	--warning: oklch(0.72 0.15 75);
 	--destructive: oklch(0.55 0.22 18);
 	--destructive-foreground: #ffffff;
 
@@ -101,6 +104,7 @@
 	--primary-foreground: #141019;
 
 	--success: oklch(0.7 0.15 160);
+	--warning: oklch(0.78 0.16 75);
 	--destructive: oklch(0.62 0.21 18);
 	--destructive-foreground: oklch(0.985 0 0);
 }
@@ -142,6 +146,7 @@
 	--color-destructive: var(--destructive);
 	--color-destructive-foreground: var(--destructive-foreground);
 	--color-success: var(--success);
+	--color-warning: var(--warning);
 	--color-border: var(--border);
 	--color-input: var(--input);
 	--color-ring: var(--ring);

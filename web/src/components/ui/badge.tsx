@@ -12,6 +12,9 @@ const badgeVariants = cva(
 				destructive:
 					"border-transparent bg-destructive text-destructive-foreground",
 				success: "border-transparent bg-[var(--success)] text-white",
+				// Attention, not failure — pending/unsaved state. Dark text: amber is a light
+				// colour in both themes, and white on it fails contrast.
+				warning: "border-transparent bg-[var(--warning)] text-black",
 				outline: "text-foreground",
 			},
 		},

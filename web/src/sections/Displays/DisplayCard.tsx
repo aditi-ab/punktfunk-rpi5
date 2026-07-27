@@ -2,10 +2,18 @@ import { useQueryClient } from "@tanstack/react-query";
 import { Button } from "@unom/ui/button";
 import { toast } from "@unom/ui/toast";
 import { Pencil, Plus, RefreshCw, Trash2 } from "lucide-react";
-import { type FC, type MouseEvent, type ReactNode, useEffect, useRef, useState } from "react";
 import {
-	getGetDisplayStateQueryKey,
+	type FC,
+	type MouseEvent,
+	type ReactNode,
+	useEffect,
+	useRef,
+	useState,
+} from "react";
+import { ApiError } from "@/api/fetcher";
+import {
 	getGetDisplaySettingsQueryKey,
+	getGetDisplayStateQueryKey,
 	useCreateCustomPreset,
 	useDeleteCustomPreset,
 	useGetDisplaySettings,
@@ -28,7 +36,6 @@ import type {
 	Preset,
 	Topology,
 } from "@/api/gen/model";
-import { ApiError } from "@/api/fetcher";
 import { QueryState } from "@/components/query-state";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -89,15 +96,47 @@ export const DisplaySection: FC = () => {
 			},
 		);
 
+	// Pending edits: the Custom fields do NOT auto-apply (unlike a preset click or an experimental
+	// toggle), so the draft can silently diverge from what the host is actually running. Reading the
+	// ref during render is safe here because every write to it is paired with a `setDraft`, so a
+	// changed seed always comes with the re-render that reads it.
+	const dirty =
+		draft !== null &&
+		seeded.current !== null &&
+		!deepEqual(draft, seeded.current);
+	const revert = () => {
+		if (seeded.current) setDraft(seeded.current);
+	};
+
+	// Last line of defence: a reload/close with pending edits loses them silently otherwise. The
+	// browser shows its own generic wording — the text is ignored, only returning a value counts.
+	useEffect(() => {
+		if (!dirty) return;
+		const warn = (e: BeforeUnloadEvent) => e.preventDefault();
+		window.addEventListener("beforeunload", warn);
+		return () => window.removeEventListener("beforeunload", warn);
+	}, [dirty]);
+
 	return (
 		<div className="flex flex-col gap-card">
 			<Card>
 				<CardHeader>
-					<CardTitle>{m.display_config_title()}</CardTitle>
+					<div className="flex flex-wrap items-center justify-between gap-2">
+						<CardTitle>{m.display_config_title()}</CardTitle>
+						{/* Visible without scrolling to the save button — the card is taller than the
+						    viewport, which is exactly how the pending edits went unnoticed. */}
+						{dirty && <Badge variant="warning">{m.display_unsaved()}</Badge>}
+					</div>
 				</CardHeader>
 				<CardContent className="space-y-4">
-					<p className="max-w-prose text-sm text-muted-foreground">{m.host_displays_help()}</p>
-					<QueryState isLoading={q.isLoading} error={q.error} refetch={q.refetch}>
+					<p className="max-w-prose text-sm text-muted-foreground">
+						{m.host_displays_help()}
+					</p>
+					<QueryState
+						isLoading={q.isLoading}
+						error={q.error}
+						refetch={q.refetch}
+					>
 						{q.data && draft && (
 							<DisplayForm
 								draft={draft}
@@ -106,6 +145,8 @@ export const DisplaySection: FC = () => {
 								customPresets={q.data.custom_presets}
 								apply={apply}
 								busy={save.isPending}
+								dirty={dirty}
+								revert={revert}
 								error={apiErrorMessage(save.error)}
 							/>
 						)}
@@ -141,8 +182,22 @@ const DisplayForm: FC<{
 	customPresets: CustomPreset[];
 	apply: (p: DisplayPolicy) => void;
 	busy: boolean;
+	/** The draft differs from what the host has stored — drives the save bar + the discard guard. */
+	dirty: boolean;
+	/** Throw the draft away and go back to the stored policy. */
+	revert: () => void;
 	error?: string;
-}> = ({ draft, setDraft, presets, customPresets, apply, busy, error }) => {
+}> = ({
+	draft,
+	setDraft,
+	presets,
+	customPresets,
+	apply,
+	busy,
+	dirty,
+	revert,
+	error,
+}) => {
 	const qc = useQueryClient();
 	const createPreset = useCreateCustomPreset();
 	const updatePreset = useUpdateCustomPreset();
@@ -169,11 +224,19 @@ const DisplayForm: FC<{
 		max_displays: draft.max_displays ?? 4,
 	};
 	const effective: EffectivePolicy =
-		(isCustom ? undefined : presets.find((p) => p.id === preset)?.fields) ?? customFields;
+		(isCustom ? undefined : presets.find((p) => p.id === preset)?.fields) ??
+		customFields;
 
 	// The five named presets apply in ONE click; "Custom" reveals the fields, seeded from the current
 	// effective behavior (nothing changes until you Save).
 	const pickPreset = (id: string) => {
+		// A preset click overwrites the whole policy, so hand-edits that were never saved would
+		// vanish without a word — the same failure as not finding the Save button, one click later.
+		if (dirty && id !== "custom" && !confirm(m.display_discard_confirm()))
+			return;
+		// Already hand-editing: re-seeding would fill in defaults for fields the stored policy
+		// leaves unset and flag "unsaved changes" for a click that changed nothing.
+		if (id === "custom" && isCustom) return;
 		if (id === "custom") {
 			setDraft({
 				version: 1,
@@ -201,7 +264,8 @@ const DisplayForm: FC<{
 
 	// Applying a custom preset writes a `Custom` policy carrying its saved fields + game-session (the
 	// one axis a preset DOES set) — the host has no separate apply route (design/gamemode-and-…).
-	const applyCustomPreset = (p: CustomPreset) =>
+	const applyCustomPreset = (p: CustomPreset) => {
+		if (dirty && !confirm(m.display_discard_confirm())) return;
 		apply({
 			version: 1,
 			preset: "custom",
@@ -216,6 +280,7 @@ const DisplayForm: FC<{
 			// (found on-glass, .136). Every orthogonal axis has to be listed.
 			capture_monitor: draft.capture_monitor ?? null,
 		});
+	};
 
 	// A custom card is "current" when the in-force policy is a Custom one whose fields + game-session
 	// value-match this preset (there is no id on DisplayPolicy — match by value).
@@ -231,7 +296,11 @@ const DisplayForm: FC<{
 		if (!name) return; // cancelled or empty
 		createPreset.mutate(
 			{
-				data: { name, fields: effective, game_session: draft.game_session ?? "auto" },
+				data: {
+					name,
+					fields: effective,
+					game_session: draft.game_session ?? "auto",
+				},
 			},
 			{ onSuccess: invalidateSettings },
 		);
@@ -240,7 +309,14 @@ const DisplayForm: FC<{
 		const name = prompt(m.display_preset_name(), p.name)?.trim();
 		if (!name) return;
 		updatePreset.mutate(
-			{ id: p.id, data: { name, fields: p.fields, game_session: p.game_session ?? "auto" } },
+			{
+				id: p.id,
+				data: {
+					name,
+					fields: p.fields,
+					game_session: p.game_session ?? "auto",
+				},
+			},
 			{ onSuccess: invalidateSettings },
 		);
 	};
@@ -248,7 +324,11 @@ const DisplayForm: FC<{
 		updatePreset.mutate(
 			{
 				id: p.id,
-				data: { name: p.name, fields: effective, game_session: draft.game_session ?? "auto" },
+				data: {
+					name: p.name,
+					fields: effective,
+					game_session: draft.game_session ?? "auto",
+				},
 			},
 			{ onSuccess: invalidateSettings },
 		);
@@ -259,21 +339,27 @@ const DisplayForm: FC<{
 
 	const ka = customFields.keep_alive;
 	// The duration value, remembered across the Off/Keep toggle so switching back restores it.
-	const [keepSecs, setKeepSecs] = useState(ka.mode === "duration" ? ka.seconds : 300);
+	const [keepSecs, setKeepSecs] = useState(
+		ka.mode === "duration" ? ka.seconds : 300,
+	);
 
 	return (
 		<div className="space-y-6">
 			{/* One-click presets — a 2-up grid so each has room to breathe */}
 			<div className="space-y-4">
-				<Label className="mb-1 block text-base font-semibold">{m.display_preset()}</Label>
+				<Label className="mb-1 block text-base font-semibold">
+					{m.display_preset()}
+				</Label>
 				<div className="grid gap-3 sm:grid-cols-2">
 					{PRESET_ORDER.map((id) => {
 						const p = presets.find((x) => x.id === id);
 						const fields = id === "custom" ? undefined : p?.fields;
-						const summary = id === "custom" ? m.display_custom_desc() : p?.summary;
+						const summary =
+							id === "custom" ? m.display_custom_desc() : p?.summary;
 						// The built-in "Custom" card is the hand-edit mode; when the active Custom policy
 						// value-matches a saved preset, that preset's card owns the "current" ring instead.
-						const selected = preset === id && !(id === "custom" && anyCustomSelected);
+						const selected =
+							preset === id && !(id === "custom" && anyCustomSelected);
 						const soon = DISABLED_PRESETS.has(id);
 						const disabled = busy || soon;
 						const pick = () => {
@@ -310,18 +396,30 @@ const DisplayForm: FC<{
 										)}
 									</span>
 									{selected && (
-										<Badge variant="success">{m.display_preset_current()}</Badge>
+										<Badge variant="success">
+											{m.display_preset_current()}
+										</Badge>
 									)}
 								</div>
 								{summary && (
-									<p className="mt-1 text-sm text-muted-foreground">{summary}</p>
+									<p className="mt-1 text-sm text-muted-foreground">
+										{summary}
+									</p>
 								)}
 								{fields && (
 									<div className="mt-auto flex flex-wrap gap-1.5 pt-3">
-										<Badge variant="secondary">{fmtKeepAlive(fields.keep_alive)}</Badge>
-										<Badge variant="secondary">{tr(TOPOLOGY_LABEL, fields.topology)}</Badge>
-										<Badge variant="outline">{tr(CONFLICT_LABEL, fields.mode_conflict)}</Badge>
-										<Badge variant="outline">{tr(IDENTITY_LABEL, fields.identity)}</Badge>
+										<Badge variant="secondary">
+											{fmtKeepAlive(fields.keep_alive)}
+										</Badge>
+										<Badge variant="secondary">
+											{tr(TOPOLOGY_LABEL, fields.topology)}
+										</Badge>
+										<Badge variant="outline">
+											{tr(CONFLICT_LABEL, fields.mode_conflict)}
+										</Badge>
+										<Badge variant="outline">
+											{tr(IDENTITY_LABEL, fields.identity)}
+										</Badge>
 									</div>
 								)}
 							</Card>
@@ -364,20 +462,40 @@ const DisplayForm: FC<{
 					</div>
 				)}
 				{presetError && (
-					<p className="text-sm text-amber-600 dark:text-amber-500">{presetError}</p>
+					<p className="text-sm text-amber-600 dark:text-amber-500">
+						{presetError}
+					</p>
 				)}
 			</div>
 
-			{/* Custom: every option by hand */}
+			{/* Custom: every option by hand. Unlike everything else on this page these fields do NOT
+			    auto-apply, so the block is titled, ringed while dirty, and ends in a sticky save bar. */}
 			{isCustom && (
-				<div className="space-y-6 rounded-lg border p-5">
-					<Field label={m.display_keep_alive()} help={m.display_keep_alive_help()}>
+				<div
+					className={cn(
+						"space-y-6 rounded-lg border p-5",
+						dirty && "border-[var(--warning)]",
+					)}
+				>
+					<div className="flex flex-wrap items-center justify-between gap-2">
+						<h3 className="text-base font-semibold">
+							{m.display_custom_title()}
+						</h3>
+						{dirty && <Badge variant="warning">{m.display_unsaved()}</Badge>}
+					</div>
+
+					<Field
+						label={m.display_keep_alive()}
+						help={m.display_keep_alive_help()}
+					>
 						<div className="flex flex-wrap items-center gap-2">
 							<Button
 								size="sm"
 								variant={ka.mode === "off" ? "default" : "outline"}
 								disabled={busy}
-								onClick={() => setDraft({ ...draft, keep_alive: { mode: "off" } })}
+								onClick={() =>
+									setDraft({ ...draft, keep_alive: { mode: "off" } })
+								}
 							>
 								{m.display_keep_alive_off()}
 							</Button>
@@ -386,7 +504,10 @@ const DisplayForm: FC<{
 								variant={ka.mode === "duration" ? "default" : "outline"}
 								disabled={busy}
 								onClick={() =>
-									setDraft({ ...draft, keep_alive: { mode: "duration", seconds: keepSecs } })
+									setDraft({
+										...draft,
+										keep_alive: { mode: "duration", seconds: keepSecs },
+									})
 								}
 							>
 								{m.display_keep_alive_keep()}
@@ -395,7 +516,9 @@ const DisplayForm: FC<{
 								size="sm"
 								variant={ka.mode === "forever" ? "default" : "outline"}
 								disabled={busy}
-								onClick={() => setDraft({ ...draft, keep_alive: { mode: "forever" } })}
+								onClick={() =>
+									setDraft({ ...draft, keep_alive: { mode: "forever" } })
+								}
 							>
 								{m.display_keep_alive_forever()}
 							</Button>
@@ -410,7 +533,10 @@ const DisplayForm: FC<{
 										onChange={(e) => {
 											const n = Math.max(0, Number(e.target.value) || 0);
 											setKeepSecs(n);
-											setDraft({ ...draft, keep_alive: { mode: "duration", seconds: n } });
+											setDraft({
+												...draft,
+												keep_alive: { mode: "duration", seconds: n },
+											});
 										}}
 									/>
 									<span className="text-sm text-muted-foreground">
@@ -437,7 +563,9 @@ const DisplayForm: FC<{
 						options={["separate", "steal", "join", "reject"]}
 						labels={CONFLICT_LABEL}
 						disabled={busy}
-						onPick={(v) => setDraft({ ...draft, mode_conflict: v as ModeConflict })}
+						onPick={(v) =>
+							setDraft({ ...draft, mode_conflict: v as ModeConflict })
+						}
 					/>
 					<Choice
 						label={m.display_identity()}
@@ -458,7 +586,10 @@ const DisplayForm: FC<{
 						onPick={(v) =>
 							setDraft({
 								...draft,
-								layout: { mode: v as LayoutMode, positions: draft.layout?.positions ?? {} },
+								layout: {
+									mode: v as LayoutMode,
+									positions: draft.layout?.positions ?? {},
+								},
 							})
 						}
 					/>
@@ -474,14 +605,39 @@ const DisplayForm: FC<{
 							onChange={(e) =>
 								setDraft({
 									...draft,
-									max_displays: Math.min(16, Math.max(1, Number(e.target.value) || 1)),
+									max_displays: Math.min(
+										16,
+										Math.max(1, Number(e.target.value) || 1),
+									),
 								})
 							}
 						/>
 					</Field>
 
-					<div className="border-t pt-4">
-						<Button onClick={() => apply(draft)} disabled={busy}>
+					{/* Sticky: the Custom block is taller than most viewports, and a save button parked
+					    at its bottom edge is invisible until you scroll all the way down — people
+					    edited, navigated away, and lost the lot. `bottom-0` pins it to the viewport
+					    while any part of the block is on screen, and it settles into place at the end. */}
+					<div
+						className={cn(
+							"sticky bottom-0 z-10 -mx-5 -mb-5 flex flex-wrap items-center justify-end gap-3 rounded-b-lg border-t px-5 py-3 backdrop-blur",
+							dirty ? "bg-[var(--warning)]/10" : "bg-neutral/80",
+						)}
+					>
+						<span
+							className={cn(
+								"mr-auto text-sm",
+								dirty ? "font-medium" : "text-muted-foreground",
+							)}
+						>
+							{dirty ? m.display_unsaved_hint() : m.display_all_saved()}
+						</span>
+						{dirty && (
+							<Button variant="ghost" onClick={revert} disabled={busy}>
+								{m.display_revert()}
+							</Button>
+						)}
+						<Button onClick={() => apply(draft)} disabled={busy || !dirty}>
 							{m.display_save()}
 						</Button>
 					</div>
@@ -537,15 +693,27 @@ const DisplayForm: FC<{
 
 			{/* What's in force right now */}
 			<div className="flex flex-wrap items-center gap-2 border-t pt-3">
-				<span className="text-sm text-muted-foreground">{m.display_effective()}:</span>
+				<span className="text-sm text-muted-foreground">
+					{m.display_effective()}:
+				</span>
 				<Badge variant="secondary">{fmtKeepAlive(effective.keep_alive)}</Badge>
-				<Badge variant="secondary">{tr(TOPOLOGY_LABEL, effective.topology)}</Badge>
-				<Badge variant="outline">{tr(CONFLICT_LABEL, effective.mode_conflict)}</Badge>
-				<Badge variant="outline">{tr(IDENTITY_LABEL, effective.identity)}</Badge>
-				<Badge variant="outline">{tr(LAYOUT_LABEL, effective.layout.mode)}</Badge>
+				<Badge variant="secondary">
+					{tr(TOPOLOGY_LABEL, effective.topology)}
+				</Badge>
+				<Badge variant="outline">
+					{tr(CONFLICT_LABEL, effective.mode_conflict)}
+				</Badge>
+				<Badge variant="outline">
+					{tr(IDENTITY_LABEL, effective.identity)}
+				</Badge>
+				<Badge variant="outline">
+					{tr(LAYOUT_LABEL, effective.layout.mode)}
+				</Badge>
 				<Badge variant="outline">{`${effective.max_displays}×`}</Badge>
 				{(draft.game_session ?? "auto") === "dedicated" && (
-					<Badge variant="secondary">{m.display_game_session_dedicated()}</Badge>
+					<Badge variant="secondary">
+						{m.display_game_session_dedicated()}
+					</Badge>
 				)}
 				{(draft.ddc_power_off ?? false) && (
 					<Badge variant="outline">{m.display_ddc_badge()}</Badge>
@@ -555,8 +723,12 @@ const DisplayForm: FC<{
 				)}
 			</div>
 
-			<p className="max-w-prose text-xs text-muted-foreground">{m.display_pending_note()}</p>
-			{error && <p className="text-sm text-amber-600 dark:text-amber-500">{error}</p>}
+			<p className="max-w-prose text-xs text-muted-foreground">
+				{m.display_pending_note()}
+			</p>
+			{error && (
+				<p className="text-sm text-amber-600 dark:text-amber-500">{error}</p>
+			)}
 		</div>
 	);
 };
@@ -571,7 +743,9 @@ const Field: FC<{ label: string; help?: string; children: ReactNode }> = ({
 	<div className="space-y-3">
 		<Label className="block">{label}</Label>
 		{children}
-		{help && <p className="max-w-prose text-xs text-muted-foreground">{help}</p>}
+		{help && (
+			<p className="max-w-prose text-xs text-muted-foreground">{help}</p>
+		)}
 	</div>
 );
 
@@ -682,9 +856,13 @@ const CustomPresetCard: FC<{
 			)}
 		>
 			<div className="flex items-start justify-between gap-2">
-				<span className="min-w-0 truncate text-base font-semibold">{preset.name}</span>
+				<span className="min-w-0 truncate text-base font-semibold">
+					{preset.name}
+				</span>
 				<div className="flex shrink-0 items-center gap-1">
-					{selected && <Badge variant="success">{m.display_preset_current()}</Badge>}
+					{selected && (
+						<Badge variant="success">{m.display_preset_current()}</Badge>
+					)}
 					<Button
 						size="icon"
 						variant="ghost"
@@ -720,10 +898,14 @@ const CustomPresetCard: FC<{
 			<div className="mt-auto flex flex-wrap gap-1.5 pt-3">
 				<Badge variant="secondary">{fmtKeepAlive(fields.keep_alive)}</Badge>
 				<Badge variant="secondary">{tr(TOPOLOGY_LABEL, fields.topology)}</Badge>
-				<Badge variant="outline">{tr(CONFLICT_LABEL, fields.mode_conflict)}</Badge>
+				<Badge variant="outline">
+					{tr(CONFLICT_LABEL, fields.mode_conflict)}
+				</Badge>
 				<Badge variant="outline">{tr(IDENTITY_LABEL, fields.identity)}</Badge>
 				{(preset.game_session ?? "auto") !== "auto" && (
-					<Badge variant="secondary">{tr(GAME_SESSION_LABEL, preset.game_session)}</Badge>
+					<Badge variant="secondary">
+						{tr(GAME_SESSION_LABEL, preset.game_session)}
+					</Badge>
 				)}
 			</div>
 		</Card>
@@ -744,14 +926,21 @@ const LiveDisplays: FC = () => {
 	const doRelease = (slot?: number) =>
 		release.mutate(
 			{ data: { slot: slot ?? null } },
-			{ onSuccess: () => qc.invalidateQueries({ queryKey: getGetDisplayStateQueryKey() }) },
+			{
+				onSuccess: () =>
+					qc.invalidateQueries({ queryKey: getGetDisplayStateQueryKey() }),
+			},
 		);
 
 	return (
 		<div className="space-y-3">
 			{/* Wrap in QueryState (like the settings card) so a failed/in-flight `/display/state`
 			    fetch surfaces as loading/error instead of masquerading as "no live displays". */}
-			<QueryState isLoading={state.isLoading} error={state.error} refetch={state.refetch}>
+			<QueryState
+				isLoading={state.isLoading}
+				error={state.error}
+				refetch={state.refetch}
+			>
 				{kept.length > 0 && (
 					<div className="flex justify-end">
 						<Button
@@ -765,7 +954,9 @@ const LiveDisplays: FC = () => {
 					</div>
 				)}
 				{displays.length === 0 ? (
-					<p className="text-sm text-muted-foreground">{m.display_none_live()}</p>
+					<p className="text-sm text-muted-foreground">
+						{m.display_none_live()}
+					</p>
 				) : (
 					<ul className="divide-y rounded-md border">
 						{displays.map((d) => (
@@ -790,18 +981,24 @@ const LiveDisplays: FC = () => {
  * `PUT /display/layout`, which switches the host to a manual layout and applies from the next connect.
  * Shown only for a ≥2-display group — arranging a single display is moot.
  */
-const DisplayArrangement: FC<{ displays: ApiDisplayInfo[] }> = ({ displays }) => {
+const DisplayArrangement: FC<{ displays: ApiDisplayInfo[] }> = ({
+	displays,
+}) => {
 	const qc = useQueryClient();
 	const saveLayout = useSetDisplayLayout();
 	// Only displays with a stable identity slot can be pinned (shared/anonymous ones have no key).
 	const arrangeable = displays.filter((d) => d.identity_slot != null);
 
 	// Local edit buffer keyed by identity-slot string → {x, y}, seeded once from the current positions.
-	const [pos, setPos] = useState<Record<string, { x: number; y: number }> | null>(null);
+	const [pos, setPos] = useState<Record<
+		string,
+		{ x: number; y: number }
+	> | null>(null);
 	useEffect(() => {
 		if (pos === null && arrangeable.length > 0) {
 			const seed: Record<string, { x: number; y: number }> = {};
-			for (const d of arrangeable) seed[String(d.identity_slot)] = { x: d.x, y: d.y };
+			for (const d of arrangeable)
+				seed[String(d.identity_slot)] = { x: d.x, y: d.y };
 			setPos(seed);
 		}
 	}, [arrangeable, pos]);
@@ -831,15 +1028,21 @@ const DisplayArrangement: FC<{ displays: ApiDisplayInfo[] }> = ({ displays }) =>
 	return (
 		<div className="space-y-2 border-t pt-4">
 			<h4 className="text-sm font-medium">{m.display_arrange()}</h4>
-			<p className="text-xs text-muted-foreground">{m.display_arrange_help()}</p>
+			<p className="text-xs text-muted-foreground">
+				{m.display_arrange_help()}
+			</p>
 			<div className="space-y-2">
 				{arrangeable.map((d) => {
 					const slot = d.identity_slot as number;
 					const p = cur[String(slot)] ?? { x: d.x, y: d.y };
 					return (
-						<div key={d.slot} className="flex flex-wrap items-center gap-2 text-sm">
+						<div
+							key={d.slot}
+							className="flex flex-wrap items-center gap-2 text-sm"
+						>
 							<span className="w-44 truncate">
-								{d.mode} <code className="text-xs text-muted-foreground">#{slot}</code>
+								{d.mode}{" "}
+								<code className="text-xs text-muted-foreground">#{slot}</code>
 							</span>
 							<Label className="text-xs" htmlFor={`disp-x-${slot}`}>
 								X
@@ -850,7 +1053,9 @@ const DisplayArrangement: FC<{ displays: ApiDisplayInfo[] }> = ({ displays }) =>
 								className="w-24"
 								value={p.x}
 								disabled={saveLayout.isPending}
-								onChange={(e) => setXY(slot, "x", Math.trunc(Number(e.target.value) || 0))}
+								onChange={(e) =>
+									setXY(slot, "x", Math.trunc(Number(e.target.value) || 0))
+								}
 							/>
 							<Label className="text-xs" htmlFor={`disp-y-${slot}`}>
 								Y
@@ -861,7 +1066,9 @@ const DisplayArrangement: FC<{ displays: ApiDisplayInfo[] }> = ({ displays }) =>
 								className="w-24"
 								value={p.y}
 								disabled={saveLayout.isPending}
-								onChange={(e) => setXY(slot, "y", Math.trunc(Number(e.target.value) || 0))}
+								onChange={(e) =>
+									setXY(slot, "y", Math.trunc(Number(e.target.value) || 0))
+								}
 							/>
 						</div>
 					);
@@ -879,11 +1086,11 @@ const DisplayArrangement: FC<{ displays: ApiDisplayInfo[] }> = ({ displays }) =>
 	);
 };
 
-const DisplayRow: FC<{ d: ApiDisplayInfo; busy: boolean; onRelease: () => void }> = ({
-	d,
-	busy,
-	onRelease,
-}) => {
+const DisplayRow: FC<{
+	d: ApiDisplayInfo;
+	busy: boolean;
+	onRelease: () => void;
+}> = ({ d, busy, onRelease }) => {
 	const active = d.state === "active";
 	const stateLabel =
 		d.state === "active"
@@ -898,7 +1105,9 @@ const DisplayRow: FC<{ d: ApiDisplayInfo; busy: boolean; onRelease: () => void }
 					<span className="font-medium">{d.mode}</span>
 					<Badge variant={active ? "success" : "secondary"}>{stateLabel}</Badge>
 					{active && d.sessions > 0 && (
-						<Badge variant="outline">{m.display_sessions({ count: d.sessions })}</Badge>
+						<Badge variant="outline">
+							{m.display_sessions({ count: d.sessions })}
+						</Badge>
 					)}
 				</div>
 				<code className="text-xs text-muted-foreground">
@@ -974,17 +1183,29 @@ const GAME_SESSION_LABEL: Record<string, () => string> = {
  * (handles the nested `keep_alive` variants + `layout.positions` map; key order doesn't matter). */
 const deepEqual = (a: unknown, b: unknown): boolean => {
 	if (a === b) return true;
-	if (typeof a !== "object" || typeof b !== "object" || a === null || b === null) return false;
+	if (
+		typeof a !== "object" ||
+		typeof b !== "object" ||
+		a === null ||
+		b === null
+	)
+		return false;
 	const ak = Object.keys(a as object);
 	const bk = Object.keys(b as object);
 	if (ak.length !== bk.length) return false;
 	return ak.every((k) =>
-		deepEqual((a as Record<string, unknown>)[k], (b as Record<string, unknown>)[k]),
+		deepEqual(
+			(a as Record<string, unknown>)[k],
+			(b as Record<string, unknown>)[k],
+		),
 	);
 };
 
 /** Look up a localized label, tolerating an unknown/undefined key (falls back to the raw value). */
-const tr = (map: Record<string, () => string>, key: string | null | undefined): string => {
+const tr = (
+	map: Record<string, () => string>,
+	key: string | null | undefined,
+): string => {
 	const fn = key == null ? undefined : map[key];
 	return fn ? fn() : String(key ?? "");
 };
