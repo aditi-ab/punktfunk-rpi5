@@ -865,11 +865,21 @@ impl VirtualDisplayManager {
                                 reasserts = fighting,
                                 "exclusive topology stable again — no non-managed display active"
                             );
+                            // Close the churn window early — descriptor-following resumes now
+                            // instead of waiting out the hold's self-expiry.
+                            pf_win_display::topology_churn::release();
                         }
                         fighting = 0;
                         continue;
                     }
                     fighting += 1;
+                    // Announce the churn BEFORE evicting: every descriptor the capturer's poller
+                    // samples from here until "stable again" (or self-expiry) is potentially the
+                    // TRANSIENT eviction state — acting on it would recreate the ring at a mode
+                    // the recovery chain is about to undo (the field hdr=true→false→true double
+                    // recreate). Window = watchdog interval + recovery/debounce margin, refreshed
+                    // every fighting round.
+                    pf_win_display::topology_churn::hold(interval + Duration::from_secs(3));
                     match fighting {
                         1..=3 => tracing::warn!(
                             survivors,

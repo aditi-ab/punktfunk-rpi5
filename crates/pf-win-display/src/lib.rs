@@ -16,6 +16,9 @@ pub mod display_events;
 mod input_desktop;
 #[cfg(target_os = "windows")]
 pub mod monitor_devnode;
+/// Cross-crate "topology churn in flight" latch (pure std — no Windows surface, so unconditionally
+/// compiled and unit-tested on every platform).
+pub mod topology_churn;
 #[cfg(target_os = "windows")]
 pub mod win_display;
 

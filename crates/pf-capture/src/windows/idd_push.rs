@@ -732,6 +732,18 @@ impl IddPushCapturer {
             return; // no new sample since last consume
         }
         self.desc_seq = seq;
+        // A topology reassert is in flight (the exclusive watchdog announced it): every sample in
+        // this window is potentially the TRANSIENT eviction state, and acting on one recreates
+        // the ring at a mode the reassert's recovery chain (`recreate_ring_in_place`, keyed off
+        // the reassert generation) is about to undo — the field hdr=true→false→true double
+        // recreate. Consume the sample, disarm the debounce, act on nothing; a REAL change that
+        // races the window survives it (the descriptor still differs once the hold clears, and
+        // the poller re-samples in ~250 ms). This also keeps the negotiated-depth pin-back below
+        // from issuing a CCD write mid-eviction, where it would fight the reassert itself.
+        if pf_win_display::topology_churn::held() {
+            self.pending_desc = None;
+            return;
+        }
         // Two cases re-assert the NEGOTIATED depth instead of following a mid-session "Use HDR"
         // flip — flip the display back and treat the descriptor as the negotiated state (so the ring
         // is never recreated at the wrong format):
