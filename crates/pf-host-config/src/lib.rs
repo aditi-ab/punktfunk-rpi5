@@ -96,6 +96,14 @@ pub struct HostConfig {
     pub perf: bool,
     /// `PUNKTFUNK_VIDEO_SOURCE` — GameStream video source select (`virtual` / `portal` / unset → synthetic).
     pub video_source: Option<String>,
+    /// `PUNKTFUNK_CAPTURE_MONITOR` — pin capture at a NAMED physical monitor (`DP-1`, `HDMI-A-2`),
+    /// instead of creating a virtual display or taking whichever head the portal hands back. The
+    /// point of the knob is an unattended host: a background `systemd --user` service has nobody to
+    /// answer a chooser dialog, so the monitor has to be config, not a prompt. A name that matches
+    /// no head is a hard error at session open (never a silent fall-back to a different screen —
+    /// showing the wrong monitor is worse than showing none). Linux-only today; see
+    /// `design/per-monitor-portal-capture.md`.
+    pub capture_monitor: Option<String>,
     /// `PUNKTFUNK_COMPOSITOR` — explicit compositor override (operator/CI/test). NOT the runtime-detected
     /// session — this one is a constant operator knob; `apply_session_env` never writes it.
     pub compositor: Option<String>,
@@ -170,6 +178,11 @@ impl HostConfig {
             chacha20: env_on("PUNKTFUNK_CHACHA20").unwrap_or(true),
             perf: flag("PUNKTFUNK_PERF"),
             video_source: val("PUNKTFUNK_VIDEO_SOURCE"),
+            // Trimmed + emptied-to-None: `PUNKTFUNK_CAPTURE_MONITOR=` in a host.env means "not
+            // set", not "match the monitor named empty string".
+            capture_monitor: val("PUNKTFUNK_CAPTURE_MONITOR")
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
             compositor: val("PUNKTFUNK_COMPOSITOR"),
             gamepad: val("PUNKTFUNK_GAMEPAD"),
             vdisplay: val("PUNKTFUNK_VDISPLAY"),

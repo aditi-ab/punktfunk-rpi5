@@ -272,6 +272,58 @@ fn hyprctl(args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// Every head Hyprland reports, for [`crate::monitors::list`].
+///
+/// `hyprctl -j monitors all` (rather than plain `monitors`) so **disabled** heads are listed too —
+/// a picker that silently omits the monitor the operator is trying to name is worse than one that
+/// shows it greyed out. Hyprland reports geometry post-transform in logical pixels, which is the
+/// space `crate::monitors` documents.
+pub(crate) fn list_monitors() -> Result<Vec<crate::monitors::PhysicalMonitor>> {
+    let raw = hyprctl(&["-j", "monitors", "all"])?;
+    let parsed: serde_json::Value =
+        serde_json::from_str(&raw).context("parse hyprctl -j monitors all")?;
+    let mut out: Vec<_> = parsed
+        .as_array()
+        .context("hyprctl monitors: not an array")?
+        .iter()
+        .filter_map(|m| {
+            let connector = m.get("name")?.as_str()?.to_string();
+            let num = |k: &str| m.get(k).and_then(|v| v.as_i64()).unwrap_or(0);
+            let description = m
+                .get("description")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or(&connector)
+                .to_string();
+            Some(crate::monitors::PhysicalMonitor {
+                connector,
+                description,
+                width: num("width").max(0) as u32,
+                height: num("height").max(0) as u32,
+                // `refreshRate` is Hz as a float.
+                refresh_mhz: (m.get("refreshRate").and_then(|v| v.as_f64()).unwrap_or(0.0) * 1000.0)
+                    as u32,
+                x: num("x") as i32,
+                y: num("y") as i32,
+                scale: m
+                    .get("scale")
+                    .and_then(|v| v.as_f64())
+                    .filter(|s| *s > 0.0)
+                    .unwrap_or(1.0),
+                primary: m.get("focused").and_then(|v| v.as_bool()).unwrap_or(false),
+                enabled: !m.get("disabled").and_then(|v| v.as_bool()).unwrap_or(false),
+                // Our headless outputs are named `PF-<n>` (see `next_output_name`).
+                managed: m
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|n| n.starts_with("PF-")),
+            })
+        })
+        .collect();
+    out.sort_by_key(|m| (m.x, m.y, m.connector.clone()));
+    Ok(out)
+}
+
 /// Run a `hyprctl` **dispatch** command (`output …`, `keyword …`, `eval …`) that reports success by
 /// printing `ok`. hyprctl often exits 0 even when the command is rejected, printing the error to
 /// stdout, so treat a known error marker as failure (this is also how [`set_monitor_rule`] tells the

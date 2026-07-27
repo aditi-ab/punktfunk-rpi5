@@ -359,6 +359,13 @@ pub fn probe(compositor: Compositor) -> Result<()> {
 #[path = "vdisplay/policy.rs"]
 pub mod policy;
 
+// Read-only physical-monitor enumeration (the heads the compositor ALREADY has — not ours), for
+// pinning capture at one of them + the console picker. Platform-neutral facade; the per-backend
+// reads live beside the code that already speaks each dialect. See
+// `design/per-monitor-portal-capture.md` §5.1.
+#[path = "vdisplay/monitors.rs"]
+pub mod monitors;
+
 // The pure per-display lifecycle state machine (refcount + linger + pin), platform-neutral and
 // property-tested; the registry executes the side effects its transitions dictate.
 #[path = "vdisplay/lifecycle.rs"]

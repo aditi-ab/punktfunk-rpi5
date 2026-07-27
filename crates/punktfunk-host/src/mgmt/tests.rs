@@ -1056,6 +1056,29 @@ async fn display_state_and_release_empty() {
     assert_eq!(body["released"], 0);
 }
 
+/// `/display/monitors` is wired, auth-gated, and — the point of the test — **always answers 200
+/// with a well-formed envelope**, including on a test host with no compositor to enumerate. The
+/// console renders a picker from this; an enumeration failure has to arrive as an `error` string
+/// next to an empty list, never as a 5xx that reads to the UI as "the host is broken".
+#[tokio::test]
+async fn display_monitors_answers_even_with_no_compositor() {
+    let app = test_app(test_state(), None);
+
+    let (status, body) = send(&app, get_req("/api/v1/display/monitors")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["monitors"].is_array(), "monitors is always an array");
+    // No compositor on the test host ⇒ either a clean empty list or an explained failure, never
+    // both empty AND silent about why.
+    let listed = body["monitors"].as_array().map(|a| a.len()).unwrap_or(0);
+    assert!(
+        listed > 0 || !body["error"].is_null() || body["compositor"].is_null(),
+        "an empty list must carry an error or an absent compositor: {body}"
+    );
+    // The pin is reported verbatim so the console can flag "pinned to a monitor you don't have";
+    // unset on the test host.
+    assert!(body["pinned"].is_null(), "no PUNKTFUNK_CAPTURE_MONITOR set");
+}
+
 #[tokio::test]
 async fn native_pairing_arm_show_and_unpair() {
     let np = Arc::new(

@@ -181,6 +181,100 @@ pub(crate) struct DisplayStateResponse {
     displays: Vec<ApiDisplayInfo>,
 }
 
+/// One physical monitor this host has, as the compositor reports it.
+#[derive(Serialize, ToSchema)]
+pub(crate) struct ApiMonitorInfo {
+    /// Connector name (`DP-1`, `HDMI-A-2`) — the value `PUNKTFUNK_CAPTURE_MONITOR` takes.
+    connector: String,
+    /// Human label for a picker (`make model`, else the connector).
+    description: String,
+    /// `WIDTHxHEIGHT@HZ` of the current mode (size only when the refresh is unknown).
+    mode: String,
+    /// Desktop-space top-left — what makes a head identifiable when two share a size.
+    x: i32,
+    y: i32,
+    /// Logical scale factor.
+    scale: f64,
+    /// The compositor's primary/focused head.
+    primary: bool,
+    /// Driven right now. A disabled head is still listed, so it can be explained rather than missing.
+    enabled: bool,
+    /// Best-effort: this is one of OUR virtual displays, not a real head (reliable on KWin only).
+    managed: bool,
+    /// True when `PUNKTFUNK_CAPTURE_MONITOR` currently names this monitor.
+    selected: bool,
+}
+
+/// The host's physical monitors + which one capture is pinned to.
+#[derive(Serialize, ToSchema)]
+pub(crate) struct MonitorsResponse {
+    /// Compositor backend the enumeration came from (`kwin`, `mutter`, …), when one was resolved.
+    compositor: Option<String>,
+    /// The heads, ordered left-to-right by desktop position.
+    monitors: Vec<ApiMonitorInfo>,
+    /// The configured `PUNKTFUNK_CAPTURE_MONITOR`, if any — reported even when it matches nothing,
+    /// so the console can show "pinned to DP-2, which this host doesn't have".
+    pinned: Option<String>,
+    /// Why the list is empty, when enumeration failed (compositor unreachable, unsupported
+    /// platform). `None` with an empty list means "asked, and there are none".
+    error: Option<String>,
+}
+
+/// Physical monitors
+///
+/// The heads this host actually has — for pinning capture at one (`PUNKTFUNK_CAPTURE_MONITOR`) and
+/// for rendering a picker. Read-only: this never creates, moves or disables anything. Note these
+/// are *not* the managed virtual displays — those are `/display/state`. See
+/// `design/per-monitor-portal-capture.md` §5.1.
+#[utoipa::path(
+    get,
+    path = "/display/monitors",
+    tag = "display",
+    operation_id = "getDisplayMonitors",
+    responses(
+        (status = OK, description = "The host's physical monitors", body = MonitorsResponse),
+        (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
+    )
+)]
+pub(crate) async fn get_display_monitors() -> Json<MonitorsResponse> {
+    let pinned = pf_host_config::config().capture_monitor.clone();
+    // Enumeration shells out / round-trips D-Bus + Wayland, so keep it off the async worker.
+    let (compositor, listed) = tokio::task::spawn_blocking(|| match crate::vdisplay::detect() {
+        Ok(c) => (Some(c.id().to_string()), crate::vdisplay::monitors::list(c)),
+        Err(e) => (None, Err(e)),
+    })
+    .await
+    .unwrap_or_else(|e| (None, Err(anyhow::anyhow!("enumeration task failed: {e}"))));
+    let (monitors, error) = match listed {
+        Ok(ms) => (
+            ms.into_iter()
+                .map(|m| ApiMonitorInfo {
+                    mode: m.mode_label(),
+                    selected: pinned
+                        .as_deref()
+                        .is_some_and(|p| p.eq_ignore_ascii_case(&m.connector)),
+                    connector: m.connector,
+                    description: m.description,
+                    x: m.x,
+                    y: m.y,
+                    scale: m.scale,
+                    primary: m.primary,
+                    enabled: m.enabled,
+                    managed: m.managed,
+                })
+                .collect(),
+            None,
+        ),
+        Err(e) => (Vec::new(), Some(format!("{e:#}"))),
+    };
+    Json(MonitorsResponse {
+        compositor,
+        monitors,
+        pinned,
+        error,
+    })
+}
+
 /// Request body for `releaseDisplay`.
 #[derive(Deserialize, ToSchema)]
 pub(crate) struct ReleaseDisplayRequest {

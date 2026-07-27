@@ -131,6 +131,14 @@ struct DeviceState {
     name: Option<String>,
     uuid: Option<String>,
     enabled: bool,
+    /// Top-left in the compositor's global logical space, from the `geometry` event — the key that
+    /// makes a head identifiable when two of them share a size (`monitors::PhysicalMonitor`).
+    position: (i32, i32),
+    /// `make` / `model` from the same event, for the picker label.
+    make: Option<String>,
+    model: Option<String>,
+    /// Logical scale from the `scale` event. `None` ⇒ the protocol's documented default of 1.
+    scale: Option<f64>,
     /// KWin's output priority; 1 is the primary. `None` until the `priority` event (device ≥ v18).
     priority: Option<u32>,
     /// The `current_mode` object id; its size is looked up in [`State::mode_dims`].
@@ -237,6 +245,15 @@ impl Dispatch<OutputDevice, u32> for State {
         match event {
             DeviceEvent::Name { name } => entry.name = Some(name),
             DeviceEvent::Uuid { uuid } => entry.uuid = Some(uuid),
+            DeviceEvent::Geometry {
+                x, y, make, model, ..
+            } => {
+                entry.position = (x, y);
+                entry.make = Some(make);
+                entry.model = Some(model);
+            }
+            // `fixed` decodes to f64 in wayland-rs.
+            DeviceEvent::Scale { factor } => entry.scale = Some(factor),
             DeviceEvent::Enabled { enabled } => entry.enabled = enabled != 0,
             DeviceEvent::Priority { priority } => entry.priority = Some(priority),
             DeviceEvent::CurrentMode { mode } => entry.current_mode = Some(mode.id()),
@@ -454,6 +471,56 @@ fn mode_spec(dims: (u32, u32, u32)) -> String {
 /// are `Virtual-punktfunk` / `Virtual-punktfunk-<id>`, so a same-family sibling session is never
 /// treated as a physical to disable, and its primary is never stolen (first-slot-wins).
 const MANAGED_PREFIX: &str = "Virtual-punktfunk";
+
+/// Every head KWin reports, for [`crate::monitors::list`].
+///
+/// Reuses the same bounded enumerate-only session the topology path opens — no configuration is
+/// built and nothing is applied, so this is a pure read. A device that never completed its `done`
+/// burst is skipped rather than reported half-read (its geometry would be a guess, and geometry is
+/// exactly what callers key on).
+pub(crate) fn list_monitors() -> anyhow::Result<Vec<crate::monitors::PhysicalMonitor>> {
+    let session = Session::open().ok_or_else(|| {
+        anyhow::anyhow!(
+            "KWin did not answer kde_output_management_v2 (not a KWin session, the protocol is \
+             not advertised to this client, or the compositor is wedged)"
+        )
+    })?;
+    let mut out: Vec<_> = session
+        .state
+        .devices
+        .values()
+        .filter(|d| d.seen_done)
+        .filter_map(|d| {
+            let connector = d.name.clone()?;
+            let dims = session.current_dims(d);
+            let label = match (d.make.as_deref(), d.model.as_deref()) {
+                (Some(make), Some(model)) if !make.is_empty() || !model.is_empty() => {
+                    format!("{make} {model}").trim().to_string()
+                }
+                _ => connector.clone(),
+            };
+            Some(crate::monitors::PhysicalMonitor {
+                managed: connector.starts_with(MANAGED_PREFIX),
+                description: label,
+                // A disabled output has no current mode — report 0s rather than inventing one.
+                width: dims.map(|d| d.0).unwrap_or(0),
+                height: dims.map(|d| d.1).unwrap_or(0),
+                refresh_mhz: dims.map(|d| d.2).unwrap_or(0),
+                x: d.position.0,
+                y: d.position.1,
+                scale: d.scale.filter(|s| *s > 0.0).unwrap_or(1.0),
+                // KWin ranks outputs; 1 is the primary.
+                primary: d.priority == Some(1),
+                enabled: d.enabled,
+                connector,
+            })
+        })
+        .collect();
+    // The device globals arrive in bind order, which is not stable across runs; sort by desktop
+    // position so a picker (and a log line) reads left-to-right the way the desk looks.
+    out.sort_by_key(|m| (m.x, m.y, m.connector.clone()));
+    Ok(out)
+}
 
 /// Make the streamed output (name starts with `our_prefix`, current size `our_w`×`our_h`) the
 /// primary — and, for `Exclusive`, disable every other enabled output — over `kde_output_management_v2`.

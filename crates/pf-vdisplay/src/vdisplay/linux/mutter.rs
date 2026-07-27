@@ -811,6 +811,61 @@ fn logical_scale(state: &CurrentState, connector: &str) -> Option<f64> {
         .map(|l| l.2)
 }
 
+/// Every head Mutter reports, for [`crate::monitors::list`].
+///
+/// A pure `GetCurrentState` read on its own short-lived connection + runtime — no session, no
+/// `ApplyMonitorsConfig`, so it never touches the topology and never contends [`TOPOLOGY_LOCK`].
+/// Geometry comes from the **logical** monitors (`state.2`), which is the coordinate space that
+/// matters (see `crate::monitors`); a monitor absent from every logical monitor is disabled, and is
+/// reported as such at the origin rather than dropped.
+pub(crate) fn list_monitors() -> Result<Vec<crate::monitors::PhysicalMonitor>> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("build tokio runtime (monitor enumeration)")?;
+    let state = rt.block_on(async {
+        let dc = display_config().await?;
+        get_state(&dc).await
+    })?;
+    let mut out: Vec<_> = state
+        .1
+        .iter()
+        .map(|(spec, _modes, _props)| {
+            let (connector, vendor, product, _serial) = spec;
+            // The logical monitor carrying this connector: its (x, y), scale and primary flag.
+            let logical = state
+                .2
+                .iter()
+                .find(|l| l.5.iter().any(|s| &s.0 == connector));
+            let (w, h, refresh) = current_mode_full(&state, connector)
+                .map(|(_id, w, h, hz)| (w.max(0) as u32, h.max(0) as u32, (hz * 1000.0) as u32))
+                .unwrap_or((0, 0, 0));
+            let label = format!("{vendor} {product}");
+            crate::monitors::PhysicalMonitor {
+                connector: connector.clone(),
+                description: if label.trim().is_empty() {
+                    connector.clone()
+                } else {
+                    label.trim().to_string()
+                },
+                width: w,
+                height: h,
+                refresh_mhz: refresh,
+                x: logical.map(|l| l.0).unwrap_or(0),
+                y: logical.map(|l| l.1).unwrap_or(0),
+                scale: logical.map(|l| l.2).filter(|s| *s > 0.0).unwrap_or(1.0),
+                primary: logical.map(|l| l.4).unwrap_or(false),
+                enabled: logical.is_some(),
+                // Mutter names a `RecordVirtual` monitor indistinguishably from a physical one —
+                // no prefix to key on, and the connector is minted per session. See the field doc.
+                managed: false,
+            }
+        })
+        .collect();
+    out.sort_by_key(|m| (m.x, m.y, m.connector.clone()));
+    Ok(out)
+}
+
 /// Read the virtual output's current scale and, when the user changed it (GNOME Settings
 /// mid-stream), persist it under the client's `scale_key` so the next connect reapplies it.
 /// Best-effort: read failures (teardown races, shell restart) are silently skipped.

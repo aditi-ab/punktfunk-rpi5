@@ -229,6 +229,68 @@ fn output_names() -> Result<Vec<String>> {
         .collect())
 }
 
+/// Every head sway reports, for [`crate::monitors::list`].
+///
+/// `swaymsg -t get_outputs` reports `rect` in the logical coordinate space (post-scale,
+/// post-transform) — what `crate::monitors` documents. An inactive output has no `current_mode`, so
+/// its mode reads as zeros rather than a guess.
+pub(crate) fn list_monitors() -> Result<Vec<crate::monitors::PhysicalMonitor>> {
+    let raw = swaymsg(&["-t", "get_outputs", "--raw"])?;
+    let parsed: serde_json::Value = serde_json::from_str(&raw).context("parse get_outputs")?;
+    let mut out: Vec<_> = parsed
+        .as_array()
+        .context("get_outputs: not an array")?
+        .iter()
+        .filter_map(|o| {
+            let connector = o.get("name")?.as_str()?.to_string();
+            let rect = |k: &str| {
+                o.get("rect")
+                    .and_then(|r| r.get(k))
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0)
+            };
+            let mode = |k: &str| {
+                o.get("current_mode")
+                    .and_then(|m| m.get(k))
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0)
+            };
+            let str_field = |k: &str| o.get(k).and_then(|v| v.as_str()).unwrap_or("").trim();
+            let label = format!("{} {}", str_field("make"), str_field("model"));
+            Some(crate::monitors::PhysicalMonitor {
+                description: if label.trim().is_empty() {
+                    connector.clone()
+                } else {
+                    label.trim().to_string()
+                },
+                width: mode("width").max(0) as u32,
+                height: mode("height").max(0) as u32,
+                // sway reports `refresh` in mHz already.
+                refresh_mhz: mode("refresh").max(0) as u32,
+                x: rect("x") as i32,
+                y: rect("y") as i32,
+                scale: o
+                    .get("scale")
+                    .and_then(|v| v.as_f64())
+                    .filter(|s| *s > 0.0)
+                    .unwrap_or(1.0),
+                primary: o
+                    .get("primary")
+                    .and_then(|v| v.as_bool())
+                    .or_else(|| o.get("focused").and_then(|v| v.as_bool()))
+                    .unwrap_or(false),
+                enabled: o.get("active").and_then(|v| v.as_bool()).unwrap_or(true),
+                // Sway auto-names headless outputs `HEADLESS-N` and that is what `create` adds. A
+                // sway started with its own headless output would match too — hence best-effort.
+                managed: connector.starts_with("HEADLESS-"),
+                connector,
+            })
+        })
+        .collect();
+    out.sort_by_key(|m| (m.x, m.y, m.connector.clone()));
+    Ok(out)
+}
+
 /// Wait for the output `create_output` added (the name not in `before` — HEADLESS-N).
 fn wait_new_output(before: &[String], timeout: Duration) -> Result<String> {
     let deadline = Instant::now() + timeout;

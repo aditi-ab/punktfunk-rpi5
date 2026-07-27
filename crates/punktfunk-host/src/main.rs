@@ -231,6 +231,37 @@ fn real_main() -> Result<()> {
         );
     }
 
+    // Report a `PUNKTFUNK_CAPTURE_MONITOR` pin at startup — the operator sets it in a host.env and
+    // then has no session to watch, so this is the only place a typo can surface. It is deliberately
+    // loud about not being enforced yet: a knob that is parsed but inert must SAY so, or a silent
+    // "it didn't work" reads as a bug.
+    #[cfg(target_os = "linux")]
+    if !management_cli {
+        if let Some(want) = pf_host_config::config().capture_monitor.as_deref() {
+            match pf_vdisplay::detect().and_then(pf_vdisplay::monitors::list) {
+                Ok(ms) => match pf_vdisplay::monitors::resolve(&ms, want) {
+                    Ok(m) => tracing::info!(
+                        connector = %m.connector,
+                        description = %m.description,
+                        mode = %m.mode_label(),
+                        at = %format!("+{}+{}", m.x, m.y),
+                        "PUNKTFUNK_CAPTURE_MONITOR names this monitor — NOTE: per-monitor capture \
+                         is not implemented yet, so sessions still use the normal display path"
+                    ),
+                    Err(e) => tracing::warn!(
+                        error = %e,
+                        "PUNKTFUNK_CAPTURE_MONITOR names no monitor on this host"
+                    ),
+                },
+                Err(e) => tracing::warn!(
+                    error = %format!("{e:#}"),
+                    monitor = %want,
+                    "PUNKTFUNK_CAPTURE_MONITOR is set but the monitors could not be enumerated"
+                ),
+            }
+        }
+    }
+
     // Wire pf-vdisplay's display-lifecycle events into the SSE event bus (the subsystem crate emits a
     // neutral DisplayEvent; the orchestrator owns the bus type — plan §W6). Set once, ignore re-set.
     let _ = pf_vdisplay::DISPLAY_EVENT_SINK.set(Box::new(|ev| match ev {
