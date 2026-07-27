@@ -1686,21 +1686,7 @@ fn restore_delay() -> Option<Duration> {
 /// the managed session is pinned (gaming-rig). No-op when nothing was stolen (non-Bazzite / headless
 /// box). Idempotent / safe to call on every session end.
 pub fn schedule_restore_tv_session() {
-    let nothing_to_restore = STOPPED_AUTOLOGIN
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .is_empty()
-        && !*STEAMOS_TOOK_OVER.lock().unwrap_or_else(|e| e.into_inner())
-        && STOPPED_DM.lock().unwrap_or_else(|e| e.into_inner()).is_none()
-        // A managed session that took nothing over (started beside a live desktop — e.g. a client
-        // gamescope pin on a KDE box) still owns the transient SESSION_UNIT: without this arm it
-        // was ORPHANED forever after disconnect ("closing the app does not end the session",
-        // field report 2026-07-24) — the restore stops it even with no autologin to bring back.
-        && MANAGED_SESSION
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_none();
-    if nothing_to_restore {
+    if !takeover_live() {
         return; // nothing was taken over → nothing to restore (also the non-managed path)
     }
     match restore_delay() {
@@ -1721,6 +1707,48 @@ pub fn schedule_restore_tv_session() {
             );
         }
     }
+}
+
+/// Is anything of the box's own session ours right now — an autologin unit we stopped, a stopped
+/// display manager, a SteamOS target we re-pointed, or a managed session we launched beside a live
+/// desktop? The precondition for every restore path.
+fn takeover_live() -> bool {
+    !STOPPED_AUTOLOGIN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_empty()
+        || *STEAMOS_TOOK_OVER.lock().unwrap_or_else(|e| e.into_inner())
+        || STOPPED_DM
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+        // A managed session that took nothing over (started beside a live desktop — e.g. a client
+        // gamescope pin on a KDE box) still owns the transient SESSION_UNIT: without this arm it
+        // was ORPHANED forever after disconnect ("closing the app does not end the session",
+        // field report 2026-07-24) — the restore stops it even with no autologin to bring back.
+        || MANAGED_SESSION
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+}
+
+/// Give the box its own session back **now**, synchronously — the host is going away (SIGTERM from
+/// `systemctl --user stop`/`restart`, a package update, Ctrl-C) and a live takeover must not
+/// outlive it. On a DM-flavor takeover the display manager is STOPPED: nothing else on the box
+/// will ever restart it, and the persisted crash-restore state lives in `$XDG_RUNTIME_DIR`, which
+/// logind removes along with the user manager — so not even the next host start can heal it. The
+/// box would stay dark until someone reached a VT.
+///
+/// Deliberately ignores the keep-alive policy that [`schedule_restore_tv_session`] honors:
+/// `keep_alive=forever` pins a session for the NEXT client, which is meaningless once the host
+/// that would serve them is exiting. No-op when nothing was taken over.
+pub fn restore_takeover_now() {
+    if !takeover_live() {
+        return;
+    }
+    *PENDING_RESTORE.lock().unwrap_or_else(|e| e.into_inner()) = None; // doing it right here
+    tracing::info!("gamescope: host is shutting down — restoring the box's own session first");
+    do_restore_tv_session();
 }
 
 /// Does any DRM connector report a physically `connected` display? Scans

@@ -268,6 +268,18 @@ pub fn restore_takeover_on_startup() {
 #[cfg(not(target_os = "linux"))]
 pub fn restore_takeover_on_startup() {}
 
+/// Give the box its own session back **now**, synchronously, because the host is exiting. Blocks
+/// (it shells out to `systemctl`), so call it off the async runtime. Call from the host's shutdown
+/// path — a takeover that outlives the host leaves the box with no display manager and nobody left
+/// to restart it. No-op when nothing was taken over.
+#[cfg(target_os = "linux")]
+pub fn restore_takeover_now() {
+    gamescope::restore_takeover_now();
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn restore_takeover_now() {}
+
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;

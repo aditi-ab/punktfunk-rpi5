@@ -350,6 +350,8 @@ pub(crate) async fn serve(
     // A3: recover a TV takeover stranded by a crashed previous host instance (persisted to
     // $XDG_RUNTIME_DIR) — schedule a restore after a reconnect grace. No-op on a clean start.
     crate::vdisplay::restore_takeover_on_startup();
+    // …and the other end of that: give the box its session back when WE are the ones going away.
+    install_shutdown_restore();
     // Host-lifetime cover-art warmer: fetches + caches GOG/Xbox cover art (no-auth api.gog.com /
     // displaycatalog) off the hot path so `all_games()` (the library list + launch resolve) never
     // blocks on the network. A no-op on a host whose stores all carry their own art.
@@ -484,6 +486,58 @@ pub(crate) async fn serve(
     while sessions.join_next().await.is_some() {}
     ep.wait_idle().await;
     Ok(())
+}
+
+/// How long a shutdown waits for the box's session to be handed back before exiting anyway. The
+/// restore is a couple of `systemctl` calls (or one `pkexec` helper run); this only bounds a
+/// genuine wedge, well inside systemd's 90 s `TimeoutStopSec`.
+const SHUTDOWN_RESTORE_GRACE: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Hand the box's own session back on the way out. Until this existed the host had NO signal
+/// handling at all: `SIGTERM` killed it outright, which is fine for a host that owns nothing — but
+/// a managed gamescope takeover owns the box's session, and on a mask-fragile display manager
+/// (Nobara's plasmalogin) it has STOPPED that display manager for the length of the stream. Killed
+/// there, the host leaves a box with no graphical session and nothing left to restart it: the
+/// crash-restore state lives in `$XDG_RUNTIME_DIR`, which logind removes along with the user
+/// manager, so even the next host start can't heal it. `systemctl --user restart punktfunk-host`
+/// mid-stream — or a package update doing it for you — was enough.
+///
+/// So: catch `SIGTERM`/`SIGINT`, restore, then exit. Restoring runs on a blocking thread (it shells
+/// out) under [`SHUTDOWN_RESTORE_GRACE`], and a host that took nothing over exits immediately.
+fn install_shutdown_restore() {
+    #[cfg(unix)]
+    tokio::spawn(async {
+        use tokio::signal::unix::{signal, SignalKind};
+        let (Ok(mut term), Ok(mut int)) = (
+            signal(SignalKind::terminate()),
+            signal(SignalKind::interrupt()),
+        ) else {
+            tracing::warn!(
+                "could not install shutdown signal handlers — a host stopped mid-takeover will \
+                 leave the box's own session down until it is restarted"
+            );
+            return;
+        };
+        let sig = tokio::select! {
+            _ = term.recv() => "SIGTERM",
+            _ = int.recv() => "SIGINT",
+        };
+        tracing::info!(
+            signal = sig,
+            "host stopping — handing the box's session back"
+        );
+        let restore = tokio::task::spawn_blocking(crate::vdisplay::restore_takeover_now);
+        if tokio::time::timeout(SHUTDOWN_RESTORE_GRACE, restore)
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                secs = SHUTDOWN_RESTORE_GRACE.as_secs(),
+                "the session restore did not finish in time — exiting anyway"
+            );
+        }
+        std::process::exit(0);
+    });
 }
 
 /// The accept loop is sequential, so the control phase must be bounded — a client that
