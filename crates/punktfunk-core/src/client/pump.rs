@@ -11,8 +11,8 @@ use crate::abr::BitrateController;
 use crate::config::Role;
 use crate::packet::FLAG_PROBE;
 use crate::quic::{
-    accept_resync, io, wall_clock_ns, window_loss_ppm, BitrateChanged, ClipState, ClockEcho,
-    ClockResync, Hello, LossReport, ProbeResult, Reconfigure, Reconfigured, RequestKeyframe,
+    io, wall_clock_ns, window_loss_ppm, BitrateChanged, ClipState, ClockEcho, ClockResync, Hello,
+    LossReport, ProbeResult, Reconfigure, Reconfigured, RequestKeyframe, ResyncAdmit, ResyncGuard,
     ResyncStep, SetBitrate, Start, Welcome,
 };
 use crate::session::Session;

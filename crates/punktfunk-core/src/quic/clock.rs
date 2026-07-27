@@ -82,8 +82,12 @@ pub fn wall_clock_ns() -> u64 {
 pub enum ResyncStep {
     /// Nothing — the echo was stale (a previous batch) or no batch is in flight.
     Idle,
-    /// Send this next-round probe and keep feeding echoes.
-    Probe(ClockProbe),
+    /// The round was recorded and the batch wants another: wait the inter-round spacing, then
+    /// stamp + send [`ClockResync::next_probe`]. Spacing the rounds makes the batch sample
+    /// several phases of the periodic video-burst cycle instead of completing inside one burst
+    /// — at high bitrates the whole 8-round batch otherwise fits in a single ~6 ms burst and
+    /// every round reads the same congested (or same quiet) instant.
+    MoreRounds,
     /// The batch is complete: the min-RTT estimate over its rounds, per [`clock_offset_ns`].
     Done { offset_ns: i64, rtt_ns: u64 },
 }
@@ -118,6 +122,13 @@ impl ClockResync {
     /// `pending_t1` and get ignored. Returns the first probe to send, stamped `now_ns`.
     pub fn begin(&mut self, now_ns: u64) -> ClockProbe {
         self.samples.clear();
+        self.next_probe(now_ns)
+    }
+
+    /// Stamp + arm the next round's probe at `now_ns` — send it immediately. Called after
+    /// [`ResyncStep::MoreRounds`] once the caller's inter-round spacing has elapsed; stamping
+    /// at send time keeps that spacing out of the measured RTT.
+    pub fn next_probe(&mut self, now_ns: u64) -> ClockProbe {
         self.pending_t1 = Some(now_ns);
         ClockProbe { t1_ns: now_ns }
     }
@@ -129,11 +140,12 @@ impl ClockResync {
         }
         self.samples
             .push((echo.t1_ns, echo.t2_ns, echo.t3_ns, now_ns));
-        if self.samples.len() < Self::ROUNDS {
-            self.pending_t1 = Some(now_ns);
-            return ResyncStep::Probe(ClockProbe { t1_ns: now_ns });
-        }
+        // No probe in flight until the driver arms the next round (or a batch restarts) — a
+        // duplicate of this round's echo must not double-record.
         self.pending_t1 = None;
+        if self.samples.len() < Self::ROUNDS {
+            return ResyncStep::MoreRounds;
+        }
         match clock_offset_ns(&self.samples) {
             Some((offset_ns, rtt_ns)) => ResyncStep::Done { offset_ns, rtt_ns },
             None => ResyncStep::Idle, // unreachable: ROUNDS > 0 samples were just collected
@@ -147,12 +159,97 @@ impl Default for ClockResync {
     }
 }
 
-/// Acceptance guard for a re-sync batch: apply the new offset only when its min RTT is
-/// comparable to the connect-time RTT — `≤ max(2 ms, 1.5 × connect RTT)`. A congested window
-/// biases the offset by its queueing delay, and frames already read late exactly then; better
-/// to keep the old estimate and let the next batch try again.
-pub fn accept_resync(batch_rtt_ns: u64, connect_rtt_ns: u64) -> bool {
-    batch_rtt_ns <= (connect_rtt_ns + connect_rtt_ns / 2).max(2_000_000)
+/// Acceptance predicate for a re-sync batch: its min RTT must be comparable to the best RTT
+/// this session has evidenced — `≤ max(2 ms, 1.5 × floor)`. A congested window biases the
+/// offset by its queueing delay, and frames already read late exactly then; better to keep the
+/// old estimate and let the next batch try again.
+pub fn accept_resync(batch_rtt_ns: u64, floor_rtt_ns: u64) -> bool {
+    batch_rtt_ns <= (floor_rtt_ns + floor_rtt_ns / 2).max(2_000_000)
+}
+
+/// Admission decision for a completed re-sync batch (see [`ResyncGuard::admit`]).
+#[derive(Debug, PartialEq, Eq)]
+pub enum ResyncAdmit {
+    /// Batch RTT is within the guard band of the session floor: apply this batch's offset.
+    Fresh,
+    /// Batch rejected (congested window) — keep the previous offset; `streak` counts the
+    /// consecutive rejections since the last applied batch.
+    Rejected { streak: u32 },
+    /// The rejection streak hit [`ResyncGuard::MAX_REJECTED_STREAK`]: apply the best (min-RTT)
+    /// batch of the streak instead of drifting further. Carries that batch's estimate.
+    BestOfStreak { offset_ns: i64, rtt_ns: u64 },
+}
+
+/// Admission control for mid-stream re-sync batches. Two fixes over the original static
+/// `≤ max(2 ms, 1.5 × connect RTT)` guard (2026-07 PyroWave-sawtooth field report):
+///
+/// - **The baseline is the session floor, not the connect-time RTT.** The connect handshake
+///   runs before the video data plane exists; comparing loaded mid-stream batches against that
+///   idle figure rejected essentially every batch of a high-bitrate LAN session, and the
+///   offset went stale while the wall clocks drifted apart — the OSD latency ramped for
+///   minutes and snapped back only when a lucky batch landed. The floor now folds in every
+///   completed batch's min RTT (rejected ones included: their min-RTT round is still floor
+///   evidence), so the baseline tracks what this path can actually do under load.
+/// - **Staleness is bounded.** After [`Self::MAX_REJECTED_STREAK`] consecutive rejections the
+///   best batch of the streak is applied anyway: its queueing bias is at most ~half its RTT
+///   (a few ms), while unbounded wall-clock drift is worth that many ms *per minute* on a
+///   slewing clock. A bounded bias beats an unbounded drift.
+pub struct ResyncGuard {
+    /// Best RTT this session has evidenced: connect-time RTT, then min over every batch.
+    floor_rtt_ns: u64,
+    rejected_streak: u32,
+    /// Min-RTT batch among the current rejection streak.
+    best_pending: Option<(i64, u64)>,
+}
+
+impl ResyncGuard {
+    /// Consecutive rejected batches tolerated before the best of them is applied anyway.
+    pub const MAX_REJECTED_STREAK: u32 = 3;
+
+    pub fn new(connect_rtt_ns: u64) -> ResyncGuard {
+        ResyncGuard {
+            floor_rtt_ns: connect_rtt_ns,
+            rejected_streak: 0,
+            best_pending: None,
+        }
+    }
+
+    /// The current baseline the guard compares batches against (log/debug surface).
+    pub fn floor_rtt_ns(&self) -> u64 {
+        self.floor_rtt_ns
+    }
+
+    /// Judge a completed batch. The caller applies the offset on [`ResyncAdmit::Fresh`] (this
+    /// batch's) or [`ResyncAdmit::BestOfStreak`] (the carried one) and keeps the old offset on
+    /// [`ResyncAdmit::Rejected`].
+    pub fn admit(&mut self, offset_ns: i64, rtt_ns: u64) -> ResyncAdmit {
+        // Judge against the floor as evidenced BEFORE this batch, then fold this batch in —
+        // comparing a batch against a floor that already includes it would accept everything.
+        let fresh = accept_resync(rtt_ns, self.floor_rtt_ns);
+        self.floor_rtt_ns = self.floor_rtt_ns.min(rtt_ns);
+        if fresh {
+            self.rejected_streak = 0;
+            self.best_pending = None;
+            return ResyncAdmit::Fresh;
+        }
+        let best = match self.best_pending {
+            Some((o, r)) if r <= rtt_ns => (o, r),
+            _ => (offset_ns, rtt_ns),
+        };
+        self.best_pending = Some(best);
+        self.rejected_streak += 1;
+        if self.rejected_streak >= Self::MAX_REJECTED_STREAK {
+            self.rejected_streak = 0;
+            self.best_pending = None;
+            return ResyncAdmit::BestOfStreak {
+                offset_ns: best.0,
+                rtt_ns: best.1,
+            };
+        }
+        ResyncAdmit::Rejected {
+            streak: self.rejected_streak,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -218,9 +315,14 @@ mod tests {
             let echo = echo_for(probe.t1_ns, one_way);
             let t4 = t4_for(&echo, one_way);
             match rs.on_echo(&echo, t4) {
-                ResyncStep::Probe(p) => {
+                ResyncStep::MoreRounds => {
                     assert!(round < ClockResync::ROUNDS - 1, "batch overran its rounds");
-                    probe = p;
+                    // A duplicate of the just-consumed echo must not double-record: no probe
+                    // is in flight until the driver arms the next round.
+                    assert_eq!(rs.on_echo(&echo, t4), ResyncStep::Idle);
+                    // The driver stamps the next probe at SEND time (after its inter-round
+                    // spacing), so the spacing never lands in the measured RTT.
+                    probe = rs.next_probe(t4 + 7_000_000);
                 }
                 ResyncStep::Done { offset_ns, rtt_ns } => {
                     assert_eq!(round, ClockResync::ROUNDS - 1, "batch ended early");
@@ -243,10 +345,46 @@ mod tests {
             rs.on_echo(&echo_for(old.t1_ns, 100_000), 2_300_000),
             ResyncStep::Idle
         );
-        assert!(matches!(
+        assert_eq!(
             rs.on_echo(&echo_for(fresh.t1_ns, 100_000), 3_300_000),
-            ResyncStep::Probe(_)
-        ));
+            ResyncStep::MoreRounds
+        );
+    }
+
+    /// The guard's two field-report fixes: the baseline tracks the SESSION floor (a batch
+    /// better than the stale connect figure re-anchors it), and a rejection streak is bounded
+    /// — the best batch of the streak is applied rather than letting the offset go stale
+    /// while the wall clocks drift apart.
+    #[test]
+    fn resync_guard_floor_tracking_and_bounded_streak() {
+        // Connect measured 400 µs idle; the 2 ms floor of accept_resync governs early on.
+        let mut g = ResyncGuard::new(400_000);
+        assert_eq!(g.admit(10, 1_500_000), ResyncAdmit::Fresh);
+        // A better batch lowers the floor evidence.
+        assert_eq!(g.admit(11, 300_000), ResyncAdmit::Fresh);
+        assert_eq!(g.floor_rtt_ns(), 300_000);
+
+        // Loaded stretch: batches at 4–6 ms all exceed max(2 ms, 1.5 × 300 µs).
+        assert_eq!(g.admit(100, 6_000_000), ResyncAdmit::Rejected { streak: 1 });
+        // The best (min-RTT) batch of the streak is remembered…
+        assert_eq!(g.admit(200, 4_000_000), ResyncAdmit::Rejected { streak: 2 });
+        // …and applied when the streak hits the cap — offset 200 (the 4 ms batch), not 300.
+        assert_eq!(
+            g.admit(300, 5_000_000),
+            ResyncAdmit::BestOfStreak {
+                offset_ns: 200,
+                rtt_ns: 4_000_000
+            }
+        );
+        // The streak reset: the next congested batch starts a new one.
+        assert_eq!(g.admit(400, 5_000_000), ResyncAdmit::Rejected { streak: 1 });
+        // A quiet batch clears it and applies normally.
+        assert_eq!(g.admit(500, 350_000), ResyncAdmit::Fresh);
+
+        // A batch that IS the new floor is always fresh (compared against the pre-batch floor).
+        let mut g2 = ResyncGuard::new(10_000_000);
+        assert_eq!(g2.admit(1, 8_000_000), ResyncAdmit::Fresh);
+        assert_eq!(g2.floor_rtt_ns(), 8_000_000);
     }
 
     /// The acceptance guard: a batch measured through a congested window (fat RTT) must not

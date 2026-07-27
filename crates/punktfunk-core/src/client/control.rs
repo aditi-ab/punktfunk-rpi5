@@ -52,8 +52,8 @@ pub(crate) struct Negotiated {
     /// Host clock minus client clock (ns); `0` = no skew handshake (old host / synced clocks).
     pub(crate) clock_offset_ns: i64,
     /// Min RTT of the connect-time skew handshake (ns); `None` = the host never answered —
-    /// mid-stream re-syncs are pointless then and stay off. The re-sync acceptance guard
-    /// compares each batch against this baseline ([`accept_resync`]).
+    /// mid-stream re-syncs are pointless then and stay off. Seeds the re-sync admission
+    /// guard's session-floor baseline ([`ResyncGuard`]).
     pub(crate) clock_rtt_ns: Option<u64>,
     /// Resolved encode bit depth: `8`, or `10` for a Main10 / HDR session.
     pub(crate) bit_depth: u8,

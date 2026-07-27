@@ -681,6 +681,11 @@
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
+// Consecutive rejected batches tolerated before the best of them is applied anyway.
+#define ResyncGuard_MAX_REJECTED_STREAK 3
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
 // Type byte of [`Reconfigure`] (first byte after the magic).
 #define MSG_RECONFIGURE 1
 #endif

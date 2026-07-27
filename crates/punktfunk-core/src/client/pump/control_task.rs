@@ -52,6 +52,14 @@ impl ControlTask {
         // the read arm below; only when the host answered the connect-time handshake — an
         // old host would just eat the probes.
         let mut resync = ClockResync::new();
+        let mut resync_guard = clock_rtt_ns.map(ResyncGuard::new);
+        // Inter-round spacing: without it the whole 8-round batch completes inside one
+        // ~6 ms video burst and every round samples the same congestion state — a batch
+        // that starts mid-burst is then wholly congested and gets rejected. 7 ms staggers
+        // the rounds across the ~16.7 ms frame cycle so the min-RTT round almost always
+        // lands in a quiet inter-burst gap, even at PyroWave-class bitrates.
+        const RESYNC_ROUND_SPACING: std::time::Duration = std::time::Duration::from_millis(7);
+        let mut staged_round: Option<tokio::time::Instant> = None;
         let mut resync_tick = tokio::time::interval_at(
             tokio::time::Instant::now() + CLOCK_RESYNC_INTERVAL,
             CLOCK_RESYNC_INTERVAL,
@@ -72,6 +80,7 @@ impl ControlTask {
                             if clock_rtt_ns.is_none() {
                                 continue; // no connect-time handshake — host can't answer
                             }
+                            staged_round = None; // a new batch abandons any staged round
                             resync.begin(wall_clock_ns()).encode()
                         }
                         CtrlRequest::ClipControl(c) => c.encode(),
@@ -83,7 +92,17 @@ impl ControlTask {
                     }
                 }
                 _ = resync_tick.tick(), if clock_rtt_ns.is_some() => {
+                    staged_round = None; // a new batch abandons any staged round
                     let probe = resync.begin(wall_clock_ns());
+                    if io::write_msg(&mut ctrl_send, &probe.encode()).await.is_err() {
+                        break;
+                    }
+                }
+                _ = async { tokio::time::sleep_until(staged_round.unwrap()).await },
+                        if staged_round.is_some() => {
+                    staged_round = None;
+                    // Stamped at send time so the inter-round spacing stays out of the RTT.
+                    let probe = resync.next_probe(wall_clock_ns());
                     if io::write_msg(&mut ctrl_send, &probe.encode()).await.is_err() {
                         break;
                     }
@@ -132,16 +151,36 @@ impl ControlTask {
                         *bitrate_ack.lock().unwrap() = Some(ack.bitrate_kbps);
                     } else if let Ok(echo) = ClockEcho::decode(&msg) {
                         match resync.on_echo(&echo, wall_clock_ns()) {
-                            ResyncStep::Probe(p) => {
-                                if io::write_msg(&mut ctrl_send, &p.encode()).await.is_err() {
-                                    break;
-                                }
+                            ResyncStep::MoreRounds => {
+                                staged_round = Some(
+                                    tokio::time::Instant::now() + RESYNC_ROUND_SPACING,
+                                );
                             }
                             ResyncStep::Done { offset_ns, rtt_ns } => {
-                                // Never let a congested window bias the offset (frames read
-                                // late exactly then) — keep the old estimate and let the next
-                                // periodic batch try again.
-                                if accept_resync(rtt_ns, clock_rtt_ns.unwrap_or(0)) {
+                                let Some(guard) = resync_guard.as_mut() else {
+                                    continue; // no connect handshake — batches never start
+                                };
+                                let (apply, best_of_streak) = match guard.admit(offset_ns, rtt_ns)
+                                {
+                                    ResyncAdmit::Fresh => (Some((offset_ns, rtt_ns)), false),
+                                    ResyncAdmit::BestOfStreak { offset_ns, rtt_ns } => {
+                                        (Some((offset_ns, rtt_ns)), true)
+                                    }
+                                    ResyncAdmit::Rejected { streak } => {
+                                        // warn, not debug: repeated rejections are exactly the
+                                        // stale-offset starvation signature the 2026-07
+                                        // PyroWave-sawtooth report had to be diagnosed without.
+                                        tracing::warn!(
+                                            rtt_us = rtt_ns / 1000,
+                                            floor_us = guard.floor_rtt_ns() / 1000,
+                                            streak,
+                                            "clock re-sync batch rejected — RTT above the \
+                                             session floor (congested window)"
+                                        );
+                                        (None, false)
+                                    }
+                                };
+                                if let Some((offset_ns, rtt_ns)) = apply {
                                     // info, not debug: ≤1/min, and it is THE forensic
                                     // trail for a stale-offset (stepped/slewed wall clock)
                                     // latency plateau — the 2026-07 two-pair investigation
@@ -149,16 +188,11 @@ impl ControlTask {
                                     tracing::info!(
                                         offset_ns,
                                         rtt_us = rtt_ns / 1000,
+                                        best_of_streak,
                                         "mid-stream clock re-sync applied"
                                     );
                                     clock_offset.store(offset_ns, Ordering::Relaxed);
                                     clock_gen.fetch_add(1, Ordering::Relaxed);
-                                } else {
-                                    tracing::info!(
-                                        rtt_us = rtt_ns / 1000,
-                                        "clock re-sync batch discarded — RTT above the \
-                                         connect-time baseline (congested window)"
-                                    );
                                 }
                             }
                             ResyncStep::Idle => {}
