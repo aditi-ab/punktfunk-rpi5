@@ -163,8 +163,15 @@ pub struct SessionEnv {
     /// `HYPRLAND_INSTANCE_SIGNATURE` of the live Hyprland instance (`Some` only for
     /// [`ActiveKind::DesktopHyprland`]). `hyprctl` needs it to reach the right instance socket;
     /// [`apply_session_env`] exports it so the systemd-`--user` host works without inheriting the
-    /// session env (unlike sway's `SWAYSOCK`). `None` for every other compositor.
+    /// session env. `None` for every other compositor.
     pub hyprland_signature: Option<String>,
+    /// `SWAYSOCK` of the live sway instance (`Some` only for a sway [`ActiveKind::DesktopWlroots`]).
+    /// `swaymsg` needs it, and it was the LAST session variable the host could not derive: a
+    /// `systemd --user` host that never inherited the login shell's environment had no sway IPC at
+    /// all, so output enumeration and the chooser both failed. Derived from the detected compositor
+    /// PID like the Hyprland signature above. `None` on river (wlroots, but no sway IPC) and every
+    /// other compositor.
+    pub sway_socket: Option<String>,
 }
 
 /// The live session: its [`ActiveKind`] plus the [`SessionEnv`] to target it.
@@ -316,6 +323,12 @@ pub fn detect_active_session() -> ActiveSession {
         ActiveKind::DesktopHyprland => find_hypr_signature(&xdg_runtime_dir, uid),
         _ => None,
     };
+    // Same idea for sway's IPC socket: without it `swaymsg` has nothing to talk to, and a
+    // `systemd --user` host never inherited it.
+    let sway_socket = match kind {
+        ActiveKind::DesktopWlroots => find_sway_socket(&xdg_runtime_dir, uid, winning_pid),
+        _ => None,
+    };
     ActiveSession {
         kind,
         env: SessionEnv {
@@ -324,6 +337,7 @@ pub fn detect_active_session() -> ActiveSession {
             dbus_session_bus_address: dbus,
             xdg_current_desktop,
             hyprland_signature,
+            sway_socket,
         },
         compositor_pid: winning_pid,
     }
@@ -359,6 +373,46 @@ fn find_hypr_signature(runtime: &str, uid: u32) -> Option<String> {
     }
     cands.sort_by_key(|(m, _)| std::cmp::Reverse(*m));
     cands.into_iter().next().map(|(_, n)| n)
+}
+
+/// Find the live sway IPC socket (`SWAYSOCK`) for our uid. Trust a valid inherited value first (the
+/// host launched inside the session); then the exact `sway-ipc.<uid>.<pid>.sock` for the compositor
+/// PID detection already picked — a name sway builds from those two numbers, so it is an identity
+/// match rather than a guess; then the newest-mtime `sway-ipc.<uid>.*.sock` we own, for the case
+/// where the socket name does not match the PID we saw (sway re-exec, a wrapper process).
+///
+/// `None` on river: it is the other [`ActiveKind::DesktopWlroots`] compositor and has no sway IPC —
+/// which is the honest answer, since the wlroots backend drives sway through `swaymsg`.
+#[cfg(target_os = "linux")]
+fn find_sway_socket(runtime: &str, uid: u32, pid: Option<u32>) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    if let Ok(s) = std::env::var("SWAYSOCK") {
+        if !s.is_empty() && std::path::Path::new(&s).exists() {
+            return Some(s);
+        }
+    }
+    if let Some(pid) = pid {
+        let exact = std::path::Path::new(runtime).join(format!("sway-ipc.{uid}.{pid}.sock"));
+        if exact.exists() {
+            return Some(exact.to_string_lossy().into_owned());
+        }
+    }
+    let prefix = format!("sway-ipc.{uid}.");
+    let mut cands: Vec<(std::time::SystemTime, String)> = Vec::new();
+    for e in std::fs::read_dir(runtime).ok()?.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if !name.starts_with(&prefix) || !name.ends_with(".sock") {
+            continue;
+        }
+        let Ok(md) = e.metadata() else { continue };
+        if md.uid() != uid {
+            continue;
+        }
+        let mtime = md.modified().unwrap_or(std::time::UNIX_EPOCH);
+        cands.push((mtime, e.path().to_string_lossy().into_owned()));
+    }
+    cands.sort_by_key(|(m, _)| std::cmp::Reverse(*m));
+    cands.into_iter().next().map(|(_, p)| p)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -425,6 +479,15 @@ pub fn apply_session_env(active: &ActiveSession) {
     match &e.hyprland_signature {
         Some(sig) => std::env::set_var("HYPRLAND_INSTANCE_SIGNATURE", sig),
         None => std::env::remove_var("HYPRLAND_INSTANCE_SIGNATURE"),
+    }
+    // sway: same treatment, and for the same reason — `swaymsg` (output enumeration, the capture
+    // chooser) is unreachable without it, so a systemd `--user` host that never inherited the login
+    // environment had no sway backend at all. Cleared when nothing sway-shaped is live, so a
+    // sway→Hyprland switch can't leave `swaymsg` aimed at a dead socket. `wlroots::is_available()`
+    // keys off this variable, so setting it here is also what makes the backend visible at all.
+    match &e.sway_socket {
+        Some(sock) => std::env::set_var("SWAYSOCK", sock),
+        None => std::env::remove_var("SWAYSOCK"),
     }
     // NOTHING live ⇒ every session-scoped var still in the env is a leftover from a previous
     // connect's retarget, and the availability probes read them: after a gnome-shell crash
@@ -564,3 +627,98 @@ pub fn settle_desktop_portal(chosen: Compositor) {
 
 #[cfg(not(target_os = "linux"))]
 pub fn settle_desktop_portal(_chosen: Compositor) {}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    /// A scratch runtime dir with the sway-ipc sockets named in `pids`, plus the uid the names are
+    /// built from. Removed on drop.
+    struct FakeRuntime {
+        dir: std::path::PathBuf,
+        uid: u32,
+    }
+
+    impl FakeRuntime {
+        fn new(tag: &str, pids: &[u32]) -> FakeRuntime {
+            // SAFETY: parameterless POSIX call, returns the calling process's uid; touches no memory.
+            let uid = unsafe { libc::getuid() };
+            let dir =
+                std::env::temp_dir().join(format!("pf-swaysock-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            for pid in pids {
+                std::fs::write(dir.join(format!("sway-ipc.{uid}.{pid}.sock")), b"").unwrap();
+            }
+            FakeRuntime { dir, uid }
+        }
+        fn path(&self) -> &str {
+            self.dir.to_str().unwrap()
+        }
+    }
+
+    impl Drop for FakeRuntime {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// Run `f` with `SWAYSOCK` unset, so the "trust what we inherited" rung can't decide the test.
+    /// Serialized on the crate's env lock — these tests mutate process-global state.
+    fn without_inherited_swaysock<R>(f: impl FnOnce() -> R) -> R {
+        crate::with_env_lock(|| {
+            let prev = std::env::var_os("SWAYSOCK");
+            std::env::remove_var("SWAYSOCK");
+            let out = f();
+            if let Some(p) = prev {
+                std::env::set_var("SWAYSOCK", p);
+            }
+            out
+        })
+    }
+
+    /// The point of deriving it: the socket that belongs to the compositor detection actually found,
+    /// not merely *a* sway socket. A stale socket from a previous sway (crash, re-login) sitting in
+    /// the same runtime dir must not win.
+    #[test]
+    fn the_socket_matching_the_detected_pid_wins() {
+        let rt = FakeRuntime::new("exact", &[4242, 9999]);
+        let got = without_inherited_swaysock(|| find_sway_socket(rt.path(), rt.uid, Some(4242)));
+        assert_eq!(
+            got,
+            Some(format!("{}/sway-ipc.{}.4242.sock", rt.path(), rt.uid))
+        );
+    }
+
+    /// sway re-exec (or a wrapper) can leave the socket named for a PID we didn't see. One socket in
+    /// the dir is still unambiguous — better to hand `swaymsg` the real thing than nothing.
+    #[test]
+    fn an_unmatched_pid_falls_back_to_the_socket_that_is_there() {
+        let rt = FakeRuntime::new("fallback", &[777]);
+        let got = without_inherited_swaysock(|| find_sway_socket(rt.path(), rt.uid, Some(12345)));
+        assert_eq!(
+            got,
+            Some(format!("{}/sway-ipc.{}.777.sock", rt.path(), rt.uid))
+        );
+    }
+
+    /// river is the other wlroots desktop and ships no sway IPC. Reporting `None` is what keeps
+    /// `apply_session_env` from exporting a `SWAYSOCK` that points at nothing — an exported lie
+    /// would make `wlroots::is_available()` claim a backend that cannot answer.
+    #[test]
+    fn no_sway_ipc_socket_reports_none() {
+        let rt = FakeRuntime::new("none", &[]);
+        let got = without_inherited_swaysock(|| find_sway_socket(rt.path(), rt.uid, Some(1)));
+        assert_eq!(got, None);
+    }
+
+    /// Someone else's socket in a shared runtime dir is not ours to talk to.
+    #[test]
+    fn another_uids_socket_is_ignored() {
+        let rt = FakeRuntime::new("otheruid", &[]);
+        let other = rt.uid.wrapping_add(1);
+        std::fs::write(rt.dir.join(format!("sway-ipc.{other}.500.sock")), b"").unwrap();
+        let got = without_inherited_swaysock(|| find_sway_socket(rt.path(), rt.uid, Some(500)));
+        assert_eq!(got, None);
+    }
+}
