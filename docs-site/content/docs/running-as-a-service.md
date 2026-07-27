@@ -26,6 +26,35 @@ systemctl --user enable --now punktfunk-host
 
 The host now starts whenever you log in. Check it with `systemctl --user status punktfunk-host`.
 
+**You don't need to export anything for it.** The host finds the live compositor session itself on
+every connect and works out where to reach it (`WAYLAND_DISPLAY`, `XDG_RUNTIME_DIR`, the session bus,
+sway's `SWAYSOCK`, Hyprland's instance signature) from the running compositor — so `host.env` is for
+policy, not session plumbing, and `systemctl --user import-environment` is not a prerequisite.
+
+### Restart the host with your desktop
+
+Add one drop-in so the host follows your session's lifetime:
+
+```sh
+mkdir -p ~/.config/systemd/user/punktfunk-host.service.d
+# /usr/share/punktfunk/ on Fedora/Arch, /usr/share/punktfunk-host/ on Debian/Ubuntu,
+# scripts/ in a source checkout
+cp /usr/share/punktfunk/punktfunk-host-desktop-session.conf \
+   ~/.config/systemd/user/punktfunk-host.service.d/desktop-session.conf
+systemctl --user daemon-reload
+systemctl --user reenable punktfunk-host
+systemctl --user restart punktfunk-host
+```
+
+Without it, restarting Plasma or GNOME — a crash, a log out and back in, "restart the shell" — leaves
+the host running against a compositor that no longer exists. It keeps listening and answering, and
+every session after that fails at capture, which is a confusing way to find out. The drop-in makes a
+compositor restart a host restart.
+
+Skip it on the headless/appliance route below (which has its own session unit), and on Sway or
+Hyprland, which don't hand their session to systemd — start the host from the compositor's config
+there instead, so it comes and goes with the session.
+
 ## B. A headless, always-on host
 
 To run with **no monitor and no login** — a machine in a closet that's always ready — you need two

@@ -18,12 +18,81 @@ opened on.
 > Reach for a preset when you want a specific experience — a dedicated box you only stream from, a
 > desktop you also use in person, or a multi-monitor workstation.
 
+If you'd rather stream a monitor the host **already has** than have punktfunk make one, that's a
+different setting and it turns most of this page off — see
+[Stream a real monitor instead](#stream-a-real-monitor-instead) right below.
+
 > **What's live today:** **keep-alive** (linger, or **forever**), **topology** (extend / primary /
 > exclusive), **conflict handling**, **per-client identity + persistent scaling** (Windows, KDE/KWin
 > *and* GNOME/Mutter), and **multi-monitor layout** (several clients as monitors of one desktop) are
 > all enforced. A reconnect always resumes the kept display — even a fast one — instead of spawning a
 > second. The remaining gaps are noted inline: the Linux `primary` physical-keep *effect*, Sway
 > `exclusive`, and multi-display for a *single* client (that last is the next stage).
+
+## Stream a real monitor instead
+
+Sometimes you don't want a new screen — you want *that* screen. A shop-floor PC on a wall mount, a
+lab bench machine, a media box whose TV output you'd like to watch from the couch: what matters is
+seeing the monitor that's already there, exactly as the person in front of it sees it.
+
+Set **Host → *Virtual displays* → Streamed screen** to one of the listed monitors and punktfunk stops
+creating a virtual display altogether. It streams that physical monitor instead, and every client
+sees it at *its* resolution — you're a viewer of a screen, not the owner of your own.
+
+- The monitor is **never touched**. punktfunk doesn't resize it, move it, disable it or restore it —
+  it only watches. Keep-alive, topology and the multi-monitor layout options above simply don't
+  apply, because there's no display of ours to apply them to.
+- **The resolution is the monitor's**, not yours. A client asking for a different one is politely
+  told no and scales its own picture — reconfiguring the display someone is sitting at would be
+  rude, and the mid-stream resize machinery is switched off for this reason.
+- **Every client sees the same screen.** Two clients means two viewers of one monitor, not two
+  desktops.
+- Naming a monitor that isn't there is a **hard error**, not a fallback: the session fails with
+  `no monitor named "DP-9" — this host has: HDMI-1`. Showing you the wrong screen would be worse
+  than showing you none.
+- Choosing **Virtual screen (default)** in the same card puts you back on the normal path.
+
+Supported on **KDE/KWin**, **GNOME/Mutter**, **Sway/wlroots** and **Hyprland** — each through the
+compositor's own screen-recording API, so there is **no chooser dialog** and nothing to click. That
+matters most for a host running unattended as a [service](/docs/running-as-a-service): a background
+`systemd --user` daemon has nobody to answer a permission prompt, so the monitor has to be
+configuration rather than a question. (A nested gamescope session has no physical monitors of its
+own, so the setting doesn't appear there.)
+
+### Naming the monitor from the host
+
+Monitors are named by **connector** — `HDMI-A-1`, `DP-2`, `eDP-1`. List what this host has:
+
+```sh
+punktfunk-host list-monitors
+```
+
+```
+Kwin:
+  HDMI-A-1        1920x1080@60 at +0,+0    scale 1  Dell U2412M  [primary]
+  DP-2            2560x1440@144 at +1920,+0  scale 1  ACME 27
+```
+
+To pin it **from the host's configuration** instead of the console — the appliance route — set it in
+[`host.env`](/docs/configuration):
+
+```sh
+PUNKTFUNK_CAPTURE_MONITOR=HDMI-A-1
+```
+
+The environment variable **wins over the console setting**, deliberately: an operator who declared
+the answer in the unit's environment shouldn't have it re-aimed by a click. The console shows the
+Streamed screen card as locked while it's set. Leave it unset on a machine you want to steer from the
+console.
+
+Check the whole path — mirror, capture, frames — without a client involved:
+
+```sh
+punktfunk-host mirror-test --monitor HDMI-A-1 --seconds 20
+```
+
+Compositor screen recording is **damage-driven**: an idle desktop legitimately produces almost no
+frames, so move the mouse on the host while it runs or a working mirror reads as a stall.
 
 ## Pick a preset
 
@@ -251,6 +320,20 @@ and reconnecting within game mode reuses the still-warm session (or cleanly recr
 landing on a dead stream — and switching between game mode and the KDE / GNOME desktop mid-stream
 follows the switch. If a launched game **exits**, a dedicated session ends and returns you to your
 library; a game mode / desktop session keeps streaming.
+
+**My keep-alive / topology / layout settings do nothing.** Check whether **Streamed screen** is set
+to a real monitor. Those options are all about a display punktfunk created; when it's mirroring one
+of yours there is nothing of ours to keep alive or rearrange. Switch the card back to *Virtual screen
+(default)* to get them back.
+
+**The console won't let me change Streamed screen.** `PUNKTFUNK_CAPTURE_MONITOR` is set in this
+host's [`host.env`](/docs/configuration) and deliberately outranks the console. Unset it (and restart
+the host) to choose from the console instead.
+
+**My session fails with "no monitor named …".** The pinned connector isn't among this host's
+monitors — it was renamed, unplugged, or the host is now in a different session. Run
+`punktfunk-host list-monitors` on the host to see the real names. punktfunk will not quietly stream a
+different screen instead.
 
 **My couch box's TV stayed on the streamed session after I disconnected.** With the **Headless box**
 preset (keep alive = *forever*), a managed Steam session is held indefinitely so a reconnect resumes

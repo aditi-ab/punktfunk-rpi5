@@ -86,6 +86,33 @@ hosts from another machine with `punktfunk-probe --discover`. Where multicast do
 Docker/VLAN setups), pass `--no-mdns` (or set `PUNKTFUNK_MDNS=0`) and add the host in the client by
 address instead.
 
+## `list-monitors`
+
+`punktfunk-host list-monitors` prints the **physical** monitors this host's compositor has, by
+connector name — which is how you name one for [Streamed
+screen](/docs/virtual-displays#stream-a-real-monitor-instead) (in the console, or as
+`PUNKTFUNK_CAPTURE_MONITOR`).
+
+```sh
+punktfunk-host list-monitors
+```
+
+```
+Kwin:
+  HDMI-A-1        1920x1080@60 at +0,+0    scale 1  Dell U2412M  [primary]
+  DP-2            2560x1440@144 at +1920,+0  scale 1  ACME 27  [PINNED]
+```
+
+Tags flag what's worth knowing before you pick: `primary`, `disabled` (nothing to stream), `punktfunk
+virtual display` (one of ours, not a real head), and `PINNED` for the one currently selected. Linux
+only — it reads the live compositor, so run it in (or with the environment of) the session you want
+to stream.
+
+`punktfunk-host mirror-test --monitor <CONNECTOR> [--seconds N] [--cpu]` then proves the whole path —
+mirror, capture, frames — with no client involved. It reports the first frame, the frame count and
+the negotiated size. Screen recording is damage-driven, so move the mouse on the host while it runs;
+an idle desktop legitimately yields almost nothing.
+
 ## `detect-conflicts`
 
 `punktfunk-host detect-conflicts` reports other Moonlight-compatible hosts (Sunshine, Apollo, and
