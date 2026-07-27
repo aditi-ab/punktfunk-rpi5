@@ -69,6 +69,9 @@ pub mod management {
 }
 
 use device::kde_output_device_mode_v2::{Event as ModeEvent, KdeOutputDeviceModeV2 as DeviceMode};
+use device::kde_output_device_registry_v2::{
+    Event as RegistryEvent, KdeOutputDeviceRegistryV2 as DeviceRegistry,
+};
 use device::kde_output_device_v2::{Event as DeviceEvent, KdeOutputDeviceV2 as OutputDevice};
 use management::kde_mode_list_v2::KdeModeListV2 as ModeList;
 use management::kde_output_configuration_v2::{
@@ -82,10 +85,16 @@ use management::kde_output_management_v2::KdeOutputManagementV2 as OutputManagem
 /// always in range on any KWin that advertises the globals.
 const MGMT_MAX: u32 = 22;
 const DEVICE_MAX: u32 = 24;
+/// `kde_output_device_registry_v2` — the newer way KWin hands out output devices (verified live on
+/// KWin 6.7.3, which advertises this at v23 and NO per-output `kde_output_device_v2` globals).
+const DEVICE_REGISTRY_MAX: u32 = 24;
 
 /// The opcode of `kde_output_device_v2.mode` (0-based event index) — the event that creates a child
 /// `kde_output_device_mode_v2`. Kept in sync with the vendored `kde-output-device-v2.xml`.
 const DEVICE_MODE_EVENT_OPCODE: u16 = 2;
+/// The opcode of `kde_output_device_registry_v2.output` — the event that creates a child
+/// `kde_output_device_v2`. `finished` is event 0, `output` is event 1.
+const REGISTRY_OUTPUT_EVENT_OPCODE: u16 = 1;
 
 /// Overall budget for one enumerate-then-apply operation. Generous next to a healthy roundtrip (a
 /// few ms); it exists only so a wedged compositor can't pin the session's stream thread.
@@ -156,6 +165,9 @@ struct DeviceState {
 struct State {
     management: Option<OutputManagement>,
     mgmt_name_version: Option<(u32, u32)>,
+    /// The `kde_output_device_registry_v2` on KWin ≥ 6.7, held so it keeps announcing outputs for
+    /// the life of the session (dropping it would end the announcements).
+    device_registry: Option<DeviceRegistry>,
     devices: HashMap<ObjectId, DeviceState>,
     /// mode object id → `(width, height, refresh_mHz)`.
     mode_dims: HashMap<ObjectId, (u32, u32, u32)>,
@@ -193,12 +205,47 @@ impl Dispatch<WlRegistry, ()> for State {
                     let dev = registry.bind::<OutputDevice, _, _>(name, v, qh, name);
                     let id = dev.id();
                     state.devices.entry(id).or_default().proxy = Some(dev);
+                } else if interface == DeviceRegistry::interface().name {
+                    // KWin ≥ 6.7 (Plasma 6.7.3 verified) no longer advertises ONE
+                    // `kde_output_device_v2` global per output — it advertises this registry and
+                    // hands the devices out through its `output` events instead. Binding it is what
+                    // makes this whole module work on a current KWin: without it the device list
+                    // comes back EMPTY, which reads as "no outputs" and silently degrades every
+                    // topology apply to the `kscreen-doctor` shell-out this module exists to avoid.
+                    // Both models are kept — the per-output globals are still what older KWin sends.
+                    let v = version.min(DEVICE_REGISTRY_MAX);
+                    state.device_registry =
+                        Some(registry.bind::<DeviceRegistry, _, _>(name, v, qh, ()));
                 }
             }
             wl_registry::Event::GlobalRemove { .. } => {}
             _ => {}
         }
     }
+}
+
+/// The device registry hands out one `kde_output_device_v2` per output via its `output` event
+/// (a `new_id`, so the child is created by the `event_created_child!` binding below). Devices that
+/// arrive this way have no global `name` number — the newest-wins supersede tie-break uses 0 for
+/// them, which is fine: that tie-break only matters for the per-output-global model.
+impl Dispatch<DeviceRegistry, ()> for State {
+    fn event(
+        state: &mut Self,
+        _: &DeviceRegistry,
+        event: RegistryEvent,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let RegistryEvent::Output { output } = event {
+            let id = output.id();
+            state.devices.entry(id).or_default().proxy = Some(output);
+        }
+    }
+
+    event_created_child!(State, DeviceRegistry, [
+        REGISTRY_OUTPUT_EVENT_OPCODE => (OutputDevice, 0u32),
+    ]);
 }
 
 // Management has no events.
@@ -365,6 +412,15 @@ impl Session {
         // (name / enabled / priority / current_mode / mode sizes / done).
         if !s.sync_barrier(deadline) {
             return None;
+        }
+        // Phase 3 (KWin ≥ 6.7, the registry model): the devices themselves only arrive as the
+        // registry's `output` events during phase 2, so their property bursts are one round further
+        // out than they are for per-output globals. One more barrier — skipped when no device is
+        // still waiting for its `done`, so the classic path costs nothing.
+        if s.state.device_registry.is_some() && s.state.devices.values().any(|d| !d.seen_done) {
+            if !s.sync_barrier(deadline) {
+                return None;
+            }
         }
         Some(s)
     }
@@ -881,5 +937,13 @@ mod tests {
     #[test]
     fn mode_event_opcode_is_two() {
         assert_eq!(DEVICE_MODE_EVENT_OPCODE, 2);
+    }
+
+    /// Same hazard for the registry's `output` event (`finished` is 0, `output` is 1): the
+    /// `event_created_child!` binding hardcodes the opcode, so a reorder in the vendored XML would
+    /// bind the child to the wrong event and produce outputs with no properties.
+    #[test]
+    fn registry_output_event_opcode_is_one() {
+        assert_eq!(REGISTRY_OUTPUT_EVENT_OPCODE, 1);
     }
 }
