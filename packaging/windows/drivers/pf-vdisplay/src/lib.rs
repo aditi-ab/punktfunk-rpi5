@@ -41,6 +41,15 @@ pub(crate) const STATUS_BUFFER_TOO_SMALL: NTSTATUS = 0xC000_0023u32 as NTSTATUS;
 
 /// IddCx (stub mode) requires the driver to export the minimum IddCx framework version it needs — the
 /// `#ifndef IDD_STUB` branch of `IddCxFuncEnum.h` that normally emits it is compiled out under
-/// `IDD_STUB`. `4` matches the proven `wdf-umdf` oracle.
+/// `IDD_STUB`.
+///
+/// `10` = IddCx 1.10, the TRUTHFUL floor: the drain loop calls
+/// `IddCxSwapChainReleaseAndAcquireBuffer2` (1.10) unconditionally and the swap-chain worker uses
+/// `IddCxSetRealtimeGPUPriority` (1.9); the product floor is already Windows 11 22H2 / build 22621,
+/// whose framework is 1.10 (the installer gate — `MinVersion=10.0.22621` in punktfunk-host.iss —
+/// exists precisely for this driver). The oracle's historical `4` predated that floor and would let
+/// the driver load against a SHORT `IddFunctions` table, where dispatching any post-1.4 DDI reads
+/// past the populated entries. With `10`, an older framework fails the bind cleanly (driver doesn't
+/// load) instead of limping into undefined dispatch.
 #[unsafe(no_mangle)]
-pub static IddMinimumVersionRequired: wdk_sys::ULONG = 4;
+pub static IddMinimumVersionRequired: wdk_sys::ULONG = 10;

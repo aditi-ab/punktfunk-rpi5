@@ -200,3 +200,20 @@ iddcx_ddi!(
     IddCxSwapChainFinishedProcessingFrame(swap_chain: iddcx::IDDCX_SWAPCHAIN)
         @ IddCxSwapChainFinishedProcessingFrameTableIndex as PFN_IDDCXSWAPCHAINFINISHEDPROCESSINGFRAME
 );
+
+iddcx_ddi!(
+    /// Raise the swap-chain's processing D3D device to realtime GPU scheduling priority — "higher
+    /// than any regular application can set" (IddCx 1.9) — so buffer processing outruns ordinary
+    /// GPU contention. It does NOT help against adapter-wide display servicing (modeset-class DDIs
+    /// idle the hardware outright); it defends the contention case only. Best-effort at the call
+    /// site: the DDI itself may decline (e.g. E_NOTIMPL on WDDM < 3.0 hardware).
+    ///
+    /// Table-slot availability rests on the driver's `IddMinimumVersionRequired = 10` export
+    /// (pf-vdisplay lib.rs): the loader refuses to bind a framework older than IddCx 1.10, so
+    /// every slot of our compiled 1.10 surface — this 1.9 one included — is populated wherever the
+    /// driver runs at all.
+    IddCxSetRealtimeGPUPriority(
+        swap_chain: iddcx::IDDCX_SWAPCHAIN,
+        in_args: *const iddcx::IDARG_IN_SETREALTIMEGPUPRIORITY,
+    ) @ IddCxSetRealtimeGPUPriorityTableIndex as PFN_IDDCXSETREALTIMEGPUPRIORITY
+);

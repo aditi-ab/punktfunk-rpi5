@@ -29,8 +29,8 @@ use std::{
 };
 
 use wdk_sys::iddcx::{
-    IDARG_IN_RELEASEANDACQUIREBUFFER2, IDARG_IN_SWAPCHAINSETDEVICE,
-    IDARG_OUT_RELEASEANDACQUIREBUFFER2, IDDCX_SWAPCHAIN,
+    IDARG_IN_RELEASEANDACQUIREBUFFER2, IDARG_IN_SETREALTIMEGPUPRIORITY,
+    IDARG_IN_SWAPCHAINSETDEVICE, IDARG_OUT_RELEASEANDACQUIREBUFFER2, IDDCX_SWAPCHAIN,
 };
 // `HANDLE` is the shared wdk-sys typedef (`crate::types`) re-used by the iddcx bindings — take it from
 // the crate root, which is guaranteed to export it (the iddcx module only re-exports it if bindgen
@@ -44,7 +44,8 @@ use windows::{
             Dxgi::{IDXGIDevice, IDXGIResource},
         },
         System::Threading::{
-            AvRevertMmThreadCharacteristics, AvSetMmThreadCharacteristicsW, WaitForSingleObject,
+            AvRevertMmThreadCharacteristics, AvSetMmThreadCharacteristicsW, GetCurrentThread,
+            SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL, WaitForSingleObject,
         },
     },
     core::{Interface, w},
@@ -125,12 +126,25 @@ impl SwapChainProcessor {
             // MMCSS can fail under the restricted WUDFHost token ('Distribution' task unregistered /
             // service unavailable). The MS sample CONTINUES unprioritized — never abort: returning
             // here would leave the assigned swap-chain undrained (the monitor stalls, DWM blocks on
-            // it) and leak the WDF swap-chain object until device teardown.
+            // it) and leak the WDF swap-chain object until device teardown. But "unprioritized" is
+            // not acceptable either: this thread is the whole display's frame pump, and at normal
+            // priority a display-stack disturbance (DDC/HPD servicing DPC pressure, poller-software
+            // storms) can starve it into multi-hundred-ms delivery holes. Fall back to
+            // TIME_CRITICAL — the highest band available without the realtime priority class, and
+            // the closest to what MMCSS 'Distribution' would have granted. The thread spends its
+            // life blocked on the surface-available event / keyed mutex, so it cannot starve others.
             let av_handle = match res {
                 Ok(h) => Some(h),
                 Err(e) => {
+                    // SAFETY: plain FFI; GetCurrentThread returns a pseudo-handle (never fails,
+                    // nothing to close), SetThreadPriority on it affects only this thread.
+                    let fallback = unsafe {
+                        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL)
+                    };
                     dbglog!(
-                        "[pf-vd] swap-chain: MMCSS prioritization failed ({e:?}) — continuing unprioritized"
+                        "[pf-vd] swap-chain: MMCSS prioritization failed ({e:?}) — fell back to \
+                         TIME_CRITICAL thread priority (ok={})",
+                        fallback.is_ok()
                     );
                     None
                 }
@@ -228,6 +242,29 @@ impl SwapChainProcessor {
                 );
             }
             thread::sleep(Duration::from_millis(50));
+        }
+        // IddCx 1.9 realtime GPU scheduling priority for the processing device (stall-immunity
+        // program, branch-2 hardening): swap-chain buffer processing outruns ordinary GPU
+        // contention — "higher priority than any regular application can set". The slot is
+        // guaranteed populated (`IddMinimumVersionRequired = 10`, lib.rs); the DDI itself may
+        // still decline (e.g. E_NOTIMPL on pre-WDDM-3.0 hardware) — best-effort, never fatal.
+        // Called while our borrowed device reference is still alive; IddCx uses it synchronously.
+        if set_ok {
+            let mut rt = pod_init!(IDARG_IN_SETREALTIMEGPUPRIORITY);
+            rt.pDevice = dxgi_device.as_raw().cast();
+            // SAFETY: driver is loaded; `swap_chain` is the live assigned swap-chain whose device
+            // bind just succeeded; `rt.pDevice` is that same bound DXGI device, alive across the
+            // synchronous call; `rt` points to valid local storage.
+            let hr = unsafe { wdk_iddcx::IddCxSetRealtimeGPUPriority(swap_chain, &rt) };
+            if hr_success(hr) {
+                dbglog!(
+                    "[pf-vd] swap-chain: processing device raised to REALTIME GPU priority (target={target_id})"
+                );
+            } else {
+                dbglog!(
+                    "[pf-vd] swap-chain: realtime GPU priority declined ({hr:#x}) — normal scheduling (target={target_id})"
+                );
+            }
         }
         // Release our borrowed device reference — IddCx holds its own now, or we gave up. (Explicit drop
         // so NLL can't release it mid-loop while the swap-chain still references the raw ptr.)
