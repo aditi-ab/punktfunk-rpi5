@@ -13,8 +13,17 @@
 // console behind the couch UI looks like a crash.
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+// The shared client log sink (std-only): a couch launch has no console, so the session's
+// stderr would otherwise evaporate — same reasoning as the shell's tee. This shim only
+// initializes + forwards; the module's subscriber-side surface stays unused here.
+#[cfg(windows)]
+#[path = "../logfile.rs"]
+#[allow(dead_code)]
+mod logfile;
+
 #[cfg(windows)]
 fn main() {
+    logfile::init();
     // The session binary ships beside us in the package; fall back to PATH for a dev run.
     let session = std::env::current_exe()
         .ok()
@@ -27,7 +36,14 @@ fn main() {
     if !std::env::args().any(|a| a == "--windowed") {
         cmd.arg("--fullscreen");
     }
-    match cmd.status() {
+    cmd.stderr(std::process::Stdio::piped());
+    let run = cmd.spawn().and_then(|mut child| {
+        if let Some(stderr) = child.stderr.take() {
+            logfile::forward_child_stderr(stderr);
+        }
+        child.wait()
+    });
+    match run {
         Ok(st) => std::process::exit(st.code().unwrap_or(0)),
         Err(_) => std::process::exit(1),
     }

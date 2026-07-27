@@ -169,13 +169,19 @@ fn spawn_with(
 
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit()) // session logs interleave with the shell's (dev runs)
+        // Piped through the log tee: dev-terminal runs keep the interleaved stderr they always
+        // had, and GUI runs — which have no console — finally keep the session's whole
+        // receive/decode/present log in the client log file.
+        .stderr(Stdio::piped())
         .creation_flags(CREATE_NO_WINDOW);
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("couldn't start punktfunk-session: {e}"))?;
     tracing::info!(host = %host_label, "session binary spawned");
 
+    if let Some(stderr) = child.stderr.take() {
+        crate::logfile::forward_child_stderr(stderr);
+    }
     let stdout = child.stdout.take().expect("piped stdout");
     // Park the child where the kill handle (and the reader, for the final reap) reach it.
     *slot.0.lock().unwrap() = Some(child);

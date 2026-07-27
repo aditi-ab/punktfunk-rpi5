@@ -26,6 +26,8 @@ mod discovery;
 #[cfg(windows)]
 mod gpu;
 #[cfg(windows)]
+mod logfile;
+#[cfg(windows)]
 mod probe;
 #[cfg(windows)]
 mod shell_window;
@@ -49,11 +51,20 @@ fn main() {
     }
     set_app_user_model_id();
 
+    // Everything logs to stderr AND `%LOCALAPPDATA%\punktfunk\logs\client.log` (see [`logfile`]):
+    // a GUI/MSIX launch has no console, so without the file the client side of any field report
+    // simply doesn't exist. ANSI off — the file is what users send, keep it grep-clean.
+    logfile::init();
     tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_writer(logfile::tee)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
+    if let Some(p) = logfile::path() {
+        tracing::info!(path = %p.display(), "client log file (rotated at 10 MB, one .old kept)");
+    }
 
     let args: Vec<String> = std::env::args().collect();
     let flag = |name: &str| args.iter().any(|a| a == name);
@@ -88,7 +99,16 @@ fn main() {
         if !flag("--windowed") {
             cmd.arg("--fullscreen");
         }
-        match cmd.status() {
+        // Spawn (not `status()`) so the session's stderr rides the log tee — a couch launch
+        // (Start-menu tile, Steam shortcut) has no console to inherit either.
+        cmd.stderr(std::process::Stdio::piped());
+        let run = cmd.spawn().and_then(|mut child| {
+            if let Some(stderr) = child.stderr.take() {
+                logfile::forward_child_stderr(stderr);
+            }
+            child.wait()
+        });
+        match run {
             Ok(st) => std::process::exit(st.code().unwrap_or(0)),
             Err(e) => {
                 eprintln!("could not start the console UI: {e}");
