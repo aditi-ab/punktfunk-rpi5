@@ -40,14 +40,15 @@ mod win {
             Devices::Display::{
                 CapabilitiesRequestAndCapabilitiesReply, DestroyPhysicalMonitor,
                 GetCapabilitiesStringLength, GetNumberOfPhysicalMonitorsFromHMONITOR,
-                GetPhysicalMonitorsFromHMONITOR, GetVCPFeatureAndVCPFeatureReply, PHYSICAL_MONITOR,
+                GetPhysicalMonitorsFromHMONITOR, GetVCPFeatureAndVCPFeatureReply, SetDisplayConfig,
+                PHYSICAL_MONITOR, SDC_APPLY, SDC_TOPOLOGY_EXTEND,
             },
             Foundation::{HANDLE, LPARAM, RECT},
             Graphics::Gdi::{
                 ChangeDisplaySettingsExW, EnumDisplayDevicesW, EnumDisplayMonitors,
-                EnumDisplaySettingsW, CDS_RESET, DEVMODEW, DISPLAY_DEVICEW,
+                EnumDisplaySettingsW, GetMonitorInfoW, CDS_RESET, DEVMODEW, DISPLAY_DEVICEW,
                 DISPLAY_DEVICE_ATTACHED_TO_DESKTOP, DISPLAY_DEVICE_MIRRORING_DRIVER,
-                DISP_CHANGE_SUCCESSFUL, ENUM_CURRENT_SETTINGS, HDC, HMONITOR,
+                DISP_CHANGE_SUCCESSFUL, ENUM_CURRENT_SETTINGS, HDC, HMONITOR, MONITORINFOEXW,
             },
         },
     };
@@ -78,9 +79,9 @@ mod win {
     fn parse_args() -> Args {
         let argv: Vec<String> = std::env::args().collect();
         let mode = argv.get(1).cloned().unwrap_or_default();
-        if !matches!(mode.as_str(), "ddc" | "modeset") {
+        if !matches!(mode.as_str(), "ddc" | "modeset" | "extend") {
             eprintln!(
-                "usage: display-disturb <ddc|modeset> [--interval-ms N] [--caps] [--vcp 0xNN]"
+                "usage: display-disturb <ddc|modeset|extend> [--interval-ms N] [--caps] [--vcp 0xNN]"
             );
             std::process::exit(2);
         }
@@ -125,21 +126,47 @@ mod win {
         );
         match args.mode.as_str() {
             "ddc" => ddc_loop(&args),
+            "extend" => extend_once(),
             _ => modeset_loop(&args),
         }
     }
 
+    /// One `SetDisplayConfig(SDC_TOPOLOGY_EXTEND)` poke — re-activates every attachable display
+    /// from the CCD database, i.e. exactly the "a non-managed display re-activated after the
+    /// verified isolate" event the exclusive-topology watchdog exists to evict. Fired ONCE (not a
+    /// loop): the point is to trigger one reassert round and observe the recovery — one
+    /// `reassert-recover` trace, ONE ring recreate, stream alive.
+    fn extend_once() -> ! {
+        let t = Instant::now();
+        // SAFETY: the no-buffers topology form of SetDisplayConfig; flags request the stored
+        // EXTEND topology be applied — a pure CCD database operation with no pointers involved.
+        let rc = unsafe { SetDisplayConfig(None, None, SDC_TOPOLOGY_EXTEND | SDC_APPLY) };
+        report("topology-extend", "all", t.elapsed(), rc == 0);
+        std::process::exit(if rc == 0 { 0 } else { 1 });
+    }
+
     // ---- Class 2: the DDC hammer ----
 
-    /// Collect the desktop's HMONITORs (the DDC handles hang off them).
-    fn monitors() -> Vec<HMONITOR> {
+    /// Collect the desktop's HMONITORs (the DDC handles hang off them), labeled by GDI device
+    /// name (`\\.\DISPLAYn`) so a virtual display and a panel are tellable apart in the output.
+    fn monitors() -> Vec<(HMONITOR, String)> {
         unsafe extern "system" fn cb(mon: HMONITOR, _dc: HDC, _rc: *mut RECT, out: LPARAM) -> BOOL {
-            // SAFETY: `out.0` is the `&mut Vec<HMONITOR>` this enumeration call passed in below,
-            // alive for the whole synchronous enumeration.
-            unsafe { &mut *(out.0 as *mut Vec<HMONITOR>) }.push(mon);
+            let mut info = MONITORINFOEXW::default();
+            info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
+            // SAFETY: `mon` is the live enumeration handle; `info.cbSize` is stamped for the EX
+            // variant so the device-name field is filled.
+            let name = if unsafe { GetMonitorInfoW(mon, &mut info.monitorInfo) }.as_bool() {
+                let d = info.szDevice;
+                String::from_utf16_lossy(&d[..d.iter().position(|&c| c == 0).unwrap_or(d.len())])
+            } else {
+                "?".into()
+            };
+            // SAFETY: `out.0` is the `&mut Vec<(HMONITOR, String)>` this enumeration call passed
+            // in below, alive for the whole synchronous enumeration.
+            unsafe { &mut *(out.0 as *mut Vec<(HMONITOR, String)>) }.push((mon, name));
             BOOL(1)
         }
-        let mut v: Vec<HMONITOR> = Vec::new();
+        let mut v: Vec<(HMONITOR, String)> = Vec::new();
         // SAFETY: null dc/clip = enumerate all display monitors; `cb` only touches the Vec whose
         // address rides in LPARAM for the duration of this synchronous call.
         let _ =
@@ -147,18 +174,26 @@ mod win {
         v
     }
 
-    /// The physical (DDC-capable) monitors behind one HMONITOR, with their descriptions.
-    fn physical_monitors(mon: HMONITOR) -> Vec<(HANDLE, String)> {
+    /// The physical (DDC-capable) monitors behind one HMONITOR, with their descriptions. The
+    /// handle-ACQUISITION timing is itself reported (`ddc-open`): it is the poller's first contact
+    /// with every monitor — including a virtual one that then yields no handles — and on a
+    /// streaming host in exclusive topology the virtual monitor is the only one there is, so the
+    /// cost of this failing path is exactly what the DDC-fail-fast driver work changes.
+    fn physical_monitors(mon: HMONITOR, label: &str) -> Vec<(HANDLE, String)> {
+        let t = Instant::now();
         let mut count = 0u32;
         // SAFETY: valid HMONITOR from enumeration; `count` is a valid out-param.
         if unsafe { GetNumberOfPhysicalMonitorsFromHMONITOR(mon, &mut count) }.is_err()
             || count == 0
         {
+            report("ddc-open", label, t.elapsed(), false);
             return Vec::new();
         }
         let mut phys = vec![PHYSICAL_MONITOR::default(); count as usize];
         // SAFETY: `phys` holds exactly `count` entries as the API requires.
-        if unsafe { GetPhysicalMonitorsFromHMONITOR(mon, &mut phys) }.is_err() {
+        let got = unsafe { GetPhysicalMonitorsFromHMONITOR(mon, &mut phys) }.is_ok();
+        report("ddc-open", label, t.elapsed(), got);
+        if !got {
             return Vec::new();
         }
         phys.iter()
@@ -175,10 +210,11 @@ mod win {
     }
 
     fn ddc_loop(args: &Args) -> ! {
+        let mut warned_none = false;
         loop {
             let mut any = false;
-            for mon in monitors() {
-                for (h, desc) in physical_monitors(mon) {
+            for (mon, dev) in monitors() {
+                for (h, desc) in physical_monitors(mon, &dev) {
                     any = true;
                     let label = if desc.is_empty() {
                         "monitor".into()
@@ -220,12 +256,13 @@ mod win {
                     let _ = unsafe { DestroyPhysicalMonitor(h) };
                 }
             }
-            if !any {
+            if !any && !warned_none {
+                warned_none = true;
                 eprintln!(
-                    "no DDC-capable (physical) monitor found — the ddc mode needs a physical \
-                     display; virtual displays expose no DDC handle"
+                    "no DDC-capable (physical) monitor yielded handles — continuing anyway: the \
+                     ddc-open timing against handle-less monitors (virtual displays included) IS \
+                     the measurement on a streaming host"
                 );
-                std::process::exit(1);
             }
             std::thread::sleep(args.interval);
         }
