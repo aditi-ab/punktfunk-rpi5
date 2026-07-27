@@ -436,11 +436,13 @@ jobs:
               | grep -q "${GITHUB_REF_NAME#v}" \
               || { echo "served catalogue does not contain ${GITHUB_REF_NAME#v}"; exit 1; }
             echo "winget source serving ${GITHUB_REF_NAME#v}"
+          # `env:` below populates the RUNNER's environment; this action runs `script` on the
+          # REMOTE host, which inherits nothing from it. `envs:` is the action's OWN input —
+          # it must live under `with:` (matching docker.yml/deploy-services.yml's REGISTRY_TOKEN
+          # forwarding) — naming the variables to forward into the remote shell. A prior fix put
+          # it as a step-level sibling of `with:`/`env:` instead: that key is not part of the
+          # step schema, so appleboy/ssh-action never received it as an input and the step kept
+          # failing ("GITHUB_REF_NAME: unbound variable") on every tag after 24d2f97e too.
+          envs: GITHUB_REF_NAME
         env:
           GITHUB_REF_NAME: ${{ gitea.ref_name }}
-        # `env:` populates the RUNNER's environment; this action runs `script` on the REMOTE
-        # host, which inherits nothing from it. `envs:` is the action's own allow-list of names
-        # to forward into the remote shell — without it `set -u` aborted at the first expansion
-        # ("GITHUB_REF_NAME: unbound variable") and the step failed on every tag, after the
-        # catalogue had already shipped correctly.
-        envs: GITHUB_REF_NAME
