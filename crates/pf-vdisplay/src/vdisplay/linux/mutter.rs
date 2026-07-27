@@ -376,6 +376,185 @@ fn session_thread(
     });
 }
 
+/// Record an **existing** monitor by connector — the monitor-mirror path
+/// (`design/per-monitor-portal-capture.md` L2). Returns the PipeWire node id and the keepalive
+/// whose drop stops the recording.
+///
+/// Same private ScreenCast API as the virtual path, one call different: `RecordMonitor` instead of
+/// `RecordVirtual`. So it inherits what makes that path work headlessly — Mutter's *direct* D-Bus
+/// API needs no interactive approval, unlike the xdg portal a background service could never answer.
+///
+/// Deliberately **not** under [`TOPOLOGY_LOCK`]: that lock serializes operations which add/remove a
+/// monitor or apply a monitor configuration, and mirroring does neither. It creates nothing, changes
+/// no layout, and leaves the head exactly as its owner set it.
+pub(crate) fn stream_existing_output(
+    connector: &str,
+    hw_cursor: bool,
+) -> Result<(u32, Box<dyn Send>)> {
+    let (setup_tx, setup_rx) = std::sync::mpsc::channel::<Result<u32, String>>();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_thread = stop.clone();
+    let connector_thread = connector.to_string();
+    thread::Builder::new()
+        .name("punktfunk-mutter-mirror".into())
+        .spawn(move || mirror_thread(setup_tx, stop_thread, connector_thread, hw_cursor))
+        .context("spawn Mutter monitor-mirror thread")?;
+    let node_id = match setup_rx.recv_timeout(Duration::from_secs(20)) {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => bail!("Mutter monitor mirror failed: {e}"),
+        Err(_) => bail!("timed out recording the Mutter output {connector:?}"),
+    };
+    Ok((node_id, Box::new(MirrorStop(stop)) as Box<dyn Send>))
+}
+
+/// Stops the mirror thread — and with it the recording — when the capturer drops it.
+struct MirrorStop(Arc<AtomicBool>);
+
+impl Drop for MirrorStop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Owns the D-Bus connection behind a mirrored monitor's cast: connect, hand back the node id,
+/// park until stopped, then `Stop` the session.
+fn mirror_thread(
+    setup_tx: Sender<Result<u32, String>>,
+    stop: Arc<AtomicBool>,
+    connector: String,
+    hw_cursor: bool,
+) {
+    let rt = match tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            let _ = setup_tx.send(Err(format!("build tokio runtime: {e}")));
+            return;
+        }
+    };
+    rt.block_on(async move {
+        let session = match connect_monitor(&connector, hw_cursor).await {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = setup_tx.send(Err(format!("{e:#}")));
+                return;
+            }
+        };
+        let _ = setup_tx.send(Ok(session.node_id));
+        while !stop.load(Ordering::Relaxed) {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        // Stop the cast. Nothing else to undo: no virtual output was added, so there is no monitor
+        // removal for Mutter to rebuild around — the SIGSEGV-adjacent teardown ordering the virtual
+        // path has to observe simply doesn't arise here.
+        let _ = session.rd_session.call_method("Stop", &()).await;
+    });
+}
+
+/// The `RecordMonitor` handshake: RemoteDesktop session → ScreenCast session anchored to it →
+/// record `connector` → node id on `PipeWireStreamAdded` after `Start`.
+async fn connect_monitor(connector: &str, hw_cursor: bool) -> Result<MutterSession> {
+    let conn = zbus::Connection::session()
+        .await
+        .context("connect session D-Bus")?;
+    let rd = zbus::Proxy::new(
+        &conn,
+        BUS_RD,
+        "/org/gnome/Mutter/RemoteDesktop",
+        "org.gnome.Mutter.RemoteDesktop",
+    )
+    .await
+    .context("RemoteDesktop proxy (is gnome-shell running?)")?;
+    let rd_path: OwnedObjectPath = rd
+        .call("CreateSession", &())
+        .await
+        .context("RemoteDesktop.CreateSession")?;
+    let rd_session = zbus::Proxy::new(
+        &conn,
+        BUS_RD,
+        rd_path,
+        "org.gnome.Mutter.RemoteDesktop.Session",
+    )
+    .await?;
+    let session_id: String = rd_session
+        .get_property("SessionId")
+        .await
+        .context("read SessionId")?;
+
+    let sc = zbus::Proxy::new(
+        &conn,
+        BUS_SC,
+        "/org/gnome/Mutter/ScreenCast",
+        "org.gnome.Mutter.ScreenCast",
+    )
+    .await
+    .context("ScreenCast proxy")?;
+    let mut props: HashMap<&str, Value> = HashMap::new();
+    props.insert("remote-desktop-session-id", Value::from(session_id));
+    let sc_path: OwnedObjectPath = sc
+        .call("CreateSession", &(props,))
+        .await
+        .context("ScreenCast.CreateSession")?;
+    let sc_session = zbus::Proxy::new(
+        &conn,
+        BUS_SC,
+        sc_path,
+        "org.gnome.Mutter.ScreenCast.Session",
+    )
+    .await?;
+
+    // `RecordMonitor(connector, properties) -> stream_path`. Only `cursor-mode` is set: the mode
+    // belongs to the monitor's owner, not to us.
+    let mut rec: HashMap<&str, Value> = HashMap::new();
+    rec.insert(
+        "cursor-mode",
+        Value::from(if hw_cursor {
+            CURSOR_METADATA
+        } else {
+            CURSOR_EMBEDDED
+        }),
+    );
+    let stream_path: OwnedObjectPath = sc_session
+        .call("RecordMonitor", &(connector, rec))
+        .await
+        .with_context(|| format!("Session.RecordMonitor({connector:?})"))?;
+    let stream = zbus::Proxy::new(
+        &conn,
+        BUS_SC,
+        stream_path,
+        "org.gnome.Mutter.ScreenCast.Stream",
+    )
+    .await?;
+
+    let mut added = stream
+        .receive_signal("PipeWireStreamAdded")
+        .await
+        .context("subscribe PipeWireStreamAdded")?;
+    rd_session
+        .call_method("Start", &())
+        .await
+        .context("RemoteDesktop.Session.Start")?;
+    let msg = tokio::time::timeout(Duration::from_secs(10), added.next())
+        .await
+        .map_err(|_| anyhow!("PipeWireStreamAdded did not arrive within 10s"))?
+        .ok_or_else(|| anyhow!("signal stream ended before PipeWireStreamAdded"))?;
+    let (node_id,): (u32,) = msg
+        .body()
+        .deserialize()
+        .context("PipeWireStreamAdded body")?;
+    tracing::info!(connector, node_id, "mutter: recording an existing monitor");
+
+    Ok(MutterSession {
+        rd_session,
+        _sc_session: sc_session,
+        _conn: conn,
+        node_id,
+    })
+}
+
 /// The live session objects (held for the stream's lifetime) + the PipeWire node id.
 struct MutterSession {
     rd_session: zbus::Proxy<'static>,

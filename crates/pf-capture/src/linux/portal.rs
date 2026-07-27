@@ -10,13 +10,18 @@
 use anyhow::{anyhow, Context, Result};
 use std::os::fd::OwnedFd;
 
-/// Whether any monitor of the live GNOME session is currently in BT.2100 (HDR) colour mode — the
+/// Whether the monitor this host would mirror is currently in BT.2100 (HDR) colour mode — the
 /// precondition for Mutter's monitor screencast advertising the 10-bit PQ formats (GNOME 50+;
 /// Mutter only appends the HDR formats while the mirrored monitor's colour state is BT.2020+PQ).
 /// Queried over the session bus: `DisplayConfig.GetCurrentState`, monitor property
 /// `"color-mode" == 1` (`META_COLOR_MODE_BT2100`). `false` on any error — not GNOME, a pre-48
 /// Mutter without colour modes, no monitors — so callers fall back to the honest SDR offer.
 /// Blocking (one D-Bus round-trip on a fresh connection); call from control-plane threads only.
+///
+/// **Scoped to `PUNKTFUNK_CAPTURE_MONITOR` when it is set** (`design/per-monitor-portal-capture.md`
+/// §7.4). Without a pin this asks "is ANY monitor in HDR mode", which was a fair heuristic while the
+/// capture path took whatever monitor it was handed — but once the operator names the head, an
+/// HDR-capable *neighbour* must not talk this host into offering PQ formats for an SDR panel.
 pub fn gnome_hdr_monitor_active() -> bool {
     use ashpd::zbus;
     // GetCurrentState reply: (serial, monitors, logical_monitors, properties); each monitor is
@@ -74,12 +79,21 @@ pub fn gnome_hdr_monitor_active() -> bool {
                 .body()
                 .deserialize()
                 .context("parse GetCurrentState")?;
-            Ok(monitors.iter().any(|(_spec, _modes, props)| {
-                props
-                    .get("color-mode")
-                    .and_then(|v| u32::try_from(v).ok())
-                    .is_some_and(|mode| mode == 1) // META_COLOR_MODE_BT2100
-            }))
+            // `spec.0` is the connector; "color-mode" 1 is META_COLOR_MODE_BT2100.
+            let heads: Vec<(&str, bool)> = monitors
+                .iter()
+                .map(|(spec, _modes, props)| {
+                    let hdr = props
+                        .get("color-mode")
+                        .and_then(|v| u32::try_from(v).ok())
+                        .is_some_and(|mode| mode == 1);
+                    (spec.0.as_str(), hdr)
+                })
+                .collect();
+            Ok(hdr_offer_for(
+                &heads,
+                pf_host_config::config().capture_monitor.as_deref(),
+            ))
         })
     };
     match probe() {
@@ -88,6 +102,24 @@ pub fn gnome_hdr_monitor_active() -> bool {
             tracing::debug!(error = %format!("{e:#}"), "GNOME HDR colour-mode probe failed — SDR");
             false
         }
+    }
+}
+
+/// Should this host offer the HDR (10-bit PQ) formats, given each head as `(connector, is_bt2100)`
+/// and the `PUNKTFUNK_CAPTURE_MONITOR` pin?
+///
+/// Pinned: only that head's colour mode counts — an HDR-capable neighbour must not talk the host
+/// into offering PQ for the SDR panel it is actually streaming. A pin naming no live head reports
+/// SDR rather than falling back to "any": the session is about to fail on that same missing
+/// monitor, and an over-claimed HDR offer would be a second, quieter wrong answer.
+/// Unpinned: the pre-existing "any monitor is in HDR mode" heuristic, unchanged.
+fn hdr_offer_for(heads: &[(&str, bool)], pinned: Option<&str>) -> bool {
+    match pinned {
+        Some(want) => heads
+            .iter()
+            .find(|(connector, _)| connector.eq_ignore_ascii_case(want))
+            .is_some_and(|(_, hdr)| *hdr),
+        None => heads.iter().any(|(_, hdr)| *hdr),
     }
 }
 
@@ -354,4 +386,34 @@ pub(super) fn portal_thread_remote_desktop(
     });
     // See `portal_thread`: drop the runtime before the caller's completion signal.
     drop(rt);
+}
+
+#[cfg(test)]
+mod hdr_offer_tests {
+    use super::hdr_offer_for;
+
+    #[test]
+    fn unpinned_keeps_the_any_monitor_heuristic() {
+        assert!(hdr_offer_for(&[("DP-1", false), ("HDMI-A-1", true)], None));
+        assert!(!hdr_offer_for(&[("DP-1", false)], None));
+    }
+
+    /// The regression this exists to prevent: an HDR TV on HDMI while the pinned head is an SDR
+    /// desk monitor. Before scoping, the host offered PQ formats for a panel that can't show them.
+    #[test]
+    fn a_pin_ignores_an_hdr_neighbour() {
+        let heads = [("DP-1", false), ("HDMI-A-1", true)];
+        assert!(!hdr_offer_for(&heads, Some("DP-1")));
+        assert!(hdr_offer_for(&heads, Some("HDMI-A-1")));
+    }
+
+    #[test]
+    fn a_pin_matches_case_insensitively_like_the_resolver() {
+        assert!(hdr_offer_for(&[("HDMI-A-1", true)], Some("hdmi-a-1")));
+    }
+
+    #[test]
+    fn a_pin_naming_no_live_head_reports_sdr() {
+        assert!(!hdr_offer_for(&[("DP-1", true)], Some("DP-9")));
+    }
 }

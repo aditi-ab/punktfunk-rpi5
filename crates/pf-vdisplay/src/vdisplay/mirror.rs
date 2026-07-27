@@ -68,6 +68,10 @@ impl VirtualDisplay for MirrorDisplay {
             Compositor::Kwin => {
                 crate::kwin::stream_existing_output(&target.connector, self.hw_cursor)?
             }
+            #[cfg(target_os = "linux")]
+            Compositor::Mutter => {
+                crate::mutter::stream_existing_output(&target.connector, self.hw_cursor)?
+            }
             other => bail!(
                 "mirroring an existing monitor is not implemented for the {} backend yet — \
                  unset PUNKTFUNK_CAPTURE_MONITOR",
