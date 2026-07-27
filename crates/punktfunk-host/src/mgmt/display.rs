@@ -88,6 +88,9 @@ pub(crate) fn display_settings_state() -> DisplaySettingsState {
             // (`vdisplay/windows/manager.rs`); stored-but-inert elsewhere.
             "ddc_power_off".into(),
             "pnp_disable_monitors".into(),
+            // Linux-only in effect: routes every session to the mirror backend
+            // (design/per-monitor-portal-capture.md).
+            "capture_monitor".into(),
         ],
     }
 }
@@ -141,6 +144,10 @@ pub(crate) async fn set_display_settings(
         );
     }
     tracing::info!("management API: display policy updated");
+    // The policy carries the capture-monitor pin, so a picker change must re-aim absolute input now
+    // rather than at the next host restart — and must clear the anchor when the pin is cleared.
+    #[cfg(target_os = "linux")]
+    crate::refresh_capture_monitor_anchor("display policy updated");
     Json(display_settings_state()).into_response()
 }
 
@@ -237,7 +244,12 @@ pub(crate) struct MonitorsResponse {
     )
 )]
 pub(crate) async fn get_display_monitors() -> Json<MonitorsResponse> {
-    let pinned = pf_host_config::config().capture_monitor.clone();
+    // The EFFECTIVE pin (env override, else the stored policy) — so the picker highlights what
+    // sessions will actually mirror, not just what the console last wrote.
+    #[cfg(target_os = "linux")]
+    let pinned = crate::vdisplay::capture_monitor();
+    #[cfg(not(target_os = "linux"))]
+    let pinned: Option<String> = None;
     // Enumeration shells out / round-trips D-Bus + Wayland, so keep it off the async worker.
     let (compositor, listed) = tokio::task::spawn_blocking(|| match crate::vdisplay::detect() {
         Ok(c) => (Some(c.id().to_string()), crate::vdisplay::monitors::list(c)),
@@ -392,6 +404,7 @@ pub(crate) async fn set_display_layout(ApiJson(req): ApiJson<DisplayLayoutReques
         store.game_session(),
         store.ddc_power_off(),
         store.pnp_disable_monitors(),
+        store.get().capture_monitor,
     );
     if let Err(e) = store.set(policy) {
         return api_error(

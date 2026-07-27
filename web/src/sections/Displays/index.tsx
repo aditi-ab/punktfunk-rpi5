@@ -3,6 +3,7 @@ import type { FC } from "react";
 import { useLocale } from "@/lib/i18n";
 import { m } from "@/paraglide/messages";
 import { DisplaySection } from "./DisplayCard";
+import { MonitorCard } from "./MonitorCard";
 import { SessionGameCard } from "./SessionGameCard";
 
 /**
@@ -21,6 +22,7 @@ export const SectionDisplays: FC = () => {
 			<div className="flex flex-col gap-card">
 				<h1 className="text-2xl font-semibold">{m.nav_displays()}</h1>
 				<DisplaySection />
+				<MonitorCard />
 				<SessionGameCard />
 			</div>
 		</Section>

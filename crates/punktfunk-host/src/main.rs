@@ -191,6 +191,67 @@ fn main() {
 /// prints an alarming `SetProcessDpiAwarenessContext … "access denied"` WARN on a plain
 /// `plugins add`. `service run` is the SCM-launched host itself, so it is explicitly NOT lightweight
 /// (it must keep the hook — the hybrid-GPU ACCESS_LOST fix depends on it).
+/// Resolve the effective monitor pin (env, else the stored policy) and aim absolute input at that
+/// head — then report it. Called at startup (an operator sets the pin in a `host.env` and then has
+/// no session to watch, so this is where a typo has to surface) and again whenever the console
+/// writes the policy, so a picker change re-aims input without a host restart.
+///
+/// The anchor lives HERE rather than in the mirror backend for two reasons: pf-vdisplay must not
+/// depend on pf-inject (its crate doc), and the anchor is a host-level pin anyway — the injector is
+/// host-lifetime and shared by every concurrent session, so there is nothing per-session to track
+/// (`design/per-monitor-portal-capture.md` §7.2).
+#[cfg(target_os = "linux")]
+pub(crate) fn refresh_capture_monitor_anchor(context: &str) {
+    let Some(want) = pf_vdisplay::capture_monitor() else {
+        // No pin (or the console just cleared one): stop aiming input at a monitor we are no
+        // longer mirroring, or a later virtual-display session inherits a stale anchor.
+        pf_inject::set_absolute_anchor(None);
+        return;
+    };
+    match pf_vdisplay::detect().and_then(pf_vdisplay::monitors::list) {
+        Ok(ms) => match pf_vdisplay::monitors::resolve(&ms, &want) {
+            Ok(m) => {
+                // Match the libei region by the head's ORIGIN: two monitors can share a size — and
+                // a mirrored head's region is not the client's size at all — so size matching would
+                // put the pointer on the wrong screen.
+                pf_inject::set_absolute_anchor(Some(pf_inject::AbsoluteAnchor {
+                    origin: Some((m.x, m.y)),
+                    mapping_id: None,
+                }));
+                tracing::info!(
+                    context,
+                    connector = %m.connector,
+                    description = %m.description,
+                    mode = %m.mode_label(),
+                    at = %format!("+{}+{}", m.x, m.y),
+                    "capture monitor: sessions will mirror this monitor (no virtual display) and \
+                     absolute input is anchored to it"
+                );
+            }
+            // Left unanchored on purpose: a pin that resolves to nothing must not aim input at a
+            // guess. The session's own `create` fails with the same reason.
+            Err(e) => {
+                pf_inject::set_absolute_anchor(None);
+                tracing::warn!(
+                    context,
+                    error = %e,
+                    "capture monitor: the pinned monitor is not on this host — sessions will fail \
+                     to start until it is corrected or cleared"
+                );
+            }
+        },
+        Err(e) => {
+            pf_inject::set_absolute_anchor(None);
+            tracing::warn!(
+                context,
+                error = %format!("{e:#}"),
+                monitor = %want,
+                "capture monitor: a monitor is pinned but the monitors could not be enumerated"
+            );
+        }
+    }
+}
+
 fn is_management_cli(args: &[String]) -> bool {
     match args.first().map(String::as_str) {
         Some("plugins")
@@ -234,51 +295,9 @@ fn real_main() -> Result<()> {
         );
     }
 
-    // Resolve a `PUNKTFUNK_CAPTURE_MONITOR` pin at startup: report it (the operator sets it in a
-    // host.env and then has no session to watch, so this is where a typo has to surface), and aim
-    // absolute input at that head.
-    //
-    // The anchor is set HERE rather than inside the mirror backend for two reasons: pf-vdisplay must
-    // not depend on pf-inject (its crate doc), and the anchor is a host-level pin anyway — the
-    // injector is host-lifetime and shared by every concurrent session, so there is nothing
-    // per-session to track (`design/per-monitor-portal-capture.md` §7.2).
     #[cfg(target_os = "linux")]
     if !management_cli {
-        if let Some(want) = pf_host_config::config().capture_monitor.as_deref() {
-            match pf_vdisplay::detect().and_then(pf_vdisplay::monitors::list) {
-                Ok(ms) => match pf_vdisplay::monitors::resolve(&ms, want) {
-                    Ok(m) => {
-                        // Match the libei region by the head's ORIGIN: two monitors can share a
-                        // size — and a mirrored head's region is not the client's size at all — so
-                        // size matching would put the pointer on the wrong screen.
-                        pf_inject::set_absolute_anchor(Some(pf_inject::AbsoluteAnchor {
-                            origin: Some((m.x, m.y)),
-                            mapping_id: None,
-                        }));
-                        tracing::info!(
-                            connector = %m.connector,
-                            description = %m.description,
-                            mode = %m.mode_label(),
-                            at = %format!("+{}+{}", m.x, m.y),
-                            "PUNKTFUNK_CAPTURE_MONITOR: sessions will mirror this monitor (no \
-                             virtual display) and absolute input is anchored to it"
-                        );
-                    }
-                    // Left unanchored on purpose: a pin that resolves to nothing must not aim input
-                    // at a guess. The session's own `create` fails with the same reason.
-                    Err(e) => tracing::warn!(
-                        error = %e,
-                        "PUNKTFUNK_CAPTURE_MONITOR names no monitor on this host — sessions will \
-                         fail to start until it is corrected or unset"
-                    ),
-                },
-                Err(e) => tracing::warn!(
-                    error = %format!("{e:#}"),
-                    monitor = %want,
-                    "PUNKTFUNK_CAPTURE_MONITOR is set but the monitors could not be enumerated"
-                ),
-            }
-        }
+        refresh_capture_monitor_anchor("startup");
     }
 
     // Wire pf-vdisplay's display-lifecycle events into the SSE event bus (the subsystem crate emits a
@@ -473,7 +492,7 @@ fn real_main() -> Result<()> {
                 println!("{compositor:?}: no monitors");
                 return Ok(());
             }
-            let pinned = pf_host_config::config().capture_monitor.as_deref();
+            let pinned = vdisplay::capture_monitor();
             println!("{compositor:?}:");
             for m in &monitors {
                 let mut tags = Vec::new();
@@ -486,8 +505,11 @@ fn real_main() -> Result<()> {
                 if m.managed {
                     tags.push("punktfunk virtual display");
                 }
-                if pinned.is_some_and(|p| p.eq_ignore_ascii_case(&m.connector)) {
-                    tags.push("PINNED (PUNKTFUNK_CAPTURE_MONITOR)");
+                if pinned
+                    .as_deref()
+                    .is_some_and(|p| p.eq_ignore_ascii_case(&m.connector))
+                {
+                    tags.push("PINNED");
                 }
                 println!(
                     "  {:<12} {:>13} at +{},+{}  scale {}  {}{}",

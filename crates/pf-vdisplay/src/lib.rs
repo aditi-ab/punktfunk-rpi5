@@ -288,19 +288,34 @@ pub fn rebuild_probe_active() -> bool {
     REBUILD_PROBES.load(std::sync::atomic::Ordering::SeqCst) > 0
 }
 
+/// The monitor this host mirrors instead of creating a virtual display, or `None` for the normal
+/// virtual-display path.
+///
+/// Precedence: **`PUNKTFUNK_CAPTURE_MONITOR` wins over the stored policy.** An appliance pins in
+/// `host.env` and must stay pinned there — a console click (or a stale settings file) should not be
+/// able to re-aim a machine whose operator declared the answer in its unit's environment. With the
+/// env unset, the console's persisted choice applies, which is what makes a picker possible at all:
+/// the env is read once at startup, so it could never be what a UI writes.
+///
+/// Read per `open` rather than cached, so a console change takes effect on the next session instead
+/// of at the next host restart.
+pub fn capture_monitor() -> Option<String> {
+    if let Some(env) = pf_host_config::config().capture_monitor.as_deref() {
+        return Some(env.to_string());
+    }
+    policy::prefs().get().capture_monitor
+}
+
 /// Open the virtual-display driver for `compositor`.
 ///
-/// A `PUNKTFUNK_CAPTURE_MONITOR` pin routes to the **mirror** backend instead: the host streams
-/// that physical head and creates no virtual display at all. Deliberately resolved here, at the one
-/// place every session opens a display, so the pin can't be honored on one plane and ignored on
-/// another — it is a host-wide setting (`design/per-monitor-portal-capture.md` §5.3).
+/// A [`capture_monitor`] pin routes to the **mirror** backend instead: the host streams that
+/// physical head and creates no virtual display at all. Deliberately resolved here, at the one place
+/// every session opens a display, so the pin can't be honored on one plane and ignored on another —
+/// it is a host-wide setting (`design/per-monitor-portal-capture.md` §5.3).
 pub fn open(compositor: Compositor) -> Result<Box<dyn VirtualDisplay>> {
     #[cfg(target_os = "linux")]
-    if let Some(connector) = pf_host_config::config().capture_monitor.as_deref() {
-        return Ok(Box::new(mirror::MirrorDisplay::new(
-            compositor,
-            connector.to_string(),
-        )?));
+    if let Some(connector) = capture_monitor() {
+        return Ok(Box::new(mirror::MirrorDisplay::new(compositor, connector)?));
     }
     #[cfg(target_os = "linux")]
     {

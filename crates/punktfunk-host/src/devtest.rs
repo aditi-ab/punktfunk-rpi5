@@ -502,7 +502,7 @@ pub fn mirror_test(args: &[String]) -> Result<()> {
     let explicit = arg("--monitor");
     let want = explicit
         .clone()
-        .or_else(|| pf_host_config::config().capture_monitor.clone())
+        .or_else(crate::vdisplay::capture_monitor)
         .context(
             "no monitor named — pass --monitor <CONNECTOR> or set PUNKTFUNK_CAPTURE_MONITOR",
         )?;

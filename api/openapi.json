@@ -190,6 +190,38 @@
         }
       }
     },
+    "/api/v1/display/monitors": {
+      "get": {
+        "tags": [
+          "display"
+        ],
+        "summary": "Physical monitors",
+        "description": "The heads this host actually has — for pinning capture at one (`PUNKTFUNK_CAPTURE_MONITOR`) and\nfor rendering a picker. Read-only: this never creates, moves or disables anything. Note these\nare *not* the managed virtual displays — those are `/display/state`. See\n`design/per-monitor-portal-capture.md` §5.1.",
+        "operationId": "getDisplayMonitors",
+        "responses": {
+          "200": {
+            "description": "The host's physical monitors",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MonitorsResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/display/presets": {
       "get": {
         "tags": [
@@ -3646,6 +3678,66 @@
           }
         }
       },
+      "ApiMonitorInfo": {
+        "type": "object",
+        "description": "One physical monitor this host has, as the compositor reports it.",
+        "required": [
+          "connector",
+          "description",
+          "mode",
+          "x",
+          "y",
+          "scale",
+          "primary",
+          "enabled",
+          "managed",
+          "selected"
+        ],
+        "properties": {
+          "connector": {
+            "type": "string",
+            "description": "Connector name (`DP-1`, `HDMI-A-2`) — the value `PUNKTFUNK_CAPTURE_MONITOR` takes."
+          },
+          "description": {
+            "type": "string",
+            "description": "Human label for a picker (`make model`, else the connector)."
+          },
+          "enabled": {
+            "type": "boolean",
+            "description": "Driven right now. A disabled head is still listed, so it can be explained rather than missing."
+          },
+          "managed": {
+            "type": "boolean",
+            "description": "Best-effort: this is one of OUR virtual displays, not a real head (reliable on KWin only)."
+          },
+          "mode": {
+            "type": "string",
+            "description": "`WIDTHxHEIGHT@HZ` of the current mode (size only when the refresh is unknown)."
+          },
+          "primary": {
+            "type": "boolean",
+            "description": "The compositor's primary/focused head."
+          },
+          "scale": {
+            "type": "number",
+            "format": "double",
+            "description": "Logical scale factor."
+          },
+          "selected": {
+            "type": "boolean",
+            "description": "True when `PUNKTFUNK_CAPTURE_MONITOR` currently names this monitor."
+          },
+          "x": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Desktop-space top-left — what makes a head identifiable when two share a size."
+          },
+          "y": {
+            "type": "integer",
+            "format": "int32"
+          }
+        }
+      },
       "ApiSelectedGpu": {
         "type": "object",
         "description": "The GPU the **next** session's pipeline will be created on, and why. (A preference change\napplies to the next session; a running session keeps the GPU it opened on.)",
@@ -4251,6 +4343,13 @@
         "type": "object",
         "description": "The user-facing display-management policy — what `display-settings.json` holds and what the mgmt\nAPI GETs/PUTs. When [`preset`](Self::preset) is not [`Preset::Custom`] the explicit fields are\nignored (the console writes one or the other); [`effective`](Self::effective) resolves both to a\nsingle [`EffectivePolicy`].",
         "properties": {
+          "capture_monitor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "**Mirror a physical monitor instead of creating a virtual display**: the connector name\n(`DP-1`, `HDMI-A-2`) sessions should stream, or `None` for the normal virtual-display path.\n\nOrthogonal to `preset`/lifecycle (like `game_session`): a preset change never clears it, and\n`#[serde(default)]` leaves existing `display-settings.json` files untouched. It is a\n**host-wide** setting, not per-client — the host-pinned decision of record in\n`design/per-monitor-portal-capture.md` §5.3. `PUNKTFUNK_CAPTURE_MONITOR` overrides it (see\n[`capture_monitor`]), so an appliance can pin in `host.env` without the console fighting it."
+          },
           "ddc_power_off": {
             "type": "boolean",
             "description": "EXPERIMENTAL (Windows): command physical monitors' panels off over DDC/CI (VCP 0xD6 →\nDPMS off) right before an `Exclusive` isolate deactivates them, and back on at restore.\nTargets the \"connected-but-dark head\" periodic-stutter class (monitor standby\nauto-input-scan / DP link churn while the virtual display is the sole active display) at\nthe monitor-firmware level. Best-effort — monitors without DDC/CI (or with it disabled in\nthe OSD) are skipped. Orthogonal to `preset` (like `game_session`): preserved across\npreset changes; `#[serde(default)]` = off so existing `display-settings.json` files are\nuntouched."
@@ -5719,6 +5818,43 @@
           "join",
           "reject"
         ]
+      },
+      "MonitorsResponse": {
+        "type": "object",
+        "description": "The host's physical monitors + which one capture is pinned to.",
+        "required": [
+          "monitors"
+        ],
+        "properties": {
+          "compositor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Compositor backend the enumeration came from (`kwin`, `mutter`, …), when one was resolved."
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why the list is empty, when enumeration failed (compositor unreachable, unsupported\nplatform). `None` with an empty list means \"asked, and there are none\"."
+          },
+          "monitors": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ApiMonitorInfo"
+            },
+            "description": "The heads, ordered left-to-right by desktop position."
+          },
+          "pinned": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The configured `PUNKTFUNK_CAPTURE_MONITOR`, if any — reported even when it matches nothing,\nso the console can show \"pinned to DP-2, which this host doesn't have\"."
+          }
+        }
       },
       "NativeClient": {
         "type": "object",

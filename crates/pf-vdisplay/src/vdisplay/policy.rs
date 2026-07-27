@@ -246,6 +246,16 @@ pub struct DisplayPolicy {
     /// startup. Orthogonal to `preset` (like `game_session`); `#[serde(default)]` = off.
     #[serde(default)]
     pub pnp_disable_monitors: bool,
+    /// **Mirror a physical monitor instead of creating a virtual display**: the connector name
+    /// (`DP-1`, `HDMI-A-2`) sessions should stream, or `None` for the normal virtual-display path.
+    ///
+    /// Orthogonal to `preset`/lifecycle (like `game_session`): a preset change never clears it, and
+    /// `#[serde(default)]` leaves existing `display-settings.json` files untouched. It is a
+    /// **host-wide** setting, not per-client — the host-pinned decision of record in
+    /// `design/per-monitor-portal-capture.md` §5.3. `PUNKTFUNK_CAPTURE_MONITOR` overrides it (see
+    /// [`capture_monitor`]), so an appliance can pin in `host.env` without the console fighting it.
+    #[serde(default)]
+    pub capture_monitor: Option<String>,
 }
 
 fn one() -> u32 {
@@ -271,6 +281,7 @@ impl Default for DisplayPolicy {
             game_session: GameSession::default(),
             ddc_power_off: false,
             pnp_disable_monitors: false,
+            capture_monitor: None,
         }
     }
 }
@@ -316,6 +327,12 @@ impl DisplayPolicy {
     pub fn sanitized(mut self) -> Self {
         self.version = 1;
         self.max_displays = self.max_displays.clamp(1, 16);
+        // A picker that clears its selection sends `""`; that means "no pin", not "match the
+        // monitor named empty string" — same normalization the env knob does.
+        self.capture_monitor = self
+            .capture_monitor
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
         self
     }
 }
@@ -332,6 +349,7 @@ impl EffectivePolicy {
         game_session: GameSession,
         ddc_power_off: bool,
         pnp_disable_monitors: bool,
+        capture_monitor: Option<String>,
     ) -> DisplayPolicy {
         DisplayPolicy {
             version: 1,
@@ -345,10 +363,13 @@ impl EffectivePolicy {
                 positions,
             },
             max_displays: self.max_displays,
-            // Preserve the orthogonal axes (EffectivePolicy doesn't carry them).
+            // Preserve the orthogonal axes (EffectivePolicy doesn't carry them). Dropping any of
+            // them here would mean "saving a display arrangement silently cleared my setting" —
+            // for `capture_monitor` that would swap the streamed screen out from under the operator.
             game_session,
             ddc_power_off,
             pnp_disable_monitors,
+            capture_monitor,
         }
     }
 }
@@ -791,12 +812,19 @@ mod tests {
         let mut positions = BTreeMap::new();
         positions.insert("1".to_string(), Position { x: 0, y: 0 });
         positions.insert("7".to_string(), Position { x: 2560, y: 0 });
-        let p = eff.with_manual_layout(positions, GameSession::Dedicated, true, true);
-        // The orthogonal axes (game-session, DDC power-off, PnP disable) are preserved through
-        // the transform.
+        let p = eff.with_manual_layout(
+            positions,
+            GameSession::Dedicated,
+            true,
+            true,
+            Some("DP-2".into()),
+        );
+        // The orthogonal axes (game-session, DDC power-off, PnP disable, capture-monitor pin) are
+        // preserved through the transform — arranging displays must not clear an unrelated setting.
         assert_eq!(p.game_session, GameSession::Dedicated);
         assert!(p.ddc_power_off);
         assert!(p.pnp_disable_monitors);
+        assert_eq!(p.capture_monitor.as_deref(), Some("DP-2"));
         // Preset drops to Custom so the explicit fields (incl. the layout) rule…
         assert_eq!(p.preset, Preset::Custom);
         // …every other behavior axis is preserved verbatim…
