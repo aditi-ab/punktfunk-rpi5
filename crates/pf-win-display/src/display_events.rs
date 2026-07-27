@@ -156,15 +156,27 @@ pub fn summarize(events: &[DisplayEvent]) -> String {
     out.join(", ")
 }
 
-/// The prime suspects for link-probe disturbances, from the cached inventory: external physical
-/// displays that are CONNECTED but not part of the desktop (standby TV / input-switched monitor).
-/// Rendered as `"<friendly> (<connector>)"`. Never blocks on the CCD lock.
-pub fn connected_inactive_externals() -> Vec<String> {
+/// The prime suspects for link-probe/dark-head disturbances, from the cached inventory: PHYSICAL
+/// displays — external connectors AND internal panels — that are CONNECTED but not part of the
+/// desktop. External = the classic standby TV / input-switched monitor; internal = the laptop
+/// panel the exclusive isolate deactivated, whose driver-level servicing produces the identical
+/// ~2 s metronome on hybrid laptops (field A/B 2026-07-27: reporter's Legion, exclusive
+/// 16.3 stalls/min vs primary 0 — the old external-only filter reported `none` there and steered
+/// the diagnosis AWAY from the real cause for hours). Virtual/indirect targets stay excluded
+/// (precision rule). Rendered as `"<friendly> (<connector>)"`. Never blocks on the CCD lock.
+pub fn connected_inactive_physicals() -> Vec<String> {
     let st = state().lock().unwrap();
     st.inventory
         .iter()
-        .filter(|t| t.external_physical && !t.active)
-        .map(|t| format!("{} ({})", t.friendly, t.tech))
+        .filter(|t| (t.external_physical || t.internal_panel) && !t.active)
+        .map(|t| {
+            let name = if t.friendly.is_empty() && t.internal_panel {
+                "laptop panel"
+            } else {
+                &t.friendly
+            };
+            format!("{} ({})", name, t.tech)
+        })
         .collect()
 }
 

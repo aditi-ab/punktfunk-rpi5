@@ -115,7 +115,7 @@ impl StallWatch {
              delivered no frame for the gap; the present path stalled below capture"
         );
         if let Some(period) = stall.metronomic {
-            let suspects = pf_win_display::display_events::connected_inactive_externals();
+            let suspects = pf_win_display::display_events::connected_inactive_physicals();
             let suspects = if suspects.is_empty() {
                 "none".to_string()
             } else {
@@ -151,10 +151,13 @@ impl StallWatch {
                      display-poller software (the SteelSeries-GG/SignalRGB class — \
                      correlate 'slow display-descriptor poll' lines), or the DWM present \
                      clock (try a different refresh rate). If connected_inactive lists a \
-                     display, its standby probing is the prime suspect: unplug it at the \
-                     GPU, disable its OSD auto input scan (TVs: instant-on/quick-start + \
-                     CEC off), use an HPD-holding adapter/dummy, or keep it active while \
-                     streaming"
+                     display, its standby servicing is the prime suspect. For a LAPTOP \
+                     PANEL (the exclusive isolate deactivated it — the dark-but-connected \
+                     head is itself the disturbance on hybrid laptops): keep it active \
+                     with `topology: primary`, or try the `pnp_disable_monitors` axis. \
+                     For an external display: unplug it at the GPU, disable its OSD auto \
+                     input scan (TVs: instant-on/quick-start + CEC off), use an \
+                     HPD-holding adapter/dummy, or keep it active while streaming"
                 );
             }
         }

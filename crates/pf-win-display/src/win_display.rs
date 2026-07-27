@@ -844,15 +844,21 @@ pub unsafe fn count_other_active(keep_target_ids: &[u32]) -> Option<u32> {
 }
 
 /// One CONNECTED display target from a full (`QDC_ALL_PATHS`) CCD sweep — the disturbance-
-/// attribution inventory. `external_physical` is the load-bearing bit: a standby TV/monitor on a
-/// real connector is the prime suspect for the periodic link-probe stutter class, while internal
-/// panels and indirect/virtual targets (our own IDD included) are not.
+/// attribution inventory. `external_physical` and `internal_panel` are the load-bearing bits: a
+/// standby TV/monitor on a real connector is the classic suspect for the periodic link-probe
+/// stutter class, and a laptop panel the exclusive isolate DEACTIVATED is the hybrid-laptop
+/// variant of the same disturbance (field A/B 2026-07-27: dark-but-connected eDP head on the
+/// iGPU → ~2 s stall metronome; `topology: primary` → zero) — only indirect/virtual targets
+/// (our own IDD included) can never be suspects.
 pub struct TargetInventory {
     pub target_id: u32,
     /// Whether any active path drives this target (part of the desktop right now).
     pub active: bool,
     /// External physical connector (HDMI/DP/DVI/…): candidate for standby link-probe churn.
     pub external_physical: bool,
+    /// Internal panel (eDP/LVDS/embedded): candidate for dark-head servicing churn when
+    /// connected-but-inactive (the exclusive isolate on a laptop creates exactly that state).
+    pub internal_panel: bool,
     /// Short connector label for logs (`"HDMI"`, `"DisplayPort"`, `"internal-panel"`, …).
     pub tech: &'static str,
     /// The monitor's friendly name (`"LG TV SSCR2"`); empty when the EDID carries none.
@@ -953,6 +959,7 @@ pub unsafe fn target_inventory() -> Vec<TargetInventory> {
             target_id: t.id,
             active: active.contains(&key),
             external_physical,
+            internal_panel: tech == "internal-panel",
             tech,
             friendly: utf16z_str(&req.monitorFriendlyDeviceName),
             monitor_device_path: utf16z_str(&req.monitorDevicePath),

@@ -181,9 +181,14 @@ pub fn panel_off_except(exclude_gdi: &str) -> u32 {
         acked += set_power(m.hmon, &m.device, POWER_OFF);
     }
     if acked == 0 {
-        tracing::debug!(
-            "DDC/CI: no physical panel accepted the DPMS-off command \
-             (no DDC/CI-capable panel besides the virtual display)"
+        // INFO, not debug: the user opted into this axis, so "it did nothing" is an answer they
+        // asked for. The common case is a laptop — internal eDP/LVDS panels have NO DDC/CI at
+        // all (their brightness/power runs over the driver's own channel), so `ddc_power_off`
+        // is structurally a no-op for them (reporter feedback 2026-07-27).
+        tracing::info!(
+            "DDC/CI: no panel accepted the DPMS-off command — the ddc_power_off axis did \
+             nothing on this display set (internal eDP/LVDS panels expose no DDC/CI; external \
+             monitors may have it disabled in the OSD or dropped by a dock/KVM)"
         );
     }
     acked
