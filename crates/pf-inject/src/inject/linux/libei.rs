@@ -20,6 +20,7 @@
 //! key events) is enough.
 
 use super::{gs_button_to_evdev, vk_to_evdev, InputInjector};
+use crate::AbsoluteAnchor;
 use anyhow::{anyhow, Result};
 use ashpd::desktop::{
     remote_desktop::{
@@ -374,23 +375,72 @@ async fn connect_socket_file(file: &std::path::Path) -> Result<(UnixStream, Opti
 }
 
 /// One EI device and its emulation state.
-/// Pick the region to map absolute coordinates into: the one whose logical size matches the
-/// streamed mode (the session's virtual output). The device advertises one region per logical
-/// monitor, and blindly taking `first()` next to a physical monitor put the pointer — and every
+/// Pick the region to map absolute coordinates into. The device advertises one region per logical
+/// monitor and blindly taking `first()` next to a physical monitor put the pointer — and every
 /// click — on whichever output the compositor happened to announce first (on-glass: GNOME with a
 /// dummy HDMI beside the virtual primary; the seat cursor never entered the streamed monitor, so
-/// neither embedded nor metadata cursor capture could see it). Size is the only key available
-/// today: regions carry no output name, and matching the screencast stream's `mapping_id` needs
-/// the stream id plumbed across crates (follow-up). Two same-sized monitors stay ambiguous.
-fn region_for_mode(
-    regions: &[reis::event::Region],
+/// neither embedded nor metadata cursor capture could see it).
+///
+/// The ladder, most identifying first:
+///
+/// 1. **`mapping_id`** from the session's [`AbsoluteAnchor`] — the protocol's own key for
+///    correlating a region with a video stream.
+/// 2. **origin** from the anchor — two outputs can share a size, never a top-left. This is what
+///    makes a *mirrored physical monitor* land correctly (`design/per-monitor-portal-capture.md`
+///    §7.2): its region is not the client's size, so the size rung can't find it.
+/// 3. **size** — the streamed mode. Correct for a client-sized virtual output, ambiguous the
+///    moment two heads share a mode, which is exactly why the rungs above exist.
+/// 4. `first()`.
+///
+/// An anchor that matches nothing falls through rather than failing: the region set is the truth
+/// and the anchor is our belief about it. The caller logs that miss ([`anchor_missed`]).
+fn region_for_mode<'a>(
+    regions: &'a [reis::event::Region],
     w: f32,
     h: f32,
-) -> Option<&reis::event::Region> {
+    anchor: Option<&AbsoluteAnchor>,
+) -> Option<&'a reis::event::Region> {
+    if let Some(a) = anchor {
+        if let Some(id) = a.mapping_id.as_deref() {
+            if let Some(r) = regions.iter().find(|r| r.mapping_id.as_deref() == Some(id)) {
+                return Some(r);
+            }
+        }
+        if let Some((x, y)) = a.origin {
+            // EI region offsets are unsigned; a compositor places every output at a non-negative
+            // origin in its own global space, so a negative anchor simply matches nothing.
+            if x >= 0 && y >= 0 {
+                if let Some(r) = regions.iter().find(|r| r.x == x as u32 && r.y == y as u32) {
+                    return Some(r);
+                }
+            }
+        }
+    }
     regions
         .iter()
         .find(|r| r.width as f32 == w && r.height as f32 == h)
         .or_else(|| regions.first())
+}
+
+/// Did an anchor name an output this region set doesn't have? Drives the one-shot warning — a
+/// silently mis-mapped pointer is the failure this whole ladder exists to prevent, so when the
+/// anchor can't be honored that has to be visible in the log rather than inferred from "clicks land
+/// on the wrong screen".
+fn anchor_missed(regions: &[reis::event::Region], anchor: Option<&AbsoluteAnchor>) -> bool {
+    let Some(a) = anchor else {
+        return false;
+    };
+    if let Some(id) = a.mapping_id.as_deref() {
+        if regions.iter().any(|r| r.mapping_id.as_deref() == Some(id)) {
+            return false;
+        }
+    }
+    if let Some((x, y)) = a.origin {
+        if x >= 0 && y >= 0 && regions.iter().any(|r| r.x == x as u32 && r.y == y as u32) {
+            return false;
+        }
+    }
+    true
 }
 
 struct DeviceSlot {
@@ -428,6 +478,30 @@ struct EiState {
     /// coordinates when the device's region is degenerate/absent (gamescope). Without it the
     /// fallback is raw client pixels, correct only when the stream runs at the output's size.
     output_hint: Option<(u32, u32)>,
+}
+
+/// The anchor whose miss we last warned about, so a persistently unmatchable anchor logs once per
+/// *change* instead of once per pointer sample (absolute motion arrives at client frame rate).
+static LAST_WARNED_ANCHOR: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Warn — once per distinct anchor — that the session's anchor names an output this EIS doesn't
+/// advertise, so absolute coordinates fell back to size matching. See [`region_for_mode`].
+fn warn_anchor_miss(anchor: &AbsoluteAnchor, regions: &[reis::event::Region]) {
+    let key = format!("{anchor:?}");
+    let mut last = LAST_WARNED_ANCHOR.lock().unwrap_or_else(|e| e.into_inner());
+    if last.as_deref() == Some(key.as_str()) {
+        return;
+    }
+    *last = Some(key);
+    tracing::warn!(
+        ?anchor,
+        regions = ?regions
+            .iter()
+            .map(|r| (r.x, r.y, r.width, r.height, r.mapping_id.clone()))
+            .collect::<Vec<_>>(),
+        "libei: the session's absolute-coordinate anchor matches no EIS region — falling back to \
+         size matching, so the pointer may land on the wrong monitor"
+    );
 }
 
 /// Is this EIS region a plausible OUTPUT geometry — something to map normalized coordinates
@@ -763,7 +837,14 @@ impl EiState {
                         // raw client pixels as the last resort.
                         let nx = (ev.x as f32 / w).clamp(0.0, 1.0);
                         let ny = (ev.y as f32 / h).clamp(0.0, 1.0);
-                        let (x, y) = match region_for_mode(slot.regions(), w, h)
+                        let anchor = crate::absolute_anchor();
+                        if let Some(a) = anchor
+                            .as_ref()
+                            .filter(|a| anchor_missed(slot.regions(), Some(a)))
+                        {
+                            warn_anchor_miss(a, slot.regions());
+                        }
+                        let (x, y) = match region_for_mode(slot.regions(), w, h, anchor.as_ref())
                             .filter(|r| sane_region(r))
                         {
                             Some(region) => (
@@ -847,8 +928,11 @@ impl EiState {
                     Some(t) if w > 0.0 && h > 0.0 => {
                         let nx = (ev.x as f32 / w).clamp(0.0, 1.0);
                         let ny = (ev.y as f32 / h).clamp(0.0, 1.0);
-                        // Same region-selection + degenerate fallback ladder as MouseMoveAbs.
-                        let (x, y) = match region_for_mode(slot.regions(), w, h)
+                        // Same region-selection + degenerate fallback ladder as MouseMoveAbs
+                        // (including the session anchor — touch must land on the same monitor the
+                        // pointer does, or a mirrored session's taps go to a different screen).
+                        let anchor = crate::absolute_anchor();
+                        let (x, y) = match region_for_mode(slot.regions(), w, h, anchor.as_ref())
                             .filter(|r| sane_region(r))
                         {
                             Some(region) => (
@@ -911,5 +995,124 @@ impl EiState {
         if loud {
             tracing::debug!(n, kind = ?ev.kind, idx, emitted, "libei: emitted");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn region(x: u32, y: u32, w: u32, h: u32, mapping_id: Option<&str>) -> reis::event::Region {
+        reis::event::Region {
+            x,
+            y,
+            width: w,
+            height: h,
+            scale: 1.0,
+            mapping_id: mapping_id.map(str::to_string),
+        }
+    }
+
+    /// The case the anchor exists for: two heads at the SAME size, so the size rung is a coin
+    /// flip. The origin picks the right one.
+    #[test]
+    fn the_origin_disambiguates_two_same_size_monitors() {
+        let regions = [
+            region(0, 0, 1920, 1080, None),
+            region(1920, 0, 1920, 1080, None),
+        ];
+        let anchor = AbsoluteAnchor {
+            origin: Some((1920, 0)),
+            mapping_id: None,
+        };
+        let picked = region_for_mode(&regions, 1920.0, 1080.0, Some(&anchor)).unwrap();
+        assert_eq!((picked.x, picked.y), (1920, 0));
+        // Without the anchor the same call takes the first same-sized region — the old behavior,
+        // preserved deliberately for the client-sized virtual-output path.
+        let picked = region_for_mode(&regions, 1920.0, 1080.0, None).unwrap();
+        assert_eq!((picked.x, picked.y), (0, 0));
+    }
+
+    /// `mapping_id` outranks the origin: it is the protocol's own stream↔region correlation, so a
+    /// stale/rounded origin can't override it.
+    #[test]
+    fn mapping_id_outranks_the_origin() {
+        let regions = [
+            region(0, 0, 1920, 1080, Some("head-a")),
+            region(1920, 0, 1920, 1080, Some("head-b")),
+        ];
+        let anchor = AbsoluteAnchor {
+            origin: Some((0, 0)),
+            mapping_id: Some("head-b".into()),
+        };
+        let picked = region_for_mode(&regions, 1920.0, 1080.0, Some(&anchor)).unwrap();
+        assert_eq!(picked.mapping_id.as_deref(), Some("head-b"));
+    }
+
+    /// A mirrored monitor's region is NOT the client's streamed size, so the size rung would miss
+    /// it entirely — the origin is what makes this land.
+    #[test]
+    fn the_anchor_finds_a_monitor_the_streamed_size_does_not_match() {
+        let regions = [
+            region(0, 0, 1920, 1080, None),
+            region(1920, 0, 3840, 2160, None),
+        ];
+        // Client streams 1280x720 of a 4K head parked to the right.
+        let anchor = AbsoluteAnchor {
+            origin: Some((1920, 0)),
+            mapping_id: None,
+        };
+        let picked = region_for_mode(&regions, 1280.0, 720.0, Some(&anchor)).unwrap();
+        assert_eq!((picked.width, picked.height), (3840, 2160));
+    }
+
+    /// An anchor that names nothing present must not strand input: fall back down the ladder
+    /// (size, then first) — and say so, which `anchor_missed` drives.
+    #[test]
+    fn an_unmatched_anchor_falls_back_and_is_reported() {
+        let regions = [region(0, 0, 1920, 1080, None)];
+        let anchor = AbsoluteAnchor {
+            origin: Some((5000, 5000)),
+            mapping_id: None,
+        };
+        assert!(anchor_missed(&regions, Some(&anchor)));
+        let picked = region_for_mode(&regions, 1920.0, 1080.0, Some(&anchor)).unwrap();
+        assert_eq!((picked.x, picked.y), (0, 0), "fell back to the size match");
+        // A matched anchor is never reported as missed.
+        let ok = AbsoluteAnchor {
+            origin: Some((0, 0)),
+            mapping_id: None,
+        };
+        assert!(!anchor_missed(&regions, Some(&ok)));
+        assert!(!anchor_missed(&regions, None), "no anchor is not a miss");
+    }
+
+    /// EI region offsets are unsigned; a negative anchor origin can only ever match nothing, and
+    /// must not be cast into a huge u32 that accidentally matches something.
+    #[test]
+    fn a_negative_origin_matches_nothing_rather_than_wrapping() {
+        let regions = [region(0, 0, 1920, 1080, None)];
+        let anchor = AbsoluteAnchor {
+            origin: Some((-1920, 0)),
+            mapping_id: None,
+        };
+        assert!(anchor_missed(&regions, Some(&anchor)));
+        let picked = region_for_mode(&regions, 1920.0, 1080.0, Some(&anchor)).unwrap();
+        assert_eq!((picked.x, picked.y), (0, 0));
+    }
+
+    /// An empty anchor is the same as no anchor — so a caller can build one unconditionally and
+    /// let the setter drop it.
+    #[test]
+    fn an_empty_anchor_is_dropped_by_the_setter() {
+        crate::set_absolute_anchor(Some(AbsoluteAnchor::default()));
+        assert_eq!(crate::absolute_anchor(), None);
+        crate::set_absolute_anchor(Some(AbsoluteAnchor {
+            origin: Some((1920, 0)),
+            mapping_id: None,
+        }));
+        assert_eq!(crate::absolute_anchor().unwrap().origin, Some((1920, 0)));
+        crate::set_absolute_anchor(None);
+        assert_eq!(crate::absolute_anchor(), None);
     }
 }

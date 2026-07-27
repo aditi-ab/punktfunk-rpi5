@@ -107,6 +107,64 @@ pub fn open(_backend: Backend) -> Result<Box<dyn InputInjector>> {
     anyhow::bail!("no input-injection backend on this platform")
 }
 
+/// Which output the session's **absolute** coordinates belong to, by identity rather than by size.
+///
+/// libei hands the injector one region per logical monitor and the region set carries no output
+/// name, so the backend has to decide which one a normalized client position maps into. Matching on
+/// *size* — all it could do before — is a coin flip the moment two heads share a mode, and it
+/// resolved wrong on-glass once already (GNOME, a dummy HDMI beside the virtual primary: the seat
+/// cursor never entered the streamed monitor). These are the two keys that actually identify a
+/// region: the protocol's own `mapping_id`, and the origin (two outputs can share a size; they can
+/// never share a top-left).
+///
+/// Best-effort by design: an anchor that matches no region warns and falls back to the size ladder,
+/// because the region set is the truth and the anchor is our belief about it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct AbsoluteAnchor {
+    /// The target output's top-left in the compositor's global logical space.
+    pub origin: Option<(i32, i32)>,
+    /// The EI `mapping_id` of the target output, when the capture side knows it — the protocol's
+    /// blessed way to correlate a region with a video stream, so it wins over the origin.
+    pub mapping_id: Option<String>,
+}
+
+impl AbsoluteAnchor {
+    /// Nothing to match on — treated as "no anchor" so callers can build one unconditionally.
+    pub fn is_empty(&self) -> bool {
+        self.origin.is_none() && self.mapping_id.is_none()
+    }
+}
+
+/// The current absolute-coordinate anchor. A `RwLock` rather than an env var: the injector is
+/// host-lifetime and lives behind a channel, so a *session* can only reach it through process
+/// state — and process state that is typed and lock-guarded beats the `set_var` pattern the
+/// backend-select still uses (security-review 2026-06-28 #7).
+static ABSOLUTE_ANCHOR: std::sync::RwLock<Option<AbsoluteAnchor>> = std::sync::RwLock::new(None);
+
+/// Anchor absolute coordinates at a specific output. `None` (the default) keeps the size-matched
+/// behavior.
+///
+/// ⚠️ **This is a HOST-level pin, not per-session state.** The injector is host-lifetime and every
+/// concurrent session's input flows through the same one, so an anchor set per session would apply
+/// to all of them — the last connect silently re-aiming everyone else's pointer. That is fine for
+/// what this exists for (`PUNKTFUNK_CAPTURE_MONITOR`, a host-wide pin — the host-pinned decision of
+/// record in `design/per-monitor-portal-capture.md` §5.3) and wrong for anything per-client. A
+/// per-session anchor needs the injector to become session-aware first; don't call this from a
+/// session path until it is.
+pub fn set_absolute_anchor(anchor: Option<AbsoluteAnchor>) {
+    let anchor = anchor.filter(|a| !a.is_empty());
+    tracing::debug!(?anchor, "input: absolute-coordinate anchor set");
+    *ABSOLUTE_ANCHOR.write().unwrap_or_else(|e| e.into_inner()) = anchor;
+}
+
+/// The anchor an injector should map absolute coordinates into, if any.
+pub fn absolute_anchor() -> Option<AbsoluteAnchor> {
+    ABSOLUTE_ANCHOR
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
 /// Pick the injection backend for the current session. gamescope hosts its own EIS server (no
 /// portal), so a gamescope session injects directly into it. wlroots/Sway only implements the
 /// ScreenCast portal (no RemoteDesktop), so libei can't run there — use the wlr virtual-input
