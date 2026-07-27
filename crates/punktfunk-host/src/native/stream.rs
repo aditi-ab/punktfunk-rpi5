@@ -496,13 +496,20 @@ struct SendStats {
 ///   * a **per-client-mode identity** policy: the mode is part of the display-identity slot key, so a
 ///     resize resolves a DIFFERENT slot (a fresh Windows monitor / a differently-named KWin output),
 ///     defeating the policy — honest downgrade is to reject and let the client scale.
+///   * a **monitor mirror** (`mirrored`): the source is a physical head running at the mode its owner
+///     set, and `MirrorDisplay::create` ignores the requested one by design
+///     (design/per-monitor-portal-capture.md §7.3). A resize would tear the cast down and re-`create`
+///     the *same* head at the *same* size — a visible hitch that changes nothing — or, worse, invite
+///     the reflex of reconfiguring the display someone is sitting in front of. Reject; the client
+///     scales, exactly as it already does for gamescope.
 ///
 /// Every other compositor (and the synthetic protocol-test source) with the default identity accepts.
 pub(super) fn reconfig_allowed(
     compositor: Option<crate::vdisplay::Compositor>,
     per_client_mode: bool,
+    mirrored: bool,
 ) -> bool {
-    compositor != Some(crate::vdisplay::Compositor::Gamescope) && !per_client_mode
+    compositor != Some(crate::vdisplay::Compositor::Gamescope) && !per_client_mode && !mirrored
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3524,22 +3531,39 @@ mod tests {
         use crate::vdisplay::Compositor::{Gamescope, Hyprland, Kwin, Mutter, Wlroots};
         // gamescope ALWAYS rejects — a resize would respawn the nested game (H1/D3), regardless of
         // the identity policy.
-        assert!(!reconfig_allowed(Some(Gamescope), false));
-        assert!(!reconfig_allowed(Some(Gamescope), true));
+        assert!(!reconfig_allowed(Some(Gamescope), false, false));
+        assert!(!reconfig_allowed(Some(Gamescope), true, false));
         // A per-client-mode identity policy rejects on every backend — the resize resolves a
         // different display-identity slot (H5).
-        assert!(!reconfig_allowed(Some(Kwin), true));
-        assert!(!reconfig_allowed(Some(Mutter), true));
-        assert!(!reconfig_allowed(None, true));
+        assert!(!reconfig_allowed(Some(Kwin), true, false));
+        assert!(!reconfig_allowed(Some(Mutter), true, false));
+        assert!(!reconfig_allowed(None, true, false));
         // Every other compositor with the default identity ACCEPTS (recreate / re-arrival / in-place).
         for c in [Kwin, Mutter, Wlroots, Hyprland] {
             assert!(
-                reconfig_allowed(Some(c), false),
+                reconfig_allowed(Some(c), false, false),
                 "{c:?} should allow live reconfigure"
             );
         }
         // The synthetic source (no compositor) is the protocol-test path — always reconfigurable.
-        assert!(reconfig_allowed(None, false));
+        assert!(reconfig_allowed(None, false, false));
+    }
+
+    /// A mirrored physical head has a fixed mode (§7.3): every backend that would otherwise accept
+    /// a live reconfigure must reject one while the session is streaming someone's real monitor.
+    #[test]
+    fn reconfig_allowed_rejects_a_monitor_mirror_on_every_backend() {
+        use crate::vdisplay::Compositor::{Hyprland, Kwin, Mutter, Wlroots};
+        for c in [Kwin, Mutter, Wlroots, Hyprland] {
+            assert!(
+                reconfig_allowed(Some(c), false, false),
+                "{c:?} without a pin should still allow live reconfigure"
+            );
+            assert!(
+                !reconfig_allowed(Some(c), false, true),
+                "{c:?} mirroring a physical head must reject a resize"
+            );
+        }
     }
 
     #[test]

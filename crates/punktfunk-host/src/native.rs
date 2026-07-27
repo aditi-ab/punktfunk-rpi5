@@ -1003,6 +1003,9 @@ async fn serve_session(
     //     so a resize would resolve a DIFFERENT slot — on Windows a fresh monitor ADD instead of the
     //     in-place reconfigure, on KWin a differently-named output — defeating the policy's
     //     per-resolution identity. Honest downgrade: reject, client scales (H5).
+    //   * a monitor MIRROR (a `capture_monitor` pin): a physical head runs at the mode its owner set
+    //     and the mirror backend ignores the requested one, so a resize would restart the identical
+    //     cast at the identical size (design/per-monitor-portal-capture.md §7.3).
     // The SYNTHETIC source stays reconfigurable on purpose (nothing to rebuild — the ack round-trip
     // is the whole effect): it is the compositor-free protocol test source, and the C-ABI roundtrip
     // test + client harnesses exercise the Reconfigure/Reconfigured plumbing through it.
@@ -1011,7 +1014,16 @@ async fn serve_session(
         let per_client_mode_identity = crate::vdisplay::policy::prefs()
             .configured_effective()
             .is_some_and(|e| e.identity == crate::vdisplay::policy::Identity::PerClientMode);
-        reconfig_allowed(compositor, per_client_mode_identity)
+        // Read once here, like the identity above: this session opened its display under whatever
+        // the pin said at bring-up, so a console change mid-session must not retroactively change
+        // what THIS session answers a Reconfigure with. Linux-only because `vdisplay::open` only
+        // routes to the mirror there — a pin left in a Windows host's settings streams nothing
+        // different, and must not silently disable resize as a side effect.
+        #[cfg(target_os = "linux")]
+        let mirrored = crate::vdisplay::capture_monitor().is_some();
+        #[cfg(not(target_os = "linux"))]
+        let mirrored = false;
+        reconfig_allowed(compositor, per_client_mode_identity, mirrored)
     };
     // Negotiated codec (HEVC / H.264 / AV1), derived from the Welcome. `Copy`, so the control task's
     // `async move` captures a copy and it stays usable for the data-plane SessionContext below.
