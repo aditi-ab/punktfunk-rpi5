@@ -87,6 +87,10 @@ impl DataPump {
         // above its floor, and the climb probe's VBV reasoning doesn't apply to hard
         // per-frame CBR — controller and capacity probe stay off (0 = permanently off).
         let rate_pinned = negotiated_codec == crate::quic::CODEC_PYROWAVE;
+        // All-intra streams have no reference chains: the frame channel drains to the newest
+        // AU instead of strict FIFO (see `FrameChannel::set_all_intra`), so a slow consumer
+        // caps its standing queue at ~1 frame with zero recovery cost.
+        frames.set_all_intra(negotiated_codec == crate::quic::CODEC_PYROWAVE);
         let mut abr = BitrateController::new(if bitrate_kbps == 0 && !rate_pinned {
             resolved_bitrate_kbps
         } else {
@@ -288,6 +292,13 @@ impl DataPump {
                 if resync_wanted {
                     resync_wanted = false;
                     let _ = ctrl_tx.try_send(CtrlRequest::ClockResync);
+                }
+                // All-intra drain-to-newest skips are NOT losses (the wire delivered them) —
+                // surface them at debug so a slow consumer is visible without alarming the
+                // OSD loss counters.
+                let skipped = frames.take_skipped();
+                if skipped > 0 {
+                    tracing::debug!(skipped, "all-intra frame channel drained to newest");
                 }
                 let window_dropped = st.frames_dropped.wrapping_sub(last_dropped);
                 let loss_ppm = window_loss_ppm(

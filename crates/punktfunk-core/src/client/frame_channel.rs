@@ -248,7 +248,16 @@ pub(crate) struct EncodeLatAcc {
 /// reference-chain break the loss counters never saw). A transient burst fills it briefly and drains on
 /// its own, so a clump never costs a keyframe.
 ///
+/// **All-intra exception** ([`set_all_intra`], PyroWave): every AU is independently decodable, so
+/// the reference-chain reasoning above does not apply — a consumer that falls behind can skip
+/// straight to the newest queued AU with zero recovery cost (no keyframe round-trip, no corrupt
+/// dependents). [`pop`] then drains to the newest instead of returning the oldest, which caps any
+/// standing queue at ~1 frame structurally; the 2026-07 field report's 780M client otherwise
+/// ratcheted a genuine multi-frame backlog between the coarse jump-to-live thresholds.
+///
 /// [`clear`]: FrameChannel::clear
+/// [`set_all_intra`]: FrameChannel::set_all_intra
+/// [`pop`]: FrameChannel::pop
 pub(crate) struct FrameChannel {
     inner: Mutex<FrameQueue>,
     ready: Condvar,
@@ -259,6 +268,11 @@ struct FrameQueue {
     /// Set when the pump exits so a blocked [`FrameChannel::pop`] reports the stream ended
     /// ([`PunktfunkError::Closed`]) rather than a spurious timeout (the old mpsc did this on sender drop).
     closed: bool,
+    /// Every AU decodes independently (PyroWave): [`FrameChannel::pop`] drains to the newest.
+    all_intra: bool,
+    /// AUs skipped by the all-intra drain since the last [`FrameChannel::take_skipped`] — NOT
+    /// losses (the wire delivered them); the pump surfaces them at debug on its report tick.
+    skipped_total: u64,
 }
 
 /// Outcome of [`FrameChannel::pop`] — mirrors the old `recv_timeout` results so `next_frame`'s
@@ -275,9 +289,23 @@ impl FrameChannel {
             inner: Mutex::new(FrameQueue {
                 q: VecDeque::new(),
                 closed: false,
+                all_intra: false,
+                skipped_total: 0,
             }),
             ready: Condvar::new(),
         }
+    }
+
+    /// Pump side, once at session start: mark the stream all-intra (every AU independently
+    /// decodable) — [`Self::pop`] then drains to the newest queued AU instead of strict FIFO.
+    pub(crate) fn set_all_intra(&self, all_intra: bool) {
+        self.inner.lock().unwrap().all_intra = all_intra;
+    }
+
+    /// Pump side: AUs skipped by the all-intra drain since the last call (reset on read).
+    pub(crate) fn take_skipped(&self) -> u64 {
+        let mut st = self.inner.lock().unwrap();
+        std::mem::take(&mut st.skipped_total)
     }
 
     /// Pump side: append a completed AU and wake a blocked consumer. Enforces the memory backstop
@@ -312,11 +340,20 @@ impl FrameChannel {
         self.ready.notify_all();
     }
 
-    /// Consumer side: pop the oldest AU, waiting up to `timeout` for one to arrive.
+    /// Consumer side: pop the oldest AU, waiting up to `timeout` for one to arrive. On an
+    /// all-intra stream ([`Self::set_all_intra`]) a multi-deep queue drains to the NEWEST AU
+    /// instead — the skipped ones are already superseded and decode independently, so showing
+    /// them only adds latency.
     pub(crate) fn pop(&self, timeout: Duration) -> FramePop {
         let mut st = self.inner.lock().unwrap();
         if st.q.is_empty() && !st.closed {
             st = self.ready.wait_timeout(st, timeout).unwrap().0;
+        }
+        if st.all_intra && st.q.len() > 1 {
+            st.skipped_total += (st.q.len() - 1) as u64;
+            let newest = st.q.pop_back().expect("len > 1");
+            st.q.clear();
+            return FramePop::Frame(newest);
         }
         if let Some(f) = st.q.pop_front() {
             FramePop::Frame(f)
@@ -362,6 +399,25 @@ mod frame_channel_tests {
         assert_eq!(popped(&ch), Some(1)); // oldest first (never newest-wins pre-decode)
         assert_eq!(popped(&ch), Some(2));
         assert_eq!(ch.depth(), 0);
+    }
+
+    /// The all-intra exception: a multi-deep queue drains to the NEWEST AU (every frame
+    /// decodes independently — older queued ones are superseded), the skips are counted
+    /// separately from losses, and a single-deep queue behaves exactly like FIFO.
+    #[test]
+    fn all_intra_drains_to_newest_and_counts_skips() {
+        let ch = FrameChannel::new();
+        ch.set_all_intra(true);
+        for i in 1..=3 {
+            ch.push(frame(i));
+        }
+        assert_eq!(popped(&ch), Some(3));
+        assert_eq!(ch.depth(), 0);
+        assert_eq!(ch.take_skipped(), 2);
+        assert_eq!(ch.take_skipped(), 0); // reset on read
+        ch.push(frame(4));
+        assert_eq!(popped(&ch), Some(4)); // depth 1 = plain FIFO, no skip accounting
+        assert_eq!(ch.take_skipped(), 0);
     }
 
     #[test]
