@@ -107,6 +107,12 @@ struct EncodeApi {
         *mut nv::NV_ENC_CAPS_PARAM,
         *mut core::ffi::c_int,
     ) -> nv::NVENCSTATUS,
+    // The two entry points behind [`probe_support`] — the driver's own list of encode GUIDs
+    // this chip exposes. Mandatory like every other entry: both have existed since NVENC 1.0, so a
+    // driver missing them is broken in ways the rest of this table would not survive either.
+    get_encode_guid_count: unsafe extern "C" fn(*mut c_void, *mut u32) -> nv::NVENCSTATUS,
+    get_encode_guids:
+        unsafe extern "C" fn(*mut c_void, *mut nv::GUID, u32, *mut u32) -> nv::NVENCSTATUS,
     get_encode_preset_config_ex: unsafe extern "C" fn(
         *mut c_void,
         nv::GUID,
@@ -168,6 +174,141 @@ fn api() -> &'static EncodeApi {
     try_api().expect("NVENC call before a successful try_api() gate")
 }
 
+/// Everything the host advertisement asks of this GPU's NVENC, answered by the driver itself on
+/// ONE throwaway session: the encode-GUID list (which codecs exist at all) and the HEVC 4:4:4 cap.
+#[derive(Clone, Copy)]
+pub(crate) struct ProbedSupport {
+    /// Which codecs this chip's NVENC encodes (`nvEncGetEncodeGUIDs`). All-`false` = the probe
+    /// could not answer — [`crate::CodecSupport::wire_mask`] turns that into `None` so the caller
+    /// keeps the static superset (fail open).
+    pub codecs: crate::CodecSupport,
+    /// `NV_ENC_CAPS_SUPPORT_YUV444_ENCODE` for the HEVC GUID — whether this chip can encode
+    /// full-chroma 4:4:4 HEVC. `false` when unanswered (fail CLOSED, unlike `codecs`: the honest
+    /// downgrade is a 4:2:0 session, not a dead one).
+    pub hevc_444: bool,
+}
+
+/// The cached [`probe_support_uncached`] answer — one throwaway session per process lifetime.
+pub(crate) fn probe_support() -> ProbedSupport {
+    static CACHE: std::sync::OnceLock<ProbedSupport> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(probe_support_uncached)
+}
+
+/// Which codecs **this GPU's** NVENC can actually encode — and whether HEVC can go 4:4:4 — asked
+/// of the driver itself (`nvEncGetEncodeGUIDs` + `nvEncGetEncodeCaps`) instead of assumed from the
+/// SDK version.
+///
+/// Why this exists: the host used to advertise a static `H.264 | HEVC | AV1` superset for every
+/// NVIDIA box, so a chip without HEVC NVENC (1st-gen Maxwell, e.g. GTX 960M — HEVC needs 2nd-gen
+/// Maxwell+, AV1 needs Ada+) still offered HEVC. A client reasonably negotiated H265 and got a dead
+/// session: `hevc_nvenc` "No capable devices found", eight pipeline retries, ~15 s of blank video,
+/// then a disconnect. The GUID list is a property of the chip+driver, so it is equally right for
+/// the direct-SDK backend and the libav `*_nvenc` one.
+///
+/// ⚠️ Deliberately NOT the VAAPI probe's shape (open a tiny libav encoder per codec). That would run
+/// ffmpeg's NVENC client, and mixing it with this direct-SDK client in one process is the prime
+/// suspect for the open bug where one `probe_can_encode_444` open wedges NVENC **process-wide**
+/// (`NV_ENC_ERR_INVALID_VERSION` on every later session until a host restart — LOG-3, Droff,
+/// 0.19.2). This asks the SAME client, on the SAME shared CUDA context, that real sessions use —
+/// one extra session open of a kind the encoder already performs per open (`query_caps`), cached
+/// once per process by [`probe_support`]. The 4:4:4 cap rides the same session for the same
+/// reason: it used to be its own libav `hevc_nvenc` FREXT open — the exact open LOG-3 caught
+/// wedging NVENC — and the direct backend re-checks the same cap at session open anyway
+/// (`query_caps` → `yuv444_supported`), so the caps bit is the answer the live session will obey.
+///
+/// Every failure path returns "nothing probed" (see the [`ProbedSupport`] field docs for the
+/// per-field fail direction).
+fn probe_support_uncached() -> ProbedSupport {
+    let unknown = ProbedSupport {
+        codecs: crate::CodecSupport {
+            h264: false,
+            h265: false,
+            av1: false,
+        },
+        hevc_444: false,
+    };
+    let Ok(api) = try_api() else {
+        return unknown;
+    };
+    let cu_ctx = match cuda::context() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %format!("{e:#}"), "NVENC codec probe: no CUDA context");
+            return unknown;
+        }
+    };
+    // SAFETY: `try_api()` returned Ok, so every fn pointer below is a live entry point from the
+    // driver's own function list. `params`/`enc`/`count`/`written` are live locals that outlive
+    // their synchronous calls; `device` is the process-shared CUDA context (`cuda::context()`
+    // returned Ok), the same handle `query_caps` passes. `guids` is sized to the count the driver
+    // just reported and its pointer is valid for that many `GUID`s, matching the
+    // `guidArraySize` argument. The session is destroyed on every path out — including the failed
+    // open, which the NVENC docs still require (the driver may have taken the slot before
+    // erroring; skipping it leaks toward the concurrent-session cap).
+    unsafe {
+        let mut params = nv::NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS {
+            version: nv::NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER,
+            deviceType: nv::NV_ENC_DEVICE_TYPE::NV_ENC_DEVICE_TYPE_CUDA,
+            device: cu_ctx,
+            apiVersion: nv::NVENCAPI_VERSION,
+            ..Default::default()
+        };
+        let mut enc: *mut c_void = ptr::null_mut();
+        if let Err(e) = (api.open_encode_session_ex)(&mut params, &mut enc).nv_ok() {
+            if !enc.is_null() {
+                let _ = (api.destroy_encoder)(enc);
+            }
+            tracing::warn!(
+                error = %format!("{:#}", nvenc_status::call_err("open_encode_session_ex (codec probe)", e)),
+                "NVENC codec probe failed — keeping the static codec advertisement"
+            );
+            return unknown;
+        }
+        // The handshake with the kernel module succeeded (same latch `query_caps` sets).
+        nvenc_status::note_session_opened();
+        let mut count = 0u32;
+        let counted = (api.get_encode_guid_count)(enc, &mut count).nv_ok().is_ok();
+        let mut guids = vec![nv::GUID::default(); count as usize];
+        let mut written = 0u32;
+        let listed = counted
+            && count > 0
+            && (api.get_encode_guids)(enc, guids.as_mut_ptr(), count, &mut written)
+                .nv_ok()
+                .is_ok();
+        guids.truncate(written as usize);
+        // The 4:4:4 cap needs the session that is still open — query it before the destroy. Only
+        // meaningful against a listed HEVC GUID (a cap query for an absent codec is undefined).
+        let mut hevc_444 = false;
+        if listed && guids.contains(&nv::NV_ENC_CODEC_HEVC_GUID) {
+            let mut param = nv::NV_ENC_CAPS_PARAM {
+                version: nv::NV_ENC_CAPS_PARAM_VER,
+                capsToQuery: nv::NV_ENC_CAPS::NV_ENC_CAPS_SUPPORT_YUV444_ENCODE,
+                reserved: [0; 62],
+            };
+            let mut val: core::ffi::c_int = 0;
+            hevc_444 = (api.get_encode_caps)(enc, nv::NV_ENC_CODEC_HEVC_GUID, &mut param, &mut val)
+                .nv_ok()
+                .is_ok()
+                && val != 0;
+        }
+        let _ = (api.destroy_encoder)(enc);
+        if !listed {
+            tracing::warn!(
+                "NVENC codec probe: driver listed no encode GUIDs — keeping the static advertisement"
+            );
+            return unknown;
+        }
+        ProbedSupport {
+            codecs: crate::CodecSupport {
+                h264: guids.contains(&nv::NV_ENC_CODEC_H264_GUID),
+                h265: guids.contains(&nv::NV_ENC_CODEC_HEVC_GUID),
+                av1: guids.contains(&nv::NV_ENC_CODEC_AV1_GUID),
+            },
+            hevc_444,
+        }
+    }
+}
+
 fn load_api() -> std::result::Result<EncodeApi, String> {
     // SAFETY: `Library::new` runs `libnvidia-encode.so.1`'s initializers — the trusted NVIDIA driver
     // library, so loading has no unexpected effects; `map_err` handles its absence (AMD/Intel/no
@@ -223,6 +364,8 @@ fn load_api() -> std::result::Result<EncodeApi, String> {
             reconfigure_encoder: list.nvEncReconfigureEncoder.ok_or(MISSING)?,
             destroy_encoder: list.nvEncDestroyEncoder.ok_or(MISSING)?,
             get_encode_caps: list.nvEncGetEncodeCaps.ok_or(MISSING)?,
+            get_encode_guid_count: list.nvEncGetEncodeGUIDCount.ok_or(MISSING)?,
+            get_encode_guids: list.nvEncGetEncodeGUIDs.ok_or(MISSING)?,
             get_encode_preset_config_ex: list.nvEncGetEncodePresetConfigEx.ok_or(MISSING)?,
             create_bitstream_buffer: list.nvEncCreateBitstreamBuffer.ok_or(MISSING)?,
             destroy_bitstream_buffer: list.nvEncDestroyBitstreamBuffer.ok_or(MISSING)?,
@@ -2284,6 +2427,46 @@ mod tests {
     /// and assert the next AU carries the recovery-anchor tag (the F2 fix) and that `caps()`
     /// advertises RFI. Needs an NVIDIA GPU + driver. Run:
     ///   cargo test -p punktfunk-host --features nvenc -- --ignored nvenc_cuda_smoke --nocapture
+    /// ON-HARDWARE: the codec/4:4:4 advertisement probe against the real driver. Asserts the two
+    /// invariants that matter for what the host advertises — every NVENC-capable GPU ever made can
+    /// encode H.264, so a probe that comes back with `h264 = false` while NVENC is otherwise
+    /// working means the enumeration itself is broken (and would silently narrow the host's
+    /// advertisement); and the answer must be stable across calls (asserted on the UNCACHED fn —
+    /// the cached [`probe_support`] would make it vacuous), since one cached answer drives every
+    /// negotiation. Prints the mask so a run on an OLD card (Maxwell GM107 = h264 only, no 4:4:4 —
+    /// the GPU this probe exists for) is self-documenting. Run:
+    ///   cargo test -p pf-encode --features nvenc -- --ignored nvenc_codec_probe --nocapture
+    #[test]
+    #[ignore = "requires an NVIDIA GPU + driver — run manually on an NVIDIA box"]
+    fn nvenc_codec_probe_reports_real_gpu_support() {
+        let probed = probe_support_uncached();
+        let caps = probed.codecs;
+        eprintln!(
+            "NVENC probe: h264={} h265={} av1={} hevc_444={}",
+            caps.h264, caps.h265, caps.av1, probed.hevc_444
+        );
+        assert!(
+            caps.h264,
+            "every NVENC generation encodes H.264 — a false here means the GUID enumeration \
+             failed, which would narrow the host's codec advertisement"
+        );
+        assert!(
+            !probed.hevc_444 || caps.h265,
+            "a 4:4:4-capable HEVC that is not in the GUID list is contradictory"
+        );
+        let again = probe_support_uncached();
+        assert_eq!(
+            (caps.h264, caps.h265, caps.av1, probed.hevc_444),
+            (
+                again.codecs.h264,
+                again.codecs.h265,
+                again.codecs.av1,
+                again.hevc_444
+            ),
+            "the probe must be stable — it is cached once and drives every later negotiation"
+        );
+    }
+
     #[test]
     #[ignore = "requires an NVIDIA GPU + driver — run manually on the RTX box (.21)"]
     fn nvenc_cuda_smoke_rfi_anchor() {

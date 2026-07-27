@@ -94,9 +94,20 @@ fn base_codec_mode_support() -> u32 {
             return m;
         }
     }
-    // Windows AMD/Intel (AMF/QSV): advertise only what the GPU actually encodes (AV1 is narrow, an
-    // old iGPU might lack HEVC). AMF probes natively (no build feature needed); QSV needs the
-    // libavcodec build. NVENC and the GPU-less software path keep the static superset.
+    // Linux NVIDIA: the driver's own encode-GUID list (`nvenc_codec_support`, one throwaway
+    // direct-SDK session, cached) — the same probe `host_wire_caps` consults, so both planes
+    // stop advertising HEVC/AV1 on a chip without them (the GM107 dead-session field bug).
+    // Fail-open like every arm here: an unanswerable probe → `probed_mask` = None → superset.
+    #[cfg(all(target_os = "linux", feature = "nvenc"))]
+    if !crate::encode::linux_zero_copy_is_vaapi() {
+        if let Some(m) = probed_mask(crate::encode::nvenc_codec_support()) {
+            return m;
+        }
+    }
+    // Windows: advertise only what the GPU actually encodes (AV1 is narrow, an old iGPU might
+    // lack HEVC, a 1st-gen-Maxwell NVENC is H.264-only). AMF probes natively (no build feature
+    // needed); QSV needs the libavcodec or VPL build, NVENC the `nvenc` build. The GPU-less
+    // software path keeps the static superset.
     #[cfg(target_os = "windows")]
     if crate::encode::windows_backend_is_probed() {
         if let Some(m) = probed_mask(crate::encode::windows_codec_support()) {

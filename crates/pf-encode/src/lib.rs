@@ -108,7 +108,21 @@ impl Codec {
                         return m & pref_ceiling;
                     }
                 }
-                // NVENC (static superset, like GameStream) — or an empty VAAPI probe (see above).
+                // NVENC: ask the DRIVER which codecs this chip's encoder exposes, the same way the
+                // VAAPI arm above does — a static superset advertised HEVC on a 1st-gen Maxwell
+                // (HEVC needs 2nd-gen Maxwell+, AV1 needs Ada+), and a client that believed it got
+                // ~15 s of blank video and a disconnect instead of a stream. Fails OPEN: a probe
+                // that can't answer (no direct-SDK build, no CUDA, an old driver) yields `None` and
+                // leaves the historical superset standing, so this can only ever narrow the
+                // advertisement to something the GPU really encodes.
+                #[cfg(feature = "nvenc")]
+                if backend == LinuxBackend::Nvenc {
+                    if let Some(m) = nvenc_codec_support().wire_mask() {
+                        return m & pref_ceiling;
+                    }
+                }
+                // NVENC without the probe (no `nvenc` feature / probe declined) — or an empty VAAPI
+                // probe (see above): the static superset, like GameStream.
                 GPU_SUPERSET & pref_ceiling
             }
             #[cfg(target_os = "windows")]
@@ -121,7 +135,8 @@ impl Codec {
                         return m;
                     }
                 }
-                // NVENC (static superset, like GameStream) — or an empty AMF/QSV probe (see above).
+                // An unprobed backend (NVENC without the `nvenc` feature) — or an empty probe
+                // (see above): the static superset, like GameStream.
                 GPU_SUPERSET
             }
             // The macOS dev/test host has no GPU encode backend — keep the pre-probe advertisement.
@@ -1263,9 +1278,31 @@ impl CodecSupport {
     }
 }
 
+/// Probe the active NVIDIA GPU for its encodable codecs (cached once per process). Asks the driver
+/// for this chip's encode-GUID list over the direct SDK — see [`nvenc_cuda::probe_support`] for
+/// why it is not shaped like the VAAPI probe below, and for the fail-open contract. Process-wide
+/// (not per selected GPU) on purpose: the direct backend opens on the shared `cuda::context()`,
+/// i.e. CUDA device 0, so that is the chip whose answer applies.
+#[cfg(all(target_os = "linux", feature = "nvenc"))]
+pub fn nvenc_codec_support() -> CodecSupport {
+    use std::sync::OnceLock;
+    static LOGGED: OnceLock<()> = OnceLock::new();
+    let probed = nvenc_cuda::probe_support();
+    LOGGED.get_or_init(|| {
+        tracing::info!(
+            h264 = probed.codecs.h264,
+            h265 = probed.codecs.h265,
+            av1 = probed.codecs.av1,
+            hevc_444 = probed.hevc_444,
+            "NVENC encode capabilities probed"
+        );
+    });
+    probed.codecs
+}
+
 /// Probe the active Linux GPU backend for its encodable codecs (cached; opens a tiny encoder per
-/// codec, once). Only the VAAPI (AMD/Intel) backend is probed — NVENC keeps its Moonlight-validated
-/// static advertisement (callers gate on [`linux_zero_copy_is_vaapi`]).
+/// codec, once). The AMD/Intel backend — NVIDIA has [`nvenc_codec_support`] (callers gate on
+/// [`linux_zero_copy_is_vaapi`]).
 #[cfg(target_os = "linux")]
 pub fn vaapi_codec_support() -> CodecSupport {
     use std::sync::OnceLock;
@@ -1320,7 +1357,29 @@ pub fn can_encode_444(codec: Codec) -> bool {
             if linux_zero_copy_is_vaapi() {
                 vaapi::probe_can_encode_444(codec)
             } else {
-                linux::probe_can_encode_444(codec)
+                // NVIDIA. On a direct-SDK host the answer comes from the driver's caps bit over
+                // the direct SDK ([`nvenc_cuda::probe_support`]) — the same
+                // `NV_ENC_CAPS_SUPPORT_YUV444_ENCODE` the live session re-checks at open
+                // (`query_caps` → `yuv444_supported`), and the same shape the Windows NVENC arm
+                // uses (`nvenc::probe_can_encode_444`). It must NOT fall back to the libav
+                // open-probe: one ffmpeg `hevc_nvenc` FREXT open in a direct-SDK process is the
+                // LOG-3 field bug — it wedged every later NVENC open process-wide
+                // (`NV_ENC_ERR_INVALID_VERSION`) until a host restart. Only a host that will
+                // really serve the session over libav (PUNKTFUNK_NVENC_DIRECT=0, or a build
+                // without `--features nvenc`) keeps the ffmpeg probe — there it validates the
+                // actual session path, and ffmpeg's NVENC client runs in that process anyway.
+                #[cfg(feature = "nvenc")]
+                {
+                    if nvenc_direct_enabled() {
+                        nvenc_cuda::probe_support().hevc_444
+                    } else {
+                        linux::probe_can_encode_444(codec)
+                    }
+                }
+                #[cfg(not(feature = "nvenc"))]
+                {
+                    linux::probe_can_encode_444(codec)
+                }
             }
         }
         #[cfg(target_os = "windows")]
@@ -1624,17 +1683,20 @@ pub fn resolved_backend_ingests_rgb_444() -> bool {
 }
 
 /// True if the active Windows backend's codec advertisement comes from a **real GPU probe**
-/// ([`windows_codec_support`]) rather than the NVENC static superset. AMF always qualifies — the
+/// ([`windows_codec_support`]) rather than the static superset. AMF always qualifies — the
 /// native factory probe (`amf::probe_can_encode`) needs no build feature — while QSV qualifies
 /// with either the native VPL build (`qsv`, the authoritative Query probe) or the `amf-qsv`
-/// (libavcodec) build. Formerly `windows_backend_is_ffmpeg`, renamed when the
-/// native AMF probe replaced the ffmpeg open-probe (design/native-amf-encoder.md §4, Phase 2).
+/// (libavcodec) build, and NVENC with the `nvenc` build (the direct-SDK GUID-list probe,
+/// `nvenc::probe_codec_support` — the Windows twin of the Linux probe that ended the
+/// advertise-HEVC-on-a-GM107 dead sessions). Formerly `windows_backend_is_ffmpeg`, renamed when
+/// the native AMF probe replaced the ffmpeg open-probe (design/native-amf-encoder.md §4, Phase 2).
 #[cfg(target_os = "windows")]
 pub fn windows_backend_is_probed() -> bool {
     match windows_resolved_backend() {
         WindowsBackend::Amf => true,
         WindowsBackend::Qsv => cfg!(feature = "qsv") || cfg!(feature = "amf-qsv"),
-        WindowsBackend::Nvenc | WindowsBackend::Software => false,
+        WindowsBackend::Nvenc => cfg!(feature = "nvenc"),
+        WindowsBackend::Software => false,
     }
 }
 
@@ -1661,18 +1723,22 @@ fn windows_gpu_vendor() -> Option<GpuVendor> {
         .or_else(|| pf_gpu::enumerate().iter().find_map(|g| by_id(g.vendor_id)))
 }
 
-/// Probe the active Windows AMF/QSV backend for its encodable codecs (cached **per (backend,
+/// Probe the active Windows GPU backend for its encodable codecs (cached **per (backend,
 /// selected GPU)** — a web-console preference change re-probes on the newly selected adapter
 /// instead of serving the old GPU's answer for the process lifetime). Mirrors
-/// [`vaapi_codec_support`]; called only when [`windows_backend_is_probed`] is true. AV1 is narrow
-/// (AMD RDNA3+, Intel Arc/Xe2+), so it must be probed, not assumed.
+/// [`vaapi_codec_support`]/[`nvenc_codec_support`]; called only when [`windows_backend_is_probed`]
+/// is true. AV1 is narrow (NVIDIA Ada+, AMD RDNA3+, Intel Arc/Xe2+) and HEVC needs 2nd-gen
+/// Maxwell+ on NVIDIA, so both must be probed, not assumed.
 ///
 /// Mirrors the session dispatch (design/native-amf-encoder.md Phase 3): **AMD advertises from the
 /// native AMF factory probe alone** (`amf::probe_can_encode`, on the selected adapter — the same
 /// path the session opens, so the advertisement can never claim a codec the session can't emit);
 /// **Intel/QSV advertises from the native VPL Query probe** (`qsv::probe_can_encode`,
 /// design/native-qsv-encoder.md §4), falling back to the libavcodec probe on builds without the
-/// `qsv` feature (all-`false` without either feature, matching a build that cannot open QSV).
+/// `qsv` feature (all-`false` without either feature, matching a build that cannot open QSV);
+/// **NVIDIA advertises from the driver's own encode-GUID list** (`nvenc::probe_codec_support`,
+/// one throwaway direct-SDK session on the selected adapter — NEVER an ffmpeg open-probe, see the
+/// Linux `nvenc_cuda::probe_support` doc for why).
 #[cfg(target_os = "windows")]
 pub fn windows_codec_support() -> CodecSupport {
     use std::collections::HashMap;
@@ -1706,22 +1772,31 @@ pub fn windows_codec_support() -> CodecSupport {
                     false
                 }
             }
-            // Callers gate on `windows_backend_is_probed` — defensively answer "nothing probed"
-            // (the advertisement then falls back to the static superset).
+            // NVENC answers below from ONE GUID-list session, not per-codec probes; Software is
+            // never probed. Callers gate on `windows_backend_is_probed` — defensively answer
+            // "nothing probed" (the advertisement then falls back to the static superset).
             WindowsBackend::Nvenc | WindowsBackend::Software => false,
         }
     };
-    let caps = CodecSupport {
-        h264: probe_one(Codec::H264),
-        h265: probe_one(Codec::H265),
-        av1: probe_one(Codec::Av1),
+    let caps = match backend {
+        // NVIDIA: one throwaway session lists every encode GUID at once — no reason to open
+        // three sessions through `probe_one`. Featureless builds fall through to `probe_one`'s
+        // defensive all-false (= "nothing probed" → static superset), matching
+        // `windows_backend_is_probed`.
+        #[cfg(feature = "nvenc")]
+        WindowsBackend::Nvenc => nvenc::probe_codec_support(),
+        _ => CodecSupport {
+            h264: probe_one(Codec::H264),
+            h265: probe_one(Codec::H265),
+            av1: probe_one(Codec::Av1),
+        },
     };
     tracing::info!(
         ?backend,
         h264 = caps.h264,
         h265 = caps.h265,
         av1 = caps.av1,
-        "Windows AMF/QSV encode capabilities probed"
+        "Windows encode capabilities probed"
     );
     // A concurrent first call may double-probe; both arrive at the same answer, last insert wins.
     cache.lock().unwrap().insert(key, caps);

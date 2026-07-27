@@ -89,6 +89,12 @@ struct EncodeApi {
         *mut nv::NV_ENC_CAPS_PARAM,
         *mut core::ffi::c_int,
     ) -> nv::NVENCSTATUS,
+    // The two entry points behind [`probe_codec_support`] — the driver's own list of encode GUIDs
+    // this chip exposes. Mandatory like every other entry: both have existed since NVENC 1.0, so a
+    // driver missing them is broken in ways the rest of this table would not survive either.
+    get_encode_guid_count: unsafe extern "C" fn(*mut c_void, *mut u32) -> nv::NVENCSTATUS,
+    get_encode_guids:
+        unsafe extern "C" fn(*mut c_void, *mut nv::GUID, u32, *mut u32) -> nv::NVENCSTATUS,
     get_encode_preset_config_ex: unsafe extern "C" fn(
         *mut c_void,
         nv::GUID,
@@ -203,6 +209,8 @@ fn load_api() -> std::result::Result<EncodeApi, String> {
             reconfigure_encoder: list.nvEncReconfigureEncoder.ok_or(MISSING)?,
             destroy_encoder: list.nvEncDestroyEncoder.ok_or(MISSING)?,
             get_encode_caps: list.nvEncGetEncodeCaps.ok_or(MISSING)?,
+            get_encode_guid_count: list.nvEncGetEncodeGUIDCount.ok_or(MISSING)?,
+            get_encode_guids: list.nvEncGetEncodeGUIDs.ok_or(MISSING)?,
             get_encode_preset_config_ex: list.nvEncGetEncodePresetConfigEx.ok_or(MISSING)?,
             create_bitstream_buffer: list.nvEncCreateBitstreamBuffer.ok_or(MISSING)?,
             destroy_bitstream_buffer: list.nvEncDestroyBitstreamBuffer.ok_or(MISSING)?,
@@ -1965,11 +1973,85 @@ pub fn probe_can_encode_10bit(codec: Codec) -> bool {
     probe_encode_cap(codec, nv::NV_ENC_CAPS::NV_ENC_CAPS_SUPPORT_10BIT_ENCODE)
 }
 
-/// Query ONE NVENC capability for `codec`: creates a throwaway hardware D3D11 device + NVENC
-/// session on the **selected render adapter**, reads the cap, and tears everything down. `false`
-/// on any failure (no loadable NVENC, no device, failed open) — the honest answer for a
+/// Query ONE NVENC capability for `codec` on a throwaway session (see [`with_probe_session`]).
+/// `false` on any failure (no loadable NVENC, no device, failed open) — the honest answer for a
 /// capability that couldn't be confirmed.
 fn probe_encode_cap(codec: Codec, cap: nv::NV_ENC_CAPS) -> bool {
+    with_probe_session(|enc| {
+        let mut param = nv::NV_ENC_CAPS_PARAM {
+            version: nv::NV_ENC_CAPS_PARAM_VER,
+            capsToQuery: cap,
+            reserved: [0; 62],
+        };
+        let mut val: i32 = 0;
+        // SAFETY: `get_encode_caps` reads one scalar cap into `val` (live locals) for the live
+        // session `enc` via the loaded API table (`with_probe_session` sits past `try_api`).
+        unsafe {
+            (api().get_encode_caps)(enc, codec_guid(codec), &mut param, &mut val)
+                .nv_ok()
+                .is_ok()
+                && val != 0
+        }
+    })
+    .unwrap_or(false)
+}
+
+/// Which codecs **this GPU's** NVENC can actually encode, asked of the driver itself
+/// (`nvEncGetEncodeGUIDs`) on a throwaway session — the Windows twin of the Linux
+/// `nvenc_cuda::probe_support` codec half, probing the **selected render adapter** (the GPU the
+/// session will really encode on) rather than CUDA device 0. Same field bug on both OSes: the
+/// static `H.264 | HEVC | AV1` superset advertised HEVC on a 1st-gen Maxwell, and a client that
+/// negotiated it got a dead session instead of a stream.
+///
+/// Every failure path returns "nothing probed", which [`crate::CodecSupport::wire_mask`] turns
+/// into `None` so the caller keeps the old static superset — a broken probe must never be able to
+/// narrow an NVIDIA host's advertisement to nothing. Cached per selected GPU by the caller
+/// ([`crate::windows_codec_support`]).
+pub(crate) fn probe_codec_support() -> crate::CodecSupport {
+    let unknown = crate::CodecSupport {
+        h264: false,
+        h265: false,
+        av1: false,
+    };
+    with_probe_session(|enc| {
+        // SAFETY: all NVENC calls go through the loaded API table against the live session `enc`;
+        // `count`/`written` are live locals, and `guids` is sized to the count the driver just
+        // reported, its pointer valid for that many `GUID`s (matching `guidArraySize`).
+        unsafe {
+            let mut count = 0u32;
+            let counted = (api().get_encode_guid_count)(enc, &mut count)
+                .nv_ok()
+                .is_ok();
+            let mut guids = vec![nv::GUID::default(); count as usize];
+            let mut written = 0u32;
+            let listed = counted
+                && count > 0
+                && (api().get_encode_guids)(enc, guids.as_mut_ptr(), count, &mut written)
+                    .nv_ok()
+                    .is_ok();
+            if !listed {
+                tracing::warn!(
+                    "NVENC codec probe: driver listed no encode GUIDs — keeping the static \
+                     advertisement"
+                );
+                return unknown;
+            }
+            guids.truncate(written as usize);
+            crate::CodecSupport {
+                h264: guids.contains(&codec_guid(Codec::H264)),
+                h265: guids.contains(&codec_guid(Codec::H265)),
+                av1: guids.contains(&codec_guid(Codec::Av1)),
+            }
+        }
+    })
+    .unwrap_or(unknown)
+}
+
+/// Open a throwaway NVENC session on a fresh hardware D3D11 device, hand it to `f`, and tear
+/// everything down. `None` = no loadable NVENC / no device / failed open — the caller supplies
+/// the honest "couldn't confirm" answer. Shared by [`probe_encode_cap`] and
+/// [`probe_codec_support`], so every advertisement probe opens sessions exactly one way.
+fn with_probe_session<T>(f: impl FnOnce(*mut c_void) -> T) -> Option<T> {
     // Same exclusion as `init_session`: this opens a real (throwaway) session, so it must never
     // overlap a zombie reap that could be destroying the very address the driver hands us.
     let _gate = DRIVER_SESSION_GATE
@@ -1983,20 +2065,20 @@ fn probe_encode_cap(codec: Codec, cap: nv::NV_ENC_CAPS) -> bool {
         D3D11CreateDevice, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION,
     };
     use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory4};
-    // No loadable NVENC on this box (non-NVIDIA / no driver) → the honest 4:4:4 answer is "no".
-    // This is also the `api()` gate for every NVENC call below.
+    // No loadable NVENC on this box (non-NVIDIA / no driver) → nothing to confirm.
+    // This is also the `api()` gate for every NVENC call below and inside `f`.
     if try_api().is_err() {
-        return false;
+        return None;
     }
     // SAFETY: a self-contained probe owning every handle it creates. `CreateDXGIFactory1`/
     // `EnumAdapterByLuid` return owned COM objects or err (→ default-adapter fallback).
     // `D3D11CreateDevice` (explicit adapter + UNKNOWN driver type, or NULL adapter + HARDWARE)
-    // fills `device` or returns Err (→ false). `open_encode_session_ex` opens an NVENC session
-    // against that device's raw pointer (valid while `device` is held) or errors (→ false, after
+    // fills `device` or returns Err (→ None). `open_encode_session_ex` opens an NVENC session
+    // against that device's raw pointer (valid while `device` is held) or errors (→ None, after
     // destroying any residue session the failed open left — the docs require it).
-    // `get_encode_caps` reads one scalar cap into `val` via the loaded API table.
-    // `destroy_encoder` frees the session exactly once; `device`/its context drop with the COM
-    // wrappers. No handle escapes this call and nothing runs concurrently.
+    // `destroy_encoder` frees the session exactly once, after `f` returns (so `enc` is live for
+    // the whole closure call); `device`/its context drop with the COM wrappers. No handle
+    // escapes this call and nothing runs concurrently (the gate above).
     unsafe {
         // Probe on the SELECTED render adapter — the GPU the session will actually encode on
         // (web-console preference / PUNKTFUNK_RENDER_ADAPTER / max VRAM). The OS default adapter
@@ -2032,9 +2114,9 @@ fn probe_encode_cap(codec: Codec, cap: nv::NV_ENC_CAPS) -> bool {
             ),
         };
         if created.is_err() {
-            return false;
+            return None;
         }
-        let Some(device) = device else { return false };
+        let device = device?;
         let mut params = nv::NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS {
             version: nv::NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER,
             deviceType: nv::NV_ENC_DEVICE_TYPE::NV_ENC_DEVICE_TYPE_DIRECTX,
@@ -2051,23 +2133,14 @@ fn probe_encode_cap(codec: Codec, cap: nv::NV_ENC_CAPS) -> bool {
             if !enc.is_null() {
                 let _ = (api().destroy_encoder)(enc);
             }
-            return false;
+            return None;
         }
         // Availability probe, but a real session open all the same: it proves the driver accepted
         // this build's version word, which is what rules a skew out later (see `nvenc_status`).
         nvenc_status::note_session_opened();
-        let mut param = nv::NV_ENC_CAPS_PARAM {
-            version: nv::NV_ENC_CAPS_PARAM_VER,
-            capsToQuery: cap,
-            reserved: [0; 62],
-        };
-        let mut val: i32 = 0;
-        let ok = (api().get_encode_caps)(enc, codec_guid(codec), &mut param, &mut val)
-            .nv_ok()
-            .is_ok()
-            && val != 0;
+        let out = f(enc);
         let _ = (api().destroy_encoder)(enc);
-        ok
+        Some(out)
     }
 }
 
@@ -2354,6 +2427,38 @@ mod tests {
         encode_pattern(
             ChromaFormat::Yuv420,
             "C:\\Users\\Public\\nvenc420_probe.h265",
+        );
+    }
+
+    /// ON-HARDWARE: the codec-advertisement probe against the real driver — the Windows twin of
+    /// the Linux `nvenc_codec_probe_reports_real_gpu_support` test, same invariants: every
+    /// NVENC-capable GPU ever made encodes H.264 (a `false` means the enumeration is broken and
+    /// would silently narrow the advertisement), and the answer must be stable across calls since
+    /// one cached answer drives every negotiation. Prints the mask so a run on an OLD card
+    /// (Maxwell GM107 = h264 only, the GPU this probe exists for) is self-documenting. Run:
+    ///   cargo test -p pf-encode --features nvenc --release -- --ignored nvenc_codec_probe --nocapture
+    /// (`--release` is REQUIRED on Windows, and pre-dates this test: the debug lib-test link
+    /// fails LNK2019 because the sdk crate's unused lazy loader references the NvEncodeAPI
+    /// imports that runtime loading deliberately avoids — debug `/OPT:NOREF` keeps the dead
+    /// COMDAT, release strips it. Windows CI gates pf-encode with clippy for the same reason.)
+    #[test]
+    #[ignore = "requires an NVIDIA GPU + driver — run manually on the RTX box (.173)"]
+    fn nvenc_codec_probe_reports_real_gpu_support() {
+        let caps = probe_codec_support();
+        eprintln!(
+            "NVENC (Windows) probe: h264={} h265={} av1={}",
+            caps.h264, caps.h265, caps.av1
+        );
+        assert!(
+            caps.h264,
+            "every NVENC generation encodes H.264 — a false here means the GUID enumeration \
+             failed, which would narrow the host's codec advertisement"
+        );
+        let again = probe_codec_support();
+        assert_eq!(
+            (caps.h264, caps.h265, caps.av1),
+            (again.h264, again.h265, again.av1),
+            "the probe must be stable — it is cached once and drives every later negotiation"
         );
     }
 }

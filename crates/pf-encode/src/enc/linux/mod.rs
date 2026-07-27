@@ -984,6 +984,12 @@ impl Drop for QuietLibavLog {
 /// takes for a live 4:4:4 stream — and reports whether it succeeded. HEVC-only; the result is cached
 /// by the caller ([`crate::can_encode_444`]). A GPU/driver/ffmpeg without RExt 4:4:4 fails
 /// the open here, so the host resolves the session to 4:2:0 before the Welcome (honest downgrade).
+///
+/// ⚠️ Only consulted when libav will really serve the session (`PUNKTFUNK_NVENC_DIRECT=0`, or a
+/// build without `--features nvenc`). A direct-SDK host answers from the driver's caps bit instead
+/// (`nvenc_cuda::probe_support`) — running THIS probe there mixes ffmpeg's NVENC client into a
+/// direct-SDK process, which is the LOG-3 field bug: one successful `hevc_nvenc` FREXT open+close
+/// wedged every later NVENC open process-wide (`NV_ENC_ERR_INVALID_VERSION`) until a host restart.
 pub fn probe_can_encode_444(codec: Codec) -> bool {
     if codec != Codec::H265 {
         return false;
