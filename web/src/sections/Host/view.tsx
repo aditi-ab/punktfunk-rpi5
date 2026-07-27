@@ -94,33 +94,41 @@ export const HostView: FC<{
 							error={compositors.error}
 							refetch={compositors.refetch}
 						>
-							<ul className="divide-y rounded-md border">
-								{compositors.data?.map((c) => (
-									<li
-										key={c.id}
-										className="flex items-center justify-between gap-4 px-4 py-3"
-									>
-										<div className="min-w-0">
-											<div className="flex items-center gap-2">
-												<span className="font-medium">{c.label}</span>
-												{c.default && (
-													<Badge variant="secondary">
-														{m.compositor_default()}
-													</Badge>
-												)}
+							{/* Empty is a real answer, not a load failure: a Windows host drives the
+						    pf-vdisplay driver and has no compositor backends at all. */}
+							{compositors.data?.length === 0 ? (
+								<p className="rounded-md border p-4 text-sm text-muted-foreground">
+									{m.compositor_none()}
+								</p>
+							) : (
+								<ul className="divide-y rounded-md border">
+									{compositors.data?.map((c) => (
+										<li
+											key={c.id}
+											className="flex items-center justify-between gap-4 px-4 py-3"
+										>
+											<div className="min-w-0">
+												<div className="flex items-center gap-2">
+													<span className="font-medium">{c.label}</span>
+													{c.default && (
+														<Badge variant="secondary">
+															{m.compositor_default()}
+														</Badge>
+													)}
+												</div>
+												<code className="text-xs text-muted-foreground">
+													{c.id}
+												</code>
 											</div>
-											<code className="text-xs text-muted-foreground">
-												{c.id}
-											</code>
-										</div>
-										<Badge variant={c.available ? "default" : "outline"}>
-											{c.available
-												? m.compositor_available()
-												: m.compositor_unavailable()}
-										</Badge>
-									</li>
-								))}
-							</ul>
+											<Badge variant={c.available ? "default" : "outline"}>
+												{c.available
+													? m.compositor_available()
+													: m.compositor_unavailable()}
+											</Badge>
+										</li>
+									))}
+								</ul>
+							)}
 						</QueryState>
 					</CardContent>
 				</Card>

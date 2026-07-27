@@ -105,8 +105,17 @@ impl MutterDisplay {
 }
 
 /// Mutter is usable when the host runs inside a GNOME session (its `RecordVirtual` D-Bus API
-/// drives the *live* compositor). Cheap signal: `XDG_CURRENT_DESKTOP` names GNOME — same basis
-/// as [`super::detect`], avoiding a blocking D-Bus round-trip on the enumeration path.
+/// drives the *live* compositor). Cheap env signal, avoiding a blocking D-Bus round-trip on the
+/// enumeration path.
+///
+/// This is the *fallback* answer only: [`crate::available`] treats a running `gnome-shell` (the
+/// `/proc` scan) as the authority, because this var belongs to the session and a host launched
+/// outside it — `systemd --user`, a TTY, ssh — never inherited it. Deliberately still just the ONE
+/// var: `XDG_CURRENT_DESKTOP` is the one [`crate::apply_session_env`] owns end to end (it writes it
+/// per connect and *scrubs* it when nothing is live), so sniffing `DESKTOP_SESSION` /
+/// `XDG_SESSION_DESKTOP` alongside would resurrect the bug that scrub exists to prevent — a stale
+/// `gnome` there after a gnome-shell crash reports Mutter usable and routes the next client into a
+/// dead session (45 s create timeouts instead of a crisp handshake error).
 pub fn is_available() -> bool {
     std::env::var("XDG_CURRENT_DESKTOP")
         .map(|d| d.to_ascii_uppercase().contains("GNOME"))

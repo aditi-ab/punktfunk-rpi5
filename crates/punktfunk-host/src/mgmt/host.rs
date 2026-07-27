@@ -319,9 +319,19 @@ pub(crate) struct AvailableCompositor {
     )
 )]
 pub(crate) async fn list_compositors() -> Json<Vec<AvailableCompositor>> {
-    let available = crate::vdisplay::available();
-    let default = crate::vdisplay::detect().ok();
-    Json(
+    // Compositor backends are a Linux concept. On Windows the pf-vdisplay IddCx driver is the sole
+    // virtual-display backend and `vdisplay::open` ignores the compositor argument entirely, so the
+    // list could only ever be five Linux backends flagged unavailable with no default — which reads
+    // as broken detection rather than "not applicable here". Report none and let the console say so.
+    #[cfg(not(target_os = "linux"))]
+    let list = Vec::new();
+    #[cfg(target_os = "linux")]
+    // One `/proc` scan backs BOTH columns (see `vdisplay::available`), so a backend can no longer
+    // be the auto-detect default and "unavailable" on the same row — the contradiction that made
+    // this list look broken on a box plainly running the compositor it called unavailable.
+    let list = {
+        let available = crate::vdisplay::available();
+        let default = crate::vdisplay::detect().ok();
         crate::vdisplay::Compositor::all()
             .into_iter()
             .map(|c| AvailableCompositor {
@@ -330,8 +340,9 @@ pub(crate) async fn list_compositors() -> Json<Vec<AvailableCompositor>> {
                 available: available.contains(&c),
                 default: default == Some(c),
             })
-            .collect(),
-    )
+            .collect()
+    };
+    Json(list)
 }
 
 /// Live host status

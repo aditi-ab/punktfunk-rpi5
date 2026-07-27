@@ -46,6 +46,7 @@
   "compositor_available": "Verfügbar",
   "compositor_unavailable": "Nicht verfügbar",
   "compositor_default": "Standard",
+  "compositor_none": "Dieser Host hat keine Compositor-Backends – die gibt es nur unter Linux. Virtuelle Displays laufen hier über den mitgelieferten pf-vdisplay-Treiber.",
   "host_gpus": "GPUs",
   "host_gpus_help": "Die GPU, auf der der Host aufnimmt und encodiert. Automatisch wählt die beste GPU; eine bevorzugte GPU bindet Aufnahme + Encoding an sie. Eine Änderung gilt ab der nächsten Sitzung.",
   "gpu_automatic": "Automatisch",

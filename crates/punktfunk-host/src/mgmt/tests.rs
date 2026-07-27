@@ -652,9 +652,16 @@ async fn compositors_lists_all_backends_with_flags() {
     let (status, body) = send(&app, get_req("/api/v1/compositors")).await;
     assert_eq!(status, StatusCode::OK);
     let arr = body.as_array().expect("array");
+    // Compositor backends are Linux-only; elsewhere the list is empty on purpose (the console
+    // renders "not applicable on this host" instead of five greyed-out rows).
+    #[cfg(not(target_os = "linux"))]
+    assert!(arr.is_empty(), "non-Linux hosts advertise no compositors");
     // Every backend the host knows, in stable order.
-    let ids: Vec<&str> = arr.iter().map(|c| c["id"].as_str().unwrap()).collect();
-    assert_eq!(ids, ["kwin", "gamescope", "mutter", "wlroots", "hyprland"]);
+    #[cfg(target_os = "linux")]
+    {
+        let ids: Vec<&str> = arr.iter().map(|c| c["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, ["kwin", "gamescope", "mutter", "wlroots", "hyprland"]);
+    }
     for c in arr {
         assert!(c["available"].is_boolean());
         assert!(c["default"].is_boolean());

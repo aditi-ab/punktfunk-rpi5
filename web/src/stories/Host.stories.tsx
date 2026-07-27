@@ -16,6 +16,11 @@ type Story = StoryObj<typeof meta>;
 
 export const Default: Story = {};
 
+/** A non-Linux host: compositor backends don't exist there, so the list is empty by design. */
+export const NoCompositors: Story = {
+	args: { compositors: { data: [], isLoading: false, error: null } },
+};
+
 export const Loading: Story = {
 	args: {
 		host: { data: undefined, isLoading: true, error: null },

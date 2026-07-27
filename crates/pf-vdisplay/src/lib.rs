@@ -171,34 +171,69 @@ impl Compositor {
 
 /// The compositor backends usable on this host *right now*: gamescope wherever its binary is
 /// installed (it spawns a nested session — independent of the running desktop), plus the live
-/// session's own compositor (KWin / Mutter / wlroots) when the host runs inside it. Cheap,
-/// side-effect-free probes — safe to call per management request. A concrete client preference
-/// is validated against this set before it's honored (see the punktfunk/1 handshake's resolution).
+/// session's own compositor (KWin / Mutter / wlroots / Hyprland) when the host runs inside it.
+/// Cheap, side-effect-free probes — safe to call per management request. A concrete client
+/// preference is validated against this set before it's honored (see the punktfunk/1 handshake's
+/// resolution).
+///
+/// The **live session is the primary signal**, ahead of each backend's own probe. Those probes read
+/// the process env (`XDG_CURRENT_DESKTOP` for Mutter, `WAYLAND_DISPLAY` for KWin's registry
+/// handshake, `SWAYSOCK` for sway) — env a host started *outside* the session (a `systemd --user`
+/// unit, a TTY, ssh) never inherited. It is only retargeted at the live session on the connect path
+/// ([`apply_session_env`]), so enumerating before the first client connect reported "unavailable"
+/// for the very desktop the operator was sitting in — while [`detect`], which scans `/proc`, marked
+/// that same backend the default. The management API showed both badges on one row, and the answer
+/// flipped depending on whether anyone had connected yet. Basing both on the same `/proc` scan makes
+/// the two agree, and makes the answer independent of how the host was launched.
 pub fn available() -> Vec<Compositor> {
     #[cfg(target_os = "linux")]
     {
-        let mut v = Vec::new();
-        if kwin::is_available() {
-            v.push(Compositor::Kwin);
-        }
-        if gamescope::is_available() {
-            v.push(Compositor::Gamescope);
-        }
-        if mutter::is_available() {
-            v.push(Compositor::Mutter);
-        }
-        if wlroots::is_available() {
-            v.push(Compositor::Wlroots);
-        }
-        if hyprland::is_available() {
-            v.push(Compositor::Hyprland);
-        }
-        v
+        let live = compositor_for_kind(detect_active_session().kind);
+        // An explicit operator pin counts too: it's what `detect` returns as the default and what
+        // the host will actually drive, so listing it "unavailable" was the same contradiction.
+        let pinned = pf_host_config::config()
+            .compositor
+            .as_deref()
+            .and_then(compositor_from_pin);
+        Compositor::all()
+            .into_iter()
+            .filter(|&c| {
+                // Running (or pinned) ⇒ usable, without consulting the env-reading probe. KWin is
+                // the one backend whose probe checks a real capability beyond "is it up" (the
+                // privileged `zkde_screencast` grant); a live-but-ungranted KWin now surfaces as
+                // available and fails at create with that probe's precise message, which beats
+                // "no usable compositor" on a box that is visibly running KDE.
+                live == Some(c)
+                    || pinned == Some(c)
+                    || match c {
+                        Compositor::Kwin => kwin::is_available(),
+                        Compositor::Gamescope => gamescope::is_available(),
+                        Compositor::Mutter => mutter::is_available(),
+                        Compositor::Wlroots => wlroots::is_available(),
+                        Compositor::Hyprland => hyprland::is_available(),
+                    }
+            })
+            .collect()
     }
     #[cfg(not(target_os = "linux"))]
     {
         Vec::new()
     }
+}
+
+/// The backend an explicit `PUNKTFUNK_COMPOSITOR` value names (aliases included), or `None` for an
+/// unrecognized value. Shared by [`detect`] (which turns `None` into an error naming the accepted
+/// values) and [`available`] (which just ignores a typo'd pin).
+fn compositor_from_pin(v: &str) -> Option<Compositor> {
+    Some(match v.trim().to_ascii_lowercase().as_str() {
+        "kwin" | "kde" | "plasma" => Compositor::Kwin,
+        // `hyprland` names the distinct backend (D1); `wlroots`/`sway`/`wlr` stay wlroots-proper.
+        "hyprland" | "hypr" => Compositor::Hyprland,
+        "wlroots" | "sway" | "wlr" | "river" => Compositor::Wlroots,
+        "mutter" | "gnome" => Compositor::Mutter,
+        "gamescope" => Compositor::Gamescope,
+        _ => return None,
+    })
 }
 
 /// Serializes ALL process-global env mutation on the per-session setup path. `std::env::set_var`
@@ -223,19 +258,11 @@ pub fn with_env_lock<R>(f: impl FnOnce() -> R) -> R {
 /// follows Gaming↔Desktop switches), else a last-resort `XDG_CURRENT_DESKTOP` read.
 pub fn detect() -> Result<Compositor> {
     if let Some(v) = pf_host_config::config().compositor.as_deref() {
-        return match v.trim().to_ascii_lowercase().as_str() {
-            "kwin" | "kde" | "plasma" => Ok(Compositor::Kwin),
-            // `hyprland` names the distinct backend (D1); `wlroots`/`sway`/`wlr` stay wlroots-proper.
-            "hyprland" | "hypr" => Ok(Compositor::Hyprland),
-            "wlroots" | "sway" | "wlr" | "river" => Ok(Compositor::Wlroots),
-            "mutter" | "gnome" => Ok(Compositor::Mutter),
-            "gamescope" => Ok(Compositor::Gamescope),
-            other => {
-                anyhow::bail!(
-                    "unknown PUNKTFUNK_COMPOSITOR '{other}' (kwin|wlroots|hyprland|mutter|gamescope)"
-                )
-            }
-        };
+        return compositor_from_pin(v).ok_or_else(|| {
+            anyhow::anyhow!(
+                "unknown PUNKTFUNK_COMPOSITOR '{v}' (kwin|wlroots|hyprland|mutter|gamescope)"
+            )
+        });
     }
     #[cfg(target_os = "linux")]
     if let Some(c) = compositor_for_kind(detect_active_session().kind) {

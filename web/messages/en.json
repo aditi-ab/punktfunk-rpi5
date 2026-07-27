@@ -46,6 +46,7 @@
   "compositor_available": "Available",
   "compositor_unavailable": "Unavailable",
   "compositor_default": "Default",
+  "compositor_none": "This host has no compositor backends — they are a Linux concept. Virtual displays here run on the bundled pf-vdisplay driver.",
   "host_gpus": "GPUs",
   "host_gpus_help": "The GPU the host captures and encodes on. Automatic picks the best GPU; preferring one pins capture + encode to it. A change applies to the next session.",
   "gpu_automatic": "Automatic",
