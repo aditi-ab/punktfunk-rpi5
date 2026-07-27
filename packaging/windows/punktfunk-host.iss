@@ -160,8 +160,20 @@ Name: "installhdrlayer"; Description: "Install the HDR Vulkan layer (lets Vulkan
 #endif
 ; Host-config choice, applied via `service install --gamestream=on|off` (writes PUNKTFUNK_HOST_CMD
 ; in host.env; a hand-customized value is left alone). Checked = the Moonlight-compatible unified
-; host (the common Windows setup); unchecked = the secure native-only host (Punktfunk clients only).
-Name: "gamestream"; Description: "Enable GameStream (Moonlight) compatibility - lets stock Moonlight clients connect (uses legacy plain-HTTP pairing; for trusted LANs)"
+; host; unchecked (DEFAULT) = the secure native-only host (Punktfunk clients only).
+;
+; OPT-IN, like allowpublicfw below and for the same reason: the host itself WARNs on every start
+; that this plane pairs over plain HTTP and its legacy control encryption can reuse GCM nonces
+; (security-review #5/#9), so an on-path LAN attacker could MITM pairing or recover input. A
+; default-on security downgrade cannot be squared with that warning - least of all on the silent
+; path, where the wizard never appears and 1839d756 makes an unattended install take these very
+; defaults. Reported by a user who found the warning in their log and had never been shown a
+; choice, because they installed through winget.
+;
+; Turning it on unattended is `/MERGETASKS="gamestream"`; on an UPGRADE this task is inert either
+; way (GamestreamParam omits the flag unless FreshHostInstall), so an existing host keeps whatever
+; host.env already says - changing it afterwards is `service install --gamestream=on|off`.
+Name: "gamestream"; Description: "Enable GameStream (Moonlight) compatibility - lets stock Moonlight clients connect (uses legacy plain-HTTP pairing; for trusted LANs)"; Flags: unchecked
 ; Firewall scope, forwarded as `--allow-public-network` to `service install` / `web setup`. Unchecked
 ; (default) = accept connections on Private + Domain networks only (the trusted-network profiles
 ; punktfunk is meant for). Check ONLY for a network you trust that Windows classifies as Public (e.g.

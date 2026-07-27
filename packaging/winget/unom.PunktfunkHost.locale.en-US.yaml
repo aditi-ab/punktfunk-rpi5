@@ -46,13 +46,14 @@ Agreements:
       redistributed under VB-Audio's bundling grant; the full notice is installed to
       %ProgramFiles%\punktfunk\licenses\VB-CABLE-NOTICE.txt.
     AgreementUrl: https://vb-audio.com/Cable/
-  - AgreementLabel: GameStream (Moonlight) compatibility is enabled by default
+  - AgreementLabel: GameStream (Moonlight) compatibility is OFF by default
     Agreement: >-
-      The default install enables GameStream so stock Moonlight clients can connect. GameStream uses
-      legacy plain-HTTP pairing and is intended for trusted LANs only. To install without it, use
-      --override "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP- /MERGETASKS=!gamestream", or run
-      --interactive and clear the GameStream checkbox. It can also be changed later via
-      PUNKTFUNK_HOST_CMD in %ProgramData%\punktfunk\host.env.
+      Punktfunk's own clients work out of the box. Support for stock Moonlight clients is a separate,
+      opt-in plane, because it pairs over legacy plain HTTP and is intended for trusted LANs only. To
+      install WITH it, use --override "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-
+      /MERGETASKS=gamestream", or run --interactive and tick the GameStream checkbox. It can also be
+      turned on later with `punktfunk-host service install --gamestream=on` (or via
+      PUNKTFUNK_HOST_CMD in %ProgramData%\punktfunk\host.env), followed by a service restart.
     AgreementUrl: https://docs.punktfunk.unom.io/docs/windows-host
 
 # Displayed after the install completes. The console password is generated per install, so it can

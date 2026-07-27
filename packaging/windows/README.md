@@ -60,10 +60,14 @@ parse breakage that silently failed installs on non-English boxes.
   **`PunktfunkWeb`** scheduled task (boot, SYSTEM, restart-on-failure → `web-run.cmd` → `bun` on
   `:47992`), opens TCP 47992, and starts it. It proxies the host's loopback mgmt API with the host's
   own `%ProgramData%\punktfunk\mgmt-token`.
-- **GameStream (Moonlight) compatibility is a wizard task** (checked by default): the choice is passed
-  to `service install --gamestream=on|off`, which writes `PUNKTFUNK_HOST_CMD=serve --gamestream` (or
-  `serve`, the secure native-only host) into `host.env`. Upgrade-safe: a hand-customized
-  `PUNKTFUNK_HOST_CMD` is never overwritten.
+- **GameStream (Moonlight) compatibility is a wizard task** (**unchecked** by default — it pairs over
+  plain HTTP, so it is opt-in like the Public-firewall task): the choice is passed to
+  `service install --gamestream=on|off`, which writes `PUNKTFUNK_HOST_CMD=serve --gamestream` (or
+  `serve`, the secure native-only host) into `host.env`. Unattended, add it with
+  `/MERGETASKS=gamestream`. Upgrade-safe: a hand-customized `PUNKTFUNK_HOST_CMD` is never
+  overwritten, and on an upgrade the task is inert entirely (the flag is omitted, so `host.env`
+  keeps whatever it already says) — change an existing host with
+  `punktfunk-host service install --gamestream=on|off` plus a service restart.
 - **Branded, modern wizard**: `WizardStyle=modern dynamic windows11` (Inno ≥ 6.6 — Windows-11-style
   controls following the system light/dark theme; pre-6.6 compilers fall back to plain `modern`), with
   the punktfunk lens mark on the side panel / header tile and a multi-size `punktfunk.ico`

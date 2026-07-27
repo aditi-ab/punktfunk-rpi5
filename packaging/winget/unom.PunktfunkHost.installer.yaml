@@ -29,8 +29,11 @@ InstallerSwitches:
   # disclosures the wizard puts on screen are carried by Agreements/InstallationNotes in the
   # locale manifest instead.
   #
-  # To opt out of individual tasks, callers use Inno's ! negation via --override, e.g.
-  #   winget install unom.PunktfunkHost --override "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP- /MERGETASKS=!gamestream"
+  # To CHANGE individual tasks, callers pass Inno's /MERGETASKS via --override: a bare name adds a
+  # task, a `!` prefix removes one. GameStream is opt-in (its plane pairs over plain HTTP), so
+  # enabling it unattended is the additive form:
+  #   winget install unom.PunktfunkHost --override "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP- /MERGETASKS=gamestream"
+  # and dropping a default-on task is the negated form, e.g. /MERGETASKS=!trayicon
   # Task names: installdriver, installgamepad, installaudiocable, installhdrlayer,
   #             gamestream, allowpublicfw, startservice, trayicon
   Silent: /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-
