@@ -205,6 +205,16 @@ pub(crate) fn refresh_capture_monitor_anchor(context: &str) {
     let Some(want) = pf_vdisplay::capture_monitor() else {
         // No pin (or the console just cleared one): stop aiming input at a monitor we are no
         // longer mirroring, or a later virtual-display session inherits a stale anchor.
+        // Setting a pin says so in the log; clearing one is the same size of change to what the
+        // host streams, so say that too — but only when there WAS one, or every unpinned host
+        // logs this line at startup for no reason.
+        if pf_inject::absolute_anchor().is_some() {
+            tracing::info!(
+                context,
+                "capture monitor: cleared — sessions create a virtual display again and absolute \
+                 input is no longer anchored"
+            );
+        }
         pf_inject::set_absolute_anchor(None);
         return;
     };
@@ -532,6 +542,10 @@ fn real_main() -> Result<()> {
         // on-glass gate, with no client involved.
         #[cfg(target_os = "linux")]
         Some("mirror-test") => devtest::mirror_test(&args),
+        // Aim absolute input at a named monitor and report which libei region it landed in — the
+        // on-glass gate for the input-region ladder, with no client involved.
+        #[cfg(target_os = "linux")]
+        Some("anchor-test") => devtest::anchor_test(&args),
         // Create a virtual DualSense via UHID and exercise it (validation, no streaming session).
         #[cfg(target_os = "linux")]
         Some("dualsense-test") => devtest::dualsense_test(&args),

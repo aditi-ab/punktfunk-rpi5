@@ -597,3 +597,133 @@ pub fn mirror_test(args: &[String]) -> Result<()> {
     }
     Ok(())
 }
+
+/// Aim absolute input at a named monitor and prove where it landed — the on-glass gate for the
+/// input-region ladder (`design/per-monitor-portal-capture.md` §7.2), without needing a client.
+///
+/// The ladder exists for one case a unit test can only simulate: **two heads of the same size**,
+/// where matching a libei region by the streamed mode is a coin flip and the pointer silently ends
+/// up on the wrong screen. This drives the real thing — the compositor's own EIS regions, the real
+/// anchor, the real resolver — and prints the region absolute coordinates actually mapped into, so
+/// "it went to the right monitor" is something you read rather than infer.
+///
+/// `--monitor <CONNECTOR>` anchors at that head's origin (default: the `PUNKTFUNK_CAPTURE_MONITOR` /
+/// policy pin); `--none` deliberately runs UNANCHORED, which is the A/B that makes the anchored run
+/// mean something on a same-size pair. It then walks the corners and centre of a `--width`×`--height`
+/// client surface so an observer can watch the pointer.
+///
+/// Read the answer from the log line `libei: absolute input maps into this output`.
+#[cfg(target_os = "linux")]
+pub fn anchor_test(args: &[String]) -> Result<()> {
+    use punktfunk_core::input::{InputEvent, InputKind};
+    use std::time::Duration;
+    let arg = |name: &str| {
+        args.iter()
+            .skip_while(|a| a.as_str() != name)
+            .nth(1)
+            .cloned()
+    };
+    let unanchored = args.iter().any(|a| a == "--none");
+    let w: u32 = arg("--width").and_then(|s| s.parse().ok()).unwrap_or(1920);
+    let h: u32 = arg("--height").and_then(|s| s.parse().ok()).unwrap_or(1080);
+
+    let compositor = crate::vdisplay::detect()?;
+    let monitors = crate::vdisplay::monitors::list(compositor)?;
+    println!(
+        "anchor-test: {compositor:?} has {} monitor(s):",
+        monitors.len()
+    );
+    for m in &monitors {
+        println!(
+            "  {:<12} {:>13} at +{},+{}",
+            m.connector,
+            m.mode_label(),
+            m.x,
+            m.y
+        );
+    }
+    // Two heads at the same size is the case the ladder exists for; say so when the rig is right,
+    // and say so when it is NOT — a green run on a single-head box proves nothing about it.
+    let same_size = monitors.iter().enumerate().any(|(i, a)| {
+        monitors
+            .iter()
+            .skip(i + 1)
+            .any(|b| a.width == b.width && a.height == b.height)
+    });
+    println!(
+        "anchor-test: two same-size heads present: {} {}",
+        same_size,
+        if same_size {
+            "— this run exercises the case the ladder exists for"
+        } else {
+            "— WEAK RIG: size matching would have picked correctly anyway"
+        }
+    );
+
+    if unanchored {
+        crate::inject::set_absolute_anchor(None);
+        println!("anchor-test: UNANCHORED (--none) — the size/first rungs decide");
+    } else {
+        let want = arg("--monitor")
+            .or_else(crate::vdisplay::capture_monitor)
+            .context("no monitor named — pass --monitor <CONNECTOR>, or --none for the A/B")?;
+        let m = crate::vdisplay::monitors::resolve(&monitors, &want)?;
+        crate::inject::set_absolute_anchor(Some(crate::inject::AbsoluteAnchor {
+            origin: Some((m.x, m.y)),
+            mapping_id: None,
+        }));
+        println!(
+            "anchor-test: anchored at {} +{},+{} ({})",
+            m.connector,
+            m.x,
+            m.y,
+            m.mode_label()
+        );
+    }
+
+    let backend = crate::inject::default_backend();
+    if backend != crate::inject::Backend::Libei {
+        // The ladder is libei's; on any other backend this command would report nothing about it.
+        // Say so rather than emitting a green run that means nothing (sway injects via WlrVirtual,
+        // which is why the sway box cannot serve as this rig — set PUNKTFUNK_INPUT_BACKEND=libei on
+        // a compositor that speaks EI).
+        anyhow::bail!(
+            "input backend is {backend:?}, not libei — the absolute-region ladder only exists on \
+             the libei backend; set PUNKTFUNK_INPUT_BACKEND=libei"
+        );
+    }
+    let mut inj = crate::inject::open(backend)?;
+    // libei establishes its portal/EIS session + device resume asynchronously; events before then
+    // are dropped (and it is the resume that publishes the regions we are testing).
+    std::thread::sleep(Duration::from_secs(4));
+
+    let flags = (w << 16) | (h & 0xffff);
+    let pts = [
+        (w as i32 / 2, h as i32 / 2),
+        (60, 60),
+        (w as i32 - 60, 60),
+        (w as i32 - 60, h as i32 - 60),
+        (60, h as i32 - 60),
+        (w as i32 / 2, h as i32 / 2),
+    ];
+    println!("anchor-test: walking {w}x{h} — centre, four corners, centre (1s apart)");
+    for (x, y) in pts {
+        let e = InputEvent {
+            kind: InputKind::MouseMoveAbs,
+            _pad: [0; 3],
+            code: 0,
+            x,
+            y,
+            flags,
+        };
+        if let Err(err) = inj.inject(&e) {
+            tracing::warn!(error = %format!("{err:#}"), "anchor-test: inject failed");
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    println!(
+        "anchor-test: done — read the `libei: absolute input maps into this output` line above \
+         for the region that was chosen"
+    );
+    Ok(())
+}

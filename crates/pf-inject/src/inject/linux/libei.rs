@@ -422,6 +422,30 @@ fn region_for_mode<'a>(
         .or_else(|| regions.first())
 }
 
+/// Report which region absolute coordinates actually landed in, once per distinct answer.
+///
+/// The ladder above is only *observable* through where the pointer ends up, which on a two-head box
+/// is precisely the thing that is hard to see and easy to get wrong — the anchor exists because it
+/// already resolved wrong on-glass once, silently. `warn_anchor_miss` covers the anchor naming
+/// nothing; this covers the other half, an anchor that matched *something*, by saying which. Once
+/// per distinct region so a live session logs one line, not one per motion event.
+fn note_abs_region(region: &reis::event::Region, anchor: Option<&AbsoluteAnchor>) {
+    static LAST: std::sync::Mutex<Option<(u32, u32, u32, u32)>> = std::sync::Mutex::new(None);
+    let key = (region.x, region.y, region.width, region.height);
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if *last == Some(key) {
+        return;
+    }
+    *last = Some(key);
+    tracing::info!(
+        region = %format!("{}x{}+{}+{}", region.width, region.height, region.x, region.y),
+        mapping_id = ?region.mapping_id,
+        anchor_origin = ?anchor.and_then(|a| a.origin),
+        anchor_mapping_id = ?anchor.and_then(|a| a.mapping_id.clone()),
+        "libei: absolute input maps into this output"
+    );
+}
+
 /// Did an anchor name an output this region set doesn't have? Drives the one-shot warning — a
 /// silently mis-mapped pointer is the failure this whole ladder exists to prevent, so when the
 /// anchor can't be honored that has to be visible in the log rather than inferred from "clicks land
@@ -847,10 +871,13 @@ impl EiState {
                         let (x, y) = match region_for_mode(slot.regions(), w, h, anchor.as_ref())
                             .filter(|r| sane_region(r))
                         {
-                            Some(region) => (
-                                region.x as f32 + nx * region.width as f32,
-                                region.y as f32 + ny * region.height as f32,
-                            ),
+                            Some(region) => {
+                                note_abs_region(region, anchor.as_ref());
+                                (
+                                    region.x as f32 + nx * region.width as f32,
+                                    region.y as f32 + ny * region.height as f32,
+                                )
+                            }
                             // Degenerate/absent region: scale into the relay-file output hint
                             // (correct even when the client streams at a different resolution
                             // than the session runs); raw client pixels as the last resort.
@@ -935,10 +962,13 @@ impl EiState {
                         let (x, y) = match region_for_mode(slot.regions(), w, h, anchor.as_ref())
                             .filter(|r| sane_region(r))
                         {
-                            Some(region) => (
-                                region.x as f32 + nx * region.width as f32,
-                                region.y as f32 + ny * region.height as f32,
-                            ),
+                            Some(region) => {
+                                note_abs_region(region, anchor.as_ref());
+                                (
+                                    region.x as f32 + nx * region.width as f32,
+                                    region.y as f32 + ny * region.height as f32,
+                                )
+                            }
                             None => match self.output_hint {
                                 Some((ow, oh)) => (nx * ow as f32, ny * oh as f32),
                                 None => (ev.x as f32, ev.y as f32),
