@@ -189,6 +189,10 @@ const DisplayForm: FC<{
 				game_session: draft.game_session ?? "auto",
 				ddc_power_off: draft.ddc_power_off ?? false,
 				pnp_disable_monitors: draft.pnp_disable_monitors ?? false,
+				// Which screen we stream is not a display-behavior axis at all — swapping the
+				// streamed screen out from under the operator because they changed a preset would be
+				// the worst kind of surprise.
+				capture_monitor: draft.capture_monitor ?? null,
 			});
 		} else {
 			apply({ ...draft, preset: id as Preset });
@@ -206,6 +210,11 @@ const DisplayForm: FC<{
 			// The experimental axes aren't part of a preset — keep the current settings.
 			ddc_power_off: draft.ddc_power_off ?? false,
 			pnp_disable_monitors: draft.pnp_disable_monitors ?? false,
+			// Nor is the streamed screen: this builds a FRESH policy object rather than spreading
+			// the draft, so anything not named here is silently dropped — which is exactly how
+			// applying a saved preset used to switch a mirroring host back to a virtual display
+			// (found on-glass, .136). Every orthogonal axis has to be listed.
+			capture_monitor: draft.capture_monitor ?? null,
 		});
 
 	// A custom card is "current" when the in-force policy is a Custom one whose fields + game-session
