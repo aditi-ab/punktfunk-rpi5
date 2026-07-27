@@ -5,6 +5,7 @@
   "description": "punktfunk management console \u2014 TanStack Start + React Query (orval) + @unom/ui + Paraglide i18n",
   "scripts": {
     "prepare": "bun run codegen",
+    "postinstall": "bun2nix -o bun.nix",
     "codegen": "orval --config orval.config.ts && paraglide-js compile --project ./project.inlang --outdir ./src/paraglide && node tools/check-i18n.mjs",
     "predev": "orval --config orval.config.ts",
     "dev": "vite dev --port 47992",
@@ -47,6 +48,7 @@
     "@types/react": "^19.2.17",
     "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^5.2.0",
+    "bun2nix": "2.1.2",
     "orval": "^8.22.0",
     "playwright": "^1.61.1",
     "storybook": "^10.5.3",

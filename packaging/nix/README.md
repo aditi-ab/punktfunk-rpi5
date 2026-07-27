@@ -229,18 +229,29 @@ The shell exports `PF_FFVK_VULKAN_INCLUDE` (Vulkan headers for pf-ffvk bindgen) 
   the poisoned artifact already existed — so this shipped as a real crash-at-launch on Debian/Ubuntu,
   not a latent one. Fixed 2026-07-27: the workflow no longer co-builds it and `build-deb.sh` now
   rebuilds it unconditionally.)
-- **The bun packages (`punktfunk-web`, `punktfunk-scripting`) — their `bun install` deps hashes.**
-  Both build their `node_modules` in a *fixed-output derivation* (`bun install` needs the network +
-  the read-public `@unom` npm registry). Each `outputHash` (in `packaging/nix/packages.nix`) is
-  pinned to a resolved dependency set and **must be refreshed when its lockfile changes** —
-  `web/bun.lock` for the console, `sdk/bun.lock` for the runner: set that `outputHash = lib.fakeHash`,
-  run `nix build .#punktfunk-web` (or `.#punktfunk-scripting`), and copy the `got: sha256-…` value
-  Nix prints back into the field. Everything downstream is offline (the console's codegen + vite
-  build; the runner's `bun build --target=bun` bundle), so only the deps FODs ever need network.
-  Both launchers exec `pkgs.bun` from the store — unlike the deb/rpm, which vendor a bun binary
-  because apt/dnf have none.
-- **Commit `flake.lock`:** it pins the input revisions (nixpkgs / crane / rust-overlay). It is
-  generated on first eval and checked in.
+- **The bun packages (`punktfunk-web`, `punktfunk-scripting`) use [bun2nix](https://github.com/nix-community/bun2nix).**
+  Their `node_modules` is fetched **one `fetchurl` per package**, straight from the integrity hashes
+  already in the lockfile, via a generated-and-committed `bun.nix` (`web/bun.nix`, `sdk/bun.nix`).
+  There is **no aggregate deps hash to bump** — the previous design put `bun install` in a
+  fixed-output derivation whose single `outputHash` silently went stale on every lockfile change and
+  broke the build. `bun.nix` regenerates itself: `bun2nix` is a devDependency of both packages and
+  runs on every `bun install` (web's `postinstall`; the SDK's `prepare`, since sdk/ is the
+  *published* `@punktfunk/host` package and a `postinstall` would then fire on consumers' installs).
+  Regenerate by hand with `cd web && bunx bun2nix -o bun.nix` if a lockfile is ever edited directly.
+  The `@unom` scope needs no special handling: `web/bun.lock` records those tarballs' full
+  `https://git.unom.io/api/packages/unom/npm/…` URLs and the registry is read-public (the same
+  anonymous pull CI's rpm/deb builds do).
+
+  > ⚠ **`bun.nix` has no schema stability across bun2nix versions.** The flake input is pinned
+  > (`github:nix-community/bun2nix?ref=2.1.2`) and the npm devDependency is pinned to the *same*
+  > exact version in `web/package.json` + `sdk/package.json`. Move both together, then rerun
+  > `bun install` in `web/` and `sdk/` to regenerate.
+
+  Everything past the deps fetch is offline (the console's codegen + vite build; the runner's
+  `bun build --target=bun` bundle). Both launchers exec `pkgs.bun` from the store — unlike the
+  deb/rpm, which vendor a bun binary because apt/dnf have none.
+- **Commit `flake.lock`:** it pins the input revisions (nixpkgs / crane / rust-overlay / bun2nix).
+  It is generated on first eval and checked in.
 - **Session Skia OSD is off under Nix.** `punktfunk-session`'s default `ui` feature draws its
   on-screen stats/console overlay with `skia-safe`, whose build *downloads* a prebuilt Skia from
   the rust-skia releases — which Nix's network-less build sandbox forbids, and a from-source Skia

@@ -8,6 +8,15 @@
       url = "github:oxalica/rust-overlay";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+    # The bun packages' node_modules (punktfunk-web, punktfunk-scripting): one fetchurl per package,
+    # straight out of `bun.lock`'s integrity hashes — no hand-maintained aggregate deps hash to bump.
+    # PIN THE TAG. `bun.nix` has no schema stability guarantee across bun2nix versions, so this ref
+    # must move together with the `bun2nix` devDependency in web/package.json + sdk/package.json
+    # (which regenerates the file on every `bun install`). See packaging/nix/README.md.
+    bun2nix = {
+      url = "github:nix-community/bun2nix?ref=2.1.2";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   outputs =
@@ -16,6 +25,7 @@
       nixpkgs,
       crane,
       rust-overlay,
+      bun2nix,
     }:
     let
       # Linux/x86_64 only — the host encodes with desktop NVENC and CI publishes no aarch64 leg
@@ -49,6 +59,8 @@
           craneLib = craneLibFor pkgs;
           src = self;
           inherit version;
+          # `.hook` + `.fetchBunDeps` (bun2nix v2 API) — see packages.nix.
+          bun2nix = bun2nix.packages.${system}.default;
         };
     in
     {
@@ -99,8 +111,7 @@
         }
       );
 
-      # `nix flake check` builds every package (web included — needs its deps hash filled in, see
-      # packaging/nix/README.md).
+      # `nix flake check` builds every package.
       checks = forAllSystems (
         system:
         let

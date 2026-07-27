@@ -60,8 +60,10 @@
   bun,
   nodejs,
   makeWrapper,
-  cacert,
   stdenvNoCC,
+  # bun2nix (github:nix-community/bun2nix, pinned in flake.nix): `.fetchBunDeps` turns a generated
+  # `bun.nix` into bun's global install cache, and `.hook` runs an offline `bun install` off it.
+  bun2nix,
 }:
 let
   gbm = if libgbm != null then libgbm else mesa;
@@ -287,119 +289,97 @@ in
   # Unlike apt/dnf — which have no bun in their repos and so VENDOR a bun binary into the package —
   # Nix has `pkgs.bun`, so the launcher just execs it from the store (no vendored runtime). The
   # systemd `--user` units + firewall wiring live in the NixOS module, pointed at this store path.
-  punktfunk-web =
-    let
-      # Offline node_modules for the console. `bun install` needs the network AND the @unom npm
-      # registry (web/.npmrc → https://git.unom.io/api/packages/unom/npm/, read-public: the same
-      # anonymous pull CI's rpm/deb builds do), so it lives in a fixed-output derivation — FODs get
-      # network, and `outputHash` pins the result. `--ignore-scripts` skips the install-time
-      # `prepare` codegen (it wants ../api/openapi.json, outside this web-only src scope); the build
-      # derivation below runs codegen itself where the whole tree is present.
-      #
-      # ⚠ When web/bun.lock changes, this hash must be refreshed: set `outputHash = lib.fakeHash`,
-      # rebuild, and copy the sha256 Nix reports back here (see packaging/nix/README.md).
-      webDeps = stdenvNoCC.mkDerivation {
-        pname = "punktfunk-web-deps";
-        inherit version;
-        src = src + "/web";
-        nativeBuildInputs = [
-          bun
-          cacert
-        ];
-        dontConfigure = true;
-        buildPhase = ''
-          runHook preBuild
-          export HOME=$TMPDIR
-          export BUN_INSTALL_CACHE_DIR=$TMPDIR/bun-cache
-          export SSL_CERT_FILE=${cacert}/etc/ssl/certs/ca-bundle.crt
-          export NODE_EXTRA_CA_CERTS=$SSL_CERT_FILE
-          # copyfile backend ⇒ node_modules is fully materialised (no links into the ephemeral
-          # cache), so the tree survives the copy into the content-addressed $out.
-          bun install --frozen-lockfile --ignore-scripts --no-progress --backend=copyfile
-          runHook postBuild
-        '';
-        installPhase = ''
-          runHook preInstall
-          mkdir -p $out
-          cp -R node_modules $out/node_modules
-          runHook postInstall
-        '';
-        dontFixup = true;
-        outputHashMode = "recursive";
-        outputHashAlgo = "sha256";
-        outputHash = "sha256-5oVZv65SMvq9i2REzHE8Pyn6qUZaV2FnPQdaouwcwoU="; # web/bun.lock deps (refresh on lockfile change; see README).
-      };
-    in
-    stdenvNoCC.mkDerivation {
-      pname = "punktfunk-web";
-      inherit src version;
-      # nodejs: the JS build tools' `.bin` shims are `#!/usr/bin/env node`; patchShebangs (below)
-      # repoints them at this node so they run in the sandbox. bun is still the RUNTIME (the launcher
-      # execs it); node is build-time only, for orval/paraglide/vite.
-      nativeBuildInputs = [
-        bun
-        nodejs
-        makeWrapper
-      ];
+  punktfunk-web = stdenvNoCC.mkDerivation {
+    pname = "punktfunk-web";
+    inherit src version;
+    # nodejs: `bun run codegen` ends in a literal `node tools/check-i18n.mjs`, so `node` must be on
+    # PATH. (The JS CLIs' own `#!/usr/bin/env node` shebangs are already rewritten inside the
+    # bun2nix cache.) bun is the RUNTIME — the launcher execs it; node is build-time only.
+    nativeBuildInputs = [
+      bun
+      nodejs
+      makeWrapper
+      bun2nix.hook
+    ];
 
-      # No cross-derivation dep cache: codegen + the vite build are fully offline (every input is in
-      # the vendored node_modules, the checked-in api/openapi.json, and web/project.inlang).
-      #
-      # ⚠ "Offline" is load-bearing and NOT self-enforcing. inlang resolves the plugins in
-      # web/project.inlang/settings.json `modules`, and a failed import is only a WARNING there:
-      # paraglide then prints "Successfully compiled", exits 0, and emits ZERO messages, so the
-      # console builds fine and dies at SSR time with every `m.foo()` undefined. That is exactly
-      # what a CDN URL in `modules` did in this network-less sandbox. The plugin is now a normal
-      # devDependency referenced by path, and `bun run codegen` ends in tools/check-i18n.mjs, which
-      # fails the build on a remote module or a short message count. Keep both properties.
-      buildPhase = ''
-        runHook preBuild
-        export HOME=$TMPDIR
-        cp -R ${webDeps}/node_modules web/node_modules
-        chmod -R u+w web/node_modules
-        # The JS CLIs (orval, paraglide-js, vite, …) ship a `#!/usr/bin/env node` shebang, and the
-        # build sandbox has no /usr/bin/env — rewrite them to the store `node` before running any
-        # script (else `bun run codegen` dies with "bad interpreter: /usr/bin/env"). Patch the WHOLE
-        # node_modules, not just .bin: bun's .bin entries are symlinks (skipped by patchShebangs'
-        # `-type f`); the real shebang lives in each package's `dist/bin/*.js` that they point to.
-        patchShebangs web/node_modules
-        cd web
-        # `codegen` = orval (a typed React-Query client from ../api/openapi.json) + paraglide-js i18n
-        # compile; both write into src/ and are prerequisites of the build (normally the install-time
-        # `prepare` hook, which was skipped in the deps FOD).
-        bun run codegen
-        # `build` = vite build ⇒ the Nitro `bun`-preset SSR bundle in .output (our Bun.serve TLS entry).
-        bun run build
-        # Guard: assert we produced the bun bundle, not a node one (same check the deb/rpm builders do).
-        grep -q 'Bun\.serve' .output/server/index.mjs \
-          || { echo "ERROR: web/.output is not a bun bundle (wrong nitro preset)" >&2; exit 1; }
-        cd ..
-        runHook postBuild
-      '';
+    # node_modules, materialised offline. `bun.nix` (generated from web/bun.lock by the `bun2nix`
+    # devDependency's postinstall hook, and committed) lists ONE `fetchurl` per package, keyed by
+    # the lockfile's own integrity hash — including the @unom scope, whose tarball URLs the
+    # lockfile records in full (web/.npmrc → https://git.unom.io/api/packages/unom/npm/, read-public,
+    # the same anonymous pull CI's rpm/deb builds do). That replaces the old single fixed-output
+    # `bun install` derivation whose aggregate `outputHash` had to be hand-bumped on every lockfile
+    # change — the failure mode this design removes.
+    bunDeps = bun2nix.fetchBunDeps { bunNix = src + "/web/bun.nix"; };
+    # `src` is the whole repo; the console (and its lockfile) live in web/.
+    bunRoot = "web";
+    # The install-time `prepare` codegen is run explicitly in buildPhase instead (below), matching
+    # the deb/rpm builders — and the dependency lifecycle scripts stay off, as they were under the
+    # old `--ignore-scripts` FOD (playwright's would try to download browsers).
+    dontRunLifecycleScripts = true;
+    # We drive the build/install ourselves; don't let the hook default them to `bun build`/`bun test`.
+    dontUseBunBuild = true;
+    dontUseBunCheck = true;
+    dontUseBunInstall = true;
+    # The hook's own patch phase would `patchShebangs .` over the ENTIRE repo checkout, rewriting
+    # shell scripts we ship verbatim (scripts/web-init.sh). node_modules needs no patching — bun2nix
+    # already patched each package's shebangs inside the cache.
+    dontUseBunPatch = true;
+    # …which also means setting HOME ourselves; bun writes there during install.
+    preConfigure = ''
+      export HOME=$TMPDIR
+    '';
 
-      installPhase = ''
-        runHook preInstall
-        # The SSR bundle + its static assets, plus the first-run helper and env sample.
-        mkdir -p $out/share/punktfunk-web/.output
-        cp -R web/.output/server $out/share/punktfunk-web/.output/server
-        cp -R web/.output/public $out/share/punktfunk-web/.output/public
-        install -Dm0755 scripts/web-init.sh $out/share/punktfunk-web/web-init.sh
-        install -Dm0644 web/web.env.example $out/share/punktfunk-web/web.env.example
+    # Everything past the deps fetch is offline: codegen + the vite build take every input from the
+    # installed node_modules, the checked-in api/openapi.json, and web/project.inlang.
+    #
+    # ⚠ "Offline" is load-bearing and NOT self-enforcing. inlang resolves the plugins in
+    # web/project.inlang/settings.json `modules`, and a failed import is only a WARNING there:
+    # paraglide then prints "Successfully compiled", exits 0, and emits ZERO messages, so the
+    # console builds fine and dies at SSR time with every `m.foo()` undefined. That is exactly
+    # what a CDN URL in `modules` did in this network-less sandbox. The plugin is now a normal
+    # devDependency referenced by path, and `bun run codegen` ends in tools/check-i18n.mjs, which
+    # fails the build on a remote module or a short message count. Keep both properties.
+    buildPhase = ''
+      runHook preBuild
+      # node_modules is already in place: the bun2nix hook ran an offline `bun install` in web/
+      # (bunRoot) off the store-fetched cache, before this phase.
+      cd web
+      # `codegen` = orval (a typed React-Query client from ../api/openapi.json) + paraglide-js i18n
+      # compile; both write into src/ and are prerequisites of the build (normally the install-time
+      # `prepare` hook, which `dontRunLifecycleScripts` skips above).
+      bun run codegen
+      # `build` = vite build ⇒ the Nitro `bun`-preset SSR bundle in .output (our Bun.serve TLS entry).
+      bun run build
+      # Guard: assert we produced the bun bundle, not a node one (same check the deb/rpm builders do).
+      grep -q 'Bun\.serve' .output/server/index.mjs \
+        || { echo "ERROR: web/.output is not a bun bundle (wrong nitro preset)" >&2; exit 1; }
+      cd ..
+      runHook postBuild
+    '';
 
-        # PATH-stable launcher: run the SSR bundle on bun from the store (mirrors the deb/rpm
-        # /usr/bin/punktfunk-web-server, minus the vendored-bun indirection).
-        makeWrapper ${bun}/bin/bun $out/bin/punktfunk-web-server \
-          --add-flags "$out/share/punktfunk-web/.output/server/index.mjs"
-        runHook postInstall
-      '';
+    installPhase = ''
+      runHook preInstall
+      # The SSR bundle + its static assets, plus the first-run helper and env sample.
+      mkdir -p $out/share/punktfunk-web/.output
+      cp -R web/.output/server $out/share/punktfunk-web/.output/server
+      cp -R web/.output/public $out/share/punktfunk-web/.output/public
+      install -Dm0755 scripts/web-init.sh $out/share/punktfunk-web/web-init.sh
+      install -Dm0644 web/web.env.example $out/share/punktfunk-web/web.env.example
 
-      dontFixup = true;
+      # PATH-stable launcher: run the SSR bundle on bun from the store (mirrors the deb/rpm
+      # /usr/bin/punktfunk-web-server, minus the vendored-bun indirection).
+      makeWrapper ${bun}/bin/bun $out/bin/punktfunk-web-server \
+        --add-flags "$out/share/punktfunk-web/.output/server/index.mjs"
+      runHook postInstall
+    '';
 
-      meta = meta // {
-        description = "punktfunk management web console (Nitro SSR on bun + React)";
-        mainProgram = "punktfunk-web-server";
-      };
+    dontFixup = true;
+
+    meta = meta // {
+      description = "punktfunk management web console (Nitro SSR on bun + React)";
+      mainProgram = "punktfunk-web-server";
     };
+  };
 
   # --- plugin/script runner (punktfunk-scripting) --------------------------------------------------
   # The host's automation runner: the `@punktfunk/host` SDK's `punktfunk-scripting` CLI (built on
@@ -410,77 +390,56 @@ in
   #
   # Unlike the deb/rpm we don't `bun build` into a bundle + vendor bun; we still bundle (one
   # self-contained JS, effect inlined) but the launcher execs `pkgs.bun` from the store.
-  punktfunk-scripting =
-    let
-      # Offline node_modules for the SDK build — same fixed-output pattern as punktfunk-web's webDeps
-      # (`bun install` needs the network). ⚠ Refresh `outputHash` when sdk/bun.lock changes (set
-      # lib.fakeHash, rebuild, copy the printed sha256 — see packaging/nix/README.md).
-      sdkDeps = stdenvNoCC.mkDerivation {
-        pname = "punktfunk-scripting-deps";
-        inherit version;
-        src = src + "/sdk";
-        nativeBuildInputs = [
-          bun
-          cacert
-        ];
-        dontConfigure = true;
-        buildPhase = ''
-          runHook preBuild
-          export HOME=$TMPDIR
-          export BUN_INSTALL_CACHE_DIR=$TMPDIR/bun-cache
-          export SSL_CERT_FILE=${cacert}/etc/ssl/certs/ca-bundle.crt
-          export NODE_EXTRA_CA_CERTS=$SSL_CERT_FILE
-          bun install --frozen-lockfile --ignore-scripts --no-progress --backend=copyfile
-          runHook postBuild
-        '';
-        installPhase = ''
-          runHook preInstall
-          mkdir -p $out
-          cp -R node_modules $out/node_modules
-          runHook postInstall
-        '';
-        dontFixup = true;
-        outputHashMode = "recursive";
-        outputHashAlgo = "sha256";
-        outputHash = "sha256-+KCKCA0q0bwTxr7bsA3X4DbT/8nUjJA/JIoJU6BfiZw="; # sdk/bun.lock deps (refresh on lockfile change; see README).
-      };
-    in
-    stdenvNoCC.mkDerivation {
-      pname = "punktfunk-scripting";
-      inherit src version;
-      nativeBuildInputs = [
-        bun
-        makeWrapper
-      ];
+  punktfunk-scripting = stdenvNoCC.mkDerivation {
+    pname = "punktfunk-scripting";
+    inherit src version;
+    nativeBuildInputs = [
+      bun
+      makeWrapper
+      bun2nix.hook
+    ];
 
-      # `bun build --target=bun` bundles the runner CLI to ONE self-contained JS: effect + the SDK
-      # are inlined, and the runner's dynamic `import()` of the operator's plugin files is left as a
-      # runtime import (bun keeps unresolvable dynamic specifiers external). Fully offline.
-      buildPhase = ''
-        runHook preBuild
-        export HOME=$TMPDIR
-        cp -R ${sdkDeps}/node_modules sdk/node_modules
-        chmod -R u+w sdk/node_modules
-        ( cd sdk && bun build src/runner-cli.ts --target=bun --outfile=$TMPDIR/runner-cli.js )
-        grep -q 'attempt=' $TMPDIR/runner-cli.js \
-          || { echo "ERROR: runner bundle missing the dynamic plugin import — wrong build" >&2; exit 1; }
-        runHook postBuild
-      '';
+    # Same bun2nix wiring as punktfunk-web, against sdk/bun.lock's generated sdk/bun.nix (kept in
+    # step by the `bun2nix` devDependency's `prepare` script — `prepare`, not `postinstall`,
+    # because sdk/ is the PUBLISHED @punktfunk/host package and a postinstall would then run on
+    # every consumer's install). No aggregate deps hash to bump.
+    bunDeps = bun2nix.fetchBunDeps { bunNix = src + "/sdk/bun.nix"; };
+    bunRoot = "sdk";
+    dontRunLifecycleScripts = true; # matches the deb/rpm/windows SDK builds' `--ignore-scripts`
+    dontUseBunBuild = true;
+    dontUseBunCheck = true;
+    dontUseBunInstall = true;
+    dontUseBunPatch = true;
+    preConfigure = ''
+      export HOME=$TMPDIR
+    '';
 
-      installPhase = ''
-        runHook preInstall
-        install -Dm0644 $TMPDIR/runner-cli.js $out/share/punktfunk-scripting/runner-cli.js
-        # Launcher: run the bundle on bun from the store (mirrors the deb/rpm /usr/bin/punktfunk-scripting).
-        makeWrapper ${bun}/bin/bun $out/bin/punktfunk-scripting \
-          --add-flags "$out/share/punktfunk-scripting/runner-cli.js"
-        runHook postInstall
-      '';
+    # `bun build --target=bun` bundles the runner CLI to ONE self-contained JS: effect + the SDK
+    # are inlined, and the runner's dynamic `import()` of the operator's plugin files is left as a
+    # runtime import (bun keeps unresolvable dynamic specifiers external). Fully offline.
+    buildPhase = ''
+      runHook preBuild
+      # node_modules is already in place (bun2nix hook, offline `bun install` in sdk/).
+      ( cd sdk && bun build src/runner-cli.ts --target=bun --outfile=$TMPDIR/runner-cli.js )
+      grep -q 'attempt=' $TMPDIR/runner-cli.js \
+        || { echo "ERROR: runner bundle missing the dynamic plugin import — wrong build" >&2; exit 1; }
+      runHook postBuild
+    '';
 
-      dontFixup = true;
+    installPhase = ''
+      runHook preInstall
+      install -Dm0644 $TMPDIR/runner-cli.js $out/share/punktfunk-scripting/runner-cli.js
+      # Launcher: run the bundle on bun from the store (mirrors the deb/rpm /usr/bin/punktfunk-scripting).
+      makeWrapper ${bun}/bin/bun $out/bin/punktfunk-scripting \
+        --add-flags "$out/share/punktfunk-scripting/runner-cli.js"
+      runHook postInstall
+    '';
 
-      meta = meta // {
-        description = "punktfunk plugin/script runner (Effect SDK on bun)";
-        mainProgram = "punktfunk-scripting";
-      };
+    dontFixup = true;
+
+    meta = meta // {
+      description = "punktfunk plugin/script runner (Effect SDK on bun)";
+      mainProgram = "punktfunk-scripting";
     };
+  };
 }
