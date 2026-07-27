@@ -71,14 +71,23 @@ static STOPPED_AUTOLOGIN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(
 /// master — live-proven on the Nobara repro VM 2026-07-24).
 static STOPPED_DM: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
-/// mtime of the `steamos-session-select` sentinel at managed-session launch — the baseline the
-/// in-stream "Switch to Desktop" detector compares against. Steam's session-select script writes
+/// mtime of the `steamos-session-select` sentinel as of the takeover — the baseline the in-stream
+/// "Switch to Desktop" detector compares against. Steam's session-select script writes
 /// `~/.config/steamos-session-select` unconditionally in its USER pass, before any of its
 /// display-manager checks — so it advances even under a DM-stop takeover, where the script's
 /// config-rewrite tail is a silent no-op (every write branch is gated on the DM *running*;
 /// diagnosed live on the Nobara repro VM 2026-07-24). An advanced mtime after a capture loss is
 /// therefore the one durable trace of the user's switch request.
-static SESSION_SELECT_BASELINE: std::sync::Mutex<Option<std::time::SystemTime>> =
+///
+/// Two levels of `Option`, because "no baseline" and "no sentinel" mean opposite things:
+/// * **outer `None`** — never baselined (no takeover this host lifetime). Nothing can read as an
+///   in-stream request: the sentinel is a permanent file, so any box whose user has EVER switched
+///   sessions has one, and comparing against a missing baseline made that ancient write look like
+///   a live "Switch to Desktop".
+/// * **`Some(None)`** — baselined while no sentinel existed yet; a later one was created inside the
+///   session, which IS a request.
+/// * **`Some(Some(t))`** — baselined at mtime `t`; anything newer is a request.
+static SESSION_SELECT_BASELINE: std::sync::Mutex<Option<Option<std::time::SystemTime>>> =
     std::sync::Mutex::new(None);
 
 /// When [`honor_session_select_switch`] last ran. While recent, a managed (re)launch is refused —
@@ -1172,18 +1181,30 @@ fn dm_helper(verb: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// `systemctl` on the SYSTEM bus, **never interactively**. Every privileged verb below runs on the
+/// stream's own thread — the capture-loss rebuild, or the restore worker — with no way to answer a
+/// question. Without `--no-ask-password`, systemctl asks polkit for interactive authorization, and
+/// on a box whose desktop session is still alive (the host is a `--user` unit inside it) polkit
+/// hands that to the session's agent: a password dialog on the box's OWN screen, which during a
+/// managed takeover is off or mid-switch. Nobody sees it, nobody answers it, and the call blocks
+/// while the rebuild budget burns — the takeover then lands after the session it was for already
+/// ended. `--no-ask-password` turns that into the immediate "interactive authentication required"
+/// failure the callers are written for, so the pkexec helper (`allow_any`, no agent needed) takes
+/// over instead of a dialog. Field-suspect in the 0.20.0 Nobara report (intermittent disconnect +
+/// a screen that never comes back), where the timing is a race against the KDE agent's own death.
+fn systemctl_system(args: &[&str]) -> bool {
+    let mut cmd = Command::new("systemctl");
+    cmd.arg("--no-ask-password").args(args);
+    cmd.status().map(|s| s.success()).unwrap_or(false)
+}
+
 /// Stop the display manager for a takeover on a mask-fragile DM flavor. Plain `systemctl stop` on
 /// the SYSTEM bus first — succeeds as root or under an operator polkit rule scoped to the DM unit
 /// (see docs); fails cleanly otherwise ("interactive authentication required") — then the
 /// packaged pkexec helper. `false` means no privilege path exists and the caller degrades to
 /// attach.
 fn try_stop_display_manager(dm: &str) -> bool {
-    let direct = Command::new("systemctl")
-        .args(["stop", dm])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    direct || dm_helper("stop")
+    systemctl_system(&["stop", dm]) || dm_helper("stop")
 }
 
 /// Restore the display manager: `reset-failed` (a relogin loop may have tripped the unit's start
@@ -1192,15 +1213,8 @@ fn try_stop_display_manager(dm: &str) -> bool {
 /// operator polkit rule), then the packaged pkexec helper, whose `restore` verb performs the same
 /// two steps as root.
 fn restore_display_manager(dm: &str) -> bool {
-    let _ = Command::new("systemctl")
-        .args(["reset-failed", dm])
-        .status();
-    let direct = Command::new("systemctl")
-        .args(["restart", dm])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    direct || dm_helper("restore")
+    let _ = systemctl_system(&["reset-failed", dm]);
+    systemctl_system(&["restart", dm]) || dm_helper("restore")
 }
 
 /// The distro's session-switch helper (ChimeraOS/Nobara layout). Its USER pass records the
@@ -1226,24 +1240,39 @@ fn session_select_mtime() -> Option<std::time::SystemTime> {
     std::fs::metadata(path).ok()?.modified().ok()
 }
 
-/// Record the sentinel baseline at managed-session launch, so a LATER write (the user's in-stream
-/// "Switch to Desktop") is distinguishable from the switch that led into this session.
+/// Record the sentinel baseline, so a LATER write (the user's in-stream "Switch to Desktop") is
+/// distinguishable from the switch that led into this session. Taken at **takeover** (the moment
+/// [`STOPPED_DM`] is set, which is what arms the honor gate) and again at a successful launch: the
+/// switch INTO game mode writes the sentinel on its way in, and that write must never read as a
+/// request to go back out. Baselining only at launch left the window in between — a takeover whose
+/// launch failed, then a client retry inside the restore debounce — reading a months-old sentinel
+/// as a live request and pushing the box to the desktop the user never asked for.
 fn record_session_select_baseline() {
     *SESSION_SELECT_BASELINE
         .lock()
-        .unwrap_or_else(|e| e.into_inner()) = session_select_mtime();
+        .unwrap_or_else(|e| e.into_inner()) = Some(session_select_mtime());
 }
 
-/// Did a session-select run inside the managed session since its launch (sentinel newer than the
-/// recorded baseline, or newly created)? Inside a managed game session the only switch Steam
-/// offers is TO the desktop, so an advanced sentinel reads as that request.
+/// Did a session-select run inside the managed session since the baseline? Inside a managed game
+/// session the only switch Steam offers is TO the desktop, so an advanced sentinel reads as that
+/// request.
 fn session_select_requested() -> bool {
     let baseline = *SESSION_SELECT_BASELINE
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    match (baseline, session_select_mtime()) {
-        (Some(base), Some(now)) => now > base,
-        (None, Some(_)) => true, // created during the session
+    sentinel_advanced(baseline, session_select_mtime())
+}
+
+/// [`session_select_requested`]'s decision, as a pure function of the two readings (the
+/// unit-testable core). No baseline ⇒ no request: see [`SESSION_SELECT_BASELINE`] for why a
+/// missing baseline must not be read as "the sentinel appeared during the session".
+fn sentinel_advanced(
+    baseline: Option<Option<std::time::SystemTime>>,
+    now: Option<std::time::SystemTime>,
+) -> bool {
+    match (baseline, now) {
+        (Some(Some(base)), Some(now)) => now > base,
+        (Some(None), Some(_)) => true, // no sentinel at baseline — created during the session
         _ => false,
     }
 }
@@ -1408,6 +1437,11 @@ fn stop_autologin_sessions() -> Result<()> {
             %dm,
             "freed Steam: stopped the display manager for this stream (mask-fragile DM flavor)"
         );
+        // Baseline the switch sentinel HERE, not just at a successful launch: setting STOPPED_DM
+        // is what arms the honor gate, so from this instant an unbaselined sentinel would read as
+        // an in-stream "Switch to Desktop" — including the write from the switch that just brought
+        // the box INTO game mode. A successful launch re-baselines (tighter still).
+        record_session_select_baseline();
         *STOPPED_DM.lock().unwrap_or_else(|e| e.into_inner()) = Some(dm);
     }
     let units: Vec<String> = listed.into_iter().map(|(u, _)| u).collect();
@@ -2148,8 +2182,29 @@ impl Drop for GamescopeProc {
 mod tests {
     use super::{
         cgroup_is_punktfunk_owned, connected_connector_under, display_manager_unit_under,
-        dm_survives_masked_unit, is_steam_launch, nested_wrapper_script, shape_dedicated_command,
+        dm_survives_masked_unit, is_steam_launch, nested_wrapper_script, sentinel_advanced,
+        shape_dedicated_command,
     };
+
+    #[test]
+    fn session_select_sentinel_needs_a_baseline() {
+        let t0 = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
+        let t1 = t0 + std::time::Duration::from_secs(1);
+        // Never baselined: the sentinel is a permanent file, so a box whose user EVER switched
+        // sessions has one — that ancient write is not a live "Switch to Desktop" request. This is
+        // the case that pushed a Nobara box to the desktop after a failed managed launch.
+        assert!(!sentinel_advanced(None, Some(t0)));
+        assert!(!sentinel_advanced(None, None));
+        // Baselined with no sentinel yet, then one appeared inside the session: a real request.
+        assert!(sentinel_advanced(Some(None), Some(t0)));
+        assert!(!sentinel_advanced(Some(None), None));
+        // Baselined at an mtime: only a NEWER one is the user's in-stream switch. The write that
+        // brought the box into game mode is the baseline itself, so it reads as no request.
+        assert!(sentinel_advanced(Some(Some(t0)), Some(t1)));
+        assert!(!sentinel_advanced(Some(Some(t0)), Some(t0)));
+        assert!(!sentinel_advanced(Some(Some(t1)), Some(t0)));
+        assert!(!sentinel_advanced(Some(Some(t0)), None));
+    }
 
     #[test]
     fn nested_wrapper_script_shapes() {
