@@ -118,6 +118,15 @@ impl DataPump {
         // in; the embedder path had neither, so an unanswered request wedged the report tick and a
         // finished one left the ABR window anchored before the burst.
         let mut was_probing = false;
+        // Set when a probe ends: the FIRST post-probe report window is discarded outright (no
+        // LossReport, no standing-latency close, no ABR feed). The `last_*` rebase below cannot
+        // fully clean it — probe frames still pending in the reassembler age out as
+        // `frames_dropped` for another LOSS_WINDOW (~120 ms) AFTER the rebase, and the burst may
+        // have latched `flush_in_window` — and either reads as SEVERE congestion. The 2026-07
+        // field report's Automatic session backed off 20→14 Mb/s one second in (exactly one
+        // report tick after its capacity probe) and, with slow start dead from that first
+        // "congestion", crawled additively for the entire match.
+        let mut discard_abr_window = false;
         let mut probe_watchdog: Option<Instant> = None;
         let (mut owd_sum_ns, mut owd_frames) = (0i128, 0u32);
         let mut flush_in_window = false;
@@ -197,6 +206,8 @@ impl DataPump {
                 last_dropped = st.frames_dropped;
                 last_bytes = st.bytes_received;
                 last_report = Instant::now();
+                discard_abr_window = true;
+                flush_in_window = false;
             }
             // Arm a watchdog on the leading edge of ANY probe, so a host that silently ignores
             // `ProbeRequest` (an old build — anticipated, see the capacity-probe timeout below)
@@ -300,6 +311,7 @@ impl DataPump {
                 if skipped > 0 {
                     tracing::debug!(skipped, "all-intra frame channel drained to newest");
                 }
+                let discard = std::mem::take(&mut discard_abr_window);
                 let window_dropped = st.frames_dropped.wrapping_sub(last_dropped);
                 let loss_ppm = window_loss_ppm(
                     st.fec_recovered_shards.wrapping_sub(last_recovered),
@@ -307,14 +319,26 @@ impl DataPump {
                     st.packets_received.wrapping_sub(last_received),
                     window_dropped,
                 );
-                let _ = ctrl_tx.try_send(CtrlRequest::Loss(LossReport { loss_ppm }));
+                if discard {
+                    // Probe-tail residue (see `discard_abr_window`): a LossReport from this
+                    // window would also spike the host's adaptive FEC off deliberate overload.
+                    tracing::debug!(
+                        loss_ppm,
+                        window_dropped,
+                        "discarding the first post-probe ABR window (probe-tail residue)"
+                    );
+                } else {
+                    let _ = ctrl_tx.try_send(CtrlRequest::Loss(LossReport { loss_ppm }));
+                }
                 // Standing-latency bleed: close the detector's window with this report's loss
                 // verdict and run its escalation ladder — re-sync first (free; a stale offset
                 // from a stepped wall clock produces exactly this signature and the applied
                 // re-sync rebases the floor), then a bounded flush+keyframe (drains a real
                 // sub-threshold standing backlog the jump-to-live thresholds tolerate), then a
                 // loud disarm (the path latency itself changed; nothing local fixes that).
-                match standing_lat.on_window(loss_ppm == 0 && window_dropped == 0) {
+                // A discard window closes the detector as NOT-loss-free: its clean-run resets
+                // (conservative) and no action can fire off probe residue.
+                match standing_lat.on_window(!discard && loss_ppm == 0 && window_dropped == 0) {
                     StandingLatAction::None => {}
                     StandingLatAction::Resync { above_ms } => {
                         tracing::info!(
@@ -397,16 +421,23 @@ impl DataPump {
                 let window_ms = last_report.elapsed().as_millis().max(1) as u64;
                 let actual_kbps = (st.bytes_received.wrapping_sub(last_bytes).saturating_mul(8)
                     / window_ms) as u32;
-                if let Some(kbps) = abr.on_window(
-                    Instant::now(),
-                    window_dropped,
-                    loss_ppm,
-                    owd_mean_us,
-                    decode_mean_us,
-                    encode_mean_us,
-                    actual_kbps,
-                    flush_in_window,
-                ) {
+                // A discard window feeds the controller NOTHING — its signals are probe-tail
+                // residue, and one "congestion" verdict here ends slow start for good.
+                let verdict = if discard {
+                    None
+                } else {
+                    abr.on_window(
+                        Instant::now(),
+                        window_dropped,
+                        loss_ppm,
+                        owd_mean_us,
+                        decode_mean_us,
+                        encode_mean_us,
+                        actual_kbps,
+                        flush_in_window,
+                    )
+                };
+                if let Some(kbps) = verdict {
                     // Log the window's signals alongside the decision so an on-glass session can
                     // tell a decode-/encode-driven re-target (the new signals — elevated with
                     // loss/OWD flat) from a network-driven one.
