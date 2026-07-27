@@ -21,22 +21,36 @@
 # for a session with `systemctl --user enable --now punktfunk-host` (or set `autoStart = true` for a
 # headless appliance with `users.users.<u>.linger = true`).
 self:
-{ config, lib, pkgs, ... }:
+{
+  config,
+  lib,
+  pkgs,
+  ...
+}:
 let
   inherit (lib)
-    mkEnableOption mkOption mkIf mkMerge mkDefault types
-    optional optionals optionalString literalExpression
-    concatStringsSep mapAttrsToList genAttrs;
+    mkEnableOption
+    mkOption
+    mkIf
+    mkMerge
+    mkDefault
+    types
+    optional
+    optionals
+    optionalString
+    literalExpression
+    concatStringsSep
+    mapAttrsToList
+    genAttrs
+    ;
 
   cfg = config.services.punktfunk;
   system = pkgs.stdenv.hostPlatform.system;
 
   # host.env rendering: booleans → 1/0 (what PUNKTFUNK_* knobs expect), everything else verbatim.
-  renderVal = v:
-    if lib.isBool v then (if v then "1" else "0")
-    else toString v;
-  renderEnv = attrs:
-    concatStringsSep "\n" (mapAttrsToList (k: v: "${k}=${renderVal v}") attrs) + "\n";
+  renderVal = v: if lib.isBool v then (if v then "1" else "0") else toString v;
+  renderEnv =
+    attrs: concatStringsSep "\n" (mapAttrsToList (k: v: "${k}=${renderVal v}") attrs) + "\n";
 
   hostSettingsFile = pkgs.writeText "punktfunk-host.env" (renderEnv cfg.host.settings);
 
@@ -44,10 +58,21 @@ let
   # ephemeral per-session UDP port the host hole-punches, so nothing fixed to open (see
   # packaging/linux/punktfunk.ufw).
   nativeTCP = [ 47990 ]; # mgmt/library REST API (HTTPS + mTLS)
-  nativeUDP = [ 9777 5353 ]; # QUIC control plane + mDNS
+  nativeUDP = [
+    9777
+    5353
+  ]; # QUIC control plane + mDNS
   # GameStream/Moonlight-compat fixed ports (opt-in with `host.gamestream`).
-  gamestreamTCP = [ 47984 47989 48010 ];
-  gamestreamUDP = [ 47998 47999 48000 ];
+  gamestreamTCP = [
+    47984
+    47989
+    48010
+  ];
+  gamestreamUDP = [
+    47998
+    47999
+    48000
+  ];
 in
 {
   options.services.punktfunk = {
@@ -93,7 +118,13 @@ in
       };
 
       settings = mkOption {
-        type = types.attrsOf (types.oneOf [ types.str types.int types.bool ]);
+        type = types.attrsOf (
+          types.oneOf [
+            types.str
+            types.int
+            types.bool
+          ]
+        );
         default = { };
         example = literalExpression ''
           {
@@ -233,10 +264,12 @@ in
   config = mkMerge [
     # --- shared: whenever either half is enabled -----------------------------------------------
     (mkIf (cfg.host.enable || cfg.client.enable) {
-      assertions = [{
-        assertion = system == "x86_64-linux";
-        message = "services.punktfunk is x86_64-linux only (desktop NVENC host; no aarch64 build).";
-      }];
+      assertions = [
+        {
+          assertion = system == "x86_64-linux";
+          message = "services.punktfunk is x86_64-linux only (desktop NVENC host; no aarch64 build).";
+        }
+      ];
       # The GPU driver libs the binaries dlopen at runtime (libcuda / libnvidia-encode / libEGL /
       # the Vulkan ICD) live under /run/opengl-driver/lib — provided by hardware.graphics.
       hardware.graphics.enable = mkDefault true;
@@ -257,11 +290,17 @@ in
       services.udev.path = [ pkgs.coreutils ];
       # uinput/uhid: the virtual X360 + DualSense nodes. vhci-hcd: the usbip transport that makes
       # the virtual Steam Deck a real USB device (Steam Input only adopts USB pads).
-      boot.kernelModules = [ "uinput" "uhid" "vhci-hcd" ];
+      boot.kernelModules = [
+        "uinput"
+        "uhid"
+        "vhci-hcd"
+      ];
 
       # `input` group membership for the virtual-gamepad nodes (mirrors the RPM's usermod hint).
       users.groups.input = { };
-      users.users = genAttrs cfg.host.users (_: { extraGroups = [ "input" ]; });
+      users.users = genAttrs cfg.host.users (_: {
+        extraGroups = [ "input" ];
+      });
 
       # Status-tray autostart entry (self-gating: `--autostart` exits unless this user runs a host).
       environment.etc."xdg/autostart/io.unom.Punktfunk.Tray.desktop".source =
@@ -281,10 +320,14 @@ in
         wantedBy = optional cfg.host.autoStart "default.target";
         # The host may exec external helpers (pw-dump, sh, and — for the gamescope/kwin backends —
         # the compositor). Extend this in your config for a headless gamescope/KWin appliance.
-        path = [ pkgs.bash pkgs.coreutils pkgs.pipewire ];
+        path = [
+          pkgs.bash
+          pkgs.coreutils
+          pkgs.pipewire
+        ];
         serviceConfig = {
-          ExecStart = "${cfg.host.package}/bin/punktfunk-host serve"
-            + optionalString cfg.host.gamestream " --gamestream";
+          ExecStart =
+            "${cfg.host.package}/bin/punktfunk-host serve" + optionalString cfg.host.gamestream " --gamestream";
           Restart = "on-failure";
           RestartSec = 2;
           EnvironmentFile =
@@ -339,7 +382,10 @@ in
       systemd.user.services.punktfunk-web = {
         description = "punktfunk management web console";
         documentation = [ "https://git.unom.io/unom/punktfunk" ];
-        after = [ "punktfunk-web-init.service" "punktfunk-host.service" ];
+        after = [
+          "punktfunk-web-init.service"
+          "punktfunk-host.service"
+        ];
         wants = [ "punktfunk-web-init.service" ];
         wantedBy = optional cfg.web.autoStart "default.target";
         environment = {

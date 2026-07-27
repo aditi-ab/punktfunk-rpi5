@@ -103,7 +103,10 @@ let
 
   meta = {
     homepage = "https://git.unom.io/unom/punktfunk";
-    license = with lib.licenses; [ mit asl20 ];
+    license = with lib.licenses; [
+      mit
+      asl20
+    ];
     platforms = [ "x86_64-linux" ]; # NVENC desktop host; matches the RPM's ExclusiveArch: x86_64
     maintainers = [ ];
   };
@@ -115,156 +118,164 @@ let
   # runtime (see crates/punktfunk-tray/Cargo.toml), so a tokio-flavoured zbus panics at startup:
   # "there is no reactor running, must be called from the context of a Tokio 1.x runtime". A separate
   # invocation keeps the tray's zbus on async-io. (The host package copies this binary into its $out.)
-  punktfunk-tray = craneLib.buildPackage (commonArgs // {
-    pname = "punktfunk-tray";
-    cargoExtraArgs = "--locked -p punktfunk-tray";
-    PUNKTFUNK_BUILD_VERSION = buildVersion;
-    # Pure-Rust leaf: ksni/zbus talk to the dbus socket, ureq+rustls(ring) + punktfunk-core `tls` —
-    # nothing to link (no buildInputs) and no GPU driver runpath (it never dlopens libcuda/EGL/vulkan).
-    meta = meta // {
-      description = "punktfunk host status tray (Linux StatusNotifierItem)";
-      mainProgram = "punktfunk-tray";
-    };
-  });
+  punktfunk-tray = craneLib.buildPackage (
+    commonArgs
+    // {
+      pname = "punktfunk-tray";
+      cargoExtraArgs = "--locked -p punktfunk-tray";
+      PUNKTFUNK_BUILD_VERSION = buildVersion;
+      # Pure-Rust leaf: ksni/zbus talk to the dbus socket, ureq+rustls(ring) + punktfunk-core `tls` —
+      # nothing to link (no buildInputs) and no GPU driver runpath (it never dlopens libcuda/EGL/vulkan).
+      meta = meta // {
+        description = "punktfunk host status tray (Linux StatusNotifierItem)";
+        mainProgram = "punktfunk-tray";
+      };
+    }
+  );
 in
 {
   inherit punktfunk-tray;
 
-  punktfunk-host = craneLib.buildPackage (commonArgs // {
-    pname = "punktfunk-host";
-    # HOST ONLY — the tray is a separate derivation (see the note above; co-building crashes it).
-    cargoExtraArgs =
-      "--locked -p punktfunk-host "
-      + "--features punktfunk-host/nvenc,punktfunk-host/vulkan-encode";
+  punktfunk-host = craneLib.buildPackage (
+    commonArgs
+    // {
+      pname = "punktfunk-host";
+      # HOST ONLY — the tray is a separate derivation (see the note above; co-building crashes it).
+      cargoExtraArgs =
+        "--locked -p punktfunk-host " + "--features punktfunk-host/nvenc,punktfunk-host/vulkan-encode";
 
-    PUNKTFUNK_BUILD_VERSION = buildVersion;
+      PUNKTFUNK_BUILD_VERSION = buildVersion;
 
-    buildInputs = [
-      ffmpeg # libavcodec/avformat/avutil (NVENC + VAAPI encode), via ffmpeg-next → ffmpeg-sys-next pkg-config
-      pipewire # libpipewire-0.3 + libspa-0.2 (portal capture + the `pipewire` crate)
-      libopus # audiopus_sys links system opus via pkg-config (else it vendors a static libopus that mis-links)
-      wayland # libwayland-client (wlr / KWin fake_input backends)
-      libxkbcommon # virtual-keyboard keymap build/validate
-      libGL # src/linux/zerocopy/egl.rs `#[link(name = "GL")]`
-      gbm # src/linux/zerocopy/egl.rs `#[link(name = "gbm")]`
-      vulkan-loader # ash (Vulkan-Video encode + the dmabuf→VK bridge); loaded at runtime
-    ];
+      buildInputs = [
+        ffmpeg # libavcodec/avformat/avutil (NVENC + VAAPI encode), via ffmpeg-next → ffmpeg-sys-next pkg-config
+        pipewire # libpipewire-0.3 + libspa-0.2 (portal capture + the `pipewire` crate)
+        libopus # audiopus_sys links system opus via pkg-config (else it vendors a static libopus that mis-links)
+        wayland # libwayland-client (wlr / KWin fake_input backends)
+        libxkbcommon # virtual-keyboard keymap build/validate
+        libGL # src/linux/zerocopy/egl.rs `#[link(name = "GL")]`
+        gbm # src/linux/zerocopy/egl.rs `#[link(name = "gbm")]`
+        vulkan-loader # ash (Vulkan-Video encode + the dmabuf→VK bridge); loaded at runtime
+      ];
 
-    # KWin resolves a streaming client to a .desktop by matching /proc/<pid>/exe against `Exec`, so
-    # the host's authorization .desktop must name the ACTUAL binary path (the store path here). The
-    # tray/client .desktop Exec lines are rewritten for the same reason (menu launch / autostart).
-    postInstall = ''
-      # The status tray, built in its own derivation (see the punktfunk-tray note above) so its zbus
-      # stays on async-io; ship it in the host's $out so the tray .desktop below resolves it.
-      install -Dm0755 ${punktfunk-tray}/bin/punktfunk-tray "$out/bin/punktfunk-tray"
+      # KWin resolves a streaming client to a .desktop by matching /proc/<pid>/exe against `Exec`, so
+      # the host's authorization .desktop must name the ACTUAL binary path (the store path here). The
+      # tray/client .desktop Exec lines are rewritten for the same reason (menu launch / autostart).
+      postInstall = ''
+        # The status tray, built in its own derivation (see the punktfunk-tray note above) so its zbus
+        # stays on async-io; ship it in the host's $out so the tray .desktop below resolves it.
+        install -Dm0755 ${punktfunk-tray}/bin/punktfunk-tray "$out/bin/punktfunk-tray"
 
-      # udev: /dev/uinput + /dev/uhid (virtual gamepads) + the vhci sysfs perms for the virtual Deck.
-      install -Dm0644 scripts/60-punktfunk.rules "$out/lib/udev/rules.d/60-punktfunk.rules"
+        # udev: /dev/uinput + /dev/uhid (virtual gamepads) + the vhci sysfs perms for the virtual Deck.
+        install -Dm0644 scripts/60-punktfunk.rules "$out/lib/udev/rules.d/60-punktfunk.rules"
 
-      # KWin Desktop-mode authorization (zkde_screencast + fake_input). Point Exec at the store binary.
-      install -Dm0644 packaging/linux/io.unom.Punktfunk.Host.desktop \
-        "$out/share/applications/io.unom.Punktfunk.Host.desktop"
-      substituteInPlace "$out/share/applications/io.unom.Punktfunk.Host.desktop" \
-        --replace-fail "/usr/bin/punktfunk-host" "$out/bin/punktfunk-host"
+        # KWin Desktop-mode authorization (zkde_screencast + fake_input). Point Exec at the store binary.
+        install -Dm0644 packaging/linux/io.unom.Punktfunk.Host.desktop \
+          "$out/share/applications/io.unom.Punktfunk.Host.desktop"
+        substituteInPlace "$out/share/applications/io.unom.Punktfunk.Host.desktop" \
+          --replace-fail "/usr/bin/punktfunk-host" "$out/bin/punktfunk-host"
 
-      # Status-tray autostart entry + its hicolor status icons.
-      install -Dm0644 packaging/linux/io.unom.Punktfunk.Tray.desktop \
-        "$out/etc/xdg/autostart/io.unom.Punktfunk.Tray.desktop"
-      substituteInPlace "$out/etc/xdg/autostart/io.unom.Punktfunk.Tray.desktop" \
-        --replace-fail "/usr/bin/punktfunk-tray" "$out/bin/punktfunk-tray"
-      for sz in 22x22 48x48; do
-        for png in packaging/linux/icons/hicolor/$sz/apps/*.png; do
-          install -Dm0644 "$png" "$out/share/icons/hicolor/$sz/apps/$(basename "$png")"
+        # Status-tray autostart entry + its hicolor status icons.
+        install -Dm0644 packaging/linux/io.unom.Punktfunk.Tray.desktop \
+          "$out/etc/xdg/autostart/io.unom.Punktfunk.Tray.desktop"
+        substituteInPlace "$out/etc/xdg/autostart/io.unom.Punktfunk.Tray.desktop" \
+          --replace-fail "/usr/bin/punktfunk-tray" "$out/bin/punktfunk-tray"
+        for sz in 22x22 48x48; do
+          for png in packaging/linux/icons/hicolor/$sz/apps/*.png; do
+            install -Dm0644 "$png" "$out/share/icons/hicolor/$sz/apps/$(basename "$png")"
+          done
         done
-      done
 
-      # Reference material: headless session helpers, example env files, the OpenAPI doc.
-      install -Dm0755 scripts/headless/run-headless-kde.sh  "$out/share/punktfunk-host/headless/run-headless-kde.sh"
-      install -Dm0755 scripts/headless/run-headless-sway.sh "$out/share/punktfunk-host/headless/run-headless-sway.sh"
-      install -Dm0644 scripts/headless/kde-authorized       "$out/share/punktfunk-host/headless/kde-authorized"
-      install -Dm0644 scripts/headless/punktfunk-sink.conf  "$out/share/punktfunk-host/headless/punktfunk-sink.conf"
-      install -Dm0644 scripts/host.env.example              "$out/share/punktfunk-host/host.env.example"
-      install -Dm0644 packaging/bazzite/host.env            "$out/share/punktfunk-host/host.env.bazzite"
-      install -Dm0644 packaging/kde/host.env                "$out/share/punktfunk-host/host.env.kde"
-      install -Dm0644 api/openapi.json                      "$out/share/punktfunk-host/openapi.json"
-    '';
+        # Reference material: headless session helpers, example env files, the OpenAPI doc.
+        install -Dm0755 scripts/headless/run-headless-kde.sh  "$out/share/punktfunk-host/headless/run-headless-kde.sh"
+        install -Dm0755 scripts/headless/run-headless-sway.sh "$out/share/punktfunk-host/headless/run-headless-sway.sh"
+        install -Dm0644 scripts/headless/kde-authorized       "$out/share/punktfunk-host/headless/kde-authorized"
+        install -Dm0644 scripts/headless/punktfunk-sink.conf  "$out/share/punktfunk-host/headless/punktfunk-sink.conf"
+        install -Dm0644 scripts/host.env.example              "$out/share/punktfunk-host/host.env.example"
+        install -Dm0644 packaging/bazzite/host.env            "$out/share/punktfunk-host/host.env.bazzite"
+        install -Dm0644 packaging/kde/host.env                "$out/share/punktfunk-host/host.env.kde"
+        install -Dm0644 api/openapi.json                      "$out/share/punktfunk-host/openapi.json"
+      '';
 
-    # Run AFTER fixup (patchelf --shrink-rpath would otherwise drop /run/opengl-driver/lib, which is
-    # empty at build time): append the driver runpath so the runtime dlopen of libcuda.so.1 /
-    # libnvidia-encode.so.1 / libEGL.so.1 / the GPU's libvulkan ICD resolves from the running system.
-    postFixup = ''
-      # Only the host dlopens the GPU stack; the tray (its own derivation, copied in above) does not.
-      addDriverRunpath "$out/bin/punktfunk-host"
-    '';
+      # Run AFTER fixup (patchelf --shrink-rpath would otherwise drop /run/opengl-driver/lib, which is
+      # empty at build time): append the driver runpath so the runtime dlopen of libcuda.so.1 /
+      # libnvidia-encode.so.1 / libEGL.so.1 / the GPU's libvulkan ICD resolves from the running system.
+      postFixup = ''
+        # Only the host dlopens the GPU stack; the tray (its own derivation, copied in above) does not.
+        addDriverRunpath "$out/bin/punktfunk-host"
+      '';
 
-    meta = meta // {
-      description = "Low-latency desktop/game streaming host (Moonlight-compatible + native punktfunk/1)";
-      mainProgram = "punktfunk-host";
-    };
-  });
+      meta = meta // {
+        description = "Low-latency desktop/game streaming host (Moonlight-compatible + native punktfunk/1)";
+        mainProgram = "punktfunk-host";
+      };
+    }
+  );
 
-  punktfunk-client = craneLib.buildPackage (commonArgs // {
-    pname = "punktfunk-client";
-    # The session's default `ui` feature pulls skia-safe, whose build DOWNLOADS a prebuilt Skia
-    # (rust-skia releases) — impossible in Nix's network-less build sandbox, and a from-source Skia
-    # build needs the full gn/ninja/python toolchain + network-fetched third-party. The `ui` feature
-    # is explicitly droppable (clients/session/Cargo.toml: "same streaming, stats on stdout only"),
-    # so build the session without it. The GTK shell (punktfunk-client-linux) is skia-free and full.
-    # Re-adding the Skia OSD under Nix is tracked in packaging/nix/README.md.
-    cargoExtraArgs =
-      "--locked -p punktfunk-client-linux -p punktfunk-client-session "
-      + "--no-default-features --features punktfunk-client-session/pyrowave";
+  punktfunk-client = craneLib.buildPackage (
+    commonArgs
+    // {
+      pname = "punktfunk-client";
+      # The session's default `ui` feature pulls skia-safe, whose build DOWNLOADS a prebuilt Skia
+      # (rust-skia releases) — impossible in Nix's network-less build sandbox, and a from-source Skia
+      # build needs the full gn/ninja/python toolchain + network-fetched third-party. The `ui` feature
+      # is explicitly droppable (clients/session/Cargo.toml: "same streaming, stats on stdout only"),
+      # so build the session without it. The GTK shell (punktfunk-client-linux) is skia-free and full.
+      # Re-adding the Skia OSD under Nix is tracked in packaging/nix/README.md.
+      cargoExtraArgs =
+        "--locked -p punktfunk-client-linux -p punktfunk-client-session "
+        + "--no-default-features --features punktfunk-client-session/pyrowave";
 
-    # pf-ffvk runs bindgen over libavutil/hwcontext_vulkan.h, which `#include <vulkan/vulkan.h>`.
-    # There is no /usr/include on NixOS, so hand it the Vulkan-Headers include dir explicitly
-    # (build.rs turns this into a clang `-I`). libavutil's own include path comes from pkg-config.
-    PF_FFVK_VULKAN_INCLUDE = "${vulkan-headers}/include";
+      # pf-ffvk runs bindgen over libavutil/hwcontext_vulkan.h, which `#include <vulkan/vulkan.h>`.
+      # There is no /usr/include on NixOS, so hand it the Vulkan-Headers include dir explicitly
+      # (build.rs turns this into a clang `-I`). libavutil's own include path comes from pkg-config.
+      PF_FFVK_VULKAN_INCLUDE = "${vulkan-headers}/include";
 
-    nativeBuildInputs = commonArgs.nativeBuildInputs ++ [ wrapGAppsHook4 ];
+      nativeBuildInputs = commonArgs.nativeBuildInputs ++ [ wrapGAppsHook4 ];
 
-    buildInputs = [
-      ffmpeg # FFmpeg decode (pf-client-core) + pf-ffvk links libavutil
-      pipewire # PipeWire audio playback + mic capture
-      libopus # audiopus_sys → system opus via pkg-config (Opus decode)
-      sdl3 # window + gamepads (SDL3 HIDAPI: DualSense touchpad/motion/triggers)
-      gtk4 # the GTK4 shell (clients/linux, relm4)
-      libadwaita
-      glib
-      librsvg # gdk-pixbuf SVG loader for symbolic icons
-      gsettings-desktop-schemas
-      adwaita-icon-theme
-      libxkbcommon
-      libGL
-      vulkan-loader # ash presenter + Vulkan-Video decode (loaded at runtime)
-    ];
+      buildInputs = [
+        ffmpeg # FFmpeg decode (pf-client-core) + pf-ffvk links libavutil
+        pipewire # PipeWire audio playback + mic capture
+        libopus # audiopus_sys → system opus via pkg-config (Opus decode)
+        sdl3 # window + gamepads (SDL3 HIDAPI: DualSense touchpad/motion/triggers)
+        gtk4 # the GTK4 shell (clients/linux, relm4)
+        libadwaita
+        glib
+        librsvg # gdk-pixbuf SVG loader for symbolic icons
+        gsettings-desktop-schemas
+        adwaita-icon-theme
+        libxkbcommon
+        libGL
+        vulkan-loader # ash presenter + Vulkan-Video decode (loaded at runtime)
+      ];
 
-    # wrapGApp needs to run on the real ELF, and addDriverRunpath must run post-shrink — so disable
-    # the hook's blanket auto-wrap and drive both by hand in postFixup (see the host note above).
-    dontWrapGApps = true;
+      # wrapGApp needs to run on the real ELF, and addDriverRunpath must run post-shrink — so disable
+      # the hook's blanket auto-wrap and drive both by hand in postFixup (see the host note above).
+      dontWrapGApps = true;
 
-    postInstall = ''
-      # hidraw access for the seated user's DualSense (SDL HIDAPI full-fidelity path).
-      install -Dm0644 scripts/70-punktfunk-client.rules "$out/lib/udev/rules.d/70-punktfunk-client.rules"
+      postInstall = ''
+        # hidraw access for the seated user's DualSense (SDL HIDAPI full-fidelity path).
+        install -Dm0644 scripts/70-punktfunk-client.rules "$out/lib/udev/rules.d/70-punktfunk-client.rules"
 
-      # Desktop launcher — point Exec at the store binary (wrapped below).
-      install -Dm0644 packaging/linux/io.unom.Punktfunk.desktop \
-        "$out/share/applications/io.unom.Punktfunk.desktop"
-      substituteInPlace "$out/share/applications/io.unom.Punktfunk.desktop" \
-        --replace-fail "Exec=punktfunk-client" "Exec=$out/bin/punktfunk-client"
-    '';
+        # Desktop launcher — point Exec at the store binary (wrapped below).
+        install -Dm0644 packaging/linux/io.unom.Punktfunk.desktop \
+          "$out/share/applications/io.unom.Punktfunk.desktop"
+        substituteInPlace "$out/share/applications/io.unom.Punktfunk.desktop" \
+          --replace-fail "Exec=punktfunk-client" "Exec=$out/bin/punktfunk-client"
+      '';
 
-    postFixup = ''
-      addDriverRunpath "$out/bin/punktfunk-client" "$out/bin/punktfunk-session"
-      # Only the GTK shell needs the GApps wrapper (GSETTINGS_SCHEMA_DIR, icon themes, typelibs);
-      # the ash session binary is not a GTK app.
-      wrapGApp "$out/bin/punktfunk-client"
-    '';
+      postFixup = ''
+        addDriverRunpath "$out/bin/punktfunk-client" "$out/bin/punktfunk-session"
+        # Only the GTK shell needs the GApps wrapper (GSETTINGS_SCHEMA_DIR, icon themes, typelibs);
+        # the ash session binary is not a GTK app.
+        wrapGApp "$out/bin/punktfunk-client"
+      '';
 
-    meta = meta // {
-      description = "Native Linux punktfunk/1 streaming client (GTK4 shell + Vulkan session)";
-      mainProgram = "punktfunk-client";
-    };
-  });
+      meta = meta // {
+        description = "Native Linux punktfunk/1 streaming client (GTK4 shell + Vulkan session)";
+        mainProgram = "punktfunk-client";
+      };
+    }
+  );
 
   # --- management web console (punktfunk-web) ------------------------------------------------------
   # The browser console every client needs for SPAKE2 PIN pairing + host status: a TanStack Start /
@@ -291,7 +302,10 @@ in
         pname = "punktfunk-web-deps";
         inherit version;
         src = src + "/web";
-        nativeBuildInputs = [ bun cacert ];
+        nativeBuildInputs = [
+          bun
+          cacert
+        ];
         dontConfigure = true;
         buildPhase = ''
           runHook preBuild
@@ -322,7 +336,11 @@ in
       # nodejs: the JS build tools' `.bin` shims are `#!/usr/bin/env node`; patchShebangs (below)
       # repoints them at this node so they run in the sandbox. bun is still the RUNTIME (the launcher
       # execs it); node is build-time only, for orval/paraglide/vite.
-      nativeBuildInputs = [ bun nodejs makeWrapper ];
+      nativeBuildInputs = [
+        bun
+        nodejs
+        makeWrapper
+      ];
 
       # No cross-derivation dep cache: codegen + the vite build are fully offline (every input is in
       # the vendored node_modules, the checked-in api/openapi.json, and web/project.inlang).
@@ -401,7 +419,10 @@ in
         pname = "punktfunk-scripting-deps";
         inherit version;
         src = src + "/sdk";
-        nativeBuildInputs = [ bun cacert ];
+        nativeBuildInputs = [
+          bun
+          cacert
+        ];
         dontConfigure = true;
         buildPhase = ''
           runHook preBuild
@@ -427,7 +448,10 @@ in
     stdenvNoCC.mkDerivation {
       pname = "punktfunk-scripting";
       inherit src version;
-      nativeBuildInputs = [ bun makeWrapper ];
+      nativeBuildInputs = [
+        bun
+        makeWrapper
+      ];
 
       # `bun build --target=bun` bundles the runner CLI to ONE self-contained JS: effect + the SDK
       # are inlined, and the runner's dynamic `import()` of the operator's plugin files is left as a

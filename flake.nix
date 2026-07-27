@@ -26,10 +26,12 @@
       # The workspace version is the single source of truth (crates/*/Cargo.toml inherit it).
       version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
 
-      pkgsFor = system: import nixpkgs {
-        inherit system;
-        overlays = [ (import rust-overlay) ];
-      };
+      pkgsFor =
+        system:
+        import nixpkgs {
+          inherit system;
+          overlays = [ (import rust-overlay) ];
+        };
 
       # Pin cargo/rustc EXACTLY to rust-toolchain.toml (channel 1.96.0 + rustfmt/clippy) so a Nix
       # build, a dev shell and CI all use the identical toolchain — the repo is deliberate about
@@ -38,7 +40,8 @@
 
       craneLibFor = pkgs: (crane.mkLib pkgs).overrideToolchain toolchainFor;
 
-      packagesFor = system:
+      packagesFor =
+        system:
         let
           pkgs = pkgsFor system;
         in
@@ -49,17 +52,30 @@
         };
     in
     {
-      packages = forAllSystems (system:
-        let pf = packagesFor system;
-        in {
-          inherit (pf) punktfunk-host punktfunk-client punktfunk-web punktfunk-scripting punktfunk-tray;
+      packages = forAllSystems (
+        system:
+        let
+          pf = packagesFor system;
+        in
+        {
+          inherit (pf)
+            punktfunk-host
+            punktfunk-client
+            punktfunk-web
+            punktfunk-scripting
+            punktfunk-tray
+            ;
           default = pf.punktfunk-host;
-        });
+        }
+      );
 
       # `nix run .#punktfunk-host -- serve` / `nix run .#punktfunk-client`.
-      apps = forAllSystems (system:
-        let pf = packagesFor system;
-        in {
+      apps = forAllSystems (
+        system:
+        let
+          pf = packagesFor system;
+        in
+        {
           punktfunk-host = {
             type = "app";
             program = "${pf.punktfunk-host}/bin/punktfunk-host";
@@ -80,19 +96,30 @@
             program = "${pf.punktfunk-scripting}/bin/punktfunk-scripting";
           };
           default = self.apps.${system}.punktfunk-host;
-        });
+        }
+      );
 
       # `nix flake check` builds every package (web included — needs its deps hash filled in, see
       # packaging/nix/README.md).
-      checks = forAllSystems (system:
-        let pf = packagesFor system;
-        in {
-          inherit (pf) punktfunk-host punktfunk-client punktfunk-web punktfunk-scripting;
-        });
+      checks = forAllSystems (
+        system:
+        let
+          pf = packagesFor system;
+        in
+        {
+          inherit (pf)
+            punktfunk-host
+            punktfunk-client
+            punktfunk-web
+            punktfunk-scripting
+            ;
+        }
+      );
 
       # `nix develop` — the pinned toolchain plus every system lib the workspace links, wired so
       # `cargo build` (all crates, host + client) works out of the box.
-      devShells = forAllSystems (system:
+      devShells = forAllSystems (
+        system:
         let
           pkgs = pkgsFor system;
           toolchain = toolchainFor pkgs;
@@ -134,9 +161,16 @@
             PF_FFVK_VULKAN_INCLUDE = "${pkgs.vulkan-headers}/include";
             # CMake ≥ 4 rejects the pre-3.5 minimums some vendored C libs (libopus) still declare.
             CMAKE_POLICY_VERSION_MINIMUM = "3.5";
-            LD_LIBRARY_PATH = "/run/opengl-driver/lib:${pkgs.lib.makeLibraryPath [ pkgs.vulkan-loader pkgs.libGL gbm ]}";
+            LD_LIBRARY_PATH = "/run/opengl-driver/lib:${
+              pkgs.lib.makeLibraryPath [
+                pkgs.vulkan-loader
+                pkgs.libGL
+                gbm
+              ]
+            }";
           };
-        });
+        }
+      );
 
       formatter = forAllSystems (system: (pkgsFor system).nixfmt-rfc-style);
 
