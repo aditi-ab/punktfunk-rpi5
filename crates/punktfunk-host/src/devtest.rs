@@ -475,3 +475,125 @@ pub fn dualsense_windows_test(args: &[String]) -> Result<()> {
     println!("dualsense-windows-test: done (devnode removed)");
     Ok(())
 }
+
+/// Mirror a physical monitor and pull frames from it — the on-glass gate for per-monitor capture
+/// (`design/per-monitor-portal-capture.md` P2/P3), without needing a client to connect.
+///
+/// Opens the display backend exactly as a session would (so a `PUNKTFUNK_CAPTURE_MONITOR` pin
+/// routes to the mirror backend), attaches a capturer to whatever PipeWire node comes back, and
+/// reports the frames it actually receives. What it proves that a unit test cannot: the compositor
+/// accepted the record request for a NAMED head, and that head is producing pixels at its own size.
+///
+/// `--monitor <CONNECTOR>` pins for this run (else `PUNKTFUNK_CAPTURE_MONITOR`); `--seconds N`.
+#[cfg(target_os = "linux")]
+pub fn mirror_test(args: &[String]) -> Result<()> {
+    use std::time::{Duration, Instant};
+    let arg = |name: &str| {
+        args.iter()
+            .skip_while(|a| a.as_str() != name)
+            .nth(1)
+            .cloned()
+    };
+    let secs: u64 = arg("--seconds").and_then(|s| s.parse().ok()).unwrap_or(5);
+    // `--monitor` cannot work by setting PUNKTFUNK_CAPTURE_MONITOR here: pf_host_config parses the
+    // environment ONCE and startup already read it, so this process would still see the old
+    // snapshot. An explicit connector therefore goes through `open_mirror` below; only the unset
+    // case falls back to the pin (and to `open`, which is the production routing).
+    let explicit = arg("--monitor");
+    let want = explicit
+        .clone()
+        .or_else(|| pf_host_config::config().capture_monitor.clone())
+        .context(
+            "no monitor named — pass --monitor <CONNECTOR> or set PUNKTFUNK_CAPTURE_MONITOR",
+        )?;
+
+    let compositor = crate::vdisplay::detect()?;
+    let monitors = crate::vdisplay::monitors::list(compositor)?;
+    let target = crate::vdisplay::monitors::resolve(&monitors, &want)?;
+    println!(
+        "mirror-test: {compositor:?} {} ({}) at +{},+{}",
+        target.connector,
+        target.mode_label(),
+        target.x,
+        target.y
+    );
+
+    // No `--monitor` ⇒ exercise the PRODUCTION routing (`open` consulting the pin), which is the
+    // more valuable path to prove; an explicit connector takes the direct opener.
+    let mut vd = match &explicit {
+        Some(connector) => crate::vdisplay::open_mirror(compositor, connector)?,
+        None => crate::vdisplay::open(compositor)?,
+    };
+    // The mode is ignored by the mirror backend (a panel runs at the mode its owner set); pass the
+    // head's own so this also behaves if the pin is ever unset mid-test.
+    let mode = crate::vdisplay::Mode {
+        width: target.width,
+        height: target.height,
+        refresh_hz: 60,
+    };
+    let vout = vd.create(mode).context("open the mirror display")?;
+    println!(
+        "mirror-test: node_id={} preferred={:?} ownership={:?}",
+        vout.node_id, vout.preferred_mode, vout.ownership
+    );
+
+    // Default to the GPU (dmabuf zero-copy) path a real session uses; `--cpu` forces the mmap
+    // path, which is worth having as a switch — the two negotiate different PipeWire buffer types.
+    let gpu = !args.iter().any(|a| a == "--cpu");
+    let fmt = pf_frame::OutputFormat::resolve(false, gpu);
+    println!(
+        "mirror-test: capture path = {}",
+        if gpu { "gpu/dmabuf" } else { "cpu/mmap" }
+    );
+    let mut cap = crate::capture::capture_virtual_output(
+        vout,
+        fmt,
+        crate::session_plan::CaptureBackend::resolve(),
+    )
+    .context("attach a capturer to the mirrored monitor")?;
+    cap.set_active(true);
+
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    let (mut frames, mut first) = (0u32, None);
+    let mut idle = 0u32;
+    let mut dims = (0u32, 0u32);
+    while Instant::now() < deadline {
+        match cap.next_frame_within(Duration::from_secs(5)) {
+            Ok(f) => {
+                if first.is_none() {
+                    first = Some(Instant::now());
+                    println!(
+                        "mirror-test: FIRST FRAME {}x{} {:?}",
+                        f.width, f.height, f.format
+                    );
+                }
+                dims = (f.width, f.height);
+                frames += 1;
+            }
+            // A timeout is NOT fatal here: compositor screencast is damage-driven, so a static
+            // desktop legitimately produces nothing for seconds at a time (the host's own capture
+            // diag logs `new_fps=0` for virtual outputs on an idle desktop for the same reason).
+            // Keep waiting until the deadline instead of ending the measurement on the first gap.
+            Err(e) => {
+                idle += 1;
+                if idle == 1 {
+                    println!("mirror-test: (idle — no damage yet: {e:#})");
+                }
+            }
+        }
+    }
+    match first {
+        Some(_) => println!(
+            "mirror-test: OK — {frames} frames in {secs}s at {}x{} ({:.1} fps over the whole run, \
+             {idle} idle gaps). Compositor capture is damage-driven: a static desktop produces \
+             nothing, so judge this by whether frames track what is happening on screen.",
+            dims.0,
+            dims.1,
+            frames as f64 / secs as f64
+        ),
+        None => {
+            anyhow::bail!("no frames arrived in {secs}s — the cast started but produced nothing")
+        }
+    }
+    Ok(())
+}

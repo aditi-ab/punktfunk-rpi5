@@ -333,6 +333,18 @@ pub fn open(compositor: Compositor) -> Result<Box<dyn VirtualDisplay>> {
     }
 }
 
+/// Open the **mirror** backend for a specific monitor, bypassing the `PUNKTFUNK_CAPTURE_MONITOR`
+/// pin that [`open`] consults. For tools that name the head explicitly (`punktfunk-host
+/// mirror-test`) — the pin can't serve them, since `pf_host_config` parses the environment once at
+/// startup, so a tool setting the variable for itself would be reading a snapshot taken before it.
+#[cfg(target_os = "linux")]
+pub fn open_mirror(compositor: Compositor, connector: &str) -> Result<Box<dyn VirtualDisplay>> {
+    Ok(Box::new(mirror::MirrorDisplay::new(
+        compositor,
+        connector.to_string(),
+    )?))
+}
+
 /// Readiness probe for `compositor`: is it up and able to create a virtual output *right
 /// now*? A session-bringup script polls this (via `punktfunk-host probe-compositor`) to gate
 /// on actual readiness instead of racing the compositor with a blind sleep.

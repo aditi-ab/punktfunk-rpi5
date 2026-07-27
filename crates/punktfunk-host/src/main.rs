@@ -506,6 +506,10 @@ fn real_main() -> Result<()> {
             }
             Ok(())
         }
+        // Mirror a pinned physical monitor and pull frames from it — the per-monitor capture
+        // on-glass gate, with no client involved.
+        #[cfg(target_os = "linux")]
+        Some("mirror-test") => devtest::mirror_test(&args),
         // Create a virtual DualSense via UHID and exercise it (validation, no streaming session).
         #[cfg(target_os = "linux")]
         Some("dualsense-test") => devtest::dualsense_test(&args),
