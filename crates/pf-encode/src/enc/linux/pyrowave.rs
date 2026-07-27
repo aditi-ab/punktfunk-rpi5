@@ -395,6 +395,9 @@ pub struct PyroWaveEncoder {
     /// packet to it, so each wire shard carries whole self-delimiting packets. `None` =
     /// one packet per AU (the dense MVP shape).
     wire_chunk: Option<usize>,
+    /// Measured windowing inflation → rate-budget deflation, so the bitrate pin holds on the
+    /// WIRE, not just the raw bitstream (see [`crate::pyrowave_wire::WireBudget`]).
+    wire_budget: crate::pyrowave_wire::WireBudget,
     bitstream: Vec<u8>,
     pending: VecDeque<EncodedFrame>,
     frame_count: u64,
@@ -653,6 +656,7 @@ impl PyroWaveEncoder {
             chroma444,
             frame_budget: budget_for(bitrate, fps),
             wire_chunk: None,
+            wire_budget: crate::pyrowave_wire::WireBudget::new(),
             bitstream: Vec::new(),
             pending: VecDeque::new(),
             frame_count: 0,
@@ -1120,6 +1124,16 @@ impl PyroWaveEncoder {
         Ok(self.cpu_img.unwrap().2)
     }
 
+    /// The per-frame budget handed to pyrowave rate control: `frame_budget`, deflated by the
+    /// measured windowing inflation when the datagram-aligned wire is on — the bitrate pin is
+    /// a promise about the wire, not the raw bitstream (see [`crate::pyrowave_wire::WireBudget`]).
+    fn rate_budget(&self) -> usize {
+        match self.wire_chunk {
+            Some(_) => self.wire_budget.deflate(self.frame_budget).max(64 * 1024),
+            None => self.frame_budget,
+        }
+    }
+
     /// One frame, synchronously: ingest → CSC → pyrowave encode (recorded into our command
     /// buffer) → submit + fence wait (sub-ms) → packetize into an `EncodedFrame`.
     unsafe fn encode_frame(&mut self, frame: &CapturedFrame) -> Result<()> {
@@ -1175,6 +1189,8 @@ impl PyroWaveEncoder {
         // paths propagate untouched and the recovery (`reset()`/`Drop`) `device_wait_idle()`s
         // before anything touches `cmd`; a buffer that completed its one-time submit is INVALID,
         // which the next `begin` may implicitly reset.
+        // Resolved before the closure (which borrows `self` mutably for the recording calls).
+        let rate_budget = self.rate_budget();
         let record_and_submit = (|| -> Result<()> {
             dev.begin_command_buffer(
                 self.cmd,
@@ -1396,7 +1412,7 @@ impl PyroWaveEncoder {
                 ],
             };
             let rc = pw::pyrowave_rate_control {
-                maximum_bitstream_size: self.frame_budget,
+                maximum_bitstream_size: rate_budget,
             };
             pw::pyrowave_device_set_command_buffer(
                 self.pw_dev,
@@ -1476,6 +1492,10 @@ impl PyroWaveEncoder {
         // single packet, or the datagram-aligned windowed AU (§4.4).
         let pkts: Vec<(usize, usize)> = packets.iter().map(|p| (p.offset, p.size)).collect();
         let au = crate::pyrowave_wire::build_au(&pkts, &self.bitstream, self.wire_chunk);
+        if self.wire_chunk.is_some() {
+            let raw: usize = pkts.iter().map(|&(_, s)| s).sum();
+            self.wire_budget.observe(raw, au.len());
+        }
         self.frame_count += 1;
         self.pending.push_back(EncodedFrame {
             data: au,

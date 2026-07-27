@@ -159,6 +159,9 @@ pub struct PyroWaveEncoder {
     frame_budget: usize,
     /// Datagram-aligned mode (plan §4.4): packetize at this boundary. `None` = one dense packet/AU.
     wire_chunk: Option<usize>,
+    /// Measured windowing inflation → rate-budget deflation, so the bitrate pin holds on the
+    /// WIRE, not just the raw bitstream (see [`pyrowave_wire::WireBudget`]).
+    wire_budget: pyrowave_wire::WireBudget,
     bitstream: Vec<u8>,
     pending: VecDeque<EncodedFrame>,
 }
@@ -288,6 +291,7 @@ impl PyroWaveEncoder {
                 hdr16,
                 frame_budget,
                 wire_chunk: None,
+                wire_budget: pyrowave_wire::WireBudget::new(),
                 bitstream: Vec::new(),
                 pending: VecDeque::new(),
             })
@@ -441,6 +445,16 @@ impl PyroWaveEncoder {
     ///
     /// # Safety
     /// Runs on the single encode thread; all pyrowave calls take handles this struct owns.
+    /// The per-frame budget handed to pyrowave rate control: `frame_budget`, deflated by the
+    /// measured windowing inflation when the datagram-aligned wire is on — the bitrate pin is
+    /// a promise about the wire, not the raw bitstream (see [`pyrowave_wire::WireBudget`]).
+    fn rate_budget(&self) -> usize {
+        match self.wire_chunk {
+            Some(_) => self.wire_budget.deflate(self.frame_budget).max(64 * 1024),
+            None => self.frame_budget,
+        }
+    }
+
     unsafe fn encode_frame(&mut self, frame: &CapturedFrame) -> Result<()> {
         // A failed `reset()` leaves the encoder destroyed and null — fail cleanly rather than
         // handing null to pyrowave (see the Linux twin).
@@ -616,7 +630,7 @@ impl PyroWaveEncoder {
             sync: std::mem::zeroed(),
         };
         let rc = pw::pyrowave_rate_control {
-            maximum_bitstream_size: self.frame_budget,
+            maximum_bitstream_size: self.rate_budget(),
         };
         pw_check(
             pw::pyrowave_encoder_encode_gpu_synchronous(
@@ -664,6 +678,10 @@ impl PyroWaveEncoder {
         }
         let pkts: Vec<(usize, usize)> = packets.iter().map(|p| (p.offset, p.size)).collect();
         let au = pyrowave_wire::build_au(&pkts, &self.bitstream, self.wire_chunk);
+        if self.wire_chunk.is_some() {
+            let raw: usize = pkts.iter().map(|&(_, s)| s).sum();
+            self.wire_budget.observe(raw, au.len());
+        }
         self.pending.push_back(EncodedFrame {
             data: au,
             pts_ns: frame.pts_ns,

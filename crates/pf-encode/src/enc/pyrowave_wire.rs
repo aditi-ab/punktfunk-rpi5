@@ -81,6 +81,61 @@ pub(crate) fn block_count_32x32(width: u32, height: u32, chroma444: bool) -> u32
     count
 }
 
+/// Wire-aware deflation of the per-frame rate budget for the datagram-aligned mode.
+///
+/// [`build_au`]'s windowing inflates the codec bitstream on its way to the wire: greedy packing
+/// of pyrowave's few-hundred-byte atomic block packets into `chunk`-sized windows leaves the
+/// tail of most windows zero-padded, plus the 4-byte prefixes and FRAG-chain tails. At
+/// 1440p/~850 KiB frames that is ×1.2–1.3 — the 2026-07 field report's "Automatic" 407 Mb/s
+/// pin put 550 Mb/s on a 1 GbE link. The pin is a promise about the LINK, so the codec budget
+/// must absorb the framing: this tracker measures the real AU/bitstream ratio per frame and
+/// deflates the budget handed to pyrowave's rate control by its EMA. Sealed-datagram framing
+/// (packet header + AEAD tag) and FEC parity are deliberately NOT compensated — H.26x sessions
+/// carry those on top of the configured bitrate too, and the pin must mean the same thing for
+/// every codec.
+pub(crate) struct WireBudget {
+    /// EMA of `built AU bytes / packetized bitstream bytes`, ×1024 fixed point.
+    scale_x1024: u32,
+}
+
+impl WireBudget {
+    /// Startup prior (×1024 ≈ 1.25 — the 1440p field measurement's midpoint); the EMA
+    /// converges onto the session's real ratio within ~a second of frames.
+    const PRIOR_X1024: u32 = 1280;
+    /// EMA weight 1/8: content-driven per-frame wobble smooths out; a mode/bitrate change
+    /// re-converges in ~16 frames.
+    const EMA_SHIFT: u32 = 3;
+    /// Sanity clamp on the applied scale: never inflate the budget (×1.0 floor), never
+    /// deflate below half (×2.0 cap — tiny explicit bitrates window very coarsely).
+    const MIN_X1024: u32 = 1024;
+    const MAX_X1024: u32 = 2048;
+
+    pub(crate) fn new() -> WireBudget {
+        WireBudget {
+            scale_x1024: Self::PRIOR_X1024,
+        }
+    }
+
+    /// Record one frame's measured inflation (`bitstream_len` = the packetized codec bytes the
+    /// rate controller budgeted; `au_len` = the windowed AU that actually reaches the wire).
+    pub(crate) fn observe(&mut self, bitstream_len: usize, au_len: usize) {
+        if bitstream_len == 0 {
+            return;
+        }
+        let sample = ((au_len as u64 * 1024) / bitstream_len as u64)
+            .clamp(Self::MIN_X1024 as u64, Self::MAX_X1024 as u64) as u32;
+        let ema = self.scale_x1024 as i64;
+        self.scale_x1024 = (ema + ((sample as i64 - ema) >> Self::EMA_SHIFT)) as u32;
+    }
+
+    /// The rate-control budget that makes the WIRE hit `budget` bytes/frame under the
+    /// currently-measured inflation.
+    pub(crate) fn deflate(&self, budget: usize) -> usize {
+        let scale = self.scale_x1024.clamp(Self::MIN_X1024, Self::MAX_X1024) as u64;
+        ((budget as u64 * 1024) / scale) as usize
+    }
+}
+
 /// Frame pyrowave's `packets` (each an `(offset, size)` into `bitstream`) into the wire AU.
 /// `wire_chunk = None` copies the single dense packet; `Some(chunk)` produces the windowed
 /// datagram-aligned AU (a whole number of `chunk`-sized windows).
@@ -257,6 +312,37 @@ mod tests {
         assert!(block_count_32x32(8192, 8192, false) > u16::MAX as u32);
         // The largest 4:2:0 mode that still fits, for the boundary the validator enforces.
         assert!(block_count_32x32(7680, 4320, false) <= u16::MAX as u32);
+    }
+
+    /// The wire-budget tracker: converges its EMA onto the measured AU/bitstream inflation,
+    /// deflates the budget by exactly that ratio, and clamps runaway samples.
+    #[test]
+    fn wire_budget_converges_and_deflates() {
+        let mut wb = WireBudget::new();
+        // Prior ≈ ×1.25 (1280/1024): the first deflation is already conservative.
+        assert_eq!(wb.deflate(1_024_000), 819_200);
+        // Feed a steady ×1.30 inflation; the EMA must converge onto it.
+        for _ in 0..64 {
+            wb.observe(1000, 1300);
+        }
+        let b = wb.deflate(1_024_000);
+        let expect = 1_024_000_u64 * 1000 / 1300;
+        assert!(
+            (b as i64 - expect as i64).unsigned_abs() < 8_000,
+            "budget {b} should approach {expect}"
+        );
+        // A dense-ish run (×1.0) walks it back down to no deflation.
+        for _ in 0..64 {
+            wb.observe(1000, 1000);
+        }
+        assert_eq!(wb.deflate(1_024_000), 1_024_000);
+        // Garbage samples are clamped: an absurd ratio can at most halve the budget…
+        for _ in 0..256 {
+            wb.observe(10, 1000);
+        }
+        assert!(wb.deflate(1_024_000) >= 512_000);
+        // …and a zero-length observation is ignored, never a division by zero.
+        wb.observe(0, 1000);
     }
 
     #[test]
