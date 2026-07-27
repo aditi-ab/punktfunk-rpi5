@@ -174,25 +174,12 @@ impl VirtualDisplay for HyprlandDisplay {
         set_monitor_rule(&name, mode).with_context(|| format!("set monitor rule for {name}"))?;
 
         // Steer xdph's custom picker at our new output, then run the portal handshake on its own
-        // thread (it parks to keep the cast alive, like the other backends).
-        ensure_xdph_config()?;
-        let sel = selection_file();
-        std::fs::write(&sel, picker_selection_line(&name))
-            .with_context(|| format!("write {sel}"))?;
-
-        let (setup_tx, setup_rx) = std::sync::mpsc::channel::<Result<(OwnedFd, u32), String>>();
-        let stop = Arc::new(AtomicBool::new(false));
-        let stop_thread = stop.clone();
-        let hw_cursor = self.hw_cursor;
-        thread::Builder::new()
-            .name("punktfunk-hypr-vout".into())
-            .spawn(move || portal_thread(setup_tx, stop_thread, hw_cursor))
-            .context("spawn hyprland portal thread")?;
-
-        let (fd, node_id) = match setup_rx.recv_timeout(Duration::from_secs(20)) {
-            Ok(Ok(v)) => v,
-            Ok(Err(e)) => bail!("ScreenCast portal on {name} failed: {e}"),
-            Err(_) => bail!("timed out waiting for the ScreenCast portal on {name}"),
+        // thread (it parks to keep the cast alive, like the other backends). Serialized: the
+        // selection is one per-user file, so a concurrent session's write between ours and xdph's
+        // read would silently capture the wrong output (see `SELECTION_LOCK`).
+        let (fd, node_id, stop) = {
+            let _sel = SELECTION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            select_and_cast(&name, self.hw_cursor)?
         };
         tracing::info!(
             node_id,
@@ -270,6 +257,49 @@ fn hyprctl(args: &[&str]) -> Result<String> {
         );
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Serializes **write-the-selection → complete-the-handshake**, process-wide — see the wlroots
+/// backend's `SELECTION_LOCK`. The xdph selection is likewise one per-user file, so a concurrent
+/// write between ours and xdph's read would silently steer capture at the other session's output.
+static SELECTION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Point xdph's custom picker at `output` and run the ScreenCast handshake, returning the portal fd
+/// + node id and the guard that stops the cast. The caller must hold [`SELECTION_LOCK`].
+fn select_and_cast(output: &str, hw_cursor: bool) -> Result<(OwnedFd, u32, Arc<AtomicBool>)> {
+    ensure_xdph_config()?;
+    let sel = selection_file();
+    std::fs::write(&sel, picker_selection_line(output)).with_context(|| format!("write {sel}"))?;
+    let (setup_tx, setup_rx) = std::sync::mpsc::channel::<Result<(OwnedFd, u32), String>>();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_thread = stop.clone();
+    thread::Builder::new()
+        .name("punktfunk-hypr-cast".into())
+        .spawn(move || portal_thread(setup_tx, stop_thread, hw_cursor))
+        .context("spawn hyprland portal thread")?;
+    match setup_rx.recv_timeout(Duration::from_secs(20)) {
+        Ok(Ok((fd, node_id))) => Ok((fd, node_id, stop)),
+        Ok(Err(e)) => bail!("ScreenCast portal on {output} failed: {e}"),
+        Err(_) => bail!("timed out waiting for the ScreenCast portal on {output}"),
+    }
+}
+
+/// Record an **existing** Hyprland monitor — the monitor-mirror path
+/// (`design/per-monitor-portal-capture.md` L3): the same custom-picker mechanism the virtual-output
+/// path uses, pointed at a physical connector, so no GUI picker is involved.
+///
+/// The keepalive stops the cast only — the monitor is Hyprland's, not ours.
+pub(crate) fn stream_existing_output(
+    connector: &str,
+    hw_cursor: bool,
+) -> Result<crate::mirror::MirrorStream> {
+    let _sel = SELECTION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (fd, node_id, stop) = select_and_cast(connector, hw_cursor)?;
+    Ok(crate::mirror::MirrorStream {
+        node_id,
+        remote_fd: Some(fd),
+        keepalive: Box::new(StopGuard(stop)),
+    })
 }
 
 /// Every head Hyprland reports, for [`crate::monitors::list`].

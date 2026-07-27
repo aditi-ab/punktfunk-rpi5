@@ -111,25 +111,13 @@ impl VirtualDisplay for WlrootsDisplay {
         swaymsg(&["output", &name, "enable"])
             .with_context(|| format!("swaymsg output {name} enable"))?;
 
-        // Steer xdpw's headless output chooser at our new output, then run the portal
-        // handshake on its own thread (it parks to keep the cast alive, like the other backends).
-        ensure_xdpw_config()?;
-        let chooser = chooser_file();
-        std::fs::write(&chooser, format!("Monitor: {name}\n"))
-            .with_context(|| format!("write {chooser}"))?;
-        let (setup_tx, setup_rx) = std::sync::mpsc::channel::<Result<(OwnedFd, u32), String>>();
-        let stop = Arc::new(AtomicBool::new(false));
-        let stop_thread = stop.clone();
-        let hw_cursor = self.hw_cursor;
-        thread::Builder::new()
-            .name("punktfunk-wlr-vout".into())
-            .spawn(move || portal_thread(setup_tx, stop_thread, hw_cursor))
-            .context("spawn wlroots portal thread")?;
-
-        let (fd, node_id) = match setup_rx.recv_timeout(Duration::from_secs(20)) {
-            Ok(Ok(v)) => v,
-            Ok(Err(e)) => bail!("ScreenCast portal on {name} failed: {e}"),
-            Err(_) => bail!("timed out waiting for the ScreenCast portal on {name}"),
+        // Steer xdpw's headless output chooser at our new output, then run the portal handshake on
+        // its own thread (it parks to keep the cast alive, like the other backends). Serialized:
+        // the chooser is one per-user file, so a concurrent session's write between ours and xdpw's
+        // read would silently capture the wrong output (see `SELECTION_LOCK`).
+        let (fd, node_id, stop) = {
+            let _sel = SELECTION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            select_and_cast(&name, self.hw_cursor)?
         };
         tracing::info!(
             node_id,
@@ -236,6 +224,54 @@ fn output_names() -> Result<Vec<String>> {
         .iter()
         .filter_map(|o| o.get("name").and_then(|n| n.as_str()).map(str::to_owned))
         .collect())
+}
+
+/// Serializes **write-the-chooser → complete-the-handshake**, process-wide.
+///
+/// The chooser is a single per-user file: whoever writes last before xdpw reads wins. Two sessions
+/// starting at once (or a mirror starting beside a virtual output) would otherwise race, and the
+/// loser doesn't fail — it silently captures the *other* session's output. Held across the portal
+/// handshake, not just the write, because the read happens inside it.
+static SELECTION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Point xdpw's chooser at `output` and run the ScreenCast handshake, returning the portal fd +
+/// node id and the guard that stops the cast. The caller must hold [`SELECTION_LOCK`].
+fn select_and_cast(output: &str, hw_cursor: bool) -> Result<(OwnedFd, u32, Arc<AtomicBool>)> {
+    ensure_xdpw_config()?;
+    let chooser = chooser_file();
+    std::fs::write(&chooser, format!("Monitor: {output}\n"))
+        .with_context(|| format!("write {chooser}"))?;
+    let (setup_tx, setup_rx) = std::sync::mpsc::channel::<Result<(OwnedFd, u32), String>>();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_thread = stop.clone();
+    thread::Builder::new()
+        .name("punktfunk-wlr-cast".into())
+        .spawn(move || portal_thread(setup_tx, stop_thread, hw_cursor))
+        .context("spawn wlroots portal thread")?;
+    match setup_rx.recv_timeout(Duration::from_secs(20)) {
+        Ok(Ok((fd, node_id))) => Ok((fd, node_id, stop)),
+        Ok(Err(e)) => bail!("ScreenCast portal on {output} failed: {e}"),
+        Err(_) => bail!("timed out waiting for the ScreenCast portal on {output}"),
+    }
+}
+
+/// Record an **existing** sway output — the monitor-mirror path
+/// (`design/per-monitor-portal-capture.md` L3). Same chooser mechanism the virtual-output path
+/// uses, pointed at a physical connector instead of a headless one we created, so it inherits the
+/// "no GUI picker" property a background service needs.
+///
+/// The keepalive stops the cast and nothing else: sway keeps the monitor, because we never made it.
+pub(crate) fn stream_existing_output(
+    connector: &str,
+    hw_cursor: bool,
+) -> Result<crate::mirror::MirrorStream> {
+    let _sel = SELECTION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (fd, node_id, stop) = select_and_cast(connector, hw_cursor)?;
+    Ok(crate::mirror::MirrorStream {
+        node_id,
+        remote_fd: Some(fd),
+        keepalive: Box::new(StopGuard(stop)),
+    })
 }
 
 /// Every head sway reports, for [`crate::monitors::list`].

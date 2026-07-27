@@ -1030,7 +1030,7 @@ fn virtual_output_thread(
 pub(crate) fn stream_existing_output(
     connector: &str,
     hw_cursor: bool,
-) -> Result<(u32, Box<dyn Send>)> {
+) -> Result<crate::mirror::MirrorStream> {
     let pointer_mode = if hw_cursor {
         POINTER_METADATA
     } else {
@@ -1053,7 +1053,12 @@ pub(crate) fn stream_existing_output(
         Ok(Err(e)) => bail!("KWin monitor mirror failed: {e}"),
         Err(_) => bail!("timed out recording the KWin output {connector:?}"),
     };
-    Ok((node_id, Box::new(StopOnDrop(stop)) as Box<dyn Send>))
+    Ok(crate::mirror::MirrorStream {
+        node_id,
+        // KWin publishes on the user's own PipeWire daemon — no portal remote to carry.
+        remote_fd: None,
+        keepalive: Box::new(StopOnDrop(stop)),
+    })
 }
 
 /// Stops the mirror thread (and thus the recording) when the capturer drops it.

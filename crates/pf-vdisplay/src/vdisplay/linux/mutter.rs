@@ -390,7 +390,7 @@ fn session_thread(
 pub(crate) fn stream_existing_output(
     connector: &str,
     hw_cursor: bool,
-) -> Result<(u32, Box<dyn Send>)> {
+) -> Result<crate::mirror::MirrorStream> {
     let (setup_tx, setup_rx) = std::sync::mpsc::channel::<Result<u32, String>>();
     let stop = Arc::new(AtomicBool::new(false));
     let stop_thread = stop.clone();
@@ -404,7 +404,12 @@ pub(crate) fn stream_existing_output(
         Ok(Err(e)) => bail!("Mutter monitor mirror failed: {e}"),
         Err(_) => bail!("timed out recording the Mutter output {connector:?}"),
     };
-    Ok((node_id, Box::new(MirrorStop(stop)) as Box<dyn Send>))
+    Ok(crate::mirror::MirrorStream {
+        node_id,
+        // Mutter's RecordMonitor node lives on the user's PipeWire daemon (like RecordVirtual).
+        remote_fd: None,
+        keepalive: Box::new(MirrorStop(stop)),
+    })
 }
 
 /// Stops the mirror thread — and with it the recording — when the capturer drops it.
