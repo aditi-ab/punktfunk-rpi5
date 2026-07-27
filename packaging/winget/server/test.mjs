@@ -100,6 +100,16 @@ const post = (p, body) =>
   check("manifest: installer has URL + sha256", !!inst?.InstallerUrl && /^[0-9A-F]{64}$/i.test(inst?.InstallerSha256 ?? ""));
   check("manifest: installer-level fields folded into the entry", inst?.InstallerType === "inno" && inst?.Scope === "machine");
   check("manifest: ProductCode preserved for correlation", !!inst?.ProductCode || !!v?.ProductCodes?.length);
+  // A Log switch is only useful if winget SUBSTITUTES the path. <LOGPATH> is the one token it
+  // replaces; anything else is passed through verbatim, and `|LOGPATH|` shipped in 0.20.0 — Inno
+  // then rejected `|` as a filename and aborted with "Error creating log file", in EVERY install
+  // mode, for any caller that requests a log (UniGetUI does by default). Reported from the field.
+  const log = inst?.InstallerSwitches?.Log;
+  check(
+    "manifest: Log switch uses winget's <LOGPATH> token, if present",
+    log === undefined || (log.includes("<LOGPATH>") && !/\|[A-Z]+\|/.test(log)),
+    `got ${JSON.stringify(log)}`,
+  );
 }
 {
   const res = await get("packageManifests/UNOM.PUNKTFUNKHOST");

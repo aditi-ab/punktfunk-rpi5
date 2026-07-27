@@ -35,7 +35,14 @@ InstallerSwitches:
   #             gamestream, allowpublicfw, startservice, trayicon
   Silent: /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-
   SilentWithProgress: /SILENT /SUPPRESSMSGBOXES /NORESTART /SP-
-  Log: /LOG="|LOGPATH|"
+  # <LOGPATH> is winget's OWN token and the only spelling it substitutes (see the schema this file
+  # declares: "…<LOGPATH> token can be included in the switch value so that winget will replace the
+  # token with user provided path"). It was written |LOGPATH| — not a token, so winget passed the
+  # literal string through and Inno rejected it: `|` is not legal in a Windows filename, giving
+  # "Error creating log file: The filename, directory name, or volume label syntax is incorrect."
+  # That aborted the install in EVERY mode, interactive included, for any caller that asks for a
+  # log — UniGetUI does so by default, which is how it was reported.
+  Log: /LOG="<LOGPATH>"
 
 # Inno writes its ARP entry under <AppId>_is1; this is what correlates an installed host with the
 # package for `winget list` / `winget upgrade`. Must track AppId in the .iss.
