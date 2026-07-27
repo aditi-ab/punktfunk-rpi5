@@ -93,7 +93,10 @@ export const BrowseTab: FC<{
 			>
 				{shown.length === 0 ? (
 					<Card>
-						<CardContent className="p-8 text-center text-sm text-muted-foreground">
+						<CardContent
+							flush
+							className="p-8 text-center text-sm text-muted-foreground"
+						>
 							{entries.length === 0 ? m.store_empty() : m.store_no_match()}
 						</CardContent>
 					</Card>

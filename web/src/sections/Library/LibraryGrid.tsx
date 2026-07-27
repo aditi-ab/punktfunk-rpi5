@@ -61,7 +61,13 @@ export const LibraryGrid: FC<{
 		>
 			{games.length === 0 ? (
 				<Card>
-					<CardContent className="p-8 text-center text-sm text-muted-foreground">
+					{/* `flush`, not a bare `p-8`: the default `sm:pt-0` would survive the override
+					    (tailwind-merge only resolves conflicts within a variant) and eat the top
+					    inset at ≥640px — see the CardContent doc comment. */}
+					<CardContent
+						flush
+						className="p-8 text-center text-sm text-muted-foreground"
+					>
 						{m.library_empty()}
 					</CardContent>
 				</Card>
