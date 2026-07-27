@@ -10,7 +10,7 @@
       "name": "MIT OR Apache-2.0",
       "identifier": "MIT OR Apache-2.0"
     },
-    "version": "0.19.2"
+    "version": "0.20.0"
   },
   "paths": {
     "/api/v1/clients": {
@@ -6633,7 +6633,7 @@
           "mbps": {
             "type": "number",
             "format": "float",
-            "description": "Transmit goodput (Mb/s)."
+            "description": "Attempted sealed wire bytes/s (Mb/s): full UDP payloads at seal time — video AU bytes\nplus shard framing (header + AEAD) plus FEC parity, and for PyroWave's datagram-aligned\nmode the zero-padded window tails. NOT goodput, and NOT reduced by socket send drops."
           },
           "packets_dropped": {
             "type": "integer",
