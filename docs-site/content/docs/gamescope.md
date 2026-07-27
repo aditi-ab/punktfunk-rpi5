@@ -69,6 +69,14 @@ depends on the display manager driving the autologin:
   restart ever loses its privilege mid-restore, `PUNKTFUNK_RECOVER_SESSION_CMD` (see
   [Configuration](/docs/configuration)) is fired as the fallback.
 
+  **Lingering is required here**, and the host turns it on for you the first time it takes the box
+  over. Stopping the display manager ends your last login session, and without
+  `loginctl enable-linger` logind stops your `systemd --user` manager about ten seconds later —
+  taking the host with it, mid-stream, with the display manager down and nothing left to bring it
+  back. If lingering can't be enabled the host refuses the takeover and degrades to attach instead
+  (above) rather than risk that. Run `sudo loginctl enable-linger "$USER"` once, as the setup guides
+  ask; `loginctl disable-linger "$USER"` reverts it.
+
   With the takeover authorized the **in-stream session switch round-trips** in managed mode:
   Steam's "Switch to Desktop" inside the streamed Game Mode returns the box to its desktop session
   and the stream follows it there; the desktop's "Return to Gaming Mode" switches it forward again.

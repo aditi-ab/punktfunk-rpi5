@@ -32,8 +32,24 @@ case "${1-}" in
     systemctl reset-failed "$dm" 2>/dev/null || :
     exec systemctl restart "$dm"
     ;;
+  linger)
+    # Keep the caller's own `systemd --user` manager alive across the stop. Stopping the display
+    # manager ends the user's last login session, and logind then stops user@<uid>.service after
+    # UserStopDelaySec (10s by default) — which takes the host that asked for the takeover with
+    # it, so nothing is left to restart the display manager and the box stays dark. Lingering is
+    # what breaks that dependency (the setup docs already ask for it).
+    #
+    # The user is NEVER caller-named: PKEXEC_UID is set by pkexec from the authenticated caller,
+    # so this grant enables lingering for that caller alone.
+    uid=${PKEXEC_UID:-}
+    [ -n "$uid" ] || {
+      echo "pf-dm-helper: no PKEXEC_UID in the environment — refusing to guess a user" >&2
+      exit 1
+    }
+    exec loginctl enable-linger "$uid"
+    ;;
   *)
-    echo "usage: pf-dm-helper stop|restore" >&2
+    echo "usage: pf-dm-helper stop|restore|linger" >&2
     exit 2
     ;;
 esac

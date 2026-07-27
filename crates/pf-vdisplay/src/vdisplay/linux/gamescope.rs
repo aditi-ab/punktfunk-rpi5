@@ -1164,8 +1164,8 @@ const DM_HELPER_PATHS: &[&str] = &[
     "/usr/lib/punktfunk/pf-dm-helper",
 ];
 
-/// Run the packaged DM helper (`stop` | `restore`) via pkexec. `false` when the helper isn't
-/// installed (tarball/old package), pkexec is missing, or polkit denies the action.
+/// Run the packaged DM helper (`stop` | `restore` | `linger`) via pkexec. `false` when the helper
+/// isn't installed (tarball/old package), pkexec is missing, or polkit denies the action.
 fn dm_helper(verb: &str) -> bool {
     let Some(helper) = DM_HELPER_PATHS
         .iter()
@@ -1196,6 +1196,78 @@ fn systemctl_system(args: &[&str]) -> bool {
     let mut cmd = Command::new("systemctl");
     cmd.arg("--no-ask-password").args(args);
     cmd.status().map(|s| s.success()).unwrap_or(false)
+}
+
+/// Would stopping the display manager also stop US? A packaged host runs as a `systemd --user`
+/// unit, so its lifetime hangs off the user manager — and the DM stop ends the user's last login
+/// session. logind then stops `user@<uid>.service` once `UserStopDelaySec` (10 s by default)
+/// elapses, taking the host with it: the stream dies mid-takeover, and nothing is left to restart
+/// the display manager, so the box stays dark until someone reaches a VT. **Field-proven on 0.20.0**
+/// (Nobara, 2026-07-27): DM stopped at 12:34:18.9, the user manager stopped the host at 12:34:29.0
+/// — 10.1 s, textbook `UserStopDelaySec`. It never showed on the repro VM because lingering was
+/// enabled there for the sessionless tests.
+///
+/// Lingering (`loginctl enable-linger` — which the KDE/GNOME/Arch setup docs already ask for) is
+/// what breaks the dependency: logind keeps the user manager up with no session at all. So ensure
+/// it BEFORE touching the DM, and refuse the takeover when it can't be ensured — the caller then
+/// degrades to attach, which mirrors the box's own session and never stops the DM.
+fn ensure_host_survives_dm_stop() -> bool {
+    if !host_is_under_user_manager() {
+        return true; // root / a system unit — the DM stop cannot reach us
+    }
+    if linger_enabled() {
+        return true;
+    }
+    // `set-self-linger` is `allow_active` in logind's own policy, so a host started inside the
+    // user's session can do this itself; a sessionless one (the packaged unit) goes through the
+    // helper, whose grant is scoped to the calling uid.
+    let uid = uid_string();
+    let _ = Command::new("loginctl")
+        .args(["--no-ask-password", "enable-linger", &uid])
+        .status();
+    if linger_enabled() || (dm_helper("linger") && linger_enabled()) {
+        tracing::info!(
+            uid,
+            "enabled lingering for this user — the managed takeover stops the display manager, \
+             which ends this login session, and without lingering logind would stop the host \
+             along with it (`loginctl disable-linger` reverts it)"
+        );
+        return true;
+    }
+    false
+}
+
+/// Is this process's lifetime tied to a `systemd --user` manager (i.e. would logind's user-manager
+/// stop take us down)? Read from our own cgroup path.
+fn host_is_under_user_manager() -> bool {
+    std::fs::read_to_string("/proc/self/cgroup")
+        .as_deref()
+        .map(cgroup_under_user_manager)
+        .unwrap_or(false)
+}
+
+/// [`host_is_under_user_manager`]'s test: does this `/proc/self/cgroup` content sit under a
+/// `user@<uid>.service` manager? Pure + unit-tested. A system unit
+/// (`/system.slice/punktfunk-host.service`) does not, and neither does a bare process started from
+/// a login shell (`/user.slice/user-1000.slice/session-2.scope`) — logind's user-manager stop only
+/// reaches units the user manager owns.
+fn cgroup_under_user_manager(cgroup: &str) -> bool {
+    cgroup.contains("user@")
+}
+
+/// Our uid as a string — what `loginctl` wants for a user argument.
+fn uid_string() -> String {
+    // SAFETY: `getuid()` is a parameterless POSIX call that always succeeds and touches no memory.
+    unsafe { libc::getuid() }.to_string()
+}
+
+/// Is lingering on for this user (logind keeps the `--user` manager alive with no session)?
+fn linger_enabled() -> bool {
+    Command::new("loginctl")
+        .args(["show-user", &uid_string(), "-p", "Linger", "--value"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "yes")
+        .unwrap_or(false)
 }
 
 /// Stop the display manager for a takeover on a mask-fragile DM flavor. Plain `systemctl stop` on
@@ -1424,6 +1496,19 @@ fn stop_autologin_sessions() -> Result<()> {
             return Ok(());
         }
         let dm = dm.expect("!is_none_or ⇒ Some");
+        // The DM stop ends this user's last login session. If our own lifetime hangs off the user
+        // manager and lingering can't be turned on, that stop kills the host ~10s later — with the
+        // box's display manager down and nobody left to bring it back. Degrading to attach is
+        // strictly better than a black screen that needs a VT to recover.
+        if !ensure_host_survives_dm_stop() {
+            bail!(
+                "stopping {dm} ends this user's last login session, and without lingering logind \
+                 would stop the user manager — and this host with it — about 10s later, leaving \
+                 the box with no display manager and nothing to restore it; enabling lingering \
+                 failed, so the managed takeover is unavailable (run `sudo loginctl enable-linger \
+                 $USER` once, as the setup docs ask, then reconnect)"
+            );
+        }
         if !try_stop_display_manager(&dm) {
             bail!(
                 "the box's gaming session is driven by {dm}, which does not survive a masked \
@@ -2181,10 +2266,30 @@ impl Drop for GamescopeProc {
 #[cfg(test)]
 mod tests {
     use super::{
-        cgroup_is_punktfunk_owned, connected_connector_under, display_manager_unit_under,
-        dm_survives_masked_unit, is_steam_launch, nested_wrapper_script, sentinel_advanced,
-        shape_dedicated_command,
+        cgroup_is_punktfunk_owned, cgroup_under_user_manager, connected_connector_under,
+        display_manager_unit_under, dm_survives_masked_unit, is_steam_launch,
+        nested_wrapper_script, sentinel_advanced, shape_dedicated_command,
     };
+
+    #[test]
+    fn user_manager_lifetime_detection() {
+        // The packaged host: a `--user` unit, so logind's user-manager stop takes it down with the
+        // login session the DM stop ends — this is the case that needs lingering.
+        assert!(cgroup_under_user_manager(
+            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/punktfunk-host.service\n"
+        ));
+        assert!(cgroup_under_user_manager(
+            "0::/user.slice/user-1000.slice/user@1000.service/session.slice/punktfunk-gamescope.service\n"
+        ));
+        // A system unit outlives every session — the DM stop cannot reach it.
+        assert!(!cgroup_under_user_manager(
+            "0::/system.slice/punktfunk-host.service\n"
+        ));
+        // Started from a login shell: owned by the session scope, not the user manager.
+        assert!(!cgroup_under_user_manager(
+            "0::/user.slice/user-1000.slice/session-2.scope\n"
+        ));
+    }
 
     #[test]
     fn session_select_sentinel_needs_a_baseline() {
