@@ -395,7 +395,15 @@ pub fn serve(
     })
 }
 
+/// The name this host shows up under everywhere a human sees it: Moonlight's host tile (the
+/// serverinfo `<hostname>` element) and Punktfunk's own client lists (the mDNS service *instance*
+/// name of both adverts). `PUNKTFUNK_HOST_NAME` wins — that's the point of the knob, a box whose
+/// machine name is `bazzite-htpc` can present itself as "Living Room" — otherwise it's the machine's
+/// own hostname, as it always was.
 fn hostname_string() -> String {
+    if let Some(n) = pf_host_config::config().host_name.as_deref() {
+        return sanitize_display_name(n);
+    }
     #[cfg(target_os = "windows")]
     if let Some(n) = std::env::var_os("COMPUTERNAME") {
         let s = n.to_string_lossy().trim().to_string();
@@ -408,6 +416,34 @@ fn hostname_string() -> String {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "punktfunk-host".to_string())
+}
+
+/// Make an operator-supplied host name safe to carry as an mDNS service instance name. Spaces and
+/// punctuation are fine there ("Living Room PC" is a perfectly legal instance name), but two things
+/// are not: a `.` splits the instance label — and clients derive the display name as the first label
+/// of the fullname (`pf-client-core::discovery`), so "Ben's PC v1.2" would arrive as "Ben's PC v1" —
+/// and DNS-SD caps a label at 63 bytes. Control characters go too.
+fn sanitize_display_name(raw: &str) -> String {
+    let cleaned: String = raw
+        .trim()
+        .chars()
+        .filter(|c| !c.is_control())
+        .map(|c| if c == '.' { '-' } else { c })
+        .collect();
+    // Truncate on a char boundary so multi-byte names can't produce invalid UTF-8.
+    let mut out = String::new();
+    for c in cleaned.trim().chars() {
+        if out.len() + c.len_utf8() > 63 {
+            break;
+        }
+        out.push(c);
+    }
+    let out = out.trim().to_string();
+    if out.is_empty() {
+        "punktfunk-host".to_string()
+    } else {
+        out
+    }
 }
 
 /// Load the persisted host uniqueid, or mint one (from the kernel UUID source) and store it.
@@ -486,6 +522,30 @@ pub(crate) fn save_paired(paired: &[Vec<u8>]) {
     if let Err(e) = std::fs::rename(&tmp, &path) {
         tracing::warn!(error = %e, "persisting pairings failed (rename)");
         let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+#[cfg(test)]
+mod host_name_tests {
+    use super::sanitize_display_name;
+
+    /// The display name rides the mDNS service INSTANCE label, and clients read it back as the
+    /// first label of the fullname — so a `.` truncates the name in every client list. Split from
+    /// the env read: `PUNKTFUNK_HOST_NAME` is process-global and must not race the parallel suite.
+    #[test]
+    fn display_name_survives_free_text_but_loses_the_label_breakers() {
+        assert_eq!(sanitize_display_name("Living Room PC"), "Living Room PC");
+        assert_eq!(sanitize_display_name("  Wohnzimmer  "), "Wohnzimmer");
+        // A dot would otherwise cut the name short client-side ("Ben's PC v1").
+        assert_eq!(sanitize_display_name("Ben's PC v1.2"), "Ben's PC v1-2");
+        assert_eq!(sanitize_display_name("Küche ☕"), "Küche ☕");
+        assert_eq!(sanitize_display_name("tab\there"), "tabhere");
+        // Never empty — an empty instance name is not registerable.
+        assert_eq!(sanitize_display_name("   "), "punktfunk-host");
+        // 63-byte DNS-SD label ceiling, truncated on a char boundary.
+        let long = sanitize_display_name(&"ü".repeat(100));
+        assert!(long.len() <= 63, "{} bytes", long.len());
+        assert_eq!(long, "ü".repeat(31));
     }
 }
 

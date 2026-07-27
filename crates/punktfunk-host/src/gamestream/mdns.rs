@@ -13,7 +13,9 @@ pub struct Advert {
 
 pub fn advertise(host: &Host) -> Result<Advert> {
     let daemon = ServiceDaemon::new().context("create mDNS daemon")?;
-    let host_name = format!("{}.local.", host.hostname);
+    // Instance name = the display name (what Moonlight lists); A-record target = the sanitized
+    // DNS label, so a free-text `PUNKTFUNK_HOST_NAME` can't produce an illegal record.
+    let host_name = format!("{}.local.", crate::discovery::dns_label(&host.hostname));
     // No TXT records are required for Moonlight discovery; it resolves the A record and then
     // GETs /serverinfo for capabilities.
     let props: HashMap<String, String> = HashMap::new();

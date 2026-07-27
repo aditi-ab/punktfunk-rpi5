@@ -51,6 +51,33 @@ fn mdns_off_value(s: &str) -> bool {
 /// Wire protocol id advertised in the `proto` TXT record.
 pub const NATIVE_PROTO: &str = "punktfunk/1";
 
+/// The DNS label a display name advertises its A record under (`<label>.local.`), which is a
+/// different thing from the service *instance* name: an instance name may be free text
+/// ("Living Room PC" — see `PUNKTFUNK_HOST_NAME`), a host name may not, and `mdns-sd` rejects the
+/// whole `ServiceInfo` if the target isn't a legal name — which would take discovery down entirely
+/// rather than just look wrong. Anything outside `[A-Za-z0-9.-]` becomes `-`; a name that is
+/// already legal (every machine hostname, i.e. every host without the override) passes through
+/// byte-for-byte, so this changes nothing for hosts that don't set the knob.
+pub(crate) fn dns_label(name: &str) -> String {
+    let mut out = String::new();
+    for c in name.trim().chars() {
+        if out.len() >= 63 {
+            break;
+        }
+        out.push(if c.is_ascii_alphanumeric() || c == '-' || c == '.' {
+            c
+        } else {
+            '-'
+        });
+    }
+    let out = out.trim_matches(['-', '.']).to_string();
+    if out.is_empty() {
+        "punktfunk-host".to_string()
+    } else {
+        out
+    }
+}
+
 /// Holds the mDNS daemon; dropping it unregisters the service.
 pub struct Advert {
     _daemon: ServiceDaemon,
@@ -70,7 +97,9 @@ pub fn advertise_native(
     mgmt_port: Option<u16>,
 ) -> Result<Advert> {
     let daemon = ServiceDaemon::new().context("create mDNS daemon")?;
-    let host_name = format!("{hostname}.local.");
+    // `hostname` is the DISPLAY name (the instance label clients read back); the A-record target
+    // has to be a legal DNS name, hence the separate sanitized label.
+    let host_name = format!("{}.local.", dns_label(hostname));
     let mut props: HashMap<String, String> = HashMap::new();
     props.insert("proto".into(), NATIVE_PROTO.into());
     props.insert("fp".into(), fingerprint.to_string());
@@ -116,7 +145,24 @@ pub fn advertise_native(
 
 #[cfg(test)]
 mod tests {
-    use super::mdns_off_value;
+    use super::{dns_label, mdns_off_value};
+
+    #[test]
+    fn dns_label_passes_machine_names_through_and_tames_display_names() {
+        // Every host WITHOUT PUNKTFUNK_HOST_NAME must advertise exactly what it did before.
+        for plain in ["bazzite-htpc", "DESKTOP-1A2B3C", "box.lan", "steamdeck"] {
+            assert_eq!(dns_label(plain), plain);
+        }
+        // A free-text display name becomes a legal label instead of poisoning the record.
+        assert_eq!(dns_label("Living Room PC"), "Living-Room-PC");
+        assert_eq!(dns_label("  Ben's Rig!  "), "Ben-s-Rig");
+        assert_eq!(dns_label("Wohnzimmer-PC ☕"), "Wohnzimmer-PC");
+        // Degenerate input still yields something registerable.
+        assert_eq!(dns_label("***"), "punktfunk-host");
+        assert_eq!(dns_label(""), "punktfunk-host");
+        // DNS caps a label at 63 bytes.
+        assert!(dns_label(&"a".repeat(200)).len() <= 63);
+    }
 
     #[test]
     fn mdns_off_grammar() {

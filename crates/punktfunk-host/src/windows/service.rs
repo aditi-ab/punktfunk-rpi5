@@ -814,7 +814,11 @@ fn ensure_default_host_env() -> Result<()> {
         # PUNKTFUNK_HOST_CMD=serve --gamestream\n\
         \n\
         # Force a specific render GPU by name substring (multi-GPU boxes only):\n\
-        # PUNKTFUNK_RENDER_ADAPTER=4090\n";
+        # PUNKTFUNK_RENDER_ADAPTER=4090\n\
+        \n\
+        # The name this host shows up under in Moonlight and the Punktfunk clients\n\
+        # (default: the machine's own computer name):\n\
+        # PUNKTFUNK_HOST_NAME=Living Room\n";
     // Write host.env DACL-locked to SYSTEM/Administrators: it controls the SYSTEM service's
     // environment + launched command line, so a local user must not be able to read or tamper with
     // it (security-review 2026-06-28 #3).

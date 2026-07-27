@@ -126,6 +126,7 @@ See your desktop page ([KDE](/docs/kde), [GNOME](/docs/gnome)) for when to set t
 
 | Setting | Values | Meaning |
 |---|---|---|
+| `PUNKTFUNK_HOST_NAME` | free text, e.g. `Living Room` | The name this host shows up under in Moonlight and in the Punktfunk clients. Default: the machine's own hostname — so a box called `bazzite-htpc` can present itself as `Living Room` without renaming the machine. Takes effect on host restart. Spaces and accents are fine; `.` becomes `-` (a dot would split the name in client lists) and it's capped at 63 characters. The machine's real hostname is still what the host answers to on the network. |
 | `PUNKTFUNK_MDNS` | `1` · `0` *(default on)* | mDNS adverts (native + GameStream). `0` skips them (same as `--no-mdns`) — for networks/containers where multicast doesn't work; add the host by address in the client instead. |
 | `PUNKTFUNK_DATA_PORT` | port | Pin the per-session video data plane to a fixed UDP port and stream direct (no hole-punch) — open exactly that port in the host firewall. Same as `serve --data-port`; see [Troubleshooting](/docs/troubleshooting). Default: random port + hole-punch. |
 

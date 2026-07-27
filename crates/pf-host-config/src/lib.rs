@@ -61,6 +61,12 @@ pub fn env_on(name: &str) -> Option<bool> {
 /// derived `Debug` impl, so the parser can stay a single platform-neutral function.
 #[derive(Debug, Clone, Default)]
 pub struct HostConfig {
+    /// `PUNKTFUNK_HOST_NAME` — the name this host shows up under in Moonlight (the serverinfo
+    /// `<hostname>` element) and in Punktfunk's own clients (the mDNS service *instance* name both
+    /// adverts carry). Unset/blank = the machine's own hostname, which is what it always was. Free
+    /// text ("Living Room PC"); the DNS-level `<label>.local.` target keeps using a sanitized
+    /// machine-safe label, so a spacey display name can't produce an invalid mDNS record.
+    pub host_name: Option<String>,
     /// `PUNKTFUNK_ENCODER` — explicit encoder-backend override (lowercased; empty = auto-detect by GPU vendor).
     pub encoder_pref: String,
     /// `PUNKTFUNK_RENDER_ADAPTER` — discrete render-GPU pin by description substring (`Some` even when empty:
@@ -159,6 +165,9 @@ impl HostConfig {
             // (`PUNKTFUNK_IDD_PUSH` was removed: IDD-push is the sole Windows capture path, so the knob
             // only split dispatch — capture ignored it while the vdisplay manager obeyed it, and `=0`
             // produced dead-swap-chain reuse on reconnect. A stale setting in an old host.env is ignored.)
+            host_name: val("PUNKTFUNK_HOST_NAME")
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
             encoder_pref: std::env::var("PUNKTFUNK_ENCODER")
                 .unwrap_or_default()
                 .to_ascii_lowercase(),
