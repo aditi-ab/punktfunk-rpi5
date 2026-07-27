@@ -33,10 +33,16 @@ pub struct StreamConfig {
     pub hdr: bool,
 }
 
-/// A pooled capturer plus the two PipeWire-negotiation-time properties reuse must match on —
-/// its HDR-ness and its metadata-cursor mode; a mismatch on either needs a fresh screencast
-/// session (see `AppState::video_cap`).
-pub type PooledCapturer = (Box<dyn Capturer>, bool, bool);
+/// A pooled capturer plus the three properties reuse must match on — its HDR-ness, its
+/// metadata-cursor mode (both fixed at PipeWire-negotiation time) and **which screen it is
+/// actually capturing**: the `capture_monitor` pin, or `None` for the portal's own pick. A
+/// mismatch on any of them needs a fresh screencast session (see `AppState::video_cap`).
+///
+/// The pin belongs in the key because it is a *live* setting — the console can re-aim the host
+/// between two GameStream connects (`design/per-monitor-portal-capture.md` §7.3). Without it the
+/// second connect would silently keep streaming the previous screen, which is the exact failure
+/// the pin exists to prevent.
+pub type PooledCapturer = (Box<dyn Capturer>, bool, bool, Option<String>);
 
 /// Slot for the persistent screen capturer, shared with the control plane and reused across
 /// streams so a reconnect doesn't open a second (conflicting) screencast session.
@@ -404,18 +410,31 @@ fn run(
         #[cfg(not(target_os = "linux"))]
         false
     };
+    // Which screen this stream must show. The host-wide pin (§5.3) applies to the compat plane too:
+    // the portal chooser cannot name a head, so a pinned host MIRRORS it here the same way the
+    // virtual source does via `vdisplay::open`. Without this a Moonlight client on a pinned host
+    // would silently get whichever monitor the portal handed back — "showing the wrong monitor is
+    // worse than showing none" is the rule the whole feature is built on.
+    #[cfg(target_os = "linux")]
+    let pinned = crate::vdisplay::capture_monitor();
+    #[cfg(not(target_os = "linux"))]
+    let pinned: Option<String> = None;
     let pooled = match video_cap.lock().unwrap().take() {
-        Some((c, was_hdr, was_meta)) if was_hdr == cfg.hdr && was_meta == metadata_cursor => {
+        Some((c, was_hdr, was_meta, ref was_pin))
+            if was_hdr == cfg.hdr && was_meta == metadata_cursor && *was_pin == pinned =>
+        {
             Some(c)
         }
-        Some((c, was_hdr, was_meta)) => {
+        Some((c, was_hdr, was_meta, was_pin)) => {
             tracing::info!(
                 was_hdr,
                 want_hdr = cfg.hdr,
                 was_metadata_cursor = was_meta,
                 want_metadata_cursor = metadata_cursor,
-                "video source: pooled capturer depth/cursor-mode mismatch — opening a fresh \
-                 screencast session"
+                was_monitor = was_pin.as_deref().unwrap_or("<portal's pick>"),
+                want_monitor = pinned.as_deref().unwrap_or("<portal's pick>"),
+                "video source: pooled capturer depth/cursor-mode/monitor mismatch — opening a \
+                 fresh screencast session"
             );
             drop(c);
             None
@@ -426,6 +445,20 @@ fn run(
         Some(c) => {
             tracing::info!("video source: reusing capturer");
             c
+        }
+        #[cfg(target_os = "linux")]
+        None if pf_host_config::config().video_source.as_deref() == Some("portal")
+            && pinned.is_some() =>
+        {
+            let connector = pinned.as_deref().expect("guarded by the match arm");
+            tracing::info!(
+                hdr = cfg.hdr,
+                metadata_cursor,
+                monitor = connector,
+                "video source: mirroring the pinned monitor (portal source, host pin)"
+            );
+            open_gs_mirror_source(connector, cfg, metadata_cursor)
+                .with_context(|| format!("mirror the pinned monitor {connector:?}"))?
         }
         None if pf_host_config::config().video_source.as_deref() == Some("portal") => {
             tracing::info!(
@@ -463,10 +496,10 @@ fn run(
     // point — and this path has no rebuild closure (unlike the virtual-output path above), so a
     // re-admitted dead capturer wedged GameStream portal video permanently, at 10 s per reconnect
     // attempt. Dropping it instead costs one fresh screencast session on the next connect. Note
-    // `result` may already be `Err` here, which is itself that signal. (`metadata_cursor` rides
-    // along as the second reuse key, beside HDR-ness — see `PooledCapturer`.)
+    // `result` may already be `Err` here, which is itself that signal. (`metadata_cursor` and the
+    // monitor pin ride along as the other two reuse keys, beside HDR-ness — see `PooledCapturer`.)
     if result.is_ok() && capturer.is_alive() {
-        *video_cap.lock().unwrap() = Some((capturer, cfg.hdr, metadata_cursor));
+        *video_cap.lock().unwrap() = Some((capturer, cfg.hdr, metadata_cursor, pinned));
     } else {
         tracing::info!(
             stream_failed = result.is_err(),
@@ -476,6 +509,53 @@ fn run(
         );
     }
     result
+}
+
+/// Open a capturer on the **pinned physical monitor** for the compat plane's portal source
+/// (`design/per-monitor-portal-capture.md` §5.3). The pin is host-wide, so it has to be honored on
+/// every plane that captures a screen — and the portal source is the one that otherwise takes
+/// "whichever head the portal hands back".
+///
+/// Deliberately *not* the `open_gs_virtual_source` path: this source launches nothing and creates no
+/// virtual output, so it needs neither the game-lifetime machinery nor the registry (a mirror is
+/// [`DisplayOwnership::External`](crate::vdisplay::DisplayOwnership) and would pass straight through
+/// it anyway). A missing monitor fails the stream loudly rather than falling back to another screen.
+#[cfg(target_os = "linux")]
+fn open_gs_mirror_source(
+    connector: &str,
+    cfg: StreamConfig,
+    metadata_cursor: bool,
+) -> Result<Box<dyn Capturer>> {
+    // Follow the live session first, exactly as the virtual source does — a mirror host that
+    // switched Desktop↔Game since startup must be enumerated against the compositor that is up now.
+    let active = crate::vdisplay::detect_active_session();
+    crate::vdisplay::observe_session_instance(&active);
+    crate::vdisplay::apply_session_env(&active);
+    let compositor = crate::vdisplay::compositor_for_kind(active.kind)
+        .map(Ok)
+        .unwrap_or_else(crate::vdisplay::detect)
+        .context("detect compositor")?;
+    crate::vdisplay::apply_input_env(compositor, false);
+    let mut vd = crate::vdisplay::open_mirror(compositor, connector)?;
+    // Cursor mode is the session's negotiated one: metadata where this encode path composites
+    // `frame.cursor`, otherwise let the compositor embed it (§7.5 — one resolver, per-backend
+    // expression).
+    vd.set_hw_cursor(metadata_cursor);
+    // The mirror backend ignores the requested mode by design (§7.3 — a panel runs at the mode its
+    // owner set, and the client scales); pass the client's anyway so the argument stays honest.
+    let vout = vd
+        .create(punktfunk_core::Mode {
+            width: cfg.width,
+            height: cfg.height,
+            refresh_hz: cfg.fps,
+        })
+        .context("start mirroring the pinned monitor")?;
+    crate::capture::capture_virtual_output(
+        vout,
+        pf_frame::OutputFormat::resolve(cfg.hdr, crate::zerocopy::enabled()),
+        crate::session_plan::CaptureBackend::resolve(),
+    )
+    .context("attach a capturer to the mirrored monitor")
 }
 
 /// What the compat plane resolved about the app a client launched: identity for the lease, the status
