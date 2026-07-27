@@ -335,6 +335,11 @@ struct FrameMsg {
     /// nor a stats capture is armed). The send thread accumulates them for the web-console sample:
     /// `cap_us` = `try_latest` (ring read + colour convert), `submit_us` = NVENC `encode_picture`
     /// launch, `wait_us` = `lock_bitstream` (the scheduling wait + ASIC encode = the "encode" stage).
+    /// SYNCHRONOUS backends (PyroWave: the whole GPU encode + fence wait runs inside `submit`)
+    /// carry their real encode time in `submit_us`, and the "encode" stage reads ~0 by
+    /// construction — read the pair together (the 2026-07 field triage read "encode 0.00" as an
+    /// instrumentation hole; it's the stage split's shape). The client-facing 0xCF `encode_us`
+    /// is unaffected: its anchor is stamped before `submit`, so it spans both.
     cap_us: u32,
     submit_us: u32,
     wait_us: u32,
@@ -1118,9 +1123,13 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
         tracing::info!("gamescope cursor: compositing the XFixes-sourced pointer into the video");
     }
     if streamed_wire {
+        // Client capability only — whether AUs actually stream per-slice depends on the encoder
+        // backend's `supports_chunked_poll()` (today: Linux direct-NVENC only), which doesn't
+        // exist yet at this point. The old wording ("chunked encoder output will stream
+        // per-slice") sent a 2026-07 field triage chasing a streaming path AMF doesn't have.
         tracing::info!(
-            "client accepts streamed AUs (VIDEO_CAP_STREAMED_AU) — chunked encoder output \
-             will stream per-slice"
+            "client accepts streamed AUs (VIDEO_CAP_STREAMED_AU) — used if this session's \
+             encoder supports chunked output"
         );
     }
     tracing::info!(

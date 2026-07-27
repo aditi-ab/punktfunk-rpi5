@@ -45,7 +45,9 @@ pub struct StatsSample {
     pub fps: f32,
     /// Re-encoded holds/s (source-starvation indicator).
     pub repeat_fps: f32,
-    /// Transmit goodput (Mb/s).
+    /// Attempted sealed wire bytes/s (Mb/s): full UDP payloads at seal time — video AU bytes
+    /// plus shard framing (header + AEAD) plus FEC parity, and for PyroWave's datagram-aligned
+    /// mode the zero-padded window tails. NOT goodput, and NOT reduced by socket send drops.
     pub mbps: f32,
     /// Configured target bitrate.
     pub bitrate_kbps: u32,
