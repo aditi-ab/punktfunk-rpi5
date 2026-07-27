@@ -1070,9 +1070,14 @@ async fn display_monitors_answers_even_with_no_compositor() {
     // No compositor on the test host ⇒ either a clean empty list or an explained failure, never
     // both empty AND silent about why.
     let listed = body["monitors"].as_array().map(|a| a.len()).unwrap_or(0);
+    // gamescope is nested: it owns no physical heads by construction, so "empty and silent" is the
+    // correct answer there, not an unexplained one. A dev box that has ever been in game mode keeps
+    // `gamescope-0` sockets in its runtime dir, so `detect()` resolves gamescope and this test would
+    // otherwise fail on the machine rather than on the code (found running the suite on .136).
+    let nested = body["compositor"] == "gamescope";
     assert!(
-        listed > 0 || !body["error"].is_null() || body["compositor"].is_null(),
-        "an empty list must carry an error or an absent compositor: {body}"
+        listed > 0 || !body["error"].is_null() || body["compositor"].is_null() || nested,
+        "an empty list must carry an error, an absent compositor, or a nested one: {body}"
     );
     // The pin is reported verbatim so the console can flag "pinned to a monitor you don't have";
     // unset on the test host.
