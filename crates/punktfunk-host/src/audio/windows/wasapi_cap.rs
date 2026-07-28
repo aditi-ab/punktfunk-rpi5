@@ -245,13 +245,7 @@ fn capture_once(
             .is_some_and(|(n, _)| wiring_plan::silent_sink(&n.to_lowercase()));
         static INSTALL_TRIED: AtomicBool = AtomicBool::new(false);
         if !have_silent && !INSTALL_TRIED.swap(true, Ordering::SeqCst) {
-            // SAFETY: `install_steam_audio_pair` is `unsafe` only because it `LoadLibraryExW`s
-            // `newdev.dll` and calls `DiInstallDriverW` through a `transmute`d function pointer;
-            // calling it imposes no extra precondition here (it takes no args and aliases
-            // nothing). Its internal contract holds: the `DiInstall` type matches the documented
-            // `BOOL DiInstallDriverW(HWND, PCWSTR, DWORD, PBOOL)` ABI, and it passes a
-            // NUL-terminated UTF-16 INF path with null/zero optional args.
-            if unsafe { super::wasapi_mic::install_steam_audio_pair() } {
+            if super::wasapi_mic::install_steam_audio_pair() {
                 wiring = audio_control::wire_now(true);
             }
             if !wiring

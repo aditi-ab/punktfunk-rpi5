@@ -357,7 +357,7 @@ fn supervise(stop: HANDLE, session_ev: HANDLE) -> Result<()> {
     // straggler still inside it — no manual CloseHandle(job).
     // SAFETY: `make_job` is unsafe only for its Win32 FFI; it has no caller preconditions and creates +
     // immediately takes RAII ownership of the job object, so calling it here is sound.
-    let job = unsafe { make_job() }.context("create job object")?;
+    let job = make_job().context("create job object")?;
 
     let mut restarts: u32 = 0;
     loop {
@@ -494,19 +494,29 @@ fn wait_any(handles: &[HANDLE], ms: u32) -> Option<usize> {
 }
 
 /// A kill-on-close + breakaway-ok job object, returned as an `OwnedHandle` (auto-`CloseHandle` on drop).
-unsafe fn make_job() -> Result<OwnedHandle> {
-    let job_raw = CreateJobObjectW(None, PCWSTR::null()).context("CreateJobObjectW")?;
+/// Safe: takes no arguments, and the handle it creates is wrapped in an `OwnedHandle` before any
+/// fallible step — so there is no precondition for a caller to uphold and no way to leak it here.
+fn make_job() -> Result<OwnedHandle> {
+    // SAFETY: a null security descriptor and a null name are both documented as "unnamed, default
+    // security"; the returned handle is checked by `?` and owned on the next line.
+    let job_raw = unsafe { CreateJobObjectW(None, PCWSTR::null()) }.context("CreateJobObjectW")?;
     // Own it immediately so any early return (e.g. a failed SetInformationJobObject) still closes it.
-    let job = OwnedHandle::from_raw_handle(job_raw.0);
+    // SAFETY: `job_raw` is the handle just created, is non-null, and is not owned anywhere else —
+    // ownership passes to the `OwnedHandle`, which closes it exactly once.
+    let job = unsafe { OwnedHandle::from_raw_handle(job_raw.0) };
     let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
     info.BasicLimitInformation.LimitFlags =
         JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK;
-    SetInformationJobObject(
-        HANDLE(job.as_raw_handle()),
-        JobObjectExtendedLimitInformation,
-        &info as *const _ as *const c_void,
-        std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-    )
+    // SAFETY: `job` is the live job object above; `info` is a local of exactly the type the
+    // `JobObjectExtendedLimitInformation` class expects, and the size argument is its `size_of`.
+    unsafe {
+        SetInformationJobObject(
+            HANDLE(job.as_raw_handle()),
+            JobObjectExtendedLimitInformation,
+            &info as *const _ as *const c_void,
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        )
+    }
     .context("SetInformationJobObject")?;
     Ok(job)
 }
@@ -625,7 +635,10 @@ unsafe fn spawn_host(
 }
 
 /// Open `path` for appending, as an INHERITABLE handle (so the child can use it as stdout/stderr).
-unsafe fn open_log_handle(path: &std::path::Path) -> Result<HANDLE> {
+/// Safe: `path` is a `&Path` and every FFI argument is built locally from it. The returned `HANDLE`
+/// is owned by the caller (it is inherited by the child and closed there), which is an ownership
+/// obligation, not a safety one — nothing a caller can do here causes UB.
+fn open_log_handle(path: &std::path::Path) -> Result<HANDLE> {
     let wpath: Vec<u16> = path
         .as_os_str()
         .to_string_lossy()
@@ -642,15 +655,19 @@ unsafe fn open_log_handle(path: &std::path::Path) -> Result<HANDLE> {
     // access mask (FILE_GENERIC_WRITE minus WRITE_DATA, plus APPEND_DATA + SYNCHRONIZE/READ_CONTROL);
     // bare FILE_APPEND_DATA alone produced a child handle that silently dropped writes.
     let access = (FILE_GENERIC_WRITE.0 & !FILE_WRITE_DATA.0) | FILE_APPEND_DATA.0;
-    let h = CreateFileW(
-        PCWSTR(wpath.as_ptr()),
-        access,
-        FILE_SHARE_READ | FILE_SHARE_WRITE,
-        Some(&sa),
-        OPEN_ALWAYS,
-        windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES(0),
-        None,
-    )
+    // SAFETY: `wpath` is the locally built NUL-terminated UTF-16 path and `sa` a correctly sized
+    // local `SECURITY_ATTRIBUTES`; both outlive the call, and the result is checked by `?`.
+    let h = unsafe {
+        CreateFileW(
+            PCWSTR(wpath.as_ptr()),
+            access,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            Some(&sa),
+            OPEN_ALWAYS,
+            windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES(0),
+            None,
+        )
+    }
     .context("CreateFileW(host.log)")?;
     Ok(h)
 }

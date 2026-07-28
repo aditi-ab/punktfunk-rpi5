@@ -153,14 +153,7 @@ fn resolve_target() -> Result<(wasapi::Device, String)> {
     let mut wiring = audio_control::wire_now(false);
     if wiring.mic_render.is_none() {
         tracing::info!("no usable virtual mic device present — attempting auto-install");
-        // SAFETY: `install_steam_audio_pair` is `unsafe` only because it `LoadLibraryExW`s
-        // `newdev.dll` and calls `DiInstallDriverW` through a `transmute`d function pointer;
-        // calling it imposes no extra precondition here (it takes no args and aliases nothing).
-        // Its internal contract holds: the `DiInstall` type matches the documented
-        // `BOOL DiInstallDriverW(HWND, PCWSTR, DWORD, PBOOL)` ABI, and it passes a
-        // NUL-terminated UTF-16 INF path with null/zero optional args. Invoked once on the
-        // dedicated mic thread.
-        if unsafe { install_steam_audio_pair() } {
+        if install_steam_audio_pair() {
             wiring = audio_control::wire_now(false);
         }
     }
@@ -185,7 +178,7 @@ fn resolve_target() -> Result<(wasapi::Device, String)> {
 /// capture ([`super::wasapi_cap`]) also installs the pair when no silent sink exists. Returns true
 /// if either installed. No-op when Steam isn't installed (INFs absent), the install is denied
 /// (needs admin — the host runs as SYSTEM), or `PUNKTFUNK_NO_MIC_INSTALL` is set.
-pub(crate) unsafe fn install_steam_audio_pair() -> bool {
+pub(crate) fn install_steam_audio_pair() -> bool {
     // Microphone first (the mic's actual target); speakers second (the distinct desktop-audio sink).
     let mic = try_install_steam_audio("SteamStreamingMicrophone.inf");
     let spk = try_install_steam_audio("SteamStreamingSpeakers.inf");
@@ -196,7 +189,11 @@ pub(crate) unsafe fn install_steam_audio_pair() -> bool {
 /// `newdev.dll`, like Apollo, to avoid an extra windows-crate feature). See
 /// [`install_steam_audio_pair`] for the contract; `inf_name` is a bare filename under Steam's
 /// per-arch `drivers\Windows10\{arch}\` directory.
-unsafe fn try_install_steam_audio(inf_name: &str) -> bool {
+///
+/// Safe: `inf_name` is a `&str` and every FFI argument is built locally from it, so there is no
+/// precondition a caller could break — the `unsafe` is the `LoadLibraryExW`/`transmute`/call chain
+/// inside, which is this function's own business.
+fn try_install_steam_audio(inf_name: &str) -> bool {
     use windows::core::{s, w, PCWSTR};
     use windows::Win32::Foundation::HWND;
     use windows::Win32::System::Environment::ExpandEnvironmentStringsW;
@@ -220,27 +217,41 @@ unsafe fn try_install_steam_audio(inf_name: &str) -> bool {
             .chain(std::iter::once(0))
             .collect();
     let mut path = vec![0u16; 1024];
-    let n = ExpandEnvironmentStringsW(PCWSTR(template.as_ptr()), Some(path.as_mut_slice()));
+    // SAFETY: `template` is a locally built NUL-terminated UTF-16 buffer that outlives the call, and
+    // the output slice is a live local whose length the callee is told via the slice itself.
+    let n =
+        unsafe { ExpandEnvironmentStringsW(PCWSTR(template.as_ptr()), Some(path.as_mut_slice())) };
     if n == 0 || n as usize > path.len() {
         return false;
     }
 
-    let Ok(newdev) = LoadLibraryExW(w!("newdev.dll"), None, LOAD_LIBRARY_SEARCH_SYSTEM32) else {
+    // SAFETY: a static NUL-terminated literal, loaded from System32 only (the flag), so this cannot
+    // pick up a planted `newdev.dll` from the working directory. The handle is checked before use.
+    let Ok(newdev) =
+        (unsafe { LoadLibraryExW(w!("newdev.dll"), None, LOAD_LIBRARY_SEARCH_SYSTEM32) })
+    else {
         tracing::warn!("could not load newdev.dll — Steam-audio auto-install unavailable");
         return false;
     };
-    let Some(addr) = GetProcAddress(newdev, s!("DiInstallDriverW")) else {
+    // SAFETY: `newdev` is the live module just loaded; the export name is a static literal.
+    let Some(addr) = (unsafe { GetProcAddress(newdev, s!("DiInstallDriverW")) }) else {
         return false;
     };
     // BOOL DiInstallDriverW(HWND hwndParent, PCWSTR InfPath, DWORD Flags, PBOOL NeedReboot)
     type DiInstall = unsafe extern "system" fn(HWND, PCWSTR, u32, *mut i32) -> i32;
-    let f: DiInstall = std::mem::transmute(addr);
-    let ok = f(
-        HWND(std::ptr::null_mut()),
-        PCWSTR(path.as_ptr()),
-        0,
-        std::ptr::null_mut(),
-    ) != 0;
+    // SAFETY: `addr` is the non-null export just resolved and `DiInstall` mirrors its documented
+    // signature (commented above).
+    let f: DiInstall = unsafe { std::mem::transmute(addr) };
+    // SAFETY: `path` is the expanded, NUL-terminated buffer above and outlives the call; a null
+    // parent HWND and a null `NeedReboot` are both documented as accepted.
+    let ok = unsafe {
+        f(
+            HWND(std::ptr::null_mut()),
+            PCWSTR(path.as_ptr()),
+            0,
+            std::ptr::null_mut(),
+        )
+    } != 0;
     if ok {
         tracing::info!(
             inf = inf_name,
@@ -248,7 +259,8 @@ unsafe fn try_install_steam_audio(inf_name: &str) -> bool {
         );
         std::thread::sleep(Duration::from_secs(5)); // let the audio subsystem register the endpoint
     } else {
-        let err = windows::Win32::Foundation::GetLastError();
+        // SAFETY: reads this thread's last-error value; takes no arguments and touches no memory.
+        let err = unsafe { windows::Win32::Foundation::GetLastError() };
         tracing::info!(
             inf = inf_name,
             ?err,
