@@ -35,19 +35,15 @@ use std::time::{Duration, Instant};
 /// where another local user could pre-create it (DoS) or rewrite it between our write and
 /// xdpw's read (steer capture at a different output).
 fn chooser_file() -> String {
-    let dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
+    let dir = crate::session::runtime_dir();
     format!("{dir}/punktfunk-xdpw-output")
 }
 
-/// The managed xdpw config: per-session output selection with no GUI. The `|| echo` fallback
-/// keeps plain portal capture (`--source portal` flow) working when no session has written
-/// the chooser file. xdpw runs `chooser_cmd` via `/bin/sh -c`, reads stdout.
-fn xdpw_config() -> String {
+/// The chooser command xdpw runs via `/bin/sh -c`, reading stdout. The `|| echo` fallback keeps
+/// plain portal capture (`--source portal`) working when no session has written the chooser file.
+fn chooser_cmd() -> String {
     format!(
-        "# managed by punktfunk (vdisplay/wlroots.rs) — per-session output selection.\n\
-[screencast]\n\
-chooser_type=simple\n\
-chooser_cmd=cat {} 2>/dev/null || echo 'Monitor: HEADLESS-1'\n",
+        "cat {} 2>/dev/null || echo 'Monitor: HEADLESS-1'",
         chooser_file()
     )
 }
@@ -359,15 +355,25 @@ fn ensure_xdpw_config() -> Result<()> {
         .map(std::path::PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))
         .ok_or_else(|| anyhow!("neither XDG_CONFIG_HOME nor HOME set"))?;
-    let dir = base.join("xdg-desktop-portal-wlr");
-    let path = dir.join("config");
-    let cfg = xdpw_config();
-    if std::fs::read_to_string(&path).is_ok_and(|c| c == cfg) {
+    let path = base.join("xdg-desktop-portal-wlr").join("config");
+    // The two keys we own, set IN PLACE. This used to `fs::write` a complete file over whatever the
+    // user had, destroying every other xdpw setting they owned on first connect.
+    let mut changed = crate::portal_config::ensure_key(
+        &path,
+        crate::portal_config::Block::Ini("screencast"),
+        "chooser_type",
+        "simple",
+    )?;
+    changed |= crate::portal_config::ensure_key(
+        &path,
+        crate::portal_config::Block::Ini("screencast"),
+        "chooser_cmd",
+        &chooser_cmd(),
+    )?;
+    if !changed {
         return Ok(());
     }
-    std::fs::create_dir_all(&dir).with_context(|| format!("mkdir {}", dir.display()))?;
-    std::fs::write(&path, &cfg).with_context(|| format!("write {}", path.display()))?;
-    tracing::info!(path = %path.display(), "wrote managed xdg-desktop-portal-wlr config");
+    tracing::info!(path = %path.display(), "pointed xdg-desktop-portal-wlr at the managed output chooser");
     let _ = Command::new("systemctl")
         .args(["--user", "try-restart", "xdg-desktop-portal-wlr.service"])
         .status();

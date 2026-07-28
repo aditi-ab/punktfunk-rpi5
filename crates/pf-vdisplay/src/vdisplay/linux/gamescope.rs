@@ -135,7 +135,7 @@ static SPAWN_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::n
 /// only if unset). Replaces the shared `/tmp/punktfunk-gamescope.log` so concurrent spawns don't
 /// clobber each other's `stream available on node ID:` line.
 fn spawn_log_path(inst: u64) -> std::path::PathBuf {
-    let base = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
+    let base = crate::session::runtime_dir();
     std::path::Path::new(&base).join(format!("punktfunk-gamescope-{inst}.log"))
 }
 
@@ -178,7 +178,7 @@ struct TakeoverState {
 /// Path of the persisted [`TakeoverState`], under `$XDG_RUNTIME_DIR` (per-user, 0700, tmpfs — cleared
 /// on reboot, which is correct: a reboot restarts the autologin itself).
 fn takeover_state_path() -> std::path::PathBuf {
-    let base = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
+    let base = crate::session::runtime_dir();
     std::path::Path::new(&base).join("punktfunk-session-takeover.json")
 }
 
@@ -820,7 +820,7 @@ fn systemctl_user(args: &[&str]) {
 
 /// Directory holding the per-user `gamescope` PATH-shim (tmpfs under `XDG_RUNTIME_DIR`).
 fn headless_shim_dir() -> std::path::PathBuf {
-    let base = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
+    let base = crate::session::runtime_dir();
     std::path::Path::new(&base).join("punktfunk-gsbin")
 }
 
@@ -2148,7 +2148,7 @@ fn point_injector_at_eis() {
 
 /// Path of the host-written `GAMESCOPE_BIN` wrapper (per-user, in tmpfs).
 fn gamescope_bin_wrapper_path() -> std::path::PathBuf {
-    let base = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
+    let base = crate::session::runtime_dir();
     std::path::Path::new(&base).join("punktfunk-gamescope-bin")
 }
 

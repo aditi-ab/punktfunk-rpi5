@@ -137,13 +137,18 @@ impl DisplayIdentityMap {
     }
 
     /// Persist atomically (temp file + rename). Best-effort: a write failure just means a restart may
-    /// re-derive an id (one scaling re-set). Not a credential, so a plain (non-ACL'd) write is fine.
+    /// re-derive an id (one scaling re-set). The CONTENTS are not a credential, so the file itself
+    /// is a plain write — but the directory it lands in is `pf_paths::config_dir()`, which is, so it
+    /// is created with the 0700 helper rather than `create_dir_all`.
     fn persist(&self) {
         let Ok(bytes) = serde_json::to_vec_pretty(&self.store) else {
             return;
         };
         if let Some(dir) = self.path.parent() {
-            let _ = std::fs::create_dir_all(dir);
+            // `create_private_dir`, not `create_dir_all`: this is `pf_paths::config_dir()`, which
+            // also holds the host private key, the pairing allow-list and the mgmt token. Every
+            // other writer in the workspace uses the 0700 helper; these two did not.
+            let _ = pf_paths::create_private_dir(dir);
         }
         let tmp = self.path.with_extension("json.tmp");
         if std::fs::write(&tmp, &bytes).is_ok() {
@@ -265,7 +270,10 @@ impl ScaleMap {
             return;
         };
         if let Some(dir) = self.path.parent() {
-            let _ = std::fs::create_dir_all(dir);
+            // `create_private_dir`, not `create_dir_all`: this is `pf_paths::config_dir()`, which
+            // also holds the host private key, the pairing allow-list and the mgmt token. Every
+            // other writer in the workspace uses the 0700 helper; these two did not.
+            let _ = pf_paths::create_private_dir(dir);
         }
         let tmp = self.path.with_extension("json.tmp");
         if std::fs::write(&tmp, &bytes).is_ok() {

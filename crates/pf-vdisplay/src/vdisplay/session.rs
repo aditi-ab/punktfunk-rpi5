@@ -255,6 +255,19 @@ impl EnvProbe {
     }
 }
 
+/// The per-user runtime directory, resolved ONCE for callers outside detection.
+///
+/// The rule is the one [`default_runtime_dir`] applies, and the point is what it is NOT: several
+/// callers used to spell it `std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into())`,
+/// while their own doc comments promised "per-user, 0700 — NOT a world-writable /tmp path another
+/// local user could pre-create or rewrite". One of those paths is an executable that
+/// xdg-desktop-portal-hyprland then RUNS. `Ok("")` was the second half of the same defect: it
+/// yielded a path relative to the process's CWD rather than any runtime dir at all.
+#[cfg(target_os = "linux")]
+pub(crate) fn runtime_dir() -> String {
+    default_runtime_dir(&EnvProbe::sample())
+}
+
 #[cfg(target_os = "linux")]
 fn default_runtime_dir(env: &EnvProbe) -> String {
     env.xdg_runtime_dir.clone().unwrap_or_else(|| {

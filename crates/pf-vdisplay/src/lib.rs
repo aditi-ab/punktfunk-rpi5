@@ -597,6 +597,15 @@ pub(crate) mod identity;
 #[path = "vdisplay/admission.rs"]
 pub mod admission;
 
+/// Editing the user's xdg-desktop-portal configs in place — the wlr-family backends both need one
+/// key set in a file the USER owns, and used to overwrite the whole thing.
+///
+/// Declared unconditionally although only the Linux backends call it: the merge is pure string
+/// handling, so its tests — which are what make a merge safe to run against a user's real config —
+/// should run on every platform's CI rather than only where the callers compile.
+#[path = "vdisplay/linux/portal_config.rs"]
+mod portal_config;
+
 #[cfg(target_os = "linux")]
 #[path = "vdisplay/linux/hyprland.rs"]
 mod hyprland;

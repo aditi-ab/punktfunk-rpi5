@@ -48,7 +48,7 @@ use std::time::{Duration, Instant};
 /// pre-create or rewrite between our write and xdph's read (steer capture elsewhere). Mirrors the
 /// wlroots chooser file.
 fn selection_file() -> String {
-    let dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
+    let dir = crate::session::runtime_dir();
     format!("{dir}/punktfunk-xdph-output")
 }
 
@@ -56,7 +56,7 @@ fn selection_file() -> String {
 /// `custom_picker_binary` and reads one selection line from its stdout; an empty read (no session
 /// has written the file) leaves xdph to its interactive picker — the graceful fallback.
 fn picker_shim_path() -> String {
-    let dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
+    let dir = crate::session::runtime_dir();
     format!("{dir}/punktfunk-xdph-picker.sh")
 }
 
@@ -67,19 +67,6 @@ fn picker_shim_path() -> String {
 /// `[SELECTION]screen:<name>`.
 fn picker_selection_line(name: &str) -> String {
     format!("[SELECTION]screen:{name}\n")
-}
-
-/// The managed xdph config: point the screencopy custom picker at our shim so headless output
-/// selection needs no GUI. xdph reads its config at startup, so a change restarts it (see
-/// [`ensure_xdph_config`]). The *selection* is the per-session file, not this static config.
-fn xdph_config() -> String {
-    format!(
-        "# managed by punktfunk (vdisplay/hyprland.rs) — headless per-session output selection.\n\
-screencopy {{\n\
-    custom_picker_binary = {}\n\
-}}\n",
-        picker_shim_path()
-    )
 }
 
 /// Monotonic per-process counter for headless output names (`PF-1`, `PF-2`, …). Named outputs kill
@@ -553,13 +540,20 @@ fn ensure_xdph_config() -> Result<()> {
     if std::fs::read_to_string(&shim).is_ok_and(|c| c == shim_body) {
         // already installed
     } else {
-        std::fs::write(&shim, &shim_body).with_context(|| format!("write {shim}"))?;
-        #[cfg(target_os = "linux")]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o700))
-                .with_context(|| format!("chmod {shim}"))?;
-        }
+        // Mode set AT CREATION, not chmod-ed after: xdph EXECUTES this file, and a
+        // write-then-chmod leaves it briefly at the umask default. (It also lives in a 0700
+        // runtime dir now — see `session::runtime_dir` — so this is defence in depth.)
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o700)
+            .open(&shim)
+            .with_context(|| format!("write {shim}"))?;
+        f.write_all(shim_body.as_bytes())
+            .with_context(|| format!("write {shim}"))?;
     }
 
     // 2. Write the managed xdph config and restart xdph on change.
@@ -567,15 +561,19 @@ fn ensure_xdph_config() -> Result<()> {
         .map(std::path::PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))
         .ok_or_else(|| anyhow!("neither XDG_CONFIG_HOME nor HOME set"))?;
-    let dir = base.join("hypr");
-    let path = dir.join("xdph.conf");
-    let cfg = xdph_config();
-    if std::fs::read_to_string(&path).is_ok_and(|c| c == cfg) {
+    let path = base.join("hypr").join("xdph.conf");
+    // ONE key, in place. This used to `fs::write` a complete file over whatever the user had,
+    // destroying every other xdph setting they owned on first connect.
+    let changed = crate::portal_config::ensure_key(
+        &path,
+        crate::portal_config::Block::Hyprlang("screencopy"),
+        "custom_picker_binary",
+        &shim,
+    )?;
+    if !changed {
         return Ok(());
     }
-    std::fs::create_dir_all(&dir).with_context(|| format!("mkdir {}", dir.display()))?;
-    std::fs::write(&path, &cfg).with_context(|| format!("write {}", path.display()))?;
-    tracing::info!(path = %path.display(), "wrote managed xdg-desktop-portal-hyprland config");
+    tracing::info!(path = %path.display(), "pointed xdg-desktop-portal-hyprland at the managed picker shim");
     let _ = Command::new("systemctl")
         .args([
             "--user",
