@@ -66,9 +66,7 @@ fn stream_rect() -> Option<Rect> {
     let fresh = st.queried.is_some_and(|at| at.elapsed() < RECT_TTL);
     if !fresh {
         st.queried = Some(Instant::now());
-        // SAFETY: read-only QueryDisplayConfig over owned locals (`source_desktop_rect`'s
-        // contract — the same call the cursor-readback poller makes at spawn).
-        match unsafe { pf_win_display::win_display::source_desktop_rect(target_id) } {
+        match pf_win_display::win_display::source_desktop_rect(target_id) {
             Some(r) => {
                 if st.rect != Some(r) {
                     tracing::info!(target_id, rect = ?r, "stream-target desktop rect resolved");

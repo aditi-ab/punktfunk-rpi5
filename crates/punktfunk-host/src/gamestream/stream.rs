@@ -254,6 +254,21 @@ fn run(
         // Desktop<->Game switch.
         let (mut capturer, compositor, gamescope_route) =
             open_gs_virtual_source(cfg, app, target.as_ref(), &life.quit)?;
+        // Only the Linux `launch_is_nested` reads it; gamescope does not exist on Windows.
+        #[cfg(not(target_os = "linux"))]
+        let _ = &gamescope_route;
+        // Register this session in the admission table. GameStream acquires a REAL display but
+        // never registered, so `admit`'s Windows budgets — `max_displays` and the NVENC session
+        // headroom — could not see it: both gate on `!live.is_empty()`, so a Moonlight-held display
+        // was invisible to them and a native connect could be admitted past a budget the box had
+        // already spent. Identity is `None` (the compat plane has no cert fingerprint), which is the
+        // same "anonymous" the conflict policy already handles. Dropped at the end of `run`.
+        let _admission_guard = crate::vdisplay::admission::register(
+            None,
+            (cfg.width, cfg.height, cfg.fps),
+            life.quit.clone(),
+            "gamestream".to_string(),
+        );
         tracing::info!(
             ?compositor,
             app = ?app.map(|a| &a.title),

@@ -1107,6 +1107,10 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
         bringup,
         resize_ms,
     } = ctx;
+    // Only the Linux paths (`launch_is_nested`, `set_gamescope_route`) read it; gamescope does not
+    // exist on Windows, where every one of those call sites is cfg'd out.
+    #[cfg(target_os = "windows")]
+    let _ = &gamescope_route;
     // Reference point for adopting the launched game's processes: anything the host will call "this
     // session's game" has to have started after this instant. Taken HERE, before the display (and
     // therefore before a bare-spawn gamescope's nested child) exists, because a reading taken after

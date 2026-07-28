@@ -963,6 +963,13 @@ fn create_managed_session_steamos(mode: Mode, hdr: bool) -> Result<VirtualOutput
     write_steamos_dropin(&shim_dir, mode, hdr)?;
     systemctl_user(&["daemon-reload"]);
     systemctl_user(&["restart", STEAMOS_SESSION_TARGET]);
+    // LOCK ORDER. Everything below this line must run WITHOUT `MANAGED_SESSION` held: the restore
+    // path takes STEAMOS_TOOK_OVER first and MANAGED_SESSION second (`do_restore_tv_session`), and
+    // `takeover_live` reads the whole set — so taking them in the other order here is an AB/BA
+    // deadlock between a connect and the restore worker, which genuinely run concurrently
+    // (`registry.rs` calls `vd.create` off the registry lock; the worker is its own thread).
+    // Nothing between here and the re-acquire reads the tracked session.
+    drop(guard);
     *STEAMOS_TOOK_OVER.lock().unwrap_or_else(|e| e.into_inner()) = true;
     persist_takeover(); // A3: survive a host crash mid-stream
                         // gamescope's node appears within a few seconds of the restart; Steam's first FRAME is slower
@@ -980,7 +987,8 @@ fn create_managed_session_steamos(mode: Mode, hdr: bool) -> Result<VirtualOutput
     // a clean restart rather than a same-mode reuse of a session we just rejected.
     verify_managed_spawn_flags(hdr)?;
     point_injector_at_eis();
-    *guard = Some(SessionState {
+    // Re-acquire to record the tracked session — the same shape `create_managed_session` uses.
+    *MANAGED_SESSION.lock().unwrap_or_else(|e| e.into_inner()) = Some(SessionState {
         width: mode.width,
         height: mode.height,
         refresh_hz: mode.refresh_hz,
@@ -1889,15 +1897,21 @@ pub fn schedule_restore_tv_session() {
 /// display manager, a SteamOS target we re-pointed, or a managed session we launched beside a live
 /// desktop? The precondition for every restore path.
 fn takeover_live() -> bool {
-    !STOPPED_AUTOLOGIN
+    // ONE lock at a time. In a `||` chain every `.lock()` temporary lives to the end of the
+    // statement, so this used to hold all four simultaneously — putting it in the lock-order graph
+    // for no reason, since each is only read. Scoped bindings drop each guard before the next.
+    let autologin = !STOPPED_AUTOLOGIN
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .is_empty()
-        || *STEAMOS_TOOK_OVER.lock().unwrap_or_else(|e| e.into_inner())
-        || STOPPED_DM
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_some()
+        .is_empty();
+    let steamos = *STEAMOS_TOOK_OVER.lock().unwrap_or_else(|e| e.into_inner());
+    let dm = STOPPED_DM
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_some();
+    autologin
+        || steamos
+        || dm
         // A managed session that took nothing over (started beside a live desktop — e.g. a client
         // gamescope pin on a KDE box) still owns the transient SESSION_UNIT: without this arm it
         // was ORPHANED forever after disconnect ("closing the app does not end the session",

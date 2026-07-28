@@ -50,8 +50,18 @@ static LAST_INSTANCE: std::sync::Mutex<Option<(ActiveKind, Option<u32>)>> =
 /// session (the per-connect resolve, the mid-stream watcher, the capture-loss re-detect).
 pub fn observe_session_instance(active: &ActiveSession) {
     let cur = (active.kind, active.compositor_pid);
-    let mut last = LAST_INSTANCE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(prev) = *last {
+    // DECIDE under the lock, ACT outside it. The action below drops keep-alive displays through the
+    // registry lock and shells out to `systemctl` on a 10 s budget; holding a process-wide mutex
+    // across that blocks every other detector — and this runs from the per-connect resolve, the
+    // mid-stream switch watcher AND the capture-loss re-detect. The baseline is advanced inside the
+    // lock too, so a concurrent observer sees the new instance and cannot run the action twice.
+    let changed = {
+        let mut last = LAST_INSTANCE.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = *last;
+        *last = Some(cur);
+        prev
+    };
+    if let Some(prev) = changed {
         // Only a **desktop** compositor (KWin / Mutter / wlroots) instance change bumps the epoch +
         // invalidates its kept displays — its PipeWire node dies with the compositor. A **gamescope**
         // session (`ActiveKind::Gaming`) is NOT the epoch's subject: the box's game-mode / managed
@@ -83,7 +93,6 @@ pub fn observe_session_instance(active: &ActiveSession) {
             );
         }
     }
-    *last = Some(cur);
 }
 
 /// Counterpart to [`settle_desktop_portal`]'s `import-environment`: drop the desktop session's

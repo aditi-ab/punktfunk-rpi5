@@ -124,10 +124,21 @@ pub fn effective_conflict() -> ModeConflict {
 /// (`design/windows-parallel-virtual-displays.md` §2.5): a display we can't afford is DECLINED here,
 /// never admitted-then-degrading a live sibling.
 pub fn admit(req_identity: Option<[u8; 32]>) -> Admission {
-    let live = table().lock().unwrap();
-    let decision = decide(effective_conflict(), req_identity, &live);
+    // The table guard is scoped to `decide` ALONE. The budget checks below call
+    // `manager::snapshot()` — which blocks on the manager `state` lock, held across DDC round trips,
+    // SetupAPI devnode work and three 3 s activation ladders — and `pf_encode`'s NVENC probe. Holding
+    // the process-wide live-session table across those stalled every other connect, disconnect and
+    // mgmt read behind one slow display operation.
+    let (decision, any_live) = {
+        let live = table().lock().unwrap();
+        (
+            decide(effective_conflict(), req_identity, &live),
+            !live.is_empty(),
+        )
+    };
+    let _ = any_live; // read only by the Windows budget block below
     #[cfg(windows)]
-    if matches!(decision, Admission::Separate) && !live.is_empty() {
+    if matches!(decision, Admission::Separate) && any_live {
         let max = policy::prefs().get().effective().max_displays;
         let slots = super::manager::snapshot().len() as u32;
         if slots >= max {

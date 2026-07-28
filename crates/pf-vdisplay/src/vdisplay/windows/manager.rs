@@ -983,8 +983,22 @@ impl VirtualDisplayManager {
                     // a pair: eviction restarts presentation, the session re-attaches capture.
                     TOPOLOGY_REASSERT_GEN.fetch_add(1, Ordering::Relaxed);
                 }
-            })
-            .expect("spawn vdisplay-exclusive-watch");
+            });
+        // NOT `.expect()`: this runs holding BOTH `exclusive_watch` and (via the caller) `state`, so
+        // a panic here poisons the two locks the whole manager runs on — every later `acquire` and
+        // every mgmt read would then panic on `.lock().unwrap()`. A thread we could not spawn means
+        // no re-assert watchdog, which is a degradation; wedging the manager is not.
+        let thread = match thread {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "could not spawn the exclusive re-assert watchdog — the isolate will not be \
+                     re-asserted if something re-lights a physical display"
+                );
+                return;
+            }
+        };
         *guard = Some(Pinger { stop, thread });
     }
 
