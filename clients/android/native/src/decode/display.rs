@@ -128,7 +128,9 @@ pub(super) fn install_render_callback(
 /// deleting the codec stops its internal threads, so no callback can still be running (or run
 /// later) against this pointer.
 pub(super) unsafe fn release_render_callback(ud: *const DisplayTracker) {
-    drop(Arc::from_raw(ud));
+    // SAFETY: `ud` is the pointer `install_render_callback` leaked from `Arc::into_raw`, and this
+    // function's contract is that it is reclaimed exactly once, after the codec is gone.
+    unsafe { drop(Arc::from_raw(ud)) };
 }
 
 /// The `AMediaCodecOnFrameRendered` trampoline: fires (possibly batched) on a codec-internal
@@ -146,7 +148,10 @@ unsafe extern "C" fn on_frame_rendered(
     media_time_us: i64,
     system_nano: i64,
 ) {
-    let t = &*(userdata as *const DisplayTracker);
+    // SAFETY: the platform hands back exactly the `userdata` registered with the callback — the
+    // `Arc::into_raw` pointer from `install_render_callback`, whose refcount is held for as long as
+    // the codec exists, and the codec is what delivers this call.
+    let t = unsafe { &*(userdata as *const DisplayTracker) };
     if !t.stats.enabled() {
         return; // HUD hidden — the ring is empty too (pushes are caller-gated)
     }
