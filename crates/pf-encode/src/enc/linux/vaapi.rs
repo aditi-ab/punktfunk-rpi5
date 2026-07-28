@@ -19,13 +19,6 @@
 //! hwdevice/hwframes/buffersrc/buffersink calls go through `ffmpeg::ffi` (= `ffmpeg_sys_next`),
 //! as the CUDA encode path and the clients' decode paths already do. The encoder is opened
 //! *without* a global header, so VPS/SPS/PPS are in-band on every IDR.
-// UNSAFE-LINT EXEMPTION (rationale + exit criteria: `unsafe_op_in_unsafe_fn` in the workspace
-// Cargo.toml). This body is raw libav (`ffmpeg-sys-next`) calls on borrowed AVFrame/AVBuffer
-// pointers almost line for line; narrowing it would add one `unsafe {}` plus one SAFETY comment per
-// call that could only restate the signature. Clearing this file means DELETING the markers that
-// carry no caller contract, not wrapping the calls — until then the lint is off HERE and enforced
-// everywhere else.
-#![allow(unsafe_op_in_unsafe_fn)]
 // Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
 #![deny(clippy::undocumented_unsafe_blocks)]
 
@@ -275,17 +268,23 @@ unsafe fn open_vaapi_encoder(
     let modes: &[bool] = entrypoint_ladder(low_power_override(), cached);
     let mut first_err = None;
     for &lp in modes {
-        match open_vaapi_encoder_mode(
-            codec,
-            width,
-            height,
-            fps,
-            bitrate_bps,
-            device_ref,
-            frames_ref,
-            ten_bit,
-            lp,
-        ) {
+        // SAFETY: `device_ref`/`frames_ref` are forwarded unchanged from this fn's own contract —
+        // valid `AVBufferRef`s — and the callee only `av_buffer_ref`s them, so retrying another
+        // entrypoint below reuses the same still-owned buffers rather than consuming them.
+        let attempt = unsafe {
+            open_vaapi_encoder_mode(
+                codec,
+                width,
+                height,
+                fps,
+                bitrate_bps,
+                device_ref,
+                frames_ref,
+                ten_bit,
+                lp,
+            )
+        };
+        match attempt {
             Ok(enc) => {
                 if let Ok(mut m) = LP_MODE.get_or_init(|| Mutex::new(HashMap::new())).lock() {
                     m.insert(key.clone(), latched_mode(lp));
@@ -343,16 +342,24 @@ unsafe fn open_vaapi_encoder_mode(
     video.set_format(if ten_bit { Pixel::P010LE } else { Pixel::NV12 });
     // Fixed rate, CBR, no B-frames, ~1-frame VBV — the shared low-latency RC contract.
     apply_low_latency_rc(&mut video, fps, bitrate_bps);
-    let raw = video.as_mut_ptr();
-    (*raw).gop_size = i32::MAX; // no periodic IDR (forced-IDR via pict_type=I on RFI)
-    let vui = vui_for(ten_bit);
-    (*raw).colorspace = vui.colorspace;
-    (*raw).color_range = vui.range;
-    (*raw).color_primaries = vui.primaries;
-    (*raw).color_trc = vui.trc;
-    (*raw).pix_fmt = ffi::AVPixelFormat::AV_PIX_FMT_VAAPI;
-    (*raw).hw_device_ctx = ffi::av_buffer_ref(device_ref);
-    (*raw).hw_frames_ctx = ffi::av_buffer_ref(frames_ref);
+    // SAFETY: `as_mut_ptr` hands back the `AVCodecContext` behind the `video` encoder allocated
+    // just above, which outlives every write here (it is moved into the return value). The
+    // colour/gop/pix_fmt stores are in-bounds scalar field writes on that live context. The two
+    // `av_buffer_ref` calls take `device_ref`/`frames_ref`, valid `AVBufferRef`s by this fn's
+    // contract, and each returns a NEW reference that the codec context adopts and unrefs when it
+    // is freed — so this shares the caller's buffers rather than taking them over.
+    unsafe {
+        let raw = video.as_mut_ptr();
+        (*raw).gop_size = i32::MAX; // no periodic IDR (forced-IDR via pict_type=I on RFI)
+        let vui = vui_for(ten_bit);
+        (*raw).colorspace = vui.colorspace;
+        (*raw).color_range = vui.range;
+        (*raw).color_primaries = vui.primaries;
+        (*raw).color_trc = vui.trc;
+        (*raw).pix_fmt = ffi::AVPixelFormat::AV_PIX_FMT_VAAPI;
+        (*raw).hw_device_ctx = ffi::av_buffer_ref(device_ref);
+        (*raw).hw_frames_ctx = ffi::av_buffer_ref(frames_ref);
+    }
 
     let mut opts = Dictionary::new();
     if let Some(profile) = explicit_profile(codec, ten_bit) {
@@ -479,35 +486,52 @@ struct VaapiHw {
 }
 
 impl VaapiHw {
-    unsafe fn new(sw_format: ffi::AVPixelFormat, w: u32, h: u32, pool: c_int) -> Result<Self> {
+    /// Safe: unlike its CUDA twin ([`super::CudaHw::new`], which is handed a `CUcontext` the caller
+    /// must vouch for) this takes only scalars and opens the device itself, so there is no caller
+    /// contract — the `unsafe` below is the libav FFI, not an obligation.
+    fn new(sw_format: ffi::AVPixelFormat, w: u32, h: u32, pool: c_int) -> Result<Self> {
         let mut device_ref: *mut ffi::AVBufferRef = ptr::null_mut();
         let node = render_node();
-        let r = ffi::av_hwdevice_ctx_create(
-            &mut device_ref,
-            ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI,
-            node.as_ptr(),
-            ptr::null_mut(),
-            0,
-        );
+        // SAFETY: `device_ref` is a live local out-param; `node` is a NUL-terminated `CString` that
+        // outlives the call, and the remaining arguments are the documented "no options" pair. On
+        // success libav writes ONE owned reference into `device_ref`.
+        let r = unsafe {
+            ffi::av_hwdevice_ctx_create(
+                &mut device_ref,
+                ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI,
+                node.as_ptr(),
+                ptr::null_mut(),
+                0,
+            )
+        };
         if r < 0 {
             bail!("no VAAPI device ({:?}): {}", node, ffmpeg::Error::from(r));
         }
         // `av_hwdevice_ctx_create` wrote an owned ref into `device_ref`; take ownership of it here so
         // every `bail!` below drops it (and the frames ref, once built) without cleanup of its own.
-        let device_ref = AvBuffer::from_raw(device_ref)
+        // SAFETY: `r >= 0`, so `device_ref` is that owned reference and this is its only owner.
+        let device_ref = unsafe { AvBuffer::from_raw(device_ref) }
             .context("av_hwdevice_ctx_create(VAAPI) gave no device")?;
-        let frames_ref = AvBuffer::from_raw(ffi::av_hwframe_ctx_alloc(device_ref.as_ptr()))
-            .context("av_hwframe_ctx_alloc(VAAPI) failed")?;
-        let fc = (*frames_ref.as_ptr()).data as *mut ffi::AVHWFramesContext;
-        (*fc).format = ffi::AVPixelFormat::AV_PIX_FMT_VAAPI;
-        (*fc).sw_format = sw_format;
-        (*fc).width = w as c_int;
-        (*fc).height = h as c_int;
-        (*fc).initial_pool_size = pool;
-        let r = ffi::av_hwframe_ctx_init(frames_ref.as_ptr());
-        if r < 0 {
-            bail!("av_hwframe_ctx_init(VAAPI) failed ({r})");
-        }
+        // SAFETY: the same shape as `CudaHw::new` — `av_hwframe_ctx_alloc` is handed the live device
+        // ref and returns null (rejected by `from_raw`, so the `?` leaves before the writes below)
+        // or a ref whose `data` libav has already initialized as an `AVHWFramesContext`. Every store
+        // is then an in-bounds scalar write on that live allocation, done before
+        // `av_hwframe_ctx_init` reads them.
+        let frames_ref = unsafe {
+            let frames_ref = AvBuffer::from_raw(ffi::av_hwframe_ctx_alloc(device_ref.as_ptr()))
+                .context("av_hwframe_ctx_alloc(VAAPI) failed")?;
+            let fc = (*frames_ref.as_ptr()).data as *mut ffi::AVHWFramesContext;
+            (*fc).format = ffi::AVPixelFormat::AV_PIX_FMT_VAAPI;
+            (*fc).sw_format = sw_format;
+            (*fc).width = w as c_int;
+            (*fc).height = h as c_int;
+            (*fc).initial_pool_size = pool;
+            let r = ffi::av_hwframe_ctx_init(frames_ref.as_ptr());
+            if r < 0 {
+                bail!("av_hwframe_ctx_init(VAAPI) failed ({r})");
+            }
+            frames_ref
+        };
         Ok(VaapiHw {
             frames_ref,
             device_ref,
@@ -548,12 +572,11 @@ impl CpuInner {
             ffi::AVPixelFormat::AV_PIX_FMT_NV12
         };
         const POOL: c_int = 16;
-        // SAFETY: `VaapiHw::new` (an `unsafe fn`) requires libav initialized — guaranteed because the
-        // only path here is `VaapiEncoder::open` → `ensure_inner` → `CpuInner::open`, and `open` ran
-        // `ffmpeg::init()`. The args are valid: an NV12/P010 sw_format, the validated positive
-        // `width`/`height`, pool=16. It returns a RAII `VaapiHw` that unrefs its two `AVBufferRef`s
-        // on drop.
-        let hw = unsafe { VaapiHw::new(staging_av, width, height, POOL)? };
+        // `VaapiHw::new` is safe now; it returns a RAII `VaapiHw` that unrefs its two `AVBufferRef`s
+        // on drop. (libav is initialized on every path here — `VaapiEncoder::open` → `ensure_inner`
+        // → `CpuInner::open`, and `open` ran `ffmpeg::init()` — which the call relies on but cannot
+        // itself be broken by a caller, so it is a note rather than a contract.)
+        let hw = VaapiHw::new(staging_av, width, height, POOL)?;
         // SAFETY: `open_vaapi_encoder` (an `unsafe fn`) borrows `hw.device_ref`/`hw.frames_ref` — both
         // non-null (`VaapiHw::new` guarantees it) and from the `hw` just built above, which is a live
         // local that outlives this synchronous call. The fn `av_buffer_ref`s them into the encoder, so
