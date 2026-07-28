@@ -1,5 +1,5 @@
 //! The isolated zero-copy GPU-import worker (`punktfunk-host zerocopy-worker`; design:
-//! [`design/zerocopy-worker-isolation.md`]). It owns the fragile driver stack — the headless
+//! `design/zerocopy-worker-isolation.md`). It owns the fragile driver stack — the headless
 //! EGLDisplay + GL context, the CUDA context, and the Vulkan bridge — so that a driver fault on a
 //! producer-invalidated dmabuf (the `cuGraphicsMapResources` SIGSEGV the F44 Game→Desktop switch
 //! reproduced) kills THIS process, not the streaming host. The host observes the dead socket,
@@ -43,9 +43,24 @@ pub fn run_from_args(args: &[String]) -> Result<()> {
         .transpose()
         .context("parse --fd")?
         .unwrap_or(3);
+    // Refuse to adopt anything that cannot be the spawning host's socket: a negative fd is
+    // outright UB inside `OwnedFd` (its niche), and 0–2 would make this worker close one of its
+    // own stdio streams on exit. Then confirm the number actually holds an open socket — the
+    // subcommand is hidden but runnable by hand, and adopting an arbitrary inherited fd would
+    // close it behind its real owner.
+    anyhow::ensure!(fd >= 3, "--fd must be >= 3 (got {fd})");
+    // SAFETY: `libc::stat` is plain-old-data for which all-zero is a valid value, so
+    // `mem::zeroed()` is a sound initializer; `fstat` writes into the live, correctly-sized
+    // `&mut st` and only reads `fd`. `st_mode` is read only after the return value is checked.
+    let is_socket = unsafe {
+        let mut st: libc::stat = std::mem::zeroed();
+        libc::fstat(fd, &mut st) == 0 && (st.st_mode & libc::S_IFMT) == libc::S_IFSOCK
+    };
+    anyhow::ensure!(is_socket, "--fd {fd} is not an open socket");
     // SAFETY: the spawning host `dup2`'d its socketpair end onto exactly this fd number before
-    // exec (the subcommand's contract) and nothing else in this fresh process owns it, so
-    // `OwnedFd` takes sole ownership and closes it exactly once at exit.
+    // exec (the subcommand's contract, just verified to be an open socket ≥ 3) and nothing else
+    // in this fresh process owns it, so `OwnedFd` takes sole ownership and closes it exactly
+    // once at exit.
     let sock = unsafe { OwnedFd::from_raw_fd(fd) };
     run(sock)
 }

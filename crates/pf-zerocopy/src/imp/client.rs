@@ -1,5 +1,5 @@
 //! Host side of the isolated zero-copy GPU import (design:
-//! [`design/zerocopy-worker-isolation.md`]): spawns the `zerocopy-worker` subprocess, mirrors the
+//! `design/zerocopy-worker-isolation.md`): spawns the `zerocopy-worker` subprocess, mirrors the
 //! [`super::egl::EglImporter`] entry points over the [`super::proto`] socket, and materializes
 //! the worker's pooled CUDA buffers in this process via CUDA IPC (each buffer's handles are
 //! opened exactly once and reused as the pool recycles). A worker death — the whole point of the
@@ -151,7 +151,7 @@ pub struct RemoteImporter {
 
 impl RemoteImporter {
     /// Spawn the worker from this host binary and complete the readiness handshake. The worker
-    /// is exec'd through the pinned [`SELF_EXE`] fd, so it is always the exact image this
+    /// is exec'd through the pinned `SELF_EXE` fd, so it is always the exact image this
     /// process runs — even after the installed binary was replaced mid-flight. An `Err` here
     /// means "no isolated zero-copy available" — callers fall back to the CPU path, exactly like
     /// an in-process `EglImporter::new()` failure.

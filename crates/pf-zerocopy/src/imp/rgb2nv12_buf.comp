@@ -11,7 +11,8 @@
 // touch the same word (an 8-bit-storage-free way to write byte planes race-free). All pitches
 // and the UV offset are in WORDS and must be word-aligned (the Rust side sizes them so).
 //
-// Rebuild: glslc rgb2nv12_buf.comp -o rgb2nv12_buf.spv
+// Rebuild: glslangValidator -V rgb2nv12_buf.comp -o rgb2nv12_buf.spv   (or glslc; CI diffs the
+// disassembly against this source, tolerating only the generator header)
 layout(local_size_x = 8, local_size_y = 8) in;
 
 layout(std430, binding = 0) readonly buffer Src {

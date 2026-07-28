@@ -45,7 +45,7 @@ use ash::vk;
 pub const CURSOR_MAX: u32 = cuda::CURSOR_MAX;
 
 /// The vendored SPIR-V for `cursor_blend.comp` (beside this file; rebuild with
-/// `glslc cursor_blend.comp -o cursor_blend.spv`).
+/// `glslangValidator -V cursor_blend.comp -o cursor_blend.spv`; CI gates drift).
 const CURSOR_SPV: &[u8] = include_bytes!("cursor_blend.spv");
 
 /// NVENC input-surface layout — selects the spec-constant `MODE` pipeline and the allocation
@@ -84,9 +84,10 @@ impl SlotFormat {
 }
 
 /// What the encoder holds per ring slot: the CUDA view it registers with NVENC plus the id it
-/// hands back to [`VkSlotBlend::blend`]. The backing Vulkan objects + CUDA mapping live in the
-/// [`VkSlotBlend`] (freed by [`free_slots`](VkSlotBlend::free_slots) / drop), so this is Copy —
-/// the encoder's ring keeps its existing shape.
+/// hands back to [`VkSlotBlend::blend_ref`] / [`VkSlotBlend::blend_ref_ordered`]. The backing
+/// Vulkan objects + CUDA mapping live in the [`VkSlotBlend`] (freed by
+/// [`free_slots`](VkSlotBlend::free_slots) / drop), so this is Copy — the encoder's ring keeps
+/// its existing shape.
 #[derive(Clone, Copy)]
 pub struct VkSlotRef {
     /// Device pointer NVENC registers (CUDA's mapping of the Vulkan memory).
@@ -654,7 +655,7 @@ impl VkSlotBlend {
     }
 
     /// Free every allocated slot (encoder teardown, alongside its ring clear). CUDA mappings drop
-    /// first (field order in [`SlotAlloc`] frees `cuda` via its own `Drop` before we free the VK
+    /// first (field order in `SlotAlloc` frees `cuda` via its own `Drop` before we free the VK
     /// objects explicitly here).
     pub fn free_slots(&mut self) {
         // Ordered blends return with their work still on the queue — quiesce before freeing the
@@ -1060,5 +1061,64 @@ impl Drop for VkSlotBlend {
             d.destroy_device(None);
             self.instance.destroy_instance(None);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn slot() -> VkSlotRef {
+        VkSlotRef {
+            ptr: 0,
+            pitch: 2048,
+            height: 1080,
+            id: 0,
+        }
+    }
+
+    fn geo(fmt: SlotFormat, cw: u32, ch: u32, ox: i32, oy: i32) -> Option<(Push, u32, u32)> {
+        VkSlotBlend::blend_geometry(&slot(), fmt, 1920, cw, ch, ox, oy)
+    }
+
+    /// An empty (clamped-away) cursor rect dispatches nothing.
+    #[test]
+    fn empty_rect_is_none() {
+        assert!(geo(SlotFormat::Argb, 0, 32, 10, 10).is_none());
+        assert!(geo(SlotFormat::Nv12, 32, 0, 10, 10).is_none());
+    }
+
+    /// Oversized bitmaps clamp to `CURSOR_MAX` — the push constants must agree with the staging
+    /// buffer's capacity, or the shader reads past the uploaded bitmap.
+    #[test]
+    fn cursor_dims_clamp_to_max() {
+        let (push, _, _) = geo(SlotFormat::Argb, CURSOR_MAX + 100, CURSOR_MAX + 1, 0, 0).unwrap();
+        assert_eq!(push.cur_w, CURSOR_MAX);
+        assert_eq!(push.cur_h, CURSOR_MAX);
+    }
+
+    /// ARGB dispatches per cursor pixel; NV12/YUV444 per word-aligned 4-px span, NV12 walking
+    /// 2-row blocks and YUV444 single rows. A 32×32 cursor at ox=13: spans cover the aligned
+    /// x∈[12,48) → 9 spans → 2 groups of 8.
+    #[test]
+    fn group_counts_per_format() {
+        let (_, gx, gy) = geo(SlotFormat::Argb, 32, 32, 13, 0).unwrap();
+        assert_eq!((gx, gy), (4, 4)); // 32/8 in both axes
+
+        let (_, gx, gy) = geo(SlotFormat::Nv12, 32, 32, 13, 0).unwrap();
+        assert_eq!((gx, gy), (2, 2)); // 9 spans → 2 groups; 16 2-row blocks → 2 groups
+
+        let (_, gx, gy) = geo(SlotFormat::Yuv444, 32, 32, 13, 0).unwrap();
+        assert_eq!((gx, gy), (2, 4)); // 9 spans → 2 groups; 32 rows → 4 groups
+    }
+
+    /// Negative `ox` must anchor spans with FLOOR alignment (`>>` on the signed value), not
+    /// truncating division: at ox=-5 the aligned start is -8, giving 9 spans over a 32-px cursor
+    /// (truncation would start at -4 and dispatch only 8 — silently dropping the right edge).
+    #[test]
+    fn negative_ox_floor_aligns_the_span_origin() {
+        let (push, gx, _) = geo(SlotFormat::Nv12, 32, 32, -5, 0).unwrap();
+        assert_eq!(push.ox, -5, "push constants carry the true origin");
+        assert_eq!(gx, 2, "9 spans from the floor-aligned start → 2 groups");
     }
 }

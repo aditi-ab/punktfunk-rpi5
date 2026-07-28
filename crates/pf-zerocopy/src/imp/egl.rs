@@ -8,7 +8,7 @@
 //! format is opaque). So we follow OBS/Sunshine: bind the `EGLImage` to a GL texture
 //! (`glEGLImageTargetTexture2DOES`), render it through a fullscreen-triangle shader into a plain
 //! immutable `GL_RGBA8` texture (de-tiling and swizzling to the BGRx the encoder wants), then
-//! register *that* texture with CUDA ([`MappedTexture`]) and copy it device-to-device into an
+//! register *that* texture with CUDA (`cuda::RegisteredTexture`) and copy it device-to-device into an
 //! owned [`DeviceBuffer`] so the dmabuf can be returned to the compositor immediately.
 
 #![allow(non_upper_case_globals)]

@@ -24,11 +24,33 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 pub use cuda::DeviceBuffer;
 pub use egl::{DmabufPlane, EglImporter};
 
-/// Whether a `PUNKTFUNK_*` flag is truthy (`1`/`true`/`yes`/`on`), or `None` when unset.
+/// Whether a `PUNKTFUNK_*` flag is truthy (`1`/`true`/`yes`/`on`, any case), falsy (`0`/`false`/
+/// `no`/`off`, any case), or `None` when unset — and, crucially, `None` for an *unrecognised*
+/// spelling too. These flags default ON (`PUNKTFUNK_ZEROCOPY`, `PUNKTFUNK_NV12`), so treating a
+/// typo'd `TRUE` as "off" silently inverted the operator's intent host-wide (a systemd drop-in or
+/// Nix module is exactly where such spellings come from). Unrecognised values are logged once so
+/// they are visible instead of silent.
 fn flag_opt(name: &str) -> Option<bool> {
-    std::env::var(name)
-        .ok()
-        .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
+    let v = std::env::var(name).ok()?;
+    match v.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" | "" => Some(false),
+        _ => {
+            use std::collections::HashSet;
+            use std::sync::Mutex;
+            static WARNED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+            let mut g = WARNED.lock().unwrap();
+            if g.get_or_insert_with(HashSet::new).insert(name.to_string()) {
+                tracing::warn!(
+                    flag = name,
+                    value = %v,
+                    "unrecognised boolean value for this PUNKTFUNK_* flag — expected \
+                     1/true/yes/on or 0/false/no/off (any case); using the flag's default"
+                );
+            }
+            None
+        }
+    }
 }
 
 /// Whether a `PUNKTFUNK_*` flag is truthy (`1`/`true`/`yes`/`on`); unset ⇒ false.
@@ -49,7 +71,7 @@ pub fn vaapi_dmabuf_forced() -> bool {
 /// (`design/zerocopy-worker-isolation.md`), so a driver fault on a producer-invalidated dmabuf kills
 /// the worker and the host degrades to its capture-loss rebuild instead of dying — the reason the
 /// NVENC path stayed opt-in is gone. Fallbacks stay in place: VAAPI has a one-shot CPU downgrade if
-/// the LINEAR-dmabuf offer never negotiates ([`note_vaapi_dmabuf_failed`]); NVENC falls back per
+/// the LINEAR-dmabuf offer never negotiates ([`note_raw_dmabuf_negotiation_failed`]); NVENC falls back per
 /// capture when no importer/importable modifier is available and latches the import off after
 /// repeated worker deaths. `PUNKTFUNK_ZEROCOPY=0` opts out; `PUNKTFUNK_FORCE_SHM` forces the
 /// race-free SHM path.
@@ -204,7 +226,7 @@ static GPU_IMPORT_DISABLED: AtomicBool = AtomicBool::new(false);
 const GPU_IMPORT_DEATH_LATCH: u32 = 3;
 
 /// Record a worker death (transport-level failure). Latches the process-wide disable after
-/// [`GPU_IMPORT_DEATH_LATCH`] consecutive deaths.
+/// `GPU_IMPORT_DEATH_LATCH` consecutive deaths.
 pub fn note_gpu_import_death() {
     let streak = GPU_IMPORT_DEATH_STREAK.fetch_add(1, Ordering::Relaxed) + 1;
     if streak >= GPU_IMPORT_DEATH_LATCH && !GPU_IMPORT_DISABLED.swap(true, Ordering::Relaxed) {
@@ -243,7 +265,7 @@ static RAW_DMABUF_DISABLED: AtomicBool = AtomicBool::new(false);
 const RAW_DMABUF_FAILURE_LATCH: u32 = 3;
 
 /// Record an encoder-side raw-dmabuf import failure. Latches the process-wide disable after
-/// [`RAW_DMABUF_FAILURE_LATCH`] consecutive failures.
+/// `RAW_DMABUF_FAILURE_LATCH` consecutive failures.
 pub fn note_raw_dmabuf_import_failure(reason: &str) {
     let streak = RAW_DMABUF_FAILURE_STREAK.fetch_add(1, Ordering::Relaxed) + 1;
     if streak >= RAW_DMABUF_FAILURE_LATCH && !RAW_DMABUF_DISABLED.swap(true, Ordering::Relaxed) {
@@ -464,6 +486,38 @@ pub fn nv12_selftest() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// [`bt709_limited`] is the sole oracle for the GPU colour self-test — a coefficient typo here
+    /// would fail the self-test on a correct GPU (operator blames the driver), or, mirrored into
+    /// the shaders, pass it on genuinely wrong output. Pin it to externally-known BT.709
+    /// limited-range anchors instead of trusting it to check itself.
+    #[test]
+    fn bt709_limited_reference_matches_known_anchors() {
+        let close = |a: f64, b: f64| (a - b).abs() < 1e-9;
+
+        let (y, u, v) = bt709_limited(0, 0, 0); // black
+        assert!(
+            close(y, 16.0) && close(u, 128.0) && close(v, 128.0),
+            "black → ({y}, {u}, {v})"
+        );
+
+        let (y, u, v) = bt709_limited(255, 255, 255); // white
+        assert!(
+            close(y, 235.0) && close(u, 128.0) && close(v, 128.0),
+            "white → ({y}, {u}, {v})"
+        );
+
+        // Pure red saturates V (Kr row sums to exactly +0.5), pure blue saturates U.
+        let (_, _, v) = bt709_limited(255, 0, 0);
+        assert!(close(v, 240.0), "red V → {v}");
+        let (_, u, _) = bt709_limited(0, 0, 255);
+        assert!(close(u, 240.0), "blue U → {u}");
+
+        // One mid-scale anchor so a swapped Kr/Kb pair can't cancel out: BT.709 Y of pure green
+        // is 16 + 219·0.7152.
+        let (y, _, _) = bt709_limited(0, 255, 0);
+        assert!(close(y, 16.0 + 219.0 * 0.7152), "green Y → {y}");
+    }
 
     /// Single test owning the process-global latch statics (they are never reset by design).
     #[test]

@@ -1,4 +1,4 @@
-//! CUDA driver-side state for the zero-copy path, layered over the raw driver-API FFI in [`ffi`]
+//! CUDA driver-side state for the zero-copy path, layered over the raw driver-API FFI in `ffi`
 //! (the `dlopen`'d `libcuda.so.1` symbol table — hand-rolled because no Rust crate exposes the
 //! GL-interop calls, and runtime-loaded so one binary runs on NVIDIA *and* on AMD/Intel where
 //! `libcuda` is absent). This facade owns the higher-level pieces on top of that layer:
@@ -356,7 +356,10 @@ fn alloc_pitched_nv12(
     // SAFETY: two independent `cuMemAllocPitch_v2` calls (wrapper → live table). `&mut y_ptr`/
     // `&mut y_pitch` and `&mut uv_ptr`/`&mut uv_pitch` are live, distinct stack out-params the
     // driver writes each plane's pointer and pitch into; all outlive their synchronous calls. The
-    // dimension/element-size args are by-value ints. No aliasing — four separate locals.
+    // dimension/element-size args are by-value ints. No aliasing — four separate locals. If the UV
+    // allocation fails, the just-created Y allocation is freed before the error propagates — this
+    // runs per frame under VRAM pressure (`BufferPool::get`'s pool-miss fallback), so a leak here
+    // would compound exactly when memory is already scarce.
     unsafe {
         ck(
             cuMemAllocPitch_v2(
@@ -369,7 +372,7 @@ fn alloc_pitched_nv12(
             "cuMemAllocPitch_v2(Y)",
         )?;
         // Chroma is W/2 samples wide at 2 bytes each = W bytes; H/2 rows.
-        ck(
+        if let Err(e) = ck(
             cuMemAllocPitch_v2(
                 &mut uv_ptr,
                 &mut uv_pitch,
@@ -378,7 +381,10 @@ fn alloc_pitched_nv12(
                 16,
             ),
             "cuMemAllocPitch_v2(UV)",
-        )?;
+        ) {
+            let _ = cuMemFree_v2(y_ptr);
+            return Err(e);
+        }
     }
     Ok(((y_ptr, y_pitch), (uv_ptr, uv_pitch)))
 }
@@ -432,7 +438,7 @@ impl InputSurface {
     }
 
     /// Planar YUV444 (8-bit 4:4:4): one allocation, Y|U|V full-res planes stacked (see
-    /// [`alloc_pitched_yuv444`]).
+    /// `alloc_pitched_yuv444`).
     pub fn alloc_yuv444(width: u32, height: u32) -> Result<InputSurface> {
         let (ptr, pitch) = alloc_pitched_yuv444(width, height)?;
         Ok(InputSurface { ptr, pitch, height })
@@ -509,7 +515,7 @@ pub struct BufferPool {
     pitch: usize,
     /// NV12 pools carry a second (chroma) pitch; `Some` ⇒ buffers from this pool have a UV plane.
     uv_pitch: Option<usize>,
-    /// YUV444 pools: one allocation of 3·`height` stacked 1-byte planes (see [`alloc_pitched_yuv444`]).
+    /// YUV444 pools: one allocation of 3·`height` stacked 1-byte planes (see `alloc_pitched_yuv444`).
     yuv444: bool,
 }
 
@@ -629,10 +635,10 @@ pub struct DeviceBuffer {
     pub pitch: usize,
     pub width: u32,
     pub height: u32,
-    /// NV12 only: the interleaved chroma plane `(ptr, pitch)` paired with the Y plane in [`ptr`].
-    /// `None` for the default 4-byte RGB/BGRx path. When `Some`, [`ptr`] is the Y plane (1 byte/px).
+    /// NV12 only: the interleaved chroma plane `(ptr, pitch)` paired with the Y plane in [`ptr`](Self::ptr).
+    /// `None` for the default 4-byte RGB/BGRx path. When `Some`, [`ptr`](Self::ptr) is the Y plane (1 byte/px).
     pub uv: Option<(CUdeviceptr, usize)>,
-    /// Planar YUV444: [`ptr`] is ONE allocation of 3·[`height`](Self::height) rows at
+    /// Planar YUV444: [`ptr`](Self::ptr) is ONE allocation of 3·[`height`](Self::height) rows at
     /// [`pitch`](Self::pitch) — the full-res 1-byte Y, U, V planes stacked in that order
     /// (`uv` stays `None`; the single-plane wire/IPC path carries it unchanged).
     pub yuv444: bool,
@@ -1005,8 +1011,15 @@ pub fn copy_nv12_to_device(
     // `sync: false` shifts the source-lifetime obligation to the caller (documented above).
     // Wrappers → live table.
     unsafe {
-        copy_async(&y, "cuMemcpy2DAsync_v2(nv12 Y dev->dev)")?;
-        copy_async(&uv, "cuMemcpy2DAsync_v2(nv12 UV dev->dev)")?;
+        // On a failed enqueue, drain the stream before propagating: the caller drops `src` on
+        // `Err`, which recycles it into its pool — a copy still in flight would then race the
+        // next frame written into the same allocation.
+        let r = copy_async(&y, "cuMemcpy2DAsync_v2(nv12 Y dev->dev)")
+            .and_then(|()| copy_async(&uv, "cuMemcpy2DAsync_v2(nv12 UV dev->dev)"));
+        if r.is_err() {
+            let _ = sync_copy_stream();
+            return r;
+        }
         if sync {
             sync_copy_stream()?;
         }
@@ -1045,8 +1058,15 @@ pub fn copy_yuv444_to_device(
         // `src.ptr + pitch·h·i` stays within the live 3·H-row stacked allocation (`yuv444`
         // checked above), `dst_ptr`/`dst_pitch` is the caller's live NVENC plane; `w`×`h` fits
         // both. Completion is the trailing stream sync below (`sync`) or the caller's
-        // stream-ordering obligation (`sync: false`, documented above). Wrapper → live table.
-        unsafe { copy_async(&copy, "cuMemcpy2DAsync_v2(yuv444 plane dev->dev)")? };
+        // stream-ordering obligation (`sync: false`, documented above). A failed enqueue drains
+        // the stream first — earlier planes are already queued, and the caller drops (recycles)
+        // `src` on `Err`. Wrapper → live table.
+        unsafe {
+            if let Err(e) = copy_async(&copy, "cuMemcpy2DAsync_v2(yuv444 plane dev->dev)") {
+                let _ = sync_copy_stream();
+                return Err(e);
+            }
+        }
     }
     if sync {
         // SAFETY: one stream sync after the last enqueue covers all three planes (FIFO) — the

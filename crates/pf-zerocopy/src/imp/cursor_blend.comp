@@ -17,7 +17,8 @@
 // rows for NV12, whose 2 chroma bytes-pairs land in one exclusive word). Spans are aligned to the
 // SURFACE, not the cursor, so neighbouring invocations never share a word even at odd `ox`.
 //
-// Rebuild: glslc cursor_blend.comp -o cursor_blend.spv   (vendored beside this file)
+// Rebuild: glslangValidator -V cursor_blend.comp -o cursor_blend.spv   (vendored beside this
+// file; or glslc — CI diffs the disassembly against this source)
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 

@@ -26,6 +26,22 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends libgtk-4-dev libadwaita-1-dev libsdl3-dev
 
+      # The committed pf-zerocopy SPIR-V blobs are pulled in with include_bytes! and rebuilt only
+      # by hand — edit a .comp, forget the rebuild, and the OLD kernel ships with no compile error
+      # or failing test. Recompile each shader and diff the disassembly. Filtering OpSourceExtension
+      # (+ --no-header) is exactly what absorbs the shaderc-vs-glslang generator difference; every
+      # instruction, ID and constant must match.
+      - name: Shader SPIR-V drift gate (pf-zerocopy)
+        run: |
+          apt-get install -y --no-install-recommends glslang-tools spirv-tools
+          for s in rgb2nv12_buf cursor_blend; do
+            d=crates/pf-zerocopy/src/imp
+            glslangValidator -V "$d/$s.comp" -o "/tmp/$s.spv" >/dev/null
+            diff <(spirv-dis --no-header "$d/$s.spv"  | grep -v OpSourceExtension) \
+                 <(spirv-dis --no-header "/tmp/$s.spv" | grep -v OpSourceExtension) \
+              || { echo "::error::$d/$s.spv is stale — rebuild it from $s.comp"; exit 1; }
+          done
+
       # Best-effort caches (act_runner's built-in cache server). Keyed on Cargo.lock:
       # registry/git are download caches, target/ the incremental build. The target key
       # carries the rustc version — resolved via `rustc --version` (below) rather than parsed

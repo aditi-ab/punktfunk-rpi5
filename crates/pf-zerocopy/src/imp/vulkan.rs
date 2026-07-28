@@ -51,7 +51,7 @@ struct Csc {
 }
 
 /// The buffer-to-buffer RGB→NV12 compute shader (see `rgb2nv12_buf.comp` beside this file;
-/// rebuild with `glslc rgb2nv12_buf.comp -o rgb2nv12_buf.spv`).
+/// rebuild with `glslangValidator -V rgb2nv12_buf.comp -o rgb2nv12_buf.spv`; CI gates drift).
 const CSC_SPV: &[u8] = include_bytes!("rgb2nv12_buf.spv");
 
 pub struct VkBridge {

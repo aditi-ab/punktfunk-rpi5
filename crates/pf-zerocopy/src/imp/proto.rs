@@ -1,6 +1,6 @@
 //! Wire protocol between the PipeWire capture thread and the isolated zero-copy GPU-import
 //! worker process (`punktfunk-host zerocopy-worker`; design:
-//! [`design/zerocopy-worker-isolation.md`]). Transport is a `SOCK_SEQPACKET` unix socketpair —
+//! `design/zerocopy-worker-isolation.md`). Transport is a `SOCK_SEQPACKET` unix socketpair —
 //! reliable, ordered, message-framed (one `sendmsg` = one message) — with dmabuf fds riding as
 //! `SCM_RIGHTS` control data. Bodies are small serde_json blobs (~200 B/frame); pixels never
 //! cross the socket (they move GPU-side via CUDA IPC, see [`super::cuda::ipc_export`]).

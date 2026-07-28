@@ -321,14 +321,15 @@ fn consume_frame(ud: &mut UserData, spa_buf: *mut spa::sys::spa_buffer) {
     // attach no fence. Covers both the GPU import and the CPU mmap read below.
     if datas[0].type_() == pw::spa::buffer::DataType::DmaBuf {
         match pf_zerocopy::dmabuf_fence::wait_read_ready(datas[0].fd(), 100) {
-            Ok(waited) => {
+            Ok(outcome) => {
                 static F1: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
                 if F1.swap(false, Ordering::Relaxed) {
                     tracing::info!(
-                        waited,
-                        "dmabuf implicit-fence sync active (waited=true → driver fences \
-                         the render, race closed; false → no implicit fence, zero-copy \
-                         may still show stale frames)"
+                        ?outcome,
+                        "dmabuf implicit-fence sync active (Signaled → driver fences the \
+                         render, race closed; NoFence → no implicit fence, zero-copy may \
+                         still show stale frames; TimedOut → fence pending past 100ms, \
+                         proceeded anyway)"
                     );
                 }
             }
