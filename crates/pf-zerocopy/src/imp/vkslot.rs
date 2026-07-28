@@ -660,10 +660,11 @@ impl VkSlotBlend {
     pub fn free_slots(&mut self) {
         // Ordered blends return with their work still on the queue — quiesce before freeing the
         // buffers/sets it references. `device_wait_idle` (not a timeline wait) so a submission
-        // whose CUDA copy-done signal never fired is still covered; this tiny device idles in
-        // microseconds outside that pathological case. CPU-synced blends need nothing (they
-        // fence-wait before returning), so a `None` timeline skips it.
-        if self.timeline.is_some() && !self.slots.is_empty() {
+        // whose CUDA copy-done signal never fired is still covered. CPU-synced blends normally
+        // fence-wait before returning, but a blend whose wait TIMED OUT propagated an error with
+        // its submission still executing — so the drain runs unconditionally (it idles in
+        // microseconds on this tiny device outside the pathological cases it exists for).
+        if !self.slots.is_empty() {
             // SAFETY: single-threaded owner; no other thread touches this device or its queue.
             unsafe {
                 let _ = self.device.device_wait_idle();
@@ -773,7 +774,14 @@ impl VkSlotBlend {
                 let x0 = (ox >> 2) << 2;
                 let spans = ((ox + cw as i32) - x0 + 3).div_euclid(4).max(1) as u32;
                 let rows = match fmt {
-                    SlotFormat::Nv12 => ch.div_ceil(2),
+                    SlotFormat::Nv12 => {
+                        // 2-row blocks anchored to the SURFACE chroma grid (cursor_blend.comp
+                        // derives the same y0): count the blocks covering luma rows
+                        // [oy, oy+ch) — one more than ch/2 when oy is odd.
+                        let first = oy.div_euclid(2);
+                        let last = (oy + ch as i32 - 1).div_euclid(2);
+                        (last - first + 1) as u32
+                    }
                     _ => ch,
                 };
                 (spans.div_ceil(8), rows.div_ceil(8))
@@ -906,6 +914,14 @@ impl VkSlotBlend {
             d.queue_submit(self.queue, &submit, self.fence)
                 .context("submit blend")?;
             let r = d.wait_for_fences(&[self.fence], true, 1_000_000_000);
+            if r.is_err() {
+                // TIMEOUT (or device loss): the submission may still be executing. Resetting a
+                // fence with a pending signal and re-recording this slot's command buffer next
+                // frame would race the GPU — drain the device first (what
+                // `VkBridge::import_linear` does on a failed wait). On this tiny device the
+                // idle completes in microseconds once the stall clears.
+                let _ = d.device_wait_idle();
+            }
             d.reset_fences(&[self.fence]).ok();
             r.context("blend fence wait")?;
         }
@@ -1126,5 +1142,19 @@ mod tests {
         let (push, gx, _) = geo(SlotFormat::Nv12, 32, 32, -5, 0).unwrap();
         assert_eq!(push.ox, -5, "push constants carry the true origin");
         assert_eq!(gx, 2, "9 spans from the floor-aligned start → 2 groups");
+    }
+
+    /// NV12 block rows anchor to the SURFACE chroma grid, so an odd `oy` needs one extra block
+    /// to reach the cursor's last luma row (the cursor-anchored count left that row's chroma
+    /// unwritten). Negative odd `oy` floors the same way (`div_euclid`).
+    #[test]
+    fn odd_oy_nv12_adds_the_straddle_block() {
+        let (_, _, gy) = geo(SlotFormat::Nv12, 32, 32, 0, 8).unwrap();
+        assert_eq!(gy, 2, "even oy: 16 chroma-grid blocks → 2 groups");
+        let (_, _, gy) = geo(SlotFormat::Nv12, 32, 32, 0, 7).unwrap();
+        assert_eq!(gy, 3, "odd oy: 17 blocks cover luma rows 7..39 → 3 groups");
+        let (push, _, gy) = geo(SlotFormat::Nv12, 32, 32, 0, -3).unwrap();
+        assert_eq!(push.oy, -3, "push constants carry the true origin");
+        assert_eq!(gy, 3, "blocks -4..30 in steps of 2 → 17 → 3 groups");
     }
 }

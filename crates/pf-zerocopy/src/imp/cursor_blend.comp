@@ -15,7 +15,9 @@
 // invocation exclusively owns the 32-bit words it read-modify-writes. ARGB: one invocation per
 // cursor pixel = one word. NV12/YUV444: one invocation per WORD-ALIGNED 4-px luma span (per two
 // rows for NV12, whose 2 chroma bytes-pairs land in one exclusive word). Spans are aligned to the
-// SURFACE, not the cursor, so neighbouring invocations never share a word even at odd `ox`.
+// SURFACE, not the cursor, so neighbouring invocations never share a word even at odd `ox`; NV12
+// block rows are likewise anchored to the surface chroma grid (even rows), so each UV sample's
+// 2x2 footprint is exactly the luma rows it averages, at any `oy`.
 //
 // Rebuild: glslangValidator -V cursor_blend.comp -o cursor_blend.spv   (vendored beside this
 // file; or glslc — CI diffs the disassembly against this source)
@@ -112,15 +114,20 @@ void main() {
         return;
     }
 
-    // NV12: rows walk 2-row luma blocks (row = block row). The span's 4 luma px × 2 rows are
-    // exclusive words; its 2 chroma samples (4 bytes) are one exclusive word.
-    int base_cy = row * 2;
-    if (base_cy >= int(pc.curH)) return;
-    // Luma: 4 px × 2 rows.
+    // NV12: rows walk 2-row luma blocks anchored to the SURFACE chroma grid (block top = an even
+    // surface row), the same way spans are anchored to the surface word grid in x. Anchoring to
+    // the cursor's oy instead put every chroma sample one luma row high whenever oy was odd —
+    // and never wrote the cursor's last row's chroma at all. y0 = floor(oy/2)*2; the arithmetic
+    // shift keeps that floor for negative oy. blend_geometry counts blocks from this same anchor.
+    int y0 = (pc.oy >> 1) << 1;
+    int py_top = y0 + row * 2;          // this block's top luma row (even by construction)
+    if (py_top >= pc.oy + int(pc.curH)) return; // dispatch-padding block below the cursor
+    // Luma: 4 px × 2 rows. The first block can start one row above the cursor (odd oy) — the
+    // per-row cy guard skips that row.
     for (int j = 0; j < 2; j++) {
-        int cy = base_cy + j;
-        int py = pc.oy + cy;
-        if (cy >= int(pc.curH) || py < 0 || py >= int(pc.surfH)) continue;
+        int py = py_top + j;
+        int cy = py - pc.oy;
+        if (cy < 0 || cy >= int(pc.curH) || py < 0 || py >= int(pc.surfH)) continue;
         for (int i = 0; i < 4; i++) {
             int px = px0 + i;
             int cx = px - pc.ox;
@@ -132,11 +139,12 @@ void main() {
         }
     }
     // Chroma: two UV samples covering the span's 2x2 blocks, alpha-weighted like the .cu kernel.
-    // The UV plane starts at row surfH; sample (uvx, uvy) lives at uv_base + uvy*pitch + uvx*2.
+    // Because py_top sits on the chroma grid, sample uvy covers exactly luma rows py_top and
+    // py_top+1 — the rows averaged below. The UV plane starts at row surfH; sample (uvx, uvy)
+    // lives at uv_base + uvy*pitch + uvx*2.
     // Guard: only spans whose px0 is 4-aligned own their chroma word (px0 is by construction).
-    int py_top = pc.oy + base_cy;
     int uvy = py_top >> 1;
-    if (py_top < 0 || uvy < 0 || uvy * 2 >= int(pc.surfH)) return;
+    if (py_top < 0 || uvy * 2 >= int(pc.surfH)) return;
     uint uv_base = pc.pitch * pc.surfH;
     for (int hf = 0; hf < 2; hf++) {
         // Each hf = one 2x2 luma block = one UV sample (2 bytes).
@@ -150,7 +158,7 @@ void main() {
                 int px = bx + i;
                 int py = py_top + j;
                 int cx = px - pc.ox;
-                int cy = base_cy + j;
+                int cy = py - pc.oy;
                 if (px < 0 || py < 0 || px >= int(pc.surfW) || py >= int(pc.surfH)) continue;
                 uvec4 s = cursor_px(cx, cy);
                 if (s.a == 0u) continue;
