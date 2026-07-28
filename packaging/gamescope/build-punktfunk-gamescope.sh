@@ -85,9 +85,20 @@ echo "==> configuring"
 #                               package already installs; ours must not collide with it.
 #                               (The layer the nested games load is that one — it is version-
 #                               independent of the compositor binary.)
+#
+# `force_fallback_for` includes **wlroots** on purpose, and it is load-bearing for a binary we
+# SHIP: gamescope vendors a wlroots submodule, but meson prefers a system one when the build host
+# happens to have `wlroots-devel` — and then links it SHARED. The result starts fine on the build
+# host and dies with `libwlroots-0.19.so: cannot open shared object file` anywhere else, which is
+# every machine that installs our package. Fedora 43 has no wlroots-devel so it fell back and
+# linked static by luck; Fedora 44's `dnf builddep gamescope` pulls one in, and the binary built
+# there would not start on the host. Pinning the fallback makes the outcome the same everywhere.
+# (gamescope's own meson.build hard-errors if libliftoff/vkroots are missing from this list, so
+# all three go together.)
 meson setup "$BUILD" "$SRCDIR" \
   --prefix="$PREFIX" \
   --buildtype=release \
+  -Dforce_fallback_for=libliftoff,vkroots,wlroots \
   -Dpipewire=enabled \
   -Denable_tests=false \
   -Denable_openvr_support=false \
