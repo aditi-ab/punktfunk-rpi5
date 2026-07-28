@@ -285,6 +285,14 @@ pub fn resolve_gdi_name(target_id: u32) -> Option<String> {
 ///
 /// Safe to call from any thread.
 pub fn active_resolution(target_id: u32) -> Option<(u32, u32)> {
+    active_mode(target_id).map(|(w, h, _)| (w, h))
+}
+
+/// The target's CURRENT active mode as `(width, height, refresh_hz)` — what the OS actually
+/// committed, which is not always what was asked for: `set_active_mode` deliberately falls back to
+/// the highest advertised refresh <= requested rather than losing the client's resolution. Callers
+/// that RECORD a mode must record this, or they claim a refresh the display is not running.
+pub fn active_mode(target_id: u32) -> Option<(u32, u32, u32)> {
     let gdi = resolve_gdi_name(target_id)?;
     let wname: Vec<u16> = gdi.encode_utf16().chain(std::iter::once(0)).collect();
     let mut dm = DEVMODEW {
@@ -299,7 +307,7 @@ pub fn active_resolution(target_id: u32) -> Option<(u32, u32)> {
     if !ok || dm.dmPelsWidth == 0 || dm.dmPelsHeight == 0 {
         return None;
     }
-    Some((dm.dmPelsWidth, dm.dmPelsHeight))
+    Some((dm.dmPelsWidth, dm.dmPelsHeight, dm.dmDisplayFrequency))
 }
 
 /// Verified-state topology-settle wait (latency plan P0.2): poll the CCD state until the target is
@@ -399,7 +407,12 @@ pub fn advertised_resolutions(gdi_name: &str) -> Vec<(u32, u32)> {
 /// gate between a driver-side mode-list refresh (`IOCTL_UPDATE_MODES`, latency plan P2) and the
 /// CCD/GDI force-set: the OS re-evaluates an indirect display's settable modes asynchronously after
 /// `IddCxMonitorUpdateModes2`, so an immediate `set_active_mode` could race the re-enumeration and
-/// silently leave the old mode. Returns `true` once any refresh at the requested WxH is enumerable.
+/// silently leave the old mode. Returns `true` once the requested `WxH@Hz` is enumerable.
+///
+/// The REFRESH is part of the match. It used to compare resolution only, which made a refresh-only
+/// change (same WxH, new Hz) report "already advertised" — so the caller's fast path skipped the
+/// `IOCTL_UPDATE_MODES` that would have taught the driver the new rate, `set_active_mode` fell back
+/// to the best advertised rate <= requested, and the resize reported success at the OLD refresh.
 pub fn wait_mode_advertised(gdi_name: &str, mode: Mode, ceiling: std::time::Duration) -> bool {
     let wname: Vec<u16> = gdi_name.encode_utf16().chain(std::iter::once(0)).collect();
     let deadline = std::time::Instant::now() + ceiling;
@@ -424,7 +437,10 @@ pub fn wait_mode_advertised(gdi_name: &str, mode: Mode, ceiling: std::time::Dura
             if !ok {
                 break;
             }
-            if dm.dmPelsWidth == mode.width && dm.dmPelsHeight == mode.height {
+            if dm.dmPelsWidth == mode.width
+                && dm.dmPelsHeight == mode.height
+                && dm.dmDisplayFrequency == mode.refresh_hz
+            {
                 return true;
             }
             i += 1;

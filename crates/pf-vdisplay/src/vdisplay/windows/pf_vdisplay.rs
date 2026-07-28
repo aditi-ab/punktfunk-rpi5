@@ -647,6 +647,37 @@ impl VdisplayDriver for PfVdisplayDriver {
         // the `cursor_excluded` tail; `out` is zero-initialized, so the missing tail reads `0`
         // (= unknown/clean — exactly what a driver that can't track declares should report).
         if (n as usize) < control::ADD_REPLY_LEGACY_SIZE {
+            // The IOCTL SUCCEEDED — the driver has already created the monitor and taken an IddCx
+            // slot; only its reply was short. Bailing without undoing that leaks both, and the slot
+            // pool is small enough that ~16 leaks wedge every later ADD at 0x80070490 (the wedge the
+            // ghost-reap above exists to recover from). Compensate with the REMOVE this session's id
+            // addresses, then fail.
+            let req = control::RemoveRequest { session_id };
+            let mut none: [u8; 0] = [];
+            // SAFETY: `dev` is the live control handle (`add_monitor`'s contract); `bytes_of(&req)`
+            // borrows a local alive across this synchronous call, and `none` is the empty output the
+            // IOCTL expects.
+            let undo = unsafe {
+                ioctl(
+                    dev,
+                    control::IOCTL_REMOVE,
+                    bytemuck::bytes_of(&req),
+                    &mut none,
+                )
+            };
+            match undo {
+                Ok(_) => tracing::warn!(
+                    session_id,
+                    "pf-vdisplay ADD returned a short reply — removed the monitor it had already \
+                     created so its IddCx slot is not leaked"
+                ),
+                Err(e) => tracing::error!(
+                    session_id,
+                    error = %format!("{e:#}"),
+                    "pf-vdisplay ADD returned a short reply AND the compensating REMOVE failed — \
+                     this monitor's IddCx slot is leaked until the driver is cycled"
+                ),
+            }
             anyhow::bail!(
                 "pf-vdisplay ADD returned {n} bytes, expected at least {}",
                 control::ADD_REPLY_LEGACY_SIZE

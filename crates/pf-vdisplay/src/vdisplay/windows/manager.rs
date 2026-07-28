@@ -165,6 +165,27 @@ struct GroupState {
     ccd_exclusive: bool,
 }
 
+/// How a mid-stream re-arrival ([`ManagerInner::re_add`]) ended.
+///
+/// Three-way on purpose. `re_add` REMOVEs the old driver monitor before it ADDs the new one, so
+/// once the ADD fails the old monitor is GONE — and the caller used to answer that by putting its
+/// `Monitor` struct back in the slot, complete with a dead `key`, a departed `target_id` and a
+/// stale `gdi_name`. Every later `acquire` then joined a monitor that did not exist.
+enum ReAdd {
+    /// Re-arrived at the requested mode.
+    Arrived(Box<Monitor>),
+    /// The ADD failed and the OLD mode was re-ADDed instead, so the session keeps streaming what it
+    /// already had. The monitor is REAL but new — a re-arrival mints a fresh `target_id` — which is
+    /// why the caller must store THIS one and not the struct it handed in.
+    RolledBack {
+        mon: Box<Monitor>,
+        err: anyhow::Error,
+    },
+    /// The ADD failed and so did the rollback: this slot has no driver monitor at all. The caller
+    /// must leave it EMPTY so the next `acquire` creates one, rather than joining a phantom.
+    Lost(anyhow::Error),
+}
+
 /// What a NON-LAST-member teardown owes the group's topology.
 ///
 /// Split out of [`ManagerInner::teardown_removed`] so the gate is testable without a driver, a CCD
@@ -665,18 +686,35 @@ impl VirtualDisplayManager {
                 };
                 // SAFETY: `dev` is the handle `ensure_device()` returned above; `re_add` touches the
                 // live topology under the held `state` lock. `mon` is owned here (removed from the map).
-                let new_mon =
-                    match unsafe { self.re_add(dev, &mut inner, slot, &mon, mode, client_hdr) } {
-                        Ok(m) => m,
-                        Err(e) => {
-                            // The re-arrival failed — put the OLD monitor back so the session keeps
-                            // streaming its current mode (the control task already acked the switch; the
-                            // rebuild reuses the old target and Fix 2's corrective ack tells the client the
-                            // resolution didn't change). Its `gen`/`refs` are intact, so leases stay valid.
-                            inner.slots.insert(slot, SlotState::Active { mon, refs });
-                            return Err(e).context("mid-stream resize re-arrival");
-                        }
-                    };
+                let new_mon = match unsafe {
+                    self.re_add(dev, &mut inner, slot, &mon, mode, client_hdr)
+                } {
+                    ReAdd::Arrived(m) => *m,
+                    ReAdd::RolledBack {
+                        mon: recovered,
+                        err,
+                    } => {
+                        // The session keeps streaming its current mode (the control task already
+                        // acked the switch; Fix 2's corrective ack tells the client the resolution
+                        // did not change). Store the RECOVERED monitor, not the one handed in:
+                        // that one's driver monitor was REMOVEd before the failed ADD, so its
+                        // `key`/`target_id`/`gdi_name` are all dead. `gen`/`refs` are preserved,
+                        // so leases stay valid either way.
+                        inner.slots.insert(
+                            slot,
+                            SlotState::Active {
+                                mon: *recovered,
+                                refs,
+                            },
+                        );
+                        return Err(err).context("mid-stream resize re-arrival");
+                    }
+                    ReAdd::Lost(err) => {
+                        // No driver monitor for this slot. Leave it EMPTY so the next acquire
+                        // does a clean fresh ADD rather than joining a phantom.
+                        return Err(err).context("mid-stream resize re-arrival (slot left empty)");
+                    }
+                };
                 // `re_add` preserved `gen`, so both the old session's lease and this new one match on
                 // release. +1 ref for the new (build-then-drop overlap) lease.
                 let out = self.output_for(slot, &new_mon, quit);
@@ -1380,12 +1418,36 @@ impl VirtualDisplayManager {
                 "in-place mode set did not commit within 1.5s (advertised after {advertised_ms} ms)"
             );
         }
+        // Record what actually COMMITTED, not what was asked for. `set_active_mode` deliberately
+        // falls back to the highest advertised refresh <= requested rather than lose the client's
+        // resolution, so `mon.mode = mode` claimed a rate the display might not be running — and
+        // `mon.mode` is what the next resize diffs against and what `/display/state` reports.
+        let committed = pf_win_display::win_display::active_mode(mon.target_id);
+        let landed = match committed {
+            Some((w, h, hz)) => Mode {
+                width: w,
+                height: h,
+                refresh_hz: hz,
+            },
+            // The settle above already verified the resolution; if the read-back races we still
+            // know the size took, so trust the request rather than leaving `mon.mode` stale.
+            None => mode,
+        };
+        if landed.refresh_hz != mode.refresh_hz {
+            tracing::info!(
+                requested_hz = mode.refresh_hz,
+                committed_hz = landed.refresh_hz,
+                "in-place resize: the OS committed a different refresh than requested (the driver \
+                 does not advertise it) — recording what it actually runs"
+            );
+        }
         tracing::info!(
             advertised_ms,
             settle_ms = settle_start.elapsed().as_millis() as u64,
+            mode = format!("{}x{}@{}", landed.width, landed.height, landed.refresh_hz),
             "in-place resize committed (verified-state wait)"
         );
-        mon.mode = mode;
+        mon.mode = landed;
         Ok(())
     }
 
@@ -1416,7 +1478,7 @@ impl VirtualDisplayManager {
         old: &Monitor,
         mode: Mode,
         client_hdr: Option<punktfunk_core::quic::HdrMeta>,
-    ) -> Result<Monitor> {
+    ) -> ReAdd {
         tracing::info!(
             slot,
             old = format!(
@@ -1454,10 +1516,45 @@ impl VirtualDisplayManager {
         let render_pin = resolve_render_pin();
         // SAFETY: `dev` is the live control handle; `render_pin`/`client_hdr` are owned `Copy`/`Option`
         // values passed by value — no borrow crosses the call.
-        let added = unsafe {
+        // SAFETY (both ADDs): `dev` is the live control handle; `render_pin`/`client_hdr` are owned
+        // `Copy`/`Option` values passed by value — no borrow crosses the call.
+        let (added, mode, rollback_err) = match unsafe {
             self.driver
                 .add_monitor(dev, mode, render_pin, slot, client_hdr, old.hw_cursor)
-                .context("re-arrival ADD at the new mode")?
+        } {
+            Ok(a) => (a, mode, None),
+            Err(e) => {
+                // The old monitor is already REMOVEd, so there is nothing to "keep". Re-ADD it at
+                // the mode it had: the resize fails, but the session keeps streaming instead of
+                // being handed a slot whose driver monitor does not exist.
+                let e = e.context("re-arrival ADD at the new mode");
+                tracing::warn!(
+                    slot,
+                    error = %format!("{e:#}"),
+                    "re-arrival ADD failed — rolling back to the previous mode"
+                );
+                // SAFETY: as the ADD above — live control handle, owned `Copy`/`Option` args.
+                match unsafe {
+                    self.driver.add_monitor(
+                        dev,
+                        old.mode,
+                        render_pin,
+                        slot,
+                        client_hdr,
+                        old.hw_cursor,
+                    )
+                } {
+                    Ok(a) => (a, old.mode, Some(e)),
+                    Err(e2) => {
+                        tracing::error!(
+                            slot,
+                            error = %format!("{e2:#}"),
+                            "re-arrival rollback ADD also failed — the slot now has NO monitor"
+                        );
+                        return ReAdd::Lost(e.context(format!("rollback also failed: {e2:#}")));
+                    }
+                }
+            }
         };
         self.ensure_pinger();
         // 3. Resolve the NEW target's GDI name (target_id changes across a re-arrival).
@@ -1494,7 +1591,7 @@ impl VirtualDisplayManager {
         }
         // 5. Rebuild the Monitor from the ADD reply, PRESERVING `gen` (lease/refcount continuity) and
         //    the group-layout `position`. A fresh `gen` would strand the old session's lease release.
-        Ok(Monitor {
+        let mon = Box::new(Monitor {
             key: added.key,
             target_id: added.target_id,
             luid: added.luid,
@@ -1509,7 +1606,11 @@ impl VirtualDisplayManager {
             // Fresh from THIS reply, not `old`: the driver's per-target declare registry is the
             // ground truth (this session may itself have declared since the original ADD).
             cursor_excluded: added.cursor_excluded,
-        })
+        });
+        match rollback_err {
+            None => ReAdd::Arrived(mon),
+            Some(err) => ReAdd::RolledBack { mon, err },
+        }
     }
 
     /// Re-isolate the composited display set after a mid-stream monitor re-arrival ([`re_add`]) put a
