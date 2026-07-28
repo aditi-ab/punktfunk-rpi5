@@ -1443,6 +1443,79 @@ impl Encoder for FfmpegWinEncoder {
 mod tests {
     use super::*;
 
+    /// Pick the Intel adapter, or any hardware D3D11 adapter, for the probes below.
+    ///
+    /// Not `EnumAdapters1(0)`: a punktfunk host box also enumerates our own virtual-display adapter,
+    /// and "Microsoft Basic Render Driver" (vendor 0x1414) is the software rasterizer, which has no
+    /// video engine at all.
+    ///
+    /// # Safety
+    /// Calls the DXGI enumeration FFI and `make_device`; every result is checked before use and no
+    /// alias to the adapter outlives the call.
+    #[cfg(test)]
+    unsafe fn test_hw_device(prefer_vendor: u32) -> Option<ID3D11Device> {
+        use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1};
+        let factory: IDXGIFactory1 = CreateDXGIFactory1().ok()?;
+        let mut preferred = None;
+        let mut fallback = None;
+        for i in 0.. {
+            let Ok(adapter) = factory.EnumAdapters1(i) else {
+                break; // DXGI_ERROR_NOT_FOUND — end of the list
+            };
+            let Ok(desc) = adapter.GetDesc1() else {
+                continue;
+            };
+            let name = String::from_utf16_lossy(&desc.Description)
+                .trim_end_matches('\0')
+                .to_string();
+            eprintln!("adapter {i}: vendor={:#06x} {name}", desc.VendorId);
+            if desc.VendorId == prefer_vendor && preferred.is_none() {
+                preferred = Some(adapter);
+            } else if desc.VendorId != 0x1414 && fallback.is_none() {
+                fallback = Some(adapter);
+            }
+        }
+        let adapter = preferred.or(fallback)?;
+        pf_frame::dxgi::make_device(&adapter).ok().map(|(d, _c)| d)
+    }
+
+    /// Construct/drop `D3d11Hw` repeatedly on real silicon — the D3D11VA half of the RAII change,
+    /// and the half that IS reachable on any GPU.
+    ///
+    /// `D3d11Hw` owns a hwdevice + frames-pool pair through `AvBuffer`, and it is shared by both
+    /// Windows zero-copy vendors, so this covers the AMF path's ownership too without needing AMD
+    /// hardware. Looping is the point, as with `cuda_hw_alloc_drop_cycles`: a double-unref aborts in
+    /// the CRT, a missed one leaks a device and a pool of eight surfaces per iteration.
+    ///
+    /// `#[ignore]`d (needs a real D3D11 GPU):
+    /// `cargo test -p pf-encode --features amf-qsv d3d11hw_alloc_drop_cycles -- --ignored --nocapture`
+    #[test]
+    #[ignore = "needs a real D3D11 GPU (run on a GPU host, not the build box)"]
+    fn d3d11hw_alloc_drop_cycles() {
+        // SAFETY: see `test_hw_device`; the returned device outlives every `D3d11Hw` built below.
+        let device = unsafe { test_hw_device(0x8086) }.expect("a hardware D3D11 adapter");
+        for i in 0..8 {
+            // SAFETY: `D3d11Hw::new` needs libav initialised (it is, statically, by the ffmpeg-next
+            // crate's first use here) and a live `ID3D11Device`, which `device` is for the whole
+            // loop. NV12 at 640x480 with an 8-surface pool are valid pool parameters. The handle
+            // drops at the end of each iteration — that release is what is under test.
+            let hw = unsafe {
+                D3d11Hw::new(
+                    &device,
+                    ffi::AVPixelFormat::AV_PIX_FMT_NV12,
+                    pool_bind_flags(WinVendor::Amf),
+                    640,
+                    480,
+                    8,
+                )
+            }
+            .unwrap_or_else(|e| panic!("D3d11Hw::new failed on iteration {i}: {e:#}"));
+            assert!(!hw.device_ref.as_ptr().is_null(), "device ref went null");
+            assert!(!hw.frames_ref.as_ptr().is_null(), "frames ref went null");
+        }
+        eprintln!("8 D3d11Hw alloc/drop cycles completed without abort");
+    }
+
     /// Construct/drop `ZeroCopyInner` on the QSV path, repeatedly, on real Intel silicon.
     ///
     /// This is the one path in the crate where ownership was genuinely ambiguous: `open` builds a
@@ -1458,21 +1531,26 @@ mod tests {
     /// whole file unless `PUNKTFUNK_QSV_FFMPEG=1`. Calling `open` directly sidesteps both gates so
     /// the ownership itself is what gets exercised.
     ///
+    /// ⚠️ **KNOWN TO FAIL on Intel UHD 750 / FFmpeg 8 (2026-07-28), and NOT because of the code it
+    /// covers.** `av_hwdevice_ctx_create_derived(QSV <- D3D11VA)` returns
+    /// `MFX_ERR_UNDEFINED_BEHAVIOR (-16)` out of `MFXVideoCORE_SetHandle`, logged by libav as
+    /// "Error setting child device handle". Confirmed pre-existing by running this same probe
+    /// against unmodified `origin/main` (raw-pointer struct) on the same box: byte-identical
+    /// failure, same call, same first iteration. The native VPL backend
+    /// (`qsv::tests::qsv_encode_live_smoke`) encodes fine on that box, so the silicon and D3D11
+    /// zero-copy both work — it is libav's QSV-from-D3D11VA derive specifically that does not.
+    ///
+    /// That matches `zerocopy_active`, which already defaults QSV **off** pending Intel validation.
+    /// The test is kept (and kept `#[ignore]`d) so the derive gets re-checked on the next Intel
+    /// driver / FFmpeg bump rather than the question being silently dropped.
+    ///
     /// `#[ignore]`d (needs a real Intel QSV device):
     /// `cargo test -p pf-encode --features amf-qsv zerocopy_qsv_alloc_drop_cycles -- --ignored --nocapture`
     #[test]
-    #[ignore = "needs a real Intel QSV device (run on an Intel host, not the build box)"]
+    #[ignore = "needs a real Intel QSV device; currently fails in libav's QSV<-D3D11VA derive (pre-existing, see doc)"]
     fn zerocopy_qsv_alloc_drop_cycles() {
-        use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1};
-        // SAFETY: `CreateDXGIFactory1`/`EnumAdapters1` are the documented enumeration pair and are
-        // checked here; `make_device` requires a live `IDXGIAdapter1`, which `adapter` is for the
-        // duration of the call (it outlives it as a local). The returned device is the sole owner of
-        // its COM object and outlives every `ZeroCopyInner` built from it below.
-        let (device, _ctx) = unsafe {
-            let factory: IDXGIFactory1 = CreateDXGIFactory1().expect("CreateDXGIFactory1");
-            let adapter = factory.EnumAdapters1(0).expect("EnumAdapters1(0)");
-            pf_frame::dxgi::make_device(&adapter).expect("D3D11 device on adapter 0")
-        };
+        // SAFETY: see `test_hw_device`; the device outlives every `ZeroCopyInner` built below.
+        let device = unsafe { test_hw_device(0x8086) }.expect("an Intel D3D11 adapter");
         for i in 0..8 {
             let zc = ZeroCopyInner::open(
                 WinVendor::Qsv,
