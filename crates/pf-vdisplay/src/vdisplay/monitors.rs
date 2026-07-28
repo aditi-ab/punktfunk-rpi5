@@ -102,10 +102,13 @@ pub fn list(compositor: Compositor) -> Result<Vec<PhysicalMonitor>> {
         Compositor::Wlroots => crate::wlroots::list_monitors(),
         #[cfg(target_os = "linux")]
         Compositor::Hyprland => crate::hyprland::list_monitors(),
-        // gamescope is nested: it has no physical heads of its own, and mirroring the desktop it
-        // runs on is a question for the compositor UNDER it. Not an error — just nothing to offer.
+        // gamescope is only *sometimes* nested. A Bazzite/SteamOS Game Mode session is the DRM
+        // master and drives a real connector; the ones this crate spawns are headless and drive
+        // none. `gamescope::list_monitors` tells those apart and answers an empty list — not an
+        // error — for the nested/headless shapes, which is what this arm used to hard-code for all
+        // of them (and why the picker was permanently empty on a TV box).
         #[cfg(target_os = "linux")]
-        Compositor::Gamescope => Ok(Vec::new()),
+        Compositor::Gamescope => crate::gamescope::list_monitors(),
         #[cfg(not(target_os = "linux"))]
         _ => bail!("physical-monitor enumeration is implemented for the Linux backends only"),
     }

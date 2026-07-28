@@ -21,6 +21,8 @@ use std::time::{Duration, Instant};
 
 #[path = "gamescope/discovery.rs"]
 mod discovery;
+#[path = "gamescope/heads.rs"]
+mod heads;
 #[path = "gamescope/splash.rs"]
 mod splash;
 use discovery::{
@@ -31,6 +33,7 @@ pub(crate) use discovery::{
     game_session_exited, gamescope_can_composite_cursor, gamescope_hdr_capable, is_available,
     note_spawn_flags_lost, steam_appid_from_launch, wait_for_steam_game_exit, SteamGameWatch,
 };
+pub(crate) use heads::list_monitors;
 pub(crate) use splash::run as splash_run;
 
 /// The gamescope virtual-display driver. Three modes by env, in precedence order:
@@ -2154,6 +2157,53 @@ fn point_injector_at_eis() {
             "gamescope: no connectable gamescope EIS socket found — input won't reach the session"
         ),
     }
+}
+
+/// Mirror the physical head this gamescope session is driving (`vdisplay::mirror`'s gamescope arm).
+///
+/// The other backends mirror a head by *starting a new cast* addressed by connector name. gamescope
+/// has no such call and needs none: it composites its one head into a PipeWire node it already
+/// publishes, so mirroring is an ATTACH to that node — the same node the `PUNKTFUNK_GAMESCOPE_NODE`
+/// route uses, reached here without the sub-mode ladder because a monitor pin has already decided
+/// the question the ladder exists to answer.
+///
+/// **What makes this the mirror rather than the takeover**: nothing is stopped, nothing is
+/// relaunched, and no mode is imposed. The MANAGED route would tear the TV's autologin session down
+/// and rebuild it headless at the client's mode — correct when the operator wants the box's screen
+/// to go dark and the client to drive it, and exactly wrong when they asked to stream the panel
+/// they are looking at. `keepalive` is therefore `()`: we did not create this session and must not
+/// end it (`DisplayOwnership::External`, applied by the caller).
+///
+/// `hw_cursor` is inert here, and deliberately so rather than silently dropped: whether gamescope's
+/// pointer reaches the stream is fixed by the SPAWN flags of the session that is already running
+/// (`--pipewire-composite-cursor`, see `gamescope_can_composite_cursor`), not negotiable per cast.
+/// The session plan reads that same fact and arranges the XFixes reconstruction when it is absent.
+pub(crate) fn stream_existing_output(
+    connector: &str,
+    hw_cursor: bool,
+) -> Result<crate::mirror::MirrorStream> {
+    let node_id = find_gamescope_node().ok_or_else(|| {
+        anyhow!(
+            "gamescope is driving {connector:?} but publishes no PipeWire Video/Source node — the \
+             session may still be starting, or this gamescope was built without PipeWire support"
+        )
+    })?;
+    // Absolute input lands through gamescope's own EIS socket, as it does on every other gamescope
+    // route. The host's `capture_monitor` anchor is a no-op for this backend (gamescope advertises
+    // a degenerate INT32_MAX region), so the output-size hint written here is what actually scales
+    // the client's normalized positions onto the head.
+    point_injector_at_eis();
+    tracing::info!(
+        connector,
+        node_id,
+        hw_cursor,
+        "gamescope: mirroring the session's own head (attach — the gaming session is untouched)"
+    );
+    Ok(crate::mirror::MirrorStream {
+        node_id,
+        remote_fd: None,
+        keepalive: Box::new(()),
+    })
 }
 
 /// Path of the host-written `GAMESCOPE_BIN` wrapper (per-user, in tmpfs).

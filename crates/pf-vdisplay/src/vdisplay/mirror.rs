@@ -93,9 +93,15 @@ impl VirtualDisplay for MirrorDisplay {
             Compositor::Hyprland => {
                 crate::hyprland::stream_existing_output(&target.connector, self.hw_cursor)?
             }
-            // gamescope is nested — it has no physical heads of its own, and `monitors::list`
-            // already returned an empty set, so `resolve` failed before we got here. This arm
-            // exists for exhaustiveness, not as a reachable path.
+            // gamescope on the DRM backend (a Bazzite/SteamOS Game Mode session) DOES drive a real
+            // head — `monitors::list` reports it, and mirroring it is an attach to the composited
+            // node this session already publishes. A nested or headless gamescope reports no heads,
+            // so `resolve` fails above and this arm is never reached for one.
+            #[cfg(target_os = "linux")]
+            Compositor::Gamescope => {
+                crate::gamescope::stream_existing_output(&target.connector, self.hw_cursor)?
+            }
+            #[allow(unreachable_patterns)]
             other => bail!(
                 "mirroring an existing monitor is not supported on the {} backend",
                 other.id()
