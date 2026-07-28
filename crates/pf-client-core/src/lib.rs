@@ -27,6 +27,10 @@ pub mod gamepad;
 pub mod keymap;
 #[cfg(any(target_os = "linux", windows))]
 pub mod library;
+// The `punktfunk://` grammar (design/client-deep-links.md §2): one parser/emitter for the
+// shells, the session and the CLI, held to the Swift/Kotlin ports by a shared vector file.
+#[cfg(any(target_os = "linux", windows))]
+pub mod deeplink;
 // Client settings profiles: the override catalog + the one connect-time resolver
 // (design/client-settings-profiles.md §4). Sits beside `trust`, which owns the host records
 // the bindings live on.

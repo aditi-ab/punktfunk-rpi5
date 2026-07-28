@@ -299,11 +299,13 @@ mod tests {
     /// value — including values that happen to equal the base (an explicit pin).
     #[test]
     fn overlay_applies_only_what_it_overrides() {
-        let mut base = Settings::default();
-        base.width = 1920;
-        base.height = 1080;
-        base.bitrate_kbps = 20000;
-        base.codec = "hevc".into();
+        let base = Settings {
+            width: 1920,
+            height: 1080,
+            bitrate_kbps: 20000,
+            codec: "hevc".into(),
+            ..Default::default()
+        };
 
         let empty = SettingsOverlay::default();
         let out = empty.apply(&base);
