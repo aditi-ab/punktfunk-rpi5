@@ -76,6 +76,9 @@ pub struct AppModel {
 
 #[derive(Debug)]
 pub enum AppMsg {
+    /// A `punktfunk://` URL arrived (scheme handler, a shortcut, or a second invocation
+    /// forwarded to this instance by GApplication) — design/client-deep-links.md §4.1.
+    DeepLink(String),
     /// The trust gate in front of every connect (rules 1–3, see `update`).
     Connect(ConnectRequest),
     /// Connect to a saved host that isn't advertising but has a known MAC: fire a wake
@@ -269,6 +272,13 @@ impl SimpleComponent for AppModel {
         }
         window.present();
 
+        // The deep-link seam is live from here: anything GApplication delivered during a cold
+        // start has been parked, and everything from now on arrives as a message.
+        LINK_TX.with_borrow_mut(|tx| *tx = Some(sender.input_sender().clone()));
+        for url in PENDING_LINKS.with_borrow_mut(std::mem::take) {
+            sender.input(AppMsg::DeepLink(url));
+        }
+
         ComponentParts {
             model,
             widgets: AppWidgets {},
@@ -277,6 +287,7 @@ impl SimpleComponent for AppModel {
 
     fn update(&mut self, msg: AppMsg, sender: ComponentSender<Self>) {
         match msg {
+            AppMsg::DeepLink(url) => self.open_deep_link(&url, &sender),
             // The trust gate (the host is the policy authority — it advertises
             // `pair=optional` only when it accepts unpaired clients):
             //   1. PINNED RECONNECT — a stored fingerprint connects silently.
@@ -504,6 +515,82 @@ impl AppModel {
         self.toasts.add_toast(adw::Toast::new(msg));
     }
 
+    /// Route a `punktfunk://` URL (design/client-deep-links.md §4.1). Parsing, host/profile
+    /// resolution and every refusal rule live in the shared brain (`plan_from_link`); this is
+    /// only the GTK end of it — turn the outcome into the same messages a card click raises,
+    /// so a link gets the identical wake, trust and error surfaces and NOT a second connect
+    /// path of its own.
+    fn open_deep_link(&mut self, url: &str, sender: &ComponentSender<AppModel>) {
+        use pf_client_core::deeplink;
+        use pf_client_core::orchestrate::{plan_from_link, PlanOutcome};
+        use pf_client_core::profiles::ProfilesFile;
+
+        tracing::debug!(%url, "deep link");
+        let link = match deeplink::parse(url) {
+            Ok(l) => l,
+            Err(e) => return self.toast(&e.message()),
+        };
+        let known = trust::KnownHosts::load();
+        let outcome = plan_from_link(
+            &link,
+            &known,
+            &ProfilesFile::load(),
+            &self.settings.borrow(),
+        );
+        match outcome {
+            Ok(PlanOutcome::Connect(plan)) => {
+                // Rule 2 of §3: never preempt a live session. Only this layer knows one is
+                // running, which is why the brain leaves the check here.
+                if self.busy {
+                    return self.toast("A session is already running — end it first.");
+                }
+                let req = ConnectRequest {
+                    name: plan.host.name.clone(),
+                    addr: plan.host.addr.clone(),
+                    port: plan.host.port,
+                    fp_hex: plan.host.fp_hex.clone(),
+                    pair_optional: false,
+                    launch: plan.launch.clone().map(|id| (id.clone(), id)),
+                    mac: plan.host.mac.clone(),
+                };
+                // A link is a launch like any other: with a MAC it takes the dial-first wake
+                // path, so a sleeping host wakes instead of erroring.
+                sender.input(if plan.wake {
+                    AppMsg::WakeConnect(req)
+                } else {
+                    AppMsg::Connect(req)
+                });
+            }
+            Ok(PlanOutcome::ConfirmUnknown(unknown)) => {
+                // Known-but-unpinned, or not known at all: the link may not pair and may not
+                // trust on its own, so it opens the ordinary ceremony under the user's eyes —
+                // the PIN dialog, seeded with what the link claimed.
+                if self.busy {
+                    return self.toast("A session is already running — end it first.");
+                }
+                let req = ConnectRequest {
+                    name: unknown.name.clone().unwrap_or_else(|| unknown.addr.clone()),
+                    addr: unknown.addr.clone(),
+                    port: unknown.port,
+                    fp_hex: unknown.fp.clone(),
+                    pair_optional: false,
+                    launch: unknown.launch.clone().map(|id| (id.clone(), id)),
+                    mac: Vec::new(),
+                };
+                self.toast(&format!(
+                    "{} isn't paired with this device yet — pair it to continue.",
+                    req.name
+                ));
+                crate::ui_trust::pin_dialog(&self.window, sender, self.identity.clone(), req);
+            }
+            Ok(PlanOutcome::Unsupported(route)) => self.toast(&format!(
+                "Punktfunk can't open “{}” links yet.",
+                route.as_str()
+            )),
+            Err(e) => self.toast(&e.message()),
+        }
+    }
+
     fn close_waiting(&mut self) {
         if let Some(w) = self.waiting.borrow_mut().take() {
             w.close();
@@ -607,6 +694,31 @@ impl AppModel {
     }
 }
 
+thread_local! {
+    /// Where a delivered URL goes once the window exists. Both ends of this live on the GTK
+    /// main thread: `connect_open` fires there, and so does the model's `init`.
+    static LINK_TX: std::cell::RefCell<Option<relm4::Sender<AppMsg>>> =
+        const { std::cell::RefCell::new(None) };
+    /// URLs that arrived before the model existed — the cold-start case, where GApplication
+    /// runs `open` before `activate` builds the window. A dropped URL is the one outcome a
+    /// link must never have, so they wait here instead.
+    static PENDING_LINKS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Hand a URL to the running app, or park it until there is one.
+fn deliver_deep_link(url: String) {
+    let queued = LINK_TX.with_borrow(|tx| match tx {
+        Some(tx) => {
+            let _ = tx.send(AppMsg::DeepLink(url.clone()));
+            false
+        }
+        None => true,
+    });
+    if queued {
+        PENDING_LINKS.with_borrow_mut(|q| q.push(url));
+    }
+}
+
 pub fn run() -> glib::ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -649,16 +761,43 @@ pub fn run() -> glib::ExitCode {
         return crate::cli::exec_session();
     }
 
-    let mut builder = adw::Application::builder().application_id(APP_ID);
+    // HANDLES_OPEN is what makes `Exec=punktfunk-client %u` work: GApplication turns the URI
+    // into an `open` call, and — this is the part that matters — a SECOND invocation forwards
+    // its URI to the already-running instance over D-Bus and exits, so clicking a link with
+    // Punktfunk open reuses the window instead of racing a new one.
+    let mut builder = adw::Application::builder()
+        .application_id(APP_ID)
+        .flags(gio::ApplicationFlags::HANDLES_OPEN);
     // Screenshot mode launches the app once per scene back-to-back; NON_UNIQUE keeps
     // each launch its own primary instance.
     if crate::cli::shot_scene().is_some() {
-        builder = builder.flags(gio::ApplicationFlags::NON_UNIQUE);
+        builder =
+            builder.flags(gio::ApplicationFlags::NON_UNIQUE | gio::ApplicationFlags::HANDLES_OPEN);
     }
     let adw_app = builder.build();
+    adw_app.connect_open(|app, files, _hint| {
+        for f in files {
+            deliver_deep_link(f.uri().to_string());
+        }
+        // `open` does not raise a window on its own; the model's activate handler does.
+        app.activate();
+    });
     // One SDL context for the whole process, started while single-threaded.
     let gamepad = crate::gamepad::GamepadService::start();
-    let app = relm4::RelmApp::from_app(adw_app).with_args(Vec::new());
+    // argv stays withheld from GApplication — except for a positional URL, which is exactly
+    // what GIO's single-instance forwarding is for. Passing it through means the FIRST
+    // instance's `open` fires locally and a later one's is delivered to the primary, with no
+    // IPC of our own.
+    let args: Vec<String> = match crate::cli::deep_link_arg() {
+        Some(url) => vec![
+            std::env::args()
+                .next()
+                .unwrap_or_else(|| "punktfunk-client".into()),
+            url,
+        ],
+        None => Vec::new(),
+    };
+    let app = relm4::RelmApp::from_app(adw_app).with_args(args);
     app.run::<AppModel>(AppInit { gamepad });
     glib::ExitCode::SUCCESS
 }

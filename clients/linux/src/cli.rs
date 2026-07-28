@@ -38,6 +38,18 @@ pub fn arg_flag(flag: &str) -> bool {
     std::env::args().any(|a| a == flag)
 }
 
+/// A positional `punktfunk://` (or the `pf://` input alias) anywhere in argv — the deep-link
+/// door (design/client-deep-links.md §4.1). It is positional, not a flag, because that is what
+/// `Exec=punktfunk-client %u` hands us, what a `.desktop` shortcut embeds, and what a browser's
+/// "Open Punktfunk?" prompt ends up invoking. Validation happens later, in the shared parser —
+/// this only decides whether argv contains something addressed to us.
+pub fn deep_link_arg() -> Option<String> {
+    std::env::args().skip(1).find(|a| {
+        let lower = a.to_ascii_lowercase();
+        lower.starts_with("punktfunk://") || lower.starts_with("pf://")
+    })
+}
+
 /// Fullscreen the shell — the Gaming-Mode fallback for a bare launch (streams and the
 /// console library exec the session binary, which handles its own fullscreen).
 pub fn fullscreen_mode() -> bool {

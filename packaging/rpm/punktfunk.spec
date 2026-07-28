@@ -475,6 +475,10 @@ udevadm trigger --subsystem-match=hidraw 2>/dev/null || :
 # Apply the UDP recv-buffer tuning now (also auto-applied at boot by systemd-sysctl; on
 # rpm-ostree it takes effect on the next boot into the layered deployment).
 sysctl -p %{_prefix}/lib/sysctl.d/99-punktfunk-client-net.conf >/dev/null 2>&1 || :
+# Register the punktfunk:// scheme handler the .desktop entry declares (deb and arch do the
+# same in their own scriptlets) — without this, xdg-open and browser prompts have no idea the
+# client claims those links.
+update-desktop-database %{_datadir}/applications >/dev/null 2>&1 || :
 
 %if %{with host}
 %post
