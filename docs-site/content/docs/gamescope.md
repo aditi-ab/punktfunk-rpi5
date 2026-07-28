@@ -113,6 +113,54 @@ a model. See the full [Configuration reference](/docs/configuration) for every o
 | `PUNKTFUNK_GAMESCOPE_NODE` | `auto` · node id | Discover and capture a **running** gamescope's PipeWire node at a fixed mode. Do **not** combine with `SESSION`. |
 | `PUNKTFUNK_GAMESCOPE_APP` | command | For an ad-hoc bare-gamescope session, the nested command to run (e.g. `vkcube`). |
 | `PUNKTFUNK_SESSION_WATCH` | `1` · `0` | Follow a Gaming ↔ Desktop switch mid-stream (rebuild in place, no reconnect). On by default on Bazzite/SteamOS; set `0` to disable. |
+| `PUNKTFUNK_GAMESCOPE_HDR` | `1` · `0` *(default off)* | Allow HDR (10-bit BT.2020 PQ) sessions. Needs `punktfunk-gamescope` — see below. |
+| `PUNKTFUNK_GAMESCOPE_SDR_NITS` | e.g. `400` | On an HDR session, how bright SDR content (the desktop, the Steam overlay, an SDR game) is inside the PQ container. gamescope's default is 400. |
+| `PUNKTFUNK_GAMESCOPE_BIN` | path | Force a specific gamescope binary. Otherwise the host prefers `punktfunk-gamescope` on `PATH`, then `gamescope`. |
+
+## HDR on gamescope
+
+Games can render HDR on a headless gamescope today, but a stock gamescope's **capture** output is
+8-bit SDR: its PipeWire node offers only 8-bit formats, and it tone-maps the composite down before
+handing it over. So a stock setup streams SDR — correctly, including a correct SDR rendition of an
+HDR game — and there is nothing to configure.
+
+To stream real HDR you need `punktfunk-gamescope`: gamescope plus a small patch that adds the
+10-bit BT.2020 PQ formats to that node (offered upstream as
+[gamescope#2126](https://github.com/ValveSoftware/gamescope/issues/2126)). It installs under its
+own name and does **not** replace your system gamescope — your Gaming Mode keeps using that one.
+
+- **Bazzite / Fedora Atomic** — included in the punktfunk sysext; `punktfunk-sysext update` gets it.
+- **Arch / SteamOS** — the `punktfunk-gamescope` package.
+- **NixOS** — `services.punktfunk.host.gamescopeHdr = true;` (it also sets the env var below).
+- **Anything else** — `bash packaging/gamescope/build-punktfunk-gamescope.sh` from the source tree.
+
+Then turn it on:
+
+```sh
+PUNKTFUNK_GAMESCOPE_HDR=1
+```
+
+and check what the host thinks it can do:
+
+```sh
+punktfunk-host hdr-probe
+```
+
+A session goes HDR when **all** of: the host allows it (`PUNKTFUNK_10BIT`, on by default, plus the
+knob above), the resolved gamescope offers the 10-bit formats, the client advertises 10-bit
+decoding with HDR enabled in its settings, the codec is HEVC or AV1 (never H.264), and the GPU
+encodes Main10. Anything missing and the session streams 8-bit SDR — decided **before** the stream
+starts, so you never get a mislabelled picture. The client overlay shows `10-bit · HDR (BT.2020
+PQ)` when it worked.
+
+Two things to know:
+
+- **SDR content rides the same PQ stream.** The desktop, the Steam overlay and SDR games are mapped
+  into the HDR container at `PUNKTFUNK_GAMESCOPE_SDR_NITS` (400 by default). If white looks too
+  bright or too dim on your TV, that is the knob.
+- **On AMD and Intel the composited mouse pointer is currently missing from HDR sessions.** HDR
+  routes the encode through a path that cannot blend the cursor gamescope leaves out of its
+  capture. SDR sessions are unaffected, as are NVIDIA hosts.
 
 ## Known limits
 
@@ -125,8 +173,11 @@ These apply to the **Gaming Mode (gamescope)** path only; the desktop path is un
   touchscreen, so the host maps a client's touchscreen to an absolute pointer: taps click exactly
   where you touch and drags work, but multi-touch gestures (pinch) aren't available in Gaming
   Mode. The desktop path has full multi-touch.
-- **HDR isn't supported on the gamescope path** — gamescope's capture output is 8-bit. SDR streams
-  normally.
+- **HDR needs the punktfunk gamescope build.** A stock gamescope's capture output is 8-bit SDR, so
+  sessions stream SDR — correctly, including SDR versions of HDR games. Install
+  `punktfunk-gamescope` (gamescope plus a small patch that teaches its capture node the 10-bit
+  BT.2020 PQ formats) and set `PUNKTFUNK_GAMESCOPE_HDR=1`, and a 10-bit-capable client streams
+  true HDR10. See [HDR on gamescope](#hdr-on-gamescope) below.
 
 To stream the KDE Plasma desktop of a Steam box instead, see [KDE Plasma](/docs/kde). To bring up the
 web console and pair a client, see [The Web Console](/docs/web-console).

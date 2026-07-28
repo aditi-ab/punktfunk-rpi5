@@ -36,12 +36,15 @@ host is newer than the Linux host.)
   VAAPI or Vulkan Video on AMD/Intel — with automatic split-encode at very high resolutions. Stable
   240 fps at 5120×1440 has been measured. A GPU-less software H.264 encoder exists as an explicit fallback.
 - **HDR (10-bit).** An HDR Windows desktop is captured and encoded as HEVC Main10 (BT.2020 PQ) to
-  HDR-capable clients (Windows, Android). On Linux, a **GNOME 50+** host can mirror an HDR monitor
-  over the GameStream desktop-capture source (`PUNKTFUNK_VIDEO_SOURCE=portal`): the portal
-  negotiates the 10-bit PQ screencast formats GNOME 50 added and encodes Main10 PQ (run
-  `punktfunk-host hdr-probe` to check readiness; pending on-glass validation). Linux **virtual
-  displays** — the native protocol and GameStream's default source — still stream 8-bit: Mutter's
-  virtual-monitor screencast is SDR-only upstream.
+  HDR-capable clients (Windows, Android). On Linux there are two routes. A **GNOME 50+** host can
+  mirror an HDR monitor over the GameStream desktop-capture source
+  (`PUNKTFUNK_VIDEO_SOURCE=portal`): the portal negotiates the 10-bit PQ screencast formats GNOME
+  50 added and encodes Main10 PQ. And a **gamescope** host can stream HDR off its virtual output
+  with the `punktfunk-gamescope` build plus `PUNKTFUNK_GAMESCOPE_HDR=1` — games get real HDR
+  surfaces and the composite is captured as 10-bit BT.2020 PQ. (Run `punktfunk-host hdr-probe` to
+  check either; both are pending on-glass validation.) The **other** Linux virtual displays —
+  Mutter, KWin, wlroots — still stream 8-bit: their virtual-monitor screencasts are SDR-only
+  upstream.
 - **Secure by default.** A **SPAKE2 PIN pairing** ceremony establishes trust (the host
   shows a 4-digit PIN; an attacker gets a single online guess, no offline dictionary
   attack). Trust-on-first-use (TOFU) remains an explicit opt-in for fully trusted LANs.
