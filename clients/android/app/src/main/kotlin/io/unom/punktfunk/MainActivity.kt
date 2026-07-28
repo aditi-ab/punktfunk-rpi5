@@ -339,6 +339,17 @@ class MainActivity : ComponentActivity() {
                     return true // consumed
                 }
             }
+            // A mouse's side buttons, when they arrive key-shaped, are X1/X2 — not navigation.
+            // Resolved before the remote-pointer hook so pointer mode can't eat them as its own
+            // BACK. See [mouseSideButton] for how a mouse's BACK is told from a remote's.
+            mouseSideButton(event)?.let { back ->
+                when (event.action) {
+                    KeyEvent.ACTION_DOWN ->
+                        if (event.repeatCount == 0) mouseForwarder?.sideButtonKey(back, true)
+                    KeyEvent.ACTION_UP -> mouseForwarder?.sideButtonKey(back, false)
+                }
+                return true
+            }
             // TV remote-as-pointer sees non-gamepad keys first (SELECT long-press toggles it;
             // while active it owns the D-pad/SELECT/PLAY-PAUSE/BACK).
             if (!event.isFromSource(InputDevice.SOURCE_GAMEPAD)) {
@@ -355,13 +366,12 @@ class MainActivity : ComponentActivity() {
                 return true
             }
             when (event.keyCode) {
-                // A mouse's back/forward buttons already go over the wire as X1/X2 via their
-                // BUTTON_* motion edges — but Android ALSO delivers them as key events: the input
-                // reader synthesizes KEYCODE_BACK/FORWARD (stamped SOURCE_MOUSE) unconditionally,
-                // and a view-level FALLBACK BACK appears when the BUTTON_* press goes unconsumed.
-                // Swallow every such duplicate or it doubles as Android navigation and yanks the
-                // user out of the stream. A remote/keyboard BACK is never mouse-sourced, so it
-                // still falls through to the BackHandler and exits.
+                // Whatever [mouseSideButton] didn't claim. A view-level FALLBACK BACK appears when
+                // a BUTTON_* press goes unconsumed, and an air-mouse remote stamps its own BACK
+                // SOURCE_MOUSE; both are duplicates of something already handled, and letting
+                // either through doubles as Android navigation and yanks the user out of the
+                // stream. A remote/keyboard BACK is never mouse-sourced, so it still falls through
+                // to the BackHandler and exits.
                 KeyEvent.KEYCODE_BACK, KeyEvent.KEYCODE_FORWARD ->
                     if (event.isFromSource(InputDevice.SOURCE_MOUSE) ||
                         event.flags and KeyEvent.FLAG_FALLBACK != 0
@@ -429,6 +439,34 @@ class MainActivity : ComponentActivity() {
             }
         }
         return super.dispatchKeyEvent(event)
+    }
+
+    /**
+     * `true` (back) / `false` (forward) when this key event is a MOUSE side button, null when it is
+     * anything else — including a remote's or keyboard's BACK, which must keep exiting the stream.
+     *
+     * A mouse that carries its side buttons on the HID consumer page (AC Back / AC Forward) reaches
+     * us only as `KEYCODE_BACK`/`KEYCODE_FORWARD`, with no `BUTTON_BACK`/`BUTTON_FORWARD` motion
+     * edge behind it — on those, the motion path alone leaves the side buttons dead. The event may
+     * even be stamped SOURCE_KEYBOARD rather than SOURCE_MOUSE, because the consumer-page collection
+     * is a separate sub-device, so the DEVICE is what we ask: it has to be able to be a mouse.
+     *
+     * A D-pad-capable device is excluded even when it also reports a pointer: that is an air-mouse
+     * remote, whose BACK is the couch user's way out of the stream and must stay navigation.
+     * FLAG_FALLBACK events are excluded too — those are a duplicate the framework raises after an
+     * unconsumed BUTTON_* press, i.e. one the motion path already forwarded.
+     */
+    private fun mouseSideButton(event: KeyEvent): Boolean? {
+        val back = when (event.keyCode) {
+            KeyEvent.KEYCODE_BACK -> true
+            KeyEvent.KEYCODE_FORWARD -> false
+            else -> return null
+        }
+        if (event.flags and KeyEvent.FLAG_FALLBACK != 0) return null
+        val device = event.device ?: return null
+        if (!device.supportsSource(InputDevice.SOURCE_MOUSE)) return null
+        if (device.supportsSource(InputDevice.SOURCE_DPAD)) return null
+        return back
     }
 
     /** Last D-pad direction synthesised from a stick/HAT — edge detection (one focus move per push). */

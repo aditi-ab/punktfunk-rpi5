@@ -180,6 +180,22 @@ class MouseForwarder(
         }
     }
 
+    /**
+     * A mouse side button that arrived as a KEY event rather than a BUTTON_* motion edge.
+     *
+     * Not every mouse reports its side buttons the same way. One that puts them on the HID button
+     * page (BTN_SIDE/BTN_EXTRA) gets `BUTTON_BACK`/`BUTTON_FORWARD` in the motion button state and
+     * lands in [button]. One that puts them on the consumer page (AC Back / AC Forward — common on
+     * Bluetooth mice, and the shape Android TV boxes tend to see) produces ONLY synthesized
+     * `KEYCODE_BACK`/`KEYCODE_FORWARD` key events, so [button] never fires and the side buttons are
+     * dead on the wire. This is the key-shaped entry point for those.
+     *
+     * Devices that report BOTH send the key first and the motion edge second (that is the order the
+     * input reader synthesizes them in), so both paths funnel into the same held-set and the
+     * add/remove guard collapses the pair into a single wire press.
+     */
+    fun sideButtonKey(back: Boolean, down: Boolean) = press(if (back) 4 else 5, down)
+
     private fun button(actionButton: Int, down: Boolean) {
         val b = when (actionButton) {
             MotionEvent.BUTTON_PRIMARY -> 1
@@ -189,9 +205,15 @@ class MouseForwarder(
             MotionEvent.BUTTON_FORWARD -> 5
             else -> return
         }
+        press(b, down)
+    }
+
+    private fun press(b: Int, down: Boolean) {
         if (down) {
-            heldButtons.add(b)
-            NativeBridge.nativeSendPointerButton(handle, b, true)
+            // add() is false when the button is already held — the second delivery of a button
+            // this device reports on two paths at once. Sending the down again would double-press
+            // it on the host.
+            if (heldButtons.add(b)) NativeBridge.nativeSendPointerButton(handle, b, true)
         } else if (heldButtons.remove(b)) {
             // Only release what we pressed — drops the release of a swallowed engaging click
             // and anything that raced a capture transition.
