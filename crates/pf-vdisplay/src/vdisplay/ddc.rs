@@ -61,10 +61,19 @@ fn active_monitors() -> Vec<ActiveMonitor> {
         let out = unsafe { &mut *(data.0 as *mut Vec<ActiveMonitor>) };
         let mut info = MONITORINFOEXW::default();
         info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
-        // SAFETY: `hmon` is the live monitor handle the enumeration just handed us; `info` is a
-        // properly-sized MONITORINFOEXW local whose cbSize is set, which GetMonitorInfoW requires
-        // to safely write the extended (szDevice) variant.
-        if unsafe { GetMonitorInfoW(hmon, &mut info.monitorInfo) }.as_bool() {
+        // The pointer is derived from the WHOLE `MONITORINFOEXW`, not from its `monitorInfo` field.
+        // `cbSize` promises the OS 104 bytes, but `&mut info.monitorInfo` is a pointer to the
+        // 40-byte `MONITORINFO` prefix: everything the OS writes past byte 40 — which is `szDevice`,
+        // the only field this function reads — is then out of bounds for that pointer's provenance.
+        // A compiler is entitled to assume those bytes were untouched and fold the zeroed
+        // initializer into the reads below, i.e. hand back an EMPTY device name. That name is what
+        // `panel_off_except`'s exclusion compares against, so an empty one would darken the very
+        // panel it is meant to spare.
+        let p = (&raw mut info).cast::<windows::Win32::Graphics::Gdi::MONITORINFO>();
+        // SAFETY: `hmon` is the live monitor handle the enumeration just handed us. `p` carries the
+        // provenance of the full `MONITORINFOEXW`, so the OS may write all `cbSize` bytes it was
+        // promised; `info` is a live local that outlives this synchronous call.
+        if unsafe { GetMonitorInfoW(hmon, p) }.as_bool() {
             let len = info
                 .szDevice
                 .iter()

@@ -29,7 +29,7 @@ use windows::Win32::Devices::DeviceAndDriverInstallation::{
     SetupDiGetDeviceInterfaceDetailW, DIGCF_DEVICEINTERFACE, DIGCF_PRESENT, HDEVINFO, SPINT_ACTIVE,
     SP_DEVICE_INTERFACE_DATA, SP_DEVICE_INTERFACE_DETAIL_DATA_W,
 };
-use windows::Win32::Foundation::{CloseHandle, HANDLE, LUID};
+use windows::Win32::Foundation::{HANDLE, LUID};
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
@@ -325,7 +325,14 @@ impl Drop for DevInfoList {
     }
 }
 
-unsafe fn open_device() -> Result<HANDLE> {
+/// Open the pf-vdisplay control device.
+///
+/// SAFE, and owning. It has no caller obligation — it takes no arguments and every precondition is
+/// internal — so the `unsafe fn` it used to be pushed a proof burden onto four call sites that had
+/// nothing to prove; two of them then re-established ownership by hand with `CloseHandle`, a shape
+/// this file has already leaked from once (see the wrap-IMMEDIATELY comment in `open`). Returning an
+/// `OwnedHandle` makes the close a `Drop`, so there is exactly one way to get it wrong: not at all.
+fn open_device() -> Result<OwnedHandle> {
     // SAFETY: plain SetupAPI enumeration call; the returned list is solely owned by the RAII wrapper.
     let hdev = DevInfoList(
         unsafe {
@@ -369,14 +376,21 @@ unsafe fn open_device() -> Result<HANDLE> {
         let _ = unsafe {
             SetupDiGetDeviceInterfaceDetailW(hdev.0, &idata, None, 0, Some(&mut required), None)
         };
-        if (required as usize) < size_of::<u32>() {
+        // Against the struct's own size, not `u32`'s: the value stamped into `cbSize` below is
+        // `size_of::<SP_DEVICE_INTERFACE_DETAIL_DATA_W>()`, so that is what the buffer must hold.
+        if (required as usize) < size_of::<SP_DEVICE_INTERFACE_DETAIL_DATA_W>() {
             continue; // sizing failed — never stamp a cbSize through an under-sized buffer
         }
-        let mut buf = vec![0u8; required as usize];
+        // `u64`, not `u8`: this buffer is written through as `SP_DEVICE_INTERFACE_DETAIL_DATA_W`,
+        // which needs 4-byte alignment, and a `Vec<u8>` only promises 1. The old SAFETY comment
+        // proved bounds and aliasing and was silent on alignment — the one obligation the code did
+        // not actually discharge.
+        let mut buf = vec![0u64; (required as usize).div_ceil(size_of::<u64>())];
         let detail = buf.as_mut_ptr() as *mut SP_DEVICE_INTERFACE_DETAIL_DATA_W;
-        // SAFETY: `buf` is `required` bytes (>= 4, checked above), so stamping `cbSize` and letting
-        // the API fill up to `required` bytes stays in bounds; `detail` aliases `buf` only within
-        // this iteration, and the `DevicePath` pointer is read before `buf` is dropped.
+        // SAFETY: `buf` is at least `required` bytes and aligned to 8 (so also to the struct's 4),
+        // so stamping `cbSize` and letting the API fill up to `required` bytes stays in bounds;
+        // `detail` aliases `buf` only within this iteration, and the `DevicePath` pointer is read
+        // before `buf` is dropped.
         let opened = unsafe {
             (*detail).cbSize = size_of::<SP_DEVICE_INTERFACE_DETAIL_DATA_W>() as u32;
             SetupDiGetDeviceInterfaceDetailW(hdev.0, &idata, Some(detail), required, None, None)
@@ -395,7 +409,10 @@ unsafe fn open_device() -> Result<HANDLE> {
                 })
         };
         match opened {
-            Ok(h) => return Ok(h),
+            // SAFETY: `h` is the handle `CreateFileW` just returned to THIS call and nothing else
+            // holds it, so transferring it into the `OwnedHandle` gives it a single owner that
+            // closes it exactly once on drop.
+            Ok(h) => return Ok(unsafe { OwnedHandle::from_raw_handle(h.0 as _) }),
             // A raced-away or wedged device — remember the error, try the next interface.
             Err(e) => last_err = Some(e),
         }
@@ -418,10 +435,7 @@ impl VdisplayDriver for PfVdisplayDriver {
     }
 
     unsafe fn open(&self, reap_orphans: bool) -> Result<(OwnedHandle, u32, u32)> {
-        // SAFETY: `open_device` is `unsafe` only because it issues SetupAPI enumeration + `CreateFileW`
-        // FFI; it takes no arguments and returns an owned raw `HANDLE` (or `Err`). Called here on the
-        // backend-init thread, with no precondition beyond a valid thread context.
-        let device = match unsafe { open_device() } {
+        let device = match open_device() {
             Ok(d) => d,
             Err(first) => {
                 // No openable interface. If a WUDFHost crash left the devnode a hostless zombie
@@ -433,8 +447,7 @@ impl VdisplayDriver for PfVdisplayDriver {
                 let mut reopened = Err(first);
                 for _ in 0..8 {
                     std::thread::sleep(std::time::Duration::from_millis(500));
-                    // SAFETY: as above — plain SetupAPI + CreateFileW FFI, no preconditions.
-                    match unsafe { open_device() } {
+                    match open_device() {
                         Ok(d) => {
                             reopened = Ok(d);
                             break;
@@ -445,11 +458,9 @@ impl VdisplayDriver for PfVdisplayDriver {
                 reopened.context("pf-vdisplay interface still absent after an adapter cycle")?
             }
         };
-        // Wrap IMMEDIATELY: every `?` below must close the device exactly once — the old
-        // wrap-on-success-only shape leaked the raw handle whenever GET_INFO itself failed.
-        // SAFETY: `device` is the valid handle `open_device` just returned; ownership transfers into
-        // the `OwnedHandle` (single owner, `CloseHandle` on drop).
-        let device = unsafe { OwnedHandle::from_raw_handle(device.0 as _) };
+        // `open_device` hands back an `OwnedHandle`, so every `?` below closes the device exactly
+        // once by construction — the shape this used to reach by wrapping the raw handle here, and
+        // which leaked whenever GET_INFO itself failed before that wrap was moved up.
         let raw = HANDLE(device.as_raw_handle());
         // HARD protocol-version check (unlike SudoVDA's best-effort log): a mismatched host/driver pair
         // fails loudly here rather than corrupting the IOCTL stream.
@@ -828,23 +839,13 @@ impl VirtualDisplay for PfVdisplayDisplay {
 
 /// Readiness probe: can we open the pf-vdisplay control device?
 pub fn probe() -> Result<()> {
-    // SAFETY: `open_device` is `unsafe` only for its SetupAPI + `CreateFileW` FFI; no arguments, returns
-    // an owned raw `HANDLE` (or `Err`).
-    let h = unsafe { open_device()? };
-    // SAFETY: `h` is the handle just opened by `open_device` in this function, owned here and not yet
-    // handed anywhere else, so this closes it exactly once — no double-close, no use-after-close.
-    unsafe {
-        let _ = CloseHandle(h);
-    }
-    Ok(())
+    // The handle closes on drop.
+    open_device().map(|_| ())
 }
 
 /// Is the pf-vdisplay driver present (device interface enumerable)?
 pub fn is_available() -> bool {
-    // SAFETY: `open_device` returns an owned raw `HANDLE`; on `Ok(h)` the handle is moved into the
-    // closure (sole owner) and closed exactly once via `CloseHandle`, on `Err` there is nothing to
-    // close — so no double-close and no leak of an opened handle. The `unsafe` covers both FFI calls.
-    unsafe { open_device().map(|h| CloseHandle(h)).is_ok() }
+    open_device().is_ok()
 }
 
 /// [`is_available`], with self-heal: an interface-less driver whose adapter devnode EXISTS is the

@@ -183,6 +183,25 @@ enum ShrinkAction {
 /// snapshot too (from `set_virtual_primary_ccd`), so keying on the snapshot ran the EXCLUSIVE
 /// isolate on a Primary group — clearing `DISPLAYCONFIG_PATH_ACTIVE` on every non-kept path, i.e.
 /// blanking the very physical displays `Primary` exists to keep lit.
+/// One stage of [`ManagerInner::resolve_target_gdi`]'s ladder: poll for the target's GDI name until
+/// the 3 s ceiling. 50 ms sampling (latency plan P0.5) — a typical activation resolves on an early
+/// poll, so finer sampling shaves ~150 ms off every stage crossing.
+///
+/// Extracted because the ladder ran this loop three times verbatim, and the 2nd and 3rd copies
+/// documented themselves as "SAFETY: as the resolve loop above" — a pointer to a proof rather than
+/// a proof, which silently rots the moment the block it points at moves.
+fn poll_gdi_name(target_id: u32) -> Option<String> {
+    for _ in 0..60 {
+        thread::sleep(Duration::from_millis(50));
+        // SAFETY: `resolve_gdi_name` is `unsafe` for its CCD FFI; it takes a plain `Copy` `u32`
+        // target id by value and returns an owned `String`, so no caller memory is borrowed.
+        if let Some(n) = unsafe { resolve_gdi_name(target_id) } {
+            return Some(n);
+        }
+    }
+    None
+}
+
 fn shrink_action(ccd_exclusive: bool, has_saved: bool) -> ShrinkAction {
     if ccd_exclusive {
         ShrinkAction::Reisolate
@@ -1049,32 +1068,19 @@ impl VirtualDisplayManager {
         // structure encodes real failure modes (headless auto-activate, integrated-panel clone,
         // lid-closed path activation) and is untouched — but a typical activation resolves on an
         // early poll, so finer sampling shaves ~150 ms off every stage crossing.
-        for _ in 0..60 {
-            thread::sleep(Duration::from_millis(50));
-            // SAFETY: `resolve_gdi_name` is `unsafe` for its CCD FFI; it takes a plain `Copy` `u32`
-            // target id by value and returns an owned `String`, so no caller memory is borrowed.
-            if let Some(n) = unsafe { resolve_gdi_name(target_id) } {
-                return Some(n);
-            }
+        if let Some(n) = poll_gdi_name(target_id) {
+            return Some(n);
         }
         // SAFETY: `force_extend_topology` only calls `SetDisplayConfig` (CCD) with no borrowed memory.
         unsafe { force_extend_topology() };
-        for _ in 0..60 {
-            thread::sleep(Duration::from_millis(50));
-            // SAFETY: as the resolve loop above.
-            if let Some(n) = unsafe { resolve_gdi_name(target_id) } {
-                return Some(n);
-            }
+        if let Some(n) = poll_gdi_name(target_id) {
+            return Some(n);
         }
         // SAFETY: `activate_target_path` runs the CCD query/apply FFI with owned local buffers; the
         // `Copy` target id is passed by value, under the `state` lock — the sole topology mutator.
         if unsafe { pf_win_display::win_display::activate_target_path(target_id) } {
-            for _ in 0..60 {
-                thread::sleep(Duration::from_millis(50));
-                // SAFETY: as the resolve loops above.
-                if let Some(n) = unsafe { resolve_gdi_name(target_id) } {
-                    return Some(n);
-                }
+            if let Some(n) = poll_gdi_name(target_id) {
+                return Some(n);
             }
         }
         None
