@@ -137,9 +137,10 @@ impl Capturer for SyntheticNv12Capturer {
 /// Resolve the same render adapter the encoder will pick (`PUNKTFUNK_RENDER_ADAPTER` / preference /
 /// max-VRAM LUID), falling back to adapter 0.
 ///
-/// # Safety
-/// Calls DXGI factory/adapter enumeration; returns owned COM objects or an error.
-unsafe fn resolve_render_adapter() -> Result<IDXGIAdapter1> {
+/// Safe: it takes no arguments, so there is nothing a caller could get wrong — it creates the
+/// factory itself and returns an owned adapter. The `# Safety` section it used to carry ("calls
+/// DXGI enumeration; returns owned COM objects") described the body, which is not a contract.
+fn resolve_render_adapter() -> Result<IDXGIAdapter1> {
     // SAFETY: three `?`/`Ok`-checked DXGI enumeration calls over owned locals — the factory is
     // created here and the adapters it returns own their own COM references. No raw pointers.
     unsafe {
@@ -155,9 +156,10 @@ unsafe fn resolve_render_adapter() -> Result<IDXGIAdapter1> {
 
 /// Create an NV12 `Texture2D` with the given usage/CPU-access/bind flags.
 ///
-/// # Safety
-/// `device` must be a live D3D11 device; the returned texture is owned by the caller.
-unsafe fn create_nv12(
+/// Safe: its old `# Safety` asked for "a live D3D11 device", which `&ID3D11Device` — a borrowed,
+/// reference-counted COM wrapper — already guarantees; the rest ("the returned texture is owned by
+/// the caller") is an ownership note, not a soundness obligation. Every flag is a plain scalar.
+fn create_nv12(
     device: &ID3D11Device,
     width: u32,
     height: u32,
@@ -181,8 +183,8 @@ unsafe fn create_nv12(
         ..Default::default()
     };
     let mut tex: Option<ID3D11Texture2D> = None;
-    // SAFETY: one `?`-checked `CreateTexture2D` on the live `device` borrow (per the contract
-    // above), with a fully-initialized stack descriptor and a live `Option` out-param.
+    // SAFETY: one `?`-checked `CreateTexture2D` on the `&ID3D11Device` borrow, which the borrow
+    // itself keeps live, with a fully-initialized stack descriptor and a live `Option` out-param.
     unsafe {
         device
             .CreateTexture2D(&desc, None, Some(&mut tex))
