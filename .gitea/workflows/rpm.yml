@@ -199,16 +199,27 @@ jobs:
             dist/punktfunk-web-"${PF_VERSION}-${PF_RELEASE}"*.rpm \
             dist/punktfunk-scripting-"${PF_VERSION}-${PF_RELEASE}"*.rpm
 
+      # The feed's SHA256SUMS is OpenPGP-signed with the same packages@unom.io key as the RPMs, and
+      # punktfunk-sysext(8) refuses a feed it can't verify — the checksums alone never proved
+      # anything, sitting on the same registry as the images they describe.
       - name: Publish the sysext feed
         env:
           TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+          RPM_GPG_PRIVATE_KEY: ${{ secrets.RPM_GPG_PRIVATE_KEY }}
         run: |
           case "$GROUP" in
-            *-canary) FEED="f${{ matrix.fedver }}-canary"; KEEP=6 ;;  # rolling: bound the pile-up
-            *)        FEED="f${{ matrix.fedver }}";        KEEP=0 ;;  # stable: keep every release
+            *-canary) FEED="f${{ matrix.fedver }}-canary"; KEEP=6; OTHER="f${{ matrix.fedver }}" ;;
+            *)        FEED="f${{ matrix.fedver }}";        KEEP=0; OTHER="f${{ matrix.fedver }}-canary" ;;
           esac
           KEEP=$KEEP bash packaging/bazzite/publish-sysext-feed.sh "$FEED" \
             "dist-sysext/punktfunk-${PF_VERSION}-${PF_RELEASE}-x86-64.raw"
+          # Re-seal this Fedora major's OTHER channel too. Stable feeds only publish on a tag, so
+          # without this a stable box would sit in front of an unsigned (hence refused) feed until
+          # the next release; canary pushes are frequent, so every live feed gets sealed within a
+          # day of this landing, and a key rotation propagates without rebuilding any image.
+          # Best-effort: a channel that has never published yet has no manifest to seal.
+          bash packaging/bazzite/publish-sysext-feed.sh --seal "$OTHER" \
+            || echo "::warning::could not seal the $OTHER feed (no manifest yet?)"
 
       # On a real release, also attach the .rpms to the unified Gitea Release. Both Fedora bases
       # (bazzite=F43, fedora-44) build the SAME filename, so suffix the asset with the base to keep

@@ -16,10 +16,17 @@
 #   sudo punktfunk-sysext update | status | remove
 #
 # Feed: the Gitea generic package registry, one feed per Fedora major x channel
-# (…/punktfunk-sysext/f43/, f43-canary, f44, …), each a SHA256SUMS + versioned .raw files —
-# published by .gitea/workflows/rpm.yml from the same RPMs the (legacy) layering path uses.
-# The image pins ID=fedora + VERSION_ID, so after a major OS rebase the old image is refused
+# (…/punktfunk-sysext/f43/, f43-canary, f44, …), each a SHA256SUMS + SHA256SUMS.asc + versioned
+# .raw files — published by .gitea/workflows/rpm.yml from the same RPMs the (legacy) layering path
+# uses. The image pins ID=fedora + VERSION_ID, so after a major OS rebase the old image is refused
 # (not merged broken) and `punktfunk-sysext update` re-resolves against the new release.
+#
+# Trust: SHA256SUMS carries a detached OpenPGP signature (SHA256SUMS.asc) from packages@unom.io —
+# the same key that signs our RPMs — and this script verifies it before believing a word of the
+# manifest. The checksums alone could never have done that: they live on the same registry as the
+# images they describe, so anything able to replace an image could replace its checksum too. The
+# public key is baked in below rather than fetched, because a key fetched from the thing you are
+# authenticating authenticates nothing.
 set -euo pipefail
 
 REGISTRY="${PUNKTFUNK_SYSEXT_REGISTRY:-https://git.unom.io/api/packages/unom/generic/punktfunk-sysext}"
@@ -29,6 +36,21 @@ IMG="$EXT_DIR/punktfunk.raw"
 SIDECAR="$EXT_DIR/.punktfunk.version"
 MARKER=/usr/lib/extension-release.d/extension-release.punktfunk
 ETC_SRC=/usr/share/punktfunk/etc
+PF_TMP="$(mktemp -d)"; trap 'rm -rf "$PF_TMP"' EXIT
+
+# The feed's signing key: punktfunk packages <packages@unom.io>, AF245C506F4E4763. Identical to
+# packaging/rpm/RPM-GPG-KEY-punktfunk — ONE key signs both the RPMs and this feed, so rotating it
+# means updating both copies (the rotation runbook in packaging/rpm/README.md says so, and
+# publish-sysext-feed.sh refuses to sign if the two ever disagree).
+FEED_KEY='-----BEGIN PGP PUBLIC KEY BLOCK-----
+
+mDMEai/2eRYJKwYBBAHaRw8BAQdAFxLGvh8wvzES9ylmxT4gy1i58EituotPyZwt
+z+y9rbC0JXB1bmt0ZnVuayBwYWNrYWdlcyA8cGFja2FnZXNAdW5vbS5pbz6IkAQT
+FgoAOBYhBDG6uOY81eoQ6beahK8kXFBvTkdjBQJqL/Z5AhsjBQsJCAcCBhUKCQgL
+AgQWAgMBAh4BAheAAAoJEK8kXFBvTkdj1QsBAM0sI/qUzGEbuC2Zrk36QQBrUu/9
+sy5uhYGZD6lMJ4uZAQC7W81H2gHlTDTA2Nq35HKW9IOU+Ll2c9fqa7fAIKf9Bg==
+=e4Az
+-----END PGP PUBLIC KEY BLOCK-----'
 
 usage() {
   sed -n 's/^#\( \|$\)//p' "$0" | sed -n '1,20p'
@@ -47,12 +69,61 @@ feed_url() {
   echo "$REGISTRY/f$(os_version_id)$suffix"
 }
 
-# latest -> "VERSION FILENAME SHA256" from the feed's SHA256SUMS (highest by version sort).
+# verify_manifest SUMS SIG -> 0 iff SIG is a good detached signature over SUMS by FEED_KEY.
+#   A throwaway keyring holding exactly our one key, so "good signature" and "signed by us" are the
+#   same statement — any other signer comes back NO_PUBKEY, and gpg exits non-zero.
+#   Spelled out with plain `if`s rather than `cond && action`: under `set -e` a failing test at the
+#   end of an && list is a trap that only bites on the path nobody exercises (here: a corrupt
+#   FEED_KEY), and this function must never abort the script — its whole job is to return a verdict.
+verify_manifest() {
+  local home rc=1
+  home="$(mktemp -d)"; chmod 700 "$home"
+  if printf '%s\n' "$FEED_KEY" | GNUPGHOME="$home" gpg --batch --quiet --import 2>/dev/null; then
+    if GNUPGHOME="$home" gpg --batch --quiet --verify "$2" "$1" 2>/dev/null; then rc=0; fi
+  fi
+  rm -rf "$home"
+  return "$rc"
+}
+
+# fetch_manifest -> download the feed's SHA256SUMS into $PF_TMP and verify its signature.
+#   Returns non-zero (having said why) rather than exiting, so `status` can report a bad feed
+#   instead of dying on it; install/update turn that into a hard stop.
+fetch_manifest() {
+  local feed sums sig
+  feed="$(feed_url)"
+  sums="$PF_TMP/SHA256SUMS"; sig="$PF_TMP/SHA256SUMS.asc"
+  curl -fsSL -o "$sums" "$feed/SHA256SUMS" || { echo "cannot reach the feed $feed" >&2; return 1; }
+  if [ "${PUNKTFUNK_SYSEXT_ALLOW_UNSIGNED:-0}" = 1 ]; then
+    echo "!! PUNKTFUNK_SYSEXT_ALLOW_UNSIGNED=1 — the feed manifest is NOT being verified." >&2
+    return 0
+  fi
+  # curl's own "404"/"could not open file" is noise here — a missing signature is an expected
+  # state with a much better explanation below, so swallow it and say the useful thing instead.
+  if ! curl -fsSL -o "$sig" "$feed/SHA256SUMS.asc" 2>/dev/null; then
+    echo "!! the feed $feed has no SHA256SUMS.asc — refusing to install from an unsigned feed." >&2
+    echo "!! (a feed published before signing existed; it is sealed on the next publish. To install" >&2
+    echo "!!  from it anyway, knowing the images are unauthenticated: PUNKTFUNK_SYSEXT_ALLOW_UNSIGNED=1)" >&2
+    return 1
+  fi
+  if ! command -v gpg >/dev/null 2>&1; then
+    echo "!! gpg not found — cannot verify the feed signature. Install gnupg2." >&2
+    return 1
+  fi
+  if ! verify_manifest "$sums" "$sig"; then
+    echo "!! the feed's SHA256SUMS is NOT signed by packages@unom.io (AF245C506F4E4763)." >&2
+    echo "!! Someone has tampered with the feed, or the signing key was rotated and this script is" >&2
+    echo "!! older than the rotation. Do not install; re-download punktfunk-sysext.sh and retry." >&2
+    return 1
+  fi
+  return 0
+}
+
+# latest -> "VERSION FILENAME SHA256" for the newest image in the VERIFIED manifest (version sort).
+#   Call fetch_manifest first — reading $PF_TMP/SHA256SUMS directly is what keeps the signature
+#   check off the subshell path, where an `exit` would have vanished into a command substitution.
 latest() {
-  local feed; feed="$(feed_url)"
-  curl -fsSL "$feed/SHA256SUMS" \
-    | awk '$2 ~ /^punktfunk-.*-x86-64\.raw$/ { v=$2; sub(/^punktfunk-/,"",v); sub(/-x86-64\.raw$/,"",v); print v, $2, $1 }' \
-    | sort -V | tail -n1
+  awk '$2 ~ /^punktfunk-.*-x86-64\.raw$/ { v=$2; sub(/^punktfunk-/,"",v); sub(/-x86-64\.raw$/,"",v); print v, $2, $1 }' \
+    "$PF_TMP/SHA256SUMS" | sort -V | tail -n1
 }
 
 installed_version() {
@@ -156,6 +227,7 @@ cmd_install() {
   if [ -n "$from_file" ]; then
     do_install --from-file "$from_file"
   else
+    fetch_manifest || exit 1
     local l; l="$(latest)"
     [ -n "$l" ] || { echo "no image in the feed $(feed_url)" >&2; exit 1; }
     # shellcheck disable=SC2086
@@ -178,6 +250,7 @@ cmd_update() {
   if [ "${1:-}" = --from-file ]; then do_install --from-file "${2:?}"; return; fi
   local cur l ver
   cur="$(installed_version)"
+  fetch_manifest || exit 1
   l="$(latest)"
   [ -n "$l" ] || { echo "no image in the feed $(feed_url)" >&2; exit 1; }
   ver="${l%% *}"
@@ -197,7 +270,17 @@ cmd_status() {
   echo "image:      $([ -f "$IMG" ] && du -h "$IMG" | cut -f1 || echo '(not installed)')"
   echo "merged:     $(merged && echo yes || echo no)"
   echo "installed:  $(installed_version || true)"
-  echo "latest:     $(latest 2>/dev/null | cut -d' ' -f1 || true)"
+  # Say WHY the feed is unreadable rather than printing a blank: unreachable and
+  # "signature does not verify" want very different reactions from whoever ran this.
+  if fetch_manifest 2>"$PF_TMP/status.err"; then
+    echo "latest:     $(latest | cut -d' ' -f1)"
+  else
+    echo "latest:     (unavailable)"
+  fi
+  # Unconditionally — fetch_manifest also warns on SUCCESS (ALLOW_UNSIGNED), and a status command
+  # that hides "this feed is not being verified" is worse than one that prints nothing at all.
+  [ -s "$PF_TMP/status.err" ] && sed 's/^/            /' "$PF_TMP/status.err" >&2
+  return 0
 }
 
 cmd_remove() {

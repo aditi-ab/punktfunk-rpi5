@@ -49,7 +49,8 @@ sudo bash punktfunk-sysext.sh install
 ```
 
 This downloads the newest image for your Fedora base (host + tray + **web console**,
-SHA-256-verified from the feed `…/packages/unom/generic/punktfunk-sysext/f<ver>[-canary]/`),
+SHA-256-verified against a signed manifest from the feed
+`…/packages/unom/generic/punktfunk-sysext/f<ver>[-canary]/`),
 installs it as `/var/lib/extensions/punktfunk.raw`, merges it, and immediately applies what the
 RPM scriptlets would have (udev reload, sysctl) plus the two `/etc` files a sysext can't carry
 (the gamescope-session drop-in and the tray autostart entry, staged under
@@ -63,6 +64,14 @@ sudo punktfunk-sysext remove    # unmerge + delete; ~/.config/punktfunk is left 
 
 Details worth knowing:
 
+- **The feed is signed.** Each feed carries `SHA256SUMS` plus a detached OpenPGP signature
+  `SHA256SUMS.asc` from `packages@unom.io` (`AF245C506F4E4763`) — the same key that signs our RPMs.
+  `punktfunk-sysext` verifies that signature, with the public key baked into the script, *before*
+  it believes the manifest, and refuses a feed it can't verify. The checksums alone never proved
+  authorship: they sit on the same registry as the images they describe, so whatever could replace
+  an image could replace its checksum in the same breath. If you are on a feed published before
+  signing existed, it is sealed on the next publish to that Fedora major; to install from it
+  meanwhile — accepting that the image is unauthenticated — set `PUNKTFUNK_SYSEXT_ALLOW_UNSIGNED=1`.
 - The image embeds `ID=fedora` + `VERSION_ID` (matched through Bazzite's `ID_LIKE`), so after a
   **major Bazzite rebase** (F43 → F44) the old image is **refused** instead of merging
   soname-broken binaries — `punktfunk-sysext update` then fetches the image built for the new

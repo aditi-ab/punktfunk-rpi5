@@ -88,6 +88,15 @@ curl --user "<user>:<write:package-PAT>" --upload-file packaging/rpm/RPM-GPG-KEY
 Rotating the key means a new generic-registry version (bump `punktfunk-keys/1` → `/2` and the
 `gpgkey=` URL), since the registry rejects re-uploading an existing file.
 
+**This key also signs the Bazzite sysext feed**, and a third copy of its public half is baked into
+`packaging/bazzite/punktfunk-sysext.sh` (`FEED_KEY=`) — that script is bootstrapped by `curl` on
+machines that have nothing installed yet, so it can't fetch the key from the thing it's
+authenticating. A rotation must update **all three**: the CI secret, this directory's
+`RPM-GPG-KEY-punktfunk` (+ its registry upload), and `FEED_KEY`. `publish-sysext-feed.sh` compares
+its signing key's fingerprint against `FEED_KEY` and refuses to sign on a mismatch, so forgetting
+the third one fails the publish instead of stranding every Bazzite box in front of a feed it
+can't verify.
+
 After reboot, as the desktop user:
 
 ```sh

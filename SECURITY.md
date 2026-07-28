@@ -56,6 +56,29 @@ https://docs.punktfunk.unom.io/docs/security):
 
 If you're unsure whether something is in scope, report it anyway — we'd rather hear about it.
 
+## Verifying what you downloaded
+
+Every distribution path is authenticated. Nothing below needs an account or a network round trip to
+us beyond the download itself.
+
+- **Release-page downloads** (DMG, MSIX, setup.exe, APK, decky zip, .deb/.rpm) each ship a
+  `<file>.sha256` next to them. In your download directory:
+  `sha256sum -c punktfunk-1.2.3.dmg.sha256` (macOS: `shasum -a 256 -c …`).
+- **RPMs** from the dnf repo are OpenPGP-signed with `packages@unom.io` (`AF245C506F4E4763`); the
+  repo file in [`packaging/rpm/README.md`](packaging/rpm/README.md) sets `gpgcheck=1`, so dnf
+  checks every package for you. `rpmkeys --checksig` on a downloaded RPM verifies it by hand.
+- **The Bazzite sysext feed** carries a detached signature over its `SHA256SUMS`, from that same
+  key. `punktfunk-sysext` verifies it before installing and refuses a feed it cannot verify — the
+  public key is baked into the script rather than fetched from the feed.
+- **Windows installers and MSIX packages** are Authenticode-signed; a release build that cannot
+  reach its code-signing certificate fails to build rather than falling back to a self-signed one.
+  Check with `Get-AuthenticodeSignature punktfunk-host-setup-1.2.3.exe`.
+
+A checksum on its own only tells you the download wasn't corrupted in transit — it says nothing
+about who produced the file, since anyone able to replace an artifact can replace its checksum.
+Where that distinction matters (the update feeds, the package repos), the checksums are covered by
+a signature. If a signature check fails, please don't work around it; report it.
+
 ## Safe harbor
 
 We consider good-faith security research that follows this policy to be authorized, and we won't
