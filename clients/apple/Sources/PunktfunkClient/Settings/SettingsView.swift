@@ -21,6 +21,14 @@ import SwiftUI
 @MainActor
 struct SettingsView: View {
     @Environment(\.dismiss) private var dismiss
+    // Which LAYER this surface is editing (SettingsView+Scope): the global defaults, or one
+    // profile's overrides. tvOS keeps defaults-only in v1 — controller-first surfaces honor
+    // profiles and render pinned cards, but don't edit them (design §5.4).
+    @ObservedObject var profiles = ProfileStore.shared
+    @State var scope: SettingsScope = .defaults
+    @State var nameAction: ProfileNameAction?
+    @State var nameDraft = ""
+    @State var profilePendingDelete: StreamProfile?
     @AppStorage(DefaultsKey.streamWidth) var width = 1920
     @AppStorage(DefaultsKey.streamHeight) var height = 1080
     @AppStorage(DefaultsKey.streamHz) var hz = 60
@@ -126,6 +134,19 @@ struct SettingsView: View {
 
     #if os(macOS)
     private var macBody: some View {
+        // The scope control heads the window — above the tabs, because it is about which layer
+        // every tab is editing, not about any one of them.
+        VStack(alignment: .leading, spacing: 0) {
+            scopeSwitcher
+                .padding(.horizontal, 20)
+                .padding(.top, 14)
+                .padding(.bottom, 10)
+            macTabs
+        }
+        .frame(width: 500, height: 580)
+    }
+
+    private var macTabs: some View {
         // Tab map mirrors SettingsCategory: General = session/app behavior, Display = the whole
         // picture (resolution lives here), Input = keyboard & mouse.
         TabView {
@@ -182,7 +203,6 @@ struct SettingsView: View {
             AcknowledgementsView()
                 .tabItem { Label("About", systemImage: "info.circle") }
         }
-        .frame(width: 500, height: 520)
     }
     #endif
 
@@ -192,6 +212,12 @@ struct SettingsView: View {
     private var iosBody: some View {
         NavigationSplitView(columnVisibility: $columnVisibility) {
             List(selection: $settingsSelection) {
+                // The scope control heads the category list: on iPhone this is the screen you
+                // start on, and on iPad it stays visible beside whichever category is open — so
+                // the layer being edited is never off screen while you edit it.
+                Section {
+                    scopeSwitcher
+                }
                 ForEach(SettingsCategory.allCases) { category in
                     // On iPhone the split view collapses to a push list, but a selection List
                     // draws no disclosure indicator of its own — add one in compact width for the

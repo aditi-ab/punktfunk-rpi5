@@ -22,7 +22,7 @@ struct ContentView: View {
     @StateObject private var store = HostStore()
     /// The settings-profile catalog (design/client-settings-profiles.md §4.2) — read at every
     /// connect to resolve the session's `EffectiveSettings`, and edited by the settings surface.
-    @StateObject private var profiles = ProfileStore()
+    @ObservedObject private var profiles = ProfileStore.shared
     @StateObject private var discovery = HostDiscovery()
     // The dev auto-connect hook writes these three, so they stay observed here; every OTHER
     // stream setting reaches a session through `EffectiveSettings`, resolved once per connect.

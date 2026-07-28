@@ -13,6 +13,12 @@ import SwiftUI
 
 @MainActor
 final class ProfileStore: ObservableObject {
+    /// One catalog for the whole app. Unlike `HostStore` (which ContentView owns and hands down),
+    /// the settings surface reaches this from a SEPARATE macOS `Settings` scene, where no parent
+    /// can pass it — and two instances would mean editing a profile in Preferences while the host
+    /// grid still shows the old one. Same shape as `GamepadManager.shared`.
+    static let shared = ProfileStore()
+
     @Published private(set) var catalog: ProfileCatalog {
         didSet { catalog.save() }
     }
@@ -78,11 +84,22 @@ final class ProfileStore: ObservableObject {
 
     /// How the delete warning counts what it is about to change: hosts bound to this profile and
     /// pinned cards that will disappear.
-    func usage(of id: String, hosts: [StoredHost]) -> (bound: Int, pinned: Int) {
-        (
+    func usage(of id: String) -> (bound: Int, pinned: Int) {
+        let hosts = Self.savedHosts()
+        return (
             hosts.filter { $0.profileID == id }.count,
             hosts.filter { ($0.pinnedProfileIDs ?? []).contains(id) }.count
         )
+    }
+
+    /// Saved hosts straight from the shared store. The settings surface owns no `HostStore` — it
+    /// only needs to COUNT what a delete is about to change, and reading the same App-Group blob
+    /// the widget reads beats threading a store through a separate macOS Settings scene.
+    static func savedHosts() -> [StoredHost] {
+        guard let data = AppGroup.defaults.data(forKey: DefaultsKey.hosts),
+              let hosts = try? JSONDecoder().decode([StoredHost].self, from: data)
+        else { return [] }
+        return hosts
     }
 
     // MARK: - Overrides

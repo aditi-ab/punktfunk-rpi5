@@ -16,9 +16,12 @@ extension SettingsView {
     /// can't match to its field is one nobody reads. Keep captions to one or two sentences; when
     /// a picker's meaning depends on the selection, pass a DYNAMIC string describing the current
     /// choice.
+    /// `field` is the overlay's name for this row (see `SettingsField`). Passing it puts the
+    /// override marker + Reset in the caption line while a profile is being edited — with the row
+    /// it belongs to, which is the only place the state is legible.
     @ViewBuilder
     func described<Content: View>(
-        _ caption: String, @ViewBuilder content: () -> Content
+        _ caption: String, field: String? = nil, @ViewBuilder content: () -> Content
     ) -> some View {
         VStack(alignment: .leading, spacing: 5) {
             content()
@@ -30,6 +33,9 @@ extension SettingsView {
                 // its text right up to the control column (toggles especially), reading as one
                 // colliding block. ~46 chars/line also just measures better.
                 .frame(maxWidth: 360, alignment: .leading)
+            if let field {
+                overrideMarker(field)
+            }
         }
         .padding(.vertical, 2)
     }
@@ -53,19 +59,23 @@ extension SettingsView {
         + "Test Network Speed…). A bitrate beyond what the link sustains causes loss "
         + "and stutter."
 
-    /// `bitrateKbps == 0` is Automatic; switching to manual lands on the host default.
+    /// `bitrateKbps == 0` is Automatic; switching to manual lands on the host default. Scoped, so
+    /// flipping it in a profile records the override there rather than moving the global.
     var automaticBitrate: Binding<Bool> {
-        Binding(
-            get: { bitrateKbps == 0 },
-            set: { bitrateKbps = $0 ? 0 : 20_000 })
+        let bitrate = scoped(SettingsFields.bitrateKbps)
+        return Binding(
+            get: { bitrate.wrappedValue == 0 },
+            set: { bitrate.wrappedValue = $0 ? 0 : 20_000 })
     }
 
     /// Slider position 0...1 ↔ kbps on the log scale, snapped to two significant figures
     /// so the readout shows round numbers instead of 47_322.
     var bitrateSlider: Binding<Double> {
-        Binding(
+        let bitrate = scoped(SettingsFields.bitrateKbps)
+        return Binding(
             get: {
-                let v = Double(bitrateKbps).clamped(Self.minSliderKbps, Self.maxSliderKbps)
+                let v = Double(bitrate.wrappedValue)
+                    .clamped(Self.minSliderKbps, Self.maxSliderKbps)
                 return log(v / Self.minSliderKbps)
                     / log(Self.maxSliderKbps / Self.minSliderKbps)
             },
@@ -73,7 +83,7 @@ extension SettingsView {
                 let raw = Self.minSliderKbps
                     * pow(Self.maxSliderKbps / Self.minSliderKbps, pos)
                 let mag = pow(10, floor(log10(raw)) - 1)
-                bitrateKbps = Int((raw / mag).rounded() * mag)
+                bitrate.wrappedValue = Int((raw / mag).rounded() * mag)
             })
     }
 
@@ -155,15 +165,16 @@ extension SettingsView {
         #if os(macOS)
         guard let screen = NSScreen.main else { return }
         let scale = screen.backingScaleFactor
-        width = Int(screen.frame.width * scale)
-        height = Int(screen.frame.height * scale)
-        hz = screen.maximumFramesPerSecond
+        setResolution(
+            width: Int(screen.frame.width * scale), height: Int(screen.frame.height * scale))
+        scoped(SettingsFields.refreshHz).wrappedValue = screen.maximumFramesPerSecond
         #else
         // nativeBounds is portrait-oriented pixels — streams are landscape.
         let bounds = UIScreen.main.nativeBounds
-        width = Int(max(bounds.width, bounds.height))
-        height = Int(min(bounds.width, bounds.height))
-        hz = UIScreen.main.maximumFramesPerSecond
+        setResolution(
+            width: Int(max(bounds.width, bounds.height)),
+            height: Int(min(bounds.width, bounds.height)))
+        scoped(SettingsFields.refreshHz).wrappedValue = UIScreen.main.maximumFramesPerSecond
         #if os(iOS)
         // The native mode is the "This device" wheel row, so leave Custom mode if it was on.
         customMode = false
