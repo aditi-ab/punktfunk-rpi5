@@ -8,8 +8,17 @@
 //
 // MODE (spec constant): 0 = packed 4-byte ARGB (NVENC byte order B,G,R,A), 1 = NV12 (Y plane +
 // interleaved half-res UV at row surfH), 2 = planar YUV444 (3 full-res planes stacked at
-// pitch*surfH). BT.709 limited-range coefficients — identical to rgb2nv12_buf.comp and the
-// retired .cu, so the cursor colour matches the frame regardless of backend.
+// pitch*surfH), 3 = packed 10-bit x:R:G:B 2:10:10:10 LE (NVENC ARGB10), 4 = packed 10-bit
+// x:B:G:R (NVENC ABGR10). BT.709 limited-range coefficients for the YUV modes — identical to
+// rgb2nv12_buf.comp and the retired .cu, so the cursor colour matches the frame regardless of
+// backend.
+//
+// The 10-bit modes are the HDR path: the surface holds PQ-encoded BT.2020 samples and NVENC does
+// the CSC itself, so the blend stays in RGB — it scales the 8-bit cursor to 10 bits and blends in
+// the destination's own (PQ) encoding. That is display-referred, i.e. an approximation, exactly
+// like the 8-bit gamma-space blend above and byte-for-byte what the CPU path's
+// `composite_cursor_rgb10` does. A real sRGB→PQ cursor LUT is polish, not correctness for a
+// pointer.
 //
 // The surface SSBO is uint[] (no 8-bit storage dependency — maximum driver reach): every
 // invocation exclusively owns the 32-bit words it read-modify-writes. ARGB: one invocation per
@@ -19,8 +28,10 @@
 // block rows are likewise anchored to the surface chroma grid (even rows), so each UV sample's
 // 2x2 footprint is exactly the luma rows it averages, at any `oy`.
 //
-// Rebuild: glslangValidator -V cursor_blend.comp -o cursor_blend.spv   (vendored beside this
-// file; or glslc — CI diffs the disassembly against this source)
+// Rebuild (vendored beside this file; CI diffs the disassembly against this source), either
+// compiler — target SPIR-V 1.0 to keep the driver reach the module was chosen for:
+//   glslc --target-env=vulkan1.0 cursor_blend.comp -o cursor_blend.spv
+//   glslangValidator -V --target-env vulkan1.0 cursor_blend.comp -o cursor_blend.spv
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
@@ -57,6 +68,22 @@ uint y_of(uvec4 s) {
 float u_of(uvec4 s) { return 128.0 - 0.1006 * float(s.r) - 0.3386 * float(s.g) + 0.4392 * float(s.b); }
 float v_of(uvec4 s) { return 128.0 + 0.4392 * float(s.r) - 0.3989 * float(s.g) - 0.0403 * float(s.b); }
 
+// Read-modify-write one packed-2:10:10:10 pixel. `r_shift` is R's bit offset (20 for x:R:G:B,
+// 0 for x:B:G:R); G is always at 10 and B sits at the opposite end from R. Matches
+// pw_cursor.rs::composite_cursor_rgb10 exactly, including the 8→10-bit expansion (replicate the
+// top 2 bits into the bottom) and the preservation of the top 2 (alpha/x) bits.
+void rmw_rgb10(uint idx, uvec4 s, uint r_shift) {
+    uint b_shift = 20u - r_shift;
+    uint w = surf[idx];
+    uint sr = (s.r << 2) | (s.r >> 6);
+    uint sg = (s.g << 2) | (s.g >> 6);
+    uint sb = (s.b << 2) | (s.b >> 6);
+    uint dr = (((w >> r_shift) & 0x3FFu) * (255u - s.a) + sr * s.a) / 255u;
+    uint dg = (((w >> 10u)      & 0x3FFu) * (255u - s.a) + sg * s.a) / 255u;
+    uint db = (((w >> b_shift) & 0x3FFu) * (255u - s.a) + sb * s.a) / 255u;
+    surf[idx] = (w & 0xC0000000u) | (dr << r_shift) | (dg << 10u) | (db << b_shift);
+}
+
 // Read-modify-write one byte lane of a word index.
 void rmw_byte(uint word_idx, uint lane, uint val8, uint a) {
     uint w = surf[word_idx];
@@ -67,6 +94,20 @@ void rmw_byte(uint word_idx, uint lane, uint val8, uint a) {
 }
 
 void main() {
+    if (MODE == 3u || MODE == 4u) {
+        // Packed 10-bit: same one-invocation-per-pixel/word geometry as MODE 0.
+        int cx = int(gl_GlobalInvocationID.x);
+        int cy = int(gl_GlobalInvocationID.y);
+        if (cx >= int(pc.curW) || cy >= int(pc.curH)) return;
+        int px = pc.ox + cx, py = pc.oy + cy;
+        if (px < 0 || py < 0 || px >= int(pc.surfW) || py >= int(pc.surfH)) return;
+        uvec4 s = cursor_px(cx, cy);
+        if (s.a == 0u) return;
+        uint idx = (uint(py) * pc.pitch + uint(px) * 4u) / 4u;
+        rmw_rgb10(idx, s, MODE == 3u ? 20u : 0u);
+        return;
+    }
+
     if (MODE == 0u) {
         // ARGB: one invocation per cursor pixel; each surface pixel is one exclusive word.
         int cx = int(gl_GlobalInvocationID.x);

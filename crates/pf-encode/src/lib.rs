@@ -365,6 +365,12 @@ fn open_video_backend_linux(
         // An HDR session (10-bit + a PQ/BT.2020 capture format) must skip the Vulkan Video
         // backend — it hardcodes an 8-bit 4:2:0 BT.709 CSC — and take the libav VAAPI path,
         // which has the P010/Main10/PQ wiring. SDR sessions keep the Vulkan default.
+        //
+        // Two things ride this switch, and both are the accepted cost of AMD/Intel HDR until
+        // Vulkan Video learns 10-bit: the Vulkan backend's real RFI loss recovery, and its
+        // compute-CSC **cursor blend**. A gamescope HDR session therefore streams without the
+        // host-composited XFixes pointer (gamescope has no embedded-cursor mode to fall back
+        // to) — `open_video`'s `blends_cursor` backstop logs it per session.
         #[cfg(feature = "vulkan-encode")]
         if matches!(codec, Codec::H265 | Codec::Av1)
             && vulkan_encode_enabled()
@@ -998,6 +1004,33 @@ pub fn linux_native_nv12_ok(codec: Codec) -> bool {
     #[cfg(not(feature = "vulkan-encode"))]
     {
         let _ = codec;
+        false
+    }
+}
+
+/// Can this host's encode path ingest a **packed 10-bit PQ/BT.2020 CUDA payload** — i.e. may an
+/// HDR capture stay zero-copy on NVIDIA?
+///
+/// Only the direct-SDK NVENC backend can: it registers the buffer as an `ARGB10`/`ABGR10` input
+/// surface and does the BT.2020 CSC in the encoder itself. The libav fallback cannot — its HDR
+/// route builds a **P010** hardware frames context and swscales the RGB into it, so handing it a
+/// packed-10-bit CUDA buffer would copy 2:10:10:10 words into a P010 surface and stream garbage.
+/// So when the direct path is compiled out or vetoed (`PUNKTFUNK_NVENC_DIRECT=0`), the capturer
+/// must NOT build the importer for an HDR session and the frames take the CPU path instead — the
+/// same route HDR took before the direct path learned 10-bit.
+///
+/// Resolved by the host facade into [`pf_capture::ZeroCopyPolicy`], like every other
+/// encode-backend fact capture is allowed to know (the one-way capture→encode edge).
+#[cfg(target_os = "linux")]
+pub fn linux_hdr_cuda_ok() -> bool {
+    #[cfg(feature = "nvenc")]
+    {
+        // Same two terms `open_nvenc_probed` uses to take the direct arm — minus `cuda`, which is
+        // the very thing the caller is deciding.
+        nvenc_direct_enabled() && !linux_zero_copy_is_vaapi()
+    }
+    #[cfg(not(feature = "nvenc"))]
+    {
         false
     }
 }

@@ -558,19 +558,44 @@ fn retrieve_loop(
     }
 }
 
-/// The NVENC input buffer format for a captured `DeviceBuffer`'s layout. NV12/YUV444 are the zero-
-/// copy worker's convert outputs; packed RGB (`ABGR`) is the fallback where NVENC does the internal
-/// CSC. 10-bit is never produced on Linux today (Phase 5.1), so everything is 8-bit.
-fn buffer_format(buf: &cuda::DeviceBuffer) -> nv::NV_ENC_BUFFER_FORMAT {
+/// The NVENC input buffer format for a captured frame. NV12/YUV444 are the zero-copy worker's
+/// convert outputs and are recognised from the `DeviceBuffer`'s layout; the packed formats are 4
+/// bytes per pixel either way, so their DEPTH and channel order can only come from the capture
+/// format — which is why `fmt` is a parameter and not something derived from `buf`.
+///
+/// Packed RGB lets NVENC do the CSC internally, which is exactly what an HDR gamescope session
+/// wants: the frame is already PQ-encoded BT.2020 RGB, and NVENC's internal conversion follows the
+/// configured VUI matrix (BT.2020 NCL for HDR — see `apply_low_latency_config`), so there is no
+/// host-side CSC pass and no depth loss anywhere on the path.
+fn buffer_format(buf: &cuda::DeviceBuffer, fmt: pf_frame::PixelFormat) -> nv::NV_ENC_BUFFER_FORMAT {
     if buf.yuv444 {
         nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_YUV444
     } else if buf.is_nv12() {
         nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_NV12
     } else {
-        // Packed 4-byte BGRA-order (the `copy_device_to_device` fallback path); NVENC's `ARGB`
-        // ingests this layout + does the internal CSC, matching the proven Windows RGB-input path.
-        nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ARGB
+        match fmt {
+            // `x:R:G:B` 2:10:10:10 LE — NVENC's `ARGB10` is the same word layout (B in the low
+            // 10 bits, R in bits 20-29).
+            pf_frame::PixelFormat::X2Rgb10 => nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ARGB10,
+            // `x:B:G:R` 2:10:10:10 LE — NVENC's `ABGR10` (R in the low 10 bits).
+            pf_frame::PixelFormat::X2Bgr10 => nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ABGR10,
+            // Packed 4-byte BGRA-order (the `copy_device_to_device` fallback path); NVENC's `ARGB`
+            // ingests this layout + does the internal CSC, matching the proven Windows RGB-input
+            // path.
+            _ => nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ARGB,
+        }
     }
+}
+
+/// Is `fmt` one of NVENC's packed 10-bit RGB inputs? Decides the session's effective bit depth and
+/// HDR flag — the input format is the only honest source for both (a 10-bit-negotiated session
+/// whose capture came back 8-bit must encode, and label, 8-bit).
+fn is_ten_bit_input(fmt: nv::NV_ENC_BUFFER_FORMAT) -> bool {
+    matches!(
+        fmt,
+        nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ARGB10
+            | nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ABGR10
+    )
 }
 
 /// One encoder-owned input surface + its NVENC registration. The surface is copied into each
@@ -596,6 +621,10 @@ fn slot_fmt_of(fmt: nv::NV_ENC_BUFFER_FORMAT) -> SlotFormat {
     match fmt {
         nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_YUV444 => SlotFormat::Yuv444,
         nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_NV12 => SlotFormat::Nv12,
+        // Still 4 bytes per pixel, so the slot GEOMETRY matches `Argb` — but the cursor blend
+        // must unpack 10-bit channels instead of bytes, hence a separate mode per channel order.
+        nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ARGB10 => SlotFormat::X2Rgb10,
+        nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ABGR10 => SlotFormat::X2Bgr10,
         _ => SlotFormat::Argb,
     }
 }
@@ -796,9 +825,10 @@ unsafe impl Send for NvencCudaEncoder {}
 impl NvencCudaEncoder {
     /// Signature mirrors `super::NvencEncoder::open` so the Linux dispatcher fork is a one-line swap.
     /// `format`/`cuda` are advisory: the session's real input format is derived from the first
-    /// captured `DeviceBuffer`'s layout (lazy init in `submit`), and this backend only accepts CUDA
-    /// frames (a CPU/dmabuf payload `bail`s). `bit_depth` is pinned to 8 on Linux (Phase 5.1 will
-    /// lift it once P010 capture exists).
+    /// captured frame (lazy init in `submit`), and this backend only accepts CUDA frames (a
+    /// CPU/dmabuf payload `bail`s). The effective `bit_depth`/`hdr` are derived from that same
+    /// input format rather than trusted from the negotiation — a 10-bit session whose capture came
+    /// back 8-bit must encode 8-bit AND say so, never mislabel.
     #[allow(clippy::too_many_arguments)]
     pub fn open(
         codec: Codec,
@@ -815,16 +845,7 @@ impl NvencCudaEncoder {
         // The runtime `.so` load is the real "is NVENC possible here" gate: fail the open with a
         // clear reason instead of an opaque session error on the first frame.
         try_api().map_err(|e| anyhow!("NVENC (Linux direct) unavailable: {e}"))?;
-        if bit_depth >= 10 {
-            // An HDR (GNOME 50 portal) session never reaches this backend: its X2RGB10 frames ride
-            // the CPU/dmabuf paths (no CUDA import for the 10-bit formats yet), so the dispatcher
-            // opens the libav P010 path instead. Reaching here 10-bit means a CUDA capture payload
-            // on a 10-bit session — not wired; encode 8-bit rather than mislabel.
-            tracing::warn!(
-                "Linux direct-NVENC: 10-bit requested but the CUDA capture path has no 10-bit \
-                 import yet (HDR rides the libav P010 path) — encoding 8-bit SDR"
-            );
-        }
+
         Ok(Self {
             encoder: ptr::null_mut(),
             cu_ctx: ptr::null_mut(),
@@ -835,7 +856,9 @@ impl NvencCudaEncoder {
             fps,
             bitrate_bps,
             buffer_fmt: nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_NV12,
-            bit_depth: 8,
+            // Provisional until the first frame names the real input format (see `submit`'s init
+            // block, which sets both from `buffer_fmt`).
+            bit_depth,
             // 4:4:4 is HEVC-only; confirmed against the frame layout + GPU support at init.
             chroma_444: chroma.is_444() && codec == Codec::H265,
             yuv444_supported: false,
@@ -1164,8 +1187,8 @@ impl NvencCudaEncoder {
         let mut cfg = preset.presetCfg;
 
         // Steps 3-7 (RC/VBV, tier+level, chroma+bit-depth, colour VUI, RFI DPB) are the shared
-        // low-latency contract. On Linux the full-chroma input is a YUV444 surface and the input is
-        // 8-bit today, so AV1's input-depth is 0.
+        // low-latency contract. On Linux the full-chroma input is a YUV444 surface; AV1's
+        // input-depth follows the surface format (10-bit for a packed PQ/BT.2020 HDR capture).
         let yuv444_input = matches!(
             self.buffer_fmt,
             nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_YUV444
@@ -1180,7 +1203,11 @@ impl NvencCudaEncoder {
                 chroma_444: self.chroma_444,
                 full_chroma_input: yuv444_input,
                 bit_depth: self.bit_depth,
-                av1_input_depth_minus8: 0,
+                av1_input_depth_minus8: if is_ten_bit_input(self.buffer_fmt) {
+                    2
+                } else {
+                    0
+                },
                 hdr: self.hdr,
                 rfi_supported: self.rfi_supported,
                 slices: self.slices,
@@ -1676,7 +1703,7 @@ impl Encoder for NvencCudaEncoder {
         self.maybe_disengage_async();
         // Re-init on a size change (the capturer can return at a different resolution after a mode
         // switch). Format changes (NV12↔YUV444) likewise re-init.
-        let new_fmt = buffer_format(buf);
+        let new_fmt = buffer_format(buf, captured.format);
         let size_changed =
             self.inited && (self.width != captured.width || self.height != captured.height);
         let fmt_changed = self.inited && self.buffer_fmt != new_fmt;
@@ -1697,6 +1724,21 @@ impl Encoder for NvencCudaEncoder {
             self.width = captured.width;
             self.height = captured.height;
             self.buffer_fmt = new_fmt;
+            // Depth + HDR follow the INPUT, like the Windows backend: a packed 10-bit PQ/BT.2020
+            // capture (an HDR gamescope output) selects Main10 / AV1 10-bit and the BT.2020 PQ
+            // colour signalling; anything else is 8-bit SDR. Deriving it here rather than
+            // trusting the negotiated depth is what keeps the label and the bitstream in step
+            // when capture and negotiation disagree.
+            let ten_bit_in = is_ten_bit_input(new_fmt);
+            if self.bit_depth >= 10 && !ten_bit_in {
+                tracing::warn!(
+                    format = ?captured.format,
+                    "Linux direct-NVENC: 10-bit negotiated but the capture delivered an 8-bit \
+                     format — encoding 8-bit SDR (the stream is labelled to match)"
+                );
+            }
+            self.bit_depth = if ten_bit_in { 10 } else { 8 };
+            self.hdr = ten_bit_in;
             // 4:4:4 honesty: engage FREXT only on a genuine YUV444 input; a subsampled NV12/RGB input
             // can't reconstruct full chroma, so clear the flag so `caps().chroma_444` is truthful.
             self.chroma_444 = self.chroma_444 && buf.yuv444;
@@ -2406,6 +2448,32 @@ mod tests {
     use super::*;
     use pf_frame::{CapturedFrame, FramePayload, PixelFormat};
     use pf_zerocopy::cuda::DeviceBuffer;
+
+    /// The 10-bit input mapping is load-bearing in a way a smoke test can't reach: pick the wrong
+    /// NVENC format for a packed 2:10:10:10 capture and the encoder reads the words as 8-bit
+    /// `ARGB` — a picture that decodes, looks *almost* right, and is silently 8-bit with the
+    /// channels shifted. These are the two tables that decide it.
+    #[test]
+    fn ten_bit_rgb_maps_to_the_matching_nvenc_format_and_blend_mode() {
+        use nv::NV_ENC_BUFFER_FORMAT as F;
+        // `x:R:G:B` (B in the low bits) is NVENC's ARGB10; `x:B:G:R` is ABGR10.
+        assert!(is_ten_bit_input(F::NV_ENC_BUFFER_FORMAT_ARGB10));
+        assert!(is_ten_bit_input(F::NV_ENC_BUFFER_FORMAT_ABGR10));
+        assert!(!is_ten_bit_input(F::NV_ENC_BUFFER_FORMAT_ARGB));
+        assert!(!is_ten_bit_input(F::NV_ENC_BUFFER_FORMAT_NV12));
+        assert!(!is_ten_bit_input(F::NV_ENC_BUFFER_FORMAT_YUV444));
+        // …and each gets the cursor-blend mode that unpacks ITS channel order. Swapping these
+        // would tint the pointer (R and B exchanged) with nothing else out of place.
+        assert_eq!(
+            slot_fmt_of(F::NV_ENC_BUFFER_FORMAT_ARGB10),
+            SlotFormat::X2Rgb10
+        );
+        assert_eq!(
+            slot_fmt_of(F::NV_ENC_BUFFER_FORMAT_ABGR10),
+            SlotFormat::X2Bgr10
+        );
+        assert_eq!(slot_fmt_of(F::NV_ENC_BUFFER_FORMAT_ARGB), SlotFormat::Argb);
+    }
 
     fn nv12_frame(w: u32, h: u32, i: u32) -> CapturedFrame {
         // Content is uninitialized device memory — NVENC encodes it fine; this smoke test asserts the

@@ -44,6 +44,10 @@ use ash::vk;
 /// Max cursor-overlay bitmap edge (px) — matches [`cuda::CURSOR_MAX`] and the capture-side clamp.
 pub const CURSOR_MAX: u32 = cuda::CURSOR_MAX;
 
+/// Number of `cursor_blend.comp` MODE variants — one specialized pipeline each, indexed by
+/// [`SlotFormat::mode`]. Bump together with the shader's MODE list.
+const PIPELINE_MODES: u32 = 5;
+
 /// The vendored SPIR-V for `cursor_blend.comp` (beside this file; rebuild with
 /// `glslangValidator -V cursor_blend.comp -o cursor_blend.spv`; CI gates drift).
 const CURSOR_SPV: &[u8] = include_bytes!("cursor_blend.spv");
@@ -58,6 +62,13 @@ pub enum SlotFormat {
     Nv12,
     /// Planar YUV444: three full-res planes stacked at `pitch × height` intervals.
     Yuv444,
+    /// Packed 10-bit `x:R:G:B` 2:10:10:10 LE (NVENC `ARGB10`) — the HDR capture format, handed to
+    /// NVENC unconverted. Same 4-bytes-per-pixel geometry as [`Argb`](Self::Argb); it needs its
+    /// own mode only because the blend must unpack 10-bit channels instead of bytes.
+    X2Rgb10,
+    /// Packed 10-bit `x:B:G:R` 2:10:10:10 LE (NVENC `ABGR10`) — [`X2Rgb10`](Self::X2Rgb10) with
+    /// R and B swapped.
+    X2Bgr10,
 }
 
 impl SlotFormat {
@@ -66,19 +77,35 @@ impl SlotFormat {
             SlotFormat::Argb => 0,
             SlotFormat::Nv12 => 1,
             SlotFormat::Yuv444 => 2,
+            SlotFormat::X2Rgb10 => 3,
+            SlotFormat::X2Bgr10 => 4,
         }
     }
+    /// True for the layouts that are one 32-bit word per pixel — the same slot geometry AND the
+    /// same one-invocation-per-pixel dispatch, whatever the per-channel packing inside the word.
+    fn is_packed32(self) -> bool {
+        matches!(
+            self,
+            SlotFormat::Argb | SlotFormat::X2Rgb10 | SlotFormat::X2Bgr10
+        )
+    }
     fn row_bytes(self, width: u32) -> u64 {
+        if self.is_packed32() {
+            return width as u64 * 4;
+        }
         match self {
-            SlotFormat::Argb => width as u64 * 4,
             SlotFormat::Nv12 | SlotFormat::Yuv444 => width as u64,
+            _ => unreachable!("packed formats returned above"),
         }
     }
     fn rows(self, height: u32) -> u64 {
+        if self.is_packed32() {
+            return height as u64;
+        }
         match self {
-            SlotFormat::Argb => height as u64,
             SlotFormat::Nv12 => height as u64 + (height as u64 / 2).max(1),
             SlotFormat::Yuv444 => height as u64 * 3,
+            _ => unreachable!("packed formats returned above"),
         }
     }
 }
@@ -159,7 +186,7 @@ pub struct VkSlotBlend {
     pipe_layout: vk::PipelineLayout,
     desc_pool: vk::DescriptorPool,
     /// One pipeline per [`SlotFormat`], indexed by `mode()` (spec constant).
-    pipelines: [vk::Pipeline; 3],
+    pipelines: [vk::Pipeline; PIPELINE_MODES as usize],
     /// Host-visible cursor bitmap staging (CURSOR_MAX²·4, tight rows), persistently mapped.
     cur_buf: vk::Buffer,
     cur_mem: vk::DeviceMemory,
@@ -281,7 +308,7 @@ impl VkSlotBlend {
                 desc_layout: vk::DescriptorSetLayout::null(),
                 pipe_layout: vk::PipelineLayout::null(),
                 desc_pool: vk::DescriptorPool::null(),
-                pipelines: [vk::Pipeline::null(); 3],
+                pipelines: [vk::Pipeline::null(); PIPELINE_MODES as usize],
                 cur_buf: vk::Buffer::null(),
                 cur_mem: vk::DeviceMemory::null(),
                 cur_map: std::ptr::null_mut(),
@@ -470,7 +497,7 @@ impl VkSlotBlend {
             self.shader = d
                 .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&words), None)
                 .context("create blend shader module")?;
-            for mode in 0u32..3 {
+            for mode in 0u32..PIPELINE_MODES {
                 let entries = [vk::SpecializationMapEntry::default()
                     .constant_id(0)
                     .offset(0)
@@ -768,24 +795,27 @@ impl VkSlotBlend {
             ox,
             oy,
         };
-        let (gx, gy) = match fmt {
-            SlotFormat::Argb => (cw.div_ceil(8), ch.div_ceil(8)),
-            _ => {
-                let x0 = (ox >> 2) << 2;
-                let spans = ((ox + cw as i32) - x0 + 3).div_euclid(4).max(1) as u32;
-                let rows = match fmt {
-                    SlotFormat::Nv12 => {
-                        // 2-row blocks anchored to the SURFACE chroma grid (cursor_blend.comp
-                        // derives the same y0): count the blocks covering luma rows
-                        // [oy, oy+ch) — one more than ch/2 when oy is odd.
-                        let first = oy.div_euclid(2);
-                        let last = (oy + ch as i32 - 1).div_euclid(2);
-                        (last - first + 1) as u32
-                    }
-                    _ => ch,
-                };
-                (spans.div_ceil(8), rows.div_ceil(8))
-            }
+        // `is_packed32`, not `== Argb`: the two 10-bit HDR formats are packed 32-bit words too, so
+        // they take the one-invocation-per-pixel arm exactly as ARGB does. Everything else is the
+        // word-aligned-span arm.
+        let (gx, gy) = if fmt.is_packed32() {
+            // One invocation per cursor pixel = one exclusively-owned 32-bit word.
+            (cw.div_ceil(8), ch.div_ceil(8))
+        } else {
+            let x0 = (ox >> 2) << 2;
+            let spans = ((ox + cw as i32) - x0 + 3).div_euclid(4).max(1) as u32;
+            let rows = match fmt {
+                SlotFormat::Nv12 => {
+                    // 2-row blocks anchored to the SURFACE chroma grid (cursor_blend.comp
+                    // derives the same y0): count the blocks covering luma rows
+                    // [oy, oy+ch) — one more than ch/2 when oy is odd.
+                    let first = oy.div_euclid(2);
+                    let last = (oy + ch as i32 - 1).div_euclid(2);
+                    (last - first + 1) as u32
+                }
+                _ => ch,
+            };
+            (spans.div_ceil(8), rows.div_ceil(8))
         };
         Some((push, gx, gy))
     }
