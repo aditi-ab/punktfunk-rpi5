@@ -90,19 +90,46 @@ static REAPER: Mutex<Vec<(Child, Instant)>> = Mutex::new(Vec::new());
 const REAPER_KILL_DEADLINE: Duration = Duration::from_secs(20);
 
 fn sweep_reaper() {
-    let mut list = REAPER.lock().unwrap();
-    let now = Instant::now();
-    list.retain_mut(|(c, parked)| {
-        if matches!(c.try_wait(), Ok(Some(_))) {
-            return false; // exited on its own → reaped
+    // Partition under the lock; kill/reap OUTSIDE it. A worker wedged inside a driver ioctl sits
+    // in D state and ignores SIGKILL — the old blocking `wait()` under the global mutex would
+    // then park every later `spawn()` and `drop()` behind a process that may never die.
+    let mut expired: Vec<Child> = Vec::new();
+    {
+        let mut list = REAPER.lock().unwrap();
+        let now = Instant::now();
+        let mut i = 0;
+        while i < list.len() {
+            if matches!(list[i].0.try_wait(), Ok(Some(_))) {
+                list.swap_remove(i); // exited on its own → reaped
+            } else if now.duration_since(list[i].1) > REAPER_KILL_DEADLINE {
+                expired.push(list.swap_remove(i).0);
+            } else {
+                i += 1;
+            }
         }
-        if now.duration_since(*parked) > REAPER_KILL_DEADLINE {
-            let _ = c.kill();
-            let _ = c.wait();
-            return false; // wedged past the deadline → force-killed + reaped
+    }
+    for mut c in expired {
+        let _ = c.kill();
+        // Bounded reap (~100 ms of polls): a SIGKILL'd process reaps near-instantly unless it is
+        // in D state — then park it again (re-killing later is harmless) so a future sweep reaps
+        // it once the driver unwedges, instead of blocking anyone here forever.
+        let mut reaped = false;
+        for _ in 0..10 {
+            if matches!(c.try_wait(), Ok(Some(_))) {
+                reaped = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
         }
-        true
-    });
+        if !reaped {
+            tracing::warn!(
+                pid = c.id(),
+                "zerocopy worker ignored SIGKILL (likely wedged in a driver call, D state) — \
+                 parked for a later sweep"
+            );
+            REAPER.lock().unwrap().push((c, Instant::now()));
+        }
+    }
 }
 
 /// Fd pinned to this process's own executable image, opened (once, lazily) via the
@@ -191,13 +218,25 @@ impl RemoteImporter {
         cmd.arg0("punktfunk-host");
         cmd.arg("zerocopy-worker").arg("--fd").arg("3");
         let raw = worker_end.as_raw_fd();
+        let parent = std::process::id() as libc::pid_t;
         // SAFETY: `pre_exec` runs between fork and exec, so only async-signal-safe calls are
-        // allowed — `dup2` and `fcntl` both are, and the closure captures only the `Copy` int
-        // `raw` (no allocation, no locks). `dup2(raw, 3)` installs the socket at the fd number
-        // the subcommand expects and clears CLOEXEC on the copy; if the parent's fd already IS 3,
+        // allowed — `prctl`, `getppid`, `dup2` and `fcntl` all are, and the closure captures only
+        // `Copy` ints (no allocation, no locks; the error paths use `from_raw_os_error`, which
+        // does not allocate). PR_SET_PDEATHSIG makes the kernel SIGKILL the worker when the host
+        // dies — without it a crashed host left the worker holding its CUcontext + BufferPool
+        // (order hundreds of MB of VRAM) indefinitely. The `getppid` check closes the standard
+        // race: if the host died between fork and the prctl, the signal is never delivered, so
+        // refuse to exec instead. `dup2(raw, 3)` installs the socket at the fd number the
+        // subcommand expects and clears CLOEXEC on the copy; if the parent's fd already IS 3,
         // `dup2(3,3)` would preserve CLOEXEC, so that case clears the flag explicitly instead.
         unsafe {
             cmd.pre_exec(move || {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if libc::getppid() != parent {
+                    return Err(io::Error::from_raw_os_error(libc::ESRCH));
+                }
                 if raw == 3 {
                     let flags = libc::fcntl(3, libc::F_GETFD);
                     if flags < 0 || libc::fcntl(3, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
