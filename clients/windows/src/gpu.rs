@@ -10,6 +10,8 @@ use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIAdapter, IDXGIFact
 
 /// The adapter's human-readable description.
 fn adapter_name(adapter: &IDXGIAdapter) -> String {
+    // SAFETY: a read-only COM call on the live `adapter` borrow, filling a descriptor returned by
+    // value; `&IDXGIAdapter` is a reference-counted wrapper, so the borrow IS the liveness.
     unsafe {
         adapter
             .GetDesc()
@@ -24,12 +26,16 @@ fn adapter_name(adapter: &IDXGIAdapter) -> String {
 
 /// Every DXGI adapter, in enumeration order.
 fn all_adapters() -> Vec<IDXGIAdapter> {
+    // SAFETY: DXGI factory creation takes no pointer and returns an owned factory or an error,
+    // matched on below before anything uses it.
     let factory: IDXGIFactory1 = match unsafe { CreateDXGIFactory1() } {
         Ok(f) => f,
         Err(_) => return Vec::new(),
     };
     let mut v = Vec::new();
     let mut i = 0u32;
+    // SAFETY: a COM call on the live factory above; it takes an index and yields an owned adapter,
+    // and the `Ok` pattern is what proves one came back.
     while let Ok(a) = unsafe { factory.EnumAdapters1(i) } {
         i += 1;
         if let Ok(a) = a.cast::<IDXGIAdapter>() {
@@ -54,6 +60,7 @@ pub fn adapter_names() -> Vec<String> {
     for a in all_adapters() {
         let desc1 = a
             .cast::<windows::Win32::Graphics::Dxgi::IDXGIAdapter1>()
+            // SAFETY: a read-only COM call on the adapter just cast, filling a descriptor by value.
             .and_then(|a1| unsafe { a1.GetDesc1() })
             .ok();
         let name = adapter_name(&a);

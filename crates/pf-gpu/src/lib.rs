@@ -22,6 +22,9 @@
 //! running session keeps the device it opened on. [`session_begin`]/[`active`] record which GPU a
 //! live session actually encodes on, for the console's "in use" display.
 
+// Unsafe-proof program: every `unsafe {}` in this leaf carries a `// SAFETY:` proof.
+#![deny(clippy::undocumented_unsafe_blocks)]
+
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -716,6 +719,42 @@ pub fn active() -> Option<(ActiveGpu, u32)> {
         .map(|s| (s.gpu.clone(), s.sessions))
 }
 
+/// Pick the render GPU LUID the Windows pipeline is created on: the IDD-push capturer's
+/// shared-texture ring, the IddCx `SET_RENDER_ADAPTER` pin, and (via the captured frame's device)
+/// NVENC/AMF/QSV all follow this one decision — see [`selected_gpu`] for the precedence (operator
+/// preference > `PUNKTFUNK_RENDER_ADAPTER` substring > max `DedicatedVideoMemory`). A configured
+/// preference that doesn't match a present GPU falls back to auto selection (with a warning) rather
+/// than returning `None`, so a stale preference never stops the host from streaming.
+///
+/// Lives here (not in a host module) so BOTH the capture and encode subsystem crates depend on it
+/// as a peer of GPU selection instead of the orchestrator — the plan's `windows/adapter.rs`, folded
+/// into `pf-gpu` (plan §W6). It was historically the SudoVDA backend's, then the host's
+/// `win_adapter.rs`; the LUID-shaped view of [`selected_gpu`] plus the per-decision logging.
+#[cfg(target_os = "windows")]
+pub fn resolve_render_adapter_luid() -> Option<windows::Win32::Foundation::LUID> {
+    match selected_gpu() {
+        Some(sel) => {
+            tracing::info!(
+                adapter = sel.info.name,
+                vram_mb = sel.info.vram_bytes / (1024 * 1024),
+                source = sel.source.tag(),
+                "render adapter selected"
+            );
+            if sel.source == PickSource::PreferenceMissing {
+                tracing::warn!(
+                    "the preferred GPU is not present — auto-selected the adapter above \
+                     (fix or clear the preference in the web console)"
+                );
+            }
+            Some(sel.info.luid())
+        }
+        None => {
+            tracing::warn!("no suitable render adapter found for SET_RENDER_ADAPTER");
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -911,42 +950,6 @@ mod tests {
                     g.id
                 );
             }
-        }
-    }
-}
-
-/// Pick the render GPU LUID the Windows pipeline is created on: the IDD-push capturer's
-/// shared-texture ring, the IddCx `SET_RENDER_ADAPTER` pin, and (via the captured frame's device)
-/// NVENC/AMF/QSV all follow this one decision — see [`selected_gpu`] for the precedence (operator
-/// preference > `PUNKTFUNK_RENDER_ADAPTER` substring > max `DedicatedVideoMemory`). A configured
-/// preference that doesn't match a present GPU falls back to auto selection (with a warning) rather
-/// than returning `None`, so a stale preference never stops the host from streaming.
-///
-/// Lives here (not in a host module) so BOTH the capture and encode subsystem crates depend on it
-/// as a peer of GPU selection instead of the orchestrator — the plan's `windows/adapter.rs`, folded
-/// into `pf-gpu` (plan §W6). It was historically the SudoVDA backend's, then the host's
-/// `win_adapter.rs`; the LUID-shaped view of [`selected_gpu`] plus the per-decision logging.
-#[cfg(target_os = "windows")]
-pub fn resolve_render_adapter_luid() -> Option<windows::Win32::Foundation::LUID> {
-    match selected_gpu() {
-        Some(sel) => {
-            tracing::info!(
-                adapter = sel.info.name,
-                vram_mb = sel.info.vram_bytes / (1024 * 1024),
-                source = sel.source.tag(),
-                "render adapter selected"
-            );
-            if sel.source == PickSource::PreferenceMissing {
-                tracing::warn!(
-                    "the preferred GPU is not present — auto-selected the adapter above \
-                     (fix or clear the preference in the web console)"
-                );
-            }
-            Some(sel.info.luid())
-        }
-        None => {
-            tracing::warn!("no suitable render adapter found for SET_RENDER_ADAPTER");
-            None
         }
     }
 }

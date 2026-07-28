@@ -427,6 +427,9 @@ impl Shell {
 
     fn draw_aurora(&self, canvas: &Canvas, w: f64, h: f64, t: f64) {
         let uniforms: [f32; 3] = [w as f32, h as f32, t as f32];
+        // SAFETY: `uniforms` is a local `[f32; 3]` — exactly 12 bytes — and `f32` has no padding or
+        // invalid bit patterns, so reading it as bytes is sound; the slice is copied by
+        // `Data::new_copy` before `uniforms` goes out of scope.
         let bytes = unsafe { std::slice::from_raw_parts(uniforms.as_ptr().cast::<u8>(), 12) };
         match self.mesh.make_shader(Data::new_copy(bytes), &[], None) {
             Some(shader) => {

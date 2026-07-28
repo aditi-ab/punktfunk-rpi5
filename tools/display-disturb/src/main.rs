@@ -19,6 +19,9 @@
 //! Usage: `display-disturb ddc [--interval-ms 2000] [--caps] [--vcp 0x10]`
 //!        `display-disturb modeset [--interval-ms 2000]`
 
+// Unsafe-proof program: every `unsafe {}` in this tool carries a `// SAFETY:` proof.
+#![deny(clippy::undocumented_unsafe_blocks)]
+
 #[cfg(not(target_os = "windows"))]
 fn main() {
     eprintln!("display-disturb is Windows-only (it exercises the WDDM display stack).");

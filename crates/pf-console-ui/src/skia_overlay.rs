@@ -190,6 +190,9 @@ impl Drop for SkiaOverlay {
     fn drop(&mut self) {
         if let Some(gpu) = &mut self.gpu {
             for slot in self.slots.iter_mut().flat_map(Option::take) {
+                // SAFETY: the view belongs to this slot and the overlay is being dropped, so no
+                // further recording can reference it; the flush/submit + queue guard below is what
+                // retires any work that still could.
                 unsafe { gpu.device.destroy_image_view(slot.view, None) };
                 drop(slot.surface);
             }
@@ -208,6 +211,10 @@ impl Overlay for SkiaOverlay {
         let entry = shared.entry.clone();
         let instance = shared.instance.clone();
         let get_proc = move |of: skvk::GetProcOf| -> *const std::ffi::c_void {
+            // SAFETY: Skia calls this loader with raw instance/device handles it received from the
+            // `BackendContext` below — i.e. the very ones owned by `shared`, still live for the
+            // overlay's lifetime — and `from_raw` only rewraps them for the ash entry points. Each
+            // name is a NUL-terminated C string from Skia, borrowed for the call.
             unsafe {
                 match of {
                     skvk::GetProcOf::Instance(raw_instance, name) => entry
@@ -223,6 +230,9 @@ impl Overlay for SkiaOverlay {
                 }
             }
         };
+        // SAFETY: the instance/physical-device/device handles come from `shared`, which owns them
+        // and outlives this backend context, and `get_proc` above resolves through those same
+        // handles. Skia stores them but does not take ownership — teardown stays ours.
         let backend = unsafe {
             skvk::BackendContext::new(
                 shared.instance.handle().as_raw() as _,
@@ -525,6 +535,9 @@ impl SkiaOverlay {
         if let Some(old) = self.slots[i].take() {
             // Any in-flight sampling of THIS slot ended two presents ago (the ring
             // alternates and the presenter waits its fence before each record).
+            // SAFETY: the view belongs to the slot being replaced, and per the comment above any
+            // in-flight sampling of THIS slot ended two presents ago — the ring alternates and the
+            // presenter waits its fence before each record — so the GPU is done with it.
             unsafe { gpu.device.destroy_image_view(old.view, None) };
         }
         let info =
@@ -549,6 +562,9 @@ impl SkiaOverlay {
             .vulkan_image_info()
             .context("backend texture is not Vulkan")?;
         let image = avk::Image::from_raw(*image_info.image() as u64);
+        // SAFETY: a create call on the live device `gpu` owns, over a builder that is a local
+        // outliving the call; `image` is the VkImage Skia just reported for this backend texture,
+        // which the surface keeps alive. The returned view is owned by the slot stored below.
         let view = unsafe {
             gpu.device.create_image_view(
                 &avk::ImageViewCreateInfo::default()

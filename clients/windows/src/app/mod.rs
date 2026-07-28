@@ -195,6 +195,9 @@ fn apply_window_icon_when_ready() {
     };
     let _ = std::thread::Builder::new()
         .name("pf-window-icon".into())
+        // SAFETY: every call in this thread is a Win32 window/icon API taking either a static wide
+        // literal, a handle it just obtained and checked, or the module handle of this process; none
+        // of them dereference caller memory, and the loop gives up after 100 tries.
         .spawn(|| unsafe {
             for _ in 0..100 {
                 if let Ok(hwnd) = FindWindowW(None, windows::core::w!("Punktfunk")) {

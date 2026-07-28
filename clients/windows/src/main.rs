@@ -14,6 +14,8 @@
 //!   punktfunk-client --headless --speed-test --connect host[:port]
 //!                    (measure the path: probe burst → goodput / loss / recommended bitrate)
 
+// Unsafe-proof program: every `unsafe {}` in this client carries a `// SAFETY:` proof.
+#![deny(clippy::undocumented_unsafe_blocks)]
 // Link as a GUI (windows) subsystem binary so the default windowed launch (MSIX / double-click)
 // does NOT pop a console window. The CLI paths (--headless/--discover) reattach to the launching
 // terminal's console at startup (see main), so their output is still visible when run from a shell.
@@ -49,6 +51,9 @@ fn main() {
     // launch is window-free. AttachConsole only binds to an ALREADY-EXISTING parent console (it
     // never creates one), so when launched from a terminal — `--headless`/`--discover` — stdout and
     // the tracing writer below land in that terminal; from Explorer/MSIX it's a harmless no-op.
+    // SAFETY: `AttachConsole` takes a plain process-id constant and binds to an already-existing
+    // parent console; it allocates nothing and dereferences no caller memory, and failure (no parent
+    // console) is ignored by design.
     unsafe {
         use windows::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
         let _ = AttachConsole(ATTACH_PARENT_PROCESS);
@@ -170,6 +175,9 @@ fn set_app_user_model_id() {
     use windows::Win32::Foundation::APPMODEL_ERROR_NO_PACKAGE;
     use windows::Win32::Storage::Packaging::Appx::GetCurrentPackageFullName;
     use windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
+    // SAFETY: `GetCurrentPackageFullName` is called with `len = 0` and no buffer, which is the
+    // documented identity PROBE — it writes nothing and only reports whether this process is
+    // packaged; `SetCurrentProcessExplicitAppUserModelID` takes a static wide literal.
     unsafe {
         let mut len: u32 = 0;
         // No buffer: just probe whether the process has package identity.

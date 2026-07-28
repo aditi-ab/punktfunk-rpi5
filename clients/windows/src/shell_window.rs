@@ -18,6 +18,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
 static SHELL_HWND: AtomicIsize = AtomicIsize::new(0);
 
 fn shell_hwnd() -> Option<HWND> {
+    // SAFETY: the cached value is an `HWND` this process obtained itself; it is re-validated with
+    // `IsWindow` before use (a stale handle is treated as absent), and the lookup calls take only
+    // static wide literals.
     unsafe {
         let cached = SHELL_HWND.load(Ordering::Relaxed);
         if cached != 0 {
@@ -37,6 +40,8 @@ fn shell_hwnd() -> Option<HWND> {
 /// the shell in view with its error banner).
 pub(crate) fn hide() {
     if let Some(h) = shell_hwnd() {
+        // SAFETY: `h` is the validated shell window handle from `shell_hwnd`; `ShowWindow` takes it
+        // plus a plain flag and dereferences nothing.
         unsafe {
             let _ = ShowWindow(h, SW_HIDE);
         }
@@ -47,6 +52,8 @@ pub(crate) fn hide() {
 /// it was never hidden — showing a visible window is a no-op.
 pub(crate) fn restore() {
     if let Some(h) = shell_hwnd() {
+        // SAFETY: as `hide` — `h` is the validated shell window handle, and both calls take only
+        // that handle plus a plain flag.
         unsafe {
             let _ = ShowWindow(h, SW_SHOW);
             let _ = SetForegroundWindow(h);
@@ -60,6 +67,7 @@ pub(crate) fn restore() {
 pub(crate) fn position() -> Option<(i32, i32)> {
     let h = shell_hwnd()?;
     let mut r = RECT::default();
+    // SAFETY: `h` is the validated shell window handle and `r` is a live local the call fills.
     unsafe { GetWindowRect(h, &mut r).ok()? };
     Some((r.left, r.top))
 }
