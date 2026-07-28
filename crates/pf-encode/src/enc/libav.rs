@@ -26,6 +26,52 @@ pub(crate) fn pixel_to_av(p: Pixel) -> ffi::AVPixelFormat {
     ffi::AVPixelFormat::from(p)
 }
 
+/// An owned `AVBufferRef` — unref'd exactly once, when it drops.
+///
+/// The hwdevice/hwframes constructors used to unref by hand on *every* failure branch (three in the
+/// CUDA path, two in VAAPI) and then once more in a hand-written `Drop`. That shape leaks the moment
+/// somebody adds a branch and forgets the cleanup, and double-unrefs the moment two of them run —
+/// and neither mistake is visible at the call site or catchable by the compiler. Ownership lives in
+/// this type instead: an early `?` drops whatever was built so far, in reverse construction order,
+/// with no cleanup code at the call site at all.
+///
+/// **Drop order** matters to the callers holding two of these. A frames context internally holds its
+/// own reference on its device, and the code this replaced deliberately unref'd frames *before*
+/// device. Rust drops struct fields in DECLARATION order, so a struct holding both must declare
+/// frames before device to keep that. Refcounting makes either order sound in principle —
+/// the device cannot die while a frames ctx still references it — but the observable order is kept
+/// exactly as it shipped rather than quietly inverted by a field reorder.
+pub(crate) struct AvBuffer(*mut ffi::AVBufferRef);
+
+impl AvBuffer {
+    /// Take ownership of a freshly-created `AVBufferRef`, rejecting the null that an ffmpeg
+    /// allocator returns on failure (so the `is_null` check every caller used to open-code happens
+    /// once, here).
+    ///
+    /// # Safety
+    /// `p` must be null, or a live `AVBufferRef` whose ownership passes to the returned value —
+    /// nothing else may unref it.
+    pub(crate) unsafe fn from_raw(p: *mut ffi::AVBufferRef) -> Option<Self> {
+        (!p.is_null()).then_some(AvBuffer(p))
+    }
+
+    /// The borrowed pointer, for the ffmpeg calls that read a ref without consuming it. Borrowed
+    /// only — the `AvBuffer` stays the owner, so callers must not unref what this returns.
+    pub(crate) fn as_ptr(&self) -> *mut ffi::AVBufferRef {
+        self.0
+    }
+}
+
+impl Drop for AvBuffer {
+    fn drop(&mut self) {
+        // SAFETY: `self.0` is the non-null ref `from_raw` took ownership of, and this type is its
+        // sole owner (it is neither `Clone` nor `Copy`, and `as_ptr` only lends), so this runs
+        // exactly once for that reference. `av_buffer_unref` drops the one reference and nulls the
+        // pointer through the `&mut`.
+        unsafe { ffi::av_buffer_unref(&mut self.0) };
+    }
+}
+
 /// One `receive_packet` attempt, with the not-ready states kept distinct so a blocking drain can
 /// tell "still encoding" (retry) from "stream over" (stop). The Linux NVENC/VAAPI polls collapse
 /// `Again`/`Eof` to `None`; the Windows AMF/QSV path keeps them apart for its deadline-driven loop.

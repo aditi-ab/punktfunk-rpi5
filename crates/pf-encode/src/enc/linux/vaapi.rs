@@ -36,7 +36,8 @@ use std::ptr;
 use std::sync::{Mutex, OnceLock};
 
 use super::libav::{
-    apply_low_latency_rc, pixel_to_av, poll_encoder, PollOutcome, SWS_CS_ITU709, SWS_POINT,
+    apply_low_latency_rc, pixel_to_av, poll_encoder, AvBuffer, PollOutcome, SWS_CS_ITU709,
+    SWS_POINT,
 };
 use ffmpeg::ffi; // = ffmpeg_sys_next
 
@@ -396,8 +397,8 @@ pub fn probe_can_encode(codec: Codec) -> bool {
                 480,
                 30,
                 2_000_000,
-                hw.device_ref,
-                hw.frames_ref,
+                hw.device_ref.as_ptr(),
+                hw.frames_ref.as_ptr(),
                 false,
             )
             .is_ok(),
@@ -435,8 +436,8 @@ pub fn probe_can_encode_10bit(codec: Codec) -> bool {
                 480,
                 30,
                 2_000_000,
-                hw.device_ref,
-                hw.frames_ref,
+                hw.device_ref.as_ptr(),
+                hw.frames_ref.as_ptr(),
                 true,
             )
             .is_ok(),
@@ -463,8 +464,11 @@ pub fn probe_can_encode_444(_codec: Codec) -> bool {
 
 /// VAAPI device + NV12 frames pool (the encoder's input surfaces for the CPU path).
 struct VaapiHw {
-    device_ref: *mut ffi::AVBufferRef,
-    frames_ref: *mut ffi::AVBufferRef,
+    // Declared frames-BEFORE-device on purpose: these drop in declaration order, which reproduces
+    // exactly what the hand-written `Drop` this replaced did (the frames ctx holds its own
+    // reference on the device). Do not reorder these two fields.
+    frames_ref: AvBuffer,
+    device_ref: AvBuffer,
 }
 
 impl VaapiHw {
@@ -481,44 +485,32 @@ impl VaapiHw {
         if r < 0 {
             bail!("no VAAPI device ({:?}): {}", node, ffmpeg::Error::from(r));
         }
-        let mut frames_ref = ffi::av_hwframe_ctx_alloc(device_ref);
-        if frames_ref.is_null() {
-            ffi::av_buffer_unref(&mut device_ref);
-            bail!("av_hwframe_ctx_alloc(VAAPI) failed");
-        }
-        let fc = (*frames_ref).data as *mut ffi::AVHWFramesContext;
+        // `av_hwdevice_ctx_create` wrote an owned ref into `device_ref`; take ownership of it here so
+        // every `bail!` below drops it (and the frames ref, once built) without cleanup of its own.
+        let device_ref = AvBuffer::from_raw(device_ref)
+            .context("av_hwdevice_ctx_create(VAAPI) gave no device")?;
+        let frames_ref = AvBuffer::from_raw(ffi::av_hwframe_ctx_alloc(device_ref.as_ptr()))
+            .context("av_hwframe_ctx_alloc(VAAPI) failed")?;
+        let fc = (*frames_ref.as_ptr()).data as *mut ffi::AVHWFramesContext;
         (*fc).format = ffi::AVPixelFormat::AV_PIX_FMT_VAAPI;
         (*fc).sw_format = sw_format;
         (*fc).width = w as c_int;
         (*fc).height = h as c_int;
         (*fc).initial_pool_size = pool;
-        let r = ffi::av_hwframe_ctx_init(frames_ref);
+        let r = ffi::av_hwframe_ctx_init(frames_ref.as_ptr());
         if r < 0 {
-            ffi::av_buffer_unref(&mut frames_ref);
-            ffi::av_buffer_unref(&mut device_ref);
             bail!("av_hwframe_ctx_init(VAAPI) failed ({r})");
         }
         Ok(VaapiHw {
-            device_ref,
             frames_ref,
+            device_ref,
         })
     }
 }
 
-impl Drop for VaapiHw {
-    fn drop(&mut self) {
-        // SAFETY: `frames_ref`/`device_ref` are the two non-null `AVBufferRef`s `VaapiHw::new`
-        // created (it bails before constructing `Self` if either alloc fails, so a live `VaapiHw`
-        // always holds both). `av_buffer_unref` drops one reference and nulls the pointer through the
-        // `&mut`. This `Drop` runs exactly once and `VaapiHw` owns these refs exclusively, so there
-        // is no double-free / use-after-free. Frames are unref'd before the device because the frames
-        // ctx internally holds a ref on the device (refcounted, so the order is sound either way).
-        unsafe {
-            ffi::av_buffer_unref(&mut self.frames_ref);
-            ffi::av_buffer_unref(&mut self.device_ref);
-        }
-    }
-}
+// No `Drop` for `VaapiHw`: each `AvBuffer` field unrefs itself, in declaration order (frames, then
+// device — see the field comment). The hand-written unref pair this replaced had to stay in sync
+// with every failure branch in `new`; now there is one unref path and it cannot be skipped.
 
 struct CpuInner {
     enc: encoder::video::Encoder,
@@ -567,8 +559,8 @@ impl CpuInner {
                 height,
                 fps,
                 bitrate_bps,
-                hw.device_ref,
-                hw.frames_ref,
+                hw.device_ref.as_ptr(),
+                hw.frames_ref.as_ptr(),
                 ten_bit,
             )?
         };
@@ -698,7 +690,7 @@ impl CpuInner {
             if hwf.is_null() {
                 bail!("av_frame_alloc(hw) failed");
             }
-            if ffi::av_hwframe_get_buffer(self.hw.frames_ref, hwf, 0) < 0 {
+            if ffi::av_hwframe_get_buffer(self.hw.frames_ref.as_ptr(), hwf, 0) < 0 {
                 ffi::av_frame_free(&mut hwf);
                 bail!("av_hwframe_get_buffer(VAAPI) failed");
             }

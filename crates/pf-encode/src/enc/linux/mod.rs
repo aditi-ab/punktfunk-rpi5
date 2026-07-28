@@ -22,7 +22,8 @@ use std::os::raw::c_int;
 use std::ptr;
 
 use super::libav::{
-    apply_low_latency_rc, pixel_to_av, poll_encoder, PollOutcome, SWS_CS_ITU709, SWS_POINT,
+    apply_low_latency_rc, pixel_to_av, poll_encoder, AvBuffer, PollOutcome, SWS_CS_ITU709,
+    SWS_POINT,
 };
 use ffmpeg::ffi; // = ffmpeg_sys_next
 
@@ -60,8 +61,11 @@ struct AVCUDADeviceContext {
 /// CUDA hardware-frame contexts that wrap our shared `CUcontext`, so `hevc_nvenc` reads the
 /// imported device buffer directly. Owns two `AVBufferRef`s, unref'd on drop.
 struct CudaHw {
-    device_ref: *mut ffi::AVBufferRef,
-    frames_ref: *mut ffi::AVBufferRef,
+    // Declared frames-BEFORE-device on purpose: these drop in declaration order, and that
+    // reproduces exactly what the hand-written `Drop` this replaced did (the frames ctx holds its
+    // own reference on the device). Do not reorder these two fields.
+    frames_ref: AvBuffer,
+    device_ref: AvBuffer,
 }
 
 impl CudaHw {
@@ -72,57 +76,42 @@ impl CudaHw {
     /// (`nvenc_open_einval`), and a hwdevice/hwframes EINVAL is a config error no bitrate can
     /// fix — enrolling it would burn ~10 doomed encoder opens before surfacing the real failure.
     unsafe fn new(cu_ctx: *mut std::ffi::c_void, sw_format: Pixel, w: u32, h: u32) -> Result<Self> {
-        let mut device_ref = ffi::av_hwdevice_ctx_alloc(ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_CUDA);
-        if device_ref.is_null() {
-            bail!("av_hwdevice_ctx_alloc(CUDA) failed");
-        }
-        let dev_ctx = (*device_ref).data as *mut ffi::AVHWDeviceContext;
+        // Each `?`/`bail!` below drops whatever has been built so far — `AvBuffer`'s `Drop` is the
+        // single unref path, so the failure branches carry no cleanup of their own.
+        let device_ref = AvBuffer::from_raw(ffi::av_hwdevice_ctx_alloc(
+            ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_CUDA,
+        ))
+        .context("av_hwdevice_ctx_alloc(CUDA) failed")?;
+        let dev_ctx = (*device_ref.as_ptr()).data as *mut ffi::AVHWDeviceContext;
         let cu = (*dev_ctx).hwctx as *mut AVCUDADeviceContext;
         (*cu).cuda_ctx = cu_ctx; // share the importer's context
-        let r = ffi::av_hwdevice_ctx_init(device_ref);
+        let r = ffi::av_hwdevice_ctx_init(device_ref.as_ptr());
         if r < 0 {
-            ffi::av_buffer_unref(&mut device_ref);
             bail!("av_hwdevice_ctx_init failed ({r})");
         }
 
-        let mut frames_ref = ffi::av_hwframe_ctx_alloc(device_ref);
-        if frames_ref.is_null() {
-            ffi::av_buffer_unref(&mut device_ref);
-            bail!("av_hwframe_ctx_alloc failed");
-        }
-        let fc = (*frames_ref).data as *mut ffi::AVHWFramesContext;
+        let frames_ref = AvBuffer::from_raw(ffi::av_hwframe_ctx_alloc(device_ref.as_ptr()))
+            .context("av_hwframe_ctx_alloc failed")?;
+        let fc = (*frames_ref.as_ptr()).data as *mut ffi::AVHWFramesContext;
         (*fc).format = ffi::AVPixelFormat::AV_PIX_FMT_CUDA;
         (*fc).sw_format = pixel_to_av(sw_format);
         (*fc).width = w as c_int;
         (*fc).height = h as c_int;
         (*fc).initial_pool_size = 0; // we supply the device pointers
-        let r = ffi::av_hwframe_ctx_init(frames_ref);
+        let r = ffi::av_hwframe_ctx_init(frames_ref.as_ptr());
         if r < 0 {
-            ffi::av_buffer_unref(&mut frames_ref);
-            ffi::av_buffer_unref(&mut device_ref);
             bail!("av_hwframe_ctx_init failed ({r})");
         }
         Ok(CudaHw {
-            device_ref,
             frames_ref,
+            device_ref,
         })
     }
 }
 
-impl Drop for CudaHw {
-    fn drop(&mut self) {
-        // SAFETY: `frames_ref`/`device_ref` are the two non-null `AVBufferRef`s `CudaHw::new` created
-        // (it bails before returning `Self` if either alloc fails, so a live `CudaHw` always holds
-        // both). `av_buffer_unref` drops one reference and nulls the pointer through the `&mut`. This
-        // `Drop` runs exactly once and `CudaHw` owns these refs exclusively → no double-free /
-        // use-after-free. Frames are unref'd before the device (the frames ctx internally refs the
-        // device; refcounted, so the order is sound regardless).
-        unsafe {
-            ffi::av_buffer_unref(&mut self.frames_ref);
-            ffi::av_buffer_unref(&mut self.device_ref);
-        }
-    }
-}
+// No `Drop` for `CudaHw`: each `AvBuffer` field unrefs itself, in declaration order (frames, then
+// device — see the field comment). The hand-written unref pair this replaced had to be kept in sync
+// with every failure branch in `new`; now there is exactly one unref path and it cannot be skipped.
 
 /// Map a captured layout to the NVENC input pixel format, and whether a 3→4 byte expand is
 /// needed (packed RGB/BGR have no padding byte; the NVENC `*0` formats do).
@@ -421,8 +410,8 @@ impl NvencEncoder {
             unsafe {
                 let raw = video.as_mut_ptr();
                 (*raw).pix_fmt = ffi::AVPixelFormat::AV_PIX_FMT_CUDA;
-                (*raw).hw_device_ctx = ffi::av_buffer_ref(hw.device_ref);
-                (*raw).hw_frames_ctx = ffi::av_buffer_ref(hw.frames_ref);
+                (*raw).hw_device_ctx = ffi::av_buffer_ref(hw.device_ref.as_ptr());
+                (*raw).hw_frames_ctx = ffi::av_buffer_ref(hw.frames_ref.as_ptr());
             }
             Some(hw)
         } else {
@@ -847,7 +836,8 @@ impl NvencEncoder {
             .cuda
             .as_ref()
             .context("CUDA hw context missing (encoder opened in CPU mode)")?
-            .frames_ref;
+            .frames_ref
+            .as_ptr();
         // The device→device copy below uses our shared context directly; make it current on the
         // encode thread (ffmpeg pushes its own around the pool alloc, so order is fine).
         pf_zerocopy::cuda::make_current().context("CUDA context current (encode thread)")?;
@@ -1053,6 +1043,37 @@ pub fn probe_can_encode_10bit(codec: Codec) -> bool {
         ChromaFormat::Yuv420,
     )
     .is_ok()
+}
+
+#[cfg(test)]
+mod cuda_hw_tests {
+    use super::*;
+
+    /// `CudaHw` owns its two `AVBufferRef`s through `AvBuffer`, so *construct and drop* is the
+    /// entire contract: a missed unref leaks, a doubled one aborts inside glibc. Nothing else in
+    /// the suite covers it — the NVENC smoke tests take the CPU path and never build one, and the
+    /// VAAPI twin's tests need AMD/Intel silicon. Looping the cycle is the point: a double-unref
+    /// shows up as an abort, and a leak shows as the allocator growing across iterations.
+    ///
+    /// `#[ignore]`d (needs a real CUDA device):
+    /// `cargo test -p pf-encode cuda_hw_alloc_drop_cycles -- --ignored --nocapture`
+    #[test]
+    #[ignore = "needs a real CUDA device (run on an NVIDIA host, not the build box)"]
+    fn cuda_hw_alloc_drop_cycles() {
+        ffmpeg::init().expect("libav init");
+        let cu_ctx = pf_zerocopy::cuda::context().expect("shared CUDA context");
+        for i in 0..8 {
+            // SAFETY: `CudaHw::new` requires libav initialized (asserted above) and a valid
+            // `CUcontext` — `cu_ctx` is the live shared context from `pf_zerocopy`. NV12 at
+            // 640x480 are a valid format and positive dims. The handle drops at the end of each
+            // iteration, which is precisely the unref path under test.
+            let hw = unsafe { CudaHw::new(cu_ctx.cast(), Pixel::NV12, 640, 480) }
+                .unwrap_or_else(|e| panic!("CudaHw::new failed on iteration {i}: {e:#}"));
+            assert!(!hw.device_ref.as_ptr().is_null(), "device ref went null");
+            assert!(!hw.frames_ref.as_ptr().is_null(), "frames ref went null");
+        }
+        eprintln!("8 CudaHw alloc/drop cycles completed without abort");
+    }
 }
 
 #[cfg(test)]
