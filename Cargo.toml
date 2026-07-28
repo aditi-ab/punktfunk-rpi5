@@ -24,6 +24,7 @@ members = [
     "crates/pyrowave-sys",
     "crates/libvpl-sys",
     "clients/probe",
+    "clients/cli",
     "clients/linux",
     "clients/session",
     "clients/windows",

@@ -1,0 +1,850 @@
+//! `punktfunk` — the headless client CLI (design/client-architecture-split.md §4).
+//!
+//! One console-subsystem binary over the same brain the GUI shells use, so a script gets the
+//! same behaviour a click does — including wake-then-connect, which the Linux shell's old
+//! exec-style `--connect` never had. It is a FRONT-END, not the brain: policy lives in
+//! `pf_client_core`, and the shells call the same functions in-process rather than shelling
+//! out to this. That is the whole point of the split — if the GUI shelled out for connects,
+//! trust prompts and wake progress would have to squeeze through an IPC contract.
+//!
+//! Existing surfaces are a frozen compatibility contract and are NOT replaced by this: the
+//! Linux shell keeps its headless flags (Decky invokes them), and `punktfunk-probe` stays the
+//! diagnostics tool. This is the door new consumers should use — the Playnite importer shells
+//! to `punktfunk library <host> --json`.
+//!
+//! Exit codes extend the session binary's: 0 ok, 2 connect failed, 3 trust rejected,
+//! 4 renderer failed, 5 could not resolve what was asked for, 6 refused because it needs a
+//! human (pairing, an unknown host). A machine consumer can branch on those without parsing
+//! prose.
+
+#![forbid(unsafe_code)]
+
+#[cfg(any(target_os = "linux", windows))]
+mod cli {
+    use pf_client_core::deeplink::{self, DeepLink, HostResolution};
+    use pf_client_core::orchestrate::{
+        self, ConnectPlan, PlanOutcome, SessionEvent, WakeOutcome, WakeWait,
+    };
+    use pf_client_core::profiles::ProfilesFile;
+    use pf_client_core::trust::{self, KnownHost, KnownHosts};
+    use pf_client_core::{library, wol};
+    use std::time::Duration;
+
+    pub const OK: u8 = 0;
+    pub const CONNECT_FAILED: u8 = 2;
+    pub const TRUST_REJECTED: u8 = 3;
+    pub const RENDERER_FAILED: u8 = 4;
+    /// Nothing here matches what you named (host, profile, game).
+    pub const UNRESOLVED: u8 = 5;
+    /// Refused because it needs a person: pairing, or trusting an unknown host.
+    pub const NEEDS_INTERACTION: u8 = 6;
+
+    const PROBE_TIMEOUT: Duration = Duration::from_millis(2500);
+
+    const USAGE: &str = "\
+punktfunk — the Punktfunk client, headless
+
+  punktfunk pair <host[:port]> [--pin N] [--name LABEL]
+  punktfunk hosts list [--probe] [--json]
+  punktfunk hosts add <host[:port]> [--name LABEL] [--fp HEX]
+  punktfunk hosts forget <host-ref>
+  punktfunk wake <host-ref> [--wait]
+  punktfunk library <host-ref> [--json]
+  punktfunk launch <host-ref> [--game ID] [--profile REF] [--exec] [--fullscreen]
+  punktfunk open <punktfunk://…>
+  punktfunk reachable <host-ref>
+  punktfunk speed-test <host-ref>
+  punktfunk profiles list [--json]
+  punktfunk reset
+
+A <host-ref> is a saved host's id, its name, or an address — the same reference a
+punktfunk:// link takes. Exit codes: 0 ok, 2 connect, 3 trust, 4 renderer, 5 not found,
+6 needs a person.";
+
+    /// The value after `--flag`, if any.
+    fn value(args: &[String], flag: &str) -> Option<String> {
+        args.iter()
+            .position(|a| a == flag)
+            .and_then(|i| args.get(i + 1))
+            .filter(|v| !v.starts_with("--"))
+            .cloned()
+    }
+
+    fn has(args: &[String], flag: &str) -> bool {
+        args.iter().any(|a| a == flag)
+    }
+
+    /// The first argument that isn't a flag or a flag's value — the verb's subject.
+    fn positional(args: &[String], skip: usize) -> Option<String> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < args.len() {
+            if args[i].starts_with("--") {
+                // Skip the flag and, when it takes one, its value.
+                if args
+                    .get(i + 1)
+                    .is_some_and(|v| !v.starts_with("--") && flag_takes_value(&args[i]))
+                {
+                    i += 1;
+                }
+            } else {
+                out.push(args[i].clone());
+            }
+            i += 1;
+        }
+        out.get(skip).cloned()
+    }
+
+    fn flag_takes_value(flag: &str) -> bool {
+        matches!(
+            flag,
+            "--pin" | "--name" | "--fp" | "--game" | "--profile" | "--port"
+        )
+    }
+
+    /// Resolve a host reference the way every other surface does: stable id, then a unique
+    /// name, then `addr[:port]` (design/client-deep-links.md §2). Sharing `resolve_host` is
+    /// what keeps `punktfunk launch desk` and `punktfunk://connect/desk` from disagreeing.
+    fn resolve(reference: &str) -> Result<(KnownHosts, usize), u8> {
+        let known = KnownHosts::load();
+        let link = DeepLink {
+            host_ref: reference.to_string(),
+            ..Default::default()
+        };
+        match deeplink::resolve_host(&link, &known) {
+            HostResolution::Known(i) => Ok((known, i)),
+            HostResolution::Ambiguous => {
+                eprintln!(
+                    "more than one saved host is called \"{reference}\" — use its address or id"
+                );
+                Err(UNRESOLVED)
+            }
+            HostResolution::Unknown { addr, port, .. } => {
+                eprintln!(
+                    "{addr}:{port} isn't a saved host — pair it first (punktfunk pair {addr}:{port})"
+                );
+                Err(NEEDS_INTERACTION)
+            }
+            HostResolution::Unresolvable => {
+                eprintln!("no saved host matches \"{reference}\"");
+                Err(UNRESOLVED)
+            }
+        }
+    }
+
+    pub fn run(args: Vec<String>) -> u8 {
+        let Some(verb) = args.first().cloned() else {
+            println!("{USAGE}");
+            return OK;
+        };
+        let rest: Vec<String> = args[1..].to_vec();
+        match verb.as_str() {
+            "pair" => pair(&rest),
+            "hosts" => hosts(&rest),
+            "wake" => wake(&rest),
+            "library" => library_cmd(&rest),
+            "launch" => launch(&rest),
+            "open" => open(&rest),
+            "reachable" => reachable(&rest),
+            "speed-test" => speed_test(&rest),
+            "profiles" => profiles(&rest),
+            "reset" => reset(),
+            "-h" | "--help" | "help" => {
+                println!("{USAGE}");
+                OK
+            }
+            "--version" | "version" => {
+                println!("punktfunk {}", env!("CARGO_PKG_VERSION"));
+                OK
+            }
+            other => {
+                eprintln!("unknown command \"{other}\"\n\n{USAGE}");
+                UNRESOLVED
+            }
+        }
+    }
+
+    /// `pair <host[:port]> [--pin N]` — the SPAKE2 ceremony. Without `--pin` it prompts, which
+    /// is the interactive shape; with one it is scriptable. Refuses rather than prompting when
+    /// stdin isn't a terminal and no PIN was given: a pairing that silently blocks a CI job
+    /// forever is worse than an exit code.
+    fn pair(args: &[String]) -> u8 {
+        let Some(target) = positional(args, 0) else {
+            eprintln!("usage: punktfunk pair <host[:port]> [--pin N]");
+            return UNRESOLVED;
+        };
+        let (addr, port) = split_host_port(&target);
+        let pin = match value(args, "--pin") {
+            Some(p) => p,
+            None => {
+                if !is_tty() {
+                    eprintln!("no --pin and no terminal to ask on");
+                    return NEEDS_INTERACTION;
+                }
+                eprint!("PIN shown on {addr}: ");
+                let mut line = String::new();
+                if std::io::stdin().read_line(&mut line).is_err() {
+                    return NEEDS_INTERACTION;
+                }
+                line.trim().to_string()
+            }
+        };
+        let identity = match trust::load_or_create_identity() {
+            Ok(i) => i,
+            Err(e) => {
+                eprintln!("client identity: {e:#}");
+                return CONNECT_FAILED;
+            }
+        };
+        let name = value(args, "--name").unwrap_or_else(trust::device_name);
+        match trust::pair_with_host(&addr, port, &identity, &pin, &name) {
+            Ok(fp) => {
+                let fp_hex = trust::hex(&fp);
+                trust::persist_host(&addr, &addr, port, &fp_hex, true);
+                trust::forget_placeholder(&addr, port);
+                println!("paired {addr}:{port} fp={fp_hex}");
+                OK
+            }
+            Err(e) => {
+                eprintln!("{}", trust::pair_error_message(&e));
+                TRUST_REJECTED
+            }
+        }
+    }
+
+    /// `hosts list|add|forget` over the shared store — the same file the shells and the session
+    /// read, so a change here shows up there.
+    fn hosts(args: &[String]) -> u8 {
+        match positional(args, 0).as_deref() {
+            Some("list") | None => {
+                let known = KnownHosts::load();
+                let online: Option<Vec<bool>> = has(args, "--probe").then(|| {
+                    trust::probe_reachable_many(
+                        known
+                            .hosts
+                            .iter()
+                            .map(|h| (h.addr.clone(), h.port))
+                            .collect(),
+                        PROBE_TIMEOUT,
+                    )
+                });
+                if has(args, "--json") {
+                    let catalog = ProfilesFile::load();
+                    let rows: Vec<serde_json::Value> = known
+                        .hosts
+                        .iter()
+                        .enumerate()
+                        .map(|(i, h)| {
+                            serde_json::json!({
+                                "id": h.id,
+                                "name": h.name,
+                                "addr": h.addr,
+                                "port": h.port,
+                                "fp_hex": h.fp_hex,
+                                "paired": h.paired,
+                                "mac": h.mac,
+                                "last_used": h.last_used,
+                                "clipboard_sync": h.clipboard_sync,
+                                "profile": h.profile_id.as_ref()
+                                    .and_then(|id| catalog.find_by_id(id))
+                                    .map(|p| serde_json::json!({"id": p.id, "name": p.name})),
+                                "pinned_profiles": h.resolved_pins(&catalog)
+                                    .iter()
+                                    .map(|p| serde_json::json!({"id": p.id, "name": p.name}))
+                                    .collect::<Vec<_>>(),
+                                "online": online.as_ref().map(|v| v[i]),
+                            })
+                        })
+                        .collect();
+                    println!("{}", serde_json::json!({ "hosts": rows }));
+                } else {
+                    for (i, h) in known.hosts.iter().enumerate() {
+                        let state = match online.as_ref().map(|v| v[i]) {
+                            Some(true) => "online",
+                            Some(false) => "offline",
+                            None => "-",
+                        };
+                        println!(
+                            "{}\t{}:{}\t{}\t{state}",
+                            h.name,
+                            h.addr,
+                            h.port,
+                            if h.paired { "paired" } else { "trusted" }
+                        );
+                    }
+                }
+                OK
+            }
+            Some("add") => {
+                let Some(target) = positional(args, 1) else {
+                    eprintln!("usage: punktfunk hosts add <host[:port]> [--name LABEL] [--fp HEX]");
+                    return UNRESOLVED;
+                };
+                let (addr, port) = split_host_port(&target);
+                let mut known = KnownHosts::load();
+                if known.hosts.iter().any(|h| h.addr == addr && h.port == port) {
+                    eprintln!("{addr}:{port} is already saved");
+                    return OK;
+                }
+                known.hosts.push(KnownHost {
+                    name: value(args, "--name").unwrap_or_else(|| addr.clone()),
+                    addr: addr.clone(),
+                    port,
+                    fp_hex: value(args, "--fp").unwrap_or_default(),
+                    ..Default::default()
+                });
+                match known.save() {
+                    Ok(()) => {
+                        println!("added {addr}:{port}");
+                        OK
+                    }
+                    Err(e) => {
+                        eprintln!("saving: {e:#}");
+                        CONNECT_FAILED
+                    }
+                }
+            }
+            Some("forget") => {
+                let Some(reference) = positional(args, 1) else {
+                    eprintln!("usage: punktfunk hosts forget <host-ref>");
+                    return UNRESOLVED;
+                };
+                let (mut known, i) = match resolve(&reference) {
+                    Ok(v) => v,
+                    Err(code) => return code,
+                };
+                let gone = known.hosts.remove(i);
+                match known.save() {
+                    Ok(()) => {
+                        println!("forgot {}", gone.name);
+                        OK
+                    }
+                    Err(e) => {
+                        eprintln!("saving: {e:#}");
+                        CONNECT_FAILED
+                    }
+                }
+            }
+            Some(other) => {
+                eprintln!("unknown hosts command \"{other}\" — list, add or forget");
+                UNRESOLVED
+            }
+        }
+    }
+
+    /// `wake <host-ref> [--wait]` — a magic packet, and with `--wait` the same bounded
+    /// wake-and-wait the shells run (`WakeWait`: a packet every 6 s, presence polled every
+    /// second, 90 s budget).
+    fn wake(args: &[String]) -> u8 {
+        let Some(reference) = positional(args, 0) else {
+            eprintln!("usage: punktfunk wake <host-ref> [--wait]");
+            return UNRESOLVED;
+        };
+        let (known, i) = match resolve(&reference) {
+            Ok(v) => v,
+            Err(code) => return code,
+        };
+        let host = &known.hosts[i];
+        if host.mac.is_empty() {
+            eprintln!("no Wake-on-LAN address known for {} — connect to it once while it's awake so the client can learn it", host.name);
+            return UNRESOLVED;
+        }
+        if !has(args, "--wait") {
+            wol::wake(&host.mac, host.addr.parse().ok());
+            println!("sent a wake packet to {}", host.name);
+            return OK;
+        }
+        let mut wait = WakeWait::new();
+        loop {
+            let online = trust::probe_reachable_many(
+                vec![(host.addr.clone(), host.port)],
+                Duration::from_millis(900),
+            )
+            .first()
+            .copied()
+            .unwrap_or(false);
+            let tick = wait.tick(online);
+            if tick.send_packet {
+                wol::wake(&host.mac, host.addr.parse().ok());
+            }
+            match tick.outcome {
+                Some(WakeOutcome::Online) => {
+                    println!("{} is up after {}s", host.name, tick.seconds);
+                    return OK;
+                }
+                Some(WakeOutcome::TimedOut) => {
+                    eprintln!("{} didn't come online within {}s", host.name, tick.seconds);
+                    return CONNECT_FAILED;
+                }
+                None => std::thread::sleep(Duration::from_secs(1)),
+            }
+        }
+    }
+
+    /// `library <host-ref> [--json]` — the host's games. TSV by default because that is what
+    /// Decky's existing consumer parses; `--json` is the door for tools (the Playnite importer
+    /// shells to exactly this).
+    fn library_cmd(args: &[String]) -> u8 {
+        let Some(reference) = positional(args, 0) else {
+            eprintln!("usage: punktfunk library <host-ref> [--json]");
+            return UNRESOLVED;
+        };
+        let (known, i) = match resolve(&reference) {
+            Ok(v) => v,
+            Err(code) => return code,
+        };
+        let host = &known.hosts[i];
+        let identity = match trust::load_or_create_identity() {
+            Ok(id) => id,
+            Err(e) => {
+                eprintln!("client identity: {e:#}");
+                return CONNECT_FAILED;
+            }
+        };
+        let pin = trust::parse_hex32(&host.fp_hex);
+        if pin.is_none() {
+            eprintln!(
+                "{} isn't paired yet — punktfunk pair {}",
+                host.name, host.addr
+            );
+            return NEEDS_INTERACTION;
+        }
+        match library::fetch_games(&host.addr, library::DEFAULT_MGMT_PORT, &identity, pin) {
+            Ok(games) => {
+                if has(args, "--json") {
+                    let rows: Vec<serde_json::Value> = games
+                        .iter()
+                        .map(
+                            |g| serde_json::json!({"id": g.id, "store": g.store, "title": g.title}),
+                        )
+                        .collect();
+                    println!("{}", serde_json::json!({ "games": rows }));
+                } else {
+                    for g in &games {
+                        println!("{}\t{}\t{}", g.id, g.store, g.title);
+                    }
+                    println!("{} game(s)", games.len());
+                }
+                OK
+            }
+            Err(e) => {
+                eprintln!("library: {e}");
+                CONNECT_FAILED
+            }
+        }
+    }
+
+    /// `launch <host-ref> [--game ID] [--profile REF] [--exec]` — start a stream, wake included.
+    /// `--exec` becomes the session process instead of supervising it: under a gamescope wrapper
+    /// the launched process must BE the streaming one for focus and lifecycle to work.
+    fn launch(args: &[String]) -> u8 {
+        let Some(reference) = positional(args, 0) else {
+            eprintln!("usage: punktfunk launch <host-ref> [--game ID] [--profile REF] [--exec]");
+            return UNRESOLVED;
+        };
+        let (known, i) = match resolve(&reference) {
+            Ok(v) => v,
+            Err(code) => return code,
+        };
+        let mut plan = ConnectPlan::for_host(
+            &known.hosts[i],
+            value(args, "--game").as_deref(),
+            value(args, "--profile").as_deref(),
+        );
+        if has(args, "--fullscreen") {
+            plan.settings.fullscreen_on_stream = true;
+        }
+        run_plan(plan, has(args, "--exec"))
+    }
+
+    /// `open <url>` — the `punktfunk://` grammar, headless. Same parser, same refusal rules and
+    /// same connect path as a card click; what changes is only where the notices go.
+    fn open(args: &[String]) -> u8 {
+        let Some(url) = positional(args, 0) else {
+            eprintln!("usage: punktfunk open <punktfunk://…>");
+            return UNRESOLVED;
+        };
+        let link = match deeplink::parse(&url) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("{}", e.message());
+                return UNRESOLVED;
+            }
+        };
+        let known = KnownHosts::load();
+        let outcome = orchestrate::plan_from_link(
+            &link,
+            &known,
+            &ProfilesFile::load(),
+            &trust::Settings::load(),
+        );
+        match outcome {
+            Ok(PlanOutcome::Connect(plan)) => run_plan(*plan, has(args, "--exec")),
+            // A URL may never pair or trust on its own — that is a decision for a person, at a
+            // surface that can show them the fingerprint.
+            Ok(PlanOutcome::ConfirmUnknown(u)) => {
+                eprintln!(
+                    "{} isn't paired with this device — punktfunk pair {}:{}",
+                    u.name.unwrap_or_else(|| u.addr.clone()),
+                    u.addr,
+                    u.port
+                );
+                NEEDS_INTERACTION
+            }
+            Ok(PlanOutcome::Unsupported(route)) => {
+                eprintln!("punktfunk can't open \"{}\" links yet", route.as_str());
+                UNRESOLVED
+            }
+            Err(e) => {
+                eprintln!("{}", e.message());
+                UNRESOLVED
+            }
+        }
+    }
+
+    /// Wake if needed, then run the session — supervising it, or becoming it under `--exec`.
+    fn run_plan(plan: ConnectPlan, exec: bool) -> u8 {
+        if plan.host.fp_hex.is_none() {
+            eprintln!(
+                "{} has no pinned fingerprint — punktfunk pair {}",
+                plan.host.name, plan.host.addr
+            );
+            return NEEDS_INTERACTION;
+        }
+        // Wake first when the host is asleep and we know how to reach it. This is the thing the
+        // old exec-style CLI never did: it fired a packet at best and dialled into the void.
+        if plan.wake
+            && !trust::probe_reachable_many(
+                vec![(plan.host.addr.clone(), plan.host.port)],
+                Duration::from_millis(900),
+            )
+            .first()
+            .copied()
+            .unwrap_or(false)
+        {
+            eprintln!("waking {}…", plan.host.name);
+            let mut wait = WakeWait::new();
+            loop {
+                let online = trust::probe_reachable_many(
+                    vec![(plan.host.addr.clone(), plan.host.port)],
+                    Duration::from_millis(900),
+                )
+                .first()
+                .copied()
+                .unwrap_or(false);
+                let tick = wait.tick(online);
+                if tick.send_packet {
+                    wol::wake(&plan.host.mac, plan.host.addr.parse().ok());
+                }
+                match tick.outcome {
+                    Some(WakeOutcome::Online) => break,
+                    Some(WakeOutcome::TimedOut) => {
+                        eprintln!("{} didn't come online", plan.host.name);
+                        return CONNECT_FAILED;
+                    }
+                    None => std::thread::sleep(Duration::from_secs(1)),
+                }
+            }
+        }
+        if let Some(p) = &plan.profile {
+            eprintln!("streaming with \"{}\"", p.name);
+        }
+        if exec {
+            let e = orchestrate::exec_session(&plan);
+            eprintln!("couldn't exec the session binary: {e}");
+            return RENDERER_FAILED;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let spawned = orchestrate::spawn_session(&plan, None, move |ev| {
+            let _ = tx.send(ev);
+        });
+        if let Err(e) = spawned {
+            eprintln!("{e}");
+            return RENDERER_FAILED;
+        }
+        let mut failure: Option<(String, bool)> = None;
+        while let Ok(ev) = rx.recv() {
+            match ev {
+                SessionEvent::Ready => eprintln!("streaming"),
+                SessionEvent::Error {
+                    msg,
+                    trust_rejected,
+                } => failure = Some((msg, trust_rejected)),
+                SessionEvent::Ended(reason) => eprintln!("{reason}"),
+                SessionEvent::Exited(code) => {
+                    return match failure {
+                        Some((msg, true)) => {
+                            eprintln!("{msg}");
+                            TRUST_REJECTED
+                        }
+                        Some((msg, false)) => {
+                            eprintln!("{msg}");
+                            CONNECT_FAILED
+                        }
+                        None if code == 0 => OK,
+                        None => RENDERER_FAILED,
+                    };
+                }
+            }
+        }
+        OK
+    }
+
+    /// `reachable <host-ref>` — one bounded, mDNS-independent probe. Exit 0 = reachable.
+    fn reachable(args: &[String]) -> u8 {
+        let Some(reference) = positional(args, 0) else {
+            eprintln!("usage: punktfunk reachable <host-ref>");
+            return UNRESOLVED;
+        };
+        // An address that isn't saved is still a legitimate thing to probe — this verb answers
+        // "can I reach this?", not "do I know this?".
+        let (addr, port) = match resolve(&reference) {
+            Ok((known, i)) => (known.hosts[i].addr.clone(), known.hosts[i].port),
+            Err(_) => split_host_port(&reference),
+        };
+        if punktfunk_core::client::NativeClient::probe(&addr, port, PROBE_TIMEOUT) {
+            println!("reachable {addr}:{port}");
+            OK
+        } else {
+            eprintln!("unreachable {addr}:{port}");
+            CONNECT_FAILED
+        }
+    }
+
+    /// `speed-test <host-ref>` — measure the real data plane and print what it recommends.
+    /// Deliberately does NOT apply the result: which layer a bitrate belongs in is a decision
+    /// the GUI makes with the user (bound profile vs global, design §5.3), and a CLI silently
+    /// rewriting a profile would be the surprise that rule exists to prevent.
+    fn speed_test(args: &[String]) -> u8 {
+        let Some(reference) = positional(args, 0) else {
+            eprintln!("usage: punktfunk speed-test <host-ref>");
+            return UNRESOLVED;
+        };
+        let (known, i) = match resolve(&reference) {
+            Ok(v) => v,
+            Err(code) => return code,
+        };
+        let host = &known.hosts[i];
+        let Some(pin) = trust::parse_hex32(&host.fp_hex) else {
+            eprintln!("{} isn't paired yet", host.name);
+            return NEEDS_INTERACTION;
+        };
+        let identity = match trust::load_or_create_identity() {
+            Ok(id) => id,
+            Err(e) => {
+                eprintln!("client identity: {e:#}");
+                return CONNECT_FAILED;
+            }
+        };
+        let client = match punktfunk_core::client::NativeClient::connect(
+            &host.addr,
+            host.port,
+            punktfunk_core::config::Mode {
+                width: 1280,
+                height: 720,
+                refresh_hz: 60,
+            },
+            punktfunk_core::config::CompositorPref::Auto,
+            punktfunk_core::config::GamepadPref::Auto,
+            0,    // bitrate_kbps: the host's default; this connect never presents
+            0,    // video_caps: nothing decodes here
+            2,    // audio_channels
+            0,    // video_codecs: the probe carries no video
+            0,    // preferred_codec
+            None, // display_hdr
+            0,    // client_caps: nothing renders a cursor
+            None, // launch
+            Some(pin),
+            Some(identity),
+            Duration::from_secs(15),
+        ) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("connect: {e:?}");
+                return CONNECT_FAILED;
+            }
+        };
+        if let Err(e) = client.request_probe(3_000_000, 2_000) {
+            eprintln!("probe: {e:?}");
+            return CONNECT_FAILED;
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            std::thread::sleep(Duration::from_millis(250));
+            let r = client.probe_result();
+            if r.done {
+                std::thread::sleep(Duration::from_millis(400));
+                let r = client.probe_result();
+                let recommended = r.throughput_kbps / 10 * 7;
+                if has(args, "--json") {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "mbps": f64::from(r.throughput_kbps) / 1000.0,
+                            "loss_pct": r.loss_pct,
+                            "recommended_kbps": recommended,
+                        })
+                    );
+                } else {
+                    println!(
+                        "{:.0} Mbit/s measured · {:.1}% loss · recommended {:.0} Mbit/s",
+                        f64::from(r.throughput_kbps) / 1000.0,
+                        r.loss_pct,
+                        f64::from(recommended) / 1000.0
+                    );
+                }
+                return OK;
+            }
+            if std::time::Instant::now() > deadline {
+                eprintln!("probe timed out");
+                return CONNECT_FAILED;
+            }
+        }
+    }
+
+    /// `profiles list` — the settings profiles this device has, and what each overrides.
+    fn profiles(args: &[String]) -> u8 {
+        match positional(args, 0).as_deref() {
+            Some("list") | None => {
+                let catalog = ProfilesFile::load();
+                if has(args, "--json") {
+                    println!(
+                        "{}",
+                        serde_json::to_string(&catalog).unwrap_or_else(|_| "{}".into())
+                    );
+                } else {
+                    for p in &catalog.profiles {
+                        let n = serde_json::to_value(&p.overrides)
+                            .ok()
+                            .and_then(|v| v.as_object().map(|o| o.len()))
+                            .unwrap_or(0);
+                        println!("{}\t{}\t{n} override(s)", p.id, p.name);
+                    }
+                }
+                OK
+            }
+            Some(other) => {
+                eprintln!("unknown profiles command \"{other}\" — list");
+                UNRESOLVED
+            }
+        }
+    }
+
+    /// `reset` — forget this device's saved hosts and stream settings. The identity (and so the
+    /// hosts' record of this device) is deliberately NOT touched: re-pairing is the user's call.
+    fn reset() -> u8 {
+        if !is_tty() {
+            eprintln!("refusing to reset without a terminal to confirm on");
+            return NEEDS_INTERACTION;
+        }
+        eprint!("Forget every saved host and reset settings? [y/N] ");
+        let mut line = String::new();
+        if std::io::stdin().read_line(&mut line).is_err() || !line.trim().eq_ignore_ascii_case("y")
+        {
+            eprintln!("cancelled");
+            return OK;
+        }
+        let mut known = KnownHosts::load();
+        known.hosts.clear();
+        let _ = known.save();
+        trust::Settings::default().save();
+        println!("client state reset");
+        OK
+    }
+
+    fn split_host_port(target: &str) -> (String, u16) {
+        match target.rsplit_once(':') {
+            Some((a, p)) => match p.parse() {
+                Ok(port) => (a.to_string(), port),
+                Err(_) => (target.to_string(), 9777),
+            },
+            None => (target.to_string(), 9777),
+        }
+    }
+
+    /// Is stdin a terminal? Decides whether a verb may ask a question or must refuse with
+    /// [`NEEDS_INTERACTION`] — a CLI that blocks a CI job on a prompt is a hang, not a UX.
+    fn is_tty() -> bool {
+        #[cfg(unix)]
+        {
+            // SAFETY-free check: `isatty` via the std file descriptor, without libc.
+            std::io::IsTerminal::is_terminal(&std::io::stdin())
+        }
+        #[cfg(not(unix))]
+        {
+            std::io::IsTerminal::is_terminal(&std::io::stdin())
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn argv(v: &[&str]) -> Vec<String> {
+            v.iter().map(|s| s.to_string()).collect()
+        }
+
+        /// Flags and their values never masquerade as the verb's subject — the bug that makes
+        /// `launch --profile Work desk` reach for a host called "Work".
+        #[test]
+        fn positional_skips_flags_and_their_values() {
+            assert_eq!(
+                positional(&argv(&["desk", "--game", "steam:570"]), 0),
+                Some("desk".into())
+            );
+            assert_eq!(
+                positional(&argv(&["--profile", "Work", "desk"]), 0),
+                Some("desk".into())
+            );
+            assert_eq!(
+                positional(&argv(&["--exec", "desk"]), 0),
+                Some("desk".into()),
+                "a valueless flag must not swallow the subject"
+            );
+            assert_eq!(
+                positional(&argv(&["add", "10.0.0.1"]), 1),
+                Some("10.0.0.1".into())
+            );
+            assert_eq!(positional(&argv(&["--json"]), 0), None);
+        }
+
+        #[test]
+        fn host_port_splitting() {
+            assert_eq!(split_host_port("desk"), ("desk".into(), 9777));
+            assert_eq!(split_host_port("desk:1234"), ("desk".into(), 1234));
+            // Not a port: keep the whole thing as the address rather than inventing one.
+            assert_eq!(split_host_port("desk:nope"), ("desk:nope".into(), 9777));
+        }
+
+        #[test]
+        fn value_reads_the_argument_after_its_flag() {
+            let a = argv(&["--game", "steam:570", "--exec"]);
+            assert_eq!(value(&a, "--game"), Some("steam:570".into()));
+            assert_eq!(value(&a, "--profile"), None);
+            // A flag followed by another flag has no value.
+            assert_eq!(value(&argv(&["--profile", "--exec"]), "--profile"), None);
+            assert!(has(&a, "--exec"));
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", windows))]
+fn main() -> std::process::ExitCode {
+    // Logs to stderr; stdout is the machine interface (TSV/JSON), exactly like the session
+    // binary's contract.
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()),
+        )
+        .init();
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    std::process::ExitCode::from(cli::run(args))
+}
+
+/// Keeps `cargo build --workspace` green on macOS, where the client is clients/apple.
+#[cfg(not(any(target_os = "linux", windows)))]
+fn main() {
+    eprintln!("punktfunk runs on Linux and Windows — the macOS client lives in clients/apple");
+    std::process::exit(2);
+}
