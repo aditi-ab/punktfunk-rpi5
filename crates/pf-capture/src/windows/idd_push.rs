@@ -648,11 +648,7 @@ impl IddPushCapturer {
         // nothing downstream could detect the mismatch, because every field it would compare against
         // had already been moved. Nothing below this line fails.
         let fmt = Self::ring_format_for(new_display_hdr);
-        // SAFETY: `create_ring_slots` is an `unsafe fn` (it makes D3D11/DXGI COM calls); we pass a live
-        // borrow of `self.device` (the capturer's own device, on which the slots are created) plus plain
-        // `u32`/`DXGI_FORMAT` values, and `?` propagates any failure before the slots are used. Every
-        // returned slot's texture + keyed mutex belongs to that same `self.device`.
-        let new_slots = unsafe { Self::create_ring_slots(&self.device, new_w, new_h, fmt)? };
+        let new_slots = Self::create_ring_slots(&self.device, new_w, new_h, fmt)?;
         self.display_hdr = new_display_hdr;
         self.width = new_w;
         self.height = new_h;
@@ -969,11 +965,11 @@ impl IddPushCapturer {
     /// mid-session mode swap.
     fn ensure_pyro_conv(&mut self) -> Result<()> {
         if self.pyro_conv.is_none() {
-            // SAFETY: `BgraToYuvPlanes::new` compiles D3D11 shaders on `self.device`; `?` propagates
-            // failure before it is stored.
-            self.pyro_conv = Some(unsafe {
-                BgraToYuvPlanes::new(&self.device, self.display_hdr, self.want_444)?
-            });
+            self.pyro_conv = Some(BgraToYuvPlanes::new(
+                &self.device,
+                self.display_hdr,
+                self.want_444,
+            )?);
         }
         Ok(())
     }
@@ -984,22 +980,22 @@ impl IddPushCapturer {
     fn ensure_converter(&mut self) -> Result<()> {
         if self.display_hdr {
             if self.hdr_p010_conv.is_none() {
-                // SAFETY: `HdrP010Converter::new` is `unsafe` (it compiles D3D11 shaders + creates
-                // resources); we pass a live borrow of `self.device`, the device the converter's resources
-                // belong to, and `?` propagates any failure before the converter is stored.
-                self.hdr_p010_conv =
-                    Some(unsafe { HdrP010Converter::new(&self.device, self.width, self.height)? });
+                self.hdr_p010_conv = Some(HdrP010Converter::new(
+                    &self.device,
+                    self.width,
+                    self.height,
+                )?);
             }
         } else if self.want_444 {
             // Full-chroma passthrough — no conversion resources to build.
         } else if self.video_conv.is_none() {
-            // SAFETY: `VideoConverter::new` is `unsafe` (it sets up the D3D11 VIDEO processor); we pass live
-            // borrows of `self.device` + its immediate `self.context` (single-threaded, this thread) plus
-            // plain `u32` dimensions, and `?` propagates any failure before it is stored. The converter's
-            // resources belong to that same device/context.
-            self.video_conv = Some(unsafe {
-                VideoConverter::new(&self.device, &self.context, self.width, self.height, false)?
-            });
+            self.video_conv = Some(VideoConverter::new(
+                &self.device,
+                &self.context,
+                self.width,
+                self.height,
+                false,
+            )?);
         }
         Ok(())
     }

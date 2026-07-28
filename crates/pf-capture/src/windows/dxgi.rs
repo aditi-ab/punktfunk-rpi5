@@ -387,11 +387,20 @@ pub(crate) struct HdrP010Converter {
     cbuf: ID3D11Buffer,
 }
 
+// The three converters' methods below are SAFE fns. They were `unsafe fn` because their bodies are
+// D3D11 FFI, which is not the same thing as having a caller contract: every parameter is a borrowed
+// windows-rs COM wrapper (`&ID3D11Device`, `&ID3D11DeviceContext`, `&ID3D11Texture2D`, the views) or
+// a plain `u32`/`bool`, each body builds its own descriptors from those, and every created interface
+// owns its reference. There is nothing a caller can pass that makes them unsound, and the proofs the
+// markers carried said exactly that — "`?`-checked D3D11 methods on the live `device` borrow" — which
+// is a description of the body, not an obligation. `unsafe` now marks the FFI inside them, where the
+// blocks and their proofs already were. `compile_shader` KEEPS its marker: it takes `PCSTR`, a raw
+// pointer the caller must guarantee is a NUL-terminated literal.
 impl HdrP010Converter {
     /// `w`/`h` are the SOURCE dimensions this converter's chroma pass will sample, baked into the
     /// immutable constant buffer. Rebuild the converter if they change (the IDD capturer's
     /// `recreate_ring` already drops it).
-    pub(crate) unsafe fn new(device: &ID3D11Device, w: u32, h: u32) -> Result<Self> {
+    pub(crate) fn new(device: &ID3D11Device, w: u32, h: u32) -> Result<Self> {
         // SAFETY: every call is a `?`-checked D3D11 method on the live `device` borrow, over
         // fully-initialized stack descriptors and live `Option` out-params; `compile_shader` receives
         // `s!()` literals (its contract). Each created COM interface owns its own reference, and no
@@ -458,7 +467,7 @@ impl HdrP010Converter {
     /// Called ONCE PER OUT-RING SLOT by the owner of the P010 textures, not per frame — see
     /// [`Self::convert`]. Fails when the driver rejects a planar RTV, which is the one hard
     /// requirement of this whole path (a D3D11.3+ runtime plus driver support).
-    pub(crate) unsafe fn plane_rtv(
+    pub(crate) fn plane_rtv(
         device: &ID3D11Device,
         dst: &ID3D11Texture2D,
         format: DXGI_FORMAT,
@@ -498,7 +507,7 @@ impl HdrP010Converter {
     /// ring slot's keyed-mutex hold, i.e. time the DRIVER spent blocked on that slot. Both are
     /// lifetime-of-mode facts: the views belong to the out-ring slot (built in `ensure_out_ring`),
     /// the buffer to this converter, which is already rebuilt on every mode change.
-    pub(crate) unsafe fn convert(
+    pub(crate) fn convert(
         &self,
         ctx: &ID3D11DeviceContext,
         src_srv: &ID3D11ShaderResourceView,
@@ -693,7 +702,7 @@ pub(crate) struct BgraToYuvPlanes {
 }
 
 impl BgraToYuvPlanes {
-    pub(crate) unsafe fn new(device: &ID3D11Device, hdr: bool, chroma444: bool) -> Result<Self> {
+    pub(crate) fn new(device: &ID3D11Device, hdr: bool, chroma444: bool) -> Result<Self> {
         // SAFETY: as `HdrP010Converter::new` — `?`-checked D3D11 shader creation on the live
         // `device` borrow, with `s!()` literals into `compile_shader` and live out-params.
         unsafe {
@@ -731,7 +740,7 @@ impl BgraToYuvPlanes {
     /// texture) + `cbcr_rtv` (half- or full-res CbCr texture per the constructed mode). Two opaque
     /// passes; `w`/`h` are the full luma dims (even for 4:2:0).
     #[allow(clippy::too_many_arguments)]
-    pub(crate) unsafe fn convert(
+    pub(crate) fn convert(
         &self,
         ctx: &ID3D11DeviceContext,
         src_srv: &ID3D11ShaderResourceView,
@@ -828,7 +837,7 @@ impl VideoConverter {
     /// linear (the HDR ring, used by a PyroWave session that tone-maps the HDR desktop down to the
     /// 8-bit wavelet stream). The output is always studio-range BT.709 NV12 — the P010/BT.2020 HDR
     /// path is [`HdrP010Converter`]'s job, never this one.
-    pub(crate) unsafe fn new(
+    pub(crate) fn new(
         device: &ID3D11Device,
         context: &ID3D11DeviceContext,
         width: u32,
@@ -897,11 +906,7 @@ impl VideoConverter {
     /// Convert `input` (BGRA, or scRGB FP16 for a converter built with `scrgb_input`) → `output`
     /// (NV12, BT.709 studio-range — see the type doc: never P010) on the video engine. Views are
     /// created per call (cheap relative to the Blt) so the input texture can vary frame to frame.
-    pub(crate) unsafe fn convert(
-        &self,
-        input: &ID3D11Texture2D,
-        output: &ID3D11Texture2D,
-    ) -> Result<()> {
+    pub(crate) fn convert(&self, input: &ID3D11Texture2D, output: &ID3D11Texture2D) -> Result<()> {
         // SAFETY: both view creations are `?`-checked calls on `self.vdev` with fully-initialized
         // stack descriptors and live out-params. `stream.pInputSurface` is a `ManuallyDrop` of the
         // input view just created: `VideoProcessorBlt` only BORROWS it (a COM in-param never transfers

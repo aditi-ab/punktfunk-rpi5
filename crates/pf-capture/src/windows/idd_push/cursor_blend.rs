@@ -56,7 +56,7 @@ pub(super) struct CursorBlendPass {
 }
 
 impl CursorBlendPass {
-    pub(super) unsafe fn new(device: &ID3D11Device) -> Result<Self> {
+    pub(super) fn new(device: &ID3D11Device) -> Result<Self> {
         // SAFETY: `?`-checked D3D11 resource creation on the live `device` borrow, over
         // fully-initialized stack descriptors and live out-params; `compile_shader` receives `s!()`
         // literals (its contract).
@@ -116,11 +116,7 @@ impl CursorBlendPass {
     }
 
     /// Upload `ov`'s bitmap if its serial is new; reuse the cached SRV otherwise.
-    unsafe fn ensure_shape(
-        &mut self,
-        device: &ID3D11Device,
-        ov: &pf_frame::CursorOverlay,
-    ) -> Result<()> {
+    fn ensure_shape(&mut self, device: &ID3D11Device, ov: &pf_frame::CursorOverlay) -> Result<()> {
         // SAFETY: `CreateTexture2D`/`CreateShaderResourceView` are `?`-checked calls on the live
         // `device` borrow. `init.pSysMem` points into `ov.rgba`, which the length check above proves
         // holds at least `ov.w * ov.h * 4` bytes for the declared `SysMemPitch = ov.w * 4`, and which
@@ -170,7 +166,7 @@ impl CursorBlendPass {
     /// composition) — linearize and scale to the target's SDR white. The quad is placed purely
     /// via the viewport (the fullscreen-triangle VS fills whatever viewport is set), clipped by
     /// the target automatically.
-    pub(super) unsafe fn blend(
+    pub(super) fn blend(
         &mut self,
         device: &ID3D11Device,
         ctx: &ID3D11DeviceContext,

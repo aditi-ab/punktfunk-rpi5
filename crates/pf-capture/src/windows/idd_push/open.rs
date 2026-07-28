@@ -85,7 +85,7 @@ impl IddPushCapturer {
     /// to the display's composition format — FP16 in HDR, BGRA in SDR). Each is shared through an
     /// UNNAMED NT handle (nothing to open by name — the sealed channel); the driver reaches it only via
     /// the duplicate the [`ChannelBroker`] sends after the ring is published.
-    pub(super) unsafe fn create_ring_slots(
+    pub(super) fn create_ring_slots(
         device: &ID3D11Device,
         w: u32,
         h: u32,
