@@ -359,6 +359,21 @@ mod tests {
     use super::*;
     use std::sync::mpsc;
 
+    /// Identity (`st_ino`) of an open fd — what SCM_RIGHTS preserves across the socket while
+    /// re-numbering the descriptor. Lets the dispatch test assert the fd that ARRIVED is the one
+    /// the host sent, not merely that the JSON body claimed one.
+    fn fd_ino(fd: impl AsRawFd) -> u64 {
+        // SAFETY: `libc::stat` is plain-old-data for which all-zero is a valid value, so
+        // `mem::zeroed()` is a sound initializer. `fd` is a live descriptor owned by the caller;
+        // `fstat` writes into the live, correctly-sized `&mut st`, and `st_ino` is read only
+        // after the return value is checked.
+        unsafe {
+            let mut st: libc::stat = std::mem::zeroed();
+            assert_eq!(libc::fstat(fd.as_raw_fd(), &mut st), 0, "fstat");
+            st.st_ino
+        }
+    }
+
     /// Records calls; import behavior is scripted per key.
     struct MockBackend {
         calls: mpsc::Sender<String>,
@@ -371,11 +386,13 @@ mod tests {
             vec![7, 8, 9]
         }
         fn import(&mut self, req: &ImportReq, fd: Option<OwnedFd>) -> Reply {
+            let received = match &fd {
+                Some(f) => format!("ino:{}", fd_ino(f.as_raw_fd())),
+                None => "none".into(),
+            };
             let _ = self.calls.send(format!(
-                "import:key={} kind={:?} fd={}",
-                req.key,
-                req.kind,
-                fd.is_some()
+                "import:key={} kind={:?} fd={received}",
+                req.key, req.kind,
             ));
             if req.key == 0xbad {
                 return Reply::Err {
@@ -460,6 +477,15 @@ mod tests {
         let (reply, _) = proto::recv::<Reply>(host.as_fd(), &mut buf).unwrap();
         assert_eq!(reply, Reply::Frame { id: 1, desc: None });
 
+        // The descriptor itself must cross the socket: an import WITH an fd rides SCM_RIGHTS and
+        // the backend receives a live descriptor with the sender's identity — `serve` dropping the
+        // received fd (e.g. `backend.import(&req, None)`) would only be caught here.
+        let (pr, _pw) = std::io::pipe().unwrap();
+        let sent_ino = fd_ino(pr.as_fd().as_raw_fd());
+        proto::send(host.as_fd(), &import_req(3, true), Some(pr.as_fd())).unwrap();
+        let (reply, _) = proto::recv::<Reply>(host.as_fd(), &mut buf).unwrap();
+        assert_eq!(reply, Reply::Frame { id: 2, desc: None });
+
         // A missing worker-side fd is a NeedFd reply (host resends), not a failure.
         proto::send(host.as_fd(), &import_req(0xfeed, false), None).unwrap();
         let (reply, _) = proto::recv::<Reply>(host.as_fd(), &mut buf).unwrap();
@@ -485,13 +511,14 @@ mod tests {
         assert_eq!(
             calls,
             vec![
-                "modifiers:42",
-                "import:key=1 kind=Tiled fd=false",
-                "import:key=1 kind=Tiled fd=false",
-                "import:key=65261 kind=Tiled fd=false", // 0xfeed
-                "import:key=2989 kind=Tiled fd=false",  // 0xbad
-                "release:0",
-                "clear",
+                "modifiers:42".to_string(),
+                "import:key=1 kind=Tiled fd=none".to_string(),
+                "import:key=1 kind=Tiled fd=none".to_string(),
+                format!("import:key=3 kind=Tiled fd=ino:{sent_ino}"),
+                "import:key=65261 kind=Tiled fd=none".to_string(), // 0xfeed
+                "import:key=2989 kind=Tiled fd=none".to_string(),  // 0xbad
+                "release:0".to_string(),
+                "clear".to_string(),
             ]
         );
     }

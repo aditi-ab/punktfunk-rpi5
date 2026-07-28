@@ -627,8 +627,16 @@ mod tests {
         assert_eq!(status.code(), Some(42));
     }
 
+    /// A request as the scripted peer saw it, paired with the identity (`st_ino`) of the
+    /// descriptor that actually arrived via SCM_RIGHTS — the `has_fd` boolean in the JSON body is
+    /// a *claim*; the received fd is the mechanism the whole worker design rests on, so tests
+    /// assert on it directly.
+    type SeenRequest = (Request, Option<u64>);
+
     /// A scripted peer: answers the handshake, then serves canned replies per request.
-    fn scripted_server(replies: Vec<Reply>) -> (RemoteImporter, thread::JoinHandle<Vec<Request>>) {
+    fn scripted_server(
+        replies: Vec<Reply>,
+    ) -> (RemoteImporter, thread::JoinHandle<Vec<SeenRequest>>) {
         let (host, worker) = proto::socketpair_seqpacket().unwrap();
         proto::send(
             worker.as_fd(),
@@ -642,9 +650,12 @@ mod tests {
             let mut buf = Vec::new();
             let mut seen = Vec::new();
             let mut replies = replies.into_iter();
-            while let Ok((req, _fd)) = proto::recv::<Request>(worker.as_fd(), &mut buf) {
+            while let Ok((req, fd)) = proto::recv::<Request>(worker.as_fd(), &mut buf) {
                 let needs_reply = matches!(req, Request::Modifiers { .. } | Request::Import { .. });
-                seen.push(req);
+                let ino = fd
+                    .as_ref()
+                    .map(|f| dmabuf_key(f.as_raw_fd()).expect("fstat received fd"));
+                seen.push((req, ino));
                 if needs_reply {
                     match replies.next() {
                         Some(r) => proto::send(worker.as_fd(), &r, None).unwrap(),
@@ -669,9 +680,12 @@ mod tests {
         let seen = join.join().unwrap();
         assert_eq!(
             seen,
-            vec![Request::Modifiers {
-                fourcc: 0x3432_5258
-            }]
+            vec![(
+                Request::Modifiers {
+                    fourcc: 0x3432_5258
+                },
+                None
+            )]
         );
     }
 
@@ -698,17 +712,26 @@ mod tests {
         // Second import: no fd (already sent) → worker answers NeedFd → one retry WITH the fd.
         assert!(imp.import(&plane, 64, 64, 1, Some(2)).is_err());
         assert!(!imp.dead(), "NeedFd handling must not mark the worker dead");
+        // The identity the passed descriptor must carry — SCM_RIGHTS re-numbers the fd but
+        // preserves the open file description, so st_ino survives the crossing.
+        let key = dmabuf_key(plane.fd).unwrap();
         drop(imp);
-        let fd_flags: Vec<bool> = join
+        let fd_sends: Vec<(bool, Option<u64>)> = join
             .join()
             .unwrap()
             .iter()
-            .map(|r| match r {
-                Request::Import { has_fd, .. } => *has_fd,
+            .map(|(r, ino)| match r {
+                Request::Import { has_fd, .. } => (*has_fd, *ino),
                 other => panic!("unexpected request {other:?}"),
             })
             .collect();
-        assert_eq!(fd_flags, vec![true, false, true]);
+        // Not just the has_fd *claim* — the descriptor itself must have crossed, with the same
+        // identity the worker will key its cache on (`pass = None` at the send site would leave
+        // has_fd=true with no actual fd, which only this assertion catches).
+        assert_eq!(
+            fd_sends,
+            vec![(true, Some(key)), (false, None), (true, Some(key))]
+        );
     }
 
     #[test]
@@ -735,18 +758,23 @@ mod tests {
         };
         assert!(format!("{err:#}").contains("died"), "{err:#}");
         assert!(imp.dead());
+        let key = dmabuf_key(plane.fd).unwrap();
         drop(imp);
         let seen = join.join().unwrap();
-        // First import carried the fd (first sight of the key); the retry didn't re-send it.
+        // First import carried the fd (first sight of the key — and the DESCRIPTOR arrived, with
+        // the sender's identity); the retry didn't re-send it.
         match (&seen[0], &seen[1]) {
             (
-                Request::Import {
-                    has_fd: true,
-                    kind: ImportKind::Tiled,
-                    ..
-                },
-                Request::Import { has_fd: false, .. },
-            ) => {}
+                (
+                    Request::Import {
+                        has_fd: true,
+                        kind: ImportKind::Tiled,
+                        ..
+                    },
+                    Some(ino),
+                ),
+                (Request::Import { has_fd: false, .. }, None),
+            ) => assert_eq!(*ino, key),
             other => panic!("unexpected requests {other:?}"),
         }
     }
