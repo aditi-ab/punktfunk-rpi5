@@ -109,6 +109,11 @@ pub enum CardOutput {
     },
     /// Put this card's `punktfunk://` URL on the clipboard.
     CopyLink(String),
+    /// Write a desktop entry that launches this card's URL.
+    CreateShortcut {
+        label: String,
+        url: String,
+    },
     /// Add or remove a pinned host+profile card (design §5.2a). Presentation only — it never
     /// changes the host's default profile, and unpinning never touches the profile itself.
     TogglePin {
@@ -407,6 +412,27 @@ impl relm4::factory::FactoryComponent for HostCard {
                         });
                         actions.add_action(&a);
                     }
+                    // "Create shortcut…": the same URL as Copy link, wrapped in a desktop
+                    // entry so it is double-clickable from the app grid.
+                    {
+                        let (host, profile) = (k.clone(), pinned.clone());
+                        let a = gio::SimpleAction::new("shortcut", None);
+                        let sender = sender.clone();
+                        a.connect_activate(move |_, _| {
+                            let url = pf_client_core::deeplink::DeepLink::for_host(
+                                &host,
+                                None,
+                                profile.as_ref().map(|(id, _)| id.as_str()),
+                            )
+                            .to_url();
+                            let label = match &profile {
+                                Some((_, name)) => format!("{} \u{00b7} {name}", host.name),
+                                None => host.name.clone(),
+                            };
+                            let _ = sender.output(CardOutput::CreateShortcut { label, url });
+                        });
+                        actions.add_action(&a);
+                    }
                     // The same action pins from a primary card and unpins from a pinned one —
                     // which of the two this card is decides the direction.
                     let (fp, addr, port) = (k.fp_hex.clone(), k.addr.clone(), k.port);
@@ -453,6 +479,7 @@ impl relm4::factory::FactoryComponent for HostCard {
                     );
                     menu.append_item(&unpin);
                     menu.append(Some("Copy link"), Some("card.copy-link"));
+                    menu.append(Some("Create shortcut\u{2026}"), Some("card.shortcut"));
                 } else {
                     if !profiles.is_empty() {
                         let with = gio::Menu::new();
@@ -503,6 +530,7 @@ impl relm4::factory::FactoryComponent for HostCard {
                         menu.append(Some("Browse library\u{2026}"), Some("card.library"));
                     }
                     menu.append(Some("Copy link"), Some("card.copy-link"));
+                    menu.append(Some("Create shortcut\u{2026}"), Some("card.shortcut"));
                     menu.append(Some("Edit\u{2026}"), Some("card.rename"));
                     menu.append(Some("Forget"), Some("card.forget"));
                 }
@@ -915,6 +943,9 @@ impl SimpleComponent for HostsPage {
                     }
                     let _ = sender.output(HostsOutput::Toast("Link copied".into()));
                 }
+                CardOutput::CreateShortcut { label, url } => {
+                    self.shortcut_result(&sender, &label, &url);
+                }
                 CardOutput::TogglePin {
                     fp_hex,
                     addr,
@@ -1073,6 +1104,45 @@ impl HostsPage {
     }
 
     /// Rename a saved host — an entry in an alert, then upsert + refresh.
+    /// Write the shortcut, or — inside the flatpak sandbox, which cannot reach
+    /// `~/.local/share/applications` — hand the user the URL to place themselves. The
+    /// DynamicLauncher portal is the intended upgrade for that case (design §5); until then
+    /// the fallback is the one the design already sanctions, not a dead end.
+    fn shortcut_result(&self, sender: &ComponentSender<Self>, label: &str, url: &str) {
+        if crate::shortcuts::sandboxed() {
+            let dialog = adw::AlertDialog::new(
+                Some("Create Shortcut"),
+                Some(
+                    "Punktfunk is sandboxed here, so it can't add the shortcut itself. Copy \
+                     this link and make a launcher for it \u{2014} it opens the same stream.",
+                ),
+            );
+            let entry = gtk::Entry::builder().text(url).editable(false).build();
+            dialog.set_extra_child(Some(&entry));
+            dialog.add_responses(&[("close", "Close"), ("copy", "Copy link")]);
+            dialog.set_response_appearance("copy", adw::ResponseAppearance::Suggested);
+            dialog.set_close_response("close");
+            {
+                let url = url.to_string();
+                dialog.connect_response(Some("copy"), move |_, _| {
+                    if let Some(display) = gtk::gdk::Display::default() {
+                        display.clipboard().set_text(&url);
+                    }
+                });
+            }
+            dialog.present(Some(&self.widgets.stack));
+            return;
+        }
+        let msg = match crate::shortcuts::write_desktop_entry(label, url) {
+            Ok(_) => format!("Shortcut for \u{201c}{label}\u{201d} added to your applications"),
+            Err(e) => {
+                tracing::warn!(error = %e, "writing the shortcut");
+                format!("Couldn't create the shortcut \u{2014} {e}")
+            }
+        };
+        let _ = sender.output(HostsOutput::Toast(msg));
+    }
+
     /// The host edit sheet — the per-host settings that are properties of the HOST, not of
     /// the stream: its name, whether this machine shares its clipboard with it, and which
     /// settings profile it defaults to.

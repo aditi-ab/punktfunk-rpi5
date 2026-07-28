@@ -14,6 +14,9 @@ pub use pf_client_core::{discovery, gamepad, library, trust, video, wol};
 mod app;
 #[cfg(target_os = "linux")]
 mod cli;
+// "Create shortcut…" — the desktop-entry writer (design/client-deep-links.md §5).
+#[cfg(target_os = "linux")]
+mod shortcuts;
 #[cfg(target_os = "linux")]
 mod spawn;
 #[cfg(target_os = "linux")]
