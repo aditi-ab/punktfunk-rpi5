@@ -50,9 +50,23 @@ pub(crate) fn fourcc_to_vk(fourcc: u32) -> Option<vk::Format> {
     const XB24: u32 = 0x3432_4258; // XBGR8888
     const AB24: u32 = 0x3432_4241; // ABGR8888
     const NV12: u32 = 0x3231_564e; // DRM_FORMAT_NV12
+                                   // The 10-bit HDR capture formats. DRM packs these as a little-endian 32-bit word — XR30 is
+                                   // x:R:G:B with B in bits 0-9 — which is exactly Vulkan's `A2R10G10B10_UNORM_PACK32` bit
+                                   // layout, so the mapping is an identity on the word and not a byte swizzle like the 8-bit
+                                   // pair above.
+                                   //
+                                   // ⚠ Only `A2B10G10R10_UNORM_PACK32` is a Vulkan-mandatory SAMPLED format; `A2R10G10B10` is
+                                   // optional (widely supported on RADV/ANV, and we only ever `texelFetch` it — no filtering).
+                                   // Both are offered to the producer, so which one a session lands on is the producer's pick;
+                                   // if a device ever rejects the XR30 import, the fix is to drop that format from the capture
+                                   // offer rather than to convert here.
+    const XR30: u32 = 0x3033_5258; // DRM_FORMAT_XRGB2101010
+    const XB30: u32 = 0x3033_4258; // DRM_FORMAT_XBGR2101010
     match fourcc {
         XR24 | AR24 => Some(vk::Format::B8G8R8A8_UNORM),
         XB24 | AB24 => Some(vk::Format::R8G8B8A8_UNORM),
+        XR30 => Some(vk::Format::A2R10G10B10_UNORM_PACK32),
+        XB30 => Some(vk::Format::A2B10G10R10_UNORM_PACK32),
         NV12 => Some(vk::Format::G8_B8R8_2PLANE_420_UNORM),
         _ => None,
     }
@@ -62,6 +76,10 @@ pub(crate) fn pixel_to_vk(fmt: PixelFormat) -> Option<vk::Format> {
     match fmt {
         PixelFormat::Bgrx | PixelFormat::Bgra => Some(vk::Format::B8G8R8A8_UNORM),
         PixelFormat::Rgbx | PixelFormat::Rgba => Some(vk::Format::R8G8B8A8_UNORM),
+        // The packed 10-bit PQ/BT.2020 capture formats (an HDR gamescope output). Sampling one
+        // yields the PQ code values normalized to [0,1] — which is what `rgb2yuv10.comp` wants.
+        PixelFormat::X2Rgb10 => Some(vk::Format::A2R10G10B10_UNORM_PACK32),
+        PixelFormat::X2Bgr10 => Some(vk::Format::A2B10G10R10_UNORM_PACK32),
         _ => None,
     }
 }

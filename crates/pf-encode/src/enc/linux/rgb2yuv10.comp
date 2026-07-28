@@ -1,0 +1,70 @@
+#version 450
+// The 10-bit HDR twin of `rgb2yuv.comp`: packed 2:10:10:10 RGB -> 10-bit 4:2:0 (BT.2020 NCL,
+// limited range), for an HEVC Main10 session off a gamescope HDR capture.
+//
+// The source samples are ALREADY PQ-encoded BT.2020 R'G'B' (gamescope composites into the PQ
+// container; see packaging/gamescope), so this is a pure 3x3 matrix on the code values — there is
+// no transfer function to apply here, and applying one would be wrong. That is the whole
+// difference from the SDR shader besides the coefficients and the store width.
+//
+// STORE LAYOUT. The scratch planes are `r16`/`rg16` and get `vkCmdCopyImage`d into the
+// `G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16` picture, whose plane texels put the 10-bit value in
+// the HIGH bits of a 16-bit word (`X6` = 6 unused low bits). So a written normalized value `f`
+// lands as `round(f * 65535)` and must equal `code10 << 6` — hence the `CODE10` factor below,
+// NOT `1/1023`. Getting this wrong is a ~1.6% luminance error: invisible on a test pattern,
+// visible as crushed blacks on real content.
+//
+// Rebuild: glslangValidator -V rgb2yuv10.comp -o rgb2yuv10.spv   (vendored beside this file)
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D rgb;                  // packed 2:10:10:10 input (sampled)
+layout(binding = 1, r16)  uniform writeonly image2D yImg;   // full-res Y  (10-bit in the high bits)
+layout(binding = 2, rg16) uniform writeonly image2D uvImg;  // half-res UV (interleaved)
+layout(binding = 3) uniform sampler2D cursorTex;            // straight-alpha RGBA cursor (top-left)
+
+layout(push_constant) uniform Push {
+    ivec2 curOrigin;   // top-left of the cursor in frame pixels (position - hotspot)
+    ivec2 curSize;     // cursor w,h in pixels; x <= 0 => disabled
+} pc;
+
+// 10-bit code value -> the normalized float that stores it in the high bits of a 16-bit texel.
+const float CODE10 = 64.0 / 65535.0;
+
+// BT.2020 non-constant-luminance, limited range, expressed directly in 10-bit code values:
+//   Y' = 64  + 876*(0.2627R + 0.6780G + 0.0593B)
+//   Cb = 512 + 896*(B' - Y')/1.8814
+//   Cr = 512 + 896*(R' - Y')/1.4746
+float lumaY(vec3 c) { return 64.0 + 230.1252*c.r + 593.9280*c.g + 51.9468*c.b; }
+
+// Blend the cursor over `col` at frame pixel `p`, when `p` falls inside the cursor rectangle.
+// The cursor bitmap is 8-bit sRGB and the frame is PQ, so this is a display-referred
+// approximation — the same one the CPU path (`pw_cursor.rs::composite_cursor_rgb10`) and the
+// CUDA path (`cursor_blend.comp` MODE 3/4) already make. Fine for a pointer.
+vec3 withCursor(ivec2 p, vec3 col) {
+    if (pc.curSize.x <= 0) return col;
+    ivec2 cp = p - pc.curOrigin;
+    if (cp.x < 0 || cp.y < 0 || cp.x >= pc.curSize.x || cp.y >= pc.curSize.y) return col;
+    vec4 c = texelFetch(cursorTex, cp, 0);
+    return mix(col, c.rgb, c.a);
+}
+
+// Source may be SMALLER than the coded (16-aligned) Y plane — clamp every fetch to the source
+// edge so the alignment-padding rows duplicate the last real row (see the SDR shader).
+void main() {
+    ivec2 sz = imageSize(yImg);
+    ivec2 rmax = textureSize(rgb, 0) - 1;
+    ivec2 uvc = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 p = uvc * 2;
+    if (p.x >= sz.x || p.y >= sz.y) return;
+    vec3 c00 = withCursor(p,               texelFetch(rgb, min(p,               rmax), 0).rgb);
+    vec3 c10 = withCursor(p + ivec2(1, 0), texelFetch(rgb, min(p + ivec2(1, 0), rmax), 0).rgb);
+    vec3 c01 = withCursor(p + ivec2(0, 1), texelFetch(rgb, min(p + ivec2(0, 1), rmax), 0).rgb);
+    vec3 c11 = withCursor(p + ivec2(1, 1), texelFetch(rgb, min(p + ivec2(1, 1), rmax), 0).rgb);
+    imageStore(yImg, p,               vec4(lumaY(c00) * CODE10, 0, 0, 1));
+    imageStore(yImg, p + ivec2(1, 0), vec4(lumaY(c10) * CODE10, 0, 0, 1));
+    imageStore(yImg, p + ivec2(0, 1), vec4(lumaY(c01) * CODE10, 0, 0, 1));
+    imageStore(yImg, p + ivec2(1, 1), vec4(lumaY(c11) * CODE10, 0, 0, 1));
+    vec3 a = (c00 + c10 + c01 + c11) * 0.25;
+    float U = 512.0 - 125.1085*a.r - 322.8915*a.g + 448.0000*a.b;
+    float V = 512.0 + 448.0000*a.r - 411.9680*a.g -  36.0320*a.b;
+    imageStore(uvImg, uvc, vec4(U * CODE10, V * CODE10, 0, 1));
+}

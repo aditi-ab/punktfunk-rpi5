@@ -225,6 +225,7 @@ pub(super) unsafe fn make_frame(
     with_ts: bool,
     csc: bool,
     pad_fmt: Option<vk::Format>,
+    hdr: bool,
     f: &mut Frame,
 ) -> Result<()> {
     // "no cursor uploaded yet" sentinel — a real serial may be 0 (see `prep_cursor`).
@@ -263,6 +264,7 @@ pub(super) unsafe fn make_frame(
             csc_dsl,
             csc_pool,
             sampler,
+            hdr,
             f,
         )?;
     }
@@ -291,13 +293,15 @@ unsafe fn make_frame_csc(
     csc_dsl: vk::DescriptorSetLayout,
     csc_pool: vk::DescriptorPool,
     sampler: vk::Sampler,
+    hdr: bool,
     f: &mut Frame,
 ) -> Result<()> {
-    // NV12 encode-src (filled by the CSC copy) — concurrent compute+encode.
+    // 4:2:0 encode-src (filled by the CSC copy) — concurrent compute+encode.
+    let pic = yuv_format(hdr);
     (f.nv12_src, f.nv12_mem) = make_video_image(
         device,
         mem_props,
-        NV12,
+        pic,
         w,
         h,
         1,
@@ -305,12 +309,22 @@ unsafe fn make_frame_csc(
         profile_list,
         fams,
     )?;
-    f.nv12_view = make_view(device, f.nv12_src, NV12, 0)?;
-    // CSC scratch (Y R8 full-res, UV RG8 half-res).
+    f.nv12_view = make_view(device, f.nv12_src, pic, 0)?;
+    // CSC scratch: Y full-res + UV half-res, in a single-plane format the shader can declare as a
+    // storage image AND that is SIZE-COMPATIBLE with the picture's planes (`vkCmdCopyImage`
+    // between differing formats requires equal texel-block size). 8-bit: R8/RG8 vs the NV12
+    // planes' 1/2 bytes. 10-bit: R16/RG16 vs the 3PACK16 planes' 2/4 bytes — the 10-bit ycbcr
+    // plane formats themselves are not storage-image formats, which is why the scratch is 16-bit
+    // and `rgb2yuv10.comp` writes the value into the high bits by hand.
+    let (y_fmt, uv_fmt) = if hdr {
+        (vk::Format::R16_UNORM, vk::Format::R16G16_UNORM)
+    } else {
+        (vk::Format::R8_UNORM, vk::Format::R8G8_UNORM)
+    };
     (f.y_img, f.y_mem, f.y_view) = make_plain_image(
         device,
         mem_props,
-        vk::Format::R8_UNORM,
+        y_fmt,
         w,
         h,
         vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC,
@@ -318,7 +332,7 @@ unsafe fn make_frame_csc(
     (f.uv_img, f.uv_mem, f.uv_view) = make_plain_image(
         device,
         mem_props,
-        vk::Format::R8G8_UNORM,
+        uv_fmt,
         w / 2,
         h / 2,
         vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC,
@@ -479,12 +493,20 @@ pub(super) unsafe fn build_parameters_h265(
     rw: u32,
     rh: u32,
     quality_level: u32,
+    // 10-bit HDR session: Main10 + BT.2020/PQ colour signalling. Must agree with the video
+    // profile the session was CREATED with (`open_inner`'s `ten_bit`) — a Main SPS on a Main10
+    // session is a bitstream that says one thing and carries another.
+    ten_bit: bool,
 ) -> Result<(vk::VideoSessionParametersKHR, Vec<u8>)> {
     use ash::vk::native as hh;
     let mut ptl: hh::StdVideoH265ProfileTierLevel = std::mem::zeroed();
     ptl.flags.set_general_progressive_source_flag(1);
     ptl.flags.set_general_frame_only_constraint_flag(1);
-    ptl.general_profile_idc = hh::StdVideoH265ProfileIdc_STD_VIDEO_H265_PROFILE_IDC_MAIN;
+    ptl.general_profile_idc = if ten_bit {
+        hh::StdVideoH265ProfileIdc_STD_VIDEO_H265_PROFILE_IDC_MAIN_10
+    } else {
+        hh::StdVideoH265ProfileIdc_STD_VIDEO_H265_PROFILE_IDC_MAIN
+    };
     ptl.general_level_idc = hh::StdVideoH265LevelIdc_STD_VIDEO_H265_LEVEL_IDC_6_0;
 
     let mut dpbm: hh::StdVideoH265DecPicBufMgr = std::mem::zeroed();
@@ -505,6 +527,11 @@ pub(super) unsafe fn build_parameters_h265(
     sps.pic_width_in_luma_samples = w;
     sps.pic_height_in_luma_samples = h;
     sps.log2_max_pic_order_cnt_lsb_minus4 = 4;
+    // Main10's `bit_depth_*_minus8 = 2`. Zeroed (= 8-bit) for Main, as before.
+    if ten_bit {
+        sps.bit_depth_luma_minus8 = 2;
+        sps.bit_depth_chroma_minus8 = 2;
+    }
     sps.log2_diff_max_min_luma_coding_block_size = 3;
     sps.log2_diff_max_min_luma_transform_block_size = 3;
     sps.max_transform_hierarchy_depth_inter = 4;
@@ -517,25 +544,26 @@ pub(super) unsafe fn build_parameters_h265(
         sps.conf_win_bottom_offset = (h - rh) / 2; // 4:2:0 SubHeightC = 2
     }
 
-    // Colour signalling. This backend's CSC (`rgb2yuv.comp`) is BT.709 LIMITED 8-bit and nothing
-    // else — `open_amd_intel` routes every HDR session to VAAPI precisely because this path
-    // hardcodes it — so the SPS can state it as a constant. Without the VUI the stream is
-    // "unspecified" and each decoder applies its own default: the punktfunk clients fall back to
-    // BT.709 (`pf_client_core::video_color::csc_rows`), but vendor TV decoders guess from
-    // RESOLUTION — an LG webOS panel reads a 4K SDR stream as BT.2020 and renders it visibly
-    // washed out. Every sibling backend (NVENC `nvenc_core.rs`, VAAPI, QSV, the Windows libav
-    // path) already signals this triplet; this one was the hole.
+    // Colour signalling, exactly what this session's CSC produced: `rgb2yuv.comp` is BT.709
+    // limited 8-bit, `rgb2yuv10.comp` is BT.2020 NCL limited 10-bit with a PQ transfer (the
+    // samples arrive PQ-encoded from the compositor and the matrix does not touch the transfer).
+    // Without the VUI the stream is "unspecified" and each decoder applies its own default: the
+    // punktfunk clients fall back to BT.709 (`pf_client_core::video_color::csc_rows`), but vendor
+    // TV decoders guess from RESOLUTION — an LG webOS panel reads a 4K SDR stream as BT.2020 and
+    // renders it visibly washed out.
     //
     // `vui` must outlive `create_video_session_parameters_khr` below — it does, `sps_arr` only
     // copies the pointer and both live to the end of this function.
     let mut vui: hh::StdVideoH265SequenceParameterSetVui = std::mem::zeroed();
     vui.flags.set_video_signal_type_present_flag(1);
-    vui.flags.set_video_full_range_flag(0); // limited/studio swing (16-235 luma)
+    vui.flags.set_video_full_range_flag(0); // limited/studio swing
     vui.flags.set_colour_description_present_flag(1);
     vui.video_format = 5; // unspecified — the CICP triplet below is what matters
-    vui.colour_primaries = 1; // BT.709
-    vui.transfer_characteristics = 1; // BT.709
-    vui.matrix_coeffs = 1; // BT.709
+                          // CICP code points: 1 = BT.709, 9 = BT.2020 primaries / BT.2020 NCL matrix, 16 = SMPTE 2084.
+    let (prim, trc, mat) = if ten_bit { (9, 16, 9) } else { (1, 1, 1) };
+    vui.colour_primaries = prim;
+    vui.transfer_characteristics = trc;
+    vui.matrix_coeffs = mat;
     sps.flags.set_vui_parameters_present_flag(1);
     sps.pSequenceParameterSetVui = &vui;
 

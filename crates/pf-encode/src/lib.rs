@@ -357,24 +357,25 @@ fn open_video_backend_linux(
     // Linux binary serves any GPU; `PUNKTFUNK_ENCODER` forces a specific backend (and surfaces
     // its errors crisply instead of silently trying the other).
     // AMD/Intel opener. Default = libav VAAPI. With `--features vulkan-encode` +
-    // PUNKTFUNK_VULKAN_ENCODE, an HEVC session instead opens the raw Vulkan Video backend (real
-    // RFI loss recovery the VAAPI path can't express); a failed open falls back to VAAPI so the
-    // stream never dies over the new path. `format`/`bit_depth`/`chroma` only matter to VAAPI —
-    // the Vulkan backend imports the dmabuf and does its own 8-bit 4:2:0 CSC.
+    // PUNKTFUNK_VULKAN_ENCODE, an HEVC/AV1 session instead opens the raw Vulkan Video backend
+    // (real RFI loss recovery the VAAPI path can't express); a failed open falls back to VAAPI so
+    // the stream never dies over the new path. `format`/`bit_depth`/`chroma` only matter to VAAPI
+    // — the Vulkan backend imports the dmabuf and does its own CSC.
     let open_amd_intel = || -> Result<(Box<dyn Encoder>, &'static str)> {
-        // An HDR session (10-bit + a PQ/BT.2020 capture format) must skip the Vulkan Video
-        // backend — it hardcodes an 8-bit 4:2:0 BT.709 CSC — and take the libav VAAPI path,
-        // which has the P010/Main10/PQ wiring. SDR sessions keep the Vulkan default.
+        // HDR (10-bit + a PQ/BT.2020 capture format) takes the Vulkan backend for **HEVC**: its
+        // compute CSC has a 10-bit BT.2020 variant and the session opens Main10. That keeps the
+        // two things an HDR session would otherwise lose here — real RFI recovery and the
+        // compute-CSC cursor blend, which is the only way a gamescope pointer reaches the stream
+        // (gamescope has no embedded-cursor mode to fall back to).
         //
-        // Two things ride this switch, and both are the accepted cost of AMD/Intel HDR until
-        // Vulkan Video learns 10-bit: the Vulkan backend's real RFI loss recovery, and its
-        // compute-CSC **cursor blend**. A gamescope HDR session therefore streams without the
-        // host-composited XFixes pointer (gamescope has no embedded-cursor mode to fall back
-        // to) — `open_video`'s `blends_cursor` backstop logs it per session.
+        // AV1 10-bit stays on libav VAAPI: encode-side driver coverage for it is far thinner than
+        // HEVC Main10, and this is not the place to gamble a session open. A device that cannot
+        // do Main10 either fails `get_physical_device_video_capabilities` inside the open and
+        // lands on the VAAPI fallback below — the same net as any other unsupported config.
         #[cfg(feature = "vulkan-encode")]
         if matches!(codec, Codec::H265 | Codec::Av1)
             && vulkan_encode_enabled()
-            && !(bit_depth == 10 && format.is_hdr_rgb10())
+            && !(bit_depth == 10 && format.is_hdr_rgb10() && codec != Codec::H265)
         {
             match vulkan_video::VulkanVideoEncoder::open(
                 codec,
@@ -1045,8 +1046,14 @@ pub fn linux_hdr_cuda_ok() -> bool {
 ///
 /// `cuda_planned` is the caller's prediction of a CUDA capture payload (NVIDIA + zero-copy — the
 /// prediction `SessionPlan` already makes); `ten_bit` the negotiated depth. Both shift the
-/// dispatch: a CPU payload keeps NVIDIA on libav NVENC (no blend), and a 10-bit HDR session
-/// skips Vulkan Video for libav VAAPI's P010/Main10 wiring (no blend).
+/// dispatch: a CPU payload keeps NVIDIA on libav NVENC (no blend), and a 10-bit **AV1** session
+/// skips Vulkan Video for libav VAAPI (no blend) — 10-bit HEVC does not, its compute CSC has a
+/// BT.2020 Main10 variant that blends like the 8-bit one.
+///
+/// Whether the DEVICE can encode Main10 is only settled when the session opens (the profile query
+/// is what answers it); a device that cannot falls back to VAAPI there, and `open_video`'s
+/// `blends_cursor` backstop logs the divergence. Same shape as every other open-time fallback
+/// this prediction cannot see.
 #[cfg(target_os = "linux")]
 pub fn cursor_blend_capable(codec: Codec, cuda_planned: bool, ten_bit: bool) -> bool {
     // A negotiated PyroWave session routes to that backend before the pref is consulted
@@ -1071,6 +1078,8 @@ pub fn cursor_blend_capable(codec: Codec, cuda_planned: bool, ten_bit: bool) -> 
         {
             matches!(codec, Codec::H265 | Codec::Av1)
                 && vulkan_encode_enabled()
+                // 10-bit is HEVC Main10 only on this backend — mirrors `open_amd_intel`.
+                && !(ten_bit && codec != Codec::H265)
                 && vulkan_encode_available(codec)
         }
         #[cfg(not(feature = "vulkan-encode"))]
@@ -1083,7 +1092,7 @@ pub fn cursor_blend_capable(codec: Codec, cuda_planned: bool, ten_bit: bool) -> 
         linux_auto_is_vaapi,
         cuda_planned,
     );
-    cursor_blend_capable_for(backend, cuda_planned, ten_bit, direct_nvenc, vulkan_csc)
+    cursor_blend_capable_for(backend, cuda_planned, direct_nvenc, vulkan_csc)
 }
 
 /// The dispatch-mirroring core of [`cursor_blend_capable`], device-free for the unit tests.
@@ -1094,7 +1103,6 @@ pub fn cursor_blend_capable(codec: Codec, cuda_planned: bool, ten_bit: bool) -> 
 fn cursor_blend_capable_for(
     backend: Option<LinuxBackend>,
     cuda_planned: bool,
-    ten_bit: bool,
     direct_nvenc: bool,
     vulkan_csc: bool,
 ) -> bool {
@@ -1104,11 +1112,11 @@ fn cursor_blend_capable_for(
         // Only the direct-SDK arm blends (VkSlotBlend), and it only takes CUDA payloads —
         // a CPU-payload session stays on libav NVENC, which cannot blend.
         Some(LinuxBackend::Nvenc) => cuda_planned && direct_nvenc,
-        // The Vulkan Video compute-CSC path blends; a 10-bit HDR session skips it for libav
-        // VAAPI (no blend). The session plan keeps a cursor-blend session off the native-NV12
-        // and RGB-direct shapes (`SessionPlan::output_format` / `VulkanVideoEncoder::open`),
-        // so CSC eligibility IS the answer.
-        Some(LinuxBackend::AmdIntel) | Some(LinuxBackend::Vulkan) => !ten_bit && vulkan_csc,
+        // The Vulkan Video compute-CSC path blends, at either depth. The session plan keeps a
+        // cursor-blend session off the native-NV12 and RGB-direct shapes
+        // (`SessionPlan::output_format` / `VulkanVideoEncoder::open`), so CSC eligibility IS the
+        // answer — including the depth term, which `vulkan_csc` already carries.
+        Some(LinuxBackend::AmdIntel) | Some(LinuxBackend::Vulkan) => vulkan_csc,
         // CPU frames: the capturer composites the metadata cursor inline before the encoder
         // runs, but the ENCODER blends nothing — the cursor channel's on-demand composite
         // contract can't be honored. Report the encoder's truth.
@@ -2081,58 +2089,32 @@ mod tests {
             Some(Pyrowave),
             false,
             false,
-            false,
             false
         ));
         // NVIDIA: only the direct-SDK arm blends (VkSlotBlend), and only for CUDA payloads.
-        assert!(cursor_blend_capable_for(
-            Some(Nvenc),
-            true,
-            false,
-            true,
-            false
-        ));
+        assert!(cursor_blend_capable_for(Some(Nvenc), true, true, false));
         assert!(
-            !cursor_blend_capable_for(Some(Nvenc), false, false, true, false),
+            !cursor_blend_capable_for(Some(Nvenc), false, true, false),
             "a CPU payload stays on libav NVENC, which cannot blend"
         );
         assert!(
-            !cursor_blend_capable_for(Some(Nvenc), true, false, false, false),
+            !cursor_blend_capable_for(Some(Nvenc), true, false, false),
             "PUNKTFUNK_NVENC_DIRECT=0 (or a build without the feature) is the libav path"
         );
-        // AMD/Intel: the Vulkan Video compute-CSC arm blends; VAAPI never does.
-        assert!(cursor_blend_capable_for(
-            Some(AmdIntel),
-            false,
-            false,
-            false,
-            true
-        ));
+        // AMD/Intel: the Vulkan Video compute-CSC arm blends — at 8 AND 10 bits, since its CSC
+        // has a BT.2020 Main10 variant. VAAPI never does. The depth term lives in `vulkan_csc`
+        // (10-bit AV1 is the one combination that still falls through to VAAPI), so this arm is
+        // now exactly "did an eligible CSC arm resolve".
+        assert!(cursor_blend_capable_for(Some(AmdIntel), false, false, true));
         assert!(
-            !cursor_blend_capable_for(Some(AmdIntel), false, false, false, false),
+            !cursor_blend_capable_for(Some(AmdIntel), false, false, false),
             "no eligible Vulkan CSC arm (H.264, PUNKTFUNK_VULKAN_ENCODE=0, unsupported \
              device) resolves to libav VAAPI, which cannot blend"
         );
-        assert!(
-            !cursor_blend_capable_for(Some(AmdIntel), false, true, false, true),
-            "a 10-bit HDR session skips Vulkan Video for VAAPI's P010 wiring — no blend"
-        );
-        assert!(cursor_blend_capable_for(
-            Some(Vulkan),
-            false,
-            false,
-            false,
-            true
-        ));
+        assert!(cursor_blend_capable_for(Some(Vulkan), false, false, true));
         // Software / unknown pref: CPU frames; the encoder blends nothing.
-        assert!(!cursor_blend_capable_for(
-            Some(Software),
-            false,
-            false,
-            true,
-            true
-        ));
-        assert!(!cursor_blend_capable_for(None, false, false, true, true));
+        assert!(!cursor_blend_capable_for(Some(Software), false, true, true));
+        assert!(!cursor_blend_capable_for(None, false, true, true));
     }
 
     /// WP7.7 guard (the cheap half): every `Encoder` trait method must be explicitly forwarded by

@@ -4,8 +4,10 @@
 //! slot (no IDR): HEVC via an explicit short-term RPS, AV1 via `ref_frame_idx` + a
 //! `primary_ref_frame = NONE` recovery anchor that also breaks the CDF chain.
 //!
-//! Capture delivers packed RGB (dmabuf/CPU); this backend imports it, runs an on-GPU RGB→NV12
-//! BT.709 compute CSC, then encodes. Proven end-to-end in `punktfunk-planning/design/vkenc-probe-harness`.
+//! Capture delivers packed RGB (dmabuf/CPU); this backend imports it, runs an on-GPU RGB→4:2:0
+//! compute CSC, then encodes — 8-bit BT.709 for an SDR session (`rgb2yuv.comp`), 10-bit BT.2020
+//! for an HDR one (`rgb2yuv10.comp` + an HEVC Main10 session; a 10-bit AV1 session is routed to
+//! VAAPI instead). Proven end-to-end in `punktfunk-planning/design/vkenc-probe-harness`.
 //! Opt-in via `PUNKTFUNK_VULKAN_ENCODE`; gated to HEVC/AV1 + a device that advertises the encode op.
 //! The AV1 encode structs our pinned `ash 0.38` predates are vendored in `vk_av1_encode.rs`.
 #![allow(clippy::too_many_arguments)]
@@ -23,12 +25,31 @@ use std::ffi::c_void;
 use std::os::fd::AsRawFd;
 
 const NV12: vk::Format = vk::Format::G8_B8R8_2PLANE_420_UNORM;
+/// The 10-bit 4:2:0 picture/DPB format an HDR (HEVC Main10) session encodes from. `3PACK16`
+/// stores each 10-bit sample in the HIGH bits of a 16-bit word — see `rgb2yuv10.comp`, whose
+/// scratch planes are the size-compatible `R16`/`RG16` this gets `vkCmdCopyImage`d from.
+const P010: vk::Format = vk::Format::G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16;
+
+/// The session's 4:2:0 picture + DPB format for its bit depth. One function so the session
+/// create-info, the DPB image, its views and the per-frame encode source cannot drift apart —
+/// they must all name the SAME format or session creation fails.
+const fn yuv_format(hdr: bool) -> vk::Format {
+    if hdr {
+        P010
+    } else {
+        NV12
+    }
+}
 /// Max resident dmabuf imports (comfortably above any PipeWire pool depth; imports alias existing
 /// buffers so this holds handles, not new allocations).
 const IMPORT_CACHE_CAP: usize = 16;
 // Prebuilt SPIR-V for the RGB→NV12 BT.709 compute CSC. Source is `rgb2yuv.comp` beside this file;
 // regenerate with `glslangValidator -V rgb2yuv.comp -o rgb2yuv.spv` after editing the shader.
 const CSC_SPV: &[u8] = include_bytes!("rgb2yuv.spv");
+/// The 10-bit HDR twin (`rgb2yuv10.comp`): packed 2:10:10:10 PQ/BT.2020 RGB → 10-bit 4:2:0,
+/// BT.2020 NCL limited. Separate module rather than a spec constant because a shader's storage
+/// image FORMAT (`r8`/`rg8` vs `r16`/`rg16`) is part of its layout, not specializable.
+const CSC10_SPV: &[u8] = include_bytes!("rgb2yuv10.spv");
 /// Fixed cursor-overlay texture size (px). Larger than any real pointer; the actual `w×h` uploads
 /// into the top-left and the shader's push constant bounds sampling, so one allocation fits every
 /// cursor and no per-size recreation is needed. See the CSC shader's `cursorTex`/push constant.
@@ -463,6 +484,9 @@ struct Frame {
     uv_img: vk::Image,
     uv_mem: vk::DeviceMemory,
     uv_view: vk::ImageView,
+    /// The CSC's output picture and this frame's encode source: NV12, or the 10-bit
+    /// `P010`/3PACK16 twin on an HDR session ([`yuv_format`]). The name predates the second
+    /// depth; every use goes through the format the session was created with.
     nv12_src: vk::Image,
     nv12_mem: vk::DeviceMemory,
     nv12_view: vk::ImageView,
@@ -669,16 +693,30 @@ impl VulkanVideoEncoder {
         cursor_blend: bool,
     ) -> Result<Self> {
         let native_nv12 = format == PixelFormat::Nv12;
-        // A cursor-blend session must keep the compute-CSC path — the only arm with the cursor
-        // blend — so it outranks an explicit RGB-direct pin (EFC cannot composite; the
-        // negotiation promised the client a composited pointer).
-        if cursor_blend && rgb_request() == Some(true) {
-            tracing::info!(
-                "PUNKTFUNK_VULKAN_RGB_DIRECT=1 ignored for this session — it composites the \
-                 pointer, which the EFC front-end cannot; using the compute-CSC path"
+        // HDR: a packed 10-bit PQ/BT.2020 capture (a gamescope output off our `pipewire-hdr`
+        // build) encodes HEVC Main10 through the 10-bit compute CSC. HEVC only — AV1 10-bit
+        // encode has far thinner driver coverage, and `open_amd_intel` keeps those sessions on
+        // libav VAAPI rather than gambling a session open on it.
+        let hdr = format.is_hdr_rgb10();
+        if hdr && codec != Codec::H265 {
+            bail!(
+                "vulkan-encode: 10-bit HDR is HEVC Main10 only here (got {codec:?}) — the \
+                 dispatcher should have routed this session to VAAPI"
             );
         }
-        let want_rgb = !native_nv12 && !cursor_blend && rgb_request().unwrap_or(true);
+        // A cursor-blend session must keep the compute-CSC path — the only arm with the cursor
+        // blend — so it outranks an explicit RGB-direct pin (EFC cannot composite; the
+        // negotiation promised the client a composited pointer). HDR pins the same arm for a
+        // different reason: the EFC's fixed-function conversion is 8-bit BT.709 narrow with no
+        // knob for BT.2020, so it cannot express this session's colourimetry at all.
+        if (cursor_blend || hdr) && rgb_request() == Some(true) {
+            tracing::info!(
+                hdr,
+                "PUNKTFUNK_VULKAN_RGB_DIRECT=1 ignored for this session — the EFC front-end can \
+                 neither composite a pointer nor convert BT.2020 10-bit; using the compute-CSC path"
+            );
+        }
+        let want_rgb = !native_nv12 && !cursor_blend && !hdr && rgb_request().unwrap_or(true);
         Self::open_opts_inner(
             codec,
             width,
@@ -687,6 +725,7 @@ impl VulkanVideoEncoder {
             bitrate_bps,
             want_rgb,
             native_nv12,
+            hdr,
         )
     }
 
@@ -704,9 +743,19 @@ impl VulkanVideoEncoder {
         bitrate_bps: u64,
         want_rgb: bool,
     ) -> Result<Self> {
-        Self::open_opts_inner(codec, width, height, fps, bitrate_bps, want_rgb, false)
+        Self::open_opts_inner(
+            codec,
+            width,
+            height,
+            fps,
+            bitrate_bps,
+            want_rgb,
+            false,
+            false,
+        )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn open_opts_inner(
         codec: Codec,
         width: u32,
@@ -715,6 +764,7 @@ impl VulkanVideoEncoder {
         bitrate_bps: u64,
         want_rgb: bool,
         native_nv12: bool,
+        hdr: bool,
     ) -> Result<Self> {
         if !matches!(codec, Codec::H265 | Codec::Av1) {
             bail!("vulkan-encode backend supports HEVC + AV1 only (got {codec:?})");
@@ -737,6 +787,7 @@ impl VulkanVideoEncoder {
                 bitrate_bps.max(1_000_000),
                 want_rgb,
                 native_nv12,
+                hdr,
             )
         }
     }
@@ -752,6 +803,8 @@ impl VulkanVideoEncoder {
         bitrate: u64,
         want_rgb: bool,
         native_nv12: bool,
+        // NOT `hdr`: this fn already binds that name to the parameter-set HEADER bytes below.
+        ten_bit: bool,
     ) -> Result<Self> {
         use super::vk_av1_encode as av1b;
         use super::vk_valve_rgb as vrgb;
@@ -871,8 +924,12 @@ impl VulkanVideoEncoder {
             p_next: std::ptr::null(),
             perform_encode_rgb_conversion: vk::TRUE,
         };
-        let mut h265_profile = vk::VideoEncodeH265ProfileInfoKHR::default()
-            .std_profile_idc(vk::native::StdVideoH265ProfileIdc_STD_VIDEO_H265_PROFILE_IDC_MAIN);
+        let mut h265_profile =
+            vk::VideoEncodeH265ProfileInfoKHR::default().std_profile_idc(if ten_bit {
+                vk::native::StdVideoH265ProfileIdc_STD_VIDEO_H265_PROFILE_IDC_MAIN_10
+            } else {
+                vk::native::StdVideoH265ProfileIdc_STD_VIDEO_H265_PROFILE_IDC_MAIN
+            });
         let mut av1_profile = av1b::VideoEncodeAV1ProfileInfoKHR {
             s_type: av1b::stype(av1b::ST_PROFILE_INFO),
             p_next: std::ptr::null(),
@@ -885,11 +942,20 @@ impl VulkanVideoEncoder {
         if rgb_cfg.is_some() {
             usage.p_next = &rgb_info as *const _ as *const c_void;
         }
+        // A device that cannot encode 10-bit fails `get_physical_device_video_capabilities`
+        // below with VIDEO_PROFILE_FORMAT_NOT_SUPPORTED, which fails the open — and a failed
+        // Vulkan open falls back to libav VAAPI in `open_amd_intel`. That is the whole 10-bit
+        // capability gate: no separate probe, and no way to reach a half-configured session.
+        let depth = if ten_bit {
+            vk::VideoComponentBitDepthFlagsKHR::TYPE_10
+        } else {
+            vk::VideoComponentBitDepthFlagsKHR::TYPE_8
+        };
         let mut profile = vk::VideoProfileInfoKHR::default()
             .video_codec_operation(codec_op)
             .chroma_subsampling(vk::VideoChromaSubsamplingFlagsKHR::TYPE_420)
-            .luma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8)
-            .chroma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8);
+            .luma_bit_depth(depth)
+            .chroma_bit_depth(depth);
         if av1 {
             av1_profile.p_next = &usage as *const _ as *const c_void;
             profile.p_next = &av1_profile as *const _ as *const c_void;
@@ -1120,13 +1186,13 @@ impl VulkanVideoEncoder {
             .picture_format(if rgb_cfg.is_some() {
                 vk::Format::B8G8R8A8_UNORM
             } else {
-                NV12
+                yuv_format(ten_bit)
             })
             .max_coded_extent(vk::Extent2D {
                 width: w,
                 height: h,
             })
-            .reference_picture_format(NV12)
+            .reference_picture_format(yuv_format(ten_bit))
             .max_dpb_slots(DPB_SLOTS + 1)
             .max_active_reference_pictures(1)
             .std_header_version(&std_hdr);
@@ -1236,6 +1302,7 @@ impl VulkanVideoEncoder {
                 rw,
                 rh,
                 quality_level,
+                ten_bit,
             )?;
             (p, hdr, Vec::new())
         };
@@ -1247,7 +1314,7 @@ impl VulkanVideoEncoder {
         let (dpb_image, dpb_mem) = make_video_image(
             &device,
             &mem_props,
-            NV12,
+            yuv_format(ten_bit),
             w,
             h,
             DPB_SLOTS,
@@ -1260,7 +1327,7 @@ impl VulkanVideoEncoder {
         for slot in 0..DPB_SLOTS {
             guard
                 .dpb_views
-                .push(make_view(&device, dpb_image, NV12, slot)?);
+                .push(make_view(&device, dpb_image, yuv_format(ten_bit), slot)?);
         }
 
         // NV12 encode-src, CSC scratch (Y/UV), bitstream, query and command buffers are all per
@@ -1281,7 +1348,11 @@ impl VulkanVideoEncoder {
             None,
         )?;
         guard.sampler = sampler;
-        let spv = ash::util::read_spv(&mut std::io::Cursor::new(CSC_SPV))?;
+        let spv = ash::util::read_spv(&mut std::io::Cursor::new(if ten_bit {
+            CSC10_SPV
+        } else {
+            CSC_SPV
+        }))?;
         let shader =
             device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&spv), None)?;
         guard.shader = shader;
@@ -1396,6 +1467,7 @@ impl VulkanVideoEncoder {
                     .as_ref()
                     .is_some_and(|c| c.padded)
                     .then_some(vk::Format::B8G8R8A8_UNORM),
+                ten_bit,
                 guard.frames.last_mut().expect("frame just pushed"),
             )?;
         }
