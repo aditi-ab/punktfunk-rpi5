@@ -744,12 +744,23 @@ struct DmabufInner {
     // so freed all four ahead of ffmpeg-next dropping the encoder. Every one of these holds its own
     // reference, so refcounting makes any order sound; the point is that a field reorder must not
     // silently change what ships. Do not move `enc`, and do not reorder the four below it.
+    /// The filter graph. Owner-only: `src`/`sink` below are borrowed filter contexts the graph owns,
+    /// and everything per-frame goes through those, so nothing reads this field again — it exists so
+    /// the graph outlives them and is freed exactly once. (`dead_code` answered here rather than by
+    /// removing the field, which would free the graph while `src`/`sink` still point into it.)
+    #[allow(dead_code)]
     graph: AvFilterGraph,
-    /// DRM-PRIME frames context for the imported dmabufs (buffersrc input).
+    /// DRM-PRIME frames context for the imported dmabufs (buffersrc input). Read per frame by
+    /// `submit`, which tags each imported `AVFrame` with a new ref of it.
     drm_frames: AvBuffer,
-    /// VAAPI device driving `hwmap`/`scale_vaapi`/the encoder.
+    /// VAAPI device driving `hwmap`/`scale_vaapi`/the encoder. Owner-only: the two filters and the
+    /// encoder each took their own ref at open, so nothing reads it again — it keeps the device
+    /// alive behind them.
+    #[allow(dead_code)]
     vaapi_device: AvBuffer,
     /// DRM device the source dmabuf frames reference (the buffersrc's `hw_frames_ctx` device).
+    /// Owner-only for the same reason: `drm_frames` holds its own ref on it.
+    #[allow(dead_code)]
     drm_device: AvBuffer,
     src: *mut ffi::AVFilterContext,
     sink: *mut ffi::AVFilterContext,
@@ -1347,6 +1358,42 @@ impl Encoder for VaapiEncoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Construct/drop `DmabufInner` repeatedly on real VAAPI silicon.
+    ///
+    /// This is the heaviest ownership change in the crate and the one with no other coverage.
+    /// `open` builds four owned objects — a DRM device, a VAAPI device derived from it, a DRM-PRIME
+    /// frames context, and a filter graph — and each of its eight failure branches used to unwind
+    /// them by hand, the same four-line block copied eight times (once inside a macro) plus a ninth
+    /// copy in `Drop`. All of that is now `AvBuffer`/`AvFilterGraph` field drops in declaration
+    /// order, so *construct and drop* is the entire contract. Looping is what separates the
+    /// outcomes: a double-free trips glibc, a missed one leaks a VAAPI device, a DRM device and a
+    /// whole filter graph per iteration.
+    ///
+    /// `vaapi_cpu_encode_smoke` does NOT cover this — it drives the swscale/CPU-upload path, which
+    /// uses `VaapiHw` and never builds a graph.
+    ///
+    /// `#[ignore]`d (needs a real VAAPI device):
+    /// `cargo test -p pf-encode dmabuf_inner_alloc_drop_cycles -- --ignored --nocapture`
+    /// ⚠️ Inside a distrobox on an immutable host, also set
+    /// `LIBVA_DRIVERS_PATH=/run/host/usr/lib64/dri` — the container's own mesa is typically older
+    /// than the host kernel's amdgpu and fails every encoder open with a bare ENOSYS.
+    #[test]
+    #[ignore = "needs a real VAAPI device (run on an AMD/Intel host, not the build box)"]
+    fn dmabuf_inner_alloc_drop_cycles() {
+        for i in 0..8 {
+            let inner = DmabufInner::open(Codec::H264, PixelFormat::Bgrx, 640, 480, 30, 8_000_000)
+                .unwrap_or_else(|e| panic!("DmabufInner::open failed on iteration {i}: {e:#}"));
+            assert!(!inner.graph.as_ptr().is_null(), "graph went null");
+            assert!(!inner.drm_frames.as_ptr().is_null(), "drm_frames went null");
+            assert!(
+                !inner.vaapi_device.as_ptr().is_null(),
+                "vaapi_device went null"
+            );
+            assert!(!inner.drm_device.as_ptr().is_null(), "drm_device went null");
+        }
+        eprintln!("8 DmabufInner alloc/drop cycles completed without abort");
+    }
 
     /// The operator pin tries exactly one mode; a cached resolution ([`LP_MODE`]) tries only the
     /// mode that worked; anything else runs the full ladder, full-feature FIRST — AMD's first-try
