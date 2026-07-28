@@ -78,8 +78,15 @@ impl Drop for AvBuffer {
 /// of eight failure branches — a four-line cleanup block copied eight times, once inside a macro.
 /// Freeing the graph is the same ownership question as unref'ing a buffer, so it gets the same
 /// answer.
+///
+/// Linux-only: the VAAPI dmabuf path is the sole filter-graph user in this crate. The Windows
+/// AMF/QSV backends feed the encoder directly and build no graph, so on Windows this type would be
+/// dead code — cfg'd out rather than `allow`ed, because "nothing here uses it" is the honest
+/// statement and an `allow` would keep it compiling after it stopped being true anywhere.
+#[cfg(target_os = "linux")]
 pub(crate) struct AvFilterGraph(*mut ffi::AVFilterGraph);
 
+#[cfg(target_os = "linux")]
 impl AvFilterGraph {
     /// Allocate a filter graph, rejecting the null `avfilter_graph_alloc` returns on OOM.
     ///
@@ -99,6 +106,7 @@ impl AvFilterGraph {
     }
 }
 
+#[cfg(target_os = "linux")]
 impl Drop for AvFilterGraph {
     fn drop(&mut self) {
         // SAFETY: `self.0` is the non-null graph `alloc` took ownership of, and this type is its

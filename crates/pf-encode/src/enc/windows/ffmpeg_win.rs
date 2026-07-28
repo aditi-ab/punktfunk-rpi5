@@ -1443,6 +1443,57 @@ impl Encoder for FfmpegWinEncoder {
 mod tests {
     use super::*;
 
+    /// Construct/drop `ZeroCopyInner` on the QSV path, repeatedly, on real Intel silicon.
+    ///
+    /// This is the one path in the crate where ownership was genuinely ambiguous: `open` builds a
+    /// `D3d11Hw` (D3D11VA device + frames pair) and then DERIVES a QSV device + frames ctx from it,
+    /// and the tuple it used to return handed those two derived pointers out **twice** — once as
+    /// the encoder's `dev_ref`/`frames_ref`, once as the pair moved into `Self`. Harmless while they
+    /// were raw pointers; two owners once they are `AvBuffer`. Looping construct/drop is what tells
+    /// the difference apart: a double-unref aborts inside the CRT, a missed one leaks an Intel
+    /// device per session.
+    ///
+    /// Nothing else reaches it. `zerocopy_enabled` defaults QSV **off**, so the normal encode path
+    /// never builds one on Intel, and the native VPL backend (`enc/windows/qsv.rs`) supersedes this
+    /// whole file unless `PUNKTFUNK_QSV_FFMPEG=1`. Calling `open` directly sidesteps both gates so
+    /// the ownership itself is what gets exercised.
+    ///
+    /// `#[ignore]`d (needs a real Intel QSV device):
+    /// `cargo test -p pf-encode --features amf-qsv zerocopy_qsv_alloc_drop_cycles -- --ignored --nocapture`
+    #[test]
+    #[ignore = "needs a real Intel QSV device (run on an Intel host, not the build box)"]
+    fn zerocopy_qsv_alloc_drop_cycles() {
+        use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1};
+        // SAFETY: `CreateDXGIFactory1`/`EnumAdapters1` are the documented enumeration pair and are
+        // checked here; `make_device` requires a live `IDXGIAdapter1`, which `adapter` is for the
+        // duration of the call (it outlives it as a local). The returned device is the sole owner of
+        // its COM object and outlives every `ZeroCopyInner` built from it below.
+        let (device, _ctx) = unsafe {
+            let factory: IDXGIFactory1 = CreateDXGIFactory1().expect("CreateDXGIFactory1");
+            let adapter = factory.EnumAdapters1(0).expect("EnumAdapters1(0)");
+            pf_frame::dxgi::make_device(&adapter).expect("D3D11 device on adapter 0")
+        };
+        for i in 0..8 {
+            let zc = ZeroCopyInner::open(
+                WinVendor::Qsv,
+                Codec::H264,
+                PixelFormat::Bgrx,
+                640,
+                480,
+                30,
+                8_000_000,
+                8,
+                &device,
+            )
+            .unwrap_or_else(|e| panic!("ZeroCopyInner::open(QSV) failed on iteration {i}: {e:#}"));
+            // The QSV arm must have derived BOTH halves — an `Option` that came back `None` here
+            // would mean the AMF branch was taken and the derived-pair ownership never ran.
+            assert!(zc.qsv_frames.is_some(), "QSV path derived no frames ctx");
+            assert!(zc.qsv_device.is_some(), "QSV path derived no device");
+        }
+        eprintln!("8 ZeroCopyInner(QSV) alloc/drop cycles completed without abort");
+    }
+
     /// Zero-copy default matrix: the operator override wins in both directions; unset resolves
     /// AMF on (on-glass validated) and QSV off (opt-in until validated on Intel glass — the
     /// probe-never-assume rule).
