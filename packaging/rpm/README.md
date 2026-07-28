@@ -52,6 +52,16 @@ The public key is served from the registry (the `gpgkey=` URL above) and committ
 `packaging/rpm/RPM-GPG-KEY-punktfunk`. (This is a GPG/OpenPGP key — a `step-ca`/X.509 cert can't
 sign RPMs; step-ca is only for registry/console TLS.)
 
+> `RPM_GPG_PRIVATE_KEY` is an **org-level** secret on `unom`, not a repo secret — it will not show
+> up under this repository's Actions secrets. Verify it end to end instead of by its absence there:
+> `curl -O <repo-url>/package/punktfunk-web/<ver>/x86_64/…rpm && rpm -qp --qf '%{RSAHEADER:pgpsig}\n'`
+> (or `rpmkeys --checksig`, which reports `NOKEY` until you import the public key — `NOKEY` still
+> means *signed*, just by a key that box doesn't have yet).
+
+On a `v*` tag build, a missing key **fails** the build: `sign-rpms.sh` will not publish unsigned
+RPMs into a repo whose own instructions say `gpgcheck=1`, because every user's `dnf upgrade` would
+then break on them. Non-release builds still fall through unsigned so forks and local builds work.
+
 How it was set up (and how to rotate the key):
 
 ```sh
@@ -68,8 +78,9 @@ EOF
 gpg --armor --export-secret-keys packages@unom.io   # -> the RPM_GPG_PRIVATE_KEY CI secret
 gpg --armor --export             packages@unom.io > packaging/rpm/RPM-GPG-KEY-punktfunk  # public half
 
-# 2. Add the armored PRIVATE key as the RPM_GPG_PRIVATE_KEY Gitea Actions secret. Commit the public
-#    half and publish it to the registry so the gpgkey= URL resolves:
+# 2. Add the armored PRIVATE key as the RPM_GPG_PRIVATE_KEY Gitea Actions secret, at the ORG level
+#    (git.unom.io/org/unom/settings/actions/secrets) so every repo's workflows inherit it. Commit
+#    the public half and publish it to the registry so the gpgkey= URL resolves:
 curl --user "<user>:<write:package-PAT>" --upload-file packaging/rpm/RPM-GPG-KEY-punktfunk \
   https://git.unom.io/api/packages/unom/generic/punktfunk-keys/1/RPM-GPG-KEY-punktfunk
 ```

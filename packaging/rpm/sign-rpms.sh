@@ -1,9 +1,16 @@
 #!/usr/bin/env bash
 # Detached-GPG-sign the built dist/*.rpm so the Gitea RPM registry can be served with gpgcheck=1.
 #
-# DORMANT by default: if RPM_GPG_PRIVATE_KEY is unset this exits 0 and leaves the RPMs unsigned —
-# exactly today's behaviour — so it is SAFE to ship before a key exists. The signing only activates
-# once you add the key as a CI secret (see packaging/rpm/README.md "Enabling per-package signing").
+# ACTIVE: RPM_GPG_PRIVATE_KEY is set as an ORG-level secret on `unom` (packages@unom.io,
+# AF245C506F4E4763 — the public half is committed at packaging/rpm/RPM-GPG-KEY-punktfunk and served
+# from the registry). Every published RPM carries its EdDSA header signature; the repo file in
+# README.md tells users gpgcheck=1, which only works because of that.
+#
+# Without the key this exits 0 and leaves the RPMs unsigned, so a fork or a local build still works
+# — but NOT on a release. On refs/tags/v* a missing key is a hard failure: an org secret that got
+# rotated, renamed, or not inherited would otherwise publish an unsigned release into a repo whose
+# own instructions say gpgcheck=1, and every user's `dnf upgrade` would break on it. Better to fail
+# the build than to find out from users. (Same fail-closed rule as the Windows pack scripts.)
 #
 # Requires a DEDICATED, PASSPHRASE-LESS signing key (the one the runbook generates with
 # %no-protection), distinct from the Gitea instance's repo-metadata key — rpm's default signer
@@ -13,7 +20,13 @@
 set -euo pipefail
 
 if [ -z "${RPM_GPG_PRIVATE_KEY:-}" ]; then
-  echo "RPM_GPG_PRIVATE_KEY unset — leaving dist/*.rpm UNSIGNED (registry stays gpgcheck=0)."
+  case "${GITHUB_REF:-}" in
+    refs/tags/v*)
+      echo "RPM_GPG_PRIVATE_KEY unset on a release build (${GITHUB_REF}) — refusing to publish" >&2
+      echo "unsigned RPMs into a gpgcheck=1 repo. Restore the org secret (packaging/rpm/README.md)." >&2
+      exit 1 ;;
+  esac
+  echo "RPM_GPG_PRIVATE_KEY unset — leaving dist/*.rpm UNSIGNED (non-release build)."
   exit 0
 fi
 

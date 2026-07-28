@@ -110,7 +110,9 @@ jobs:
         # Recommends both). Both need bun (ensured in Prep).
         run: PF_VERSION="$PF_VERSION" PF_RELEASE="$PF_RELEASE" PF_WITH_WEB=1 PF_WITH_SCRIPTING=1 bash packaging/rpm/build-rpm.sh
 
-      - name: Sign RPMs (dormant until RPM_GPG_PRIVATE_KEY is set — see packaging/rpm/README.md)
+      # Signs with packages@unom.io (org secret) and self-verifies before publish. On a v* tag a
+      # missing key FAILS the build rather than publishing unsigned RPMs into a gpgcheck=1 repo.
+      - name: Sign RPMs
         env:
           RPM_GPG_PRIVATE_KEY: ${{ secrets.RPM_GPG_PRIVATE_KEY }}
           RPM_GPG_PASSPHRASE: ${{ secrets.RPM_GPG_PASSPHRASE }}
