@@ -53,6 +53,7 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.LifecycleOwner
 import io.unom.punktfunk.components.EmptyHostsState
 import io.unom.punktfunk.components.HostCard
+import io.unom.punktfunk.components.HostMenuItem
 import io.unom.punktfunk.components.SectionLabel
 import io.unom.punktfunk.kit.Gamepad
 import io.unom.punktfunk.kit.NativeBridge
@@ -196,6 +197,11 @@ fun ConnectScreen(
     val identityStore = remember { IdentityStore(context) }
     val knownHostStore = remember { KnownHostStore(context) }
     var savedHosts by remember { mutableStateOf(knownHostStore.all()) }
+    // The settings-profile catalog. Read here (not in the settings screen's copy) because this is
+    // where profiles are USED: to resolve what a tap connects with, to offer the one-offs, and to
+    // render the pinned cards. Re-read on entry, since Settings may have changed it in between.
+    val profileStore = remember { ProfileStore(context) }
+    var profiles by remember { mutableStateOf(profileStore.all()) }
     // Wakes a sleeping saved host and waits for it to reappear on mDNS before dialing (its overlay
     // rides over both the touch and console home). Fire-and-forget WoL isn't enough — a cold boot can
     // take a minute-plus to advertise again.
@@ -268,21 +274,41 @@ fun ConnectScreen(
 
     // Issue the native connect (shared by the normal connect and the request-access path). A plain
     // desktop connect (no library launch) — the library launcher calls [connectToHost] with an id.
-    suspend fun connectNative(id: ClientIdentity, targetHost: String, targetPort: Int, pinHex: String, timeoutMs: Int): Long =
-        connectToHost(context, settings, id, targetHost, targetPort, pinHex, launch = null, timeoutMs = timeoutMs)
+    suspend fun connectNative(
+        id: ClientIdentity,
+        targetHost: String,
+        targetPort: Int,
+        pinHex: String,
+        timeoutMs: Int,
+        profile: StreamProfile?,
+    ): Long = connectToHost(
+        context, settings.effectiveFor(profile), id, targetHost, targetPort, pinHex,
+        launch = null, timeoutMs = timeoutMs,
+    )
 
     // What the stream screen is handed: the settings this connect actually used, plus the HOST's
     // clipboard decision (a property of the record, not a global). A host we never saved — a
     // connect that failed to pin — falls back to the on default the setting always had.
-    fun session(handle: Long, record: KnownHost?) =
-        ActiveSession(handle, settings, clipboardSync = record?.clipboardSync ?: true)
+    fun session(handle: Long, record: KnownHost?, profile: StreamProfile?) = ActiveSession(
+        handle,
+        settings.effectiveFor(profile),
+        clipboardSync = record?.clipboardSync ?: true,
+        profileName = profile?.name,
+    )
 
     // The actual dial (identity already ready). On a TOFU connect (pinHex null), pin the fingerprint
     // the host presented (as an unpaired known host) so the next connect goes straight through and it
     // appears in the saved-hosts list. [onFailure], when set, takes over a failed dial (the wake-wait
     // fallback) instead of the error status line — discovery is already restarted when it runs, so
     // the wait can observe the host reappear.
-    fun doConnectDirect(targetHost: String, targetPort: Int, name: String, pinHex: String?, onFailure: (() -> Unit)? = null) {
+    fun doConnectDirect(
+        targetHost: String,
+        targetPort: Int,
+        name: String,
+        pinHex: String?,
+        profile: StreamProfile?,
+        onFailure: (() -> Unit)? = null,
+    ) {
         val id = identity ?: run {
             status = "Identity not ready yet — try again in a moment"
             return
@@ -293,7 +319,7 @@ fun ConnectScreen(
         status = null
         discovery.stop() // free the Wi-Fi radio before the stream session
         scope.launch {
-            val handle = connectNative(id, targetHost, targetPort, pinHex ?: "", CONNECT_TIMEOUT_MS)
+            val handle = connectNative(id, targetHost, targetPort, pinHex ?: "", CONNECT_TIMEOUT_MS, profile)
             // Cancelled mid-dial: the UI's already been returned (and discovery restarted) by
             // cancelConnect — drop the just-opened session silently rather than navigating into it.
             if (thisAttempt.cancelled.get()) {
@@ -310,7 +336,7 @@ fun ConnectScreen(
                         record = knownHostStore.trust(targetHost, targetPort, name, fp, paired = false)
                     }
                 }
-                onConnected(session(handle, record))
+                onConnected(session(handle, record, profile))
             } else {
                 discovery.start()
                 val token = NativeBridge.nativeTakeLastError()
@@ -347,12 +373,15 @@ fun ConnectScreen(
     // only a FAILED dial falls into the wake-and-WAIT-for-mDNS flow (WakeController's "Waking…"
     // overlay), which redials once the host reappears. Otherwise (auto-wake off, no MAC, or already
     // seen live) dial straight through.
-    fun doConnect(targetHost: String, targetPort: Int, name: String, pinHex: String?) {
+    fun doConnect(targetHost: String, targetPort: Int, name: String, pinHex: String?, oneOffProfile: String?) {
         if (identity == null) {
             status = "Identity not ready yet — try again in a moment"
             return
         }
         val kh = knownHostStore.get(targetHost, targetPort)
+        // Latched here, not per dial attempt: a wake-and-redial must stream with the same profile
+        // the user asked for, and the "applies from the next session" footers stay truthful.
+        val profile = profileStore.resolveFor(kh, oneOffProfile)
         val macs = kh?.mac ?: emptyList()
         // "Up" = a live advert that is THIS host — matched by fingerprint first (so it survives a DHCP
         // address change on a cold boot), else by address:port. Returns the CURRENT advert so we can
@@ -363,7 +392,7 @@ fun ConnectScreen(
         if (settings.autoWakeEnabled && macs.isNotEmpty() && liveAdvert() == null) {
             // Fire-and-forget first packet (harmless if it's awake), then dial-first.
             scope.launch(Dispatchers.IO) { NativeBridge.nativeWakeOnLan(macs.joinToString(","), targetHost) }
-            doConnectDirect(targetHost, targetPort, name, pinHex, onFailure = {
+            doConnectDirect(targetHost, targetPort, name, pinHex, profile, onFailure = {
                 waker.start(
                     hostName = name,
                     connectsAfter = true,
@@ -379,12 +408,12 @@ fun ConnectScreen(
                             knownHostStore.save(kh.copy(address = live.host, port = live.port))
                             savedHosts = knownHostStore.all()
                         }
-                        doConnectDirect(live?.host ?: targetHost, live?.port ?: targetPort, name, pinHex)
+                        doConnectDirect(live?.host ?: targetHost, live?.port ?: targetPort, name, pinHex, profile)
                     },
                 )
             })
         } else {
-            doConnectDirect(targetHost, targetPort, name, pinHex)
+            doConnectDirect(targetHost, targetPort, name, pinHex, profile)
         }
     }
 
@@ -409,7 +438,9 @@ fun ConnectScreen(
             // Pin the advertised fingerprint for a discovered host (defence against an impostor while
             // we wait); a manually-typed host has none, so trust-on-first-use.
             val pinHex = target.advertisedFp ?: ""
-            val handle = connectNative(id, target.host, target.port, pinHex, REQUEST_ACCESS_TIMEOUT_MS)
+            // A host being trusted for the first time can't have a binding yet, so this is always
+            // the plain defaults — a profile only ever enters via a later, deliberate choice.
+            val handle = connectNative(id, target.host, target.port, pinHex, REQUEST_ACCESS_TIMEOUT_MS, null)
             // Cancelled while we were parked: tear the (possibly just-approved) session down and
             // don't touch UI a fresh action may now own.
             if (req.cancelled.get()) {
@@ -427,7 +458,7 @@ fun ConnectScreen(
                     record = knownHostStore.trust(target.host, target.port, target.name, fp, paired = true)
                     savedHosts = knownHostStore.all()
                 }
-                onConnected(session(handle, record))
+                onConnected(session(handle, record, profile = null))
             } else {
                 // Cause-specific: an operator denial, an approval timeout, and a request that
                 // never reached the host are different problems with different fixes.
@@ -450,6 +481,10 @@ fun ConnectScreen(
         targetPort: Int,
         dh: DiscoveredHost? = null,
         manualName: String? = null,
+        // A one-off "Connect with ▸" pick. `null` = follow the host's binding (a plain tap);
+        // `""` = force the global defaults, which is a real choice on a bound host and must
+        // therefore survive as a value rather than collapsing into "unset". NEVER rebinds.
+        oneOffProfile: String? = null,
     ) {
         // Every dial/pair path funnels through here — with local network access denied the connect
         // can only EPERM its way to a 10 s timeout, so ask instead of pretending to try.
@@ -465,7 +500,7 @@ fun ConnectScreen(
         when {
             // Known host whose advertised fp still matches the pin → silent pinned reconnect.
             known != null && (adv == null || adv == known.fpHex) ->
-                doConnect(targetHost, targetPort, known.name, known.fpHex)
+                doConnect(targetHost, targetPort, known.name, known.fpHex, oneOffProfile)
             // Known host whose fp changed → force re-pairing (no silent re-trust shortcut).
             known != null -> pendingTrust =
                 PendingTrust(targetHost, targetPort, known.name, adv, PendingTrust.Kind.FP_CHANGED)
@@ -480,6 +515,56 @@ fun ConnectScreen(
         }
     }
 
+    // Toggle a host+profile pin. Presentation only: it never touches the profile itself and never
+    // changes the host's default binding.
+    fun togglePin(kh: KnownHost, profile: StreamProfile) {
+        val pins = if (profile.id in kh.pinnedProfileIds) {
+            kh.pinnedProfileIds - profile.id
+        } else {
+            kh.pinnedProfileIds + profile.id
+        }
+        knownHostStore.save(kh.copy(pinnedProfileIds = pins))
+        savedHosts = knownHostStore.all()
+    }
+
+    // The profile rows a card's overflow menu grows. With no profiles at all it stays empty — a
+    // user who never wants this feature sees no new clutter anywhere but the settings scope chips.
+    // "Connect with" is a ONE-OFF on every card: it never rebinds the host, which is why rebinding
+    // lives in the Edit sheet instead.
+    fun hostMenu(kh: KnownHost, pin: StreamProfile?): List<HostMenuItem> = buildList {
+        if (profiles.isEmpty()) return@buildList
+        if (pin != null) {
+            add(HostMenuItem("Unpin card", startsSection = true) { togglePin(kh, pin) })
+        }
+        add(
+            HostMenuItem("Connect with: Default settings", startsSection = true) {
+                // The empty reference is "force the defaults", not "unset" — on a bound host that
+                // is a real, different action from a plain tap.
+                connect(kh.address, kh.port, oneOffProfile = "")
+            },
+        )
+        profiles.forEach { p ->
+            add(HostMenuItem("Connect with: ${p.name}") { connect(kh.address, kh.port, oneOffProfile = p.id) })
+        }
+        if (pin == null) {
+            profiles.forEachIndexed { i, p ->
+                val pinned = p.id in kh.pinnedProfileIds
+                add(
+                    HostMenuItem(
+                        if (pinned) "Unpin card: ${p.name}" else "Pin as card: ${p.name}",
+                        startsSection = i == 0,
+                    ) { togglePin(kh, p) },
+                )
+            }
+        }
+    }
+
+    // The saved-hosts grid: each host's own card, then one card per profile it has pinned, so a
+    // pinned combination is a plain one-click connect instead of a trip through a menu.
+    val savedCards = savedHosts.flatMap { kh ->
+        listOf(HostCardEntry(kh, null)) + profileStore.pinsFor(kh).map { HostCardEntry(kh, it) }
+    }
+
     var showManualSheet by remember { mutableStateOf(false) }
 
     if (gamepadUi) {
@@ -487,11 +572,15 @@ fun ConnectScreen(
         // every action above; the trailing Add Host tile opens the same manual-entry sheet.
         val tiles = buildList {
             savedHosts.forEach { kh ->
+                val bound = kh.profileId?.let { id -> profiles.firstOrNull { it.id == id } }
                 add(
                     HomeTile(
-                        id = "saved-${kh.address}:${kh.port}",
+                        id = "saved-${kh.id}",
                         title = kh.name,
-                        subtitle = "${kh.address}:${kh.port}",
+                        // The binding is what a press will actually do, so the tile says so — the
+                        // console can't edit profiles, but it must never lie about which one it uses.
+                        subtitle = bound?.let { "${kh.address}:${kh.port} · ${it.name}" }
+                            ?: "${kh.address}:${kh.port}",
                         filled = true,
                         online = kh.isOnline(discovered, reachable),
                         paired = kh.paired,
@@ -499,6 +588,22 @@ fun ConnectScreen(
                         activate = { connect(kh.address, kh.port) },
                     ),
                 )
+                // Pinned host+profile combinations, right after their host: one focus-and-press
+                // each, which is the affordance a controller surface does well (menus are not).
+                profileStore.pinsFor(kh).forEach { p ->
+                    add(
+                        HomeTile(
+                            id = "pin-${kh.id}-${p.id}",
+                            title = kh.name,
+                            subtitle = p.name,
+                            filled = true,
+                            online = kh.isOnline(discovered, reachable),
+                            paired = kh.paired,
+                            knownHost = kh,
+                            activate = { connect(kh.address, kh.port, oneOffProfile = p.id) },
+                        ),
+                    )
+                }
             }
             discoveredUnsaved.forEach { dh ->
                 add(
@@ -621,24 +726,42 @@ fun ConnectScreen(
                 item(span = { GridItemSpan(maxLineSpan) }) {
                     SectionLabel("Saved hosts")
                 }
-                items(savedHosts, key = { "saved-${it.address}-${it.port}" }) { kh ->
+                items(savedCards, key = { it.key }) { entry ->
+                    val kh = entry.host
+                    val pin = entry.pin
+                    val bound = kh.profileId?.let { id -> profiles.firstOrNull { it.id == id } }
                     HostCard(
                         name = kh.name,
                         address = "${kh.address}:${kh.port}",
                         status = if (kh.paired) HostStatus.PAIRED else HostStatus.TOFU,
                         online = kh.isOnline(discovered, reachable),
                         enabled = !connecting,
-                        onConnect = { connect(kh.address, kh.port) },
-                        onForget = {
-                            knownHostStore.remove(kh)
-                            savedHosts = knownHostStore.all()
+                        // A pinned card connects with ITS profile; the host's own card follows the
+                        // binding, which is exactly what its chip says it will do.
+                        onConnect = {
+                            if (pin != null) {
+                                connect(kh.address, kh.port, oneOffProfile = pin.id)
+                            } else {
+                                connect(kh.address, kh.port)
+                            }
                         },
-                        onEdit = { editTarget = kh },
+                        // Edit / Forget / Wake live on the host's own card only: a pinned card is a
+                        // shortcut, not a second host, and offering destructive host actions on it
+                        // would blur exactly that.
+                        onForget = if (pin != null) {
+                            null
+                        } else {
+                            {
+                                knownHostStore.remove(kh)
+                                savedHosts = knownHostStore.all()
+                            }
+                        },
+                        onEdit = if (pin != null) null else ({ editTarget = kh }),
                         // Explicit wake-only: offered when the host is offline and we have a MAC. Runs
                         // through the WakeController so it shows the "Waking…" overlay and waits for
                         // the host to come online (matched by fingerprint, so a new DHCP address on a
                         // cold boot still counts as "up") rather than firing a single silent packet.
-                        onWake = if (kh.mac.isNotEmpty() && !kh.isOnline(discovered, reachable)) {
+                        onWake = if (pin == null && kh.mac.isNotEmpty() && !kh.isOnline(discovered, reachable)) {
                             {
                                 // The magic packet is UDP broadcast — LNP-blocked like everything else.
                                 if (!lnpGranted) {
@@ -657,6 +780,10 @@ fun ConnectScreen(
                         } else {
                             null
                         },
+                        profileLabel = pin?.name ?: bound?.name,
+                        profileProminent = pin != null,
+                        accent = accentColor(pin?.accent ?: bound?.accent),
+                        menuItems = hostMenu(kh, pin),
                     )
                 }
             }
@@ -753,12 +880,12 @@ fun ConnectScreen(
             knownHostStore.trust(pt.host, pt.port, pt.name, fp, paired = true)
             savedHosts = knownHostStore.all()
             pendingTrust = null
-            doConnect(pt.host, pt.port, pt.name, fp)
+            doConnect(pt.host, pt.port, pt.name, fp, null)
         }
         when (pt.kind) {
             PendingTrust.Kind.TRUST_NEW ->
-                if (gamepadUi) GamepadTrustNewDialog(pt, { pendingTrust = null; doConnect(pt.host, pt.port, pt.name, null) }, onPair, { pendingTrust = null })
-                else TrustNewHostDialog(pt, { pendingTrust = null; doConnect(pt.host, pt.port, pt.name, null) }, onPair, { pendingTrust = null })
+                if (gamepadUi) GamepadTrustNewDialog(pt, { pendingTrust = null; doConnect(pt.host, pt.port, pt.name, null, null) }, onPair, { pendingTrust = null })
+                else TrustNewHostDialog(pt, { pendingTrust = null; doConnect(pt.host, pt.port, pt.name, null, null) }, onPair, { pendingTrust = null })
             PendingTrust.Kind.FP_CHANGED ->
                 if (gamepadUi) GamepadFingerprintChangedDialog(pt, onPair, { pendingTrust = null })
                 else FingerprintChangedDialog(pt, onPair, { pendingTrust = null })
@@ -841,6 +968,7 @@ fun ConnectScreen(
             EditHostDialog(
                 target = kh,
                 suggestedMacs = suggested,
+                profiles = profiles,
                 onSave = onSaveHost,
                 onDismiss = { editTarget = null },
             )
@@ -879,6 +1007,15 @@ fun ConnectScreen(
         gamepadUi = gamepadUi,
         onCancelConnect = { cancelConnect() },
     )
+}
+
+/**
+ * One entry in the saved-hosts grid: a host's own card ([pin] null), or one of its pinned
+ * host+profile cards. Pins are additive presentation state on the host record — never duplicated
+ * host entries, which would fork pairing, trust and renames (design §5.2a).
+ */
+private data class HostCardEntry(val host: KnownHost, val pin: StreamProfile?) {
+    val key: String get() = "card-${host.id}-${pin?.id ?: "primary"}"
 }
 
 /**

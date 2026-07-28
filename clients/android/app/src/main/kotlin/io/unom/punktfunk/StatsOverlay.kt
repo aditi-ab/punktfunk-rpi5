@@ -40,6 +40,12 @@ internal fun StatsOverlay(
     verbosity: StatsVerbosity,
     decoderLabel: String = "",
     codecLabel: String = "",
+    /**
+     * The settings profile this session resolved, appended to the first line when there is one —
+     * the in-stream answer to "which profile am I on?", as on the other clients. Absent (the
+     * common case: no profile) the line is exactly what it always was.
+     */
+    profileName: String? = null,
     modifier: Modifier = Modifier,
 ) {
     if (verbosity == StatsVerbosity.OFF || s.size < 10) return
@@ -56,13 +62,17 @@ internal fun StatsOverlay(
             .background(Color.Black.copy(alpha = 0.45f), RoundedCornerShape(6.dp))
             .padding(horizontal = 8.dp, vertical = 4.dp),
     ) {
+        val profileTag = profileName?.let { "   · $it" }.orEmpty()
         // Compact: everything the glance-value needs on one line, nothing else.
         if (verbosity == StatsVerbosity.COMPACT) {
-            statLine(compactLine(s, latValid), Color.White)
+            statLine(compactLine(s, latValid) + profileTag, Color.White)
             return@Column
         }
 
-        statLine("$w×$h@$hz   ${s[0].roundToInt()} fps   ${"%.1f".format(s[1])} Mb/s", Color.White)
+        statLine(
+            "$w×$h@$hz   ${s[0].roundToInt()} fps   ${"%.1f".format(s[1])} Mb/s$profileTag",
+            Color.White,
+        )
         if (detailed && decoderLabel.isNotEmpty()) {
             statLine(decoderLabel, Color(0xFFB0D0FF))
         }

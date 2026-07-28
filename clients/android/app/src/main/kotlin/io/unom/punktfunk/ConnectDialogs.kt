@@ -365,6 +365,7 @@ internal fun AwaitingApprovalDialog(hostLabel: String, onCancel: () -> Unit) {
 internal fun EditHostDialog(
     target: KnownHost,
     suggestedMacs: List<String>,
+    profiles: List<StreamProfile>,
     onSave: (KnownHost) -> Unit,
     onDismiss: () -> Unit,
 ) {
@@ -375,6 +376,12 @@ internal fun EditHostDialog(
         mutableStateOf(target.mac.ifEmpty { suggestedMacs }.joinToString(", "))
     }
     var clipboard by remember(target) { mutableStateOf(target.clipboardSync) }
+    // A binding whose profile was deleted reads as "Default settings" (which is what it already
+    // resolves to) and is cleaned off the record on the next save — never an error state.
+    var boundId by remember(target, profiles) {
+        mutableStateOf(target.profileId?.takeIf { id -> profiles.any { it.id == id } })
+    }
+    var pins by remember(target) { mutableStateOf(target.pinnedProfileIds) }
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("Edit host") },
@@ -424,6 +431,17 @@ internal fun EditHostDialog(
                     }
                     Switch(checked = clipboard, onCheckedChange = { clipboard = it })
                 }
+                if (profiles.isNotEmpty()) {
+                    HostProfileBinding(
+                        profiles = profiles,
+                        boundId = boundId,
+                        onBind = { boundId = it },
+                        pins = pins,
+                        onTogglePin = { id ->
+                            pins = if (id in pins) pins - id else pins + id
+                        },
+                    )
+                }
             }
         },
         confirmButton = {
@@ -437,6 +455,8 @@ internal fun EditHostDialog(
                             port = port.toIntOrNull() ?: target.port,
                             mac = KnownHostStore.parseMacs(mac),
                             clipboardSync = clipboard,
+                            profileId = boundId,
+                            pinnedProfileIds = pins,
                         ),
                     )
                 },

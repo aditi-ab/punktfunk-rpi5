@@ -69,6 +69,9 @@ class ScreenshotTest {
     }
 
     @Test
+    fun settingsProfile() = shootRoot("settings-profile") { SettingsProfileScene() }
+
+    @Test
     @Config(sdk = [36], qualifiers = "w800dp-h360dp-xxhdpi") // landscape — the stream is immersive
     fun stream() = shootRoot("stream") { StreamScene(io.unom.punktfunk.StatsVerbosity.DETAILED) }
 

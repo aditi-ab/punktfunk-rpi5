@@ -44,6 +44,7 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExposedDropdownMenuBox
 import androidx.compose.material3.ExposedDropdownMenuAnchorType
 import androidx.compose.material3.ExposedDropdownMenuDefaults
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -51,9 +52,12 @@ import androidx.compose.material3.OutlinedCard
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.VerticalDivider
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.compositionLocalOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -72,12 +76,13 @@ import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import io.unom.punktfunk.kit.VideoDecoders
 import io.unom.punktfunk.kit.deviceBodyVibrator
+import io.unom.punktfunk.kit.security.KnownHostStore
 
 /**
  * Stream settings, organised as an iOS-Settings / Android-system-settings style list of category
  * subpages. On a phone the category list pushes to a full-screen detail; on a tablet / large screen
  * it becomes a two-pane list-detail (the list stays on the left, the detail on the right). Edits
- * persist immediately via [onChange]; [onBack] returns to the connect screen.
+ * persist immediately; [onBack] returns to the connect screen.
  *
  * **Structure mirrors the desktop/Apple settings revamp** ([SettingsCategory], and the Windows
  * client's `app/settings.rs`), so every client reads the same way: General = session/app behaviour,
@@ -86,6 +91,12 @@ import io.unom.punktfunk.kit.deviceBodyVibrator
  * [SettingDropdown]'s `caption` and [ToggleRow]'s `subtitle`) rather than as loose paragraphs
  * floating between controls; the only form-level notes are the "applies from the next session"
  * footers, one per affected category.
+ *
+ * **One settings UI, not two.** The scope switcher on top edits either the global defaults
+ * ([onChange], the base layer every profile inherits from) or one profile's overrides — the same
+ * rows either way, so a profile can never drift from the surface it overrides. In profile scope
+ * only profileable settings render, every row shows the EFFECTIVE value, and a row the profile
+ * overrides carries a marker and a reset. See [SettingsOverlay] for the model.
  */
 @Composable
 fun SettingsScreen(
@@ -98,14 +109,48 @@ fun SettingsScreen(
      * `PUNKTFUNK_SHOT_SETTINGS_SCOPE` seeds its scope.
      */
     initialCategory: SettingsCategory? = null,
+    /** Seeds the scope the same way, for a screenshot of a profile being edited. */
+    initialProfileId: String? = null,
 ) {
-    var s by remember { mutableStateOf(initial) }
+    var globals by remember { mutableStateOf(initial) }
     val context = LocalContext.current
+    val profileStore = remember { ProfileStore(context) }
+    val hostStore = remember { KnownHostStore(context) }
+    var profiles by remember { mutableStateOf(profileStore.all()) }
+    // Which layer is being edited: null = the global defaults, else a profile id. Survives rotation
+    // but not a trip out of Settings — coming back should land on the defaults, which is what the
+    // host cards actually connect with unless they say otherwise.
+    var scopeId by rememberSaveable { mutableStateOf(initialProfileId) }
+    // A profile deleted from under the scope (or a store that never had it) falls back to defaults.
+    val active = scopeId?.let { id -> profiles.firstOrNull { it.id == id } }
+    if (scopeId != null && active == null) scopeId = null
+
     var showLicenses by remember { mutableStateOf(false) }
     var showControllers by remember { mutableStateOf(false) }
+    var naming by remember { mutableStateOf<NameIntent?>(null) }
+    var deleting by remember { mutableStateOf<StreamProfile?>(null) }
+
+    // Every row renders the EFFECTIVE value: the globals with this profile's overrides on top, so a
+    // row the profile doesn't override reads as the live global — and keeps following it.
+    val s = globals.effectiveFor(active)
+
     fun update(next: Settings) {
-        s = next
-        onChange(next)
+        val profile = active
+        if (profile == null) {
+            globals = next
+            onChange(next)
+        } else {
+            // `absorb` against what the control was SHOWING, so picking today's global value is
+            // still recorded as an override (the pin) — see [SettingsOverlay.absorb].
+            profileStore.save(profile.copy(overrides = profile.overrides.absorb(s, next)))
+            profiles = profileStore.all()
+        }
+    }
+
+    fun resetField(field: String) {
+        val profile = active ?: return
+        profileStore.save(profile.copy(overrides = profile.overrides.clear(field)))
+        profiles = profileStore.all()
     }
 
     // Mic uplink — turning it on requests RECORD_AUDIO; if denied, the toggle stays off.
@@ -133,96 +178,255 @@ fun SettingsScreen(
 
     // Selected category persists across rotation (stored by name — null = the bare list on a phone).
     var selectedName by rememberSaveable { mutableStateOf(initialCategory?.name) }
-    val selected = selectedName?.let { n -> SettingsCategory.entries.firstOrNull { it.name == n } }
+    val categories = SettingsCategory.entries.filter { active == null || it.profileable }
+    val selected = selectedName
+        ?.let { n -> categories.firstOrNull { it.name == n } }
 
-    BoxWithConstraints(Modifier.fillMaxSize()) {
-        val twoPane = maxWidth >= 640.dp
-        // A two-column layout must never show an empty detail — land on the first category.
-        LaunchedEffect(twoPane) {
-            if (twoPane && selected == null) selectedName = SettingsCategory.General.name
-        }
-
-        val detail: @Composable (SettingsCategory, (() -> Unit)?) -> Unit = { cat, back ->
-            CategoryDetail(
-                category = cat,
-                settings = s,
-                onChange = ::update,
-                context = context,
-                onMicChange = onMicChange,
-                onOpenControllers = { showControllers = true },
-                onOpenLicenses = { showLicenses = true },
-                onBack = back,
+    Column(Modifier.fillMaxSize()) {
+        ProfileScopeChips(
+            profiles = profiles,
+            selectedId = active?.id,
+            onSelect = { id ->
+                scopeId = id
+                // About has no profileable rows at all; don't strand the pane on it.
+                if (id != null && selected?.profileable == false) selectedName = null
+            },
+            onNew = { naming = NameIntent.New },
+            onRename = { active?.let { naming = NameIntent.Rename(it) } },
+            onDuplicate = {
+                active?.let { p ->
+                    val copy = newProfile(uniqueName(profileStore, p.name)).copy(
+                        accent = p.accent,
+                        overrides = p.overrides,
+                    )
+                    profileStore.save(copy)
+                    profiles = profileStore.all()
+                    scopeId = copy.id
+                }
+            },
+            onDelete = { deleting = active },
+            modifier = Modifier.padding(top = 12.dp, bottom = 4.dp),
+        )
+        if (active != null) {
+            Text(
+                "Overrides the default settings for hosts that use “${active.name}”.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(horizontal = 20.dp, vertical = 4.dp),
             )
         }
+        HorizontalDivider()
 
-        if (twoPane) {
-            BackHandler(onBack = onBack)
-            Row(Modifier.fillMaxSize()) {
-                CategoryList(
-                    selected = selected,
-                    twoPane = true,
-                    onSelect = { selectedName = it.name },
-                    modifier = Modifier.width(300.dp).fillMaxHeight(),
-                )
-                VerticalDivider()
-                Box(Modifier.weight(1f).fillMaxHeight()) {
-                    // Cross-fade the detail pane as the selected category changes.
-                    AnimatedContent(
-                        targetState = selected ?: SettingsCategory.General,
-                        transitionSpec = { fadeIn(tween(200)) togetherWith fadeOut(tween(200)) },
-                        label = "SettingsPane",
-                    ) { cat -> detail(cat, null) }
+        CompositionLocalProvider(
+            LocalSettingsScope provides SettingsScopeState(
+                profileScope = active != null,
+                overridden = active?.overrides?.overridden() ?: emptySet(),
+                onReset = ::resetField,
+            ),
+        ) {
+            BoxWithConstraints(Modifier.fillMaxSize()) {
+                val twoPane = maxWidth >= 640.dp
+                // A two-column layout must never show an empty detail — land on the first category.
+                LaunchedEffect(twoPane, categories) {
+                    if (twoPane && selected == null) selectedName = categories.first().name
                 }
-            }
-        } else {
-            // Compact: the category list pushes to a full-screen detail and back, like the iOS /
-            // Android system settings — a horizontal slide that tracks the drill-in direction.
-            BackHandler { if (selected != null) selectedName = null else onBack() }
-            AnimatedContent(
-                targetState = selected,
-                transitionSpec = {
-                    if (targetState != null) {
-                        slideInHorizontally { it } + fadeIn() togetherWith
-                            slideOutHorizontally { -it } + fadeOut()
-                    } else {
-                        slideInHorizontally { -it } + fadeIn() togetherWith
-                            slideOutHorizontally { it } + fadeOut()
-                    }
-                },
-                label = "SettingsPush",
-            ) { sel ->
-                if (sel == null) {
-                    CategoryList(
-                        selected = null,
-                        twoPane = false,
-                        onSelect = { selectedName = it.name },
-                        modifier = Modifier.fillMaxSize(),
+
+                val detail: @Composable (SettingsCategory, (() -> Unit)?) -> Unit = { cat, back ->
+                    CategoryDetail(
+                        category = cat,
+                        settings = s,
+                        onChange = ::update,
+                        context = context,
+                        onMicChange = onMicChange,
+                        onOpenControllers = { showControllers = true },
+                        onOpenLicenses = { showLicenses = true },
+                        onBack = back,
                     )
+                }
+
+                if (twoPane) {
+                    BackHandler(onBack = onBack)
+                    Row(Modifier.fillMaxSize()) {
+                        CategoryList(
+                            categories = categories,
+                            selected = selected,
+                            twoPane = true,
+                            onSelect = { selectedName = it.name },
+                            modifier = Modifier.width(300.dp).fillMaxHeight(),
+                        )
+                        VerticalDivider()
+                        Box(Modifier.weight(1f).fillMaxHeight()) {
+                            // Cross-fade the detail pane as the selected category changes.
+                            AnimatedContent(
+                                targetState = selected ?: categories.first(),
+                                transitionSpec = { fadeIn(tween(200)) togetherWith fadeOut(tween(200)) },
+                                label = "SettingsPane",
+                            ) { cat -> detail(cat, null) }
+                        }
+                    }
                 } else {
-                    detail(sel) { selectedName = null }
+                    // Compact: the category list pushes to a full-screen detail and back, like the
+                    // iOS / Android system settings — a horizontal slide tracking the drill-in.
+                    BackHandler { if (selected != null) selectedName = null else onBack() }
+                    AnimatedContent(
+                        targetState = selected,
+                        transitionSpec = {
+                            if (targetState != null) {
+                                slideInHorizontally { it } + fadeIn() togetherWith
+                                    slideOutHorizontally { -it } + fadeOut()
+                            } else {
+                                slideInHorizontally { -it } + fadeIn() togetherWith
+                                    slideOutHorizontally { it } + fadeOut()
+                            }
+                        },
+                        label = "SettingsPush",
+                    ) { sel ->
+                        if (sel == null) {
+                            CategoryList(
+                                categories = categories,
+                                selected = null,
+                                twoPane = false,
+                                onSelect = { selectedName = it.name },
+                                modifier = Modifier.fillMaxSize(),
+                            )
+                        } else {
+                            detail(sel) { selectedName = null }
+                        }
+                    }
                 }
             }
         }
     }
+
+    naming?.let { intent ->
+        val editing = (intent as? NameIntent.Rename)?.profile
+        ProfileNameDialog(
+            title = if (editing == null) "New profile" else "Rename profile",
+            initialName = editing?.name.orEmpty(),
+            confirmLabel = if (editing == null) "Create" else "Rename",
+            taken = { profileStore.nameTaken(it, except = editing?.id) },
+            onConfirm = { name ->
+                val saved = editing?.copy(name = name) ?: newProfile(name)
+                profileStore.save(saved)
+                profiles = profileStore.all()
+                scopeId = saved.id
+                naming = null
+            },
+            onDismiss = { naming = null },
+        )
+    }
+
+    deleting?.let { profile ->
+        val hosts = hostStore.all()
+        DeleteProfileDialog(
+            profile = profile,
+            boundHosts = hosts.count { it.profileId == profile.id },
+            pinnedCards = hosts.count { profile.id in it.pinnedProfileIds },
+            onConfirm = {
+                profileStore.delete(profile.id)
+                profiles = profileStore.all()
+                scopeId = null
+                deleting = null
+                // Bindings and pins are left dangling on purpose: they resolve to "no profile" and
+                // to "no card", which is exactly right, and rewriting every host record here would
+                // be a second write pass over data the user didn't ask us to touch.
+            },
+            onDismiss = { deleting = null },
+        )
+    }
 }
+
+/** What the name dialog is for. */
+private sealed interface NameIntent {
+    data object New : NameIntent
+    data class Rename(val profile: StreamProfile) : NameIntent
+}
+
+/** "Work" → "Work copy" → "Work copy 2" — the first name Duplicate can actually save. */
+private fun uniqueName(store: ProfileStore, base: String): String {
+    val first = "$base copy"
+    if (!store.nameTaken(first)) return first
+    var n = 2
+    while (store.nameTaken("$first $n")) n++
+    return "$first $n"
+}
+
+// ---- Scope plumbing ----------------------------------------------------------------------------
+
+/**
+ * What the rows need to know about the layer being edited. Carried as a composition local rather
+ * than threaded through every category and row: the rows are the same rows in both scopes, and the
+ * scope only decides whether tier-G rows render at all and whether a row wears an override marker.
+ */
+private class SettingsScopeState(
+    val profileScope: Boolean,
+    val overridden: Set<String>,
+    val onReset: (String) -> Unit,
+)
+
+private val LocalSettingsScope = compositionLocalOf {
+    SettingsScopeState(profileScope = false, overridden = emptySet(), onReset = {})
+}
+
+/**
+ * Wraps rows that are facts about THIS DEVICE or this app rather than about a stream — the console
+ * UI toggle, the library browser, auto-wake, the controller diagnostics, rumble mirroring, SC2
+ * capture (design §3, tiers G and H). They never belong to a profile, so in profile scope they
+ * simply don't render.
+ */
+@Composable
+private fun DeviceScopeOnly(content: @Composable () -> Unit) {
+    if (!LocalSettingsScope.current.profileScope) content()
+}
+
+/**
+ * The accent marker and reset a row wears when the selected profile overrides it. Nothing renders
+ * in the defaults scope, or on a row the profile inherits — an inherited row shows the live global
+ * value in the ordinary quiet style, which is the whole point of inherit-by-default.
+ */
+@Composable
+private fun OverrideBadge(field: String?) {
+    val scope = LocalSettingsScope.current
+    if (!scope.profileScope || field == null || field !in scope.overridden) return
+    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+        AccentDot(MaterialTheme.colorScheme.primary, size = 8)
+        Text(
+            "Overridden",
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.primary,
+            modifier = Modifier.padding(start = 6.dp).weight(1f),
+        )
+        TextButton(onClick = { scope.onReset(field) }) { Text("Reset to default") }
+    }
+}
+
+// ---- Categories --------------------------------------------------------------------------------
 
 /**
  * The top-level settings groups — each opens its own subpage (list on phone, split on tablet).
  * The map and its order are the cross-client one (Apple's `SettingsCategory`, the Windows
  * NavigationView, the GTK pages): General, Display, Input, Audio, Controllers, About.
+ *
+ * [profileable] is false for a category with no profileable rows at all — it isn't offered in
+ * profile scope, rather than opening onto an empty page.
  */
-enum class SettingsCategory(val title: String, val icon: ImageVector) {
+enum class SettingsCategory(
+    val title: String,
+    val icon: ImageVector,
+    internal val profileable: Boolean = true,
+) {
     General("General", Icons.Filled.Tune),
     Display("Display", Icons.Filled.Tv),
     Input("Input", Icons.Filled.TouchApp),
     Audio("Audio", Icons.AutoMirrored.Filled.VolumeUp),
     Controllers("Controllers", Icons.Filled.SportsEsports),
-    About("About", Icons.Filled.Info),
+    About("About", Icons.Filled.Info, profileable = false),
 }
 
 /** The category list — the settings root. Highlights the [selected] row when it drives a detail pane. */
 @Composable
 private fun CategoryList(
+    categories: List<SettingsCategory>,
     selected: SettingsCategory?,
     twoPane: Boolean,
     onSelect: (SettingsCategory) -> Unit,
@@ -239,7 +443,7 @@ private fun CategoryList(
             style = MaterialTheme.typography.headlineMedium,
             modifier = Modifier.padding(start = 8.dp, bottom = 12.dp),
         )
-        SettingsCategory.entries.forEach { cat ->
+        categories.forEach { cat ->
             val highlighted = twoPane && selected == cat
             Row(
                 modifier = Modifier
@@ -307,48 +511,51 @@ private fun CategoryDetail(
     }
 }
 
-// ---- The categories ----------------------------------------------------------------------------
-
 @Composable
 private fun GeneralSettings(s: Settings, update: (Settings) -> Unit) {
-    SettingsGroup("Session") {
-        ToggleRow(
-            title = "Auto-wake on connect",
-            subtitle = "Connecting to a saved host that isn't seen on the network sends " +
-                "Wake-on-LAN and waits for it to boot. Turn off if hosts behind a VPN look " +
-                "offline when they aren't — connects then go straight through.",
-            checked = s.autoWakeEnabled,
-            onCheckedChange = { on -> update(s.copy(autoWakeEnabled = on)) },
-        )
+    DeviceScopeOnly {
+        SettingsGroup("Session") {
+            ToggleRow(
+                title = "Auto-wake on connect",
+                subtitle = "Connecting to a saved host that isn't seen on the network sends " +
+                    "Wake-on-LAN and waits for it to boot. Turn off if hosts behind a VPN look " +
+                    "offline when they aren't — connects then go straight through.",
+                checked = s.autoWakeEnabled,
+                onCheckedChange = { on -> update(s.copy(autoWakeEnabled = on)) },
+            )
+        }
     }
     SettingsGroup("Statistics") {
         SettingDropdown(
             label = "Stats overlay",
             options = STATS_VERBOSITY_OPTIONS,
             selected = s.statsVerbosity,
+            field = "stats_verbosity",
             caption = "Live session stats in a corner overlay — Compact is a single " +
                 "fps · latency · bitrate line, Normal adds the resolution and reliability lines, " +
                 "Detailed adds the decoder, colour and latency-breakdown lines. A 3-finger tap " +
                 "cycles the tiers live.",
         ) { v -> update(s.copy(statsVerbosity = v)) }
     }
-    SettingsGroup("Library") {
-        ToggleRow(
-            title = "Game library",
-            subtitle = "Browse a paired host's Steam and custom games and launch one directly " +
-                "(press Y on a saved host). No extra host setup.",
-            checked = s.libraryEnabled,
-            onCheckedChange = { on -> update(s.copy(libraryEnabled = on)) },
-        )
-    }
-    SettingsGroup("Interface") {
-        ToggleRow(
-            title = "Controller-optimized UI",
-            subtitle = "Switch to the console home (host carousel) whenever a controller is " +
-                "connected. Turn off to keep the touch interface. A TV is always in this mode.",
-            checked = s.gamepadUiEnabled,
-            onCheckedChange = { on -> update(s.copy(gamepadUiEnabled = on)) },
-        )
+    DeviceScopeOnly {
+        SettingsGroup("Library") {
+            ToggleRow(
+                title = "Game library",
+                subtitle = "Browse a paired host's Steam and custom games and launch one directly " +
+                    "(press Y on a saved host). No extra host setup.",
+                checked = s.libraryEnabled,
+                onCheckedChange = { on -> update(s.copy(libraryEnabled = on)) },
+            )
+        }
+        SettingsGroup("Interface") {
+            ToggleRow(
+                title = "Controller-optimized UI",
+                subtitle = "Switch to the console home (host carousel) whenever a controller is " +
+                    "connected. Turn off to keep the touch interface. A TV is always in this mode.",
+                checked = s.gamepadUiEnabled,
+                onCheckedChange = { on -> update(s.copy(gamepadUiEnabled = on)) },
+            )
+        }
     }
 }
 
@@ -368,6 +575,7 @@ private fun DisplaySettings(s: Settings, update: (Settings) -> Unit, context: an
                 // stored its label carries the live value, like the native row carries ($nw × $nh).
                 ((-1 to -1) to if (s.isCustomResolution()) "Custom (${s.width} × ${s.height})" else "Custom…"),
             selected = if (showCustom) -1 to -1 else s.width to s.height,
+            field = SettingsOverlay.FIELD_RESOLUTION,
             caption = "The host drives a real virtual output at exactly this size — true pixels, " +
                 "no scaling. “Native display” follows this device's panel.",
         ) { (w, h) ->
@@ -396,6 +604,7 @@ private fun DisplaySettings(s: Settings, update: (Settings) -> Unit, context: an
             label = "Refresh rate",
             options = REFRESH_OPTIONS.map { (hz, lbl) -> hz to (if (hz == 0) "$lbl ($nhz Hz)" else lbl) },
             selected = s.hz,
+            field = "refresh_hz",
             caption = "“Native” resolves to this display's refresh rate at connect.",
         ) { hz -> update(s.copy(hz = hz)) }
     }
@@ -407,6 +616,7 @@ private fun DisplaySettings(s: Settings, update: (Settings) -> Unit, context: an
             // Snap the stored value (a Float round-tripped to Double) to the nearest preset so the
             // exact Double keys match.
             selected = RenderScale.PRESETS.minByOrNull { kotlin.math.abs(it - s.renderScale) } ?: 1.0,
+            field = "render_scale",
             caption = "Above native supersamples for sharpness, at more bandwidth AND decode; " +
                 "below renders lighter on the host and the link. This device resamples the " +
                 "result to the screen.",
@@ -416,6 +626,7 @@ private fun DisplaySettings(s: Settings, update: (Settings) -> Unit, context: an
             label = "Bitrate",
             options = BITRATE_OPTIONS,
             selected = s.bitrateKbps,
+            field = "bitrate_kbps",
             caption = "Automatic lets the host decide (its default, clamped to what it supports).",
         ) { kbps -> update(s.copy(bitrateKbps = kbps)) }
 
@@ -426,6 +637,7 @@ private fun DisplaySettings(s: Settings, update: (Settings) -> Unit, context: an
             label = "Video codec",
             options = codecOptionsFor(s.codec, av1Capable),
             selected = s.codec,
+            field = "codec",
             caption = "A preference — the host falls back if it can't encode this one.",
         ) { c -> update(s.copy(codec = c)) }
 
@@ -442,13 +654,15 @@ private fun DisplaySettings(s: Settings, update: (Settings) -> Unit, context: an
             },
             checked = s.hdrEnabled && hdrCapable,
             enabled = hdrCapable,
+            field = "hdr_enabled",
             onCheckedChange = { on -> update(s.copy(hdrEnabled = on)) },
         )
     }
 
-    // The decode pipeline is a fact about THIS device's SoC, not about the stream — the desktop
-    // clients group their decoder/GPU pickers here for the same reason. Android has no decoder or
-    // adapter choice (MediaCodec resolves both), so the master toggle is this group's only row.
+    // The desktop clients group their decoder and GPU pickers here, and keep them out of profiles —
+    // they are facts about that machine's hardware. Android has neither choice (MediaCodec resolves
+    // both), and the one knob it does have IS worth varying per host: a marginal link is exactly
+    // where you want the plain decode path back (design §3 lists it as an Android-only profileable).
     SettingsGroup("Decoding") {
         ToggleRow(
             title = "Low-latency mode",
@@ -456,6 +670,7 @@ private fun DisplaySettings(s: Settings, update: (Settings) -> Unit, context: an
                 "mode). On by default — turn off to fall back to the plain decode path if the " +
                 "stream stutters or glitches on this device.",
             checked = s.lowLatencyMode,
+            field = "low_latency_mode",
             onCheckedChange = { on -> update(s.copy(lowLatencyMode = on)) },
         )
     }
@@ -465,6 +680,7 @@ private fun DisplaySettings(s: Settings, update: (Settings) -> Unit, context: an
             label = "Compositor",
             options = COMPOSITOR_OPTIONS.mapIndexed { i, lbl -> i to lbl },
             selected = s.compositor,
+            field = "compositor",
             caption = "The backend the host uses for its virtual output (Linux hosts only). A " +
                 "specific choice falls back to auto-detection when that backend isn't available.",
         ) { c -> update(s.copy(compositor = c)) }
@@ -478,6 +694,7 @@ private fun InputSettings(s: Settings, update: (Settings) -> Unit) {
             label = "Touch input",
             options = TOUCH_MODE_OPTIONS,
             selected = s.touchMode,
+            field = "touch_mode",
             caption = "Trackpad: relative cursor like a laptop touchpad — tap to click, " +
                 "two-finger tap right-clicks, two fingers scroll, tap-then-drag holds the " +
                 "button. Direct pointer: the cursor jumps to your finger. Touch passthrough: " +
@@ -489,6 +706,7 @@ private fun InputSettings(s: Settings, update: (Settings) -> Unit) {
             label = "Mouse input",
             options = MOUSE_MODE_OPTIONS,
             selected = s.mouseMode,
+            field = "mouse_mode",
             caption = "Capture locks a connected mouse to the stream and sends relative motion " +
                 "(mouse-look) — best for games; click the stream to re-capture. Desktop leaves " +
                 "the pointer free to enter and leave the stream and sends absolute positions — " +
@@ -498,10 +716,11 @@ private fun InputSettings(s: Settings, update: (Settings) -> Unit) {
             title = "Invert scroll direction",
             subtitle = "Reverses the wheel and two-finger touch scroll direction sent to the host",
             checked = s.invertScroll,
+            field = "invert_scroll",
             onCheckedChange = { on -> update(s.copy(invertScroll = on)) },
         )
-        // "Shared clipboard" is NOT here any more: it is a trust decision about one host, so it
-        // lives on the host record and is edited from that host's Edit sheet.
+        // "Shared clipboard" is NOT here: it is a trust decision about one host, so it lives on the
+        // host record and is edited from that host's Edit sheet.
     }
 }
 
@@ -512,6 +731,7 @@ private fun AudioSettings(s: Settings, update: (Settings) -> Unit, onMicChange: 
             label = "Audio channels",
             options = AUDIO_CHANNEL_OPTIONS,
             selected = s.audioChannels,
+            field = "audio_channels",
             caption = "The speaker layout requested from the host. It downmixes if its own " +
                 "output has fewer channels.",
         ) { ch -> update(s.copy(audioChannels = ch)) }
@@ -519,6 +739,7 @@ private fun AudioSettings(s: Settings, update: (Settings) -> Unit, onMicChange: 
             title = "Microphone",
             subtitle = "This device's microphone feeds the host's virtual microphone",
             checked = s.micEnabled,
+            field = "mic_enabled",
             onCheckedChange = onMicChange,
         )
     }
@@ -531,39 +752,42 @@ private fun ControllerSettings(s: Settings, update: (Settings) -> Unit, onOpenCo
             label = "Controller type",
             options = GAMEPAD_OPTIONS,
             selected = s.gamepad,
+            field = "gamepad",
             caption = "The virtual pad created on the host. Automatic matches your controller — " +
                 "a DualSense keeps adaptive triggers, lightbar, touchpad and motion. Every " +
                 "connected controller is forwarded, each as its own player.",
         ) { g -> update(s.copy(gamepad = g)) }
-        ClickableRow(
-            title = "Connected controllers",
-            subtitle = "What the app detects, with a live input test",
-            onClick = onOpenControllers,
-        )
-        // Rumble mirroring needs a body vibrator to mirror ONTO — a TV box has none, so the row
-        // would be a silent no-op there.
-        val context = LocalContext.current
-        val hasBodyVibrator = remember { deviceBodyVibrator(context) != null }
-        if (hasBodyVibrator) {
+        DeviceScopeOnly {
+            ClickableRow(
+                title = "Connected controllers",
+                subtitle = "What the app detects, with a live input test",
+                onClick = onOpenControllers,
+            )
+            // Rumble mirroring needs a body vibrator to mirror ONTO — a TV box has none, so the row
+            // would be a silent no-op there.
+            val context = LocalContext.current
+            val hasBodyVibrator = remember { deviceBodyVibrator(context) != null }
+            if (hasBodyVibrator) {
+                ToggleRow(
+                    title = "Rumble on this phone",
+                    subtitle = "Also play controller 1's rumble on this phone's own vibration " +
+                        "motor — for clip-on pads without rumble motors",
+                    checked = s.rumbleOnPhone,
+                    onCheckedChange = { on -> update(s.copy(rumbleOnPhone = on)) },
+                )
+            }
+            // NOT gated on the vibrator: SC2 passthrough is a USB/BLE capture that has nothing to do
+            // with rumbling this device's body, and the gate hid the toggle on exactly the machines
+            // that most want it — TV boxes, where a Steam Controller 2 is the whole input story.
             ToggleRow(
-                title = "Rumble on this phone",
-                subtitle = "Also play controller 1's rumble on this phone's own vibration " +
-                    "motor — for clip-on pads without rumble motors",
-                checked = s.rumbleOnPhone,
-                onCheckedChange = { on -> update(s.copy(rumbleOnPhone = on)) },
+                title = "Steam Controller 2 passthrough",
+                subtitle = "Capture a Steam Controller 2 (wired, Puck dongle, or paired " +
+                    "Bluetooth): it navigates these menus and streams as-is — Steam on the " +
+                    "host drives it like the physical pad (trackpads, gyro, haptics)",
+                checked = s.sc2Capture,
+                onCheckedChange = { on -> update(s.copy(sc2Capture = on)) },
             )
         }
-        // NOT gated on the vibrator: SC2 passthrough is a USB/BLE capture that has nothing to do
-        // with rumbling this device's body, and the gate hid the toggle on exactly the machines
-        // that most want it — TV boxes, where a Steam Controller 2 is the whole input story.
-        ToggleRow(
-            title = "Steam Controller 2 passthrough",
-            subtitle = "Capture a Steam Controller 2 (wired, Puck dongle, or paired " +
-                "Bluetooth): it navigates these menus and streams as-is — Steam on the " +
-                "host drives it like the physical pad (trackpads, gyro, haptics)",
-            checked = s.sc2Capture,
-            onCheckedChange = { on -> update(s.copy(sc2Capture = on)) },
-        )
     }
 }
 
@@ -639,7 +863,10 @@ private fun SettingsGroup(
     }
 }
 
-/** A title + subtitle on the left, a Switch on the right. [enabled] greys out the whole row. */
+/**
+ * A title + subtitle on the left, a Switch on the right. [enabled] greys out the whole row;
+ * [field] is the overlay field this row writes, which is what its override marker keys on.
+ */
 @Composable
 private fun ToggleRow(
     title: String,
@@ -647,23 +874,27 @@ private fun ToggleRow(
     checked: Boolean,
     onCheckedChange: (Boolean) -> Unit,
     enabled: Boolean = true,
+    field: String? = null,
 ) {
     // Dim the labels when disabled so the row reads as inactive (the Switch dims itself).
     val labelAlpha = if (enabled) 1f else 0.38f
-    Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-        Column(Modifier.weight(1f)) {
-            Text(
-                title,
-                style = MaterialTheme.typography.bodyLarge,
-                color = MaterialTheme.colorScheme.onSurface.copy(alpha = labelAlpha),
-            )
-            Text(
-                subtitle,
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = labelAlpha),
-            )
+    Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+        OverrideBadge(field)
+        Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f)) {
+                Text(
+                    title,
+                    style = MaterialTheme.typography.bodyLarge,
+                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = labelAlpha),
+                )
+                Text(
+                    subtitle,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = labelAlpha),
+                )
+            }
+            Switch(checked = checked, onCheckedChange = onCheckedChange, enabled = enabled)
         }
-        Switch(checked = checked, onCheckedChange = onCheckedChange, enabled = enabled)
     }
 }
 
@@ -695,7 +926,8 @@ private fun ClickableRow(title: String, subtitle: String, onClick: () -> Unit) {
  * A labelled read-only dropdown over [options] (value → label); calls [onSelect] on a pick.
  * [caption] is the field's own explanation, rendered directly under the control — the `described()`
  * idiom the other clients use, so a dropdown's guidance belongs to it instead of floating as a
- * loose paragraph between rows.
+ * loose paragraph between rows. [field] is the overlay field this row writes, which is what its
+ * override marker keys on.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -703,6 +935,7 @@ private fun <T> SettingDropdown(
     label: String,
     options: List<Pair<T, String>>,
     selected: T,
+    field: String? = null,
     caption: String? = null,
     onSelect: (T) -> Unit,
 ) {
@@ -710,6 +943,7 @@ private fun <T> SettingDropdown(
     val selectedLabel = options.firstOrNull { it.first == selected }?.second
         ?: options.firstOrNull()?.second.orEmpty()
     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        OverrideBadge(field)
         ExposedDropdownMenuBox(expanded = expanded, onExpandedChange = { expanded = it }) {
             OutlinedTextField(
                 value = selectedLabel,

@@ -42,6 +42,11 @@ data class ActiveSession(
     val handle: Long,
     val settings: io.unom.punktfunk.Settings,
     val clipboardSync: Boolean,
+    /**
+     * The settings profile this session resolved, if any — shown on the stats overlay's first line
+     * so "which profile am I on?" is answerable from inside the stream, as on the other clients.
+     */
+    val profileName: String? = null,
 )
 
 /** Trust state of a host, shown as a colored pill on its card. */

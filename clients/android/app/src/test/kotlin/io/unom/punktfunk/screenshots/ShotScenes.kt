@@ -19,10 +19,12 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import io.unom.punktfunk.BrandDark
@@ -35,8 +37,12 @@ import io.unom.punktfunk.SettingsCategory
 import io.unom.punktfunk.SettingsScreen
 import io.unom.punktfunk.StatsOverlay
 import io.unom.punktfunk.StatsVerbosity
+import io.unom.punktfunk.ProfileStore
+import io.unom.punktfunk.SettingsOverlay
 import io.unom.punktfunk.components.HostCard
+import io.unom.punktfunk.components.HostMenuItem
 import io.unom.punktfunk.components.SectionLabel
+import io.unom.punktfunk.newProfile
 import io.unom.punktfunk.models.HostStatus
 
 // The CI screenshot scenes: the REAL app composables, fed embedded mock state, under the forced
@@ -49,10 +55,20 @@ internal fun ShotTheme(content: @Composable () -> Unit) {
     MaterialTheme(colorScheme = BrandDark, content = content)
 }
 
-private data class MockHost(val name: String, val address: String, val status: HostStatus)
+private data class MockHost(
+    val name: String,
+    val address: String,
+    val status: HostStatus,
+    val profile: String? = null,
+    val pin: String? = null,
+    val accent: Color? = null,
+)
 
 private val SAVED = listOf(
-    MockHost("Living Room PC", "192.168.1.42:9777", HostStatus.PAIRED),
+    MockHost(
+        "Living Room PC", "192.168.1.42:9777", HostStatus.PAIRED,
+        profile = "Game", pin = "Work", accent = Color(0xFFFF8A4C),
+    ),
     MockHost("Office", "192.168.1.50:9777", HostStatus.TOFU),
 )
 private val DISCOVERED = listOf(
@@ -87,8 +103,32 @@ internal fun HostsScene() {
                 }
             }
             item(span = { GridItemSpan(maxLineSpan) }) { SectionLabel("Saved hosts") }
-            items(SAVED) { h ->
-                HostCard(h.name, h.address, h.status, enabled = true, onConnect = {}, onForget = {}, onEdit = {})
+            // A pinned card is its OWN grid cell right after its host — the same flat list the
+            // connect screen builds, not a second card crammed into the host's cell.
+            SAVED.forEach { h ->
+                item {
+                    HostCard(
+                        h.name, h.address, h.status, enabled = true,
+                        onConnect = {}, onForget = {}, onEdit = {},
+                        // The bound profile is a quiet chip: the card says what a tap will do.
+                        profileLabel = h.profile,
+                        accent = h.accent,
+                        menuItems = listOf(
+                            HostMenuItem("Connect with: Default settings", startsSection = true) {},
+                            HostMenuItem("Connect with: Game") {},
+                        ),
+                    )
+                }
+                if (h.pin != null) {
+                    item {
+                        HostCard(
+                            h.name, h.address, h.status, enabled = true,
+                            onConnect = {}, onForget = null,
+                            profileLabel = h.pin, profileProminent = true, accent = h.accent,
+                            menuItems = listOf(HostMenuItem("Unpin card", startsSection = true) {}),
+                        )
+                    }
+                }
             }
             item(span = { GridItemSpan(maxLineSpan) }) {
                 Spacer(Modifier.height(12.dp))
@@ -138,6 +178,36 @@ internal fun SettingsCategoryScene(category: SettingsCategory) {
             onChange = {},
             onBack = {},
             initialCategory = category,
+        )
+    }
+}
+
+/**
+ * The same settings surface in a PROFILE's scope: the scope chips with "Game" selected, only
+ * profileable rows, every row showing the effective value, and the overridden ones carrying their
+ * marker and reset. One settings UI, two layers — this shot is what proves it stayed one.
+ */
+@Composable
+internal fun SettingsProfileScene() {
+    val store = ProfileStore(LocalContext.current)
+    val profile = remember {
+        val p = newProfile("Game").copy(
+            accent = "#FF8A4C",
+            // A representative mix: a resolution and refresh the profile pins, and a codec — the
+            // rest of the page keeps following the defaults, visibly unmarked.
+            overrides = SettingsOverlay(width = 3840, height = 2160, hz = 120, codec = "h264"),
+        )
+        store.save(p)
+        store.save(newProfile("Work"))
+        p
+    }
+    Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
+        SettingsScreen(
+            initial = SHOT_SETTINGS,
+            onChange = {},
+            onBack = {},
+            initialCategory = SettingsCategory.Display,
+            initialProfileId = profile.id,
         )
     }
 }

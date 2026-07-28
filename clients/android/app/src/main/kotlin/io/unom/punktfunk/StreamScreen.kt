@@ -470,7 +470,10 @@ fun StreamScreen(session: ActiveSession, onDisconnect: () -> Unit) {
         // BEFORE the transparent gesture layer below, so it shows through and never eats touches.
         if (statsOn) {
             stats?.let {
-                StatsOverlay(it, statsVerbosity, decoderLabel, codecLabel, Modifier.align(Alignment.TopStart).padding(12.dp))
+                StatsOverlay(
+                    it, statsVerbosity, decoderLabel, codecLabel, session.profileName,
+                    Modifier.align(Alignment.TopStart).padding(12.dp),
+                )
             }
         }
         // "Hold to quit" hint while the gamepad exit chord is armed — the exit debounces on a ~1 s

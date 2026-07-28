@@ -13,12 +13,14 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ElevatedCard
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -32,6 +34,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -49,8 +52,25 @@ fun SectionLabel(text: String) {
 }
 
 /**
+ * One row of a host card's overflow menu. [startsSection] draws a divider above it, which is how
+ * the profile actions ("Connect with: …", "Pin as card: …") stay legible next to the host actions
+ * in one flat menu — Compose has no submenus, and the Windows client made the same call.
+ */
+data class HostMenuItem(
+    val label: String,
+    val startsSection: Boolean = false,
+    val onClick: () -> Unit,
+)
+
+/**
  * A host as an Apple-style card: a colored letter-avatar, name + address, a trust pill, and (for
- * saved hosts) an overflow menu with Rename / Forget. Tapping the card connects.
+ * saved hosts) an overflow menu with Wake / Edit / Forget plus whatever [menuItems] adds. Tapping
+ * the card connects.
+ *
+ * [profileLabel] names the settings profile this card connects with. On a host's own card that is
+ * its default binding, drawn as a quiet chip — the card says what a tap will do. On a **pinned
+ * card** ([profileProminent]) the host name is still the title, but the profile is the loud part,
+ * because the pin exists to make that one combination a single tap.
  */
 @Composable
 fun HostCard(
@@ -63,6 +83,10 @@ fun HostCard(
     onForget: (() -> Unit)?,
     onEdit: (() -> Unit)? = null,
     onWake: (() -> Unit)? = null,
+    profileLabel: String? = null,
+    profileProminent: Boolean = false,
+    accent: Color? = null,
+    menuItems: List<HostMenuItem> = emptyList(),
 ) {
     // D-pad / controller focus highlight: a clickable card is focusable, but the default state
     // layer is too subtle on a TV across a room — draw a clear primary-colour border when focused.
@@ -106,6 +130,10 @@ fun HostCard(
                     overflow = TextOverflow.Ellipsis,
                     textAlign = TextAlign.Center,
                 )
+                if (profileLabel != null) {
+                    Spacer(Modifier.height(8.dp))
+                    ProfileChip(profileLabel, accent, prominent = profileProminent)
+                }
                 Spacer(Modifier.height(12.dp))
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
@@ -116,7 +144,7 @@ fun HostCard(
                 }
             }
 
-            if (onForget != null || onEdit != null || onWake != null) {
+            if (onForget != null || onEdit != null || onWake != null || menuItems.isNotEmpty()) {
                 var menu by remember { mutableStateOf(false) }
                 Box(modifier = Modifier.align(Alignment.TopEnd)) {
                     IconButton(enabled = enabled, onClick = { menu = true }) {
@@ -155,10 +183,51 @@ fun HostCard(
                                 },
                             )
                         }
+                        menuItems.forEach { item ->
+                            if (item.startsSection) HorizontalDivider()
+                            DropdownMenuItem(
+                                text = { Text(item.label) },
+                                onClick = {
+                                    menu = false
+                                    item.onClick()
+                                },
+                            )
+                        }
                     }
                 }
             }
         }
+    }
+}
+
+/**
+ * The profile a card connects with. Quiet on a bound host's own card (it is a note about what a tap
+ * does); filled and tinted on a pinned card, where the profile IS the reason the card exists — the
+ * accent field the schema reserves earns its keep here.
+ */
+@Composable
+private fun ProfileChip(label: String, accent: Color?, prominent: Boolean) {
+    val tint = accent ?: MaterialTheme.colorScheme.primary
+    Row(
+        modifier = Modifier
+            .clip(RoundedCornerShape(50))
+            .background(tint.copy(alpha = if (prominent) 0.24f else 0.12f))
+            .padding(horizontal = 10.dp, vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Box(Modifier.size(7.dp).clip(CircleShape).background(tint))
+        Spacer(Modifier.width(6.dp))
+        Text(
+            label,
+            style = if (prominent) {
+                MaterialTheme.typography.labelLarge
+            } else {
+                MaterialTheme.typography.labelMedium
+            },
+            color = tint,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
     }
 }
 
