@@ -111,12 +111,12 @@ data class Settings(
     val sc2Capture: Boolean = true,
 
     /**
-     * Lock a physical mouse to the stream ([android.view.View.requestPointerCapture]) and forward
-     * raw relative motion — FPS mouse-look, the iPad "Capture pointer for games" twin. Engages at
-     * stream start and on a click into the stream; Ctrl+Alt+Shift+Q toggles it live (the chord
-     * works even with this off). Off (default): a mouse points absolutely, desktop-style.
+     * How a physical mouse drives the host — the cross-client mouse model (see [MouseMode]).
+     * [MouseMode.DESKTOP] (default here) points absolutely; [MouseMode.CAPTURE] locks the pointer
+     * to the stream ([android.view.View.requestPointerCapture]) and forwards raw relative motion.
+     * Read once per session by StreamScreen; Ctrl+Alt+Shift+Q flips the capture live either way.
      */
-    val pointerCapture: Boolean = false,
+    val mouseMode: MouseMode = MouseMode.DESKTOP,
 
     /**
      * Flip scroll direction — the mouse wheel and the two-finger touch scroll both. Parity with
@@ -134,6 +134,20 @@ data class Settings(
 
 /** [Settings.touchMode] values; persisted by name. */
 enum class TouchMode { TRACKPAD, POINTER, TOUCH }
+
+/**
+ * How a physical mouse drives the host — the cross-client mouse model (the Rust `MouseMode`,
+ * persisted as the same lowercase names). Only meaningful with a mouse attached.
+ * - [CAPTURE] — pointer lock: relative deltas, the local cursor hidden, the host's cursor the only
+ *   one you see. The game model, and the desktop clients' default.
+ * - [DESKTOP] — uncaptured absolute pointing: the cursor enters and leaves the stream freely. The
+ *   remote-desktop model, and Android's default (a phone/TV is far more often driven by touch or a
+ *   pad than by a locked mouse, and this is what the platform did before the setting existed).
+ */
+enum class MouseMode(val storedName: String, val label: String) {
+    CAPTURE("capture", "Capture (games)"),
+    DESKTOP("desktop", "Desktop (absolute)"),
+}
 
 /**
  * Stats-overlay detail tiers, in cycling order (persisted by name). Each tier is a strict superset
@@ -193,7 +207,12 @@ class SettingsStore(context: Context) {
         autoWakeEnabled = prefs.getBoolean(K_AUTO_WAKE, true),
         rumbleOnPhone = prefs.getBoolean(K_RUMBLE_ON_PHONE, false),
         sc2Capture = prefs.getBoolean(K_SC2_CAPTURE, true),
-        pointerCapture = prefs.getBoolean(K_POINTER_CAPTURE, false),
+        mouseMode = prefs.getString(K_MOUSE_MODE, null)
+            ?.let { name -> MouseMode.entries.firstOrNull { it.storedName == name } }
+            // Migration: the pre-enum Boolean "pointer_capture" (true = lock the pointer). Its
+            // default was false, which IS `desktop` — so an install that never touched the toggle
+            // lands where it already was.
+            ?: if (prefs.getBoolean(K_POINTER_CAPTURE, false)) MouseMode.CAPTURE else MouseMode.DESKTOP,
         invertScroll = prefs.getBoolean(K_INVERT_SCROLL, false),
         clipboardSync = prefs.getBoolean(K_CLIPBOARD_SYNC, true),
     )
@@ -219,7 +238,7 @@ class SettingsStore(context: Context) {
             .putBoolean(K_AUTO_WAKE, s.autoWakeEnabled)
             .putBoolean(K_RUMBLE_ON_PHONE, s.rumbleOnPhone)
             .putBoolean(K_SC2_CAPTURE, s.sc2Capture)
-            .putBoolean(K_POINTER_CAPTURE, s.pointerCapture)
+            .putString(K_MOUSE_MODE, s.mouseMode.storedName)
             .putBoolean(K_INVERT_SCROLL, s.invertScroll)
             .putBoolean(K_CLIPBOARD_SYNC, s.clipboardSync)
             .apply()
@@ -260,6 +279,9 @@ class SettingsStore(context: Context) {
         const val K_AUTO_WAKE = "auto_wake_enabled"
         const val K_RUMBLE_ON_PHONE = "rumble_on_phone"
         const val K_SC2_CAPTURE = "sc2_capture"
+        const val K_MOUSE_MODE = "mouse_mode"
+
+        /** Legacy Boolean the [K_MOUSE_MODE] enum replaced — read once for migration, never written. */
         const val K_POINTER_CAPTURE = "pointer_capture"
         const val K_INVERT_SCROLL = "invert_scroll"
         const val K_CLIPBOARD_SYNC = "clipboard_sync"
@@ -406,21 +428,47 @@ val AUDIO_CHANNEL_OPTIONS = listOf(
     8 to "7.1 Surround",
 )
 
-/** (stored value, label) for the preferred video codec. `"auto"` = host decides. The `"av1"` row
- * only makes sense on a device with a real AV1 decoder — SettingsScreen filters it out otherwise. */
+/**
+ * (stored value, label) for the preferred video codec — the cross-client table (the Rust
+ * `CODECS`), so a value another client or a profile stored is always representable here.
+ * `"auto"` = host decides.
+ *
+ * Two rows are capability-gated by [codecOptionsFor] rather than dropped from the table: `"av1"`
+ * needs a real `video/av01` decoder on this device, and `"pyrowave"` needs a PyroWave decoder,
+ * which this platform does not have at all (it is a Vulkan-compute codec living in `pf-presenter`;
+ * the JNI client decodes through MediaCodec and never advertises the bit, so preferring it would
+ * be a dead setting that silently resolves to HEVC).
+ */
 val CODEC_OPTIONS = listOf(
     "auto" to "Automatic",
     "hevc" to "HEVC (H.265)",
     "h264" to "H.264 (AVC)",
     "av1" to "AV1",
+    "pyrowave" to "PyroWave (wired LAN)",
 )
 
+/**
+ * [CODEC_OPTIONS] minus the rows this device can't decode — a preference the client never
+ * advertises is a setting that does nothing. [stored] is the currently persisted value, which is
+ * always kept selectable so the selection can be rendered (the don't-clobber rule: a codec chosen
+ * on another device, or by a newer build, must survive being looked at here).
+ */
+fun codecOptionsFor(stored: String, av1Capable: Boolean): List<Pair<String, String>> =
+    CODEC_OPTIONS.filter { (v, _) ->
+        when (v) {
+            "av1" -> av1Capable || stored == "av1"
+            "pyrowave" -> stored == "pyrowave" // no PyroWave decoder on Android — see above
+            else -> true
+        }
+    }
+
 /** The [Settings.codec] string as a `quic::CODEC_*` preference byte (`0` = auto). H264=1, HEVC=2,
- * AV1=4. */
+ * AV1=4, PyroWave=8 (never decodable here, but the byte is the shared contract). */
 fun Settings.preferredCodec(): Int = when (codec) {
     "h264" -> 1
     "hevc" -> 2
     "av1" -> 4
+    "pyrowave" -> 8
     else -> 0
 }
 
@@ -456,11 +504,20 @@ val TOUCH_MODE_OPTIONS = listOf(
     TouchMode.TOUCH to "Touch passthrough",
 )
 
-/** index = GamepadPref wire byte (0=Auto 1=Xbox360 2=DualSense 3=XboxOne 4=DualShock4). */
+/** (mode, label) for the physical-mouse model. */
+val MOUSE_MODE_OPTIONS = MouseMode.entries.map { it to it.label }
+
+/**
+ * (GamepadPref wire byte, label) for the emulated pad the host creates. NOT positional: the wire
+ * bytes are `punktfunk_core::config::GamepadPref` (see `Gamepad.PREF_*`), and Steam Deck is `6`
+ * with `5` (the classic Steam Controller) deliberately not offered — the same subset the desktop
+ * clients' picker shows.
+ */
 val GAMEPAD_OPTIONS = listOf(
-    "Automatic",
-    "Xbox 360",
-    "DualSense",
-    "Xbox One",
-    "DualShock 4",
+    io.unom.punktfunk.kit.Gamepad.PREF_AUTO to "Automatic",
+    io.unom.punktfunk.kit.Gamepad.PREF_XBOX360 to "Xbox 360",
+    io.unom.punktfunk.kit.Gamepad.PREF_DUALSENSE to "DualSense",
+    io.unom.punktfunk.kit.Gamepad.PREF_XBOXONE to "Xbox One",
+    io.unom.punktfunk.kit.Gamepad.PREF_DUALSHOCK4 to "DualShock 4",
+    io.unom.punktfunk.kit.Gamepad.PREF_STEAMDECK to "Steam Deck",
 )

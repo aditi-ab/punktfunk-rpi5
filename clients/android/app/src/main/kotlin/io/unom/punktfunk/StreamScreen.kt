@@ -246,7 +246,7 @@ fun StreamScreen(handle: Long, micEnabled: Boolean, onDisconnect: () -> Unit) {
         val mouse = MouseForwarder(
             handle,
             invertScroll = initialSettings.invertScroll,
-            captureWanted = initialSettings.pointerCapture,
+            captureWanted = initialSettings.mouseMode == MouseMode.CAPTURE,
             surfaceSize = { (decor?.width ?: 0) to (decor?.height ?: 0) },
         )
         mouse.onRequestCapture = {

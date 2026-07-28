@@ -419,14 +419,12 @@ private fun DisplaySettings(s: Settings, update: (Settings) -> Unit, context: an
             caption = "Automatic lets the host decide (its default, clamped to what it supports).",
         ) { kbps -> update(s.copy(bitrateKbps = kbps)) }
 
-        // AV1 is only offered when the device has a real AV1 decoder (it's never advertised to the
-        // host otherwise, so preferring it would be a dead setting). A stored "av1" from a capable
-        // device stays visible so the selection is always representable.
+        // Only codecs this device can actually decode are offered — a preference the client never
+        // advertises would be a dead setting (see [codecOptionsFor]).
         val av1Capable = remember { VideoDecoders.pickDecoder("video/av01") != null }
-        val codecOptions = CODEC_OPTIONS.filter { (v, _) -> v != "av1" || av1Capable || s.codec == "av1" }
         SettingDropdown(
             label = "Video codec",
-            options = codecOptions,
+            options = codecOptionsFor(s.codec, av1Capable),
             selected = s.codec,
             caption = "A preference — the host falls back if it can't encode this one.",
         ) { c -> update(s.copy(codec = c)) }
@@ -487,14 +485,15 @@ private fun InputSettings(s: Settings, update: (Settings) -> Unit) {
         ) { mode -> update(s.copy(touchMode = mode)) }
     }
     SettingsGroup("Keyboard & mouse") {
-        ToggleRow(
-            title = "Capture pointer for games",
-            subtitle = "Lock a connected mouse to the stream and send raw relative motion " +
-                "(mouse-look). Ctrl+Alt+Shift+Q toggles it live; click the stream to re-capture. " +
-                "Off: the mouse points at the desktop directly",
-            checked = s.pointerCapture,
-            onCheckedChange = { on -> update(s.copy(pointerCapture = on)) },
-        )
+        SettingDropdown(
+            label = "Mouse input",
+            options = MOUSE_MODE_OPTIONS,
+            selected = s.mouseMode,
+            caption = "Capture locks a connected mouse to the stream and sends relative motion " +
+                "(mouse-look) — best for games; click the stream to re-capture. Desktop leaves " +
+                "the pointer free to enter and leave the stream and sends absolute positions — " +
+                "best for remote-desktop work. Ctrl+Alt+Shift+Q flips the capture live either way.",
+        ) { mode -> update(s.copy(mouseMode = mode)) }
         ToggleRow(
             title = "Invert scroll direction",
             subtitle = "Reverses the wheel and two-finger touch scroll direction sent to the host",
@@ -535,7 +534,7 @@ private fun ControllerSettings(s: Settings, update: (Settings) -> Unit, onOpenCo
     SettingsGroup(footer = "Applies from the next session.") {
         SettingDropdown(
             label = "Controller type",
-            options = GAMEPAD_OPTIONS.mapIndexed { i, lbl -> i to lbl },
+            options = GAMEPAD_OPTIONS,
             selected = s.gamepad,
             caption = "The virtual pad created on the host. Automatic matches your controller — " +
                 "a DualSense keeps adaptive triggers, lightbar, touchpad and motion. Every " +
@@ -546,7 +545,8 @@ private fun ControllerSettings(s: Settings, update: (Settings) -> Unit, onOpenCo
             subtitle = "What the app detects, with a live input test",
             onClick = onOpenControllers,
         )
-        // Only where the device has a body vibrator to mirror onto (a TV box doesn't).
+        // Rumble mirroring needs a body vibrator to mirror ONTO — a TV box has none, so the row
+        // would be a silent no-op there.
         val context = LocalContext.current
         val hasBodyVibrator = remember { deviceBodyVibrator(context) != null }
         if (hasBodyVibrator) {
@@ -557,15 +557,18 @@ private fun ControllerSettings(s: Settings, update: (Settings) -> Unit, onOpenCo
                 checked = s.rumbleOnPhone,
                 onCheckedChange = { on -> update(s.copy(rumbleOnPhone = on)) },
             )
-            ToggleRow(
-                title = "Steam Controller 2 passthrough",
-                subtitle = "Capture a Steam Controller 2 (wired, Puck dongle, or paired " +
-                    "Bluetooth): it navigates these menus and streams as-is — Steam on the " +
-                    "host drives it like the physical pad (trackpads, gyro, haptics)",
-                checked = s.sc2Capture,
-                onCheckedChange = { on -> update(s.copy(sc2Capture = on)) },
-            )
         }
+        // NOT gated on the vibrator: SC2 passthrough is a USB/BLE capture that has nothing to do
+        // with rumbling this device's body, and the gate hid the toggle on exactly the machines
+        // that most want it — TV boxes, where a Steam Controller 2 is the whole input story.
+        ToggleRow(
+            title = "Steam Controller 2 passthrough",
+            subtitle = "Capture a Steam Controller 2 (wired, Puck dongle, or paired " +
+                "Bluetooth): it navigates these menus and streams as-is — Steam on the " +
+                "host drives it like the physical pad (trackpads, gyro, haptics)",
+            checked = s.sc2Capture,
+            onCheckedChange = { on -> update(s.copy(sc2Capture = on)) },
+        )
     }
 }
 

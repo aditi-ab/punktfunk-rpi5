@@ -87,7 +87,9 @@ fun GamepadSettingsScreen(
     val context = LocalContext.current
     // Gates the "Rumble on this phone" row — a TV box has no body vibrator to mirror onto.
     val hasBodyVibrator = remember { deviceBodyVibrator(context) != null }
-    val rows = buildSettingsRows(s, hasBodyVibrator, ::update)
+    // Gates the AV1 codec row the same way the touch settings do (see `codecOptionsFor`).
+    val av1Capable = remember { io.unom.punktfunk.kit.VideoDecoders.pickDecoder("video/av01") != null }
+    val rows = buildSettingsRows(s, hasBodyVibrator, av1Capable, ::update)
     var focus by remember { mutableIntStateOf(0) }
     if (focus > rows.lastIndex) focus = rows.lastIndex
     // The direction the focused value last stepped (+1 forward / -1 back) — drives which way the
@@ -263,10 +265,12 @@ private fun SettingRowView(row: GpRow, focused: Boolean, adjustDir: Int, onClick
 }
 
 /** Build the console settings rows from the current [Settings], writing through [update].
- * [hasBodyVibrator] gates the "Rumble on this phone" row (absent on TVs). */
+ * [hasBodyVibrator] gates the "Rumble on this phone" row (absent on TVs); [av1Capable] gates the
+ * AV1 codec entry (see `codecOptionsFor`). */
 private fun buildSettingsRows(
     s: Settings,
     hasBodyVibrator: Boolean,
+    av1Capable: Boolean,
     update: (Settings) -> Unit,
 ): List<GpRow> {
     fun <T> choice(
@@ -337,7 +341,7 @@ private fun buildSettingsRows(
         choice(
             "codec", "Video", "Video codec",
             "A preference — the host falls back if it can't encode this one.",
-            CODEC_OPTIONS, s.codec,
+            codecOptionsFor(s.codec, av1Capable), s.codec,
         ) { update(s.copy(codec = it)) },
         toggle(
             "hdr", null, "10-bit HDR",
@@ -362,7 +366,7 @@ private fun buildSettingsRows(
         choice(
             "padType", "Controller", "Controller type",
             "The virtual pad the host creates — Automatic matches this controller.",
-            GAMEPAD_OPTIONS.mapIndexed { i, lbl -> i to lbl }, s.gamepad,
+            GAMEPAD_OPTIONS, s.gamepad,
         ) { update(s.copy(gamepad = it)) },
     ) + listOfNotNull(
         if (hasBodyVibrator) {
