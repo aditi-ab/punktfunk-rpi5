@@ -610,7 +610,7 @@ impl D3d11vaDecoder {
     /// BGRA8) under its keyed mutex and describe the hand-off. The mutex acquire also
     /// back-pressures against the presenter still reading this slot (only possible if the
     /// stream runs `RING_SLOTS` ahead of present).
-    unsafe fn lift(&mut self) -> Result<D3d11Frame> {
+    fn lift(&mut self) -> Result<D3d11Frame> {
         use ffmpeg::ffi;
         unsafe {
             if (*self.frame).format != ffi::AVPixelFormat::AV_PIX_FMT_D3D11 as i32 {

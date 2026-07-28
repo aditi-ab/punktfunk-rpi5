@@ -320,7 +320,7 @@ impl VulkanDecoder {
     /// guard — keeps the image + frames context alive through present) and ship the
     /// POINTERS; the presenter reads the live sync state under the frames-context lock
     /// at its own submit time.
-    unsafe fn extract(&mut self) -> Result<VkVideoFrame> {
+    fn extract(&mut self) -> Result<VkVideoFrame> {
         use ffmpeg::ffi;
         unsafe {
             if (*self.frame).format != ffi::AVPixelFormat::AV_PIX_FMT_VULKAN as i32 {

@@ -139,7 +139,7 @@ impl VaapiDecoder {
     /// single-plane texture with the chroma dropped, painting the screen green. The fix:
     /// derive the COMBINED fourcc from the decoder's software pixel format (NV12 →
     /// `DRM_FORMAT_NV12`) and flatten every plane across every layer in order (Y then UV).
-    unsafe fn map_dmabuf(&mut self) -> Result<DmabufFrame> {
+    fn map_dmabuf(&mut self) -> Result<DmabufFrame> {
         use ffmpeg::ffi;
         unsafe {
             if (*self.frame).format != ffi::AVPixelFormat::AV_PIX_FMT_VAAPI as i32 {
