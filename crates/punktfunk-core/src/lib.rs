@@ -33,6 +33,10 @@
 //! Nothing in the per-frame path touches an async runtime. `tokio`/`quinn` are gated
 //! behind the off-by-default `quic` feature and used only for the control plane.
 
+// Unsafe-proof program: every `unsafe {}` / `unsafe impl` in this crate carries a `// SAFETY:`
+// proof. The bulk lives in `abi.rs`, whose sites are instances of the ABI contract stated once at
+// the top of that file rather than 141 independent arguments.
+#![deny(clippy::undocumented_unsafe_blocks)]
 #![forbid(unsafe_op_in_unsafe_fn)]
 
 pub mod abi;

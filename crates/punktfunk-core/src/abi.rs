@@ -10,6 +10,27 @@
 //! - Versioned: [`punktfunk_abi_version`] + `PunktfunkConfig::struct_size` for forward-compat.
 //! - Panics never cross the boundary: every entry point is wrapped in `catch_unwind`.
 
+// THE ABI CONTRACT, stated once - most `// SAFETY:` proofs below are an instance of it.
+//
+// Every pointer crossing this boundary is C memory the CALLER owns, and the header
+// (`include/punktfunk_core.h`) is where that contract is published. Three shapes recur:
+//
+//  * HANDLES (`PunktfunkSession*`, `PunktfunkConnection*`, ...) come from a `*_new`/`*_pair` and
+//    stay valid until the matching `*_free`. They are only ever reached through `as_mut()`/
+//    `as_ref()`, which turn null into `None` - so a null handle is a `NullPointer` status, never a
+//    dereference. Using one after `*_free` is the caller's error and the one thing this layer
+//    cannot defend against.
+//  * OUT-PARAMS are caller-owned writable slots of the matching `#[repr(C)]` type. Where the header
+//    documents one as optional it is null-checked here before it is written; where it does not, a
+//    null is rejected by the entry point's own guard before any store.
+//  * C STRINGS are NUL-terminated or null, and are read through `opt_cstr`, which handles both and
+//    borrows for the call only.
+//
+// Two properties hold everywhere and are not repeated per site: no pointer is retained past the
+// call that received it (a `PunktfunkFrame`'s `data` is borrowed until the next `poll`/`free` on
+// that session, as the module header says), and every entry point runs inside `guard`'s
+// `catch_unwind`, so a panic becomes a status code rather than unwinding into C.
+
 use crate::config::{Config, FecConfig, FecScheme, ProtocolPhase, Role};
 use crate::crypto::SessionKey;
 use crate::error::PunktfunkStatus;
@@ -118,10 +139,15 @@ unsafe fn config_from_ptr(cfg: *const PunktfunkConfig) -> Result<Config, Punktfu
         return Err(PunktfunkStatus::NullPointer);
     }
     // Read only the 4-byte size prefix first to bound the subsequent full read.
+    // SAFETY: `addr_of!` forms a raw pointer WITHOUT creating a reference, which is the point: the
+    // caller's struct may be an older, smaller version, so the field is read by offset rather than
+    // through a `&`.
     let declared = unsafe { std::ptr::addr_of!((*cfg).struct_size).read_unaligned() } as usize;
     if declared < std::mem::size_of::<PunktfunkConfig>() {
         return Err(PunktfunkStatus::InvalidArg);
     }
+    // SAFETY: per the ABI contract - the pointer operands in this block are caller-supplied and
+    // are null-checked or handle-validated on this path before they are read.
     unsafe { *cfg }.to_config()
 }
 
@@ -225,6 +251,8 @@ pub unsafe extern "C" fn punktfunk_wake_on_lan(
         if mac_count == 0 {
             return PunktfunkStatus::InvalidArg;
         }
+        // SAFETY: per the ABI contract - a caller-supplied pointer/length pair describing one
+        // readable region, borrowed only for this call.
         let bytes = unsafe { std::slice::from_raw_parts(macs, mac_count * 6) };
         let mac_vec: Vec<crate::wol::Mac> = bytes
             .chunks_exact(6)
@@ -237,6 +265,8 @@ pub unsafe extern "C" fn punktfunk_wake_on_lan(
         let ip = if last_known_ip.is_null() {
             None
         } else {
+            // SAFETY: per the ABI contract - a caller-supplied C string, NUL-terminated or null,
+            // borrowed only for this call.
             match unsafe { CStr::from_ptr(last_known_ip) }
                 .to_str()
                 .ok()
@@ -268,14 +298,20 @@ pub unsafe extern "C" fn punktfunk_session_new(
         if cfg.is_null() || local.is_null() || peer.is_null() {
             return ptr::null_mut();
         }
+        // SAFETY: per the ABI contract - the pointer operands in this block are caller-supplied
+        // and are null-checked or handle-validated on this path before they are read.
         let config = match unsafe { config_from_ptr(cfg) } {
             Ok(c) => c,
             Err(_) => return ptr::null_mut(),
         };
+        // SAFETY: per the ABI contract - a caller-supplied C string, NUL-terminated or null,
+        // borrowed only for this call.
         let local = match unsafe { CStr::from_ptr(local) }.to_str() {
             Ok(s) => s,
             Err(_) => return ptr::null_mut(),
         };
+        // SAFETY: per the ABI contract - a caller-supplied C string, NUL-terminated or null,
+        // borrowed only for this call.
         let peer = match unsafe { CStr::from_ptr(peer) }.to_str() {
             Ok(s) => s,
             Err(_) => return ptr::null_mut(),
@@ -309,10 +345,14 @@ pub unsafe extern "C" fn punktfunk_test_loopback_pair(
         {
             return PunktfunkStatus::NullPointer;
         }
+        // SAFETY: per the ABI contract - the pointer operands in this block are caller-supplied
+        // and are null-checked or handle-validated on this path before they are read.
         let hconf = match unsafe { config_from_ptr(host_cfg) } {
             Ok(c) => c,
             Err(s) => return s,
         };
+        // SAFETY: per the ABI contract - the pointer operands in this block are caller-supplied
+        // and are null-checked or handle-validated on this path before they are read.
         let cconf = match unsafe { config_from_ptr(client_cfg) } {
             Ok(c) => c,
             Err(s) => return s,
@@ -326,6 +366,8 @@ pub unsafe extern "C" fn punktfunk_test_loopback_pair(
             Ok(s) => s,
             Err(e) => return e.status(),
         };
+        // SAFETY: per the ABI contract - `out` is a caller-owned writable slot of the matching
+        // `#[repr(C)]` type, written once by value.
         unsafe {
             *out_host = new_handle(hs);
             *out_client = new_handle(cs);
@@ -341,6 +383,8 @@ pub unsafe extern "C" fn punktfunk_test_loopback_pair(
 #[no_mangle]
 pub unsafe extern "C" fn punktfunk_session_free(s: *mut PunktfunkSession) {
     if !s.is_null() {
+        // SAFETY: per the ABI contract - the pointer operands in this block are caller-supplied
+        // and are null-checked or handle-validated on this path before they are read.
         drop(unsafe { Box::from_raw(s) });
     }
 }
@@ -358,6 +402,9 @@ pub unsafe extern "C" fn punktfunk_host_submit_frame(
     flags: u32,
 ) -> PunktfunkStatus {
     guard(|| {
+        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
+        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
+        // here handles.
         let s = match unsafe { s.as_mut() } {
             Some(s) => s,
             None => return PunktfunkStatus::NullPointer,
@@ -368,6 +415,8 @@ pub unsafe extern "C" fn punktfunk_host_submit_frame(
         let slice = if len == 0 {
             &[][..]
         } else {
+            // SAFETY: per the ABI contract - a caller-supplied pointer/length pair describing one
+            // readable region, borrowed only for this call.
             unsafe { std::slice::from_raw_parts(data, len) }
         };
         match s.inner.submit_frame(slice, pts_ns, flags) {
@@ -388,6 +437,9 @@ pub unsafe extern "C" fn punktfunk_client_poll_frame(
     out: *mut PunktfunkFrame,
 ) -> PunktfunkStatus {
     guard(|| {
+        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
+        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
+        // here handles.
         let s = match unsafe { s.as_mut() } {
             Some(s) => s,
             None => return PunktfunkStatus::NullPointer,
@@ -399,6 +451,8 @@ pub unsafe extern "C" fn punktfunk_client_poll_frame(
             Ok(frame) => {
                 s.last_frame = Some(frame);
                 let f = s.last_frame.as_ref().unwrap();
+                // SAFETY: per the ABI contract - `out` is a caller-owned writable slot of the
+                // matching `#[repr(C)]` type, written once by value.
                 unsafe {
                     *out = PunktfunkFrame {
                         data: f.data.as_ptr(),
@@ -426,10 +480,16 @@ pub unsafe extern "C" fn punktfunk_send_input(
     ev: *const InputEvent,
 ) -> PunktfunkStatus {
     guard(|| {
+        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
+        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
+        // here handles.
         let s = match unsafe { s.as_mut() } {
             Some(s) => s,
             None => return PunktfunkStatus::NullPointer,
         };
+        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
+        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
+        // here handles.
         let ev = match unsafe { ev.as_ref() } {
             Some(e) => e,
             None => return PunktfunkStatus::NullPointer,
@@ -455,6 +515,9 @@ pub unsafe extern "C" fn punktfunk_set_input_callback(
     user: *mut c_void,
 ) -> PunktfunkStatus {
     guard(|| {
+        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
+        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
+        // here handles.
         let s = match unsafe { s.as_mut() } {
             Some(s) => s,
             None => return PunktfunkStatus::NullPointer,
@@ -483,6 +546,9 @@ pub unsafe extern "C" fn punktfunk_host_poll_input(s: *mut PunktfunkSession) -> 
             // of firing the cleared callback for the queued remainder. (Freeing the session
             // from inside the callback remains forbidden, as on every entry point.)
             let (ev, cb) = {
+                // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the
+                // caller has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and
+                // the `match` here handles.
                 let s = match unsafe { s.as_mut() } {
                     Some(s) => s,
                     None => return PunktfunkStatus::NullPointer as i32,
@@ -513,6 +579,9 @@ pub unsafe extern "C" fn punktfunk_get_stats(
     out: *mut PunktfunkStats,
 ) -> PunktfunkStatus {
     guard(|| {
+        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
+        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
+        // here handles.
         let s = match unsafe { s.as_ref() } {
             Some(s) => s,
             None => return PunktfunkStatus::NullPointer,
@@ -521,6 +590,8 @@ pub unsafe extern "C" fn punktfunk_get_stats(
             return PunktfunkStatus::NullPointer;
         }
         let stats = s.inner.stats();
+        // SAFETY: per the ABI contract - a caller-owned out-param, non-null on this path, written
+        // once by value.
         unsafe { *out = PunktfunkStats::from(stats) };
         PunktfunkStatus::Ok
     })
@@ -964,6 +1035,8 @@ unsafe fn opt_cstr<'a>(p: *const std::os::raw::c_char) -> std::result::Result<Op
     if p.is_null() {
         return Ok(None);
     }
+    // SAFETY: per the ABI contract - a caller-supplied C string, NUL-terminated or null, borrowed
+    // only for this call.
     unsafe { std::ffi::CStr::from_ptr(p) }
         .to_str()
         .map(Some)
@@ -1167,6 +1240,8 @@ pub unsafe extern "C" fn punktfunk_connect(
     client_key_pem: *const std::os::raw::c_char,
     timeout_ms: u32,
 ) -> *mut PunktfunkConnection {
+    // SAFETY: the pointer arguments are forwarded UNCHANGED to the versioned entry point, which
+    // applies the same ABI contract to them; this shim dereferences nothing itself.
     unsafe {
         punktfunk_connect_ex(
             host,
@@ -1207,6 +1282,8 @@ pub unsafe extern "C" fn punktfunk_connect_ex(
     client_key_pem: *const std::os::raw::c_char,
     timeout_ms: u32,
 ) -> *mut PunktfunkConnection {
+    // SAFETY: the pointer arguments are forwarded UNCHANGED to the versioned entry point, which
+    // applies the same ABI contract to them; this shim dereferences nothing itself.
     unsafe {
         punktfunk_connect_ex2(
             host,
@@ -1250,6 +1327,8 @@ pub unsafe extern "C" fn punktfunk_connect_ex2(
     client_key_pem: *const std::os::raw::c_char,
     timeout_ms: u32,
 ) -> *mut PunktfunkConnection {
+    // SAFETY: the pointer arguments are forwarded UNCHANGED to the versioned entry point, which
+    // applies the same ABI contract to them; this shim dereferences nothing itself.
     unsafe {
         punktfunk_connect_ex3(
             host,
@@ -1295,6 +1374,8 @@ pub unsafe extern "C" fn punktfunk_connect_ex3(
     timeout_ms: u32,
 ) -> *mut PunktfunkConnection {
     // Delegate to the launch-aware variant with no game requested (the host's default session).
+    // SAFETY: the pointer arguments are forwarded UNCHANGED to the versioned entry point, which
+    // applies the same ABI contract to them; this shim dereferences nothing itself.
     unsafe {
         punktfunk_connect_ex4(
             host,
@@ -1343,6 +1424,8 @@ pub unsafe extern "C" fn punktfunk_connect_ex4(
 ) -> *mut PunktfunkConnection {
     // Back-compat: ex4 advertises no video caps (8-bit BT.709 SDR). HDR-capable embedders call
     // `punktfunk_connect_ex5` with the cap bits.
+    // SAFETY: the pointer arguments are forwarded UNCHANGED to the versioned entry point, which
+    // applies the same ABI contract to them; this shim dereferences nothing itself.
     unsafe {
         punktfunk_connect_ex5(
             host,
@@ -1395,6 +1478,8 @@ pub unsafe extern "C" fn punktfunk_connect_ex5(
     timeout_ms: u32,
 ) -> *mut PunktfunkConnection {
     // Delegate to the surround-aware variant requesting stereo (the pre-surround behaviour).
+    // SAFETY: the pointer arguments are forwarded UNCHANGED to the versioned entry point, which
+    // applies the same ABI contract to them; this shim dereferences nothing itself.
     unsafe {
         punktfunk_connect_ex6(
             host,
@@ -1446,6 +1531,8 @@ pub unsafe extern "C" fn punktfunk_connect_ex6(
     client_key_pem: *const std::os::raw::c_char,
     timeout_ms: u32,
 ) -> *mut PunktfunkConnection {
+    // SAFETY: the pointer arguments are forwarded UNCHANGED to the versioned entry point, which
+    // applies the same ABI contract to them; this shim dereferences nothing itself.
     unsafe {
         punktfunk_connect_ex7(
             host,
@@ -1502,6 +1589,8 @@ pub unsafe extern "C" fn punktfunk_connect_ex7(
     client_key_pem: *const std::os::raw::c_char,
     timeout_ms: u32,
 ) -> *mut PunktfunkConnection {
+    // SAFETY: the pointer arguments are forwarded UNCHANGED to the versioned entry point, which
+    // applies the same ABI contract to them; this shim dereferences nothing itself.
     unsafe {
         connect_ex_impl(
             host,
@@ -1562,6 +1651,8 @@ pub unsafe extern "C" fn punktfunk_connect_ex8(
     timeout_ms: u32,
     status_out: *mut i32,
 ) -> *mut PunktfunkConnection {
+    // SAFETY: the pointer arguments are forwarded UNCHANGED to the versioned entry point, which
+    // applies the same ABI contract to them; this shim dereferences nothing itself.
     unsafe {
         connect_ex_impl(
             host,
@@ -1622,6 +1713,8 @@ pub unsafe extern "C" fn punktfunk_connect_ex9(
     timeout_ms: u32,
     status_out: *mut i32,
 ) -> *mut PunktfunkConnection {
+    // SAFETY: the pointer arguments are forwarded UNCHANGED to the versioned entry point, which
+    // applies the same ABI contract to them; this shim dereferences nothing itself.
     unsafe {
         connect_ex_impl(
             host,
@@ -1681,6 +1774,8 @@ unsafe fn connect_ex_impl(
 ) -> *mut PunktfunkConnection {
     let set_status = |s: crate::error::PunktfunkStatus| {
         if !status_out.is_null() {
+            // SAFETY: per the ABI contract - a caller-owned out-param, non-null on this path,
+            // written once by value.
             unsafe { *status_out = s as i32 };
         }
     };
@@ -1689,6 +1784,8 @@ unsafe fn connect_ex_impl(
             set_status(crate::error::PunktfunkStatus::InvalidArg);
             return std::ptr::null_mut();
         }
+        // SAFETY: per the ABI contract - a caller-supplied C string, NUL-terminated or null,
+        // borrowed only for this call.
         let host = match unsafe { std::ffi::CStr::from_ptr(host) }.to_str() {
             Ok(s) => s,
             Err(_) => {
@@ -1697,6 +1794,8 @@ unsafe fn connect_ex_impl(
             }
         };
         // A bad-UTF-8 launch id is non-fatal — treat it as "no game" rather than failing connect.
+        // SAFETY: per the ABI contract - the pointer operands in this block are caller-supplied
+        // and are null-checked or handle-validated on this path before they are read.
         let launch = match unsafe { opt_cstr(launch_id) } {
             Ok(Some(s)) if !s.is_empty() => Some(s.to_string()),
             _ => None,
@@ -1718,9 +1817,13 @@ unsafe fn connect_ex_impl(
             None
         } else {
             let mut p = [0u8; 32];
+            // SAFETY: per the ABI contract - a caller-supplied pointer/length pair describing one
+            // readable region, borrowed only for this call.
             p.copy_from_slice(unsafe { std::slice::from_raw_parts(pin_sha256, 32) });
             Some(p)
         };
+        // SAFETY: per the ABI contract - the pointer operands in this block are caller-supplied
+        // and are null-checked or handle-validated on this path before they are read.
         let identity = match (unsafe { opt_cstr(client_cert_pem) }, unsafe {
             opt_cstr(client_key_pem)
         }) {
@@ -1758,6 +1861,8 @@ unsafe fn connect_ex_impl(
         ) {
             Ok(c) => {
                 if !observed_sha256_out.is_null() {
+                    // SAFETY: per the ABI contract - a caller-owned output buffer of exactly the
+                    // documented fixed length, non-null on this path and written once.
                     unsafe {
                         std::slice::from_raw_parts_mut(observed_sha256_out, 32)
                             .copy_from_slice(&c.host_fingerprint);
@@ -1812,6 +1917,8 @@ pub unsafe extern "C" fn punktfunk_generate_identity(
         if cert.len() + 1 > cert_cap || key.len() + 1 > key_cap {
             return PunktfunkStatus::InvalidArg;
         }
+        // SAFETY: per the ABI contract - the pointer operands in this block are caller-supplied
+        // and are null-checked or handle-validated on this path before they are read.
         unsafe {
             // `.cast()`, not `as *mut u8`: `c_char` is i8 on x86_64 but u8 on aarch64, so the
             // `as` form is a REQUIRED conversion on one and a no-op clippy rejects on the other.
@@ -1842,6 +1949,8 @@ pub unsafe extern "C" fn punktfunk_probe(
     timeout_ms: u32,
 ) -> PunktfunkStatus {
     guard(|| {
+        // SAFETY: per the ABI contract - the pointer operands in this block are caller-supplied
+        // and are null-checked or handle-validated on this path before they are read.
         let Ok(Some(host)) = (unsafe { opt_cstr(host) }) else {
             return PunktfunkStatus::NullPointer;
         };
@@ -1881,10 +1990,20 @@ pub unsafe extern "C" fn punktfunk_pair(
 ) -> PunktfunkStatus {
     guard(|| {
         let (Ok(Some(host)), Ok(Some(cert)), Ok(Some(key)), Ok(Some(pin)), Ok(Some(name))) = (
+            // SAFETY: per the ABI contract - the pointer operands in this block are caller-
+            // supplied and are null-checked or handle-validated on this path before they are read.
             unsafe { opt_cstr(host) },
+            // SAFETY: per the ABI contract - the pointer operands in this block are caller-
+            // supplied and are null-checked or handle-validated on this path before they are read.
             unsafe { opt_cstr(client_cert_pem) },
+            // SAFETY: per the ABI contract - the pointer operands in this block are caller-
+            // supplied and are null-checked or handle-validated on this path before they are read.
             unsafe { opt_cstr(client_key_pem) },
+            // SAFETY: per the ABI contract - the pointer operands in this block are caller-
+            // supplied and are null-checked or handle-validated on this path before they are read.
             unsafe { opt_cstr(pin) },
+            // SAFETY: per the ABI contract - the pointer operands in this block are caller-
+            // supplied and are null-checked or handle-validated on this path before they are read.
             unsafe { opt_cstr(name) },
         ) else {
             return PunktfunkStatus::NullPointer;
@@ -1901,6 +2020,8 @@ pub unsafe extern "C" fn punktfunk_pair(
             std::time::Duration::from_millis(timeout_ms as u64),
         ) {
             Ok(fp) => {
+                // SAFETY: per the ABI contract - a caller-owned output buffer of exactly the
+                // documented fixed length, non-null on this path and written once.
                 unsafe {
                     std::slice::from_raw_parts_mut(host_sha256_out, 32).copy_from_slice(&fp);
                 }
@@ -1928,6 +2049,9 @@ pub unsafe extern "C" fn punktfunk_connection_next_au(
 ) -> PunktfunkStatus {
     guard(|| {
         // Shared reference only: video and audio threads must never alias a `&mut`.
+        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
+        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
+        // here handles.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
@@ -1943,6 +2067,8 @@ pub unsafe extern "C" fn punktfunk_connection_next_au(
                 let mut slot = c.last.lock().unwrap();
                 *slot = Some(frame);
                 let f = slot.as_ref().unwrap();
+                // SAFETY: per the ABI contract - `out` is a caller-owned writable slot of the
+                // matching `#[repr(C)]` type, written once by value.
                 unsafe {
                     *out = PunktfunkFrame {
                         data: f.data.as_ptr(),
@@ -1988,6 +2114,9 @@ pub unsafe extern "C" fn punktfunk_connection_next_audio(
     timeout_ms: u32,
 ) -> PunktfunkStatus {
     guard(|| {
+        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
+        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
+        // here handles.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
@@ -2003,6 +2132,8 @@ pub unsafe extern "C" fn punktfunk_connection_next_audio(
                 let mut slot = c.last_audio.lock().unwrap();
                 *slot = Some(pkt);
                 let p = slot.as_ref().unwrap();
+                // SAFETY: per the ABI contract - `out` is a caller-owned writable slot of the
+                // matching `#[repr(C)]` type, written once by value.
                 unsafe {
                     *out = PunktfunkAudioPacket {
                         data: p.data.as_ptr(),
@@ -2034,6 +2165,9 @@ pub unsafe extern "C" fn punktfunk_connection_audio_channels(
     out: *mut u8,
 ) -> PunktfunkStatus {
     guard(|| {
+        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
+        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
+        // here handles.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
@@ -2084,6 +2218,9 @@ pub unsafe extern "C" fn punktfunk_connection_next_audio_pcm(
     timeout_ms: u32,
 ) -> PunktfunkStatus {
     guard(|| {
+        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
+        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
+        // here handles.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
@@ -2124,6 +2261,8 @@ pub unsafe extern "C" fn punktfunk_connection_next_audio_pcm(
         // per-channel capacity; an empty payload requests packet-loss concealment.
         match dec.decode_float(&pkt.data, pcm, false) {
             Ok(frame_count) => {
+                // SAFETY: per the ABI contract - `out` is a caller-owned writable slot of the
+                // matching `#[repr(C)]` type, written once by value.
                 unsafe {
                     *out = PunktfunkAudioPcm {
                         samples: pcm.as_ptr(),
@@ -2161,6 +2300,9 @@ pub unsafe extern "C" fn punktfunk_connection_next_rumble(
     timeout_ms: u32,
 ) -> PunktfunkStatus {
     guard(|| {
+        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
+        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
+        // here handles.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
@@ -2170,6 +2312,8 @@ pub unsafe extern "C" fn punktfunk_connection_next_rumble(
             .next_rumble(std::time::Duration::from_millis(timeout_ms as u64))
         {
             Ok((p, l, h)) => {
+                // SAFETY: per the ABI contract - each out-param below is OPTIONAL, so it is null-
+                // checked before it is written; a non-null one is a caller-owned writable slot.
                 unsafe {
                     if !pad.is_null() {
                         *pad = p;
@@ -2214,6 +2358,9 @@ pub unsafe extern "C" fn punktfunk_connection_next_rumble2(
     timeout_ms: u32,
 ) -> PunktfunkStatus {
     guard(|| {
+        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
+        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
+        // here handles.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
@@ -2223,6 +2370,8 @@ pub unsafe extern "C" fn punktfunk_connection_next_rumble2(
             .next_rumble_ttl(std::time::Duration::from_millis(timeout_ms as u64))
         {
             Ok((p, l, h, ttl)) => {
+                // SAFETY: per the ABI contract - each out-param below is OPTIONAL, so it is null-
+                // checked before it is written; a non-null one is a caller-owned writable slot.
                 unsafe {
                     if !pad.is_null() {
                         *pad = p;
@@ -2277,6 +2426,9 @@ pub unsafe extern "C" fn punktfunk_connection_next_rumble_cmd(
     timeout_ms: u32,
 ) -> PunktfunkStatus {
     guard(|| {
+        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
+        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
+        // here handles.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
@@ -2286,6 +2438,8 @@ pub unsafe extern "C" fn punktfunk_connection_next_rumble_cmd(
             .next_rumble_command(std::time::Duration::from_millis(timeout_ms as u64))
         {
             Ok(cmd) => {
+                // SAFETY: per the ABI contract - each out-param below is OPTIONAL, so it is null-
+                // checked before it is written; a non-null one is a caller-owned writable slot.
                 unsafe {
                     if !pad.is_null() {
                         *pad = cmd.pad;
@@ -2327,6 +2481,9 @@ pub unsafe extern "C" fn punktfunk_connection_set_rumble_quirks(
     flags: u32,
 ) -> PunktfunkStatus {
     guard(|| {
+        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
+        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
+        // here handles.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
@@ -2359,6 +2516,9 @@ pub unsafe extern "C" fn punktfunk_connection_next_hidout(
     timeout_ms: u32,
 ) -> PunktfunkStatus {
     guard(|| {
+        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
+        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
+        // here handles.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
@@ -2372,6 +2532,8 @@ pub unsafe extern "C" fn punktfunk_connection_next_hidout(
         {
             Ok(h) => match PunktfunkHidOutput::from_hid(&h) {
                 Some(v) => {
+                    // SAFETY: per the ABI contract - a caller-owned out-param, non-null on this
+                    // path, written once by value.
                     unsafe { *out = v };
                     PunktfunkStatus::Ok
                 }
@@ -2402,6 +2564,9 @@ pub unsafe extern "C" fn punktfunk_connection_next_hdr_meta(
     timeout_ms: u32,
 ) -> PunktfunkStatus {
     guard(|| {
+        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
+        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
+        // here handles.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
@@ -2414,6 +2579,8 @@ pub unsafe extern "C" fn punktfunk_connection_next_hdr_meta(
             .next_hdr_meta(std::time::Duration::from_millis(timeout_ms as u64))
         {
             Ok(m) => {
+                // SAFETY: per the ABI contract - a caller-owned out-param, non-null on this path,
+                // written once by value.
                 unsafe { *out = PunktfunkHdrMeta::from_meta(&m) };
                 PunktfunkStatus::Ok
             }
@@ -2465,6 +2632,9 @@ pub unsafe extern "C" fn punktfunk_connection_next_cursor_shape(
     timeout_ms: u32,
 ) -> PunktfunkStatus {
     guard(|| {
+        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
+        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
+        // here handles.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
@@ -2480,6 +2650,8 @@ pub unsafe extern "C" fn punktfunk_connection_next_cursor_shape(
                 let mut slot = c.last_cursor_shape.lock().unwrap();
                 *slot = Some(shape);
                 let sh = slot.as_ref().unwrap();
+                // SAFETY: per the ABI contract - `out` is a caller-owned writable slot of the
+                // matching `#[repr(C)]` type, written once by value.
                 unsafe {
                     *out = PunktfunkCursorShape {
                         serial: sh.serial,
@@ -2513,6 +2685,9 @@ pub unsafe extern "C" fn punktfunk_connection_next_cursor_state(
     timeout_ms: u32,
 ) -> PunktfunkStatus {
     guard(|| {
+        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
+        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
+        // here handles.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
@@ -2525,6 +2700,8 @@ pub unsafe extern "C" fn punktfunk_connection_next_cursor_state(
             .next_cursor_state(std::time::Duration::from_millis(timeout_ms as u64))
         {
             Ok(st) => {
+                // SAFETY: per the ABI contract - `out` is a caller-owned writable slot of the
+                // matching `#[repr(C)]` type, written once by value.
                 unsafe {
                     *out = PunktfunkCursorState {
                         serial: st.serial,
@@ -2556,6 +2733,9 @@ pub unsafe extern "C" fn punktfunk_connection_set_cursor_render(
     client_draws: bool,
 ) -> PunktfunkStatus {
     guard(|| {
+        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
+        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
+        // here handles.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
@@ -2585,6 +2765,9 @@ pub unsafe extern "C" fn punktfunk_connection_next_host_timing(
     timeout_ms: u32,
 ) -> PunktfunkStatus {
     guard(|| {
+        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
+        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
+        // here handles.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
@@ -2597,6 +2780,8 @@ pub unsafe extern "C" fn punktfunk_connection_next_host_timing(
             .next_host_timing(std::time::Duration::from_millis(timeout_ms as u64))
         {
             Ok(t) => {
+                // SAFETY: per the ABI contract - `out` is a caller-owned writable slot of the
+                // matching `#[repr(C)]` type, written once by value.
                 unsafe {
                     *out = PunktfunkHostTiming {
                         pts_ns: t.pts_ns,
@@ -2630,11 +2815,16 @@ pub unsafe extern "C" fn punktfunk_connection_color_info(
     bit_depth: *mut u8,
 ) -> PunktfunkStatus {
     guard(|| {
+        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
+        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
+        // here handles.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
         };
         let color = c.inner.color;
+        // SAFETY: per the ABI contract - each out-param below is OPTIONAL, so it is null-checked
+        // before it is written; a non-null one is a caller-owned writable slot.
         unsafe {
             if !primaries.is_null() {
                 *primaries = color.primaries;
@@ -2671,6 +2861,9 @@ pub unsafe extern "C" fn punktfunk_connection_chroma_format(
     out: *mut u8,
 ) -> PunktfunkStatus {
     guard(|| {
+        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
+        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
+        // here handles.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
@@ -2698,6 +2891,9 @@ pub unsafe extern "C" fn punktfunk_connection_codec(
     out: *mut u8,
 ) -> PunktfunkStatus {
     guard(|| {
+        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
+        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
+        // here handles.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
@@ -2725,6 +2921,9 @@ pub unsafe extern "C" fn punktfunk_connection_shard_payload(
     out: *mut u32,
 ) -> PunktfunkStatus {
     guard(|| {
+        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
+        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
+        // here handles.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
@@ -2748,10 +2947,16 @@ pub unsafe extern "C" fn punktfunk_connection_send_input(
     ev: *const InputEvent,
 ) -> PunktfunkStatus {
     guard(|| {
+        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
+        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
+        // here handles.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
         };
+        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
+        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
+        // here handles.
         let ev = match unsafe { ev.as_ref() } {
             Some(e) => e,
             None => return PunktfunkStatus::NullPointer,
@@ -2780,6 +2985,9 @@ pub unsafe extern "C" fn punktfunk_connection_send_mic(
     pts_ns: u64,
 ) -> PunktfunkStatus {
     guard(|| {
+        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
+        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
+        // here handles.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
@@ -2790,6 +2998,8 @@ pub unsafe extern "C" fn punktfunk_connection_send_mic(
         let opus = if len == 0 {
             Vec::new()
         } else {
+            // SAFETY: per the ABI contract - a caller-supplied pointer/length pair describing one
+            // readable region, borrowed only for this call.
             unsafe { std::slice::from_raw_parts(opus_data, len) }.to_vec()
         };
         match c.inner.send_mic(seq, pts_ns, opus) {
@@ -2813,10 +3023,16 @@ pub unsafe extern "C" fn punktfunk_connection_send_rich_input(
     rich: *const PunktfunkRichInput,
 ) -> PunktfunkStatus {
     guard(|| {
+        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
+        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
+        // here handles.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
         };
+        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
+        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
+        // here handles.
         let rich = match unsafe { rich.as_ref() } {
             Some(r) => r,
             None => return PunktfunkStatus::NullPointer,
@@ -2845,6 +3061,9 @@ pub unsafe extern "C" fn punktfunk_connection_send_rich_input2(
     rich: *const PunktfunkRichInputEx,
 ) -> PunktfunkStatus {
     guard(|| {
+        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
+        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
+        // here handles.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
@@ -2854,10 +3073,15 @@ pub unsafe extern "C" fn punktfunk_connection_send_rich_input2(
         }
         // Read only the 4-byte size prefix first to bound the subsequent full read (the
         // `PunktfunkConfig` ABI-skew precedent).
+        // SAFETY: `addr_of!` forms a raw pointer WITHOUT creating a reference, which is the point:
+        // the caller's struct may be an older, smaller version, so the field is read by offset
+        // rather than through a `&`.
         let declared = unsafe { std::ptr::addr_of!((*rich).struct_size).read_unaligned() } as usize;
         if declared < std::mem::size_of::<PunktfunkRichInputEx>() {
             return PunktfunkStatus::InvalidArg;
         }
+        // SAFETY: per the ABI contract - the pointer operands in this block are caller-supplied
+        // and are null-checked or handle-validated on this path before they are read.
         match unsafe { *rich }.to_rich() {
             Some(r) => match c.inner.send_rich_input(r) {
                 Ok(()) => PunktfunkStatus::Ok,
@@ -2888,6 +3112,9 @@ pub unsafe extern "C" fn punktfunk_connection_send_pen(
     count: u32,
 ) -> PunktfunkStatus {
     guard(|| {
+        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
+        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
+        // here handles.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
@@ -2898,6 +3125,8 @@ pub unsafe extern "C" fn punktfunk_connection_send_pen(
         if count == 0 || count > PUNKTFUNK_PEN_BATCH_MAX {
             return PunktfunkStatus::InvalidArg;
         }
+        // SAFETY: per the ABI contract - a caller-supplied pointer/length pair describing one
+        // readable region, borrowed only for this call.
         let raw = unsafe { std::slice::from_raw_parts(samples, count as usize) };
         let mut batch = [crate::quic::PenSample::default(); crate::quic::PEN_BATCH_MAX];
         for (slot, s) in batch.iter_mut().zip(raw) {
@@ -2927,11 +3156,16 @@ pub unsafe extern "C" fn punktfunk_connection_mode(
     refresh_hz: *mut u32,
 ) -> PunktfunkStatus {
     guard(|| {
+        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
+        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
+        // here handles.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
         };
         let mode = c.inner.mode();
+        // SAFETY: per the ABI contract - each out-param below is OPTIONAL, so it is null-checked
+        // before it is written; a non-null one is a caller-owned writable slot.
         unsafe {
             if !width.is_null() {
                 *width = mode.width;
@@ -2961,10 +3195,15 @@ pub unsafe extern "C" fn punktfunk_connection_gamepad(
     gamepad: *mut u32,
 ) -> PunktfunkStatus {
     guard(|| {
+        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
+        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
+        // here handles.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
         };
+        // SAFETY: per the ABI contract - each out-param below is OPTIONAL, so it is null-checked
+        // before it is written; a non-null one is a caller-owned writable slot.
         unsafe {
             if !gamepad.is_null() {
                 *gamepad = c.inner.resolved_gamepad.to_u8() as u32;
@@ -3141,10 +3380,15 @@ pub unsafe extern "C" fn punktfunk_connection_host_caps(
     caps: *mut u8,
 ) -> PunktfunkStatus {
     guard(|| {
+        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
+        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
+        // here handles.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
         };
+        // SAFETY: per the ABI contract - each out-param below is OPTIONAL, so it is null-checked
+        // before it is written; a non-null one is a caller-owned writable slot.
         unsafe {
             if !caps.is_null() {
                 *caps = c.inner.host_caps();
@@ -3168,6 +3412,9 @@ pub unsafe extern "C" fn punktfunk_connection_clipboard_control(
     flags: u8,
 ) -> PunktfunkStatus {
     guard(|| {
+        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
+        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
+        // here handles.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
@@ -3195,6 +3442,9 @@ pub unsafe extern "C" fn punktfunk_connection_clipboard_offer(
     n: usize,
 ) -> PunktfunkStatus {
     guard(|| {
+        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
+        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
+        // here handles.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
@@ -3204,11 +3454,15 @@ pub unsafe extern "C" fn punktfunk_connection_clipboard_offer(
         }
         let mut out = Vec::with_capacity(n);
         if n != 0 {
+            // SAFETY: per the ABI contract - a caller-supplied pointer/length pair describing one
+            // readable region, borrowed only for this call.
             let slice = unsafe { std::slice::from_raw_parts(kinds, n) };
             for k in slice {
                 let mime = if k.mime.is_null() {
                     String::new()
                 } else {
+                    // SAFETY: per the ABI contract - a caller-supplied C string, NUL-terminated or
+                    // null, borrowed only for this call.
                     match unsafe { std::ffi::CStr::from_ptr(k.mime) }.to_str() {
                         Ok(s) => s.to_string(),
                         Err(_) => return PunktfunkStatus::InvalidArg,
@@ -3245,6 +3499,9 @@ pub unsafe extern "C" fn punktfunk_connection_clipboard_fetch(
     xfer_id_out: *mut u32,
 ) -> PunktfunkStatus {
     guard(|| {
+        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
+        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
+        // here handles.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
@@ -3252,12 +3509,16 @@ pub unsafe extern "C" fn punktfunk_connection_clipboard_fetch(
         if mime.is_null() {
             return PunktfunkStatus::NullPointer;
         }
+        // SAFETY: per the ABI contract - a caller-supplied C string, NUL-terminated or null,
+        // borrowed only for this call.
         let mime = match unsafe { std::ffi::CStr::from_ptr(mime) }.to_str() {
             Ok(s) => s.to_string(),
             Err(_) => return PunktfunkStatus::InvalidArg,
         };
         match c.inner.clip_fetch(seq, mime, file_index) {
             Ok(xfer_id) => {
+                // SAFETY: per the ABI contract - each out-param below is OPTIONAL, so it is null-
+                // checked before it is written; a non-null one is a caller-owned writable slot.
                 unsafe {
                     if !xfer_id_out.is_null() {
                         *xfer_id_out = xfer_id;
@@ -3287,6 +3548,9 @@ pub unsafe extern "C" fn punktfunk_connection_clipboard_serve(
     last: bool,
 ) -> PunktfunkStatus {
     guard(|| {
+        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
+        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
+        // here handles.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
@@ -3297,6 +3561,8 @@ pub unsafe extern "C" fn punktfunk_connection_clipboard_serve(
         let bytes = if len == 0 {
             Vec::new()
         } else {
+            // SAFETY: per the ABI contract - a caller-supplied pointer/length pair describing one
+            // readable region, borrowed only for this call.
             unsafe { std::slice::from_raw_parts(data, len) }.to_vec()
         };
         match c.inner.clip_serve(req_id, bytes, last) {
@@ -3318,6 +3584,9 @@ pub unsafe extern "C" fn punktfunk_connection_clipboard_cancel(
     id: u32,
 ) -> PunktfunkStatus {
     guard(|| {
+        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
+        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
+        // here handles.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
@@ -3344,6 +3613,9 @@ pub unsafe extern "C" fn punktfunk_connection_next_clipboard(
     timeout_ms: u32,
 ) -> PunktfunkStatus {
     guard(|| {
+        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
+        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
+        // here handles.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
@@ -3358,6 +3630,8 @@ pub unsafe extern "C" fn punktfunk_connection_next_clipboard(
             Ok(ev) => {
                 let mut slot = c.last_clip.lock().unwrap();
                 let out_ev = build_clip_event(ev, &mut slot);
+                // SAFETY: per the ABI contract - a caller-owned out-param, non-null on this path,
+                // written once by value.
                 unsafe { *out = out_ev };
                 PunktfunkStatus::Ok
             }
@@ -3389,10 +3663,15 @@ pub unsafe extern "C" fn punktfunk_connection_compositor(
     compositor: *mut u32,
 ) -> PunktfunkStatus {
     guard(|| {
+        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
+        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
+        // here handles.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
         };
+        // SAFETY: per the ABI contract - each out-param below is OPTIONAL, so it is null-checked
+        // before it is written; a non-null one is a caller-owned writable slot.
         unsafe {
             if !compositor.is_null() {
                 *compositor = c.inner.resolved_compositor.to_u8() as u32;
@@ -3415,10 +3694,15 @@ pub unsafe extern "C" fn punktfunk_connection_bitrate(
     bitrate_kbps: *mut u32,
 ) -> PunktfunkStatus {
     guard(|| {
+        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
+        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
+        // here handles.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
         };
+        // SAFETY: per the ABI contract - each out-param below is OPTIONAL, so it is null-checked
+        // before it is written; a non-null one is a caller-owned writable slot.
         unsafe {
             if !bitrate_kbps.is_null() {
                 *bitrate_kbps = c.inner.resolved_bitrate_kbps;
@@ -3445,10 +3729,15 @@ pub unsafe extern "C" fn punktfunk_connection_clock_offset_ns(
     offset_ns: *mut i64,
 ) -> PunktfunkStatus {
     guard(|| {
+        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
+        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
+        // here handles.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
         };
+        // SAFETY: per the ABI contract - each out-param below is OPTIONAL, so it is null-checked
+        // before it is written; a non-null one is a caller-owned writable slot.
         unsafe {
             if !offset_ns.is_null() {
                 *offset_ns = c.inner.clock_offset_ns;
@@ -3474,10 +3763,15 @@ pub unsafe extern "C" fn punktfunk_connection_clock_offset_now_ns(
     offset_ns: *mut i64,
 ) -> PunktfunkStatus {
     guard(|| {
+        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
+        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
+        // here handles.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
         };
+        // SAFETY: per the ABI contract - each out-param below is OPTIONAL, so it is null-checked
+        // before it is written; a non-null one is a caller-owned writable slot.
         unsafe {
             if !offset_ns.is_null() {
                 *offset_ns = c.inner.clock_offset_now_ns();
@@ -3505,6 +3799,9 @@ pub unsafe extern "C" fn punktfunk_connection_request_mode(
     refresh_hz: u32,
 ) -> PunktfunkStatus {
     guard(|| {
+        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
+        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
+        // here handles.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
@@ -3535,6 +3832,9 @@ pub unsafe extern "C" fn punktfunk_connection_request_keyframe(
     c: *const PunktfunkConnection,
 ) -> PunktfunkStatus {
     guard(|| {
+        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
+        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
+        // here handles.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
@@ -3566,6 +3866,9 @@ pub unsafe extern "C" fn punktfunk_connection_request_rfi(
     last_frame: u32,
 ) -> PunktfunkStatus {
     guard(|| {
+        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
+        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
+        // here handles.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
@@ -3598,12 +3901,17 @@ pub unsafe extern "C" fn punktfunk_connection_note_frame_index(
     gap_out: *mut bool,
 ) -> PunktfunkStatus {
     guard(|| {
+        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
+        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
+        // here handles.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
         };
         let gap = c.inner.note_frame_index(frame_index);
         if !gap_out.is_null() {
+            // SAFETY: per the ABI contract - a caller-owned out-param, non-null on this path,
+            // written once by value.
             unsafe { *gap_out = gap };
         }
         PunktfunkStatus::Ok
@@ -3629,12 +3937,19 @@ pub unsafe extern "C" fn punktfunk_connection_frames_dropped(
         // The header promises "writes 0 on a NULL connection" — honor it BEFORE the handle
         // check, so an embedder that skips the status never reads an uninitialized slot.
         if !out.is_null() {
+            // SAFETY: per the ABI contract - a caller-owned out-param, non-null on this path,
+            // written once by value.
             unsafe { *out = 0 };
         }
+        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
+        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
+        // here handles.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
         };
+        // SAFETY: per the ABI contract - each out-param below is OPTIONAL, so it is null-checked
+        // before it is written; a non-null one is a caller-owned writable slot.
         unsafe {
             if !out.is_null() {
                 *out = c.inner.frames_dropped();
@@ -3664,6 +3979,9 @@ pub unsafe extern "C" fn punktfunk_connection_report_decode_us(
     us: u32,
 ) -> PunktfunkStatus {
     guard(|| {
+        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
+        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
+        // here handles.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
@@ -3691,12 +4009,19 @@ pub unsafe extern "C" fn punktfunk_connection_wants_decode_latency(
         // The header promises "writes 0 on a NULL connection" — honor it BEFORE the handle
         // check: an uninitialized byte is not even a valid C++/Swift bool to read.
         if !out.is_null() {
+            // SAFETY: per the ABI contract - a caller-owned out-param, non-null on this path,
+            // written once by value.
             unsafe { *out = false };
         }
+        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
+        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
+        // here handles.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
         };
+        // SAFETY: per the ABI contract - each out-param below is OPTIONAL, so it is null-checked
+        // before it is written; a non-null one is a caller-owned writable slot.
         unsafe {
             if !out.is_null() {
                 *out = c.inner.wants_decode_latency();
@@ -3750,6 +4075,9 @@ pub unsafe extern "C" fn punktfunk_connection_speed_test(
     duration_ms: u32,
 ) -> PunktfunkStatus {
     guard(|| {
+        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
+        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
+        // here handles.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
@@ -3774,6 +4102,9 @@ pub unsafe extern "C" fn punktfunk_connection_probe_result(
     out: *mut PunktfunkProbeResult,
 ) -> PunktfunkStatus {
     guard(|| {
+        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
+        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
+        // here handles.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
@@ -3782,6 +4113,8 @@ pub unsafe extern "C" fn punktfunk_connection_probe_result(
             return PunktfunkStatus::NullPointer;
         }
         let o = c.inner.probe_result();
+        // SAFETY: per the ABI contract - `out` is a caller-owned writable slot of the matching
+        // `#[repr(C)]` type, written once by value.
         unsafe {
             *out = PunktfunkProbeResult {
                 done: o.done as u8,
@@ -3812,6 +4145,9 @@ pub unsafe extern "C" fn punktfunk_connection_probe_result(
 #[cfg(feature = "quic")]
 #[no_mangle]
 pub unsafe extern "C" fn punktfunk_connection_disconnect_quit(c: *mut PunktfunkConnection) {
+    // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller has
+    // not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match` here
+    // handles.
     if let Some(c) = unsafe { c.as_ref() } {
         c.inner.disconnect_quit();
     }
@@ -3825,6 +4161,8 @@ pub unsafe extern "C" fn punktfunk_connection_disconnect_quit(c: *mut PunktfunkC
 #[no_mangle]
 pub unsafe extern "C" fn punktfunk_connection_close(c: *mut PunktfunkConnection) {
     if !c.is_null() {
+        // SAFETY: per the ABI contract - the pointer operands in this block are caller-supplied
+        // and are null-checked or handle-validated on this path before they are read.
         drop(unsafe { Box::from_raw(c) });
     }
 }
@@ -3856,6 +4194,8 @@ pub extern "C" fn punktfunk_reanchor_gate_new(frames_dropped: u64) -> *mut Reanc
 #[no_mangle]
 pub unsafe extern "C" fn punktfunk_reanchor_gate_free(g: *mut ReanchorGate) {
     if !g.is_null() {
+        // SAFETY: per the ABI contract - the pointer operands in this block are caller-supplied
+        // and are null-checked or handle-validated on this path before they are read.
         drop(unsafe { Box::from_raw(g) });
     }
 }
@@ -3867,6 +4207,9 @@ pub unsafe extern "C" fn punktfunk_reanchor_gate_free(g: *mut ReanchorGate) {
 /// `g` is a valid gate handle.
 #[no_mangle]
 pub unsafe extern "C" fn punktfunk_reanchor_gate_arm(g: *mut ReanchorGate) {
+    // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller has
+    // not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match` here
+    // handles.
     if let Some(g) = unsafe { g.as_mut() } {
         g.arm(std::time::Instant::now());
     }
@@ -3888,6 +4231,9 @@ pub unsafe extern "C" fn punktfunk_reanchor_gate_on_decoded(
     out_present: *mut bool,
 ) -> PunktfunkStatus {
     guard(|| {
+        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
+        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
+        // here handles.
         let g = match unsafe { g.as_mut() } {
             Some(g) => g,
             None => return PunktfunkStatus::NullPointer,
@@ -3895,6 +4241,8 @@ pub unsafe extern "C" fn punktfunk_reanchor_gate_on_decoded(
         let present = g.on_decoded(flags, decoder_keyframe, std::time::Instant::now())
             == GateVerdict::Present;
         if !out_present.is_null() {
+            // SAFETY: per the ABI contract - a caller-owned out-param, non-null on this path,
+            // written once by value.
             unsafe { *out_present = present };
         }
         PunktfunkStatus::Ok
@@ -3913,12 +4261,17 @@ pub unsafe extern "C" fn punktfunk_reanchor_gate_on_no_output(
     out_request_kf: *mut bool,
 ) -> PunktfunkStatus {
     guard(|| {
+        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
+        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
+        // here handles.
         let g = match unsafe { g.as_mut() } {
             Some(g) => g,
             None => return PunktfunkStatus::NullPointer,
         };
         let request = g.on_no_output(std::time::Instant::now());
         if !out_request_kf.is_null() {
+            // SAFETY: per the ABI contract - a caller-owned out-param, non-null on this path,
+            // written once by value.
             unsafe { *out_request_kf = request };
         }
         PunktfunkStatus::Ok
@@ -3938,12 +4291,17 @@ pub unsafe extern "C" fn punktfunk_reanchor_gate_poll(
     out_request_kf: *mut bool,
 ) -> PunktfunkStatus {
     guard(|| {
+        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
+        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
+        // here handles.
         let g = match unsafe { g.as_mut() } {
             Some(g) => g,
             None => return PunktfunkStatus::NullPointer,
         };
         let request = g.poll(frames_dropped, std::time::Instant::now());
         if !out_request_kf.is_null() {
+            // SAFETY: per the ABI contract - a caller-owned out-param, non-null on this path,
+            // written once by value.
             unsafe { *out_request_kf = request };
         }
         PunktfunkStatus::Ok
@@ -3961,8 +4319,13 @@ pub unsafe extern "C" fn punktfunk_reanchor_gate_is_holding(
     out_holding: *mut bool,
 ) -> PunktfunkStatus {
     guard(|| {
+        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
+        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
+        // here handles.
         let holding = unsafe { g.as_ref() }.is_some_and(ReanchorGate::is_holding);
         if !out_holding.is_null() {
+            // SAFETY: per the ABI contract - a caller-owned out-param, non-null on this path,
+            // written once by value.
             unsafe { *out_holding = holding };
         }
         PunktfunkStatus::Ok

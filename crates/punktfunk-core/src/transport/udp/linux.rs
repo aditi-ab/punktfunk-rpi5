@@ -42,6 +42,8 @@ use libc::{mmsghdr, recvmmsg, sendmmsg};
 fn mmsghdrs(iovs: &mut [libc::iovec]) -> Vec<mmsghdr> {
     iovs.iter_mut()
         .map(|iov| {
+            // SAFETY: `mmsghdr` is a `repr(C)` POD of scalars and pointers, so all-zeroes is a
+            // valid bit pattern; every field the kernel reads is assigned right below.
             let mut h: mmsghdr = unsafe { std::mem::zeroed() };
             h.msg_hdr.msg_iov = iov;
             h.msg_hdr.msg_iovlen = 1;
@@ -123,9 +125,15 @@ fn send_one_gso(fd: libc::c_int, buf: &[u8], gso_size: u16) -> std::io::Result<(
         bytes: [u8; 64],
     }
     let mut control = CmsgBuf { bytes: [0u8; 64] };
+    // SAFETY: `msghdr` is a `repr(C)` POD of scalars and pointers, so all-zeroes is a valid bit
+    // pattern; every field the kernel reads is assigned below before the call.
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
+    // SAFETY: `control` and `iov` are locals that outlive the call. `msg_controllen` is set to
+    // `CMSG_SPACE(size_of::<u16>())`, which the 64-byte `CmsgBuf` covers, so the kernel cannot write
+    // past it; `CMSG_FIRSTHDR`/`CMSG_DATA` are the documented accessors for that buffer and the
+    // header they return is checked for null before it is written through.
     let rc = unsafe {
         msg.msg_control = control.bytes.as_mut_ptr() as *mut libc::c_void;
         msg.msg_controllen = libc::CMSG_SPACE(std::mem::size_of::<u16>() as u32) as _;
@@ -162,6 +170,9 @@ pub(super) fn send_batch(t: &UdpTransport, packets: &[&[u8]]) -> std::io::Result
             })
             .collect();
         let mut hdrs = mmsghdrs(&mut iovs);
+        // SAFETY: `fd` is the live socket, and `hdrs` is a local slice of `mmsghdr` whose length
+        // is passed alongside it; each header points at an `iov` in `iovs`, which outlives the
+        // call. The kernel only reads the buffers and writes each header's `msg_len`.
         let n = unsafe { sendmmsg(fd, hdrs.as_mut_ptr(), hdrs.len() as libc::c_uint, 0) };
         if n < 0 {
             let err = std::io::Error::last_os_error();
@@ -250,6 +261,9 @@ pub(super) fn recv_batch(
         })
         .collect();
     let mut hdrs = mmsghdrs(&mut iovs);
+    // SAFETY: `fd` is the live socket, and `hdrs` is a local slice of `mmsghdr` whose length is
+    // passed alongside it; each header points at an `iov` backed by a buffer in `bufs`, which
+    // outlives the call, so the kernel writes only inside those buffers.
     let n = unsafe {
         recvmmsg(
             fd,
