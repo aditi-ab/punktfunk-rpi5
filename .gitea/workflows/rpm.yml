@@ -59,6 +59,11 @@ jobs:
           dnf -y install gtk4-devel libadwaita-devel SDL3-devel vulkan-headers
           # sysext build (packaging/bazzite/build-sysext.sh): squashfs + SELinux labeling.
           dnf -y install squashfs-tools cpio libselinux-utils selinux-policy-targeted
+          # Fedora's own gamescope, for its RUNTIME libraries only — never shipped, never run. The
+          # sysext folds in our punktfunk-gamescope and verifies it by executing `--version`, and
+          # on a cache hit (the common case) nothing else in this job would have pulled libavif /
+          # luajit / seatd / SDL2 in. Cheap, and it tracks gamescope's dep list for us.
+          dnf -y install gamescope || true
           # bun builds the punktfunk-web console (--with web). Baked into the image; install it
           # here too so the job stays green against the PREVIOUS image (docker.yml bootstrap note).
           command -v bun >/dev/null || {
@@ -124,13 +129,62 @@ jobs:
           done
           echo "published to $OWNER/rpm/$GROUP"
 
+      # The HDR-capable gamescope the sysext carries (packaging/gamescope) — what lets the
+      # gamescope backend stream 10-bit BT.2020 PQ instead of 8-bit SDR.
+      #
+      # CACHED, and that is the whole reason this is affordable: it is a ~10-minute C++ meson build
+      # of an entirely separate tree that depends on NOTHING in this repo except
+      # `packaging/gamescope/**` (the patches and the upstream pin, which lives in the build
+      # script). So the key is that directory's hash and a normal push restores a binary instead of
+      # building one. Per-Fedora-major, because the binary is soname-coupled to its base exactly
+      # like the RPM is — an f43 build does not start on f44 (libavutil.so.59 vs .60).
+      - uses: actions/cache@v4
+        id: gamescope
+        with:
+          path: gs-cache
+          key: punktfunk-gamescope-f${{ matrix.fedver }}-${{ hashFiles('packaging/gamescope/**') }}
+
+      - name: Build the HDR gamescope
+        if: steps.gamescope.outputs.cache-hit != 'true'
+        # Best-effort ON PURPOSE. The sysext is the primary Bazzite delivery path and works without
+        # this binary (the host just stays SDR on the gamescope backend, which is what every
+        # release before this one did) — so a hiccup building someone else's tree must not cost the
+        # whole image. It is loud, though: the warning below, and `--gamescope` silently absent
+        # downstream is impossible because build-sysext.sh verifies the +pfhdr marker itself.
+        run: |
+          set -x
+          # `dnf builddep` resolves Fedora's PACKAGED gamescope, which is older than the master we
+          # pin, so it can come up short — xorg-x11-server-Xwayland-devel is the one that actually
+          # bites (wlroots' configure dies on a missing xserver.wrap several minutes in).
+          dnf -y install dnf-plugins-core meson ninja-build glslc || true
+          dnf builddep -y gamescope || true
+          dnf -y install xorg-x11-server-Xwayland-devel || true
+          if bash packaging/gamescope/build-punktfunk-gamescope.sh \
+               --destdir "$PWD/gs-stage" --prefix /usr --jobs "$(nproc)"; then
+            install -Dm0755 gs-stage/usr/bin/punktfunk-gamescope gs-cache/punktfunk-gamescope
+          else
+            echo "::warning::punktfunk-gamescope failed to build for f${{ matrix.fedver }} — the sysext ships without it (gamescope sessions stay SDR)"
+          fi
+
       # The no-layering Bazzite path: wrap the just-built host + web RPMs into a systemd-sysext
       # image and publish it to the per-Fedora-major feed (punktfunk-sysext/f43[-canary], …) that
       # `punktfunk-sysext install|update` reads. Same RPMs, same channels — just no rpm-ostree.
       - name: Build the sysext image
         run: |
+          # Execute it here rather than only handing it over: build-sysext.sh treats an unusable
+          # --version as fatal (rightly — it is how the +pfhdr marker is read), and a cached binary
+          # whose runtime libs are missing from this container must cost the image its HDR, not the
+          # image itself.
+          gs=()
+          if [ -x gs-cache/punktfunk-gamescope ] && gs-cache/punktfunk-gamescope --version >/dev/null 2>&1; then
+            gs=(--gamescope gs-cache/punktfunk-gamescope)
+            echo "folding in $(gs-cache/punktfunk-gamescope --version 2>&1 | head -1)"
+          else
+            echo "::warning::no usable punktfunk-gamescope for f${{ matrix.fedver }} — the sysext ships without it (gamescope sessions stay SDR)"
+          fi
           bash packaging/bazzite/build-sysext.sh --version-id "${{ matrix.fedver }}" \
             --out "dist-sysext/punktfunk-${PF_VERSION}-${PF_RELEASE}-x86-64.raw" \
+            "${gs[@]}" \
             dist/punktfunk-"${PF_VERSION}-${PF_RELEASE}"*.rpm \
             dist/punktfunk-web-"${PF_VERSION}-${PF_RELEASE}"*.rpm \
             dist/punktfunk-scripting-"${PF_VERSION}-${PF_RELEASE}"*.rpm

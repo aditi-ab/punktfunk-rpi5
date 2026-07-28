@@ -3,7 +3,13 @@
 #
 # An override rather than a from-scratch derivation on purpose: gamescope vendors wlroots,
 # vkroots, libliftoff, libdisplay-info, SPIRV-Headers and reshade as git submodules plus two meson
-# wraps, and nixpkgs already solves all of that. What we add is two patches and a rename.
+# wraps, and nixpkgs already solves all of that. What we add is the patch set and a rename.
+#
+# This is also why the override needs none of the `force_fallback_for` armour
+# `build-punktfunk-gamescope.sh` carries: that exists because meson silently prefers a SYSTEM
+# wlroots when the build host has one and links it shared, producing a binary that starts only on
+# machines with that dev library. A nix closure names every library it links, so the outcome is
+# whatever nixpkgs' own gamescope already does — reproducibly.
 #
 # `gamescope` in nixpkgs is a wrapper (it wires the WSI layer + capabilities); the buildable
 # derivation is `gamescope.unwrapped` — patching the wrapper would be a no-op, so this asserts on
@@ -20,23 +26,44 @@
   patchDir,
 }:
 let
+  # As of nixos-unstable (checked 2026-07-28) `gamescope` IS the buildable derivation — pname
+  # "gamescope", version 3.16.25, carrying `src`/`patches`/`mesonFlags`. Revisions that wrap it
+  # (to wire the WSI layer + capabilities) expose the build as `.unwrapped`, so prefer that where
+  # it exists and take `gamescope` itself otherwise.
+  #
+  # The check is on the RESULT, not on which attribute we found: `overrideAttrs` on a symlinkJoin
+  # wrapper succeeds and does nothing, which would hand us an UNPATCHED gamescope installed under
+  # our own name — the single worst outcome here, because the host reads the name as a promise of
+  # HDR. (`installCheckPhase` below greps for the marker as the second line of defence; this one
+  # fails at eval, before anything is built.)
+  base = gamescope.unwrapped or gamescope;
   unwrapped =
-    gamescope.unwrapped or (throw ''
-      punktfunk-gamescope needs `gamescope.unwrapped` (the buildable derivation behind nixpkgs'
-      gamescope wrapper) and this nixpkgs does not expose it. Update nixpkgs, or build the
-      compositor with packaging/gamescope/build-punktfunk-gamescope.sh instead.
-    '');
+    if base ? src then
+      base
+    else
+      throw ''
+        punktfunk-gamescope needs a buildable gamescope derivation (one with a `src` that
+        `overrideAttrs` can patch); this nixpkgs' `gamescope` is neither that nor a wrapper
+        exposing `.unwrapped`. Update nixpkgs, or build the compositor with
+        packaging/gamescope/build-punktfunk-gamescope.sh instead.
+      '';
 in
 unwrapped.overrideAttrs (old: {
   pname = "punktfunk-gamescope";
 
-  patches = (old.patches or [ ]) ++ [
-    "${patchDir}/0001-pipewire-offer-10-bit-BT.2020-PQ-capture-formats-HDR.patch"
-    "${patchDir}/0002-punktfunk-stamp-the-version-banner-with-pfhdr1.patch"
-  ];
+  # Read the patch DIRECTORY rather than naming files: `builtins.attrNames` sorts
+  # lexicographically, which for `000N-` prefixes is exactly the apply order, and a patch added or
+  # renamed upstream of this file can no longer leave nix silently building a subset. (That already
+  # happened once — this list still named the level-1 banner patch after level 2 landed, so a nix
+  # build would have shipped a binary with no cursor patch and a marker claiming otherwise.)
+  patches =
+    (old.patches or [ ])
+    ++ map (f: "${patchDir}/${f}") (
+      builtins.filter (lib.hasSuffix ".patch") (builtins.attrNames (builtins.readDir patchDir))
+    );
 
   # nixpkgs builds from a `fetchFromGitHub` src, so there is no `.git` for `git describe` and the
-  # banner would read `+pfhdr1 (gcc …)` with no version at all — which the host's diagnostic
+  # banner would read `+pfhdr2 (gcc …)` with no version at all — which the host's diagnostic
   # version gate then misreads (it takes the first X.Y.Z triple it finds, i.e. the compiler's).
   # Substituting the real version in keeps `--version` honest AND keeps our marker.
   postPatch = (old.postPatch or "") + ''

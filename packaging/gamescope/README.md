@@ -47,8 +47,18 @@ Bump it whenever a patch adds or changes something the host must know about befo
 SteamOS PATH shim) pass these flags through `PF_HDR_ARGS`, so they share one dependency: if the
 session ignores `GAMESCOPE_BIN`/`PATH` and execs the distro's gamescope, it gets neither the HDR
 formats nor the cursor flag. HDR fails loudly there (the capture negotiation times out and latches
-an SDR downgrade); a missing cursor would be silent. Worth a post-spawn `/proc/<pid>/cmdline` check
-if that ever bites.
+an SDR downgrade) — but a missing cursor would be silent, because the host was told the compositor
+would paint the pointer and so painted none itself.
+
+Both managed paths therefore **verify after spawn**: once the session's node appears,
+`verify_managed_spawn_flags` reads the running compositor's `/proc/<pid>/cmdline` and refuses the
+session if a flag we passed isn't there. The plan is fixed by then (`cursor_blend` feeds the encoder
+open, which precedes the display), so the session cannot be corrected in place — instead the
+capability is latched off for the process and the spawn fails, and the retry resolves a correct SDR
+host-composited session. One rejected attempt per boot, then it converges.
+
+The check fails **open** at every ambiguity: no flags expected, or no readable gamescope in
+`/proc`, says nothing. Only a compositor we can see, missing a flag we can name, fails.
 
 ## Which binary the host runs
 
@@ -106,6 +116,28 @@ own binary. Mirror it if you install ours system-wide:
 ```sh
 setcap 'CAP_SYS_NICE=eip' /usr/bin/punktfunk-gamescope
 ```
+
+## How each channel ships it
+
+Four packaging paths, one build recipe — `build-punktfunk-gamescope.sh` — because the two things
+that are easy to get wrong (which patches get applied, and whether wlroots is linked statically)
+must not be decided twice.
+
+| Channel | Built by | Notes |
+|---|---|---|
+| Bazzite / Fedora Atomic | `.gitea/workflows/rpm.yml` → `build-sysext.sh --gamescope` | Inside the matching Fedora container, per major — the binary is soname-coupled to its base exactly like the RPM |
+| Arch / SteamOS | `.gitea/workflows/arch.yml` → `makepkg` on `./PKGBUILD` | Its own pkgbase in the same pacman repo; `pacman -S punktfunk-gamescope` |
+| NixOS | `packaging/nix/gamescope.nix` (an `overrideAttrs` on nixpkgs' gamescope) | The one path that does NOT call the script — nixpkgs already solves the submodules, and a nix closure names every library it links |
+| Anything else | the script, by hand | See *Building* above |
+
+Both CI builds are **cached on `packaging/gamescope/**`** and **best-effort**. Cached because this
+tree depends on nothing else in the repo, so a normal push restores a binary instead of spending
+ten minutes on someone else's C++; best-effort because punktfunk works without it (SDR on the
+gamescope backend, which is what every release before this one did) and a hiccup building gamescope
+must not cost the packages those workflows exist to publish. A failed build emits a `::warning::`
+and is never cached, so the next run retries.
+
+Note what is NOT in that table: the `.deb`. Debian/Ubuntu boxes build it by hand for now.
 
 ## Verifying the patch on a box (P0 exit)
 

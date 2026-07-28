@@ -112,10 +112,48 @@ jobs:
             makepkg -f -d --holdver
           ls -lh "$GITHUB_WORKSPACE/dist"
 
+      # The optional HDR gamescope companion (packaging/gamescope) — a separate pkgbase with a
+      # completely different dependency set, published into the same repo so `pacman -S
+      # punktfunk-gamescope` is all an Arch/SteamOS box needs for 10-bit BT.2020 PQ.
+      #
+      # CACHED on `packaging/gamescope/**`: it depends on nothing else in this repo, so a normal
+      # push restores the built package instead of spending ~10 minutes on someone else's C++ tree.
+      # Arch is rolling, so the cache is invalidated by our own patch changes only — a stale binary
+      # against newer system libs is the same risk the distro's own package carries between rebuilds.
+      - uses: actions/cache@v4
+        id: gamescope
+        with:
+          path: dist-gamescope
+          key: punktfunk-gamescope-arch-${{ hashFiles('packaging/gamescope/**') }}
+
+      - name: Build punktfunk-gamescope (makepkg)
+        if: steps.gamescope.outputs.cache-hit != 'true'
+        # Best-effort: punktfunk-host works without it (SDR on the gamescope backend), and a
+        # failure building gamescope must not cost the packages this workflow exists to publish.
+        run: |
+          set -x
+          pacman -S --noconfirm --needed \
+            glslang libcap libdrm libinput libx11 libxcomposite libxdamage libxext \
+            libxkbcommon libxmu libxrender libxres libxtst libxxf86vm libavif libdecor \
+            hwdata luajit pipewire seatd sdl2-compat vulkan-icd-loader wayland \
+            xcb-util-errors xcb-util-wm xorg-xwayland \
+            meson cmake glm wayland-protocols benchmark libxcursor || true
+          mkdir -p dist-gamescope && chown builder: dist-gamescope
+          chown -R builder: packaging/gamescope
+          if sudo -u builder env PKGDEST="$GITHUB_WORKSPACE/dist-gamescope" \
+               bash -c 'cd packaging/gamescope && makepkg -f -d --holdver'; then
+            ls -lh dist-gamescope
+          else
+            echo "::warning::punktfunk-gamescope failed to build — Arch boxes stay SDR on the gamescope backend this run"
+            rm -rf dist-gamescope   # never cache a failed build (an empty path is not saved)
+          fi
+
       - name: Publish to the Gitea Arch registry
         env:
           TOKEN: ${{ secrets.REGISTRY_TOKEN }}
         run: |
+          # The gamescope companion rides the same loop (same repo, same channel).
+          cp -f dist-gamescope/*.pkg.tar.zst dist/ 2>/dev/null || true
           for pkg in dist/*.pkg.tar.zst; do
             echo "uploading $pkg"
             NAME=$(bsdtar -xOf "$pkg" .PKGINFO | sed -n 's/^pkgname = //p')
