@@ -8,7 +8,11 @@
 //!   [`punktfunk_session_free`]. A [`PunktfunkFrame`]'s `data` is borrowed until the next
 //!   `poll`/`free` on that session — copy it out before then.
 //! - Versioned: [`punktfunk_abi_version`] + `PunktfunkConfig::struct_size` for forward-compat.
-//! - Panics never cross the boundary: every entry point is wrapped in `catch_unwind`.
+//! - Panics never cross the boundary. Status-returning entry points use [`guard`], which reports a
+//!   panic as `PunktfunkStatus::Panic`; the teardown/mutator ones that return nothing use
+//!   [`guard_void`], which swallows and logs. The remaining bare ones are bare ON PURPOSE and only
+//!   because they cannot panic: [`punktfunk_abi_version`] returns a constant, and the
+//!   `punktfunk_connect*` shims forward every argument unchanged into a guarded implementation.
 
 // THE ABI CONTRACT, stated once - most `// SAFETY:` proofs below are an instance of it.
 //
@@ -211,6 +215,17 @@ fn guard<F: FnOnce() -> PunktfunkStatus>(f: F) -> PunktfunkStatus {
     std::panic::catch_unwind(AssertUnwindSafe(f)).unwrap_or(PunktfunkStatus::Panic)
 }
 
+/// `guard` for the entry points that return nothing — the teardown/mutator calls, which have no
+/// status to report a panic through. They still must not let one unwind into C: since Rust 1.81
+/// that is a hard abort rather than undefined behaviour, but aborting the CALLER'S process because
+/// one of our `Drop` impls hit a poisoned mutex is not an acceptable failure mode for a library.
+/// Swallowing is right here — the object is being torn down either way.
+fn guard_void<F: FnOnce()>(f: F) {
+    if std::panic::catch_unwind(AssertUnwindSafe(f)).is_err() {
+        tracing::error!("panic escaped a punktfunk_* teardown entry point; swallowed at the C ABI");
+    }
+}
+
 fn new_handle(session: Session) -> *mut PunktfunkSession {
     Box::into_raw(Box::new(PunktfunkSession {
         inner: session,
@@ -382,11 +397,13 @@ pub unsafe extern "C" fn punktfunk_test_loopback_pair(
 /// `s` must be a handle from `punktfunk_session_new`/`punktfunk_test_loopback_pair`, freed once.
 #[no_mangle]
 pub unsafe extern "C" fn punktfunk_session_free(s: *mut PunktfunkSession) {
-    if !s.is_null() {
-        // SAFETY: per the ABI contract - the pointer operands in this block are caller-supplied
-        // and are null-checked or handle-validated on this path before they are read.
-        drop(unsafe { Box::from_raw(s) });
-    }
+    guard_void(|| {
+        if !s.is_null() {
+            // SAFETY: per the ABI contract - the pointer operands in this block are caller-supplied
+            // and are null-checked or handle-validated on this path before they are read.
+            drop(unsafe { Box::from_raw(s) });
+        }
+    });
 }
 
 /// Host: FEC-protect, packetize, seal and send one encoded access unit.
@@ -4145,12 +4162,14 @@ pub unsafe extern "C" fn punktfunk_connection_probe_result(
 #[cfg(feature = "quic")]
 #[no_mangle]
 pub unsafe extern "C" fn punktfunk_connection_disconnect_quit(c: *mut PunktfunkConnection) {
-    // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller has
-    // not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match` here
-    // handles.
-    if let Some(c) = unsafe { c.as_ref() } {
-        c.inner.disconnect_quit();
-    }
+    guard_void(|| {
+        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller has
+        // not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match` here
+        // handles.
+        if let Some(c) = unsafe { c.as_ref() } {
+            c.inner.disconnect_quit();
+        }
+    });
 }
 
 /// Close the connection and free the handle (joins the internal threads). NULL is a no-op.
@@ -4160,11 +4179,13 @@ pub unsafe extern "C" fn punktfunk_connection_disconnect_quit(c: *mut PunktfunkC
 #[cfg(feature = "quic")]
 #[no_mangle]
 pub unsafe extern "C" fn punktfunk_connection_close(c: *mut PunktfunkConnection) {
-    if !c.is_null() {
-        // SAFETY: per the ABI contract - the pointer operands in this block are caller-supplied
-        // and are null-checked or handle-validated on this path before they are read.
-        drop(unsafe { Box::from_raw(c) });
-    }
+    guard_void(|| {
+        if !c.is_null() {
+            // SAFETY: per the ABI contract - the pointer operands in this block are caller-supplied
+            // and are null-checked or handle-validated on this path before they are read.
+            drop(unsafe { Box::from_raw(c) });
+        }
+    });
 }
 
 // ---- Post-loss re-anchor freeze gate ----
@@ -4193,11 +4214,13 @@ pub extern "C" fn punktfunk_reanchor_gate_new(frames_dropped: u64) -> *mut Reanc
 /// `g` was returned by [`punktfunk_reanchor_gate_new`] and is not used after this call.
 #[no_mangle]
 pub unsafe extern "C" fn punktfunk_reanchor_gate_free(g: *mut ReanchorGate) {
-    if !g.is_null() {
-        // SAFETY: per the ABI contract - the pointer operands in this block are caller-supplied
-        // and are null-checked or handle-validated on this path before they are read.
-        drop(unsafe { Box::from_raw(g) });
-    }
+    guard_void(|| {
+        if !g.is_null() {
+            // SAFETY: per the ABI contract - the pointer operands in this block are caller-supplied
+            // and are null-checked or handle-validated on this path before they are read.
+            drop(unsafe { Box::from_raw(g) });
+        }
+    });
 }
 
 /// Arm the freeze: a loss was detected (a frame-index gap, or a decoder wedge/demotion). Zeroes the
@@ -4207,12 +4230,14 @@ pub unsafe extern "C" fn punktfunk_reanchor_gate_free(g: *mut ReanchorGate) {
 /// `g` is a valid gate handle.
 #[no_mangle]
 pub unsafe extern "C" fn punktfunk_reanchor_gate_arm(g: *mut ReanchorGate) {
-    // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller has
-    // not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match` here
-    // handles.
-    if let Some(g) = unsafe { g.as_mut() } {
-        g.arm(std::time::Instant::now());
-    }
+    guard_void(|| {
+        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller has
+        // not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match` here
+        // handles.
+        if let Some(g) = unsafe { g.as_mut() } {
+            g.arm(std::time::Instant::now());
+        }
+    });
 }
 
 /// Fold one decoded frame and write to `out_present` whether to display it (`true`) or withhold it as
