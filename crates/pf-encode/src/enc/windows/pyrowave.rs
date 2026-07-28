@@ -22,6 +22,13 @@
 //! The capture side (a BGRA→YUV CSC into two shareable plane textures + a shared fence, gated on the
 //! pyrowave session flag) lives in `pf-capture` (`windows/idd_push.rs`); the CbCr plane + fence ride
 //! the frame on [`pf_frame::dxgi::D3d11Frame::pyro`], the Y plane on `D3d11Frame::texture`.
+// UNSAFE-LINT EXEMPTION (rationale + exit criteria: `unsafe_op_in_unsafe_fn` in the workspace
+// Cargo.toml). This body is `pyrowave-sys` C-API plus D3D11/Vulkan interop calls almost line for
+// line; narrowing it would add one `unsafe {}` plus one SAFETY comment per call that could only
+// restate the signature. Clearing this file means DELETING the markers that carry no caller
+// contract, not wrapping the calls — until then the lint is off HERE and enforced everywhere else.
+#![allow(unsafe_op_in_unsafe_fn)]
+
 // Every `unsafe` block in this module carries a `// SAFETY:` proof (the crate root enforces it).
 
 use crate::pyrowave_wire;

@@ -60,11 +60,30 @@ repository = "https://git.unom.io/unom/punktfunk"
 # workspace. `unsafe fn` marks a CONTRACT the caller must uphold; it is not a licence for the whole
 # body to skip checking. Without this lint an `unsafe fn` body is unchecked end to end, so a 600-line
 # function hides which handful of lines are actually the unsafe ones — exactly the reviewer-hostile
-# shape we are working down. `warn` while the remaining sites are cleared crate by crate; flip to
-# `deny` once they are, so it can never regress. (This is the Rust 2024 default; adopting it early
-# also pays off the edition migration.)
+# shape we are working down. (This is the Rust 2024 default; adopting it early also pays off the
+# edition migration.)
+#
+# `deny`, not `warn`. `warn` was never actually a softer setting: CI runs `cargo clippy … -D
+# warnings`, which promotes it to a hard error anyway — that is how adopting this lint turned main
+# red on every platform for a day without the level in this file ever saying `deny`. A level that
+# lies about its own severity is worse than a strict one, so this now states what CI already does,
+# and the exemptions are written down per file instead of hiding in a 689-warning wall nobody reads.
+#
+# THE EXEMPTIONS. Fourteen GPU/FFI backend files carry `#![allow(unsafe_op_in_unsafe_fn)]` with a
+# one-line reason each. They are not "not done yet" — they are where this lint stops paying:
+# their bodies are ash/CUDA/AMF/libav calls almost line for line (measured: 64% of the sites are a
+# single third-party FFI call, and of the 44 `unsafe fn`s in them only 4 have a body containing no
+# unsafe operation at all). Narrowing them means one `unsafe {}` per line plus, since pf-encode also
+# denies `clippy::undocumented_unsafe_blocks`, one hand-written SAFETY comment per line that could
+# only ever restate "an ash call on a live device" — the precise noise that made `unsafe` stop
+# meaning anything here before (see the header of `pf-win-display/src/win_display.rs`).
+#
+# Everything else in the workspace is at zero and enforced. Removing one of those allows, file by
+# file, is real work with a real payoff; blanket-narrowing all fourteen is not. Prefer DELETING an
+# `unsafe fn` marker over wrapping its body: keep the marker only where a caller can actually break
+# something (a raw pointer, a borrowed HANDLE, a GPU object that must not be in flight).
 [workspace.lints.rust]
-unsafe_op_in_unsafe_fn = "warn"
+unsafe_op_in_unsafe_fn = "deny"
 
 [profile.release]
 opt-level = 3

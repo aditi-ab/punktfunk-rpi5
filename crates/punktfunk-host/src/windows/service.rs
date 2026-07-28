@@ -658,11 +658,14 @@ unsafe fn spawn_host(
 
     // Take ownership of the process + thread handles the API filled into `pi`; the returned `Child`
     // closes BOTH on drop, so the supervise loop no longer hand-closes them in its match arms.
-    // SAFETY: `created` was `Ok`, so `pi` holds two distinct owned handles that nothing else closes;
-    // wrapping each transfers that ownership to an `OwnedHandle`, which closes it exactly once.
+    // SAFETY: `created` was `Ok`, so `pi.hProcess` is an owned handle nothing else closes; wrapping
+    // it transfers that ownership to the `OwnedHandle`, which closes it exactly once.
+    let process = unsafe { OwnedHandle::from_raw_handle(pi.hProcess.0) };
+    // SAFETY: the same, for the distinct thread handle `CreateProcessAsUserW` filled in.
+    let thread = unsafe { OwnedHandle::from_raw_handle(pi.hThread.0) };
     Ok(Child {
-        process: unsafe { OwnedHandle::from_raw_handle(pi.hProcess.0) },
-        _thread: unsafe { OwnedHandle::from_raw_handle(pi.hThread.0) },
+        process,
+        _thread: thread,
         pid: pi.dwProcessId,
     })
 }

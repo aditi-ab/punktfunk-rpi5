@@ -19,6 +19,13 @@
 //! hwdevice/hwframes/buffersrc/buffersink calls go through `ffmpeg::ffi` (= `ffmpeg_sys_next`),
 //! as the CUDA encode path and the clients' decode paths already do. The encoder is opened
 //! *without* a global header, so VPS/SPS/PPS are in-band on every IDR.
+// UNSAFE-LINT EXEMPTION (rationale + exit criteria: `unsafe_op_in_unsafe_fn` in the workspace
+// Cargo.toml). This body is raw libav (`ffmpeg-sys-next`) calls on borrowed AVFrame/AVBuffer
+// pointers almost line for line; narrowing it would add one `unsafe {}` plus one SAFETY comment per
+// call that could only restate the signature. Clearing this file means DELETING the markers that
+// carry no caller contract, not wrapping the calls — until then the lint is off HERE and enforced
+// everywhere else.
+#![allow(unsafe_op_in_unsafe_fn)]
 // Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
 #![deny(clippy::undocumented_unsafe_blocks)]
 

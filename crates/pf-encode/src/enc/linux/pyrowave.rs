@@ -21,6 +21,13 @@
 //! on every AU. NOTE: until Phase 2 lands `CODEC_PYROWAVE` negotiation + a client decoder,
 //! no shipping client can decode this — the backend is reachable only via an explicit
 //! `PUNKTFUNK_ENCODER=pyrowave` and logs that loudly.
+// UNSAFE-LINT EXEMPTION (rationale + exit criteria: `unsafe_op_in_unsafe_fn` in the workspace
+// Cargo.toml). This body is `pyrowave-sys` C-API and ash/Vulkan compute calls almost line for line;
+// narrowing it would add one `unsafe {}` plus one SAFETY comment per call that could only restate
+// the signature. Clearing this file means DELETING the markers that carry no caller contract, not
+// wrapping the calls — until then the lint is off HERE and enforced everywhere else.
+#![allow(unsafe_op_in_unsafe_fn)]
+
 // Every unsafe block in this module carries a `// SAFETY:` proof (parent module enforces it).
 
 use super::vk_util::{

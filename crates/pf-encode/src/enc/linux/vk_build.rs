@@ -6,6 +6,13 @@
 //! visibility churn, and ~800 lines of construction `unsafe` get their own review surface.
 //! Steady-state encode logic stays in the parent.
 
+// UNSAFE-LINT EXEMPTION (rationale + exit criteria: `unsafe_op_in_unsafe_fn` in the workspace
+// Cargo.toml). This body is raw ash/Vulkan object construction and bitstream writing almost line
+// for line; narrowing it would add one `unsafe {}` plus one SAFETY comment per call that could only
+// restate the signature. Clearing this file means DELETING the markers that carry no caller
+// contract, not wrapping the calls — until then the lint is off HERE and enforced everywhere else.
+#![allow(unsafe_op_in_unsafe_fn)]
+
 // The parent's whole item namespace (Frame, the consts, sibling helpers) — the point of the
 // child-module shape. External imports are this file's own; `vk_util` is a crate-root sibling,
 // so the path is `crate::`, not the parent-relative `super::` the parent uses.

@@ -1,6 +1,13 @@
 //! Small ash/Vulkan leaf helpers shared by the Linux Vulkan encode backends
 //! (`vulkan_video.rs`, `pyrowave.rs`) — extracted verbatim from `vulkan_video.rs`
 //! when the PyroWave backend arrived so the two don't fork copies.
+// UNSAFE-LINT EXEMPTION (rationale + exit criteria: `unsafe_op_in_unsafe_fn` in the workspace
+// Cargo.toml). This body is raw ash/Vulkan object construction almost line for line; narrowing it
+// would add one `unsafe {}` plus one SAFETY comment per call that could only restate the signature.
+// Clearing this file means DELETING the markers that carry no caller contract, not wrapping the
+// calls — until then the lint is off HERE and enforced everywhere else.
+#![allow(unsafe_op_in_unsafe_fn)]
+
 // Every unsafe block carries a `// SAFETY:` proof (parent module enforces it).
 
 use anyhow::Result;

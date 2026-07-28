@@ -732,10 +732,6 @@ fn group(title: &str, description: &str) -> adw::PreferencesGroup {
     g
 }
 
-/// `on_closed` runs after the settings are saved (the app shell refreshes the hosts grid
-/// there so the library toggle takes effect without a nav round-trip). `probes` is the
-/// shell's startup device probe (`AppModel::probes`) — may still be empty. Returns the
-/// presented dialog so the screenshot harness can select a page; callers ignore it.
 /// The dialog in a given [`Scope`]. `on_scope` asks the app to re-open it in another one:
 /// switching scope closes this dialog first, so the layer being edited is committed before
 /// the next one is loaded, and there is exactly one place that builds the rows.

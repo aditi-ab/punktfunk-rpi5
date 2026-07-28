@@ -1,4 +1,10 @@
 //! FFmpeg Vulkan Video decode over the presenter's own VkDevice (zero-copy VkImage).
+// UNSAFE-LINT EXEMPTION (rationale + exit criteria: `unsafe_op_in_unsafe_fn` in the workspace
+// Cargo.toml). This body is raw libav + ash calls on the presenter's VkDevice almost line for line;
+// narrowing it would add one `unsafe {}` plus one SAFETY comment per call that could only restate
+// the signature. Clearing this file means DELETING the markers that carry no caller contract, not
+// wrapping the calls — until then the lint is off HERE and enforced everywhere else.
+#![allow(unsafe_op_in_unsafe_fn)]
 #![allow(clippy::unnecessary_cast)]
 
 use crate::video::{

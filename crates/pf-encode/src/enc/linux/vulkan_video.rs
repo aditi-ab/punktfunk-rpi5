@@ -10,6 +10,12 @@
 //! VAAPI instead). Proven end-to-end in `punktfunk-planning/design/vkenc-probe-harness`.
 //! Opt-in via `PUNKTFUNK_VULKAN_ENCODE`; gated to HEVC/AV1 + a device that advertises the encode op.
 //! The AV1 encode structs our pinned `ash 0.38` predates are vendored in `vk_av1_encode.rs`.
+// UNSAFE-LINT EXEMPTION (rationale + exit criteria: `unsafe_op_in_unsafe_fn` in the workspace
+// Cargo.toml). This body is raw ash/Vulkan Video calls against an app-owned DPB almost line for
+// line; narrowing it would add one `unsafe {}` plus one SAFETY comment per call that could only
+// restate the signature. Clearing this file means DELETING the markers that carry no caller
+// contract, not wrapping the calls — until then the lint is off HERE and enforced everywhere else.
+#![allow(unsafe_op_in_unsafe_fn)]
 #![allow(clippy::too_many_arguments)]
 
 use super::vk_util::{

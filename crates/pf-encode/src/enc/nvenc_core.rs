@@ -5,6 +5,13 @@
 //! `libloading`), the device binding (D3D11 vs CUDA), input-surface registration, and the
 //! Windows-only async retrieve — stay in their backends. Sibling of [`super::nvenc_status`].
 
+// UNSAFE-LINT EXEMPTION (rationale + exit criteria: `unsafe_op_in_unsafe_fn` in the workspace
+// Cargo.toml). This body is raw `nvEncodeAPI` entry-table calls almost line for line; narrowing it
+// would add one `unsafe {}` plus one SAFETY comment per call that could only restate the signature.
+// Clearing this file means DELETING the markers that carry no caller contract, not wrapping the
+// calls — until then the lint is off HERE and enforced everywhere else.
+#![allow(unsafe_op_in_unsafe_fn)]
+
 use super::Codec;
 use nvidia_video_codec_sdk::sys::nvEncodeAPI as nv;
 

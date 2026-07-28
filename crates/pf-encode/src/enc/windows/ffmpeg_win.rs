@@ -37,6 +37,13 @@
 //! through `ffmpeg::ffi` (= `ffmpeg_sys_next`), exactly as the Linux CUDA/VAAPI paths do. The
 //! `AVD3D11VADeviceContext`/`AVD3D11VAFramesContext` layouts are mirrored (the bindings don't
 //! allowlist `hwcontext_d3d11va.h`), as [`super::linux`] mirrors `AVCUDADeviceContext`.
+// UNSAFE-LINT EXEMPTION (rationale + exit criteria: `unsafe_op_in_unsafe_fn` in the workspace
+// Cargo.toml). This body is raw libav (`ffmpeg-sys-next`) calls on borrowed hwcontext pointers
+// almost line for line; narrowing it would add one `unsafe {}` plus one SAFETY comment per call
+// that could only restate the signature. Clearing this file means DELETING the markers that carry
+// no caller contract, not wrapping the calls — until then the lint is off HERE and enforced
+// everywhere else.
+#![allow(unsafe_op_in_unsafe_fn)]
 // Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
 #![deny(clippy::undocumented_unsafe_blocks)]
 

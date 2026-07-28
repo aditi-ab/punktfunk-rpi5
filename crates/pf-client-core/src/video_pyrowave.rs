@@ -29,6 +29,13 @@
 //! rings are retired, not destroyed — the presenter may still hold their views (see
 //! [`RETIRE_HANDOVERS`]).
 
+// UNSAFE-LINT EXEMPTION (rationale + exit criteria: `unsafe_op_in_unsafe_fn` in the workspace
+// Cargo.toml). This body is `pyrowave-sys` C-API and ash/Vulkan compute calls almost line for line;
+// narrowing it would add one `unsafe {}` plus one SAFETY comment per call that could only restate
+// the signature. Clearing this file means DELETING the markers that carry no caller contract, not
+// wrapping the calls — until then the lint is off HERE and enforced everywhere else.
+#![allow(unsafe_op_in_unsafe_fn)]
+
 use crate::video::{ColorDesc, VulkanDecodeDevice};
 use anyhow::{bail, Context as _, Result};
 use ash::vk;
