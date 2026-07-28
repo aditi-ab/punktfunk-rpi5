@@ -58,6 +58,19 @@ struct AVCUDADeviceContext {
     internal: *mut std::ffi::c_void, // filled by ctx_init
 }
 
+// A hand-written mirror of libav's `AVCUDADeviceContext` (hwcontext_cuda.h) — `ffmpeg-sys-next`
+// does not bind it, so this is the only definition, and `CudaHw::new` WRITES `cuda_ctx` through it.
+// A wrong offset here would not fail to compile or crash; it would scribble over libav's internal
+// pointer. Nothing checked that until this block: the realistic failure is someone adding or
+// reordering a field here, which these assertions turn into a build error.
+const _: () = {
+    use std::mem::{offset_of, size_of};
+    assert!(size_of::<AVCUDADeviceContext>() == 3 * size_of::<*mut std::ffi::c_void>());
+    assert!(offset_of!(AVCUDADeviceContext, cuda_ctx) == 0);
+    assert!(offset_of!(AVCUDADeviceContext, stream) == size_of::<*mut std::ffi::c_void>());
+    assert!(offset_of!(AVCUDADeviceContext, internal) == 2 * size_of::<*mut std::ffi::c_void>());
+};
+
 /// CUDA hardware-frame contexts that wrap our shared `CUcontext`, so `hevc_nvenc` reads the
 /// imported device buffer directly. Owns two `AVBufferRef`s, unref'd on drop.
 struct CudaHw {

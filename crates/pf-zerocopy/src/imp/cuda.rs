@@ -1401,30 +1401,6 @@ pub fn copy_pitched_nv12_to_buffer(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::mem::{offset_of, size_of};
-
-    /// The external-semaphore param structs are hand-flattened from cuda.h unions — assert the
-    /// layout against the C definitions so a transcription slip fails in CI, not in the driver.
-    #[test]
-    fn external_semaphore_struct_layouts_match_cuda_h() {
-        // CUDA_EXTERNAL_SEMAPHORE_HANDLE_DESC: type(4)+pad(4)+union(16)+flags(4)+reserved(64) = 96.
-        assert_eq!(size_of::<CUDA_EXTERNAL_SEMAPHORE_HANDLE_DESC>(), 96);
-        assert_eq!(offset_of!(CUDA_EXTERNAL_SEMAPHORE_HANDLE_DESC, handle), 8);
-        assert_eq!(offset_of!(CUDA_EXTERNAL_SEMAPHORE_HANDLE_DESC, flags), 24);
-
-        // CUDA_EXTERNAL_SEMAPHORE_SIGNAL_PARAMS: params{fence(8)+nvSciSync(8)+keyedMutex(8)+
-        // reserved[12](48)} = 72, flags at 72, reserved[16] → 144 total.
-        assert_eq!(size_of::<CUDA_EXTERNAL_SEMAPHORE_SIGNAL_PARAMS>(), 144);
-        assert_eq!(offset_of!(CUDA_EXTERNAL_SEMAPHORE_SIGNAL_PARAMS, value), 0);
-        assert_eq!(offset_of!(CUDA_EXTERNAL_SEMAPHORE_SIGNAL_PARAMS, flags), 72);
-
-        // CUDA_EXTERNAL_SEMAPHORE_WAIT_PARAMS: params{fence(8)+nvSciSync(8)+keyedMutex(16,
-        // tail-padded)+reserved[10](40)} = 72, flags at 72, reserved[16] → 144 total.
-        assert_eq!(size_of::<CUDA_EXTERNAL_SEMAPHORE_WAIT_PARAMS>(), 144);
-        assert_eq!(offset_of!(CUDA_EXTERNAL_SEMAPHORE_WAIT_PARAMS, value), 0);
-        assert_eq!(offset_of!(CUDA_EXTERNAL_SEMAPHORE_WAIT_PARAMS, flags), 72);
-    }
-}
+// The cuda.h struct layouts these calls depend on are asserted at COMPILE time in `ffi.rs`
+// (`const _`), which covers all six structs and every build — the runtime test that used to live
+// here checked three of them and only when someone ran it.

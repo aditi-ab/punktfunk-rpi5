@@ -149,6 +149,32 @@ struct AVD3D11VAFramesContext {
     texture_infos: *mut c_void, // AVD3D11FrameDescriptor* (FFmpeg-managed)
 }
 
+// Hand-written mirrors of libav's `AVD3D11VADeviceContext` / `AVD3D11VAFramesContext`
+// (hwcontext_d3d11va.h) — `ffmpeg-sys-next` binds neither, and we WRITE `device` / `bind_flags`
+// through them, so a wrong offset is silent corruption of libav's context rather than a compile
+// error. ⚠ These two structs are duplicated in the other crate that talks to the same libav
+// contexts (pf-encode's `ffmpeg_win.rs` and pf-client-core's `video_d3d11.rs`); they must agree
+// with libav AND with each other, and these assertions are what makes a drift in either a build
+// failure instead of a runtime mystery.
+const _: () = {
+    use std::mem::{offset_of, size_of};
+    type P = *mut c_void;
+    assert!(size_of::<AVD3D11VADeviceContext>() == 7 * size_of::<P>());
+    assert!(offset_of!(AVD3D11VADeviceContext, device) == 0);
+    assert!(offset_of!(AVD3D11VADeviceContext, device_context) == size_of::<P>());
+    assert!(offset_of!(AVD3D11VADeviceContext, video_device) == 2 * size_of::<P>());
+    assert!(offset_of!(AVD3D11VADeviceContext, video_context) == 3 * size_of::<P>());
+    assert!(offset_of!(AVD3D11VADeviceContext, lock) == 4 * size_of::<P>());
+    assert!(offset_of!(AVD3D11VADeviceContext, unlock) == 5 * size_of::<P>());
+    assert!(offset_of!(AVD3D11VADeviceContext, lock_ctx) == 6 * size_of::<P>());
+    // ptr, u32, u32, ptr — the two 32-bit flags pack into one pointer-sized slot with no padding.
+    assert!(size_of::<AVD3D11VAFramesContext>() == 3 * size_of::<P>());
+    assert!(offset_of!(AVD3D11VAFramesContext, texture) == 0);
+    assert!(offset_of!(AVD3D11VAFramesContext, bind_flags) == size_of::<P>());
+    assert!(offset_of!(AVD3D11VAFramesContext, misc_flags) == size_of::<P>() + 4);
+    assert!(offset_of!(AVD3D11VAFramesContext, texture_infos) == 2 * size_of::<P>());
+};
+
 fn averr(what: &str, code: i32) -> anyhow::Error {
     anyhow!("{what}: {}", ffmpeg::Error::from(code))
 }

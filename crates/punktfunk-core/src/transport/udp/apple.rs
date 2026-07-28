@@ -49,6 +49,24 @@ struct MsghdrX {
     msg_datalen: libc::size_t,
 }
 
+// A hand-written mirror of Darwin's `struct msghdr_x` (sys/socket.h), which `libc` does not expose.
+// `sendmsg_x`/`recvmsg_x` read and write through it, so a wrong offset would hand the kernel the
+// wrong pointer or length — the two fields it uses to decide how much memory to touch. The layout is
+// not obvious by inspection because the 32-bit fields force padding before the pointers that follow
+// them, which is exactly the kind of thing an edit gets wrong silently.
+const _: () = {
+    use std::mem::{offset_of, size_of};
+    assert!(size_of::<MsghdrX>() == 56);
+    assert!(offset_of!(MsghdrX, msg_name) == 0);
+    assert!(offset_of!(MsghdrX, msg_namelen) == 8);
+    assert!(offset_of!(MsghdrX, msg_iov) == 16); // 4 bytes of padding after msg_namelen
+    assert!(offset_of!(MsghdrX, msg_iovlen) == 24);
+    assert!(offset_of!(MsghdrX, msg_control) == 32); // padding after msg_iovlen
+    assert!(offset_of!(MsghdrX, msg_controllen) == 40);
+    assert!(offset_of!(MsghdrX, msg_flags) == 44);
+    assert!(offset_of!(MsghdrX, msg_datalen) == 48);
+};
+
 #[cfg(target_vendor = "apple")]
 extern "C" {
     /// Darwin batched receive: up to `cnt` datagrams in one syscall; returns the count received and

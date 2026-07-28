@@ -310,6 +310,26 @@ struct IPolicyConfigVtbl {
     // SetEndpointVisibility follows — unused.
 }
 
+// This mirrors the vtable of the UNDOCUMENTED `IPolicyConfig` COM interface, so there is no header
+// to check it against and no `windows-rs` binding to fall back on. `set_default_endpoint` is called
+// by INDEX — `((*vtbl).set_default_endpoint)(..)` is really "the 14th function pointer in this
+// table" — so a field added, removed or resized above it does not fail to compile: it silently calls
+// a DIFFERENT function through a mismatched signature, which is arbitrary-code territory rather
+// than a wrong answer. The `_reserved` gap is what makes that easy to get wrong, since its ten slots
+// carry no names to anchor a review. These assertions pin the two things the call actually depends
+// on: the slot index of `set_default_endpoint`, and the size of the table up to it.
+const _: () = {
+    use std::mem::{offset_of, size_of};
+    type P = *const c_void;
+    // 3 IUnknown slots + 10 reserved = `set_default_endpoint` is slot 13 (0-based).
+    assert!(offset_of!(IPolicyConfigVtbl, query_interface) == 0);
+    assert!(offset_of!(IPolicyConfigVtbl, add_ref) == size_of::<P>());
+    assert!(offset_of!(IPolicyConfigVtbl, release) == 2 * size_of::<P>());
+    assert!(offset_of!(IPolicyConfigVtbl, _reserved) == 3 * size_of::<P>());
+    assert!(offset_of!(IPolicyConfigVtbl, set_default_endpoint) == 13 * size_of::<P>());
+    assert!(size_of::<IPolicyConfigVtbl>() == 14 * size_of::<P>());
+};
+
 /// Set `device_id` as the default audio endpoint for eConsole/eMultimedia/eCommunications via the
 /// undocumented `IPolicyConfig::SetDefaultEndpoint` (the call `mmsys.cpl` makes). Errs if any role
 /// fails.

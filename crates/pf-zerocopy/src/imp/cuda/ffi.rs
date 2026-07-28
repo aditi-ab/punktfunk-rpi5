@@ -139,6 +139,59 @@ pub struct CUDA_EXTERNAL_SEMAPHORE_WAIT_PARAMS {
 /// to try".
 pub const CU_EXTERNAL_SEMAPHORE_HANDLE_TYPE_TIMELINE_SEMAPHORE_FD: c_uint = 9;
 
+// LAYOUT GUARDS for the six hand-flattened cuda.h structs above.
+//
+// These are filled here and handed straight to the CUDA driver, which reads them by offset. A
+// transcription slip does not fail to compile and does not reliably crash — it makes the driver read
+// a pitch, a size or an fd from the wrong bytes. Three of the six were already asserted, but only in
+// `#[cfg(test)]`, so the check ran when someone ran the tests and never in a release build; these
+// are `const`, so they hold on every compilation and cannot be skipped. The other three
+// (`CUDA_MEMCPY2D` and the two external-memory descs) had no check at all until now, and
+// `CUDA_MEMCPY2D` is the one used on every zero-copy frame.
+const _: () = {
+    use std::mem::{offset_of, size_of};
+
+    // 16 fields, all pointer-sized or padded to it: 16 * 8 = 128. The two `c_uint` memory-type
+    // fields are each followed by padding to align the pointer after them, which is the part a
+    // hand-transcription gets wrong.
+    assert!(size_of::<CUDA_MEMCPY2D>() == 128);
+    assert!(offset_of!(CUDA_MEMCPY2D, srcMemoryType) == 16);
+    assert!(offset_of!(CUDA_MEMCPY2D, srcHost) == 24); // padded past srcMemoryType
+    assert!(offset_of!(CUDA_MEMCPY2D, srcPitch) == 48);
+    assert!(offset_of!(CUDA_MEMCPY2D, dstMemoryType) == 72);
+    assert!(offset_of!(CUDA_MEMCPY2D, dstHost) == 80); // padded past dstMemoryType
+    assert!(offset_of!(CUDA_MEMCPY2D, dstPitch) == 104);
+    assert!(offset_of!(CUDA_MEMCPY2D, WidthInBytes) == 112);
+    assert!(offset_of!(CUDA_MEMCPY2D, Height) == 120);
+
+    // type(4)+pad(4)+union(16)+size(8)+flags(4)+reserved[16](64) = 104.
+    assert!(size_of::<CUDA_EXTERNAL_MEMORY_HANDLE_DESC>() == 104);
+    assert!(offset_of!(CUDA_EXTERNAL_MEMORY_HANDLE_DESC, handle) == 8);
+    assert!(offset_of!(CUDA_EXTERNAL_MEMORY_HANDLE_DESC, size) == 24);
+    assert!(offset_of!(CUDA_EXTERNAL_MEMORY_HANDLE_DESC, flags) == 32);
+
+    // offset(8)+size(8)+flags(4)+reserved[16](64), tail-padded to 8 = 88.
+    assert!(size_of::<CUDA_EXTERNAL_MEMORY_BUFFER_DESC>() == 88);
+    assert!(offset_of!(CUDA_EXTERNAL_MEMORY_BUFFER_DESC, size) == 8);
+    assert!(offset_of!(CUDA_EXTERNAL_MEMORY_BUFFER_DESC, flags) == 16);
+
+    // type(4)+pad(4)+union(16)+flags(4)+reserved[16](64) = 96. No `size` — a semaphore has none.
+    assert!(size_of::<CUDA_EXTERNAL_SEMAPHORE_HANDLE_DESC>() == 96);
+    assert!(offset_of!(CUDA_EXTERNAL_SEMAPHORE_HANDLE_DESC, handle) == 8);
+    assert!(offset_of!(CUDA_EXTERNAL_SEMAPHORE_HANDLE_DESC, flags) == 24);
+
+    // params{fence(8)+nvSciSync(8)+keyedMutex(8)+reserved[12](48)} = 72, flags at 72 → 144.
+    assert!(size_of::<CUDA_EXTERNAL_SEMAPHORE_SIGNAL_PARAMS>() == 144);
+    assert!(offset_of!(CUDA_EXTERNAL_SEMAPHORE_SIGNAL_PARAMS, value) == 0);
+    assert!(offset_of!(CUDA_EXTERNAL_SEMAPHORE_SIGNAL_PARAMS, flags) == 72);
+
+    // As signal, but `keyedMutex` is `{u64 key; u32 timeoutMs;}` = 16 with tail padding, hence the
+    // explicit pad word before the 10 reserved words. Still 72 to `flags` → 144.
+    assert!(size_of::<CUDA_EXTERNAL_SEMAPHORE_WAIT_PARAMS>() == 144);
+    assert!(offset_of!(CUDA_EXTERNAL_SEMAPHORE_WAIT_PARAMS, value) == 0);
+    assert!(offset_of!(CUDA_EXTERNAL_SEMAPHORE_WAIT_PARAMS, flags) == 72);
+};
+
 /// `CUipcMemHandle` (cuda.h): an opaque 64-byte struct identifying a device allocation across
 /// processes. Produced by `cuIpcGetMemHandle` in the exporting process, consumed by
 /// `cuIpcOpenMemHandle` in the importer — passed **by value**, matching the C
