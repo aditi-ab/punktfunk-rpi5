@@ -243,6 +243,13 @@ fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
     // Which Settings section the NavigationView shows (persists across visits this run).
     // Opens on General — the first sidebar item, matching the Apple client's landing category.
     let (settings_nav, set_settings_nav) = cx.use_async_state("general".to_string());
+    // Which LAYER the settings screen edits: "" = the global defaults, else a profile id
+    // (design/client-settings-profiles.md §5.1). Root state for the same reason as the section
+    // above — the ComboBox's change handler is wired in the reactor backend.
+    let (settings_scope, set_settings_scope) = cx.use_async_state(String::new());
+    // The profile a Delete… click is asking about; `Some` renders the confirmation. Root state
+    // because this page stays hook-free (its handlers are wired in the reactor backend).
+    let (settings_delete, set_settings_delete) = cx.use_async_state(Option::<String>::None);
     // Connected-controller count, mirrored from the gamepad service by a poll thread
     // (thread-driven state must be root state — see the module docs). Drives the hosts
     // page's "Open console UI" hint; the compare in `call` makes the steady state free.
@@ -489,6 +496,10 @@ fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
             &set_screen,
             &settings_nav,
             &set_settings_nav,
+            &settings_scope,
+            &set_settings_scope,
+            &settings_delete,
+            &set_settings_delete,
             nav_progress,
         ),
         Screen::Licenses => licenses::licenses_page(&set_screen),
