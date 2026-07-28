@@ -143,6 +143,109 @@ impl SettingsOverlay {
         s
     }
 
+    /// Record, as overrides, every tier-P field that differs between two settings snapshots.
+    ///
+    /// This is for front-ends that commit PER CONTROL rather than per dialog (the WinUI shell
+    /// writes on every change; the GTK one writes once on close). They can't hand over a list
+    /// of touched fields, so they hand over "the effective settings before this control fired"
+    /// and "after": the only field that can differ is the one the user just touched.
+    ///
+    /// That is not the diff-on-save this design rejects. The comparison is against the
+    /// EFFECTIVE settings — what the control was showing — not against the globals, so setting
+    /// a value back to what the global happens to be still records an override, which is the
+    /// pin the design asks for. It only ever adds overrides; removing one is an explicit
+    /// reset, which is a different operation.
+    pub fn absorb(&mut self, before: &Settings, after: &Settings) {
+        if after.width != before.width {
+            self.width = Some(after.width);
+        }
+        if after.height != before.height {
+            self.height = Some(after.height);
+        }
+        if after.refresh_hz != before.refresh_hz {
+            self.refresh_hz = Some(after.refresh_hz);
+        }
+        if after.match_window != before.match_window {
+            self.match_window = Some(after.match_window);
+        }
+        if after.bitrate_kbps != before.bitrate_kbps {
+            self.bitrate_kbps = Some(after.bitrate_kbps);
+        }
+        if after.render_scale != before.render_scale {
+            self.render_scale = Some(after.render_scale);
+        }
+        if after.codec != before.codec {
+            self.codec = Some(after.codec.clone());
+        }
+        if after.hdr_enabled != before.hdr_enabled {
+            self.hdr_enabled = Some(after.hdr_enabled);
+        }
+        if after.compositor != before.compositor {
+            self.compositor = Some(after.compositor.clone());
+        }
+        if after.audio_channels != before.audio_channels {
+            self.audio_channels = Some(after.audio_channels);
+        }
+        if after.mic_enabled != before.mic_enabled {
+            self.mic_enabled = Some(after.mic_enabled);
+        }
+        if after.touch_mode != before.touch_mode {
+            self.touch_mode = Some(after.touch_mode.clone());
+        }
+        if after.mouse_mode != before.mouse_mode {
+            self.mouse_mode = Some(after.mouse_mode.clone());
+        }
+        if after.invert_scroll != before.invert_scroll {
+            self.invert_scroll = Some(after.invert_scroll);
+        }
+        if after.inhibit_shortcuts != before.inhibit_shortcuts {
+            self.inhibit_shortcuts = Some(after.inhibit_shortcuts);
+        }
+        if after.gamepad != before.gamepad {
+            self.gamepad = Some(after.gamepad.clone());
+        }
+        if after.stats_verbosity() != before.stats_verbosity() {
+            self.stats_verbosity = Some(after.stats_verbosity());
+        }
+        if after.fullscreen_on_stream != before.fullscreen_on_stream {
+            self.fullscreen_on_stream = Some(after.fullscreen_on_stream);
+        }
+    }
+
+    /// Drop one override by its overlay field name, putting the row back to inheriting. The
+    /// names are the serialised ones, so a UI can carry them as plain strings; `resolution`
+    /// is the one alias, covering the width/height/match-window tri-state a single control
+    /// drives on every client. Returns false for a name this build doesn't know.
+    pub fn clear(&mut self, field: &str) -> bool {
+        match field {
+            "resolution" => {
+                self.width = None;
+                self.height = None;
+                self.match_window = None;
+            }
+            "width" => self.width = None,
+            "height" => self.height = None,
+            "refresh_hz" => self.refresh_hz = None,
+            "match_window" => self.match_window = None,
+            "bitrate_kbps" => self.bitrate_kbps = None,
+            "render_scale" => self.render_scale = None,
+            "codec" => self.codec = None,
+            "hdr_enabled" => self.hdr_enabled = None,
+            "compositor" => self.compositor = None,
+            "audio_channels" => self.audio_channels = None,
+            "mic_enabled" => self.mic_enabled = None,
+            "touch_mode" => self.touch_mode = None,
+            "mouse_mode" => self.mouse_mode = None,
+            "invert_scroll" => self.invert_scroll = None,
+            "inhibit_shortcuts" => self.inhibit_shortcuts = None,
+            "gamepad" => self.gamepad = None,
+            "stats_verbosity" => self.stats_verbosity = None,
+            "fullscreen_on_stream" => self.fullscreen_on_stream = None,
+            _ => return false,
+        }
+        true
+    }
+
     /// True when the profile overrides nothing — "inherits everything", the state a freshly
     /// created profile starts in. Unknown-key carry-through counts: a profile that only holds
     /// a newer client's field is not empty.
@@ -371,6 +474,68 @@ mod tests {
         let mut moved = base.clone();
         moved.bitrate_kbps = 50000;
         assert_eq!(pin.apply(&moved).bitrate_kbps, 20000);
+    }
+
+    /// `absorb` records exactly the field a control changed, compares against the EFFECTIVE
+    /// settings (so a value equal to the global is still a pin), and never removes anything.
+    #[test]
+    fn absorb_records_the_touched_field_only() {
+        let base = Settings {
+            bitrate_kbps: 20000,
+            codec: "hevc".into(),
+            ..Default::default()
+        };
+        let mut o = SettingsOverlay::default();
+
+        // One control fires: before = what it was showing, after = what the user picked.
+        let before = o.apply(&base);
+        let mut after = before.clone();
+        after.codec = "av1".into();
+        o.absorb(&before, &after);
+        assert_eq!(o.codec.as_deref(), Some("av1"));
+        assert_eq!(o.bitrate_kbps, None, "nothing else may be recorded");
+
+        // Setting it BACK to the global's value is still an override — the pin case. This is
+        // what makes absorb different from diffing against the globals at save time.
+        let before = o.apply(&base);
+        let mut after = before.clone();
+        after.codec = "hevc".into();
+        o.absorb(&before, &after);
+        assert_eq!(o.codec.as_deref(), Some("hevc"));
+        let mut moved = base.clone();
+        moved.codec = "h264".into();
+        assert_eq!(o.apply(&moved).codec, "hevc");
+
+        // The stats tier goes through the resolver, not the legacy bool.
+        let before = o.apply(&base);
+        let mut after = before.clone();
+        after.set_stats_verbosity(StatsVerbosity::Detailed);
+        o.absorb(&before, &after);
+        assert_eq!(o.stats_verbosity, Some(StatsVerbosity::Detailed));
+
+        // Identical snapshots record nothing.
+        let before = o.apply(&base);
+        let mut o2 = o.clone();
+        o2.absorb(&before, &before);
+        assert_eq!(o2, o);
+    }
+
+    /// `clear` is the explicit way back to inheriting, including the resolution tri-state.
+    #[test]
+    fn clear_drops_one_override() {
+        let mut o = SettingsOverlay {
+            width: Some(3840),
+            height: Some(2160),
+            match_window: Some(false),
+            codec: Some("av1".into()),
+            ..Default::default()
+        };
+        assert!(o.clear("codec"));
+        assert_eq!(o.codec, None);
+        assert!(o.clear("resolution"));
+        assert_eq!((o.width, o.height, o.match_window), (None, None, None));
+        assert!(o.is_empty());
+        assert!(!o.clear("no_such_field"));
     }
 
     /// Stats verbosity Off must survive `apply` — it is a legitimate override, and going
