@@ -101,17 +101,21 @@ pub fn pack_luid(luid: LUID) -> i64 {
 pub unsafe fn make_device(adapter: &IDXGIAdapter1) -> Result<(ID3D11Device, ID3D11DeviceContext)> {
     let mut device: Option<ID3D11Device> = None;
     let mut context: Option<ID3D11DeviceContext> = None;
-    D3D11CreateDevice(
-        adapter,
-        D3D_DRIVER_TYPE_UNKNOWN,
-        HMODULE::default(),
-        D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-        Some(&[D3D_FEATURE_LEVEL_11_0]),
-        D3D11_SDK_VERSION,
-        Some(&mut device),
-        None,
-        Some(&mut context),
-    )
+    // SAFETY: `adapter` is live for the call (caller contract). The two out-params are local
+    // `Option`s the callee only writes, and both are checked below before use.
+    unsafe {
+        D3D11CreateDevice(
+            adapter,
+            D3D_DRIVER_TYPE_UNKNOWN,
+            HMODULE::default(),
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+            Some(&[D3D_FEATURE_LEVEL_11_0]),
+            D3D11_SDK_VERSION,
+            Some(&mut device),
+            None,
+            Some(&mut context),
+        )
+    }
     .context("D3D11CreateDevice")?;
     let device = device.context("null D3D11 device")?;
     let context = context.context("null D3D11 context")?;
@@ -127,14 +131,17 @@ pub unsafe fn make_device(adapter: &IDXGIAdapter1) -> Result<(ID3D11Device, ID3D
     elevate_process_gpu_priority();
     if let Ok(dxgi_dev) = device.cast::<IDXGIDevice>() {
         // The absolute max GPU thread priority (0x4000001E; the same value Sunshine/Apollo use); fall back to relative +7.
-        if dxgi_dev.SetGPUThreadPriority(0x4000_001E).is_err()
-            && dxgi_dev.SetGPUThreadPriority(7).is_err()
+        // SAFETY: `dxgi_dev` is a live interface just obtained by a checked `cast`; both calls take
+        // a scalar and only report failure through their return value.
+        if unsafe { dxgi_dev.SetGPUThreadPriority(0x4000_001E) }.is_err()
+            && unsafe { dxgi_dev.SetGPUThreadPriority(7) }.is_err()
         {
             tracing::warn!("SetGPUThreadPriority failed (run as admin/SYSTEM for GPU priority)");
         }
     }
     if let Ok(dxgi1) = device.cast::<IDXGIDevice1>() {
-        let _ = dxgi1.SetMaximumFrameLatency(1);
+        // SAFETY: `dxgi1` is a live interface from a checked `cast`; the arg is a scalar.
+        let _ = unsafe { dxgi1.SetMaximumFrameLatency(1) };
     }
     // REALTIME auto-gate (gpu-contention §5.C / latency plan T2.3) — needs the device's adapter,
     // so it runs here, after creation; internally once-per-process.
