@@ -1081,6 +1081,7 @@ pub fn cursor_blend_capable(codec: Codec, cuda_planned: bool, ten_bit: bool) -> 
         }
         #[cfg(not(feature = "vulkan-encode"))]
         {
+            let _ = ten_bit; // the depth only ever narrows the Vulkan arm
             false
         }
     };
@@ -1138,7 +1139,7 @@ fn vulkan_encode_available(codec: Codec) -> bool {
 /// decides whether an HDR session gets the good path (real RFI + the compute CSC's cursor blend)
 /// or falls back to libav VAAPI — asked per codec, because a device can advertise HEVC Main10 and
 /// still decline 10-bit AV1.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "vulkan-encode"))]
 fn vulkan_encode_available_at(codec: Codec, ten_bit: bool) -> bool {
     let caps = vulkan_encode_caps(codec);
     caps.supported
@@ -1153,7 +1154,12 @@ fn vulkan_encode_available_at(codec: Codec, ten_bit: bool) -> bool {
 /// a web-console GPU change re-probes on the new adapter before the next Welcome, mirroring
 /// `can_encode_444`/`can_encode_10bit`. The probe creates and destroys its own Vulkan instance,
 /// so it is worth caching but safe to call from anywhere.
-#[cfg(target_os = "linux")]
+///
+/// The `vulkan-encode` half of the cfg is not decoration: the return type comes from the
+/// `vulkan_video` module, which only exists under that feature. Every caller is already gated;
+/// leaving these two definitions on bare `target_os = "linux"` is what broke a featureless Linux
+/// build (caught on Fedora 44, 2026-07-28).
+#[cfg(all(target_os = "linux", feature = "vulkan-encode"))]
 fn vulkan_encode_caps(codec: Codec) -> vulkan_video::VulkanEncodeCaps {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
