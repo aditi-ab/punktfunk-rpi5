@@ -32,28 +32,43 @@ follow what the app happens to render.
 Works on the headless backend as well as a real connector: no HDR display is
 involved anywhere in the LUT set.
 ---
- src/pipewire.cpp     | 99 ++++++++++++++++++++++++++++++++------------
- src/steamcompmgr.cpp | 21 ++++++++--
- 2 files changed, 91 insertions(+), 29 deletions(-)
+ src/pipewire.cpp     | 114 +++++++++++++++++++++++++++++++++----------
+ src/steamcompmgr.cpp |  21 ++++++--
+ 2 files changed, 106 insertions(+), 29 deletions(-)
 
 diff --git a/src/pipewire.cpp b/src/pipewire.cpp
-index 76b3ea8..0cf71d2 100644
+index 76b3ea8..6b56b01 100644
 --- a/src/pipewire.cpp
 +++ b/src/pipewire.cpp
-@@ -18,6 +18,25 @@
+@@ -18,6 +18,40 @@
  
  static LogScope pwr_log("pipewire");
  
 +// 10-bit HDR capture.
 +//
-+// The packed 10-bit RGB SPA formats (xRGB_210LE / xBGR_210LE) and the SMPTE ST.2084 (PQ)
-+// transfer function all predate PipeWire 1.0 by a wide margin; the guard only exists so the
-+// file still compiles against an ancient libspa, in which case the stream offers exactly the
-+// 8-bit formats it always did.
++// The packed 10-bit RGB SPA formats (xRGB_210LE / xBGR_210LE) predate PipeWire 1.0; the guard
++// only exists so this file still compiles against an ancient libspa, in which case the stream
++// offers exactly the 8-bit formats it always did.
 +#if PW_CHECK_VERSION(1, 0, 0)
 +#define GAMESCOPE_PIPEWIRE_HDR 1
 +#else
 +#define GAMESCOPE_PIPEWIRE_HDR 0
++#endif
++
++#if GAMESCOPE_PIPEWIRE_HDR
++// The colorimetry VALUES, spelled out rather than taken from the enums, because the headers that
++// name them are much newer than the ones that name the formats above: SPA grew
++// BT2020_10 / SMPTE2084 / ARIB_STD_B67 as one block, and a libspa without it stops at ADOBERGB —
++// PipeWire 1.4.11 (Fedora 43 / Bazzite) does exactly that, so `SPA_VIDEO_TRANSFER_SMPTE2084`
++// fails to compile there even though the library parses the value perfectly well.
++//
++// Spelling them out is safe because the enum is WIRE ABI, not a private detail: SPA mirrors
++// GStreamer's GstVideoTransferFunction / GstVideoColorPrimaries, where these landed together, so
++// the numbers are identical on every implementation that has them at all. On one that does not,
++// a consumer simply fails to intersect this pod and negotiates 8-bit — the same outcome as not
++// offering HDR. (punktfunk's own consumer spells out the same 14 for the same reason.)
++static constexpr uint32_t kSpaVideoTransferSmpte2084 = 14;
++static constexpr uint32_t kSpaVideoColorPrimariesBt2020 = 7;
 +#endif
 +
 +#if GAMESCOPE_PIPEWIRE_HDR
@@ -66,7 +81,7 @@ index 76b3ea8..0cf71d2 100644
  static struct pipewire_state pipewire_state = { .stream_node_id = SPA_ID_INVALID };
  static int nudgePipe[2] = { -1, -1 };
  
-@@ -94,6 +113,37 @@ static void calculate_capture_size()
+@@ -94,6 +128,37 @@ static void calculate_capture_size()
  	s_nCaptureHeight = SPA_ROUND_UP_N(s_nCaptureHeight, kCaptureAlign);
  }
  
@@ -94,9 +109,9 @@ index 76b3ea8..0cf71d2 100644
 +#if GAMESCOPE_PIPEWIRE_HDR
 +	else if (is_hdr_video_format(format)) {
 +		spa_pod_builder_prop(builder, SPA_FORMAT_VIDEO_transferFunction, SPA_POD_PROP_FLAG_MANDATORY);
-+		spa_pod_builder_id(builder, SPA_VIDEO_TRANSFER_SMPTE2084);
++		spa_pod_builder_id(builder, kSpaVideoTransferSmpte2084);
 +		spa_pod_builder_prop(builder, SPA_FORMAT_VIDEO_colorPrimaries, SPA_POD_PROP_FLAG_MANDATORY);
-+		spa_pod_builder_id(builder, SPA_VIDEO_COLOR_PRIMARIES_BT2020);
++		spa_pod_builder_id(builder, kSpaVideoColorPrimariesBt2020);
 +	}
 +#endif
 +}
@@ -104,7 +119,7 @@ index 76b3ea8..0cf71d2 100644
  static void build_format_params(struct spa_pod_builder *builder, spa_video_format format, std::vector<const struct spa_pod *> &params) {
  	struct spa_rectangle size = SPA_RECTANGLE(s_nCaptureWidth, s_nCaptureHeight);
  	struct spa_rectangle min_requested_size = { 0, 0 };
-@@ -112,18 +162,7 @@ static void build_format_params(struct spa_pod_builder *builder, spa_video_forma
+@@ -112,18 +177,7 @@ static void build_format_params(struct spa_pod_builder *builder, spa_video_forma
  		SPA_FORMAT_VIDEO_requested_size, SPA_POD_CHOICE_RANGE_Rectangle( &min_requested_size, &min_requested_size, &max_requested_size ),
  		SPA_FORMAT_VIDEO_gamescope_focus_appid, SPA_POD_CHOICE_RANGE_Long( 0ll, INT64_MIN, INT64_MAX ),
  		0);
@@ -124,7 +139,7 @@ index 76b3ea8..0cf71d2 100644
  	spa_pod_builder_prop(builder, SPA_FORMAT_VIDEO_modifier, SPA_POD_PROP_FLAG_MANDATORY);
  	spa_pod_builder_push_choice(builder, &choice_frame, SPA_CHOICE_Enum, 0);
  	spa_pod_builder_long(builder, modifier); // default
-@@ -141,18 +180,7 @@ static void build_format_params(struct spa_pod_builder *builder, spa_video_forma
+@@ -141,18 +195,7 @@ static void build_format_params(struct spa_pod_builder *builder, spa_video_forma
  		SPA_FORMAT_VIDEO_requested_size, SPA_POD_CHOICE_RANGE_Rectangle( &min_requested_size, &min_requested_size, &max_requested_size ),
  		SPA_FORMAT_VIDEO_gamescope_focus_appid, SPA_POD_CHOICE_RANGE_Long( 0ll, INT64_MIN, INT64_MAX ),
  		0);
@@ -144,7 +159,7 @@ index 76b3ea8..0cf71d2 100644
  	params.push_back((const struct spa_pod *) spa_pod_builder_pop(builder, &obj_frame));
  
  //	for (auto& param : params)
-@@ -166,6 +194,14 @@ static std::vector<const struct spa_pod *> build_format_params(struct spa_pod_bu
+@@ -166,6 +209,14 @@ static std::vector<const struct spa_pod *> build_format_params(struct spa_pod_bu
  
  	build_format_params(builder, SPA_VIDEO_FORMAT_BGRx, params);
  	build_format_params(builder, SPA_VIDEO_FORMAT_NV12, params);
@@ -159,7 +174,7 @@ index 76b3ea8..0cf71d2 100644
  
  	return params;
  }
-@@ -288,7 +324,7 @@ static void dispatch_nudge(struct pipewire_state *state, int fd)
+@@ -288,7 +339,7 @@ static void dispatch_nudge(struct pipewire_state *state, int fd)
  	if (s_nCaptureWidth != state->video_info.size.width || s_nCaptureHeight != state->video_info.size.height) {
  		pwr_log.debugf("renegotiating stream params (size: %dx%d)", s_nCaptureWidth, s_nCaptureHeight);
  
@@ -168,7 +183,7 @@ index 76b3ea8..0cf71d2 100644
  		struct spa_pod_builder builder = SPA_POD_BUILDER_INIT(buf, sizeof(buf));
  		std::vector<const struct spa_pod *> format_params = build_format_params(&builder);
  		int ret = pw_stream_update_params(state->stream, format_params.data(), format_params.size());
-@@ -412,6 +448,12 @@ static void stream_handle_param_changed(void *data, uint32_t id, const struct sp
+@@ -412,6 +463,12 @@ static void stream_handle_param_changed(void *data, uint32_t id, const struct sp
  		state->video_info.size.width, state->video_info.size.height,
  		s_nRequestedWidth, s_nRequestedHeight,
  		state->video_info.format, state->shm_stride, shm_size, state->dmabuf);
@@ -181,7 +196,7 @@ index 76b3ea8..0cf71d2 100644
  }
  
  static void randname(char *buf)
-@@ -450,6 +492,11 @@ uint32_t spa_format_to_drm(uint32_t spa_format)
+@@ -450,6 +507,11 @@ uint32_t spa_format_to_drm(uint32_t spa_format)
  	switch (spa_format)
  	{
  		case SPA_VIDEO_FORMAT_NV12: return DRM_FORMAT_NV12;
@@ -193,7 +208,7 @@ index 76b3ea8..0cf71d2 100644
  		default:
  		case SPA_VIDEO_FORMAT_BGR: return DRM_FORMAT_XRGB8888;
  	}
-@@ -715,7 +762,7 @@ bool init_pipewire(void)
+@@ -715,7 +777,7 @@ bool init_pipewire(void)
  	s_nOutputHeight = g_nOutputHeight;
  	calculate_capture_size();
  

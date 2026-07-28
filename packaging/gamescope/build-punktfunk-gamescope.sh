@@ -75,10 +75,23 @@ fi
 
 BUILD="$SRCDIR/build-punktfunk"
 echo "==> configuring"
+# We ship ONE binary out of this tree, so build only what leads to it:
+#   -Denable_tests=false        gamescope's own unit tests want Catch2 **v3**
+#                               (`catch2-with-main`); Fedora ships v2, and building someone else's
+#                               test suite is not our job either way.
+#   -Denable_openvr_support     the VR integration pulls the openvr submodule + its build for a
+#                               code path a headless capture session never enters.
+#   -Denable_gamescope_wsi_layer the WSI layer is a SEPARATE artifact the distro's gamescope
+#                               package already installs; ours must not collide with it.
+#                               (The layer the nested games load is that one — it is version-
+#                               independent of the compositor binary.)
 meson setup "$BUILD" "$SRCDIR" \
   --prefix="$PREFIX" \
   --buildtype=release \
-  -Dpipewire=enabled
+  -Dpipewire=enabled \
+  -Denable_tests=false \
+  -Denable_openvr_support=false \
+  -Denable_gamescope_wsi_layer=false
 
 echo "==> building"
 ninja -C "$BUILD" ${JOBS:+-j "$JOBS"}

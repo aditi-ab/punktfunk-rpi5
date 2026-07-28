@@ -81,6 +81,25 @@ ninja -C build/
 install -Dm755 build/src/gamescope /usr/bin/punktfunk-gamescope
 ```
 
+### Build dependencies
+
+They are gamescope's, not ours, and they vary by distro. Two shortcuts that work:
+
+```sh
+# Fedora / Bazzite (inside a toolbox/distrobox — the host is immutable)
+sudo dnf install -y dnf-plugins-core meson ninja-build glslc
+sudo dnf builddep -y gamescope
+sudo dnf install -y xorg-x11-server-Xwayland-devel      # NOT pulled by builddep; wlroots needs it
+
+# Arch / SteamOS — see the makedepends in ./PKGBUILD
+```
+
+⚠️ `dnf builddep gamescope` resolves Fedora's *packaged* gamescope, which is older than the master
+we pin, so it can come up short. `xorg-x11-server-Xwayland-devel` is the one that actually bit
+(2026-07-28, Fedora 43): without it wlroots' configure fails with `Neither a subproject directory
+nor a xserver.wrap file was found`, several minutes into an otherwise clean run. If a different
+one surfaces, meson names it — install and re-run with `--srcdir` so the clone is not repeated.
+
 `gamescope` needs `CAP_SYS_NICE` for its realtime priority; the distro packages set it on their
 own binary. Mirror it if you install ours system-wide:
 
