@@ -960,6 +960,32 @@ mod tests {
         }
     }
 
+    /// Run `f` on a worker thread and give up after `budget`, so a HANG fails the case instead of
+    /// wedging the box.
+    ///
+    /// Earned the hard way: this file's 3.2 case hung inside `create`, and killing the harness
+    /// skipped every `Drop`, leaking an IddCx monitor. A few of those exhaust the driver's slot
+    /// pool, after which every later run wedges too and only a reboot clears it. A bounded wait
+    /// lets the harness exit NORMALLY, which is what lets the driver reap the session.
+    fn within<T: Send + 'static>(
+        budget: Duration,
+        what: &str,
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        match rx.recv_timeout(budget) {
+            Ok(v) => v,
+            Err(_) => panic!(
+                "{what} did not finish within {budget:?} — failing rather than hanging, so the \
+                 harness can exit and the driver can reap. Check for a leaked punktfunk monitor \
+                 before the next run."
+            ),
+        }
+    }
+
     /// §5 3.2 on glass: when the FIRST member's isolate fails, a later member's isolate must be
     /// ADOPTED as the group's restore snapshot — otherwise it deactivates the operator's panels
     /// with nothing able to put them back.
