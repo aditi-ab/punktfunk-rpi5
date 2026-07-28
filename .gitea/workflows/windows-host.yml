@@ -22,7 +22,9 @@
 #
 # Signing reuses the client's MSIX_CERT_PFX_B64 / MSIX_CERT_PASSWORD secrets (CN=unom). Without them
 # an ephemeral self-signed cert is generated and its public .cer published next to the installer
-# (import once to LocalMachine\TrustedPublisher). See packaging/windows/pack-host-installer.ps1.
+# (import once to LocalMachine\TrustedPublisher). That fallback is for canary/CI ONLY — on a v* tag
+# the pack script FAILS CLOSED rather than ship a release signed by a per-build throwaway cert.
+# See packaging/windows/pack-host-installer.ps1.
 #
 # GPU backends: the host builds with --features nvenc,amf-qsv,qsv = all three vendors in one installer.
 #  - NVENC (NVIDIA, direct SDK): nothing needed at build time — the entry points are resolved at

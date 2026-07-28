@@ -14,6 +14,8 @@
        in-process. The package installs only where that cert is trusted, so the matching public
        .cer is exported next to the .msix for the user to import (Trusted People) before install.
        Swap in a real cert later with zero manifest changes — just pass -PfxBase64/-Publisher.
+       This fallback is for canary/CI/dev ONLY: on a v* tag build a missing cert is a hard failure
+       (-RequireSignedCert), never a silent downgrade to a throwaway cert.
 
   Run on the Windows runner (or the dev VM) with the MSVC/Windows SDK present.
 
@@ -33,7 +35,9 @@ param(
     [string]$OutDir = (Join-Path $TargetDir 'msix'),
     [string]$Publisher = 'CN=unom',                                     # MUST equal the signing cert subject DN
     [string]$PfxBase64 = $env:MSIX_CERT_PFX_B64,                        # optional: base64 of a code-signing .pfx
-    [string]$PfxPassword = $env:MSIX_CERT_PASSWORD
+    [string]$PfxPassword = $env:MSIX_CERT_PASSWORD,
+    # 'auto' (default) = required iff this is a v* tag build; 'true'/'false' to force. See below.
+    [ValidateSet('auto', 'true', 'false')][string]$RequireSignedCert = 'auto'
 )
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
@@ -138,11 +142,23 @@ $msix = Join-Path $OutDir "punktfunk-client-windows_${Version}_${Arch}.msix"
 if ($LASTEXITCODE -ne 0) { throw "makeappx pack failed ($LASTEXITCODE)" }
 
 # --- signing cert (supplied stable pfx OR ephemeral self-signed) ---
+# FAIL CLOSED on a real release. The ephemeral fallback below exists so canary/CI/dev builds keep
+# working without the secret, but it is a per-build throwaway cert: nobody can pin it, and a package
+# signed with one is indistinguishable from a package signed by an attacker's. Silently falling back
+# on a tag build would ship exactly that to users under the release's name — so on refs/tags/v* an
+# absent MSIX_CERT_PFX_B64 is a build failure, not a downgrade. ('auto' resolves from GITHUB_REF, so
+# a workflow can't forget to opt in; -RequireSignedCert true/false overrides for local testing.)
+$requireCert = if ($RequireSignedCert -eq 'auto') { $env:GITHUB_REF -like 'refs/tags/v*' }
+               else { [Convert]::ToBoolean($RequireSignedCert) }
 $pfxPath = Join-Path $OutDir 'signing.pfx'
 $cerPath = Join-Path $OutDir "punktfunk-client-windows_${Version}_${Arch}.cer"
 if ($PfxBase64) {
     Write-Host "signing with supplied code-signing cert (MSIX_CERT_PFX_B64)"
     [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($PfxBase64))
+} elseif ($requireCert) {
+    throw ("release build ($env:GITHUB_REF) with no MSIX_CERT_PFX_B64 — refusing to fall back to an " +
+           "ephemeral self-signed cert. Restore the MSIX_CERT_PFX_B64 / MSIX_CERT_PASSWORD repo " +
+           "secrets, or pass -RequireSignedCert false if this really is a test build.")
 } else {
     Write-Host "no MSIX_CERT_PFX_B64 -> generating an ephemeral self-signed cert (subject $Publisher)"
     if (-not $PfxPassword) { $PfxPassword = 'punktfunk' }

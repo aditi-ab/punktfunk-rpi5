@@ -21,11 +21,14 @@
 #                Published to the generic registry + the `canary/` alias.
 # Both arches share the version; artifacts are arch-suffixed (..._x64.msix / ..._arm64.msix).
 #
-# Signing (packaging/pack-msix.ps1): if the MSIX_CERT_PFX_B64 / MSIX_CERT_PASSWORD Actions secrets
-# are set (a real or shared code-signing .pfx whose subject DN == Publisher), the package is signed
-# with them. Otherwise an ephemeral self-signed cert is generated and its public .cer is published
-# next to the .msix (users import it to Trusted People before install). Drop in a real cert later
-# with no workflow change — just add the secrets (+ pass -Publisher if its subject differs).
+# Signing (clients/windows/packaging/pack-msix.ps1): if the MSIX_CERT_PFX_B64 / MSIX_CERT_PASSWORD
+# Actions secrets are set (a real or shared code-signing .pfx whose subject DN == Publisher), the
+# package is signed with them. Otherwise an ephemeral self-signed cert is generated and its public
+# .cer is published next to the .msix (users import it to Trusted People before install).
+#
+# That fallback is for canary/CI ONLY. On a v* tag the pack script FAILS CLOSED — a missing secret
+# aborts the build instead of quietly shipping a release signed by a per-build throwaway cert that
+# no one can pin. Nothing to opt into here: the script reads GITHUB_REF itself.
 name: windows-msix
 # One pending run per workflow+ref: a newer push supersedes the queued/running one and cancels
 # it (a canary only needs the latest commit; each release tag is its own ref so tag runs never

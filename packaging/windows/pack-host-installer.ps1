@@ -5,7 +5,9 @@
 .DESCRIPTION
   From a release `cargo build -p punktfunk-host --features nvenc` output (the exe), this:
     1. resolves a code-signing cert (supplied stable .pfx from CI secrets OR an ephemeral self-signed
-       CN=unom - same scheme as the client's pack-msix.ps1) and exports the public .cer,
+       CN=unom - same scheme as the client's pack-msix.ps1) and exports the public .cer. The
+       ephemeral fallback is for canary/CI/dev ONLY: on a v* tag build a missing cert (or -NoSign)
+       is a hard failure, never a silent downgrade to a throwaway cert - see -RequireSignedCert,
     2. signs the inner punktfunk-host.exe,
     3. stages the pf-vdisplay virtual-display driver bundle (unless -NoDriver),
     4. runs ISCC to build punktfunk-host-setup-<ver>.exe,
@@ -31,7 +33,9 @@ param(
     [string]$BunExe = $env:BUN_EXE,                                # portable bun.exe runtime for the console + runner
     [string]$VbCableDir = $env:VBCABLE_DIR,                         # official base VB-CABLE package -> bundle the virtual mic
     [switch]$NoDriver,                                              # build without the bundled pf-vdisplay driver
-    [switch]$NoSign                                                 # skip signing (local debug)
+    [switch]$NoSign,                                                # skip signing (local debug)
+    # 'auto' (default) = required iff this is a v* tag build; 'true'/'false' to force. See below.
+    [ValidateSet('auto', 'true', 'false')][string]$RequireSignedCert = 'auto'
 )
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
@@ -71,6 +75,17 @@ $iscc = Find-Iscc
 Write-Host "ISCC: $iscc"
 
 # --- signing cert (supplied stable pfx OR ephemeral self-signed) -----------------------------
+# FAIL CLOSED on a real release. The ephemeral fallback below exists so canary/CI/dev builds keep
+# working without the secret, but it is a per-build throwaway cert: nobody can pin it, and an
+# installer signed with one is indistinguishable from one signed by an attacker. Silently falling
+# back on a tag build would ship exactly that to users under the release's name — so on refs/tags/v*
+# a missing MSIX_CERT_PFX_B64 (or -NoSign) is a build failure, not a downgrade. ('auto' resolves from
+# GITHUB_REF so a workflow can't forget to opt in; -RequireSignedCert true/false overrides.)
+$requireCert = if ($RequireSignedCert -eq 'auto') { $env:GITHUB_REF -like 'refs/tags/v*' }
+               else { [Convert]::ToBoolean($RequireSignedCert) }
+if ($NoSign -and $requireCert) {
+    throw "release build ($env:GITHUB_REF) with -NoSign — refusing to publish an unsigned installer."
+}
 $pfxPath = Join-Path $OutDir 'signing.pfx'
 $cerPath = Join-Path $OutDir "punktfunk-host-windows_${Version}.cer"
 $signtool = $null
@@ -80,6 +95,11 @@ if (-not $NoSign) {
     if ($PfxBase64) {
         Write-Host "signing with supplied code-signing cert (MSIX_CERT_PFX_B64)"
         [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($PfxBase64))
+    }
+    elseif ($requireCert) {
+        throw ("release build ($env:GITHUB_REF) with no MSIX_CERT_PFX_B64 — refusing to fall back to " +
+               "an ephemeral self-signed cert. Restore the MSIX_CERT_PFX_B64 / MSIX_CERT_PASSWORD " +
+               "repo secrets, or pass -RequireSignedCert false if this really is a test build.")
     }
     else {
         Write-Host "no MSIX_CERT_PFX_B64 -> generating an ephemeral self-signed cert (subject $Publisher)"
