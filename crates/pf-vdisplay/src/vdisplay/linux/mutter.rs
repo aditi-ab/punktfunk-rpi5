@@ -1370,4 +1370,50 @@ mod tests {
     fn nothing_new_is_nothing_to_pick() {
         assert!(pick_virtual(&[], M).is_none());
     }
+
+    /// Live GNOME round trip — the on-glass lever for this backend, same convention as the Windows
+    /// backend's `live_create_drop`. Exercises the real four-step handshake end to end: create the
+    /// virtual monitor, hold it, then drop the keepalive and let the RAII teardown revert it.
+    ///
+    /// Needs a running `gnome-shell` on the session bus. Run it as:
+    /// ```text
+    /// PUNKTFUNK_MUTTER_VIRTUAL_PRIMARY=0 \
+    ///   cargo test -p pf-vdisplay -- --ignored --nocapture live_mutter_create_drop
+    /// ```
+    /// **Set that variable** unless you mean to exercise the exclusive topology: without it the
+    /// default resolves to `Exclusive`, which disables the box's physical heads for the duration
+    /// (they come back on teardown — that is what this test also proves, but on a box you are
+    /// sitting at, do it deliberately).
+    #[test]
+    #[ignore = "needs a live gnome-shell on the session bus; run with --ignored"]
+    fn live_mutter_create_drop() {
+        use super::{MutterDisplay, VirtualDisplay};
+
+        let mode = Mode {
+            width: 1920,
+            height: 1080,
+            refresh_hz: 60,
+        };
+        let mut vd = MutterDisplay::new().expect("construct the Mutter backend");
+        let started = std::time::Instant::now();
+        let out = vd.create(mode).expect("create the Mutter virtual monitor");
+        println!(
+            "created: node_id={} preferred={:?} in {:?}",
+            out.node_id,
+            out.preferred_mode,
+            started.elapsed()
+        );
+        assert!(out.node_id > 0, "a real PipeWire node id");
+        assert_eq!(
+            out.preferred_mode,
+            Some((mode.width, mode.height, mode.refresh_hz))
+        );
+
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        drop(out);
+        // The keepalive's Drop only SIGNALS the thread; give it more than one 200 ms tick to run
+        // the Stop + topology revert before the harness exits and takes the process with it.
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        println!("dropped — gnome-shell should have removed the monitor and reverted the topology");
+    }
 }
