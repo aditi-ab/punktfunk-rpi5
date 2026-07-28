@@ -57,20 +57,36 @@ fn next_session_id() -> u64 {
 
 /// One `DeviceIoControl` round trip (METHOD_BUFFERED). `input`/`output` may be empty. Identical to the
 /// SudoVDA backend's wrapper; struct<->bytes conversion happens at the call sites via `bytemuck`.
+///
+/// # Safety
+///
+/// `h` must be a live handle to the pf-vdisplay control device — one returned by [`open_device`]
+/// and not yet closed. Every other obligation is discharged inside: the two buffer pointers are
+/// derived from the caller's slices and are passed with exactly those slices' lengths, and the
+/// slices outlive the call.
 unsafe fn ioctl(h: HANDLE, code: u32, input: &[u8], output: &mut [u8]) -> Result<u32> {
     let mut returned = 0u32;
     let inp = (!input.is_empty()).then_some(input.as_ptr() as *const c_void);
     let outp = (!output.is_empty()).then_some(output.as_mut_ptr() as *mut c_void);
-    DeviceIoControl(
-        h,
-        code,
-        inp,
-        input.len() as u32,
-        outp,
-        output.len() as u32,
-        Some(&mut returned),
-        None,
-    )
+    // SAFETY: `h` is a live control-device handle by this fn's contract. `inp`/`outp` are derived
+    // from `input`/`output` and paired with those slices' own lengths, so the kernel reads exactly
+    // `input.len()` initialised bytes and writes at most `output.len()` bytes it is entitled to;
+    // both slices are borrowed for the whole call. `Some(&mut returned)` is a live local. This is
+    // METHOD_BUFFERED, so the kernel copies through its own system buffer rather than retaining
+    // either pointer, and `None` for the OVERLAPPED makes the call synchronous — nothing outlives
+    // the call to alias.
+    unsafe {
+        DeviceIoControl(
+            h,
+            code,
+            inp,
+            input.len() as u32,
+            outp,
+            output.len() as u32,
+            Some(&mut returned),
+            None,
+        )
+    }
     .with_context(|| format!("DeviceIoControl(code={code:#x})"))?;
     Ok(returned)
 }
@@ -194,18 +210,29 @@ fn is_slot_exhaustion_wedge(e: &anyhow::Error) -> bool {
 /// different adapter than the one we duplicate/encode on (the ACCESS_LOST storm). The driver
 /// implements it (`control.rs` → `adapter::set_render_adapter`); callers still tolerate an `Err`
 /// (warn + continue) since the driver reports its real render LUID in the shared header either way.
+///
+/// # Safety
+///
+/// `h` must be a live handle to the pf-vdisplay control device — [`ioctl`]'s obligation, and the
+/// only one. `luid` is plain `Copy` data with no validity requirement of its own.
 unsafe fn set_render_adapter(h: HANDLE, luid: LUID) -> Result<()> {
     let req = control::SetRenderAdapterRequest {
         luid_low: luid.LowPart,
         luid_high: luid.HighPart,
     };
     let mut none: [u8; 0] = [];
-    ioctl(
-        h,
-        control::IOCTL_SET_RENDER_ADAPTER,
-        bytemuck::bytes_of(&req),
-        &mut none,
-    )
+    // SAFETY: `h` is a live control-device handle by this fn's contract — the one thing `ioctl`
+    // asks of its caller. The request is a `Pod` struct viewed through `bytemuck::bytes_of`, so
+    // the input slice is exactly its initialised bytes, and the empty output slice matches the
+    // IOCTL's "no output buffer" contract.
+    unsafe {
+        ioctl(
+            h,
+            control::IOCTL_SET_RENDER_ADAPTER,
+            bytemuck::bytes_of(&req),
+            &mut none,
+        )
+    }
     .map(|_| ())
     .context("pf-vdisplay SET_RENDER_ADAPTER")
 }

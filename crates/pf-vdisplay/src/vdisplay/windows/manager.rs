@@ -1594,7 +1594,14 @@ impl VirtualDisplayManager {
             // displays.
             inner.group.ccd_exclusive = false;
             if let Some(saved) = inner.group.ccd_saved.take() {
-                restore_displays_ccd(&saved);
+                // SAFETY: `saved` is a `SavedConfig` this manager captured from
+                // `isolate_displays_ccd`/`set_virtual_primary_ccd` on this same box (it can be
+                // produced no other way), so its path+mode arrays are a self-consistent CCD
+                // topology and are passed with their own lengths. `restore_displays_ccd` binds
+                // itself to the input desktop internally (`retry_set_display_config`), which is
+                // the one thing its callers could otherwise get wrong. The `take()` above makes
+                // this the only consumer of that snapshot, so no second restore can race it.
+                unsafe { restore_displays_ccd(&saved) };
                 // EXPERIMENTAL `ddc_power_off` wake: the restore re-activated the physical paths, and
                 // returning signal alone wakes DPMS-off panels on most firmware — the explicit ON is
                 // belt-and-braces for the rest. The brief settle wait lets the re-activated paths show
