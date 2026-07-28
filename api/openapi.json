@@ -6355,6 +6355,7 @@
           "audio_streaming",
           "pin_pending",
           "paired_clients",
+          "native_paired_clients",
           "active_sessions",
           "games"
         ],
@@ -6376,10 +6377,16 @@
             },
             "description": "Every launched game the host is tracking: one row per live session that launched a title, plus\nany game whose session has ended and which is waiting out its reconnect window before being\nended (`state: \"grace\"`). Empty when nothing was launched — a plain desktop stream has no game."
           },
+          "native_paired_clients": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Number of paired native (punktfunk/1) devices — the default plane, so on a host that has\nnever been touched by Moonlight this is the only non-zero one of the pair.",
+            "minimum": 0
+          },
           "paired_clients": {
             "type": "integer",
             "format": "int32",
-            "description": "Number of pinned (paired) client certificates.",
+            "description": "Number of pinned (paired) GameStream client certificates. Native (punktfunk/1) devices pair\nagainst a separate store and are counted in `native_paired_clients` — sum the two for\n\"how many clients are paired with this host\".",
             "minimum": 0
           },
           "pin_pending": {

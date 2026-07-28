@@ -100,8 +100,13 @@ pub(crate) struct RuntimeStatus {
     /// True while a pairing handshake is parked waiting for the user's PIN
     /// (submit it via `POST /api/v1/pair/pin`).
     pin_pending: bool,
-    /// Number of pinned (paired) client certificates.
+    /// Number of pinned (paired) GameStream client certificates. Native (punktfunk/1) devices pair
+    /// against a separate store and are counted in `native_paired_clients` — sum the two for
+    /// "how many clients are paired with this host".
     paired_clients: u32,
+    /// Number of paired native (punktfunk/1) devices — the default plane, so on a host that has
+    /// never been touched by Moonlight this is the only non-zero one of the pair.
+    native_paired_clients: u32,
     /// Number of live streaming sessions across BOTH planes (GameStream + native punktfunk/1). The
     /// native server admits concurrent sessions, so this can exceed 1; `session`/`stream` below
     /// describe a single representative session for the detail card.
@@ -420,6 +425,7 @@ pub(crate) async fn get_status(State(st): State<Arc<MgmtState>>) -> Json<Runtime
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .len() as u32,
+        native_paired_clients: st.native.as_ref().map_or(0, |n| n.status().paired_clients),
         active_sessions: native.len() as u32 + u32::from(gs_video),
         session,
         stream,

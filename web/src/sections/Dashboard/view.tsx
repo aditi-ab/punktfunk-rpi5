@@ -54,13 +54,17 @@ export const DashboardView: FC<{
 									label={m.status_audio()}
 									on={s.audio_streaming}
 								/>
+								{/* Both planes. GameStream and native (punktfunk/1) devices pair
+								    into SEPARATE stores, and native is the DEFAULT one — counting
+								    only the GameStream certs read as "0 paired" on a host every
+								    one of whose clients was in fact paired. */}
 								<Card>
 									<CardContent className="flex flex-1 items-center justify-between p-4 sm:pt-6">
 										<span className="text-sm text-muted-foreground">
 											{m.status_paired_count()}
 										</span>
 										<span className="text-2xl font-semibold tabular-nums">
-											{s.paired_clients}
+											{s.paired_clients + s.native_paired_clients}
 										</span>
 									</CardContent>
 								</Card>
