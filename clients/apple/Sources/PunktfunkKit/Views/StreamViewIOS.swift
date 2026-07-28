@@ -368,9 +368,14 @@ public final class StreamViewController: StreamViewControllerBase {
             guard self.inputCapture?.gcMouseForwarding == false else { return }
             self.inputCapture?.sendMouseButton(button, pressed: down)
         }
+        // Scroll is the ONE indirect channel that is NOT gated on the lock. The scroll pan keeps
+        // firing while the scene is pointer-locked (it is the only way trackpad two-finger scrolling
+        // ever arrives — GameController has no gesture channel), so gating it here dropped trackpad
+        // scrolling entirely under lock. Nothing double-sends because iOS installs no GCMouse scroll
+        // handler at all: this recognizer sees the wheel too, already carrying the system's Natural
+        // Scrolling preference, which the raw GameController axis does not.
         streamView.onScroll = { [weak self] dx, dy in
-            guard let self, self.inputCapture?.gcMouseForwarding == false else { return }
-            self.inputCapture?.sendScroll(dx: dx, dy: dy)
+            self?.inputCapture?.sendScroll(dx: dx, dy: dy)
         }
 
         let capture = InputCapture(connection: connection)
@@ -920,14 +925,21 @@ final class StreamLayerUIView: UIView {
         }
     }
 
-    /// Trackpad / wheel scroll (no lock) → host scroll deltas. The translation is consumed
-    /// each callback so the next is a fresh delta. Sign/scale are tunable (≈ one notch per
-    /// ~10 pt): finger up scrolls up (host +y), x passes through — the host WHEEL convention.
+    /// Trackpad / wheel scroll → host scroll deltas. The translation is consumed each callback so
+    /// the next is a fresh delta, and scales at ≈ one WHEEL notch per 10 pt of pan.
+    ///
+    /// Both axes pass through with their sign intact, which is what makes the stream follow the
+    /// system's Natural Scrolling switch: UIKit has already applied that preference by the time it
+    /// hands us a translation (it is what makes every UIScrollView on the device turn the right
+    /// way), so the sign we get IS the user's choice, and the host's WHEEL convention agrees with
+    /// it — +y is a wheel-forward notch, the one that moves content down. Negating y here, as this
+    /// did, pinned the stream to traditional scrolling and inverted the setting for everyone on the
+    /// default. macOS passes `NSEvent.scrollingDeltaY` through for exactly the same reason.
     @objc private func handleScroll(_ g: UIPanGestureRecognizer) {
         guard g.state == .began || g.state == .changed else { return }
         let t = g.translation(in: self)
         g.setTranslation(.zero, in: self)
-        onScroll?(Float(t.x) * 12, Float(-t.y) * 12)
+        onScroll?(Float(t.x) * 12, Float(t.y) * 12)
     }
 
     /// Map a view-space point through the aspect-fit letterbox into host-mode pixels; points
@@ -944,9 +956,21 @@ final class StreamLayerUIView: UIView {
         return HostPoint(x: x, y: y, w: UInt32(hostMode.width), h: UInt32(hostMode.height))
     }
 
-    /// `.secondary` (right button / two-finger click) → GameStream right (3); else left (1).
+    /// UIKit's button mask → the wire's GameStream button number.
+    ///
+    /// The mask is 1-based over the HID button order — 1 primary, 2 secondary, 3 middle, 4/5 the
+    /// side buttons — while the wire numbers middle and right the other way round (1 left,
+    /// 2 middle, 3 right, 4 X1/back, 5 X2/forward), so only those two swap. Without the 3…5 arms
+    /// every button past the first two fell into the `else` and clicked LEFT on the host.
+    ///
+    /// `.primary`/`.secondary` are spelled out because they are the only two named cases; the rest
+    /// come from `.button(_:)`, which takes the same 1-based number.
     private static func gsButton(for mask: UIEvent.ButtonMask) -> UInt32 {
-        mask.contains(.secondary) ? 3 : 1
+        if mask.contains(.secondary) { return 3 }
+        if mask.contains(.button(3)) { return 2 }
+        if mask.contains(.button(4)) { return 4 }
+        if mask.contains(.button(5)) { return 5 }
+        return 1
     }
 
     private func nextFreeID() -> UInt32 {

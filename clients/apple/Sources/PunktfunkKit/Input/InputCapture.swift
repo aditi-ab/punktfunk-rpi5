@@ -86,6 +86,13 @@ public final class InputCapture {
     /// its Esc suppression need it in both states).
     private var cmdKeysDown: Set<UInt32> = []
 
+    #if !os(macOS)
+    /// The key currently auto-repeating, and the timer driving it. iOS/tvOS only — see
+    /// `startAutoRepeat`. Main-queue only, like every other field here.
+    private var autoRepeatVK: UInt32?
+    private var autoRepeatTimer: Timer?
+    #endif
+
     /// Physical Control/Option/Shift keys currently held (Windows VKs, both L/R sides). iPad only:
     /// the ⌃⌥⇧Q release chord is recognized from the HID stream here (iOS has no NSEvent monitor,
     /// like the ⌘⎋ toggle), so it needs the live modifier state — tracked in both forwarding states,
@@ -322,6 +329,9 @@ public final class InputCapture {
         }
         mice.removeAll()
         keyboards.removeAll()
+        #if !os(macOS)
+        stopAutoRepeat()
+        #endif
     }
 
     deinit { stop() }
@@ -330,6 +340,9 @@ public final class InputCapture {
     /// and modifier/latch tracking (GC delivers nothing while inactive, so a ⌘ released
     /// in another app would otherwise stay "held" here forever — hijacking Esc).
     private func releaseAll() {
+        #if !os(macOS)
+        stopAutoRepeat() // before the releases below, so the ticker can't outlive the key-up
+        #endif
         cmdKeysDown.removeAll()
         chordModifiersDown.removeAll()
         suppressedVK = nil
@@ -346,6 +359,58 @@ public final class InputCapture {
         residualScrollX = 0
         residualScrollY = 0
     }
+
+    #if !os(macOS)
+    /// Windows VKs that must never auto-repeat: the modifiers (a held Shift is a state, not a
+    /// stream of presses) and the lock keys (each repeat would toggle the light again).
+    private static let noAutoRepeatVKs: Set<UInt32> = [
+        0x10, 0xA0, 0xA1, // Shift, LShift, RShift
+        0x11, 0xA2, 0xA3, // Control, LControl, RControl
+        0x12, 0xA4, 0xA5, // Alt, LAlt, RAlt
+        0x5B, 0x5C, // LWin, RWin
+        0x14, 0x90, 0x91, // CapsLock, NumLock, ScrollLock
+    ]
+
+    /// Start (or hand over) the held-key auto-repeat, matching a real keyboard's delay-then-rate.
+    ///
+    /// GameController reports a key ONCE on press and once on release — it has no repeat channel —
+    /// and the host injects exactly what it is told, so nothing downstream ever turns a held key
+    /// into a stream of presses. Holding Backspace deleted a single character. macOS is unaffected:
+    /// its NSEvent path already receives the window server's own repeats and forwards them.
+    ///
+    /// Only the newest key repeats, which is what a hardware keyboard does — pressing a second key
+    /// takes the repeat over from the first. Timings are the iOS/macOS defaults (~0.5 s delay,
+    /// ~25 Hz); `.common` keeps it running while a scroll or gesture is tracking.
+    private func startAutoRepeat(_ vk: UInt32) {
+        guard !Self.noAutoRepeatVKs.contains(vk) else { return }
+        stopAutoRepeat()
+        autoRepeatVK = vk
+        let timer = Timer(timeInterval: 0.5, repeats: false) { [weak self] _ in
+            guard let self, self.autoRepeatVK == vk else { return }
+            let ticker = Timer(timeInterval: 0.04, repeats: true) { [weak self] _ in
+                // Stop the moment the key is no longer held — a release that raced the timer, or a
+                // releaseAll from a blur, must not keep typing into the host.
+                guard let self, self.autoRepeatVK == vk, self.forwarding,
+                      self.pressedVKs.contains(vk)
+                else {
+                    self?.stopAutoRepeat()
+                    return
+                }
+                self.emitKey(vk, down: true)
+            }
+            self.autoRepeatTimer = ticker
+            RunLoop.main.add(ticker, forMode: .common)
+        }
+        autoRepeatTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    private func stopAutoRepeat() {
+        autoRepeatTimer?.invalidate()
+        autoRepeatTimer = nil
+        autoRepeatVK = nil
+    }
+    #endif
 
     /// The single wire boundary for a key event. Every `.key` send funnels through here so the
     /// active location-based modifier layout is applied in exactly one place while all internal
@@ -534,15 +599,23 @@ public final class InputCapture {
                 }
             }
         }
-        // Scroll WHEEL (plain HID mice) while pointer-locked: GCMouse's scroll dpad reports
-        // wheel deltas here, +y up / +x right — already the host's WHEEL convention, one unit
-        // per notch → ×120 (WHEEL_DELTA), residual-accumulated by sendScroll. (Trackpad
-        // two-finger scrolling is gesture-based and does NOT reach GameController — that
-        // arrives via the stream view's scroll pan recognizer; on macOS, via scrollWheel.)
+        // Scroll WHEEL, tvOS only. GCMouse's scroll dpad reports raw device deltas, +y up / +x
+        // right — the host's WHEEL convention already, one unit per notch → ×120 (WHEEL_DELTA),
+        // residual-accumulated by sendScroll.
+        //
+        // iOS deliberately installs no handler here and takes ALL scroll from the stream view's
+        // pan recognizer instead — the same one that carries trackpad two-finger scrolling, which
+        // is gesture-based and never reaches GameController. That recognizer sees a plain wheel
+        // too, and unlike this raw axis its deltas already carry the system's Natural Scrolling
+        // preference, so routing everything through it is what makes the setting apply under
+        // pointer lock. Installing both would double-send every wheel notch. (macOS has its own
+        // path: StreamLayerView.scrollWheel.)
+        #if os(tvOS)
         input.scroll.valueChangedHandler = { [weak self] _, dx, dy in
             guard let self, self.forwarding, self.gcMouseForwarding else { return }
             self.sendScroll(dx: dx * 120, dy: dy * 120)
         }
+        #endif
         #endif
     }
 
@@ -676,6 +749,14 @@ public final class InputCapture {
                 self.pressedVKs.remove(vk)
             }
             self.emitKey(vk, down: pressed)
+            // GC has no repeat channel, so a held key becomes a repeat here (see startAutoRepeat).
+            // A release only cancels the repeat if it is THIS key's — releasing an older key while
+            // a newer one is still held must leave the newer one repeating.
+            if pressed {
+                self.startAutoRepeat(vk)
+            } else if self.autoRepeatVK == vk {
+                self.stopAutoRepeat()
+            }
         }
         #endif
     }
