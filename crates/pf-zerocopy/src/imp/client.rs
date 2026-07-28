@@ -35,7 +35,7 @@ const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 /// close, which is what tells an idle worker to exit.
 struct Shared {
     sock: OwnedFd,
-    mappings: Mutex<HashMap<u32, Mapping>>,
+    mappings: Mutex<HashMap<u32, MapEntry>>,
     dead: AtomicBool,
 }
 
@@ -49,15 +49,33 @@ struct Mapping {
     height: u32,
 }
 
+/// A [`Mapping`] plus its lifecycle: how many in-flight [`DeviceBuffer`]s still point into it,
+/// and whether its pool generation was retired by a renegotiation ([`RemoteImporter::clear_cache`]).
+/// Retired-but-referenced entries linger as a graveyard and close when their last frame releases
+/// — without this, every renegotiation (mode change, HDR toggle, client reconnect) permanently
+/// pinned a pool's worth of host VA reservations to peer memory the worker had already freed.
+/// Worker buffer ids are never reused (its `next_id` only counts up), so retired entries can
+/// share the map with the next generation's.
+struct MapEntry {
+    m: Mapping,
+    refs: u32,
+    retired: bool,
+}
+
 impl Drop for Shared {
     fn drop(&mut self) {
-        // Last reference gone — no DeviceBuffer can still point into these mappings.
-        for (_, m) in self.mappings.lock().unwrap().drain() {
-            cuda::ipc_close(m.y);
-            if let Some((uv, _)) = m.uv {
-                cuda::ipc_close(uv);
-            }
+        // Last reference gone — no DeviceBuffer can still point into these mappings (current
+        // generation or graveyard alike).
+        for (_, e) in self.mappings.lock().unwrap().drain() {
+            close_mapping(&e.m);
         }
+    }
+}
+
+fn close_mapping(m: &Mapping) {
+    cuda::ipc_close(m.y);
+    if let Some((uv, _)) = m.uv {
+        cuda::ipc_close(uv);
     }
 }
 
@@ -414,19 +432,24 @@ impl RemoteImporter {
                         self.mark_dead();
                         format!("open CUDA IPC mapping for worker buffer {id}")
                     })?;
-                    self.shared.mappings.lock().unwrap().insert(id, mapping);
+                    self.shared.mappings.lock().unwrap().insert(
+                        id,
+                        MapEntry {
+                            m: mapping,
+                            refs: 0,
+                            retired: false,
+                        },
+                    );
                 }
-                let m = self
-                    .shared
-                    .mappings
-                    .lock()
-                    .unwrap()
-                    .get(&id)
-                    .copied()
-                    .ok_or_else(|| {
+                let m = {
+                    let mut g = self.shared.mappings.lock().unwrap();
+                    let entry = g.get_mut(&id).ok_or_else(|| {
                         self.mark_dead();
                         anyhow::anyhow!("worker delivered unknown buffer id {id} (desync)")
                     })?;
+                    entry.refs += 1;
+                    entry.m
+                };
                 let shared = self.shared.clone();
                 Ok(DeviceBuffer::remote(
                     m.y,
@@ -439,8 +462,17 @@ impl RemoteImporter {
                     Box::new(move || {
                         // Fire-and-forget recycle; a dead worker just means EPIPE, ignored. The
                         // captured `shared` Arc is what keeps the mapping + socket alive until
-                        // the last frame drops.
+                        // the last frame drops. A retired mapping (its generation renegotiated
+                        // away) closes here with its last reference.
                         let _ = proto::send(shared.sock.as_fd(), &Request::Release { id }, None);
+                        let mut g = shared.mappings.lock().unwrap();
+                        if let Some(entry) = g.get_mut(&id) {
+                            entry.refs = entry.refs.saturating_sub(1);
+                            if entry.retired && entry.refs == 0 {
+                                let entry = g.remove(&id).expect("entry exists");
+                                close_mapping(&entry.m);
+                            }
+                        }
                     }),
                 ))
             }
@@ -452,9 +484,24 @@ impl RemoteImporter {
         }
     }
 
-    /// The PipeWire stream renegotiated — reset both sides' per-buffer caches.
+    /// The PipeWire stream renegotiated — reset both sides' per-buffer caches, and retire the
+    /// outgoing generation's CUDA IPC mappings: the worker replaces its pool, so these host-side
+    /// mappings pin VA reservations to peer memory that is about to be (or already was) freed.
+    /// Unreferenced ones close now; ones still under an in-flight frame close with its release.
     pub fn clear_cache(&mut self) {
         self.sent_keys.clear();
+        {
+            let mut g = self.shared.mappings.lock().unwrap();
+            g.retain(|_, entry| {
+                if entry.refs == 0 {
+                    close_mapping(&entry.m);
+                    false
+                } else {
+                    entry.retired = true;
+                    true
+                }
+            });
+        }
         if !self.dead() {
             if let Err(e) = proto::send(self.shared.sock.as_fd(), &Request::ClearCache, None) {
                 tracing::warn!(error = %e, "zerocopy worker ClearCache failed");

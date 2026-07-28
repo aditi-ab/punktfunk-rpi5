@@ -194,8 +194,9 @@ struct EglBackend {
     inflight: HashMap<u32, DeviceBuffer>,
     /// Buffer id per device allocation. Valid only within one pool generation: pools never free
     /// allocations while alive, so a device VA can't repeat until a size change replaces the pool
-    /// — at which point [`Self::note_dims`] clears this map (ids themselves are never reused;
-    /// `next_id` only counts up).
+    /// — at which point [`Self::note_dims`] clears this map, as does `ClearCache` (the host
+    /// retires its IPC mappings on that boundary). Ids themselves are never reused; `next_id`
+    /// only counts up.
     ids: HashMap<CUdeviceptr, u32>,
     next_id: u32,
     /// The (kind, width, height) of the last import — a change means the importer replaced its
@@ -282,6 +283,13 @@ impl ImportBackend for EglBackend {
         }
         self.fd_lru.clear();
         self.importer.clear_linear_cache();
+        // ClearCache is the generation boundary the HOST retires its CUDA IPC mappings on: it
+        // closes every mapping the renegotiated-away generation opened (keeping only ones still
+        // under an in-flight frame, until they release). Forget the VA→id map so anything
+        // delivered after this point gets a fresh id WITH its descriptor — re-delivering an old
+        // id would reference a mapping the host just closed. Ids never repeat (`next_id` only
+        // counts up), so fresh ids can't collide with the host's graveyard.
+        self.ids.clear();
     }
 }
 
