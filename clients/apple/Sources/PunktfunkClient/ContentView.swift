@@ -116,7 +116,66 @@ struct ContentView: View {
             gamepadConnected: gamepadManager.active != nil, enabledSetting: gamepadUIEnabled)
     }
 
+    // The body is split in two — `driven` (the screen plus its lifecycle drivers and sheets) and
+    // the prompt chain below. Not a style choice: as ONE expression this blew Swift's
+    // type-checker budget on the iOS slice ("unable to type-check in reasonable time"), which
+    // macOS builds never reveal. Keep new modifiers on whichever half is shorter.
     var body: some View {
+        driven
+            // Fresh pair=required / unknown host: offer the two ways in. An action sheet (not an
+            // alert) so it never collides with the wait alert below. "Request Access" is the
+            // no-PIN delegated-approval path; "Pair with PIN…" runs the SPAKE2 ceremony. The
+            // follow-on presentation is deferred a tick so this dialog is fully dismissed first.
+            .confirmationDialog(
+                "Pairing required",
+                isPresented: approvalChoicePresented,
+                titleVisibility: .visible,
+                presenting: approvalChoice
+            ) { req in
+                Button("Request Access") {
+                    DispatchQueue.main.async { requestAccess(req) }
+                }
+                Button("Pair with PIN…") {
+                    DispatchQueue.main.async { pairingTarget = req.host }
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: { req in
+                Text("\(req.host.displayName) requires pairing. Request access and approve this "
+                    + "device in the host's web console (port 47992 → Pairing) — no PIN needed. Or "
+                    + "pair with the 4-digit PIN it can display.")
+            }
+            // One "Connection failed" surface for every home screen (touch grid, gamepad launcher)
+            // and platform — SessionModel funnels all connect/session errors into `errorMessage`.
+            .alert("Connection failed", isPresented: connectionErrorPresented) {
+                Button("OK", role: .cancel) {}
+            } message: {
+                Text(model.errorMessage ?? "")
+            }
+            // The delegated-approval wait: the host holds the connection open until the operator
+            // approves it. Cancel returns the UI at once; the in-flight connect is left to time out
+            // and its late result is discarded by SessionModel's connect guard (disconnect resets
+            // the phase/host it checks).
+            .alert(
+                "Waiting for approval",
+                isPresented: awaitingApprovalPresented,
+                presenting: awaitingApproval
+            ) { _ in
+                Button("Cancel", role: .cancel) { model.disconnect() }
+            } message: { req in
+                Text("Approve \u{201C}\(localDeviceName)\u{201D} in \(req.host.displayName)'s web "
+                    + "console (port 47992 → Pairing). This device connects automatically once you "
+                    + "approve it — no need to reconnect.")
+            }
+            // Informational deep-link outcome (unknown host, a refused profile, already
+            // streaming). Not an error.
+            .alert("Can't open", isPresented: deepLinkNoticePresented) {
+                Button("OK", role: .cancel) {}
+            } message: {
+                Text(deepLinkNotice ?? "")
+            }
+    }
+
+    private var driven: some View {
         Group {
             // The stream view's structural identity MUST be stable across the
             // awaiting-trust → streaming transition: recreating it restarts the pump,
@@ -300,86 +359,42 @@ struct ContentView: View {
         }
         #endif
         #endif
-        // Fresh pair=required / unknown host: offer the two ways in. An action sheet (not an
-        // alert) so it never collides with the wait alert below. "Request Access" is the no-PIN
-        // delegated-approval path; "Pair with PIN…" runs the SPAKE2 ceremony. The follow-on
-        // presentation is deferred a tick so this dialog is fully dismissed first.
-        .confirmationDialog(
-            "Pairing required",
-            isPresented: Binding(
-                get: { approvalChoice != nil },
-                set: { if !$0 { approvalChoice = nil } }),
-            titleVisibility: .visible,
-            presenting: approvalChoice
-        ) { req in
-            Button("Request Access") {
-                DispatchQueue.main.async { requestAccess(req) }
-            }
-            Button("Pair with PIN…") {
-                DispatchQueue.main.async { pairingTarget = req.host }
-            }
-            Button("Cancel", role: .cancel) {}
-        } message: { req in
-            Text("\(req.host.displayName) requires pairing. Request access and approve this "
-                + "device in the host's web console (port 47992 → Pairing) — no PIN needed. Or "
-                + "pair with the 4-digit PIN it can display.")
-        }
-        // One "Connection failed" surface for every home screen (touch grid, gamepad launcher) and
-        // platform — SessionModel funnels all connect/session errors into `errorMessage`.
-        .alert(
-            "Connection failed",
-            isPresented: Binding(
-                get: {
-                    guard model.errorMessage != nil else { return false }
-                    #if os(macOS)
-                    // Defer the alert while a forced-fullscreen exit is still pending: a sheet
-                    // attached to a fullscreen window makes AppKit drop `-toggleFullScreen:`, so
-                    // presenting it now strands the window fullscreen on the home screen after a
-                    // session error (a deliberate disconnect sets no `errorMessage`, which is why
-                    // it never stuck). Tearing the session down already flipped `active`→false;
-                    // once the window leaves fullscreen and `isFullscreen` flips, the alert shows
-                    // over the windowed home UI. Not gated when fullscreen is the user's own manual
-                    // choice (opt-out setting) — nothing is auto-exiting there to conflict with.
-                    if fullscreenForSession && isFullscreen { return false }
-                    #endif
-                    return true
-                },
-                set: { if !$0 { model.errorMessage = nil } })
-        ) {
-            Button("OK", role: .cancel) {}
-        } message: {
-            Text(model.errorMessage ?? "")
-        }
-        // The delegated-approval wait: the host holds the connection open until the operator
-        // approves it. Cancel returns the UI at once; the in-flight connect is left to time out
-        // and its late result is discarded by SessionModel's connect guard (disconnect resets the
-        // phase/host it checks).
-        .alert(
-            "Waiting for approval",
-            isPresented: Binding(
-                get: { awaitingApproval != nil },
-                set: { if !$0 { awaitingApproval = nil } }),
-            presenting: awaitingApproval
-        ) { _ in
-            Button("Cancel", role: .cancel) { model.disconnect() }
-        } message: { req in
-            Text("Approve \u{201C}\(localDeviceName)\u{201D} in \(req.host.displayName)'s web "
-                + "console (port 47992 → Pairing). This device connects automatically once you "
-                + "approve it — no need to reconnect.")
-        }
-        // Informational deep-link outcome (unknown host / already streaming). Not an error.
-        .alert("Can't open", isPresented: deepLinkNoticePresented) {
-            Button("OK", role: .cancel) {}
-        } message: {
-            Text(deepLinkNotice ?? "")
-        }
     }
 
-    /// Presentation flag for the informational deep-link alert. Extracted from the `.alert` call so
-    /// the manual get/set Binding type-checks on its own instead of inflating the body chain's
-    /// budget (adding it inline tips SwiftUI's per-expression limit — see the split sections idiom).
+    // Presentation flags for the prompt chain, extracted from their `.alert`/`.confirmationDialog`
+    // calls so each manual get/set Binding type-checks on its own instead of inflating the body's
+    // budget (inline, they tip SwiftUI's per-expression limit — see the split sections idiom).
+
     private var deepLinkNoticePresented: Binding<Bool> {
         Binding(get: { deepLinkNotice != nil }, set: { if !$0 { deepLinkNotice = nil } })
+    }
+
+    private var approvalChoicePresented: Binding<Bool> {
+        Binding(get: { approvalChoice != nil }, set: { if !$0 { approvalChoice = nil } })
+    }
+
+    private var awaitingApprovalPresented: Binding<Bool> {
+        Binding(get: { awaitingApproval != nil }, set: { if !$0 { awaitingApproval = nil } })
+    }
+
+    private var connectionErrorPresented: Binding<Bool> {
+        Binding(
+            get: {
+                guard model.errorMessage != nil else { return false }
+                #if os(macOS)
+                // Defer the alert while a forced-fullscreen exit is still pending: a sheet
+                // attached to a fullscreen window makes AppKit drop `-toggleFullScreen:`, so
+                // presenting it now strands the window fullscreen on the home screen after a
+                // session error (a deliberate disconnect sets no `errorMessage`, which is why
+                // it never stuck). Tearing the session down already flipped `active`→false;
+                // once the window leaves fullscreen and `isFullscreen` flips, the alert shows
+                // over the windowed home UI. Not gated when fullscreen is the user's own manual
+                // choice (opt-out setting) — nothing is auto-exiting there to conflict with.
+                if fullscreenForSession && isFullscreen { return false }
+                #endif
+                return true
+            },
+            set: { if !$0 { model.errorMessage = nil } })
     }
 
     #if os(iOS)

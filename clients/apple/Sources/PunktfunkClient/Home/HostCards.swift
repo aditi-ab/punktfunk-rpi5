@@ -229,17 +229,13 @@ struct HostCardView: View {
                 Button {
                     menu.connectWith(.defaults)
                 } label: {
-                    Label(
-                        "Default settings",
-                        systemImage: menu.boundID == nil ? "checkmark" : "")
+                    checkable("Default settings", on: menu.boundID == nil)
                 }
                 ForEach(menu.profiles) { profile in
                     Button {
                         menu.connectWith(.profile(profile.id))
                     } label: {
-                        Label(
-                            profile.name,
-                            systemImage: menu.boundID == profile.id ? "checkmark" : "")
+                        checkable(profile.name, on: menu.boundID == profile.id)
                     }
                 }
                 Divider()
@@ -262,12 +258,21 @@ struct HostCardView: View {
                     Button {
                         menu.togglePin(profile.id)
                     } label: {
-                        Label(
-                            profile.name,
-                            systemImage: menu.pinnedIDs.contains(profile.id) ? "checkmark" : "")
+                        checkable(profile.name, on: menu.pinnedIDs.contains(profile.id))
                     }
                 }
             }
+        }
+    }
+
+    /// A menu row that carries a checkmark when it is the current choice. Built as two shapes
+    /// rather than one `Label` with an empty symbol name — `Image(systemName: "")` is not a
+    /// blank image, it is an invalid one.
+    @ViewBuilder private func checkable(_ title: String, on: Bool) -> some View {
+        if on {
+            Label(title, systemImage: "checkmark")
+        } else {
+            Text(title)
         }
     }
 

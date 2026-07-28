@@ -272,8 +272,13 @@ extension SettingsView {
 
     /// "Editing: Default settings ▾" plus the edited profile's own management actions. One
     /// control, at the top of the surface, so the layer being edited is never ambiguous.
+    ///
+    /// Absent on tvOS: controller-first surfaces honor profiles and render pinned cards, but don't
+    /// EDIT them in v1 (design §5.4) — a name prompt and a nested management menu are not what a
+    /// remote does well, and the pattern should prove itself on the primary surfaces first.
     @ViewBuilder
     var scopeSwitcher: some View {
+        #if !os(tvOS)
         VStack(alignment: .leading, spacing: 4) {
             Menu {
                 Picker("Editing", selection: scopeSelection) {
@@ -344,6 +349,7 @@ extension SettingsView {
         } message: { profile in
             Text(Self.deleteWarning(for: profile, in: profiles))
         }
+        #endif
     }
 
     /// Switching scope is a plain state change — the rows are built by one code path and simply

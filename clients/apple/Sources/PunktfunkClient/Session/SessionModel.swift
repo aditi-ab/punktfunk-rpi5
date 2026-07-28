@@ -361,6 +361,9 @@ final class SessionModel: ObservableObject {
                     if case .success(let conn) = result {
                         Task.detached { conn.close() } // joins Rust threads — off-main
                     }
+                    // A LATER connect has already latched its own settings; only release the
+                    // latch when nothing took over, or this would blank the live session's.
+                    if self.phase == .idle { SessionSettings.end() }
                     return
                 }
                 switch result {
@@ -383,12 +386,14 @@ final class SessionModel: ObservableObject {
                         Task.detached { conn.close() } // joins Rust threads — off-main
                         self.phase = .idle
                         self.activeHost = nil
+                        SessionSettings.end() // no session, so nothing may keep its settings latched
                         self.errorMessage = "\(host.displayName) is not paired yet. "
                             + "Pair with its PIN before streaming."
                     }
                 case .failure(let error):
                     self.phase = .idle
                     self.activeHost = nil
+                    SessionSettings.end() // the dial failed — back to the plain globals
                     if case PunktfunkClientError.rejected(let rejection) = error {
                         // The host answered and stated its reason (declined / approval timed
                         // out / busy / versions differ) — show that, and never wake-retry a

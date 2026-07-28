@@ -5,7 +5,12 @@
 
 import PunktfunkKit
 import SwiftUI
-#if os(tvOS)
+// The tvOS slide transition ships with the Xcode PROJECT only — its manifest breaks SwiftPM's
+// whole-graph validation, so `swift build` never sees it. `canImport` rather than `os(tvOS)` so
+// the tvOS sources still TYPECHECK from the command line (the hand recipe in the Apple client's
+// README), where the module is genuinely absent; in the app it is present and the transition
+// applies exactly as before.
+#if os(tvOS) && canImport(SwiftUINavigationTransitions)
 import SwiftUINavigationTransitions
 #endif
 
@@ -151,7 +156,7 @@ struct HomeView: View {
         #if os(macOS)
         .frame(minWidth: 480, minHeight: 360)
         #endif
-        #if os(tvOS)
+        #if os(tvOS) && canImport(SwiftUINavigationTransitions)
         // The Settings-app slide for every push in this stack (top-level routes AND
         // the pickers' drill-ins) — SwiftUI's default on tvOS is a bare crossfade.
         // Spring-driven (UISpringTimingParameters): ~0.87 damping ratio — settles fast
