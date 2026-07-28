@@ -50,10 +50,10 @@ use std::os::raw::{c_int, c_uint, c_void};
 use std::ptr;
 use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D11::{
-    ID3D11Device, ID3D11DeviceContext, ID3D11Resource, ID3D11Texture2D, D3D11_BIND_DECODER,
-    D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_BIND_VIDEO_ENCODER,
-    D3D11_CPU_ACCESS_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_TEXTURE2D_DESC,
-    D3D11_USAGE_STAGING,
+    ID3D11Device, ID3D11DeviceContext, ID3D11Multithread, ID3D11Resource, ID3D11Texture2D,
+    D3D11_BIND_DECODER, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE,
+    D3D11_BIND_VIDEO_ENCODER, D3D11_CPU_ACCESS_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ,
+    D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_NV12, DXGI_FORMAT_P010,
@@ -882,6 +882,44 @@ impl D3d11Hw {
         .context("av_hwdevice_ctx_alloc(D3D11VA) failed")?;
         let dev_ctx = (*device_ref.as_ptr()).data as *mut ffi::AVHWDeviceContext;
         let d11 = (*dev_ctx).hwctx as *mut AVD3D11VADeviceContext;
+
+        // Turn on D3D11 multithread protection before libav sees the device.
+        //
+        // libav does this itself in `d3d11va_device_create` — but only there. We take the OTHER
+        // path (`d3d11va_device_init`, because we supply the capturer's device), which does not,
+        // and the omission bites twice:
+        //
+        //  * QSV. `av_hwdevice_ctx_create_derived(QSV <- D3D11VA)` ends in
+        //    `MFXVideoCORE_SetHandle`, and MFX rejects a device that is not multithread-protected
+        //    with `MFX_ERR_UNDEFINED_BEHAVIOR (-16)` — logged only as "Error setting child device
+        //    handle", which names neither the cause nor the cure. Measured on Intel UHD 750 /
+        //    FFmpeg 7.1.5+libvpl: identical device, protection off -> derive fails; protection on
+        //    -> derive succeeds. `D3D11_CREATE_DEVICE_VIDEO_SUPPORT` makes no difference either way.
+        //
+        //  * AMF, which is the DEFAULT path and was already shipping. We deliberately leave
+        //    `lock`/`unlock` null so libav installs its `d3d11va_default_lock`, and that lock is
+        //    `ID3D11Multithread::Enter`/`Leave` — which are documented no-ops while protection is
+        //    off. So the lock libav installs to serialise our capture thread against its encode
+        //    thread has been doing nothing at all. It only starts working from here.
+        //
+        // Idempotent, and safe to apply to a device the capturer owns: it only enables the
+        // device's internal critical section (`was` is the previous state, reported once at debug).
+        match device.cast::<ID3D11Multithread>() {
+            Ok(mt) => {
+                let was = mt.SetMultithreadProtected(true);
+                tracing::debug!(
+                    previously_protected = was.as_bool(),
+                    "D3D11 multithread protection enabled for the libav hwdevice"
+                );
+            }
+            // Pre-11.1 runtimes have no ID3D11Multithread. Nothing to enable, so carry on and let
+            // the QSV derive fail with its own message rather than failing capture here.
+            Err(e) => tracing::warn!(
+                error = %e,
+                "no ID3D11Multithread on this device — QSV zero-copy will not derive"
+            ),
+        }
+
         // Share the capture device. FFmpeg's d3d11va teardown Releases `device`, so hand it an owned
         // reference (clone = AddRef, forget = don't Release ours). init() fills
         // device_context / video_device / video_context / the default lock from a non-null device.
@@ -1531,23 +1569,16 @@ mod tests {
     /// whole file unless `PUNKTFUNK_QSV_FFMPEG=1`. Calling `open` directly sidesteps both gates so
     /// the ownership itself is what gets exercised.
     ///
-    /// ⚠️ **KNOWN TO FAIL on Intel UHD 750 / FFmpeg 8 (2026-07-28), and NOT because of the code it
-    /// covers.** `av_hwdevice_ctx_create_derived(QSV <- D3D11VA)` returns
-    /// `MFX_ERR_UNDEFINED_BEHAVIOR (-16)` out of `MFXVideoCORE_SetHandle`, logged by libav as
-    /// "Error setting child device handle". Confirmed pre-existing by running this same probe
-    /// against unmodified `origin/main` (raw-pointer struct) on the same box: byte-identical
-    /// failure, same call, same first iteration. The native VPL backend
-    /// (`qsv::tests::qsv_encode_live_smoke`) encodes fine on that box, so the silicon and D3D11
-    /// zero-copy both work — it is libav's QSV-from-D3D11VA derive specifically that does not.
-    ///
-    /// That matches `zerocopy_active`, which already defaults QSV **off** pending Intel validation.
-    /// The test is kept (and kept `#[ignore]`d) so the derive gets re-checked on the next Intel
-    /// driver / FFmpeg bump rather than the question being silently dropped.
+    /// This test is also the regression guard for the D3D11 multithread-protection fix in
+    /// `D3d11Hw::new`. Without it the QSV derive dies in `MFXVideoCORE_SetHandle` with
+    /// `MFX_ERR_UNDEFINED_BEHAVIOR (-16)`, surfacing only as libav's "Error setting child device
+    /// handle" — a message that names neither the cause nor the cure. If this starts failing that
+    /// way again, look there first.
     ///
     /// `#[ignore]`d (needs a real Intel QSV device):
     /// `cargo test -p pf-encode --features amf-qsv zerocopy_qsv_alloc_drop_cycles -- --ignored --nocapture`
     #[test]
-    #[ignore = "needs a real Intel QSV device; currently fails in libav's QSV<-D3D11VA derive (pre-existing, see doc)"]
+    #[ignore = "needs a real Intel QSV device (run on an Intel host, not the build box)"]
     fn zerocopy_qsv_alloc_drop_cycles() {
         // SAFETY: see `test_hw_device`; the device outlives every `ZeroCopyInner` built below.
         let device = unsafe { test_hw_device(0x8086) }.expect("an Intel D3D11 adapter");
