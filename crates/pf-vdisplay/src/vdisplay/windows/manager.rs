@@ -165,6 +165,34 @@ struct GroupState {
     ccd_exclusive: bool,
 }
 
+/// What a NON-LAST-member teardown owes the group's topology.
+///
+/// Split out of [`ManagerInner::teardown_removed`] so the gate is testable without a driver, a CCD
+/// device or a desktop — the Windows half of this crate has no other way to pin a decision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShrinkAction {
+    /// Exclusive group: re-issue the isolate over the shrunk managed set.
+    Reisolate,
+    /// Primary group: re-promote a survivor — the departing member may have been holding primary.
+    RepromotePrimary,
+    /// Extend/Auto, or nothing was ever captured: leave the topology alone.
+    Nothing,
+}
+
+/// `ccd_exclusive` is the discriminator, NOT `ccd_saved.is_some()`: `Topology::Primary` stores a
+/// snapshot too (from `set_virtual_primary_ccd`), so keying on the snapshot ran the EXCLUSIVE
+/// isolate on a Primary group — clearing `DISPLAYCONFIG_PATH_ACTIVE` on every non-kept path, i.e.
+/// blanking the very physical displays `Primary` exists to keep lit.
+fn shrink_action(ccd_exclusive: bool, has_saved: bool) -> ShrinkAction {
+    if ccd_exclusive {
+        ShrinkAction::Reisolate
+    } else if has_saved {
+        ShrinkAction::RepromotePrimary
+    } else {
+        ShrinkAction::Nothing
+    }
+}
+
 /// The manager's guarded state: the slot map + the (single) group record. One lock for both — every
 /// group mutation happens on a slot transition, so splitting them would only invite lock-order bugs.
 #[derive(Default)]
@@ -1164,11 +1192,28 @@ impl VirtualDisplayManager {
                         } else {
                             // Grown set: re-isolate so the fresh member joins the composited set
                             // (its auto-activate may have lit nothing extra to deactivate, but the
-                            // re-commit also drives COMMIT_MODES for the new path). The returned
-                            // snapshot is DISCARDED — the group restores the FIRST member's.
+                            // re-commit also drives COMMIT_MODES for the new path).
                             // SAFETY: as above — borrowed slice of Copy ids, owned return, under the
                             // `state` lock.
-                            let _ = unsafe { isolate_displays_ccd(&keep) };
+                            let snap = unsafe { isolate_displays_ccd(&keep) };
+                            // Normally DISCARDED — the group restores the FIRST member's snapshot.
+                            // But if the first member's isolate FAILED, there is no first snapshot,
+                            // and this one just deactivated the physicals with nothing able to put
+                            // them back: `teardown_removed`'s restore is gated on `ccd_saved`, and
+                            // the re-assert watchdog never started either. Adopt the first
+                            // SUCCESSFUL isolate as the group's snapshot instead.
+                            if inner.group.ccd_saved.is_none() {
+                                if let Some(snap) = snap {
+                                    tracing::warn!(
+                                        "display isolate (CCD): the first member captured no restore \
+                                         snapshot (its isolate failed) — adopting this member's, so \
+                                         teardown can still put the physical displays back"
+                                    );
+                                    inner.group.ccd_saved = Some(snap);
+                                    inner.group.ccd_exclusive = true;
+                                    self.ensure_exclusive_watch();
+                                }
+                            }
                         }
                     }
                     Topology::Primary if first_member => {
@@ -1602,31 +1647,52 @@ impl VirtualDisplayManager {
                 // the one thing its callers could otherwise get wrong. The `take()` above makes
                 // this the only consumer of that snapshot, so no second restore can race it.
                 unsafe { restore_displays_ccd(&saved) };
-                // EXPERIMENTAL `ddc_power_off` wake: the restore re-activated the physical paths, and
-                // returning signal alone wakes DPMS-off panels on most firmware — the explicit ON is
-                // belt-and-braces for the rest. The brief settle wait lets the re-activated paths show
-                // up in EnumDisplayMonitors (no HMONITOR, no DDC channel); teardown is already
-                // seconds-scale and watched by the 10 s wedge logger above.
-                if inner.group.ddc_panels_off > 0 {
-                    thread::sleep(Duration::from_millis(300));
-                    let woken = crate::ddc::panel_on_all();
-                    tracing::info!(
-                        commanded_off = inner.group.ddc_panels_off,
-                        woken,
-                        "DDC/CI: panel wake commands sent after topology restore"
-                    );
-                    inner.group.ddc_panels_off = 0;
-                }
             }
-        } else if inner.group.ccd_saved.is_some() {
-            // Siblings remain and an exclusive isolate is live: re-issue it with the SHRUNK managed
-            // set (defensive — the departing monitor's path dies with the REMOVE below anyway, but
-            // a re-commit keeps the surviving set authoritative if the OS re-lit anything). The
-            // returned snapshot is discarded; the group keeps the first member's.
-            let keep = inner.target_ids();
-            // SAFETY: `isolate_displays_ccd` only drives the CCD query/apply FFI over a borrowed
-            // slice of Copy target ids, under the `state` lock — the sole topology mutator.
-            let _ = unsafe { isolate_displays_ccd(&keep) };
+            // EXPERIMENTAL `ddc_power_off` wake. OUTSIDE the `ccd_saved` gate, for the same reason
+            // `pnp_disabled` is above it: the panels were commanded dark BEFORE the isolate, and
+            // the isolate can return `None` (its `query_active_config` failed). Nested inside that
+            // arm, the wake then never ran — and because the link stays live, there is no returning
+            // signal to trigger a DPMS wake either, so the panels stayed dark for the rest of the
+            // host's life. The brief settle wait lets re-activated paths show up in
+            // EnumDisplayMonitors (no HMONITOR, no DDC channel); teardown is already seconds-scale
+            // and watched by the 10 s wedge logger above.
+            if inner.group.ddc_panels_off > 0 {
+                thread::sleep(Duration::from_millis(300));
+                let woken = crate::ddc::panel_on_all();
+                tracing::info!(
+                    commanded_off = inner.group.ddc_panels_off,
+                    woken,
+                    "DDC/CI: panel wake commands sent after topology restore"
+                );
+                inner.group.ddc_panels_off = 0;
+            }
+        } else {
+            match shrink_action(inner.group.ccd_exclusive, inner.group.ccd_saved.is_some()) {
+                // Re-issue the isolate over the shrunk set (defensive — the departing monitor's
+                // path dies with the REMOVE below anyway, but a re-commit keeps the surviving set
+                // authoritative if the OS re-lit anything). The returned snapshot is discarded;
+                // the group keeps the first member's.
+                ShrinkAction::Reisolate => {
+                    let keep = inner.target_ids();
+                    // SAFETY: `isolate_displays_ccd` only drives the CCD query/apply FFI over a
+                    // borrowed slice of Copy target ids, under the `state` lock — the sole
+                    // topology mutator.
+                    let _ = unsafe { isolate_displays_ccd(&keep) };
+                }
+                // Re-promote a survivor rather than leaving the desktop's primary on a target that
+                // is about to be REMOVEd. Same save/restore-the-snapshot dance as
+                // `reisolate_after_swap`, and for the same reason: `set_virtual_primary_ccd`
+                // recaptures one and the group must keep the FIRST member's.
+                ShrinkAction::RepromotePrimary => {
+                    if let Some(&survivor) = inner.target_ids().first() {
+                        let keep_saved = inner.group.ccd_saved.take();
+                        // SAFETY: `Copy` target id by value, owned return, under the `state` lock.
+                        let _ = unsafe { set_virtual_primary_ccd(survivor) };
+                        inner.group.ccd_saved = keep_saved;
+                    }
+                }
+                ShrinkAction::Nothing => {}
+            }
         }
         // SAFETY: `teardown_removed`'s own `# Safety` contract guarantees `dev` is the live control
         // handle, and `remove_monitor` requires exactly that. `&mon.key` borrows the `MonitorKey`
@@ -1648,6 +1714,14 @@ impl VirtualDisplayManager {
                 "virtual-display monitor removed"
             );
         }
+        // Re-arrange whatever is LEFT. `apply_group_layout` had only ever been called from
+        // `acquire` (fresh create, re-arrival, in-place resize), so a member leaving never
+        // triggered it: the survivors kept the CCD origins computed when the departing monitor was
+        // still between them, leaving a dead gap in the desktop that nothing closed until the next
+        // acquire. Here rather than at the six call sites because this is where the slot map has
+        // already shrunk, and after the REMOVE so the departing path is genuinely gone. It no-ops
+        // for a group of fewer than two.
+        self.apply_group_layout(inner);
         done.store(true, Ordering::SeqCst);
     }
 
@@ -2051,4 +2125,34 @@ pub(crate) fn snapshot() -> Vec<ManagedInfo> {
 /// if nothing was kept (or the manager is uninitialised).
 pub(crate) fn force_release(slot: Option<u64>) -> usize {
     VDM.get().map(|m| m.force_release(slot)).unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{shrink_action, ShrinkAction};
+
+    /// The gate a non-last-member teardown keys off. It used to be `ccd_saved.is_some()`, which is
+    /// true for BOTH topologies — so a `Primary` group shrinking ran the exclusive isolate and
+    /// blanked the physical displays that `Primary` exists to keep lit.
+    #[test]
+    fn a_primary_group_shrink_repromotes_instead_of_isolating() {
+        // Primary: a snapshot exists (from `set_virtual_primary_ccd`) but exclusivity was never
+        // asserted. This is the case the old gate got wrong.
+        assert_eq!(
+            shrink_action(false, true),
+            ShrinkAction::RepromotePrimary,
+            "a Primary group must never run the exclusive isolate on a shrink"
+        );
+        // Exclusive: re-isolate over the shrunk managed set, as before.
+        assert_eq!(shrink_action(true, true), ShrinkAction::Reisolate);
+        // Extend/Auto captured nothing — leave the operator's topology alone.
+        assert_eq!(shrink_action(false, false), ShrinkAction::Nothing);
+    }
+
+    /// Exclusivity is the discriminator on its own: a group that asserted it still re-isolates even
+    /// if the snapshot went missing, because the physicals are deactivated either way.
+    #[test]
+    fn exclusivity_decides_without_a_snapshot() {
+        assert_eq!(shrink_action(true, false), ShrinkAction::Reisolate);
+    }
 }
