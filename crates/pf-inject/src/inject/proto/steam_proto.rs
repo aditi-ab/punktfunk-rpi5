@@ -551,7 +551,7 @@ pub fn deck_unit_id(index: u8) -> u32 {
 /// serial passes, so we keep the PunktFunk marker one slot in (`"FVPF"`) — still distinct from a
 /// real Deck's `"FVZZ"` for the self-detection below while satisfying Steam's format check.
 /// Derived from [`deck_unit_id`] so the `0xAE` serial reply and the `0x83` unit-id attrs stay
-/// consistent. (The Windows UMDF driver mirrors this exact format — see pf-dualsense lib.rs.)
+/// consistent. (The Windows UMDF driver mirrors this exact format — see pf-gamepad lib.rs.)
 pub fn deck_serial(index: u8) -> String {
     format!("FVPF{:08X}", deck_unit_id(index))
 }

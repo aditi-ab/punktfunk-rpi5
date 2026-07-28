@@ -59,6 +59,10 @@ windows = { version = "0.62", features = [
     "Win32_Devices_Enumeration_Pnp",
     # SwDeviceCreate's SW_DEVICE_CREATE_INFO references DEVPROPKEY (Properties).
     "Win32_Devices_Properties",
+    # The channel proof: HidD_GetIndexedString + GUID_DEVINTERFACE_HID (the pads/mouse leg) and
+    # CreateFileW to open the device interface the proof is asked over.
+    "Win32_Devices_HumanInterfaceDevice",
+    "Win32_Storage_FileSystem",
     "Win32_System_Memory",
     "Win32_System_IO",
     "Win32_System_StationsAndDesktops",

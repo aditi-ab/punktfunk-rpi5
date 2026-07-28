@@ -327,6 +327,12 @@ fn libei_ei_source() -> libei::EiSource {
 // Goal-1 stage 6: Linux UHID/uinput/libei/wlr backends under `inject/linux/`, the Windows UMDF/SendInput
 // backends under `inject/windows/`, and the transport-independent HID codecs under `inject/proto/`;
 // `#[path]` keeps every `crate::*` module name flat.
+/// Windows: asks a devnode which process is serving it (`pf_driver_proto::gamepad::ChannelProof`) —
+/// the unforgeable answer the sealed pad channel duplicates its DATA section into, replacing the
+/// LocalService-writable bootstrap mailbox as the source of that decision.
+#[cfg(target_os = "windows")]
+#[path = "inject/windows/channel_proof.rs"]
+pub mod channel_proof;
 #[cfg(target_os = "linux")]
 #[path = "inject/linux/dualsense.rs"]
 pub mod dualsense;

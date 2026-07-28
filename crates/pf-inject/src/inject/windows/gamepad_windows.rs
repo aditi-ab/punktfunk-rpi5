@@ -173,6 +173,11 @@ impl XusbWinPad {
         // created". Returning Err routes it through PadSlots' ERROR + capped-backoff retry — parity
         // with the Linux uinput path, which self-heals for exactly this reason.
         let (hsw, instance_id) = create_swdevice(index)?;
+        channel.bind_devnode(
+            index as u32,
+            instance_id.clone(),
+            super::gamepad_raii::ProofTransport::XusbIoctl,
+        );
         let _sw = Some(super::gamepad_raii::SwDevice::new(hsw));
         // Bounded eager delivery: the driver's EvtDeviceAdd publishes its pid right away; handing it
         // the DATA handle before we return means the pad is live for the game's first XInput poll.
@@ -184,7 +189,7 @@ impl XusbWinPad {
             attach: super::gamepad_raii::DriverAttach::new(
                 "pf_xusb",
                 "pf_xusb.inf",
-                "C:\\Users\\Public\\pfxusb-driver.log",
+                "C:\\Windows\\ServiceProfiles\\LocalService\\AppData\\Local\\Temp\\pfxusb-driver.log",
                 boot_name,
                 instance_id,
             ),

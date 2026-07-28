@@ -327,6 +327,16 @@ pub fn vmouse_spike(args: &[String]) -> Result<()> {
     crate::inject::mouse_windows::spike_hold(secs)
 }
 
+/// Windows CHANNEL-PROOF PROBE: settle, on a real box, which HID IOCTL hidclass forwards to a UMDF
+/// HID minidriver — the one assumption in the pad channel's v3 delivery gate that could not be
+/// settled by reading. Spins up a throwaway `pf_mouse_probe` devnode at pad index 9 (so it is safe
+/// to run beside a live host), asks it for its channel proof over both HID paths, and prints which
+/// answered. Needs the CURRENT drivers installed: `punktfunk-host.exe driver install --gamepad`.
+#[cfg(target_os = "windows")]
+pub fn channel_proof_probe(_args: &[String]) -> Result<()> {
+    crate::inject::mouse_windows::channel_proof_probe()
+}
+
 /// Windows: create a virtual DualSense via the UMDF driver (a SwDeviceCreate per-session
 /// devnode plus the shared-memory channel) and hold it, pushing one fixed frame (Cross +
 /// LS-right). Drives the real DualSenseWindowsManager, so it validates the device lifecycle

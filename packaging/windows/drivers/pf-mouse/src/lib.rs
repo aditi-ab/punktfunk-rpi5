@@ -9,7 +9,7 @@
 // the report path below is exercised by `punktfunk-host vmouse-spike` (validation) and is the
 // future higher-fidelity injection route.
 //
-// Structure is pf-dualsense minus the identity zoo: one fixed HID identity (PF:MO, an obviously
+// Structure is pf-gamepad minus the identity zoo: one fixed HID identity (PF:MO, an obviously
 // virtual VID/PID no software matches on), one 8-byte input report (5 buttons + absolute 15-bit
 // X/Y + wheel + AC-pan), no feature/output reports. The host channel is the **sealed pad channel**
 // (design/gamepad-channel-sealing.md) verbatim — mailbox `Global\pfmouse-boot-<i>`, unnamed
@@ -28,6 +28,7 @@
 
 use core::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 
+use pf_driver_proto::gamepad::ChannelProof;
 use pf_driver_proto::mouse::{
     MOUSE_PID, MOUSE_REPORT_ID, MOUSE_REPORT_LEN, MOUSE_VER, MOUSE_VID, MouseShm,
 };
@@ -173,10 +174,10 @@ fn channel_cfg() -> ChannelConfig {
     }
 }
 
-/// Whether the world-writable bring-up file log is enabled (resolved once). OPT-IN — debug builds,
-/// or the `PFMOUSE_DEBUG_LOG` (system-wide) env var — the same policy as the pad drivers (audit
-/// §4.4): a RELEASE driver never writes the Public file. DebugView can't see the UMDF host across
-/// session 0, so the file stays the bring-up diagnostic when enabled.
+/// Whether the bring-up file log is enabled (resolved once). OPT-IN — debug builds, or the
+/// `PFMOUSE_DEBUG_LOG` (system-wide) env var — the same policy as the pad drivers (audit §4.4):
+/// a RELEASE driver never writes it. DebugView can't see the UMDF host across session 0, so the
+/// file stays the bring-up diagnostic when enabled.
 fn file_log_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
@@ -193,10 +194,15 @@ fn file_appender() -> Option<&'static std::sync::Mutex<std::fs::File>> {
             if !file_log_enabled() {
                 return None;
             }
+            // Write to the WUDFHost's own (LocalService) temp dir — NOT world-writable/readable
+            // `C:\Users\Public`, where any local reader gets the diagnostics and a non-admin can
+            // pre-create the path as a hard link to redirect this LocalService appender's writes
+            // (security-review 2026-07-17; pf-xusb/pf-gamepad/pf-vdisplay were moved then, this
+            // driver was missed — security-review 2026-07-28). Opt-in/debug only.
             std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open("C:\\Users\\Public\\pfmouse-driver.log")
+                .open(std::env::temp_dir().join("pfmouse-driver.log"))
                 .ok()
                 .map(std::sync::Mutex::new)
         })
@@ -325,7 +331,7 @@ extern "C" fn evt_device_add(_driver: WDFDRIVER, mut device_init: PWDFDEVICE_INI
     MANUAL_QUEUE.store(manual_queue, Ordering::SeqCst);
 
     // Periodic timer (parent = manual queue): sealed-channel pump + health marks + event-driven
-    // READ_REPORT completion. 8 ms — the proven pf-dualsense cadence; the mouse is presence-first
+    // READ_REPORT completion. 8 ms — the proven pf-gamepad cadence; the mouse is presence-first
     // (SendInput injects), so a 125 Hz ceiling on the validation/report path is fine.
     // SAFETY: zeroed config then fields set.
     let mut tcfg: WDF_TIMER_CONFIG = unsafe { core::mem::zeroed() };
@@ -397,6 +403,9 @@ extern "C" fn evt_io_device_control(
         // No output reports are declared; ack a stray write instead of failing the sender.
         IOCTL_HID_WRITE_REPORT | IOCTL_UMDF_HID_SET_OUTPUT_REPORT => STATUS_SUCCESS,
         IOCTL_HID_GET_STRING => on_get_string(&request),
+        // The channel proof (see `pf_umdf_util::hid`): the host asks THIS devnode which process
+        // serves it, and duplicates the DATA section into the answer — so it never has to trust the
+        // LocalService-writable bootstrap mailbox to name its target.
         _ => STATUS_NOT_IMPLEMENTED,
     };
 
@@ -406,7 +415,7 @@ extern "C" fn evt_io_device_control(
 
 // IOCTL_HID_GET_STRING: the input is a ULONG whose low word is the string id and whose high word
 // is the language id. Windows polls ids 0x0E/0x0F/0x10 (manufacturer/product/serial) as well as
-// the 0/1/2 HID_STRING_ID_* constants — serve both (the pf-dualsense finding).
+// the 0/1/2 HID_STRING_ID_* constants — serve both (the pf-gamepad finding).
 fn on_get_string(request: &Request) -> NTSTATUS {
     let (bytes, _) = match request.input_bytes(4) {
         Ok(v) => v,
@@ -418,10 +427,15 @@ fn on_get_string(request: &Request) -> NTSTATUS {
         0
     };
     let string_id = id_val & 0xFFFF;
-    let s: &str = match string_id {
-        0 | 0x000E => "punktfunk",
-        2 | 0x0010 => "PFMOUSE00",
-        _ => "punktfunk Virtual Mouse",
+    let s: String = match string_id {
+        0 | 0x000E => "punktfunk".into(),
+        // (2) The SERIAL carries the channel proof — the one transport measured to reach a UMDF HID
+        // minidriver from user mode (`HidD_GetSerialNumberString`, zero-access handle, verified on
+        // .173). Safe HERE and only here: nothing reads the virtual mouse's serial, whereas the pads'
+        // serials are what SDL and Steam dedup controllers on. The old value was the inert
+        // "PFMOUSE00"; the proof text is just as inert and does the security work.
+        2 | 0x0010 => ChannelProof::new(CHANNEL.index(), std::process::id()).to_hid_string(),
+        _ => "punktfunk Virtual Mouse".into(),
     };
     let mut wide: Vec<u8> = Vec::with_capacity(s.len() * 2 + 2);
     for u in s.encode_utf16() {

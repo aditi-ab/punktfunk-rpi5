@@ -183,7 +183,7 @@ if (-not $NoDriver) {
 else { Write-Host "-NoDriver: building installer WITHOUT the bundled pf-vdisplay driver" }
 
 # --- build (from source) + stage the punktfunk virtual-gamepad UMDF drivers --------------------
-# pf-dualsense (DualSense / DualShock 4) + pf-xusb (Xbox 360 / XInput) are members of the same drivers
+# pf-gamepad (DualSense / DS4 / Edge / Deck) + pf-xusb (Xbox 360 / XInput) are members of the same drivers
 # workspace as pf-vdisplay, built from source per release (build-gamepad-drivers.ps1) - same anti-stale
 # reasoning as pf-vdisplay; the prior checked-in binaries under gamepad-drivers/ are retired. The
 # installer adds each to the store via `punktfunk-host.exe driver install --gamepad` (the host

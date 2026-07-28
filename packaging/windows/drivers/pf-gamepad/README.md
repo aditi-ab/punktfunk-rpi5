@@ -1,4 +1,11 @@
-# pf-dualsense — virtual DualSense UMDF2 HID minidriver
+# pf-gamepad — the virtual-gamepad UMDF2 HID minidriver
+
+> Renamed from **pf-dualsense** (2026-07-28). One driver has always served four identities —
+> DualSense, DualShock 4, DualSense Edge and Steam Deck — so the old name read as if the other three
+> lived somewhere else. Only the PACKAGE identity moved (crate, INF, CAT, DLL, UMDF service); the
+> four **hardware ids** (`pf_dualsense`, `pf_dualshock4`, `pf_dualsenseedge`, `pf_steamdeck`) are
+> deliberately unchanged — they bind every devnode the host creates and every installed system.
+> `driver install --gamepad` retires the pre-rename store package so the two can't both claim them.
 
 A self-authored **Rust UMDF2 HID minidriver** that presents a virtual Sony **DualSense**
 (VID `054C` / PID `0CE6`) to Windows, so games drive adaptive triggers / lightbar / rumble —
@@ -42,24 +49,24 @@ plus the sign steps below, staged for the installer. The original manual dev-box
 lore (paths reflect that era's cargo-make layout):
 
 ```powershell
-cargo make                              # -> target\debug\pf_dualsense_package\ (.inf/.cat/.dll)
+cargo make                              # -> target\debug\pf_gamepad_package\ (.inf/.cat/.dll)
 
 # *** CRITICAL: clear the PE FORCE_INTEGRITY bit ***
 # windows-drivers-rs links the DLL with /INTEGRITYCHECK, which forces a CI-trusted page-hash
 # signature a self-signed cert cannot satisfy (CodeIntegrity 3004 "hash not found" /
 # 3089 VerificationError 7). SudoVDA.dll (third-party VDD prior art, not used by punktfunk) has
 # this bit OFF. Clear bit 0x80 at PE-header offset +0x5e:
-$f = 'target\debug\pf_dualsense_package\pf_dualsense.dll'
+$f = 'target\debug\pf_gamepad_package\pf_gamepad.dll'
 $b = [IO.File]::ReadAllBytes($f); $pe = [BitConverter]::ToInt32($b,0x3c); $off = $pe + 0x5e
 $dc = [BitConverter]::ToUInt16($b,$off); $bb = [BitConverter]::GetBytes([uint16]($dc -band 0xFF7F))
 $b[$off]=$bb[0]; $b[$off+1]=$bb[1]; [IO.File]::WriteAllBytes($f,$b)
 
 signtool sign /fd SHA256 /sha1 <cert-thumbprint> $f
-Remove-Item target\debug\pf_dualsense_package\pf_dualsense.cat
-Inf2Cat /driver:target\debug\pf_dualsense_package /os:10_x64
-signtool sign /fd SHA256 /sha1 <cert-thumbprint> target\debug\pf_dualsense_package\pf_dualsense.cat
+Remove-Item target\debug\pf_gamepad_package\pf_gamepad.cat
+Inf2Cat /driver:target\debug\pf_gamepad_package /os:10_x64
+signtool sign /fd SHA256 /sha1 <cert-thumbprint> target\debug\pf_gamepad_package\pf_gamepad.cat
 
-pnputil /add-driver target\debug\pf_dualsense_package\pf_dualsense.inf /install
+pnputil /add-driver target\debug\pf_gamepad_package\pf_gamepad.inf /install
 devgen /add /hardwareid "root\pf_dualsense"     # creates the (transient, SWD) device node
 ```
 

@@ -1,7 +1,7 @@
 //! The sealed pad channel, driver side (`design/gamepad-channel-sealing.md`, gamepad proto v2):
 //! poll the named bootstrap mailbox by index, publish our pid (iff the host's proto version
 //! matches), adopt the host-delivered DATA-section handle, and validate the mapped section's magic
-//! and `pad_index` before use. One implementation shared by `pf-xusb` and `pf-dualsense` (they used
+//! and `pad_index` before use. One implementation shared by `pf-xusb` and `pf-gamepad` (they used
 //! to hand-duplicate it), parameterized by [`ChannelConfig`].
 //!
 //! This module **forbids `unsafe`**: the entire state machine is safe Rust over

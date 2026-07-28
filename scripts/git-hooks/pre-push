@@ -29,9 +29,9 @@ fi
 # 2. UMDF driver workspace — mirrors windows-drivers.yml's gate (the shipped drivers + the
 # audited safe layer; pf-vdisplay is deliberately NOT gated there, so not here either).
 if ! (cd "$root/packaging/windows/drivers" \
-      && cargo fmt -p pf-umdf-util -p pf-xusb -p pf-dualsense --check >/dev/null 2>&1); then
+      && cargo fmt -p pf-umdf-util -p pf-xusb -p pf-gamepad -p pf-mouse --check >/dev/null 2>&1); then
     fail "driver workspace is not rustfmt-clean (windows-drivers.yml would fail)" \
-         "(cd packaging/windows/drivers && cargo fmt -p pf-umdf-util -p pf-xusb -p pf-dualsense)"
+         "(cd packaging/windows/drivers && cargo fmt -p pf-umdf-util -p pf-xusb -p pf-gamepad -p pf-mouse)"
 fi
 
 exit 0

@@ -1,4 +1,4 @@
-//! Virtual Sony DualSense on Windows via the UMDF minidriver (`packaging/windows/drivers/pf-dualsense`).
+//! Virtual Sony DualSense on Windows via the UMDF minidriver (`packaging/windows/drivers/pf-gamepad`).
 //!
 //! The Windows analogue of the Linux UHID backend ([`super::dualsense`]): same [`DsState`] model and
 //! the same byte-level report codec ([`super::dualsense_proto`]), but a different transport. Where
@@ -37,7 +37,7 @@ use windows::Win32::Foundation::{CloseHandle, E_FAIL, WAIT_OBJECT_0};
 use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 
 /// Shared-section layout — the single source of truth is [`pf_driver_proto::gamepad::PadShm`] (offset
-/// asserts pin every field; the `pf_dualsense` driver maps the same struct). Derive the size/offsets/magic
+/// asserts pin every field; the `pf_gamepad` driver maps the same struct). Derive the size/offsets/magic
 /// from it so a layout change is a compile error, not a hand-synced literal (audit §6.1). `pub(super)` so
 /// the sibling DualShock 4 backend ([`super::dualshock4_windows`]) reuses the exact offsets.
 pub(super) const SHM_SIZE: usize = core::mem::size_of::<pf_driver_proto::gamepad::PadShm>();
@@ -385,7 +385,7 @@ impl WinDsIdentity {
         WinDsIdentity {
             devtype: 0,
             instance_prefix: "pf_pad",
-            hwid: "pf_dualsense",
+            hwid: "pf_gamepad",
             usb_vid_pid: "VID_054C&PID_0CE6",
             description: "punktfunk Virtual DualSense",
         }
@@ -444,6 +444,13 @@ impl DsWinPad {
                 (None, None)
             }
         };
+        // The DATA section goes to whoever THIS devnode says is serving it — not to whatever pid
+        // the LocalService-writable mailbox names (security-review 2026-07-28).
+        channel.bind_devnode(
+            index as u32,
+            instance_id.clone(),
+            super::gamepad_raii::ProofTransport::HidFeatureReport,
+        );
         let _sw = hsw.map(super::gamepad_raii::SwDevice::new);
         // Bounded eager delivery so the driver holds the DATA section before hidclass asks it for
         // descriptors (the driver reads `device_type` from the section to pick its HID identity).
@@ -453,8 +460,8 @@ impl DsWinPad {
             channel,
             attach: super::gamepad_raii::DriverAttach::new(
                 id.hwid,
-                "pf_dualsense.inf", // one driver package serves every PS identity
-                "C:\\Users\\Public\\pfds-driver.log",
+                "pf_gamepad.inf", // one driver package serves every PS identity
+                "C:\\Windows\\ServiceProfiles\\LocalService\\AppData\\Local\\Temp\\pf_gamepad-driver.log",
                 boot_name,
                 instance_id,
             ),
@@ -472,7 +479,7 @@ impl DsWinPad {
         serialize_state(&mut r, st, self.seq, self.ts);
         // SAFETY: base points at SHM_SIZE bytes; input slot is OFF_INPUT..OFF_INPUT+64. Unlike the
         // XUSB `packet` / DualSense `out_seq` fields, the input path has NO driver-polled change-detect
-        // field to publish last: the `pf_dualsense` driver streams the whole `input` region to game
+        // field to publish last: the `pf_gamepad` driver streams the whole `input` region to game
         // READ_REPORTs on its ~125 Hz timer, and the report's own sequence counter (r[7], mid-report)
         // is consumed by the game's HID stack, not the driver — so it cannot serve as a separable
         // publish flag without a seqlock generation the driver `Acquire`-reads (a `PadShm` layout +
@@ -622,7 +629,7 @@ pub fn deck_spike_hold(index: u8, secs: u64) -> Result<()> {
         std::ptr::write_unaligned(base as *mut u32, SHM_MAGIC);
     }
     let inst = format!("pf_deckspike_{index}");
-    let (hsw, _) = create_swdevice(&SwDeviceProfile {
+    let (hsw, spike_instance_id) = create_swdevice(&SwDeviceProfile {
         instance: &inst,
         container_tag: 0x5046_4453, // "PFDS"
         container_index: index,
@@ -633,6 +640,13 @@ pub fn deck_spike_hold(index: u8, secs: u64) -> Result<()> {
         usb_mi: Some(2),
         description: "punktfunk Virtual Steam Deck (spike)",
     })?;
+    // The spike drives a real pad channel, so it takes the same devnode-proved delivery a session
+    // pad does — no special case, and no reason for a bring-up tool to run on the old trust.
+    channel.bind_devnode(
+        index as u32,
+        spike_instance_id,
+        super::gamepad_raii::ProofTransport::HidFeatureReport,
+    );
     let _sw = super::gamepad_raii::SwDevice::new(hsw);
     channel.deliver_eager(std::time::Duration::from_millis(1500));
     println!(

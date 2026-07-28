@@ -358,7 +358,7 @@ static DEVTYPE_WAITED: AtomicBool = AtomicBool::new(false);
 /// This pad's channel config (magic/size/pad_index offset + our logger).
 fn channel_cfg() -> ChannelConfig {
     ChannelConfig {
-        tag: "pf-ds",
+        tag: "pf-gamepad",
         boot_name_prefix: "Global\\pfds-boot-",
         data_magic: SHM_MAGIC,
         data_size: SHM_SIZE,
@@ -385,14 +385,14 @@ fn pad_index() -> u8 {
 }
 
 /// Whether the world-writable bring-up file log is enabled (resolved once). OPT-IN — debug builds,
-/// or the `PFDS_DEBUG_LOG` (system-wide) env var — the same treatment pf-vdisplay got in audit
+/// or the `PFGAMEPAD_DEBUG_LOG` (system-wide) env var — the same treatment pf-vdisplay got in audit
 /// §4.4: a RELEASE driver never writes the Public file (info-leak/DoS surface), and the per-report
 /// OUTPUT hex dumps stop being a sustained disk-write path during gameplay. DebugView can't see the
 /// UMDF host across session 0, so the file stays the bring-up diagnostic when enabled.
 fn file_log_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| cfg!(debug_assertions) || std::env::var_os("PFDS_DEBUG_LOG").is_some())
+    *ON.get_or_init(|| cfg!(debug_assertions) || std::env::var_os("PFGAMEPAD_DEBUG_LOG").is_some())
 }
 
 /// Process-lifetime append handle to the bring-up log, opened ONCE and shared via a `Mutex`
@@ -411,7 +411,7 @@ fn file_appender() -> Option<&'static std::sync::Mutex<std::fs::File>> {
             std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open(std::env::temp_dir().join("pfds-driver.log"))
+                .open(std::env::temp_dir().join("pf_gamepad-driver.log"))
                 .ok()
                 .map(std::sync::Mutex::new)
         })
@@ -437,7 +437,7 @@ pub unsafe extern "system" fn driver_entry(
     driver: PDRIVER_OBJECT,
     registry_path: PCUNICODE_STRING,
 ) -> NTSTATUS {
-    log("[pf-ds] DriverEntry");
+    log("[pf-gamepad] DriverEntry");
     // SAFETY: zeroed WDF_DRIVER_CONFIG is a valid all-null config; we then set Size + the callback.
     let mut config: WDF_DRIVER_CONFIG = unsafe { core::mem::zeroed() };
     config.Size = core::mem::size_of::<WDF_DRIVER_CONFIG>() as ULONG;
@@ -457,7 +457,7 @@ pub unsafe extern "system" fn driver_entry(
 }
 
 extern "C" fn evt_device_add(_driver: WDFDRIVER, mut device_init: PWDFDEVICE_INIT) -> NTSTATUS {
-    log("[pf-ds] EvtDeviceAdd");
+    log("[pf-gamepad] EvtDeviceAdd");
 
     // Mark as a filter (HID minidriver sits below mshidumdf.sys).
     // SAFETY: device_init is provided by the framework and non-null.
@@ -474,14 +474,14 @@ extern "C" fn evt_device_add(_driver: WDFDRIVER, mut device_init: PWDFDEVICE_INI
         )
     };
     if !nt_success(st) {
-        dbglog!("[pf-ds] WdfDeviceCreate failed 0x{:08x}", st as u32);
+        dbglog!("[pf-gamepad] WdfDeviceCreate failed 0x{:08x}", st as u32);
         return st;
     }
 
     // SAFETY: `device` is the live device just created — the exact contract this fn requires.
     let shm_idx = unsafe { wdf::query_location_index(device) };
     CHANNEL.set_index(shm_idx);
-    dbglog!("[pf-ds] shm index = {shm_idx}");
+    dbglog!("[pf-gamepad] shm index = {shm_idx}");
 
     // Default parallel queue handling all IOCTLs.
     // SAFETY: zeroed config then fields set; Size matches the struct.
@@ -507,7 +507,7 @@ extern "C" fn evt_device_add(_driver: WDFDRIVER, mut device_init: PWDFDEVICE_INI
     };
     if !nt_success(st) {
         dbglog!(
-            "[pf-ds] default WdfIoQueueCreate failed 0x{:08x}",
+            "[pf-gamepad] default WdfIoQueueCreate failed 0x{:08x}",
             st as u32
         );
         return st;
@@ -531,7 +531,10 @@ extern "C" fn evt_device_add(_driver: WDFDRIVER, mut device_init: PWDFDEVICE_INI
         )
     };
     if !nt_success(st) {
-        dbglog!("[pf-ds] manual WdfIoQueueCreate failed 0x{:08x}", st as u32);
+        dbglog!(
+            "[pf-gamepad] manual WdfIoQueueCreate failed 0x{:08x}",
+            st as u32
+        );
         return st;
     }
     MANUAL_QUEUE.store(manual_queue, Ordering::SeqCst);
@@ -558,13 +561,13 @@ extern "C" fn evt_device_add(_driver: WDFDRIVER, mut device_init: PWDFDEVICE_INI
         call_unsafe_wdf_function_binding!(WdfTimerCreate, &mut tcfg, &mut tattr, &mut timer)
     };
     if !nt_success(st) {
-        dbglog!("[pf-ds] WdfTimerCreate failed 0x{:08x}", st as u32);
+        dbglog!("[pf-gamepad] WdfTimerCreate failed 0x{:08x}", st as u32);
         return st;
     }
     // SAFETY: timer valid; -80000 == 8ms relative due time (100ns units, negative = relative).
     let _started = unsafe { call_unsafe_wdf_function_binding!(WdfTimerStart, timer, -80000i64) };
 
-    log("[pf-ds] device ready (DualSense 054C:0CE6)");
+    log("[pf-gamepad] device ready (DualSense 054C:0CE6)");
     STATUS_SUCCESS
 }
 
@@ -582,7 +585,7 @@ extern "C" fn evt_io_device_control(
     // Skip the 8ms READ_REPORT cadence so the log stays readable during a game test;
     // the 0x02 OUTPUT report (the gate) and the descriptor handshake still log.
     if ioctl != IOCTL_HID_READ_REPORT {
-        dbglog!("[pf-ds] ioctl 0x{ioctl:08x} out={_output_len} in={_input_len}");
+        dbglog!("[pf-gamepad] ioctl 0x{ioctl:08x} out={_output_len} in={_input_len}");
     }
 
     // READ_REPORT forwards to the manual queue (the timer completes it) — this CONSUMES the request
@@ -618,10 +621,16 @@ extern "C" fn evt_io_device_control(
         IOCTL_UMDF_HID_GET_FEATURE => on_get_feature(&request),
         IOCTL_UMDF_HID_GET_INPUT_REPORT => request.copy_to_output(&neutral_report(device_type())),
         IOCTL_HID_GET_STRING => on_get_string(&request),
+        // The channel proof (see `pf_umdf_util::hid`): the host asks THIS devnode which process
+        // serves it, and duplicates the DATA section into the answer — so it never has to trust the
+        // LocalService-writable bootstrap mailbox to name its target.
         _ => STATUS_NOT_IMPLEMENTED,
     };
 
-    dbglog!("[pf-ds] ioctl 0x{ioctl:08x} -> 0x{:08x}", status as u32);
+    dbglog!(
+        "[pf-gamepad] ioctl 0x{ioctl:08x} -> 0x{:08x}",
+        status as u32
+    );
     request.complete(status);
 }
 
@@ -644,7 +653,7 @@ fn on_output_report(request: &Request, ioctl: ULONG) -> NTSTATUS {
     } else {
         "SET_OUTPUT_REPORT"
     };
-    dbglog!("[pf-ds] *** OUTPUT {kind} reportId={report_id} len={inlen} data: {hex}");
+    dbglog!("[pf-gamepad] *** OUTPUT {kind} reportId={report_id} len={inlen} data: {hex}");
 
     // Publish the game's 0x02 output report to the sealed DATA section for the host (rumble /
     // lightbar / player-LEDs / adaptive triggers): legacy slot + seq, plus the v2.1 ring.
@@ -696,7 +705,7 @@ fn on_set_feature(request: &Request) -> NTSTATUS {
             publish_output(view, &out);
         }
     }
-    dbglog!("[pf-ds] SET_FEATURE (acked, latched for GET)");
+    dbglog!("[pf-gamepad] SET_FEATURE (acked, latched for GET)");
     STATUS_SUCCESS
 }
 
@@ -718,6 +727,16 @@ fn deck_feature_reply() -> [u8; 64] {
     let unit_serial = format!("FVPF{unit_id:08X}");
     let unit_serial = unit_serial.as_bytes();
     let mut r = [0u8; 64];
+    // The CHANNEL PROOF, Deck flavour: the Deck's ONE feature report is unnumbered and Steam drives
+    // it as command→response, so the proof rides that same contract instead of a new report id (no
+    // descriptor change). Two command bytes, so a Steam command we haven't catalogued cannot collide.
+    if last.starts_with(&pf_driver_proto::gamepad::DECK_PROOF_CMD) {
+        let proof =
+            pf_driver_proto::gamepad::ChannelProof::new(CHANNEL.index(), std::process::id());
+        r[..2].copy_from_slice(&pf_driver_proto::gamepad::DECK_PROOF_CMD);
+        r[2..18].copy_from_slice(&proof.to_bytes());
+        return r;
+    }
     match last[0] {
         0x83 => {
             // GET_ATTRIBUTES_VALUES: [0x83, 0x2d, then 9x (attr-id, value u32-LE)].
@@ -779,6 +798,24 @@ fn on_get_feature(request: &Request) -> NTSTATUS {
     let Some(&report_id) = bytes.first() else {
         return STATUS_INVALID_PARAMETER;
     };
+    // The CHANNEL PROOF (security-review 2026-07-28): tell the host which process serves this
+    // devnode, so it never has to trust the LocalService-writable bootstrap mailbox to name its
+    // duplication target. `0x85` is already declared as a Feature report in all three captured
+    // descriptors and was previously answered with STATUS_INVALID_PARAMETER, so this costs NO
+    // report-descriptor change — the identity Steam and SDL fingerprint is untouched. Derived only
+    // from our own devnode Location + pid: nothing a caller supplies feeds into it.
+    if report_id == pf_driver_proto::gamepad::HID_FEATURE_REPORT_CHANNEL_PROOF {
+        let len = request.output_buffer_len();
+        return match pf_driver_proto::gamepad::ChannelProof::new(
+            CHANNEL.index(),
+            std::process::id(),
+        )
+        .to_feature_report(report_id, len)
+        {
+            Some(rep) => request.copy_to_output(&rep),
+            None => STATUS_INVALID_PARAMETER, // caller's buffer can't hold id + proof
+        };
+    }
     // DualSense + Edge use feature ids 0x05/0x09/0x20 (same blobs — SDL forces enhanced-rumble
     // for the Edge PID regardless of the firmware version at 0x20[44..46]); DualShock 4 uses
     // 0x02/0x12/0xa3.
@@ -801,7 +838,7 @@ fn on_get_feature(request: &Request) -> NTSTATUS {
         (1, 0x12) => &ds4_pairing,
         (1, 0xA3) => &DS4_FEATURE_FIRMWARE,
         (_, other) => {
-            dbglog!("[pf-ds] GET_FEATURE unknown report id 0x{other:02x}");
+            dbglog!("[pf-gamepad] GET_FEATURE unknown report id 0x{other:02x}");
             return STATUS_INVALID_PARAMETER;
         }
     };
@@ -825,7 +862,7 @@ fn on_get_string(request: &Request) -> NTSTATUS {
     };
     let string_id = id_val & 0xFFFF;
     let devtype = device_type();
-    dbglog!("[pf-ds] GET_STRING id=0x{string_id:04x} (raw 0x{id_val:08x}) devtype={devtype}");
+    dbglog!("[pf-gamepad] GET_STRING id=0x{string_id:04x} (raw 0x{id_val:08x}) devtype={devtype}");
     let s: String = match string_id {
         0 | 0x000e => match devtype {
             1 => "Sony Computer Entertainment".into(),
@@ -882,7 +919,7 @@ fn device_type() -> u8 {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         dbglog!(
-            "[pf-ds] device_type: sealed channel not attached within 1s — defaulting to the last observed identity"
+            "[pf-gamepad] device_type: sealed channel not attached within 1s — defaulting to the last observed identity"
         );
     }
     LAST_DEVTYPE.load(Ordering::Relaxed) as u8

@@ -245,10 +245,31 @@ impl Drop for KeyedMutexGuard<'_> {
 /// broker duplicates sensitive handles into it. The pid is driver-reported (the frame channel's
 /// [`control::AddReply::wudf_pid`], or the gamepad bootstrap's `driver_pid`); a spoofed devnode / a
 /// tampered mailbox could name an arbitrary process to receive the channel, so this is the
-/// confused-deputy gate. Best-effort image-path identity is proportionate: a fully-compromised REAL
-/// driver is already a channel endpoint, and any *other* process (attacker exe, a non-driver pid)
-/// fails this WUDFHost image check. `what` names the channel in the error (e.g. `"frame-channel"`);
-/// shared with the gamepad sealed channel (`inject/windows/gamepad_raii.rs`).
+/// confused-deputy gate. `what` names the channel in the error (e.g. `"frame-channel"`); shared with
+/// the gamepad sealed channel (`inject/windows/gamepad_raii.rs`).
+///
+/// # What this does and does NOT prove (security-review 2026-07-28)
+///
+/// It proves the target's image is the system WUDFHost binary. It does **not** prove the target is
+/// *the* WUDFHost hosting our devnode, and it is not an authorization check: `WUDFHost.exe` is
+/// world-executable, so anyone who can name a pid to a broker can first spawn their own copy (e.g.
+/// `CREATE_SUSPENDED`, which parks it indefinitely with the right image path) and pass this check.
+/// It therefore only screens out *non-WUDFHost* pids — an attacker exe, a stale/wrong devnode.
+///
+/// Whether that is sufficient depends entirely on who can name the pid, so it must be judged at each
+/// caller, NOT here:
+/// - **Frame channel** — sufficient. The pid is `AddReply::wudf_pid`, which the driver fills with its
+///   own `GetCurrentProcessId()` and returns over the pf-vdisplay control device, whose DACL is
+///   `D:P(A;;GA;;;SY)(A;;GA;;;BA)`. Only SYSTEM/Administrators can speak on that channel, and both are
+///   out of scope by SECURITY.md.
+/// - **Gamepad/mouse channel** — NOT sufficient on its own. The pid comes from a `Global\` mailbox
+///   that LocalService can write, so this check does not identify the caller; see the corrected
+///   analysis and the one-delivery rule in `pf-inject/src/inject/windows/gamepad_raii.rs`.
+///
+/// Do not add a token/session/account check here expecting it to fix the gamepad case: a genuine
+/// UMDF host and a LocalService attacker's spawned WUDFHost are both session 0 and both LocalService,
+/// so such checks discriminate nothing while risking a false negative that would silently kill
+/// display capture and every virtual pad.
 ///
 /// # Safety
 /// `process` must be a live process handle carrying `PROCESS_QUERY_LIMITED_INFORMATION`.

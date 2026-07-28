@@ -1,5 +1,5 @@
 //! The audited unsafe-primitive layer under the punktfunk UMDF gamepad drivers (`pf-xusb`,
-//! `pf-dualsense`).
+//! `pf-gamepad`).
 //!
 //! A UMDF driver cannot be literally free of `unsafe` — WDF dispatch, Win32 section mapping and
 //! cross-process shared memory are FFI by nature. What Rust *can* buy is confining every raw
@@ -15,6 +15,9 @@
 //! * [`wdf`] — [`wdf::Request`] + queue/device-property helpers: each framework callback converts
 //!   its raw `WDFREQUEST` into a token exactly once (`unsafe`, with the framework's validity as the
 //!   contract); everything after that is safe.
+//! * [`hid`] — the HID minidrivers' **channel proof** answer (also `#[forbid(unsafe_code)]`): how
+//!   `pf_gamepad`/`pf_mouse` tell the host, over the device stack, which process is serving this
+//!   devnode. That is what the host trusts instead of the LocalService-writable bootstrap mailbox.
 //!
 //! Lint gates (mirrored in every driver crate, enforced by the drivers CI clippy step):
 //! `unsafe_op_in_unsafe_fn` + `clippy::undocumented_unsafe_blocks` — every remaining `unsafe {}`
@@ -24,6 +27,7 @@
 #![deny(clippy::undocumented_unsafe_blocks)]
 
 pub mod channel;
+pub mod hid;
 pub mod section;
 pub mod wdf;
 

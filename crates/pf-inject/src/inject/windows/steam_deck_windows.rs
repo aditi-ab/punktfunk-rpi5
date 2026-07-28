@@ -79,6 +79,13 @@ impl DeckWinPad {
             description: "punktfunk Virtual Steam Deck",
         })?; // Propagate — swallowing latched the slot to a pad with no devnode (see the DS4 twin).
         let (hsw, instance_id) = (Some(hsw), instance_id);
+        // The DATA section goes to whoever THIS devnode says is serving it — not to whatever pid
+        // the LocalService-writable mailbox names (security-review 2026-07-28).
+        channel.bind_devnode(
+            index as u32,
+            instance_id.clone(),
+            super::gamepad_raii::ProofTransport::HidFeatureReport,
+        );
         let _sw = hsw.map(super::gamepad_raii::SwDevice::new);
         // Bounded eager delivery — the driver must read `device_type = 3` before hidclass asks
         // it for descriptors, or the pad would enumerate with the default DualSense identity.
@@ -88,8 +95,8 @@ impl DeckWinPad {
             channel,
             attach: super::gamepad_raii::DriverAttach::new(
                 "pf_steamdeck",
-                "pf_dualsense.inf", // one driver package serves every identity
-                "C:\\Users\\Public\\pfds-driver.log",
+                "pf_gamepad.inf", // one driver package serves every identity
+                "C:\\Windows\\ServiceProfiles\\LocalService\\AppData\\Local\\Temp\\pf_gamepad-driver.log",
                 boot_name,
                 instance_id,
             ),

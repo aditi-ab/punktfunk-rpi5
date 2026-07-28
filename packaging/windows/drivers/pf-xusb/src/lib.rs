@@ -58,6 +58,14 @@ const IOCTL_XUSB_GET_XINPUT_MANAGEMENT_DRIVER: u32 = 0x8000_6380;
 const IOCTL_XUSB_WAIT_FOR_INPUT: u32 = 0x8000_E3AC;
 const IOCTL_XUSB_GET_INFORMATION_EX: u32 = 0x8000_E3FC;
 
+/// Our own private IOCTL (NOT part of xusb22): answer the host's **channel proof** — which process
+/// is serving this devnode — so the host learns its duplication target from the device stack instead
+/// of from the LocalService-writable bootstrap mailbox (see `pf_driver_proto::gamepad::ChannelProof`
+/// for why that distinction is the whole security property). Any local caller may ask; the answer is
+/// a pid and two version numbers, none of them secret, and it is only worth anything to a process
+/// that can already duplicate handles into us.
+const IOCTL_PF_GET_CHANNEL_PROOF: u32 = pf_driver_proto::gamepad::IOCTL_PF_GET_CHANNEL_PROOF;
+
 // Xbox 360 wired identity (what GET_INFORMATION reports). 0x0103 unblocks SET_STATE (vibration).
 const XUSB_VID: u16 = 0x045E;
 const XUSB_PID: u16 = 0x028E;
@@ -389,6 +397,14 @@ extern "C" fn evt_io_device_control(
             }
         }
         IOCTL_XUSB_GET_STATE => request.copy_to_output(&build_get_state(data)),
+        // The channel proof — deliberately answered from THIS process's own identity, never from
+        // anything a caller supplied, so the only way to make this devnode name a process is to BE
+        // the driver bound to it.
+        IOCTL_PF_GET_CHANNEL_PROOF => {
+            let proof =
+                pf_driver_proto::gamepad::ChannelProof::new(CHANNEL.index(), std::process::id());
+            request.copy_to_output(&proof.to_bytes())
+        }
         IOCTL_XUSB_GET_LED_STATE => request.copy_to_output(&[0x00, 0x00, 0x06]),
         IOCTL_XUSB_GET_BATTERY_INFORMATION => request.copy_to_output(&[0x00, 0x01, 0x03, 0x00]),
         IOCTL_XUSB_SET_STATE => on_set_state(&request, data),

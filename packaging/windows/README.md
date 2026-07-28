@@ -80,7 +80,7 @@ parse breakage that silently failed installs on non-English boxes.
 - **Uninstall** (Add/Remove Programs): runs `service uninstall` (stop + delete service + remove
   firewall rules), removes the `PunktfunkWeb` task + its firewall rule, then `driver uninstall` (+
   `--gamepad`) removes the punktfunk virtual-device drivers — the pf-vdisplay device node(s) and the
-  pf-vdisplay / pf-dualsense / pf-xusb driver-store packages (the field report was that they survived
+  pf-vdisplay / pf-gamepad / pf-xusb driver-store packages (the field report was that they survived
   uninstall). **VB-CABLE is intentionally NOT removed** (a third-party shared component the user may
   use elsewhere — its own uninstaller is `VBCABLE_Setup_x64.exe -u -h`); the `%ProgramData%\punktfunk`
   config (incl. `web-password`) is also left in place.
@@ -123,7 +123,7 @@ fresh install uses the generated random console password — read it from
 | `branding/` | Wizard branding: `gen-branding.ps1` renders the brand mark into the committed `wizard-image-*.bmp` / `wizard-small-*.bmp` (100–200% DPI) + `punktfunk.ico`. Re-run only on a brand change. |
 | `pack-host-installer.ps1` | Orchestrator: cert + sign exe, **build + sign the drivers from source**, stage them + FFmpeg + VB-CABLE + the **web console** (`.output` + bun) + the HDR layer + branding, run ISCC, sign setup.exe. |
 | `build-pf-vdisplay.ps1` | Build pf-vdisplay from source (the `drivers/` workspace) + clear FORCE_INTEGRITY + sign `.dll`/`.cat` + export `.cer`. |
-| `build-gamepad-drivers.ps1` | Sign + catalog the gamepad drivers (`pf-dualsense` + `pf-xusb`) from the same workspace build (`-SkipBuild`), one shared cert. |
+| `build-gamepad-drivers.ps1` | Sign + catalog the gamepad drivers (`pf-gamepad` + `pf-xusb`) from the same workspace build (`-SkipBuild`), one shared cert. |
 | `install-vbcable.ps1` | On-target: seed VB-Audio's cert into `TrustedPublisher`, silently install the bundled VB-CABLE (`-i -h`). Run by the installer's *Install VB-CABLE virtual audio* task; idempotent + always exits 0 (non-fatal). |
 | `clear-force-integrity.ps1` | Clear the `/INTEGRITYCHECK` PE bit so a self-signed driver loads (reused by every driver build). |
 | `stage-pf-vdisplay.ps1` | Stage the just-built pf-vdisplay bundle + fetch/verify the **pinned** nefcon release. |
@@ -133,7 +133,7 @@ fresh install uses the generated random console password — read it from
 | `redeploy-pf-vdisplay.ps1` | **Dev:** one-shot redeploy — (optional) build → stop host → `deploy-dev.ps1 -Install` → reload adapter → start host. |
 | `pf-vkhdr-layer/` | **HDR Vulkan layer** (standalone `cdylib`): lets Vulkan games (Doom: The Dark Ages, etc.) enable HDR over the virtual display by advertising the HDR surface formats the NVIDIA/AMD ICDs hide on an indirect display. Built by the packer, laid into `{app}\vklayer`, registered under `HKLM64\…\Khronos\Vulkan\ImplicitLayers` (opt-out *Install the HDR Vulkan layer* task). Self-gated on the display's HDR state. See its README. |
 
-> **Drivers are built from source, not vendored.** All three (pf-vdisplay + the gamepad pf-dualsense /
+> **Drivers are built from source, not vendored.** All three (pf-vdisplay + the gamepad pf-gamepad /
 > pf-xusb) are members of the all-Rust `drivers/` workspace (windows-drivers-rs / IddCx) and are
 > **rebuilt + signed every release** by `build-pf-vdisplay.ps1` + `build-gamepad-drivers.ps1` - the
 > checked-in prebuilt binaries were deleted (a stale `.cat` once stopped covering its `.inf` →

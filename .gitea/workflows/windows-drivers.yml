@@ -153,9 +153,9 @@ jobs:
         # `// SAFETY:` proof. Both invariants are lint-gated (`unsafe_op_in_unsafe_fn` +
         # `undocumented_unsafe_blocks`); this step keeps them from regressing. (wdk-probe is a
         # toolchain-only probe crate and is excluded.)
-        run: cargo clippy -p pf-umdf-util -p pf-xusb -p pf-dualsense -p pf-mouse -p wdk-iddcx -p pf-vdisplay --all-targets -- -D warnings
+        run: cargo clippy -p pf-umdf-util -p pf-xusb -p pf-gamepad -p pf-mouse -p wdk-iddcx -p pf-vdisplay --all-targets -- -D warnings
       - name: cargo fmt --check the safe-layer + gamepad/mouse drivers
-        run: cargo fmt -p pf-umdf-util -p pf-xusb -p pf-dualsense -p pf-mouse --check
+        run: cargo fmt -p pf-umdf-util -p pf-xusb -p pf-gamepad -p pf-mouse --check
       - name: Inspect /INTEGRITYCHECK (before) — expect FORCE_INTEGRITY set by wdk-build
         run: |
           # explicit --target (.cargo/config.toml) -> output under the triple subdir.

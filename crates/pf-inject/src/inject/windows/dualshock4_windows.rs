@@ -77,6 +77,13 @@ impl Ds4WinPad {
         // `gate.on_success()` cleared the backoff, so the create-gate that exists precisely to
         // self-heal a transient PnP failure never retried. The game saw no controller for the whole
         // session unless the client unplugged the pad. Matches the XUSB sibling, which propagates.
+        // The DATA section goes to whoever THIS devnode says is serving it — not to whatever pid
+        // the LocalService-writable mailbox names (security-review 2026-07-28).
+        channel.bind_devnode(
+            index as u32,
+            instance_id.clone(),
+            super::gamepad_raii::ProofTransport::HidFeatureReport,
+        );
         let _sw = hsw.map(super::gamepad_raii::SwDevice::new);
         // Bounded eager delivery — for the DS4 this is what closes the identity race: the driver
         // must read `device_type = 1` from the delivered DATA section before hidclass asks it for
@@ -87,8 +94,8 @@ impl Ds4WinPad {
             channel,
             attach: super::gamepad_raii::DriverAttach::new(
                 "pf_dualshock4",
-                "pf_dualsense.inf", // one driver package serves both HID identities
-                "C:\\Users\\Public\\pfds-driver.log",
+                "pf_gamepad.inf", // one driver package serves both HID identities
+                "C:\\Windows\\ServiceProfiles\\LocalService\\AppData\\Local\\Temp\\pf_gamepad-driver.log",
                 boot_name,
                 instance_id,
             ),

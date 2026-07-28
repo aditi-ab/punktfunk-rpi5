@@ -681,7 +681,7 @@ pub mod frame {
     };
 }
 
-/// Gamepad shared-memory layouts (host ↔ the UMDF gamepad drivers `pf_xusb` / `pf_dualsense`).
+/// Gamepad shared-memory layouts (host ↔ the UMDF gamepad drivers `pf_xusb` / `pf_gamepad`).
 ///
 /// These were hand-duplicated as `OFF_*`/`SHM_*` constants in `inject/{gamepad,dualsense}_windows.rs`
 /// and (as bare literals — `*view.add(140)`) in the standalone `xusb-driver`/`dualsense-driver`
@@ -699,12 +699,12 @@ pub mod gamepad {
 
     /// XUSB section magic — the exact u32 the shipped host + `pf_xusb` driver compare (loosely "PFXU").
     pub const XUSB_MAGIC: u32 = 0x5558_4650;
-    /// Pad section magic — the exact u32 the shipped host + `pf_dualsense` driver compare (loosely
+    /// Pad section magic — the exact u32 the shipped host + `pf_gamepad` driver compare (loosely
     /// "PFDS"). (Note: the two magics happen to use opposite byte-order mnemonics in the legacy code;
     /// only the u32 value is the contract.)
     pub const PAD_MAGIC: u32 = 0x5046_4453;
 
-    /// `device_type` selector the `pf_dualsense` driver reads to pick its HID identity. The section is
+    /// `device_type` selector the `pf_gamepad` driver reads to pick its HID identity. The section is
     /// zeroed, so `0` = DualSense is the default; one driver serves every identity.
     pub const DEVTYPE_DUALSENSE: u8 = 0;
     /// `device_type` = DualShock 4 (`VID_054C&PID_09CC` HID identity).
@@ -730,7 +730,235 @@ pub mod gamepad {
     /// gained `pad_index` (carved from reserved space) so the driver rejects a cross-pad delivery.
     /// A v1 driver opens `Global\pf…-shm-<i>` (which no longer exists) and a v1 host never creates
     /// the mailbox a v2 driver polls, so a mixed pairing fails closed either way.
-    pub const GAMEPAD_PROTO_VERSION: u32 = 2;
+    ///
+    /// v3: the **channel proof** ([`ChannelProof`]) — the host stopped trusting the mailbox's
+    /// `driver_pid` and now learns the duplication target over the DEVICE STACK instead. A v2 driver
+    /// answers no proof, so a v3 host refuses to deliver to it; a v2 host never asks, and a v3 driver
+    /// refuses the v2 handshake on the `host_proto` check. Mixed pairings fail closed both ways, with
+    /// the existing "update host + drivers together" diagnostic.
+    pub const GAMEPAD_PROTO_VERSION: u32 = 3;
+
+    // ── the channel proof (v3): who to hand the DATA section to ──────────────────────────────────
+    //
+    // WHY THIS EXISTS. Through v2 the host took the duplication target from the mailbox's
+    // `driver_pid`. The mailbox has to be openable by LocalService (that is what the driver's own
+    // WUDFHost runs as), and the delivery gate — `verify_is_wudfhost` — only checks that the named
+    // process's IMAGE is `%SystemRoot%\System32\WUDFHost.exe`, which is world-executable. So any
+    // LocalService principal, notably the deliberately de-privileged plugin runner, could spawn its
+    // own WUDFHost, publish that pid, and be handed the pad's DATA section: forged HID input into the
+    // interactive desktop (the mouse section drives a real absolute pointer) and a read of the remote
+    // user's controller state (security-review 2026-07-28).
+    //
+    // WHY IT HAS TO COME FROM THE DEVICE STACK. That race cannot be closed on the host side alone.
+    // Everything the real driver can read at LocalService — the devnode's Location, its
+    // `Device Parameters` key, the object namespace — an attacker at LocalService can read too, so no
+    // host-published secret tells the two apart. The ONE thing an attacker cannot forge is *being the
+    // driver bound to our devnode*: only that process answers I/O sent to the device the host itself
+    // created (and the host looks the device up by the instance id `SwDeviceCreate` handed back, so a
+    // planted look-alike devnode is not in the running). Asking the devnode "which process are you?"
+    // therefore yields a pid the host can trust, and the mailbox is demoted to what it always should
+    // have been: a rendezvous for a handle VALUE that is meaningless anywhere but in that process.
+    //
+    // Two transports, because the drivers are two different shapes:
+    //   * `pf_xusb` is a plain UMDF2 driver that owns `GUID_DEVINTERFACE_XUSB` and dispatches its own
+    //     IOCTLs -> [`IOCTL_PF_XUSB_GET_CHANNEL_PROOF`].
+    //   * `pf_gamepad` / `pf_mouse` are HID minidrivers with no control device (hidclass owns the
+    //     stack, and UMDF has no control-device objects), so the reachable read path is a HID string
+    //     -> [`HID_STRING_INDEX_CHANNEL_PROOF`], which needs no report-descriptor change. That
+    //     matters: the pads' descriptors, VID/PID and serials are what Steam and SDL fingerprint,
+    //     and a new feature report there would risk the identity work this driver exists to get right.
+
+    /// Proof magic ("PFCP" — punktfunk channel proof), and the `PFCP` prefix of the text form.
+    pub const PROOF_MAGIC: u32 = 0x5043_4650;
+
+    /// Reserved HID string index the `pf_gamepad` / `pf_mouse` minidrivers answer with their
+    /// [`ChannelProof`], fetched by the host with `HidD_GetIndexedString`.
+    ///
+    /// ⚠️ MEASURED UNUSABLE on .173 (Win11 26200): hidclass does not carry an arbitrary indexed-string
+    /// request to a UMDF HID minidriver — `HidD_GetIndexedString` failed for EVERY index, including
+    /// ones the driver demonstrably serves through the named wrappers. Kept because it costs one
+    /// failed IOCTL and is the right thing to ask first if a later Windows starts forwarding it; the
+    /// transports that actually work are [`PF_PAD_CONTROL_INTERFACE_GUID_U128`] (if hidclass lets it
+    /// through) and, for `pf_mouse`, the serial string ([`proof_is_serial_string`]).
+    ///
+    /// 16-bit on purpose: both `IOCTL_HID_GET_INDEXED_STRING` and `IOCTL_HID_GET_STRING` pack their
+    /// argument as `(language_id << 16) | string_index`, so only the low word survives the trip and
+    /// both drivers mask before comparing. `0x5046` ("PF") is still far outside the 1..=255 range a
+    /// real USB/HID string-descriptor index can occupy, so it cannot collide with a string the OS, a
+    /// game, or Steam asks for.
+    pub const HID_STRING_INDEX_CHANNEL_PROOF: u32 = 0x5046;
+
+    // ❌ A private device interface (`WdfDeviceCreateDeviceInterface`) was tried here as a
+    // hidclass-independent transport for the HID minidrivers and MEASURED DEAD on .173 (Win11
+    // 26200): it registers and enumerates, but `CreateFile` on it is refused (ERROR_GEN_FAILURE)
+    // because hidclass owns `IRP_MJ_CREATE` on a devnode it is the FDO for. Do not re-try it for
+    // `pf_gamepad`/`pf_mouse`; see `pf_umdf_util::hid` for the full measurement.
+
+    /// The proof question itself, on whichever interface carries it.
+    /// `CTL_CODE(0x8000, 0x0FE0, METHOD_BUFFERED, FILE_ANY_ACCESS)`: a function code no xusb22 IOCTL
+    /// uses, `METHOD_BUFFERED` so the answer is a plain buffer copy, and `FILE_ANY_ACCESS` so the host
+    /// can ask over a `CreateFile` handle opened with NO access rights (the same way it must open a
+    /// HID collection). Answering it leaks nothing — a pid is not a secret, and the proof is only
+    /// worth anything to a process that can already duplicate handles.
+    pub const IOCTL_PF_GET_CHANNEL_PROOF: u32 = 0x8000_3F80;
+
+    /// Whether a driver serves its channel proof AS its HID serial-number string.
+    ///
+    /// The one transport measured to work against a UMDF HID minidriver today: on .173,
+    /// `HidD_GetSerialNumberString` succeeds on a zero-access handle and returns the driver's own
+    /// text, so a proof placed there reaches the host. Enabled for **`pf_mouse` only** — its serial
+    /// (`PFMOUSE00`) is inert, whereas the pads' serials are what SDL and Steam dedup controllers on,
+    /// and Steam is already known to mangle a pad's displayed name over serial FORMAT alone.
+    ///
+    /// `pf_mouse` is also the one that matters most: its section drives a real absolute pointer, so a
+    /// hijacked mouse channel is desktop control, where a hijacked pad channel is gamepad input.
+    pub const fn proof_is_serial_string(pad_kind_is_mouse: bool) -> bool {
+        pad_kind_is_mouse
+    }
+
+    /// The feature report the **PS pad identities** (DualSense / DualShock 4 / Edge) answer the
+    /// channel proof on.
+    ///
+    /// `0x85` is already DECLARED as a Feature report in all three captured descriptors and was
+    /// previously unserved — the driver failed it with `STATUS_INVALID_PARAMETER`. That is what makes
+    /// this transport free: **no report-descriptor change**, so the VID/PID, report layout, serial and
+    /// product strings that Steam and SDL fingerprint are untouched, and `HidD_GetFeature` is allowed
+    /// through by hidclass because the id is in the descriptor. Nothing can have depended on the old
+    /// failure: SDL reads `0x05`/`0x09`/`0x20` (DualSense) and `0x02`/`0x12`/`0xA3` (DS4); `0x85` is
+    /// one of Sony's vendor reports neither it nor Steam asks for.
+    pub const HID_FEATURE_REPORT_CHANNEL_PROOF: u8 = 0x85;
+
+    /// The Steam Deck identity's private proof command.
+    ///
+    /// The Deck descriptor declares ONE unnumbered feature report and Steam drives it as a
+    /// command/response protocol (`0x83` GET_ATTRIBUTES, `0xAE` GET_STRING_ATTRIBUTE); the driver
+    /// echoes commands it doesn't know. So the proof rides that same contract — SET_FEATURE this
+    /// command, then GET_FEATURE the reply — again with no descriptor change. TWO bytes, not one, so
+    /// a Steam command byte we haven't catalogued can never be mistaken for it.
+    pub const DECK_PROOF_CMD: [u8; 2] = [0xF9, 0x50];
+
+    /// What a driver answers when the host asks, over the device stack, who it is.
+    #[repr(C)]
+    #[derive(Clone, Copy, Pod, Zeroable, Debug, PartialEq, Eq)]
+    pub struct ChannelProof {
+        /// [`PROOF_MAGIC`].
+        pub magic: u32,
+        /// The driver's [`GAMEPAD_PROTO_VERSION`].
+        pub proto: u32,
+        /// The pad index the driver read from its devnode Location — cross-checked against the pad
+        /// the host is delivering, so a mis-resolved devnode can't cross-wire two pads.
+        pub pad_index: u32,
+        /// `GetCurrentProcessId()` of the driver's WUDFHost: the duplication target.
+        pub wudf_pid: u32,
+    }
+
+    impl ChannelProof {
+        /// This driver's answer. `pad_index` comes from the devnode Location, `wudf_pid` from
+        /// `GetCurrentProcessId()`.
+        pub fn new(pad_index: u32, wudf_pid: u32) -> ChannelProof {
+            ChannelProof {
+                magic: PROOF_MAGIC,
+                proto: GAMEPAD_PROTO_VERSION,
+                pad_index,
+                wudf_pid,
+            }
+        }
+
+        /// Validate an answer against the pad the host is actually delivering, yielding the pid to
+        /// duplicate into. `Err` carries the operator-facing reason — every rejection is a refusal to
+        /// deliver, so the host must be able to say precisely which check failed rather than falling
+        /// back to a pid it cannot trust.
+        pub fn check(&self, expect_pad_index: u32) -> Result<u32, &'static str> {
+            if self.magic != PROOF_MAGIC {
+                return Err(
+                    "the devnode's answer is not a punktfunk channel proof (bad magic) — \
+                            some other driver is bound to this device",
+                );
+            }
+            if self.proto != GAMEPAD_PROTO_VERSION {
+                return Err(
+                    "the driver bound to this devnode speaks a different gamepad protocol \
+                            — update the host and the drivers together",
+                );
+            }
+            if self.pad_index != expect_pad_index {
+                return Err(
+                    "the devnode answered for a DIFFERENT pad index — the interface lookup \
+                            resolved the wrong device",
+                );
+            }
+            if self.wudf_pid == 0 {
+                return Err("the driver reported pid 0");
+            }
+            Ok(self.wudf_pid)
+        }
+
+        /// The 16 wire bytes of the `pf_xusb` IOCTL answer. Offered here (rather than leaving each
+        /// side to reach for `bytemuck`) so the driver crates need no extra dependency and both
+        /// sides go through one length-checked pair with [`from_bytes`](Self::from_bytes).
+        pub fn to_bytes(self) -> [u8; 16] {
+            let mut out = [0u8; 16];
+            out.copy_from_slice(bytemuck::bytes_of(&self));
+            out
+        }
+
+        /// Parse [`to_bytes`](Self::to_bytes). `None` if the device returned fewer bytes than a whole
+        /// proof — a short read must refuse the delivery, never be zero-extended into a pid.
+        ///
+        /// `pod_read_unaligned`, NOT `from_bytes`: the feature-report form offsets the proof by one
+        /// byte (the report id sits at 0), so the slice is not 4-aligned and `from_bytes` panics on
+        /// it. Device I/O buffers carry no alignment guarantee either.
+        pub fn from_bytes(b: &[u8]) -> Option<ChannelProof> {
+            (b.len() >= 16).then(|| bytemuck::pod_read_unaligned::<ChannelProof>(&b[..16]))
+        }
+
+        /// The proof as a HID **feature report** of exactly `len` bytes: `[report_id, proof(16), 0…]`.
+        /// A HID feature reply carries its report id in byte 0 and is sized by the descriptor, so the
+        /// driver pads to whatever length the caller's buffer declares. `None` if `len` cannot hold
+        /// the id plus a whole proof.
+        pub fn to_feature_report(self, report_id: u8, len: usize) -> Option<alloc::vec::Vec<u8>> {
+            if len < 17 {
+                return None;
+            }
+            let mut out = alloc::vec![0u8; len];
+            out[0] = report_id;
+            out[1..17].copy_from_slice(&self.to_bytes());
+            Some(out)
+        }
+
+        /// Parse [`to_feature_report`](Self::to_feature_report) — skips the leading report id.
+        pub fn from_feature_report(b: &[u8]) -> Option<ChannelProof> {
+            Self::from_bytes(b.get(1..)?)
+        }
+
+        /// Render as the ASCII text a HID indexed-string answer carries:
+        /// `PFCP:<proto>:<pad_index>:<wudf_pid>`. Text rather than the raw struct because
+        /// `HidD_GetIndexedString` is a string channel, and because a human reading a driver log or
+        /// poking the device with a HID inspector should be able to see what the pad answered.
+        pub fn to_hid_string(self) -> String {
+            alloc::format!("PFCP:{}:{}:{}", self.proto, self.pad_index, self.wudf_pid)
+        }
+
+        /// Parse [`to_hid_string`](Self::to_hid_string). `None` on ANY deviation — a foreign string
+        /// index answered, a truncated read, a non-decimal field, trailing junk — so a host that
+        /// cannot read a well-formed proof refuses to deliver instead of guessing at a pid.
+        pub fn from_hid_string(s: &str) -> Option<ChannelProof> {
+            let rest = s.strip_prefix("PFCP:")?;
+            let mut it = rest.split(':');
+            let proto = it.next()?.parse::<u32>().ok()?;
+            let pad_index = it.next()?.parse::<u32>().ok()?;
+            let wudf_pid = it.next()?.parse::<u32>().ok()?;
+            if it.next().is_some() {
+                return None; // trailing field: not a shape we minted
+            }
+            Some(ChannelProof {
+                magic: PROOF_MAGIC,
+                proto,
+                pad_index,
+                wudf_pid,
+            })
+        }
+    }
 
     /// Bootstrap-mailbox magic (`"PFBT"` LE) — the host stamps it LAST (after `host_proto`), so a
     /// driver only trusts a fully-initialized mailbox.
@@ -754,16 +982,22 @@ pub mod gamepad {
     /// 1. host creates it (zeroed), stamps `host_proto` then `magic` (in that order);
     /// 2. driver opens it by name (pad index from `pszDeviceLocation`), writes `driver_proto`, and —
     ///    iff `host_proto` matches its own version — publishes `driver_pid`;
-    /// 3. host polls `driver_pid`, verifies the pid is a genuine WUDFHost, duplicates the unnamed DATA
-    ///    section into it, then writes `data_handle` + `handle_pid` and bumps `handle_seq` LAST;
+    /// 3. host asks the DEVNODE who the driver is ([`ChannelProof`]) — **not** the mailbox — verifies
+    ///    that pid is a genuine WUDFHost, duplicates the unnamed DATA section into it, then writes
+    ///    `data_handle` + `handle_pid` and bumps `handle_seq` LAST;
     /// 4. driver sees a fresh `handle_seq` addressed to its own pid, maps `data_handle`, and validates
     ///    the mapped section's magic + `pad_index` before use.
     ///
-    /// Deliberately safe to leave named + LS-openable: it carries only pids (not sensitive) and a
-    /// handle VALUE (meaningless outside the target WUDFHost's handle table). A sibling LocalService
-    /// that tampers with it can at worst mis-route a delivery — a gamepad DoS, never a read or an
-    /// injection (it cannot place a valid section handle in the WUDFHost, and the driver's
-    /// magic+`pad_index` validation rejects any handle that doesn't resolve to this pad's section).
+    /// **Trust boundary (v3).** This mailbox is writable by LocalService — it has to be, since that is
+    /// what the driver's own WUDFHost runs as — so NOTHING in it may decide where the DATA section
+    /// goes. Through v2 `driver_pid` did decide that, which was the security-review 2026-07-28 hole
+    /// (see [`ChannelProof`]); step 3 now sources the pid from the device stack and `driver_pid` is
+    /// advisory only — a liveness/diagnostic hint. What is left here is a handle VALUE, meaningless
+    /// outside the one process it was minted for, plus pids and version numbers, none of them secret.
+    /// A LocalService tamperer can therefore still deny a pad (overwrite the fields, squat the name)
+    /// but can no longer read or inject: it cannot place a valid section handle in the WUDFHost, the
+    /// driver's magic + `pad_index` validation rejects any handle that does not resolve to this pad's
+    /// section, and the delivery target is no longer its to choose.
     #[repr(C)]
     #[derive(Clone, Copy, Pod, Zeroable, Debug, PartialEq, Eq)]
     pub struct PadBootstrap {
@@ -941,6 +1175,12 @@ pub mod gamepad {
         assert!(offset_of!(PadShm, ring_head) == 160);
         assert!(offset_of!(PadShm, out_ring) == PAD_SHM_LEGACY_SIZE);
         assert!(size_of::<OutSlot>() == 68);
+
+        assert!(size_of::<ChannelProof>() == 16);
+        assert!(offset_of!(ChannelProof, magic) == 0);
+        assert!(offset_of!(ChannelProof, proto) == 4);
+        assert!(offset_of!(ChannelProof, pad_index) == 8);
+        assert!(offset_of!(ChannelProof, wudf_pid) == 12);
 
         assert!(size_of::<PadBootstrap>() == 32);
         assert!(offset_of!(PadBootstrap, magic) == 0);
@@ -1485,5 +1725,112 @@ mod tests {
     fn guid_is_not_sudovda() {
         const SUDOVDA: u128 = 0xE5BC_C234_1E0C_418A_A0D4_EF8B_7501_414D;
         assert_ne!(PF_VDISPLAY_INTERFACE_GUID_U128, SUDOVDA);
+    }
+
+    /// The channel proof is what the host trusts INSTEAD of the mailbox's `driver_pid`
+    /// (security-review 2026-07-28), so both wire forms — the `pf_xusb` IOCTL struct and the HID
+    /// indexed-string text the two minidrivers answer — have to survive a round trip byte-for-byte,
+    /// and every malformed shape has to be rejected rather than half-parsed into a pid the host
+    /// would then duplicate a live input section into.
+    #[test]
+    fn channel_proof_round_trips_in_both_wire_forms() {
+        use gamepad::*;
+        let proof = ChannelProof::new(2, 4242);
+        assert_eq!(proof.magic, PROOF_MAGIC);
+        assert_eq!(PROOF_MAGIC, u32::from_le_bytes(*b"PFCP"));
+        assert_eq!(proof.proto, GAMEPAD_PROTO_VERSION);
+
+        // XUSB IOCTL form: the raw 16-byte struct.
+        let bytes = bytemuck::bytes_of(&proof);
+        assert_eq!(bytes.len(), 16);
+        assert_eq!(*bytemuck::from_bytes::<ChannelProof>(bytes), proof);
+
+        // HID indexed-string form: the same four fields as text.
+        let s = proof.to_hid_string();
+        assert_eq!(s, alloc::format!("PFCP:{GAMEPAD_PROTO_VERSION}:2:4242"));
+        assert_eq!(ChannelProof::from_hid_string(&s), Some(proof));
+
+        // Every malformed shape parses to None — the host then refuses to deliver.
+        for bad in [
+            "",
+            "PFCP",
+            "PFCP:",
+            "PFCP:3:0",        // truncated read
+            "PFCP:3:0:4242:9", // trailing field we never mint
+            "PFCP:3:0:-1",     // not a u32
+            "PFCP:3:0:0x10",   // not decimal
+            "PFCP:3:0: 4242",  // whitespace is not trimmed away into a valid pid
+            "NOPE:3:0:4242",   // another driver answered this string index
+            "pfcp:3:0:4242",   // prefix is case-sensitive
+        ] {
+            assert_eq!(
+                ChannelProof::from_hid_string(bad),
+                None,
+                "malformed proof {bad:?} must not parse"
+            );
+        }
+    }
+
+    /// `check` is the gate that decides whether a pid is allowed to receive a pad's whole input and
+    /// rumble surface, so pin each refusal: a foreign driver, a version skew, and — the one that
+    /// would silently cross-wire two live pads — an answer from the wrong devnode.
+    #[test]
+    fn channel_proof_check_refuses_everything_it_should() {
+        use gamepad::*;
+        assert_eq!(ChannelProof::new(0, 1234).check(0), Ok(1234));
+        assert_eq!(ChannelProof::new(3, 1234).check(3), Ok(1234));
+
+        // Right shape, WRONG pad: the interface lookup resolved another pad's devnode.
+        assert!(ChannelProof::new(1, 1234).check(0).is_err());
+        // A driver that isn't ours answered the reserved string index / IOCTL.
+        let mut foreign = ChannelProof::new(0, 1234);
+        foreign.magic = 0xDEAD_BEEF;
+        assert!(foreign.check(0).is_err());
+        // Version skew must fail closed, not "probably compatible".
+        let mut old = ChannelProof::new(0, 1234);
+        old.proto = GAMEPAD_PROTO_VERSION - 1;
+        assert!(old.check(0).is_err());
+        // pid 0 is never a duplication target.
+        assert!(ChannelProof::new(0, 0).check(0).is_err());
+    }
+
+    /// A v2 driver answers no proof at all and a v2 host never asks, so the version must have moved
+    /// — this is the tripwire that stops the two halves shipping out of step.
+    #[test]
+    fn gamepad_proto_is_at_the_channel_proof_version() {
+        assert_eq!(gamepad::GAMEPAD_PROTO_VERSION, 3);
+    }
+
+    /// The pad identities carry the proof in a HID FEATURE report — the transport chosen because
+    /// `0x85` is already declared in the captured descriptors, so nothing about the device's
+    /// Steam/SDL-visible identity changes. Pin the framing (report id in byte 0, proof in 1..17,
+    /// zero padding to the descriptor's length) and the short-read refusal.
+    #[test]
+    fn channel_proof_feature_report_round_trips_and_refuses_short_reads() {
+        use gamepad::*;
+        let proof = ChannelProof::new(1, 4242);
+        let rep = proof
+            .to_feature_report(HID_FEATURE_REPORT_CHANNEL_PROOF, 64)
+            .expect("64 bytes is plenty");
+        assert_eq!(rep.len(), 64);
+        assert_eq!(
+            rep[0], 0x85,
+            "byte 0 is the report id, as every HID feature reply is"
+        );
+        assert!(rep[17..].iter().all(|&b| b == 0), "tail is zero padding");
+        assert_eq!(ChannelProof::from_feature_report(&rep), Some(proof));
+
+        // Exactly big enough, and one byte too small.
+        assert!(proof.to_feature_report(0x85, 17).is_some());
+        assert!(proof.to_feature_report(0x85, 16).is_none());
+        // A truncated read must NOT be zero-extended into a pid.
+        assert_eq!(ChannelProof::from_feature_report(&rep[..16]), None);
+        assert_eq!(ChannelProof::from_feature_report(&[]), None);
+
+        // The Deck's private command is two bytes so a stray Steam command can't collide, and is
+        // distinct from the commands the driver already serves.
+        assert_eq!(DECK_PROOF_CMD.len(), 2);
+        assert!(!DECK_PROOF_CMD.starts_with(&[0x83]) && !DECK_PROOF_CMD.starts_with(&[0xAE]));
+        assert!(!DECK_PROOF_CMD.starts_with(&[0xEB]) && !DECK_PROOF_CMD.starts_with(&[0x8F]));
     }
 }

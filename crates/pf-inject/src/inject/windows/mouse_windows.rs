@@ -17,7 +17,7 @@
 //! disappears with the host service, which is exactly when nobody is streaming.
 
 use super::dualsense_windows::{create_swdevice, SwDeviceProfile};
-use super::gamepad_raii::{DriverAttach, PadChannel};
+use super::gamepad_raii::{DriverAttach, PadChannel, ProofTransport};
 use anyhow::Result;
 use pf_driver_proto::mouse::{input_report, mouse_boot_name, MouseShm, MOUSE_MAGIC};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -74,6 +74,9 @@ impl VirtualMouse {
                 (None, None)
             }
         };
+        // The DATA section goes to whoever THIS devnode says is serving it — not to whatever pid
+        // the LocalService-writable mailbox names (security-review 2026-07-28).
+        channel.bind_devnode(0, instance_id.clone(), ProofTransport::HidSerialString);
         let _sw = hsw.map(super::gamepad_raii::SwDevice::new);
         channel.deliver_eager(Duration::from_millis(1500));
         Ok(VirtualMouse {
@@ -82,7 +85,7 @@ impl VirtualMouse {
             attach: DriverAttach::new(
                 "pf_mouse",
                 "pf_mouse.inf",
-                "C:\\Users\\Public\\pfmouse-driver.log",
+                "C:\\Windows\\ServiceProfiles\\LocalService\\AppData\\Local\\Temp\\pfmouse-driver.log",
                 boot_name,
                 instance_id,
             ),
@@ -351,5 +354,78 @@ pub fn spike_hold(secs: u64) -> Result<()> {
             "driver NOT ticking"
         }
     );
+    Ok(())
+}
+
+/// **Channel-proof probe** — settles, on a real box, the one thing the design could not settle by
+/// reading: which HID IOCTL hidclass actually forwards to a UMDF HID minidriver.
+///
+/// The pad channel hands a pad's whole input surface to whichever process the DEVNODE names
+/// (`pf_driver_proto::gamepad::ChannelProof`), because the bootstrap mailbox is writable by
+/// LocalService and therefore cannot be trusted to name it (security-review 2026-07-28). For the two
+/// HID minidrivers that answer travels as a HID string, and both `HidD_GetIndexedString` and a
+/// direct arbitrary-index `IOCTL_HID_GET_STRING` are wired up so only one of them has to work. This
+/// prints which one did.
+///
+/// Self-contained: it spins up its OWN throwaway `pf_mouse_probe` devnode at pad index 9, so it can
+/// run alongside a live host without touching the resident mouse (index 0) or its mailbox, and the
+/// devnode disappears when the command exits. Needs the pf_mouse driver installed
+/// (`punktfunk-host.exe driver install --gamepad`).
+pub fn channel_proof_probe() -> Result<()> {
+    use crate::channel_proof::{self, ProofTransport};
+
+    /// A pad index no real pad uses, so the proof's index check is actually exercised and the
+    /// probe can never be confused with the resident mouse at 0.
+    const PROBE_INDEX: u8 = 9;
+
+    println!("creating a throwaway pf_mouse devnode (pad index {PROBE_INDEX})…");
+    let (hsw, instance_id) = create_swdevice(&SwDeviceProfile {
+        instance: "pf_mouse_probe",
+        container_tag: 0x5046_4D4F, // "PFMO"
+        container_index: PROBE_INDEX,
+        hwid: "pf_mouse",
+        usb_vid_pid: "VID_5046&PID_4D4F",
+        usb_mi: None,
+        description: "punktfunk Virtual Mouse (channel-proof probe)",
+    })?;
+    let _sw = super::gamepad_raii::SwDevice::new(hsw);
+    let Some(instance_id) = instance_id else {
+        anyhow::bail!("SwDeviceCreate reported no instance id — cannot look the devnode up");
+    };
+
+    // PnP has to start the driver and hidclass has to publish the collection interface; both happen
+    // in tens of milliseconds, but poll rather than sleep a fixed amount so a slow box still reports.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let report = loop {
+        let r = channel_proof::diagnose(
+            &instance_id,
+            ProofTransport::HidSerialString,
+            PROBE_INDEX as u32,
+        );
+        if r.contains("ChannelProof") || std::time::Instant::now() >= deadline {
+            break r;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    };
+    println!("\n{report}");
+
+    match channel_proof::probe_pid(
+        &instance_id,
+        ProofTransport::HidSerialString,
+        PROBE_INDEX as u32,
+    ) {
+        Ok(pid) => println!(
+            "RESULT: the devnode proved its driver is pid {pid} — the HID channel proof WORKS on \
+             this build of Windows, so the pad channel never has to trust the mailbox."
+        ),
+        Err(e) => println!(
+            "RESULT: no usable channel proof ({e:#}).\n\
+             If BOTH HID lines above say \"call failed\", hidclass on this build forwards neither \
+             IOCTL to a UMDF minidriver and the HID pads/mouse need a different transport (the \
+             xusb leg is unaffected — it owns its own device interface). If one says \"answered, \
+             but not a proof\", an OLD pf_mouse driver is installed: reinstall with\n\
+             \x20  punktfunk-host.exe driver install --gamepad"
+        ),
+    }
     Ok(())
 }

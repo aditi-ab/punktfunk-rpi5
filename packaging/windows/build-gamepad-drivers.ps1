@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-  Build + sign the punktfunk virtual-gamepad UMDF drivers (pf-dualsense = DualSense/DualShock 4, pf-xusb =
+  Build + sign the punktfunk virtual-gamepad UMDF drivers (pf-gamepad = DualSense/DualShock 4/Edge/Deck, pf-xusb =
   Xbox 360 / XInput) FROM SOURCE, in CI, and stage them for the host installer. The gamepad analogue of
   build-pf-vdisplay.ps1 - replaces the checked-in prebuilt binaries (packaging/windows/gamepad-drivers/)
   so the .dll/.inf/.cat stay in lockstep with the source and never go stale.
@@ -13,7 +13,7 @@
   supplied DRIVER_CERT secret) + ONE exported .cer - the layout `punktfunk-host.exe driver install
   --gamepad` consumes (per-driver .inf/.cat/.dll + one shared punktfunk-driver.cer).
 
-  Output (-Out): pf_dualsense.{dll,inf,cat} + pf_xusb.{dll,inf,cat} + pf_mouse.{dll,inf,cat} +
+  Output (-Out): pf_gamepad.{dll,inf,cat} + pf_xusb.{dll,inf,cat} + pf_mouse.{dll,inf,cat} +
   punktfunk-driver.cer. (pf_mouse is the resident virtual HID pointer, not a gamepad - it shares
   this pipeline + the --gamepad install path.)
 
@@ -37,7 +37,7 @@ $DriversDir = (Resolve-Path $DriversDir).Path
 $clear = Join-Path $PSScriptRoot 'clear-force-integrity.ps1'
 
 $drivers = @(
-    @{ crate = 'pf-dualsense'; dll = 'pf_dualsense.dll'; inx = 'pf-dualsense\pf_dualsense.inx'; inf = 'pf_dualsense.inf'; cat = 'pf_dualsense.cat' }
+    @{ crate = 'pf-gamepad';   dll = 'pf_gamepad.dll';   inx = 'pf-gamepad\pf_gamepad.inx';     inf = 'pf_gamepad.inf';   cat = 'pf_gamepad.cat' }
     @{ crate = 'pf-xusb';      dll = 'pf_xusb.dll';      inx = 'pf-xusb\pf_xusb.inx';           inf = 'pf_xusb.inf';      cat = 'pf_xusb.cat' }
     # Not a gamepad, but it rides the identical UMDF HID pipeline + the same install path
     # (`driver install --gamepad` adds every staged .inf): the resident virtual HID mouse that

@@ -153,6 +153,15 @@ fn install_gamepad(dir: &Path) -> Result<()> {
         bail!("no driver .inf in {}", dir.display());
     }
     trust_cert(dir);
+    // Retire the PRE-RENAME package first. `pf-dualsense` became `pf-gamepad` (one driver always
+    // served four identities, so the old name read as if the other three lived elsewhere) and the
+    // HARDWARE IDS deliberately did not move — they are the binding contract with every devnode the
+    // host creates and with every installed system. That means an upgraded box would otherwise hold
+    // TWO store packages claiming `pf_dualsense`/`pf_dualshock4`/…, and PnP would be free to bind
+    // the stale one. Matched on `pf_dualsense.dll`, a string only the OLD package's INF contains —
+    // the new INF still mentions the hardware ids, so matching on those would delete what we are
+    // about to install.
+    delete_store_drivers(&["pf_dualsense.dll"]);
     // Add each package to the store - no /install, no device node: the host SwDeviceCreate's the
     // per-session devnode when a client forwards a pad, so PnP binds the store driver on demand.
     for inf in &infs {
@@ -187,7 +196,7 @@ fn remove_pad_devnodes() {
 // ── `driver uninstall [--gamepad]` ──────────────────────────────────────────────────────────────
 // The uninstaller's cleanup counterpart (Inno [UninstallRun]) — the field report was that our
 // virtual-device drivers survived an uninstall. Removes the pf-vdisplay device node(s) + driver
-// package, or (--gamepad) the pf-dualsense/pf-xusb driver packages (their devnodes are per-session
+// package, or (--gamepad) the pf-gamepad/pf-xusb driver packages (their devnodes are per-session
 // SwDeviceCreate'd and are already gone once the service stopped). Locale-safe by construction: we
 // never parse pnputil's localized LABELS — devices are matched on the un-localized VALUE side
 // (instance IDs / device IDs), and driver packages are found by scanning %WINDIR%\INF\oem*.inf
@@ -226,7 +235,13 @@ fn uninstall_gamepad() -> Result<()> {
     // Devnodes first (incl. phantoms — the same ghost-device complaint the vdisplay uninstall
     // fixed), then the store packages.
     remove_pad_devnodes();
-    delete_store_drivers(&["pf_dualsense", "pf_dualshock4", "pf_xusb", "pf_mouse"]);
+    delete_store_drivers(&[
+        "pf_gamepad",
+        "pf_dualsense",
+        "pf_dualshock4",
+        "pf_xusb",
+        "pf_mouse",
+    ]);
     Ok(())
 }
 

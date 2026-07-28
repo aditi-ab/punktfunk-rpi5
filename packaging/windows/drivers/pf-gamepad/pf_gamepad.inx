@@ -1,6 +1,12 @@
 ;/*++
-; punktfunk virtual PlayStation/Valve pads — UMDF2 HID minidriver INF (M0 spike).
-; One package, four hardware ids: DualSense, DualShock 4, DualSense Edge, Steam Deck.
+; punktfunk virtual gamepads — UMDF2 HID minidriver INF.
+; One package, four hardware ids: DualSense, DualShock 4, DualSense Edge, Steam Deck — which is why
+; the package is called pf_gamepad and not pf_dualsense (it never was one identity).
+;
+; ⚠️ The HARDWARE IDS below deliberately keep their old names (`pf_dualsense`, `pf_dualshock4`,
+; `pf_dualsenseedge`, `pf_steamdeck`). They are the binding contract with every devnode the host
+; SwDeviceCreate's and with every already-installed system; renaming them would orphan existing
+; installs and buy nothing. Only the PACKAGE identity (INF/CAT/DLL/service) moved to pf_gamepad.
 ; Adapted from the WDK vhidmini2 UMDF2 sample (VhidminiUm.inx).
 ; Depends on MsHidUmdf.inf (build >= 22000).
 ; Install: devgen /add /hardwareid "root\pf_dualsense"  (after pnputil /add-driver /install)
@@ -10,7 +16,7 @@ Signature="$WINDOWS NT$"
 Class=HIDClass
 ClassGuid={745a17a0-74d3-11d0-b6fe-00a0c90f57da}
 Provider=%ProviderString%
-CatalogFile=pf_dualsense.cat
+CatalogFile=pf_gamepad.cat
 PnpLockdown=1
 
 [DestinationDirs]
@@ -20,7 +26,7 @@ DefaultDestDir = 13
 1=%Disk_Description%,,,
 
 [SourceDisksFiles]
-pf_dualsense.dll=1
+pf_gamepad.dll=1
 
 [Manufacturer]
 %ManufacturerString%=pf, NT$ARCH$.10.0...22000
@@ -30,44 +36,44 @@ pf_dualsense.dll=1
 ; for the host's SwDeviceCreate'd DualSense (the `root\` prefix is reserved for root enumeration, so
 ; SwDeviceCreate rejects it with E_INVALIDARG); `pf_dualshock4` / `pf_dualsenseedge` / `pf_steamdeck`
 ; for the host's other virtual pads — ONE driver binds all of them (every model line below installs
-; the same `pfDualSense` section) and serves the matching HID identity per the device_type byte the
+; the same `pfGamepad` section) and serves the matching HID identity per the device_type byte the
 ; host stamps into shared memory.
 ;
 ; Each id carries its OWN description: Device Manager reads this string, and a single shared
 ; "Virtual DualSense" made an emulated DualShock 4 look like the controller-type setting had been
 ; ignored. The HID layer (VID/PID, report descriptor, product string) was always per-type; this
 ; makes the human-readable name agree with it.
-%DeviceDesc%=pfDualSense, root\pf_dualsense, pf_dualsense
-%DeviceDescDS4%=pfDualSense, pf_dualshock4
-%DeviceDescEdge%=pfDualSense, pf_dualsenseedge
-%DeviceDescDeck%=pfDualSense, pf_steamdeck
+%DeviceDesc%=pfGamepad, root\pf_dualsense, pf_dualsense
+%DeviceDescDS4%=pfGamepad, pf_dualshock4
+%DeviceDescEdge%=pfGamepad, pf_dualsenseedge
+%DeviceDescDeck%=pfGamepad, pf_steamdeck
 
-[pfDualSense.NT]
+[pfGamepad.NT]
 CopyFiles=UMDriverCopy
 Include=MsHidUmdf.inf
 Needs=MsHidUmdf.NT
 Include=WUDFRD.inf
 Needs=WUDFRD_LowerFilter.NT
 
-[pfDualSense.NT.hw]
+[pfGamepad.NT.hw]
 Include=MsHidUmdf.inf
 Needs=MsHidUmdf.NT.hw
 Include=WUDFRD.inf
 Needs=WUDFRD_LowerFilter.NT.hw
 
-[pfDualSense.NT.Services]
+[pfGamepad.NT.Services]
 Include=MsHidUmdf.inf
 Needs=MsHidUmdf.NT.Services
 Include=WUDFRD.inf
 Needs=WUDFRD_LowerFilter.NT.Services
 
-[pfDualSense.NT.Filters]
+[pfGamepad.NT.Filters]
 Include=WUDFRD.inf
 Needs=WUDFRD_LowerFilter.NT.Filters
 
-[pfDualSense.NT.Wdf]
-UmdfService="pf_dualsense", pf_dualsense_Install
-UmdfServiceOrder=pf_dualsense
+[pfGamepad.NT.Wdf]
+UmdfService="pf_gamepad", pf_gamepad_Install
+UmdfServiceOrder=pf_gamepad
 UmdfKernelModeClientPolicy=AllowKernelModeClients
 UmdfFileObjectPolicy=AllowNullAndUnknownFileObjects
 UmdfMethodNeitherAction=Copy
@@ -76,18 +82,18 @@ UmdfFsContextUsePolicy=CanUseFsContext2
 ; across multiple simultaneous controllers (multi-pad).
 UmdfHostProcessSharing=ProcessSharingDisabled
 
-[pf_dualsense_Install]
+[pf_gamepad_Install]
 UmdfLibraryVersion=$UMDFVERSION$
-ServiceBinary="%13%\pf_dualsense.dll"
+ServiceBinary="%13%\pf_gamepad.dll"
 
 [UMDriverCopy]
-pf_dualsense.dll
+pf_gamepad.dll
 
 [Strings]
 ProviderString     ="punktfunk"
 ManufacturerString ="punktfunk"
 ClassName          ="HID device"
-Disk_Description   ="punktfunk DualSense Installation Disk"
+Disk_Description   ="punktfunk Gamepad Installation Disk"
 ; One per hardware id — these are what Device Manager shows. Keep them aligned with the product
 ; strings the driver serves per device_type (src/lib.rs `on_get_string`).
 DeviceDesc         ="punktfunk Virtual DualSense"

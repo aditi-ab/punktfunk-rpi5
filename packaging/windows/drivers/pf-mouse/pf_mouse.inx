@@ -1,6 +1,6 @@
 ;/*++
 ; punktfunk virtual HID mouse (absolute pointer) — UMDF2 HID minidriver INF.
-; Same skeleton as pf_dualsense.inx (the WDK vhidmini2 UMDF2 shape).
+; Same skeleton as pf_gamepad.inx (the WDK vhidmini2 UMDF2 shape).
 ; Depends on MsHidUmdf.inf (build >= 22000).
 ; Install: devgen /add /hardwareid "root\pf_mouse"  (after pnputil /add-driver /install)
 ;--*/

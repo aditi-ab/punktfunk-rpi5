@@ -559,6 +559,10 @@ fn real_main() -> Result<()> {
         // (validates the resident-mouse cursor-presence fix on-glass). `--seconds N`.
         #[cfg(target_os = "windows")]
         Some("vmouse-spike") => devtest::vmouse_spike(&args),
+        // Windows: ask a throwaway pf_mouse devnode for its channel proof and report which HID
+        // transport hidclass forwarded — the pad channel's v3 delivery gate, verified on glass.
+        #[cfg(target_os = "windows")]
+        Some("channel-proof-probe") => devtest::channel_proof_probe(&args),
         // Windows: create a virtual DualSense (or --ds4/--edge/--deck/--xbox) via the UMDF driver and
         // hold it, driving the real *WindowsManager end to end. `--index N`, `--seconds N`.
         #[cfg(target_os = "windows")]
