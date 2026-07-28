@@ -919,12 +919,25 @@ impl D3d11Hw {
 
 struct ZeroCopyInner {
     vendor: WinVendor,
+    /// QSV only: the QSV device + frames ctx derived from the D3D11VA ones (the encoder's real
+    /// input). `None` for AMF, which takes the D3D11 frames directly — the nullable raw pointers
+    /// these replaced said the same thing, but only in a comment.
+    ///
+    /// FIELD ORDER IS LOAD-BEARING: frames before device, and BOTH before `enc`/`hw`. Fields drop
+    /// in declaration order, and that sequence reproduces the hand-written `Drop` this replaced,
+    /// which ran ahead of every field and so released the derived QSV pair before the encoder and
+    /// the D3D11 refs. Everything holds its own reference, so refcounting makes any order sound;
+    /// the ordering is pinned so a reorder cannot quietly change what ships.
+    qsv_frames: Option<AvBuffer>,
+    /// Unlike `qsv_frames` (which the send path reads to tag each mapped frame), this one is held
+    /// purely as an owner: the frames ctx and the encoder each took their own ref, so nothing reads
+    /// it again — it exists so the QSV device outlives both and is unref'd exactly once. Same
+    /// reasoning as the decoders' `hw_device`: removing the field would free the device early, and
+    /// an underscore name would hide what it holds.
+    #[allow(dead_code)]
+    qsv_device: Option<AvBuffer>,
     enc: encoder::video::Encoder,
     hw: D3d11Hw,
-    /// QSV only: the QSV device + frames ctx derived from the D3D11VA ones (the encoder's real
-    /// input). `None` for AMF (which takes the D3D11 frames directly).
-    qsv_device: *mut ffi::AVBufferRef,
-    qsv_frames: *mut ffi::AVBufferRef,
     ctx: ID3D11DeviceContext,
     /// The pool's fixed sw_format (NV12 8-bit / P010 10-bit). A captured frame whose format differs
     /// (the capturer's video-processor fell back to Bgra/Rgb10a2) cannot be CopySubresourceRegion'd
@@ -958,28 +971,27 @@ impl ZeroCopyInner {
         };
         let bind_flags = pool_bind_flags(vendor);
         const POOL: c_int = 8;
-        // SAFETY: `D3d11Hw::new` wraps the capturer's `device` as a D3D11VA hwdevice (handing FFmpeg an
-        // owned AddRef of it, balanced by FFmpeg's teardown Release) and builds an owned
-        // device_ref/frames_ref pair freed by `D3d11Hw::Drop`; `hw` is a local, so it is dropped (and
-        // both refs freed) on every early `return Err`. For QSV, `av_hwdevice_ctx_create_derived` and
-        // `av_hwframe_ctx_create_derived` fill the null-initialised `qsv_device`/`qsv_frames` out-params
-        // only on success (`r >= 0` checked); on the frames-derive failure we unref the already-created
-        // `qsv_device` before bailing. `open_win_encoder` internally `av_buffer_ref`s the dev/frames
-        // refs it is given (so ownership of `hw`'s and the derived refs stays here), and on its failure
-        // we unref the still-owned derived `qsv_frames`/`qsv_device` (null for AMF → skipped) and return
-        // — `hw` then drops its D3D11 refs. On success the derived refs are moved into `ZeroCopyInner`
-        // (freed in its `Drop`) and the encoder holds its own AddRef'd copies. Every `AVBufferRef` is
-        // unref'd exactly once across all paths — no leak, no double-free.
+        // SAFETY: `D3d11Hw::new` wraps the capturer's `device` as a D3D11VA hwdevice (handing FFmpeg
+        // an owned AddRef of it, balanced by FFmpeg's teardown Release) and returns an owned
+        // frames_ref/device_ref pair. For QSV, `av_hwdevice_ctx_create_derived` /
+        // `av_hwframe_ctx_create_derived` fill their null-initialised out-params only on success
+        // (`r >= 0` checked) and each result is taken into an `AvBuffer` immediately. From there
+        // every handle in this function is owned by a local, so each early `bail!`/`?` releases
+        // exactly what exists at that point, in reverse order — there is no cleanup code on any
+        // failure branch to keep in step. `open_win_encoder` takes its OWN refs of the dev/frames
+        // pointers it is handed, so lending them via `as_ptr()` transfers nothing; on success the
+        // owners move into `ZeroCopyInner` and are released by its field drops. Every `AVBufferRef`
+        // is still unref'd exactly once on every path — the difference is that it is now the type
+        // system enforcing it rather than a comment.
         unsafe {
             let hw = D3d11Hw::new(device, sw_av, bind_flags, width, height, POOL)?;
-            let (pix_fmt, dev_ref, frames_ref, mut qsv_device, mut qsv_frames) = match vendor {
-                WinVendor::Amf => (
-                    ffi::AVPixelFormat::AV_PIX_FMT_D3D11,
-                    hw.device_ref.as_ptr(),
-                    hw.frames_ref.as_ptr(),
-                    ptr::null_mut(),
-                    ptr::null_mut(),
-                ),
+            // Own the derived QSV pair (or nothing, on AMF). Keeping ownership here and deriving the
+            // encoder's pointers from it below is the whole point: the tuple this replaced handed
+            // the SAME two pointers out twice — once as the encoder's dev/frames args and once as
+            // the pair moved into `Self` — which is fine for raw pointers and would be two owners
+            // for `AvBuffer`.
+            let (qsv_frames, qsv_device) = match vendor {
+                WinVendor::Amf => (None, None),
                 WinVendor::Qsv => {
                     // Derive a QSV device that SHARES the D3D11 device, and a QSV frames ctx derived
                     // from the D3D11 frames pool (auto-mapped 1:1). The encoder takes AV_PIX_FMT_QSV.
@@ -993,28 +1005,39 @@ impl ZeroCopyInner {
                     if r < 0 {
                         bail!("derive QSV device from D3D11VA: {}", ffmpeg::Error::from(r));
                     }
+                    let qsv_device = AvBuffer::from_raw(qsv_device)
+                        .context("av_hwdevice_ctx_create_derived(QSV) gave no device")?;
                     let mut qsv_frames: *mut ffi::AVBufferRef = ptr::null_mut();
                     let r = ffi::av_hwframe_ctx_create_derived(
                         &mut qsv_frames,
                         ffi::AVPixelFormat::AV_PIX_FMT_QSV,
-                        qsv_device,
+                        qsv_device.as_ptr(),
                         hw.frames_ref.as_ptr(),
                         ffi::AV_HWFRAME_MAP_DIRECT as c_int,
                     );
                     if r < 0 {
-                        ffi::av_buffer_unref(&mut qsv_device);
+                        // `qsv_device` drops here — the hand-written unref this replaced was the
+                        // single easiest line in the function to forget.
                         bail!("derive QSV frames from D3D11VA: {}", ffmpeg::Error::from(r));
                     }
-                    (
-                        ffi::AVPixelFormat::AV_PIX_FMT_QSV,
-                        qsv_device,
-                        qsv_frames,
-                        qsv_device,
-                        qsv_frames,
-                    )
+                    let qsv_frames = AvBuffer::from_raw(qsv_frames)
+                        .context("av_hwframe_ctx_create_derived(QSV) gave no frames ctx")?;
+                    (Some(qsv_frames), Some(qsv_device))
                 }
             };
-            let enc = match open_win_encoder(
+            // BORROWED views for the encoder — `open_win_encoder` takes its own refs of whatever it
+            // is handed, so ownership stays with `qsv_*`/`hw` either way.
+            let (pix_fmt, dev_ref, frames_ref) = match (&qsv_device, &qsv_frames) {
+                (Some(d), Some(f)) => (ffi::AVPixelFormat::AV_PIX_FMT_QSV, d.as_ptr(), f.as_ptr()),
+                _ => (
+                    ffi::AVPixelFormat::AV_PIX_FMT_D3D11,
+                    hw.device_ref.as_ptr(),
+                    hw.frames_ref.as_ptr(),
+                ),
+            };
+            // `?` is enough now: on failure `qsv_frames`/`qsv_device` and `hw` all drop on the way
+            // out, which is what the hand-written null-checked unref pair here used to do.
+            let enc = open_win_encoder(
                 vendor,
                 codec,
                 width,
@@ -1026,18 +1049,7 @@ impl ZeroCopyInner {
                 ten_bit,
                 dev_ref,
                 frames_ref,
-            ) {
-                Ok(e) => e,
-                Err(e) => {
-                    if !qsv_frames.is_null() {
-                        ffi::av_buffer_unref(&mut qsv_frames);
-                    }
-                    if !qsv_device.is_null() {
-                        ffi::av_buffer_unref(&mut qsv_device);
-                    }
-                    return Err(e);
-                }
-            };
+            )?;
             tracing::info!(
                 encoder = vendor.encoder_name(codec),
                 "{} encode active ({width}x{height}@{fps}, zero-copy D3D11 {} path)",
@@ -1046,10 +1058,10 @@ impl ZeroCopyInner {
             );
             Ok(ZeroCopyInner {
                 vendor,
+                qsv_frames,
+                qsv_device,
                 enc,
                 hw,
-                qsv_device,
-                qsv_frames,
                 ctx: immediate_context(device),
                 pool_format,
             })
@@ -1108,8 +1120,17 @@ impl ZeroCopyInner {
                         ffi::av_frame_free(&mut d3d);
                         bail!("av_frame_alloc(qsv) failed");
                     }
+                    // Always `Some` on this arm — `open` fills the pair for `WinVendor::Qsv` and
+                    // leaves it `None` only for AMF — but say so with a bail rather than an unwrap,
+                    // matching the null check above it. The `Option` is what the raw pointer's
+                    // "null means AMF" convention was already encoding.
+                    let Some(qsv_frames) = self.qsv_frames.as_ref() else {
+                        ffi::av_frame_free(&mut qsv);
+                        ffi::av_frame_free(&mut d3d);
+                        bail!("QSV send path without a derived QSV frames context");
+                    };
                     (*qsv).format = ffi::AVPixelFormat::AV_PIX_FMT_QSV as c_int;
-                    (*qsv).hw_frames_ctx = ffi::av_buffer_ref(self.qsv_frames);
+                    (*qsv).hw_frames_ctx = ffi::av_buffer_ref(qsv_frames.as_ptr());
                     // The map flags are a bindgen enum (no BitOr) — cast each to int before OR-ing.
                     let r = ffi::av_hwframe_map(
                         qsv,
@@ -1140,23 +1161,10 @@ impl ZeroCopyInner {
     }
 }
 
-impl Drop for ZeroCopyInner {
-    fn drop(&mut self) {
-        // SAFETY: `qsv_frames`/`qsv_device` are the derived QSV `AVBufferRef`s (or null for AMF); each
-        // is `av_buffer_unref`'d once here (nulling the pointer through the `&mut`) — `ZeroCopyInner`
-        // owns these handles exclusively and this `Drop` runs once, so no double-free. The `enc` and
-        // `hw` fields free the encoder's AddRef'd copies and the D3D11 device/frames refs through their
-        // own `Drop`, so all references stay balanced.
-        unsafe {
-            if !self.qsv_frames.is_null() {
-                ffi::av_buffer_unref(&mut self.qsv_frames);
-            }
-            if !self.qsv_device.is_null() {
-                ffi::av_buffer_unref(&mut self.qsv_device);
-            }
-        }
-    }
-}
+// No `Drop` for `ZeroCopyInner`: the two `Option<AvBuffer>`s unref themselves when present and do
+// nothing when `None` (AMF), which is what the hand-written null checks amounted to. Field order
+// (see the struct) keeps the release sequence identical: QSV frames, QSV device, then the encoder's
+// AddRef'd copies via `enc`, then the D3D11 pair via `hw`.
 
 // ---------------------------------------------------------------------------------------------
 
