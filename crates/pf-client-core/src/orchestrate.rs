@@ -23,6 +23,7 @@
 use crate::deeplink::{DeepLink, HostResolution, Route};
 use crate::profiles::{ProfilesFile, Resolution, StreamProfile};
 use crate::trust::{effective_settings, KnownHost, KnownHosts, Settings};
+use serde::{Deserialize, Serialize};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 
@@ -79,6 +80,10 @@ pub struct ConnectPlan {
     /// The pin came from an advert rather than the store: persist it once the session reports
     /// ready (ready proves the host really holds that identity).
     pub tofu: bool,
+    /// Share this machine's clipboard with this host — a trust decision about the HOST, so it
+    /// lives on the record rather than in a profile, and the spawner resolves it once here
+    /// instead of the renderer looking it up again.
+    pub clipboard: bool,
 }
 
 impl ConnectPlan {
@@ -101,6 +106,7 @@ impl ConnectPlan {
             settings,
             connect_timeout_secs: None,
             tofu: false,
+            clipboard: host.clipboard_sync,
         }
     }
 
@@ -140,6 +146,17 @@ impl ConnectPlan {
             settings,
             connect_timeout_secs: None,
             tofu: false,
+            clipboard: host.clipboard_sync,
+        }
+    }
+
+    /// This plan as a [`ResolvedSpec`] — what a first-party spawner hands the session so it
+    /// performs no store reads of its own.
+    pub fn spec(&self, clipboard: bool) -> ResolvedSpec {
+        ResolvedSpec {
+            settings: self.settings.clone(),
+            clipboard,
+            profile: self.profile.as_ref().map(|p| p.name.clone()),
         }
     }
 
@@ -448,6 +465,49 @@ pub enum ConnectOutcome {
 // Session spawn + the stdout contract.
 // ---------------------------------------------------------------------------------------
 
+/// Everything a session needs, resolved by the caller — the spec `--resolved-spec` carries
+/// (design/client-architecture-split.md §5).
+///
+/// The session binary is a renderer: given this, it performs ZERO store reads. Its old habit of
+/// re-deriving state (loading `Settings`, looking up the host's `clipboard_sync`, resolving the
+/// profile) meant policy was being evaluated inside the thing that draws pixels, and that the
+/// spawner and the child could disagree about a file either of them might have written since.
+///
+/// The compat path — a hand-run `punktfunk-session --connect` with no spec — still resolves for
+/// itself, but through the *same* helper (`effective_settings`), so the two modes cannot drift.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ResolvedSpec {
+    /// Effective settings: the global defaults with the chosen profile already applied.
+    pub settings: Settings,
+    /// Whether this host may share the clipboard — a per-host trust decision, resolved by the
+    /// spawner rather than re-looked-up here.
+    pub clipboard: bool,
+    /// The profile's name, for the stats overlay. `None` = the global defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+}
+
+impl ResolvedSpec {
+    /// Write the spec somewhere the child can read it, returning the path. Temp files rather
+    /// than a pipe because the session already takes a file path elsewhere and a crashed
+    /// spawner leaves something inspectable; the name carries the pid so concurrent launches
+    /// (a shell and a CLI, or two Decky invocations) never overwrite each other's spec.
+    pub fn write_temp(&self) -> std::io::Result<std::path::PathBuf> {
+        let path = std::env::temp_dir().join(format!("punktfunk-spec-{}.json", std::process::id()));
+        let json = serde_json::to_vec_pretty(self)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        std::fs::write(&path, json)?;
+        Ok(path)
+    }
+
+    /// Read a spec written by the spawner.
+    pub fn read(path: &std::path::Path) -> std::io::Result<ResolvedSpec> {
+        let text = std::fs::read_to_string(path)?;
+        serde_json::from_str(&text)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    }
+}
+
 /// One event from the session child's stdout contract (`{"ready":true}`, `{"error":…}`,
 /// `{"ended":…}`, then EOF and an exit code). Parsed in one place so a shell, the console and
 /// the CLI cannot disagree about what "ready" or "trust rejected" means.
@@ -460,6 +520,13 @@ pub enum SessionEvent {
         trust_rejected: bool,
     },
     Ended(String),
+    /// The session window's logical size settled at this, under the match-window policy. The
+    /// SPAWNER persists it (design §5): a renderer that load-modify-saves the shared settings
+    /// file was one of its five concurrent writers, for a value only the parent needs.
+    Window {
+        w: u32,
+        h: u32,
+    },
     /// EOF: the child is gone. `-1` = killed by a signal.
     Exited(i32),
 }
@@ -480,7 +547,24 @@ pub fn parse_session_line(line: &str) -> Option<SessionEvent> {
     if let Some(msg) = v.get("ended").and_then(|m| m.as_str()) {
         return Some(SessionEvent::Ended(msg.to_string()));
     }
+    if let Some(win) = v.get("window") {
+        let dim = |k: &str| win.get(k).and_then(|n| n.as_u64()).map(|n| n as u32);
+        if let (Some(w), Some(h)) = (dim("w"), dim("h")) {
+            return Some(SessionEvent::Window { w, h });
+        }
+    }
     None
+}
+
+/// Persist a window size the session reported. The spawner's job now, not the renderer's — and
+/// it writes only on a real change, so a session that never resizes never touches the file.
+pub fn persist_window_size(w: u32, h: u32) {
+    let mut s = Settings::load();
+    if (s.last_window_w, s.last_window_h) != (w, h) {
+        s.last_window_w = w;
+        s.last_window_h = h;
+        s.save();
+    }
 }
 
 /// The session binary: installed next to this executable, else `$PATH` (a dev run out of
@@ -525,7 +609,23 @@ pub fn spawn_session(
     on_event: impl FnMut(SessionEvent) + Send + 'static,
 ) -> Result<CancelHandle, String> {
     let mut cmd = Command::new(session_binary());
-    cmd.args(plan.session_args())
+    let mut args = plan.session_args();
+    // Spec mode: hand the child the settings we already resolved, so it reads no stores and
+    // cannot disagree with us about a file either of us might write (design §5). A spec we
+    // fail to write is not fatal — the child's compat path resolves the same values through
+    // the same helper, which is exactly why that path was kept.
+    let spec_path = match plan.spec(plan.clipboard).write_temp() {
+        Ok(path) => {
+            args.push("--resolved-spec".into());
+            args.push(path.to_string_lossy().into_owned());
+            Some(path)
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "couldn't write the resolved spec; the session will resolve for itself");
+            None
+        }
+    };
+    cmd.args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit()); // the session's logs interleave with the front-end's
@@ -550,8 +650,18 @@ pub fn spawn_session(
             for line in std::io::BufReader::new(stdout).lines() {
                 let Ok(line) = line else { break };
                 if let Some(ev) = parse_session_line(&line) {
+                    // The window size is the spawner's to persist — the renderer only reports
+                    // it. Front-ends still see the event; they just don't have to act on it.
+                    if let SessionEvent::Window { w, h } = ev {
+                        persist_window_size(w, h);
+                    }
                     on_event(ev);
                 }
+            }
+            // The spec has done its job the moment the child has read it; a leftover temp file
+            // in %TEMP% is litter, and one per launch adds up.
+            if let Some(path) = &spec_path {
+                let _ = std::fs::remove_file(path);
             }
             // EOF — reap (a cancel-killed child lands here too; -1 = died on a signal).
             let code = reader_slot
@@ -675,6 +785,7 @@ mod tests {
             wake: true,
             connect_timeout_secs: None,
             tofu: false,
+            clipboard: false,
         };
         assert_eq!(
             plan.session_args(),
@@ -807,6 +918,65 @@ mod tests {
         ));
     }
 
+    /// The spec is the whole of what a session needs, and it round-trips — a field lost here
+    /// is a setting the stream silently doesn't get.
+    #[test]
+    fn resolved_spec_round_trips() {
+        let spec = ResolvedSpec {
+            settings: Settings {
+                width: 2560,
+                height: 1440,
+                bitrate_kbps: 55000,
+                codec: "av1".into(),
+                ..Default::default()
+            },
+            clipboard: true,
+            profile: Some("Work".into()),
+        };
+        let json = serde_json::to_string(&spec).unwrap();
+        assert_eq!(serde_json::from_str::<ResolvedSpec>(&json).unwrap(), spec);
+
+        // A spec without a profile is the defaults, and the key is simply absent.
+        let plain = ResolvedSpec {
+            profile: None,
+            ..spec.clone()
+        };
+        let json = serde_json::to_string(&plain).unwrap();
+        assert!(!json.contains("profile"));
+        assert_eq!(serde_json::from_str::<ResolvedSpec>(&json).unwrap(), plain);
+    }
+
+    /// A plan's spec carries the settings the plan resolved — including the profile's name for
+    /// the overlay, and the host's clipboard decision the renderer no longer looks up.
+    #[test]
+    fn plan_spec_carries_what_the_session_may_not_re_derive() {
+        let h = KnownHost {
+            name: "Desk".into(),
+            addr: "192.168.1.50".into(),
+            fp_hex: "a".repeat(64),
+            clipboard_sync: true,
+            profile_id: Some("aaaaaaaaaaaa".into()),
+            ..Default::default()
+        };
+        let catalog = ProfilesFile {
+            version: 1,
+            profiles: vec![crate::profiles::StreamProfile {
+                id: "aaaaaaaaaaaa".into(),
+                name: "Game".into(),
+                overrides: crate::profiles::SettingsOverlay {
+                    bitrate_kbps: Some(80000),
+                    ..Default::default()
+                },
+                ..crate::profiles::StreamProfile::new("")
+            }],
+        };
+        let plan = ConnectPlan::resolve(&h, None, None, &catalog, &Settings::default());
+        let spec = plan.spec(plan.clipboard);
+        assert_eq!(spec.settings.bitrate_kbps, 80000, "the overlay is baked in");
+        assert_eq!(spec.profile.as_deref(), Some("Game"));
+        assert!(spec.clipboard, "the host's decision, resolved once");
+    }
+
     /// The stdout contract, parsed once for every front-end.
     #[test]
     fn session_contract_lines() {
@@ -832,6 +1002,14 @@ mod tests {
             parse_session_line(r#"{"ended":"Host ended the session"}"#),
             Some(SessionEvent::Ended("Host ended the session".into()))
         );
+        // The window report the spawner persists on the session's behalf.
+        assert_eq!(
+            parse_session_line(r#"{"window":{"w":1600,"h":900}}"#),
+            Some(SessionEvent::Window { w: 1600, h: 900 })
+        );
+        // A half-formed window line is not an event — persisting half a size would be worse
+        // than ignoring it.
+        assert_eq!(parse_session_line(r#"{"window":{"w":1600}}"#), None);
         // Stats lines and stray output are never events.
         assert_eq!(parse_session_line("stats: 1280×800@60 · 60 fps"), None);
         assert_eq!(parse_session_line(""), None);

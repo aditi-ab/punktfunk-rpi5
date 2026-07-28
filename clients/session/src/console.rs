@@ -183,7 +183,9 @@ pub fn run(target: Option<&str>) -> u8 {
         window_size: crate::session_main::window_size(&settings_at_start),
         // Latched at console start (like the stats tier above): toggling Match window in
         // the console's settings screen applies from the next console launch.
-        match_window: crate::session_main::match_window(&settings_at_start),
+        // The console owns its own window across every launch, and no parent is listening to
+        // its stdout, so it keeps persisting the size itself.
+        match_window: crate::session_main::match_window(&settings_at_start, true),
         render_scale: settings_at_start.render_scale,
         render_scale_max_dim: punktfunk_core::render_scale::max_dimension(&settings_at_start.codec),
     };
@@ -218,6 +220,8 @@ pub fn run(target: Option<&str>) -> u8 {
                     let mut params = session_params(
                         &settings,
                         profile.map(|p| p.name),
+                        // In-process launch: no spawner resolved a clipboard decision for us.
+                        None,
                         addr.clone(),
                         port,
                         pin,

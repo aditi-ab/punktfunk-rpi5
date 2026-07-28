@@ -78,6 +78,12 @@ pub fn spawn_session(
         wake: false,
         connect_timeout_secs: opts.connect_timeout_secs,
         tofu,
+        // The per-host clipboard decision, resolved here so the child doesn't look it up
+        // again — matched by address, the way every other per-host lookup matches.
+        clipboard: pf_client_core::trust::KnownHosts::load()
+            .hosts
+            .iter()
+            .any(|h| h.addr == req.addr && h.port == req.port && h.clipboard_sync),
     };
 
     let persist_paired = opts.persist_paired;
@@ -96,6 +102,8 @@ pub fn spawn_session(
             trust_rejected,
         } => error = Some((msg, trust_rejected)),
         SessionEvent::Ended(msg) => ended = Some(msg),
+        // The brain persists the window size; the shell has nothing to do with it.
+        SessionEvent::Window { .. } => {}
         SessionEvent::Exited(code) => {
             let _ = sender.send(AppMsg::SessionExited {
                 req: req.clone(),

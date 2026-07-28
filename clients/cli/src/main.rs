@@ -571,6 +571,8 @@ punktfunk:// link takes. Exit codes: 0 ok, 2 connect, 3 trust, 4 renderer, 5 not
                     trust_rejected,
                 } => failure = Some((msg, trust_rejected)),
                 SessionEvent::Ended(reason) => eprintln!("{reason}"),
+                // Persisted by the brain on the way past; nothing to report here.
+                SessionEvent::Window { .. } => {}
                 SessionEvent::Exited(code) => {
                     return match failure {
                         Some((msg, true)) => {

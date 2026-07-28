@@ -159,6 +159,7 @@ mod session_main {
     pub(crate) fn session_params(
         settings: &trust::Settings,
         profile: Option<String>,
+        clipboard_override: Option<bool>,
         addr: String,
         port: u16,
         pin: [u8; 32],
@@ -169,14 +170,16 @@ mod session_main {
         force_software: Arc<AtomicBool>,
         vulkan: Option<pf_client_core::video::VulkanDecodeDevice>,
     ) -> SessionParams {
-        // Per-host clipboard opt-in (design/clipboard-and-file-transfer.md §5.3), resolved
-        // here rather than passed in so every caller — a direct connect and the console's
-        // own launches — honors the same stored decision. `addr` is moved into the struct
+        // Per-host clipboard opt-in (design/clipboard-and-file-transfer.md §5.3). In spec
+        // mode the spawner already resolved it; otherwise this looks it up itself, which is
+        // the last store read the compat path still owes. `addr` is moved into the struct
         // below, so read it first.
-        let clipboard = trust::KnownHosts::load()
-            .hosts
-            .iter()
-            .any(|h| h.addr == addr && h.port == port && h.clipboard_sync);
+        let clipboard = clipboard_override.unwrap_or_else(|| {
+            trust::KnownHosts::load()
+                .hosts
+                .iter()
+                .any(|h| h.addr == addr && h.port == port && h.clipboard_sync)
+        });
         // Re-apply the shell-persisted forwarded-controller pin (stable `vid:pid:name`
         // key) to OUR gamepad service — the shells' in-process services can't reach this
         // process. Applied per params-build (idempotent; browse re-launches included) so
@@ -280,14 +283,24 @@ mod session_main {
     /// debounced resize→`Reconfigure` machinery on; the callback stores each resize-end's
     /// logical window size (load-modify-save, like the console settings screen) so the
     /// next launch opens at it.
-    pub(crate) fn match_window(settings: &trust::Settings) -> Option<Box<dyn FnMut(u32, u32)>> {
+    /// The Match-window policy hook (design/midstream-resolution-resize.md D1/D2). The
+    /// callback used to load-modify-save the shared settings file from inside the renderer —
+    /// one of that file's five concurrent writers, for a value only the parent needs. It now
+    /// REPORTS the size on stdout and the spawner persists it
+    /// (design/client-architecture-split.md §5).
+    ///
+    /// `persist_locally` keeps a hand-run session remembering its own window: nobody is
+    /// listening to stdout there, so the event alone would drop the value. A spawned session
+    /// leaves the write to its parent, which is the whole point.
+    pub(crate) fn match_window(
+        settings: &trust::Settings,
+        persist_locally: bool,
+    ) -> Option<Box<dyn FnMut(u32, u32)>> {
         settings.match_window.then(|| {
-            Box::new(|w: u32, h: u32| {
-                let mut s = trust::Settings::load();
-                if (s.last_window_w, s.last_window_h) != (w, h) {
-                    s.last_window_w = w;
-                    s.last_window_h = h;
-                    s.save();
+            Box::new(move |w: u32, h: u32| {
+                println!("{{\"window\":{{\"w\":{w},\"h\":{h}}}}}");
+                if persist_locally {
+                    pf_client_core::orchestrate::persist_window_size(w, h);
                 }
             }) as Box<dyn FnMut(u32, u32)>
         })
@@ -473,12 +486,31 @@ mod session_main {
                 return EXIT_CONNECT_FAILED;
             }
         };
-        // Global defaults with this host's settings profile overlaid — the binding on the
-        // host record, or `--profile <id|name>` for a one-off (`--profile ""` forces the
-        // defaults). Resolved through the shared helper, exactly like the console's launches.
-        let (settings, profile) = trust::effective_settings(&addr, port, profile_arg().as_deref());
-        if let Some(p) = &profile {
-            tracing::info!(profile = %p.name, id = %p.id, "streaming with a settings profile");
+        // `--resolved-spec <path>`: the spawner already did the resolving, so this process
+        // performs ZERO store reads (design/client-architecture-split.md §5) — no Settings
+        // load, no known-hosts lookup, no profile resolution. Without it (a hand-run
+        // `--connect`, an old Decky script) the session resolves for itself through the SAME
+        // helper, so the two modes cannot drift.
+        let spec = arg_value("--resolved-spec").map(std::path::PathBuf::from);
+        let (settings, profile_name, clipboard_override) = match &spec {
+            Some(path) => match pf_client_core::orchestrate::ResolvedSpec::read(path) {
+                Ok(s) => {
+                    tracing::info!(path = %path.display(), "running from a resolved spec");
+                    (s.settings, s.profile, Some(s.clipboard))
+                }
+                Err(e) => {
+                    json_line("error", &format!("resolved spec: {e}"), None);
+                    return EXIT_CONNECT_FAILED;
+                }
+            },
+            None => {
+                let (settings, profile) =
+                    trust::effective_settings(&addr, port, profile_arg().as_deref());
+                (settings, profile.map(|p| p.name), None)
+            }
+        };
+        if let Some(name) = &profile_name {
+            tracing::info!(profile = %name, "streaming with a settings profile");
         }
 
         // Trust follows the GTK client's `--connect` rules: a stored (or `--fp`) pin
@@ -540,7 +572,8 @@ mod session_main {
             #[cfg(not(feature = "ui"))]
             overlay: None,
             window_size: window_size(&settings),
-            match_window: match_window(&settings),
+            // A spawned session (spec mode) reports its window; a hand-run one persists it.
+            match_window: match_window(&settings, spec.is_none()),
             render_scale: settings.render_scale,
             render_scale_max_dim: punktfunk_core::render_scale::max_dimension(&settings.codec),
         };
@@ -549,7 +582,8 @@ mod session_main {
             pf_presenter::run_session(opts, move |gamepad, native, force_software, vulkan| {
                 session_params(
                     &settings,
-                    profile.map(|p| p.name),
+                    profile_name,
+                    clipboard_override,
                     addr,
                     port,
                     pin,
