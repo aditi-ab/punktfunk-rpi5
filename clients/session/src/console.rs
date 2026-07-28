@@ -137,6 +137,13 @@ pub fn run(target: Option<&str>) -> u8 {
     // `{"ready":true}` and restores on exit) — plain CLI/gamescope runs stay silent.
     let json_status = arg_flag("--json-status");
     let settings_at_start = trust::Settings::load();
+    // The console's window and its input models are built ONCE, from the global defaults, and
+    // live across every launch — so the presentation-tier fields below (stats tier, touch and
+    // mouse model, match-window, render scale) are latched here and a per-host profile cannot
+    // move them in this mode. Everything the HOST is told (mode, bitrate, codec, audio, pad) is
+    // re-resolved per launch and does honor the binding. Closing that gap means rebuilding the
+    // presenter's models per launch — profiles P4 territory, not P0.
+    let latched_mouse = settings_at_start.mouse_mode();
 
     // Request-access hand-off: the launch handler stamps this when it starts a delegated-approval
     // connect; `on_connected` reads it once the host lets us in and persists the host as PAIRED,
@@ -221,6 +228,13 @@ pub fn run(target: Option<&str>) -> u8 {
                         force_software,
                         vulkan,
                     );
+                    // …with ONE field that must follow the latched model rather than this
+                    // launch's: the cursor-channel advertisement says "this client draws the
+                    // host cursor itself", which is only true while the presenter is in desktop
+                    // mouse mode. A profile that flips `mouse_mode` here would make the host
+                    // stop compositing the pointer into a presenter that isn't drawing one —
+                    // a stream with no visible cursor at all.
+                    params.cursor_forward = latched_mouse == trust::MouseMode::Desktop;
                     if request_access {
                         // The host PARKS the connect until the operator approves — outlast its
                         // approval window (host `PENDING_APPROVAL_WAIT`), matching the desktop
