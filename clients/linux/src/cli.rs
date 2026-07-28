@@ -495,6 +495,7 @@ pub fn run_shot(ctx: &ShotCtx, scene: &str) {
         pair_optional: true,
         launch: None,
         mac: Vec::new(),
+        profile: None,
     };
     let mock_advert =
         |key: &str, name: &str, addr: &str, fp: &str| crate::discovery::DiscoveredHost {

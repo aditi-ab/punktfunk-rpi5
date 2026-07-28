@@ -565,6 +565,9 @@ impl AppModel {
                     pair_optional: false,
                     launch: plan.launch.clone().map(|id| (id.clone(), id)),
                     mac: plan.host.mac.clone(),
+                    // `profile=` in a URL is a one-off, exactly like "Connect with ▸": it
+                    // shapes this session and leaves the host's binding alone.
+                    profile: plan.profile_override.clone(),
                 };
                 // A link is a launch like any other: with a MAC it takes the dial-first wake
                 // path, so a sleeping host wakes instead of erroring.
@@ -589,6 +592,7 @@ impl AppModel {
                     pair_optional: false,
                     launch: unknown.launch.clone().map(|id| (id.clone(), id)),
                     mac: Vec::new(),
+                    profile: None,
                 };
                 self.toast(&format!(
                     "{} isn't paired with this device yet — pair it to continue.",

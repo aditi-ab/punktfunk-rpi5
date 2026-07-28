@@ -47,10 +47,11 @@ pub fn spawn_session(
     fullscreen_on_stream: bool,
     opts: SpawnOpts,
 ) -> Result<(), String> {
-    // The plan a card click resolves to. No `--profile`: a plain click honors the host's own
-    // binding, which the session resolves through the same helper this shell would have used
-    // (design/client-settings-profiles.md §4.6) — passing it here would be a second source of
-    // truth for the same decision.
+    // The plan this connect resolves to. A plain card click carries no `--profile`: it honors
+    // the host's own binding, which the session resolves through the same helper this shell
+    // would have used (design/client-settings-profiles.md §4.6) — passing it here would be a
+    // second source of truth for one decision. Only a "Connect with ▸" pick (or a URL's
+    // `profile=`) sets one, and it applies to this session alone.
     //
     // Two fields are deliberately not the shell's state yet, because nothing in the spawn path
     // reads them: `settings` carries only what the argv needs (the fullscreen flag), and `wake`
@@ -67,7 +68,9 @@ pub fn spawn_session(
         },
         launch: req.launch.as_ref().map(|(id, _)| id.clone()),
         profile: None,
-        profile_override: None,
+        // A one-off pick rides the flag; without one the session resolves the host's own
+        // binding through the same helper this shell would have used.
+        profile_override: req.profile.clone(),
         settings: Settings {
             fullscreen_on_stream,
             ..Default::default()

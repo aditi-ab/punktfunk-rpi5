@@ -32,6 +32,11 @@ pub struct ConnectRequest {
     pub launch: Option<(String, String)>,
     /// Wake-on-LAN MAC(s) for this host. Empty when none is known.
     pub mac: Vec<String>,
+    /// A ONE-OFF settings profile for this connect ("Connect with ▸ X"): `Some(id)` overrides
+    /// the host's binding for this launch, `Some("")` forces the global defaults on a bound
+    /// host, `None` honors the binding. It never rebinds anything — the host's default changes
+    /// only through an explicit "Default profile" pick (design/client-settings-profiles.md §5.2).
+    pub profile: Option<String>,
 }
 
 impl ConnectRequest {
@@ -62,6 +67,9 @@ enum CardKind {
         online: bool,
         recent: bool,
         library_enabled: bool,
+        /// The profile catalog as `(id, name)`, for this card's menus and chip. Shared per
+        /// refresh rather than re-read per card.
+        profiles: Rc<Vec<(String, String)>>,
     },
     Discovered(DiscoveredHost),
 }
@@ -69,13 +77,30 @@ enum CardKind {
 #[derive(Debug)]
 pub enum CardOutput {
     Connect(ConnectRequest),
+    /// Set (or clear, with `None`) this host's DEFAULT settings profile — the explicit
+    /// rebinding act; a one-off connect never does this.
+    BindProfile {
+        fp_hex: String,
+        addr: String,
+        port: u16,
+        profile_id: Option<String>,
+    },
     WakeConnect(ConnectRequest),
     Pair(ConnectRequest),
     SpeedTest(ConnectRequest),
     Library(ConnectRequest),
-    Rename { fp_hex: String, name: String },
-    Forget { fp_hex: String, name: String },
-    Wake { mac: Vec<String>, addr: String },
+    Rename {
+        fp_hex: String,
+        name: String,
+    },
+    Forget {
+        fp_hex: String,
+        name: String,
+    },
+    Wake {
+        mac: Vec<String>,
+        addr: String,
+    },
 }
 
 impl HostCard {
@@ -90,6 +115,7 @@ impl HostCard {
                 pair_optional: false,
                 launch: None,
                 mac: k.mac.clone(),
+                profile: None,
             },
             CardKind::Discovered(a) => ConnectRequest {
                 name: a.name.clone(),
@@ -100,6 +126,7 @@ impl HostCard {
                 pair_optional: a.pair == "optional",
                 launch: None,
                 mac: a.mac.clone(),
+                profile: None,
             },
         }
     }
@@ -171,7 +198,10 @@ impl relm4::factory::FactoryComponent for HostCard {
         };
         match &self.kind {
             CardKind::Saved {
-                host: k, online, ..
+                host: k,
+                online,
+                profiles,
+                ..
             } => {
                 // Presence pip + spelled-out state, then the trust pill.
                 let pip = gtk::Box::new(gtk::Orientation::Horizontal, 0);
@@ -190,6 +220,17 @@ impl relm4::factory::FactoryComponent for HostCard {
                 } else {
                     pill("Trusted", "pf-accent")
                 });
+                // The chip says what a plain click will do — the profile this host is bound
+                // to. A binding whose profile was deleted shows nothing and resolves as the
+                // defaults, which is exactly what will happen on connect (design §6).
+                if let Some(name) = k
+                    .profile_id
+                    .as_ref()
+                    .and_then(|id| profiles.iter().find(|(pid, _)| pid == id))
+                    .map(|(_, name)| name.as_str())
+                {
+                    status.append(&pill(name, "pf-neutral"));
+                }
             }
             CardKind::Discovered(_) => {
                 status.append(&if req.pair_optional {
@@ -214,6 +255,7 @@ impl relm4::factory::FactoryComponent for HostCard {
                 online,
                 recent,
                 library_enabled,
+                profiles,
             } => {
                 if *recent {
                     overlay.add_css_class("pf-recent");
@@ -276,9 +318,70 @@ impl relm4::factory::FactoryComponent for HostCard {
                         }),
                     );
                 }
+                // Profiles: a ONE-OFF connect ("Connect with"), and the explicit rebinding
+                // act ("Default profile"). They are separate menus on purpose — the whole
+                // predictability rule is that connecting with a profile never changes what
+                // the card will do next time (design §5.2).
+                {
+                    let profile_action =
+                        |name: &str, out: Box<dyn Fn(Option<String>) -> CardOutput>| {
+                            let a = gio::SimpleAction::new(name, Some(glib::VariantTy::STRING));
+                            let sender = sender.clone();
+                            a.connect_activate(move |_, param| {
+                                // The empty string is "Default settings" — a real choice, not
+                                // an absent one, so it has to survive as a value.
+                                let id = param.and_then(|p| p.str()).unwrap_or("").to_string();
+                                let _ = sender.output(out(Some(id).filter(|s| !s.is_empty())));
+                            });
+                            actions.add_action(&a);
+                        };
+                    let req_for_connect = req.clone();
+                    profile_action(
+                        "connect-with",
+                        Box::new(move |id| {
+                            let mut req = req_for_connect.clone();
+                            // `Some("")` — not `None` — so a bound host really does connect
+                            // with the defaults when the user asks for them.
+                            req.profile = Some(id.unwrap_or_default());
+                            CardOutput::Connect(req)
+                        }),
+                    );
+                    let (fp, addr, port) = (k.fp_hex.clone(), k.addr.clone(), k.port);
+                    profile_action(
+                        "bind-profile",
+                        Box::new(move |id| CardOutput::BindProfile {
+                            fp_hex: fp.clone(),
+                            addr: addr.clone(),
+                            port,
+                            profile_id: id,
+                        }),
+                    );
+                }
                 overlay.insert_action_group("card", Some(&actions));
 
                 let menu = gio::Menu::new();
+                if !profiles.is_empty() {
+                    let with = gio::Menu::new();
+                    let bind = gio::Menu::new();
+                    for (label, id) in std::iter::once(("Default settings", "")).chain(
+                        profiles
+                            .iter()
+                            .map(|(id, name)| (name.as_str(), id.as_str())),
+                    ) {
+                        // A checkmark would be the natural cue for the current binding, but a
+                        // GMenu radio needs shared state per card; the bound profile is named
+                        // on the card's chip instead, which is visible without opening a menu.
+                        for (menu, action) in
+                            [(&with, "card.connect-with"), (&bind, "card.bind-profile")]
+                        {
+                            let item = gio::MenuItem::new(Some(label), None);
+                            item.set_action_and_target_value(Some(action), Some(&id.to_variant()));
+                            menu.append_item(&item);
+                        }
+                    }
+                    menu.append_submenu(Some("Connect with"), &with);
+                    menu.append_submenu(Some("Default profile"), &bind);
+                }
                 menu.append(Some("Pair with PIN…"), Some("card.pair"));
                 menu.append(Some("Test network speed…"), Some("card.speed"));
                 // An explicit wake only when offline and a MAC is known.
@@ -671,6 +774,27 @@ impl SimpleComponent for HostsPage {
                 CardOutput::Rename { fp_hex, name } => self.rename_dialog(&sender, &fp_hex, &name),
                 CardOutput::Forget { fp_hex, name } => self.forget_dialog(&sender, &fp_hex, &name),
                 CardOutput::Wake { mac, addr } => crate::wol::wake(&mac, addr.parse().ok()),
+                CardOutput::BindProfile {
+                    fp_hex,
+                    addr,
+                    port,
+                    profile_id,
+                } => {
+                    // Written straight onto the host record — the binding IS a field there, so
+                    // there is no map to keep in step (design §4.1). Matched by fingerprint
+                    // when there is one, else by address, like every other per-host lookup.
+                    let mut known = KnownHosts::load();
+                    if let Some(h) = known.hosts.iter_mut().find(|h| {
+                        (!fp_hex.is_empty() && h.fp_hex == fp_hex)
+                            || (h.addr == addr && h.port == port)
+                    }) {
+                        h.profile_id = profile_id;
+                        if let Err(e) = known.save() {
+                            tracing::warn!(error = %format!("{e:#}"), "saving the profile binding");
+                        }
+                    }
+                    self.rebuild(); // the chip follows immediately
+                }
             },
         }
     }
@@ -694,6 +818,14 @@ impl HostsPage {
             .max_by_key(|&(_, t)| t)
             .map(|(fp, _)| fp);
         let library_enabled = self.settings.borrow().library_enabled;
+        // One catalog read per refresh, shared by every card's menus and chip.
+        let profiles: Rc<Vec<(String, String)>> = Rc::new(
+            pf_client_core::profiles::ProfilesFile::load()
+                .profiles
+                .into_iter()
+                .map(|p| (p.id, p.name))
+                .collect(),
+        );
 
         {
             let mut saved = self.saved.guard();
@@ -715,6 +847,7 @@ impl HostsPage {
                     kind: CardKind::Saved {
                         host: k.clone(),
                         online,
+                        profiles: profiles.clone(),
                         recent: most_recent.as_deref() == Some(k.fp_hex.as_str()),
                         library_enabled,
                     },
@@ -886,6 +1019,7 @@ impl HostsPage {
                     pair_optional: false,
                     launch: None,
                     mac: Vec::new(),
+                    profile: None,
                 }));
             });
         }
