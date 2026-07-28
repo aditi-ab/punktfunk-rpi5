@@ -29,7 +29,7 @@ use discovery::{
 };
 pub(crate) use discovery::{
     game_session_exited, gamescope_can_composite_cursor, gamescope_hdr_capable, is_available,
-    steam_appid_from_launch, wait_for_steam_game_exit, SteamGameWatch,
+    note_spawn_flags_lost, steam_appid_from_launch, wait_for_steam_game_exit, SteamGameWatch,
 };
 pub(crate) use splash::run as splash_run;
 
@@ -935,6 +935,11 @@ fn create_managed_session_steamos(mode: Mode, hdr: bool) -> Result<VirtualOutput
              {STEAMOS_SESSION_TARGET} — check `journalctl --user -u gamescope-session.service`"
         )
     })?;
+    // The shim is only a PATH entry — confirm the session actually took it before we trust the
+    // capabilities the plan was already built on (a stock gamescope here means no HDR and, worse,
+    // a silently pointerless stream). Leaves the tracked state unset on failure, so the retry does
+    // a clean restart rather than a same-mode reuse of a session we just rejected.
+    verify_managed_spawn_flags(hdr)?;
     point_injector_at_eis();
     *guard = Some(SessionState {
         width: mode.width,
@@ -1060,10 +1065,19 @@ fn ensure_box_gamescope_mode(mode: Mode) -> Result<u32> {
     }
 }
 
-/// Output (capture) resolution `-W <w> -H <h>` of the running `gamescope` binary, parsed from its
-/// `/proc/<pid>/cmdline`. `None` if no gamescope is running or the flags aren't present.
-fn current_gamescope_output_size() -> Option<(u32, u32)> {
-    for entry in std::fs::read_dir("/proc").ok()?.flatten() {
+/// argv of every gamescope COMPOSITOR running on this box, read from `/proc/<pid>/cmdline`.
+///
+/// Match by argv[0]'s basename — NOT `/proc/<pid>/exe`, which is commonly unreadable for the
+/// gamescope process (returns empty). `ends_with` rather than `==` because the binary the host
+/// resolves is frequently our own `punktfunk-gamescope` ([`gamescope_bin`]); it still excludes
+/// `gamescopectl`, `gamescopereaper` and the `gamescope-session-plus` shell wrapper, none of which
+/// END in the name.
+fn gamescope_argvs() -> Vec<Vec<String>> {
+    let mut found = Vec::new();
+    let Ok(dir) = std::fs::read_dir("/proc") else {
+        return found;
+    };
+    for entry in dir.flatten() {
         let name = entry.file_name();
         let Some(pid) = name.to_str() else { continue };
         if !pid.bytes().all(|b| b.is_ascii_digit()) {
@@ -1077,17 +1091,21 @@ fn current_gamescope_output_size() -> Option<(u32, u32)> {
             .filter(|s| !s.is_empty())
             .map(|s| String::from_utf8_lossy(s).into_owned())
             .collect();
-        // Match the gamescope BINARY by argv[0]'s basename — NOT /proc/<pid>/exe, which is commonly
-        // unreadable for the gamescope process (returns empty). The session wrapper scripts run as
-        // bash/sh (argv[0] != gamescope), so they're excluded; the -W/-H presence check below is the
-        // final filter.
-        let is_gamescope = args
+        if args
             .first()
-            .map(|a0| a0.rsplit('/').next().unwrap_or(a0) == "gamescope")
-            .unwrap_or(false);
-        if !is_gamescope {
-            continue;
+            .is_some_and(|a0| a0.rsplit('/').next().unwrap_or(a0).ends_with("gamescope"))
+        {
+            found.push(args);
         }
+    }
+    found
+}
+
+/// Output (capture) resolution `-W <w> -H <h>` of the running gamescope, parsed from its
+/// `/proc/<pid>/cmdline`. `None` if no gamescope is running or the flags aren't present — which is
+/// also the final filter that separates a compositor from anything else [`gamescope_argvs`] let by.
+fn current_gamescope_output_size() -> Option<(u32, u32)> {
+    gamescope_argvs().into_iter().find_map(|args| {
         let flag = |names: &[&str]| -> Option<u32> {
             args.iter().enumerate().find_map(|(i, a)| {
                 names
@@ -1096,14 +1114,87 @@ fn current_gamescope_output_size() -> Option<(u32, u32)> {
                     .flatten()
             })
         };
-        if let (Some(w), Some(h)) = (
+        match (
             flag(&["-W", "--output-width"]),
             flag(&["-H", "--output-height"]),
         ) {
-            return Some((w, h));
+            (Some(w), Some(h)) => Some((w, h)),
+            _ => None,
         }
+    })
+}
+
+/// Did the flags we passed an INDIRECTLY-spawned session actually reach its gamescope?
+///
+/// The bare spawn builds argv itself and cannot lose them. The two managed modes can: a
+/// `gamescope-session-plus` gets them through `GAMESCOPE_BIN` + `PF_HDR_ARGS`, SteamOS through a
+/// PATH shim, and a session that ignores either execs the distro's gamescope with none of them.
+/// The HDR half of that failure is loud on its own (capture negotiation times out and the session
+/// dies on the bit-depth promise) — but a lost `--pipewire-composite-cursor` is SILENT: the host
+/// was told the compositor would paint the pointer, so it didn't, and nobody did. The stream is
+/// fine except that it has no cursor.
+///
+/// So check the running compositor and refuse the session when a flag is missing. The plan is
+/// already fixed by this point (`cursor_blend` feeds the encoder open, which precedes the display),
+/// so correcting THIS session isn't possible — instead latch the capability off
+/// ([`note_spawn_flags_lost`]) and fail, and the retry plans a correct host-composited SDR session.
+///
+/// Fail OPEN in every ambiguous direction: no expected flags, or no readable gamescope process at
+/// all, is silence. Only a compositor we can see, that is missing a flag we can name, fails.
+///
+/// It accepts ANY running gamescope carrying the flags, which is deliberate — a box commonly has a
+/// second one (observed on the Nobara test box: its own game-mode
+/// `/usr/bin/gamescope --prefer-output *,eDP-1 … --steam` running beside ours), and demanding that
+/// EVERY gamescope carry them would reject a perfectly good session. The direction that error can
+/// go is a false PASS, and the flag that matters is immune to it: `--pipewire-composite-cursor`
+/// exists only in our patch set, so no foreign gamescope can be carrying it. `--hdr-enabled`
+/// predates us and could in principle be borrowed from a neighbour, but its failure mode is the
+/// loud one this check is not for.
+fn verify_managed_spawn_flags(hdr: bool) -> Result<()> {
+    let expected: Vec<String> = hdr_args(hdr)
+        .into_iter()
+        .chain(cursor_args())
+        .filter(|a| a.starts_with("--")) // flag names only — their values are bare words
+        .collect();
+    if expected.is_empty() {
+        return Ok(());
     }
-    None
+    let missing = missing_flags(&expected, &gamescope_argvs());
+    if missing.is_empty() {
+        tracing::debug!(flags = ?expected, "gamescope: the session's compositor carries our flags");
+        return Ok(());
+    }
+    note_spawn_flags_lost();
+    // Warn as well as erroring: the latch is a process-wide capability change, and whichever
+    // caller consumes this error decides on its own how loudly to report it.
+    tracing::warn!(
+        missing = %missing.join(" "),
+        "gamescope: the session ignored GAMESCOPE_BIN / the PATH shim and ran a stock gamescope — \
+         HDR and the in-node cursor are now off for this host process"
+    );
+    Err(anyhow!(
+        "the gamescope session started without {} — it ignored GAMESCOPE_BIN / the PATH shim and \
+         ran a stock gamescope. Refusing it rather than streaming a session whose shape was \
+         planned around flags that never arrived (a missing cursor flag has no symptom but an \
+         absent pointer). Those capabilities are off for this host now; reconnect for a plain SDR \
+         session, or install punktfunk-gamescope as the box's `gamescope`",
+        missing.join(" ")
+    ))
+}
+
+/// Which of `expected` no running gamescope carries. Split out pure because both of its empty
+/// answers are load-bearing and mean opposite things: no `argvs` is "we could not look" (silence),
+/// no missing flag is "we looked and it is fine" — and getting the first one wrong would fail every
+/// session on a box whose `/proc` we cannot read.
+fn missing_flags<'a>(expected: &'a [String], argvs: &[Vec<String>]) -> Vec<&'a str> {
+    if argvs.is_empty() {
+        return Vec::new();
+    }
+    expected
+        .iter()
+        .filter(|f| !argvs.iter().any(|argv| argv.iter().any(|a| a == *f)))
+        .map(String::as_str)
+        .collect()
 }
 
 /// The running autologin gaming-mode unit (`gamescope-session-plus@<client>.service`), if any — the
@@ -2105,6 +2196,13 @@ fn launch_session(client: &str, unit_name: &str, mode: Mode, hdr: bool) -> Resul
     let deadline = Instant::now() + Duration::from_secs(45);
     loop {
         if let Some(id) = find_gamescope_node() {
+            // `GAMESCOPE_BIN` is a session-plus convention, not a guarantee — confirm the session
+            // honoured it before we trust the capabilities the plan was already built on. Stop the
+            // unit on rejection so the retry relaunches instead of reusing what we just refused.
+            if let Err(e) = verify_managed_spawn_flags(hdr) {
+                stop_session(unit_name);
+                return Err(e);
+            }
             return Ok(id);
         }
         if Instant::now() >= deadline {
@@ -2417,7 +2515,7 @@ mod tests {
     use super::{
         cgroup_is_punktfunk_owned, cgroup_under_user_manager, connected_connector_under,
         display_manager_unit_under, dm_survives_masked_unit, hdr_args, is_steam_launch,
-        nested_wrapper_script, sentinel_advanced, shape_dedicated_command,
+        missing_flags, nested_wrapper_script, sentinel_advanced, shape_dedicated_command,
     };
 
     /// The HDR spawn flags are what make a nested game render HDR at all — and their absence is
@@ -2597,5 +2695,64 @@ mod tests {
             "0::/user.slice/user-1000.slice/user@1000.service/app.slice/punktfunk-gamescope.service"
         ));
         assert!(!cgroup_is_punktfunk_owned(""));
+    }
+
+    /// The silent-cursor guard: a managed session that ignored `GAMESCOPE_BIN` / the PATH shim runs
+    /// a stock gamescope, and the host — already told the compositor would paint the pointer —
+    /// paints none either. Only a compositor we can SEE, missing a flag we can NAME, may fail.
+    #[test]
+    fn spawn_flag_verification_fails_closed_only_on_evidence() {
+        let argv = |s: &str| -> Vec<String> { s.split(' ').map(str::to_string).collect() };
+        let want: Vec<String> = ["--hdr-enabled", "--pipewire-composite-cursor"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        // The flags arrived: nothing to report.
+        assert!(missing_flags(
+            &want,
+            &[argv(
+                "/usr/bin/punktfunk-gamescope --backend headless -W 1920 -H 1080 \
+                 --hdr-enabled --hdr-debug-force-support --pipewire-composite-cursor"
+            )]
+        )
+        .is_empty());
+
+        // The session execed the distro binary — BOTH flags lost. This is the case that used to
+        // stream a pointerless picture without a word.
+        assert_eq!(
+            missing_flags(
+                &want,
+                &[argv(
+                    "/usr/bin/gamescope --backend headless -W 1920 -H 1080"
+                )]
+            ),
+            vec!["--hdr-enabled", "--pipewire-composite-cursor"]
+        );
+
+        // A stock gamescope can take `--hdr-enabled` (it predates our patches) — so the HDR flag
+        // alone proves nothing, and the cursor flag must be checked on its own.
+        assert_eq!(
+            missing_flags(
+                &want,
+                &[argv("/usr/bin/gamescope --hdr-enabled -W 1920 -H 1080")]
+            ),
+            vec!["--pipewire-composite-cursor"]
+        );
+
+        // Fail OPEN when we could not look: an unreadable `/proc` is not evidence of anything, and
+        // treating it as a miss would fail every managed session on a hardened box.
+        assert!(missing_flags(&want, &[]).is_empty());
+
+        // Several gamescopes running (a nested game under the session): the flags need only be on
+        // ONE of them — the session compositor.
+        assert!(missing_flags(
+            &want,
+            &[
+                argv("/usr/bin/gamescope -W 800 -H 600"),
+                argv("/usr/bin/punktfunk-gamescope --hdr-enabled --pipewire-composite-cursor"),
+            ]
+        )
+        .is_empty());
     }
 }

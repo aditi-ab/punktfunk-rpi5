@@ -439,7 +439,7 @@ fn gamescope_patch_level() -> u32 {
 /// Does the resolved gamescope offer 10-bit BT.2020/PQ formats on its PipeWire node — i.e. can a
 /// session on this host stream true HDR10 off a gamescope virtual output?
 pub(crate) fn gamescope_hdr_capable() -> bool {
-    gamescope_patch_level() >= 1
+    gamescope_patch_level() >= 1 && !flags_lost()
 }
 
 /// Can the resolved gamescope paint the pointer INTO its PipeWire node
@@ -447,8 +447,35 @@ pub(crate) fn gamescope_hdr_capable() -> bool {
 /// XFixes and blending it in — which is what frees the session to take the encoder's zero-CSC
 /// RGB-direct source, since that front end has no blend stage.
 pub(crate) fn gamescope_can_composite_cursor() -> bool {
-    gamescope_patch_level() >= 2
+    gamescope_patch_level() >= 2 && !flags_lost()
 }
+
+/// Has a spawn been observed where our flags did NOT reach the gamescope process?
+///
+/// The binary probe above answers "can it", which is all the bare spawn needs — there we build
+/// argv ourselves. The two INDIRECT modes can't promise that much: a host-managed
+/// `gamescope-session-plus` gets the flags via `GAMESCOPE_BIN` + `PF_HDR_ARGS`, and SteamOS via a
+/// PATH shim, and a session free to ignore either would exec the distro's gamescope instead. Then
+/// the binary is still capable and the running compositor still has none of the flags.
+///
+/// So a capability that was only ever *probed* becomes one that has been *contradicted*, and this
+/// latch is how the contradiction sticks: [`note_spawn_flags_lost`] sets it, and from then on both
+/// answers above are `false` for the rest of the process. The observing spawn fails — the plan it
+/// was created under is already wrong and cannot be edited mid-create — and the retry re-resolves
+/// against the latched answers, landing on a correct SDR host-composited session. One failed
+/// attempt per boot, then it converges.
+fn flags_lost() -> bool {
+    FLAGS_LOST.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Record that a spawned session's gamescope did not receive the flags we passed it — see
+/// [`flags_lost`]. Idempotent and one-way: nothing ever clears it, because nothing we can observe
+/// proves the next session would fare better.
+pub(crate) fn note_spawn_flags_lost() {
+    FLAGS_LOST.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+static FLAGS_LOST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// The marker `packaging/gamescope/patches/0003-*` stamps into the `--version` banner, followed by
 /// the patch-set revision (`+pfhdr1`, `+pfhdr2`, …).

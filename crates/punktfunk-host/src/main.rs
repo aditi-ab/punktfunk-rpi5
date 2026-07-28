@@ -480,6 +480,16 @@ fn real_main() -> Result<()> {
             println!("monitor in BT.2100 (HDR) colour mode: {monitor_hdr}");
             println!("gamescope offers 10-bit PQ capture:   {gs_binary_hdr}");
             println!("PUNKTFUNK_GAMESCOPE_HDR:              {gs_knob}");
+            // The other half of what the patched gamescope buys, and the one with no on-glass
+            // symptom of its own: when it is true the compositor paints the pointer into the
+            // capture node and the host stops blending — which is what lets the session take the
+            // zero-CSC encode source. When it is false the pointer is still streamed, just at the
+            // cost of a full-frame pass. Printed because "cursor composited by" is otherwise
+            // invisible until you compare two streams side by side.
+            println!(
+                "gamescope paints the cursor in-node:  {}",
+                pf_vdisplay::gamescope_composites_cursor()
+            );
             println!("encoder Main10 (HEVC): {hevc10}");
             println!("encoder 10-bit (AV1):  {av110}");
             println!(
