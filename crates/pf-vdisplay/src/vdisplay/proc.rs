@@ -78,6 +78,21 @@ fn timed_out(cmd: &Command, budget: Duration) -> Error {
     )
 }
 
+/// The calling process's real uid.
+///
+/// Every session/gamescope lookup that derives `/run/user/<uid>` (or filters `/proc` to "our"
+/// processes) needs this, and each one used to open its own `unsafe` block carrying a verbatim
+/// copy of the same SAFETY note. `getuid()` is parameterless, always succeeds, and touches no
+/// memory, so there is no contract for a caller to uphold — which makes it exactly the shape that
+/// belongs behind a safe wrapper instead of being restated at every call site. One `unsafe` here,
+/// none at the callers.
+#[cfg(target_os = "linux")]
+pub(crate) fn current_uid() -> u32 {
+    // SAFETY: parameterless POSIX call that always succeeds and touches no memory — it just
+    // returns the calling process's real uid. Nothing is aliased, read, or freed.
+    unsafe { libc::getuid() }
+}
+
 // `unix` gate, not `test` alone: this module is compiled on every platform (lib.rs declares it
 // unconditionally), but the cases below spawn `sleep`/`true`/`echo` as EXECUTABLES. On Windows
 // `echo` is a shell builtin and there is no `sleep.exe`, so an ungated module turns a green suite

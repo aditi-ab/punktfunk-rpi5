@@ -92,3 +92,6 @@ pyrowave = ["dep:pyrowave-sys"]
 # (design/native-qsv-encoder.md). ⚠ Like `nvenc`: hand builds need this feature or
 # Intel boxes fall through to the ffmpeg path / software.
 qsv = ["dep:libvpl-sys"]
+
+[lints]
+workspace = true

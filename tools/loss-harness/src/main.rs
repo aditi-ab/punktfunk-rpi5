@@ -4,6 +4,7 @@
 //! both FEC schemes, and prints how many frames survive. A pure-software stand-in for
 //! `tc netem` that needs no network and runs anywhere `punktfunk_core` builds. The real punktfunk/1
 //! harness adds `tc netem` jitter/reorder on the UDP path.
+#![forbid(unsafe_code)]
 
 use punktfunk_core::config::{Config, FecConfig, FecScheme, ProtocolPhase, Role};
 use punktfunk_core::crypto::SessionKey;

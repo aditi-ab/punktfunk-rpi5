@@ -31,6 +31,7 @@
 //! = off, anything else = on, so the old presence-style `=1` keeps working). The Linux `zerocopy`
 //! module keeps its own *truthy* parser (`1|true|yes|on`) — the two are independent features that
 //! share a name; do NOT conflate them.
+#![forbid(unsafe_code)]
 
 use std::sync::OnceLock;
 

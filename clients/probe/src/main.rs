@@ -45,6 +45,7 @@
 //!         [--input-test | --mic-test [--mic-burst] | --touch-test | --rich-input-test]
 //!         [--pin HEX | --pair PIN] [--compositor NAME] [--gamepad NAME] | --discover [SECS]`
 //! Env: `PUNKTFUNK_CLIENT_10BIT=1` / `PUNKTFUNK_CLIENT_444=1` advertise the 10-bit / 4:4:4 caps.
+#![forbid(unsafe_code)]
 
 use anyhow::{anyhow, Context, Result};
 use punktfunk_core::config::GamepadPref;

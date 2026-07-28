@@ -10,3 +10,6 @@ description = "Process-wide punktfunk host configuration (env-parsed HostConfig 
 publish = false
 
 [dependencies]
+
+[lints]
+workspace = true

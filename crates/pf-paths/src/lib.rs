@@ -6,6 +6,7 @@
 //! - [`config_dir`] resolves the per-host config directory (XDG / `%ProgramData%`, `PUNKTFUNK_CONFIG_DIR` override).
 //! - [`create_private_dir`] makes it owner-private (0700 / restrictive DACL).
 //! - [`write_secret_file`] writes an owner-only secret (0600 / SYSTEM+Admins DACL).
+#![forbid(unsafe_code)]
 
 use std::path::PathBuf;
 

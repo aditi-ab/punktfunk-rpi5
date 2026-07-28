@@ -10,3 +10,6 @@ repository.workspace = true
 
 [dependencies]
 punktfunk-core = { path = "../../crates/punktfunk-core" }
+
+[lints]
+workspace = true

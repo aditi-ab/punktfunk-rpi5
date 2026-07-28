@@ -20,7 +20,7 @@
 //!
 //! The GUID and LUID are carried as plain integers; the host converts to `windows::core::GUID` /
 //! `windows::Win32::Foundation::LUID` and the driver to its own bindgen types via the same constants.
-
+#![forbid(unsafe_code)]
 #![cfg_attr(not(test), no_std)]
 
 extern crate alloc;

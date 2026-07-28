@@ -14,3 +14,6 @@ windows = { version = "0.62", features = [
     "Win32_Graphics_Gdi",
     "Win32_Foundation",
 ] }
+
+[lints]
+workspace = true

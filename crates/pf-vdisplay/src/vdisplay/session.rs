@@ -280,9 +280,7 @@ pub(crate) fn runtime_dir() -> String {
 #[cfg(target_os = "linux")]
 fn default_runtime_dir(env: &EnvProbe) -> String {
     env.xdg_runtime_dir.clone().unwrap_or_else(|| {
-        // SAFETY: `getuid()` is a parameterless POSIX call that always succeeds and touches no
-        // memory — it just returns the calling process's real uid. Nothing is aliased or freed.
-        let uid = unsafe { libc::getuid() };
+        let uid = crate::proc::current_uid();
         format!("/run/user/{uid}")
     })
 }
@@ -305,9 +303,7 @@ fn default_bus(env: &EnvProbe, runtime: &str) -> String {
 #[cfg(target_os = "linux")]
 pub fn detect_active_session() -> ActiveSession {
     use std::os::unix::fs::MetadataExt;
-    // SAFETY: `getuid()` is a parameterless POSIX call that always succeeds and touches no memory —
-    // it just returns the calling process's real uid. Nothing is aliased or freed.
-    let uid = unsafe { libc::getuid() };
+    let uid = crate::proc::current_uid();
     // ONE sample of the session-scoped env, before any scanning — see [`EnvProbe`]. Everything
     // below reads this snapshot, never the process env.
     let env = EnvProbe::sample();
@@ -712,8 +708,7 @@ mod tests {
 
     impl FakeRuntime {
         fn new(tag: &str, pids: &[u32]) -> FakeRuntime {
-            // SAFETY: parameterless POSIX call, returns the calling process's uid; touches no memory.
-            let uid = unsafe { libc::getuid() };
+            let uid = crate::proc::current_uid();
             let dir =
                 std::env::temp_dir().join(format!("pf-swaysock-{tag}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);

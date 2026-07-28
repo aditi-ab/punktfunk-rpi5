@@ -56,6 +56,16 @@ license = "MIT OR Apache-2.0"
 authors = ["unom"]
 repository = "https://git.unom.io/unom/punktfunk"
 
+# The `unsafe` discipline the `packaging/windows/drivers/*` crates already run, extended to the
+# workspace. `unsafe fn` marks a CONTRACT the caller must uphold; it is not a licence for the whole
+# body to skip checking. Without this lint an `unsafe fn` body is unchecked end to end, so a 600-line
+# function hides which handful of lines are actually the unsafe ones — exactly the reviewer-hostile
+# shape we are working down. `warn` while the remaining sites are cleared crate by crate; flip to
+# `deny` once they are, so it can never regress. (This is the Rust 2024 default; adopting it early
+# also pays off the edition migration.)
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+
 [profile.release]
 opt-level = 3
 lto = "thin"

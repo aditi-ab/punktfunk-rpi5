@@ -11,3 +11,6 @@ publish = false
 
 [dependencies]
 tracing = "0.1"
+
+[lints]
+workspace = true

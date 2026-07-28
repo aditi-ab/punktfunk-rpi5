@@ -106,8 +106,7 @@ pub(crate) fn wait_for_steam_game_exit(
 /// `AppId=57` never matches appid 570) — specific to the game reaper, so Steam's own shader-precompile
 /// step (not reaper-wrapped) can't be mistaken for the game.
 fn steam_game_running(appid: u32) -> bool {
-    // SAFETY: `getuid()` is a parameterless POSIX call that always succeeds and touches no memory.
-    let uid = unsafe { libc::getuid() };
+    let uid = crate::proc::current_uid();
     let appid_tok = format!("AppId={appid}");
     let Ok(entries) = std::fs::read_dir("/proc") else {
         return false;

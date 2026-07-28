@@ -5,6 +5,7 @@
 //! anything, so regressions are quantifiable.
 //!
 //! Status: scaffold.
+#![forbid(unsafe_code)]
 
 fn main() {
     println!(

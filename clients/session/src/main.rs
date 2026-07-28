@@ -13,6 +13,7 @@
 //! the first presented frame, `stats:` lines per 1 s window, one `{"error": …}` /
 //! `{"ended": …}` JSON line on the way out. Logs go to stderr. Exit codes: 0 clean end,
 //! 2 connect failed, 3 trust rejected / pairing required, 4 presenter init failed.
+#![forbid(unsafe_code)]
 
 #[cfg(all(any(target_os = "linux", windows), feature = "ui"))]
 mod console;

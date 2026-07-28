@@ -18,3 +18,6 @@ publish = false
 [dependencies]
 # `min_const_generics`: Pod/Zeroable for `[u8; N]` of any N (the gamepad SHM reserved tails are >32).
 bytemuck = { version = "1.19", features = ["derive", "min_const_generics"] }
+
+[lints]
+workspace = true

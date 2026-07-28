@@ -95,3 +95,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"
 windows-reactor-setup = { git = "https://github.com/microsoft/windows-rs", rev = "a4f7b2cb7c63c6bb7fc77a2affe57145be1d8c4f" }
+
+[lints]
+workspace = true

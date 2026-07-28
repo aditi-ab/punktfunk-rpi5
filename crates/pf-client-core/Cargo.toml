@@ -79,3 +79,6 @@ windows = { git = "https://github.com/microsoft/windows-rs", rev = "a4f7b2cb7c63
 # still strictly per-session opt-in (Settings codec pick / PUNKTFUNK_PREFER_PYROWAVE=1).
 default = ["pyrowave"]
 pyrowave = ["dep:pyrowave-sys", "dep:ash"]
+
+[lints]
+workspace = true

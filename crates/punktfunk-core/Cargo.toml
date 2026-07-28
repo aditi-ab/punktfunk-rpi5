@@ -107,3 +107,6 @@ harness = false
 
 [build-dependencies]
 cbindgen = "0.29"
+
+[lints]
+workspace = true

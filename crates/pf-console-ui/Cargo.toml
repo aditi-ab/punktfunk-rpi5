@@ -33,3 +33,6 @@ sdl3 = { version = "0.18", features = ["hidapi", "ash"] }
 
 [target.'cfg(windows)'.dependencies]
 sdl3 = { version = "0.18", features = ["hidapi", "ash", "build-from-source"] }
+
+[lints]
+workspace = true

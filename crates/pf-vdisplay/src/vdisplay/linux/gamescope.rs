@@ -604,8 +604,7 @@ pub fn managed_session_available() -> bool {
 /// walking each candidate's ppid chain — so one client's nested gamescope never makes the next
 /// client attach to it.
 pub fn foreign_gamescope_running() -> bool {
-    // SAFETY: `getuid()` is a parameterless POSIX call that always succeeds and touches no memory.
-    let uid = unsafe { libc::getuid() };
+    let uid = crate::proc::current_uid();
     let our_pid = std::process::id();
     let Ok(entries) = std::fs::read_dir("/proc") else {
         return false;
@@ -708,8 +707,7 @@ pub fn launch_into_session(cmd: &str) -> Result<std::process::Child> {
 /// when a process exposes it. Empty when no gamescope session is running / none exposes a `DISPLAY`.
 #[cfg(target_os = "linux")]
 pub(crate) fn xwayland_cursor_targets() -> Vec<(String, Option<String>)> {
-    // SAFETY: `getuid()` is a parameterless POSIX call that always succeeds and touches no memory.
-    let uid = unsafe { libc::getuid() };
+    let uid = crate::proc::current_uid();
     let mut out: Vec<(String, Option<String>)> = Vec::new();
     let Ok(entries) = std::fs::read_dir("/proc") else {
         return out;
@@ -765,8 +763,7 @@ pub(crate) fn xwayland_cursor_targets() -> Vec<(String, Option<String>)> {
 /// gamescope socket; `DISPLAY` is the nested Xwayland; `XAUTHORITY` is its auth file (for X
 /// clients that aren't gamescope children). Any one can be individually absent.
 fn discover_session_display_env() -> Option<(Option<String>, Option<String>, Option<String>)> {
-    // SAFETY: `getuid()` is a parameterless POSIX call that always succeeds and touches no memory.
-    let uid = unsafe { libc::getuid() };
+    let uid = crate::proc::current_uid();
     for e in std::fs::read_dir("/proc").ok()?.flatten() {
         let name = e.file_name();
         let Some(pid_str) = name.to_str() else {
@@ -1441,8 +1438,7 @@ fn cgroup_under_user_manager(cgroup: &str) -> bool {
 
 /// Our uid as a string — what `loginctl` wants for a user argument.
 fn uid_string() -> String {
-    // SAFETY: `getuid()` is a parameterless POSIX call that always succeeds and touches no memory.
-    unsafe { libc::getuid() }.to_string()
+    crate::proc::current_uid().to_string()
 }
 
 /// Is lingering on for this user (logind keeps the `--user` manager alive with no session)?

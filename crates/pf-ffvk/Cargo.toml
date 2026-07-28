@@ -20,3 +20,6 @@ ash = { version = "0.38", features = ["loaded"] }
 # Same bindgen configuration as ffmpeg-sys-next (runtime = dlopen libclang).
 bindgen = { version = "0.72", features = ["runtime"], default-features = false }
 pkg-config = "0.3"
+
+[lints]
+workspace = true

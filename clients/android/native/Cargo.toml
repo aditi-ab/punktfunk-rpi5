@@ -64,3 +64,6 @@ libc = "0.2"
 # host + Linux client use. audiopus_sys vendors libopus (pure C) and builds it static via cmake —
 # the cargo-ndk build sets LIBOPUS_STATIC=1/LIBOPUS_NO_PKG=1 so it links the bundled lib, not the host's.
 opus = "0.3"
+
+[lints]
+workspace = true

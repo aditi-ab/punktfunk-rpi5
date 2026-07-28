@@ -22,3 +22,6 @@ mdns-sd = "0.20"
 # encoder. libopus is already in the graph via `punktfunk-core`'s quic feature; this exposes the
 # name directly. Cross-platform (cmake-vendored), so the probe builds + validates everywhere.
 opus = "0.3"
+
+[lints]
+workspace = true
