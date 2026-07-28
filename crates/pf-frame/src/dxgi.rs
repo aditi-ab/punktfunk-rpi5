@@ -184,7 +184,7 @@ fn configured_gpu_priority_mode() -> PrioMode {
 /// HIGH/REALTIME GPU scheduling-priority bump on it. Held by SYSTEM/Administrators; a UAC-FILTERED
 /// token does NOT have it, which is why `elevate_process_gpu_priority` may silently no-op in a
 /// restricted service context.
-unsafe fn enable_inc_base_priority() {
+fn enable_inc_base_priority() {
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::{CloseHandle, HANDLE, LUID};
     use windows::Win32::Security::{
@@ -194,15 +194,24 @@ unsafe fn enable_inc_base_priority() {
     };
     use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
     let mut token = HANDLE::default();
-    if OpenProcessToken(
-        GetCurrentProcess(),
-        TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
-        &mut token,
-    )
-    .is_ok()
-    {
+    // SAFETY: `GetCurrentProcess` returns the current-process pseudo-handle, always valid and never
+    // closed; `token` is a local the callee only writes, and it is only used below if this succeeded.
+    let opened = unsafe {
+        OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+            &mut token,
+        )
+    }
+    .is_ok();
+    if opened {
         let mut luid = LUID::default();
-        if LookupPrivilegeValueW(PCWSTR::null(), SE_INC_BASE_PRIORITY_NAME, &mut luid).is_ok() {
+        // SAFETY: a null system name means "local system"; `SE_INC_BASE_PRIORITY_NAME` is a static
+        // NUL-terminated constant, and `luid` is a local the callee only writes.
+        let found =
+            unsafe { LookupPrivilegeValueW(PCWSTR::null(), SE_INC_BASE_PRIORITY_NAME, &mut luid) }
+                .is_ok();
+        if found {
             let tp = TOKEN_PRIVILEGES {
                 PrivilegeCount: 1,
                 Privileges: [LUID_AND_ATTRIBUTES {
@@ -210,20 +219,25 @@ unsafe fn enable_inc_base_priority() {
                     Attributes: SE_PRIVILEGE_ENABLED,
                 }],
             };
-            if AdjustTokenPrivileges(
-                token,
-                false,
-                Some(&tp as *const TOKEN_PRIVILEGES),
-                0,
-                None,
-                None,
-            )
-            .is_err()
-            {
+            // SAFETY: `token` is the live handle opened above; `tp` is a correctly sized local
+            // `TOKEN_PRIVILEGES` whose `PrivilegeCount` matches its one-element array, borrowed only
+            // for the duration of the call.
+            let adjusted = unsafe {
+                AdjustTokenPrivileges(
+                    token,
+                    false,
+                    Some(&tp as *const TOKEN_PRIVILEGES),
+                    0,
+                    None,
+                    None,
+                )
+            };
+            if adjusted.is_err() {
                 tracing::warn!("could not enable SE_INC_BASE_PRIORITY for GPU priority");
             }
         }
-        let _ = CloseHandle(token);
+        // SAFETY: `token` was opened above, is owned here, and is closed exactly once on this path.
+        let _ = unsafe { CloseHandle(token) };
     }
 }
 
@@ -238,11 +252,17 @@ unsafe fn d3dkmt_set_scheduling_priority_class(
     use windows::core::s;
     use windows::Win32::Foundation::HANDLE;
     use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryA};
-    let gdi32 = LoadLibraryA(s!("gdi32.dll")).ok()?;
-    let p = GetProcAddress(gdi32, s!("D3DKMTSetProcessSchedulingPriorityClass"))?;
+    // SAFETY: both take static NUL-terminated literals; `LoadLibraryA` returns a module handle the
+    // process keeps for its lifetime (gdi32 is never unloaded here), and `GetProcAddress` is passed
+    // that live handle. Both results are checked by `?` before use.
+    let gdi32 = unsafe { LoadLibraryA(s!("gdi32.dll")) }.ok()?;
+    let p = unsafe { GetProcAddress(gdi32, s!("D3DKMTSetProcessSchedulingPriorityClass")) }?;
     type SetPrio = unsafe extern "system" fn(HANDLE, i32) -> i32;
-    let f: SetPrio = std::mem::transmute(p);
-    Some(f(process, prio))
+    // SAFETY: `p` is the non-null export just resolved, and `SetPrio` is its documented signature
+    // (`NTSTATUS D3DKMTSetProcessSchedulingPriorityClass(HANDLE, D3DKMT_SCHEDULINGPRIORITYCLASS)`,
+    // both arguments 4/8-byte scalars). `process` is a valid handle by this fn's own contract.
+    let f: SetPrio = unsafe { std::mem::transmute(p) };
+    Some(unsafe { f(process, prio) })
 }
 
 /// GPU scheduling-priority hardening — the same approach as Sunshine/Apollo, independently
@@ -261,13 +281,7 @@ unsafe fn d3dkmt_set_scheduling_priority_class(
 fn elevate_process_gpu_priority() {
     use std::sync::Once;
     static ONCE: Once = Once::new();
-    // SAFETY: the closure calls two of this module's `unsafe fn`s — `enable_inc_base_priority`
-    // (adjusts the current-process token; it has no caller precondition and builds all its FFI args
-    // locally) and `d3dkmt_set_scheduling_priority_class` (loads gdi32 by name and calls the export).
-    // The latter requires `process` to be a valid process handle; `GetCurrentProcess()` returns the
-    // current-process pseudo-handle, which is always valid and needs no close. Runs once via
-    // `Once::call_once`; no raw pointers are dereferenced here.
-    ONCE.call_once(|| unsafe {
+    ONCE.call_once(|| {
         use windows::Win32::System::Threading::GetCurrentProcess;
         let prio = match configured_gpu_priority_mode() {
             PrioMode::Off => {
@@ -280,7 +294,10 @@ fn elevate_process_gpu_priority() {
             PrioMode::Auto => 4,
         };
         enable_inc_base_priority();
-        match d3dkmt_set_scheduling_priority_class(GetCurrentProcess(), prio) {
+        // SAFETY: `d3dkmt_set_scheduling_priority_class` requires a valid process handle;
+        // `GetCurrentProcess()` returns the current-process pseudo-handle, which is always valid and
+        // needs no close.
+        match unsafe { d3dkmt_set_scheduling_priority_class(GetCurrentProcess(), prio) } {
             Some(0) => tracing::info!(
                 priority_class = prio,
                 "GPU process scheduling priority class set (2=normal 4=high 5=realtime)"
@@ -323,10 +340,10 @@ const KMTQAITYPE_WDDM_2_7_CAPS: u32 = 70;
 /// setter). `None` = could not determine (missing exports / query failed) — the caller treats
 /// unknown as "assume the hazard exists".
 ///
-/// # Safety
-/// Calls gdi32 exports through by-name transmuted pointers with locally built, correctly sized
-/// `repr(C)` argument structs; the adapter handle is closed before returning on every path.
-unsafe fn hags_enabled(luid: LUID) -> Option<bool> {
+/// Safe: `luid` is a plain value (no pointer a caller could get wrong), every gdi32 argument struct
+/// is built locally here, and the adapter handle is closed before returning on every path — so there
+/// is no precondition left for a caller to uphold. The `unsafe` that remains is internal.
+fn hags_enabled(luid: LUID) -> Option<bool> {
     use windows::core::s;
     use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryA};
     #[repr(C)]
@@ -345,19 +362,25 @@ unsafe fn hags_enabled(luid: LUID) -> Option<bool> {
         private_data: *mut std::ffi::c_void,
         private_data_size: u32,
     }
-    let gdi32 = LoadLibraryA(s!("gdi32.dll")).ok()?;
-    let open = GetProcAddress(gdi32, s!("D3DKMTOpenAdapterFromLuid"))?;
-    let query = GetProcAddress(gdi32, s!("D3DKMTQueryAdapterInfo"))?;
-    let close = GetProcAddress(gdi32, s!("D3DKMTCloseAdapter"))?;
+    // SAFETY: static NUL-terminated literals; gdi32 stays loaded for the process lifetime, and each
+    // result is checked by `?`/`.ok()?` before the next call uses it.
+    let gdi32 = unsafe { LoadLibraryA(s!("gdi32.dll")) }.ok()?;
+    let open = unsafe { GetProcAddress(gdi32, s!("D3DKMTOpenAdapterFromLuid")) }?;
+    let query = unsafe { GetProcAddress(gdi32, s!("D3DKMTQueryAdapterInfo")) }?;
+    let close = unsafe { GetProcAddress(gdi32, s!("D3DKMTCloseAdapter")) }?;
     type OpenFn = unsafe extern "system" fn(*mut OpenFromLuid) -> i32;
     type QueryFn = unsafe extern "system" fn(*mut QueryInfo) -> i32;
     type CloseFn = unsafe extern "system" fn(*mut CloseAdapter) -> i32;
-    let open: OpenFn = std::mem::transmute(open);
-    let query: QueryFn = std::mem::transmute(query);
-    let close: CloseFn = std::mem::transmute(close);
+    // SAFETY: each pointer is the non-null export resolved just above, and each fn type mirrors that
+    // export's documented signature — one `*mut` to the matching `repr(C)` struct declared here,
+    // returning NTSTATUS.
+    let open: OpenFn = unsafe { std::mem::transmute(open) };
+    let query: QueryFn = unsafe { std::mem::transmute(query) };
+    let close: CloseFn = unsafe { std::mem::transmute(close) };
 
     let mut oa = OpenFromLuid { luid, h_adapter: 0 };
-    if open(&mut oa) != 0 {
+    // SAFETY: `oa` is a live local of exactly the type the export expects; it borrows nothing.
+    if unsafe { open(&mut oa) } != 0 {
         return None;
     }
     let mut caps: u32 = 0;
@@ -367,11 +390,14 @@ unsafe fn hags_enabled(luid: LUID) -> Option<bool> {
         private_data: (&mut caps as *mut u32).cast(),
         private_data_size: std::mem::size_of::<u32>() as u32,
     };
-    let st = query(&mut qi);
+    // SAFETY: `qi` is a live local; `private_data` points at `caps`, which outlives the call, and
+    // `private_data_size` is that variable's exact size.
+    let st = unsafe { query(&mut qi) };
     let mut ca = CloseAdapter {
         h_adapter: oa.h_adapter,
     };
-    let _ = close(&mut ca);
+    // SAFETY: `ca` is a live local holding the adapter `open` returned; closed exactly once.
+    let _ = unsafe { close(&mut ca) };
     if st != 0 {
         return None; // pre-WDDM-2.7 driver: the query type doesn't exist ⇒ HAGS can't be on
     }
@@ -407,9 +433,7 @@ fn auto_priority_gate(device: &ID3D11Device) {
                 return;
             }
         };
-        // SAFETY: `hags_enabled` builds all its FFI arguments locally and closes the adapter
-        // handle before returning (see its own contract); `luid` is a plain value.
-        let hags = unsafe { hags_enabled(luid) };
+        let hags = hags_enabled(luid);
         match hags {
             Some(false) => {
                 // No HAGS ⇒ the NVENC-hang hazard cannot occur: take REALTIME outright.
