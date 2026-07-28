@@ -4,6 +4,14 @@
 # `screenshots` job, gated to STABLE RELEASE tags only. Standalone + best-effort: a failure here
 # reds nothing else. PNGs land as a 30-day artifact; not committed or published.
 name: android-screenshots
+# One pending run per workflow+ref: a newer push supersedes the queued/running one and cancels
+# it (a canary only needs the latest commit; each release tag is its own ref so tag runs never
+# cancel each other). Keeps a busy push cadence from piling ~10 queued runs per commit onto the
+# runner fleet. Gitea honors this for push triggers (PR triggers: see gitea#35933).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 
 on:
   push:

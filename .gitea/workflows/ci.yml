@@ -3,6 +3,14 @@
 # PipeWire, GL/GBM, libcuda link stub, pinned-channel rustup) so the workspace links the
 # same libs as the dev boxes. Apple client CI lives in apple.yml (macOS runner).
 name: ci
+# One pending run per workflow+ref: a newer push supersedes the queued/running one and cancels
+# it (a canary only needs the latest commit; each release tag is its own ref so tag runs never
+# cancel each other). Keeps a busy push cadence from piling ~10 queued runs per commit onto the
+# runner fleet. Gitea honors this for push triggers (PR triggers: see gitea#35933).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 
 on:
   push:
