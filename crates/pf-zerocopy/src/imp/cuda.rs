@@ -249,9 +249,14 @@ fn copy_stream() -> CUstream {
 /// (the source dmabuf is safe to recycle once this returns), but the wait is scoped to our own
 /// stream and the copy carries the high priority hint.
 unsafe fn copy_blocking(copy: &CUDA_MEMCPY2D, what: &str) -> Result<()> {
-    let stream = copy_stream();
-    ck(cuMemcpy2DAsync_v2(copy, stream), what)?;
-    ck(cuStreamSynchronize(stream), "cuStreamSynchronize")
+    // SAFETY: caller contract: the shared context is current and `copy` describes live, in-bounds
+    // device/host memory (each caller carries that proof). Wrapper -> live table; `&copy` outlives
+    // the synchronous call.
+    unsafe {
+        let stream = copy_stream();
+        ck(cuMemcpy2DAsync_v2(copy, stream), what)?;
+        ck(cuStreamSynchronize(stream), "cuStreamSynchronize")
+    }
 }
 
 /// Issue `copy` on this thread's priority stream WITHOUT waiting — for stream-ordered consumers
@@ -259,7 +264,10 @@ unsafe fn copy_blocking(copy: &CUDA_MEMCPY2D, what: &str) -> Result<()> {
 /// stream, not the CPU, orders completion, so the SOURCE must stay valid until the downstream
 /// stream work (the encode) has finished.
 unsafe fn copy_async(copy: &CUDA_MEMCPY2D, what: &str) -> Result<()> {
-    ck(cuMemcpy2DAsync_v2(copy, copy_stream()), what)
+    // SAFETY: caller contract: the shared context is current and `copy` describes live, in-bounds
+    // device/host memory that stays valid until the stream work completes (each caller carries that
+    // proof). Wrapper -> live table.
+    unsafe { ck(cuMemcpy2DAsync_v2(copy, copy_stream()), what) }
 }
 
 /// Block until everything enqueued on THIS THREAD's copy stream completed — the shared tail of
@@ -268,16 +276,23 @@ unsafe fn copy_async(copy: &CUDA_MEMCPY2D, what: &str) -> Result<()> {
 /// game's GPU load each exposed wait eats scheduling latency). The shared context must be
 /// current.
 unsafe fn sync_copy_stream() -> Result<()> {
-    ck(cuStreamSynchronize(copy_stream()), "cuStreamSynchronize")
+    // SAFETY: caller contract: the shared context is current. Wrapper -> live table; synchronizing
+    // the dedicated copy stream touches no Rust memory.
+    unsafe { ck(cuStreamSynchronize(copy_stream()), "cuStreamSynchronize") }
 }
 
 /// `copy_blocking` when `sync`, else `copy_async` — the shared tail of the public `copy_*_to_device`
 /// helpers, whose `sync: false` mode carries `copy_async`'s source-lifetime contract.
 unsafe fn copy_issue(copy: &CUDA_MEMCPY2D, what: &str, sync: bool) -> Result<()> {
-    if sync {
-        copy_blocking(copy, what)
-    } else {
-        copy_async(copy, what)
+    // SAFETY: caller contract: the shared context is current and `copy` describes live, in-bounds
+    // memory (each caller carries that proof). The stream handle is the once-created per-process
+    // copy stream. Wrapper -> live table.
+    unsafe {
+        if sync {
+            copy_blocking(copy, what)
+        } else {
+            copy_async(copy, what)
+        }
     }
 }
 
@@ -785,19 +800,24 @@ impl RegisteredTexture {
     /// The GL context and the shared CUDA context must both be current on this thread, and
     /// `texture` must be a valid `GL_TEXTURE_2D`.
     pub unsafe fn register_gl(texture: u32) -> Result<RegisteredTexture> {
-        const GL_TEXTURE_2D: c_uint = 0x0DE1;
-        const CU_GRAPHICS_REGISTER_FLAGS_READ_ONLY: c_uint = 0x01;
-        let mut resource: CUgraphicsResource = std::ptr::null_mut();
-        ck(
-            cuGraphicsGLRegisterImage(
-                &mut resource,
-                texture,
-                GL_TEXTURE_2D,
-                CU_GRAPHICS_REGISTER_FLAGS_READ_ONLY,
-            ),
-            "cuGraphicsGLRegisterImage",
-        )?;
-        Ok(RegisteredTexture { resource })
+        // SAFETY: caller contract: the GL context owning `texture` and the shared CUDA context are
+        // current on this thread, and `texture` is a live, complete GL texture. The out-param is a
+        // live stack local; wrapper -> live table.
+        unsafe {
+            const GL_TEXTURE_2D: c_uint = 0x0DE1;
+            const CU_GRAPHICS_REGISTER_FLAGS_READ_ONLY: c_uint = 0x01;
+            let mut resource: CUgraphicsResource = std::ptr::null_mut();
+            ck(
+                cuGraphicsGLRegisterImage(
+                    &mut resource,
+                    texture,
+                    GL_TEXTURE_2D,
+                    CU_GRAPHICS_REGISTER_FLAGS_READ_ONLY,
+                ),
+                "cuGraphicsGLRegisterImage",
+            )?;
+            Ok(RegisteredTexture { resource })
+        }
     }
 
     /// Map the texture for this frame, copy its (already-linear RGBA8) array into `dst`, then

@@ -10,7 +10,11 @@
 
 // Unsafe-proof program: every `unsafe {}` / `unsafe impl` must carry a `// SAFETY:` proof. Each
 // file keeps its own `#![deny(...)]` too; this crate-root deny is the catch-all gate.
+// `unsafe_op_in_unsafe_fn` closes the gap the clippy lint leaves: operations inside an
+// `unsafe fn` body are not "unsafe blocks", so without it ~45 functions' worth of raw driver
+// calls sat OUTSIDE the invariant this crate advertises.
 #![deny(clippy::undocumented_unsafe_blocks)]
+#![deny(unsafe_op_in_unsafe_fn)]
 
 /// Wait for a dmabuf's implicit read-ready fence (`DMA_BUF_IOCTL_EXPORT_SYNC_FILE` + poll).
 #[cfg(target_os = "linux")]

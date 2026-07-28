@@ -797,74 +797,80 @@ impl VkSlotBlend {
         gx: u32,
         gy: u32,
     ) -> Result<vk::CommandBuffer> {
-        let alloc = self
-            .slots
-            .get(id)
-            .ok_or_else(|| anyhow!("bad slot id {id}"))?;
-        let d = &self.device;
-        let cmd = alloc.cmd;
-        d.begin_command_buffer(
-            cmd,
-            &vk::CommandBufferBeginInfo::default()
-                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-        )
-        .context("begin blend cmd")?;
-        // CUDA wrote the frame into this memory outside Vulkan's view — make it visible to
-        // the shader (external-memory coherence ceremony; NVIDIA honors this with the
-        // fence/semaphore ordering alone, the barrier is the spec-shaped belt-and-braces).
-        let acquire = [vk::MemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
-            .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)];
-        d.cmd_pipeline_barrier(
-            cmd,
-            vk::PipelineStageFlags::TOP_OF_PIPE,
-            vk::PipelineStageFlags::COMPUTE_SHADER,
-            vk::DependencyFlags::empty(),
-            &acquire,
-            &[],
-            &[],
-        );
-        d.cmd_bind_pipeline(
-            cmd,
-            vk::PipelineBindPoint::COMPUTE,
-            self.pipelines[fmt.mode() as usize],
-        );
-        d.cmd_bind_descriptor_sets(
-            cmd,
-            vk::PipelineBindPoint::COMPUTE,
-            self.pipe_layout,
-            0,
-            &[alloc.desc],
-            &[],
-        );
-        let bytes = std::slice::from_raw_parts(
-            (push as *const Push) as *const u8,
-            std::mem::size_of::<Push>(),
-        );
-        d.cmd_push_constants(
-            cmd,
-            self.pipe_layout,
-            vk::ShaderStageFlags::COMPUTE,
-            0,
-            bytes,
-        );
-        d.cmd_dispatch(cmd, gx.max(1), gy.max(1), 1);
-        // Release the shader's writes so the downstream CUDA/NVENC reads (fence- or
-        // semaphore-ordered) see them.
-        let release = [vk::MemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-            .dst_access_mask(vk::AccessFlags::MEMORY_READ)];
-        d.cmd_pipeline_barrier(
-            cmd,
-            vk::PipelineStageFlags::COMPUTE_SHADER,
-            vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-            vk::DependencyFlags::empty(),
-            &release,
-            &[],
-            &[],
-        );
-        d.end_command_buffer(cmd).context("end blend cmd")?;
-        Ok(cmd)
+        // SAFETY: caller contract (`# Safety` above): the slot's previous submission completed, so
+        // its command buffer is re-recordable. Handles are owned by `self` on this single thread;
+        // `bytes` reborrows `push` (repr(C), size_of::<Push>()) for the synchronous push-constant
+        // copy; builder infos are locals outliving each call.
+        unsafe {
+            let alloc = self
+                .slots
+                .get(id)
+                .ok_or_else(|| anyhow!("bad slot id {id}"))?;
+            let d = &self.device;
+            let cmd = alloc.cmd;
+            d.begin_command_buffer(
+                cmd,
+                &vk::CommandBufferBeginInfo::default()
+                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+            )
+            .context("begin blend cmd")?;
+            // CUDA wrote the frame into this memory outside Vulkan's view — make it visible to
+            // the shader (external-memory coherence ceremony; NVIDIA honors this with the
+            // fence/semaphore ordering alone, the barrier is the spec-shaped belt-and-braces).
+            let acquire = [vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)];
+            d.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &acquire,
+                &[],
+                &[],
+            );
+            d.cmd_bind_pipeline(
+                cmd,
+                vk::PipelineBindPoint::COMPUTE,
+                self.pipelines[fmt.mode() as usize],
+            );
+            d.cmd_bind_descriptor_sets(
+                cmd,
+                vk::PipelineBindPoint::COMPUTE,
+                self.pipe_layout,
+                0,
+                &[alloc.desc],
+                &[],
+            );
+            let bytes = std::slice::from_raw_parts(
+                (push as *const Push) as *const u8,
+                std::mem::size_of::<Push>(),
+            );
+            d.cmd_push_constants(
+                cmd,
+                self.pipe_layout,
+                vk::ShaderStageFlags::COMPUTE,
+                0,
+                bytes,
+            );
+            d.cmd_dispatch(cmd, gx.max(1), gy.max(1), 1);
+            // Release the shader's writes so the downstream CUDA/NVENC reads (fence- or
+            // semaphore-ordered) see them.
+            let release = [vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::MEMORY_READ)];
+            d.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                vk::DependencyFlags::empty(),
+                &release,
+                &[],
+                &[],
+            );
+            d.end_command_buffer(cmd).context("end blend cmd")?;
+            Ok(cmd)
+        }
     }
 
     /// Blend the uploaded cursor into `slot` at `(ox, oy)`: record, submit, fence-wait. The

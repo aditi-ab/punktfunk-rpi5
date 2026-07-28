@@ -179,89 +179,98 @@ struct GlBlit {
 
 impl GlBlit {
     unsafe fn new(width: u32, height: u32) -> Result<GlBlit> {
-        // Declared before every GL name so it drops LAST on unwind — after the CUDA registration
-        // (declared below) has unregistered itself.
-        let mut guard = GlNameGuard::default();
-        let program = compile_program()?;
-        guard.programs.push(program);
-        let mut vao = 0u32;
-        glGenVertexArrays(1, &mut vao); // core profile needs a bound VAO for glDrawArrays
-        guard.vaos.push(vao);
-        let mut fbo = 0u32;
-        glGenFramebuffers(1, &mut fbo);
-        guard.fbos.push(fbo);
+        // SAFETY: caller contract (`import_inner`): the GL context and the shared CUDA context are
+        // current on this thread. Raw GL calls pass live locals whose pointers outlive each
+        // synchronous call; every created name is owned by `guard` until the struct exists.
+        unsafe {
+            // Declared before every GL name so it drops LAST on unwind — after the CUDA registration
+            // (declared below) has unregistered itself.
+            let mut guard = GlNameGuard::default();
+            let program = compile_program()?;
+            guard.programs.push(program);
+            let mut vao = 0u32;
+            glGenVertexArrays(1, &mut vao); // core profile needs a bound VAO for glDrawArrays
+            guard.vaos.push(vao);
+            let mut fbo = 0u32;
+            glGenFramebuffers(1, &mut fbo);
+            guard.fbos.push(fbo);
 
-        let mut dst_tex = 0u32;
-        glGenTextures(1, &mut dst_tex);
-        guard.textures.push(dst_tex);
-        glBindTexture(GL_TEXTURE_2D, dst_tex);
-        glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, width as c_int, height as c_int);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+            let mut dst_tex = 0u32;
+            glGenTextures(1, &mut dst_tex);
+            guard.textures.push(dst_tex);
+            glBindTexture(GL_TEXTURE_2D, dst_tex);
+            glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, width as c_int, height as c_int);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 
-        let mut src_tex = 0u32;
-        glGenTextures(1, &mut src_tex);
-        guard.textures.push(src_tex);
-        glBindTexture(GL_TEXTURE_2D, src_tex);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        glBindTexture(GL_TEXTURE_2D, 0);
+            let mut src_tex = 0u32;
+            glGenTextures(1, &mut src_tex);
+            guard.textures.push(src_tex);
+            glBindTexture(GL_TEXTURE_2D, src_tex);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glBindTexture(GL_TEXTURE_2D, 0);
 
-        glBindFramebuffer(GL_FRAMEBUFFER, fbo);
-        glFramebufferTexture2D(
-            GL_FRAMEBUFFER,
-            GL_COLOR_ATTACHMENT0,
-            GL_TEXTURE_2D,
-            dst_tex,
-            0,
-        );
-        let status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
-        glBindFramebuffer(GL_FRAMEBUFFER, 0);
-        ensure!(
-            status == GL_FRAMEBUFFER_COMPLETE,
-            "blit FBO incomplete ({status:#x})"
-        );
-        // Register the (immutable, reused) destination texture with CUDA once, and stand up the
-        // device-buffer pool — both per-resolution, not per-frame. Requires the CUDA context to be
-        // current (the caller makes it current before constructing the blit).
-        let registered = cuda::RegisteredTexture::register_gl(dst_tex)?;
-        let pool = cuda::BufferPool::new(width, height)?;
-        guard.defuse();
-        Ok(GlBlit {
-            program,
-            vao,
-            fbo,
-            dst_tex,
-            src_tex,
-            width,
-            height,
-            registered,
-            pool,
-        })
+            glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+            glFramebufferTexture2D(
+                GL_FRAMEBUFFER,
+                GL_COLOR_ATTACHMENT0,
+                GL_TEXTURE_2D,
+                dst_tex,
+                0,
+            );
+            let status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+            ensure!(
+                status == GL_FRAMEBUFFER_COMPLETE,
+                "blit FBO incomplete ({status:#x})"
+            );
+            // Register the (immutable, reused) destination texture with CUDA once, and stand up the
+            // device-buffer pool — both per-resolution, not per-frame. Requires the CUDA context to be
+            // current (the caller makes it current before constructing the blit).
+            let registered = cuda::RegisteredTexture::register_gl(dst_tex)?;
+            let pool = cuda::BufferPool::new(width, height)?;
+            guard.defuse();
+            Ok(GlBlit {
+                program,
+                vao,
+                fbo,
+                dst_tex,
+                src_tex,
+                width,
+                height,
+                registered,
+                pool,
+            })
+        }
     }
 
     /// Bind `image` to the source texture and render it into `dst_tex`.
     ///
     /// # Safety: the GL context is current on this thread; `image` is a valid `EGLImage`.
     unsafe fn run(&self, egl_image_target: EglImageTargetFn, image: *mut c_void) -> Result<()> {
-        glBindTexture(GL_TEXTURE_2D, self.src_tex);
-        let _ = glGetError();
-        egl_image_target(GL_TEXTURE_2D, image);
-        let e = glGetError();
-        glBindTexture(GL_TEXTURE_2D, 0);
-        ensure!(e == 0, "glEGLImageTargetTexture2DOES failed ({e:#x})");
+        // SAFETY: caller contract (`# Safety` above): GL context current, `image` a valid EGLImage.
+        // Raw GL calls pass names owned by `self`, created on this same context.
+        unsafe {
+            glBindTexture(GL_TEXTURE_2D, self.src_tex);
+            let _ = glGetError();
+            egl_image_target(GL_TEXTURE_2D, image);
+            let e = glGetError();
+            glBindTexture(GL_TEXTURE_2D, 0);
+            ensure!(e == 0, "glEGLImageTargetTexture2DOES failed ({e:#x})");
 
-        glBindFramebuffer(GL_FRAMEBUFFER, self.fbo);
-        glViewport(0, 0, self.width as c_int, self.height as c_int);
-        glUseProgram(self.program);
-        glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, self.src_tex);
-        glBindVertexArray(self.vao);
-        glDrawArrays(GL_TRIANGLES, 0, 3);
-        glBindVertexArray(0);
-        glBindFramebuffer(GL_FRAMEBUFFER, 0);
-        glFlush(); // submit GL work before CUDA maps the texture
-        Ok(())
+            glBindFramebuffer(GL_FRAMEBUFFER, self.fbo);
+            glViewport(0, 0, self.width as c_int, self.height as c_int);
+            glUseProgram(self.program);
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, self.src_tex);
+            glBindVertexArray(self.vao);
+            glDrawArrays(GL_TRIANGLES, 0, 3);
+            glBindVertexArray(0);
+            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+            glFlush(); // submit GL work before CUDA maps the texture
+            Ok(())
+        }
     }
 }
 
@@ -319,102 +328,111 @@ struct Nv12Blit {
 
 impl Nv12Blit {
     unsafe fn new(width: u32, height: u32) -> Result<Nv12Blit> {
-        ensure!(
-            width % 2 == 0 && height % 2 == 0,
-            "NV12 convert needs even dimensions (got {width}x{height})"
-        );
-        // Declared before every GL name so it drops LAST on unwind — after the CUDA registrations
-        // (declared below) have unregistered themselves.
-        let mut guard = GlNameGuard::default();
-        let y_program = compile_program_with(FRAG_Y_SRC)?;
-        guard.programs.push(y_program);
-        let uv_program = compile_program_with(FRAG_UV_SRC)?;
-        guard.programs.push(uv_program);
-        let mut vao = 0u32;
-        glGenVertexArrays(1, &mut vao);
-        guard.vaos.push(vao);
-        let mut fbos = [0u32; 2];
-        glGenFramebuffers(2, fbos.as_mut_ptr());
-        guard.fbos.extend_from_slice(&fbos);
-        let (y_fbo, uv_fbo) = (fbos[0], fbos[1]);
-
-        // Luma target: GL_R8 at full resolution.
-        let mut y_tex = 0u32;
-        glGenTextures(1, &mut y_tex);
-        guard.textures.push(y_tex);
-        glBindTexture(GL_TEXTURE_2D, y_tex);
-        glTexStorage2D(GL_TEXTURE_2D, 1, GL_R8, width as c_int, height as c_int);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-
-        // Chroma target: GL_RG8 at half resolution (R=U, G=V).
-        let mut uv_tex = 0u32;
-        glGenTextures(1, &mut uv_tex);
-        guard.textures.push(uv_tex);
-        glBindTexture(GL_TEXTURE_2D, uv_tex);
-        glTexStorage2D(
-            GL_TEXTURE_2D,
-            1,
-            GL_RG8,
-            (width / 2) as c_int,
-            (height / 2) as c_int,
-        );
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-
-        // Source: GL_LINEAR so the half-res UV pass averages the 2×2 chroma footprint.
-        let mut src_tex = 0u32;
-        glGenTextures(1, &mut src_tex);
-        guard.textures.push(src_tex);
-        glBindTexture(GL_TEXTURE_2D, src_tex);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        glBindTexture(GL_TEXTURE_2D, 0);
-
-        for (fbo, tex) in [(y_fbo, y_tex), (uv_fbo, uv_tex)] {
-            glBindFramebuffer(GL_FRAMEBUFFER, fbo);
-            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
-            let status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
-            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        // SAFETY: caller contract (`import_inner`): the GL context and the shared CUDA context are
+        // current on this thread. Raw GL calls pass live locals whose pointers outlive each
+        // synchronous call; every created name is owned by `guard` until the struct exists.
+        unsafe {
             ensure!(
-                status == GL_FRAMEBUFFER_COMPLETE,
-                "NV12 blit FBO incomplete ({status:#x}) — GL_R8/GL_RG8 not renderable?"
+                width % 2 == 0 && height % 2 == 0,
+                "NV12 convert needs even dimensions (got {width}x{height})"
             );
+            // Declared before every GL name so it drops LAST on unwind — after the CUDA registrations
+            // (declared below) have unregistered themselves.
+            let mut guard = GlNameGuard::default();
+            let y_program = compile_program_with(FRAG_Y_SRC)?;
+            guard.programs.push(y_program);
+            let uv_program = compile_program_with(FRAG_UV_SRC)?;
+            guard.programs.push(uv_program);
+            let mut vao = 0u32;
+            glGenVertexArrays(1, &mut vao);
+            guard.vaos.push(vao);
+            let mut fbos = [0u32; 2];
+            glGenFramebuffers(2, fbos.as_mut_ptr());
+            guard.fbos.extend_from_slice(&fbos);
+            let (y_fbo, uv_fbo) = (fbos[0], fbos[1]);
+
+            // Luma target: GL_R8 at full resolution.
+            let mut y_tex = 0u32;
+            glGenTextures(1, &mut y_tex);
+            guard.textures.push(y_tex);
+            glBindTexture(GL_TEXTURE_2D, y_tex);
+            glTexStorage2D(GL_TEXTURE_2D, 1, GL_R8, width as c_int, height as c_int);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+
+            // Chroma target: GL_RG8 at half resolution (R=U, G=V).
+            let mut uv_tex = 0u32;
+            glGenTextures(1, &mut uv_tex);
+            guard.textures.push(uv_tex);
+            glBindTexture(GL_TEXTURE_2D, uv_tex);
+            glTexStorage2D(
+                GL_TEXTURE_2D,
+                1,
+                GL_RG8,
+                (width / 2) as c_int,
+                (height / 2) as c_int,
+            );
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+
+            // Source: GL_LINEAR so the half-res UV pass averages the 2×2 chroma footprint.
+            let mut src_tex = 0u32;
+            glGenTextures(1, &mut src_tex);
+            guard.textures.push(src_tex);
+            glBindTexture(GL_TEXTURE_2D, src_tex);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glBindTexture(GL_TEXTURE_2D, 0);
+
+            for (fbo, tex) in [(y_fbo, y_tex), (uv_fbo, uv_tex)] {
+                glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+                glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+                let status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+                glBindFramebuffer(GL_FRAMEBUFFER, 0);
+                ensure!(
+                    status == GL_FRAMEBUFFER_COMPLETE,
+                    "NV12 blit FBO incomplete ({status:#x}) — GL_R8/GL_RG8 not renderable?"
+                );
+            }
+            // Register both convert targets with CUDA once (per-resolution), + the NV12 two-plane pool.
+            let y_registered = cuda::RegisteredTexture::register_gl(y_tex)?;
+            let uv_registered = cuda::RegisteredTexture::register_gl(uv_tex)?;
+            let pool = cuda::BufferPool::new_nv12(width, height)?;
+            guard.defuse();
+            Ok(Nv12Blit {
+                y_program,
+                uv_program,
+                vao,
+                y_fbo,
+                uv_fbo,
+                y_tex,
+                uv_tex,
+                src_tex,
+                width,
+                height,
+                y_registered,
+                uv_registered,
+                pool,
+                test_src_storage: false,
+            })
         }
-        // Register both convert targets with CUDA once (per-resolution), + the NV12 two-plane pool.
-        let y_registered = cuda::RegisteredTexture::register_gl(y_tex)?;
-        let uv_registered = cuda::RegisteredTexture::register_gl(uv_tex)?;
-        let pool = cuda::BufferPool::new_nv12(width, height)?;
-        guard.defuse();
-        Ok(Nv12Blit {
-            y_program,
-            uv_program,
-            vao,
-            y_fbo,
-            uv_fbo,
-            y_tex,
-            uv_tex,
-            src_tex,
-            width,
-            height,
-            y_registered,
-            uv_registered,
-            pool,
-            test_src_storage: false,
-        })
     }
 
     /// Bind `image` to the source texture and run both convert passes into `y_tex`/`uv_tex`.
     ///
     /// # Safety: the GL context is current on this thread; `image` is a valid `EGLImage`.
     unsafe fn run(&self, egl_image_target: EglImageTargetFn, image: *mut c_void) -> Result<()> {
-        glBindTexture(GL_TEXTURE_2D, self.src_tex);
-        let _ = glGetError();
-        egl_image_target(GL_TEXTURE_2D, image);
-        let e = glGetError();
-        glBindTexture(GL_TEXTURE_2D, 0);
-        ensure!(e == 0, "glEGLImageTargetTexture2DOES failed ({e:#x})");
-        self.run_passes()
+        // SAFETY: caller contract (`# Safety` above): GL context current, `image` a valid EGLImage.
+        // Raw GL calls pass names owned by `self`, created on this same context.
+        unsafe {
+            glBindTexture(GL_TEXTURE_2D, self.src_tex);
+            let _ = glGetError();
+            egl_image_target(GL_TEXTURE_2D, image);
+            let e = glGetError();
+            glBindTexture(GL_TEXTURE_2D, 0);
+            ensure!(e == 0, "glEGLImageTargetTexture2DOES failed ({e:#x})");
+            self.run_passes()
+        }
     }
 
     /// Run the two convert passes from whatever is currently in `src_tex` (caller populated it).
@@ -422,25 +440,29 @@ impl Nv12Blit {
     ///
     /// # Safety: the GL context is current on this thread.
     unsafe fn run_passes(&self) -> Result<()> {
-        glActiveTexture(GL_TEXTURE0);
-        glBindVertexArray(self.vao);
-        // Y pass: full-res into the R8 target.
-        glBindFramebuffer(GL_FRAMEBUFFER, self.y_fbo);
-        glViewport(0, 0, self.width as c_int, self.height as c_int);
-        glUseProgram(self.y_program);
-        glBindTexture(GL_TEXTURE_2D, self.src_tex);
-        glDrawArrays(GL_TRIANGLES, 0, 3);
-        // UV pass: half-res into the RG8 target (GL_LINEAR averages the 2×2).
-        glBindFramebuffer(GL_FRAMEBUFFER, self.uv_fbo);
-        glViewport(0, 0, (self.width / 2) as c_int, (self.height / 2) as c_int);
-        glUseProgram(self.uv_program);
-        glBindTexture(GL_TEXTURE_2D, self.src_tex);
-        glDrawArrays(GL_TRIANGLES, 0, 3);
+        // SAFETY: caller contract (`# Safety` above): GL context current. Raw GL calls pass names
+        // owned by `self`, created on this same context.
+        unsafe {
+            glActiveTexture(GL_TEXTURE0);
+            glBindVertexArray(self.vao);
+            // Y pass: full-res into the R8 target.
+            glBindFramebuffer(GL_FRAMEBUFFER, self.y_fbo);
+            glViewport(0, 0, self.width as c_int, self.height as c_int);
+            glUseProgram(self.y_program);
+            glBindTexture(GL_TEXTURE_2D, self.src_tex);
+            glDrawArrays(GL_TRIANGLES, 0, 3);
+            // UV pass: half-res into the RG8 target (GL_LINEAR averages the 2×2).
+            glBindFramebuffer(GL_FRAMEBUFFER, self.uv_fbo);
+            glViewport(0, 0, (self.width / 2) as c_int, (self.height / 2) as c_int);
+            glUseProgram(self.uv_program);
+            glBindTexture(GL_TEXTURE_2D, self.src_tex);
+            glDrawArrays(GL_TRIANGLES, 0, 3);
 
-        glBindVertexArray(0);
-        glBindFramebuffer(GL_FRAMEBUFFER, 0);
-        glFlush(); // submit GL work before CUDA maps the textures
-        Ok(())
+            glBindVertexArray(0);
+            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+            glFlush(); // submit GL work before CUDA maps the textures
+            Ok(())
+        }
     }
 }
 
@@ -498,100 +520,110 @@ struct Yuv444Blit {
 
 impl Yuv444Blit {
     unsafe fn new(width: u32, height: u32) -> Result<Yuv444Blit> {
-        ensure!(
-            width % 2 == 0 && height % 2 == 0,
-            "YUV444 convert needs even dimensions (got {width}x{height})"
-        );
-        let full_range = std::env::var("PUNKTFUNK_444_FULLRANGE").is_ok_and(|v| v.trim() == "1");
-        let (y_src, u_src, v_src) = yuv444_frag_sources(full_range);
-        // Declared before every GL name so it drops LAST on unwind — after the CUDA registrations
-        // (declared below) have unregistered themselves.
-        let mut guard = GlNameGuard::default();
-        let mut programs = [0u32; 3];
-        for (p, src) in programs.iter_mut().zip([&y_src, &u_src, &v_src]) {
-            *p = compile_program_with(src)?;
-            guard.programs.push(*p);
-        }
-        let mut vao = 0u32;
-        glGenVertexArrays(1, &mut vao);
-        guard.vaos.push(vao);
-        let mut fbos = [0u32; 3];
-        glGenFramebuffers(3, fbos.as_mut_ptr());
-        guard.fbos.extend_from_slice(&fbos);
-        let mut texs = [0u32; 3];
-        glGenTextures(3, texs.as_mut_ptr());
-        guard.textures.extend_from_slice(&texs);
-        for &tex in &texs {
-            glBindTexture(GL_TEXTURE_2D, tex);
-            glTexStorage2D(GL_TEXTURE_2D, 1, GL_R8, width as c_int, height as c_int);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-        }
-        // Source: LINEAR is exact at the 1:1 mapping every pass uses (texel centres), matching
-        // the Nv12Blit source setup.
-        let mut src_tex = 0u32;
-        glGenTextures(1, &mut src_tex);
-        guard.textures.push(src_tex);
-        glBindTexture(GL_TEXTURE_2D, src_tex);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        glBindTexture(GL_TEXTURE_2D, 0);
-        for (&fbo, &tex) in fbos.iter().zip(&texs) {
-            glBindFramebuffer(GL_FRAMEBUFFER, fbo);
-            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
-            let status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
-            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        // SAFETY: caller contract (`import_inner`): the GL context and the shared CUDA context are
+        // current on this thread. Raw GL calls pass live locals whose pointers outlive each
+        // synchronous call; every created name is owned by `guard` until the struct exists.
+        unsafe {
             ensure!(
-                status == GL_FRAMEBUFFER_COMPLETE,
-                "YUV444 blit FBO incomplete ({status:#x}) — GL_R8 not renderable?"
+                width % 2 == 0 && height % 2 == 0,
+                "YUV444 convert needs even dimensions (got {width}x{height})"
             );
+            let full_range =
+                std::env::var("PUNKTFUNK_444_FULLRANGE").is_ok_and(|v| v.trim() == "1");
+            let (y_src, u_src, v_src) = yuv444_frag_sources(full_range);
+            // Declared before every GL name so it drops LAST on unwind — after the CUDA registrations
+            // (declared below) have unregistered themselves.
+            let mut guard = GlNameGuard::default();
+            let mut programs = [0u32; 3];
+            for (p, src) in programs.iter_mut().zip([&y_src, &u_src, &v_src]) {
+                *p = compile_program_with(src)?;
+                guard.programs.push(*p);
+            }
+            let mut vao = 0u32;
+            glGenVertexArrays(1, &mut vao);
+            guard.vaos.push(vao);
+            let mut fbos = [0u32; 3];
+            glGenFramebuffers(3, fbos.as_mut_ptr());
+            guard.fbos.extend_from_slice(&fbos);
+            let mut texs = [0u32; 3];
+            glGenTextures(3, texs.as_mut_ptr());
+            guard.textures.extend_from_slice(&texs);
+            for &tex in &texs {
+                glBindTexture(GL_TEXTURE_2D, tex);
+                glTexStorage2D(GL_TEXTURE_2D, 1, GL_R8, width as c_int, height as c_int);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+            }
+            // Source: LINEAR is exact at the 1:1 mapping every pass uses (texel centres), matching
+            // the Nv12Blit source setup.
+            let mut src_tex = 0u32;
+            glGenTextures(1, &mut src_tex);
+            guard.textures.push(src_tex);
+            glBindTexture(GL_TEXTURE_2D, src_tex);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glBindTexture(GL_TEXTURE_2D, 0);
+            for (&fbo, &tex) in fbos.iter().zip(&texs) {
+                glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+                glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+                let status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+                glBindFramebuffer(GL_FRAMEBUFFER, 0);
+                ensure!(
+                    status == GL_FRAMEBUFFER_COMPLETE,
+                    "YUV444 blit FBO incomplete ({status:#x}) — GL_R8 not renderable?"
+                );
+            }
+            let registered = [
+                cuda::RegisteredTexture::register_gl(texs[0])?,
+                cuda::RegisteredTexture::register_gl(texs[1])?,
+                cuda::RegisteredTexture::register_gl(texs[2])?,
+            ];
+            let pool = cuda::BufferPool::new_yuv444(width, height)?;
+            guard.defuse();
+            if full_range {
+                tracing::info!("YUV444 zero-copy convert: FULL range (PUNKTFUNK_444_FULLRANGE=1)");
+            }
+            Ok(Yuv444Blit {
+                programs,
+                vao,
+                fbos,
+                texs,
+                src_tex,
+                width,
+                height,
+                registered,
+                pool,
+            })
         }
-        let registered = [
-            cuda::RegisteredTexture::register_gl(texs[0])?,
-            cuda::RegisteredTexture::register_gl(texs[1])?,
-            cuda::RegisteredTexture::register_gl(texs[2])?,
-        ];
-        let pool = cuda::BufferPool::new_yuv444(width, height)?;
-        guard.defuse();
-        if full_range {
-            tracing::info!("YUV444 zero-copy convert: FULL range (PUNKTFUNK_444_FULLRANGE=1)");
-        }
-        Ok(Yuv444Blit {
-            programs,
-            vao,
-            fbos,
-            texs,
-            src_tex,
-            width,
-            height,
-            registered,
-            pool,
-        })
     }
 
     /// Bind `image` to the source texture and run the three plane passes.
     ///
     /// # Safety: the GL context is current on this thread; `image` is a valid `EGLImage`.
     unsafe fn run(&self, egl_image_target: EglImageTargetFn, image: *mut c_void) -> Result<()> {
-        glBindTexture(GL_TEXTURE_2D, self.src_tex);
-        let _ = glGetError();
-        egl_image_target(GL_TEXTURE_2D, image);
-        let e = glGetError();
-        glBindTexture(GL_TEXTURE_2D, 0);
-        ensure!(e == 0, "glEGLImageTargetTexture2DOES failed ({e:#x})");
-        glActiveTexture(GL_TEXTURE0);
-        glBindVertexArray(self.vao);
-        for (&fbo, &program) in self.fbos.iter().zip(&self.programs) {
-            glBindFramebuffer(GL_FRAMEBUFFER, fbo);
-            glViewport(0, 0, self.width as c_int, self.height as c_int);
-            glUseProgram(program);
+        // SAFETY: caller contract (`# Safety` above): GL context current, `image` a valid EGLImage.
+        // Raw GL calls pass names owned by `self`, created on this same context.
+        unsafe {
             glBindTexture(GL_TEXTURE_2D, self.src_tex);
-            glDrawArrays(GL_TRIANGLES, 0, 3);
+            let _ = glGetError();
+            egl_image_target(GL_TEXTURE_2D, image);
+            let e = glGetError();
+            glBindTexture(GL_TEXTURE_2D, 0);
+            ensure!(e == 0, "glEGLImageTargetTexture2DOES failed ({e:#x})");
+            glActiveTexture(GL_TEXTURE0);
+            glBindVertexArray(self.vao);
+            for (&fbo, &program) in self.fbos.iter().zip(&self.programs) {
+                glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+                glViewport(0, 0, self.width as c_int, self.height as c_int);
+                glUseProgram(program);
+                glBindTexture(GL_TEXTURE_2D, self.src_tex);
+                glDrawArrays(GL_TRIANGLES, 0, 3);
+            }
+            glBindVertexArray(0);
+            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+            glFlush(); // submit GL work before CUDA maps the textures
+            Ok(())
         }
-        glBindVertexArray(0);
-        glBindFramebuffer(GL_FRAMEBUFFER, 0);
-        glFlush(); // submit GL work before CUDA maps the textures
-        Ok(())
     }
 }
 

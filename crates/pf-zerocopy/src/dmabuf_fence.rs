@@ -11,7 +11,7 @@
 //! fd we can `poll()` — readable once the producer's writes complete. This makes zero-copy capture
 //! race-free WITHOUT the producer doing anything, *iff* the driver actually attaches the fence. If it
 //! attaches none, the export yields an already-signaled sync_file (poll returns immediately) — no
-//! wait, no harm, and [`WaitOutcome::NoFence`] tells us the driver doesn't fence (so zero-copy
+//! wait, no harm, and `WaitOutcome::NoFence` tells us the driver doesn't fence (so zero-copy
 //! would still race).
 
 // Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).

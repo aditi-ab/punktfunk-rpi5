@@ -148,60 +148,71 @@ pub(crate) fn yuv444_frag_sources(full_range: bool) -> (Vec<u8>, Vec<u8>, Vec<u8
 }
 
 pub(crate) unsafe fn compile_shader(kind: u32, src: &[u8]) -> Result<u32> {
-    let sh = glCreateShader(kind);
-    ensure!(sh != 0, "glCreateShader failed");
-    let ptr = src.as_ptr() as *const i8;
-    let len = src.len() as c_int;
-    glShaderSource(sh, 1, &ptr, &len);
-    glCompileShader(sh);
-    let mut ok: c_int = 0;
-    glGetShaderiv(sh, GL_COMPILE_STATUS, &mut ok);
-    if ok == 0 {
-        glDeleteShader(sh);
-        bail!("GL shader compile failed");
+    // SAFETY: caller contract: the GL context is current on this thread. `src` is a live slice; its
+    // pointer/length locals outlive the synchronous `glShaderSource`; the shader name is deleted on
+    // the compile-failure path.
+    unsafe {
+        let sh = glCreateShader(kind);
+        ensure!(sh != 0, "glCreateShader failed");
+        let ptr = src.as_ptr() as *const i8;
+        let len = src.len() as c_int;
+        glShaderSource(sh, 1, &ptr, &len);
+        glCompileShader(sh);
+        let mut ok: c_int = 0;
+        glGetShaderiv(sh, GL_COMPILE_STATUS, &mut ok);
+        if ok == 0 {
+            glDeleteShader(sh);
+            bail!("GL shader compile failed");
+        }
+        Ok(sh)
     }
-    Ok(sh)
 }
 
 /// Compile+link the fullscreen-triangle program with fragment source `frag` and bind its `image`
 /// sampler to texture unit 0.
 pub(crate) unsafe fn compile_program_with(frag: &[u8]) -> Result<u32> {
-    // Callers retry per frame, so every error path below must delete what it created — a leak
-    // here is unbounded, not one-shot.
-    let vs = compile_shader(GL_VERTEX_SHADER, VERT_SRC)?;
-    let fs = match compile_shader(GL_FRAGMENT_SHADER, frag) {
-        Ok(fs) => fs,
-        Err(e) => {
+    // SAFETY: caller contract: the GL context is current on this thread. All names are created here
+    // and deleted on every failure path; `c"image"` is a valid NUL-terminated literal.
+    unsafe {
+        // Callers retry per frame, so every error path below must delete what it created — a leak
+        // here is unbounded, not one-shot.
+        let vs = compile_shader(GL_VERTEX_SHADER, VERT_SRC)?;
+        let fs = match compile_shader(GL_FRAGMENT_SHADER, frag) {
+            Ok(fs) => fs,
+            Err(e) => {
+                glDeleteShader(vs);
+                return Err(e);
+            }
+        };
+        let prog = glCreateProgram();
+        if prog == 0 {
             glDeleteShader(vs);
-            return Err(e);
+            glDeleteShader(fs);
+            bail!("glCreateProgram failed");
         }
-    };
-    let prog = glCreateProgram();
-    if prog == 0 {
+        glAttachShader(prog, vs);
+        glAttachShader(prog, fs);
+        glLinkProgram(prog);
         glDeleteShader(vs);
         glDeleteShader(fs);
-        bail!("glCreateProgram failed");
+        let mut ok: c_int = 0;
+        glGetProgramiv(prog, GL_LINK_STATUS, &mut ok);
+        if ok == 0 {
+            glDeleteProgram(prog);
+            bail!("GL program link failed");
+        }
+        glUseProgram(prog);
+        let loc = glGetUniformLocation(prog, c"image".as_ptr());
+        if loc >= 0 {
+            glUniform1i(loc, 0); // sampler -> texture unit 0
+        }
+        glUseProgram(0);
+        Ok(prog)
     }
-    glAttachShader(prog, vs);
-    glAttachShader(prog, fs);
-    glLinkProgram(prog);
-    glDeleteShader(vs);
-    glDeleteShader(fs);
-    let mut ok: c_int = 0;
-    glGetProgramiv(prog, GL_LINK_STATUS, &mut ok);
-    if ok == 0 {
-        glDeleteProgram(prog);
-        bail!("GL program link failed");
-    }
-    glUseProgram(prog);
-    let loc = glGetUniformLocation(prog, c"image".as_ptr());
-    if loc >= 0 {
-        glUniform1i(loc, 0); // sampler -> texture unit 0
-    }
-    glUseProgram(0);
-    Ok(prog)
 }
 
 pub(crate) unsafe fn compile_program() -> Result<u32> {
-    compile_program_with(FRAG_SRC)
+    // SAFETY: caller contract: the GL context is current on this thread (forwarded to
+    // `compile_program_with`).
+    unsafe { compile_program_with(FRAG_SRC) }
 }

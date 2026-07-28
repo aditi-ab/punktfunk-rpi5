@@ -307,13 +307,19 @@ pub(crate) fn cuda_api() -> Option<&'static CudaApi> {
 // present; every other entry runs after `context()` succeeded, so its wrapper always hits `Some`.
 pub(crate) unsafe fn cuInit(flags: c_uint) -> CUresult {
     match cuda_api() {
-        Some(a) => (a.cuInit)(flags),
+        // SAFETY: forwards this unsafe wrapper's arguments to the live dlopen'd entry point (the
+        // table is never unloaded — `mem::forget(lib)`); the caller upholds the driver-API contract,
+        // with the site-specific proof at each call site.
+        Some(a) => unsafe { (a.cuInit)(flags) },
         None => CU_ERROR_NOT_LOADED,
     }
 }
 pub(crate) unsafe fn cuDeviceGet(device: *mut CUdevice, ordinal: c_int) -> CUresult {
     match cuda_api() {
-        Some(a) => (a.cuDeviceGet)(device, ordinal),
+        // SAFETY: forwards this unsafe wrapper's arguments to the live dlopen'd entry point (the
+        // table is never unloaded — `mem::forget(lib)`); the caller upholds the driver-API contract,
+        // with the site-specific proof at each call site.
+        Some(a) => unsafe { (a.cuDeviceGet)(device, ordinal) },
         None => CU_ERROR_NOT_LOADED,
     }
 }
@@ -323,19 +329,28 @@ pub(crate) unsafe fn cuCtxCreate_v2(
     dev: CUdevice,
 ) -> CUresult {
     match cuda_api() {
-        Some(a) => (a.cuCtxCreate_v2)(pctx, flags, dev),
+        // SAFETY: forwards this unsafe wrapper's arguments to the live dlopen'd entry point (the
+        // table is never unloaded — `mem::forget(lib)`); the caller upholds the driver-API contract,
+        // with the site-specific proof at each call site.
+        Some(a) => unsafe { (a.cuCtxCreate_v2)(pctx, flags, dev) },
         None => CU_ERROR_NOT_LOADED,
     }
 }
 pub(crate) unsafe fn cuCtxDestroy_v2(ctx: CUcontext) -> CUresult {
     match cuda_api() {
-        Some(a) => (a.cuCtxDestroy_v2)(ctx),
+        // SAFETY: forwards this unsafe wrapper's arguments to the live dlopen'd entry point (the
+        // table is never unloaded — `mem::forget(lib)`); the caller upholds the driver-API contract,
+        // with the site-specific proof at each call site.
+        Some(a) => unsafe { (a.cuCtxDestroy_v2)(ctx) },
         None => CU_ERROR_NOT_LOADED,
     }
 }
 pub(crate) unsafe fn cuCtxSetCurrent(ctx: CUcontext) -> CUresult {
     match cuda_api() {
-        Some(a) => (a.cuCtxSetCurrent)(ctx),
+        // SAFETY: forwards this unsafe wrapper's arguments to the live dlopen'd entry point (the
+        // table is never unloaded — `mem::forget(lib)`); the caller upholds the driver-API contract,
+        // with the site-specific proof at each call site.
+        Some(a) => unsafe { (a.cuCtxSetCurrent)(ctx) },
         None => CU_ERROR_NOT_LOADED,
     }
 }
@@ -347,25 +362,39 @@ pub(crate) unsafe fn cuMemAllocPitch_v2(
     element_size: c_uint,
 ) -> CUresult {
     match cuda_api() {
-        Some(a) => (a.cuMemAllocPitch_v2)(dptr, pitch, width_bytes, height, element_size),
+        // SAFETY: forwards this unsafe wrapper's arguments to the live dlopen'd entry point (the
+        // table is never unloaded — `mem::forget(lib)`); the caller upholds the driver-API contract,
+        // with the site-specific proof at each call site.
+        Some(a) => unsafe {
+            (a.cuMemAllocPitch_v2)(dptr, pitch, width_bytes, height, element_size)
+        },
         None => CU_ERROR_NOT_LOADED,
     }
 }
 pub(crate) unsafe fn cuMemFree_v2(dptr: CUdeviceptr) -> CUresult {
     match cuda_api() {
-        Some(a) => (a.cuMemFree_v2)(dptr),
+        // SAFETY: forwards this unsafe wrapper's arguments to the live dlopen'd entry point (the
+        // table is never unloaded — `mem::forget(lib)`); the caller upholds the driver-API contract,
+        // with the site-specific proof at each call site.
+        Some(a) => unsafe { (a.cuMemFree_v2)(dptr) },
         None => CU_ERROR_NOT_LOADED,
     }
 }
 pub(crate) unsafe fn cuMemcpy2DAsync_v2(copy: *const CUDA_MEMCPY2D, stream: CUstream) -> CUresult {
     match cuda_api() {
-        Some(a) => (a.cuMemcpy2DAsync_v2)(copy, stream),
+        // SAFETY: forwards this unsafe wrapper's arguments to the live dlopen'd entry point (the
+        // table is never unloaded — `mem::forget(lib)`); the caller upholds the driver-API contract,
+        // with the site-specific proof at each call site.
+        Some(a) => unsafe { (a.cuMemcpy2DAsync_v2)(copy, stream) },
         None => CU_ERROR_NOT_LOADED,
     }
 }
 pub(crate) unsafe fn cuStreamSynchronize(stream: CUstream) -> CUresult {
     match cuda_api() {
-        Some(a) => (a.cuStreamSynchronize)(stream),
+        // SAFETY: forwards this unsafe wrapper's arguments to the live dlopen'd entry point (the
+        // table is never unloaded — `mem::forget(lib)`); the caller upholds the driver-API contract,
+        // with the site-specific proof at each call site.
+        Some(a) => unsafe { (a.cuStreamSynchronize)(stream) },
         None => CU_ERROR_NOT_LOADED,
     }
 }
@@ -374,7 +403,10 @@ pub(crate) unsafe fn cuCtxGetStreamPriorityRange(
     greatest: *mut c_int,
 ) -> CUresult {
     match cuda_api() {
-        Some(a) => (a.cuCtxGetStreamPriorityRange)(least, greatest),
+        // SAFETY: forwards this unsafe wrapper's arguments to the live dlopen'd entry point (the
+        // table is never unloaded — `mem::forget(lib)`); the caller upholds the driver-API contract,
+        // with the site-specific proof at each call site.
+        Some(a) => unsafe { (a.cuCtxGetStreamPriorityRange)(least, greatest) },
         None => CU_ERROR_NOT_LOADED,
     }
 }
@@ -384,7 +416,10 @@ pub(crate) unsafe fn cuStreamCreateWithPriority(
     priority: c_int,
 ) -> CUresult {
     match cuda_api() {
-        Some(a) => (a.cuStreamCreateWithPriority)(stream, flags, priority),
+        // SAFETY: forwards this unsafe wrapper's arguments to the live dlopen'd entry point (the
+        // table is never unloaded — `mem::forget(lib)`); the caller upholds the driver-API contract,
+        // with the site-specific proof at each call site.
+        Some(a) => unsafe { (a.cuStreamCreateWithPriority)(stream, flags, priority) },
         None => CU_ERROR_NOT_LOADED,
     }
 }
@@ -395,7 +430,10 @@ pub(crate) unsafe fn cuGraphicsGLRegisterImage(
     flags: c_uint,
 ) -> CUresult {
     match cuda_api() {
-        Some(a) => (a.cuGraphicsGLRegisterImage)(resource, texture, target, flags),
+        // SAFETY: forwards this unsafe wrapper's arguments to the live dlopen'd entry point (the
+        // table is never unloaded — `mem::forget(lib)`); the caller upholds the driver-API contract,
+        // with the site-specific proof at each call site.
+        Some(a) => unsafe { (a.cuGraphicsGLRegisterImage)(resource, texture, target, flags) },
         None => CU_ERROR_NOT_LOADED,
     }
 }
@@ -405,7 +443,10 @@ pub(crate) unsafe fn cuGraphicsMapResources(
     stream: *mut c_void,
 ) -> CUresult {
     match cuda_api() {
-        Some(a) => (a.cuGraphicsMapResources)(count, resources, stream),
+        // SAFETY: forwards this unsafe wrapper's arguments to the live dlopen'd entry point (the
+        // table is never unloaded — `mem::forget(lib)`); the caller upholds the driver-API contract,
+        // with the site-specific proof at each call site.
+        Some(a) => unsafe { (a.cuGraphicsMapResources)(count, resources, stream) },
         None => CU_ERROR_NOT_LOADED,
     }
 }
@@ -415,7 +456,10 @@ pub(crate) unsafe fn cuGraphicsUnmapResources(
     stream: *mut c_void,
 ) -> CUresult {
     match cuda_api() {
-        Some(a) => (a.cuGraphicsUnmapResources)(count, resources, stream),
+        // SAFETY: forwards this unsafe wrapper's arguments to the live dlopen'd entry point (the
+        // table is never unloaded — `mem::forget(lib)`); the caller upholds the driver-API contract,
+        // with the site-specific proof at each call site.
+        Some(a) => unsafe { (a.cuGraphicsUnmapResources)(count, resources, stream) },
         None => CU_ERROR_NOT_LOADED,
     }
 }
@@ -426,13 +470,21 @@ pub(crate) unsafe fn cuGraphicsSubResourceGetMappedArray(
     mip_level: c_uint,
 ) -> CUresult {
     match cuda_api() {
-        Some(a) => (a.cuGraphicsSubResourceGetMappedArray)(array, resource, array_index, mip_level),
+        // SAFETY: forwards this unsafe wrapper's arguments to the live dlopen'd entry point (the
+        // table is never unloaded — `mem::forget(lib)`); the caller upholds the driver-API contract,
+        // with the site-specific proof at each call site.
+        Some(a) => unsafe {
+            (a.cuGraphicsSubResourceGetMappedArray)(array, resource, array_index, mip_level)
+        },
         None => CU_ERROR_NOT_LOADED,
     }
 }
 pub(crate) unsafe fn cuGraphicsUnregisterResource(resource: CUgraphicsResource) -> CUresult {
     match cuda_api() {
-        Some(a) => (a.cuGraphicsUnregisterResource)(resource),
+        // SAFETY: forwards this unsafe wrapper's arguments to the live dlopen'd entry point (the
+        // table is never unloaded — `mem::forget(lib)`); the caller upholds the driver-API contract,
+        // with the site-specific proof at each call site.
+        Some(a) => unsafe { (a.cuGraphicsUnregisterResource)(resource) },
         None => CU_ERROR_NOT_LOADED,
     }
 }
@@ -441,7 +493,10 @@ pub(crate) unsafe fn cuImportExternalMemory(
     mem_handle_desc: *const CUDA_EXTERNAL_MEMORY_HANDLE_DESC,
 ) -> CUresult {
     match cuda_api() {
-        Some(a) => (a.cuImportExternalMemory)(ext_mem_out, mem_handle_desc),
+        // SAFETY: forwards this unsafe wrapper's arguments to the live dlopen'd entry point (the
+        // table is never unloaded — `mem::forget(lib)`); the caller upholds the driver-API contract,
+        // with the site-specific proof at each call site.
+        Some(a) => unsafe { (a.cuImportExternalMemory)(ext_mem_out, mem_handle_desc) },
         None => CU_ERROR_NOT_LOADED,
     }
 }
@@ -451,13 +506,19 @@ pub(crate) unsafe fn cuExternalMemoryGetMappedBuffer(
     buffer_desc: *const CUDA_EXTERNAL_MEMORY_BUFFER_DESC,
 ) -> CUresult {
     match cuda_api() {
-        Some(a) => (a.cuExternalMemoryGetMappedBuffer)(dev_ptr, ext_mem, buffer_desc),
+        // SAFETY: forwards this unsafe wrapper's arguments to the live dlopen'd entry point (the
+        // table is never unloaded — `mem::forget(lib)`); the caller upholds the driver-API contract,
+        // with the site-specific proof at each call site.
+        Some(a) => unsafe { (a.cuExternalMemoryGetMappedBuffer)(dev_ptr, ext_mem, buffer_desc) },
         None => CU_ERROR_NOT_LOADED,
     }
 }
 pub(crate) unsafe fn cuDestroyExternalMemory(ext_mem: CUexternalMemory) -> CUresult {
     match cuda_api() {
-        Some(a) => (a.cuDestroyExternalMemory)(ext_mem),
+        // SAFETY: forwards this unsafe wrapper's arguments to the live dlopen'd entry point (the
+        // table is never unloaded — `mem::forget(lib)`); the caller upholds the driver-API contract,
+        // with the site-specific proof at each call site.
+        Some(a) => unsafe { (a.cuDestroyExternalMemory)(ext_mem) },
         None => CU_ERROR_NOT_LOADED,
     }
 }
@@ -466,13 +527,19 @@ pub(crate) unsafe fn cuImportExternalSemaphore(
     sem_handle_desc: *const CUDA_EXTERNAL_SEMAPHORE_HANDLE_DESC,
 ) -> CUresult {
     match cuda_api() {
-        Some(a) => (a.cuImportExternalSemaphore)(ext_sem_out, sem_handle_desc),
+        // SAFETY: forwards this unsafe wrapper's arguments to the live dlopen'd entry point (the
+        // table is never unloaded — `mem::forget(lib)`); the caller upholds the driver-API contract,
+        // with the site-specific proof at each call site.
+        Some(a) => unsafe { (a.cuImportExternalSemaphore)(ext_sem_out, sem_handle_desc) },
         None => CU_ERROR_NOT_LOADED,
     }
 }
 pub(crate) unsafe fn cuDestroyExternalSemaphore(ext_sem: CUexternalSemaphore) -> CUresult {
     match cuda_api() {
-        Some(a) => (a.cuDestroyExternalSemaphore)(ext_sem),
+        // SAFETY: forwards this unsafe wrapper's arguments to the live dlopen'd entry point (the
+        // table is never unloaded — `mem::forget(lib)`); the caller upholds the driver-API contract,
+        // with the site-specific proof at each call site.
+        Some(a) => unsafe { (a.cuDestroyExternalSemaphore)(ext_sem) },
         None => CU_ERROR_NOT_LOADED,
     }
 }
@@ -483,7 +550,10 @@ pub(crate) unsafe fn cuSignalExternalSemaphoresAsync(
     stream: CUstream,
 ) -> CUresult {
     match cuda_api() {
-        Some(a) => (a.cuSignalExternalSemaphoresAsync)(ext_sems, params, count, stream),
+        // SAFETY: forwards this unsafe wrapper's arguments to the live dlopen'd entry point (the
+        // table is never unloaded — `mem::forget(lib)`); the caller upholds the driver-API contract,
+        // with the site-specific proof at each call site.
+        Some(a) => unsafe { (a.cuSignalExternalSemaphoresAsync)(ext_sems, params, count, stream) },
         None => CU_ERROR_NOT_LOADED,
     }
 }
@@ -494,13 +564,19 @@ pub(crate) unsafe fn cuWaitExternalSemaphoresAsync(
     stream: CUstream,
 ) -> CUresult {
     match cuda_api() {
-        Some(a) => (a.cuWaitExternalSemaphoresAsync)(ext_sems, params, count, stream),
+        // SAFETY: forwards this unsafe wrapper's arguments to the live dlopen'd entry point (the
+        // table is never unloaded — `mem::forget(lib)`); the caller upholds the driver-API contract,
+        // with the site-specific proof at each call site.
+        Some(a) => unsafe { (a.cuWaitExternalSemaphoresAsync)(ext_sems, params, count, stream) },
         None => CU_ERROR_NOT_LOADED,
     }
 }
 pub(crate) unsafe fn cuIpcGetMemHandle(handle: *mut CUipcMemHandle, dptr: CUdeviceptr) -> CUresult {
     match cuda_api() {
-        Some(a) => (a.cuIpcGetMemHandle)(handle, dptr),
+        // SAFETY: forwards this unsafe wrapper's arguments to the live dlopen'd entry point (the
+        // table is never unloaded — `mem::forget(lib)`); the caller upholds the driver-API contract,
+        // with the site-specific proof at each call site.
+        Some(a) => unsafe { (a.cuIpcGetMemHandle)(handle, dptr) },
         None => CU_ERROR_NOT_LOADED,
     }
 }
@@ -510,13 +586,19 @@ pub(crate) unsafe fn cuIpcOpenMemHandle(
     flags: c_uint,
 ) -> CUresult {
     match cuda_api() {
-        Some(a) => (a.cuIpcOpenMemHandle)(dptr, handle, flags),
+        // SAFETY: forwards this unsafe wrapper's arguments to the live dlopen'd entry point (the
+        // table is never unloaded — `mem::forget(lib)`); the caller upholds the driver-API contract,
+        // with the site-specific proof at each call site.
+        Some(a) => unsafe { (a.cuIpcOpenMemHandle)(dptr, handle, flags) },
         None => CU_ERROR_NOT_LOADED,
     }
 }
 pub(crate) unsafe fn cuIpcCloseMemHandle(dptr: CUdeviceptr) -> CUresult {
     match cuda_api() {
-        Some(a) => (a.cuIpcCloseMemHandle)(dptr),
+        // SAFETY: forwards this unsafe wrapper's arguments to the live dlopen'd entry point (the
+        // table is never unloaded — `mem::forget(lib)`); the caller upholds the driver-API contract,
+        // with the site-specific proof at each call site.
+        Some(a) => unsafe { (a.cuIpcCloseMemHandle)(dptr) },
         None => CU_ERROR_NOT_LOADED,
     }
 }

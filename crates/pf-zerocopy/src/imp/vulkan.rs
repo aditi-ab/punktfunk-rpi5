@@ -292,184 +292,197 @@ impl VkBridge {
 
     /// Import `fd` (dup'd internally; Vulkan owns the dup) as a transfer-src buffer of `size`.
     unsafe fn import_src(&mut self, fd: i32, size: u64) -> Result<()> {
-        use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
-        let dup = libc::dup(fd);
-        if dup < 0 {
-            bail!("dup(dmabuf fd)");
-        }
-        // Own the dup so every early return BEFORE Vulkan consumes it (at `allocate_memory` success)
-        // closes it. `SrcBuf` holds raw handles with no Drop and is only populated on the success
-        // path, so each fallible step below must also destroy the buffer it created — otherwise a
-        // failed import (which the worker survives and the caller retries every frame) leaks a
-        // VkBuffer + VkDeviceMemory + fd per frame for the worker's whole lifetime.
-        let dup = OwnedFd::from_raw_fd(dup);
-        let mut ext_info = vk::ExternalMemoryBufferCreateInfo::default()
-            .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
-        let buffer = self
-            .device
-            .create_buffer(
-                &vk::BufferCreateInfo::default()
-                    .size(size)
-                    // STORAGE so the NV12 compute CSC can read it as an SSBO (T2.5b); harmless
-                    // for the plain copy path.
-                    .usage(
-                        vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::STORAGE_BUFFER,
-                    )
-                    .push_next(&mut ext_info),
-                None,
-            )
-            .context("create import buffer")?; // `dup` drops → closes on failure
-        let mut fd_props = vk::MemoryFdPropertiesKHR::default();
-        if let Err(e) = self.ext_fd.get_memory_fd_properties(
-            vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT,
-            dup.as_raw_fd(),
-            &mut fd_props,
-        ) {
-            self.device.destroy_buffer(buffer, None);
-            return Err(e).context("vkGetMemoryFdPropertiesKHR");
-        }
-        let reqs = self.device.get_buffer_memory_requirements(buffer);
-        let mem_type = match self.memory_type(
-            reqs.memory_type_bits & fd_props.memory_type_bits,
-            vk::MemoryPropertyFlags::empty(),
-        ) {
-            Ok(t) => t,
-            Err(e) => {
-                self.device.destroy_buffer(buffer, None);
-                return Err(e);
+        // SAFETY: caller contract: single-threaded use of handles this bridge owns; every builder
+        // info is built from locals that outlive the synchronous call reading them, and every
+        // fallible step destroys what it created before returning (comments below).
+        unsafe {
+            use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
+            let dup = libc::dup(fd);
+            if dup < 0 {
+                bail!("dup(dmabuf fd)");
             }
-        };
-        // Vulkan takes ownership of the fd on a SUCCESSFUL import: hand over the raw fd now, and on
-        // failure close it ourselves (matching the original contract) plus destroy the buffer.
-        let raw = dup.into_raw_fd();
-        let mut import = vk::ImportMemoryFdInfoKHR::default()
-            .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
-            .fd(raw);
-        let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().buffer(buffer);
-        let memory = match self.device.allocate_memory(
-            &vk::MemoryAllocateInfo::default()
-                .allocation_size(reqs.size.max(size))
-                .memory_type_index(mem_type)
-                .push_next(&mut import)
-                .push_next(&mut dedicated),
-            None,
-        ) {
-            Ok(m) => m,
-            Err(e) => {
-                libc::close(raw); // failed import does not consume the fd
+            // Own the dup so every early return BEFORE Vulkan consumes it (at `allocate_memory` success)
+            // closes it. `SrcBuf` holds raw handles with no Drop and is only populated on the success
+            // path, so each fallible step below must also destroy the buffer it created — otherwise a
+            // failed import (which the worker survives and the caller retries every frame) leaks a
+            // VkBuffer + VkDeviceMemory + fd per frame for the worker's whole lifetime.
+            let dup = OwnedFd::from_raw_fd(dup);
+            let mut ext_info = vk::ExternalMemoryBufferCreateInfo::default()
+                .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+            let buffer = self
+                .device
+                .create_buffer(
+                    &vk::BufferCreateInfo::default()
+                        .size(size)
+                        // STORAGE so the NV12 compute CSC can read it as an SSBO (T2.5b); harmless
+                        // for the plain copy path.
+                        .usage(
+                            vk::BufferUsageFlags::TRANSFER_SRC
+                                | vk::BufferUsageFlags::STORAGE_BUFFER,
+                        )
+                        .push_next(&mut ext_info),
+                    None,
+                )
+                .context("create import buffer")?; // `dup` drops → closes on failure
+            let mut fd_props = vk::MemoryFdPropertiesKHR::default();
+            if let Err(e) = self.ext_fd.get_memory_fd_properties(
+                vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT,
+                dup.as_raw_fd(),
+                &mut fd_props,
+            ) {
                 self.device.destroy_buffer(buffer, None);
-                return Err(anyhow!("import dmabuf memory: {e}"));
+                return Err(e).context("vkGetMemoryFdPropertiesKHR");
             }
-        };
-        if let Err(e) = self.device.bind_buffer_memory(buffer, memory, 0) {
-            // `memory` owns the imported fd — freeing it releases the fd too.
-            self.device.free_memory(memory, None);
-            self.device.destroy_buffer(buffer, None);
-            return Err(e).context("bind import memory");
-        }
-        self.src_cache.insert(
-            fd,
-            SrcBuf {
-                buffer,
-                memory,
-                size,
-            },
-        );
-        Ok(())
-    }
-
-    /// (Re)create the exportable destination of at least `size` bytes + its CUDA mapping.
-    unsafe fn ensure_dst(&mut self, size: u64) -> Result<()> {
-        if self.dst.as_ref().is_some_and(|d| d.size >= size) {
-            return Ok(());
-        }
-        // Build the replacement FULLY before retiring the old one. Previously the old dst was
-        // destroyed and `self.dst` nulled up front, so a failed rebuild both dropped the working
-        // buffer AND leaked every object the partial rebuild created (`buffer`/`memory` are raw ash
-        // handles with no Drop, and `VkBridge::drop` only frees the live `self.dst`). Now every
-        // fallible step unwinds locally, and the swap happens only on full success.
-        let mut ext_info = vk::ExternalMemoryBufferCreateInfo::default()
-            .handle_types(vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD);
-        let buffer = self
-            .device
-            .create_buffer(
-                &vk::BufferCreateInfo::default()
-                    .size(size)
-                    // STORAGE so the NV12 compute CSC can write it as an SSBO (T2.5b).
-                    .usage(
-                        vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::STORAGE_BUFFER,
-                    )
-                    .push_next(&mut ext_info),
-                None,
-            )
-            .context("create export buffer")?;
-        let reqs = self.device.get_buffer_memory_requirements(buffer);
-        let mem_type =
-            match self.memory_type(reqs.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL) {
+            let reqs = self.device.get_buffer_memory_requirements(buffer);
+            let mem_type = match self.memory_type(
+                reqs.memory_type_bits & fd_props.memory_type_bits,
+                vk::MemoryPropertyFlags::empty(),
+            ) {
                 Ok(t) => t,
                 Err(e) => {
                     self.device.destroy_buffer(buffer, None);
                     return Err(e);
                 }
             };
-        let mut export = vk::ExportMemoryAllocateInfo::default()
-            .handle_types(vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD);
-        let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().buffer(buffer);
-        let memory = match self.device.allocate_memory(
-            &vk::MemoryAllocateInfo::default()
-                .allocation_size(reqs.size)
-                .memory_type_index(mem_type)
-                .push_next(&mut export)
-                .push_next(&mut dedicated),
-            None,
-        ) {
-            Ok(m) => m,
-            Err(e) => {
-                self.device.destroy_buffer(buffer, None);
-                return Err(e).context("allocate exportable memory");
-            }
-        };
-        if let Err(e) = self.device.bind_buffer_memory(buffer, memory, 0) {
-            self.device.free_memory(memory, None);
-            self.device.destroy_buffer(buffer, None);
-            return Err(e).context("bind export memory");
-        }
-        let opaque_fd = match self.ext_fd.get_memory_fd(
-            &vk::MemoryGetFdInfoKHR::default()
-                .memory(memory)
-                .handle_type(vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD),
-        ) {
-            Ok(f) => f,
-            Err(e) => {
+            // Vulkan takes ownership of the fd on a SUCCESSFUL import: hand over the raw fd now, and on
+            // failure close it ourselves (matching the original contract) plus destroy the buffer.
+            let raw = dup.into_raw_fd();
+            let mut import = vk::ImportMemoryFdInfoKHR::default()
+                .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
+                .fd(raw);
+            let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().buffer(buffer);
+            let memory = match self.device.allocate_memory(
+                &vk::MemoryAllocateInfo::default()
+                    .allocation_size(reqs.size.max(size))
+                    .memory_type_index(mem_type)
+                    .push_next(&mut import)
+                    .push_next(&mut dedicated),
+                None,
+            ) {
+                Ok(m) => m,
+                Err(e) => {
+                    libc::close(raw); // failed import does not consume the fd
+                    self.device.destroy_buffer(buffer, None);
+                    return Err(anyhow!("import dmabuf memory: {e}"));
+                }
+            };
+            if let Err(e) = self.device.bind_buffer_memory(buffer, memory, 0) {
+                // `memory` owns the imported fd — freeing it releases the fd too.
                 self.device.free_memory(memory, None);
                 self.device.destroy_buffer(buffer, None);
-                return Err(e).context("vkGetMemoryFdKHR");
+                return Err(e).context("bind import memory");
             }
-        };
-        // CUDA imports (and on success owns) the exported fd. Size must match the allocation.
-        // `import_owned_fd` closes `opaque_fd` on its own failure, so only the Vulkan objects unwind.
-        let cuda = match cuda::ExternalDmabuf::import_owned_fd(opaque_fd, reqs.size) {
-            Ok(c) => c,
-            Err(e) => {
+            self.src_cache.insert(
+                fd,
+                SrcBuf {
+                    buffer,
+                    memory,
+                    size,
+                },
+            );
+            Ok(())
+        }
+    }
+
+    /// (Re)create the exportable destination of at least `size` bytes + its CUDA mapping.
+    unsafe fn ensure_dst(&mut self, size: u64) -> Result<()> {
+        // SAFETY: caller contract: single-threaded use of handles this bridge owns; every builder
+        // info is built from locals that outlive the synchronous call reading them; created handles
+        // are destroyed on the error paths below or owned by `DstBuf`.
+        unsafe {
+            if self.dst.as_ref().is_some_and(|d| d.size >= size) {
+                return Ok(());
+            }
+            // Build the replacement FULLY before retiring the old one. Previously the old dst was
+            // destroyed and `self.dst` nulled up front, so a failed rebuild both dropped the working
+            // buffer AND leaked every object the partial rebuild created (`buffer`/`memory` are raw ash
+            // handles with no Drop, and `VkBridge::drop` only frees the live `self.dst`). Now every
+            // fallible step unwinds locally, and the swap happens only on full success.
+            let mut ext_info = vk::ExternalMemoryBufferCreateInfo::default()
+                .handle_types(vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD);
+            let buffer = self
+                .device
+                .create_buffer(
+                    &vk::BufferCreateInfo::default()
+                        .size(size)
+                        // STORAGE so the NV12 compute CSC can write it as an SSBO (T2.5b).
+                        .usage(
+                            vk::BufferUsageFlags::TRANSFER_DST
+                                | vk::BufferUsageFlags::STORAGE_BUFFER,
+                        )
+                        .push_next(&mut ext_info),
+                    None,
+                )
+                .context("create export buffer")?;
+            let reqs = self.device.get_buffer_memory_requirements(buffer);
+            let mem_type = match self
+                .memory_type(reqs.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL)
+            {
+                Ok(t) => t,
+                Err(e) => {
+                    self.device.destroy_buffer(buffer, None);
+                    return Err(e);
+                }
+            };
+            let mut export = vk::ExportMemoryAllocateInfo::default()
+                .handle_types(vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD);
+            let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().buffer(buffer);
+            let memory = match self.device.allocate_memory(
+                &vk::MemoryAllocateInfo::default()
+                    .allocation_size(reqs.size)
+                    .memory_type_index(mem_type)
+                    .push_next(&mut export)
+                    .push_next(&mut dedicated),
+                None,
+            ) {
+                Ok(m) => m,
+                Err(e) => {
+                    self.device.destroy_buffer(buffer, None);
+                    return Err(e).context("allocate exportable memory");
+                }
+            };
+            if let Err(e) = self.device.bind_buffer_memory(buffer, memory, 0) {
                 self.device.free_memory(memory, None);
                 self.device.destroy_buffer(buffer, None);
-                return Err(e).context("cuImportExternalMemory(OPAQUE_FD from Vulkan)");
+                return Err(e).context("bind export memory");
             }
-        };
-        // Full success: retire the previous buffer now, then publish the new one.
-        if let Some(old) = self.dst.take() {
-            self.device.destroy_buffer(old.buffer, None);
-            self.device.free_memory(old.memory, None);
-            // old.cuda drops its mapping with it
+            let opaque_fd = match self.ext_fd.get_memory_fd(
+                &vk::MemoryGetFdInfoKHR::default()
+                    .memory(memory)
+                    .handle_type(vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD),
+            ) {
+                Ok(f) => f,
+                Err(e) => {
+                    self.device.free_memory(memory, None);
+                    self.device.destroy_buffer(buffer, None);
+                    return Err(e).context("vkGetMemoryFdKHR");
+                }
+            };
+            // CUDA imports (and on success owns) the exported fd. Size must match the allocation.
+            // `import_owned_fd` closes `opaque_fd` on its own failure, so only the Vulkan objects unwind.
+            let cuda = match cuda::ExternalDmabuf::import_owned_fd(opaque_fd, reqs.size) {
+                Ok(c) => c,
+                Err(e) => {
+                    self.device.free_memory(memory, None);
+                    self.device.destroy_buffer(buffer, None);
+                    return Err(e).context("cuImportExternalMemory(OPAQUE_FD from Vulkan)");
+                }
+            };
+            // Full success: retire the previous buffer now, then publish the new one.
+            if let Some(old) = self.dst.take() {
+                self.device.destroy_buffer(old.buffer, None);
+                self.device.free_memory(old.memory, None);
+                // old.cuda drops its mapping with it
+            }
+            tracing::info!(size, "Vulkan→CUDA exportable staging buffer ready");
+            self.dst = Some(DstBuf {
+                buffer,
+                memory,
+                size: reqs.size,
+                cuda,
+            });
+            Ok(())
         }
-        tracing::info!(size, "Vulkan→CUDA exportable staging buffer ready");
-        self.dst = Some(DstBuf {
-            buffer,
-            memory,
-            size: reqs.size,
-            cuda,
-        });
-        Ok(())
     }
 
     /// Build the RGB→NV12 compute pipeline once (T2.5b): two-SSBO descriptor set + a 28-byte
@@ -477,112 +490,124 @@ impl VkBridge {
     /// what was already created (the caller retries per frame, so a leak would be unbounded) and
     /// leaves `self.csc` `None`.
     unsafe fn ensure_csc(&mut self) -> Result<()> {
-        if self.csc.is_some() {
-            return Ok(());
+        // SAFETY: caller contract: single-threaded use of handles this bridge owns. `build_csc`
+        // fills `csc` front to back; on failure the destroy calls below run in reverse creation
+        // order, and Vulkan destroys are defined no-ops on the null handles a partial build left.
+        unsafe {
+            if self.csc.is_some() {
+                return Ok(());
+            }
+            let mut csc = Csc {
+                module: vk::ShaderModule::null(),
+                dset_layout: vk::DescriptorSetLayout::null(),
+                playout: vk::PipelineLayout::null(),
+                pipeline: vk::Pipeline::null(),
+                dpool: vk::DescriptorPool::null(),
+                dset: vk::DescriptorSet::null(),
+            };
+            if let Err(e) = self.build_csc(&mut csc) {
+                // Reverse creation order; Vulkan destroy calls are defined no-ops on the null
+                // handles a partial build left behind.
+                let d = &self.device;
+                d.destroy_descriptor_pool(csc.dpool, None); // frees `csc.dset` with it
+                d.destroy_pipeline(csc.pipeline, None);
+                d.destroy_pipeline_layout(csc.playout, None);
+                d.destroy_descriptor_set_layout(csc.dset_layout, None);
+                d.destroy_shader_module(csc.module, None);
+                return Err(e);
+            }
+            self.csc = Some(csc);
+            tracing::info!(
+                "Vulkan-bridge NV12 compute CSC ready (LINEAR path feeds NVENC native YUV)"
+            );
+            Ok(())
         }
-        let mut csc = Csc {
-            module: vk::ShaderModule::null(),
-            dset_layout: vk::DescriptorSetLayout::null(),
-            playout: vk::PipelineLayout::null(),
-            pipeline: vk::Pipeline::null(),
-            dpool: vk::DescriptorPool::null(),
-            dset: vk::DescriptorSet::null(),
-        };
-        if let Err(e) = self.build_csc(&mut csc) {
-            // Reverse creation order; Vulkan destroy calls are defined no-ops on the null
-            // handles a partial build left behind.
-            let d = &self.device;
-            d.destroy_descriptor_pool(csc.dpool, None); // frees `csc.dset` with it
-            d.destroy_pipeline(csc.pipeline, None);
-            d.destroy_pipeline_layout(csc.playout, None);
-            d.destroy_descriptor_set_layout(csc.dset_layout, None);
-            d.destroy_shader_module(csc.module, None);
-            return Err(e);
-        }
-        self.csc = Some(csc);
-        tracing::info!("Vulkan-bridge NV12 compute CSC ready (LINEAR path feeds NVENC native YUV)");
-        Ok(())
     }
 
     /// The fallible half of [`ensure_csc`](Self::ensure_csc): fills `csc` front to back so the
     /// caller knows exactly what to destroy when a step fails.
     unsafe fn build_csc(&mut self, csc: &mut Csc) -> Result<()> {
-        let words: Vec<u32> = CSC_SPV
-            .chunks_exact(4)
-            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
-            .collect();
-        csc.module = self
-            .device
-            .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&words), None)
-            .context("create CSC shader module")?;
-        let bindings = [
-            vk::DescriptorSetLayoutBinding::default()
-                .binding(0)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::COMPUTE),
-            vk::DescriptorSetLayoutBinding::default()
-                .binding(1)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::COMPUTE),
-        ];
-        csc.dset_layout = self
-            .device
-            .create_descriptor_set_layout(
-                &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
-                None,
-            )
-            .context("create CSC dset layout")?;
-        let pc = [vk::PushConstantRange::default()
-            .stage_flags(vk::ShaderStageFlags::COMPUTE)
-            .size(28)];
-        let layouts = [csc.dset_layout];
-        csc.playout = self
-            .device
-            .create_pipeline_layout(
-                &vk::PipelineLayoutCreateInfo::default()
-                    .set_layouts(&layouts)
-                    .push_constant_ranges(&pc),
-                None,
-            )
-            .context("create CSC pipeline layout")?;
-        let entry = c"main";
-        let stage = vk::PipelineShaderStageCreateInfo::default()
-            .stage(vk::ShaderStageFlags::COMPUTE)
-            .module(csc.module)
-            .name(entry);
-        csc.pipeline = self
-            .device
-            .create_compute_pipelines(
-                vk::PipelineCache::null(),
-                &[vk::ComputePipelineCreateInfo::default()
-                    .stage(stage)
-                    .layout(csc.playout)],
-                None,
-            )
-            .map_err(|(_, e)| anyhow!("create CSC pipeline: {e}"))?[0];
-        let sizes = [vk::DescriptorPoolSize::default()
-            .ty(vk::DescriptorType::STORAGE_BUFFER)
-            .descriptor_count(2)];
-        csc.dpool = self
-            .device
-            .create_descriptor_pool(
-                &vk::DescriptorPoolCreateInfo::default()
-                    .max_sets(1)
-                    .pool_sizes(&sizes),
-                None,
-            )
-            .context("create CSC descriptor pool")?;
-        csc.dset = self
-            .device
-            .allocate_descriptor_sets(
-                &vk::DescriptorSetAllocateInfo::default()
-                    .descriptor_pool(csc.dpool)
-                    .set_layouts(&layouts),
-            )
-            .context("allocate CSC descriptor set")?[0];
-        Ok(())
+        // SAFETY: caller contract (via `ensure_csc`): single-threaded use of handles this bridge
+        // owns; every builder info is built from locals that outlive the synchronous call reading
+        // them; partial results land in `csc` for the caller to destroy on failure.
+        unsafe {
+            let words: Vec<u32> = CSC_SPV
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                .collect();
+            csc.module = self
+                .device
+                .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&words), None)
+                .context("create CSC shader module")?;
+            let bindings = [
+                vk::DescriptorSetLayoutBinding::default()
+                    .binding(0)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .descriptor_count(1)
+                    .stage_flags(vk::ShaderStageFlags::COMPUTE),
+                vk::DescriptorSetLayoutBinding::default()
+                    .binding(1)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .descriptor_count(1)
+                    .stage_flags(vk::ShaderStageFlags::COMPUTE),
+            ];
+            csc.dset_layout = self
+                .device
+                .create_descriptor_set_layout(
+                    &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
+                    None,
+                )
+                .context("create CSC dset layout")?;
+            let pc = [vk::PushConstantRange::default()
+                .stage_flags(vk::ShaderStageFlags::COMPUTE)
+                .size(28)];
+            let layouts = [csc.dset_layout];
+            csc.playout = self
+                .device
+                .create_pipeline_layout(
+                    &vk::PipelineLayoutCreateInfo::default()
+                        .set_layouts(&layouts)
+                        .push_constant_ranges(&pc),
+                    None,
+                )
+                .context("create CSC pipeline layout")?;
+            let entry = c"main";
+            let stage = vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::COMPUTE)
+                .module(csc.module)
+                .name(entry);
+            csc.pipeline = self
+                .device
+                .create_compute_pipelines(
+                    vk::PipelineCache::null(),
+                    &[vk::ComputePipelineCreateInfo::default()
+                        .stage(stage)
+                        .layout(csc.playout)],
+                    None,
+                )
+                .map_err(|(_, e)| anyhow!("create CSC pipeline: {e}"))?[0];
+            let sizes = [vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(2)];
+            csc.dpool = self
+                .device
+                .create_descriptor_pool(
+                    &vk::DescriptorPoolCreateInfo::default()
+                        .max_sets(1)
+                        .pool_sizes(&sizes),
+                    None,
+                )
+                .context("create CSC descriptor pool")?;
+            csc.dset = self
+                .device
+                .allocate_descriptor_sets(
+                    &vk::DescriptorSetAllocateInfo::default()
+                        .descriptor_pool(csc.dpool)
+                        .set_layouts(&layouts),
+                )
+                .context("allocate CSC descriptor set")?[0];
+            Ok(())
+        }
     }
 
     /// Bridge one LINEAR dmabuf frame into a pooled NV12 CUDA buffer (latency plan T2.5b):
