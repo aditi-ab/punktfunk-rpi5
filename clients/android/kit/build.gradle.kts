@@ -33,7 +33,11 @@ dependencies {
     // mTLS HTTPS client for the host's management API (the game-library fetch + cover-art loads).
     // OkHttp lets us present the paired client cert and pin the host's self-signed cert by SHA-256.
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
-    testImplementation("junit:junit:4.13.2") // JVM unit test for the pure TXT parser
+    testImplementation("junit:junit:4.13.2") // JVM unit tests for the pure parsers/migrations
+    // A REAL org.json on the unit-test classpath. android.jar's org.json is stubs that throw
+    // "Stub!", so the host-store migration test — which asserts over the very JSON blobs the store
+    // reads and writes — cannot run without it. Explicit test deps precede the mockable android.jar.
+    testImplementation("org.json:json:20250107")
 }
 
 // ------------------------------------------------------------------------------------------------

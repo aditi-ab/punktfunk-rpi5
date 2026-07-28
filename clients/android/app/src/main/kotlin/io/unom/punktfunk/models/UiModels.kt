@@ -29,6 +29,21 @@ data class PendingTrust(
     enum class Kind { TRUST_NEW, FP_CHANGED, PAIR, REQUEST_ACCESS }
 }
 
+/**
+ * A stream session that just opened, and the state the stream screen needs about it.
+ *
+ * [settings] is the settings the connect ACTUALLY used, resolved once at connect time — not
+ * "whatever the settings store says now". Every post-connect read (the stats tier, the touch and
+ * mouse models, the low-latency pipeline, rumble, SC2 capture) takes it, so the stream can never
+ * disagree with the connect that produced it. [clipboardSync] comes from the host record, because
+ * clipboard sync is a decision about that host rather than about this device.
+ */
+data class ActiveSession(
+    val handle: Long,
+    val settings: io.unom.punktfunk.Settings,
+    val clipboardSync: Boolean,
+)
+
 /** Trust state of a host, shown as a colored pill on its card. */
 enum class HostStatus(val label: String) {
     PAIRED("Paired"),

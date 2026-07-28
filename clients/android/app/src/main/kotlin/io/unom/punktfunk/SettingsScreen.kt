@@ -500,13 +500,8 @@ private fun InputSettings(s: Settings, update: (Settings) -> Unit) {
             checked = s.invertScroll,
             onCheckedChange = { on -> update(s.copy(invertScroll = on)) },
         )
-        ToggleRow(
-            title = "Shared clipboard",
-            subtitle = "Text copied here pastes on the host and vice versa (hosts with " +
-                "clipboard sharing enabled)",
-            checked = s.clipboardSync,
-            onCheckedChange = { on -> update(s.copy(clipboardSync = on)) },
-        )
+        // "Shared clipboard" is NOT here any more: it is a trust decision about one host, so it
+        // lives on the host record and is edited from that host's Edit sheet.
     }
 }
 

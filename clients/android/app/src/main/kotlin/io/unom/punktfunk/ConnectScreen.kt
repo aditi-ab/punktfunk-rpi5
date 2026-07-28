@@ -63,6 +63,7 @@ import io.unom.punktfunk.kit.security.IdentityStore
 import io.unom.punktfunk.kit.security.KnownHost
 import io.unom.punktfunk.kit.security.KnownHostStore
 import io.unom.punktfunk.kit.security.obtainIdentity
+import io.unom.punktfunk.models.ActiveSession
 import io.unom.punktfunk.models.HostStatus
 import io.unom.punktfunk.models.PendingTrust
 import java.util.concurrent.atomic.AtomicBoolean
@@ -101,7 +102,7 @@ private class ConnectAttempt(val hostName: String) {
 @Composable
 fun ConnectScreen(
     settings: Settings,
-    onConnected: (Long) -> Unit,
+    onConnected: (ActiveSession) -> Unit,
     // Console (gamepad) mode: render the host carousel instead of the touch grid, sharing all of this
     // screen's connect/trust/discovery logic. [onOpenSettings]/[onOpenLibrary] are the X/Y actions the
     // gamepad shell owns (the touch UI reaches Settings via the bottom bar and has no library button).
@@ -270,6 +271,12 @@ fun ConnectScreen(
     suspend fun connectNative(id: ClientIdentity, targetHost: String, targetPort: Int, pinHex: String, timeoutMs: Int): Long =
         connectToHost(context, settings, id, targetHost, targetPort, pinHex, launch = null, timeoutMs = timeoutMs)
 
+    // What the stream screen is handed: the settings this connect actually used, plus the HOST's
+    // clipboard decision (a property of the record, not a global). A host we never saved — a
+    // connect that failed to pin — falls back to the on default the setting always had.
+    fun session(handle: Long, record: KnownHost?) =
+        ActiveSession(handle, settings, clipboardSync = record?.clipboardSync ?: true)
+
     // The actual dial (identity already ready). On a TOFU connect (pinHex null), pin the fingerprint
     // the host presented (as an unpaired known host) so the next connect goes straight through and it
     // appears in the saved-hosts list. [onFailure], when set, takes over a failed dial (the wake-wait
@@ -296,13 +303,14 @@ fun ConnectScreen(
             attempt = null
             connecting = false
             if (handle != 0L) {
+                var record = knownHostStore.get(targetHost, targetPort)
                 if (pinHex == null) { // TOFU: pin what we observed (unpaired)
                     val fp = NativeBridge.nativeHostFingerprint(handle)
                     if (fp.isNotEmpty()) {
-                        knownHostStore.save(KnownHost(targetHost, targetPort, name, fp, paired = false))
+                        record = knownHostStore.trust(targetHost, targetPort, name, fp, paired = false)
                     }
                 }
-                onConnected(handle)
+                onConnected(session(handle, record))
             } else {
                 discovery.start()
                 val token = NativeBridge.nativeTakeLastError()
@@ -368,7 +376,7 @@ fun ConnectScreen(
                         // connects) point at the live one, then dial there (no fallback on this
                         // redial — a second failure surfaces as the plain error).
                         if (live != null && kh != null && (live.host != kh.address || live.port != kh.port)) {
-                            knownHostStore.update(kh.address, kh.port, kh.copy(address = live.host, port = live.port))
+                            knownHostStore.save(kh.copy(address = live.host, port = live.port))
                             savedHosts = knownHostStore.all()
                         }
                         doConnectDirect(live?.host ?: targetHost, live?.port ?: targetPort, name, pinHex)
@@ -414,11 +422,12 @@ fun ConnectScreen(
                 // Approved — save the host as PAIRED, pinning the fingerprint it presented, so
                 // future connects are silent (exactly like after a PIN ceremony).
                 val fp = NativeBridge.nativeHostFingerprint(handle)
+                var record = knownHostStore.get(target.host, target.port)
                 if (fp.isNotEmpty()) {
-                    knownHostStore.save(KnownHost(target.host, target.port, target.name, fp, paired = true))
+                    record = knownHostStore.trust(target.host, target.port, target.name, fp, paired = true)
                     savedHosts = knownHostStore.all()
                 }
-                onConnected(handle)
+                onConnected(session(handle, record))
             } else {
                 // Cause-specific: an operator denial, an approval timeout, and a request that
                 // never reached the host are different problems with different fixes.
@@ -621,7 +630,7 @@ fun ConnectScreen(
                         enabled = !connecting,
                         onConnect = { connect(kh.address, kh.port) },
                         onForget = {
-                            knownHostStore.remove(kh.address, kh.port)
+                            knownHostStore.remove(kh)
                             savedHosts = knownHostStore.all()
                         },
                         onEdit = { editTarget = kh },
@@ -741,7 +750,7 @@ fun ConnectScreen(
         // Same trust/pairing logic, console-styled + controller-navigable in gamepad mode.
         val onPair = { pendingTrust = pt.copy(kind = PendingTrust.Kind.PAIR) }
         val onSavePaired = { fp: String ->
-            knownHostStore.save(KnownHost(pt.host, pt.port, pt.name, fp, paired = true))
+            knownHostStore.trust(pt.host, pt.port, pt.name, fp, paired = true)
             savedHosts = knownHostStore.all()
             pendingTrust = null
             doConnect(pt.host, pt.port, pt.name, fp)
@@ -801,7 +810,7 @@ fun ConnectScreen(
             },
             onEdit = { optionsTarget = null; editTarget = kh },
             onForget = {
-                knownHostStore.remove(kh.address, kh.port)
+                knownHostStore.remove(kh)
                 savedHosts = knownHostStore.all()
                 optionsTarget = null
             },
@@ -814,7 +823,7 @@ fun ConnectScreen(
         // `discovery.hosts.first { host.matches($0) }?.macAddresses`.
         val suggested = discovered.firstOrNull { kh.matches(it) }?.mac ?: emptyList()
         val onSaveHost: (KnownHost) -> Unit = { updated ->
-            knownHostStore.update(kh.address, kh.port, updated)
+            knownHostStore.save(updated)
             savedHosts = knownHostStore.all()
             editTarget = null
         }

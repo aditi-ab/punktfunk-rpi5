@@ -63,6 +63,7 @@ import io.unom.punktfunk.kit.security.ClientIdentity
 import io.unom.punktfunk.kit.security.IdentityStore
 import io.unom.punktfunk.kit.security.KnownHost
 import io.unom.punktfunk.kit.security.obtainIdentity
+import io.unom.punktfunk.models.ActiveSession
 import kotlin.math.PI
 import kotlin.math.absoluteValue
 import kotlin.math.cos
@@ -85,7 +86,7 @@ private sealed class LibState {
 fun LibraryScreen(
     host: KnownHost,
     settings: Settings,
-    onLaunched: (Long) -> Unit,
+    onLaunched: (ActiveSession) -> Unit,
     onBack: () -> Unit,
     navActive: Boolean = true,
 ) {
@@ -142,7 +143,11 @@ fun LibraryScreen(
                                         host.address, host.port, host.fpHex, launch = game.id,
                                     )
                                     launching = false
-                                    if (handle != 0L) onLaunched(handle)
+                                    if (handle != 0L) {
+                                        onLaunched(
+                                            ActiveSession(handle, settings, host.clipboardSync),
+                                        )
+                                    }
                                     else Toast.makeText(
                                         context,
                                         "Launch failed — check the host and try again.",

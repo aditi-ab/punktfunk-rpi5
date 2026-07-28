@@ -32,7 +32,6 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -42,6 +41,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.dp
+import io.unom.punktfunk.models.ActiveSession
 import io.unom.punktfunk.models.Tab
 
 @Composable
@@ -49,7 +49,9 @@ fun App(forceGamepadUi: Boolean = false) {
     val context = LocalContext.current
     val settingsStore = remember { SettingsStore(context) }
     var settings by remember { mutableStateOf(settingsStore.load()) }
-    var streamHandle by remember { mutableLongStateOf(0L) } // 0 = not streaming
+    // The active session (null = not streaming). It carries the settings the connect resolved,
+    // so the stream screen never re-reads the store behind its own connect's back.
+    var session by remember { mutableStateOf<ActiveSession?>(null) }
     var tab by remember { mutableStateOf(Tab.Connect) }
 
     // Console (gamepad) mode mirrors the Apple client: the setting AND (a pad is attached OR this is
@@ -59,20 +61,20 @@ fun App(forceGamepadUi: Boolean = false) {
     val gamepadUi = gamepadUiActive(settings.gamepadUiEnabled, controllerConnected, tv, forceGamepadUi)
 
     AnimatedContent(
-        targetState = streamHandle != 0L,
+        targetState = session,
         transitionSpec = {
             fadeIn() togetherWith fadeOut()
         },
         label = "StreamTransition"
-    ) { isStreaming ->
-        if (isStreaming) {
+    ) { active ->
+        if (active != null) {
             // Immersive: the stream takes the whole screen, no bottom bar.
-            StreamScreen(streamHandle, micEnabled = settings.micEnabled, onDisconnect = { streamHandle = 0L })
+            StreamScreen(active, onDisconnect = { session = null })
         } else if (gamepadUi) {
             GamepadShell(
                 settings = settings,
                 onSettingsChange = { settings = it; settingsStore.save(it) },
-                onConnected = { streamHandle = it },
+                onConnected = { session = it },
             )
         } else {
             // Adaptive nav: a bottom bar on phones; on tablets / large windows a side NavigationRail
@@ -103,7 +105,7 @@ fun App(forceGamepadUi: Boolean = false) {
                     label = "TabTransition"
                 ) { targetTab ->
                     when (targetTab) {
-                        Tab.Connect -> ConnectScreen(settings = settings, onConnected = { streamHandle = it })
+                        Tab.Connect -> ConnectScreen(settings = settings, onConnected = { session = it })
                         Tab.Settings -> SettingsScreen(
                             initial = settings,
                             onChange = { settings = it; settingsStore.save(it) },
@@ -167,7 +169,7 @@ private enum class GamepadScreen { Home, Settings, Library }
 fun GamepadShell(
     settings: Settings,
     onSettingsChange: (Settings) -> Unit,
-    onConnected: (Long) -> Unit,
+    onConnected: (ActiveSession) -> Unit,
 ) {
     val context = LocalContext.current
     var screen by remember { mutableStateOf(GamepadScreen.Home) }

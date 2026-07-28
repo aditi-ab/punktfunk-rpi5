@@ -59,11 +59,21 @@ import io.unom.punktfunk.kit.deviceBodyVibrator
 import io.unom.punktfunk.kit.NativeBridge
 import io.unom.punktfunk.kit.Sc2Capture
 import io.unom.punktfunk.kit.VideoDecoders
+import io.unom.punktfunk.models.ActiveSession
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.delay
 
+/**
+ * The immersive stream. Everything it reads about the session comes from [session] — the settings
+ * the connect actually resolved (globals, or a profile's overrides on top of them) and the HOST's
+ * clipboard decision — rather than from a fresh `SettingsStore` load, which could disagree with
+ * the connect that produced this handle.
+ */
 @Composable
-fun StreamScreen(handle: Long, micEnabled: Boolean, onDisconnect: () -> Unit) {
+fun StreamScreen(session: ActiveSession, onDisconnect: () -> Unit) {
+    val handle = session.handle
+    val initialSettings = session.settings
+    val micEnabled = initialSettings.micEnabled
     val context = LocalContext.current
     val activity = context as? MainActivity
     val window = activity?.window
@@ -85,7 +95,6 @@ fun StreamScreen(handle: Long, micEnabled: Boolean, onDisconnect: () -> Unit) {
     // Settings. The tier only changes how many lines `StatsOverlay` draws — switching between the
     // visible tiers keeps sampling running (the effect keys on `statsOn`, not the tier) so it never
     // blanks the numbers for a poll interval.
-    val initialSettings = remember { SettingsStore(context).load() }
     var stats by remember { mutableStateOf<DoubleArray?>(null) }
     var decoderLabel by remember { mutableStateOf("") }
     var codecLabel by remember { mutableStateOf("") }
@@ -276,7 +285,7 @@ fun StreamScreen(handle: Long, micEnabled: Boolean, onDisconnect: () -> Unit) {
         activity?.remotePointer = remote
         // Shared clipboard (text v1): only when the user setting is on AND the host has a
         // working clipboard service. Protocol-level opt-in + the poll thread live in the sync.
-        val clip = if (initialSettings.clipboardSync && NativeBridge.nativeClipSupported(handle)) {
+        val clip = if (session.clipboardSync && NativeBridge.nativeClipSupported(handle)) {
             ClipboardSync(context, handle).also { it.start() }
         } else {
             null

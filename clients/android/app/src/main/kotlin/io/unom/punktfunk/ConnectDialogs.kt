@@ -19,6 +19,7 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberModalBottomSheetState
@@ -353,11 +354,12 @@ internal fun AwaitingApprovalDialog(hostLabel: String, onCancel: () -> Unit) {
 }
 
 /**
- * Edit a saved host: name, address, port, and the Wake-on-LAN MAC. The MAC is auto-learned from the
- * host's mDNS advert while it's online, but this is where you can enter or correct it (e.g. to wake a
- * host you've only ever reached by address). [suggestedMacs] prefills the field from the live advert
- * when nothing's been learned yet. Keyed by the host so reopening resets the fields. Mirrors the
- * Apple client's edit form.
+ * Edit a saved host: name, address, port, the Wake-on-LAN MAC, and the per-host settings the record
+ * owns — shared clipboard (a trust decision about THIS machine, so it was never really a global).
+ * The MAC is auto-learned from the host's mDNS advert while it's online, but this is where you can
+ * enter or correct it (e.g. to wake a host you've only ever reached by address). [suggestedMacs]
+ * prefills the field from the live advert when nothing's been learned yet. Keyed by the host so
+ * reopening resets the fields. Mirrors the Apple client's edit form.
  */
 @Composable
 internal fun EditHostDialog(
@@ -372,6 +374,7 @@ internal fun EditHostDialog(
     var mac by remember(target) {
         mutableStateOf(target.mac.ifEmpty { suggestedMacs }.joinToString(", "))
     }
+    var clipboard by remember(target) { mutableStateOf(target.clipboardSync) }
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("Edit host") },
@@ -407,6 +410,20 @@ internal fun EditHostDialog(
                     placeholder = { Text("auto-filled when the host is seen") },
                     singleLine = true,
                 )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Column(Modifier.weight(1f)) {
+                        Text("Shared clipboard", style = MaterialTheme.typography.bodyLarge)
+                        Text(
+                            "Text copied here pastes on this host and vice versa",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    Switch(checked = clipboard, onCheckedChange = { clipboard = it })
+                }
             }
         },
         confirmButton = {
@@ -419,6 +436,7 @@ internal fun EditHostDialog(
                             address = address.trim(),
                             port = port.toIntOrNull() ?: target.port,
                             mac = KnownHostStore.parseMacs(mac),
+                            clipboardSync = clipboard,
                         ),
                     )
                 },
