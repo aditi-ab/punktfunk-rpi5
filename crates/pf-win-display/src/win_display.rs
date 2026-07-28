@@ -924,6 +924,18 @@ fn query_active_config() -> Option<SavedConfig> {
     if unsafe { GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut np, &mut nm) }.is_err() {
         return None;
     }
+    // Zero active paths is an ANSWER, not a failure — and an ordinary state: every panel off or in
+    // standby, a KVM switched away, a headless box between the adapter arriving and its first
+    // monitor. `QueryDisplayConfig` REJECTS a zero-count call rather than returning an empty set,
+    // so asking anyway turns "nothing is active" into "the query failed". Measured on .173
+    // (RTX 4090, Win11 26200, TV powered off — every monitor devnode Code 45): the sizing call
+    // succeeds with numPaths=0 and the query then returns 0x57 ERROR_INVALID_PARAMETER in a live
+    // logged-on console session, 0x5 ERROR_ACCESS_DENIED from session 0. That `None` is what makes
+    // `isolate_displays_ccd` report failure, which is the condition whose recovery legs exist to
+    // stop the operator's panels being left dark.
+    if np == 0 {
+        return Some((Vec::new(), Vec::new()));
+    }
     let mut paths = vec![DISPLAYCONFIG_PATH_INFO::default(); np as usize];
     let mut modes = vec![DISPLAYCONFIG_MODE_INFO::default(); nm as usize];
     // SAFETY: the CCD contract — `paths`/`modes` were just allocated with exactly `np`/`nm`
@@ -1114,6 +1126,20 @@ pub fn target_inventory() -> Vec<TargetInventory> {
 pub fn isolate_displays_ccd(keep_target_ids: &[u32]) -> Option<SavedConfig> {
     // Snapshot the ORIGINAL active config ONCE for restore-on-teardown, before any changes.
     let saved = query_active_config()?;
+
+    // Nothing is active, so there is nothing to deactivate and nothing to restore later. Say so by
+    // returning the empty snapshot rather than falling into the retry loop: the re-commit below is
+    // there to drive the IddCx adapter's COMMIT_MODES, and with no path at all there is no config
+    // to commit — a zero-path `SetDisplayConfig` is simply rejected, and the four attempts would
+    // log an apply failure and a 250 ms sleep each for a topology that is already what we want.
+    // `restore_displays_ccd` already treats an empty config as the no-op it is.
+    if saved.0.is_empty() {
+        tracing::info!(
+            "display isolate (CCD): no display path is active — nothing to isolate for target set \
+             {keep_target_ids:?} (every panel off/standby, or a headless host)"
+        );
+        return Some(saved);
+    }
 
     // Deactivate every non-keep display, then VERIFY and RETRY. A field-reported bug had a physical
     // monitor STAY ACTIVE in exclusive mode, so we don't trust a single SetDisplayConfig: re-query the
@@ -1501,33 +1527,11 @@ pub fn apply_source_positions(positions: &[(u32, i32, i32)]) {
 /// `DXGI_ERROR_MODE_CHANGE_IN_PROGRESS` when another display is live — see [`set_active_mode`]).
 /// Returns the original config to restore on teardown.
 pub fn set_virtual_primary_ccd(keep_target_id: u32) -> Option<SavedConfig> {
-    let mut np = 0u32;
-    let mut nm = 0u32;
-    // SAFETY: the CCD contract at the top of this file — `&mut np`/`&mut nm` are live
-    // locals the OS fills with the counts it wants for these flags.
-    if unsafe { GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut np, &mut nm) }.is_err() {
-        return None;
-    }
-    let mut paths = vec![DISPLAYCONFIG_PATH_INFO::default(); np as usize];
-    let mut modes = vec![DISPLAYCONFIG_MODE_INFO::default(); nm as usize];
-    // SAFETY: the CCD contract — `paths`/`modes` were just allocated with exactly `np`/`nm`
-    // elements from the sizing call above, and are handed over with those same counts.
-    if unsafe {
-        QueryDisplayConfig(
-            QDC_ONLY_ACTIVE_PATHS,
-            &mut np,
-            paths.as_mut_ptr(),
-            &mut nm,
-            modes.as_mut_ptr(),
-            None,
-        )
-    }
-    .is_err()
-    {
-        return None;
-    }
-    paths.truncate(np as usize);
-    modes.truncate(nm as usize);
+    // Through the shared query, not a private copy of it. This was a verbatim duplicate of
+    // `query_active_config` — same flags, same shape — and so the one CCD entry point that did not
+    // inherit its zero-path fix (the seam asymmetry this crate keeps producing: N-1 of N sibling
+    // paths share a helper and the Nth open-codes it).
+    let (paths, mut modes) = query_active_config()?;
     let saved = (paths.clone(), modes.clone());
 
     // The virtual output's source width, to lay the other displays out to its right.
@@ -1649,5 +1653,46 @@ pub fn restore_displays_ccd(saved: &SavedConfig) {
             "display isolate (CCD): no external physical display active after the restore (rc={rc:#x}, connected={connected}) — forcing the EXTEND preset so the desk is not left dark"
         );
         force_extend_topology();
+    }
+}
+
+/// This file's first tests. Everything here reads the LIVE display topology, so each case is
+/// `#[ignore]`d and reports `ignored` rather than a vacuous `ok` when nobody runs it on hardware —
+/// the shape Phase 0.3 of the pf-vdisplay sweep settled on after finding env-guarded early-returns
+/// reporting success without executing.
+///
+/// Run with `cargo test -p pf-win-display -- --ignored` on a real box.
+///
+/// ⚠️ Read-only by construction, and it must stay that way. The obvious companion assertion —
+/// `isolate_displays_ccd(&[])` — is NOT written here on purpose: an empty keep set means "keep
+/// nothing", so on a box with displays it would deactivate every one of them and blank the
+/// operator's desk. The query below is the safe half of the same evidence.
+#[cfg(test)]
+mod live_tests {
+    use super::*;
+
+    /// A CCD query must never report FAILURE for a host that simply has nothing lit.
+    ///
+    /// `GetDisplayConfigBufferSizes` answers `numPaths = 0` for an ordinary state — every panel off
+    /// or in standby, a KVM switched away, a headless box. `QueryDisplayConfig` then rejects the
+    /// zero-count call rather than handing back an empty set, so asking anyway converted "nothing
+    /// is active" into "the query failed". That `None` propagates: `isolate_displays_ccd` returns
+    /// `None`, which is the teardown-gate condition whose recovery legs exist precisely to stop the
+    /// operator's panels being left dark.
+    ///
+    /// Verified on .173 (RTX 4090, Win11 26200) with the TV powered off — every monitor devnode
+    /// Code 45, `numPaths = 0` for `QDC_ALL_PATHS` as well — in a live logged-on console session,
+    /// where the query returned 0x57 ERROR_INVALID_PARAMETER (and 0x5 ERROR_ACCESS_DENIED from
+    /// session 0). This case FAILS there without the zero-path short-circuit and passes with it,
+    /// while a box that does have a display lit passes either way.
+    #[test]
+    #[ignore = "hardware: reads the live display topology"]
+    fn a_host_with_nothing_lit_reports_zero_actives_rather_than_a_failed_query() {
+        let n = count_other_active(&[]).expect(
+            "count_other_active returned None, i.e. the CCD query was reported as FAILED. On a \
+             host with no active display path that is the zero-path conflation, and it is what \
+             makes isolate_displays_ccd yield None on a perfectly healthy machine",
+        );
+        tracing::info!("live CCD query: {n} active display path(s)");
     }
 }
