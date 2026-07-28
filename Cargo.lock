@@ -3051,6 +3051,7 @@ dependencies = [
  "sha2",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "utoipa",
  "wayland-backend",
  "wayland-client",

@@ -1010,6 +1010,10 @@ mod tests {
     #[test]
     #[ignore = "needs the pf-vdisplay driver on real hardware; run with --ignored"]
     fn live_a_failed_first_isolate_is_recovered_by_adopting_the_next() {
+        // Without this the run is BLIND: the adoption arm and the dark-desk backstop announce
+        // themselves only through `tracing`, and a bare test harness has no subscriber. The first
+        // on-glass run could see the panel stay dark but not say WHICH link broke.
+        init_test_tracing();
         assert!(
             std::env::var("PUNKTFUNK_NO_ISOLATE").is_err(),
             "PUNKTFUNK_NO_ISOLATE forces Topology::Extend — this case needs Exclusive"
@@ -1036,10 +1040,19 @@ mod tests {
             })
             .expect("create member 1");
         thread::sleep(Duration::from_secs(2));
+        // ⭐ THE MEASUREMENT THAT SEPARATES THE TWO CANDIDATES. Member 1's isolate was injected to
+        // fail, so nothing of OURS deactivated anything here. If the operator's panel is ALREADY
+        // dark at this point, the arriving IddCx monitor took the desktop on its own — and every
+        // snapshot taken from here on records "panel off", so member 2's adopted snapshot is
+        // POISONED AT BIRTH and restoring it faithfully restores darkness. If the panel is still
+        // lit here, poisoning is excluded and the failure is downstream (adoption never fired, or
+        // the restore/backstop did and could not re-light it).
+        let physicals_after_m1 = active_physicals();
         println!(
             "after member 1 (isolate INJECTED to fail): {:?}",
             active_targets()
         );
+        println!("physicals after member 1  : {physicals_after_m1:?}  <- poisoned-at-birth probe");
 
         let mut vd2 = PfVdisplayDisplay::new().expect("open pf-vdisplay (member 2)");
         vd2.set_client_identity(Some([0xB2; 32]));
@@ -1075,11 +1088,20 @@ mod tests {
         println!("physicals after teardown  : {physicals_after:?}");
         assert!(
             !physicals_after.is_empty(),
-            "the operator's physical panel was left DEACTIVATED after teardown. The first \
-             member's isolate failed, so the group held no restore snapshot; the second member's \
-             isolate deactivated the physicals and its snapshot was discarded (sweep §5 3.2). \
-             Active targets now: {:?}",
-            active_targets()
+            "the operator's physical panel was left DEACTIVATED after teardown (sweep §5 3.2). \
+             Active targets now: {:?}.\n\
+             Which candidate this run implicates — read it off the poisoned-at-birth probe above:\n\
+             * physicals after member 1 was EMPTY ({m1_empty}) -> the snapshot member 2 adopted was \
+             already poisoned: the panel went dark at member 1's create (IddCx auto-activation), so \
+             the adopted topology records 'panel off' and restoring it faithfully restores darkness. \
+             Adoption is working; the SNAPSHOT SOURCE is the defect.\n\
+             * physicals after member 1 was NON-empty -> poisoning is excluded; the break is \
+             downstream. Check the trace for 'adopting this member's' (the adoption arm) and for \
+             'no external physical display active after the restore' (the dark-desk backstop). A \
+             missing adoption line means teardown's restore was never gated on; a backstop line \
+             followed by a non-zero force-EXTEND rc means the remedy itself failed.",
+            active_targets(),
+            m1_empty = physicals_after_m1.is_empty()
         );
     }
 
@@ -1128,6 +1150,27 @@ mod tests {
             .filter(|t| t.active)
             .map(|t| (t.target_id, format!("{} [{}]", t.friendly, t.tech)))
             .collect()
+    }
+
+    /// Surface the manager/backend `tracing` output on stdout for a live case.
+    ///
+    /// These on-glass cases drive decision points — the isolate ladder, the snapshot-adoption arm,
+    /// `restore_displays_ccd`'s dark-desk backstop — whose ONLY account of what they chose is a
+    /// `tracing` event. A bare `cargo test` harness installs no subscriber, so those events go
+    /// nowhere and a failing run cannot say which link broke; that is exactly what left §5 3.2's
+    /// two candidates undistinguished after the first on-glass run.
+    ///
+    /// `with_test_writer` routes through the harness's capture, so the output appears under
+    /// `--nocapture` (and on failure) rather than racing `println!`. Idempotent and non-fatal: the
+    /// global default can only be set once per process, and several live cases may run in one
+    /// binary, so a second call is a no-op rather than a panic that would fail an unrelated test.
+    /// `RUST_LOG` still wins when set; the default is `debug` for our own crates, which is where
+    /// the ladder's reasoning lives.
+    fn init_test_tracing() {
+        use tracing_subscriber::{fmt, EnvFilter};
+        let filter = EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| EnvFilter::new("pf_vdisplay=debug,pf_win_display=debug"));
+        let _ = fmt().with_env_filter(filter).with_test_writer().try_init();
     }
 
     /// The active targets that are EXTERNAL PHYSICAL panels — the operator's actual desk.
@@ -1213,8 +1256,9 @@ mod tests {
     fn live_inplace_resize() {
         // Live-run diagnostics: surface the manager/backend tracing (activation ladder, settle
         // waits, UPDATE_MODES) on stdout — a bare test harness has no subscriber, which made the
-        // first on-glass run blind.
-        // (tracing-subscriber is not a dep of this crate — run the host binary for traced runs.)
+        // first on-glass run blind. `tracing-subscriber` is now a dev-dependency, so this case no
+        // longer has to be re-run through the host binary to be traced.
+        init_test_tracing();
         // Context probe: can this process see the CCD active-path set at all? (`None` = the query
         // itself fails in this session/window-station — the whole ladder would be blind, and a
         // "monitor never activated" verdict would be an artifact of the test context.)
