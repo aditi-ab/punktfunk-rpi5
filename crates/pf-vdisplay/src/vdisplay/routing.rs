@@ -62,8 +62,56 @@ fn pick_gamescope_mode(
 /// foreign gamescope on an infra-less box), or **bare spawn** (a per-session headless gamescope
 /// nesting the session's launch command — the plain-distro default). `PUNKTFUNK_GAMESCOPE_MANAGED`
 /// forces managed over all of it.
+/// The operator's gamescope overrides, sampled ONCE — before this module has written anything.
+///
+/// [`apply_input_env`] both WRITES `PUNKTFUNK_GAMESCOPE_NODE`/`_SESSION` (to publish the sub-mode it
+/// chose) and READS them as operator overrides. Reading them live therefore fed the ladder its own
+/// previous output: the Attach arm sets `_NODE=auto`, and `node_env` sits at rung 2 of
+/// [`pick_gamescope_mode`] — ABOVE `dedicated_launch` at rung 3 — so one Attach decision latched
+/// Attach for the rest of the host's life and silently overrode `game_session=dedicated`. Only rung
+/// 1 (`_MANAGED`) could escape, because the Spawn arm that would clear the keys sits below the rung
+/// that by then always fired.
+///
+/// Sampling at first use keeps the override's actual meaning — "the operator set this before we
+/// ran" — and makes it immune to our own writes. The live reads that remain
+/// ([`launch_is_nested`], gamescope's `poolable_now`) are deliberate: those consume the PUBLISHED
+/// decision, which is what the keys carry after this function has run.
+#[cfg(target_os = "linux")]
+static OPERATOR_GAMESCOPE: std::sync::OnceLock<OperatorGamescope> = std::sync::OnceLock::new();
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug)]
+struct OperatorGamescope {
+    managed: bool,
+    attach: bool,
+    node: bool,
+    session: bool,
+}
+
+#[cfg(target_os = "linux")]
+fn operator_gamescope() -> OperatorGamescope {
+    *OPERATOR_GAMESCOPE.get_or_init(|| {
+        let ov = with_env_lock(|| OperatorGamescope {
+            managed: std::env::var_os("PUNKTFUNK_GAMESCOPE_MANAGED").is_some(),
+            attach: std::env::var_os("PUNKTFUNK_GAMESCOPE_ATTACH").is_some(),
+            node: std::env::var_os("PUNKTFUNK_GAMESCOPE_NODE").is_some(),
+            session: std::env::var_os("PUNKTFUNK_GAMESCOPE_SESSION").is_some(),
+        });
+        if ov.managed || ov.attach || ov.node || ov.session {
+            tracing::info!(
+                ?ov,
+                "gamescope: operator sub-mode overrides sampled from the environment"
+            );
+        }
+        ov
+    })
+}
+
 #[cfg(target_os = "linux")]
 pub fn apply_input_env(chosen: Compositor, dedicated_launch: bool) {
+    // Sampled BEFORE the lock — `operator_gamescope` takes it itself, and this mutex is not
+    // reentrant.
+    let ov = operator_gamescope();
     let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let backend = match chosen {
         Compositor::Gamescope => "gamescope",
@@ -80,10 +128,10 @@ pub fn apply_input_env(chosen: Compositor, dedicated_launch: bool) {
     if chosen == Compositor::Gamescope {
         let mode = pick_gamescope_mode(
             dedicated_launch,
-            std::env::var_os("PUNKTFUNK_GAMESCOPE_MANAGED").is_some(),
-            std::env::var_os("PUNKTFUNK_GAMESCOPE_ATTACH").is_some(),
-            std::env::var_os("PUNKTFUNK_GAMESCOPE_NODE").is_some(),
-            std::env::var_os("PUNKTFUNK_GAMESCOPE_SESSION").is_some(),
+            ov.managed,
+            ov.attach,
+            ov.node,
+            ov.session,
             gamescope::managed_session_available(),
             gamescope::foreign_gamescope_running(),
         );
@@ -315,5 +363,28 @@ mod tests {
         assert_eq!(pick(true, true, false, false, false, true, false), Managed);
         assert_eq!(pick(true, false, true, false, false, false, false), Attach);
         assert_eq!(pick(true, false, false, true, false, false, false), Attach);
+    }
+
+    /// The ladder must not be able to read back its own output. `apply_input_env`'s Attach arm
+    /// writes `PUNKTFUNK_GAMESCOPE_NODE=auto`, and `node_env` outranks `dedicated_launch` — so when
+    /// the override was read live, one Attach latched Attach for the host's lifetime and silently
+    /// overrode `game_session=dedicated`. Sampling once is what breaks the loop; this pins that the
+    /// sample does not move when the key is written afterwards.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn operator_overrides_do_not_see_our_own_writes() {
+        use super::operator_gamescope;
+        let first = operator_gamescope();
+        let restore = crate::with_env_lock(|| std::env::var_os("PUNKTFUNK_GAMESCOPE_NODE"));
+        crate::with_env_lock(|| std::env::set_var("PUNKTFUNK_GAMESCOPE_NODE", "auto"));
+        let second = operator_gamescope();
+        crate::with_env_lock(|| match &restore {
+            Some(v) => std::env::set_var("PUNKTFUNK_GAMESCOPE_NODE", v),
+            None => std::env::remove_var("PUNKTFUNK_GAMESCOPE_NODE"),
+        });
+        assert_eq!(
+            second.node, first.node,
+            "writing the key we publish must not turn into an operator override"
+        );
     }
 }

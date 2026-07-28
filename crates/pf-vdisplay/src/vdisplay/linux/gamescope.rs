@@ -294,13 +294,23 @@ impl VirtualDisplay for GamescopeDisplay {
         // full Steam-Deck-UI session headless at the client's resolution + refresh — so games SEE
         // them (via the injected --nested-refresh + generated CVT modes, not the box's TV EDID) —
         // and relaunch it when the client's mode changes. Reuses the node + EIS discovery below.
-        if let Ok(client) = std::env::var("PUNKTFUNK_GAMESCOPE_SESSION") {
+        // Both keys read in ONE guarded snapshot: `apply_input_env` writes them under the env
+        // lock but releases it before they are consumed, so reading them live here raced its
+        // writes — and read them WITHOUT the lock that `poolable_now` and `launch_is_nested` take
+        // for the same two keys.
+        let (session_env, node_env) = crate::with_env_lock(|| {
+            (
+                std::env::var("PUNKTFUNK_GAMESCOPE_SESSION").ok(),
+                std::env::var("PUNKTFUNK_GAMESCOPE_NODE").ok(),
+            )
+        });
+        if let Some(client) = session_env {
             return create_managed_session(&client, mode, self.hdr);
         }
         // Attach to an already-running gamescope (a foreign / externally-launched session) instead
         // of spawning our own: capture its node AND inject into its EIS socket.
         // PUNKTFUNK_GAMESCOPE_NODE=<id|auto>; "auto" discovers the gamescope `Video/Source` node.
-        if let Ok(id) = std::env::var("PUNKTFUNK_GAMESCOPE_NODE") {
+        if let Some(id) = node_env {
             let node_id: u32 = if id.trim().eq_ignore_ascii_case("auto") {
                 // Attach to the box-owned game-mode session, but FIRST make it run at the connecting
                 // client's resolution (the box is headless, so its game-mode mode is ours to set).

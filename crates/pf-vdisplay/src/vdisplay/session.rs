@@ -190,11 +190,12 @@ impl ActiveSession {
     // session to describe.
     #[cfg_attr(target_os = "linux", allow(dead_code))]
     fn none() -> ActiveSession {
+        let probe = EnvProbe::sample();
         ActiveSession {
             kind: ActiveKind::None,
             env: SessionEnv {
-                xdg_runtime_dir: default_runtime_dir(),
-                dbus_session_bus_address: default_bus(&default_runtime_dir()),
+                xdg_runtime_dir: default_runtime_dir(&probe),
+                dbus_session_bus_address: default_bus(&probe, &default_runtime_dir(&probe)),
                 ..Default::default()
             },
             compositor_pid: None,
@@ -214,9 +215,49 @@ pub fn compositor_for_kind(kind: ActiveKind) -> Option<Compositor> {
     }
 }
 
+/// The session-scoped variables detection reads, sampled ONCE under [`ENV_LOCK`].
+///
+/// Detection used to call `std::env::var` at five points spread across a `/proc` scan, none of them
+/// holding the lock its own writers take — the getenv/setenv data race [`crate::ENV_LOCK`]'s doc
+/// describes as UB that "could crash the host" (glibc `setenv` can realloc `environ` and free the
+/// old value string under a concurrent reader). Sampling up front closes that.
+///
+/// Sampling rather than simply taking the lock for the whole of [`detect_active_session`] is
+/// deliberate: that function runs every second from the host's session watcher and scans `/proc`,
+/// and holding a process-wide lock across a directory walk trades one problem for another. The
+/// snapshot costs one acquisition and five reads with no syscalls in between.
+///
+/// It also makes the readers below pure functions of their inputs, which is what lets the tests
+/// exercise them without mutating process-global state.
+#[derive(Clone, Debug, Default)]
+struct EnvProbe {
+    xdg_runtime_dir: Option<String>,
+    dbus_session_bus_address: Option<String>,
+    wayland_display: Option<String>,
+    hyprland_signature: Option<String>,
+    swaysock: Option<String>,
+}
+
+impl EnvProbe {
+    /// Every var is `filter`ed non-empty: `Ok("")` is not a usable runtime dir or socket path, and
+    /// treating it as one is how an empty `XDG_RUNTIME_DIR` used to yield a *relative* path.
+    fn sample() -> EnvProbe {
+        fn v(k: &str) -> Option<String> {
+            std::env::var(k).ok().filter(|s| !s.is_empty())
+        }
+        crate::with_env_lock(|| EnvProbe {
+            xdg_runtime_dir: v("XDG_RUNTIME_DIR"),
+            dbus_session_bus_address: v("DBUS_SESSION_BUS_ADDRESS"),
+            wayland_display: v("WAYLAND_DISPLAY"),
+            hyprland_signature: v("HYPRLAND_INSTANCE_SIGNATURE"),
+            swaysock: v("SWAYSOCK"),
+        })
+    }
+}
+
 #[cfg(target_os = "linux")]
-fn default_runtime_dir() -> String {
-    std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| {
+fn default_runtime_dir(env: &EnvProbe) -> String {
+    env.xdg_runtime_dir.clone().unwrap_or_else(|| {
         // SAFETY: `getuid()` is a parameterless POSIX call that always succeeds and touches no
         // memory — it just returns the calling process's real uid. Nothing is aliased or freed.
         let uid = unsafe { libc::getuid() };
@@ -225,12 +266,14 @@ fn default_runtime_dir() -> String {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn default_runtime_dir() -> String {
-    std::env::var("XDG_RUNTIME_DIR").unwrap_or_default()
+fn default_runtime_dir(env: &EnvProbe) -> String {
+    env.xdg_runtime_dir.clone().unwrap_or_default()
 }
 
-fn default_bus(runtime: &str) -> String {
-    std::env::var("DBUS_SESSION_BUS_ADDRESS").unwrap_or_else(|_| format!("unix:path={runtime}/bus"))
+fn default_bus(env: &EnvProbe, runtime: &str) -> String {
+    env.dbus_session_bus_address
+        .clone()
+        .unwrap_or_else(|| format!("unix:path={runtime}/bus"))
 }
 
 /// Detect the graphical session live for our uid right now (cheap, side-effect-free: a `/proc`
@@ -243,8 +286,11 @@ pub fn detect_active_session() -> ActiveSession {
     // SAFETY: `getuid()` is a parameterless POSIX call that always succeeds and touches no memory —
     // it just returns the calling process's real uid. Nothing is aliased or freed.
     let uid = unsafe { libc::getuid() };
-    let xdg_runtime_dir = default_runtime_dir();
-    let dbus = default_bus(&xdg_runtime_dir);
+    // ONE sample of the session-scoped env, before any scanning — see [`EnvProbe`]. Everything
+    // below reads this snapshot, never the process env.
+    let env = EnvProbe::sample();
+    let xdg_runtime_dir = default_runtime_dir(&env);
+    let dbus = default_bus(&env, &xdg_runtime_dir);
 
     // Process probe: the running graphical compositor of THIS uid decides the kind. Priority lets
     // a real desktop (kwin/gnome/sway) win over a leftover gamescope child. comm names mirror the
@@ -306,7 +352,7 @@ pub fn detect_active_session() -> ActiveSession {
     // driven and don't.
     let wayland_display = match kind {
         ActiveKind::DesktopKde | ActiveKind::DesktopWlroots | ActiveKind::DesktopHyprland => {
-            find_wayland_socket(&xdg_runtime_dir, uid)
+            find_wayland_socket(&env, &xdg_runtime_dir, uid)
         }
         _ => None,
     };
@@ -323,13 +369,13 @@ pub fn detect_active_session() -> ActiveSession {
     // Discover the Hyprland instance signature so `hyprctl` can reach the compositor even when the
     // host runs as a systemd `--user` service that never inherited the session env.
     let hyprland_signature = match kind {
-        ActiveKind::DesktopHyprland => find_hypr_signature(&xdg_runtime_dir, uid),
+        ActiveKind::DesktopHyprland => find_hypr_signature(&env, &xdg_runtime_dir, uid),
         _ => None,
     };
     // Same idea for sway's IPC socket: without it `swaymsg` has nothing to talk to, and a
     // `systemd --user` host never inherited it.
     let sway_socket = match kind {
-        ActiveKind::DesktopWlroots => find_sway_socket(&xdg_runtime_dir, uid, winning_pid),
+        ActiveKind::DesktopWlroots => find_sway_socket(&env, &xdg_runtime_dir, uid, winning_pid),
         _ => None,
     };
     ActiveSession {
@@ -353,12 +399,12 @@ pub fn detect_active_session() -> ActiveSession {
 /// normally exposes exactly one. (Phase-2 refinement: match the instance to `compositor_pid` via
 /// `hyprctl instances` when several coexist — `design/hyprland-support.md` §Phase-1.1.)
 #[cfg(target_os = "linux")]
-fn find_hypr_signature(runtime: &str, uid: u32) -> Option<String> {
+fn find_hypr_signature(env: &EnvProbe, runtime: &str, uid: u32) -> Option<String> {
     use std::os::unix::fs::MetadataExt;
     let hypr = std::path::Path::new(runtime).join("hypr");
-    if let Ok(sig) = std::env::var("HYPRLAND_INSTANCE_SIGNATURE") {
-        if !sig.is_empty() && hypr.join(&sig).join(".socket.sock").exists() {
-            return Some(sig);
+    if let Some(sig) = &env.hyprland_signature {
+        if hypr.join(sig).join(".socket.sock").exists() {
+            return Some(sig.clone());
         }
     }
     let mut cands: Vec<(std::time::SystemTime, String)> = Vec::new();
@@ -387,11 +433,11 @@ fn find_hypr_signature(runtime: &str, uid: u32) -> Option<String> {
 /// `None` on river: it is the other [`ActiveKind::DesktopWlroots`] compositor and has no sway IPC —
 /// which is the honest answer, since the wlroots backend drives sway through `swaymsg`.
 #[cfg(target_os = "linux")]
-fn find_sway_socket(runtime: &str, uid: u32, pid: Option<u32>) -> Option<String> {
+fn find_sway_socket(env: &EnvProbe, runtime: &str, uid: u32, pid: Option<u32>) -> Option<String> {
     use std::os::unix::fs::MetadataExt;
-    if let Ok(s) = std::env::var("SWAYSOCK") {
-        if !s.is_empty() && std::path::Path::new(&s).exists() {
-            return Some(s);
+    if let Some(s) = &env.swaysock {
+        if std::path::Path::new(s).exists() {
+            return Some(s.clone());
         }
     }
     if let Some(pid) = pid {
@@ -427,10 +473,10 @@ pub fn detect_active_session() -> ActiveSession {
 /// valid inherited `WAYLAND_DISPLAY` first; otherwise take the newest-mtime socket we own (a
 /// desktop session normally exposes exactly one).
 #[cfg(target_os = "linux")]
-fn find_wayland_socket(runtime: &str, uid: u32) -> Option<String> {
+fn find_wayland_socket(env: &EnvProbe, runtime: &str, uid: u32) -> Option<String> {
     use std::os::unix::fs::MetadataExt;
-    if let Ok(w) = std::env::var("WAYLAND_DISPLAY") {
-        if !w.is_empty() {
+    if let Some(w) = env.wayland_display.clone() {
+        {
             let p = if w.starts_with('/') {
                 std::path::PathBuf::from(&w)
             } else {
@@ -666,18 +712,11 @@ mod tests {
         }
     }
 
-    /// Run `f` with `SWAYSOCK` unset, so the "trust what we inherited" rung can't decide the test.
-    /// Serialized on the crate's env lock — these tests mutate process-global state.
-    fn without_inherited_swaysock<R>(f: impl FnOnce() -> R) -> R {
-        crate::with_env_lock(|| {
-            let prev = std::env::var_os("SWAYSOCK");
-            std::env::remove_var("SWAYSOCK");
-            let out = f();
-            if let Some(p) = prev {
-                std::env::set_var("SWAYSOCK", p);
-            }
-            out
-        })
+    /// A probe with nothing inherited, so the "trust what we inherited" rung can't decide the test.
+    /// The readers take this by argument, so — unlike the `set_var`/`remove_var` dance this replaced
+    /// — the tests no longer mutate process-global state to steer them.
+    fn no_inherited_env() -> EnvProbe {
+        EnvProbe::default()
     }
 
     /// The point of deriving it: the socket that belongs to the compositor detection actually found,
@@ -686,7 +725,7 @@ mod tests {
     #[test]
     fn the_socket_matching_the_detected_pid_wins() {
         let rt = FakeRuntime::new("exact", &[4242, 9999]);
-        let got = without_inherited_swaysock(|| find_sway_socket(rt.path(), rt.uid, Some(4242)));
+        let got = find_sway_socket(&no_inherited_env(), rt.path(), rt.uid, Some(4242));
         assert_eq!(
             got,
             Some(format!("{}/sway-ipc.{}.4242.sock", rt.path(), rt.uid))
@@ -698,7 +737,7 @@ mod tests {
     #[test]
     fn an_unmatched_pid_falls_back_to_the_socket_that_is_there() {
         let rt = FakeRuntime::new("fallback", &[777]);
-        let got = without_inherited_swaysock(|| find_sway_socket(rt.path(), rt.uid, Some(12345)));
+        let got = find_sway_socket(&no_inherited_env(), rt.path(), rt.uid, Some(12345));
         assert_eq!(
             got,
             Some(format!("{}/sway-ipc.{}.777.sock", rt.path(), rt.uid))
@@ -711,7 +750,7 @@ mod tests {
     #[test]
     fn no_sway_ipc_socket_reports_none() {
         let rt = FakeRuntime::new("none", &[]);
-        let got = without_inherited_swaysock(|| find_sway_socket(rt.path(), rt.uid, Some(1)));
+        let got = find_sway_socket(&no_inherited_env(), rt.path(), rt.uid, Some(1));
         assert_eq!(got, None);
     }
 
@@ -725,7 +764,7 @@ mod tests {
         let rt = FakeRuntime::new("otheruid", &[]);
         let other = rt.uid.wrapping_add(1);
         std::fs::write(rt.dir.join(format!("sway-ipc.{other}.500.sock")), b"").unwrap();
-        let got = without_inherited_swaysock(|| find_sway_socket(rt.path(), rt.uid, Some(500)));
+        let got = find_sway_socket(&no_inherited_env(), rt.path(), rt.uid, Some(500));
         assert_eq!(got, None);
     }
 
@@ -757,7 +796,7 @@ mod tests {
         // Query with a pid that does NOT match the filename: the exact-path shortcut earlier in
         // `find_sway_socket` returns before the ownership guard, so hitting it would make this
         // test vacuous in the same way the one above was.
-        let got = without_inherited_swaysock(|| find_sway_socket(rt.path(), rt.uid, Some(999)));
+        let got = find_sway_socket(&no_inherited_env(), rt.path(), rt.uid, Some(999));
         assert_eq!(got, None, "a socket owned by another uid must be rejected");
     }
 }
