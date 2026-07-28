@@ -10,9 +10,13 @@
 // STORE LAYOUT. The scratch planes are `r16`/`rg16` and get `vkCmdCopyImage`d into the
 // `G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16` picture, whose plane texels put the 10-bit value in
 // the HIGH bits of a 16-bit word (`X6` = 6 unused low bits). So a written normalized value `f`
-// lands as `round(f * 65535)` and must equal `code10 << 6` — hence the `CODE10` factor below,
-// NOT `1/1023`. Getting this wrong is a ~1.6% luminance error: invisible on a test pattern,
-// visible as crushed blacks on real content.
+// lands as `round(f * 65535)` and must equal `code10 << 6` — hence the `CODE10` factor below.
+//
+// What actually goes wrong if you change it: the `<< 6` PLACEMENT is the load-bearing part —
+// dropping it (writing `code10 / 65535.0`) is 64x too dark, i.e. a black picture, which is at
+// least obvious. Writing `code10 / 1023.0` instead is only ~0.1% high (65472 vs 65535 full
+// scale) and is genuinely harmless; it is wrong, not dangerous. Verified by round-trip on RADV
+// 2026-07-28: fed (160,160,800) 10-bit codes, decoded back (159,158,796).
 //
 // Rebuild: glslangValidator -V rgb2yuv10.comp -o rgb2yuv10.spv   (vendored beside this file)
 layout(local_size_x = 8, local_size_y = 8) in;

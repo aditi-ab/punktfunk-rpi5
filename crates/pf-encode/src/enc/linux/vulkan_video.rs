@@ -805,6 +805,24 @@ impl VulkanVideoEncoder {
         bitrate_bps: u64,
         want_rgb: bool,
     ) -> Result<Self> {
+        Self::open_opts_depth(codec, width, height, fps, bitrate_bps, want_rgb, false)
+    }
+
+    /// [`open_opts`](Self::open_opts) with the bit depth explicit — the 10-bit smokes' entry
+    /// point. A 10-bit session takes the packed 2:10:10:10 source format the HDR capture
+    /// negotiates (`xRGB_210LE` → `A2R10G10B10_UNORM_PACK32`; that is the one gamescope's node
+    /// actually fixates, verified on RADV 2026-07-28), so the smoke drives the same formats a
+    /// real session does.
+    #[cfg(test)]
+    pub(crate) fn open_opts_depth(
+        codec: Codec,
+        width: u32,
+        height: u32,
+        fps: u32,
+        bitrate_bps: u64,
+        want_rgb: bool,
+        ten_bit: bool,
+    ) -> Result<Self> {
         Self::open_opts_inner(
             codec,
             width,
@@ -813,8 +831,12 @@ impl VulkanVideoEncoder {
             bitrate_bps,
             want_rgb,
             false,
-            false,
-            vk::Format::B8G8R8A8_UNORM,
+            ten_bit,
+            if ten_bit {
+                vk::Format::A2R10G10B10_UNORM_PACK32
+            } else {
+                vk::Format::B8G8R8A8_UNORM
+            },
         )
     }
 
@@ -4515,6 +4537,124 @@ mod tests {
     fn vulkan_smoke_rgb_av1() {
         if let Some(aus) = run_smoke_opts(Codec::Av1, true) {
             dump_smoke(&aus, "rgb.obu");
+        }
+    }
+
+    /// A packed 2:10:10:10 (`xRGB_210LE` / `PixelFormat::X2Rgb10`) CPU frame — the layout a
+    /// gamescope HDR capture delivers, and the one its node actually fixates. Channels are given
+    /// as 10-bit code values so the test can speak in the units the PQ container uses.
+    fn cpu_frame_rgb10(w: u32, h: u32, pts_ns: u64, rgb10: [u16; 3]) -> CapturedFrame {
+        // x:R:G:B 2:10:10:10 little-endian — B in bits 0-9, G in 10-19, R in 20-29.
+        let word = ((rgb10[0] as u32 & 0x3FF) << 20)
+            | ((rgb10[1] as u32 & 0x3FF) << 10)
+            | (rgb10[2] as u32 & 0x3FF);
+        let mut buf = vec![0u8; (w * h * 4) as usize];
+        for px in buf.chunks_exact_mut(4) {
+            px.copy_from_slice(&word.to_le_bytes());
+        }
+        CapturedFrame {
+            width: w,
+            height: h,
+            pts_ns,
+            format: PixelFormat::X2Rgb10,
+            payload: FramePayload::Cpu(buf),
+            cursor: None,
+        }
+    }
+
+    /// The 10-bit twin of [`run_smoke_opts`]: a full HDR session end to end — Main10 / AV1-at-10
+    /// profile, `G10X6…3PACK16` picture + DPB, `rgb2yuv10.comp` (or the EFC's BT.2020 conversion
+    /// when `rgb`), and headers carrying the depth + BT.2020/PQ signalling.
+    ///
+    /// This is the least-exercised path in the backend — nothing had ever created a 10-bit video
+    /// session here — so the assertions stay where a smoke test can be honest: every submit
+    /// encodes, the AU count matches, and the depth the encoder settled on is the one asked for.
+    /// Colour truth is out of band (the `dump_smoke` + ffmpeg recipe), because a shader that
+    /// wrote the 10 bits into the wrong end of the word still produces a decodable stream.
+    ///
+    /// `None` = the device declined the 10-bit profile (or, with `rgb`, the BT.2020 EFC
+    /// conversion): a soft skip, not a failure — that is the same verdict `open_amd_intel`
+    /// consults to route such a session to VAAPI.
+    fn run_smoke_10bit(codec: Codec, rgb: bool) -> Option<Vec<crate::EncodedFrame>> {
+        let env_dim = |k: &str, d: u32| {
+            std::env::var(k)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(d)
+        };
+        let (w, h) = (env_dim("PF_SMOKE_W", 256), env_dim("PF_SMOKE_H", 256));
+        let mut enc =
+            match VulkanVideoEncoder::open_opts_depth(codec, w, h, 60, 10_000_000, rgb, true) {
+                Ok(e) => e,
+                Err(e) => {
+                    eprintln!("run_smoke_10bit({codec:?}, rgb={rgb}): open declined — {e:#}");
+                    return None;
+                }
+            };
+        if rgb && enc.rgb.is_none() {
+            eprintln!("run_smoke_10bit: BT.2020 RGB-direct unavailable on this driver — skipping");
+            return None;
+        }
+        assert!(enc.ten_bit, "a 10-bit session must report 10-bit");
+
+        // 10-bit code values spanning the range, so a wrong shift shows up as a wildly wrong
+        // luminance in the dump rather than a plausible-looking picture.
+        let colors: [[u16; 3]; 8] = [
+            [160, 160, 800],
+            [160, 800, 160],
+            [800, 160, 160],
+            [800, 800, 160],
+            [160, 800, 800],
+            [800, 160, 800],
+            [480, 800, 320],
+            [320, 480, 800],
+        ];
+        let mut aus: Vec<crate::EncodedFrame> = Vec::new();
+        for (i, c) in colors.iter().enumerate() {
+            enc.submit_indexed(&cpu_frame_rgb10(w, h, i as u64 * 16_666_667, *c), i as u32)
+                .expect("submit");
+            while let Some(au) = enc.poll().expect("poll") {
+                aus.push(au);
+            }
+        }
+        enc.flush().expect("flush");
+        while let Some(au) = enc.poll().expect("poll") {
+            aus.push(au);
+        }
+        assert_eq!(aus.len(), colors.len(), "one AU per submitted frame");
+        assert!(aus[0].keyframe, "frame 0 must be IDR");
+        for (i, au) in aus.iter().enumerate() {
+            assert!(!au.data.is_empty(), "AU {i} empty");
+        }
+        Some(aus)
+    }
+
+    /// HEVC **Main10** through the compute CSC — the AMD/Intel HDR path a gamescope session takes.
+    #[test]
+    #[ignore = "needs a real VK_KHR_video_encode_h265 device with a 10-bit profile"]
+    fn vulkan_smoke_10bit() {
+        if let Some(aus) = run_smoke_10bit(Codec::H265, false) {
+            dump_smoke(&aus, "10bit.h265");
+        }
+    }
+
+    /// AV1 at 10 bits — the codec whose driver coverage is thinner, hence its own smoke.
+    #[test]
+    #[ignore = "needs a real VK_KHR_video_encode_av1 device with a 10-bit profile"]
+    fn vulkan_smoke_10bit_av1() {
+        if let Some(aus) = run_smoke_10bit(Codec::Av1, false) {
+            dump_smoke(&aus, "10bit.obu");
+        }
+    }
+
+    /// HDR with **no host CSC at all**: the EFC does the BT.2020 conversion off the packed 10-bit
+    /// source. Soft-skips where the hardware advertises no `MODEL_YCBCR_2020`, which is the one
+    /// capability bit in this whole path that has never been seen reported by a real device.
+    #[test]
+    #[ignore = "needs VK_VALVE_video_encode_rgb_conversion with the BT.2020 model at 10-bit"]
+    fn vulkan_smoke_rgb_10bit() {
+        if let Some(aus) = run_smoke_10bit(Codec::H265, true) {
+            dump_smoke(&aus, "rgb.10bit.h265");
         }
     }
 
