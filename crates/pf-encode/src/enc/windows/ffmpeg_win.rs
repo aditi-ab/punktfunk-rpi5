@@ -61,8 +61,8 @@ use windows::Win32::Graphics::Dxgi::Common::{
 };
 
 use super::libav::{
-    apply_low_latency_rc, pixel_to_av, poll_encoder, PollOutcome, SWS_CS_BT2020, SWS_CS_ITU709,
-    SWS_POINT,
+    apply_low_latency_rc, pixel_to_av, poll_encoder, AvBuffer, PollOutcome, SWS_CS_BT2020,
+    SWS_CS_ITU709, SWS_POINT,
 };
 use ffmpeg::ffi; // = ffmpeg_sys_next
 
@@ -857,8 +857,11 @@ impl Drop for SystemInner {
 // ---------------------------------------------------------------------------------------------
 
 struct D3d11Hw {
-    device_ref: *mut ffi::AVBufferRef,
-    frames_ref: *mut ffi::AVBufferRef,
+    // Declared frames-BEFORE-device on purpose: these drop in declaration order, reproducing what
+    // the hand-written `Drop` this replaced did (the frames ctx holds its own ref on the device).
+    // Do not reorder these two fields.
+    frames_ref: AvBuffer,
+    device_ref: AvBuffer,
 }
 
 impl D3d11Hw {
@@ -871,30 +874,27 @@ impl D3d11Hw {
         h: u32,
         pool: c_int,
     ) -> Result<Self> {
-        let mut device_ref =
-            ffi::av_hwdevice_ctx_alloc(ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA);
-        if device_ref.is_null() {
-            bail!("av_hwdevice_ctx_alloc(D3D11VA) failed");
-        }
-        let dev_ctx = (*device_ref).data as *mut ffi::AVHWDeviceContext;
+        // Owned from the moment it exists: each `bail!` below drops what was built so far, so none
+        // of the failure branches carry cleanup of their own.
+        let device_ref = AvBuffer::from_raw(ffi::av_hwdevice_ctx_alloc(
+            ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA,
+        ))
+        .context("av_hwdevice_ctx_alloc(D3D11VA) failed")?;
+        let dev_ctx = (*device_ref.as_ptr()).data as *mut ffi::AVHWDeviceContext;
         let d11 = (*dev_ctx).hwctx as *mut AVD3D11VADeviceContext;
         // Share the capture device. FFmpeg's d3d11va teardown Releases `device`, so hand it an owned
         // reference (clone = AddRef, forget = don't Release ours). init() fills
         // device_context / video_device / video_context / the default lock from a non-null device.
         std::mem::forget(device.clone());
         (*d11).device = device.as_raw();
-        let r = ffi::av_hwdevice_ctx_init(device_ref);
+        let r = ffi::av_hwdevice_ctx_init(device_ref.as_ptr());
         if r < 0 {
-            ffi::av_buffer_unref(&mut device_ref);
             bail!("av_hwdevice_ctx_init(D3D11VA) failed ({r})");
         }
 
-        let mut frames_ref = ffi::av_hwframe_ctx_alloc(device_ref);
-        if frames_ref.is_null() {
-            ffi::av_buffer_unref(&mut device_ref);
-            bail!("av_hwframe_ctx_alloc(D3D11VA) failed");
-        }
-        let fc = (*frames_ref).data as *mut ffi::AVHWFramesContext;
+        let frames_ref = AvBuffer::from_raw(ffi::av_hwframe_ctx_alloc(device_ref.as_ptr()))
+            .context("av_hwframe_ctx_alloc(D3D11VA) failed")?;
+        let fc = (*frames_ref.as_ptr()).data as *mut ffi::AVHWFramesContext;
         (*fc).format = ffi::AVPixelFormat::AV_PIX_FMT_D3D11;
         (*fc).sw_format = sw_format;
         (*fc).width = w as c_int;
@@ -902,33 +902,20 @@ impl D3d11Hw {
         (*fc).initial_pool_size = pool;
         let f11 = (*fc).hwctx as *mut AVD3D11VAFramesContext;
         (*f11).bind_flags = bind_flags;
-        let r = ffi::av_hwframe_ctx_init(frames_ref);
+        let r = ffi::av_hwframe_ctx_init(frames_ref.as_ptr());
         if r < 0 {
-            ffi::av_buffer_unref(&mut frames_ref);
-            ffi::av_buffer_unref(&mut device_ref);
             bail!("av_hwframe_ctx_init(D3D11VA) failed ({r})");
         }
         Ok(D3d11Hw {
-            device_ref,
             frames_ref,
+            device_ref,
         })
     }
 }
 
-impl Drop for D3d11Hw {
-    fn drop(&mut self) {
-        // SAFETY: `frames_ref`/`device_ref` are the two non-null `AVBufferRef`s `D3d11Hw::new` created
-        // (it bails before constructing `Self` if either alloc/init fails, so a live `D3d11Hw` always
-        // holds both). `av_buffer_unref` drops one reference and nulls the pointer through the `&mut`.
-        // This `Drop` runs exactly once and `D3d11Hw` owns these refs exclusively → no double-free /
-        // use-after-free. Frames are unref'd before the device because the frames ctx internally holds
-        // a ref on the device (refcounted, so the order is sound either way).
-        unsafe {
-            ffi::av_buffer_unref(&mut self.frames_ref);
-            ffi::av_buffer_unref(&mut self.device_ref);
-        }
-    }
-}
+// No `Drop` for `D3d11Hw`: each `AvBuffer` field unrefs itself, in declaration order (frames, then
+// device — see the field comment). The hand-written unref pair this replaced had to be kept in sync
+// with every failure branch in `new`; now there is one unref path per ref and none can skip it.
 
 struct ZeroCopyInner {
     vendor: WinVendor,
@@ -988,8 +975,8 @@ impl ZeroCopyInner {
             let (pix_fmt, dev_ref, frames_ref, mut qsv_device, mut qsv_frames) = match vendor {
                 WinVendor::Amf => (
                     ffi::AVPixelFormat::AV_PIX_FMT_D3D11,
-                    hw.device_ref,
-                    hw.frames_ref,
+                    hw.device_ref.as_ptr(),
+                    hw.frames_ref.as_ptr(),
                     ptr::null_mut(),
                     ptr::null_mut(),
                 ),
@@ -1000,7 +987,7 @@ impl ZeroCopyInner {
                     let r = ffi::av_hwdevice_ctx_create_derived(
                         &mut qsv_device,
                         ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_QSV,
-                        hw.device_ref,
+                        hw.device_ref.as_ptr(),
                         0,
                     );
                     if r < 0 {
@@ -1011,7 +998,7 @@ impl ZeroCopyInner {
                         &mut qsv_frames,
                         ffi::AVPixelFormat::AV_PIX_FMT_QSV,
                         qsv_device,
-                        hw.frames_ref,
+                        hw.frames_ref.as_ptr(),
                         ffi::AV_HWFRAME_MAP_DIRECT as c_int,
                     );
                     if r < 0 {
@@ -1089,7 +1076,7 @@ impl ZeroCopyInner {
             if d3d.is_null() {
                 bail!("av_frame_alloc(d3d11) failed");
             }
-            let r = ffi::av_hwframe_get_buffer(self.hw.frames_ref, d3d, 0);
+            let r = ffi::av_hwframe_get_buffer(self.hw.frames_ref.as_ptr(), d3d, 0);
             if r < 0 {
                 ffi::av_frame_free(&mut d3d);
                 bail!("av_hwframe_get_buffer(D3D11) failed ({r})");
