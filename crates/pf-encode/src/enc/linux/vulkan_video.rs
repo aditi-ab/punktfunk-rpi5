@@ -33,6 +33,22 @@ const P010: vk::Format = vk::Format::G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16;
 /// The session's 4:2:0 picture + DPB format for its bit depth. One function so the session
 /// create-info, the DPB image, its views and the per-frame encode source cannot drift apart —
 /// they must all name the SAME format or session creation fails.
+const fn component_depth(ten_bit: bool) -> vk::VideoComponentBitDepthFlagsKHR {
+    if ten_bit {
+        vk::VideoComponentBitDepthFlagsKHR::TYPE_10
+    } else {
+        vk::VideoComponentBitDepthFlagsKHR::TYPE_8
+    }
+}
+
+const fn h265_profile_idc(ten_bit: bool) -> vk::native::StdVideoH265ProfileIdc {
+    if ten_bit {
+        vk::native::StdVideoH265ProfileIdc_STD_VIDEO_H265_PROFILE_IDC_MAIN_10
+    } else {
+        vk::native::StdVideoH265ProfileIdc_STD_VIDEO_H265_PROFILE_IDC_MAIN
+    }
+}
+
 const fn yuv_format(hdr: bool) -> vk::Format {
     if hdr {
         P010
@@ -168,7 +184,7 @@ struct RgbProfileStack {
 }
 
 impl RgbProfileStack {
-    fn new(codec_op: vk::VideoCodecOperationFlagsKHR) -> Self {
+    fn new(codec_op: vk::VideoCodecOperationFlagsKHR, ten_bit: bool) -> Self {
         use super::vk_av1_encode as av1b;
         use super::vk_valve_rgb as vrgb;
         Self {
@@ -181,9 +197,8 @@ impl RgbProfileStack {
                 .video_usage_hints(vk::VideoEncodeUsageFlagsKHR::STREAMING)
                 .video_content_hints(vk::VideoEncodeContentFlagsKHR::RENDERED)
                 .tuning_mode(vk::VideoEncodeTuningModeKHR::ULTRA_LOW_LATENCY),
-            h265: vk::VideoEncodeH265ProfileInfoKHR::default().std_profile_idc(
-                vk::native::StdVideoH265ProfileIdc_STD_VIDEO_H265_PROFILE_IDC_MAIN,
-            ),
+            h265: vk::VideoEncodeH265ProfileInfoKHR::default()
+                .std_profile_idc(h265_profile_idc(ten_bit)),
             av1: av1b::VideoEncodeAV1ProfileInfoKHR {
                 s_type: av1b::stype(av1b::ST_PROFILE_INFO),
                 p_next: std::ptr::null(),
@@ -192,8 +207,8 @@ impl RgbProfileStack {
             profile: vk::VideoProfileInfoKHR::default()
                 .video_codec_operation(codec_op)
                 .chroma_subsampling(vk::VideoChromaSubsamplingFlagsKHR::TYPE_420)
-                .luma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8)
-                .chroma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8),
+                .luma_bit_depth(component_depth(ten_bit))
+                .chroma_bit_depth(component_depth(ten_bit)),
         }
     }
 
@@ -221,26 +236,26 @@ struct NativeProfileStack {
 }
 
 impl NativeProfileStack {
-    fn new(codec_op: vk::VideoCodecOperationFlagsKHR) -> Self {
+    fn new(codec_op: vk::VideoCodecOperationFlagsKHR, ten_bit: bool) -> Self {
         use super::vk_av1_encode as av1b;
         Self {
             usage: vk::VideoEncodeUsageInfoKHR::default()
                 .video_usage_hints(vk::VideoEncodeUsageFlagsKHR::STREAMING)
                 .video_content_hints(vk::VideoEncodeContentFlagsKHR::RENDERED)
                 .tuning_mode(vk::VideoEncodeTuningModeKHR::ULTRA_LOW_LATENCY),
-            h265: vk::VideoEncodeH265ProfileInfoKHR::default().std_profile_idc(
-                vk::native::StdVideoH265ProfileIdc_STD_VIDEO_H265_PROFILE_IDC_MAIN,
-            ),
+            h265: vk::VideoEncodeH265ProfileInfoKHR::default()
+                .std_profile_idc(h265_profile_idc(ten_bit)),
             av1: av1b::VideoEncodeAV1ProfileInfoKHR {
                 s_type: av1b::stype(av1b::ST_PROFILE_INFO),
                 p_next: std::ptr::null(),
+                // AV1 Main covers 8 AND 10 bits — the depth rides `VideoProfileInfoKHR` alone.
                 std_profile: vk::native::StdVideoAV1Profile_STD_VIDEO_AV1_PROFILE_MAIN,
             },
             profile: vk::VideoProfileInfoKHR::default()
                 .video_codec_operation(codec_op)
                 .chroma_subsampling(vk::VideoChromaSubsamplingFlagsKHR::TYPE_420)
-                .luma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8)
-                .chroma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8),
+                .luma_bit_depth(component_depth(ten_bit))
+                .chroma_bit_depth(component_depth(ten_bit)),
         }
     }
 
@@ -260,7 +275,7 @@ impl NativeProfileStack {
 /// profile rebuilds — the two must agree, profile identity is by value).
 /// The physical device + encode queue family a session runs on: the FIRST device exposing a
 /// `VIDEO_ENCODE` queue family that advertises `codec_op` (llvmpipe advertises none, so it drops
-/// out implicitly). Shared by [`VulkanVideoEncoder::open_inner`] and [`probe_encode_support`].
+/// out implicitly). Shared by [`VulkanVideoEncoder::open_inner`] and [`probe_encode_caps`].
 ///
 /// # Safety
 /// `instance` must be a live `ash::Instance` and `devices` handles enumerated from it.
@@ -291,57 +306,102 @@ unsafe fn find_encode_device(
     None
 }
 
-/// Can this GPU + driver open a Vulkan Video **encode** session for `codec` at all?
+/// What this device's Vulkan Video **encode** stack can actually do for one codec — the caps
+/// probe the negotiation stands on, so a session is never planned around a guess.
 ///
-/// This is the verdict the native-NV12 capture negotiation needs BEFORE it commits
-/// ([`crate::linux_native_nv12_ok`]): once the producer hands over two-plane NV12 there is no VAAPI
-/// fallback — libav would import it as packed RGB — so [`crate::open_video`] deliberately makes
-/// that open-failure fatal, and a Mesa built without `VK_KHR_video_encode_h265` therefore kills the
-/// session at its first frame instead of streaming on VAAPI.
+/// Two questions, and they are genuinely independent: an encode queue for the codec operation may
+/// exist while the silicon declines the 10-bit profile (older VCN, an Intel generation without
+/// Main10 encode). Answering only the first is what used to push every HDR session to libav VAAPI
+/// — losing real RFI recovery and the compute CSC's cursor blend for nothing on hardware that
+/// could do it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct VulkanEncodeCaps {
+    /// An encode queue advertises this codec's operation.
+    pub supported: bool,
+    /// The device accepts an 8-bit 4:2:0 profile for it (the ordinary SDR session).
+    pub eight_bit: bool,
+    /// …and a 10-bit one: HEVC Main10 / AV1 Main at 10 bits, the HDR session's profile.
+    pub ten_bit: bool,
+}
+
+/// Probe [`VulkanEncodeCaps`] for `codec`. Uncached — [`crate::vulkan_encode_caps`] owns the
+/// per-(GPU, codec) cache, exactly as it did for the old boolean.
 ///
-/// Deliberately the FIRST check `open_inner` performs and hard-fails on, and nothing more: the same
-/// [`find_encode_device`] scan, run against the same codec op. That makes it provably no stricter
-/// than the open, so a failure here can only ever name a session that would have died anyway — it
-/// can never talk a working host out of the fast path. It is also cheap: one instance plus
-/// physical-device queries, no logical device, no video session, no VRAM. The later stages
-/// (`create_device`, `create_video_session`, the capability query) can still fail for reasons this
-/// does not model; those keep the session on the packed-RGB negotiation the ordinary way, because
-/// the capture format is only committed once this said yes.
-///
-/// Probed PER CODEC, not once: `codec_op_for` selects a different queue-family bit for AV1, and
-/// HEVC-encode-without-AV1-encode is the common VCN/ANV configuration.
-pub(crate) fn probe_encode_support(codec: Codec) -> Result<(), &'static str> {
+/// The depth answers come from `vkGetPhysicalDeviceVideoCapabilitiesKHR` against a profile built
+/// at that depth, which is the same query the session open makes: a `true` here means the open
+/// will get past the profile gate, and a `false` means it would have failed. No second source of
+/// truth to drift.
+pub(crate) fn probe_encode_caps(codec: Codec) -> VulkanEncodeCaps {
     if !matches!(codec, Codec::H265 | Codec::Av1) {
-        return Err("the Vulkan Video backend encodes HEVC + AV1 only");
+        return VulkanEncodeCaps::default();
     }
-    let codec_op = codec_op_for(codec == Codec::Av1);
+    let av1 = codec == Codec::Av1;
+    let codec_op = codec_op_for(av1);
     // SAFETY: creates one Vulkan instance and issues only physical-device queries against it, then
     // destroys it on EVERY path below before returning — no handle derived from it escapes, and
     // nothing outside this call observes it. `Entry::load` only dlopens the loader (a missing
     // libvulkan returns `Err`), touching no process state the rest of the crate relies on.
-    // `find_encode_device` gets a live instance and handles enumerated from it, as it requires.
+    // `find_encode_device` gets a live instance and handles enumerated from it, as it requires;
+    // `depth_supported` gets that same live instance plus the physical device it returned.
     unsafe {
         let Ok(entry) = ash::Entry::load() else {
-            return Err("no Vulkan loader");
+            return VulkanEncodeCaps::default();
         };
         let app = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_3);
         let Ok(instance) = entry.create_instance(
             &vk::InstanceCreateInfo::default().application_info(&app),
             None,
         ) else {
-            return Err("vkCreateInstance failed");
+            return VulkanEncodeCaps::default();
         };
         let found = match instance.enumerate_physical_devices() {
-            Ok(devices) => find_encode_device(&instance, &devices, codec_op).is_some(),
-            Err(_) => false,
+            Ok(devices) => find_encode_device(&instance, &devices, codec_op).map(|(pd, _)| pd),
+            Err(_) => None,
+        };
+        let caps = match found {
+            Some(pd) => {
+                let vq_inst = ash::khr::video_queue::Instance::new(&entry, &instance);
+                VulkanEncodeCaps {
+                    supported: true,
+                    eight_bit: depth_supported(&vq_inst, pd, codec_op, av1, false),
+                    ten_bit: depth_supported(&vq_inst, pd, codec_op, av1, true),
+                }
+            }
+            None => VulkanEncodeCaps::default(),
         };
         instance.destroy_instance(None);
-        if found {
-            Ok(())
-        } else {
-            Err("no VK_KHR_video_encode queue for this codec on any device")
-        }
+        caps
     }
+}
+
+/// Does `pd` accept an encode profile for `codec_op` at this bit depth? The profile chain is
+/// byte-identical to the one [`VulkanVideoEncoder::open_inner`] builds — that is the point.
+///
+/// # Safety
+/// `vq_inst` must wrap the live instance `pd` was enumerated from.
+unsafe fn depth_supported(
+    vq_inst: &ash::khr::video_queue::Instance,
+    pd: vk::PhysicalDevice,
+    codec_op: vk::VideoCodecOperationFlagsKHR,
+    av1: bool,
+    ten_bit: bool,
+) -> bool {
+    let mut ps = NativeProfileStack::new(codec_op, ten_bit);
+    let profile = *ps.wire(av1);
+    let mut h265_caps = vk::VideoEncodeH265CapabilitiesKHR::default();
+    let mut av1_caps: super::vk_av1_encode::VideoEncodeAV1CapabilitiesKHR = std::mem::zeroed();
+    av1_caps.s_type = super::vk_av1_encode::stype(super::vk_av1_encode::ST_CAPABILITIES);
+    let mut enc_caps = vk::VideoEncodeCapabilitiesKHR::default();
+    let mut caps = vk::VideoCapabilitiesKHR::default();
+    if av1 {
+        av1_caps.p_next = &mut enc_caps as *mut _ as *mut c_void;
+        caps.p_next = &mut av1_caps as *mut _ as *mut c_void;
+    } else {
+        h265_caps.p_next = &mut enc_caps as *mut _ as *mut c_void;
+        caps.p_next = &mut h265_caps as *mut _ as *mut c_void;
+    }
+    (vq_inst.fp().get_physical_device_video_capabilities_khr)(pd, &profile, &mut caps)
+        == vk::Result::SUCCESS
 }
 
 fn codec_op_for(av1: bool) -> vk::VideoCodecOperationFlagsKHR {
@@ -639,6 +699,11 @@ pub struct VulkanVideoEncoder {
     /// aligned and an undersized direct source is the OOB-read class behind the 2026-07-20 field
     /// GPU reset (those paths keep their aligned-size sources/staging).
     native_nv12: bool,
+    /// This is a 10-bit (HDR) session: Main10 / AV1-10 profile, `P010` picture + DPB, and either
+    /// the BT.2020 compute CSC or the EFC's BT.2020 conversion. Every profile chain rebuilt after
+    /// `open` (the per-buffer dmabuf imports) must present the SAME depth, so it is carried here
+    /// rather than re-derived.
+    ten_bit: bool,
 
     /// A [`reconfigure_bitrate`](Encoder::reconfigure_bitrate) rate not yet installed in the video
     /// session. The next `record_submit` emits an `ENCODE_RATE_CONTROL` control command carrying it
@@ -694,29 +759,25 @@ impl VulkanVideoEncoder {
     ) -> Result<Self> {
         let native_nv12 = format == PixelFormat::Nv12;
         // HDR: a packed 10-bit PQ/BT.2020 capture (a gamescope output off our `pipewire-hdr`
-        // build) encodes HEVC Main10 through the 10-bit compute CSC. HEVC only — AV1 10-bit
-        // encode has far thinner driver coverage, and `open_amd_intel` keeps those sessions on
-        // libav VAAPI rather than gambling a session open on it.
-        let hdr = format.is_hdr_rgb10();
-        if hdr && codec != Codec::H265 {
-            bail!(
-                "vulkan-encode: 10-bit HDR is HEVC Main10 only here (got {codec:?}) — the \
-                 dispatcher should have routed this session to VAAPI"
-            );
-        }
+        // build, or the GNOME 50+ portal monitor mirror). BOTH codecs and BOTH encode sources
+        // serve it — which of them this device can actually do is `probe_encode_caps`' answer,
+        // consulted by the dispatcher before we get here and re-checked by the profile query
+        // inside the open.
+        let ten_bit = format.is_hdr_rgb10();
+        // The RGB-direct (EFC) source needs the captured format as the session's picture format.
+        // `pixel_to_vk` covers every format the capture can hand a GPU session; the BGRA default
+        // only preserves the old behaviour for the CPU-only layouts, which never reach that arm.
+        let src_rgb_fmt = pixel_to_vk(format).unwrap_or(vk::Format::B8G8R8A8_UNORM);
         // A cursor-blend session must keep the compute-CSC path — the only arm with the cursor
         // blend — so it outranks an explicit RGB-direct pin (EFC cannot composite; the
-        // negotiation promised the client a composited pointer). HDR pins the same arm for a
-        // different reason: the EFC's fixed-function conversion is 8-bit BT.709 narrow with no
-        // knob for BT.2020, so it cannot express this session's colourimetry at all.
-        if (cursor_blend || hdr) && rgb_request() == Some(true) {
+        // negotiation promised the client a composited pointer).
+        if cursor_blend && rgb_request() == Some(true) {
             tracing::info!(
-                hdr,
-                "PUNKTFUNK_VULKAN_RGB_DIRECT=1 ignored for this session — the EFC front-end can \
-                 neither composite a pointer nor convert BT.2020 10-bit; using the compute-CSC path"
+                "PUNKTFUNK_VULKAN_RGB_DIRECT=1 ignored for this session — it composites the \
+                 pointer, which the EFC front-end cannot; using the compute-CSC path"
             );
         }
-        let want_rgb = !native_nv12 && !cursor_blend && !hdr && rgb_request().unwrap_or(true);
+        let want_rgb = !native_nv12 && !cursor_blend && rgb_request().unwrap_or(true);
         Self::open_opts_inner(
             codec,
             width,
@@ -725,7 +786,8 @@ impl VulkanVideoEncoder {
             bitrate_bps,
             want_rgb,
             native_nv12,
-            hdr,
+            ten_bit,
+            src_rgb_fmt,
         )
     }
 
@@ -752,6 +814,7 @@ impl VulkanVideoEncoder {
             want_rgb,
             false,
             false,
+            vk::Format::B8G8R8A8_UNORM,
         )
     }
 
@@ -764,7 +827,8 @@ impl VulkanVideoEncoder {
         bitrate_bps: u64,
         want_rgb: bool,
         native_nv12: bool,
-        hdr: bool,
+        ten_bit: bool,
+        src_rgb_fmt: vk::Format,
     ) -> Result<Self> {
         if !matches!(codec, Codec::H265 | Codec::Av1) {
             bail!("vulkan-encode backend supports HEVC + AV1 only (got {codec:?})");
@@ -787,7 +851,8 @@ impl VulkanVideoEncoder {
                 bitrate_bps.max(1_000_000),
                 want_rgb,
                 native_nv12,
-                hdr,
+                ten_bit,
+                src_rgb_fmt,
             )
         }
     }
@@ -805,6 +870,7 @@ impl VulkanVideoEncoder {
         native_nv12: bool,
         // NOT `hdr`: this fn already binds that name to the parameter-set HEADER bytes below.
         ten_bit: bool,
+        src_rgb_fmt: vk::Format,
     ) -> Result<Self> {
         use super::vk_av1_encode as av1b;
         use super::vk_valve_rgb as vrgb;
@@ -863,7 +929,7 @@ impl VulkanVideoEncoder {
         let rgb_probe = if native_nv12 {
             Err("not-probed(native NV12 source selected)")
         } else {
-            probe_rgb_direct(&instance, &vq_inst, pd, codec_op, av1)
+            probe_rgb_direct(&instance, &vq_inst, pd, codec_op, av1, ten_bit, src_rgb_fmt)
         };
         let rgb_cfg: Option<RgbDirect> = match (&rgb_probe, want_rgb) {
             (Ok((x, y)), true) => {
@@ -925,11 +991,7 @@ impl VulkanVideoEncoder {
             perform_encode_rgb_conversion: vk::TRUE,
         };
         let mut h265_profile =
-            vk::VideoEncodeH265ProfileInfoKHR::default().std_profile_idc(if ten_bit {
-                vk::native::StdVideoH265ProfileIdc_STD_VIDEO_H265_PROFILE_IDC_MAIN_10
-            } else {
-                vk::native::StdVideoH265ProfileIdc_STD_VIDEO_H265_PROFILE_IDC_MAIN
-            });
+            vk::VideoEncodeH265ProfileInfoKHR::default().std_profile_idc(h265_profile_idc(ten_bit));
         let mut av1_profile = av1b::VideoEncodeAV1ProfileInfoKHR {
             s_type: av1b::stype(av1b::ST_PROFILE_INFO),
             p_next: std::ptr::null(),
@@ -946,11 +1008,7 @@ impl VulkanVideoEncoder {
         // below with VIDEO_PROFILE_FORMAT_NOT_SUPPORTED, which fails the open — and a failed
         // Vulkan open falls back to libav VAAPI in `open_amd_intel`. That is the whole 10-bit
         // capability gate: no separate probe, and no way to reach a half-configured session.
-        let depth = if ten_bit {
-            vk::VideoComponentBitDepthFlagsKHR::TYPE_10
-        } else {
-            vk::VideoComponentBitDepthFlagsKHR::TYPE_8
-        };
+        let depth = component_depth(ten_bit);
         let mut profile = vk::VideoProfileInfoKHR::default()
             .video_codec_operation(codec_op)
             .chroma_subsampling(vk::VideoChromaSubsamplingFlagsKHR::TYPE_420)
@@ -1175,7 +1233,7 @@ impl VulkanVideoEncoder {
         let mut rgb_sci = vrgb::VideoEncodeSessionRgbConversionCreateInfoVALVE {
             s_type: vrgb::stype(vrgb::ST_SESSION_CREATE_INFO),
             p_next: std::ptr::null(),
-            rgb_model: vrgb::MODEL_YCBCR_709,
+            rgb_model: rgb_model_for(ten_bit),
             rgb_range: vrgb::RANGE_NARROW,
             x_chroma_offset: rgb_cfg.as_ref().map_or(0, |c| c.x_offset),
             y_chroma_offset: rgb_cfg.as_ref().map_or(0, |c| c.y_offset),
@@ -1184,7 +1242,7 @@ impl VulkanVideoEncoder {
             .queue_family_index(encode_family)
             .video_profile(&profile)
             .picture_format(if rgb_cfg.is_some() {
-                vk::Format::B8G8R8A8_UNORM
+                src_rgb_fmt
             } else {
                 yuv_format(ten_bit)
             })
@@ -1290,6 +1348,7 @@ impl VulkanVideoEncoder {
                 av1_caps.max_level,
                 av1_superblock128,
                 quality_level,
+                ten_bit,
             )?
         } else {
             let (p, hdr) = build_parameters_h265(
@@ -1466,7 +1525,7 @@ impl VulkanVideoEncoder {
                 rgb_cfg
                     .as_ref()
                     .is_some_and(|c| c.padded)
-                    .then_some(vk::Format::B8G8R8A8_UNORM),
+                    .then_some(src_rgb_fmt),
                 ten_bit,
                 guard.frames.last_mut().expect("frame just pushed"),
             )?;
@@ -1527,6 +1586,7 @@ impl VulkanVideoEncoder {
             cpu_expand: Vec::new(),
             rgb: rgb_cfg,
             native_nv12,
+            ten_bit,
             pending_bitrate: None,
             width: w,
             height: h,
@@ -1687,7 +1747,8 @@ impl VulkanVideoEncoder {
         ch: u32,
     ) -> Result<(vk::Image, vk::DeviceMemory, vk::ImageView)> {
         if self.native_nv12 {
-            let mut ps = NativeProfileStack::new(codec_op_for(self.codec == Codec::Av1));
+            let mut ps =
+                NativeProfileStack::new(codec_op_for(self.codec == Codec::Av1), self.ten_bit);
             let profile = *ps.wire(self.codec == Codec::Av1);
             let arr = [profile];
             let mut plist = vk::VideoProfileListInfoKHR::default().profiles(&arr);
@@ -1716,7 +1777,7 @@ impl VulkanVideoEncoder {
                 None,
             )
         } else if self.rgb.is_some() {
-            let mut ps = RgbProfileStack::new(codec_op_for(self.codec == Codec::Av1));
+            let mut ps = RgbProfileStack::new(codec_op_for(self.codec == Codec::Av1), self.ten_bit);
             let profile = *ps.wire(self.codec == Codec::Av1);
             let arr = [profile];
             let mut plist = vk::VideoProfileListInfoKHR::default().profiles(&arr);
@@ -1873,7 +1934,7 @@ impl VulkanVideoEncoder {
                 // usage, and shared with the encode queue (the compute queue only copies into
                 // it; the semaphore orders the hand-off, CONCURRENT avoids a QFOT).
                 let av1 = self.codec == Codec::Av1;
-                let mut ps = RgbProfileStack::new(codec_op_for(av1));
+                let mut ps = RgbProfileStack::new(codec_op_for(av1), self.ten_bit);
                 let profile = *ps.wire(av1);
                 let arr = [profile];
                 let mut plist = vk::VideoProfileListInfoKHR::default().profiles(&arr);
@@ -4232,7 +4293,7 @@ impl Drop for VulkanVideoEncoder {
 mod build;
 use self::build::{
     align_up, build_parameters_av1, build_parameters_h265, make_frame, make_video_image,
-    probe_rgb_direct,
+    probe_rgb_direct, rgb_model_for,
 };
 
 #[cfg(test)]

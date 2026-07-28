@@ -20,17 +20,25 @@ pub(super) fn align_up(v: u64, a: u64) -> u64 {
 }
 
 /// Probe for the RGB-direct encode source (design/vulkan-rgb-direct-encode.md): can this device
-/// take the captured RGB dmabuf directly, with the VCN EFC front-end doing the 709-narrow CSC,
-/// via `VK_VALVE_video_encode_rgb_conversion` (RADV since Mesa 26.0, gated on EFC hardware)?
+/// take the captured RGB dmabuf directly, with the VCN EFC front-end doing the CSC, via
+/// `VK_VALVE_video_encode_rgb_conversion` (RADV since Mesa 26.0, gated on EFC hardware)?
 /// `Ok((x_offset, y_offset))` carries the chroma-siting bits a session must be created with
 /// (the preferred available bit per axis); `Err` is the first missing requirement, logged as
 /// the open-time verdict.
+///
+/// `ten_bit` + `src_fmt` describe the session being planned: an HDR one needs the EFC to advertise
+/// the BT.2020 model (not 709) and the 10-bit packed-RGB `src_fmt` as an encode-source format.
+/// Both are hardware facts, so an EFC that cannot do HDR simply reports `Err` and the session
+/// takes the compute CSC — no fallback all the way out to VAAPI.
+#[allow(clippy::too_many_arguments)]
 pub(super) unsafe fn probe_rgb_direct(
     instance: &ash::Instance,
     vq_inst: &ash::khr::video_queue::Instance,
     pd: vk::PhysicalDevice,
     codec_op: vk::VideoCodecOperationFlagsKHR,
     av1: bool,
+    ten_bit: bool,
+    src_fmt: vk::Format,
 ) -> Result<(u32, u32), &'static str> {
     use crate::vk_av1_encode as av1b;
     use crate::vk_valve_rgb as vrgb;
@@ -58,10 +66,11 @@ pub(super) unsafe fn probe_rgb_direct(
     if feat.video_encode_rgb_conversion == vk::FALSE {
         return Err("no-feature");
     }
-    // 3. Capabilities under the rgb-chained profile — the conversion must cover the compute
-    //    CSC's colour math (rgb2yuv.comp: BT.709, narrow range; chroma siting is looser, see
-    //    below). The profile chain is the same one every rgb-direct consumer presents.
-    let mut ps = RgbProfileStack::new(codec_op);
+    // 3. Capabilities under the rgb-chained profile — the conversion must cover the colour math
+    //    the compute CSC would otherwise do (`rgb2yuv.comp`: BT.709 narrow; `rgb2yuv10.comp`:
+    //    BT.2020 narrow), at this session's depth. Chroma siting is looser, see below. The
+    //    profile chain is the same one every rgb-direct consumer presents.
+    let mut ps = RgbProfileStack::new(codec_op, ten_bit);
     let profile = *ps.wire(av1);
     let mut rgb_caps = vrgb::VideoEncodeRgbConversionCapabilitiesVALVE {
         s_type: vrgb::stype(vrgb::ST_CAPABILITIES),
@@ -103,10 +112,13 @@ pub(super) unsafe fn probe_rgb_direct(
             None
         }
     };
-    if rgb_caps.rgb_models & vrgb::MODEL_YCBCR_709 == 0
-        || rgb_caps.rgb_ranges & vrgb::RANGE_NARROW == 0
-    {
-        return Err("no-709-narrow");
+    let want_model = rgb_model_for(ten_bit);
+    if rgb_caps.rgb_models & want_model == 0 || rgb_caps.rgb_ranges & vrgb::RANGE_NARROW == 0 {
+        return Err(if ten_bit {
+            "no-2020-narrow"
+        } else {
+            "no-709-narrow"
+        });
     }
     let (Some(x_offset), Some(y_offset)) = (
         pick(rgb_caps.x_chroma_offsets),
@@ -114,8 +126,10 @@ pub(super) unsafe fn probe_rgb_direct(
     ) else {
         return Err("no-chroma-siting");
     };
-    // 4. The encode-src format set under this profile must offer BGRA with DRM-modifier tiling —
-    //    the capture hands LINEAR BGRx dmabufs (fourcc XR24), which import as B8G8R8A8_UNORM.
+    // 4. The encode-src format set under this profile must offer the CAPTURED format with
+    //    DRM-modifier tiling — LINEAR BGRx dmabufs (fourcc XR24) import as B8G8R8A8_UNORM, and a
+    //    10-bit PQ capture (XR30/XB30) as one of the packed 2:10:10:10 formats. A device whose
+    //    EFC handles 8-bit RGB but not 10-bit lands here rather than at the session create.
     let profile_arr = [profile];
     let plist = vk::VideoProfileListInfoKHR::default().profiles(&profile_arr);
     let mut fmt_info = vk::PhysicalDeviceVideoFormatInfoKHR::default()
@@ -132,13 +146,29 @@ pub(super) unsafe fn probe_rgb_direct(
     if r != vk::Result::SUCCESS && r != vk::Result::INCOMPLETE {
         return Err("no-rgb-format");
     }
-    if !props[..count as usize].iter().any(|p| {
-        p.format == vk::Format::B8G8R8A8_UNORM
-            && p.image_tiling == vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT
-    }) {
-        return Err("no-bgra-modifier-tiling");
+    if !props[..count as usize]
+        .iter()
+        .any(|p| p.format == src_fmt && p.image_tiling == vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
+    {
+        return Err(if ten_bit {
+            "no-rgb10-modifier-tiling"
+        } else {
+            "no-bgra-modifier-tiling"
+        });
     }
     Ok((x_offset, y_offset))
+}
+
+/// The EFC colour model a session of this depth needs: BT.709 for SDR, BT.2020 for HDR — the same
+/// matrices the two compute-CSC shaders implement, so the encode source is interchangeable and the
+/// SPS/sequence-header colour signalling is correct either way.
+pub(super) fn rgb_model_for(ten_bit: bool) -> u32 {
+    use crate::vk_valve_rgb as vrgb;
+    if ten_bit {
+        vrgb::MODEL_YCBCR_2020
+    } else {
+        vrgb::MODEL_YCBCR_709
+    }
 }
 
 pub(super) unsafe fn make_video_image(
@@ -708,9 +738,10 @@ fn leb128(mut v: u64) -> Vec<u8> {
 
 /// Bit-pack a `sequence_header_obu` (AV1 spec §5.5) into a size-delimited OBU. The field values here
 /// MUST mirror the `StdVideoAV1SequenceHeader` handed to the driver in `build_parameters_av1` so the
-/// driver-emitted frame OBUs parse against this header. Single operating point, 8-bit 4:2:0,
-/// order-hint on, CDEF+restoration+filter-intra allowed, everything exotic (compound/warp/superres)
-/// disabled — the profile our single-reference P-frame encoder actually uses.
+/// driver-emitted frame OBUs parse against this header. Single operating point, 4:2:0 at 8 or 10
+/// bits, order-hint on, CDEF+restoration+filter-intra allowed, everything exotic
+/// (compound/warp/superres) disabled — the profile our single-reference P-frame encoder uses.
+#[allow(clippy::too_many_arguments)]
 fn av1_sequence_header_obu(
     sb128: bool,
     fwb: u32,
@@ -719,6 +750,7 @@ fn av1_sequence_header_obu(
     max_h_m1: u32,
     order_hint_bits_minus_1: u32,
     seq_level_idx: u32,
+    ten_bit: bool,
 ) -> Vec<u8> {
     let mut w = Av1BitWriter::new();
     w.put(0, 3); // seq_profile = MAIN
@@ -753,19 +785,28 @@ fn av1_sequence_header_obu(
     w.bit(0); // enable_superres
     w.bit(0); // enable_cdef
     w.bit(0); // enable_restoration
-              // color_config() (AV1 spec §5.5.2): 8-bit 4:2:0, BT.709 limited — the CSC this
-              // backend's `rgb2yuv.comp` actually performs. AV1 has no VUI, so the CICP triplet
-              // lives here; omitting it (color_description_present_flag = 0) left the stream
-              // "unspecified" and vendor TV decoders guess colorimetry from resolution.
-              // CP_BT_709/TC_BT_709/MC_BT_709 avoids the spec's sRGB special case (which would
-              // force color_range = 1 and drop the explicit range bit), so the field order below
-              // is the same as the unspecified form plus the three CICP bytes.
-    w.bit(0); // high_bitdepth
+              // color_config() (AV1 spec §5.5.2): 4:2:0 at the session's depth, limited range,
+              // carrying the CSC this backend actually performed — BT.709 for `rgb2yuv.comp`,
+              // BT.2020 + PQ for `rgb2yuv10.comp` (or the EFC's equivalent). AV1 has no VUI, so
+              // the CICP triplet lives here; omitting it (color_description_present_flag = 0)
+              // left the stream "unspecified" and vendor TV decoders guess colorimetry from
+              // resolution. Neither triplet hits the spec's sRGB special case (which would force
+              // color_range = 1 and drop the explicit range bit), so the field order below is the
+              // same as the unspecified form plus the three CICP bytes.
+              //
+              // `high_bitdepth` alone encodes 10-bit here: `twelve_bit` follows it ONLY for
+              // seq_profile 2, and ours is MAIN (0).
+    w.bit(ten_bit as u32); // high_bitdepth -> BitDepth = 10
     w.bit(0); // mono_chrome
     w.bit(1); // color_description_present_flag
-    w.put(1, 8); // color_primaries = CP_BT_709
-    w.put(1, 8); // transfer_characteristics = TC_BT_709
-    w.put(1, 8); // matrix_coefficients = MC_BT_709
+    let (prim, trc, mat) = if ten_bit {
+        (9u32, 16u32, 9u32)
+    } else {
+        (1, 1, 1)
+    };
+    w.put(prim, 8); // color_primaries         (1 = BT.709, 9 = BT.2020)
+    w.put(trc, 8); // transfer_characteristics (1 = BT.709, 16 = SMPTE 2084)
+    w.put(mat, 8); // matrix_coefficients      (1 = BT.709, 9 = BT.2020 NCL)
     w.bit(0); // color_range (studio/limited)
     w.put(0, 2); // chroma_sample_position = CSP_UNKNOWN (subsampling_x==subsampling_y==1 for profile 0)
     w.bit(0); // separate_uv_delta_q
@@ -796,6 +837,9 @@ pub(super) unsafe fn build_parameters_av1(
     max_level: ash::vk::native::StdVideoAV1Level,
     sb128: bool,
     quality_level: u32,
+    // 10-bit HDR session — must agree with the video profile the session was CREATED with
+    // (`open_inner`'s `ten_bit`) and with the OBU packed below.
+    ten_bit: bool,
 ) -> Result<(vk::VideoSessionParametersKHR, Vec<u8>, Vec<u8>)> {
     use crate::vk_av1_encode as av1;
     use ash::vk::native as hh;
@@ -806,21 +850,33 @@ pub(super) unsafe fn build_parameters_av1(
     let seq_level_idx = max_level; // StdVideoAV1Level's numeric value IS the AV1 seq_level_idx
 
     // ---- Std sequence header (must match the OBU packed below) ----
-    // BT.709 limited, mirroring the `color_config()` bits `av1_sequence_header_obu` packs — the two
-    // MUST stay identical or the driver's frame OBUs parse against a header we didn't write.
-    // `color_range` stays 0 (studio swing); only the description flag + CICP triplet change.
+    // Limited range at the session's depth, mirroring the `color_config()` bits
+    // `av1_sequence_header_obu` packs — the two MUST stay identical or the driver's frame OBUs
+    // parse against a header we didn't write. `color_range` stays 0 (studio swing).
     let mut cc_flags: hh::StdVideoAV1ColorConfigFlags = std::mem::zeroed();
     cc_flags.set_color_description_present_flag(1);
     let mut cc: hh::StdVideoAV1ColorConfig = std::mem::zeroed();
     cc.flags = cc_flags;
-    cc.BitDepth = 8;
+    // The Std struct carries the DEPTH; the driver derives the OBU's `high_bitdepth` from it.
+    cc.BitDepth = if ten_bit { 10 } else { 8 };
     cc.subsampling_x = 1;
     cc.subsampling_y = 1;
-    cc.color_primaries = hh::StdVideoAV1ColorPrimaries_STD_VIDEO_AV1_COLOR_PRIMARIES_BT_709;
-    cc.transfer_characteristics =
-        hh::StdVideoAV1TransferCharacteristics_STD_VIDEO_AV1_TRANSFER_CHARACTERISTICS_BT_709;
-    cc.matrix_coefficients =
-        hh::StdVideoAV1MatrixCoefficients_STD_VIDEO_AV1_MATRIX_COEFFICIENTS_BT_709;
+    let (prim, trc, mat) = if ten_bit {
+        (
+            hh::StdVideoAV1ColorPrimaries_STD_VIDEO_AV1_COLOR_PRIMARIES_BT_2020,
+            hh::StdVideoAV1TransferCharacteristics_STD_VIDEO_AV1_TRANSFER_CHARACTERISTICS_SMPTE_2084,
+            hh::StdVideoAV1MatrixCoefficients_STD_VIDEO_AV1_MATRIX_COEFFICIENTS_BT_2020_NCL,
+        )
+    } else {
+        (
+            hh::StdVideoAV1ColorPrimaries_STD_VIDEO_AV1_COLOR_PRIMARIES_BT_709,
+            hh::StdVideoAV1TransferCharacteristics_STD_VIDEO_AV1_TRANSFER_CHARACTERISTICS_BT_709,
+            hh::StdVideoAV1MatrixCoefficients_STD_VIDEO_AV1_MATRIX_COEFFICIENTS_BT_709,
+        )
+    };
+    cc.color_primaries = prim;
+    cc.transfer_characteristics = trc;
+    cc.matrix_coefficients = mat;
     cc.chroma_sample_position =
         hh::StdVideoAV1ChromaSamplePosition_STD_VIDEO_AV1_CHROMA_SAMPLE_POSITION_UNKNOWN;
 
@@ -891,6 +947,7 @@ pub(super) unsafe fn build_parameters_av1(
         h - 1,
         order_hint_bits_minus_1,
         seq_level_idx,
+        ten_bit,
     );
     let mut keyframe_prefix = td.clone();
     keyframe_prefix.extend_from_slice(&seq_obu);
@@ -911,7 +968,7 @@ mod tests {
         fwb: u32,
         fhb: u32,
         seq_level_idx: u32,
-    ) -> (u8, u8, u8, u8, u8) {
+    ) -> (u8, u8, u8, u8, u8, u8) {
         // obu_header (1 byte) + leb128 size — the payload starts after both.
         assert_eq!(
             obu[0], 0x0a,
@@ -972,8 +1029,9 @@ mod tests {
         take(1); // enable_cdef
         take(1); // enable_restoration
 
-        // color_config()
-        assert_eq!(take(1), 0, "high_bitdepth (8-bit)");
+        // color_config(). `high_bitdepth` is returned rather than asserted — the 10-bit case
+        // below is the whole point of reading it.
+        let high_bitdepth = take(1) as u8;
         assert_eq!(take(1), 0, "mono_chrome");
         let described = take(1) as u8;
         let (cp, tc, mc) = if described == 1 {
@@ -986,7 +1044,7 @@ mod tests {
         assert_eq!(take(1), 0, "separate_uv_delta_q");
         assert_eq!(take(1), 0, "film_grain_params_present");
         assert_eq!(take(1), 1, "trailing_one_bit");
-        (described, cp, tc, mc, range)
+        (high_bitdepth, described, cp, tc, mc, range)
     }
 
     /// The sequence header must SIGNAL BT.709 limited — the CSC `rgb2yuv.comp` actually performs.
@@ -1001,8 +1059,9 @@ mod tests {
         // 1920x1080: av_log2 gives 10/10 frame-size bits; level 4.0 (seq_level_idx 8) exercises
         // the seq_tier branch, and sb128 both ways since it sits above color_config.
         for (sb128, level) in [(false, 8u32), (true, 5u32)] {
-            let obu = av1_sequence_header_obu(sb128, 10, 10, 1919, 1079, 7, level);
-            let (described, cp, tc, mc, range) = read_color_config(&obu, 10, 10, level);
+            let obu = av1_sequence_header_obu(sb128, 10, 10, 1919, 1079, 7, level, false);
+            let (depth10, described, cp, tc, mc, range) = read_color_config(&obu, 10, 10, level);
+            assert_eq!(depth10, 0, "high_bitdepth (8-bit session)");
             assert_eq!(
                 described, 1,
                 "color_description_present_flag (sb128={sb128})"
@@ -1011,6 +1070,26 @@ mod tests {
                 (cp, tc, mc),
                 (1, 1, 1),
                 "CICP BT.709 primaries/transfer/matrix"
+            );
+            assert_eq!(range, 0, "color_range = studio/limited swing");
+        }
+    }
+
+    /// …and a 10-bit session must signal BT.2020 + PQ with `high_bitdepth` set. Same reason the
+    /// 8-bit twin exists, plus one that is specific to AV1: `high_bitdepth` sits BEFORE the CICP
+    /// bytes in `color_config()`, so getting it wrong does not just mislabel the depth — every
+    /// field after it parses one bit out of phase.
+    #[test]
+    fn av1_sequence_header_signals_bt2020_pq_at_10_bit() {
+        for (sb128, level) in [(false, 8u32), (true, 5u32)] {
+            let obu = av1_sequence_header_obu(sb128, 10, 10, 1919, 1079, 7, level, true);
+            let (depth10, described, cp, tc, mc, range) = read_color_config(&obu, 10, 10, level);
+            assert_eq!(depth10, 1, "high_bitdepth (sb128={sb128})");
+            assert_eq!(described, 1, "color_description_present_flag");
+            assert_eq!(
+                (cp, tc, mc),
+                (9, 16, 9),
+                "CICP BT.2020 primaries / SMPTE 2084 transfer / BT.2020-NCL matrix"
             );
             assert_eq!(range, 0, "color_range = studio/limited swing");
         }

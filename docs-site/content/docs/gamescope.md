@@ -158,10 +158,11 @@ Two things to know:
 - **SDR content rides the same PQ stream.** The desktop, the Steam overlay and SDR games are mapped
   into the HDR container at `PUNKTFUNK_GAMESCOPE_SDR_NITS` (400 by default). If white looks too
   bright or too dim on your TV, that is the knob.
-- **HDR picks HEVC on AMD and Intel.** A 10-bit AV1 session falls back to a slower encode path
-  that also can't draw the mouse pointer gamescope leaves out of its capture — so if you stream
-  Gaming Mode in HDR from an AMD or Intel box, leave the codec on HEVC. NVIDIA is unaffected
-  either way.
+- **On AMD and Intel, HDR follows what the GPU can encode.** The host asks the driver whether it
+  can encode your codec at 10 bits and picks the fast path when it can — which current AMD and
+  Intel GPUs do for HEVC, and newer ones for AV1 too. On a GPU that declines, the session still
+  streams HDR through a slower path, but the mouse pointer gamescope leaves out of its capture
+  can't be drawn back in there. `punktfunk-host hdr-probe` reports what your box answered.
 
 ## Known limits
 

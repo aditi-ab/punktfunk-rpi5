@@ -362,20 +362,22 @@ fn open_video_backend_linux(
     // the stream never dies over the new path. `format`/`bit_depth`/`chroma` only matter to VAAPI
     // — the Vulkan backend imports the dmabuf and does its own CSC.
     let open_amd_intel = || -> Result<(Box<dyn Encoder>, &'static str)> {
-        // HDR (10-bit + a PQ/BT.2020 capture format) takes the Vulkan backend for **HEVC**: its
-        // compute CSC has a 10-bit BT.2020 variant and the session opens Main10. That keeps the
-        // two things an HDR session would otherwise lose here — real RFI recovery and the
-        // compute-CSC cursor blend, which is the only way a gamescope pointer reaches the stream
-        // (gamescope has no embedded-cursor mode to fall back to).
+        // HDR (10-bit + a PQ/BT.2020 capture format) keeps this backend for EITHER codec, as
+        // long as the device says it can: the compute CSC has a BT.2020 10-bit variant, the EFC
+        // has a BT.2020 conversion, and the session opens Main10 / AV1-at-10. That keeps the two
+        // things an HDR session would otherwise lose — real RFI recovery, and the compute CSC's
+        // cursor blend, which is the only way a gamescope pointer reaches the stream (gamescope
+        // has no embedded-cursor mode to fall back to).
         //
-        // AV1 10-bit stays on libav VAAPI: encode-side driver coverage for it is far thinner than
-        // HEVC Main10, and this is not the place to gamble a session open. A device that cannot
-        // do Main10 either fails `get_physical_device_video_capabilities` inside the open and
-        // lands on the VAAPI fallback below — the same net as any other unsupported config.
+        // `vulkan_encode_available_at` is the device's own answer to the same profile query the
+        // open will make, so this is a prediction that cannot disagree with reality — and a `no`
+        // routes to libav VAAPI here rather than burning a failed session open first.
+        #[cfg(feature = "vulkan-encode")]
+        let ten_bit_session = bit_depth == 10 && format.is_hdr_rgb10();
         #[cfg(feature = "vulkan-encode")]
         if matches!(codec, Codec::H265 | Codec::Av1)
             && vulkan_encode_enabled()
-            && !(bit_depth == 10 && format.is_hdr_rgb10() && codec != Codec::H265)
+            && vulkan_encode_available_at(codec, ten_bit_session)
         {
             match vulkan_video::VulkanVideoEncoder::open(
                 codec,
@@ -1046,14 +1048,9 @@ pub fn linux_hdr_cuda_ok() -> bool {
 ///
 /// `cuda_planned` is the caller's prediction of a CUDA capture payload (NVIDIA + zero-copy — the
 /// prediction `SessionPlan` already makes); `ten_bit` the negotiated depth. Both shift the
-/// dispatch: a CPU payload keeps NVIDIA on libav NVENC (no blend), and a 10-bit **AV1** session
-/// skips Vulkan Video for libav VAAPI (no blend) — 10-bit HEVC does not, its compute CSC has a
-/// BT.2020 Main10 variant that blends like the 8-bit one.
-///
-/// Whether the DEVICE can encode Main10 is only settled when the session opens (the profile query
-/// is what answers it); a device that cannot falls back to VAAPI there, and `open_video`'s
-/// `blends_cursor` backstop logs the divergence. Same shape as every other open-time fallback
-/// this prediction cannot see.
+/// dispatch: a CPU payload keeps NVIDIA on libav NVENC (no blend), and a 10-bit session keeps
+/// Vulkan Video (which blends) only where the device advertises a 10-bit profile for that codec —
+/// `vulkan_encode_available_at`, the same query the open makes.
 #[cfg(target_os = "linux")]
 pub fn cursor_blend_capable(codec: Codec, cuda_planned: bool, ten_bit: bool) -> bool {
     // A negotiated PyroWave session routes to that backend before the pref is consulted
@@ -1076,11 +1073,11 @@ pub fn cursor_blend_capable(codec: Codec, cuda_planned: bool, ten_bit: bool) -> 
         // the device probe runs last (it opens a Vulkan instance, cached per GPU+codec).
         #[cfg(feature = "vulkan-encode")]
         {
+            // Mirrors `open_amd_intel` exactly, depth included — the device answers whether a
+            // 10-bit profile for this codec exists, so the prediction and the open agree.
             matches!(codec, Codec::H265 | Codec::Av1)
                 && vulkan_encode_enabled()
-                // 10-bit is HEVC Main10 only on this backend — mirrors `open_amd_intel`.
-                && !(ten_bit && codec != Codec::H265)
-                && vulkan_encode_available(codec)
+                && vulkan_encode_available_at(codec, ten_bit)
         }
         #[cfg(not(feature = "vulkan-encode"))]
         {
@@ -1134,30 +1131,59 @@ fn cursor_blend_capable_for(
 /// reports what actually did.
 #[cfg(all(target_os = "linux", feature = "vulkan-encode"))]
 fn vulkan_encode_available(codec: Codec) -> bool {
+    vulkan_encode_caps(codec).supported
+}
+
+/// Can the Vulkan Video backend encode `codec` at this depth on the selected GPU? The gate that
+/// decides whether an HDR session gets the good path (real RFI + the compute CSC's cursor blend)
+/// or falls back to libav VAAPI — asked per codec, because a device can advertise HEVC Main10 and
+/// still decline 10-bit AV1.
+#[cfg(target_os = "linux")]
+fn vulkan_encode_available_at(codec: Codec, ten_bit: bool) -> bool {
+    let caps = vulkan_encode_caps(codec);
+    caps.supported
+        && if ten_bit {
+            caps.ten_bit
+        } else {
+            caps.eight_bit
+        }
+}
+
+/// The device's Vulkan Video encode capabilities for `codec`, cached per (selected GPU, codec) —
+/// a web-console GPU change re-probes on the new adapter before the next Welcome, mirroring
+/// `can_encode_444`/`can_encode_10bit`. The probe creates and destroys its own Vulkan instance,
+/// so it is worth caching but safe to call from anywhere.
+#[cfg(target_os = "linux")]
+fn vulkan_encode_caps(codec: Codec) -> vulkan_video::VulkanEncodeCaps {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
-    static CACHE: OnceLock<Mutex<HashMap<(String, &'static str), bool>>> = OnceLock::new();
+    #[allow(clippy::type_complexity)]
+    static CACHE: OnceLock<Mutex<HashMap<(String, &'static str), vulkan_video::VulkanEncodeCaps>>> =
+        OnceLock::new();
     let key = (pf_gpu::selection_key(), codec.label());
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     if let Some(v) = cache.lock().unwrap().get(&key) {
         return *v;
     }
-    let verdict = vulkan_video::probe_encode_support(codec);
-    let ok = verdict.is_ok();
-    match &verdict {
-        Ok(()) => tracing::info!(
+    let caps = vulkan_video::probe_encode_caps(codec);
+    if caps.supported {
+        tracing::info!(
             ?codec,
-            "Vulkan Video encode probed OK — producer-native NV12 capture is eligible"
-        ),
-        Err(why) => tracing::info!(
+            eight_bit = caps.eight_bit,
+            ten_bit = caps.ten_bit,
+            "Vulkan Video encode probed — producer-native NV12 capture is eligible, and a 10-bit \
+             session keeps this backend (real RFI + the compute CSC's cursor blend) where the \
+             device accepts the profile"
+        );
+    } else {
+        tracing::info!(
             ?codec,
-            why = *why,
-            "Vulkan Video encode unavailable — keeping the packed-RGB capture negotiation \
-             (the native-NV12 path has no VAAPI fallback)"
-        ),
+            "Vulkan Video encode unavailable (no encode queue for this codec) — keeping the \
+             packed-RGB capture negotiation (the native-NV12 path has no VAAPI fallback)"
+        );
     }
-    cache.lock().unwrap().insert(key, ok);
-    ok
+    cache.lock().unwrap().insert(key, caps);
+    caps
 }
 
 /// Cheap, side-effect-free NVIDIA-presence probe for the `auto` backend selector: the NVIDIA
@@ -1503,13 +1529,16 @@ pub fn can_encode_10bit(codec: Codec) -> bool {
     let supported = {
         #[cfg(target_os = "linux")]
         {
-            // NVENC (libav, the HDR P010 swscale path) or VAAPI (P010 upload / dmabuf graph),
-            // probed by opening a tiny real Main10 encoder — the same honesty contract as
-            // `can_encode_444`. Vulkan-video and the direct-SDK CUDA path stay 8-bit; a 10-bit
-            // session routes around them (see `open_video_backend`). NOTE: encode capability is
-            // only half the Linux gate — the capture side (GNOME 50+ portal monitor in HDR mode)
-            // is resolved separately by the host (`capturer_supports_hdr` / the GameStream RTSP
-            // honor), since this probe can't know what the compositor will negotiate.
+            // NVENC (libav, the HDR P010 swscale path — the direct-SDK CUDA path encodes the
+            // same GPU's Main10, so this is a truthful proxy for it too) or, on AMD/Intel, VAAPI
+            // OR Vulkan Video. Both of the latter are asked because either can serve the session:
+            // `open_amd_intel` tries Vulkan first and falls back to VAAPI, so 10-bit is available
+            // if EITHER says yes, and answering `false` when only one does would strand a
+            // perfectly encodable HDR session at 8 bits. NOTE: encode capability is only half the
+            // Linux gate — the capture side (a gamescope HDR output, or a GNOME 50+ portal
+            // monitor in HDR mode) is resolved separately by the host
+            // (`capture::capturer_supports_hdr_for` / the GameStream RTSP honor), since this
+            // probe can't know what the compositor will negotiate.
             // Resolve through the SAME helper `can_encode_444` uses (and which mirrors
             // `open_video`'s dispatch): `linux_auto_is_vaapi` ignores `encoder_pref`, so on a box
             // that forces a backend — e.g. `encoder_pref = "vaapi"` on an NVIDIA host — this probe
@@ -1517,7 +1546,17 @@ pub fn can_encode_10bit(codec: Codec) -> bool {
             // depth (plus the HDR/SDR colour label derived from it) would describe a backend that
             // never runs. That is exactly the dishonesty this probe exists to prevent.
             if linux_zero_copy_is_vaapi() {
-                vaapi::probe_can_encode_10bit(codec)
+                let vulkan10 = {
+                    #[cfg(feature = "vulkan-encode")]
+                    {
+                        vulkan_encode_enabled() && vulkan_encode_available_at(codec, true)
+                    }
+                    #[cfg(not(feature = "vulkan-encode"))]
+                    {
+                        false
+                    }
+                };
+                vulkan10 || vaapi::probe_can_encode_10bit(codec)
             } else {
                 linux::probe_can_encode_10bit(codec)
             }
