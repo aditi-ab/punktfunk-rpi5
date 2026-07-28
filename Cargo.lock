@@ -3281,6 +3281,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "punktfunk-cli"
+version = "0.21.0"
+dependencies = [
+ "pf-client-core",
+ "punktfunk-core",
+ "serde_json",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "punktfunk-client-android"
 version = "0.21.0"
 dependencies = [
