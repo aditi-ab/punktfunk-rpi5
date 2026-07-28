@@ -20,7 +20,6 @@
 //! "Could not find output". We talk raw Wayland on `$WAYLAND_DISPLAY`, so the host must run inside
 //! the KWin session's environment.
 
-#![allow(clippy::all, dead_code, non_camel_case_types, non_snake_case, unused)]
 // Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
 #![deny(clippy::undocumented_unsafe_blocks)]
 
@@ -600,12 +599,7 @@ fn output_modes(output: &str) -> Vec<KModeRow> {
 /// of the request (which excludes the output's native 60 Hz entry for every rate we install a custom
 /// mode for). Widest wins, then fastest — so an exact-width mode always beats an aligned one, and a
 /// list carrying duplicate custom modes from earlier sessions still resolves.
-fn pick_custom_mode<'a>(
-    modes: &'a [KModeRow],
-    width: u32,
-    height: u32,
-    hz: u32,
-) -> Option<&'a KModeRow> {
+fn pick_custom_mode(modes: &[KModeRow], width: u32, height: u32, hz: u32) -> Option<&KModeRow> {
     modes
         .iter()
         .filter(|m| {

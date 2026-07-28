@@ -20,7 +20,6 @@
 //! each output's name / enabled / priority / current-mode size, then build a
 //! `kde_output_configuration_v2` and `apply()` it, waiting for `applied` / `failed`.
 
-#![allow(clippy::all, dead_code, non_camel_case_types, non_snake_case, unused)]
 #![deny(clippy::undocumented_unsafe_blocks)]
 
 use std::collections::HashMap;
@@ -91,6 +90,10 @@ const DEVICE_REGISTRY_MAX: u32 = 24;
 
 /// The opcode of `kde_output_device_v2.mode` (0-based event index) — the event that creates a child
 /// `kde_output_device_mode_v2`. Kept in sync with the vendored `kde-output-device-v2.xml`.
+// The `event_created_child!` macro hard-codes the literal 2, so nothing reads this constant at
+// run time; `mode_event_opcode_is_two` asserts the two agree. That guard test is the point — it is
+// what catches a re-vendored XML that reorders the events.
+#[allow(dead_code)]
 const DEVICE_MODE_EVENT_OPCODE: u16 = 2;
 /// The opcode of `kde_output_device_registry_v2.output` — the event that creates a child
 /// `kde_output_device_v2`. `finished` is event 0, `output` is event 1.
@@ -349,10 +352,13 @@ impl Dispatch<OutputConfig, ()> for State {
         _: &QueueHandle<Self>,
     ) {
         match event {
+            // No catch-all: `kde_output_configuration_v2` has exactly these three events, so a
+            // future re-vendor of the XML that adds one should fail the build here rather than
+            // silently drop it — which is what the old `_ => {}` did (the compiler calls it
+            // unreachable today).
             ConfigEvent::Applied => state.applied = Some(true),
             ConfigEvent::Failed => state.applied = Some(false),
             ConfigEvent::FailureReason { reason } => state.failure_reason = Some(reason),
-            _ => {}
         }
     }
 }
@@ -417,10 +423,11 @@ impl Session {
         // registry's `output` events during phase 2, so their property bursts are one round further
         // out than they are for per-output globals. One more barrier — skipped when no device is
         // still waiting for its `done`, so the classic path costs nothing.
-        if s.state.device_registry.is_some() && s.state.devices.values().any(|d| !d.seen_done) {
-            if !s.sync_barrier(deadline) {
-                return None;
-            }
+        if s.state.device_registry.is_some()
+            && s.state.devices.values().any(|d| !d.seen_done)
+            && !s.sync_barrier(deadline)
+        {
+            return None;
         }
         Some(s)
     }

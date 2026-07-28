@@ -172,8 +172,8 @@ jobs:
         # openh264 rebuild), and keeps everything in one C:\t\release tree. Same reason
         # pf-vkhdr-layer's clippy below runs --release.
         #
-        # pf-encode and pf-capture are linted SEPARATELY with --all-targets so their Windows
-        # `#[cfg(test)]` modules are type-checked — pf-encode's AMF C-ABI layout assertions
+        # pf-encode, pf-capture and pf-vdisplay are linted SEPARATELY with --all-targets so their
+        # Windows `#[cfg(test)]` modules are type-checked — pf-encode's AMF C-ABI layout assertions
         # (`variant_layout_matches_c` and friends, which are the only guard on a hand-mirrored
         # vtable ABI), the QSV tests, the PyroWave-Windows smoke test; pf-capture's `StallWatch`
         # tests, the DXGI HDR self-tests and the cursor-conversion tables. The host lint above
@@ -199,6 +199,7 @@ jobs:
           cargo clippy --release -p punktfunk-host --features nvenc,amf-qsv,qsv -- -D warnings; if ($LASTEXITCODE) { throw "host clippy" }
           cargo clippy --release -p pf-encode --all-targets --features nvenc,amf-qsv,qsv -- -D warnings; if ($LASTEXITCODE) { throw "pf-encode clippy" }
           cargo clippy --release -p pf-capture --all-targets -- -D warnings; if ($LASTEXITCODE) { throw "pf-capture clippy" }
+          cargo clippy --release -p pf-vdisplay --all-targets -- -D warnings; if ($LASTEXITCODE) { throw "pf-vdisplay clippy" }
           cargo clippy --release -p punktfunk-tray -- -D warnings; if ($LASTEXITCODE) { throw "tray clippy" }
 
       - name: Test (pf-capture, Windows)
@@ -222,6 +223,28 @@ jobs:
         # cleanly, building in ~51 s off an existing release target dir.
         run: |
           cargo test --release -p pf-capture; if ($LASTEXITCODE) { throw "pf-capture tests" }
+
+      - name: Test (pf-vdisplay, Windows)
+        shell: pwsh
+        # pf-vdisplay's Windows half is ~3,400 lines (manager.rs, pf_vdisplay.rs, ddc.rs, the three
+        # manager/ submodules) that NO other job compiles — the host lint above builds the crate as
+        # a dependency, so its test targets were reaching no compiler anywhere. Worse, the only two
+        # Windows `#[test]`s were `if env::var("PUNKTFUNK_PF_VDISPLAY_LIVE").is_err() { return; }`
+        # early-returns, so an unrun hardware test reported `ok`. They are `#[ignore]`d now and this
+        # step reports them as `ignored`, which is the truth.
+        #
+        # The link objection recorded for the host and pf-encode above does NOT apply here, for the
+        # same reason it does not apply to pf-capture: `pf-encode` is `default = []`, and nothing in
+        # `-p pf-vdisplay`'s graph turns on `nvenc`/`amf-qsv`/`qsv`, so no nvidia/ffmpeg/libvpl
+        # import libs are ever asked for. Settled empirically before this step was added, to the
+        # same standard as pf-capture's: the exact two commands were run on this runner against a
+        # checkout at C:\temp\pf-vd-check — clippy clean, then 46 passed / 2 ignored in 0.19 s.
+        #
+        # --release to reuse C:\t\release rather than spawning a debug tree (the C1069 trigger).
+        # Note this DOES build a second, featureless pf-encode; it is small precisely because none
+        # of the encoder features are on.
+        run: |
+          cargo test --release -p pf-vdisplay; if ($LASTEXITCODE) { throw "pf-vdisplay tests" }
 
       - name: Build + lint the HDR Vulkan layer (pf-vkhdr-layer)
         shell: pwsh

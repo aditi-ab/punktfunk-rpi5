@@ -78,7 +78,11 @@ fn timed_out(cmd: &Command, budget: Duration) -> Error {
     )
 }
 
-#[cfg(test)]
+// `unix` gate, not `test` alone: this module is compiled on every platform (lib.rs declares it
+// unconditionally), but the cases below spawn `sleep`/`true`/`echo` as EXECUTABLES. On Windows
+// `echo` is a shell builtin and there is no `sleep.exe`, so an ungated module turns a green suite
+// red the first time anyone runs it there. The Windows twin is below.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
@@ -105,6 +109,48 @@ mod tests {
 
         let out = output_within(
             Command::new("echo").arg("punktfunk"),
+            Duration::from_secs(5),
+        )
+        .expect("ran");
+        assert!(out.status.success());
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "punktfunk");
+    }
+}
+
+/// The same two cases through `cmd /c`, so the budget logic is covered on the platform whose
+/// process model differs most (job objects, no `SIGKILL`). `ping -n` is the standard Windows
+/// no-extra-tooling sleep.
+#[cfg(all(test, windows))]
+mod tests_windows {
+    use super::*;
+
+    #[test]
+    fn a_hung_child_is_killed_at_the_budget() {
+        let started = Instant::now();
+        let err = status_within(
+            Command::new("cmd").args(["/c", "ping -n 60 127.0.0.1 >NUL"]),
+            Duration::from_millis(150),
+        )
+        .expect_err("must time out");
+        assert_eq!(err.kind(), ErrorKind::TimedOut);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "must return at its budget, not the child's lifetime (took {:?})",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_quick_child_returns_normally() {
+        let st = status_within(
+            Command::new("cmd").args(["/c", "exit 0"]),
+            Duration::from_secs(5),
+        )
+        .expect("ran");
+        assert!(st.success());
+
+        let out = output_within(
+            Command::new("cmd").args(["/c", "echo punktfunk"]),
             Duration::from_secs(5),
         )
         .expect("ran");

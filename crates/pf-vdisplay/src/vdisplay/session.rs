@@ -186,6 +186,9 @@ pub struct ActiveSession {
 
 impl ActiveSession {
     /// A "nothing live" result carrying just the runtime-dir anchor.
+    // Only the non-Linux `detect_active_session` calls this (below); Linux always has a real
+    // session to describe.
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
     fn none() -> ActiveSession {
         ActiveSession {
             kind: ActiveKind::None,
@@ -712,13 +715,49 @@ mod tests {
         assert_eq!(got, None);
     }
 
-    /// Someone else's socket in a shared runtime dir is not ours to talk to.
+    /// A socket NAMED for another uid is not ours to talk to. This covers the filename filter
+    /// (`sway-ipc.<uid>.` prefix) and nothing more — it was previously called
+    /// `another_uids_socket_is_ignored`, which claimed the ownership guard below it. It never
+    /// reached that guard: the prefix test `continue`s first, so the assertion held even with
+    /// `md.uid() != uid` deleted. See `another_uids_owned_socket_is_ignored` for the real leg.
     #[test]
-    fn another_uids_socket_is_ignored() {
+    fn another_uids_socket_name_is_ignored() {
         let rt = FakeRuntime::new("otheruid", &[]);
         let other = rt.uid.wrapping_add(1);
         std::fs::write(rt.dir.join(format!("sway-ipc.{other}.500.sock")), b"").unwrap();
         let got = without_inherited_swaysock(|| find_sway_socket(rt.path(), rt.uid, Some(500)));
         assert_eq!(got, None);
+    }
+
+    /// The ownership guard proper: a socket named as ours but OWNED by someone else must be
+    /// rejected on its metadata. That is the case that matters — a hostile local user can pick the
+    /// filename, so the name is not evidence.
+    ///
+    /// Ignored by default because it needs to `chown` a file to another uid, i.e. root. Run it
+    /// where that is true (a container, or CI as root):
+    ///     cargo test -p pf-vdisplay -- --ignored another_uids_owned
+    #[test]
+    #[ignore = "needs root to chown the socket to another uid"]
+    fn another_uids_owned_socket_is_ignored() {
+        use std::os::unix::fs::MetadataExt;
+        let rt = FakeRuntime::new("ownedbyother", &[]);
+        // Named exactly as one of OURS, so the prefix filter admits it and the metadata check is
+        // the only thing that can reject it.
+        let path = rt.dir.join(format!("sway-ipc.{}.500.sock", rt.uid));
+        std::fs::write(&path, b"").unwrap();
+        let target_uid = rt.uid.wrapping_add(1);
+        let c_path = std::ffi::CString::new(path.to_string_lossy().as_bytes()).unwrap();
+        // SAFETY: `c_path` is a live NUL-terminated CString borrowed for the duration of the call,
+        // and `chown` reads it without retaining it. `u32::MAX` is the unsigned spelling of the
+        // `-1` gid that means "leave the group unchanged".
+        let rc = unsafe { libc::chown(c_path.as_ptr(), target_uid, u32::MAX) };
+        assert_eq!(rc, 0, "chown failed — this test needs root");
+        assert_eq!(std::fs::metadata(&path).unwrap().uid(), target_uid);
+
+        // Query with a pid that does NOT match the filename: the exact-path shortcut earlier in
+        // `find_sway_socket` returns before the ownership guard, so hitting it would make this
+        // test vacuous in the same way the one above was.
+        let got = without_inherited_swaysock(|| find_sway_socket(rt.path(), rt.uid, Some(999)));
+        assert_eq!(got, None, "a socket owned by another uid must be rejected");
     }
 }

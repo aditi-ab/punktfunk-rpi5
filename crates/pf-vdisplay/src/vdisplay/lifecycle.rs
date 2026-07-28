@@ -59,11 +59,16 @@ pub enum Release {
 impl State {
     /// True while a backend display resource exists (Active/Lingering/Pinned) — the registry holds
     /// the keepalive in exactly these states, and `Idle` means it has been dropped.
+    // Read only by this module's tests, including the property test that pins `has_display()` to a
+    // shadow "resource alive" flag. That IS its job: it is the machine's observable invariant, not
+    // production API, so it is deliberately kept rather than inlined into the assertions.
+    #[allow(dead_code)]
     pub fn has_display(self) -> bool {
         !matches!(self, State::Idle)
     }
 
     /// Number of live sessions holding the display (0 unless Active).
+    #[allow(dead_code)] // as `has_display` above — the tests are the caller.
     pub fn refs(self) -> u32 {
         match self {
             State::Active { refs } => refs,

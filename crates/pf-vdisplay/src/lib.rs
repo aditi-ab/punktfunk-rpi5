@@ -13,8 +13,13 @@
 //! owned keepalive whose `Drop` releases the output (RAII — no explicit `destroy`). Capture
 //! consumes the node via the host `capture::capture_virtual_output`.
 
-// Scaffold: some backend paths + Stage-3 identity are defined ahead of the target that uses them.
-#![allow(dead_code)]
+// `dead_code` is ENFORCED on Linux, where ~10k of this crate's ~17k lines live. Off elsewhere for
+// one structural reason: `proc`, `session`, `routing`, `monitors` and `lifecycle` are declared
+// unconditionally but exist to serve the Linux backends, so on Windows/macOS most of their surface
+// is legitimately unreferenced. Scoping it this way rather than crate-wide keeps the platform that
+// owns the code honest. (Was a bare crate-wide allow whose "scaffold, defined ahead of the target
+// that uses them" rationale had stopped being true.)
+#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 // Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
 #![deny(clippy::undocumented_unsafe_blocks)]
 // …and that program only covers a whole `unsafe fn` body once the body needs its own block: in

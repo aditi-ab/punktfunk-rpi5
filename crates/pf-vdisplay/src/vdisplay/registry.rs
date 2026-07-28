@@ -244,6 +244,11 @@ mod linux {
         life: lifecycle::State,
         /// The backend's keepalive (KWin Wayland conn / Mutter D-Bus session / gamescope child). Its
         /// `Drop` releases the compositor output — so it is dropped only on teardown/expiry.
+        // NEVER READ, ON PURPOSE — `dead_code` is right that nothing loads this field and wrong
+        // about what that means. It is an RAII guard: holding it is the whole behaviour, and its
+        // `Drop` is what releases the compositor output. Deleting it as "unused" would release
+        // every pooled display the instant it was created.
+        #[allow(dead_code)]
         keepalive: Box<dyn Send>,
         node_id: u32,
         preferred_mode: Option<(u32, u32, u32)>,

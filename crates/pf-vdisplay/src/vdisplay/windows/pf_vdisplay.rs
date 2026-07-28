@@ -874,13 +874,11 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
-    /// Live hardware round trip — skipped unless `PUNKTFUNK_PF_VDISPLAY_LIVE=1` (needs the pf-vdisplay
-    /// driver installed). Exercises the real trait path: open -> create -> hold -> drop (REMOVE).
+    /// Live hardware round trip — `#[ignore]`d (needs the pf-vdisplay driver installed); run with
+    /// `cargo test -p pf-vdisplay -- --ignored live_create_drop`. Exercises the real trait path: open -> create -> hold -> drop (REMOVE).
     #[test]
+    #[ignore = "needs the pf-vdisplay driver on real hardware; run with --ignored"]
     fn live_create_drop() {
-        if std::env::var("PUNKTFUNK_PF_VDISPLAY_LIVE").is_err() {
-            return;
-        }
         let mut vd = PfVdisplayDisplay::new().expect("open pf-vdisplay");
         let vout = vd
             .create(Mode {
@@ -894,18 +892,16 @@ mod tests {
         drop(vout); // triggers REMOVE + stops the pinger
     }
 
-    /// Live in-place resize spike — skipped unless `PUNKTFUNK_PF_VDISPLAY_LIVE=1` (needs a v4
-    /// pf-vdisplay driver installed + the host service STOPPED, single-instance guard). Answers the
+    /// Live in-place resize spike — `#[ignore]`d (needs a v4 pf-vdisplay driver installed + the host
+    /// service STOPPED, single-instance guard); run with `-- --ignored live_inplace_resize`. Answers the
     /// P2 open questions on real glass with no streaming client: create at one mode, then acquire
     /// the SAME session's slot at a DIFFERENT mode — the manager's resize branch runs UPDATE_MODES
     /// → mode-advertised wait → set_active_mode → verified settle. In-place success is visible as
     /// the SAME OS target id on the second output (a re-arrival fallback mints a new one) plus the
     /// committed active resolution; the test reports which path ran and asserts the mode landed.
     #[test]
+    #[ignore = "needs the pf-vdisplay driver on real hardware; run with --ignored"]
     fn live_inplace_resize() {
-        if std::env::var("PUNKTFUNK_PF_VDISPLAY_LIVE").is_err() {
-            return;
-        }
         // Live-run diagnostics: surface the manager/backend tracing (activation ladder, settle
         // waits, UPDATE_MODES) on stdout — a bare test harness has no subscriber, which made the
         // first on-glass run blind.
