@@ -163,6 +163,34 @@ in
           firewall still streams (it just adds ~2.5 s at session start).
         '';
       };
+
+      gamescopeHdr = mkOption {
+        type = types.bool;
+        default = false;
+        description = ''
+          Put `punktfunk-gamescope` — gamescope carrying punktfunk's `pipewire-hdr` patches — on
+          the host service's PATH and turn HDR on for the gamescope backend
+          (`PUNKTFUNK_GAMESCOPE_HDR=1`), so a 10-bit-capable client can stream true HDR10
+          (BT.2020 PQ) off a gamescope virtual output.
+
+          It does NOT replace the system's `gamescope`: the binary has its own name and the host
+          prefers it only for the sessions it spawns itself. Costs a gamescope build from source.
+
+          Off by default while the feature soaks (design §4 rollout); the host also stays SDR on
+          its own if the patched binary is somehow absent, so this is a policy switch, not a
+          promise.
+        '';
+      };
+
+      gamescopePackage = mkOption {
+        type = types.package;
+        default = self.packages.${system}.punktfunk-gamescope;
+        defaultText = literalExpression "punktfunk.packages.\${system}.punktfunk-gamescope";
+        description = ''
+          The patched gamescope used when `gamescopeHdr = true`. Override to build it from a
+          different nixpkgs (the patches apply to whatever gamescope that nixpkgs pins).
+        '';
+      };
     };
 
     client = {
@@ -324,7 +352,10 @@ in
           pkgs.bash
           pkgs.coreutils
           pkgs.pipewire
-        ];
+        ]
+        # The HDR-capable gamescope, if enabled. On PATH rather than pinned through
+        # PUNKTFUNK_GAMESCOPE_BIN so an operator's own override of that env still wins.
+        ++ optional cfg.host.gamescopeHdr cfg.host.gamescopePackage;
         serviceConfig = {
           ExecStart =
             "${cfg.host.package}/bin/punktfunk-host serve" + optionalString cfg.host.gamestream " --gamestream";
@@ -334,6 +365,9 @@ in
             (optional (cfg.host.settings != { }) "${hostSettingsFile}")
             ++ (optional (cfg.host.environmentFile != null) "-${toString cfg.host.environmentFile}");
         };
+        # Layered UNDER `settings`/`environmentFile` (systemd's Environment= loses to a later
+        # EnvironmentFile), so an explicit `PUNKTFUNK_GAMESCOPE_HDR` in either still wins.
+        environment = mkIf cfg.host.gamescopeHdr { PUNKTFUNK_GAMESCOPE_HDR = "1"; };
       };
     })
 

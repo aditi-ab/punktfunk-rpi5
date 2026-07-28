@@ -61,6 +61,15 @@
           inherit version;
           # `.hook` + `.fetchBunDeps` (bun2nix v2 API) — see packages.nix.
           bun2nix = bun2nix.packages.${system}.default;
+        }
+        // {
+          # gamescope + our `pipewire-hdr` patches, so the gamescope backend can stream HDR.
+          # Kept OUT of packages.nix (a Rust/crane file) — it is a C++ meson override with a
+          # disjoint dependency set — and out of `checks` below, because it rebuilds gamescope
+          # from source and would make `nix flake check` an hour long.
+          punktfunk-gamescope = pkgs.callPackage ./packaging/nix/gamescope.nix {
+            patchDir = ./packaging/gamescope/patches;
+          };
         };
     in
     {
@@ -76,6 +85,7 @@
             punktfunk-web
             punktfunk-scripting
             punktfunk-tray
+            punktfunk-gamescope
             ;
           default = pf.punktfunk-host;
         }

@@ -1,0 +1,37 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Enrico=20B=C3=BChler?= <enrico.buehler@unom.io>
+Date: Tue, 28 Jul 2026 13:53:41 +0200
+Subject: [PATCH] punktfunk: stamp the version banner with +pfhdr1
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+punktfunk decides a session's bit depth before the virtual display exists (the
+Welcome is irrevocable — a PQ stream on an 8-bit encoder is a hard error), so
+its capability answer has to be a static property of the resolved binary rather
+than an optimistic negotiation. Marking the banner lets it probe with
+`gamescope --version`.
+
+NOT for upstream: drop this commit once pipewire-hdr lands there and a plain
+version floor answers the same question.
+---
+ src/meson.build | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/src/meson.build b/src/meson.build
+index 662f752..b68e72c 100644
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -177,7 +177,11 @@ compiler_version = cc.version()
+ 
+ vcs_tag_cmd = ['git', 'describe', '--always', '--tags', '--dirty=+']
+ vcs_tag = run_command(vcs_tag_cmd, check: false).stdout().strip()
+-version_tag = vcs_tag + ' (' + compiler_name + ' ' + compiler_version + ')'
++# punktfunk carries a pipewire-hdr patch on top of upstream; stamp the banner so a host can probe
++# "does this gamescope offer 10-bit PQ capture?" from `gamescope --version` alone, before it has
++# to commit a session to 10-bit (the Welcome is irrevocable). Bump the number when the patch's
++# wire behaviour changes.
++version_tag = vcs_tag + '+pfhdr1' + ' (' + compiler_name + ' ' + compiler_version + ')'
+ 
+ gamescope_version_conf = configuration_data()
+ gamescope_version_conf.set('VCS_TAG', version_tag)

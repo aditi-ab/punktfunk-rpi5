@@ -1,0 +1,10 @@
+# gamescope raises its own scheduling priority; without CAP_SYS_NICE it still runs, just with
+# worse frame pacing and a warning per launch. Same capability Arch's own `gamescope` package sets
+# — set here too so our binary behaves identically to the one it stands beside.
+post_install() {
+  setcap 'CAP_SYS_NICE=eip' usr/bin/punktfunk-gamescope 2>/dev/null || true
+}
+
+post_upgrade() {
+  post_install
+}

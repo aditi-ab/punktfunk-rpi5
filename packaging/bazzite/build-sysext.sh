@@ -24,18 +24,27 @@
 #
 # Usage:
 #   bash build-sysext.sh --version-id 43 --out dist/punktfunk-0.7.1-1-x86-64.raw \
+#        [--gamescope path/to/punktfunk-gamescope] \
 #        dist/punktfunk-0.7.1-1.fc43.x86_64.rpm dist/punktfunk-web-0.7.1-1.fc43.noarch.rpm
+#
+# --gamescope folds in a prebuilt HDR-capable gamescope (packaging/gamescope) as
+# /usr/bin/punktfunk-gamescope, which is what lets the gamescope backend stream 10-bit BT.2020 PQ.
+# It is NOT built here: it is a C++ meson build with gamescope's whole dependency set, so CI builds
+# it in the same Fedora container beforehand (`bash packaging/gamescope/build-punktfunk-gamescope.sh
+# --destdir stage --prefix /usr`) and passes the resulting binary in. Omit it and the image is
+# exactly what it was — the host then stays SDR on that backend, by design.
 #
 # The installed image MUST be named punktfunk.raw (the embedded extension-release marker is
 # extension-release.punktfunk; systemd-sysext requires marker == image name) — the feed carries
 # versioned filenames and punktfunk-sysext installs to the fixed name.
 set -euo pipefail
 
-VERSION_ID="" OUT="" RPMS=()
+VERSION_ID="" OUT="" GAMESCOPE="" RPMS=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --version-id) VERSION_ID="${2:?}"; shift 2 ;;
     --out)        OUT="${2:?}"; shift 2 ;;
+    --gamescope)  GAMESCOPE="${2:?}"; shift 2 ;;
     *)            RPMS+=("$1"); shift ;;
   esac
 done
@@ -77,6 +86,17 @@ if [ -d "$STAGE/etc" ]; then
   rm -rf "${STAGE:?}/etc"
 fi
 rm -rf "${STAGE:?}/var"   # rpm ghosts etc. — nothing outside /usr may remain
+
+# The HDR-capable gamescope, when one was built (see --gamescope in the header). Verified by its
+# banner marker rather than trusted by filename: an unpatched gamescope shipped under this name
+# would make the host promise HDR it cannot deliver, and the punktfunk/1 Welcome cannot take that
+# back mid-session.
+if [ -n "$GAMESCOPE" ]; then
+  [ -x "$GAMESCOPE" ] || { echo "no such executable: $GAMESCOPE" >&2; exit 1; }
+  "$GAMESCOPE" --version 2>&1 | grep -q '+pfhdr' || {
+    echo "$GAMESCOPE has no +pfhdr marker — it is not a punktfunk HDR build" >&2; exit 1; }
+  install -Dm0755 "$GAMESCOPE" "$STAGE/usr/bin/punktfunk-gamescope"
+fi
 
 # Self-update: the helper rides inside the image.
 install -Dm0755 "$HERE/punktfunk-sysext.sh" "$STAGE/usr/bin/punktfunk-sysext"
