@@ -63,6 +63,9 @@ windows = { version = "0.62", features = [
     "Win32_Graphics_Gdi",
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
+    # `proc`'s budget ends the helper's whole process TREE: every Windows helper is reached through
+    # a shell, so the process that hangs is a grandchild `Child::kill` cannot reach.
+    "Win32_System_JobObjects",
     "Win32_System_Threading",
 ] }
 

@@ -10,6 +10,9 @@
 //! These wrappers bound the wait: poll for exit until the budget runs out, then kill the child and
 //! report [`std::io::ErrorKind::TimedOut`], so callers see a plain "the helper failed" error and
 //! take their existing failure path instead of hanging.
+//!
+//! What the budget bounds is the whole **process tree**, not just the process we spawned — see
+//! [`tree`] for why that distinction is the entire difference on Windows.
 
 use std::io::{Error, ErrorKind, Result};
 use std::process::{Command, ExitStatus, Output};
@@ -25,11 +28,18 @@ const POLL: Duration = Duration::from_millis(20);
 /// commands run for their exit status alone — see [`output_within`] when the output is read.
 pub(crate) fn status_within(cmd: &mut Command, budget: Duration) -> Result<ExitStatus> {
     let mut child = cmd.spawn()?;
+    let tree = tree::Guard::attach(&child);
     let deadline = Instant::now() + budget;
     loop {
         match child.try_wait()? {
-            Some(status) => return Ok(status),
+            Some(status) => {
+                // The helper is gone; anything it left running is not something the caller asked
+                // for and still holds the stdio it inherited from us.
+                tree.terminate();
+                return Ok(status);
+            }
             None if Instant::now() >= deadline => {
+                tree.terminate();
                 let _ = child.kill();
                 let _ = child.wait(); // reap it — never leave a zombie behind
                 return Err(timed_out(cmd, budget));
@@ -49,12 +59,20 @@ pub(crate) fn output_within(cmd: &mut Command, budget: Duration) -> Result<Outpu
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()?;
+    let tree = tree::Guard::attach(&child);
     let deadline = Instant::now() + budget;
     loop {
         match child.try_wait()? {
-            // Exited: `wait_with_output` now only drains already-buffered pipes.
-            Some(_) => return child.wait_with_output(),
+            Some(_) => {
+                // Exited: `wait_with_output` now only drains already-buffered pipes — but only if
+                // nothing else still holds their WRITE end. A grandchild that outlived the helper
+                // does, and `wait_with_output` reads to an EOF that would then never arrive, which
+                // is the one way this "bounded" helper could still hang forever. End the tree first.
+                tree.terminate();
+                return child.wait_with_output();
+            }
             None if Instant::now() >= deadline => {
+                tree.terminate();
                 let _ = child.kill();
                 let _ = child.wait();
                 return Err(timed_out(cmd, budget));
@@ -91,6 +109,136 @@ pub(crate) fn current_uid() -> u32 {
     // SAFETY: parameterless POSIX call that always succeeds and touches no memory — it just
     // returns the calling process's real uid. Nothing is aliased, read, or freed.
     unsafe { libc::getuid() }
+}
+
+/// Ending the *tree* the helper started, not just the process we spawned.
+///
+/// [`std::process::Child::kill`] is one `TerminateProcess` / one `SIGKILL`: it ends exactly the
+/// process we launched. On Unix that is the whole story here — `kscreen-doctor`, `systemctl`,
+/// `pw-dump` and friends are single processes we exec directly, and none of them forks a worker
+/// that outlives it.
+///
+/// On Windows it is not, because there is no direct exec: every helper is reached through a shell
+/// (`cmd /c …`, `powershell -Command "… | pnputil …"`), so the process that actually hangs is a
+/// **grandchild**. Killing the shell leaves it running — holding the stdio handles and the working
+/// directory it inherited from us — and a budget that leaves that behind has not bounded anything.
+/// This is not theoretical: it is how a fully green `cargo test -p pf-vdisplay` still failed its CI
+/// job. The suite's own hung-helper case orphaned a 60-second `ping.exe`, which kept the build
+/// step's stdout pipe open past the runner's 10 s `WaitDelay` and pinned `crates\pf-vdisplay` so
+/// the workspace could not be cleaned up.
+///
+/// A Job object is the mechanism Windows provides for exactly this: job membership is inherited
+/// across `CreateProcess`, so assigning the child enrolls every descendant it goes on to spawn, and
+/// one `TerminateJobObject` ends all of them. `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` makes that hold
+/// even on paths that never reach [`Guard::terminate`] — an early `?`, a panic — because closing
+/// the last handle to the job is then itself the kill.
+///
+/// Best-effort by construction: if the job cannot be created or the child cannot be assigned, the
+/// helpers degrade to the single-process kill they did before rather than failing the query, which
+/// is the same stance as the already-ignored result of `Child::kill`.
+#[cfg(windows)]
+mod tree {
+    use std::os::windows::io::AsRawHandle;
+    use std::process::Child;
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+
+    /// Owns a Job object holding the spawned helper and everything it spawns. `None` when the job
+    /// could not be set up (see the module doc: degrade, don't fail).
+    pub(super) struct Guard(Option<HANDLE>);
+
+    impl Guard {
+        /// Enroll `child` — and, transitively, its descendants — in a fresh kill-on-close job.
+        pub(super) fn attach(child: &Child) -> Self {
+            // SAFETY: an unnamed job object with default security attributes; no pointer is passed
+            // and none is retained. The handle it yields is owned by the `Guard` constructed from
+            // it on the next line and closed exactly once, in that `Guard`'s `Drop`.
+            let job = match unsafe { CreateJobObjectW(None, None) } {
+                Ok(job) => job,
+                Err(e) => {
+                    tracing::debug!(error = %e, "no job object for this helper — a hung one's \
+                         grandchildren will outlive its budget");
+                    return Self(None);
+                }
+            };
+            // Owned from here on, so both fallible steps below can bail without leaking it.
+            let guard = Self(Some(job));
+            if let Err(e) = guard.enroll(child) {
+                tracing::debug!(error = %e, "could not enroll this helper in its job object — a \
+                     hung one's grandchildren will outlive its budget");
+            }
+            guard
+        }
+
+        fn enroll(&self, child: &Child) -> windows::core::Result<()> {
+            let Some(job) = self.0 else { return Ok(()) };
+            let info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
+                BasicLimitInformation:
+                    windows::Win32::System::JobObjects::JOBOBJECT_BASIC_LIMIT_INFORMATION {
+                        LimitFlags: JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+                        ..Default::default()
+                    },
+                ..Default::default()
+            };
+            // SAFETY: `job` is the live handle this `Guard` owns. The pointer is to a fully
+            // initialised local of exactly the type `JobObjectExtendedLimitInformation` selects,
+            // passed with that type's own size, and the kernel copies the limits out before
+            // returning — `info` is not retained past the call.
+            unsafe {
+                SetInformationJobObject(
+                    job,
+                    JobObjectExtendedLimitInformation,
+                    std::ptr::from_ref(&info).cast(),
+                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                )?;
+            }
+            // SAFETY: `job` is the live handle this `Guard` owns. `child` is borrowed for the call,
+            // so the process handle it lends is open and stays open for the duration — `Child`
+            // closes it only in its own `Drop`. The kernel duplicates what it needs; we keep
+            // ownership of both handles.
+            unsafe { AssignProcessToJobObject(job, HANDLE(child.as_raw_handle())) }
+        }
+
+        /// End every process still in the job. A no-op once they have all exited, so this is safe
+        /// to call on the success path as well as the timeout one.
+        pub(super) fn terminate(&self) {
+            let Some(job) = self.0 else { return };
+            // SAFETY: `job` is this `Guard`'s live, owned handle — it is closed only in `Drop`,
+            // which cannot have run while `&self` is borrowed. The exit code is arbitrary; nothing
+            // reads it, because a killed tree is reported to callers as the budget's `TimedOut`.
+            let _ = unsafe { TerminateJobObject(job, 1) };
+        }
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            let Some(job) = self.0.take() else { return };
+            // SAFETY: `job` is the handle created in `attach` and owned solely by this `Guard`;
+            // `take` makes this the one and only close. Per the module doc this close is also the
+            // backstop kill — with KILL_ON_JOB_CLOSE set, dropping the last handle terminates
+            // whatever is still in the job, so no early return can leak the tree.
+            let _ = unsafe { CloseHandle(job) };
+        }
+    }
+}
+
+/// The Unix half: `Child::kill` already ends the only process there is (see the Windows module doc
+/// for why that is not true there). Kept as a real type rather than `cfg`ing the call sites, so the
+/// two platforms read as one flow.
+#[cfg(not(windows))]
+mod tree {
+    pub(super) struct Guard;
+
+    impl Guard {
+        pub(super) fn attach(_child: &std::process::Child) -> Self {
+            Self
+        }
+        pub(super) fn terminate(&self) {}
+    }
 }
 
 // `unix` gate, not `test` alone: this module is compiled on every platform (lib.rs declares it
@@ -171,5 +319,79 @@ mod tests_windows {
         .expect("ran");
         assert!(out.status.success());
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "punktfunk");
+    }
+
+    /// A scratch directory for the tree test's marker files, removed on drop. `remove_dir_all` is
+    /// deliberately un-asserted: if the tree *did* survive it still has this directory as its
+    /// working directory and the removal fails — which is the failure the test itself reports.
+    struct Scratch(std::path::PathBuf);
+
+    impl Scratch {
+        fn new() -> Self {
+            let dir = std::env::temp_dir().join(format!("pf-vd-proc-tree-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("scratch dir");
+            Self(dir)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// The budget must end the whole tree, not just the process we spawned.
+    ///
+    /// Every Windows helper is reached through a shell, so the process that actually hangs is a
+    /// grandchild that `Child::kill` cannot see. Left alive it keeps our stdio handles and our
+    /// working directory — which is how a green test run still failed its CI job before the job
+    /// object went in (the orphan held the build step's pipe open past the runner's `WaitDelay`
+    /// and pinned the crate directory against cleanup).
+    #[test]
+    fn the_budget_ends_the_whole_tree_not_just_the_child() {
+        let scratch = Scratch::new();
+        let ran = scratch.0.join("grandchild-ran");
+        let survived = scratch.0.join("grandchild-survived");
+        let script = scratch.0.join("grandchild.cmd");
+        // `%~dp0` — the script's own directory, resolved by cmd at run time — rather than the paths
+        // interpolated in. A .cmd file is read in the OEM code page, so an absolute path baked into
+        // it is mangled the moment the temp dir contains a non-ASCII character (`C:\Users\Enrico
+        // Bühler\…` arrives as `B?hler`) and every redirect in it fails with "path not found".
+        std::fs::write(
+            &script,
+            format!(
+                "@echo off\r\n\
+                 echo up>\"%~dp0{}\"\r\n\
+                 ping -n 4 127.0.0.1 >NUL\r\n\
+                 echo up>\"%~dp0{}\"\r\n",
+                ran.file_name().expect("marker name").to_string_lossy(),
+                survived.file_name().expect("marker name").to_string_lossy(),
+            ),
+        )
+        .expect("write the grandchild script");
+
+        // `cmd /c cmd /c <script>`: the OUTER cmd is our child, the inner one is the grandchild
+        // that `Child::kill` alone would leave running.
+        let err = status_within(
+            Command::new("cmd").args(["/c", "cmd", "/c", &script.display().to_string()]),
+            Duration::from_millis(2500),
+        )
+        .expect_err("must time out");
+        assert_eq!(err.kind(), ErrorKind::TimedOut);
+
+        // Without this the test could pass vacuously — a grandchild killed before it ever started
+        // proves nothing about killing trees.
+        assert!(
+            ran.exists(),
+            "the grandchild never got as far as its first marker, so this run proves nothing"
+        );
+
+        // Outlast the grandchild's own sleep: a surviving tree writes the second marker.
+        std::thread::sleep(Duration::from_secs(5));
+        assert!(
+            !survived.exists(),
+            "a grandchild outlived the budget — the shell was killed but not the tree under it"
+        );
     }
 }
