@@ -924,6 +924,66 @@ mod tests {
         drop(vout); // triggers REMOVE + stops the pinger
     }
 
+    /// `SDC_TOPOLOGY_EXTEND` needs something to extend ACROSS — and that is the state its callers
+    /// are in, which is why this looked like a defect and is not.
+    ///
+    /// `force_extend_topology` carries two jobs: stop a fresh IddCx monitor being CLONED onto the
+    /// existing panel, and serve as `restore_displays_ccd`'s last-resort "the desk is not left
+    /// dark" backstop. Probed directly on .173 with only the LG TV connected, the preset returns
+    /// **rc=31 ERROR_GEN_FAILURE** (`SDC_USE_DATABASE_CURRENT` returns 0), which reads like an
+    /// inert backstop.
+    ///
+    /// On glass it is not, and this case is the measurement that settled it — active paths
+    /// `1 -> (virtual up) 1 -> (after force-EXTEND) 2`:
+    ///
+    /// * With one connected display there is nothing to extend across, hence rc=31.
+    /// * With the virtual present there are two, and the preset applies. Both real call sites run
+    ///   in exactly that state — the restore fires BEFORE the REMOVE, so the virtual is still
+    ///   there — so the backstop does work where it fires.
+    /// * ⭐ It also caught the clone hazard live: the arriving virtual monitor did **not** get its
+    ///   own active path (1 -> 1), only the forced EXTEND gave it one (-> 2). That is precisely the
+    ///   "no distinct source -> no frames" case `force_extend_topology`'s own doc describes.
+    ///
+    /// ⚠️ Residual worth remembering rather than asserting: a restore that fails once the virtual
+    /// is already gone is back to one connected display, where EXTEND returns 31 and cannot
+    /// re-light anything.
+    ///
+    /// Reports the counts rather than pinning a topology — which answer is "correct" depends on the
+    /// box. It does assert the desk is not left with zero active paths.
+    #[test]
+    #[ignore = "needs the pf-vdisplay driver on real hardware; run with --ignored"]
+    fn live_force_extend_with_a_virtual_display_present() {
+        fn active_paths() -> Option<u32> {
+            pf_win_display::win_display::count_other_active(&[])
+        }
+        let before = active_paths();
+        let mut vd = PfVdisplayDisplay::new().expect("open pf-vdisplay");
+        let vout = vd
+            .create(Mode {
+                width: 1920,
+                height: 1080,
+                refresh_hz: 60,
+            })
+            .expect("create virtual display");
+        thread::sleep(Duration::from_secs(2));
+        let with_virtual = active_paths();
+        pf_win_display::win_display::force_extend_topology();
+        thread::sleep(Duration::from_secs(2));
+        let after_extend = active_paths();
+        drop(vout);
+        thread::sleep(Duration::from_secs(3));
+        let after_drop = active_paths();
+        println!(
+            "force-EXTEND on glass: active paths {before:?} -> (virtual up) {with_virtual:?} -> \
+             (after force-EXTEND) {after_extend:?} -> (virtual dropped) {after_drop:?}"
+        );
+        assert_ne!(
+            after_drop,
+            Some(0),
+            "the desk was left with NO active display path after the teardown"
+        );
+    }
+
     /// Live in-place resize spike — `#[ignore]`d (needs a v4 pf-vdisplay driver installed + the host
     /// service STOPPED, single-instance guard); run with `-- --ignored live_inplace_resize`. Answers the
     /// P2 open questions on real glass with no streaming client: create at one mode, then acquire
