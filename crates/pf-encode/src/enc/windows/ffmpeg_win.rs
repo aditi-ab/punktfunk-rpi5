@@ -37,13 +37,6 @@
 //! through `ffmpeg::ffi` (= `ffmpeg_sys_next`), exactly as the Linux CUDA/VAAPI paths do. The
 //! `AVD3D11VADeviceContext`/`AVD3D11VAFramesContext` layouts are mirrored (the bindings don't
 //! allowlist `hwcontext_d3d11va.h`), as [`super::linux`] mirrors `AVCUDADeviceContext`.
-// UNSAFE-LINT EXEMPTION (rationale + exit criteria: `unsafe_op_in_unsafe_fn` in the workspace
-// Cargo.toml). This body is raw libav (`ffmpeg-sys-next`) calls on borrowed hwcontext pointers
-// almost line for line; narrowing it would add one `unsafe {}` plus one SAFETY comment per call
-// that could only restate the signature. Clearing this file means DELETING the markers that carry
-// no caller contract, not wrapping the calls — until then the lint is off HERE and enforced
-// everywhere else.
-#![allow(unsafe_op_in_unsafe_fn)]
 // Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
 #![deny(clippy::undocumented_unsafe_blocks)]
 
@@ -337,29 +330,40 @@ unsafe fn open_win_encoder(
     video.set_format(Pixel::from(sw_pix_fmt));
     // Fixed rate, CBR, no B-frames, ~1-frame VBV — the shared low-latency RC contract.
     apply_low_latency_rc(&mut video, fps, bitrate_bps);
-    let raw = video.as_mut_ptr();
-    (*raw).gop_size = i32::MAX; // no periodic IDR (forced-IDR via pict_type=I on RFI)
-    if ten_bit {
-        // 10-bit HDR: BT.2020 primaries + SMPTE-2084 (PQ) transfer. The client auto-detects PQ from
-        // the HEVC VUI; the static mastering metadata also rides the 0xCE datagram out-of-band.
-        (*raw).colorspace = ffi::AVColorSpace::AVCOL_SPC_BT2020_NCL;
-        (*raw).color_range = ffi::AVColorRange::AVCOL_RANGE_MPEG;
-        (*raw).color_primaries = ffi::AVColorPrimaries::AVCOL_PRI_BT2020;
-        (*raw).color_trc = ffi::AVColorTransferCharacteristic::AVCOL_TRC_SMPTE2084;
-    } else {
-        // We hand the encoder BT.709 *limited* NV12 (video-processor or swscale CSC), so signal that
-        // VUI — else the client decoder washes the picture out.
-        (*raw).colorspace = ffi::AVColorSpace::AVCOL_SPC_BT709;
-        (*raw).color_range = ffi::AVColorRange::AVCOL_RANGE_MPEG;
-        (*raw).color_primaries = ffi::AVColorPrimaries::AVCOL_PRI_BT709;
-        (*raw).color_trc = ffi::AVColorTransferCharacteristic::AVCOL_TRC_BT709;
-    }
-    (*raw).pix_fmt = pix_fmt;
-    if !device_ref.is_null() {
-        (*raw).hw_device_ctx = ffi::av_buffer_ref(device_ref);
-    }
-    if !frames_ref.is_null() {
-        (*raw).hw_frames_ctx = ffi::av_buffer_ref(frames_ref);
+    // SAFETY: `as_mut_ptr` hands back the `AVCodecContext` behind the `video` encoder allocated just
+    // above, which outlives every write here (it is opened and returned below). The gop/colour/
+    // pix_fmt stores are in-bounds scalar field writes on that live context. `device_ref` and
+    // `frames_ref` are valid `AVBufferRef`s by this fn's contract OR null — the system path passes
+    // null for both — and the `is_null` guards keep `av_buffer_ref` off the null case; each call
+    // returns a NEW reference that the codec context adopts and unrefs when freed, so this shares
+    // the caller's buffers rather than taking them over.
+    let raw = unsafe { video.as_mut_ptr() };
+    // SAFETY: as above — `raw` is that live `AVCodecContext` and every store below is an in-bounds
+    // field write on it, with the two `av_buffer_ref` calls guarded against null.
+    unsafe {
+        (*raw).gop_size = i32::MAX; // no periodic IDR (forced-IDR via pict_type=I on RFI)
+        if ten_bit {
+            // 10-bit HDR: BT.2020 primaries + SMPTE-2084 (PQ) transfer. The client auto-detects PQ from
+            // the HEVC VUI; the static mastering metadata also rides the 0xCE datagram out-of-band.
+            (*raw).colorspace = ffi::AVColorSpace::AVCOL_SPC_BT2020_NCL;
+            (*raw).color_range = ffi::AVColorRange::AVCOL_RANGE_MPEG;
+            (*raw).color_primaries = ffi::AVColorPrimaries::AVCOL_PRI_BT2020;
+            (*raw).color_trc = ffi::AVColorTransferCharacteristic::AVCOL_TRC_SMPTE2084;
+        } else {
+            // We hand the encoder BT.709 *limited* NV12 (video-processor or swscale CSC), so signal that
+            // VUI — else the client decoder washes the picture out.
+            (*raw).colorspace = ffi::AVColorSpace::AVCOL_SPC_BT709;
+            (*raw).color_range = ffi::AVColorRange::AVCOL_RANGE_MPEG;
+            (*raw).color_primaries = ffi::AVColorPrimaries::AVCOL_PRI_BT709;
+            (*raw).color_trc = ffi::AVColorTransferCharacteristic::AVCOL_TRC_BT709;
+        }
+        (*raw).pix_fmt = pix_fmt;
+        if !device_ref.is_null() {
+            (*raw).hw_device_ctx = ffi::av_buffer_ref(device_ref);
+        }
+        if !frames_ref.is_null() {
+            (*raw).hw_frames_ctx = ffi::av_buffer_ref(frames_ref);
+        }
     }
 
     // Low-latency tuning — the per-vendor contract lives in `vendor_opts` (pure, test-pinned).
@@ -434,12 +438,19 @@ pub fn probe_can_encode(vendor: WinVendor, codec: Codec) -> bool {
 }
 
 /// The immediate context of an `ID3D11Device` (for `CopyResource`/`CopySubresourceRegion`).
-unsafe fn immediate_context(device: &ID3D11Device) -> ID3D11DeviceContext {
+///
+/// Safe: `&ID3D11Device` is a borrowed, reference-counted COM wrapper, so the borrow itself is the
+/// "live device" guarantee, and the returned context owns its own reference.
+fn immediate_context(device: &ID3D11Device) -> ID3D11DeviceContext {
     // windows-rs 0.62: the inherent method takes no args and returns the context (the OutRef form is
     // only on the `_Impl` trait, for implementing the interface). Every D3D11 device has one.
-    device
-        .GetImmediateContext()
-        .expect("ID3D11Device always has an immediate context")
+    // SAFETY: a `?`-free COM call on the live `device` borrow; it takes no pointers and every
+    // D3D11 device has an immediate context, so the `expect` is unreachable in practice.
+    unsafe {
+        device
+            .GetImmediateContext()
+            .expect("ID3D11Device always has an immediate context")
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -538,11 +549,10 @@ impl SystemInner {
     }
 
     /// Lazily (re)build the staging texture matching `dxgi_fmt` on the captured device.
-    unsafe fn ensure_staging(
-        &mut self,
-        device: &ID3D11Device,
-        dxgi_fmt: DXGI_FORMAT,
-    ) -> Result<()> {
+    ///
+    /// Safe: `&ID3D11Device` is the live-device guarantee and `dxgi_fmt` is a plain enum; the
+    /// texture it creates is owned by `self`.
+    fn ensure_staging(&mut self, device: &ID3D11Device, dxgi_fmt: DXGI_FORMAT) -> Result<()> {
         if self.staging.is_some() {
             return Ok(());
         }
@@ -562,25 +572,38 @@ impl SystemInner {
             MiscFlags: 0,
         };
         let mut t: Option<ID3D11Texture2D> = None;
-        device
-            .CreateTexture2D(&desc, None, Some(&mut t))
-            .context("CreateTexture2D(staging readback)")?;
+        // SAFETY: one `?`-checked `CreateTexture2D` on the live `device` borrow, over a
+        // fully-initialized stack descriptor and a live `Option` out-param.
+        unsafe {
+            device
+                .CreateTexture2D(&desc, None, Some(&mut t))
+                .context("CreateTexture2D(staging readback)")?;
+        }
         self.staging = t;
         self.ctx = Some(immediate_context(device));
         Ok(())
     }
 
     /// Send the reusable `sw_frame` to the encoder with the given pts / IDR flag.
-    unsafe fn send(&mut self, pts: i64, idr: bool) -> Result<()> {
-        (*self.sw_frame).pts = pts;
-        (*self.sw_frame).pict_type = if idr {
-            ffi::AVPictureType::AV_PICTURE_TYPE_I
-        } else {
-            ffi::AVPictureType::AV_PICTURE_TYPE_NONE
-        };
-        let r = ffi::avcodec_send_frame(self.enc.as_mut_ptr(), self.sw_frame);
-        if r < 0 {
-            bail!("avcodec_send_frame({} system) failed ({r})", "ffmpeg_win");
+    ///
+    /// Safe: both arguments are scalars, and `sw_frame`/`enc` are allocations `self` owns from its
+    /// constructor until `Drop` — no caller supplies or can invalidate them.
+    fn send(&mut self, pts: i64, idr: bool) -> Result<()> {
+        // SAFETY: `self.sw_frame` is the `AVFrame` this struct allocated and owns, so the two field
+        // stores are in-bounds writes on a live allocation; `avcodec_send_frame` then takes that
+        // frame and `self.enc`'s own context, both live for the call and neither retained by libav
+        // (it references the frame's buffers itself).
+        unsafe {
+            (*self.sw_frame).pts = pts;
+            (*self.sw_frame).pict_type = if idr {
+                ffi::AVPictureType::AV_PICTURE_TYPE_I
+            } else {
+                ffi::AVPictureType::AV_PICTURE_TYPE_NONE
+            };
+            let r = ffi::avcodec_send_frame(self.enc.as_mut_ptr(), self.sw_frame);
+            if r < 0 {
+                bail!("avcodec_send_frame({} system) failed ({r})", "ffmpeg_win");
+            }
         }
         Ok(())
     }
@@ -807,7 +830,10 @@ impl SystemInner {
     /// Lazily build the swscale context (src → NV12/P010, limited range, the given colorspace). A
     /// SystemInner uses exactly one src→dst conversion for its lifetime (8-bit RGB→NV12 BT.709, or
     /// 10-bit RGB10→P010 BT.2020), so caching a single context is sound.
-    unsafe fn ensure_sws(
+    ///
+    /// Safe: every argument is a plain libav enum/int, and the context it caches belongs to `self`
+    /// (freed once in `Drop`).
+    fn ensure_sws(
         &mut self,
         src_av: ffi::AVPixelFormat,
         dst_av: ffi::AVPixelFormat,
@@ -816,25 +842,33 @@ impl SystemInner {
         if !self.sws.is_null() {
             return Ok(());
         }
-        let sws = ffi::sws_getContext(
-            self.width as c_int,
-            self.height as c_int,
-            src_av,
-            self.width as c_int,
-            self.height as c_int,
-            dst_av,
-            SWS_POINT,
-            ptr::null_mut(),
-            ptr::null_mut(),
-            ptr::null(),
-        );
-        if sws.is_null() {
-            bail!("sws_getContext(RGB→YUV) failed");
-        }
-        // Source full-range RGB → destination limited-range YUV (matches the limited-range VUI we
-        // signal). For RGB input the src coefficient table is unused; pass the dst table for both.
-        let coeff = ffi::sws_getCoefficients(cs);
-        ffi::sws_setColorspaceDetails(sws, coeff, 1, coeff, 0, 0, 1 << 16, 1 << 16);
+        // SAFETY: `sws_getContext` takes only scalars plus the documented "no filters, no params"
+        // null trio, and returns an owned context or null — which is checked before use, so
+        // `sws_setColorspaceDetails` and the store below only ever see a live one.
+        // `sws_getCoefficients` returns a pointer into libav's own static tables, valid for the
+        // process, and the call only reads it.
+        let sws = unsafe {
+            let sws = ffi::sws_getContext(
+                self.width as c_int,
+                self.height as c_int,
+                src_av,
+                self.width as c_int,
+                self.height as c_int,
+                dst_av,
+                SWS_POINT,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null(),
+            );
+            if sws.is_null() {
+                bail!("sws_getContext(RGB→YUV) failed");
+            }
+            // Source full-range RGB → destination limited-range YUV (matches the limited-range VUI
+            // we signal). For RGB input the src coefficient table is unused; pass dst for both.
+            let coeff = ffi::sws_getCoefficients(cs);
+            ffi::sws_setColorspaceDetails(sws, coeff, 1, coeff, 0, 0, 1 << 16, 1 << 16);
+            sws
+        };
         self.sws = sws;
         Ok(())
     }
@@ -873,7 +907,10 @@ struct D3d11Hw {
 
 impl D3d11Hw {
     /// Wrap the capturer's `ID3D11Device` as a D3D11VA hwdevice and build an NV12/P010 frames pool.
-    unsafe fn new(
+    /// Safe: like [`super::super::linux::VaapiHw::new`] and unlike its CUDA counterpart, this is
+    /// handed no raw pointer — `&ID3D11Device` is a borrowed, reference-counted COM wrapper and the
+    /// rest are scalars — so there is no caller contract; the `unsafe` below is the libav/D3D11 FFI.
+    fn new(
         device: &ID3D11Device,
         sw_format: ffi::AVPixelFormat,
         bind_flags: u32,
@@ -883,12 +920,19 @@ impl D3d11Hw {
     ) -> Result<Self> {
         // Owned from the moment it exists: each `bail!` below drops what was built so far, so none
         // of the failure branches carry cleanup of their own.
-        let device_ref = AvBuffer::from_raw(ffi::av_hwdevice_ctx_alloc(
-            ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA,
-        ))
-        .context("av_hwdevice_ctx_alloc(D3D11VA) failed")?;
-        let dev_ctx = (*device_ref.as_ptr()).data as *mut ffi::AVHWDeviceContext;
-        let d11 = (*dev_ctx).hwctx as *mut AVD3D11VADeviceContext;
+        // SAFETY: `av_hwdevice_ctx_alloc` returns null — rejected by `AvBuffer::from_raw`, so the
+        // `?` leaves before anything below runs — or a ref whose `data` libav has already
+        // initialized as an `AVHWDeviceContext`; for a D3D11VA device that context's `hwctx` is an
+        // `AVD3D11VADeviceContext`, so `d11` addresses a live, correctly-typed struct.
+        let (device_ref, d11) = unsafe {
+            let device_ref = AvBuffer::from_raw(ffi::av_hwdevice_ctx_alloc(
+                ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA,
+            ))
+            .context("av_hwdevice_ctx_alloc(D3D11VA) failed")?;
+            let dev_ctx = (*device_ref.as_ptr()).data as *mut ffi::AVHWDeviceContext;
+            let d11 = (*dev_ctx).hwctx as *mut AVD3D11VADeviceContext;
+            (device_ref, d11)
+        };
 
         // Turn on D3D11 multithread protection before libav sees the device.
         //
@@ -913,7 +957,9 @@ impl D3d11Hw {
         // device's internal critical section (`was` is the previous state, reported once at debug).
         match device.cast::<ID3D11Multithread>() {
             Ok(mt) => {
-                let was = mt.SetMultithreadProtected(true);
+                // SAFETY: a COM call on the live `ID3D11Multithread` just obtained by a checked
+                // `cast` of the borrowed device; it takes a BOOL and returns the previous state.
+                let was = unsafe { mt.SetMultithreadProtected(true) };
                 tracing::debug!(
                     previously_protected = was.as_bool(),
                     "D3D11 multithread protection enabled for the libav hwdevice"
@@ -931,26 +977,40 @@ impl D3d11Hw {
         // reference (clone = AddRef, forget = don't Release ours). init() fills
         // device_context / video_device / video_context / the default lock from a non-null device.
         std::mem::forget(device.clone());
-        (*d11).device = device.as_raw();
-        let r = ffi::av_hwdevice_ctx_init(device_ref.as_ptr());
+        // SAFETY: `d11` is the live `AVD3D11VADeviceContext` from above, so storing the device
+        // pointer is an in-bounds field write; the `forget(clone())` on the line above is what
+        // makes that pointer an OWNED reference, matching the Release libav does at teardown.
+        // `av_hwdevice_ctx_init` then reads that field, which is why the store precedes it.
+        let r = unsafe {
+            (*d11).device = device.as_raw();
+            ffi::av_hwdevice_ctx_init(device_ref.as_ptr())
+        };
         if r < 0 {
             bail!("av_hwdevice_ctx_init(D3D11VA) failed ({r})");
         }
 
-        let frames_ref = AvBuffer::from_raw(ffi::av_hwframe_ctx_alloc(device_ref.as_ptr()))
-            .context("av_hwframe_ctx_alloc(D3D11VA) failed")?;
-        let fc = (*frames_ref.as_ptr()).data as *mut ffi::AVHWFramesContext;
-        (*fc).format = ffi::AVPixelFormat::AV_PIX_FMT_D3D11;
-        (*fc).sw_format = sw_format;
-        (*fc).width = w as c_int;
-        (*fc).height = h as c_int;
-        (*fc).initial_pool_size = pool;
-        let f11 = (*fc).hwctx as *mut AVD3D11VAFramesContext;
-        (*f11).bind_flags = bind_flags;
-        let r = ffi::av_hwframe_ctx_init(frames_ref.as_ptr());
-        if r < 0 {
-            bail!("av_hwframe_ctx_init(D3D11VA) failed ({r})");
-        }
+        // SAFETY: same shape one level up — `av_hwframe_ctx_alloc` takes the live, now-initialized
+        // device ref and returns null (rejected by `from_raw`, so the `?` leaves before the writes)
+        // or a ref whose `data` is a live `AVHWFramesContext` whose `hwctx` is an
+        // `AVD3D11VAFramesContext`. Every store is an in-bounds field write on those, all done
+        // before `av_hwframe_ctx_init` reads them.
+        let frames_ref = unsafe {
+            let frames_ref = AvBuffer::from_raw(ffi::av_hwframe_ctx_alloc(device_ref.as_ptr()))
+                .context("av_hwframe_ctx_alloc(D3D11VA) failed")?;
+            let fc = (*frames_ref.as_ptr()).data as *mut ffi::AVHWFramesContext;
+            (*fc).format = ffi::AVPixelFormat::AV_PIX_FMT_D3D11;
+            (*fc).sw_format = sw_format;
+            (*fc).width = w as c_int;
+            (*fc).height = h as c_int;
+            (*fc).initial_pool_size = pool;
+            let f11 = (*fc).hwctx as *mut AVD3D11VAFramesContext;
+            (*f11).bind_flags = bind_flags;
+            let r = ffi::av_hwframe_ctx_init(frames_ref.as_ptr());
+            if r < 0 {
+                bail!("av_hwframe_ctx_init(D3D11VA) failed ({r})");
+            }
+            frames_ref
+        };
         Ok(D3d11Hw {
             frames_ref,
             device_ref,
@@ -1494,20 +1554,25 @@ mod tests {
     /// and "Microsoft Basic Render Driver" (vendor 0x1414) is the software rasterizer, which has no
     /// video engine at all.
     ///
-    /// # Safety
-    /// Calls the DXGI enumeration FFI and `make_device`; every result is checked before use and no
-    /// alias to the adapter outlives the call.
+    /// Safe: `prefer_vendor` is a plain id and every DXGI object is created here and owned by the
+    /// returned device; the old `# Safety` section described the body, not a caller obligation.
     #[cfg(test)]
-    unsafe fn test_hw_device(prefer_vendor: u32) -> Option<ID3D11Device> {
+    fn test_hw_device(prefer_vendor: u32) -> Option<ID3D11Device> {
         use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1};
-        let factory: IDXGIFactory1 = CreateDXGIFactory1().ok()?;
-        let mut preferred = None;
-        let mut fallback = None;
+        // SAFETY: DXGI factory/adapter enumeration over owned locals — the factory is created here,
+        // each adapter it yields owns its own COM reference, and every call is `.ok()`-checked
+        // before use. `GetDesc1` fills a fully-initialized stack descriptor.
+        let (factory, mut preferred, mut fallback): (IDXGIFactory1, _, _) =
+            (unsafe { CreateDXGIFactory1() }.ok()?, None, None);
         for i in 0.. {
-            let Ok(adapter) = factory.EnumAdapters1(i) else {
+            // SAFETY: a COM call on the live `factory` created above; it takes an index and
+            // yields an owned adapter, and the `Ok` binding is what proves one came back.
+            let Ok(adapter) = (unsafe { factory.EnumAdapters1(i) }) else {
                 break; // DXGI_ERROR_NOT_FOUND — end of the list
             };
-            let Ok(desc) = adapter.GetDesc1() else {
+            // SAFETY: a COM call on the adapter just enumerated, filling a fully-initialized
+            // stack descriptor it returns by value.
+            let Ok(desc) = (unsafe { adapter.GetDesc1() }) else {
                 continue;
             };
             let name = String::from_utf16_lossy(&desc.Description)
@@ -1521,7 +1586,11 @@ mod tests {
             }
         }
         let adapter = preferred.or(fallback)?;
-        pf_frame::dxgi::make_device(&adapter).ok().map(|(d, _c)| d)
+        // SAFETY: `make_device` requires a live `IDXGIAdapter1`; `adapter` is one of the adapters
+        // enumerated above, still owned here and borrowed only for this synchronous call.
+        unsafe { pf_frame::dxgi::make_device(&adapter) }
+            .ok()
+            .map(|(d, _c)| d)
     }
 
     /// Construct/drop `D3d11Hw` repeatedly on real silicon — the D3D11VA half of the RAII change,
@@ -1537,23 +1606,20 @@ mod tests {
     #[test]
     #[ignore = "needs a real D3D11 GPU (run on a GPU host, not the build box)"]
     fn d3d11hw_alloc_drop_cycles() {
-        // SAFETY: see `test_hw_device`; the returned device outlives every `D3d11Hw` built below.
-        let device = unsafe { test_hw_device(0x8086) }.expect("a hardware D3D11 adapter");
+        let device = test_hw_device(0x8086).expect("a hardware D3D11 adapter");
         for i in 0..8 {
-            // SAFETY: `D3d11Hw::new` needs libav initialised (it is, statically, by the ffmpeg-next
-            // crate's first use here) and a live `ID3D11Device`, which `device` is for the whole
-            // loop. NV12 at 640x480 with an 8-surface pool are valid pool parameters. The handle
-            // drops at the end of each iteration — that release is what is under test.
-            let hw = unsafe {
-                D3d11Hw::new(
-                    &device,
-                    ffi::AVPixelFormat::AV_PIX_FMT_NV12,
-                    pool_bind_flags(WinVendor::Amf),
-                    640,
-                    480,
-                    8,
-                )
-            }
+            // `D3d11Hw::new` is safe now; it still needs libav initialised, which the ffmpeg-next
+            // crate does statically on first use here. NV12 at 640x480 with an 8-surface pool are
+            // valid pool parameters. The handle drops at the end of each iteration — that release
+            // is what is under test.
+            let hw = D3d11Hw::new(
+                &device,
+                ffi::AVPixelFormat::AV_PIX_FMT_NV12,
+                pool_bind_flags(WinVendor::Amf),
+                640,
+                480,
+                8,
+            )
             .unwrap_or_else(|e| panic!("D3d11Hw::new failed on iteration {i}: {e:#}"));
             assert!(!hw.device_ref.as_ptr().is_null(), "device ref went null");
             assert!(!hw.frames_ref.as_ptr().is_null(), "frames ref went null");
@@ -1587,8 +1653,7 @@ mod tests {
     #[test]
     #[ignore = "needs a real Intel QSV device (run on an Intel host, not the build box)"]
     fn zerocopy_qsv_alloc_drop_cycles() {
-        // SAFETY: see `test_hw_device`; the device outlives every `ZeroCopyInner` built below.
-        let device = unsafe { test_hw_device(0x8086) }.expect("an Intel D3D11 adapter");
+        let device = test_hw_device(0x8086).expect("an Intel D3D11 adapter");
         for i in 0..8 {
             let zc = ZeroCopyInner::open(
                 WinVendor::Qsv,
