@@ -214,7 +214,7 @@ async function ensureControllerConfig(): Promise<void> {
  * the current runner path. Reuses/repoints the remembered shortcut (the plugin dir can change
  * across reinstalls, and pre-two-shortcut installs had this one visible).
  */
-async function ensureStreamShortcut(): Promise<{ appId: number; runner: string }> {
+async function ensureStreamShortcut(): Promise<{ appId: number; runner: string; clientBin: string }> {
   const info = await runnerInfo();
   if (!info.exists) {
     throw new Error(`launch wrapper missing at ${info.runner}`);
@@ -231,7 +231,7 @@ async function ensureStreamShortcut(): Promise<{ appId: number; runner: string }
     SteamClient.Apps.SetShortcutName(remembered, SHORTCUT_NAME);
     setShortcutHidden(remembered, true); // migrate pre-two-shortcut installs (were visible)
     void applyArtwork(remembered);
-    return { appId: remembered, runner: info.runner };
+    return { appId: remembered, runner: info.runner, clientBin: info.client_bin ?? "" };
   }
 
   const appId = await SteamClient.Apps.AddShortcut(SHORTCUT_NAME, SHELL, startDir, "");
@@ -239,7 +239,7 @@ async function ensureStreamShortcut(): Promise<{ appId: number; runner: string }
   setShortcutHidden(appId, true);
   void applyArtwork(appId);
   remember(STORAGE_KEY_STREAM, appId);
-  return { appId, runner: info.runner };
+  return { appId, runner: info.runner, clientBin: info.client_bin ?? "" };
 }
 
 /**
@@ -259,7 +259,10 @@ export async function ensureGamepadUiShortcut(): Promise<number | null> {
     void ensureControllerConfig();
     // Bare browse: PF_BROWSE with no PF_HOST → the wrapper runs `--browse --fullscreen` (console
     // home). %command% expands to the shortcut exe (/bin/sh); the wrapper rides behind as an arg.
-    const launchOpts = `PF_BROWSE=1 %command% "${info.runner}"`;
+    // PF_CLIENT_BIN only when the backend resolved a NATIVE client — else the wrapper's flatpak
+    // default stands and this shortcut is exactly what it always was.
+    const clientBin = info.client_bin ? `PF_CLIENT_BIN=${info.client_bin} ` : "";
+    const launchOpts = `${clientBin}PF_BROWSE=1 %command% "${info.runner}"`;
 
     // Reuse the remembered entry only if it still exists; a stale appId (deleted shortcut whose
     // localStorage key survived a plugin reinstall) falls through to AddShortcut so the visible
@@ -357,9 +360,14 @@ export async function launchStream(
   // Best-effort — the flatpak client's --wake looks up the host's learned MAC (a no-op if none is
   // known), and the connect that follows has its own retry window, so a failure never blocks launch.
   const waking = wake(host, port).catch(() => ({ ok: false }));
-  const [{ appId, runner }, woke] = await Promise.all([ensureStreamShortcut(), waking]);
+  const [{ appId, runner, clientBin }, woke] = await Promise.all([ensureStreamShortcut(), waking]);
   const target = port && port !== 9777 ? `${host}:${port}` : host;
   const env = [`PF_HOST=${target}`];
+  // Set only for a NATIVE client install; absent, the wrapper takes its flatpak default, so every
+  // existing Deck install produces byte-identical launch options to before.
+  if (clientBin) {
+    env.push(`PF_CLIENT_BIN=${clientBin}`);
+  }
   // A magic packet actually went out (a MAC was known), so the host may be mid-resume from
   // suspend — that takes far longer than the client's default 15 s connect budget. Stretch the
   // budget so the client's wake-tolerant dial keeps retrying across the resume; against an

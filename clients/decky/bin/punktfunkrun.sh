@@ -20,6 +20,9 @@
 #                        firing Wake-on-LAN so the connect survives the host's resume)
 #   PF_APPID  flatpak app id                        (default io.unom.Punktfunk)
 #   PF_FLATPAK  override the flatpak binary path     (default: `flatpak` on PATH)
+#   PF_CLIENT_BIN  absolute path of a NATIVE client  (optional; set by the plugin when it
+#                  resolved a non-flatpak install — then the client is exec'd directly and
+#                  PF_APPID/PF_FLATPAK are unused)
 #
 # Values are plain tokens (the plugin validates launch ids to space/quote-free ASCII before
 # they ever reach Steam launch options). An older flatpak without --launch/--browse ignores
@@ -38,8 +41,23 @@ set -u
 APPID="${PF_APPID:-io.unom.Punktfunk}"
 FLATPAK="${PF_FLATPAK:-flatpak}"
 
-# exec so the flatpak client IS the game process — when it exits, Steam ends the "game" and
-# Gaming Mode reclaims focus automatically (no manual refocus needed).
+# The client is not always the flatpak: a sysext, a .deb/.rpm, an AUR build or a nix profile
+# installs a native `punktfunk-client`, and the plugin passes its absolute path here when that
+# is what it resolved. Both kinds take the same argv and share ~/.config/punktfunk, so the only
+# difference is the prefix in front of it.
+#
+# exec so the client IS the game process — when it exits, Steam ends the "game" and Gaming Mode
+# reclaims focus automatically (no manual refocus needed).
+run_client() {
+    if [ -n "${PF_CLIENT_BIN:-}" ]; then
+        exec "$PF_CLIENT_BIN" "$@"
+    fi
+    exec "$FLATPAK" run --arch=x86_64 "$APPID" "$@"
+}
+
+# What we are about to run, for the log line each branch prints.
+CLIENT_LABEL="${PF_CLIENT_BIN:-$APPID}"
+
 # --fullscreen: present the stream chrome-less and fullscreen (the client also auto-detects the
 # Deck/gamescope env, and ignores the flag harmlessly on older builds that predate it).
 if [ -n "${PF_BROWSE:-}" ]; then
@@ -48,14 +66,14 @@ if [ -n "${PF_BROWSE:-}" ]; then
     # library shortcut launches. `--browse <host>` opens straight into that host's library (the
     # per-host "open on screen" action). A streams a game, session end returns here, B quits.
     if [ -z "${PF_HOST:-}" ]; then
-        echo "punktfunkrun: gamepad UI $APPID --browse (console home)" >&2
-        exec "$FLATPAK" run --arch=x86_64 "$APPID" --browse --fullscreen
+        echo "punktfunkrun: gamepad UI $CLIENT_LABEL --browse (console home)" >&2
+        run_client --browse --fullscreen
     fi
-    echo "punktfunkrun: library $APPID --browse $PF_HOST" >&2
+    echo "punktfunkrun: library $CLIENT_LABEL --browse $PF_HOST" >&2
     if [ -n "${PF_MGMT:-}" ]; then
-        exec "$FLATPAK" run --arch=x86_64 "$APPID" --browse "$PF_HOST" --mgmt "$PF_MGMT" --fullscreen
+        run_client --browse "$PF_HOST" --mgmt "$PF_MGMT" --fullscreen
     fi
-    exec "$FLATPAK" run --arch=x86_64 "$APPID" --browse "$PF_HOST" --fullscreen
+    run_client --browse "$PF_HOST" --fullscreen
 fi
 
 # Streaming modes need a host (browse above is the only host-less path).
@@ -72,8 +90,8 @@ if [ -n "${PF_CONNECT_TIMEOUT:-}" ]; then
 fi
 if [ -n "${PF_LAUNCH:-}" ]; then
     # A pinned game: the id rides the session Hello and the host launches that title.
-    echo "punktfunkrun: streaming $APPID --connect $PF_HOST --launch $PF_LAUNCH" >&2
-    exec "$FLATPAK" run --arch=x86_64 "$APPID" --connect "$PF_HOST" --launch "$PF_LAUNCH" "$@"
+    echo "punktfunkrun: streaming $CLIENT_LABEL --connect $PF_HOST --launch $PF_LAUNCH" >&2
+    run_client --connect "$PF_HOST" --launch "$PF_LAUNCH" "$@"
 fi
-echo "punktfunkrun: streaming $APPID --connect $PF_HOST" >&2
-exec "$FLATPAK" run --arch=x86_64 "$APPID" --connect "$PF_HOST" "$@"
+echo "punktfunkrun: streaming $CLIENT_LABEL --connect $PF_HOST" >&2
+run_client --connect "$PF_HOST" "$@"

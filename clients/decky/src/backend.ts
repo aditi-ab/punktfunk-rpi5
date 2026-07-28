@@ -90,6 +90,11 @@ export interface RunnerInfo {
   runner: string; // absolute path to bin/punktfunkrun.sh
   app_id: string; // flatpak app id
   exists: boolean;
+  // Which client the backend resolved: the flatpak, a native install (.deb/rpm/sysext/AUR/nix),
+  // or none at all. Older backends send neither field — hence optional.
+  client_kind?: "flatpak" | "native" | "none";
+  // Absolute path of the native binary; "" for flatpak. Passed to the wrapper as PF_CLIENT_BIN.
+  client_bin?: string;
 }
 
 // The slice of the flatpak client's settings JSON this UI surfaces. The file can hold more

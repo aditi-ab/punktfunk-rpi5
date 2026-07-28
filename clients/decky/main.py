@@ -328,10 +328,75 @@ def _flatpak() -> str | None:
     )
 
 
+# --- which client is installed -------------------------------------------------------------
+#
+# The flatpak is the Deck's usual client, but it is not the only one: a sysext, a .deb/.rpm, an
+# AUR build, a nix profile and a hand-built binary all install a NATIVE `punktfunk-client`, and
+# on those the plugin used to be dead in the water — every headless call went through
+# `flatpak run io.unom.Punktfunk` and simply failed. Both kinds keep identity, known-hosts and
+# settings in the same ~/.config/punktfunk (the flatpak's sandbox HOME resolves to the real
+# home), so nothing else in this file has to care which one answered.
+NATIVE_BIN = "punktfunk-client"
+
+# Prefixes to try when PATH doesn't have it. The Decky backend runs with a minimal PATH, and
+# SteamOS's read-only /usr pushes native installs into a sysext or the user's own prefix.
+_NATIVE_PREFIXES = (
+    "/usr/bin",
+    "/usr/local/bin",
+    "/run/host/usr/bin",
+    "/var/lib/extensions/punktfunk/usr/bin",
+)
+
+
+def _native_client() -> str | None:
+    """Absolute path of a native (non-flatpak) client binary, or None."""
+    found = shutil.which(NATIVE_BIN, path=os.environ.get("PATH", "") + ":" + ":".join(_NATIVE_PREFIXES))
+    if found:
+        return found
+    for prefix in (str(Path(decky.DECKY_USER_HOME) / ".local" / "bin"),):
+        candidate = Path(prefix) / NATIVE_BIN
+        if candidate.exists():
+            return str(candidate)
+    return None
+
+
+def _flatpak_installed() -> bool:
+    """True when the flatpak APP is actually installed — not merely that `flatpak` exists.
+
+    Checked by the app's own exported directory rather than by shelling out to `flatpak info`,
+    because this is on the path of every headless call and a subprocess per call would be absurd.
+    Both scopes count: the Deck installs --user, a distro image may ship it system-wide.
+    """
+    if not _flatpak():
+        return False
+    user = Path(decky.DECKY_USER_HOME) / ".local" / "share" / "flatpak" / "app" / APP_ID
+    return user.exists() or Path("/var/lib/flatpak/app", APP_ID).exists()
+
+
+def _client_argv() -> list[str] | None:
+    """The argv PREFIX that runs the client headlessly, or None when no client is installed.
+
+    Flatpak wins when it is installed: it is the tested Deck path, so an existing install keeps
+    behaving exactly as it did. A native binary is the fallback — and on a machine with no
+    flatpak client, the thing that makes the plugin work at all. `PF_DECKY_CLIENT=native|flatpak`
+    forces one when a machine has both.
+    """
+    forced = os.environ.get("PF_DECKY_CLIENT", "").strip().lower()
+    native = _native_client()
+    if forced == "native":
+        return [native] if native else None
+    if forced != "flatpak" and not _flatpak_installed() and native:
+        return [native]
+    if _flatpak_installed():
+        return [_flatpak(), "run", "--arch=x86_64", APP_ID]
+    return [native] if native else None
+
+
 def _flatpak_env() -> dict:
-    """Environment for a headless ``flatpak run`` from the backend (no display needed for
-    pairing). Reconstruct the user-session bits flatpak wants; the backend may not inherit
-    them. Harmless if some are already set."""
+    """Environment for a headless client run from the backend (no display needed for pairing).
+    Reconstruct the user-session bits flatpak wants; the backend may not inherit them. Harmless
+    if some are already set — and correct for a NATIVE client too, which needs the same HOME and
+    the same LD_LIBRARY_PATH repair below."""
     env = dict(os.environ)
     # Decky Loader is a PyInstaller binary: it prepends its bundled libs (an older libssl) to
     # LD_LIBRARY_PATH (its /tmp/_MEI* unpack dir), and that env leaks into our subprocess. The
@@ -388,17 +453,19 @@ async def _flatpak_capture(args: list[str], timeout: float = 20.0) -> tuple[int,
 
 
 async def _run_client(client_args: list[str], timeout: float = 20.0) -> tuple[int, str, str]:
-    """Run the flatpak CLIENT headlessly (``flatpak run … io.unom.Punktfunk <client_args>``) with
-    the user-session env, returning ``(returncode, stdout, stderr)`` with SEPARATE pipes so a JSON
-    payload on stdout stays clean of the client's log lines on stderr. ``(-1, "", "")`` when
-    flatpak is missing or the call errors/times out. This is the single entry point for the
-    headless host-store modes (``--list-hosts`` / ``--add-host`` / ``--set-host`` /
-    ``--forget-host`` / ``--reset`` / ``--reachable``), which mutate the SAME
-    ``client-known-hosts.json`` the desktop client reads — so state is shared, not duplicated."""
-    flatpak = _flatpak()
-    if not flatpak:
+    """Run the CLIENT headlessly with the user-session env, returning ``(returncode, stdout,
+    stderr)`` with SEPARATE pipes so a JSON payload on stdout stays clean of the client's log
+    lines on stderr. ``(-1, "", "")`` when no client is installed or the call errors/times out.
+
+    Whether that client is the flatpak or a native install is [_client_argv]'s business; both
+    read and write the SAME ``client-known-hosts.json`` the desktop client uses. This is the
+    single entry point for the headless host-store modes (``--list-hosts`` / ``--add-host`` /
+    ``--set-host`` / ``--forget-host`` / ``--reset`` / ``--reachable``), so state is shared, not
+    duplicated."""
+    prefix = _client_argv()
+    if not prefix:
         return -1, "", ""
-    argv = [flatpak, "run", "--arch=x86_64", APP_ID, *client_args]
+    argv = [*prefix, *client_args]
     proc = None
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -885,9 +952,22 @@ class Plugin:
         """The wrapper-script path + flatpak app id the frontend needs to create the Steam
         shortcut. The shortcut invokes the script through ``/bin/sh`` (see steam.ts), so no
         exec bit is needed — Decky's zip extraction drops it, and the root-owned plugins dir
-        means this unprivileged backend couldn't chmod it back on anyway."""
+        means this unprivileged backend couldn't chmod it back on anyway.
+
+        ``client_bin`` is set only when the resolved client is a NATIVE install; the frontend
+        passes it to the wrapper as ``PF_CLIENT_BIN`` so the launch execs the binary instead of
+        ``flatpak run``. Absent = the wrapper's flatpak default, i.e. every existing Deck
+        install is unaffected."""
         path = _runner_path()
-        return {"runner": path, "app_id": APP_ID, "exists": Path(path).exists()}
+        prefix = _client_argv()
+        native = bool(prefix) and prefix[0] != _flatpak()
+        return {
+            "runner": path,
+            "app_id": APP_ID,
+            "exists": Path(path).exists(),
+            "client_kind": "native" if native else ("flatpak" if prefix else "none"),
+            "client_bin": prefix[0] if native else "",
+        }
 
     async def get_settings(self) -> dict:
         """Read the flatpak client's stream settings (resolution/bitrate/gamepad…)."""
@@ -1032,28 +1112,36 @@ class Plugin:
         }
 
     async def kill_stream(self) -> dict:
-        """Force-stop a wedged stream client (``flatpak kill``)."""
-        flatpak = _flatpak()
-        if not flatpak:
-            return {"ok": False, "error": "flatpak-not-found"}
+        """Force-stop a wedged stream client — ``flatpak kill`` for the sandboxed one, a plain
+        SIGTERM by name for a native install (which has no flatpak instance to kill)."""
+        prefix = _client_argv()
+        if not prefix:
+            return {"ok": False, "error": "client-not-found"}
+        if prefix[0] == _flatpak():
+            argv = [prefix[0], "kill", APP_ID]
+        else:
+            # -x: whole-name match, so this can only ever hit the client itself.
+            killer = shutil.which("pkill") or "/usr/bin/pkill"
+            argv = [killer, "-x", NATIVE_BIN]
         try:
             proc = await asyncio.create_subprocess_exec(
-                flatpak, "kill", APP_ID,
+                *argv,
                 stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
                 env=_flatpak_env(),
             )
             await asyncio.wait_for(proc.wait(), timeout=10.0)
         except Exception:  # noqa: BLE001
-            decky.logger.exception("flatpak kill failed")
+            decky.logger.exception("kill_stream (%s) failed", argv[0])
             return {"ok": False}
         return {"ok": True}
 
     async def update_client(self) -> dict:
         """Update the flatpak **client** (io.unom.Punktfunk) in the USER installation — the scope a
         Steam Deck install lives in, which ``sudo flatpak update`` (system-scope) never reaches.
-        Returns whether a new commit was actually pulled. Best-effort; non-fatal."""
-        flatpak = _flatpak()
-        if not flatpak:
+        Returns whether a new commit was actually pulled. Best-effort; non-fatal. A NATIVE client
+        is updated by whatever installed it (distro package manager, sysext, nix), never here —
+        `check_update` reports no client update for one, so the UI never offers this."""
+        if not _flatpak_installed():
             return {"ok": False, "updated": False, "error": "flatpak-not-found"}
         _, before = await _flatpak_capture(["info", "--user", APP_ID], timeout=10.0)
         before_commit = _field_from(before, "Commit")
