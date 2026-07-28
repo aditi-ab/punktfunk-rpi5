@@ -38,9 +38,11 @@ BIN="$OUTDIR/$PKG"
 # The Vulkan/Skia session streamer the shell execs for a connect — shipped alongside the shell
 # (the shell resolves it as its /usr/bin sibling), or desktop streaming breaks.
 SESSION_BIN="$OUTDIR/punktfunk-session"
+# The headless CLI (design/client-architecture-split.md §4) ships with every client.
+CLI_BIN="$OUTDIR/punktfunk"
 if [ ! -x "$BIN" ] || [ ! -x "$SESSION_BIN" ]; then
   echo "==> building $CRATE + punktfunk-client-session (release${TARGET:+ for $TARGET})"
-  cargo build --release --locked "${CARGO_TARGET_ARGS[@]}" -p "$CRATE" -p punktfunk-client-session
+  cargo build --release --locked "${CARGO_TARGET_ARGS[@]}" -p "$CRATE" -p punktfunk-client-session -p punktfunk-cli
 fi
 
 STAGE="$(mktemp -d)"
@@ -50,6 +52,7 @@ DOCDIR="$STAGE/usr/share/doc/$PKG"
 # --- file layout --------------------------------------------------------------
 install -Dm0755 "$BIN"                                   "$STAGE/usr/bin/$PKG"
 install -Dm0755 "$SESSION_BIN"                           "$STAGE/usr/bin/punktfunk-session"
+install -Dm0755 "$CLI_BIN"                               "$STAGE/usr/bin/punktfunk"
 install -Dm0644 packaging/linux/io.unom.Punktfunk.desktop \
                 "$STAGE/usr/share/applications/io.unom.Punktfunk.desktop"
 # DualSense hidraw access (full pad fidelity through SDL's HIDAPI driver).

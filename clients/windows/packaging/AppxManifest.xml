@@ -106,6 +106,27 @@
         <uap:DefaultTile Square71x71Logo="Assets\Square71x71Logo.png" />
       </uap:VisualElements>
     </Application>
+    <!--
+      The headless CLI (design/client-architecture-split.md §4). AppListEntry="none" keeps it
+      out of the Start menu: it is a command, not a tile. Its alias is what a plugin or a
+      script types, and what the Playnite importer shells to for `punktfunk library`.
+    -->
+    <Application Id="PunktfunkCli" Executable="punktfunk.exe"
+                 EntryPoint="Windows.FullTrustApplication">
+      <uap:VisualElements AppListEntry="none"
+        DisplayName="Punktfunk CLI"
+        Description="Headless Punktfunk client commands"
+        BackgroundColor="transparent"
+        Square150x150Logo="Assets\Square150x150Logo.png"
+        Square44x44Logo="Assets\Square44x44Logo.png" />
+      <Extensions>
+        <uap5:Extension Category="windows.appExecutionAlias">
+          <uap5:AppExecutionAlias>
+            <uap5:ExecutionAlias Alias="punktfunk.exe" />
+          </uap5:AppExecutionAlias>
+        </uap5:Extension>
+      </Extensions>
+    </Application>
   </Applications>
 
   <Capabilities>

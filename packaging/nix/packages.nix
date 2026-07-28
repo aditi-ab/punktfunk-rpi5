@@ -224,7 +224,7 @@ in
       # so build the session without it. The GTK shell (punktfunk-client-linux) is skia-free and full.
       # Re-adding the Skia OSD under Nix is tracked in packaging/nix/README.md.
       cargoExtraArgs =
-        "--locked -p punktfunk-client-linux -p punktfunk-client-session "
+        "--locked -p punktfunk-client-linux -p punktfunk-client-session -p punktfunk-cli "
         + "--no-default-features --features punktfunk-client-session/pyrowave";
 
       # pf-ffvk runs bindgen over libavutil/hwcontext_vulkan.h, which `#include <vulkan/vulkan.h>`.

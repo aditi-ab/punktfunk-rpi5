@@ -222,8 +222,12 @@ modules:
       # unification identical to a workspace build (the pinned skia-binaries archive's
       # `pdf-textlayout-vulkan` key must match the resolved feature set).
       - cargo --offline build --release -p punktfunk-client-linux -p punktfunk-client-session
+          -p punktfunk-cli
       - install -Dm0755 target/release/punktfunk-client ${FLATPAK_DEST}/bin/punktfunk-client
       - install -Dm0755 target/release/punktfunk-session ${FLATPAK_DEST}/bin/punktfunk-session
+      # The headless CLI (design/client-architecture-split.md §4) — reachable as
+      # `flatpak run --command=punktfunk io.unom.Punktfunk …`.
+      - install -Dm0755 target/release/punktfunk ${FLATPAK_DEST}/bin/punktfunk
       # Desktop entry (renamed to the app id; Exec is the in-sandbox binary).
       - install -Dm0644 packaging/flatpak/io.unom.Punktfunk.desktop
           ${FLATPAK_DEST}/share/applications/io.unom.Punktfunk.desktop

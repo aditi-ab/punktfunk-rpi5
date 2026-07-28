@@ -400,10 +400,16 @@ mod session_main {
             };
         }
 
-        // `--pair <PIN>`: enrol this machine against a host and exit. Sits with the other
-        // non-streaming subcommands, above every graphics call — the box doing this may have
-        // no display at all.
+        // `--pair <PIN>`: enrol this machine against a host and exit. DEPRECATED — pairing is
+        // a trust ceremony and belongs to the brain, fronted by `punktfunk pair` or a shell
+        // (design/client-architecture-split.md §5). It still works, with a notice, for the one
+        // release this needs; a renderer owning a trust ceremony is exactly the mixing of
+        // concerns the split exists to undo.
         if let Some(pin) = arg_value("--pair") {
+            eprintln!(
+                "note: punktfunk-session --pair is deprecated \u{2014} use `punktfunk pair \
+                 <host[:port]>` instead (same store, same result)."
+            );
             return headless_pair(&pin);
         }
 

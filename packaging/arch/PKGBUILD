@@ -96,10 +96,11 @@ build() {
   # opts back to libav VAAPI), and a failed open falls back to VAAPI so unsupported devices are safe.
   if [ "$CARCH" = 'aarch64' ]; then
     # Client-only: no host crate, so none of the encode features below apply.
-    cargo build --release --locked -p punktfunk-client-linux -p punktfunk-client-session
+    cargo build --release --locked -p punktfunk-client-linux -p punktfunk-client-session \
+      -p punktfunk-cli
   else
   cargo build --release --locked --features punktfunk-host/nvenc,punktfunk-host/vulkan-encode \
-    -p punktfunk-host -p punktfunk-client-linux -p punktfunk-client-session
+    -p punktfunk-host -p punktfunk-client-linux -p punktfunk-client-session -p punktfunk-cli
   # The status tray in its OWN cargo invocation — load-bearing, not tidiness. Cargo unifies features
   # across everything in one build, so co-building the tray with the host pulls the host's
   # ashpd -> zbus/tokio onto the tray's shared zbus; the tray (ksni async-io + blocking, no tokio
@@ -250,6 +251,8 @@ package_punktfunk-client() {
   install -Dm0755 "$T/punktfunk-client"  "$pkgdir/usr/bin/punktfunk-client"
   # The session streamer the shell execs for a connect (resolved as its sibling in /usr/bin).
   install -Dm0755 "$T/punktfunk-session" "$pkgdir/usr/bin/punktfunk-session"
+  # The headless CLI (design/client-architecture-split.md §4).
+  install -Dm0755 "$T/punktfunk" "$pkgdir/usr/bin/punktfunk"
   install -Dm0644 "$R/packaging/linux/io.unom.Punktfunk.desktop" \
     "$pkgdir/usr/share/applications/io.unom.Punktfunk.desktop"
   # DualSense hidraw access (full pad fidelity through SDL's HIDAPI driver).
