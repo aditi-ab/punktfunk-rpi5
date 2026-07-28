@@ -9,6 +9,12 @@
 //! - [`display_events`]: the `WM_DISPLAYCHANGE` / device-arrival watch that lets a capture stall say
 //!   whether an OS display event coincided with it.
 
+// `win_display` has denied both unsafe-proof lints since its CCD helpers stopped being `unsafe fn`;
+// hoist that to the crate root so the smaller modules (`input_desktop`, `monitor_devnode`,
+// `display_events`) and any future one are covered by default rather than by remembering to opt in.
+#![deny(clippy::undocumented_unsafe_blocks)]
+#![deny(unsafe_op_in_unsafe_fn)]
+
 #[cfg(target_os = "windows")]
 pub mod display_events;
 /// Bind display-config writes to the input desktop so a UAC / lock screen can't refuse them.

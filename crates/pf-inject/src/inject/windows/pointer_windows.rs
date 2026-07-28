@@ -132,7 +132,7 @@ unsafe fn inject_following_desktop(
 ) -> windows::core::Result<()> {
     // SAFETY: per this fn's contract — `dev` is live and `frame` outlives the call, which only
     // reads it. Best-effort, exactly as the direct call was.
-    match InjectSyntheticPointerInput(dev, frame) {
+    match unsafe { InjectSyntheticPointerInput(dev, frame) } {
         Ok(()) => Ok(()),
         Err(first) => {
             // Only a desktop switch is worth a rebind; anything else would just fail identically.
@@ -140,7 +140,7 @@ unsafe fn inject_following_desktop(
                 return Err(first);
             };
             // SAFETY: same live `dev`/`frame`, re-issued with this thread on the input desktop.
-            InjectSyntheticPointerInput(dev, frame)
+            unsafe { InjectSyntheticPointerInput(dev, frame) }
         }
     }
 }

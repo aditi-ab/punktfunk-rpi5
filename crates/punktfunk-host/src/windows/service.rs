@@ -543,44 +543,63 @@ unsafe fn spawn_host(
     //    (LocalSystem) token, then set its session id. SYSTEM holds SE_TCB so SetTokenInformation
     //    (TokenSessionId) is permitted.
     let mut proc_token = HANDLE::default();
-    OpenProcessToken(
-        GetCurrentProcess(),
-        TOKEN_DUPLICATE
-            | TOKEN_QUERY
-            | TOKEN_ASSIGN_PRIMARY
-            | TOKEN_ADJUST_DEFAULT
-            | TOKEN_ADJUST_SESSIONID,
-        &mut proc_token,
-    )
+    // SAFETY: `GetCurrentProcess` returns the pseudo-handle for this process, which needs no close;
+    // `proc_token` is a live local out-param that receives an owned handle on `Ok`, closed once below.
+    unsafe {
+        OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_DUPLICATE
+                | TOKEN_QUERY
+                | TOKEN_ASSIGN_PRIMARY
+                | TOKEN_ADJUST_DEFAULT
+                | TOKEN_ADJUST_SESSIONID,
+            &mut proc_token,
+        )
+    }
     .context("OpenProcessToken (service must run as SYSTEM)")?;
 
     let mut primary = HANDLE::default();
-    let dup = DuplicateTokenEx(
-        proc_token,
-        TOKEN_ALL_ACCESS,
-        None,
-        SecurityImpersonation,
-        TokenPrimary,
-        &mut primary,
-    );
-    let _ = CloseHandle(proc_token);
+    // SAFETY: `proc_token` is the live token just opened; `primary` is a live local out-param that
+    // receives a second owned handle on `Ok`. Both are closed exactly once in this function.
+    let dup = unsafe {
+        DuplicateTokenEx(
+            proc_token,
+            TOKEN_ALL_ACCESS,
+            None,
+            SecurityImpersonation,
+            TokenPrimary,
+            &mut primary,
+        )
+    };
+    // SAFETY: `proc_token` is live and owned here, closed exactly once and not used after.
+    let _ = unsafe { CloseHandle(proc_token) };
     dup.context("DuplicateTokenEx(TokenPrimary)")?;
 
-    SetTokenInformation(
-        primary,
-        TokenSessionId,
-        &session_id as *const u32 as *const c_void,
-        std::mem::size_of::<u32>() as u32,
-    )
+    // SAFETY: `primary` is the live duplicated token; the value pointer is a local `u32` matching
+    // what `TokenSessionId` expects, and the length argument is exactly its `size_of`.
+    unsafe {
+        SetTokenInformation(
+            primary,
+            TokenSessionId,
+            &session_id as *const u32 as *const c_void,
+            std::mem::size_of::<u32>() as u32,
+        )
+    }
     .context("SetTokenInformation(TokenSessionId)")?;
 
     // 2) The session's environment block, merged with this process's PUNKTFUNK_*/RUST_LOG (so the
     //    host runs with host.env's settings, not a bare block). Same merge the interactive launch uses.
     let mut env_block: *mut c_void = std::ptr::null_mut();
-    let _ = CreateEnvironmentBlock(&mut env_block, Some(primary), false);
-    let merged = crate::interactive::merged_env_block(env_block as *const u16);
+    // SAFETY: `env_block` is a live local out-param and `primary` the live token above; on success
+    // the call stores an owned block pointer, destroyed exactly once below.
+    let _ = unsafe { CreateEnvironmentBlock(&mut env_block, Some(primary), false) };
+    // SAFETY: `env_block` is either still null (the call above failed) or the double-null-terminated
+    // UTF-16 block `CreateEnvironmentBlock` just wrote — exactly the two states the helper accepts.
+    let merged = unsafe { crate::interactive::merged_env_block(env_block as *const u16) };
     if !env_block.is_null() {
-        let _ = DestroyEnvironmentBlock(env_block);
+        // SAFETY: `env_block` is the live block from the call above, destroyed exactly once and not
+        // read after — `merged` owns its own copy of the parsed entries.
+        let _ = unsafe { DestroyEnvironmentBlock(env_block) };
     }
 
     // 3) Redirect the host's stdout+stderr to host.log (inheritable handle). The previous child has
@@ -604,32 +623,46 @@ unsafe fn spawn_host(
     let cwd = (!workdir.is_empty()).then_some(PCWSTR(workdir.as_ptr()));
     let mut pi = PROCESS_INFORMATION::default();
 
-    let created = CreateProcessAsUserW(
-        Some(primary),
-        None,
-        Some(PWSTR(cmd.as_mut_ptr())),
-        None,
-        None,
-        true, // inherit the log handle
-        CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
-        Some(merged.as_ptr() as *const c_void),
-        cwd.unwrap_or(PCWSTR::null()),
-        &si,
-        &mut pi,
-    );
+    // SAFETY: `primary` is the live retargeted token; `cmd`, `desktop` (via `si.lpDesktop`),
+    // `workdir` (via `cwd`) and `merged` are live for the call and NUL-terminated as the API
+    // requires — `merged` doubly so, per `merged_env_block`. `si.hStdOutput`/`hStdError` are the
+    // live inheritable `log` handle. `pi` is a live local out-param; no pointer is retained.
+    let created = unsafe {
+        CreateProcessAsUserW(
+            Some(primary),
+            None,
+            Some(PWSTR(cmd.as_mut_ptr())),
+            None,
+            None,
+            true, // inherit the log handle
+            CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
+            Some(merged.as_ptr() as *const c_void),
+            cwd.unwrap_or(PCWSTR::null()),
+            &si,
+            &mut pi,
+        )
+    };
 
-    let _ = CloseHandle(log); // the child owns its inherited copy
-    let _ = CloseHandle(primary);
+    // SAFETY: both are live and owned here, each closed exactly once and not used after — the child
+    // holds its own inherited copy of `log`.
+    unsafe {
+        let _ = CloseHandle(log); // the child owns its inherited copy
+        let _ = CloseHandle(primary);
+    }
     created.context("CreateProcessAsUserW(host)")?;
 
     // Best-effort: keep the host inside the kill-on-close job.
-    let _ = AssignProcessToJobObject(job, pi.hProcess);
+    // SAFETY: `job` is a live job object per this fn's contract, and `pi.hProcess` is the live child
+    // handle just created (`created` was `Ok`), still owned here.
+    let _ = unsafe { AssignProcessToJobObject(job, pi.hProcess) };
 
     // Take ownership of the process + thread handles the API filled into `pi`; the returned `Child`
     // closes BOTH on drop, so the supervise loop no longer hand-closes them in its match arms.
+    // SAFETY: `created` was `Ok`, so `pi` holds two distinct owned handles that nothing else closes;
+    // wrapping each transfers that ownership to an `OwnedHandle`, which closes it exactly once.
     Ok(Child {
-        process: OwnedHandle::from_raw_handle(pi.hProcess.0),
-        _thread: OwnedHandle::from_raw_handle(pi.hThread.0),
+        process: unsafe { OwnedHandle::from_raw_handle(pi.hProcess.0) },
+        _thread: unsafe { OwnedHandle::from_raw_handle(pi.hThread.0) },
         pid: pi.dwProcessId,
     })
 }
