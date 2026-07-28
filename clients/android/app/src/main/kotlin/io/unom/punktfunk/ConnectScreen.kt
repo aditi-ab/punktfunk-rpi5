@@ -59,6 +59,11 @@ import io.unom.punktfunk.kit.Gamepad
 import io.unom.punktfunk.kit.NativeBridge
 import io.unom.punktfunk.kit.discovery.DiscoveredHost
 import io.unom.punktfunk.kit.discovery.HostDiscovery
+import io.unom.punktfunk.kit.link.DeepLinkResult
+import io.unom.punktfunk.kit.link.DeepLinks
+import io.unom.punktfunk.kit.link.HostResolution
+import io.unom.punktfunk.kit.link.LinkError
+import io.unom.punktfunk.kit.link.LinkRoute
 import io.unom.punktfunk.kit.security.ClientIdentity
 import io.unom.punktfunk.kit.security.IdentityStore
 import io.unom.punktfunk.kit.security.KnownHost
@@ -111,6 +116,11 @@ fun ConnectScreen(
     onOpenSettings: () -> Unit = {},
     onOpenLibrary: (KnownHost) -> Unit = {},
     navGate: Boolean = true, // false while the console home is cross-fading out
+    // A `punktfunk://` URL to route (design/client-deep-links.md §3). This screen owns it because
+    // it owns the connect path — trust decisions, the local-network grant, wake-and-retry — and a
+    // link must go through all of them, not around them.
+    deepLink: String? = null,
+    onDeepLinkHandled: () -> Unit = {},
 ) {
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
@@ -281,9 +291,10 @@ fun ConnectScreen(
         pinHex: String,
         timeoutMs: Int,
         profile: StreamProfile?,
+        launch: String?,
     ): Long = connectToHost(
         context, settings.effectiveFor(profile), id, targetHost, targetPort, pinHex,
-        launch = null, timeoutMs = timeoutMs,
+        launch = launch, timeoutMs = timeoutMs,
     )
 
     // What the stream screen is handed: the settings this connect actually used, plus the HOST's
@@ -294,6 +305,7 @@ fun ConnectScreen(
         settings.effectiveFor(profile),
         clipboardSync = record?.clipboardSync ?: true,
         profileName = profile?.name,
+        hostId = record?.id,
     )
 
     // The actual dial (identity already ready). On a TOFU connect (pinHex null), pin the fingerprint
@@ -307,6 +319,7 @@ fun ConnectScreen(
         name: String,
         pinHex: String?,
         profile: StreamProfile?,
+        launch: String? = null,
         onFailure: (() -> Unit)? = null,
     ) {
         val id = identity ?: run {
@@ -319,7 +332,8 @@ fun ConnectScreen(
         status = null
         discovery.stop() // free the Wi-Fi radio before the stream session
         scope.launch {
-            val handle = connectNative(id, targetHost, targetPort, pinHex ?: "", CONNECT_TIMEOUT_MS, profile)
+            val handle =
+                connectNative(id, targetHost, targetPort, pinHex ?: "", CONNECT_TIMEOUT_MS, profile, launch)
             // Cancelled mid-dial: the UI's already been returned (and discovery restarted) by
             // cancelConnect — drop the just-opened session silently rather than navigating into it.
             if (thisAttempt.cancelled.get()) {
@@ -373,7 +387,14 @@ fun ConnectScreen(
     // only a FAILED dial falls into the wake-and-WAIT-for-mDNS flow (WakeController's "Waking…"
     // overlay), which redials once the host reappears. Otherwise (auto-wake off, no MAC, or already
     // seen live) dial straight through.
-    fun doConnect(targetHost: String, targetPort: Int, name: String, pinHex: String?, oneOffProfile: String?) {
+    fun doConnect(
+        targetHost: String,
+        targetPort: Int,
+        name: String,
+        pinHex: String?,
+        oneOffProfile: String?,
+        launch: String? = null,
+    ) {
         if (identity == null) {
             status = "Identity not ready yet — try again in a moment"
             return
@@ -392,7 +413,7 @@ fun ConnectScreen(
         if (settings.autoWakeEnabled && macs.isNotEmpty() && liveAdvert() == null) {
             // Fire-and-forget first packet (harmless if it's awake), then dial-first.
             scope.launch(Dispatchers.IO) { NativeBridge.nativeWakeOnLan(macs.joinToString(","), targetHost) }
-            doConnectDirect(targetHost, targetPort, name, pinHex, profile, onFailure = {
+            doConnectDirect(targetHost, targetPort, name, pinHex, profile, launch, onFailure = {
                 waker.start(
                     hostName = name,
                     connectsAfter = true,
@@ -408,12 +429,15 @@ fun ConnectScreen(
                             knownHostStore.save(kh.copy(address = live.host, port = live.port))
                             savedHosts = knownHostStore.all()
                         }
-                        doConnectDirect(live?.host ?: targetHost, live?.port ?: targetPort, name, pinHex, profile)
+                        doConnectDirect(
+                            live?.host ?: targetHost, live?.port ?: targetPort, name, pinHex,
+                            profile, launch,
+                        )
                     },
                 )
             })
         } else {
-            doConnectDirect(targetHost, targetPort, name, pinHex, profile)
+            doConnectDirect(targetHost, targetPort, name, pinHex, profile, launch)
         }
     }
 
@@ -440,7 +464,10 @@ fun ConnectScreen(
             val pinHex = target.advertisedFp ?: ""
             // A host being trusted for the first time can't have a binding yet, so this is always
             // the plain defaults — a profile only ever enters via a later, deliberate choice.
-            val handle = connectNative(id, target.host, target.port, pinHex, REQUEST_ACCESS_TIMEOUT_MS, null)
+            val handle = connectNative(
+                id, target.host, target.port, pinHex, REQUEST_ACCESS_TIMEOUT_MS,
+                profile = null, launch = target.launch,
+            )
             // Cancelled while we were parked: tear the (possibly just-approved) session down and
             // don't touch UI a fresh action may now own.
             if (req.cancelled.get()) {
@@ -485,6 +512,8 @@ fun ConnectScreen(
         // `""` = force the global defaults, which is a real choice on a bound host and must
         // therefore survive as a value rather than collapsing into "unset". NEVER rebinds.
         oneOffProfile: String? = null,
+        // A library id the host should boot straight into (`launch=` on a link).
+        launch: String? = null,
     ) {
         // Every dial/pair path funnels through here — with local network access denied the connect
         // can only EPERM its way to a 10 s timeout, so ask instead of pretending to try.
@@ -500,18 +529,24 @@ fun ConnectScreen(
         when {
             // Known host whose advertised fp still matches the pin → silent pinned reconnect.
             known != null && (adv == null || adv == known.fpHex) ->
-                doConnect(targetHost, targetPort, known.name, known.fpHex, oneOffProfile)
+                doConnect(targetHost, targetPort, known.name, known.fpHex, oneOffProfile, launch)
             // Known host whose fp changed → force re-pairing (no silent re-trust shortcut).
-            known != null -> pendingTrust =
-                PendingTrust(targetHost, targetPort, known.name, adv, PendingTrust.Kind.FP_CHANGED)
+            known != null -> pendingTrust = PendingTrust(
+                targetHost, targetPort, known.name, adv, PendingTrust.Kind.FP_CHANGED,
+                oneOffProfile, launch,
+            )
             // Host explicitly advertised pair=optional → trust-on-first-use is permitted (offer it,
             // clearly labeled, alongside PIN pairing). Smart-cast: this branch ⇒ dh != null.
-            dh?.pairingRequired == false -> pendingTrust =
-                PendingTrust(targetHost, targetPort, name, dh.fingerprint, PendingTrust.Kind.TRUST_NEW)
+            dh?.pairingRequired == false -> pendingTrust = PendingTrust(
+                targetHost, targetPort, name, dh.fingerprint, PendingTrust.Kind.TRUST_NEW,
+                oneOffProfile, launch,
+            )
             // pair=required, or a manual/unknown-policy host → offer the two ways in: a no-PIN
             // "request access" (approve in the console) or the SPAKE2 PIN ceremony.
-            else -> pendingTrust =
-                PendingTrust(targetHost, targetPort, name, adv, PendingTrust.Kind.REQUEST_ACCESS)
+            else -> pendingTrust = PendingTrust(
+                targetHost, targetPort, name, adv, PendingTrust.Kind.REQUEST_ACCESS,
+                oneOffProfile, launch,
+            )
         }
     }
 
@@ -563,6 +598,89 @@ fun ConnectScreen(
     // pinned combination is a plain one-click connect instead of a trip through a menu.
     val savedCards = savedHosts.flatMap { kh ->
         listOf(HostCardEntry(kh, null)) + profileStore.pinsFor(kh).map { HostCardEntry(kh, it) }
+    }
+
+    // ---- punktfunk:// routing (design/client-deep-links.md §3) --------------------------------
+    //
+    // The invariant: a URL may only ever do what a click on an existing card could do, MINUS trust
+    // decisions. So it never pairs, never trusts on its own, and carries references rather than
+    // values. Everything below is either "do exactly what the card does" or "refuse and say why" —
+    // a shortcut that can't honour its reference must say so, because streaming with the wrong
+    // settings is worse than an explanatory notice.
+    LaunchedEffect(deepLink, identity, savedHosts) {
+        val url = deepLink ?: return@LaunchedEffect
+        // Wait for the identity rather than refusing: it arrives a beat after first composition and
+        // the effect re-runs when it does.
+        if (identity == null) return@LaunchedEffect
+        onDeepLinkHandled()
+        val parsed = DeepLinks.parse(url)
+        if (parsed is DeepLinkResult.Refused) {
+            // A link for someone else's scheme is not our business to complain about.
+            if (parsed.error != LinkError.NOT_OUR_SCHEME) status = parsed.message()
+            return@LaunchedEffect
+        }
+        val link = (parsed as DeepLinkResult.Parsed).link
+        if (link.route != LinkRoute.CONNECT) {
+            // `wake` and `browse` are reserved in the grammar and parse today; a front-end that
+            // hasn't implemented them refuses with a notice rather than silently connecting.
+            status = "Punktfunk on Android can't do “${link.route.word}” links yet."
+            return@LaunchedEffect
+        }
+        // A profile reference that can't be honoured refuses: a "Work" shortcut streaming with the
+        // wrong settings is worse than an error naming what failed.
+        val profileRef = link.profile
+        if (profileRef != null) {
+            val (_, resolution) = profileStore.resolve(profileRef)
+            if (resolution != ProfileResolution.FOUND) {
+                status = if (resolution == ProfileResolution.AMBIGUOUS) {
+                    "More than one profile is called “$profileRef” — rename one and try again."
+                } else {
+                    "That link asks for a profile called “$profileRef”, which isn't on this device."
+                }
+                return@LaunchedEffect
+            }
+        }
+        when (val resolved = DeepLinks.resolveHost(link, savedHosts)) {
+            // Known AND pinned is the one-click contract: do exactly what tapping its card does.
+            is HostResolution.Known -> {
+                // A pin that contradicts the stored one is the link being stale or lying. Hard
+                // refusal: this is the one case where doing what the card does would be wrong.
+                if (link.pinConflict(resolved.host)) {
+                    status = "That link's fingerprint doesn't match the one pinned for " +
+                        "${resolved.host.name} — it's out of date, or it isn't that host."
+                    return@LaunchedEffect
+                }
+                if (resolved.host.fpHex.isEmpty()) {
+                    // Saved but never pinned (nothing writes such a record today, but the rule is
+                    // absolute): a link may not establish trust, so this is a confirmation.
+                    pendingTrust = PendingTrust(
+                        resolved.host.address, resolved.host.port, resolved.host.name,
+                        link.fp, PendingTrust.Kind.REQUEST_ACCESS, profileRef, link.launch,
+                    )
+                    return@LaunchedEffect
+                }
+                connect(
+                    resolved.host.address, resolved.host.port,
+                    oneOffProfile = profileRef, launch = link.launch,
+                )
+            }
+            // Unknown, or known only by address: the confirmation sheet, from which the normal
+            // pairing flow proceeds under the user's eyes. Never a silent trust.
+            is HostResolution.Unknown -> pendingTrust = PendingTrust(
+                resolved.address,
+                resolved.port,
+                link.name ?: resolved.address,
+                resolved.fp,
+                PendingTrust.Kind.REQUEST_ACCESS,
+                profileRef,
+                link.launch,
+            )
+            HostResolution.Ambiguous ->
+                status = "More than one saved host is called “${link.hostRef}” — " +
+                    "rename one, or use its address."
+            HostResolution.Unresolvable ->
+                status = "That link points at a host this device doesn't know."
+        }
     }
 
     var showManualSheet by remember { mutableStateOf(false) }
@@ -880,12 +998,12 @@ fun ConnectScreen(
             knownHostStore.trust(pt.host, pt.port, pt.name, fp, paired = true)
             savedHosts = knownHostStore.all()
             pendingTrust = null
-            doConnect(pt.host, pt.port, pt.name, fp, null)
+            doConnect(pt.host, pt.port, pt.name, fp, pt.profile, pt.launch)
         }
         when (pt.kind) {
             PendingTrust.Kind.TRUST_NEW ->
-                if (gamepadUi) GamepadTrustNewDialog(pt, { pendingTrust = null; doConnect(pt.host, pt.port, pt.name, null, null) }, onPair, { pendingTrust = null })
-                else TrustNewHostDialog(pt, { pendingTrust = null; doConnect(pt.host, pt.port, pt.name, null, null) }, onPair, { pendingTrust = null })
+                if (gamepadUi) GamepadTrustNewDialog(pt, { pendingTrust = null; doConnect(pt.host, pt.port, pt.name, null, pt.profile, pt.launch) }, onPair, { pendingTrust = null })
+                else TrustNewHostDialog(pt, { pendingTrust = null; doConnect(pt.host, pt.port, pt.name, null, pt.profile, pt.launch) }, onPair, { pendingTrust = null })
             PendingTrust.Kind.FP_CHANGED ->
                 if (gamepadUi) GamepadFingerprintChangedDialog(pt, onPair, { pendingTrust = null })
                 else FingerprintChangedDialog(pt, onPair, { pendingTrust = null })

@@ -31,6 +31,7 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -41,12 +42,18 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.dp
+import android.widget.Toast
+import io.unom.punktfunk.kit.link.DeepLinkResult
+import io.unom.punktfunk.kit.link.DeepLinks
+import io.unom.punktfunk.kit.link.HostResolution
+import io.unom.punktfunk.kit.security.KnownHostStore
 import io.unom.punktfunk.models.ActiveSession
 import io.unom.punktfunk.models.Tab
 
 @Composable
 fun App(forceGamepadUi: Boolean = false) {
     val context = LocalContext.current
+    val activity = context as? MainActivity
     val settingsStore = remember { SettingsStore(context) }
     var settings by remember { mutableStateOf(settingsStore.load()) }
     // The active session (null = not streaming). It carries the settings the connect resolved,
@@ -59,6 +66,27 @@ fun App(forceGamepadUi: Boolean = false) {
     val tv = remember { isTvDevice(context) }
     val controllerConnected by rememberControllerConnected()
     val gamepadUi = gamepadUiActive(settings.gamepadUiEnabled, controllerConnected, tv, forceGamepadUi)
+
+    // A `punktfunk://` URL that arrived while a session is live is REFUSED, never honoured: a URL
+    // may not preempt a stream (design/client-deep-links.md §3.2). Pointing at the host already
+    // being streamed is the one exception, and its right answer is to do nothing — the intent has
+    // already brought the app forward, which is exactly what "focus it" means here.
+    val pendingLink = activity?.pendingDeepLink
+    LaunchedEffect(pendingLink, session) {
+        val url = pendingLink ?: return@LaunchedEffect
+        val live = session ?: return@LaunchedEffect // not streaming: ConnectScreen routes it
+        activity.pendingDeepLink = null
+        val parsed = DeepLinks.parse(url) as? DeepLinkResult.Parsed ?: return@LaunchedEffect
+        val target = DeepLinks.resolveHost(parsed.link, KnownHostStore(context).all())
+        val sameHost = target is HostResolution.Known && target.host.id == live.hostId
+        if (!sameHost) {
+            Toast.makeText(
+                context,
+                "Already streaming — end this session first.",
+                Toast.LENGTH_LONG,
+            ).show()
+        }
+    }
 
     AnimatedContent(
         targetState = session,
@@ -75,6 +103,8 @@ fun App(forceGamepadUi: Boolean = false) {
                 settings = settings,
                 onSettingsChange = { settings = it; settingsStore.save(it) },
                 onConnected = { session = it },
+                deepLink = pendingLink,
+                onDeepLinkHandled = { activity?.pendingDeepLink = null },
             )
         } else {
             // Adaptive nav: a bottom bar on phones; on tablets / large windows a side NavigationRail
@@ -105,7 +135,12 @@ fun App(forceGamepadUi: Boolean = false) {
                     label = "TabTransition"
                 ) { targetTab ->
                     when (targetTab) {
-                        Tab.Connect -> ConnectScreen(settings = settings, onConnected = { session = it })
+                        Tab.Connect -> ConnectScreen(
+                            settings = settings,
+                            onConnected = { session = it },
+                            deepLink = pendingLink,
+                            onDeepLinkHandled = { activity?.pendingDeepLink = null },
+                        )
                         Tab.Settings -> SettingsScreen(
                             initial = settings,
                             onChange = { settings = it; settingsStore.save(it) },
@@ -170,6 +205,8 @@ fun GamepadShell(
     settings: Settings,
     onSettingsChange: (Settings) -> Unit,
     onConnected: (ActiveSession) -> Unit,
+    deepLink: String? = null,
+    onDeepLinkHandled: () -> Unit = {},
 ) {
     val context = LocalContext.current
     var screen by remember { mutableStateOf(GamepadScreen.Home) }
@@ -196,6 +233,8 @@ fun GamepadShell(
             GamepadScreen.Home -> ConnectScreen(
                 settings = settings,
                 onConnected = onConnected,
+                deepLink = deepLink,
+                onDeepLinkHandled = onDeepLinkHandled,
                 gamepadUi = true,
                 onOpenSettings = { screen = GamepadScreen.Settings },
                 onOpenLibrary = { host -> libraryHost = host; screen = GamepadScreen.Library },

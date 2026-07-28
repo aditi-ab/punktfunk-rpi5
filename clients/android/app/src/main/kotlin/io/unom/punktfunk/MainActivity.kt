@@ -96,6 +96,17 @@ class MainActivity : ComponentActivity() {
     var lastPadStyle by mutableStateOf(Gamepad.PadStyle.GENERIC)
         private set
 
+    /**
+     * A `punktfunk://` URL waiting to be routed — set from the VIEW intent that started (or
+     * re-entered) this activity, cleared by whoever handles it. Compose observes it.
+     *
+     * Read in BOTH [onCreate] and [onNewIntent] on purpose: `launchMode` is `standard`, so a second
+     * link usually arrives as a fresh activity instance (onCreate) and only sometimes as a new
+     * intent on this one (a caller that set `FLAG_ACTIVITY_SINGLE_TOP`). A link arriving while an
+     * earlier one is still unhandled replaces it — the user's latest intent is the live one.
+     */
+    var pendingDeepLink by mutableStateOf<String?>(null)
+
     /** The panel's highest-refresh display mode (0 = unknown/unsupported), resolved once at startup. */
     private var highRefreshModeId = 0
 
@@ -125,6 +136,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        pendingDeepLink = deepLinkFrom(intent)
         lastPadIsGamepad = !isTvDevice(this)
         lastPadStyle = Gamepad.styleFor(Gamepad.firstPad())
         resolveHighRefreshMode()
@@ -184,6 +196,20 @@ class MainActivity : ComponentActivity() {
             }
         }
     }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        // Keep `getIntent()` truthful for anything that reads it later (the gamepad-UI dev flag).
+        setIntent(intent)
+        deepLinkFrom(intent)?.let { pendingDeepLink = it }
+    }
+
+    /**
+     * The `punktfunk://` URL of a VIEW intent, or null. Only VIEW: the launcher's MAIN intent
+     * carries no data, and nothing else may inject a URL into the router.
+     */
+    private fun deepLinkFrom(intent: Intent?): String? =
+        intent?.takeIf { it.action == Intent.ACTION_VIEW }?.data?.toString()
 
     override fun onResume() {
         super.onResume()

@@ -25,6 +25,14 @@ data class PendingTrust(
     val name: String,
     val advertisedFp: String?,
     val kind: Kind,
+    /**
+     * What the connect on the far side of this decision should carry — a `punktfunk://` link's
+     * one-off profile and library id. A link to an unknown host goes through the confirmation
+     * first, and the user's stated intent must survive that detour rather than being silently
+     * dropped on the way to a plain desktop session.
+     */
+    val profile: String? = null,
+    val launch: String? = null,
 ) {
     enum class Kind { TRUST_NEW, FP_CHANGED, PAIR, REQUEST_ACCESS }
 }
@@ -47,6 +55,12 @@ data class ActiveSession(
      * so "which profile am I on?" is answerable from inside the stream, as on the other clients.
      */
     val profileName: String? = null,
+    /**
+     * The stable id of the host being streamed, when it is a saved one — so a `punktfunk://` link
+     * that arrives mid-stream can tell "this same host" (a no-op; the intent already focused us)
+     * from "a different host" (a notice; a URL may never preempt a live session).
+     */
+    val hostId: String? = null,
 )
 
 /** Trust state of a host, shown as a colored pill on its card. */
