@@ -660,7 +660,7 @@ impl MouseMode {
 
 /// App settings, persisted as JSON. Stringly-typed gamepad/compositor prefs so the file
 /// stays readable; parsed with `*Pref::from_name` at connect time.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     /// Stream mode; `0` = the native size/refresh of the monitor the window is on,
