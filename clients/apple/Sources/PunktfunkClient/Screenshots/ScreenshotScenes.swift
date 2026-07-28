@@ -114,7 +114,7 @@ private struct ShotHome: View {
             store: store, model: model, discovery: discovery,
             showAddHost: .constant(false), pairingTarget: .constant(nil),
             speedTestTarget: .constant(nil), libraryTarget: .constant(nil),
-            connect: { _ in }, connectDiscovered: { _ in },
+            connect: { _, _ in }, connectDiscovered: { _ in },
             onPaired: { _, _ in }, onLaunchTitle: { _, _ in }, wake: { _ in })
         #else
         HomeView(
@@ -122,7 +122,7 @@ private struct ShotHome: View {
             showAddHost: .constant(false), pairingTarget: .constant(nil),
             speedTestTarget: .constant(nil), libraryTarget: .constant(nil),
             showSettings: .constant(false),
-            connect: { _ in }, connectDiscovered: { _ in },
+            connect: { _, _ in }, connectDiscovered: { _ in },
             onPaired: { _, _ in }, onLaunchTitle: { _, _ in }, wake: { _ in })
         #endif
     }
@@ -141,7 +141,7 @@ private struct ShotGamepadHome: View {
         GamepadHomeView(
             store: store, model: model, discovery: discovery,
             libraryTarget: .constant(nil), waker: waker,
-            connect: { _ in }, connectDiscovered: { _ in })
+            connect: { _, _ in }, connectDiscovered: { _ in })
     }
 }
 
@@ -197,7 +197,7 @@ private struct ShotConnect: View {
             GamepadHomeView(
                 store: store, model: model, discovery: discovery,
                 libraryTarget: .constant(nil), waker: waker,
-                connect: { _ in }, connectDiscovered: { _ in })
+                connect: { _, _ in }, connectDiscovered: { _ in })
         } else {
             ShotHome()
         }

@@ -70,8 +70,32 @@ private func monogramTile(_ letter: String, m: CardMetrics, connecting: Bool, fi
     }
 }
 
+/// Everything a card's profile affordances need: the catalog to offer, what this host is bound
+/// and pinned to, and the acts a menu can perform (design/client-settings-profiles.md §5.2/§5.2a).
+///
+/// Passed as one value rather than eight closures because every surface that renders a host card
+/// has to offer the SAME set — a menu that quietly lacks "Pin as card" on one screen is how a
+/// feature becomes folklore.
+struct HostProfileMenu {
+    var profiles: [StreamProfile]
+    /// The host's default profile — the chip, and the checkmark in "Connect with ▸".
+    var boundID: String?
+    var pinnedIDs: [String]
+    /// A ONE-OFF connect. Never rebinds: rebinding is `setDefault`, an explicit act (§5.2).
+    var connectWith: (ProfileSelection) -> Void
+    var setDefault: (String?) -> Void
+    var togglePin: (String) -> Void
+    /// Copy a `punktfunk://` link for this host, optionally carrying a profile.
+    var copyLink: (String?) -> Void
+}
+
 /// A saved host. A left accent bar marks the most-recently-connected one; the context menu
 /// pairs / speed-tests / forgets / removes. Disabled while a session is busy.
+///
+/// The same view renders a PINNED host+profile card (§5.2a): same host, same live status, with
+/// the profile as the prominent subtitle. A pinned card is a shortcut, not a second host, so its
+/// menu carries only connect-shaped actions — edit/pair/forget/remove stay on the primary card,
+/// where the thing they act on actually lives.
 struct HostCardView: View {
     let host: StoredHost
     /// Currently advertising on the LAN (matched against live mDNS discovery). False means
@@ -92,6 +116,18 @@ struct HostCardView: View {
     var onWake: (() -> Void)? = nil
     /// Open the edit sheet (name / address / port / Wake-on-LAN MAC).
     var onEdit: (() -> Void)? = nil
+    /// This card's profile affordances — nil on surfaces that don't offer them.
+    var profileMenu: HostProfileMenu? = nil
+    /// Set on a PINNED card: the profile this card connects with. nil = the host's primary card,
+    /// which follows the binding.
+    var pinnedProfile: StreamProfile? = nil
+
+    /// The profile this card announces: a pinned card's own, else the host's binding.
+    private var shownProfile: StreamProfile? {
+        pinnedProfile ?? profileMenu.flatMap { menu in
+            menu.boundID.flatMap { id in menu.profiles.first { $0.id == id } }
+        }
+    }
 
     var body: some View {
         let m = CardMetrics.current
@@ -103,6 +139,9 @@ struct HostCardView: View {
                         .font(.geist(m.name, .bold, relativeTo: .title3))
                         .foregroundStyle(.primary)
                         .lineLimit(1)
+                    if let profile = shownProfile {
+                        ProfileChip(profile: profile, size: m.status, prominent: pinnedProfile != nil)
+                    }
                     Text("\(host.address):\(String(host.port))")
                         .font(.geist(m.meta, relativeTo: .caption))
                         .foregroundStyle(.secondary)
@@ -138,9 +177,31 @@ struct HostCardView: View {
         .buttonStyle(.plain)
         #endif
         .disabled(isBusy)
-        .contextMenu {
+        .contextMenu { menuItems }
+    }
+
+    @ViewBuilder private var menuItems: some View {
+        if let pinned = pinnedProfile, let menu = profileMenu {
+            // A pinned card is a shortcut, not a second host: only connect-shaped actions, plus
+            // the way to remove the shortcut itself. Unpinning touches neither the profile nor
+            // the host's default binding.
+            connectWithMenu(menu)
+            if LinkClipboard.isAvailable {
+                Button("Copy Link") { menu.copyLink(pinned.id) }
+            }
+            Button("Unpin Card", systemImage: "pin.slash", role: .destructive) {
+                menu.togglePin(pinned.id)
+            }
+        } else {
             if let onEdit {
                 Button("Edit…", systemImage: "pencil", action: onEdit)
+            }
+            if let menu = profileMenu {
+                connectWithMenu(menu)
+                pinMenu(menu)
+                if LinkClipboard.isAvailable {
+                    Button("Copy Link") { menu.copyLink(nil) }
+                }
             }
             Button("Pair with PIN…", action: onPair)
             Button("Test Network Speed…", action: onSpeedTest)
@@ -156,6 +217,57 @@ struct HostCardView: View {
                 Button("Forget Identity (re-pair to reconnect)", action: onForget)
             }
             Button("Remove", role: .destructive, action: onRemove)
+        }
+    }
+
+    /// "Connect with ▸" — a ONE-OFF pick that never rebinds the host, with a checkmark on what a
+    /// plain click would use. Its last item is the explicit way to rebind, for the users who do
+    /// want that from here.
+    @ViewBuilder private func connectWithMenu(_ menu: HostProfileMenu) -> some View {
+        if !menu.profiles.isEmpty {
+            Menu("Connect with") {
+                Button {
+                    menu.connectWith(.defaults)
+                } label: {
+                    Label(
+                        "Default settings",
+                        systemImage: menu.boundID == nil ? "checkmark" : "")
+                }
+                ForEach(menu.profiles) { profile in
+                    Button {
+                        menu.connectWith(.profile(profile.id))
+                    } label: {
+                        Label(
+                            profile.name,
+                            systemImage: menu.boundID == profile.id ? "checkmark" : "")
+                    }
+                }
+                Divider()
+                Menu("Set Default Profile") {
+                    Button("Default settings") { menu.setDefault(nil) }
+                    ForEach(menu.profiles) { profile in
+                        Button(profile.name) { menu.setDefault(profile.id) }
+                    }
+                }
+            }
+        }
+    }
+
+    /// "Pin as card ▸" — a host+profile combo gets its own one-click card in the grid, which is
+    /// what turns a regularly-used profile from a menu dive into a press (§5.2a).
+    @ViewBuilder private func pinMenu(_ menu: HostProfileMenu) -> some View {
+        if !menu.profiles.isEmpty {
+            Menu("Pin as Card") {
+                ForEach(menu.profiles) { profile in
+                    Button {
+                        menu.togglePin(profile.id)
+                    } label: {
+                        Label(
+                            profile.name,
+                            systemImage: menu.pinnedIDs.contains(profile.id) ? "checkmark" : "")
+                    }
+                }
+            }
         }
     }
 
@@ -178,6 +290,47 @@ struct HostCardView: View {
         .tracking(0.8)
         .foregroundStyle(.secondary)
         .lineLimit(1)
+    }
+}
+
+/// The profile a card connects with, as a tinted pill. Quiet on a bound primary card (it only
+/// answers "what will a click do?"); prominent on a pinned card, where the profile IS the reason
+/// the card exists — which is where the catalog's `accent` earns its keep.
+struct ProfileChip: View {
+    let profile: StreamProfile
+    let size: CGFloat
+    var prominent = false
+
+    var body: some View {
+        let tint = profile.accentColor ?? Color.brand
+        return HStack(spacing: 5) {
+            Circle()
+                .fill(tint)
+                .frame(width: size * 0.55, height: size * 0.55)
+                .accessibilityHidden(true) // the name is right there
+            Text(profile.name)
+                .font(.geist(prominent ? size + 2 : size, .semibold, relativeTo: .caption2))
+                .lineLimit(1)
+        }
+        .foregroundStyle(tint)
+        .padding(.horizontal, 7)
+        .padding(.vertical, 2)
+        .background(Capsule().fill(tint.opacity(prominent ? 0.22 : 0.13)))
+        .accessibilityLabel("Profile \(profile.name)")
+    }
+}
+
+extension StreamProfile {
+    /// The `#RRGGBB` accent as a colour, or nil when the profile hasn't been given one (the
+    /// schema reserves the field; every surface falls back to the brand tint).
+    var accentColor: Color? {
+        guard let accent, accent.hasPrefix("#"), accent.count == 7,
+              let value = UInt32(accent.dropFirst(), radix: 16)
+        else { return nil }
+        return Color(
+            red: Double((value >> 16) & 0xFF) / 255,
+            green: Double((value >> 8) & 0xFF) / 255,
+            blue: Double(value & 0xFF) / 255)
     }
 }
 

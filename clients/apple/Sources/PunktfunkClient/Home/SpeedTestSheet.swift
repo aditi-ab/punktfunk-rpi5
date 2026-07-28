@@ -34,10 +34,10 @@ struct SpeedTestSheet: View {
     @Environment(\.dismiss) private var dismiss
     let host: StoredHost
 
-    @AppStorage(DefaultsKey.streamWidth) private var width = 1920
-    @AppStorage(DefaultsKey.streamHeight) private var height = 1080
-    @AppStorage(DefaultsKey.streamHz) private var hz = 60
     @AppStorage(DefaultsKey.bitrateKbps) private var bitrateKbps = 0
+    /// The catalog, so the Apply button can write to the layer this host actually reads its
+    /// bitrate from (design/client-settings-profiles.md §5.3).
+    @ObservedObject private var profiles = ProfileStore.shared
 
     private enum Phase: Equatable {
         case connecting
@@ -87,14 +87,7 @@ struct SpeedTestSheet: View {
                 .keyboardShortcut(.cancelAction)
                 #endif
                 if case .done(let result) = phase, let rec = Self.recommendedKbps(result) {
-                    Button("Use \(Self.mbpsLabel(kbps: rec))") {
-                        bitrateKbps = rec
-                        dismiss()
-                    }
-                    .glassProminentButtonStyle()
-                    #if !os(tvOS)
-                    .keyboardShortcut(.defaultAction)
-                    #endif
+                    applyButtons(rec)
                 }
                 if case .failed = phase {
                     Button("Retry") { run() }
@@ -120,6 +113,45 @@ struct SpeedTestSheet: View {
         #endif
         .onAppear { run() }
         .onDisappear { token.cancelled = true }
+    }
+
+    /// Apply writes to **the layer this host actually resolves its bitrate from** (§5.3) — the
+    /// sharpest symptom of the missing feature was a per-host measurement overwriting the global.
+    ///
+    ///   • unbound host → the global, exactly as before;
+    ///   • bound to a profile that already overrides bitrate → that override;
+    ///   • bound to a profile that INHERITS bitrate → both are offered, because either is a
+    ///     defensible answer and guessing would silently pick one.
+    ///
+    /// Every button names its target, so what a click changes is never inferred from context.
+    @ViewBuilder private func applyButtons(_ recommended: Int) -> some View {
+        let bound = profiles.binding(for: host)
+        let label = Self.mbpsLabel(kbps: recommended)
+        if let bound {
+            Button("Apply to “\(bound.name)”") {
+                profiles.setOverride(bound.id, \.bitrateKbps, recommended)
+                dismiss()
+            }
+            .glassProminentButtonStyle()
+            #if !os(tvOS)
+            .keyboardShortcut(.defaultAction)
+            #endif
+            if bound.overrides.bitrateKbps == nil {
+                Button("Set as default (\(label))") {
+                    bitrateKbps = recommended
+                    dismiss()
+                }
+            }
+        } else {
+            Button("Use \(label)") {
+                bitrateKbps = recommended
+                dismiss()
+            }
+            .glassProminentButtonStyle()
+            #if !os(tvOS)
+            .keyboardShortcut(.defaultAction)
+            #endif
+        }
     }
 
     private var phaseIsFinal: Bool {
@@ -190,7 +222,12 @@ struct SpeedTestSheet: View {
         let address = host.address
         let port = host.port
         let pin = host.pinnedSHA256
-        let (w, h, fps) = (UInt32(clamping: width), UInt32(clamping: height), UInt32(clamping: hz))
+        // Probe at the mode this host would actually stream at — its profile's, if it is bound to
+        // one. The measurement IS the streaming path, so it should be the streaming path's mode.
+        let mode = EffectiveSettings.resolve(host: host, catalog: profiles.catalog)
+        let (w, h, fps) = (
+            UInt32(clamping: mode.width), UInt32(clamping: mode.height),
+            UInt32(clamping: mode.refreshHz))
         Task.detached(priority: .userInitiated) {
             // Connect (blocking) — same identity/trust as a session, but TOFU results are
             // NOT persisted from here.

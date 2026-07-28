@@ -15,7 +15,7 @@ import Foundation
 /// it without the shared module taking a dependency on the kit.
 public let punktfunkDefaultMgmtPort: UInt16 = 47990
 
-public struct StoredHost: Identifiable, Codable, Hashable {
+public struct StoredHost: Identifiable, Codable, Hashable, Sendable {
     public var id = UUID()
     public var name: String
     public var address: String

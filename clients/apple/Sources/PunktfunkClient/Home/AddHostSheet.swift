@@ -20,6 +20,16 @@ struct AddHostSheet: View {
     @State private var address: String
     @State private var port: Int
     @State private var mac: String
+    #if !os(tvOS)
+    /// This host's DEFAULT settings profile — what a plain click/tap uses. Empty = Default
+    /// settings (design/client-settings-profiles.md §5.2). Changing it here is the only way the
+    /// default moves; "Connect with ▸" is deliberately a one-off.
+    @State private var profileID: String
+    /// Profiles pinned as their own cards for this host (§5.2a) — presentation only, and
+    /// independent of the default above.
+    @State private var pinnedIDs: Set<String>
+    @ObservedObject private var profiles = ProfileStore.shared
+    #endif
     #if os(macOS)
     /// Share the clipboard with this host (macOS sessions only; design
     /// clipboard-and-file-transfer.md §5.3). Off by default; honored only when the host
@@ -49,6 +59,10 @@ struct AddHostSheet: View {
         _mac = State(initialValue: (stored.isEmpty ? suggestedMacs : stored).joined(separator: ", "))
         #if os(macOS)
         _clipboardSync = State(initialValue: existing?.clipboardSync ?? false)
+        #endif
+        #if !os(tvOS)
+        _profileID = State(initialValue: existing?.profileID ?? "")
+        _pinnedIDs = State(initialValue: Set(existing?.pinnedProfileIDs ?? []))
         #endif
     }
 
@@ -108,6 +122,7 @@ struct AddHostSheet: View {
                 #if os(macOS)
                 Toggle("Share clipboard with this host", isOn: $clipboardSync)
                 #endif
+                profileRows
             }
             #if !os(tvOS)
             .formStyle(.grouped)
@@ -142,14 +157,48 @@ struct AddHostSheet: View {
             #endif
         }
         #if os(iOS)
-        // Four fields + the action row — a touch taller than the 3-field add sheet used to be.
-        .presentationDetents([.height(392)])
+        // Four fields + the action row — a touch taller than the 3-field add sheet used to be,
+        // and taller again once there are profiles to bind and pin.
+        .presentationDetents([.height(profiles.profiles.isEmpty ? 392 : 480)])
         .presentationDragIndicator(.visible)
         #endif
         #if os(macOS)
         .frame(width: 400)
         .fixedSize(horizontal: false, vertical: true)
         #endif
+        #endif
+    }
+
+    /// The per-host profile rows: which profile this host uses by default, and which extra ones
+    /// get their own card in the grid. Absent when no profiles exist — a user who has never made
+    /// one sees exactly today's sheet, which is the "zero profiles = zero new clutter" rule.
+    @ViewBuilder private var profileRows: some View {
+        #if !os(tvOS)
+        if !profiles.profiles.isEmpty {
+            Picker("Profile", selection: $profileID) {
+                Text("Default settings").tag("")
+                ForEach(profiles.profiles) { profile in
+                    Text(profile.name).tag(profile.id)
+                }
+                // A binding whose profile was deleted resolves as Default settings anyway; saying
+                // so beats an empty picker, and saving cleans the field up.
+                if !profileID.isEmpty, profiles.profile(id: profileID) == nil {
+                    Text("Default settings (profile deleted)").tag(profileID)
+                }
+            }
+            DisclosureGroup("Pinned cards") {
+                ForEach(profiles.profiles) { profile in
+                    Toggle(profile.name, isOn: Binding(
+                        get: { pinnedIDs.contains(profile.id) },
+                        set: { on in
+                            if on { pinnedIDs.insert(profile.id) } else { pinnedIDs.remove(profile.id) }
+                        }))
+                }
+                Text("A pinned profile gets its own card next to this host — one click, no menu.")
+                    .font(.geist(12, relativeTo: .caption))
+                    .foregroundStyle(.secondary)
+            }
+        }
         #endif
     }
 
@@ -163,6 +212,17 @@ struct AddHostSheet: View {
         // nil when off: the key stays absent from the saved JSON (forward-compat, and "never
         // opted in" and "opted out" read the same — off).
         host.clipboardSync = clipboardSync ? true : nil
+        #endif
+        #if !os(tvOS)
+        // nil rather than "" for the same forward-compat reason, and a dangling binding is
+        // cleaned up on this save (§6) instead of lingering as a stale id forever.
+        host.profileID = profiles.profile(id: profileID) == nil ? nil : profileID
+        // Keep the stored ORDER (it is card order) and drop what this sheet unpinned; anything
+        // newly ticked goes on the end.
+        let kept = (host.pinnedProfileIDs ?? []).filter { pinnedIDs.contains($0) }
+        let added = pinnedIDs.filter { !kept.contains($0) }.sorted()
+        let pins = kept + added
+        host.pinnedProfileIDs = pins.isEmpty ? nil : pins
         #endif
         onSave(host)
         dismiss()

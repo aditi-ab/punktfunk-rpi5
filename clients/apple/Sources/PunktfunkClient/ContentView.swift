@@ -200,16 +200,19 @@ struct ContentView: View {
             }
         }
         // The Live Activity's / Shortcuts' End button runs EndStreamIntent in-process, which posts
-        // this — tear the session down deliberately (quit-close the host).
+        // this — tear the session down deliberately (quit-close the host). iOS-only along with
+        // the intent itself (LiveActivityIntent is ActivityKit's world).
         .onReceive(NotificationCenter.default.publisher(for: .punktfunkEndActiveSession)) { _ in
             model.disconnect(deliberate: true)
         }
-        // Connect App Intent (Siri/Shortcuts): route its punktfunk:// URL through the same handler
-        // as a widget tap.
+        #endif
+        // Connect App Intent (Siri/Shortcuts/Spotlight): route its punktfunk:// URL through the
+        // same handler a widget tap uses. NOT iOS-gated — the Connect intent compiles on macOS and
+        // tvOS too, and an intent that posts to nobody would be a shortcut that silently does
+        // nothing.
         .onReceive(NotificationCenter.default.publisher(for: .punktfunkOpenDeepLink)) { note in
             if let url = note.object as? URL { handleDeepLink(url) }
         }
-        #endif
         .onChange(of: model.phase) { _, phase in
             switch phase {
             case .streaming:
@@ -505,13 +508,13 @@ struct ContentView: View {
                 GamepadHomeView(
                     store: store, model: model, discovery: discovery,
                     libraryTarget: $libraryTarget, waker: waker,
-                    connect: { connect($0) }, connectDiscovered: connectDiscovered)
+                    connect: { connect($0, profile: $1) }, connectDiscovered: connectDiscovered)
             } else {
                 HomeView(
                     store: store, model: model, discovery: discovery,
                     showAddHost: $showAddHost, pairingTarget: $pairingTarget,
                     speedTestTarget: $speedTestTarget, libraryTarget: $libraryTarget,
-                    connect: { connect($0) }, connectDiscovered: connectDiscovered,
+                    connect: { connect($0, profile: $1) }, connectDiscovered: connectDiscovered,
                     onPaired: handlePaired, onLaunchTitle: launchTitle, wake: { wakeOnly($0) })
             }
         }
@@ -521,7 +524,7 @@ struct ContentView: View {
                 GamepadHomeView(
                     store: store, model: model, discovery: discovery,
                     libraryTarget: $libraryTarget, waker: waker,
-                    connect: { connect($0) }, connectDiscovered: connectDiscovered)
+                    connect: { connect($0, profile: $1) }, connectDiscovered: connectDiscovered)
                 // On tvOS pairing/library normally present from HomeView's navigationDestinations
                 // — which aren't mounted while the gamepad launcher is up. Give the launcher its
                 // own presenters (exactly one of the two homes is mounted at a time, so these can
@@ -545,7 +548,7 @@ struct ContentView: View {
                     showAddHost: $showAddHost, pairingTarget: $pairingTarget,
                     speedTestTarget: $speedTestTarget, libraryTarget: $libraryTarget,
                     showSettings: $showSettings,
-                    connect: { connect($0) }, connectDiscovered: connectDiscovered,
+                    connect: { connect($0, profile: $1) }, connectDiscovered: connectDiscovered,
                     onPaired: handlePaired, onLaunchTitle: launchTitle, wake: { wakeOnly($0) })
             }
         }

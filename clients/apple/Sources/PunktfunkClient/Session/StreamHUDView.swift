@@ -85,6 +85,15 @@ struct StreamHUDView: View {
                     .frame(width: 7, height: 7)
                 Text("\(connection.width)×\(connection.height)@\(connection.refreshHz)  \(model.fps) fps  \(model.mbps, specifier: "%.1f") Mb/s")
                     .font(.system(.caption, design: .monospaced))
+                // Which settings profile this session resolved to, if any (design §5.2). Near-zero
+                // cost, and it answers "which profile am I on?" without leaving the stream —
+                // otherwise the only evidence is the settings themselves, which is a guessing game.
+                if let profile = model.settings.profileName {
+                    Text("· \(profile)")
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundStyle(Color.accentColor)
+                        .lineLimit(1)
+                }
             }
             if model.endToEndValid {
                 // Stage-2: the end-to-end headline (capture→on-glass, measured directly, skew-

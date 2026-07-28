@@ -26,7 +26,9 @@ import GameController
 /// One navigable tile: a saved host, a discovered-but-unsaved one, or the trailing Add Host
 /// action. Hashable so it can be the carousel's scroll-position identity.
 private enum GamepadHomeTarget: Hashable {
-    case saved(UUID)
+    /// A saved host's own tile, or one of its pinned host+profile cards (§5.2a) — which on a
+    /// controller-first surface are THE profile affordance: focus and press, no menus.
+    case saved(UUID, profile: String?)
     case discovered(String)
     case addHost
 }
@@ -37,6 +39,9 @@ private struct HomeTile: Identifiable {
     let id: GamepadHomeTarget
     let title: String
     let subtitle: String
+    /// The profile this tile connects with — shown as a tinted chip. Set on a pinned card; nil on
+    /// a plain host tile unless the host is bound to one (then it answers "what will A do?").
+    var profile: StreamProfile?
     var isOnline = false
     var isPaired = false
     var isConnecting = false
@@ -59,9 +64,12 @@ struct GamepadHomeView: View {
     /// Wake-and-wait driver — gates the carousel while its overlay is up, and the carousel's
     /// activate routes an offline+wakeable host through it (see ContentView.startSession).
     @ObservedObject var waker: HostWaker
-    let connect: (StoredHost) -> Void
+    let connect: (StoredHost, ProfileSelection) -> Void
     let connectDiscovered: (DiscoveredHost) -> Void
 
+    /// The profile catalog — pinned host+profile combos render as their own tiles here, which is
+    /// how a controller picks a profile: one focus-and-press instead of a menu (design §5.4).
+    @ObservedObject private var profiles = ProfileStore.shared
     /// Same gate the touch grid's "Browse Library…" context-menu item uses (default ON; the
     /// Settings "Game library" toggle opts out).
     @AppStorage(DefaultsKey.libraryEnabled) private var libraryEnabled = true
@@ -250,22 +258,34 @@ struct GamepadHomeView: View {
     /// then discovered-but-unsaved ones, then the Add Host action tile (so the strip is never
     /// empty and manual entry is always one press away).
     private var tiles: [HomeTile] {
-        let saved = store.hosts.map { host in
-            HomeTile(
-                id: .saved(host.id),
-                title: host.displayName,
-                subtitle: "\(host.address):\(String(host.port))",
-                // Online = advertising on mDNS OR proven reachable by the probe (a routed/VPN host
-                // never advertises); the wake item is offered only when neither holds.
-                isOnline: discovery.advertises(host) || store.probedOnline.contains(host.id),
-                isPaired: host.pinnedSHA256 != nil,
-                isConnecting: model.phase == .connecting && model.activeHost?.id == host.id,
-                filled: true,
-                hasLibrary: true,
-                canWake: autoWakeEnabled && PunktfunkConnection.wakeOnLANAvailable
-                    && !discovery.advertises(host) && !store.probedOnline.contains(host.id)
-                    && !host.wakeMacs.isEmpty,
-                activate: { connect(host) })
+        var saved: [HomeTile] = []
+        for host in store.hosts {
+            // Online = advertising on mDNS OR proven reachable by the probe (a routed/VPN host
+            // never advertises); the wake item is offered only when neither holds.
+            let online = discovery.advertises(host) || store.probedOnline.contains(host.id)
+            let bound = profiles.binding(for: host)
+            let connecting = model.phase == .connecting && model.activeHost?.id == host.id
+            // The host's own tile, then one per pinned profile — the same order the touch grid
+            // uses, so a pin reads as belonging to its host on both surfaces.
+            for profile in [StreamProfile?.none] + profiles.pinned(for: host).map(Optional.some) {
+                saved.append(HomeTile(
+                    id: .saved(host.id, profile: profile?.id),
+                    title: host.displayName,
+                    subtitle: "\(host.address):\(String(host.port))",
+                    profile: profile ?? bound,
+                    isOnline: online,
+                    isPaired: host.pinnedSHA256 != nil,
+                    isConnecting: connecting,
+                    filled: true,
+                    // A pinned card is a shortcut, not a second host — Y (library) stays on the
+                    // host's own tile, where the host-level actions live.
+                    hasLibrary: profile == nil,
+                    canWake: autoWakeEnabled && PunktfunkConnection.wakeOnLANAvailable
+                        && !online && !host.wakeMacs.isEmpty,
+                    activate: {
+                        connect(host, profile.map { .profile($0.id) } ?? .inherit)
+                    }))
+            }
         }
         let discovered = discovery.unsaved(among: store.hosts).map { d in
             HomeTile(
@@ -287,7 +307,7 @@ struct GamepadHomeView: View {
     /// Only saved hosts have a library — matches the touch grid, where "Browse Library…" is a
     /// `HostCardView`-only action never offered on `DiscoveredCardView`.
     private func openLibraryForSelected() {
-        guard libraryEnabled, case .saved(let id) = selection,
+        guard libraryEnabled, case .saved(let id, let profile) = selection, profile == nil,
               let host = store.hosts.first(where: { $0.id == id })
         else { return }
         libraryTarget = host
@@ -353,6 +373,10 @@ private struct GamepadHostTile: View {
                 .foregroundStyle(.white)
                 .lineLimit(1)
                 .minimumScaleFactor(0.7)
+            if let profile = tile.profile {
+                ProfileChip(profile: profile, size: Self.statusFont, prominent: true)
+                    .padding(.top, 4)
+            }
             Text(tile.subtitle)
                 .font(.geist(Self.subtitleFont, relativeTo: .caption))
                 .foregroundStyle(.white.opacity(0.55))

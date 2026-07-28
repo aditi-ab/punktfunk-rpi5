@@ -13,6 +13,9 @@ struct HomeView: View {
     @ObservedObject var store: HostStore
     @ObservedObject var model: SessionModel
     @ObservedObject var discovery: HostDiscovery
+    /// The profile catalog — the source of the card chips, the "Connect with ▸" menu, and the
+    /// pinned host+profile cards the grid renders alongside their host (design §5.2a).
+    @ObservedObject private var profiles = ProfileStore.shared
     @Binding var showAddHost: Bool
     @Binding var pairingTarget: StoredHost?
     @Binding var speedTestTarget: StoredHost?
@@ -20,7 +23,9 @@ struct HomeView: View {
     #if !os(macOS)
     @Binding var showSettings: Bool
     #endif
-    let connect: (StoredHost) -> Void
+    /// Start a session with this host, using the given profile selection — `.inherit` for a plain
+    /// card tap (the host's binding), an explicit pick from "Connect with ▸" or a pinned card.
+    let connect: (StoredHost, ProfileSelection) -> Void
     let connectDiscovered: (DiscoveredHost) -> Void
     /// Pairing succeeded (tvOS PairSheet route) — pin + connect (ContentView guards staleness).
     let onPaired: (StoredHost, Data) -> Void
@@ -44,8 +49,8 @@ struct HomeView: View {
                     ScrollView {
                         if !store.hosts.isEmpty {
                             LazyVGrid(columns: gridColumns, spacing: gridSpacing) {
-                                ForEach(store.hosts) { host in
-                                    hostCard(host)
+                                ForEach(gridEntries) { entry in
+                                    hostCard(entry.host, pinned: entry.profile)
                                 }
                             }
                             .padding()
@@ -180,22 +185,63 @@ struct HomeView: View {
 
     // MARK: - Cards
 
-    private func hostCard(_ host: StoredHost) -> some View {
+    /// One grid tile: a host's primary card, or one of its pinned host+profile cards. A pin is
+    /// presentation only — same record, same live status, so it is an extra ENTRY here rather than
+    /// a duplicated host (which would fork pairing, WoL and renames — design §5.2a).
+    private struct HostGridEntry: Identifiable {
+        let host: StoredHost
+        let profile: StreamProfile?
+        var id: String { "\(host.id.uuidString)#\(profile?.id ?? "")" }
+    }
+
+    /// Saved hosts, each immediately followed by its pinned cards — so a pin reads as belonging to
+    /// its host rather than as a stray tile somewhere in the grid.
+    private var gridEntries: [HostGridEntry] {
+        store.hosts.flatMap { host in
+            [HostGridEntry(host: host, profile: nil)]
+                + profiles.pinned(for: host).map { HostGridEntry(host: host, profile: $0) }
+        }
+    }
+
+    private func hostCard(_ host: StoredHost, pinned: StreamProfile?) -> some View {
         let onBrowseLibrary: (() -> Void)? = libraryEnabled ? { libraryTarget = host } : nil
+        // A pinned card connects with ITS profile; the primary card follows the binding.
+        let selection: ProfileSelection = pinned.map { .profile($0.id) } ?? .inherit
         return HostCardView(
             host: host,
             isOnline: discovery.advertises(host) || store.probedOnline.contains(host.id),
             isConnecting: model.phase == .connecting && model.activeHost?.id == host.id,
-            isMostRecent: host.id == mostRecentHostID,
+            // The accent ring marks the most recent HOST; pinned cards stay quiet so the grid
+            // doesn't grow several "most recent" bars for one machine.
+            isMostRecent: pinned == nil && host.id == mostRecentHostID,
             isBusy: model.isBusy,
-            onConnect: { connect(host) },
+            onConnect: { connect(host, selection) },
             onPair: { if !model.isBusy { pairingTarget = host } },
             onSpeedTest: { if !model.isBusy { speedTestTarget = host } },
             onForget: { store.forgetIdentity(host) },
             onRemove: { store.remove(host) },
             onBrowseLibrary: onBrowseLibrary,
             onWake: { wake(host) },
-            onEdit: { editTarget = host })
+            onEdit: { editTarget = host },
+            profileMenu: profileMenu(for: host),
+            pinnedProfile: pinned)
+    }
+
+    /// The profile affordances every host card carries (§5.2/§5.2a).
+    private func profileMenu(for host: StoredHost) -> HostProfileMenu {
+        HostProfileMenu(
+            profiles: profiles.profiles,
+            boundID: host.profileID,
+            pinnedIDs: host.pinnedProfileIDs ?? [],
+            connectWith: { selection in connect(host, selection) },
+            setDefault: { store.setProfile(host.id, profileID: $0) },
+            togglePin: { id in
+                let pinned = (host.pinnedProfileIDs ?? []).contains(id)
+                store.setPinned(host.id, profileID: id, pinned: !pinned)
+            },
+            copyLink: { profileID in
+                LinkClipboard.copy(DeepLink.forHost(host, profile: profileID).urlString)
+            })
     }
 
     private var discoveredSection: some View {
