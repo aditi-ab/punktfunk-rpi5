@@ -37,6 +37,7 @@
 //! LUID) so the shared textures never cross GPUs on a multi-adapter box.
 
 use crate::video::ColorDesc;
+use crate::video_libav::AvBuffer;
 use anyhow::{anyhow, bail, Context as _, Result};
 use ffmpeg_next as ffmpeg;
 use std::ffi::c_void;
@@ -225,11 +226,13 @@ fn decode_profile_supported(device: &ID3D11Device, codec_id: ffmpeg::codec::Id) 
 unsafe fn d3d11va_decode_supported(hw_device: *mut ffmpeg::ffi::AVBufferRef) -> bool {
     use ffmpeg::ffi::*;
     unsafe {
-        let frames_ref = av_hwframe_ctx_alloc(hw_device);
-        if frames_ref.is_null() {
+        // Scope-bound: this probe owns the frames ctx for the length of the check and the drop
+        // below releases it on BOTH exits, instead of the early return relying on the null case and
+        // the success path unref'ing by hand.
+        let Some(frames_ref) = AvBuffer::from_raw(av_hwframe_ctx_alloc(hw_device)) else {
             return false;
-        }
-        let frames = (*frames_ref).data as *mut AVHWFramesContext;
+        };
+        let frames = (*frames_ref.as_ptr()).data as *mut AVHWFramesContext;
         (*frames).format = AVPixelFormat::AV_PIX_FMT_D3D11;
         (*frames).sw_format = AVPixelFormat::AV_PIX_FMT_NV12;
         (*frames).width = 1920;
@@ -237,9 +240,7 @@ unsafe fn d3d11va_decode_supported(hw_device: *mut ffmpeg::ffi::AVBufferRef) -> 
         (*frames).initial_pool_size = DECODE_POOL_SIZE;
         let fhw = (*frames).hwctx as *mut AVD3D11VAFramesContext;
         (*fhw).bind_flags = BIND_DECODER;
-        let r = av_hwframe_ctx_init(frames_ref);
-        let mut fr = frames_ref;
-        av_buffer_unref(&mut fr);
+        let r = av_hwframe_ctx_init(frames_ref.as_ptr());
         r >= 0
     }
 }
@@ -467,7 +468,14 @@ impl SharedRing {
 
 pub(crate) struct D3d11vaDecoder {
     ctx: *mut ffmpeg::ffi::AVCodecContext,
-    hw_device: *mut ffmpeg::ffi::AVBufferRef,
+    /// The D3D11VA hwdevice, owned. Nothing reads this field after construction — the codec context
+    /// took its own ref via `av_buffer_ref` — it exists so the device outlives the decoder and is
+    /// unref'd exactly once when it drops. Declared after `ctx` so it still releases AFTER the
+    /// `Drop` below frees packet/frame/context, which is the order the hand-written unref had.
+    /// `dead_code` is answered here rather than by removing the field (that would free the device
+    /// early) or by an underscore name (that would hide what it is).
+    #[allow(dead_code)]
+    hw_device: AvBuffer,
     packet: *mut ffmpeg::ffi::AVPacket,
     frame: *mut ffmpeg::ffi::AVFrame,
     device: ID3D11Device,
@@ -525,20 +533,19 @@ impl D3d11vaDecoder {
                 ffi::av_buffer_unref(&mut hw);
                 bail!("av_hwdevice_ctx_init: {}", ffmpeg::Error::from(r));
             }
+            // Owned from here: every `bail!` below drops it, so none of them unref by hand.
+            let hw_device = AvBuffer::from_raw(hw_device)
+                .context("av_hwdevice_ctx_alloc(D3D11VA) gave no device")?;
             // Up-front viability probe (see `d3d11va_decode_supported`).
-            if !d3d11va_decode_supported(hw_device) {
-                let mut hw = hw_device;
-                ffi::av_buffer_unref(&mut hw);
+            if !d3d11va_decode_supported(hw_device.as_ptr()) {
                 bail!("GPU can't create the D3D11VA decode surface pool");
             }
             let codec = ffi::avcodec_find_decoder(codec_id.into());
             if codec.is_null() {
-                let mut hw = hw_device;
-                ffi::av_buffer_unref(&mut hw);
                 bail!("no {codec_id:?} decoder");
             }
             let ctx = ffi::avcodec_alloc_context3(codec);
-            (*ctx).hw_device_ctx = ffi::av_buffer_ref(hw_device);
+            (*ctx).hw_device_ctx = ffi::av_buffer_ref(hw_device.as_ptr());
             (*ctx).get_format = Some(get_format_d3d11);
             (*ctx).flags |= ffi::AV_CODEC_FLAG_LOW_DELAY as i32;
             (*ctx).thread_count = 1; // hwaccel: threads only add latency
@@ -549,8 +556,6 @@ impl D3d11vaDecoder {
             if r < 0 {
                 let mut ctx = ctx;
                 ffi::avcodec_free_context(&mut ctx);
-                let mut hw = hw_device;
-                ffi::av_buffer_unref(&mut hw);
                 bail!("avcodec_open2 (D3D11VA): {}", ffmpeg::Error::from(r));
             }
             Ok(D3d11vaDecoder {
@@ -789,7 +794,7 @@ impl Drop for D3d11vaDecoder {
             ffi::av_packet_free(&mut self.packet);
             ffi::av_frame_free(&mut self.frame);
             ffi::avcodec_free_context(&mut self.ctx);
-            ffi::av_buffer_unref(&mut self.hw_device);
+            // `hw_device` is an `AvBuffer` and unrefs itself when the field drops, right after this.
         }
         // `ring` drops after the codec: no decode can be in flight past avcodec_free_context,
         // and the slots' CloseHandle only closes OUR handle — a presenter-side import that is

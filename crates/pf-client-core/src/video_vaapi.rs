@@ -33,8 +33,13 @@ unsafe extern "C" fn pick_vaapi(
 #[cfg(target_os = "linux")]
 pub(crate) struct VaapiDecoder {
     ctx: *mut ffmpeg::ffi::AVCodecContext,
-    // Owned: unrefs itself. Declared after `ctx` so it still releases AFTER the `Drop` below frees
-    // packet/frame/ctx — the same order the hand-written unref had.
+    /// The VAAPI hwdevice, owned. Nothing reads this field after construction — the codec context
+    /// took its own ref via `av_buffer_ref` — it exists so the device outlives the decoder and is
+    /// unref'd exactly once when it drops. Declared after `ctx` so it still releases AFTER the
+    /// `Drop` below frees packet/frame/context, which is the order the hand-written unref had.
+    /// `dead_code` is answered here rather than by removing the field (that would free the device
+    /// early) or by an underscore name (that would hide what it is).
+    #[allow(dead_code)]
     hw_device: AvBuffer,
     packet: *mut ffmpeg::ffi::AVPacket,
     frame: *mut ffmpeg::ffi::AVFrame,
