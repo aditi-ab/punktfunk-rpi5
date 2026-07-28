@@ -1,9 +1,22 @@
-# Supply-chain advisory scan for BOTH dependency trees the project ships to users:
+# Supply-chain advisory scan for EVERY dependency tree the project ships or publishes, plus the
+# license-allowlist gate (CRA Annex I Part II: know your components; catch a bad dep the moment
+# it lands).
 #   * cargo-audit → the (network-facing, crypto-heavy) Rust tree, against the RustSec advisory DB.
-#   * bun audit   → the web management console (Nitro/Bun BFF) — the component that holds the login
-#                   gate, session sealing, and the mgmt bearer token, so its deps matter too.
-# Triggers: weekly (catch newly-disclosed CVEs in pinned deps), on every lockfile change (catch a bad
-# dep the moment it lands), and on demand.
+#   * bun audit   → each Bun-managed tree that ships or publishes: web (the mgmt console BFF —
+#                   login gate, session sealing, mgmt bearer token), sdk (@punktfunk/host),
+#                   plugin-kit (@punktfunk/plugin-kit).
+#   * pnpm audit  → clients/decky (the Steam Deck plugin).
+#   * docs-site   → scanned NON-blocking (continue-on-error): known transitive advisories ride in
+#                   via the CMS/UI chain (@unom/ui → payload → dompurify/monaco) and the nitropack
+#                   build chain (node-tar, brace-expansion); clearing them needs coordinated bumps
+#                   verified against the LIVE site (the docs don't build standalone) — tracked in
+#                   punktfunk-planning design/cra-readiness.md. Flip to blocking once clean.
+#   * cargo-about → license-allowlist gate over BOTH Rust workspaces (about.toml `accepted`);
+#                   fails if any crate carries a license outside the allowlist — the regression
+#                   guard about.toml always promised. (The Android Gradle tree has no lockfile, so
+#                   nothing scans it — see the CRA roadmap.)
+# Triggers: weekly (catch newly-disclosed CVEs in pinned deps), on every lockfile/allowlist
+# change, and on demand.
 # To silence a known-unfixable Rust advisory, add it to `.cargo/audit.toml` ([advisories] ignore=[…]).
 name: audit
 
@@ -12,7 +25,16 @@ on:
     - cron: '0 6 * * 1'   # Mondays 06:00 UTC
   push:
     branches: [main]
-    paths: ['Cargo.lock', 'web/bun.lock', '.gitea/workflows/audit.yml']
+    paths:
+      - 'Cargo.lock'
+      - 'packaging/windows/drivers/Cargo.lock'
+      - 'web/bun.lock'
+      - 'docs-site/bun.lock'
+      - 'sdk/bun.lock'
+      - 'plugin-kit/bun.lock'
+      - 'clients/decky/pnpm-lock.yaml'
+      - 'about.toml'
+      - '.gitea/workflows/audit.yml'
   workflow_dispatch:
 
 jobs:
@@ -36,13 +58,17 @@ jobs:
           cargo audit
 
   bun-audit:
+    strategy:
+      fail-fast: false
+      matrix:
+        tree: [web, sdk, plugin-kit]
     runs-on: ubuntu-24.04
     container:
       image: oven/bun:1
     timeout-minutes: 15
     defaults:
       run:
-        working-directory: web
+        working-directory: ${{ matrix.tree }}
     steps:
       # oven/bun's slim base lacks a CA bundle + git — actions/checkout's HTTPS fetch needs them
       # (same preamble as web-screenshots.yml / ci.yml's web job).
@@ -50,9 +76,69 @@ jobs:
         working-directory: /
         run: apt-get update && apt-get install -y --no-install-recommends ca-certificates git
       - uses: actions/checkout@v4
-      # `bun audit` queries the registry advisory DB for the versions pinned in web/bun.lock. No
-      # install/build needed — it reads the manifest + lockfile. Fails the job on any advisory, the
-      # same fail-on-vulnerability stance as cargo-audit above; triage a finding by bumping the dep
-      # (or, if genuinely unfixable + inapplicable, pinning a resolution and noting why here).
+      # `bun audit` queries the registry advisory DB for the versions pinned in the tree's
+      # bun.lock. No install/build needed — it reads the manifest + lockfile. Fails the job on any
+      # advisory, the same fail-on-vulnerability stance as cargo-audit above; triage a finding by
+      # bumping the dep (or, if genuinely unfixable + inapplicable, pinning a resolution and
+      # noting why here).
       - name: bun audit
         run: bun audit
+
+  # Kept OUT of the bun-audit matrix so this tree's known-advisory state can't normalize failure
+  # in a shipping tree. See the header for why this one is non-blocking.
+  docs-site-audit:
+    runs-on: ubuntu-24.04
+    container:
+      image: oven/bun:1
+    timeout-minutes: 15
+    continue-on-error: true
+    defaults:
+      run:
+        working-directory: docs-site
+    steps:
+      - name: Install git + CA certs
+        working-directory: /
+        run: apt-get update && apt-get install -y --no-install-recommends ca-certificates git
+      - uses: actions/checkout@v4
+      - name: bun audit (non-blocking)
+        run: bun audit
+
+  pnpm-audit:
+    runs-on: ubuntu-24.04
+    container:
+      image: node:22-bookworm
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: clients/decky
+    steps:
+      - uses: actions/checkout@v4
+      # decky is pnpm-managed (pnpm-lock.yaml lockfileVersion 9.0 → pnpm 10 reads it). Like
+      # bun audit, `pnpm audit` needs no install/build — lockfile + registry advisory DB only.
+      - name: pnpm audit
+        run: |
+          npm install -g pnpm@10
+          pnpm audit
+
+  # The regression guard about.toml documents: fail if any crate in either Rust workspace carries
+  # a license outside the `accepted` allowlist (e.g. a copyleft dep silently entering the linked
+  # set). cargo-about is version-pinned: the config uses the per-crate `accepted` syntax
+  # validated against exactly this version.
+  license-gate:
+    runs-on: ubuntu-24.04
+    container:
+      image: git.unom.io/unom/punktfunk-rust-ci:latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: /usr/local/cargo
+          key: cargo-about-0.9.1
+          restore-keys: cargo-about-
+      - name: cargo about license gate (host + driver workspaces)
+        run: |
+          git config --global --add safe.directory "$PWD"
+          command -v cargo-about >/dev/null 2>&1 || cargo install --locked cargo-about --version 0.9.1 --features cli
+          cargo about generate about.hbs --fail -o /dev/null
+          cargo about generate -m packaging/windows/drivers/Cargo.toml -c about.toml about.hbs --fail -o /dev/null

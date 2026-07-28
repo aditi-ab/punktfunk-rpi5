@@ -37,13 +37,15 @@ accepted = [
 ignore-build-dependencies = true
 ignore-dev-dependencies = true
 
-# r-efi offers an LGPL-2.1-or-later arm but is tri-licensed; take a permissive arm. (It is also
-# UEFI-target-gated out of every shipped build.)
-[r-efi.clarify]
-license = "MIT OR Apache-2.0"
-
-[ring.clarify]
-license = "MIT AND ISC AND OpenSSL"
-
-[aws-lc-sys.clarify]
-license = "ISC AND Apache-2.0 AND MIT AND BSD-3-Clause AND OpenSSL"
+# Per-crate license-acceptance additions (cargo-about ≥0.6 syntax; the old `[crate.clarify]`
+# license-only form fails to deserialize under cargo-about 0.9, which now wants checksummed file
+# clarifications — per-crate `accepted` extensions express the same intent without checksums).
+#
+# r-efi is tri-licensed with an LGPL-2.1-or-later arm; cargo-about resolves OR-expressions to an
+# accepted arm on its own (MIT/Apache-2.0 are globally accepted), so it needs no entry. (It is
+# also UEFI-target-gated out of every shipped build.)
+#
+# ring's license is an AND of permissive terms including the OpenSSL license; accept the
+# OpenSSL/ISC parts for this crate only, not globally.
+[ring]
+accepted = ["OpenSSL", "ISC"]

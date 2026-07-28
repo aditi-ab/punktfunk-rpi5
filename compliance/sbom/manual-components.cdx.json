@@ -1,0 +1,79 @@
+{
+  "bomFormat": "CycloneDX",
+  "specVersion": "1.6",
+  "version": 1,
+  "components": [
+    {
+      "type": "library",
+      "name": "pyrowave",
+      "version": "509e4f887b585a3f97471fcc804e9de649f2c16f",
+      "description": "GPU wavelet codec, vendored at crates/pyrowave-sys/vendor/pyrowave (pruned tree) with local patches from crates/pyrowave-sys/patches/; commits recorded in vendor/pyrowave/PUNKTFUNK-VENDOR.txt",
+      "licenses": [{ "license": { "id": "MIT" } }],
+      "externalReferences": [{ "type": "vcs", "url": "https://github.com/Themaister/pyrowave" }]
+    },
+    {
+      "type": "library",
+      "name": "Granite",
+      "version": "44362775d36e0c4139352f83efd96bab4e239f66",
+      "description": "Vulkan backend subset vendored inside the pyrowave tree",
+      "licenses": [{ "license": { "id": "MIT" } }],
+      "externalReferences": [{ "type": "vcs", "url": "https://github.com/Themaister/Granite" }]
+    },
+    {
+      "type": "library",
+      "name": "volk",
+      "version": "47cddf7ed97b94118a08aacb548a411188e016cc",
+      "description": "Vulkan meta-loader vendored inside the pyrowave/Granite tree",
+      "licenses": [{ "license": { "id": "MIT" } }],
+      "externalReferences": [{ "type": "vcs", "url": "https://github.com/zeux/volk" }]
+    },
+    {
+      "type": "library",
+      "name": "Vulkan-Headers",
+      "version": "015e25c3c91b70eb1a754d36fb14c4ba6ad9b0b9",
+      "description": "Vulkan API headers vendored inside the pyrowave tree",
+      "licenses": [{ "license": { "id": "Apache-2.0" } }, { "license": { "id": "MIT" } }],
+      "externalReferences": [{ "type": "vcs", "url": "https://github.com/KhronosGroup/Vulkan-Headers" }]
+    },
+    {
+      "type": "library",
+      "name": "libvpl",
+      "version": "2.17.0",
+      "description": "Intel oneVPL dispatcher, vendored at crates/libvpl-sys/vendor/libvpl",
+      "licenses": [{ "license": { "id": "MIT" } }],
+      "externalReferences": [{ "type": "vcs", "url": "https://github.com/intel/libvpl" }]
+    },
+    {
+      "type": "library",
+      "name": "FFmpeg",
+      "version": "7.x/8.x (system-provided on Linux; replaceable DLLs bundled with the Windows packages)",
+      "description": "Dynamically linked libav* decode/encode; LGPL notice at packaging/windows/licenses/FFmpeg-LGPL-NOTICE.txt",
+      "licenses": [{ "license": { "id": "LGPL-2.1-or-later" } }],
+      "externalReferences": [{ "type": "website", "url": "https://ffmpeg.org" }]
+    },
+    {
+      "type": "library",
+      "name": "SDL3",
+      "version": "3.x (system-provided or bundled per platform package)",
+      "description": "Windowing/input layer for the desktop clients, dynamically linked",
+      "licenses": [{ "license": { "id": "Zlib" } }],
+      "externalReferences": [{ "type": "vcs", "url": "https://github.com/libsdl-org/SDL" }]
+    },
+    {
+      "type": "application",
+      "name": "VB-CABLE",
+      "version": "redistributed installer, see packaging/windows/install-vbcable.ps1",
+      "description": "Third-party kernel-mode virtual audio driver redistributed with the Windows host; notice at packaging/windows/licenses/VB-CABLE-NOTICE.txt. Planned to be replaced by an attestation-signed first-party driver.",
+      "licenses": [{ "license": { "name": "Proprietary freeware (VB-Audio Software, redistribution permitted per notice)" } }],
+      "externalReferences": [{ "type": "website", "url": "https://vb-audio.com/Cable/" }]
+    },
+    {
+      "type": "application",
+      "name": "punktfunk-gamescope",
+      "version": "upstream gamescope pinned by packaging/nix/gamescope.nix (nixpkgs) or built by packaging/gamescope/build-punktfunk-gamescope.sh, plus 3 local patches from packaging/gamescope/patches/",
+      "description": "Patched gamescope compositor distributed via sysext/Arch/nix channels alongside the host",
+      "licenses": [{ "license": { "id": "BSD-2-Clause" } }],
+      "externalReferences": [{ "type": "vcs", "url": "https://github.com/ValveSoftware/gamescope" }]
+    }
+  ]
+}
