@@ -161,8 +161,11 @@ Two things to know:
 - **On AMD and Intel, HDR follows what the GPU can encode.** The host asks the driver whether it
   can encode your codec at 10 bits and picks the fast path when it can — which current AMD and
   Intel GPUs do for HEVC, and newer ones for AV1 too. On a GPU that declines, the session still
-  streams HDR through a slower path, but the mouse pointer gamescope leaves out of its capture
-  can't be drawn back in there. `punktfunk-host hdr-probe` reports what your box answered.
+  streams HDR through a slower path. That slower path is also the only one that can draw a pointer
+  back into the picture — so on a declining GPU, a *stock* gamescope would cost you the cursor.
+  `punktfunk-gamescope` puts the pointer in the capture itself, which is why it is worth installing
+  even on a box where you never turn HDR on. `punktfunk-host hdr-probe` reports what your box
+  answered, including which side is drawing the cursor.
 
 ## Known limits
 
@@ -170,7 +173,12 @@ These apply to the **Gaming Mode (gamescope)** path only; the desktop path is un
 
 - **gamescope 3.16.22 or newer is required.** Older versions can deadlock during capture. Bazzite's
   and SteamOS's current gamescope is fine; this only bites if you've pinned an old one.
-- **The mouse cursor isn't included in the captured image** — a gamescope limitation for now.
+- **gamescope leaves the mouse cursor out of its captured image.** You still see a pointer: the
+  host reads it separately and draws it into every frame. That costs a full pass over the picture,
+  and on the fastest encode paths it cannot be done at all (see the AMD/Intel note above).
+  `punktfunk-gamescope` fixes it at the source — that build paints the pointer straight into the
+  capture, so the host stops redrawing it and the frame reaches the encoder untouched. Nothing to
+  configure; installing the build is enough, HDR or not.
 - **Touch arrives as a single-finger pointer.** gamescope's virtual input device has no
   touchscreen, so the host maps a client's touchscreen to an absolute pointer: taps click exactly
   where you touch and drags work, but multi-touch gestures (pinch) aren't available in Gaming
