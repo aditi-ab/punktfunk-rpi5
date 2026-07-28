@@ -5,6 +5,8 @@
 use super::style::*;
 use super::{Screen, Svc};
 use crate::probe::run_speed_probe;
+use crate::trust::KnownHosts;
+use pf_client_core::profiles::ProfilesFile;
 use windows_reactor::*;
 
 /// Speed-test lifecycle. Held as ROOT state (the probe worker completes it via
@@ -122,17 +124,54 @@ pub(crate) fn speed_page(props: &SpeedProps, cx: &mut RenderCx) -> Element {
             recommended_kbps,
         } => {
             let recommended_mbps = f64::from(*recommended_kbps) / 1000.0;
+            // A measured bitrate belongs in the layer the TESTED host actually reads it from
+            // (design/client-settings-profiles.md §5.3) — writing the global here is what made
+            // measuring one host re-tune every other one. Resolved the way a connect resolves
+            // it: the one-off this test was started with, else the host's binding.
+            let target = ctx.shared.target.lock().unwrap().clone();
+            let bound = KnownHosts::load()
+                .hosts
+                .iter()
+                .find(|h| h.addr == target.addr && h.port == target.port)
+                .and_then(|h| h.profile_id.clone());
+            let profile = match target.profile.as_deref() {
+                Some("") => None,
+                Some(id) => Some(id.to_string()),
+                None => bound,
+            }
+            .and_then(|reference| ProfilesFile::load().resolve(&reference).0.cloned());
             let apply_btn = {
                 let (ctx, ss, kbps) = (ctx.clone(), set_screen.clone(), *recommended_kbps);
-                button(format!("Use {recommended_mbps:.0} Mb/s"))
-                    .accent()
-                    .icon(Symbol::Accept)
-                    .on_click(move || {
-                        let mut s = ctx.settings.lock().unwrap();
-                        s.bitrate_kbps = kbps;
-                        s.save();
-                        ss.call(Screen::Hosts);
-                    })
+                let profile = profile.clone();
+                button(match &profile {
+                    Some(p) => format!(
+                        "Set {recommended_mbps:.0} Mb/s in \u{201c}{}\u{201d}",
+                        p.name
+                    ),
+                    None => format!("Use {recommended_mbps:.0} Mb/s"),
+                })
+                .accent()
+                .icon(Symbol::Accept)
+                .on_click(move || {
+                    match &profile {
+                        Some(p) => {
+                            let mut catalog = ProfilesFile::load();
+                            if let Some(slot) = catalog.profiles.iter_mut().find(|x| x.id == p.id) {
+                                slot.overrides.bitrate_kbps = Some(kbps);
+                                if let Err(e) = catalog.save() {
+                                    tracing::warn!(error = %format!("{e:#}"),
+                                        "saving the measured bitrate");
+                                }
+                            }
+                        }
+                        None => {
+                            let mut s = ctx.settings.lock().unwrap();
+                            s.bitrate_kbps = kbps;
+                            s.save();
+                        }
+                    }
+                    ss.call(Screen::Hosts);
+                })
             };
             let results = card(
                 vstack((

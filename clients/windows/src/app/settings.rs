@@ -204,6 +204,56 @@ fn commit(ctx: &Arc<AppCtx>, scope: &str, edit: impl FnOnce(&mut Settings)) {
     }
 }
 
+/// Which tier-P rows the profile in scope overrides. Plain bools rather than a lookup so the
+/// call sites read as `over.codec` — the row and its flag stay visibly paired.
+#[derive(Default)]
+struct OverrideFlags {
+    resolution: bool,
+    refresh_hz: bool,
+    render_scale: bool,
+    bitrate_kbps: bool,
+    codec: bool,
+    hdr_enabled: bool,
+    compositor: bool,
+    audio_channels: bool,
+    mic_enabled: bool,
+    touch_mode: bool,
+    mouse_mode: bool,
+    invert_scroll: bool,
+    inhibit_shortcuts: bool,
+    gamepad: bool,
+    stats_verbosity: bool,
+    fullscreen_on_stream: bool,
+}
+
+impl OverrideFlags {
+    fn of(profile: Option<&StreamProfile>) -> OverrideFlags {
+        let Some(o) = profile.map(|p| &p.overrides) else {
+            return OverrideFlags::default();
+        };
+        OverrideFlags {
+            // One control drives the width/height/match-window tri-state, so any of the three
+            // marks the row.
+            resolution: o.width.is_some() || o.height.is_some() || o.match_window.is_some(),
+            refresh_hz: o.refresh_hz.is_some(),
+            render_scale: o.render_scale.is_some(),
+            bitrate_kbps: o.bitrate_kbps.is_some(),
+            codec: o.codec.is_some(),
+            hdr_enabled: o.hdr_enabled.is_some(),
+            compositor: o.compositor.is_some(),
+            audio_channels: o.audio_channels.is_some(),
+            mic_enabled: o.mic_enabled.is_some(),
+            touch_mode: o.touch_mode.is_some(),
+            mouse_mode: o.mouse_mode.is_some(),
+            invert_scroll: o.invert_scroll.is_some(),
+            inhibit_shortcuts: o.inhibit_shortcuts.is_some(),
+            gamepad: o.gamepad.is_some(),
+            stats_verbosity: o.stats_verbosity.is_some(),
+            fullscreen_on_stream: o.fullscreen_on_stream.is_some(),
+        }
+    }
+}
+
 /// The layer the settings screen is editing, resolved for display: `None` = the defaults.
 fn active_profile(scope: &str) -> Option<StreamProfile> {
     (!scope.is_empty())
@@ -261,6 +311,52 @@ fn setting_toggle(
 /// but a caption under it reads as a caption, which is how every Windows Settings page and
 /// the Apple client both do it. Width-capped for the same reason Apple caps at 360pt: a
 /// full-width caption runs into the control column and the whole cell reads as one block.
+/// [`described`], plus the override marker and reset a profile-scope row carries: the caption
+/// says the profile changes this one, and the button is the only way back to inheriting —
+/// overrides are recorded on touch and never inferred from a value comparison, so "not
+/// overridden" needs an explicit act.
+fn described_overridable(
+    rev: (u64, &AsyncSetState<u64>),
+    scope: &str,
+    field: &'static str,
+    overridden: bool,
+    control: impl Into<Element>,
+    caption: &str,
+) -> Element {
+    if scope.is_empty() || !overridden {
+        return described(control, caption);
+    }
+    let (rev, set_rev) = (rev.0, rev.1.clone());
+    let scope = scope.to_string();
+    vstack((
+        control.into(),
+        hstack((
+            text_block(format!("\u{25cf} Overridden here \u{00b7} {caption}"))
+                .font_size(12.0)
+                .foreground(ThemeRef::AccentText)
+                .wrap()
+                .max_width(360.0)
+                .horizontal_alignment(HorizontalAlignment::Left),
+            button("Reset").on_click(move || {
+                let mut catalog = ProfilesFile::load();
+                if let Some(p) = catalog.profiles.iter_mut().find(|p| p.id == scope) {
+                    p.overrides.clear(field);
+                    if let Err(e) = catalog.save() {
+                        tracing::warn!(error = %format!("{e:#}"), "clearing an override");
+                    }
+                }
+                // The catalog changed behind the controls, and nothing the page reads as
+                // state did — bump the revision so the row re-renders showing the inherited
+                // value again.
+                set_rev.call(rev + 1);
+            }),
+        ))
+        .spacing(8.0),
+    ))
+    .spacing(5.0)
+    .into()
+}
+
 fn described(control: impl Into<Element>, caption: &str) -> Element {
     vstack((
         control.into(),
@@ -329,6 +425,8 @@ pub(crate) fn settings_page(
     set_scope: &AsyncSetState<String>,
     delete_pending: &Option<String>,
     set_delete: &AsyncSetState<Option<String>>,
+    rev: u64,
+    set_rev: &AsyncSetState<u64>,
     progress: f64,
 ) -> Element {
     // The layer being edited. A scope pointing at a deleted profile degrades to the defaults,
@@ -339,8 +437,12 @@ pub(crate) fn settings_page(
         None => "",
     };
     let profile_mode = active.is_some();
-    // Every control shows the EFFECTIVE value: the global underneath with this profile's
-    // overrides on top, so a row the profile doesn't override reads as the live global.
+    // Which rows this profile overrides — the marker + reset each of them carries. In the
+    // defaults scope nothing is marked, and `described_overridable` degrades to `described`.
+    let over = OverrideFlags::of(active.as_ref());
+    let _ = rev; // read via the closures below; the value itself only forces the re-render
+                 // Every control shows the EFFECTIVE value: the global underneath with this profile's
+                 // overrides on top, so a row the profile doesn't override reads as the live global.
     let s = {
         let base = ctx.settings.lock().unwrap().clone();
         match &active {
@@ -602,14 +704,22 @@ pub(crate) fn settings_page(
             let mut out = group(
                 Some("Resolution"),
                 vec![
-                    described(
+                    described_overridable(
+                        (rev, set_rev),
+                        scope,
+                        "resolution",
+                        over.resolution,
                         res_combo,
                         "The host drives a real virtual output at exactly this size \u{2014} true \
                          pixels, no scaling. \u{201C}Native display\u{201D} follows the monitor this \
                          window is on; \u{201C}Match window\u{201D} keeps the picture pixel-exact \
                          (1:1) through every resize.",
                     ),
-                    described(
+                    described_overridable(
+                        (rev, set_rev),
+                        scope,
+                        "refresh_hz",
+                        over.refresh_hz,
                         hz_combo,
                         "\u{201C}Native\u{201D} resolves to this display\u{2019}s refresh rate at \
                          connect.",
@@ -620,24 +730,40 @@ pub(crate) fn settings_page(
             out.extend(group(
                 Some("Quality"),
                 vec![
-                    described(
+                    described_overridable(
+                        (rev, set_rev),
+                        scope,
+                        "render_scale",
+                        over.render_scale,
                         scale_combo,
                         "Above native supersamples for sharpness; below renders lighter on the \
                          host and the link. This device resamples the result to the window.",
                     ),
-                    described(
+                    described_overridable(
+                        (rev, set_rev),
+                        scope,
+                        "bitrate_kbps",
+                        over.bitrate_kbps,
                         bitrate_box,
                         "0 lets the host decide (its default, clamped to what it supports). A \
                          host card\u{2019}s context menu has a network speed test.",
                     ),
-                    described(
+                    described_overridable(
+                        (rev, set_rev),
+                        scope,
+                        "codec",
+                        over.codec,
                         codec_combo,
                         "A preference \u{2014} the host falls back if it can\u{2019}t encode it. \
                          PyroWave is the low-latency wavelet codec for a WIRED link: it trades \
                          bitrate (hundreds of Mb/s) for near-zero decode time, so it wants \
                          gigabit Ethernet.",
                     ),
-                    described(
+                    described_overridable(
+                        (rev, set_rev),
+                        scope,
+                        "hdr_enabled",
+                        over.hdr_enabled,
                         hdr_toggle,
                         "HDR10, when the host has HDR content and this display supports it. \
                          HEVC only; otherwise the stream stays SDR.",
@@ -670,7 +796,11 @@ pub(crate) fn settings_page(
             ));
             out.extend(group(
                 Some("Host output"),
-                vec![described(
+                vec![described_overridable(
+                    (rev, set_rev),
+                    scope,
+                    "compositor",
+                    over.compositor,
                     comp_combo,
                     "The backend the host uses for its virtual output (Linux hosts only). A \
                      specific choice falls back to auto-detection when that backend \
@@ -684,7 +814,11 @@ pub(crate) fn settings_page(
         "input" => {
             let mut out = group(
                 Some("Touch & pointer"),
-                vec![described(
+                vec![described_overridable(
+                    (rev, set_rev),
+                    scope,
+                    "touch_mode",
+                    over.touch_mode,
                     touch_combo,
                     "How a touchscreen drives the host: Trackpad moves the host cursor like a \
                      laptop trackpad (tap to click), Direct pointer jumps the cursor to wherever \
@@ -695,19 +829,31 @@ pub(crate) fn settings_page(
             out.extend(group(
                 Some("Keyboard & mouse"),
                 vec![
-                    described(
+                    described_overridable(
+                        (rev, set_rev),
+                        scope,
+                        "mouse_mode",
+                        over.mouse_mode,
                         mouse_combo,
                         "Capture locks the pointer to the stream and sends relative motion — \
                          best for games. Desktop leaves the pointer free to enter and leave \
                          the stream and sends absolute positions — best for remote desktop \
                          work. Ctrl+Alt+Shift+M switches live.",
                     ),
-                    described(
+                    described_overridable(
+                        (rev, set_rev),
+                        scope,
+                        "inhibit_shortcuts",
+                        over.inhibit_shortcuts,
                         shortcuts_toggle,
                         "Alt+Tab, the Windows key and friends reach the host while the stream \
                          has input captured. Off, they act on this machine instead.",
                     ),
-                    described(
+                    described_overridable(
+                        (rev, set_rev),
+                        scope,
+                        "invert_scroll",
+                        over.invert_scroll,
                         invert_scroll_toggle,
                         "Reverses the wheel and trackpad scroll direction sent to the host.",
                     ),
@@ -732,7 +878,11 @@ pub(crate) fn settings_page(
                          one to force single-player \u{2014} only it reaches the host.",
                     )
                     }),
-                    Some(described(
+                    Some(described_overridable(
+                        (rev, set_rev),
+                        scope,
+                        "gamepad",
+                        over.gamepad,
                         pad_combo,
                         "The virtual pad created on the host. Automatic matches your controller \
                          \u{2014} a DualSense keeps adaptive triggers, lightbar, touchpad and \
@@ -750,12 +900,20 @@ pub(crate) fn settings_page(
             group(
                 None,
                 vec![
-                    described(
+                    described_overridable(
+                        (rev, set_rev),
+                        scope,
+                        "audio_channels",
+                        over.audio_channels,
                         channels_combo,
                         "The speaker layout requested from the host. It downmixes if its own \
                          output has fewer channels.",
                     ),
-                    described(
+                    described_overridable(
+                        (rev, set_rev),
+                        scope,
+                        "mic_enabled",
+                        over.mic_enabled,
                         mic_toggle,
                         "This device\u{2019}s microphone feeds the host\u{2019}s virtual mic.",
                     ),
@@ -775,7 +933,11 @@ pub(crate) fn settings_page(
         _ => {
             let mut out = group(
                 Some("Session"),
-                vec![described(
+                vec![described_overridable(
+                    (rev, set_rev),
+                    scope,
+                    "fullscreen_on_stream",
+                    over.fullscreen_on_stream,
                     fullscreen_toggle,
                     "Go fullscreen when a session starts; F11 or Alt+Enter switches back \
                          live.",
@@ -796,7 +958,11 @@ pub(crate) fn settings_page(
             );
             out.extend(group(
                 Some("Statistics"),
-                vec![described(
+                vec![described_overridable(
+                    (rev, set_rev),
+                    scope,
+                    "stats_verbosity",
+                    over.stats_verbosity,
                     hud_combo,
                     "Live session stats in a corner overlay \u{2014} Compact is a one-line pill, \
                      Detailed adds the latency stage breakdown. Ctrl+Alt+Shift+S cycles the \

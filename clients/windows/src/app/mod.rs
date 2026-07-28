@@ -255,6 +255,10 @@ fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
     // The profile a Delete… click is asking about; `Some` renders the confirmation. Root state
     // because this page stays hook-free (its handlers are wired in the reactor backend).
     let (settings_delete, set_settings_delete) = cx.use_async_state(Option::<String>::None);
+    // Bumped when a settings edit changes what the page should SHOW without changing any state
+    // it already reads — resetting an override, which rewrites the catalog behind the controls.
+    // Root state comparison makes same-value calls free, so a counter is what forces the pass.
+    let (settings_rev, set_settings_rev) = cx.use_async_state(0u64);
     // Connected-controller count, mirrored from the gamepad service by a poll thread
     // (thread-driven state must be root state — see the module docs). Drives the hosts
     // page's "Open console UI" hint; the compare in `call` makes the steady state free.
@@ -505,6 +509,8 @@ fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
             &set_settings_scope,
             &settings_delete,
             &set_settings_delete,
+            settings_rev,
+            &set_settings_rev,
             nav_progress,
         ),
         Screen::Licenses => licenses::licenses_page(&set_screen),
