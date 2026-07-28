@@ -7,6 +7,7 @@ use super::style::*;
 use super::{AppCtx, Screen, Svc, Target};
 use crate::discovery::DiscoveredHost;
 use crate::trust::{self, KnownHost, KnownHosts};
+use pf_client_core::orchestrate::{WakeOutcome, WakeWait};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -418,15 +419,19 @@ pub(crate) fn request_access(props: &Svc, target: &Target) {
 /// longer to POST/boot/re-advertise than a connect attempt will sit). On reappearance we dial it
 /// (re-keying the saved host when it came back on a new IP); on timeout or Cancel we return to
 /// the host list.
+///
+/// The cadence is [`WakeWait`], shared with the GTK shell and ported from Apple's `HostWaker`
+/// (design/client-architecture-split.md §3) — the comment this function used to carry ("mirrors
+/// the Apple HostWaker") is now literally true instead of aspirational.
 fn wake_and_connect(
     ctx: &Arc<AppCtx>,
     target: Target,
     set_screen: &AsyncSetState<Screen>,
     set_status: &AsyncSetState<String>,
 ) {
-    // First packet now; the poll loop re-sends every RESEND_SECS (a single one can be missed, and
-    // some NICs only wake on a fresh packet after dropping into a deeper sleep state).
-    crate::wol::wake(&target.mac, target.addr.parse().ok());
+    // The packets are the wait's business: `WakeWait` asks for one on its first tick and every
+    // 6 s after (a single one can be missed, and some NICs only wake on a fresh packet after
+    // dropping into a deeper sleep state).
     // A fresh cancel flag per wake, installed where the "Waking…" screen's Cancel button reads it
     // back (the same shared channel as the request-access flow); the poll loop checks the same `Arc`.
     let cancel = Arc::new(AtomicBool::new(false));
@@ -438,12 +443,9 @@ fn wake_and_connect(
 
     let (ctx, ss, st) = (ctx.clone(), set_screen.clone(), set_status.clone());
     std::thread::spawn(move || {
-        // Generous — a cold boot + service start can be a minute-plus; re-send periodically.
-        const TIMEOUT_SECS: u64 = 90;
-        const RESEND_SECS: u64 = 6;
         let rx = crate::discovery::browse();
         let mut seen: Vec<DiscoveredHost> = Vec::new();
-        let mut elapsed: u64 = 0;
+        let mut wait = WakeWait::new();
         loop {
             // Cancel already returned the UI to the host list — stop re-sending and tear down.
             if cancel.load(Ordering::SeqCst) {
@@ -465,40 +467,46 @@ fn wake_and_connect(
                     _ => h.addr == target.addr && h.port == target.port,
                 })
                 .map(|h| (h.addr.clone(), h.port));
-            if let Some((addr, port)) = resolved {
-                let mut target = target.clone();
-                // Came back on a new IP (DHCP): dial the fresh address and re-key the saved host so
-                // the pin stays reachable next time (keyed by fingerprint; addr/port overwritten,
-                // `paired`/`mac` preserved by `upsert`).
-                if addr != target.addr || port != target.port {
-                    target.addr = addr;
-                    target.port = port;
-                    if let Some(fp) = target.fp_hex.clone() {
-                        let mut k = KnownHosts::load();
-                        k.upsert(KnownHost {
-                            name: target.name.clone(),
-                            addr: target.addr.clone(),
-                            port: target.port,
-                            fp_hex: fp,
-                            mac: target.mac.clone(),
-                            ..Default::default()
-                        });
-                        let _ = k.save();
-                    }
-                }
-                initiate(&ctx, target, &ss, &st);
-                return;
-            }
-            if elapsed >= TIMEOUT_SECS {
-                st.call("The host didn't come online.".to_string());
-                ss.call(Screen::Hosts);
-                return;
-            }
-            std::thread::sleep(Duration::from_secs(1));
-            elapsed += 1;
-            if elapsed % RESEND_SECS == 0 {
+
+            let tick = wait.tick(resolved.is_some());
+            if tick.send_packet {
                 crate::wol::wake(&target.mac, target.addr.parse().ok());
             }
+            match tick.outcome {
+                Some(WakeOutcome::Online) => {
+                    let mut target = target.clone();
+                    // Came back on a new IP (DHCP): dial the fresh address and re-key the saved
+                    // host so the pin stays reachable next time (keyed by fingerprint;
+                    // addr/port overwritten, `paired`/`mac` preserved by `upsert`).
+                    if let Some((addr, port)) =
+                        resolved.filter(|(a, p)| *a != target.addr || *p != target.port)
+                    {
+                        target.addr = addr;
+                        target.port = port;
+                        if let Some(fp) = target.fp_hex.clone() {
+                            let mut k = KnownHosts::load();
+                            k.upsert(KnownHost {
+                                name: target.name.clone(),
+                                addr: target.addr.clone(),
+                                port: target.port,
+                                fp_hex: fp,
+                                mac: target.mac.clone(),
+                                ..Default::default()
+                            });
+                            let _ = k.save();
+                        }
+                    }
+                    initiate(&ctx, target, &ss, &st);
+                    return;
+                }
+                Some(WakeOutcome::TimedOut) => {
+                    st.call("The host didn't come online.".to_string());
+                    ss.call(Screen::Hosts);
+                    return;
+                }
+                None => {}
+            }
+            std::thread::sleep(Duration::from_secs(1));
         }
     });
 }

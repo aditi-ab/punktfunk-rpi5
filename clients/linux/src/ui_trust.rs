@@ -9,6 +9,7 @@ use crate::trust;
 use crate::ui_hosts::ConnectRequest;
 use adw::prelude::*;
 use gtk::glib;
+use pf_client_core::orchestrate::{WakeOutcome, WakeWait};
 use relm4::prelude::*;
 
 /// Wake-and-wait: the FALLBACK after a failed dial to a non-advertising saved host with a
@@ -16,7 +17,11 @@ use relm4::prelude::*;
 /// sent a magic packet, then we poll mDNS until it comes back online — re-sending every few
 /// seconds up to a timeout — and route back into the trust gate, **re-keying the saved
 /// record if the host woke on a new DHCP IP** (matched by fingerprint). A "Waking…" dialog
-/// lets the user cancel. Mirrors the Apple/Android `HostWaker` (90 s budget, resend every 6 s).
+/// lets the user cancel.
+///
+/// The cadence itself is [`WakeWait`] — the same state machine the WinUI shell drives, ported
+/// from Apple's `HostWaker` (design/client-architecture-split.md §3). What is left here is the
+/// GTK half: the dialog, the advert drain, the re-key, and the route back into the trust gate.
 pub fn wake_and_connect(
     window: &adw::ApplicationWindow,
     sender: &ComponentSender<AppModel>,
@@ -40,23 +45,17 @@ pub fn wake_and_connect(
 
     let sender = sender.clone();
     glib::spawn_future_local(async move {
-        use std::time::{Duration, Instant};
+        use std::time::Duration;
         let events = crate::discovery::browse();
-        let started = Instant::now();
-        let budget = Duration::from_secs(90);
-        let resend = Duration::from_secs(6);
-        crate::wol::wake(&req.mac, req.addr.parse().ok());
-        let mut last_wake = Instant::now();
+        let mut wait = WakeWait::new();
         loop {
             if cancel.get() {
                 waiting.close();
                 return;
             }
-            if last_wake.elapsed() >= resend {
-                crate::wol::wake(&req.mac, req.addr.parse().ok());
-                last_wake = Instant::now();
-            }
-            // Drain resolved adverts; a match (fingerprint, else addr:port) = it's up.
+            // Drain resolved adverts; a match (fingerprint, else addr:port) means it is up,
+            // and carries the address it came back on.
+            let mut seen: Option<(String, u16)> = None;
             while let Ok(ev) = events.try_recv() {
                 let crate::discovery::DiscoveryEvent::Resolved(h) = ev else {
                     continue;
@@ -66,30 +65,42 @@ pub fn wake_and_connect(
                     None => h.addr == req.addr && h.port == req.port,
                 };
                 if matched {
+                    seen = Some((h.addr, h.port));
+                }
+            }
+            let tick = wait.tick(seen.is_some());
+            if tick.send_packet {
+                crate::wol::wake(&req.mac, req.addr.parse().ok());
+            }
+            match tick.outcome {
+                Some(WakeOutcome::Online) => {
                     waiting.close();
                     let mut req = req.clone();
                     // Re-key on a new DHCP lease so this + future connects dial the
                     // live address.
-                    if h.addr != req.addr || h.port != req.port {
+                    if let Some((addr, port)) =
+                        seen.filter(|(a, p)| *a != req.addr || *p != req.port)
+                    {
                         if let Some(fp) = &req.fp_hex {
-                            trust::rekey_addr(fp, &h.addr, h.port);
+                            trust::rekey_addr(fp, &addr, port);
                         }
-                        req.addr = h.addr;
-                        req.port = h.port;
+                        req.addr = addr;
+                        req.port = port;
                     }
                     sender.input(AppMsg::Connect(req));
                     return;
                 }
+                Some(WakeOutcome::TimedOut) => {
+                    waiting.close();
+                    sender.input(AppMsg::Toast(format!(
+                        "Couldn't reach “{}” — is it powered and on the network?",
+                        req.name
+                    )));
+                    return;
+                }
+                None => {}
             }
-            if started.elapsed() >= budget {
-                waiting.close();
-                sender.input(AppMsg::Toast(format!(
-                    "Couldn't reach “{}” — is it powered and on the network?",
-                    req.name
-                )));
-                return;
-            }
-            glib::timeout_future(Duration::from_millis(500)).await;
+            glib::timeout_future(Duration::from_secs(1)).await;
         }
     });
 }
