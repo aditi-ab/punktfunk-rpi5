@@ -517,6 +517,28 @@ pub(super) unsafe fn build_parameters_h265(
         sps.conf_win_bottom_offset = (h - rh) / 2; // 4:2:0 SubHeightC = 2
     }
 
+    // Colour signalling. This backend's CSC (`rgb2yuv.comp`) is BT.709 LIMITED 8-bit and nothing
+    // else — `open_amd_intel` routes every HDR session to VAAPI precisely because this path
+    // hardcodes it — so the SPS can state it as a constant. Without the VUI the stream is
+    // "unspecified" and each decoder applies its own default: the punktfunk clients fall back to
+    // BT.709 (`pf_client_core::video_color::csc_rows`), but vendor TV decoders guess from
+    // RESOLUTION — an LG webOS panel reads a 4K SDR stream as BT.2020 and renders it visibly
+    // washed out. Every sibling backend (NVENC `nvenc_core.rs`, VAAPI, QSV, the Windows libav
+    // path) already signals this triplet; this one was the hole.
+    //
+    // `vui` must outlive `create_video_session_parameters_khr` below — it does, `sps_arr` only
+    // copies the pointer and both live to the end of this function.
+    let mut vui: hh::StdVideoH265SequenceParameterSetVui = std::mem::zeroed();
+    vui.flags.set_video_signal_type_present_flag(1);
+    vui.flags.set_video_full_range_flag(0); // limited/studio swing (16-235 luma)
+    vui.flags.set_colour_description_present_flag(1);
+    vui.video_format = 5; // unspecified — the CICP triplet below is what matters
+    vui.colour_primaries = 1; // BT.709
+    vui.transfer_characteristics = 1; // BT.709
+    vui.matrix_coeffs = 1; // BT.709
+    sps.flags.set_vui_parameters_present_flag(1);
+    sps.pSequenceParameterSetVui = &vui;
+
     let mut pps: hh::StdVideoH265PictureParameterSet = std::mem::zeroed();
     pps.flags.set_cu_qp_delta_enabled_flag(1);
     pps.flags.set_pps_loop_filter_across_slices_enabled_flag(1);
@@ -703,10 +725,19 @@ fn av1_sequence_header_obu(
     w.bit(0); // enable_superres
     w.bit(0); // enable_cdef
     w.bit(0); // enable_restoration
-              // color_config(): 8-bit 4:2:0, unspecified primaries/transfer/matrix, limited range
+              // color_config() (AV1 spec §5.5.2): 8-bit 4:2:0, BT.709 limited — the CSC this
+              // backend's `rgb2yuv.comp` actually performs. AV1 has no VUI, so the CICP triplet
+              // lives here; omitting it (color_description_present_flag = 0) left the stream
+              // "unspecified" and vendor TV decoders guess colorimetry from resolution.
+              // CP_BT_709/TC_BT_709/MC_BT_709 avoids the spec's sRGB special case (which would
+              // force color_range = 1 and drop the explicit range bit), so the field order below
+              // is the same as the unspecified form plus the three CICP bytes.
     w.bit(0); // high_bitdepth
     w.bit(0); // mono_chrome
-    w.bit(0); // color_description_present_flag
+    w.bit(1); // color_description_present_flag
+    w.put(1, 8); // color_primaries = CP_BT_709
+    w.put(1, 8); // transfer_characteristics = TC_BT_709
+    w.put(1, 8); // matrix_coefficients = MC_BT_709
     w.bit(0); // color_range (studio/limited)
     w.put(0, 2); // chroma_sample_position = CSP_UNKNOWN (subsampling_x==subsampling_y==1 for profile 0)
     w.bit(0); // separate_uv_delta_q
@@ -747,18 +778,21 @@ pub(super) unsafe fn build_parameters_av1(
     let seq_level_idx = max_level; // StdVideoAV1Level's numeric value IS the AV1 seq_level_idx
 
     // ---- Std sequence header (must match the OBU packed below) ----
+    // BT.709 limited, mirroring the `color_config()` bits `av1_sequence_header_obu` packs — the two
+    // MUST stay identical or the driver's frame OBUs parse against a header we didn't write.
+    // `color_range` stays 0 (studio swing); only the description flag + CICP triplet change.
     let mut cc_flags: hh::StdVideoAV1ColorConfigFlags = std::mem::zeroed();
-    let _ = &mut cc_flags; // all zero: mono_chrome/color_range/description/separate_uv_delta_q = 0
+    cc_flags.set_color_description_present_flag(1);
     let mut cc: hh::StdVideoAV1ColorConfig = std::mem::zeroed();
     cc.flags = cc_flags;
     cc.BitDepth = 8;
     cc.subsampling_x = 1;
     cc.subsampling_y = 1;
-    cc.color_primaries = hh::StdVideoAV1ColorPrimaries_STD_VIDEO_AV1_COLOR_PRIMARIES_BT_UNSPECIFIED;
+    cc.color_primaries = hh::StdVideoAV1ColorPrimaries_STD_VIDEO_AV1_COLOR_PRIMARIES_BT_709;
     cc.transfer_characteristics =
-        hh::StdVideoAV1TransferCharacteristics_STD_VIDEO_AV1_TRANSFER_CHARACTERISTICS_UNSPECIFIED;
+        hh::StdVideoAV1TransferCharacteristics_STD_VIDEO_AV1_TRANSFER_CHARACTERISTICS_BT_709;
     cc.matrix_coefficients =
-        hh::StdVideoAV1MatrixCoefficients_STD_VIDEO_AV1_MATRIX_COEFFICIENTS_UNSPECIFIED;
+        hh::StdVideoAV1MatrixCoefficients_STD_VIDEO_AV1_MATRIX_COEFFICIENTS_BT_709;
     cc.chroma_sample_position =
         hh::StdVideoAV1ChromaSamplePosition_STD_VIDEO_AV1_CHROMA_SAMPLE_POSITION_UNKNOWN;
 
@@ -833,4 +867,124 @@ pub(super) unsafe fn build_parameters_av1(
     let mut keyframe_prefix = td.clone();
     keyframe_prefix.extend_from_slice(&seq_obu);
     Ok((params, keyframe_prefix, td))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Walks a bit-packed AV1 sequence header field-by-field (spec §5.5.1 order, for the fixed
+    /// configuration `av1_sequence_header_obu` emits) and returns the `color_config()` values.
+    /// Deliberately an INDEPENDENT walk rather than a mirror of the writer: it is the only thing
+    /// that catches a field width or ordering change upstream of `color_config`, which would leave
+    /// the colour bits parsing at the wrong offset — the exact desync the module doc warns about.
+    fn read_color_config(
+        obu: &[u8],
+        fwb: u32,
+        fhb: u32,
+        seq_level_idx: u32,
+    ) -> (u8, u8, u8, u8, u8) {
+        // obu_header (1 byte) + leb128 size — the payload starts after both.
+        assert_eq!(
+            obu[0], 0x0a,
+            "obu_header: OBU_SEQUENCE_HEADER + has_size_field"
+        );
+        let mut i = 1;
+        while obu[i] & 0x80 != 0 {
+            i += 1;
+        }
+        let payload = &obu[i + 1..];
+
+        let mut pos = 0usize;
+        let mut take = |bits: u32| -> u32 {
+            let mut v = 0u32;
+            for _ in 0..bits {
+                let byte = payload[pos / 8];
+                v = (v << 1) | u32::from((byte >> (7 - (pos % 8))) & 1);
+                pos += 1;
+            }
+            v
+        };
+
+        assert_eq!(take(3), 0, "seq_profile = MAIN");
+        take(1); // still_picture
+        assert_eq!(take(1), 0, "reduced_still_picture_header");
+        assert_eq!(take(1), 0, "timing_info_present_flag");
+        assert_eq!(take(1), 0, "initial_display_delay_present_flag");
+        assert_eq!(take(5), 0, "operating_points_cnt_minus_1");
+        take(12); // operating_point_idc[0]
+        assert_eq!(take(5), seq_level_idx, "seq_level_idx[0]");
+        if seq_level_idx > 7 {
+            take(1); // seq_tier[0]
+        }
+        assert_eq!(take(4), fwb, "frame_width_bits_minus_1");
+        assert_eq!(take(4), fhb, "frame_height_bits_minus_1");
+        take(fwb + 1); // max_frame_width_minus_1
+        take(fhb + 1); // max_frame_height_minus_1
+        take(1); // frame_id_numbers_present_flag
+        take(1); // use_128x128_superblock
+        take(1); // enable_filter_intra
+        take(1); // enable_intra_edge_filter
+        take(1); // enable_interintra_compound
+        take(1); // enable_masked_compound
+        take(1); // enable_warped_motion
+        take(1); // enable_dual_filter
+        let order_hint = take(1); // enable_order_hint
+        assert_eq!(
+            order_hint, 1,
+            "enable_order_hint (our single-ref P-frame config)"
+        );
+        take(1); // enable_jnt_comp
+        take(1); // enable_ref_frame_mvs
+        assert_eq!(take(1), 1, "seq_choose_screen_content_tools = SELECT");
+        // seq_force_screen_content_tools = SELECT (> 0), so seq_choose_integer_mv is present.
+        assert_eq!(take(1), 1, "seq_choose_integer_mv = SELECT");
+        take(3); // order_hint_bits_minus_1
+        take(1); // enable_superres
+        take(1); // enable_cdef
+        take(1); // enable_restoration
+
+        // color_config()
+        assert_eq!(take(1), 0, "high_bitdepth (8-bit)");
+        assert_eq!(take(1), 0, "mono_chrome");
+        let described = take(1) as u8;
+        let (cp, tc, mc) = if described == 1 {
+            (take(8) as u8, take(8) as u8, take(8) as u8)
+        } else {
+            (2, 2, 2) // CICP "unspecified"
+        };
+        let range = take(1) as u8;
+        take(2); // chroma_sample_position
+        assert_eq!(take(1), 0, "separate_uv_delta_q");
+        assert_eq!(take(1), 0, "film_grain_params_present");
+        assert_eq!(take(1), 1, "trailing_one_bit");
+        (described, cp, tc, mc, range)
+    }
+
+    /// The sequence header must SIGNAL BT.709 limited — the CSC `rgb2yuv.comp` actually performs.
+    /// An unsignalled ("unspecified") AV1 stream makes vendor TV decoders guess colorimetry from
+    /// resolution: an LG webOS panel reads 4K SDR as BT.2020 and renders it washed out.
+    ///
+    /// The values here must equal the `StdVideoAV1ColorConfig` in `build_parameters_av1` — the
+    /// driver packs its frame OBUs against that struct while clients parse this header, so a
+    /// mismatch desyncs every inter frame.
+    #[test]
+    fn av1_sequence_header_signals_bt709_limited() {
+        // 1920x1080: av_log2 gives 10/10 frame-size bits; level 4.0 (seq_level_idx 8) exercises
+        // the seq_tier branch, and sb128 both ways since it sits above color_config.
+        for (sb128, level) in [(false, 8u32), (true, 5u32)] {
+            let obu = av1_sequence_header_obu(sb128, 10, 10, 1919, 1079, 7, level);
+            let (described, cp, tc, mc, range) = read_color_config(&obu, 10, 10, level);
+            assert_eq!(
+                described, 1,
+                "color_description_present_flag (sb128={sb128})"
+            );
+            assert_eq!(
+                (cp, tc, mc),
+                (1, 1, 1),
+                "CICP BT.709 primaries/transfer/matrix"
+            );
+            assert_eq!(range, 0, "color_range = studio/limited swing");
+        }
+    }
 }

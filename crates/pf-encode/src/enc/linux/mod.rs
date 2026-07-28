@@ -345,11 +345,23 @@ impl NvencEncoder {
             };
         }
 
-        // NV12 / 4:4:4 paths: we do the RGB→YUV conversion ourselves as BT.709 (swscale), so
-        // signal that in the bitstream VUI (colorspace/range/primaries/transfer) — otherwise the
-        // client decoder assumes a default and the picture comes out washed-out / wrong-contrast.
-        // The RGB-input 4:2:0 path leaves these unset (NVENC's internal CSC writes its own VUI).
-        // Matches the Windows NV12 path's BT.709 limited-range signalling.
+        // Colour signalling, written for EVERY session (colorspace/range/primaries/transfer) —
+        // otherwise the client decoder assumes a default and the picture comes out washed-out /
+        // wrong-contrast. Matches the Windows NV12 path's BT.709 limited-range signalling.
+        //
+        // The packed-RGB 4:2:0 path used to be excluded, on the belief that "NVENC's internal CSC
+        // writes its own VUI". It does not: libavcodec's nvenc wrapper derives
+        // `colourDescriptionPresentFlag` from these very AVCodecContext fields, so leaving them
+        // UNSPECIFIED produced a stream with NO colour description at all. Every punktfunk client
+        // then falls back to BT.709 (`csc_rows`) and looks fine, but vendor TV decoders guess from
+        // RESOLUTION — an LG webOS panel reads a 4K SDR stream as BT.2020 and washes it out.
+        // BT.709 limited is the honest answer for that path too: NVENC's internal RGB→YUV is the
+        // same conversion both direct-SDK backends feed from an ARGB surface
+        // (`nvenc_cuda.rs`/`windows/nvenc.rs`), and `nvenc_core.rs` already stamps 709-limited on
+        // those unconditionally. This only makes the libav sibling consistent with them.
+        //
+        // Reachable whenever the direct-SDK path is not: a CPU/dmabuf (non-CUDA) capture, a build
+        // without `--features nvenc`, or PUNKTFUNK_NVENC_DIRECT=0.
         //
         // PUNKTFUNK_444_FULLRANGE=1 (experimental, 4:4:4-only): convert AND signal FULL range —
         // recovers the ~12% of code space limited-range quantization gives up, for the exact
@@ -372,7 +384,7 @@ impl NvencEncoder {
                 (*raw).color_primaries = ffi::AVColorPrimaries::AVCOL_PRI_BT2020;
                 (*raw).color_trc = ffi::AVColorTransferCharacteristic::AVCOL_TRC_SMPTE2084;
             }
-        } else if matches!(format, PixelFormat::Nv12) || want_444 {
+        } else {
             // SAFETY: same `video` builder — `raw = video.as_mut_ptr()` is the non-null, properly-
             // aligned, sole-owned, not-yet-opened `AVCodecContext`. We set its four VUI colour enum
             // fields to valid `AVColorSpace`/`AVColorRange`/`AVColorPrimaries`/`AVColorTransfer-

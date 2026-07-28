@@ -3,11 +3,15 @@
 //! no B-frames (Baseline), bitrate rate-control, in-band SPS/PPS each IDR.
 //! Synchronous: `submit` encodes immediately and stashes the AU for `poll` (no internal queue).
 //!
-//! The RGB→YUV conversion is OURS, BT.709 limited range: openh264 writes no colour description
-//! into the VUI (unspecified), so decoders fall back to their default — BT.709 limited on every
-//! punktfunk client — and the pixels must match that default. The crate's own `YUVBuffer`
-//! converter is BT.601 (0.2578/0.5039/0.0977 + 16), which decoded-as-709 is a constant hue
-//! error; that's why it is NOT used here.
+//! The RGB→YUV conversion is OURS, BT.709 limited range, and the SPS VUI says so
+//! ([`VuiConfig::bt709`], applied in `open`). The crate's own `YUVBuffer` converter is BT.601
+//! (0.2578/0.5039/0.0977 + 16), which decoded-as-709 is a constant hue error; that's why it is
+//! NOT used here.
+//!
+//! Signalling is not optional. This used to leave the VUI unwritten and lean on decoders
+//! defaulting to BT.709 limited — true of every punktfunk client (`csc_rows` falls back to 709 on
+//! "unspecified"), but NOT of vendor TV decoders, which guess colorimetry from RESOLUTION: an LG
+//! webOS panel reads a 4K SDR stream as BT.2020 and renders it visibly washed out.
 // Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
 #![deny(clippy::undocumented_unsafe_blocks)]
 
@@ -15,7 +19,7 @@ use super::{EncodedFrame, Encoder};
 use anyhow::{bail, ensure, Context, Result};
 use openh264::encoder::{
     BitRate, Complexity, Encoder as Oh264, EncoderConfig, FrameRate, FrameType, IntraFramePeriod,
-    Profile, RateControlMode, SpsPpsStrategy, UsageType,
+    Profile, RateControlMode, SpsPpsStrategy, UsageType, VuiConfig,
 };
 use openh264::formats::YUVSlices;
 use openh264::OpenH264API;
@@ -100,7 +104,10 @@ impl OpenH264Encoder {
             .scene_change_detect(false) // no surprise IDRs (bitrate spikes / freeze)
             .adaptive_quantization(true)
             .complexity(Complexity::Low) // latency over BD-rate
-            .profile(Profile::Baseline); // no B-frames; the VUI carries no colour description
+            .profile(Profile::Baseline) // no B-frames
+            // video_signal_type + colour_description in the SPS VUI: BT.709 primaries/transfer/
+            // matrix, video_full_range_flag = 0 — exactly what `convert_bt709` below produces.
+            .vui(VuiConfig::bt709());
         let api = OpenH264API::from_source(); // statically-bundled build (default `source` feature)
         let enc = Oh264::with_api_config(api, cfg).context("openh264 Encoder::with_api_config")?;
         let (w, h) = (width as usize, height as usize);
@@ -362,6 +369,144 @@ mod tests {
             .windows(5)
             .any(|w| w[0] == 0 && w[1] == 0 && w[2] == 0 && w[3] == 1 && (w[4] & 0x1f) == 7);
         assert!(has_sps, "IDR must carry an SPS NAL (type 7)");
+    }
+
+    /// Strip Annex-B framing + emulation-prevention bytes from the first SPS NAL in `au`.
+    fn sps_rbsp(au: &[u8]) -> Vec<u8> {
+        let start = au
+            .windows(5)
+            .position(|w| w[..4] == [0, 0, 0, 1] && (w[4] & 0x1f) == 7)
+            .map(|p| p + 5)
+            .expect("an SPS NAL");
+        let end = au[start..]
+            .windows(4)
+            .position(|w| w[..3] == [0, 0, 1] || w == [0, 0, 0, 1])
+            .map_or(au.len(), |p| start + p);
+        let mut rbsp = Vec::new();
+        let nal = &au[start..end];
+        let mut i = 0;
+        while i < nal.len() {
+            // 00 00 03 -> the 03 is an emulation-prevention byte, not payload.
+            if i + 2 < nal.len() && nal[i] == 0 && nal[i + 1] == 0 && nal[i + 2] == 3 {
+                rbsp.extend_from_slice(&[0, 0]);
+                i += 3;
+            } else {
+                rbsp.push(nal[i]);
+                i += 1;
+            }
+        }
+        rbsp
+    }
+
+    /// The colour signalling the SPS actually carries, walked per ITU-T H.264 §7.3.2.1.1: returns
+    /// `(video_full_range_flag, colour_primaries, transfer_characteristics, matrix_coefficients)`.
+    /// `None` when the stream is unsignalled — which is what this module used to emit.
+    fn sps_colour(rbsp: &[u8]) -> Option<(u8, u8, u8, u8)> {
+        // Exp-Golomb ue(v): count leading zeros, then read that many trailing bits.
+        fn ue(u: &mut dyn FnMut(u32) -> u32) -> u32 {
+            let mut lz = 0;
+            while u(1) == 0 {
+                lz += 1;
+                assert!(lz < 32, "malformed Exp-Golomb");
+            }
+            if lz == 0 {
+                0
+            } else {
+                (1 << lz) - 1 + u(lz)
+            }
+        }
+        let mut pos = 0usize;
+        let mut u = |bits: u32| -> u32 {
+            let mut v = 0;
+            for _ in 0..bits {
+                v = (v << 1) | u32::from((rbsp[pos / 8] >> (7 - (pos % 8))) & 1);
+                pos += 1;
+            }
+            v
+        };
+        let profile_idc = u(8);
+        u(8); // constraint_set flags + reserved
+        u(8); // level_idc
+        ue(&mut u); // seq_parameter_set_id
+        assert_eq!(
+            profile_idc, 66,
+            "this encoder is pinned to Baseline — a profile change adds the chroma_format_idc \
+             block this walk deliberately omits"
+        );
+        ue(&mut u); // log2_max_frame_num_minus4
+        let poc_type = ue(&mut u);
+        match poc_type {
+            0 => {
+                ue(&mut u);
+            } // log2_max_pic_order_cnt_lsb_minus4
+            1 => panic!("pic_order_cnt_type 1 unhandled — openh264 emits 0 or 2"),
+            _ => {}
+        }
+        ue(&mut u); // max_num_ref_frames
+        u(1); // gaps_in_frame_num_value_allowed_flag
+        ue(&mut u); // pic_width_in_mbs_minus1
+        ue(&mut u); // pic_height_in_map_units_minus1
+        if u(1) == 0 {
+            u(1); // mb_adaptive_frame_field_flag
+        }
+        u(1); // direct_8x8_inference_flag
+        if u(1) == 1 {
+            for _ in 0..4 {
+                ue(&mut u); // frame_crop_*_offset
+            }
+        }
+        if u(1) == 0 {
+            return None; // vui_parameters_present_flag
+        }
+        if u(1) == 1 {
+            // aspect_ratio_info_present_flag
+            if u(8) == 255 {
+                u(16);
+                u(16);
+            }
+        }
+        if u(1) == 1 {
+            u(1); // overscan_info_present_flag -> overscan_appropriate_flag
+        }
+        if u(1) == 0 {
+            return None; // video_signal_type_present_flag
+        }
+        u(3); // video_format
+        let full_range = u(1) as u8;
+        if u(1) == 0 {
+            return None; // colour_description_present_flag
+        }
+        Some((full_range, u(8) as u8, u(8) as u8, u(8) as u8))
+    }
+
+    /// The SPS must SIGNAL BT.709 limited, not merely be encoded that way. `VuiConfig::bt709()`
+    /// is a request to a C library; this asserts it lands in the emitted bitstream.
+    ///
+    /// Unsignalled was the old behaviour and it looks fine on every punktfunk client (`csc_rows`
+    /// defaults to BT.709 on "unspecified"), so nothing in our own stack catches a regression
+    /// here — but vendor TV decoders guess colorimetry from RESOLUTION, and an LG webOS panel
+    /// reads a 4K SDR stream as BT.2020 and renders it visibly washed out.
+    #[test]
+    fn sps_signals_bt709_limited() {
+        let (w, h, fps) = (1280u32, 720u32, 60u32);
+        let mut enc =
+            OpenH264Encoder::open(PixelFormat::Bgrx, w, h, fps, 8_000_000).expect("open openh264");
+        let frame = CapturedFrame {
+            width: w,
+            height: h,
+            pts_ns: 0,
+            format: PixelFormat::Bgrx,
+            payload: FramePayload::Cpu(vec![0x80u8; (w * h * 4) as usize]),
+            cursor: None,
+        };
+        enc.submit(&frame).expect("submit");
+        let au = enc.poll().expect("poll").expect("an AU");
+        let colour = sps_colour(&sps_rbsp(&au.data)).expect(
+            "the SPS must carry video_signal_type + colour_description — \
+             see EncoderConfig::vui in `open`",
+        );
+        // (video_full_range_flag, colour_primaries, transfer, matrix) — 0 = limited, 1 = BT.709.
+        assert_eq!(colour, (0, 1, 1, 1), "expected BT.709 limited signalling");
     }
 
     /// The modes the software encoder can actually serve — including the portrait orientation,
