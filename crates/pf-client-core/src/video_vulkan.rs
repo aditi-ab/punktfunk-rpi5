@@ -1,10 +1,4 @@
 //! FFmpeg Vulkan Video decode over the presenter's own VkDevice (zero-copy VkImage).
-// UNSAFE-LINT EXEMPTION (rationale + exit criteria: `unsafe_op_in_unsafe_fn` in the workspace
-// Cargo.toml). This body is raw libav + ash calls on the presenter's VkDevice almost line for line;
-// narrowing it would add one `unsafe {}` plus one SAFETY comment per call that could only restate
-// the signature. Clearing this file means DELETING the markers that carry no caller contract, not
-// wrapping the calls — until then the lint is off HERE and enforced everywhere else.
-#![allow(unsafe_op_in_unsafe_fn)]
 #![allow(clippy::unnecessary_cast)]
 
 use crate::video::{
@@ -67,25 +61,45 @@ struct VkCtxStorage {
 /// [`VkCtxStorage`], which outlives the context). Replaces FFmpeg's internal default,
 /// which only serializes FFmpeg against itself — the presenter submits to the same
 /// graphics queue from another thread and holds this same lock around its calls.
+///
+/// # Safety
+/// FFmpeg calls this with the `AVHWDeviceContext` it owns, whose `user_opaque` we set to a
+/// `*const QueueLock` before handing the context over.
 unsafe extern "C" fn ffvk_lock_queue(
     ctx: *mut pf_ffvk::AVHWDeviceContext,
     _queue_family: u32,
     _index: u32,
 ) {
-    let dev = ctx as *mut ffmpeg::ffi::AVHWDeviceContext;
-    let lock = (*dev).user_opaque as *const QueueLock;
-    (*lock).lock();
+    // SAFETY: `ctx` is the live context FFmpeg passes to its own callback, and the two
+    // `AVHWDeviceContext` declarations (pf_ffvk's and ffmpeg-sys's) describe the same C struct, so
+    // the cast reads the same `user_opaque` field. That field holds the pointer we stored, which
+    // borrows `VkCtxStorage::_queue_lock` — an `Arc<QueueLock>` the storage keeps alive for as long
+    // as the hw device context can fire this trampoline (see its field doc), so the lock outlives
+    // every call FFmpeg can make.
+    unsafe {
+        let dev = ctx as *mut ffmpeg::ffi::AVHWDeviceContext;
+        let lock = (*dev).user_opaque as *const QueueLock;
+        (*lock).lock();
+    }
 }
 
 /// The matching `unlock_queue` trampoline — see [`ffvk_lock_queue`].
+///
+/// # Safety
+/// As [`ffvk_lock_queue`]; additionally, FFmpeg only calls this after a matching `lock_queue`, so
+/// the lock it releases is one this pair took.
 unsafe extern "C" fn ffvk_unlock_queue(
     ctx: *mut pf_ffvk::AVHWDeviceContext,
     _queue_family: u32,
     _index: u32,
 ) {
-    let dev = ctx as *mut ffmpeg::ffi::AVHWDeviceContext;
-    let lock = (*dev).user_opaque as *const QueueLock;
-    (*lock).unlock();
+    // SAFETY: as `ffvk_lock_queue` — same live context from FFmpeg, same `user_opaque` pointer into
+    // the `Arc<QueueLock>` that `VkCtxStorage` keeps alive for the context's whole lifetime.
+    unsafe {
+        let dev = ctx as *mut ffmpeg::ffi::AVHWDeviceContext;
+        let lock = (*dev).user_opaque as *const QueueLock;
+        (*lock).unlock();
+    }
 }
 
 impl VulkanDecoder {
