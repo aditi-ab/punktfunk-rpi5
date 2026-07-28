@@ -18,6 +18,7 @@
 use super::cuda::{self, DeviceBuffer};
 use anyhow::{ensure, Context as _, Result};
 use khronos_egl as egl;
+use std::os::fd::{AsRawFd as _, FromRawFd as _};
 use std::os::raw::{c_int, c_void};
 
 // EGL_EXT_image_dma_buf_import / _modifiers + platform enums (not defined by khronos-egl).
@@ -90,6 +91,75 @@ fn nvidia_render_node_in(
         .map(|node| dri.join(node))
 }
 
+/// Bare GL names created mid-constructor, deleted on unwind if the constructor fails before its
+/// struct (whose `Drop` then owns deletion) exists. The blit constructors interleave GL-object
+/// creation with fallible steps (FBO-completeness checks, CUDA registration, pool allocation) and
+/// are retried per frame — without this, a late failure leaked every name, unbounded, under
+/// exactly the VRAM pressure that causes such failures. `defuse()` hands ownership to the built
+/// struct. `RegisteredTexture` locals unwind themselves (their own `Drop`), and they drop before
+/// this guard (declared after it), preserving the unregister-before-delete order.
+#[derive(Default)]
+struct GlNameGuard {
+    textures: Vec<u32>,
+    fbos: Vec<u32>,
+    vaos: Vec<u32>,
+    programs: Vec<u32>,
+}
+
+impl GlNameGuard {
+    /// Construction succeeded — the final struct's `Drop` owns the names from here.
+    fn defuse(mut self) {
+        self.textures.clear();
+        self.fbos.clear();
+        self.vaos.clear();
+        self.programs.clear();
+    }
+}
+
+impl Drop for GlNameGuard {
+    fn drop(&mut self) {
+        // SAFETY: every name held was created by the guarded constructor on the GL context still
+        // current on this thread (constructors run and unwind on the single capture thread). Each
+        // `glDelete*` gets a count of 1 and a pointer to one live element; names reaching this
+        // `Drop` were never handed to a final struct (`defuse` clears the Vecs), so each is
+        // deleted exactly once.
+        unsafe {
+            for t in &self.textures {
+                glDeleteTextures(1, t);
+            }
+            for f in &self.fbos {
+                glDeleteFramebuffers(1, f);
+            }
+            for v in &self.vaos {
+                glDeleteVertexArrays(1, v);
+            }
+            for &p in &self.programs {
+                glDeleteProgram(p);
+            }
+        }
+    }
+}
+
+/// The GBM device and the DRM render-node fd it borrows, owned together so every exit path —
+/// including each `?` in `EglImporter::new` after their creation (most realistically a host where
+/// EGL comes up but CUDA does not) — releases both, in order: destroy the device, then close the
+/// fd (`OwnedFd`'s drop). Also what makes `EglImporter` teardown ordering structural: the importer
+/// has no `Drop` of its own, so its fields drop in declaration order — GL/CUDA objects first, this
+/// device (and the display it backs) last.
+struct GbmDevice {
+    raw: *mut c_void,
+    _fd: std::os::fd::OwnedFd,
+}
+
+impl Drop for GbmDevice {
+    fn drop(&mut self) {
+        // SAFETY: `raw` is the non-null `gbm_device*` from `gbm_create_device` (null-checked at
+        // construction), owned exclusively by this struct and destroyed exactly once here — before
+        // `_fd` (the render-node fd the device borrows) closes via its own drop.
+        unsafe { gbm_device_destroy(self.raw) };
+    }
+}
+
 /// Per-size GL machinery to blit a dmabuf EGLImage into a CUDA-registrable `GL_RGBA8` texture.
 struct GlBlit {
     program: u32,
@@ -109,14 +179,21 @@ struct GlBlit {
 
 impl GlBlit {
     unsafe fn new(width: u32, height: u32) -> Result<GlBlit> {
+        // Declared before every GL name so it drops LAST on unwind — after the CUDA registration
+        // (declared below) has unregistered itself.
+        let mut guard = GlNameGuard::default();
         let program = compile_program()?;
+        guard.programs.push(program);
         let mut vao = 0u32;
         glGenVertexArrays(1, &mut vao); // core profile needs a bound VAO for glDrawArrays
+        guard.vaos.push(vao);
         let mut fbo = 0u32;
         glGenFramebuffers(1, &mut fbo);
+        guard.fbos.push(fbo);
 
         let mut dst_tex = 0u32;
         glGenTextures(1, &mut dst_tex);
+        guard.textures.push(dst_tex);
         glBindTexture(GL_TEXTURE_2D, dst_tex);
         glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, width as c_int, height as c_int);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
@@ -124,6 +201,7 @@ impl GlBlit {
 
         let mut src_tex = 0u32;
         glGenTextures(1, &mut src_tex);
+        guard.textures.push(src_tex);
         glBindTexture(GL_TEXTURE_2D, src_tex);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
@@ -148,6 +226,7 @@ impl GlBlit {
         // current (the caller makes it current before constructing the blit).
         let registered = cuda::RegisteredTexture::register_gl(dst_tex)?;
         let pool = cuda::BufferPool::new(width, height)?;
+        guard.defuse();
         Ok(GlBlit {
             program,
             vao,
@@ -193,10 +272,12 @@ impl Drop for GlBlit {
         // its GL objects leaked on every size change and on importer teardown.
         self.registered.release();
         // SAFETY: these GL names were all created by THIS `GlBlit` in `GlBlit::new` on the current
-        // GL context, still current here (the owning `EglImporter` drops on its single capture
-        // thread and never releases the context). Each `glDelete*` gets a count of 1 and a `&u32`
-        // to one live field; the symbols dispatch through libGL to the driver for the current
-        // context. Each name is deleted exactly once, after its CUDA registration was released.
+        // GL context, still current here (the owning `EglImporter` — which never releases the
+        // context — drops on its single capture thread and has no `Drop` of its own, so this blit
+        // field drops before the `GbmDevice` backing the display). Each `glDelete*` gets a count
+        // of 1 and a `&u32` to one live field; the symbols dispatch through libGL to the driver
+        // for the current context. Each name is deleted exactly once, after its CUDA registration
+        // was released.
         unsafe {
             glDeleteTextures(1, &self.dst_tex);
             glDeleteTextures(1, &self.src_tex);
@@ -242,17 +323,25 @@ impl Nv12Blit {
             width % 2 == 0 && height % 2 == 0,
             "NV12 convert needs even dimensions (got {width}x{height})"
         );
+        // Declared before every GL name so it drops LAST on unwind — after the CUDA registrations
+        // (declared below) have unregistered themselves.
+        let mut guard = GlNameGuard::default();
         let y_program = compile_program_with(FRAG_Y_SRC)?;
+        guard.programs.push(y_program);
         let uv_program = compile_program_with(FRAG_UV_SRC)?;
+        guard.programs.push(uv_program);
         let mut vao = 0u32;
         glGenVertexArrays(1, &mut vao);
+        guard.vaos.push(vao);
         let mut fbos = [0u32; 2];
         glGenFramebuffers(2, fbos.as_mut_ptr());
+        guard.fbos.extend_from_slice(&fbos);
         let (y_fbo, uv_fbo) = (fbos[0], fbos[1]);
 
         // Luma target: GL_R8 at full resolution.
         let mut y_tex = 0u32;
         glGenTextures(1, &mut y_tex);
+        guard.textures.push(y_tex);
         glBindTexture(GL_TEXTURE_2D, y_tex);
         glTexStorage2D(GL_TEXTURE_2D, 1, GL_R8, width as c_int, height as c_int);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
@@ -261,6 +350,7 @@ impl Nv12Blit {
         // Chroma target: GL_RG8 at half resolution (R=U, G=V).
         let mut uv_tex = 0u32;
         glGenTextures(1, &mut uv_tex);
+        guard.textures.push(uv_tex);
         glBindTexture(GL_TEXTURE_2D, uv_tex);
         glTexStorage2D(
             GL_TEXTURE_2D,
@@ -275,6 +365,7 @@ impl Nv12Blit {
         // Source: GL_LINEAR so the half-res UV pass averages the 2×2 chroma footprint.
         let mut src_tex = 0u32;
         glGenTextures(1, &mut src_tex);
+        guard.textures.push(src_tex);
         glBindTexture(GL_TEXTURE_2D, src_tex);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
@@ -294,6 +385,7 @@ impl Nv12Blit {
         let y_registered = cuda::RegisteredTexture::register_gl(y_tex)?;
         let uv_registered = cuda::RegisteredTexture::register_gl(uv_tex)?;
         let pool = cuda::BufferPool::new_nv12(width, height)?;
+        guard.defuse();
         Ok(Nv12Blit {
             y_program,
             uv_program,
@@ -362,8 +454,9 @@ impl Drop for Nv12Blit {
         self.uv_registered.release();
         // SAFETY: these GL names (textures/FBOs/VAO/programs) were all created by THIS `Nv12Blit`
         // in `Nv12Blit::new` on the current GL context, which is still current because the owning
-        // `EglImporter` is dropped on its single capture thread (fields drop before
-        // `EglImporter::drop`, which never releases the context). `glDelete*` takes a count + a
+        // `EglImporter` (which never releases the context) drops on its single capture thread and
+        // has no `Drop` of its own — its fields drop in declaration order, this blit before the
+        // `GbmDevice` backing the display. `glDelete*` takes a count + a
         // pointer to that many names: `&self.y_tex`/`&self.vao` are `&u32` to one live field (n=1);
         // `[self.y_fbo, self.uv_fbo].as_ptr()` points at a 2-element temporary that lives for the
         // whole `glDeleteFramebuffers` call (n=2 matches). The symbols dispatch through libGL
@@ -411,17 +504,23 @@ impl Yuv444Blit {
         );
         let full_range = std::env::var("PUNKTFUNK_444_FULLRANGE").is_ok_and(|v| v.trim() == "1");
         let (y_src, u_src, v_src) = yuv444_frag_sources(full_range);
-        let programs = [
-            compile_program_with(&y_src)?,
-            compile_program_with(&u_src)?,
-            compile_program_with(&v_src)?,
-        ];
+        // Declared before every GL name so it drops LAST on unwind — after the CUDA registrations
+        // (declared below) have unregistered themselves.
+        let mut guard = GlNameGuard::default();
+        let mut programs = [0u32; 3];
+        for (p, src) in programs.iter_mut().zip([&y_src, &u_src, &v_src]) {
+            *p = compile_program_with(src)?;
+            guard.programs.push(*p);
+        }
         let mut vao = 0u32;
         glGenVertexArrays(1, &mut vao);
+        guard.vaos.push(vao);
         let mut fbos = [0u32; 3];
         glGenFramebuffers(3, fbos.as_mut_ptr());
+        guard.fbos.extend_from_slice(&fbos);
         let mut texs = [0u32; 3];
         glGenTextures(3, texs.as_mut_ptr());
+        guard.textures.extend_from_slice(&texs);
         for &tex in &texs {
             glBindTexture(GL_TEXTURE_2D, tex);
             glTexStorage2D(GL_TEXTURE_2D, 1, GL_R8, width as c_int, height as c_int);
@@ -432,6 +531,7 @@ impl Yuv444Blit {
         // the Nv12Blit source setup.
         let mut src_tex = 0u32;
         glGenTextures(1, &mut src_tex);
+        guard.textures.push(src_tex);
         glBindTexture(GL_TEXTURE_2D, src_tex);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
@@ -452,6 +552,7 @@ impl Yuv444Blit {
             cuda::RegisteredTexture::register_gl(texs[2])?,
         ];
         let pool = cuda::BufferPool::new_yuv444(width, height)?;
+        guard.defuse();
         if full_range {
             tracing::info!("YUV444 zero-copy convert: FULL range (PUNKTFUNK_444_FULLRANGE=1)");
         }
@@ -502,10 +603,11 @@ impl Drop for Yuv444Blit {
             r.release();
         }
         // SAFETY: these GL names were all created by THIS `Yuv444Blit` in `new` on the current GL
-        // context (still current — the owning `EglImporter` drops on its single capture thread).
-        // Each `glDelete*` takes a count + a pointer to that many names; the arrays are live
-        // fields (or a live temporary for the whole call). Each name is deleted exactly once,
-        // after its CUDA registration was released above.
+        // context (still current — the owning `EglImporter` drops on its single capture thread,
+        // and having no `Drop` of its own, this blit field drops before the `GbmDevice` backing
+        // the display). Each `glDelete*` takes a count + a pointer to that many names; the arrays
+        // are live fields (or a live temporary for the whole call). Each name is deleted exactly
+        // once, after its CUDA registration was released above.
         unsafe {
             glDeleteTextures(3, self.texs.as_ptr());
             glDeleteTextures(1, &self.src_tex);
@@ -563,8 +665,11 @@ pub struct EglImporter {
     /// NV12 twin of [`linear_pool`](Self::linear_pool) for the bridge's compute-CSC output
     /// (T2.5b) — separate pools because a session may fall back RGB mid-stream.
     linear_nv12_pool: Option<cuda::BufferPool>,
-    gbm: *mut c_void,
-    render_fd: c_int,
+    /// Declared LAST deliberately: with no `Drop` impl on `EglImporter`, fields drop in
+    /// declaration order, so every GL blit / CUDA registration / Vulkan bridge above releases its
+    /// driver objects BEFORE the gbm device backing the EGLDisplay (and its fd) go away — the
+    /// stale-driver-state class the blit destructors' ordering comments cite.
+    _gbm: GbmDevice,
 }
 
 // SAFETY: `EglImporter` owns thread-affine handles — an EGLDisplay/contexts made current on one
@@ -593,19 +698,25 @@ impl EglImporter {
         // retains the pointer nor writes through it, so there is no aliasing or lifetime hazard.
         let render_fd = unsafe { libc::open(path.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
         ensure!(render_fd >= 0, "open {} for GBM", node.display());
-        // SAFETY: `render_fd` is the live DRM render-node fd just returned by `open` and checked
-        // `>= 0`. `gbm_create_device` (libgbm, linked above) builds a `gbm_device` over that fd and
-        // returns a `*mut gbm_device` (or null); it borrows but does not take ownership of the fd,
-        // which `EglImporter` keeps open and closes only in `Drop` after `gbm_device_destroy`. No
-        // Rust-owned memory is passed, so there is nothing to alias.
-        let gbm = unsafe { gbm_create_device(render_fd) };
-        if gbm.is_null() {
-            // SAFETY: reached only when `gbm_create_device` failed (null) — the fd was not consumed
-            // and no `EglImporter` exists yet to close it again, so this `close` runs exactly once on
-            // the live `render_fd`, releasing it before the error return. No double-close.
-            unsafe { libc::close(render_fd) };
+        // SAFETY: `open` just returned this fd (checked `>= 0`) and nothing else owns it, so
+        // `OwnedFd` takes sole ownership — every exit path below (including each `?`) now closes
+        // it exactly once, after the gbm device borrowing it is destroyed (`GbmDevice`'s drop
+        // order).
+        let render_fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(render_fd) };
+        // SAFETY: `render_fd` is the live DRM render-node fd just opened. `gbm_create_device`
+        // (libgbm, linked above) builds a `gbm_device` over that fd and returns a
+        // `*mut gbm_device` (or null); it borrows but does not take ownership of the fd, which
+        // `GbmDevice` keeps open until after `gbm_device_destroy`. No Rust-owned memory is
+        // passed, so there is nothing to alias.
+        let raw_gbm = unsafe { gbm_create_device(render_fd.as_raw_fd()) };
+        if raw_gbm.is_null() {
+            // `render_fd` closes via its own drop.
             anyhow::bail!("gbm_create_device failed on {}", node.display());
         }
+        let gbm = GbmDevice {
+            raw: raw_gbm,
+            _fd: render_fd,
+        };
 
         // SAFETY: `Egl::load_required` dlopens the system libEGL and binds its entry points,
         // trusting that libEGL (libglvnd) is a genuine EGL 1.5 implementation whose core symbols
@@ -613,16 +724,16 @@ impl EglImporter {
         // returned instance is afterwards used only through the safe `khronos_egl` wrappers.
         let egl: Egl =
             unsafe { Egl::load_required() }.context("load libEGL (EGL 1.5 dynamic instance)")?;
-        // SAFETY: `gbm` is the non-null `gbm_device*` created just above (checked), and
+        // SAFETY: `gbm.raw` is the non-null `gbm_device*` created just above (checked), and
         // `EGL_PLATFORM_GBM_KHR` is exactly the platform enum that pairs with a GBM device as the
-        // native-display handle, so the `gbm as NativeDisplayType` cast hands EGL a valid native
+        // native-display handle, so the `gbm.raw as NativeDisplayType` cast hands EGL a valid native
         // display for the requested platform. `&[egl::ATTRIB_NONE]` is a properly terminated, empty
         // attribute array borrowed for this synchronous call; EGL only reads it and returns an
         // `EGLDisplay`, retaining no pointer into Rust memory.
         let display = unsafe {
             egl.get_platform_display(
                 EGL_PLATFORM_GBM_KHR,
-                gbm as egl::NativeDisplayType,
+                gbm.raw as egl::NativeDisplayType,
                 &[egl::ATTRIB_NONE],
             )
         }
@@ -736,8 +847,7 @@ impl EglImporter {
             vk: None,
             linear_pool: None,
             linear_nv12_pool: None,
-            gbm,
-            render_fd,
+            _gbm: gbm,
         })
     }
 
@@ -1155,23 +1265,11 @@ impl EglImporter {
     }
 }
 
-impl Drop for EglImporter {
-    fn drop(&mut self) {
-        if !self.gbm.is_null() {
-            // SAFETY: `self.gbm` is the non-null `gbm_device*` from `gbm_create_device` in `new`
-            // (checked non-null here), owned exclusively by this `EglImporter` and destroyed exactly
-            // once (in `Drop`). It is freed BEFORE `render_fd` is closed below — the correct order,
-            // since the device borrowed that fd for its lifetime.
-            unsafe { gbm_device_destroy(self.gbm) };
-        }
-        if self.render_fd >= 0 {
-            // SAFETY: `self.render_fd` is the fd `open` returned in `new` (checked `>= 0`), owned
-            // exclusively by this `EglImporter`; this `close` runs exactly once, after the gbm device
-            // that borrowed it has been destroyed. No double-close or use-after-close.
-            unsafe { libc::close(self.render_fd) };
-        }
-    }
-}
+// No `Drop` impl on `EglImporter` — deliberately. `Drop::drop` runs BEFORE field drops, so the
+// old impl destroyed the gbm device and closed the render-node fd while the blits' destructors
+// (which call `cuGraphicsUnregisterResource`/`glDeleteTextures` into the driver) still had to
+// run. With teardown expressed purely as field order (blits and bridge first, `GbmDevice` last —
+// see the field comments), the driver objects always release against a live native display.
 
 #[cfg(test)]
 mod tests {

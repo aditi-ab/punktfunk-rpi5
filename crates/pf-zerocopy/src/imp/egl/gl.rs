@@ -166,9 +166,22 @@ pub(crate) unsafe fn compile_shader(kind: u32, src: &[u8]) -> Result<u32> {
 /// Compile+link the fullscreen-triangle program with fragment source `frag` and bind its `image`
 /// sampler to texture unit 0.
 pub(crate) unsafe fn compile_program_with(frag: &[u8]) -> Result<u32> {
+    // Callers retry per frame, so every error path below must delete what it created — a leak
+    // here is unbounded, not one-shot.
     let vs = compile_shader(GL_VERTEX_SHADER, VERT_SRC)?;
-    let fs = compile_shader(GL_FRAGMENT_SHADER, frag)?;
+    let fs = match compile_shader(GL_FRAGMENT_SHADER, frag) {
+        Ok(fs) => fs,
+        Err(e) => {
+            glDeleteShader(vs);
+            return Err(e);
+        }
+    };
     let prog = glCreateProgram();
+    if prog == 0 {
+        glDeleteShader(vs);
+        glDeleteShader(fs);
+        bail!("glCreateProgram failed");
+    }
     glAttachShader(prog, vs);
     glAttachShader(prog, fs);
     glLinkProgram(prog);
@@ -176,7 +189,10 @@ pub(crate) unsafe fn compile_program_with(frag: &[u8]) -> Result<u32> {
     glDeleteShader(fs);
     let mut ok: c_int = 0;
     glGetProgramiv(prog, GL_LINK_STATUS, &mut ok);
-    ensure!(ok != 0, "GL program link failed");
+    if ok == 0 {
+        glDeleteProgram(prog);
+        bail!("GL program link failed");
+    }
     glUseProgram(prog);
     let loc = glGetUniformLocation(prog, c"image".as_ptr());
     if loc >= 0 {
