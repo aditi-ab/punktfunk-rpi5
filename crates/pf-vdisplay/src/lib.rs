@@ -87,8 +87,9 @@ pub use session::{session_epoch, try_recover_session};
 #[path = "vdisplay/routing.rs"]
 pub(crate) mod routing;
 pub use routing::{
-    apply_input_env, managed_session_available, restore_managed_session, restore_takeover_now,
-    restore_takeover_on_startup, start_restore_worker, wants_dedicated_game_session,
+    apply_input_env, managed_session_available, resolve_gamescope_route, restore_managed_session,
+    restore_takeover_now, restore_takeover_on_startup, start_restore_worker,
+    wants_dedicated_game_session, GamescopeRoute,
 };
 #[cfg(target_os = "linux")]
 pub use routing::{

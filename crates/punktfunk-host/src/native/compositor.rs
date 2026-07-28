@@ -40,14 +40,17 @@ fn pick_compositor(
 pub(super) fn resolve_compositor(
     pref: CompositorPref,
     dedicated_launch: bool,
-) -> Result<crate::vdisplay::Compositor> {
+) -> Result<(
+    crate::vdisplay::Compositor,
+    Option<crate::vdisplay::GamescopeRoute>,
+)> {
     use crate::vdisplay::Compositor;
     // Windows has a single virtual-display backend (pf-vdisplay); vdisplay::open ignores the compositor
     // arg there, so short-circuit the Linux session-detection state machine with a placeholder.
     #[cfg(target_os = "windows")]
     {
         let _ = (pref, dedicated_launch);
-        Ok(Compositor::Kwin)
+        Ok((Compositor::Kwin, None))
     }
     #[cfg(not(target_os = "windows"))]
     {
@@ -83,11 +86,12 @@ pub(super) fn resolve_compositor(
         // env was already retargeted above (for XDG_RUNTIME_DIR / the PipeWire daemon); we just pin the
         // backend + input to the spawn sub-mode. Skipped under an explicit operator compositor pin.
         if dedicated_launch && !overridden {
-            crate::vdisplay::apply_input_env(Compositor::Gamescope, true);
+            let route = crate::vdisplay::apply_input_env(Compositor::Gamescope, true);
             tracing::info!(
+                ?route,
                 "dedicated game session — routing to a headless gamescope spawn at the client mode"
             );
-            return Ok(Compositor::Gamescope);
+            return Ok((Compositor::Gamescope, route));
         }
         let available = crate::vdisplay::available();
         let chosen = match pick_compositor(pref, &available, detected) {
@@ -125,11 +129,19 @@ pub(super) fn resolve_compositor(
                 );
             }
         };
-        if !overridden {
-            // Point input at the same backend and resolve the gamescope sub-mode (managed where the
-            // session infra exists, attach to a foreign gamescope, else per-session bare spawn).
-            crate::vdisplay::apply_input_env(chosen, false);
-        }
+        // Point input at the same backend and resolve the gamescope sub-mode (managed where the
+        // session infra exists, attach to a foreign gamescope, else per-session bare spawn). The
+        // route travels back to the caller as a VALUE and is carried on the backend instance — an
+        // operator pin skips the input retarget but still needs a route resolved, or `create` would
+        // fall through to a bare spawn on a box that was pinned to the managed session.
+        let route = if !overridden {
+            crate::vdisplay::apply_input_env(chosen, false)
+        } else {
+            // An operator pin deliberately leaves PUNKTFUNK_INPUT_BACKEND alone, but still needs a
+            // route resolved — otherwise `create` falls through to a bare spawn on a box pinned to
+            // the managed session.
+            crate::vdisplay::resolve_gamescope_route(chosen, false)
+        };
         let avail_ids: Vec<&str> = available.iter().map(|c| c.id()).collect();
         match Compositor::from_pref(pref) {
             Some(want) if want == chosen => {
@@ -149,7 +161,7 @@ pub(super) fn resolve_compositor(
                 "auto-detected compositor (client: auto)"
             ),
         }
-        Ok(chosen)
+        Ok((chosen, route))
     }
 }
 

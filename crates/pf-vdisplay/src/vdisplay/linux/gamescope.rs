@@ -49,6 +49,12 @@ pub struct GamescopeDisplay {
     /// WSI layer advertises HDR10/scRGB surfaces to nested games, and the composite gamescope
     /// hands us can be negotiated as a 10-bit PQ stream (`packaging/gamescope`).
     hdr: bool,
+    /// This session's resolved sub-mode (set via [`VirtualDisplay::set_gamescope_route`]). Same
+    /// per-instance discipline as `cmd`, and for the same reason: it used to arrive through
+    /// `PUNKTFUNK_GAMESCOPE_NODE`/`_SESSION`, which a concurrent connect could overwrite between
+    /// the decision and this session's `create`. `None` = nothing resolved it (a caller that never
+    /// ran `apply_input_env`); `create` then falls through to the bare spawn, the safe default.
+    route: Option<crate::GamescopeRoute>,
 }
 
 /// A running host-managed session (its transient systemd --user unit) + the mode it was launched at.
@@ -263,16 +269,17 @@ impl VirtualDisplay for GamescopeDisplay {
         self.hdr
     }
 
+    fn set_gamescope_route(&mut self, route: Option<crate::GamescopeRoute>) {
+        self.route = route;
+    }
+
     fn poolable_now(&self) -> bool {
         // Only a bare SPAWN is registry-poolable (its `create` reports `Owned`); managed
         // (`PUNKTFUNK_GAMESCOPE_SESSION`) and attach (`PUNKTFUNK_GAMESCOPE_NODE`) report
         // `SessionManaged`/`External`, so the registry must not reuse a kept spawn for them (same
         // backend name). Mirrors [`crate::launch_is_nested`]; read under the env lock the
         // sub-mode ladder writes these keys under.
-        crate::with_env_lock(|| {
-            std::env::var_os("PUNKTFUNK_GAMESCOPE_SESSION").is_none()
-                && std::env::var_os("PUNKTFUNK_GAMESCOPE_NODE").is_none()
-        })
+        matches!(self.route, None | Some(crate::GamescopeRoute::Spawn))
     }
 
     fn launch_command(&self) -> Option<String> {
@@ -294,16 +301,17 @@ impl VirtualDisplay for GamescopeDisplay {
         // full Steam-Deck-UI session headless at the client's resolution + refresh — so games SEE
         // them (via the injected --nested-refresh + generated CVT modes, not the box's TV EDID) —
         // and relaunch it when the client's mode changes. Reuses the node + EIS discovery below.
-        // Both keys read in ONE guarded snapshot: `apply_input_env` writes them under the env
-        // lock but releases it before they are consumed, so reading them live here raced its
-        // writes — and read them WITHOUT the lock that `poolable_now` and `launch_is_nested` take
-        // for the same two keys.
-        let (session_env, node_env) = crate::with_env_lock(|| {
-            (
-                std::env::var("PUNKTFUNK_GAMESCOPE_SESSION").ok(),
-                std::env::var("PUNKTFUNK_GAMESCOPE_NODE").ok(),
-            )
-        });
+        // THIS session's resolved sub-mode, handed over by the host from `apply_input_env`. It
+        // used to be read out of the process env here, which meant a second connect could retarget
+        // this one between the decision and this line.
+        let (session_env, node_env) = match self.route.clone() {
+            Some(crate::GamescopeRoute::Managed { client }) => (Some(client), None),
+            Some(crate::GamescopeRoute::Attach { node }) => (None, Some(node)),
+            Some(crate::GamescopeRoute::Spawn) => (None, None),
+            // Nobody resolved a route (no `apply_input_env` on this path): bare spawn, which is
+            // also what the ladder's own default arm picks.
+            None => (None, None),
+        };
         if let Some(client) = session_env {
             return create_managed_session(&client, mode, self.hdr);
         }

@@ -919,6 +919,10 @@ pub(super) struct SessionContext {
     pub(super) bitrate_rx: std::sync::mpsc::Receiver<u32>,
     /// The resolved compositor backend (moot on Windows — `vdisplay::open` ignores it there).
     pub(super) compositor: crate::vdisplay::Compositor,
+    /// This session's resolved gamescope sub-mode, or `None` for every other backend. Carried here
+    /// (and on to the backend instance) rather than through `PUNKTFUNK_GAMESCOPE_NODE`/`_SESSION`:
+    /// two sessions connecting at once used to overwrite each other's decision in the process env.
+    pub(super) gamescope_route: Option<crate::vdisplay::GamescopeRoute>,
     /// Negotiated encoder bitrate (kbps).
     pub(super) bitrate_kbps: u32,
     /// The encoder's live APPLIED rate (kbps) — shared with the send pacer, the web console, the
@@ -1073,6 +1077,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
         rfi,
         bitrate_rx,
         compositor,
+        gamescope_route,
         mut bitrate_kbps,
         live_bitrate,
         encoder_ceiling_kbps,
@@ -1195,6 +1200,11 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
             // session after capture is up (below).
             #[cfg(not(target_os = "windows"))]
             vd.set_launch_command(launch.clone());
+            // Same per-instance discipline for the gamescope sub-mode this session resolved at
+            // handshake time: it used to arrive through PUNKTFUNK_GAMESCOPE_NODE/_SESSION, which a
+            // second connect (or the switch watcher below) could overwrite before this `create`.
+            #[cfg(not(target_os = "windows"))]
+            vd.set_gamescope_route(gamescope_route.clone());
             // IDD-push reconnect preempt (the dance now lives in the manager, Goal-1 §2.5):
             // serialize setup so a reconnect FLOOD can't run concurrent monitor create/teardown,
             // STOP the prior session + WAIT for it to release its monitor (instead of tearing a
@@ -1248,7 +1258,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
     }
     #[cfg(target_os = "linux")]
     let spawned_launch = match launch.as_deref() {
-        Some(cmd) if crate::vdisplay::launch_is_nested(compositor) => {
+        Some(cmd) if crate::vdisplay::launch_is_nested(compositor, gamescope_route.as_ref()) => {
             tracing::info!(command = %cmd, "launch nested into the per-session gamescope");
             None
         }
@@ -1275,7 +1285,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
     //   a mere disconnect only after a reconnect window (`_game_life`'s drop, below).
     let game_lease = launch_target.as_ref().map(|target| {
         #[cfg(target_os = "linux")]
-        let nested = crate::vdisplay::launch_is_nested(compositor);
+        let nested = crate::vdisplay::launch_is_nested(compositor, gamescope_route.as_ref());
         #[cfg(not(target_os = "linux"))]
         let nested = false;
         #[cfg(target_os = "linux")]
@@ -1583,7 +1593,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                 });
                 // A mid-stream Game↔Desktop switch is not a fresh dedicated launch — route input at the
                 // switched-to backend's normal sub-mode.
-                crate::vdisplay::apply_input_env(sw.compositor, false);
+                let switched_route = crate::vdisplay::apply_input_env(sw.compositor, false);
                 // Switching INTO a desktop mid-stream: the xdg portal / systemd-user env may still
                 // point at the old session, so input would silently not land until a reconnect.
                 // Settle it (env push + KWin portal restart) before the injector reopens against it.
@@ -1598,6 +1608,10 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                 let rebuilt =
                     (|| -> Result<(Box<dyn crate::vdisplay::VirtualDisplay>, Pipeline)> {
                         let mut new_vd = crate::vdisplay::open(sw.compositor)?;
+                        // The switch re-resolved the sub-mode; give it to the NEW instance, the
+                        // same way the initial build does. Without this the rebuilt backend would
+                        // have no route and fall through to a bare spawn.
+                        new_vd.set_gamescope_route(switched_route.clone());
                         let pipe = build_pipeline_with_retry(
                             &mut new_vd,
                             cur_mode,
@@ -2143,7 +2157,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                 #[cfg(target_os = "linux")]
                 if launch.is_some()
                     && crate::session_settings::get().session_on_game_exit
-                    && crate::vdisplay::launch_is_nested(compositor)
+                    && crate::vdisplay::launch_is_nested(compositor, gamescope_route.as_ref())
                     && crate::vdisplay::dedicated_game_exited(cur_node_id)
                 {
                     tracing::info!(
@@ -2218,7 +2232,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                         if let Some(c) = crate::vdisplay::compositor_for_kind(active.kind) {
                             crate::vdisplay::apply_session_env(&active);
                             // Capture-loss rebuild follows the live box session, not a fresh dedicated launch.
-                            crate::vdisplay::apply_input_env(c, false);
+                            let rebuilt_route = crate::vdisplay::apply_input_env(c, false);
                             if c != compositor {
                                 if matches!(
                                     c,
@@ -2257,6 +2271,11 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                                         "capture loss: opening the newly-detected compositor failed — retrying"),
                                 }
                             }
+                            // The rebuild re-resolved the sub-mode; hand it to whichever backend
+                            // instance the rebuild will use — the freshly opened one on a
+                            // compositor switch, or the existing one when the backend is unchanged.
+                            // Skipping this would leave the rebuilt display on a bare spawn.
+                            vd.set_gamescope_route(rebuilt_route.clone());
                         }
                     }
                     let _probe = (loss_at.elapsed() < PROBE_HOLDOFF)

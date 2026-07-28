@@ -976,7 +976,7 @@ async fn serve_session(
         });
     }
 
-    let (hello, welcome, udp_port, data_sock, direct, start, compositor, prep) =
+    let (hello, welcome, udp_port, data_sock, direct, start, compositor, gamescope_route, prep) =
         tokio::time::timeout(
             HANDSHAKE_TIMEOUT,
             handshake::negotiate(
@@ -1529,6 +1529,7 @@ async fn serve_session(
                         rfi: rfi_rx,
                         bitrate_rx,
                         compositor,
+                        gamescope_route,
                         bitrate_kbps,
                         live_bitrate,
                         encoder_ceiling_kbps,

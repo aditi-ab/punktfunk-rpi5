@@ -252,7 +252,7 @@ fn run(
         // exactly like the native plane), create a virtual output at the client mode, and capture it.
         // Re-runnable: the encode loop calls it again on a mid-stream capture loss to FOLLOW a
         // Desktop<->Game switch.
-        let (mut capturer, compositor) =
+        let (mut capturer, compositor, gamescope_route) =
             open_gs_virtual_source(cfg, app, target.as_ref(), &life.quit)?;
         tracing::info!(
             ?compositor,
@@ -288,7 +288,9 @@ fn run(
         // source open), so launching again would start it twice.
         #[cfg(target_os = "linux")]
         let spawned_launch = match target.as_ref().and_then(|t| t.command.as_deref()) {
-            Some(_) if crate::vdisplay::launch_is_nested(compositor) => None,
+            Some(_) if crate::vdisplay::launch_is_nested(compositor, gamescope_route.as_ref()) => {
+                None
+            }
             Some(cmd) => match crate::library::launch_session_command(compositor, cmd) {
                 Ok(spawned) => Some(spawned),
                 Err(e) => {
@@ -310,7 +312,7 @@ fn run(
         //   relaunch of the same title reclaims the game (above).
         let _game_life = target.as_ref().map(|t| {
             #[cfg(target_os = "linux")]
-            let nested = crate::vdisplay::launch_is_nested(compositor);
+            let nested = crate::vdisplay::launch_is_nested(compositor, gamescope_route.as_ref());
             #[cfg(not(target_os = "linux"))]
             let nested = false;
             #[cfg(target_os = "linux")]
@@ -368,7 +370,7 @@ fn run(
         // without a Moonlight reconnect. (A resolution change can't be followed mid-stream on
         // GameStream — WxH is locked at ANNOUNCE — but a session toggle keeps the negotiated mode.)
         let rebuild =
-            || open_gs_virtual_source(cfg, app, target.as_ref(), &life.quit).map(|(c, _)| c);
+            || open_gs_virtual_source(cfg, app, target.as_ref(), &life.quit).map(|(c, _, _)| c);
         return stream_body(
             &mut capturer,
             Some(&rebuild),
@@ -535,7 +537,9 @@ fn open_gs_mirror_source(
         .map(Ok)
         .unwrap_or_else(crate::vdisplay::detect)
         .context("detect compositor")?;
-    crate::vdisplay::apply_input_env(compositor, false);
+    // A mirror streams an existing head — no gamescope sub-mode applies, so the resolved route is
+    // deliberately dropped here rather than carried.
+    let _ = crate::vdisplay::apply_input_env(compositor, false);
     let mut vd = crate::vdisplay::open_mirror(compositor, connector)?;
     // Cursor mode is the session's negotiated one: metadata where this encode path composites
     // `frame.cursor`, otherwise let the compositor embed it (§7.5 — one resolver, per-backend
@@ -633,9 +637,16 @@ fn open_gs_virtual_source(
     launch: Option<&GsApp>,
     // The session's deliberate-quit flag, handed to the display's keep-alive lease.
     quit: &Arc<AtomicBool>,
-) -> Result<(Box<dyn Capturer>, crate::vdisplay::Compositor)> {
-    let compositor = if let Some(c) = app.and_then(|a| a.compositor) {
-        c
+) -> Result<(
+    Box<dyn Capturer>,
+    crate::vdisplay::Compositor,
+    Option<crate::vdisplay::GamescopeRoute>,
+)> {
+    let (compositor, gamescope_route) = if let Some(c) = app.and_then(|a| a.compositor) {
+        // An app-pinned compositor still needs a route resolved, or `create` falls through to a
+        // bare spawn on a box pinned to the managed session (mirrors `native::resolve_compositor`).
+        let r = crate::vdisplay::resolve_gamescope_route(c, false);
+        (c, r)
     } else {
         // Windows has a single virtual-display backend (pf-vdisplay); `vdisplay::open` ignores the
         // compositor arg there, so short-circuit the Linux session-detection state machine with a
@@ -644,7 +655,7 @@ fn open_gs_virtual_source(
         // killed the GameStream video thread → black screen (the native plane was already guarded).
         #[cfg(target_os = "windows")]
         {
-            crate::vdisplay::Compositor::Kwin
+            (crate::vdisplay::Compositor::Kwin, None)
         }
         #[cfg(not(target_os = "windows"))]
         {
@@ -661,15 +672,16 @@ fn open_gs_virtual_source(
             // the resolved command so an unresolvable entry falls back to auto routing (review #9).
             let has_launch = launch.and_then(|t| t.command.as_deref()).is_some();
             if crate::vdisplay::wants_dedicated_game_session(has_launch) {
-                crate::vdisplay::apply_input_env(crate::vdisplay::Compositor::Gamescope, true);
-                crate::vdisplay::Compositor::Gamescope
+                let r =
+                    crate::vdisplay::apply_input_env(crate::vdisplay::Compositor::Gamescope, true);
+                (crate::vdisplay::Compositor::Gamescope, r)
             } else {
                 let c = crate::vdisplay::compositor_for_kind(active.kind)
                     .map(Ok)
                     .unwrap_or_else(crate::vdisplay::detect)
                     .context("detect compositor")?;
-                crate::vdisplay::apply_input_env(c, false);
-                c
+                let r = crate::vdisplay::apply_input_env(c, false);
+                (c, r)
             }
         }
     };
@@ -681,6 +693,10 @@ fn open_gs_virtual_source(
     // Linux this is a no-op backend-side, and a library title resolves to no command at all — the
     // interactive-session spawner launches it by id instead.
     vd.set_launch_command(launch.and_then(|t| t.command.clone()));
+    // This plane's resolved gamescope sub-mode, on the instance for the same reason as the launch
+    // command above — the GameStream and native planes both call `apply_input_env`, so publishing
+    // through the process env let either retarget the other's `create`.
+    vd.set_gamescope_route(gamescope_route.clone());
     // Serialize with the punktfunk/1 plane's IDD-push setup dance (Goal-1 §2.5). A GameStream
     // connect used to skip it entirely, so it could ADD/reconfigure the shared monitor while a
     // native session was mid-build (and vice versa), and its sealed-channel delivery would replace
@@ -729,7 +745,7 @@ fn open_gs_virtual_source(
     )
     .context("capture virtual output")?;
     capturer.set_active(true);
-    Ok((capturer, compositor))
+    Ok((capturer, compositor, gamescope_route))
 }
 
 /// The encoder bit depth implied by the captured frame's pixel format: a 10-bit (HDR) source — the

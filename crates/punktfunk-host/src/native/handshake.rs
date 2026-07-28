@@ -83,6 +83,9 @@ pub(super) async fn negotiate(
     bool,
     Start,
     Option<crate::vdisplay::Compositor>,
+    // This session's resolved gamescope sub-mode — carried to the data plane as a value rather
+    // than published to process env, where a concurrent connect could overwrite it.
+    Option<crate::vdisplay::GamescopeRoute>,
     Option<super::stream::PrepHandle>,
 )> {
     let peer = conn.remote_address();
@@ -225,6 +228,11 @@ pub(super) async fn negotiate(
         }
         Punktfunk1Source::Synthetic => None,
     };
+    // Split the pair immediately: `compositor` keeps its old meaning for the Welcome and the
+    // cursor-forward decision, while the gamescope sub-mode travels separately to the data plane
+    // (SessionContext → `vd.set_gamescope_route`) instead of through process env.
+    let gamescope_route = compositor.as_ref().and_then(|(_, r)| r.clone());
+    let compositor = compositor.map(|(c, _)| c);
 
     // A requested library launch (the client sends only the store-qualified id; we look it up
     // in OUR library so a client can't inject a command) is resolved below — after the Welcome,
@@ -617,6 +625,14 @@ pub(super) async fn negotiate(
         Start::decode(&io::read_msg(recv).await?).map_err(|e| anyhow!("Start decode: {e:?}"))?;
     bringup.mark("start");
     Ok::<_, anyhow::Error>((
-        hello, welcome, udp_port, data_sock, direct, start, compositor, prep,
+        hello,
+        welcome,
+        udp_port,
+        data_sock,
+        direct,
+        start,
+        compositor,
+        gamescope_route,
+        prep,
     ))
 }

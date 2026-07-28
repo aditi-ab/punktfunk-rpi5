@@ -117,6 +117,13 @@ pub trait VirtualDisplay: Send {
     /// sessions can't stomp each other's launch target. Default: no-op (backends that attach to an
     /// existing session / don't spawn a nested command ignore it; only gamescope's spawn path uses it).
     fn set_launch_command(&mut self, _cmd: Option<String>) {}
+    /// Set the RESOLVED gamescope sub-mode for this session (from
+    /// [`apply_input_env`](crate::apply_input_env)). Carried on the backend instance for the same
+    /// reason as [`set_launch_command`](Self::set_launch_command) — it used to travel through
+    /// `PUNKTFUNK_GAMESCOPE_NODE`/`_SESSION`, where the GameStream plane and the mid-session switch
+    /// watcher could overwrite one session's decision before another session's `create` read it.
+    /// Default: no-op (only the gamescope backend has sub-modes).
+    fn set_gamescope_route(&mut self, _route: Option<crate::GamescopeRoute>) {}
     /// Set the connecting client's cert fingerprint so the backend can give that client a STABLE virtual
     /// monitor identity across reconnects and its saved per-monitor config (notably DPI scaling) is
     /// reapplied — via the OS (Windows EDID serial), the compositor (KWin per-slot output name), or

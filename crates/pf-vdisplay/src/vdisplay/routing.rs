@@ -5,8 +5,32 @@
 
 use super::*;
 
-/// How a gamescope-backed session is realized. Chosen per connect by [`pick_gamescope_mode`],
-/// written into the env knobs `GamescopeDisplay::create` dispatches on.
+/// The RESOLVED gamescope sub-mode for one session, with the payload `GamescopeDisplay::create`
+/// needs.
+///
+/// This is what [`apply_input_env`] hands back, and it is carried on the backend INSTANCE
+/// (`VirtualDisplay::set_gamescope_route`) exactly as `set_launch_command` carries the launch — not
+/// through process env. The env knobs used to BE the channel: `apply_input_env` wrote
+/// `PUNKTFUNK_GAMESCOPE_NODE`/`_SESSION` and `create` read them back, but the lock was released in
+/// between, and the whole GameStream plane plus the mid-session switch watcher re-run the writer —
+/// so session B's decision could overwrite session A's before A's `create` ever read it. They
+/// remain *operator overrides*, sampled once (see `operator_gamescope`); nothing writes them now.
+///
+/// Defined on every platform because the host's `SessionContext` carries it beside `compositor`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GamescopeRoute {
+    /// Host-managed `gamescope-session-plus` / SteamOS session at the client's mode. `client` is
+    /// the session flavour (`steam`), from `PUNKTFUNK_GAMESCOPE_SESSION` if the operator set it.
+    Managed { client: String },
+    /// Attach to an already-running gamescope. `node` is a PipeWire node id, or `auto` to discover
+    /// the box's own game-mode session (from `PUNKTFUNK_GAMESCOPE_NODE` if the operator set it).
+    Attach { node: String },
+    /// Bare-spawn a headless gamescope for this session, nesting its launch command.
+    Spawn,
+}
+
+/// How a gamescope-backed session is realized — the pure ladder's verdict, before the payload is
+/// attached (see [`GamescopeRoute`]).
 #[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GamescopeMode {
@@ -80,24 +104,31 @@ fn pick_gamescope_mode(
 static OPERATOR_GAMESCOPE: std::sync::OnceLock<OperatorGamescope> = std::sync::OnceLock::new();
 
 #[cfg(target_os = "linux")]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct OperatorGamescope {
     managed: bool,
     attach: bool,
-    node: bool,
-    session: bool,
+    /// The operator's `PUNKTFUNK_GAMESCOPE_NODE` VALUE, if set — the ladder needs its presence and
+    /// `apply_input_env` needs its content to build the route.
+    node: Option<String>,
+    /// Likewise `PUNKTFUNK_GAMESCOPE_SESSION` — the managed session flavour.
+    session: Option<String>,
 }
 
 #[cfg(target_os = "linux")]
-fn operator_gamescope() -> OperatorGamescope {
-    *OPERATOR_GAMESCOPE.get_or_init(|| {
+fn operator_gamescope() -> &'static OperatorGamescope {
+    OPERATOR_GAMESCOPE.get_or_init(|| {
         let ov = with_env_lock(|| OperatorGamescope {
             managed: std::env::var_os("PUNKTFUNK_GAMESCOPE_MANAGED").is_some(),
             attach: std::env::var_os("PUNKTFUNK_GAMESCOPE_ATTACH").is_some(),
-            node: std::env::var_os("PUNKTFUNK_GAMESCOPE_NODE").is_some(),
-            session: std::env::var_os("PUNKTFUNK_GAMESCOPE_SESSION").is_some(),
+            node: std::env::var("PUNKTFUNK_GAMESCOPE_NODE")
+                .ok()
+                .filter(|v| !v.is_empty()),
+            session: std::env::var("PUNKTFUNK_GAMESCOPE_SESSION")
+                .ok()
+                .filter(|v| !v.is_empty()),
         });
-        if ov.managed || ov.attach || ov.node || ov.session {
+        if ov.managed || ov.attach || ov.node.is_some() || ov.session.is_some() {
             tracing::info!(
                 ?ov,
                 "gamescope: operator sub-mode overrides sampled from the environment"
@@ -107,11 +138,14 @@ fn operator_gamescope() -> OperatorGamescope {
     })
 }
 
+///
+/// Returns the resolved [`GamescopeRoute`] when `chosen` is gamescope — the caller must carry it to
+/// the backend instance via `VirtualDisplay::set_gamescope_route`. It is a RETURN VALUE and no
+/// longer an env write precisely because two sessions connecting at once would otherwise clobber
+/// each other's decision through the process env.
 #[cfg(target_os = "linux")]
-pub fn apply_input_env(chosen: Compositor, dedicated_launch: bool) {
-    // Sampled BEFORE the lock — `operator_gamescope` takes it itself, and this mutex is not
-    // reentrant.
-    let ov = operator_gamescope();
+#[must_use = "the resolved gamescope route must reach the backend instance (set_gamescope_route)"]
+pub fn apply_input_env(chosen: Compositor, dedicated_launch: bool) -> Option<GamescopeRoute> {
     let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let backend = match chosen {
         Compositor::Gamescope => "gamescope",
@@ -125,42 +159,66 @@ pub fn apply_input_env(chosen: Compositor, dedicated_launch: bool) {
         Compositor::Wlroots | Compositor::Hyprland => "wlr",
     };
     std::env::set_var("PUNKTFUNK_INPUT_BACKEND", backend);
-    if chosen == Compositor::Gamescope {
+    drop(_env_guard);
+    resolve_gamescope_route(chosen, dedicated_launch)
+}
+
+/// The gamescope sub-mode ladder ALONE — no input-backend env write.
+///
+/// Split out for the operator-pinned path (`PUNKTFUNK_COMPOSITOR` set), which deliberately leaves
+/// `PUNKTFUNK_INPUT_BACKEND` alone but still needs a route: without one, `create` would fall
+/// through to a bare spawn on a box the operator pinned to the managed session.
+#[cfg(target_os = "linux")]
+#[must_use = "the resolved gamescope route must reach the backend instance (set_gamescope_route)"]
+pub fn resolve_gamescope_route(
+    chosen: Compositor,
+    dedicated_launch: bool,
+) -> Option<GamescopeRoute> {
+    if chosen != Compositor::Gamescope {
+        return None;
+    }
+    {
+        // Sampled inside — `operator_gamescope` takes ENV_LOCK itself, and `apply_input_env` has
+        // already dropped its guard before calling us (the mutex is not reentrant).
+        let ov = operator_gamescope();
         let mode = pick_gamescope_mode(
             dedicated_launch,
             ov.managed,
             ov.attach,
-            ov.node,
-            ov.session,
+            ov.node.is_some(),
+            ov.session.is_some(),
             gamescope::managed_session_available(),
             gamescope::foreign_gamescope_running(),
         );
         tracing::info!(?mode, "gamescope sub-mode");
-        match mode {
-            GamescopeMode::Attach => {
-                std::env::remove_var("PUNKTFUNK_GAMESCOPE_SESSION");
-                if std::env::var_os("PUNKTFUNK_GAMESCOPE_NODE").is_none() {
-                    std::env::set_var("PUNKTFUNK_GAMESCOPE_NODE", "auto");
-                }
-            }
-            GamescopeMode::Managed => {
-                if std::env::var_os("PUNKTFUNK_GAMESCOPE_SESSION").is_none() {
-                    std::env::set_var("PUNKTFUNK_GAMESCOPE_SESSION", "steam");
-                }
-                std::env::remove_var("PUNKTFUNK_GAMESCOPE_NODE");
-            }
-            GamescopeMode::Spawn => {
-                // Bare spawn: `create` must fall through to the spawn path, so neither knob may
-                // linger from an earlier connect's managed/attach selection.
-                std::env::remove_var("PUNKTFUNK_GAMESCOPE_SESSION");
-                std::env::remove_var("PUNKTFUNK_GAMESCOPE_NODE");
-            }
-        }
+        // Nothing is written back to the two knobs: they are the OPERATOR's inputs, sampled once
+        // above, and the decision travels out as a value. An earlier revision published it here,
+        // which is how one Attach latched Attach for the host's lifetime (the ladder re-read its
+        // own output) and how a second session could retarget a first session's `create`.
+        Some(match mode {
+            GamescopeMode::Attach => GamescopeRoute::Attach {
+                node: ov.node.clone().unwrap_or_else(|| "auto".to_string()),
+            },
+            GamescopeMode::Managed => GamescopeRoute::Managed {
+                client: ov.session.clone().unwrap_or_else(|| "steam".to_string()),
+            },
+            GamescopeMode::Spawn => GamescopeRoute::Spawn,
+        })
     }
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn apply_input_env(_chosen: Compositor, _dedicated_launch: bool) {}
+pub fn apply_input_env(_chosen: Compositor, _dedicated_launch: bool) -> Option<GamescopeRoute> {
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn resolve_gamescope_route(
+    _chosen: Compositor,
+    _dedicated_launch: bool,
+) -> Option<GamescopeRoute> {
+    None
+}
 
 /// Should a game-launching session get a **dedicated** headless gamescope (`game_session=dedicated`
 /// policy, `design/gamemode-and-dedicated-sessions.md` B0)? True only when the session carries a
@@ -191,15 +249,12 @@ pub fn wants_dedicated_game_session(has_launch: bool) -> bool {
 
 /// Will `vd.create` on this backend NEST the session's launch command itself (gamescope's bare
 /// spawn runs it inside the new gamescope)? When true the session must NOT also spawn the command
-/// into the session — it would start twice. Read AFTER [`apply_input_env`] resolved the gamescope
-/// sub-mode (the env knobs are that resolution's output).
+/// into the session — it would start twice. Takes the session's own resolved
+/// [`GamescopeRoute`] (from [`apply_input_env`]) rather than re-reading process env, so a
+/// concurrent session's routing decision cannot change this session's answer.
 #[cfg(target_os = "linux")]
-pub fn launch_is_nested(compositor: Compositor) -> bool {
-    compositor == Compositor::Gamescope
-        && with_env_lock(|| {
-            std::env::var_os("PUNKTFUNK_GAMESCOPE_SESSION").is_none()
-                && std::env::var_os("PUNKTFUNK_GAMESCOPE_NODE").is_none()
-        })
+pub fn launch_is_nested(compositor: Compositor, route: Option<&GamescopeRoute>) -> bool {
+    compositor == Compositor::Gamescope && matches!(route, Some(GamescopeRoute::Spawn))
 }
 
 /// Launch `cmd` into the live gamescope session (managed/attach — see
