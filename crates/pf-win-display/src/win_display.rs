@@ -1000,6 +1000,37 @@ pub struct TargetInventory {
     pub monitor_device_path: String,
 }
 
+/// EDID manufacturer id of punktfunk's own IddCx monitors, as it appears in the PnP hardware id and
+/// therefore in the CCD monitor device path (`\\?\DISPLAY#PNK….`). The driver stamps `"PNK"` into
+/// EDID bytes 8-9 (`packaging/windows/drivers/pf-vdisplay/src/edid.rs`).
+const PF_EDID_MANUFACTURER: &str = "PNK";
+
+/// Is this monitor device path one of OUR virtual displays?
+///
+/// It has to be asked, because the connector class cannot answer it: our IddCx monitor declares
+/// `DISPLAYCONFIG_OUTPUT_TECHNOLOGY_HDMI` (driver `monitor.rs`, `IDDCX_MONITOR_INFO::MonitorType`),
+/// which [`output_tech_class`]'s allowlist reads as a real external panel — so without this check
+/// punktfunk's own display counts as one of the operator's physical monitors. Measured on .173:
+/// `target_inventory()` returned `[(4352, "LG TV SSCR2", HDMI), (257, "punktfunk", HDMI)]` with
+/// BOTH flagged `external_physical`.
+///
+/// That is not cosmetic. [`restore_displays_ccd`]'s last-resort "the desk is not left dark"
+/// backstop fires on `connected > 0 && lit == 0` over exactly this set, and the restore runs BEFORE
+/// the virtual is REMOVEd — so our own still-active display kept `lit >= 1` and the backstop could
+/// never fire, in precisely the situation it was written for. It also made our display a candidate
+/// "physical suspect" in the disturbance-attribution inventory, which [`TargetInventory`]'s own doc
+/// says can never happen ("only indirect/virtual targets (our own IDD included)").
+///
+/// Matching on the device path rather than the friendly name: the name comes from the EDID's 0xFC
+/// descriptor and is what a user sees, while the path carries the manufacturer id the OS itself
+/// derived. Allowlist-shaped like [`output_tech_class`] — anything unrecognised stays "not ours",
+/// so a third-party virtual display is never silently adopted.
+fn is_our_virtual_display(monitor_device_path: &str) -> bool {
+    monitor_device_path
+        .to_ascii_uppercase()
+        .contains(PF_EDID_MANUFACTURER)
+}
+
 /// Classify a CCD output technology: `(external physical?, log label)`. Allowlist, not blocklist:
 /// new/unknown/indirect technologies read as non-external, so a co-installed third-party virtual
 /// display can never be mistaken for a physical suspect (same precision rule as `monitor_devnode`).
@@ -1096,7 +1127,14 @@ pub fn target_inventory() -> Vec<TargetInventory> {
         if unsafe { DisplayConfigGetDeviceInfo(&mut req.header) } != 0 {
             continue; // target with no queryable monitor — nothing to attribute to
         }
-        let (external_physical, tech) = output_tech_class(req.outputTechnology);
+        let monitor_device_path = utf16z_str(&req.monitorDevicePath);
+        let (mut external_physical, mut tech) = output_tech_class(req.outputTechnology);
+        // Our own IddCx monitor claims HDMI, so the connector class alone would call it one of the
+        // operator's panels — see `is_our_virtual_display` for what that broke.
+        if is_our_virtual_display(&monitor_device_path) {
+            external_physical = false;
+            tech = "punktfunk-virtual";
+        }
         out.push(TargetInventory {
             target_id: t.id,
             active: active.contains(&key),
@@ -1104,7 +1142,7 @@ pub fn target_inventory() -> Vec<TargetInventory> {
             internal_panel: tech == "internal-panel",
             tech,
             friendly: utf16z_str(&req.monitorFriendlyDeviceName),
-            monitor_device_path: utf16z_str(&req.monitorDevicePath),
+            monitor_device_path,
         });
     }
     out
@@ -1685,6 +1723,62 @@ mod live_tests {
     /// where the query returned 0x57 ERROR_INVALID_PARAMETER (and 0x5 ERROR_ACCESS_DENIED from
     /// session 0). This case FAILS there without the zero-path short-circuit and passes with it,
     /// while a box that does have a display lit passes either way.
+    /// Pure, so it runs everywhere — the identification rule itself needs no hardware.
+    #[test]
+    fn our_own_virtual_display_is_never_an_external_physical() {
+        assert!(super::is_our_virtual_display(
+            r"\\?\DISPLAY#PNK0000#5&1234abcd&0&UID257#{e6f07b5f-ee97-4a90-b076-33f57bf4eaa7}"
+        ));
+        // Case-insensitive: the OS is not consistent about the path's case.
+        assert!(super::is_our_virtual_display(
+            r"\\?\display#pnk0000#5&1&0&uid257#{guid}"
+        ));
+        // A real panel, and a third-party virtual display, both stay physical suspects.
+        assert!(!super::is_our_virtual_display(
+            r"\\?\DISPLAY#GSM83CD#5&367fb4cb&0&UID4352#{e6f07b5f-ee97-4a90-b076-33f57bf4eaa7}"
+        ));
+        assert!(!super::is_our_virtual_display(
+            r"\\?\DISPLAY#SMVD0001#5&1&0&UID999#{guid}"
+        ));
+    }
+
+    /// Read-only: prove on real hardware that punktfunk's own display is not counted among the
+    /// operator's physical panels. Creates and destroys nothing, so it is safe to run against a
+    /// live host — which matters, because repeated IddCx create/destroy cycles are exactly what
+    /// wedges the driver's slot pool.
+    ///
+    /// Measured on .173 BEFORE the fix: `[(4352, "LG TV SSCR2", HDMI), (257, "punktfunk", HDMI)]`
+    /// with both flagged `external_physical`, because the driver declares
+    /// `DISPLAYCONFIG_OUTPUT_TECHNOLOGY_HDMI`.
+    #[test]
+    #[ignore = "hardware: reads the live display topology"]
+    fn our_own_display_is_excluded_from_the_operators_physicals_on_real_hardware() {
+        let inv = target_inventory();
+        for t in &inv {
+            println!(
+                "target {:>5}  active={:<5} external_physical={:<5} tech={:<18} {:?}  {}",
+                t.target_id,
+                t.active,
+                t.external_physical,
+                t.tech,
+                t.friendly,
+                t.monitor_device_path
+            );
+        }
+        for t in inv
+            .iter()
+            .filter(|t| is_our_virtual_display(&t.monitor_device_path))
+        {
+            assert!(
+                !t.external_physical,
+                "our own display {} ({:?}) is still counted as one of the operator's physical \
+                 panels — `restore_displays_ccd`'s dark-desk backstop keys on exactly this set and \
+                 would never fire",
+                t.target_id, t.friendly
+            );
+        }
+    }
+
     #[test]
     #[ignore = "hardware: reads the live display topology"]
     fn a_host_with_nothing_lit_reports_zero_actives_rather_than_a_failed_query() {

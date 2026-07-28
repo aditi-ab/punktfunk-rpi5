@@ -221,6 +221,42 @@ fn poll_gdi_name(target_id: u32) -> Option<String> {
     None
 }
 
+/// Test-only fault injection for the CCD isolate.
+///
+/// Every Phase-3 recovery leg in this file fires only when [`isolate_displays_ccd`] returns `None`,
+/// and on healthy hardware it never does — which is exactly why those legs shipped unexercised on
+/// glass. This counter lets a live test fail the next N isolates against the REAL driver and a REAL
+/// panel, so the recovery is observed rather than reasoned about.
+///
+/// `#[cfg(test)]`-only on purpose: this crate's live hardware tests compile under `cfg(test)`, so
+/// the seam is reachable where it is needed WITHOUT shipping a production knob that could leave
+/// display isolation silently disabled on an operator's box.
+#[cfg(test)]
+pub(crate) static FAIL_NEXT_ISOLATES: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
+/// [`isolate_displays_ccd`] with the test seam in front of it. Every call site in this file goes
+/// through here so an injected failure exercises the same gates a real one would.
+fn isolate_displays_ccd_seam(keep_target_ids: &[u32]) -> Option<SavedConfig> {
+    #[cfg(test)]
+    {
+        use std::sync::atomic::Ordering;
+        if FAIL_NEXT_ISOLATES
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                (n > 0).then(|| n - 1)
+            })
+            .is_ok()
+        {
+            tracing::warn!(
+                keep = ?keep_target_ids,
+                "TEST fault injection: forcing isolate_displays_ccd -> None"
+            );
+            return None;
+        }
+    }
+    isolate_displays_ccd(keep_target_ids)
+}
+
 fn shrink_action(ccd_exclusive: bool, has_saved: bool) -> ShrinkAction {
     if ccd_exclusive {
         ShrinkAction::Reisolate
@@ -975,7 +1011,7 @@ impl VirtualDisplayManager {
                             "re-asserting exclusive topology"
                         ),
                     }
-                    let _ = isolate_displays_ccd(&keep);
+                    let _ = isolate_displays_ccd_seam(&keep);
                     // That same forced re-commit hands the live IDD path a fresh swap-chain,
                     // orphaning the session's capture ring — announce it so the session rebuilds
                     // its capture attachment (same-mode ring recreate + driver re-attach + fresh
@@ -1198,7 +1234,7 @@ impl VirtualDisplayManager {
                             if crate::policy::prefs().ddc_power_off() {
                                 inner.group.ddc_panels_off = crate::ddc::panel_off_except(n);
                             }
-                            inner.group.ccd_saved = isolate_displays_ccd(&keep);
+                            inner.group.ccd_saved = isolate_displays_ccd_seam(&keep);
                             // EXPERIMENTAL `pnp_disable_monitors` policy axis: AFTER the isolate took,
                             // additionally disable the deactivated monitors' PnP devnodes (persistent
                             // across hot-plug re-arrival) so a standby monitor/TV's periodic wake
@@ -1223,7 +1259,7 @@ impl VirtualDisplayManager {
                             // Grown set: re-isolate so the fresh member joins the composited set
                             // (its auto-activate may have lit nothing extra to deactivate, but the
                             // re-commit also drives COMMIT_MODES for the new path).
-                            let snap = isolate_displays_ccd(&keep);
+                            let snap = isolate_displays_ccd_seam(&keep);
                             // Normally DISCARDED — the group restores the FIRST member's snapshot.
                             // But if the first member's isolate FAILED, there is no first snapshot,
                             // and this one just deactivated the physicals with nothing able to put
@@ -1643,7 +1679,7 @@ impl VirtualDisplayManager {
                 // snapshot is DISCARDED — the group keeps the first member's (design §6.1).
                 let mut keep = inner.target_ids();
                 keep.push(new_target);
-                let _ = isolate_displays_ccd(&keep);
+                let _ = isolate_displays_ccd_seam(&keep);
             }
             Topology::Primary => {
                 // Make the new target primary again (its predecessor held primary), preserving the
@@ -1740,7 +1776,7 @@ impl VirtualDisplayManager {
                 // the group keeps the first member's.
                 ShrinkAction::Reisolate => {
                     let keep = inner.target_ids();
-                    let _ = isolate_displays_ccd(&keep);
+                    let _ = isolate_displays_ccd_seam(&keep);
                 }
                 // Re-promote a survivor rather than leaving the desktop's primary on a target that
                 // is about to be REMOVEd. Same save/restore-the-snapshot dance as

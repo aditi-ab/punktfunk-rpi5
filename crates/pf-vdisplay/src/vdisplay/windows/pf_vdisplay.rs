@@ -924,6 +924,161 @@ mod tests {
         drop(vout); // triggers REMOVE + stops the pinger
     }
 
+    /// Forces `Topology::Exclusive` for the duration of a case and puts the operator's real policy
+    /// back on drop — including when the case panics.
+    ///
+    /// The isolate branch this file's Phase-3 cases exercise runs ONLY under `Exclusive`, and a real
+    /// install is usually configured otherwise (.173 is `"topology": "extend"`, which is why the
+    /// first attempt at these cases silently never ran an isolate at all — `topology_action()`
+    /// returns `effective_topology()` as soon as ANY policy is configured). Note this writes the
+    /// host's `display-settings.json`; the guard is what makes that safe to do on a real box.
+    struct ExclusiveTopology(crate::policy::DisplayPolicy);
+
+    impl ExclusiveTopology {
+        fn force() -> Self {
+            let original = crate::policy::prefs().get();
+            let mut forced = original.clone();
+            forced.preset = crate::policy::Preset::Custom; // explicit fields are ignored otherwise
+            forced.topology = crate::policy::Topology::Exclusive;
+            crate::policy::prefs()
+                .set(forced)
+                .expect("force Topology::Exclusive for this case");
+            assert_eq!(
+                crate::effective_topology(),
+                crate::policy::Topology::Exclusive,
+                "the forced policy did not resolve to Exclusive"
+            );
+            Self(original)
+        }
+    }
+
+    impl Drop for ExclusiveTopology {
+        fn drop(&mut self) {
+            if let Err(e) = crate::policy::prefs().set(self.0.clone()) {
+                eprintln!("WARNING: could not restore the display policy: {e}");
+            }
+        }
+    }
+
+    /// §5 3.2 on glass: when the FIRST member's isolate fails, a later member's isolate must be
+    /// ADOPTED as the group's restore snapshot — otherwise it deactivates the operator's panels
+    /// with nothing able to put them back.
+    ///
+    /// This leg only fires on a FAILED `isolate_displays_ccd`, which real hardware does not
+    /// produce, so it shipped unexercised. `manager::FAIL_NEXT_ISOLATES` (a `#[cfg(test)]` seam)
+    /// fails exactly the first isolate, against the real driver and a real panel; the second member
+    /// then isolates for real and the physical genuinely goes dark mid-test.
+    ///
+    /// The assertion is the user-visible one: after both members are torn down, the operator's
+    /// external panel is ACTIVE again. Without the adoption the group holds no snapshot,
+    /// `teardown_removed`'s restore is gated on it and never runs, and the panel stays deactivated.
+    ///
+    /// ⚠️ Two members means two SLOTS, which is what `slot_id_for(client_fp, …)` keys on — hence the
+    /// two distinct client fingerprints. Needs `Topology::Exclusive`, which is the default when no
+    /// policy is configured and `PUNKTFUNK_NO_ISOLATE` is unset; the test asserts an isolate really
+    /// happened rather than trusting that.
+    ///
+    /// ⚠️ If this test leaves the desk dark, recover from the CONSOLE session with
+    /// `SetDisplayConfig(0,null,0,null, SDC_USE_DATABASE_CURRENT|SDC_APPLY)` — measured rc=0 on
+    /// .173. `SDC_TOPOLOGY_EXTEND` will NOT do it with a single connected display (rc=31).
+    #[test]
+    #[ignore = "needs the pf-vdisplay driver on real hardware; run with --ignored"]
+    fn live_a_failed_first_isolate_is_recovered_by_adopting_the_next() {
+        assert!(
+            std::env::var("PUNKTFUNK_NO_ISOLATE").is_err(),
+            "PUNKTFUNK_NO_ISOLATE forces Topology::Extend — this case needs Exclusive"
+        );
+        let _topology = ExclusiveTopology::force();
+        let physicals_before = active_physicals();
+        assert!(
+            !physicals_before.is_empty(),
+            "no external physical panel is active, so 'the panel came back' cannot be observed — \
+             power the display on first (a TV in standby reads as Code 45 / zero CCD paths)"
+        );
+        println!("physicals before          : {physicals_before:?}");
+
+        // Fail EXACTLY the first member's isolate.
+        super::super::manager::FAIL_NEXT_ISOLATES.store(1, std::sync::atomic::Ordering::Relaxed);
+
+        let mut vd1 = PfVdisplayDisplay::new().expect("open pf-vdisplay (member 1)");
+        vd1.set_client_identity(Some([0xA1; 32]));
+        let out1 = vd1
+            .create(Mode {
+                width: 1920,
+                height: 1080,
+                refresh_hz: 60,
+            })
+            .expect("create member 1");
+        thread::sleep(Duration::from_secs(2));
+        println!(
+            "after member 1 (isolate INJECTED to fail): {:?}",
+            active_targets()
+        );
+
+        let mut vd2 = PfVdisplayDisplay::new().expect("open pf-vdisplay (member 2)");
+        vd2.set_client_identity(Some([0xB2; 32]));
+        let out2 = vd2
+            .create(Mode {
+                width: 1280,
+                height: 720,
+                refresh_hz: 60,
+            })
+            .expect("create member 2");
+        thread::sleep(Duration::from_secs(2));
+        let during = active_physicals();
+        println!(
+            "after member 2 (isolate REAL)            : {:?}",
+            active_targets()
+        );
+        println!("physicals during                        : {during:?}");
+
+        // The seam must have been consumed — otherwise the injection never took and a pass here
+        // would prove nothing about the recovery.
+        assert_eq!(
+            super::super::manager::FAIL_NEXT_ISOLATES.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "the injected isolate failure was never consumed — no isolate ran, so this run proves \
+             nothing (is the topology really Exclusive?)"
+        );
+
+        drop(out2);
+        drop(out1);
+        thread::sleep(Duration::from_secs(6)); // async PnP removal + the restore settling
+
+        let physicals_after = active_physicals();
+        println!("physicals after teardown  : {physicals_after:?}");
+        assert!(
+            !physicals_after.is_empty(),
+            "the operator's physical panel was left DEACTIVATED after teardown. The first \
+             member's isolate failed, so the group held no restore snapshot; the second member's \
+             isolate deactivated the physicals and its snapshot was discarded (sweep §5 3.2). \
+             Active targets now: {:?}",
+            active_targets()
+        );
+    }
+
+    /// The ACTIVE display targets, as `(target_id, friendly)` — not just a count.
+    ///
+    /// Counting alone cannot tell "the physical is still lit" from "the physical was deactivated
+    /// and the virtual took its place", which on a single-panel box are both `1`. Every on-glass
+    /// claim in this module about panels going dark rests on the identities, so read them.
+    fn active_targets() -> Vec<(u32, String)> {
+        pf_win_display::win_display::target_inventory()
+            .into_iter()
+            .filter(|t| t.active)
+            .map(|t| (t.target_id, format!("{} [{}]", t.friendly, t.tech)))
+            .collect()
+    }
+
+    /// The active targets that are EXTERNAL PHYSICAL panels — the operator's actual desk.
+    fn active_physicals() -> Vec<(u32, String)> {
+        pf_win_display::win_display::target_inventory()
+            .into_iter()
+            .filter(|t| t.active && t.external_physical)
+            .map(|t| (t.target_id, format!("{} [{}]", t.friendly, t.tech)))
+            .collect()
+    }
+
     /// `SDC_TOPOLOGY_EXTEND` needs something to extend ACROSS — and that is the state its callers
     /// are in, which is why this looked like a defect and is not.
     ///
@@ -953,10 +1108,7 @@ mod tests {
     #[test]
     #[ignore = "needs the pf-vdisplay driver on real hardware; run with --ignored"]
     fn live_force_extend_with_a_virtual_display_present() {
-        fn active_paths() -> Option<u32> {
-            pf_win_display::win_display::count_other_active(&[])
-        }
-        let before = active_paths();
+        let before = active_targets();
         let mut vd = PfVdisplayDisplay::new().expect("open pf-vdisplay");
         let vout = vd
             .create(Mode {
@@ -966,21 +1118,26 @@ mod tests {
             })
             .expect("create virtual display");
         thread::sleep(Duration::from_secs(2));
-        let with_virtual = active_paths();
+        let with_virtual = active_targets();
+        let physicals_with_virtual = active_physicals();
         pf_win_display::win_display::force_extend_topology();
         thread::sleep(Duration::from_secs(2));
-        let after_extend = active_paths();
+        let after_extend = active_targets();
         drop(vout);
-        thread::sleep(Duration::from_secs(3));
-        let after_drop = active_paths();
-        println!(
-            "force-EXTEND on glass: active paths {before:?} -> (virtual up) {with_virtual:?} -> \
-             (after force-EXTEND) {after_extend:?} -> (virtual dropped) {after_drop:?}"
-        );
-        assert_ne!(
-            after_drop,
-            Some(0),
+        thread::sleep(Duration::from_secs(6)); // PnP removal is async — a short wait reads a ghost
+        let after_drop = active_targets();
+        println!("force-EXTEND on glass, ACTIVE TARGETS at each step:");
+        println!("  before          : {before:?}");
+        println!("  virtual up      : {with_virtual:?}   (physicals: {physicals_with_virtual:?})");
+        println!("  after force-EXT : {after_extend:?}");
+        println!("  virtual dropped : {after_drop:?}");
+        assert!(
+            !after_drop.is_empty(),
             "the desk was left with NO active display path after the teardown"
+        );
+        assert!(
+            !active_physicals().is_empty(),
+            "the operator's physical panel was left DEACTIVATED after teardown: {after_drop:?}"
         );
     }
 
