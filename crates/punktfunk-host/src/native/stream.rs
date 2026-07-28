@@ -1232,6 +1232,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                 &mut vd,
                 mode,
                 bitrate_kbps,
+                bitrate_auto,
                 bit_depth,
                 plan,
                 &quit,
@@ -1244,8 +1245,18 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
             (vd, pipe)
         }
     };
-    let (mut capturer, mut enc, mut frame, mut interval, mut cur_node_id, mut cur_display_gen) =
-        pipe;
+    let (
+        mut capturer,
+        mut enc,
+        mut frame,
+        mut interval,
+        mut cur_node_id,
+        mut cur_display_gen,
+        built_bitrate,
+    ) = pipe;
+    // The encoder may have opened at a re-resolved rate (a mirrored head delivering a size this
+    // session never negotiated). Adopt it before anything downstream reads `bitrate_kbps`.
+    adopt_built_bitrate(&mut bitrate_kbps, built_bitrate, &live_bitrate);
 
     // Capture is live — launch the requested title so it renders onto the streamed output and
     // grabs focus. Windows spawns the library id into the interactive user session; Linux spawns
@@ -1620,6 +1631,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                             &mut new_vd,
                             cur_mode,
                             bitrate_kbps,
+                            bitrate_auto,
                             bit_depth,
                             plan,
                             &quit,
@@ -1632,7 +1644,15 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                 match rebuilt {
                     Ok((
                         new_vd,
-                        (new_cap, new_enc, new_frame, new_interval, new_node_id, new_gen),
+                        (
+                            new_cap,
+                            new_enc,
+                            new_frame,
+                            new_interval,
+                            new_node_id,
+                            new_gen,
+                            new_bitrate,
+                        ),
                     )) => {
                         // Replace the pipeline first (drops the old capturer → old PipeWire stream +
                         // virtual output), then the factory (drops e.g. the old KWin connection).
@@ -1642,6 +1662,10 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                         interval = new_interval;
                         cur_node_id = new_node_id;
                         cur_display_gen = new_gen;
+                        // The new compositor may deliver a different size than the old one did (a
+                        // Game→Desktop switch onto a mirrored 4K panel is exactly that), so adopt
+                        // the rate the rebuilt encoder actually opened at.
+                        adopt_built_bitrate(&mut bitrate_kbps, new_bitrate, &live_bitrate);
                         vd = new_vd;
                         compositor = sw.compositor;
                         next = std::time::Instant::now();
@@ -1711,6 +1735,12 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                 );
             #[cfg(not(target_os = "windows"))]
             let fast_done = false;
+            // The rate the rebuilt encoder ends up opened at. Seeded with the new mode's own
+            // re-resolve, which is what the Windows in-place fast path applies (it swaps only the
+            // encoder and never reaches `build_pipeline`); a full rebuild overwrites it with the
+            // rate `build_pipeline` actually used, which differs when the source delivers a size
+            // the mode did not ask for.
+            let mut built_bitrate = mode_bitrate;
             // Full rebuild — build the new pipeline BEFORE dropping the old one: the host already
             // acked the switch as accepted, so a rebuild failure must not kill an otherwise
             // healthy session — keep streaming the current mode and log instead.
@@ -1719,6 +1749,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                     &mut vd,
                     new_mode,
                     mode_bitrate,
+                    bitrate_auto,
                     bit_depth,
                     plan,
                     &quit,
@@ -1736,7 +1767,15 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                         // The destructuring assignment drops the OLD capturer (→ its display lease)
                         // as each binding is replaced — the new pipeline is already up
                         // (create-before-drop).
-                        (capturer, enc, frame, interval, cur_node_id, cur_display_gen) = next_pipe;
+                        (
+                            capturer,
+                            enc,
+                            frame,
+                            interval,
+                            cur_node_id,
+                            cur_display_gen,
+                            built_bitrate,
+                        ) = next_pipe;
                         // H4: the old display's lease drop above is indistinguishable from a
                         // disconnect to the keep-alive machinery — under linger/forever policies
                         // every resize would ACCUMULATE kept monitors at stale modes. Retire the
@@ -1766,15 +1805,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                     }
                 };
             if rebuilt {
-                if mode_bitrate != bitrate_kbps {
-                    tracing::info!(
-                        from_kbps = bitrate_kbps,
-                        to_kbps = mode_bitrate,
-                        "pinned PyroWave bitrate re-resolved for the new mode"
-                    );
-                    bitrate_kbps = mode_bitrate;
-                    live_bitrate.store(mode_bitrate, Ordering::Relaxed);
-                }
+                adopt_built_bitrate(&mut bitrate_kbps, built_bitrate, &live_bitrate);
                 cur_mode = new_mode;
                 next = std::time::Instant::now();
                 // H2/H3: the backend may have honored a different mode than requested — KWin caps
@@ -2225,7 +2256,15 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                         );
                     }
                 }
-                let (new_cap, new_enc, new_frame, new_interval, new_node_id, new_display_gen) = loop {
+                let (
+                    new_cap,
+                    new_enc,
+                    new_frame,
+                    new_interval,
+                    new_node_id,
+                    new_display_gen,
+                    new_bitrate,
+                ) = loop {
                     // Follow the active session unless an explicit PUNKTFUNK_COMPOSITOR pin forbids
                     // retargeting (then we stick to the pinned backend and just rebuild it).
                     if pf_host_config::config().compositor.is_none() {
@@ -2288,6 +2327,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                         &mut vd,
                         cur_mode,
                         bitrate_kbps,
+                        bitrate_auto,
                         bit_depth,
                         plan,
                         &quit,
@@ -2331,6 +2371,10 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                 interval = new_interval;
                 cur_node_id = new_node_id;
                 cur_display_gen = new_display_gen;
+                // A capture-loss rebuild can land on a different source than it lost (this loop
+                // re-detects the session every cycle, precisely so it can follow a switch), so the
+                // delivered size — and with it an Automatic rate — may have changed under us.
+                adopt_built_bitrate(&mut bitrate_kbps, new_bitrate, &live_bitrate);
                 enc.request_keyframe(); // belt-and-suspenders; a fresh encoder opens on an IDR anyway
                 last_forced_idr = Some(std::time::Instant::now()); // anchor the IDR cooldown from the rebuild
                 next = std::time::Instant::now();
@@ -2999,6 +3043,11 @@ type Pipeline = (
     // `registry::retire` the superseded old display, so linger/forever keep-alive policies don't
     // accumulate kept monitors at stale modes (design/midstream-resolution-resize.md H4).
     Option<u64>,
+    // The bitrate the encoder was ACTUALLY opened at (kbps). Normally the one asked for; different
+    // when an Automatic rate was re-resolved because the source delivers a size the session did not
+    // negotiate (a monitor mirror). The caller adopts it so the ABR controller, the console sample
+    // and every later `SetBitrate` resolve against what the encoder is really doing.
+    u32,
 );
 
 /// The in-place resize fast path (latency plan P2.3, Windows IDD-push): the manager mode-sets the
@@ -3197,6 +3246,8 @@ pub(super) fn prepare_display(
     client_hdr: Option<punktfunk_core::quic::HdrMeta>,
     cursor_forward: bool,
     bitrate_kbps: u32,
+    // Passed through to [`build_pipeline`] — see its parameter of the same name.
+    bitrate_auto: bool,
     bit_depth: u8,
     chroma: crate::encode::ChromaFormat,
     codec: crate::encode::Codec,
@@ -3245,6 +3296,7 @@ pub(super) fn prepare_display(
         &mut vd,
         mode,
         bitrate_kbps,
+        bitrate_auto,
         bit_depth,
         plan,
         quit,
@@ -3270,6 +3322,8 @@ fn build_pipeline_with_retry(
     vd: &mut Box<dyn crate::vdisplay::VirtualDisplay>,
     mode: punktfunk_core::Mode,
     bitrate_kbps: u32,
+    // Passed through to [`build_pipeline`] — see its parameter of the same name.
+    bitrate_auto: bool,
     bit_depth: u8,
     plan: crate::session_plan::SessionPlan,
     quit: &Arc<AtomicBool>,
@@ -3333,6 +3387,7 @@ fn build_pipeline_with_retry(
             vd,
             mode,
             bitrate_kbps,
+            bitrate_auto,
             bit_depth,
             plan,
             quit,
@@ -3427,6 +3482,25 @@ fn pacing_hz(session_hz: u32, achieved_hz: u32) -> u32 {
     achieved_hz.min(session_hz).max(1)
 }
 
+/// Adopt the rate a freshly built pipeline's encoder was actually opened at.
+///
+/// The session's own `bitrate_kbps` is the number every later decision reads — the ABR controller's
+/// climb base, the console's sample, what a `SetBitrate` ack is measured against — so letting it
+/// disagree with the live encoder means each of those reasons about a stream that doesn't exist.
+/// Silent when nothing changed, which is the overwhelmingly common case.
+fn adopt_built_bitrate(current: &mut u32, built: u32, live: &Arc<AtomicU32>) {
+    if built == *current {
+        return;
+    }
+    tracing::info!(
+        from_kbps = *current,
+        to_kbps = built,
+        "adopted the rebuilt pipeline's bitrate (re-resolved for what it actually encodes)"
+    );
+    *current = built;
+    live.store(built, Ordering::Relaxed);
+}
+
 /// Encode-stall recovery: rebuild the encoder in place (keeping capture + the session up) and
 /// discard the owed in-flight frame records — their AUs died with the old encoder instance.
 /// Returns `false` when the backend has no in-place rebuild ([`crate::encode::Encoder::reset`]'s
@@ -3450,6 +3524,10 @@ fn build_pipeline(
     vd: &mut Box<dyn crate::vdisplay::VirtualDisplay>,
     mode: punktfunk_core::Mode,
     bitrate_kbps: u32,
+    // The client asked for "Automatic", so `bitrate_kbps` is the host's own codec-aware answer for
+    // `mode` — and may be re-resolved below when the source delivers a different size than `mode`.
+    // An explicit client rate is left exactly as given.
+    bitrate_auto: bool,
     bit_depth: u8,
     plan: crate::session_plan::SessionPlan,
     quit: &Arc<AtomicBool>,
@@ -3568,6 +3646,40 @@ fn build_pipeline(
     if let Some(t) = trace {
         t.mark("first_frame");
     }
+    // A source may deliver a different frame size than the session negotiated, and the encoder below
+    // is opened at the DELIVERED one. The case that matters is a monitor MIRROR: `MirrorDisplay`
+    // ignores the requested mode by design (a physical head runs at the mode its owner set —
+    // design/per-monitor-portal-capture.md §7.3), so a client that asked for 1080p and mirrors a 4K
+    // panel encodes four times the pixels. An Automatic bitrate resolved from the *negotiated* mode
+    // then hands the codec a quarter of the bits per pixel it was sized for, which arrives as a soft,
+    // stuttering picture rather than as the mismatch it actually is. Re-resolve for what we will
+    // really encode.
+    //
+    // Automatic ONLY. An explicit client rate is the operator's statement about their own link and is
+    // never second-guessed — the same contract `resolve_bitrate_kbps_for` keeps everywhere else. The
+    // refresh is left at the negotiated one so this changes exactly one input (the pixel count) to a
+    // formula that is otherwise untouched.
+    let bitrate_kbps = if bitrate_auto && (frame.width, frame.height) != (mode.width, mode.height) {
+        let delivered = punktfunk_core::Mode {
+            width: frame.width,
+            height: frame.height,
+            ..mode
+        };
+        let re = resolve_bitrate_kbps_for(plan.codec, 0, &delivered, plan.chroma, bit_depth);
+        if re != bitrate_kbps {
+            tracing::info!(
+                negotiated = %format!("{}x{}", mode.width, mode.height),
+                delivered = %format!("{}x{}", frame.width, frame.height),
+                from_kbps = bitrate_kbps,
+                to_kbps = re,
+                "the source delivers a different size than the session negotiated — re-resolved the \
+                 Automatic bitrate for the pixels actually being encoded"
+            );
+        }
+        re
+    } else {
+        bitrate_kbps
+    };
     // `bit_depth` is the handshake-negotiated value (8, or 10 = HEVC Main10 when the client
     // advertised VIDEO_CAP_10BIT and the host opted in). Threaded down from the Welcome.
     let mut enc = crate::encode::open_video(
@@ -3605,7 +3717,15 @@ fn build_pipeline(
         );
     }
     let interval = std::time::Duration::from_secs_f64(1.0 / effective_hz.max(1) as f64);
-    Ok((capturer, enc, frame, interval, node_id, pool_gen))
+    Ok((
+        capturer,
+        enc,
+        frame,
+        interval,
+        node_id,
+        pool_gen,
+        bitrate_kbps,
+    ))
 }
 
 #[cfg(test)]

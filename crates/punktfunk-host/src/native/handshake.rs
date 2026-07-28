@@ -577,6 +577,10 @@ pub(super) async fn negotiate(
             // prepared display and the session wiring cannot disagree with it.
             let cursor_fw = welcome.host_caps & punktfunk_core::quic::HOST_CAP_CURSOR != 0;
             let (mode, shard_payload) = (hello.mode, welcome.shard_payload);
+            // "Automatic" — `bitrate_kbps` above is the host's own answer for `mode`, so the build
+            // may re-resolve it if the source turns out to deliver a different size. Sampled here
+            // rather than in the thread body so the closure doesn't have to capture `hello`.
+            let bitrate_auto = hello.bitrate_kbps == 0;
             let trace = bringup.clone();
             std::thread::Builder::new()
                 .name("punktfunk1-stream".into())
@@ -588,6 +592,7 @@ pub(super) async fn negotiate(
                         client_hdr,
                         cursor_fw,
                         bitrate_kbps,
+                        bitrate_auto,
                         bit_depth,
                         chroma,
                         codec,
