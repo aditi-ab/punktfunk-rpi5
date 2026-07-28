@@ -3012,7 +3012,10 @@ fn try_inplace_resize(
     // re-arrival fallback) and returns a +1-ref lease, released again when `vout` drops below —
     // the capturer keeps holding its own original lease (`gen` is preserved by both paths).
     // In-place resize keeps the SAME display (no supersede — the manager resizes the live monitor).
-    let vout = match crate::vdisplay::registry::acquire(vd, new_mode, quit.clone(), None) {
+    // Same display-rate multiplier the initial build applies, so a mid-stream resize doesn't
+    // silently drop back to 1×.
+    let new_display_mode = display_mode_for(new_mode);
+    let vout = match crate::vdisplay::registry::acquire(vd, new_display_mode, quit.clone(), None) {
         Ok(v) => v,
         Err(e) => {
             tracing::warn!(error = %format!("{e:#}"), "in-place resize: acquire failed");
@@ -3020,11 +3023,12 @@ fn try_inplace_resize(
         }
     };
     trace.mark("display_resized");
-    let effective_hz = vout
+    let achieved_hz = vout
         .preferred_mode
         .map(|(_, _, hz)| hz)
         .filter(|&hz| hz > 0)
-        .unwrap_or(new_mode.refresh_hz);
+        .unwrap_or(new_display_mode.refresh_hz);
+    let effective_hz = pacing_hz(new_mode.refresh_hz, achieved_hz);
     if vout.win_capture.as_ref().map(|t| t.target_id) != Some(cur_target) {
         // The manager re-arrived a fresh monitor (old driver / in-place failure): this capturer is
         // bound to the departed target. The full rebuild re-acquires (JOINing the already-resized
@@ -3369,6 +3373,37 @@ fn is_permanent_build_error(chain: &str) -> bool {
     PERMANENT.iter().any(|p| lower.contains(p))
 }
 
+/// The mode the VIRTUAL DISPLAY is created at, which is the session's mode with its refresh rate
+/// multiplied by `PUNKTFUNK_VDISPLAY_HZ_MULT` (default 1 — off, and then this is the identity).
+///
+/// The stream is NOT paced at this rate; [`pacing_hz`] clamps it straight back down. Overdriving
+/// only the display buys freshness: a compositor paints on its own vblank, so at 1× a frame that
+/// finished just after the capture sampled waits nearly a full interval to be picked up. Doubling
+/// the display's rate halves that worst case without putting one extra frame on the wire.
+///
+/// Capped at the 0xffff the mode word packs into ([`crate::native::pack_mode`]) so an absurd
+/// combination can't wrap; in practice the backend refuses long before that and reports what it
+/// achieved instead.
+fn display_mode_for(session: punktfunk_core::Mode) -> punktfunk_core::Mode {
+    let mult = pf_host_config::config().vdisplay_hz_mult.max(1);
+    punktfunk_core::Mode {
+        refresh_hz: session.refresh_hz.saturating_mul(mult).min(0xffff),
+        ..session
+    }
+}
+
+/// The rate the stream is PACED and the encoder opened at: never above what the session
+/// negotiated, and never above what the display actually achieved.
+///
+/// Two independent reasons the two differ. Downward: a backend can refuse the requested refresh
+/// (KWin caps a virtual output at 60 Hz when the custom-mode install is rejected), and pacing
+/// above the source would only emit phantom duplicates. Upward: [`display_mode_for`] deliberately
+/// asked for a multiple of the session rate, and honoring that on the wire would send the client
+/// frames it never negotiated.
+fn pacing_hz(session_hz: u32, achieved_hz: u32) -> u32 {
+    achieved_hz.min(session_hz).max(1)
+}
+
 /// Encode-stall recovery: rebuild the encoder in place (keeping capture + the session up) and
 /// discard the owed in-flight frame records — their AUs died with the old encoder instance.
 /// Returns `false` when the backend has no in-place rebuild ([`crate::encode::Encoder::reset`]'s
@@ -3413,7 +3448,8 @@ fn build_pipeline(
     // session per policy); on Windows it delegates to `vd.create` (the manager already leases). The
     // returned `VirtualOutput`'s keepalive is a registry lease — the capturer holds it as before. The
     // `quit` flag rides into the lease so a deliberate-quit teardown skips the keep-alive linger.
-    let vout = crate::vdisplay::registry::acquire(vd, mode, quit.clone(), supersedes)
+    let display_mode = display_mode_for(mode);
+    let vout = crate::vdisplay::registry::acquire(vd, display_mode, quit.clone(), supersedes)
         .context("create virtual output")?;
     if let Some(t) = trace {
         t.mark("display_acquired");
@@ -3433,21 +3469,35 @@ fn build_pipeline(
     // this session's own node). Read before `capture_virtual_output` consumes `vout`.
     let node_id = vout.node_id;
     // The backend reports the refresh it actually achieved in `preferred_mode.2` (KWin may cap a
-    // virtual output at 60 Hz if the custom-mode install was rejected). Pace the encoder + frame
-    // clock to that, not the requested rate, so we don't emit phantom duplicate frames over a
-    // slower source. Falls back to the requested rate when a backend reports nothing.
-    let effective_hz = vout
+    // virtual output at 60 Hz if the custom-mode install was rejected). Falls back to the
+    // requested rate when a backend reports nothing.
+    let achieved_hz = vout
         .preferred_mode
         .map(|(_, _, hz)| hz)
         .filter(|&hz| hz > 0)
-        .unwrap_or(mode.refresh_hz);
-    if effective_hz != mode.refresh_hz {
+        .unwrap_or(display_mode.refresh_hz);
+    // A shortfall BELOW the session's own rate is the one that costs the client frames — warn.
+    // Falling short of a multiplied ask while still meeting the session rate is the expected
+    // outcome of an opt-in knob on a backend that won't overdrive, not a fault, so it only
+    // informs. `pacing_hz` below keeps the session correct in both cases.
+    if achieved_hz < mode.refresh_hz {
         tracing::warn!(
-            requested = mode.refresh_hz,
-            effective = effective_hz,
+            requested = display_mode.refresh_hz,
+            achieved = achieved_hz,
+            session = mode.refresh_hz,
             "compositor did not honor the requested refresh — encoding at the achieved rate"
         );
+    } else if achieved_hz < display_mode.refresh_hz {
+        tracing::info!(
+            requested = display_mode.refresh_hz,
+            achieved = achieved_hz,
+            session = mode.refresh_hz,
+            "compositor did not honor the multiplied display refresh — the session rate is unaffected"
+        );
     }
+    // Pace the encoder + frame clock at the session's rate, floored by what the display achieved
+    // — never above either.
+    let effective_hz = pacing_hz(mode.refresh_hz, achieved_hz);
     // HDR vs SDR for the IDD-push conversion: a negotiated 10-bit session (client advertised
     // VIDEO_CAP_10BIT + host opted in via PUNKTFUNK_10BIT) is our HDR path → BT.2020 PQ Rgb10a2;
     // otherwise the FP16 IDD frames are converted to 8-bit SDR. (Ignored by non-IDD-push backends,
@@ -3538,6 +3588,41 @@ fn build_pipeline(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pacing_never_exceeds_the_session_rate_or_the_display() {
+        // Backend honored the request exactly (the multiplier off): pace at it.
+        assert_eq!(pacing_hz(120, 120), 120);
+        // Backend fell short (KWin capping a virtual output at 60): pace at what it gives,
+        // or we emit phantom duplicates over a slower source.
+        assert_eq!(pacing_hz(120, 60), 60);
+        // Display overdriven by PUNKTFUNK_VDISPLAY_HZ_MULT: the extra composites buy freshness,
+        // but the wire stays at the rate the client negotiated.
+        assert_eq!(pacing_hz(60, 120), 60);
+        assert_eq!(pacing_hz(120, 240), 120);
+        // Overdriven AND short of the multiplied ask, but still at or above the session rate —
+        // the session is unaffected.
+        assert_eq!(pacing_hz(60, 90), 60);
+        // Never zero: a 0 would divide into an infinite interval.
+        assert_eq!(pacing_hz(60, 0), 1);
+    }
+
+    #[test]
+    fn display_mode_multiplier_scales_only_the_refresh() {
+        // Default (no env set in the test process) is 1× — the identity, which is what every
+        // host that never touches the knob must keep getting.
+        let session = punktfunk_core::Mode {
+            width: 2560,
+            height: 1440,
+            refresh_hz: 60,
+        };
+        let display = display_mode_for(session);
+        assert_eq!((display.width, display.height), (2560, 1440));
+        assert_eq!(
+            display.refresh_hz,
+            session.refresh_hz * pf_host_config::config().vdisplay_hz_mult.max(1)
+        );
+    }
 
     #[test]
     fn reconfig_allowed_gates_gamescope_and_per_client_mode() {
