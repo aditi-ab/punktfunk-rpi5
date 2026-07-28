@@ -43,17 +43,13 @@ extension FocusedValues {
 
 struct StreamCommands: Commands {
     @FocusedValue(\.sessionFocus) private var session
-    // The raw string so @AppStorage observes the shared key; the absent-key default runs the
-    // legacy-hudEnabled migration (same pattern as ContentView/SettingsView).
-    @AppStorage(DefaultsKey.statsVerbosity) private var statsVerbosityRaw
-        = StatsVerbosity.current.rawValue
 
     var body: some Commands {
         CommandMenu("Stream") {
-            Button("Cycle Statistics") {
-                let current = StatsVerbosity(rawValue: statsVerbosityRaw) ?? .normal
-                statsVerbosityRaw = current.next().rawValue
-            }
+            // Through the shared cycle so it advances from the LIVE session's tier — a profile
+            // that starts a session on Detailed must cycle to Off from here, not from whatever
+            // the global default happens to be.
+            Button("Cycle Statistics") { StatsVerbosity.cycle() }
             .keyboardShortcut("s", modifiers: [.control, .option, .shift])
             // Reaches the key window's stream view via NotificationCenter — capture is view
             // state the Scene can't touch directly. (Captured, the combo is handled by

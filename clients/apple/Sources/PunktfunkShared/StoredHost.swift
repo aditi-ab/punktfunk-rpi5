@@ -39,11 +39,22 @@ public struct StoredHost: Identifiable, Codable, Hashable {
     /// forward-compat reason as `mgmtPort`). Honored only when the host advertises
     /// `HOST_CAP_CLIPBOARD`.
     public var clipboardSync: Bool?
+    /// This host's default settings profile (`StreamProfile.id`) — what a plain click/tap uses.
+    /// nil, or an id whose profile was deleted, resolves as "Default settings", i.e. exactly
+    /// today's behaviour: a dangling binding is never an error and never blocks a connect
+    /// (design/client-settings-profiles.md §4.4). Optional and appended last for the same
+    /// widget-contract reason as `mgmtPort`.
+    public var profileID: String?
+    /// Profiles pinned as additional cards for this host (design §5.2a), in card order. NOT the
+    /// default — that is `profileID`; a pin is presentation only, and duplicates and dangling ids
+    /// are dropped when the cards are built. Optional for the same forward-compat reason.
+    public var pinnedProfileIDs: [String]?
 
     public init(
         id: UUID = UUID(), name: String, address: String, port: UInt16 = 9777,
         pinnedSHA256: Data? = nil, lastConnected: Date? = nil, mgmtPort: UInt16? = nil,
-        macAddresses: [String]? = nil, clipboardSync: Bool? = nil
+        macAddresses: [String]? = nil, clipboardSync: Bool? = nil,
+        profileID: String? = nil, pinnedProfileIDs: [String]? = nil
     ) {
         self.id = id
         self.name = name
@@ -54,6 +65,8 @@ public struct StoredHost: Identifiable, Codable, Hashable {
         self.mgmtPort = mgmtPort
         self.macAddresses = macAddresses
         self.clipboardSync = clipboardSync
+        self.profileID = profileID
+        self.pinnedProfileIDs = pinnedProfileIDs
     }
 
     public var displayName: String { name.isEmpty ? address : name }

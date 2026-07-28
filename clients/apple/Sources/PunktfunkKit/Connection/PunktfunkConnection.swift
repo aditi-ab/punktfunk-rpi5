@@ -1020,6 +1020,20 @@ public final class PunktfunkConnection {
     /// auto-selected. Decoded by the Metal wavelet decoder, not VideoToolbox.
     public static let codecPyroWave: UInt8 = UInt8(PUNKTFUNK_CODEC_PYROWAVE)
 
+    /// The `codec` SETTING (a `DefaultsKey.codec` / profile-overlay string) as a soft-preference
+    /// byte; `0` = Automatic, i.e. the host decides. Lives here beside the bits so the settings
+    /// string is mapped to the wire in exactly one place — a session and a speed test that
+    /// disagreed on what "pyrowave" means would be a silent mismatch.
+    public static func codecByte(_ setting: String) -> UInt8 {
+        switch setting {
+        case "h264": return codecH264
+        case "hevc": return codecHEVC
+        case "av1": return codecAV1
+        case "pyrowave": return codecPyroWave
+        default: return 0
+        }
+    }
+
     /// `AccessUnit.flags` bit: the AU is shard-aligned self-delimiting chunks (the wire's
     /// `USER_FLAG_CHUNK_ALIGNED`, PyroWave datagram-aligned mode §4.4) — walk it
     /// window-by-window at `shardPayload`. (The C `#define` doesn't import into Swift.)

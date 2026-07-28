@@ -20,36 +20,32 @@ import SwiftUI
 struct ContentView: View {
     @StateObject private var model = SessionModel()
     @StateObject private var store = HostStore()
+    /// The settings-profile catalog (design/client-settings-profiles.md §4.2) — read at every
+    /// connect to resolve the session's `EffectiveSettings`, and edited by the settings surface.
+    @StateObject private var profiles = ProfileStore()
     @StateObject private var discovery = HostDiscovery()
+    // The dev auto-connect hook writes these three, so they stay observed here; every OTHER
+    // stream setting reaches a session through `EffectiveSettings`, resolved once per connect.
     @AppStorage(DefaultsKey.streamWidth) private var width = 1920
     @AppStorage(DefaultsKey.streamHeight) private var height = 1080
     @AppStorage(DefaultsKey.streamHz) private var hz = 60
-    @AppStorage(DefaultsKey.renderScale) private var renderScale = 1.0
-    @AppStorage(DefaultsKey.compositor) private var compositor = 0
-    @AppStorage(DefaultsKey.gamepadType) private var gamepadType = 0
-    @AppStorage(DefaultsKey.bitrateKbps) private var bitrateKbps = 0
-    @AppStorage(DefaultsKey.audioChannels) private var audioChannels = 2
-    @AppStorage(DefaultsKey.codec) private var codec = "auto"
-    @AppStorage(DefaultsKey.hdrEnabled) private var hdrEnabled = true
     @AppStorage(DefaultsKey.fullscreenWhileStreaming) private var fullscreenWhileStreaming = true
     // The raw string is what @AppStorage observes (so cycles from any surface re-render this
     // view); the absent-key default runs the legacy-hudEnabled migration once per init.
     @AppStorage(DefaultsKey.statsVerbosity) private var statsVerbosityRaw
         = StatsVerbosity.current.rawValue
     @AppStorage(DefaultsKey.hudPlacement) private var hudPlacement = HUDPlacement.topTrailing.rawValue
-    /// The persisted overlay tier (unknown raw falls back to .normal, like the migration).
+    /// The tier the overlay actually shows: the live session's (its profile's, then whatever the
+    /// ⌃⌥⇧S/three-finger cycle moved it to) while streaming, the persisted global otherwise.
     private var statsVerbosity: StatsVerbosity {
-        StatsVerbosity(rawValue: statsVerbosityRaw) ?? .normal
+        model.connection != nil
+            ? model.statsVerbosity
+            : (StatsVerbosity(rawValue: statsVerbosityRaw) ?? .normal)
     }
-    /// The `codec` setting as a `PUNKTFUNK_CODEC_*` soft-preference byte (`0` = auto).
-    private var preferredCodecByte: UInt8 {
-        switch codec {
-        case "h264": return PunktfunkConnection.codecH264
-        case "hevc": return PunktfunkConnection.codecHEVC
-        case "av1": return PunktfunkConnection.codecAV1
-        case "pyrowave": return PunktfunkConnection.codecPyroWave
-        default: return 0
-        }
+    /// Fullscreen-while-streaming is profileable (a Game profile goes fullscreen, a Work one
+    /// doesn't), so a live session obeys ITS value and the host list obeys the global.
+    private var fullscreenForSession: Bool {
+        model.connection != nil ? model.settings.fullscreenWhileStreaming : fullscreenWhileStreaming
     }
     @State private var showAddHost = false
     /// A `punktfunk://` deep link (widget / Siri / Shortcuts) couldn't be honored — unknown host, or
@@ -144,6 +140,12 @@ struct ContentView: View {
         // tap uses, so trust policy / WoL / the approval sheet all come along. Never starts a
         // parallel session — this drives the one `model` ContentView owns.
         .onOpenURL { handleDeepLink($0) }
+        // A live stats-overlay cycle from ANY surface (⌃⌥⇧S, the three-finger tap, the Stream
+        // menu) writes the global; push it into the session so the overlay follows it from there
+        // on, whatever tier the session's profile started on.
+        .onChange(of: statsVerbosityRaw) { _, raw in
+            model.setStatsVerbosity(StatsVerbosity(rawValue: raw) ?? .normal)
+        }
         #if os(iOS) || os(tvOS)
         // Backgrounding driver. Only .background/.active matter; .inactive (a transient peek) is
         // ignored so neither branch fires for a Control-Center pull.
@@ -260,7 +262,7 @@ struct ContentView: View {
         // `isFullscreen` (the user can toggle it manually), which drives the session view's
         // safe-area handling below.
         .background(FullscreenController(
-            active: fullscreenWhileStreaming && model.connection != nil,
+            active: fullscreenForSession && model.connection != nil,
             isFullscreen: $isFullscreen))
         #endif
         // On the outer Group so the sheet survives the trust-prompt → home transition
@@ -335,7 +337,7 @@ struct ContentView: View {
                     // once the window leaves fullscreen and `isFullscreen` flips, the alert shows
                     // over the windowed home UI. Not gated when fullscreen is the user's own manual
                     // choice (opt-out setting) — nothing is auto-exiting there to conflict with.
-                    if fullscreenWhileStreaming && isFullscreen { return false }
+                    if fullscreenForSession && isFullscreen { return false }
                     #endif
                     return true
                 },
@@ -396,25 +398,81 @@ struct ContentView: View {
     }
     #endif
 
-    /// Route a `punktfunk://` deep link into the existing connect path. Rules (per design):
-    /// unknown host → notice + no-op; a live session is up → ignore if it's the same host, else
-    /// tell the user to end the current one first (NEVER tear down a live session on a background
-    /// tap); otherwise the normal `connect` — trust policy, WoL and the approval sheet all apply.
+    /// Route a `punktfunk://` deep link into the existing connect path — the whole §2 grammar
+    /// (design/client-deep-links.md): a stable id, a unique host name or an `addr[:port]`, with
+    /// `fp`/`host` recovery parameters and a one-off `profile`.
+    ///
+    /// The security posture is the parser's plus three rules that live here, and none of them
+    /// bends: a URL never pairs and never trusts on its own (an unknown host becomes a
+    /// confirmation, not a connect), never preempts a live session (same host → focus, different
+    /// host → say so; NEVER tear one down on a background tap), and carries only references — a
+    /// profile it can't honor refuses with a notice rather than streaming with the wrong settings.
     private func handleDeepLink(_ url: URL) {
-        guard case let .connect(hostID, launchID)? = DeepLink(url) else { return }
-        guard let host = store.hosts.first(where: { $0.id == hostID }) else {
-            deepLinkNotice = "That host isn't saved on this device."
+        let link: DeepLink
+        do {
+            link = try DeepLink(url: url)
+        } catch DeepLinkError.notOurScheme {
+            return // not ours — ignore it silently rather than warning about someone else's URL
+        } catch {
+            deepLinkNotice = (error as? DeepLinkError)?.message
+                ?? "That link is malformed and was ignored."
             return
         }
-        if model.phase != .idle {
-            guard model.activeHost?.id == hostID else {
-                let current = model.activeHost?.displayName ?? "a host"
-                deepLinkNotice = "Already streaming \(current). End that session first."
+        guard link.route == .connect else {
+            // `wake` and `browse` are reserved in the grammar and parse today; this build routes
+            // neither, and saying so beats silently connecting instead.
+            deepLinkNotice = "Punktfunk links can't do “\(link.route.rawValue)” yet."
+            return
+        }
+        // Resolve the one-off profile BEFORE anything happens: an unknown or ambiguous reference
+        // must refuse, not degrade to the host's binding (§10.6).
+        var selection = ProfileSelection.inherit
+        if let reference = link.profile {
+            let (profile, resolution) = profiles.catalog.resolve(reference)
+            switch resolution {
+            case .found:
+                selection = .profile(profile?.id ?? "")
+            case .notFound:
+                deepLinkNotice = "No settings profile called “\(reference)” on this device."
+                return
+            case .ambiguous:
+                deepLinkNotice = "More than one settings profile is called “\(reference)”. "
+                    + "Rename one, or link to it by its id."
                 return
             }
-            return // deep-linked to the host we're already on — nothing to do
         }
-        connect(host, launchID: launchID)
+        switch link.resolveHost(in: store.hosts) {
+        case .known(let host):
+            guard !link.pinConflict(with: host) else {
+                deepLinkNotice = "That link's fingerprint doesn't match the identity saved for "
+                    + "\(host.displayName). It's out of date, or it isn't pointing where it says."
+                return
+            }
+            guard model.phase == .idle else {
+                guard model.activeHost?.id == host.id else {
+                    let current = model.activeHost?.displayName ?? "a host"
+                    deepLinkNotice = "Already streaming \(current). End that session first."
+                    return
+                }
+                return // deep-linked to the host we're already on — nothing to do
+            }
+            connect(host, launchID: link.launch, profile: selection)
+        case .unknown(let address, let port, let name, let fp):
+            // Never a silent connect: hand the address, claimed name and pin to the add sheet so
+            // the user makes the trust decision with their eyes on it.
+            guard model.phase == .idle else {
+                deepLinkNotice = "Already streaming. End that session first."
+                return
+            }
+            deepLinkNotice = "\(name ?? address) isn't saved on this device yet. "
+                + "Add it with the + button — the link points at \(address):\(String(port))"
+                + (fp == nil ? "." : ", and carries a fingerprint to verify it against.")
+        case .ambiguous:
+            deepLinkNotice = "More than one saved host is called “\(link.hostRef)”. "
+                + "Rename one, or link to it by its address."
+        case .unresolvable:
+            deepLinkNotice = "That host isn't saved on this device."
+        }
     }
 
     private var home: some View {
@@ -731,7 +789,14 @@ struct ContentView: View {
 
     // MARK: - Connect
 
-    private func connect(_ host: StoredHost, launchID: String? = nil, allowTofu: Bool? = nil) {
+    /// `profile` is this connect's one-off pick ("Connect with ▸", a pinned card, a link's
+    /// `profile=`). `.inherit` — the default, and what a plain card tap passes — falls through to
+    /// the host's binding. A one-off NEVER rebinds the host: rebinding is always an explicit act
+    /// in the edit sheet (design §5.2).
+    private func connect(
+        _ host: StoredHost, launchID: String? = nil,
+        profile: ProfileSelection = .inherit, allowTofu: Bool? = nil
+    ) {
         // A pinned host connects on its stored fingerprint; an unpinned host may only TOFU when
         // the host's LIVE advert says `pair=optional` (rule 3a). When the caller doesn't already
         // know the policy (a saved-card tap / manual entry), resolve it from the current mDNS set:
@@ -750,20 +815,22 @@ struct ContentView: View {
                 return
             }
         }
-        startSession(host, launchID: launchID, allowTofu: host.pinnedSHA256 == nil)
+        startSession(
+            host, launchID: launchID, profile: profile, allowTofu: host.pinnedSHA256 == nil)
     }
 
-    /// Resolve the @AppStorage stream mode + input prefs and hand off to the session model. The
-    /// gamepad-type setting resolves NOW (Automatic → match the active physical controller): the
-    /// host's virtual pad backend is fixed per session. `requestAccess` opens the no-PIN
-    /// delegated-approval connect (host parks it until the operator approves).
+    /// Resolve the stream mode + input prefs and hand off to the session model. The gamepad-type
+    /// setting resolves NOW (Automatic → match the active physical controller): the host's virtual
+    /// pad backend is fixed per session. `requestAccess` opens the no-PIN delegated-approval
+    /// connect (host parks it until the operator approves).
     private func startSession(
         _ host: StoredHost, launchID: String? = nil,
+        profile: ProfileSelection = .inherit,
         allowTofu: Bool, requestAccess: Bool = false, approvalReq: ApprovalRequest? = nil
     ) {
         let go = {
             startSessionDirect(
-                host, launchID: launchID, allowTofu: allowTofu,
+                host, launchID: launchID, profile: profile, allowTofu: allowTofu,
                 requestAccess: requestAccess, approvalReq: approvalReq)
         }
         // Not advertising and we can wake it? DIAL FIRST anyway — no mDNS advert does NOT mean
@@ -778,7 +845,7 @@ struct ContentView: View {
            !host.wakeMacs.isEmpty, !discovery.advertises(host) {
             discovery.start() // so the wake-wait can observe it reappear
             startSessionDirect(
-                host, launchID: launchID, allowTofu: allowTofu,
+                host, launchID: launchID, profile: profile, allowTofu: allowTofu,
                 requestAccess: requestAccess, approvalReq: approvalReq,
                 onUnreachable: {
                     waker.start(
@@ -794,19 +861,9 @@ struct ContentView: View {
     /// host is back online. `prepareWake` still runs here to LEARN/refresh the MAC now that the host
     /// is advertising (and is a harmless no-op otherwise). `onUnreachable` hands a plain connect
     /// failure back to the caller (the wake-wait fallback) instead of the error alert.
-    /// The stream mode to request = the chosen resolution × the render scale, aspect-preserved,
-    /// even, and clamped to the codec's max dimension. > 1 supersamples for sharpness (the presenter
-    /// downscales the larger decoded frame to this display); < 1 renders under native and upscales.
-    /// The match-window path applies the SAME scale to the live window size in `MatchWindowFollower`.
-    private func scaledMode() -> (width: UInt32, height: UInt32) {
-        RenderScale.apply(
-            baseWidth: width, baseHeight: height,
-            scale: renderScale,
-            maxDimension: RenderScale.maxDimension(codec: codec))
-    }
-
     private func startSessionDirect(
         _ host: StoredHost, launchID: String? = nil,
+        profile: ProfileSelection = .inherit,
         allowTofu: Bool, requestAccess: Bool = false, approvalReq: ApprovalRequest? = nil,
         onUnreachable: (@MainActor () -> Void)? = nil
     ) {
@@ -814,19 +871,17 @@ struct ContentView: View {
         // The delegated-approval wait prompt only makes sense once we're actually dialing — set it
         // here (after any wake), not before, so it never stacks under the "Waking…" overlay.
         if let approvalReq { awaitingApproval = approvalReq }
+        // THE resolution point (design §4.4): the globals plus this connect's profile, once, here.
+        // The model latches the result for the whole session, so nothing downstream can end up
+        // applying a profile to half of it.
+        let effective = EffectiveSettings.resolve(
+            host: host, selection: profile, catalog: profiles.catalog)
         model.connect(
             to: host,
-            width: scaledMode().width, height: scaledMode().height,
-            hz: UInt32(clamping: hz),
-            compositor: PunktfunkConnection.Compositor(
-                rawValue: UInt32(clamping: compositor)) ?? .auto,
+            effective: effective,
             gamepad: GamepadManager.shared.resolveType(
                 setting: PunktfunkConnection.GamepadType(
-                    rawValue: UInt32(clamping: gamepadType)) ?? .auto),
-            bitrateKbps: UInt32(clamping: bitrateKbps),
-            audioChannels: UInt8(clamping: audioChannels),
-            hdrEnabled: hdrEnabled,
-            preferredCodec: preferredCodecByte,
+                    rawValue: UInt32(clamping: effective.gamepadType)) ?? .auto),
             launchID: launchID,
             allowTofu: allowTofu,
             requestAccess: requestAccess,
@@ -979,36 +1034,25 @@ struct ContentView: View {
                 hz = dims[2]
             }
         }
-        var pref = PunktfunkConnection.Compositor(
-            rawValue: UInt32(clamping: compositor)) ?? .auto
+        // The dev levers layer over the globals (no host record, so no binding to resolve).
+        var effective = EffectiveSettings(defaults: .standard)
         if let name = ProcessInfo.processInfo.environment["PUNKTFUNK_COMPOSITOR"],
            let c = PunktfunkConnection.Compositor(name: name) {
-            pref = c
+            effective.compositor = Int(c.rawValue)
         }
         var pad = GamepadManager.shared.resolveType(
             setting: PunktfunkConnection.GamepadType(
-                rawValue: UInt32(clamping: gamepadType)) ?? .auto)
+                rawValue: UInt32(clamping: effective.gamepadType)) ?? .auto)
         if let name = ProcessInfo.processInfo.environment["PUNKTFUNK_REMOTE_GAMEPAD"],
            let g = PunktfunkConnection.GamepadType(name: name) {
             // Back through resolveType so the lever is adopted as the session's setting: the
             // per-pad arrivals declare it too, which is what the host actually builds from.
             pad = GamepadManager.shared.resolveType(setting: g)
         }
-        var bitrate = UInt32(clamping: bitrateKbps)
         if let kbps = ProcessInfo.processInfo.environment["PUNKTFUNK_BITRATE_KBPS"],
-           let v = UInt32(kbps) {
-            bitrate = v
+           let v = Int(kbps) {
+            effective.bitrateKbps = v
         }
-        model.connect(
-            to: host,
-            width: scaledMode().width, height: scaledMode().height,
-            hz: UInt32(clamping: hz),
-            compositor: pref,
-            gamepad: pad,
-            bitrateKbps: bitrate,
-            audioChannels: UInt8(clamping: audioChannels),
-            hdrEnabled: hdrEnabled,
-            preferredCodec: preferredCodecByte,
-            autoTrust: true)
+        model.connect(to: host, effective: effective, gamepad: pad, autoTrust: true)
     }
 }

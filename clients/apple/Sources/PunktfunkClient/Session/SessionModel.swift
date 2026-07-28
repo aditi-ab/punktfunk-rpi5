@@ -65,6 +65,14 @@ final class SessionModel: ObservableObject {
     @Published private(set) var connection: PunktfunkConnection?
     /// The host this session is for (a value copy; identity = id).
     @Published private(set) var activeHost: StoredHost?
+    /// The settings THIS session runs on — the globals with its profile overlaid, resolved once at
+    /// connect (design/client-settings-profiles.md §4.2). Also mirrored into `SessionSettings` for
+    /// the readers that live in PunktfunkKit and can't see this model.
+    @Published private(set) var settings = EffectiveSettings()
+    /// The stats-overlay tier for this session: the resolved one at connect, then whatever the
+    /// live cycle surfaces (⌃⌥⇧S, the three-finger tap) move it to. Separate from the @AppStorage
+    /// global so a profile that overrides the tier actually gets it, without the cycle breaking.
+    @Published var statsVerbosity: StatsVerbosity = .normal
     @Published var errorMessage: String?
     @Published var fps = 0
     @Published var mbps = 0.0
@@ -218,13 +226,13 @@ final class SessionModel: ObservableObject {
     /// failure: the caller takes over recovery (the Wake-on-LAN wait for a host that stopped
     /// advertising). It never fires for the delegated-approval path, whose failure text carries
     /// its own instructions.
-    func connect(to host: StoredHost, width: UInt32, height: UInt32, hz: UInt32,
-                 compositor: PunktfunkConnection.Compositor = .auto,
+    /// `effective` is the whole stream mode + input/audio configuration for this session, already
+    /// resolved from the globals and the session's profile by the caller — the ONE place that
+    /// resolution happens (§4.4). It is latched into `SessionSettings` here so the kit-side
+    /// readers (the presenter, the input paths, the match-window follower) see the same values
+    /// this connect asked the host for, instead of re-reading the globals mid-session.
+    func connect(to host: StoredHost, effective: EffectiveSettings,
                  gamepad: PunktfunkConnection.GamepadType = .auto,
-                 bitrateKbps: UInt32 = 0,
-                 audioChannels: UInt8 = 2,
-                 hdrEnabled: Bool = true,
-                 preferredCodec: UInt8 = 0,
                  launchID: String? = nil,
                  allowTofu: Bool = false,
                  autoTrust: Bool = false,
@@ -234,6 +242,21 @@ final class SessionModel: ObservableObject {
         phase = .connecting
         activeHost = host
         errorMessage = nil
+        settings = effective
+        statsVerbosity = StatsVerbosity(rawValue: effective.statsVerbosity) ?? .normal
+        SessionSettings.begin(effective)
+        let mode = RenderScale.apply(
+            baseWidth: effective.width, baseHeight: effective.height,
+            scale: effective.renderScale,
+            maxDimension: RenderScale.maxDimension(codec: effective.codec))
+        let (width, height) = (mode.width, mode.height)
+        let hz = UInt32(clamping: effective.refreshHz)
+        let compositor = PunktfunkConnection.Compositor(
+            rawValue: UInt32(clamping: effective.compositor)) ?? .auto
+        let bitrateKbps = UInt32(clamping: effective.bitrateKbps)
+        let audioChannels = UInt8(clamping: effective.audioChannels)
+        let hdrEnabled = effective.hdrEnabled
+        let preferredCodec = PunktfunkConnection.codecByte(effective.codec)
         let pin = host.pinnedSHA256
         // Capability gate (main-actor — screen APIs): only advertise HDR when this display can
         // actually present it, so the host sends a proper SDR stream to an SDR display rather than
@@ -266,7 +289,7 @@ final class SessionModel: ObservableObject {
         // doesn't visibly need, and the encode/decode pixel rate rises. The host allows it by
         // default (PUNKTFUNK_444, default on), so this toggle is the one real switch; the
         // hardware-decode probe below still gates what can actually be advertised.
-        let want444 = (UserDefaults.standard.object(forKey: DefaultsKey.enable444) as? Bool) ?? false
+        let want444 = effective.enable444
         Task.detached(priority: .userInitiated) {
             // PunktfunkConnection.init blocks on the QUIC handshake — keep it off the main
             // actor. The persistent identity is presented on every connect so a paired
@@ -313,9 +336,7 @@ final class SessionModel: ObservableObject {
             // NSCursor. Capture-mode sessions keep today's composited pointer.
             #if os(macOS)
             let clientCaps: UInt8 =
-                (MouseInputMode(
-                    rawValue: UserDefaults.standard.string(forKey: DefaultsKey.mouseMode) ?? "")
-                    ?? .capture) == .desktop ? 0x01 : 0
+                (MouseInputMode(rawValue: effective.mouseMode) ?? .capture) == .desktop ? 0x01 : 0
             #else
             let clientCaps: UInt8 = 0
             #endif
@@ -443,6 +464,16 @@ final class SessionModel: ObservableObject {
         }
     }
 
+    /// Follow a live stats-overlay cycle (⌃⌥⇧S, the three-finger tap, the Stream menu). Those
+    /// surfaces write the GLOBAL setting as they always have; this moves the session's own tier
+    /// with it, so cycling still works in a session a profile put on a different tier.
+    func setStatsVerbosity(_ tier: StatsVerbosity) {
+        guard statsVerbosity != tier else { return }
+        statsVerbosity = tier
+        settings.statsVerbosity = tier.rawValue
+        SessionSettings.setStatsVerbosity(tier.rawValue)
+    }
+
     /// The user confirmed the fingerprint: returns it for pinning and enters streaming.
     func confirmTrust() -> Data? {
         guard case .awaitingTrust(let fingerprint) = phase else { return nil }
@@ -460,6 +491,9 @@ final class SessionModel: ObservableObject {
     func disconnect(deliberate: Bool = true) {
         statsTimer?.invalidate()
         statsTimer = nil
+        // Release the session's resolved settings: from here every reader falls back to the plain
+        // globals, which is exactly what they saw before profiles existed.
+        SessionSettings.end()
         // No-op when this session never reached `.streaming` (a refused/aborted connect).
         displaySleepGuard.release()
         // Drop any armed background keep-alive (incl. the timeout that just fired us).
@@ -559,15 +593,15 @@ final class SessionModel: ObservableObject {
         phase = .streaming
         displaySleepGuard.acquire()
         // Audio starts with streaming, not during the trust prompt — no host sound (or
-        // mic uplink!) before the user trusted the host. Devices come from Settings;
-        // "" = system default.
-        let defaults = UserDefaults.standard
+        // mic uplink!) before the user trusted the host. Devices and the mic switch come from the
+        // session's resolved settings ("" = system default), so a profile that turns the mic on
+        // for work calls applies to the uplink too.
         let audio = SessionAudio(connection: conn)
         audio.start(
-            speakerUID: defaults.string(forKey: DefaultsKey.speakerUID) ?? "",
-            micUID: defaults.string(forKey: DefaultsKey.micUID) ?? "",
-            micChannel: defaults.integer(forKey: DefaultsKey.micChannel),
-            micEnabled: defaults.object(forKey: DefaultsKey.micEnabled) as? Bool ?? true)
+            speakerUID: settings.speakerUID,
+            micUID: settings.micUID,
+            micChannel: settings.micChannel,
+            micEnabled: settings.micEnabled)
         self.audio = audio
         // Gamepads: forward every controller GamepadManager selected — each on its own wire pad
         // index (a pin forwards only one, Automatic forwards all) — and render the host's feedback

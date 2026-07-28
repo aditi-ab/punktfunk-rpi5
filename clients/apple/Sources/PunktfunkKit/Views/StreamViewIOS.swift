@@ -242,10 +242,11 @@ public final class StreamViewController: StreamViewControllerBase {
     #if os(iOS)
     /// Whether the user wants the mouse/trackpad pointer CAPTURED (pointer lock → relative
     /// movement, the gaming default) rather than forwarded as an absolute position (desktop
-    /// use). Read live from UserDefaults so it tracks the Settings toggle; defaults to on when
+    /// use). Read from the session's resolved settings so it tracks the Settings toggle (it is
+    /// tier G — this device's input hardware — so no profile can move it); defaults to on when
     /// unset. iPad-only — gated again in `prefersPointerLocked`.
     private var pointerCaptureEnabled: Bool {
-        UserDefaults.standard.object(forKey: DefaultsKey.pointerCapture) as? Bool ?? true
+        SessionSettings.current.pointerCapture
     }
 
     /// Whether the pointer should be CAPTURED right now: iPad, capture engaged, and the user
@@ -403,10 +404,10 @@ public final class StreamViewController: StreamViewControllerBase {
         // default keeps the explicit mode.
         let follower = MatchWindowFollower(
             connection: connection,
-            enabled: UserDefaults.standard.object(forKey: DefaultsKey.matchWindow) as? Bool ?? false,
-            renderScale: UserDefaults.standard.object(forKey: DefaultsKey.renderScale) as? Double ?? 1.0,
+            enabled: SessionSettings.current.matchWindow,
+            renderScale: SessionSettings.current.renderScale,
             maxDimension: RenderScale.maxDimension(
-                codec: UserDefaults.standard.string(forKey: DefaultsKey.codec) ?? "auto"))
+                codec: SessionSettings.current.codec))
         follower.onResizeTarget = onResizeTarget
         matchFollower = follower
         #endif
@@ -560,7 +561,7 @@ public final class StreamViewController: StreamViewControllerBase {
     private func applyDisplayCriteriaIfNeeded() {
         guard let manager = view.window?.avDisplayManager, let connection,
               manager.preferredDisplayCriteria == nil,
-              UserDefaults.standard.object(forKey: DefaultsKey.hdrEnabled) as? Bool ?? true
+              SessionSettings.current.hdrEnabled
         else { return }
         let mode = connection.currentMode()
         guard mode.width > 0, mode.height > 0, mode.refreshHz > 0 else { return }

@@ -886,7 +886,7 @@ public final class StreamLayerView: NSView {
             // Advance the shared tier setting directly — every @AppStorage reader (the HUD's
             // visibility/content, the Settings pickers) observes UserDefaults, so this is the
             // same as the menu path.
-            StatsVerbosity.store(StatsVerbosity.current.next())
+            StatsVerbosity.cycle()
         }
         capture.start()
         inputCapture = capture
@@ -896,7 +896,7 @@ public final class StreamLayerView: NSView {
         // only a relative pointer, so absolute sends would be silently dropped there
         // (pointer stuck = "all input dead") — pinned to capture. ⌃⌥⇧M flips it live.
         let mode = MouseInputMode(
-            rawValue: UserDefaults.standard.string(forKey: DefaultsKey.mouseMode) ?? ""
+            rawValue: SessionSettings.current.mouseMode
         ) ?? .capture
         let absOK = connection.resolvedCompositor != .gamescope
         desktopMouse = mode == .desktop && absOK
@@ -943,10 +943,10 @@ public final class StreamLayerView: NSView {
         // default keeps the explicit mode.
         let follower = MatchWindowFollower(
             connection: connection,
-            enabled: UserDefaults.standard.object(forKey: DefaultsKey.matchWindow) as? Bool ?? false,
-            renderScale: UserDefaults.standard.object(forKey: DefaultsKey.renderScale) as? Double ?? 1.0,
+            enabled: SessionSettings.current.matchWindow,
+            renderScale: SessionSettings.current.renderScale,
             maxDimension: RenderScale.maxDimension(
-                codec: UserDefaults.standard.string(forKey: DefaultsKey.codec) ?? "auto"))
+                codec: SessionSettings.current.codec))
         follower.onResizeTarget = onResizeTarget // resize overlay START signal (instant, on the follower)
         matchFollower = follower
         layoutPresenter()

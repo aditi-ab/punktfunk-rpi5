@@ -148,6 +148,25 @@ final class HostStore: ObservableObject {
         hosts[i].macAddresses = macs
     }
 
+    /// Bind this host to a settings profile, or to "Default settings" (nil) — the ONLY way the
+    /// default changes. A one-off "Connect with ▸" deliberately never lands here (§5.2:
+    /// predictable, not sticky).
+    func setProfile(_ hostID: UUID, profileID: String?) {
+        guard let i = hosts.firstIndex(where: { $0.id == hostID }) else { return }
+        hosts[i].profileID = profileID
+    }
+
+    /// Pin or unpin a host+profile combo as its own card (§5.2a). Presentation only: it never
+    /// touches the default binding or the profile itself. nil stays out of the saved JSON when
+    /// nothing is pinned, so the widget contract sees no new key for the common case.
+    func setPinned(_ hostID: UUID, profileID: String, pinned: Bool) {
+        guard let i = hosts.firstIndex(where: { $0.id == hostID }) else { return }
+        var pins = hosts[i].pinnedProfileIDs ?? []
+        pins.removeAll { $0 == profileID }
+        if pinned { pins.append(profileID) }
+        hosts[i].pinnedProfileIDs = pins.isEmpty ? nil : pins
+    }
+
     /// Drop the pinned identity (e.g. after a legitimate host reinstall). This does NOT downgrade
     /// to TOFU: the next connect re-pairs via the PIN ceremony, unless the host advertises
     /// `pair=optional` (the only case the connect path still offers the trust prompt).

@@ -56,4 +56,21 @@ public enum StatsVerbosity: String, CaseIterable, Sendable {
     public static func store(_ tier: StatsVerbosity) {
         UserDefaults.standard.set(tier.rawValue, forKey: DefaultsKey.statsVerbosity)
     }
+
+    /// The tier the LIVE session is showing — its profile's, if one overrode it — falling back to
+    /// the persisted global while idle. What the in-stream cycle advances FROM: cycling in a
+    /// session a profile put on Detailed must go to Off, not to whatever the global happens to be.
+    public static var session: StatsVerbosity {
+        StatsVerbosity(rawValue: SessionSettings.current.statsVerbosity) ?? .normal
+    }
+
+    /// Advance the in-stream overlay one tier (⌃⌥⇧S, the three-finger tap, the Stream menu).
+    ///
+    /// It writes the GLOBAL, as every client's cycle always has, and the app pushes that back into
+    /// the live session — so from the moment the user cycles, the session follows the global
+    /// rather than the profile's start-of-session tier. That is the honest reading of an explicit
+    /// live override, and it keeps one observable source (`@AppStorage`) driving the overlay.
+    public static func cycle() {
+        store(session.next())
+    }
 }

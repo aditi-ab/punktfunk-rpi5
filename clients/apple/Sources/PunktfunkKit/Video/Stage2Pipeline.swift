@@ -848,7 +848,7 @@ public final class Stage2Pipeline {
         let vsyncPaced = vsyncPaced
         let vsyncEnabled = vsyncPaced || presentMode == "vsync"
             || (presentMode != "immediate"
-                && UserDefaults.standard.bool(forKey: DefaultsKey.vsync))
+                && SessionSettings.current.vsync)
         let vsyncClock = vsyncClock
         // Stage-3's bounded in-flight present gate; nil = stage-2's present-on-arrival. A local
         // (like the ring) so neither the render thread nor the presented handlers capture `self`.

@@ -34,7 +34,7 @@ public enum TouchInputMode: String, CaseIterable, Sendable {
     /// The persisted setting, defaulting to trackpad when unset/unknown.
     public static var current: TouchInputMode {
         TouchInputMode(
-            rawValue: UserDefaults.standard.string(forKey: DefaultsKey.touchMode) ?? ""
+            rawValue: SessionSettings.current.touchMode
         ) ?? .trackpad
     }
 }
@@ -331,7 +331,7 @@ final class TouchMouse {
     /// through the shared `statsVerbosity` default, which the app's HUD views observe via
     /// @AppStorage (so this needs no wiring to them). Same cycle as Android's triple-tap.
     private static func cycleStats() {
-        StatsVerbosity.store(StatsVerbosity.current.next())
+        StatsVerbosity.cycle()
     }
 }
 #endif

@@ -1,8 +1,12 @@
-// PunktfunkShared is now a wire contract between the app (writer) and the widget extension +
-// deep-link senders (readers). These pin the two formats that cross that boundary:
+// PunktfunkShared is a wire contract between the app (writer) and the widget extension +
+// deep-link senders (readers). These pin the formats that cross that boundary:
 //   • the `StoredHost` JSON codec — the widget decodes the exact bytes the app persisted, and
-//     older saved JSON (missing `mgmtPort` / `macAddresses`) must still decode;
-//   • the `punktfunk://` deep-link grammar — the widget builds URLs the app parses.
+//     older saved JSON (missing `mgmtPort` / `macAddresses` / `profileID`) must still decode;
+//   • the `punktfunk://` deep-link grammar — driven by `clients/shared/deeplink-vectors.json`,
+//     the SAME file the Rust suite runs, so the two parsers cannot drift into two security
+//     postures;
+//   • the settings-profile catalog — including the don't-clobber rule that keeps an older build
+//     from erasing a newer one's overlay fields just by opening a profile.
 
 import XCTest
 
@@ -18,16 +22,18 @@ final class SharedFoundationTests: XCTestCase {
             name: "Tower", address: "192.168.1.173", port: 9777,
             pinnedSHA256: Data([0xDE, 0xAD, 0xBE, 0xEF]),
             lastConnected: Date(timeIntervalSince1970: 1_700_000_000),
-            mgmtPort: 47990, macAddresses: ["aa:bb:cc:dd:ee:ff"], clipboardSync: true)
+            mgmtPort: 47990, macAddresses: ["aa:bb:cc:dd:ee:ff"], clipboardSync: true,
+            profileID: "a1b2c3d4e5f6", pinnedProfileIDs: ["0f0f0f0f0f0f"])
 
         let data = try JSONEncoder().encode(host)
         let decoded = try JSONDecoder().decode(StoredHost.self, from: data)
         XCTAssertEqual(decoded, host)
     }
 
-    /// Older saved hosts predate `mgmtPort`/`macAddresses` — a missing key must decode to nil, not
-    /// throw (synthesized Decodable treats a missing Optional as nil). This is the forward-compat
-    /// guarantee the widget depends on when reading a store written by any prior build.
+    /// Older saved hosts predate `mgmtPort`/`macAddresses` — and now `profileID`/
+    /// `pinnedProfileIDs` too. A missing key must decode to nil, not throw (synthesized Decodable
+    /// treats a missing Optional as nil). This is the forward-compat guarantee the widget depends
+    /// on when reading a store written by any prior build.
     func testStoredHostDecodesLegacyJSONWithoutOptionalKeys() throws {
         let json = """
         {"id":"11111111-2222-3333-4444-555555555555","name":"Old","address":"10.0.0.5","port":9777}
@@ -40,6 +46,8 @@ final class SharedFoundationTests: XCTestCase {
         XCTAssertNil(decoded.pinnedSHA256)
         XCTAssertNil(decoded.lastConnected)
         XCTAssertNil(decoded.clipboardSync)
+        XCTAssertNil(decoded.profileID)
+        XCTAssertNil(decoded.pinnedProfileIDs)
         // Resolvers fall back cleanly.
         XCTAssertEqual(decoded.effectiveMgmtPort, punktfunkDefaultMgmtPort)
         XCTAssertEqual(decoded.wakeMacs, [])
@@ -51,40 +59,351 @@ final class SharedFoundationTests: XCTestCase {
         XCTAssertEqual(host.displayName, "10.0.0.9")
     }
 
-    // MARK: - DeepLink grammar
+    // MARK: - DeepLink grammar (the cross-language vector file)
 
-    func testDeepLinkConnectRoundTrips() {
-        let id = UUID()
-        let link = DeepLink.connect(host: id, launchID: nil)
-        let parsed = DeepLink(link.url)
-        XCTAssertEqual(parsed, link)
-        XCTAssertEqual(parsed, .connect(host: id, launchID: nil))
+    private struct VectorFile: Decodable {
+        struct Case: Decodable {
+            let name: String
+            let url: String
+            let error: String?
+            let emit: String?
+            let expect: Expect?
+        }
+
+        struct Expect: Decodable {
+            let route: String
+            // swiftlint:disable:next identifier_name
+            let host_ref: String
+            let fp: String?
+            let launch: String?
+            let profile: String?
+            let name: String?
+            let host_addr: String?
+            let host_port: Int?
+        }
+
+        let cases: [Case]
     }
 
-    func testDeepLinkConnectWithLaunchRoundTrips() {
-        let id = UUID()
-        // A store-qualified GameEntry.id with a reserved char must survive percent-encoding.
-        let launch = "steam:570"
-        let link = DeepLink.connect(host: id, launchID: launch)
-        XCTAssertEqual(DeepLink(link.url), .connect(host: id, launchID: launch))
+    /// `clients/shared/deeplink-vectors.json`, read from the source tree rather than copied into
+    /// the test bundle — a copy is a second file, and a second file drifts. Resolved from
+    /// `#filePath` (this file sits at `clients/apple/Tests/PunktfunkKitTests/`).
+    private static var vectorFileURL: URL {
+        URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent() // PunktfunkKitTests
+            .deletingLastPathComponent() // Tests
+            .deletingLastPathComponent() // apple
+            .deletingLastPathComponent() // clients
+            .appendingPathComponent("shared/deeplink-vectors.json")
     }
 
-    func testDeepLinkParsesCanonicalString() throws {
-        let id = UUID()
-        let url = try XCTUnwrap(URL(string: "punktfunk://connect/\(id.uuidString)"))
-        XCTAssertEqual(DeepLink(url), .connect(host: id, launchID: nil))
+    /// Every case in the shared vector file — the same 44 the Rust suite's `shared_vectors` test
+    /// consumes. Refusal CODES are part of the contract, not just the happy path: a parser that
+    /// rejects the right inputs for the wrong reason has already drifted from the other one.
+    func testDeepLinkSharedVectors() throws {
+        let url = Self.vectorFileURL
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: url.path),
+            "the cross-language vector file must be readable at \(url.path)")
+        let file = try JSONDecoder().decode(VectorFile.self, from: Data(contentsOf: url))
+        XCTAssertGreaterThan(file.cases.count, 20, "the vector file is the contract; keep it rich")
+
+        for testCase in file.cases {
+            if let code = testCase.error {
+                do {
+                    let link = try DeepLink.parse(testCase.url)
+                    XCTFail("\(testCase.name): expected \(code), parsed \(link)")
+                } catch let error as DeepLinkError {
+                    XCTAssertEqual(error.code, code, testCase.name)
+                }
+                continue
+            }
+            let want = try XCTUnwrap(testCase.expect, testCase.name)
+            let link = try DeepLink.parse(testCase.url)
+            XCTAssertEqual(link.route.rawValue, want.route, testCase.name)
+            XCTAssertEqual(link.hostRef, want.host_ref, testCase.name)
+            XCTAssertEqual(link.fp, want.fp, "\(testCase.name) fp")
+            XCTAssertEqual(link.launch, want.launch, "\(testCase.name) launch")
+            XCTAssertEqual(link.profile, want.profile, "\(testCase.name) profile")
+            XCTAssertEqual(link.name, want.name, "\(testCase.name) name")
+            XCTAssertEqual(link.host?.address, want.host_addr, "\(testCase.name) host_addr")
+            XCTAssertEqual(
+                link.host.map { Int($0.port) }, want.host_port, "\(testCase.name) host_port")
+            if let emit = testCase.emit {
+                XCTAssertEqual(link.urlString, emit, "\(testCase.name) emit")
+            }
+        }
     }
 
-    func testDeepLinkRejectsForeignSchemeAndBadHost() throws {
+    /// The widget's and the Connect intent's emitter — a bare UUID path, which is the grammar the
+    /// shipped links use. Backward compatibility is not optional here: a widget on the Home Screen
+    /// keeps sending yesterday's URL.
+    func testDeepLinkConnectRoundTrips() throws {
         let id = UUID()
-        XCTAssertNil(DeepLink(try XCTUnwrap(URL(string: "https://connect/\(id.uuidString)"))))
-        XCTAssertNil(DeepLink(try XCTUnwrap(URL(string: "punktfunk://connect/not-a-uuid"))))
-        XCTAssertNil(DeepLink(try XCTUnwrap(URL(string: "punktfunk://bogus/\(id.uuidString)"))))
+        let link = DeepLink.connect(host: id)
+        XCTAssertEqual(try DeepLink(url: link.url), link)
+        XCTAssertEqual(link.hostRef, id.uuidString)
+        XCTAssertNil(link.launch)
+
+        let launched = DeepLink.connect(host: id, launchID: "steam:570")
+        XCTAssertEqual(try DeepLink(url: launched.url).launch, "steam:570")
+
+        let profiled = DeepLink.connect(host: id, launchID: nil, profile: "a1b2c3d4e5f6")
+        XCTAssertEqual(try DeepLink(url: profiled.url).profile, "a1b2c3d4e5f6")
     }
 
-    func testDeepLinkSchemeIsCaseInsensitive() throws {
-        let id = UUID()
-        let url = try XCTUnwrap(URL(string: "PUNKTFUNK://connect/\(id.uuidString)"))
-        XCTAssertEqual(DeepLink(url), .connect(host: id, launchID: nil))
+    /// Self-emitted links ("Copy link", a shortcut) carry all three references, so they survive
+    /// both a re-addressed host and a wiped store.
+    func testDeepLinkForHostCarriesIDAddressAndPin() throws {
+        var host = StoredHost(
+            id: UUID(uuidString: "11111111-2222-4333-8444-555555555555")!,
+            name: "Desk", address: "192.168.1.50", port: 7777)
+        host.pinnedSHA256 = Data(repeating: 0xCC, count: 32)
+        let link = DeepLink.forHost(host, launch: "steam:570", profile: "aaaaaaaaaaaa")
+        XCTAssertEqual(
+            link.urlString,
+            "punktfunk://connect/11111111-2222-4333-8444-555555555555"
+                + "?fp=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                + "&host=192.168.1.50:7777&launch=steam:570&profile=aaaaaaaaaaaa")
+        XCTAssertEqual(try DeepLink.parse(link.urlString), link)
+    }
+
+    /// Resolution order — id beats a unique name beats an address — plus the two refusals a
+    /// front-end must surface rather than guess through.
+    func testDeepLinkHostResolution() throws {
+        let desk = StoredHost(
+            id: UUID(uuidString: "11111111-2222-4333-8444-555555555555")!,
+            name: "Desk", address: "192.168.1.50",
+            pinnedSHA256: Data(repeating: 0xAA, count: 32))
+        let couchA = StoredHost(name: "Couch", address: "192.168.1.60")
+        let couchB = StoredHost(name: "Couch", address: "192.168.1.61")
+        let hosts = [desk, couchA, couchB]
+        func resolve(_ url: String) throws -> DeepLink.HostResolution {
+            try DeepLink.parse(url).resolveHost(in: hosts)
+        }
+
+        XCTAssertEqual(
+            try resolve("punktfunk://connect/11111111-2222-4333-8444-555555555555"), .known(desk))
+        XCTAssertEqual(try resolve("punktfunk://connect/desk"), .known(desk))
+        XCTAssertEqual(try resolve("punktfunk://connect/couch"), .ambiguous)
+        XCTAssertEqual(try resolve("punktfunk://connect/192.168.1.50:9777"), .known(desk))
+        // A stale id with the recovery parameter: the address finds the record anyway.
+        XCTAssertEqual(
+            try resolve(
+                "punktfunk://connect/00000000-0000-4000-8000-000000000000?host=192.168.1.50"),
+            .known(desk))
+        // Nothing local matches: the sheet gets the address, the claimed name and the pin — which
+        // is what makes a first connect verified rather than blind trust-on-first-use.
+        XCTAssertEqual(
+            try resolve("punktfunk://connect/10.0.0.9:7000?name=Studio"),
+            .unknown(address: "10.0.0.9", port: 7000, name: "Studio", fp: nil))
+        // But a stale record id is not a hostname: without `host=` there is nothing to dial.
+        XCTAssertEqual(
+            try resolve("punktfunk://connect/00000000-0000-4000-8000-000000000000"), .unresolvable)
+        XCTAssertEqual(try resolve("punktfunk://connect/Basement%20PC"), .unresolvable)
+
+        // A pin that contradicts the stored one is the link lying — the caller hard-refuses.
+        let lying = try DeepLink.parse("punktfunk://connect/desk?fp=\(String(repeating: "b", count: 64))")
+        XCTAssertTrue(lying.pinConflict(with: desk))
+        let honest = try DeepLink.parse("punktfunk://connect/desk?fp=\(String(repeating: "a", count: 64))")
+        XCTAssertFalse(honest.pinConflict(with: desk))
+        // No pin stored → nothing to contradict; the trust flow runs as usual.
+        XCTAssertFalse(lying.pinConflict(with: couchA))
+    }
+
+    // MARK: - Settings profiles
+
+    /// The overlay applies field by field: a value wins, an absent one keeps the base's live
+    /// value — including a value that happens to equal the base (an explicit pin).
+    func testOverlayAppliesOnlyWhatItOverrides() {
+        var base = EffectiveSettings()
+        base.width = 1920
+        base.height = 1080
+        base.bitrateKbps = 20_000
+        base.codec = "hevc"
+
+        XCTAssertTrue(SettingsOverlay().isEmpty)
+        XCTAssertEqual(base.applying(SettingsOverlay()), base)
+
+        var overlay = SettingsOverlay()
+        overlay.width = 3840
+        overlay.height = 2160
+        overlay.refreshHz = 120
+        overlay.codec = "av1"
+        overlay.enable444 = true
+        overlay.modifierLayout = "windows"
+        XCTAssertFalse(overlay.isEmpty)
+        let out = base.applying(overlay)
+        XCTAssertEqual([out.width, out.height, out.refreshHz], [3840, 2160, 120])
+        XCTAssertEqual(out.codec, "av1")
+        XCTAssertTrue(out.enable444)
+        XCTAssertEqual(out.modifierLayout, "windows")
+        // Untouched fields keep following the base.
+        XCTAssertEqual(out.bitrateKbps, 20_000)
+        // Tier-G endpoints are not in the overlay at all — no profile can move this device's
+        // speaker or microphone.
+        XCTAssertEqual(out.speakerUID, base.speakerUID)
+
+        // An overlay carrying a value equal to the base is still an override: the profile PINS it,
+        // so a later change to the global doesn't move it.
+        var pin = SettingsOverlay()
+        pin.bitrateKbps = 20_000
+        XCTAssertFalse(pin.isEmpty)
+        var moved = base
+        moved.bitrateKbps = 50_000
+        XCTAssertEqual(moved.applying(pin).bitrateKbps, 20_000)
+    }
+
+    /// `clear` is the explicit way back to inheriting, including the resolution tri-state one row
+    /// drives.
+    func testOverlayClearDropsOneOverride() {
+        var overlay = SettingsOverlay()
+        overlay.width = 3840
+        overlay.height = 2160
+        overlay.matchWindow = false
+        overlay.codec = "av1"
+        XCTAssertTrue(OverlayField.isOverridden("resolution", in: overlay))
+        XCTAssertTrue(OverlayField.clear("codec", in: &overlay))
+        XCTAssertNil(overlay.codec)
+        XCTAssertTrue(OverlayField.clear(OverlayField.resolution, in: &overlay))
+        XCTAssertNil(overlay.width)
+        XCTAssertNil(overlay.height)
+        XCTAssertNil(overlay.matchWindow)
+        XCTAssertTrue(overlay.isEmpty)
+        XCTAssertFalse(OverlayField.clear("no_such_field", in: &overlay))
+    }
+
+    /// A catalog round-trips, and what this build can't represent survives it: an unknown overlay
+    /// KEY is carried through untouched rather than erased — the don't-clobber rule, which is what
+    /// keeps an older build from silently gutting a profile a newer one wrote.
+    func testCatalogRoundTripsAndPreservesUnknownKeys() throws {
+        let stored = """
+        {
+          "version": 1,
+          "profiles": [
+            {
+              "id": "a1b2c3d4e5f6", "name": "Game", "accent": "#ff8800",
+              "overrides": {
+                "width": 3840, "height": 2160, "refresh_hz": 120,
+                "codec": "vvc-from-the-future", "stats_verbosity": "compact",
+                "some_new_axis": {"nested": true}
+              },
+              "future_profile_key": 7
+            },
+            { "id": "0f0f0f0f0f0f", "name": "Work" }
+          ]
+        }
+        """.data(using: .utf8)!
+
+        let catalog = try JSONDecoder().decode(ProfileCatalog.self, from: stored)
+        XCTAssertEqual(catalog.profiles.count, 2)
+        let game = try XCTUnwrap(catalog.profile(id: "a1b2c3d4e5f6"))
+        XCTAssertEqual(game.accent, "#ff8800")
+        XCTAssertEqual(game.overrides.codec, "vvc-from-the-future")
+        XCTAssertEqual(game.overrides.statsVerbosity, "compact")
+        // A profile with no `overrides` key at all is the empty (inherit-everything) one.
+        XCTAssertTrue(try XCTUnwrap(catalog.profile(id: "0f0f0f0f0f0f")).overrides.isEmpty)
+
+        let text = try XCTUnwrap(String(data: JSONEncoder().encode(catalog), encoding: .utf8))
+        XCTAssertTrue(text.contains("some_new_axis"))
+        XCTAssertTrue(text.contains("future_profile_key"))
+        // Absent overrides serialize away entirely — "not overridden" has one representation.
+        XCTAssertFalse(text.contains("null"))
+        let round = try JSONDecoder().decode(ProfileCatalog.self, from: Data(text.utf8))
+        XCTAssertEqual(round.profile(id: "a1b2c3d4e5f6")?.overrides.width, 3840)
+        XCTAssertEqual(round.profile(id: "a1b2c3d4e5f6")?.overrides.extra.count, 1)
+        XCTAssertEqual(round.profile(id: "a1b2c3d4e5f6")?.extra.count, 1)
+    }
+
+    /// Reference resolution: id first, then a unique case-insensitive name; two profiles sharing a
+    /// name resolve to `.ambiguous` (the caller refuses) rather than to whichever came first.
+    func testCatalogResolvesIDsFirstAndRefusesAmbiguity() {
+        let catalog = ProfileCatalog(profiles: [
+            StreamProfile(name: "Work", id: "111111111111"),
+            StreamProfile(name: "work", id: "222222222222"),
+            StreamProfile(name: "Game", id: "333333333333"),
+        ])
+        XCTAssertEqual(catalog.resolve("111111111111").1, .found)
+        XCTAssertEqual(catalog.resolve("Work").1, .ambiguous)
+        XCTAssertEqual(catalog.resolve("game").1, .found)
+        XCTAssertEqual(catalog.resolve("GAME").0?.id, "333333333333")
+        XCTAssertEqual(catalog.resolve("nope").1, .notFound)
+
+        XCTAssertTrue(catalog.nameTaken("GAME"))
+        XCTAssertFalse(catalog.nameTaken("GAME", except: "333333333333"))
+        XCTAssertTrue(catalog.nameTaken("GAME", except: "111111111111"))
+        XCTAssertFalse(catalog.nameTaken("Travel"))
+    }
+
+    /// Bindings and pins live ON the host record, and both degrade rather than error: a deleted
+    /// profile means "Default settings" for a binding and a vanished card for a pin.
+    func testBindingsAndPinsDropDanglingIDs() {
+        let catalog = ProfileCatalog(profiles: [
+            StreamProfile(name: "Game", id: "111111111111"),
+            StreamProfile(name: "Work", id: "222222222222"),
+        ])
+        var host = StoredHost(name: "Desk", address: "10.0.0.1")
+        XCTAssertNil(catalog.binding(for: host))
+
+        host.profileID = "111111111111"
+        XCTAssertEqual(catalog.binding(for: host)?.name, "Game")
+        host.profileID = "deadbeefdead"
+        XCTAssertNil(catalog.binding(for: host), "a deleted profile is Default settings, not an error")
+
+        host.pinnedProfileIDs = ["222222222222", "deadbeefdead", "222222222222", "111111111111"]
+        XCTAssertEqual(catalog.pinned(for: host).map(\.id), ["222222222222", "111111111111"])
+    }
+
+    /// The whole per-connect resolution, in the precedence every client shares:
+    /// one-off pick ?? host binding ?? none.
+    func testEffectiveSettingsResolutionPrecedence() {
+        let defaults = UserDefaults(suiteName: "io.unom.punktfunk.tests.effective")!
+        defaults.removePersistentDomain(forName: "io.unom.punktfunk.tests.effective")
+        defaults.set(2_560, forKey: DefaultsKey.streamWidth)
+        defaults.set(30_000, forKey: DefaultsKey.bitrateKbps)
+
+        var gameOverrides = SettingsOverlay()
+        gameOverrides.bitrateKbps = 80_000
+        var workOverrides = SettingsOverlay()
+        workOverrides.bitrateKbps = 8_000
+        let catalog = ProfileCatalog(profiles: [
+            StreamProfile(name: "Game", id: "111111111111", overrides: gameOverrides),
+            StreamProfile(name: "Work", id: "222222222222", overrides: workOverrides),
+        ])
+        var host = StoredHost(name: "Desk", address: "10.0.0.1")
+        host.profileID = "111111111111"
+
+        let unbound = EffectiveSettings.resolve(
+            host: StoredHost(name: "Plain", address: "10.0.0.2"),
+            catalog: catalog, defaults: defaults)
+        XCTAssertEqual(unbound.bitrateKbps, 30_000)
+        XCTAssertNil(unbound.profileID)
+        XCTAssertEqual(unbound.width, 2_560, "globals still flow through in every case")
+
+        let bound = EffectiveSettings.resolve(host: host, catalog: catalog, defaults: defaults)
+        XCTAssertEqual(bound.bitrateKbps, 80_000)
+        XCTAssertEqual(bound.profileName, "Game")
+
+        // A one-off pick wins over the binding — and does not rebind anything.
+        let oneOff = EffectiveSettings.resolve(
+            host: host, selection: .profile("222222222222"),
+            catalog: catalog, defaults: defaults)
+        XCTAssertEqual(oneOff.bitrateKbps, 8_000)
+        XCTAssertEqual(host.profileID, "111111111111")
+
+        // "Connect with ▸ Default settings" on a BOUND host forces the globals — the case that
+        // makes this a three-way selection rather than an optional profile.
+        XCTAssertEqual(
+            EffectiveSettings.resolve(host: host, selection: .defaults, catalog: catalog,
+                                      defaults: defaults).bitrateKbps,
+            30_000)
+        // A one-off naming a profile that no longer exists degrades to the globals rather than
+        // erroring — same rule as a dangling binding.
+        XCTAssertEqual(
+            EffectiveSettings.resolve(host: host, selection: .profile("gone"), catalog: catalog,
+                                      defaults: defaults).bitrateKbps,
+            30_000)
+
+        defaults.removePersistentDomain(forName: "io.unom.punktfunk.tests.effective")
     }
 }

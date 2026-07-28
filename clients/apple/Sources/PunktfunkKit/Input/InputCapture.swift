@@ -670,7 +670,7 @@ public final class InputCapture {
         // the macOS wheel, the iOS trackpad pan, and a GCMouse wheel all land here — so the toggle
         // flips them consistently. Residuals are accumulated AFTER inversion so a direction change
         // between events doesn't strand a fractional remainder of the old sign.
-        let invert = UserDefaults.standard.bool(forKey: DefaultsKey.invertScroll)
+        let invert = SessionSettings.current.invertScroll
         let dx = invert ? -rawDx : rawDx
         let dy = invert ? -rawDy : rawDy
         let fy = dy + residualScrollY

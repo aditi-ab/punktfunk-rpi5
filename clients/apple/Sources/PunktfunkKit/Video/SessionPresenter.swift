@@ -275,8 +275,8 @@ final class SessionPresenter {
         let choice = explicit ?? PresenterChoice.platformDefault
         let pacing = Self.pacing(for: choice, explicit: explicit, codec: connection.videoCodec)
         let priority = PresentPriority.resolve(
-            setting: UserDefaults.standard.string(forKey: DefaultsKey.presentPriority),
-            bufferSetting: UserDefaults.standard.object(forKey: DefaultsKey.smoothBuffer) as? Int)
+            setting: SessionSettings.current.presentPriority,
+            bufferSetting: SessionSettings.current.smoothBuffer)
         // macOS smoothness rides arrival pacing + forced vsync scheduling; under a glass-paced
         // macOS session (the PyroWave DCP mitigation) the gate already serializes on the
         // display, so the FIFO alone provides the buffering.
@@ -305,8 +305,7 @@ final class SessionPresenter {
             // Resolve THIS session's windowed mechanism once (setting + dev env lever) —
             // `setComposited` routes between it and fullscreen-async from every layout.
             windowedMode = Self.windowedPresentMode(
-                setting: UserDefaults.standard.object(
-                    forKey: DefaultsKey.windowedSafePresent) as? Bool,
+                setting: SessionSettings.current.windowedSafePresent,
                 env: ProcessInfo.processInfo.environment["PUNKTFUNK_WINDOWED_PRESENT"])
             // The surface present target sits ABOVE the metal layer: transparent (nil contents)
             // unless the surface mechanism actually presents, covering it while it does.
@@ -364,7 +363,7 @@ final class SessionPresenter {
         stage2?.setFrameRateHint(hz: Float(hz))
         guard let link = stage2Link else { return }
         let hzF = Float(hz)
-        let allowVRR = UserDefaults.standard.object(forKey: DefaultsKey.allowVRR) as? Bool ?? true
+        let allowVRR = SessionSettings.current.allowVRR
         #if os(macOS)
         // Off: `.default` = the link free-runs at the display's native rate (pre-VRR behavior).
         // On: request the content rate with a 24 Hz floor — capped at the display, never at the

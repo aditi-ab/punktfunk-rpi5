@@ -44,7 +44,8 @@ public enum ModifierLayout: String, CaseIterable, Sendable {
 
     /// The persisted layout (default `.mac` when unset).
     public static var current: ModifierLayout {
-        guard let raw = UserDefaults.standard.string(forKey: DefaultsKey.modifierLayout) else {
+        guard let raw = SessionSettings.active?.modifierLayout
+            ?? UserDefaults.standard.string(forKey: DefaultsKey.modifierLayout) else {
             return .mac
         }
         return ModifierLayout(rawValue: raw) ?? .mac

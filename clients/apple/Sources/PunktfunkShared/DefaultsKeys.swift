@@ -94,6 +94,11 @@ public enum DefaultsKey {
     /// stays 4:2:0). Sharper text/UI at the cost of more bandwidth.
     public static let enable444 = "punktfunk.enable444"
     public static let hosts = "punktfunk.hosts"
+    /// The settings-profile catalog (`ProfileCatalog`, one JSON blob) — design
+    /// client-settings-profiles.md §4.2. Lives in the APP GROUP suite with `hosts`, not with the
+    /// settings: bindings and pins are fields on the host record, and an extension that can read
+    /// the hosts should be able to read what they point at.
+    public static let profiles = "punktfunk.profiles"
     /// Physical-mouse model (macOS): "capture" (pointer lock + relative, the default) or
     /// "desktop" (uncaptured absolute pointer) — the cross-client `mouse_mode`. Replaces the
     /// never-shipped "punktfunk.cursorMode" (auto/always/never client-side-cursor setting,
