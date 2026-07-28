@@ -104,6 +104,13 @@ struct CaptureSignals {
     /// Set once the stream negotiated one of the 10-bit PQ formats, i.e. frames really are
     /// PQ/BT.2020 — drives `hdr_meta`.
     hdr_negotiated: Arc<AtomicBool>,
+    /// Set by the PipeWire thread once it ACTUALLY advertised the EGL→CUDA dmabuf-only offer
+    /// (importer constructed, importable modifiers found, not the raw passthrough, not HDR).
+    /// `plan.build_importer` alone cannot answer this — the importer may fail to construct (no
+    /// CUDA on this box), in which case no dmabuf was offered and a negotiation timeout must NOT
+    /// latch the GPU offer off. Read by `next_frame`'s timeout diagnosis, the EGL→CUDA twin of
+    /// the raw-passthrough arm.
+    gpu_dmabuf_offer: Arc<AtomicBool>,
     /// The LIVE cursor overlay, published from every buffer's `SPA_META_Cursor` — including the
     /// cursor-only "corrupted" buffers that never become frames — so the encode loop's forwarder
     /// tracks pointer-only motion on a static desktop (the frame-attached overlay alone goes stale
@@ -123,6 +130,7 @@ impl CaptureSignals {
             streaming: Arc::new(AtomicBool::new(false)),
             broken: Arc::new(AtomicBool::new(false)),
             hdr_negotiated: Arc::new(AtomicBool::new(false)),
+            gpu_dmabuf_offer: Arc::new(AtomicBool::new(false)),
             cursor_live: Arc::new(std::sync::Mutex::new(None)),
             frame_size: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
@@ -444,6 +452,7 @@ fn spawn_pipewire(
         native_nv12_session: policy.native_nv12_session,
         raw_dmabuf_import_disabled: pf_zerocopy::raw_dmabuf_import_disabled(),
         gpu_import_disabled: pf_zerocopy::gpu_import_disabled(),
+        gpu_dmabuf_negotiation_failed: pf_zerocopy::gpu_dmabuf_negotiation_disabled(),
         // Default ON; `PUNKTFUNK_PIPEWIRE_NV12=0` (or any falsy spelling — the shared parser, not a
         // bare `!= "0"` string compare) restores the packed-RGB negotiation.
         native_nv12_env_on: pf_host_config::env_on("PUNKTFUNK_PIPEWIRE_NV12").unwrap_or(true),
@@ -721,7 +730,7 @@ impl PortalCapturer {
                          reconnect to stream SDR",
                         self.node_id
                     ))
-                } else if self.vaapi_dmabuf && !pf_zerocopy::vaapi_dmabuf_forced() {
+                } else if self.vaapi_dmabuf && !pf_zerocopy::zerocopy_forced() {
                     // The dmabuf-only raw-passthrough offer was never accepted. Latch the
                     // downgrade so the encode loop's pipeline rebuild retries on the CPU offer
                     // instead of failing this same negotiation forever. The latch is SCOPED to the
@@ -736,6 +745,25 @@ impl PortalCapturer {
                          accepted the dmabuf-only offer (raw-dmabuf passthrough) — downgrading \
                          THIS path to CPU capture for the rest of the process; the pipeline \
                          rebuild will renegotiate without dmabuf",
+                        self.node_id
+                    ))
+                } else if self.signals.gpu_dmabuf_offer.load(Ordering::Relaxed)
+                    && !pf_zerocopy::zerocopy_forced()
+                {
+                    // The EGL→CUDA dmabuf-only offer was never accepted — the twin of the raw-
+                    // passthrough arm above (the offer the thread ACTUALLY made, per the signal
+                    // it set — see `CaptureSignals::gpu_dmabuf_offer`). One timeout is conclusive:
+                    // a compositor that allocates none of the importer's modifiers refuses them
+                    // identically on every retry, so latch the offer off and let the pipeline
+                    // rebuild renegotiate the CPU path instead of re-running this same 10 s
+                    // timeout on every reconnect. A forced PUNKTFUNK_ZEROCOPY=1 keeps erroring
+                    // loudly instead (same rule as the raw arm).
+                    pf_zerocopy::note_gpu_dmabuf_negotiation_failed();
+                    Err(anyhow!(
+                        "no PipeWire frame within {within}s (node {}): the compositor never \
+                         accepted the dmabuf-only offer (EGL→CUDA GPU import) — downgrading THIS \
+                         offer to the CPU path for the rest of the process; the pipeline rebuild \
+                         will renegotiate without dmabuf",
                         self.node_id
                     ))
                 } else {

@@ -127,6 +127,9 @@ pub(super) struct NegotiationInputs {
     pub raw_dmabuf_import_disabled: bool,
     /// `pf_zerocopy::gpu_import_disabled()` — repeated import-worker deaths.
     pub gpu_import_disabled: bool,
+    /// `pf_zerocopy::gpu_dmabuf_negotiation_disabled()` — a previous EGL→CUDA dmabuf-only offer
+    /// timed out (the compositor accepts none of the importer's modifiers).
+    pub gpu_dmabuf_negotiation_failed: bool,
     /// `PUNKTFUNK_PIPEWIRE_NV12` (default ON) — allow the producer-side NV12 preference.
     pub native_nv12_env_on: bool,
 }
@@ -154,8 +157,8 @@ pub(super) struct NegotiationPlan {
     /// Diagnostic: this capture WOULD have taken the raw passthrough, but its scoped latch is
     /// set (the encoder repeatedly failed to import, or a previous negotiation timed out).
     pub raw_dmabuf_latched: bool,
-    /// Diagnostic: this capture WOULD have built the EGL→CUDA importer, but repeated
-    /// import-worker deaths latched the GPU import off.
+    /// Diagnostic: this capture WOULD have built the EGL→CUDA importer, but a latch fired —
+    /// repeated import-worker deaths, or a previous dmabuf-offer negotiation timeout.
     pub gpu_import_latched: bool,
 }
 
@@ -176,8 +179,14 @@ pub(super) fn negotiation_plan(i: NegotiationInputs) -> NegotiationPlan {
     // Building the EGL→CUDA importer would waste a CUDA probe under a raw passthrough — or
     // worse, succeed and produce CUDA payloads only NVENC can consume. HDR is excluded by
     // invariant 1. `gpu_import_disabled` is the repeated-worker-death latch (a wedged GPU stack
-    // must not crash-loop).
-    let build_importer = i.zerocopy && !raw_passthrough && !i.want_hdr && !i.gpu_import_disabled;
+    // must not crash-loop); `gpu_dmabuf_negotiation_failed` is the offer's own timeout latch (a
+    // compositor that accepts none of the importer's modifiers refuses them identically on every
+    // retry, so the next session negotiates the CPU path instead of re-paying the 10 s timeout).
+    let build_importer = i.zerocopy
+        && !raw_passthrough
+        && !i.want_hdr
+        && !i.gpu_import_disabled
+        && !i.gpu_dmabuf_negotiation_failed;
     // Note there is no `importer.is_none()` term, unlike the expression this replaces: it was
     // redundant (`build_importer` already excludes `raw_passthrough`, so the importer is
     // necessarily absent here) and it is what made the decision look impure — the reason
@@ -200,7 +209,10 @@ pub(super) fn negotiation_plan(i: NegotiationInputs) -> NegotiationPlan {
             && !i.force_shm
             && raw_passthrough
             && i.raw_dmabuf_import_disabled,
-        gpu_import_latched: i.zerocopy && !raw_passthrough && !i.want_hdr && i.gpu_import_disabled,
+        gpu_import_latched: i.zerocopy
+            && !raw_passthrough
+            && !i.want_hdr
+            && (i.gpu_import_disabled || i.gpu_dmabuf_negotiation_failed),
     }
 }
 
@@ -810,7 +822,8 @@ pub fn pipewire_thread(
     // the import off — see `negotiation_plan`).
     if plan.gpu_import_latched {
         tracing::warn!(
-            "zero-copy GPU import disabled after repeated import-worker deaths — using CPU path"
+            "zero-copy GPU import disabled for this host process (repeated import-worker deaths, \
+             or a previous dmabuf negotiation timeout) — using CPU path"
         );
     }
     let mut importer = if plan.build_importer {
@@ -862,6 +875,13 @@ pub fn pipewire_thread(
     // The one runtime-dependent half of the decision (see `NegotiationPlan::want_dmabuf`): it
     // needs the modifier list the importer's construction actually yielded.
     let want_dmabuf = plan.want_dmabuf(importer.is_some(), &modifiers);
+    // Record whether THIS capture really advertises the EGL→CUDA dmabuf-only offer, for the
+    // capturer's negotiation-timeout diagnosis (its latch must fire only for an offer that was
+    // actually made — `plan.build_importer` alone can't know the importer constructed).
+    signals.gpu_dmabuf_offer.store(
+        want_dmabuf && !vaapi_passthrough && !want_hdr,
+        Ordering::Relaxed,
+    );
     if force_shm {
         tracing::info!(
             "capture: PUNKTFUNK_FORCE_SHM — race-free SHM download path (no dmabuf, no zero-copy)"
@@ -1398,6 +1418,7 @@ mod tests {
             native_nv12_session: false,
             raw_dmabuf_import_disabled: false,
             gpu_import_disabled: false,
+            gpu_dmabuf_negotiation_failed: false,
             native_nv12_env_on: true,
         }
     }
@@ -1510,6 +1531,29 @@ mod tests {
                 .vaapi_passthrough
             );
         }
+    }
+
+    /// The EGL→CUDA offer's own negotiation-timeout latch gates `build_importer` — the twin of
+    /// the raw passthrough's latch, so a compositor that accepts none of the importer's modifiers
+    /// stops being asked (previously it re-ran the same 10 s timeout on every session, forever).
+    /// The raw passthrough is untouched by it.
+    #[test]
+    fn gpu_dmabuf_negotiation_latch_gates_only_the_importer() {
+        let p = negotiation_plan(NegotiationInputs {
+            gpu_dmabuf_negotiation_failed: true,
+            ..nvenc()
+        });
+        assert!(!p.build_importer, "latched offer must not be re-made");
+        assert!(p.gpu_import_latched, "the downgrade must be diagnosable");
+        let p = negotiation_plan(NegotiationInputs {
+            gpu_dmabuf_negotiation_failed: true,
+            ..vaapi_native_nv12()
+        });
+        assert!(
+            p.vaapi_passthrough,
+            "the raw passthrough has its own latch — this one must not touch it"
+        );
+        assert!(!p.gpu_import_latched, "no importer was ever wanted here");
     }
 
     /// A PyroWave session on an NVIDIA box takes the raw passthrough (the wavelet encoder's own

@@ -60,7 +60,8 @@ fn flag(name: &str) -> bool {
 
 /// True when `PUNKTFUNK_ZEROCOPY` is explicitly truthy — the operator forced the dmabuf offer, so
 /// a failed negotiation keeps erroring loudly instead of silently downgrading to the CPU path.
-pub fn vaapi_dmabuf_forced() -> bool {
+/// Read by BOTH negotiation-timeout latches (the raw passthrough's and the EGL→CUDA offer's).
+pub fn zerocopy_forced() -> bool {
     flag_opt("PUNKTFUNK_ZEROCOPY") == Some(true)
 }
 
@@ -70,11 +71,12 @@ pub fn vaapi_dmabuf_forced() -> bool {
 /// Vulkan (LINEAR) imports now run in a per-capture worker subprocess
 /// (`design/zerocopy-worker-isolation.md`), so a driver fault on a producer-invalidated dmabuf kills
 /// the worker and the host degrades to its capture-loss rebuild instead of dying — the reason the
-/// NVENC path stayed opt-in is gone. Fallbacks stay in place: VAAPI has a one-shot CPU downgrade if
-/// the LINEAR-dmabuf offer never negotiates ([`note_raw_dmabuf_negotiation_failed`]); NVENC falls back per
-/// capture when no importer/importable modifier is available and latches the import off after
-/// repeated worker deaths. `PUNKTFUNK_ZEROCOPY=0` opts out; `PUNKTFUNK_FORCE_SHM` forces the
-/// race-free SHM path.
+/// NVENC path stayed opt-in is gone. Fallbacks stay in place: VAAPI has a one-shot CPU downgrade
+/// if the LINEAR-dmabuf offer never negotiates ([`note_raw_dmabuf_negotiation_failed`]); NVENC
+/// falls back per capture when no importer/importable modifier is available, and latches the
+/// import off after repeated worker deaths or its own negotiation timeout
+/// ([`note_gpu_dmabuf_negotiation_failed`]). `PUNKTFUNK_ZEROCOPY=0` opts out;
+/// `PUNKTFUNK_FORCE_SHM` forces the race-free SHM path.
 ///
 /// This is the GLOBAL switch and nothing but the env var moves it. It used to fall back to
 /// `!VAAPI_DMABUF_FAILED`, a latch a capture-side dmabuf *negotiation* timeout set — which made one
@@ -309,6 +311,35 @@ pub fn note_raw_dmabuf_negotiation_failed() {
 /// [`note_raw_dmabuf_import_failure`]).
 pub fn raw_dmabuf_import_disabled() -> bool {
     RAW_DMABUF_DISABLED.load(Ordering::Relaxed)
+}
+
+/// The EGL→CUDA twin of the raw-passthrough negotiation latch: the capture advertised the GPU
+/// importer's dmabuf-only offer and the compositor never accepted it. Without this, the raw
+/// passthrough stopped being asked after one timeout while the GPU-import offer re-ran the same
+/// 10 s negotiation timeout on every session, forever — the mirror image of the hybrid-Intel case
+/// [`note_raw_dmabuf_negotiation_failed`] was written for.
+static GPU_DMABUF_NEGOTIATION_FAILED: AtomicBool = AtomicBool::new(false);
+
+/// Latch the EGL→CUDA dmabuf offer off because it *never negotiated*. One timeout is conclusive
+/// for this offer too: a compositor that cannot allocate any of the advertised EGL-importable
+/// modifiers refuses them identically on every retry. Scoped deliberately — this gates only
+/// `build_importer` (the capture-side EGL→CUDA offer); the raw passthrough, the worker-death
+/// latch, and the encoder are untouched.
+pub fn note_gpu_dmabuf_negotiation_failed() {
+    if !GPU_DMABUF_NEGOTIATION_FAILED.swap(true, Ordering::Relaxed) {
+        tracing::warn!(
+            "zero-copy EGL→CUDA dmabuf offer disabled for this host process: the compositor never \
+             accepted the GPU importer's dmabuf-only capture offer, so later captures negotiate \
+             the CPU path instead of repeating that timeout (the raw-dmabuf passthrough is NOT \
+             affected)"
+        );
+    }
+}
+
+/// True once a negotiation timeout latched the EGL→CUDA dmabuf offer off (see
+/// [`note_gpu_dmabuf_negotiation_failed`]).
+pub fn gpu_dmabuf_negotiation_disabled() -> bool {
+    GPU_DMABUF_NEGOTIATION_FAILED.load(Ordering::Relaxed)
 }
 
 /// DRM FourCC for a packed 32-bit format name (little-endian, e.g. `b"XR24"`).
