@@ -12,10 +12,10 @@ use anyhow::Result;
 // `crate::capture::*` (the capture mechanics that used the rest moved into pf-capture).
 pub use pf_frame::{CapturedFrame, OutputFormat, PixelFormat};
 // The capturer types + trait + synthetics live in `pf-capture`; re-export them at the old paths.
-pub use pf_capture::{
-    capturer_supports_444, capturer_supports_hdr, Capturer, FastSyntheticCapturer,
-    SyntheticCapturer,
-};
+// `capturer_supports_hdr` is deliberately NOT re-exported: on Linux it is only the platform floor,
+// and a caller reaching for it by that name would silently miss the gamescope arm. The host's
+// answer is [`capturer_supports_hdr_for`] below.
+pub use pf_capture::{capturer_supports_444, Capturer, FastSyntheticCapturer, SyntheticCapturer};
 // `crate::capture::dxgi::{install_gpu_pref_hook, hdr_p010_selftest_at}` (main.rs subcommands) and
 // `crate::capture::synthetic_nv12` resolve through pf-capture's Windows modules.
 #[cfg(target_os = "windows")]
@@ -60,6 +60,10 @@ fn zero_copy_policy(
         pyrowave_session,
         pyrowave_modifiers,
         native_nv12_session,
+        // Only the direct-SDK NVENC backend takes a packed 10-bit PQ CUDA payload; without it an
+        // HDR capture must stay on the CPU path (libav's HDR route swscales into a P010 hardware
+        // frame). Resolved here, in the facade, like every other encode fact capture is told.
+        hdr_cuda_ok: pf_encode::linux_hdr_cuda_ok(),
     }
 }
 
@@ -107,13 +111,17 @@ pub fn capture_virtual_output(
     want: OutputFormat,
     _capture: crate::session_plan::CaptureBackend,
 ) -> Result<Box<dyn Capturer>> {
-    // The Linux NATIVE plane stays 8-bit (Mutter's virtual-monitor streams are SDR-only upstream;
-    // the GNOME 50+ HDR path is monitor-mirror only — `open_portal_monitor`) and the portal
-    // negotiates its own pixel format, so `want.gpu` gates GPU zero-copy capture (the capture
-    // backend is always the portal — the `CaptureBackend` arg is a Windows-only dispatch) and
-    // `want.chroma_444` selects the worker's planar-YUV444 GPU convert. `gpu = false` (4:4:4
+    // The portal negotiates its own pixel format, so `want.gpu` gates GPU zero-copy capture (the
+    // capture backend is always the portal — the `CaptureBackend` arg is a Windows-only dispatch)
+    // and `want.chroma_444` selects the worker's planar-YUV444 GPU convert. `gpu = false` (4:4:4
     // without zero-copy) forces the CPU mmap path so the encoder gets CPU-resident RGB to swscale
     // into YUV444P.
+    //
+    // `want.hdr` runs the 10-bit PQ/BT.2020 offer. It is only ever set for a gamescope output off
+    // our `pipewire-hdr` build — every other Linux virtual output is SDR-only upstream — and the
+    // handshake already resolved that through [`capturer_supports_hdr_for`] before the Welcome,
+    // so passing it through here is the whole of this arm's HDR logic. It used to be dropped on
+    // the floor, which is what kept the Linux native plane at 8 bits.
     pf_capture::open_virtual_output(
         vout.remote_fd,
         vout.node_id,
@@ -121,9 +129,41 @@ pub fn capture_virtual_output(
         vout.keepalive,
         want.gpu,
         want.chroma_444,
+        want.hdr,
         zero_copy_policy(want.pyrowave, want.nv12_native),
         vout.expect_exact_dims,
     )
+}
+
+/// Can the NATIVE-plane capture source this session will drive deliver a 10-bit PQ/BT.2020 frame?
+/// The capture-side half of the punktfunk/1 bit-depth gate (`native::handshake`), and the single
+/// source-aware answer — `pf_capture::capturer_supports_hdr()` alone cannot answer it on Linux,
+/// where it depends on which compositor is resolved and which gamescope binary is installed.
+///
+/// **Must be truthful, because the Welcome is irrevocable**: `bit_depth` is decided before the
+/// display exists, and PQ frames handed to an 8-bit encoder are a deliberate hard error
+/// (`pf-encode/src/enc/linux/mod.rs`). So every term here is a STATIC fact resolvable before the
+/// spawn — never "spawn it and find out".
+///
+/// - **Windows**: the IDD-push capturer proactively enables advanced colour → the platform answer.
+/// - **Linux + gamescope**: true when the host knob allows it, the resolved gamescope binary
+///   offers 10-bit BT.2020/PQ capture formats (`packaging/gamescope`), the sub-mode is one we
+///   SPAWN (an attach to a foreign gamescope tells us nothing about how it was started — §3.6
+///   stretch), and no earlier virtual-output HDR negotiation on this host has latched a downgrade.
+/// - **Linux, anything else**: false. Mutter/KWin/wlroots virtual outputs are 8-bit upstream. The
+///   other Linux HDR path — the GNOME 50+ portal monitor mirror — belongs to the GameStream plane
+///   and is gated by `gamestream::host_hdr_capable` + the live monitor colour-mode probe instead.
+pub fn capturer_supports_hdr_for(compositor: Option<crate::vdisplay::Compositor>) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        if compositor == Some(crate::vdisplay::Compositor::Gamescope) {
+            return pf_host_config::config().gamescope_hdr
+                && pf_vdisplay::gamescope_hdr_available()
+                && !pf_capture::hdr_capture_failed(pf_capture::HdrSource::VirtualOutput);
+        }
+    }
+    let _ = compositor;
+    pf_capture::capturer_supports_hdr()
 }
 
 #[cfg(target_os = "windows")]

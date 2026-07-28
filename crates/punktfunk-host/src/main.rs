@@ -463,20 +463,32 @@ fn real_main() -> Result<()> {
             }
             crate::capture::dxgi::hdr_p010_selftest_at(size.0, size.1, vendor)
         }
-        // Linux HDR readiness probe (GNOME 50+ portal path): prints whether a monitor is currently
-        // in BT.2100 (HDR) colour mode, whether the NVENC/VAAPI backend probes Main10 for
-        // HEVC/AV1, and the GameStream HDR capability the two combine into — the "why isn't my
-        // stream HDR?" diagnostic (no display/session needed for the encoder half).
+        // Linux HDR readiness probe: prints, for BOTH Linux HDR sources, whether they can deliver
+        // 10-bit PQ right now — the monitor mirror (is a monitor in BT.2100 colour mode?) and the
+        // gamescope virtual output (is the resolved gamescope our `pipewire-hdr` build, and is the
+        // knob on?) — plus whether the NVENC/VAAPI backend probes Main10 for HEVC/AV1 and the
+        // GameStream capability they combine into. The "why isn't my stream HDR?" diagnostic (no
+        // display/session needed for the encoder half).
         #[cfg(target_os = "linux")]
         Some("hdr-probe") => {
             let monitor_hdr = pf_capture::gnome_hdr_monitor_active();
             let hevc10 = encode::can_encode_10bit(encode::Codec::H265);
             let av110 = encode::can_encode_10bit(encode::Codec::Av1);
+            let gs_binary_hdr = pf_vdisplay::gamescope_hdr_available();
+            let gs_knob = pf_host_config::config().gamescope_hdr;
+            let compositor = vdisplay::detect().ok();
             println!("monitor in BT.2100 (HDR) colour mode: {monitor_hdr}");
+            println!("gamescope offers 10-bit PQ capture:   {gs_binary_hdr}");
+            println!("PUNKTFUNK_GAMESCOPE_HDR:              {gs_knob}");
             println!("encoder Main10 (HEVC): {hevc10}");
             println!("encoder 10-bit (AV1):  {av110}");
             println!(
-                "GameStream HDR capable (PUNKTFUNK_10BIT + video_source=portal + encoder): {}",
+                "native-plane HDR on the resolved compositor ({}): {}",
+                compositor.map_or("none".to_string(), |c| format!("{c:?}")),
+                crate::capture::capturer_supports_hdr_for(compositor)
+            );
+            println!(
+                "GameStream HDR capable (PUNKTFUNK_10BIT + a capable source + encoder): {}",
                 gamestream::host_hdr_capable()
             );
             Ok(())

@@ -132,6 +132,9 @@ pub(super) struct NegotiationInputs {
     pub gpu_dmabuf_negotiation_failed: bool,
     /// `PUNKTFUNK_PIPEWIRE_NV12` (default ON) — allow the producer-side NV12 preference.
     pub native_nv12_env_on: bool,
+    /// [`ZeroCopyPolicy::hdr_cuda_ok`] — the resolved encoder can ingest a packed 10-bit PQ CUDA
+    /// payload. Only the direct-SDK NVENC backend can.
+    pub hdr_cuda_ok: bool,
 }
 
 /// The resolved zero-copy negotiation decision — **one resolver, consumed by the PipeWire thread
@@ -166,8 +169,11 @@ pub(super) struct NegotiationPlan {
 ///
 /// The four invariants this encodes were previously prose-only comments spread across the
 /// prologue; `negotiation_plan_invariants` in the tests below pins each one:
-///   1. HDR never builds the EGL→CUDA importer (its de-tile blit is 8-bit RGBA8 → silent depth
-///      loss); the HDR consumers are the CPU mmap path and the raw passthrough.
+///   1. HDR never takes the TILED EGL de-tile blit (it renders into an 8-bit `GL_RGBA8` texture
+///      → silent depth loss). It may still build the importer, because the HDR pod family
+///      advertises LINEAR only ([`build_hdr_dmabuf_format`]) — so an HDR dmabuf necessarily
+///      takes the Vulkan-bridge / CUDA-external-memory arm, which is byte-exact for any 4 Bpp
+///      packed format. The per-frame gate in `.process` enforces the tiled half.
 ///   2. 4:4:4 never prefers producer NV12 (a 4:4:4 session must not be subsampled).
 ///   3. Producer-native NV12 only on a `native_nv12_session` under an active raw passthrough
 ///      (libav VAAPI would misread the two-plane buffer; the CUDA importer expects packed RGB).
@@ -177,16 +183,22 @@ pub(super) fn negotiation_plan(i: NegotiationInputs) -> NegotiationPlan {
     // CSC) or a PyroWave session (the wavelet encoder's own Vulkan device, any vendor).
     let raw_passthrough = i.backend_is_vaapi || i.pyrowave_session;
     // Building the EGL→CUDA importer would waste a CUDA probe under a raw passthrough — or
-    // worse, succeed and produce CUDA payloads only NVENC can consume. HDR is excluded by
-    // invariant 1. `gpu_import_disabled` is the repeated-worker-death latch (a wedged GPU stack
-    // must not crash-loop); `gpu_dmabuf_negotiation_failed` is the offer's own timeout latch (a
-    // compositor that accepts none of the importer's modifiers refuses them identically on every
-    // retry, so the next session negotiates the CPU path instead of re-paying the 10 s timeout).
+    // worse, succeed and produce CUDA payloads only NVENC can consume. `gpu_import_disabled` is
+    // the repeated-worker-death latch (a wedged GPU stack must not crash-loop);
+    // `gpu_dmabuf_negotiation_failed` is the offer's own timeout latch (a compositor that accepts
+    // none of the importer's modifiers refuses them identically on every retry, so the next
+    // session negotiates the CPU path instead of re-paying the 10 s timeout).
+    //
+    // HDR is NOT excluded outright (invariant 1): its pods are LINEAR-only, so it lands on the
+    // Vulkan-bridge arm, never the 8-bit de-tile blit. But it is excluded where the encoder cannot
+    // take a packed 10-bit CUDA payload — the libav fallback's HDR route swscales into a P010
+    // hardware frame, so it must keep getting CPU frames. Without that term a
+    // `PUNKTFUNK_NVENC_DIRECT=0` host would stream garbage.
     let build_importer = i.zerocopy
         && !raw_passthrough
-        && !i.want_hdr
         && !i.gpu_import_disabled
-        && !i.gpu_dmabuf_negotiation_failed;
+        && !i.gpu_dmabuf_negotiation_failed
+        && (!i.want_hdr || i.hdr_cuda_ok);
     // Note there is no `importer.is_none()` term, unlike the expression this replaces: it was
     // redundant (`build_importer` already excludes `raw_passthrough`, so the importer is
     // necessarily absent here) and it is what made the decision look impure — the reason
@@ -209,9 +221,11 @@ pub(super) fn negotiation_plan(i: NegotiationInputs) -> NegotiationPlan {
             && !i.force_shm
             && raw_passthrough
             && i.raw_dmabuf_import_disabled,
+        // Every `build_importer` term EXCEPT the two latches, and then either latch — i.e. exactly
+        // "this capture would have built the importer, but a latch stopped it".
         gpu_import_latched: i.zerocopy
             && !raw_passthrough
-            && !i.want_hdr
+            && (!i.want_hdr || i.hdr_cuda_ok)
             && (i.gpu_import_disabled || i.gpu_dmabuf_negotiation_failed),
     }
 }
@@ -463,10 +477,20 @@ fn consume_frame(ud: &mut UserData, spa_buf: *mut spa::sys::spa_buffer) {
     // through to the shm de-pad copy below.
     let mut gpu_import_broken = false;
     if let (Some(importer), Some(fmt)) = (ud.importer.as_mut(), ud.format) {
-        // Defense-in-depth: the 10-bit PQ formats must never enter the EGL→CUDA import (its
-        // de-tile blit is 8-bit RGBA8 — silent depth loss). An HDR offer never builds the
-        // importer, so this gate only matters if those invariants ever drift apart.
-        if datas[0].type_() == pw::spa::buffer::DataType::DmaBuf && !fmt.is_hdr_rgb10() {
+        // Invariant 1's teeth: a 10-bit PQ frame may take the LINEAR (Vulkan-bridge → CUDA
+        // external memory) arm, which moves 4 Bpp words verbatim, but must NEVER take the TILED
+        // EGL de-tile blit — that renders into an 8-bit `GL_RGBA8` texture and would crush the
+        // depth silently. The HDR pods advertise LINEAR only, so a tiled modifier here means the
+        // producer ignored the offer; drop to the CPU path rather than trust it.
+        let hdr_tiled = fmt.is_hdr_rgb10() && ud.modifier != 0;
+        if hdr_tiled {
+            warn_once(
+                "HDR frame arrived with a tiled modifier — the GPU de-tile blit is 8-bit, so \
+                 this stream falls back to the CPU path (the producer ignored our LINEAR-only \
+                 HDR offer)",
+            );
+        }
+        if datas[0].type_() == pw::spa::buffer::DataType::DmaBuf && !hdr_tiled {
             let plane = pf_zerocopy::DmabufPlane {
                 fd: datas[0].fd(),
                 offset: datas[0].chunk().offset(),
@@ -486,8 +510,13 @@ fn consume_frame(ud: &mut UserData, spa_buf: *mut spa::sys::spa_buffer) {
                 // stays RGB, falling to the encoder's clear-error path (`want_444` with an
                 // RGB CUDA payload) rather than silently subsampling. A LINEAR NV12 convert
                 // failure latches RGB for the stream (mid-frame fallback, no drop).
-                let yuv444 = ud.yuv444 && modifier.is_some();
-                let mut nv12 = ud.nv12 && !ud.yuv444;
+                // A 10-bit frame takes NEITHER convert: both the GL and the Vulkan compute CSCs
+                // write 8-bit planes, and NVENC ingests the packed 10-bit RGB natively
+                // (`ARGB10`/`ABGR10`) with its own BT.2020 CSC. So HDR stays packed RGB all the
+                // way to the encoder — no depth loss, no extra pass.
+                let ten_bit = fmt.is_hdr_rgb10();
+                let yuv444 = ud.yuv444 && modifier.is_some() && !ten_bit;
+                let mut nv12 = ud.nv12 && !ud.yuv444 && !ten_bit;
                 let imported = if let Some(m) = modifier {
                     if yuv444 {
                         importer.import_yuv444(&plane, w as u32, h as u32, fourcc, Some(m))
@@ -818,8 +847,8 @@ pub fn pipewire_thread(
     // (design/zerocopy-worker-isolation.md), so a driver fault on a dying compositor's dmabuf
     // kills the worker, not this host. If construction fails, log and fall back to the CPU path
     // (we simply won't request dmabuf below); `plan.build_importer` already encodes WHEN to try
-    // at all (not under a raw passthrough, not for HDR, not once repeated worker deaths latched
-    // the import off — see `negotiation_plan`).
+    // at all (not under a raw passthrough, not once repeated worker deaths latched the import
+    // off — see `negotiation_plan`).
     if plan.gpu_import_latched {
         tracing::warn!(
             "zero-copy GPU import disabled for this host process (repeated import-worker deaths, \
@@ -1420,6 +1449,7 @@ mod tests {
             gpu_import_disabled: false,
             gpu_dmabuf_negotiation_failed: false,
             native_nv12_env_on: true,
+            hdr_cuda_ok: true,
         }
     }
 
@@ -1435,23 +1465,45 @@ mod tests {
     /// The four invariants that were prose-only comments in `pipewire_thread`'s prologue.
     #[test]
     fn negotiation_plan_invariants() {
-        // 1. HDR NEVER builds the EGL→CUDA importer — its de-tile blit is 8-bit RGBA8, so an
-        //    importer here would silently crush the 10-bit depth.
+        // 1. HDR builds the importer on the NVENC path — its pods are LINEAR-only, so the frames
+        //    take the Vulkan-bridge/CUDA arm (byte-exact for 4 Bpp), never the 8-bit de-tile
+        //    blit. (The tiled half of the invariant is enforced per frame in `.process`, which
+        //    sees the negotiated modifier this plan cannot.)
         for want_444 in [false, true] {
             let p = negotiation_plan(NegotiationInputs {
                 want_hdr: true,
                 want_444,
                 ..nvenc()
             });
-            assert!(!p.build_importer, "HDR must not build the importer");
+            assert!(p.build_importer, "HDR on NVENC keeps zero-copy");
         }
-        // …on every backend, including the ones that take the raw passthrough.
+        // …but never under a raw passthrough (VAAPI/PyroWave import the dmabuf themselves).
         assert!(
             !negotiation_plan(NegotiationInputs {
                 want_hdr: true,
                 ..vaapi_native_nv12()
             })
             .build_importer
+        );
+        // …and never when the resolved encoder can't take a packed 10-bit CUDA payload (libav
+        // NVENC: its HDR route swscales into a P010 hardware frame). SDR is unaffected — the term
+        // is HDR-only, so a libav host keeps its 8-bit zero-copy.
+        assert!(
+            !negotiation_plan(NegotiationInputs {
+                want_hdr: true,
+                hdr_cuda_ok: false,
+                ..nvenc()
+            })
+            .build_importer,
+            "HDR must stay on the CPU path where the encoder can't ingest 10-bit CUDA"
+        );
+        assert!(
+            negotiation_plan(NegotiationInputs {
+                hdr_cuda_ok: false,
+                ..nvenc()
+            })
+            .build_importer,
+            "the HDR-only guard must not touch an SDR session"
         );
 
         // 2. 4:4:4 never prefers producer NV12 (a 4:4:4 session must not be subsampled).
@@ -1614,16 +1666,18 @@ mod tests {
         });
         assert!(!p.build_importer);
         assert!(p.gpu_import_latched);
-        // It is NOT reported for a capture that would never have built one anyway (HDR, or a
-        // raw passthrough) — that would misdirect the operator.
+        // Reported for an HDR capture too — HDR takes the same importer (LINEAR/Vulkan-bridge
+        // arm), so the latch really did cost it zero-copy.
         assert!(
-            !negotiation_plan(NegotiationInputs {
+            negotiation_plan(NegotiationInputs {
                 gpu_import_disabled: true,
                 want_hdr: true,
                 ..nvenc()
             })
             .gpu_import_latched
         );
+        // It is NOT reported for a capture that would never have built one anyway (a raw
+        // passthrough) — that would misdirect the operator.
         assert!(
             !negotiation_plan(NegotiationInputs {
                 gpu_import_disabled: true,

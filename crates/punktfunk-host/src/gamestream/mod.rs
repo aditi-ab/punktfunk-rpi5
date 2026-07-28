@@ -68,12 +68,16 @@ pub const SERVER_CODEC_MODE_SUPPORT: u32 = SCM_H264 | SCM_HEVC | SCM_AV1_MAIN8;
 /// client HDR request proactively enables advanced color on the per-session virtual display so PQ
 /// flows even from an SDR desktop.
 ///
-/// **Linux**: the GNOME 50+ portal **monitor mirror** (`video_source=portal`) can negotiate the
-/// 10-bit PQ formats while the mirrored monitor is in HDR mode, and the NVENC/VAAPI encoders have
-/// a probed Main10 path ([`crate::encode::can_encode_10bit`]). The virtual-output source stays SDR
-/// (Mutter's RecordVirtual streams are 8-bit-only upstream), so this is `false` for it. Whether
-/// the monitor is ACTUALLY in HDR mode right now is checked live at RTSP honor time
-/// ([`pf_capture::gnome_hdr_monitor_active`]) — this fn is the static serverinfo capability.
+/// **Linux**: two sources can do it, and they are gated differently because they fail differently.
+/// The GNOME 50+ portal **monitor mirror** (`video_source=portal`) negotiates the 10-bit PQ
+/// formats only while the mirrored monitor is in HDR mode — a LIVE box-state fact, re-checked at
+/// RTSP honor time ([`pf_capture::gnome_hdr_monitor_active`]), so this fn can only make the static
+/// claim. A **gamescope virtual output** negotiates them whenever the resolved gamescope offers
+/// them (our `pipewire-hdr` build) — a STATIC binary-identity fact, so
+/// [`crate::capture::capturer_supports_hdr_for`] is the whole answer and the RTSP gate has nothing
+/// live to add. Every other virtual output stays SDR (Mutter's RecordVirtual streams and the
+/// KWin/wlroots equivalents are 8-bit upstream). Both arms also need the encoders' probed Main10
+/// path ([`crate::encode::can_encode_10bit`]).
 pub fn host_hdr_capable() -> bool {
     if !pf_host_config::config().ten_bit {
         return false;
@@ -84,8 +88,16 @@ pub fn host_hdr_capable() -> bool {
     }
     #[cfg(target_os = "linux")]
     {
-        pf_host_config::config().video_source.as_deref() == Some("portal")
-            && crate::encode::can_encode_10bit(crate::encode::Codec::H265)
+        let source_can_hdr = match pf_host_config::config().video_source.as_deref() {
+            Some("portal") => true,
+            // A virtual-output GameStream session drives the host's configured compositor; the
+            // gamescope arm is the only one that can be HDR. `detect()` is the same resolution
+            // the session itself will do, and it is cheap + cached downstream.
+            _ => crate::vdisplay::detect()
+                .ok()
+                .is_some_and(|c| crate::capture::capturer_supports_hdr_for(Some(c))),
+        };
+        source_can_hdr && crate::encode::can_encode_10bit(crate::encode::Codec::H265)
     }
     #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     {

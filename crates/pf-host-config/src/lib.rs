@@ -137,6 +137,22 @@ pub struct HostConfig {
     /// starts over (the "fresh gamescope output never delivers frames" field failure). Default ON;
     /// explicit-off grammar (`=0` disables, the on-glass A/B + emergency escape hatch).
     pub gamescope_splash: bool,
+    /// `PUNKTFUNK_GAMESCOPE_HDR` — allow HDR (10-bit BT.2020 PQ) sessions on the gamescope
+    /// backend. Needs the punktfunk gamescope build (`packaging/gamescope`), which teaches
+    /// gamescope's PipeWire node the 10-bit PQ capture formats; the host probes for it and stays
+    /// SDR when it isn't installed, so this knob only decides whether HDR is *attempted*.
+    ///
+    /// Default OFF for the canary release, then default-on (matching `PUNKTFUNK_10BIT`'s
+    /// explicit-off grammar). It gates the whole feature — spawn flags included — so an operator
+    /// who hits a bad interaction can turn the gamescope backend back into exactly today's 8-bit
+    /// path with one env var and no downgrade path to trip over.
+    pub gamescope_hdr: bool,
+    /// `PUNKTFUNK_GAMESCOPE_SDR_NITS` — the luminance SDR content is mapped to inside the PQ
+    /// container of an HDR gamescope session (gamescope's `--hdr-sdr-content-nits`, default 400).
+    /// An HDR stream carries the desktop, the Steam overlay and any SDR game through the same PQ
+    /// encode, so this is the knob that decides how bright "white" looks on the client's panel.
+    /// `None` = leave gamescope's own default.
+    pub gamescope_sdr_nits: Option<u32>,
     /// `PUNKTFUNK_RECOVER_SESSION_CMD` — operator hook fired (debounced) when a client connects while NO
     /// graphical session is live for this uid: the state a compositor crash leaves behind (gnome-shell
     /// SIGSEGV → GDM greeter, whose auto-login is once-per-boot, so the box would otherwise need a walk-up
@@ -210,6 +226,11 @@ impl HostConfig {
             // Default ON, explicit-off grammar: the splash is what makes a fresh bare spawn deliver
             // its first frames at all; `=0` is the A/B + escape hatch.
             gamescope_splash: env_on("PUNKTFUNK_GAMESCOPE_SPLASH").unwrap_or(true),
+            // Default OFF for one canary release (design §4 rollout), then flip the `unwrap_or`.
+            gamescope_hdr: env_on("PUNKTFUNK_GAMESCOPE_HDR").unwrap_or(false),
+            gamescope_sdr_nits: val("PUNKTFUNK_GAMESCOPE_SDR_NITS")
+                .and_then(|s| s.trim().parse::<u32>().ok())
+                .filter(|n| (1..=10_000).contains(n)),
             recover_session_cmd: val("PUNKTFUNK_RECOVER_SESSION_CMD")
                 .filter(|s| !s.trim().is_empty()),
             on_connect_cmd: val("PUNKTFUNK_ON_CONNECT_CMD").filter(|s| !s.trim().is_empty()),

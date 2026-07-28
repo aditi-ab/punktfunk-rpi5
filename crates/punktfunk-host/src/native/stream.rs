@@ -1168,6 +1168,11 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
             // panel instead of the driver's built-in ~1000-nit placeholder. No-op on Linux
             // backends and for older/SDR clients.
             vd.set_client_hdr(client_hdr);
+            // THIS SESSION's colourimetry (distinct from the client panel's volume above): a
+            // 10-bit session needs the output brought up HDR, which on gamescope means spawning
+            // it with the HDR flags so nested games get HDR surfaces at all. Decided in the
+            // Welcome (`capture::capturer_supports_hdr_for`), so it cannot change under us.
+            vd.set_hdr(bit_depth >= 10);
             // Cursor-forward sessions ask the backend for an out-of-band hardware cursor
             // (Windows pf-vdisplay / IddCx; no-op on Linux — the portal already separates it).
             vd.set_hw_cursor(cursor_forward);
@@ -3191,6 +3196,7 @@ pub(super) fn prepare_display(
     let mut vd = crate::vdisplay::open(compositor)?;
     vd.set_client_identity(client_identity);
     vd.set_client_hdr(client_hdr);
+    vd.set_hdr(bit_depth >= 10);
     vd.set_hw_cursor(cursor_forward);
     vd.set_quit_flag(quit.clone());
     // Slot-scoped setup serialization + reconnect preempt — see the inline arm in

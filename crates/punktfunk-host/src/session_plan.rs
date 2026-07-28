@@ -88,10 +88,13 @@ pub struct SessionPlan {
     pub encoder: EncoderBackend,
     /// Handshake-negotiated encode bit depth (8, or 10 = HEVC Main10).
     pub bit_depth: u8,
-    /// The IDD-push HDR hint (`bit_depth >= 10`) — the want-HDR flag handed to the capturer so it
-    /// proactively enables advanced color on the virtual display. The Linux NATIVE plane is 8-bit
-    /// (Mutter's virtual-monitor streams are SDR-only upstream — GNOME 50 HDR is monitor-mirror
-    /// only, which the GameStream portal path uses; see `capture::capturer_supports_hdr`).
+    /// The want-HDR flag handed to the capturer (`bit_depth >= 10`): on Windows the IDD-push
+    /// capturer proactively enables advanced colour on the virtual display; on Linux it runs the
+    /// 10-bit PQ/BT.2020 PipeWire offer. It is only ever set where the handshake's source-aware
+    /// gate said yes (`capture::capturer_supports_hdr_for`) — on Linux that means a gamescope
+    /// output off our `pipewire-hdr` build, since Mutter's/KWin's/wlroots' virtual outputs are
+    /// 8-bit upstream (GNOME 50's HDR is monitor-mirror only, which is the GameStream portal
+    /// path's business).
     pub hdr: bool,
     /// Handshake-negotiated chroma subsampling (4:2:0, or full-chroma 4:4:4 when the client + host +
     /// GPU all support it). Resolved before the Welcome; `Yuv420` on every backend that declined it.

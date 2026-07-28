@@ -24,12 +24,12 @@ mod discovery;
 #[path = "gamescope/splash.rs"]
 mod splash;
 use discovery::{
-    check_gamescope_version, find_gamescope_eis_socket, find_gamescope_node,
+    check_gamescope_version, find_gamescope_eis_socket, find_gamescope_node, gamescope_bin,
     gamescope_node_present, poll_managed_node, wait_for_node,
 };
 pub(crate) use discovery::{
-    game_session_exited, is_available, steam_appid_from_launch, wait_for_steam_game_exit,
-    SteamGameWatch,
+    game_session_exited, gamescope_hdr_capable, is_available, steam_appid_from_launch,
+    wait_for_steam_game_exit, SteamGameWatch,
 };
 pub(crate) use splash::run as splash_run;
 
@@ -44,6 +44,11 @@ pub struct GamescopeDisplay {
     /// The resolved per-session launch command (set via [`VirtualDisplay::set_launch_command`]); the
     /// bare-spawn path runs it instead of reading the process-global `PUNKTFUNK_GAMESCOPE_APP`.
     cmd: Option<String>,
+    /// This session negotiated HDR (10-bit BT.2020 PQ) — set via [`VirtualDisplay::set_hdr`]
+    /// before `create`. Spawns gamescope with `--hdr-enabled --hdr-debug-force-support` so the
+    /// WSI layer advertises HDR10/scRGB surfaces to nested games, and the composite gamescope
+    /// hands us can be negotiated as a 10-bit PQ stream (`packaging/gamescope`).
+    hdr: bool,
 }
 
 /// A running host-managed session (its transient systemd --user unit) + the mode it was launched at.
@@ -51,6 +56,11 @@ struct SessionState {
     width: u32,
     height: u32,
     refresh_hz: u32,
+    /// Whether the session was launched with the HDR flags. Part of the reuse key for the same
+    /// reason the registry's is: gamescope cannot turn HDR on live, so an SDR session cannot be
+    /// handed to an HDR client (the game would get no HDR surfaces while the stream negotiated
+    /// PQ) — that needs a relaunch, exactly like a mode change.
+    hdr: bool,
 }
 
 /// The host-managed `gamescope-session-plus` session, tracked at **host lifetime** (NOT per
@@ -242,6 +252,17 @@ impl VirtualDisplay for GamescopeDisplay {
         self.cmd = cmd;
     }
 
+    fn set_hdr(&mut self, on: bool) {
+        self.hdr = on;
+    }
+
+    fn hdr(&self) -> bool {
+        // The registry keys keep-alive reuse on it too: a kept SDR gamescope was spawned WITHOUT
+        // the HDR flags, so handing it to an HDR session would give the game no HDR surfaces and
+        // negotiate a PQ stream over an SDR composite — wrong, and not obviously broken.
+        self.hdr
+    }
+
     fn poolable_now(&self) -> bool {
         // Only a bare SPAWN is registry-poolable (its `create` reports `Owned`); managed
         // (`PUNKTFUNK_GAMESCOPE_SESSION`) and attach (`PUNKTFUNK_GAMESCOPE_NODE`) report
@@ -274,7 +295,7 @@ impl VirtualDisplay for GamescopeDisplay {
         // them (via the injected --nested-refresh + generated CVT modes, not the box's TV EDID) —
         // and relaunch it when the client's mode changes. Reuses the node + EIS discovery below.
         if let Ok(client) = std::env::var("PUNKTFUNK_GAMESCOPE_SESSION") {
-            return create_managed_session(&client, mode);
+            return create_managed_session(&client, mode, self.hdr);
         }
         // Attach to an already-running gamescope (a foreign / externally-launched session) instead
         // of spawning our own: capture its node AND inject into its EIS socket.
@@ -331,6 +352,7 @@ impl VirtualDisplay for GamescopeDisplay {
             mode.refresh_hz.max(1),
             self.cmd.as_deref(),
             &log,
+            self.hdr,
         )?;
         let child_pid = child.id();
         let proc = GamescopeProc {
@@ -368,14 +390,14 @@ impl VirtualDisplay for GamescopeDisplay {
 /// the running session if the mode is unchanged and its node is still live (no Steam restart);
 /// otherwise stop the old transient unit and RELAUNCH at the new mode (gamescope can't change output
 /// mode live). Then discover the node + point the injector, exactly as the attach path does.
-fn create_managed_session(client: &str, mode: Mode) -> Result<VirtualOutput> {
+fn create_managed_session(client: &str, mode: Mode, hdr: bool) -> Result<VirtualOutput> {
     // A (re)connect cancels any pending debounced TV-restore: we're about to (re)use the managed
     // session, so the autologin must stay stopped and the warm session stays up (no stop/relaunch).
     *PENDING_RESTORE.lock().unwrap_or_else(|e| e.into_inner()) = None;
     // SteamOS (the real Steam Deck) has no session-plus: take over its `gamescope-session.target`
     // headless at the client's mode instead of launching a separate managed session.
     if steamos_session_present() {
-        return create_managed_session_steamos(mode);
+        return create_managed_session_steamos(mode, hdr);
     }
     // In-stream "Switch to Desktop" under a DM-stop takeover: the user's session-select inside
     // the streamed game mode advanced the sentinel, but its config rewrite was a silent no-op
@@ -417,7 +439,10 @@ fn create_managed_session(client: &str, mode: Mode) -> Result<VirtualOutput> {
     if crate::rebuild_probe_active() {
         let guard = MANAGED_SESSION.lock().unwrap_or_else(|e| e.into_inner());
         let same_mode = guard.as_ref().is_some_and(|s| {
-            s.width == mode.width && s.height == mode.height && s.refresh_hz == mode.refresh_hz
+            s.width == mode.width
+                && s.height == mode.height
+                && s.refresh_hz == mode.refresh_hz
+                && s.hdr == hdr
         });
         if same_mode {
             if let Some(node_id) = find_gamescope_node() {
@@ -466,7 +491,10 @@ fn create_managed_session(client: &str, mode: Mode) -> Result<VirtualOutput> {
     free_desktop_steam()?;
     let mut guard = MANAGED_SESSION.lock().unwrap_or_else(|e| e.into_inner());
     let same_mode = guard.as_ref().is_some_and(|s| {
-        s.width == mode.width && s.height == mode.height && s.refresh_hz == mode.refresh_hz
+        s.width == mode.width
+            && s.height == mode.height
+            && s.refresh_hz == mode.refresh_hz
+            && s.hdr == hdr
     });
     if same_mode {
         if let Some(node_id) = find_gamescope_node() {
@@ -485,7 +513,7 @@ fn create_managed_session(client: &str, mode: Mode) -> Result<VirtualOutput> {
     }
     // (Re)launch at the new mode. `launch_session` stops the old unit by name first, so there is
     // exactly one gamescope `Video/Source` node for discovery.
-    let node_id = match launch_session(client, SESSION_UNIT, mode) {
+    let node_id = match launch_session(client, SESSION_UNIT, mode, hdr) {
         Ok(id) => id,
         Err(e) => {
             // The takeover already happened (autologin units stopped, possibly the DM down) — arm
@@ -505,6 +533,7 @@ fn create_managed_session(client: &str, mode: Mode) -> Result<VirtualOutput> {
         width: mode.width,
         height: mode.height,
         refresh_hz: mode.refresh_hz,
+        hdr,
     });
     tracing::info!(
         node_id,
@@ -781,8 +810,11 @@ fn headless_shim_dir() -> std::path::PathBuf {
 /// session's `exec gamescope` (via PATH) and rewrite to a headless output at the client's mode (read
 /// from `PF_W`/`PF_H`/`PF_HZ`), dropping the physical flags. Idempotent; returns the shim's directory.
 fn write_headless_shim() -> Result<std::path::PathBuf> {
-    const SHIM_BODY: &str = r#"#!/bin/bash
-W="${PF_W:-1920}"; H="${PF_H:-1080}"; HZ="${PF_HZ:-60}"
+    // `$PF_HDR_ARGS` is unquoted for the same reason as in the GAMESCOPE_BIN wrapper: it is our
+    // own flag list ([`hdr_args`]) and must word-split into separate argv entries.
+    let shim_body = format!(
+        r#"#!/bin/bash
+W="${{PF_W:-1920}}"; H="${{PF_H:-1080}}"; HZ="${{PF_HZ:-60}}"
 keep=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -790,12 +822,14 @@ while [ $# -gt 0 ]; do
     *) keep+=("$1"); shift;;
   esac
 done
-exec /usr/bin/gamescope --backend headless -W "$W" -H "$H" -w "$W" -h "$H" -r "$HZ" "${keep[@]}"
-"#;
+exec {bin} --backend headless -W "$W" -H "$H" -w "$W" -h "$H" -r "$HZ" ${{PF_HDR_ARGS}} "${{keep[@]}}"
+"#,
+        bin = gamescope_bin()
+    );
     let dir = headless_shim_dir();
     std::fs::create_dir_all(&dir).with_context(|| format!("mkdir {}", dir.display()))?;
     let shim = dir.join("gamescope");
-    std::fs::write(&shim, SHIM_BODY).with_context(|| format!("write shim {}", shim.display()))?;
+    std::fs::write(&shim, &shim_body).with_context(|| format!("write shim {}", shim.display()))?;
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))
         .with_context(|| format!("chmod shim {}", shim.display()))?;
@@ -812,7 +846,7 @@ fn steamos_dropin_path() -> std::path::PathBuf {
 
 /// Write the drop-in: prepend the shim dir to the service's PATH + pass the client's mode via `PF_*`.
 /// A subsequent `daemon-reload` + target restart applies it.
-fn write_steamos_dropin(shim_dir: &std::path::Path, mode: Mode) -> Result<()> {
+fn write_steamos_dropin(shim_dir: &std::path::Path, mode: Mode, hdr: bool) -> Result<()> {
     let path = steamos_dropin_path();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
@@ -827,11 +861,15 @@ fn write_steamos_dropin(shim_dir: &std::path::Path, mode: Mode) -> Result<()> {
          Environment=PF_W={w}\n\
          Environment=PF_H={h}\n\
          Environment=PF_HZ={hz}\n\
+         Environment=\"PF_HDR_ARGS={hdr_args}\"\n\
          UnsetEnvironment=DISPLAY WAYLAND_DISPLAY\n",
         shim = shim_dir.display(),
         w = mode.width,
         h = mode.height,
         hz = mode.refresh_hz.max(1),
+        // Read (unquoted) by the PATH shim — empty for an SDR session. Quoted HERE because a
+        // systemd `Environment=` value with spaces must be, or only the first flag survives.
+        hdr_args = hdr_args(hdr).join(" "),
     );
     std::fs::write(&path, body).with_context(|| format!("write drop-in {}", path.display()))
 }
@@ -846,10 +884,13 @@ fn remove_steamos_dropin() {
 /// brings Steam up in the fresh headless gamescope — and attach to its node. A same-mode reconnect
 /// reuses the running session (no Steam restart); a different mode rewrites the drop-in + restarts.
 /// The restart kills any prior gamescope, so there's exactly one node to discover (no stale attach).
-fn create_managed_session_steamos(mode: Mode) -> Result<VirtualOutput> {
+fn create_managed_session_steamos(mode: Mode, hdr: bool) -> Result<VirtualOutput> {
     let mut guard = MANAGED_SESSION.lock().unwrap_or_else(|e| e.into_inner());
     let same_mode = guard.as_ref().is_some_and(|s| {
-        s.width == mode.width && s.height == mode.height && s.refresh_hz == mode.refresh_hz
+        s.width == mode.width
+            && s.height == mode.height
+            && s.refresh_hz == mode.refresh_hz
+            && s.hdr == hdr
     });
     if same_mode {
         if let Some(node_id) = find_gamescope_node() {
@@ -876,7 +917,7 @@ fn create_managed_session_steamos(mode: Mode) -> Result<VirtualOutput> {
         ));
     }
     let shim_dir = write_headless_shim()?;
-    write_steamos_dropin(&shim_dir, mode)?;
+    write_steamos_dropin(&shim_dir, mode, hdr)?;
     systemctl_user(&["daemon-reload"]);
     systemctl_user(&["restart", STEAMOS_SESSION_TARGET]);
     *STEAMOS_TOOK_OVER.lock().unwrap_or_else(|e| e.into_inner()) = true;
@@ -895,6 +936,7 @@ fn create_managed_session_steamos(mode: Mode) -> Result<VirtualOutput> {
         width: mode.width,
         height: mode.height,
         refresh_hz: mode.refresh_hz,
+        hdr,
     });
     tracing::info!(
         node_id,
@@ -1978,13 +2020,20 @@ fn gamescope_bin_wrapper_path() -> std::path::PathBuf {
 
 /// Write the `GAMESCOPE_BIN` wrapper that injects `--nested-refresh $PF_HZ` — the flag
 /// gamescope-session-plus does NOT expose, and the one that makes games see the client's refresh
-/// instead of ~60 Hz. The body is constant (the rate comes from the `PF_HZ` env per launch), so the
-/// write is idempotent. Returns its path.
+/// instead of ~60 Hz — plus `$PF_HDR_ARGS` for an HDR session. The body is constant (rate and HDR
+/// flags come from the env per launch), so the write is idempotent. Returns its path.
+///
+/// `$PF_HDR_ARGS` is deliberately UNQUOTED: it is either empty or a short list of gamescope flags
+/// this host built itself ([`hdr_args`]), never operator input, and it has to word-split into
+/// separate argv entries.
 fn write_gamescope_bin_wrapper() -> Result<std::path::PathBuf> {
     let path = gamescope_bin_wrapper_path();
     std::fs::write(
         &path,
-        "#!/bin/sh\nexec /usr/bin/gamescope --nested-refresh \"${PF_HZ:-60}\" \"$@\"\n",
+        format!(
+            "#!/bin/sh\nexec {} --nested-refresh \"${{PF_HZ:-60}}\" ${{PF_HDR_ARGS}} \"$@\"\n",
+            gamescope_bin()
+        ),
     )
     .with_context(|| format!("write GAMESCOPE_BIN wrapper {}", path.display()))?;
     use std::os::unix::fs::PermissionsExt;
@@ -1998,7 +2047,7 @@ fn write_gamescope_bin_wrapper() -> Result<std::path::PathBuf> {
 /// the wrapper) + `--generate-drm-mode cvt` so games see exactly `mode` (resolution + refresh) and
 /// not the box's physical-display EDID. Blocks until the gamescope `Video/Source` node appears
 /// (Steam Big Picture cold-start is slow), returning its id; on timeout it stops the unit and errors.
-fn launch_session(client: &str, unit_name: &str, mode: Mode) -> Result<u32> {
+fn launch_session(client: &str, unit_name: &str, mode: Mode, hdr: bool) -> Result<u32> {
     if !std::path::Path::new(SESSION_PLUS_BIN).exists() {
         anyhow::bail!(
             "PUNKTFUNK_GAMESCOPE_SESSION is set but {SESSION_PLUS_BIN} is missing — the host-managed \
@@ -2019,6 +2068,8 @@ fn launch_session(client: &str, unit_name: &str, mode: Mode) -> Result<u32> {
             .arg(format!("--setenv=SCREEN_WIDTH={}", mode.width))
             .arg(format!("--setenv=SCREEN_HEIGHT={}", mode.height))
             .arg(format!("--setenv=PF_HZ={hz}"))
+            // Read (unquoted) by the GAMESCOPE_BIN wrapper — empty for an SDR session.
+            .arg(format!("--setenv=PF_HDR_ARGS={}", hdr_args(hdr).join(" ")))
             .arg(format!("--setenv=GAMESCOPE_BIN={}", wrapper.display()))
             .arg("--setenv=DRM_MODE=cvt")
             .arg(format!("--setenv=CUSTOM_REFRESH_RATES={hz}"))
@@ -2150,6 +2201,7 @@ fn add_bare_gamescope_args(
     hz: u32,
     steam_mode: bool,
     grab_cursor: bool,
+    hdr: bool,
 ) {
     command
         .args(["--backend", "headless"])
@@ -2162,7 +2214,41 @@ fn add_bare_gamescope_args(
     if grab_cursor {
         command.arg("--force-grab-cursor");
     }
+    for arg in hdr_args(hdr) {
+        command.arg(arg);
+    }
     command.args(["--xwayland-count", "1", "--"]);
+}
+
+/// The gamescope flags that make an HDR session HDR — shared by all three spawn sub-modes (bare
+/// spawn, the `GAMESCOPE_BIN` wrapper, the SteamOS PATH shim), which is the point: a kept display
+/// is keyed on `hdr`, so the flags must not be able to drift between the paths that produce it.
+///
+/// * `--hdr-enabled` sets gamescope's `cv_hdr_enabled` convar.
+/// * `--hdr-debug-force-support` is what makes it work HEADLESS: the headless connector hardcodes
+///   `SupportsHDR() == false`, and this flag is the documented bypass. Without it steamcompmgr
+///   never pushes the `gamescopeHDROutputFeedback` root atom, so the WSI layer advertises no
+///   HDR10/scRGB surfaces and nested games render SDR — which would look exactly like a capture
+///   negotiation failure while actually being a spawn-flag bug. (A first-class `--headless-hdr`
+///   is the upstream-friendly replacement; we pin the gamescope we ship, so the debug flag is
+///   fine meanwhile.)
+/// * `--hdr-sdr-content-nits` maps SDR content into the PQ container. Everything that is not an
+///   HDR game — the desktop, the Steam overlay, an SDR title — rides through it, so it decides
+///   how bright "white" lands on the client's panel. Only passed when the operator set the knob;
+///   otherwise gamescope's own default (400) applies.
+fn hdr_args(hdr: bool) -> Vec<String> {
+    if !hdr {
+        return Vec::new();
+    }
+    let mut args = vec![
+        "--hdr-enabled".to_string(),
+        "--hdr-debug-force-support".to_string(),
+    ];
+    if let Some(nits) = pf_host_config::config().gamescope_sdr_nits {
+        args.push("--hdr-sdr-content-nits".to_string());
+        args.push(nits.to_string());
+    }
+    args
 }
 
 /// Spawn `gamescope --backend headless -W w -H h -r hz -- <app>`. The app comes from
@@ -2175,7 +2261,14 @@ fn add_bare_gamescope_args(
 /// compositor has a painting window from the first second: gamescope pushes capture buffers only
 /// when it composites, and a nested Steam bootstrap paints nothing until the gamepad UI's first
 /// frame — far longer than any first-frame budget (see `gamescope/splash.rs`).
-fn spawn(w: u32, h: u32, hz: u32, cmd: Option<&str>, log: &std::path::Path) -> Result<Child> {
+fn spawn(
+    w: u32,
+    h: u32,
+    hz: u32,
+    cmd: Option<&str>,
+    log: &std::path::Path,
+    hdr: bool,
+) -> Result<Child> {
     // A non-empty per-session command (set via `set_launch_command`) wins; else the
     // `PUNKTFUNK_GAMESCOPE_APP` env var (the documented manual fallback); else a no-op that keeps
     // gamescope alive. Each level is taken only if non-empty, so a blank per-session cmd transparently
@@ -2218,8 +2311,8 @@ fn spawn(w: u32, h: u32, hz: u32, cmd: Option<&str>, log: &std::path::Path) -> R
             r.map_err(|e| tracing::warn!(error = %e, "gamescope: current_exe failed — no splash"))
                 .ok()
         });
-    let mut cmd = Command::new("gamescope");
-    add_bare_gamescope_args(&mut cmd, w, h, hz, steam_mode, grab_cursor);
+    let mut cmd = Command::new(gamescope_bin());
+    add_bare_gamescope_args(&mut cmd, w, h, hz, steam_mode, grab_cursor, hdr);
     let script = nested_wrapper_script(&relay, splash_exe.is_some());
     cmd.args(["sh", "-c", &script, "sh"]);
     if let Some(exe) = &splash_exe {
@@ -2245,7 +2338,8 @@ fn spawn(w: u32, h: u32, hz: u32, cmd: Option<&str>, log: &std::path::Path) -> R
         cmd.stdout(Stdio::null()).stderr(Stdio::null());
     }
     tracing::info!(
-        w, h, hz, steam_mode,
+        w, h, hz, steam_mode, hdr,
+        bin = %gamescope_bin(),
         splash = splash_exe.is_some(),
         %app,
         log = %log.display(),
@@ -2295,9 +2389,28 @@ impl Drop for GamescopeProc {
 mod tests {
     use super::{
         cgroup_is_punktfunk_owned, cgroup_under_user_manager, connected_connector_under,
-        display_manager_unit_under, dm_survives_masked_unit, is_steam_launch,
+        display_manager_unit_under, dm_survives_masked_unit, hdr_args, is_steam_launch,
         nested_wrapper_script, sentinel_advanced, shape_dedicated_command,
     };
+
+    /// The HDR spawn flags are what make a nested game render HDR at all — and their absence is
+    /// indistinguishable, on-glass, from a capture negotiation failure. Both flags are required:
+    /// `--hdr-enabled` alone does nothing on the HEADLESS backend, whose connector hardcodes
+    /// `SupportsHDR() == false`.
+    #[test]
+    fn hdr_spawn_flags_are_both_present_and_absent_for_sdr() {
+        assert!(
+            hdr_args(false).is_empty(),
+            "an SDR spawn takes no HDR flags"
+        );
+        let args = hdr_args(true);
+        assert!(args.iter().any(|a| a == "--hdr-enabled"));
+        assert!(
+            args.iter().any(|a| a == "--hdr-debug-force-support"),
+            "without the force flag the headless connector reports no HDR support, so the WSI \
+             layer advertises no HDR surfaces and games render SDR"
+        );
+    }
 
     #[test]
     fn user_manager_lifetime_detection() {

@@ -167,6 +167,9 @@ pub struct PortalCapturer {
     /// `want_hdr`. Read by the negotiation-timeout diagnosis (a failed HDR offer latches the
     /// process-wide SDR downgrade) and by [`hdr_meta`](Capturer::hdr_meta).
     hdr_offer: bool,
+    /// Which HDR source this capturer is — the latch a failed [`hdr_offer`](Self::hdr_offer)
+    /// belongs to. See [`super::HdrSource`] for why the latch is not one process-wide flag.
+    hdr_source: super::HdrSource,
     /// The PipeWire node this capturer consumes — surfaced in error messages for diagnosis.
     node_id: u32,
     /// Stops the PipeWire loop on teardown (sent in `Drop`). Without it a dropped or failed
@@ -301,7 +304,7 @@ impl PortalCapturer {
             },
             policy,
         )?
-        .into_capturer(node_id, None, Some(portal)))
+        .into_capturer(node_id, None, Some(portal), super::HdrSource::PortalMonitor))
     }
 
     /// Build a capturer from an already-created virtual output's PipeWire node. The host facade
@@ -312,6 +315,8 @@ impl PortalCapturer {
     /// [`OutputFormat::gpu`](pf_frame::OutputFormat): `false` forces the CPU mmap path, `true` keeps
     /// the GPU zero-copy path subject to `PUNKTFUNK_ZEROCOPY`. `want_444` (a 4:4:4 session) makes the
     /// zero-copy worker convert tiled dmabufs to planar YUV444 on the GPU instead of NV12/RGB.
+    /// `want_hdr` runs the 10-bit PQ/BT.2020 offer instead of the SDR set — see
+    /// [`crate::open_virtual_output`] for who is allowed to pass it.
     #[allow(clippy::too_many_arguments)]
     pub fn from_virtual_output(
         remote_fd: Option<OwnedFd>,
@@ -320,6 +325,7 @@ impl PortalCapturer {
         keepalive: Box<dyn Send>,
         allow_zerocopy: bool,
         want_444: bool,
+        want_hdr: bool,
         policy: ZeroCopyPolicy,
         expect_exact_dims: bool,
     ) -> Result<PortalCapturer> {
@@ -327,11 +333,14 @@ impl PortalCapturer {
             node_id,
             allow_zerocopy,
             want_444,
+            want_hdr,
             expect_exact_dims,
             "connecting PipeWire to virtual output"
         );
-        // Virtual outputs are SDR-only upstream (Mutter's RecordVirtual streams advertise 8-bit
-        // BGRx/BGRA exclusively, GNOME 50 and 51-dev alike) — never run the HDR offer here.
+        // Most virtual outputs are SDR-only upstream (Mutter's RecordVirtual streams advertise
+        // 8-bit BGRx/BGRA exclusively, GNOME 50 and 51-dev alike; KWin/wlroots the same), so
+        // `want_hdr` reaches here ONLY for a gamescope node off our `pipewire-hdr` build — the
+        // host resolves that before the Welcome (`capture::capturer_supports_hdr_for`).
         Ok(spawn_pipewire(
             remote_fd,
             node_id,
@@ -339,15 +348,19 @@ impl PortalCapturer {
             CaptureOpts {
                 allow_zerocopy,
                 want_444,
-                // Virtual outputs are SDR-only upstream (see the comment above).
-                want_hdr: false,
+                want_hdr,
                 expect_exact_dims,
             },
             policy,
         )?
         // No portal thread on this path: the node belongs to a virtual output the caller created,
         // and `keepalive` is what releases it.
-        .into_capturer(node_id, Some(keepalive), None))
+        .into_capturer(
+            node_id,
+            Some(keepalive),
+            None,
+            super::HdrSource::VirtualOutput,
+        ))
     }
 }
 
@@ -378,6 +391,7 @@ impl PwHandles {
         node_id: u32,
         keepalive: Option<Box<dyn Send>>,
         portal: Option<PortalSession>,
+        hdr_source: super::HdrSource,
     ) -> PortalCapturer {
         PortalCapturer {
             slot: self.slot,
@@ -386,6 +400,7 @@ impl PwHandles {
             stall_since: None,
             vaapi_dmabuf: self.vaapi_dmabuf,
             hdr_offer: self.hdr_offer,
+            hdr_source,
             node_id,
             quit: Some(self.quit),
             join: Some(self.join),
@@ -456,6 +471,7 @@ fn spawn_pipewire(
         // Default ON; `PUNKTFUNK_PIPEWIRE_NV12=0` (or any falsy spelling — the shared parser, not a
         // bare `!= "0"` string compare) restores the packed-RGB negotiation.
         native_nv12_env_on: pf_host_config::env_on("PUNKTFUNK_PIPEWIRE_NV12").unwrap_or(true),
+        hdr_cuda_ok: policy.hdr_cuda_ok,
     });
     // The capturer's timeout diagnosis reads the SAME resolved bool the thread acts on.
     let vaapi_dmabuf = plan.vaapi_passthrough;
@@ -633,11 +649,15 @@ impl Capturer for PortalCapturer {
             && self.join.as_ref().is_some_and(|j| !j.is_finished())
     }
 
-    /// Generic HDR10 mastering metadata once the stream negotiated a 10-bit PQ format. Mutter
-    /// exposes no per-monitor mastering volume through the screencast, so this is the standard
-    /// HDR10 default block (BT.2020 primaries, D65 white, 1000 / 0.005 cd/m², CLL unknown) — the
-    /// same fallback Windows uses when a display reports nothing. The native stream loop prefers
-    /// the client display's own volume when the client sent one (`Hello::display_hdr`).
+    /// Generic HDR10 mastering metadata once the stream negotiated a 10-bit PQ format — for
+    /// BOTH Linux HDR sources (the portal monitor mirror and a gamescope virtual output).
+    /// Neither producer exposes a mastering volume through the screencast: Mutter has no
+    /// per-monitor one, and gamescope's PipeWire node carries no per-frame HDR metadata (the
+    /// game's `VK_EXT_hdr_metadata` blob stops at the compositor — forwarding it needs the
+    /// patch's v2 custom SPA meta). So this is the standard HDR10 default block (BT.2020
+    /// primaries, D65 white, 1000 / 0.005 cd/m², CLL unknown) — the same fallback Windows uses
+    /// when a display reports nothing. The native stream loop prefers the client display's own
+    /// volume when the client sent one (`Hello::display_hdr`).
     fn hdr_meta(&self) -> Option<punktfunk_core::quic::HdrMeta> {
         if !self.signals.hdr_negotiated.load(Ordering::Relaxed) {
             return None;
@@ -722,7 +742,7 @@ impl PortalCapturer {
                     // GNOME 50 HDR formats, or its allocator can't do LINEAR for XR30/XB30.
                     // Latch the process-wide SDR downgrade so the next session (Moonlight
                     // auto-reconnects) negotiates SDR instead of re-running this same timeout.
-                    super::note_hdr_capture_failed();
+                    super::note_hdr_capture_failed(self.hdr_source);
                     Err(anyhow!(
                         "no PipeWire frame within {within}s (node {}): the compositor never \
                          accepted the HDR (10-bit PQ/BT.2020 dmabuf) offer — is the mirrored \

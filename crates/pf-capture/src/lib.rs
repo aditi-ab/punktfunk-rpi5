@@ -134,8 +134,9 @@ pub trait Capturer: Send {
     // ---- Stream properties ------------------------------------------------------------------
 
     /// The source's static HDR mastering metadata (SMPTE ST.2086 + content light level), when the
-    /// capturer can read it from the output (Windows `IDXGIOutput6::GetDesc1`). `None` = unknown /
-    /// SDR / a backend that doesn't expose it (the default — Linux capture has no HDR path yet).
+    /// capturer can read it from the output (Windows `IDXGIOutput6::GetDesc1`), or a generic HDR10
+    /// block once an HDR stream is negotiated (Linux — neither the portal nor gamescope exposes a
+    /// real mastering volume). `None` = unknown / SDR / a backend that doesn't expose it.
     /// The stream loop forwards this to the encoder (in-band SEI) and the client (`0xCE` datagram),
     /// so the two stay a single source of truth. May change mid-session if the source is regraded.
     fn hdr_meta(&self) -> Option<punktfunk_core::quic::HdrMeta> {
@@ -362,6 +363,12 @@ pub struct ZeroCopyPolicy {
     /// resolved when the session encodes PyroWave (the passthrough advertises them so Mutter+NVIDIA,
     /// which allocates tiled-only, still negotiates zero-copy). Empty otherwise.
     pub pyrowave_modifiers: Vec<u64>,
+    /// The resolved encoder can ingest a packed 10-bit PQ CUDA payload (`pf_encode::linux_hdr_cuda_ok`
+    /// — direct-SDK NVENC only). An HDR capture builds the GPU importer ONLY when this holds:
+    /// libav's HDR route wants a P010 hardware frame it swscales into, so a packed-2:10:10:10 CUDA
+    /// buffer would land in a P010 surface as garbage. `false` ⇒ HDR takes the CPU path, exactly as
+    /// it did before the direct backend learned 10-bit.
+    pub hdr_cuda_ok: bool,
 }
 
 /// Discovers gamescope's nested Xwayland cursor targets — `(DISPLAY, XAUTHORITY)`, one per
@@ -387,15 +394,21 @@ pub fn capturer_supports_444(_encoder_ingests_rgb_444: bool) -> bool {
 }
 
 /// Whether the **native-plane** capturer (a compositor virtual output) can deliver an HDR (10-bit
-/// PQ/BT.2020) source on this platform — the capture-side gate the punktfunk/1 handshake consults
-/// before negotiating 10-bit (mirroring [`capturer_supports_444`]).
+/// PQ/BT.2020) source **on this platform alone**, without knowing which compositor will be
+/// driven — the platform half of the gate the punktfunk/1 handshake consults before negotiating
+/// 10-bit (mirroring [`capturer_supports_444`]).
 ///
-/// Linux: `false`. GNOME 50 added HDR **screen sharing** for *monitor* streams only — Mutter's
-/// `RecordVirtual` virtual-monitor streams advertise 8-bit BGRx/BGRA exclusively (still true on
-/// the GNOME 51 dev branch), and virtual outputs report no BT2020/PQ colour capabilities, so they
-/// can't be flipped into HDR mode via DisplayConfig either. The Linux HDR path that DOES exist —
-/// the GNOME 50+ portal **monitor mirror** (`open_portal_monitor` with `want_hdr`) — is gated
-/// separately by the GameStream plane (`host_hdr_capable` + the live monitor colour-mode probe).
+/// Linux: `false`, and this is NOT the whole Linux answer any more. It says only that no Linux
+/// virtual output is HDR-capable *by platform*: Mutter's `RecordVirtual` virtual-monitor streams
+/// advertise 8-bit BGRx/BGRA exclusively (still true on the GNOME 51 dev branch) and report no
+/// BT2020/PQ colour capabilities, and KWin/wlroots virtual outputs are the same. The one Linux
+/// virtual output that CAN be 10-bit — gamescope's PipeWire node, with our carried
+/// `pipewire-hdr` patch (`packaging/gamescope`) — depends on the resolved compositor **and** the
+/// resolved gamescope binary, neither of which this crate knows. The host resolves it in
+/// `capture::capturer_supports_hdr_for(compositor)`, which consults this for the platform floor;
+/// the other Linux HDR path (the GNOME 50+ portal **monitor mirror**, `open_portal_monitor` with
+/// `want_hdr`) is gated separately by the GameStream plane (`host_hdr_capable` + the live monitor
+/// colour-mode probe).
 #[cfg(target_os = "linux")]
 pub fn capturer_supports_hdr() -> bool {
     false
@@ -410,28 +423,67 @@ pub fn capturer_supports_hdr() -> bool {
     false
 }
 
-/// Process-wide latch: a `want_hdr` portal capture failed to negotiate the HDR (10-bit PQ) offer —
-/// the compositor never accepted it (monitor left HDR mode between the probe and the negotiation,
-/// NVIDIA EGL not listing LINEAR for XR30, a pre-50 Mutter…). Later sessions consult
-/// [`hdr_capture_failed`] and fall back to the SDR offer instead of re-running the same doomed
-/// 10-second negotiation timeout on every reconnect. Sticky until host restart (matching the
-/// zero-copy downgrade latches); the log line at latch time says so.
+/// Which HDR capture source a `want_hdr` negotiation failure belongs to.
+///
+/// The failure latch below is **per source**, because the two Linux HDR sources fail for
+/// completely unrelated reasons and share nothing but the word "HDR": the portal monitor mirror
+/// fails when the mirrored monitor leaves HDR mode (a live, box-state fact), a gamescope virtual
+/// output fails when the spawned binary has no 10-bit formats (a static, binary-identity fact).
+/// A single process-wide latch let either one disable the other until the host restarted.
 #[cfg(target_os = "linux")]
-static HDR_CAPTURE_FAILED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HdrSource {
+    /// The GNOME 50+ portal **monitor mirror** (`open_portal_monitor` with `want_hdr`) — the
+    /// GameStream plane's HDR path.
+    PortalMonitor,
+    /// A compositor **virtual output** (`open_virtual_output` with `want_hdr`) — today only
+    /// gamescope's PipeWire node, with the carried `pipewire-hdr` patch.
+    VirtualOutput,
+}
+
+/// Per-source latch: a `want_hdr` capture failed to negotiate the HDR (10-bit PQ) offer — the
+/// producer never accepted it (monitor left HDR mode between the probe and the negotiation,
+/// NVIDIA EGL not listing LINEAR for XR30, an unpatched gamescope…). Later sessions **on that
+/// same source** consult [`hdr_capture_failed`] and fall back to the SDR offer instead of
+/// re-running the same doomed 10-second negotiation timeout on every reconnect. Sticky until host
+/// restart (matching the zero-copy downgrade latches); the log line at latch time says so.
+/// Indexed by [`HdrSource`] — see its doc for why one shared latch was wrong.
+#[cfg(target_os = "linux")]
+static HDR_CAPTURE_FAILED: [std::sync::atomic::AtomicBool; 2] = [
+    std::sync::atomic::AtomicBool::new(false),
+    std::sync::atomic::AtomicBool::new(false),
+];
 
 #[cfg(target_os = "linux")]
-pub fn hdr_capture_failed() -> bool {
-    HDR_CAPTURE_FAILED.load(std::sync::atomic::Ordering::Relaxed)
+impl HdrSource {
+    fn slot(self) -> usize {
+        match self {
+            HdrSource::PortalMonitor => 0,
+            HdrSource::VirtualOutput => 1,
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn note_hdr_capture_failed() {
-    if !HDR_CAPTURE_FAILED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        tracing::warn!(
-            "HDR capture negotiation failed — this host will offer SDR capture for the rest of \
-             the process lifetime (restart the host after fixing the monitor's HDR mode to retry)"
-        );
+pub fn hdr_capture_failed(source: HdrSource) -> bool {
+    HDR_CAPTURE_FAILED[source.slot()].load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn note_hdr_capture_failed(source: HdrSource) {
+    if !HDR_CAPTURE_FAILED[source.slot()].swap(true, std::sync::atomic::Ordering::Relaxed) {
+        match source {
+            HdrSource::PortalMonitor => tracing::warn!(
+                "HDR capture negotiation failed on the monitor mirror — this host will offer SDR \
+                 for that source for the rest of the process lifetime (restart the host after \
+                 fixing the monitor's HDR mode to retry)"
+            ),
+            HdrSource::VirtualOutput => tracing::warn!(
+                "HDR capture negotiation failed on the virtual output — this host will offer SDR \
+                 for that source for the rest of the process lifetime (is the spawned gamescope \
+                 the punktfunk build? see packaging/gamescope)"
+            ),
+        }
     }
 }
 #[cfg(target_os = "windows")]
@@ -543,7 +595,7 @@ pub fn open_portal_monitor(
 ) -> Result<Box<dyn Capturer>> {
     linux::PortalCapturer::open(
         anchored,
-        want_hdr && !hdr_capture_failed(),
+        want_hdr && !hdr_capture_failed(HdrSource::PortalMonitor),
         want_metadata_cursor,
         policy,
     )
@@ -553,7 +605,11 @@ pub fn open_portal_monitor(
 /// Open the Linux portal capturer bound to an already-created virtual output's PipeWire node. The
 /// caller (host facade) explodes its `VirtualOutput` into these primitives + owns nothing after —
 /// the capturer takes `keepalive`, so dropping it releases the output. `allow_zerocopy` mirrors
-/// `OutputFormat::gpu`; `want_444` selects the planar-YUV444 GPU convert.
+/// `OutputFormat::gpu`; `want_444` selects the planar-YUV444 GPU convert. `want_hdr` offers the
+/// 10-bit PQ/BT.2020 formats instead of the SDR set — pass it only when the output was actually
+/// brought up HDR (a gamescope spawned with `--hdr-enabled` off our `pipewire-hdr` build); the
+/// host resolves that in `capture::capturer_supports_hdr_for` **before** the Welcome, because a
+/// session that negotiated PQ cannot fall back to SDR afterwards.
 #[cfg(target_os = "linux")]
 #[allow(clippy::too_many_arguments)]
 pub fn open_virtual_output(
@@ -563,6 +619,7 @@ pub fn open_virtual_output(
     keepalive: Box<dyn Send>,
     allow_zerocopy: bool,
     want_444: bool,
+    want_hdr: bool,
     policy: ZeroCopyPolicy,
     expect_exact_dims: bool,
 ) -> Result<Box<dyn Capturer>> {
@@ -573,6 +630,7 @@ pub fn open_virtual_output(
         keepalive,
         allow_zerocopy,
         want_444,
+        want_hdr && !hdr_capture_failed(HdrSource::VirtualOutput),
         policy,
         expect_exact_dims,
     )

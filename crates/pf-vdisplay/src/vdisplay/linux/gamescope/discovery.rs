@@ -329,12 +329,109 @@ pub(super) fn find_gamescope_eis_socket() -> Option<String> {
 /// not require any particular desktop to be running. Quiet (no version warning — that's for the
 /// create path); just checks the binary executes.
 pub(crate) fn is_available() -> bool {
-    std::process::Command::new("gamescope")
+    std::process::Command::new(gamescope_bin())
         .arg("--version")
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
 }
+
+/// The gamescope binary this host spawns, resolved ONCE per process:
+///
+/// 1. `PUNKTFUNK_GAMESCOPE_BIN` — an absolute path override (an operator's own build),
+/// 2. `punktfunk-gamescope` on `PATH` — our carried build (`packaging/gamescope`), which adds
+///    10-bit BT.2020/PQ capture formats to gamescope's PipeWire node,
+/// 3. `gamescope` — the distro's.
+///
+/// Resolved to an ABSOLUTE path whenever it can be (`which`-style `PATH` walk), because the
+/// same answer has to be baked into the two indirect spawn paths — the `GAMESCOPE_BIN` wrapper
+/// (gamescope-session-plus) and the SteamOS PATH shim — which run outside this process's `PATH`.
+/// A resolution failure falls back to the bare name so a normal install still works.
+pub(crate) fn gamescope_bin() -> &'static str {
+    static BIN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    BIN.get_or_init(|| {
+        // The env override is read under the shared env lock (a concurrent session's `set_var`
+        // must not race it) — same discipline as every other env read in this crate.
+        let over = crate::with_env_lock(|| std::env::var("PUNKTFUNK_GAMESCOPE_BIN").ok())
+            .filter(|s| !s.trim().is_empty());
+        if let Some(path) = over {
+            tracing::info!(bin = %path, "gamescope: PUNKTFUNK_GAMESCOPE_BIN override");
+            return path;
+        }
+        if let Some(path) = which_in_path("punktfunk-gamescope") {
+            tracing::info!(
+                bin = %path,
+                "gamescope: using the punktfunk build (10-bit HDR capture available)"
+            );
+            return path;
+        }
+        which_in_path("gamescope").unwrap_or_else(|| "gamescope".to_string())
+    })
+    .as_str()
+}
+
+/// Minimal `which`: the first executable `<dir>/<name>` across `PATH`. No crate dependency for
+/// three lines of `access(2)`-shaped logic, and it keeps [`gamescope_bin`] honest about whether
+/// our build is actually installed (a bare name would "resolve" and then fail at spawn).
+fn which_in_path(name: &str) -> Option<String> {
+    use std::os::unix::fs::PermissionsExt;
+    let path = crate::with_env_lock(|| std::env::var("PATH").ok())?;
+    for dir in path.split(':').filter(|d| !d.is_empty()) {
+        let cand = std::path::Path::new(dir).join(name);
+        let Ok(md) = std::fs::metadata(&cand) else {
+            continue;
+        };
+        if md.is_file() && md.permissions().mode() & 0o111 != 0 {
+            return Some(cand.to_string_lossy().into_owned());
+        }
+    }
+    None
+}
+
+/// Does the resolved gamescope offer 10-bit BT.2020/PQ formats on its PipeWire node — i.e. can a
+/// session on this host stream true HDR10 off a gamescope virtual output?
+///
+/// **A static, binary-identity answer, cached for the process.** It has to be: punktfunk fixes a
+/// session's bit depth in the Welcome, *before* the display exists, and the Welcome is
+/// irrevocable (PQ frames handed to an 8-bit encoder are a deliberate hard error). Optimistic
+/// "spawn it and see" would strand the session. So we ask the binary, once, and believe it.
+///
+/// The answer is the `+pfhdr<N>` marker our build stamps into the `--version` banner (see
+/// `packaging/gamescope/README.md`). When upstream takes the patch this becomes a plain version
+/// floor, exactly like [`MIN_GAMESCOPE_OVERLAY`].
+pub(crate) fn gamescope_hdr_capable() -> bool {
+    static CAP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        let Ok(out) = Command::new(gamescope_bin()).arg("--version").output() else {
+            return false;
+        };
+        // The banner goes to stderr on some builds, stdout on others (same as the version gate).
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let capable = text.contains(PFHDR_MARKER);
+        if capable {
+            tracing::info!(
+                bin = %gamescope_bin(),
+                "gamescope offers 10-bit BT.2020/PQ capture — HDR sessions are available"
+            );
+        } else {
+            tracing::debug!(
+                bin = %gamescope_bin(),
+                "gamescope has no {PFHDR_MARKER} marker — sessions on this backend stay 8-bit SDR \
+                 (install punktfunk-gamescope for HDR)"
+            );
+        }
+        capable
+    })
+}
+
+/// The marker `packaging/gamescope/patches/0002-*` stamps into the `--version` banner. Matched as
+/// a PREFIX (`+pfhdr1`, `+pfhdr2`, …): the number tracks the patch's wire behaviour, and every
+/// revision of it still offers 10-bit PQ capture.
+const PFHDR_MARKER: &str = "+pfhdr";
 
 /// Minimum gamescope that captures reliably: below 3.16.22, headless PipeWire capture deadlocks
 /// against PipeWire ≥ 1.6 (a loop-lock bug) and a stuck link head-blocks the whole daemon.
@@ -354,7 +451,10 @@ const MIN_GAMESCOPE_OVERLAY: (u32, u32, u32) = (3, 16, 23);
 /// the stream). Parsing failures are silent (don't block a possibly-fine custom build) — this is a
 /// diagnostic, not a gate. Returns the parsed version when it could read one.
 pub(super) fn check_gamescope_version() -> Option<(u32, u32, u32)> {
-    let out = Command::new("gamescope").arg("--version").output().ok()?;
+    let out = Command::new(gamescope_bin())
+        .arg("--version")
+        .output()
+        .ok()?;
     // gamescope prints the version banner to stderr on some builds, stdout on others.
     let text = format!(
         "{}{}",

@@ -264,18 +264,18 @@ pub(super) async fn negotiate(
     let client_supports_10bit = hello.video_caps & punktfunk_core::quic::VIDEO_CAP_10BIT != 0;
     // The capture side must be able to deliver a 10-bit HDR source for the NATIVE plane's
     // virtual-output capture — the honest-downgrade gate, mirroring `capturer_supports_444`.
-    // Windows IDD-push can (it proactively enables advanced colour); Linux cannot: Mutter's
-    // RecordVirtual virtual-monitor streams are 8-bit-only upstream (GNOME 50 added HDR for
-    // *monitor* streams only — the GameStream portal-mirror path uses that; see
-    // `gamestream::host_hdr_capable`), so a Linux native session honestly stays 8-bit SDR even
-    // though `can_encode_10bit` now probes true on a Main10-capable GPU.
+    // SOURCE-AWARE, because on Linux the answer depends on which compositor we just resolved:
+    // Windows IDD-push always can (it proactively enables advanced colour); a gamescope output
+    // can when the host runs our `pipewire-hdr` gamescope build and the knob allows it; every
+    // other Linux virtual output is 8-bit upstream (Mutter's RecordVirtual streams, KWin's and
+    // wlroots' virtual outputs alike — GNOME 50 added HDR for *monitor* streams only, which is
+    // the GameStream portal-mirror path, see `gamestream::host_hdr_capable`).
     //
-    // That `false` is also why this plane needs no equivalent of the GameStream path's
-    // `pf_capture::hdr_capture_failed()` check (rtsp.rs): that latch is a fact about the PORTAL
-    // capturer's HDR offer, and the native plane captures a virtual output instead — it never
-    // reaches the portal path, and on Linux it never negotiates 10-bit at all. Revisit both halves
-    // together if Mutter ever gains HDR for RecordVirtual streams.
-    let capture_supports_hdr = crate::capture::capturer_supports_hdr();
+    // The gamescope arm folds in its own downgrade latch
+    // (`pf_capture::hdr_capture_failed(VirtualOutput)`), which is why the check the GameStream
+    // path makes separately in rtsp.rs has no twin here: that latch is per-source, and this gate
+    // already consulted the one belonging to the source this session will drive.
+    let capture_supports_hdr = crate::capture::capturer_supports_hdr_for(compositor);
     // The GPU probe may open a tiny encoder on first use, so run it off the reactor like the
     // 4:4:4 probe below (blocking probes → spawn_blocking), short-circuited behind the cheap
     // gates. The result is cached process-wide per (GPU, codec).

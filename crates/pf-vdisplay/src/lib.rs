@@ -516,6 +516,33 @@ pub fn gamescope_splash_client() -> anyhow::Result<()> {
     gamescope::splash_run()
 }
 
+/// Can a gamescope session on this host stream true HDR (10-bit BT.2020 PQ)?
+///
+/// **A static answer, resolved before anything is spawned** — the punktfunk/1 Welcome fixes a
+/// session's bit depth before the display exists and cannot take it back. Two terms, both facts
+/// about how the session will be brought up rather than about how it went:
+///
+/// 1. the resolved gamescope binary offers 10-bit PQ capture formats (our `pipewire-hdr` build —
+///    probed once per process from the `--version` banner), and
+/// 2. this host **spawns** gamescope rather than attaching to a foreign one
+///    (`PUNKTFUNK_GAMESCOPE_NODE`): an attach inherits whatever flags someone else's session was
+///    started with, so it can promise nothing. (Attach-mode HDR needs the distro's gamescope
+///    patched — the upstream-PR follow-up.)
+///
+/// A host-managed `gamescope-session-plus` / SteamOS session counts as a spawn: we own its
+/// `GAMESCOPE_BIN` wrapper (or PATH shim), so the flags are ours.
+///
+/// Always `false` off Linux.
+pub fn gamescope_hdr_available() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let attaching = with_env_lock(|| std::env::var_os("PUNKTFUNK_GAMESCOPE_NODE").is_some());
+        !attaching && gamescope::gamescope_hdr_capable()
+    }
+    #[cfg(not(target_os = "linux"))]
+    false
+}
+
 // Platform-neutral per-client stable display-id map (Stage 3): Windows seeds the monitor EDID +
 // ConnectorIndex from the id; KWin names its output from it. `allow(dead_code)` because only Windows
 // consumes it in non-test code today — the KWin wiring is the next Stage-3 step.

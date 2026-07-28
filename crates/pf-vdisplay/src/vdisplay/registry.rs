@@ -273,6 +273,12 @@ mod linux {
         /// embedded display has no cursor metadata for a channel session to forward, and a kept
         /// metadata display would leave a channel-less session with no pointer in its frames.
         hw_cursor: bool,
+        /// The stream colourimetry this display was BROUGHT UP for: 10-bit BT.2020/PQ (HDR) vs
+        /// 8-bit SDR. Reuse requires an exact match — a kept SDR gamescope was spawned without
+        /// `--hdr-enabled`, so an HDR session reusing it would get a game with no HDR surfaces
+        /// under a stream that negotiated PQ over an SDR composite (wrong, and not obviously
+        /// broken); the reverse would try to negotiate 8-bit off a PQ composite.
+        hdr: bool,
     }
 
     /// A per-group topology-restore action (see [`Entry::topology_restore`]).
@@ -479,6 +485,7 @@ mod linux {
                             && e.mode == mode
                             && e.launch == launch
                             && e.hw_cursor == vd.hw_cursor()
+                            && e.hdr == vd.hdr()
                             && epoch_matches(e.backend, e.epoch, cur_epoch)
                     })
                     .map(|e| (e.gen, e.node_id))
@@ -615,6 +622,7 @@ mod linux {
             epoch: cur_epoch,
             gen,
             hw_cursor: vd.hw_cursor(),
+            hdr: vd.hdr(),
         };
 
         // Compute this new display's position in its group (design §6.2) BEFORE pushing, then push
@@ -1037,6 +1045,7 @@ mod linux {
                 epoch: 0,
                 gen,
                 hw_cursor: false,
+                hdr: false,
             }
         }
 

@@ -142,6 +142,22 @@ pub trait VirtualDisplay: Send {
     /// the backend's default EDID. Default: no-op — only the Windows pf-vdisplay backend can mint
     /// per-monitor EDIDs today (the Linux compositors' virtual outputs take no EDID from us).
     fn set_client_hdr(&mut self, _hdr: Option<punktfunk_core::quic::HdrMeta>) {}
+    /// Tell the backend THIS SESSION negotiated HDR — a 10-bit BT.2020/PQ stream (`bit_depth >=
+    /// 10`, decided in the punktfunk/1 Welcome before any display exists). Distinct from
+    /// [`set_client_hdr`](Self::set_client_hdr), which describes the *client panel's* colour
+    /// volume for the EDID; this is the stream's own colourimetry, and the backend may have to
+    /// bring the output up differently for it. Carried on the backend instance; set once before
+    /// [`create`](Self::create). Default: no-op — only the Linux gamescope backend uses it, where
+    /// it adds `--hdr-enabled --hdr-debug-force-support` to the spawn so nested games get HDR
+    /// surfaces from the WSI layer and the composite can be captured as 10-bit PQ.
+    fn set_hdr(&mut self, _on: bool) {}
+    /// The HDR request currently set (see [`set_hdr`](Self::set_hdr)). The registry includes it in
+    /// the keep-alive REUSE key: a kept display brought up SDR cannot serve an HDR session (it was
+    /// spawned without the HDR flags — the game would see no HDR surfaces while the stream
+    /// negotiated PQ over an SDR composite) nor vice versa.
+    fn hdr(&self) -> bool {
+        false
+    }
     /// Ask the backend for an OUT-OF-BAND cursor on the created output (the cursor channel):
     /// the compositor/OS stops compositing the pointer into captured frames and the capture
     /// layer surfaces shape/position separately. Carried on the backend instance; set once

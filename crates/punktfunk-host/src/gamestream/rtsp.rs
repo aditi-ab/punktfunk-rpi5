@@ -456,8 +456,15 @@ fn stream_config(map: &HashMap<String, String>) -> Option<StreamConfig> {
             "client requested HDR (dynamicRangeMode != 0) but host is not HDR-capable — streaming 8-bit SDR"
         );
     }
+    // SOURCE-AWARE: the live colour-mode probe belongs to the portal MONITOR mirror, whose HDR
+    // depends on a monitor being in BT.2100 right now. A gamescope virtual-output session has no
+    // monitor at all — its HDR is a static fact about the binary we spawn, already settled by
+    // `host_hdr_capable` — so running the probe there would hard-refuse every gamescope HDR
+    // session on a headless box (there is no monitor to be in HDR mode).
     #[cfg(target_os = "linux")]
-    if hdr && !pf_capture::gnome_hdr_monitor_active() {
+    let portal_source = pf_host_config::config().video_source.as_deref() == Some("portal");
+    #[cfg(target_os = "linux")]
+    if hdr && portal_source && !pf_capture::gnome_hdr_monitor_active() {
         tracing::warn!(
             "client requested HDR but no monitor is in BT.2100 (HDR) colour mode — enable HDR in \
              GNOME Settings → Displays (GNOME 50+) to stream it; streaming 8-bit SDR"
@@ -474,12 +481,21 @@ fn stream_config(map: &HashMap<String, String>) -> Option<StreamConfig> {
     // anywhere — and because the latch is sticky until host restart, every reconnect repeats it.
     // Consulted here rather than folded into `host_hdr_capable` for the same reason as the probe
     // above: that fn is the STATIC serverinfo capability, and this is a live per-session fact.
+    // The latch is PER SOURCE, so consult the one belonging to the source this session drives —
+    // a wedged monitor mirror must not disable a gamescope session's HDR, or vice versa.
     #[cfg(target_os = "linux")]
-    if hdr && pf_capture::hdr_capture_failed() {
+    let hdr_source = if portal_source {
+        pf_capture::HdrSource::PortalMonitor
+    } else {
+        pf_capture::HdrSource::VirtualOutput
+    };
+    #[cfg(target_os = "linux")]
+    if hdr && pf_capture::hdr_capture_failed(hdr_source) {
         tracing::warn!(
-            "client requested HDR and a monitor is in BT.2100 (HDR) colour mode, but an earlier \
-             HDR capture negotiation on this host failed — the capturer offers SDR only for the \
-             rest of the process lifetime, so streaming 8-bit SDR (restart the host to retry HDR)"
+            ?hdr_source,
+            "client requested HDR and the host is HDR-capable, but an earlier HDR capture \
+             negotiation on this source failed — the capturer offers SDR only for the rest of the \
+             process lifetime, so streaming 8-bit SDR (restart the host to retry HDR)"
         );
         hdr = false;
     }
