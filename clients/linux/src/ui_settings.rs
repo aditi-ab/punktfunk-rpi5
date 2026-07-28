@@ -4,12 +4,48 @@
 //! dynamic where the meaning depends on the selection (touch mode). Written back to
 //! disk when the dialog closes. About stays in the primary menu (GNOME convention)
 //! rather than as a page.
+//!
+//! The same surface edits SETTINGS PROFILES (design/client-settings-profiles.md §5.1): a
+//! scope switcher at the top swaps the whole dialog between the global defaults and one
+//! profile's overrides. It is deliberately not a second editor — a parallel one would drift
+//! from this one field by field. In profile scope only profileable ("tier P") rows render,
+//! every row shows the EFFECTIVE value (the inherited global until you touch it), and the
+//! override is recorded on touch rather than by comparing values, so a profile can pin a
+//! value that happens to equal today's global and keep it when the global later moves.
 
 use crate::trust::Settings;
 use adw::prelude::*;
+use pf_client_core::profiles::{ProfilesFile, SettingsOverlay, StreamProfile};
 use pf_client_core::trust::StatsVerbosity;
 use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
 use std::rc::Rc;
+
+/// Which layer the dialog is editing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Scope {
+    /// The global defaults every profile inherits from — the only scope before this feature.
+    Defaults,
+    /// One profile's overrides, by id.
+    Profile(String),
+}
+
+/// Which rows the user actually touched this session. The override model is explicit, not
+/// diffed: touching a control creates the override, and only an explicit reset removes it
+/// (design §4.1). Keys are the overlay's field names, with `resolution` covering the
+/// width/height/match-window tri-state that one row drives.
+#[derive(Clone, Default)]
+struct Touched(Rc<RefCell<HashSet<&'static str>>>);
+
+impl Touched {
+    fn mark(&self, key: &'static str) {
+        self.0.borrow_mut().insert(key);
+    }
+
+    fn has(&self, key: &str) -> bool {
+        self.0.borrow().contains(key)
+    }
+}
 
 /// `(0, 0)` = the native size of the monitor the window is on, resolved at connect.
 const RESOLUTIONS: &[(u32, u32)] = &[
@@ -24,6 +60,344 @@ const REFRESH: &[u32] = &[0, 30, 60, 90, 120, 144, 165, 240];
 /// Render-scale multipliers (persisted as f64; mirrors [`punktfunk_core::render_scale::PRESETS`]).
 /// `1.0` = Native. Applied at connect and each match-window resize.
 const RENDER_SCALES: &[f64] = &[0.5, 0.67, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0];
+
+/// The scope switcher, plus (in profile scope) that profile's management actions.
+///
+/// Switching scope does not swap the rows in place: it closes the dialog — which commits the
+/// layer being edited — and asks the app to re-open in the new scope. One code path builds
+/// the rows, and the commit ordering is unambiguous.
+#[allow(clippy::too_many_arguments)]
+fn scope_group(
+    dialog: &adw::PreferencesDialog,
+    inline: bool,
+    scope: &Scope,
+    catalog: &ProfilesFile,
+    active: Option<&StreamProfile>,
+    next_scope: &Rc<RefCell<Option<Scope>>>,
+    parent: &impl IsA<gtk::Widget>,
+) -> adw::PreferencesGroup {
+    let g = group(
+        "",
+        "A profile overrides only what you change here; everything else follows Default \
+         settings.",
+    );
+    let mut labels: Vec<String> = vec!["Default settings".into()];
+    labels.extend(catalog.profiles.iter().map(|p| p.name.clone()));
+    labels.push("New profile…".into());
+    let new_index = (labels.len() - 1) as u32;
+    let current = match scope {
+        Scope::Defaults => 0,
+        Scope::Profile(id) => catalog
+            .profiles
+            .iter()
+            .position(|p| &p.id == id)
+            .map_or(0, |i| i as u32 + 1),
+    };
+    let row = ChoiceRow::new(
+        dialog,
+        inline,
+        "Editing",
+        "Which layer these settings belong to",
+        &labels.iter().map(String::as_str).collect::<Vec<_>>(),
+    );
+    row.set_selected(current);
+    {
+        let (dialog, next, parent) = (dialog.clone(), next_scope.clone(), parent.as_ref().clone());
+        let ids: Vec<String> = catalog.profiles.iter().map(|p| p.id.clone()).collect();
+        row.connect_changed(move |i| {
+            if i == new_index {
+                // Creation is the one branch that has to ask a question first; the switch
+                // happens in its callback, so a cancelled prompt leaves the dialog put.
+                let (dialog, next) = (dialog.clone(), next.clone());
+                prompt_name(&parent, "New profile", "Create", "", move |name| {
+                    let mut catalog = ProfilesFile::load();
+                    if catalog.name_taken(&name, None) {
+                        return; // the prompt already refuses these; belt and braces
+                    }
+                    let profile = StreamProfile::new(name);
+                    let id = profile.id.clone();
+                    catalog.profiles.push(profile);
+                    if catalog.save().is_ok() {
+                        *next.borrow_mut() = Some(Scope::Profile(id));
+                        dialog.close();
+                    }
+                });
+                return;
+            }
+            *next.borrow_mut() = Some(match i {
+                0 => Scope::Defaults,
+                n => match ids.get(n as usize - 1) {
+                    Some(id) => Scope::Profile(id.clone()),
+                    None => Scope::Defaults,
+                },
+            });
+            dialog.close();
+        });
+    }
+    g.add(row.widget());
+    // Leaking the row keeps its handler alive for the dialog's lifetime — the ChoiceRow owns
+    // the closure, and the widget alone doesn't keep it.
+    std::mem::forget(row);
+
+    if let Some(active) = active {
+        let actions = adw::ActionRow::builder()
+            .title(&active.name)
+            .subtitle("This profile")
+            .use_markup(false)
+            .build();
+        let buttons = gtk::Box::builder()
+            .spacing(6)
+            .valign(gtk::Align::Center)
+            .build();
+        for (label, action) in [
+            ("Rename…", ProfileAction::Rename),
+            ("Duplicate", ProfileAction::Duplicate),
+            ("Delete…", ProfileAction::Delete),
+        ] {
+            let b = gtk::Button::builder().label(label).build();
+            if matches!(action, ProfileAction::Delete) {
+                b.add_css_class("destructive-action");
+            }
+            let (dialog, next, parent, id, name) = (
+                dialog.clone(),
+                next_scope.clone(),
+                parent.as_ref().clone(),
+                active.id.clone(),
+                active.name.clone(),
+            );
+            b.connect_clicked(move |_| {
+                run_profile_action(action, &parent, &dialog, &next, &id, &name)
+            });
+            buttons.append(&b);
+        }
+        actions.add_suffix(&buttons);
+        g.add(&actions);
+    }
+    g
+}
+
+#[derive(Clone, Copy)]
+enum ProfileAction {
+    Rename,
+    Duplicate,
+    Delete,
+}
+
+/// Rename / duplicate / delete for the profile in scope. Each ends by closing the dialog so
+/// the edit and the re-render can't disagree about what the catalog holds.
+fn run_profile_action(
+    action: ProfileAction,
+    parent: &gtk::Widget,
+    dialog: &adw::PreferencesDialog,
+    next: &Rc<RefCell<Option<Scope>>>,
+    id: &str,
+    name: &str,
+) {
+    let (dialog, next, id) = (dialog.clone(), next.clone(), id.to_string());
+    match action {
+        ProfileAction::Rename => {
+            let keep = id.clone();
+            prompt_name(parent, "Rename profile", "Rename", name, move |new_name| {
+                let mut catalog = ProfilesFile::load();
+                if catalog.name_taken(&new_name, Some(&keep)) {
+                    return;
+                }
+                if let Some(p) = catalog.profiles.iter_mut().find(|p| p.id == keep) {
+                    p.name = new_name;
+                }
+                if catalog.save().is_ok() {
+                    *next.borrow_mut() = Some(Scope::Profile(keep.clone()));
+                    dialog.close();
+                }
+            });
+        }
+        ProfileAction::Duplicate => {
+            let mut catalog = ProfilesFile::load();
+            let Some(source) = catalog.find_by_id(&id).cloned() else {
+                return;
+            };
+            // "Work 2", "Work 3", … — the first name the catalog doesn't already hold.
+            let copy_name = (2..)
+                .map(|n| format!("{} {n}", source.name))
+                .find(|n| !catalog.name_taken(n, None))
+                .unwrap_or_else(|| source.name.clone());
+            let mut copy = StreamProfile::new(copy_name);
+            copy.overrides = source.overrides.clone();
+            copy.accent = source.accent.clone();
+            let new_id = copy.id.clone();
+            catalog.profiles.push(copy);
+            if catalog.save().is_ok() {
+                *next.borrow_mut() = Some(Scope::Profile(new_id));
+                dialog.close();
+            }
+        }
+        ProfileAction::Delete => {
+            // The warning counts what actually breaks: hosts that fall back to the defaults,
+            // and pinned cards that disappear (design §6).
+            let known = crate::trust::KnownHosts::load();
+            let bound = known
+                .hosts
+                .iter()
+                .filter(|h| h.profile_id.as_deref() == Some(id.as_str()))
+                .count();
+            let pinned = known
+                .hosts
+                .iter()
+                .filter(|h| h.pinned_profiles.iter().any(|p| p == &id))
+                .count();
+            let mut body = format!("“{name}” will be removed.");
+            if bound > 0 {
+                body.push_str(&format!(
+                    "\n\n{bound} host{} will fall back to Default settings.",
+                    if bound == 1 { "" } else { "s" }
+                ));
+            }
+            if pinned > 0 {
+                body.push_str(&format!(
+                    "\n{pinned} pinned card{} will disappear.",
+                    if pinned == 1 { "" } else { "s" }
+                ));
+            }
+            let confirm = adw::AlertDialog::new(Some("Delete profile?"), Some(&body));
+            confirm.add_responses(&[("cancel", "Cancel"), ("delete", "Delete")]);
+            confirm.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
+            confirm.set_close_response("cancel");
+            confirm.connect_response(Some("delete"), move |_, _| {
+                let mut catalog = ProfilesFile::load();
+                catalog.profiles.retain(|p| p.id != id);
+                if catalog.save().is_ok() {
+                    // Bindings and pins are left dangling on purpose: they resolve as "no
+                    // profile" everywhere, and rewriting every host record here would be a
+                    // second, racier source of truth.
+                    *next.borrow_mut() = Some(Scope::Defaults);
+                    dialog.close();
+                }
+            });
+            confirm.present(Some(parent));
+        }
+    }
+}
+
+/// A one-line name prompt (create/rename). Refuses empty and duplicate names in place —
+/// menus keyed by name are ambiguous otherwise (design §6) — rather than failing after the
+/// dialog is gone.
+fn prompt_name(
+    parent: &impl IsA<gtk::Widget>,
+    heading: &str,
+    accept: &str,
+    initial: &str,
+    on_ok: impl Fn(String) + 'static,
+) {
+    let dialog = adw::AlertDialog::new(Some(heading), None);
+    let entry = adw::EntryRow::builder().title("Name").build();
+    entry.set_text(initial);
+    let list = gtk::ListBox::builder()
+        .selection_mode(gtk::SelectionMode::None)
+        .css_classes(["boxed-list"])
+        .build();
+    list.append(&entry);
+    dialog.set_extra_child(Some(&list));
+    dialog.add_responses(&[("cancel", "Cancel"), ("ok", accept)]);
+    dialog.set_response_appearance("ok", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("ok"));
+    dialog.set_close_response("cancel");
+    let taken_against = initial.to_string();
+    let e = entry.clone();
+    let d = dialog.clone();
+    let validate = move || {
+        let name = e.text().trim().to_string();
+        let catalog = ProfilesFile::load();
+        let dup = !name.eq_ignore_ascii_case(&taken_against) && catalog.name_taken(&name, None);
+        d.set_response_enabled("ok", !name.is_empty() && !dup);
+        e.set_title(if dup {
+            "Name — already used by another profile"
+        } else {
+            "Name"
+        });
+    };
+    validate();
+    {
+        let validate = validate.clone();
+        entry.connect_changed(move |_| validate());
+    }
+    let e = entry.clone();
+    dialog.connect_response(Some("ok"), move |_, _| {
+        let name = e.text().trim().to_string();
+        if !name.is_empty() {
+            on_ok(name);
+        }
+    });
+    dialog.present(Some(parent));
+}
+
+/// Write the rows the user touched into this profile's overlay and persist the catalog.
+///
+/// Only touched fields move: an untouched row leaves whatever the profile already had
+/// (an inherited `None`, or an existing override this build might not even render), which is
+/// what keeps an older client from erasing a newer one's values just by opening the dialog.
+/// The catalog is re-read here rather than reused, so a profile renamed in another window
+/// between opening and closing this one survives.
+fn commit_profile(active: &StreamProfile, touched: &Touched, values: &Settings) {
+    let mut catalog = ProfilesFile::load();
+    let Some(slot) = catalog.profiles.iter_mut().find(|p| p.id == active.id) else {
+        return; // deleted from under us — nothing to write to, and nothing to complain about
+    };
+    let o: &mut SettingsOverlay = &mut slot.overrides;
+    if touched.has("resolution") {
+        // One row drives the tri-state, so all three fields move together.
+        o.match_window = Some(values.match_window);
+        o.width = Some(values.width);
+        o.height = Some(values.height);
+    }
+    if touched.has("refresh_hz") {
+        o.refresh_hz = Some(values.refresh_hz);
+    }
+    if touched.has("render_scale") {
+        o.render_scale = Some(values.render_scale);
+    }
+    if touched.has("bitrate_kbps") {
+        o.bitrate_kbps = Some(values.bitrate_kbps);
+    }
+    if touched.has("codec") {
+        o.codec = Some(values.codec.clone());
+    }
+    if touched.has("hdr_enabled") {
+        o.hdr_enabled = Some(values.hdr_enabled);
+    }
+    if touched.has("compositor") {
+        o.compositor = Some(values.compositor.clone());
+    }
+    if touched.has("audio_channels") {
+        o.audio_channels = Some(values.audio_channels);
+    }
+    if touched.has("mic_enabled") {
+        o.mic_enabled = Some(values.mic_enabled);
+    }
+    if touched.has("touch_mode") {
+        o.touch_mode = Some(values.touch_mode.clone());
+    }
+    if touched.has("mouse_mode") {
+        o.mouse_mode = Some(values.mouse_mode.clone());
+    }
+    if touched.has("invert_scroll") {
+        o.invert_scroll = Some(values.invert_scroll);
+    }
+    if touched.has("inhibit_shortcuts") {
+        o.inhibit_shortcuts = Some(values.inhibit_shortcuts);
+    }
+    if touched.has("gamepad") {
+        o.gamepad = Some(values.gamepad.clone());
+    }
+    if touched.has("stats_verbosity") {
+        o.stats_verbosity = Some(values.stats_verbosity());
+    }
+    if touched.has("fullscreen_on_stream") {
+        o.fullscreen_on_stream = Some(values.fullscreen_on_stream);
+    }
+    if let Err(e) = catalog.save() {
+        tracing::warn!(error = %format!("{e:#}"), "saving the profile catalog");
+    }
+}
 
 /// A compact label for a render-scale multiplier: "Native" / "1.5×" / "2× (supersample)".
 fn render_scale_label(scale: f64) -> String {
@@ -130,7 +504,7 @@ fn gamescope_session() -> bool {
         || std::env::var("GAMESCOPE_WAYLAND_DISPLAY").is_ok()
 }
 
-type ChangedFn = Rc<RefCell<Option<Box<dyn Fn(u32)>>>>;
+type ChangedFn = Rc<RefCell<Vec<Box<dyn Fn(u32)>>>>;
 
 /// A titled single-choice preference row. On a desktop this is a stock popover
 /// [`adw::ComboRow`]; under gamescope (see [`gamescope_session`]) it becomes an activatable
@@ -138,8 +512,9 @@ type ChangedFn = Rc<RefCell<Option<Box<dyn Fn(u32)>>>>;
 struct ChoiceRow {
     row: adw::PreferencesRow,
     selected: Rc<Cell<u32>>,
-    /// Fires on user changes only — [`connect_changed`](Self::connect_changed) is installed
-    /// after seeding, so programmatic `set_selected` during setup never fires it.
+    /// Fires on user changes only — handlers are installed after seeding, so programmatic
+    /// `set_selected` during setup never fires them. A list, not one: a row can carry both a
+    /// dynamic caption and (in profile scope) the override mark.
     changed: ChangedFn,
     /// Subpage mode only: the current value rendered as the row's suffix.
     value_label: Option<gtk::Label>,
@@ -158,7 +533,7 @@ impl ChoiceRow {
     ) -> ChoiceRow {
         let options: Rc<Vec<String>> = Rc::new(options.iter().map(|s| s.to_string()).collect());
         let selected = Rc::new(Cell::new(0u32));
-        let changed: ChangedFn = Rc::new(RefCell::new(None));
+        let changed: ChangedFn = Rc::new(RefCell::new(Vec::new()));
 
         if !inline {
             let row = adw::ComboRow::builder()
@@ -171,7 +546,7 @@ impl ChoiceRow {
             let (sel, chg) = (selected.clone(), changed.clone());
             row.connect_selected_notify(move |r| {
                 if sel.replace(r.selected()) != r.selected() {
-                    if let Some(f) = chg.borrow().as_ref() {
+                    for f in chg.borrow().iter() {
                         f(r.selected());
                     }
                 }
@@ -227,7 +602,7 @@ impl ChoiceRow {
                         let user_change = sel.replace(idx) != idx;
                         value.set_text(&label);
                         if user_change {
-                            if let Some(f) = chg.borrow().as_ref() {
+                            for f in chg.borrow().iter() {
                                 f(idx);
                             }
                         }
@@ -291,7 +666,7 @@ impl ChoiceRow {
     }
 
     fn connect_changed(&self, f: impl Fn(u32) + 'static) {
-        *self.changed.borrow_mut() = Some(Box::new(f));
+        self.changed.borrow_mut().push(Box::new(f));
     }
 }
 
@@ -368,6 +743,48 @@ pub fn show(
     probes: &DeviceProbes,
     on_closed: impl Fn() + 'static,
 ) -> adw::PreferencesDialog {
+    show_scoped(
+        parent,
+        settings,
+        gamepads,
+        probes,
+        Scope::Defaults,
+        |_| {},
+        on_closed,
+    )
+}
+
+/// The dialog in a given [`Scope`]. `on_scope` asks the app to re-open it in another one:
+/// switching scope closes this dialog first, so the layer being edited is committed before
+/// the next one is loaded, and there is exactly one place that builds the rows.
+pub fn show_scoped(
+    parent: &impl IsA<gtk::Widget>,
+    settings: Rc<RefCell<Settings>>,
+    gamepads: &crate::gamepad::GamepadService,
+    probes: &DeviceProbes,
+    scope: Scope,
+    on_scope: impl Fn(Scope) + 'static,
+    on_closed: impl Fn() + 'static,
+) -> adw::PreferencesDialog {
+    let catalog = ProfilesFile::load();
+    // A scope pointing at a deleted profile degrades to the defaults rather than erroring —
+    // the same rule a dangling host binding follows.
+    let active: Option<StreamProfile> = match &scope {
+        Scope::Profile(id) => catalog.find_by_id(id).cloned(),
+        Scope::Defaults => None,
+    };
+    let profile_mode = active.is_some();
+    // Rows always show the EFFECTIVE value: the global underneath, with this profile's
+    // overrides on top. A row the profile doesn't override therefore reads as the live
+    // global, which is what "inherit by default" has to look like.
+    let seed: Settings = match &active {
+        Some(p) => p.overrides.apply(&settings.borrow()),
+        None => settings.borrow().clone(),
+    };
+    let touched = Touched::default();
+    // Where a scope switch wants to go once this dialog has committed and closed.
+    let next_scope: Rc<RefCell<Option<Scope>>> = Rc::default();
+
     // The dialog exists before the rows: ChoiceRow's gamescope mode pushes its selection
     // subpage onto it.
     let dialog = adw::PreferencesDialog::new();
@@ -465,7 +882,7 @@ pub fn show(
     // GPU picker (multi-GPU boxes): the adapter name feeds the session's device pick
     // via `Settings::adapter` → PUNKTFUNK_VK_ADAPTER. Hidden when there's nothing to
     // pick; a saved adapter that's gone (eGPU unplugged) keeps a revertable entry.
-    let saved_adapter = settings.borrow().adapter.clone();
+    let saved_adapter = seed.adapter.clone();
     let mut gpu_names = vec!["Automatic".to_string()];
     let mut gpu_keys: Vec<String> = vec![String::new()];
     for a in &probes.adapters {
@@ -709,9 +1126,9 @@ pub fn show(
         ],
     );
 
-    // ---- Seed from the current settings ----
+    // ---- Seed from the effective settings for this scope ----
     {
-        let s = settings.borrow();
+        let s = &seed;
         let res_i = if s.match_window {
             1
         } else {
@@ -775,18 +1192,72 @@ pub fn show(
         set_row_subtitle(codec_row.widget(), codec_caption(codec_i as u32));
     }
 
+    // ---- Override tracking (profile scope) ----
+    // Installed after the seed block on purpose: `set_selected`/`set_active` during setup must
+    // not look like the user touching the control, or opening a profile would override every
+    // row in it.
+    if profile_mode {
+        macro_rules! on_change {
+            ($row:expr, $key:literal) => {{
+                let t = touched.clone();
+                $row.connect_changed(move |_| t.mark($key));
+            }};
+        }
+        macro_rules! on_toggle {
+            ($row:expr, $key:literal) => {{
+                let t = touched.clone();
+                $row.connect_active_notify(move |_| t.mark($key));
+            }};
+        }
+        on_change!(res_row, "resolution");
+        on_change!(hz_row, "refresh_hz");
+        on_change!(scale_row, "render_scale");
+        on_change!(codec_row, "codec");
+        on_change!(compositor_row, "compositor");
+        on_change!(stats_row, "stats_verbosity");
+        on_change!(touch_row, "touch_mode");
+        on_change!(mouse_row, "mouse_mode");
+        on_change!(surround_row, "audio_channels");
+        on_change!(pad_row, "gamepad");
+        on_toggle!(hdr_row, "hdr_enabled");
+        on_toggle!(fullscreen_row, "fullscreen_on_stream");
+        on_toggle!(inhibit_row, "inhibit_shortcuts");
+        on_toggle!(invert_row, "invert_scroll");
+        on_toggle!(mic_row, "mic_enabled");
+        let t = touched.clone();
+        bitrate_row.connect_value_notify(move |_| t.mark("bitrate_kbps"));
+    }
+
     // ---- Assemble the category pages (the Apple revamp's map) ----
     let general = page("General", "preferences-system-symbolic");
+    // The scope switcher heads the first page — the one row that is always about which layer
+    // you are editing, not about the stream.
+    general.add(&scope_group(
+        &dialog,
+        inline,
+        &scope,
+        &catalog,
+        active.as_ref(),
+        &next_scope,
+        parent,
+    ));
     let session_group = group("Session", "");
     session_group.add(&fullscreen_row);
-    session_group.add(&wake_row);
+    // Auto-wake is a property of the host and this network, not of "Game vs Work" — it stays
+    // global in v1 (design §3, tier H/G).
+    if !profile_mode {
+        session_group.add(&wake_row);
+    }
     let stats_group = group("Statistics", "");
     stats_group.add(stats_row.widget());
-    let library_group = group("Library", "");
-    library_group.add(&library_row);
     general.add(&session_group);
     general.add(&stats_group);
-    general.add(&library_group);
+    // The library browser is an app-level toggle for this device, not a per-profile one.
+    if !profile_mode {
+        let library_group = group("Library", "");
+        library_group.add(&library_row);
+        general.add(&library_group);
+    }
 
     let display = page("Display", "video-display-symbolic");
     let resolution_group = group("Resolution", "");
@@ -797,8 +1268,11 @@ pub fn show(
     quality_group.add(&bitrate_row);
     quality_group.add(codec_row.widget());
     quality_group.add(&hdr_row);
-    quality_group.add(decoder_row.widget());
-    if let Some(r) = &gpu_row {
+    // Decoder and GPU are facts about THIS device's hardware — never per profile (tier G).
+    if !profile_mode {
+        quality_group.add(decoder_row.widget());
+    }
+    if let (Some(r), false) = (&gpu_row, profile_mode) {
         quality_group.add(r.widget());
     }
     // The one form-level note (deliberately not repeated on every row).
@@ -825,11 +1299,14 @@ pub fn show(
     let audio = page("Audio", "audio-volume-high-symbolic");
     let audio_group = group("", "Applies from the next session.");
     audio_group.add(surround_row.widget());
-    if let Some(r) = &speaker_row {
+    // The speaker/mic endpoint pickers below are this device's audio routing (tier G) — they
+    // render only in the defaults scope; the surround + mic-uplink rows above are profileable.
+
+    if let (Some(r), false) = (&speaker_row, profile_mode) {
         audio_group.add(r.widget());
     }
     audio_group.add(&mic_row);
-    if let Some(r) = &micdev_row {
+    if let (Some(r), false) = (&micdev_row, profile_mode) {
         audio_group.add(r.widget());
     }
     audio.add(&audio_group);
@@ -837,8 +1314,12 @@ pub fn show(
     let controllers = page("Controllers", "input-gaming-symbolic");
     let controllers_group = group("", "");
     // The detected-pad list (mirrors the Apple Controllers section): informational rows
-    // above the pickers, from the same snapshot that feeds the forwarding picker.
-    if pads.is_empty() {
+    // above the pickers, from the same snapshot that feeds the forwarding picker. It is
+    // about the hardware plugged into THIS device, so profile scope shows only the
+    // emulated-type picker below it.
+    if profile_mode {
+        // nothing — the pad inventory belongs to the device, not the profile
+    } else if pads.is_empty() {
         let none = adw::ActionRow::builder()
             .title("No controllers detected")
             .css_classes(["dim-label"])
@@ -861,7 +1342,9 @@ pub fn show(
             controllers_group.add(&row);
         }
     }
-    controllers_group.add(forward_row.widget());
+    if !profile_mode {
+        controllers_group.add(forward_row.widget());
+    }
     controllers_group.add(pad_row.widget());
     controllers.add(&controllers_group);
 
@@ -872,64 +1355,89 @@ pub fn show(
     dialog.add(&controllers);
 
     dialog.connect_closed(move |_| {
-        let mut s = settings.borrow_mut();
-        // Index 1 is the virtual "Match window" option; 0 = Native, 2.. = explicit.
-        let res_i = (res_row.selected() as usize).min(RESOLUTIONS.len());
-        s.match_window = res_i == 1;
-        (s.width, s.height) = if res_i <= 1 {
-            (0, 0)
-        } else {
-            RESOLUTIONS[res_i - 1]
-        };
-        s.refresh_hz = REFRESH[(hz_row.selected() as usize).min(REFRESH.len() - 1)];
-        s.render_scale =
-            RENDER_SCALES[(scale_row.selected() as usize).min(RENDER_SCALES.len() - 1)];
-        s.bitrate_kbps = (bitrate_row.value() * 1000.0) as u32;
-        // Keep a stored preference this table doesn't list (e.g. "switchpro" — valid to the
-        // session, hand-edited or written by another client): it displays as "Automatic", and
-        // writing that back would silently erase it just by opening + closing the dialog.
-        // Persist the row only when the user picked a non-Auto entry or the stored value was
-        // a listed one to begin with.
-        let pad_sel = (pad_row.selected() as usize).min(GAMEPADS.len() - 1);
-        if pad_sel != 0 || GAMEPADS.contains(&s.gamepad.as_str()) {
-            s.gamepad = GAMEPADS[pad_sel].to_string();
-        }
-        s.touch_mode =
-            TOUCH_MODES[(touch_row.selected() as usize).min(TOUCH_MODES.len() - 1)].to_string();
-        s.mouse_mode =
-            MOUSE_MODES[(mouse_row.selected() as usize).min(MOUSE_MODES.len() - 1)].to_string();
-        s.forward_pad = chosen_pin.borrow().clone();
-        s.compositor = COMPOSITORS[(compositor_row.selected() as usize).min(COMPOSITORS.len() - 1)]
+        // One reader for the rows, two destinations: the globals, or a profile's overrides.
+        // Sharing it is what keeps the two scopes from interpreting the same controls
+        // differently (the tri-state resolution row is the obvious trap).
+        let apply_rows = |s: &mut Settings| {
+            // Index 1 is the virtual "Match window" option; 0 = Native, 2.. = explicit.
+            let res_i = (res_row.selected() as usize).min(RESOLUTIONS.len());
+            s.match_window = res_i == 1;
+            (s.width, s.height) = if res_i <= 1 {
+                (0, 0)
+            } else {
+                RESOLUTIONS[res_i - 1]
+            };
+            s.refresh_hz = REFRESH[(hz_row.selected() as usize).min(REFRESH.len() - 1)];
+            s.render_scale =
+                RENDER_SCALES[(scale_row.selected() as usize).min(RENDER_SCALES.len() - 1)];
+            s.bitrate_kbps = (bitrate_row.value() * 1000.0) as u32;
+            // Keep a stored preference this table doesn't list (e.g. "switchpro" — valid to the
+            // session, hand-edited or written by another client): it displays as "Automatic", and
+            // writing that back would silently erase it just by opening + closing the dialog.
+            // Persist the row only when the user picked a non-Auto entry or the stored value was
+            // a listed one to begin with.
+            let pad_sel = (pad_row.selected() as usize).min(GAMEPADS.len() - 1);
+            if pad_sel != 0 || GAMEPADS.contains(&s.gamepad.as_str()) {
+                s.gamepad = GAMEPADS[pad_sel].to_string();
+            }
+            s.touch_mode =
+                TOUCH_MODES[(touch_row.selected() as usize).min(TOUCH_MODES.len() - 1)].to_string();
+            s.mouse_mode =
+                MOUSE_MODES[(mouse_row.selected() as usize).min(MOUSE_MODES.len() - 1)].to_string();
+            s.forward_pad = chosen_pin.borrow().clone();
+            s.compositor = COMPOSITORS
+                [(compositor_row.selected() as usize).min(COMPOSITORS.len() - 1)]
             .to_string();
-        s.decoder = DECODERS[(decoder_row.selected() as usize).min(DECODERS.len() - 1)].to_string();
-        if let Some(r) = &gpu_row {
-            s.adapter = gpu_keys[(r.selected() as usize).min(gpu_keys.len() - 1)].clone();
-        }
-        if let Some(r) = &speaker_row {
-            s.speaker_device =
-                speaker_keys[(r.selected() as usize).min(speaker_keys.len() - 1)].clone();
-        }
-        if let Some(r) = &micdev_row {
-            s.mic_device = micdev_keys[(r.selected() as usize).min(micdev_keys.len() - 1)].clone();
-        }
-        s.set_stats_verbosity(
-            StatsVerbosity::ALL[(stats_row.selected() as usize).min(StatsVerbosity::ALL.len() - 1)],
-        );
-        s.fullscreen_on_stream = fullscreen_row.is_active();
-        s.auto_wake = wake_row.is_active();
-        s.inhibit_shortcuts = inhibit_row.is_active();
-        s.invert_scroll = invert_row.is_active();
-        s.mic_enabled = mic_row.is_active();
-        s.hdr_enabled = hdr_row.is_active();
-        s.audio_channels = match surround_row.selected() {
-            1 => 6,
-            2 => 8,
-            _ => 2,
+            s.decoder =
+                DECODERS[(decoder_row.selected() as usize).min(DECODERS.len() - 1)].to_string();
+            if let Some(r) = &gpu_row {
+                s.adapter = gpu_keys[(r.selected() as usize).min(gpu_keys.len() - 1)].clone();
+            }
+            if let Some(r) = &speaker_row {
+                s.speaker_device =
+                    speaker_keys[(r.selected() as usize).min(speaker_keys.len() - 1)].clone();
+            }
+            if let Some(r) = &micdev_row {
+                s.mic_device =
+                    micdev_keys[(r.selected() as usize).min(micdev_keys.len() - 1)].clone();
+            }
+            s.set_stats_verbosity(
+                StatsVerbosity::ALL
+                    [(stats_row.selected() as usize).min(StatsVerbosity::ALL.len() - 1)],
+            );
+            s.fullscreen_on_stream = fullscreen_row.is_active();
+            s.auto_wake = wake_row.is_active();
+            s.inhibit_shortcuts = inhibit_row.is_active();
+            s.invert_scroll = invert_row.is_active();
+            s.mic_enabled = mic_row.is_active();
+            s.hdr_enabled = hdr_row.is_active();
+            s.audio_channels = match surround_row.selected() {
+                1 => 6,
+                2 => 8,
+                _ => 2,
+            };
+            s.codec = CODECS[(codec_row.selected() as usize).min(CODECS.len() - 1)].to_string();
+            s.library_enabled = library_row.is_active();
         };
-        s.codec = CODECS[(codec_row.selected() as usize).min(CODECS.len() - 1)].to_string();
-        s.library_enabled = library_row.is_active();
-        s.save();
-        drop(s);
+
+        match &active {
+            // Profile scope writes the touched rows into the catalog and leaves the globals
+            // exactly as they were — the point of the whole feature.
+            Some(active) => {
+                let mut values = seed.clone();
+                apply_rows(&mut values);
+                commit_profile(active, &touched, &values);
+            }
+            None => {
+                let mut s = settings.borrow_mut();
+                apply_rows(&mut s);
+                s.save();
+            }
+        }
+        // A scope switch closed this dialog to commit first; now re-open in the new scope.
+        if let Some(next) = next_scope.borrow_mut().take() {
+            on_scope(next);
+        }
         on_closed();
     });
     dialog.present(Some(parent));

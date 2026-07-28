@@ -118,6 +118,9 @@ pub enum AppMsg {
     /// The speed-test dialog resolved (either way) — release `busy`.
     SpeedTestDone,
     ShowPreferences,
+    /// Re-open Preferences editing a specific layer — the settings scope switcher's
+    /// destination (design/client-settings-profiles.md §5.1).
+    ShowPreferencesScoped(crate::ui_settings::Scope),
     ShowShortcuts,
     ShowAbout,
     ShowAddHost,
@@ -489,15 +492,25 @@ impl SimpleComponent for AppModel {
                 self.hosts.emit(HostsMsg::SetConnecting(None));
                 self.toast("Cancelled — the request may still be pending on the host.");
             }
-            AppMsg::ShowPreferences => {
+            AppMsg::ShowPreferences => sender.input(AppMsg::ShowPreferencesScoped(
+                crate::ui_settings::Scope::Defaults,
+            )),
+            AppMsg::ShowPreferencesScoped(scope) => {
                 let hosts = self.hosts.sender().clone();
-                crate::ui_settings::show(
+                let reopen = sender.clone();
+                crate::ui_settings::show_scoped(
                     &self.window,
                     self.settings.clone(),
                     &self.gamepad,
                     &self.probes.borrow(),
+                    scope,
+                    // The switcher closes the dialog to commit the layer it was editing, then
+                    // asks for it back in the new scope — so the app owns the re-open and the
+                    // dialog stays a pure view.
+                    move |next| reopen.input(AppMsg::ShowPreferencesScoped(next)),
                     move || {
-                        // The library toggle changes the saved cards' menu — re-render.
+                        // The library toggle changes the saved cards' menu, and a profile edit
+                        // changes the chips — re-render either way.
                         let _ = hosts.send(HostsMsg::Refresh);
                     },
                 );

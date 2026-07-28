@@ -544,11 +544,26 @@ pub fn run_shot(ctx: &ShotCtx, scene: &str) {
                 speakers: vec![dev("alsa_output.mock-hdmi", "HDMI / DisplayPort Audio")],
                 mics: vec![dev("alsa_input.mock-usb", "USB Microphone Analog Stereo")],
             };
-            let dialog = crate::ui_settings::show(
+            // `PUNKTFUNK_SHOT_SETTINGS_SCOPE=<profile id|name>` captures the dialog in
+            // PROFILE scope — the second half of the settings surface (design
+            // client-settings-profiles.md §5.1), where only profileable rows render.
+            let scope = std::env::var("PUNKTFUNK_SHOT_SETTINGS_SCOPE")
+                .ok()
+                .filter(|v| !v.is_empty())
+                .and_then(|reference| {
+                    pf_client_core::profiles::ProfilesFile::load()
+                        .resolve(&reference)
+                        .0
+                        .map(|p| crate::ui_settings::Scope::Profile(p.id.clone()))
+                })
+                .unwrap_or(crate::ui_settings::Scope::Defaults);
+            let dialog = crate::ui_settings::show_scoped(
                 &ctx.window,
                 ctx.settings.clone(),
                 &ctx.gamepad,
                 &probes,
+                scope,
+                |_| {},
                 || {},
             );
             // Optional page for the capture (general/display/input/audio/controllers);
