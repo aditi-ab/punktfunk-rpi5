@@ -294,7 +294,15 @@ jobs:
             Add-Content -Path $rc -Value "//git.unom.io/api/packages/unom/npm/:_authToken=$env:REGISTRY_TOKEN"
           }
           Push-Location web
-          & $bun install --frozen-lockfile; if ($LASTEXITCODE) { throw "bun install failed ($LASTEXITCODE)" }
+          # `--ignore-scripts` like every other web install in CI (ci.yml, web-screenshots.yml,
+          # sdk/plugin-kit-publish, and the SDK install further down this same file). This step was
+          # the one site that ran lifecycle scripts, and web's `postinstall` is `bun2nix -o bun.nix`
+          # — a NIX codegen step that shells out to `bun` on PATH. CI runs a fetched PORTABLE bun by
+          # absolute path (`$env:BUN_EXE`), so PATH has none, and bun2nix aborted the install:
+          #   error: bun is not installed in %PATH% ... postinstall script exited with 255
+          # Nothing here needs those scripts — `build` re-runs its own `prebuild` codegen — and
+          # bun.nix is a Nix artifact this job neither consumes nor commits.
+          & $bun install --frozen-lockfile --ignore-scripts; if ($LASTEXITCODE) { throw "bun install failed ($LASTEXITCODE)" }
           & $bun run build; if ($LASTEXITCODE) { throw "web build failed ($LASTEXITCODE)" }
           if (-not (Select-String -Path .output\server\index.mjs -Pattern 'Bun\.serve' -Quiet)) {
             throw "web build is not a bun bundle - need the 'bun' preset + custom entry"
