@@ -4,7 +4,8 @@
 #   . scripts/ci/gitea-release.ps1
 # Mirrors scripts/ci/gitea-release.sh; parses JSON with ConvertFrom-Json (the Windows runner
 # has no python). Same idempotent semantics: Upsert-GiteaAsset deletes an existing asset of
-# the same name before uploading, so re-runs / rolling canary uploads don't 409.
+# the same name before uploading, so re-runs / rolling canary uploads don't 409 — and attaches
+# a `<asset>.sha256` sidecar alongside every asset, exactly like the bash twin.
 #
 # Env (Gitea Actions sets the first two automatically):
 #   GITHUB_SERVER_URL   e.g. https://git.unom.io
@@ -57,16 +58,10 @@ function Ensure-GiteaRelease {
   }
 }
 
-# Upsert-GiteaAsset RELEASEID FILE [NAME]
-#   Attach FILE, replacing any existing asset of the same name first (idempotent).
-function Upsert-GiteaAsset {
-  param(
-    [Parameter(Mandatory)] [string]$ReleaseId,
-    [Parameter(Mandatory)] [string]$File,
-    [string]$Name
-  )
-  if (-not (Test-Path $File)) { throw "gitea-release: asset file not found: $File" }
-  if (-not $Name) { $Name = Split-Path $File -Leaf }
+# _PutGiteaAsset RELEASEID FILE NAME
+#   The raw attach: delete any existing asset of the same name, then POST FILE under NAME.
+function _PutGiteaAsset {
+  param([string]$ReleaseId, [string]$File, [string]$Name)
   $api = _GiteaApi; $h = _GiteaHeaders
   $assets = Invoke-RestMethod -Method Get -Uri "$api/releases/$ReleaseId/assets" -Headers $h
   $existing = $assets | Where-Object { $_.name -eq $Name } | Select-Object -First 1
@@ -79,4 +74,29 @@ function Upsert-GiteaAsset {
     -X POST "$api/releases/$ReleaseId/assets?name=$enc" -F "attachment=@$File"
   if ($LASTEXITCODE -ne 0) { throw "gitea-release: asset upload failed ($LASTEXITCODE): $Name" }
   Write-Output "gitea-release: uploaded '$Name' -> release $ReleaseId"
+}
+
+# Upsert-GiteaAsset RELEASEID FILE [NAME]
+#   Attach FILE, replacing any existing asset of the same name first (idempotent), plus a
+#   `<NAME>.sha256` checksum sidecar so the download is verifiable. Sidecars rather than one
+#   shared SHA256SUMS because every platform's workflow attaches to the same release object
+#   concurrently — see the bash twin's comment for the full reasoning.
+function Upsert-GiteaAsset {
+  param(
+    [Parameter(Mandatory)] [string]$ReleaseId,
+    [Parameter(Mandatory)] [string]$File,
+    [string]$Name
+  )
+  if (-not (Test-Path $File)) { throw "gitea-release: asset file not found: $File" }
+  if (-not $Name) { $Name = Split-Path $File -Leaf }
+  _PutGiteaAsset -ReleaseId $ReleaseId -File $File -Name $Name
+  if ($Name -like '*.sha256') { return }
+  # "<digest>  <name>", LF-terminated and written byte-exactly: GNU sha256sum -c treats a trailing
+  # CR as part of the filename, so PowerShell's default CRLF output would make every check fail on
+  # the Linux/macOS box doing the verifying. The name is the ASSET name, not the local basename.
+  $digest = (Get-FileHash -Algorithm SHA256 -LiteralPath $File).Hash.ToLowerInvariant()
+  $sums = Join-Path ([IO.Path]::GetTempPath()) ([IO.Path]::GetRandomFileName())
+  [IO.File]::WriteAllText($sums, "$digest  $Name`n", (New-Object Text.UTF8Encoding $false))
+  try { _PutGiteaAsset -ReleaseId $ReleaseId -File $sums -Name "$Name.sha256" }
+  finally { Remove-Item -LiteralPath $sums -Force -ErrorAction SilentlyContinue }
 }

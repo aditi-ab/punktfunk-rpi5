@@ -7,6 +7,10 @@
 # same name already exists, so re-running a workflow — or reusing the rolling `canary`
 # release with stable filenames — would fail. upsert_asset deletes the old asset first.
 #
+# upsert_asset also attaches a `<asset>.sha256` sidecar for every asset, so a download off a
+# release page is verifiable (`sha256sum -c punktfunk-1.2.3.dmg.sha256`) — see its comment for
+# why sidecars rather than one shared SHA256SUMS.
+#
 # Callers run under Gitea Actions' default `bash -eo pipefail`, so a non-zero return from
 # these functions aborts the step (the desired behaviour on a real failure).
 #
@@ -101,14 +105,12 @@ PY
   printf '%s' "$id"
 }
 
-# upsert_asset RELEASE_ID FILE [NAME]
-#   Attach FILE to the release, replacing any existing asset of the same name first so that
+# _put_asset RELEASE_ID FILE NAME
+#   The raw attach: delete any existing asset of the same name, then POST FILE under NAME, so
 #   re-runs and rolling canary re-uploads are idempotent (a plain POST 409s on a dup name).
-upsert_asset() {
-  local rid="${1:?release id}" file="${2:?file}" name="${3:-}"
+_put_asset() {
+  local rid="$1" file="$2" name="$3"
   local api existing
-  [ -n "$name" ] || name="$(basename "$file")"
-  [ -f "$file" ] || { echo "gitea-release: asset file not found: $file" >&2; return 1; }
   api="$(_gitea_api)"
   existing=$(curl -fsS "$api/releases/$rid/assets" \
                -H "Authorization: token ${GITEA_TOKEN:?}" 2>/dev/null \
@@ -121,6 +123,46 @@ upsert_asset() {
     -H "Authorization: token ${GITEA_TOKEN:?}" \
     -F "attachment=@$file"
   echo "gitea-release: uploaded '$name' -> release $rid"
+}
+
+# _sha256 FILE -> lowercase hex digest
+#   python3 rather than sha256sum/shasum: python3 is already a hard dependency of this file, and
+#   the two coreutils spellings differ across our runners (Linux has sha256sum, macOS only shasum).
+_sha256() {
+  python3 - "$1" <<'PY'
+import hashlib, sys
+h = hashlib.sha256()
+with open(sys.argv[1], "rb") as f:
+    for chunk in iter(lambda: f.read(1 << 20), b""):
+        h.update(chunk)
+print(h.hexdigest())
+PY
+}
+
+# upsert_asset RELEASE_ID FILE [NAME]
+#   Attach FILE to the release AND a `<NAME>.sha256` checksum sidecar next to it, so every
+#   download off a release page can be verified:  sha256sum -c punktfunk-1.2.3.dmg.sha256
+#
+#   Sidecars, not one shared SHA256SUMS, ON PURPOSE: half a dozen workflows (release, windows-*,
+#   android, decky, deb, rpm, arch, flatpak) attach to the SAME release object concurrently, and a
+#   single manifest would be a read-modify-write race that silently loses whichever leg lost. One
+#   sidecar per asset has no shared mutable state — each leg only ever writes names it owns.
+#
+#   Living here rather than in the callers means a new packaging workflow inherits checksums for
+#   free; the only way to attach an unchecksummed asset is to bypass this helper entirely.
+upsert_asset() {
+  local rid="${1:?release id}" file="${2:?file}" name="${3:-}"
+  local sums
+  [ -n "$name" ] || name="$(basename "$file")"
+  [ -f "$file" ] || { echo "gitea-release: asset file not found: $file" >&2; return 1; }
+  _put_asset "$rid" "$file" "$name"
+  # A sidecar gets no sidecar of its own (and neither does a caller attaching one by hand).
+  case "$name" in *.sha256) return 0 ;; esac
+  # `sha256sum -c` wants "<digest>  <filename>" with the filename as downloaded — i.e. the ASSET
+  # name, which is not necessarily the local basename (callers rename, e.g. Punktfunk-$VERSION.dmg).
+  sums="$(mktemp)"
+  printf '%s  %s\n' "$(_sha256 "$file")" "$name" > "$sums"
+  if _put_asset "$rid" "$sums" "$name.sha256"; then rm -f "$sums"; else rm -f "$sums"; return 1; fi
 }
 
 # apply_release_notes RELEASE_ID TAG
