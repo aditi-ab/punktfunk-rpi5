@@ -72,9 +72,7 @@ impl CursorShared {
             MappedSection { handle: map, view }
         };
         // Desktop origin of this monitor's source — for the desktop→frame coordinate shift.
-        // SAFETY: `source_desktop_rect` only runs the CCD QueryDisplayConfig FFI over owned
-        // locals (same call the compose-kick path makes).
-        let rect = unsafe { pf_win_display::win_display::source_desktop_rect(target_id) };
+        let rect = pf_win_display::win_display::source_desktop_rect(target_id);
         let origin = rect.map(|(x, y, _w, _h)| (x, y)).unwrap_or((0, 0));
         Ok(CursorShared {
             section,

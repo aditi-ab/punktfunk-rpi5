@@ -281,11 +281,8 @@ impl IddPushCapturer {
         // a fullscreen game can hold the virtual display at a different mode (esp. across a reconnect), so
         // matching the actual mode lets the first frame flow instead of being dropped (game-capture bug
         // GB1). Falls back to the negotiated mode when the CCD read is unavailable.
-        // SAFETY: `active_resolution` is an `unsafe fn` (Win32 CCD `QueryDisplayConfig`) that takes only a
-        // copy of the plain `u32` CCD target id and returns owned `(w, h)` values; it forms no borrows from
-        // us and validates the id internally, returning `None` on any failure (handled by `unwrap_or`).
-        let (w, h) = unsafe { pf_win_display::win_display::active_resolution(target.target_id) }
-            .unwrap_or((pw, ph));
+        let (w, h) =
+            pf_win_display::win_display::active_resolution(target.target_id).unwrap_or((pw, ph));
         if (w, h) != (pw, ph) {
             tracing::info!(
                 target_id = target.target_id,

@@ -69,17 +69,13 @@ pub(super) fn kick_dwm_compose(target_id: u32) {
     let mut pos = POINT::default();
     // SAFETY: plain FFI; `pos` is a valid out-param for this synchronous call.
     let have_pos = unsafe { GetCursorPos(&mut pos) }.is_ok();
-    // SAFETY: `source_desktop_rect` only runs the CCD QueryDisplayConfig FFI over owned local
-    // buffers; the `Copy` target id crosses by value.
-    let rect = unsafe { pf_win_display::win_display::source_desktop_rect(target_id) };
+    let rect = pf_win_display::win_display::source_desktop_rect(target_id);
     // HID-first (see the doc comment): the registered virtual-mouse kick works from any
     // session/desktop and wakes an off display. Both geometries come from CCD (global database),
     // NOT per-session GDI metrics, so the aim is right even from a non-console session. Fall
     // through to SendInput only when the hook isn't registered / the mouse isn't up.
     if let (Some(kick), Some(rect)) = (crate::HID_COMPOSE_KICK.get(), rect) {
-        // SAFETY: `desktop_bounds` only runs the CCD QueryDisplayConfig FFI over owned local
-        // buffers.
-        let bounds = unsafe { pf_win_display::win_display::desktop_bounds() };
+        let bounds = pf_win_display::win_display::desktop_bounds();
         if let Some(bounds) = bounds {
             if kick(rect, bounds) {
                 return;

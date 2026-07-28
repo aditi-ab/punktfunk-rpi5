@@ -187,10 +187,7 @@ fn run(
             // transient CCD failure must not park the pointer at a `(0, 0, 0, 0)` rect, which would
             // report every position invisible.
             //
-            // SAFETY: `source_desktop_rect` is an `unsafe fn` running the read-only CCD
-            // `QueryDisplayConfig` over owned local buffers; the `Copy` target id crosses by value
-            // and it returns owned `(x, y, w, h)` values, borrowing nothing.
-            let fresh = unsafe { pf_win_display::win_display::source_desktop_rect(target_id) };
+            let fresh = pf_win_display::win_display::source_desktop_rect(target_id);
             if let Some(fresh) = fresh {
                 if fresh != rect {
                     tracing::info!(

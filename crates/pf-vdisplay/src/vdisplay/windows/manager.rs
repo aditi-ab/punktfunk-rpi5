@@ -193,9 +193,7 @@ enum ShrinkAction {
 fn poll_gdi_name(target_id: u32) -> Option<String> {
     for _ in 0..60 {
         thread::sleep(Duration::from_millis(50));
-        // SAFETY: `resolve_gdi_name` is `unsafe` for its CCD FFI; it takes a plain `Copy` `u32`
-        // target id by value and returns an owned `String`, so no caller memory is borrowed.
-        if let Some(n) = unsafe { resolve_gdi_name(target_id) } {
+        if let Some(n) = resolve_gdi_name(target_id) {
             return Some(n);
         }
     }
@@ -380,9 +378,7 @@ pub fn force_recommit() -> bool {
         return false;
     };
     let _guard = m.state.lock().unwrap();
-    // SAFETY: `force_mode_reenumeration`'s contract is "call under the manager `state` lock";
-    // held above. The call reads + re-applies the current CCD config over owned locals.
-    unsafe { pf_win_display::win_display::force_mode_reenumeration() }
+    pf_win_display::win_display::force_mode_reenumeration()
 }
 
 /// Best-effort "is this WUDFHost pid still alive?" — the monitor-liveness probe for the JOIN path.
@@ -561,9 +557,7 @@ impl VirtualDisplayManager {
                 // Let the OS finish the ASYNC monitor departure before the next ADD; a back-to-back
                 // REMOVE→ADD races the teardown and the ADD IOCTL is rejected under reconnect churn.
                 // Verified-state wait, ceiling = the old fixed 400 ms settle (latency plan P0.3).
-                // SAFETY: CCD query FFI over a `Copy` target id, under the held `state` lock.
-                let departed =
-                    unsafe { wait_target_departed(old_target, Duration::from_millis(400)) };
+                let departed = wait_target_departed(old_target, Duration::from_millis(400));
                 if !departed {
                     tracing::debug!(
                         old_target,
@@ -598,8 +592,7 @@ impl VirtualDisplayManager {
                 // is exclusively owned here — no aliasing.
                 unsafe { self.teardown_removed(dev, &mut inner, mon) };
                 // Same async-departure settle as the reconnect preempt above (verified wait, P0.3).
-                // SAFETY: CCD query FFI over a `Copy` target id, under the held `state` lock.
-                let _ = unsafe { wait_target_departed(old_target, Duration::from_millis(400)) };
+                let _ = wait_target_departed(old_target, Duration::from_millis(400));
             }
         }
 
@@ -902,10 +895,7 @@ impl VirtualDisplayManager {
                     if keep.is_empty() {
                         continue;
                     }
-                    // SAFETY: `count_other_active` runs the CCD QueryDisplayConfig FFI over a
-                    // borrowed slice of `Copy` target ids (owned result), under the `state` lock
-                    // (`inner` guard held to the end of this iteration).
-                    let survivors = unsafe { count_other_active(&keep) }.unwrap_or(0);
+                    let survivors = count_other_active(&keep).unwrap_or(0);
                     if survivors == 0 {
                         if fighting > 0 {
                             tracing::info!(
@@ -947,16 +937,7 @@ impl VirtualDisplayManager {
                             "re-asserting exclusive topology"
                         ),
                     }
-                    // SAFETY: `isolate_displays_ccd` drives the CCD query/apply FFI over a
-                    // borrowed slice of `Copy` target ids, under the `state` lock — the sole
-                    // topology mutator. The returned snapshot is discarded (the group restores
-                    // the FIRST member's). The FULL isolate on purpose — its forced re-commit
-                    // (SDC_FORCE_MODE_ENUMERATION → COMMIT_MODES → ASSIGN_SWAPCHAIN) is
-                    // load-bearing here exactly as at first isolate: after the eviction's
-                    // topology change the OS stops presenting to the virtual display until a
-                    // forced mode re-commit restarts it (on-glass: a gentle supplied-config
-                    // eviction left capture receiving ONE stashed frame and then nothing).
-                    let _ = unsafe { isolate_displays_ccd(&keep) };
+                    let _ = isolate_displays_ccd(&keep);
                     // That same forced re-commit hands the live IDD path a fresh swap-chain,
                     // orphaning the session's capture ring — announce it so the session rebuilds
                     // its capture attachment (same-mode ring recreate + driver re-attach + fresh
@@ -1014,9 +995,7 @@ impl VirtualDisplayManager {
             .zip(&placements)
             .map(|(&(_, _, target, _), p)| (target, p.x, p.y))
             .collect();
-        // SAFETY: `apply_source_positions` only drives the CCD query/apply FFI with owned local
-        // buffers, under the `state` lock — the sole topology mutator.
-        unsafe { pf_win_display::win_display::apply_source_positions(&positions) };
+        pf_win_display::win_display::apply_source_positions(&positions);
         for (&(slot, ..), p) in ordered.iter().zip(&placements) {
             if let Some(
                 SlotState::Active { mon, .. }
@@ -1071,14 +1050,11 @@ impl VirtualDisplayManager {
         if let Some(n) = poll_gdi_name(target_id) {
             return Some(n);
         }
-        // SAFETY: `force_extend_topology` only calls `SetDisplayConfig` (CCD) with no borrowed memory.
-        unsafe { force_extend_topology() };
+        force_extend_topology();
         if let Some(n) = poll_gdi_name(target_id) {
             return Some(n);
         }
-        // SAFETY: `activate_target_path` runs the CCD query/apply FFI with owned local buffers; the
-        // `Copy` target id is passed by value, under the `state` lock — the sole topology mutator.
-        if unsafe { pf_win_display::win_display::activate_target_path(target_id) } {
+        if pf_win_display::win_display::activate_target_path(target_id) {
             if let Some(n) = poll_gdi_name(target_id) {
                 return Some(n);
             }
@@ -1170,11 +1146,7 @@ impl VirtualDisplayManager {
                             if crate::policy::prefs().ddc_power_off() {
                                 inner.group.ddc_panels_off = crate::ddc::panel_off_except(n);
                             }
-                            // SAFETY: `isolate_displays_ccd` is `unsafe` for its CCD topology FFI; it
-                            // takes a borrowed slice of `Copy` target ids (alive across the call) and
-                            // returns an owned `SavedConfig`, under the `state` lock — the sole
-                            // topology mutator.
-                            inner.group.ccd_saved = unsafe { isolate_displays_ccd(&keep) };
+                            inner.group.ccd_saved = isolate_displays_ccd(&keep);
                             // EXPERIMENTAL `pnp_disable_monitors` policy axis: AFTER the isolate took,
                             // additionally disable the deactivated monitors' PnP devnodes (persistent
                             // across hot-plug re-arrival) so a standby monitor/TV's periodic wake
@@ -1199,9 +1171,7 @@ impl VirtualDisplayManager {
                             // Grown set: re-isolate so the fresh member joins the composited set
                             // (its auto-activate may have lit nothing extra to deactivate, but the
                             // re-commit also drives COMMIT_MODES for the new path).
-                            // SAFETY: as above — borrowed slice of Copy ids, owned return, under the
-                            // `state` lock.
-                            let snap = unsafe { isolate_displays_ccd(&keep) };
+                            let snap = isolate_displays_ccd(&keep);
                             // Normally DISCARDED — the group restores the FIRST member's snapshot.
                             // But if the first member's isolate FAILED, there is no first snapshot,
                             // and this one just deactivated the physicals with nothing able to put
@@ -1233,10 +1203,8 @@ impl VirtualDisplayManager {
                         // persistence DB, RESETTING a 120 Hz panel to 60 Hz. So force-EXTEND only when the
                         // virtual is currently sole; otherwise skip straight to the reposition, which
                         // re-supplies each physical's QUERIED mode verbatim (preserving its refresh).
-                        // SAFETY: `count_other_active` runs the CCD QueryDisplayConfig FFI (borrowed
-                        // slice of Copy ids, owned result), under the `state` lock.
                         let already_extended =
-                            unsafe { count_other_active(&[added.target_id]) }.unwrap_or(0) > 0;
+                            count_other_active(&[added.target_id]).unwrap_or(0) > 0;
                         if already_extended {
                             tracing::info!(
                                 "display topology=primary — a physical display is already active; \
@@ -1244,14 +1212,10 @@ impl VirtualDisplayManager {
                                  virtual primary"
                             );
                         } else {
-                            // SAFETY: `force_extend_topology` drives the CCD topology FFI (no args, no
-                            // borrowed memory), under the `state` lock — the sole topology mutator.
-                            unsafe { force_extend_topology() };
+                            force_extend_topology();
                             thread::sleep(Duration::from_millis(300));
                         }
-                        // SAFETY: `set_virtual_primary_ccd` takes the `Copy` target id by value and returns
-                        // an owned `SavedConfig` (no borrowed memory crosses), under the `state` lock.
-                        inner.group.ccd_saved = unsafe { set_virtual_primary_ccd(added.target_id) };
+                        inner.group.ccd_saved = set_virtual_primary_ccd(added.target_id);
                     }
                     Topology::Primary => {
                         // A sibling already holds primary (the group's designated member) — the new
@@ -1271,10 +1235,7 @@ impl VirtualDisplayManager {
                 // 1500 ms sleep (a rejected mode / slow third-party CCD-lock holder burns the
                 // ceiling and proceeds, exactly like the sleep it replaces).
                 let settle_start = std::time::Instant::now();
-                // SAFETY: CCD/GDI query FFI over a `Copy` target id, under the held `state` lock.
-                let settled = unsafe {
-                    wait_mode_settled(added.target_id, mode, Duration::from_millis(1500))
-                };
+                let settled = wait_mode_settled(added.target_id, mode, Duration::from_millis(1500));
                 tracing::info!(
                     settle_ms = settle_start.elapsed().as_millis() as u64,
                     verified = settled,
@@ -1391,8 +1352,7 @@ impl VirtualDisplayManager {
             // SAFETY: `dev` is the live control handle (this fn's contract); `update_modes`
             // forwards it to a synchronous IOCTL with owned/borrowed locals only.
             unsafe { self.driver.update_modes(dev, &mon.key, mode) }?;
-            // SAFETY: CCD query/apply FFI under the held `state` lock (this fn's contract).
-            unsafe { pf_win_display::win_display::force_mode_reenumeration() };
+            pf_win_display::win_display::force_mode_reenumeration();
             if !pf_win_display::win_display::wait_mode_advertised(
                 &gdi,
                 mode,
@@ -1414,9 +1374,7 @@ impl VirtualDisplayManager {
         // Verified-state settle (P0.2): the same committed-state predicate as the create paths. A
         // mode set that did not commit within the ceiling routes to the re-arrival fallback.
         let settle_start = Instant::now();
-        // SAFETY: CCD/GDI query FFI over a `Copy` target id, under the held `state` lock.
-        let settled =
-            unsafe { wait_mode_settled(mon.target_id, mode, Duration::from_millis(1500)) };
+        let settled = wait_mode_settled(mon.target_id, mode, Duration::from_millis(1500));
         if !settled {
             anyhow::bail!(
                 "in-place mode set did not commit within 1.5s (advertised after {advertised_ms} ms)"
@@ -1486,8 +1444,7 @@ impl VirtualDisplayManager {
         // the old fixed 400 ms settle (latency plan P0.3); the driver's ghost-reap ADD retry remains
         // the backstop for a departure the CCD reports early.
         let depart_start = std::time::Instant::now();
-        // SAFETY: CCD query FFI over a `Copy` target id, under the held `state` lock.
-        let departed = unsafe { wait_target_departed(old.target_id, Duration::from_millis(400)) };
+        let departed = wait_target_departed(old.target_id, Duration::from_millis(400));
         tracing::info!(
             depart_ms = depart_start.elapsed().as_millis() as u64,
             verified = departed,
@@ -1522,10 +1479,7 @@ impl VirtualDisplayManager {
                 // Topology settle before capture reopens: verified-state wait, ceiling = the old
                 // fixed 1500 ms sleep (latency plan P0.2 — the re-arrival twin).
                 let settle_start = std::time::Instant::now();
-                // SAFETY: CCD/GDI query FFI over a `Copy` target id, under the held `state` lock.
-                let settled = unsafe {
-                    wait_mode_settled(added.target_id, mode, Duration::from_millis(1500))
-                };
+                let settled = wait_mode_settled(added.target_id, mode, Duration::from_millis(1500));
                 tracing::info!(
                     settle_ms = settle_start.elapsed().as_millis() as u64,
                     verified = settled,
@@ -1574,16 +1528,14 @@ impl VirtualDisplayManager {
                 // snapshot is DISCARDED — the group keeps the first member's (design §6.1).
                 let mut keep = inner.target_ids();
                 keep.push(new_target);
-                // SAFETY: borrowed slice of Copy target ids, owned return, under the `state` lock.
-                let _ = unsafe { isolate_displays_ccd(&keep) };
+                let _ = isolate_displays_ccd(&keep);
             }
             Topology::Primary => {
                 // Make the new target primary again (its predecessor held primary), preserving the
                 // original restore snapshot: `set_virtual_primary_ccd` recaptures one, so save + restore
                 // the group's around the call.
                 let keep_saved = inner.group.ccd_saved.take();
-                // SAFETY: `Copy` target id by value, owned return, under the `state` lock.
-                let _ = unsafe { set_virtual_primary_ccd(new_target) };
+                let _ = set_virtual_primary_ccd(new_target);
                 inner.group.ccd_saved = keep_saved;
             }
             Topology::Extend | Topology::Auto => {
@@ -1645,14 +1597,7 @@ impl VirtualDisplayManager {
             // displays.
             inner.group.ccd_exclusive = false;
             if let Some(saved) = inner.group.ccd_saved.take() {
-                // SAFETY: `saved` is a `SavedConfig` this manager captured from
-                // `isolate_displays_ccd`/`set_virtual_primary_ccd` on this same box (it can be
-                // produced no other way), so its path+mode arrays are a self-consistent CCD
-                // topology and are passed with their own lengths. `restore_displays_ccd` binds
-                // itself to the input desktop internally (`retry_set_display_config`), which is
-                // the one thing its callers could otherwise get wrong. The `take()` above makes
-                // this the only consumer of that snapshot, so no second restore can race it.
-                unsafe { restore_displays_ccd(&saved) };
+                restore_displays_ccd(&saved);
             }
             // EXPERIMENTAL `ddc_power_off` wake. OUTSIDE the `ccd_saved` gate, for the same reason
             // `pnp_disabled` is above it: the panels were commanded dark BEFORE the isolate, and
@@ -1680,10 +1625,7 @@ impl VirtualDisplayManager {
                 // the group keeps the first member's.
                 ShrinkAction::Reisolate => {
                     let keep = inner.target_ids();
-                    // SAFETY: `isolate_displays_ccd` only drives the CCD query/apply FFI over a
-                    // borrowed slice of Copy target ids, under the `state` lock — the sole
-                    // topology mutator.
-                    let _ = unsafe { isolate_displays_ccd(&keep) };
+                    let _ = isolate_displays_ccd(&keep);
                 }
                 // Re-promote a survivor rather than leaving the desktop's primary on a target that
                 // is about to be REMOVEd. Same save/restore-the-snapshot dance as
@@ -1692,8 +1634,7 @@ impl VirtualDisplayManager {
                 ShrinkAction::RepromotePrimary => {
                     if let Some(&survivor) = inner.target_ids().first() {
                         let keep_saved = inner.group.ccd_saved.take();
-                        // SAFETY: `Copy` target id by value, owned return, under the `state` lock.
-                        let _ = unsafe { set_virtual_primary_ccd(survivor) };
+                        let _ = set_virtual_primary_ccd(survivor);
                         inner.group.ccd_saved = keep_saved;
                     }
                 }

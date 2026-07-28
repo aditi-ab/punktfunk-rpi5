@@ -910,8 +910,7 @@ mod tests {
         // Context probe: can this process see the CCD active-path set at all? (`None` = the query
         // itself fails in this session/window-station — the whole ladder would be blind, and a
         // "monitor never activated" verdict would be an artifact of the test context.)
-        // SAFETY: CCD query over an owned empty slice (test-only diagnostics).
-        let active0 = unsafe { pf_win_display::win_display::count_other_active(&[]) };
+        let active0 = pf_win_display::win_display::count_other_active(&[]);
         println!("spike: CCD active paths visible before create: {active0:?}");
         let mut vd = PfVdisplayDisplay::new().expect("open pf-vdisplay");
         let first = vd
@@ -943,8 +942,7 @@ mod tests {
             .expect("no capture target")
             .target_id;
         let in_place = t1 == t2;
-        // SAFETY: CCD query over a Copy target id (test-only diagnostics).
-        let active = unsafe { pf_win_display::win_display::active_resolution(t2) };
+        let active = pf_win_display::win_display::active_resolution(t2);
         println!(
             "in-place resize spike: in_place={in_place} (target {t1} -> {t2}) took {resize_ms} ms, \
              active resolution now {active:?}"

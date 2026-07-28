@@ -174,9 +174,7 @@ pub fn disable_for_deactivated(
 /// active flags it reads are the settled ones. Journals like [`disable_for_deactivated`]; the
 /// caller merges the returned ids into the same teardown list.
 pub fn disable_connected_inactive(keep_target_ids: &[u32]) -> Vec<String> {
-    // SAFETY: `target_inventory` only runs read-only CCD queries over local buffers (see its
-    // docs); no borrowed memory crosses the call.
-    let inventory = unsafe { crate::win_display::target_inventory() };
+    let inventory = crate::win_display::target_inventory();
     let mut targets: Vec<(String, String)> = Vec::new();
     for t in &inventory {
         if t.active || !t.external_physical || keep_target_ids.contains(&t.target_id) {

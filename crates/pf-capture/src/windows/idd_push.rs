@@ -791,13 +791,8 @@ impl IddPushCapturer {
             // Reading back immediately can catch a flip that has not settled yet; that costs one
             // debounce cycle (the poller re-samples in ~250 ms) and never a wrong ring, which is why
             // this does not block the frame path on a settle poll the way `open_on` does.
-            // SAFETY: both are `unsafe fn`s over CCD DisplayConfig; each takes a copy of the plain
-            // `u32` target id (plus a `bool`), forms no lasting borrow, and returns an owned value.
-            let requested =
-                unsafe { pf_win_display::win_display::set_advanced_color(self.target_id, want) };
-            // SAFETY: as above — a read-only CCD query over a copy of the plain `u32` target id.
-            let observed =
-                unsafe { pf_win_display::win_display::advanced_color_enabled(self.target_id) };
+            let requested = pf_win_display::win_display::set_advanced_color(self.target_id, want);
+            let observed = pf_win_display::win_display::advanced_color_enabled(self.target_id);
             // A failed READ is not evidence of a failed flip — keep the poller's sample then.
             now.hdr = observed.unwrap_or(now.hdr);
             if now.hdr != want && !self.hdr_pin_warned {
@@ -1129,9 +1124,7 @@ impl IddPushCapturer {
         if !self.display_hdr {
             return;
         }
-        // SAFETY: `sdr_white_level_scale` is an `unsafe fn` running a read-only CCD query over owned
-        // local buffers; the `Copy` target id crosses by value and it returns an owned value.
-        let queried = unsafe { pf_win_display::win_display::sdr_white_level_scale(self.target_id) };
+        let queried = pf_win_display::win_display::sdr_white_level_scale(self.target_id);
         self.sdr_white_scale = queried.unwrap_or(self.sdr_white_scale);
         tracing::info!(
             target_id = self.target_id,
@@ -1830,9 +1823,7 @@ impl Capturer for IddPushCapturer {
         // driver's stash (measured: new_fps=0 forever after the re-attach). CDS_RESET forces a
         // real mode-set at the CURRENT mode — the same lever bring-up's ADD path relies on —
         // and the ring recreate below then re-attaches after that churn, not before it.
-        // SAFETY: `resolve_gdi_name` runs the CCD query FFI over a `Copy` target id (owned
-        // return) — same contract as every sibling call in this file.
-        match unsafe { pf_win_display::win_display::resolve_gdi_name(self.target_id) } {
+        match pf_win_display::win_display::resolve_gdi_name(self.target_id) {
             Some(gdi) => {
                 if !pf_win_display::win_display::force_mode_reset(&gdi) {
                     tracing::warn!(

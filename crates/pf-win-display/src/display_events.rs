@@ -193,9 +193,7 @@ fn push_event(kind: DisplayEventKind, detail: Option<String>) {
 }
 
 fn refresh_inventory() {
-    // SAFETY: `target_inventory` only runs read-only CCD queries over locals (see its SAFETY doc);
-    // called from the listener thread, never the capture thread.
-    let inv = unsafe { crate::win_display::target_inventory() };
+    let inv = crate::win_display::target_inventory();
     if !inv.is_empty() {
         state().lock().unwrap().inventory = inv;
     }

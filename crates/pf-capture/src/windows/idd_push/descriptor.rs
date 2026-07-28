@@ -59,14 +59,10 @@ impl DescriptorPoller {
                 let mut last_slow_log: Option<Instant> = None;
                 while !stop_t.load(Ordering::Relaxed) {
                     let t = Instant::now();
-                    // SAFETY: both are read-only CCD queries taking only a copy of the plain `u32`
-                    // target id (see their own SAFETY docs); nothing is borrowed across the calls.
-                    let (hdr, res) = unsafe {
-                        (
+                    let (hdr, res) = (
                             pf_win_display::win_display::advanced_color_enabled(target_id),
                             pf_win_display::win_display::active_resolution(target_id),
-                        )
-                    };
+                        );
                     let took = t.elapsed();
                     if took >= Self::SLOW
                         && last_slow_log.is_none_or(|t| t.elapsed() >= Duration::from_secs(10))
