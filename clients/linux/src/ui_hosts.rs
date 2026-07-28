@@ -94,7 +94,8 @@ pub enum CardOutput {
     Pair(ConnectRequest),
     SpeedTest(ConnectRequest),
     Library(ConnectRequest),
-    Rename {
+    /// Open the host edit sheet (name, profile binding, clipboard).
+    Edit {
         fp_hex: String,
         name: String,
     },
@@ -323,7 +324,7 @@ impl relm4::factory::FactoryComponent for HostCard {
                     let (fp, name) = (k.fp_hex.clone(), k.name.clone());
                     add(
                         "rename",
-                        Box::new(move || CardOutput::Rename {
+                        Box::new(move || CardOutput::Edit {
                             fp_hex: fp.clone(),
                             name: name.clone(),
                         }),
@@ -502,7 +503,7 @@ impl relm4::factory::FactoryComponent for HostCard {
                         menu.append(Some("Browse library\u{2026}"), Some("card.library"));
                     }
                     menu.append(Some("Copy link"), Some("card.copy-link"));
-                    menu.append(Some("Rename\u{2026}"), Some("card.rename"));
+                    menu.append(Some("Edit\u{2026}"), Some("card.rename"));
                     menu.append(Some("Forget"), Some("card.forget"));
                 }
                 let menu_btn = gtk::MenuButton::builder()
@@ -884,7 +885,7 @@ impl SimpleComponent for HostsPage {
                     let mgmt = self.mgmt_port_for(&req);
                     let _ = sender.output(HostsOutput::Library(req, mgmt));
                 }
-                CardOutput::Rename { fp_hex, name } => self.rename_dialog(&sender, &fp_hex, &name),
+                CardOutput::Edit { fp_hex, name } => self.edit_host_dialog(&sender, &fp_hex, &name),
                 CardOutput::Forget { fp_hex, name } => self.forget_dialog(&sender, &fp_hex, &name),
                 CardOutput::Wake { mac, addr } => crate::wol::wake(&mac, addr.parse().ok()),
                 CardOutput::BindProfile {
@@ -1072,28 +1073,83 @@ impl HostsPage {
     }
 
     /// Rename a saved host — an entry in an alert, then upsert + refresh.
-    fn rename_dialog(&self, sender: &ComponentSender<Self>, fp_hex: &str, current: &str) {
-        let entry = gtk::Entry::builder()
-            .text(current)
-            .activates_default(true)
+    /// The host edit sheet — the per-host settings that are properties of the HOST, not of
+    /// the stream: its name, whether this machine shares its clipboard with it, and which
+    /// settings profile it defaults to.
+    ///
+    /// Linux had only "Rename" until now; the clipboard toggle in particular existed in the
+    /// store and on the Apple and Windows clients but had no Linux surface at all, so a Linux
+    /// user could not turn on a feature they were already paying the storage for.
+    fn edit_host_dialog(&self, sender: &ComponentSender<Self>, fp_hex: &str, current: &str) {
+        let stored = KnownHosts::load()
+            .hosts
+            .iter()
+            .find(|h| h.fp_hex == fp_hex)
+            .cloned();
+        let name_row = adw::EntryRow::builder().title("Name").build();
+        name_row.set_text(current);
+        let clipboard_row = adw::SwitchRow::builder()
+            .title("Share clipboard")
+            .subtitle(
+                "Copy and paste between this machine and that host. Per host \u{2014} handing a \
+                 host your clipboard is a decision about that host.",
+            )
             .build();
-        let dialog = adw::AlertDialog::new(Some("Rename Host"), None);
-        dialog.set_extra_child(Some(&entry));
-        dialog.add_responses(&[("cancel", "Cancel"), ("rename", "Rename")]);
-        dialog.set_response_appearance("rename", adw::ResponseAppearance::Suggested);
-        dialog.set_default_response(Some("rename"));
+        clipboard_row.set_active(stored.as_ref().is_some_and(|h| h.clipboard_sync));
+
+        // Profile picker: "Default settings" plus the catalog, seeded to the current binding.
+        let catalog = pf_client_core::profiles::ProfilesFile::load();
+        let mut labels = vec!["Default settings".to_string()];
+        let mut ids: Vec<String> = vec![String::new()];
+        for p in &catalog.profiles {
+            labels.push(p.name.clone());
+            ids.push(p.id.clone());
+        }
+        let bound = stored.as_ref().and_then(|h| h.profile_id.clone());
+        // A binding whose profile is gone reads as Default settings and is cleaned up on save
+        // — the same "dangling resolves as none" rule the connect path follows.
+        let selected = bound
+            .as_ref()
+            .and_then(|id| ids.iter().position(|i| i == id))
+            .unwrap_or(0);
+        let profile_row = adw::ComboRow::builder()
+            .title("Profile")
+            .subtitle("The settings a plain click uses for this host")
+            .model(&gtk::StringList::new(
+                &labels.iter().map(String::as_str).collect::<Vec<_>>(),
+            ))
+            .build();
+        profile_row.set_selected(selected as u32);
+
+        let list = gtk::ListBox::builder()
+            .selection_mode(gtk::SelectionMode::None)
+            .css_classes(["boxed-list"])
+            .build();
+        list.append(&name_row);
+        list.append(&profile_row);
+        list.append(&clipboard_row);
+
+        let dialog = adw::AlertDialog::new(Some("Edit Host"), None);
+        dialog.set_extra_child(Some(&list));
+        dialog.add_responses(&[("cancel", "Cancel"), ("save", "Save")]);
+        dialog.set_response_appearance("save", adw::ResponseAppearance::Suggested);
+        dialog.set_default_response(Some("save"));
         dialog.set_close_response("cancel");
         {
             let sender = sender.clone();
             let fp = fp_hex.to_string();
-            dialog.connect_response(Some("rename"), move |_, _| {
-                let name = entry.text().trim().to_string();
-                if name.is_empty() {
-                    return;
-                }
+            dialog.connect_response(Some("save"), move |_, _| {
+                let name = name_row.text().trim().to_string();
                 let mut known = KnownHosts::load();
                 if let Some(h) = known.hosts.iter_mut().find(|h| h.fp_hex == fp) {
-                    h.name = name;
+                    if !name.is_empty() {
+                        h.name = name;
+                    }
+                    h.clipboard_sync = clipboard_row.is_active();
+                    h.profile_id = ids
+                        .get(profile_row.selected() as usize)
+                        .filter(|id| !id.is_empty())
+                        .cloned();
                     let _ = known.save();
                 }
                 sender.input(HostsMsg::Refresh);
