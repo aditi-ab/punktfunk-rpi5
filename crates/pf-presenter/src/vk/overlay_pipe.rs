@@ -32,6 +32,8 @@ impl OverlayPipe {
             .dst_access_mask(
                 vk::AccessFlags::COLOR_ATTACHMENT_READ | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
             )];
+        // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this
+        // type and live for the call, and every builder struct is a local that outlives it.
         let render_pass = unsafe {
             device.create_render_pass(
                 &vk::RenderPassCreateInfo::default()
@@ -43,6 +45,8 @@ impl OverlayPipe {
         }
         .context("overlay render pass")?;
 
+        // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this
+        // type and live for the call, and every builder struct is a local that outlives it.
         let sampler = unsafe {
             device.create_sampler(
                 &vk::SamplerCreateInfo::default()
@@ -61,6 +65,8 @@ impl OverlayPipe {
             .descriptor_count(1)
             .stage_flags(vk::ShaderStageFlags::FRAGMENT)
             .immutable_samplers(&samplers)];
+        // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this
+        // type and live for the call, and every builder struct is a local that outlives it.
         let set_layout = unsafe {
             device.create_descriptor_set_layout(
                 &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
@@ -68,6 +74,8 @@ impl OverlayPipe {
             )
         }?;
         let set_layouts = [set_layout];
+        // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this
+        // type and live for the call, and every builder struct is a local that outlives it.
         let pipeline_layout = unsafe {
             device.create_pipeline_layout(
                 &vk::PipelineLayoutCreateInfo::default().set_layouts(&set_layouts),
@@ -77,6 +85,8 @@ impl OverlayPipe {
         let pool_sizes = [vk::DescriptorPoolSize::default()
             .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
             .descriptor_count(1)];
+        // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this
+        // type and live for the call, and every builder struct is a local that outlives it.
         let desc_pool = unsafe {
             device.create_descriptor_pool(
                 &vk::DescriptorPoolCreateInfo::default()
@@ -85,6 +95,8 @@ impl OverlayPipe {
                 None,
             )
         }?;
+        // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this
+        // type and live for the call, and every builder struct is a local that outlives it.
         let desc_set = unsafe {
             device.allocate_descriptor_sets(
                 &vk::DescriptorSetAllocateInfo::default()
@@ -131,6 +143,9 @@ impl OverlayPipe {
     ) -> Result<()> {
         self.destroy_targets(device); // no-op after take_targets; safety net otherwise
         for &image in images {
+            // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by
+            // this type and live for the call, and every builder struct is a local that outlives
+            // it.
             let view = unsafe {
                 device.create_image_view(
                     &vk::ImageViewCreateInfo::default()
@@ -143,6 +158,9 @@ impl OverlayPipe {
             }?;
             self.views.push(view);
             let attachments = [view];
+            // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by
+            // this type and live for the call, and every builder struct is a local that outlives
+            // it.
             let fb = unsafe {
                 device.create_framebuffer(
                     &vk::FramebufferCreateInfo::default()
@@ -160,6 +178,8 @@ impl OverlayPipe {
     }
 
     fn destroy_targets(&mut self, device: &ash::Device) {
+        // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this
+        // type and live for the call, and every builder struct is a local that outlives it.
         unsafe {
             for fb in self.framebuffers.drain(..) {
                 device.destroy_framebuffer(fb, None);
@@ -172,6 +192,10 @@ impl OverlayPipe {
 
     pub(super) fn destroy(&mut self, device: &ash::Device) {
         self.destroy_targets(device);
+        // SAFETY: per the Vulkan contract above - this destroys objects this type owns, and the
+        // GPU is known idle for them (the fence/queue-wait on the path here, or the swapchain
+        // being retired), which is the obligation that makes a destroy sound rather than the
+        // handle merely being non-null.
         unsafe {
             device.destroy_pipeline(self.pipeline, None);
             device.destroy_pipeline_layout(self.pipeline_layout, None);

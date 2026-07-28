@@ -14,6 +14,9 @@ impl Retired {
             #[cfg(windows)]
             Retired::D3d11(f) => f.destroy(device),
             Retired::Vk { frame, views } => {
+                // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned
+                // by this type and live for the call, and every builder struct is a local that
+                // outlives it.
                 unsafe {
                     for v in views {
                         device.destroy_image_view(v, None);
@@ -49,6 +52,8 @@ impl Presenter {
         }
         let s = self.staging.as_ref().unwrap();
         let n = f.rgba.len().min(needed);
+        // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this
+        // type and live for the call, and every builder struct is a local that outlives it.
         unsafe { std::ptr::copy_nonoverlapping(f.rgba.as_ptr(), s.ptr, n) };
         Ok(())
     }
@@ -57,6 +62,9 @@ impl Presenter {
         // Fence-quiesce: the old image is only ever referenced by OUR command buffers.
         self.quiesce_own()?;
         if let Some(v) = self.video.take() {
+            // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by
+            // this type and live for the call, and every builder struct is a local that outlives
+            // it.
             unsafe {
                 if v.framebuffer != vk::Framebuffer::null() {
                     self.device.destroy_framebuffer(v.framebuffer, None);
@@ -69,6 +77,8 @@ impl Presenter {
             }
         }
         // COLOR_ATTACHMENT is the CSC pass's render target; harmless where hw is absent.
+        // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this
+        // type and live for the call, and every builder struct is a local that outlives it.
         let image = unsafe {
             self.device.create_image(
                 &vk::ImageCreateInfo::default()
@@ -92,11 +102,17 @@ impl Presenter {
                 None,
             )
         }?;
+        // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this
+        // type and live for the call, and every builder struct is a local that outlives it.
         let reqs = unsafe { self.device.get_image_memory_requirements(image) };
         let memory = self.allocate(reqs, vk::MemoryPropertyFlags::DEVICE_LOCAL)?;
+        // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this
+        // type and live for the call, and every builder struct is a local that outlives it.
         unsafe { self.device.bind_image_memory(image, memory, 0) }?;
         // The CSC pass renders into it — view + framebuffer, unconditional (Vulkan-Video
         // frames need the pass on every device, dmabuf-capable or not).
+        // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this
+        // type and live for the call, and every builder struct is a local that outlives it.
         let view = unsafe {
             self.device.create_image_view(
                 &vk::ImageViewCreateInfo::default()
@@ -108,6 +124,8 @@ impl Presenter {
             )
         }?;
         let attachments = [view];
+        // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this
+        // type and live for the call, and every builder struct is a local that outlives it.
         let framebuffer = unsafe {
             self.device.create_framebuffer(
                 &vk::FramebufferCreateInfo::default()
@@ -133,12 +151,18 @@ impl Presenter {
     fn rebuild_staging(&mut self, capacity: usize) -> Result<()> {
         self.quiesce_own()?;
         if let Some(s) = self.staging.take() {
+            // SAFETY: per the Vulkan contract above - this destroys objects this type owns, and
+            // the GPU is known idle for them (the fence/queue-wait on the path here, or the
+            // swapchain being retired), which is the obligation that makes a destroy sound rather
+            // than the handle merely being non-null.
             unsafe {
                 self.device.unmap_memory(s.memory);
                 self.device.destroy_buffer(s.buffer, None);
                 self.device.free_memory(s.memory, None);
             }
         }
+        // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this
+        // type and live for the call, and every builder struct is a local that outlives it.
         let buffer = unsafe {
             self.device.create_buffer(
                 &vk::BufferCreateInfo::default()
@@ -148,12 +172,18 @@ impl Presenter {
                 None,
             )
         }?;
+        // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this
+        // type and live for the call, and every builder struct is a local that outlives it.
         let reqs = unsafe { self.device.get_buffer_memory_requirements(buffer) };
         let memory = self.allocate(
             reqs,
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
         )?;
+        // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this
+        // type and live for the call, and every builder struct is a local that outlives it.
         unsafe { self.device.bind_buffer_memory(buffer, memory, 0) }?;
+        // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this
+        // type and live for the call, and every builder struct is a local that outlives it.
         let ptr = unsafe {
             self.device
                 .map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())

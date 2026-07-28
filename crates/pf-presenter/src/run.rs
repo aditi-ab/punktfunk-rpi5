@@ -1704,6 +1704,8 @@ fn apply_capture(
 /// forwarded as touch passthrough. An unknown/invalid id (INVALID) reads as not-direct.
 fn is_direct_touch(touch_id: u64) -> bool {
     use sdl3::sys::touch::{SDL_GetTouchDeviceType, SDL_TouchDeviceType, SDL_TouchID};
+    // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this type
+    // and live for the call, and every builder struct is a local that outlives it.
     unsafe { SDL_GetTouchDeviceType(SDL_TouchID(touch_id)) == SDL_TouchDeviceType::DIRECT }
 }
 

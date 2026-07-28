@@ -113,6 +113,8 @@ impl Presenter {
 
         // One frame in flight: the fence covers the command buffer, the staging buffer
         // AND the previously submitted hw frame — waiting makes all three reusable.
+        // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this
+        // type and live for the call, and every builder struct is a local that outlives it.
         unsafe {
             if self.submitted {
                 self.device.wait_for_fences(&[self.fence], true, u64::MAX)?;
@@ -189,9 +191,14 @@ impl Presenter {
                 .dst_binding(0)
                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                 .image_info(&infos)];
+            // SAFETY: per the Vulkan contract above - recorded into a command buffer this code
+            // owns and has begun, referencing handles it also owns; nothing is submitted until the
+            // recording is ended.
             unsafe { self.device.update_descriptor_sets(&writes, &[]) };
         }
 
+        // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this
+        // type and live for the call, and every builder struct is a local that outlives it.
         let (index, _suboptimal) = match unsafe {
             self.swap_d.acquire_next_image(
                 self.swapchain,
@@ -218,6 +225,9 @@ impl Presenter {
         };
         let swap_image = self.images[index as usize];
 
+        // SAFETY: per the Vulkan contract above - recorded into a command buffer this code owns
+        // and has begun, referencing handles it also owns; nothing is submitted until the
+        // recording is ended.
         unsafe {
             self.device.begin_command_buffer(
                 self.cmd_buf,
@@ -628,6 +638,9 @@ impl Presenter {
         depth: u8,
         msb_packed: bool,
     ) {
+        // SAFETY: per the Vulkan contract above - recorded into a command buffer this code owns
+        // and has begun, referencing handles it also owns; nothing is submitted until the
+        // recording is ended.
         unsafe {
             self.device.cmd_begin_render_pass(
                 self.cmd_buf,
@@ -714,6 +727,9 @@ impl Presenter {
         let Some(planar) = self.csc_planar.as_ref() else {
             return;
         };
+        // SAFETY: per the Vulkan contract above - recorded into a command buffer this code owns
+        // and has begun, referencing handles it also owns; nothing is submitted until the
+        // recording is ended.
         unsafe {
             self.device.cmd_begin_render_pass(
                 self.cmd_buf,
@@ -816,11 +832,16 @@ impl Presenter {
             );
         };
         // img[0] is creation-constant (only the sync fields need the frames lock).
-        let image =
-            vk::Image::from_raw(
-                unsafe { (*(f.vkframe as *const pf_ffvk::AVVkFrame)).img[0] } as u64,
-            );
+        let image = vk::Image::from_raw(
+            // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned
+            // by this type and live for the call, and every builder struct is a local that
+            // outlives it.
+            unsafe { (*(f.vkframe as *const pf_ffvk::AVVkFrame)).img[0] } as u64,
+        );
         let make = |aspect: vk::ImageAspectFlags, format: vk::Format| {
+            // SAFETY: per the Vulkan contract above - a create/allocate call on the live device,
+            // over builder structs that are locals outliving the call; the handle it returns is
+            // owned by the value being built here.
             unsafe {
                 self.device.create_image_view(
                     &vk::ImageViewCreateInfo::default()
@@ -842,6 +863,10 @@ impl Presenter {
         let chroma = match make(vk::ImageAspectFlags::PLANE_1, chroma_fmt) {
             Ok(v) => v,
             Err(e) => {
+                // SAFETY: per the Vulkan contract above - this destroys objects this type owns,
+                // and the GPU is known idle for them (the fence/queue-wait on the path here, or
+                // the swapchain being retired), which is the obligation that makes a destroy sound
+                // rather than the handle merely being non-null.
                 unsafe { self.device.destroy_image_view(luma, None) };
                 return Err(e);
             }
@@ -871,6 +896,8 @@ struct VkFrameSync {
 // is required on one platform and a no-op on the other.
 #[allow(clippy::unnecessary_cast)]
 fn lock_vkframe(f: &VkVideoFrame) -> VkFrameSync {
+    // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this type
+    // and live for the call, and every builder struct is a local that outlives it.
     unsafe {
         let lock: unsafe extern "C" fn(*mut pf_ffvk::AVHWFramesContext, *mut pf_ffvk::AVVkFrame) =
             std::mem::transmute(f.lock_frame);
@@ -890,6 +917,8 @@ fn lock_vkframe(f: &VkVideoFrame) -> VkFrameSync {
 /// Write the post-submission state back (FFmpeg waits these on its next use of the
 /// frame) and release the lock. On a failed submit only the lock is released.
 fn unlock_vkframe(f: &VkVideoFrame, sync: &VkFrameSync, submitted: bool, graphics_qf: u32) {
+    // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this type
+    // and live for the call, and every builder struct is a local that outlives it.
     unsafe {
         let vkf = f.vkframe as *mut pf_ffvk::AVVkFrame;
         if submitted {

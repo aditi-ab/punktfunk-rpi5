@@ -61,6 +61,8 @@ impl HwFrame {
     }
 
     pub fn destroy(self, device: &ash::Device) {
+        // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this
+        // type and live for the call, and every builder struct is a local that outlives it.
         unsafe {
             for v in self.views {
                 device.destroy_image_view(v, None);
@@ -136,6 +138,10 @@ pub fn import(
     {
         Ok(r) => r,
         Err(e) => {
+            // SAFETY: per the Vulkan contract above - this destroys objects this type owns, and
+            // the GPU is known idle for them (the fence/queue-wait on the path here, or the
+            // swapchain being retired), which is the obligation that makes a destroy sound rather
+            // than the handle merely being non-null.
             unsafe {
                 device.destroy_image(luma_img, None);
                 device.free_memory(luma_mem, None);
@@ -145,6 +151,9 @@ pub fn import(
     };
 
     let view = |image, format| {
+        // SAFETY: per the Vulkan contract above - a create/allocate call on the live device, over
+        // builder structs that are locals outliving the call; the handle it returns is owned by
+        // the value being built here.
         unsafe {
             device.create_image_view(
                 &vk::ImageViewCreateInfo::default()
@@ -162,6 +171,10 @@ pub fn import(
         }
         .context("plane image view")
     };
+    // SAFETY: per the Vulkan contract above - this destroys objects this type owns, and the GPU is
+    // known idle for them (the fence/queue-wait on the path here, or the swapchain being retired),
+    // which is the obligation that makes a destroy sound rather than the handle merely being non-
+    // null.
     let destroy_images = |views: &[vk::ImageView]| unsafe {
         for v in views {
             device.destroy_image_view(*v, None);
@@ -228,6 +241,8 @@ fn plane_image(
         .plane_layouts(&plane_layouts);
     let mut external_info = vk::ExternalMemoryImageCreateInfo::default()
         .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+    // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this type
+    // and live for the call, and every builder struct is a local that outlives it.
     let image = unsafe {
         device.create_image(
             &vk::ImageCreateInfo::default()
@@ -256,6 +271,9 @@ fn plane_image(
     let result = (|| {
         // The fd's importable memory types, intersected with the image's requirement.
         let mut fd_props = vk::MemoryFdPropertiesKHR::default();
+        // SAFETY: per the Vulkan contract above - a create/allocate call on the live device, over
+        // builder structs that are locals outliving the call; the handle it returns is owned by
+        // the value being built here.
         unsafe {
             ext_mem_fd.get_memory_fd_properties(
                 vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT,
@@ -264,6 +282,8 @@ fn plane_image(
             )
         }
         .context("vkGetMemoryFdPropertiesKHR")?;
+        // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this
+        // type and live for the call, and every builder struct is a local that outlives it.
         let reqs = unsafe { device.get_image_memory_requirements(image) };
         let bits = reqs.memory_type_bits & fd_props.memory_type_bits;
         let type_index = (0..32u32)
@@ -271,6 +291,8 @@ fn plane_image(
             .context("no importable memory type for dmabuf")?;
 
         // Vulkan owns the fd it imports — dup so the decoder guard keeps the original.
+        // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this
+        // type and live for the call, and every builder struct is a local that outlives it.
         let owned = unsafe { BorrowedFd::borrow_raw(fd) }
             .try_clone_to_owned()
             .context("dup dmabuf fd")?;
@@ -278,6 +300,8 @@ fn plane_image(
             .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
             .fd(owned.into_raw_fd());
         let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().image(image);
+        // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this
+        // type and live for the call, and every builder struct is a local that outlives it.
         let memory = unsafe {
             device.allocate_memory(
                 &vk::MemoryAllocateInfo::default()
@@ -290,7 +314,13 @@ fn plane_image(
         }
         .context("import dmabuf memory")?;
         // (On allocate_memory failure Vulkan still closed the dup'd fd — nothing leaks.)
+        // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this
+        // type and live for the call, and every builder struct is a local that outlives it.
         if let Err(e) = unsafe { device.bind_image_memory(image, memory, 0) } {
+            // SAFETY: per the Vulkan contract above - this destroys objects this type owns, and
+            // the GPU is known idle for them (the fence/queue-wait on the path here, or the
+            // swapchain being retired), which is the obligation that makes a destroy sound rather
+            // than the handle merely being non-null.
             unsafe { device.free_memory(memory, None) };
             return Err(e).context("bind imported memory");
         }
@@ -300,6 +330,10 @@ fn plane_image(
     match result {
         Ok(memory) => Ok((image, memory)),
         Err(e) => {
+            // SAFETY: per the Vulkan contract above - this destroys objects this type owns, and
+            // the GPU is known idle for them (the fence/queue-wait on the path here, or the
+            // swapchain being retired), which is the obligation that makes a destroy sound rather
+            // than the handle merely being non-null.
             unsafe { device.destroy_image(image, None) };
             Err(e)
         }

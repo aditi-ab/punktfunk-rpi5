@@ -93,6 +93,10 @@ fn send_one_uso(socket: &std::net::UdpSocket, buf: &[u8], seg_size: u16) -> std:
     };
     let cmsg_len = cmsgdata_align(hdr) + std::mem::size_of::<u32>(); // WSA_CMSG_LEN(4)
     let space = cmsgdata_align(hdr + cmsghdr_align(std::mem::size_of::<u32>())); // WSA_CMSG_SPACE(4)
+                                                                                 // SAFETY: `ctrl` is a local control buffer sized by `WSA_CMSG_SPACE(4)` — computed as `space`
+                                                                                 // just above — so the header plus its 4-byte payload fit inside it and neither the field stores
+                                                                                 // nor the unaligned data write can run past the end. `write_unaligned` is used because the
+                                                                                 // payload sits at a `WSA_CMSG_DATA` offset with no alignment guarantee.
     unsafe {
         let cmsg = ctrl.0.as_mut_ptr() as *mut CMSGHDR;
         (*cmsg).cmsg_len = cmsg_len;

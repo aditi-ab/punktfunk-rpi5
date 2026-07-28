@@ -30,6 +30,9 @@ const APP_USER_MODEL_ID: *const u16 = w!("unom.punktfunk.client");
 /// process already carries the MSIX identity, which must win). Call before any window
 /// exists; later calls don't re-tag existing windows.
 pub(crate) fn set_app_user_model_id() {
+    // SAFETY: `GetCurrentPackageFullName` is called with `len = 0` and a NULL buffer, which is the
+    // documented identity PROBE — it writes nothing and only reports whether the process is
+    // packaged. `SetCurrentProcessExplicitAppUserModelID` takes a static wide literal.
     unsafe {
         let mut len: u32 = 0;
         // No buffer: just probe whether the process has package identity.
@@ -43,6 +46,9 @@ pub(crate) fn set_app_user_model_id() {
 /// Stamp the exe-embedded icon (resource ordinal 1) onto the SDL window's title bar,
 /// taskbar and Alt-Tab. A quiet no-op when the exe embeds no icon.
 pub(crate) fn stamp_window_icon(window: &sdl3::video::Window) {
+    // SAFETY: the SDL property lookups return the `HWND` SDL itself owns for this live `window`
+    // borrow; the icon calls only pass that handle and a resource ordinal back to Win32, and every
+    // result is checked before use.
     unsafe {
         // The HWND behind the SDL window, via SDL3's window properties (the same route
         // the sdl3 crate's raw-window-handle integration takes).

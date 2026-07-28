@@ -38,6 +38,10 @@ fn qos_handle() -> Option<HANDLE> {
         // SAFETY: both pointers are valid for the duration of the synchronous call.
         if unsafe { QOSCreateHandle(&version, &mut handle) } == 0 {
             tracing::debug!(
+                // SAFETY: `GetLastError` takes no arguments and reads this thread's own last-error
+                // slot; it is called immediately after the failing call, before anything can reset it.
+                // SAFETY: `GetLastError` takes no arguments and reads this thread's own last-error
+                // slot; it is called immediately after the failing call, before anything can reset it.
                 err = unsafe { GetLastError() },
                 "QOSCreateHandle failed — qWAVE DSCP marking unavailable"
             );
@@ -95,6 +99,8 @@ pub(super) fn add_media_flow(socket: &UdpSocket, class: MediaClass) -> Option<Qo
     };
     if ok == 0 {
         tracing::debug!(
+            // SAFETY: `GetLastError` takes no arguments and reads this thread's own last-error
+            // slot; it is called immediately after the failing call, before anything can reset it.
             err = unsafe { GetLastError() },
             ?class,
             "QOSAddSocketToFlow failed — DSCP marking skipped"
@@ -124,6 +130,8 @@ pub(super) fn add_media_flow(socket: &UdpSocket, class: MediaClass) -> Option<Qo
     };
     if ok == 0 {
         tracing::debug!(
+            // SAFETY: `GetLastError` takes no arguments and reads this thread's own last-error
+            // slot; it is called immediately after the failing call, before anything can reset it.
             err = unsafe { GetLastError() },
             ?class,
             "QOSSetFlow(OutgoingDSCPValue) refused — traffic-type default marking stands"

@@ -47,10 +47,15 @@ impl Presenter {
         // the stream for a frame, and only happens on resize/HDR-flip/OUT_OF_DATE.
         {
             let _q = self.queue_lock.guard();
+            // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by
+            // this type and live for the call, and every builder struct is a local that outlives
+            // it.
             unsafe { self.device.queue_wait_idle(self.queue) }
                 .context("vkQueueWaitIdle (swapchain recreate)")?;
         }
 
+        // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this
+        // type and live for the call, and every builder struct is a local that outlives it.
         let caps = unsafe {
             self.surface_i
                 .get_physical_device_surface_capabilities(self.pdev, self.surface)
@@ -91,6 +96,9 @@ impl Presenter {
             .present_mode(self.present_mode)
             .clipped(true)
             .old_swapchain(old);
+        // SAFETY: per the Vulkan contract above - a create/allocate call on the live device, over
+        // builder structs that are locals outliving the call; the handle it returns is owned by
+        // the value being built here.
         let swapchain = unsafe { self.swap_d.create_swapchain(&info, None) }
             .map_err(|e| anyhow!("vkCreateSwapchainKHR: {e}{}", kmsdrm_swapchain_hint()))?;
         // The old swapchain and everything tied to its images dies NOW: the fence
@@ -105,6 +113,8 @@ impl Presenter {
         // An unclaimed last present belonged to the dying swapchain — drop the claim.
         self.last_presented = None;
         let (overlay_views, overlay_framebuffers) = self.overlay_pipe.take_targets();
+        // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this
+        // type and live for the call, and every builder struct is a local that outlives it.
         unsafe {
             for fb in overlay_framebuffers {
                 self.device.destroy_framebuffer(fb, None);
@@ -120,6 +130,8 @@ impl Presenter {
             }
         }
         self.swapchain = swapchain;
+        // SAFETY: per the Vulkan contract above - a read-only query on the live instance/device,
+        // filling locals returned by value.
         self.images = unsafe { self.swap_d.get_swapchain_images(swapchain) }?;
         self.extent = extent;
         self.overlay_pipe.rebuild_targets(
@@ -130,6 +142,9 @@ impl Presenter {
         )?;
 
         for _ in 0..self.images.len() {
+            // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by
+            // this type and live for the call, and every builder struct is a local that outlives
+            // it.
             self.render_sems.push(unsafe {
                 self.device
                     .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
@@ -205,6 +220,8 @@ impl Presenter {
             .min_luminance(m.min_display_mastering_luminance as f32 / 10_000.0)
             .max_content_light_level(m.max_cll as f32)
             .max_frame_average_light_level(m.max_fall as f32);
+        // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this
+        // type and live for the call, and every builder struct is a local that outlives it.
         unsafe { ext.set_hdr_metadata(&[self.swapchain], &[md]) };
         tracing::debug!(from_host = self.hdr_meta.is_some(), "HDR metadata pushed");
     }
@@ -238,6 +255,10 @@ impl Presenter {
             self.csc_planar = Some(CscPass::new_planar(&self.device, self.video_format)?);
         }
         if let Some(v) = self.video.take() {
+            // SAFETY: per the Vulkan contract above - this destroys objects this type owns, and
+            // the GPU is known idle for them (the fence/queue-wait on the path here, or the
+            // swapchain being retired), which is the obligation that makes a destroy sound rather
+            // than the handle merely being non-null.
             unsafe {
                 self.device.destroy_framebuffer(v.framebuffer, None);
                 self.device.destroy_image_view(v.view, None);
@@ -254,6 +275,8 @@ impl Presenter {
             OverlayPipe::new(&self.device, target.format)?,
         );
         let (overlay_views, overlay_framebuffers) = old_pipe.take_targets();
+        // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this
+        // type and live for the call, and every builder struct is a local that outlives it.
         unsafe {
             for fb in overlay_framebuffers {
                 self.device.destroy_framebuffer(fb, None);

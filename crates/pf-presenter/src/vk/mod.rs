@@ -230,6 +230,8 @@ impl Presenter {
     /// The queue lock is held as cheap insurance against a straggling submitter.
     pub fn wait_idle(&self) {
         let _q = self.queue_lock.guard();
+        // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this
+        // type and live for the call, and every builder struct is a local that outlives it.
         unsafe { self.device.device_wait_idle() }.ok();
     }
 
@@ -278,6 +280,8 @@ impl Drop for Presenter {
         // after in-flight waits complete, bounded by their 250 ms cap) BEFORE the
         // swapchain teardown below.
         self.present_timer.take();
+        // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this
+        // type and live for the call, and every builder struct is a local that outlives it.
         unsafe {
             {
                 // Insurance against a straggling submitter (the run loop joins the

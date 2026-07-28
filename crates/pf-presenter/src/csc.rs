@@ -91,6 +91,8 @@ impl CscPass {
                 .dst_stage_mask(vk::PipelineStageFlags::TRANSFER)
                 .dst_access_mask(vk::AccessFlags::TRANSFER_READ),
         ];
+        // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this
+        // type and live for the call, and every builder struct is a local that outlives it.
         let render_pass = unsafe {
             device.create_render_pass(
                 &vk::RenderPassCreateInfo::default()
@@ -102,6 +104,8 @@ impl CscPass {
         }
         .context("CSC render pass")?;
 
+        // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this
+        // type and live for the call, and every builder struct is a local that outlives it.
         let sampler = unsafe {
             device.create_sampler(
                 &vk::SamplerCreateInfo::default()
@@ -125,6 +129,8 @@ impl CscPass {
                     .immutable_samplers(&samplers)
             })
             .collect();
+        // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this
+        // type and live for the call, and every builder struct is a local that outlives it.
         let set_layout = unsafe {
             device.create_descriptor_set_layout(
                 &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
@@ -135,6 +141,8 @@ impl CscPass {
         let push = [vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::FRAGMENT)
             .size(64)]; // three vec4 rows + a params vec4 (mode, tonemap peak)
+                        // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this
+                        // type and live for the call, and every builder struct is a local that outlives it.
         let pipeline_layout = unsafe {
             device.create_pipeline_layout(
                 &vk::PipelineLayoutCreateInfo::default()
@@ -147,6 +155,8 @@ impl CscPass {
         let pool_sizes = [vk::DescriptorPoolSize::default()
             .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
             .descriptor_count(plane_bindings)];
+        // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this
+        // type and live for the call, and every builder struct is a local that outlives it.
         let desc_pool = unsafe {
             device.create_descriptor_pool(
                 &vk::DescriptorPoolCreateInfo::default()
@@ -155,6 +165,8 @@ impl CscPass {
                 None,
             )
         }?;
+        // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this
+        // type and live for the call, and every builder struct is a local that outlives it.
         let desc_set = unsafe {
             device.allocate_descriptor_sets(
                 &vk::DescriptorSetAllocateInfo::default()
@@ -203,6 +215,9 @@ impl CscPass {
                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                 .image_info(&infos[1]),
         ];
+        // SAFETY: per the Vulkan contract above - recorded into a command buffer this code owns
+        // and has begun, referencing handles it also owns; nothing is submitted until the
+        // recording is ended.
         unsafe { device.update_descriptor_sets(&writes, &[]) };
     }
 
@@ -223,10 +238,17 @@ impl CscPass {
                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                 .image_info(&infos[b as usize])
         });
+        // SAFETY: per the Vulkan contract above - recorded into a command buffer this code owns
+        // and has begun, referencing handles it also owns; nothing is submitted until the
+        // recording is ended.
         unsafe { device.update_descriptor_sets(&writes, &[]) };
     }
 
     pub fn destroy(&self, device: &ash::Device) {
+        // SAFETY: per the Vulkan contract above - this destroys objects this type owns, and the
+        // GPU is known idle for them (the fence/queue-wait on the path here, or the swapchain
+        // being retired), which is the obligation that makes a destroy sound rather than the
+        // handle merely being non-null.
         unsafe {
             device.destroy_pipeline(self.pipeline, None);
             device.destroy_pipeline_layout(self.pipeline_layout, None);
@@ -255,15 +277,23 @@ pub(crate) fn build_fullscreen_pipeline(
         &include_bytes!("../shaders/fullscreen.vert.spv")[..],
     ))?;
     let frag = ash::util::read_spv(&mut std::io::Cursor::new(frag_spv))?;
+    // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this type
+    // and live for the call, and every builder struct is a local that outlives it.
     let vert_mod = unsafe {
         device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&vert), None)
     }?;
+    // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this type
+    // and live for the call, and every builder struct is a local that outlives it.
     let frag_mod = unsafe {
         device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&frag), None)
     };
     let frag_mod = match frag_mod {
         Ok(m) => m,
         Err(e) => {
+            // SAFETY: per the Vulkan contract above - this destroys objects this type owns, and
+            // the GPU is known idle for them (the fence/queue-wait on the path here, or the
+            // swapchain being retired), which is the obligation that makes a destroy sound rather
+            // than the handle merely being non-null.
             unsafe { device.destroy_shader_module(vert_mod, None) };
             return Err(e).context("fragment shader module");
         }
@@ -325,9 +355,16 @@ pub(crate) fn build_fullscreen_pipeline(
         .layout(layout)
         .render_pass(render_pass);
     let pipeline =
+        // SAFETY: per the Vulkan contract above - a create/allocate call on the live device, over
+        // builder structs that are locals outliving the call; the handle it returns is owned by
+        // the value being built here.
         unsafe { device.create_graphics_pipelines(vk::PipelineCache::null(), &[info], None) }
             .map_err(|(_, e)| e)
             .context("CSC pipeline");
+    // SAFETY: per the Vulkan contract above - this destroys objects this type owns, and the GPU is
+    // known idle for them (the fence/queue-wait on the path here, or the swapchain being retired),
+    // which is the obligation that makes a destroy sound rather than the handle merely being non-
+    // null.
     unsafe {
         device.destroy_shader_module(vert_mod, None);
         device.destroy_shader_module(frag_mod, None);

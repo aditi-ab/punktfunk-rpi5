@@ -14,6 +14,29 @@
 //! Windows) and `d3d11` is its Windows counterpart (D3D11VA shared-texture import) —
 //! the decode chain there is Vulkan → D3D11VA → software.
 
+// Unsafe-proof program: every `unsafe {}` in this crate carries a `// SAFETY:` proof.
+#![deny(clippy::undocumented_unsafe_blocks)]
+
+// THE VULKAN CONTRACT, stated once - most `// SAFETY:` proofs in this crate are an instance of it.
+//
+// Nearly every `unsafe` here is an `ash` call, which is `unsafe` because Vulkan is a C API, not
+// because each call carries its own bespoke obligation. Three shapes recur, and only one of them
+// has a real precondition worth restating per site:
+//
+//  * CREATE / ALLOCATE - `create_*`, `allocate_*`. The device is live (this type owns it), and the
+//    `vk::*CreateInfo` builders are locals that outlive the synchronous call. The handle returned is
+//    owned by the value being constructed and destroyed in its `Drop`.
+//  * RECORD - `cmd_*`, `begin/end_command_buffer`, `update_descriptor_sets`. Recorded into a command
+//    buffer this code owns and has begun, referencing handles it also owns. Nothing executes until
+//    submit, so a recording error is not yet a memory error.
+//  * DESTROY - `destroy_*`, `free_*`, `unmap_memory`. THIS is the one with a real obligation: the
+//    GPU must not still be using the object. That is established on the path, not by the call - a
+//    fence wait, a `queue_wait_idle`, or the swapchain having been retired - and the per-site proofs
+//    say so, because getting it wrong is a use-after-free the type system cannot catch.
+//
+// A block doing something OUTSIDE these three shapes gets a real, specific proof; if you add one and
+// find yourself writing "as above", it probably belongs in one of them.
+
 #[cfg(any(target_os = "linux", windows))]
 pub mod csc;
 #[cfg(any(target_os = "linux", windows))]

@@ -48,6 +48,8 @@ fn format_importable(
         .push_next(&mut ext_info);
     let mut ext_props = vk::ExternalImageFormatProperties::default();
     let mut props = vk::ImageFormatProperties2::default().push_next(&mut ext_props);
+    // SAFETY: per the Vulkan contract in lib.rs - a read-only query on the live instance/device,
+    // filling locals returned by value.
     unsafe { instance.get_physical_device_image_format_properties2(pdev, &fmt_info, &mut props) }
         .is_ok()
         && ext_props
@@ -90,6 +92,9 @@ impl HwFrame {
     }
 
     pub fn destroy(self, device: &ash::Device) {
+        // SAFETY: per the Vulkan contract in lib.rs - destroys objects this type owns, on a path
+        // where the GPU is known idle for them; that idleness is the obligation, not the handle
+        // being non-null.
         unsafe {
             device.destroy_image(self.image, None);
             device.free_memory(self.memory, None);
@@ -122,6 +127,9 @@ pub fn import(
     // the whole job. Kept maximally "identical" to the D3D11 resource (no view-format
     // aliasing, no extra usages).
     let mut external_info = vk::ExternalMemoryImageCreateInfo::default().handle_types(handle_type);
+    // SAFETY: per the Vulkan contract in lib.rs - a create/allocate/import call on the live
+    // device, over builder structs that are locals outliving the call; the handle returned is
+    // owned by the value being built here.
     let image = unsafe {
         device.create_image(
             &vk::ImageCreateInfo::default()
@@ -153,10 +161,14 @@ pub fn import(
         // The handle's importable memory types, intersected with the image's requirement.
         let handle = frame.handle as vk::HANDLE;
         let mut handle_props = vk::MemoryWin32HandlePropertiesKHR::default();
+        // SAFETY: per the Vulkan contract in lib.rs - a read-only query on the live
+        // instance/device, filling locals returned by value.
         unsafe {
             ext_mem_win32.get_memory_win32_handle_properties(handle_type, handle, &mut handle_props)
         }
         .context("vkGetMemoryWin32HandlePropertiesKHR")?;
+        // SAFETY: per the Vulkan contract in lib.rs - a read-only query on the live
+        // instance/device, filling locals returned by value.
         let reqs = unsafe { device.get_image_memory_requirements(image) };
         let bits = reqs.memory_type_bits & handle_props.memory_type_bits;
         let type_index = (0..32u32)
@@ -169,6 +181,9 @@ pub fn import(
             .handle_type(handle_type)
             .handle(handle);
         let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().image(image);
+        // SAFETY: per the Vulkan contract in lib.rs - a create/allocate/import call on the live
+        // device, over builder structs that are locals outliving the call; the handle returned is
+        // owned by the value being built here.
         let memory = unsafe {
             device.allocate_memory(
                 &vk::MemoryAllocateInfo::default()
@@ -180,7 +195,13 @@ pub fn import(
             )
         }
         .context("import D3D11 texture memory")?;
+        // SAFETY: per the Vulkan contract in lib.rs - a create/allocate/import call on the live
+        // device, over builder structs that are locals outliving the call; the handle returned is
+        // owned by the value being built here.
         if let Err(e) = unsafe { device.bind_image_memory(image, memory, 0) } {
+            // SAFETY: per the Vulkan contract in lib.rs - destroys objects this type owns, on a
+            // path where the GPU is known idle for them; that idleness is the obligation, not the
+            // handle being non-null.
             unsafe { device.free_memory(memory, None) };
             return Err(e).context("bind imported memory");
         }
@@ -189,6 +210,9 @@ pub fn import(
     let memory = match result {
         Ok(m) => m,
         Err(e) => {
+            // SAFETY: per the Vulkan contract in lib.rs - destroys objects this type owns, on a
+            // path where the GPU is known idle for them; that idleness is the obligation, not the
+            // handle being non-null.
             unsafe { device.destroy_image(image, None) };
             return Err(e);
         }

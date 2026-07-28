@@ -58,6 +58,9 @@ impl PresentTimer {
             .spawn(move || {
                 while let Ok(job) = rx.recv() {
                     // 250 ms cap — see the module doc's lifecycle note.
+                    // SAFETY: per the Vulkan contract above - the Vulkan handles used here are
+                    // owned by this type and live for the call, and every builder struct is a
+                    // local that outlives it.
                     let r = unsafe {
                         wait_d.wait_for_present(job.swapchain, job.present_id, 250_000_000)
                     };

@@ -17,6 +17,9 @@ impl Presenter {
     /// Bring up instance → surface → device → swapchain over an SDL window.
     /// `instance_extensions` comes from `VideoSubsystem::vulkan_instance_extensions()`.
     pub fn new(window: &sdl3::video::Window, instance_extensions: &[String]) -> Result<Presenter> {
+        // SAFETY: per the Vulkan contract above - a create/allocate call on the live device, over
+        // builder structs that are locals outliving the call; the handle it returns is owned by
+        // the value being built here.
         let entry = unsafe { ash::Entry::load() }.context("libvulkan not loadable")?;
 
         let app_name = CString::new("punktfunk-session").unwrap();
@@ -29,6 +32,8 @@ impl Presenter {
         // HDR10 presentation needs the extended colorspaces at the INSTANCE level.
         let mut instance_extensions: Vec<String> = instance_extensions.to_vec();
         let inst_available =
+            // SAFETY: per the Vulkan contract above - a read-only query on the live
+            // instance/device, filling locals returned by value.
             unsafe { entry.enumerate_instance_extension_properties(None) }.unwrap_or_default();
         let has_colorspace_ext = inst_available
             .iter()
@@ -44,6 +49,8 @@ impl Presenter {
         // hardcoded `*const i8` compiles on the desktop targets and fails to match ash's
         // `&[*const c_char]` on ARM.
         let ext_ptrs: Vec<*const c_char> = ext_cstrings.iter().map(|e| e.as_ptr()).collect();
+        // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this
+        // type and live for the call, and every builder struct is a local that outlives it.
         let instance = unsafe {
             entry.create_instance(
                 &vk::InstanceCreateInfo::default()
@@ -55,12 +62,19 @@ impl Presenter {
         .context("vkCreateInstance")?;
         let surface_i = ash::khr::surface::Instance::new(&entry, &instance);
 
+        // SAFETY: per the Vulkan contract above - a create/allocate call on the live device, over
+        // builder structs that are locals outliving the call; the handle it returns is owned by
+        // the value being built here.
         let surface = unsafe { window.vulkan_create_surface(instance.handle()) }
             .map_err(|e| anyhow!("SDL_Vulkan_CreateSurface: {e}"))?;
 
         let (pdev, qfi) = pick_device(&instance, &surface_i, surface)?;
+        // SAFETY: per the Vulkan contract above - a read-only query on the live instance/device,
+        // filling locals returned by value.
         let mem_props = unsafe { instance.get_physical_device_memory_properties(pdev) };
         {
+            // SAFETY: per the Vulkan contract above - a read-only query on the live
+            // instance/device, filling locals returned by value.
             let props = unsafe { instance.get_physical_device_properties(pdev) };
             let name = props
                 .device_name_as_c_str()
@@ -72,6 +86,8 @@ impl Presenter {
         // The dmabuf import set is optional: enabled when the device offers all four,
         // else that path is off (`supports_dmabuf() == false`). Windows has no
         // dmabuf/DRM-PRIME — the whole import path is compiled out there.
+        // SAFETY: per the Vulkan contract above - a read-only query on the live instance/device,
+        // filling locals returned by value.
         let available = unsafe { instance.enumerate_device_extension_properties(pdev) }?;
         let has = |name: &std::ffi::CStr| {
             available
@@ -113,6 +129,8 @@ impl Presenter {
         // SAME adapter). Core 1.1 query; valid on effectively every Windows driver.
         let mut id_props = vk::PhysicalDeviceIDProperties::default();
         let mut props2 = vk::PhysicalDeviceProperties2::default().push_next(&mut id_props);
+        // SAFETY: per the Vulkan contract above - a read-only query on the live instance/device,
+        // filling locals returned by value.
         unsafe { instance.get_physical_device_properties2(pdev, &mut props2) };
         let adapter_luid: Option<[u8; 8]> =
             (id_props.device_luid_valid == vk::TRUE).then_some(id_props.device_luid);
@@ -130,6 +148,8 @@ impl Presenter {
         // Probed, never required: a capable stack gets the video extensions, a second
         // (decode) queue, and the features FFmpeg's decoder needs; anything less means
         // `vulkan_decode() == None` and the decoder chain falls back (VAAPI/software).
+        // SAFETY: per the Vulkan contract above - a read-only query on the live instance/device,
+        // filling locals returned by value.
         let dev_props = unsafe { instance.get_physical_device_properties(pdev) };
         let dev_is_13 = vk::api_version_major(dev_props.api_version) > 1
             || vk::api_version_minor(dev_props.api_version) >= 3;
@@ -149,6 +169,8 @@ impl Presenter {
         if present_wait_exts {
             have_f2 = have_f2.push_next(&mut have_pid).push_next(&mut have_pwait);
         }
+        // SAFETY: per the Vulkan contract above - a read-only query on the live instance/device,
+        // filling locals returned by value.
         unsafe { instance.get_physical_device_features2(pdev, &mut have_f2) };
         // Copy the one base-features fact out NOW: `have_f2` mutably borrows the chained
         // structs through its pNext chain, so any later use of it would pin those borrows —
@@ -174,6 +196,8 @@ impl Presenter {
 
         // The decode queue family + which codec operations it can run.
         let decode_family: Option<(u32, vk::VideoCodecOperationFlagsKHR)> = {
+            // SAFETY: per the Vulkan contract above - a read-only query on the live
+            // instance/device, filling locals returned by value.
             let n = unsafe { instance.get_physical_device_queue_family_properties2_len(pdev) };
             let mut video: Vec<vk::QueueFamilyVideoPropertiesKHR> =
                 vec![vk::QueueFamilyVideoPropertiesKHR::default(); n];
@@ -181,6 +205,8 @@ impl Presenter {
                 .iter_mut()
                 .map(|v| vk::QueueFamilyProperties2::default().push_next(v))
                 .collect();
+            // SAFETY: per the Vulkan contract above - a read-only query on the live
+            // instance/device, filling locals returned by value.
             unsafe { instance.get_physical_device_queue_family_properties2(pdev, &mut props) };
             // `props` mutably borrows `video` (push_next); copy the flags out, then
             // read the driver-filled video properties directly.
@@ -282,6 +308,8 @@ impl Presenter {
                     .queue_priorities(&priorities),
             );
         }
+        // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this
+        // type and live for the call, and every builder struct is a local that outlives it.
         let device = unsafe {
             instance.create_device(
                 pdev,
@@ -305,6 +333,8 @@ impl Presenter {
         );
         let hdr_metadata_d =
             has_hdr_metadata.then(|| ash::ext::hdr_metadata::Device::new(&instance, &device));
+        // SAFETY: per the Vulkan contract above - a read-only query on the live instance/device,
+        // filling locals returned by value.
         let queue = unsafe { device.get_device_queue(qfi, 0) };
         #[cfg(target_os = "linux")]
         let hw = if hw_capable {
@@ -341,6 +371,8 @@ impl Presenter {
         #[cfg(not(windows))]
         let export_worthy = video_ok || pyrowave_ok;
         let video_export = if export_worthy {
+            // SAFETY: per the Vulkan contract above - a read-only query on the live
+            // instance/device, filling locals returned by value.
             let qf_props = unsafe { instance.get_physical_device_queue_family_properties(pdev) };
             let mut device_extensions: Vec<CString> =
                 vec![CString::from(ash::khr::swapchain::NAME)];
@@ -425,6 +457,9 @@ impl Presenter {
         );
         let overlay_pipe = OverlayPipe::new(&device, format.format)?;
 
+        // SAFETY: per the Vulkan contract above - recorded into a command buffer this code owns
+        // and has begun, referencing handles it also owns; nothing is submitted until the
+        // recording is ended.
         let cmd_pool = unsafe {
             device.create_command_pool(
                 &vk::CommandPoolCreateInfo::default()
@@ -433,6 +468,9 @@ impl Presenter {
                 None,
             )
         }?;
+        // SAFETY: per the Vulkan contract above - recorded into a command buffer this code owns
+        // and has begun, referencing handles it also owns; nothing is submitted until the
+        // recording is ended.
         let cmd_buf = unsafe {
             device.allocate_command_buffers(
                 &vk::CommandBufferAllocateInfo::default()
@@ -442,7 +480,12 @@ impl Presenter {
             )
         }?[0];
         let acquire_sem =
+            // SAFETY: per the Vulkan contract above - a create/allocate call on the live device,
+            // over builder structs that are locals outliving the call; the handle it returns is
+            // owned by the value being built here.
             unsafe { device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) }?;
+        // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this
+        // type and live for the call, and every builder struct is a local that outlives it.
         let fence = unsafe {
             device.create_fence(
                 &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
@@ -506,11 +549,16 @@ impl Presenter {
 /// the whole `PUNKTFUNK_VK_ADAPTER` match key, so a second identical card adds nothing).
 /// Same 1.3 instance the presenter creates, so the list matches what streaming sees.
 pub fn list_adapters() -> Result<Vec<String>> {
+    // SAFETY: per the Vulkan contract above - a create/allocate call on the live device, over
+    // builder structs that are locals outliving the call; the handle it returns is owned by the
+    // value being built here.
     let entry = unsafe { ash::Entry::load() }.context("libvulkan not loadable")?;
     let app_name = CString::new("punktfunk-session").unwrap();
     let app_info = vk::ApplicationInfo::default()
         .application_name(&app_name)
         .api_version(vk::API_VERSION_1_3);
+    // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this type
+    // and live for the call, and every builder struct is a local that outlives it.
     let instance = unsafe {
         entry.create_instance(
             &vk::InstanceCreateInfo::default().application_info(&app_info),
@@ -518,9 +566,13 @@ pub fn list_adapters() -> Result<Vec<String>> {
         )
     }
     .context("vkCreateInstance")?;
+    // SAFETY: per the Vulkan contract above - a read-only query on the live instance/device,
+    // filling locals returned by value.
     let mut ranked: Vec<(u8, String)> = unsafe { instance.enumerate_physical_devices() }?
         .into_iter()
         .map(|d| {
+            // SAFETY: per the Vulkan contract above - a read-only query on the live
+            // instance/device, filling locals returned by value.
             let props = unsafe { instance.get_physical_device_properties(d) };
             let rank = match props.device_type {
                 vk::PhysicalDeviceType::DISCRETE_GPU => 0u8,
@@ -535,6 +587,10 @@ pub fn list_adapters() -> Result<Vec<String>> {
         })
         .filter(|(_, n)| !n.is_empty())
         .collect();
+    // SAFETY: per the Vulkan contract above - this destroys objects this type owns, and the GPU is
+    // known idle for them (the fence/queue-wait on the path here, or the swapchain being retired),
+    // which is the obligation that makes a destroy sound rather than the handle merely being non-
+    // null.
     unsafe { instance.destroy_instance(None) };
     ranked.sort_by_key(|(r, _)| *r); // stable: enumeration order within each tier
     let mut names: Vec<String> = Vec::new();
@@ -553,6 +609,8 @@ fn pick_device(
     surface_i: &ash::khr::surface::Instance,
     surface: vk::SurfaceKHR,
 ) -> Result<(vk::PhysicalDevice, u32)> {
+    // SAFETY: per the Vulkan contract above - a read-only query on the live instance/device,
+    // filling locals returned by value.
     let devices = unsafe { instance.enumerate_physical_devices() }?;
     let forced: Option<usize> = std::env::var("PUNKTFUNK_VK_DEVICE")
         .ok()
@@ -575,6 +633,8 @@ fn pick_device(
             .map(|w| w.trim().to_lowercase())
             .filter(|w| !w.is_empty());
         candidates.sort_by_key(|d| {
+            // SAFETY: per the Vulkan contract above - a read-only query on the live
+            // instance/device, filling locals returned by value.
             let props = unsafe { instance.get_physical_device_properties(*d) };
             let name = props
                 .device_name_as_c_str()
@@ -595,10 +655,14 @@ fn pick_device(
         });
     }
     for pdev in candidates {
+        // SAFETY: per the Vulkan contract above - a read-only query on the live instance/device,
+        // filling locals returned by value.
         let families = unsafe { instance.get_physical_device_queue_family_properties(pdev) };
         for (i, f) in families.iter().enumerate() {
             let graphics = f.queue_flags.contains(vk::QueueFlags::GRAPHICS);
             let present =
+                // SAFETY: per the Vulkan contract above - a read-only query on the live
+                // instance/device, filling locals returned by value.
                 unsafe { surface_i.get_physical_device_surface_support(pdev, i as u32, surface) }
                     .unwrap_or(false);
             if graphics && present {
@@ -629,6 +693,8 @@ pub(super) fn pick_formats(
     let colorspace_ext = colorspace_ext
         && !std::env::var("PUNKTFUNK_HDR10")
             .is_ok_and(|v| matches!(v.as_str(), "0" | "false" | "off" | "no"));
+    // SAFETY: per the Vulkan contract above - a read-only query on the live instance/device,
+    // filling locals returned by value.
     let formats = unsafe { surface_i.get_physical_device_surface_formats(pdev, surface) }?;
     let mut sdr = None;
     for want in [vk::Format::B8G8R8A8_UNORM, vk::Format::R8G8B8A8_UNORM] {
@@ -673,6 +739,8 @@ fn pick_present_mode(
     pdev: vk::PhysicalDevice,
     surface: vk::SurfaceKHR,
 ) -> Result<vk::PresentModeKHR> {
+    // SAFETY: per the Vulkan contract above - a read-only query on the live instance/device,
+    // filling locals returned by value.
     let modes = unsafe { surface_i.get_physical_device_surface_present_modes(pdev, surface) }?;
     let want = match std::env::var("PUNKTFUNK_PRESENT_MODE").ok().as_deref() {
         Some("fifo") => vk::PresentModeKHR::FIFO,

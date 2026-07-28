@@ -10,6 +10,8 @@ impl Presenter {
     /// submits FFmpeg's Vulkan decode work concurrently, and wait-idle's external-sync
     /// rule over every device queue would race it (observed as a resize crash).
     pub(super) fn quiesce_own(&mut self) -> Result<()> {
+        // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this
+        // type and live for the call, and every builder struct is a local that outlives it.
         unsafe {
             if self.submitted {
                 self.device.wait_for_fences(&[self.fence], true, u64::MAX)?;
@@ -31,6 +33,9 @@ impl Presenter {
                         .contains(flags)
             })
             .with_context(|| format!("no memory type for {flags:?}"))?;
+        // SAFETY: per the Vulkan contract above - a create/allocate call on the live device, over
+        // builder structs that are locals outliving the call; the handle it returns is owned by
+        // the value being built here.
         unsafe {
             self.device.allocate_memory(
                 &vk::MemoryAllocateInfo::default()
@@ -111,6 +116,9 @@ pub(super) fn vkframe_acquire_barrier(
         .dst_queue_family_index(dst)
         .image(image)
         .subresource_range(subresource_range());
+    // SAFETY: per the Vulkan contract above - recorded into a command buffer this code owns and
+    // has begun, referencing handles it also owns; nothing is submitted until the recording is
+    // ended.
     unsafe {
         device.cmd_pipeline_barrier(
             cmd,
@@ -145,6 +153,8 @@ pub(super) fn external_acquire_barrier(
         .dst_queue_family_index(qfi)
         .image(image)
         .subresource_range(subresource_range());
+    // SAFETY: per the Vulkan contract in lib.rs - recorded into a command buffer this code owns
+    // and has begun, referencing handles it also owns; nothing runs until submit.
     unsafe {
         device.cmd_pipeline_barrier(
             cmd,
@@ -177,6 +187,9 @@ pub(super) fn foreign_acquire_barrier(
         .dst_queue_family_index(qfi)
         .image(image)
         .subresource_range(subresource_range());
+    // SAFETY: per the Vulkan contract above - recorded into a command buffer this code owns and
+    // has begun, referencing handles it also owns; nothing is submitted until the recording is
+    // ended.
     unsafe {
         device.cmd_pipeline_barrier(
             cmd,
@@ -208,6 +221,9 @@ pub(super) fn barrier(
         .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
         .image(image)
         .subresource_range(subresource_range());
+    // SAFETY: per the Vulkan contract above - recorded into a command buffer this code owns and
+    // has begun, referencing handles it also owns; nothing is submitted until the recording is
+    // ended.
     unsafe {
         device.cmd_pipeline_barrier(
             cmd,
