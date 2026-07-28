@@ -369,7 +369,28 @@ pub fn capture_monitor() -> Option<String> {
 pub fn open(compositor: Compositor) -> Result<Box<dyn VirtualDisplay>> {
     #[cfg(target_os = "linux")]
     if let Some(connector) = capture_monitor() {
-        return Ok(Box::new(mirror::MirrorDisplay::new(compositor, connector)?));
+        // A pin is host-wide and PERSISTED, but the session it applies to is not: a box that boots
+        // between a desktop (heads to mirror) and a nested/headless Game Mode (none) would carry the
+        // pin into a session where `resolve` can only fail — and since this is the one place every
+        // session opens a display, that failure is a host that refuses to stream at all rather than
+        // one that streams the normal way. So a compositor reporting NO heads whatsoever degrades to
+        // the virtual-display path with the reason logged.
+        //
+        // Narrow on purpose. A pin that misses among heads that DO exist stays the hard error
+        // `monitors::resolve` makes it (design/per-monitor-portal-capture.md §5.2): showing someone
+        // a different screen than they asked for is the failure worth refusing over, and "there are
+        // no screens here" is not that. An enumeration ERROR also stays on the mirror path, so the
+        // session fails with the real reason instead of quietly ignoring the operator's choice.
+        match monitors::list(compositor) {
+            Ok(heads) if heads.is_empty() => tracing::warn!(
+                pinned = %connector,
+                compositor = compositor.id(),
+                "the streamed-screen pin names a monitor but this session has no physical heads to \
+                 mirror (a nested or headless compositor) — creating a virtual display instead; the \
+                 pin applies again as soon as a session with real heads runs"
+            ),
+            _ => return Ok(Box::new(mirror::MirrorDisplay::new(compositor, connector)?)),
+        }
     }
     #[cfg(target_os = "linux")]
     {
