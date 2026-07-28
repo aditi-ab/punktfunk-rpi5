@@ -157,7 +157,7 @@ struct Vui {
 }
 
 /// 10-bit HDR: BT.2020 primaries + SMPTE-2084 (PQ) transfer, limited range — matches the P010 the
-/// CSC produces (swscale BT.2020 on the CPU path; `scale_vaapi` pinned to bt2020 on the zero-copy
+/// CSC produces (swscale BT.2020 on the CPU path; `scale_vaapi` pinned to bt2020nc on the zero-copy
 /// path); the client decoder auto-detects PQ from the VUI. SDR: we hand the encoder BT.709
 /// *limited* NV12 (swscale CSC on the CPU path; `scale_vaapi` pinned to
 /// `out_color_matrix=bt709:out_range=limited` on the zero-copy path, with the full-range RGB input
@@ -204,7 +204,7 @@ fn async_depth(raw: Option<&str>) -> u32 {
 /// matrix untouched.)
 fn scale_vaapi_args(ten_bit: bool) -> &'static CStr {
     if ten_bit {
-        c"format=p010:out_color_matrix=bt2020:out_range=limited"
+        c"format=p010:out_color_matrix=bt2020nc:out_range=limited"
     } else {
         c"format=nv12:out_color_matrix=bt709:out_range=limited"
     }
@@ -1565,7 +1565,7 @@ mod tests {
         let args = scale_vaapi_args(true).to_str().unwrap();
         for needle in [
             "format=p010",
-            "out_color_matrix=bt2020",
+            "out_color_matrix=bt2020nc",
             "out_range=limited",
         ] {
             assert!(
