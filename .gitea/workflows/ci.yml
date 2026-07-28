@@ -31,14 +31,22 @@ jobs:
       # or failing test. Recompile each shader and diff the disassembly. Filtering OpSourceExtension
       # (+ --no-header) is exactly what absorbs the shaderc-vs-glslang generator difference; every
       # instruction, ID and constant must match.
+      #
+      # Disassemble to FILES rather than `diff <(…) <(…)`: Gitea's runner executes a step's `run:`
+      # under `sh -e`, not bash, and dash has no process substitution — the shell rejected the
+      # script at PARSE time, so the gate never compared anything. Worse, it took the whole `rust`
+      # job with it: Format, Clippy, Build, Test and every gate below were skipped on each of the
+      # 35 commits between the gate landing (143a707f) and this fix. A gate that cannot run is
+      # indistinguishable from one that passes, which is exactly the failure it exists to prevent.
       - name: Shader SPIR-V drift gate (pf-zerocopy)
         run: |
           apt-get install -y --no-install-recommends glslang-tools spirv-tools
           for s in rgb2nv12_buf cursor_blend; do
             d=crates/pf-zerocopy/src/imp
             glslangValidator -V "$d/$s.comp" -o "/tmp/$s.spv" >/dev/null
-            diff <(spirv-dis --no-header "$d/$s.spv"  | grep -v OpSourceExtension) \
-                 <(spirv-dis --no-header "/tmp/$s.spv" | grep -v OpSourceExtension) \
+            spirv-dis --no-header "$d/$s.spv"  | grep -v OpSourceExtension > "/tmp/$s.committed"
+            spirv-dis --no-header "/tmp/$s.spv" | grep -v OpSourceExtension > "/tmp/$s.rebuilt"
+            diff "/tmp/$s.committed" "/tmp/$s.rebuilt" \
               || { echo "::error::$d/$s.spv is stale — rebuild it from $s.comp"; exit 1; }
           done
 
