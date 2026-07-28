@@ -43,26 +43,41 @@ pub fn serverinfo_xml(host: &Host, https: bool, paired: bool) -> String {
     )
 }
 
-/// The `<ServerCodecModeSupport>` mask to advertise: the SDR baseline ([`base_codec_mode_support`]) plus
-/// the HEVC Main10 (HDR) bit when the host can actually deliver HDR ([`apply_hdr`] /
-/// [`crate::gamestream::host_hdr_capable`]). Without the Main10 bit Moonlight never offers its HDR
-/// toggle; with it, enabling HDR client-side negotiates Main10 and the IDD-push path streams BT.2020 PQ.
+/// The `<ServerCodecModeSupport>` mask to advertise: the SDR baseline ([`base_codec_mode_support`])
+/// plus the 10-bit (HDR) bit of each codec the host can actually deliver HDR with ([`apply_hdr`] /
+/// [`crate::gamestream::host_hdr_capable`]). Without a 10-bit bit Moonlight never offers its HDR
+/// toggle; with one, enabling HDR client-side negotiates that profile and the host streams
+/// BT.2020 PQ.
 fn codec_mode_support() -> u32 {
+    use crate::encode::Codec;
+    // Per codec, exactly like the SDR baseline is: `can_encode_10bit` answers for the backend this
+    // host will actually open (on AMD/Intel, the union of VAAPI's and Vulkan Video's 10-bit
+    // support), so a box that encodes HEVC Main10 but not 10-bit AV1 — or the reverse — advertises
+    // the truth instead of one bit standing in for both.
+    let hdr = crate::gamestream::host_hdr_capable();
     apply_hdr(
         base_codec_mode_support(),
-        crate::gamestream::host_hdr_capable(),
+        hdr && crate::encode::can_encode_10bit(Codec::H265),
+        hdr && crate::encode::can_encode_10bit(Codec::Av1),
     )
 }
 
-/// Add the HEVC Main10 (HDR) bit to `base` when `hdr` and HEVC is advertised — pure so the
-/// HDR-layering is unit-testable without a GPU. (HDR streaming uses HEVC Main10; AV1 Main10 is left
-/// off until the GameStream AV1 path is live-confirmed.)
-fn apply_hdr(base: u32, hdr: bool) -> u32 {
-    if hdr && base & super::SCM_HEVC != 0 {
-        base | super::SCM_HEVC_MAIN10
-    } else {
-        base
+/// Layer each codec's 10-bit (HDR) bit onto `base`, gated on the SDR baseline already advertising
+/// that codec — pure so the HDR-layering is unit-testable without a GPU.
+///
+/// AV1 Main10 used to be omitted unconditionally, on the theory that the GameStream AV1 path was
+/// unconfirmed. But the baseline already offers AV1 **Main8** to every client, so the AV1 path is
+/// either live or it is not — the depth was never the uncertain part. Now that the encoders probe
+/// 10-bit per codec, withholding the bit only cost AV1-preferring clients their HDR.
+fn apply_hdr(base: u32, hevc_10bit: bool, av1_10bit: bool) -> u32 {
+    let mut m = base;
+    if hevc_10bit && base & super::SCM_HEVC != 0 {
+        m |= super::SCM_HEVC_MAIN10;
     }
+    if av1_10bit && base & super::SCM_AV1_MAIN8 != 0 {
+        m |= super::SCM_AV1_MAIN10;
+    }
+    m
 }
 
 /// The **SDR baseline** mask. On the VAAPI (AMD/Intel) backend it reflects what the GPU can ACTUALLY
@@ -140,7 +155,7 @@ fn probed_mask(caps: crate::encode::CodecSupport) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gamestream::{SCM_AV1_MAIN8, SCM_H264, SCM_HEVC, SCM_HEVC_MAIN10};
+    use crate::gamestream::{SCM_AV1_MAIN10, SCM_AV1_MAIN8, SCM_H264, SCM_HEVC, SCM_HEVC_MAIN10};
 
     /// The advertised codec mask: H.264 + HEVC + AV1 Main8 (= 65793), and explicitly *no*
     /// 10-bit bits — Moonlight gates its HDR mode on those, which we can't deliver (8-bit
@@ -160,20 +175,29 @@ mod tests {
         );
     }
 
+    /// The 10-bit bits are layered PER CODEC, and each needs both halves: the host able to encode
+    /// 10-bit for that codec, and the SDR baseline already advertising it. A client gates its HDR
+    /// toggle on these, so an over-claim invites it into a mode the encoder cannot open.
     #[test]
-    fn apply_hdr_adds_main10_only_when_capable_and_hevc() {
-        // HDR-capable + HEVC advertised → Main10 added.
+    fn apply_hdr_adds_each_codecs_10bit_bit_independently() {
+        let sdr = SCM_H264 | SCM_HEVC | SCM_AV1_MAIN8;
+        // Both codecs 10-bit-capable → both bits.
         assert_eq!(
-            apply_hdr(SCM_H264 | SCM_HEVC | SCM_AV1_MAIN8, true),
-            SCM_H264 | SCM_HEVC | SCM_AV1_MAIN8 | SCM_HEVC_MAIN10
+            apply_hdr(sdr, true, true),
+            sdr | SCM_HEVC_MAIN10 | SCM_AV1_MAIN10
         );
-        // Not HDR-capable → baseline unchanged (no HDR claim).
+        // Neither → baseline unchanged (no HDR claim).
+        assert_eq!(apply_hdr(sdr, false, false), sdr);
+        // One without the other — the case a single shared flag used to get wrong in both
+        // directions (AV1 Main10 was never advertised at all, and HEVC Main10 stood in for it).
+        assert_eq!(apply_hdr(sdr, true, false), sdr | SCM_HEVC_MAIN10);
+        assert_eq!(apply_hdr(sdr, false, true), sdr | SCM_AV1_MAIN10);
+        // 10-bit-capable but the codec isn't in the SDR baseline at all → no bit for it.
+        assert_eq!(apply_hdr(SCM_H264, true, true), SCM_H264);
         assert_eq!(
-            apply_hdr(SCM_H264 | SCM_HEVC | SCM_AV1_MAIN8, false),
-            SCM_H264 | SCM_HEVC | SCM_AV1_MAIN8
+            apply_hdr(SCM_H264 | SCM_HEVC, true, true),
+            SCM_H264 | SCM_HEVC | SCM_HEVC_MAIN10
         );
-        // HDR-capable but a GPU with no HEVC at all → no Main10 (you can't do Main10 without HEVC).
-        assert_eq!(apply_hdr(SCM_H264, true), SCM_H264);
     }
 
     #[test]

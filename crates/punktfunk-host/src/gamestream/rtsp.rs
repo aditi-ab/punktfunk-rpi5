@@ -456,6 +456,18 @@ fn stream_config(map: &HashMap<String, String>) -> Option<StreamConfig> {
             "client requested HDR (dynamicRangeMode != 0) but host is not HDR-capable — streaming 8-bit SDR"
         );
     }
+    // …and this SESSION's codec must be one of the 10-bit-capable ones. `host_hdr_capable` is
+    // host-wide (any codec), and serverinfo advertises the 10-bit bit per codec, so a client
+    // that picked the other one has to degrade here rather than be handed a PQ label over an
+    // 8-bit stream. H.264 always lands here — there is no 10-bit H.264 encode anywhere.
+    if hdr && !crate::encode::can_encode_10bit(codec) {
+        tracing::warn!(
+            ?codec,
+            "client requested HDR but this host cannot encode 10-bit with the codec it \
+             negotiated — streaming 8-bit SDR (pick the other codec client-side for HDR)"
+        );
+        hdr = false;
+    }
     // SOURCE-AWARE: the live colour-mode probe belongs to the portal MONITOR mirror, whose HDR
     // depends on a monitor being in BT.2100 right now. A gamescope virtual-output session has no
     // monitor at all — its HDR is a static fact about the binary we spawn, already settled by

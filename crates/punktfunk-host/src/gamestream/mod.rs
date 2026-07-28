@@ -58,10 +58,11 @@ pub const SCM_AV1_MAIN10: u32 = 0x0002_0000;
 /// full-chroma is a punktfunk/1-native negotiation only (`crate::capture::capturer_supports_444`).
 pub const SERVER_CODEC_MODE_SUPPORT: u32 = SCM_H264 | SCM_HEVC | SCM_AV1_MAIN8;
 
-/// Whether this host can deliver an **HDR** (HEVC Main10 / BT.2020 PQ) GameStream — the single gate
-/// for advertising [`SCM_HEVC_MAIN10`] in serverinfo and `IsHdrSupported` per app, and (together
-/// with the live capture-side check at RTSP time) for honoring a client's `dynamicRangeMode`
-/// request. Behind the operator's `PUNKTFUNK_10BIT` opt-in — the same policy gate the native
+/// Whether this host can deliver an **HDR** (10-bit BT.2020 PQ) GameStream at all — the gate for
+/// `IsHdrSupported` per app, for layering the 10-bit codec bits in serverinfo, and (together with
+/// the live capture-side check and the session's own codec at RTSP time) for honoring a client's
+/// `dynamicRangeMode` request. Host-wide and codec-agnostic on purpose: the per-codec depth
+/// question belongs to whoever knows which codec is in play. Behind the operator's `PUNKTFUNK_10BIT` opt-in — the same policy gate the native
 /// punktfunk/1 plane honors — on both OSes.
 ///
 /// **Windows**: the IDD-push capturer streams HEVC Main10 PQ whenever the desktop is HDR, and a
@@ -97,7 +98,12 @@ pub fn host_hdr_capable() -> bool {
                 .ok()
                 .is_some_and(|c| crate::capture::capturer_supports_hdr_for(Some(c))),
         };
-        source_can_hdr && crate::encode::can_encode_10bit(crate::encode::Codec::H265)
+        // ANY 10-bit-capable codec makes the host HDR-capable; which BITS get advertised, and
+        // whether a given session's negotiated codec can carry it, are per-codec questions
+        // answered by `serverinfo::apply_hdr` and the RTSP honor respectively.
+        source_can_hdr
+            && (crate::encode::can_encode_10bit(crate::encode::Codec::H265)
+                || crate::encode::can_encode_10bit(crate::encode::Codec::Av1))
     }
     #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     {
