@@ -106,7 +106,10 @@ SHDEPS="$SHDEPS, libvulkan1"
 
 # Manual additions shlibdeps can't see: the PipeWire daemon + session manager are runtime
 # services (audio playback / mic capture degrade gracefully without them — Recommends).
-RECOMMENDS="pipewire, wireplumber, pipewire-pulse"
+# NOT pipewire-pulse: the client speaks native PipeWire (audio.rs → libpipewire-0.3) and never
+# opens a Pulse socket, and the shim Conflicts with pulseaudio — so recommending it only nags
+# users who run real PulseAudio, in exchange for nothing the client can use.
+RECOMMENDS="pipewire, wireplumber"
 
 INSTALLED_KB="$(du -k -s "$STAGE" | cut -f1)"
 

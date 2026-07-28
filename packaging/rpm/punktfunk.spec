@@ -104,8 +104,13 @@ BuildRequires:  vulkan-headers
 
 # --- Runtime -----------------------------------------------------------------
 Requires:       pipewire
-Requires:       pipewire-pulseaudio
 Requires:       wireplumber
+# The host captures the sink monitor through NATIVE PipeWire (audio/linux.rs) and never opens a
+# Pulse socket itself — the shim is for the GAMES, which commonly emit through the PulseAudio
+# API. Weak-dep, because `pipewire-pulseaudio` CONFLICTS with `pulseaudio`: as a hard Requires it
+# made the host uninstallable for anyone running real PulseAudio, which serves those games just
+# as well. Fedora installs pipewire-pulseaudio by default, so the default box is unaffected.
+Recommends:     pipewire-pulseaudio
 Requires:       opus
 Requires:       libei
 # FFmpeg runtime with NVENC (RPM Fusion). Weak-dep so the package installs even if
