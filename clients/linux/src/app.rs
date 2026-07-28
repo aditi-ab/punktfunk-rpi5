@@ -230,6 +230,7 @@ impl SimpleComponent for AppModel {
                     HostsOutput::Pair(req) => AppMsg::Pair(req),
                     HostsOutput::SpeedTest(req) => AppMsg::SpeedTest(req),
                     HostsOutput::Library(req, mgmt) => AppMsg::OpenLibrary(req, mgmt),
+                    HostsOutput::Toast(msg) => AppMsg::Toast(msg),
                 });
 
         let nav = adw::NavigationView::new();
@@ -629,7 +630,33 @@ impl AppModel {
         let status = gtk::Label::new(Some("Connecting…"));
         let dialog = adw::AlertDialog::new(Some("Network Speed Test"), Some(&req.name));
         dialog.set_extra_child(Some(&status));
-        dialog.add_responses(&[("close", "Close"), ("apply", "Apply")]);
+        // Where a measured bitrate belongs is "the layer this host actually resolves bitrate
+        // from" (design/client-settings-profiles.md §5.3) — the long-standing wrong answer was
+        // always the global, so measuring the slow retro box downstairs re-tuned the desktop
+        // too. The target depends only on the host, so it is known before the result lands and
+        // the button can say where it will write.
+        let target = SpeedTestTarget::resolve(&req);
+        match &target {
+            SpeedTestTarget::Global => {
+                dialog.add_responses(&[("close", "Close"), ("apply", "Apply")]);
+            }
+            SpeedTestTarget::Profile(p) => {
+                dialog.add_responses(&[
+                    ("close", "Close"),
+                    ("apply", &format!("Apply to “{}”", p.name)),
+                ]);
+            }
+            // A bound host whose profile doesn't override bitrate could legitimately mean
+            // either: the user gets both, rather than us guessing which layer they meant.
+            SpeedTestTarget::Ask(p) => {
+                dialog.add_responses(&[
+                    ("close", "Close"),
+                    ("apply-global", "Set as default"),
+                    ("apply", &format!("Set in “{}”", p.name)),
+                ]);
+                dialog.set_response_enabled("apply-global", false);
+            }
+        }
         dialog.set_response_enabled("apply", false);
         dialog.set_close_response("close");
         dialog.present(Some(&self.window));
@@ -699,13 +726,36 @@ impl AppModel {
                     ));
                     dialog.set_response_enabled("apply", true);
                     dialog.set_response_appearance("apply", adw::ResponseAppearance::Suggested);
-                    dialog.connect_response(Some("apply"), move |_, _| {
+                    if matches!(target, SpeedTestTarget::Ask(_)) {
+                        dialog.set_response_enabled("apply-global", true);
+                    }
+                    let mbit = f64::from(recommended_kbps) / 1000.0;
+                    {
+                        let (settings, toasts) = (settings.clone(), toasts.clone());
+                        dialog.connect_response(Some("apply"), move |_, _| {
+                            let where_to = match &target {
+                                SpeedTestTarget::Global => {
+                                    let mut s = settings.borrow_mut();
+                                    s.bitrate_kbps = recommended_kbps;
+                                    s.save();
+                                    "the default bitrate".to_string()
+                                }
+                                SpeedTestTarget::Profile(p) | SpeedTestTarget::Ask(p) => {
+                                    write_profile_bitrate(&p.id, recommended_kbps);
+                                    format!("“{}”", p.name)
+                                }
+                            };
+                            toasts.add_toast(adw::Toast::new(&format!(
+                                "{mbit:.0} Mbit/s set in {where_to}"
+                            )));
+                        });
+                    }
+                    dialog.connect_response(Some("apply-global"), move |_, _| {
                         let mut s = settings.borrow_mut();
                         s.bitrate_kbps = recommended_kbps;
                         s.save();
                         toasts.add_toast(adw::Toast::new(&format!(
-                            "Bitrate set to {:.0} Mbit/s",
-                            f64::from(recommended_kbps) / 1000.0
+                            "{mbit:.0} Mbit/s set in the default bitrate"
                         )));
                     });
                 }
@@ -713,6 +763,56 @@ impl AppModel {
                 Err(_) => {}
             }
         });
+    }
+}
+
+/// Which layer a measured bitrate should land in for the host that was tested
+/// (design/client-settings-profiles.md §5.3).
+enum SpeedTestTarget {
+    /// No profile bound — the global default, i.e. what has always happened.
+    Global,
+    /// The bound profile already overrides bitrate, so that override is what this host reads.
+    Profile(pf_client_core::profiles::StreamProfile),
+    /// Bound, but the profile inherits bitrate: writing either layer is defensible, so ask.
+    Ask(pf_client_core::profiles::StreamProfile),
+}
+
+impl SpeedTestTarget {
+    fn resolve(req: &crate::ui_hosts::ConnectRequest) -> SpeedTestTarget {
+        // Resolved exactly the way a connect resolves it: the one-off pick this test was
+        // started with (a pinned card carries one), else the host's binding.
+        let bound = trust::KnownHosts::load()
+            .hosts
+            .iter()
+            .find(|h| h.addr == req.addr && h.port == req.port)
+            .and_then(|h| h.profile_id.clone());
+        let reference = match req.profile.as_deref() {
+            Some("") => return SpeedTestTarget::Global,
+            Some(id) => Some(id.to_string()),
+            None => bound,
+        };
+        let Some(reference) = reference else {
+            return SpeedTestTarget::Global;
+        };
+        let catalog = pf_client_core::profiles::ProfilesFile::load();
+        match catalog.resolve(&reference).0 {
+            Some(p) if p.overrides.bitrate_kbps.is_some() => SpeedTestTarget::Profile(p.clone()),
+            Some(p) => SpeedTestTarget::Ask(p.clone()),
+            // A dangling binding resolves as no profile everywhere else; here too.
+            None => SpeedTestTarget::Global,
+        }
+    }
+}
+
+/// Write a measured bitrate into one profile's overlay, leaving everything else alone.
+fn write_profile_bitrate(id: &str, kbps: u32) {
+    let mut catalog = pf_client_core::profiles::ProfilesFile::load();
+    let Some(p) = catalog.profiles.iter_mut().find(|p| p.id == id) else {
+        return; // deleted while the test ran — the toast still tells the truth about the test
+    };
+    p.overrides.bitrate_kbps = Some(kbps);
+    if let Err(e) = catalog.save() {
+        tracing::warn!(error = %format!("{e:#}"), "saving the measured bitrate");
     }
 }
 

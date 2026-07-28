@@ -106,6 +106,8 @@ pub enum CardOutput {
         mac: Vec<String>,
         addr: String,
     },
+    /// Put this card's `punktfunk://` URL on the clipboard.
+    CopyLink(String),
     /// Add or remove a pinned host+profile card (design §5.2a). Presentation only — it never
     /// changes the host's default profile, and unpinning never touches the profile itself.
     TogglePin {
@@ -385,6 +387,25 @@ impl relm4::factory::FactoryComponent for HostCard {
                             profile_id: id,
                         }),
                     );
+                    // "Copy link": the self-emitted URL for this card, which is the pairing
+                    // an external tool (a Playnite entry, a Stream Deck macro) is configured
+                    // with. It carries the stable id AND host+fp, so it still resolves after a
+                    // re-address or a reinstall (design/client-deep-links.md §2/§5).
+                    {
+                        let (host, profile) = (k.clone(), pinned.clone());
+                        let a = gio::SimpleAction::new("copy-link", None);
+                        let sender = sender.clone();
+                        a.connect_activate(move |_, _| {
+                            let url = pf_client_core::deeplink::DeepLink::for_host(
+                                &host,
+                                None,
+                                profile.as_ref().map(|(id, _)| id.as_str()),
+                            )
+                            .to_url();
+                            let _ = sender.output(CardOutput::CopyLink(url));
+                        });
+                        actions.add_action(&a);
+                    }
                     // The same action pins from a primary card and unpins from a pinned one —
                     // which of the two this card is decides the direction.
                     let (fp, addr, port) = (k.fp_hex.clone(), k.addr.clone(), k.port);
@@ -430,6 +451,7 @@ impl relm4::factory::FactoryComponent for HostCard {
                         Some(&pin_id.as_str().to_variant()),
                     );
                     menu.append_item(&unpin);
+                    menu.append(Some("Copy link"), Some("card.copy-link"));
                 } else {
                     if !profiles.is_empty() {
                         let with = gio::Menu::new();
@@ -479,6 +501,7 @@ impl relm4::factory::FactoryComponent for HostCard {
                     if *library_enabled {
                         menu.append(Some("Browse library\u{2026}"), Some("card.library"));
                     }
+                    menu.append(Some("Copy link"), Some("card.copy-link"));
                     menu.append(Some("Rename\u{2026}"), Some("card.rename"));
                     menu.append(Some("Forget"), Some("card.forget"));
                 }
@@ -583,6 +606,8 @@ pub enum HostsMsg {
 #[derive(Debug)]
 pub enum HostsOutput {
     Connect(ConnectRequest),
+    /// A one-line confirmation for the window's toast overlay.
+    Toast(String),
     WakeConnect(ConnectRequest),
     Pair(ConnectRequest),
     SpeedTest(ConnectRequest),
@@ -882,6 +907,12 @@ impl SimpleComponent for HostsPage {
                         }
                     }
                     self.rebuild(); // the chip follows immediately
+                }
+                CardOutput::CopyLink(url) => {
+                    if let Some(display) = gtk::gdk::Display::default() {
+                        display.clipboard().set_text(&url);
+                    }
+                    let _ = sender.output(HostsOutput::Toast("Link copied".into()));
                 }
                 CardOutput::TogglePin {
                     fp_hex,
