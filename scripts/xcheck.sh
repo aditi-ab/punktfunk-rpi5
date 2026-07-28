@@ -111,6 +111,14 @@ mkdir -p "$OUT"
   echo
   echo '[workspace.package]'
   sed -n '/^\[workspace\.package\]/,/^$/p' "$REPO/Cargo.toml" | sed '1d;/^$/d'
+  # …and the real [workspace.lints.*] tables. Every crate manifest now carries
+  # `[lints] workspace = true` (the workspace-wide unsafe discipline), and a member inheriting a
+  # lint table the generated ROOT does not define does not merely lose the lint — cargo refuses to
+  # parse the manifest at all ("error inheriting `lints` from workspace root manifest's
+  # `workspace.lints`"), which broke this script outright the day that landed. Mirrored generically
+  # so a new table (clippy, rustdoc, …) is picked up without touching this script again.
+  echo
+  awk '/^\[/ { in_lints = ($0 ~ /^\[workspace\.lints/) } in_lints' "$REPO/Cargo.toml"
 } > "$OUT/Cargo.toml"
 
 mkdir -p "$OUT/punktfunk-core/src"

@@ -133,13 +133,15 @@ unsafe fn desktop_name(h: HDESK) -> Option<String> {
     let mut needed = 0u32;
     // SAFETY: `h` is live per this fn's contract; `name`/`needed` are live out-params and the call
     // writes at most `nlength` bytes, exactly the size passed.
-    GetUserObjectInformationW(
-        HANDLE(h.0),
-        UOI_NAME,
-        Some(name.as_mut_ptr().cast()),
-        (name.len() * 2) as u32,
-        Some(&mut needed),
-    )
+    unsafe {
+        GetUserObjectInformationW(
+            HANDLE(h.0),
+            UOI_NAME,
+            Some(name.as_mut_ptr().cast()),
+            (name.len() * 2) as u32,
+            Some(&mut needed),
+        )
+    }
     .ok()?;
     let len = name.iter().position(|&c| c == 0).unwrap_or(name.len());
     Some(String::from_utf16_lossy(&name[..len]))

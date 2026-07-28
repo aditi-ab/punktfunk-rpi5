@@ -134,6 +134,9 @@ pub unsafe fn make_device(adapter: &IDXGIAdapter1) -> Result<(ID3D11Device, ID3D
         // SAFETY: `dxgi_dev` is a live interface just obtained by a checked `cast`; both calls take
         // a scalar and only report failure through their return value.
         if unsafe { dxgi_dev.SetGPUThreadPriority(0x4000_001E) }.is_err()
+            // SAFETY: same live interface, same scalar-in/HRESULT-out contract as the call above.
+            // Deliberately its own block rather than one around the whole chain, which would
+            // destroy the short-circuit and always issue the relative-priority call too.
             && unsafe { dxgi_dev.SetGPUThreadPriority(7) }.is_err()
         {
             tracing::warn!("SetGPUThreadPriority failed (run as admin/SYSTEM for GPU priority)");
@@ -256,12 +259,17 @@ unsafe fn d3dkmt_set_scheduling_priority_class(
     // process keeps for its lifetime (gdi32 is never unloaded here), and `GetProcAddress` is passed
     // that live handle. Both results are checked by `?` before use.
     let gdi32 = unsafe { LoadLibraryA(s!("gdi32.dll")) }.ok()?;
+    // SAFETY: `gdi32` is the live module handle the checked `LoadLibraryA` just returned, and the
+    // export name is a static NUL-terminated literal; the result is checked by `?` before use.
     let p = unsafe { GetProcAddress(gdi32, s!("D3DKMTSetProcessSchedulingPriorityClass")) }?;
     type SetPrio = unsafe extern "system" fn(HANDLE, i32) -> i32;
     // SAFETY: `p` is the non-null export just resolved, and `SetPrio` is its documented signature
     // (`NTSTATUS D3DKMTSetProcessSchedulingPriorityClass(HANDLE, D3DKMT_SCHEDULINGPRIORITYCLASS)`,
     // both arguments 4/8-byte scalars). `process` is a valid handle by this fn's own contract.
     let f: SetPrio = unsafe { std::mem::transmute(p) };
+    // SAFETY: `f` is that export transmuted to its documented signature directly above; `process`
+    // is a valid handle by this fn's own contract and `prio` is a plain scalar. The call returns an
+    // NTSTATUS and retains nothing.
     Some(unsafe { f(process, prio) })
 }
 
@@ -365,8 +373,12 @@ fn hags_enabled(luid: LUID) -> Option<bool> {
     // SAFETY: static NUL-terminated literals; gdi32 stays loaded for the process lifetime, and each
     // result is checked by `?`/`.ok()?` before the next call uses it.
     let gdi32 = unsafe { LoadLibraryA(s!("gdi32.dll")) }.ok()?;
+    // SAFETY: `gdi32` is the live handle from the `.ok()?`-checked load above; static literal name;
+    // `?` checks the result.
     let open = unsafe { GetProcAddress(gdi32, s!("D3DKMTOpenAdapterFromLuid")) }?;
+    // SAFETY: same live `gdi32` handle and static-literal name; `?` checks the result.
     let query = unsafe { GetProcAddress(gdi32, s!("D3DKMTQueryAdapterInfo")) }?;
+    // SAFETY: same live `gdi32` handle and static-literal name; `?` checks the result.
     let close = unsafe { GetProcAddress(gdi32, s!("D3DKMTCloseAdapter")) }?;
     type OpenFn = unsafe extern "system" fn(*mut OpenFromLuid) -> i32;
     type QueryFn = unsafe extern "system" fn(*mut QueryInfo) -> i32;
@@ -375,7 +387,11 @@ fn hags_enabled(luid: LUID) -> Option<bool> {
     // export's documented signature — one `*mut` to the matching `repr(C)` struct declared here,
     // returning NTSTATUS.
     let open: OpenFn = unsafe { std::mem::transmute(open) };
+    // SAFETY: `query` is the non-null export resolved above and `QueryFn` mirrors its documented
+    // signature — one `*mut` to the `repr(C)` struct declared here, returning NTSTATUS.
     let query: QueryFn = unsafe { std::mem::transmute(query) };
+    // SAFETY: `close` is the non-null export resolved above and `CloseFn` mirrors its documented
+    // signature — one `*mut` to the `repr(C)` struct declared here, returning NTSTATUS.
     let close: CloseFn = unsafe { std::mem::transmute(close) };
 
     let mut oa = OpenFromLuid { luid, h_adapter: 0 };
