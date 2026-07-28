@@ -231,6 +231,8 @@ unsafe impl Send for DrmFrameGuard {}
 
 impl Drop for DrmFrameGuard {
     fn drop(&mut self) {
+        // SAFETY: `self.0` is the one `AVFrame` this guard owns; `av_frame_free` releases it
+        // exactly once (this `Drop` runs once) and nulls the pointer through the `&mut`.
         unsafe { ffmpeg::ffi::av_frame_free(&mut self.0) };
     }
 }

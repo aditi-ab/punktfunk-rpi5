@@ -113,6 +113,10 @@ impl VulkanDecoder {
         vk: &VulkanDecodeDevice,
     ) -> Result<VulkanDecoder> {
         use ffmpeg::ffi;
+        // SAFETY: a self-contained builder — every allocation is made here and null-checked before
+        // use, the `AVVulkanDeviceContext` fields are filled from `vk`'s live handles and from
+        // `_ctx_storage`, which the decoder keeps alive alongside the context, and what survives is
+        // moved into the returned `VulkanDecoder`, which frees each exactly once in `Drop`.
         unsafe {
             let mut hw_device =
                 ffi::av_hwdevice_ctx_alloc(ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VULKAN);
@@ -273,6 +277,9 @@ impl VulkanDecoder {
 
     pub(crate) fn decode(&mut self, au: &[u8]) -> Result<Option<VkVideoFrame>> {
         use ffmpeg::ffi;
+        // SAFETY: `packet`/`frame`/`ctx` are this decoder's own allocations, live for its whole
+        // lifetime; `au` outlives the synchronous `send_packet` that copies out of it, and every
+        // libav return is checked before the result is used.
         unsafe {
             let r = ffi::av_new_packet(self.packet, au.len() as i32);
             if r < 0 {
@@ -327,6 +334,9 @@ impl VulkanDecoder {
     /// at its own submit time.
     fn extract(&mut self) -> Result<VkVideoFrame> {
         use ffmpeg::ffi;
+        // SAFETY: `self.frame` is this decoder's own `AVFrame`; the format check below is what
+        // proves it carries an `AVVkFrame` before anything reads the Vulkan image out of it, and
+        // the clone handed onward keeps the image + frames context alive through present.
         unsafe {
             if (*self.frame).format != ffi::AVPixelFormat::AV_PIX_FMT_VULKAN as i32 {
                 bail!("decoder returned a non-Vulkan frame");
@@ -387,6 +397,9 @@ impl VulkanDecoder {
 impl Drop for VulkanDecoder {
     fn drop(&mut self) {
         use ffmpeg::ffi;
+        // SAFETY: each pointer is this decoder's own allocation and nothing else holds it; `Drop`
+        // runs exactly once, and each free nulls the pointer through its `&mut`, so none can be
+        // released twice. Freed packet-then-frame-then-context, the order libav documents.
         unsafe {
             ffi::av_packet_free(&mut self.packet);
             ffi::av_frame_free(&mut self.frame);
@@ -406,6 +419,9 @@ unsafe extern "C" fn pick_vulkan(
     mut list: *const ffmpeg::ffi::AVPixelFormat,
 ) -> ffmpeg::ffi::AVPixelFormat {
     use ffmpeg::ffi;
+    // SAFETY: libav calls this `get_format` callback with a list it owns, terminated by
+    // `AV_PIX_FMT_NONE` — the walk stops at that terminator, so it stays inside the array, and it
+    // only reads.
     unsafe {
         let mut offered = false;
         while *list != ffi::AVPixelFormat::AV_PIX_FMT_NONE {

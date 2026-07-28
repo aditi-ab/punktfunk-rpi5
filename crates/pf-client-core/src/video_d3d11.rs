@@ -165,6 +165,9 @@ unsafe extern "C" fn get_format_d3d11(
     mut list: *const ffmpeg::ffi::AVPixelFormat,
 ) -> ffmpeg::ffi::AVPixelFormat {
     use ffmpeg::ffi::*;
+    // SAFETY: libav calls this `get_format` callback with a context and a list it owns; the list
+    // is terminated by `AV_PIX_FMT_NONE`, so the walk stays inside it, and `avctx`'s fields are
+    // read/set only while libav holds it live for the call.
     unsafe {
         if (*avctx).hw_device_ctx.is_null() {
             return AVPixelFormat::AV_PIX_FMT_NONE;
@@ -187,6 +190,8 @@ fn decode_profile_supported(device: &ID3D11Device, codec_id: ffmpeg::codec::Id) 
     let video: ID3D11VideoDevice = device
         .cast()
         .context("device lacks ID3D11VideoDevice (created without VIDEO_SUPPORT)")?;
+    // SAFETY: COM calls on the live `ID3D11VideoDevice` obtained by the checked `cast` above; the
+    // count bounds the loop and each profile is returned by value.
     let profiles: Vec<GUID> = unsafe {
         let n = video.GetVideoDecoderProfileCount();
         (0..n)
@@ -200,6 +205,8 @@ fn decode_profile_supported(device: &ID3D11Device, codec_id: ffmpeg::codec::Id) 
         other => bail!("no DXVA profile known for {other:?}"),
     };
     let ok = profiles.contains(&wanted)
+        // SAFETY: same live video device; the two arguments are a borrowed local GUID and a plain
+        // format enum.
         && unsafe { video.CheckVideoDecoderFormat(&wanted, format) }
             .map(|b| b.as_bool())
             .unwrap_or(false);
@@ -210,6 +217,7 @@ fn decode_profile_supported(device: &ID3D11Device, codec_id: ffmpeg::codec::Id) 
     // decode error → software demotion + keyframe re-request path covers the switch.
     if codec_id == ffmpeg::codec::Id::HEVC {
         let main10 = profiles.contains(&PROFILE_HEVC_VLD_MAIN10)
+            // SAFETY: as above — borrowed static GUID plus a plain format enum.
             && unsafe { video.CheckVideoDecoderFormat(&PROFILE_HEVC_VLD_MAIN10, DXGI_FORMAT_P010) }
                 .map(|b| b.as_bool())
                 .unwrap_or(false);
@@ -225,6 +233,9 @@ fn decode_profile_supported(device: &ID3D11Device, codec_id: ffmpeg::codec::Id) 
 /// gap-free stream) instead of dying mid-stream on the opening IDR.
 unsafe fn d3d11va_decode_supported(hw_device: *mut ffmpeg::ffi::AVBufferRef) -> bool {
     use ffmpeg::ffi::*;
+    // SAFETY: `hw_device` is a valid `AVBufferRef` by this fn's contract; the frames context is
+    // allocated, configured and released within this scope, and every libav return is checked
+    // before use.
     unsafe {
         // Scope-bound: this probe owns the frames ctx for the length of the check and the drop
         // below releases it on BOTH exits, instead of the early return relying on the null case and
@@ -250,13 +261,19 @@ unsafe fn d3d11va_decode_supported(hw_device: *mut ffmpeg::ffi::AVBufferRef) -> 
 /// keeps the shared textures on one GPU. `None`/no match falls back to the first hardware
 /// adapter (single-GPU boxes; a WARP-only box fails out to software decode).
 fn create_device(luid: Option<[u8; 8]>) -> Result<(ID3D11Device, ID3D11DeviceContext)> {
+    // SAFETY: DXGI factory creation takes no pointer and returns an owned factory or an error,
+    // checked by `?`.
     let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }.context("CreateDXGIFactory1")?;
     let mut chosen: Option<IDXGIAdapter1> = None;
     let mut fallback: Option<IDXGIAdapter1> = None;
     for i in 0.. {
+        // SAFETY: a COM call on the live factory; the `Ok` binding is what proves an adapter came
+        // back.
         let Ok(adapter) = (unsafe { factory.EnumAdapters1(i) }) else {
             break;
         };
+        // SAFETY: a COM call on the adapter just enumerated, filling a descriptor returned by
+        // value.
         let Ok(desc) = (unsafe { adapter.GetDesc1() }) else {
             continue;
         };
@@ -286,6 +303,8 @@ fn create_device(luid: Option<[u8; 8]>) -> Result<(ID3D11Device, ID3D11DeviceCon
         .ok_or_else(|| anyhow!("no hardware DXGI adapter"))?;
     let mut device = None;
     let mut context = None;
+    // SAFETY: `adapter` is the live adapter chosen above; the two out-params are local `Option`s
+    // the callee only writes, and both are checked before use.
     unsafe {
         D3D11CreateDevice(
             &adapter,
@@ -308,6 +327,8 @@ fn create_device(luid: Option<[u8; 8]>) -> Result<(ID3D11Device, ID3D11DeviceCon
     // keeps the invariant obvious).
     if let Ok(mt) = device.cast::<ID3D11Multithread>() {
         // Returns the PREVIOUS protection state — nothing to act on.
+        // SAFETY: a COM call on the live `ID3D11Multithread` from a checked `cast`; it takes a
+        // BOOL and returns the previous state.
         let _ = unsafe { mt.SetMultithreadProtected(true) };
     }
     Ok((device, context))
@@ -326,6 +347,8 @@ struct Slot {
 
 impl Drop for Slot {
     fn drop(&mut self) {
+        // SAFETY: `self.handle` is the shared-texture NT handle this slot owns; `Drop` runs once,
+        // so it is closed exactly once and never used after.
         unsafe {
             let _ = windows::Win32::Foundation::CloseHandle(self.handle);
         }
@@ -374,8 +397,11 @@ impl SharedRing {
             OutputHeight: height,
             Usage: D3D11_VIDEO_USAGE_PLAYBACK_NORMAL,
         };
+        // SAFETY: COM calls on the live video device, with a borrowed local descriptor and a
+        // checked out-param.
         let enumerator = unsafe { video_device.CreateVideoProcessorEnumerator(&content) }
             .context("CreateVideoProcessorEnumerator")?;
+        // SAFETY: same live device, borrowed enumerator from the line above.
         let vp = unsafe { video_device.CreateVideoProcessor(&enumerator, 0) }
             .context("CreateVideoProcessor")?;
 
@@ -407,6 +433,8 @@ impl SharedRing {
         let mut slots = Vec::with_capacity(RING_SLOTS);
         for _ in 0..RING_SLOTS {
             let mut tex = None;
+            // SAFETY: a `?`-checked `CreateTexture2D` on the live device, over a fully-initialized
+            // stack descriptor and a live `Option` out-param.
             unsafe { device.CreateTexture2D(&desc, None, Some(&mut tex)) }
                 .context("create shared hand-off texture")?;
             let tex: ID3D11Texture2D = tex.expect("CreateTexture2D succeeded");
@@ -414,6 +442,8 @@ impl SharedRing {
                 tex.cast().context("shared texture lacks IDXGIKeyedMutex")?;
             let resource: IDXGIResource1 =
                 tex.cast().context("shared texture lacks IDXGIResource1")?;
+            // SAFETY: the shared-handle creation runs on the live texture just created; the
+            // returned NT handle is owned by the `Slot` built below, which closes it in `Drop`.
             let handle = unsafe {
                 resource.CreateSharedHandle(
                     None,
@@ -428,6 +458,8 @@ impl SharedRing {
                 ..Default::default()
             };
             let mut out_view = None;
+            // SAFETY: COM calls on the live video device with borrowed local descriptors and a
+            // checked out-param.
             unsafe {
                 video_device.CreateVideoProcessorOutputView(
                     &tex,
@@ -518,6 +550,9 @@ impl D3d11vaDecoder {
         let video_context1: ID3D11VideoContext1 = context
             .cast()
             .context("context lacks ID3D11VideoContext1 (pre-1703 Windows?)")?;
+        // SAFETY: a self-contained builder: every libav allocation is made here and null-checked,
+        // the D3D11VA hwctx fields are filled from the live device/context borrowed above, and
+        // what survives is moved into the decoder, which frees each exactly once in `Drop`.
         unsafe {
             let hw_device =
                 ffi::av_hwdevice_ctx_alloc(ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA);
@@ -579,6 +614,9 @@ impl D3d11vaDecoder {
 
     pub(crate) fn decode(&mut self, au: &[u8]) -> Result<Option<D3d11Frame>> {
         use ffmpeg::ffi;
+        // SAFETY: `packet`/`frame`/`ctx` are this decoder's own allocations, live for its whole
+        // lifetime; `au` outlives the synchronous copy out of it, and every libav return is
+        // checked before use.
         unsafe {
             let r = ffi::av_new_packet(self.packet, au.len() as i32);
             if r < 0 {
@@ -616,6 +654,8 @@ impl D3d11vaDecoder {
     /// stream runs `RING_SLOTS` ahead of present).
     fn lift(&mut self) -> Result<D3d11Frame> {
         use ffmpeg::ffi;
+        // SAFETY: `self.frame` is this decoder's own `AVFrame`; the format check below is what
+        // proves it carries a D3D11 texture before anything reads the surface out of it.
         unsafe {
             if (*self.frame).format != ffi::AVPixelFormat::AV_PIX_FMT_D3D11 as i32 {
                 bail!("decoder returned a software frame (no D3D11 surface)");
@@ -794,6 +834,9 @@ impl D3d11vaDecoder {
 impl Drop for D3d11vaDecoder {
     fn drop(&mut self) {
         use ffmpeg::ffi;
+        // SAFETY: each pointer is this decoder's own allocation and nothing else holds it; `Drop`
+        // runs exactly once and each free nulls its pointer through the `&mut`, so none can be
+        // released twice.
         unsafe {
             ffi::av_packet_free(&mut self.packet);
             ffi::av_frame_free(&mut self.frame);

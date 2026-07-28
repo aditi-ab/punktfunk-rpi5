@@ -19,6 +19,9 @@ unsafe extern "C" fn pick_vaapi(
     _ctx: *mut ffmpeg::ffi::AVCodecContext,
     mut list: *const ffmpeg::ffi::AVPixelFormat,
 ) -> ffmpeg::ffi::AVPixelFormat {
+    // SAFETY: libav calls this `get_format` callback with a list it owns, terminated by
+    // `AV_PIX_FMT_NONE` — the walk stops at that terminator, so it stays inside the array, and it
+    // only reads.
     unsafe {
         while *list != ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_NONE {
             if *list == ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_VAAPI {
@@ -59,6 +62,9 @@ unsafe impl Send for VaapiDecoder {}
 impl VaapiDecoder {
     pub(crate) fn new(codec_id: ffmpeg::codec::Id) -> Result<VaapiDecoder> {
         use ffmpeg::ffi;
+        // SAFETY: a self-contained builder — every allocation below is made here, each result is
+        // checked before the next call uses it, and the ones that survive are moved into the
+        // returned `VaapiDecoder`, which frees each exactly once in `Drop`.
         unsafe {
             let mut hw_device: *mut ffi::AVBufferRef = ptr::null_mut();
             let r = ffi::av_hwdevice_ctx_create(
@@ -109,6 +115,9 @@ impl VaapiDecoder {
 
     pub(crate) fn decode(&mut self, au: &[u8]) -> Result<Option<DmabufFrame>> {
         use ffmpeg::ffi;
+        // SAFETY: `packet`/`frame`/`ctx` are this decoder's own allocations, live for its whole
+        // lifetime; `au` outlives the synchronous `send_packet` that copies out of it, and every
+        // libav return is checked before the result is used.
         unsafe {
             let r = ffi::av_new_packet(self.packet, au.len() as i32);
             if r < 0 {
@@ -147,6 +156,8 @@ impl VaapiDecoder {
     /// `DRM_FORMAT_NV12`) and flatten every plane across every layer in order (Y then UV).
     fn map_dmabuf(&mut self) -> Result<DmabufFrame> {
         use ffmpeg::ffi;
+        // SAFETY: `self.frame` is this decoder's own `AVFrame`, holding a decoded VAAPI surface —
+        // the format check below is what proves that before anything reads the hardware layout.
         unsafe {
             if (*self.frame).format != ffi::AVPixelFormat::AV_PIX_FMT_VAAPI as i32 {
                 bail!("decoder returned a software frame (no VAAPI surface)");
@@ -247,6 +258,9 @@ fn log_descriptor_once(
 impl Drop for VaapiDecoder {
     fn drop(&mut self) {
         use ffmpeg::ffi;
+        // SAFETY: each pointer is this decoder's own allocation and nothing else holds it; `Drop`
+        // runs exactly once, and each free nulls the pointer through its `&mut`, so none can be
+        // released twice. Freed packet-then-frame-then-context, the order libav documents.
         unsafe {
             ffi::av_packet_free(&mut self.packet);
             ffi::av_frame_free(&mut self.frame);

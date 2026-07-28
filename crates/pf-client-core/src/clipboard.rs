@@ -292,6 +292,7 @@ mod os {
     /// A registered clipboard format id, by name (`PNG`, the concealed marker, …).
     fn registered(name: &str) -> u32 {
         let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+        // SAFETY: `wide` is a local NUL-terminated UTF-16 buffer that outlives this synchronous call.
         unsafe { RegisterClipboardFormatW(PCWSTR(wide.as_ptr())) }
     }
 
@@ -305,6 +306,7 @@ mod os {
         fn open() -> Result<Clip> {
             // A retry loop: another app can hold the clipboard for a moment.
             for _ in 0..10 {
+                // SAFETY: takes no pointer; `None` is the documented "associate with no window" argument.
                 if unsafe { OpenClipboard(None) }.is_ok() {
                     return Ok(Clip);
                 }
@@ -315,26 +317,31 @@ mod os {
     }
     impl Drop for Clip {
         fn drop(&mut self) {
+            // SAFETY: pairs with the `OpenClipboard` that built this guard; closing is what `Drop` is for.
             let _ = unsafe { CloseClipboard() };
         }
     }
 
     pub fn sequence_number() -> u32 {
+        // SAFETY: a no-argument query that only reads the OS clipboard's sequence counter.
         unsafe { GetClipboardSequenceNumber() }
     }
 
     /// Password managers mark secrets with this format; §5.2's concealed-type rule.
     pub fn is_concealed() -> bool {
         let fmt = registered("ExcludeClipboardContentFromMonitorProcessing");
+        // SAFETY: a scalar format id in, a status out; reads nothing through a pointer.
         unsafe { IsClipboardFormatAvailable(fmt) }.is_ok()
     }
 
     /// The wire kinds the current clipboard can supply, with size hints where they're free.
     pub fn available_kinds() -> Vec<(&'static str, u64)> {
         let mut out = Vec::new();
+        // SAFETY: as above — a scalar format id, status out.
         if unsafe { IsClipboardFormatAvailable(CF_UNICODETEXT) }.is_ok() {
             out.push((MIME_TEXT, 0));
         }
+        // SAFETY: as above — a scalar format id, status out.
         if unsafe { IsClipboardFormatAvailable(png_format()) }.is_ok() {
             out.push((MIME_PNG, 0));
         }
@@ -346,32 +353,43 @@ mod os {
         let _clip = Clip::open()?;
         match mime {
             MIME_TEXT => {
+                // SAFETY: the clipboard is open (the `Clip` guard); the handle returned is BORROWED from the clipboard and stays valid while it is open, so it is never freed here.
                 let h = unsafe { GetClipboardData(CF_UNICODETEXT) }?;
                 let g = HGLOBAL(h.0);
+                // SAFETY: `g` is that borrowed clipboard handle; `GlobalLock` yields a pointer valid until the matching `GlobalUnlock` below.
                 let p = unsafe { GlobalLock(g) } as *const u16;
                 if p.is_null() {
                     bail!("clipboard text lock failed");
                 }
                 // GlobalSize is a byte count of a NUL-terminated UTF-16 buffer.
+                // SAFETY: a size query on the same live handle.
                 let bytes = unsafe { GlobalSize(g) };
                 let mut len = bytes / 2;
+                // SAFETY: `p` is the locked buffer and `len` is derived from the `GlobalSize` above, so the slice stays inside the allocation; it is read before the unlock.
                 let slice = unsafe { std::slice::from_raw_parts(p, len) };
                 if let Some(nul) = slice.iter().position(|&c| c == 0) {
                     len = nul;
                 }
+                // SAFETY: as above — same locked buffer and same length, read before the unlock.
                 let text = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(p, len) });
+                // SAFETY: releases the lock taken above, exactly once.
                 let _ = unsafe { GlobalUnlock(g) };
                 Ok(text.into_bytes())
             }
             MIME_PNG => {
+                // SAFETY: as the text path — the handle is borrowed from the open clipboard, never freed here.
                 let h = unsafe { GetClipboardData(png_format()) }?;
                 let g = HGLOBAL(h.0);
+                // SAFETY: `g` is that borrowed handle; the pointer is valid until the matching unlock.
                 let p = unsafe { GlobalLock(g) } as *const u8;
                 if p.is_null() {
                     bail!("clipboard png lock failed");
                 }
+                // SAFETY: a size query on the same live handle.
                 let len = unsafe { GlobalSize(g) };
+                // SAFETY: `p` is the locked buffer and `len` came from `GlobalSize`, so the slice is in bounds; it is copied out before the unlock.
                 let out = unsafe { std::slice::from_raw_parts(p, len) }.to_vec();
+                // SAFETY: releases the lock taken above, exactly once.
                 let _ = unsafe { GlobalUnlock(g) };
                 Ok(out)
             }
@@ -392,15 +410,21 @@ mod os {
             other => bail!("unsupported clipboard format {other}"),
         };
         let _clip = Clip::open()?;
+        // SAFETY: no arguments; the clipboard is open and owned by this thread via the `Clip` guard.
         unsafe { EmptyClipboard() }?;
         // The clipboard OWNS this block once SetClipboardData succeeds — do not free it.
+        // SAFETY: a size in, an owned moveable handle out — ownership passes to the clipboard at `SetClipboardData` below.
         let g = unsafe { GlobalAlloc(GMEM_MOVEABLE, payload.len()) }?;
+        // SAFETY: `g` is the handle just allocated; the pointer is valid until the matching unlock.
         let p = unsafe { GlobalLock(g) } as *mut u8;
         if p.is_null() {
             bail!("clipboard alloc lock failed");
         }
+        // SAFETY: `p` addresses that locked block, allocated at exactly `payload.len()` bytes on the line above, and the two regions are distinct allocations.
         unsafe { std::ptr::copy_nonoverlapping(payload.as_ptr(), p, payload.len()) };
+        // SAFETY: releases the lock taken above, before the handle is handed to the clipboard.
         let _ = unsafe { GlobalUnlock(g) };
+        // SAFETY: ownership of `g` transfers to the clipboard here, which is why nothing frees it afterwards.
         unsafe { SetClipboardData(fmt, Some(HANDLE(g.0))) }?;
         Ok(())
     }

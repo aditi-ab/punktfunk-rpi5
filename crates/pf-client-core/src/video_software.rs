@@ -23,6 +23,9 @@ impl SoftwareDecoder {
         let codec = ffmpeg::decoder::find(codec_id)
             .ok_or_else(|| anyhow!("no {codec_id:?} decoder in libavcodec"))?;
         let mut ctx = ffmpeg::codec::Context::new_with_codec(codec);
+        // SAFETY: `as_mut_ptr` yields the `AVCodecContext` behind the `ctx` allocated on the line
+        // above, which outlives these writes; each store is an in-bounds scalar field write on that
+        // live context, made before the decoder is opened and reads them.
         unsafe {
             let raw = ctx.as_mut_ptr();
             (*raw).flags |= ffmpeg::ffi::AV_CODEC_FLAG_LOW_DELAY as i32;
@@ -70,6 +73,9 @@ impl SoftwareDecoder {
                 5 | 6 => SWS_CS_ITU601,
                 _ => SWS_CS_ITU709,
             };
+            // SAFETY: `sws_getCoefficients` returns a pointer into libav's own static coefficient
+            // tables — valid for the process, read-only — and `sws_setColorspaceDetails` takes it
+            // plus the live `SwsContext` behind `ctx` and plain scalars.
             unsafe {
                 let coeffs = ffmpeg::ffi::sws_getCoefficients(cs);
                 ffmpeg::ffi::sws_setColorspaceDetails(

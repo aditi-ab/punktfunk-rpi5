@@ -14,6 +14,12 @@
 //! so `crate::audio` is the only name the session pump ever sees. `keymap` (evdev-keyed)
 //! stays Linux: the session path uses pf-presenter's SDL-scancode table instead.
 
+// Unsafe-proof program: every `unsafe {}` / `unsafe impl` in this crate carries a `// SAFETY:`
+// proof of why it is sound. This crate held ~91 unsafe items with NO enforcement while every
+// other subsystem crate denied it — the decoders' `unsafe impl Send`s had a one-line aside
+// instead of an argument precisely because nothing required one.
+#![deny(clippy::undocumented_unsafe_blocks)]
+
 #[cfg(target_os = "linux")]
 pub mod audio;
 #[cfg(windows)]

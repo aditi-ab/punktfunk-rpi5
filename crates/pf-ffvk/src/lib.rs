@@ -6,6 +6,8 @@
 //! conversion helpers below cross between them and ash's u64-newtype handles; both sides
 //! are the same underlying Vulkan object handles, so the casts are value-preserving.
 
+// Unsafe-proof program: every `unsafe {}` here carries a `// SAFETY:` proof.
+#![deny(clippy::undocumented_unsafe_blocks)]
 #![allow(non_upper_case_globals)]
 #![allow(non_camel_case_types)]
 #![allow(non_snake_case)]
@@ -63,6 +65,9 @@ pub mod ashx {
             *const std::ffi::c_char,
         ) -> ash::vk::PFN_vkVoidFunction,
     ) -> PFN_vkGetInstanceProcAddr {
+        // SAFETY: both sides are `extern "system"` fn pointers with the identical signature —
+        // `(VkInstance, *const c_char) -> PFN_vkVoidFunction`. The transmute only reinterprets the
+        // ash-side type alias as our bindgen-side one, which are the same ABI type.
         unsafe { std::mem::transmute(f) }
     }
 }
@@ -75,6 +80,9 @@ mod tests {
     /// readable at the offsets bindgen computed — sem_value zero-initialized.
     #[test]
     fn vk_frame_alloc_links_and_zeroes() {
+        // SAFETY: `av_vk_frame_alloc` is libavutil's own allocator and returns either null —
+        // asserted against before any field is read — or a zero-initialized `AVVkFrame` valid for
+        // the reads below. The frame is deliberately leaked, so nothing frees it twice.
         unsafe {
             let f = av_vk_frame_alloc();
             assert!(!f.is_null(), "av_vk_frame_alloc returned NULL");
@@ -87,6 +95,8 @@ mod tests {
     /// AV_NUM_DATA_POINTERS-sized arrays came through with the right length.
     #[test]
     fn frame_arrays_are_av_num_data_pointers() {
+        // SAFETY: `AVVkFrame` is a `repr(C)` POD of scalars, handles and fixed-size arrays, so
+        // all-zeroes is a valid bit pattern for it; the test only reads array lengths.
         let f: AVVkFrame = unsafe { std::mem::zeroed() };
         assert_eq!(f.img.len(), 8);
         assert_eq!(f.sem_value.len(), 8);

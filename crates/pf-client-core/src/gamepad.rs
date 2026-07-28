@@ -999,6 +999,8 @@ impl Worker {
     fn set_slot_sensors(slot: &mut Slot, enabled: bool) {
         use sdl3::sensor::SensorType;
         for s in [SensorType::Gyroscope, SensorType::Accelerometer] {
+            // SAFETY: an SDL3 query on the gamepad this slot owns and keeps open; it takes a
+            // plain sensor-type enum and only reads device state.
             if unsafe { slot.pad.has_sensor(s) } {
                 let _ = slot.pad.sensor_set_enabled(s, enabled);
             }
