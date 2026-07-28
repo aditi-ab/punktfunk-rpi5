@@ -33,9 +33,15 @@ export const DetailCard: FC<{
 					<span>
 						{m.stats_detail_title()}
 						{cap && (
+							// Encoder + GPU ride along with the mode: the stage split below can't be
+							// read without knowing which backend produced it (a 10 ms `submit` means
+							// very different things on NVENC and on Vulkan). Older recordings predate
+							// the fields and simply omit them.
 							<span className="ml-2 text-sm font-normal text-muted-foreground">
 								{cap.meta.width}×{cap.meta.height}@{cap.meta.fps} ·{" "}
 								{cap.meta.codec.toUpperCase()}
+								{cap.meta.encoder_backend && ` · ${cap.meta.encoder_backend}`}
+								{cap.meta.gpu && ` · ${cap.meta.gpu}`}
 							</span>
 						)}
 					</span>

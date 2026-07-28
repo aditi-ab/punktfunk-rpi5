@@ -3912,10 +3912,18 @@
             "format": "int64",
             "minimum": 0
           },
+          "encoder_backend": {
+            "type": "string",
+            "description": "The encode backend that ACTUALLY opened for this session — `\"nvenc\"`, `\"vaapi\"`,\n`\"vulkan\"`, `\"amf\"`, `\"qsv\"`, `\"software\"`, … — and the GPU it runs on.\n\nRecorded because the stage split alone can't be read without them. A p50 `submit` of 10 ms\nmeans \"the GPU's CSC+encode throughput is the ceiling\" on one backend and something else\nentirely on another, and every fps-shortfall report so far has cost a round-trip asking\nwhich one it was. Both come from `pf_gpu::active()`, the record the encoder open itself\nwrites, so they name the branch that really opened rather than a re-derived guess.\n\n`\"\"` when nothing was streaming at registration (or on a build without the record)."
+          },
           "fps": {
             "type": "integer",
             "format": "int32",
             "minimum": 0
+          },
+          "gpu": {
+            "type": "string",
+            "description": "Human-readable GPU name (`\"NVIDIA GeForce RTX 4090\"`, `\"CPU (openh264)\"`), or `\"\"`."
           },
           "height": {
             "type": "integer",

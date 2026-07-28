@@ -232,6 +232,8 @@ export const captureMetas: CaptureMeta[] = [
 		duration_ms: 92_000,
 		sample_count: 92,
 		started_unix_ms: 1_782_415_260_000,
+		encoder_backend: "nvenc",
+		gpu: "NVIDIA GeForce RTX 4090",
 	},
 	{
 		id: "cap-20260628-1903",

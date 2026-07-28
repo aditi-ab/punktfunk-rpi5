@@ -80,6 +80,21 @@ pub struct CaptureMeta {
     /// Short label / fingerprint prefix, or `""` if unknown.
     pub client: String,
     pub sample_count: u32,
+    /// The encode backend that ACTUALLY opened for this session — `"nvenc"`, `"vaapi"`,
+    /// `"vulkan"`, `"amf"`, `"qsv"`, `"software"`, … — and the GPU it runs on.
+    ///
+    /// Recorded because the stage split alone can't be read without them. A p50 `submit` of 10 ms
+    /// means "the GPU's CSC+encode throughput is the ceiling" on one backend and something else
+    /// entirely on another, and every fps-shortfall report so far has cost a round-trip asking
+    /// which one it was. Both come from `pf_gpu::active()`, the record the encoder open itself
+    /// writes, so they name the branch that really opened rather than a re-derived guess.
+    ///
+    /// `""` when nothing was streaming at registration (or on a build without the record).
+    #[serde(default)]
+    pub encoder_backend: String,
+    /// Human-readable GPU name (`"NVIDIA GeForce RTX 4090"`, `"CPU (openh264)"`), or `""`.
+    #[serde(default)]
+    pub gpu: String,
 }
 
 /// A full capture: summary + the sample time-series. The wire + on-disk shape.
@@ -115,6 +130,8 @@ struct MetaSeed {
     fps: u32,
     codec: String,
     client: String,
+    encoder_backend: String,
+    gpu: String,
 }
 
 /// The in-progress capture (present iff armed).
@@ -246,6 +263,12 @@ impl StatsRecorder {
         client: &str,
     ) -> u32 {
         let sid = self.next_sid.fetch_add(1, Ordering::Relaxed);
+        // The live encode backend + GPU, straight from the record the encoder open wrote. Read
+        // outside the lock (it takes its own) and only on the first registration path's behalf —
+        // this runs once per capture, not per frame.
+        let (encoder_backend, gpu) = pf_gpu::active()
+            .map(|(g, _)| (g.backend.to_string(), g.name))
+            .unwrap_or_default();
         let mut guard = self.live.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(live) = guard.as_mut() {
             if live.meta.is_none() {
@@ -256,6 +279,8 @@ impl StatsRecorder {
                     fps,
                     codec: codec.to_string(),
                     client: client.to_string(),
+                    encoder_backend,
+                    gpu,
                 });
             }
         }
@@ -398,7 +423,7 @@ fn status_of(live: Option<&Live>) -> StatsStatus {
 /// Compute the `CaptureMeta` for an in-progress or finalizing capture (id derived from the start
 /// time + negotiated mode; duration from the monotonic start).
 fn meta_of(live: &Live) -> CaptureMeta {
-    let (kind, width, height, fps, codec, client) = match &live.meta {
+    let (kind, width, height, fps, codec, client, encoder_backend, gpu) = match &live.meta {
         Some(m) => (
             m.kind.clone(),
             m.width,
@@ -406,8 +431,10 @@ fn meta_of(live: &Live) -> CaptureMeta {
             m.fps,
             m.codec.clone(),
             m.client.clone(),
+            m.encoder_backend.clone(),
+            m.gpu.clone(),
         ),
-        None => (String::new(), 0, 0, 0, String::new(), String::new()),
+        None => Default::default(),
     };
     CaptureMeta {
         id: capture_id(live.started_unix_ms, width, height),
@@ -420,6 +447,8 @@ fn meta_of(live: &Live) -> CaptureMeta {
         codec,
         client,
         sample_count: live.samples.len() as u32,
+        encoder_backend,
+        gpu,
     }
 }
 
