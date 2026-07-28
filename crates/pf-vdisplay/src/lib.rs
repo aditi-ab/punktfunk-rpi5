@@ -268,33 +268,49 @@ pub fn with_env_lock<R>(f: impl FnOnce() -> R) -> R {
 /// a backend for a test), else the **live session** ([`detect_active_session`] — so a Bazzite box
 /// follows Gaming↔Desktop switches), else a last-resort `XDG_CURRENT_DESKTOP` read.
 pub fn detect() -> Result<Compositor> {
-    if let Some(v) = pf_host_config::config().compositor.as_deref() {
-        return compositor_from_pin(v).ok_or_else(|| {
-            anyhow::anyhow!(
-                "unknown PUNKTFUNK_COMPOSITOR '{v}' (kwin|wlroots|hyprland|mutter|gamescope)"
-            )
-        });
+    // Compositor detection is a Linux question — the variants ARE the Linux backends. Asked
+    // anywhere else this used to fall through to the XDG sniff below and fail with advice about
+    // `XDG_CURRENT_DESKTOP` and `PUNKTFUNK_COMPOSITOR`, which `mgmt/display.rs` puts VERBATIM into
+    // the `/display/monitors` response — so on a Windows host the console's only explanation for an
+    // empty monitor picker was Linux troubleshooting (sweep §13.17). The operator pin is gated with
+    // it: naming a Wayland compositor on Windows cannot be honoured either.
+    #[cfg(not(target_os = "linux"))]
+    {
+        anyhow::bail!(
+            "compositor detection is Linux-only; on {} the host enumerates displays through the OS \
+             display API instead (`vdisplay::monitors::list_windows`)",
+            std::env::consts::OS
+        )
     }
     #[cfg(target_os = "linux")]
-    if let Some(c) = compositor_for_kind(detect_active_session().kind) {
-        return Ok(c);
-    }
-    let desktop = std::env::var("XDG_CURRENT_DESKTOP")
-        .unwrap_or_default()
-        .to_ascii_uppercase();
-    if desktop.contains("KDE") {
-        Ok(Compositor::Kwin)
-    } else if desktop.contains("GNOME") {
-        Ok(Compositor::Mutter)
-    } else if desktop.contains("HYPRLAND") {
-        Ok(Compositor::Hyprland)
-    } else if desktop.contains("SWAY") || desktop.contains("WLROOTS") {
-        Ok(Compositor::Wlroots)
-    } else {
-        anyhow::bail!(
-            "could not detect compositor: no live graphical session for this uid and \
-             XDG_CURRENT_DESKTOP='{desktop}'; set PUNKTFUNK_COMPOSITOR"
-        )
+    {
+        if let Some(v) = pf_host_config::config().compositor.as_deref() {
+            return compositor_from_pin(v).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "unknown PUNKTFUNK_COMPOSITOR '{v}' (kwin|wlroots|hyprland|mutter|gamescope)"
+                )
+            });
+        }
+        if let Some(c) = compositor_for_kind(detect_active_session().kind) {
+            return Ok(c);
+        }
+        let desktop = std::env::var("XDG_CURRENT_DESKTOP")
+            .unwrap_or_default()
+            .to_ascii_uppercase();
+        if desktop.contains("KDE") {
+            Ok(Compositor::Kwin)
+        } else if desktop.contains("GNOME") {
+            Ok(Compositor::Mutter)
+        } else if desktop.contains("HYPRLAND") {
+            Ok(Compositor::Hyprland)
+        } else if desktop.contains("SWAY") || desktop.contains("WLROOTS") {
+            Ok(Compositor::Wlroots)
+        } else {
+            anyhow::bail!(
+                "could not detect compositor: no live graphical session for this uid and \
+                 XDG_CURRENT_DESKTOP='{desktop}'; set PUNKTFUNK_COMPOSITOR"
+            )
+        }
     }
 }
 

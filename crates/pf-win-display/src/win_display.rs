@@ -998,6 +998,25 @@ pub struct TargetInventory {
     pub friendly: String,
     /// Monitor device interface path — maps to the PnP instance id (`monitor_devnode`).
     pub monitor_device_path: String,
+    /// One of OUR virtual displays (see [`is_our_virtual_display`]) — the reliable answer to
+    /// "is this the operator's screen or something we made?", which the connector class cannot give.
+    pub ours: bool,
+    /// GDI device name (`\\.\DISPLAY1`) of the SOURCE driving this target; empty when inactive
+    /// (an inactive path has no source). This is the id a Windows operator recognises and the one
+    /// capture pins on.
+    pub gdi_name: String,
+    /// Desktop position + mode of the driving source, in PIXELS. All zero when inactive: the CCD
+    /// mode indices are only valid for active paths, and inventing geometry for a dark head would
+    /// be worse than reporting none.
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+    /// Refresh in mHz (60000 = 60 Hz), from the path's own `refreshRate` rational. 0 when the
+    /// path reports no rate (inactive, or a target that does not drive one).
+    pub refresh_mhz: u32,
+    /// The desktop origin sits on this head — Windows' notion of "primary".
+    pub primary: bool,
 }
 
 /// EDID manufacturer id of punktfunk's own IddCx monitors, as it appears in the PnP hardware id and
@@ -1131,18 +1150,66 @@ pub fn target_inventory() -> Vec<TargetInventory> {
         let (mut external_physical, mut tech) = output_tech_class(req.outputTechnology);
         // Our own IddCx monitor claims HDMI, so the connector class alone would call it one of the
         // operator's panels — see `is_our_virtual_display` for what that broke.
-        if is_our_virtual_display(&monitor_device_path) {
+        let ours = is_our_virtual_display(&monitor_device_path);
+        if ours {
             external_physical = false;
             tech = "punktfunk-virtual";
         }
+        let is_active = active.contains(&key);
+        // Geometry + the GDI name come from the SOURCE this path drives, and only an ACTIVE path
+        // has one — `modeInfoIdx` is the INVALID sentinel otherwise, so everything stays zeroed
+        // rather than indexing the mode table with 0xffffffff.
+        let (mut gdi_name, mut x, mut y, mut width, mut height) =
+            (String::new(), 0i32, 0i32, 0u32, 0u32);
+        if is_active {
+            // SAFETY: POD union read (header) — `modeInfoIdx` overlays a same-sized bitfield
+            // struct, both valid for every bit pattern. Used only as a bounds-checked index below.
+            let idx = unsafe { p.sourceInfo.Anonymous.modeInfoIdx } as usize;
+            if let Some(m) = modes.get(idx) {
+                if m.infoType == DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE {
+                    // SAFETY: discriminated union read — the `infoType` test directly above is the
+                    // discriminant the CCD contract defines for `sourceMode`.
+                    let sm = unsafe { m.Anonymous.sourceMode };
+                    x = sm.position.x;
+                    y = sm.position.y;
+                    width = sm.width;
+                    height = sm.height;
+                }
+            }
+            let mut src = DISPLAYCONFIG_SOURCE_DEVICE_NAME::default();
+            src.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+            src.header.size = size_of::<DISPLAYCONFIG_SOURCE_DEVICE_NAME>() as u32;
+            src.header.adapterId = p.sourceInfo.adapterId;
+            src.header.id = p.sourceInfo.id;
+            // SAFETY: `src.header` is a live local whose `size` was just set to the enclosing
+            // struct's own `size_of`, which is the contract telling the OS how many bytes it may
+            // write; the struct outlives this synchronous call.
+            if unsafe { DisplayConfigGetDeviceInfo(&mut src.header) } == 0 {
+                gdi_name = utf16z_str(&src.viewGdiDeviceName);
+            }
+        }
+        // A rational, not a scalar: mHz keeps 59.94 distinguishable from 60 without a float.
+        let refresh_mhz = match t.refreshRate.Denominator {
+            0 => 0,
+            d => (u64::from(t.refreshRate.Numerator) * 1000 / u64::from(d)) as u32,
+        };
         out.push(TargetInventory {
             target_id: t.id,
-            active: active.contains(&key),
+            active: is_active,
             external_physical,
             internal_panel: tech == "internal-panel",
             tech,
             friendly: utf16z_str(&req.monitorFriendlyDeviceName),
             monitor_device_path,
+            ours,
+            gdi_name,
+            // Windows' primary is the head at the desktop origin.
+            primary: is_active && x == 0 && y == 0,
+            x,
+            y,
+            width,
+            height,
+            refresh_mhz,
         });
     }
     out

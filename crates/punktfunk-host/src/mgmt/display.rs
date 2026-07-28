@@ -250,10 +250,24 @@ pub(crate) async fn get_display_monitors() -> Json<MonitorsResponse> {
     let pinned = crate::vdisplay::capture_monitor();
     #[cfg(not(target_os = "linux"))]
     let pinned: Option<String> = None;
-    // Enumeration shells out / round-trips D-Bus + Wayland, so keep it off the async worker.
-    let (compositor, listed) = tokio::task::spawn_blocking(|| match crate::vdisplay::detect() {
-        Ok(c) => (Some(c.id().to_string()), crate::vdisplay::monitors::list(c)),
-        Err(e) => (None, Err(e)),
+    // Enumeration shells out / round-trips D-Bus + Wayland (and on Windows walks the CCD
+    // database, which can serialize on the display-config lock), so keep it off the async worker.
+    let (compositor, listed) = tokio::task::spawn_blocking(|| {
+        // Windows has no compositor to detect — asking used to fail with Linux advice about
+        // XDG_CURRENT_DESKTOP, which landed verbatim in `error` below and was the console's only
+        // explanation for an empty picker. Report the display API we actually used instead.
+        #[cfg(windows)]
+        {
+            (
+                Some("windows".to_string()),
+                crate::vdisplay::monitors::list_windows(),
+            )
+        }
+        #[cfg(not(windows))]
+        match crate::vdisplay::detect() {
+            Ok(c) => (Some(c.id().to_string()), crate::vdisplay::monitors::list(c)),
+            Err(e) => (None, Err(e)),
+        }
     })
     .await
     .unwrap_or_else(|e| (None, Err(anyhow::anyhow!("enumeration task failed: {e}"))));

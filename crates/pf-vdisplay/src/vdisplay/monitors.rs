@@ -111,6 +111,62 @@ pub fn list(compositor: Compositor) -> Result<Vec<PhysicalMonitor>> {
     }
 }
 
+/// Every head Windows reports — the non-compositor counterpart to [`list`].
+///
+/// Windows has no compositor to ask, so this reads the same CCD database the rest of the Windows
+/// backend drives and reports what it finds. Until this existed the mgmt API answered
+/// `/display/monitors` on Windows with an empty list and a LINUX error string (`detect()` fell
+/// through to an `XDG_CURRENT_DESKTOP` sniff), so the console could neither show the operator's
+/// screen nor honestly say why.
+///
+/// INACTIVE heads are listed too, with zeroed geometry and `enabled: false` — the same contract
+/// [`list`] documents, so "why can't I pick it?" still has an answer.
+///
+/// Two fields cannot mean here what they mean on Linux, and are reported honestly rather than
+/// invented:
+/// * `scale` is always `1.0`. Windows scaling is per-monitor DPI applied by each application, not
+///   a compositor-global logical scale, so there is no factor that would make these coordinates
+///   "logical" the way the module doc means. The geometry below is therefore PIXELS.
+/// * `refresh_mhz` comes from the path's own rational rate, which keeps 59.94 distinct from 60.
+#[cfg(windows)]
+pub fn list_windows() -> Result<Vec<PhysicalMonitor>> {
+    let inv = pf_win_display::win_display::target_inventory();
+    if inv.is_empty() {
+        // Distinguish "reached it, nothing there" from a failure, exactly as [`list`] promises:
+        // an empty CCD database is a real state (every panel off — measured on .173 with the TV
+        // powered down), not an error.
+        return Ok(Vec::new());
+    }
+    Ok(inv
+        .into_iter()
+        .map(|t| {
+            // The GDI name is what an operator recognises and what capture pins on; an inactive
+            // path has none, so fall back to the stable target id rather than an empty string —
+            // `resolve` matches on this, and a blank id can never be pinned.
+            let connector = if t.gdi_name.is_empty() {
+                format!("target-{}", t.target_id)
+            } else {
+                t.gdi_name
+            };
+            PhysicalMonitor {
+                description: describe("", &t.friendly, &connector),
+                connector,
+                width: t.width,
+                height: t.height,
+                refresh_mhz: t.refresh_mhz,
+                x: t.x,
+                y: t.y,
+                scale: 1.0,
+                primary: t.primary,
+                enabled: t.active,
+                // Unlike the Linux backends, Windows CAN say this reliably: our IddCx monitors
+                // carry our own EDID manufacturer id in their device path.
+                managed: t.ours,
+            }
+        })
+        .collect())
+}
+
 /// Resolve a configured monitor name against `monitors`, exactly then case-insensitively.
 ///
 /// **A miss is a hard error carrying the available names**, never a silent fall-back to some other

@@ -1057,6 +1057,40 @@ mod tests {
         );
     }
 
+    /// What `/display/monitors` will now answer on Windows — the operator's real screens.
+    ///
+    /// Read-only, so it is safe against a live host. Before `monitors::list_windows` existed this
+    /// endpoint returned an empty list plus a LINUX error string on every Windows box (`detect()`
+    /// fell through to an `XDG_CURRENT_DESKTOP` sniff), so the console could show no physical
+    /// screen and could not honestly say why.
+    #[test]
+    #[ignore = "hardware: reads the live display topology"]
+    fn live_windows_monitor_enumeration_reports_the_physical_screens() {
+        let ms = crate::monitors::list_windows().expect("list_windows");
+        for m in &ms {
+            println!(
+                "connector={:<14} enabled={:<5} managed={:<5} primary={:<5} {:>5}x{:<5} @{:>3}Hz  \
+                 pos=({},{})  {:?}",
+                m.connector,
+                m.enabled,
+                m.managed,
+                m.primary,
+                m.width,
+                m.height,
+                m.refresh_mhz / 1000,
+                m.x,
+                m.y,
+                m.description
+            );
+        }
+        assert!(!ms.is_empty(), "no monitors enumerated at all");
+        // The point of the change: a real, non-managed head is visible to the console.
+        assert!(
+            ms.iter().any(|m| !m.managed),
+            "every enumerated head is one of OURS — the operator's physical screen is still missing"
+        );
+    }
+
     /// The ACTIVE display targets, as `(target_id, friendly)` — not just a count.
     ///
     /// Counting alone cannot tell "the physical is still lit" from "the physical was deactivated
