@@ -70,6 +70,11 @@ enum CardKind {
         /// The profile catalog as `(id, name)`, for this card's menus and chip. Shared per
         /// refresh rather than re-read per card.
         profiles: Rc<Vec<(String, String)>>,
+        /// `Some((id, name))` when this card is a PINNED host+profile pair rather than the
+        /// host's primary card (design §5.2a): a one-click shortcut for a profile the user
+        /// reaches for often. It is presentation state on the host record — never a second
+        /// host entry, which would fork pairing, WoL and renames.
+        pinned: Option<(String, String)>,
     },
     Discovered(DiscoveredHost),
 }
@@ -101,12 +106,23 @@ pub enum CardOutput {
         mac: Vec<String>,
         addr: String,
     },
+    /// Add or remove a pinned host+profile card (design §5.2a). Presentation only — it never
+    /// changes the host's default profile, and unpinning never touches the profile itself.
+    TogglePin {
+        fp_hex: String,
+        addr: String,
+        port: u16,
+        profile_id: String,
+        pin: bool,
+    },
 }
 
 impl HostCard {
     fn request(&self) -> ConnectRequest {
         match &self.kind {
-            CardKind::Saved { host: k, .. } => ConnectRequest {
+            CardKind::Saved {
+                host: k, pinned, ..
+            } => ConnectRequest {
                 name: k.name.clone(),
                 addr: k.addr.clone(),
                 port: k.port,
@@ -115,7 +131,9 @@ impl HostCard {
                 pair_optional: false,
                 launch: None,
                 mac: k.mac.clone(),
-                profile: None,
+                // A pinned card IS its profile: clicking it connects with that one, without
+                // touching the host's default.
+                profile: pinned.as_ref().map(|(id, _)| id.clone()),
             },
             CardKind::Discovered(a) => ConnectRequest {
                 name: a.name.clone(),
@@ -201,6 +219,7 @@ impl relm4::factory::FactoryComponent for HostCard {
                 host: k,
                 online,
                 profiles,
+                pinned,
                 ..
             } => {
                 // Presence pip + spelled-out state, then the trust pill.
@@ -220,16 +239,25 @@ impl relm4::factory::FactoryComponent for HostCard {
                 } else {
                     pill("Trusted", "pf-accent")
                 });
-                // The chip says what a plain click will do — the profile this host is bound
-                // to. A binding whose profile was deleted shows nothing and resolves as the
-                // defaults, which is exactly what will happen on connect (design §6).
-                if let Some(name) = k
-                    .profile_id
-                    .as_ref()
-                    .and_then(|id| profiles.iter().find(|(pid, _)| pid == id))
-                    .map(|(_, name)| name.as_str())
-                {
-                    status.append(&pill(name, "pf-neutral"));
+                // The chip says what a plain click on THIS card will do: its own profile on a
+                // pinned card, the host's binding on the primary one. A binding whose profile
+                // was deleted shows nothing and resolves as the defaults, which is exactly
+                // what will happen on connect (design §6).
+                let chip = pinned.as_ref().map(|(_, name)| name.as_str()).or_else(|| {
+                    k.profile_id
+                        .as_ref()
+                        .and_then(|id| profiles.iter().find(|(pid, _)| pid == id))
+                        .map(|(_, name)| name.as_str())
+                });
+                if let Some(name) = chip {
+                    status.append(&pill(
+                        name,
+                        if pinned.is_some() {
+                            "pf-accent"
+                        } else {
+                            "pf-neutral"
+                        },
+                    ));
                 }
             }
             CardKind::Discovered(_) => {
@@ -256,6 +284,7 @@ impl relm4::factory::FactoryComponent for HostCard {
                 recent,
                 library_enabled,
                 profiles,
+                pinned,
             } => {
                 if *recent {
                     overlay.add_css_class("pf-recent");
@@ -356,44 +385,103 @@ impl relm4::factory::FactoryComponent for HostCard {
                             profile_id: id,
                         }),
                     );
+                    // The same action pins from a primary card and unpins from a pinned one —
+                    // which of the two this card is decides the direction.
+                    let (fp, addr, port) = (k.fp_hex.clone(), k.addr.clone(), k.port);
+                    let pinning = pinned.is_none();
+                    profile_action(
+                        "toggle-pin",
+                        Box::new(move |id| CardOutput::TogglePin {
+                            fp_hex: fp.clone(),
+                            addr: addr.clone(),
+                            port,
+                            profile_id: id.unwrap_or_default(),
+                            pin: pinning,
+                        }),
+                    );
                 }
                 overlay.insert_action_group("card", Some(&actions));
 
                 let menu = gio::Menu::new();
-                if !profiles.is_empty() {
+                if let Some((pin_id, pin_name)) = pinned {
+                    // A pinned card is a shortcut, not a second host: it offers the one-offs
+                    // and its own removal, and deliberately NOT pair/rename/forget — those
+                    // belong to the host, and offering them here would blur what the card is.
                     let with = gio::Menu::new();
-                    let bind = gio::Menu::new();
-                    for (label, id) in std::iter::once(("Default settings", "")).chain(
+                    for (label, target) in std::iter::once(("Default settings", "")).chain(
                         profiles
                             .iter()
                             .map(|(id, name)| (name.as_str(), id.as_str())),
                     ) {
-                        // A checkmark would be the natural cue for the current binding, but a
-                        // GMenu radio needs shared state per card; the bound profile is named
-                        // on the card's chip instead, which is visible without opening a menu.
-                        for (menu, action) in
-                            [(&with, "card.connect-with"), (&bind, "card.bind-profile")]
-                        {
-                            let item = gio::MenuItem::new(Some(label), None);
-                            item.set_action_and_target_value(Some(action), Some(&id.to_variant()));
-                            menu.append_item(&item);
-                        }
+                        let item = gio::MenuItem::new(Some(label), None);
+                        item.set_action_and_target_value(
+                            Some("card.connect-with"),
+                            Some(&target.to_variant()),
+                        );
+                        with.append_item(&item);
                     }
                     menu.append_submenu(Some("Connect with"), &with);
-                    menu.append_submenu(Some("Default profile"), &bind);
+                    let unpin = gio::MenuItem::new(
+                        Some(&format!("Unpin \u{201c}{pin_name}\u{201d}")),
+                        None,
+                    );
+                    unpin.set_action_and_target_value(
+                        Some("card.toggle-pin"),
+                        Some(&pin_id.as_str().to_variant()),
+                    );
+                    menu.append_item(&unpin);
+                } else {
+                    if !profiles.is_empty() {
+                        let with = gio::Menu::new();
+                        let bind = gio::Menu::new();
+                        let pin = gio::Menu::new();
+                        for (label, id) in std::iter::once(("Default settings", "")).chain(
+                            profiles
+                                .iter()
+                                .map(|(id, name)| (name.as_str(), id.as_str())),
+                        ) {
+                            // A checkmark would be the natural cue for the current binding, but
+                            // a GMenu radio needs shared state per card; the bound profile is
+                            // named on the card's chip instead, visible without opening a menu.
+                            for (menu, action) in
+                                [(&with, "card.connect-with"), (&bind, "card.bind-profile")]
+                            {
+                                let item = gio::MenuItem::new(Some(label), None);
+                                item.set_action_and_target_value(
+                                    Some(action),
+                                    Some(&id.to_variant()),
+                                );
+                                menu.append_item(&item);
+                            }
+                            // "Default settings" is not pinnable — the primary card is that.
+                            if !id.is_empty() && !k.pinned_profiles.iter().any(|p| p == id) {
+                                let item = gio::MenuItem::new(Some(label), None);
+                                item.set_action_and_target_value(
+                                    Some("card.toggle-pin"),
+                                    Some(&id.to_variant()),
+                                );
+                                pin.append_item(&item);
+                            }
+                        }
+                        menu.append_submenu(Some("Connect with"), &with);
+                        menu.append_submenu(Some("Default profile"), &bind);
+                        if pin.n_items() > 0 {
+                            menu.append_submenu(Some("Pin as card"), &pin);
+                        }
+                    }
+                    menu.append(Some("Pair with PIN\u{2026}"), Some("card.pair"));
+                    menu.append(Some("Test network speed\u{2026}"), Some("card.speed"));
+                    // An explicit wake only when offline and a MAC is known.
+                    if !online && !k.mac.is_empty() {
+                        menu.append(Some("Wake host"), Some("card.wake"));
+                    }
+                    // Experimental (Preferences gate): browse the host's game library.
+                    if *library_enabled {
+                        menu.append(Some("Browse library\u{2026}"), Some("card.library"));
+                    }
+                    menu.append(Some("Rename\u{2026}"), Some("card.rename"));
+                    menu.append(Some("Forget"), Some("card.forget"));
                 }
-                menu.append(Some("Pair with PIN…"), Some("card.pair"));
-                menu.append(Some("Test network speed…"), Some("card.speed"));
-                // An explicit wake only when offline and a MAC is known.
-                if !online && !k.mac.is_empty() {
-                    menu.append(Some("Wake host"), Some("card.wake"));
-                }
-                // Experimental (Preferences gate): browse the host's game library.
-                if *library_enabled {
-                    menu.append(Some("Browse library…"), Some("card.library"));
-                }
-                menu.append(Some("Rename…"), Some("card.rename"));
-                menu.append(Some("Forget"), Some("card.forget"));
                 let menu_btn = gtk::MenuButton::builder()
                     .icon_name("view-more-symbolic")
                     .menu_model(&menu)
@@ -795,6 +883,28 @@ impl SimpleComponent for HostsPage {
                     }
                     self.rebuild(); // the chip follows immediately
                 }
+                CardOutput::TogglePin {
+                    fp_hex,
+                    addr,
+                    port,
+                    profile_id,
+                    pin,
+                } => {
+                    let mut known = KnownHosts::load();
+                    if let Some(h) = known.hosts.iter_mut().find(|h| {
+                        (!fp_hex.is_empty() && h.fp_hex == fp_hex)
+                            || (h.addr == addr && h.port == port)
+                    }) {
+                        h.pinned_profiles.retain(|p| p != &profile_id);
+                        if pin {
+                            h.pinned_profiles.push(profile_id);
+                        }
+                        if let Err(e) = known.save() {
+                            tracing::warn!(error = %format!("{e:#}"), "saving the pinned cards");
+                        }
+                    }
+                    self.rebuild();
+                }
             },
         }
     }
@@ -850,8 +960,30 @@ impl HostsPage {
                         profiles: profiles.clone(),
                         recent: most_recent.as_deref() == Some(k.fp_hex.as_str()),
                         library_enabled,
+                        pinned: None,
                     },
                 });
+                // …then its pinned host+profile cards, in the order the user pinned them.
+                // They share the host's live status because they read the same record, and a
+                // pin whose profile is gone simply doesn't render (design §5.2a).
+                for id in &k.pinned_profiles {
+                    let Some((id, name)) = profiles.iter().find(|(pid, _)| pid == id) else {
+                        continue;
+                    };
+                    saved.push_back(HostCard {
+                        // The spinner belongs to whichever card was clicked; a pin has its own
+                        // key so two cards for one host don't both spin.
+                        connecting: false,
+                        kind: CardKind::Saved {
+                            host: k.clone(),
+                            online,
+                            profiles: profiles.clone(),
+                            recent: false,
+                            library_enabled,
+                            pinned: Some((id.clone(), name.clone())),
+                        },
+                    });
+                }
             }
         }
 
