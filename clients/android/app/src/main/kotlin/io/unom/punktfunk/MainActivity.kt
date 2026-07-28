@@ -13,6 +13,7 @@ import android.view.InputDevice
 import android.view.KeyCharacterMap
 import android.view.KeyEvent
 import android.view.MotionEvent
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
 import androidx.activity.compose.setContent
@@ -27,6 +28,10 @@ import io.unom.punktfunk.kit.Gamepad
 import io.unom.punktfunk.kit.GamepadRouter
 import io.unom.punktfunk.kit.Keymap
 import io.unom.punktfunk.kit.NativeBridge
+import io.unom.punktfunk.kit.link.DeepLinkResult
+import io.unom.punktfunk.kit.link.DeepLinks
+import io.unom.punktfunk.kit.link.HostResolution
+import io.unom.punktfunk.kit.security.KnownHostStore
 
 /** Broadcast action for the menu-time SC2 USB-permission grant (see [MainActivity.startSc2MenuNav]). */
 private const val SC2_MENU_PERMISSION = "io.unom.punktfunk.SC2_MENU_USB_PERMISSION"
@@ -136,6 +141,27 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // A URL may never preempt a live session (design/client-deep-links.md §3.2). With
+        // `launchMode = standard` a link normally arrives as a NEW activity instance in a new task
+        // — the streaming one gets backgrounded, and backgrounding ends a session — so the refusal
+        // has to happen HERE, before this instance is resumed, not inside the composition (which
+        // only ever sees the rare `onNewIntent` case). Finishing now leaves the streaming task in
+        // front, untouched.
+        val live = liveStream
+        if (live != null && deepLinkFrom(intent) != null) {
+            // Pointing at the host already being streamed is the one exception, and its right
+            // answer is to do nothing: the intent has already brought the app forward, which is
+            // what "focus it" means here.
+            if (!targetsHost(intent, live)) {
+                Toast.makeText(
+                    this,
+                    "Already streaming — end this session first.",
+                    Toast.LENGTH_LONG,
+                ).show()
+            }
+            finish()
+            return
+        }
         pendingDeepLink = deepLinkFrom(intent)
         lastPadIsGamepad = !isTvDevice(this)
         lastPadStyle = Gamepad.styleFor(Gamepad.firstPad())
@@ -566,5 +592,30 @@ class MainActivity : ComponentActivity() {
         KeyEvent.KEYCODE_DPAD_RIGHT, KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER,
         -> true
         else -> KeyEvent.isGamepadButton(kc)
+    }
+
+    /** Does [intent]'s link resolve to the host [live] is already streaming? */
+    private fun targetsHost(intent: Intent?, live: LiveStream): Boolean {
+        val url = deepLinkFrom(intent) ?: return false
+        val parsed = DeepLinks.parse(url) as? DeepLinkResult.Parsed ?: return false
+        val target = DeepLinks.resolveHost(parsed.link, KnownHostStore(this).all())
+        return target is HostResolution.Known && target.host.id == live.hostId
+    }
+
+    /** The host a live stream is on — see [liveStream]. */
+    data class LiveStream(val hostId: String?)
+
+    companion object {
+        /**
+         * The live stream, PROCESS-wide (null = not streaming), published by the composition that
+         * owns it.
+         *
+         * Deliberately not per-instance state: `launchMode` is `standard`, so a `punktfunk://`
+         * link arrives as a second activity instance that knows nothing about the first — and the
+         * one thing it must know is that a session is already running. Static state is what
+         * crosses that gap; the process dying resets it, which is also correct.
+         */
+        @Volatile
+        var liveStream: LiveStream? = null
     }
 }

@@ -31,6 +31,7 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -67,10 +68,19 @@ fun App(forceGamepadUi: Boolean = false) {
     val controllerConnected by rememberControllerConnected()
     val gamepadUi = gamepadUiActive(settings.gamepadUiEnabled, controllerConnected, tv, forceGamepadUi)
 
-    // A `punktfunk://` URL that arrived while a session is live is REFUSED, never honoured: a URL
-    // may not preempt a stream (design/client-deep-links.md §3.2). Pointing at the host already
-    // being streamed is the one exception, and its right answer is to do nothing — the intent has
-    // already brought the app forward, which is exactly what "focus it" means here.
+    // Publish the live session process-wide, so a `punktfunk://` link that arrives as a SECOND
+    // activity instance (the normal case under `launchMode = standard`) can refuse it before that
+    // instance is ever resumed — see MainActivity.onCreate. Cleared on dispose, so an activity
+    // destroyed mid-stream doesn't leave a ghost that blocks every future link.
+    DisposableEffect(session) {
+        MainActivity.liveStream = session?.let { MainActivity.LiveStream(it.hostId) }
+        onDispose { MainActivity.liveStream = null }
+    }
+
+    // The same rule for the rare in-instance case (a caller that set FLAG_ACTIVITY_SINGLE_TOP, so
+    // the link reached `onNewIntent` on the streaming activity itself). Pointing at the host
+    // already being streamed is the one exception, and its right answer is to do nothing — the
+    // intent has already brought the app forward, which is exactly what "focus it" means here.
     val pendingLink = activity?.pendingDeepLink
     LaunchedEffect(pendingLink, session) {
         val url = pendingLink ?: return@LaunchedEffect
