@@ -188,6 +188,12 @@ impl VirtualDisplay for MutterDisplay {
             })
             .context("spawn Mutter virtual-output thread")?;
 
+        // Built BEFORE the wait so EVERY error arm below sets the flag on its way out — a thread
+        // that finishes after we gave up then parks for at most one 200 ms tick. `report_node` is
+        // the primary defence (it stops the session outright); this is the belt-and-braces half,
+        // and it also covers a thread that is somewhere else entirely when the timeout fires.
+        let guard = StopGuard(stop);
+
         // 45 s (was 20 s): setups now queue on TOPOLOGY_LOCK, so a session behind a slow sibling
         // (whose guard spans up to a ~10 s stream wait + 6 s connector wait + the apply) must
         // outwait it plus its own handshake before this fires.
@@ -205,7 +211,7 @@ impl VirtualDisplay for MutterDisplay {
         Ok(VirtualOutput::owned(
             node_id,
             Some((mode.width, mode.height, mode.refresh_hz)),
-            Box::new(StopGuard(stop)),
+            Box::new(guard),
         ))
     }
 }
@@ -303,7 +309,25 @@ fn session_thread(
                 return;
             }
         };
-        let _ = setup_tx.send(Ok(session.node_id));
+        // Report the node id, and STOP if nobody is listening any more. Everything below this line
+        // mutates the operator's desktop topology on behalf of a session that, past this point,
+        // would have no way to undo it.
+        if !report_node(&setup_tx, &session).await {
+            return;
+        }
+        // The send can also LAND in the moment the opener's `recv_timeout` gives up — the value sits
+        // in the queue, so the send reports success while `create` is already bailing. That drops
+        // the `StopGuard`, so check the flag HERE, before the topology work, rather than only at the
+        // park loop below: the point is that a doomed session never applies a sole-monitor config at
+        // all, instead of applying one and reverting it a tick later.
+        if stop.load(Ordering::Relaxed) {
+            tracing::warn!(
+                "mutter: the opener gave up as the handshake completed — stopping without touching \
+                 the desktop topology"
+            );
+            let _ = session.rd_session.call_method("Stop", &()).await;
+            return;
+        }
 
         // Identify the virtual connector (present now, absent in the pre-snapshot), then — when this
         // session owns the topology — make it the PRIMARY monitor so the GNOME shell + new windows
@@ -312,7 +336,7 @@ fn session_thread(
         // Best-effort: any failure just logs and streaming continues unchanged.
         let mut tracked: Option<(zbus::Proxy<'static>, CurrentState, String)> = None;
         if let Some((dc, pre)) = dc_pre {
-            match wait_virtual_connector(&dc, &pre).await {
+            match wait_virtual_connector(&dc, &pre, mode).await {
                 Ok((vconn, state)) => {
                     if want_config {
                         match make_virtual_primary(
@@ -408,6 +432,9 @@ pub(crate) fn stream_existing_output(
         .name("punktfunk-mutter-mirror".into())
         .spawn(move || mirror_thread(setup_tx, stop_thread, connector_thread, hw_cursor))
         .context("spawn Mutter monitor-mirror thread")?;
+    // As in `create`: built before the wait, so a timeout/failure arm still signals the thread
+    // rather than leaving a permanent `RecordMonitor` cast on one of the operator's real heads.
+    let guard = MirrorStop(stop);
     let node_id = match setup_rx.recv_timeout(Duration::from_secs(20)) {
         Ok(Ok(v)) => v,
         Ok(Err(e)) => bail!("Mutter monitor mirror failed: {e}"),
@@ -417,7 +444,7 @@ pub(crate) fn stream_existing_output(
         node_id,
         // Mutter's RecordMonitor node lives on the user's PipeWire daemon (like RecordVirtual).
         remote_fd: None,
-        keepalive: Box::new(MirrorStop(stop)),
+        keepalive: Box::new(guard),
     })
 }
 
@@ -457,7 +484,9 @@ fn mirror_thread(
                 return;
             }
         };
-        let _ = setup_tx.send(Ok(session.node_id));
+        if !report_node(&setup_tx, &session).await {
+            return;
+        }
         while !stop.load(Ordering::Relaxed) {
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
@@ -471,54 +500,7 @@ fn mirror_thread(
 /// The `RecordMonitor` handshake: RemoteDesktop session → ScreenCast session anchored to it →
 /// record `connector` → node id on `PipeWireStreamAdded` after `Start`.
 async fn connect_monitor(connector: &str, hw_cursor: bool) -> Result<MutterSession> {
-    let conn = zbus::Connection::session()
-        .await
-        .context("connect session D-Bus")?;
-    let rd = zbus::Proxy::new(
-        &conn,
-        BUS_RD,
-        "/org/gnome/Mutter/RemoteDesktop",
-        "org.gnome.Mutter.RemoteDesktop",
-    )
-    .await
-    .context("RemoteDesktop proxy (is gnome-shell running?)")?;
-    let rd_path: OwnedObjectPath = rd
-        .call("CreateSession", &())
-        .await
-        .context("RemoteDesktop.CreateSession")?;
-    let rd_session = zbus::Proxy::new(
-        &conn,
-        BUS_RD,
-        rd_path,
-        "org.gnome.Mutter.RemoteDesktop.Session",
-    )
-    .await?;
-    let session_id: String = rd_session
-        .get_property("SessionId")
-        .await
-        .context("read SessionId")?;
-
-    let sc = zbus::Proxy::new(
-        &conn,
-        BUS_SC,
-        "/org/gnome/Mutter/ScreenCast",
-        "org.gnome.Mutter.ScreenCast",
-    )
-    .await
-    .context("ScreenCast proxy")?;
-    let mut props: HashMap<&str, Value> = HashMap::new();
-    props.insert("remote-desktop-session-id", Value::from(session_id));
-    let sc_path: OwnedObjectPath = sc
-        .call("CreateSession", &(props,))
-        .await
-        .context("ScreenCast.CreateSession")?;
-    let sc_session = zbus::Proxy::new(
-        &conn,
-        BUS_SC,
-        sc_path,
-        "org.gnome.Mutter.ScreenCast.Session",
-    )
-    .await?;
+    let (conn, rd_session, sc_session) = open_rd_sc().await?;
 
     // `RecordMonitor(connector, properties) -> stream_path`. Only `cursor-mode` is set: the mode
     // belongs to the monitor's owner, not to us.
@@ -535,57 +517,22 @@ async fn connect_monitor(connector: &str, hw_cursor: bool) -> Result<MutterSessi
         .call("RecordMonitor", &(connector, rec))
         .await
         .with_context(|| format!("Session.RecordMonitor({connector:?})"))?;
-    let stream = zbus::Proxy::new(
-        &conn,
-        BUS_SC,
-        stream_path,
-        "org.gnome.Mutter.ScreenCast.Stream",
-    )
-    .await?;
 
-    let mut added = stream
-        .receive_signal("PipeWireStreamAdded")
-        .await
-        .context("subscribe PipeWireStreamAdded")?;
-    rd_session
-        .call_method("Start", &())
-        .await
-        .context("RemoteDesktop.Session.Start")?;
-    let msg = tokio::time::timeout(Duration::from_secs(10), added.next())
-        .await
-        .map_err(|_| anyhow!("PipeWireStreamAdded did not arrive within 10s"))?
-        .ok_or_else(|| anyhow!("signal stream ended before PipeWireStreamAdded"))?;
-    let (node_id,): (u32,) = msg
-        .body()
-        .deserialize()
-        .context("PipeWireStreamAdded body")?;
-    tracing::info!(connector, node_id, "mutter: recording an existing monitor");
-
-    Ok(MutterSession {
-        rd_session,
-        _sc_session: sc_session,
-        _conn: conn,
-        node_id,
-    })
+    let session = start_and_await_node(conn, rd_session, sc_session, stream_path).await?;
+    tracing::info!(
+        connector,
+        node_id = session.node_id,
+        "mutter: recording an existing monitor"
+    );
+    Ok(session)
 }
 
-/// The live session objects (held for the stream's lifetime) + the PipeWire node id.
-struct MutterSession {
-    rd_session: zbus::Proxy<'static>,
-    _sc_session: zbus::Proxy<'static>,
-    _conn: zbus::Connection,
-    node_id: u32,
-}
-
-/// Run the four-step handshake (see module docs). `preferred_scale` is the client's remembered
-/// desktop scale, passed as the virtual mode's `preferred-scale` so Mutter creates the monitor
-/// already scaled (Mutter ≥ 48; older Mutter ignores unknown mode keys) — this covers the
-/// `extend` topology, where we never issue our own ApplyMonitorsConfig.
-async fn connect(
-    mode: Mode,
-    hw_cursor: bool,
-    preferred_scale: Option<f64>,
-) -> Result<MutterSession> {
+/// Steps 1–2 of the handshake (module docs), shared by the virtual (`RecordVirtual`) and the mirror
+/// (`RecordMonitor`) paths: session bus → RemoteDesktop session → ScreenCast session anchored to it.
+///
+/// Hands back the *connection* alongside the two proxies because the connection IS the sessions'
+/// lifetime — drop it and Mutter tears them down, which is the whole RAII teardown model here.
+async fn open_rd_sc() -> Result<(zbus::Connection, zbus::Proxy<'static>, zbus::Proxy<'static>)> {
     let conn = zbus::Connection::session()
         .await
         .context("connect session D-Bus")?;
@@ -637,6 +584,93 @@ async fn connect(
         "org.gnome.Mutter.ScreenCast.Session",
     )
     .await?;
+    Ok((conn, rd_session, sc_session))
+}
+
+/// Step 4, shared by both record paths: subscribe to `PipeWireStreamAdded` **before** `Start` (the
+/// signal can otherwise land while we are still subscribing), start the combined session, and wait
+/// out the node id.
+async fn start_and_await_node(
+    conn: zbus::Connection,
+    rd_session: zbus::Proxy<'static>,
+    sc_session: zbus::Proxy<'static>,
+    stream_path: OwnedObjectPath,
+) -> Result<MutterSession> {
+    let stream = zbus::Proxy::new(
+        &conn,
+        BUS_SC,
+        stream_path,
+        "org.gnome.Mutter.ScreenCast.Stream",
+    )
+    .await?;
+    let mut added = stream
+        .receive_signal("PipeWireStreamAdded")
+        .await
+        .context("subscribe PipeWireStreamAdded")?;
+    rd_session
+        .call_method("Start", &())
+        .await
+        .context("RemoteDesktop.Session.Start")?;
+    let msg = tokio::time::timeout(Duration::from_secs(10), added.next())
+        .await
+        .map_err(|_| anyhow!("PipeWireStreamAdded did not arrive within 10s"))?
+        .ok_or_else(|| anyhow!("signal stream ended before PipeWireStreamAdded"))?;
+    let (node_id,): (u32,) = msg
+        .body()
+        .deserialize()
+        .context("PipeWireStreamAdded body")?;
+
+    Ok(MutterSession {
+        rd_session,
+        _sc_session: sc_session,
+        _conn: conn,
+        node_id,
+    })
+}
+
+/// Hand the node id back to the opener ([`MutterDisplay::create`] / [`stream_existing_output`]).
+///
+/// A failed send means the opener ALREADY GAVE UP — its `recv_timeout` fired — so nothing will ever
+/// drop this session's keepalive. The thread must unwind here rather than run on and park forever
+/// holding the D-Bus connection that *is* the monitor's lifetime. Returns `false` for "stop now".
+///
+/// The other three portal/D-Bus backends have always done this (`kwin.rs`, `hyprland.rs`,
+/// `wlroots.rs` all `?` on the send); Mutter discarded it with `let _ =`, which on a timed-out
+/// create left an orphan thread that went on to apply a SOLE-monitor topology — every physical head
+/// dark, reverted only when the virtual monitor disappears, which the parked thread prevented.
+async fn report_node(setup_tx: &Sender<Result<u32, String>>, session: &MutterSession) -> bool {
+    if setup_tx.send(Ok(session.node_id)).is_ok() {
+        return true;
+    }
+    tracing::warn!(
+        node_id = session.node_id,
+        "mutter: the virtual-output opener gave up before the handshake finished — stopping the \
+         session instead of parking on it (a parked session keeps the monitor, and its topology, alive)"
+    );
+    let _ = session.rd_session.call_method("Stop", &()).await;
+    false
+}
+
+/// The live session objects (held for the stream's lifetime) + the PipeWire node id.
+struct MutterSession {
+    rd_session: zbus::Proxy<'static>,
+    _sc_session: zbus::Proxy<'static>,
+    _conn: zbus::Connection,
+    node_id: u32,
+}
+
+/// Run the four-step handshake (see module docs). `preferred_scale` is the client's remembered
+/// desktop scale, passed as the virtual mode's `preferred-scale` so Mutter creates the monitor
+/// already scaled (Mutter ≥ 48; older Mutter ignores unknown mode keys) — this covers the
+/// `extend` topology, where we never issue our own ApplyMonitorsConfig.
+async fn connect(
+    mode: Mode,
+    hw_cursor: bool,
+    preferred_scale: Option<f64>,
+) -> Result<MutterSession> {
+    // 1–2. RemoteDesktop session (the anchor; also the future input path) + the ScreenCast session
+    // anchored to it.
+    let (conn, rd_session, sc_session) = open_rd_sc().await?;
 
     // 3. The virtual monitor. For >60 Hz we pin the client's exact WxH@Hz via RecordVirtual's
     // "modes" (explicit size + refresh-rate; Mutter ≥ 47) — validated at 5120×1440@240 on Mutter 50
@@ -672,38 +706,9 @@ async fn connect(
         .call("RecordVirtual", &(rec,))
         .await
         .context("Session.RecordVirtual")?;
-    let stream = zbus::Proxy::new(
-        &conn,
-        BUS_SC,
-        stream_path,
-        "org.gnome.Mutter.ScreenCast.Stream",
-    )
-    .await?;
 
     // 4. Subscribe to the node-id signal BEFORE starting, then start the (combined) session.
-    let mut added = stream
-        .receive_signal("PipeWireStreamAdded")
-        .await
-        .context("subscribe PipeWireStreamAdded")?;
-    rd_session
-        .call_method("Start", &())
-        .await
-        .context("RemoteDesktop.Session.Start")?;
-    let msg = tokio::time::timeout(Duration::from_secs(10), added.next())
-        .await
-        .map_err(|_| anyhow!("PipeWireStreamAdded did not arrive within 10s"))?
-        .ok_or_else(|| anyhow!("signal stream ended before PipeWireStreamAdded"))?;
-    let (node_id,): (u32,) = msg
-        .body()
-        .deserialize()
-        .context("PipeWireStreamAdded body")?;
-
-    Ok(MutterSession {
-        rd_session,
-        _sc_session: sc_session,
-        _conn: conn,
-        node_id,
-    })
+    start_and_await_node(conn, rd_session, sc_session, stream_path).await
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -874,17 +879,36 @@ fn physical_keep_mode(
 async fn wait_virtual_connector(
     dc: &zbus::Proxy<'_>,
     pre: &CurrentState,
+    mode: Mode,
 ) -> Result<(String, CurrentState)> {
     let pre_conns = connectors(pre);
     let deadline = Instant::now() + Duration::from_secs(6);
     loop {
         let state = get_state(dc).await?;
-        let virt = state
-            .1
-            .iter()
-            .map(|m| m.0 .0.clone())
-            .find(|c| !pre_conns.contains(c));
-        if let Some(vconn) = virt {
+        // Everything absent from the pre-snapshot. Normally exactly one — TOPOLOGY_LOCK keeps a
+        // SIBLING session out of this window — but a physical hotplug is not ours to serialise, and
+        // this window is wide (a ~10 s stream wait plus up to 6 s of polling). Plugging a monitor in
+        // during it used to hijack the identity outright, so the session's topology apply and its
+        // scale persistence would then be aimed at the operator's new panel.
+        let chosen = {
+            let fresh: Vec<&MonitorInfo> = state
+                .1
+                .iter()
+                .filter(|m| !pre_conns.contains(&m.0 .0))
+                .collect();
+            let pick = pick_virtual(&fresh, mode);
+            if fresh.len() > 1 {
+                tracing::warn!(
+                    candidates = ?fresh.iter().map(|m| m.0 .0.as_str()).collect::<Vec<_>>(),
+                    chosen = pick.map(|m| m.0 .0.as_str()),
+                    want = format!("{}x{}", mode.width, mode.height),
+                    "mutter: more than one connector appeared while waiting for the virtual monitor \
+                     (a physical hotplug?) — picking the one advertising the client's mode"
+                );
+            }
+            pick.map(|m| m.0 .0.clone())
+        };
+        if let Some(vconn) = chosen {
             return Ok((vconn, state));
         }
         if Instant::now() >= deadline {
@@ -892,6 +916,25 @@ async fn wait_virtual_connector(
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
+}
+
+/// Which of the connectors that appeared since the pre-snapshot is OURS.
+///
+/// Disambiguate on what we actually asked Mutter for: the virtual monitor advertises the client's
+/// exact WxH (`make_virtual_primary` matches the same pair to pick its mode). Falling back to "the
+/// first new connector" keeps the old behaviour wherever that does not single one out — an older
+/// Mutter whose `RecordVirtual` mode list omits the size, or the ordinary case of exactly one.
+///
+/// Split out of the polling loop so the choice is testable without a session bus.
+fn pick_virtual<'a>(fresh: &[&'a MonitorInfo], mode: Mode) -> Option<&'a MonitorInfo> {
+    fresh
+        .iter()
+        .find(|m| {
+            m.1.iter()
+                .any(|md| md.1 == mode.width as i32 && md.2 == mode.height as i32)
+        })
+        .or(fresh.first())
+        .copied()
 }
 
 /// Make the virtual output the primary output — SOLE (`exclusive`: physicals disabled for the
@@ -1158,7 +1201,7 @@ fn build_primary_keeping_physicals(
 
 #[cfg(test)]
 mod tests {
-    use super::{pick_keep_mode, snap_integral_scale};
+    use super::{pick_keep_mode, pick_virtual, snap_integral_scale, HashMap, Mode, MonitorInfo};
 
     // (id, w, h, refresh, is_current, is_preferred)
     fn m(
@@ -1250,5 +1293,81 @@ mod tests {
             pick_keep_mode(None, &no_current),
             Some(("B".to_string(), 1920))
         );
+    }
+
+    /// Build a `MonitorInfo` advertising exactly the given modes.
+    fn mon(connector: &str, modes: &[(i32, i32)]) -> MonitorInfo {
+        (
+            (
+                connector.to_string(),
+                "vendor".into(),
+                "product".into(),
+                "serial".into(),
+            ),
+            modes
+                .iter()
+                .map(|&(w, h)| {
+                    (
+                        format!("{w}x{h}"),
+                        w,
+                        h,
+                        60.0,
+                        1.0,
+                        vec![1.0],
+                        HashMap::new(),
+                    )
+                })
+                .collect(),
+            HashMap::new(),
+        )
+    }
+
+    const M: Mode = Mode {
+        width: 1920,
+        height: 1080,
+        refresh_hz: 60,
+    };
+
+    /// The ordinary case: one new connector, and it is ours whether or not the size matches (an
+    /// older Mutter may not advertise it).
+    #[test]
+    fn a_lone_new_connector_is_ours() {
+        let only = mon("VIRTUAL-1", &[(3840, 2160)]);
+        assert_eq!(
+            pick_virtual(&[&only], M).map(|m| m.0 .0.as_str()),
+            Some("VIRTUAL-1")
+        );
+    }
+
+    /// A physical hotplug lands in the same window (TOPOLOGY_LOCK only keeps SIBLING sessions out).
+    /// The client's exact mode is what tells the two apart — without it the hotplugged panel used to
+    /// win whenever it sorted first, and the session's topology apply and scale persistence were
+    /// then aimed at the operator's monitor.
+    #[test]
+    fn a_hotplug_does_not_steal_the_identity() {
+        let hotplug = mon("DP-3", &[(2560, 1440), (3840, 2160)]);
+        let ours = mon("VIRTUAL-1", &[(1920, 1080)]);
+        assert_eq!(
+            pick_virtual(&[&hotplug, &ours], M).map(|m| m.0 .0.as_str()),
+            Some("VIRTUAL-1"),
+            "the connector advertising the client's mode must win regardless of order"
+        );
+    }
+
+    /// Ambiguous — nothing advertises the client's size. Falling back to the first keeps the old
+    /// behaviour rather than failing the session; the caller logs a warning when it happens.
+    #[test]
+    fn with_no_mode_match_the_first_still_wins() {
+        let a = mon("DP-3", &[(2560, 1440)]);
+        let b = mon("VIRTUAL-1", &[(3840, 2160)]);
+        assert_eq!(
+            pick_virtual(&[&a, &b], M).map(|m| m.0 .0.as_str()),
+            Some("DP-3")
+        );
+    }
+
+    #[test]
+    fn nothing_new_is_nothing_to_pick() {
+        assert!(pick_virtual(&[], M).is_none());
     }
 }
