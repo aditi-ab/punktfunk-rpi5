@@ -168,6 +168,38 @@ pub struct HostConfig {
     /// `PUNKTFUNK_ON_DISCONNECT_CMD` — the `client.disconnected` sibling of
     /// [`Self::on_connect_cmd`].
     pub on_disconnect_cmd: Option<String>,
+    /// `PUNKTFUNK_MAX_FPS` — frame limiter for the GAME. `None` (unset, `0`, or unparseable) =
+    /// no limit, the default and what every existing host does.
+    ///
+    /// This caps how fast the compositor lets the game render; it does **not** touch the session.
+    /// The client still negotiates and receives its full rate — a 120 Hz session over a game
+    /// limited to 60 sends 120 frames a second, 60 of them repeats of an unchanged picture, which
+    /// costs an almost-empty P-frame. That split is the whole point: the game stops rendering
+    /// frames nobody asked for, and the GPU time it gives up goes to capture and encode instead
+    /// (and, on a laptop or handheld, to heat and battery).
+    ///
+    /// Capping the STREAM instead would be a different and mostly unwanted feature — it hands the
+    /// client fewer frames than it asked for and saves the game's GPU nothing.
+    ///
+    /// Enforced by the compositor, so its reach is whatever that compositor offers. **gamescope**
+    /// takes it as `--nested-refresh`, the rate it clamps the game to; note that is the nested
+    /// output's rate, so everything gamescope composites moves at it, not the game alone — under
+    /// gamescope there is only the one output. Values are clamped into 1..=240.
+    pub max_fps: Option<u32>,
+    /// `PUNKTFUNK_VDISPLAY_HZ_MULT` — run the VIRTUAL DISPLAY at this multiple of the session's
+    /// frame rate while the stream stays paced at the session rate. Default 1 (off); 2 is the
+    /// interesting one, hence the name this shipped under.
+    ///
+    /// A compositor only paints on its own vblank, so at 1× a frame can be finished just after
+    /// the capture sampled and then waits nearly a whole interval to be picked up — up to
+    /// ~16 ms of pure age at 60 Hz, and it is the jittery part of the latency, not the steady
+    /// part. Driving the display at 2× halves that worst case without sending a single extra
+    /// frame: the pacing clamp below keeps the wire at exactly the rate the client negotiated.
+    ///
+    /// It is not free — the compositor and the GPU do the extra composites — so it stays opt-in.
+    /// Clamped to 1..=4; a backend that cannot honor the multiplied rate simply reports what it
+    /// achieved and the pacing follows that, exactly as it does for any other refusal.
+    pub vdisplay_hz_mult: u32,
 }
 
 impl HostConfig {
@@ -235,6 +267,31 @@ impl HostConfig {
                 .filter(|s| !s.trim().is_empty()),
             on_connect_cmd: val("PUNKTFUNK_ON_CONNECT_CMD").filter(|s| !s.trim().is_empty()),
             on_disconnect_cmd: val("PUNKTFUNK_ON_DISCONNECT_CMD").filter(|s| !s.trim().is_empty()),
+            // 0 means "no limit" rather than "stream nothing" — it is the natural way to spell
+            // "off" in a config file, and a 0 fps session is not a thing anyone wants.
+            max_fps: val("PUNKTFUNK_MAX_FPS")
+                .and_then(|s| s.trim().parse::<u32>().ok())
+                .filter(|&f| f > 0)
+                .map(|f| f.clamp(1, 240)),
+            vdisplay_hz_mult: val("PUNKTFUNK_VDISPLAY_HZ_MULT")
+                .and_then(|s| s.trim().parse::<u32>().ok())
+                .unwrap_or(1)
+                .clamp(1, 4),
+        }
+    }
+}
+
+impl HostConfig {
+    /// The rate to hand the compositor as the GAME's refresh: the session's rate, capped by
+    /// [`Self::max_fps`]. Only the compositor's game-facing rate goes through here — the session's
+    /// own mode, the encoder and the wire never do (see the field docs for why).
+    ///
+    /// `0` in means `0` out. A zero rate is rejected upstream, and quietly turning it into a real
+    /// one here would hide that.
+    pub fn game_fps(&self, session_hz: u32) -> u32 {
+        match self.max_fps {
+            Some(cap) if session_hz > cap => cap,
+            _ => session_hz,
         }
     }
 }
@@ -243,4 +300,33 @@ impl HostConfig {
 pub fn config() -> &'static HostConfig {
     static CFG: OnceLock<HostConfig> = OnceLock::new();
     CFG.get_or_init(HostConfig::from_env)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg(max_fps: Option<u32>) -> HostConfig {
+        HostConfig {
+            max_fps,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn game_fps_caps_only_above_the_limit() {
+        // Unset: every session rate passes through untouched — the default, and every existing
+        // host. The game keeps rendering at the session's rate, exactly as it always did.
+        for hz in [24, 30, 60, 120, 144, 240] {
+            assert_eq!(cfg(None).game_fps(hz), hz);
+        }
+        // Set: capped above, exact at, untouched below. A session BELOW the limit keeps its own
+        // rate — the knob is a ceiling on the game, not a target to render up to.
+        let c = cfg(Some(60));
+        assert_eq!(c.game_fps(120), 60);
+        assert_eq!(c.game_fps(60), 60);
+        assert_eq!(c.game_fps(30), 30);
+        // An invalid rate stays invalid rather than being laundered into a real one.
+        assert_eq!(c.game_fps(0), 0);
+    }
 }

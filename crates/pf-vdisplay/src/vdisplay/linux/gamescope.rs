@@ -806,9 +806,30 @@ fn headless_shim_dir() -> std::path::PathBuf {
     std::path::Path::new(&base).join("punktfunk-gsbin")
 }
 
+/// The rate to give gamescope as its nested refresh — the client's, capped by the host's frame
+/// limiter (`PUNKTFUNK_MAX_FPS`, unset by default).
+///
+/// gamescope's nested refresh is the rate the game is clamped to, which is what makes it the right
+/// and only place for this knob. The session is untouched: the client still negotiates and receives
+/// its full rate, because the encode loop re-encodes the held frame whenever the compositor has
+/// produced no new one — a repeat of an unchanged picture, which costs an almost-empty P-frame.
+/// So a 60-capped game on a 120 Hz session still puts 120 frames a second on the wire, and the GPU
+/// time the game is no longer spending goes to capture and encode instead (see
+/// `design/…` and issue #9's contention notes).
+///
+/// The cap is the nested output's rate, so everything gamescope composites moves at it, not just
+/// the game — under gamescope there is only the one output. That is the trade the knob is: it is
+/// off by default, and its whole purpose is to stop the game rendering flat out.
+fn game_hz(session_hz: u32) -> u32 {
+    pf_host_config::config().game_fps(session_hz).max(1)
+}
+
 /// The gamescope arg-rewriting shim. SteamOS hardcodes physical-panel args, so we intercept the
 /// session's `exec gamescope` (via PATH) and rewrite to a headless output at the client's mode (read
 /// from `PF_W`/`PF_H`/`PF_HZ`), dropping the physical flags. Idempotent; returns the shim's directory.
+///
+/// `PF_HZ` is the frame-limited rate ([`game_hz`]) — the shim spends it on `-r` alone, so it caps
+/// the game without touching the resolution the client negotiated (`PF_W`/`PF_H`).
 fn write_headless_shim() -> Result<std::path::PathBuf> {
     // `$PF_HDR_ARGS` is unquoted for the same reason as in the GAMESCOPE_BIN wrapper: it is our
     // own flag list ([`hdr_args`]) and must word-split into separate argv entries.
@@ -866,7 +887,7 @@ fn write_steamos_dropin(shim_dir: &std::path::Path, mode: Mode, hdr: bool) -> Re
         shim = shim_dir.display(),
         w = mode.width,
         h = mode.height,
-        hz = mode.refresh_hz.max(1),
+        hz = game_hz(mode.refresh_hz),
         // Read (unquoted) by the PATH shim — empty for an SDR session. Quoted HERE because a
         // systemd `Environment=` value with spaces must be, or only the first flag survives.
         hdr_args = hdr_args(hdr)
@@ -2152,6 +2173,12 @@ fn launch_session(client: &str, unit_name: &str, mode: Mode, hdr: bool) -> Resul
     let wrapper = write_gamescope_bin_wrapper()?;
     stop_session(unit_name); // clear any stale unit + relay so a relaunch is clean
     let hz = mode.refresh_hz.max(1);
+    // The two rates are deliberately different when the frame limiter is set. CUSTOM_REFRESH_RATES
+    // generates the mode the session ADVERTISES, which must stay the client's — that is what makes
+    // games see the real refresh instead of the box's EDID. PF_HZ becomes `--nested-refresh`, the
+    // rate the game is clamped to, and is the only one the limiter touches. Identical when it's
+    // unset, which is the default.
+    let game = game_hz(mode.refresh_hz);
     let start_unit = || -> Result<()> {
         let status = Command::new("systemd-run")
             .args(["--user", "--collect", &format!("--unit={unit_name}")])
@@ -2162,7 +2189,7 @@ fn launch_session(client: &str, unit_name: &str, mode: Mode, hdr: bool) -> Resul
             .arg("--setenv=BACKEND=headless")
             .arg(format!("--setenv=SCREEN_WIDTH={}", mode.width))
             .arg(format!("--setenv=SCREEN_HEIGHT={}", mode.height))
-            .arg(format!("--setenv=PF_HZ={hz}"))
+            .arg(format!("--setenv=PF_HZ={game}"))
             // Read (unquoted) by the GAMESCOPE_BIN wrapper — empty for a stock-gamescope SDR
             // session, and carrying the cursor flag whenever the binary supports it.
             .arg(format!(
@@ -2304,6 +2331,10 @@ fn shape_dedicated_command(app: &str) -> String {
 /// Add the compositor-side arguments shared by every bare gamescope spawn. `steam_mode` belongs
 /// before the `--` terminator; [`PUNKTFUNK_GAMESCOPE_APP`](spawn) configures the nested command
 /// after it and therefore cannot enable gamescope's Steam integration itself.
+///
+/// `-r` is the rate the GAME sees and is clamped to, which is why the frame limiter lives here
+/// (see [`game_hz`]) and nowhere near the session: capping it makes the game stop rendering
+/// frames nobody asked for, while capture and the wire keep running at the client's own rate.
 fn add_bare_gamescope_args(
     command: &mut Command,
     w: u32,
@@ -2317,7 +2348,7 @@ fn add_bare_gamescope_args(
         .args(["--backend", "headless"])
         .args(["-W", &w.to_string()])
         .args(["-H", &h.to_string()])
-        .args(["-r", &hz.to_string()]);
+        .args(["-r", &game_hz(hz).to_string()]);
     if steam_mode {
         command.arg("--steam");
     }
@@ -2514,7 +2545,7 @@ impl Drop for GamescopeProc {
 mod tests {
     use super::{
         cgroup_is_punktfunk_owned, cgroup_under_user_manager, connected_connector_under,
-        display_manager_unit_under, dm_survives_masked_unit, hdr_args, is_steam_launch,
+        display_manager_unit_under, dm_survives_masked_unit, game_hz, hdr_args, is_steam_launch,
         missing_flags, nested_wrapper_script, sentinel_advanced, shape_dedicated_command,
     };
 
@@ -2674,6 +2705,21 @@ mod tests {
             shape_dedicated_command("steam -bigpicture"),
             "steam -bigpicture"
         );
+    }
+
+    #[test]
+    fn game_hz_is_the_session_rate_until_the_limiter_is_set() {
+        // The env is process-wide and `config()` is parsed once, so this asserts the DEFAULT
+        // (nothing set) — which is the case that matters most: every existing host must keep
+        // handing gamescope the client's own rate, untouched. `game_fps`'s own unit test in
+        // pf-host-config covers the capping arithmetic without needing the env.
+        if pf_host_config::config().max_fps.is_none() {
+            for hz in [30, 60, 120, 144, 240] {
+                assert_eq!(game_hz(hz), hz);
+            }
+        }
+        // Never zero, whatever the inputs: gamescope would reject `-r 0`.
+        assert!(game_hz(0) >= 1);
     }
 
     #[test]
