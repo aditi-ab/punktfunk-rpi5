@@ -124,6 +124,15 @@ mod session_main {
         }
     }
 
+    /// `--profile <id|name>` — the settings profile this one session runs with, overriding the
+    /// host's own binding for this launch only (never rebinding it): the shells' "Connect
+    /// with ▸ X" and a `punktfunk://…&profile=` link both land here. Absent = honor the host's
+    /// binding; `--profile ""` (or a bare `--profile`) forces the global defaults, which is
+    /// how "Connect with ▸ Default settings" reaches a bound host.
+    fn profile_arg() -> Option<String> {
+        arg_flag("--profile").then(|| arg_value("--profile").unwrap_or_default())
+    }
+
     /// The connect budget: 15 s normally; `--connect-timeout SECS` overrides — the
     /// shell's request-access flow passes ~185 s because the host PARKS the connection
     /// until the operator clicks Approve.
@@ -135,13 +144,20 @@ mod session_main {
         )
     }
 
-    /// One session's pump parameters from the Settings store — shared by `--connect`
+    /// One session's pump parameters from the EFFECTIVE settings — shared by `--connect`
     /// and every `--browse` launch. Explicit settings, `0` fields resolved to the
     /// window's display (the GTK client reads the monitor under its window — same
     /// contract).
+    ///
+    /// `settings` is what [`trust::effective_settings`] returned, never a raw
+    /// `Settings::load()`: both callers resolve the host's profile first, so the two
+    /// construction sites cannot drift (they historically did — touching one and not the
+    /// other is a Windows-only build break). `profile` is that profile's name, for the
+    /// stats overlay's first line.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn session_params(
         settings: &trust::Settings,
+        profile: Option<String>,
         addr: String,
         port: u16,
         pin: [u8; 32],
@@ -246,6 +262,7 @@ mod session_main {
             identity,
             connect_timeout: connect_timeout(),
             force_software,
+            profile,
         }
     }
 
@@ -431,14 +448,16 @@ mod session_main {
         }
         let Some(target) = arg_value("--connect") else {
             eprintln!(
-                "usage: punktfunk-session --connect host[:port] [--fp HEX] [--launch id] [--fullscreen]\n\
+                "usage: punktfunk-session --connect host[:port] [--fp HEX] [--launch id] [--profile REF] [--fullscreen]\n\
                  \x20      punktfunk-session --browse [host[:port]] [--mgmt PORT] [--fullscreen] [--json-status]\n\
                  \x20      punktfunk-session --pair <PIN> --connect host[:port] [--name LABEL]\n\
                  \n\
                  Streams from a paired punktfunk host in a Vulkan window. --browse opens the\n\
                  gamepad console instead: bare --browse is the host list (discovery, PIN\n\
                  pairing, settings, wake-on-LAN); with a target it opens that host's game\n\
-                 library. --connect never dials a host it has no pinned fingerprint for —\n\
+                 library. --profile picks a settings profile by id or name for this session\n\
+                 only (\"\" = the global defaults); without it the host's own profile applies.\n\
+                 --connect never dials a host it has no pinned fingerprint for —\n\
                  enrol with --pair (no display needed), in the console, or from the desktop\n\
                  client."
             );
@@ -453,7 +472,13 @@ mod session_main {
                 return EXIT_CONNECT_FAILED;
             }
         };
-        let settings = trust::Settings::load();
+        // Global defaults with this host's settings profile overlaid — the binding on the
+        // host record, or `--profile <id|name>` for a one-off (`--profile ""` forces the
+        // defaults). Resolved through the shared helper, exactly like the console's launches.
+        let (settings, profile) = trust::effective_settings(&addr, port, profile_arg().as_deref());
+        if let Some(p) = &profile {
+            tracing::info!(profile = %p.name, id = %p.id, "streaming with a settings profile");
+        }
 
         // Trust follows the GTK client's `--connect` rules: a stored (or `--fp`) pin
         // connects silently; an unknown host is REFUSED — there is no dialog here, and a
@@ -523,6 +548,7 @@ mod session_main {
             pf_presenter::run_session(opts, move |gamepad, native, force_software, vulkan| {
                 session_params(
                     &settings,
+                    profile.map(|p| p.name),
                     addr,
                     port,
                     pin,

@@ -272,9 +272,8 @@ fn connect_spawn(
                             port: target.port,
                             fp_hex: fp_hex.clone(),
                             paired: persist_paired,
-                            last_used: None,
                             mac: target.mac.clone(),
-                            clipboard_sync: false,
+                            ..Default::default()
                         });
                         let _ = k.save();
                     }
@@ -481,10 +480,8 @@ fn wake_and_connect(
                             addr: target.addr.clone(),
                             port: target.port,
                             fp_hex: fp,
-                            paired: false,
-                            last_used: None,
                             mac: target.mac.clone(),
-                            clipboard_sync: false,
+                            ..Default::default()
                         });
                         let _ = k.save();
                     }

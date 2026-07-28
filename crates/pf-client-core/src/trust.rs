@@ -9,11 +9,12 @@
 //! shell stays the settings file's only writer (the session only reads). Pre-unification
 //! shell files (≤ 0.8.4: `show_hud`, `engine`) still load — see the migration test below.
 
+use crate::profiles::{ProfilesFile, Resolution, StreamProfile};
 use anyhow::{anyhow, Context, Result};
 use punktfunk_core::client::NativeClient;
 use punktfunk_core::quic::endpoint;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub fn config_dir() -> Result<PathBuf> {
     #[cfg(windows)]
@@ -89,6 +90,25 @@ fn lock_identity_perms(dir: &std::path::Path, key: &std::path::Path) {
     let _ = std::fs::set_permissions(key, std::fs::Permissions::from_mode(0o600));
 }
 
+/// Write a config file the safe way: a sibling temp file, then a rename over the target. A
+/// plain `fs::write` truncates first, so a crash, a full disk or a power cut between truncate
+/// and the last byte leaves an empty/half file — and these stores are what a client needs to
+/// find its hosts at all. Rename is atomic within a directory on both Unix and Windows
+/// (`MoveFileEx` with replace), so a reader ever sees the old file or the new one, never a
+/// torn one. Same discipline as the host's `session_settings.rs`.
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, bytes)?;
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            // Don't leave the temp behind to confuse the next writer (or a backup tool).
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
 pub fn hex(fp: &[u8; 32]) -> String {
     fp.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -130,6 +150,63 @@ pub struct KnownHost {
     /// also advertise `HOST_CAP_CLIPBOARD` and have its own policy enabled.
     #[serde(default)]
     pub clipboard_sync: bool,
+    /// This host's default settings profile (design/client-settings-profiles.md §4.1) — the
+    /// one a plain click uses. `None`, or an id whose profile was deleted, means the global
+    /// defaults, i.e. exactly today's behavior; a dangling binding never errors and never
+    /// blocks a connect.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    /// Profiles pinned as extra cards for this host (design §5.2a); order = card order.
+    /// Presentation only — NOT the default (that's `profile_id`) — and duplicates/dangling
+    /// ids are dropped when the list is resolved against the catalog.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pinned_profiles: Vec<String>,
+    /// Stable record identity (design §4.5): minted lazily for records that predate it, never
+    /// changed afterwards, so a deep link or a future cross-reference has something to point
+    /// at that survives a rename or a new DHCP lease. **No lookup in this crate is keyed by
+    /// it** — `fp_hex`/`addr:port` stay the lookup keys; this is groundwork.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+}
+
+impl Default for KnownHost {
+    /// A blank record with a fresh stable id — the base every construction site builds on
+    /// (`KnownHost { name, addr, port, ..Default::default() }`), so adding a field here can't
+    /// silently produce records that lack it. That is not hypothetical: `clipboard_sync`
+    /// survives today only because [`KnownHosts::upsert`] happens to skip it.
+    fn default() -> KnownHost {
+        KnownHost {
+            name: String::new(),
+            addr: String::new(),
+            port: 9777,
+            fp_hex: String::new(),
+            paired: false,
+            last_used: None,
+            mac: Vec::new(),
+            clipboard_sync: false,
+            profile_id: None,
+            pinned_profiles: Vec::new(),
+            id: Some(crate::profiles::new_record_uuid()),
+        }
+    }
+}
+
+impl KnownHost {
+    /// This host's pinned profiles that still exist, in card order, without duplicates — what
+    /// a grid renders. Dangling pins (the profile was deleted) simply disappear, per design
+    /// §5.2a: a pin is presentation state, never a reason to show an error.
+    pub fn resolved_pins<'a>(&self, catalog: &'a ProfilesFile) -> Vec<&'a StreamProfile> {
+        let mut out: Vec<&StreamProfile> = Vec::new();
+        for id in &self.pinned_profiles {
+            if out.iter().any(|p| p.id == *id) {
+                continue;
+            }
+            if let Some(p) = catalog.find_by_id(id) {
+                out.push(p);
+            }
+        }
+        out
+    }
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -142,18 +219,42 @@ impl KnownHosts {
         Ok(config_dir()?.join("client-known-hosts.json"))
     }
 
+    /// The store, with any pre-[`KnownHost::id`] records given one. The mint is written back
+    /// best-effort right here rather than "on the next save" so the id a caller sees is the
+    /// id that is on disk — an identity that changed every load would be worse than none.
+    /// A read-only config dir just keeps re-minting in memory, which harms nothing: no lookup
+    /// is keyed by the id yet (design §4.5).
     pub fn load() -> KnownHosts {
-        Self::path()
+        let mut k: KnownHosts = Self::path()
             .and_then(|p| Ok(std::fs::read_to_string(p)?))
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        if k.mint_missing_ids() {
+            let _ = k.save();
+        }
+        k
+    }
+
+    /// Give every record still missing one a stable id; returns true if anything changed
+    /// (i.e. whether this needs persisting). Idempotent — a store that has been through it
+    /// once is left byte-identical.
+    pub fn mint_missing_ids(&mut self) -> bool {
+        let mut minted = false;
+        for h in &mut self.hosts {
+            if h.id.as_deref().is_none_or(str::is_empty) {
+                h.id = Some(crate::profiles::new_record_uuid());
+                minted = true;
+            }
+        }
+        minted
     }
 
     pub fn save(&self) -> Result<()> {
         let p = Self::path()?;
         std::fs::create_dir_all(p.parent().unwrap())?;
-        std::fs::write(&p, serde_json::to_string_pretty(self)?)?;
+        // Temp+rename: losing this file to a torn write costs the user every pairing.
+        write_atomic(&p, serde_json::to_string_pretty(self)?.as_bytes())?;
         Ok(())
     }
 
@@ -189,6 +290,24 @@ impl KnownHosts {
             if !entry.mac.is_empty() {
                 h.mac = entry.mac;
             }
+            // Everything below is state the user set ON this record, which a refresh (a
+            // reconnect, a re-pair, a rediscovery) never carries and therefore must never
+            // clear: the per-host clipboard decision — which survives today only because this
+            // function happens not to mention it — plus the profile binding, its pinned
+            // cards, and the stable id. Only an upsert that actually carries a value moves
+            // one of them.
+            if entry.clipboard_sync {
+                h.clipboard_sync = true;
+            }
+            if entry.profile_id.is_some() {
+                h.profile_id = entry.profile_id;
+            }
+            if !entry.pinned_profiles.is_empty() {
+                h.pinned_profiles = entry.pinned_profiles;
+            }
+            if h.id.as_deref().is_none_or(str::is_empty) {
+                h.id = entry.id;
+            }
         } else {
             self.hosts.push(entry);
         }
@@ -199,15 +318,17 @@ impl KnownHosts {
 /// ceremony, delegated approval, headless pairing) ends in.
 pub fn persist_host(name: &str, addr: &str, port: u16, fp_hex: &str, paired: bool) {
     let mut known = KnownHosts::load();
+    // `..Default::default()` deliberately: this builds a record from a trust decision only,
+    // so every user-set field (clipboard, profile binding, pins) must arrive as "not carried"
+    // — `upsert` then leaves an existing host's own settings alone. A hand-written literal
+    // here is how those fields would get silently reset on the next re-pair.
     known.upsert(KnownHost {
         name: name.to_string(),
         addr: addr.to_string(),
         port,
         fp_hex: fp_hex.to_string(),
         paired,
-        last_used: None,
-        mac: Vec::new(),
-        clipboard_sync: false,
+        ..Default::default()
     });
     let _ = known.save();
 }
@@ -769,12 +890,79 @@ impl Settings {
             .unwrap_or_default()
     }
 
+    /// Fire-and-forget by design (a failed settings write must never take a stream down),
+    /// but temp+rename: this file has five whole-file writers, and a torn one loads as
+    /// `Default` — i.e. silently resets every setting the user has.
     pub fn save(&self) {
         let Ok(p) = Self::path() else { return };
         let _ = std::fs::create_dir_all(p.parent().unwrap());
         if let Ok(s) = serde_json::to_string_pretty(self) {
-            let _ = std::fs::write(&p, s);
+            let _ = write_atomic(&p, s.as_bytes());
         }
+    }
+}
+
+/// The one settings resolver every front-end and the session binary go through
+/// (design/client-settings-profiles.md §4.4/§4.6): global defaults, with the profile this
+/// connect uses overlaid.
+///
+/// ```text
+/// effective = overlay(profile).apply(global)
+/// profile   = one-off override  ??  host binding  ??  none
+/// ```
+///
+/// `one_off` is the "Connect with ▸ X" / `--profile` / `profile=` pick, by id or unique name;
+/// `Some("")` forces the global defaults on a bound host. It never rebinds anything — the
+/// host's default is changed only by an explicit act in the UI.
+///
+/// Nothing here fails: an unknown one-off falls back to the *defaults* (not to the host's
+/// binding — a connect that was explicitly asked for "Work" must not silently run "Game"),
+/// and a dangling binding resolves as none, exactly today's behavior. The host is looked up
+/// by `addr:port`, the same match the per-host clipboard decision has always used —
+/// consistency with the shipped precedent beats purity here (§4.6).
+pub fn effective_settings(
+    addr: &str,
+    port: u16,
+    one_off: Option<&str>,
+) -> (Settings, Option<StreamProfile>) {
+    let base = Settings::load();
+    let catalog = ProfilesFile::load();
+    let bound = KnownHosts::load()
+        .hosts
+        .iter()
+        .find(|h| h.addr == addr && h.port == port)
+        .and_then(|h| h.profile_id.clone());
+
+    match resolve_profile(&catalog, bound.as_deref(), one_off) {
+        Some(p) => (p.overrides.apply(&base), Some(p)),
+        None => (base, None),
+    }
+}
+
+/// The profile half of [`effective_settings`], split out so the precedence rules are testable
+/// without touching the config directory: one-off pick ?? host binding ?? none.
+fn resolve_profile(
+    catalog: &ProfilesFile,
+    bound: Option<&str>,
+    one_off: Option<&str>,
+) -> Option<StreamProfile> {
+    match one_off {
+        // `--profile ""` — "Connect with ▸ Default settings" on a bound host.
+        Some("") => None,
+        Some(reference) => match catalog.resolve(reference) {
+            (Some(p), _) => Some(p.clone()),
+            (_, res) => {
+                tracing::warn!(
+                    profile = %reference,
+                    ambiguous = res == Resolution::Ambiguous,
+                    "no such settings profile — streaming with the default settings"
+                );
+                None
+            }
+        },
+        // A binding is an id, never a name: it was written by a picker, and resolving it by
+        // name would let renaming another profile hijack it. Dangling → the defaults.
+        None => bound.and_then(|id| catalog.find_by_id(id).cloned()),
     }
 }
 
@@ -881,5 +1069,224 @@ mod tests {
         assert_eq!(h.last_used, None);
         assert_eq!(h.mac, vec!["aa:bb:cc:dd:ee:ff".to_string()]);
         assert!(parse_hex32(&h.fp_hex).is_some());
+    }
+
+    /// A pre-profiles known-hosts file loads unchanged — no binding, no pins — and its
+    /// records serialize back without the new keys, so an older client reading the same file
+    /// sees exactly what it wrote. The id is minted only when `load()` runs (the migration
+    /// step), not by deserialization.
+    #[test]
+    fn known_hosts_migration_is_a_no_op_on_a_pre_profiles_store() {
+        let old = r#"{"hosts":[{
+            "name": "Gaming PC", "addr": "192.168.1.50", "port": 9777,
+            "fp_hex": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "paired": true, "clipboard_sync": true
+        }]}"#;
+        let mut k: KnownHosts = serde_json::from_str(old).unwrap();
+        let h = &k.hosts[0];
+        assert_eq!(h.profile_id, None);
+        assert!(h.pinned_profiles.is_empty());
+        assert_eq!(h.id, None);
+        assert!(h.clipboard_sync);
+        let text = serde_json::to_string(&k).unwrap();
+        assert!(!text.contains("profile_id"));
+        assert!(!text.contains("pinned_profiles"));
+        assert!(!text.contains("\"id\""));
+
+        // Minting is idempotent: the second pass reports nothing to persist and leaves the
+        // id it handed out alone.
+        assert!(k.mint_missing_ids());
+        let minted = k.hosts[0].id.clone().unwrap();
+        assert_eq!(minted.len(), 36);
+        assert!(!k.mint_missing_ids());
+        assert_eq!(k.hosts[0].id.as_deref(), Some(minted.as_str()));
+        // An empty-string id (a hand-edited store) counts as missing, not as an identity.
+        k.hosts[0].id = Some(String::new());
+        assert!(k.mint_missing_ids());
+        assert_ne!(k.hosts[0].id.as_deref(), Some(""));
+    }
+
+    /// `upsert` refreshes what a reconnect actually knows and preserves what the user set:
+    /// the profile binding, the pinned cards, the clipboard decision and the stable id all
+    /// survive a trust-decision upsert that carries none of them (the bug `clipboard_sync`
+    /// only ever avoided by accident).
+    #[test]
+    fn upsert_preserves_user_set_host_state() {
+        let fp = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let mut k = KnownHosts {
+            hosts: vec![KnownHost {
+                name: "Desk".into(),
+                addr: "192.168.1.50".into(),
+                port: 9777,
+                fp_hex: fp.into(),
+                paired: true,
+                last_used: Some(1000),
+                mac: vec!["aa:bb:cc:dd:ee:ff".into()],
+                clipboard_sync: true,
+                profile_id: Some("aaaaaaaaaaaa".into()),
+                pinned_profiles: vec!["bbbbbbbbbbbb".into()],
+                id: Some("11111111-2222-4333-8444-555555555555".into()),
+            }],
+        };
+        // What `persist_host` builds: a trust decision, nothing else.
+        k.upsert(KnownHost {
+            name: "Desk".into(),
+            addr: "192.168.1.51".into(), // new lease
+            port: 9777,
+            fp_hex: fp.into(),
+            paired: false, // must not demote
+            ..Default::default()
+        });
+        let h = &k.hosts[0];
+        assert_eq!(k.hosts.len(), 1);
+        assert_eq!(h.addr, "192.168.1.51");
+        assert!(h.paired);
+        assert_eq!(h.last_used, Some(1000));
+        assert_eq!(h.mac, vec!["aa:bb:cc:dd:ee:ff".to_string()]);
+        assert!(h.clipboard_sync);
+        assert_eq!(h.profile_id.as_deref(), Some("aaaaaaaaaaaa"));
+        assert_eq!(h.pinned_profiles, vec!["bbbbbbbbbbbb".to_string()]);
+        assert_eq!(
+            h.id.as_deref(),
+            Some("11111111-2222-4333-8444-555555555555")
+        );
+
+        // A carried value does move the binding (that is how the UI rebinds through upsert).
+        k.upsert(KnownHost {
+            fp_hex: fp.into(),
+            profile_id: Some("cccccccccccc".into()),
+            pinned_profiles: vec!["dddddddddddd".into()],
+            ..Default::default()
+        });
+        assert_eq!(k.hosts[0].profile_id.as_deref(), Some("cccccccccccc"));
+        assert_eq!(k.hosts[0].pinned_profiles, vec!["dddddddddddd".to_string()]);
+    }
+
+    /// Pins render in card order, deduplicated, with deleted profiles simply gone — a pin is
+    /// presentation state, so a dangling one is never an error surface.
+    #[test]
+    fn resolved_pins_drop_duplicates_and_dangling_ids() {
+        use crate::profiles::{ProfilesFile, StreamProfile};
+        let catalog = ProfilesFile {
+            version: 1,
+            profiles: vec![
+                StreamProfile {
+                    id: "aaaaaaaaaaaa".into(),
+                    name: "Work".into(),
+                    ..StreamProfile::new("")
+                },
+                StreamProfile {
+                    id: "bbbbbbbbbbbb".into(),
+                    name: "Game".into(),
+                    ..StreamProfile::new("")
+                },
+            ],
+        };
+        let h = KnownHost {
+            pinned_profiles: vec![
+                "bbbbbbbbbbbb".into(),
+                "deleted00000".into(),
+                "bbbbbbbbbbbb".into(),
+                "aaaaaaaaaaaa".into(),
+            ],
+            ..Default::default()
+        };
+        let names: Vec<&str> = h
+            .resolved_pins(&catalog)
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["Game", "Work"]);
+        assert!(KnownHost::default().resolved_pins(&catalog).is_empty());
+    }
+
+    /// The connect-time precedence: a one-off pick beats the host's binding, `""` forces the
+    /// defaults, a dangling binding resolves as none, and a one-off that can't be honored
+    /// falls back to the DEFAULTS rather than to the host's own profile — "connect with Work"
+    /// must never quietly run "Game".
+    #[test]
+    fn profile_resolution_precedence() {
+        use crate::profiles::{ProfilesFile, StreamProfile};
+        let catalog = ProfilesFile {
+            version: 1,
+            profiles: vec![
+                StreamProfile {
+                    id: "aaaaaaaaaaaa".into(),
+                    name: "Game".into(),
+                    ..StreamProfile::new("")
+                },
+                StreamProfile {
+                    id: "bbbbbbbbbbbb".into(),
+                    name: "Work".into(),
+                    ..StreamProfile::new("")
+                },
+                StreamProfile {
+                    id: "cccccccccccc".into(),
+                    name: "work".into(),
+                    ..StreamProfile::new("")
+                },
+            ],
+        };
+        let name_of = |p: Option<StreamProfile>| p.map(|p| p.name);
+
+        // No binding, no pick: today's behavior.
+        assert_eq!(resolve_profile(&catalog, None, None), None);
+        // The binding drives a plain connect…
+        assert_eq!(
+            name_of(resolve_profile(&catalog, Some("aaaaaaaaaaaa"), None)),
+            Some("Game".into())
+        );
+        // …a one-off overrides it, by id or by unique name…
+        assert_eq!(
+            name_of(resolve_profile(
+                &catalog,
+                Some("aaaaaaaaaaaa"),
+                Some("bbbbbbbbbbbb")
+            )),
+            Some("Work".into())
+        );
+        assert_eq!(
+            name_of(resolve_profile(&catalog, None, Some("GAME"))),
+            Some("Game".into())
+        );
+        // …and `""` forces the defaults on a bound host.
+        assert_eq!(
+            resolve_profile(&catalog, Some("aaaaaaaaaaaa"), Some("")),
+            None
+        );
+        // A deleted binding is not an error, it is "no profile".
+        assert_eq!(resolve_profile(&catalog, Some("deleted00000"), None), None);
+        // Unknown and ambiguous one-offs fall back to the defaults, NOT to the binding.
+        assert_eq!(
+            resolve_profile(&catalog, Some("aaaaaaaaaaaa"), Some("nope")),
+            None
+        );
+        assert_eq!(
+            resolve_profile(&catalog, Some("aaaaaaaaaaaa"), Some("work")),
+            None
+        );
+        // A binding resolves by id only — a profile NAMED like the bound id doesn't hijack it.
+        assert_eq!(resolve_profile(&catalog, Some("Game"), None), None);
+    }
+
+    /// The atomic write replaces the target in one step and leaves no temp behind — the
+    /// discipline all three client stores now share.
+    #[test]
+    fn write_atomic_replaces_and_cleans_up() {
+        let dir = std::env::temp_dir().join(format!(
+            "pf-client-core-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("store.json");
+        write_atomic(&p, b"{\"a\":1}").unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "{\"a\":1}");
+        write_atomic(&p, b"{\"a\":2}").unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "{\"a\":2}");
+        assert!(!p.with_extension("json.tmp").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -201,11 +201,16 @@ pub fn run(target: Option<&str>) -> u8 {
                     tracing::info!(%addr, %title, request_access,
                         launch = launch.as_deref().unwrap_or("desktop"),
                         "launching from the console");
-                    // Settings re-load per launch: the console's own settings screen
-                    // may have changed them since the last stream.
-                    let settings = trust::Settings::load();
+                    // Settings re-resolve per launch: the console's own settings screen may
+                    // have changed the defaults since the last stream, and the host may carry
+                    // a profile binding. Console (and therefore Decky, which spawns this
+                    // binary) honors bindings with no console-side work — the resolver is the
+                    // same one `--connect` goes through. No one-off here: picking a profile is
+                    // a desktop-shell affordance in v1, pinned cards are the console's.
+                    let (settings, profile) = trust::effective_settings(&addr, port, None);
                     let mut params = session_params(
                         &settings,
+                        profile.map(|p| p.name),
                         addr.clone(),
                         port,
                         pin,
@@ -434,11 +439,7 @@ impl ServiceState {
                         name: if name.is_empty() { addr.clone() } else { name },
                         addr,
                         port,
-                        fp_hex: String::new(),
-                        paired: false,
-                        last_used: None,
-                        mac: Vec::new(),
-                        clipboard_sync: false,
+                        ..Default::default()
                     });
                 }
                 if let Err(e) = known.save() {

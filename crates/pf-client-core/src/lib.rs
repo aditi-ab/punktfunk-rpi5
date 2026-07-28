@@ -27,6 +27,11 @@ pub mod gamepad;
 pub mod keymap;
 #[cfg(any(target_os = "linux", windows))]
 pub mod library;
+// Client settings profiles: the override catalog + the one connect-time resolver
+// (design/client-settings-profiles.md §4). Sits beside `trust`, which owns the host records
+// the bindings live on.
+#[cfg(any(target_os = "linux", windows))]
+pub mod profiles;
 #[cfg(any(target_os = "linux", windows))]
 pub mod session;
 #[cfg(any(target_os = "linux", windows))]

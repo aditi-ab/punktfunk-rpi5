@@ -41,6 +41,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
 tracing = "0.1"
+# Stable ids for profiles and host records (profiles.rs) — the OS RNG only, same version the
+# workspace already resolves for punktfunk-core. No uuid crate: the v4 layout is four lines.
+rand = "0.9"
 
 # Gamepads: capture + feedback (full DualSense fidelity — touchpad/motion/triggers/LEDs
 # need the hidapi driver). Linux links the system SDL3; Windows builds it from source

@@ -336,11 +336,7 @@ pub fn headless_add_host(target: &str) -> glib::ExitCode {
             name,
             addr: addr.clone(),
             port,
-            fp_hex: String::new(),
-            paired: false,
-            last_used: None,
-            mac: Vec::new(),
-            clipboard_sync: false,
+            ..Default::default()
         });
     }
     match known.save() {

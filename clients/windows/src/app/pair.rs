@@ -57,9 +57,8 @@ pub(crate) fn pair_page(props: &Svc, cx: &mut RenderCx) -> Element {
                                 port: target3.port,
                                 fp_hex: trust::hex(&fp),
                                 paired: true,
-                                last_used: None,
                                 mac: target3.mac.clone(),
-                                clipboard_sync: false,
+                                ..Default::default()
                             });
                             let _ = k.save();
                             connect(&ctx3, &target3, Some(fp), &ss, &st);

@@ -185,6 +185,9 @@ struct StreamState {
     canceled: bool,
     ready_announced: bool,
     mode_line: String,
+    /// The settings profile this session resolved with, for the stats overlay's first line
+    /// ("which profile am I on?"). `None` = the global defaults, and nothing is shown.
+    profile: Option<String>,
     /// Live host↔client clock offset handle (None until Connected): loaded per present so
     /// mid-stream re-syncs keep the end-to-end number honest after an NTP step / drift.
     clock_offset: Option<Arc<std::sync::atomic::AtomicI64>>,
@@ -260,6 +263,7 @@ impl StreamState {
         force_software: Arc<AtomicBool>,
         wake: sdl3::event::EventSender,
     ) -> StreamState {
+        let profile = params.profile.clone();
         let handle = session::start(params);
         let (wake_tx, wake_rx) = async_channel::bounded(2);
         let pump_rx = handle.frames.clone();
@@ -284,6 +288,7 @@ impl StreamState {
             canceled: false,
             ready_announced: false,
             mode_line: String::new(),
+            profile,
             clock_offset: None,
             hdr: false,
             win_e2e_us: Vec::with_capacity(256),
@@ -1031,6 +1036,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         &st.presented,
                         st.hdr,
                         presenter.hdr_active(),
+                        st.profile.as_deref(),
                     );
                     if stats_verbosity != StatsVerbosity::Off {
                         // The stdout line is the machine interface (shell status card,
@@ -1042,6 +1048,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                             &st.presented,
                             st.hdr,
                             presenter.hdr_active(),
+                            st.profile.as_deref(),
                         );
                         println!("stats: {}", full.replace('\n', " | "));
                     }
@@ -1770,6 +1777,7 @@ fn bump_stats_tier(
                 &st.presented,
                 st.hdr,
                 presenter.hdr_active(),
+                st.profile.as_deref(),
             ),
             None => String::new(),
         };
@@ -1867,6 +1875,10 @@ const HINT_WITH_PAD: &str = "Click the stream to capture input · Ctrl+Alt+Shift
 /// The HDR tag is honest about the display path: `HDR` only when the swapchain actually
 /// runs HDR10 (`hdr_display`); a PQ stream tone-mapped onto an SDR surface (no HDR10
 /// format offered, HDR off in the compositor) shows `HDR→SDR` instead.
+///
+/// `profile` (the session's settings profile, `None` for the global defaults) closes the
+/// first line at every tier — the cheapest possible answer to "which profile am I on?"
+/// (design/client-settings-profiles.md §5.2).
 fn stats_text(
     verbosity: StatsVerbosity,
     mode_line: &str,
@@ -1874,7 +1886,9 @@ fn stats_text(
     p: &PresentedWindow,
     hdr_stream: bool,
     hdr_display: bool,
+    profile: Option<&str>,
 ) -> String {
+    let profile_tag = profile.map(|n| format!(" · {n}")).unwrap_or_default();
     match verbosity {
         StatsVerbosity::Off => return String::new(),
         StatsVerbosity::Compact => {
@@ -1888,6 +1902,7 @@ fn stats_text(
             if s.lost > 0 {
                 text.push_str(&format!(" · lost {}", s.lost));
             }
+            text.push_str(&profile_tag);
             return text;
         }
         StatsVerbosity::Normal | StatsVerbosity::Detailed => {}
@@ -1908,6 +1923,7 @@ fn stats_text(
     } else {
         format!("{mode_line} · {:.0} fps · {:.1} Mb/s", s.fps, s.mbps)
     };
+    text.push_str(&profile_tag);
     text.push_str(&format!(
         "\ne2e {:.1}/{:.1} ms (p50/p95)",
         p.e2e_p50_ms, p.e2e_p95_ms
@@ -2194,7 +2210,7 @@ mod tests {
     #[test]
     fn stats_text_tiers() {
         let (s, p) = sample();
-        let text = |v| stats_text(v, "1920×1080@120", &s, &p, true, false);
+        let text = |v| stats_text(v, "1920×1080@120", &s, &p, true, false, None);
 
         assert_eq!(text(StatsVerbosity::Off), "");
 
@@ -2227,8 +2243,54 @@ mod tests {
         s.lost = 0;
         let p = PresentedWindow::default();
         assert_eq!(
-            stats_text(StatsVerbosity::Compact, "m", &s, &p, false, false),
+            stats_text(StatsVerbosity::Compact, "m", &s, &p, false, false, None),
             "120 fps · 24 Mb/s"
+        );
+    }
+
+    /// The session's settings profile closes the FIRST line at every tier — one line in
+    /// Compact, the mode line in Normal/Detailed — and nothing renders without one.
+    #[test]
+    fn stats_text_names_the_active_profile() {
+        let (s, p) = sample();
+        assert_eq!(
+            stats_text(
+                StatsVerbosity::Compact,
+                "m",
+                &s,
+                &p,
+                false,
+                false,
+                Some("Game")
+            ),
+            "120 fps · 6.4 ms · 24 Mb/s · lost 3 · Game"
+        );
+        let normal = stats_text(
+            StatsVerbosity::Normal,
+            "1920×1080@120",
+            &s,
+            &p,
+            false,
+            false,
+            Some("Work"),
+        );
+        assert_eq!(
+            normal.lines().next().unwrap(),
+            "1920×1080@120 · 120 fps · 24.3 Mb/s · Work"
+        );
+        let detailed = stats_text(
+            StatsVerbosity::Detailed,
+            "1920×1080@120",
+            &s,
+            &p,
+            true,
+            true,
+            Some("Work"),
+        );
+        assert!(detailed.lines().next().unwrap().ends_with("· HDR · Work"));
+        // No profile → the line is exactly what it always was.
+        assert!(
+            !stats_text(StatsVerbosity::Normal, "m", &s, &p, false, false, None).contains(" ·  ")
         );
     }
 

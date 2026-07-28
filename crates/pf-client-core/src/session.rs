@@ -73,6 +73,11 @@ pub struct SessionParams {
     /// re-requests a keyframe. Decode itself succeeds in that state, so nothing else
     /// would recover — without this the stream stays black.
     pub force_software: Arc<AtomicBool>,
+    /// Name of the settings profile these params were resolved with (`None` = the global
+    /// defaults). Display only — every value it influenced is already baked into the fields
+    /// above; it rides along so the stats overlay can answer "which profile am I on?" without
+    /// re-reading any store (design/client-settings-profiles.md §5.2).
+    pub profile: Option<String>,
 }
 
 /// The session pump's share of the unified stats window (design/stats-unification.md):

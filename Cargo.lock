@@ -2863,6 +2863,7 @@ dependencies = [
  "pipewire",
  "punktfunk-core",
  "pyrowave-sys",
+ "rand 0.9.4",
  "rustls",
  "sdl3",
  "serde",
