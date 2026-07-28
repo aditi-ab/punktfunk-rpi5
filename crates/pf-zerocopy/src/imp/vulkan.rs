@@ -104,25 +104,44 @@ impl VkBridge {
                 )
                 .context("vkCreateInstance")?;
 
-            // Pick the NVIDIA GPU (matches CUDA device 0 on this single-dGPU host).
-            let phys = instance
+            // Pick the NVIDIA GPU (matches CUDA device 0 on this single-dGPU host). Failure paths
+            // between instance and device creation destroy the instance explicitly (the shape
+            // `VkSlotBlend::new` uses) — a box that refuses the bridge retries per frame, so a
+            // leak here is unbounded, not one-shot.
+            let phys = match instance
                 .enumerate_physical_devices()
-                .context("enumerate GPUs")?
-                .into_iter()
-                .find(|&p| instance.get_physical_device_properties(p).vendor_id == 0x10DE)
-                .ok_or_else(|| anyhow!("no NVIDIA Vulkan device"))?;
+                .context("enumerate GPUs")
+                .map(|devs| {
+                    devs.into_iter()
+                        .find(|&p| instance.get_physical_device_properties(p).vendor_id == 0x10DE)
+                }) {
+                Ok(Some(p)) => p,
+                Ok(None) => {
+                    instance.destroy_instance(None);
+                    return Err(anyhow!("no NVIDIA Vulkan device"));
+                }
+                Err(e) => {
+                    instance.destroy_instance(None);
+                    return Err(e);
+                }
+            };
             let mem_props = instance.get_physical_device_memory_properties(phys);
 
             // A COMPUTE-capable family (compute implies transfer): the copy path only needs
             // transfer, but the NV12 CSC dispatch (T2.5b) needs compute — on every NVIDIA
             // device family 0 is graphics+compute+transfer, so this picks the same family the
             // old transfer-only predicate did.
-            let qf = instance
+            let qf = match instance
                 .get_physical_device_queue_family_properties(phys)
                 .iter()
                 .position(|q| q.queue_flags.contains(vk::QueueFlags::COMPUTE))
-                .ok_or_else(|| anyhow!("no compute-capable queue family"))?
-                as u32;
+            {
+                Some(i) => i as u32,
+                None => {
+                    instance.destroy_instance(None);
+                    return Err(anyhow!("no compute-capable queue family"));
+                }
+            };
 
             // Global-priority queue (latency plan §7 LN4, PyroWave's `ac0e7332` lever for the
             // VkBridge): the LINEAR/gamescope CSC dispatch shares the SM/compute cores with the
@@ -206,15 +225,34 @@ impl VkBridge {
                         try_priority = None;
                     }
                     Err(e) => {
+                        instance.destroy_instance(None);
                         return Err(e)
-                            .context("vkCreateDevice (external-memory extensions supported?)")
+                            .context("vkCreateDevice (external-memory extensions supported?)");
                     }
                 }
             };
+            // From here teardown-on-error goes through `Drop`, which tolerates null handles
+            // (Vulkan destroy calls are defined no-ops on VK_NULL_HANDLE) — build the remaining
+            // objects into an incrementally-filled struct so any `?` below unwinds cleanly
+            // instead of leaking the instance + device.
             let ext_fd = ash::khr::external_memory_fd::Device::new(&instance, &device);
             let queue = device.get_device_queue(qf, 0);
-
-            let cmd_pool = device
+            let mut me = VkBridge {
+                _entry: entry,
+                instance,
+                device,
+                ext_fd,
+                queue,
+                cmd_pool: vk::CommandPool::null(),
+                cmd: vk::CommandBuffer::null(),
+                fence: vk::Fence::null(),
+                mem_props,
+                src_cache: HashMap::new(),
+                dst: None,
+                csc: None,
+            };
+            me.cmd_pool = me
+                .device
                 .create_command_pool(
                     &vk::CommandPoolCreateInfo::default()
                         .queue_family_index(qf)
@@ -222,33 +260,22 @@ impl VkBridge {
                     None,
                 )
                 .context("create command pool")?;
-            let cmd = device
+            me.cmd = me
+                .device
                 .allocate_command_buffers(
                     &vk::CommandBufferAllocateInfo::default()
-                        .command_pool(cmd_pool)
+                        .command_pool(me.cmd_pool)
                         .level(vk::CommandBufferLevel::PRIMARY)
                         .command_buffer_count(1),
                 )
                 .context("allocate command buffer")?[0];
-            let fence = device
+            me.fence = me
+                .device
                 .create_fence(&vk::FenceCreateInfo::default(), None)
                 .context("create fence")?;
 
             tracing::info!("Vulkan bridge ready (dmabuf import → OPAQUE_FD export → CUDA)");
-            Ok(VkBridge {
-                _entry: entry,
-                instance,
-                device,
-                ext_fd,
-                queue,
-                cmd_pool,
-                cmd,
-                fence,
-                mem_props,
-                src_cache: HashMap::new(),
-                dst: None,
-                csc: None,
-            })
+            Ok(me)
         }
     }
 
@@ -446,16 +473,45 @@ impl VkBridge {
     }
 
     /// Build the RGB→NV12 compute pipeline once (T2.5b): two-SSBO descriptor set + a 28-byte
-    /// push-constant block matching `rgb2nv12_buf.comp`'s `Push`.
+    /// push-constant block matching `rgb2nv12_buf.comp`'s `Push`. A mid-build failure destroys
+    /// what was already created (the caller retries per frame, so a leak would be unbounded) and
+    /// leaves `self.csc` `None`.
     unsafe fn ensure_csc(&mut self) -> Result<()> {
         if self.csc.is_some() {
             return Ok(());
         }
+        let mut csc = Csc {
+            module: vk::ShaderModule::null(),
+            dset_layout: vk::DescriptorSetLayout::null(),
+            playout: vk::PipelineLayout::null(),
+            pipeline: vk::Pipeline::null(),
+            dpool: vk::DescriptorPool::null(),
+            dset: vk::DescriptorSet::null(),
+        };
+        if let Err(e) = self.build_csc(&mut csc) {
+            // Reverse creation order; Vulkan destroy calls are defined no-ops on the null
+            // handles a partial build left behind.
+            let d = &self.device;
+            d.destroy_descriptor_pool(csc.dpool, None); // frees `csc.dset` with it
+            d.destroy_pipeline(csc.pipeline, None);
+            d.destroy_pipeline_layout(csc.playout, None);
+            d.destroy_descriptor_set_layout(csc.dset_layout, None);
+            d.destroy_shader_module(csc.module, None);
+            return Err(e);
+        }
+        self.csc = Some(csc);
+        tracing::info!("Vulkan-bridge NV12 compute CSC ready (LINEAR path feeds NVENC native YUV)");
+        Ok(())
+    }
+
+    /// The fallible half of [`ensure_csc`](Self::ensure_csc): fills `csc` front to back so the
+    /// caller knows exactly what to destroy when a step fails.
+    unsafe fn build_csc(&mut self, csc: &mut Csc) -> Result<()> {
         let words: Vec<u32> = CSC_SPV
             .chunks_exact(4)
             .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
             .collect();
-        let module = self
+        csc.module = self
             .device
             .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&words), None)
             .context("create CSC shader module")?;
@@ -471,7 +527,7 @@ impl VkBridge {
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::COMPUTE),
         ];
-        let dset_layout = self
+        csc.dset_layout = self
             .device
             .create_descriptor_set_layout(
                 &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
@@ -481,8 +537,8 @@ impl VkBridge {
         let pc = [vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::COMPUTE)
             .size(28)];
-        let layouts = [dset_layout];
-        let playout = self
+        let layouts = [csc.dset_layout];
+        csc.playout = self
             .device
             .create_pipeline_layout(
                 &vk::PipelineLayoutCreateInfo::default()
@@ -494,22 +550,22 @@ impl VkBridge {
         let entry = c"main";
         let stage = vk::PipelineShaderStageCreateInfo::default()
             .stage(vk::ShaderStageFlags::COMPUTE)
-            .module(module)
+            .module(csc.module)
             .name(entry);
-        let pipeline = self
+        csc.pipeline = self
             .device
             .create_compute_pipelines(
                 vk::PipelineCache::null(),
                 &[vk::ComputePipelineCreateInfo::default()
                     .stage(stage)
-                    .layout(playout)],
+                    .layout(csc.playout)],
                 None,
             )
             .map_err(|(_, e)| anyhow!("create CSC pipeline: {e}"))?[0];
         let sizes = [vk::DescriptorPoolSize::default()
             .ty(vk::DescriptorType::STORAGE_BUFFER)
             .descriptor_count(2)];
-        let dpool = self
+        csc.dpool = self
             .device
             .create_descriptor_pool(
                 &vk::DescriptorPoolCreateInfo::default()
@@ -518,23 +574,14 @@ impl VkBridge {
                 None,
             )
             .context("create CSC descriptor pool")?;
-        let dset = self
+        csc.dset = self
             .device
             .allocate_descriptor_sets(
                 &vk::DescriptorSetAllocateInfo::default()
-                    .descriptor_pool(dpool)
+                    .descriptor_pool(csc.dpool)
                     .set_layouts(&layouts),
             )
             .context("allocate CSC descriptor set")?[0];
-        self.csc = Some(Csc {
-            module,
-            dset_layout,
-            playout,
-            pipeline,
-            dpool,
-            dset,
-        });
-        tracing::info!("Vulkan-bridge NV12 compute CSC ready (LINEAR path feeds NVENC native YUV)");
         Ok(())
     }
 
