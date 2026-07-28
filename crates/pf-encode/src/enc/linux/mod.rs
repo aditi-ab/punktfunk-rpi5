@@ -8,12 +8,6 @@
 //! does *not* accept — we expand it to `rgb0` (one padding byte/pixel, no colour math).
 //! The encoder is opened *without* a global header so VPS/SPS/PPS are emitted in-band on
 //! every IDR — the output is both a playable raw Annex-B stream and self-contained AUs.
-// UNSAFE-LINT EXEMPTION (rationale + exit criteria: `unsafe_op_in_unsafe_fn` in the workspace
-// Cargo.toml). This body is raw libav (`ffmpeg-sys-next`) hwcontext calls almost line for line;
-// narrowing it would add one `unsafe {}` plus one SAFETY comment per call that could only restate
-// the signature. Clearing this file means DELETING the markers that carry no caller contract, not
-// wrapping the calls — until then the lint is off HERE and enforced everywhere else.
-#![allow(unsafe_op_in_unsafe_fn)]
 // Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
 #![deny(clippy::undocumented_unsafe_blocks)]
 
@@ -84,30 +78,49 @@ impl CudaHw {
     unsafe fn new(cu_ctx: *mut std::ffi::c_void, sw_format: Pixel, w: u32, h: u32) -> Result<Self> {
         // Each `?`/`bail!` below drops whatever has been built so far — `AvBuffer`'s `Drop` is the
         // single unref path, so the failure branches carry no cleanup of their own.
-        let device_ref = AvBuffer::from_raw(ffi::av_hwdevice_ctx_alloc(
-            ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_CUDA,
-        ))
-        .context("av_hwdevice_ctx_alloc(CUDA) failed")?;
-        let dev_ctx = (*device_ref.as_ptr()).data as *mut ffi::AVHWDeviceContext;
-        let cu = (*dev_ctx).hwctx as *mut AVCUDADeviceContext;
-        (*cu).cuda_ctx = cu_ctx; // share the importer's context
-        let r = ffi::av_hwdevice_ctx_init(device_ref.as_ptr());
-        if r < 0 {
-            bail!("av_hwdevice_ctx_init failed ({r})");
-        }
 
-        let frames_ref = AvBuffer::from_raw(ffi::av_hwframe_ctx_alloc(device_ref.as_ptr()))
-            .context("av_hwframe_ctx_alloc failed")?;
-        let fc = (*frames_ref.as_ptr()).data as *mut ffi::AVHWFramesContext;
-        (*fc).format = ffi::AVPixelFormat::AV_PIX_FMT_CUDA;
-        (*fc).sw_format = pixel_to_av(sw_format);
-        (*fc).width = w as c_int;
-        (*fc).height = h as c_int;
-        (*fc).initial_pool_size = 0; // we supply the device pointers
-        let r = ffi::av_hwframe_ctx_init(frames_ref.as_ptr());
-        if r < 0 {
-            bail!("av_hwframe_ctx_init failed ({r})");
-        }
+        // SAFETY: `av_hwdevice_ctx_alloc` returns either null — which `AvBuffer::from_raw` rejects,
+        // so the `?` returns before anything below runs — or a fresh ref whose `data` libav has
+        // already initialized as an `AVHWDeviceContext`. For a CUDA device that context's `hwctx`
+        // is an `AVCUDADeviceContext` (our repr(C) mirror of libav's layout), so writing
+        // `cuda_ctx` is an in-bounds field store on a live allocation, and `cu_ctx` is a valid
+        // `CUcontext` by this fn's contract. `av_hwdevice_ctx_init` then takes the same live ref;
+        // it must see `cuda_ctx` already set, which is why the store precedes it.
+        let device_ref = unsafe {
+            let device_ref = AvBuffer::from_raw(ffi::av_hwdevice_ctx_alloc(
+                ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_CUDA,
+            ))
+            .context("av_hwdevice_ctx_alloc(CUDA) failed")?;
+            let dev_ctx = (*device_ref.as_ptr()).data as *mut ffi::AVHWDeviceContext;
+            let cu = (*dev_ctx).hwctx as *mut AVCUDADeviceContext;
+            (*cu).cuda_ctx = cu_ctx; // share the importer's context
+            let r = ffi::av_hwdevice_ctx_init(device_ref.as_ptr());
+            if r < 0 {
+                bail!("av_hwdevice_ctx_init failed ({r})");
+            }
+            device_ref
+        };
+
+        // SAFETY: the same shape one level up — `av_hwframe_ctx_alloc` is handed the live,
+        // now-initialized device ref and returns null (rejected by `from_raw`, so the `?` leaves
+        // before the writes) or a ref whose `data` is a live `AVHWFramesContext`. Every store below
+        // is an in-bounds field write on that allocation, all plain scalars, done before
+        // `av_hwframe_ctx_init` reads them.
+        let frames_ref = unsafe {
+            let frames_ref = AvBuffer::from_raw(ffi::av_hwframe_ctx_alloc(device_ref.as_ptr()))
+                .context("av_hwframe_ctx_alloc failed")?;
+            let fc = (*frames_ref.as_ptr()).data as *mut ffi::AVHWFramesContext;
+            (*fc).format = ffi::AVPixelFormat::AV_PIX_FMT_CUDA;
+            (*fc).sw_format = pixel_to_av(sw_format);
+            (*fc).width = w as c_int;
+            (*fc).height = h as c_int;
+            (*fc).initial_pool_size = 0; // we supply the device pointers
+            let r = ffi::av_hwframe_ctx_init(frames_ref.as_ptr());
+            if r < 0 {
+                bail!("av_hwframe_ctx_init failed ({r})");
+            }
+            frames_ref
+        };
         Ok(CudaHw {
             frames_ref,
             device_ref,
