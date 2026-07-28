@@ -107,7 +107,8 @@ NVENC/EGL come from the NVIDIA driver: `sudo pacman -S --needed nvidia-utils`. A
 | Need | Arch package |
 |------|--------------|
 | FFmpeg + NVENC | `ffmpeg` (NVENC built in) |
-| PipeWire + Pulse + session mgr | `pipewire` `pipewire-pulse` `wireplumber` |
+| PipeWire + session mgr | `pipewire` `wireplumber` |
+| PulseAudio-API audio for games | `pipewire-pulse` *(host optdepend — real `pulseaudio` also works; never a hard dep, it CONFLICTS with `pulseaudio`)* |
 | Opus / input injection | `opus` `libei` |
 | GL/EGL + gbm + xkb + wayland | `libglvnd` `mesa` `libxkbcommon` `wayland` |
 | NVIDIA driver (NVENC/EGL/CUDA) | `nvidia-utils` *(optdepend — never a hard dep)* |

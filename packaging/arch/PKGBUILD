@@ -126,9 +126,14 @@ package_punktfunk-host() {
   pkgdesc="Low-latency desktop/game streaming HOST (Moonlight-compatible + punktfunk/1)"
   # NVENC + GPU EGL/CUDA come from the NVIDIA driver (nvidia-utils) — kept an optdepend, never a
   # hard dep, exactly as the RPM (__requires_exclude libcuda) and deb (shlibdeps filter) do.
-  depends=('ffmpeg' 'pipewire' 'pipewire-pulse' 'wireplumber' 'opus' 'libei'
+  # The host captures the sink monitor through NATIVE PipeWire (audio/linux.rs) — it never
+  # opens a Pulse socket itself, so pipewire-pulse is an OPTdepend, not a depend: it exists
+  # for the GAMES, which commonly emit through the PulseAudio API. Hard-depending on it made
+  # the package uninstallable next to real `pulseaudio`, which serves those games just as well.
+  depends=('ffmpeg' 'pipewire' 'wireplumber' 'opus' 'libei'
            'mesa' 'libglvnd' 'libxkbcommon' 'wayland')
-  optdepends=('nvidia-utils: NVENC hardware encode + GPU EGL/CUDA zero-copy (REQUIRED to encode on NVIDIA)'
+  optdepends=('pipewire-pulse: PulseAudio-API audio from games/apps (real `pulseaudio` also works)'
+              'nvidia-utils: NVENC hardware encode + GPU EGL/CUDA zero-copy (REQUIRED to encode on NVIDIA)'
               'gamescope: per-session nested compositor backend (no desktop login needed) — needs >=3.16.22'
               'kwin: stream a KDE Plasma desktop (kwin VirtualDisplay backend)'
               'mutter: stream a GNOME desktop (Mutter RecordVirtual backend)'
@@ -227,7 +232,12 @@ package_punktfunk-client() {
   # The GTK4/libadwaita shell + its Vulkan session streamer: SDL3 gamepads, FFmpeg (VAAPI +
   # Vulkan Video) decode, PipeWire audio/mic. vulkan-icd-loader: the session binary loads
   # libvulkan at runtime (ash) for its ash/Skia presenter.
-  depends=('gtk4' 'libadwaita' 'sdl3' 'ffmpeg' 'pipewire' 'wireplumber' 'pipewire-pulse'
+  # NOT pipewire-pulse: the client speaks NATIVE PipeWire (audio.rs drives libpipewire-0.3
+  # directly for both playback and the mic uplink) and never opens a Pulse socket, so the
+  # compat shim buys it nothing — while `pipewire-pulse` CONFLICTS with `pulseaudio`, which
+  # made the package uninstallable for anyone keeping real PulseAudio. Matches the .deb
+  # (Recommends) and the RPM (Recommends, "degrade gracefully without it").
+  depends=('gtk4' 'libadwaita' 'sdl3' 'ffmpeg' 'pipewire' 'wireplumber'
            'opus' 'libglvnd' 'vulkan-icd-loader')
   optdepends=('libva-mesa-driver: VAAPI hardware decode on AMD (incl. Steam Deck); software fallback otherwise'
               'intel-media-driver: VAAPI hardware decode on Intel'
