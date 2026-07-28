@@ -50,6 +50,9 @@ pub mod video;
 mod video_color;
 #[cfg(any(target_os = "linux", windows))]
 mod video_software;
+// libav ownership helpers shared by the hardware decoders below (`AvBuffer`).
+#[cfg(any(target_os = "linux", windows))]
+mod video_libav;
 #[cfg(target_os = "linux")]
 mod video_vaapi;
 #[cfg(any(target_os = "linux", windows))]

@@ -5,7 +5,8 @@ use crate::video::{
     AVERROR_EAGAIN,
 };
 use crate::video_color::ColorDesc;
-use anyhow::{anyhow, bail, Result};
+use crate::video_libav::AvBuffer;
+use anyhow::{anyhow, bail, Context, Result};
 use ffmpeg_next as ffmpeg;
 use std::ptr;
 
@@ -32,7 +33,9 @@ unsafe extern "C" fn pick_vaapi(
 #[cfg(target_os = "linux")]
 pub(crate) struct VaapiDecoder {
     ctx: *mut ffmpeg::ffi::AVCodecContext,
-    hw_device: *mut ffmpeg::ffi::AVBufferRef,
+    // Owned: unrefs itself. Declared after `ctx` so it still releases AFTER the `Drop` below frees
+    // packet/frame/ctx — the same order the hand-written unref had.
+    hw_device: AvBuffer,
     packet: *mut ffmpeg::ffi::AVPacket,
     frame: *mut ffmpeg::ffi::AVFrame,
 }
@@ -57,14 +60,16 @@ impl VaapiDecoder {
             if r < 0 {
                 bail!("no VAAPI device ({})", ffmpeg::Error::from(r));
             }
+            // Owned from here: every `bail!` below drops it, so none of them unref by hand.
+            let hw_device = AvBuffer::from_raw(hw_device)
+                .context("av_hwdevice_ctx_create(VAAPI) gave no device")?;
             // The negotiated codec's decoder id (av_codec_id maps 1:1 from ffmpeg::codec::Id).
             let codec = ffi::avcodec_find_decoder(codec_id.into());
             if codec.is_null() {
-                ffi::av_buffer_unref(&mut hw_device);
                 bail!("no {codec_id:?} decoder");
             }
             let ctx = ffi::avcodec_alloc_context3(codec);
-            (*ctx).hw_device_ctx = ffi::av_buffer_ref(hw_device);
+            (*ctx).hw_device_ctx = ffi::av_buffer_ref(hw_device.as_ptr());
             (*ctx).get_format = Some(pick_vaapi);
             (*ctx).flags |= ffi::AV_CODEC_FLAG_LOW_DELAY as i32;
             (*ctx).thread_count = 1; // hwaccel: threads only add latency
@@ -80,8 +85,6 @@ impl VaapiDecoder {
             if r < 0 {
                 let mut ctx = ctx;
                 ffi::avcodec_free_context(&mut ctx);
-                let mut hw_device = hw_device;
-                ffi::av_buffer_unref(&mut hw_device);
                 bail!("avcodec_open2: {}", ffmpeg::Error::from(r));
             }
             Ok(VaapiDecoder {
@@ -237,7 +240,7 @@ impl Drop for VaapiDecoder {
             ffi::av_packet_free(&mut self.packet);
             ffi::av_frame_free(&mut self.frame);
             ffi::avcodec_free_context(&mut self.ctx);
-            ffi::av_buffer_unref(&mut self.hw_device);
+            // `hw_device` is an `AvBuffer` and unrefs itself when the field drops, right after this.
         }
     }
 }

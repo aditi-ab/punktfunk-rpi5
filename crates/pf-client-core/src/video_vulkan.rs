@@ -6,7 +6,8 @@ use crate::video::{
     AVERROR_EAGAIN,
 };
 use crate::video_color::ColorDesc;
-use anyhow::{bail, Result};
+use crate::video_libav::AvBuffer;
+use anyhow::{bail, Context, Result};
 use ffmpeg_next as ffmpeg;
 use std::ptr;
 
@@ -18,7 +19,9 @@ use std::ptr;
 /// frames are `AVVkFrame`s whose VkImage the presenter feeds straight to its CSC pass.
 pub(crate) struct VulkanDecoder {
     ctx: *mut ffmpeg::ffi::AVCodecContext,
-    hw_device: *mut ffmpeg::ffi::AVBufferRef,
+    // Owned: unrefs itself. Declared after `ctx` so it still releases AFTER the `Drop` below frees
+    // packet/frame/ctx — the same order the hand-written unref had.
+    hw_device: AvBuffer,
     packet: *mut ffmpeg::ffi::AVPacket,
     frame: *mut ffmpeg::ffi::AVFrame,
     /// `vkWaitSemaphores` on the shared device — the decode-complete measurement
@@ -187,6 +190,9 @@ impl VulkanDecoder {
                 ffi::av_buffer_unref(&mut hw_device);
                 return Err(averr("av_hwdevice_ctx_init(VULKAN)", r));
             }
+            // Owned from here: every failure path below drops it instead of unref'ing by hand.
+            let hw_device = AvBuffer::from_raw(hw_device)
+                .context("av_hwdevice_ctx_alloc(VULKAN) gave no device")?;
 
             // vkWaitSemaphores for the pump's decode-complete stat: loader →
             // vkGetDeviceProcAddr → device fn (core 1.2, guaranteed by our gate).
@@ -201,18 +207,16 @@ impl VulkanDecoder {
                 c"vkWaitSemaphores".as_ptr(),
             ));
             if wait_semaphores.is_none() {
-                ffi::av_buffer_unref(&mut hw_device);
                 bail!("vkWaitSemaphores unresolvable on this device");
             }
             let vk_device = (*hwctx).act_dev;
 
             let codec = ffi::avcodec_find_decoder(codec_id.into());
             if codec.is_null() {
-                ffi::av_buffer_unref(&mut hw_device);
                 bail!("no {codec_id:?} decoder");
             }
             let ctx = ffi::avcodec_alloc_context3(codec);
-            (*ctx).hw_device_ctx = ffi::av_buffer_ref(hw_device);
+            (*ctx).hw_device_ctx = ffi::av_buffer_ref(hw_device.as_ptr());
             (*ctx).get_format = Some(pick_vulkan);
             (*ctx).flags |= ffi::AV_CODEC_FLAG_LOW_DELAY as i32;
             (*ctx).thread_count = 1; // hwaccel: threads only add latency
@@ -223,7 +227,6 @@ impl VulkanDecoder {
             if r < 0 {
                 let mut ctx = ctx;
                 ffi::avcodec_free_context(&mut ctx);
-                ffi::av_buffer_unref(&mut hw_device);
                 return Err(averr("avcodec_open2 (vulkan)", r));
             }
             Ok(VulkanDecoder {
@@ -358,7 +361,7 @@ impl Drop for VulkanDecoder {
             ffi::av_packet_free(&mut self.packet);
             ffi::av_frame_free(&mut self.frame);
             ffi::avcodec_free_context(&mut self.ctx);
-            ffi::av_buffer_unref(&mut self.hw_device);
+            // `hw_device` is an `AvBuffer` and unrefs itself when the field drops, right after this.
         }
     }
 }
@@ -396,24 +399,29 @@ unsafe extern "C" fn pick_vulkan(
             tracing::warn!(code = r, "avcodec_get_hw_frames_parameters(VULKAN) failed");
             return ffi::AVPixelFormat::AV_PIX_FMT_NONE;
         }
-        let fc = (*fr).data as *mut ffi::AVHWFramesContext;
+        // Owned until the codec takes it at the bottom: the init-failure path below just returns
+        // and the drop releases it.
+        let Some(fr) = AvBuffer::from_raw(fr) else {
+            return ffi::AVPixelFormat::AV_PIX_FMT_NONE;
+        };
+        let fc = (*fr.as_ptr()).data as *mut ffi::AVHWFramesContext;
         let vkfc = (*fc).hwctx as *mut pf_ffvk::AVVulkanFramesContext;
         // MUTABLE_FORMAT: per-plane views (spec requirement); ALIAS is FFmpeg's default.
         // (`as _`: the FlagBits constants are i32 under MSVC, the img_flags field u32.)
         (*vkfc).img_flags = (pf_ffvk::VkImageCreateFlagBits_VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT
             | pf_ffvk::VkImageCreateFlagBits_VK_IMAGE_CREATE_ALIAS_BIT)
             as _;
-        let r = ffi::av_hwframe_ctx_init(fr);
+        let r = ffi::av_hwframe_ctx_init(fr.as_ptr());
         if r < 0 {
             tracing::warn!(code = r, "av_hwframe_ctx_init(VULKAN) failed");
-            let mut fr = fr;
-            ffi::av_buffer_unref(&mut fr);
             return ffi::AVPixelFormat::AV_PIX_FMT_NONE;
         }
         if !(*ctx).hw_frames_ctx.is_null() {
             ffi::av_buffer_unref(&mut (*ctx).hw_frames_ctx);
         }
-        (*ctx).hw_frames_ctx = fr; // the codec owns our ref now
+        // Ownership TRANSFERS to the codec here, so hand over the raw pointer and forget the
+        // wrapper — dropping it as well would be the double-unref `AvBuffer` exists to prevent.
+        (*ctx).hw_frames_ctx = fr.into_raw();
         ffi::AVPixelFormat::AV_PIX_FMT_VULKAN
     }
 }
