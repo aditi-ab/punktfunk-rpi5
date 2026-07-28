@@ -72,6 +72,43 @@ impl Drop for AvBuffer {
     }
 }
 
+/// An owned `AVFilterGraph`, freed exactly once when it drops.
+///
+/// The dmabuf path built its graph beside three `AvBuffer`s and unwound all four by hand on each
+/// of eight failure branches — a four-line cleanup block copied eight times, once inside a macro.
+/// Freeing the graph is the same ownership question as unref'ing a buffer, so it gets the same
+/// answer.
+pub(crate) struct AvFilterGraph(*mut ffi::AVFilterGraph);
+
+impl AvFilterGraph {
+    /// Allocate a filter graph, rejecting the null `avfilter_graph_alloc` returns on OOM.
+    ///
+    /// Safe: the call takes no arguments and has no precondition a caller could violate — the only
+    /// contract is what happens to the result, and that is exactly what this type owns.
+    pub(crate) fn alloc() -> Option<Self> {
+        // SAFETY: parameterless allocator; it returns either a fresh graph whose ownership passes
+        // to the value returned here, or null (rejected below).
+        let g = unsafe { ffi::avfilter_graph_alloc() };
+        (!g.is_null()).then_some(AvFilterGraph(g))
+    }
+
+    /// The borrowed pointer, for the `avfilter_*` calls that build into the graph without taking
+    /// ownership of it.
+    pub(crate) fn as_ptr(&self) -> *mut ffi::AVFilterGraph {
+        self.0
+    }
+}
+
+impl Drop for AvFilterGraph {
+    fn drop(&mut self) {
+        // SAFETY: `self.0` is the non-null graph `alloc` took ownership of, and this type is its
+        // sole owner (neither `Clone` nor `Copy`; `as_ptr` only lends), so this runs exactly once.
+        // `avfilter_graph_free` frees the graph together with the filter contexts and per-filter
+        // device refs it owns, and nulls the pointer through the `&mut`.
+        unsafe { ffi::avfilter_graph_free(&mut self.0) };
+    }
+}
+
 /// One `receive_packet` attempt, with the not-ready states kept distinct so a blocking drain can
 /// tell "still encoding" (retry) from "stream over" (stop). The Linux NVENC/VAAPI polls collapse
 /// `Again`/`Eof` to `None`; the Windows AMF/QSV path keeps them apart for its deadline-driven loop.

@@ -36,8 +36,8 @@ use std::ptr;
 use std::sync::{Mutex, OnceLock};
 
 use super::libav::{
-    apply_low_latency_rc, pixel_to_av, poll_encoder, AvBuffer, PollOutcome, SWS_CS_ITU709,
-    SWS_POINT,
+    apply_low_latency_rc, pixel_to_av, poll_encoder, AvBuffer, AvFilterGraph, PollOutcome,
+    SWS_CS_ITU709, SWS_POINT,
 };
 use ffmpeg::ffi; // = ffmpeg_sys_next
 
@@ -738,14 +738,19 @@ impl Drop for CpuInner {
 // ---------------------------------------------------------------------------------------------
 
 struct DmabufInner {
-    enc: encoder::video::Encoder,
-    /// DRM device the source dmabuf frames reference (the buffersrc's `hw_frames_ctx` device).
-    drm_device: *mut ffi::AVBufferRef,
-    /// VAAPI device driving `hwmap`/`scale_vaapi`/the encoder.
-    vaapi_device: *mut ffi::AVBufferRef,
+    // FIELD ORDER IS LOAD-BEARING. These drop in declaration order, and this order reproduces
+    // exactly what the hand-written `Drop` this replaced did: graph, then frames, then the derived
+    // VAAPI device, then DRM — and `enc` last of all, since the old `Drop` ran before any field and
+    // so freed all four ahead of ffmpeg-next dropping the encoder. Every one of these holds its own
+    // reference, so refcounting makes any order sound; the point is that a field reorder must not
+    // silently change what ships. Do not move `enc`, and do not reorder the four below it.
+    graph: AvFilterGraph,
     /// DRM-PRIME frames context for the imported dmabufs (buffersrc input).
-    drm_frames: *mut ffi::AVBufferRef,
-    graph: *mut ffi::AVFilterGraph,
+    drm_frames: AvBuffer,
+    /// VAAPI device driving `hwmap`/`scale_vaapi`/the encoder.
+    vaapi_device: AvBuffer,
+    /// DRM device the source dmabuf frames reference (the buffersrc's `hw_frames_ctx` device).
+    drm_device: AvBuffer,
     src: *mut ffi::AVFilterContext,
     sink: *mut ffi::AVFilterContext,
     width: u32,
@@ -755,6 +760,10 @@ struct DmabufInner {
     /// submit (import+push vs CSC pull vs encoder send), the stage that dominates AMD/Intel
     /// host latency (7.9 ms p50 at 1440p on the 780M).
     frames: u64,
+    /// Declared LAST on purpose — see the field-order note at the top of this struct. The encoder
+    /// holds its own device ref and must drop after the graph and the three buffers, which is what
+    /// the hand-written `Drop` used to guarantee by running ahead of every field.
+    enc: encoder::video::Encoder,
 }
 
 impl DmabufInner {
@@ -821,70 +830,58 @@ impl DmabufInner {
                     ffmpeg::Error::from(r)
                 );
             }
+            // Own each handle the moment it exists: from here every `bail!` drops whatever has been
+            // built so far, in reverse order, so not one failure branch below carries cleanup code.
+            let drm_device = AvBuffer::from_raw(drm_device)
+                .context("av_hwdevice_ctx_create(DRM) gave no device")?;
             let mut vaapi_device: *mut ffi::AVBufferRef = ptr::null_mut();
             let r = ffi::av_hwdevice_ctx_create_derived(
                 &mut vaapi_device,
                 ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI,
-                drm_device,
+                drm_device.as_ptr(),
                 0,
             );
             if r < 0 {
-                ffi::av_buffer_unref(&mut drm_device);
                 bail!("derive VAAPI from DRM: {}", ffmpeg::Error::from(r));
             }
+            let vaapi_device = AvBuffer::from_raw(vaapi_device)
+                .context("av_hwdevice_ctx_create_derived(VAAPI) gave no device")?;
 
             // DRM-PRIME frames context for the imported dmabufs.
-            let mut drm_frames = ffi::av_hwframe_ctx_alloc(drm_device);
-            if drm_frames.is_null() {
-                ffi::av_buffer_unref(&mut vaapi_device);
-                ffi::av_buffer_unref(&mut drm_device);
-                bail!("av_hwframe_ctx_alloc(DRM) failed");
-            }
-            let fc = (*drm_frames).data as *mut ffi::AVHWFramesContext;
+            let drm_frames = AvBuffer::from_raw(ffi::av_hwframe_ctx_alloc(drm_device.as_ptr()))
+                .context("av_hwframe_ctx_alloc(DRM) failed")?;
+            let fc = (*drm_frames.as_ptr()).data as *mut ffi::AVHWFramesContext;
             (*fc).format = ffi::AVPixelFormat::AV_PIX_FMT_DRM_PRIME;
             (*fc).sw_format = sw_format; // packed XR24 RGB plane, or XR30/XB30 for HDR
             (*fc).width = width as c_int;
             (*fc).height = height as c_int;
-            if ffi::av_hwframe_ctx_init(drm_frames) < 0 {
-                ffi::av_buffer_unref(&mut drm_frames);
-                ffi::av_buffer_unref(&mut vaapi_device);
-                ffi::av_buffer_unref(&mut drm_device);
+            if ffi::av_hwframe_ctx_init(drm_frames.as_ptr()) < 0 {
                 bail!("av_hwframe_ctx_init(DRM) failed");
             }
 
             // Filter graph: buffer(drm_prime) → hwmap=derive_device=vaapi:mode=read →
             // scale_vaapi=format=nv12 → buffersink.
-            let mut graph = ffi::avfilter_graph_alloc();
-            if graph.is_null() {
-                ffi::av_buffer_unref(&mut drm_frames);
-                ffi::av_buffer_unref(&mut vaapi_device);
-                ffi::av_buffer_unref(&mut drm_device);
-                bail!("avfilter_graph_alloc failed");
-            }
+            let graph = AvFilterGraph::alloc().context("avfilter_graph_alloc failed")?;
 
             let mk = |name: &CStr, inst: &CStr| -> *mut ffi::AVFilterContext {
                 let f = ffi::avfilter_get_by_name(name.as_ptr());
                 if f.is_null() {
                     return ptr::null_mut();
                 }
-                ffi::avfilter_graph_alloc_filter(graph, f, inst.as_ptr())
+                ffi::avfilter_graph_alloc_filter(graph.as_ptr(), f, inst.as_ptr())
             };
             let src = mk(c"buffer", c"in");
             let hwmap = mk(c"hwmap", c"map");
             let scale = mk(c"scale_vaapi", c"csc");
             let sink = mk(c"buffersink", c"out");
             if src.is_null() || hwmap.is_null() || scale.is_null() || sink.is_null() {
-                ffi::avfilter_graph_free(&mut graph);
-                ffi::av_buffer_unref(&mut drm_frames);
-                ffi::av_buffer_unref(&mut vaapi_device);
-                ffi::av_buffer_unref(&mut drm_device);
                 bail!("a VAAPI filter (buffer/hwmap/scale_vaapi/buffersink) is missing");
             }
             // hwmap maps the DRM-PRIME input onto THIS vaapi device; scale_vaapi runs the CSC on
             // it. Giving both our device (rather than `hwmap=derive_device`) keeps every surface —
             // and the sink's output frames ctx the encoder adopts — on one VADisplay.
-            (*hwmap).hw_device_ctx = ffi::av_buffer_ref(vaapi_device);
-            (*scale).hw_device_ctx = ffi::av_buffer_ref(vaapi_device);
+            (*hwmap).hw_device_ctx = ffi::av_buffer_ref(vaapi_device.as_ptr());
+            (*scale).hw_device_ctx = ffi::av_buffer_ref(vaapi_device.as_ptr());
 
             // buffersrc params: DRM-PRIME frames, the drm_frames ctx.
             let par = ffi::av_buffersrc_parameters_alloc();
@@ -905,24 +902,16 @@ impl DmabufInner {
             // the struct, not the ref. Our single owned `drm_frames` ref is retained, lives in
             // `DmabufInner`, and is unref'd in `Drop`. Wrapping it in `av_buffer_ref` here would leak
             // that extra ref every session (the persistent listener would accumulate them).
-            (*par).hw_frames_ctx = drm_frames;
+            (*par).hw_frames_ctx = drm_frames.as_ptr();
             let r = ffi::av_buffersrc_parameters_set(src, par);
             ffi::av_free(par as *mut _);
             if r < 0 {
-                ffi::avfilter_graph_free(&mut graph);
-                ffi::av_buffer_unref(&mut drm_frames);
-                ffi::av_buffer_unref(&mut vaapi_device);
-                ffi::av_buffer_unref(&mut drm_device);
                 bail!("av_buffersrc_parameters_set failed ({r})");
             }
             macro_rules! init {
                 ($ctx:expr, $args:expr, $what:literal) => {{
                     let r = ffi::avfilter_init_str($ctx, $args);
                     if r < 0 {
-                        ffi::avfilter_graph_free(&mut graph);
-                        ffi::av_buffer_unref(&mut drm_frames);
-                        ffi::av_buffer_unref(&mut vaapi_device);
-                        ffi::av_buffer_unref(&mut drm_device);
                         bail!(concat!("init ", $what, " failed ({})"), r);
                     }
                 }};
@@ -936,28 +925,16 @@ impl DmabufInner {
                 ffi::avfilter_link(a, 0, b, 0)
             };
             if link(src, hwmap) < 0 || link(hwmap, scale) < 0 || link(scale, sink) < 0 {
-                ffi::avfilter_graph_free(&mut graph);
-                ffi::av_buffer_unref(&mut drm_frames);
-                ffi::av_buffer_unref(&mut vaapi_device);
-                ffi::av_buffer_unref(&mut drm_device);
                 bail!("avfilter_link failed");
             }
-            let r = ffi::avfilter_graph_config(graph, ptr::null_mut());
+            let r = ffi::avfilter_graph_config(graph.as_ptr(), ptr::null_mut());
             if r < 0 {
-                ffi::avfilter_graph_free(&mut graph);
-                ffi::av_buffer_unref(&mut drm_frames);
-                ffi::av_buffer_unref(&mut vaapi_device);
-                ffi::av_buffer_unref(&mut drm_device);
                 bail!("avfilter_graph_config failed ({r})");
             }
 
             // The encoder takes NV12 surfaces from the sink's output frames context.
             let nv12_ctx = ffi::av_buffersink_get_hw_frames_ctx(sink);
             if nv12_ctx.is_null() {
-                ffi::avfilter_graph_free(&mut graph);
-                ffi::av_buffer_unref(&mut drm_frames);
-                ffi::av_buffer_unref(&mut vaapi_device);
-                ffi::av_buffer_unref(&mut drm_device);
                 bail!("filter sink has no VAAPI frames context");
             }
             // On encoder-open failure, free the graph + our owned buffer refs before bailing (matching
@@ -971,16 +948,12 @@ impl DmabufInner {
                 height,
                 fps,
                 bitrate_bps,
-                vaapi_device,
+                vaapi_device.as_ptr(),
                 nv12_ctx,
                 ten_bit,
             ) {
                 Ok(enc) => enc,
                 Err(e) => {
-                    ffi::avfilter_graph_free(&mut graph);
-                    ffi::av_buffer_unref(&mut drm_frames);
-                    ffi::av_buffer_unref(&mut vaapi_device);
-                    ffi::av_buffer_unref(&mut drm_device);
                     return Err(e);
                 }
             };
@@ -991,17 +964,17 @@ impl DmabufInner {
                 if ten_bit { "P010 (HDR10)" } else { "NV12" }
             );
             Ok(DmabufInner {
-                enc,
-                drm_device,
-                vaapi_device,
-                drm_frames,
                 graph,
+                drm_frames,
+                vaapi_device,
+                drm_device,
                 src,
                 sink,
                 width,
                 height,
                 fourcc: drm_fourcc,
                 frames: 0,
+                enc,
             })
         }
     }
@@ -1076,7 +1049,7 @@ impl DmabufInner {
             // Mesa's is BT.601, contradicting the BT.709-limited VUI the encoder signals).
             (*drm).color_range = ffi::AVColorRange::AVCOL_RANGE_JPEG;
             (*drm).colorspace = ffi::AVColorSpace::AVCOL_SPC_RGB;
-            (*drm).hw_frames_ctx = ffi::av_buffer_ref(self.drm_frames);
+            (*drm).hw_frames_ctx = ffi::av_buffer_ref(self.drm_frames.as_ptr());
             (*drm).data[0] = Box::into_raw(desc) as *mut u8;
             // Own the descriptor so it frees with the frame (the fd is owned by the DmabufFrame,
             // which outlives this call — the graph reads the surface before submit returns).
@@ -1156,23 +1129,11 @@ impl DmabufInner {
     }
 }
 
-impl Drop for DmabufInner {
-    fn drop(&mut self) {
-        // SAFETY: `graph`/`drm_frames`/`vaapi_device`/`drm_device` are the non-null objects
-        // `DmabufInner::open` built and moved into `self` (open bails before constructing `Self` if any
-        // alloc fails). `avfilter_graph_free` frees the graph (and the per-filter device refs it owns);
-        // each `av_buffer_unref` drops one ref and nulls the pointer via `&mut`. `DmabufInner` owns all
-        // four exclusively and `Drop` runs once → no double-free/use-after-free. The graph is freed
-        // first (it holds refs on the devices), then frames, then the derived VAAPI device, then DRM.
-        // (`self.enc` drops via ffmpeg-next afterward, holding its own refs.)
-        unsafe {
-            ffi::avfilter_graph_free(&mut self.graph);
-            ffi::av_buffer_unref(&mut self.drm_frames);
-            ffi::av_buffer_unref(&mut self.vaapi_device);
-            ffi::av_buffer_unref(&mut self.drm_device);
-        }
-    }
-}
+// No `Drop` for `DmabufInner`: `AvFilterGraph`/`AvBuffer` each free themselves, in field-declaration
+// order — graph, frames, derived VAAPI device, DRM device, then `enc` — which is exactly the order
+// the hand-written `Drop` this replaced used. That `Drop` had to be kept in step with eight separate
+// failure branches in `open`, each repeating the same four-line unwind; there is now one release
+// path per handle and no branch can skip it.
 
 // ---------------------------------------------------------------------------------------------
 
