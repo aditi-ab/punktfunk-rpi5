@@ -2609,6 +2609,172 @@ mod tests {
         );
     }
 
+    /// A packed 2:10:10:10 (`X2Rgb10`) CUDA frame — the layout an HDR gamescope capture imports
+    /// through the Vulkan bridge, and what NVENC ingests as `ARGB10` with no host CSC at all.
+    /// The device memory is uninitialised: this smoke asserts the session/registration/encode
+    /// machinery, not picture fidelity (that is the AMD round-trip's job — the CSC here is
+    /// NVENC's own ASIC, not our shader).
+    fn rgb10_frame(w: u32, h: u32, i: u32) -> CapturedFrame {
+        let buf = DeviceBuffer::alloc(w, h).expect("alloc packed RGB device buffer");
+        CapturedFrame {
+            width: w,
+            height: h,
+            pts_ns: i as u64 * 16_666_667,
+            format: PixelFormat::X2Rgb10,
+            payload: FramePayload::Cuda(buf),
+            cursor: None,
+        }
+    }
+
+    /// ON-HARDWARE: the HDR path — a packed 10-bit PQ/BT.2020 CUDA payload straight into NVENC as
+    /// `ARGB10`, which is what makes an NVIDIA HDR session zero-copy AND host-CSC-free: NVENC does
+    /// the BT.2020 conversion in the ASIC, following the VUI this session configures.
+    ///
+    /// The load-bearing assertions are the ones that would catch a mislabelled stream: the encoder
+    /// must have DERIVED 10-bit from the input format (not merely been asked for it), and it must
+    /// report HDR — that pair is what selects Main10 / AV1-10 and the BT.2020 PQ signalling.
+    #[test]
+    #[ignore = "requires an NVIDIA GPU + driver with 10-bit encode"]
+    fn nvenc_cuda_hdr10_packed_rgb() {
+        for codec in [Codec::H265, Codec::Av1] {
+            const W: u32 = 1280;
+            const H: u32 = 720;
+            pf_zerocopy::cuda::make_current().expect("shared CUDA context current");
+            let mut enc = NvencCudaEncoder::open(
+                codec,
+                PixelFormat::X2Rgb10,
+                W,
+                H,
+                60,
+                20_000_000,
+                true,
+                10,
+                ChromaFormat::Yuv420,
+                false,
+            )
+            .expect("open NVENC CUDA session");
+
+            let mut aus = 0usize;
+            let mut first_key = false;
+            let mut stream: Vec<u8> = Vec::new();
+            for i in 0..4u32 {
+                enc.submit_indexed(&rgb10_frame(W, H, i), i)
+                    .expect("submit");
+                while let Some(au) = enc.poll().expect("poll") {
+                    if aus == 0 {
+                        first_key = au.keyframe;
+                    }
+                    assert!(!au.data.is_empty(), "empty AU");
+                    stream.extend_from_slice(&au.data);
+                    aus += 1;
+                }
+            }
+            enc.flush().ok();
+            // Dumped for the out-of-band ffprobe check. In-tree we can assert the encoder's OWN
+            // view of the config; only a decoder confirms the BITSTREAM says Main10 / BT.2020 /
+            // PQ, which is what a client actually reads.
+            if let Ok(home) = std::env::var("HOME") {
+                let ext = if codec == Codec::Av1 { "obu" } else { "h265" };
+                let path = format!("{home}/nvenc-hdr10.{ext}");
+                if std::fs::write(&path, &stream).is_ok() {
+                    println!(
+                        "nvenc_cuda HDR10 {codec:?}: wrote {path} ({} bytes)",
+                        stream.len()
+                    );
+                }
+            }
+            assert!(aus > 0, "{codec:?}: no AUs produced");
+            assert!(first_key, "{codec:?}: first AU must be the session IDR");
+            // The whole point: depth + HDR came from the INPUT format, so the bitstream's profile
+            // and colour signalling describe what was actually encoded.
+            assert_eq!(enc.bit_depth, 10, "{codec:?}: must have derived 10-bit");
+            assert!(
+                enc.hdr,
+                "{codec:?}: must have derived HDR from the PQ format"
+            );
+            assert_eq!(
+                enc.buffer_fmt,
+                nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ARGB10,
+                "{codec:?}: X2Rgb10 must ingest as ARGB10"
+            );
+            println!("nvenc_cuda HDR10 {codec:?}: {aus} AUs, ARGB10 in, 10-bit derived");
+        }
+    }
+
+    /// ON-HARDWARE: the cursor blended into a **10-bit** input surface — `cursor_blend.comp`'s
+    /// MODE 3/4, which unpack 2:10:10:10 channels instead of bytes. New shader code, and the only
+    /// way a gamescope pointer reaches an HDR NVIDIA stream: the packed-RGB slot is what NVENC
+    /// ingests, so the blend has to happen in that layout rather than in a YUV plane.
+    ///
+    /// Asserts the machinery — AUs come out, and the blend targets the 10-bit slot layout rather
+    /// than silently falling back to the 8-bit one, which would tint the pointer and shift its
+    /// channels. Blend CORRECTNESS is display-referred by design (see the shader), so it is
+    /// judged by eye on a dump, not here.
+    #[test]
+    #[ignore = "requires an NVIDIA GPU + driver with 10-bit encode"]
+    fn nvenc_cuda_hdr10_cursor_blend() {
+        const W: u32 = 1280;
+        const H: u32 = 720;
+        pf_zerocopy::cuda::make_current().expect("shared CUDA context current");
+        if !stream_ordered_requested() || async_retrieve_requested() {
+            println!("skipped: stream-ordered submit disabled by env");
+            return;
+        }
+        let mut enc = NvencCudaEncoder::open(
+            Codec::H265,
+            PixelFormat::X2Rgb10,
+            W,
+            H,
+            60,
+            8_000_000,
+            true,
+            10,
+            ChromaFormat::Yuv420,
+            true, // cursor_blend: bring up the Vulkan slot ring + the 10-bit blend
+        )
+        .expect("open NVENC CUDA session");
+        let cursor = |serial: u64, x: i32, y: i32| pf_frame::CursorOverlay {
+            x,
+            y,
+            w: 32,
+            h: 32,
+            rgba: std::sync::Arc::new(vec![0xFF; 32 * 32 * 4]),
+            serial,
+            hot_x: 0,
+            hot_y: 0,
+            visible: true,
+        };
+        let mut aus = 0usize;
+        for i in 0..6u32 {
+            let mut frame = rgb10_frame(W, H, i);
+            // Bitmap serial flips at frame 3 (upload quiesce over in-flight ordered blends); the
+            // position moves every frame (push-constant path) — same shape as the 8-bit twin.
+            frame.cursor = Some(cursor(
+                if i < 3 { 1 } else { 2 },
+                40 + i as i32 * 9,
+                60 + i as i32 * 5,
+            ));
+            enc.submit_indexed(&frame, i).expect("submit");
+            while let Some(au) = enc.poll().expect("poll") {
+                assert!(!au.data.is_empty(), "empty AU");
+                aus += 1;
+            }
+        }
+        enc.flush().ok();
+        assert!(aus > 0, "no AUs produced");
+        assert_eq!(enc.bit_depth, 10, "must be a 10-bit session");
+        assert_eq!(
+            slot_fmt_of(enc.buffer_fmt),
+            SlotFormat::X2Rgb10,
+            "the blend must target the 10-bit packed slot layout, not the 8-bit one"
+        );
+        assert!(
+            enc.caps().blends_cursor,
+            "the direct-SDK path must still report a cursor blend at 10-bit"
+        );
+        println!("nvenc_cuda HDR10 cursor blend: {aus} AUs, slot fmt X2Rgb10");
+    }
+
     /// ON-HARDWARE (RTX box `.21`): the 4:4:4 path — a planar-YUV444 `DeviceBuffer` through an HEVC
     /// FREXT (chromaFormatIDC=3) session, exercising the stacked-plane input surface + copy that NV12
     /// doesn't. Asserts AUs come out and `caps().chroma_444` reports true (the GPU supports it). Run:
