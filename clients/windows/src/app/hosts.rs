@@ -724,6 +724,7 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                     })
             };
             let (ctx2, ss, st) = (ctx.clone(), set_screen.clone(), set_status.clone());
+            let pinned_base = target.clone();
             tiles.push(host_tile(
                 &k.fp_hex,
                 &hover,
@@ -751,6 +752,41 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                     }
                 })),
             ));
+
+            // …then this host's pinned host+profile tiles, in the order they were pinned
+            // (design §5.2a). They share the host's live status because they read the same
+            // record, and a pin whose profile is gone simply doesn't render. No menu of their
+            // own: a pinned tile is a shortcut, not a second host, and pin/unpin already live
+            // on the primary tile's menu — the one place you decide it.
+            for id in &k.pinned_profiles {
+                let Some((id, name)) = profiles.iter().find(|(pid, _)| pid == id) else {
+                    continue;
+                };
+                let (ctx3, ss3, st3) = (ctx.clone(), set_screen.clone(), set_status.clone());
+                let mut pinned_target = pinned_base.clone();
+                pinned_target.profile = Some(id.clone());
+                tiles.push(host_tile(
+                    // Its own hover key: two tiles for one host must not light up together.
+                    &format!("{}#{id}", k.fp_hex),
+                    &hover,
+                    &k.name,
+                    &format!("{}:{}", k.addr, k.port),
+                    status_row_with(
+                        Some(online),
+                        if k.paired { "Paired" } else { "Trusted" },
+                        if k.paired { Pill::Good } else { Pill::Info },
+                        Some((name.as_str(), Pill::Info)),
+                    ),
+                    None,
+                    Some(Box::new(move || {
+                        if can_wake {
+                            initiate_waking(&ctx3, pinned_target.clone(), &ss3, &st3);
+                        } else {
+                            initiate(&ctx3, pinned_target.clone(), &ss3, &st3);
+                        }
+                    })),
+                ));
+            }
         }
         body.push(tile_grid(tiles, cols, TILE_GAP));
     }
