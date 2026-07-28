@@ -37,7 +37,22 @@ pub struct MappedView {
 // none of which require a single-thread owner, so sharing/sending the view across the driver's
 // callback threads is sound.
 unsafe impl Send for MappedView {}
-// SAFETY: as above — `&MappedView` only exposes accessors that are safe under concurrent use.
+// SAFETY: `&MappedView` IS shared across threads for real — `ChannelState::data()` hands out
+// `&'static MappedView`, and every driver using it dispatches its queue
+// `WdfIoQueueDispatchParallel` with `NumberOfPresentedRequests = u32::MAX`, so two callbacks can
+// hold it at once. What makes that sound is NOT that the accessors are individually race-free:
+// `read_u8`/`write_u8`/`read_u16`/… are plain unaligned accesses through `&self` and would race if
+// two threads hit the same offset. It is that these bytes are a section mapped into ANOTHER PROCESS
+// that writes them concurrently, so no Rust-level exclusivity over them is achievable in the first
+// place — the peer defeats it regardless of what this type does. Consistency is therefore the
+// channel protocol's job (seq-fenced publishes, per the struct doc), the cross-process
+// synchronization fields go through the `load_*`/`store_*` ATOMIC accessors, and each side reads
+// only fields the protocol says are stable.
+//
+// ⚠ The rule this proof implies, for anything added later: a new accessor may use the plain path
+// ONLY for bytes the protocol already fences. Anything that must be coherent between threads or
+// between processes belongs in the atomic set — a plain accessor over such a field is a race the
+// `Sync` here does not cover.
 unsafe impl Sync for MappedView {}
 
 impl MappedView {

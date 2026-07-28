@@ -222,7 +222,11 @@ pub struct DmabufPlane {
 /// Owns the mapped DRM-PRIME `AVFrame` (which in turn references the VAAPI surface).
 /// Dropping it releases the surface back to the decoder pool and closes the fds.
 pub struct DrmFrameGuard(pub(crate) *mut ffmpeg::ffi::AVFrame);
-// An AVFrame is plain refcounted data; freeing it from the GTK main thread is fine.
+// SAFETY: the guard owns one `AVFrame` and frees it exactly once in `Drop`. libav's buffer
+// refcounts are atomic and its hwframe pool is internally locked, so releasing the frame — and with
+// it the VAAPI surface, back to the decoder's pool — from a different thread than the one that
+// mapped it is sound. That is the whole point here: the guard is handed to GTK and dropped on the
+// main thread while the pump thread keeps decoding. Moved, never shared; deliberately NOT `Sync`.
 unsafe impl Send for DrmFrameGuard {}
 
 impl Drop for DrmFrameGuard {

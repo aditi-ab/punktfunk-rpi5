@@ -39,7 +39,12 @@ pub(crate) struct VulkanDecoder {
     _ctx_storage: Box<VkCtxStorage>,
 }
 
-// Single-owner pointers, only touched from the session pump thread.
+// SAFETY: `ctx`/`packet`/`frame` are allocations this decoder owns from its constructor to `Drop`,
+// `hw_device` is an owning `AvBuffer` (atomic refcount), and `_ctx_storage` is a `Box` that merely
+// has to outlive them. `Send` only moves that ownership between threads, which libav permits for a
+// codec context used serially — `&mut self` on every method provides that. The presenter reaches
+// decoded images through the `AVFrame` guard's own references and the shared `QueueLock`, not
+// through this struct. Deliberately NOT `Sync`.
 unsafe impl Send for VulkanDecoder {}
 
 struct VkCtxStorage {

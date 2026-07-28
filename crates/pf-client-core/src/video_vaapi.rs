@@ -45,7 +45,13 @@ pub(crate) struct VaapiDecoder {
     frame: *mut ffmpeg::ffi::AVFrame,
 }
 
-// Single-owner pointers, only touched from the session pump thread.
+// SAFETY: the three raw pointers (`ctx`, `packet`, `frame`) are allocations this decoder makes in
+// its constructor and frees exactly once in `Drop`; nothing else holds them, and `hw_device` is an
+// owning `AvBuffer` whose refcount is atomic. `Send` only permits MOVING that ownership to another
+// thread, which libav supports — a codec context may be used from a thread other than the one that
+// created it, provided use is serialised, and `&mut self` on every method is that serialisation.
+// Deliberately NOT `Sync`: two threads holding `&VaapiDecoder` could call into libav concurrently
+// on one context, which libav does not allow.
 #[cfg(target_os = "linux")]
 unsafe impl Send for VaapiDecoder {}
 

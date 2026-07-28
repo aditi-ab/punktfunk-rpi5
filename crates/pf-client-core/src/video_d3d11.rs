@@ -492,8 +492,12 @@ pub(crate) struct D3d11vaDecoder {
     hdr10_out: bool,
 }
 
-// Single-owner pointers + COM interfaces, only touched from the session pump thread (the
-// decode loop); the presenter reaches the shared textures exclusively via their NT handles.
+// SAFETY: the libav pointers are this decoder's own allocations (freed once in `Drop`) and the COM
+// interfaces it holds are reference-counted with interlocked counts, so moving the whole struct to
+// another thread and releasing it there is sound. D3D11's immediate context is not thread-SAFE but
+// it is thread-AGNOSTIC: it requires serialised use, which `&mut self` on every method gives, not
+// use from one fixed thread. The presenter never touches these objects — it reaches the shared
+// textures through their NT handles on its own device. Moved, never shared; deliberately NOT `Sync`.
 unsafe impl Send for D3d11vaDecoder {}
 
 impl D3d11vaDecoder {
