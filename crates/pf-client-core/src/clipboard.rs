@@ -260,6 +260,16 @@ fn handle_event(client: &NativeClient, state: &mut State, ev: ClipEventCore) {
     }
 }
 
+/// Put plain text on this machine's clipboard — the "Copy link" affordance, which has nothing
+/// to do with the streaming bridge above but wants the same OS plumbing. Best-effort: a
+/// clipboard another process is holding open is a transient nuisance, never worth failing a
+/// user action over. A no-op where this build has no OS clipboard.
+pub fn set_text(text: &str) {
+    if let Err(e) = os::set(MIME_TEXT, text.as_bytes()) {
+        tracing::warn!(error = %format!("{e:#}"), "copying to the clipboard");
+    }
+}
+
 #[cfg(windows)]
 mod os {
     //! The Win32 clipboard seam. Every entry point opens the clipboard, does one thing and

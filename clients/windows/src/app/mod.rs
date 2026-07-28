@@ -80,6 +80,11 @@ pub(crate) struct Target {
     /// Wake-on-LAN MAC(s) for this host (from the saved store or the live advert) — used to send a
     /// magic packet before connecting to an offline host. Empty when none is known.
     pub(crate) mac: Vec<String>,
+    /// A ONE-OFF settings profile for this connect ("Connect with"): `Some(id)` overrides the
+    /// host's binding for this launch, `Some("")` forces the global defaults on a bound host,
+    /// `None` honors the binding. It never rebinds anything — the default changes only through
+    /// the picker in the host editor (design/client-settings-profiles.md §5.2).
+    pub(crate) profile: Option<String>,
 }
 
 /// Stable app services handed to the page components as props. Each routed screen that uses

@@ -20,6 +20,13 @@ const MENU_WAKE: &str = "Wake host";
 /// Apple client's add/edit sheet. A menu item per field read as clutter and buried the ones
 /// that matter.
 const MENU_EDIT: &str = "Edit\u{2026}";
+/// Dynamic menu-item prefixes: this flyout has no submenus, so the profile entries are flat
+/// items matched by prefix. The trailing space keeps them readable AND keeps a profile named
+/// e.g. "Copy link" from colliding with a fixed entry.
+const MENU_WITH: &str = "Connect with: ";
+const MENU_PIN: &str = "Pin as card: ";
+const MENU_UNPIN: &str = "Unpin card: ";
+const MENU_COPY_LINK: &str = "Copy link";
 const MENU_FORGET: &str = "Forget\u{2026}";
 
 /// Whether the console (gamepad) UI is available in this build: the session binary ships
@@ -163,6 +170,19 @@ pub(crate) struct Hover {
 
 /// The status row at the bottom of a tile: presence dot + Online/Offline, plus the trust chip.
 fn status_row(online: Option<bool>, badge: &str, kind: Pill) -> Element {
+    status_row_with(online, badge, kind, None)
+}
+
+/// [`status_row`] plus the profile chip: what a plain click on THIS tile will use — its own
+/// profile on a pinned tile, the host's binding on the primary one. A binding whose profile
+/// was deleted shows nothing and resolves as the defaults, which is what will happen on
+/// connect (design §6).
+fn status_row_with(
+    online: Option<bool>,
+    badge: &str,
+    kind: Pill,
+    profile: Option<(&str, Pill)>,
+) -> Element {
     let mut items: Vec<Element> = Vec::new();
     if let Some(online) = online {
         items.push(
@@ -183,6 +203,13 @@ fn status_row(online: Option<bool>, badge: &str, kind: Pill) -> Element {
             .vertical_alignment(VerticalAlignment::Center)
             .into(),
     );
+    if let Some((name, kind)) = profile {
+        items.push(
+            pill(name, kind)
+                .vertical_alignment(VerticalAlignment::Center)
+                .into(),
+        );
+    }
     hstack(items)
         .spacing(6.0)
         .margin(edges(0.0, 12.0, 0.0, 0.0))
@@ -250,6 +277,43 @@ fn edit_editor(
             se.call(None);
         }
     };
+    // The profile binding: what a plain click on this tile will use. It commits on change
+    // rather than at Save — it is a picker with no draft ref, and the rest of the sheet's
+    // fields are text boxes that genuinely need one.
+    let profile_picker = {
+        let catalog = pf_client_core::profiles::ProfilesFile::load();
+        let stored = KnownHosts::load()
+            .hosts
+            .iter()
+            .find(|h| h.fp_hex == fp)
+            .and_then(|h| h.profile_id.clone());
+        let mut names = vec!["Default settings".to_string()];
+        let mut ids: Vec<String> = vec![String::new()];
+        for p in &catalog.profiles {
+            names.push(p.name.clone());
+            ids.push(p.id.clone());
+        }
+        // A binding whose profile is gone reads as Default settings — the same "dangling
+        // resolves as none" rule the connect path follows — and is cleaned up on the next pick.
+        let current = stored
+            .as_ref()
+            .and_then(|id| ids.iter().position(|i| i == id))
+            .unwrap_or(0);
+        let fp = fp.to_string();
+        ComboBox::new(names)
+            .header("Profile")
+            .selected_index(current as i32)
+            .on_selection_changed(move |i: i32| {
+                let Some(id) = ids.get(i.max(0) as usize) else {
+                    return;
+                };
+                let mut known = KnownHosts::load();
+                if let Some(h) = known.hosts.iter_mut().find(|h| h.fp_hex == fp) {
+                    h.profile_id = (!id.is_empty()).then(|| id.clone());
+                    let _ = known.save();
+                }
+            })
+    };
     let field = |label: &str, value: String, placeholder: &str, draft: HookRef<String>| {
         vstack((
             text_block(label)
@@ -281,6 +345,18 @@ fn edit_editor(
                 "auto-filled when known",
                 mac_draft,
             ),
+            vstack((
+                profile_picker,
+                text_block(
+                    "The settings a plain click on this host uses. \u{201c}Connect with\u{201d} \
+                     in the tile\u{2019}s menu overrides it for one session without changing it.",
+                )
+                .font_size(12.0)
+                .foreground(ThemeRef::SecondaryText)
+                .wrap()
+                .horizontal_alignment(HorizontalAlignment::Left),
+            ))
+            .spacing(4.0),
             vstack((
                 ToggleSwitch::new(clip0)
                     .header("Share clipboard with this host")
@@ -481,6 +557,12 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
     if !known.hosts.is_empty() {
         body.push(section("SAVED HOSTS"));
         let mut tiles: Vec<Element> = Vec::new();
+        // One catalog read per render, shared by every tile's menu and chip.
+        let profiles: Vec<(String, String)> = pf_client_core::profiles::ProfilesFile::load()
+            .profiles
+            .into_iter()
+            .map(|p| (p.id, p.name))
+            .collect();
         for k in &known.hosts {
             // Rust 2021 (no let-chains): match the "this tile is being edited" case explicitly.
             if matches!(&rename, Some((fp, _)) if fp == &k.fp_hex) {
@@ -504,6 +586,7 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                 fp_hex: Some(k.fp_hex.clone()),
                 pair_optional: false,
                 mac: k.mac.clone(),
+                profile: None,
             };
             // Online = advertising on mDNS OR proven reachable by the last probe sweep (the latter
             // covers a routed/Tailscale host that never advertises — the display companion to
@@ -525,6 +608,8 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                 let (svc, target) = (props.svc.clone(), target.clone());
                 let (sf, sr) = (set_forget.clone(), set_rename.clone());
                 let (fp, name) = (k.fp_hex.clone(), k.name.clone());
+                let menu_profiles = profiles.clone();
+                let (link_host, link_profile) = (k.clone(), None::<String>);
                 button("")
                     .icon(Symbol::More)
                     .subtle()
@@ -532,6 +617,24 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                     .automation_name("More options")
                     .menu_flyout({
                         let mut items = vec![menu_item(MENU_CONNECT)];
+                        // One-off connects, flat: this flyout has no submenus, so each
+                        // profile is its own item. "Connect with" NEVER rebinds — the default
+                        // is changed in the host editor (design §5.2).
+                        for (_, name) in profiles.iter() {
+                            items.push(menu_item(format!("{MENU_WITH}{name}")));
+                        }
+                        if !profiles.is_empty() {
+                            items.push(menu_item(format!("{MENU_WITH}Default settings")));
+                            for (id, name) in profiles.iter() {
+                                let label = if k.pinned_profiles.iter().any(|p| p == id) {
+                                    format!("{MENU_UNPIN}{name}")
+                                } else {
+                                    format!("{MENU_PIN}{name}")
+                                };
+                                items.push(menu_item(label));
+                            }
+                        }
+                        items.push(menu_item(MENU_COPY_LINK));
                         // The library surfaces — mouse/KB page and the gamepad console UI —
                         // for paired hosts only (the mgmt API needs the paired identity);
                         // the page additionally sits behind the experimental toggle, the
@@ -550,6 +653,52 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                         items
                     })
                     .on_item_clicked(move |item: String| match item.as_str() {
+                        // The profile items are dynamic, so they are matched by prefix before
+                        // the fixed ones.
+                        _ if item.starts_with(MENU_WITH) => {
+                            let name = item.trim_start_matches(MENU_WITH);
+                            let mut target = target.clone();
+                            // `Some("")` — not `None` — so "Default settings" really does
+                            // override a bound host for this one connect.
+                            target.profile = Some(
+                                menu_profiles
+                                    .iter()
+                                    .find(|(_, n)| n == name)
+                                    .map(|(id, _)| id.clone())
+                                    .unwrap_or_default(),
+                            );
+                            initiate(&svc.ctx, target, &svc.set_screen, &svc.set_status)
+                        }
+                        _ if item.starts_with(MENU_PIN) || item.starts_with(MENU_UNPIN) => {
+                            let pin = item.starts_with(MENU_PIN);
+                            let name = item
+                                .trim_start_matches(MENU_PIN)
+                                .trim_start_matches(MENU_UNPIN);
+                            let Some((id, _)) =
+                                menu_profiles.iter().find(|(_, n)| n == name).cloned()
+                            else {
+                                return;
+                            };
+                            let mut known = KnownHosts::load();
+                            if let Some(h) = known.hosts.iter_mut().find(|h| h.fp_hex == fp) {
+                                h.pinned_profiles.retain(|p| p != &id);
+                                if pin {
+                                    h.pinned_profiles.push(id);
+                                }
+                                let _ = known.save();
+                            }
+                            // The tile list re-reads the store on the next render; nudge it.
+                            sr.call(None);
+                        }
+                        MENU_COPY_LINK => {
+                            let url = pf_client_core::deeplink::DeepLink::for_host(
+                                &link_host,
+                                None,
+                                link_profile.as_deref(),
+                            )
+                            .to_url();
+                            pf_client_core::clipboard::set_text(&url);
+                        }
                         MENU_CONNECT => {
                             initiate(&svc.ctx, target.clone(), &svc.set_screen, &svc.set_status)
                         }
@@ -580,10 +729,14 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                 &hover,
                 &k.name,
                 &format!("{}:{}", k.addr, k.port),
-                status_row(
+                status_row_with(
                     Some(online),
                     if k.paired { "Paired" } else { "Trusted" },
                     if k.paired { Pill::Good } else { Pill::Info },
+                    k.profile_id
+                        .as_ref()
+                        .and_then(|id| profiles.iter().find(|(pid, _)| pid == id))
+                        .map(|(_, name)| (name.as_str(), Pill::Neutral)),
                 ),
                 Some(menu),
                 Some(Box::new(move || {
@@ -634,6 +787,7 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                 fp_hex: (!h.fp_hex.is_empty()).then(|| h.fp_hex.clone()),
                 pair_optional: h.pair == "optional",
                 mac: h.mac.clone(),
+                profile: None,
             };
             let (ctx2, ss, st) = (ctx.clone(), set_screen.clone(), set_status.clone());
             let (badge, kind) = if h.pair == "required" {
@@ -716,6 +870,7 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                     fp_hex: None,
                     pair_optional: false,
                     mac: Vec::new(),
+                    profile: None,
                 },
                 &ss,
                 &st,

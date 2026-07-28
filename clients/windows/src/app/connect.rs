@@ -239,6 +239,7 @@ fn connect_spawn(
     let target = target.clone();
     // The closure owns `target`/`fp_hex`; the call itself borrows copies.
     let (addr, port, fp_arg) = (target.addr.clone(), target.port, fp_hex.clone());
+    let profile_arg = target.profile.clone();
     let spawned = crate::spawn::spawn_session(
         &addr,
         port,
@@ -246,6 +247,7 @@ fn connect_spawn(
         opts.connect_timeout.as_secs(),
         fullscreen,
         opts.launch.as_deref(),
+        profile_arg.as_deref(),
         child,
         move |event| {
             use crate::spawn::SpawnEvent;

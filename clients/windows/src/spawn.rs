@@ -101,6 +101,7 @@ pub(crate) fn spawn_session(
     connect_timeout_secs: u64,
     fullscreen: bool,
     launch: Option<&str>,
+    profile: Option<&str>,
     slot: SessionChild,
     on_event: impl FnMut(SpawnEvent) + Send + 'static,
 ) -> Result<(), String> {
@@ -116,6 +117,11 @@ pub(crate) fn spawn_session(
     }
     if let Some(id) = launch {
         cmd.arg("--launch").arg(id);
+    }
+    // Only a ONE-OFF pick rides the flag: without it the session resolves the host's own
+    // binding through the same helper this shell would have used, so the two can't disagree.
+    if let Some(reference) = profile {
+        cmd.arg("--profile").arg(reference);
     }
     add_window_pos(&mut cmd);
     spawn_with(cmd, &format!("{addr}:{port}"), slot, on_event)
