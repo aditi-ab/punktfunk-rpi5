@@ -42,9 +42,17 @@ export const MonitorCard: FC = () => {
 	// environment is read-only here: offering controls that silently lose to the env would be worse
 	// than saying so.
 	const envLocked = !!pinned && policy?.capture_monitor !== pinned;
+	// The host says whether it can honor a pin at all. Windows enumerates its heads but has no
+	// backend that can capture one (see `MonitorsResponse.pin_supported`), and this card used to
+	// offer the choice anyway: the PUT persisted, nothing consumed it, and a virtual display was
+	// still created on connect. Defaults to TRUE when the field is absent so an older host — which
+	// only ever shipped this picker where it worked — is not retroactively locked out.
+	const pinSupported = monitors.data?.pin_supported ?? true;
+	// Both reasons produce the same read-only card; only the explanation above it differs.
+	const locked = envLocked || !pinSupported;
 
 	const choose = (connector: string | null) => {
-		if (!policy || envLocked) return;
+		if (!policy || locked) return;
 		save.mutate(
 			{ data: { ...policy, capture_monitor: connector } },
 			{
@@ -71,13 +79,13 @@ export const MonitorCard: FC = () => {
 		<button
 			key={key}
 			type="button"
-			disabled={busy || envLocked || !onSelect}
+			disabled={busy || locked || !onSelect}
 			onClick={onSelect}
 			aria-pressed={selected}
 			className={cn(
 				"flex w-full items-start justify-between gap-4 rounded-md border p-3 text-left transition-colors",
 				selected ? "border-primary bg-primary/5" : "hover:bg-muted/50",
-				(busy || envLocked) && "cursor-not-allowed opacity-60",
+				(busy || locked) && "cursor-not-allowed opacity-60",
 			)}
 		>
 			<span className="flex flex-col gap-1">
@@ -124,7 +132,12 @@ export const MonitorCard: FC = () => {
 				<p className="max-w-prose text-sm text-muted-foreground">
 					{m.display_monitor_intro()}
 				</p>
-				{envLocked && (
+				{!pinSupported && (
+					<p className="text-sm text-amber-600 dark:text-amber-500">
+						{m.display_monitor_unsupported()}
+					</p>
+				)}
+				{pinSupported && envLocked && (
 					<p className="text-sm text-amber-600 dark:text-amber-500">
 						{m.display_monitor_env_locked()}
 					</p>

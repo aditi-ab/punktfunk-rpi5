@@ -430,6 +430,7 @@
   "display_monitor_none": "This host reports no monitors.",
   "display_monitor_unavailable": "Monitors could not be listed on this host.",
   "display_monitor_env_locked": "Pinned by PUNKTFUNK_CAPTURE_MONITOR on this host — unset it to choose here.",
+  "display_monitor_unsupported": "Streaming one of these screens isn't supported on this host yet — it's available on Linux hosts only. The screens are listed so you can see what this computer has; clients keep getting their own virtual screen.",
   "display_monitor_primary": "primary",
   "display_monitor_disabled": "off",
   "display_monitor_saved": "Streamed screen saved"

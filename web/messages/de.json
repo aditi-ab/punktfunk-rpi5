@@ -430,6 +430,7 @@
   "display_monitor_none": "Dieser Host meldet keine Monitore.",
   "display_monitor_unavailable": "Monitore konnten auf diesem Host nicht ermittelt werden.",
   "display_monitor_env_locked": "Auf diesem Host über PUNKTFUNK_CAPTURE_MONITOR festgelegt — dort entfernen, um hier zu wählen.",
+  "display_monitor_unsupported": "Das Übertragen eines dieser Bildschirme wird auf diesem Host noch nicht unterstützt — das gibt es bisher nur auf Linux-Hosts. Die Bildschirme sind hier aufgeführt, damit du siehst, was dieser Computer hat; Clients bekommen weiterhin ihren eigenen virtuellen Bildschirm.",
   "display_monitor_primary": "primär",
   "display_monitor_disabled": "aus",
   "display_monitor_saved": "Übertragener Bildschirm gespeichert"

@@ -5831,7 +5831,8 @@
         "type": "object",
         "description": "The host's physical monitors + which one capture is pinned to.",
         "required": [
-          "monitors"
+          "monitors",
+          "pin_supported"
         ],
         "properties": {
           "compositor": {
@@ -5854,6 +5855,10 @@
               "$ref": "#/components/schemas/ApiMonitorInfo"
             },
             "description": "The heads, ordered left-to-right by desktop position."
+          },
+          "pin_supported": {
+            "type": "boolean",
+            "description": "Whether this build can actually STREAM one of these monitors.\n\nEnumeration and capture are separate capabilities, and on Windows only the first exists: the\nheads below are real and worth showing (they explain the topology, and `/display/state`\ncross-references them), but `pf-capture`'s sole Windows entry point is `open_idd_push` — a\nframe channel pushed by our OWN IddCx virtual display. There is no desktop-duplication\ncapturer to point at a chosen head (DXGI Desktop Duplication was deliberately removed), so\n`vdisplay::open` has no mirror arm outside Linux and a pin could not be honored.\n\nThe console renders the picker read-only on `false`. Reported as a capability rather than\nsniffed client-side from the OS so the answer comes from the build that would have to honor\nit — when a Windows mirror backend lands, this flips and the UI needs no change."
           },
           "pinned": {
             "type": [
