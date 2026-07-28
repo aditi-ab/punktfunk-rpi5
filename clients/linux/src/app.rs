@@ -35,6 +35,11 @@ const CSS: &str = "
 .pf-pip { min-width: 8px; min-height: 8px; border-radius: 999px;
           background: alpha(currentColor, 0.35); }
 .pf-pip.pf-online { background: @success_color; }
+/* An overridden row in profile scope: an accent dot in the prefix, so which settings this
+   profile changes is legible at a glance without reading every value. (Plain string literal
+   -- a quote in here would end it.) */
+.pf-override-dot { min-width: 8px; min-height: 8px; border-radius: 999px;
+                   background: @accent_color; }
 /* Most-recent host: a full accent ring drawn as an inset outline so it follows the card's
    rounded corners (an `inset` box-shadow bar gets eaten by the 12px corner clip) and leaves
    the card's own elevation shadow intact. */

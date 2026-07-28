@@ -337,7 +337,12 @@ fn prompt_name(
 /// what keeps an older client from erasing a newer one's values just by opening the dialog.
 /// The catalog is re-read here rather than reused, so a profile renamed in another window
 /// between opening and closing this one survives.
-fn commit_profile(active: &StreamProfile, touched: &Touched, values: &Settings) {
+fn commit_profile(
+    active: &StreamProfile,
+    touched: &Touched,
+    cleared: &HashSet<&'static str>,
+    values: &Settings,
+) {
     let mut catalog = ProfilesFile::load();
     let Some(slot) = catalog.profiles.iter_mut().find(|p| p.id == active.id) else {
         return; // deleted from under us — nothing to write to, and nothing to complain about
@@ -393,6 +398,33 @@ fn commit_profile(active: &StreamProfile, touched: &Touched, values: &Settings) 
     }
     if touched.has("fullscreen_on_stream") {
         o.fullscreen_on_stream = Some(values.fullscreen_on_stream);
+    }
+    // Resets last: a row the user reset may also have fired its change handler on the way
+    // (a ComboRow re-seeds), and "back to inheriting" is the later, explicit intent.
+    for key in cleared {
+        match *key {
+            "resolution" => {
+                o.match_window = None;
+                o.width = None;
+                o.height = None;
+            }
+            "refresh_hz" => o.refresh_hz = None,
+            "render_scale" => o.render_scale = None,
+            "bitrate_kbps" => o.bitrate_kbps = None,
+            "codec" => o.codec = None,
+            "hdr_enabled" => o.hdr_enabled = None,
+            "compositor" => o.compositor = None,
+            "audio_channels" => o.audio_channels = None,
+            "mic_enabled" => o.mic_enabled = None,
+            "touch_mode" => o.touch_mode = None,
+            "mouse_mode" => o.mouse_mode = None,
+            "invert_scroll" => o.invert_scroll = None,
+            "inhibit_shortcuts" => o.inhibit_shortcuts = None,
+            "gamepad" => o.gamepad = None,
+            "stats_verbosity" => o.stats_verbosity = None,
+            "fullscreen_on_stream" => o.fullscreen_on_stream = None,
+            other => tracing::warn!(field = other, "reset of an unknown overlay field"),
+        }
     }
     if let Err(e) = catalog.save() {
         tracing::warn!(error = %format!("{e:#}"), "saving the profile catalog");
@@ -760,6 +792,9 @@ pub fn show_scoped(
         None => settings.borrow().clone(),
     };
     let touched = Touched::default();
+    // Fields whose override a per-row reset dropped — applied at commit, after the touched
+    // ones, so "reset" wins over a value the same row happens to be showing.
+    let cleared: Rc<RefCell<HashSet<&'static str>>> = Rc::default();
     // Where a scope switch wants to go once this dialog has committed and closed.
     let next_scope: Rc<RefCell<Option<Scope>>> = Rc::default();
 
@@ -1206,6 +1241,96 @@ pub fn show_scoped(
         bitrate_row.connect_value_notify(move |_| t.mark("bitrate_kbps"));
     }
 
+    // ---- Override markers + per-row reset (profile scope) ----
+    // Every overridden row says so — an accent dot — and carries the only way back to
+    // inheriting: an explicit reset. Without this a profile is a one-way door, since the
+    // override model deliberately never infers "not overridden" from a value comparison.
+    if let Some(active) = &active {
+        let o = &active.overrides;
+        let mark = |row: &adw::PreferencesRow, key: &'static str, overridden: bool| {
+            if !overridden {
+                return;
+            }
+            let Some(row) = row.downcast_ref::<adw::ActionRow>() else {
+                return;
+            };
+            let dot = gtk::Box::builder()
+                .css_classes(["pf-override-dot"])
+                .valign(gtk::Align::Center)
+                .build();
+            row.add_prefix(&dot);
+            let reset = gtk::Button::builder()
+                .icon_name("edit-undo-symbolic")
+                .tooltip_text("Reset to Default settings")
+                .valign(gtk::Align::Center)
+                .css_classes(["flat"])
+                .build();
+            let (dialog, next, cleared, scope) = (
+                dialog.clone(),
+                next_scope.clone(),
+                cleared.clone(),
+                scope.clone(),
+            );
+            reset.connect_clicked(move |_| {
+                // Queue the clear and re-open in the same scope: the close handler commits
+                // whatever else was edited first, then drops this field, and the rebuilt rows
+                // show the inherited value. One code path builds rows — including this one.
+                cleared.borrow_mut().insert(key);
+                *next.borrow_mut() = Some(scope.clone());
+                dialog.close();
+            });
+            row.add_suffix(&reset);
+        };
+        mark(
+            res_row.widget(),
+            "resolution",
+            o.width.is_some() || o.height.is_some() || o.match_window.is_some(),
+        );
+        mark(hz_row.widget(), "refresh_hz", o.refresh_hz.is_some());
+        mark(scale_row.widget(), "render_scale", o.render_scale.is_some());
+        mark(
+            bitrate_row.upcast_ref(),
+            "bitrate_kbps",
+            o.bitrate_kbps.is_some(),
+        );
+        mark(codec_row.widget(), "codec", o.codec.is_some());
+        mark(hdr_row.upcast_ref(), "hdr_enabled", o.hdr_enabled.is_some());
+        mark(
+            compositor_row.widget(),
+            "compositor",
+            o.compositor.is_some(),
+        );
+        mark(
+            surround_row.widget(),
+            "audio_channels",
+            o.audio_channels.is_some(),
+        );
+        mark(mic_row.upcast_ref(), "mic_enabled", o.mic_enabled.is_some());
+        mark(touch_row.widget(), "touch_mode", o.touch_mode.is_some());
+        mark(mouse_row.widget(), "mouse_mode", o.mouse_mode.is_some());
+        mark(
+            invert_row.upcast_ref(),
+            "invert_scroll",
+            o.invert_scroll.is_some(),
+        );
+        mark(
+            inhibit_row.upcast_ref(),
+            "inhibit_shortcuts",
+            o.inhibit_shortcuts.is_some(),
+        );
+        mark(pad_row.widget(), "gamepad", o.gamepad.is_some());
+        mark(
+            stats_row.widget(),
+            "stats_verbosity",
+            o.stats_verbosity.is_some(),
+        );
+        mark(
+            fullscreen_row.upcast_ref(),
+            "fullscreen_on_stream",
+            o.fullscreen_on_stream.is_some(),
+        );
+    }
+
     // ---- Assemble the category pages (the Apple revamp's map) ----
     let general = page("General", "preferences-system-symbolic");
     // The scope switcher heads the first page — the one row that is always about which layer
@@ -1404,7 +1529,7 @@ pub fn show_scoped(
             Some(active) => {
                 let mut values = seed.clone();
                 apply_rows(&mut values);
-                commit_profile(active, &touched, &values);
+                commit_profile(active, &touched, &cleared.borrow(), &values);
             }
             None => {
                 let mut s = settings.borrow_mut();
