@@ -27,6 +27,7 @@ const MENU_WITH: &str = "Connect with: ";
 const MENU_PIN: &str = "Pin as card: ";
 const MENU_UNPIN: &str = "Unpin card: ";
 const MENU_COPY_LINK: &str = "Copy link";
+const MENU_SHORTCUT: &str = "Create shortcut\u{2026}";
 const MENU_FORGET: &str = "Forget\u{2026}";
 
 /// Whether the console (gamepad) UI is available in this build: the session binary ships
@@ -610,6 +611,7 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                 let (fp, name) = (k.fp_hex.clone(), k.name.clone());
                 let menu_profiles = profiles.clone();
                 let (link_host, link_profile) = (k.clone(), None::<String>);
+                let shortcut_host = k.clone();
                 button("")
                     .icon(Symbol::More)
                     .subtle()
@@ -635,6 +637,7 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                             }
                         }
                         items.push(menu_item(MENU_COPY_LINK));
+                        items.push(menu_item(MENU_SHORTCUT));
                         // The library surfaces — mouse/KB page and the gamepad console UI —
                         // for paired hosts only (the mgmt API needs the paired identity);
                         // the page additionally sits behind the experimental toggle, the
@@ -689,6 +692,18 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                             }
                             // The tile list re-reads the store on the next render; nudge it.
                             sr.call(None);
+                        }
+                        MENU_SHORTCUT => {
+                            let url = pf_client_core::deeplink::DeepLink::for_host(
+                                &shortcut_host,
+                                None,
+                                None,
+                            )
+                            .to_url();
+                            match crate::deeplink::write_shortcut(&shortcut_host.name, &url) {
+                                Ok(p) => tracing::info!(path = %p.display(), "shortcut written"),
+                                Err(e) => tracing::warn!(error = %e, "writing the shortcut"),
+                            }
                         }
                         MENU_COPY_LINK => {
                             let url = pf_client_core::deeplink::DeepLink::for_host(

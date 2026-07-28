@@ -21,6 +21,10 @@
 
 #[cfg(windows)]
 mod app;
+// `punktfunk://` activation: single instance, hand-off, and the positional URL parse
+// (design/client-deep-links.md §4.2).
+#[cfg(windows)]
+mod deeplink;
 #[cfg(windows)]
 mod discovery;
 #[cfg(windows)]
@@ -68,6 +72,17 @@ fn main() {
 
     let args: Vec<String> = std::env::args().collect();
     let flag = |name: &str| args.iter().any(|a| a == name);
+
+    // A `punktfunk://` link — from protocol activation, `start`, or a shortcut. If a shell is
+    // already running, hand it over and get out of the way: one window, and the link opens
+    // where the user's hosts already are. A hand-off that finds nobody falls through and this
+    // process becomes the shell that opens it, so the link is never simply lost.
+    let link = deeplink::positional_url(&args);
+    if let Some(url) = &link {
+        if !deeplink::claim_primary() && deeplink::forward_to_primary(url) {
+            return;
+        }
+    }
 
     if flag("--discover") {
         discover_and_print();
@@ -129,7 +144,17 @@ fn main() {
     // actual forwarding — so, unlike the old shell fork, we never `attach()` here. Idle it stays
     // hands-off the hardware (id-getter metadata, no device open, Valve HIDAPI drivers off).
     let gamepad = pf_client_core::gamepad::GamepadService::start();
-    if let Err(e) = app::run(identity, gamepad) {
+    // From here this process IS the shell: queue the link it was launched with (the router
+    // picks it up once the window is live) and start listening for links from later instances.
+    if let Some(url) = link {
+        deeplink::queue(url);
+    }
+    deeplink::install_receiver();
+    let outcome = app::run(identity, gamepad);
+    // Hand the single-instance mutex back before exiting, so the next launch claims it as
+    // primary immediately rather than waiting for the kernel to notice this process is gone.
+    deeplink::release_primary();
+    if let Err(e) = outcome {
         tracing::error!(error = %e, "WinUI app failed");
         std::process::exit(1);
     }

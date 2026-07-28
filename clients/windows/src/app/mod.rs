@@ -259,6 +259,24 @@ fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
     // it already reads — resetting an override, which rewrites the catalog behind the controls.
     // Root state comparison makes same-value calls free, so a counter is what forces the pass.
     let (settings_rev, set_settings_rev) = cx.use_async_state(0u64);
+    // `punktfunk://` links: the receiver thread queues them (from this launch's argv, or from a
+    // later instance over WM_COPYDATA) and this poll pulls them onto the UI thread. Thread-fed
+    // state must be root state, like the pad count below.
+    let (deep_link, set_deep_link) = cx.use_async_state(Option::<String>::None);
+    cx.use_effect((), {
+        let set_deep_link = set_deep_link.clone();
+        move || {
+            std::thread::Builder::new()
+                .name("pf-deeplink-poll".into())
+                .spawn(move || loop {
+                    for url in crate::deeplink::drain() {
+                        set_deep_link.call(Some(url));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(150));
+                })
+                .ok();
+        }
+    });
     // Connected-controller count, mirrored from the gamepad service by a poll thread
     // (thread-driven state must be root state — see the module docs). Drives the hosts
     // page's "Open console UI" hint; the compare in `call` makes the steady state free.
@@ -282,6 +300,80 @@ fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
     let (library, set_library) = cx.use_async_state(library::LibraryState::default());
 
     // Continuous LAN discovery (spawned once).
+    // Route an arriving link. Parsing, host and profile resolution and every refusal rule live
+    // in the shared brain (`plan_from_link`); this is only the WinUI end — turn the outcome into
+    // the same call a tile click makes, so a link gets the identical wake, trust and error
+    // surfaces rather than a second connect path of its own.
+    cx.use_effect(deep_link.clone(), {
+        let (ctx, set_screen, set_status, set_deep_link) = (
+            ctx.clone(),
+            set_screen.clone(),
+            set_status.clone(),
+            set_deep_link.clone(),
+        );
+        let screen_now = screen.clone();
+        move || {
+            let Some(url) = deep_link.clone() else {
+                return;
+            };
+            set_deep_link.call(None);
+            let refuse = |msg: String| {
+                tracing::info!(%msg, "deep link refused");
+                set_status.call(msg);
+                set_screen.call(Screen::Hosts);
+            };
+            let link = match pf_client_core::deeplink::parse(&url) {
+                Ok(l) => l,
+                Err(e) => return refuse(e.message()),
+            };
+            // Rule 2 of §3: never preempt a live session. Only this layer knows one is running,
+            // which is why the brain leaves the check here.
+            if matches!(screen_now, Screen::Stream | Screen::Connecting) {
+                return refuse("A session is already running \u{2014} end it first.".into());
+            }
+            let known = KnownHosts::load();
+            let plan = pf_client_core::orchestrate::plan_from_link(
+                &link,
+                &known,
+                &pf_client_core::profiles::ProfilesFile::load(),
+                &ctx.settings.lock().unwrap().clone(),
+            );
+            use pf_client_core::orchestrate::PlanOutcome;
+            match plan {
+                Ok(PlanOutcome::Connect(p)) => {
+                    let target = Target {
+                        name: p.host.name.clone(),
+                        addr: p.host.addr.clone(),
+                        port: p.host.port,
+                        fp_hex: p.host.fp_hex.clone(),
+                        pair_optional: false,
+                        mac: p.host.mac.clone(),
+                        profile: p.profile_override.clone(),
+                    };
+                    // With a MAC it takes the dial first wake path, so a sleeping host wakes
+                    // instead of erroring — exactly what clicking its tile would do.
+                    if p.wake && !target.mac.is_empty() {
+                        connect::initiate_waking(&ctx, target, &set_screen, &set_status);
+                    } else {
+                        connect::initiate(&ctx, target, &set_screen, &set_status);
+                    }
+                }
+                // Known but never pinned, or not known at all: a link may not pair or trust on
+                // its own, so it lands on the host list with the reason shown. The user pairs
+                // there, under their own eyes.
+                Ok(PlanOutcome::ConfirmUnknown(u)) => refuse(format!(
+                    "{} isn't paired with this device yet \u{2014} pair it, then use the link again.",
+                    u.name.clone().unwrap_or_else(|| u.addr.clone())
+                )),
+                Ok(PlanOutcome::Unsupported(route)) => refuse(format!(
+                    "Punktfunk can't open \u{201c}{}\u{201d} links yet.",
+                    route.as_str()
+                )),
+                Err(e) => refuse(e.message()),
+            }
+        }
+    });
+
     cx.use_effect((), {
         let set_hosts = set_hosts.clone();
         move || {

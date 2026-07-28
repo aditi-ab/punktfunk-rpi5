@@ -19,8 +19,9 @@
 <Package
   xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
   xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+  xmlns:uap5="http://schemas.microsoft.com/appx/manifest/uap/windows10/5"
   xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
-  IgnorableNamespaces="uap rescap">
+  IgnorableNamespaces="uap uap5 rescap">
 
   <Identity
     Name="unom.Punktfunk"
@@ -56,6 +57,32 @@
         Square44x44Logo="Assets\Square44x44Logo.png">
         <uap:DefaultTile Square71x71Logo="Assets\Square71x71Logo.png" />
       </uap:VisualElements>
+      <Extensions>
+        <!--
+          The punktfunk:// scheme (design/client-deep-links.md §4.2). Protocol activation of a
+          full trust packaged exe delivers the URI as the command line, so this and a shortcut
+          land in the same place: the positional URL parse in main().
+
+          Declared here rather than written to the registry on install, so uninstall leaves
+          nothing behind. Windows also asks the user before handing a scheme to a newly
+          installed app, which is the origin friction this design wants and does not duplicate.
+        -->
+        <uap:Extension Category="windows.protocol">
+          <uap:Protocol Name="punktfunk">
+            <uap:DisplayName>Punktfunk stream link</uap:DisplayName>
+          </uap:Protocol>
+        </uap:Extension>
+        <!--
+          An app execution alias so a written shortcut can target punktfunk-client.exe by name
+          from anywhere, without knowing the package install path (which changes on every
+          update). The .lnk writer uses exactly this.
+        -->
+        <uap5:Extension Category="windows.appExecutionAlias">
+          <uap5:AppExecutionAlias>
+            <uap5:ExecutionAlias Alias="punktfunk-client.exe" />
+          </uap5:AppExecutionAlias>
+        </uap5:Extension>
+      </Extensions>
     </Application>
     <!--
       Second entry point: the couch/console UI, for an HTPC or a TV-attached box where the
