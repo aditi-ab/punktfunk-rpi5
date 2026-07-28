@@ -1047,9 +1047,13 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
         ),
         ctx.cursor_forward,
     );
-    // gamescope: the XFixes cursor source feeds the always-on composite (Phase C). Set after
-    // resolve so the flag is a pure function of the compositor.
-    plan.gamescope_cursor = ctx.compositor == pf_vdisplay::Compositor::Gamescope;
+    // gamescope: the XFixes cursor source feeds the host-side composite (Phase C) — unless the
+    // spawned gamescope paints the pointer into its node itself, in which case the reader would
+    // produce a second one. Set after resolve so the flag stays a pure function of the compositor
+    // (+ that capability).
+    plan.gamescope_cursor = crate::session_plan::gamescope_cursor_for(
+        ctx.compositor == pf_vdisplay::Compositor::Gamescope,
+    );
     // PyroWave rides the datagram-aligned wire mode (§4.4): every encoder this session opens
     // packetizes at the negotiated shard payload, so a lost datagram costs blocks, not frames.
     if ctx.codec == crate::encode::Codec::PyroWave {
@@ -2243,7 +2247,9 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                                             c == crate::vdisplay::Compositor::Gamescope,
                                         );
                                         plan.gamescope_cursor =
-                                            c == crate::vdisplay::Compositor::Gamescope;
+                                            crate::session_plan::gamescope_cursor_for(
+                                                c == crate::vdisplay::Compositor::Gamescope,
+                                            );
                                         gamescope_composite =
                                             plan.gamescope_cursor && cursor_fwd.is_none();
                                     }
@@ -3189,7 +3195,8 @@ pub(super) fn prepare_display(
         ),
         cursor_forward,
     );
-    plan.gamescope_cursor = compositor == pf_vdisplay::Compositor::Gamescope;
+    plan.gamescope_cursor =
+        crate::session_plan::gamescope_cursor_for(compositor == pf_vdisplay::Compositor::Gamescope);
     if codec == crate::encode::Codec::PyroWave {
         plan.wire_chunk = Some(shard_payload as usize);
     }

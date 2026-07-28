@@ -119,11 +119,16 @@ pub struct SessionPlan {
     /// locally, so `cursor_blend` is off AND (on Windows) the capturer sets the driver's
     /// hardware cursor up via [`OutputFormat::hw_cursor`](pf_frame::OutputFormat).
     pub cursor_forward: bool,
-    /// This is a gamescope session and its cursor comes from the XFixes source, NOT the
-    /// (absent) `SPA_META_Cursor` (remote-desktop-sweep Phase C). Distinct from `cursor_forward`:
-    /// gamescope can't embed the pointer OR carry the channel for a plain capture-mode client, so
-    /// the host ALWAYS composites the XFixes-sourced cursor into the video (`cursor_blend` is set
-    /// too). `build_pipeline` reads this to attach the XFixes reader to the capturer.
+    /// This gamescope session's cursor comes from the XFixes source, NOT the (absent)
+    /// `SPA_META_Cursor` (remote-desktop-sweep Phase C). Distinct from `cursor_forward`: a stock
+    /// gamescope can neither embed the pointer nor carry the channel for a plain capture-mode
+    /// client, so the host composites the XFixes-sourced cursor into the video (`cursor_blend` is
+    /// set too). `build_pipeline` reads this to attach the XFixes reader to the capturer.
+    ///
+    /// **`false` when the spawned gamescope paints the cursor into its node itself** (our patch
+    /// level 2+ — `pf_vdisplay::gamescope_composites_cursor`): the XFixes reader would then be
+    /// redundant work producing a SECOND pointer. Resolved by [`cursor_blend_for`]'s sibling so
+    /// the two answers cannot disagree.
     pub gamescope_cursor: bool,
 }
 
@@ -242,7 +247,40 @@ pub(crate) fn cursor_blend_for(cursor_forward: bool, gamescope: bool) -> bool {
     }
     #[cfg(not(target_os = "windows"))]
     {
-        cursor_forward || gamescope
+        cursor_forward || gamescope_needs_host_cursor(gamescope)
+    }
+}
+
+/// Does a gamescope session still need the HOST to composite its pointer?
+///
+/// It always did: gamescope keeps the cursor on a hardware plane for scanout and never painted it
+/// into its PipeWire node, so the host read it from XFixes and blended it into every frame. Our
+/// carried patch (level 2+, `--pipewire-composite-cursor`) puts it in the node instead — and then
+/// the host must NOT blend, or the pointer is drawn twice.
+///
+/// This is worth more than saving a blend. A session that composites forces the encoder onto its
+/// compute colour-conversion arm, because the zero-copy RGB-direct source hands the captured
+/// buffer to a fixed-function front end that has no blend stage. So a gamescope session with the
+/// cursor in the node is the first one that can be genuinely zero-copy end to end.
+#[cfg(not(target_os = "windows"))]
+fn gamescope_needs_host_cursor(gamescope: bool) -> bool {
+    gamescope && !pf_vdisplay::gamescope_composites_cursor()
+}
+
+/// Should this session attach the XFixes cursor reader — i.e. is this a gamescope session whose
+/// pointer the host still has to source and composite itself? The `SessionPlan::gamescope_cursor`
+/// resolver, kept beside [`cursor_blend_for`] because the two must give the same answer: attaching
+/// the reader without the blend wastes an X11 connection, and blending without it streams no
+/// pointer at all.
+pub(crate) fn gamescope_cursor_for(gamescope: bool) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        let _ = gamescope;
+        false
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        gamescope_needs_host_cursor(gamescope)
     }
 }
 

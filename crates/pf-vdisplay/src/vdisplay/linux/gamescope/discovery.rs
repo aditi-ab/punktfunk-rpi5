@@ -388,22 +388,28 @@ fn which_in_path(name: &str) -> Option<String> {
     None
 }
 
-/// Does the resolved gamescope offer 10-bit BT.2020/PQ formats on its PipeWire node — i.e. can a
-/// session on this host stream true HDR10 off a gamescope virtual output?
+/// The punktfunk patch-set revision the resolved gamescope carries — the `+pfhdr<N>` marker our
+/// build stamps into the `--version` banner (`packaging/gamescope/README.md`). `None` for a stock
+/// gamescope.
 ///
-/// **A static, binary-identity answer, cached for the process.** It has to be: punktfunk fixes a
-/// session's bit depth in the Welcome, *before* the display exists, and the Welcome is
-/// irrevocable (PQ frames handed to an 8-bit encoder are a deliberate hard error). Optimistic
-/// "spawn it and see" would strand the session. So we ask the binary, once, and believe it.
+/// **A static, binary-identity answer, cached for the process**, and it has to be: punktfunk
+/// fixes a session's shape before the display exists — the bit depth in the Welcome, which is
+/// irrevocable (PQ frames handed to an 8-bit encoder are a deliberate hard error), and whether
+/// the host must composite the cursor itself, which is decided before the encoder is opened.
+/// Optimistic "spawn it and see" would strand the session either way. So we ask the binary once
+/// and believe it.
 ///
-/// The answer is the `+pfhdr<N>` marker our build stamps into the `--version` banner (see
-/// `packaging/gamescope/README.md`). When upstream takes the patch this becomes a plain version
-/// floor, exactly like [`MIN_GAMESCOPE_OVERLAY`].
-pub(crate) fn gamescope_hdr_capable() -> bool {
-    static CAP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CAP.get_or_init(|| {
+/// Monotonic, so one probe answers every capability:
+/// * `1` — 10-bit BT.2020/PQ capture formats ([`gamescope_hdr_capable`]);
+/// * `2` — …and `--pipewire-composite-cursor` ([`gamescope_can_composite_cursor`]).
+///
+/// When upstream takes the functional patches this becomes a plain version floor, exactly like
+/// [`MIN_GAMESCOPE_OVERLAY`].
+fn gamescope_patch_level() -> u32 {
+    static LEVEL: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *LEVEL.get_or_init(|| {
         let Ok(out) = Command::new(gamescope_bin()).arg("--version").output() else {
-            return false;
+            return 0;
         };
         // The banner goes to stderr on some builds, stdout on others (same as the version gate).
         let text = format!(
@@ -411,27 +417,58 @@ pub(crate) fn gamescope_hdr_capable() -> bool {
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
         );
-        let capable = text.contains(PFHDR_MARKER);
-        if capable {
+        let level = parse_patch_level(&text);
+        if level > 0 {
             tracing::info!(
                 bin = %gamescope_bin(),
-                "gamescope offers 10-bit BT.2020/PQ capture — HDR sessions are available"
+                level,
+                "gamescope carries the punktfunk patch set — HDR capture, and (level 2+) the \
+                 cursor composited into the capture stream"
             );
         } else {
             tracing::debug!(
                 bin = %gamescope_bin(),
                 "gamescope has no {PFHDR_MARKER} marker — sessions on this backend stay 8-bit SDR \
-                 (install punktfunk-gamescope for HDR)"
+                 with a host-composited cursor (install punktfunk-gamescope for HDR)"
             );
         }
-        capable
+        level
     })
 }
 
-/// The marker `packaging/gamescope/patches/0002-*` stamps into the `--version` banner. Matched as
-/// a PREFIX (`+pfhdr1`, `+pfhdr2`, …): the number tracks the patch's wire behaviour, and every
-/// revision of it still offers 10-bit PQ capture.
+/// Does the resolved gamescope offer 10-bit BT.2020/PQ formats on its PipeWire node — i.e. can a
+/// session on this host stream true HDR10 off a gamescope virtual output?
+pub(crate) fn gamescope_hdr_capable() -> bool {
+    gamescope_patch_level() >= 1
+}
+
+/// Can the resolved gamescope paint the pointer INTO its PipeWire node
+/// (`--pipewire-composite-cursor`)? When it can, the host stops reconstructing the cursor from
+/// XFixes and blending it in — which is what frees the session to take the encoder's zero-CSC
+/// RGB-direct source, since that front end has no blend stage.
+pub(crate) fn gamescope_can_composite_cursor() -> bool {
+    gamescope_patch_level() >= 2
+}
+
+/// The marker `packaging/gamescope/patches/0003-*` stamps into the `--version` banner, followed by
+/// the patch-set revision (`+pfhdr1`, `+pfhdr2`, …).
 const PFHDR_MARKER: &str = "+pfhdr";
+
+/// The `+pfhdr<N>` revision in a `--version` banner, or `0` for a stock gamescope. Split out pure
+/// because everything downstream is a `>=` on it: read it too low and a capable box silently loses
+/// HDR; too high and the host promises a cursor nobody paints.
+fn parse_patch_level(banner: &str) -> u32 {
+    banner
+        .find(PFHDR_MARKER)
+        .map(|i| &banner[i + PFHDR_MARKER.len()..])
+        .map(|tail| {
+            tail.chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+        })
+        .and_then(|digits| digits.parse().ok())
+        .unwrap_or(0)
+}
 
 /// Minimum gamescope that captures reliably: below 3.16.22, headless PipeWire capture deadlocks
 /// against PipeWire ≥ 1.6 (a loop-lock bug) and a stuck link head-blocks the whole daemon.
@@ -501,7 +538,39 @@ fn parse_version(text: &str) -> Option<(u32, u32, u32)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_version, steam_appid_from_launch, MIN_GAMESCOPE, MIN_GAMESCOPE_OVERLAY};
+    use super::{
+        parse_patch_level, parse_version, steam_appid_from_launch, MIN_GAMESCOPE,
+        MIN_GAMESCOPE_OVERLAY,
+    };
+
+    /// The `+pfhdr<N>` probe decides, before anything is spawned, whether a session may negotiate
+    /// HDR (level 1) and whether the host must composite the pointer itself (level 2). Both are
+    /// irreversible once the session is planned, so the parse has to be exact in both directions:
+    /// too low silently costs a capable box its HDR, too high promises a cursor nobody paints.
+    #[test]
+    fn patch_level_parses_the_marker_and_nothing_else() {
+        // The real banner shape: `git describe` output, our marker, then the compiler.
+        assert_eq!(
+            parse_patch_level("gamescope version 3.16.25-1-g8c676c3+pfhdr2 (gcc 15.2.0)"),
+            2
+        );
+        assert_eq!(
+            parse_patch_level("gamescope version 3.16.25+pfhdr1 (clang 20)"),
+            1
+        );
+        // A stock gamescope — every capability off.
+        assert_eq!(
+            parse_patch_level("gamescope version 3.16.25 (gcc 15.2.0)"),
+            0
+        );
+        assert_eq!(parse_patch_level(""), 0);
+        // Multi-digit revisions must not truncate to their first digit.
+        assert_eq!(parse_patch_level("3.16.25+pfhdr10 (gcc)"), 10);
+        // A marker with no number is not a capability claim.
+        assert_eq!(parse_patch_level("3.16.25+pfhdr (gcc)"), 0);
+        // The version triple must never be mistaken for the level.
+        assert_eq!(parse_patch_level("gamescope version 3.16.25"), 0);
+    }
 
     #[test]
     fn parses_steam_appid_from_launch() {

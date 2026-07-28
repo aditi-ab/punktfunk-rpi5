@@ -28,8 +28,8 @@ use discovery::{
     gamescope_node_present, poll_managed_node, wait_for_node,
 };
 pub(crate) use discovery::{
-    game_session_exited, gamescope_hdr_capable, is_available, steam_appid_from_launch,
-    wait_for_steam_game_exit, SteamGameWatch,
+    game_session_exited, gamescope_can_composite_cursor, gamescope_hdr_capable, is_available,
+    steam_appid_from_launch, wait_for_steam_game_exit, SteamGameWatch,
 };
 pub(crate) use splash::run as splash_run;
 
@@ -869,7 +869,11 @@ fn write_steamos_dropin(shim_dir: &std::path::Path, mode: Mode, hdr: bool) -> Re
         hz = mode.refresh_hz.max(1),
         // Read (unquoted) by the PATH shim — empty for an SDR session. Quoted HERE because a
         // systemd `Environment=` value with spaces must be, or only the first flag survives.
-        hdr_args = hdr_args(hdr).join(" "),
+        hdr_args = hdr_args(hdr)
+            .into_iter()
+            .chain(cursor_args())
+            .collect::<Vec<_>>()
+            .join(" "),
     );
     std::fs::write(&path, body).with_context(|| format!("write drop-in {}", path.display()))
 }
@@ -2068,8 +2072,16 @@ fn launch_session(client: &str, unit_name: &str, mode: Mode, hdr: bool) -> Resul
             .arg(format!("--setenv=SCREEN_WIDTH={}", mode.width))
             .arg(format!("--setenv=SCREEN_HEIGHT={}", mode.height))
             .arg(format!("--setenv=PF_HZ={hz}"))
-            // Read (unquoted) by the GAMESCOPE_BIN wrapper — empty for an SDR session.
-            .arg(format!("--setenv=PF_HDR_ARGS={}", hdr_args(hdr).join(" ")))
+            // Read (unquoted) by the GAMESCOPE_BIN wrapper — empty for a stock-gamescope SDR
+            // session, and carrying the cursor flag whenever the binary supports it.
+            .arg(format!(
+                "--setenv=PF_HDR_ARGS={}",
+                hdr_args(hdr)
+                    .into_iter()
+                    .chain(cursor_args())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ))
             .arg(format!("--setenv=GAMESCOPE_BIN={}", wrapper.display()))
             .arg("--setenv=DRM_MODE=cvt")
             .arg(format!("--setenv=CUSTOM_REFRESH_RATES={hz}"))
@@ -2214,7 +2226,7 @@ fn add_bare_gamescope_args(
     if grab_cursor {
         command.arg("--force-grab-cursor");
     }
-    for arg in hdr_args(hdr) {
+    for arg in hdr_args(hdr).into_iter().chain(cursor_args()) {
         command.arg(arg);
     }
     command.args(["--xwayland-count", "1", "--"]);
@@ -2249,6 +2261,21 @@ fn hdr_args(hdr: bool) -> Vec<String> {
         args.push(nits.to_string());
     }
     args
+}
+
+/// `--pipewire-composite-cursor` when the resolved gamescope has it (patch level 2+). Paired with
+/// [`crate::gamescope_composites_cursor`], which is what tells the host to STOP compositing the
+/// pointer itself — the two must agree, so both read the same probe.
+///
+/// Passed on every session, HDR or not: a cursor in the node is strictly better than one blended
+/// host-side (it costs the host a full-frame pass, and on the zero-CSC encode source it cannot be
+/// done at all). Empty on a stock gamescope, which is exactly the old behaviour.
+fn cursor_args() -> Vec<String> {
+    if gamescope_can_composite_cursor() {
+        vec!["--pipewire-composite-cursor".to_string()]
+    } else {
+        Vec::new()
+    }
 }
 
 /// Spawn `gamescope --backend headless -W w -H h -r hz -- <app>`. The app comes from

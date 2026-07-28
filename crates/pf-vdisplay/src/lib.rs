@@ -534,10 +534,41 @@ pub fn gamescope_splash_client() -> anyhow::Result<()> {
 ///
 /// Always `false` off Linux.
 pub fn gamescope_hdr_available() -> bool {
+    gamescope_ours_and(
+        #[cfg(target_os = "linux")]
+        gamescope::gamescope_hdr_capable,
+    )
+}
+
+/// Will a gamescope session paint the pointer INTO its PipeWire node, so the host does NOT have to
+/// reconstruct it from XFixes and blend it into every frame?
+///
+/// That blend is not free: it forces the encode path onto its compute colour-conversion arm,
+/// because the zero-copy RGB-direct source hands the captured buffer to a fixed-function front end
+/// with no blend stage. So a `true` here is what lets a gamescope session skip a full-frame pass
+/// per frame — and, like the HDR answer, it must be settled BEFORE the session is planned
+/// (`SessionPlan::cursor_blend` feeds the encoder open).
+///
+/// Same two terms as [`gamescope_hdr_available`], for the same reasons: the resolved binary
+/// carries the patch, and this host is the one spawning it.
+pub fn gamescope_composites_cursor() -> bool {
+    gamescope_ours_and(
+        #[cfg(target_os = "linux")]
+        gamescope::gamescope_can_composite_cursor,
+    )
+}
+
+/// The shared half of the two capability answers above: the session must be one this host
+/// **spawns** (an attach inherits whatever flags someone else's session was started with, so it
+/// can promise nothing), and then `probe` — which asks the resolved binary — must agree.
+///
+/// A host-managed `gamescope-session-plus` / SteamOS session counts as a spawn: we own its
+/// `GAMESCOPE_BIN` wrapper (or PATH shim), so the flags are ours.
+fn gamescope_ours_and(#[cfg(target_os = "linux")] probe: fn() -> bool) -> bool {
     #[cfg(target_os = "linux")]
     {
         let attaching = with_env_lock(|| std::env::var_os("PUNKTFUNK_GAMESCOPE_NODE").is_some());
-        !attaching && gamescope::gamescope_hdr_capable()
+        !attaching && probe()
     }
     #[cfg(not(target_os = "linux"))]
     false

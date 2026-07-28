@@ -12,19 +12,43 @@ The patches here add the missing half, and nothing else. See
 | Patch | What | Upstream? |
 |---|---|---|
 | `0001-pipewire-offer-10-bit-BT.2020-PQ-capture-formats-HDR.patch` | Offer SPA `xRGB_210LE`/`xBGR_210LE` with MANDATORY SMPTE ST.2084 + BT.2020 props, map them to `DRM_FORMAT_XRGB2101010`/`XBGR2101010`, and composite them with `g_ScreenshotColorMgmtLutsHDR` + `EOTF_PQ` | **Yes** — offered against [gamescope#2126](https://github.com/ValveSoftware/gamescope/issues/2126) |
-| `0002-punktfunk-stamp-the-version-banner-with-pfhdr1.patch` | Append `+pfhdr1` to the `--version` banner | **No** — ours only, retired when patch 1 lands upstream |
+| `0002-pipewire-optionally-composite-the-cursor-into-the-ca.patch` | `--pipewire-composite-cursor` (off by default): paint the pointer into the capture stream, using the same `MouseCursor::paint` call the scanout composite uses | **Yes** — independently useful to any consumer with no cursor of its own |
+| `0003-punktfunk-stamp-the-version-banner-with-pfhdrN.patch` | Append `+pfhdr<N>` to the `--version` banner | **No** — ours only, retired when the two above land upstream |
+
+### Why the cursor patch matters more than it looks
+
+gamescope keeps the pointer out of its PipeWire node — it lives on a hardware plane for scanout —
+so punktfunk has always reconstructed it from XFixes and blended it into every frame host-side.
+That blend is what forces the encode path onto its compute colour-conversion arm: the zero-copy
+RGB-direct encode source (`VK_VALVE_video_encode_rgb_conversion`) hands the captured buffer to a
+fixed-function front end with no blend stage. Painting the cursor into the node removes the reason
+for the blend, and with it a full-frame pass per frame — a gamescope session becomes the first one
+that can be genuinely zero-copy end to end.
 
 ## Why the marker exists
 
-punktfunk decides a session's bit depth at handshake time, **before** the virtual display
-exists, and the Welcome is irrevocable (a PQ stream handed to an 8-bit encoder is a deliberate
-hard error). The capability answer must therefore be a static property of the resolved binary,
-not an optimistic negotiation. The host runs `<gamescope> --version` once per boot and looks for
-`+pfhdr` in the banner — see `gamescope_hdr_capable()` in
-`crates/pf-vdisplay/src/vdisplay/linux/gamescope/discovery.rs`.
+punktfunk decides a session's shape **before** the virtual display exists: the bit depth at
+handshake time (irrevocable — a PQ stream handed to an 8-bit encoder is a deliberate hard error),
+and whether the host must composite the cursor before the encoder is even opened. Both answers
+must therefore be static properties of the resolved binary, not optimistic negotiations. The host
+runs `<gamescope> --version` once per boot and reads the revision — see `gamescope_patch_level()`
+in `crates/pf-vdisplay/src/vdisplay/linux/gamescope/discovery.rs`.
 
-Bump the number (`+pfhdr2`, …) only if the patch's **wire** behaviour changes; the host's probe
-accepts any `+pfhdr<N>`.
+The number is a **monotonic patch-set revision**, so one probe answers every capability:
+
+| Level | Adds |
+|---|---|
+| `+pfhdr1` | 10-bit BT.2020/PQ capture formats |
+| `+pfhdr2` | …and `--pipewire-composite-cursor` |
+
+Bump it whenever a patch adds or changes something the host must know about before it spawns.
+
+⚠️ The two indirect spawn modes (the `GAMESCOPE_BIN` wrapper for gamescope-session-plus, and the
+SteamOS PATH shim) pass these flags through `PF_HDR_ARGS`, so they share one dependency: if the
+session ignores `GAMESCOPE_BIN`/`PATH` and execs the distro's gamescope, it gets neither the HDR
+formats nor the cursor flag. HDR fails loudly there (the capture negotiation times out and latches
+an SDR downgrade); a missing cursor would be silent. Worth a post-spawn `/proc/<pid>/cmdline` check
+if that ever bites.
 
 ## Which binary the host runs
 
@@ -67,9 +91,9 @@ setcap 'CAP_SYS_NICE=eip' /usr/bin/punktfunk-gamescope
 ## Verifying the patch on a box (P0 exit)
 
 ```sh
-punktfunk-gamescope --version                    # must contain +pfhdr1
+punktfunk-gamescope --version                    # must contain +pfhdr2
 punktfunk-gamescope --backend headless -W 1920 -H 1080 -r 60 \
-    --hdr-enabled --hdr-debug-force-support -- vkcube &
+    --hdr-enabled --hdr-debug-force-support --pipewire-composite-cursor -- vkcube &
 pw-dump | grep -A40 '"gamescope"'                # node offers xRGB_210LE / xBGR_210LE
 ```
 
