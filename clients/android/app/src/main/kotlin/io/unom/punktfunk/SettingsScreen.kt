@@ -33,11 +33,12 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
+import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.SportsEsports
+import androidx.compose.material.icons.filled.TouchApp
 import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.filled.Tv
-import androidx.compose.material.icons.filled.VolumeUp
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExposedDropdownMenuBox
@@ -67,6 +68,7 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import io.unom.punktfunk.kit.VideoDecoders
 import io.unom.punktfunk.kit.deviceBodyVibrator
@@ -76,12 +78,26 @@ import io.unom.punktfunk.kit.deviceBodyVibrator
  * subpages. On a phone the category list pushes to a full-screen detail; on a tablet / large screen
  * it becomes a two-pane list-detail (the list stays on the left, the detail on the right). Edits
  * persist immediately via [onChange]; [onBack] returns to the connect screen.
+ *
+ * **Structure mirrors the desktop/Apple settings revamp** ([SettingsCategory], and the Windows
+ * client's `app/settings.rs`), so every client reads the same way: General = session/app behaviour,
+ * Display = everything about the picture, Input = touch/keyboard/mouse, Audio, Controllers, About.
+ * Each field carries its explanation DIRECTLY under it (the `described()` idiom — see
+ * [SettingDropdown]'s `caption` and [ToggleRow]'s `subtitle`) rather than as loose paragraphs
+ * floating between controls; the only form-level notes are the "applies from the next session"
+ * footers, one per affected category.
  */
 @Composable
 fun SettingsScreen(
     initial: Settings,
     onChange: (Settings) -> Unit,
     onBack: () -> Unit,
+    /**
+     * Seeds the pushed detail page. The live app always starts on the category list (null); the
+     * screenshot harness passes a category to capture one, the way the GTK client's
+     * `PUNKTFUNK_SHOT_SETTINGS_SCOPE` seeds its scope.
+     */
+    initialCategory: SettingsCategory? = null,
 ) {
     var s by remember { mutableStateOf(initial) }
     val context = LocalContext.current
@@ -116,14 +132,14 @@ fun SettingsScreen(
     }
 
     // Selected category persists across rotation (stored by name — null = the bare list on a phone).
-    var selectedName by rememberSaveable { mutableStateOf<String?>(null) }
+    var selectedName by rememberSaveable { mutableStateOf(initialCategory?.name) }
     val selected = selectedName?.let { n -> SettingsCategory.entries.firstOrNull { it.name == n } }
 
     BoxWithConstraints(Modifier.fillMaxSize()) {
         val twoPane = maxWidth >= 640.dp
         // A two-column layout must never show an empty detail — land on the first category.
         LaunchedEffect(twoPane) {
-            if (twoPane && selected == null) selectedName = SettingsCategory.Display.name
+            if (twoPane && selected == null) selectedName = SettingsCategory.General.name
         }
 
         val detail: @Composable (SettingsCategory, (() -> Unit)?) -> Unit = { cat, back ->
@@ -152,7 +168,7 @@ fun SettingsScreen(
                 Box(Modifier.weight(1f).fillMaxHeight()) {
                     // Cross-fade the detail pane as the selected category changes.
                     AnimatedContent(
-                        targetState = selected ?: SettingsCategory.Display,
+                        targetState = selected ?: SettingsCategory.General,
                         transitionSpec = { fadeIn(tween(200)) togetherWith fadeOut(tween(200)) },
                         label = "SettingsPane",
                     ) { cat -> detail(cat, null) }
@@ -190,12 +206,17 @@ fun SettingsScreen(
     }
 }
 
-/** The top-level settings groups — each opens its own subpage (list on phone, split on tablet). */
+/**
+ * The top-level settings groups — each opens its own subpage (list on phone, split on tablet).
+ * The map and its order are the cross-client one (Apple's `SettingsCategory`, the Windows
+ * NavigationView, the GTK pages): General, Display, Input, Audio, Controllers, About.
+ */
 enum class SettingsCategory(val title: String, val icon: ImageVector) {
+    General("General", Icons.Filled.Tune),
     Display("Display", Icons.Filled.Tv),
-    Audio("Audio", Icons.Filled.VolumeUp),
-    Controls("Controls", Icons.Filled.SportsEsports),
-    Interface("Interface", Icons.Filled.Tune),
+    Input("Input", Icons.Filled.TouchApp),
+    Audio("Audio", Icons.AutoMirrored.Filled.VolumeUp),
+    Controllers("Controllers", Icons.Filled.SportsEsports),
     About("About", Icons.Filled.Info),
 }
 
@@ -276,12 +297,58 @@ private fun CategoryDetail(
             Text(category.title, style = MaterialTheme.typography.headlineMedium)
         }
         when (category) {
+            SettingsCategory.General -> GeneralSettings(settings, onChange)
             SettingsCategory.Display -> DisplaySettings(settings, onChange, context)
+            SettingsCategory.Input -> InputSettings(settings, onChange)
             SettingsCategory.Audio -> AudioSettings(settings, onChange, onMicChange)
-            SettingsCategory.Controls -> ControlsSettings(settings, onChange, onOpenControllers)
-            SettingsCategory.Interface -> InterfaceSettings(settings, onChange)
-            SettingsCategory.About -> AboutSettings(onOpenLicenses)
+            SettingsCategory.Controllers -> ControllerSettings(settings, onChange, onOpenControllers)
+            SettingsCategory.About -> AboutSettings(context, onOpenLicenses)
         }
+    }
+}
+
+// ---- The categories ----------------------------------------------------------------------------
+
+@Composable
+private fun GeneralSettings(s: Settings, update: (Settings) -> Unit) {
+    SettingsGroup("Session") {
+        ToggleRow(
+            title = "Auto-wake on connect",
+            subtitle = "Connecting to a saved host that isn't seen on the network sends " +
+                "Wake-on-LAN and waits for it to boot. Turn off if hosts behind a VPN look " +
+                "offline when they aren't — connects then go straight through.",
+            checked = s.autoWakeEnabled,
+            onCheckedChange = { on -> update(s.copy(autoWakeEnabled = on)) },
+        )
+    }
+    SettingsGroup("Statistics") {
+        SettingDropdown(
+            label = "Stats overlay",
+            options = STATS_VERBOSITY_OPTIONS,
+            selected = s.statsVerbosity,
+            caption = "Live session stats in a corner overlay — Compact is a single " +
+                "fps · latency · bitrate line, Normal adds the resolution and reliability lines, " +
+                "Detailed adds the decoder, colour and latency-breakdown lines. A 3-finger tap " +
+                "cycles the tiers live.",
+        ) { v -> update(s.copy(statsVerbosity = v)) }
+    }
+    SettingsGroup("Library") {
+        ToggleRow(
+            title = "Game library",
+            subtitle = "Browse a paired host's Steam and custom games and launch one directly " +
+                "(press Y on a saved host). No extra host setup.",
+            checked = s.libraryEnabled,
+            onCheckedChange = { on -> update(s.copy(libraryEnabled = on)) },
+        )
+    }
+    SettingsGroup("Interface") {
+        ToggleRow(
+            title = "Controller-optimized UI",
+            subtitle = "Switch to the console home (host carousel) whenever a controller is " +
+                "connected. Turn off to keep the touch interface. A TV is always in this mode.",
+            checked = s.gamepadUiEnabled,
+            onCheckedChange = { on -> update(s.copy(gamepadUiEnabled = on)) },
+        )
     }
 }
 
@@ -293,7 +360,7 @@ private fun DisplaySettings(s: Settings, update: (Settings) -> Unit, context: an
     // from the stored size, never flagged (see [isCustomResolution]), so nothing new persists.
     var customPicked by remember { mutableStateOf(false) }
     val showCustom = customPicked || s.isCustomResolution()
-    SettingsCard {
+    SettingsGroup("Resolution") {
         SettingDropdown(
             label = "Resolution",
             options = RESOLUTION_OPTIONS.map { (w, h, lbl) -> (w to h) to (if (w == 0) "$lbl ($nw × $nh)" else lbl) } +
@@ -301,6 +368,8 @@ private fun DisplaySettings(s: Settings, update: (Settings) -> Unit, context: an
                 // stored its label carries the live value, like the native row carries ($nw × $nh).
                 ((-1 to -1) to if (s.isCustomResolution()) "Custom (${s.width} × ${s.height})" else "Custom…"),
             selected = if (showCustom) -1 to -1 else s.width to s.height,
+            caption = "The host drives a real virtual output at exactly this size — true pixels, " +
+                "no scaling. “Native display” follows this device's panel.",
         ) { (w, h) ->
             if (w < 0) {
                 // Seed from the current *effective* size so the fields start from something
@@ -327,29 +396,40 @@ private fun DisplaySettings(s: Settings, update: (Settings) -> Unit, context: an
             label = "Refresh rate",
             options = REFRESH_OPTIONS.map { (hz, lbl) -> hz to (if (hz == 0) "$lbl ($nhz Hz)" else lbl) },
             selected = s.hz,
+            caption = "“Native” resolves to this display's refresh rate at connect.",
         ) { hz -> update(s.copy(hz = hz)) }
+    }
 
-        SettingDropdown(label = "Bitrate", options = BITRATE_OPTIONS, selected = s.bitrateKbps) { kbps ->
-            update(s.copy(bitrateKbps = kbps))
-        }
-
+    SettingsGroup("Quality") {
         SettingDropdown(
             label = "Render scale",
             options = RENDER_SCALE_OPTIONS,
             // Snap the stored value (a Float round-tripped to Double) to the nearest preset so the
-            // exact Double keys match. > 1 supersamples for sharpness (more bandwidth AND decode);
-            // < 1 renders under native for a lighter host — this device resamples to the display.
+            // exact Double keys match.
             selected = RenderScale.PRESETS.minByOrNull { kotlin.math.abs(it - s.renderScale) } ?: 1.0,
+            caption = "Above native supersamples for sharpness, at more bandwidth AND decode; " +
+                "below renders lighter on the host and the link. This device resamples the " +
+                "result to the screen.",
         ) { scale -> update(s.copy(renderScale = scale)) }
+
+        SettingDropdown(
+            label = "Bitrate",
+            options = BITRATE_OPTIONS,
+            selected = s.bitrateKbps,
+            caption = "Automatic lets the host decide (its default, clamped to what it supports).",
+        ) { kbps -> update(s.copy(bitrateKbps = kbps)) }
 
         // AV1 is only offered when the device has a real AV1 decoder (it's never advertised to the
         // host otherwise, so preferring it would be a dead setting). A stored "av1" from a capable
         // device stays visible so the selection is always representable.
         val av1Capable = remember { VideoDecoders.pickDecoder("video/av01") != null }
         val codecOptions = CODEC_OPTIONS.filter { (v, _) -> v != "av1" || av1Capable || s.codec == "av1" }
-        SettingDropdown(label = "Video codec", options = codecOptions, selected = s.codec) { c ->
-            update(s.copy(codec = c))
-        }
+        SettingDropdown(
+            label = "Video codec",
+            options = codecOptions,
+            selected = s.codec,
+            caption = "A preference — the host falls back if it can't encode this one.",
+        ) { c -> update(s.copy(codec = c)) }
 
         // HDR is only meaningful on a panel that can present HDR10; on an SDR display the toggle is
         // disabled (and HDR is never advertised) so the host doesn't send PQ the panel mis-tone-maps.
@@ -357,7 +437,8 @@ private fun DisplaySettings(s: Settings, update: (Settings) -> Unit, context: an
         ToggleRow(
             title = "HDR",
             subtitle = if (hdrCapable) {
-                "Stream 10-bit HDR (BT.2020 PQ) when the host supports it"
+                "Stream 10-bit HDR (BT.2020 PQ) when the host has HDR content. HEVC only; " +
+                    "otherwise the stream stays SDR."
             } else {
                 "This display can't present HDR10 — streams stay SDR"
             },
@@ -365,53 +446,47 @@ private fun DisplaySettings(s: Settings, update: (Settings) -> Unit, context: an
             enabled = hdrCapable,
             onCheckedChange = { on -> update(s.copy(hdrEnabled = on)) },
         )
+    }
 
-        SettingDropdown(
-            label = "Compositor",
-            options = COMPOSITOR_OPTIONS.mapIndexed { i, lbl -> i to lbl },
-            selected = s.compositor,
-        ) { c -> update(s.copy(compositor = c)) }
-
+    // The decode pipeline is a fact about THIS device's SoC, not about the stream — the desktop
+    // clients group their decoder/GPU pickers here for the same reason. Android has no decoder or
+    // adapter choice (MediaCodec resolves both), so the master toggle is this group's only row.
+    SettingsGroup("Decoding") {
         ToggleRow(
             title = "Low-latency mode",
             subtitle = "The fast pipeline (async decode, per-device decoder selection, HDMI game " +
-                "mode). On by default — turn off to fall back to the plain decode path if the stream " +
-                "stutters or glitches on this device.",
+                "mode). On by default — turn off to fall back to the plain decode path if the " +
+                "stream stutters or glitches on this device.",
             checked = s.lowLatencyMode,
             onCheckedChange = { on -> update(s.copy(lowLatencyMode = on)) },
         )
     }
-}
 
-@Composable
-private fun AudioSettings(s: Settings, update: (Settings) -> Unit, onMicChange: (Boolean) -> Unit) {
-    SettingsCard {
-        SettingDropdown(label = "Audio channels", options = AUDIO_CHANNEL_OPTIONS, selected = s.audioChannels) { ch ->
-            update(s.copy(audioChannels = ch))
-        }
-        ToggleRow(
-            title = "Microphone",
-            subtitle = "Send your mic to the host's virtual microphone",
-            checked = s.micEnabled,
-            onCheckedChange = onMicChange,
-        )
+    SettingsGroup("Host output", footer = "Display changes apply from the next session.") {
+        SettingDropdown(
+            label = "Compositor",
+            options = COMPOSITOR_OPTIONS.mapIndexed { i, lbl -> i to lbl },
+            selected = s.compositor,
+            caption = "The backend the host uses for its virtual output (Linux hosts only). A " +
+                "specific choice falls back to auto-detection when that backend isn't available.",
+        ) { c -> update(s.copy(compositor = c)) }
     }
 }
 
 @Composable
-private fun ControlsSettings(s: Settings, update: (Settings) -> Unit, onOpenControllers: () -> Unit) {
-    SettingsCard {
-        SettingDropdown(label = "Touch input", options = TOUCH_MODE_OPTIONS, selected = s.touchMode) { mode ->
-            update(s.copy(touchMode = mode))
-        }
-        Text(
-            "Trackpad: relative cursor like a laptop touchpad — tap to click, two-finger tap " +
-                "right-clicks, two fingers scroll, tap-then-drag holds the button. Direct pointer: " +
-                "the cursor jumps to your finger. Touch passthrough: real multi-touch reaches the " +
-                "host, for apps that understand touch.",
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
+private fun InputSettings(s: Settings, update: (Settings) -> Unit) {
+    SettingsGroup("Touch & pointer") {
+        SettingDropdown(
+            label = "Touch input",
+            options = TOUCH_MODE_OPTIONS,
+            selected = s.touchMode,
+            caption = "Trackpad: relative cursor like a laptop touchpad — tap to click, " +
+                "two-finger tap right-clicks, two fingers scroll, tap-then-drag holds the " +
+                "button. Direct pointer: the cursor jumps to your finger. Touch passthrough: " +
+                "real multi-touch reaches the host, for apps that understand touch.",
+        ) { mode -> update(s.copy(touchMode = mode)) }
+    }
+    SettingsGroup("Keyboard & mouse") {
         ToggleRow(
             title = "Capture pointer for games",
             subtitle = "Lock a connected mouse to the stream and send raw relative motion " +
@@ -422,7 +497,7 @@ private fun ControlsSettings(s: Settings, update: (Settings) -> Unit, onOpenCont
         )
         ToggleRow(
             title = "Invert scroll direction",
-            subtitle = "Flip the mouse wheel and two-finger touch scrolling",
+            subtitle = "Reverses the wheel and two-finger touch scroll direction sent to the host",
             checked = s.invertScroll,
             onCheckedChange = { on -> update(s.copy(invertScroll = on)) },
         )
@@ -434,11 +509,37 @@ private fun ControlsSettings(s: Settings, update: (Settings) -> Unit, onOpenCont
             onCheckedChange = { on -> update(s.copy(clipboardSync = on)) },
         )
     }
-    SettingsCard {
+}
+
+@Composable
+private fun AudioSettings(s: Settings, update: (Settings) -> Unit, onMicChange: (Boolean) -> Unit) {
+    SettingsGroup(footer = "Applies from the next session.") {
+        SettingDropdown(
+            label = "Audio channels",
+            options = AUDIO_CHANNEL_OPTIONS,
+            selected = s.audioChannels,
+            caption = "The speaker layout requested from the host. It downmixes if its own " +
+                "output has fewer channels.",
+        ) { ch -> update(s.copy(audioChannels = ch)) }
+        ToggleRow(
+            title = "Microphone",
+            subtitle = "This device's microphone feeds the host's virtual microphone",
+            checked = s.micEnabled,
+            onCheckedChange = onMicChange,
+        )
+    }
+}
+
+@Composable
+private fun ControllerSettings(s: Settings, update: (Settings) -> Unit, onOpenControllers: () -> Unit) {
+    SettingsGroup(footer = "Applies from the next session.") {
         SettingDropdown(
             label = "Controller type",
             options = GAMEPAD_OPTIONS.mapIndexed { i, lbl -> i to lbl },
             selected = s.gamepad,
+            caption = "The virtual pad created on the host. Automatic matches your controller — " +
+                "a DualSense keeps adaptive triggers, lightbar, touchpad and motion. Every " +
+                "connected controller is forwarded, each as its own player.",
         ) { g -> update(s.copy(gamepad = g)) }
         ClickableRow(
             title = "Connected controllers",
@@ -469,46 +570,26 @@ private fun ControlsSettings(s: Settings, update: (Settings) -> Unit, onOpenCont
 }
 
 @Composable
-private fun InterfaceSettings(s: Settings, update: (Settings) -> Unit) {
-    SettingsCard {
-        ToggleRow(
-            title = "Controller-optimized UI",
-            subtitle = "Switch to the console home (host carousel) when a controller is connected",
-            checked = s.gamepadUiEnabled,
-            onCheckedChange = { on -> update(s.copy(gamepadUiEnabled = on)) },
-        )
-        ToggleRow(
-            title = "Game library",
-            subtitle = "Browse a paired host's game library (press Y on a saved host)",
-            checked = s.libraryEnabled,
-            onCheckedChange = { on -> update(s.copy(libraryEnabled = on)) },
-        )
-        ToggleRow(
-            title = "Auto-wake on connect",
-            subtitle = "Send Wake-on-LAN and wait for a saved host to reappear on mDNS before " +
-                "connecting. Turn off if a host that's already on isn't seen on mDNS, so connects " +
-                "go straight through instead of waiting out the wake timeout.",
-            checked = s.autoWakeEnabled,
-            onCheckedChange = { on -> update(s.copy(autoWakeEnabled = on)) },
-        )
-        SettingDropdown(
-            label = "Stats overlay",
-            options = STATS_VERBOSITY_OPTIONS,
-            selected = s.statsVerbosity,
-        ) { v -> update(s.copy(statsVerbosity = v)) }
-        Text(
-            "How much the in-stream overlay shows: Compact is a single fps · latency · bitrate " +
-                "line; Normal adds the resolution and reliability lines; Detailed adds the decoder, " +
-                "colour and latency-breakdown lines. A 3-finger tap cycles the tiers live.",
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
+private fun AboutSettings(context: android.content.Context, onOpenLicenses: () -> Unit) {
+    // The app's own version, read from the installed package (the WinUI/Apple About convention:
+    // identity first, then the legal rows). Empty on a harness with no real package info.
+    val version = remember {
+        runCatching {
+            @Suppress("DEPRECATION")
+            context.packageManager.getPackageInfo(context.packageName, 0).versionName
+        }.getOrNull().orEmpty()
     }
-}
-
-@Composable
-private fun AboutSettings(onOpenLicenses: () -> Unit) {
-    SettingsCard {
+    SettingsGroup {
+        Column {
+            Text("Punktfunk", style = MaterialTheme.typography.titleLarge)
+            if (version.isNotEmpty()) {
+                Text(
+                    "Version $version",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
         ClickableRow(
             title = "Open-source licenses",
             subtitle = "Third-party notices and credits",
@@ -517,15 +598,46 @@ private fun AboutSettings(onOpenLicenses: () -> Unit) {
     }
 }
 
-/** A group of settings rendered inside an outlined card. */
+// ---- Row / group primitives --------------------------------------------------------------------
+
+/**
+ * A group of settings rendered inside an outlined card, with an optional sub-section [header]
+ * above it and an optional form-level [footer] beneath it. The header is what turns a long
+ * category into the scannable sub-sections the desktop clients have ("Resolution", "Quality",
+ * "Host output"); the footer carries the one "applies from the next session" note per category —
+ * per-field guidance lives on the fields themselves.
+ */
 @Composable
-private fun SettingsCard(content: @Composable ColumnScope.() -> Unit) {
-    OutlinedCard(modifier = Modifier.fillMaxWidth()) {
-        Column(
-            modifier = Modifier.padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(16.dp),
-            content = content,
-        )
+private fun SettingsGroup(
+    header: String? = null,
+    footer: String? = null,
+    content: @Composable ColumnScope.() -> Unit,
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        if (header != null) {
+            Text(
+                header.uppercase(),
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.primary,
+                letterSpacing = 1.2.sp,
+                modifier = Modifier.padding(start = 4.dp),
+            )
+        }
+        OutlinedCard(modifier = Modifier.fillMaxWidth()) {
+            Column(
+                modifier = Modifier.padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(16.dp),
+                content = content,
+            )
+        }
+        if (footer != null) {
+            Text(
+                footer,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(start = 4.dp),
+            )
+        }
     }
 }
 
@@ -581,39 +693,54 @@ private fun ClickableRow(title: String, subtitle: String, onClick: () -> Unit) {
     }
 }
 
-/** A labelled read-only dropdown over [options] (value → label); calls [onSelect] on a pick. */
+/**
+ * A labelled read-only dropdown over [options] (value → label); calls [onSelect] on a pick.
+ * [caption] is the field's own explanation, rendered directly under the control — the `described()`
+ * idiom the other clients use, so a dropdown's guidance belongs to it instead of floating as a
+ * loose paragraph between rows.
+ */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun <T> SettingDropdown(
     label: String,
     options: List<Pair<T, String>>,
     selected: T,
+    caption: String? = null,
     onSelect: (T) -> Unit,
 ) {
     var expanded by remember { mutableStateOf(false) }
     val selectedLabel = options.firstOrNull { it.first == selected }?.second
         ?: options.firstOrNull()?.second.orEmpty()
-    ExposedDropdownMenuBox(expanded = expanded, onExpandedChange = { expanded = it }) {
-        OutlinedTextField(
-            value = selectedLabel,
-            onValueChange = {},
-            readOnly = true,
-            label = { Text(label) },
-            trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded) },
-            modifier = Modifier
-                .menuAnchor(ExposedDropdownMenuAnchorType.PrimaryNotEditable)
-                .fillMaxWidth(),
-        )
-        ExposedDropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
-            options.forEach { (value, lbl) ->
-                DropdownMenuItem(
-                    text = { Text(lbl) },
-                    onClick = {
-                        onSelect(value)
-                        expanded = false
-                    },
-                )
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        ExposedDropdownMenuBox(expanded = expanded, onExpandedChange = { expanded = it }) {
+            OutlinedTextField(
+                value = selectedLabel,
+                onValueChange = {},
+                readOnly = true,
+                label = { Text(label) },
+                trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded) },
+                modifier = Modifier
+                    .menuAnchor(ExposedDropdownMenuAnchorType.PrimaryNotEditable)
+                    .fillMaxWidth(),
+            )
+            ExposedDropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+                options.forEach { (value, lbl) ->
+                    DropdownMenuItem(
+                        text = { Text(lbl) },
+                        onClick = {
+                            onSelect(value)
+                            expanded = false
+                        },
+                    )
+                }
             }
+        }
+        if (caption != null) {
+            Text(
+                caption,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
         }
     }
 }

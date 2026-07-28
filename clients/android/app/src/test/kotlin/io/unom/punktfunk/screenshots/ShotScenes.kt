@@ -31,6 +31,7 @@ import io.unom.punktfunk.ConnectPhase
 import io.unom.punktfunk.ConnectTakeover
 import io.unom.punktfunk.Settings
 import io.unom.punktfunk.TouchMode
+import io.unom.punktfunk.SettingsCategory
 import io.unom.punktfunk.SettingsScreen
 import io.unom.punktfunk.StatsOverlay
 import io.unom.punktfunk.StatsVerbosity
@@ -100,24 +101,43 @@ internal fun HostsScene() {
     }
 }
 
-/** The real SettingsScreen, fed a representative non-default Settings. */
+/** A representative non-default settings state, shared by the settings scenes. */
+private val SHOT_SETTINGS = Settings(
+    width = 1920,
+    height = 1080,
+    hz = 120,
+    bitrateKbps = 50_000,
+    compositor = 1,
+    gamepad = 2,
+    micEnabled = true,
+    statsVerbosity = StatsVerbosity.DETAILED,
+    touchMode = TouchMode.TRACKPAD,
+)
+
+/**
+ * The real SettingsScreen at its root — the shared category map (General / Display / Input /
+ * Audio / Controllers / About) every client now presents.
+ */
 @Composable
 internal fun SettingsScene() {
     Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
+        SettingsScreen(initial = SHOT_SETTINGS, onChange = {}, onBack = {})
+    }
+}
+
+/**
+ * One category page, seeded through `initialCategory` — the sub-section headers, the
+ * caption-under-control fields and the "applies from the next session" footer only exist inside a
+ * category, so the root shot alone can't regress-catch them. Display is the richest page.
+ */
+@Composable
+internal fun SettingsCategoryScene(category: SettingsCategory) {
+    Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
         SettingsScreen(
-            initial = Settings(
-                width = 1920,
-                height = 1080,
-                hz = 120,
-                bitrateKbps = 50_000,
-                compositor = 1,
-                gamepad = 2,
-                micEnabled = true,
-                statsVerbosity = StatsVerbosity.DETAILED,
-                touchMode = TouchMode.TRACKPAD,
-            ),
+            initial = SHOT_SETTINGS,
             onChange = {},
             onBack = {},
+            initialCategory = category,
         )
     }
 }

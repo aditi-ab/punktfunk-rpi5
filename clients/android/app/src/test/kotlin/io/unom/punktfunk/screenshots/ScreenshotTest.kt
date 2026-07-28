@@ -56,6 +56,18 @@ class ScreenshotTest {
     @Test
     fun settings() = shootRoot("settings") { SettingsScene() }
 
+    // One category page per shot: the sub-section headers, the caption-under-control fields and
+    // the "applies from the next session" footers live inside a category, not on the root list.
+    @Test
+    fun settingsDisplay() = shootRoot("settings-display") {
+        SettingsCategoryScene(io.unom.punktfunk.SettingsCategory.Display)
+    }
+
+    @Test
+    fun settingsInput() = shootRoot("settings-input") {
+        SettingsCategoryScene(io.unom.punktfunk.SettingsCategory.Input)
+    }
+
     @Test
     @Config(sdk = [36], qualifiers = "w800dp-h360dp-xxhdpi") // landscape — the stream is immersive
     fun stream() = shootRoot("stream") { StreamScene(io.unom.punktfunk.StatsVerbosity.DETAILED) }
