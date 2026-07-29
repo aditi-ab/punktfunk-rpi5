@@ -40,14 +40,18 @@ const TILE_GAP: f64 = 12.0;
 /// Props for the hosts page: the services plus the changing discovery/status data that must
 /// drive its re-render (compared by value, so a new host list or error refreshes the page).
 ///
-/// `forget` and `rename` are the per-host action state, and they live in ROOT (not this page's
-/// own `use_state`) on purpose: the "…" overflow is a WinUI `MenuFlyout`, whose item clicks are
-/// wired directly in the reactor backend (`add_Click`) and so bypass the normal event-dispatch
-/// flush — a *sync* child `SetState` from that handler marks state dirty but never pumps the
-/// reconciler, so nothing re-renders. Root `AsyncSetState` re-renders the whole tree; because
-/// these values are props, the changed value propagates back into this page (a child's own async
-/// state would be memoised away when its props are unchanged). `(fp_hex, _)` in each identifies
-/// the target saved host; `rename`'s second field is the in-progress draft name.
+/// `forget`, `rename` and `hover` used to live here too, hoisted into root on the belief that
+/// MenuFlyout item clicks and pointer enter/exit — wired straight in the reactor backend
+/// (`add_Click` etc.) — bypassed the render flush, so a *sync* child `SetState` from such a
+/// handler would never repaint. The characterization suite disproved that at the current pin
+/// (`tests/reactor_semantics.rs`: `sync_state_from_backend_fired_event_rerenders`,
+/// `sync_state_child_under_element_equal_border_rerenders` — a sync `use_state` write
+/// re-renders its owner, from backend-fired handlers and under element-equal wrappers alike),
+/// so they moved back down into `hosts_page`'s own `use_state` on 2026-07-29.
+///
+/// `show_add` is the one that STAYS root, for a different reason: the add-modal entrance
+/// tween in `app/mod.rs` is keyed on it, and the tween worker thread writes root async state
+/// (`add_anim`) — root can only start the tween if it owns the trigger.
 #[derive(Clone)]
 pub(crate) struct HostsProps {
     pub(crate) svc: Svc,
@@ -60,21 +64,12 @@ pub(crate) struct HostsProps {
     /// Connected-controller count (root state, mirrored from the gamepad service) — a
     /// pad plus a paired host surfaces the "Open console UI" hint card.
     pub(crate) pads: usize,
-    pub(crate) forget: Option<(String, String)>,
-    pub(crate) rename: Option<(String, String)>,
-    /// Whether the "Add host" modal is open. Root state (like `forget`/`rename`), not the page's
-    /// own `use_state`: a child component's sync `SetState` marks its slot dirty but does not
-    /// re-render when its props are otherwise unchanged, so the toggle wouldn't take.
+    /// Whether the "Add host" modal is open. Root state (see the struct docs: the entrance
+    /// tween in `app/mod.rs` keys on it).
     pub(crate) show_add: bool,
     /// The modal's entrance-tween progress (0 → 1, root-driven): opacity + slide-up offset.
     pub(crate) add_anim: f64,
-    /// The hovered tile's stable id (saved: fp_hex, discovered: `addr:port`) — root state because
-    /// the pointer enter/exit handlers bypass the reconciler flush, like the flyout clicks above.
-    pub(crate) hover: Option<String>,
-    pub(crate) set_forget: AsyncSetState<Option<(String, String)>>,
-    pub(crate) set_rename: AsyncSetState<Option<(String, String)>>,
     pub(crate) set_show_add: AsyncSetState<bool>,
-    pub(crate) set_hover: AsyncSetState<Option<String>>,
 }
 
 impl PartialEq for HostsProps {
@@ -85,11 +80,8 @@ impl PartialEq for HostsProps {
             && self.probed == other.probed
             && self.status == other.status
             && self.pads == other.pads
-            && self.forget == other.forget
-            && self.rename == other.rename
             && self.show_add == other.show_add
             && self.add_anim == other.add_anim
-            && self.hover == other.hover
     }
 }
 
@@ -161,10 +153,12 @@ fn host_tile(
         .into()
 }
 
-/// The hover-tracking pair `host_tile` needs: the currently hovered tile id + its root setter.
+/// The hover-tracking pair `host_tile` needs: the currently hovered tile id + the page's own
+/// sync setter (pointer enter/exit handlers re-render this component reliably — measured by
+/// `sync_state_from_backend_fired_event_rerenders`).
 pub(crate) struct Hover {
     pub(crate) current: Option<String>,
-    pub(crate) set: AsyncSetState<Option<String>>,
+    pub(crate) set: SetState<Option<String>>,
 }
 
 /// The status row at the bottom of a tile: the host's OS mark (when advertised), presence
@@ -259,7 +253,7 @@ fn edit_editor(
     port_draft: HookRef<String>,
     mac_draft: HookRef<String>,
     clip_draft: HookRef<bool>,
-    set_edit: AsyncSetState<Option<(String, String)>>,
+    set_edit: SetState<Option<(String, String)>>,
 ) -> Element {
     let commit = {
         let (fp, se) = (fp.to_string(), set_edit.clone());
@@ -478,15 +472,19 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
     // would connect to the empty mount-time value. Mirror every keystroke into this stable ref (the
     // pair-screen PIN pattern). `manual` still drives the text box's displayed value.
     let manual_live = cx.use_ref(String::new());
-    // "Add host" modal open state lives in ROOT (see `HostsProps`).
+    // "Add host" modal open state lives in ROOT (see `HostsProps`: the entrance tween keys on it).
     let show_add = props.show_add;
     let set_show_add = &props.set_show_add;
-    // Forget confirmation and in-progress rename live in ROOT state (see `HostsProps`) — the
-    // overflow menu's flyout clicks can't re-render off a sync setter. Both are `(fp_hex, _)`.
-    let forget = props.forget.clone();
-    let rename = props.rename.clone();
-    let set_forget = &props.set_forget;
-    let set_rename = &props.set_rename;
+    // Forget confirmation and in-progress edit target, `(fp_hex, name)` each. Page-local sync
+    // state (moved back down from root 2026-07-29): the flyout's item clicks fire through the
+    // backend attach path, and a sync `use_state` write from such a handler re-renders this
+    // component reliably (`sync_state_from_backend_fired_event_rerenders`).
+    let (forget, set_forget) = cx.use_state(Option::<(String, String)>::None);
+    let (rename, set_rename) = cx.use_state(Option::<(String, String)>::None);
+    // The hovered tile's stable id (saved: fp_hex, discovered: `addr:port`), driving the
+    // WinUI-style card hover fill. Same measured rule as above for pointer enter/exit.
+    let (hover_id, set_hover) = cx.use_state(Option::<String>::None);
+    let (set_forget, set_rename) = (&set_forget, &set_rename);
     // The live edit drafts, read at Save time (see `edit_editor`). Root `rename` carries only
     // the target's fingerprint + initial name, so typing never round-trips through a
     // re-render. Every draft is re-seeded from the STORED host whenever the edit target
@@ -525,8 +523,8 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
         }
     }
     let hover = Hover {
-        current: props.hover.clone(),
-        set: props.set_hover.clone(),
+        current: hover_id,
+        set: set_hover,
     };
     let known = KnownHosts::load();
     // The experimental library gate ("Show game library" in Settings) — GTK/Apple parity.

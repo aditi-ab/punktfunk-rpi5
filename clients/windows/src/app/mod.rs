@@ -30,6 +30,10 @@
 //!   (`async_state_child_under_element_equal_border_rerenders` asserts the drop). So
 //!   everything THREAD-driven (discovery, HUD stats, speed-test results, spawn events)
 //!   is held as *root* state and passed down as props.
+//! * Corollary: state a root tween is KEYED on (`screen`, the settings section, `show_add`)
+//!   also stays in root even though it is user-event-driven — the tween workers are root
+//!   `use_effect`s writing root async state, and root can only observe the trigger (and
+//!   start the tween) if it owns it.
 
 mod connect;
 mod help;
@@ -100,8 +104,8 @@ pub(crate) struct Target {
 }
 
 /// Stable app services handed to the page components as props. Each routed screen that uses
-/// hooks (`hosts_page`/`pair_page`/`speed_page`/`library_page`) is mounted as its own
-/// `component(...)`, so its hooks live in an isolated slot list — calling them on the shared
+/// hooks (`hosts_page`/`settings_page`/`pair_page`/`speed_page`/`library_page`) is mounted as
+/// its own `component(...)`, so its hooks live in an isolated slot list — calling them on the shared
 /// parent `cx` would change the hook order whenever the screen changes (reactor's
 /// Rules-of-Hooks guard aborts).
 ///
@@ -259,40 +263,23 @@ fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
     let (status, set_status) = cx.use_async_state(String::new());
     let (hud, set_hud) = cx.use_async_state(stream::HudSample::default());
     let (speed, set_speed) = cx.use_async_state(SpeedState::Running);
-    // Per-host action state for the hosts page. Root, not page-local: the "…" overflow is a WinUI
-    // MenuFlyout whose item clicks are wired straight in the reactor backend, bypassing the normal
-    // event-dispatch flush — a sync page-local setter marks state dirty but never re-renders. See
-    // `hosts::HostsProps`.
-    let (forget, set_forget) = cx.use_async_state(Option::<(String, String)>::None);
-    let (rename, set_rename) = cx.use_async_state(Option::<(String, String)>::None);
+    // "Add host" modal open state. Root, not hosts-page-local — NOT for a re-render reason
+    // (a page-local sync setter would repaint fine per the measured rules) but because the
+    // modal's entrance tween below is keyed on it, and the tween worker thread writes root
+    // async state (`add_anim`): root can only start the tween if it owns the trigger. The
+    // page's other action state (forget/rename/hover) moved into `hosts_page` 2026-07-29.
     let (show_add, set_show_add) = cx.use_async_state(false);
-    // Hovered host tile (its stable id), driving the WinUI-style card hover fill. Root state for
-    // the same reason as `forget`/`rename`: pointer enter/exit handlers are wired straight in the
-    // reactor backend, so only a root `AsyncSetState` reliably re-renders the page.
-    let (hover, set_hover) = cx.use_async_state(Option::<String>::None);
     // Which Settings section the NavigationView shows (persists across visits this run).
     // Opens on General — the first sidebar item, matching the Apple client's landing category.
+    // Root for the same tween-coupling reason as `show_add`: the section-switch entrance tween
+    // below keys on it. The page's other UI state (scope/delete/edit/revision) is its own
+    // sync `use_state` — see `settings::SettingsProps`.
     let (settings_nav, set_settings_nav) = cx.use_async_state("general".to_string());
-    // Which LAYER the settings screen edits: "" = the global defaults, else a profile id
-    // (design/client-settings-profiles.md §5.1). Root state for the same reason as the section
-    // above — the ComboBox's change handler is wired in the reactor backend.
-    let (settings_scope, set_settings_scope) = cx.use_async_state(String::new());
-    // The profile a Delete… click is asking about; `Some` renders the confirmation. Root state
-    // because this page stays hook-free (its handlers are wired in the reactor backend).
-    let (settings_delete, set_settings_delete) = cx.use_async_state(Option::<String>::None);
-    // Whether the Edit-profile modal is up. Root state for the reactor-backend-handler reason
-    // above; guarded in the page so it only renders while a profile is actually in scope.
-    let (settings_edit, set_settings_edit) = cx.use_async_state(false);
     // Window size, read at ROOT: the settings screen places its scope switcher by the same
     // width threshold WinUI's NavigationView uses to collapse its pane (reactor exposes no
     // pane-opened/closed event). Registering the size here re-renders the tree on resize,
     // which the per-screen `use_inner_size` readers (hosts, library) already caused anyway.
     let window = cx.use_inner_size();
-    // Bumped when a settings edit changes what the page should SHOW without changing any state
-    // it already reads — ANY edit through `settings::commit` (creating an override must surface
-    // its marker as immediately as resetting one clears it), a reset, a profile colour change.
-    // Root state comparison makes same-value calls free, so a counter is what forces the pass.
-    let (settings_rev, set_settings_rev) = cx.use_async_state(0u64);
     // `punktfunk://` links: the receiver thread queues them (from this launch's argv, or from a
     // later instance over WM_COPYDATA) and this poll pulls them onto the UI thread. Thread-fed
     // state must be root state, like the pad count below.
@@ -610,37 +597,26 @@ fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
                 probed,
                 status,
                 pads,
-                forget,
-                rename,
                 show_add,
                 add_anim,
-                hover,
-                set_forget,
-                set_rename,
                 set_show_add,
-                set_hover,
             },
         ),
-        // connecting_page / request_access_page / waking_page / settings_page / licenses_page /
-        // help_page use no hooks (they never touch `cx`), so calling them inline is sound.
+        // connecting_page / request_access_page / waking_page / licenses_page / help_page use
+        // no hooks (they never touch `cx`), so calling them inline is sound.
         Screen::Connecting => connect::connecting_page(ctx, &status),
         Screen::RequestAccess => connect::request_access_page(ctx, &set_screen),
         Screen::Waking => connect::waking_page(ctx, &set_screen),
-        Screen::Settings => settings::settings_page(
-            ctx,
-            &set_screen,
-            &settings_nav,
-            &set_settings_nav,
-            &settings_scope,
-            &set_settings_scope,
-            &settings_delete,
-            &set_settings_delete,
-            settings_edit,
-            &set_settings_edit,
-            settings_rev,
-            &set_settings_rev,
-            nav_progress,
-            window.width,
+        Screen::Settings => component(
+            settings::settings_page,
+            settings::SettingsProps {
+                ctx: ctx.clone(),
+                set_screen: set_screen.clone(),
+                section: settings_nav.clone(),
+                set_section: set_settings_nav.clone(),
+                progress: nav_progress,
+                window_width: window.width,
+            },
         ),
         Screen::Licenses => licenses::licenses_page(&set_screen),
         Screen::Help => help::help_page(&set_screen),
