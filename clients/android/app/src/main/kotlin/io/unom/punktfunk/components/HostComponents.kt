@@ -5,8 +5,6 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.ExperimentalLayoutApi
-import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -18,6 +16,9 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Key
+import androidx.compose.material.icons.filled.Lock
+import androidx.compose.material.icons.filled.LockOpen
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.DropdownMenu
@@ -38,6 +39,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -75,7 +78,6 @@ data class HostMenuItem(
  * card** ([profileProminent]) the host name is still the title, but the profile is the loud part,
  * because the pin exists to make that one combination a single tap.
  */
-@OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun HostCard(
     name: String,
@@ -125,8 +127,8 @@ fun HostCard(
                     .padding(16.dp),
                 horizontalAlignment = Alignment.CenterHorizontally,
             ) {
-                HostAvatar(name)
-                Spacer(Modifier.height(12.dp))
+                HostAvatar(name, online)
+                Spacer(Modifier.height(10.dp))
                 Text(
                     name,
                     style = MaterialTheme.typography.titleMedium,
@@ -143,7 +145,7 @@ fun HostCard(
                     textAlign = TextAlign.Center,
                 )
                 if (profileLabel != null || reserveProfileSlot) {
-                    Spacer(Modifier.height(8.dp))
+                    Spacer(Modifier.height(10.dp))
                     Box(
                         Modifier.heightIn(min = PROFILE_CHIP_SLOT),
                         contentAlignment = Alignment.Center,
@@ -153,20 +155,14 @@ fun HostCard(
                         }
                     }
                 }
-                Spacer(Modifier.height(12.dp))
-                // Fixed slot, and pills WRAP as pills rather than wrapping their own text: "Trust
-                // on first use" beside "Online" doesn't fit a narrow card, and letting the label
-                // run to three lines made that card tower over a "Paired" one in the same row.
-                Box(Modifier.heightIn(min = PILL_SLOT), contentAlignment = Alignment.TopCenter) {
-                    FlowRow(
-                        horizontalArrangement = Arrangement.spacedBy(12.dp, Alignment.CenterHorizontally),
-                        verticalArrangement = Arrangement.spacedBy(2.dp),
-                    ) {
-                        PresencePill(online)
-                        StatusPill(status)
-                    }
-                }
             }
+
+            // Trust state lives in the free top-left corner, mirroring the overflow on the right —
+            // it costs no height, and it is a state you glance at rather than read. The label is
+            // still there for TalkBack, and the trust DECISION is made in a dialog that spells all
+            // of this out; on the card it only has to say "this one is settled" vs "this one will
+            // ask something of you".
+            TrustBadge(status, Modifier.align(Alignment.TopStart))
 
             if (onForget != null || onEdit != null || onWake != null || menuItems.isNotEmpty()) {
                 var menu by remember { mutableStateOf(false) }
@@ -256,74 +252,90 @@ private fun ProfileChip(label: String, accent: Color?, prominent: Boolean) {
 }
 
 /**
- * Reserved heights for the two parts of a card that would otherwise vary: the profile chip, and the
- * presence/trust pills. `LazyVerticalGrid` sizes a row to its tallest item and does NOT stretch the
- * others, so anything variable here shows up as cards stepping up and down within one row.
+ * Reserved height for the profile chip — the one part of a card that varies. `LazyVerticalGrid`
+ * sizes a row to its tallest item and does NOT stretch the others, so a card that grew a chip its
+ * neighbour lacks would leave the row stepping up and down.
  *
- * `heightIn(min =)`, not a fixed height: at a large accessibility font scale the content must be
- * allowed to grow rather than clip. That is also why the pill slot is sized with room to spare
- * rather than to a measured two lines — the equal-height guarantee only holds while every card
- * fits INSIDE the reserved space, so the reservation has to be comfortable, not exact. Past that
- * (a very large font scale) a row can step again: a rare, self-healing cosmetic cost, and the
- * right trade against truncating a host's trust state.
+ * `heightIn(min =)`, not a fixed height: at a large accessibility font scale the chip must be
+ * allowed to grow rather than clip, and the reservation is sized with room to spare because the
+ * equal-height guarantee only holds while every card fits INSIDE it.
  */
 private val PROFILE_CHIP_SLOT = 26.dp
-private val PILL_SLOT = 48.dp
 
-/** A circular avatar with the host's first letter (Apple-contact style). */
+/** Live presence, on any dynamic scheme: green reads as "up" to everyone, and Material You's
+ * primary might be any hue at all — including a green that would then mean nothing. */
+private val PRESENCE_ONLINE = Color(0xFF4ADE80)
+
+/**
+ * The host's letter avatar (Apple-contact style) with its presence as a dot on the corner — the
+ * idiom every contact list already uses, and one fewer labelled badge on a small card.
+ *
+ * [online] is true when the host advertises on mDNS OR answers the reachability probe, so a
+ * routed/VPN host that never advertises still reads as up. Online is a FILLED green dot, offline a
+ * hollow grey ring: the difference is a shape as well as a colour, so it survives both a
+ * colour-blind reader and a screenshot in greyscale. TalkBack gets the word either way.
+ */
 @Composable
-fun HostAvatar(name: String) {
+fun HostAvatar(name: String, online: Boolean = false) {
     val letter = name.trim().firstOrNull()?.uppercaseChar()?.toString() ?: "?"
-    Box(
-        modifier = Modifier
-            .size(44.dp)
-            .clip(CircleShape)
-            .background(MaterialTheme.colorScheme.primaryContainer),
-        contentAlignment = Alignment.Center,
-    ) {
-        Text(
-            letter,
-            style = MaterialTheme.typography.titleMedium,
-            color = MaterialTheme.colorScheme.onPrimaryContainer,
+    val cardColor = CardDefaults.elevatedCardColors().containerColor
+    Box {
+        Box(
+            modifier = Modifier
+                .size(44.dp)
+                .clip(CircleShape)
+                .background(MaterialTheme.colorScheme.primaryContainer),
+            contentAlignment = Alignment.Center,
+        ) {
+            Text(
+                letter,
+                style = MaterialTheme.typography.titleMedium,
+                color = MaterialTheme.colorScheme.onPrimaryContainer,
+            )
+        }
+        Box(
+            modifier = Modifier
+                .align(Alignment.BottomEnd)
+                .size(13.dp)
+                .clip(CircleShape)
+                // A ring in the card's own colour is what makes the dot read as sitting ON the
+                // avatar rather than beside it.
+                .background(cardColor)
+                .padding(2.dp)
+                .clip(CircleShape)
+                .then(
+                    if (online) {
+                        Modifier.background(PRESENCE_ONLINE)
+                    } else {
+                        Modifier
+                            .background(cardColor)
+                            .border(1.5.dp, MaterialTheme.colorScheme.onSurfaceVariant, CircleShape)
+                    },
+                )
+                .semantics { contentDescription = if (online) "Online" else "Offline" },
         )
     }
 }
 
 /**
- * A small dot + label for live presence: green Online when the host advertises on mDNS OR answers
- * the reachability probe (so a routed/VPN host that never advertises still reads Online), dimmed
- * Offline otherwise.
+ * The host's trust state as a corner glyph: locked (paired — nothing more to do), a key (this host
+ * will ask for a PIN), or an open lock (trust-on-first-use, the weakest of the three). The full
+ * label rides along as the content description, and the dialogs that actually make the decision
+ * spell it out in sentences.
  */
 @Composable
-fun PresencePill(online: Boolean) {
-    val color =
-        if (online) MaterialTheme.colorScheme.primary
-        else MaterialTheme.colorScheme.onSurfaceVariant
-    Row(verticalAlignment = Alignment.CenterVertically) {
-        Box(Modifier.size(8.dp).clip(CircleShape).background(color))
-        Spacer(Modifier.width(6.dp))
-        Text(
-            if (online) "Online" else "Offline",
-            style = MaterialTheme.typography.labelMedium,
-            color = color,
-            maxLines = 1,
-        )
+private fun TrustBadge(status: HostStatus, modifier: Modifier = Modifier) {
+    val (icon, tint) = when (status) {
+        HostStatus.PAIRED -> Icons.Filled.Lock to MaterialTheme.colorScheme.primary
+        HostStatus.PAIRING -> Icons.Filled.Key to MaterialTheme.colorScheme.tertiary
+        HostStatus.TOFU -> Icons.Filled.LockOpen to MaterialTheme.colorScheme.onSurfaceVariant
     }
-}
-
-/** A small colored dot + label for the host's trust state. */
-@Composable
-fun StatusPill(status: HostStatus) {
-    val color = when (status) {
-        HostStatus.PAIRED -> MaterialTheme.colorScheme.primary
-        HostStatus.PAIRING -> MaterialTheme.colorScheme.tertiary
-        HostStatus.TOFU -> MaterialTheme.colorScheme.onSurfaceVariant
-    }
-    Row(verticalAlignment = Alignment.CenterVertically) {
-        Box(Modifier.size(8.dp).clip(CircleShape).background(color))
-        Spacer(Modifier.width(6.dp))
-        Text(status.label, style = MaterialTheme.typography.labelMedium, color = color, maxLines = 1)
-    }
+    Icon(
+        icon,
+        contentDescription = status.label,
+        tint = tint.copy(alpha = 0.85f),
+        modifier = modifier.padding(14.dp).size(18.dp),
+    )
 }
 
 /** Shown when there are no saved or discovered hosts. */

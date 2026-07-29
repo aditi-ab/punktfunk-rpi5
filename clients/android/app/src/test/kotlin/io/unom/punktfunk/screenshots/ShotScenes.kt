@@ -65,6 +65,7 @@ private data class MockHost(
     val profile: String? = null,
     val pin: String? = null,
     val accent: Color? = null,
+    val online: Boolean = false,
 )
 
 // Ordered so an UNCHIPPED card sits beside a CHIPPED one in the same grid row, and a long trust
@@ -75,12 +76,13 @@ private val SAVED = listOf(
     MockHost("Office", "192.168.1.50:9777", HostStatus.TOFU),
     MockHost(
         "Living Room PC", "192.168.1.42:9777", HostStatus.PAIRED,
-        profile = "Game", pin = "Work", accent = Color(0xFFFF8A4C),
+        profile = "Game", pin = "Work", accent = Color(0xFFFF8A4C), online = true,
     ),
 )
 private val DISCOVERED = listOf(
-    MockHost("studio-deck", "192.168.1.61:9777", HostStatus.PAIRING),
-    MockHost("HTPC", "192.168.1.70:9777", HostStatus.TOFU),
+    // Discovered ⇒ advertising right now, so both are online.
+    MockHost("studio-deck", "192.168.1.61:9777", HostStatus.PAIRING, online = true),
+    MockHost("HTPC", "192.168.1.70:9777", HostStatus.TOFU, online = true),
 )
 
 /** The connect screen's host grid, reconstructed from the real HostCard/SectionLabel components. */
@@ -115,7 +117,7 @@ internal fun HostsScene() {
             SAVED.forEach { h ->
                 item {
                     HostCard(
-                        h.name, h.address, h.status, enabled = true,
+                        h.name, h.address, h.status, online = h.online, enabled = true,
                         onConnect = {}, onForget = {}, onEdit = {},
                         // The bound profile is a quiet chip: the card says what a tap will do.
                         profileLabel = h.profile,
@@ -132,7 +134,7 @@ internal fun HostsScene() {
                 if (h.pin != null) {
                     item {
                         HostCard(
-                            h.name, h.address, h.status, enabled = true,
+                            h.name, h.address, h.status, online = h.online, enabled = true,
                             onConnect = {}, onForget = null,
                             profileLabel = h.pin, profileProminent = true, accent = h.accent,
                             menuItems = listOf(HostMenuItem("Unpin card", startsSection = true) {}),
@@ -146,7 +148,10 @@ internal fun HostsScene() {
                 SectionLabel("Discovered on the network")
             }
             items(DISCOVERED) { h ->
-                HostCard(h.name, h.address, h.status, enabled = true, onConnect = {}, onForget = null)
+                HostCard(
+                    h.name, h.address, h.status, online = h.online,
+                    enabled = true, onConnect = {}, onForget = null,
+                )
             }
         }
     }
