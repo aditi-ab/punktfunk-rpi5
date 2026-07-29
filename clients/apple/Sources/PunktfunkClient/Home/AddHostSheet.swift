@@ -76,7 +76,7 @@ struct AddHostSheet: View {
             TVFieldRow(label: "Port", value: String(port), placeholder: "") { editingField = .port }
             TVFieldRow(
                 label: "MAC address", value: mac,
-                placeholder: "Optional — lets Punktfunk wake this host") { editingField = .mac }
+                placeholder: "For Wake-on-LAN, optional") { editingField = .mac }
             HStack(spacing: 32) {
                 Button("Cancel", role: .cancel) { dismiss() }
                 Button(actionTitle) { save() }.disabled(!canSave)
@@ -113,31 +113,32 @@ struct AddHostSheet: View {
         #else
         VStack(spacing: 0) {
             Form {
-                Section {
-                    TextField("Name", text: $name, prompt: Text("Optional — e.g. Living Room"))
-                    TextField("Address", text: $address, prompt: Text("IP or hostname"))
-                    TextField("Port", value: $port, format: .number.grouping(.never))
-                    // "MAC" alone said what the value IS and nothing about why it's here, and
-                    // "Wake-on-LAN" as the placeholder read like the field wanted that typed in.
-                    // The label names the value, the footer says what it buys.
-                    TextField(
-                        "MAC address", text: $mac,
-                        prompt: Text("Optional — aa:bb:cc:dd:ee:ff"))
-                        .autocorrectionDisabled()
-                        #if os(iOS)
-                        .textInputAutocapitalization(.never)
-                        #endif
-                    #if os(macOS)
-                    Toggle("Share clipboard with this host", isOn: $clipboardSync)
+                TextField("Name", text: $name, prompt: Text("Optional — e.g. Living Room"))
+                TextField("Address", text: $address, prompt: Text("IP or hostname"))
+                TextField("Port", value: $port, format: .number.grouping(.never))
+                // The PROMPT is the only thing on show here on iOS (a field's title is its
+                // accessibility label once a prompt is given), so it has to name the field
+                // itself — "Wake-on-LAN — auto-filled when known" read as if that were the
+                // value being asked for.
+                TextField(
+                    "MAC address", text: $mac,
+                    prompt: Text("MAC address (for Wake-on-LAN, optional)"))
+                    .autocorrectionDisabled()
+                    #if os(iOS)
+                    .textInputAutocapitalization(.never)
                     #endif
-                } footer: {
-                    Text("The MAC address lets Punktfunk wake this host while it's asleep. "
-                        + "It fills in by itself once the host has been seen on the network.")
-                }
+                #if os(macOS)
+                Toggle("Share clipboard with this host", isOn: $clipboardSync)
+                #endif
                 profileRows
             }
             #if !os(tvOS)
             .formStyle(.grouped)
+            #endif
+            #if os(iOS)
+            // As before: the sheet is sized to its content, so there is nothing to scroll. Only
+            // the edit sheet's profile rows can outgrow that, and only they turn it back on.
+            .scrollDisabled(!showsProfileRows)
             #endif
             #if os(macOS)
             // macOS ONLY: the grouped form's default system text is oversized next to the app's
@@ -170,9 +171,8 @@ struct AddHostSheet: View {
             #endif
         }
         #if os(iOS)
-        // The sheet follows what it is actually showing (see `sheetHeight`), and `.large` is
-        // always reachable so a large Dynamic Type size can never strand the action row.
-        .presentationDetents([.height(sheetHeight), .large])
+        // Sized to its content (see `sheetHeight`).
+        .presentationDetents([.height(sheetHeight)])
         .presentationDragIndicator(.visible)
         #endif
         #if os(macOS)
@@ -183,16 +183,13 @@ struct AddHostSheet: View {
     }
 
     #if os(iOS)
-    /// The sheet's height, derived from what it is actually showing rather than pinned to one
-    /// number — which is what clipped the profile rows before: a sheet can't grow into a height
-    /// nobody recomputed.
-    ///
-    /// Estimates, deliberately: the form scrolls and `.large` is offered alongside, so running
-    /// short costs a scroll rather than a stranded row at accessibility text sizes.
+    /// Four fields + the action row — a touch taller than the 3-field add sheet used to be. The
+    /// edit sheet's profile rows are the only thing that can outgrow it, and they say by how much;
+    /// a single fixed number is what clipped them.
     private var sheetHeight: CGFloat {
-        var height: CGFloat = 440 // name, address, port, MAC + its footnote + the action row
+        var height: CGFloat = 392
         if showsProfileRows {
-            height += 128 // the Profile picker and its footnote
+            height += 116 // the Profile picker and its footnote
             height += 96 + CGFloat(profiles.profiles.count) * 44 // the pins, their header + footer
         }
         return height
