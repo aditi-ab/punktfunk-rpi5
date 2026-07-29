@@ -305,8 +305,13 @@ extension SettingsView {
                 Label {
                     Text(profile.name)
                 } icon: {
-                    Image(systemName: "circle.fill")
-                        .foregroundStyle(profile.accentColor)
+                    // Rasterised, not tinted — see MenuIcon: a tinted symbol in a menu is a
+                    // stencil, and the colour never arrives.
+                    if let chip = MenuIcon.swatch(profile.accentColor, scheme: colorScheme) {
+                        chip
+                    } else {
+                        Image(systemName: "circle.fill")
+                    }
                 }
                 .tag(SettingsScope.profile(profile.id))
             }
@@ -336,7 +341,17 @@ extension SettingsView {
             Button(role: .destructive) {
                 profilePendingDelete = active
             } label: {
-                Label("Delete “\(active.name)”…", systemImage: "trash")
+                Label {
+                    Text("Delete “\(active.name)”…")
+                } icon: {
+                    // The destructive ROLE colours the row on iOS and nothing at all on macOS,
+                    // and either way it leaves the icon as a stencil — so the red is rendered in.
+                    if let trash = MenuIcon.symbol("trash", color: .red, scheme: colorScheme) {
+                        trash
+                    } else {
+                        Image(systemName: "trash")
+                    }
+                }
             }
         }
     }

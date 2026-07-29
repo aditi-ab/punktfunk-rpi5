@@ -30,6 +30,9 @@ struct SettingsView: View {
     /// is being confirmed for.
     @State var profileDraft: ProfileDraft?
     @State var profilePendingDelete: StreamProfile?
+    /// The menu's icons are rasterised per appearance (see `MenuIcon`), so the surface has to know
+    /// which one it is drawing in.
+    @Environment(\.colorScheme) var colorScheme
     #if os(macOS)
     @State private var macTab: MacTab = .general
     #endif
