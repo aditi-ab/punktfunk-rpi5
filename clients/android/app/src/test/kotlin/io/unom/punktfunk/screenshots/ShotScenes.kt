@@ -37,6 +37,7 @@ import io.unom.punktfunk.SettingsCategory
 import io.unom.punktfunk.SettingsScreen
 import io.unom.punktfunk.StatsOverlay
 import io.unom.punktfunk.StatsVerbosity
+import io.unom.punktfunk.ProfileNameFields
 import io.unom.punktfunk.ProfileStore
 import io.unom.punktfunk.SettingsOverlay
 import io.unom.punktfunk.SpeedTestDialog
@@ -242,6 +243,24 @@ internal fun SpeedTestScene() {
         onApply = {},
         onDismiss = {},
     )
+}
+
+/**
+ * Creating a profile. Small, but it is the first thing a user meets when they reach for this
+ * feature — and dialogs only get a shot each because a layout slip inside one is invisible from
+ * every other scene (this one shipped with the field and its caption touching).
+ */
+@Composable
+internal fun NewProfileScene() {
+    Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
+        Column(Modifier.padding(24.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+            Text("New profile", style = MaterialTheme.typography.headlineSmall)
+            // The dialog's own body, not a rebuild of it — the spacing under test is the real one.
+            ProfileNameFields(name = "Travel", duplicate = false, onNameChange = {})
+            Text("Duplicate name", style = MaterialTheme.typography.headlineSmall)
+            ProfileNameFields(name = "Game", duplicate = true, onNameChange = {})
+        }
+    }
 }
 
 /** The real TOFU AlertDialog (mirrors ConnectScreen's PendingTrust.Kind.TRUST_NEW), shown over the host grid. */

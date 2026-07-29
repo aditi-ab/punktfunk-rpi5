@@ -113,6 +113,9 @@ class ScreenshotTest {
     }
 
     @Test
+    fun newProfile() = shootRoot("new-profile") { NewProfileScene() }
+
+    @Test
     fun speedTest() = shootScreen("speed-test") {
         HostsScene()
         SpeedTestScene()

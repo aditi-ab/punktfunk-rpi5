@@ -8,7 +8,9 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
@@ -77,9 +79,19 @@ internal fun ProfileScopeChips(
             FilterChip(
                 selected = selectedId == p.id,
                 onClick = { onSelect(p.id) },
-                label = { Text(p.name) },
-                leadingIcon = p.accent?.let { accent ->
-                    { AccentDot(accentColor(accent) ?: MaterialTheme.colorScheme.primary) }
+                // The accent dot rides INSIDE the label, not in the `leadingIcon` slot: that slot
+                // reserves an 18dp icon and shrinks the chip's leading padding to suit, so a
+                // profile with an accent would sit differently from one without and from
+                // "Default settings" beside it. In the label every chip keeps the same padding and
+                // the dot's spacing is ours to set.
+                label = {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        accentColor(p.accent)?.let { dot ->
+                            AccentDot(dot, size = 8)
+                            Spacer(Modifier.width(8.dp))
+                        }
+                        Text(p.name)
+                    }
                 },
             )
         }
@@ -127,33 +139,7 @@ internal fun ProfileNameDialog(
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text(title) },
-        text = {
-            Column {
-                OutlinedTextField(
-                    value = name,
-                    onValueChange = { name = it },
-                    label = { Text("Name") },
-                    placeholder = { Text("e.g. Game, Work, Travel") },
-                    singleLine = true,
-                    isError = duplicate,
-                )
-                Text(
-                    if (duplicate) {
-                        "A profile called “$trimmed” already exists."
-                    } else {
-                        "A profile starts out inheriting every default setting. Whatever you " +
-                            "change while it's selected becomes an override; everything else " +
-                            "keeps following the defaults."
-                    },
-                    style = MaterialTheme.typography.bodySmall,
-                    color = if (duplicate) {
-                        MaterialTheme.colorScheme.error
-                    } else {
-                        MaterialTheme.colorScheme.onSurfaceVariant
-                    },
-                )
-            }
-        },
+        text = { ProfileNameFields(name, duplicate) { name = it } },
         confirmButton = {
             TextButton(
                 enabled = trimmed.isNotEmpty() && !duplicate,
@@ -162,6 +148,41 @@ internal fun ProfileNameDialog(
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
     )
+}
+
+/**
+ * The name field and its caption. Extracted from [ProfileNameDialog] so the screenshot harness can
+ * render exactly these — a focused text field inside a Dialog window never reaches idle under
+ * Robolectric, so the dialog itself is uncapturable, and an eyeballed-only layout is how this
+ * shipped with the field and its caption touching.
+ */
+@Composable
+internal fun ProfileNameFields(name: String, duplicate: Boolean, onNameChange: (String) -> Unit) {
+    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        OutlinedTextField(
+            value = name,
+            onValueChange = onNameChange,
+            label = { Text("Name") },
+            placeholder = { Text("e.g. Game, Work, Travel") },
+            singleLine = true,
+            isError = duplicate,
+        )
+        Text(
+            if (duplicate) {
+                "A profile called “${name.trim()}” already exists."
+            } else {
+                "A profile starts out inheriting every default setting. Whatever you " +
+                    "change while it's selected becomes an override; everything else " +
+                    "keeps following the defaults."
+            },
+            style = MaterialTheme.typography.bodySmall,
+            color = if (duplicate) {
+                MaterialTheme.colorScheme.error
+            } else {
+                MaterialTheme.colorScheme.onSurfaceVariant
+            },
+        )
+    }
 }
 
 /**
@@ -181,7 +202,7 @@ internal fun DeleteProfileDialog(
         onDismissRequest = onDismiss,
         title = { Text("Delete “${profile.name}”?") },
         text = {
-            Column {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 val consequences = buildList {
                     if (boundHosts > 0) {
                         add("$boundHosts ${plural(boundHosts, "host", "hosts")} will fall back to the default settings")
