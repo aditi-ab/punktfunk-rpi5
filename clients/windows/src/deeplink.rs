@@ -56,6 +56,8 @@ pub(crate) fn positional_url(args: &[String]) -> Option<String> {
 /// Try to become the one shell for this user. `true` = we are it; `false` = another instance
 /// holds the mutex and this process should hand off and exit.
 pub(crate) fn claim_primary() -> bool {
+    // SAFETY: `CreateMutexW` takes a static wide name literal and no pointer we own; the handle it
+    // returns is stored in `MUTEX` and released once in `release_primary`.
     unsafe {
         let handle = match CreateMutexW(None, true, MUTEX_NAME) {
             Ok(h) => h,
@@ -82,6 +84,8 @@ pub(crate) fn claim_primary() -> bool {
 pub(crate) fn release_primary() {
     let raw = MUTEX.swap(0, Ordering::Relaxed);
     if raw != 0 {
+        // SAFETY: `raw` is the handle `claim_primary` stored, taken out of the atomic by `swap` so
+        // this runs at most once even if two threads race here.
         unsafe {
             let _ = ReleaseMutex(windows::Win32::Foundation::HANDLE(raw as *mut _));
         }
@@ -96,6 +100,9 @@ pub(crate) fn release_primary() {
 pub(crate) fn forward_to_primary(url: &str) -> bool {
     let wide: Vec<u16> = url.encode_utf16().collect();
     for attempt in 0..20 {
+        // SAFETY: `FindWindowW` takes static literals. The `COPYDATASTRUCT` points at `wide`, a
+        // local that outlives the call because `SendMessage` is synchronous — the receiver has
+        // finished with the buffer before it returns, which is precisely why this is not `Post`.
         unsafe {
             if let Ok(hwnd) = FindWindowW(None, windows::core::w!("Punktfunk")) {
                 let data = COPYDATASTRUCT {
@@ -128,6 +135,8 @@ pub(crate) fn install_receiver() {
         .name("pf-deeplink-receiver".into())
         .spawn(|| {
             for _ in 0..200 {
+                // SAFETY: `FindWindowW` takes static literals, and `SetWindowSubclass` is given
+                // our own `wnd_proc` plus a plain id; the window handle is one the OS just returned.
                 unsafe {
                     if let Ok(hwnd) = FindWindowW(None, windows::core::w!("Punktfunk")) {
                         // Subclassing (rather than replacing the window proc) is what lets the
@@ -154,9 +163,16 @@ unsafe extern "system" fn wnd_proc(
     _data: usize,
 ) -> LRESULT {
     if msg == WM_COPYDATA {
+        // SAFETY: for `WM_COPYDATA` the OS marshals the sender's `COPYDATASTRUCT` and its buffer
+        // into THIS process and keeps both valid for the duration of the handler — that is the
+        // guarantee this relies on, not the sender's honesty, which is why a hostile sender can at
+        // worst supply a wrong `dwData`/contents rather than a bad pointer.
         let cds = unsafe { &*(lparam.0 as *const COPYDATASTRUCT) };
         if cds.dwData == COPYDATA_URL && !cds.lpData.is_null() {
             let len = cds.cbData as usize / 2;
+            // SAFETY: as above, `lpData` is the OS-marshalled copy, valid for `cbData` bytes and
+            // suitably aligned because the OS allocated it; `len` is `cbData / 2`, so the slice
+            // cannot read past the buffer even if `cbData` is odd (the division rounds down).
             let slice = unsafe { std::slice::from_raw_parts(cds.lpData as *const u16, len) };
             let url = String::from_utf16_lossy(slice);
             tracing::debug!(%url, "link from another instance");
@@ -164,6 +180,9 @@ unsafe extern "system" fn wnd_proc(
             return LRESULT(1);
         }
     }
+    // SAFETY: the default handler is called with exactly the parameters the OS passed this window
+    // procedure, unmodified — forwarding them on is what a subclass proc is required to do for any
+    // message it does not consume.
     unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
 }
 
@@ -198,6 +217,9 @@ pub(crate) fn write_shortcut(label: &str, url: &str) -> Result<std::path::PathBu
         .map(|p| std::path::PathBuf::from(p).join("Desktop"))
         .map_err(|_| "USERPROFILE isn't set".to_string())?;
     let path = desktop.join(format!("{}.lnk", file_name(label)));
+    // SAFETY: COM calls on this thread's apartment. `CoCreateInstance` returns an owned interface
+    // checked by `?`, and every setter below takes a borrowed `HSTRING`/`PCWSTR` that outlives its
+    // synchronous call; nothing here dereferences a pointer the caller supplied.
     unsafe {
         // The UI thread is already apartment-threaded; this is belt and braces for the case
         // where a caller ever moves this off it. An already-initialised apartment returns
