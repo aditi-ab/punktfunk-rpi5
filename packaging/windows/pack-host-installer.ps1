@@ -78,13 +78,13 @@ Write-Host "ISCC: $iscc"
 # FAIL CLOSED on a real release. The ephemeral fallback below exists so canary/CI/dev builds keep
 # working without the secret, but it is a per-build throwaway cert: nobody can pin it, and an
 # installer signed with one is indistinguishable from one signed by an attacker. Silently falling
-# back on a tag build would ship exactly that to users under the release's name — so on refs/tags/v*
+# back on a tag build would ship exactly that to users under the release's name - so on refs/tags/v*
 # a missing MSIX_CERT_PFX_B64 (or -NoSign) is a build failure, not a downgrade. ('auto' resolves from
 # GITHUB_REF so a workflow can't forget to opt in; -RequireSignedCert true/false overrides.)
 $requireCert = if ($RequireSignedCert -eq 'auto') { $env:GITHUB_REF -like 'refs/tags/v*' }
                else { [Convert]::ToBoolean($RequireSignedCert) }
 if ($NoSign -and $requireCert) {
-    throw "release build ($env:GITHUB_REF) with -NoSign — refusing to publish an unsigned installer."
+    throw "release build ($env:GITHUB_REF) with -NoSign - refusing to publish an unsigned installer."
 }
 $pfxPath = Join-Path $OutDir 'signing.pfx'
 $cerPath = Join-Path $OutDir "punktfunk-host-windows_${Version}.cer"
@@ -97,7 +97,7 @@ if (-not $NoSign) {
         [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($PfxBase64))
     }
     elseif ($requireCert) {
-        throw ("release build ($env:GITHUB_REF) with no MSIX_CERT_PFX_B64 — refusing to fall back to " +
+        throw ("release build ($env:GITHUB_REF) with no MSIX_CERT_PFX_B64 - refusing to fall back to " +
                "an ephemeral self-signed cert. Restore the MSIX_CERT_PFX_B64 / MSIX_CERT_PASSWORD " +
                "repo secrets, or pass -RequireSignedCert false if this really is a test build.")
     }

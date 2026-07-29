@@ -35,8 +35,8 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 $PSNativeCommandUseErrorActionPreference = $false
 
-# The decoded signing key must not outlive this script. It is a STABLE key now — trusted as a
-# machine root on every box that installs punktfunk — so a .pfx left behind in a build directory is
+# The decoded signing key must not outlive this script. It is a STABLE key now - trusted as a
+# machine root on every box that installs punktfunk - so a .pfx left behind in a build directory is
 # a standing credential on a machine that runs build jobs, not the throwaway it used to be. A
 # script-scope trap covers the failure paths; Remove-SigningPfx is also called on the way out.
 $script:ShredPfx = $null
@@ -49,7 +49,7 @@ function Remove-SigningPfx {
 # `break` is for explicitness, not correctness: measured on the runner, a bare trap and
 # trap+break behave identically here (exit 1, no resumption) for `throw` at script scope,
 # `throw` inside a function, and a cmdlet error under EAP=Stop. Kept because it states the
-# intent — shred, then re-throw — instead of relying on a default that is easy to misread.
+# intent - shred, then re-throw - instead of relying on a default that is easy to misread.
 trap { Remove-SigningPfx; break }
 
 $DriversDir = (Resolve-Path $DriversDir).Path
@@ -106,7 +106,7 @@ foreach ($t in @($signtool, $stampinf, $inf2cat)) {
 
 # --- 3. signing cert (supplied stable pfx OR fresh self-signed; shared by both drivers) -------
 # FAIL CLOSED on a real release, same rule as the host/MSIX pack scripts. The fallback below mints
-# a cert per BUILD, and the installer trusts whatever .cer ships in the bundle — so the signature
+# a cert per BUILD, and the installer trusts whatever .cer ships in the bundle - so the signature
 # proves nothing about origin, and each upgrade adds another self-signed root CA to the user's
 # machine under the same name. That is survivable for canary and dev builds; shipping it in a
 # release is not. ('auto' resolves from GITHUB_REF so a new workflow inherits the guard.)
@@ -123,7 +123,7 @@ if ($CertPfxB64) {
     $pubForCer = if ($sec) { Get-PfxCertificate -FilePath $pfx -Password $sec } else { Get-PfxCertificate -FilePath $pfx }
 }
 elseif ($requireCert) {
-    throw ("release build ($env:GITHUB_REF) with no DRIVER_CERT_PFX_B64 — refusing to sign drivers " +
+    throw ("release build ($env:GITHUB_REF) with no DRIVER_CERT_PFX_B64 - refusing to sign drivers " +
            "with a per-build throwaway cert. Set the DRIVER_CERT_PFX_B64 / DRIVER_CERT_PASSWORD " +
            "secrets (packaging/windows/README.md), or pass -RequireSignedCert false for a test build.")
 }
