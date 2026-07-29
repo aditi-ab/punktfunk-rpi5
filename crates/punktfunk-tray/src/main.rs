@@ -20,6 +20,8 @@ mod linux;
 mod status;
 #[cfg(windows)]
 mod win;
+#[cfg(windows)]
+mod win_theme;
 
 /// CLI configuration (hand-rolled parse, house style). The mgmt address/port default to the
 /// host's defaults; they are flags because the tray cannot read `host.env` on Windows (it is

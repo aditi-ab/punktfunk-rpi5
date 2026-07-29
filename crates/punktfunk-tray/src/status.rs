@@ -29,6 +29,10 @@ pub struct Summary {
     pub video_streaming: bool,
     pub audio_streaming: bool,
     pub session: Option<SessionInfo>,
+    /// Display name of the streaming client (trust-store name, else the device's own), for the
+    /// connect toast. `#[serde(default)]`: absent when idle, nameless, or from an older host.
+    #[serde(default)]
+    pub client_name: Option<String>,
     pub paired_clients: u32,
     pub native_paired_clients: u32,
     pub pin_pending: bool,
@@ -404,6 +408,7 @@ mod tests {
                 height: 1440,
                 fps: 120,
             }),
+            client_name: streaming.then(|| "studio-deck".into()),
             paired_clients: 1,
             native_paired_clients: 2,
             pin_pending: false,
