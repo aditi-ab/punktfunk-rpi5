@@ -47,3 +47,19 @@ catch { Write-Warning "disk reclaim step failed (non-fatal): $_" }
 $ciDir = $PSScriptRoot
 & "$ciDir\provision-windows-wdk.ps1"
 & "$ciDir\provision-windows-punktfunk-extras.ps1"
+
+# --- sccache: shared compile cache (RustFS S3 over the LAN). The Windows workflows set
+# RUSTC_WRAPPER=sccache, so the binary must exist on any runner regardless of when the
+# template was last re-baked. GITHUB_PATH makes it visible to every later step.
+$sccacheDir = 'C:\Users\Public\sccache'
+$sccacheExe = Join-Path $sccacheDir 'sccache.exe'
+if (-not (Test-Path $sccacheExe)) {
+  $v = '0.10.0'
+  $tarball = Join-Path $env:TEMP "sccache-$v.tar.gz"
+  Invoke-WebRequest -Uri "https://github.com/mozilla/sccache/releases/download/v$v/sccache-v$v-x86_64-pc-windows-msvc.tar.gz" -OutFile $tarball
+  New-Item -ItemType Directory -Force -Path $sccacheDir | Out-Null
+  tar -xzf $tarball -C $sccacheDir --strip-components=1
+  Remove-Item $tarball -ErrorAction SilentlyContinue
+}
+& $sccacheExe --version
+if ($env:GITHUB_PATH) { Add-Content -Path $env:GITHUB_PATH -Value $sccacheDir }

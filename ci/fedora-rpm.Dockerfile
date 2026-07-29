@@ -66,3 +66,11 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
     | sh -s -- -y --no-modify-path --profile minimal \
     && chmod -R a+w "$RUSTUP_HOME" "$CARGO_HOME" \
     && rustc --version && cargo --version
+
+# Shared compile cache: jobs set RUSTC_WRAPPER=sccache (backend = RustFS S3 on the LAN,
+# see .gitea/workflows — the env lives there so dev use of this image stays uncached).
+# musl build: one static binary serves the Ubuntu and Fedora images alike.
+ARG SCCACHE_VERSION=0.10.0
+RUN curl -fsSL "https://github.com/mozilla/sccache/releases/download/v${SCCACHE_VERSION}/sccache-v${SCCACHE_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
+    | tar -xz --wildcards --strip-components=1 -C /usr/local/bin '*/sccache' \
+    && sccache --version

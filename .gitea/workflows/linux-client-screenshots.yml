@@ -19,6 +19,20 @@ on:
     tags: ["v*"]
   workflow_dispatch:
 
+# Shared compile cache: sccache -> RustFS S3 (storage.unom.io, LAN-pinned via ci-core's
+# unbound). Keys include compiler hash + target + flags, so cross-OS/arch entries can
+# never collide; every Rust job on every host feeds and reads one warm cache.
+env:
+  RUSTC_WRAPPER: sccache
+  SCCACHE_BUCKET: unom-ci-sccache
+  SCCACHE_ENDPOINT: https://storage.unom.io
+  SCCACHE_REGION: home-central
+  AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_SECRET_ACCESS_KEY }}
+  # sccache and incremental compilation are mutually exclusive; CI wants the shared
+  # cache, dev boxes keep incremental.
+  CARGO_INCREMENTAL: "0"
+
 jobs:
   screenshots:
     if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
@@ -29,6 +43,16 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
+
+      # Shared compile cache (sccache -> RustFS S3 over the LAN). Baked into the builder
+      # images; this fetch keeps the job green while the running :latest predates the bake.
+      - name: sccache (no-op once the image bakes it)
+        run: |
+          command -v sccache >/dev/null 2>&1 || {
+            curl -fsSL https://github.com/mozilla/sccache/releases/download/v0.10.0/sccache-v0.10.0-x86_64-unknown-linux-musl.tar.gz \
+              | tar -xz --wildcards --strip-components=1 -C /usr/local/bin '*/sccache'
+          }
+          sccache --version
 
       # Client link deps (baked into the image; kept here so the job is green across image
       # rebuilds — a no-op once present) PLUS the headless-render extras: a virtual X server,
