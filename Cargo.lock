@@ -3335,11 +3335,15 @@ name = "punktfunk-client-session"
 version = "0.21.0"
 dependencies = [
  "anyhow",
+ "async-channel",
  "glib-build-tools",
+ "gtk4",
+ "libadwaita",
  "pf-client-core",
  "pf-console-ui",
  "pf-presenter",
  "punktfunk-core",
+ "relm4",
  "serde_json",
  "tracing",
  "tracing-subscriber",
