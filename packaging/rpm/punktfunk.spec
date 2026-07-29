@@ -326,7 +326,6 @@ done
 install -Dm0755 target/release/punktfunk-client %{buildroot}%{_bindir}/punktfunk-client
 # The session streamer the shell execs for a connect (resolved as its sibling in %{_bindir}).
 install -Dm0755 target/release/punktfunk-session %{buildroot}%{_bindir}/punktfunk-session
-%{_bindir}/punktfunk
 # The headless CLI (design/client-architecture-split.md §4).
 install -Dm0755 target/release/punktfunk %{buildroot}%{_bindir}/punktfunk
 install -Dm0644 packaging/linux/io.unom.Punktfunk.desktop \
@@ -450,6 +449,7 @@ install -Dm0644 scripts/punktfunk-scripting.service %{buildroot}%{_userunitdir}/
 %license LICENSE-MIT LICENSE-APACHE THIRD-PARTY-NOTICES.txt
 %{_bindir}/punktfunk-client
 %{_bindir}/punktfunk-session
+%{_bindir}/punktfunk
 %{_datadir}/applications/io.unom.Punktfunk.desktop
 %{_datadir}/icons/hicolor/scalable/apps/io.unom.Punktfunk.svg
 %{_udevrulesdir}/70-punktfunk-client.rules
