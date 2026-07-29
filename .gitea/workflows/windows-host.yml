@@ -276,6 +276,18 @@ jobs:
           cargo clippy --release -- -D warnings; if ($LASTEXITCODE) { throw "pf-vkhdr-layer clippy" }
           Pop-Location
 
+      # The console output is fully self-contained (Nitro noExternals) and most pushes
+      # don't touch web/ or sdk/ — restore it from the central cache and skip the ~2.5 min
+      # bun build+smoke entirely on a hit. First workflow on this runner to use the
+      # actions cache at all (the runner's config.yaml needed cache.external_server —
+      # see unom/infra runners/ci-core/README.md).
+      - name: Cache web console output
+        id: webconsole
+        uses: actions/cache@v4
+        with:
+          path: web/.output
+          key: web-console-win-${{ hashFiles('web/**', 'sdk/**') }}
+
       - name: Fetch portable bun runtime (build tool + bundled to run the console)
         shell: pwsh
         run: |
@@ -295,6 +307,7 @@ jobs:
           & $bun --version
 
       - name: Build + smoke-boot web console (bun)
+        if: steps.webconsole.outputs.cache-hit != 'true'
         shell: pwsh
         env:
           # PAT with read access to the unom org packages — the @unom npm registry needs auth to BUILD.
@@ -354,6 +367,17 @@ jobs:
             throw "runner bundle missing the dynamic plugin import - wrong build"
           }
           "SCRIPTING_BUNDLE=C:\t\scripting\runner-cli.js" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      # The UMDF drivers build IN-TREE inside the pack step (a relocated CARGO_TARGET_DIR
+      # breaks wdk-build's manifest walk), and checkout's clean wipes that tree every run —
+      # ~1 min of rebuild for crates that rarely change. Cache the in-tree target; cargo's
+      # own fingerprints decide what's still fresh after a restore.
+      - name: Cache drivers workspace target (built in-tree by the pack step)
+        uses: actions/cache@v4
+        with:
+          path: packaging/windows/drivers/target
+          key: drivers-target-${{ hashFiles('packaging/windows/drivers/**', 'crates/pf-driver-proto/**') }}
+          restore-keys: drivers-target-
 
       - name: Pack + sign installer
         shell: pwsh
