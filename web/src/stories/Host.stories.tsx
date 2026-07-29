@@ -21,6 +21,34 @@ export const NoCompositors: Story = {
 	args: { compositors: { data: [], isLoading: false, error: null } },
 };
 
+/** A Windows host wears the Windows mark (and, correctly, has no compositors). */
+export const WindowsHost: Story = {
+	args: {
+		host: {
+			data: { ...hostInfo, os: "windows", os_name: "Windows" },
+			isLoading: false,
+			error: null,
+		},
+		compositors: { data: [], isLoading: false, error: null },
+	},
+};
+
+/** An unrecognized distro chain walks up to its family mark — here neither `chimera` nor
+ * `frontier` have art, so the icon degrades all the way to generic Tux. */
+export const UnknownDistro: Story = {
+	args: {
+		host: {
+			data: {
+				...hostInfo,
+				os: "linux/frontier/chimera",
+				os_name: "Chimera Linux",
+			},
+			isLoading: false,
+			error: null,
+		},
+	},
+};
+
 export const Loading: Story = {
 	args: {
 		host: { data: undefined, isLoading: true, error: null },

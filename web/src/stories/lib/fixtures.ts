@@ -22,6 +22,8 @@ export const hostInfo: HostInfo = {
 	gfe_version: "3.23.0.74",
 	hostname: "ENRICOS-DESKTOP",
 	local_ip: "192.168.1.173",
+	os: "linux/fedora/bazzite",
+	os_name: "Bazzite 42 (Kinoite)",
 	ports: {
 		audio: 48000,
 		control: 47999,

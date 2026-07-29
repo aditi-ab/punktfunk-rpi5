@@ -2,6 +2,7 @@ import Section from "@unom/ui/section";
 import type { FC, ReactNode } from "react";
 import type { AvailableCompositor } from "@/api/gen/model/availableCompositor";
 import type { HostInfo } from "@/api/gen/model/hostInfo";
+import { OsIcon } from "@/components/os-icon";
 import { QueryState } from "@/components/query-state";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -34,6 +35,14 @@ export const HostView: FC<{
 								<CardContent>
 									<dl className="grid grid-cols-1 gap-3">
 										<Row label={m.host_hostname()} value={h.hostname} />
+										{/* The OS mark resolves from the identity chain (h.os), which also
+										    serves as the tooltip for the curious; the text is the pretty name. */}
+										<Row
+											label={m.host_os()}
+											value={h.os_name}
+											title={h.os}
+											icon={<OsIcon os={h.os} className="size-4 shrink-0" />}
+										/>
 										<Row label={m.host_local_ip()} value={h.local_ip} mono />
 										<Row
 											label={m.host_version()}
@@ -137,17 +146,22 @@ export const HostView: FC<{
 	);
 };
 
-const Row: FC<{ label: string; value: string; mono?: boolean }> = ({
-	label,
-	value,
-	mono,
-}) => (
+const Row: FC<{
+	label: string;
+	value: string;
+	mono?: boolean;
+	/** Optional leading glyph inside the value cell (the OS mark). */
+	icon?: ReactNode;
+	/** Tooltip override — defaults to the value itself (which may be truncated). */
+	title?: string;
+}> = ({ label, value, mono, icon, title }) => (
 	<div className="flex items-baseline justify-between gap-4">
 		<dt className="text-sm text-muted-foreground">{label}</dt>
 		<dd
-			className={mono ? "truncate font-mono text-xs" : "font-medium"}
-			title={value}
+			className={`${mono ? "truncate font-mono text-xs" : "font-medium"}${icon ? " flex items-center gap-2" : ""}`}
+			title={title ?? value}
 		>
+			{icon}
 			{value}
 		</dd>
 	</div>

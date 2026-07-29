@@ -35,6 +35,7 @@
   "action_unpair": "Entkoppeln",
   "host_identity": "Identität",
   "host_hostname": "Hostname",
+  "host_os": "Betriebssystem",
   "host_local_ip": "Lokale IP",
   "host_version": "Version",
   "host_abi": "ABI-Version",

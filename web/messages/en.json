@@ -35,6 +35,7 @@
   "action_unpair": "Unpair",
   "host_identity": "Identity",
   "host_hostname": "Hostname",
+  "host_os": "Operating system",
   "host_local_ip": "Local IP",
   "host_version": "Version",
   "host_abi": "ABI version",
