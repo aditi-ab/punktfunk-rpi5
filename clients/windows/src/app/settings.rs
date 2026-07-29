@@ -518,58 +518,47 @@ fn described_overridable(
     control: impl Into<Element>,
     caption: &str,
 ) -> Element {
-    if scope.is_empty() {
+    if scope.is_empty() || !overridden {
         return described(control, caption);
     }
-    // Nothing that appears on an edit may move what was edited (the GTK client's rule,
-    // learned there the hard way): both states of a profile-scope row reserve the same
-    // caption-line height, so the marker + Reset materialise IN PLACE instead of shoving
-    // every row below them down by a button's height.
-    const CAPTION_MIN_H: f64 = 34.0;
-    if !overridden {
-        return vstack((
-            control.into(),
-            hstack(vec![text_block(caption)
-                .font_size(12.0)
-                .foreground(ThemeRef::SecondaryText)
-                .wrap()
-                .max_width(420.0)
-                .horizontal_alignment(HorizontalAlignment::Left)
-                .vertical_alignment(VerticalAlignment::Center)
-                .into()])
-            .min_height(CAPTION_MIN_H),
-        ))
-        .spacing(5.0)
-        .into();
-    }
+    // The override marker lives on the CONTROL's line, not in the caption: a small tinted
+    // "Overridden" chip and the Reset button sit to the control's right, bottom-aligned to
+    // its box. The caption below stays plain and identical in both states — appearing to
+    // the SIDE means nothing moves and the description stays a description (the mixed
+    // marker-plus-caption line read as neither).
     let (rev, set_rev) = (rev.0, rev.1.clone());
     let scope = scope.to_string();
     vstack((
-        control.into(),
         hstack((
-            text_block(format!("\u{25cf} Overridden here \u{00b7} {caption}"))
-                .font_size(12.0)
-                .foreground(ThemeRef::AccentText)
-                .wrap()
-                .max_width(360.0)
-                .horizontal_alignment(HorizontalAlignment::Left)
-                .vertical_alignment(VerticalAlignment::Center),
-            button("Reset").icon(Symbol::Undo).on_click(move || {
-                let mut catalog = ProfilesFile::load();
-                if let Some(p) = catalog.profiles.iter_mut().find(|p| p.id == scope) {
-                    p.overrides.clear(field);
-                    if let Err(e) = catalog.save() {
-                        tracing::warn!(error = %format!("{e:#}"), "clearing an override");
+            control.into(),
+            pill("Overridden", Pill::Info)
+                .vertical_alignment(VerticalAlignment::Bottom)
+                .margin(edges(0.0, 0.0, 0.0, 5.0)),
+            button("Reset")
+                .icon(Symbol::Undo)
+                .tooltip("Back to inheriting from Default settings")
+                .vertical_alignment(VerticalAlignment::Bottom)
+                .on_click(move || {
+                    let mut catalog = ProfilesFile::load();
+                    if let Some(p) = catalog.profiles.iter_mut().find(|p| p.id == scope) {
+                        p.overrides.clear(field);
+                        if let Err(e) = catalog.save() {
+                            tracing::warn!(error = %format!("{e:#}"), "clearing an override");
+                        }
                     }
-                }
-                // The catalog changed behind the controls, and nothing the page reads as
-                // state did — bump the revision so the row re-renders showing the inherited
-                // value again.
-                set_rev.call(rev + 1);
-            }),
+                    // The catalog changed behind the controls, and nothing the page reads
+                    // as state did — bump the revision so the row re-renders showing the
+                    // inherited value again.
+                    set_rev.call(rev + 1);
+                }),
         ))
-        .spacing(8.0)
-        .min_height(CAPTION_MIN_H),
+        .spacing(8.0),
+        text_block(caption)
+            .font_size(12.0)
+            .foreground(ThemeRef::SecondaryText)
+            .wrap()
+            .max_width(420.0)
+            .horizontal_alignment(HorizontalAlignment::Left),
     ))
     .spacing(5.0)
     .into()
@@ -607,7 +596,13 @@ fn group_heading(label: &str) -> Element {
 
 /// One settings group: an optional sub-section label, a card of fields, and an optional
 /// form-level note under it (Apple's Section header/footer). Groups stack down the page.
+/// A group with NO fields renders NOTHING — several groups pass an empty list in profile
+/// scope (Decoding, Library: device facts, never per profile), and a heading over an empty
+/// card read as a bug.
 fn group(header: Option<&str>, fields: Vec<Element>, footer: Option<&str>) -> Vec<Element> {
+    if fields.is_empty() {
+        return Vec::new();
+    }
     let mut out = Vec::with_capacity(3);
     if let Some(h) = header {
         out.push(group_heading(h));
@@ -1484,68 +1479,83 @@ pub(crate) fn settings_page(
     .opacity(progress)
     .margin(edges(0.0, (1.0 - progress) * 22.0, 0.0, 0.0));
     let content: Element = scrolled.into();
-    // The delete confirmation, when armed. Declarative, like every other dialog in this shell:
-    // it is an element in the tree with `is_open`, not a call.
-    let confirm: Option<Element> = delete_pending.as_ref().and_then(|id| {
-        let p = ProfilesFile::load().find_by_id(id).cloned()?;
-        // The warning counts what actually breaks: hosts that fall back to the defaults, and
-        // pinned cards that disappear (design §6).
-        let known = KnownHosts::load();
-        let bound = known
-            .hosts
-            .iter()
-            .filter(|h| h.profile_id.as_deref() == Some(p.id.as_str()))
-            .count();
-        let pinned = known
-            .hosts
-            .iter()
-            .filter(|h| h.pinned_profiles.iter().any(|x| x == &p.id))
-            .count();
-        let mut body = format!("\u{201c}{}\u{201d} will be removed.", p.name);
-        if bound > 0 {
-            body.push_str(&format!(
-                " {bound} host{} will fall back to Default settings.",
-                if bound == 1 { "" } else { "s" }
-            ));
-        }
-        if pinned > 0 {
-            body.push_str(&format!(
-                " {pinned} pinned card{} will disappear.",
-                if pinned == 1 { "" } else { "s" }
-            ));
-        }
+    // The delete confirmation. Declarative like every dialog in this shell — but ALWAYS
+    // MOUNTED, with `is_open` doing the arming: a ContentDialog is a "phantom" child in the
+    // reactor backend (tracked logically, never attached to the panel), and unmounting one
+    // destroys its handle before `remove_child` runs, so the backend stops recognising it
+    // as phantom and RemoveAt()s a visual child that does not exist — E_BOUNDS, main-thread
+    // panic ("Daten außerhalb des gültigen Bereichs"), reliably on every delete. A mounted
+    // dialog is never removed, so the bug has nothing to bite. (Upstream report material —
+    // the third windows-reactor bug this client documents.)
+    let confirm: Element = {
+        let pending = delete_pending
+            .as_ref()
+            .and_then(|id| ProfilesFile::load().find_by_id(id).cloned());
+        // The warning counts what actually breaks: hosts that fall back to the defaults,
+        // and pinned cards that disappear (design §6).
+        let body = pending
+            .as_ref()
+            .map(|p| {
+                let known = KnownHosts::load();
+                let bound = known
+                    .hosts
+                    .iter()
+                    .filter(|h| h.profile_id.as_deref() == Some(p.id.as_str()))
+                    .count();
+                let pinned = known
+                    .hosts
+                    .iter()
+                    .filter(|h| h.pinned_profiles.iter().any(|x| x == &p.id))
+                    .count();
+                let mut body = format!("\u{201c}{}\u{201d} will be removed.", p.name);
+                if bound > 0 {
+                    body.push_str(&format!(
+                        " {bound} host{} will fall back to Default settings.",
+                        if bound == 1 { "" } else { "s" }
+                    ));
+                }
+                if pinned > 0 {
+                    body.push_str(&format!(
+                        " {pinned} pinned card{} will disappear.",
+                        if pinned == 1 { "" } else { "s" }
+                    ));
+                }
+                body
+            })
+            .unwrap_or_default();
         let (id, set_scope, set_delete, set_edit) = (
-            p.id.clone(),
+            pending.as_ref().map(|p| p.id.clone()),
             set_scope.clone(),
             set_delete.clone(),
             set_edit.clone(),
         );
-        Some(
-            ContentDialog::new("Delete profile?")
-                .content(body)
-                .primary_button_text("Delete")
-                .close_button_text("Cancel")
-                .is_open(true)
-                .on_closed(move |r: ContentDialogResult| {
-                    set_delete.call(None);
-                    if r != ContentDialogResult::Primary {
-                        return;
-                    }
-                    let mut catalog = ProfilesFile::load();
-                    catalog.profiles.retain(|p| p.id != id);
-                    // Bindings and pins are left dangling on purpose: they resolve as "no
-                    // profile" everywhere, and rewriting every host record here would be a
-                    // second, racier source of truth.
-                    if catalog.save().is_ok() {
-                        set_scope.call(String::new());
-                        // The profile the Edit modal was showing is gone — without this, the
-                        // still-armed flag would pop the modal open on the NEXT profile pick.
-                        set_edit.call(false);
-                    }
-                })
-                .into(),
-        )
-    });
+        ContentDialog::new("Delete profile?")
+            .content(body)
+            .primary_button_text("Delete")
+            .close_button_text("Cancel")
+            .is_open(pending.is_some())
+            .on_closed(move |r: ContentDialogResult| {
+                set_delete.call(None);
+                if r != ContentDialogResult::Primary {
+                    return;
+                }
+                let Some(id) = id.clone() else {
+                    return;
+                };
+                let mut catalog = ProfilesFile::load();
+                catalog.profiles.retain(|p| p.id != id);
+                // Bindings and pins are left dangling on purpose: they resolve as "no
+                // profile" everywhere, and rewriting every host record here would be a
+                // second, racier source of truth.
+                if catalog.save().is_ok() {
+                    set_scope.call(String::new());
+                    // The profile the sheet was showing is gone — without this, the
+                    // still-armed flag would pop the sheet open on the NEXT profile pick.
+                    set_edit.call(false);
+                }
+            })
+            .into()
+    };
     let nav = NavigationView::new(items, content)
         .pane_title("Settings")
         .selected_tag(section)
@@ -1560,14 +1570,16 @@ pub(crate) fn settings_page(
             move || ss.call(Screen::Hosts)
         });
     // Overlay layers fill the NAV's cell (grids stretch children; a vstack would hand the
-    // NavigationView its desired height — clipped short, floating tall): the nav, the
-    // profile-sheet scrim + card over it, and the delete confirmation (a ContentDialog, its
-    // own WinUI layer, so its slot is irrelevant — it just needs to be in the tree).
-    let mut layers: Vec<Element> = vec![nav.into()];
-    // The profile sheet — "Edit profile…" in the bar. The bar owns the scope choice, so
-    // the sheet carries only the profile being edited.
-    if edit_open && profile_mode {
-        layers.push(edit_profile_modal(
+    // NavigationView its desired height — clipped short, floating tall). The layer list is
+    // STABLE — always [nav, sheet slot, dialog] — so no pass ever removes a grid child:
+    // removals are where the reconciler's phantom-dialog bookkeeping breaks (see `confirm`
+    // above), and a closed sheet leaves a same-kind, background-less Border in its slot
+    // (invisible, and per style.rs a null background is not hit-testable, so it swallows
+    // no clicks).
+    let sheet_slot: Element = if edit_open && profile_mode {
+        // The profile sheet — "Edit profile…" in the bar. The bar owns the scope choice,
+        // so the sheet carries only the profile being edited.
+        edit_profile_modal(
             active.as_ref(),
             None,
             set_scope,
@@ -1575,16 +1587,15 @@ pub(crate) fn settings_page(
             set_edit,
             rev,
             set_rev,
-        ));
-    }
-    if let Some(dialog) = confirm {
-        layers.push(dialog);
-    }
+        )
+    } else {
+        border(vstack(Vec::<Element>::new())).into()
+    };
     // The bar rides an Auto row above the nav's Star row, so the nav (and the sheet's scrim
     // over it) still fills the rest of the window.
     grid(vec![
         scope_bar.grid_row(0),
-        Element::from(grid(layers)).grid_row(1),
+        Element::from(grid(vec![nav.into(), sheet_slot, confirm])).grid_row(1),
     ])
     .rows([GridLength::Auto, GridLength::STAR])
     .into()

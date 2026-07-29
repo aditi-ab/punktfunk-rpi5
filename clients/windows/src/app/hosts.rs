@@ -168,20 +168,26 @@ pub(crate) struct Hover {
 }
 
 /// The status row at the bottom of a tile: the host's OS mark (when advertised), presence
-/// dot + Online/Offline, plus the trust chip.
-fn status_row(os: &str, online: Option<bool>, badge: &str, kind: Pill) -> Element {
-    status_row_with(os, online, badge, kind, None)
+/// dot + Online/Offline, plus a trust chip only where it says something (see
+/// [`status_row_with`]).
+fn status_row(os: &str, online: Option<bool>, badge: Option<(&str, Pill)>) -> Element {
+    status_row_with(os, online, badge, None)
 }
 
-/// [`status_row`] plus the profile chip: what a plain click on THIS tile will use — its own
+/// [`status_row`] plus the profile: what a plain click on THIS tile will use — its own
 /// profile on a pinned tile, the host's binding on the primary one. A binding whose profile
 /// was deleted shows nothing and resolves as the defaults, which is what will happen on
 /// connect (design §6).
+///
+/// The row is METADATA, not a badge shelf — three chips side by side read as noise. Paired
+/// is the normal resting state of a saved host, so it earns NO chip at all; a chip appears
+/// only where it carries a decision ("Trusted" = TOFU without pairing, "PIN"/"Open" on a
+/// discovered host). The profile is a small dot in the profile's own colour plus its name
+/// in plain caption text — recognisable at a glance without competing with the host name.
 fn status_row_with(
     os: &str,
     online: Option<bool>,
-    badge: &str,
-    kind: Pill,
+    badge: Option<(&str, Pill)>,
     profile: Option<(&str, Option<String>)>,
 ) -> Element {
     let mut items: Vec<Element> = Vec::new();
@@ -212,29 +218,45 @@ fn status_row_with(
                 .into(),
         );
     }
-    items.push(
-        pill(badge, kind)
-            .vertical_alignment(VerticalAlignment::Center)
-            .into(),
-    );
+    if let Some((badge, kind)) = badge {
+        items.push(
+            pill(badge, kind)
+                .vertical_alignment(VerticalAlignment::Center)
+                .into(),
+        );
+    }
     if let Some((name, accent)) = profile {
-        // A profile's own colour where it has one, the neutral chip where it doesn't — the
+        // The profile's own colour where it has one, a neutral disc where it doesn't — the
         // palette stays opt-in, and an unparsable value falls back rather than being trusted.
-        let chip = match accent.as_deref().and_then(super::settings::hex_color) {
-            Some(colour) => border(
-                text_block(name)
-                    .font_size(11.0)
-                    .semibold()
-                    .foreground(colour),
-            )
-            .background(Color { a: 46, ..colour })
-            .border_brush(ThemeRef::CardStroke)
-            .border_thickness(uniform(1.0))
-            .corner_radius(10.0)
-            .padding(edges(9.0, 2.0, 9.0, 2.0)),
-            None => pill(name, Pill::Neutral),
-        };
-        items.push(chip.vertical_alignment(VerticalAlignment::Center).into());
+        let colour = accent
+            .as_deref()
+            .and_then(super::settings::hex_color)
+            .unwrap_or(Color {
+                a: 120,
+                r: 128,
+                g: 128,
+                b: 128,
+            });
+        items.push(
+            border(vstack(Vec::<Element>::new()).width(8.0).height(8.0))
+                .background(colour)
+                .corner_radius(4.0)
+                .margin(edges(
+                    if items.is_empty() { 0.0 } else { 4.0 },
+                    0.0,
+                    0.0,
+                    0.0,
+                ))
+                .vertical_alignment(VerticalAlignment::Center)
+                .into(),
+        );
+        items.push(
+            text_block(name)
+                .font_size(11.0)
+                .foreground(ThemeRef::SecondaryText)
+                .vertical_alignment(VerticalAlignment::Center)
+                .into(),
+        );
     }
     hstack(items)
         .spacing(6.0)
@@ -809,9 +831,9 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                 status_row_with(
                     &k.os,
                     Some(online),
-                    if k.paired { "Paired" } else { "Trusted" },
-                    if k.paired { Pill::Good } else { Pill::Info },
-                    // The chip carries the profile's own colour where it has one —
+                    // Paired is the resting state — no chip; TOFU-only trust is worth one.
+                    (!k.paired).then_some(("Trusted", Pill::Info)),
+                    // The dot carries the profile's own colour where it has one —
                     // that is what makes two bound hosts tell apart at a glance.
                     k.profile_id
                         .as_ref()
@@ -853,8 +875,7 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                     status_row_with(
                         &k.os,
                         Some(online),
-                        if k.paired { "Paired" } else { "Trusted" },
-                        if k.paired { Pill::Good } else { Pill::Info },
+                        (!k.paired).then_some(("Trusted", Pill::Info)),
                         Some((name.as_str(), accent.clone())),
                     ),
                     None,
@@ -916,7 +937,7 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                 &hover,
                 &h.name,
                 &format!("{}:{}", h.addr, h.port),
-                status_row(&h.os, None, badge, kind),
+                status_row(&h.os, None, Some((badge, kind))),
                 None,
                 Some(Box::new(move || initiate(&ctx2, target.clone(), &ss, &st))),
             ));
@@ -924,35 +945,45 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
         body.push(tile_grid(tiles, cols, TILE_GAP));
     }
 
-    // Forget confirmation (modal; shown while `forget` holds a pending host). Confirmed first,
-    // since it's destructive and re-establishing trust needs a fresh pairing.
-    if let Some((fp, name)) = forget {
+    // Forget confirmation, armed while `forget` holds a pending host. ALWAYS MOUNTED with
+    // `is_open` doing the arming, and in a STABLE trailing layer rather than in `body`
+    // (whose child list shifts with discovery): unmounting — or positionally re-pairing —
+    // a ContentDialog trips the reactor backend's phantom-child bookkeeping (the handle
+    // dies before `remove_child` runs, the dialog stops being recognised as phantom, and a
+    // visual child that never existed gets RemoveAt()'d — E_BOUNDS panic; see the
+    // delete-profile dialog in settings.rs). Confirmed first, since it's destructive and
+    // re-establishing trust needs a fresh pairing.
+    let forget_confirm: Element = {
         let sf = set_forget.clone();
-        body.push(
-            ContentDialog::new("Remove saved host?")
-                .content(format!(
+        let pending = forget.clone();
+        let content = pending
+            .as_ref()
+            .map(|(_, name)| {
+                format!(
                     "Forget \u{201C}{name}\u{201D}? You'll need to pair (or trust) it again to \
                      reconnect."
-                ))
-                .primary_button_text("Remove")
-                .close_button_text("Cancel")
-                .is_open(true)
-                .on_closed(move |r: ContentDialogResult| {
-                    if r == ContentDialogResult::Primary {
+                )
+            })
+            .unwrap_or_default();
+        ContentDialog::new("Remove saved host?")
+            .content(content)
+            .primary_button_text("Remove")
+            .close_button_text("Cancel")
+            .is_open(pending.is_some())
+            .on_closed(move |r: ContentDialogResult| {
+                if r == ContentDialogResult::Primary {
+                    if let Some((fp, _)) = &pending {
                         let mut known = KnownHosts::load();
-                        known.remove_by_fp(&fp);
+                        known.remove_by_fp(fp);
                         let _ = known.save();
                     }
-                    sf.call(None); // re-renders the page; the row is gone on the next load
-                })
-                .into(),
-        );
-    }
+                }
+                sf.call(None); // re-renders the page; the row is gone on the next load
+            })
+            .into()
+    };
 
     let page = page_wide(body);
-    if !show_add {
-        return page;
-    }
 
     // "Add host" modal: a scrim + centered card. It's an in-tree overlay, not a WinUI
     // ContentDialog, because ContentDialog is text-only in windows-reactor (no room for a text
@@ -1044,12 +1075,20 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
         24.0,
     ));
 
-    // The scrim fades in with the same tween.
-    let scrim = border(modal).background(Color {
-        a: (140.0 * props.add_anim) as u8,
-        r: 0,
-        g: 0,
-        b: 0,
-    });
-    grid(vec![page, scrim.into()]).into()
+    // The scrim fades in with the same tween. Its layer slot is STABLE (a same-kind,
+    // background-less Border when closed — invisible and not hit-testable) so the layer
+    // list never changes shape around the always-mounted dialog after it.
+    let add_slot: Element = if show_add {
+        border(modal)
+            .background(Color {
+                a: (140.0 * props.add_anim) as u8,
+                r: 0,
+                g: 0,
+                b: 0,
+            })
+            .into()
+    } else {
+        border(vstack(Vec::<Element>::new())).into()
+    };
+    grid(vec![page, add_slot, forget_confirm]).into()
 }
