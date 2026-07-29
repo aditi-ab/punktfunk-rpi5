@@ -118,10 +118,90 @@ const NEW_PROFILE: &str = "\u{1}new";
 /// Rename / duplicate / delete for the profile in scope. Rename is a text box rather than a
 /// modal because this toolkit's ContentDialog is text-only (the same constraint that put the
 /// host editor in a tile); it commits on change, which is how every other control here works.
+/// The chip palette a profile can carry (`StreamProfile.accent`), same set as the GTK client so
+/// a profile looks the same on both. Eight legible colours rather than a free picker: the job is
+/// telling profiles apart at a glance on a host tile, and the schema still accepts any
+/// `#RRGGBB` a hand-edit writes.
+const SWATCHES: &[(&str, &str)] = &[
+    ("", "None"),
+    ("#e01b24", "Red"),
+    ("#ff7800", "Orange"),
+    ("#f6d32d", "Yellow"),
+    ("#33d17a", "Green"),
+    ("#3584e4", "Blue"),
+    ("#9141ac", "Purple"),
+    ("#d16d9e", "Pink"),
+    ("#77767b", "Slate"),
+];
+
+/// `#RRGGBB` to a brush colour. Anything else is refused rather than guessed at — the value is
+/// user data and reaches the renderer.
+pub(crate) fn hex_color(hex: &str) -> Option<Color> {
+    let h = hex.strip_prefix('#')?;
+    if h.len() != 6 || !h.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(Color {
+        a: 255,
+        r: u8::from_str_radix(&h[0..2], 16).ok()?,
+        g: u8::from_str_radix(&h[2..4], 16).ok()?,
+        b: u8::from_str_radix(&h[4..6], 16).ok()?,
+    })
+}
+
+/// The colour row: one tappable swatch per palette entry, the current one ringed.
+fn colour_swatches(profile: &StreamProfile, rev: u64, set_rev: &AsyncSetState<u64>) -> Element {
+    let current = profile.accent.clone().unwrap_or_default();
+    let mut row: Vec<Element> = vec![text_block("Colour")
+        .font_size(12.0)
+        .foreground(ThemeRef::SecondaryText)
+        .vertical_alignment(VerticalAlignment::Center)
+        .margin(edges(0.0, 0.0, 6.0, 0.0))
+        .into()];
+    for (hex, name) in SWATCHES {
+        let selected = current == *hex;
+        // "None" (and anything unparsable) draws as a faint neutral disc, so the row still
+        // reads as a palette with a clear "no colour" end.
+        let fill = hex_color(hex).unwrap_or(Color {
+            a: 40,
+            r: 128,
+            g: 128,
+            b: 128,
+        });
+        let (id, set_rev, hex_owned) = (profile.id.clone(), set_rev.clone(), hex.to_string());
+        row.push(
+            border(vstack(Vec::<Element>::new()).width(20.0).height(20.0))
+                .background(fill)
+                .corner_radius(10.0)
+                .border_brush(if selected {
+                    ThemeRef::Accent
+                } else {
+                    ThemeRef::CardStroke
+                })
+                .border_thickness(uniform(if selected { 2.0 } else { 1.0 }))
+                .tooltip(*name)
+                .on_tapped(move || {
+                    let mut catalog = ProfilesFile::load();
+                    if let Some(p) = catalog.profiles.iter_mut().find(|p| p.id == id) {
+                        p.accent = (!hex_owned.is_empty()).then(|| hex_owned.clone());
+                        if let Err(e) = catalog.save() {
+                            tracing::warn!(error = %format!("{e:#}"), "saving the profile colour");
+                        }
+                    }
+                    set_rev.call(rev + 1);
+                })
+                .into(),
+        );
+    }
+    hstack(row).spacing(8.0).into()
+}
+
 fn profile_actions(
     profile: &StreamProfile,
     set_scope: &AsyncSetState<String>,
     set_delete: &AsyncSetState<Option<String>>,
+    rev: u64,
+    set_rev: &AsyncSetState<u64>,
 ) -> Element {
     let id = profile.id.clone();
     let name_box = {
@@ -171,7 +251,12 @@ fn profile_actions(
         button("Delete\u{2026}").on_click(move || set_delete.call(Some(id.clone())))
     };
     described(
-        vstack((name_box, hstack((duplicate, delete)).spacing(8.0))).spacing(8.0),
+        vstack((
+            name_box,
+            colour_swatches(profile, rev, set_rev),
+            hstack((duplicate, delete)).spacing(8.0),
+        ))
+        .spacing(10.0),
         "Renaming applies as you type. Deleting leaves hosts that used it on Default settings.",
     )
 }
@@ -1067,10 +1152,18 @@ pub(crate) fn settings_page(
         "A profile overrides only what you change while it is selected; everything else \
          follows Default settings.",
     );
-    let mut header_rows = vec![switcher];
+    // The switcher is CHROME, not a setting: it belongs above the whole surface, so it reads as
+    // "which layer am I editing" and is visible from every section. Inside the section content
+    // it looked like one more row — and on the About page, where there are barely any rows, it
+    // looked like it lived there.
+    let mut bar_rows: Vec<Element> = vec![switcher];
     if let Some(p) = &active {
-        header_rows.push(profile_actions(p, set_scope, set_delete));
+        bar_rows.push(profile_actions(p, set_scope, set_delete, rev, set_rev));
     }
+    let scope_bar = card(vstack(bar_rows).spacing(10.0))
+        .margin(edges(24.0, 12.0, 24.0, 0.0))
+        .into();
+
     let titled: Vec<Element> = std::iter::once(
         text_block(title)
             .font_size(28.0)
@@ -1079,7 +1172,6 @@ pub(crate) fn settings_page(
             .margin(edges(0.0, 0.0, 0.0, 6.0))
             .into(),
     )
-    .chain(group(None, header_rows, None))
     .chain(groups)
     .collect();
     // The keyed column MUST sit inside a panel's child list, not directly under the
@@ -1171,8 +1263,9 @@ pub(crate) fn settings_page(
             let ss = set_screen.clone();
             move || ss.call(Screen::Hosts)
         });
-    match confirm {
-        Some(dialog) => vstack(vec![nav.into(), dialog]).into(),
-        None => nav.into(),
+    let mut surface: Vec<Element> = vec![scope_bar, nav.into()];
+    if let Some(dialog) = confirm {
+        surface.push(dialog);
     }
+    vstack(surface).into()
 }

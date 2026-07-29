@@ -24,8 +24,6 @@ const MENU_EDIT: &str = "Edit\u{2026}";
 /// items matched by prefix. The trailing space keeps them readable AND keeps a profile named
 /// e.g. "Copy link" from colliding with a fixed entry.
 const MENU_WITH: &str = "Connect with: ";
-const MENU_PIN: &str = "Pin as card: ";
-const MENU_UNPIN: &str = "Unpin card: ";
 const MENU_COPY_LINK: &str = "Copy link";
 const MENU_SHORTCUT: &str = "Create shortcut\u{2026}";
 const MENU_FORGET: &str = "Forget\u{2026}";
@@ -182,7 +180,7 @@ fn status_row_with(
     online: Option<bool>,
     badge: &str,
     kind: Pill,
-    profile: Option<(&str, Pill)>,
+    profile: Option<(&str, Option<String>)>,
 ) -> Element {
     let mut items: Vec<Element> = Vec::new();
     if let Some(online) = online {
@@ -204,12 +202,24 @@ fn status_row_with(
             .vertical_alignment(VerticalAlignment::Center)
             .into(),
     );
-    if let Some((name, kind)) = profile {
-        items.push(
-            pill(name, kind)
-                .vertical_alignment(VerticalAlignment::Center)
-                .into(),
-        );
+    if let Some((name, accent)) = profile {
+        // A profile's own colour where it has one, the neutral chip where it doesn't — the
+        // palette stays opt-in, and an unparsable value falls back rather than being trusted.
+        let chip = match accent.as_deref().and_then(super::settings::hex_color) {
+            Some(colour) => border(
+                text_block(name)
+                    .font_size(11.0)
+                    .semibold()
+                    .foreground(colour),
+            )
+            .background(Color { a: 46, ..colour })
+            .border_brush(ThemeRef::CardStroke)
+            .border_thickness(uniform(1.0))
+            .corner_radius(10.0)
+            .padding(edges(9.0, 2.0, 9.0, 2.0)),
+            None => pill(name, Pill::Neutral),
+        };
+        items.push(chip.vertical_alignment(VerticalAlignment::Center).into());
     }
     hstack(items)
         .spacing(6.0)
@@ -315,6 +325,53 @@ fn edit_editor(
                 }
             })
     };
+    // Pinned tiles: which profiles get their own one-click tile for this host. They used to be
+    // two more flat entries in the tile's flyout, which is what tipped that menu over — and this
+    // is where they belong anyway, beside the default they sit next to (design §5.2a). Each
+    // switch writes immediately, like the profile picker above and unlike the text fields, which
+    // need a Save because they have drafts.
+    let pin_switches: Element = {
+        let catalog = pf_client_core::profiles::ProfilesFile::load();
+        let stored = KnownHosts::load()
+            .hosts
+            .iter()
+            .find(|h| h.fp_hex == fp)
+            .cloned();
+        if catalog.profiles.is_empty() {
+            vstack(Vec::<Element>::new()).into()
+        } else {
+            let mut rows: Vec<Element> = vec![text_block("Pinned tiles")
+                .font_size(12.0)
+                .foreground(ThemeRef::SecondaryText)
+                .horizontal_alignment(HorizontalAlignment::Left)
+                .into()];
+            for p in &catalog.profiles {
+                let on = stored
+                    .as_ref()
+                    .is_some_and(|h| h.pinned_profiles.iter().any(|id| id == &p.id));
+                let (fp, id) = (fp.to_string(), p.id.clone());
+                rows.push(
+                    ToggleSwitch::new(on)
+                        .header(&p.name)
+                        .on_content("Shown")
+                        .off_content("Hidden")
+                        .on_toggled(move |v: bool| {
+                            let mut known = KnownHosts::load();
+                            if let Some(h) = known.hosts.iter_mut().find(|h| h.fp_hex == fp) {
+                                h.pinned_profiles.retain(|x| x != &id);
+                                if v {
+                                    h.pinned_profiles.push(id.clone());
+                                }
+                                let _ = known.save();
+                            }
+                        })
+                        .into(),
+                );
+            }
+            vstack(rows).spacing(6.0).into()
+        }
+    };
+
     let field = |label: &str, value: String, placeholder: &str, draft: HookRef<String>| {
         vstack((
             text_block(label)
@@ -358,6 +415,7 @@ fn edit_editor(
                 .horizontal_alignment(HorizontalAlignment::Left),
             ))
             .spacing(4.0),
+            pin_switches,
             vstack((
                 ToggleSwitch::new(clip0)
                     .header("Share clipboard with this host")
@@ -559,11 +617,12 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
         body.push(section("SAVED HOSTS"));
         let mut tiles: Vec<Element> = Vec::new();
         // One catalog read per render, shared by every tile's menu and chip.
-        let profiles: Vec<(String, String)> = pf_client_core::profiles::ProfilesFile::load()
-            .profiles
-            .into_iter()
-            .map(|p| (p.id, p.name))
-            .collect();
+        let profiles: Vec<(String, String, Option<String>)> =
+            pf_client_core::profiles::ProfilesFile::load()
+                .profiles
+                .into_iter()
+                .map(|p| (p.id, p.name, p.accent))
+                .collect();
         for k in &known.hosts {
             // Rust 2021 (no let-chains): match the "this tile is being edited" case explicitly.
             if matches!(&rename, Some((fp, _)) if fp == &k.fp_hex) {
@@ -618,40 +677,42 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                     .tooltip("More options")
                     .automation_name("More options")
                     .menu_flyout({
+                        // Kept short deliberately, and in sections. It had grown into a list of
+                        // everything, with the entries you actually reach for (connect, library,
+                        // speed) buried in list management. Two rules thin it: anything that
+                        // CONFIGURES the host lives in the editor — the default profile and the
+                        // pinned tiles are properties of the record, and the editor is where you
+                        // already go to change its name or address — and what is left is
+                        // grouped, so a glance lands on the right third of the menu.
                         let mut items = vec![menu_item(MENU_CONNECT)];
-                        // One-off connects, flat: this flyout has no submenus, so each
-                        // profile is its own item. "Connect with" NEVER rebinds — the default
-                        // is changed in the host editor (design §5.2).
-                        for (_, name) in profiles.iter() {
+                        // One-off connects, flat: this flyout has no submenus, so each profile
+                        // is its own item. "Connect with" NEVER rebinds the host.
+                        for (_, name, _) in profiles.iter() {
                             items.push(menu_item(format!("{MENU_WITH}{name}")));
                         }
                         if !profiles.is_empty() {
                             items.push(menu_item(format!("{MENU_WITH}Default settings")));
-                            for (id, name) in profiles.iter() {
-                                let label = if k.pinned_profiles.iter().any(|p| p == id) {
-                                    format!("{MENU_UNPIN}{name}")
-                                } else {
-                                    format!("{MENU_PIN}{name}")
-                                };
-                                items.push(menu_item(label));
-                            }
                         }
-                        items.push(menu_item(MENU_COPY_LINK));
-                        items.push(menu_item(MENU_SHORTCUT));
-                        // The library surfaces — mouse/KB page and the gamepad console UI —
-                        // for paired hosts only (the mgmt API needs the paired identity);
-                        // the page additionally sits behind the experimental toggle, the
-                        // console UI behind the x64-only skia build.
+
+                        items.push(menu_separator());
+                        // The library surfaces — mouse/KB page and the gamepad console UI — for
+                        // paired hosts only (the mgmt API needs the paired identity); the page
+                        // additionally sits behind the experimental toggle.
                         if library_enabled && k.paired {
                             items.push(menu_item(MENU_LIBRARY));
                         }
                         items.push(menu_item(MENU_SPEED));
-                        // Offer an explicit wake only when the host is offline and we have a MAC.
+                        // An explicit wake only when the host is offline and we have a MAC.
                         if can_wake {
                             items.push(menu_item(MENU_WAKE));
                         }
-                        items.push(menu_item(MENU_EDIT));
+
                         items.push(menu_separator());
+                        items.push(menu_item(MENU_COPY_LINK));
+                        items.push(menu_item(MENU_SHORTCUT));
+
+                        items.push(menu_separator());
+                        items.push(menu_item(MENU_EDIT));
                         items.push(menu_item(MENU_FORGET));
                         items
                     })
@@ -666,32 +727,11 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                             target.profile = Some(
                                 menu_profiles
                                     .iter()
-                                    .find(|(_, n)| n == name)
-                                    .map(|(id, _)| id.clone())
+                                    .find(|(_, n, _)| n == name)
+                                    .map(|(id, _, _)| id.clone())
                                     .unwrap_or_default(),
                             );
                             initiate(&svc.ctx, target, &svc.set_screen, &svc.set_status)
-                        }
-                        _ if item.starts_with(MENU_PIN) || item.starts_with(MENU_UNPIN) => {
-                            let pin = item.starts_with(MENU_PIN);
-                            let name = item
-                                .trim_start_matches(MENU_PIN)
-                                .trim_start_matches(MENU_UNPIN);
-                            let Some((id, _)) =
-                                menu_profiles.iter().find(|(_, n)| n == name).cloned()
-                            else {
-                                return;
-                            };
-                            let mut known = KnownHosts::load();
-                            if let Some(h) = known.hosts.iter_mut().find(|h| h.fp_hex == fp) {
-                                h.pinned_profiles.retain(|p| p != &id);
-                                if pin {
-                                    h.pinned_profiles.push(id);
-                                }
-                                let _ = known.save();
-                            }
-                            // The tile list re-reads the store on the next render; nudge it.
-                            sr.call(None);
                         }
                         MENU_SHORTCUT => {
                             let url = pf_client_core::deeplink::DeepLink::for_host(
@@ -749,10 +789,12 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                     Some(online),
                     if k.paired { "Paired" } else { "Trusted" },
                     if k.paired { Pill::Good } else { Pill::Info },
+                    // The chip carries the profile's own colour where it has one —
+                    // that is what makes two bound hosts tell apart at a glance.
                     k.profile_id
                         .as_ref()
-                        .and_then(|id| profiles.iter().find(|(pid, _)| pid == id))
-                        .map(|(_, name)| (name.as_str(), Pill::Neutral)),
+                        .and_then(|id| profiles.iter().find(|(pid, _, _)| pid == id))
+                        .map(|(_, name, accent)| (name.as_str(), accent.clone())),
                 ),
                 Some(menu),
                 Some(Box::new(move || {
@@ -774,7 +816,7 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
             // own: a pinned tile is a shortcut, not a second host, and pin/unpin already live
             // on the primary tile's menu — the one place you decide it.
             for id in &k.pinned_profiles {
-                let Some((id, name)) = profiles.iter().find(|(pid, _)| pid == id) else {
+                let Some((id, name, accent)) = profiles.iter().find(|(pid, ..)| pid == id) else {
                     continue;
                 };
                 let (ctx3, ss3, st3) = (ctx.clone(), set_screen.clone(), set_status.clone());
@@ -790,7 +832,7 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                         Some(online),
                         if k.paired { "Paired" } else { "Trusted" },
                         if k.paired { Pill::Good } else { Pill::Info },
-                        Some((name.as_str(), Pill::Info)),
+                        Some((name.as_str(), accent.clone())),
                     ),
                     None,
                     Some(Box::new(move || {
