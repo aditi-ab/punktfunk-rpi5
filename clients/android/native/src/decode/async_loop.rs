@@ -21,7 +21,10 @@ use super::setup::{
     android_hdr_static_info, boost_hot_threads, boost_thread_priority, codec_mime,
     configure_low_latency, create_codec, try_set_frame_rate,
 };
-use super::{DecodeOptions, FRAME_PARK_CAP, IN_FLIGHT_CAP, NO_OUTPUT_PATIENCE, PENDING_SPLIT_CAP};
+use super::{
+    DecodeOptions, FRAME_PARK_CAP, IN_FLIGHT_CAP, NO_OUTPUT_PATIENCE, NO_VIDEO_PATIENCE,
+    NO_VIDEO_RETRY, PENDING_SPLIT_CAP,
+};
 
 /// One decoded output buffer ready to release: its codec buffer index + the pts the codec echoed
 /// (from the output callback's `BufferInfo`), used to pair the `decode` HUD stat, and the
@@ -259,6 +262,10 @@ pub(super) fn run_async(
     // first frame — the missed opening IDR — is caught by the same window.
     let mut last_output = Instant::now();
     let mut fed_at_output: u64 = 0;
+    // Nothing-ever-arrived backstop (see [`NO_VIDEO_PATIENCE`]) — the mirror of the one above, for a
+    // session whose video plane delivers no AU at all.
+    let started = Instant::now();
+    let mut last_no_video_req: Option<Instant> = None;
 
     while !shutdown.load(Ordering::Relaxed) && !fatal {
         // Block for the next event (idle wait — excluded from the work tally). The short timeout
@@ -387,6 +394,23 @@ pub(super) fn run_async(
             gate.arm(now);
             last_output = now; // one request per patience window, not per iteration
             fed_at_output = fed;
+        }
+        // Nothing has EVER arrived: not an idle stream but a session that never got a picture — the
+        // `starved` test above cannot see it, because it needs `fed` to have moved. Evaluated after
+        // `feed_ready`, so an AU that arrived this pass has either been fed or is parked in
+        // `pending_aus`; both mean video IS flowing.
+        let no_video_yet = fed == 0 && pending_aus.is_empty();
+        if no_video_yet
+            && now.duration_since(started) >= NO_VIDEO_PATIENCE
+            && last_no_video_req.is_none_or(|t| now.duration_since(t) >= NO_VIDEO_RETRY)
+        {
+            log::warn!(
+                "decode: no video received {} ms into the session — requesting a keyframe",
+                now.duration_since(started).as_millis()
+            );
+            last_no_video_req = Some(now);
+            let _ = client.request_keyframe();
+            last_kf_req = Some(now); // share the throttle with the loss-recovery path below
         }
         if (gate.poll(client.frames_dropped(), now) || aus_dropped > 0 || starved)
             && last_kf_req.is_none_or(|t| now.duration_since(t) >= Duration::from_millis(100))

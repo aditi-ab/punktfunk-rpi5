@@ -62,6 +62,26 @@ const RENDERED_CAP: usize = 64;
 /// costs half a second before it self-heals is not a bug the user reports.
 const NO_OUTPUT_PATIENCE: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// How long a session may deliver NO access unit at all before we ask for a keyframe and say so.
+///
+/// [`NO_OUTPUT_PATIENCE`] covers "fed but silent", and it deliberately requires `fed` to have moved
+/// so an idle stream never asks for anything. That leaves its mirror image uncovered: a session that
+/// receives nothing whatsoever. A decoder cannot be starved of output when it was handed no input,
+/// so no signal in either loop fires, and the session sits connected — audio, input and the control
+/// plane all alive — behind a black surface with a HUD reading `0 fps · 0.0 Mb/s`, which is exactly
+/// how it comes back in reports (2026-07-30).
+///
+/// Asking costs one small control message, and it is the right ask in the case we can actually fix:
+/// the host is encoding, but under infinite GOP every picture it sends references an IDR this client
+/// never saw. When the host is sending nothing at all, the request changes nothing — but the log line
+/// beside it is what separates that from "we received AUs and lost them", which no previous black
+/// screen report could tell us.
+const NO_VIDEO_PATIENCE: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// Re-ask cadence once [`NO_VIDEO_PATIENCE`] has elapsed with still nothing received. Slow, because
+/// this state is either self-healing on the first ask or not ours to heal — and each pass logs.
+const NO_VIDEO_RETRY: std::time::Duration = std::time::Duration::from_millis(2000);
+
 /// Whether low-latency mode uses the event-driven async decode loop (default) or the synchronous
 /// poll loop. Flip to `false` to A/B the two on the HUD (`design/…`); the async loop presents a
 /// decoded frame the instant it's ready instead of waiting out a poll interval. Only consulted when
