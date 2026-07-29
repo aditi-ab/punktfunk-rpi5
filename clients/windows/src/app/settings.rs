@@ -1326,12 +1326,13 @@ pub(crate) fn settings_page(props: &SettingsProps, cx: &mut RenderCx) -> Element
     // the whole surface read as clutter. Editing the profile itself (name, colour, delete)
     // is a modal behind the "Edit profile…" button, not inline chrome.
     //
-    // But ONLY while the pane is expanded: in Auto display mode WinUI collapses the pane
-    // below 1008 epx (compact rail, then minimal), and pane-footer content is CLIPPED to the
-    // rail, not adapted. Reactor exposes no pane-opened/closed event, so the switcher follows
-    // the same width threshold WinUI uses: expanded pane → footer; collapsed → a slim row at
-    // the top of the content column instead.
-    let pane_expanded = window_width >= 1008.0;
+    // But ONLY while the pane is expanded — pane-footer content is CLIPPED to the compact
+    // rail, not adapted. WinUI's Auto mode would collapse the pane below 1008 epx (under the
+    // app's own 1000-wide default window!), which kept booting the switcher out of the nav,
+    // so the page FORCES the pane: expanded (`Left`, at a tighter 250 length) whenever the
+    // content column still gets a workable width, minimal below that. Reactor exposes no
+    // pane-opened/closed event, so the switcher placement rides the same threshold.
+    let pane_expanded = window_width >= 720.0;
     let catalog = ProfilesFile::load();
     let mut scope_names = vec!["Default settings".to_string()];
     let mut scope_ids: Vec<String> = vec![String::new()];
@@ -1527,6 +1528,12 @@ pub(crate) fn settings_page(props: &SettingsProps, cx: &mut RenderCx) -> Element
     });
     let mut nav = NavigationView::new(items, content)
         .pane_title("Settings")
+        .pane_display_mode(if pane_expanded {
+            NavigationViewPaneDisplayMode::Left
+        } else {
+            NavigationViewPaneDisplayMode::LeftMinimal
+        })
+        .open_pane_length(250.0)
         .selected_tag(section)
         .on_selection_changed({
             let ss = set_section.clone();
