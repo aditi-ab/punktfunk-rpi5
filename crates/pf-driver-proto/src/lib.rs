@@ -490,8 +490,17 @@ pub mod frame {
     /// Header magic (`"PFVD"` LE). The host stamps it LAST (after the ring textures exist) so the driver
     /// only attaches to a fully-published ring.
     pub const MAGIC: u32 = 0x4456_4650;
-    /// Frame-plane version (independent bump of the header layout).
-    pub const VERSION: u32 = 1;
+    /// Frame-plane version (independent bump of the header layout). v2 appended the stall-attribution
+    /// telemetry tail (`drain_heartbeat_qpc`/`last_acquire_qpc`/`offered_total`); see
+    /// [`VERSION_TELEMETRY`] for the compatibility contract.
+    pub const VERSION: u32 = 2;
+    /// The header version that grew the telemetry tail. Compatibility is gated on the HOST-stamped
+    /// `version` field, not on mapping sizes: a v2 driver writes the tail only when
+    /// `version >= VERSION_TELEMETRY` (a v1 host created a 64-byte layout — never write past it),
+    /// and a v2 host reads `drain_heartbeat_qpc == 0` as "pre-telemetry driver, no verdict" (the
+    /// same zero-means-absent convention as [`OPENED_DETAIL_LIVE`]). Neither side rejects the
+    /// other's version — the tail is diagnostics, not frame-plane semantics.
+    pub const VERSION_TELEMETRY: u32 = 2;
     /// Ring slots. Headroom so the driver's 0 ms-timeout publish always finds a free slot while the host
     /// holds one across the convert/copy + the pipelined encode. MUST be identical on both sides — it is,
     /// because both read this one constant.
@@ -587,6 +596,22 @@ pub mod frame {
         /// token blocks file writes, so this header is how the driver reports state).
         pub driver_status: u32,
         pub driver_status_detail: u32,
+        /// v2 telemetry tail (stall attribution, Phase A.1 of the vdisplay-disturbance-immunity
+        /// program): driver-written on every drain-loop pass, host-read when a capture stall ends.
+        /// All three are best-effort Relaxed atomic stores (the `driver_status` visibility
+        /// contract); `0` means a pre-v2 driver never wrote them. QPC of the swap-chain worker's
+        /// most recent drain-loop iteration — E_PENDING passes included, so a fresh heartbeat over
+        /// a stale [`Self::last_acquire_qpc`] reads "the worker is running and DWM is composing
+        /// nothing", while a stale heartbeat reads "our worker starved".
+        pub drain_heartbeat_qpc: u64,
+        /// QPC of the most recent SUCCESSFUL swap-chain acquire — the last instant DWM actually
+        /// composed this display. The Branch-1/Branch-2 fork in one field.
+        pub last_acquire_qpc: u64,
+        /// Wrapping count of surfaces offered to the ring publisher — the full-width sibling of
+        /// the packed 15-bit [`OPENED_DETAIL_LIVE`] counter (which saturates and cannot be
+        /// delta'd over a stall window). The host snapshots it per consumed frame; the delta
+        /// across a stall says whether frames existed that never reached the ring.
+        pub offered_total: u64,
     }
 
     /// Why the driver's publisher must NOT attach a delivered channel to its monitor's ring — the
@@ -663,7 +688,7 @@ pub mod frame {
     const _: () = {
         use core::mem::{offset_of, size_of};
 
-        assert!(size_of::<SharedHeader>() == 64);
+        assert!(size_of::<SharedHeader>() == 88);
         assert!(offset_of!(SharedHeader, magic) == 0);
         assert!(offset_of!(SharedHeader, version) == 4);
         assert!(offset_of!(SharedHeader, generation) == 8);
@@ -678,6 +703,9 @@ pub mod frame {
         assert!(offset_of!(SharedHeader, driver_render_luid_high) == 52);
         assert!(offset_of!(SharedHeader, driver_status) == 56);
         assert!(offset_of!(SharedHeader, driver_status_detail) == 60);
+        assert!(offset_of!(SharedHeader, drain_heartbeat_qpc) == 64);
+        assert!(offset_of!(SharedHeader, last_acquire_qpc) == 72);
+        assert!(offset_of!(SharedHeader, offered_total) == 80);
     };
 }
 
@@ -1426,14 +1454,15 @@ mod tests {
     }
 
     #[test]
-    fn shared_header_is_pod_and_64_bytes() {
+    fn shared_header_is_pod_and_88_bytes() {
         let mut h = frame::SharedHeader::zeroed();
         h.magic = frame::MAGIC;
         h.width = 5120;
         h.height = 1440;
         h.target_id = 262;
+        h.drain_heartbeat_qpc = 0x1234_5678_9abc_def0;
         let bytes = bytemuck::bytes_of(&h);
-        assert_eq!(bytes.len(), 64);
+        assert_eq!(bytes.len(), 88);
         let back: frame::SharedHeader = *bytemuck::from_bytes(bytes);
         assert_eq!(back.magic, frame::MAGIC);
         assert_eq!(back.width, 5120);
@@ -1441,6 +1470,11 @@ mod tests {
         // v3: the monitor binding occupies the old `_pad` slot at offset 28 — byte-compatible (a v2
         // host left it zero there).
         assert_eq!(bytes[28..32], 262u32.to_le_bytes());
+        // Header v2: the telemetry tail is appended — the first 64 bytes ARE the v1 layout, so a
+        // pre-telemetry driver reading its 64-byte view sees exactly what it always saw.
+        assert_eq!(bytes[64..72], 0x1234_5678_9abc_def0u64.to_le_bytes());
+        assert_eq!(back.last_acquire_qpc, 0);
+        assert_eq!(back.offered_total, 0);
     }
 
     #[test]

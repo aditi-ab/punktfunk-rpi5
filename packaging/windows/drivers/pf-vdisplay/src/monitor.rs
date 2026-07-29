@@ -485,20 +485,22 @@ pub fn set_cursor_channel(
 /// genuine teardown, not a flap: the entry was already removed) so the caller drops it, closing the ring
 /// handles. Replacing an already-stashed publisher (should not happen — one worker exits at a time)
 /// drops the old one, so it can never accumulate. Returning the publisher in the `Err` makes the
-/// `Result` itself `#[must_use]`, so a caller can't silently drop the not-preserved publisher.
+/// `Result` itself `#[must_use]`, so a caller can't silently drop the not-preserved publisher; it
+/// rides boxed (the struct outgrew clippy's 128-byte `result_large_err` bar with the v2 telemetry
+/// fields, and this path runs once per worker exit — the allocation is free).
 pub fn preserve_publisher(
     target_id: u32,
     publisher: crate::frame_transport::FramePublisher,
-) -> Result<(), crate::frame_transport::FramePublisher> {
+) -> Result<(), Box<crate::frame_transport::FramePublisher>> {
     if target_id == 0 {
-        return Err(publisher);
+        return Err(Box::new(publisher));
     }
     let mut lock = lock_monitors();
     if let Some(m) = lock.iter_mut().find(|m| m.target_id == target_id) {
         m.preserved_publisher = Some(publisher);
         Ok(())
     } else {
-        Err(publisher)
+        Err(Box::new(publisher))
     }
 }
 

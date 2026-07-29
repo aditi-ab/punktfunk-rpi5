@@ -408,6 +408,15 @@ impl SwapChainProcessor {
                 )
             };
 
+            // v2 telemetry (stall attribution): stamp the drain heartbeat — plus the last-acquire
+            // on a pass that got a composed frame — into the shared header EVERY pass, E_PENDING
+            // included (the wait below is ≤16 ms, so the heartbeat cadence bounds how stale it can
+            // read while this thread is scheduled). What lets the host split a capture stall into
+            // worker-starved / DWM-composed-nothing / our-delivery-leg.
+            if let Some(p) = publisher.as_ref() {
+                p.note_drain(hr_success(hr));
+            }
+
             if (hr as u32) == E_PENDING {
                 if !logged_pending {
                     dbglog!(

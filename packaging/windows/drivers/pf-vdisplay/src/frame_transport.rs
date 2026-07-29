@@ -31,7 +31,8 @@ use std::time::Instant;
 use pf_driver_proto::control::SetFrameChannelRequest;
 use pf_driver_proto::frame::{
     AttachReject, DRV_STATUS_BIND_FAIL, DRV_STATUS_NO_DEVICE1, DRV_STATUS_OPENED,
-    DRV_STATUS_TEX_FAIL, FrameToken, RING_LEN, SharedHeader, check_attach, pack_opened_detail,
+    DRV_STATUS_TEX_FAIL, FrameToken, RING_LEN, SharedHeader, VERSION_TELEMETRY, check_attach,
+    pack_opened_detail,
 };
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Graphics::Direct3D11::{
@@ -43,6 +44,7 @@ use windows::Win32::Graphics::Dxgi::IDXGIKeyedMutex;
 use windows::Win32::System::Memory::{
     FILE_MAP_READ, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, UnmapViewOfFile,
 };
+use windows::Win32::System::Performance::QueryPerformanceCounter;
 use windows::Win32::System::Threading::SetEvent;
 use windows::core::Interface;
 
@@ -292,6 +294,13 @@ pub struct FramePublisher {
     /// "DWM never composed" from "every compose mismatched the ring".
     offered: u32,
     mismatch_drops: u32,
+    /// Whether the HOST created a telemetry-capable (v2, 88-byte) header — stamped `version >=
+    /// VERSION_TELEMETRY` at attach. Gates every write to the telemetry tail: a v1 host's header
+    /// is 64 bytes, and the tail fields would land past the layout it reads.
+    telemetry: bool,
+    /// Full-width wrapping sibling of `offered` (which packs to 15 saturating bits) — mirrored
+    /// into `SharedHeader::offered_total` so the host can delta it across a stall window.
+    offered_total: u64,
     /// The slot of the most recent successful publish + when it happened — what [`Self::harvest_into`]
     /// reads when this publisher is superseded. `None` until the first publish.
     last_published: Option<(u32, Instant)>,
@@ -327,20 +336,16 @@ impl FramePublisher {
 
         // 1. Map the header from the duplicated section handle (ours from here on).
         let map = FrameChannel::take(&mut channel.header);
-        // SAFETY: `map` is the live section handle the host duplicated into this process; mapping
-        // size_of::<SharedHeader>() bytes of it (the host created the mapping at >= that size). The null
-        // `view.Value` is checked below.
+        // SAFETY: `map` is the live section handle the host duplicated into this process; a byte
+        // count of 0 maps the WHOLE section — a v1 host created a 64-byte (pre-telemetry) header,
+        // so requesting size_of::<SharedHeader>() (the v2 88 bytes) could exceed what that host
+        // declared, while 0 always fits and always covers the layout the host actually built (the
+        // `telemetry` version gate keeps our writes inside it). The null `view.Value` is checked below.
         let view = unsafe {
             // Read/write only — the host now duplicates the header handle with least access
             // (`SECTION_MAP_READ | SECTION_MAP_WRITE`), so `FILE_MAP_ALL_ACCESS` would exceed the
             // granted rights and fail. We read the layout + write status/publish-token fields; RW covers it.
-            MapViewOfFile(
-                map,
-                FILE_MAP_READ | FILE_MAP_WRITE,
-                0,
-                0,
-                core::mem::size_of::<SharedHeader>(),
-            )
+            MapViewOfFile(map, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, 0)
         };
         if view.Value.is_null() {
             let err = windows::core::Error::from_win32();
@@ -370,15 +375,16 @@ impl FramePublisher {
         //    into another client's ring. The shared `check_attach` (unit-tested in pf-driver-proto)
         //    owns the precedence: staleness first, binding second.
         // SAFETY: `header` is the mapped host header; `magic`/`generation` live within it and are read
-        // atomically (Acquire) to pair with the host's Release publishes; `target_id` is a plain
-        // in-bounds u32 read, stamped before the magic the Acquire load ordered us behind.
-        let (magic, header_gen, header_target) = unsafe {
+        // atomically (Acquire) to pair with the host's Release publishes; `target_id`/`version` are
+        // plain in-bounds u32 reads, stamped before the magic the Acquire load ordered us behind.
+        let (magic, header_gen, header_target, header_version) = unsafe {
             (
                 (*(core::ptr::addr_of!((*header).magic) as *const AtomicU32))
                     .load(Ordering::Acquire),
                 (*(core::ptr::addr_of!((*header).generation) as *const AtomicU32))
                     .load(Ordering::Acquire),
                 (*header).target_id,
+                (*header).version,
             )
         };
         match check_attach(
@@ -518,14 +524,46 @@ impl FramePublisher {
             mismatch_logged: false,
             offered: 0,
             mismatch_drops: 0,
+            telemetry: header_version >= VERSION_TELEMETRY,
+            offered_total: 0,
             last_published: None,
             render_luid_low,
             render_luid_high,
         })
     }
 
+    /// v2 telemetry tail, drain side (stall attribution): stamp the heartbeat on EVERY drain-loop
+    /// pass — and the last-acquire on a pass that actually acquired a composed frame — so the host
+    /// can split a capture stall into "our worker starved" (heartbeat went stale) vs "the worker
+    /// drained E_PENDING the whole hole — DWM composed nothing" (heartbeat fresh, last-acquire
+    /// stale). Gated on the host's stamped header version (see the `telemetry` field docs);
+    /// best-effort Relaxed stores, the `driver_status` visibility contract.
+    pub fn note_drain(&self, acquired: bool) {
+        if !self.telemetry {
+            return;
+        }
+        let mut qpc = 0i64;
+        // SAFETY: plain FFI; `qpc` is a valid local out-param. QPC cannot fail on any OS we load on.
+        if unsafe { QueryPerformanceCounter(&mut qpc) }.is_err() {
+            return;
+        }
+        // SAFETY: `self.header` stays mapped for the publisher's lifetime and the version gate above
+        // proves the host built the v2 (88-byte) layout; both fields are naturally-aligned u64s
+        // within it, valid for `AtomicU64` views (the same pattern as `latest_cell`).
+        unsafe {
+            (*(core::ptr::addr_of!((*self.header).drain_heartbeat_qpc) as *const AtomicU64))
+                .store(qpc as u64, Ordering::Relaxed);
+            if acquired {
+                (*(core::ptr::addr_of!((*self.header).last_acquire_qpc) as *const AtomicU64))
+                    .store(qpc as u64, Ordering::Relaxed);
+            }
+        }
+    }
+
     /// Mirror the live diagnostic counters into the header's detail word (proto
-    /// `pack_opened_detail`) — read by the host's first-frame timeout to name a no-frames failure.
+    /// `pack_opened_detail`) — read by the host's first-frame timeout to name a no-frames failure —
+    /// plus, on a telemetry-capable (v2) header, the full-width `offered_total` the host deltas
+    /// across a stall window (the packed 15-bit counter saturates, so it can't be delta'd).
     #[inline]
     fn write_opened_detail(&self) {
         // SAFETY: `self.header` stays mapped for the publisher's lifetime (unmapped only in Drop);
@@ -533,6 +571,14 @@ impl FramePublisher {
         unsafe {
             (*self.header).driver_status_detail =
                 pack_opened_detail(self.offered, self.mismatch_drops);
+        }
+        if self.telemetry {
+            // SAFETY: the version gate proves the host built the v2 (88-byte) layout;
+            // `offered_total` is a naturally-aligned u64 within it (the `latest_cell` pattern).
+            unsafe {
+                (*(core::ptr::addr_of!((*self.header).offered_total) as *const AtomicU64))
+                    .store(self.offered_total, Ordering::Relaxed);
+            }
         }
     }
 
@@ -624,6 +670,7 @@ impl FramePublisher {
         // header's detail word — what lets the host's first-frame timeout tell "DWM never composed"
         // from "every compose mismatched the ring". Written once per call, after the outcome is known.
         self.offered = self.offered.saturating_add(1);
+        self.offered_total = self.offered_total.wrapping_add(1);
         if desc.Format.0 as u32 != self.ring_format || desc.Width != rw || desc.Height != rh {
             self.mismatch_drops = self.mismatch_drops.saturating_add(1);
             self.write_opened_detail();

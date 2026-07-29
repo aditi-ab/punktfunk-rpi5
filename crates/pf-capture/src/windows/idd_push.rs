@@ -54,6 +54,8 @@ use windows::Win32::Security::Authorization::{
     ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
 };
 use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
+use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
+
 use windows::Win32::System::Memory::{
     CreateFileMappingW, MapViewOfFile, UnmapViewOfFile, FILE_MAP_ALL_ACCESS,
     MEMORY_MAPPED_VIEW_ADDRESS, PAGE_READWRITE,
@@ -324,7 +326,7 @@ mod descriptor;
 mod stall;
 use channel::ChannelBroker;
 use descriptor::{DescriptorPoller, DisplayDescriptor};
-use stall::StallWatch;
+use stall::{StallEvidence, StallWatch};
 
 pub struct IddPushCapturer {
     device: ID3D11Device,
@@ -482,6 +484,11 @@ pub struct IddPushCapturer {
     /// during active flow and warns when they turn metronomic — the sole-virtual-display
     /// periodic-stutter diagnostic.
     stall_watch: StallWatch,
+    /// v2 driver-telemetry trackers feeding [`stall::StallEvidence`]: the header's
+    /// `offered_total` as of the last fresh frame, and the stalest the driver's drain heartbeat
+    /// ever read (µs) while the host starved since then. Rolled at every fresh frame.
+    offered_at_fresh: u64,
+    max_hb_age_us: u64,
     /// Host-owned ROTATING output ring NVENC encodes (one YUV texture per slot). Rotating it per frame
     /// is the precondition for pipelining the encode loop: while NVENC encodes frame N's texture on the
     /// ASIC, frame N+1's convert writes a DIFFERENT texture — the two overlap. Format = `out_format()`:
@@ -530,6 +537,47 @@ impl IddPushCapturer {
             (*(std::ptr::addr_of!((*self.header).latest) as *const AtomicU64))
                 .load(Ordering::Acquire)
         }
+    }
+
+    /// Age of a driver-stamped QPC value in microseconds (QPC is system-wide, so cross-process
+    /// comparison is sound); 0 when the stamp reads ahead of us (a benign race with the writer).
+    fn qpc_age_us(stamp: u64) -> u64 {
+        static FREQ: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let freq = *FREQ.get_or_init(|| {
+            let mut f = 0i64;
+            // SAFETY: plain FFI; `f` is a valid local out-param. The frequency is fixed at boot and
+            // cannot fail on any OS we run on; 0 would only mean the call failed — guarded below.
+            let _ = unsafe { QueryPerformanceFrequency(&mut f) };
+            f.max(0) as u64
+        });
+        if freq == 0 {
+            return 0;
+        }
+        let mut now = 0i64;
+        // SAFETY: plain FFI; `now` is a valid local out-param.
+        if unsafe { QueryPerformanceCounter(&mut now) }.is_err() {
+            return 0;
+        }
+        (now as u64).saturating_sub(stamp).saturating_mul(1_000_000) / freq
+    }
+
+    /// The header's v2 telemetry tail — `(drain_heartbeat_qpc, offered_total)`; `None` until a
+    /// telemetry-capable driver writes its first heartbeat (the host always creates the v2 layout,
+    /// so a zero heartbeat means the attached driver predates it).
+    #[inline]
+    fn telemetry(&self) -> Option<(u64, u64)> {
+        // SAFETY: like `latest` — the header stays mapped for the capturer's lifetime, both fields
+        // are 8-aligned `u64`s within the v2 layout the host itself created, and Relaxed suffices
+        // for best-effort diagnostics (the same contract the driver writes them under).
+        let (hb, offered) = unsafe {
+            (
+                (*(std::ptr::addr_of!((*self.header).drain_heartbeat_qpc) as *const AtomicU64))
+                    .load(Ordering::Relaxed),
+                (*(std::ptr::addr_of!((*self.header).offered_total) as *const AtomicU64))
+                    .load(Ordering::Relaxed),
+            )
+        };
+        (hb != 0).then_some((hb, offered))
     }
 
     /// Log the driver's status once it first reports (the only driver-visibility channel we have).
@@ -1380,6 +1428,14 @@ impl IddPushCapturer {
                 );
             }
         }
+        // Stall-attribution evidence (v2 telemetry): record the STALEST the driver's drain
+        // heartbeat ever reads between fresh frames. A heartbeat that goes quiet for the hole
+        // convicts our worker (starved/dead WUDFHost); one that stays fresh through it acquits the
+        // driver and indicts the compose/present path. Two Relaxed loads + a QPC read per consume
+        // tick; rolled at every fresh frame below.
+        if let Some((hb, _)) = self.telemetry() {
+            self.max_hb_age_us = self.max_hb_age_us.max(Self::qpc_age_us(hb));
+        }
         let latest = self.latest();
         // `latest` is the proto publish token `(generation << 40) | (seq << 8) | slot`. Reject any publish
         // whose generation isn't our CURRENT ring (a stale old-ring publish racing a recreate, or the 0
@@ -1529,10 +1585,29 @@ impl IddPushCapturer {
             // the running correlated/total tally — lives on `StallWatch` (sweep Phase 5.4). It was
             // ~65 lines of log prose inside `try_consume`, which is the hot loop, and its two
             // counters were capturer fields that nothing else touched.
-            self.stall_watch.report(&stall, now);
+            let evidence = StallEvidence {
+                // A publisher re-attach restarts `offered_total` near zero; a ring recreate resets
+                // the stall watch before that can matter, but guard the delta anyway (a restarted
+                // counter reads as "frames offered since the restart", never as a u64 underflow).
+                offered_delta: self.telemetry().map(|(_, offered)| {
+                    if offered >= self.offered_at_fresh {
+                        offered - self.offered_at_fresh
+                    } else {
+                        offered
+                    }
+                }),
+                max_heartbeat_age_ms: self.max_hb_age_us / 1_000,
+            };
+            self.stall_watch.report(&stall, now, &evidence);
         }
         if !regen {
-            self.last_fresh = now; // feeds the driver-death watch
+            // A fresh driver frame: feed the driver-death watch and roll the stall-evidence
+            // trackers (a regen re-encodes OLD content — it is not evidence of driver progress).
+            self.last_fresh = now;
+            if let Some((_, offered)) = self.telemetry() {
+                self.offered_at_fresh = offered;
+            }
+            self.max_hb_age_us = 0;
         }
         // Build the frame. For PyroWave the encode input is the Y plane
         // (`texture`) + the CbCr plane & fence in `pyro`; signal the shared fence
@@ -2036,5 +2111,36 @@ mod tests {
             w.note_fresh(at(1_104 + 19 * 16 + 300)).is_some(),
             "detection re-armed after the reset"
         );
+    }
+
+    /// [`stall::attribute`]'s verdict table — the Branch-1/Branch-2 fork, per evidence shape.
+    #[test]
+    fn stall_attribution_verdicts() {
+        use super::stall::{attribute, StallVerdict};
+        let verdict = |gap_ms: u64, offered: Option<u64>, hb_age_ms: u64| {
+            attribute(
+                Duration::from_millis(gap_ms),
+                &StallEvidence {
+                    offered_delta: offered,
+                    max_heartbeat_age_ms: hb_age_ms,
+                },
+            )
+        };
+        // Pre-telemetry driver: no verdict, whatever the heartbeat tracker read.
+        assert_eq!(verdict(300, None, 500), StallVerdict::NoTelemetry);
+        // Heartbeat silent for most of the hole → the worker starved, wherever the frames were.
+        assert_eq!(verdict(600, Some(0), 400), StallVerdict::WorkerStalled);
+        assert_eq!(verdict(600, Some(50), 300), StallVerdict::WorkerStalled);
+        // A scheduled worker heartbeats every ≤16 ms — 200 ms of silence on a 300 ms gap is under
+        // the max(gap/2, 250 ms) bar, so the verdict falls through to the offered-frames fork.
+        assert_eq!(verdict(300, Some(1), 200), StallVerdict::ComposeSilence);
+        // The stall-ending frame (+ a small resume burst) does not acquit DWM...
+        assert_eq!(verdict(300, Some(3), 20), StallVerdict::ComposeSilence);
+        // ...but sustained composition through the hole does: the frames existed, WE lost them.
+        assert_eq!(verdict(300, Some(8), 20), StallVerdict::DeliveryLeg);
+        assert_eq!(verdict(2_000, Some(120), 30), StallVerdict::DeliveryLeg);
+        // Long holes scale the worker-stalled bar: 900 ms of silence on a 3 s gap is not half.
+        assert_eq!(verdict(3_000, Some(2), 900), StallVerdict::ComposeSilence);
+        assert_eq!(verdict(3_000, Some(2), 1_600), StallVerdict::WorkerStalled);
     }
 }
