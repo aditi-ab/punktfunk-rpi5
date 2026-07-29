@@ -17,7 +17,9 @@
 #   <feed>   e.g. f43, f43-canary, f44 (Fedora major x channel)
 #   KEEP     newest images to keep in the feed; 0/unset-for-stable = keep all
 #   --seal   re-sign a feed's EXISTING manifest without publishing an image. For feeds published
-#            before signing existed, and after a key rotation. Idempotent.
+#            before signing existed, and after a key rotation. Idempotent. Also re-publishes the
+#            manifest if normalizing it changed anything, because the signature has to cover the
+#            bytes a client downloads.
 # Env: REGISTRY (git.unom.io), OWNER (unom), TOKEN (write:package PAT), CURL_USER (login name),
 #      RPM_GPG_PRIVATE_KEY (armored private key; absent => unsigned, fatal on a v* tag)
 set -euo pipefail
@@ -40,6 +42,28 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
 SUMS="$WORK/SHA256SUMS"
 SIG="$WORK/SHA256SUMS.asc"
+FETCHED="$WORK/SHA256SUMS.fetched"   # exactly what the registry served, before normalization
+
+# read_manifest -> the feed's current manifest, normalized into $SUMS and kept verbatim in
+# $FETCHED. Returns non-zero iff the feed has no manifest at all.
+#
+# -L is not optional here. The registry answers a file GET with a 303 See Other pointing at
+# presigned object storage, and `curl -f` does NOT treat a 3xx as an error — so without -L the call
+# "succeeds" and hands back the redirect's HTML body ('<a href="…">See Other</a>.'). Both callers
+# then took that page for the manifest: every publish prepended a stale redirect page and dropped
+# every prior image line, and --seal signed a page whose presigned URL expired 300 seconds later —
+# a signature over bytes that exist nowhere. Clients fetch WITH -L, so they checked the real
+# manifest against that signature and refused the feed, which from a Bazzite box is indistinguishable
+# from someone having tampered with it.
+#
+# The line filter is the second layer, and the one that does not depend on getting curl's flags
+# right: whatever the transport hands back, only well-formed "<sha256>  <filename>" lines are ever
+# signed or re-published. It also scrubs a feed that already carries an injected page.
+read_manifest() {
+  : > "$SUMS"; : > "$FETCHED"
+  curl -fsSL "${AUTH[@]}" -o "$FETCHED" "$BASE/SHA256SUMS" || return 1
+  grep -E '^[0-9a-f]{64}  [^ ]+$' "$FETCHED" > "$SUMS" || :
+}
 
 # sign_manifest — detached-sign $SUMS into $SIG with RPM_GPG_PRIVATE_KEY. Prints nothing and
 # returns 1 if no key is available; the caller decides whether that is survivable.
@@ -88,14 +112,29 @@ require_signature() {
 
 # --seal: re-sign whatever manifest the feed already has, no image, no pruning.
 if [ "$SEAL" = 1 ]; then
-  curl -fsS "${AUTH[@]}" -o "$SUMS" "$BASE/SHA256SUMS" \
-    || { echo "no SHA256SUMS at $BASE — nothing to seal" >&2; exit 1; }
-  sign_manifest || require_signature
-  if [ -f "$SIG" ]; then
-    curl -fsS -o /dev/null "${AUTH[@]}" -X DELETE "$BASE/SHA256SUMS.asc" || true
-    curl -fsS -o /dev/null "${AUTH[@]}" --upload-file "$SIG" "$BASE/SHA256SUMS.asc"
-    echo "sealed $BASE ($(wc -l <"$SUMS") image(s))"
+  read_manifest || { echo "no SHA256SUMS at $BASE — nothing to seal" >&2; exit 1; }
+  # An empty result means the manifest was ALL junk. Signing that would hand clients a feed that
+  # verifies and offers no images, which reads as "up to date" to `punktfunk-sysext update`.
+  if [ ! -s "$SUMS" ]; then
+    echo "$BASE/SHA256SUMS lists no images — refusing to seal it (feed needs a republish)" >&2
+    exit 1
   fi
+  if ! sign_manifest; then
+    require_signature   # non-release: warn and leave the live feed exactly as it was
+    exit 0
+  fi
+  # The signature must cover the bytes a client actually downloads, so a manifest that normalizing
+  # changed gets re-published with it — otherwise the .asc would describe a file the registry does
+  # not have, which is the very failure this is repairing. Manifest first, signature second, and
+  # neither when the stored copy was already clean.
+  if ! cmp -s "$SUMS" "$FETCHED"; then
+    echo "normalizing $BASE/SHA256SUMS: $(grep -c '' <"$FETCHED") line(s) served, $(grep -c '' <"$SUMS") kept"
+    curl -fsS -o /dev/null "${AUTH[@]}" -X DELETE "$BASE/SHA256SUMS" || true
+    curl -fsS -o /dev/null "${AUTH[@]}" --upload-file "$SUMS" "$BASE/SHA256SUMS"
+  fi
+  curl -fsS -o /dev/null "${AUTH[@]}" -X DELETE "$BASE/SHA256SUMS.asc" || true
+  curl -fsS -o /dev/null "${AUTH[@]}" --upload-file "$SIG" "$BASE/SHA256SUMS.asc"
+  echo "sealed $BASE ($(grep -c '' <"$SUMS") image(s))"
   exit 0
 fi
 
@@ -103,7 +142,14 @@ FNAME="$(basename "$RAW")"
 SHA="$(sha256sum "$RAW" | cut -d' ' -f1)"
 
 # Merge into the existing manifest: drop any prior line for this filename, append ours.
-curl -fsS "${AUTH[@]}" "$BASE/SHA256SUMS" 2>/dev/null | grep -v " $FNAME\$" > "$SUMS" || true
+if read_manifest; then
+  sed -i "\| $FNAME\$|d" "$SUMS"
+  # Said out loud on purpose. A manifest that silently shrinks is how a feed loses its rollback
+  # history, and that went unnoticed precisely because nothing ever reported the carry-over.
+  echo "carrying forward $(grep -c '' <"$SUMS") image(s) from the existing manifest"
+else
+  echo "no manifest at $BASE yet — starting a new feed"
+fi
 printf '%s  %s\n' "$SHA" "$FNAME" >> "$SUMS"
 
 # Prune: keep only the newest $KEEP images (by version sort) in manifest + registry.
