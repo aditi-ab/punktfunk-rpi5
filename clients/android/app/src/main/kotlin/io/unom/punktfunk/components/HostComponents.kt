@@ -84,6 +84,8 @@ fun HostCard(
     address: String,
     status: HostStatus,
     online: Boolean = false,
+    /** OS-identity chain (mDNS `os` TXT / stored), for the address line's OS mark. "" = none. */
+    os: String = "",
     enabled: Boolean,
     onConnect: () -> Unit,
     onForget: (() -> Unit)?,
@@ -136,14 +138,28 @@ fun HostCard(
                     overflow = TextOverflow.Ellipsis,
                     textAlign = TextAlign.Center,
                 )
-                Text(
-                    address,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    textAlign = TextAlign.Center,
-                )
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    // The OS mark leads the address line; absent entirely for a host that
+                    // doesn't advertise one, so those cards render exactly as they always did.
+                    val osIcon = resolveOsIcon(os)
+                    if (osIcon != null) {
+                        Icon(
+                            osIcon,
+                            contentDescription = os,
+                            modifier = Modifier.size(12.dp),
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        Spacer(Modifier.width(4.dp))
+                    }
+                    Text(
+                        address,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        textAlign = TextAlign.Center,
+                    )
+                }
                 if (profileLabel != null || reserveProfileSlot) {
                     Spacer(Modifier.height(10.dp))
                     Box(

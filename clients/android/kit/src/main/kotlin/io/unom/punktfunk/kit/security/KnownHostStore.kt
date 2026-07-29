@@ -26,6 +26,12 @@ data class KnownHost(
      * online, so the client can wake it once it sleeps. Empty until first learned.
      */
     val mac: List<String> = emptyList(),
+    /**
+     * The host's OS-identity chain (`windows` | `linux/<family>/<id>`, ...) learned from its mDNS
+     * `os` TXT while online, so the card's OS icon survives the host going to sleep. Empty until
+     * first learned (or forever, against an older host).
+     */
+    val os: String = "",
     /** Stable record identity — see the class doc. Minted here for a genuinely new record. */
     val id: String = newRecordId(),
     /**
@@ -113,6 +119,17 @@ class KnownHostStore(context: Context) {
         save(h.copy(mac = mac))
     }
 
+    /**
+     * Learn/refresh a saved host's OS-identity chain from its live advert — same contract as
+     * [learnMac]: no-op when unsaved, empty, or unchanged.
+     */
+    fun learnOs(address: String, port: Int, os: String) {
+        if (os.isEmpty()) return
+        val h = get(address, port) ?: return
+        if (h.os == os) return
+        save(h.copy(os = os))
+    }
+
     /** Forget [host] (the next connect re-pairs / re-TOFUs). */
     fun remove(host: KnownHost) {
         prefs.edit().remove(host.id).apply()
@@ -162,6 +179,7 @@ class KnownHostStore(context: Context) {
             fpHex = j.getString("fp"),
             paired = j.optBoolean("paired", false),
             mac = j.optString("mac", "").split(",").map { it.trim() }.filter { it.isNotEmpty() },
+            os = j.optString("os", ""),
             // A record without an id can only be one this build wrote before the migration ran, or
             // a hand-edited file; minting here keeps the parse total rather than dropping a host.
             id = j.optString("id", "").ifEmpty { newRecordId() },
@@ -247,6 +265,7 @@ class KnownHostStore(context: Context) {
             .put("fp", host.fpHex.lowercase())
             .put("paired", host.paired)
             .put("mac", host.mac.joinToString(","))
+            .put("os", host.os)
             .put("clip", host.clipboardSync)
             .put("profile", host.profileId ?: "")
             .put("pins", JSONArray(host.pinnedProfileIds))

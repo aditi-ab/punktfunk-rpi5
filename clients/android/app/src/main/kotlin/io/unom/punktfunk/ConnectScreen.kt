@@ -237,6 +237,13 @@ fun ConnectScreen(
                     knownHostStore.learnMac(dh.host, dh.port, dh.mac)
                     any = true
                 }
+                // Same for the OS-identity chain, so the card's icon survives the host sleeping.
+                if (dh.os.isNotEmpty() &&
+                    knownHostStore.get(dh.host, dh.port)?.let { it.os != dh.os } == true
+                ) {
+                    knownHostStore.learnOs(dh.host, dh.port, dh.os)
+                    any = true
+                }
             }
             any
         }
@@ -921,6 +928,9 @@ fun ConnectScreen(
                         address = "${kh.address}:${kh.port}",
                         status = if (kh.paired) HostStatus.PAIRED else HostStatus.TOFU,
                         online = kh.isOnline(discovered, reachable),
+                        // Live advert preferred (the store lags a discovery tick), else stored.
+                        os = discovered.firstOrNull { kh.matches(it) && it.os.isNotEmpty() }?.os
+                            ?: kh.os,
                         enabled = !connecting,
                         // A pinned card connects with ITS profile; the host's own card follows the
                         // binding, which is exactly what its chip says it will do.
@@ -986,6 +996,7 @@ fun ConnectScreen(
                         address = "${dh.host}:${dh.port}",
                         status = if (dh.pairingRequired) HostStatus.PAIRING else HostStatus.TOFU,
                         online = true, // in the discovered list ⇒ live on mDNS right now
+                        os = dh.os,
                         enabled = !connecting,
                         onConnect = { connect(dh.host, dh.port, dh) },
                         onForget = null,

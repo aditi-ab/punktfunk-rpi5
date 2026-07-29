@@ -34,6 +34,17 @@ class KnownHostStoreTest {
         assertEquals(emptyList<String>(), KnownHostStore.parseMacs("+a:-b:+c:-d:+e:-f")) // signed octets
         assertEquals(listOf("aa:bb:cc:dd:ee:ff"), KnownHostStore.parseMacs("junk, aa:bb:cc:dd:ee:ff"))
     }
+
+    @Test
+    fun encodedRecordCarriesTheOsChainAndLegacyRecordsReadBackEmpty() {
+        val h = KnownHost("10.0.0.5", 9777, "HTPC", "a".repeat(64), true, os = "linux/fedora/bazzite")
+        val j = JSONObject(KnownHostStore.encode(h))
+        assertEquals("linux/fedora/bazzite", j.getString("os"))
+        // A record written before the field existed has no "os" key; the parse contract
+        // (optString) reads it back as empty — same additive rule as every late field.
+        val legacy = JSONObject().put("addr", "10.0.0.5").put("port", 9777).toString()
+        assertEquals("", JSONObject(legacy).optString("os", ""))
+    }
 }
 
 /**

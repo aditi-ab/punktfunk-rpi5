@@ -34,6 +34,39 @@ class ParseRecordTest {
     }
 
     @Test
+    fun sevenFieldRecordHasNoOs() {
+        // A native lib predating the 8th field: `os` defaults empty, everything else parses.
+        val h = parseHostRecord(rec("k", "n", "10.0.0.5", "9777", "", "optional", "aa:bb:cc:dd:ee:ff"))!!
+        assertEquals(listOf("aa:bb:cc:dd:ee:ff"), h.mac)
+        assertEquals("", h.os)
+    }
+
+    @Test
+    fun eighthFieldCarriesTheOsChain() {
+        val h = parseHostRecord(
+            rec("k", "n", "10.0.0.5", "9777", "", "optional", "", "linux/fedora/bazzite"),
+        )!!
+        assertEquals("linux/fedora/bazzite", h.os)
+    }
+
+    @Test
+    fun osChainIsSanitizedAsUntrustedInput() {
+        // mDNS is unauthenticated: junk is dropped, case folds, token/count caps apply.
+        val h = parseHostRecord(rec("k", "n", "10.0.0.5", "9777", "", "optional", "", "Linux/Fe do!ra"))!!
+        assertEquals("linux/fedora", h.os)
+        assertEquals("", sanitizeOsChain("///!!!"))
+        assertEquals("a/b/c/d/e", sanitizeOsChain("a/b/c/d/e/f/g"))
+    }
+
+    @Test
+    fun iconWalkIsMostSpecificFirstWithAliases() {
+        assertEquals(listOf("bazzite", "fedora", "linux"), osIconTokens("linux/fedora/bazzite"))
+        assertEquals(listOf("steam", "arch", "linux"), osIconTokens("linux/arch/steamos"))
+        assertEquals(listOf("apple"), osIconTokens("macos"))
+        assertTrue(osIconTokens("").isEmpty())
+    }
+
+    @Test
     fun emptyKeyFallsBackToAddrPort() {
         // Host advertised no `id` TXT → the native side leaves the key blank; we synthesize addr:port.
         val h = parseHostRecord(rec("", "name", "10.0.0.5", "9777", "", "required"))!!

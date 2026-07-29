@@ -18,16 +18,17 @@ data class DiscoveredHost(
     val fingerprint: String? = null, // TXT "fp" (host cert SHA-256, advisory — TOFU still verifies)
     val pairingRequired: Boolean = false,
     val mac: List<String> = emptyList(), // TXT "mac" (wake-capable NIC MAC(s), for Wake-on-LAN)
+    val os: String = "", // TXT "os" (OS-identity chain, e.g. "linux/fedora/bazzite"); "" on older hosts
 )
 
 /** Field separator the native browse uses inside one record (ASCII Unit Separator). */
 private const val FIELD_SEP = '\u001F'
 
 /**
- * Parse one record from [NativeBridge.nativeDiscoveryPoll] (`key␟name␟addr␟port␟fp␟pair␟mac`), or
- * null if it's malformed. `mac` (7th field) is optional — an older host omits it. Pure —
- * unit-tested without Android (see ParseRecordTest). The native side already applied the protocol
- * gate and address selection, so this is just field marshaling.
+ * Parse one record from [NativeBridge.nativeDiscoveryPoll] (`key␟name␟addr␟port␟fp␟pair␟mac␟os`),
+ * or null if it's malformed. Fields past the 6th are optional — an older native lib omits them
+ * (`mac` 7th, `os` 8th). Pure — unit-tested without Android (see ParseRecordTest). The native side
+ * already applied the protocol gate and address selection, so this is just field marshaling.
  */
 fun parseHostRecord(record: String): DiscoveredHost? {
     val f = record.split(FIELD_SEP)
@@ -44,8 +45,40 @@ fun parseHostRecord(record: String): DiscoveredHost? {
         pairingRequired = f[5] == "required",
         mac = if (f.size > 6) f[6].split(",").map { it.trim() }.filter { it.isNotEmpty() }
         else emptyList(),
+        os = if (f.size > 7) sanitizeOsChain(f[7]) else "",
     )
 }
+
+/**
+ * Reduce a raw `os` TXT value to the trusted grammar (pf-client-core's `sanitize_os`, mirrored):
+ * lowercase slash-separated tokens of `[a-z0-9._-]`, each ≤ 32 chars, at most 5. mDNS is
+ * unauthenticated input; a value that sanitizes to nothing becomes "" (no icon, like an older host).
+ */
+fun sanitizeOsChain(raw: String): String =
+    raw.lowercase()
+        .split('/')
+        .map { token -> token.filter { it in 'a'..'z' || it in '0'..'9' || it in "._-" }.take(32) }
+        .filter { it.isNotEmpty() }
+        .take(5)
+        .joinToString("/")
+
+/**
+ * The icon-lookup order for a chain: sanitized tokens most-specific-first, brand aliases applied
+ * (`macos` → `apple` art, `steamos` → `steam` art) — pf-client-core's `os_icon_tokens`, mirrored.
+ * The UI takes the first token it has art for; empty means "no OS icon" (older host / garbage).
+ */
+fun osIconTokens(chain: String): List<String> =
+    sanitizeOsChain(chain)
+        .split('/')
+        .filter { it.isNotEmpty() }
+        .reversed()
+        .map {
+            when (it) {
+                "macos" -> "apple"
+                "steamos" -> "steam"
+                else -> it
+            }
+        }
 
 /**
  * Browses `_punktfunk._udp` for punktfunk/1 hosts via the native `mdns-sd` core (the same browse the

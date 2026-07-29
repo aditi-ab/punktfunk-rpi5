@@ -31,9 +31,10 @@ const PROTO: &str = "punktfunk/1";
 /// Field separator inside one serialized record (ASCII Unit Separator — never in a field value).
 const FIELD_SEP: char = '\u{1f}';
 
-/// One resolved host, serialized to Kotlin as `key␟name␟addr␟port␟fp␟pair␟mac` (`␟` = [`FIELD_SEP`]).
-/// Records are newline-joined in a poll snapshot; [`Host::encode`] strips the framing bytes from
-/// every field so no value can break it.
+/// One resolved host, serialized to Kotlin as `key␟name␟addr␟port␟fp␟pair␟mac␟os`
+/// (`␟` = [`FIELD_SEP`]). Records are newline-joined in a poll snapshot; [`Host::encode`] strips
+/// the framing bytes from every field so no value can break it. New fields append (the Kotlin
+/// parser tolerates both arities), never reorder.
 #[derive(Clone, PartialEq)]
 struct Host {
     key: String,
@@ -44,6 +45,9 @@ struct Host {
     pair: String,
     /// Wake-on-LAN MAC(s) from the mDNS `mac` TXT (comma-separated), for later wake. Empty if absent.
     mac: String,
+    /// OS-identity chain from the mDNS `os` TXT (`linux/fedora/bazzite`, ...), for the host
+    /// card's OS icon. Empty if absent (older host).
+    os: String,
 }
 
 impl Host {
@@ -56,7 +60,7 @@ impl Host {
             s.replace(['\n', '\r', FIELD_SEP], "")
         }
         format!(
-            "{}{FIELD_SEP}{}{FIELD_SEP}{}{FIELD_SEP}{}{FIELD_SEP}{}{FIELD_SEP}{}{FIELD_SEP}{}",
+            "{}{FIELD_SEP}{}{FIELD_SEP}{}{FIELD_SEP}{}{FIELD_SEP}{}{FIELD_SEP}{}{FIELD_SEP}{}{FIELD_SEP}{}",
             clean(&self.key),
             clean(&self.name),
             clean(&self.addr),
@@ -64,6 +68,7 @@ impl Host {
             clean(&self.fp),
             clean(&self.pair),
             clean(&self.mac),
+            clean(&self.os),
         )
     }
 }
@@ -186,6 +191,7 @@ fn resolve(info: &ResolvedService) -> Option<Host> {
         fp: val("fp"),
         pair: val("pair"),
         mac: val("mac"),
+        os: val("os"),
     })
 }
 
@@ -206,7 +212,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeDiscoverySt
 }
 
 /// `NativeBridge.nativeDiscoveryPoll(handle): String` — the current resolved-host snapshot,
-/// newline-joined records of `key␟name␟addr␟port␟fp␟pair␟mac` (`␟` = U+001F). Empty string = no hosts /
+/// newline-joined records of `key␟name␟addr␟port␟fp␟pair␟mac␟os` (`␟` = U+001F). Empty string = no hosts /
 /// `0` handle. Poll ~1 Hz from the UI thread (cheap: a mutex lock + string build).
 #[no_mangle]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeDiscoveryPoll<'local>(
@@ -268,10 +274,11 @@ mod tests {
             fp: "ab".repeat(32),
             pair: "required".into(),
             mac: "aa:bb:cc:dd:ee:ff".into(),
+            os: "linux/fedora/bazzite".into(),
         };
         let encoded = h.encode();
         let fields: Vec<&str> = encoded.split(FIELD_SEP).collect();
-        assert_eq!(fields.len(), 7);
+        assert_eq!(fields.len(), 8);
         assert_eq!(fields[0], "host-123");
         assert_eq!(fields[1], "home-worker-2");
         assert_eq!(fields[2], "192.168.1.70");
@@ -279,6 +286,7 @@ mod tests {
         assert_eq!(fields[4], "ab".repeat(32));
         assert_eq!(fields[5], "required");
         assert_eq!(fields[6], "aa:bb:cc:dd:ee:ff");
+        assert_eq!(fields[7], "linux/fedora/bazzite");
         assert!(
             !encoded.contains('\n'),
             "a record must never contain the record separator"
@@ -297,12 +305,13 @@ mod tests {
             fp: "ab\u{1f}cd".into(),
             pair: "required\n".into(),
             mac: "aa:bb\u{1f}cc".into(),
+            os: "linux\u{1f}evil/arch".into(),
         };
         let encoded = h.encode();
         assert_eq!(
             encoded.matches(FIELD_SEP).count(),
-            6,
-            "exactly seven fields"
+            7,
+            "exactly eight fields"
         );
         assert!(!encoded.contains('\n') && !encoded.contains('\r'));
         let fields: Vec<&str> = encoded.split(FIELD_SEP).collect();
@@ -310,5 +319,6 @@ mod tests {
         assert_eq!(fields[1], "evilhost");
         assert_eq!(fields[4], "abcd");
         assert_eq!(fields[5], "required");
+        assert_eq!(fields[7], "linuxevil/arch");
     }
 }
