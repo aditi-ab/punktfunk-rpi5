@@ -26,6 +26,9 @@ on:
     paths:
       - 'crates/**'
       - 'clients/android/**'
+      # The builder image is part of what this artifact is built from — an image
+      # change must exercise its consumer.
+      - 'ci/android-ci.Dockerfile'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'rust-toolchain.toml'
@@ -39,6 +42,9 @@ on:
     paths:
       - 'crates/**'
       - 'clients/android/**'
+      # The builder image is part of what this artifact is built from — an image
+      # change must exercise its consumer.
+      - 'ci/android-ci.Dockerfile'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'rust-toolchain.toml'

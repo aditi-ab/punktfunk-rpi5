@@ -47,7 +47,11 @@ dependencies {
 // /README.md): `cargo install cargo-ndk` + `rustup target add aarch64-linux-android x86_64-linux-android`.
 // ------------------------------------------------------------------------------------------------
 val repoRoot = rootDir.parentFile.parentFile // clients/android -> clients -> repo root
-val cargoBin = "${System.getProperty("user.home")}/.cargo/bin"
+// CARGO_HOME first: rustup puts every binary in $CARGO_HOME/bin, and the CI image
+// (ci/android-ci.Dockerfile) installs the shared toolchain at /usr/local/cargo — the
+// historical ~/.cargo fallback is what a GUI Android Studio launch (no env) still needs.
+val cargoBin = System.getenv("CARGO_HOME")?.let { "$it/bin" }
+    ?: "${System.getProperty("user.home")}/.cargo/bin"
 
 // SDK location without depending on AGP's DSL (sdkDirectory isn't in AGP 9's library extension):
 // env first (set by Android Studio and by our CLI shell), then local.properties, then the default.
