@@ -49,7 +49,7 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
     && cargo install cargo-ndk --locked \
     && rm -rf "$CARGO_HOME/registry" "$CARGO_HOME/git" \
     && chmod -R a+w "$RUSTUP_HOME" "$CARGO_HOME" \
-    && rustc --version && cargo-ndk --version
+    && rustc --version && cargo ndk --version
 
 # Shared compile cache: jobs set RUSTC_WRAPPER=sccache (backend = RustFS S3 on the LAN,
 # see .gitea/workflows — the env lives there so dev use of this image stays uncached).
