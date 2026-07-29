@@ -303,18 +303,25 @@ fn edit_profile_modal(
             .into(),
         );
     }
+    // "Save", not "Close": every field in the sheet commits as you type, so this is really
+    // "done" — but the review is right that a sheet full of edits wants a verb, and Save
+    // is the promise the button already keeps.
+    let close_sheet = {
+        let (set_edit, set_rev) = (set_edit.clone(), set_rev.clone());
+        move || {
+            set_edit.call(false);
+            // The deferred repaint: the bar dropdown (and any pinned tiles) pick up the
+            // rename now, in one pass, instead of remounting per keystroke.
+            set_rev.call(rev + 1);
+        }
+    };
     buttons.push(
         {
-            let (set_edit, set_rev) = (set_edit.clone(), set_rev.clone());
-            button("Close")
+            let close_sheet = close_sheet.clone();
+            button("Save")
                 .accent()
-                .icon(Symbol::Accept)
-                .on_click(move || {
-                    set_edit.call(false);
-                    // The deferred repaint: the pane dropdown (and any pinned tiles) pick up the
-                    // rename now, in one pass, instead of remounting per keystroke.
-                    set_rev.call(rev + 1);
-                })
+                .icon(Symbol::Save)
+                .on_click(close_sheet)
         }
         .into(),
     );
@@ -327,21 +334,41 @@ fn edit_profile_modal(
     );
     // The content scrolls when the window is shorter than the sheet (same rule as the host
     // editor) — a sheet must never clip its own controls.
+    // A tap INSIDE the card bubbles up to the scrim (WinUI bubbles `Tapped`; reactor can't
+    // mark it handled), so the card raises this flag first and the scrim's handler swallows
+    // exactly that tap — a tap on the scrim itself, and Escape, dismiss the sheet.
+    let inside_tap = std::rc::Rc::new(std::cell::Cell::new(false));
     let modal = dialog_surface(scroll_view(vstack(rows).spacing(12.0)))
+        .on_tapped({
+            let inside_tap = inside_tap.clone();
+            move || inside_tap.set(true)
+        })
         .max_width(420.0)
         .horizontal_alignment(HorizontalAlignment::Center)
         .vertical_alignment(VerticalAlignment::Center)
         .margin(uniform(24.0));
-    // The scrim fills the cell and is hit-testable, so it blocks the page behind; it closes
-    // only via the buttons (a scrim tap would bubble `Tapped` up from the card too).
-    border(modal)
-        .background(Color {
-            a: 140,
-            r: 0,
-            g: 0,
-            b: 0,
-        })
-        .into()
+    let scrim_close = close_sheet.clone();
+    let esc_close = close_sheet;
+    Element::from(
+        border(modal)
+            .background(Color {
+                a: 140,
+                r: 0,
+                g: 0,
+                b: 0,
+            })
+            .on_tapped(move || {
+                if inside_tap.replace(false) {
+                    return;
+                }
+                scrim_close();
+            }),
+    )
+    .keyboard_accelerator(KeyboardAccelerator::new(
+        VirtualKey::Escape,
+        VirtualKeyModifiers::None,
+        esc_close,
+    ))
 }
 
 /// Persist one control's edit into the layer being edited.

@@ -396,6 +396,13 @@ fn edit_editor(
     // below the fold with nothing hinting at it (live-diagnosed 2026-07-29: a control's
     // visible rect was a 9-px sliver). A sheet centres at its own height — and its content
     // sits in a scroll_view, so a short window scrolls the card instead of clipping it.
+    // A tap on the scrim, or Escape, cancels (a tap INSIDE the card bubbles to the scrim —
+    // the flag makes the scrim swallow exactly that one).
+    let inside_tap = std::rc::Rc::new(std::cell::Cell::new(false));
+    let cancel = {
+        let se = set_edit.clone();
+        move || se.call(None)
+    };
     let modal = dialog_surface(scroll_view(
         vstack((
             text_block(format!("Edit \u{201c}{initial_name}\u{201d}"))
@@ -452,19 +459,35 @@ fn edit_editor(
         ))
         .spacing(10.0),
     ))
+    .on_tapped({
+        let inside_tap = inside_tap.clone();
+        move || inside_tap.set(true)
+    })
     .max_width(460.0)
     .horizontal_alignment(HorizontalAlignment::Center)
     .vertical_alignment(VerticalAlignment::Center)
     .margin(uniform(24.0));
-    // The scrim: blocks the page, closes only via Save/Cancel (same rules as the add modal).
-    border(modal)
-        .background(Color {
-            a: 140,
-            r: 0,
-            g: 0,
-            b: 0,
-        })
-        .into()
+    let scrim_cancel = cancel.clone();
+    Element::from(
+        border(modal)
+            .background(Color {
+                a: 140,
+                r: 0,
+                g: 0,
+                b: 0,
+            })
+            .on_tapped(move || {
+                if inside_tap.replace(false) {
+                    return;
+                }
+                scrim_cancel();
+            }),
+    )
+    .keyboard_accelerator(KeyboardAccelerator::new(
+        VirtualKey::Escape,
+        VirtualKeyModifiers::None,
+        cancel,
+    ))
 }
 
 pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
@@ -1074,16 +1097,38 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
 
     // The scrim fades in with the same tween. Its layer slot is STABLE (a same-kind,
     // background-less Border when closed — invisible and not hit-testable) so the layer
-    // list never changes shape around the always-mounted dialog after it.
+    // list never changes shape around the always-mounted dialog after it. A tap on the
+    // scrim, or Escape, cancels — with the same bubble-swallow flag the sheets use.
     let add_slot: Element = if show_add {
-        border(modal)
+        let inside_tap = std::rc::Rc::new(std::cell::Cell::new(false));
+        let cancel = {
+            let sa = set_show_add.clone();
+            move || sa.call(false)
+        };
+        let scrim_cancel = cancel.clone();
+        Element::from(
+            border(Element::from(modal).on_tapped({
+                let inside_tap = inside_tap.clone();
+                move || inside_tap.set(true)
+            }))
             .background(Color {
                 a: (140.0 * props.add_anim) as u8,
                 r: 0,
                 g: 0,
                 b: 0,
             })
-            .into()
+            .on_tapped(move || {
+                if inside_tap.replace(false) {
+                    return;
+                }
+                scrim_cancel();
+            }),
+        )
+        .keyboard_accelerator(KeyboardAccelerator::new(
+            VirtualKey::Escape,
+            VirtualKeyModifiers::None,
+            cancel,
+        ))
     } else {
         border(vstack(Vec::<Element>::new())).into()
     };
