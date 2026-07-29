@@ -419,7 +419,30 @@ fn region_for_mode<'a>(
     regions
         .iter()
         .find(|r| r.width as f32 == w && r.height as f32 == h)
+        // A display scale s shrinks the output's EI region to LOGICAL pixels (Mutter advertises
+        // 853x533 for a 1280x800 output at 1.5), so the exact rung above misses every scaled
+        // output and fell through to `regions.first()` — the wrong monitor whenever another
+        // region sorts first (on-glass: a park landed on a LINGERING sibling virtual display).
+        .or_else(|| regions.iter().find(|r| scaled_region_match(r, w, h)))
         .or_else(|| regions.first())
+}
+
+/// Is `r` the streamed `w`×`h` surface advertised at a display scale > 1 — i.e. does one
+/// consistent scale factor map the region onto the mode on both axes? Per-axis rounding
+/// (Mutter floors 1280/1.5 to 853) allows ±2 logical px of slack, scaled back into mode space.
+/// Scales run 1..=4 (fractional 1.25/1.5/1.75 included); exactly 1.0 is the exact rung's job,
+/// and anything past 4 is no real display scale — matching it would just resurrect the
+/// wrong-monitor fallback this rung exists to prevent.
+fn scaled_region_match(r: &reis::event::Region, w: f32, h: f32) -> bool {
+    let (rw, rh) = (r.width as f32, r.height as f32);
+    if rw < 1.0 || rh < 1.0 {
+        return false;
+    }
+    let s = w / rw;
+    if !(1.0..=4.0).contains(&s) {
+        return false;
+    }
+    (rh * s - h).abs() <= 2.0 * s
 }
 
 /// Report which region absolute coordinates actually landed in, once per distinct answer.
@@ -1077,6 +1100,36 @@ mod tests {
         };
         let picked = region_for_mode(&regions, 1920.0, 1080.0, Some(&anchor)).unwrap();
         assert_eq!(picked.mapping_id.as_deref(), Some("head-b"));
+    }
+
+    /// A display scale shrinks the output's EI region to logical pixels — the exact rung misses
+    /// it, and before the scaled rung the ladder fell through to `regions.first()`, the wrong
+    /// monitor. The on-glass shape: a 1280x800 stream whose output runs at 1.5 scale (Mutter
+    /// advertises 853x533, per-axis floor), listed AFTER a lingering sibling virtual display.
+    #[test]
+    fn a_scaled_output_beats_the_first_region_fallback() {
+        let regions = [
+            region(0, 0, 1462, 1044, None),    // lingering sibling virtual display
+            region(1462, 0, 1920, 1080, None), // physical
+            region(3382, 0, 853, 533, None),   // ours: 1280x800 at 1.5 scale
+        ];
+        let picked = region_for_mode(&regions, 1280.0, 800.0, None).unwrap();
+        assert_eq!((picked.width, picked.height), (853, 533));
+        // Integer scales round-trip too (2x: 640x400).
+        let regions = [
+            region(0, 0, 1920, 1080, None),
+            region(1920, 0, 640, 400, None),
+        ];
+        let picked = region_for_mode(&regions, 1280.0, 800.0, None).unwrap();
+        assert_eq!((picked.width, picked.height), (640, 400));
+        // A region that is NOT the mode at any consistent scale (wrong aspect) must not match —
+        // the fallback stays `regions.first()`.
+        let regions = [
+            region(0, 0, 1000, 1000, None),
+            region(1000, 0, 640, 200, None),
+        ];
+        let picked = region_for_mode(&regions, 1280.0, 800.0, None).unwrap();
+        assert_eq!((picked.width, picked.height), (1000, 1000));
     }
 
     /// A mirrored monitor's region is NOT the client's streamed size, so the size rung would miss
