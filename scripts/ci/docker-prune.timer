@@ -4,8 +4,9 @@
 # build failed with `as: BFD assertion fail` — assembler noise for "can't write, No space left on
 # device" — and by the time anyone looked, the disk was back to 37% used.)
 #
-# Ten minutes is mitigation, not a fix: the real levers are runner capacity (three replicas sharing
-# one 123 G disk) or a bigger disk. RandomizedDelaySec stays low so the guard is prompt.
+# Ten minutes is a backstop, not the fix. The fix was capacity: the LXC rootfs went 123 G -> 175 G
+# on 2026-07-29 (`pct resize 116 rootfs +50G` on home-node-1), which is what actually gives three
+# concurrent builds room. RandomizedDelaySec stays low so the guard is prompt.
 # Persistent=true catches up after downtime. Install: see the header of docker-prune.service.
 
 [Unit]

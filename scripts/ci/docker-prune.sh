@@ -41,13 +41,20 @@ fi
 
 # 3) Burst guard: a push-storm fills the disk WITHIN one interval — three concurrent Rust builds,
 #    each with a multi-GB target/, on top of a ~40 GB containerd image baseline. Trigger on a free
-#    -space FLOOR as well as a percentage: the percentage alone is the wrong instrument here,
-#    because 80% of 123 G still leaves only ~25 G, which three jobs can swallow before the next
-#    poll. In-use images are protected by the daemon, so this cannot pull the rug from a live job.
+#    -space FLOOR as well as a percentage: the percentage is the wrong instrument on its own, since
+#    what matters is absolute headroom for three concurrent target/ dirs, not a ratio — and the
+#    ratio moves whenever the disk is resized (it went 123 G -> 175 G on 2026-07-29) while the
+#    headroom three jobs need does not. In-use images are protected by the daemon, so a burst clear
+#    cannot pull the rug from a live job.
 PCT=$(df --output=pcent / | tr -dc '0-9')
 FREE_GB=$(df --output=avail -BG / | tr -dc '0-9')
-if { [ -n "$PCT" ] && [ "$PCT" -ge "$BURST_PCT" ]; } ||
-   { [ -n "$FREE_GB" ] && [ "$FREE_GB" -lt "$MIN_FREE_GB" ]; }; then
+# Two flat tests into a flag rather than one multi-line `{ …; } || { …; }` condition: the brace-group
+# form is easy to get subtly wrong across a line break, and this reads as what it is — either signal
+# alone is enough. Empty values (a df that failed) simply leave the flag unset, i.e. no clear.
+BURST=0
+[ -n "$PCT" ] && [ "$PCT" -ge "$BURST_PCT" ] && BURST=1
+[ -n "$FREE_GB" ] && [ "$FREE_GB" -lt "$MIN_FREE_GB" ] && BURST=1
+if [ "$BURST" = 1 ]; then
   echo "disk ${PCT}% used, ${FREE_GB}G free (thresholds ${BURST_PCT}% / ${MIN_FREE_GB}G) — burst clear"
   docker image prune -af   || true
   docker builder prune -af || true
