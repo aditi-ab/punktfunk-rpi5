@@ -13,6 +13,7 @@
 #if canImport(Network)
 import Foundation
 import Network
+import PunktfunkShared
 
 /// A punktfunk/1 host found on the LAN. `fingerprintHex` is advisory (see file header).
 public struct DiscoveredHost: Identifiable, Sendable, Equatable {
@@ -37,6 +38,10 @@ public struct DiscoveredHost: Identifiable, Sendable, Equatable {
     /// value only makes a wake fail — the magic packet is inert and the fingerprint still gates
     /// the connection).
     public let macAddresses: [String]
+    /// The host's OS-identity chain (mDNS `os` TXT, e.g. `linux/fedora/bazzite`), sanitized
+    /// (`sanitizeOsChain`) — drives the host card's OS mark and is persisted like the MACs.
+    /// Empty when not advertised (older host). Advisory/unauthenticated like the rest.
+    public let osChain: String
 }
 
 @MainActor
@@ -118,6 +123,7 @@ public final class HostDiscovery: ObservableObject {
         var pair: String?
         var id: String?
         var macs: [String] = []
+        var osChain = ""
         if case let .bonjour(txt) = result.metadata {
             fp = Self.entry(txt, "fp")
             pair = Self.entry(txt, "pair")
@@ -126,6 +132,7 @@ public final class HostDiscovery: ObservableObject {
                 .split(separator: ",")
                 .map { $0.trimmingCharacters(in: .whitespaces) }
                 .filter { !$0.isEmpty }
+            osChain = sanitizeOsChain(Self.entry(txt, "os") ?? "")
         }
         // Resolve over IPv4 only: Network.framework prefers IPv6 (RFC 6724), and the host's OS
         // mDNS responder often answers AAAA for its hostname even though the punktfunk host stack
@@ -149,7 +156,8 @@ public final class HostDiscovery: ObservableObject {
                             id: (id?.isEmpty == false) ? id! : name,
                             name: name, host: address, port: port.rawValue,
                             fingerprintHex: fp, requiresPairing: pair == "required",
-                            allowsTofu: pair == "optional", macAddresses: macs)
+                            allowsTofu: pair == "optional", macAddresses: macs,
+                            osChain: osChain)
                         self.publish()
                     }
                     conn.cancel()

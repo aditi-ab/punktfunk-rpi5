@@ -916,6 +916,7 @@ struct ContentView: View {
     private func prepareWake(for host: StoredHost) {
         if let live = discovery.hosts.first(where: { host.matches($0) }) {
             store.updateMacs(host.id, macs: live.macAddresses) // learn — on every platform
+            store.updateOsChain(host.id, chain: live.osChain) // ditto for the card's OS mark
         } else if autoWakeEnabled, PunktfunkConnection.wakeOnLANAvailable, !host.wakeMacs.isEmpty {
             // Auto-wake only: fire the up-front packet so a genuinely-asleep host is booting while the
             // dial times out. With auto-wake off, connects go straight through (no packet).
@@ -970,7 +971,8 @@ struct ContentView: View {
         guard !model.isBusy else { return }
         let host = StoredHost(
             name: d.name, address: d.host, port: d.port,
-            macAddresses: d.macAddresses.isEmpty ? nil : d.macAddresses)
+            macAddresses: d.macAddresses.isEmpty ? nil : d.macAddresses,
+            osChain: d.osChain.isEmpty ? nil : d.osChain)
         store.add(host)
         if d.allowsTofu {
             connect(host, allowTofu: true)

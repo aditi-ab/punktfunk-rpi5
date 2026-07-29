@@ -295,6 +295,16 @@ struct HostCardView: View {
     /// certificate is pinned (the lock state, spelled out).
     @ViewBuilder private func statusRow(_ m: CardMetrics) -> some View {
         HStack(spacing: 6) {
+            // The host's OS mark leads the row (template asset — tints like an SF Symbol);
+            // absent entirely for a host that never advertised one, so those cards render
+            // exactly as they always did.
+            if let mark = osIconImage(for: host.osChain) {
+                mark
+                    .resizable()
+                    .scaledToFit()
+                    .frame(width: m.status + 2, height: m.status + 2)
+                    .accessibilityLabel(host.osChain ?? "")
+            }
             RoundedRectangle(cornerRadius: 1.5)
                 .fill(isOnline ? Color.green : Color.secondary.opacity(0.4))
                 .frame(width: 6, height: 6)
@@ -365,6 +375,14 @@ struct DiscoveredCardView: View {
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                     HStack(spacing: 6) {
+                        // Same leading OS mark as a saved card's status row — live from the advert.
+                        if let mark = osIconImage(for: discovered.osChain) {
+                            mark
+                                .resizable()
+                                .scaledToFit()
+                                .frame(width: m.status + 2, height: m.status + 2)
+                                .accessibilityLabel(discovered.osChain)
+                        }
                         Image(systemName: discovered.requiresPairing
                             ? "lock.fill" : "antenna.radiowaves.left.and.right")
                             .font(.system(size: m.status))

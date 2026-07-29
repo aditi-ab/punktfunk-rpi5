@@ -25,11 +25,13 @@ final class SharedFoundationTests: XCTestCase {
             lastConnected: Date(timeIntervalSince1970: 1_700_000_000),
             mgmtPort: 47990, macAddresses: ["aa:bb:cc:dd:ee:ff"], clipboardSync: true,
             profileID: "a1b2c3d4e5f6", pinnedProfileIDs: ["0f0f0f0f0f0f"],
-            addedAt: Date(timeIntervalSince1970: 1_600_000_000))
+            addedAt: Date(timeIntervalSince1970: 1_600_000_000),
+            osChain: "linux/fedora/bazzite")
 
         let data = try JSONEncoder().encode(host)
         let decoded = try JSONDecoder().decode(StoredHost.self, from: data)
         XCTAssertEqual(decoded, host)
+        XCTAssertEqual(decoded.osChain, "linux/fedora/bazzite")
     }
 
     /// Older saved hosts predate `mgmtPort`/`macAddresses` — and now `profileID`/
@@ -51,6 +53,7 @@ final class SharedFoundationTests: XCTestCase {
         XCTAssertNil(decoded.profileID)
         XCTAssertNil(decoded.pinnedProfileIDs)
         XCTAssertNil(decoded.addedAt)
+        XCTAssertNil(decoded.osChain)
         // Resolvers fall back cleanly.
         XCTAssertEqual(decoded.effectiveMgmtPort, punktfunkDefaultMgmtPort)
         XCTAssertEqual(decoded.wakeMacs, [])
@@ -60,6 +63,26 @@ final class SharedFoundationTests: XCTestCase {
     func testStoredHostDisplayNameFallsBackToAddress() {
         let host = StoredHost(name: "", address: "10.0.0.9")
         XCTAssertEqual(host.displayName, "10.0.0.9")
+    }
+
+    // MARK: - OS-identity chain (mDNS `os` TXT → card icon walk)
+
+    /// Mirrors pf-client-core's `os.rs` tests — the two implementations must agree on the
+    /// grammar (lowercase `[a-z0-9._-]` tokens, ≤ 32 chars each, ≤ 5 of them) and the walk
+    /// order (most-specific-first, `macos`→`apple`, `steamos`→`steam`).
+    func testOsChainSanitizeAndWalk() {
+        XCTAssertEqual(sanitizeOsChain("linux/fedora/bazzite"), "linux/fedora/bazzite")
+        XCTAssertEqual(sanitizeOsChain("Linux/Fe do!ra"), "linux/fedora")
+        XCTAssertEqual(sanitizeOsChain("///"), "")
+        XCTAssertEqual(sanitizeOsChain("a/b/c/d/e/f/g"), "a/b/c/d/e")
+        XCTAssertEqual(sanitizeOsChain(String(repeating: "x", count: 80)),
+                       String(repeating: "x", count: 32))
+
+        XCTAssertEqual(osIconTokens("linux/fedora/bazzite"), ["bazzite", "fedora", "linux"])
+        XCTAssertEqual(osIconTokens("linux/arch/steamos"), ["steam", "arch", "linux"])
+        XCTAssertEqual(osIconTokens("macos"), ["apple"])
+        XCTAssertEqual(osIconTokens(nil), [])
+        XCTAssertEqual(osIconTokens("!!!"), [])
     }
 
     // MARK: - DeepLink grammar (the cross-language vector file)

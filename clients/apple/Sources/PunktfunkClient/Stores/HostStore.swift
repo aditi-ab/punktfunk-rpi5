@@ -153,6 +153,15 @@ final class HostStore: ObservableObject {
         hosts[i].macAddresses = macs
     }
 
+    /// Learn/refresh this host's OS-identity chain from its live advert — same contract as
+    /// [`updateMacs`]: no-op when empty or unchanged, so discovery ticks don't churn UserDefaults.
+    func updateOsChain(_ hostID: UUID, chain: String) {
+        guard !chain.isEmpty,
+              let i = hosts.firstIndex(where: { $0.id == hostID }),
+              hosts[i].osChain != chain else { return }
+        hosts[i].osChain = chain
+    }
+
     /// Bind this host to a settings profile, or to "Default settings" (nil) — the ONLY way the
     /// default changes. A one-off "Connect with ▸" deliberately never lands here (§5.2:
     /// predictable, not sticky).
