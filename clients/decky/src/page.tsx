@@ -30,6 +30,7 @@ import {
 } from "react-icons/fa";
 import { UpdateInfo, forgetHost, killStream } from "./backend";
 import { PluginErrorBoundary } from "./boundary";
+import { OsMark } from "./os-icon";
 import {
   DOCS_URL,
   HostView,
@@ -182,6 +183,7 @@ const HostRow: FC<{
     <Field
       label={
         <span style={{ display: "inline-flex", alignItems: "center", gap: "0.4em" }}>
+          <OsMark os={host.os} />
           {pair ? <FaLock /> : <FaLockOpen />}
           {host.name}
         </span>

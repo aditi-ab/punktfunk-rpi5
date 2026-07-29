@@ -644,6 +644,9 @@ def _parse_avahi_browse(stdout: str) -> list[dict]:
             "proto": props.get("proto", ""),
             "id": props.get("id", ""),
             "mgmt": mgmt,
+            # OS-identity chain for the host row's icon (e.g. "linux/fedora/bazzite");
+            # empty on an older host that doesn't advertise it.
+            "os": props.get("os", ""),
         }
         key = props.get("id") or f"{address}:{port}"
         existing = out.get(key)

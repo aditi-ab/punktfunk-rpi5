@@ -11,6 +11,7 @@ export interface Host {
   paired: boolean; // whether THIS device has already PIN-paired this host (by fingerprint)
   id: string; // the host's stable instance id (mDNS TXT `id`; "" when not advertised)
   mgmt: number; // management-API port (mDNS TXT `mgmt`; 0 = not advertised → default 47990)
+  os: string; // OS-identity chain (mDNS TXT `os`, e.g. "linux/fedora/bazzite"); "" on older hosts
 }
 
 // One title from a host's game library (the flatpak client's --library TSV, parsed by the
@@ -66,6 +67,9 @@ export interface SavedHost {
   fp_hex: string; // host cert fingerprint (lowercase hex); "" for a not-yet-paired manual entry
   paired: boolean;
   mac: string[];
+  // OS-identity chain learned by the desktop client; optional because the installed
+  // flatpak client may predate the field.
+  os?: string;
   last_used: number | null;
   online: boolean | null;
 }

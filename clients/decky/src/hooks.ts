@@ -107,6 +107,7 @@ export interface HostView {
   pairPolicy: string; // the advert's policy ("required"|"optional"), "" when not advertising
   mgmt: number; // advertised mgmt-API port (0 = not advertised → default)
   id: string; // advertised stable host id ("" when not advertising)
+  os: string; // OS-identity chain (live advert preferred, else the stored one); "" unknown
 }
 
 function advertMatchesSaved(a: Host, s: SavedHost): boolean {
@@ -131,6 +132,7 @@ export function mergeHosts(saved: SavedHost[], discovered: Host[]): HostView[] {
       pairPolicy: advert?.pair ?? "",
       mgmt: advert?.mgmt ?? 0,
       id: advert?.id ?? "",
+      os: advert?.os || s.os || "",
     };
   });
   for (const a of discovered) {
@@ -148,6 +150,7 @@ export function mergeHosts(saved: SavedHost[], discovered: Host[]): HostView[] {
       pairPolicy: a.pair,
       mgmt: a.mgmt,
       id: a.id,
+      os: a.os,
     });
   }
   return views;
@@ -174,6 +177,7 @@ export function toHost(v: HostView): Host {
     paired: v.paired,
     id: v.id,
     mgmt: v.mgmt,
+    os: v.os,
   };
 }
 
@@ -485,6 +489,7 @@ export function resolvePinHost(
       paired: !!pin.paired,
       id: pin.host_id,
       mgmt: pin.mgmt,
+      os: "", // pins don't store the chain; the icon is a hosts-tab affordance
     },
     online: false,
   };
