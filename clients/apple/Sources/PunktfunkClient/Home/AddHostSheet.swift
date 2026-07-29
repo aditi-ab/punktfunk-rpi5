@@ -250,6 +250,8 @@ struct AddHostSheet: View {
                 }
             } footer: {
                 Text("The settings a plain tap on this host streams with.")
+                    .font(.geist(12, relativeTo: .caption))
+                    .foregroundStyle(.secondary)
             }
             Section {
                 ForEach(profiles.profiles) { profile in
@@ -267,6 +269,8 @@ struct AddHostSheet: View {
                 Text("Pinned cards")
             } footer: {
                 Text("A pinned profile gets its own card next to this host — one tap, no menu.")
+                    .font(.geist(12, relativeTo: .caption))
+                    .foregroundStyle(.secondary)
             }
         }
         #endif

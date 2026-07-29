@@ -275,6 +275,10 @@ extension SettingsView {
                 .accessibilityLabel("Reset to Default settings")
                 .help("Stop overriding this — follow Default settings again")
             }
+            // The marker carries a bordered button, which needs more air under the control or
+            // caption above it than a line of text would. Here rather than at each call site, so
+            // every row that shows it is spaced the same.
+            .padding(.top, 4)
         }
     }
 

@@ -238,7 +238,12 @@ struct SettingsView: View {
                 Section {
                     scopeRow
                 } footer: {
+                    // A List footer inherits the app's body font unless it's told otherwise, and
+                    // 17pt Geist next to the 12pt footers everywhere else read as a different
+                    // kind of text. Same style as every other footer in this surface.
                     Text(scopeCaption)
+                        .font(.geist(12, relativeTo: .caption))
+                        .foregroundStyle(.secondary)
                 }
                 ForEach(SettingsCategory.allCases) { category in
                     // On iPhone the split view collapses to a push list, but a selection List

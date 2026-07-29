@@ -36,16 +36,20 @@ extension SettingsView {
             #if os(iOS) || os(macOS)
             // Match-window (design/midstream-resolution-resize.md D1): follow the session
             // window/scene, renegotiating the host mode on a resize. Off → the explicit mode below.
+            // NO marker here even though this toggle writes one: match-window, width and
+            // height are ONE override (they are reset together), and hanging its marker off the
+            // first of the two controls that drive it read as if the toggle alone were
+            // overridden. It goes under the size control below, for the group.
             described(effective.matchWindow
                 ? "The host resizes its output to follow this window — the picture stays "
                     + "pixel-exact (1:1) through every resize."
-                : "Stream at the fixed mode below; a window at a different size shows it scaled.",
-                field: OverlayField.resolution) {
+                : "Stream at the fixed mode below; a window at a different size shows it scaled.") {
                 Toggle("Match window", isOn: scoped(SettingsFields.matchWindow))
             }
             #endif
             #if os(iOS)
             iosResolutionWheel
+            overrideMarker(OverlayField.resolution)
             iosRefreshRows
             Button("Use this display's mode") { fillFromMainScreen() }
             #elseif os(macOS)
@@ -57,6 +61,7 @@ extension SettingsView {
                 TextField("", value: scoped(SettingsFields.height), format: .number.grouping(.never))
                     .labelsHidden()
             }
+            overrideMarker(OverlayField.resolution)
             described("The host drives a real virtual output at exactly this size and refresh — "
                 + "true pixels, no scaling.", field: "refresh_hz") {
                 TextField(
