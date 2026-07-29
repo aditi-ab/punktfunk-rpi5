@@ -44,6 +44,21 @@ struct AddHostSheet: View {
     @State private var editingField: EditField?
     #endif
 
+    /// A field's placeholder, which is not the same job on both platforms.
+    ///
+    /// macOS draws a `TextField`'s title as a leading label, so the prompt only has to hint at the
+    /// VALUE. On iOS that title becomes an accessibility label the moment a prompt exists and
+    /// nothing is drawn — the prompt is the field's entire visible identity, so it has to name the
+    /// field as well as hint at it. Writing one string for both leaves you a Mac panel that says
+    /// everything twice or a phone form of unlabelled boxes.
+    private static func prompt(touch: String, desktop: String) -> Text {
+        #if os(macOS)
+        Text(desktop)
+        #else
+        Text(touch)
+        #endif
+    }
+
     private var isEditing: Bool { existing != nil }
     private var actionTitle: String { isEditing ? "Save" : "Add Host" }
     private var canSave: Bool { !address.trimmingCharacters(in: .whitespaces).isEmpty }
@@ -113,16 +128,18 @@ struct AddHostSheet: View {
         #else
         VStack(spacing: 0) {
             Form {
-                TextField("Name", text: $name, prompt: Text("Optional — e.g. Living Room"))
+                TextField(
+                    "Name", text: $name,
+                    prompt: Self.prompt(
+                        touch: "Name (optional, e.g. Living Room)",
+                        desktop: "Optional — e.g. Living Room"))
                 TextField("Address", text: $address, prompt: Text("IP or hostname"))
                 TextField("Port", value: $port, format: .number.grouping(.never))
-                // The PROMPT is the only thing on show here on iOS (a field's title is its
-                // accessibility label once a prompt is given), so it has to name the field
-                // itself — "Wake-on-LAN — auto-filled when known" read as if that were the
-                // value being asked for.
                 TextField(
                     "MAC address", text: $mac,
-                    prompt: Text("MAC address (for Wake-on-LAN, optional)"))
+                    prompt: Self.prompt(
+                        touch: "MAC address (for Wake-on-LAN, optional)",
+                        desktop: "For Wake-on-LAN, optional"))
                     .autocorrectionDisabled()
                     #if os(iOS)
                     .textInputAutocapitalization(.never)
