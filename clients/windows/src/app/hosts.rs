@@ -20,14 +20,17 @@ const MENU_WAKE: &str = "Wake host";
 /// Apple client's add/edit sheet. A menu item per field read as clutter and buried the ones
 /// that matter.
 const MENU_EDIT: &str = "Edit\u{2026}";
-/// Dynamic menu-item prefixes: this flyout has no submenus, so the profile entries are flat
-/// items matched by prefix. The trailing space keeps them readable AND keeps a profile named
-/// e.g. "Copy link" from colliding with a fixed entry.
-const MENU_WITH: &str = "Connect with: ";
+/// The per-profile families nest in submenus. Submenu LEAVES are what the shared click
+/// callback reports (the backend wires clicks recursively and hands back the leaf text):
+/// "Connect with"'s leaves are the bare profile names + [`SUB_WITH_DEFAULT`]; "Pin tiles"'s
+/// leaves keep a verb prefix, which is what tells the two families apart in the callback.
+/// (A profile literally named like a fixed entry, e.g. "Connect", is shadowed by it — the
+/// same last-wins rule the scope dropdown documents.)
+const SUB_WITH: &str = "Connect with";
+const SUB_WITH_DEFAULT: &str = "Default settings";
+const SUB_PIN: &str = "Pin tiles";
 const MENU_COPY_LINK: &str = "Copy link";
 const MENU_SHORTCUT: &str = "Create shortcut\u{2026}";
-/// Pin/unpin a profile's one-click tile for this host — dynamic per profile, prefix-matched
-/// like [`MENU_WITH`] (same flat-flyout constraint, same collision-proof trailing space).
 const MENU_PIN: &str = "Pin tile: ";
 const MENU_UNPIN: &str = "Unpin tile: ";
 const MENU_FORGET: &str = "Forget\u{2026}";
@@ -707,19 +710,19 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                     .menu_flyout({
                         // Kept short deliberately, and in sections. It had grown into a list of
                         // everything, with the entries you actually reach for (connect, library,
-                        // speed) buried in list management. Two rules thin it: anything that
-                        // CONFIGURES the host lives in the editor — the default profile and the
-                        // pinned tiles are properties of the record, and the editor is where you
-                        // already go to change its name or address — and what is left is
-                        // grouped, so a glance lands on the right third of the menu.
+                        // speed) buried in list management. The per-profile families nest in
+                        // SUBMENUS — one "Connect with" and one "Pin tiles" — so the top level
+                        // stays a fixed handful whatever the catalog grows to.
                         let mut items = vec![menu_item(MENU_CONNECT)];
-                        // One-off connects, flat: this flyout has no submenus, so each profile
-                        // is its own item. "Connect with" NEVER rebinds the host.
-                        for (_, name, _) in profiles.iter() {
-                            items.push(menu_item(format!("{MENU_WITH}{name}")));
-                        }
+                        // One-off connects: "Connect with" NEVER rebinds the host. Submenu
+                        // leaves report their own text, so the leaf names stay bare.
                         if !profiles.is_empty() {
-                            items.push(menu_item(format!("{MENU_WITH}Default settings")));
+                            let mut leaves: Vec<MenuItemDef> = profiles
+                                .iter()
+                                .map(|(_, name, _)| menu_item(name.clone()))
+                                .collect();
+                            leaves.push(menu_item(SUB_WITH_DEFAULT));
+                            items.push(menu_sub_item(SUB_WITH, leaves));
                         }
 
                         items.push(menu_separator());
@@ -739,13 +742,21 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                         items.push(menu_item(MENU_COPY_LINK));
                         items.push(menu_item(MENU_SHORTCUT));
                         // Pin/unpin a profile's one-click tile, beside the other tile-shaped
-                        // shortcuts (the review moved these here from the editor).
-                        for (id, name, _) in profiles.iter() {
-                            let pinned = pinned_now.iter().any(|x| x == id);
-                            items.push(menu_item(format!(
-                                "{}{name}",
-                                if pinned { MENU_UNPIN } else { MENU_PIN }
-                            )));
+                        // shortcuts. The verb prefixes stay on the leaves: "Connect with"'s
+                        // leaves are bare names, and the shared click callback only gets the
+                        // leaf text — the prefix is what keeps the two families apart.
+                        if !profiles.is_empty() {
+                            let leaves: Vec<MenuItemDef> = profiles
+                                .iter()
+                                .map(|(id, name, _)| {
+                                    let pinned = pinned_now.iter().any(|x| x == id);
+                                    menu_item(format!(
+                                        "{}{name}",
+                                        if pinned { MENU_UNPIN } else { MENU_PIN }
+                                    ))
+                                })
+                                .collect();
+                            items.push(menu_sub_item(SUB_PIN, leaves));
                         }
 
                         items.push(menu_separator());
@@ -781,20 +792,6 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                             // as state did — the bump is what makes the pinned tile appear
                             // (or vanish) NOW, not on the next discovery tick.
                             set_hosts_rev.call(hosts_rev + 1);
-                        }
-                        _ if item.starts_with(MENU_WITH) => {
-                            let name = item.trim_start_matches(MENU_WITH);
-                            let mut target = target.clone();
-                            // `Some("")` — not `None` — so "Default settings" really does
-                            // override a bound host for this one connect.
-                            target.profile = Some(
-                                menu_profiles
-                                    .iter()
-                                    .find(|(_, n, _)| n == name)
-                                    .map(|(id, _, _)| id.clone())
-                                    .unwrap_or_default(),
-                            );
-                            initiate(&svc.ctx, target, &svc.set_screen, &svc.set_status)
                         }
                         MENU_SHORTCUT => {
                             let url = pf_client_core::deeplink::DeepLink::for_host(
@@ -838,7 +835,24 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                         }
                         MENU_EDIT => sr.call(Some((fp.clone(), name.clone()))),
                         MENU_FORGET => sf.call(Some((fp.clone(), name.clone()))),
-                        _ => {}
+                        // "Connect with"'s submenu leaves: a bare profile name, or
+                        // SUB_WITH_DEFAULT. `Some("")` — not `None` — so Default settings
+                        // really does override a bound host for this one connect.
+                        other => {
+                            let profile_id = if other == SUB_WITH_DEFAULT {
+                                Some(String::new())
+                            } else {
+                                menu_profiles
+                                    .iter()
+                                    .find(|(_, n, _)| n == other)
+                                    .map(|(id, _, _)| id.clone())
+                            };
+                            if let Some(id) = profile_id {
+                                let mut target = target.clone();
+                                target.profile = Some(id);
+                                initiate(&svc.ctx, target, &svc.set_screen, &svc.set_status)
+                            }
+                        }
                     })
             };
             let (ctx2, ss, st) = (ctx.clone(), set_screen.clone(), set_status.clone());
