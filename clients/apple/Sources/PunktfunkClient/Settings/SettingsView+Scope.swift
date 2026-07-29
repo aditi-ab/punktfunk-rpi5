@@ -395,6 +395,12 @@ extension SettingsView {
                 }
                 .menuStyle(.button)
                 .fixedSize()
+                // Same reason as the host grid's sort menu: a Menu draws its label — and the
+                // icons of everything inside it — in the ACCENT colour, which put a purple wash
+                // over a control whose only meaningful colour is the profile chips. Those are
+                // rendered bitmaps (see MenuIcon), so they keep their colour; the decoration
+                // loses its. macOS only — iOS menus already draw their icons in the label colour.
+                .tint(.primary)
                 Text(scopeCaption)
                     .font(.geist(12, relativeTo: .caption))
                     .foregroundStyle(.secondary)
