@@ -394,7 +394,14 @@ private fun OverrideBadge(field: String?) {
     // One compact line. A `TextButton` here carried its own 48dp touch target and dwarfed both the
     // control it annotates and the caption under it; the reset keeps a generous padded hit area
     // instead, which is the right trade for a secondary action inside a dense settings list.
-    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        // No vertical padding of its own: this row is the FIRST thing in a card whose column
+        // already pads 16dp, and anything added here reads as double the gap every other row has.
+        // The bottom padding is the badge's tie to the control it annotates — deliberately tighter
+        // than the gap down to the caption, so the marker groups upward with its own field.
+        modifier = Modifier.fillMaxWidth().padding(bottom = 6.dp),
+    ) {
         AccentDot(MaterialTheme.colorScheme.primary, size = 6)
         Text(
             "Overridden",
@@ -409,7 +416,7 @@ private fun OverrideBadge(field: String?) {
             modifier = Modifier
                 .clip(RoundedCornerShape(6.dp))
                 .clickable { scope.onReset(field) }
-                .padding(horizontal = 10.dp, vertical = 6.dp),
+                .padding(horizontal = 10.dp, vertical = 2.dp),
         )
     }
 }
@@ -876,7 +883,7 @@ private fun ToggleRow(
 ) {
     // Dim the labels when disabled so the row reads as inactive (the Switch dims itself).
     val labelAlpha = if (enabled) 1f else 0.38f
-    Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+    Column {
         OverrideBadge(field)
         Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f)) {
@@ -940,7 +947,7 @@ private fun <T> SettingDropdown(
     var expanded by remember { mutableStateOf(false) }
     val selectedLabel = options.firstOrNull { it.first == selected }?.second
         ?: options.firstOrNull()?.second.orEmpty()
-    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+    Column {
         OverrideBadge(field)
         ExposedDropdownMenuBox(expanded = expanded, onExpandedChange = { expanded = it }) {
             OutlinedTextField(
@@ -970,6 +977,7 @@ private fun <T> SettingDropdown(
                 caption,
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(top = 10.dp),
             )
         }
     }
