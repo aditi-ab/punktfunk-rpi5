@@ -147,7 +147,7 @@ pub(crate) fn hex_color(hex: &str) -> Option<Color> {
 }
 
 /// The colour row: one tappable swatch per palette entry, the current one ringed.
-fn colour_swatches(profile: &StreamProfile, rev: u64, set_rev: &SetState<u64>) -> Element {
+fn colour_swatches(profile: &StreamProfile, rev: u64, set_rev: &AsyncSetState<u64>) -> Element {
     let current = profile.accent.clone().unwrap_or_default();
     let mut row: Vec<Element> = vec![text_block("Colour")
         .font_size(12.0)
@@ -202,11 +202,11 @@ fn colour_swatches(profile: &StreamProfile, rev: u64, set_rev: &SetState<u64>) -
 /// under the user mid-keystroke.
 fn edit_profile_modal(
     profile: &StreamProfile,
-    set_scope: &SetState<String>,
-    set_delete: &SetState<Option<String>>,
-    set_edit: &SetState<bool>,
+    set_scope: &AsyncSetState<String>,
+    set_delete: &AsyncSetState<Option<String>>,
+    set_edit: &AsyncSetState<bool>,
     rev: u64,
-    set_rev: &SetState<u64>,
+    set_rev: &AsyncSetState<u64>,
 ) -> Element {
     let id = profile.id.clone();
     let name_box = {
@@ -320,7 +320,7 @@ fn edit_profile_modal(
 fn commit(
     ctx: &Arc<AppCtx>,
     scope: &str,
-    rev: (u64, &SetState<u64>),
+    rev: (u64, &AsyncSetState<u64>),
     edit: impl FnOnce(&mut Settings),
 ) {
     if scope.is_empty() {
@@ -405,7 +405,7 @@ fn active_profile(scope: &str) -> Option<StreamProfile> {
 fn setting_combo(
     ctx: &Arc<AppCtx>,
     scope: &str,
-    rev: (u64, &SetState<u64>),
+    rev: (u64, &AsyncSetState<u64>),
     header: &str,
     names: Vec<String>,
     current: usize,
@@ -435,7 +435,7 @@ fn presets<V>(table: &[(V, &str)], is_current: impl Fn(&V) -> bool) -> (Vec<Stri
 fn setting_toggle(
     ctx: &Arc<AppCtx>,
     scope: &str,
-    rev: (u64, &SetState<u64>),
+    rev: (u64, &AsyncSetState<u64>),
     header: &str,
     on: bool,
     apply: impl Fn(&mut Settings, bool) + 'static,
@@ -466,7 +466,7 @@ fn setting_toggle(
 /// its row, and "not overridden" needs an explicit Reset. (Linux marks a literal no-op
 /// touch too — unobservable here, the one intentional divergence.)
 fn described_overridable(
-    rev: (u64, &SetState<u64>),
+    rev: (u64, &AsyncSetState<u64>),
     scope: &str,
     field: &'static str,
     overridden: bool,
@@ -559,77 +559,32 @@ fn group(header: Option<&str>, fields: Vec<Element>, footer: Option<&str>) -> Ve
     out
 }
 
-/// Props for the settings page (mounted as its own `component(...)` so its hooks live in an
-/// isolated slot list — see `Svc`'s docs in `app/mod.rs`).
-///
-/// What is a prop here (vs the page's own `use_state`) is deliberate:
-/// * `section` + `set_section` — the selected pane tag stays ROOT state because the
-///   section-switch entrance tween in `app/mod.rs` is keyed on it: the tween worker thread
-///   writes root async state (`nav_anim`), and root can only start it if it owns the trigger.
-///   The NavigationView's `on_selection_changed` therefore keeps calling the root setter.
-/// * `progress` — that tween's value (0 → 1), root-driven for the same reason.
-/// * `window_width` — read at root (`use_inner_size`) so resize re-renders the tree; the page
-///   only compares it against WinUI's pane-collapse threshold.
-///
-/// Everything else the page shows (scope, delete confirmation, edit modal, revision) is its
-/// own sync `use_state` — see `settings_page`.
-#[derive(Clone)]
-pub(crate) struct SettingsProps {
-    pub(crate) ctx: Arc<AppCtx>,
-    pub(crate) set_screen: AsyncSetState<Screen>,
-    pub(crate) section: String,
-    pub(crate) set_section: AsyncSetState<String>,
-    pub(crate) progress: f64,
-    pub(crate) window_width: f64,
-}
-
-impl PartialEq for SettingsProps {
-    fn eq(&self, other: &Self) -> bool {
-        // Setters are identity-stable; only the data fields drive re-render.
-        Arc::ptr_eq(&self.ctx, &other.ctx)
-            && self.section == other.section
-            && self.progress == other.progress
-            && self.window_width == other.window_width
-    }
-}
-
 /// The settings screen: a stock WinUI `NavigationView` (the Windows-Settings sidebar pattern) —
 /// one pane item per section, the section's card as the content, the built-in back arrow
-/// returning to the host list.
-///
-/// The page-only UI state (which layer is edited, the delete confirmation, the Edit-profile
-/// modal, the repaint revision) lives HERE as sync `use_state`, de-hoisted from root
-/// 2026-07-29: every writer is a UI-thread handler (ComboBox `on_selection_changed`, button
-/// clicks, swatch taps), and the characterization suite measured that a sync `use_state`
-/// write from a backend-wired handler re-renders its owning component
-/// (`tests/reactor_semantics.rs::sync_state_from_backend_fired_event_rerenders`). The section
-/// tag is the exception — root-owned, tween-coupled; see `SettingsProps`.
-pub(crate) fn settings_page(props: &SettingsProps, cx: &mut RenderCx) -> Element {
-    // Hooks first, unconditionally, in a stable order (reactor's Rules-of-Hooks guard aborts
-    // on a changed order).
-    // Which LAYER the screen edits: "" = the global defaults, else a profile id
-    // (design/client-settings-profiles.md §5.1).
-    let (scope_id, set_scope) = cx.use_state(String::new());
-    // The profile a Delete… click is asking about; `Some` renders the confirmation.
-    let (delete_pending, set_delete) = cx.use_state(Option::<String>::None);
-    // Whether the Edit-profile modal is up; guarded below so it only renders while a profile
-    // is actually in scope.
-    let (edit_open, set_edit) = cx.use_state(false);
-    // Bumped when an edit changes what the page should SHOW without changing any state it
-    // already reads — ANY edit through `commit` (creating an override must surface its marker
-    // as immediately as resetting one clears it), a reset, a profile colour change. The
-    // same-value compare in `call` makes no-op bumps free; the counter is what forces the pass.
-    let (rev, set_rev) = cx.use_state(0u64);
-    let (set_scope, set_delete, set_edit, set_rev) = (&set_scope, &set_delete, &set_edit, &set_rev);
-    let ctx = &props.ctx;
-    let set_screen = &props.set_screen;
-    let section = props.section.as_str();
-    let set_section = &props.set_section;
-    let progress = props.progress;
-    let window_width = props.window_width;
+/// returning to the host list. `section`/`set_section` are the selected pane tag, held in ROOT
+/// state (this page stays hook-free): `on_selection_changed` is wired in the reactor backend, so
+/// only a root `AsyncSetState` reliably re-renders the new section in. `progress` is the
+/// section-switch entrance tween (0 → 1), mapped onto the content column's opacity + offset.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn settings_page(
+    ctx: &Arc<AppCtx>,
+    set_screen: &AsyncSetState<Screen>,
+    section: &str,
+    set_section: &AsyncSetState<String>,
+    scope_id: &str,
+    set_scope: &AsyncSetState<String>,
+    delete_pending: &Option<String>,
+    set_delete: &AsyncSetState<Option<String>>,
+    edit_open: bool,
+    set_edit: &AsyncSetState<bool>,
+    rev: u64,
+    set_rev: &AsyncSetState<u64>,
+    progress: f64,
+    window_width: f64,
+) -> Element {
     // The layer being edited. A scope pointing at a deleted profile degrades to the defaults,
     // the same rule a dangling host binding follows.
-    let active = active_profile(&scope_id);
+    let active = active_profile(scope_id);
     let scope: &str = match &active {
         Some(p) => &p.id,
         None => "",
