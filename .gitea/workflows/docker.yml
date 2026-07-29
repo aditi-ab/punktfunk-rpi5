@@ -65,6 +65,11 @@ jobs:
             dockerfile: ci/fedora-rpm.Dockerfile
             buildargs: --build-arg FEDORA_VERSION=44
             keysuffix: -f44
+          # Android builder (JDK + SDK/NDK + cargo-ndk + sccache) — android.yml and
+          # android-screenshots.yml run in it; ~3 GB of per-run Google downloads became
+          # image layers.
+          - image: punktfunk-android-ci
+            dockerfile: ci/android-ci.Dockerfile
     steps:
       - uses: actions/checkout@v4
 

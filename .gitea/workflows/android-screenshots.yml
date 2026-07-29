@@ -22,24 +22,14 @@ jobs:
   screenshots:
     if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
+    # JDK 21 + SDK baked (AGP 9.3 + Robolectric's SDK-36 android-all jar both want 17–21).
+    # The tests are pure JVM (no NDK), but sharing android.yml's image means one image to
+    # keep warm instead of a per-run setup-java + sdkmanager download pair.
+    container:
+      image: 192.168.1.58:5010/punktfunk-android-ci:latest
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
-
-      - name: JDK 21 (AGP 9.3 + Robolectric's SDK-36 android-all jar both want 17–21)
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: "21"
-
-      - name: Android SDK
-        # SHA-pinned for parity with android.yml (third-party action). v3 = 9fc6c4e.
-        uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3
-
-      # No NDK/CMake — the screenshot unit tests are pure JVM. compileSdk 37 auto-downloads via AGP
-      # if the platform channel lacks it (same note as android.yml).
-      - name: platform-tools + platform 36 + build-tools
-        run: sdkmanager "platform-tools" "platforms;android-36" "build-tools;37.0.0"
 
       - name: Cache (gradle)
         uses: actions/cache@v4
@@ -49,9 +39,10 @@ jobs:
             ~/.gradle/wrapper
           # gradle-wrapper.properties is in the key on purpose: `~/.gradle/wrapper` caches the
           # Gradle DISTRIBUTION, so a wrapper bump with no .gradle.kts change would otherwise
-          # restore a key that can never hold the new one.
-          key: android-screenshots-${{ hashFiles('clients/android/**/*.gradle.kts', 'clients/android/gradle/wrapper/gradle-wrapper.properties') }}
-          restore-keys: android-screenshots-
+          # restore a key that can never hold the new one. Namespace shared with android.yml —
+          # it is the same content; two keys just stored it twice in the central cache.
+          key: gradle-${{ hashFiles('clients/android/**/*.gradle.kts', 'clients/android/gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: gradle-
 
       # Roborazzi renders Compose on the JVM (Robolectric Native Graphics). `-PskipRustBuild` keeps
       # the cargo-ndk native build out of the graph — the tests never load libpunktfunk_android.so.

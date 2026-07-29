@@ -2,11 +2,11 @@
 # cargo-ndk for all three shipping ABIs and assembles the debug APK (clients/android). Mirrors apple.yml
 # but on a Linux runner — the NDK is cross-platform, so no self-hosted host is needed.
 #
-# Prereq: the runner needs ~6 GB free + internet (it pulls the Android SDK/NDK and the Gradle
-# distribution in-job). If android-actions/setup-android is not mirrored on this Gitea instance,
-# replace that step with a manual cmdline-tools download, or bake an `android-ci` image like
-# ci/rust-ci.Dockerfile. Emulator instrumentation tests are deferred until a KVM-capable runner
-# exists (they self-skip otherwise, like apple.yml's RemoteFirstLightTests).
+# Runs in the punktfunk-android-ci builder image (ci/android-ci.Dockerfile, content-keyed on
+# the LAN registry): JDK 21, the Android SDK/NDK/CMake pins, cargo-ndk and sccache are all
+# baked, so the multi-GB per-run Google downloads this job used to make are gone. Emulator
+# instrumentation tests are deferred until a KVM-capable runner exists (they self-skip
+# otherwise, like apple.yml's RemoteFirstLightTests).
 name: android
 # One pending run per workflow+ref: a newer push supersedes the queued/running one and cancels
 # it (a canary only needs the latest commit; each release tag is its own ref so tag runs never
@@ -46,66 +46,62 @@ on:
       - '.gitea/workflows/android.yml'
   workflow_dispatch:
 
+# Shared compile cache: sccache -> RustFS S3 (storage.unom.io, LAN-pinned via ci-core's
+# unbound). The NDK clang targets get their own key universes automatically (keys embed
+# compiler hash + target), so the three ABI builds share the bucket with everything else.
+env:
+  RUSTC_WRAPPER: sccache
+  SCCACHE_BUCKET: unom-ci-sccache
+  SCCACHE_ENDPOINT: https://storage.unom.io
+  SCCACHE_REGION: home-central
+  AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_SECRET_ACCESS_KEY }}
+  # sccache and incremental compilation are mutually exclusive; CI wants the shared
+  # cache, dev boxes keep incremental.
+  CARGO_INCREMENTAL: "0"
+
 jobs:
   android:
     runs-on: ubuntu-24.04
+    container:
+      image: 192.168.1.58:5010/punktfunk-android-ci:latest
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
-      - name: JDK 21 (AGP 9.3 runs on JDK 17–21, not the host default)
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: "21"
+      # Everything below the checkout used to be four download steps (JDK, SDK,
+      # NDK+CMake, cargo-ndk — the flakiest, heaviest part of the job); it is all baked
+      # into the image now. This guard only re-asserts the Android targets so a
+      # rust-toolchain.toml pin bump keeps working against an older image (:latest lags
+      # one image rebuild, same bootstrap note as ci.yml's dep steps).
+      - name: Rust Android targets (no-op unless the toolchain pin outran the image)
+        run: rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android
 
-      - name: Rust toolchain + Android targets (self-healing on a fresh runner)
-        run: |
-          if ! command -v rustup >/dev/null && [ ! -x "$HOME/.cargo/bin/rustup" ]; then
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-              | sh -s -- -y --no-modify-path --profile minimal
-          fi
-          RUSTUP="$(command -v rustup || echo "$HOME/.cargo/bin/rustup")"
-          dirname "$RUSTUP" >> "$GITHUB_PATH"
-          "$RUSTUP" target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android
-
-      - name: Android SDK
-        # SHA-pinned: this workflow's release job carries the signing keystore + Play service-account
-        # secrets, so a moved tag on a third-party action could exfiltrate them. v3 = 9fc6c4e.
-        uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3
-        with:
-          # Only platform-tools — NOT the action's default legacy `tools`, whose dependency chain
-          # drags in the ~250 MB emulator nobody here runs (instrumentation tests are deferred).
-          # That download was the single flakiest piece of this job: the shared runner fleet drops
-          # packets under parallel-job load and sdkmanager's streamed unzip turns a truncated
-          # stream into "Error on ZipFile unknown archive" (observed 2026-07-22, twice).
-          packages: platform-tools
-
-      - name: NDK r30 + platform 36 + build-tools + CMake (libopus cross-build)
-        # cmake;3.22.1 installs cmake + ninja under $ANDROID_SDK/cmake/3.22.1/bin — the exact path
-        # kit/build.gradle.kts prepends to PATH for cargo-ndk's audiopus_sys (libopus) CMake build.
-        # Note: platforms;android-37 is sometimes missing from standard channels; AGP will
-        # auto-download it if needed during the build.
-        # retry.sh: sdkmanager is a single-shot multi-hundred-MB fetch, exactly the class the
-        # helper exists for (fleet-load packet drops truncate the stream mid-unzip); a failed
-        # attempt leaves no partial package behind, so a plain re-invoke is safe.
-        run: bash scripts/ci/retry.sh 4 sdkmanager "platform-tools" "platforms;android-36" "build-tools;37.0.0" "ndk;30.0.14904198" "cmake;3.22.1"
-
-      - name: Caches (cargo + gradle)
+      # Same key namespace as ci.yml/deb.yml ON PURPOSE: identical Cargo.lock, identical
+      # CARGO_HOME layout (/usr/local/cargo), so the registry/git downloads dedupe with
+      # the rest of the fleet in the central cache. target/ is deliberately NOT cached
+      # anymore — sccache covers recompilation without shipping multi-GB tars per run.
+      - name: Cache (cargo registry)
         uses: actions/cache@v4
         with:
           path: |
-            ~/.cargo/registry
-            ~/.cargo/git
+            /usr/local/cargo/registry
+            /usr/local/cargo/git
+          key: cargo-home-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-home-
+
+      - name: Cache (gradle)
+        uses: actions/cache@v4
+        with:
+          path: |
             ~/.gradle/caches
             ~/.gradle/wrapper
-            target
-          # gradle-wrapper.properties is in the key on purpose — see android-screenshots.yml.
-          key: android-${{ hashFiles('Cargo.lock', 'clients/android/**/*.gradle.kts', 'clients/android/gradle/wrapper/gradle-wrapper.properties') }}
-          restore-keys: android-
-
-      - name: cargo-ndk
-        run: command -v cargo-ndk >/dev/null || cargo install cargo-ndk
+          # gradle-wrapper.properties is in the key on purpose: `~/.gradle/wrapper` caches the
+          # Gradle DISTRIBUTION, so a wrapper bump with no .gradle.kts change would otherwise
+          # restore a key that can never hold the new one. Namespace shared with
+          # android-screenshots.yml — same content, one copy in the central store.
+          key: gradle-${{ hashFiles('clients/android/**/*.gradle.kts', 'clients/android/gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: gradle-
 
       - name: assembleDebug (cargo-ndk → jniLibs → APK)
         working-directory: clients/android

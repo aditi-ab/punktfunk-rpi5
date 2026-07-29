@@ -116,7 +116,10 @@ shoot_sim() {
   xcrun simctl bootstatus "$udid" -b >/dev/null 2>&1 || true
 
   log "$prefix — building ($scheme)…"
-  local dd; dd="$(mktemp -d)"
+  # PF_SHOT_DERIVED_DATA (optional): a STABLE DerivedData root, so repeat runs reuse the
+  # incremental build instead of cold-building into a throwaway tmpdir — CI pins this
+  # (apple.yml); local runs keep the self-cleaning mktemp default.
+  local dd; dd="${PF_SHOT_DERIVED_DATA:-$(mktemp -d)}"; mkdir -p "$dd"
   xcodebuild -project Punktfunk.xcodeproj -scheme "$scheme" -configuration Debug \
     -sdk "$sdk" -destination "id=$udid" -derivedDataPath "$dd" \
     CODE_SIGNING_ALLOWED=NO build >/dev/null \
