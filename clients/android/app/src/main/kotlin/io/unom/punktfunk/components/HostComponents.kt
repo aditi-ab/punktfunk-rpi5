@@ -69,9 +69,9 @@ data class HostMenuItem(
 )
 
 /**
- * A host as an Apple-style card: a colored letter-avatar, name + address, a trust pill, and (for
- * saved hosts) an overflow menu with Wake / Edit / Forget plus whatever [menuItems] adds. Tapping
- * the card connects.
+ * A host as an Apple-style card: a colored avatar carrying the host's OS mark (its initial when we
+ * don't know the OS), name + address, a trust pill, and (for saved hosts) an overflow menu with
+ * Wake / Edit / Forget plus whatever [menuItems] adds. Tapping the card connects.
  *
  * [profileLabel] names the settings profile this card connects with. On a host's own card that is
  * its default binding, drawn as a quiet chip — the card says what a tap will do. On a **pinned
@@ -84,7 +84,7 @@ fun HostCard(
     address: String,
     status: HostStatus,
     online: Boolean = false,
-    /** OS-identity chain (mDNS `os` TXT / stored), for the address line's OS mark. "" = none. */
+    /** OS-identity chain (mDNS `os` TXT / stored), drawn as the avatar's mark. "" = the initial. */
     os: String = "",
     enabled: Boolean,
     onConnect: () -> Unit,
@@ -129,7 +129,7 @@ fun HostCard(
                     .padding(16.dp),
                 horizontalAlignment = Alignment.CenterHorizontally,
             ) {
-                HostAvatar(name, online)
+                HostAvatar(name, online, os)
                 Spacer(Modifier.height(10.dp))
                 Text(
                     name,
@@ -138,28 +138,14 @@ fun HostCard(
                     overflow = TextOverflow.Ellipsis,
                     textAlign = TextAlign.Center,
                 )
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    // The OS mark leads the address line; absent entirely for a host that
-                    // doesn't advertise one, so those cards render exactly as they always did.
-                    val osIcon = resolveOsIcon(os)
-                    if (osIcon != null) {
-                        Icon(
-                            osIcon,
-                            contentDescription = os,
-                            modifier = Modifier.size(12.dp),
-                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                        Spacer(Modifier.width(4.dp))
-                    }
-                    Text(
-                        address,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                        textAlign = TextAlign.Center,
-                    )
-                }
+                Text(
+                    address,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    textAlign = TextAlign.Center,
+                )
                 if (profileLabel != null || reserveProfileSlot) {
                     Spacer(Modifier.height(10.dp))
                     Box(
@@ -283,8 +269,9 @@ private val PROFILE_CHIP_SLOT = 26.dp
 private val PRESENCE_ONLINE = Color(0xFF4ADE80)
 
 /**
- * The host's letter avatar (Apple-contact style) with its presence as a dot on the corner — the
- * idiom every contact list already uses, and one fewer labelled badge on a small card.
+ * The host's avatar (Apple-contact style) with its presence as a dot on the corner — the idiom
+ * every contact list already uses, and one fewer labelled badge on a small card. It carries the
+ * host's OS mark when [os] resolves to one we ship, and the host's initial otherwise.
  *
  * [online] is true when the host advertises on mDNS OR answers the reachability probe, so a
  * routed/VPN host that never advertises still reads as up. Online is a FILLED green dot, offline a
@@ -292,9 +279,10 @@ private val PRESENCE_ONLINE = Color(0xFF4ADE80)
  * colour-blind reader and a screenshot in greyscale. TalkBack gets the word either way.
  */
 @Composable
-fun HostAvatar(name: String, online: Boolean = false) {
+fun HostAvatar(name: String, online: Boolean = false, os: String = "") {
     val letter = name.trim().firstOrNull()?.uppercaseChar()?.toString() ?: "?"
     val cardColor = CardDefaults.elevatedCardColors().containerColor
+    val osIcon = resolveOsIcon(os)
     Box {
         Box(
             modifier = Modifier
@@ -303,11 +291,23 @@ fun HostAvatar(name: String, online: Boolean = false) {
                 .background(MaterialTheme.colorScheme.primaryContainer),
             contentAlignment = Alignment.Center,
         ) {
-            Text(
-                letter,
-                style = MaterialTheme.typography.titleMedium,
-                color = MaterialTheme.colorScheme.onPrimaryContainer,
-            )
+            // The OS mark IS the avatar when we know the OS — it identifies the machine better than
+            // the initial ever did, and it's the same circle, so a card whose host advertises no OS
+            // (or one we ship no mark for) keeps the letter and the row still reads as one set.
+            if (osIcon != null) {
+                Icon(
+                    osIcon,
+                    contentDescription = os,
+                    modifier = Modifier.size(24.dp),
+                    tint = MaterialTheme.colorScheme.onPrimaryContainer,
+                )
+            } else {
+                Text(
+                    letter,
+                    style = MaterialTheme.typography.titleMedium,
+                    color = MaterialTheme.colorScheme.onPrimaryContainer,
+                )
+            }
         }
         Box(
             modifier = Modifier
