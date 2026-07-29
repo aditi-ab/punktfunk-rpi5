@@ -41,6 +41,28 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# The GTK4/libadwaita session shell (app.rs, cli.rs, ui_*.rs, shortcuts.rs, spawn.rs). Those
+# modules are `#[cfg(target_os = "linux")]` in main.rs, so their dependencies belong in a
+# linux-only block — the Windows leg of this crate is a stub binary and must not pull GTK.
+#
+# Versions and features track clients/linux verbatim (gtk4 0.11 "v4_16", libadwaita 0.9 "v1_5"):
+# the two crates compile the same widget vocabulary, and a version skew between them would show up
+# as type mismatches through relm4 rather than as anything legible.
+#
+# glib / gio / gdk / pango are NOT listed on purpose — the sources reach them as `gtk::glib`,
+# `gtk::gio`, `gtk::gdk` and `gtk::pango`, gtk4's own re-exports. Declaring them separately would
+# risk resolving a DIFFERENT version of the same sys crate than the one gtk4 links against.
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = { package = "gtk4", version = "0.11", features = ["v4_16"] }
+adw = { package = "libadwaita", version = "0.9", features = ["v1_5"] }
+relm4 = { version = "0.11", features = ["libadwaita"] }
+async-channel = "2"
+# NOT optional here, unlike the shared block above where it hangs off `ui`. cli.rs's `--json` host
+# listing is a CLI feature, not a console-UI one, so on Linux it is needed whether or not `ui` is
+# on — and `--no-default-features` is a documented Linux build ("same streaming, stats on stdout
+# only"), which without this simply did not compile.
+serde_json = "1"
+
 # Embeds the app icon as an exe resource (build.rs) — Windows hosts only (rc.exe from
 # the SDK); same pattern as clients/windows.
 [target.'cfg(windows)'.build-dependencies]
