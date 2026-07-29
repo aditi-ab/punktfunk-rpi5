@@ -60,15 +60,6 @@ pub struct HostCard {
     connecting: bool,
 }
 
-/// One catalog entry as the cards need it: what to call the profile, and the colour its chips
-/// carry (`StreamProfile.accent`) — the field the schema reserved for exactly this.
-#[derive(Clone, Debug)]
-pub struct Profile {
-    pub id: String,
-    pub name: String,
-    pub accent: Option<String>,
-}
-
 #[derive(Debug)]
 enum CardKind {
     Saved {
@@ -78,7 +69,7 @@ enum CardKind {
         library_enabled: bool,
         /// The profile catalog as `(id, name)`, for this card's menus and chip. Shared per
         /// refresh rather than re-read per card.
-        profiles: Rc<Vec<Profile>>,
+        profiles: Rc<Vec<(String, String)>>,
         /// `Some((id, name))` when this card is a PINNED host+profile pair rather than the
         /// host's primary card (design §5.2a): a one-click shortcut for a profile the user
         /// reaches for often. It is presentation state on the host record — never a second
@@ -256,18 +247,25 @@ impl relm4::factory::FactoryComponent for HostCard {
                 } else {
                     pill("Trusted", "pf-accent")
                 });
-                // The chip says what a plain click on THIS card will do: its own profile on
-                // a pinned card, the host's binding on the primary one. Both resolve through
-                // the catalog so the chip can carry the profile's colour; a binding whose
-                // profile was deleted shows nothing and resolves as the defaults, which is
-                // exactly what will happen on connect (design §6).
-                let chip = pinned
-                    .as_ref()
-                    .map(|(id, _)| id.as_str())
-                    .or(k.profile_id.as_deref())
-                    .and_then(|id| profiles.iter().find(|p| p.id == id));
-                if let Some(p) = chip {
-                    status.append(&profile_pill(p));
+                // The chip says what a plain click on THIS card will do: its own profile on a
+                // pinned card, the host's binding on the primary one. A binding whose profile
+                // was deleted shows nothing and resolves as the defaults, which is exactly
+                // what will happen on connect (design §6).
+                let chip = pinned.as_ref().map(|(_, name)| name.as_str()).or_else(|| {
+                    k.profile_id
+                        .as_ref()
+                        .and_then(|id| profiles.iter().find(|(pid, _)| pid == id))
+                        .map(|(_, name)| name.as_str())
+                });
+                if let Some(name) = chip {
+                    status.append(&pill(
+                        name,
+                        if pinned.is_some() {
+                            "pf-accent"
+                        } else {
+                            "pf-neutral"
+                        },
+                    ));
                 }
             }
             CardKind::Discovered(_) => {
@@ -458,9 +456,11 @@ impl relm4::factory::FactoryComponent for HostCard {
                     // and its own removal, and deliberately NOT pair/rename/forget — those
                     // belong to the host, and offering them here would blur what the card is.
                     let with = gio::Menu::new();
-                    for (label, target) in std::iter::once(("Default settings", ""))
-                        .chain(profiles.iter().map(|p| (p.name.as_str(), p.id.as_str())))
-                    {
+                    for (label, target) in std::iter::once(("Default settings", "")).chain(
+                        profiles
+                            .iter()
+                            .map(|(id, name)| (name.as_str(), id.as_str())),
+                    ) {
                         let item = gio::MenuItem::new(Some(label), None);
                         item.set_action_and_target_value(
                             Some("card.connect-with"),
@@ -485,9 +485,11 @@ impl relm4::factory::FactoryComponent for HostCard {
                         let with = gio::Menu::new();
                         let bind = gio::Menu::new();
                         let pin = gio::Menu::new();
-                        for (label, id) in std::iter::once(("Default settings", ""))
-                            .chain(profiles.iter().map(|p| (p.name.as_str(), p.id.as_str())))
-                        {
+                        for (label, id) in std::iter::once(("Default settings", "")).chain(
+                            profiles
+                                .iter()
+                                .map(|(id, name)| (name.as_str(), id.as_str())),
+                        ) {
                             // A checkmark would be the natural cue for the current binding, but
                             // a GMenu radio needs shared state per card; the bound profile is
                             // named on the card's chip instead, visible without opening a menu.
@@ -582,59 +584,6 @@ const PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(12);
 
 /// The key a saved host is tracked under in the probe-results map: its fingerprint (stable
 /// across IP changes) when it has one, else `addr:port` (a not-yet-paired manual entry).
-/// A profile chip in that profile's colour. `accent` is the field the catalog schema reserved
-/// for this — without it every profile is the same grey, and telling them apart across a grid
-/// at a glance is the whole reason the chip exists. No colour set keeps the neutral pill, so
-/// the palette stays opt-in.
-fn profile_pill(p: &Profile) -> gtk::Widget {
-    let label = gtk::Label::new(Some(&p.name));
-    label.add_css_class("pf-pill");
-    let Some(hex) = p.accent.as_deref().filter(|h| is_hex_colour(h)) else {
-        label.add_css_class("pf-neutral");
-        return label.upcast();
-    };
-    label.add_css_class(&tint_class(hex));
-    label.upcast()
-}
-
-/// The CSS class that tints a pill with `hex`, registering its rule on the display the first
-/// time that colour is seen.
-///
-/// Per-widget providers are gone since GTK 4.10, and the colour is user data rather than one of
-/// a fixed set, so the rule is generated once per distinct colour and added display-wide. A
-/// handful of profiles means a handful of tiny rules, and re-rendering the grid (which happens
-/// on every state change) reuses them instead of allocating more.
-fn tint_class(hex: &str) -> String {
-    thread_local! {
-        static REGISTERED: RefCell<HashMap<String, ()>> = RefCell::new(HashMap::new());
-    }
-    let class = format!("pf-tint-{}", &hex[1..]);
-    REGISTERED.with_borrow_mut(|seen| {
-        if seen.contains_key(&class) {
-            return;
-        }
-        if let Some(display) = gtk::gdk::Display::default() {
-            let provider = gtk::CssProvider::new();
-            provider.load_from_string(&format!(
-                ".pf-pill.{class} {{ color: {hex}; background: alpha({hex}, 0.18); }}"
-            ));
-            gtk::style_context_add_provider_for_display(
-                &display,
-                &provider,
-                gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
-            );
-            seen.insert(class.clone(), ());
-        }
-    });
-    class
-}
-
-/// `#RRGGBB` only — the value is interpolated into CSS, so anything else is refused rather
-/// than injected.
-fn is_hex_colour(s: &str) -> bool {
-    s.len() == 7 && s.starts_with('#') && s[1..].chars().all(|c| c.is_ascii_hexdigit())
-}
-
 fn saved_key(h: &KnownHost) -> String {
     if h.fp_hex.is_empty() {
         format!("{}:{}", h.addr, h.port)
@@ -1043,15 +992,11 @@ impl HostsPage {
             .map(|(fp, _)| fp);
         let library_enabled = self.settings.borrow().library_enabled;
         // One catalog read per refresh, shared by every card's menus and chip.
-        let profiles: Rc<Vec<Profile>> = Rc::new(
+        let profiles: Rc<Vec<(String, String)>> = Rc::new(
             pf_client_core::profiles::ProfilesFile::load()
                 .profiles
                 .into_iter()
-                .map(|p| Profile {
-                    id: p.id,
-                    name: p.name,
-                    accent: p.accent,
-                })
+                .map(|p| (p.id, p.name))
                 .collect(),
         );
 
@@ -1085,10 +1030,9 @@ impl HostsPage {
                 // They share the host's live status because they read the same record, and a
                 // pin whose profile is gone simply doesn't render (design §5.2a).
                 for id in &k.pinned_profiles {
-                    let Some(p) = profiles.iter().find(|p| &p.id == id) else {
+                    let Some((id, name)) = profiles.iter().find(|(pid, _)| pid == id) else {
                         continue;
                     };
-                    let (id, name) = (p.id.clone(), p.name.clone());
                     saved.push_back(HostCard {
                         // The spinner belongs to whichever card was clicked; a pin has its own
                         // key so two cards for one host don't both spin.
@@ -1099,7 +1043,7 @@ impl HostsPage {
                             profiles: profiles.clone(),
                             recent: false,
                             library_enabled,
-                            pinned: Some((id, name)),
+                            pinned: Some((id.clone(), name.clone())),
                         },
                     });
                 }

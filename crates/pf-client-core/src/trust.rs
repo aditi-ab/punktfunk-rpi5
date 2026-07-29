@@ -719,6 +719,13 @@ pub struct Settings {
     /// stores (and the Linux shells, which have no picker yet) load.
     #[serde(default)]
     pub adapter: String,
+    /// Ask the host for full-chroma **4:4:4** video (`quic::VIDEO_CAP_444`). Default off: it
+    /// costs bandwidth and encode headroom, and only lands when everything lines up — HEVC,
+    /// the host's own policy, and a GPU that can actually encode 4:4:4. It is what makes small
+    /// text and thin UI lines crisp on a remote desktop, which is why this is a per-profile
+    /// choice rather than a global one (a "Work" profile wants it; "Game" usually doesn't).
+    #[serde(default)]
+    pub enable_444: bool,
     /// Advertise 10-bit + HDR10 so the host upgrades HDR content to a Main10/PQ stream.
     /// The presenter handles the display side dynamically either way (HDR10 swapchain
     /// where offered, tonemap where not) — off means "never send me 10-bit".
@@ -854,6 +861,7 @@ impl Default for Settings {
             codec: "auto".into(),
             decoder: "auto".into(),
             adapter: String::new(),
+            enable_444: false,
             hdr_enabled: true,
             show_stats: true,
             stats_verbosity: None,

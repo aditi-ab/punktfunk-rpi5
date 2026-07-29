@@ -54,6 +54,8 @@ pub struct SettingsOverlay {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hdr_enabled: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub enable_444: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub compositor: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audio_channels: Option<u8>,
@@ -107,6 +109,9 @@ impl SettingsOverlay {
         }
         if let Some(v) = self.hdr_enabled {
             s.hdr_enabled = v;
+        }
+        if let Some(v) = self.enable_444 {
+            s.enable_444 = v;
         }
         if let Some(v) = &self.compositor {
             s.compositor = v.clone();
@@ -180,6 +185,9 @@ impl SettingsOverlay {
         if after.hdr_enabled != before.hdr_enabled {
             self.hdr_enabled = Some(after.hdr_enabled);
         }
+        if after.enable_444 != before.enable_444 {
+            self.enable_444 = Some(after.enable_444);
+        }
         if after.compositor != before.compositor {
             self.compositor = Some(after.compositor.clone());
         }
@@ -231,6 +239,7 @@ impl SettingsOverlay {
             "render_scale" => self.render_scale = None,
             "codec" => self.codec = None,
             "hdr_enabled" => self.hdr_enabled = None,
+            "enable_444" => self.enable_444 = None,
             "compositor" => self.compositor = None,
             "audio_channels" => self.audio_channels = None,
             "mic_enabled" => self.mic_enabled = None,
