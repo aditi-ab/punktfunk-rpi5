@@ -63,8 +63,8 @@ struct HomeView: View {
                                         groupHeader(title, accent: group.accent)
                                     }
                                     LazyVGrid(columns: gridColumns, spacing: gridSpacing) {
-                                        ForEach(entries(in: group)) { entry in
-                                            hostCard(entry.host, pinned: entry.profile)
+                                        ForEach(group.cards) { card in
+                                            hostCard(card.host, pinned: card.pinned)
                                         }
                                     }
                                 }
@@ -210,31 +210,15 @@ struct HomeView: View {
 
     // MARK: - Cards
 
-    /// One grid tile: a host's primary card, or one of its pinned host+profile cards. A pin is
-    /// presentation only — same record, same live status, so it is an extra ENTRY here rather than
-    /// a duplicated host (which would fork pairing, WoL and renames — design §5.2a).
-    private struct HostGridEntry: Identifiable {
-        let host: StoredHost
-        let profile: StreamProfile?
-        var id: String { "\(host.id.uuidString)#\(profile?.id ?? "")" }
-    }
-
-    /// The grid's bands, ordered and divided per this device's preference (`HostArrangement`).
+    /// The grid's bands, ordered and divided per this device's preference — cards and all, so a
+    /// pinned card can be filed under the profile it connects with rather than under its host's
+    /// binding (`HostArrangement`).
     private var hostGroups: [HostGroup] {
         HostArrangement.groups(
             hosts: store.hosts, catalog: profiles.catalog,
             online: Set(store.hosts.filter(isOnline).map(\.id)),
             sort: HostSort(rawValue: sortRaw) ?? .added,
             grouping: HostGrouping(rawValue: groupingRaw) ?? .none)
-    }
-
-    /// A band's hosts, each immediately followed by its pinned cards — so a pin reads as belonging
-    /// to its host rather than as a stray tile somewhere in the grid.
-    private func entries(in group: HostGroup) -> [HostGridEntry] {
-        group.hosts.flatMap { host in
-            [HostGridEntry(host: host, profile: nil)]
-                + profiles.pinned(for: host).map { HostGridEntry(host: host, profile: $0) }
-        }
     }
 
     /// Online = advertising on mDNS OR answered the reachability probe (a routed/VPN host never

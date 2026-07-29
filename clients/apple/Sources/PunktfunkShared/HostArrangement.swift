@@ -1,10 +1,14 @@
 // How the host grid is ordered and grouped.
 //
-// Pure value logic, deliberately: which host lands where is the kind of thing that reads as
+// Pure value logic, deliberately: which card lands where is the kind of thing that reads as
 // obviously right and behaves subtly wrong (an unstable sort reshuffling equal rows on every
 // redraw, a never-connected host sorting as if it were connected in 1970), so it lives apart from
 // the view and is tested. It sits in PunktfunkShared because everything it touches — `StoredHost`,
 // `ProfileCatalog` — already does.
+//
+// It arranges CARDS, not hosts. A host contributes its own card plus one per pinned profile
+// (§5.2a), and under profile grouping those go to different bands — the pinned card belongs to
+// the profile it connects with, which is the whole reason it exists.
 
 import Foundation
 
@@ -38,8 +42,10 @@ public enum HostSort: String, CaseIterable, Identifiable, Sendable {
 /// What the grid is divided by.
 public enum HostGrouping: String, CaseIterable, Identifiable, Sendable {
     case none
-    /// The host's DEFAULT profile — the one a plain tap uses. Pinned cards stay with their host:
-    /// a pin is presentation of that host, not a host of its own.
+    /// The profile each CARD connects with: a host's own card follows its binding, a pinned card
+    /// follows its pin. Grouping by the binding alone would file every pinned card under "No
+    /// Profile" — pins are not bindings, and a pinned card is precisely the one that knows which
+    /// profile it means.
     case profile
     case status
 
@@ -62,6 +68,21 @@ public enum HostGrouping: String, CaseIterable, Identifiable, Sendable {
     }
 }
 
+/// One card in the grid: a host, and the profile that card connects with.
+public struct HostCard: Identifiable, Equatable, Sendable {
+    public let host: StoredHost
+    /// nil = the host's own card, which follows whatever it is bound to. Set = a pinned
+    /// host+profile card (§5.2a).
+    public let pinned: StreamProfile?
+
+    public var id: String { "\(host.id.uuidString)#\(pinned?.id ?? "")" }
+
+    public init(host: StoredHost, pinned: StreamProfile? = nil) {
+        self.host = host
+        self.pinned = pinned
+    }
+}
+
 /// One rendered band of the grid. `title` is nil for the ungrouped case, which is what tells the
 /// view to draw no header at all rather than an empty one.
 public struct HostGroup: Identifiable, Equatable, Sendable {
@@ -69,13 +90,13 @@ public struct HostGroup: Identifiable, Equatable, Sendable {
     public let title: String?
     /// `#RRGGBB` when the band is a profile — its chip colour, so the header matches the cards.
     public let accent: String?
-    public let hosts: [StoredHost]
+    public let cards: [HostCard]
 
-    public init(id: String, title: String?, accent: String? = nil, hosts: [StoredHost]) {
+    public init(id: String, title: String?, accent: String? = nil, cards: [HostCard]) {
         self.id = id
         self.title = title
         self.accent = accent
-        self.hosts = hosts
+        self.cards = cards
     }
 }
 
@@ -120,26 +141,46 @@ public enum HostArrangement {
             }.map(\.host)
         }
 
+        /// A host's own card, then one per pinned profile — so a pin reads as belonging to its
+        /// host wherever the two sit together.
+        func cards(_ host: StoredHost) -> [HostCard] {
+            [HostCard(host: host)] + catalog.pinned(for: host).map { HostCard(host: host, pinned: $0) }
+        }
+
         switch grouping {
         case .none:
-            return [HostGroup(id: "all", title: nil, hosts: ordered(ranked))]
+            return [HostGroup(id: "all", title: nil, cards: ordered(ranked).flatMap(cards))]
 
         case .profile:
             // Catalog order, so the bands sit in the same order the scope menu lists them, then
-            // the unbound hosts. A band with nothing in it isn't drawn.
+            // whatever belongs to no profile. A band with nothing in it isn't drawn.
+            let sorted = ordered(ranked)
             var groups: [HostGroup] = catalog.profiles.compactMap { profile in
-                let members = ranked.filter { catalog.binding(for: $0.host)?.id == profile.id }
+                let members: [HostCard] = sorted.flatMap { host -> [HostCard] in
+                    var found: [HostCard] = []
+                    // A host BOUND to this profile brings its own card…
+                    if catalog.binding(for: host)?.id == profile.id {
+                        found.append(HostCard(host: host))
+                    }
+                    // …and a host that PINNED it brings that pinned card, whatever it is bound
+                    // to. Both can be true: a bound profile may also be pinned.
+                    if let pin = catalog.pinned(for: host).first(where: { $0.id == profile.id }) {
+                        found.append(HostCard(host: host, pinned: pin))
+                    }
+                    return found
+                }
                 guard !members.isEmpty else { return nil }
                 return HostGroup(
                     id: "profile-\(profile.id)", title: profile.name, accent: profile.accent,
-                    hosts: ordered(members))
+                    cards: members)
             }
-            // A dangling binding resolves as none (§4.4), so it lands here rather than in a band
-            // named after a profile that no longer exists.
-            let unbound = ranked.filter { catalog.binding(for: $0.host) == nil }
+            // Hosts that a plain tap streams with the defaults. A dangling binding resolves as
+            // none (§4.4), so it lands here rather than in a band named after a profile that no
+            // longer exists.
+            let unbound = sorted.filter { catalog.binding(for: $0) == nil }.map { HostCard(host: $0) }
             if !unbound.isEmpty {
                 groups.append(
-                    HostGroup(id: "profile-none", title: "No Profile", hosts: ordered(unbound)))
+                    HostGroup(id: "profile-none", title: "No Profile", cards: unbound))
             }
             return groups
 
@@ -148,11 +189,14 @@ public enum HostArrangement {
             let up = ranked.filter { online.contains($0.host.id) }
             let down = ranked.filter { !online.contains($0.host.id) }
             if !up.isEmpty {
-                groups.append(HostGroup(id: "status-online", title: "Online", hosts: ordered(up)))
+                groups.append(
+                    HostGroup(id: "status-online", title: "Online",
+                              cards: ordered(up).flatMap(cards)))
             }
             if !down.isEmpty {
                 groups.append(
-                    HostGroup(id: "status-offline", title: "Offline", hosts: ordered(down)))
+                    HostGroup(id: "status-offline", title: "Offline",
+                              cards: ordered(down).flatMap(cards)))
             }
             return groups
         }

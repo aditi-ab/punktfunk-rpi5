@@ -235,6 +235,8 @@ final class SharedFoundationTests: XCTestCase {
         var couch = StoredHost(name: "Couch", address: "10.0.0.4",
                                addedAt: Date(timeIntervalSince1970: 300))
         couch.lastConnected = Date(timeIntervalSince1970: 9_000)
+        // Couch is bound to nothing but has PINNED both profiles as their own cards.
+        couch.pinnedProfileIDs = ["111111111111", "222222222222"]
         return ([basement, desk, attic, couch], catalog)
     }
 
@@ -246,51 +248,67 @@ final class SharedFoundationTests: XCTestCase {
             hosts: hosts, catalog: catalog, online: online, sort: sort, grouping: grouping)
     }
 
+    /// Card labels: the host, plus the pinned profile when the card carries one.
+    private func labels(_ group: HostGroup) -> [String] {
+        group.cards.map { card in
+            card.pinned.map { "\(card.host.name)·\($0.name)" } ?? card.host.name
+        }
+    }
+
     /// The default is the order the grid had before it could sort at all — an update must not
-    /// rearrange anyone's hosts.
+    /// rearrange anyone's hosts. Each host is followed by its own pinned cards.
     ///
     /// Undated hosts sort FIRST, because having no date means predating the field means being
     /// older. In a real store they are a prefix (everything saved before the upgrade), so the
     /// result is the stored order exactly — which is the point.
     func testHostSortByDateAddedKeepsTheStoredOrder() {
-        let (hosts, _) = arrangementFixture()
         let group = arranged(.added)[0]
         XCTAssertNil(group.title, "ungrouped draws no header")
-        XCTAssertEqual(group.hosts.map(\.name), hosts.map(\.name))
-        XCTAssertEqual(group.hosts.map(\.name), ["Basement", "Desk", "attic", "Couch"])
+        XCTAssertEqual(
+            labels(group), ["Basement", "Desk", "attic", "Couch", "Couch·Game", "Couch·Work"])
     }
 
     /// Case- and locale-insensitive, so "attic" doesn't sort after "Desk" the way a raw `<` on
     /// Strings would put every lowercase name below every uppercase one.
     func testHostSortByNameIgnoresCase() {
         XCTAssertEqual(
-            arranged(.name)[0].hosts.map(\.name), ["attic", "Basement", "Couch", "Desk"])
+            arranged(.name)[0].cards.map(\.host.name),
+            ["attic", "Basement", "Couch", "Couch", "Couch", "Desk"])
     }
 
     /// Most recent first — and a host you have NEVER connected to goes last, not first. Treating
     /// "never" as `.distantPast` would sort it as if it had been connected in 1970.
     func testHostSortByLastConnectedPutsNeverConnectedLast() {
-        let hosts = arranged(.lastConnected)[0].hosts
-        XCTAssertEqual(hosts.prefix(2).map(\.name), ["Couch", "Desk"])
+        let names = arranged(.lastConnected)[0].cards.map(\.host.name)
+        XCTAssertEqual(names.prefix(4).map { $0 }, ["Couch", "Couch", "Couch", "Desk"])
         // The two never-connected ones tie, so they keep their stored order — `sorted` is not
         // stable in Swift, and equal rows swapping between redraws is a visible bug.
-        XCTAssertEqual(hosts.suffix(2).map(\.name), ["Basement", "attic"])
+        XCTAssertEqual(names.suffix(2).map { $0 }, ["Basement", "attic"])
     }
 
-    /// Bands in catalog order, then the unbound ones. An empty band isn't drawn at all.
-    func testHostGroupingByProfile() {
+    /// ⭐ The regression this was written for: a PINNED card belongs to the profile it connects
+    /// with, not to whatever its host is bound to. Grouping on the binding alone filed every
+    /// pinned card under "No Profile" — including the ones visibly wearing a profile chip.
+    func testHostGroupingFilesPinnedCardsUnderTheirOwnProfile() {
         let groups = arranged(.name, .profile)
         XCTAssertEqual(groups.map(\.title), ["Game", "Work", "No Profile"])
+        // Desk is BOUND to Game; Couch merely pinned it. Both belong in the Game band.
+        XCTAssertEqual(labels(groups[0]), ["Couch·Game", "Desk"])
+        XCTAssertEqual(labels(groups[1]), ["attic", "Couch·Work"])
+        // Couch's OWN card streams with the defaults, so that one is unbound.
+        XCTAssertEqual(labels(groups[2]), ["Basement", "Couch"])
         XCTAssertEqual(groups[0].accent, "#ff8800", "the header matches its cards")
-        XCTAssertEqual(groups[0].hosts.map(\.name), ["Desk"])
-        XCTAssertEqual(groups[2].hosts.map(\.name), ["Basement", "Couch"])
+    }
 
-        // A profile nobody uses gets no band.
-        let unused = ProfileCatalog(profiles: [StreamProfile(name: "Travel", id: "333333333333")])
+    /// A profile nobody uses gets no band at all.
+    func testHostGroupingSkipsEmptyBands() {
         let (hosts, _) = arrangementFixture()
-        let none = HostArrangement.groups(
+        let unused = ProfileCatalog(profiles: [StreamProfile(name: "Travel", id: "333333333333")])
+        let groups = HostArrangement.groups(
             hosts: hosts, catalog: unused, online: [], sort: .name, grouping: .profile)
-        XCTAssertEqual(none.map(\.title), ["No Profile"], "every host is unbound in this catalog")
+        XCTAssertEqual(groups.map(\.title), ["No Profile"])
+        // The pins point at profiles this catalog doesn't have, so they produce no cards either.
+        XCTAssertEqual(labels(groups[0]), ["attic", "Basement", "Couch", "Desk"])
     }
 
     /// A dangling binding resolves as no profile (§4.4), so it lands in the unbound band rather
@@ -316,8 +334,9 @@ final class SharedFoundationTests: XCTestCase {
         let up = hosts.filter { ["Desk", "Couch"].contains($0.name) }.map(\.id)
         let some = groups(online: Set(up))
         XCTAssertEqual(some.map(\.title), ["Online", "Offline"])
-        XCTAssertEqual(some[0].hosts.map(\.name), ["Couch", "Desk"])
-        XCTAssertEqual(some[1].hosts.map(\.name), ["attic", "Basement"])
+        // A pinned card follows its host's status — same record, same reachability.
+        XCTAssertEqual(labels(some[0]), ["Couch", "Couch·Game", "Couch·Work", "Desk"])
+        XCTAssertEqual(labels(some[1]), ["attic", "Basement"])
 
         // All offline: no empty "Online" band.
         XCTAssertEqual(groups(online: []).map(\.title), ["Offline"])
