@@ -946,6 +946,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "cursor-probe"
+version = "0.21.0"
+dependencies = [
+ "anyhow",
+ "pf-capture",
+ "pf-inject",
+ "pf-vdisplay",
+ "punktfunk-core",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "curve25519-dalek"
 version = "4.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"

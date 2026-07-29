@@ -1,0 +1,217 @@
+//! Cursor-as-metadata on-glass probe (see Cargo.toml). Run inside the target user session:
+//!
+//! ```sh
+//! DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus cursor-probe [--seconds 20] [--embedded] [--gpu]
+//! ```
+//!
+//! `--embedded` A/Bs the pre-channel path (compositor embeds the pointer, no metadata expected);
+//! `--gpu` takes the zero-copy dmabuf negotiation a real session uses instead of the CPU mmap path.
+
+#[cfg(target_os = "linux")]
+fn main() -> anyhow::Result<()> {
+    linux::run()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn main() {
+    eprintln!("cursor-probe is Linux-only (compositor virtual outputs)");
+    std::process::exit(1);
+}
+
+#[cfg(target_os = "linux")]
+mod linux {
+    use anyhow::{Context, Result};
+    use punktfunk_core::input::{InputEvent, InputKind};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    const W: u32 = 1280;
+    const H: u32 = 800;
+
+    pub fn run() -> Result<()> {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+            )
+            .init();
+        let args: Vec<String> = std::env::args().collect();
+        let arg = |name: &str| {
+            args.iter()
+                .skip_while(|a| a.as_str() != name)
+                .nth(1)
+                .cloned()
+        };
+        let secs: u64 = arg("--seconds").and_then(|s| s.parse().ok()).unwrap_or(20);
+        let embedded = args.iter().any(|a| a == "--embedded");
+        let gpu = args.iter().any(|a| a == "--gpu");
+
+        let compositor = pf_vdisplay::detect()?;
+        println!("cursor-probe: compositor = {compositor:?}");
+        let mut vd = pf_vdisplay::open(compositor)?;
+        // The cursor-channel session's request: out-of-band cursor (Mutter/KWin metadata mode).
+        vd.set_hw_cursor(!embedded);
+        println!(
+            "cursor-probe: virtual output with {} cursor",
+            if embedded {
+                "EMBEDDED (compositor paints it)"
+            } else {
+                "METADATA (out-of-band)"
+            }
+        );
+        let vout = vd
+            .create(pf_vdisplay::Mode {
+                width: W,
+                height: H,
+                refresh_hz: 60,
+            })
+            .context("create the virtual output")?;
+        println!("cursor-probe: node_id = {}", vout.node_id);
+
+        // Encode-backend facts don't matter to the metadata question; all-off = CPU-friendly.
+        let policy = pf_capture::ZeroCopyPolicy {
+            backend_is_vaapi: false,
+            backend_is_gpu: gpu,
+            pyrowave_session: false,
+            native_nv12_session: false,
+            pyrowave_modifiers: Vec::new(),
+            hdr_cuda_ok: false,
+        };
+        let mut cap = pf_capture::open_virtual_output(
+            vout.remote_fd,
+            vout.node_id,
+            vout.preferred_mode,
+            vout.keepalive,
+            gpu,
+            false,
+            false,
+            policy,
+            vout.expect_exact_dims,
+        )
+        .context("attach the PipeWire capturer")?;
+        cap.set_active(true);
+        // A cursor-channel session in capture mode: the HOST composites, so the capturer must
+        // keep surfacing the overlay (this is a no-op on the Linux portal capturer, but state it
+        // the way the encode loop does).
+        cap.set_cursor_forward(false);
+
+        // Wiggle the pointer over the virtual output through the production injector (libei on
+        // GNOME/KWin). The region ladder maps the absolute events onto the output by size match —
+        // W×H is deliberately distinctive.
+        let backend = pf_inject::default_backend();
+        println!("cursor-probe: input backend = {backend:?} (4 s device-resume wait)");
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_inj = stop.clone();
+        // `dyn InputInjector` isn't Send — build it on the thread that drives it.
+        let injector = std::thread::spawn(move || {
+            let mut inj = match pf_inject::open(backend) {
+                Ok(i) => i,
+                Err(e) => {
+                    tracing::error!(error = %format!("{e:#}"), "cursor-probe: injector open failed");
+                    return;
+                }
+            };
+            std::thread::sleep(Duration::from_secs(4));
+            let flags = (W << 16) | (H & 0xffff);
+            let (cx, cy, r) = ((W / 2) as f64, (H / 2) as f64, 200.0f64);
+            let mut t = 0.0f64;
+            let started = Instant::now();
+            let mut announced_rel = false;
+            while !stop_inj.load(Ordering::Relaxed) {
+                // Phase 1 (8 s): ABSOLUTE wiggle — parks the pointer on the virtual output and
+                // proves the metadata path. Phase 2: RELATIVE circles — what a capture-mode
+                // (pointer-lock) client sends; watch whether the live meta position keeps moving.
+                let e = if started.elapsed() < Duration::from_secs(8) {
+                    InputEvent {
+                        kind: InputKind::MouseMoveAbs,
+                        _pad: [0; 3],
+                        code: 0,
+                        x: (cx + r * t.cos()) as i32,
+                        y: (cy + r * t.sin()) as i32,
+                        flags,
+                    }
+                } else {
+                    if !announced_rel {
+                        announced_rel = true;
+                        println!("cursor-probe: switching to RELATIVE motion (capture-mode model)");
+                    }
+                    InputEvent {
+                        kind: InputKind::MouseMove,
+                        _pad: [0; 3],
+                        code: 0,
+                        x: (12.0 * t.cos()) as i32,
+                        y: (12.0 * t.sin()) as i32,
+                        flags: 0,
+                    }
+                };
+                if let Err(err) = inj.inject(&e) {
+                    tracing::warn!(error = %format!("{err:#}"), "cursor-probe: inject failed");
+                }
+                t += 0.15;
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        let (mut frames, mut with_overlay) = (0u64, 0u64);
+        let mut last_report = Instant::now();
+        let mut live_seen = false;
+        while Instant::now() < deadline {
+            // Damage-driven source: timeouts (gaps) are normal, hence the missing error arm.
+            if let Ok(f) = cap.next_frame_within(Duration::from_millis(500)) {
+                frames += 1;
+                if let Some(c) = &f.cursor {
+                    with_overlay += 1;
+                    if with_overlay == 1 {
+                        println!(
+                            "cursor-probe: FIRST frame-attached overlay: pos=({}, {}) \
+                             {}x{} serial={} visible={}",
+                            c.x, c.y, c.w, c.h, c.serial, c.visible
+                        );
+                    }
+                }
+            }
+            if last_report.elapsed() >= Duration::from_secs(2) {
+                last_report = Instant::now();
+                let live = cap.cursor();
+                if live.is_some() {
+                    live_seen = true;
+                }
+                match live {
+                    Some(c) => println!(
+                        "cursor-probe: frames={frames} with_overlay={with_overlay} live: \
+                         pos=({}, {}) {}x{} serial={} visible={}",
+                        c.x, c.y, c.w, c.h, c.serial, c.visible
+                    ),
+                    None => println!(
+                        "cursor-probe: frames={frames} with_overlay={with_overlay} live: NONE \
+                         (no SPA_META_Cursor bitmap yet)"
+                    ),
+                }
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        let _ = injector.join();
+
+        println!("---");
+        if embedded {
+            println!(
+                "cursor-probe: EMBEDDED run — no metadata expected; check the stream visually. \
+                 frames={frames}"
+            );
+        } else if live_seen || with_overlay > 0 {
+            println!(
+                "cursor-probe: VERDICT: metadata cursor DELIVERED ({with_overlay}/{frames} \
+                 frames carried it; live overlay seen: {live_seen})"
+            );
+        } else {
+            println!(
+                "cursor-probe: VERDICT: NO cursor metadata after {secs}s of pointer motion over \
+                 the virtual output ({frames} frames) — the compositor is not delivering \
+                 SPA_META_Cursor on this stream"
+            );
+        }
+        Ok(())
+    }
+}

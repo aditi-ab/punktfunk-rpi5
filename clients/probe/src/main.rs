@@ -53,8 +53,9 @@ use punktfunk_core::config::Role;
 use punktfunk_core::input::{InputEvent, InputKind};
 use punktfunk_core::packet::FLAG_PROBE;
 use punktfunk_core::quic::{
-    endpoint, io, window_loss_ppm, BitrateChanged, Hello, LossReport, ProbeRequest, ProbeResult,
-    Reconfigure, Reconfigured, RequestKeyframe, SetBitrate, Start, Welcome,
+    endpoint, io, window_loss_ppm, BitrateChanged, CursorRenderMode, Hello, LossReport,
+    ProbeRequest, ProbeResult, Reconfigure, Reconfigured, RequestKeyframe, SetBitrate, Start,
+    Welcome,
 };
 use punktfunk_core::transport::UdpTransport;
 use punktfunk_core::{CompositorPref, Mode, PunktfunkError, Session};
@@ -115,6 +116,12 @@ struct Args {
     /// `--speed-test KBPS:MS` — after the stream starts, ask the host for a `MS`-millisecond
     /// bandwidth probe burst at `KBPS`, then report measured throughput + loss.
     speed_test: Option<(u32, u32)>,
+    /// `--cursor-capture` — negotiate the cursor channel (`CLIENT_CAP_CURSOR`) and immediately
+    /// flip it to the capture model (`CursorRenderMode { client_draws: false }`), then wiggle the
+    /// pointer with RELATIVE motion for the whole stream: the headless reproduction of a
+    /// pointer-lock client expecting the HOST to composite the cursor into the video. Decode the
+    /// dump and look for the pointer — a cursorless dump is the bug this flag was built to catch.
+    cursor_capture: bool,
     /// `--discover [SECS]` — browse the LAN for native (`_punktfunk._udp`) hosts for `SECS`
     /// seconds (default 4), print what's found, and exit. No connection is made.
     discover: Option<u64>,
@@ -278,6 +285,7 @@ fn parse_args() -> Args {
             "h264" | "avc" => punktfunk_core::quic::CODEC_H264,
             "hevc" | "h265" => punktfunk_core::quic::CODEC_HEVC,
             "av1" => punktfunk_core::quic::CODEC_AV1,
+            "pyrowave" => punktfunk_core::quic::CODEC_PYROWAVE,
             _ => 0, // auto — no preference
         },
         launch: get("--launch").map(str::to_string),
@@ -292,6 +300,7 @@ fn parse_args() -> Args {
             .any(|a| a == "--discover")
             .then(|| get("--discover").and_then(|s| s.parse().ok()).unwrap_or(4)),
         clock_resync: argv.iter().any(|a| a == "--clock-resync"),
+        cursor_capture: argv.iter().any(|a| a == "--cursor-capture"),
     }
 }
 
@@ -308,6 +317,7 @@ fn codec_ext(codec: u8) -> &'static str {
     match codec {
         punktfunk_core::quic::CODEC_H264 => "h264",
         punktfunk_core::quic::CODEC_AV1 => "av1",
+        punktfunk_core::quic::CODEC_PYROWAVE => "pyrowave",
         _ => "h265",
     }
 }
@@ -517,16 +527,29 @@ async fn session(args: Args) -> Result<()> {
             // `Welcome::codec`; the dump extension follows that.
             video_codecs: punktfunk_core::quic::CODEC_H264
                 | punktfunk_core::quic::CODEC_HEVC
-                | punktfunk_core::quic::CODEC_AV1,
+                | punktfunk_core::quic::CODEC_AV1
+                // PyroWave only on request: a PyroWave-default host would otherwise pick it
+                // for every probe run, changing the dump format under long-standing recipes.
+                | if args.preferred_codec == punktfunk_core::quic::CODEC_PYROWAVE {
+                    punktfunk_core::quic::CODEC_PYROWAVE
+                } else {
+                    0
+                },
             // `--codec` soft preference (0 = auto). The host honors it when it can emit it.
             preferred_codec: args.preferred_codec,
             // PUNKTFUNK_CLIENT_PEAK_NITS=<nits> advertises a synthetic display volume — the host
             // writes it into the virtual display's EDID (CTA HDR block), so the EDID-forwarding
             // path can be validated headlessly (check the host's monitor caps / ADD log line).
             display_hdr: punktfunk_core::client::display_hdr_env_override(),
-            // No CLIENT_CAP_CURSOR: this headless tool renders nothing — advertising it would
-            // just strip the pointer from the dumped bitstream.
-            client_caps: 0,
+            // No CLIENT_CAP_CURSOR by default: this headless tool renders nothing — advertising
+            // it would just strip the pointer from the dumped bitstream. `--cursor-capture`
+            // advertises it deliberately and then flips the channel to the capture model, so the
+            // HOST composites and the dump is where the pointer must appear.
+            client_caps: if args.cursor_capture {
+                punktfunk_core::quic::CLIENT_CAP_CURSOR
+            } else {
+                0
+            },
         }
         .encode(),
     )
@@ -821,6 +844,64 @@ async fn session(args: Args) -> Result<()> {
                 send_dropped = res.send_dropped,
                 "SPEED TEST complete",
             );
+        });
+    } else if args.cursor_capture {
+        // Capture-model cursor repro: flip the negotiated cursor channel to "host composites"
+        // and drive RELATIVE pointer motion, exactly like a pointer-lock client. Owns BOTH
+        // control halves: the host may send CursorShape (0x50) messages while the channel is
+        // still in its initial client-draws state, and dropping our recv half would fail those
+        // writes host-side.
+        let mut cs = send;
+        let mut cr = recv;
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            match io::write_msg(
+                &mut cs,
+                &CursorRenderMode {
+                    client_draws: false,
+                }
+                .encode(),
+            )
+            .await
+            {
+                Ok(()) => tracing::info!(
+                    "cursor-capture: CursorRenderMode {{ client_draws: false }} sent — the host \
+                     must now composite the pointer into the video"
+                ),
+                Err(e) => {
+                    tracing::error!(error = %format!("{e:#}"), "cursor-capture: render-mode write failed");
+                    return;
+                }
+            }
+            // Drain (and just log) whatever the host still sends on the control stream.
+            while let Ok(b) = cr.read_msg().await {
+                tracing::debug!(
+                    len = b.len(),
+                    ty = b.get(4).copied().unwrap_or(0),
+                    "cursor-capture: control message drained"
+                );
+            }
+        });
+        let wiggle_conn = conn.clone();
+        tokio::spawn(async move {
+            // Relative circles, forever: keeps the host pointer moving (and, on metadata-cursor
+            // compositors, keeps cursor updates flowing) for the whole dump.
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            tracing::info!("cursor-capture: relative pointer wiggle running");
+            let mut t = 0.0f64;
+            loop {
+                let e = InputEvent {
+                    kind: InputKind::MouseMove,
+                    _pad: [0; 3],
+                    code: 0,
+                    x: (10.0 * t.cos()) as i32,
+                    y: (10.0 * t.sin()) as i32,
+                    flags: 0,
+                };
+                let _ = wiggle_conn.send_datagram(e.encode().to_vec().into());
+                t += 0.2;
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
         });
     } else {
         // Normal stream mode: relay the data loop's windowed loss estimate to the host as periodic

@@ -1,0 +1,26 @@
+# On-glass probe for the Linux cursor-as-metadata capture path: creates a virtual output with the
+# out-of-band cursor requested (exactly like a cursor-channel session), attaches the production
+# PipeWire capturer, wiggles the pointer over it via the production injector, and reports whether
+# `SPA_META_Cursor` ever yields an overlay (position + bitmap). Answers "does THIS compositor
+# deliver cursor metadata on a virtual output" without needing a client.
+[package]
+name = "cursor-probe"
+description = "On-glass probe: does this compositor's virtual output deliver SPA_META_Cursor?"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+pf-vdisplay = { path = "../../crates/pf-vdisplay" }
+pf-capture = { path = "../../crates/pf-capture" }
+pf-inject = { path = "../../crates/pf-inject" }
+punktfunk-core = { path = "../../crates/punktfunk-core", features = ["quic"] }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[lints]
+workspace = true

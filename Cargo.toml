@@ -29,6 +29,7 @@ members = [
     "clients/session",
     "clients/windows",
     "clients/android/native",
+    "tools/cursor-probe",
     "tools/display-disturb",
     "tools/latency-probe",
     "tools/loss-harness",
