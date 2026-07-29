@@ -187,10 +187,14 @@ pub(crate) struct StreamInfo {
     last_resize_ms: Option<u32>,
 }
 
-/// Non-sensitive host status for the local tray icon: counts and booleans only — no PIN values,
-/// no fingerprints, no device names. Served unauthenticated to LOOPBACK peers only (see
-/// `require_auth`): the bearer-token file is SYSTEM/Administrators-DACL'd on Windows, so the
-/// per-user tray process cannot authenticate — this narrow read-only route is its status source.
+/// Non-sensitive host status for the local tray icon: counts and booleans — no PIN values, no
+/// fingerprints. The ONE name exposed is `client_name`, the streaming client's display label
+/// (deliberate loosening for the tray's "client connected" toast: it tells the local user who is
+/// on their machine, which is disclosure in the user's favor — and any local process could
+/// already infer a session exists from the booleans here). Served unauthenticated to LOOPBACK
+/// peers only (see `require_auth`): the bearer-token file is SYSTEM/Administrators-DACL'd on
+/// Windows, so the per-user tray process cannot authenticate — this narrow read-only route is
+/// its status source.
 #[derive(Serialize, ToSchema)]
 pub(crate) struct LocalSummary {
     /// Host version (mirrors `/health`).
@@ -203,6 +207,11 @@ pub(crate) struct LocalSummary {
     /// The active session: GameStream's launch (Moonlight `/launch`) when present, else the first
     /// live native session. `null` when nothing is streaming.
     session: Option<SessionInfo>,
+    /// Display name of the (first) streaming native client — the trust store's name for it, else
+    /// the name the device sent at connect. `null` when idle, for a nameless client, or for a
+    /// GameStream session (that plane carries no device name).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    client_name: Option<String>,
     /// Number of pinned (paired) GameStream client certificates.
     paired_clients: u32,
     /// Number of paired native (punktfunk/1) devices.
@@ -457,8 +466,8 @@ pub(crate) async fn get_status(State(st): State<Arc<MgmtState>>) -> Json<Runtime
 
 /// Local status summary for the tray icon
 ///
-/// Non-sensitive status (counts and booleans only — no PIN values, no fingerprints, no device
-/// names). Unauthenticated, but served to loopback peers only.
+/// Non-sensitive status (counts, booleans, and the streaming client's display name — no PIN
+/// values, no fingerprints). Unauthenticated, but served to loopback peers only.
 #[utoipa::path(
     get,
     path = "/local/summary",
@@ -506,6 +515,9 @@ pub(crate) async fn get_local_summary(State(st): State<Arc<MgmtState>>) -> Json<
         video_streaming: st.app.streaming.load(Ordering::SeqCst) || !native.is_empty(),
         audio_streaming: st.app.audio_streaming.load(Ordering::SeqCst) || !native.is_empty(),
         session,
+        // The first native session's display name (matches the `session` fallback order — a
+        // GameStream launch carries no device name, so the field stays absent there).
+        client_name: native.first().and_then(|s| s.client_name.clone()),
         paired_clients: st
             .app
             .paired

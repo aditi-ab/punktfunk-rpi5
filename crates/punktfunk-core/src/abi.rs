@@ -1872,6 +1872,11 @@ unsafe fn connect_ex_impl(
             // ([`punktfunk_connection_next_cursor_shape`]/`_state`) may set it. ex7/ex8 pass 0.
             client_caps,
             launch,
+            // The C ABI has no device-name parameter (only `punktfunk_pair` takes one), so every
+            // embedder gets the OS hostname default — this is what the host's pending-approval
+            // list shows when an unpaired embedder knocks. An `ex10` variant can make it explicit
+            // if an embedder ever wants a custom label (e.g. the platform's marketing name).
+            Some(crate::client::device_name()),
             pin,
             identity,
             std::time::Duration::from_millis(timeout_ms as u64),

@@ -273,6 +273,9 @@ fn pump(
             0
         },
         params.launch.clone(),
+        // The host's approval-list / trust-store label for this client. Without it every no-PIN
+        // "request access" knock showed up as the fingerprint placeholder "device abcd1234".
+        Some(crate::trust::device_name()),
         params.pin,
         Some(params.identity),
         params.connect_timeout,

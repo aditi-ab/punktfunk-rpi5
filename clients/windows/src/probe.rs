@@ -58,6 +58,9 @@ pub fn run_speed_probe(
         None, // display_hdr: probe connect, nothing presents
         0,    // client_caps: probe connect, nothing renders a cursor
         None, // launch: no game
+        // Same label a real session sends — a speed test against a host that doesn't know us yet
+        // should knock under this device's name, not a fingerprint placeholder.
+        Some(punktfunk_core::client::device_name()),
         pin,
         Some(identity),
         Duration::from_secs(15),

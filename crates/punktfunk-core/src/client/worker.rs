@@ -24,6 +24,8 @@ pub(crate) struct WorkerArgs {
     pub(crate) display_hdr: Option<HdrMeta>,
     pub(crate) client_caps: u8,
     pub(crate) launch: Option<String>,
+    /// This device's display name, sent in `Hello` (the host's approval list / trust store label).
+    pub(crate) name: Option<String>,
     pub(crate) pin: Option<[u8; 32]>,
     pub(crate) identity: Option<(String, String)>,
     /// The embedder's connect budget (the same value `connect` bounds `ready_rx` with): the

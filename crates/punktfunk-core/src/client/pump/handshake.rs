@@ -120,9 +120,10 @@ pub(super) async fn connect_and_handshake(args: &WorkerArgs) -> Result<Handshake
                 compositor,
                 gamepad,
                 bitrate_kbps,
-                // No device name yet: the connect ABI has no name parameter (pairing does). The
-                // host falls back to a fingerprint-derived label in its pending-approval list.
-                name: None,
+                // The embedder's device name — what the host's pending-approval list and paired-
+                // devices store show for this client. `None` makes the host fall back to a
+                // fingerprint-derived "device abcd1234" label.
+                name: args.name.clone(),
                 // Library id to launch this session, if the embedder asked for one.
                 launch: launch.clone(),
                 // The embedder's decode/present caps (e.g. the Windows client advertises

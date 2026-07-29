@@ -10,7 +10,7 @@
       "name": "MIT OR Apache-2.0",
       "identifier": "MIT OR Apache-2.0"
     },
-    "version": "0.20.0"
+    "version": "0.21.0"
   },
   "paths": {
     "/api/v1/clients": {
@@ -1558,7 +1558,7 @@
           "host"
         ],
         "summary": "Local status summary for the tray icon",
-        "description": "Non-sensitive status (counts and booleans only — no PIN values, no fingerprints, no device\nnames). Unauthenticated, but served to loopback peers only.",
+        "description": "Non-sensitive status (counts, booleans, and the streaming client's display name — no PIN\nvalues, no fingerprints). Unauthenticated, but served to loopback peers only.",
         "operationId": "getLocalSummary",
         "responses": {
           "200": {
@@ -5686,7 +5686,7 @@
       },
       "LocalSummary": {
         "type": "object",
-        "description": "Non-sensitive host status for the local tray icon: counts and booleans only — no PIN values,\nno fingerprints, no device names. Served unauthenticated to LOOPBACK peers only (see\n`require_auth`): the bearer-token file is SYSTEM/Administrators-DACL'd on Windows, so the\nper-user tray process cannot authenticate — this narrow read-only route is its status source.",
+        "description": "Non-sensitive host status for the local tray icon: counts and booleans — no PIN values, no\nfingerprints. The ONE name exposed is `client_name`, the streaming client's display label\n(deliberate loosening for the tray's \"client connected\" toast: it tells the local user who is\non their machine, which is disclosure in the user's favor — and any local process could\nalready infer a session exists from the booleans here). Served unauthenticated to LOOPBACK\npeers only (see `require_auth`): the bearer-token file is SYSTEM/Administrators-DACL'd on\nWindows, so the per-user tray process cannot authenticate — this narrow read-only route is\nits status source.",
         "required": [
           "version",
           "video_streaming",
@@ -5701,6 +5701,13 @@
           "audio_streaming": {
             "type": "boolean",
             "description": "True while audio is streaming on either plane (same rule as `video_streaming`)."
+          },
+          "client_name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Display name of the (first) streaming native client — the trust store's name for it, else\nthe name the device sent at connect. `null` when idle, for a nameless client, or for a\nGameStream session (that plane carries no device name)."
           },
           "conflicts": {
             "type": "array",

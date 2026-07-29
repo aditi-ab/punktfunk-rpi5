@@ -292,6 +292,26 @@ fn register_hot_tid(reg: &Mutex<Vec<i32>>) {
     }
 }
 
+/// This machine's name — the default value for [`NativeClient::connect`]'s `name` parameter
+/// (what a host shows in its pending-approval list and files this client under when approved).
+/// `/etc/hostname` first (the answer on any Linux box, and available in a minimal build with no
+/// desktop toolkit to ask), then the usual environment fallbacks. Lives here (not in a client
+/// shell crate) so the C ABI's `punktfunk_connect` can share the same default.
+pub fn device_name() -> String {
+    #[cfg(target_os = "linux")]
+    if let Ok(s) = std::fs::read_to_string("/etc/hostname") {
+        let s = s.trim();
+        if !s.is_empty() {
+            return s.to_string();
+        }
+    }
+    std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "This device".into())
+}
+
 impl NativeClient {
     /// Connect to a `punktfunk/1` host and start the session at (up to) `mode`. Blocks until the
     /// handshake completes or `timeout` elapses.
@@ -335,6 +355,11 @@ impl NativeClient {
         // streams with NO visible cursor at all. `0` = today's composited behavior.
         client_caps: u8,
         launch: Option<String>,
+        // This device's display name, carried in [`crate::quic::Hello::name`]: what the host's
+        // pending-approval list shows when an unpaired client knocks, and what its trust store
+        // files the device under on delegated approval. `None` = the host falls back to a
+        // fingerprint-derived "device abcd1234" label. Embedders usually pass [`device_name`].
+        name: Option<String>,
         pin: Option<[u8; 32]>,
         identity: Option<(String, String)>,
         timeout: Duration,
@@ -414,6 +439,7 @@ impl NativeClient {
                     display_hdr,
                     client_caps,
                     launch,
+                    name,
                     pin,
                     identity,
                     connect_timeout: timeout,

@@ -42,6 +42,9 @@ struct LiveSession {
     force_idr: Arc<AtomicBool>,
     /// Short client label (cert-fingerprint prefix / peer IP) — carried on the lifecycle events.
     client: String,
+    /// The client's display name (trust-store name, else its sanitized Hello name) — what the
+    /// local summary's connect toast shows. `None` for a nameless knock (old client / Android).
+    client_name: Option<String>,
     /// Whether the session negotiated HDR — carried on the lifecycle events.
     hdr: bool,
     /// Completed bring-up total (hello → first packet), ms; 0 until the first packet left. Written
@@ -55,13 +58,16 @@ struct LiveSession {
 }
 
 /// A resolved read of one live session, for the `/status` view.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct SessionSnapshot {
     pub width: u32,
     pub height: u32,
     pub fps: u32,
     pub bitrate_kbps: u32,
     pub codec: Codec,
+    /// The client's display name (trust-store name, else its sanitized Hello name); `None` for a
+    /// nameless client.
+    pub client_name: Option<String>,
     /// Bring-up total (hello → first packet), ms; 0 while still bringing up (latency plan P0.1).
     pub time_to_first_frame_ms: u32,
     /// Most recent mid-stream resize total, ms; 0 = no resize this session.
@@ -106,6 +112,8 @@ pub struct Registration {
     pub force_idr: Arc<AtomicBool>,
     /// Short client label (cert-fingerprint prefix / peer IP).
     pub client: String,
+    /// The client's display name, when it has one (trust-store name, else sanitized Hello name).
+    pub client_name: Option<String>,
     pub hdr: bool,
     /// Bring-up total slot (hello → first packet), ms.
     pub ttff_ms: Arc<AtomicU32>,
@@ -127,6 +135,7 @@ pub fn register(reg: Registration) -> LiveSessionGuard {
         quit,
         force_idr,
         client,
+        client_name,
         hdr,
         ttff_ms,
         last_resize_ms,
@@ -142,6 +151,7 @@ pub fn register(reg: Registration) -> LiveSessionGuard {
         quit,
         force_idr,
         client,
+        client_name,
         hdr,
         ttff_ms,
         last_resize_ms,
@@ -197,6 +207,7 @@ pub fn snapshot() -> Vec<SessionSnapshot> {
                 fps,
                 bitrate_kbps: s.bitrate_kbps.load(Ordering::Relaxed),
                 codec: s.codec,
+                client_name: s.client_name.clone(),
                 time_to_first_frame_ms: s.ttff_ms.load(Ordering::Relaxed),
                 last_resize_ms: s.last_resize_ms.load(Ordering::Relaxed),
             }

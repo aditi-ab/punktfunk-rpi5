@@ -57,6 +57,10 @@ object NativeBridge {
         /** Store-qualified library id (`steam:<appid>` / `custom:<id>`) to boot straight into a game,
          *  or `null`/empty for a plain desktop connect. Rides the Hello as `launch`. */
         launch: String?,
+        /** This device's display name (rides the Hello as `name`) — what the host's pending-approval
+         *  list and trust store show for it, same convention as [nativePair]'s `name`. `null`/blank ⇒
+         *  the host falls back to a fingerprint-derived "device abcd1234" label. */
+        deviceName: String?,
     ): Long
 
     /** 64-hex SHA-256 of the cert the host presented on [handle]; valid after a successful connect. */
