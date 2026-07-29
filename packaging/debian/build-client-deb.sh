@@ -40,8 +40,13 @@ BIN="$OUTDIR/$PKG"
 SESSION_BIN="$OUTDIR/punktfunk-session"
 # The headless CLI (design/client-architecture-split.md §4) ships with every client.
 CLI_BIN="$OUTDIR/punktfunk"
-if [ ! -x "$BIN" ] || [ ! -x "$SESSION_BIN" ]; then
-  echo "==> building $CRATE + punktfunk-client-session (release${TARGET:+ for $TARGET})"
+# Test every binary this script goes on to install, not a subset. It used to check only $BIN and
+# $SESSION_BIN while installing three, so a caller that pre-built exactly those two (deb.yml did)
+# satisfied the guard, skipped this build, and then died on `install: No such file or directory`
+# for $CLI_BIN — a confusing way to say "the CLI was never built". The arm64 leg never hit it
+# because it pre-builds nothing, so the guard always fired there and built all three.
+if [ ! -x "$BIN" ] || [ ! -x "$SESSION_BIN" ] || [ ! -x "$CLI_BIN" ]; then
+  echo "==> building $CRATE + punktfunk-client-session + punktfunk-cli (release${TARGET:+ for $TARGET})"
   cargo build --release --locked "${CARGO_TARGET_ARGS[@]}" -p "$CRATE" -p punktfunk-client-session -p punktfunk-cli
 fi
 
