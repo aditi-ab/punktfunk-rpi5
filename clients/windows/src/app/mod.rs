@@ -293,11 +293,6 @@ fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
     // Whether the Edit-profile modal is up. Root state for the reactor-backend-handler reason
     // above; guarded in the page so it only renders while a profile is actually in scope.
     let (settings_edit, set_settings_edit) = cx.use_async_state(false);
-    // Window size, read at ROOT: the settings screen places its scope switcher by the same
-    // width threshold WinUI's NavigationView uses to collapse its pane (reactor exposes no
-    // pane-opened/closed event). Registering the size here re-renders the tree on resize,
-    // which the per-screen `use_inner_size` readers (hosts, library) already caused anyway.
-    let window = cx.use_inner_size();
     // Bumped when a settings edit changes what the page should SHOW without changing any state
     // it already reads — ANY edit through `settings::commit` (creating an override must surface
     // its marker as immediately as resetting one clears it), a reset, a profile colour change.
@@ -650,7 +645,6 @@ fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
             settings_rev,
             &set_settings_rev,
             nav_progress,
-            window.width,
         ),
         Screen::Licenses => licenses::licenses_page(&set_screen),
         Screen::Help => help::help_page(&set_screen),
