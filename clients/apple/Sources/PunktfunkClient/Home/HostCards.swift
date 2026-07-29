@@ -135,21 +135,23 @@ struct HostCardView: View {
             HStack(spacing: m.spacing) {
                 monogramTile(monogram(host.displayName), m: m, connecting: isConnecting, filled: true)
                 VStack(alignment: .leading, spacing: 4) {
-                    // The chip rides the TITLE line rather than a line of its own: a card with a
-                    // profile and one without have to be the same height, or a pinned card sticks
-                    // out of its row in the grid. Beside the name is also where it reads as "this
-                    // card connects with that", which is what it means.
+                    // The chip rides the TITLE line, anchored to the card's trailing edge — not
+                    // trailing the name, where it read as part of the title, and not on a line of
+                    // its own, where it made cards with a profile taller than cards without and a
+                    // pinned card stuck out of its grid row. The spacer is what anchors it: the
+                    // name truncates against that gap instead of ever running into the chip.
                     HStack(spacing: 6) {
                         Text(host.displayName)
                             .font(.geist(m.name, .bold, relativeTo: .title3))
                             .foregroundStyle(.primary)
                             .lineLimit(1)
+                        Spacer(minLength: 8)
                         if let profile = shownProfile {
                             ProfileChip(
                                 profile: profile, size: m.status,
                                 prominent: pinnedProfile != nil)
-                                // The chip is the shorter, more compressible of the two; let the
-                                // host name give up its width first only after the chip has.
+                                // The name gives up width first: a truncated host name still reads,
+                                // a truncated profile name is the one thing the chip exists to say.
                                 .layoutPriority(1)
                         }
                     }
@@ -159,7 +161,9 @@ struct HostCardView: View {
                         .lineLimit(1)
                     statusRow(m)
                 }
-                Spacer(minLength: 0)
+                // Fills the card so the title row's trailing spacer reaches the real edge; without
+                // it the text column hugs its content and "trailing" means "just after the name".
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
             .padding(m.padding)
             .frame(maxWidth: .infinity, alignment: .leading)
