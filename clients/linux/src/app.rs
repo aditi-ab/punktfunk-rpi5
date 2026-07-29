@@ -699,6 +699,9 @@ impl AppModel {
                     None, // display_hdr: probe connect, nothing presents
                     0,    // client_caps: probe connect, nothing renders a cursor
                     None, // launch: probe connect, no game
+                    // Knock under this device's name, not a fingerprint placeholder, when the
+                    // probed host doesn't know us yet.
+                    Some(pf_client_core::trust::device_name()),
                     pin,
                     Some(identity),
                     std::time::Duration::from_secs(15),

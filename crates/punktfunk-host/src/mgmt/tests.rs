@@ -316,6 +316,7 @@ fn fake_native_session(
         quit: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         force_idr: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         client: "test-client".into(),
+        client_name: Some("studio-deck".into()),
         hdr: false,
         ttff_ms: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         last_resize_ms: Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -345,17 +346,28 @@ async fn local_summary_reports_a_native_session_as_streaming() {
     assert_eq!(body["session"]["width"], 3840);
     assert_eq!(body["session"]["height"], 2160);
     assert_eq!(body["session"]["fps"], 120);
+    // The STREAMING client's display name rides along (the tray's connect toast); see the
+    // non-sensitive test below for the idle-side guarantee.
+    assert_eq!(body["client_name"], "studio-deck");
 
-    // Session over → back to idle.
+    // Session over → back to idle, and the name goes with it.
     drop(session);
     let (_, body) = send(&app, summary_req()).await;
     assert_eq!(body["video_streaming"], false);
     assert_eq!(body["session"], serde_json::Value::Null);
+    assert_eq!(
+        body["client_name"],
+        serde_json::Value::Null,
+        "no live session → no client name in the summary"
+    );
 }
 
 /// The tray's `/local/summary` is unauthenticated for LOOPBACK peers only — a LAN peer is
 /// rejected even though the route needs no bearer token, and the body never carries secret
-/// material (no PIN values, no fingerprints, no device names — counts/booleans only).
+/// material (no PIN values, no fingerprints). The ONE name it may carry is the *streaming*
+/// client's display name (`client_name`, for the tray's connect toast) — a paired-but-idle
+/// device's name must still never appear, which is what this test pins (it pairs a device and
+/// registers NO session).
 #[tokio::test]
 async fn local_summary_is_loopback_only_and_non_sensitive() {
     let _serial = SESSION_REGISTRY_LOCK.lock().await;

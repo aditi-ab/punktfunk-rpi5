@@ -1,6 +1,7 @@
 package io.unom.punktfunk
 
 import android.content.Context
+import android.os.Build
 import io.unom.punktfunk.kit.Gamepad
 import io.unom.punktfunk.kit.NativeBridge
 import io.unom.punktfunk.kit.VideoDecoders
@@ -53,6 +54,9 @@ suspend fun connectToHost(
             // the user's soft codec preference — the host resolves the emitted codec from both.
             VideoDecoders.decodableCodecBits(), settings.preferredCodec(), timeoutMs,
             launch,
+            // The host's approval-list / trust-store label for this device — the same
+            // Build.MODEL convention the pairing dialogs use for nativePair.
+            Build.MODEL ?: "Android",
         )
     }
 }

@@ -252,6 +252,16 @@ Source: "{#VkLayerDir}\pf_vkhdr_layer.json"; DestDir: "{app}\vklayer"; Flags: ig
 ; with the app). Operators who moved --mgmt-bind can append --mgmt-addr/--mgmt-port here.
 Root: HKLM64; Subkey: "SOFTWARE\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; \
   ValueName: "PunktfunkTray"; ValueData: """{app}\punktfunk-tray.exe"""; Flags: uninsdeletevalue; Tasks: trayicon
+; Toast identity for the tray's notifications ("client connected"). The tray process tags itself
+; with this AppUserModelID (win.rs TRAY_AUMID — keep in sync), and this registration is what makes
+; Windows 11 attribute its toasts as "Punktfunk" with the brand icon instead of a generic entry —
+; the same Classes\AppUserModelId mechanism the Windows App SDK uses for unpackaged apps. No Start
+; menu shortcut needed. Installed unconditionally (like the tray exe itself): the keys are inert
+; without the tray running.
+Root: HKLM64; Subkey: "SOFTWARE\Classes\AppUserModelId\unom.punktfunk.tray"; ValueType: string; \
+  ValueName: "DisplayName"; ValueData: "Punktfunk"; Flags: uninsdeletekey
+Root: HKLM64; Subkey: "SOFTWARE\Classes\AppUserModelId\unom.punktfunk.tray"; ValueType: string; \
+  ValueName: "IconUri"; ValueData: "{app}\punktfunk.ico"
 ; Put {app} on the MACHINE PATH so `punktfunk-host plugins add …` / `punktfunk-host service …` are
 ; runnable by name. Appended to the existing value ({olddata}) and guarded by PathNeedsAdd so a
 ; repair/upgrade never appends a duplicate. Deliberately NOT `uninsdeletevalue` — that would delete

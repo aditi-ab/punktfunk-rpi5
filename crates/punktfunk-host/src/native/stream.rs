@@ -999,6 +999,9 @@ pub(super) struct SessionContext {
     /// Short client label (cert-fingerprint prefix, else peer IP) seeded into the capture meta on
     /// the first armed stats registration.
     pub(super) client_label: String,
+    /// The client's display name (trust-store name, else sanitized Hello name; `None` = nameless
+    /// knock) — published to the live-session registry for the local summary's connect toast.
+    pub(super) client_name: Option<String>,
     /// The session's requested launch, `None` = none. On Windows the store-qualified library id
     /// (spawned into the interactive user session once capture is live); on other hosts the shell
     /// command already resolved against the host's own library — nested into gamescope's bare spawn
@@ -1140,6 +1143,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
         streamed_au,
         stats,
         client_label,
+        client_name,
         launch,
         launch_target,
         client_hdr,
@@ -1480,6 +1484,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
         quit: quit.clone(),
         force_idr: force_idr.clone(),
         client: client_label,
+        client_name,
         hdr: plan.hdr,
         ttff_ms: bringup.total_slot(),
         last_resize_ms: resize_ms.clone(),

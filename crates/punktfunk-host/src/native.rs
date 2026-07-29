@@ -1460,6 +1460,23 @@ async fn serve_session(
     let client_label = endpoint::peer_fingerprint(&conn)
         .map(|fp| fingerprint_hex(&fp)[..12].to_string())
         .unwrap_or_else(|| conn.remote_address().ip().to_string());
+    // The client's DISPLAY name for the status surface (local summary → the tray's connect
+    // toast): the trust store's operator-curated name for this fingerprint first (a rename at
+    // approval time wins over whatever the device calls itself), else the sanitized Hello name.
+    // `None` (nameless knock from an old client / Android) keeps the summary name-free.
+    let client_name = endpoint::peer_fingerprint(&conn)
+        .map(|fp| fingerprint_hex(&fp))
+        .and_then(|fp_hex| {
+            np.list()
+                .into_iter()
+                .find(|c| c.fingerprint == fp_hex)
+                .map(|c| c.name)
+                .or_else(|| {
+                    let raw = hello.name.as_deref().unwrap_or("").trim();
+                    (!raw.is_empty())
+                        .then(|| crate::native_pairing::sanitize_device_name(raw, &fp_hex))
+                })
+        });
     // Transition-trace handles for the data plane (P0.1): the punch stamp + the virtual-stream
     // stages ride the same per-session trace; resizes write their totals into the shared slot.
     let bringup_dp = bringup.clone();
@@ -1556,6 +1573,7 @@ async fn serve_session(
                         streamed_au,
                         stats: stats_dp,
                         client_label,
+                        client_name,
                         launch: launch_for_dp,
                         launch_target,
                         client_hdr,
@@ -2260,6 +2278,7 @@ mod tests {
             None, // display_hdr
             0,    // client_caps
             None, // launch
+            None, // name
             None, // pin (TOFU)
             None, // identity (host doesn't require pairing)
             std::time::Duration::from_secs(10),
@@ -2431,6 +2450,7 @@ mod tests {
             None, // display_hdr
             0,    // client_caps
             None, // launch
+            None, // name: absent on purpose — this test asserts the fingerprint-derived label
             None, // pin: TOFU — the operator's approval (not a PIN) authorizes this client
             Some((cert, key)),
             std::time::Duration::from_secs(15),
@@ -2499,6 +2519,7 @@ mod tests {
                 None, // display_hdr
                 0,    // client_caps
                 None, // launch
+                None, // name
                 None,
                 None,
                 timeout
@@ -2529,6 +2550,7 @@ mod tests {
             None, // display_hdr
             0,    // client_caps
             None, // launch
+            None, // name
             Some(host_fp),
             Some((cert.clone(), key.clone())),
             timeout,

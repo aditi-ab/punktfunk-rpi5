@@ -8,7 +8,7 @@
 //! left admin-gated rather than DACL-opened to every local user.
 
 use std::os::windows::ffi::OsStrExt;
-use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU8, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use windows::core::{w, PCWSTR};
@@ -17,21 +17,25 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::CreateMutexW;
+use windows::Win32::UI::HiDpi::GetSystemMetricsForDpi;
 use windows::Win32::UI::Shell::{
-    ShellExecuteW, Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIM_ADD,
-    NIM_DELETE, NIM_MODIFY, NIM_SETVERSION, NIN_SELECT, NOTIFYICONDATAW, NOTIFYICON_VERSION_4,
+    SetCurrentProcessExplicitAppUserModelID, ShellExecuteW, Shell_NotifyIconW, NIF_ICON, NIF_INFO,
+    NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIIF_LARGE_ICON, NIIF_RESPECT_QUIET_TIME, NIIF_USER,
+    NIM_ADD, NIM_DELETE, NIM_MODIFY, NIM_SETVERSION, NIN_SELECT, NOTIFYICONDATAW,
+    NOTIFYICON_VERSION_4,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
-    DispatchMessageW, FindWindowW, GetCursorPos, GetMessageW, LoadIconW, PostMessageW,
+    DispatchMessageW, FindWindowW, GetCursorPos, GetMessageW, LoadImageW, PostMessageW,
     PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SetForegroundWindow,
-    SetMenuDefaultItem, TrackPopupMenuEx, TranslateMessage, HICON, MF_GRAYED, MF_SEPARATOR,
-    MF_STRING, MSG, SW_HIDE, SW_SHOWNORMAL, TPM_BOTTOMALIGN, TPM_RIGHTBUTTON, WINDOW_EX_STYLE,
-    WM_APP, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_DESTROY, WM_ENDSESSION, WM_NULL, WNDCLASSW,
-    WS_OVERLAPPED,
+    SetMenuDefaultItem, TrackPopupMenuEx, TranslateMessage, HICON, IMAGE_ICON, LR_SHARED,
+    MF_GRAYED, MF_SEPARATOR, MF_STRING, MSG, SM_CXICON, SM_CXSMICON, SW_HIDE, SW_SHOWNORMAL,
+    TPM_BOTTOMALIGN, TPM_RIGHTBUTTON, WINDOW_EX_STYLE, WM_APP, WM_CLOSE, WM_COMMAND,
+    WM_CONTEXTMENU, WM_DESTROY, WM_ENDSESSION, WM_NULL, WM_SETTINGCHANGE, WNDCLASSW, WS_OVERLAPPED,
 };
 
 use crate::status::{Poller, TrayStatus};
+use crate::win_theme;
 
 /// Keyboard "select" on the icon (Enter/Space) — `NIN_SELECT | NINF_KEY`; the windows crate
 /// exports only NIN_SELECT.
@@ -79,6 +83,10 @@ struct App {
     /// or falls back to showing the menu.
     web_console: AtomicBool,
     web_port: u16,
+    /// Streaming edge tracker for the connect toast: 0 = no status seen yet, 1 = not streaming,
+    /// 2 = streaming. The "no status yet" state keeps a tray started mid-session (sign-in while a
+    /// client already streams) from firing a stale toast.
+    streaming_seen: AtomicU8,
 }
 
 static APP: OnceLock<App> = OnceLock::new();
@@ -128,6 +136,19 @@ pub fn run(args: crate::Args) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // Toast identity: the installer registers this AUMID under Classes\AppUserModelId with
+    // DisplayName "Punktfunk" + the brand IconUri (punktfunk-host.iss [Registry] — keep in sync),
+    // so the connect toast is attributed to "Punktfunk" with the logo instead of a generic entry.
+    // Must run before the notify icon exists. Unregistered (dev run) it degrades to the default
+    // attribution, never an error.
+    // SAFETY: static nul-terminated literal.
+    unsafe {
+        let _ = SetCurrentProcessExplicitAppUserModelID(w!("unom.punktfunk.tray"));
+    }
+
+    // Before the first menu: opt this process's popup menus into the system dark mode.
+    win_theme::init_dark_mode();
+
     let host_exe = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.join("punktfunk-host.exe")))
@@ -143,6 +164,7 @@ pub fn run(args: crate::Args) -> anyhow::Result<()> {
         host_exe,
         web_console: AtomicBool::new(false), // live-probed by the poller within its first cycle
         web_port: args.web_port,
+        streaming_seen: AtomicU8::new(0),
     })
     .ok()
     .expect("run() is called once");
@@ -247,14 +269,27 @@ fn update_icon(hwnd: HWND, add: bool) -> bool {
         uCallbackMessage: WMAPP_NOTIFYCALLBACK,
         ..Default::default()
     };
-    // SAFETY: LoadIconW by ordinal from this exe's embedded resources (build.rs); the ordinal is
-    // one of the ids compiled in, and a failure falls back to a null icon rather than UB.
+    // Ask for the shell's small-icon size at this DPI, so LoadImageW serves the best frame of the
+    // multi-size .ico instead of the 32 px default the shell then downscales (soft at 125 %+).
+    // SAFETY: plain metric query; 0 (failure) falls back to the classic 16 px.
+    let sm = match unsafe { GetSystemMetricsForDpi(SM_CXSMICON, win_theme::window_dpi(hwnd)) } {
+        0 => 16,
+        n => n,
+    };
+    // SAFETY: LoadImageW by ordinal from this exe's embedded resources (build.rs); the ordinal is
+    // one of the ids compiled in, LR_SHARED handles are system-cached (never destroyed by us),
+    // and a failure falls back to a null icon rather than UB.
     nid.hIcon = unsafe {
-        LoadIconW(
+        LoadImageW(
             Some(GetModuleHandleW(None).unwrap_or_default().into()),
             PCWSTR(icon_ordinal(&status) as usize as *const u16),
+            IMAGE_ICON,
+            sm,
+            sm,
+            LR_SHARED,
         )
     }
+    .map(|h| HICON(h.0))
     .unwrap_or(HICON(std::ptr::null_mut()));
     // Tooltip: truncate to the szTip capacity (127 UTF-16 units + nul).
     let tip = to_wide(&status.headline());
@@ -281,6 +316,77 @@ fn update_icon(hwnd: HWND, add: bool) -> bool {
     }
 }
 
+/// Toast when a client connects (the idle → streaming edge, as seen by the poller). Windows 11
+/// renders `NIF_INFO` balloons as native toasts under the app's name — no WinRT/AUMID
+/// registration needed for a plain exe. Fired from the UI thread on WMAPP_STATUS.
+fn notify_on_connect(hwnd: HWND) {
+    let status = app().status.lock().unwrap().clone();
+    let now: u8 = if status.is_streaming() { 2 } else { 1 };
+    // 0 = first status since launch: record only. A tray started mid-session (sign-in while a
+    // client already streams) must not fire a stale toast.
+    let was = app().streaming_seen.swap(now, Ordering::SeqCst);
+    if !(was == 1 && now == 2) {
+        return;
+    }
+    let (title, body) = match &status {
+        TrayStatus::Running(s) => (
+            // The host resolves the name from its trust store, else the device's own Hello name;
+            // absent (older host / nameless client) the toast stays generic.
+            match &s.client_name {
+                Some(name) => format!("{name} connected"),
+                None => "Client connected".to_string(),
+            },
+            match &s.session {
+                Some(sess) => format!(
+                    "Streaming {}×{} @ {} fps",
+                    sess.width, sess.height, sess.fps
+                ),
+                None => "A client is streaming from this host.".to_string(),
+            },
+        ),
+        _ => return, // is_streaming() implies Running; stay defensive
+    };
+    let mut nid = NOTIFYICONDATAW {
+        cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+        hWnd: hwnd,
+        uID: 1,
+        uFlags: NIF_INFO, // NIM_MODIFY touches only the balloon fields; icon/tip stay as-is
+        dwInfoFlags: NIIF_USER | NIIF_LARGE_ICON | NIIF_RESPECT_QUIET_TIME,
+        ..Default::default()
+    };
+    let title = to_wide(&title);
+    let n = title.len().min(nid.szInfoTitle.len() - 1);
+    nid.szInfoTitle[..n].copy_from_slice(&title[..n]);
+    let body = to_wide(&body);
+    let n = body.len().min(nid.szInfo.len() - 1);
+    nid.szInfo[..n].copy_from_slice(&body[..n]);
+    // SAFETY: plain metric query; 0 (failure) falls back to the classic 32 px.
+    let sm = match unsafe { GetSystemMetricsForDpi(SM_CXICON, win_theme::window_dpi(hwnd)) } {
+        0 => 32,
+        n => n,
+    };
+    // The brand logo (ordinal 1, punktfunk.ico) at full toast size — the toast is Punktfunk
+    // speaking, not a status glyph. SAFETY: LoadImageW by ordinal from this exe's embedded
+    // resources; LR_SHARED handles are system-cached (never destroyed by us), and on failure the
+    // toast just shows no image.
+    nid.hBalloonIcon = unsafe {
+        LoadImageW(
+            Some(GetModuleHandleW(None).unwrap_or_default().into()),
+            PCWSTR(1usize as *const u16),
+            IMAGE_ICON,
+            sm,
+            sm,
+            LR_SHARED,
+        )
+    }
+    .map(|h| HICON(h.0))
+    .unwrap_or(HICON(std::ptr::null_mut()));
+    // SAFETY: nid fully initialized with a correct cbSize; NIM_MODIFY only reads it.
+    unsafe {
+        let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
+    }
+}
+
 /// The right-click menu, rebuilt from the live status each time.
 fn show_menu(hwnd: HWND) {
     let status = app().status.lock().unwrap().clone();
@@ -296,7 +402,10 @@ fn show_menu(hwnd: HWND) {
     // below (SetForegroundWindow before, WM_NULL after) per the Shell_NotifyIcon docs.
     unsafe {
         let Ok(menu) = CreatePopupMenu() else { return };
-        let add = |id: usize, text: &str, grayed: bool| {
+        // Glyph bitmaps: the menu references but does not own them; the guard deletes them after
+        // DestroyMenu below.
+        let mut glyphs = win_theme::MenuGlyphs::new(hwnd);
+        let mut add = |id: usize, text: &str, grayed: bool, glyph: Option<u16>| {
             let wide = to_wide(text);
             let flags = if grayed {
                 MF_STRING | MF_GRAYED
@@ -304,41 +413,91 @@ fn show_menu(hwnd: HWND) {
                 MF_STRING
             };
             let _ = AppendMenuW(menu, flags, id, PCWSTR(wide.as_ptr()));
+            if let Some(g) = glyph {
+                glyphs.set(menu, id, g);
+            }
         };
-        add(IDM_HEADER, &status.headline(), true);
+        add(IDM_HEADER, &status.headline(), true, None);
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         // The console entry is ALWAYS here — it is the reason most people open this menu, and
         // left-clicking the icon is not a discoverable substitute. When the loopback probe says
         // the console isn't answering the label says so, rather than the entry vanishing.
         if app().web_console.load(Ordering::SeqCst) {
-            add(IDM_OPEN_WEB, "Open web console", false);
+            add(
+                IDM_OPEN_WEB,
+                "Open web console",
+                false,
+                Some(win_theme::GLYPH_GLOBE),
+            );
         } else {
-            add(IDM_OPEN_WEB, "Open web console (not responding)", false);
+            add(
+                IDM_OPEN_WEB,
+                "Open web console (not responding)",
+                false,
+                Some(win_theme::GLYPH_GLOBE),
+            );
         }
         let _ = SetMenuDefaultItem(menu, IDM_OPEN_WEB as u32, 0);
         if status.pairing_attention() {
-            add(IDM_PAIRING, "Approve pairing request…", false);
+            add(
+                IDM_PAIRING,
+                "Approve pairing request…",
+                false,
+                Some(win_theme::GLYPH_APPROVE),
+            );
         }
         match status.kept_displays() {
             0 => {}
-            1 => add(IDM_DISPLAYS, "Release kept display…", false),
-            n => add(IDM_DISPLAYS, &format!("Release {n} kept displays…"), false),
+            1 => add(
+                IDM_DISPLAYS,
+                "Release kept display…",
+                false,
+                Some(win_theme::GLYPH_DISPLAY),
+            ),
+            n => add(
+                IDM_DISPLAYS,
+                &format!("Release {n} kept displays…"),
+                false,
+                Some(win_theme::GLYPH_DISPLAY),
+            ),
         }
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+        // The service actions all carry the shield: Explorer's convention for "selecting this
+        // opens a UAC prompt" (each runs `punktfunk-host.exe service …` elevated).
         if can_control {
             if startable {
-                add(IDM_START, "Start host", false);
+                add(
+                    IDM_START,
+                    "Start host",
+                    false,
+                    Some(win_theme::GLYPH_SHIELD),
+                );
             }
             if running {
-                add(IDM_STOP, "Stop host", false);
-                add(IDM_RESTART, "Restart host", false);
+                add(IDM_STOP, "Stop host", false, Some(win_theme::GLYPH_SHIELD));
+                add(
+                    IDM_RESTART,
+                    "Restart host",
+                    false,
+                    Some(win_theme::GLYPH_SHIELD),
+                );
             } else if matches!(status, TrayStatus::Error(_)) {
-                add(IDM_RESTART, "Restart host", false);
+                add(
+                    IDM_RESTART,
+                    "Restart host",
+                    false,
+                    Some(win_theme::GLYPH_SHIELD),
+                );
             }
         }
-        add(IDM_LOGS, "Open logs folder", false);
+        add(
+            IDM_LOGS,
+            "Open logs folder",
+            false,
+            Some(win_theme::GLYPH_FOLDER),
+        );
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-        add(IDM_EXIT, "Exit tray", false);
+        add(IDM_EXIT, "Exit tray", false, Some(win_theme::GLYPH_POWER));
 
         let mut pt = Default::default();
         let _ = GetCursorPos(&mut pt);
@@ -425,7 +584,17 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
     match msg {
         WMAPP_STATUS => {
             update_icon(hwnd, false);
+            notify_on_connect(hwnd);
             LRESULT(0)
+        }
+        WM_SETTINGCHANGE => {
+            // Light/dark flipped while running: drop the cached menu theme so the next popup
+            // renders in the new mode.
+            if win_theme::is_color_scheme_change(lparam) {
+                win_theme::on_color_scheme_changed();
+            }
+            // SAFETY: setting broadcasts still get default processing.
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
         WMAPP_NOTIFYCALLBACK => {
             // NOTIFYICON_VERSION_4: LOWORD(lParam) is the event.

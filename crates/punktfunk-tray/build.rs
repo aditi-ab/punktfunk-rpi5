@@ -25,6 +25,24 @@ fn main() {
         // Task Manager / Explorer identity (matches the host's "Punktfunk Host").
         res.set("FileDescription", "Punktfunk Tray");
         res.set("ProductName", "Punktfunk");
+        // PerMonitorV2: without a DPI manifest the process is virtualized and its menu
+        // GDI-stretched — visibly blurry on any scaled display (most Windows 11 laptops).
+        res.set_manifest(
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+    <application>
+      <!-- Windows 10/11 -->
+      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"/>
+    </application>
+  </compatibility>
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2</dpiAwareness>
+    </windowsSettings>
+  </application>
+</assembly>"#,
+        );
         res.compile().expect("embed windows icon resources");
     }
 }

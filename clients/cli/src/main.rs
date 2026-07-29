@@ -657,6 +657,7 @@ punktfunk:// link takes. Exit codes: 0 ok, 2 connect, 3 trust, 4 renderer, 5 not
             None, // display_hdr
             0,    // client_caps: nothing renders a cursor
             None, // launch
+            Some(punktfunk_core::client::device_name()),
             Some(pin),
             Some(identity),
             Duration::from_secs(15),

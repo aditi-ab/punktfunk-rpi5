@@ -84,8 +84,11 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSetLowLaten
 }
 
 /// `NativeBridge.nativeConnect(host, port, w, h, hz, certPem, keyPem, pinHex, bitrateKbps,
-/// compositorPref, gamepadPref, hdrEnabled, audioChannels, preferredCodec, timeoutMs, launch): Long`.
+/// compositorPref, gamepadPref, hdrEnabled, audioChannels, preferredCodec, timeoutMs, launch,
+/// deviceName): Long`.
 /// `launch` (empty ⇒ none) is a store-qualified library id to boot straight into a game.
+/// `deviceName` (empty ⇒ none) rides the Hello as `name` — what the host's pending-approval list
+/// and trust store show for this device (Kotlin passes `Build.MODEL`, its `nativePair` convention).
 /// `certPem`/`keyPem` empty = anonymous, else presented as the persistent identity. `pinHex` empty
 /// = TOFU (read `nativeHostFingerprint` after), else 64-hex SHA-256 to pin the host (mismatch → 0).
 /// `bitrateKbps` 0 = host default. `compositorPref`/`gamepadPref` are `CompositorPref`/`GamepadPref`
@@ -117,6 +120,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConnect<'lo
     preferred_codec: jint,
     timeout_ms: jint,
     launch: JString<'local>,
+    device_name: JString<'local>,
 ) -> jlong {
     let host: String = match env.get_string(&host) {
         Ok(s) => s.into(),
@@ -135,6 +139,14 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConnect<'lo
         .map(Into::into)
         .ok()
         .filter(|s: &String| !s.is_empty());
+    // The host's approval-list / trust-store label for this device; null / blank ⇒ None (the host
+    // falls back to its fingerprint-derived "device abcd1234" placeholder).
+    let device_name: Option<String> = env
+        .get_string(&device_name)
+        .map(Into::into)
+        .ok()
+        .map(|s: String| s.trim().to_string())
+        .filter(|s| !s.is_empty());
 
     let identity: Option<(String, String)> = if cert.is_empty() || key.is_empty() {
         None
@@ -204,8 +216,9 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConnect<'lo
         // No non-video caps: this client does not render the host cursor locally (no shape/state
         // planes in the jni surface), so advertising CLIENT_CAP_CURSOR would stream cursor-less.
         0,
-        launch,   // a store-qualified library id to boot into a game, or None for the desktop
-        pin,      // Some → Crypto on host-fp mismatch
+        launch, // a store-qualified library id to boot into a game, or None for the desktop
+        device_name, // Kotlin's Build.MODEL — the host's approval-list / trust-store label
+        pin,    // Some → Crypto on host-fp mismatch
         identity, // owned (cert, key) PEM, or None (anonymous)
         // Handshake budget from Kotlin: ~10 s for a normal connect, ~185 s for "request access"
         // (the host parks the connection until the operator approves the device — see ConnectScreen).

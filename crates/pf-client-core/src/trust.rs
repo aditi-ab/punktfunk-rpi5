@@ -344,21 +344,10 @@ pub fn persist_host(name: &str, addr: &str, port: u16, fp_hex: &str, paired: boo
 }
 
 /// This machine's name — the label a host files this client under in its paired-devices list.
-/// `/etc/hostname` first (the answer on any Linux box, and the only one available in a minimal
-/// build with no GTK to ask), then the usual environment fallbacks.
+/// Now owned by punktfunk-core (`client::device_name`) so the connect path and the C ABI share
+/// the same default; re-exported here for the existing pairing-path callers.
 pub fn device_name() -> String {
-    #[cfg(target_os = "linux")]
-    if let Ok(s) = std::fs::read_to_string("/etc/hostname") {
-        let s = s.trim();
-        if !s.is_empty() {
-            return s.to_string();
-        }
-    }
-    std::env::var("COMPUTERNAME")
-        .or_else(|_| std::env::var("HOSTNAME"))
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "This device".into())
+    punktfunk_core::client::device_name()
 }
 
 /// Drop an fp-less placeholder entry for `addr:port`. A host added by address before any
