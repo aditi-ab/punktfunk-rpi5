@@ -100,14 +100,28 @@ export const PendingDevices: FC<{
 						<TableBody>
 							{rows.map((p) => (
 								<TableRow className="h-18" key={p.id}>
-									<TableCell className="font-medium">{p.name}</TableCell>
-									<TableCell className="font-mono text-xs text-muted-foreground">
+									{/* The row must keep the actions on-canvas in a portrait phone
+									    viewport: the name flexes and truncates (w-full + max-w-0),
+									    and the fingerprint/age columns collapse into a sub-line
+									    here below md/sm instead of widening the row past the
+									    screen (the table wrapper scrolls, the page doesn't — an
+									    off-canvas Approve button is unreachable on mobile). */}
+									<TableCell className="w-full max-w-0 font-medium">
+										<div className="truncate">{p.name}</div>
+										<div className="truncate font-mono text-xs font-normal text-muted-foreground md:hidden">
+											{p.fingerprint.slice(0, 16)}…
+											<span className="ml-2 font-sans sm:hidden">
+												{fmtAge(p.age_secs)}
+											</span>
+										</div>
+									</TableCell>
+									<TableCell className="hidden font-mono text-xs text-muted-foreground md:table-cell">
 										{p.fingerprint.slice(0, 16)}…
 									</TableCell>
-									<TableCell className="text-xs text-muted-foreground">
+									<TableCell className="hidden text-xs text-muted-foreground sm:table-cell">
 										{fmtAge(p.age_secs)}
 									</TableCell>
-									<TableCell className="text-right">
+									<TableCell className="whitespace-nowrap text-right">
 										<div className="flex justify-end gap-2">
 											<Button
 												size="sm"
