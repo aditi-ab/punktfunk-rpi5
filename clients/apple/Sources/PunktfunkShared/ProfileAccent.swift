@@ -21,8 +21,9 @@ public struct ProfileAccent: Identifiable, Sendable, Hashable {
 
     /// Hues that stay legible as tinted text on their own tinted capsule, in both appearances,
     /// and that stay tellable apart from each other at chip size.
+    /// No violet: the brand purple IS the default, and a swatch a shade off it would be a
+    /// choice you can't see you made.
     public static let palette: [ProfileAccent] = [
-        ProfileAccent(hex: "#8b5cf6", name: "Violet"),
         ProfileAccent(hex: "#3aa0ff", name: "Blue"),
         ProfileAccent(hex: "#2bb8a6", name: "Teal"),
         ProfileAccent(hex: "#35c759", name: "Green"),

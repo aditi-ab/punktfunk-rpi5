@@ -46,23 +46,11 @@ final class ProfileStore: ObservableObject {
 
     // MARK: - Catalog management (the scope menu's Rename / Duplicate / Delete)
 
-    /// Create an EMPTY profile — it inherits everything, which is the right creation default under
-    /// inherit-by-exception. "Duplicate" covers starting from another profile.
-    @discardableResult
-    func create(name: String) -> StreamProfile {
-        let profile = StreamProfile(name: name)
+    /// Add a profile the editor built. A blank one inherits everything — the right creation
+    /// default under inherit-by-exception; a duplicate arrives carrying the source's overrides,
+    /// which is what duplicating is for.
+    func add(_ profile: StreamProfile) {
         catalog.profiles.append(profile)
-        return profile
-    }
-
-    @discardableResult
-    func duplicate(_ id: String, name: String) -> StreamProfile? {
-        guard let source = catalog.profile(id: id) else { return nil }
-        var copy = source
-        copy.id = newProfileID()
-        copy.name = name
-        catalog.profiles.append(copy)
-        return copy
     }
 
     func rename(_ id: String, to name: String) {

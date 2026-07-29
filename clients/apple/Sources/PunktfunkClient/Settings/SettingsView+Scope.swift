@@ -303,57 +303,15 @@ extension SettingsView {
         }
         .pickerStyle(.inline)
         Divider()
-        Button("New Profile…") {
-            nameDraft = ""
-            nameAction = .create
-        }
+        // Three actions, one sheet. A profile is a name and a colour; deciding them in separate
+        // menu items — each raising its own bare alert — is how "make a Work profile" became four
+        // trips through this menu.
+        Button("New Profile…") { profileDraft = .create() }
         if let active = activeProfile {
-            Button("Rename “\(active.name)”…") {
-                nameDraft = active.name
-                nameAction = .rename(active.id)
+            Button("Edit “\(active.name)”…") { profileDraft = .edit(active) }
+            Button("Duplicate “\(active.name)”…") {
+                profileDraft = .duplicate(active, name: Self.copyName(of: active.name, in: profiles))
             }
-            Button("Duplicate “\(active.name)”") {
-                nameDraft = Self.copyName(of: active.name, in: profiles)
-                nameAction = .duplicate(active.id)
-            }
-            colorMenu(active)
-            Button("Delete “\(active.name)”…", role: .destructive) {
-                profilePendingDelete = active
-            }
-        }
-    }
-
-    /// "Color ▸" — what tints this profile's chip on the host cards and its dot here. A palette
-    /// rather than a colour well: the chip is small tinted text on a tinted capsule, and a colour
-    /// picked freehand lands somewhere unreadable often enough to matter (see `ProfileAccent`).
-    @ViewBuilder
-    private func colorMenu(_ active: StreamProfile) -> some View {
-        Menu("Color") {
-            Button {
-                profiles.setAccent(active.id, to: nil)
-            } label: {
-                Self.checkable("Default", on: active.accent == nil)
-            }
-            ForEach(ProfileAccent.palette) { accent in
-                Button {
-                    profiles.setAccent(active.id, to: accent.hex)
-                } label: {
-                    Self.checkable(
-                        accent.name,
-                        on: active.accent?.caseInsensitiveCompare(accent.hex) == .orderedSame)
-                }
-            }
-        }
-    }
-
-    /// A menu row carrying a checkmark when it is the current choice. Two shapes rather than one
-    /// `Label` with an empty symbol name — `Image(systemName: "")` is not a blank image.
-    @ViewBuilder
-    private static func checkable(_ title: String, on: Bool) -> some View {
-        if on {
-            Label(title, systemImage: "checkmark")
-        } else {
-            Text(title)
         }
     }
 
@@ -431,89 +389,17 @@ extension SettingsView {
     }
     #endif
 
-    /// The two prompts the scope menu can raise, attached wherever the menu lives.
+    /// The editor, attached wherever the menu lives.
     private func profilePrompts<Content: View>(_ content: Content) -> some View {
-        content
-            // Name prompts (create / rename / duplicate) share one alert: they differ only in the
-            // title and what happens with the name.
-            .alert(nameAction?.title ?? "", isPresented: namePromptPresented) {
-                TextField("Name", text: $nameDraft)
-                Button("Cancel", role: .cancel) { nameAction = nil }
-                Button(nameAction?.accept ?? "OK") { commitNamePrompt() }
-                    .disabled(!isNameAcceptable)
-            } message: {
-                Text(nameMessage)
-            }
-            // Deleting warns with what it will change — bindings fall back to Default settings
-            // and pinned cards disappear (§6). Neither is an error, but neither is a surprise.
-            .alert(
-                "Delete “\(profilePendingDelete?.name ?? "")”?",
-                isPresented: profileDeletePresented,
-                presenting: profilePendingDelete
-            ) { profile in
-                Button("Cancel", role: .cancel) { profilePendingDelete = nil }
-                Button("Delete", role: .destructive) {
-                    profiles.delete(profile.id)
-                    scope = .defaults
-                    profilePendingDelete = nil
-                }
-            } message: { profile in
-                Text(Self.deleteWarning(for: profile, in: profiles))
-            }
-    }
-
-    private var profileDeletePresented: Binding<Bool> {
-        Binding(
-            get: { profilePendingDelete != nil },
-            set: { if !$0 { profilePendingDelete = nil } })
+        content.sheet(item: $profileDraft) { draft in
+            ProfileEditorSheet(draft: draft) { scope = $0 }
+        }
     }
 
     /// Switching scope is a plain state change — the rows are built by one code path and simply
     /// read the other layer, so there is nothing to commit on the way out.
     private var scopeSelection: Binding<SettingsScope> {
         Binding(get: { scope }, set: { scope = $0 })
-    }
-
-    private var namePromptPresented: Binding<Bool> {
-        Binding(get: { nameAction != nil }, set: { if !$0 { nameAction = nil } })
-    }
-
-    /// Names are unique case-insensitively — two "Work"s make every menu ambiguous, and the
-    /// deep-link grammar has to refuse an ambiguous reference rather than guess.
-    private var isNameAcceptable: Bool {
-        let name = nameDraft.trimmingCharacters(in: .whitespaces)
-        guard !name.isEmpty else { return false }
-        let except: String? = {
-            if case .rename(let id) = nameAction { return id }
-            return nil
-        }()
-        return !profiles.nameTaken(name, except: except)
-    }
-
-    private var nameMessage: String {
-        let name = nameDraft.trimmingCharacters(in: .whitespaces)
-        if !name.isEmpty, !isNameAcceptable {
-            return "Another profile is already called “\(name)”."
-        }
-        if case .create = nameAction {
-            return "A new profile inherits everything. Change a setting here and only that "
-                + "setting is overridden."
-        }
-        return ""
-    }
-
-    private func commitNamePrompt() {
-        let name = nameDraft.trimmingCharacters(in: .whitespaces)
-        guard !name.isEmpty, let action = nameAction else { return }
-        switch action {
-        case .create:
-            scope = .profile(profiles.create(name: name).id)
-        case .rename(let id):
-            profiles.rename(id, to: name)
-        case .duplicate(let id):
-            if let copy = profiles.duplicate(id, name: name) { scope = .profile(copy.id) }
-        }
-        nameAction = nil
     }
 
     /// "Game copy", "Game copy 2", … — the first name that isn't taken, so Duplicate never opens
@@ -525,40 +411,4 @@ extension SettingsView {
         return base
     }
 
-    private static func deleteWarning(for profile: StreamProfile, in store: ProfileStore) -> String {
-        let (bound, pinned) = store.usage(of: profile.id)
-        var parts: [String] = []
-        if bound > 0 {
-            parts.append("\(bound) host\(bound == 1 ? "" : "s") will fall back to Default settings")
-        }
-        if pinned > 0 {
-            parts.append("\(pinned) pinned card\(pinned == 1 ? "" : "s") will disappear")
-        }
-        guard !parts.isEmpty else { return "Nothing uses this profile." }
-        return parts.joined(separator: ", ") + "."
-    }
-}
-
-/// The three name prompts the scope menu raises. One alert serves all of them; only the title,
-/// the accept verb and what happens with the name differ.
-enum ProfileNameAction: Equatable {
-    case create
-    case rename(String)
-    case duplicate(String)
-
-    var title: String {
-        switch self {
-        case .create: return "New Profile"
-        case .rename: return "Rename Profile"
-        case .duplicate: return "Duplicate Profile"
-        }
-    }
-
-    var accept: String {
-        switch self {
-        case .create: return "Create"
-        case .rename: return "Rename"
-        case .duplicate: return "Duplicate"
-        }
-    }
 }
