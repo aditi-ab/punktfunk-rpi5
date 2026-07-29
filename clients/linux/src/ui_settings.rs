@@ -640,9 +640,10 @@ fn commit_profile(active: &StreamProfile, touched: &Touched, values: &Settings) 
 fn render_scale_label(scale: f64) -> String {
     if scale == 1.0 {
         "Native".to_string()
-    } else if scale > 1.0 {
-        format!("{scale}× (supersample)")
     } else {
+        // Just the multiplier: the row's caption already says what above and below 1× mean,
+        // and "2× (supersample)" is long enough that the value ellipsizes to "2× (su…" the
+        // moment the row grows another suffix.
         format!("{scale}×")
     }
 }
@@ -914,6 +915,66 @@ impl ChoiceRow {
 fn set_row_subtitle(row: &adw::PreferencesRow, text: &str) {
     if let Some(r) = row.downcast_ref::<adw::ActionRow>() {
         r.set_subtitle(text);
+        cap_subtitle(r);
+    }
+}
+
+/// How wide a row's caption may get before it wraps. Rows put the title and subtitle in one
+/// box and the control in the suffix, and that box asks for as much width as its longest line
+/// wants — so a long caption starves the value label next to it, which then ellipsizes ("2×
+/// (su…"). Capping the caption gives the width back to the control.
+///
+/// The repo's standing rule was "keep captions to one line (~66 chars)", which works until a
+/// row grows another suffix — the override marker's reset button did exactly that. A cap is
+/// the structural version of the same rule: it holds however many suffixes a row ends up with.
+const CAPTION_CHARS: i32 = 46;
+
+/// Cap a row's caption width. The subtitle label isn't exposed by libadwaita, so it is found by
+/// matching its text — a miss simply leaves the row as it was, which is the pre-cap behaviour.
+fn cap_subtitle(row: &adw::ActionRow) {
+    let subtitle = row.subtitle().unwrap_or_default();
+    if subtitle.is_empty() {
+        return;
+    }
+    fn walk(w: &gtk::Widget, want: &str) -> Option<gtk::Label> {
+        if let Some(l) = w.downcast_ref::<gtk::Label>() {
+            if l.label() == want {
+                return Some(l.clone());
+            }
+        }
+        let mut child = w.first_child();
+        while let Some(c) = child {
+            if let Some(hit) = walk(&c, want) {
+                return Some(hit);
+            }
+            child = c.next_sibling();
+        }
+        None
+    }
+    if let Some(label) = walk(row.upcast_ref(), &subtitle) {
+        label.set_wrap(true);
+        label.set_max_width_chars(CAPTION_CHARS);
+        label.set_xalign(0.0);
+        // `max_width_chars` alone only caps what the label ASKS for; an expanding label still
+        // fills whatever the row hands it and goes back to one long line. Refusing the expand
+        // is what actually leaves the width for the control beside it.
+        label.set_hexpand(false);
+        // …and Start, not the default Fill: a filled label is allocated the whole box and
+        // draws on one long line regardless of the cap. Start alignment makes the allocation
+        // equal the (now capped) natural width, which is what makes the cap visible.
+        label.set_halign(gtk::Align::Start);
+    }
+}
+
+/// Walk a page and cap every caption it contains (see [`cap_subtitle`]).
+fn cap_captions(root: &gtk::Widget) {
+    if let Some(row) = root.downcast_ref::<adw::ActionRow>() {
+        cap_subtitle(row);
+    }
+    let mut child = root.first_child();
+    while let Some(c) = child {
+        cap_captions(&c);
+        child = c.next_sibling();
     }
 }
 
@@ -1094,9 +1155,8 @@ pub fn show_scoped(
     let chroma_row = adw::SwitchRow::builder()
         .title("Full chroma (4:4:4)")
         .subtitle(
-            "Ask for full-colour video instead of subsampled \u{2014} small text and thin lines \
-             stay crisp, at more bandwidth. HEVC only, and only when the host and its GPU can \
-             encode it; otherwise the stream stays 4:2:0.",
+            "Full-colour video: crisp small text and thin lines, at more bandwidth. HEVC \
+             only, and only where the host can encode it.",
         )
         .build();
     let decoder_row = ChoiceRow::new(
@@ -1441,8 +1501,13 @@ pub fn show_scoped(
                         .valign(gtk::Align::Center)
                         .css_classes(["flat"])
                         .build();
+                    // BOTH on the left, never in the suffix. A suffix reset shifts the row's
+                    // control leftwards the instant an override appears — so the second click
+                    // on a Bitrate "+" lands on a revert button that moved under the pointer,
+                    // silently undoing the edit that had just been made. Nothing that appears
+                    // in response to a click may displace the thing that was clicked.
                     row.add_prefix(&dot);
-                    row.add_suffix(&reset);
+                    row.add_prefix(&reset);
                     {
                         let (widgets, row, touched, id, revert) = (
                             widgets.clone(),
@@ -1744,6 +1809,11 @@ pub fn show_scoped(
     controllers_group.add(pad_row.widget());
     controllers.add(&controllers_group);
 
+    // Cap every caption in one pass, after the rows exist: a per-row call would be sixteen
+    // easy-to-forget lines, and a row added later would silently miss it.
+    for page in [&general, &display, &input, &audio, &controllers] {
+        cap_captions(page.upcast_ref());
+    }
     dialog.add(&general);
     dialog.add(&display);
     dialog.add(&input);
