@@ -322,6 +322,12 @@ mod cursor_blend;
 mod cursor_poll;
 #[path = "idd_push/descriptor.rs"]
 mod descriptor;
+// Stall attribution (vdisplay-disturbance-immunity Phase A): the DxgKrnl ETW watch (A.3), the
+// micro-probe engine (A.2), and the stall watch + verdict matrix that folds them (A.1).
+#[path = "idd_push/dxgkrnl_etw.rs"]
+mod dxgkrnl_etw;
+#[path = "idd_push/probes.rs"]
+mod probes;
 #[path = "idd_push/stall.rs"]
 mod stall;
 use channel::ChannelBroker;
@@ -489,6 +495,12 @@ pub struct IddPushCapturer {
     /// ever read (µs) while the host starved since then. Rolled at every fresh frame.
     offered_at_fresh: u64,
     max_hb_age_us: u64,
+    /// The Phase A.2 micro-probe engine (refcounted process singleton) — its window read rides
+    /// every stall report so the verdict matrix can name the disturbance class.
+    probes: Arc<probes::ProbeEngine>,
+    /// The Phase A.3 DxgKrnl ETW watch; `None` when the session can't start (non-admin dev run)
+    /// — reports then say `etw=unavailable`.
+    etw: Option<Arc<dxgkrnl_etw::EtwWatch>>,
     /// Host-owned ROTATING output ring NVENC encodes (one YUV texture per slot). Rotating it per frame
     /// is the precondition for pipelining the encode loop: while NVENC encodes frame N's texture on the
     /// ASIC, frame N+1's convert writes a DIFFERENT texture — the two overlap. Format = `out_format()`:
@@ -1597,6 +1609,15 @@ impl IddPushCapturer {
                     }
                 }),
                 max_heartbeat_age_ms: self.max_hb_age_us / 1_000,
+                // The probe + ETW reads span the same window the report's OS-event correlation
+                // uses (the gap plus a lead-in for the disturbance that CAUSED it).
+                probes: now
+                    .checked_sub(stall.gap + Duration::from_millis(300))
+                    .map(|from| self.probes.window(from, now)),
+                etw: self.etw.as_ref().and_then(|w| {
+                    now.checked_sub(stall.gap + Duration::from_millis(300))
+                        .map(|from| w.summary(from, now))
+                }),
             };
             self.stall_watch.report(&stall, now, &evidence);
         }
@@ -2123,6 +2144,8 @@ mod tests {
                 &StallEvidence {
                     offered_delta: offered,
                     max_heartbeat_age_ms: hb_age_ms,
+                    probes: None,
+                    etw: None,
                 },
             )
         };
@@ -2142,5 +2165,98 @@ mod tests {
         // Long holes scale the worker-stalled bar: 900 ms of silence on a 3 s gap is not half.
         assert_eq!(verdict(3_000, Some(2), 900), StallVerdict::ComposeSilence);
         assert_eq!(verdict(3_000, Some(2), 1_600), StallVerdict::WorkerStalled);
+    }
+
+    /// [`stall::classify`]'s verdict matrix — how the micro-probe window refines (or declines to
+    /// refine) the driver-telemetry verdict into a named disturbance class.
+    #[test]
+    fn stall_classification_matrix() {
+        use super::stall::{classify, ProbeWindow, StallClass, StallVerdict};
+        let gap = Duration::from_millis(600);
+        let probes = |fence: Option<u64>, dwm: Option<u64>, flush: Option<u64>| ProbeWindow {
+            fence_max_us: fence,
+            dwm_tick_frozen_us: dwm,
+            dwm_flush_max_us: flush,
+            ..ProbeWindow::default()
+        };
+        // The driver's own verdicts win outright — probes can't overrule "we lost the frames".
+        assert_eq!(
+            classify(
+                gap,
+                &StallVerdict::WorkerStalled,
+                Some(&probes(Some(500_000), None, None))
+            ),
+            StallClass::OursWorker
+        );
+        assert_eq!(
+            classify(gap, &StallVerdict::DeliveryLeg, None),
+            StallClass::OursDelivery
+        );
+        // No probes: compose-silence alone can't name a class.
+        assert_eq!(
+            classify(gap, &StallVerdict::ComposeSilence, None),
+            StallClass::Unattributed
+        );
+        // Fences stalled ≥ gap/2 → the adapter froze — Class 1 (even without driver telemetry).
+        assert_eq!(
+            classify(
+                gap,
+                &StallVerdict::ComposeSilence,
+                Some(&probes(Some(400_000), Some(400_000), None))
+            ),
+            StallClass::AdapterFreeze
+        );
+        assert_eq!(
+            classify(
+                gap,
+                &StallVerdict::NoTelemetry,
+                Some(&probes(Some(400_000), None, None))
+            ),
+            StallClass::AdapterFreeze
+        );
+        // Fences fine (16 ms round-trips) but DWM's tick froze — Class 2; DwmFlush counts too.
+        assert_eq!(
+            classify(
+                gap,
+                &StallVerdict::ComposeSilence,
+                Some(&probes(Some(16_000), Some(500_000), None))
+            ),
+            StallClass::CompositorBlocked
+        );
+        assert_eq!(
+            classify(
+                gap,
+                &StallVerdict::ComposeSilence,
+                Some(&probes(Some(16_000), Some(20_000), Some(450_000)))
+            ),
+            StallClass::CompositorBlocked
+        );
+        // Everything alive + the driver swears E_PENDING → the frame-generation path.
+        assert_eq!(
+            classify(
+                gap,
+                &StallVerdict::ComposeSilence,
+                Some(&probes(Some(16_000), Some(20_000), Some(30_000)))
+            ),
+            StallClass::FrameGeneration
+        );
+        // Healthy probes but a pre-telemetry driver: delivery-leg is equally possible — honest.
+        assert_eq!(
+            classify(
+                gap,
+                &StallVerdict::NoTelemetry,
+                Some(&probes(Some(16_000), Some(20_000), None))
+            ),
+            StallClass::Unattributed
+        );
+        // An absent probe (None) never reads as "stalled" — absence is stated, not guessed.
+        assert_eq!(
+            classify(
+                gap,
+                &StallVerdict::ComposeSilence,
+                Some(&probes(None, Some(20_000), Some(30_000)))
+            ),
+            StallClass::FrameGeneration
+        );
     }
 }

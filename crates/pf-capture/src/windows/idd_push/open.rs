@@ -635,6 +635,8 @@ impl IddPushCapturer {
                 stall_watch: StallWatch::new(),
                 offered_at_fresh: 0,
                 max_hb_age_us: 0,
+                probes: super::probes::acquire(),
+                etw: super::dxgkrnl_etw::acquire(),
                 out_ring: Vec::new(),
                 out_idx: 0,
                 video_conv: None,

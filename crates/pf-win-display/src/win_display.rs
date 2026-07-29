@@ -1524,6 +1524,49 @@ pub fn source_desktop_rect(target_id: u32) -> Option<(i32, i32, i32, i32)> {
     None
 }
 
+/// Scanline-probe target (stall-attribution Phase A.2): the adapter LUID + VidPn SOURCE id of an
+/// ACTIVE path, preferring a real display over one of OUR virtual monitors. `D3DKMTGetScanLine`
+/// wants a source that actually scans out, so a physical head (`physical == true`) gives the
+/// honest Level-Zero KMD-liveness probe; on an exclusive topology only our IDD is active, and the
+/// caller still gets it (`physical == false`) — the CALL's latency is the measurement either way,
+/// the flag just keeps the report from over-reading the returned scanline values. Returns
+/// `(adapter_luid_low, adapter_luid_high, vidpn_source_id, physical)`; `None` when nothing is
+/// active or the query fails.
+pub fn active_scanline_target() -> Option<(u32, i32, u32, bool)> {
+    // SAFETY: `query_active_config` is this module's own CCD helper: it takes nothing and returns owned
+    // `Vec`s built from a fresh `QueryDisplayConfig`, so it has no caller obligation at all.
+    let (paths, _modes) = query_active_config()?;
+    let mut fallback: Option<(u32, i32, u32, bool)> = None;
+    for p in &paths {
+        if p.flags & DISPLAYCONFIG_PATH_ACTIVE == 0 {
+            continue;
+        }
+        let candidate = (
+            p.sourceInfo.adapterId.LowPart,
+            p.sourceInfo.adapterId.HighPart,
+            p.sourceInfo.id,
+            false,
+        );
+        let mut req = DISPLAYCONFIG_TARGET_DEVICE_NAME::default();
+        req.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
+        req.header.size = size_of::<DISPLAYCONFIG_TARGET_DEVICE_NAME>() as u32;
+        req.header.adapterId = p.targetInfo.adapterId;
+        req.header.id = p.targetInfo.id;
+        // SAFETY: `req.header` is a live local whose `size` field was just set to the enclosing
+        // struct's own `size_of` (the byte-count contract); the struct outlives this synchronous call.
+        if unsafe { DisplayConfigGetDeviceInfo(&mut req.header) } != 0 {
+            fallback.get_or_insert(candidate);
+            continue;
+        }
+        if is_our_virtual_display(&utf16z_str(&req.monitorDevicePath)) {
+            fallback.get_or_insert(candidate);
+            continue;
+        }
+        return Some((candidate.0, candidate.1, candidate.2, true));
+    }
+    fallback
+}
+
 /// The union of every ACTIVE path's source rect — the virtual-desktop bounds `(x, y, w, h)` in
 /// desktop coordinates. Read from CCD rather than `GetSystemMetrics(SM_*VIRTUALSCREEN)` so the
 /// answer is the CONSOLE's real layout even when the calling process sits in another session (the

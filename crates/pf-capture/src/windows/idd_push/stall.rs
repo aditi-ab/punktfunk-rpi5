@@ -26,6 +26,131 @@ pub(super) struct StallEvidence {
     /// The STALEST the driver's drain heartbeat ever read while the host starved (max of
     /// now − heartbeat over the window), in milliseconds.
     pub(super) max_heartbeat_age_ms: u64,
+    /// What the micro-probe engine saw across the window (Phase A.2); `None` when the engine
+    /// isn't running.
+    pub(super) probes: Option<ProbeWindow>,
+    /// The DxgKrnl DDI activity inside the window (Phase A.3 ETW summary); `None` when the
+    /// session is unavailable (non-admin dev run).
+    pub(super) etw: Option<String>,
+}
+
+/// The micro-probes' window read (Phase A.2, built by `probes::ProbeEngine::window`): per-leg
+/// maxima across one stall window. Every field is `None` when that probe is absent (no adapter
+/// device, no active output, thread failed to spawn) — absence is stated, never guessed.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(super) struct ProbeWindow {
+    /// Worst engine-liveness fence round-trip (µs) across all hardware adapters.
+    pub(super) fence_max_us: Option<u64>,
+    /// Longest span (µs) with no `DwmGetCompositionTimingInfo` `cRefresh` advance.
+    pub(super) dwm_tick_frozen_us: Option<u64>,
+    /// Worst watchdogged `DwmFlush` latency (µs).
+    pub(super) dwm_flush_max_us: Option<u64>,
+    /// Worst `D3DKMTGetScanLine` CALL latency (µs) — Level-Zero, so blocking convicts the KMD.
+    pub(super) scanline_max_us: Option<u64>,
+    /// Whether the scanline probe had a PHYSICAL head to ask (exclusive topology leaves only our
+    /// IDD active — latency still counts, scanline values don't).
+    pub(super) scanline_physical: bool,
+    /// Worst high-res sleeper overshoot (µs) — the DPC-storm / CPU-starvation discriminator.
+    pub(super) cpu_max_overshoot_us: Option<u64>,
+}
+
+impl std::fmt::Display for ProbeWindow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let ms = |v: Option<u64>| match v {
+            Some(us) => format!("{:.0}ms", us as f64 / 1_000.0),
+            None => "absent".to_string(),
+        };
+        write!(
+            f,
+            "fence={} dwm_tick_frozen={} dwm_flush={} scanline={}({}) cpu_overshoot={}",
+            ms(self.fence_max_us),
+            ms(self.dwm_tick_frozen_us),
+            ms(self.dwm_flush_max_us),
+            ms(self.scanline_max_us),
+            if self.scanline_physical {
+                "physical"
+            } else {
+                "virtual"
+            },
+            ms(self.cpu_max_overshoot_us),
+        )
+    }
+}
+
+/// The named disturbance class a stall's combined evidence supports — the [`attribute`] verdict
+/// (driver telemetry, Phase A.1) refined by the micro-probe window (Phase A.2). This is the
+/// per-stall output of the program's verdict matrix (design doc §4.4).
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(super) enum StallClass {
+    /// The drain worker starved — ours (CPU/MMCSS/dead WUDFHost).
+    OursWorker,
+    /// Frames were composed and offered but never became consumable — ours (ring/publish/consume).
+    OursDelivery,
+    /// Engine-liveness fences stalled with the hole: the ADAPTER froze (Level-Two/Three DDI
+    /// servicing — link train, power transition, mux). Class 1.
+    AdapterFreeze,
+    /// Engines alive but DWM's own tick froze: the compositor is blocked on something (DDC/child
+    /// I/O vendor lock, win32k display-config queue). Class 2.
+    CompositorBlocked,
+    /// Engines alive, DWM ticking, driver drained E_PENDING — composition happened for OTHER
+    /// surfaces but produced no frame for OUR display: the frame-generation path
+    /// (IddCx/dirty-tracking/divider). Ours to chase with IddCx WPP.
+    FrameGeneration,
+    /// Not enough evidence to name a class (pre-telemetry driver and/or probes absent).
+    Unattributed,
+}
+
+impl std::fmt::Display for StallClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::OursWorker => "OURS-worker (drain thread starved)",
+            Self::OursDelivery => "OURS-delivery (ring/publish/consume lost composed frames)",
+            Self::AdapterFreeze => {
+                "CLASS-1 adapter freeze (engines stalled below the OS — link/power/mux servicing)"
+            }
+            Self::CompositorBlocked => {
+                "CLASS-2 compositor blocked (engines alive, DWM tick frozen — vendor lock / DDC)"
+            }
+            Self::FrameGeneration => {
+                "FRAME-GENERATION (DWM ticked, engines alive, no frame for THIS display — IddCx/dirty/divider)"
+            }
+            Self::Unattributed => "UNATTRIBUTED (insufficient telemetry)",
+        })
+    }
+}
+
+/// The verdict matrix: fold the driver-telemetry verdict and the probe window into a class.
+/// Pure — unit-tested beside the [`StallWatch`] tests. A leg is "stalled for the hole" when its
+/// worst reading covers at least half the gap (the same proportional bar as [`attribute`]).
+pub(super) fn classify(
+    gap: Duration,
+    verdict: &StallVerdict,
+    probes: Option<&ProbeWindow>,
+) -> StallClass {
+    match verdict {
+        StallVerdict::WorkerStalled => return StallClass::OursWorker,
+        StallVerdict::DeliveryLeg => return StallClass::OursDelivery,
+        StallVerdict::ComposeSilence | StallVerdict::NoTelemetry => {}
+    }
+    let Some(p) = probes else {
+        return StallClass::Unattributed;
+    };
+    let half_gap_us = (gap.as_micros() as u64) / 2;
+    let covers = |v: Option<u64>| v.is_some_and(|us| us >= half_gap_us);
+    if covers(p.fence_max_us) {
+        return StallClass::AdapterFreeze;
+    }
+    if covers(p.dwm_tick_frozen_us) || covers(p.dwm_flush_max_us) {
+        return StallClass::CompositorBlocked;
+    }
+    // Engines alive and DWM ticking: only the driver's own E_PENDING testimony can pin the
+    // frame-generation path — without it (pre-telemetry driver) the delivery leg is equally
+    // possible, so stay honest.
+    if matches!(verdict, StallVerdict::ComposeSilence) {
+        StallClass::FrameGeneration
+    } else {
+        StallClass::Unattributed
+    }
 }
 
 /// The attribution a stall's evidence supports — the Branch-1/Branch-2 fork of the
@@ -102,6 +227,9 @@ pub(super) struct StallWatch {
     /// in [`StallVerdict`] order — the metronomic WARN prints it, so one pasted line attributes the
     /// whole session's beat, not just the stall that tripped the metronome.
     verdicts: [u32; 4],
+    /// Running per-class tally ([`StallClass`] order: ours-worker, ours-delivery, adapter-freeze,
+    /// compositor-blocked, frame-generation, unattributed) — the verdict matrix's session summary.
+    classes: [u32; 6],
 }
 
 impl StallWatch {
@@ -122,6 +250,7 @@ impl StallWatch {
             seen: 0,
             with_os_events: 0,
             verdicts: [0; 4],
+            classes: [0; 6],
         }
     }
 
@@ -183,6 +312,15 @@ impl StallWatch {
             StallVerdict::ComposeSilence => 2,
             StallVerdict::DeliveryLeg => 3,
         }] += 1;
+        let class = classify(stall.gap, &verdict, evidence.probes.as_ref());
+        self.classes[match class {
+            StallClass::OursWorker => 0,
+            StallClass::OursDelivery => 1,
+            StallClass::AdapterFreeze => 2,
+            StallClass::CompositorBlocked => 3,
+            StallClass::FrameGeneration => 4,
+            StallClass::Unattributed => 5,
+        }] += 1;
         // debug (not warn): a single hole also happens when content legitimately pauses;
         // the reportable signal is the metronomic cycle below. Mounjay-class triage runs
         // at debug level, and the web-console debug ring captures these.
@@ -190,10 +328,13 @@ impl StallWatch {
             gap_ms = stall.gap.as_millis() as u64,
             os_display_events = %pf_win_display::display_events::summarize(&events),
             verdict = %verdict,
+            class = %class,
+            probes = evidence.probes.as_ref().map(tracing::field::display),
+            etw = evidence.etw.as_deref().unwrap_or("unavailable"),
             offered_during_gap = evidence.offered_delta,
             max_heartbeat_age_ms = evidence.max_heartbeat_age_ms,
             "IDD-push capture stall — the desktop was composing at speed, then the ring \
-             delivered no frame for the gap; the verdict names the leg that lost them"
+             delivered no frame for the gap; the class names the leg that lost them"
         );
         if let Some(period) = stall.metronomic {
             let suspects = pf_win_display::display_events::connected_inactive_physicals();
@@ -208,6 +349,16 @@ impl StallWatch {
                 "worker-stalled {}, compose-silence {}, delivery-leg {}, no-telemetry {}",
                 self.verdicts[1], self.verdicts[2], self.verdicts[3], self.verdicts[0]
             );
+            let class_tally = format!(
+                "ours-worker {}, ours-delivery {}, adapter-freeze {}, compositor-blocked {}, \
+                 frame-generation {}, unattributed {}",
+                self.classes[0],
+                self.classes[1],
+                self.classes[2],
+                self.classes[3],
+                self.classes[4],
+                self.classes[5]
+            );
             // Half-or-more of the stalls carrying a coinciding OS event = the reaction
             // cascade is OS-visible; otherwise the disturbance never surfaces above the
             // driver. Different classes, different cures — say which one this box has.
@@ -217,6 +368,7 @@ impl StallWatch {
                     os_correlated = correlated,
                     connected_inactive = %suspects,
                     verdicts = %verdict_tally,
+                    classes = %class_tally,
                     "capture stalls are METRONOMIC and coincide with Windows monitor \
                      hot-plug/re-enumeration events — a connected display (or its \
                      cable/switch/AVR) re-probes the link on a timer and Windows re-reacts \
@@ -233,6 +385,7 @@ impl StallWatch {
                     os_correlated = correlated,
                     connected_inactive = %suspects,
                     verdicts = %verdict_tally,
+                    classes = %class_tally,
                     "capture stalls are METRONOMIC with NO coinciding OS display event — \
                      the disturbance is BELOW Windows: the GPU driver servicing a \
                      connected-but-asleep sink (standby HPD/DDC/link probing), \
