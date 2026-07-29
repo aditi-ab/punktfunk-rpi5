@@ -702,9 +702,23 @@ const APP_LICENSE: &str = concat!(
 /// scripts/gen-third-party-notices.sh; shown as a Legal section in the About dialog).
 const THIRD_PARTY_NOTICES: &str = include_str!("../../../THIRD-PARTY-NOTICES.txt");
 
+/// The dynamically linked system libraries — not in the crate notices, since they aren't
+/// crates. Their full texts ship with each project rather than being vendored here.
+const SYSTEM_LIBRARY_NOTICES: &str =
+    "This application dynamically links system libraries under their own licenses, including \
+     FFmpeg (LGPL v2.1+), GTK 4 and libadwaita (LGPL v2.1+), PipeWire (MIT), and SDL 3 (Zlib). \
+     Their full license texts are available from each project.";
+
 /// Show the About dialog (app license + the third-party-software Legal section) — reached
 /// from the primary menu (app.rs `win.about`).
 pub fn show_about(parent: &impl IsA<gtk::Widget>) {
+    // Every licence field here is PANGO MARKUP, not plain text — so a crate author's
+    // `<name@example.com>` reads as an unclosed tag and Pango drops the whole section with
+    // "is not a valid name: @". The notices are generated from crate metadata and are full of
+    // those, so they are escaped rather than trusted. Nothing in them wants markup anyway.
+    let license = gtk::glib::markup_escape_text(APP_LICENSE);
+    let crate_notices = gtk::glib::markup_escape_text(THIRD_PARTY_NOTICES);
+    let system_notices = gtk::glib::markup_escape_text(SYSTEM_LIBRARY_NOTICES);
     let about = adw::AboutDialog::builder()
         .application_name("Punktfunk")
         // The app's own icon, by the id the desktop entry and the icon theme both use. It
@@ -715,7 +729,7 @@ pub fn show_about(parent: &impl IsA<gtk::Widget>) {
         .version(env!("CARGO_PKG_VERSION"))
         .website("https://git.unom.io/unom/punktfunk")
         .license_type(gtk::License::Custom)
-        .license(APP_LICENSE)
+        .license(license.as_str())
         .build();
     // The native (FFmpeg/GTK/PipeWire/SDL3) components are dynamically linked under their own
     // (LGPL/Zlib/MIT) licenses; the Rust crate notices are the substantive attribution set.
@@ -723,17 +737,13 @@ pub fn show_about(parent: &impl IsA<gtk::Widget>) {
         "Third-party software (Rust crates)",
         None,
         gtk::License::Custom,
-        Some(THIRD_PARTY_NOTICES),
+        Some(crate_notices.as_str()),
     );
     about.add_legal_section(
         "Third-party software (system libraries)",
         None,
         gtk::License::Custom,
-        Some(
-            "This application dynamically links system libraries under their own licenses, \
-             including FFmpeg (LGPL v2.1+), GTK 4 and libadwaita (LGPL v2.1+), PipeWire (MIT), \
-             and SDL 3 (Zlib). Their full license texts are available from each project.",
-        ),
+        Some(system_notices.as_str()),
     );
     about.present(Some(parent));
 }
