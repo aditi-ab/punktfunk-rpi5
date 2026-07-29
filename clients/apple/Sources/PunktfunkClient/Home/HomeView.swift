@@ -370,6 +370,13 @@ struct HomeView: View {
         } label: {
             Label("Sort and Group", systemImage: "line.3.horizontal.decrease.circle")
         }
+        #if os(macOS)
+        // A Menu draws its label in the ACCENT colour where a Button draws it in the label
+        // colour, so next to Add Host and Settings this one came out brand-purple. macOS only:
+        // on iOS every toolbar item is accent-tinted, and pinning this one to primary would make
+        // it the odd one out there instead.
+        .tint(.primary)
+        #endif
     }
     #endif
 
