@@ -1019,6 +1019,45 @@ pub(super) struct SessionContext {
     /// Shared slot the latest completed mid-stream resize total (ms) lands in — registered with
     /// `session_status` so the Dashboard shows it.
     pub(super) resize_ms: Arc<AtomicU32>,
+    /// The session's input pipeline (the same channel client datagrams feed) — the stream loop
+    /// uses it to PARK the seat pointer on the streamed surface (see [`park_pointer`]).
+    #[cfg(target_os = "linux")]
+    pub(super) input_tx: std::sync::mpsc::Sender<super::input::ClientInput>,
+}
+
+/// Park the seat pointer at the centre of the streamed surface, through the SAME injection path
+/// client input takes (capability routing, region ladder, anchor — everything).
+///
+/// Why this exists (the GNOME capture-mode cursor bug, 2026-07): a Linux virtual output is
+/// created fresh per session, and the seat pointer stays wherever it last was — usually on a
+/// physical monitor. A capture-model (pointer-lock) client sends only RELATIVE deltas, so
+/// nothing ever moves the pointer INTO the streamed output: its input lands on the wrong
+/// monitor, and on compositors that only embed/report the cursor while it is over the recorded
+/// view (Mutter suppresses `SPA_META_Cursor` entirely — `should_cursor_metadata_be_set` — and
+/// its embedded mode paints nothing either) the stream has NO cursor at all, in both the
+/// embedded and the cursor-channel composite models. Parking once per (re)built display — and
+/// again on the mid-stream flip to the capture model, which heals a pointer that drifted off the
+/// output's edge — pins the pointer to the surface the client actually sees. A desktop-model
+/// client overrides it with its first absolute move, so the jump is invisible in practice.
+#[cfg(target_os = "linux")]
+fn park_pointer(input_tx: &std::sync::mpsc::Sender<super::input::ClientInput>, w: u32, h: u32) {
+    let ev = punktfunk_core::input::InputEvent {
+        kind: punktfunk_core::input::InputKind::MouseMoveAbs,
+        _pad: [0; 3],
+        code: 0,
+        x: (w / 2) as i32,
+        y: (h / 2) as i32,
+        // MouseMoveAbs packs its reference extent into `flags` — the injector's region ladder
+        // matches the streamed output by exactly these dims.
+        flags: (w << 16) | (h & 0xffff),
+    };
+    if input_tx.send(super::input::ClientInput::Event(ev)).is_ok() {
+        tracing::info!(
+            w,
+            h,
+            "parked the seat pointer at the streamed surface's centre"
+        );
+    }
 }
 
 pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDisplay>) -> Result<()> {
@@ -1106,6 +1145,8 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
         client_hdr,
         bringup,
         resize_ms,
+        #[cfg(target_os = "linux")]
+        input_tx,
     } = ctx;
     // Only the Linux paths (`launch_is_nested`, `set_gamescope_route`) read it; gamescope does not
     // exist on Windows, where every one of those call sites is cfg'd out.
@@ -1512,6 +1553,24 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
     // send rate ⇒ the capture source isn't producing frames (e.g. an IDD virtual display DWM isn't
     // compositing), NOT an encoder problem. Logged every 2 s when `PUNKTFUNK_PERF`.
     let (mut diag_new, mut diag_repeat) = (0u64, 0u64);
+    // Seat-pointer park schedule (see `park_pointer`): per (re)built display, and re-armed by
+    // the capture-model flip. More than one attempt because the first park of a session can
+    // land on a still-cold EIS connection (devices not yet resumed → the injector DROPS it) —
+    // observed on-glass; the retry a second later goes through. While the session is in the
+    // capture model with no live cursor overlay, keep trying up to the cap: no overlay there
+    // means the pointer still isn't on the streamed output, and a relative-only client can
+    // never fix that itself.
+    #[cfg(target_os = "linux")]
+    let mut parked_display = None;
+    #[cfg(target_os = "linux")]
+    let mut park_attempts: u32 = 0;
+    #[cfg(target_os = "linux")]
+    let mut next_park_at = std::time::Instant::now();
+    #[cfg(target_os = "linux")]
+    const PARK_ATTEMPTS_MAX: u32 = 10;
+    // Per-session one-shot latches for the host-composite breadcrumbs below.
+    #[cfg(not(target_os = "windows"))]
+    let (mut composite_saw_overlay, mut composite_saw_none) = (false, false);
     let mut diag_at = std::time::Instant::now();
     // Anchor for the forced-IDR cooldown (see the keyframe-request handling below): the timestamp of
     // the most recent forced/opening IDR. The session's pipeline just opened on an IDR, so start the
@@ -2162,6 +2221,18 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                 frame = f;
                 diag_new += 1;
                 capture_rebuilds = 0; // a delivered frame clears the consecutive-loss counter
+                                      // Re-arm the park schedule for a (re)built display: pin the seat pointer to
+                                      // the streamed surface (see `park_pointer` and the schedule state above).
+                                      // Not gamescope — its nested seat owns the pointer and its cursor comes from
+                                      // the XFixes source regardless of seat position.
+                #[cfg(target_os = "linux")]
+                if compositor != pf_vdisplay::Compositor::Gamescope
+                    && parked_display != Some((cur_node_id, cur_display_gen))
+                {
+                    parked_display = Some((cur_node_id, cur_display_gen));
+                    park_attempts = 0;
+                    next_park_at = std::time::Instant::now();
+                }
             }
             Ok(None) => {
                 diag_repeat += 1; // no new frame (static desktop / mid-rebuild) — repeat the last
@@ -2420,6 +2491,15 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                         "host composites"
                     }
                 );
+                // Entering the capture model: the client is now relative-only, so re-arm the
+                // park schedule — the pointer may have drifted onto another monitor while the
+                // desktop model steered it, and a capture-model session can never bring it
+                // back on its own (see `park_pointer`).
+                #[cfg(target_os = "linux")]
+                if !client_draws {
+                    park_attempts = 0;
+                    next_park_at = std::time::Instant::now();
+                }
             }
             if client_draws {
                 let live = capturer.cursor();
@@ -2441,8 +2521,38 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                 // NOT Windows: its capturer composites internally (cursor_blend.rs) and frames
                 // must never carry an overlay a blend path would double-draw.
                 #[cfg(not(target_os = "windows"))]
-                if let Some(live) = capturer.cursor() {
-                    frame.cursor = Some(live);
+                {
+                    // One-shot breadcrumbs (per session), both directions: capture-mode field
+                    // triage starts with "did the composite arm ever SEE an overlay" —
+                    // pf-capture's sibling lines say whether the meta/bitmap arrived; these say
+                    // whether the encoder was ever handed one.
+                    match capturer.cursor() {
+                        Some(live) => {
+                            if !composite_saw_overlay {
+                                composite_saw_overlay = true;
+                                tracing::info!(
+                                    x = live.x,
+                                    y = live.y,
+                                    w = live.w,
+                                    h = live.h,
+                                    visible = live.visible,
+                                    "host-composite: first live cursor overlay handed to the \
+                                     encoder blend"
+                                );
+                            }
+                            frame.cursor = Some(live);
+                        }
+                        None => {
+                            if !composite_saw_none {
+                                composite_saw_none = true;
+                                tracing::info!(
+                                    "host-composite active but the capture has no live cursor \
+                                     overlay yet (no SPA_META_Cursor bitmap) — the stream is \
+                                     cursorless until one arrives"
+                                );
+                            }
+                        }
+                    }
                 }
             }
         } else if gamescope_composite {
@@ -2460,6 +2570,34 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
         // HERE, after forwarding, so no blend path ever draws an invisible cursor.
         if frame.cursor.as_ref().is_some_and(|c| !c.visible) {
             frame.cursor = None;
+        }
+        // The seat-pointer park schedule (state + rationale at the declarations above; armed by
+        // the first frame of every (re)built display and by the capture-model flip). The first
+        // two attempts run unconditionally — attempt 1 can be swallowed by a cold EIS
+        // connection. Past those, only a cursor-channel session in the capture model that STILL
+        // has no live overlay keeps trying: that combination means the pointer has not reached
+        // the streamed output (the compositor reports cursor metadata only while it is over the
+        // recorded view), and a relative-only client cannot get it there on its own.
+        // Armed from the loop's first tick — a static desktop may never deliver a fresh frame
+        // (`parked_display` is only bookkeeping for rebuild re-arming), and the pointer must be
+        // parked regardless.
+        #[cfg(target_os = "linux")]
+        if compositor != pf_vdisplay::Compositor::Gamescope
+            && park_attempts < PARK_ATTEMPTS_MAX
+            && std::time::Instant::now() >= next_park_at
+        {
+            let composite_starved = cursor_fwd.is_some()
+                && !cursor_client_draws.load(Ordering::Relaxed)
+                && capturer.cursor().is_none();
+            if park_attempts < 2 || composite_starved {
+                park_pointer(&input_tx, frame.width, frame.height);
+                park_attempts += 1;
+                next_park_at = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            } else {
+                // Settled (overlay flowing, or the client draws): stop scheduling until a
+                // rebuild or a capture-model flip re-arms it.
+                park_attempts = PARK_ATTEMPTS_MAX;
+            }
         }
         if perf && diag_at.elapsed() >= std::time::Duration::from_secs(2) {
             let secs = diag_at.elapsed().as_secs_f64();

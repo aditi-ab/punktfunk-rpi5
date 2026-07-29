@@ -35,6 +35,10 @@ pub(super) struct CursorState {
     /// channel (the blend path uses the pre-adjusted `x`/`y` and never reads it).
     hot_x: i32,
     hot_y: i32,
+    /// One-shot breadcrumb latch: this stream saw a `SPA_META_Cursor` region (the Meta param
+    /// negotiated). Per-stream deliberately — a host serves many sessions per process, and a
+    /// process-wide latch made the second session's triage read as "no meta".
+    seen_meta: bool,
 }
 
 impl CursorState {
@@ -92,6 +96,13 @@ pub(super) fn update_cursor_meta(cursor: &mut CursorState, spa_buf: *mut spa::sy
     let meta = unsafe { spa::sys::spa_buffer_find_meta(spa_buf, spa::sys::SPA_META_Cursor) };
     if meta.is_null() {
         return;
+    }
+    // One-shot breadcrumb (per stream): the producer DID attach a cursor-meta region (the Meta
+    // param negotiated). Field triage for a cursorless stream starts by grepping for this line
+    // — its absence means the negotiation dropped the meta, not that the pointer never moved.
+    if !cursor.seen_meta {
+        cursor.seen_meta = true;
+        tracing::info!("cursor meta: first SPA_META_Cursor region observed on this stream");
     }
     // SAFETY: `meta` is non-null and points into the held buffer's metadata array.
     let (region_size, data) = unsafe { ((*meta).size as usize, (*meta).data as *const u8) };
@@ -180,6 +191,12 @@ pub(super) fn update_cursor_meta(cursor: &mut CursorState, spa_buf: *mut spa::sy
     cursor.bw = bw;
     cursor.bh = bh;
     cursor.serial = cursor.serial.wrapping_add(1);
+    // One-shot sibling of the region breadcrumb above (per stream, via the serial's 0→1 edge):
+    // the first BITMAP — before this line has fired, `overlay()` is `None` and every
+    // blend/forward path is cursorless by construction.
+    if cursor.serial == 1 {
+        tracing::info!(w = bw, h = bh, "cursor meta: first cursor bitmap received");
+    }
 }
 
 /// The byte range inside the producer's cursor-meta region that a `bh`-row, `row`-wide,
@@ -349,6 +366,7 @@ mod tests {
             serial: 1,
             hot_x: 0,
             hot_y: 0,
+            seen_meta: true,
         }
     }
 
