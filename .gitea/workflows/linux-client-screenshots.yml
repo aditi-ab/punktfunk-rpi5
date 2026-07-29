@@ -25,7 +25,7 @@ jobs:
     runs-on: ubuntu-24.04
     # Same image as ci.yml/deb.yml — already carries the Rust toolchain + GTK/SDL build deps.
     container:
-      image: git.unom.io/unom/punktfunk-rust-ci:latest
+      image: 192.168.1.58:5010/punktfunk-rust-ci:latest
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4

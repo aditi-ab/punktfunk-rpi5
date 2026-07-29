@@ -20,11 +20,30 @@ concurrency:
 on:
   push:
     branches: [main]
+    # Scope canary builds to what this artifact is built FROM — a docs-only or
+    # web-only push should not light up the whole fleet. Applies to branch pushes;
+    # tag runs are matched by `tags:` (proven by flatpak/windows-msix releases).
+    paths:
+      - 'crates/**'
+      - 'clients/android/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'scripts/ci/**'
+      - '.gitea/workflows/android.yml'
     # Single project version: a `vX.Y.Z` tag is THE release (uploads to Play's `alpha` closed
     # track for manual promotion + attaches the .aab/.apk to the unified Gitea Release). A main
     # push is canary (Play `internal`).
     tags: ['v*']
   pull_request:
+    paths:
+      - 'crates/**'
+      - 'clients/android/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'scripts/ci/**'
+      - '.gitea/workflows/android.yml'
   workflow_dispatch:
 
 jobs:

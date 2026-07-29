@@ -29,7 +29,7 @@ jobs:
   sbom:
     runs-on: ubuntu-24.04
     container:
-      image: git.unom.io/unom/punktfunk-rust-ci:latest
+      image: 192.168.1.58:5010/punktfunk-rust-ci:latest
     timeout-minutes: 20
     steps:
       # fetch-depth 0: the dispatch path derives the canary base from the tag history

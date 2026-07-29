@@ -21,6 +21,21 @@ concurrency:
 on:
   push:
     branches: [main]
+    # Scope canary builds to what this artifact is built FROM — a docs-only or
+    # web-only push should not light up the whole fleet. Applies to branch pushes;
+    # tag runs are matched by `tags:` (proven by flatpak/windows-msix releases).
+    paths:
+      - 'crates/**'
+      - 'web/**'
+      - 'sdk/**'
+      - 'packaging/rpm/**'
+      - 'packaging/gamescope/**'
+      - 'packaging/bazzite/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'scripts/ci/**'
+      - '.gitea/workflows/rpm.yml'
     # Single project version: a `vX.Y.Z` tag is THE release. main publishes to the `*-canary` rpm
     # groups, tags to the base groups (`bazzite`/`fedora-44`) — separate repos, so the old
     # version-shadow (a release outranking rolling builds in one group) is structurally gone.
@@ -48,7 +63,7 @@ jobs:
             group: fedora-44
             fedver: 44
     container:
-      image: git.unom.io/unom/${{ matrix.image }}:latest
+      image: 192.168.1.58:5010/${{ matrix.image }}:latest
     timeout-minutes: 90
     env:
       CARGO_HOME: /usr/local/cargo
@@ -83,8 +98,8 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: /usr/local/cargo/registry
-          key: cargo-home-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-home-
+          key: cargo-home-fedora-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-home-fedora-
 
       - name: Version + channel
         # vX.Y.Z tag -> X.Y.Z-1 in the base group (a real release); main push -> <next-minor>-0.ciN.g<sha>

@@ -49,14 +49,16 @@ jobs:
   cargo-audit:
     runs-on: ubuntu-24.04
     container:
-      image: git.unom.io/unom/punktfunk-rust-ci:latest
+      image: 192.168.1.58:5010/punktfunk-rust-ci:latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       # Cache /usr/local/cargo so the cargo-audit binary (and the advisory DB clone) persist.
       - uses: actions/cache@v4
         with:
-          path: /usr/local/cargo
+          path: |
+            /usr/local/cargo/bin
+            /usr/local/cargo/registry
           key: cargo-audit-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-audit-
       - name: cargo audit
@@ -139,13 +141,15 @@ jobs:
   license-gate:
     runs-on: ubuntu-24.04
     container:
-      image: git.unom.io/unom/punktfunk-rust-ci:latest
+      image: 192.168.1.58:5010/punktfunk-rust-ci:latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/cache@v4
         with:
-          path: /usr/local/cargo
+          path: |
+            /usr/local/cargo/bin
+            /usr/local/cargo/registry
           key: cargo-about-0.9.1
           restore-keys: cargo-about-
       - name: cargo about license gate (host + driver workspaces)

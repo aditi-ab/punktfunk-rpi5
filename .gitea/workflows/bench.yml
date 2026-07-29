@@ -1,0 +1,34 @@
+# Report-only CPU benchmarks, moved out of ci.yml: they never fail the build (shared CI
+# hardware is too noisy to gate on), so running them per-push only occupied a fleet slot
+# during fan-out storms. Nightly + on demand is exactly as much signal at none of the
+# queue cost. The tight regression gate + the real encode/stream path live on the
+# self-hosted GPU runner (Tier 3, bench-gpu.yml).
+name: bench
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  schedule:
+    - cron: '30 4 * * *'
+  workflow_dispatch:
+
+jobs:
+  bench:
+    # Tier-1 (criterion microbenchmarks) + Tier-2 (FEC loss recovery) — GPU-free, so they run here.
+    runs-on: ubuntu-24.04
+    container:
+      image: 192.168.1.58:5010/punktfunk-rust-ci:latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prep
+        run: |
+          git config --global --add safe.directory "$PWD"
+          command -v python3 >/dev/null || { apt-get update && apt-get install -y --no-install-recommends python3; }
+      - name: Tier-1 microbenchmarks (criterion)
+        run: cargo bench -p punktfunk-core --bench pipeline -- --warm-up-time 1 --measurement-time 3
+      - name: Tier-2 FEC loss recovery (loss-harness)
+        run: cargo run -q -p loss-harness
+      - name: Compare vs baseline (report-only)
+        run: python3 scripts/bench/compare.py --threshold 0.5

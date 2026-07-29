@@ -135,6 +135,25 @@ jobs:
             https://dl.flathub.org/repo/flathub.flatpakrepo
           git config --global --add safe.directory "$PWD"
 
+      # This job was the fleet's single heaviest network consumer: every run re-downloaded
+      # the GNOME runtime + SDK + llvm/rust/ffmpeg extensions (multi-GB from Flathub) and
+      # every crate source. Both live in well-defined directories, both are idempotently
+      # verified/extended by the steps below, and the central cache server restores them
+      # at LAN speed — so cache them. Keyed on what actually pins them: the manifest tree
+      # (runtimes/extensions) and manifest+Cargo.lock (crate sources + builder state).
+      - name: Cache Flathub runtimes
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/share/flatpak
+          key: flatpak-runtimes-${{ hashFiles('packaging/flatpak/**') }}
+          restore-keys: flatpak-runtimes-
+      - name: Cache flatpak-builder state (crate sources, ccache)
+        uses: actions/cache@v4
+        with:
+          path: .flatpak-builder
+          key: flatpak-builder-state-${{ hashFiles('Cargo.lock', 'packaging/flatpak/**') }}
+          restore-keys: flatpak-builder-state-
+
       - name: Version + channel
         # Tag vX.Y.Z -> X.Y.Z on the OSTree `stable` branch (a real release); a main push ->
         # <next-minor>-ciN.g<sha> on the `canary` branch (base one minor ahead of the latest stable

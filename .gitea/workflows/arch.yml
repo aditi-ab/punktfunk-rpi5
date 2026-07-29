@@ -26,6 +26,24 @@ concurrency:
 on:
   push:
     branches: [main]
+    # Scope canary builds to what this artifact is built FROM — a docs-only or
+    # web-only push should not light up the whole fleet. Applies to branch pushes;
+    # tag runs are matched by `tags:` (proven by flatpak/windows-msix releases).
+    paths:
+      - 'crates/**'
+      - 'clients/linux/**'
+      - 'clients/session/**'
+      - 'clients/shared/**'
+      - 'clients/cli/**'
+      - 'web/**'
+      - 'sdk/**'
+      - 'packaging/arch/**'
+      - 'packaging/gamescope/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'scripts/ci/**'
+      - '.gitea/workflows/arch.yml'
     # Single project version: a `vX.Y.Z` tag is THE release. main publishes to the
     # `punktfunk-canary` pacman repo as X.Y.Z-0.<run#> (sorts below the eventual X.Y.Z-1),
     # tags to `punktfunk` — separate repos, so neither channel can shadow the other.

@@ -16,7 +16,7 @@
 # explicit `Architectures:` or apt tries to fetch arm64 from the amd64 mirror and 404s.
 #
 # Built from the REPO ROOT context (not ci/) — see the rust-toolchain.toml copy below.
-FROM git.unom.io/unom/punktfunk-rust-ci:latest
+FROM 192.168.1.58:5010/punktfunk-rust-ci:latest
 
 ENV DEBIAN_FRONTEND=noninteractive
 

@@ -35,6 +35,24 @@ concurrency:
 on:
   push:
     branches: [main]
+    # Scope canary builds to what this artifact is built FROM — a docs-only or
+    # web-only push should not light up the whole fleet. Applies to branch pushes;
+    # tag runs are matched by `tags:` (proven by flatpak/windows-msix releases).
+    paths:
+      - 'crates/**'
+      - 'clients/linux/**'
+      - 'clients/session/**'
+      - 'clients/shared/**'
+      - 'clients/cli/**'
+      - 'web/**'
+      - 'sdk/**'
+      - 'packaging/debian/**'
+      - 'packaging/linux/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'scripts/ci/**'
+      - '.gitea/workflows/deb.yml'
     # Single project version: a `vX.Y.Z` tag is THE release for every platform (see
     # docs-site channels.md). The old version-shadow (a client tag shipping a host package
     # that outranked rolling builds) is now structurally impossible — main publishes to the
@@ -51,7 +69,7 @@ jobs:
   build-publish:
     runs-on: ubuntu-24.04
     container:
-      image: git.unom.io/unom/punktfunk-rust-ci:latest
+      image: 192.168.1.58:5010/punktfunk-rust-ci:latest
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
@@ -197,7 +215,7 @@ jobs:
   build-publish-host:
     runs-on: ubuntu-24.04
     container:
-      image: git.unom.io/unom/punktfunk-rust-ci-noble:latest
+      image: 192.168.1.58:5010/punktfunk-rust-ci-noble:latest
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
@@ -304,7 +322,7 @@ jobs:
   build-publish-client-arm64:
     runs-on: ubuntu-24.04
     container:
-      image: git.unom.io/unom/punktfunk-rust-ci-arm64cross:latest
+      image: 192.168.1.58:5010/punktfunk-rust-ci-arm64cross:latest
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4

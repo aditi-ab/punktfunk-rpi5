@@ -20,7 +20,28 @@ concurrency:
 on:
   push:
     branches: [main]
+    # Scope canary builds to what this artifact is built FROM — a docs-only or
+    # web-only push should not light up the whole fleet. Applies to branch pushes;
+    # tag runs are matched by `tags:` (proven by flatpak/windows-msix releases).
+    paths:
+      - 'crates/**'
+      - 'clients/apple/**'
+      - 'scripts/build-xcframework.sh'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'scripts/ci/**'
+      - '.gitea/workflows/apple.yml'
   pull_request:
+    paths:
+      - 'crates/**'
+      - 'clients/apple/**'
+      - 'scripts/build-xcframework.sh'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'scripts/ci/**'
+      - '.gitea/workflows/apple.yml'
   workflow_dispatch:
 
 jobs:

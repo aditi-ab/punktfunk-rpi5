@@ -1,17 +1,28 @@
-# Build + push the dockerized pieces to the Gitea container registry:
-#   punktfunk-web      — management console (web/Dockerfile, repo-root context)
-#   punktfunk-docs     — documentation site (docs-site/Dockerfile)
-#   punktfunk-rust-ci  — Rust CI builder image consumed by ci.yml
-#   punktfunk-rust-ci-arm64cross — the above + an arm64 sysroot, for the aarch64 client legs
-#   punktfunk-fedora-rpm — Fedora 43 builder image consumed by rpm.yml (Bazzite RPM)
+# Build + push the dockerized pieces.
+#
+# Two very different image families now:
+#
+#   BUILDER images (punktfunk-rust-ci{,-noble,-arm64cross}, punktfunk-fedora{,44}-rpm)
+#     live on the LAN registry (home-ci-core, 192.168.1.58:5010 — unom/infra
+#     runners/ci-core/) and are CONTENT-KEYED: the tag is a hash of what they are built
+#     from (the ci/ tree, + rust-toolchain.toml for the cross image), and a build only
+#     happens when that key has no manifest yet. A push that doesn't touch ci/ costs one
+#     curl per image (~seconds), pushes nothing over the WAN, and mints no per-SHA tag
+#     debris on the runners — the failure mode that filled the fleet's disks. `:latest`
+#     is re-pushed alongside every new key and is what the consuming workflows pin.
+#
+#   APP images (punktfunk-web, punktfunk-docs) are deployables: they keep going to the
+#     Gitea registry (git.unom.io) with :latest + :sha-<8> (+ :vX.Y.Z on tags), because
+#     unom-1 deploys pull from there and releases pin them.
+#
 # Host and clients are intentionally NOT containerized (see CLAUDE.md "What's left").
 #
-# REGISTRY_TOKEN: repo Actions secret, a PAT with write:package scope.
+# REGISTRY_TOKEN: repo Actions secret, a PAT with write:package scope (app images only —
+# the LAN registry is unauthenticated inside the LAN).
 #
-# Bootstrap note: ci.yml's rust job pulls punktfunk-rust-ci:latest from the registry, so
-# this workflow (or a manual push) must have succeeded once before that job can run; on
-# the same push, ci.yml builds against the PREVIOUS image. All three were seeded manually
-# on 2026-06-12.
+# Bootstrap note: consuming workflows pull <LAN>/punktfunk-rust-ci:latest, so the LAN
+# registry must hold a seeded :latest once (done 2026-07-29 from the last Gitea-registry
+# images); after that, this workflow keeps :latest current whenever ci/ changes.
 name: docker
 # One pending run per workflow+ref: a newer push supersedes the queued/running one and cancels
 # it (a canary only needs the latest commit; each release tag is its own ref so tag runs never
@@ -31,9 +42,142 @@ on:
 env:
   REGISTRY: git.unom.io
   OWNER: unom
+  CI_REGISTRY: 192.168.1.58:5010
 
 jobs:
-  build-push:
+  builders:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      matrix:
+        include:
+          - image: punktfunk-rust-ci
+            dockerfile: ci/rust-ci.Dockerfile
+          # Ubuntu 24.04 LTS host builder: same purpose as rust-ci but lowers the host .deb's glibc
+          # floor to 2.39 and bundles a from-source FFmpeg 8, so the package installs on 24.04 LTS
+          # (rust-ci's 26.04 build is uninstallable there). Consumed by deb.yml's build-publish-host job.
+          - image: punktfunk-rust-ci-noble
+            dockerfile: ci/rust-ci-noble.Dockerfile
+          - image: punktfunk-fedora-rpm
+            dockerfile: ci/fedora-rpm.Dockerfile
+          # Fedora 44 builder (Fedora KDE spin): same Dockerfile, newer base → libavcodec.so.62.
+          - image: punktfunk-fedora44-rpm
+            dockerfile: ci/fedora-rpm.Dockerfile
+            buildargs: --build-arg FEDORA_VERSION=44
+            keysuffix: -f44
+    steps:
+      - uses: actions/checkout@v4
+
+      # The key is the git TREE HASH of ci/ — every byte any of these Dockerfiles can see
+      # (they all use ci/ as build context). One key for the whole family on purpose: a
+      # change to any of them re-keys all four, and a spurious rebuild of a sibling is
+      # cheap, rare, and infinitely better than a stale one.
+      - name: Content key
+        run: |
+          git config --global --add safe.directory "$PWD"
+          echo "KEY=ck-$(git rev-parse HEAD:ci | cut -c1-12)${{ matrix.keysuffix }}" >> "$GITHUB_ENV"
+
+      - name: Check whether this key already exists
+        id: exists
+        run: |
+          ACCEPT='Accept: application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json'
+          if curl -sf -o /dev/null -H "$ACCEPT" \
+              "http://$CI_REGISTRY/v2/${{ matrix.image }}/manifests/$KEY"; then
+            echo "hit=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::${{ matrix.image }}:$KEY already in the LAN registry — nothing to build"
+          else
+            echo "hit=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build
+        if: steps.exists.outputs.hit == 'false'
+        # --pull is cheap now: base images come through the ci-core pull-through mirror.
+        run: |
+          docker build --pull ${{ matrix.buildargs }} \
+            -f "${{ matrix.dockerfile }}" \
+            -t "$CI_REGISTRY/${{ matrix.image }}:$KEY" \
+            -t "$CI_REGISTRY/${{ matrix.image }}:latest" \
+            ci
+
+      - name: Push
+        if: steps.exists.outputs.hit == 'false'
+        run: |
+          docker push "$CI_REGISTRY/${{ matrix.image }}:$KEY"
+          docker push "$CI_REGISTRY/${{ matrix.image }}:latest"
+
+      # A release pins reproducible builder images without any rebuild: copy the key's
+      # manifest to a vX.Y.Z tag via the registry API (no image bytes move).
+      - name: Tag for release
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          ACCEPT='Accept: application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json'
+          MT=$(curl -sfI -H "$ACCEPT" "http://$CI_REGISTRY/v2/${{ matrix.image }}/manifests/$KEY" \
+            | tr -d '\r' | sed -n 's/^[Cc]ontent-[Tt]ype: //p')
+          curl -sf -H "$ACCEPT" -o /tmp/manifest.json \
+            "http://$CI_REGISTRY/v2/${{ matrix.image }}/manifests/$KEY"
+          curl -sf -X PUT -H "Content-Type: $MT" --data-binary @/tmp/manifest.json \
+            "http://$CI_REGISTRY/v2/${{ matrix.image }}/manifests/$GITHUB_REF_NAME"
+
+  # The aarch64 CROSS builder — a SEPARATE job because it is `FROM punktfunk-rust-ci:latest`
+  # (the LAN copy) and so must not race the matrix entry that publishes that base. Consumed
+  # by the arm64 client legs in ci.yml/deb.yml. Its key also folds in rust-toolchain.toml:
+  # the Dockerfile installs the aarch64 target against the toolchain the workspace pins.
+  builders-arm64cross:
+    runs-on: ubuntu-24.04
+    needs: builders
+    timeout-minutes: 60
+    env:
+      IMAGE: punktfunk-rust-ci-arm64cross
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Content key
+        run: |
+          git config --global --add safe.directory "$PWD"
+          echo "KEY=ck-$(printf '%s%s' "$(git rev-parse HEAD:ci)" "$(git rev-parse HEAD:rust-toolchain.toml)" | sha256sum | cut -c1-12)" >> "$GITHUB_ENV"
+
+      - name: Check whether this key already exists
+        id: exists
+        run: |
+          ACCEPT='Accept: application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json'
+          if curl -sf -o /dev/null -H "$ACCEPT" \
+              "http://$CI_REGISTRY/v2/$IMAGE/manifests/$KEY"; then
+            echo "hit=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::$IMAGE:$KEY already in the LAN registry — nothing to build"
+          else
+            echo "hit=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build
+        if: steps.exists.outputs.hit == 'false'
+        # Root context: it needs rust-toolchain.toml to install the target against the
+        # toolchain the workspace actually pins.
+        run: |
+          docker build --pull \
+            -f ci/rust-ci-arm64cross.Dockerfile \
+            -t "$CI_REGISTRY/$IMAGE:$KEY" \
+            -t "$CI_REGISTRY/$IMAGE:latest" \
+            .
+
+      - name: Push
+        if: steps.exists.outputs.hit == 'false'
+        run: |
+          docker push "$CI_REGISTRY/$IMAGE:$KEY"
+          docker push "$CI_REGISTRY/$IMAGE:latest"
+
+      - name: Tag for release
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          ACCEPT='Accept: application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json'
+          MT=$(curl -sfI -H "$ACCEPT" "http://$CI_REGISTRY/v2/$IMAGE/manifests/$KEY" \
+            | tr -d '\r' | sed -n 's/^[Cc]ontent-[Tt]ype: //p')
+          curl -sf -H "$ACCEPT" -o /tmp/manifest.json \
+            "http://$CI_REGISTRY/v2/$IMAGE/manifests/$KEY"
+          curl -sf -X PUT -H "Content-Type: $MT" --data-binary @/tmp/manifest.json \
+            "http://$CI_REGISTRY/v2/$IMAGE/manifests/$GITHUB_REF_NAME"
+
+  # Deployable app images — unchanged flow, Gitea registry, per-SHA + release tags.
+  apps:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     strategy:
@@ -45,23 +189,6 @@ jobs:
           - image: punktfunk-docs
             dockerfile: docs-site/Dockerfile
             context: docs-site
-          - image: punktfunk-rust-ci
-            dockerfile: ci/rust-ci.Dockerfile
-            context: ci
-          # Ubuntu 24.04 LTS host builder: same purpose as rust-ci but lowers the host .deb's glibc
-          # floor to 2.39 and bundles a from-source FFmpeg 8, so the package installs on 24.04 LTS
-          # (rust-ci's 26.04 build is uninstallable there). Consumed by deb.yml's build-publish-host job.
-          - image: punktfunk-rust-ci-noble
-            dockerfile: ci/rust-ci-noble.Dockerfile
-            context: ci
-          - image: punktfunk-fedora-rpm
-            dockerfile: ci/fedora-rpm.Dockerfile
-            context: ci
-          # Fedora 44 builder (Fedora KDE spin): same Dockerfile, newer base → libavcodec.so.62.
-          - image: punktfunk-fedora44-rpm
-            dockerfile: ci/fedora-rpm.Dockerfile
-            context: ci
-            buildargs: --build-arg FEDORA_VERSION=44
     steps:
       - uses: actions/checkout@v4
 
@@ -76,7 +203,7 @@ jobs:
           # On a release tag, also tag the image vX.Y.Z so a release pins reproducible web/docs images.
           EXTRA=""
           case "$GITHUB_REF" in refs/tags/v*) EXTRA="-t $REGISTRY/$OWNER/${{ matrix.image }}:${GITHUB_REF_NAME}" ;; esac
-          docker build --pull ${{ matrix.buildargs }} \
+          docker build --pull \
             -f "${{ matrix.dockerfile }}" \
             -t "$REGISTRY/$OWNER/${{ matrix.image }}:latest" \
             -t "$REGISTRY/$OWNER/${{ matrix.image }}:sha-${GITHUB_SHA::8}" \
@@ -89,48 +216,13 @@ jobs:
           docker push "$REGISTRY/$OWNER/${{ matrix.image }}:latest"
           case "$GITHUB_REF" in refs/tags/v*) docker push "$REGISTRY/$OWNER/${{ matrix.image }}:${GITHUB_REF_NAME}" ;; esac
 
-  # The aarch64 CROSS builder — a SEPARATE job because it is `FROM punktfunk-rust-ci:latest`
-  # and so must not race the matrix entry that publishes that base. Consumed by the arm64
-  # client legs in deb.yml/rpm.yml/arch.yml. Root context: it needs rust-toolchain.toml to
-  # install the target against the toolchain the workspace actually pins.
-  build-push-arm64cross:
-    runs-on: ubuntu-24.04
-    needs: build-push
-    timeout-minutes: 45
-    env:
-      IMAGE: punktfunk-rust-ci-arm64cross
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Login to registry
-        run: |
-          echo "${{ secrets.REGISTRY_TOKEN }}" \
-            | docker login "$REGISTRY" -u enricobuehler --password-stdin
-
-      - name: Build
-        run: |
-          EXTRA=""
-          case "$GITHUB_REF" in refs/tags/v*) EXTRA="-t $REGISTRY/$OWNER/$IMAGE:${GITHUB_REF_NAME}" ;; esac
-          docker build --pull \
-            -f ci/rust-ci-arm64cross.Dockerfile \
-            -t "$REGISTRY/$OWNER/$IMAGE:latest" \
-            -t "$REGISTRY/$OWNER/$IMAGE:sha-${GITHUB_SHA::8}" \
-            $EXTRA \
-            .
-
-      - name: Push
-        run: |
-          docker push "$REGISTRY/$OWNER/$IMAGE:sha-${GITHUB_SHA::8}"
-          docker push "$REGISTRY/$OWNER/$IMAGE:latest"
-          case "$GITHUB_REF" in refs/tags/v*) docker push "$REGISTRY/$OWNER/$IMAGE:${GITHUB_REF_NAME}" ;; esac
-
   # Deploy the docs site to unom-1, the DMZ services VM website/cms also deploy to
   # (docs.punktfunk.unom.io via Caddy on home-reverse-proxy-1 -> :3220). Same secret set
   # as unom/website's deploy: DEPLOY_HOST/DEPLOY_USER/DEPLOY_PORT/DEPLOY_SSH_KEY (the
   # unom-ci-deploy key).
   deploy-docs:
     runs-on: ubuntu-24.04
-    needs: build-push
+    needs: apps
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
