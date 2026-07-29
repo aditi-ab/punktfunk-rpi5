@@ -13,12 +13,11 @@
 
 use std::sync::atomic::{AtomicIsize, Ordering};
 use std::sync::Mutex;
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
-use windows::Win32::System::Threading::{CreateMutexW, ReleaseMutex};
-use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
-// COPYDATASTRUCT lives with the other data-exchange types, not with the message constant.
-use windows::Win32::System::DataExchange::COPYDATASTRUCT;
-use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, SendMessageW, WM_COPYDATA};
+use windows::Win32::commctrl::{DefSubclassProc, SetWindowSubclass};
+use windows::Win32::minwindef::{LPARAM, LRESULT, WPARAM};
+use windows::Win32::synchapi::{CreateMutexW, ReleaseMutex};
+use windows::Win32::windef::HWND;
+use windows::Win32::winuser::{FindWindowW, SendMessageW, COPYDATASTRUCT, WM_COPYDATA};
 
 /// The single-instance mutex. Named per the design; deliberately not `Global\` — one shell per
 /// user session is the rule, and a second desktop user gets their own.
@@ -59,19 +58,18 @@ pub(crate) fn claim_primary() -> bool {
     // SAFETY: `CreateMutexW` takes a static wide name literal and no pointer we own; the handle it
     // returns is stored in `MUTEX` and released once in `release_primary`.
     unsafe {
-        let handle = match CreateMutexW(None, true, MUTEX_NAME) {
-            Ok(h) => h,
-            // Without the mutex we cannot tell primary from secondary; behaving as primary is
-            // the safe answer — a second window is a nuisance, a dropped launch is a bug.
-            Err(e) => {
-                tracing::warn!(error = %e, "single instance mutex; continuing as primary");
-                return true;
-            }
-        };
+        let handle = CreateMutexW(None, true, MUTEX_NAME);
+        // Without the mutex we cannot tell primary from secondary; behaving as primary is
+        // the safe answer — a second window is a nuisance, a dropped launch is a bug.
+        if handle.0.is_null() {
+            let e = windows::Win32::errhandlingapi::GetLastError();
+            tracing::warn!(error = e, "single instance mutex; continuing as primary");
+            return true;
+        }
         // ERROR_ALREADY_EXISTS means someone else created it first — `CreateMutexW` still
         // hands back a valid handle, so ask the OS what actually happened.
-        let already = windows::Win32::Foundation::GetLastError()
-            == windows::Win32::Foundation::ERROR_ALREADY_EXISTS;
+        let already = windows::Win32::errhandlingapi::GetLastError()
+            == windows::Win32::winerror::ERROR_ALREADY_EXISTS as u32;
         if already {
             return false;
         }
@@ -87,7 +85,7 @@ pub(crate) fn release_primary() {
         // SAFETY: `raw` is the handle `claim_primary` stored, taken out of the atomic by `swap` so
         // this runs at most once even if two threads race here.
         unsafe {
-            let _ = ReleaseMutex(windows::Win32::Foundation::HANDLE(raw as *mut _));
+            let _ = ReleaseMutex(windows::Win32::winnt::HANDLE(raw as *mut _));
         }
     }
 }
@@ -104,7 +102,8 @@ pub(crate) fn forward_to_primary(url: &str) -> bool {
         // local that outlives the call because `SendMessage` is synchronous — the receiver has
         // finished with the buffer before it returns, which is precisely why this is not `Post`.
         unsafe {
-            if let Ok(hwnd) = FindWindowW(None, windows::core::w!("Punktfunk")) {
+            let hwnd = FindWindowW(None, windows::core::w!("Punktfunk"));
+            if !hwnd.0.is_null() {
                 let data = COPYDATASTRUCT {
                     dwData: COPYDATA_URL,
                     cbData: (wide.len() * 2) as u32,
@@ -114,9 +113,9 @@ pub(crate) fn forward_to_primary(url: &str) -> bool {
                 // copied it, which only a synchronous send guarantees.
                 SendMessageW(
                     hwnd,
-                    WM_COPYDATA,
-                    Some(WPARAM(0)),
-                    Some(LPARAM(&data as *const _ as isize)),
+                    WM_COPYDATA as u32,
+                    WPARAM(0),
+                    LPARAM(&data as *const _ as isize),
                 );
                 tracing::info!(attempt, "handed the link to the running shell");
                 return true;
@@ -138,7 +137,8 @@ pub(crate) fn install_receiver() {
                 // SAFETY: `FindWindowW` takes static literals, and `SetWindowSubclass` is given
                 // our own `wnd_proc` plus a plain id; the window handle is one the OS just returned.
                 unsafe {
-                    if let Ok(hwnd) = FindWindowW(None, windows::core::w!("Punktfunk")) {
+                    let hwnd = FindWindowW(None, windows::core::w!("Punktfunk"));
+                    if !hwnd.0.is_null() {
                         // Subclassing (rather than replacing the window proc) is what lets the
                         // WinUI window keep behaving as itself; the same mechanism the stream
                         // input hooks already use.
@@ -162,7 +162,7 @@ unsafe extern "system" fn wnd_proc(
     _id: usize,
     _data: usize,
 ) -> LRESULT {
-    if msg == WM_COPYDATA {
+    if msg == WM_COPYDATA as u32 {
         // SAFETY: for `WM_COPYDATA` the OS marshals the sender's `COPYDATASTRUCT` and its buffer
         // into THIS process and keeps both valid for the duration of the handler — that is the
         // guarantee this relies on, not the sender's honesty, which is why a hostile sender can at
@@ -207,11 +207,11 @@ pub(crate) fn queue(url: String) {
 /// it valid across updates, since the install path changes and the alias doesn't.
 pub(crate) fn write_shortcut(label: &str, url: &str) -> Result<std::path::PathBuf, String> {
     use windows::core::{Interface, HSTRING};
-    use windows::Win32::System::Com::{
-        CoCreateInstance, CoInitializeEx, IPersistFile, CLSCTX_INPROC_SERVER,
-        COINIT_APARTMENTTHREADED,
-    };
-    use windows::Win32::UI::Shell::{IShellLinkW, ShellLink};
+    use windows::Win32::combaseapi::{CoCreateInstance, CoInitializeEx};
+    use windows::Win32::objbase::COINIT_APARTMENTTHREADED;
+    use windows::Win32::objidl::IPersistFile;
+    use windows::Win32::shobjidl_core::{IShellLinkW, ShellLink};
+    use windows::Win32::wtypesbase::CLSCTX_INPROC_SERVER;
 
     let desktop = std::env::var("USERPROFILE")
         .map(|p| std::path::PathBuf::from(p).join("Desktop"))
@@ -224,20 +224,24 @@ pub(crate) fn write_shortcut(label: &str, url: &str) -> Result<std::path::PathBu
         // The UI thread is already apartment-threaded; this is belt and braces for the case
         // where a caller ever moves this off it. An already-initialised apartment returns
         // S_FALSE, which is not an error.
-        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED as u32);
         let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)
             .map_err(|e| format!("shell link: {e}"))?;
         link.SetPath(&HSTRING::from("punktfunk-client.exe"))
+            .ok()
             .map_err(|e| format!("shortcut target: {e}"))?;
         link.SetArguments(&HSTRING::from(url))
+            .ok()
             .map_err(|e| format!("shortcut argument: {e}"))?;
         link.SetDescription(&HSTRING::from(format!("Stream from {label}")))
+            .ok()
             .map_err(|e| format!("shortcut description: {e}"))?;
         let persist: IPersistFile = link.cast().map_err(|e| format!("shortcut save: {e}"))?;
         // `to_string_lossy` rather than the OsStr: HSTRING is UTF-16 and the path came from an
         // env var plus our own sanitised name, so there is nothing lossy left to lose.
         persist
             .Save(&HSTRING::from(path.to_string_lossy().as_ref()), true)
+            .ok()
             .map_err(|e| format!("{}: {e}", path.display()))?;
     }
     Ok(path)

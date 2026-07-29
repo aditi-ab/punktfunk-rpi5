@@ -10,8 +10,8 @@
 //! `stream::window_dpi`.
 
 use std::sync::atomic::{AtomicIsize, Ordering};
-use windows::Win32::Foundation::{HWND, RECT};
-use windows::Win32::UI::WindowsAndMessaging::{
+use windows::Win32::windef::{HWND, RECT};
+use windows::Win32::winuser::{
     FindWindowW, GetWindowRect, IsWindow, SetForegroundWindow, ShowWindow, SW_HIDE, SW_SHOW,
 };
 
@@ -29,7 +29,10 @@ fn shell_hwnd() -> Option<HWND> {
                 return Some(h);
             }
         }
-        let h = FindWindowW(None, windows::core::w!("Punktfunk")).ok()?;
+        let h = FindWindowW(None, windows::core::w!("Punktfunk"));
+        if h.0.is_null() {
+            return None;
+        }
         SHELL_HWND.store(h.0 as isize, Ordering::Relaxed);
         Some(h)
     }
@@ -68,6 +71,8 @@ pub(crate) fn position() -> Option<(i32, i32)> {
     let h = shell_hwnd()?;
     let mut r = RECT::default();
     // SAFETY: `h` is the validated shell window handle and `r` is a live local the call fills.
-    unsafe { GetWindowRect(h, &mut r).ok()? };
+    if !unsafe { GetWindowRect(h, &mut r) }.as_bool() {
+        return None;
+    }
     Some((r.left, r.top))
 }

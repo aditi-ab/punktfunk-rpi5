@@ -6,21 +6,22 @@
 //! by the session child at connect (`PUNKTFUNK_ADAPTER` remains the session binary's env override).
 
 use windows::core::Interface;
-use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIAdapter, IDXGIFactory1};
+use windows::Win32::dxgi::{CreateDXGIFactory1, IDXGIAdapter, IDXGIFactory1};
 
 /// The adapter's human-readable description.
 fn adapter_name(adapter: &IDXGIAdapter) -> String {
-    // SAFETY: a read-only COM call on the live `adapter` borrow, filling a descriptor returned by
-    // value; `&IDXGIAdapter` is a reference-counted wrapper, so the borrow IS the liveness.
+    // SAFETY: a read-only COM call on the live `adapter` borrow, filling a zeroed local
+    // descriptor through the out-param, checked before the descriptor is read; `&IDXGIAdapter`
+    // is a reference-counted wrapper, so the borrow IS the liveness.
     unsafe {
-        adapter
-            .GetDesc()
-            .map(|d| {
-                String::from_utf16_lossy(&d.Description)
-                    .trim_end_matches('\0')
-                    .to_string()
-            })
-            .unwrap_or_else(|_| "<unknown adapter>".into())
+        let mut d: windows::Win32::dxgi::DXGI_ADAPTER_DESC = std::mem::zeroed();
+        if adapter.GetDesc(&mut d).is_ok() {
+            String::from_utf16_lossy(&d.Description)
+                .trim_end_matches('\0')
+                .to_string()
+        } else {
+            "<unknown adapter>".into()
+        }
     }
 }
 
@@ -59,10 +60,14 @@ pub fn adapter_names() -> Vec<String> {
     let mut names: Vec<String> = Vec::new();
     for a in all_adapters() {
         let desc1 = a
-            .cast::<windows::Win32::Graphics::Dxgi::IDXGIAdapter1>()
-            // SAFETY: a read-only COM call on the adapter just cast, filling a descriptor by value.
-            .and_then(|a1| unsafe { a1.GetDesc1() })
-            .ok();
+            .cast::<windows::Win32::dxgi::IDXGIAdapter1>()
+            .ok()
+            // SAFETY: a read-only COM call on the adapter just cast, filling a zeroed local
+            // descriptor through the out-param, discarded unless the call reports success.
+            .and_then(|a1| unsafe {
+                let mut d: windows::Win32::dxgi::DXGI_ADAPTER_DESC1 = std::mem::zeroed();
+                a1.GetDesc1(&mut d).is_ok().then_some(d)
+            });
         let name = adapter_name(&a);
         // Forensics for the next duplicate/oddity report — which adapters DXGI actually
         // returned, and whether the repeats share a LUID (one adapter enumerated twice)

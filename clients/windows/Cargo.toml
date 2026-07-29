@@ -3,7 +3,9 @@ name = "punktfunk-client-windows"
 description = "Native Windows punktfunk/1 client — WinUI 3 (windows-reactor) shell, SDL3 gamepads; streaming runs in the spawned punktfunk-session binary"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
+# Not workspace-inherited (1.82): windows-reactor at the pinned rev declares rust-version 1.95+
+# and edition 2024. rust-toolchain.toml pins 1.96, so this records reality rather than raising it.
+rust-version = "1.96"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -41,40 +43,39 @@ punktfunk-core = { path = "../../crates/punktfunk-core", features = ["quic"] }
 # nothing enables it and the C++ is never compiled.
 pf-client-core = { path = "../../crates/pf-client-core", default-features = false }
 
-# WinUI 3 UI via windows-reactor (a declarative React-like framework backed by WinUI). Its
-# `build.rs` downloads the Windows App SDK NuGets and stages the bootstrap DLL + resources.pri
-# next to the exe; it requires `CARGO_WORKSPACE_DIR` to be set in the build env. Unpublished
-# (version 0.0.0) and fast-moving, so pinned to a verified commit.
-windows-reactor = { git = "https://github.com/microsoft/windows-rs", rev = "a4f7b2cb7c63c6bb7fc77a2affe57145be1d8c4f" }
-# Win32 / Direct3D11 / DXGI for the SwapChainPanel composition swapchain. Pulled from the SAME
+# WinUI 3 UI via windows-reactor (a declarative React-like framework backed by WinUI).
+# Unpublished (version 0.0.0) and fast-moving, so pinned to a verified commit. Pin bumped
+# 2026-07-29 (from the 2026-07-01 rev) for: reconciler keyed-child-order fix (#4728), widget
+# validation (#4727), DPI collision fix (#4751), icon elements (#4736), multi-window (#4730),
+# scroll virtualization (#4710). All three windows-rs deps here MUST share this rev, and it
+# must match pf-client-core's `windows` pin, so the workspace builds ONE windows-rs.
+windows-reactor = { git = "https://github.com/microsoft/windows-rs", rev = "acb5a1a7441033d9312b16842af02eb0c2b403dc" }
+# Win32 / DXGI for the GPU picker and the shell's window plumbing. Pulled from the SAME
 # windows-rs commit as windows-reactor so their `windows-core` unifies — the `IDXGISwapChain1`
 # we hand to `SwapChainPanelHandle::set_swap_chain` must satisfy reactor's `windows_core::Interface`.
-windows = { git = "https://github.com/microsoft/windows-rs", rev = "a4f7b2cb7c63c6bb7fc77a2affe57145be1d8c4f", features = [
-    "Win32_Foundation",
-    "Win32_Graphics_Dxgi",
-    "Win32_Graphics_Dxgi_Common",
+# Features are header-named since the in-house-metadata rework (#4689) — one feature per SDK
+# header, replacing the old `Win32_*` namespace features.
+windows = { git = "https://github.com/microsoft/windows-rs", rev = "acb5a1a7441033d9312b16842af02eb0c2b403dc", features = [
     # GetCurrentPackageFullName — the packaged-run probe guarding the explicit
     # AppUserModelID (main.rs; MSIX identity must win over the dev-run tag).
-    "Win32_Storage_Packaging_Appx",
-    "Win32_Graphics_Direct3D",
-    "Win32_Graphics_Direct3D11",
-    "Win32_Graphics_Direct3D_Fxc",
-    "Win32_Graphics_Gdi",
-    # IShellLinkW + IPersistFile for the "Create shortcut" writer, and COPYDATASTRUCT for the
-    # link hand-off between instances (deeplink.rs).
-    "Win32_System_Com",
-    "Win32_System_DataExchange",
-    "Win32_System_Console",
-    "Win32_System_LibraryLoader",
-    "Win32_System_Threading",
-    "Win32_UI_HiDpi",
-    "Win32_UI_Input_KeyboardAndMouse",
-    # Win32 window subclassing (SetWindowSubclass/DefSubclassProc) — the stream input hooks
-    # subclass the WinUI window + its content-island children to swallow WM_SETCURSOR so the
-    # local cursor stays hidden while the pointer is locked (WinUI otherwise re-asserts the arrow
-    # on every pointer move, defeating a one-shot ShowCursor(false)).
-    "Win32_UI_Shell",
-    "Win32_UI_WindowsAndMessaging",
+    "appmodel",
+    # CoCreateInstance/CoInitializeEx (+ objbase/objidl/wtypesbase below) for the
+    # "Create shortcut" writer (deeplink.rs).
+    "combaseapi",
+    # SetWindowSubclass/DefSubclassProc — the deep-link WM_COPYDATA subclass hook.
+    "commctrl",
+    "consoleapi",
+    "dxgi",
+    "errhandlingapi",
+    "libloaderapi",
+    "objbase",
+    "objidl",
+    # SetCurrentProcessExplicitAppUserModelID + ShellLink/IShellLinkW.
+    "shobjidl_core",
+    "synchapi",
+    "winerror",
+    # Windowing, messages, icons — and COPYDATASTRUCT, which lives in winuser now too.
+    "winuser",
 ] }
 
 # FFmpeg — used only to enumerate which codecs this client can decode (probe::decodable_codecs),
@@ -98,7 +99,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # to the exe — the new-model replacement for the old windows-reactor build.rs; same pinned rev.
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"
-windows-reactor-setup = { git = "https://github.com/microsoft/windows-rs", rev = "a4f7b2cb7c63c6bb7fc77a2affe57145be1d8c4f" }
+windows-reactor-setup = { git = "https://github.com/microsoft/windows-rs", rev = "acb5a1a7441033d9312b16842af02eb0c2b403dc" }
 
 [lints]
 workspace = true

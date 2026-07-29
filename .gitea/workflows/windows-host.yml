@@ -123,10 +123,9 @@ jobs:
         shell: pwsh
         run: |
           # CARGO_TARGET_DIR=C:\t dodges the MAX_PATH wall in the CMake-from-source crates (aws-lc,
-          # opus) the host pulls; CARGO_WORKSPACE_DIR mirrors the client workflows. Both via GITHUB_ENV
-          # (pwsh Out-File utf8 = no BOM, unlike Windows PowerShell 5.1 — keeps the first line clean).
+          # opus) the host pulls; via GITHUB_ENV (pwsh Out-File utf8 = no BOM, unlike Windows
+          # PowerShell 5.1 — keeps the first line clean).
           "CARGO_TARGET_DIR=C:\t" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          "CARGO_WORKSPACE_DIR=$env:GITHUB_WORKSPACE" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           # audiopus_sys' vendored opus declares cmake_minimum_required < 3.5, which CMake 4.x
           # refuses outright. Green runs today only survive on the cached configure output — a
           # target-dir purge (the runner's disk-cleanup task) would fail the fresh configure, as

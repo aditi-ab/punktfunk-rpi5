@@ -45,6 +45,13 @@ def find_license_files(pkg_dir):
     return out
 
 
+# Crates that ship license-mit/license-apache-2.0 files but omit the `license` field in
+# their Cargo.toml (publish = false upstream), so `cargo metadata` reports no SPDX for them.
+LICENSE_OVERRIDES = {
+    "windows-reactor-setup": "MIT OR Apache-2.0",
+}
+
+
 # Third-party source trees VENDORED inside first-party workspace crates — the
 # workspace-member skip in main() hides them from `cargo metadata`, so they are listed
 # here explicitly: (label, license file relative to the repo root, source URL).
@@ -146,7 +153,7 @@ def main():
     w("MANIFEST (crate version — SPDX license — source)")
     w("-" * 76)
     for p in pkgs:
-        lic = p.get("license") or (("file: " + p["license_file"]) if p.get("license_file") else "UNKNOWN")
+        lic = p.get("license") or LICENSE_OVERRIDES.get(p["name"]) or (("file: " + p["license_file"]) if p.get("license_file") else "UNKNOWN")
         repo = p.get("repository") or ""
         w(f'  {p["name"]} {p["version"]} — {lic}' + (f' — {repo}' if repo else ""))
     w("")
@@ -156,7 +163,7 @@ def main():
         w("Crates whose package did not embed a license file (SPDX + source only)")
         w("-" * 76)
         for p in no_text:
-            lic = p.get("license") or "UNKNOWN"
+            lic = p.get("license") or LICENSE_OVERRIDES.get(p["name"]) or "UNKNOWN"
             repo = p.get("repository") or ""
             w(f'  {p["name"]} {p["version"]} — {lic}' + (f' — {repo}' if repo else ""))
         w("")

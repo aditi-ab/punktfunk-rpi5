@@ -42,8 +42,9 @@ A stock [Moonlight](https://moonlight-stream.org/) client also works over GameSt
 ## Build from source
 
 Windows-only (the crate builds as a stub on other platforms so the workspace stays green). You need
-the MSVC toolchain, an `FFMPEG_DIR` FFmpeg tree, and CMake (SDL3 builds from source). windows-reactor's
-`build.rs` downloads the Windows App SDK NuGets and needs `CARGO_WORKSPACE_DIR` set.
+the MSVC toolchain, an `FFMPEG_DIR` FFmpeg tree, and CMake (SDL3 builds from source). The Windows
+App SDK runtime bootstrap is staged next to the exe by `windows-reactor-setup` from this crate's
+own `build.rs` — no extra environment needed.
 
 ```sh
 cargo build -p punktfunk-client-windows --target x86_64-pc-windows-msvc
@@ -59,21 +60,42 @@ punktfunk-client --headless --speed-test --connect host[:port]  # probe burst �
 
 ## Layout
 
+Decode/present/input live in the spawned `punktfunk-session` binary (`clients/session`), not here —
+this crate is the shell that discovers, pairs, and launches it.
+
 ```
 src/
   main.rs                 entry point + CLI paths (--discover · --headless · --speed-test)
+  bin/punktfunk-console.rs  the couch/HTPC Start-menu entry (re-execs with --console)
   app/                    WinUI 3 shell (windows-reactor), one module per screen:
                           mod (root/router) · hosts · connect · pair · speed · settings ·
-                          licenses · stream · style (shared cards/pills/monograms)
-  present.rs · gpu.rs      SwapChainPanel D3D11 composition swapchain; shared D3D11 device
-  video.rs                FFmpeg HEVC decode (D3D11VA zero-copy + software fallback)
-  audio.rs                WASAPI render + mic capture
-  gamepad.rs              SDL3 controllers + rumble/lightbar/DualSense feedback
-  input.rs                Win32 low-level hooks → host input (pointer lock · click-to-capture)
-  session.rs              session lifecycle over the NativeClient connector (+ speed probe)
+                          library · help · licenses · stream · style (shared cards/pills)
+  deeplink.rs             punktfunk:// activation, single-instance hand-off, shortcut writer
+  spawn.rs                punktfunk-session child process + its stdout event contract
+  shell_window.rs         hide/restore the shell HWND around a session
+  gpu.rs                  DXGI adapter enumeration for the GPU picker
   trust.rs · discovery.rs persistent identity, TOFU/PIN pairing, mDNS browse
+  probe.rs · wol.rs       speed probe · Wake-on-LAN
+  logfile.rs              log tee to %LOCALAPPDATA%
 packaging/                MSIX manifest, signing, pack script
 ```
+
+## Manual smoke checklist
+
+The windows-reactor pin is a moving target and WinUI regressions rarely show up in `cargo check` —
+walk this after a reactor bump or a change to the render/state architecture:
+
+- **Hosts** — discovery populates tiles; tile hover fill; "…" menu → Forget and Rename;
+  add-host modal connects; WOL wait screen cancels.
+- **Settings** — every section renders; combos still show their selection after a section
+  switch AND a scope switch (the historic blank-combo reconciler bug); profile create /
+  rename / delete (with confirm); colour swatches repaint; the Overridden marker appears on
+  edit and clears on Reset; GPU combo lists adapters.
+- **Pair** — PIN entry pairs (the typed PIN must reach the Connect click — `use_ref` mirror path).
+- **Session** — connect → session spawns → HUD stats tick; Ctrl+Alt+Shift+Q releases the pointer;
+  shell window restores on exit.
+- **Shell** — speed test completes; library grid loads; `punktfunk://` deep link routes (second
+  instance hands off and exits); window icon appears; screen-entrance animations play.
 
 ## Related
 

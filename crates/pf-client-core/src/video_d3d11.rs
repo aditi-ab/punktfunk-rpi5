@@ -43,9 +43,7 @@ use ffmpeg_next as ffmpeg;
 use std::ffi::c_void;
 use std::ptr;
 use windows::core::{Interface, GUID};
-use windows::Win32::Foundation::{HANDLE, RECT};
-use windows::Win32::Graphics::Direct3D::{D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1};
-use windows::Win32::Graphics::Direct3D11::{
+use windows::Win32::d3d11::{
     D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Multithread, ID3D11Texture2D,
     ID3D11VideoContext1, ID3D11VideoDevice, ID3D11VideoProcessor, ID3D11VideoProcessorEnumerator,
     ID3D11VideoProcessorOutputView, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE,
@@ -57,19 +55,20 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_VIDEO_USAGE_PLAYBACK_NORMAL, D3D11_VPIV_DIMENSION_TEXTURE2D,
     D3D11_VPOV_DIMENSION_TEXTURE2D,
 };
-use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020, DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709,
-    DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P2020, DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P601,
-    DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P709, DXGI_COLOR_SPACE_YCBCR_STUDIO_G2084_LEFT_P2020,
-    DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P2020, DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P601,
-    DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709, DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM,
-    DXGI_FORMAT_NV12, DXGI_FORMAT_P010, DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_RATIONAL,
-    DXGI_SAMPLE_DESC,
-};
-use windows::Win32::Graphics::Dxgi::{
+use windows::Win32::d3dcommon::{D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1};
+use windows::Win32::dxgi::{
     CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1, IDXGIKeyedMutex, IDXGIResource1,
-    DXGI_ADAPTER_FLAG_SOFTWARE, DXGI_SHARED_RESOURCE_READ, DXGI_SHARED_RESOURCE_WRITE,
+    DXGI_ADAPTER_DESC1, DXGI_ADAPTER_FLAG_SOFTWARE, DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020,
+    DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709, DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P2020,
+    DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P601, DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P709,
+    DXGI_COLOR_SPACE_YCBCR_STUDIO_G2084_LEFT_P2020, DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P2020,
+    DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P601, DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709,
+    DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_NV12, DXGI_FORMAT_P010,
+    DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_RATIONAL, DXGI_SAMPLE_DESC, DXGI_SHARED_RESOURCE_READ,
+    DXGI_SHARED_RESOURCE_WRITE,
 };
+use windows::Win32::windef::RECT;
+use windows::Win32::winnt::HANDLE;
 
 /// Ring of shareable hand-off textures. Bounds how many decoded-but-unpresented frames can
 /// exist without a slot being rewritten under an in-flight older frame: the pump's decoded
@@ -298,12 +297,14 @@ fn create_device(luid: Option<[u8; 8]>) -> Result<(ID3D11Device, ID3D11DeviceCon
         let Ok(adapter) = (unsafe { factory.EnumAdapters1(i) }) else {
             break;
         };
-        // SAFETY: a COM call on the adapter just enumerated, filling a descriptor returned by
-        // value.
-        let Ok(desc) = (unsafe { adapter.GetDesc1() }) else {
+        // SAFETY: `DXGI_ADAPTER_DESC1` is plain-old-data, so all-zeroes is a valid value.
+        let mut desc: DXGI_ADAPTER_DESC1 = unsafe { std::mem::zeroed() };
+        // SAFETY: a COM call on the adapter just enumerated, filling the zeroed local descriptor
+        // through the out-param; checked before the descriptor is read.
+        if unsafe { adapter.GetDesc1(&mut desc) }.is_err() {
             continue;
-        };
-        if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 {
+        }
+        if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE as u32 != 0 {
             continue; // WARP can't hardware-decode; software decode covers that box anyway
         }
         if fallback.is_none() {
@@ -334,16 +335,17 @@ fn create_device(luid: Option<[u8; 8]>) -> Result<(ID3D11Device, ID3D11DeviceCon
     unsafe {
         D3D11CreateDevice(
             &adapter,
-            windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN,
-            None,
-            D3D11_CREATE_DEVICE_VIDEO_SUPPORT | D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+            windows::Win32::d3dcommon::D3D_DRIVER_TYPE_UNKNOWN,
+            windows::Win32::minwindef::HINSTANCE(std::ptr::null_mut()),
+            (D3D11_CREATE_DEVICE_VIDEO_SUPPORT | D3D11_CREATE_DEVICE_BGRA_SUPPORT) as u32,
             Some(&[D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0]),
-            D3D11_SDK_VERSION,
+            D3D11_SDK_VERSION as u32,
             Some(&mut device),
             None,
             Some(&mut context),
         )
     }
+    .ok()
     .context("D3D11CreateDevice")?;
     let device = device.ok_or_else(|| anyhow!("D3D11CreateDevice returned no device"))?;
     let context = context.ok_or_else(|| anyhow!("D3D11CreateDevice returned no context"))?;
@@ -376,7 +378,7 @@ impl Drop for Slot {
         // SAFETY: `self.handle` is the shared-texture NT handle this slot owns; `Drop` runs once,
         // so it is closed exactly once and never used after.
         unsafe {
-            let _ = windows::Win32::Foundation::CloseHandle(self.handle);
+            let _ = windows::Win32::handleapi::CloseHandle(self.handle);
         }
     }
 }
@@ -451,10 +453,10 @@ impl SharedRing {
             },
             Usage: D3D11_USAGE_DEFAULT,
             // RENDER_TARGET: the video processor's output view renders into it.
-            BindFlags: (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0) as u32,
+            BindFlags: (D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET) as u32,
             CPUAccessFlags: 0,
-            MiscFlags: (D3D11_RESOURCE_MISC_SHARED_NTHANDLE.0
-                | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX.0) as u32,
+            MiscFlags: (D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX)
+                as u32,
         };
         let mut slots = Vec::with_capacity(RING_SLOTS);
         for _ in 0..RING_SLOTS {
@@ -462,6 +464,7 @@ impl SharedRing {
             // SAFETY: a `?`-checked `CreateTexture2D` on the live device, over a fully-initialized
             // stack descriptor and a live `Option` out-param.
             unsafe { device.CreateTexture2D(&desc, None, Some(&mut tex)) }
+                .ok()
                 .context("create shared hand-off texture")?;
             let tex: ID3D11Texture2D = tex.expect("CreateTexture2D succeeded");
             let mutex: IDXGIKeyedMutex =
@@ -473,7 +476,7 @@ impl SharedRing {
             let handle = unsafe {
                 resource.CreateSharedHandle(
                     None,
-                    (DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE).0,
+                    DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE as u32,
                     None,
                 )
             }
@@ -494,6 +497,7 @@ impl SharedRing {
                     Some(&mut out_view),
                 )
             }
+            .ok()
             .context("CreateVideoProcessorOutputView")?;
             let out_view = out_view.expect("output view created");
             slots.push(Slot {
@@ -735,6 +739,7 @@ impl D3d11vaDecoder {
             let mut in_view = None;
             video_device
                 .CreateVideoProcessorInputView(&src, &ring.enumerator, &iv_desc, Some(&mut in_view))
+                .ok()
                 .context("CreateVideoProcessorInputView")?;
             let in_view = in_view.expect("input view created");
 

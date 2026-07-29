@@ -190,9 +190,9 @@ pub fn run(identity: (String, String), gamepad: GamepadService) -> windows_react
 /// window icon-less and exposes no handle before `App::render` blocks, so a short background
 /// poll finds our own window by its (unique) title.
 fn apply_window_icon_when_ready() {
-    use windows::Win32::Foundation::{LPARAM, WPARAM};
-    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-    use windows::Win32::UI::WindowsAndMessaging::{
+    use windows::Win32::libloaderapi::GetModuleHandleW;
+    use windows::Win32::minwindef::{LPARAM, WPARAM};
+    use windows::Win32::winuser::{
         FindWindowW, GetSystemMetrics, LoadImageW, SendMessageW, ICON_BIG, ICON_SMALL, IMAGE_ICON,
         LR_DEFAULTCOLOR, SM_CXICON, SM_CXSMICON, WM_SETICON,
     };
@@ -203,27 +203,35 @@ fn apply_window_icon_when_ready() {
         // of them dereference caller memory, and the loop gives up after 100 tries.
         .spawn(|| unsafe {
             for _ in 0..100 {
-                if let Ok(hwnd) = FindWindowW(None, windows::core::w!("Punktfunk")) {
-                    let Ok(module) = GetModuleHandleW(None) else {
+                let hwnd = FindWindowW(None, windows::core::w!("Punktfunk"));
+                if !hwnd.0.is_null() {
+                    let module = GetModuleHandleW(None);
+                    if module.0.is_null() {
                         return;
-                    };
+                    }
                     // Small (title bar) and big (Alt-Tab) at their native metrics, both from
                     // the multi-size .ico so nothing is scaled at draw time.
+                    // MAKEINTRESOURCE(1): the "pointer" IS the resource ordinal — not a
+                    // dangling pointer, and `ptr::dangling()` (an alignment-based address)
+                    // would name a different resource.
+                    #[allow(clippy::manual_dangling_ptr)]
+                    let ordinal_1 = windows::core::PCWSTR(1 as *const u16);
                     for (which, metric) in [(ICON_SMALL, SM_CXSMICON), (ICON_BIG, SM_CXICON)] {
                         let px = GetSystemMetrics(metric);
-                        if let Ok(icon) = LoadImageW(
-                            Some(module.into()),
-                            windows::core::PCWSTR(1 as *const u16),
-                            IMAGE_ICON,
+                        let icon = LoadImageW(
+                            Some(module),
+                            ordinal_1,
+                            IMAGE_ICON as u32,
                             px,
                             px,
-                            LR_DEFAULTCOLOR,
-                        ) {
+                            LR_DEFAULTCOLOR as u32,
+                        );
+                        if !icon.0.is_null() {
                             SendMessageW(
                                 hwnd,
-                                WM_SETICON,
-                                Some(WPARAM(which as usize)),
-                                Some(LPARAM(icon.0 as isize)),
+                                WM_SETICON as u32,
+                                WPARAM(which as usize),
+                                LPARAM(icon.0 as isize),
                             );
                         }
                     }

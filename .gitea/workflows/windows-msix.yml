@@ -92,11 +92,9 @@ jobs:
       - name: Configure + version
         shell: pwsh
         run: |
-          # windows-reactor's build.rs unwraps CARGO_WORKSPACE_DIR; CARGO_TARGET_DIR (per-arch, short)
-          # dodges the MAX_PATH wall in the CMake-from-source crates (see windows.yml). FFMPEG_DIR
-          # selects the arch's import libs + is read by pack-msix.ps1 for the runtime DLLs. All via
-          # GITHUB_ENV.
-          "CARGO_WORKSPACE_DIR=$env:GITHUB_WORKSPACE" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          # CARGO_TARGET_DIR (per-arch, short) dodges the MAX_PATH wall in the CMake-from-source
+          # crates (see windows.yml). FFMPEG_DIR selects the arch's import libs + is read by
+          # pack-msix.ps1 for the runtime DLLs. All via GITHUB_ENV.
           "CARGO_TARGET_DIR=${{ matrix.td }}" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "FFMPEG_DIR=${{ matrix.ffmpeg }}" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           # pf-ffvk's bindgen needs Vulkan headers (arch-independent; provisioned alongside FFmpeg).

@@ -22,8 +22,6 @@
 # The MSVC/WinUI/FFmpeg toolchain (cargo/rustup on ASCII paths, NASM, CMake, LLVM, the x64 FFmpeg,
 # CARGO_HOME, CMAKE_POLICY_VERSION_MINIMUM, …) is baked into the runner's daemon env. Per-checkout
 # / per-arch vars are set in a step:
-#   - CARGO_WORKSPACE_DIR  windows-reactor's build.rs unwraps it + stages the Win App SDK
-#                          NuGets/winmd under it (from GITHUB_WORKSPACE).
 #   - CARGO_TARGET_DIR=C:\t…  the runner's host workdir is buried deep under
 #                          C:\Windows\System32\config\systemprofile\.cache\act\<hash>\hostexecutor\,
 #                          so the default target\ path blows past Windows' MAX_PATH (260) inside the
@@ -34,8 +32,8 @@
 #   - FFMPEG_DIR           per-arch FFmpeg import libs (x64 vs arm64 tree).
 #
 # Steps use `shell: pwsh` (PowerShell 7) deliberately: Windows PowerShell 5.1's
-# `Out-File -Encoding utf8` prepends a UTF-8 BOM that corrupts the first GITHUB_ENV line (the
-# CARGO_WORKSPACE_DIR var silently never gets set -> reactor build.rs panics). pwsh writes no BOM.
+# `Out-File -Encoding utf8` prepends a UTF-8 BOM that corrupts the first GITHUB_ENV line (that
+# var silently never gets set). pwsh writes no BOM.
 # The runner's daemon wrapper puts C:\Program Files\PowerShell\7 on PATH so the job finds pwsh.
 name: windows
 # One pending run per workflow+ref: a newer push supersedes the queued/running one and cancels
@@ -105,7 +103,6 @@ jobs:
       - name: Configure + toolchain versions
         shell: pwsh
         run: |
-          "CARGO_WORKSPACE_DIR=$env:GITHUB_WORKSPACE" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           # Per-arch short target root (dodges MAX_PATH; keeps the two legs from sharing target\).
           $td = if ('${{ matrix.target }}' -eq 'aarch64-pc-windows-msvc') { 'C:\t-a64' } else { 'C:\t' }
           "CARGO_TARGET_DIR=$td" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8

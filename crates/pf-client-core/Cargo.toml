@@ -58,19 +58,20 @@ sdl3 = { version = "0.18", features = ["hidapi", "build-from-source"] }
 # D3D11VA decode (video_d3d11.rs): device/adapter selection, DXVA probes, and the shared
 # NT-handle hand-off ring. Same pinned rev as clients/windows so the workspace builds ONE
 # windows-rs.
-windows = { git = "https://github.com/microsoft/windows-rs", rev = "a4f7b2cb7c63c6bb7fc77a2affe57145be1d8c4f", features = [
-    "Win32_Foundation",
-    "Win32_Graphics_Direct3D",
-    "Win32_Graphics_Direct3D11",
-    "Win32_Graphics_Dxgi",
-    "Win32_Graphics_Dxgi_Common",
-    # IDXGIResource1::CreateSharedHandle takes an optional SECURITY_ATTRIBUTES — the
-    # method itself is feature-gated behind this.
-    "Win32_Security",
+windows = { git = "https://github.com/microsoft/windows-rs", rev = "acb5a1a7441033d9312b16842af02eb0c2b403dc", features = [
+    # Features are header-named since windows-rs generates from the SDK headers directly
+    # (#4689) — one feature per header, replacing the old `Win32_*` namespace features.
+    "d3d11",
+    "d3dcommon",
+    "dxgi",
+    "handleapi",
+    # IDXGIResource1::CreateSharedHandle takes an optional SECURITY_ATTRIBUTES.
+    "minwinbase",
+    # The GlobalAlloc block the clipboard takes ownership of (clipboard.rs).
+    "winbase",
     # The OS-clipboard bridge (clipboard.rs): Open/Get/SetClipboardData + the sequence
-    # number, and the GlobalAlloc block the clipboard takes ownership of.
-    "Win32_System_DataExchange",
-    "Win32_System_Memory",
+    # number — all in winuser now.
+    "winuser",
 ] }
 
 [features]
