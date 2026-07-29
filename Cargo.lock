@@ -951,6 +951,7 @@ version = "0.21.0"
 dependencies = [
  "anyhow",
  "pf-capture",
+ "pf-frame",
  "pf-inject",
  "pf-vdisplay",
  "punktfunk-core",
