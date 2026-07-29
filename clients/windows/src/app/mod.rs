@@ -269,8 +269,12 @@ fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
     // The profile a Delete… click is asking about; `Some` renders the confirmation. Root state
     // because this page stays hook-free (its handlers are wired in the reactor backend).
     let (settings_delete, set_settings_delete) = cx.use_async_state(Option::<String>::None);
+    // Whether the Edit-profile modal is up. Root state for the reactor-backend-handler reason
+    // above; guarded in the page so it only renders while a profile is actually in scope.
+    let (settings_edit, set_settings_edit) = cx.use_async_state(false);
     // Bumped when a settings edit changes what the page should SHOW without changing any state
-    // it already reads — resetting an override, which rewrites the catalog behind the controls.
+    // it already reads — ANY edit through `settings::commit` (creating an override must surface
+    // its marker as immediately as resetting one clears it), a reset, a profile colour change.
     // Root state comparison makes same-value calls free, so a counter is what forces the pass.
     let (settings_rev, set_settings_rev) = cx.use_async_state(0u64);
     // `punktfunk://` links: the receiver thread queues them (from this launch's argv, or from a
@@ -615,6 +619,8 @@ fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
             &set_settings_scope,
             &settings_delete,
             &set_settings_delete,
+            settings_edit,
+            &set_settings_edit,
             settings_rev,
             &set_settings_rev,
             nav_progress,

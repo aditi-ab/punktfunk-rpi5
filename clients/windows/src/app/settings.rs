@@ -115,9 +115,6 @@ const COMPOSITORS: &[(&str, &str)] = &[
 /// layer, and a real id can never collide with it (ids are 12 hex chars).
 const NEW_PROFILE: &str = "\u{1}new";
 
-/// Rename / duplicate / delete for the profile in scope. Rename is a text box rather than a
-/// modal because this toolkit's ContentDialog is text-only (the same constraint that put the
-/// host editor in a tile); it commits on change, which is how every other control here works.
 /// The chip palette a profile can carry (`StreamProfile.accent`), same set as the GTK client so
 /// a profile looks the same on both. Eight legible colours rather than a free picker: the job is
 /// telling profiles apart at a glance on a host tile, and the schema still accepts any
@@ -196,10 +193,18 @@ fn colour_swatches(profile: &StreamProfile, rev: u64, set_rev: &AsyncSetState<u6
     hstack(row).spacing(8.0).into()
 }
 
-fn profile_actions(
+/// The Edit-profile modal: a scrim + centered card, the same in-tree overlay the Add-host
+/// modal uses (ContentDialog is text-only in windows-reactor — no room for a text field or
+/// the swatch row). Every control in it commits in place, exactly like the settings rows, so
+/// the modal needs no draft state and Close is the only way out — there is nothing to cancel.
+/// The one deferred repaint is the profile NAME: renaming commits as you type but the pane's
+/// scope dropdown refreshes on Close (one revision bump), so the ComboBox is not remounted
+/// under the user mid-keystroke.
+fn edit_profile_modal(
     profile: &StreamProfile,
     set_scope: &AsyncSetState<String>,
     set_delete: &AsyncSetState<Option<String>>,
+    set_edit: &AsyncSetState<bool>,
     rev: u64,
     set_rev: &AsyncSetState<u64>,
 ) -> Element {
@@ -207,6 +212,7 @@ fn profile_actions(
     let name_box = {
         let id = id.clone();
         text_box(&profile.name)
+            .header("Name")
             .placeholder_text("Profile name")
             .on_text_changed(move |t: String| {
                 let name = t.trim().to_string();
@@ -242,6 +248,7 @@ fn profile_actions(
             let new_id = copy.id.clone();
             catalog.profiles.push(copy);
             if catalog.save().is_ok() {
+                // The modal stays open and now edits the copy — scope follows it.
                 set_scope.call(new_id);
             }
         })
@@ -250,15 +257,49 @@ fn profile_actions(
         let (id, set_delete) = (id.clone(), set_delete.clone());
         button("Delete\u{2026}").on_click(move || set_delete.call(Some(id.clone())))
     };
-    described(
+    let close = {
+        let (set_edit, set_rev) = (set_edit.clone(), set_rev.clone());
+        button("Close").accent().on_click(move || {
+            set_edit.call(false);
+            // The deferred repaint: the pane dropdown (and any pinned tiles) pick up the
+            // rename now, in one pass, instead of remounting per keystroke.
+            set_rev.call(rev + 1);
+        })
+    };
+    let modal = dialog_surface(
         vstack((
+            text_block("Edit profile").font_size(20.0).bold(),
             name_box,
             colour_swatches(profile, rev, set_rev),
-            hstack((duplicate, delete)).spacing(8.0),
+            text_block(
+                "A profile overrides only what you change while it is selected; everything \
+                 else follows Default settings. Renaming applies as you type. Deleting leaves \
+                 hosts that used it on Default settings.",
+            )
+            .font_size(12.0)
+            .wrap()
+            .foreground(ThemeRef::SecondaryText),
+            hstack((duplicate, delete, close))
+                .spacing(8.0)
+                .horizontal_alignment(HorizontalAlignment::Right)
+                .margin(edges(0.0, 6.0, 0.0, 0.0)),
         ))
-        .spacing(10.0),
-        "Renaming applies as you type. Deleting leaves hosts that used it on Default settings.",
+        .spacing(12.0),
     )
+    .max_width(420.0)
+    .horizontal_alignment(HorizontalAlignment::Center)
+    .vertical_alignment(VerticalAlignment::Center)
+    .margin(uniform(24.0));
+    // The scrim fills the cell and is hit-testable, so it blocks the page behind; it closes
+    // only via the buttons (a scrim tap would bubble `Tapped` up from the card too).
+    border(modal)
+        .background(Color {
+            a: 140,
+            r: 0,
+            g: 0,
+            b: 0,
+        })
+        .into()
 }
 
 /// Persist one control's edit into the layer being edited.
@@ -268,11 +309,25 @@ fn profile_actions(
 /// before and after instead, and [`SettingsOverlay::absorb`] records the field that moved —
 /// the comparison is against what the control was SHOWING, so picking a value that happens to
 /// equal the global still records an override (the pin the design asks for).
-fn commit(ctx: &Arc<AppCtx>, scope: &str, edit: impl FnOnce(&mut Settings)) {
+///
+/// Every commit ends by bumping the revision: a profile-scope edit changes what the page
+/// should SHOW (the row's Overridden marker, the catalog behind the controls) without
+/// changing any state the page reads, so without the bump no render pass runs and the
+/// marker only appears after some unrelated re-render — the exact bug the Linux client
+/// fixed in "the override marker appears on touch". Bumping on global-scope edits too is
+/// deliberate: it is one code path, a same-value repaint is cheap, and it also refreshes
+/// rows whose displayed effective value derives from the field just written.
+fn commit(
+    ctx: &Arc<AppCtx>,
+    scope: &str,
+    rev: (u64, &AsyncSetState<u64>),
+    edit: impl FnOnce(&mut Settings),
+) {
     if scope.is_empty() {
         let mut s = ctx.settings.lock().unwrap();
         edit(&mut s);
         s.save();
+        rev.1.call(rev.0 + 1);
         return;
     }
     let mut catalog = ProfilesFile::load();
@@ -287,6 +342,7 @@ fn commit(ctx: &Arc<AppCtx>, scope: &str, edit: impl FnOnce(&mut Settings)) {
     if let Err(e) = catalog.save() {
         tracing::warn!(error = %format!("{e:#}"), "saving the profile catalog");
     }
+    rev.1.call(rev.0 + 1);
 }
 
 /// Which tier-P rows the profile in scope overrides. Plain bools rather than a lookup so the
@@ -349,18 +405,22 @@ fn active_profile(scope: &str) -> Option<StreamProfile> {
 fn setting_combo(
     ctx: &Arc<AppCtx>,
     scope: &str,
+    rev: (u64, &AsyncSetState<u64>),
     header: &str,
     names: Vec<String>,
     current: usize,
     apply: impl Fn(&mut Settings, usize) + 'static,
 ) -> ComboBox {
     let (ctx, scope) = (ctx.clone(), scope.to_string());
+    let (rev, set_rev) = (rev.0, rev.1.clone());
     let max = names.len().saturating_sub(1);
     ComboBox::new(names)
         .header(header)
         .selected_index(current as i32)
         .on_selection_changed(move |i: i32| {
-            commit(&ctx, &scope, |s| apply(s, (i.max(0) as usize).min(max)));
+            commit(&ctx, &scope, (rev, &set_rev), |s| {
+                apply(s, (i.max(0) as usize).min(max));
+            });
         })
 }
 
@@ -375,17 +435,19 @@ fn presets<V>(table: &[(V, &str)], is_current: impl Fn(&V) -> bool) -> (Vec<Stri
 fn setting_toggle(
     ctx: &Arc<AppCtx>,
     scope: &str,
+    rev: (u64, &AsyncSetState<u64>),
     header: &str,
     on: bool,
     apply: impl Fn(&mut Settings, bool) + 'static,
 ) -> ToggleSwitch {
     let (ctx, scope) = (ctx.clone(), scope.to_string());
+    let (rev, set_rev) = (rev.0, rev.1.clone());
     ToggleSwitch::new(on)
         .header(header)
         .on_content("On")
         .off_content("Off")
         .on_toggled(move |v: bool| {
-            commit(&ctx, &scope, |s| apply(s, v));
+            commit(&ctx, &scope, (rev, &set_rev), |s| apply(s, v));
         })
 }
 
@@ -397,9 +459,12 @@ fn setting_toggle(
 /// the Apple client both do it. Width-capped for the same reason Apple caps at 360pt: a
 /// full-width caption runs into the control column and the whole cell reads as one block.
 /// [`described`], plus the override marker and reset a profile-scope row carries: the caption
-/// says the profile changes this one, and the button is the only way back to inheriting —
-/// overrides are recorded on touch and never inferred from a value comparison, so "not
-/// overridden" needs an explicit act.
+/// says the profile changes this one, and the button is the only way back to inheriting.
+/// An override is recorded when a control's committed value differs from what it was
+/// SHOWING (`SettingsOverlay::absorb` diffs against the effective snapshot — see `commit`);
+/// WinUI change events don't fire on a no-op re-selection, so every reachable edit marks
+/// its row, and "not overridden" needs an explicit Reset. (Linux marks a literal no-op
+/// touch too — unobservable here, the one intentional divergence.)
 fn described_overridable(
     rev: (u64, &AsyncSetState<u64>),
     scope: &str,
@@ -510,6 +575,8 @@ pub(crate) fn settings_page(
     set_scope: &AsyncSetState<String>,
     delete_pending: &Option<String>,
     set_delete: &AsyncSetState<Option<String>>,
+    edit_open: bool,
+    set_edit: &AsyncSetState<bool>,
     rev: u64,
     set_rev: &AsyncSetState<u64>,
     progress: f64,
@@ -525,9 +592,8 @@ pub(crate) fn settings_page(
     // Which rows this profile overrides — the marker + reset each of them carries. In the
     // defaults scope nothing is marked, and `described_overridable` degrades to `described`.
     let over = OverrideFlags::of(active.as_ref());
-    let _ = rev; // read via the closures below; the value itself only forces the re-render
-                 // Every control shows the EFFECTIVE value: the global underneath with this profile's
-                 // overrides on top, so a row the profile doesn't override reads as the live global.
+    // Every control shows the EFFECTIVE value: the global underneath with this profile's
+    // overrides on top, so a row the profile doesn't override reads as the live global.
     let s = {
         let base = ctx.settings.lock().unwrap().clone();
         match &active {
@@ -560,10 +626,18 @@ pub(crate) fn settings_page(
         };
         (names, i)
     };
-    let res_combo = setting_combo(ctx, scope, "Resolution", res_names, res_i, |s, i| {
-        s.match_window = i == 1;
-        (s.width, s.height) = if i <= 1 { (0, 0) } else { RESOLUTIONS[i - 1] };
-    });
+    let res_combo = setting_combo(
+        ctx,
+        scope,
+        (rev, set_rev),
+        "Resolution",
+        res_names,
+        res_i,
+        |s, i| {
+            s.match_window = i == 1;
+            (s.width, s.height) = if i <= 1 { (0, 0) } else { RESOLUTIONS[i - 1] };
+        },
+    );
     let (hz_names, hz_i) = {
         let names: Vec<String> = REFRESH
             .iter()
@@ -578,9 +652,17 @@ pub(crate) fn settings_page(
         let i = REFRESH.iter().position(|&r| r == s.refresh_hz).unwrap_or(0);
         (names, i)
     };
-    let hz_combo = setting_combo(ctx, scope, "Refresh rate", hz_names, hz_i, |s, i| {
-        s.refresh_hz = REFRESH[i];
-    });
+    let hz_combo = setting_combo(
+        ctx,
+        scope,
+        (rev, set_rev),
+        "Refresh rate",
+        hz_names,
+        hz_i,
+        |s, i| {
+            s.refresh_hz = REFRESH[i];
+        },
+    );
     let (scale_names, scale_i) = {
         let names: Vec<String> = RENDER_SCALES
             .iter()
@@ -592,20 +674,41 @@ pub(crate) fn settings_page(
             .unwrap_or_else(|| RENDER_SCALES.iter().position(|&x| x == 1.0).unwrap());
         (names, i)
     };
-    let scale_combo = setting_combo(ctx, scope, "Render scale", scale_names, scale_i, |s, i| {
-        s.render_scale = RENDER_SCALES[i];
-    });
+    let scale_combo = setting_combo(
+        ctx,
+        scope,
+        (rev, set_rev),
+        "Render scale",
+        scale_names,
+        scale_i,
+        |s, i| {
+            s.render_scale = RENDER_SCALES[i];
+        },
+    );
     let (comp_names, comp_i) = presets(COMPOSITORS, |v| *v == s.compositor);
-    let comp_combo = setting_combo(ctx, scope, "Host compositor", comp_names, comp_i, |s, i| {
-        s.compositor = COMPOSITORS[i].0.to_string();
-    });
-    let auto_wake_toggle =
-        setting_toggle(ctx, scope, "Auto-wake on connect", s.auto_wake, |s, on| {
-            s.auto_wake = on
-        });
+    let comp_combo = setting_combo(
+        ctx,
+        scope,
+        (rev, set_rev),
+        "Host compositor",
+        comp_names,
+        comp_i,
+        |s, i| {
+            s.compositor = COMPOSITORS[i].0.to_string();
+        },
+    );
+    let auto_wake_toggle = setting_toggle(
+        ctx,
+        scope,
+        (rev, set_rev),
+        "Auto-wake on connect",
+        s.auto_wake,
+        |s, on| s.auto_wake = on,
+    );
     let fullscreen_toggle = setting_toggle(
         ctx,
         scope,
+        (rev, set_rev),
         "Start streams fullscreen",
         s.fullscreen_on_stream,
         |s, on| s.fullscreen_on_stream = on,
@@ -613,9 +716,17 @@ pub(crate) fn settings_page(
 
     // --- Video -----------------------------------------------------------------------------
     let (dec_names, dec_i) = presets(DECODERS, |v| *v == s.decoder);
-    let decoder_combo = setting_combo(ctx, scope, "Video decoder", dec_names, dec_i, |s, i| {
-        s.decoder = DECODERS[i].0.to_string();
-    });
+    let decoder_combo = setting_combo(
+        ctx,
+        scope,
+        (rev, set_rev),
+        "Video decoder",
+        dec_names,
+        dec_i,
+        |s, i| {
+            s.decoder = DECODERS[i].0.to_string();
+        },
+    );
     // GPU picker, only on a multi-GPU box (hybrid laptop, eGPU): which adapter decodes + presents.
     // Stored as the adapter description; empty = automatic (the window's monitor's adapter).
     let gpus = crate::gpu::adapter_names();
@@ -627,34 +738,53 @@ pub(crate) fn settings_page(
             .position(|n| *n == s.adapter)
             .map_or(0, |i| i + 1);
         let gpus = gpus.clone();
-        setting_combo(ctx, scope, "GPU", names, current, move |s, i| {
-            s.adapter = if i == 0 {
-                String::new()
-            } else {
-                gpus[i - 1].clone()
-            };
-        })
+        setting_combo(
+            ctx,
+            scope,
+            (rev, set_rev),
+            "GPU",
+            names,
+            current,
+            move |s, i| {
+                s.adapter = if i == 0 {
+                    String::new()
+                } else {
+                    gpus[i - 1].clone()
+                };
+            },
+        )
     });
     let (codec_names, codec_i) = presets(CODECS, |v| *v == s.codec);
-    let codec_combo = setting_combo(ctx, scope, "Video codec", codec_names, codec_i, |s, i| {
-        s.codec = CODECS[i].0.to_string();
-    });
+    let codec_combo = setting_combo(
+        ctx,
+        scope,
+        (rev, set_rev),
+        "Video codec",
+        codec_names,
+        codec_i,
+        |s, i| {
+            s.codec = CODECS[i].0.to_string();
+        },
+    );
     // Free-form Mb/s (0 = host default) instead of presets, so a speed-test recommendation
-    // round-trips exactly.
+    // round-trips exactly. Through `commit` like every other row: writing `ctx.settings`
+    // directly here would edit the GLOBAL defaults from inside a profile scope (and record
+    // no override, so the row could never say "Overridden here").
     let bitrate_box = {
-        let ctx = ctx.clone();
+        let (ctx, scope, set_rev) = (ctx.clone(), scope.to_string(), set_rev.clone());
         NumberBox::new(f64::from(s.bitrate_kbps) / 1000.0)
             .header("Bitrate (Mb/s, 0 = automatic)")
             .range(0.0, 3000.0)
             .on_value_changed(move |v: f64| {
-                let mut s = ctx.settings.lock().unwrap();
-                s.bitrate_kbps = (v.clamp(0.0, 3000.0) * 1000.0) as u32;
-                s.save();
+                commit(&ctx, &scope, (rev, &set_rev), |s| {
+                    s.bitrate_kbps = (v.clamp(0.0, 3000.0) * 1000.0) as u32;
+                });
             })
     };
     let hdr_toggle = setting_toggle(
         ctx,
         scope,
+        (rev, set_rev),
         "HDR (10-bit, BT.2020 PQ)",
         s.hdr_enabled,
         |s, on| s.hdr_enabled = on,
@@ -707,20 +837,45 @@ pub(crate) fn settings_page(
     let (pad_names, pad_i) = presets(GAMEPADS, |v| {
         GamepadPref::from_name(v) == GamepadPref::from_name(&s.gamepad)
     });
-    let pad_combo = setting_combo(ctx, scope, "Gamepad type", pad_names, pad_i, |s, i| {
-        s.gamepad = GAMEPADS[i].0.to_string();
-    });
+    let pad_combo = setting_combo(
+        ctx,
+        scope,
+        (rev, set_rev),
+        "Gamepad type",
+        pad_names,
+        pad_i,
+        |s, i| {
+            s.gamepad = GAMEPADS[i].0.to_string();
+        },
+    );
     let (touch_names, touch_i) = presets(TOUCH_MODES, |v| *v == s.touch_mode);
-    let touch_combo = setting_combo(ctx, scope, "Touch input", touch_names, touch_i, |s, i| {
-        s.touch_mode = TOUCH_MODES[i].0.to_string();
-    });
+    let touch_combo = setting_combo(
+        ctx,
+        scope,
+        (rev, set_rev),
+        "Touch input",
+        touch_names,
+        touch_i,
+        |s, i| {
+            s.touch_mode = TOUCH_MODES[i].0.to_string();
+        },
+    );
     let (mouse_names, mouse_i) = presets(MOUSE_MODES, |v| *v == s.mouse_mode);
-    let mouse_combo = setting_combo(ctx, scope, "Mouse input", mouse_names, mouse_i, |s, i| {
-        s.mouse_mode = MOUSE_MODES[i].0.to_string();
-    });
+    let mouse_combo = setting_combo(
+        ctx,
+        scope,
+        (rev, set_rev),
+        "Mouse input",
+        mouse_names,
+        mouse_i,
+        |s, i| {
+            s.mouse_mode = MOUSE_MODES[i].0.to_string();
+        },
+    );
     let invert_scroll_toggle = setting_toggle(
         ctx,
         scope,
+        (rev, set_rev),
         "Invert scroll direction",
         s.invert_scroll,
         |s, on| s.invert_scroll = on,
@@ -728,6 +883,7 @@ pub(crate) fn settings_page(
     let shortcuts_toggle = setting_toggle(
         ctx,
         scope,
+        (rev, set_rev),
         "Capture system shortcuts (Alt+Tab, Win, \u{2026})",
         s.inhibit_shortcuts,
         |s, on| s.inhibit_shortcuts = on,
@@ -735,12 +891,21 @@ pub(crate) fn settings_page(
 
     // --- Audio -----------------------------------------------------------------------------
     let (ac_names, ac_i) = presets(AUDIO_CHANNELS, |v| *v == s.audio_channels);
-    let channels_combo = setting_combo(ctx, scope, "Audio channels", ac_names, ac_i, |s, i| {
-        s.audio_channels = AUDIO_CHANNELS[i].0;
-    });
+    let channels_combo = setting_combo(
+        ctx,
+        scope,
+        (rev, set_rev),
+        "Audio channels",
+        ac_names,
+        ac_i,
+        |s, i| {
+            s.audio_channels = AUDIO_CHANNELS[i].0;
+        },
+    );
     let mic_toggle = setting_toggle(
         ctx,
         scope,
+        (rev, set_rev),
         "Stream microphone to the host",
         s.mic_enabled,
         |s, on| s.mic_enabled = on,
@@ -750,6 +915,7 @@ pub(crate) fn settings_page(
     let hud_combo = setting_combo(
         ctx,
         scope,
+        (rev, set_rev),
         "Stats overlay (HUD)",
         hud_names,
         hud_i,
@@ -765,6 +931,7 @@ pub(crate) fn settings_page(
     let library_toggle = setting_toggle(
         ctx,
         scope,
+        (rev, set_rev),
         "Show game library (experimental)",
         s.library_enabled,
         |s, on| s.library_enabled = on,
@@ -1107,8 +1274,11 @@ pub(crate) fn settings_page(
     // left inset belongs to WinUI's own template (a string prop is all we can set), so it
     // sat noticeably right of the cards under it. In the content column it shares the cards'
     // left edge by construction.
-    // The scope switcher sits above the section title, so it reads as "which layer all of
-    // this belongs to" rather than as one section's setting.
+    // The scope switcher lives in the NavigationView's PANE FOOTER: it is chrome ("which
+    // layer am I editing"), visible from every section, and down there it reads as part of
+    // the navigation rather than as one more settings row — a bar of profile controls above
+    // the whole surface read as clutter. Editing the profile itself (name, colour, delete)
+    // is a modal behind the "Edit profile…" button, not inline chrome.
     let catalog = ProfilesFile::load();
     let mut scope_names = vec!["Default settings".to_string()];
     let mut scope_ids: Vec<String> = vec![String::new()];
@@ -1119,50 +1289,56 @@ pub(crate) fn settings_page(
     scope_names.push("New profile\u{2026}".to_string());
     scope_ids.push(NEW_PROFILE.to_string());
     let scope_i = scope_ids.iter().position(|i| i == scope).unwrap_or(0);
-    let switcher = described(
-        ComboBox::new(scope_names)
-            .header("Editing")
-            .selected_index(scope_i as i32)
-            .on_selection_changed({
-                let (set_scope, ids) = (set_scope.clone(), scope_ids.clone());
-                move |i: i32| {
-                    let Some(id) = ids.get(i.max(0) as usize) else {
-                        return;
-                    };
-                    if id == NEW_PROFILE {
-                        // Creation needs no prompt here: WinUI's ContentDialog is text-only in
-                        // this toolkit, so a new profile takes an auto-numbered name and is
-                        // renamed from the row below — one fewer modal, same end state.
-                        let mut catalog = ProfilesFile::load();
-                        let name = (1..)
-                            .map(|n| format!("Profile {n}"))
-                            .find(|n| !catalog.name_taken(n, None))
-                            .unwrap_or_else(|| "Profile".to_string());
-                        let profile = StreamProfile::new(name);
-                        let new_id = profile.id.clone();
-                        catalog.profiles.push(profile);
-                        if catalog.save().is_ok() {
-                            set_scope.call(new_id);
-                        }
-                        return;
+    let switcher = ComboBox::new(scope_names.clone())
+        .header("Editing")
+        .selected_index(scope_i as i32)
+        .min_width(200.0)
+        .on_selection_changed({
+            let (set_scope, set_edit, ids) = (set_scope.clone(), set_edit.clone(), scope_ids);
+            move |i: i32| {
+                let Some(id) = ids.get(i.max(0) as usize) else {
+                    return;
+                };
+                if id == NEW_PROFILE {
+                    // A new profile takes an auto-numbered name and lands straight in the
+                    // Edit modal to be named — creation and naming are one gesture, and
+                    // there is no half-created state a Cancel would have to unwind.
+                    let mut catalog = ProfilesFile::load();
+                    let name = (1..)
+                        .map(|n| format!("Profile {n}"))
+                        .find(|n| !catalog.name_taken(n, None))
+                        .unwrap_or_else(|| "Profile".to_string());
+                    let profile = StreamProfile::new(name);
+                    let new_id = profile.id.clone();
+                    catalog.profiles.push(profile);
+                    if catalog.save().is_ok() {
+                        set_scope.call(new_id);
+                        set_edit.call(true);
                     }
-                    set_scope.call(id.clone());
+                    return;
                 }
-            }),
-        "A profile overrides only what you change while it is selected; everything else \
-         follows Default settings.",
-    );
-    // The switcher is CHROME, not a setting: it belongs above the whole surface, so it reads as
-    // "which layer am I editing" and is visible from every section. Inside the section content
-    // it looked like one more row — and on the About page, where there are barely any rows, it
-    // looked like it lived there.
-    let mut bar_rows: Vec<Element> = vec![switcher];
-    if let Some(p) = &active {
-        bar_rows.push(profile_actions(p, set_scope, set_delete, rev, set_rev));
+                set_scope.call(id.clone());
+            }
+        });
+    let mut footer_rows: Vec<Element> = vec![switcher.into()];
+    if profile_mode {
+        let set_edit = set_edit.clone();
+        footer_rows.push(
+            button("Edit profile\u{2026}")
+                .on_click(move || set_edit.call(true))
+                .into(),
+        );
     }
-    let scope_bar = card(vstack(bar_rows).spacing(10.0))
-        .margin(edges(24.0, 12.0, 24.0, 0.0))
-        .into();
+    // Keyed by scope + the name list: a rename/create/delete changes the ComboBox's items,
+    // and an in-place diff re-sets items (clearing WinUI's selection) while skipping
+    // `selected_index` when it compares equal — the combo then renders blank. A remount
+    // applies every prop. The keyed child sits inside a plain vstack because only a panel's
+    // child list takes the keyed path (same rule as the content column below).
+    let footer = vstack(vec![vstack(footer_rows)
+        .spacing(8.0)
+        .with_key(format!("{scope}\u{1}{}", scope_names.join("\u{1}")))
+        .into()])
+    .margin(edges(16.0, 0.0, 16.0, 12.0));
 
     let titled: Vec<Element> = std::iter::once(
         text_block(title)
@@ -1226,7 +1402,12 @@ pub(crate) fn settings_page(
                 if pinned == 1 { "" } else { "s" }
             ));
         }
-        let (id, set_scope, set_delete) = (p.id.clone(), set_scope.clone(), set_delete.clone());
+        let (id, set_scope, set_delete, set_edit) = (
+            p.id.clone(),
+            set_scope.clone(),
+            set_delete.clone(),
+            set_edit.clone(),
+        );
         Some(
             ContentDialog::new("Delete profile?")
                 .content(body)
@@ -1245,6 +1426,9 @@ pub(crate) fn settings_page(
                     // second, racier source of truth.
                     if catalog.save().is_ok() {
                         set_scope.call(String::new());
+                        // The profile the Edit modal was showing is gone — without this, the
+                        // still-armed flag would pop the modal open on the NEXT profile pick.
+                        set_edit.call(false);
                     }
                 })
                 .into(),
@@ -1252,6 +1436,7 @@ pub(crate) fn settings_page(
     });
     let nav = NavigationView::new(items, content)
         .pane_title("Settings")
+        .pane_footer(footer)
         .selected_tag(section)
         .on_selection_changed({
             let ss = set_section.clone();
@@ -1263,7 +1448,17 @@ pub(crate) fn settings_page(
             let ss = set_screen.clone();
             move || ss.call(Screen::Hosts)
         });
-    let mut surface: Vec<Element> = vec![scope_bar, nav.into()];
+    // The Edit-profile modal overlays the whole NavigationView (scrim + card), and the delete
+    // confirmation — a ContentDialog, so its own WinUI layer — can sit above either.
+    let mut layers: Vec<Element> = vec![nav.into()];
+    if edit_open {
+        if let Some(p) = &active {
+            layers.push(edit_profile_modal(
+                p, set_scope, set_delete, set_edit, rev, set_rev,
+            ));
+        }
+    }
+    let mut surface: Vec<Element> = vec![grid(layers).into()];
     if let Some(dialog) = confirm {
         surface.push(dialog);
     }
