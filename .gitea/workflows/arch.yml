@@ -112,11 +112,26 @@ jobs:
         # vX.Y.Z tag -> X.Y.Z-1 in the `punktfunk` repo; main push -> <next-minor>-0.<run#> in
         # `punktfunk-canary` (pkgrel accepts only digits+dots — the run number carries the
         # monotonic ordering; the commit sha is stamped into the binary via the workflow log).
+        #
+        # The run number is ZERO-PADDED to a fixed width, and that padding is load-bearing.
+        # pacman's own vercmp compares numeric segments numerically and gets this right either
+        # way, but Gitea's Arch registry picks the version it advertises in `punktfunk-canary.db`
+        # by STRING order. Unpadded, the run counter crossing a power of ten inverts that order
+        # ("0.9907" > "0.10095" because '9' > '1'), so the db pins itself to the last build
+        # before the rollover and every later canary becomes invisible to `pacman -Syu` — the
+        # packages publish fine, the index just never names them. That is exactly what happened
+        # on 2026-07-29 when run #10000 landed; it cost an evening and needed a manual purge of
+        # every 4-digit `0.22.0-0.9xxx` version to unstick. Padding keeps string order and
+        # numeric order in agreement, so the two can never disagree again.
+        #
+        # Keep the leading `0.` — it is what sorts a canary BELOW the eventual `X.Y.Z-1` stable
+        # release. (A pkgrel is digits+dots only, so `0.` is the only prefix available; raising
+        # it to `1.` would sort canaries ABOVE the release and is not an option.)
         run: |
           eval "$(bash scripts/ci/pf-version.sh)"   # -> PF_BASE (one minor ahead of latest stable)
           case "$GITHUB_REF" in
             refs/tags/v*) V="${GITHUB_REF_NAME#v}"; R="1";                       REPO=punktfunk ;;
-            *)            V="$PF_BASE";             R="0.${GITHUB_RUN_NUMBER}";  REPO=punktfunk-canary ;;
+            *)            V="$PF_BASE";  R="0.$(printf '%08d' "$GITHUB_RUN_NUMBER")";  REPO=punktfunk-canary ;;
           esac
           echo "PF_PKGVER=$V" >> "$GITHUB_ENV"
           echo "PF_PKGREL=$R" >> "$GITHUB_ENV"
