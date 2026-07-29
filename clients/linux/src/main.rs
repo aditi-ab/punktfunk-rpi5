@@ -8,7 +8,7 @@
 // The UI-agnostic plumbing lives in `pf-client-core`, shared with the session binary.
 // Root re-exports keep every `crate::trust`-style path resolving unchanged.
 #[cfg(target_os = "linux")]
-pub use pf_client_core::{discovery, gamepad, library, trust, video, wol};
+pub use pf_client_core::{discovery, gamepad, library, os, trust, video, wol};
 
 #[cfg(target_os = "linux")]
 mod app;

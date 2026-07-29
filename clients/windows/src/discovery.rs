@@ -18,6 +18,10 @@ pub struct DiscoveredHost {
     /// Wake-on-LAN MAC(s) from the mDNS `mac` TXT (comma-separated `aa:bb:cc:dd:ee:ff`), which the
     /// hosts page persists onto the matching saved host so it can wake it later. Empty if absent.
     pub mac: Vec<String>,
+    /// The host's OS-identity chain from the mDNS `os` TXT (`windows` | `macos` |
+    /// `linux[/<family>][/<id>]`), sanitized — drives the host tile's OS mark and is
+    /// persisted like `mac`. Empty if absent (older host).
+    pub os: String,
 }
 
 /// Browse continuously for the app's lifetime. The thread exits when the receiver is
@@ -71,6 +75,7 @@ pub fn browse() -> async_channel::Receiver<DiscoveredHost> {
                             .map(|s| s.trim().to_string())
                             .filter(|s| !s.is_empty())
                             .collect(),
+                        os: pf_client_core::os::sanitize_os(&val("os")),
                     };
                     if tx.send_blocking(host).is_err() {
                         break; // UI gone — stop browsing

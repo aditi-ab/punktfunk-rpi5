@@ -25,6 +25,7 @@ mod help;
 mod hosts;
 mod library;
 mod licenses;
+mod os_icons;
 mod pair;
 mod settings;
 mod speed;
@@ -152,6 +153,8 @@ pub struct AppCtx {
 }
 
 pub fn run(identity: (String, String), gamepad: GamepadService) -> windows_reactor::Result<()> {
+    // The host tiles' OS marks load as file:/// URIs — put the embedded PNGs on disk first.
+    os_icons::install();
     let ctx = Arc::new(AppCtx {
         identity,
         settings: Mutex::new(Settings::load()),

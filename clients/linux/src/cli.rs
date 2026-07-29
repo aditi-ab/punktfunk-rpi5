@@ -283,6 +283,7 @@ pub fn headless_list_hosts() -> glib::ExitCode {
                 "fp_hex": h.fp_hex,
                 "paired": h.paired,
                 "mac": h.mac,
+                "os": h.os,
                 "last_used": h.last_used,
                 "online": online.as_ref().map(|v| serde_json::Value::Bool(v[i]))
                     .unwrap_or(serde_json::Value::Null),
@@ -508,6 +509,7 @@ pub fn run_shot(ctx: &ShotCtx, scene: &str) {
             pair: "required".to_string(),
             mgmt_port: None,
             mac: Vec::new(),
+            os: "linux/arch/steamos".to_string(),
         };
 
     // What the self-capture renders: the main window, except for scenes that open their

@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- The shell's embedded icon assets: the host-card OS marks (derived from the
+     assets/os-icons masters; see that directory's README for provenance/licensing).
+     Registered under the hicolor-style layout IconTheme::add_resource_path expects. -->
+<gresources>
+  <gresource prefix="/io/unom/Punktfunk">
+    <file>icons/scalable/actions/pf-os-windows-symbolic.svg</file>
+    <file>icons/scalable/actions/pf-os-apple-symbolic.svg</file>
+    <file>icons/scalable/actions/pf-os-linux-symbolic.svg</file>
+    <file>icons/scalable/actions/pf-os-steam-symbolic.svg</file>
+    <file>icons/scalable/actions/pf-os-ubuntu-symbolic.svg</file>
+    <file>icons/scalable/actions/pf-os-fedora-symbolic.svg</file>
+    <file>icons/scalable/actions/pf-os-arch-symbolic.svg</file>
+    <file>icons/scalable/actions/pf-os-debian-symbolic.svg</file>
+    <file>icons/scalable/actions/pf-os-nixos-symbolic.svg</file>
+    <file>icons/scalable/actions/pf-os-opensuse-symbolic.svg</file>
+  </gresource>
+</gresources>

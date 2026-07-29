@@ -179,6 +179,7 @@ impl SimpleComponent for AppModel {
             }
         };
         load_css();
+        install_os_icons();
         // Screenshot scenes must capture settled frames: kill every GTK/libadwaita
         // animation (a headless session may starve the frame clock and leave a
         // transition frozen mid-flight in the capture).
@@ -935,6 +936,19 @@ pub fn run() -> glib::ExitCode {
     let app = relm4::RelmApp::from_app(adw_app).with_args(args);
     app.run::<AppModel>(AppInit { gamepad });
     glib::ExitCode::SUCCESS
+}
+
+/// Register the embedded gresource (built by build.rs from `data/`) and point the icon
+/// theme at it, so the host cards' `pf-os-*-symbolic` OS marks resolve — and recolor —
+/// like any themed icon.
+fn install_os_icons() {
+    if let Err(e) = gio::resources_register_include!("punktfunk-client.gresource") {
+        tracing::warn!("register gresource: {e} — host cards lose their OS marks");
+        return;
+    }
+    if let Some(display) = gdk::Display::default() {
+        gtk::IconTheme::for_display(&display).add_resource_path("/io/unom/Punktfunk/icons");
+    }
 }
 
 fn load_css() {

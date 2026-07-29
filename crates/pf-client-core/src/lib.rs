@@ -41,6 +41,9 @@ pub mod deeplink;
 // state machine every front-end drives, and the session spawn + stdout contract.
 #[cfg(any(target_os = "linux", windows))]
 pub mod orchestrate;
+// The host's OS-identity chain (mDNS `os=` TXT): sanitize + icon-walk order. Pure string
+// logic, built everywhere (the Apple/Android ports mirror it rather than link it).
+pub mod os;
 // Client settings profiles: the override catalog + the one connect-time resolver
 // (design/client-settings-profiles.md §4). Sits beside `trust`, which owns the host records
 // the bindings live on.

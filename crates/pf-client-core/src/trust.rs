@@ -144,6 +144,11 @@ pub struct KnownHost {
     /// pre-existing stores load; empty until first learned.
     #[serde(default)]
     pub mac: Vec<String>,
+    /// The host's OS-identity chain (`windows` | `macos` | `linux[/<family>][/<id>]`) learned
+    /// from its mDNS `os` TXT while online, so the card's OS icon survives the host going to
+    /// sleep. `default` (and elided when empty) so pre-existing stores load unchanged.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub os: String,
     /// Share this machine's clipboard with THIS host (design/clipboard-and-file-transfer.md
     /// §5.3 — the Apple client's `StoredHost.clipboardSync`). Per-host, not global: handing a
     /// host your clipboard is a trust decision about that host. Default off; the host must
@@ -183,6 +188,7 @@ impl Default for KnownHost {
             paired: false,
             last_used: None,
             mac: Vec::new(),
+            os: String::new(),
             clipboard_sync: false,
             profile_id: None,
             pinned_profiles: Vec::new(),
@@ -290,6 +296,10 @@ impl KnownHosts {
             if !entry.mac.is_empty() {
                 h.mac = entry.mac;
             }
+            // Same rule for the learned OS chain: only an upsert that carries one moves it.
+            if !entry.os.is_empty() {
+                h.os = entry.os;
+            }
             // Everything below is state the user set ON this record, which a refresh (a
             // reconnect, a re-pair, a rediscovery) never carries and therefore must never
             // clear: the per-host clipboard decision — which survives today only because this
@@ -386,6 +396,28 @@ pub fn learn_mac(fp_hex: &str, addr: &str, port: u16, mac: &[String]) {
         return;
     }
     h.mac = mac.to_vec();
+    let _ = known.save();
+}
+
+/// Learn/refresh a saved host's OS-identity chain from its live advert (mDNS `os` TXT), matched
+/// like [`learn_mac`]: by fingerprint or address. No-op — and no disk write — when unchanged, so
+/// the hosts page can call it on every discovery tick without churning the store.
+pub fn learn_os(fp_hex: &str, addr: &str, port: u16, os: &str) {
+    if os.is_empty() {
+        return;
+    }
+    let mut known = KnownHosts::load();
+    let Some(h) = known
+        .hosts
+        .iter_mut()
+        .find(|h| (!fp_hex.is_empty() && h.fp_hex == fp_hex) || (h.addr == addr && h.port == port))
+    else {
+        return;
+    };
+    if h.os == os {
+        return;
+    }
+    h.os = os.to_string();
     let _ = known.save();
 }
 
@@ -1077,6 +1109,28 @@ mod tests {
         assert_eq!(h.last_used, None);
         assert_eq!(h.mac, vec!["aa:bb:cc:dd:ee:ff".to_string()]);
         assert!(parse_hex32(&h.fp_hex).is_some());
+        // A store predating the `os` field loads with it empty, and serializes back without
+        // the key (an older client reading the same file sees exactly what it wrote).
+        assert_eq!(h.os, "");
+        assert!(!serde_json::to_string(&k).unwrap().contains("\"os\""));
+    }
+
+    /// The learned OS chain round-trips, and an absent key stays absent — the same
+    /// back-compat contract as every late `KnownHost` field.
+    #[test]
+    fn known_hosts_os_chain_round_trips() {
+        let k = KnownHosts {
+            hosts: vec![KnownHost {
+                name: "HTPC".into(),
+                addr: "192.168.1.181".into(),
+                port: 9777,
+                os: "linux/fedora/bazzite".into(),
+                ..Default::default()
+            }],
+        };
+        let text = serde_json::to_string(&k).unwrap();
+        let back: KnownHosts = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.hosts[0].os, "linux/fedora/bazzite");
     }
 
     /// A pre-profiles known-hosts file loads unchanged — no binding, no pins — and its
@@ -1130,6 +1184,7 @@ mod tests {
                 paired: true,
                 last_used: Some(1000),
                 mac: vec!["aa:bb:cc:dd:ee:ff".into()],
+                os: "linux/fedora/bazzite".into(),
                 clipboard_sync: true,
                 profile_id: Some("aaaaaaaaaaaa".into()),
                 pinned_profiles: vec!["bbbbbbbbbbbb".into()],
@@ -1151,6 +1206,8 @@ mod tests {
         assert!(h.paired);
         assert_eq!(h.last_used, Some(1000));
         assert_eq!(h.mac, vec!["aa:bb:cc:dd:ee:ff".to_string()]);
+        // The learned OS chain rides the same rule as `mac`: a carrier-less upsert keeps it.
+        assert_eq!(h.os, "linux/fedora/bazzite");
         assert!(h.clipboard_sync);
         assert_eq!(h.profile_id.as_deref(), Some("aaaaaaaaaaaa"));
         assert_eq!(h.pinned_profiles, vec!["bbbbbbbbbbbb".to_string()]);

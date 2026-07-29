@@ -243,6 +243,7 @@ punktfunk:// link takes. Exit codes: 0 ok, 2 connect, 3 trust, 4 renderer, 5 not
                                 "fp_hex": h.fp_hex,
                                 "paired": h.paired,
                                 "mac": h.mac,
+                                "os": h.os,
                                 "last_used": h.last_used,
                                 "clipboard_sync": h.clipboard_sync,
                                 "profile": h.profile_id.as_ref()

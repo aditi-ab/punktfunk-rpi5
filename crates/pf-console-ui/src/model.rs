@@ -31,6 +31,10 @@ pub struct HostRow {
     pub can_wake: bool,
     /// Last successful connect (UNIX seconds) — the most-recent accent.
     pub last_used: Option<u64>,
+    /// The host's OS-identity chain (live advert preferred, else the stored one), for a
+    /// future tile OS glyph. Empty = unknown (older host). Plumbed now; drawing is a
+    /// follow-up — the Skia glyph set doesn't exist yet.
+    pub os: String,
 }
 
 /// The pairing ceremony's observable state (one at a time — the ceremony is modal).
@@ -179,6 +183,7 @@ mod tests {
             mgmt_port: 47990,
             can_wake: false,
             last_used: None,
+            os: String::new(),
         };
         shared.set_hosts(vec![row.clone()]);
         let g1 = shared.hosts_gen();

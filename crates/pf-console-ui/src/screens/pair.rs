@@ -429,6 +429,7 @@ mod tests {
             mgmt_port: 47990,
             can_wake: false,
             last_used: None,
+            os: String::new(),
         }
     }
 

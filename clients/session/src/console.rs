@@ -78,6 +78,7 @@ pub fn run(target: Option<&str>) -> u8 {
                     .unwrap_or(library::DEFAULT_MGMT_PORT),
                 can_wake: false,
                 last_used: k.and_then(|h| h.last_used),
+                os: k.map(|h| h.os.clone()).unwrap_or_default(),
             };
             let label = row.name.clone();
             if k.is_none() {
@@ -295,6 +296,7 @@ fn fake_host_row() -> HostRow {
         mgmt_port: library::DEFAULT_MGMT_PORT,
         can_wake: false,
         last_used: None,
+        os: "linux/arch/steamos".into(),
     }
 }
 
@@ -570,6 +572,10 @@ impl ServiceState {
                         .unwrap_or(library::DEFAULT_MGMT_PORT),
                     can_wake: !online && !h.mac.is_empty(),
                     last_used: h.last_used,
+                    os: advert
+                        .filter(|d| !d.os.is_empty())
+                        .map(|d| d.os.clone())
+                        .unwrap_or_else(|| h.os.clone()),
                 }
             })
             .collect();
@@ -600,6 +606,7 @@ impl ServiceState {
                 mgmt_port: d.mgmt_port.unwrap_or(library::DEFAULT_MGMT_PORT),
                 can_wake: false,
                 last_used: None,
+                os: d.os.clone(),
             })
             .collect();
         extra.sort_by(|a, b| a.name.cmp(&b.name));

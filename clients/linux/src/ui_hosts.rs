@@ -217,6 +217,15 @@ impl relm4::factory::FactoryComponent for HostCard {
         let status = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         status.set_halign(gtk::Align::Center);
         status.set_margin_top(4);
+        // The host's OS mark leads the row; nothing at all for an older host that doesn't
+        // advertise one, so those cards render exactly as they always did.
+        let os_chain = match &self.kind {
+            CardKind::Saved { host: k, .. } => k.os.as_str(),
+            CardKind::Discovered(a) => a.os.as_str(),
+        };
+        if let Some(img) = os_icon_image(os_chain) {
+            status.append(&img);
+        }
         let pill = |text: &str, class: &str| {
             let l = gtk::Label::new(Some(text));
             l.add_css_class("pf-pill");
@@ -573,6 +582,28 @@ const PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(12);
 /// for this — without it every profile is the same grey, and telling them apart across a grid
 /// at a glance is the whole reason the chip exists. No colour set keeps the neutral pill, so
 /// the palette stays opt-in.
+/// The OS-icon tokens this shell ships symbolic art for (`data/icons/.../pf-os-<t>-symbolic.svg`,
+/// embedded via gresource). Chains walk most-specific-first, so a distro without its own mark
+/// (Bazzite, CachyOS, ...) lands on its family's and finally on plain Tux.
+const OS_ICON_TOKENS: &[&str] = &[
+    "windows", "apple", "linux", "steam", "ubuntu", "fedora", "arch", "debian", "nixos", "opensuse",
+];
+
+/// The card's OS glyph for an advertised chain, or `None` (no widget) when the host doesn't
+/// advertise one / nothing in the chain is recognized-and-drawable. Symbolic, so it recolors
+/// with the Adwaita theme like every other status glyph; the raw chain is the tooltip.
+fn os_icon_image(chain: &str) -> Option<gtk::Image> {
+    let token = crate::os::os_icon_tokens(chain)
+        .into_iter()
+        .find(|t| OS_ICON_TOKENS.contains(&t.as_str()))?;
+    let img = gtk::Image::from_icon_name(&format!("pf-os-{token}-symbolic"));
+    img.set_pixel_size(14);
+    img.add_css_class("dim-label");
+    img.set_valign(gtk::Align::Center);
+    img.set_tooltip_text(Some(chain));
+    Some(img)
+}
+
 fn profile_pill(p: &Profile) -> gtk::Widget {
     let label = gtk::Label::new(Some(&p.name));
     label.add_css_class("pf-pill");
@@ -1035,6 +1066,14 @@ impl HostsPage {
                     .find(|a| matches(k, a) && !a.mac.is_empty())
                 {
                     crate::trust::learn_mac(&k.fp_hex, &k.addr, k.port, &a.mac);
+                }
+                // Same for its OS chain — the icon then survives the host going offline.
+                if let Some(a) = self
+                    .adverts
+                    .values()
+                    .find(|a| matches(k, a) && !a.os.is_empty())
+                {
+                    crate::trust::learn_os(&k.fp_hex, &k.addr, k.port, &a.os);
                 }
                 saved.push_back(HostCard {
                     connecting: self.connecting.as_deref() == Some(k.fp_hex.as_str()),

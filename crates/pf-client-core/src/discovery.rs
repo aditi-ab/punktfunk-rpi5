@@ -25,6 +25,10 @@ pub struct DiscoveredHost {
     /// Wake-on-LAN MAC(s) from the mDNS `mac` TXT (comma-separated `aa:bb:cc:dd:ee:ff`), which the
     /// hosts page persists onto the matching saved host so it can wake it later. Empty if absent.
     pub mac: Vec<String>,
+    /// The host's OS-identity chain from the mDNS `os` TXT (`windows` | `macos` |
+    /// `linux[/<family>][/<id>]`), sanitized ([`crate::os::sanitize_os`]) — drives the host
+    /// card's OS icon and is persisted like `mac`. Empty if absent (older host).
+    pub os: String,
 }
 
 /// One discovery update for the UI's advert map.
@@ -96,6 +100,7 @@ pub fn browse() -> async_channel::Receiver<DiscoveryEvent> {
                                 .map(|s| s.trim().to_string())
                                 .filter(|s| !s.is_empty())
                                 .collect(),
+                            os: crate::os::sanitize_os(&val("os")),
                         })
                     }
                     ServiceEvent::ServiceRemoved(_ty, fullname) => {

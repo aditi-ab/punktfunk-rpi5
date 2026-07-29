@@ -167,9 +167,10 @@ pub(crate) struct Hover {
     pub(crate) set: AsyncSetState<Option<String>>,
 }
 
-/// The status row at the bottom of a tile: presence dot + Online/Offline, plus the trust chip.
-fn status_row(online: Option<bool>, badge: &str, kind: Pill) -> Element {
-    status_row_with(online, badge, kind, None)
+/// The status row at the bottom of a tile: the host's OS mark (when advertised), presence
+/// dot + Online/Offline, plus the trust chip.
+fn status_row(os: &str, online: Option<bool>, badge: &str, kind: Pill) -> Element {
+    status_row_with(os, online, badge, kind, None)
 }
 
 /// [`status_row`] plus the profile chip: what a plain click on THIS tile will use — its own
@@ -177,12 +178,26 @@ fn status_row(online: Option<bool>, badge: &str, kind: Pill) -> Element {
 /// was deleted shows nothing and resolves as the defaults, which is what will happen on
 /// connect (design §6).
 fn status_row_with(
+    os: &str,
     online: Option<bool>,
     badge: &str,
     kind: Pill,
     profile: Option<(&str, Option<String>)>,
 ) -> Element {
     let mut items: Vec<Element> = Vec::new();
+    // The OS mark leads the row; nothing at all for an older host that doesn't advertise
+    // one, so those tiles render exactly as they always did. Raster at 16px from the
+    // materialized cache (reactor has no vector element); the raw chain is the tooltip.
+    if let Some(uri) = super::os_icons::uri(os) {
+        items.push(
+            Image::new_with_uri(uri)
+                .width(16.0)
+                .height(16.0)
+                .tooltip(os)
+                .vertical_alignment(VerticalAlignment::Center)
+                .into(),
+        );
+    }
     if let Some(online) = online {
         items.push(
             presence_dot(online)
@@ -663,6 +678,12 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
             }) {
                 crate::trust::learn_mac(&k.fp_hex, &k.addr, k.port, &a.mac);
             }
+            // Same for its OS chain — the tile's mark then survives the host going offline.
+            if let Some(a) = hosts.iter().find(|h| {
+                (h.fp_hex == k.fp_hex || (h.addr == k.addr && h.port == k.port)) && !h.os.is_empty()
+            }) {
+                crate::trust::learn_os(&k.fp_hex, &k.addr, k.port, &a.os);
+            }
             let can_wake = !online && !k.mac.is_empty();
             let menu = {
                 let (svc, target) = (props.svc.clone(), target.clone());
@@ -786,6 +807,7 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                 &k.name,
                 &format!("{}:{}", k.addr, k.port),
                 status_row_with(
+                    &k.os,
                     Some(online),
                     if k.paired { "Paired" } else { "Trusted" },
                     if k.paired { Pill::Good } else { Pill::Info },
@@ -829,6 +851,7 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                     &k.name,
                     &format!("{}:{}", k.addr, k.port),
                     status_row_with(
+                        &k.os,
                         Some(online),
                         if k.paired { "Paired" } else { "Trusted" },
                         if k.paired { Pill::Good } else { Pill::Info },
@@ -893,7 +916,7 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                 &hover,
                 &h.name,
                 &format!("{}:{}", h.addr, h.port),
-                status_row(None, badge, kind),
+                status_row(&h.os, None, badge, kind),
                 None,
                 Some(Box::new(move || initiate(&ctx2, target.clone(), &ss, &st))),
             ));
