@@ -14,11 +14,22 @@
 //! * [`style`] — the shared look (cards, pills, monograms), following the windows-reactor
 //!   gallery: Mica backdrop, a centred max-width column, theme brushes (`ThemeRef`)
 //!
-//! **Re-render discipline** (reactor's rules): each hook-using screen is mounted as its own
-//! `component(...)` so its hooks live in an isolated slot list. A child's *sync* `use_state`
-//! marks it dirty and re-renders it; an `AsyncSetState` written from a background thread does
-//! NOT (the child is pruned when its props are unchanged) — so everything thread-driven
-//! (discovery, HUD stats, speed-test results) is held as *root* state and passed down as props.
+//! **Re-render discipline** — MEASURED rules, not folklore: each is pinned by a
+//! characterization test in `tests/reactor_semantics.rs` against the exact windows-reactor
+//! rev in Cargo.toml. Re-run that suite on every bump; a red test means this note is stale.
+//!
+//! * A child's *sync* `use_state` re-renders it — including under element-equal
+//!   non-component wrappers (`border`, `scroll_viewer`), and including writes from
+//!   backend-wired event handlers (`sync_state_child_under_element_equal_border_rerenders`,
+//!   `sync_state_from_backend_fired_event_rerenders`). Per-screen UI state driven by user
+//!   events may therefore live in the screen's own component.
+//! * An `AsyncSetState` written from a background thread does NOT re-render its owning
+//!   component: the value lands and the dirty flag is set, but the rerender request is
+//!   keyed by the component's own HostId, which is never registered — only the root's is —
+//!   so it is silently dropped and surfaces on the next unrelated pass
+//!   (`async_state_child_under_element_equal_border_rerenders` asserts the drop). So
+//!   everything THREAD-driven (discovery, HUD stats, speed-test results, spawn events)
+//!   is held as *root* state and passed down as props.
 
 mod connect;
 mod help;
@@ -272,6 +283,11 @@ fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
     // Whether the Edit-profile modal is up. Root state for the reactor-backend-handler reason
     // above; guarded in the page so it only renders while a profile is actually in scope.
     let (settings_edit, set_settings_edit) = cx.use_async_state(false);
+    // Window size, read at ROOT: the settings screen places its scope switcher by the same
+    // width threshold WinUI's NavigationView uses to collapse its pane (reactor exposes no
+    // pane-opened/closed event). Registering the size here re-renders the tree on resize,
+    // which the per-screen `use_inner_size` readers (hosts, library) already caused anyway.
+    let window = cx.use_inner_size();
     // Bumped when a settings edit changes what the page should SHOW without changing any state
     // it already reads — ANY edit through `settings::commit` (creating an override must surface
     // its marker as immediately as resetting one clears it), a reset, a profile colour change.
@@ -624,6 +640,7 @@ fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
             settings_rev,
             &set_settings_rev,
             nav_progress,
+            window.width,
         ),
         Screen::Licenses => licenses::licenses_page(&set_screen),
         Screen::Help => help::help_page(&set_screen),

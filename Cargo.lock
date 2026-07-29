@@ -3374,6 +3374,7 @@ dependencies = [
  "punktfunk-core",
  "serde",
  "serde_json",
+ "test_reactor",
  "tracing",
  "tracing-subscriber",
  "windows 0.62.2 (git+https://github.com/microsoft/windows-rs?rev=acb5a1a7441033d9312b16842af02eb0c2b403dc)",
@@ -4577,6 +4578,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "test_reactor"
+version = "0.0.0"
+source = "git+https://github.com/microsoft/windows-rs?rev=acb5a1a7441033d9312b16842af02eb0c2b403dc#acb5a1a7441033d9312b16842af02eb0c2b403dc"
+dependencies = [
+ "rustc-hash",
+ "windows-core 0.62.2 (git+https://github.com/microsoft/windows-rs?rev=acb5a1a7441033d9312b16842af02eb0c2b403dc)",
+ "windows-reactor",
+ "windows-reactor-setup",
+ "windows-reference",
+]
+
+[[package]]
 name = "thiserror"
 version = "1.0.69"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5431,6 +5444,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "windows-canvas"
+version = "0.0.0"
+source = "git+https://github.com/microsoft/windows-rs?rev=acb5a1a7441033d9312b16842af02eb0c2b403dc#acb5a1a7441033d9312b16842af02eb0c2b403dc"
+dependencies = [
+ "windows-core 0.62.2 (git+https://github.com/microsoft/windows-rs?rev=acb5a1a7441033d9312b16842af02eb0c2b403dc)",
+ "windows-numerics 0.3.1 (git+https://github.com/microsoft/windows-rs?rev=acb5a1a7441033d9312b16842af02eb0c2b403dc)",
+ "windows-window",
+]
+
+[[package]]
 name = "windows-collections"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5582,6 +5605,7 @@ version = "0.0.0"
 source = "git+https://github.com/microsoft/windows-rs?rev=acb5a1a7441033d9312b16842af02eb0c2b403dc#acb5a1a7441033d9312b16842af02eb0c2b403dc"
 dependencies = [
  "rustc-hash",
+ "windows-canvas",
  "windows-collections 0.3.2 (git+https://github.com/microsoft/windows-rs?rev=acb5a1a7441033d9312b16842af02eb0c2b403dc)",
  "windows-composition",
  "windows-core 0.62.2 (git+https://github.com/microsoft/windows-rs?rev=acb5a1a7441033d9312b16842af02eb0c2b403dc)",
@@ -5768,6 +5792,14 @@ source = "git+https://github.com/microsoft/windows-rs?rev=acb5a1a7441033d9312b16
 dependencies = [
  "windows-core 0.62.2 (git+https://github.com/microsoft/windows-rs?rev=acb5a1a7441033d9312b16842af02eb0c2b403dc)",
  "windows-link 0.2.1 (git+https://github.com/microsoft/windows-rs?rev=acb5a1a7441033d9312b16842af02eb0c2b403dc)",
+]
+
+[[package]]
+name = "windows-window"
+version = "0.0.0"
+source = "git+https://github.com/microsoft/windows-rs?rev=acb5a1a7441033d9312b16842af02eb0c2b403dc#acb5a1a7441033d9312b16842af02eb0c2b403dc"
+dependencies = [
+ "windows-core 0.62.2 (git+https://github.com/microsoft/windows-rs?rev=acb5a1a7441033d9312b16842af02eb0c2b403dc)",
 ]
 
 [[package]]

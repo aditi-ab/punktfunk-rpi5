@@ -94,6 +94,15 @@ serde_json = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# The reactor's own headless test harness, at the SAME pinned rev: the `test` feature gates
+# `RenderCx::for_test`/`ChannelDispatcher`; `test_reactor` is the upstream repo's
+# RecordingBackend crate (cargo resolves a git dep's workspace member by package name).
+# These power tests/reactor_semantics.rs — the characterization suite for the re-render
+# semantics this client's architecture depends on. Re-run it on every future SHA bump.
+[target.'cfg(windows)'.dev-dependencies]
+windows-reactor = { git = "https://github.com/microsoft/windows-rs", rev = "acb5a1a7441033d9312b16842af02eb0c2b403dc", features = ["test"] }
+test_reactor = { git = "https://github.com/microsoft/windows-rs", rev = "acb5a1a7441033d9312b16842af02eb0c2b403dc" }
+
 # Embeds the app icon as an exe resource (build.rs) — Windows hosts only (rc.exe from the SDK).
 # windows-reactor-setup stages the Windows App SDK runtime bootstrap (framework-dependent) next
 # to the exe — the new-model replacement for the old windows-reactor build.rs; same pinned rev.

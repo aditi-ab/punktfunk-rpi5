@@ -580,6 +580,7 @@ pub(crate) fn settings_page(
     rev: u64,
     set_rev: &AsyncSetState<u64>,
     progress: f64,
+    window_width: f64,
 ) -> Element {
     // The layer being edited. A scope pointing at a deleted profile degrades to the defaults,
     // the same rule a dangling host binding follows.
@@ -1279,6 +1280,13 @@ pub(crate) fn settings_page(
     // the navigation rather than as one more settings row — a bar of profile controls above
     // the whole surface read as clutter. Editing the profile itself (name, colour, delete)
     // is a modal behind the "Edit profile…" button, not inline chrome.
+    //
+    // But ONLY while the pane is expanded: in Auto display mode WinUI collapses the pane
+    // below 1008 epx (compact rail, then minimal), and pane-footer content is CLIPPED to the
+    // rail, not adapted. Reactor exposes no pane-opened/closed event, so the switcher follows
+    // the same width threshold WinUI uses: expanded pane → footer; collapsed → a slim row at
+    // the top of the content column instead.
+    let pane_expanded = window_width >= 1008.0;
     let catalog = ProfilesFile::load();
     let mut scope_names = vec!["Default settings".to_string()];
     let mut scope_ids: Vec<String> = vec![String::new()];
@@ -1320,25 +1328,53 @@ pub(crate) fn settings_page(
                 set_scope.call(id.clone());
             }
         });
-    let mut footer_rows: Vec<Element> = vec![switcher.into()];
-    if profile_mode {
+    let edit_button: Option<Element> = profile_mode.then(|| {
         let set_edit = set_edit.clone();
-        footer_rows.push(
-            button("Edit profile\u{2026}")
-                .on_click(move || set_edit.call(true))
-                .into(),
-        );
-    }
+        button("Edit profile\u{2026}")
+            .on_click(move || set_edit.call(true))
+            .into()
+    });
     // Keyed by scope + the name list: a rename/create/delete changes the ComboBox's items,
     // and an in-place diff re-sets items (clearing WinUI's selection) while skipping
     // `selected_index` when it compares equal — the combo then renders blank. A remount
     // applies every prop. The keyed child sits inside a plain vstack because only a panel's
     // child list takes the keyed path (same rule as the content column below).
-    let footer = vstack(vec![vstack(footer_rows)
-        .spacing(8.0)
-        .with_key(format!("{scope}\u{1}{}", scope_names.join("\u{1}")))
-        .into()])
-    .margin(edges(16.0, 0.0, 16.0, 12.0));
+    let switcher_key = format!("{scope}\u{1}{}", scope_names.join("\u{1}"));
+    // Expanded pane: combo over button, in the footer. Collapsed: one horizontal row that
+    // leads the content column (bottom-aligned so the combo's "Editing" header doesn't push
+    // the button off its baseline).
+    let (footer, inline_switcher): (Option<Element>, Option<Element>) = if pane_expanded {
+        let rows: Vec<Element> = std::iter::once(Element::from(switcher))
+            .chain(edit_button)
+            .collect();
+        (
+            Some(
+                vstack(vec![vstack(rows)
+                    .spacing(8.0)
+                    .with_key(switcher_key)
+                    .into()])
+                .margin(edges(16.0, 0.0, 16.0, 12.0))
+                .into(),
+            ),
+            None,
+        )
+    } else {
+        let row: Vec<Element> = std::iter::once(Element::from(switcher))
+            .chain(edit_button)
+            .collect();
+        (
+            None,
+            Some(
+                vstack(vec![hstack(row)
+                    .spacing(8.0)
+                    .vertical_alignment(VerticalAlignment::Bottom)
+                    .with_key(switcher_key)
+                    .into()])
+                .margin(edges(24.0, 12.0, 28.0, 0.0))
+                .into(),
+            ),
+        )
+    };
 
     let titled: Vec<Element> = std::iter::once(
         text_block(title)
@@ -1358,7 +1394,7 @@ pub(crate) fn settings_page(
     // but skips `selected_index` whenever the two sections' values compare equal, so the
     // combos render blank until touched. A panel (vstack) takes the keyed path, so the key
     // remounts the whole column and every prop is applied fresh.
-    let content = scroll_view(
+    let scrolled = scroll_view(
         // ⚠️ Keyed on (scope, section), not section alone: switching SCOPE re-renders the same
         // section's controls with different values, and an in-place diff re-sets each reused
         // ComboBox's items (clearing WinUI's selection) while skipping `selected_index`
@@ -1372,6 +1408,16 @@ pub(crate) fn settings_page(
     )
     .opacity(progress)
     .margin(edges(0.0, (1.0 - progress) * 22.0, 0.0, 0.0));
+    // With the pane collapsed the switcher leads the content column, above the scrolling
+    // region so it stays put — it is still chrome, not a settings row. An Auto/Star grid,
+    // not a vstack: a StackPanel would hand the scroll_view its DESIRED height and the
+    // viewport (and scrolling) would be gone.
+    let content: Element = match inline_switcher {
+        Some(row) => grid(vec![row.grid_row(0), Element::from(scrolled).grid_row(1)])
+            .rows([GridLength::Auto, GridLength::STAR])
+            .into(),
+        None => scrolled.into(),
+    };
     // The delete confirmation, when armed. Declarative, like every other dialog in this shell:
     // it is an element in the tree with `is_open`, not a call.
     let confirm: Option<Element> = delete_pending.as_ref().and_then(|id| {
@@ -1434,9 +1480,8 @@ pub(crate) fn settings_page(
                 .into(),
         )
     });
-    let nav = NavigationView::new(items, content)
+    let mut nav = NavigationView::new(items, content)
         .pane_title("Settings")
-        .pane_footer(footer)
         .selected_tag(section)
         .on_selection_changed({
             let ss = set_section.clone();
@@ -1448,6 +1493,9 @@ pub(crate) fn settings_page(
             let ss = set_screen.clone();
             move || ss.call(Screen::Hosts)
         });
+    if let Some(f) = footer {
+        nav = nav.pane_footer(f);
+    }
     // One grid, so every layer FILLS the window (a vstack would hand the NavigationView its
     // desired height — clipped when the window is short, floating when it is tall): the nav,
     // the Edit-profile scrim + card over it, and the delete confirmation (a ContentDialog,
