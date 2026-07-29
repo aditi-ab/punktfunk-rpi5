@@ -17,10 +17,13 @@ use super::*;
 /// (`encode::cursor_blend_capable`): the channel's capture-mouse flip (`CursorRenderMode`,
 /// `client_draws = false`) makes the HOST draw the pointer, and on Linux the encoder is that
 /// compositing stage — granting the channel over a backend that can't blend (libav
-/// VAAPI/NVENC, software) shipped a cursorless stream on every capture-mode flip. Denied, the
-/// session keeps the pre-channel path: the compositor EMBEDS the pointer and the client never
-/// draws — never cursorless, never doubled. THE single predicate: the Welcome's
-/// `HOST_CAP_CURSOR` bit is computed from it, and the session wiring reads that bit back.
+/// VAAPI/NVENC, software) shipped a cursorless stream on every capture-mode flip. Denied — or
+/// never asked for (a capture-latched client, `console.rs` `latched_mouse`) — the session
+/// composites host-side anyway wherever the backend can blend
+/// (`session_plan::cursor_blend_for`'s no-channel arm; the compositor-EMBEDS fallback never
+/// paints on a Mutter virtual stream), and only a can't-blend backend falls back to the
+/// compositor EMBED. THE single predicate: the Welcome's `HOST_CAP_CURSOR` bit is computed
+/// from it, and the session wiring reads that bit back.
 pub(super) fn cursor_forward(
     client_caps: u8,
     compositor: Option<crate::vdisplay::Compositor>,

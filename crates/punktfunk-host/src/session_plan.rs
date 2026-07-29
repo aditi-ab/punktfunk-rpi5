@@ -108,7 +108,9 @@ pub struct SessionPlan {
     pub wire_chunk: Option<usize>,
     /// The session may hand the encoder cursor bitmaps to composite (cursor-as-metadata
     /// captures). Set via [`cursor_blend_for`] — the single platform rule — so it is `true` only
-    /// where the ENCODER is the compositing stage (Linux cursor-forward and gamescope sessions);
+    /// where the ENCODER is the compositing stage (Linux: cursor-forward sessions, gamescope,
+    /// AND no-channel sessions on a blend-capable backend — the compositor-EMBEDS fallback is
+    /// broken on Mutter virtual streams, see [`cursor_blend_for`]);
     /// Windows is always `false` (the IDD capturer composites the pointer itself). Encoders
     /// whose fast path cannot blend (the Vulkan EFC RGB-direct source, native NV12) stay off
     /// those shapes when this is set — see [`Self::output_format`] and
@@ -234,20 +236,46 @@ pub(crate) fn resolve_topology() -> SessionTopology {
 /// THE rule for [`SessionPlan::cursor_blend`], shared by every resolve caller (initial plan and
 /// the mid-stream compositor re-gate) so they can't drift:
 /// * **Linux**: the encoder is the compositing stage — blend for a cursor-forward session (the
-///   capture-mouse flip needs the host composite on demand) and for gamescope (its capture
-///   carries no pointer at all; the XFixes-sourced cursor must be drawn into the video).
+///   capture-mouse flip needs the host composite on demand), for gamescope (its capture
+///   carries no pointer at all; the XFixes-sourced cursor must be drawn into the video), AND
+///   for a no-channel session whenever the resolved backend can composite. The pre-channel
+///   "compositor EMBEDS the pointer" fallback is a fiction on a Mutter virtual stream:
+///   cursor-only motion never re-records the stream (probed on-glass, Mutter 50.3 — frames
+///   froze the instant motion went relative while `SPA_META_Cursor` kept updating), so a
+///   capture-latched client (which never advertises `CLIENT_CAP_CURSOR`, `console.rs`
+///   `latched_mouse`) streamed cursorless. Metadata + host blend is the path that was
+///   verified end-to-end; embedded remains only the can't-blend fallback (libav
+///   VAAPI/NVENC, software).
 /// * **Windows**: never — the IDD capturer composites the pointer itself (`cursor_blend.rs` /
 ///   DWM), and no Windows encode backend reads `frame.cursor`. Asking the encoder anyway made
 ///   `open_video`'s blends-cursor backstop fire spuriously on every cursor-channel session.
-pub(crate) fn cursor_blend_for(cursor_forward: bool, gamescope: bool) -> bool {
+pub(crate) fn cursor_blend_for(
+    cursor_forward: bool,
+    gamescope: bool,
+    codec: crate::encode::Codec,
+    bit_depth: u8,
+) -> bool {
     #[cfg(target_os = "windows")]
     {
-        let _ = (cursor_forward, gamescope);
+        let _ = (cursor_forward, gamescope, codec, bit_depth);
         false
     }
     #[cfg(not(target_os = "windows"))]
     {
-        cursor_forward || gamescope_needs_host_cursor(gamescope)
+        if gamescope {
+            // gamescope's capture carries no SPA_META_Cursor; the blend-capable term below
+            // must not apply, or a patch-2+ gamescope (composites its own pointer) would lose
+            // its native-NV12 zero-copy shape for a blend that can never receive an overlay.
+            return gamescope_needs_host_cursor(true);
+        }
+        if cursor_forward {
+            return true;
+        }
+        // No cursor channel: the same CUDA-payload prediction `handshake::cursor_forward` and
+        // the GameStream monitor mirror make — the NVIDIA resolution plus the zero-copy master
+        // switch — deciding direct-SDK NVENC (blends) vs libav NVENC (doesn't).
+        let cuda_planned = !crate::encode::linux_zero_copy_is_vaapi() && crate::zerocopy::enabled();
+        crate::encode::cursor_blend_capable(codec, cuda_planned, bit_depth == 10)
     }
 }
 

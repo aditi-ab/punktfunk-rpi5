@@ -50,13 +50,19 @@ const APPLY_TEMPORARY: u32 = 1;
 /// the frames. The capturer always negotiates the meta (pf-capture `meta_param`) and the encoder
 /// blend composites it for sessions where the client does not draw the cursor itself — while a
 /// cursor-forwarding session strips the overlay and sends shape/state over the cursor channel.
-/// Embedded mode would leave BOTH paths blind: no metadata means nothing to forward AND nothing
-/// to blend, and Mutter's own embedded painting is what the pre-channel path relied on.
+/// This is the mode for EVERY session whose host plans a composite or forward (`set_hw_cursor`
+/// on), channel or not: Mutter's embedded painting is a fiction on a virtual stream — since
+/// Mutter 48 (commit `7ff5334a`, hw-cursor inhibition removed) the software cursor overlay is
+/// suppressed STAGE-GLOBALLY whenever any physical head realizes a hardware cursor, so
+/// dmabuf-recorded frames blit the view without a pointer, and cursor-only motion schedules no
+/// re-record either (mutter#4939). Probed on-glass (Mutter 50.3): embedded + relative motion =
+/// frozen frame counter; metadata positions kept flowing in the same setup.
 const CURSOR_METADATA: u32 = 2;
-/// `cursor-mode` embedded (mutter enum 1): Mutter composites the pointer into frames itself —
-/// zero host-side cursor work, the pre-channel path. Chosen for every session WITHOUT the
-/// negotiated cursor channel (`set_hw_cursor` off — Phase B, the Windows no-regression gate
-/// mirrored); metadata stays the cursor-channel sessions' mode (shapes forwarded / host blend).
+/// `cursor-mode` embedded (mutter enum 1): Mutter composites the pointer into frames itself.
+/// Kept only as the can't-blend fallback (`set_hw_cursor` off — the resolved encode backend
+/// cannot composite a metadata cursor, so metadata would strand the pointer in meta nothing
+/// draws). Know its limits (above): on a virtual stream it paints only into the MemFd/SHM
+/// record path (`FORCE_CURSORS`) and only refreshes on unrelated damage.
 const CURSOR_EMBEDDED: u32 = 1;
 
 /// Serializes, process-wide, every Mutter operation that adds/removes a virtual monitor or applies

@@ -389,12 +389,14 @@ fn run(
         return stream_body(
             &mut capturer,
             Some(&rebuild),
-            // The virtual-output source never selects cursor-as-metadata (`set_hw_cursor` is
-            // never called → the compositor EMBEDS the pointer where it can), so the encoder
-            // is handed nothing to composite. gamescope remains the pointerless residual —
-            // its capture carries no cursor either way (the native plane's XFixes source is
-            // not wired on this plane).
-            false,
+            // Mirrors the source's own `set_hw_cursor` request (`open_gs_virtual_source`):
+            // cursor-as-metadata + host blend wherever the backend composites — the
+            // compositor-EMBEDS fallback never paints on a Mutter virtual stream (the
+            // native plane's no-channel rule, `session_plan::cursor_blend_for`). gamescope
+            // remains the pointerless residual — its capture carries no cursor either way
+            // (the native plane's XFixes source is not wired on this plane).
+            compositor != crate::vdisplay::Compositor::Gamescope
+                && blend_capable_metadata_cursor(&cfg),
             &sock,
             cfg,
             running,
@@ -415,18 +417,7 @@ fn run(
     // `frame.cursor` (the caps-aware negotiation — mirror of the native plane's); otherwise ask
     // the portal to EMBED the pointer so no backend × cursor-mode combination streams
     // cursorless. Synthetic frames carry no pointer either way.
-    let metadata_cursor = {
-        #[cfg(target_os = "linux")]
-        {
-            // Same CUDA-payload prediction SessionPlan/`handshake::cursor_forward` make:
-            // the NVIDIA resolution plus the zero-copy master switch.
-            let cuda_planned =
-                !crate::encode::linux_zero_copy_is_vaapi() && crate::zerocopy::enabled();
-            crate::encode::cursor_blend_capable(cfg.codec, cuda_planned, cfg.hdr)
-        }
-        #[cfg(not(target_os = "linux"))]
-        false
-    };
+    let metadata_cursor = blend_capable_metadata_cursor(&cfg);
     // Which screen this stream must show. The host-wide pin (§5.3) applies to the compat plane too:
     // the portal chooser cannot name a head, so a pinned host MIRRORS it here the same way the
     // virtual source does via `vdisplay::open`. Without this a Moonlight client on a pinned host
@@ -643,6 +634,24 @@ fn resolve_gs_app(app: Option<&super::apps::AppEntry>) -> Option<GsApp> {
 /// entry can PIN a compositor (skips the live detect/retarget). Re-run on a mid-stream capture loss to
 /// FOLLOW a Desktop<->Game switch: it re-detects the now-live compositor and re-targets at it. Does NOT
 /// launch the app (that happens once at stream start; a rebuild must not re-spawn it).
+/// Cursor-as-metadata for this plane (GameStream has no cursor channel): only where the encode
+/// backend this session resolves to composites `frame.cursor` — the same CUDA-payload
+/// prediction `SessionPlan`/`handshake::cursor_forward` make (the NVIDIA resolution plus the
+/// zero-copy master switch). Shared by the monitor-mirror and virtual-output sources so their
+/// `set_hw_cursor` request and `stream_body`'s blend flag cannot drift.
+fn blend_capable_metadata_cursor(cfg: &StreamConfig) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let cuda_planned = !crate::encode::linux_zero_copy_is_vaapi() && crate::zerocopy::enabled();
+        crate::encode::cursor_blend_capable(cfg.codec, cuda_planned, cfg.hdr)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = cfg;
+        false
+    }
+}
+
 fn open_gs_virtual_source(
     cfg: StreamConfig,
     app: Option<&super::apps::AppEntry>,
@@ -701,6 +710,16 @@ fn open_gs_virtual_source(
         }
     };
     let mut vd = crate::vdisplay::open(compositor).context("open virtual display")?;
+    // Out-of-band cursor for the virtual source (the native plane's no-channel rule, mirrored):
+    // GameStream has no cursor channel, and the compositor-EMBEDS fallback never paints on a
+    // Mutter virtual stream (stage-global overlay suppression since Mutter 48 — see
+    // pf-vdisplay `mutter.rs`), so ask for cursor-as-metadata wherever the resolved backend
+    // composites `frame.cursor`; `stream_body`'s blend flag mirrors this request. gamescope
+    // stays off: its capture carries no metadata either way, and the request would cost the
+    // native-NV12 shape for nothing.
+    vd.set_hw_cursor(
+        compositor != crate::vdisplay::Compositor::Gamescope && blend_capable_metadata_cursor(&cfg),
+    );
     // Carry the resolved launch command on the backend instance (per-session) rather than a
     // process-global env var, so concurrent sessions can't stomp each other's launch target. It is
     // the RESOLVED command, so gamescope's bare spawn nests a library title exactly like an

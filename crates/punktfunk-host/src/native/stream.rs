@@ -1076,20 +1076,20 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
         ctx.bit_depth,
         ctx.chroma,
         ctx.codec,
-        // Blend CAPABILITY for cursor-FORWARD sessions (Phase B, the Windows gate mirrored):
-        // their client can flip to the capture mouse model mid-stream (`CursorRenderMode`), and
-        // the composite side of that flip must not need an encoder rebuild — WHETHER a frame's
-        // pointer is drawn stays per-tick (the encode loop strips `frame.cursor` while the client
-        // draws locally, see the forwarder tick). Non-channel NON-gamescope sessions get the
-        // pointer compositor-EMBEDDED (`vd.set_hw_cursor(false)` → no cursor metadata, nothing to
-        // blend), keeping the zero-cost pre-channel path. gamescope is the exception (Phase C):
-        // it can't embed the pointer, so the host ALWAYS composites the XFixes-sourced cursor —
-        // the blend must be built for every gamescope session. (`cursor_forward` is already
-        // blend-gated: `handshake::cursor_forward` grants the channel only where
-        // `encode::cursor_blend_capable` says the resolved backend composites.)
+        // Blend CAPABILITY (the single rule in `cursor_blend_for`): cursor-FORWARD sessions
+        // need it for the mid-stream capture-mouse flip (`CursorRenderMode` — WHETHER a
+        // frame's pointer is drawn stays per-tick, the encode loop strips `frame.cursor`
+        // while the client draws locally); gamescope (Phase C) can't embed a pointer, so the
+        // host always composites the XFixes-sourced cursor; and a NO-channel session gets
+        // metadata + host blend too wherever the backend composites — the compositor-EMBEDS
+        // fallback streams cursorless on a Mutter virtual output (the overlay-visibility
+        // gate is stage-global since Mutter 48; see `cursor_blend_for`'s doc). Embedded
+        // remains only the can't-blend fallback.
         crate::session_plan::cursor_blend_for(
             ctx.cursor_forward,
             ctx.compositor == pf_vdisplay::Compositor::Gamescope,
+            ctx.codec,
+            ctx.bit_depth,
         ),
         ctx.cursor_forward,
     );
@@ -1187,6 +1187,24 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
     if gamescope_composite {
         tracing::info!("gamescope cursor: compositing the XFixes-sourced pointer into the video");
     }
+    // No-channel metadata composite: the client never draws the pointer (it did not advertise
+    // the cursor channel — e.g. a capture-latched client, `console.rs` `latched_mouse`), and
+    // the compositor-EMBEDS fallback is a fiction on a Mutter virtual stream (the software
+    // cursor overlay is suppressed stage-globally whenever any physical head realizes a HW
+    // cursor, Mutter 48+ — dmabuf frames blit the view WITHOUT it, and cursor-only motion
+    // schedules no update either, mutter#4939). So the plan asked the backend for
+    // cursor-as-metadata and the HOST composites, permanently — the same arm a channel
+    // session lands in after its capture-model flip, minus the channel.
+    // `mut`: recomputed with `gamescope_composite` on a mid-stream compositor retarget.
+    let mut metadata_composite = cursor_fwd.is_none()
+        && plan.cursor_blend
+        && compositor != pf_vdisplay::Compositor::Gamescope;
+    if metadata_composite {
+        tracing::info!(
+            "no cursor channel — compositing the metadata cursor into the video (embedded \
+             fallback is unreliable on virtual streams)"
+        );
+    }
     if streamed_wire {
         // Client capability only — whether AUs actually stream per-slice depends on the encoder
         // backend's `supports_chunked_poll()` (today: Linux direct-NVENC only), which doesn't
@@ -1231,9 +1249,12 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
             // it with the HDR flags so nested games get HDR surfaces at all. Decided in the
             // Welcome (`capture::capturer_supports_hdr_for`), so it cannot change under us.
             vd.set_hdr(bit_depth >= 10);
-            // Cursor-forward sessions ask the backend for an out-of-band hardware cursor
-            // (Windows pf-vdisplay / IddCx; no-op on Linux — the portal already separates it).
-            vd.set_hw_cursor(cursor_forward);
+            // Out-of-band cursor request: cursor-forward sessions (Windows pf-vdisplay /
+            // IddCx hardware cursor; Linux metadata mode) AND no-channel host-composite
+            // sessions (Linux only — `metadata_composite` is `plan.cursor_blend`-gated, so
+            // it is always false on Windows). The backend keeps the pointer out of the
+            // pixels; the host blend (or the client) puts it back.
+            vd.set_hw_cursor(cursor_forward || metadata_composite);
             // Deliberate-quit wiring (Windows pf-vdisplay; no-op elsewhere): every lease the
             // backend mints — the retry-hold below AND the capturer's — carries the session's quit
             // flag, so a user "stop" (⌘D → the QUIT close code) tears the virtual monitor down the
@@ -2378,6 +2399,8 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                                         plan.cursor_blend = crate::session_plan::cursor_blend_for(
                                             plan.cursor_forward,
                                             c == crate::vdisplay::Compositor::Gamescope,
+                                            plan.codec,
+                                            plan.bit_depth,
                                         );
                                         plan.gamescope_cursor =
                                             crate::session_plan::gamescope_cursor_for(
@@ -2385,6 +2408,16 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                                             );
                                         gamescope_composite =
                                             plan.gamescope_cursor && cursor_fwd.is_none();
+                                        metadata_composite = cursor_fwd.is_none()
+                                            && plan.cursor_blend
+                                            && c != crate::vdisplay::Compositor::Gamescope;
+                                        // The retargeted backend starts with `hw_cursor`
+                                        // unset — without re-applying the session's
+                                        // out-of-band cursor request, the rebuilt display
+                                        // would come up EMBEDDED: double-drawn for a
+                                        // desktop-model channel client, cursorless for
+                                        // every host-composite session.
+                                        vd.set_hw_cursor(plan.cursor_forward || metadata_composite);
                                     }
                                     Err(e2) => tracing::warn!(error = %format!("{e2:#}"),
                                         "capture loss: opening the newly-detected compositor failed — retrying"),
@@ -2560,15 +2593,41 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                     }
                 }
             }
-        } else if gamescope_composite {
-            // gamescope (Phase C): no channel, host always composites. Refresh the (repeat or new)
-            // frame's overlay from the capturer's LIVE cursor — the XFixes source publishes there
-            // — so pointer-only motion on a static gamescope UI re-blends at tick rate instead of
-            // freezing at the last damage frame (the same reason the composite arm above re-reads
-            // it). A grabbed/hidden pointer arrives `visible: false` and is stripped just below.
+        } else if gamescope_composite || metadata_composite {
+            // No channel, host always composites: gamescope (Phase C — the XFixes source
+            // publishes on `capturer.cursor()`) and the metadata-composite session (the portal
+            // `SPA_META_Cursor` live overlay publishes there too). Refresh the (repeat or new)
+            // frame's overlay from the capturer's LIVE cursor so pointer-only motion on a
+            // static desktop re-blends at tick rate instead of freezing at the last damage
+            // frame (the same reason the channel's composite arm above re-reads it). A
+            // grabbed/hidden pointer arrives `visible: false` and is stripped just below.
             #[cfg(not(target_os = "windows"))]
-            if let Some(live) = capturer.cursor() {
-                frame.cursor = Some(live);
+            match capturer.cursor() {
+                Some(live) => {
+                    if !composite_saw_overlay {
+                        composite_saw_overlay = true;
+                        tracing::info!(
+                            x = live.x,
+                            y = live.y,
+                            w = live.w,
+                            h = live.h,
+                            visible = live.visible,
+                            "host-composite: first live cursor overlay handed to the encoder \
+                             blend"
+                        );
+                    }
+                    frame.cursor = Some(live);
+                }
+                None => {
+                    if !composite_saw_none {
+                        composite_saw_none = true;
+                        tracing::info!(
+                            "host-composite active but the capture has no live cursor overlay \
+                             yet (no SPA_META_Cursor bitmap) — the stream is cursorless until \
+                             one arrives"
+                        );
+                    }
+                }
             }
         }
         // The overlay surfaces hidden pointers too (for the hint above) — strip them
@@ -2579,10 +2638,12 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
         // The seat-pointer park schedule (state + rationale at the declarations above; armed by
         // the first frame of every (re)built display and by the capture-model flip). The first
         // two attempts run unconditionally — attempt 1 can be swallowed by a cold EIS
-        // connection. Past those, only a cursor-channel session in the capture model that STILL
-        // has no live overlay keeps trying: that combination means the pointer has not reached
-        // the streamed output (the compositor reports cursor metadata only while it is over the
-        // recorded view), and a relative-only client cannot get it there on its own.
+        // connection. Past those, only a host-composite session that STILL has no live overlay
+        // keeps trying — a channel session in the capture model, or a no-channel
+        // metadata-composite session (both relative-only): no overlay there means the pointer
+        // has not reached the streamed output (the compositor reports cursor metadata only
+        // while it is over the recorded view), and a relative-only client cannot get it there
+        // on its own.
         // Armed from the loop's first tick — a static desktop may never deliver a fresh frame
         // (`parked_display` is only bookkeeping for rebuild re-arming), and the pointer must be
         // parked regardless.
@@ -2591,8 +2652,9 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
             && park_attempts < PARK_ATTEMPTS_MAX
             && std::time::Instant::now() >= next_park_at
         {
-            let composite_starved = cursor_fwd.is_some()
-                && !cursor_client_draws.load(Ordering::Relaxed)
+            let composite_starved = ((cursor_fwd.is_some()
+                && !cursor_client_draws.load(Ordering::Relaxed))
+                || metadata_composite)
                 && capturer.cursor().is_none();
             if park_attempts < 2 || composite_starved {
                 park_pointer(&input_tx, frame.width, frame.height);
@@ -3406,13 +3468,14 @@ pub(super) fn prepare_display(
         bit_depth,
         chroma,
         codec,
-        // Blend capability — must MATCH virtual_stream's resolve (Phase B: non-channel
-        // non-gamescope sessions get the pointer compositor-EMBEDDED, nothing to blend; the
-        // mid-stream `CursorRenderMode` flip strips/keeps `frame.cursor` per tick for channel
-        // sessions). gamescope (Phase C) can't embed → always composites the XFixes cursor.
+        // Blend capability — must MATCH virtual_stream's resolve. Windows-only path, where
+        // the rule is a constant `false` (the IDD capturer composites itself); passed through
+        // the shared rule anyway so the two resolves cannot drift.
         crate::session_plan::cursor_blend_for(
             cursor_forward,
             compositor == pf_vdisplay::Compositor::Gamescope,
+            codec,
+            bit_depth,
         ),
         cursor_forward,
     );

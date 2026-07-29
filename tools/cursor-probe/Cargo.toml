@@ -16,6 +16,7 @@ repository.workspace = true
 [target.'cfg(target_os = "linux")'.dependencies]
 pf-vdisplay = { path = "../../crates/pf-vdisplay" }
 pf-capture = { path = "../../crates/pf-capture" }
+pf-frame = { path = "../../crates/pf-frame" }
 pf-inject = { path = "../../crates/pf-inject" }
 punktfunk-core = { path = "../../crates/punktfunk-core", features = ["quic"] }
 anyhow = "1"

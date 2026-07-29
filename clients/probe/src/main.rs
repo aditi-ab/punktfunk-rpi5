@@ -122,6 +122,13 @@ struct Args {
     /// pointer-lock client expecting the HOST to composite the cursor into the video. Decode the
     /// dump and look for the pointer — a cursorless dump is the bug this flag was built to catch.
     cursor_capture: bool,
+    /// `--cursor-nochannel` — the same relative wiggle WITHOUT the cursor channel: no
+    /// `CLIENT_CAP_CURSOR`, no render-mode flip. The headless reproduction of a client LATCHED
+    /// in capture mode at connect (`console.rs` `latched_mouse` — it never advertises the
+    /// channel), the shape of the 2026-07 "no cursor in Mutter capture mode" field report. The
+    /// host must composite the metadata cursor on its own; decode the dump and look for the
+    /// pointer.
+    cursor_nochannel: bool,
     /// `--discover [SECS]` — browse the LAN for native (`_punktfunk._udp`) hosts for `SECS`
     /// seconds (default 4), print what's found, and exit. No connection is made.
     discover: Option<u64>,
@@ -301,6 +308,7 @@ fn parse_args() -> Args {
             .then(|| get("--discover").and_then(|s| s.parse().ok()).unwrap_or(4)),
         clock_resync: argv.iter().any(|a| a == "--clock-resync"),
         cursor_capture: argv.iter().any(|a| a == "--cursor-capture"),
+        cursor_nochannel: argv.iter().any(|a| a == "--cursor-nochannel"),
     }
 }
 
@@ -845,32 +853,37 @@ async fn session(args: Args) -> Result<()> {
                 "SPEED TEST complete",
             );
         });
-    } else if args.cursor_capture {
-        // Capture-model cursor repro: flip the negotiated cursor channel to "host composites"
-        // and drive RELATIVE pointer motion, exactly like a pointer-lock client. Owns BOTH
-        // control halves: the host may send CursorShape (0x50) messages while the channel is
+    } else if args.cursor_capture || args.cursor_nochannel {
+        // Capture-model cursor repro. `--cursor-capture`: flip the negotiated cursor channel to
+        // "host composites" and drive RELATIVE pointer motion, exactly like a pointer-lock
+        // client. `--cursor-nochannel`: the same motion with NO channel at all (a
+        // capture-latched client) — the host must composite unprompted. Owns BOTH control
+        // halves: the host may send CursorShape (0x50) messages while a negotiated channel is
         // still in its initial client-draws state, and dropping our recv half would fail those
         // writes host-side.
+        let flip_channel = args.cursor_capture;
         let mut cs = send;
         let mut cr = recv;
         tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            match io::write_msg(
-                &mut cs,
-                &CursorRenderMode {
-                    client_draws: false,
-                }
-                .encode(),
-            )
-            .await
-            {
-                Ok(()) => tracing::info!(
-                    "cursor-capture: CursorRenderMode {{ client_draws: false }} sent — the host \
-                     must now composite the pointer into the video"
-                ),
-                Err(e) => {
-                    tracing::error!(error = %format!("{e:#}"), "cursor-capture: render-mode write failed");
-                    return;
+            if flip_channel {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                match io::write_msg(
+                    &mut cs,
+                    &CursorRenderMode {
+                        client_draws: false,
+                    }
+                    .encode(),
+                )
+                .await
+                {
+                    Ok(()) => tracing::info!(
+                        "cursor-capture: CursorRenderMode {{ client_draws: false }} sent — the \
+                         host must now composite the pointer into the video"
+                    ),
+                    Err(e) => {
+                        tracing::error!(error = %format!("{e:#}"), "cursor-capture: render-mode write failed");
+                        return;
+                    }
                 }
             }
             // Drain (and just log) whatever the host still sends on the control stream.

@@ -153,6 +153,19 @@ mod linux {
             }
         });
 
+        let dump = args.iter().any(|a| a == "--dump");
+        let dump_dir = format!(
+            "/tmp/pf-probe-frames-{}",
+            if embedded { "embedded" } else { "metadata" }
+        );
+        if dump {
+            let _ = std::fs::remove_dir_all(&dump_dir);
+            let _ = std::fs::create_dir_all(&dump_dir);
+        }
+        let mut prev: Vec<u8> = Vec::new();
+        let mut changed = 0u64;
+        let mut dumped = 0u32;
+
         let deadline = Instant::now() + Duration::from_secs(secs);
         let (mut frames, mut with_overlay) = (0u64, 0u64);
         let mut last_report = Instant::now();
@@ -161,6 +174,24 @@ mod linux {
             // Damage-driven source: timeouts (gaps) are normal, hence the missing error arm.
             if let Ok(f) = cap.next_frame_within(Duration::from_millis(500)) {
                 frames += 1;
+                if let pf_frame::FramePayload::Cpu(data) = &f.payload {
+                    if !prev.is_empty()
+                        && prev.len() == data.len()
+                        && prev.as_slice() != data.as_slice()
+                    {
+                        changed += 1;
+                    }
+                    prev.clear();
+                    prev.extend_from_slice(data);
+                    if dump && frames % 15 == 1 && dumped < 16 {
+                        dumped += 1;
+                        let path = format!("{dump_dir}/frame-{frames:05}.ppm");
+                        match dump_ppm(&path, f.width, f.height, f.format, data) {
+                            Ok(()) => println!("cursor-probe: dumped {path}"),
+                            Err(e) => eprintln!("cursor-probe: dump failed: {e:#}"),
+                        }
+                    }
+                }
                 if let Some(c) = &f.cursor {
                     with_overlay += 1;
                     if with_overlay == 1 {
@@ -195,9 +226,13 @@ mod linux {
         let _ = injector.join();
 
         println!("---");
+        println!(
+            "cursor-probe: content-changed frames: {changed}/{frames} (a moving embedded \
+             cursor over a static desktop should change nearly every frame)"
+        );
         if embedded {
             println!(
-                "cursor-probe: EMBEDDED run — no metadata expected; check the stream visually. \
+                "cursor-probe: EMBEDDED run — no metadata expected; check the dumped frames. \
                  frames={frames}"
             );
         } else if live_seen || with_overlay > 0 {
@@ -211,6 +246,28 @@ mod linux {
                  the virtual output ({frames} frames) — the compositor is not delivering \
                  SPA_META_Cursor on this stream"
             );
+        }
+        Ok(())
+    }
+
+    /// Write a packed 4-bpp frame as a PPM, swapping B/R for the BGR layouts. Enough fidelity
+    /// to answer "is the pointer in the pixels".
+    fn dump_ppm(
+        path: &str,
+        w: u32,
+        h: u32,
+        format: pf_frame::PixelFormat,
+        data: &[u8],
+    ) -> Result<()> {
+        use std::io::Write;
+        let mut out = std::io::BufWriter::new(std::fs::File::create(path)?);
+        write!(out, "P6\n{w} {h}\n255\n")?;
+        let (ri, gi, bi) = match format {
+            pf_frame::PixelFormat::Rgbx | pf_frame::PixelFormat::Rgba => (0usize, 1usize, 2usize),
+            _ => (2usize, 1usize, 0usize),
+        };
+        for px in data.chunks_exact(4).take((w as usize) * (h as usize)) {
+            out.write_all(&[px[ri], px[gi], px[bi]])?;
         }
         Ok(())
     }
