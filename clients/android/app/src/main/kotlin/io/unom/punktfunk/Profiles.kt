@@ -323,11 +323,39 @@ class ProfileStore(context: Context) {
 }
 
 /**
+ * Chip colours a new profile is given, in order. Chosen to stay legible on a dark surface and to
+ * be distinguishable from each other at the size they are actually used — a 6dp dot on a chip and
+ * a tint on a pinned card. Deliberately NOT the presence green ([HostCard]'s online dot), which
+ * means something else entirely.
+ */
+val PROFILE_ACCENTS = listOf(
+    "#FF8A4C", // orange
+    "#60A5FA", // blue
+    "#F472B6", // pink
+    "#34D399", // green
+    "#FBBF24", // amber
+    "#A78BFA", // violet
+    "#22D3EE", // cyan
+    "#FB7185", // rose
+)
+
+/** The first accent no existing profile is using, so two profiles don't look alike by accident. */
+fun nextAccent(existing: List<StreamProfile>): String {
+    val taken = existing.mapNotNull { it.accent?.lowercase() }.toSet()
+    return PROFILE_ACCENTS.firstOrNull { it.lowercase() !in taken } ?: PROFILE_ACCENTS.first()
+}
+
+/**
  * A new, empty profile: it inherits everything, which is the right creation default under
  * inherit-by-exception (Duplicate covers "start from that other profile"). The id is 12 lowercase
  * hex characters — the shape the Rust `new_profile_id` mints.
+ *
+ * [accent] is presentation, not a setting, so it does NOT inherit — a profile with no colour would
+ * be indistinguishable from the defaults everywhere the accent is the whole signal (a bound card's
+ * chip, a pinned card's tint). Callers creating a profile from the UI pass [nextAccent].
  */
-fun newProfile(name: String): StreamProfile = StreamProfile(id = newProfileId(), name = name)
+fun newProfile(name: String, accent: String? = null): StreamProfile =
+    StreamProfile(id = newProfileId(), name = name, accent = accent)
 
 private val PROFILE_ID_RNG = SecureRandom()
 

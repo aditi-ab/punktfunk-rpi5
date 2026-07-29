@@ -1,10 +1,14 @@
 package io.unom.punktfunk
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
@@ -42,6 +46,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 
 /**
@@ -62,6 +68,7 @@ internal fun ProfileScopeChips(
     onNew: () -> Unit,
     onRename: () -> Unit,
     onDuplicate: () -> Unit,
+    onRecolour: () -> Unit,
     onDelete: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -111,6 +118,7 @@ internal fun ProfileScopeChips(
                 DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
                     DropdownMenuItem(text = { Text("Rename…") }, onClick = { menu = false; onRename() })
                     DropdownMenuItem(text = { Text("Duplicate") }, onClick = { menu = false; onDuplicate() })
+                    DropdownMenuItem(text = { Text("Change colour…") }, onClick = { menu = false; onRecolour() })
                     DropdownMenuItem(text = { Text("Delete…") }, onClick = { menu = false; onDelete() })
                 }
             }
@@ -183,6 +191,66 @@ internal fun ProfileNameFields(name: String, duplicate: Boolean, onNameChange: (
             },
         )
     }
+}
+
+/**
+ * Pick a profile's chip colour. The accent is the whole signal on the surfaces where a profile has
+ * no room for its name — a bound host card's chip, a pinned card's tint — so it is worth being able
+ * to choose rather than take whatever creation handed out.
+ */
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+internal fun ProfileColourDialog(
+    profile: StreamProfile,
+    onPick: (String?) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Colour for “${profile.name}”") },
+        text = {
+            FlowRow(
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                PROFILE_ACCENTS.forEach { hex ->
+                    Swatch(
+                        colour = accentColor(hex),
+                        selected = profile.accent?.equals(hex, ignoreCase = true) == true,
+                        onClick = { onPick(hex) },
+                    )
+                }
+                // "No colour" is a real choice, not an absence: the chip then falls back to the
+                // theme's own accent, which is what a profile created before this picker existed has.
+                Swatch(colour = null, selected = profile.accent == null, onClick = { onPick(null) })
+            }
+        },
+        confirmButton = {},
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Close") } },
+    )
+}
+
+/** One colour choice: a filled disc, ringed when it is the current one. `null` = no colour. */
+@Composable
+private fun Swatch(colour: Color?, selected: Boolean, onClick: () -> Unit) {
+    val fill = colour ?: MaterialTheme.colorScheme.surfaceVariant
+    Box(
+        Modifier
+            .size(40.dp)
+            .clip(CircleShape)
+            .background(fill)
+            .then(
+                if (selected) {
+                    Modifier.border(3.dp, MaterialTheme.colorScheme.onSurface, CircleShape)
+                } else if (colour == null) {
+                    Modifier.border(1.dp, MaterialTheme.colorScheme.outline, CircleShape)
+                } else {
+                    Modifier
+                },
+            )
+            .clickable(onClick = onClick)
+            .semantics { contentDescription = if (colour == null) "No colour" else "Colour" },
+    )
 }
 
 /**

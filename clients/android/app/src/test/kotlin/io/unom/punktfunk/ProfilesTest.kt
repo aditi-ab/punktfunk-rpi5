@@ -216,6 +216,25 @@ class ProfilesTest {
         assertEquals(base, base.effectiveFor(store.resolveFor(h, oneOff = null)))
     }
 
+    /**
+     * A profile created from the UI gets a colour, and a distinct one — the accent is the WHOLE
+     * signal on a bound host card's chip and a pinned card's tint, so two profiles sharing it (or
+     * having none) makes those surfaces say less than they look like they're saying.
+     */
+    @Test
+    fun creationHandsOutADistinctColour() {
+        val made = mutableListOf<StreamProfile>()
+        repeat(PROFILE_ACCENTS.size) { made += newProfile("p$it", nextAccent(made)) }
+        assertEquals(PROFILE_ACCENTS, made.map { it.accent })
+        // Past the palette it wraps rather than handing out nothing — a duplicate colour beats an
+        // invisible chip, and the picker is right there.
+        assertEquals(PROFILE_ACCENTS.first(), nextAccent(made))
+        // A gap is reused before wrapping.
+        assertEquals(PROFILE_ACCENTS[2], nextAccent(made.filter { it.accent != PROFILE_ACCENTS[2] }))
+        // The colour is presentation, so it never reaches the resolved settings.
+        assertEquals(base, made.first().overrides.apply(base))
+    }
+
     @Test
     fun mintedIdsAreWellFormed() {
         val id = newProfileId()

@@ -131,6 +131,7 @@ fun SettingsScreen(
     var showControllers by remember { mutableStateOf(false) }
     var naming by remember { mutableStateOf<NameIntent?>(null) }
     var deleting by remember { mutableStateOf<StreamProfile?>(null) }
+    var recolouring by remember { mutableStateOf<StreamProfile?>(null) }
 
     // Every row renders the EFFECTIVE value: the globals with this profile's overrides on top, so a
     // row the profile doesn't override reads as the live global — and keeps following it.
@@ -206,6 +207,7 @@ fun SettingsScreen(
                     scopeId = copy.id
                 }
             },
+            onRecolour = { recolouring = active },
             onDelete = { deleting = active },
             modifier = Modifier.padding(top = 12.dp),
         )
@@ -309,13 +311,25 @@ fun SettingsScreen(
             confirmLabel = if (editing == null) "Create" else "Rename",
             taken = { profileStore.nameTaken(it, except = editing?.id) },
             onConfirm = { name ->
-                val saved = editing?.copy(name = name) ?: newProfile(name)
+                val saved = editing?.copy(name = name) ?: newProfile(name, nextAccent(profiles))
                 profileStore.save(saved)
                 profiles = profileStore.all()
                 scopeId = saved.id
                 naming = null
             },
             onDismiss = { naming = null },
+        )
+    }
+
+    recolouring?.let { profile ->
+        ProfileColourDialog(
+            profile = profile,
+            onPick = { hex ->
+                profileStore.save(profile.copy(accent = hex))
+                profiles = profileStore.all()
+                recolouring = null
+            },
+            onDismiss = { recolouring = null },
         )
     }
 
