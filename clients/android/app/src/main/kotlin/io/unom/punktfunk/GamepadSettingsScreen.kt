@@ -141,7 +141,10 @@ fun GamepadSettingsScreen(
                 verticalArrangement = Arrangement.spacedBy(6.dp),
             ) {
             item(key = "__title") {
-                ConsoleHeader("Settings", horizontalInset = false)
+                // "Default settings", not "Settings": this screen edits the base layer only. The
+                // console honours a host's profile but doesn't edit profiles (design §5.4), so a
+                // bare "Settings" would quietly imply it changes whatever that host streams with.
+                ConsoleHeader("Default settings", horizontalInset = false)
             }
             itemsIndexed(rows, key = { _, r -> r.id }) { index, row ->
                 SettingRowView(row, focused = index == focus, adjustDir = adjustDir, onClick = {
@@ -308,9 +311,36 @@ private fun buildSettingsRows(
         toggled = value,
     )
 
+    // Grouped and ordered by the cross-client category map (General / Display / Audio /
+    // Controllers), with the same sub-section names the touch settings and the desktop clients use,
+    // so a setting sits in the same place whichever surface you found it on. The ROWS stay the
+    // couch-relevant subset: a pad can't drive a touch-input picker, and adding one for the sake of
+    // symmetry would be parity in name only.
     return listOf(
         choice(
-            "resolution", "Stream", "Resolution",
+            "hud", "General · Statistics", "Statistics overlay",
+            "How much the overlay shows: Compact (one line) → Normal → Detailed (full HUD). " +
+                "A 3-finger tap cycles the tiers live.",
+            STATS_VERBOSITY_OPTIONS, s.statsVerbosity,
+        ) { update(s.copy(statsVerbosity = it)) },
+        toggle(
+            "autoWake", "General · Session", "Auto-wake on connect",
+            "Wake a saved host with Wake-on-LAN when it isn't seen on the network, then connect.",
+            s.autoWakeEnabled,
+        ) { update(s.copy(autoWakeEnabled = it)) },
+        toggle(
+            "library", "General · Library", "Game library",
+            "Browse a paired host's games with Y (experimental).",
+            s.libraryEnabled,
+        ) { update(s.copy(libraryEnabled = it)) },
+        toggle(
+            "gamepadUI", "General · Interface", "Controller-optimized UI",
+            "Turn off to use the touch interface even with a controller connected.",
+            s.gamepadUiEnabled,
+        ) { update(s.copy(gamepadUiEnabled = it)) },
+
+        choice(
+            "resolution", "Display · Resolution", "Resolution",
             "The host creates a virtual display at exactly this size — no scaling. " +
                 "Custom sizes are typed in the touch settings.",
             // A custom size (typed in the touch settings) leads the list so it stays visible and
@@ -327,19 +357,15 @@ private fun buildSettingsRows(
             "refresh", null, "Refresh rate", "Frame rate the host renders and streams at.",
             REFRESH_OPTIONS, s.hz,
         ) { update(s.copy(hz = it)) },
+
         choice(
-            "bitrate", null, "Bitrate",
-            "Automatic uses the host's default. Run a speed test from the touch UI for an informed value.",
+            "bitrate", "Display · Quality", "Bitrate",
+            "Automatic uses the host's default. A host's options (Up on its tile) can measure the " +
+                "link and set an informed value.",
             BITRATE_OPTIONS, s.bitrateKbps,
         ) { update(s.copy(bitrateKbps = it)) },
         choice(
-            "compositor", null, "Compositor",
-            "Which compositor drives the virtual output — honored only if available on the host.",
-            COMPOSITOR_OPTIONS.mapIndexed { i, lbl -> i to lbl }, s.compositor,
-        ) { update(s.copy(compositor = it)) },
-
-        choice(
-            "codec", "Video", "Video codec",
+            "codec", null, "Video codec",
             "A preference — the host falls back if it can't encode this one.",
             codecOptionsFor(s.codec, av1Capable), s.codec,
         ) { update(s.copy(codec = it)) },
@@ -348,11 +374,18 @@ private fun buildSettingsRows(
             "HDR10 — engages when the host sends HDR content and this display supports it.",
             s.hdrEnabled,
         ) { update(s.copy(hdrEnabled = it)) },
+
         toggle(
-            "lowLatency", null, "Low-latency mode",
+            "lowLatency", "Display · Decoding", "Low-latency mode",
             "The fast pipeline (async decode + system tuning). On by default — turn off to fall back if the stream stutters or glitches.",
             s.lowLatencyMode,
         ) { update(s.copy(lowLatencyMode = it)) },
+
+        choice(
+            "compositor", "Display · Host output", "Compositor",
+            "Which compositor drives the virtual output — honored only if available on the host.",
+            COMPOSITOR_OPTIONS.mapIndexed { i, lbl -> i to lbl }, s.compositor,
+        ) { update(s.copy(compositor = it)) },
 
         choice(
             "audio", "Audio", "Audio channels", "The speaker layout requested from the host.",
@@ -364,7 +397,7 @@ private fun buildSettingsRows(
         ) { update(s.copy(micEnabled = it)) },
 
         choice(
-            "padType", "Controller", "Controller type",
+            "padType", "Controllers", "Controller type",
             "The virtual pad the host creates — Automatic matches this controller.",
             GAMEPAD_OPTIONS, s.gamepad,
         ) { update(s.copy(gamepad = it)) },
@@ -380,26 +413,13 @@ private fun buildSettingsRows(
             null
         },
     ) + listOf(
-        choice(
-            "hud", "Interface", "Statistics overlay",
-            "How much the overlay shows: Compact (one line) → Normal → Detailed (full HUD). " +
-                "A 3-finger tap cycles the tiers live.",
-            STATS_VERBOSITY_OPTIONS, s.statsVerbosity,
-        ) { update(s.copy(statsVerbosity = it)) },
+        // NOT gated on the vibrator (the bug A2 fixed in the touch settings): an SC2 capture has
+        // nothing to do with this device's motor, and a TV box is where it matters most.
         toggle(
-            "library", null, "Game library",
-            "Browse a paired host's games with Y (experimental).",
-            s.libraryEnabled,
-        ) { update(s.copy(libraryEnabled = it)) },
-        toggle(
-            "autoWake", null, "Auto-wake on connect",
-            "Wake a saved host with Wake-on-LAN when it isn't seen on the network, then connect.",
-            s.autoWakeEnabled,
-        ) { update(s.copy(autoWakeEnabled = it)) },
-        toggle(
-            "gamepadUI", null, "Controller-optimized UI",
-            "Turn off to use the touch interface even with a controller connected.",
-            s.gamepadUiEnabled,
-        ) { update(s.copy(gamepadUiEnabled = it)) },
+            "sc2", null, "Steam Controller 2 passthrough",
+            "Capture a Steam Controller 2 (wired, Puck dongle, or paired Bluetooth) and stream " +
+                "it as-is — Steam on the host drives it like the physical pad.",
+            s.sc2Capture,
+        ) { update(s.copy(sc2Capture = it)) },
     )
 }
