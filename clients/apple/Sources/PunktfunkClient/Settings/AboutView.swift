@@ -6,6 +6,10 @@
 // The license wall itself is still `AcknowledgementsView`; About opens it as a sheet — pushed
 // only on tvOS, where this page really is inside a navigation stack. The iPad settings detail
 // column deliberately isn't one, so a push there had no way back.
+//
+// Wording note: this page says the SOURCE is open, never that the app is "free software". The
+// term means liberty, but it is read as price — and this app is sold on the App Store, so to the
+// person most likely to read this line it would be a claim about what they just paid for.
 
 import PunktfunkKit
 import SwiftUI
@@ -50,7 +54,7 @@ struct AboutView: View {
             Section {
                 acknowledgementsRow
             } footer: {
-                Text("Punktfunk is free software under MIT or Apache-2.0.")
+                Text("Punktfunk's source is open under MIT or Apache-2.0.")
                     .font(.geist(12, relativeTo: .caption))
                     .foregroundStyle(.secondary)
             }
@@ -165,7 +169,7 @@ struct AboutView: View {
                     tvAddress("Source code", Destination.source)
                 }
                 NavigationLink("Acknowledgements") { AcknowledgementsView() }
-                Text("Punktfunk is free software under MIT or Apache-2.0.")
+                Text("Punktfunk's source is open under MIT or Apache-2.0.")
                     .font(.geist(20, relativeTo: .caption))
                     .foregroundStyle(.secondary)
             }
