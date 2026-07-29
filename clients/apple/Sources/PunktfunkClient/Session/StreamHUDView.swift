@@ -91,7 +91,8 @@ struct StreamHUDView: View {
                 if let profile = model.settings.profileName {
                     Text("· \(profile)")
                         .font(.system(.caption, design: .monospaced))
-                        .foregroundStyle(Color.accentColor)
+                        .foregroundStyle(
+                            Color(hex: model.settings.profileAccent ?? "") ?? Color.accentColor)
                         .lineLimit(1)
                 }
             }

@@ -55,6 +55,9 @@ public struct EffectiveSettings: Equatable, Sendable {
     /// to be guessed from the settings themselves.
     public var profileID: String?
     public var profileName: String?
+    /// The profile's `#RRGGBB` chip colour, so the HUD names it in the same colour the card that
+    /// launched it wore — the colour is an identifier, and it only works if it's the same one.
+    public var profileAccent: String?
 
     public init() {}
 
@@ -170,6 +173,7 @@ public struct EffectiveSettings: Equatable, Sendable {
         var out = base.applying(profile.overrides)
         out.profileID = profile.id
         out.profileName = profile.name
+        out.profileAccent = profile.accent
         return out
     }
 }

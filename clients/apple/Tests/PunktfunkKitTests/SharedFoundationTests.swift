@@ -8,6 +8,7 @@
 //   • the settings-profile catalog — including the don't-clobber rule that keeps an older build
 //     from erasing a newer one's overlay fields just by opening a profile.
 
+import SwiftUI
 import XCTest
 
 @testable import PunktfunkKit
@@ -354,6 +355,26 @@ final class SharedFoundationTests: XCTestCase {
         XCTAssertEqual(catalog.pinned(for: host).map(\.id), ["222222222222", "111111111111"])
     }
 
+    /// The accent is a plain `#RRGGBB` string in the catalog — the palette is what this client
+    /// OFFERS, not what it accepts, so a colour another platform wrote still renders and a
+    /// malformed one falls back to the brand tint rather than to black.
+    func testProfileAccentParsing() {
+        XCTAssertNotNil(Color(hex: "#ff8800"))
+        XCTAssertNil(Color(hex: "ff8800"), "a missing # is not a colour")
+        XCTAssertNil(Color(hex: "#ff88"), "a short value is not a colour")
+        XCTAssertNil(Color(hex: "#gggggg"), "non-hex is not a colour")
+        XCTAssertNil(Color(hex: ""))
+
+        // Every offered swatch parses, and each is distinguishable by name and value.
+        XCTAssertEqual(Set(ProfileAccent.palette.map(\.hex)).count, ProfileAccent.palette.count)
+        for accent in ProfileAccent.palette {
+            XCTAssertNotNil(Color(hex: accent.hex), accent.name)
+            XCTAssertEqual(ProfileAccent.named(accent.hex.uppercased())?.name, accent.name)
+        }
+        XCTAssertNil(ProfileAccent.named(nil))
+        XCTAssertNil(ProfileAccent.named("#123456"), "an unlisted colour has no palette name")
+    }
+
     /// The whole per-connect resolution, in the precedence every client shares:
     /// one-off pick ?? host binding ?? none.
     func testEffectiveSettingsResolutionPrecedence() {
@@ -367,7 +388,8 @@ final class SharedFoundationTests: XCTestCase {
         var workOverrides = SettingsOverlay()
         workOverrides.bitrateKbps = 8_000
         let catalog = ProfileCatalog(profiles: [
-            StreamProfile(name: "Game", id: "111111111111", overrides: gameOverrides),
+            StreamProfile(
+                name: "Game", id: "111111111111", accent: "#ff8800", overrides: gameOverrides),
             StreamProfile(name: "Work", id: "222222222222", overrides: workOverrides),
         ])
         var host = StoredHost(name: "Desk", address: "10.0.0.1")
@@ -383,6 +405,9 @@ final class SharedFoundationTests: XCTestCase {
         let bound = EffectiveSettings.resolve(host: host, catalog: catalog, defaults: defaults)
         XCTAssertEqual(bound.bitrateKbps, 80_000)
         XCTAssertEqual(bound.profileName, "Game")
+        // The chip colour rides along, so the HUD can name the session in the same colour the
+        // card that launched it wore.
+        XCTAssertEqual(bound.profileAccent, "#ff8800")
 
         // A one-off pick wins over the binding — and does not rebind anything.
         let oneOff = EffectiveSettings.resolve(

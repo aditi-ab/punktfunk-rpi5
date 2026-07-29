@@ -218,7 +218,7 @@ struct SettingsView: View {
             .tabItem { Label("Controllers", systemImage: "gamecontroller") }
             .tag(MacTab.controllers)
 
-            AcknowledgementsView()
+            AboutView()
                 .tabItem { Label("About", systemImage: "info.circle") }
                 .tag(MacTab.about)
         }
@@ -346,10 +346,11 @@ struct SettingsView: View {
                 .navigationTitle("Controllers")
                 .navigationBarTitleDisplayMode(.inline)
         case .about:
-            // Already a full scrollable view that sets its own "Acknowledgements" title; pin the
-            // display mode inline to match the five sibling detail pages (it would otherwise inherit
-            // the large title from the "Settings" sidebar root).
-            AcknowledgementsView()
+            // The identity card; the license wall is one push further in. Inline title to match
+            // the five sibling detail pages (it would otherwise inherit the large title from the
+            // "Settings" sidebar root).
+            AboutView()
+                .navigationTitle("About")
                 .navigationBarTitleDisplayMode(.inline)
         }
     }
@@ -481,7 +482,7 @@ struct SettingsView: View {
                     title: "Gamepad-optimized browsing",
                     options: [("On", "on"), ("Off", "off")], selection: gamepadUIEnabledTag)
                 tvCaption(Self.controllersFooter)
-                NavigationLink("Acknowledgements") { AcknowledgementsView() }
+                NavigationLink("About") { AboutView() }
                     .padding(.top, 8)
             }
             .frame(maxWidth: 1000)

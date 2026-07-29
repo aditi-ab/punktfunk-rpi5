@@ -316,15 +316,65 @@ extension SettingsView {
                 nameDraft = Self.copyName(of: active.name, in: profiles)
                 nameAction = .duplicate(active.id)
             }
+            colorMenu(active)
             Button("Delete “\(active.name)”…", role: .destructive) {
                 profilePendingDelete = active
             }
         }
     }
 
+    /// "Color ▸" — what tints this profile's chip on the host cards and its dot here. A palette
+    /// rather than a colour well: the chip is small tinted text on a tinted capsule, and a colour
+    /// picked freehand lands somewhere unreadable often enough to matter (see `ProfileAccent`).
+    @ViewBuilder
+    private func colorMenu(_ active: StreamProfile) -> some View {
+        Menu("Color") {
+            Button {
+                profiles.setAccent(active.id, to: nil)
+            } label: {
+                Self.checkable("Default", on: active.accent == nil)
+            }
+            ForEach(ProfileAccent.palette) { accent in
+                Button {
+                    profiles.setAccent(active.id, to: accent.hex)
+                } label: {
+                    Self.checkable(
+                        accent.name,
+                        on: active.accent?.caseInsensitiveCompare(accent.hex) == .orderedSame)
+                }
+            }
+        }
+    }
+
+    /// A menu row carrying a checkmark when it is the current choice. Two shapes rather than one
+    /// `Label` with an empty symbol name — `Image(systemName: "")` is not a blank image.
+    @ViewBuilder
+    private static func checkable(_ title: String, on: Bool) -> some View {
+        if on {
+            Label(title, systemImage: "checkmark")
+        } else {
+            Text(title)
+        }
+    }
+
     /// The name of the layer being edited, and one line on what editing it means. Shared by both
     /// chromes — the caption is a stacked line on macOS and the list section's footer on iOS.
     var scopeName: String { activeProfile?.name ?? "Default settings" }
+
+    /// The edited layer as a glyph: a profile's own colour, or the settings gear for the
+    /// defaults. Colour is only worth choosing if it shows up where you chose it.
+    @ViewBuilder
+    var scopeDot: some View {
+        if let profile = activeProfile {
+            Circle()
+                .fill(profile.accentColor)
+                .frame(width: 9, height: 9)
+                .accessibilityHidden(true) // the name is right beside it
+        } else {
+            Image(systemName: "gearshape")
+                .foregroundStyle(.secondary)
+        }
+    }
 
     var scopeCaption: String {
         activeProfile == nil
@@ -339,9 +389,10 @@ extension SettingsView {
         profilePrompts(
             VStack(alignment: .leading, spacing: 4) {
                 Menu { scopeMenuContent } label: {
-                    Label(
-                        scopeName,
-                        systemImage: activeProfile == nil ? "gearshape" : "slider.horizontal.3")
+                    HStack(spacing: 6) {
+                        scopeDot
+                        Text(scopeName)
+                    }
                 }
                 .menuStyle(.button)
                 .fixedSize()
@@ -365,6 +416,7 @@ extension SettingsView {
                     Text("Editing")
                         .foregroundStyle(.primary)
                     Spacer(minLength: 8)
+                    scopeDot
                     Text(scopeName)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)

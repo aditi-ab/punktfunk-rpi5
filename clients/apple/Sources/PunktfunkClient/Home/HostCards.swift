@@ -325,7 +325,7 @@ struct ProfileChip: View {
     var prominent = false
 
     var body: some View {
-        let tint = profile.accentColor ?? Color.brand
+        let tint = profile.accentColor
         return HStack(spacing: 5) {
             Circle()
                 .fill(tint)
@@ -340,20 +340,6 @@ struct ProfileChip: View {
         .padding(.vertical, 2)
         .background(Capsule().fill(tint.opacity(prominent ? 0.24 : 0.12)))
         .accessibilityLabel("Profile \(profile.name)")
-    }
-}
-
-extension StreamProfile {
-    /// The `#RRGGBB` accent as a colour, or nil when the profile hasn't been given one (the
-    /// schema reserves the field; every surface falls back to the brand tint).
-    var accentColor: Color? {
-        guard let accent, accent.hasPrefix("#"), accent.count == 7,
-              let value = UInt32(accent.dropFirst(), radix: 16)
-        else { return nil }
-        return Color(
-            red: Double((value >> 16) & 0xFF) / 255,
-            green: Double((value >> 8) & 0xFF) / 255,
-            blue: Double(value & 0xFF) / 255)
     }
 }
 
