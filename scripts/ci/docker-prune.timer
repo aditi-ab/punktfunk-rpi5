@@ -1,13 +1,19 @@
-# Runs docker-prune.service every 30 min. The runner is hammered with build bursts that can refill
-# the disk fast (and the actcache cap needs to react well within an hour), so 30 min beats hourly.
+# Runs docker-prune.service every 10 min. It was every 30, and that is how the burst guard never
+# fired once: three concurrent Rust builds fill the disk and drain it again well inside a 30-minute
+# window, so the poll kept landing on a healthy `df` while jobs died of ENOSPC in between. (An arch
+# build failed with `as: BFD assertion fail` — assembler noise for "can't write, No space left on
+# device" — and by the time anyone looked, the disk was back to 37% used.)
+#
+# Ten minutes is mitigation, not a fix: the real levers are runner capacity (three replicas sharing
+# one 123 G disk) or a bigger disk. RandomizedDelaySec stays low so the guard is prompt.
 # Persistent=true catches up after downtime. Install: see the header of docker-prune.service.
 
 [Unit]
-Description=Run docker-prune every 30 min (CI runner disk hygiene + actcache cap + burst guard)
+Description=Run docker-prune every 10 min (CI runner disk hygiene + cache cap + burst guard)
 
 [Timer]
-OnCalendar=*:0/30
-RandomizedDelaySec=120
+OnCalendar=*:0/10
+RandomizedDelaySec=30
 Persistent=true
 
 [Install]
