@@ -37,6 +37,23 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 $PSNativeCommandUseErrorActionPreference = $false
 
+# The decoded signing key must not outlive this script. It is a STABLE key now — trusted as a
+# machine root on every box that installs punktfunk — so a .pfx left behind in a build directory is
+# a standing credential on a machine that runs build jobs, not the throwaway it used to be. A
+# script-scope trap covers the failure paths; Remove-SigningPfx is also called on the way out.
+$script:ShredPfx = $null
+function Remove-SigningPfx {
+    if ($script:ShredPfx -and (Test-Path $script:ShredPfx)) {
+        Remove-Item $script:ShredPfx -Force -ErrorAction SilentlyContinue
+        $script:ShredPfx = $null
+    }
+}
+# `break` is for explicitness, not correctness: measured on the runner, a bare trap and
+# trap+break behave identically here (exit 1, no resumption) for `throw` at script scope,
+# `throw` inside a function, and a cmdlet error under EAP=Stop. Kept because it states the
+# intent — shred, then re-throw — instead of relying on a default that is easy to misread.
+trap { Remove-SigningPfx; break }
+
 $DriversDir = (Resolve-Path $DriversDir).Path
 $inx = Join-Path $DriversDir 'pf-vdisplay\pf_vdisplay.inx'
 $clear = Join-Path $PSScriptRoot 'clear-force-integrity.ps1'
@@ -96,6 +113,7 @@ $cleanupCert = $null
 if ($CertPfxB64) {
     Write-Host '==> signing with supplied driver cert (DRIVER_CERT_PFX_B64)'
     $pfx = Join-Path $Out '..\driver-signing.pfx'
+    $script:ShredPfx = $pfx
     [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($CertPfxB64))
     $sec = if ($CertPassword) { ConvertTo-SecureString $CertPassword -AsPlainText -Force } else { $null }
     $signArgs = @('/f', $pfx); if ($CertPassword) { $signArgs += @('/p', $CertPassword) }
@@ -138,6 +156,7 @@ if (-not (Test-Path $sCat)) { throw "Inf2Cat did not produce $sCat" }
 if ($LASTEXITCODE -ne 0) { throw "signtool sign (cat) failed ($LASTEXITCODE)" }
 Export-Certificate -Cert $pubForCer -FilePath $sCer | Out-Null
 if ($cleanupCert) { Remove-Item "Cert:\CurrentUser\My\$($cleanupCert.Thumbprint)" -Force -ErrorAction SilentlyContinue }
+Remove-SigningPfx
 
 # --- 5. guard: assert the freshly-built catalog covers the inf + dll ---------------------------
 # Built-from-source can't drift, but this catches a botched stampinf/Inf2Cat ordering. Test-FileCatalog
