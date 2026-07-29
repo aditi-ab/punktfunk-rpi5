@@ -127,7 +127,10 @@ jobs:
       # hand-off shim. --no-default-features on ARM64 is a no-op for the shell.
       - name: Build (release)
         shell: pwsh
-        run: cargo build --release -p punktfunk-client-windows -p punktfunk-client-session ${{ matrix.session_flags }} --target ${{ matrix.target }}
+        # punktfunk-cli builds the `punktfunk.exe` the manifest aliases and pack-msix.ps1
+        # requires (bf981027 added the requirement without the build — same gap 90c84ef4
+        # closed for deb).
+        run: cargo build --release -p punktfunk-client-windows -p punktfunk-client-session -p punktfunk-cli ${{ matrix.session_flags }} --target ${{ matrix.target }}
 
       - name: Pack + sign MSIX
         shell: pwsh

@@ -57,3 +57,11 @@ ARG SCCACHE_VERSION=0.10.0
 RUN curl -fsSL "https://github.com/mozilla/sccache/releases/download/v${SCCACHE_VERSION}/sccache-v${SCCACHE_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
     | tar -xz --wildcards --strip-components=1 -C /usr/local/bin '*/sccache' \
     && sccache --version
+
+# actions/checkout (and every other JS action: cache, upload-artifact) execs `node` INSIDE
+# the job container — no node, no checkout (exit 127; same lesson flatpak.yml documents for
+# fedora:43). A separate trailing layer on purpose: appending here keeps the fat SDK/NDK
+# layers above cache-valid instead of invalidating the whole build.
+RUN apt-get update && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/* \
+    && node --version
