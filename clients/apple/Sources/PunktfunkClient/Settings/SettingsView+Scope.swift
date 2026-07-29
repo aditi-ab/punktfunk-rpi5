@@ -295,10 +295,20 @@ extension SettingsView {
     /// remote does well, and the pattern should prove itself on the primary surfaces first.
     @ViewBuilder
     var scopeMenuContent: some View {
+        // A Picker rather than hand-rolled buttons: the platform owns the selection checkmark
+        // and draws it in its OWN column, which leaves each row's icon free to be the profile's
+        // colour chip. Rolling the selection by hand would have cost one or the other.
         Picker("Editing", selection: scopeSelection) {
-            Text("Default settings").tag(SettingsScope.defaults)
+            Label("Default settings", systemImage: "gearshape")
+                .tag(SettingsScope.defaults)
             ForEach(profiles.profiles) { profile in
-                Text(profile.name).tag(SettingsScope.profile(profile.id))
+                Label {
+                    Text(profile.name)
+                } icon: {
+                    Image(systemName: "circle.fill")
+                        .foregroundStyle(profile.accentColor)
+                }
+                .tag(SettingsScope.profile(profile.id))
             }
         }
         .pickerStyle(.inline)
@@ -306,11 +316,27 @@ extension SettingsView {
         // Three actions, one sheet. A profile is a name and a colour; deciding them in separate
         // menu items — each raising its own bare alert — is how "make a Work profile" became four
         // trips through this menu.
-        Button("New Profile…") { profileDraft = .create() }
+        Button {
+            profileDraft = .create()
+        } label: {
+            Label("New Profile…", systemImage: "plus")
+        }
         if let active = activeProfile {
-            Button("Edit “\(active.name)”…") { profileDraft = .edit(active) }
-            Button("Duplicate “\(active.name)”…") {
+            Button {
+                profileDraft = .edit(active)
+            } label: {
+                Label("Edit “\(active.name)”…", systemImage: "pencil")
+            }
+            Button {
                 profileDraft = .duplicate(active, name: Self.copyName(of: active.name, in: profiles))
+            } label: {
+                Label("Duplicate “\(active.name)”…", systemImage: "plus.square.on.square")
+            }
+            Divider()
+            Button(role: .destructive) {
+                profilePendingDelete = active
+            } label: {
+                Label("Delete “\(active.name)”…", systemImage: "trash")
             }
         }
     }
@@ -389,11 +415,48 @@ extension SettingsView {
     }
     #endif
 
-    /// The editor, attached wherever the menu lives.
+    /// The editor and the delete confirmation, attached wherever the menu lives.
     private func profilePrompts<Content: View>(_ content: Content) -> some View {
-        content.sheet(item: $profileDraft) { draft in
-            ProfileEditorSheet(draft: draft) { scope = $0 }
+        content
+            .sheet(item: $profileDraft) { draft in
+                ProfileEditorSheet(draft: draft) { scope = $0 }
+            }
+            // Deleting warns with what it changes (§6): bound hosts fall back to Default settings
+            // and pinned cards disappear. Neither is an error, but neither should be a surprise —
+            // so the counts are in the question, not discovered afterwards.
+            .alert(
+                "Delete “\(profilePendingDelete?.name ?? "")”?",
+                isPresented: profileDeletePresented,
+                presenting: profilePendingDelete
+            ) { profile in
+                Button("Cancel", role: .cancel) { profilePendingDelete = nil }
+                Button("Delete", role: .destructive) {
+                    profiles.delete(profile.id)
+                    scope = .defaults
+                    profilePendingDelete = nil
+                }
+            } message: { profile in
+                Text(deleteWarning(for: profile))
+            }
+    }
+
+    private var profileDeletePresented: Binding<Bool> {
+        Binding(
+            get: { profilePendingDelete != nil },
+            set: { if !$0 { profilePendingDelete = nil } })
+    }
+
+    private func deleteWarning(for profile: StreamProfile) -> String {
+        let (bound, pinned) = profiles.usage(of: profile.id)
+        var parts: [String] = []
+        if bound > 0 {
+            parts.append("\(bound) host\(bound == 1 ? "" : "s") will fall back to Default settings")
         }
+        if pinned > 0 {
+            parts.append("\(pinned) pinned card\(pinned == 1 ? "" : "s") will disappear")
+        }
+        guard !parts.isEmpty else { return "Nothing uses this profile yet." }
+        return parts.joined(separator: ", ") + "."
     }
 
     /// Switching scope is a plain state change — the rows are built by one code path and simply

@@ -47,13 +47,12 @@ struct ProfileEditorSheet: View {
     @ObservedObject private var profiles = ProfileStore.shared
 
     let draft: ProfileDraft
-    /// Where the settings surface should be pointing afterwards — at the new profile, or back at
-    /// the defaults when this one was deleted.
+    /// Where the settings surface should be pointing afterwards — at the profile that was just
+    /// created, so you land in the layer you made rather than back on the defaults.
     let onScope: (SettingsScope) -> Void
 
     @State private var name: String
     @State private var accent: String?
-    @State private var confirmingDelete = false
 
     init(draft: ProfileDraft, onScope: @escaping (SettingsScope) -> Void) {
         self.draft = draft
@@ -64,7 +63,7 @@ struct ProfileEditorSheet: View {
 
     var body: some View {
         #if os(macOS)
-        withDeletePrompt(VStack(spacing: 0) {
+        VStack(spacing: 0) {
             form
             HStack {
                 Button("Cancel", role: .cancel) { dismiss() }
@@ -78,9 +77,9 @@ struct ProfileEditorSheet: View {
             .padding(16)
         }
         .frame(width: 420)
-        .fixedSize(horizontal: false, vertical: true))
+        .fixedSize(horizontal: false, vertical: true)
         #else
-        withDeletePrompt(NavigationStack {
+        NavigationStack {
             form
                 .navigationTitle(draft.title)
                 #if os(iOS)
@@ -97,7 +96,7 @@ struct ProfileEditorSheet: View {
                 }
         }
         .presentationDetents([.medium, .large])
-        .presentationDragIndicator(.visible))
+        .presentationDragIndicator(.visible)
         #endif
     }
 
@@ -131,15 +130,6 @@ struct ProfileEditorSheet: View {
                 Text("Tints this profile's chip on host cards and in the stream overlay.")
                     .font(.geist(12, relativeTo: .caption))
                     .foregroundStyle(.secondary)
-            }
-            if draft.editingID != nil {
-                Section {
-                    Button("Delete Profile", role: .destructive) { confirmingDelete = true }
-                } footer: {
-                    Text(deleteFootnote)
-                        .font(.geist(12, relativeTo: .caption))
-                        .foregroundStyle(.secondary)
-                }
             }
         }
         .formStyle(.grouped)
@@ -224,26 +214,6 @@ struct ProfileEditorSheet: View {
             : "Hosts and pinned cards follow this profile by id, so renaming keeps them attached."
     }
 
-    private var deleteFootnote: String {
-        guard let id = draft.editingID else { return "" }
-        let (bound, pinned) = profiles.usage(of: id)
-        var parts: [String] = []
-        if bound > 0 {
-            parts.append("\(bound) host\(bound == 1 ? "" : "s") use\(bound == 1 ? "s" : "") it")
-        }
-        if pinned > 0 {
-            parts.append("\(pinned) pinned card\(pinned == 1 ? "" : "s") show\(pinned == 1 ? "s" : "") it")
-        }
-        guard !parts.isEmpty else { return "Nothing uses this profile yet." }
-        return parts.joined(separator: " and ") + "."
-    }
-
-    private var deleteMessage: String {
-        let usage = deleteFootnote
-        return "Hosts using it fall back to Default settings and its pinned cards disappear."
-            + (usage.isEmpty ? "" : " \(usage)")
-    }
-
     private func commit() {
         guard isNameAcceptable else { return }
         if let id = draft.editingID {
@@ -258,23 +228,5 @@ struct ProfileEditorSheet: View {
             onScope(.profile(profile.id))
         }
         dismiss()
-    }
-
-    private func delete() {
-        guard let id = draft.editingID else { return }
-        profiles.delete(id)
-        onScope(.defaults)
-        dismiss()
-    }
-
-    /// Deleting warns with what it changes (§6): bindings fall back to Default settings and
-    /// pinned cards disappear. Neither is an error; neither should be a surprise.
-    private func withDeletePrompt<Content: View>(_ content: Content) -> some View {
-        content.alert("Delete “\(draft.name)”?", isPresented: $confirmingDelete) {
-            Button("Cancel", role: .cancel) {}
-            Button("Delete", role: .destructive) { delete() }
-        } message: {
-            Text(deleteMessage)
-        }
     }
 }

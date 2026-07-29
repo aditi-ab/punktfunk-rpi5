@@ -26,8 +26,10 @@ struct SettingsView: View {
     // profiles and render pinned cards, but don't edit them (design §5.4).
     @ObservedObject var profiles = ProfileStore.shared
     @State var scope: SettingsScope = .defaults
-    /// The profile editor (create / duplicate / edit / delete), when it is open.
+    /// The profile editor (create / duplicate / edit), when it is open, and the profile a delete
+    /// is being confirmed for.
     @State var profileDraft: ProfileDraft?
+    @State var profilePendingDelete: StreamProfile?
     #if os(macOS)
     @State private var macTab: MacTab = .general
     #endif
