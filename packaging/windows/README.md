@@ -153,7 +153,15 @@ Our three UMDF drivers are signed with a **stable self-signed code-signing cert*
 is a **hard failure** (`-RequireSignedCert`, default `auto` off `GITHUB_REF`); canary and local
 builds still fall back to a per-build throwaway.
 
-**Current fingerprint (SHA-1 thumbprint):** `<fill in after generating — see below>`
+**Current fingerprint (SHA-1 thumbprint):** `4B8493E7CD565758D335F8F4F05C5A7261A13E02`
+
+Verify a shipped driver against it:
+
+```powershell
+$dll = Get-ChildItem C:\Windows\System32\DriverStore\FileRepository\pf_vdisplay*\pf_vdisplay.dll |
+         Select-Object -First 1 -Expand FullName
+(Get-AuthenticodeSignature $dll).SignerCertificate.Thumbprint
+```
 
 Why stable matters here. The installer trusts the `.cer` that ships in the bundle
 (`certutil -addstore -f Root` + `TrustedPublisher`, `crates/punktfunk-host/src/windows/install.rs`),

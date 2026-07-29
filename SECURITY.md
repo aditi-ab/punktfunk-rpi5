@@ -74,7 +74,8 @@ us beyond the download itself.
   reach its code-signing certificate fails to build rather than falling back to a self-signed one.
   Check with `Get-AuthenticodeSignature punktfunk-host-setup-1.2.3.exe`.
 - **The Windows drivers** (virtual display, virtual gamepads) are signed with a stable self-signed
-  certificate, `CN=punktfunk-driver`, whose fingerprint is published in
+  certificate, `CN=punktfunk-driver`
+  (SHA-1 `4B8493E7CD565758D335F8F4F05C5A7261A13E02`), also published in
   [`packaging/windows/README.md`](packaging/windows/README.md). The installer has to add it to the
   machine's trusted roots for a self-signed driver to install at all, so — unlike the cases above —
   this signature does **not** authenticate the download: it gives the drivers a stable publisher
