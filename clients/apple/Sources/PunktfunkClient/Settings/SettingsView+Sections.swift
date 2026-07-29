@@ -134,7 +134,6 @@ extension SettingsView {
                 .labelsHidden()
                 .pickerStyle(.segmented)
                 overrideMarker("refresh_hz")
-                    .modifier(CaptionWidth())
             }
         } else {
             // A device with a single supported rate (e.g. 60 Hz) has nothing to pick.

@@ -8,19 +8,20 @@ import AppKit
 import PunktfunkKit
 import SwiftUI
 
-/// How wide a `described` row's caption (and its override marker) may run.
+/// How wide a `described` row's caption may run. TEXT only — the override marker's Reset is a
+/// control and belongs on the row's trailing edge, not in the caption's column.
 ///
 /// Two limits, because they solve different problems. The 360pt CAP is about reading: past roughly
 /// 46 characters a line stops scanning well, and on a wide Mac window or an iPad detail pane an
 /// uncapped caption runs the full cell. The trailing INSET is about collision: an iOS grouped row
-/// puts its switch or value about 60pt in from the trailing edge, and a caption laid out to the
-/// full cell width runs its last line straight under that control — which is what the cap alone
-/// never fixed, because an iPhone cell is narrower than the cap in the first place.
+/// puts its switch or value in from the trailing edge, and a caption laid out to the full cell
+/// width runs its last line straight under that control — which is what the cap alone never
+/// fixed, because an iPhone cell is narrower than the cap in the first place.
 struct CaptionWidth: ViewModifier {
     #if os(iOS)
-    /// Reserve the control column. Sized to a `UISwitch` (51pt) plus breathing room — the widest
-    /// of the trailing accessories these rows use.
-    private static let trailingInset: CGFloat = 60
+    /// Reserve the control column. A `UISwitch` is 51pt, and the rest is breathing room — the
+    /// caption should stop visibly short of the control, not graze it.
+    private static let trailingInset: CGFloat = 76
     #else
     // macOS lays the control out inline and its cells are wider than the cap; nothing to clear.
     private static let trailingInset: CGFloat = 0
@@ -52,17 +53,18 @@ extension SettingsView {
     ) -> some View {
         VStack(alignment: .leading, spacing: 5) {
             content()
-            VStack(alignment: .leading, spacing: 5) {
-                Text(caption)
-                    .font(.geist(13, relativeTo: .footnote))
-                    .foregroundStyle(.secondary)
-                    // Wrap, never truncate, in Form cells.
-                    .fixedSize(horizontal: false, vertical: true)
-                if let field {
-                    overrideMarker(field)
-                }
+            Text(caption)
+                .font(.geist(13, relativeTo: .footnote))
+                .foregroundStyle(.secondary)
+                // Wrap, never truncate, in Form cells.
+                .fixedSize(horizontal: false, vertical: true)
+                .modifier(CaptionWidth())
+            if let field {
+                // Full cell width, deliberately: the marker's Reset is a CONTROL, and it belongs
+                // on the same trailing edge as the row's own control above it. Sharing the
+                // caption's reserved column left it stranded mid-row.
+                overrideMarker(field)
             }
-            .modifier(CaptionWidth())
         }
         .padding(.vertical, 2)
     }
