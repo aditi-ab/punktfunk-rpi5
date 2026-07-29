@@ -29,6 +29,9 @@ struct AddHostSheet: View {
     /// independent of the default above.
     @State private var pinnedIDs: Set<String>
     @ObservedObject private var profiles = ProfileStore.shared
+    /// Bound rather than left to the disclosure itself: on iOS the sheet's height is computed
+    /// from what it shows, and an expansion the sheet doesn't know about is one it clips.
+    @State private var pinsExpanded = false
     #endif
     #if os(macOS)
     /// Share the clipboard with this host (macOS sessions only; design
@@ -126,13 +129,14 @@ struct AddHostSheet: View {
             }
             #if !os(tvOS)
             .formStyle(.grouped)
-            // The grouped form's default system text is oversized next to the app's Geist
-            // typography — bring it down and on-brand so the panel doesn't read out of place.
+            #endif
+            #if os(macOS)
+            // macOS ONLY: the grouped form's default system text is oversized next to the app's
+            // Geist typography, so the panel reads out of place at full size. iOS keeps the app's
+            // body size — a touch target and a field label there are not a Mac panel's, and 12pt
+            // made this the one sheet in the app you had to squint at.
             .font(.geist(12, relativeTo: .callout))
             .controlSize(.small)
-            #endif
-            #if os(iOS)
-            .scrollDisabled(true)
             #endif
             #if os(macOS)
             HStack {
@@ -157,9 +161,9 @@ struct AddHostSheet: View {
             #endif
         }
         #if os(iOS)
-        // Four fields + the action row — a touch taller than the 3-field add sheet used to be,
-        // and taller again once there are profiles to bind and pin.
-        .presentationDetents([.height(profiles.profiles.isEmpty ? 392 : 480)])
+        // The sheet follows what it is actually showing (see `sheetHeight`), and `.large` is
+        // always reachable so a large Dynamic Type size can never strand the action row.
+        .presentationDetents([.height(sheetHeight), .large])
         .presentationDragIndicator(.visible)
         #endif
         #if os(macOS)
@@ -168,6 +172,25 @@ struct AddHostSheet: View {
         #endif
         #endif
     }
+
+    #if os(iOS)
+    /// The sheet's height, derived from what it is actually showing rather than pinned to one
+    /// number: the four base fields plus the action row, the Profile picker when there are
+    /// profiles to pick, and the pin toggles while they are expanded.
+    ///
+    /// A fixed detent is what clipped the expanded pins — a sheet can't grow into a height nobody
+    /// recomputed. `.large` is offered alongside so an accessibility text size still reaches
+    /// everything even when these estimates run short.
+    private var sheetHeight: CGFloat {
+        var height: CGFloat = 392 // name, address, port, MAC + the action row
+        guard !profiles.profiles.isEmpty else { return height }
+        height += 104 // the Profile picker + the "Pinned cards" row
+        if pinsExpanded {
+            height += CGFloat(profiles.profiles.count) * 44 + 60 // a toggle each + the caption
+        }
+        return height
+    }
+    #endif
 
     /// The per-host profile rows: which profile this host uses by default, and which extra ones
     /// get their own card in the grid. Absent when no profiles exist — a user who has never made
@@ -186,7 +209,7 @@ struct AddHostSheet: View {
                     Text("Default settings (profile deleted)").tag(profileID)
                 }
             }
-            DisclosureGroup("Pinned cards") {
+            DisclosureGroup("Pinned cards", isExpanded: $pinsExpanded) {
                 ForEach(profiles.profiles) { profile in
                     Toggle(profile.name, isOn: Binding(
                         get: { pinnedIDs.contains(profile.id) },
