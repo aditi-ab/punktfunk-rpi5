@@ -125,6 +125,7 @@ fresh install uses the generated random console password — read it from
 | `build-pf-vdisplay.ps1` | Build pf-vdisplay from source (the `drivers/` workspace) + clear FORCE_INTEGRITY + sign `.dll`/`.cat` + export `.cer`. |
 | `build-gamepad-drivers.ps1` | Sign + catalog the gamepad drivers (`pf-gamepad` + `pf-xusb`) from the same workspace build (`-SkipBuild`), one shared cert. |
 | `install-vbcable.ps1` | On-target: seed VB-Audio's cert into `TrustedPublisher`, silently install the bundled VB-CABLE (`-i -h`). Run by the installer's *Install VB-CABLE virtual audio* task; idempotent + always exits 0 (non-fatal). |
+| `make-driver-cert.ps1` | Generate the stable `CN=punktfunk-driver` code-signing cert (the `DRIVER_CERT_PFX_B64` / `DRIVER_CERT_PASSWORD` secrets). No key container, so it works over SSH; self-tests with signtool where it can. See *Driver signing* above. |
 | `clear-force-integrity.ps1` | Clear the `/INTEGRITYCHECK` PE bit so a self-signed driver loads (reused by every driver build). |
 | `stage-pf-vdisplay.ps1` | Stage the just-built pf-vdisplay bundle + fetch/verify the **pinned** nefcon release. |
 | `../../scripts/windows/web-run.cmd` | The `PunktfunkWeb` task action: loads the mgmt token + login password env, runs the bundled `bun` on the Nitro server (`:47992`). |
@@ -171,38 +172,35 @@ entirely — including the pile left by the per-build-cert era.
 > else — not on a dev laptop. This is the trade for stability, and the reason attestation signing
 > (which chains to Microsoft and needs no root import at all) remains the real fix.
 
-Generating it — **run this yourself**, on a trusted Windows box, elevated:
+Generating it — **run `make-driver-cert.ps1` yourself** on a Windows box; it prints the thumbprint
+and writes the two secret values to files, and the private key never touches a certificate store:
 
 ```powershell
-# 1. Create the cert. 10-year lifetime: an expired driver cert breaks INSTALLS on new machines, and
-#    rotating means every user picks up a new root anyway, so churn buys nothing here.
-$c = New-SelfSignedCertificate -Type CodeSigningCert -Subject 'CN=punktfunk-driver' `
-       -CertStoreLocation Cert:\CurrentUser\My -KeyExportPolicy Exportable `
-       -NotAfter (Get-Date).AddYears(10)
-$c.Thumbprint      # <- publish this: paste into the "Current fingerprint" line above + SECURITY.md
-
-# 2. Export it, protected by a strong random password. RandomNumberGenerator, NOT Get-Random —
-#    Get-Random is System.Random, which is not a cryptographic RNG and has no business generating
-#    the passphrase on a signing key. (.Create()/.GetBytes() works on both PS 5.1 and PS 7.)
-$rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
-$bytes = [byte[]]::new(24); $rng.GetBytes($bytes); $pw = [Convert]::ToBase64String($bytes)
-$sec = ConvertTo-SecureString $pw -AsPlainText -Force
-Export-PfxCertificate -Cert "Cert:\CurrentUser\My\$($c.Thumbprint)" -FilePath .\driver.pfx -Password $sec | Out-Null
-[Convert]::ToBase64String([IO.File]::ReadAllBytes('.\driver.pfx')) | Set-Clipboard   # -> DRIVER_CERT_PFX_B64
-$pw                # -> DRIVER_CERT_PASSWORD
-
-# 3. Add BOTH as **repo**-level Gitea Actions secrets on unom/punktfunk — same scope as the
-#    MSIX_CERT_PFX_B64 signing cert next door, and only this repo builds drivers. (RPM_GPG_PRIVATE_KEY
-#    is org-level because other repos publish RPMs; nothing else needs this one.) Then destroy the
-#    local copies — the .pfx must not linger on the machine that generated it:
-Remove-Item .\driver.pfx -Force
-Remove-Item "Cert:\CurrentUser\My\$($c.Thumbprint)" -Force
+pwsh -File packaging\windows\make-driver-cert.ps1 -TestOnly   # dry run: generates, self-tests, keeps nothing
+pwsh -File packaging\windows\make-driver-cert.ps1             # the real thing
 ```
 
-Generate it on a machine you would trust with a signing key, at an **interactive** logon (physical
-console or RDP). Over SSH, `New-SelfSignedCertificate` fails with `NTE_PERM 0x80090010`: a network
-logon has no access to the user's key container. Avoid generating it on the CI runner — that box
-executes build code, which is the one place a signing key should not be sitting.
+Then add both values as **repo**-level Gitea Actions secrets on `unom/punktfunk` — same scope as
+the `MSIX_CERT_PFX_B64` cert next door, and only this repo builds drivers (`RPM_GPG_PRIVATE_KEY` is
+org-level because other repos publish RPMs; nothing else needs this one). Back up the `.pfx` and its
+password somewhere you'd keep a signing key, then delete the output folder.
+
+Two details the script exists to get right, both learned the hard way:
+
+- It builds the cert with the .NET `CertificateRequest` API instead of `New-SelfSignedCertificate`,
+  so **no key container is involved** and generation works over SSH. `New-SelfSignedCertificate`
+  fails there with `NTE_PERM 0x80090010` — a network logon has no key container. Note that
+  *consuming* a `.pfx` (signtool, or loading it in .NET) still needs one, which is why the script's
+  signtool self-test reports SKIPPED over SSH rather than failing. The key is valid either way; run
+  it at a console/RDP session to exercise the self-test, or let a canary build be the proof.
+- The extension set is explicit and matches what the drivers have always been signed with —
+  `KeyUsage=DigitalSignature` (critical), `EKU=codeSigning` (non-critical), SubjectKeyIdentifier,
+  and deliberately **no** basicConstraints. This is not the place to improvise: a chain-building
+  difference would surface as a failed driver install on a user's machine, not as a build error.
+
+It also avoids `Get-Random` for the .pfx passphrase (that's `System.Random`, not a cryptographic
+RNG) and uses .NET's own PKCS#12 writer rather than OpenSSL, whose 3.x default AES-256/PBKDF2
+encryption produces a `.pfx` Windows CryptoAPI often cannot read.
 
 Keep an offline backup of the .pfx + password somewhere you'd keep a signing key. Losing it means
 the next release ships a cert nobody has trusted before, and every user's installer adds a second
