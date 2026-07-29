@@ -108,13 +108,6 @@ const COMPOSITORS: &[(&str, &str)] = &[
     ("gamescope", "gamescope"),
 ];
 
-/// A `ComboBox` bound to one settings field: shows `names`, starts at `current`, and runs
-/// `apply(settings, picked_index)` under the settings lock, then saves. The index handed to
-/// `apply` is already clamped to `names`.
-/// The sentinel the scope ComboBox's last entry carries — "New profile…" is an action, not a
-/// layer, and a real id can never collide with it (ids are 12 hex chars).
-const NEW_PROFILE: &str = "\u{1}new";
-
 /// The chip palette a profile can carry (`StreamProfile.accent`), same set as the GTK client so
 /// a profile looks the same on both. Eight legible colours rather than a free picker: the job is
 /// telling profiles apart at a glance on a host tile, and the schema still accepts any
@@ -1278,103 +1271,82 @@ pub(crate) fn settings_page(
     // sat noticeably right of the cards under it. In the content column it shares the cards'
     // left edge by construction.
     // The scope switcher is a slim BAR ABOVE the whole NavigationView — visible from every
-    // section, at every window size, in every pane state. It went through three homes: a
-    // fat card of profile controls above the page (clutter), the pane footer (WinUI clips
-    // footer content to the compact rail, and reactor exposes no pane-opened event to adapt
-    // by), and a clip-aware footer (looked broken). A single row — label, combo, Edit — is
-    // the version that holds up: profile EDITING lives in the sheet, so the bar carries
-    // only the choice.
+    // section, at every window size, in every pane state — and the switcher itself is ONE
+    // native control: a DropDownButton whose label is the scope in play and whose menu
+    // holds the choices, "New profile…", and "Edit …". Faking a fused combo+pencil out of
+    // separate controls looked exactly like what it was (the toolkit exposes no per-corner
+    // radius to build a real input group, though WinUI itself has one) — the native
+    // dropdown IS the coherent element, with one hover state and no seams. It also retires
+    // the ComboBox items/selected_index remount hazard: a button label is one plain prop.
     let catalog = ProfilesFile::load();
-    let mut scope_names = vec!["Default settings".to_string()];
-    let mut scope_ids: Vec<String> = vec![String::new()];
-    for p in &catalog.profiles {
-        scope_names.push(p.name.clone());
-        scope_ids.push(p.id.clone());
-    }
-    scope_names.push("New profile\u{2026}".to_string());
-    scope_ids.push(NEW_PROFILE.to_string());
-    let scope_i = scope_ids.iter().position(|i| i == scope).unwrap_or(0);
-    let make_switcher = {
-        let (set_scope, set_edit) = (set_scope.clone(), set_edit.clone());
-        let (names, ids) = (scope_names.clone(), scope_ids);
-        move || {
-            ComboBox::new(names.clone())
-                .selected_index(scope_i as i32)
-                .min_width(220.0)
-                // The bar's controls share one height, or the row reads ragged.
-                .height(36.0)
-                .on_selection_changed({
-                    let (set_scope, set_edit, ids) =
-                        (set_scope.clone(), set_edit.clone(), ids.clone());
-                    move |i: i32| {
-                        let Some(id) = ids.get(i.max(0) as usize) else {
-                            return;
-                        };
-                        if id == NEW_PROFILE {
-                            // A new profile takes an auto-numbered name and lands straight
-                            // in the sheet to be named — creation and naming are one
-                            // gesture, and there is no half-created state a Cancel would
-                            // have to unwind.
-                            let mut catalog = ProfilesFile::load();
-                            let name = (1..)
-                                .map(|n| format!("Profile {n}"))
-                                .find(|n| !catalog.name_taken(n, None))
-                                .unwrap_or_else(|| "Profile".to_string());
-                            let profile = StreamProfile::new(name);
-                            let new_id = profile.id.clone();
-                            catalog.profiles.push(profile);
-                            if catalog.save().is_ok() {
-                                set_scope.call(new_id);
-                                set_edit.call(true);
-                            }
-                            return;
+    let scope_pairs: Vec<(String, String)> = catalog
+        .profiles
+        .iter()
+        .map(|p| (p.id.clone(), p.name.clone()))
+        .collect();
+    const SCOPE_DEFAULT: &str = "Default settings";
+    const SCOPE_NEW: &str = "New profile\u{2026}";
+    // The Edit entry's prefix — the suffix is the profile's display name.
+    const SCOPE_EDIT: &str = "Edit \u{201c}";
+    let scope_bar: Element = {
+        let scope_label = match &active {
+            Some(p) => p.name.clone(),
+            None => SCOPE_DEFAULT.to_string(),
+        };
+        let switcher = {
+            let (set_scope, set_edit) = (set_scope.clone(), set_edit.clone());
+            let pairs = scope_pairs.clone();
+            let mut items = vec![menu_item(SCOPE_DEFAULT)];
+            for (_, name) in &pairs {
+                items.push(menu_item(name.clone()));
+            }
+            items.push(menu_separator());
+            items.push(menu_item(SCOPE_NEW));
+            if let Some(p) = &active {
+                items.push(menu_item(format!("{SCOPE_EDIT}{}\u{201d}\u{2026}", p.name)));
+            }
+            drop_down_button(&scope_label)
+                .menu_flyout(items)
+                .on_item_clicked(move |item: String| {
+                    // Fixed entries first — a profile could share their text.
+                    if item == SCOPE_NEW {
+                        // A new profile takes an auto-numbered name and lands straight in
+                        // the sheet to be named — creation and naming are one gesture, and
+                        // there is no half-created state a Cancel would have to unwind.
+                        let mut catalog = ProfilesFile::load();
+                        let name = (1..)
+                            .map(|n| format!("Profile {n}"))
+                            .find(|n| !catalog.name_taken(n, None))
+                            .unwrap_or_else(|| "Profile".to_string());
+                        let profile = StreamProfile::new(name);
+                        let new_id = profile.id.clone();
+                        catalog.profiles.push(profile);
+                        if catalog.save().is_ok() {
+                            set_scope.call(new_id);
+                            set_edit.call(true);
                         }
+                        return;
+                    }
+                    if item.starts_with(SCOPE_EDIT) {
+                        set_edit.call(true);
+                        return;
+                    }
+                    if item == SCOPE_DEFAULT {
+                        set_scope.call(String::new());
+                        return;
+                    }
+                    if let Some((id, _)) = pairs.iter().find(|(_, n)| n == &item) {
                         set_scope.call(id.clone());
                     }
                 })
-        }
-    };
-    let scope_bar: Element = {
-        // Every piece is vertically CENTRED against the combo (the tallest control), and
-        // the row shares the content column's 24-left / 28-right page margins, so the bar
-        // reads as part of the page grid rather than floating chrome.
-        // The switcher is ONE combined element (review feedback): the combo and the pencil
-        // share a control-look wrapper — the stock 4-epx control radius and a CardStroke
-        // outline — with the pencil as a borderless icon segment. Only a Border can carry a
-        // corner radius in this toolkit, so the wrapper supplies the joint chrome. In the
-        // defaults scope there is nothing to edit and the bare combo stands alone.
-        let switcher_key = format!("{scope}\u{1}{}", scope_names.join("\u{1}"));
-        let combined: Element = if profile_mode {
-            let set_edit = set_edit.clone();
-            border(
-                hstack(vec![
-                    Element::from(make_switcher()),
-                    button("")
-                        .icon(Symbol::Edit)
-                        .subtle()
-                        .height(36.0)
-                        .width(40.0)
-                        .tooltip("Edit profile\u{2026}")
-                        .automation_name("Edit profile\u{2026}")
-                        .on_click(move || set_edit.call(true))
-                        .into(),
-                ])
-                .spacing(0.0),
-            )
-            .corner_radius(4.0)
-            .border_brush(ThemeRef::CardStroke)
-            .border_thickness(uniform(1.0))
-            .into()
-        } else {
-            make_switcher().into()
         };
         let mut row: Vec<Element> = vec![text_block("Editing")
             .font_size(13.0)
             .foreground(ThemeRef::SecondaryText)
             .vertical_alignment(VerticalAlignment::Center)
             .into()];
-        // The profile's colour, right where the choice is made (a ComboBox item is a plain
-        // string in this toolkit, so the chip cannot ride inside the dropdown).
+        // The profile's colour, right where the choice is made (menu items are plain
+        // strings in this toolkit, so the chip cannot ride inside the menu).
         if let Some(c) = active
             .as_ref()
             .and_then(|p| p.accent.as_deref())
@@ -1390,15 +1362,7 @@ pub(crate) fn settings_page(
                     .into(),
             );
         }
-        // Keyed by scope + the name list: a rename/create/delete changes the ComboBox's
-        // items, and an in-place diff re-sets items (clearing WinUI's selection) while
-        // skipping `selected_index` when it compares equal — the combo then renders blank.
-        // A remount applies every prop; the hstack's child list takes the keyed path.
-        row.push(
-            combined
-                .with_key(switcher_key)
-                .vertical_alignment(VerticalAlignment::Center),
-        );
+        row.push(Element::from(switcher).vertical_alignment(VerticalAlignment::Center));
         hstack(row)
             .spacing(12.0)
             .margin(edges(24.0, 12.0, 28.0, 8.0))
