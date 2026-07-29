@@ -29,9 +29,6 @@ struct AddHostSheet: View {
     /// independent of the default above.
     @State private var pinnedIDs: Set<String>
     @ObservedObject private var profiles = ProfileStore.shared
-    /// Bound rather than left to the disclosure itself: on iOS the sheet's height is computed
-    /// from what it shows, and an expansion the sheet doesn't know about is one it clips.
-    @State private var pinsExpanded = false
     #endif
     #if os(macOS)
     /// Share the clipboard with this host (macOS sessions only; design
@@ -77,7 +74,9 @@ struct AddHostSheet: View {
             TVFieldRow(label: "Name", value: name, placeholder: "Optional") { editingField = .name }
             TVFieldRow(label: "Address", value: address, placeholder: "IP or hostname") { editingField = .address }
             TVFieldRow(label: "Port", value: String(port), placeholder: "") { editingField = .port }
-            TVFieldRow(label: "MAC", value: mac, placeholder: "Wake-on-LAN — auto-filled when known") { editingField = .mac }
+            TVFieldRow(
+                label: "MAC address", value: mac,
+                placeholder: "Optional — lets Punktfunk wake this host") { editingField = .mac }
             HStack(spacing: 32) {
                 Button("Cancel", role: .cancel) { dismiss() }
                 Button(actionTitle) { save() }.disabled(!canSave)
@@ -114,17 +113,27 @@ struct AddHostSheet: View {
         #else
         VStack(spacing: 0) {
             Form {
-                TextField("Name", text: $name, prompt: Text("Optional — e.g. Living Room"))
-                TextField("Address", text: $address, prompt: Text("IP or hostname"))
-                TextField("Port", value: $port, format: .number.grouping(.never))
-                TextField("MAC", text: $mac, prompt: Text("Wake-on-LAN — auto-filled when known"))
-                    .autocorrectionDisabled()
-                    #if os(iOS)
-                    .textInputAutocapitalization(.never)
+                Section {
+                    TextField("Name", text: $name, prompt: Text("Optional — e.g. Living Room"))
+                    TextField("Address", text: $address, prompt: Text("IP or hostname"))
+                    TextField("Port", value: $port, format: .number.grouping(.never))
+                    // "MAC" alone said what the value IS and nothing about why it's here, and
+                    // "Wake-on-LAN" as the placeholder read like the field wanted that typed in.
+                    // The label names the value, the footer says what it buys.
+                    TextField(
+                        "MAC address", text: $mac,
+                        prompt: Text("Optional — aa:bb:cc:dd:ee:ff"))
+                        .autocorrectionDisabled()
+                        #if os(iOS)
+                        .textInputAutocapitalization(.never)
+                        #endif
+                    #if os(macOS)
+                    Toggle("Share clipboard with this host", isOn: $clipboardSync)
                     #endif
-                #if os(macOS)
-                Toggle("Share clipboard with this host", isOn: $clipboardSync)
-                #endif
+                } footer: {
+                    Text("The MAC address lets Punktfunk wake this host while it's asleep. "
+                        + "It fills in by itself once the host has been seen on the network.")
+                }
                 profileRows
             }
             #if !os(tvOS)
@@ -175,51 +184,75 @@ struct AddHostSheet: View {
 
     #if os(iOS)
     /// The sheet's height, derived from what it is actually showing rather than pinned to one
-    /// number: the four base fields plus the action row, the Profile picker when there are
-    /// profiles to pick, and the pin toggles while they are expanded.
+    /// number — which is what clipped the profile rows before: a sheet can't grow into a height
+    /// nobody recomputed.
     ///
-    /// A fixed detent is what clipped the expanded pins — a sheet can't grow into a height nobody
-    /// recomputed. `.large` is offered alongside so an accessibility text size still reaches
-    /// everything even when these estimates run short.
+    /// Estimates, deliberately: the form scrolls and `.large` is offered alongside, so running
+    /// short costs a scroll rather than a stranded row at accessibility text sizes.
     private var sheetHeight: CGFloat {
-        var height: CGFloat = 392 // name, address, port, MAC + the action row
-        guard !profiles.profiles.isEmpty else { return height }
-        height += 104 // the Profile picker + the "Pinned cards" row
-        if pinsExpanded {
-            height += CGFloat(profiles.profiles.count) * 44 + 60 // a toggle each + the caption
+        var height: CGFloat = 440 // name, address, port, MAC + its footnote + the action row
+        if showsProfileRows {
+            height += 128 // the Profile picker and its footnote
+            height += 96 + CGFloat(profiles.profiles.count) * 44 // the pins, their header + footer
         }
         return height
     }
     #endif
 
+    /// Whether this sheet shows the per-host profile rows at all.
+    ///
+    /// Only when EDITING, and only once profiles exist. Adding a host is about reaching it — the
+    /// address, and whether we can wake it; which settings it streams with is a decision for the
+    /// host you already have, and stacking it onto the add flow made the first thing a new user
+    /// sees a longer form than the one they came for. Editing is one context-menu item away.
+    private var showsProfileRows: Bool {
+        #if os(tvOS)
+        return false
+        #else
+        return isEditing && !profiles.profiles.isEmpty
+        #endif
+    }
+
     /// The per-host profile rows: which profile this host uses by default, and which extra ones
-    /// get their own card in the grid. Absent when no profiles exist — a user who has never made
-    /// one sees exactly today's sheet, which is the "zero profiles = zero new clutter" rule.
+    /// get their own card in the grid.
+    ///
+    /// Two plain sections, no disclosure. A collapsed group had to animate its own height AND the
+    /// sheet's, and got both wrong; with a profile or three these are a couple of rows, and rows
+    /// that are simply there can't be clipped or fail to expand.
     @ViewBuilder private var profileRows: some View {
         #if !os(tvOS)
-        if !profiles.profiles.isEmpty {
-            Picker("Profile", selection: $profileID) {
-                Text("Default settings").tag("")
-                ForEach(profiles.profiles) { profile in
-                    Text(profile.name).tag(profile.id)
+        if showsProfileRows {
+            Section {
+                Picker("Profile", selection: $profileID) {
+                    Text("Default settings").tag("")
+                    ForEach(profiles.profiles) { profile in
+                        Text(profile.name).tag(profile.id)
+                    }
+                    // A binding whose profile was deleted resolves as Default settings anyway;
+                    // saying so beats an empty picker, and saving cleans the field up.
+                    if !profileID.isEmpty, profiles.profile(id: profileID) == nil {
+                        Text("Default settings (profile deleted)").tag(profileID)
+                    }
                 }
-                // A binding whose profile was deleted resolves as Default settings anyway; saying
-                // so beats an empty picker, and saving cleans the field up.
-                if !profileID.isEmpty, profiles.profile(id: profileID) == nil {
-                    Text("Default settings (profile deleted)").tag(profileID)
-                }
+            } footer: {
+                Text("The settings a plain tap on this host streams with.")
             }
-            DisclosureGroup("Pinned cards", isExpanded: $pinsExpanded) {
+            Section {
                 ForEach(profiles.profiles) { profile in
                     Toggle(profile.name, isOn: Binding(
                         get: { pinnedIDs.contains(profile.id) },
                         set: { on in
-                            if on { pinnedIDs.insert(profile.id) } else { pinnedIDs.remove(profile.id) }
+                            if on {
+                                pinnedIDs.insert(profile.id)
+                            } else {
+                                pinnedIDs.remove(profile.id)
+                            }
                         }))
                 }
-                Text("A pinned profile gets its own card next to this host — one click, no menu.")
-                    .font(.geist(12, relativeTo: .caption))
-                    .foregroundStyle(.secondary)
+            } header: {
+                Text("Pinned cards")
+            } footer: {
+                Text("A pinned profile gets its own card next to this host — one tap, no menu.")
             }
         }
         #endif
