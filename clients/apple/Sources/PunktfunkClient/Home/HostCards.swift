@@ -38,9 +38,16 @@ private func monogram(_ name: String) -> String {
     return String(first).uppercased()
 }
 
-/// The squared monogram tile. `filled` = a solid brand-purple chip (saved hosts); otherwise a
-/// tinted outline (discovered hosts). Shows a spinner in place of the glyph while connecting.
-private func monogramTile(_ letter: String, m: CardMetrics, connecting: Bool, filled: Bool) -> some View {
+/// The squared host tile. `filled` = a solid brand-purple chip (saved hosts); otherwise a tinted
+/// outline (discovered hosts). Shows a spinner in place of the glyph while connecting.
+///
+/// `mark` is the host's OS mark, and it REPLACES the monogram when we have one: it identifies the
+/// machine better than its initial ever did, and on a row of similarly-named boxes the initial says
+/// nothing the name beneath it doesn't already say. A host that advertises no OS chain — or one we
+/// ship no art for — keeps its letter, so a mixed row still reads as one set.
+private func monogramTile(
+    _ letter: String, osChain: String?, m: CardMetrics, connecting: Bool, filled: Bool
+) -> some View {
     let shape = RoundedRectangle(cornerRadius: m.radius - 3, style: .continuous)
     return ZStack {
         shape.fill(filled
@@ -50,6 +57,16 @@ private func monogramTile(_ letter: String, m: CardMetrics, connecting: Bool, fi
             : AnyShapeStyle(Color.brand.opacity(0.14)))
         if connecting {
             ProgressView().tint(filled ? .white : Color.brand)
+        } else if let mark = osIconImage(for: osChain) {
+            // Template asset — tints from foregroundStyle exactly like the letter it stands in for.
+            // Labelled, because this is where the OS is now announced: it used to ride the status
+            // row below, which no longer carries it.
+            mark
+                .resizable()
+                .scaledToFit()
+                .frame(width: m.monogram, height: m.monogram)
+                .foregroundStyle(filled ? Color.white : Color.brand)
+                .accessibilityLabel(osChain ?? "")
         } else {
             // Fixed size (not Dynamic Type): the glyph is pinned inside a fixed tile, so it must
             // not scale up and spill out at large accessibility text sizes. minimumScaleFactor +
@@ -133,7 +150,8 @@ struct HostCardView: View {
         let m = CardMetrics.current
         return Button(action: onConnect) {
             HStack(spacing: m.spacing) {
-                monogramTile(monogram(host.displayName), m: m, connecting: isConnecting, filled: true)
+                monogramTile(monogram(host.displayName), osChain: host.osChain,
+                             m: m, connecting: isConnecting, filled: true)
                 VStack(alignment: .leading, spacing: 4) {
                     // The chip rides the TITLE line, anchored to the card's trailing edge — not
                     // trailing the name, where it read as part of the title, and not on a line of
@@ -295,16 +313,7 @@ struct HostCardView: View {
     /// certificate is pinned (the lock state, spelled out).
     @ViewBuilder private func statusRow(_ m: CardMetrics) -> some View {
         HStack(spacing: 6) {
-            // The host's OS mark leads the row (template asset — tints like an SF Symbol);
-            // absent entirely for a host that never advertised one, so those cards render
-            // exactly as they always did.
-            if let mark = osIconImage(for: host.osChain) {
-                mark
-                    .resizable()
-                    .scaledToFit()
-                    .frame(width: m.status + 2, height: m.status + 2)
-                    .accessibilityLabel(host.osChain ?? "")
-            }
+            // The OS mark used to lead this row; it is the tile's glyph now (see monogramTile).
             RoundedRectangle(cornerRadius: 1.5)
                 .fill(isOnline ? Color.green : Color.secondary.opacity(0.4))
                 .frame(width: 6, height: 6)
@@ -364,7 +373,8 @@ struct DiscoveredCardView: View {
         let m = CardMetrics.current
         return Button(action: onConnect) {
             HStack(spacing: m.spacing) {
-                monogramTile(monogram(discovered.name), m: m, connecting: false, filled: false)
+                monogramTile(monogram(discovered.name), osChain: discovered.osChain,
+                              m: m, connecting: false, filled: false)
                 VStack(alignment: .leading, spacing: 4) {
                     Text(discovered.name)
                         .font(.geist(m.name, .bold, relativeTo: .title3))
@@ -375,14 +385,7 @@ struct DiscoveredCardView: View {
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                     HStack(spacing: 6) {
-                        // Same leading OS mark as a saved card's status row — live from the advert.
-                        if let mark = osIconImage(for: discovered.osChain) {
-                            mark
-                                .resizable()
-                                .scaledToFit()
-                                .frame(width: m.status + 2, height: m.status + 2)
-                                .accessibilityLabel(discovered.osChain)
-                        }
+                        // The advert's OS mark is the tile's glyph now (see monogramTile).
                         Image(systemName: discovered.requiresPairing
                             ? "lock.fill" : "antenna.radiowaves.left.and.right")
                             .font(.system(size: m.status))

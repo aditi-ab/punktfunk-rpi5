@@ -54,6 +54,9 @@ private struct HomeTile: Identifiable {
     var hasLibrary = false
     /// Shows this SF symbol in the badge instead of the title monogram (the Add Host tile).
     var icon: String?
+    /// The host's OS-identity chain. When we ship art for it, the badge wears the OS mark instead
+    /// of the title's initial — the same substitution the touch cards make.
+    var osChain: String?
     /// Offline saved host we hold a MAC for (and WoL is available) — activating it wakes first.
     var canWake = false
     let activate: () -> Void
@@ -284,6 +287,7 @@ struct GamepadHomeView: View {
                     // A pinned card is a shortcut, not a second host — Y (library) stays on the
                     // host's own tile, where the host-level actions live.
                     hasLibrary: profile == nil,
+                    osChain: host.osChain,
                     canWake: autoWakeEnabled && PunktfunkConnection.wakeOnLANAvailable
                         && !online && !host.wakeMacs.isEmpty,
                     activate: {
@@ -297,6 +301,7 @@ struct GamepadHomeView: View {
                 title: d.name,
                 subtitle: "\(d.host):\(String(d.port))",
                 isOnline: true,
+                osChain: d.osChain,
                 activate: { connectDiscovered(d) })
         }
         let add = HomeTile(
@@ -420,6 +425,15 @@ private struct GamepadHostTile: View {
                 Image(systemName: icon)
                     .font(.system(size: Self.iconFont, weight: .semibold))
                     .foregroundStyle(Color.brand)
+            } else if let mark = osIconImage(for: tile.osChain) {
+                // The OS mark stands in for the initial (template asset — tints like the text it
+                // replaces), and carries the label, since nothing else on the tile names the OS.
+                mark
+                    .resizable()
+                    .scaledToFit()
+                    .frame(width: Self.monogramFont, height: Self.monogramFont)
+                    .foregroundStyle(tile.filled ? .white : Color.brand)
+                    .accessibilityLabel(tile.osChain ?? "")
             } else {
                 Text(monogram(tile.title))
                     .font(.geistFixed(Self.monogramFont, .bold))
