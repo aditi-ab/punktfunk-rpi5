@@ -97,6 +97,11 @@ final class HostStore: ObservableObject {
     }
 
     func add(_ host: StoredHost) {
+        var host = host
+        // Stamped here rather than in the initializer: a `StoredHost` is also built to describe a
+        // host we are only dialing (the dev auto-connect hook, a deep link's confirmation), and
+        // those were never added to anything.
+        host.addedAt = host.addedAt ?? Date()
         hosts.append(host)
     }
 

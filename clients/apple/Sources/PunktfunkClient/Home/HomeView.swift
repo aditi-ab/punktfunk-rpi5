@@ -44,6 +44,10 @@ struct HomeView: View {
     @AppStorage(DefaultsKey.libraryEnabled) private var libraryEnabled = true
     /// The host being edited (name / address / port / Wake-on-LAN MAC) — drives the edit sheet.
     @State private var editTarget: StoredHost?
+    // How this device shows its own list. `.added` is the default because it is what the grid
+    // did before it could sort at all — an update should not rearrange anyone's hosts.
+    @AppStorage(DefaultsKey.hostSort) private var sortRaw = HostSort.added.rawValue
+    @AppStorage(DefaultsKey.hostGrouping) private var groupingRaw = HostGrouping.none.rawValue
 
     var body: some View {
         NavigationStack {
@@ -53,9 +57,16 @@ struct HomeView: View {
                 } else {
                     ScrollView {
                         if !store.hosts.isEmpty {
-                            LazyVGrid(columns: gridColumns, spacing: gridSpacing) {
-                                ForEach(gridEntries) { entry in
-                                    hostCard(entry.host, pinned: entry.profile)
+                            LazyVStack(alignment: .leading, spacing: gridSpacing) {
+                                ForEach(hostGroups) { group in
+                                    if let title = group.title {
+                                        groupHeader(title, accent: group.accent)
+                                    }
+                                    LazyVGrid(columns: gridColumns, spacing: gridSpacing) {
+                                        ForEach(entries(in: group)) { entry in
+                                            hostCard(entry.host, pinned: entry.profile)
+                                        }
+                                    }
                                 }
                             }
                             .padding()
@@ -137,8 +148,17 @@ struct HomeView: View {
                 #if os(iOS)
                 // Adjacent trailing items share one glass pill (the system default).
                 ToolbarItem(placement: .topBarTrailing) { settingsButton }
+                if showsArrangeMenu {
+                    ToolbarItem(placement: .topBarTrailing) { arrangeMenu }
+                }
                 ToolbarItem(placement: .topBarTrailing) { addHostButton }
                 #else
+                if showsArrangeMenu {
+                    ToolbarItem(placement: .primaryAction) {
+                        arrangeMenu
+                            .help("Sort and group the host list")
+                    }
+                }
                 ToolbarItem(placement: .primaryAction) {
                     addHostButton
                         .help("Add a host")
@@ -199,13 +219,43 @@ struct HomeView: View {
         var id: String { "\(host.id.uuidString)#\(profile?.id ?? "")" }
     }
 
-    /// Saved hosts, each immediately followed by its pinned cards — so a pin reads as belonging to
-    /// its host rather than as a stray tile somewhere in the grid.
-    private var gridEntries: [HostGridEntry] {
-        store.hosts.flatMap { host in
+    /// The grid's bands, ordered and divided per this device's preference (`HostArrangement`).
+    private var hostGroups: [HostGroup] {
+        HostArrangement.groups(
+            hosts: store.hosts, catalog: profiles.catalog,
+            online: Set(store.hosts.filter(isOnline).map(\.id)),
+            sort: HostSort(rawValue: sortRaw) ?? .added,
+            grouping: HostGrouping(rawValue: groupingRaw) ?? .none)
+    }
+
+    /// A band's hosts, each immediately followed by its pinned cards — so a pin reads as belonging
+    /// to its host rather than as a stray tile somewhere in the grid.
+    private func entries(in group: HostGroup) -> [HostGridEntry] {
+        group.hosts.flatMap { host in
             [HostGridEntry(host: host, profile: nil)]
                 + profiles.pinned(for: host).map { HostGridEntry(host: host, profile: $0) }
         }
+    }
+
+    /// Online = advertising on mDNS OR answered the reachability probe (a routed/VPN host never
+    /// advertises). One definition, used by the cards and by the Status grouping alike.
+    private func isOnline(_ host: StoredHost) -> Bool {
+        discovery.advertises(host) || store.probedOnline.contains(host.id)
+    }
+
+    private func groupHeader(_ title: String, accent: String?) -> some View {
+        HStack(spacing: 7) {
+            Circle()
+                .fill(Color(hex: accent ?? "") ?? Color.secondary.opacity(0.5))
+                .frame(width: 7, height: 7)
+                .accessibilityHidden(true) // the title says it
+            Text(title)
+                .font(.geist(13, .semibold, relativeTo: .subheadline))
+                .foregroundStyle(.secondary)
+                .textCase(.uppercase)
+                .tracking(0.6)
+        }
+        .padding(.top, 4)
     }
 
     private func hostCard(_ host: StoredHost, pinned: StreamProfile?) -> some View {
@@ -214,7 +264,7 @@ struct HomeView: View {
         let selection: ProfileSelection = pinned.map { .profile($0.id) } ?? .inherit
         return HostCardView(
             host: host,
-            isOnline: discovery.advertises(host) || store.probedOnline.contains(host.id),
+            isOnline: isOnline(host),
             isConnecting: model.phase == .connecting && model.activeHost?.id == host.id,
             // The accent ring marks the most recent HOST; pinned cards stay quiet so the grid
             // doesn't grow several "most recent" bars for one machine.
@@ -310,6 +360,34 @@ struct HomeView: View {
             Label("Add Host", systemImage: "plus")
         }
     }
+
+    #if !os(tvOS)
+    /// One host has no order and nothing to divide, so the control stays out of the way until
+    /// there is a list to arrange.
+    private var showsArrangeMenu: Bool { store.hosts.count > 1 }
+
+    /// Sort and group, as two inline pickers in one menu — both are about the same list, and
+    /// splitting them across two toolbar items would say otherwise.
+    private var arrangeMenu: some View {
+        Menu {
+            Picker("Sort By", selection: $sortRaw) {
+                ForEach(HostSort.allCases) { option in
+                    Label(option.label, systemImage: option.symbol).tag(option.rawValue)
+                }
+            }
+            .pickerStyle(.inline)
+            Divider()
+            Picker("Group By", selection: $groupingRaw) {
+                ForEach(HostGrouping.allCases) { option in
+                    Label(option.label, systemImage: option.symbol).tag(option.rawValue)
+                }
+            }
+            .pickerStyle(.inline)
+        } label: {
+            Label("Sort and Group", systemImage: "line.3.horizontal.decrease.circle")
+        }
+    }
+    #endif
 
     #if !os(macOS)
     private var settingsButton: some View {

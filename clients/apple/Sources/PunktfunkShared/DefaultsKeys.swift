@@ -94,6 +94,11 @@ public enum DefaultsKey {
     /// stays 4:2:0). Sharper text/UI at the cost of more bandwidth.
     public static let enable444 = "punktfunk.enable444"
     public static let hosts = "punktfunk.hosts"
+    /// How the host grid is ordered (a `HostSort` raw value) and what it's divided by (a
+    /// `HostGrouping`). Per device, never per profile: it is this device's window on its own
+    /// list, not something about how a host is streamed.
+    public static let hostSort = "punktfunk.hostSort"
+    public static let hostGrouping = "punktfunk.hostGrouping"
     /// The settings-profile catalog (`ProfileCatalog`, one JSON blob) — design
     /// client-settings-profiles.md §4.2. Lives in the APP GROUP suite with `hosts`, not with the
     /// settings: bindings and pins are fields on the host record, and an extension that can read

@@ -24,7 +24,8 @@ final class SharedFoundationTests: XCTestCase {
             pinnedSHA256: Data([0xDE, 0xAD, 0xBE, 0xEF]),
             lastConnected: Date(timeIntervalSince1970: 1_700_000_000),
             mgmtPort: 47990, macAddresses: ["aa:bb:cc:dd:ee:ff"], clipboardSync: true,
-            profileID: "a1b2c3d4e5f6", pinnedProfileIDs: ["0f0f0f0f0f0f"])
+            profileID: "a1b2c3d4e5f6", pinnedProfileIDs: ["0f0f0f0f0f0f"],
+            addedAt: Date(timeIntervalSince1970: 1_600_000_000))
 
         let data = try JSONEncoder().encode(host)
         let decoded = try JSONDecoder().decode(StoredHost.self, from: data)
@@ -49,6 +50,7 @@ final class SharedFoundationTests: XCTestCase {
         XCTAssertNil(decoded.clipboardSync)
         XCTAssertNil(decoded.profileID)
         XCTAssertNil(decoded.pinnedProfileIDs)
+        XCTAssertNil(decoded.addedAt)
         // Resolvers fall back cleanly.
         XCTAssertEqual(decoded.effectiveMgmtPort, punktfunkDefaultMgmtPort)
         XCTAssertEqual(decoded.wakeMacs, [])
@@ -210,6 +212,116 @@ final class SharedFoundationTests: XCTestCase {
         XCTAssertFalse(honest.pinConflict(with: desk))
         // No pin stored → nothing to contradict; the trust flow runs as usual.
         XCTAssertFalse(lying.pinConflict(with: couchA))
+    }
+
+    // MARK: - Host grid arrangement
+
+    private func arrangementFixture() -> (hosts: [StoredHost], catalog: ProfileCatalog) {
+        let catalog = ProfileCatalog(profiles: [
+            StreamProfile(name: "Game", id: "111111111111", accent: "#ff8800"),
+            StreamProfile(name: "Work", id: "222222222222"),
+        ])
+        // Stored order is the order they were added. Basement has no `addedAt` at all — it was
+        // saved before the field existed, which is why it sits at the FRONT of the store: undated
+        // hosts are always the oldest ones, never scattered through the middle.
+        let basement = StoredHost(name: "Basement", address: "10.0.0.3")
+        var desk = StoredHost(name: "Desk", address: "10.0.0.1",
+                              addedAt: Date(timeIntervalSince1970: 100))
+        desk.profileID = "111111111111"
+        desk.lastConnected = Date(timeIntervalSince1970: 5_000)
+        var attic = StoredHost(name: "attic", address: "10.0.0.2",
+                               addedAt: Date(timeIntervalSince1970: 200))
+        attic.profileID = "222222222222"
+        var couch = StoredHost(name: "Couch", address: "10.0.0.4",
+                               addedAt: Date(timeIntervalSince1970: 300))
+        couch.lastConnected = Date(timeIntervalSince1970: 9_000)
+        return ([basement, desk, attic, couch], catalog)
+    }
+
+    private func arranged(
+        _ sort: HostSort, _ grouping: HostGrouping = .none, online: Set<UUID> = []
+    ) -> [HostGroup] {
+        let (hosts, catalog) = arrangementFixture()
+        return HostArrangement.groups(
+            hosts: hosts, catalog: catalog, online: online, sort: sort, grouping: grouping)
+    }
+
+    /// The default is the order the grid had before it could sort at all — an update must not
+    /// rearrange anyone's hosts.
+    ///
+    /// Undated hosts sort FIRST, because having no date means predating the field means being
+    /// older. In a real store they are a prefix (everything saved before the upgrade), so the
+    /// result is the stored order exactly — which is the point.
+    func testHostSortByDateAddedKeepsTheStoredOrder() {
+        let (hosts, _) = arrangementFixture()
+        let group = arranged(.added)[0]
+        XCTAssertNil(group.title, "ungrouped draws no header")
+        XCTAssertEqual(group.hosts.map(\.name), hosts.map(\.name))
+        XCTAssertEqual(group.hosts.map(\.name), ["Basement", "Desk", "attic", "Couch"])
+    }
+
+    /// Case- and locale-insensitive, so "attic" doesn't sort after "Desk" the way a raw `<` on
+    /// Strings would put every lowercase name below every uppercase one.
+    func testHostSortByNameIgnoresCase() {
+        XCTAssertEqual(
+            arranged(.name)[0].hosts.map(\.name), ["attic", "Basement", "Couch", "Desk"])
+    }
+
+    /// Most recent first — and a host you have NEVER connected to goes last, not first. Treating
+    /// "never" as `.distantPast` would sort it as if it had been connected in 1970.
+    func testHostSortByLastConnectedPutsNeverConnectedLast() {
+        let hosts = arranged(.lastConnected)[0].hosts
+        XCTAssertEqual(hosts.prefix(2).map(\.name), ["Couch", "Desk"])
+        // The two never-connected ones tie, so they keep their stored order — `sorted` is not
+        // stable in Swift, and equal rows swapping between redraws is a visible bug.
+        XCTAssertEqual(hosts.suffix(2).map(\.name), ["Basement", "attic"])
+    }
+
+    /// Bands in catalog order, then the unbound ones. An empty band isn't drawn at all.
+    func testHostGroupingByProfile() {
+        let groups = arranged(.name, .profile)
+        XCTAssertEqual(groups.map(\.title), ["Game", "Work", "No Profile"])
+        XCTAssertEqual(groups[0].accent, "#ff8800", "the header matches its cards")
+        XCTAssertEqual(groups[0].hosts.map(\.name), ["Desk"])
+        XCTAssertEqual(groups[2].hosts.map(\.name), ["Basement", "Couch"])
+
+        // A profile nobody uses gets no band.
+        let unused = ProfileCatalog(profiles: [StreamProfile(name: "Travel", id: "333333333333")])
+        let (hosts, _) = arrangementFixture()
+        let none = HostArrangement.groups(
+            hosts: hosts, catalog: unused, online: [], sort: .name, grouping: .profile)
+        XCTAssertEqual(none.map(\.title), ["No Profile"], "every host is unbound in this catalog")
+    }
+
+    /// A dangling binding resolves as no profile (§4.4), so it lands in the unbound band rather
+    /// than in one named after a profile that no longer exists.
+    func testHostGroupingDropsDanglingBindings() {
+        var host = StoredHost(name: "Desk", address: "10.0.0.1")
+        host.profileID = "deadbeefdead"
+        let groups = HostArrangement.groups(
+            hosts: [host], catalog: ProfileCatalog(), online: [], sort: .name, grouping: .profile)
+        XCTAssertEqual(groups.map(\.title), ["No Profile"])
+    }
+
+    func testHostGroupingByStatus() {
+        // One fixture, reused: each call mints fresh UUIDs, so an `online` set taken from a
+        // second fixture would name hosts this one has never heard of.
+        let (hosts, catalog) = arrangementFixture()
+        func groups(online: Set<UUID>) -> [HostGroup] {
+            HostArrangement.groups(
+                hosts: hosts, catalog: catalog, online: online, sort: .name, grouping: .status)
+        }
+
+        // By name, not by index: the fixture's order is a fact about `.added`, not about this.
+        let up = hosts.filter { ["Desk", "Couch"].contains($0.name) }.map(\.id)
+        let some = groups(online: Set(up))
+        XCTAssertEqual(some.map(\.title), ["Online", "Offline"])
+        XCTAssertEqual(some[0].hosts.map(\.name), ["Couch", "Desk"])
+        XCTAssertEqual(some[1].hosts.map(\.name), ["attic", "Basement"])
+
+        // All offline: no empty "Online" band.
+        XCTAssertEqual(groups(online: []).map(\.title), ["Offline"])
+        XCTAssertEqual(groups(online: Set(hosts.map(\.id))).map(\.title), ["Online"])
     }
 
     // MARK: - Settings profiles

@@ -49,12 +49,16 @@ public struct StoredHost: Identifiable, Codable, Hashable, Sendable {
     /// default — that is `profileID`; a pin is presentation only, and duplicates and dangling ids
     /// are dropped when the cards are built. Optional for the same forward-compat reason.
     public var pinnedProfileIDs: [String]?
+    /// When this host was saved — what the grid's "Date Added" sort orders by. Optional and
+    /// appended last for the same widget-contract reason as the rest; hosts saved before it
+    /// existed have none, and keep their stored order, which IS the order they were added in.
+    public var addedAt: Date?
 
     public init(
         id: UUID = UUID(), name: String, address: String, port: UInt16 = 9777,
         pinnedSHA256: Data? = nil, lastConnected: Date? = nil, mgmtPort: UInt16? = nil,
         macAddresses: [String]? = nil, clipboardSync: Bool? = nil,
-        profileID: String? = nil, pinnedProfileIDs: [String]? = nil
+        profileID: String? = nil, pinnedProfileIDs: [String]? = nil, addedAt: Date? = nil
     ) {
         self.id = id
         self.name = name
@@ -67,6 +71,7 @@ public struct StoredHost: Identifiable, Codable, Hashable, Sendable {
         self.clipboardSync = clipboardSync
         self.profileID = profileID
         self.pinnedProfileIDs = pinnedProfileIDs
+        self.addedAt = addedAt
     }
 
     public var displayName: String { name.isEmpty ? address : name }
