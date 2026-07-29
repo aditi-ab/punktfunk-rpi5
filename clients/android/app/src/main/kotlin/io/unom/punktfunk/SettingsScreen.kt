@@ -129,9 +129,8 @@ fun SettingsScreen(
 
     var showLicenses by remember { mutableStateOf(false) }
     var showControllers by remember { mutableStateOf(false) }
-    var naming by remember { mutableStateOf<NameIntent?>(null) }
+    var editing by remember { mutableStateOf<EditIntent?>(null) }
     var deleting by remember { mutableStateOf<StreamProfile?>(null) }
-    var recolouring by remember { mutableStateOf<StreamProfile?>(null) }
 
     // Every row renders the EFFECTIVE value: the globals with this profile's overrides on top, so a
     // row the profile doesn't override reads as the live global — and keeps following it.
@@ -194,21 +193,16 @@ fun SettingsScreen(
                 // About has no profileable rows at all; don't strand the pane on it.
                 if (id != null && selected?.profileable == false) selectedName = null
             },
-            onNew = { naming = NameIntent.New },
-            onRename = { active?.let { naming = NameIntent.Rename(it) } },
-            onDuplicate = {
-                active?.let { p ->
-                    val copy = newProfile(uniqueName(profileStore, p.name)).copy(
-                        accent = p.accent,
-                        overrides = p.overrides,
-                    )
-                    profileStore.save(copy)
-                    profiles = profileStore.all()
-                    scopeId = copy.id
-                }
+            onNew = { editing = EditIntent.New(nextAccent(profiles)) },
+            onEdit = { p -> editing = EditIntent.Existing(p) },
+            onDuplicate = { p ->
+                val copy = newProfile(uniqueName(profileStore, p.name), p.accent)
+                    .copy(overrides = p.overrides)
+                profileStore.save(copy)
+                profiles = profileStore.all()
+                scopeId = copy.id
             },
-            onRecolour = { recolouring = active },
-            onDelete = { deleting = active },
+            onDelete = { p -> deleting = p },
             modifier = Modifier.padding(top = 12.dp),
         )
         if (active != null) {
@@ -303,33 +297,24 @@ fun SettingsScreen(
         }
     }
 
-    naming?.let { intent ->
-        val editing = (intent as? NameIntent.Rename)?.profile
-        ProfileNameDialog(
-            title = if (editing == null) "New profile" else "Rename profile",
-            initialName = editing?.name.orEmpty(),
-            confirmLabel = if (editing == null) "Create" else "Rename",
-            taken = { profileStore.nameTaken(it, except = editing?.id) },
-            onConfirm = { name ->
-                val saved = editing?.copy(name = name) ?: newProfile(name, nextAccent(profiles))
+    editing?.let { intent ->
+        val existing = (intent as? EditIntent.Existing)?.profile
+        ProfileEditorDialog(
+            title = if (existing == null) "New profile" else "Edit profile",
+            confirmLabel = if (existing == null) "Create" else "Save",
+            initialName = existing?.name.orEmpty(),
+            initialAccent = existing?.accent ?: (intent as? EditIntent.New)?.accent,
+            creating = existing == null,
+            taken = { profileStore.nameTaken(it, except = existing?.id) },
+            onConfirm = { name, accent ->
+                val saved = existing?.copy(name = name, accent = accent)
+                    ?: newProfile(name, accent)
                 profileStore.save(saved)
                 profiles = profileStore.all()
                 scopeId = saved.id
-                naming = null
+                editing = null
             },
-            onDismiss = { naming = null },
-        )
-    }
-
-    recolouring?.let { profile ->
-        ProfileColourDialog(
-            profile = profile,
-            onPick = { hex ->
-                profileStore.save(profile.copy(accent = hex))
-                profiles = profileStore.all()
-                recolouring = null
-            },
-            onDismiss = { recolouring = null },
+            onDismiss = { editing = null },
         )
     }
 
@@ -353,10 +338,11 @@ fun SettingsScreen(
     }
 }
 
-/** What the name dialog is for. */
-private sealed interface NameIntent {
-    data object New : NameIntent
-    data class Rename(val profile: StreamProfile) : NameIntent
+/** What the profile editor is for — a fresh profile (with the colour creation picked out for it),
+ * or one that already exists. */
+private sealed interface EditIntent {
+    data class New(val accent: String) : EditIntent
+    data class Existing(val profile: StreamProfile) : EditIntent
 }
 
 /** "Work" → "Work copy" → "Work copy 2" — the first name Duplicate can actually save. */

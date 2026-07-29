@@ -19,7 +19,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
-import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.ArrowDropDown
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.AssistChipDefaults
@@ -32,7 +32,6 @@ import androidx.compose.material3.ExposedDropdownMenuBox
 import androidx.compose.material3.ExposedDropdownMenuDefaults
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
@@ -56,9 +55,13 @@ import androidx.compose.ui.unit.dp
  * that drifts from it. "Default settings" is the base layer every profile inherits from.
  *
  * A chips row rather than a menu, because on touch the scopes are worth seeing at a glance and
- * there are rarely more than a handful. The overflow beside them manages the SELECTED profile
- * (rename / duplicate / delete); with no profiles at all the row is just "Default settings" and a
- * "New profile" chip, which is all the clutter a user who never wants this feature ever sees.
+ * there are rarely more than a handful. Managing a profile lives ON its chip: the selected one
+ * grows a chevron, and tapping it again opens Edit / Duplicate / Delete anchored under it. That
+ * replaced a lone overflow button parked after the LAST chip — which meant scrolling past every
+ * profile to reach an action that applied to one of them, with nothing on screen saying which.
+ *
+ * With no profiles at all the row is just "Default settings" and a "New profile" chip, which is
+ * all the clutter a user who never wants this feature ever sees.
  */
 @Composable
 internal fun ProfileScopeChips(
@@ -66,12 +69,13 @@ internal fun ProfileScopeChips(
     selectedId: String?,
     onSelect: (String?) -> Unit,
     onNew: () -> Unit,
-    onRename: () -> Unit,
-    onDuplicate: () -> Unit,
-    onRecolour: () -> Unit,
-    onDelete: () -> Unit,
+    onEdit: (StreamProfile) -> Unit,
+    onDuplicate: (StreamProfile) -> Unit,
+    onDelete: (StreamProfile) -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    // Which chip's menu is open — one at a time, and it closes itself when the scope changes.
+    var menuFor by remember { mutableStateOf<String?>(null) }
     Row(
         modifier = modifier.horizontalScroll(rememberScrollState()).padding(horizontal = 12.dp),
         horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -83,24 +87,45 @@ internal fun ProfileScopeChips(
             label = { Text("Default settings") },
         )
         profiles.forEach { p ->
-            FilterChip(
-                selected = selectedId == p.id,
-                onClick = { onSelect(p.id) },
-                // The accent dot rides INSIDE the label, not in the `leadingIcon` slot: that slot
-                // reserves an 18dp icon and shrinks the chip's leading padding to suit, so a
-                // profile with an accent would sit differently from one without and from
-                // "Default settings" beside it. In the label every chip keeps the same padding and
-                // the dot's spacing is ours to set.
-                label = {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        accentColor(p.accent)?.let { dot ->
-                            AccentDot(dot, size = 8)
-                            Spacer(Modifier.width(8.dp))
+            val isSelected = selectedId == p.id
+            Box {
+                FilterChip(
+                    selected = isSelected,
+                    // Tap to select; tap the selected one — the one wearing the chevron — to manage
+                    // it. The action is on the object it acts on, which is the whole point.
+                    onClick = { if (isSelected) menuFor = p.id else onSelect(p.id) },
+                    // The dot and the chevron ride INSIDE the label, not in the `leadingIcon` /
+                    // `trailingIcon` slots: those reserve an 18dp icon and shrink the chip's padding
+                    // to suit, so a chip with an accent (or with the chevron) would sit differently
+                    // from "Default settings" beside it. In the label every chip keeps the same
+                    // padding and the spacing is ours to set.
+                    label = {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            accentColor(p.accent)?.let { dot ->
+                                AccentDot(dot, size = 8)
+                                Spacer(Modifier.width(8.dp))
+                            }
+                            Text(p.name)
+                            if (isSelected) {
+                                Spacer(Modifier.width(2.dp))
+                                Icon(
+                                    Icons.Filled.ArrowDropDown,
+                                    contentDescription = "Manage “${p.name}”",
+                                    modifier = Modifier.size(18.dp),
+                                )
+                            }
                         }
-                        Text(p.name)
-                    }
-                },
-            )
+                    },
+                )
+                DropdownMenu(expanded = menuFor == p.id, onDismissRequest = { menuFor = null }) {
+                    DropdownMenuItem(text = { Text("Edit…") }, onClick = { menuFor = null; onEdit(p) })
+                    DropdownMenuItem(
+                        text = { Text("Duplicate") },
+                        onClick = { menuFor = null; onDuplicate(p) },
+                    )
+                    DropdownMenuItem(text = { Text("Delete…") }, onClick = { menuFor = null; onDelete(p) })
+                }
+            }
         }
         AssistChip(
             onClick = onNew,
@@ -109,49 +134,52 @@ internal fun ProfileScopeChips(
                 Icon(Icons.Filled.Add, contentDescription = null, Modifier.size(AssistChipDefaults.IconSize))
             },
         )
-        if (selectedId != null) {
-            var menu by remember { mutableStateOf(false) }
-            Box {
-                IconButton(onClick = { menu = true }) {
-                    Icon(Icons.Filled.MoreVert, contentDescription = "Manage profile")
-                }
-                DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
-                    DropdownMenuItem(text = { Text("Rename…") }, onClick = { menu = false; onRename() })
-                    DropdownMenuItem(text = { Text("Duplicate") }, onClick = { menu = false; onDuplicate() })
-                    DropdownMenuItem(text = { Text("Change colour…") }, onClick = { menu = false; onRecolour() })
-                    DropdownMenuItem(text = { Text("Delete…") }, onClick = { menu = false; onDelete() })
-                }
-            }
-        }
     }
 }
 
 /**
- * Name a profile — used by both "New profile…" and "Rename…". Names must be unique
- * case-insensitively: two "Work" chips in a menu are ambiguous, and a `punktfunk://…?profile=Work`
- * link would have to refuse rather than guess. [taken] is the live duplicate check, which lets a
- * rename keep its own name (and change only its case).
+ * Create or edit a profile: its name and its colour, decided together. They were two flows —
+ * a name dialog at creation, "Change colour…" afterwards — which meant every profile started
+ * colourless-looking until the user went hunting for a menu item, and the accent is exactly the
+ * signal that has to be there from the first moment (it is all a bound host card's chip and a
+ * pinned card's tint have to go on).
+ *
+ * Names must be unique case-insensitively: two "Work" chips in a menu are ambiguous, and a
+ * `punktfunk://…?profile=Work` link would have to refuse rather than guess. [taken] is the live
+ * duplicate check, which lets an edit keep its own name (and change only its case).
  */
 @Composable
-internal fun ProfileNameDialog(
+internal fun ProfileEditorDialog(
     title: String,
-    initialName: String,
     confirmLabel: String,
+    initialName: String,
+    initialAccent: String?,
+    creating: Boolean,
     taken: (String) -> Boolean,
-    onConfirm: (String) -> Unit,
+    onConfirm: (name: String, accent: String?) -> Unit,
     onDismiss: () -> Unit,
 ) {
     var name by remember { mutableStateOf(initialName) }
+    var accent by remember { mutableStateOf(initialAccent) }
     val trimmed = name.trim()
     val duplicate = trimmed.isNotEmpty() && taken(trimmed)
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text(title) },
-        text = { ProfileNameFields(name, duplicate) { name = it } },
+        text = {
+            ProfileEditorFields(
+                name = name,
+                accent = accent,
+                duplicate = duplicate,
+                creating = creating,
+                onNameChange = { name = it },
+                onAccentChange = { accent = it },
+            )
+        },
         confirmButton = {
             TextButton(
                 enabled = trimmed.isNotEmpty() && !duplicate,
-                onClick = { onConfirm(trimmed) },
+                onClick = { onConfirm(trimmed, accent) },
             ) { Text(confirmLabel) }
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
@@ -159,13 +187,21 @@ internal fun ProfileNameDialog(
 }
 
 /**
- * The name field and its caption. Extracted from [ProfileNameDialog] so the screenshot harness can
- * render exactly these — a focused text field inside a Dialog window never reaches idle under
- * Robolectric, so the dialog itself is uncapturable, and an eyeballed-only layout is how this
- * shipped with the field and its caption touching.
+ * The editor's body. Extracted from [ProfileEditorDialog] so the screenshot harness can render
+ * exactly these — a focused text field inside a Dialog window never reaches idle under Robolectric,
+ * so the dialog itself is uncapturable, and an eyeballed-only layout is how this shipped once with
+ * the field and its caption touching.
  */
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
-internal fun ProfileNameFields(name: String, duplicate: Boolean, onNameChange: (String) -> Unit) {
+internal fun ProfileEditorFields(
+    name: String,
+    accent: String?,
+    duplicate: Boolean,
+    creating: Boolean,
+    onNameChange: (String) -> Unit,
+    onAccentChange: (String?) -> Unit,
+) {
     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
         OutlinedTextField(
             value = name,
@@ -176,12 +212,11 @@ internal fun ProfileNameFields(name: String, duplicate: Boolean, onNameChange: (
             isError = duplicate,
         )
         Text(
-            if (duplicate) {
-                "A profile called “${name.trim()}” already exists."
-            } else {
-                "A profile starts out inheriting every default setting. Whatever you " +
-                    "change while it's selected becomes an override; everything else " +
-                    "keeps following the defaults."
+            when {
+                duplicate -> "A profile called “${name.trim()}” already exists."
+                creating -> "A profile starts out inheriting every default setting. Whatever you " +
+                    "change while it's selected becomes an override."
+                else -> "The colour marks this profile on host cards, where its name doesn't fit."
             },
             style = MaterialTheme.typography.bodySmall,
             color = if (duplicate) {
@@ -190,53 +225,31 @@ internal fun ProfileNameFields(name: String, duplicate: Boolean, onNameChange: (
                 MaterialTheme.colorScheme.onSurfaceVariant
             },
         )
-    }
-}
-
-/**
- * Pick a profile's chip colour. The accent is the whole signal on the surfaces where a profile has
- * no room for its name — a bound host card's chip, a pinned card's tint — so it is worth being able
- * to choose rather than take whatever creation handed out.
- */
-@OptIn(ExperimentalLayoutApi::class)
-@Composable
-internal fun ProfileColourDialog(
-    profile: StreamProfile,
-    onPick: (String?) -> Unit,
-    onDismiss: () -> Unit,
-) {
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("Colour for “${profile.name}”") },
-        text = {
-            FlowRow(
-                horizontalArrangement = Arrangement.spacedBy(12.dp),
-                verticalArrangement = Arrangement.spacedBy(12.dp),
-            ) {
-                PROFILE_ACCENTS.forEach { hex ->
-                    Swatch(
-                        colour = accentColor(hex),
-                        selected = profile.accent?.equals(hex, ignoreCase = true) == true,
-                        onClick = { onPick(hex) },
-                    )
-                }
-                // "No colour" is a real choice, not an absence: the chip then falls back to the
-                // theme's own accent, which is what a profile created before this picker existed has.
-                Swatch(colour = null, selected = profile.accent == null, onClick = { onPick(null) })
+        FlowRow(
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            PROFILE_ACCENTS.forEach { hex ->
+                Swatch(
+                    colour = accentColor(hex),
+                    selected = accent?.equals(hex, ignoreCase = true) == true,
+                    onClick = { onAccentChange(hex) },
+                )
             }
-        },
-        confirmButton = {},
-        dismissButton = { TextButton(onClick = onDismiss) { Text("Close") } },
-    )
+            // "No colour" is a real choice, not only an initial state: the chip then falls back to
+            // the theme's own accent, which is what a profile made before colours existed shows.
+            Swatch(colour = null, selected = accent == null, onClick = { onAccentChange(null) })
+        }
+    }
 }
 
 /** One colour choice: a filled disc, ringed when it is the current one. `null` = no colour. */
 @Composable
-private fun Swatch(colour: Color?, selected: Boolean, onClick: () -> Unit) {
+internal fun Swatch(colour: Color?, selected: Boolean, onClick: () -> Unit) {
     val fill = colour ?: MaterialTheme.colorScheme.surfaceVariant
     Box(
         Modifier
-            .size(40.dp)
+            .size(36.dp)
             .clip(CircleShape)
             .background(fill)
             .then(

@@ -37,7 +37,7 @@ import io.unom.punktfunk.SettingsCategory
 import io.unom.punktfunk.SettingsScreen
 import io.unom.punktfunk.StatsOverlay
 import io.unom.punktfunk.StatsVerbosity
-import io.unom.punktfunk.ProfileNameFields
+import io.unom.punktfunk.ProfileEditorFields
 import io.unom.punktfunk.ProfileStore
 import io.unom.punktfunk.SettingsOverlay
 import io.unom.punktfunk.SpeedTestDialog
@@ -255,10 +255,24 @@ internal fun NewProfileScene() {
     Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
         Column(Modifier.padding(24.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
             Text("New profile", style = MaterialTheme.typography.headlineSmall)
-            // The dialog's own body, not a rebuild of it — the spacing under test is the real one.
-            ProfileNameFields(name = "Travel", duplicate = false, onNameChange = {})
+            // The dialog's own body, not a rebuild of it — the layout under test is the real one.
+            ProfileEditorFields(
+                name = "Travel",
+                accent = "#60A5FA",
+                duplicate = false,
+                creating = true,
+                onNameChange = {},
+                onAccentChange = {},
+            )
             Text("Duplicate name", style = MaterialTheme.typography.headlineSmall)
-            ProfileNameFields(name = "Game", duplicate = true, onNameChange = {})
+            ProfileEditorFields(
+                name = "Game",
+                accent = "#FF8A4C",
+                duplicate = true,
+                creating = false,
+                onNameChange = {},
+                onAccentChange = {},
+            )
         }
     }
 }
