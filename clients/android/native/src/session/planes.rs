@@ -5,7 +5,7 @@ use jni::objects::JObject;
 // Used only by the android-gated `nativeStartVideo`; on the host build that fn is cfg'd out.
 #[cfg(target_os = "android")]
 use jni::objects::JString;
-use jni::sys::{jboolean, jdoubleArray, jlong, jsize, jstring};
+use jni::sys::{jboolean, jdoubleArray, jintArray, jlong, jsize, jstring};
 use jni::JNIEnv;
 
 use super::{jni_guard, SessionHandle};
@@ -257,6 +257,36 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeVideoStats(
             Err(_) => return std::ptr::null_mut(),
         };
         if env.set_double_array_region(&arr, 0, &buf).is_err() {
+            return std::ptr::null_mut();
+        }
+        arr.into_raw()
+    })
+}
+
+/// `NativeBridge.nativeVideoSize(handle): IntArray?` — the negotiated video mode as
+/// `[width, height]`. Resolved at the handshake (Welcome), so it is known before a single frame
+/// arrives: the UI sizes the video surface to the STREAM's aspect rather than stretching it to the
+/// panel's. `null` on a `0` handle. Not android-gated — pure `jni` + a connector read, so it links
+/// on the host build too. Cheap; safe on the UI thread.
+#[no_mangle]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeVideoSize(
+    env: JNIEnv,
+    _this: JObject,
+    handle: jlong,
+) -> jintArray {
+    jni_guard(std::ptr::null_mut(), || {
+        if handle == 0 {
+            return std::ptr::null_mut();
+        }
+        // SAFETY: live handle per the nativeConnect/nativeClose contract.
+        let h = unsafe { &*(handle as *const SessionHandle) };
+        let mode = h.client.mode();
+        let buf: [i32; 2] = [mode.width as i32, mode.height as i32];
+        let arr = match env.new_int_array(buf.len() as jsize) {
+            Ok(a) => a,
+            Err(_) => return std::ptr::null_mut(),
+        };
+        if env.set_int_array_region(&arr, 0, &buf).is_err() {
             return std::ptr::null_mut();
         }
         arr.into_raw()

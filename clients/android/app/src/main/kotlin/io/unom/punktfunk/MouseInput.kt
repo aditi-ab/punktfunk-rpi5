@@ -32,7 +32,13 @@ class MouseForwarder(
     private val handle: Long,
     private val invertScroll: Boolean,
     private val captureWanted: Boolean,
-    private val surfaceSize: () -> Pair<Int, Int>,
+    /**
+     * The picture's rect in WINDOW coordinates — where the letterboxed video actually sits, which is
+     * the frame absolute positions must be measured against. Events arrive from the activity's
+     * dispatch overrides in window coordinates, so a stream narrower than the panel needs the origin
+     * subtracted as well as the size divided; `null` while the surface isn't laid out yet.
+     */
+    private val videoRect: () -> android.graphics.Rect?,
 ) {
     /** Capture plumbing, owned by StreamScreen (the focusable capture view). */
     var onRequestCapture: (() -> Unit)? = null
@@ -152,12 +158,16 @@ class MouseForwarder(
     }
 
     private fun sendAbs(ev: MotionEvent) {
-        val (w, h) = surfaceSize()
+        val r = videoRect() ?: return
+        val w = r.width()
+        val h = r.height()
         if (w <= 0 || h <= 0) return
+        // Clamped into the picture: a pointer out on a letterbox bar has no host position of its
+        // own, and the edge is the honest answer for it.
         NativeBridge.nativeSendPointerAbs(
             handle,
-            ev.x.roundToInt().coerceIn(0, w - 1),
-            ev.y.roundToInt().coerceIn(0, h - 1),
+            (ev.x - r.left).roundToInt().coerceIn(0, w - 1),
+            (ev.y - r.top).roundToInt().coerceIn(0, h - 1),
             w,
             h,
         )

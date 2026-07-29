@@ -26,6 +26,7 @@ import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -197,6 +198,11 @@ fun StreamScreen(session: ActiveSession, onDisconnect: () -> Unit) {
     // below so the capture callbacks can reach the view once it exists.
     var keyCapture by remember { mutableStateOf<KeyCaptureView?>(null) }
 
+    // The video SurfaceView, hoisted for the same reason: the pointer paths built below map WINDOW
+    // coordinates onto the picture, and with a letterboxed stream that rect is the video's, not the
+    // panel's. Set when the view is created.
+    var videoView by remember { mutableStateOf<SurfaceView?>(null) }
+
     DisposableEffect(handle) {
         window?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         wifiLocks.forEach { lock ->
@@ -256,7 +262,15 @@ fun StreamScreen(session: ActiveSession, onDisconnect: () -> Unit) {
             handle,
             invertScroll = initialSettings.invertScroll,
             captureWanted = initialSettings.mouseMode == MouseMode.CAPTURE,
-            surfaceSize = { (decor?.width ?: 0) to (decor?.height ?: 0) },
+            // The picture's rect in window coordinates (see MouseForwarder.videoRect) — read live,
+            // so it is right from the frame the SurfaceView is first laid out.
+            videoRect = {
+                videoView?.takeIf { it.width > 0 && it.height > 0 }?.let { v ->
+                    val loc = IntArray(2)
+                    v.getLocationInWindow(loc)
+                    android.graphics.Rect(loc[0], loc[1], loc[0] + v.width, loc[1] + v.height)
+                }
+            },
         )
         mouse.onRequestCapture = {
             // The grab needs the (focusable) capture view: focus it, then ask. Posted so a
@@ -275,7 +289,7 @@ fun StreamScreen(session: ActiveSession, onDisconnect: () -> Unit) {
         val remote = if (isTv) {
             RemotePointer(
                 handle,
-                surfaceWidth = { decor?.width ?: 1920 },
+                surfaceWidth = { videoView?.width?.takeIf { it > 0 } ?: decor?.width ?: 1920 },
                 onActiveChanged = { on -> remotePointerOn = on },
                 onKeyboardToggle = { keyCapture?.let { it.setImeVisible(!it.imeShown) } },
             )
@@ -423,11 +437,33 @@ fun StreamScreen(session: ActiveSession, onDisconnect: () -> Unit) {
         activity?.mouseForwarder?.engageFromStart()
     }
 
-    Box(modifier = Modifier.fillMaxSize()) {
+    // Fit the picture to the stream's own aspect, letterboxing the rest in black. MediaCodec scales
+    // whatever it decodes to fill the Surface it renders into, so a 16:9 stream on a 20:9 panel came
+    // out stretched — the surface has to carry the aspect, because nothing downstream of it can.
+    // The mode is the negotiated one (known from the handshake, before the first frame); 0/absent —
+    // an older native lib — falls back to filling, i.e. exactly the previous behaviour.
+    val videoAspect = remember(handle) {
+        val size = NativeBridge.nativeVideoSize(handle)
+        val w = size?.getOrNull(0) ?: 0
+        val h = size?.getOrNull(1) ?: 0
+        if (w > 0 && h > 0) w.toFloat() / h.toFloat() else 0f
+    }
+    Box(modifier = Modifier.fillMaxSize().background(Color.Black)) {
+        // One rect for the picture AND for the input that lands on it. Every absolute mapping —
+        // direct-pointer touch, multi-touch passthrough, the pen lane — measures against the size of
+        // the node it sits on, so putting the gesture layer on this same rect keeps all three correct
+        // by construction rather than by threading an offset through each of them. The cost is that
+        // trackpad swipes starting inside a letterbox bar don't register; the picture is the surface.
+        val videoFit = if (videoAspect > 0f) {
+            Modifier.align(Alignment.Center).aspectRatio(videoAspect)
+        } else {
+            Modifier.fillMaxSize()
+        }
         AndroidView(
-            modifier = Modifier.fillMaxSize(),
+            modifier = videoFit,
             factory = { ctx ->
                 SurfaceView(ctx).apply {
+                    videoView = this
                     holder.addCallback(object : SurfaceHolder.Callback {
                         override fun surfaceCreated(holder: SurfaceHolder) {
                             // Low-latency mode: rank MediaCodecList decoders for the negotiated
@@ -517,7 +553,7 @@ fun StreamScreen(session: ActiveSession, onDisconnect: () -> Unit) {
             LaunchedEffect(stylus) { stylus.heartbeatLoop() }
         }
         Box(
-            Modifier.fillMaxSize().pointerInput(handle, touchMode) {
+            videoFit.pointerInput(handle, touchMode) {
                 when (touchMode) {
                     TouchMode.TOUCH -> streamTouchPassthrough(handle, stylus)
                     else -> streamTouchInput(

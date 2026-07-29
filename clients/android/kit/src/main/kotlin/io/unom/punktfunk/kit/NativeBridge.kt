@@ -184,6 +184,14 @@ object NativeBridge {
     external fun nativeVideoMime(handle: Long): String
 
     /**
+     * The negotiated video mode as `[width, height]`, or `null` on a `0` handle. Resolved at the
+     * handshake, so it is known before the first frame — the stream view sizes itself to THIS
+     * aspect rather than stretching the picture to the panel's. Fixed for the session; read once.
+     * Cheap; UI-safe.
+     */
+    external fun nativeVideoSize(handle: Long): IntArray?
+
+    /**
      * A short human label for the codec the host resolved (`"H.264"` / `"HEVC"` / `"AV1"` /
      * `"PyroWave"`), for the stats HUD's video-feed line, or `""` on a `0` handle. Distinct from
      * [nativeVideoMime] because the MIME collapses PyroWave onto `video/hevc` and can't name it.
