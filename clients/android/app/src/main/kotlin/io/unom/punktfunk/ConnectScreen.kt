@@ -275,7 +275,7 @@ fun ConnectScreen(
     var editTarget by remember { mutableStateOf<KnownHost?>(null) }
     // A saved host whose console options menu (Wake / Edit / Forget) is open — reached with Up on the
     // carousel (the console counterpart of the touch host card's overflow menu).
-    var optionsTarget by remember { mutableStateOf<KnownHost?>(null) }
+    var optionsTarget by remember { mutableStateOf<HostCardEntry?>(null) }
 
     // Discovered hosts not already saved — a saved host (paired or TOFU) belongs in "Saved hosts",
     // not also in "Discovered", so we hide the overlap (matched by fingerprint when both carry it, so
@@ -718,6 +718,7 @@ fun ConnectScreen(
                             online = kh.isOnline(discovered, reachable),
                             paired = kh.paired,
                             knownHost = kh,
+                            pinnedProfileId = p.id,
                             activate = { connect(kh.address, kh.port, oneOffProfile = p.id) },
                         ),
                     )
@@ -758,7 +759,11 @@ fun ConnectScreen(
             onActivate = { it.activate() },
             onOpenLibrary = { it.knownHost?.let(onOpenLibrary) },
             onOpenSettings = onOpenSettings,
-            onOptions = { it.knownHost?.let { kh -> optionsTarget = kh } },
+            onOptions = { tile ->
+                tile.knownHost?.let { kh ->
+                    optionsTarget = HostCardEntry(kh, tile.pinnedProfileId?.let(profileStore::byId))
+                }
+            },
         )
     } else {
         Box(Modifier.fillMaxSize()) {
@@ -1028,7 +1033,9 @@ fun ConnectScreen(
     }
 
     // Console host options (Up on a saved carousel tile): Wake / Edit / Forget.
-    optionsTarget?.let { kh ->
+    optionsTarget?.let { entry ->
+        val kh = entry.host
+        val pin = entry.pin
         val offline = !kh.isOnline(discovered, reachable)
         GamepadHostOptionsDialog(
             hostName = kh.name,
@@ -1048,7 +1055,7 @@ fun ConnectScreen(
             },
             // A saved host always has a library (it's a knownHost) → offer it when the setting's on,
             // so a TV remote reaches the library here instead of via the Y face button.
-            onLibrary = if (settings.libraryEnabled) {
+            onLibrary = if (settings.libraryEnabled && pin == null) {
                 { optionsTarget = null; onOpenLibrary(kh) }
             } else {
                 null
@@ -1060,6 +1067,9 @@ fun ConnectScreen(
                 optionsTarget = null
             },
             onDismiss = { optionsTarget = null },
+            // A pin's only action: unpinning touches neither the host nor the profile.
+            onUnpin = pin?.let { p -> { togglePin(kh, p); optionsTarget = null } },
+            profileName = pin?.name,
         )
     }
 

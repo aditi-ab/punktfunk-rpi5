@@ -73,11 +73,17 @@ class HomeTile(
     val connecting: Boolean = false,
     val isAdd: Boolean = false,      // the trailing Add Host tile (plus icon, not a monogram)
     val knownHost: KnownHost? = null, // set for saved hosts → enables the library (Y)
+    /**
+     * Set when this tile is a PINNED host+profile combination rather than the host's own tile.
+     * A pin is a shortcut, not a second host: the host-level actions (wake, edit, forget, library)
+     * belong to the host's own tile, and this one offers only Unpin.
+     */
+    val pinnedProfileId: String? = null,
     val activate: () -> Unit,
 ) {
     // Any SAVED host offers the library (matches Apple) — the fetch itself returns a clear "pair
     // first" message if the host hasn't authorized this device for its management API.
-    val hasLibrary: Boolean get() = knownHost != null
+    val hasLibrary: Boolean get() = knownHost != null && pinnedProfileId == null
 }
 
 /**

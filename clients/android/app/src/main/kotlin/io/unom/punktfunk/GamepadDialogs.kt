@@ -213,11 +213,23 @@ fun GamepadHostOptionsDialog(
     onEdit: () -> Unit,
     onForget: () -> Unit,
     onDismiss: () -> Unit,
+    /**
+     * Non-null when this is a PINNED host+profile tile, whose only action is to unpin. A pin is a
+     * shortcut, not a second host — offering the host's destructive actions on it would blur
+     * exactly that, and the touch grid withholds them for the same reason.
+     */
+    onUnpin: (() -> Unit)? = null,
+    profileName: String? = null,
 ) {
     GamepadDialog(
-        title = hostName,
+        title = if (profileName != null) "$hostName · $profileName" else hostName,
         onDismiss = onDismiss,
         actions = buildList {
+            if (onUnpin != null) {
+                add(DialogAction("Unpin card", primary = true, onClick = onUnpin))
+                add(DialogAction("Cancel", onClick = onDismiss))
+                return@buildList
+            }
             if (onLibrary != null) add(DialogAction("Library", primary = true, onClick = onLibrary))
             if (canWake) add(DialogAction("Wake host", onClick = onWake))
             add(DialogAction("Edit…", primary = onLibrary == null, onClick = onEdit))
@@ -225,7 +237,14 @@ fun GamepadHostOptionsDialog(
             add(DialogAction("Cancel", onClick = onDismiss))
         },
     ) {
-        DialogText("Manage this saved host.")
+        DialogText(
+            if (onUnpin != null) {
+                "This card is a shortcut to this host with one profile. Unpinning it changes " +
+                    "nothing about the host or the profile."
+            } else {
+                "Manage this saved host."
+            },
+        )
     }
 }
 
