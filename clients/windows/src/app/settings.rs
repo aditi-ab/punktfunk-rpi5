@@ -201,95 +201,133 @@ fn colour_swatches(profile: &StreamProfile, rev: u64, set_rev: &AsyncSetState<u6
 /// scope dropdown refreshes on Close (one revision bump), so the ComboBox is not remounted
 /// under the user mid-keystroke.
 fn edit_profile_modal(
-    profile: &StreamProfile,
+    profile: Option<&StreamProfile>,
+    switcher: Option<ComboBox>,
     set_scope: &AsyncSetState<String>,
     set_delete: &AsyncSetState<Option<String>>,
     set_edit: &AsyncSetState<bool>,
     rev: u64,
     set_rev: &AsyncSetState<u64>,
 ) -> Element {
-    let id = profile.id.clone();
-    let name_box = {
-        let id = id.clone();
-        text_box(&profile.name)
-            .header("Name")
-            .placeholder_text("Profile name")
-            .on_text_changed(move |t: String| {
-                let name = t.trim().to_string();
-                if name.is_empty() {
-                    return;
-                }
-                let mut catalog = ProfilesFile::load();
-                // Names are unique case-insensitively — menus keyed by name are ambiguous
-                // otherwise. A collision simply doesn't commit; the box keeps what was typed.
-                if catalog.name_taken(&name, Some(&id)) {
-                    return;
-                }
-                if let Some(p) = catalog.profiles.iter_mut().find(|p| p.id == id) {
-                    p.name = name;
-                    let _ = catalog.save();
-                }
-            })
-    };
-    let duplicate = {
-        let (id, set_scope) = (id.clone(), set_scope.clone());
-        button("Duplicate").on_click(move || {
-            let mut catalog = ProfilesFile::load();
-            let Some(source) = catalog.find_by_id(&id).cloned() else {
-                return;
-            };
-            let name = (2..)
-                .map(|n| format!("{} {n}", source.name))
-                .find(|n| !catalog.name_taken(n, None))
-                .unwrap_or_else(|| source.name.clone());
-            let mut copy = StreamProfile::new(name);
-            copy.overrides = source.overrides.clone();
-            copy.accent = source.accent.clone();
-            let new_id = copy.id.clone();
-            catalog.profiles.push(copy);
-            if catalog.save().is_ok() {
-                // The modal stays open and now edits the copy — scope follows it.
-                set_scope.call(new_id);
+    let mut rows: Vec<Element> = vec![text_block(if switcher.is_some() {
+        "Profiles"
+    } else {
+        "Edit profile"
+    })
+    .font_size(20.0)
+    .bold()
+    .into()];
+    if let Some(sw) = switcher {
+        // Keyed by scope: an in-sheet scope switch re-renders this combo with a different
+        // selection, and the in-place diff would leave it blank (the documented
+        // items/selected_index hazard) — a remount applies every prop.
+        rows.push(
+            vstack(vec![Element::from(sw)])
+                .with_key(format!(
+                    "sheet-scope-{}",
+                    profile.map(|p| p.id.as_str()).unwrap_or("")
+                ))
+                .into(),
+        );
+    }
+    if let Some(profile) = profile {
+        let id = profile.id.clone();
+        let name_box = {
+            let id = id.clone();
+            text_box(&profile.name)
+                .header("Name")
+                .placeholder_text("Profile name")
+                .on_text_changed(move |t: String| {
+                    let name = t.trim().to_string();
+                    if name.is_empty() {
+                        return;
+                    }
+                    let mut catalog = ProfilesFile::load();
+                    // Names are unique case-insensitively — menus keyed by name are ambiguous
+                    // otherwise. A collision simply doesn't commit; the box keeps what was typed.
+                    if catalog.name_taken(&name, Some(&id)) {
+                        return;
+                    }
+                    if let Some(p) = catalog.profiles.iter_mut().find(|p| p.id == id) {
+                        p.name = name;
+                        let _ = catalog.save();
+                    }
+                })
+        };
+        rows.push(name_box.into());
+        rows.push(colour_swatches(profile, rev, set_rev));
+    }
+    rows.push(
+        text_block(
+            "A profile overrides only what you change while it is selected; everything \
+             else follows Default settings. Renaming applies as you type. Deleting leaves \
+             hosts that used it on Default settings.",
+        )
+        .font_size(12.0)
+        .wrap()
+        .foreground(ThemeRef::SecondaryText)
+        .into(),
+    );
+    let mut buttons: Vec<Element> = Vec::new();
+    if let Some(p) = profile {
+        let id = p.id.clone();
+        buttons.push(
+            {
+                let (id, set_scope) = (id.clone(), set_scope.clone());
+                button("Duplicate").on_click(move || {
+                    let mut catalog = ProfilesFile::load();
+                    let Some(source) = catalog.find_by_id(&id).cloned() else {
+                        return;
+                    };
+                    let name = (2..)
+                        .map(|n| format!("{} {n}", source.name))
+                        .find(|n| !catalog.name_taken(n, None))
+                        .unwrap_or_else(|| source.name.clone());
+                    let mut copy = StreamProfile::new(name);
+                    copy.overrides = source.overrides.clone();
+                    copy.accent = source.accent.clone();
+                    let new_id = copy.id.clone();
+                    catalog.profiles.push(copy);
+                    if catalog.save().is_ok() {
+                        // The sheet stays open and now edits the copy — scope follows it.
+                        set_scope.call(new_id);
+                    }
+                })
             }
-        })
-    };
-    let delete = {
-        let (id, set_delete) = (id.clone(), set_delete.clone());
-        button("Delete\u{2026}").on_click(move || set_delete.call(Some(id.clone())))
-    };
-    let close = {
-        let (set_edit, set_rev) = (set_edit.clone(), set_rev.clone());
-        button("Close").accent().on_click(move || {
-            set_edit.call(false);
-            // The deferred repaint: the pane dropdown (and any pinned tiles) pick up the
-            // rename now, in one pass, instead of remounting per keystroke.
-            set_rev.call(rev + 1);
-        })
-    };
-    let modal = dialog_surface(
-        vstack((
-            text_block("Edit profile").font_size(20.0).bold(),
-            name_box,
-            colour_swatches(profile, rev, set_rev),
-            text_block(
-                "A profile overrides only what you change while it is selected; everything \
-                 else follows Default settings. Renaming applies as you type. Deleting leaves \
-                 hosts that used it on Default settings.",
-            )
-            .font_size(12.0)
-            .wrap()
-            .foreground(ThemeRef::SecondaryText),
-            hstack((duplicate, delete, close))
-                .spacing(8.0)
-                .horizontal_alignment(HorizontalAlignment::Right)
-                .margin(edges(0.0, 6.0, 0.0, 0.0)),
-        ))
-        .spacing(12.0),
-    )
-    .max_width(420.0)
-    .horizontal_alignment(HorizontalAlignment::Center)
-    .vertical_alignment(VerticalAlignment::Center)
-    .margin(uniform(24.0));
+            .into(),
+        );
+        buttons.push(
+            {
+                let set_delete = set_delete.clone();
+                button("Delete\u{2026}").on_click(move || set_delete.call(Some(id.clone())))
+            }
+            .into(),
+        );
+    }
+    buttons.push(
+        {
+            let (set_edit, set_rev) = (set_edit.clone(), set_rev.clone());
+            button("Close").accent().on_click(move || {
+                set_edit.call(false);
+                // The deferred repaint: the pane dropdown (and any pinned tiles) pick up the
+                // rename now, in one pass, instead of remounting per keystroke.
+                set_rev.call(rev + 1);
+            })
+        }
+        .into(),
+    );
+    rows.push(
+        hstack(buttons)
+            .spacing(8.0)
+            .horizontal_alignment(HorizontalAlignment::Right)
+            .margin(edges(0.0, 6.0, 0.0, 0.0))
+            .into(),
+    );
+    let modal = dialog_surface(vstack(rows).spacing(12.0))
+        .max_width(420.0)
+        .horizontal_alignment(HorizontalAlignment::Center)
+        .vertical_alignment(VerticalAlignment::Center)
+        .margin(uniform(24.0));
     // The scrim fills the cell and is hit-testable, so it blocks the page behind; it closes
     // only via the buttons (a scrim tap would bubble `Tapped` up from the card too).
     border(modal)
@@ -1281,12 +1319,14 @@ pub(crate) fn settings_page(
     // the whole surface read as clutter. Editing the profile itself (name, colour, delete)
     // is a modal behind the "Edit profile…" button, not inline chrome.
     //
-    // But ONLY while the pane is expanded — pane-footer content is CLIPPED to the compact
-    // rail, not adapted. WinUI's Auto mode would collapse the pane below 1008 epx (under the
-    // app's own 1000-wide default window!), which kept booting the switcher out of the nav,
-    // so the page FORCES the pane: expanded (`Left`, at a tighter 250 length) whenever the
-    // content column still gets a workable width, minimal below that. Reactor exposes no
-    // pane-opened/closed event, so the switcher placement rides the same threshold.
+    // And it stays in the nav at EVERY width. WinUI's Auto mode collapses the pane below
+    // 1008 epx (under the app's own 1000-wide default window) and CLIPS pane-footer content
+    // to the rail — so the page forces the mode instead: `Left` (always expanded, 280 long)
+    // while the content column still gets a workable width, `LeftCompact` (the 48 rail,
+    // footer still visible) below that. In the rail the footer swaps to a fitting compact
+    // form — a monogram disc for the scope, which opens the profile sheet — rather than a
+    // clipped ComboBox. Reactor exposes no pane-opened/closed event, so both the mode and
+    // the footer form ride this one width threshold.
     let pane_expanded = window_width >= 720.0;
     let catalog = ProfilesFile::load();
     let mut scope_names = vec!["Default settings".to_string()];
@@ -1298,83 +1338,112 @@ pub(crate) fn settings_page(
     scope_names.push("New profile\u{2026}".to_string());
     scope_ids.push(NEW_PROFILE.to_string());
     let scope_i = scope_ids.iter().position(|i| i == scope).unwrap_or(0);
-    let switcher = ComboBox::new(scope_names.clone())
-        .header("Editing")
-        .selected_index(scope_i as i32)
-        .min_width(200.0)
-        .on_selection_changed({
-            let (set_scope, set_edit, ids) = (set_scope.clone(), set_edit.clone(), scope_ids);
-            move |i: i32| {
-                let Some(id) = ids.get(i.max(0) as usize) else {
-                    return;
-                };
-                if id == NEW_PROFILE {
-                    // A new profile takes an auto-numbered name and lands straight in the
-                    // Edit modal to be named — creation and naming are one gesture, and
-                    // there is no half-created state a Cancel would have to unwind.
-                    let mut catalog = ProfilesFile::load();
-                    let name = (1..)
-                        .map(|n| format!("Profile {n}"))
-                        .find(|n| !catalog.name_taken(n, None))
-                        .unwrap_or_else(|| "Profile".to_string());
-                    let profile = StreamProfile::new(name);
-                    let new_id = profile.id.clone();
-                    catalog.profiles.push(profile);
-                    if catalog.save().is_ok() {
-                        set_scope.call(new_id);
-                        set_edit.call(true);
+    // A factory, not a value: the combo is placed in the pane footer when the pane is
+    // expanded, and inside the profile sheet when the rail's monogram opens it — one
+    // builder, instantiated for whichever surface renders this pass.
+    let make_switcher = {
+        let (set_scope, set_edit) = (set_scope.clone(), set_edit.clone());
+        let (names, ids) = (scope_names.clone(), scope_ids);
+        move || {
+            ComboBox::new(names.clone())
+                .header("Editing")
+                .selected_index(scope_i as i32)
+                .min_width(216.0)
+                .on_selection_changed({
+                    let (set_scope, set_edit, ids) =
+                        (set_scope.clone(), set_edit.clone(), ids.clone());
+                    move |i: i32| {
+                        let Some(id) = ids.get(i.max(0) as usize) else {
+                            return;
+                        };
+                        if id == NEW_PROFILE {
+                            // A new profile takes an auto-numbered name and lands straight
+                            // in the sheet to be named — creation and naming are one
+                            // gesture, and there is no half-created state a Cancel would
+                            // have to unwind.
+                            let mut catalog = ProfilesFile::load();
+                            let name = (1..)
+                                .map(|n| format!("Profile {n}"))
+                                .find(|n| !catalog.name_taken(n, None))
+                                .unwrap_or_else(|| "Profile".to_string());
+                            let profile = StreamProfile::new(name);
+                            let new_id = profile.id.clone();
+                            catalog.profiles.push(profile);
+                            if catalog.save().is_ok() {
+                                set_scope.call(new_id);
+                                set_edit.call(true);
+                            }
+                            return;
+                        }
+                        set_scope.call(id.clone());
                     }
-                    return;
-                }
-                set_scope.call(id.clone());
-            }
-        });
-    let edit_button: Option<Element> = profile_mode.then(|| {
-        let set_edit = set_edit.clone();
-        button("Edit profile\u{2026}")
-            .on_click(move || set_edit.call(true))
-            .into()
-    });
-    // Keyed by scope + the name list: a rename/create/delete changes the ComboBox's items,
-    // and an in-place diff re-sets items (clearing WinUI's selection) while skipping
-    // `selected_index` when it compares equal — the combo then renders blank. A remount
-    // applies every prop. The keyed child sits inside a plain vstack because only a panel's
-    // child list takes the keyed path (same rule as the content column below).
-    let switcher_key = format!("{scope}\u{1}{}", scope_names.join("\u{1}"));
-    // Expanded pane: combo over button, in the footer. Collapsed: one horizontal row that
-    // leads the content column (bottom-aligned so the combo's "Editing" header doesn't push
-    // the button off its baseline).
-    let (footer, inline_switcher): (Option<Element>, Option<Element>) = if pane_expanded {
-        let rows: Vec<Element> = std::iter::once(Element::from(switcher))
-            .chain(edit_button)
-            .collect();
-        (
-            Some(
-                vstack(vec![vstack(rows)
-                    .spacing(8.0)
-                    .with_key(switcher_key)
-                    .into()])
-                .margin(edges(16.0, 0.0, 16.0, 12.0))
-                .into(),
-            ),
-            None,
-        )
+                })
+        }
+    };
+    let footer: Element = if pane_expanded {
+        // Keyed by scope + the name list: a rename/create/delete changes the ComboBox's
+        // items, and an in-place diff re-sets items (clearing WinUI's selection) while
+        // skipping `selected_index` when it compares equal — the combo then renders blank.
+        // A remount applies every prop. The keyed child sits inside a plain vstack because
+        // only a panel's child list takes the keyed path (same rule as the content column).
+        let switcher_key = format!("{scope}\u{1}{}", scope_names.join("\u{1}"));
+        let mut rows: Vec<Element> = vec![make_switcher().into()];
+        if profile_mode {
+            let set_edit = set_edit.clone();
+            rows.push(
+                button("Edit profile\u{2026}")
+                    .on_click(move || set_edit.call(true))
+                    .into(),
+            );
+        }
+        vstack(vec![vstack(rows)
+            .spacing(8.0)
+            .with_key(switcher_key)
+            .into()])
+        .margin(edges(16.0, 0.0, 16.0, 12.0))
+        .into()
     } else {
-        let row: Vec<Element> = std::iter::once(Element::from(switcher))
-            .chain(edit_button)
-            .collect();
-        (
-            None,
-            Some(
-                vstack(vec![hstack(row)
-                    .spacing(8.0)
-                    .vertical_alignment(VerticalAlignment::Bottom)
-                    .with_key(switcher_key)
-                    .into()])
-                .margin(edges(24.0, 12.0, 28.0, 0.0))
-                .into(),
-            ),
+        // The compact rail: a 40-square monogram disc for the scope (profile accent when it
+        // has one), opening the profile sheet. Plain prop diffs — no combo in the rail, so
+        // no key needed.
+        let scope_label = match &active {
+            Some(p) => p.name.clone(),
+            None => "Default settings".to_string(),
+        };
+        let initial = scope_label
+            .chars()
+            .find(|c| c.is_alphanumeric())
+            .map(|c| c.to_uppercase().to_string())
+            .unwrap_or_else(|| "?".into());
+        let accent = active
+            .as_ref()
+            .and_then(|p| p.accent.as_deref())
+            .and_then(hex_color);
+        let disc = border(
+            text_block(initial)
+                .font_size(17.0)
+                .semibold()
+                // The on-accent brush, not AccentText — see `style::avatar`.
+                .foreground(ThemeRef::custom("TextOnAccentFillColorPrimaryBrush"))
+                .horizontal_alignment(HorizontalAlignment::Center)
+                .vertical_alignment(VerticalAlignment::Center),
         )
+        .corner_radius(10.0)
+        .width(40.0)
+        .height(40.0)
+        .tooltip(format!("Editing: {scope_label}"))
+        .on_tapped({
+            let set_edit = set_edit.clone();
+            move || set_edit.call(true)
+        });
+        let disc = match accent {
+            Some(c) => disc.background(c),
+            None => disc.background(ThemeRef::Accent),
+        };
+        vstack(vec![disc.into()])
+            .horizontal_alignment(HorizontalAlignment::Center)
+            .margin(edges(4.0, 0.0, 4.0, 12.0))
+            .into()
     };
 
     let titled: Vec<Element> = std::iter::once(
@@ -1409,16 +1478,7 @@ pub(crate) fn settings_page(
     )
     .opacity(progress)
     .margin(edges(0.0, (1.0 - progress) * 22.0, 0.0, 0.0));
-    // With the pane collapsed the switcher leads the content column, above the scrolling
-    // region so it stays put — it is still chrome, not a settings row. An Auto/Star grid,
-    // not a vstack: a StackPanel would hand the scroll_view its DESIRED height and the
-    // viewport (and scrolling) would be gone.
-    let content: Element = match inline_switcher {
-        Some(row) => grid(vec![row.grid_row(0), Element::from(scrolled).grid_row(1)])
-            .rows([GridLength::Auto, GridLength::STAR])
-            .into(),
-        None => scrolled.into(),
-    };
+    let content: Element = scrolled.into();
     // The delete confirmation, when armed. Declarative, like every other dialog in this shell:
     // it is an element in the tree with `is_open`, not a call.
     let confirm: Option<Element> = delete_pending.as_ref().and_then(|id| {
@@ -1486,9 +1546,9 @@ pub(crate) fn settings_page(
         .pane_display_mode(if pane_expanded {
             NavigationViewPaneDisplayMode::Left
         } else {
-            NavigationViewPaneDisplayMode::LeftMinimal
+            NavigationViewPaneDisplayMode::LeftCompact
         })
-        .open_pane_length(250.0)
+        .open_pane_length(280.0)
         .selected_tag(section)
         .on_selection_changed({
             let ss = set_section.clone();
@@ -1500,21 +1560,26 @@ pub(crate) fn settings_page(
             let ss = set_screen.clone();
             move || ss.call(Screen::Hosts)
         });
-    if let Some(f) = footer {
-        nav = nav.pane_footer(f);
-    }
+    nav = nav.pane_footer(footer);
     // One grid, so every layer FILLS the window (a vstack would hand the NavigationView its
     // desired height — clipped when the window is short, floating when it is tall): the nav,
     // the Edit-profile scrim + card over it, and the delete confirmation (a ContentDialog,
     // its own WinUI layer, so its slot in the cell is irrelevant — it just needs to be in
     // the tree).
     let mut layers: Vec<Element> = vec![nav.into()];
-    if edit_open {
-        if let Some(p) = &active {
-            layers.push(edit_profile_modal(
-                p, set_scope, set_delete, set_edit, rev, set_rev,
-            ));
-        }
+    // The profile sheet: reachable via "Edit profile…" (expanded pane, profile in scope)
+    // or the rail's monogram disc (compact — then it carries the scope combo too, since
+    // the rail has no room for one).
+    if edit_open && (profile_mode || !pane_expanded) {
+        layers.push(edit_profile_modal(
+            active.as_ref(),
+            (!pane_expanded).then(&make_switcher),
+            set_scope,
+            set_delete,
+            set_edit,
+            rev,
+            set_rev,
+        ));
     }
     if let Some(dialog) = confirm {
         layers.push(dialog);
