@@ -20,9 +20,16 @@
 //!
 //! * A child's *sync* `use_state` re-renders it — including under element-equal
 //!   non-component wrappers (`border`, `scroll_viewer`), and including writes from
-//!   backend-wired event handlers (`sync_state_child_under_element_equal_border_rerenders`,
-//!   `sync_state_from_backend_fired_event_rerenders`). Per-screen UI state driven by user
-//!   events may therefore live in the screen's own component.
+//!   handlers fired through the harness backend
+//!   (`sync_state_child_under_element_equal_border_rerenders`,
+//!   `sync_state_from_backend_fired_event_rerenders`).
+//! * **BUT the real WinUI backend does not honour that last rule.** Measured 2026-07-29:
+//!   settings was componentized with its scope as local sync state, and a live UIA pick in
+//!   the scope ComboBox changed nothing on screen — `on_selection_changed` wired in the
+//!   real backend never pumped the pass the harness pumps (the de-hoist is reverted in this
+//!   branch's history; repro = tests/reactor_semantics.rs case 3 passing while the same
+//!   flow fails live). So per-screen EVENT-driven UI state ALSO stays in root as
+//!   `AsyncSetState` props — hoisting here is on real-backend evidence, not engine rules.
 //! * An `AsyncSetState` written from a background thread does NOT re-render its owning
 //!   component: the value lands and the dirty flag is set, but the rerender request is
 //!   keyed by the component's own HostId, which is never registered — only the root's is —
@@ -30,6 +37,9 @@
 //!   (`async_state_child_under_element_equal_border_rerenders` asserts the drop). So
 //!   everything THREAD-driven (discovery, HUD stats, speed-test results, spawn events)
 //!   is held as *root* state and passed down as props.
+//! * Corollary: state a root tween is KEYED on (`screen`, the settings section, `show_add`)
+//!   must stay in root regardless — the tween workers are root effects writing root async
+//!   state, and root can only start a tween off a trigger it owns.
 
 mod connect;
 mod help;

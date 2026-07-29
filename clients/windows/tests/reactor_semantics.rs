@@ -247,8 +247,13 @@ fn async_state_child_under_element_equal_border_rerenders() {
 
 // --- Case 3: sync `use_state` written from a backend-fired event handler -----------------
 // The client hoists `forget`/`rename`/`hover` to root because WinUI-wired handlers
-// (MenuFlyout `add_Click`, pointer enter/exit) were believed to mark dirty without ever
-// pumping the reconciler. The harness fires through the same backend attach path.
+// (MenuFlyout `add_Click`, ComboBox selection, pointer enter/exit) mark dirty without ever
+// pumping the reconciler. This test PASSES — the ENGINE honours a handler-driven sync
+// write — but the claim it probes is about the REAL WinUI backend, and there it was
+// re-confirmed live on 2026-07-29: a componentized settings page with local sync scope
+// state did not repaint on a real ComboBox pick (see the discipline note in app/mod.rs;
+// the de-hoist was reverted). Keep this green as the ENGINE contract; do NOT read it as
+// permission to de-hoist event-driven state until a live UIA check passes too.
 
 struct ToggleInner {
     renders: Rc<Cell<u32>>,
