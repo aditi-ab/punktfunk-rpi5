@@ -61,6 +61,7 @@ import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.compositionLocalOf
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -136,21 +137,38 @@ fun SettingsScreen(
     // row the profile doesn't override reads as the live global — and keeps following it.
     val s = globals.effectiveFor(active)
 
+    /**
+     * The scope an edit writes to, resolved AT THE EDIT rather than closed over at composition.
+     *
+     * [update] and [resetField] reach the rows as `::update` / `::resetField` — callable references,
+     * and two of those compare EQUAL however different the scope they captured. Compose therefore
+     * sees an unchanged callback and skips [CategoryDetail] on a scope switch that doesn't move any
+     * value on screen — which is the ordinary case, since a profile inherits the globals until it
+     * overrides something. The row then kept calling the reference it was first handed and wrote
+     * into the scope the user had just LEFT: edit a default, switch to a profile, edit the same row
+     * — the globals move again and the profile records nothing; switch back and the next edit lands
+     * on the profile. Reading the live state here is what makes the write follow the chips.
+     */
+    fun scopeProfile(): StreamProfile? = scopeId?.let { id -> profiles.firstOrNull { it.id == id } }
+
     fun update(next: Settings) {
-        val profile = active
+        val profile = scopeProfile()
         if (profile == null) {
             globals = next
             onChange(next)
         } else {
             // `absorb` against what the control was SHOWING, so picking today's global value is
-            // still recorded as an override (the pin) — see [SettingsOverlay.absorb].
-            profileStore.save(profile.copy(overrides = profile.overrides.absorb(s, next)))
+            // still recorded as an override (the pin) — see [SettingsOverlay.absorb]. A skipped row
+            // shows what a fresh one would (that is WHY it skipped), so the effective settings
+            // recomputed here are the same ones it rendered.
+            val shown = globals.effectiveFor(profile)
+            profileStore.save(profile.copy(overrides = profile.overrides.absorb(shown, next)))
             profiles = profileStore.all()
         }
     }
 
     fun resetField(field: String) {
-        val profile = active ?: return
+        val profile = scopeProfile() ?: return
         profileStore.save(profile.copy(overrides = profile.overrides.clear(field)))
         profiles = profileStore.all()
     }
@@ -231,16 +249,22 @@ fun SettingsScreen(
                 }
 
                 val detail: @Composable (SettingsCategory, (() -> Unit)?) -> Unit = { cat, back ->
-                    CategoryDetail(
-                        category = cat,
-                        settings = s,
-                        onChange = ::update,
-                        context = context,
-                        onMicChange = onMicChange,
-                        onOpenControllers = { showControllers = true },
-                        onOpenLicenses = { showLicenses = true },
-                        onBack = back,
-                    )
+                    // Keyed on the scope: switching chips rebuilds the page rather than recomposing
+                    // it in place. Correctness no longer depends on it (see [scopeProfile]), but a
+                    // row's own `remember` is per-scope state too — "Custom…" picked while editing
+                    // a profile has no business still being picked over on the defaults.
+                    key(active?.id) {
+                        CategoryDetail(
+                            category = cat,
+                            settings = s,
+                            onChange = ::update,
+                            context = context,
+                            onMicChange = onMicChange,
+                            onOpenControllers = { showControllers = true },
+                            onOpenLicenses = { showLicenses = true },
+                            onBack = back,
+                        )
+                    }
                 }
 
                 if (twoPane) {
