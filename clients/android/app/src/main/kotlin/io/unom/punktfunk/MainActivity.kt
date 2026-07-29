@@ -6,6 +6,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.content.res.Configuration
 import android.hardware.usb.UsbManager
 import android.os.Build
 import android.os.Bundle
@@ -18,10 +19,14 @@ import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.systemBars
 import androidx.compose.material3.Surface
+import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import io.unom.punktfunk.kit.Gamepad
@@ -35,6 +40,33 @@ import io.unom.punktfunk.kit.security.KnownHostStore
 
 /** Broadcast action for the menu-time SC2 USB-permission grant (see [MainActivity.startSc2MenuNav]). */
 private const val SC2_MENU_PERMISSION = "io.unom.punktfunk.SC2_MENU_USB_PERMISSION"
+
+/**
+ * Keeps ONE window-insets reader alive for as long as the app's UI exists — the fix for the menus
+ * coming back from a stream laid out against the WRONG safe area.
+ *
+ * Compose attaches its `OnApplyWindowInsets` **and** `WindowInsetsAnimation` callbacks when the
+ * first composable reads an inset, and removes them again when the last reader goes away
+ * (`WindowInsetsHolder.increment/decrementAccessors`). The immersive stream reads no insets at all
+ * — it's a bare full-screen surface — so entering one dropped the reader count to zero right in
+ * the middle of the `hide(systemBars())` animation [StreamScreen] had just started. With the
+ * animation callback gone, that animation's `onEnd` never reached Compose's listener, which kept
+ * `runningAnimation = true` for the rest of the process: from then on EVERY `onApplyWindowInsets`
+ * was swallowed (it defers to `onProgress`, which can no longer arrive) and the inset values stayed
+ * frozen at the last animation frame — the landscape, bars-hidden ones. Coming back out, the menus
+ * were laid out against those: content shoved right by the landscape side inset, and nothing kept
+ * clear of the status bar or the gesture pill (reported on-glass 2026-07-29).
+ *
+ * Reading an inset here costs nothing and holds the count above zero for the activity's whole life,
+ * so the listeners survive the stream, the rotation and the bar animations — and every animation
+ * gets its `onEnd`.
+ */
+@Composable
+private fun HoldWindowInsetsListeners() {
+    // The read itself IS the registration (the accessor is scoped to this composable, which never
+    // leaves the composition); `remember` is only what keeps it from being a value nobody uses.
+    remember(WindowInsets.systemBars) {}
+}
 
 class MainActivity : ComponentActivity() {
     /**
@@ -207,6 +239,7 @@ class MainActivity : ComponentActivity() {
         }
         setContent {
             PunktfunkTheme {
+                HoldWindowInsetsListeners()
                 // Focus hook for the SC2's synthetic navigation (see [sc2MoveFocus]). `Next` is
                 // the bootstrap: directional moves need an already-focused node, while one-
                 // dimensional traversal assigns initial focus when there is none.
@@ -236,6 +269,18 @@ class MainActivity : ComponentActivity() {
      */
     private fun deepLinkFrom(intent: Intent?): String? =
         intent?.takeIf { it.action == Intent.ACTION_VIEW }?.data?.toString()
+
+    /**
+     * This activity declares `configChanges=orientation|screenSize|…`, so a rotation never recreates
+     * it — the window is re-laid-out in place. The safe area changes with every one of those, and a
+     * dropped insets dispatch is invisible until the layout is already wrong on screen, so ask for a
+     * fresh pass whenever the configuration moves. One traversal, and it re-syncs the insets after
+     * the stream releases its landscape lock. Belt to [HoldWindowInsetsListeners]' braces.
+     */
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        window.decorView.requestApplyInsets()
+    }
 
     override fun onResume() {
         super.onResume()
