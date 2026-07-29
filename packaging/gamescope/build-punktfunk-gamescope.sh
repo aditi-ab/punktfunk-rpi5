@@ -95,6 +95,19 @@ echo "==> configuring"
 # there would not start on the host. Pinning the fallback makes the outcome the same everywhere.
 # (gamescope's own meson.build hard-errors if libliftoff/vkroots are missing from this list, so
 # all three go together.)
+#
+# The C++ runtime goes STATIC for the same reason wlroots does: this binary is built on a ROLLING
+# distro and has to start on a FROZEN one. Arch's gcc (16.1.1 when this was written) makes the
+# compositor require `GLIBCXX_3.4.35`, and SteamOS 3.8.16 ships libstdc++ 3.4.34 — so the published
+# Arch package died on the very platform the gamescope backend matters most on ("version
+# GLIBCXX_3.4.35 not found"), while every other soname resolved and glibc was never close to the
+# limit (the binary asks for 2.38 at most; SteamOS has 2.41). Safe because
+# gamescope links NO shared C++ library (its `NEEDED` list is all C — glslang/SPIRV are build-time
+# only), so no C++ ABI ever crosses a shared boundary; it costs ~1 MB.
+# Appended to LDFLAGS rather than passed as `-Dcpp_link_args`, because that option would REPLACE
+# the value meson derives from the environment and silently drop makepkg's hardening flags
+# (`-z relro`, `-z now`, `--as-needed`).
+export LDFLAGS="${LDFLAGS:-} -static-libstdc++ -static-libgcc"
 meson setup "$BUILD" "$SRCDIR" \
   --prefix="$PREFIX" \
   --buildtype=release \
@@ -112,6 +125,17 @@ ninja -C "$BUILD" ${JOBS:+-j "$JOBS"}
 # distro's gamescope package — and we need none of them: the host only ever execs the compositor.
 BIN="$BUILD/src/gamescope"
 [ -x "$BIN" ] || { echo "build produced no $BIN" >&2; exit 1; }
+# The static C++ runtime above is invisible in a successful build and only shows up as a binary
+# that will not start on an older distro — so assert it here, where a mistake is a build failure
+# instead of a package that dies at `--version` on SteamOS. No `libstdc++.so.6` in NEEDED is the
+# whole invariant (and it needs no version threshold to check).
+if command -v objdump >/dev/null; then
+  objdump -p "$BIN" 2>/dev/null | grep -q 'NEEDED.*libstdc++' && {
+    echo "built binary links libstdc++ dynamically — the static C++ runtime did not take, and this" >&2
+    echo "package would not start on a distro older than the build host" >&2
+    exit 1
+  }
+fi
 DEST="${DESTDIR}${PREFIX}/bin/punktfunk-gamescope"
 echo "==> installing $DEST"
 install -Dm755 "$BIN" "$DEST"
