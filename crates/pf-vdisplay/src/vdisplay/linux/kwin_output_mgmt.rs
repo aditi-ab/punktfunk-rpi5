@@ -79,9 +79,10 @@ use management::kde_output_configuration_v2::{
 use management::kde_output_management_v2::KdeOutputManagementV2 as OutputManagement;
 
 /// Highest interface versions we drive; we bind `min(advertised, MAX)`. Every request we issue is
-/// `since ≤ 2` (`create_configuration`/`enable`/`mode`/`position`/`apply` are v1, `set_primary_output`
-/// is v2) and every event we read is `since ≤ 18` (`priority`), so binding high and calling low is
-/// always in range on any KWin that advertises the globals.
+/// `since ≤ 3` (`create_configuration`/`enable`/`mode`/`position`/`apply` are v1, `set_primary_output`
+/// v2, `set_priority` v3 — version-gated at its call site) and every event we read is `since ≤ 18`
+/// (`priority`), so binding high and calling low is always in range on any KWin that advertises the
+/// globals.
 const MGMT_MAX: u32 = 22;
 const DEVICE_MAX: u32 = 24;
 /// `kde_output_device_registry_v2` — the newer way KWin hands out output devices (verified live on
@@ -627,11 +628,17 @@ pub(crate) fn apply_topology(
     let our_id = ours.proxy.as_ref().map(|p| p.id());
 
     // First-slot-wins (§6.1): don't steal primary if another managed sibling already holds it
-    // (priority 1) — a 2nd exclusive session joins as a secondary of the shared desktop.
+    // (priority 1) — a 2nd exclusive session joins as a secondary of the shared desktop. A
+    // SAME-NAMED output is not a sibling: it is this slot's own predecessor mid-supersede (a
+    // mode switch creates the replacement before dropping the old), and deferring to it would
+    // hand primary to whatever output KWin promotes when the predecessor disappears a moment
+    // later — the physical, in the field report's layout. Now that primary is driven through
+    // priorities that actually apply, the predecessor really does hold priority 1 here.
     let sibling_is_primary = sess.state.devices.values().any(|d| {
         d.enabled
             && d.priority == Some(1)
             && d.proxy.as_ref().map(|p| p.id()) != our_id
+            && d.name != ours.name
             && d.name
                 .as_deref()
                 .is_some_and(|n| n.starts_with(MANAGED_PREFIX))
@@ -658,11 +665,48 @@ pub(crate) fn apply_topology(
 
     // Build one configuration: ensure ours is enabled, take primary (unless a sibling holds it),
     // disable the others. `apply()` is atomic — KWin re-homes the shell onto the remaining desktop.
+    //
+    // "Primary" is driven through the output PRIORITY list, not `set_primary_output`: KWin's
+    // handler for the latter is literally `// intentionally ignored` (verified in the 6.7.3
+    // source, and on-glass by a field report whose virtual output stayed at priority 2 while we
+    // logged success). `set_priority` (management ≥ 3; we bind up to v22) is what kscreen-doctor
+    // itself uses, so ours gets 1 and every other enabled output is renumbered behind it — the
+    // protocol wants the values unique among enabled outputs. `set_primary_output` is still sent
+    // for pre-`set_priority` compositors, where it was honored.
+    let mgmt_version = sess
+        .state
+        .mgmt_name_version
+        .map(|(_, v)| v)
+        .unwrap_or_default();
     let config = sess.new_config();
     if let Some(proxy) = ours.proxy.as_ref() {
         config.enable(proxy, 1);
         if !sibling_is_primary {
             config.set_primary_output(proxy);
+            if mgmt_version >= 3 {
+                config.set_priority(proxy, 1);
+                // The rest of the enabled outputs, in their existing order, from 2 — skipping
+                // the ones this apply disables (a disabled output's priority is meaningless).
+                let disabling: Vec<ObjectId> = to_disable.iter().map(|(p, _, _)| p.id()).collect();
+                let mut others: Vec<&DeviceState> = sess
+                    .state
+                    .devices
+                    .values()
+                    .filter(|d| {
+                        d.enabled
+                            && d.proxy.as_ref().map(|p| p.id()) != our_id
+                            && d.proxy
+                                .as_ref()
+                                .is_some_and(|p| !disabling.contains(&p.id()))
+                    })
+                    .collect();
+                others.sort_by_key(|d| d.priority.unwrap_or(u32::MAX));
+                for (i, d) in others.iter().enumerate() {
+                    if let Some(proxy) = d.proxy.as_ref() {
+                        config.set_priority(proxy, 2 + i as u32);
+                    }
+                }
+            }
         }
     }
     for (proxy, _, _) in &to_disable {
@@ -679,11 +723,46 @@ pub(crate) fn apply_topology(
         .map(|(_, name, spec)| (name, spec))
         .collect();
     if applied {
-        tracing::info!(
-            also_disabled = ?disabled,
-            primary_taken = !sibling_is_primary,
-            "KWin output management: streamed output set as the desktop (in-process)"
-        );
+        // Read the outcome BACK instead of echoing the request: KWin emits fresh `priority`
+        // events after the apply; one sync barrier drains them, and "primary" is then a fact —
+        // ours holds the lowest priority among enabled outputs. The old log's `primary_taken`
+        // was the request, which is how an intentionally-ignored `set_primary_output` shipped a
+        // green log over a non-primary output for a whole release line.
+        let verified = {
+            let vdeadline = Instant::now() + Duration::from_millis(500);
+            sess.sync_barrier(vdeadline);
+            let ours_now = sess
+                .state
+                .devices
+                .values()
+                .find(|d| d.proxy.as_ref().map(|p| p.id()) == our_id)
+                .and_then(|d| d.priority);
+            let min_enabled = sess
+                .state
+                .devices
+                .values()
+                .filter(|d| d.enabled)
+                .filter_map(|d| d.priority)
+                .min();
+            match (ours_now, min_enabled) {
+                (Some(p), Some(m)) => Some(p <= m),
+                _ => None, // pre-v18 devices carry no priority event — nothing to verify against
+            }
+        };
+        if sibling_is_primary || verified != Some(false) {
+            tracing::info!(
+                also_disabled = ?disabled,
+                primary_requested = !sibling_is_primary,
+                primary_verified = ?verified,
+                "KWin output management: streamed output set as the desktop (in-process)"
+            );
+        } else {
+            tracing::warn!(
+                also_disabled = ?disabled,
+                "KWin output management: apply acked but the streamed output did NOT become the \
+                 primary (priority read-back) — the desktop stays on another output"
+            );
+        }
     } else {
         tracing::warn!(
             reason = ?sess.state.failure_reason,
