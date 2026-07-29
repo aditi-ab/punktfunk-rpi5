@@ -3,9 +3,9 @@
 // source, licenses). It replaced a bare header over an 885 KB wall of license text, which answered
 // the one question nobody opens About to ask.
 //
-// The license wall itself is still `AcknowledgementsView`; About links to it — pushed on
-// iOS/tvOS, where this page lives in a navigation stack, and as a sheet on macOS, where the
-// preferences TabView has no stack to push onto.
+// The license wall itself is still `AcknowledgementsView`; About opens it as a sheet — pushed
+// only on tvOS, where this page really is inside a navigation stack. The iPad settings detail
+// column deliberately isn't one, so a push there had no way back.
 
 import PunktfunkKit
 import SwiftUI
@@ -22,7 +22,7 @@ struct AboutView: View {
     private static let tagline =
         "Low-latency desktop and game streaming with first-class Linux and Windows hosts."
 
-    #if os(macOS)
+    #if !os(tvOS)
     @State private var showAcknowledgements = false
     #endif
 
@@ -56,7 +56,9 @@ struct AboutView: View {
             }
         }
         .formStyle(.grouped)
-        #if os(macOS)
+        // A SHEET, not a push — on iPad the settings detail column is deliberately not a
+        // NavigationStack (an inner one doubles the title bar), so a NavigationLink from here
+        // pushed into a context with no back button and stranded the licenses on screen.
         .sheet(isPresented: $showAcknowledgements) {
             NavigationStack {
                 AcknowledgementsView()
@@ -66,9 +68,10 @@ struct AboutView: View {
                         }
                     }
             }
+            #if os(macOS)
             .frame(width: 640, height: 560)
+            #endif
         }
-        #endif
         #endif
     }
 
@@ -128,8 +131,7 @@ struct AboutView: View {
         .foregroundStyle(.primary)
     }
 
-    @ViewBuilder private var acknowledgementsRow: some View {
-        #if os(macOS)
+    private var acknowledgementsRow: some View {
         Button {
             showAcknowledgements = true
         } label: {
@@ -145,13 +147,6 @@ struct AboutView: View {
         }
         .buttonStyle(.plain)
         .foregroundStyle(.primary)
-        #else
-        NavigationLink {
-            AcknowledgementsView()
-        } label: {
-            Label("Acknowledgements", systemImage: "text.document")
-        }
-        #endif
     }
     #endif
 
@@ -219,11 +214,17 @@ struct AppIconView: View {
 
     var body: some View {
         Group {
-            if let image = Self.bundleIcon {
-                image
+            if let icon = Self.bundleIcon {
+                icon.image
                     .resizable()
                     .interpolation(.high)
                     .aspectRatio(contentMode: .fit)
+                    // iOS ships the icon UNMASKED — the springboard applies the rounded shape at
+                    // draw time, so used raw it is a hard-cornered square. macOS bakes its own
+                    // shape (and margins) into the image, and clipping that would cut into it.
+                    .clipShape(RoundedRectangle(
+                        cornerRadius: icon.needsMask ? side * Self.iOSCornerRatio : 0,
+                        style: .continuous))
             } else {
                 monogram
             }
@@ -231,6 +232,9 @@ struct AppIconView: View {
         .frame(width: side, height: side)
         .accessibilityHidden(true) // the app's name is the next line
     }
+
+    /// The iOS icon's corner radius as a fraction of its side — the squircle's ~22.37%.
+    private static let iOSCornerRatio: CGFloat = 0.2237
 
     private var monogram: some View {
         let shape = RoundedRectangle(cornerRadius: side * 0.22, style: .continuous)
@@ -245,9 +249,10 @@ struct AppIconView: View {
             }
     }
 
-    private static var bundleIcon: Image? {
+    /// `needsMask` = the platform hands over a bare square that the OS normally rounds for us.
+    private static var bundleIcon: (image: Image, needsMask: Bool)? {
         #if os(macOS)
-        return Image(nsImage: NSApplication.shared.applicationIconImage)
+        return (Image(nsImage: NSApplication.shared.applicationIconImage), false)
         #elseif os(iOS)
         // The last entry is the largest — `CFBundleIconFiles` is ordered small to large.
         guard let icons = Bundle.main.infoDictionary?["CFBundleIcons"] as? [String: Any],
@@ -256,7 +261,7 @@ struct AppIconView: View {
               let name = files.last,
               let image = UIImage(named: name)
         else { return nil }
-        return Image(uiImage: image)
+        return (Image(uiImage: image), true)
         #else
         return nil // tvOS: layered icons have no single image to load
         #endif
