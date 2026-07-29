@@ -21,7 +21,7 @@ use super::setup::{
     android_hdr_static_info, boost_hot_threads, boost_thread_priority, codec_mime,
     configure_low_latency, create_codec, try_set_frame_rate,
 };
-use super::{DecodeOptions, FRAME_PARK_CAP, IN_FLIGHT_CAP, PENDING_SPLIT_CAP};
+use super::{DecodeOptions, FRAME_PARK_CAP, IN_FLIGHT_CAP, NO_OUTPUT_PATIENCE, PENDING_SPLIT_CAP};
 
 /// One decoded output buffer ready to release: its codec buffer index + the pts the codec echoed
 /// (from the output callback's `BufferInfo`), used to pair the `decode` HUD stat, and the
@@ -253,6 +253,12 @@ pub(super) fn run_async(
     // presented. The blocking event wait is excluded (idle, not work) — same accounting as the sync loop.
     let mut work_accum_ns: i64 = 0;
     let mut fatal = false;
+    // No-output backstop (see [`NO_OUTPUT_PATIENCE`]): the last time the decoder handed us a frame,
+    // and how many AUs it had been fed by then. Silence only counts while AUs are actually going in,
+    // so an idle stream never asks for anything. Seeded at start so a decoder that never produces a
+    // first frame — the missed opening IDR — is caught by the same window.
+    let mut last_output = Instant::now();
+    let mut fed_at_output: u64 = 0;
 
     while !shutdown.load(Ordering::Relaxed) && !fatal {
         // Block for the next event (idle wait — excluded from the work tally). The short timeout
@@ -344,6 +350,12 @@ pub(super) fn run_async(
                 h.report_actual(work_accum_ns);
             }
             work_accum_ns = 0;
+            // The one line that separates "the stream never reached glass" from "it reached glass
+            // and looked wrong" — the periodic tally below only starts at 300 frames, which is no
+            // help at all on a session that renders none.
+            if rendered == 1 {
+                log::info!("decode: first frame presented (fed={fed} discarded={discarded})");
+            }
             if rendered > 0 && rendered % 300 == 0 {
                 log::info!("decode: fed={fed} rendered={rendered} discarded={discarded}");
             }
@@ -356,7 +368,27 @@ pub(super) fn run_async(
         if aus_dropped > 0 {
             gate.arm(now);
         }
-        if (gate.poll(client.frames_dropped(), now) || aus_dropped > 0)
+        // Fed but silent: the decoder is holding nothing it can decode — the opening IDR never
+        // reached it, or its reference chain is gone. Ask for a fresh one and arm the freeze, so the
+        // concealment it may start emitting on the way back is withheld until a clean re-anchor
+        // (`gate.poll` keeps re-asking on the deadline until one arrives).
+        let starved = !had_output
+            && fed > fed_at_output
+            && now.duration_since(last_output) >= NO_OUTPUT_PATIENCE;
+        if had_output {
+            last_output = now;
+            fed_at_output = fed;
+        } else if starved {
+            log::warn!(
+                "decode: no output for {} ms with {} AU(s) fed — requesting a re-anchor keyframe",
+                now.duration_since(last_output).as_millis(),
+                fed - fed_at_output
+            );
+            gate.arm(now);
+            last_output = now; // one request per patience window, not per iteration
+            fed_at_output = fed;
+        }
+        if (gate.poll(client.frames_dropped(), now) || aus_dropped > 0 || starved)
             && last_kf_req.is_none_or(|t| now.duration_since(t) >= Duration::from_millis(100))
         {
             last_kf_req = Some(now);

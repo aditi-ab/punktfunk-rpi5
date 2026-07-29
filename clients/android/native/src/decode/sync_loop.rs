@@ -24,7 +24,7 @@ use super::setup::{
     android_hdr_static_info, boost_hot_threads, boost_thread_priority, codec_mime,
     configure_low_latency, create_codec, try_set_frame_rate,
 };
-use super::{DecodeOptions, IN_FLIGHT_CAP, PENDING_SPLIT_CAP};
+use super::{DecodeOptions, IN_FLIGHT_CAP, NO_OUTPUT_PATIENCE, PENDING_SPLIT_CAP};
 
 /// The synchronous poll loop — the original decode path: the only one when low-latency mode is off,
 /// and the [`USE_ASYNC_DECODE`] A/B fallback when it's on. Feeds and drains on this one thread; the
@@ -144,6 +144,12 @@ pub(super) fn run_sync(
     let mut fed: u64 = 0;
     let mut rendered: u64 = 0;
     let mut discarded: u64 = 0;
+    // No-output backstop (see [`NO_OUTPUT_PATIENCE`]): when the decoder last handed us a frame, and
+    // how many AUs it had been fed by then. Silence only counts while AUs are going in, so an idle
+    // stream asks for nothing; seeded at start so a decoder that never produces a FIRST frame — the
+    // missed opening IDR — is caught by the same window.
+    let mut last_output = Instant::now();
+    let mut fed_at_output: u64 = 0;
     // AUs larger than the codec input buffer, dropped whole (see `feed`/`feed_ready`).
     let mut oversized_dropped: u64 = 0;
     // The AU waiting for a free codec input buffer. `feed` is non-blocking; on transient input
@@ -313,6 +319,11 @@ pub(super) fn run_sync(
         );
         rendered += r;
         discarded += d;
+        // The one line that separates "the stream never reached glass" from "it reached glass and
+        // looked wrong"; the tally above counts AUs FED, which a black session racks up happily.
+        if r > 0 && rendered == r {
+            log::info!("decode: first frame presented (fed={fed} discarded={discarded})");
+        }
 
         // ADPF: attribute this iteration's feed+drain time to the frame being produced, and report
         // the accumulated per-frame work once one is actually presented (r > 0). Under back-pressure
@@ -355,8 +366,29 @@ pub(super) fn run_sync(
         // a decode-error trigger rarely fires — the gate arms the freeze on the drop-count climb
         // instead. An overdue freeze (held REANCHOR_FREEZE_MAX with no clean re-anchor) re-asks while it
         // keeps holding: never resume to gray — a dead stream is the QUIC idle-timeout watchdog's job.
+        //
+        // Fed but silent is its own recovery trigger (see [`NO_OUTPUT_PATIENCE`]): a decoder that
+        // never got the opening IDR emits nothing at all and errors on nothing, so none of the
+        // signals above ever fire and the surface stays black for the life of the session.
         let now = Instant::now();
-        if gate.poll(client.frames_dropped(), now)
+        let had_output = r + d > 0;
+        let starved = !had_output
+            && fed > fed_at_output
+            && now.duration_since(last_output) >= NO_OUTPUT_PATIENCE;
+        if had_output {
+            last_output = now;
+            fed_at_output = fed;
+        } else if starved {
+            log::warn!(
+                "decode: no output for {} ms with {} AU(s) fed — requesting a re-anchor keyframe",
+                now.duration_since(last_output).as_millis(),
+                fed - fed_at_output
+            );
+            gate.arm(now);
+            last_output = now; // one request per patience window, not per iteration
+            fed_at_output = fed;
+        }
+        if (gate.poll(client.frames_dropped(), now) || starved)
             && last_kf_req.is_none_or(|t| now.duration_since(t) >= Duration::from_millis(100))
         {
             last_kf_req = Some(now);

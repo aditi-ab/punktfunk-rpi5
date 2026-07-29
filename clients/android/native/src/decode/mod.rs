@@ -41,6 +41,27 @@ const PENDING_SPLIT_CAP: usize = 256;
 /// gets evicted.
 const RENDERED_CAP: usize = 64;
 
+/// How long the decoder may be FED while producing nothing before we treat it as un-anchored and
+/// ask the host for a fresh IDR.
+///
+/// The shared gate's per-AU streak ([`punktfunk_core::reanchor::ReanchorGate::on_no_output`]) can't
+/// be used verbatim here: it counts one-in/one-out decodes (the desktop clients' `LOW_DELAY`
+/// libavcodec path and Apple's VideoToolbox), while MediaCodec is pipelined — inputs and outputs
+/// don't pair up, so "this AU produced no output" isn't a thing this loop can observe. A wall-clock
+/// silence window is the same signal in the shape Android can measure.
+///
+/// Why it matters: the host opens a stream with an IDR and, under infinite GOP, sends no other one
+/// unless asked. Miss that one — the decode thread only starts at `surfaceCreated`, so a slow TV box
+/// can be handed the stream mid-GOP — and every later AU references a picture the decoder never had.
+/// A hardware decoder doesn't error on that; it simply emits nothing. Without this backstop the
+/// session sat there forever: AUs arriving, a healthy HUD, and a black surface, because nothing in
+/// the Android loops ever asked for the keyframe that would re-anchor it.
+///
+/// 500 ms because it must never fire on a decoder that is merely slow to spin up: even the pokiest
+/// hardware decoder emits its first frame within a couple of frame periods, and a wedge that only
+/// costs half a second before it self-heals is not a bug the user reports.
+const NO_OUTPUT_PATIENCE: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// Whether low-latency mode uses the event-driven async decode loop (default) or the synchronous
 /// poll loop. Flip to `false` to A/B the two on the HUD (`design/…`); the async loop presents a
 /// decoded frame the instant it's ready instead of waiting out a poll interval. Only consulted when
