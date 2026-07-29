@@ -281,86 +281,136 @@ extension SettingsView {
 
     // MARK: - The scope switcher
 
-    /// "Editing: Default settings ▾" plus the edited profile's own management actions. One
-    /// control, at the top of the surface, so the layer being edited is never ambiguous.
+    /// The menu itself — which layer to edit, plus the edited profile's own management actions.
+    /// ONE definition, two chromes: the macOS preferences window heads itself with a button menu
+    /// (`scopeSwitcher`), while iOS puts a value row at the top of the settings list
+    /// (`scopeRow`) — a form sheet has no window header to hang a button off, and a bordered
+    /// button dropped into a `List` renders as neither a row nor a control.
     ///
     /// Absent on tvOS: controller-first surfaces honor profiles and render pinned cards, but don't
     /// EDIT them in v1 (design §5.4) — a name prompt and a nested management menu are not what a
     /// remote does well, and the pattern should prove itself on the primary surfaces first.
     @ViewBuilder
+    var scopeMenuContent: some View {
+        Picker("Editing", selection: scopeSelection) {
+            Text("Default settings").tag(SettingsScope.defaults)
+            ForEach(profiles.profiles) { profile in
+                Text(profile.name).tag(SettingsScope.profile(profile.id))
+            }
+        }
+        .pickerStyle(.inline)
+        Divider()
+        Button("New Profile…") {
+            nameDraft = ""
+            nameAction = .create
+        }
+        if let active = activeProfile {
+            Button("Rename “\(active.name)”…") {
+                nameDraft = active.name
+                nameAction = .rename(active.id)
+            }
+            Button("Duplicate “\(active.name)”") {
+                nameDraft = Self.copyName(of: active.name, in: profiles)
+                nameAction = .duplicate(active.id)
+            }
+            Button("Delete “\(active.name)”…", role: .destructive) {
+                profilePendingDelete = active
+            }
+        }
+    }
+
+    /// The name of the layer being edited, and one line on what editing it means. Shared by both
+    /// chromes — the caption is a stacked line on macOS and the list section's footer on iOS.
+    var scopeName: String { activeProfile?.name ?? "Default settings" }
+
+    var scopeCaption: String {
+        activeProfile == nil
+            ? "The settings every profile inherits from."
+            : "Overrides Default settings for hosts that use this profile. Untouched rows keep "
+                + "following the defaults."
+    }
+
+    #if os(macOS)
+    /// The control that heads the preferences window.
     var scopeSwitcher: some View {
-        #if !os(tvOS)
-        VStack(alignment: .leading, spacing: 4) {
-            Menu {
-                Picker("Editing", selection: scopeSelection) {
-                    Text("Default settings").tag(SettingsScope.defaults)
-                    ForEach(profiles.profiles) { profile in
-                        Text(profile.name).tag(SettingsScope.profile(profile.id))
-                    }
+        profilePrompts(
+            VStack(alignment: .leading, spacing: 4) {
+                Menu { scopeMenuContent } label: {
+                    Label(
+                        scopeName,
+                        systemImage: activeProfile == nil ? "gearshape" : "slider.horizontal.3")
                 }
-                .pickerStyle(.inline)
-                Divider()
-                Button("New Profile…") {
-                    nameDraft = ""
-                    nameAction = .create
+                .menuStyle(.button)
+                .fixedSize()
+                Text(scopeCaption)
+                    .font(.geist(12, relativeTo: .caption))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            })
+    }
+    #endif
+
+    #if os(iOS)
+    /// A standard value row at the head of the settings list: label on the left, current layer on
+    /// the right, the system's up/down chevron. Its caption belongs to the section FOOTER, not to
+    /// the row — stacked inside the row it wrapped to four lines and made the first thing on the
+    /// screen a block of text.
+    var scopeRow: some View {
+        profilePrompts(
+            Menu { scopeMenuContent } label: {
+                HStack(spacing: 8) {
+                    Text("Editing")
+                        .foregroundStyle(.primary)
+                    Spacer(minLength: 8)
+                    Text(scopeName)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                    Image(systemName: "chevron.up.chevron.down")
+                        .font(.footnote.weight(.semibold))
+                        .foregroundStyle(.tertiary)
+                        .accessibilityHidden(true) // the menu itself announces the action
                 }
-                if let active = activeProfile {
-                    Button("Rename “\(active.name)”…") {
-                        nameDraft = active.name
-                        nameAction = .rename(active.id)
-                    }
-                    Button("Duplicate “\(active.name)”") {
-                        nameDraft = Self.copyName(of: active.name, in: profiles)
-                        nameAction = .duplicate(active.id)
-                    }
-                    Button("Delete “\(active.name)”…", role: .destructive) {
-                        profilePendingDelete = active
-                    }
-                }
-            } label: {
-                Label(
-                    activeProfile?.name ?? "Default settings",
-                    systemImage: activeProfile == nil ? "gearshape" : "slider.horizontal.3")
+                // The whole row opens the menu, not just the glyphs.
+                .contentShape(Rectangle())
+            })
+    }
+    #endif
+
+    /// The two prompts the scope menu can raise, attached wherever the menu lives.
+    private func profilePrompts<Content: View>(_ content: Content) -> some View {
+        content
+            // Name prompts (create / rename / duplicate) share one alert: they differ only in the
+            // title and what happens with the name.
+            .alert(nameAction?.title ?? "", isPresented: namePromptPresented) {
+                TextField("Name", text: $nameDraft)
+                Button("Cancel", role: .cancel) { nameAction = nil }
+                Button(nameAction?.accept ?? "OK") { commitNamePrompt() }
+                    .disabled(!isNameAcceptable)
+            } message: {
+                Text(nameMessage)
             }
-            .menuStyle(.button)
-            .fixedSize()
-            Text(activeProfile == nil
-                ? "The settings every profile inherits from."
-                : "Overrides Default settings for hosts that use this profile. "
-                    + "Untouched rows keep following the defaults.")
-                .font(.geist(12, relativeTo: .caption))
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-        }
-        // Name prompts (create / rename / duplicate) share one alert: they differ only in the
-        // title and what happens with the name.
-        .alert(nameAction?.title ?? "", isPresented: namePromptPresented) {
-            TextField("Name", text: $nameDraft)
-            Button("Cancel", role: .cancel) { nameAction = nil }
-            Button(nameAction?.accept ?? "OK") { commitNamePrompt() }
-                .disabled(!isNameAcceptable)
-        } message: {
-            Text(nameMessage)
-        }
-        // Deleting warns with what it will change — bindings fall back to Default settings and
-        // pinned cards disappear (§6). Neither is an error, but neither should be a surprise.
-        .alert(
-            "Delete “\(profilePendingDelete?.name ?? "")”?",
-            isPresented: Binding(
-                get: { profilePendingDelete != nil },
-                set: { if !$0 { profilePendingDelete = nil } }),
-            presenting: profilePendingDelete
-        ) { profile in
-            Button("Cancel", role: .cancel) { profilePendingDelete = nil }
-            Button("Delete", role: .destructive) {
-                profiles.delete(profile.id)
-                scope = .defaults
-                profilePendingDelete = nil
+            // Deleting warns with what it will change — bindings fall back to Default settings
+            // and pinned cards disappear (§6). Neither is an error, but neither is a surprise.
+            .alert(
+                "Delete “\(profilePendingDelete?.name ?? "")”?",
+                isPresented: profileDeletePresented,
+                presenting: profilePendingDelete
+            ) { profile in
+                Button("Cancel", role: .cancel) { profilePendingDelete = nil }
+                Button("Delete", role: .destructive) {
+                    profiles.delete(profile.id)
+                    scope = .defaults
+                    profilePendingDelete = nil
+                }
+            } message: { profile in
+                Text(Self.deleteWarning(for: profile, in: profiles))
             }
-        } message: { profile in
-            Text(Self.deleteWarning(for: profile, in: profiles))
-        }
-        #endif
+    }
+
+    private var profileDeletePresented: Binding<Bool> {
+        Binding(
+            get: { profilePendingDelete != nil },
+            set: { if !$0 { profilePendingDelete = nil } })
     }
 
     /// Switching scope is a plain state change — the rows are built by one code path and simply

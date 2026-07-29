@@ -233,9 +233,12 @@ struct SettingsView: View {
             List(selection: $settingsSelection) {
                 // The scope control heads the category list: on iPhone this is the screen you
                 // start on, and on iPad it stays visible beside whichever category is open — so
-                // the layer being edited is never off screen while you edit it.
+                // the layer being edited is never off screen while you edit it. The caption is
+                // the section's FOOTER; in the row it wrapped to four lines.
                 Section {
-                    scopeSwitcher
+                    scopeRow
+                } footer: {
+                    Text(scopeCaption)
                 }
                 ForEach(SettingsCategory.allCases) { category in
                     // On iPhone the split view collapses to a push list, but a selection List
