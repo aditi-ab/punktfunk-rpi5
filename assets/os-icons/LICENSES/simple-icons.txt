@@ -1,0 +1,10 @@
+Simple Icons — brand icons (arch, nixos, debian in assets/os-icons/) are from
+Simple Icons (https://simpleicons.org, https://github.com/simple-icons/simple-icons).
+
+The Simple Icons SVG path data is released under CC0 1.0 Universal (public domain
+dedication), https://creativecommons.org/publicdomain/zero/1.0/ — no attribution
+required; this notice is provided for provenance.
+
+Brand icons are trademarks of their respective owners and are used for
+identification purposes only; their use does not imply endorsement. See
+https://github.com/simple-icons/simple-icons/blob/develop/DISCLAIMER.md.

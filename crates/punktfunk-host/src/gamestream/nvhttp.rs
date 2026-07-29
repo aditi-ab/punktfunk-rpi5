@@ -427,6 +427,8 @@ mod tests {
             local_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
             http_port: HTTP_PORT,
             https_port: HTTPS_PORT,
+            os_chain: "linux".into(),
+            os_name: "Linux".into(),
         };
         let identity = super::super::cert::ServerIdentity::ephemeral().expect("ephemeral identity");
         let stats = crate::stats_recorder::StatsRecorder::new(

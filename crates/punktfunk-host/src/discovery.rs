@@ -18,6 +18,9 @@
 //! - `mac` — the host's wake-capable NIC MAC(s) (comma-separated, routed NIC first), which a client
 //!   persists so it can Wake-on-LAN this host after it sleeps. Advisory/unauthenticated (a wrong
 //!   MAC only makes a wake fail). Omitted when none can be read.
+//! - `os` — the host's OS identity chain (`windows` | `macos` | `linux[/<family>][/<id>]`, e.g.
+//!   `linux/fedora/bazzite` — see [`crate::osinfo`]), so a client can show an OS icon on the host
+//!   card. Advisory/unauthenticated like `mac`: a wrong value only draws a wrong icon.
 
 use anyhow::{Context, Result};
 use mdns_sd::{ServiceDaemon, ServiceInfo};
@@ -87,6 +90,9 @@ pub struct Advert {
 /// `require_pairing` tells a discovering client whether it must pair before it can stream;
 /// `mgmt_port` is the management API's port (`Some` when this host serves one — the client browses
 /// the library there over mTLS on the advertised IP), `None` for a host with no mgmt API.
+// One parameter per TXT key, single call site — a params struct would just restate the
+// module doc's key list with extra ceremony.
+#[allow(clippy::too_many_arguments)]
 pub fn advertise_native(
     hostname: &str,
     ip: IpAddr,
@@ -95,6 +101,7 @@ pub fn advertise_native(
     require_pairing: bool,
     uniqueid: &str,
     mgmt_port: Option<u16>,
+    os_chain: &str,
 ) -> Result<Advert> {
     let daemon = ServiceDaemon::new().context("create mDNS daemon")?;
     // `hostname` is the DISPLAY name (the instance label clients read back); the A-record target
@@ -115,6 +122,10 @@ pub fn advertise_native(
     props.insert("id".into(), uniqueid.to_string());
     if let Some(mgmt) = mgmt_port {
         props.insert("mgmt".into(), mgmt.to_string());
+    }
+    // `os` — advisory OS-identity chain for the client's host-card icon (see module doc).
+    if !os_chain.is_empty() {
+        props.insert("os".into(), os_chain.to_string());
     }
     // `mac` — the host's wake-capable NIC MAC(s), comma-separated `aa:bb:cc:dd:ee:ff`, routed NIC
     // first. A client persists these while the host is awake so it can send a Wake-on-LAN magic

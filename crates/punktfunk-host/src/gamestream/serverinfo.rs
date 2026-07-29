@@ -208,6 +208,8 @@ mod tests {
             local_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             http_port: 47989,
             https_port: 47984,
+            os_chain: "linux".into(),
+            os_name: "Linux".into(),
         };
         let xml = serverinfo_xml(&host, false, false);
         // The mask is the GPU-aware value (NVENC/no-GPU → the static 65793; a VAAPI host →

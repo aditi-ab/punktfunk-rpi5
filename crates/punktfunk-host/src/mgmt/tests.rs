@@ -29,6 +29,8 @@ fn test_state() -> Arc<AppState> {
         local_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
         http_port: HTTP_PORT,
         https_port: HTTPS_PORT,
+        os_chain: "linux/arch/steamos".into(),
+        os_name: "SteamOS".into(),
     };
     let identity = ServerIdentity::ephemeral().expect("ephemeral identity");
     Arc::new(AppState::new(host, identity, test_stats()))
@@ -623,6 +625,10 @@ async fn host_info_reports_identity_and_ports() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["hostname"], "test-host");
     assert_eq!(body["uniqueid"], "deadbeef");
+    // OS identity rides along verbatim from the detected Host (chain for the icon walk,
+    // pretty name for the human label).
+    assert_eq!(body["os"], "linux/arch/steamos");
+    assert_eq!(body["os_name"], "SteamOS");
     assert_eq!(body["ports"]["http"], HTTP_PORT);
     assert_eq!(body["ports"]["mgmt"], DEFAULT_PORT);
     // Codecs are GPU-aware (derived from `Codec::host_wire_caps`), so assert against that mask

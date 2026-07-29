@@ -77,6 +77,7 @@ mod mgmt;
 mod mgmt_token;
 mod native;
 mod native_pairing;
+mod osinfo;
 mod pipeline;
 mod plugins;
 // Finding a launched game's processes from its store's detect signals — the read side of the

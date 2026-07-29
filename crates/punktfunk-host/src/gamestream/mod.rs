@@ -119,17 +119,25 @@ pub struct Host {
     pub local_ip: IpAddr,
     pub http_port: u16,
     pub https_port: u16,
+    /// OS identity chain (`windows` | `macos` | `linux[/<family>][/<id>]`), advertised in the
+    /// mDNS `os=` TXT record and `HostInfo.os` so clients can show an OS icon.
+    pub os_chain: String,
+    /// Human-readable OS name (os-release `PRETTY_NAME`), surfaced as `HostInfo.os_name` only.
+    pub os_name: String,
     // Pairing state (server cert, paired client certs) lands in the next P1.1 slice.
 }
 
 impl Host {
     pub fn detect() -> Result<Host> {
+        let os = crate::osinfo::detect();
         Ok(Host {
             hostname: hostname_string(),
             uniqueid: load_or_create_uniqueid()?,
             local_ip: primary_local_ip().unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST)),
             http_port: HTTP_PORT,
             https_port: HTTPS_PORT,
+            os_chain: os.chain.clone(),
+            os_name: os.pretty.clone(),
         })
     }
 }
@@ -578,6 +586,8 @@ mod session_tests {
             local_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
             http_port: HTTP_PORT,
             https_port: HTTPS_PORT,
+            os_chain: "linux".into(),
+            os_name: "Linux".into(),
         };
         let identity = cert::ServerIdentity::ephemeral().expect("ephemeral identity");
         let stats = crate::stats_recorder::StatsRecorder::new(std::env::temp_dir().join(format!(

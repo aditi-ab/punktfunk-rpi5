@@ -318,6 +318,7 @@ pub(crate) async fn serve(
             &h.uniqueid,
             // 0 = standalone `punktfunk1-host` (no mgmt API) → don't advertise an `mgmt` port.
             (mgmt_port != 0).then_some(mgmt_port),
+            &h.os_chain,
         )
         .map_err(|e| tracing::warn!(error = %format!("{e:#}"), "native mDNS advertise failed (continuing)"))
         .ok(),

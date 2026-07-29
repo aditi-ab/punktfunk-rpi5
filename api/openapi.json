@@ -5335,6 +5335,8 @@
           "abi_version",
           "app_version",
           "gfe_version",
+          "os",
+          "os_name",
           "codecs",
           "gamestream",
           "ports"
@@ -5371,6 +5373,16 @@
           "local_ip": {
             "type": "string",
             "description": "Best-effort primary LAN IP."
+          },
+          "os": {
+            "type": "string",
+            "description": "OS identity chain, generic → most specific, slash-separated (`windows` | `macos` |\n`linux[/<family>][/<id>]`). A client walks it most-specific-first and shows the first\ntoken it has an icon for, so an unknown distro still degrades to its family's mark.",
+            "example": "linux/fedora/bazzite"
+          },
+          "os_name": {
+            "type": "string",
+            "description": "Human-readable OS name (os-release `PRETTY_NAME`; `\"Windows\"`/`\"macOS\"` elsewhere).",
+            "example": "Bazzite 42 (Kinoite)"
           },
           "ports": {
             "$ref": "#/components/schemas/PortMap"

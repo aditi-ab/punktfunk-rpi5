@@ -39,6 +39,14 @@ pub(crate) struct HostInfo {
     app_version: String,
     /// GFE version advertised to Moonlight clients.
     gfe_version: String,
+    /// OS identity chain, generic → most specific, slash-separated (`windows` | `macos` |
+    /// `linux[/<family>][/<id>]`). A client walks it most-specific-first and shows the first
+    /// token it has an icon for, so an unknown distro still degrades to its family's mark.
+    #[schema(example = "linux/fedora/bazzite")]
+    os: String,
+    /// Human-readable OS name (os-release `PRETTY_NAME`; `"Windows"`/`"macOS"` elsewhere).
+    #[schema(example = "Bazzite 42 (Kinoite)")]
+    os_name: String,
     /// Codecs the host can encode (NVENC).
     codecs: Vec<ApiCodec>,
     /// Whether the GameStream/Moonlight-compat planes are running (`--gamestream`). `false` on the
@@ -262,6 +270,8 @@ pub(crate) async fn get_host_info(State(st): State<Arc<MgmtState>>) -> Json<Host
         abi_version: punktfunk_core::ABI_VERSION,
         app_version: APP_VERSION.into(),
         gfe_version: GFE_VERSION.into(),
+        os: h.os_chain.clone(),
+        os_name: h.os_name.clone(),
         // What this host can ACTUALLY encode on its resolved backend — GPU-aware, straight from the
         // same capability mask that drives GameStream/QUIC negotiation ([`Codec::host_wire_caps`]).
         // So an iGPU without AV1 encode won't advertise AV1, a software-only host reports H.264 only,
