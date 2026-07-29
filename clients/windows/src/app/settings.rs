@@ -167,7 +167,11 @@ fn colour_swatches(profile: &StreamProfile, rev: u64, set_rev: &AsyncSetState<u6
         });
         let (id, set_rev, hex_owned) = (profile.id.clone(), set_rev.clone(), hex.to_string());
         row.push(
-            border(vstack(Vec::<Element>::new()).width(20.0).height(20.0))
+            // Size on the BORDER itself: sized only via its child, the border gets squeezed
+            // by the sheet's layout and the discs render as squashed ovals.
+            border(vstack(Vec::<Element>::new()))
+                .width(20.0)
+                .height(20.0)
                 .background(fill)
                 .corner_radius(10.0)
                 .border_brush(if selected {
@@ -447,11 +451,14 @@ fn active_profile(scope: &str) -> Option<StreamProfile> {
         .flatten()
 }
 
+// NOTE: the row builders no longer set the widget's own `.header` — the row label is
+// rendered by [`described_overridable`]/[`described_labeled`], because the Overridden pill
+// must sit BETWEEN the label and the input, and a widget-embedded header allows nothing
+// between itself and its box.
 fn setting_combo(
     ctx: &Arc<AppCtx>,
     scope: &str,
     rev: (u64, &AsyncSetState<u64>),
-    header: &str,
     names: Vec<String>,
     current: usize,
     apply: impl Fn(&mut Settings, usize) + 'static,
@@ -460,7 +467,6 @@ fn setting_combo(
     let (rev, set_rev) = (rev.0, rev.1.clone());
     let max = names.len().saturating_sub(1);
     ComboBox::new(names)
-        .header(header)
         .selected_index(current as i32)
         .on_selection_changed(move |i: i32| {
             commit(&ctx, &scope, (rev, &set_rev), |s| {
@@ -476,19 +482,18 @@ fn presets<V>(table: &[(V, &str)], is_current: impl Fn(&V) -> bool) -> (Vec<Stri
     (names, current)
 }
 
-/// A `ToggleSwitch` bound to one boolean settings field.
+/// A `ToggleSwitch` bound to one boolean settings field (label rendered by the row — see
+/// [`setting_combo`]'s note).
 fn setting_toggle(
     ctx: &Arc<AppCtx>,
     scope: &str,
     rev: (u64, &AsyncSetState<u64>),
-    header: &str,
     on: bool,
     apply: impl Fn(&mut Settings, bool) + 'static,
 ) -> ToggleSwitch {
     let (ctx, scope) = (ctx.clone(), scope.to_string());
     let (rev, set_rev) = (rev.0, rev.1.clone());
     ToggleSwitch::new(on)
-        .header(header)
         .on_content("On")
         .off_content("Off")
         .on_toggled(move |v: bool| {
@@ -503,7 +508,7 @@ fn setting_toggle(
 /// but a caption under it reads as a caption, which is how every Windows Settings page and
 /// the Apple client both do it. Width-capped for the same reason Apple caps at 360pt: a
 /// full-width caption runs into the control column and the whole cell reads as one block.
-/// [`described`], plus the override marker and reset a profile-scope row carries: the caption
+/// [`described_labeled`], plus the override marker and reset a profile-scope row carries: the caption
 /// says the profile changes this one, and the button is the only way back to inheriting.
 /// An override is recorded when a control's committed value differs from what it was
 /// SHOWING (`SettingsOverlay::absorb` diffs against the effective snapshot — see `commit`);
@@ -514,70 +519,94 @@ fn described_overridable(
     rev: (u64, &AsyncSetState<u64>),
     scope: &str,
     field: &'static str,
+    label: &str,
     overridden: bool,
     control: impl Into<Element>,
     caption: &str,
 ) -> Element {
     if scope.is_empty() || !overridden {
-        return described(control, caption);
+        return described_labeled(label, control, caption);
     }
-    // The override marker lives on the CONTROL's line, not in the caption: a small tinted
-    // "Overridden" chip and the Reset button sit to the control's right, bottom-aligned to
-    // its box. The caption below stays plain and identical in both states — appearing to
-    // the SIDE means nothing moves and the description stays a description (the mixed
-    // marker-plus-caption line read as neither).
+    // The override marker is ONE capsule on its own line BETWEEN the control and its
+    // caption (the reviewed placement): left-aligned like everything else in the card, so
+    // every row's marker sits identically no matter how wide its control is. The capsule
+    // holds the state ("Overridden") and the way out ("Reset") as segments of a single
+    // tinted pill, the whole of which is the tap target; the caption below stays a plain
+    // description in both states.
     let (rev, set_rev) = (rev.0, rev.1.clone());
     let scope = scope.to_string();
-    vstack((
+    let reset_pill = border(
         hstack((
-            control.into(),
-            pill("Overridden", Pill::Info)
-                .vertical_alignment(VerticalAlignment::Bottom)
-                .margin(edges(0.0, 0.0, 0.0, 5.0)),
-            button("Reset")
-                .icon(Symbol::Undo)
-                .tooltip("Back to inheriting from Default settings")
-                .vertical_alignment(VerticalAlignment::Bottom)
-                .on_click(move || {
-                    let mut catalog = ProfilesFile::load();
-                    if let Some(p) = catalog.profiles.iter_mut().find(|p| p.id == scope) {
-                        p.overrides.clear(field);
-                        if let Err(e) = catalog.save() {
-                            tracing::warn!(error = %format!("{e:#}"), "clearing an override");
-                        }
-                    }
-                    // The catalog changed behind the controls, and nothing the page reads
-                    // as state did — bump the revision so the row re-renders showing the
-                    // inherited value again.
-                    set_rev.call(rev + 1);
-                }),
+            text_block("Overridden")
+                .font_size(11.0)
+                .semibold()
+                .foreground(ThemeRef::SystemAttention)
+                .vertical_alignment(VerticalAlignment::Center),
+            // The seam between the state and the action.
+            border(vstack(Vec::<Element>::new()).width(1.0).height(12.0))
+                .background(ThemeRef::CardStroke)
+                .vertical_alignment(VerticalAlignment::Center),
+            text_block("Reset")
+                .font_size(11.0)
+                .semibold()
+                .foreground(ThemeRef::AccentText)
+                .vertical_alignment(VerticalAlignment::Center),
         ))
-        .spacing(8.0),
-        text_block(caption)
-            .font_size(12.0)
-            .foreground(ThemeRef::SecondaryText)
-            .wrap()
-            .max_width(420.0)
-            .horizontal_alignment(HorizontalAlignment::Left),
+        .spacing(7.0),
+    )
+    .background(ThemeRef::SystemAttentionBackground)
+    .border_brush(ThemeRef::CardStroke)
+    .border_thickness(uniform(1.0))
+    .corner_radius(10.0)
+    .padding(edges(10.0, 3.0, 10.0, 3.0))
+    .tooltip("Overridden by this profile \u{2014} Reset returns it to Default settings")
+    .on_tapped(move || {
+        let mut catalog = ProfilesFile::load();
+        if let Some(p) = catalog.profiles.iter_mut().find(|p| p.id == scope) {
+            p.overrides.clear(field);
+            if let Err(e) = catalog.save() {
+                tracing::warn!(error = %format!("{e:#}"), "clearing an override");
+            }
+        }
+        // The catalog changed behind the controls, and nothing the page reads as state
+        // did — bump the revision so the row re-renders showing the inherited value.
+        set_rev.call(rev + 1);
+    });
+    vstack((
+        row_label(label),
+        Element::from(reset_pill).horizontal_alignment(HorizontalAlignment::Left),
+        control.into(),
+        row_caption(caption),
     ))
-    .spacing(5.0)
+    .spacing(6.0)
     .into()
 }
 
-fn described(control: impl Into<Element>, caption: &str) -> Element {
-    vstack((
-        control.into(),
-        text_block(caption)
-            .font_size(12.0)
-            .foreground(ThemeRef::SecondaryText)
-            .wrap()
-            .max_width(420.0)
-            // Stretch (the TextBlock default) CENTRES a MaxWidth-capped block in the leftover
-            // width — the caption must be pinned left or it drifts away from its control.
-            .horizontal_alignment(HorizontalAlignment::Left),
-    ))
-    .spacing(5.0)
-    .into()
+/// The row's label line — what the widgets' `.header` used to render, moved out so the
+/// Overridden pill can sit between label and input with ONE consistent gap everywhere.
+fn row_label(label: &str) -> Element {
+    text_block(label)
+        .horizontal_alignment(HorizontalAlignment::Left)
+        .into()
+}
+
+/// The row's caption line (shared styling for every variant).
+fn row_caption(caption: &str) -> Element {
+    text_block(caption)
+        .font_size(12.0)
+        .foreground(ThemeRef::SecondaryText)
+        .wrap()
+        .max_width(420.0)
+        .horizontal_alignment(HorizontalAlignment::Left)
+        .into()
+}
+
+/// The plain row with the row-owned label line: label, input, caption — the same skeleton
+/// as an overridable row minus the pill, so both kinds space out identically.
+fn described_labeled(label: &str, control: impl Into<Element>, caption: &str) -> Element {
+    vstack((row_label(label), control.into(), row_caption(caption)))
+        .spacing(6.0)
+        .into()
 }
 
 /// A settings sub-section heading. Deliberately NOT the shared [`section`] helper: that one
@@ -653,7 +682,7 @@ pub(crate) fn settings_page(
     };
     let profile_mode = active.is_some();
     // Which rows this profile overrides — the marker + reset each of them carries. In the
-    // defaults scope nothing is marked, and `described_overridable` degrades to `described`.
+    // defaults scope nothing is marked, and `described_overridable` degrades to `described_labeled`.
     let over = OverrideFlags::of(active.as_ref());
     // Every control shows the EFFECTIVE value: the global underneath with this profile's
     // overrides on top, so a row the profile doesn't override reads as the live global.
@@ -689,18 +718,10 @@ pub(crate) fn settings_page(
         };
         (names, i)
     };
-    let res_combo = setting_combo(
-        ctx,
-        scope,
-        (rev, set_rev),
-        "Resolution",
-        res_names,
-        res_i,
-        |s, i| {
-            s.match_window = i == 1;
-            (s.width, s.height) = if i <= 1 { (0, 0) } else { RESOLUTIONS[i - 1] };
-        },
-    );
+    let res_combo = setting_combo(ctx, scope, (rev, set_rev), res_names, res_i, |s, i| {
+        s.match_window = i == 1;
+        (s.width, s.height) = if i <= 1 { (0, 0) } else { RESOLUTIONS[i - 1] };
+    });
     let (hz_names, hz_i) = {
         let names: Vec<String> = REFRESH
             .iter()
@@ -715,17 +736,9 @@ pub(crate) fn settings_page(
         let i = REFRESH.iter().position(|&r| r == s.refresh_hz).unwrap_or(0);
         (names, i)
     };
-    let hz_combo = setting_combo(
-        ctx,
-        scope,
-        (rev, set_rev),
-        "Refresh rate",
-        hz_names,
-        hz_i,
-        |s, i| {
-            s.refresh_hz = REFRESH[i];
-        },
-    );
+    let hz_combo = setting_combo(ctx, scope, (rev, set_rev), hz_names, hz_i, |s, i| {
+        s.refresh_hz = REFRESH[i];
+    });
     let (scale_names, scale_i) = {
         let names: Vec<String> = RENDER_SCALES
             .iter()
@@ -737,59 +750,29 @@ pub(crate) fn settings_page(
             .unwrap_or_else(|| RENDER_SCALES.iter().position(|&x| x == 1.0).unwrap());
         (names, i)
     };
-    let scale_combo = setting_combo(
-        ctx,
-        scope,
-        (rev, set_rev),
-        "Render scale",
-        scale_names,
-        scale_i,
-        |s, i| {
-            s.render_scale = RENDER_SCALES[i];
-        },
-    );
+    let scale_combo = setting_combo(ctx, scope, (rev, set_rev), scale_names, scale_i, |s, i| {
+        s.render_scale = RENDER_SCALES[i];
+    });
     let (comp_names, comp_i) = presets(COMPOSITORS, |v| *v == s.compositor);
-    let comp_combo = setting_combo(
-        ctx,
-        scope,
-        (rev, set_rev),
-        "Host compositor",
-        comp_names,
-        comp_i,
-        |s, i| {
-            s.compositor = COMPOSITORS[i].0.to_string();
-        },
-    );
-    let auto_wake_toggle = setting_toggle(
-        ctx,
-        scope,
-        (rev, set_rev),
-        "Auto-wake on connect",
-        s.auto_wake,
-        |s, on| s.auto_wake = on,
-    );
+    let comp_combo = setting_combo(ctx, scope, (rev, set_rev), comp_names, comp_i, |s, i| {
+        s.compositor = COMPOSITORS[i].0.to_string();
+    });
+    let auto_wake_toggle = setting_toggle(ctx, scope, (rev, set_rev), s.auto_wake, |s, on| {
+        s.auto_wake = on
+    });
     let fullscreen_toggle = setting_toggle(
         ctx,
         scope,
         (rev, set_rev),
-        "Start streams fullscreen",
         s.fullscreen_on_stream,
         |s, on| s.fullscreen_on_stream = on,
     );
 
     // --- Video -----------------------------------------------------------------------------
     let (dec_names, dec_i) = presets(DECODERS, |v| *v == s.decoder);
-    let decoder_combo = setting_combo(
-        ctx,
-        scope,
-        (rev, set_rev),
-        "Video decoder",
-        dec_names,
-        dec_i,
-        |s, i| {
-            s.decoder = DECODERS[i].0.to_string();
-        },
-    );
+    let decoder_combo = setting_combo(ctx, scope, (rev, set_rev), dec_names, dec_i, |s, i| {
+        s.decoder = DECODERS[i].0.to_string();
+    });
     // GPU picker, only on a multi-GPU box (hybrid laptop, eGPU): which adapter decodes + presents.
     // Stored as the adapter description; empty = automatic (the window's monitor's adapter).
     let gpus = crate::gpu::adapter_names();
@@ -801,34 +784,18 @@ pub(crate) fn settings_page(
             .position(|n| *n == s.adapter)
             .map_or(0, |i| i + 1);
         let gpus = gpus.clone();
-        setting_combo(
-            ctx,
-            scope,
-            (rev, set_rev),
-            "GPU",
-            names,
-            current,
-            move |s, i| {
-                s.adapter = if i == 0 {
-                    String::new()
-                } else {
-                    gpus[i - 1].clone()
-                };
-            },
-        )
+        setting_combo(ctx, scope, (rev, set_rev), names, current, move |s, i| {
+            s.adapter = if i == 0 {
+                String::new()
+            } else {
+                gpus[i - 1].clone()
+            };
+        })
     });
     let (codec_names, codec_i) = presets(CODECS, |v| *v == s.codec);
-    let codec_combo = setting_combo(
-        ctx,
-        scope,
-        (rev, set_rev),
-        "Video codec",
-        codec_names,
-        codec_i,
-        |s, i| {
-            s.codec = CODECS[i].0.to_string();
-        },
-    );
+    let codec_combo = setting_combo(ctx, scope, (rev, set_rev), codec_names, codec_i, |s, i| {
+        s.codec = CODECS[i].0.to_string();
+    });
     // Free-form Mb/s (0 = host default) instead of presets, so a speed-test recommendation
     // round-trips exactly. Through `commit` like every other row: writing `ctx.settings`
     // directly here would edit the GLOBAL defaults from inside a profile scope (and record
@@ -836,7 +803,6 @@ pub(crate) fn settings_page(
     let bitrate_box = {
         let (ctx, scope, set_rev) = (ctx.clone(), scope.to_string(), set_rev.clone());
         NumberBox::new(f64::from(s.bitrate_kbps) / 1000.0)
-            .header("Bitrate (Mb/s, 0 = automatic)")
             .range(0.0, 3000.0)
             .on_value_changed(move |v: f64| {
                 commit(&ctx, &scope, (rev, &set_rev), |s| {
@@ -844,22 +810,12 @@ pub(crate) fn settings_page(
                 });
             })
     };
-    let hdr_toggle = setting_toggle(
-        ctx,
-        scope,
-        (rev, set_rev),
-        "HDR (10-bit, BT.2020 PQ)",
-        s.hdr_enabled,
-        |s, on| s.hdr_enabled = on,
-    );
-    let chroma_toggle = setting_toggle(
-        ctx,
-        scope,
-        (rev, set_rev),
-        "Full chroma (4:4:4)",
-        s.enable_444,
-        |s, on| s.enable_444 = on,
-    );
+    let hdr_toggle = setting_toggle(ctx, scope, (rev, set_rev), s.hdr_enabled, |s, on| {
+        s.hdr_enabled = on
+    });
+    let chroma_toggle = setting_toggle(ctx, scope, (rev, set_rev), s.enable_444, |s, on| {
+        s.enable_444 = on
+    });
 
     // --- Input -----------------------------------------------------------------------------
     // Controller forwarding: Automatic forwards EVERY real controller, each as its own pad;
@@ -888,7 +844,6 @@ pub(crate) fn settings_page(
         let ctx2 = ctx.clone();
         let keys: Vec<String> = pads.iter().map(|p| p.key.clone()).collect();
         ComboBox::new(fwd_names)
-            .header("Forwarded controller")
             .selected_index(fwd_i as i32)
             .on_selection_changed(move |i: i32| {
                 let sel = i.max(0) as usize;
@@ -908,105 +863,47 @@ pub(crate) fn settings_page(
     let (pad_names, pad_i) = presets(GAMEPADS, |v| {
         GamepadPref::from_name(v) == GamepadPref::from_name(&s.gamepad)
     });
-    let pad_combo = setting_combo(
-        ctx,
-        scope,
-        (rev, set_rev),
-        "Gamepad type",
-        pad_names,
-        pad_i,
-        |s, i| {
-            s.gamepad = GAMEPADS[i].0.to_string();
-        },
-    );
+    let pad_combo = setting_combo(ctx, scope, (rev, set_rev), pad_names, pad_i, |s, i| {
+        s.gamepad = GAMEPADS[i].0.to_string();
+    });
     let (touch_names, touch_i) = presets(TOUCH_MODES, |v| *v == s.touch_mode);
-    let touch_combo = setting_combo(
-        ctx,
-        scope,
-        (rev, set_rev),
-        "Touch input",
-        touch_names,
-        touch_i,
-        |s, i| {
-            s.touch_mode = TOUCH_MODES[i].0.to_string();
-        },
-    );
+    let touch_combo = setting_combo(ctx, scope, (rev, set_rev), touch_names, touch_i, |s, i| {
+        s.touch_mode = TOUCH_MODES[i].0.to_string();
+    });
     let (mouse_names, mouse_i) = presets(MOUSE_MODES, |v| *v == s.mouse_mode);
-    let mouse_combo = setting_combo(
-        ctx,
-        scope,
-        (rev, set_rev),
-        "Mouse input",
-        mouse_names,
-        mouse_i,
-        |s, i| {
-            s.mouse_mode = MOUSE_MODES[i].0.to_string();
-        },
-    );
-    let invert_scroll_toggle = setting_toggle(
-        ctx,
-        scope,
-        (rev, set_rev),
-        "Invert scroll direction",
-        s.invert_scroll,
-        |s, on| s.invert_scroll = on,
-    );
-    let shortcuts_toggle = setting_toggle(
-        ctx,
-        scope,
-        (rev, set_rev),
-        "Capture system shortcuts (Alt+Tab, Win, \u{2026})",
-        s.inhibit_shortcuts,
-        |s, on| s.inhibit_shortcuts = on,
-    );
+    let mouse_combo = setting_combo(ctx, scope, (rev, set_rev), mouse_names, mouse_i, |s, i| {
+        s.mouse_mode = MOUSE_MODES[i].0.to_string();
+    });
+    let invert_scroll_toggle =
+        setting_toggle(ctx, scope, (rev, set_rev), s.invert_scroll, |s, on| {
+            s.invert_scroll = on
+        });
+    let shortcuts_toggle =
+        setting_toggle(ctx, scope, (rev, set_rev), s.inhibit_shortcuts, |s, on| {
+            s.inhibit_shortcuts = on
+        });
 
     // --- Audio -----------------------------------------------------------------------------
     let (ac_names, ac_i) = presets(AUDIO_CHANNELS, |v| *v == s.audio_channels);
-    let channels_combo = setting_combo(
-        ctx,
-        scope,
-        (rev, set_rev),
-        "Audio channels",
-        ac_names,
-        ac_i,
-        |s, i| {
-            s.audio_channels = AUDIO_CHANNELS[i].0;
-        },
-    );
-    let mic_toggle = setting_toggle(
-        ctx,
-        scope,
-        (rev, set_rev),
-        "Stream microphone to the host",
-        s.mic_enabled,
-        |s, on| s.mic_enabled = on,
-    );
+    let channels_combo = setting_combo(ctx, scope, (rev, set_rev), ac_names, ac_i, |s, i| {
+        s.audio_channels = AUDIO_CHANNELS[i].0;
+    });
+    let mic_toggle = setting_toggle(ctx, scope, (rev, set_rev), s.mic_enabled, |s, on| {
+        s.mic_enabled = on
+    });
 
     let (hud_names, hud_i) = presets(STATS_TIERS, |v| *v == s.stats_verbosity());
-    let hud_combo = setting_combo(
-        ctx,
-        scope,
-        (rev, set_rev),
-        "Stats overlay (HUD)",
-        hud_names,
-        hud_i,
-        |s, i| {
-            s.set_stats_verbosity(STATS_TIERS[i].0);
-        },
-    );
+    let hud_combo = setting_combo(ctx, scope, (rev, set_rev), hud_names, hud_i, |s, i| {
+        s.set_stats_verbosity(STATS_TIERS[i].0);
+    });
 
     let licenses_button = {
         let ss = set_screen.clone();
         button("Third-party licenses").on_click(move || ss.call(Screen::Licenses))
     };
-    let library_toggle = setting_toggle(
-        ctx,
-        scope,
-        (rev, set_rev),
-        "Show game library (experimental)",
-        s.library_enabled,
-        |s, on| s.library_enabled = on,
-    );
+    let library_toggle = setting_toggle(ctx, scope, (rev, set_rev), s.library_enabled, |s, on| {
+        s.library_enabled = on
+    });
     // App identity + version at the top of the About card (the WinUI Settings convention; the About
     // screen previously showed no version at all). CARGO_PKG_VERSION is the workspace version, baked
     // in at compile time.
@@ -1031,6 +928,7 @@ pub(crate) fn settings_page(
                         (rev, set_rev),
                         scope,
                         "resolution",
+                        "Resolution",
                         over.resolution,
                         res_combo,
                         "The host drives a real virtual output at exactly this size \u{2014} true \
@@ -1042,6 +940,7 @@ pub(crate) fn settings_page(
                         (rev, set_rev),
                         scope,
                         "refresh_hz",
+                        "Refresh rate",
                         over.refresh_hz,
                         hz_combo,
                         "\u{201C}Native\u{201D} resolves to this display\u{2019}s refresh rate at \
@@ -1057,6 +956,7 @@ pub(crate) fn settings_page(
                         (rev, set_rev),
                         scope,
                         "render_scale",
+                        "Render scale",
                         over.render_scale,
                         scale_combo,
                         "Above native supersamples for sharpness; below renders lighter on the \
@@ -1066,6 +966,7 @@ pub(crate) fn settings_page(
                         (rev, set_rev),
                         scope,
                         "bitrate_kbps",
+                        "Bitrate (Mb/s, 0 = automatic)",
                         over.bitrate_kbps,
                         bitrate_box,
                         "0 lets the host decide (its default, clamped to what it supports). A \
@@ -1075,6 +976,7 @@ pub(crate) fn settings_page(
                         (rev, set_rev),
                         scope,
                         "codec",
+                        "Video codec",
                         over.codec,
                         codec_combo,
                         "A preference \u{2014} the host falls back if it can\u{2019}t encode it. \
@@ -1086,6 +988,7 @@ pub(crate) fn settings_page(
                         (rev, set_rev),
                         scope,
                         "hdr_enabled",
+                        "HDR (10-bit, BT.2020 PQ)",
                         over.hdr_enabled,
                         hdr_toggle,
                         "HDR10, when the host has HDR content and this display supports it. \
@@ -1097,6 +1000,7 @@ pub(crate) fn settings_page(
                         (rev, set_rev),
                         scope,
                         "enable_444",
+                        "Full chroma (4:4:4)",
                         over.enable_444,
                         chroma_toggle,
                         "Full-colour video: crisp small text and thin lines, at more \
@@ -1111,14 +1015,16 @@ pub(crate) fn settings_page(
                 if profile_mode {
                     Vec::new()
                 } else {
-                    let mut fields = vec![described(
+                    let mut fields = vec![described_labeled(
+                        "Video decoder",
                         decoder_combo,
                         "Automatic picks the hardware path this GPU does best \u{2014} Direct3D \
                          11 on Intel, Vulkan Video on NVIDIA and AMD \u{2014} and falls back to \
                          the CPU. Change it only when debugging.",
                     )];
                     if let Some(c) = gpu_combo {
-                        fields.push(described(
+                        fields.push(described_labeled(
+                            "GPU",
                             c,
                             "Which adapter decodes and presents the stream. Automatic uses the \
                              GPU driving this window\u{2019}s display.",
@@ -1134,6 +1040,7 @@ pub(crate) fn settings_page(
                     (rev, set_rev),
                     scope,
                     "compositor",
+                    "Host compositor",
                     over.compositor,
                     comp_combo,
                     "The backend the host uses for its virtual output (Linux hosts only). A \
@@ -1152,6 +1059,7 @@ pub(crate) fn settings_page(
                     (rev, set_rev),
                     scope,
                     "touch_mode",
+                    "Touch input",
                     over.touch_mode,
                     touch_combo,
                     "How a touchscreen drives the host: Trackpad moves the host cursor like a \
@@ -1167,6 +1075,7 @@ pub(crate) fn settings_page(
                         (rev, set_rev),
                         scope,
                         "mouse_mode",
+                        "Mouse input",
                         over.mouse_mode,
                         mouse_combo,
                         "Capture locks the pointer to the stream and sends relative motion — \
@@ -1178,6 +1087,7 @@ pub(crate) fn settings_page(
                         (rev, set_rev),
                         scope,
                         "inhibit_shortcuts",
+                        "Capture system shortcuts (Alt+Tab, Win, \u{2026})",
                         over.inhibit_shortcuts,
                         shortcuts_toggle,
                         "Alt+Tab, the Windows key and friends reach the host while the stream \
@@ -1187,6 +1097,7 @@ pub(crate) fn settings_page(
                         (rev, set_rev),
                         scope,
                         "invert_scroll",
+                        "Invert scroll direction",
                         over.invert_scroll,
                         invert_scroll_toggle,
                         "Reverses the wheel and trackpad scroll direction sent to the host.",
@@ -1206,7 +1117,8 @@ pub(crate) fn settings_page(
                     // Which physical pad this device forwards is a device fact (tier G), so it
                     // renders only in the defaults scope; the EMULATED type below is profileable.
                     (!profile_mode).then(|| {
-                        described(
+                        described_labeled(
+                        "Forwarded controller",
                         forward_combo,
                         "Every connected controller is forwarded, each as its own player. Pick \
                          one to force single-player \u{2014} only it reaches the host.",
@@ -1216,6 +1128,7 @@ pub(crate) fn settings_page(
                         (rev, set_rev),
                         scope,
                         "gamepad",
+                        "Gamepad type",
                         over.gamepad,
                         pad_combo,
                         "The virtual pad created on the host. Automatic matches your controller \
@@ -1238,6 +1151,7 @@ pub(crate) fn settings_page(
                         (rev, set_rev),
                         scope,
                         "audio_channels",
+                        "Audio channels",
                         over.audio_channels,
                         channels_combo,
                         "The speaker layout requested from the host. It downmixes if its own \
@@ -1247,6 +1161,7 @@ pub(crate) fn settings_page(
                         (rev, set_rev),
                         scope,
                         "mic_enabled",
+                        "Stream microphone to the host",
                         over.mic_enabled,
                         mic_toggle,
                         "This device\u{2019}s microphone feeds the host\u{2019}s virtual mic.",
@@ -1271,6 +1186,7 @@ pub(crate) fn settings_page(
                     (rev, set_rev),
                     scope,
                     "fullscreen_on_stream",
+                    "Start streams fullscreen",
                     over.fullscreen_on_stream,
                     fullscreen_toggle,
                     "Go fullscreen when a session starts; F11 or Alt+Enter switches back \
@@ -1280,7 +1196,8 @@ pub(crate) fn settings_page(
                 // Auto-wake is about this host and this network, not about "Game vs Work" —
                 // it stays global in v1 (design §3, tier H/G).
                 .chain((!profile_mode).then(|| {
-                    described(
+                    described_labeled(
+                        "Auto-wake on connect",
                         auto_wake_toggle,
                         "Connecting to a saved host that\u{2019}s offline sends Wake-on-LAN and \
                          waits for it to boot. Turn off if hosts behind a VPN look offline when \
@@ -1296,6 +1213,7 @@ pub(crate) fn settings_page(
                     (rev, set_rev),
                     scope,
                     "stats_verbosity",
+                    "Stats overlay (HUD)",
                     over.stats_verbosity,
                     hud_combo,
                     "Live session stats in a corner overlay \u{2014} Compact is a one-line pill, \
@@ -1310,7 +1228,8 @@ pub(crate) fn settings_page(
                 if profile_mode {
                     Vec::new()
                 } else {
-                    vec![described(
+                    vec![described_labeled(
+                    "Show game library (experimental)",
                     library_toggle,
                     "Adds \u{201C}Browse library\u{2026}\u{201D} to paired hosts \u{2014} list \
                      their Steam and custom games and launch one directly. No extra host setup.",
@@ -1380,6 +1299,8 @@ pub(crate) fn settings_page(
             ComboBox::new(names.clone())
                 .selected_index(scope_i as i32)
                 .min_width(220.0)
+                // The bar's controls share one height, or the row reads ragged.
+                .height(36.0)
                 .on_selection_changed({
                     let (set_scope, set_edit, ids) =
                         (set_scope.clone(), set_edit.clone(), ids.clone());
@@ -1430,11 +1351,30 @@ pub(crate) fn settings_page(
                 .with_key(format!("{scope}\u{1}{}", scope_names.join("\u{1}")))
                 .vertical_alignment(VerticalAlignment::Center),
         ];
+        // The profile's colour, right where the choice is made (a ComboBox item is a plain
+        // string in this toolkit, so the chip cannot ride inside the dropdown).
+        if let Some(c) = active
+            .as_ref()
+            .and_then(|p| p.accent.as_deref())
+            .and_then(hex_color)
+        {
+            row.push(
+                border(vstack(Vec::<Element>::new()))
+                    .width(12.0)
+                    .height(12.0)
+                    .background(c)
+                    .corner_radius(6.0)
+                    .vertical_alignment(VerticalAlignment::Center)
+                    .into(),
+            );
+        }
         if profile_mode {
             let set_edit = set_edit.clone();
             row.push(
                 button("Edit profile\u{2026}")
                     .icon(Symbol::Edit)
+                    // Matches the combo — the bar's controls share one height.
+                    .height(36.0)
                     .on_click(move || set_edit.call(true))
                     .vertical_alignment(VerticalAlignment::Center)
                     .into(),

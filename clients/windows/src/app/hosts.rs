@@ -393,13 +393,18 @@ fn edit_editor(
                         .on_content("Shown")
                         .off_content("Hidden")
                         .on_toggled(move |v: bool| {
+                            tracing::info!(pin = %id, host = %fp, on = v, "pin toggle");
                             let mut known = KnownHosts::load();
                             if let Some(h) = known.hosts.iter_mut().find(|h| h.fp_hex == fp) {
                                 h.pinned_profiles.retain(|x| x != &id);
                                 if v {
                                     h.pinned_profiles.push(id.clone());
                                 }
-                                let _ = known.save();
+                                if let Err(e) = known.save() {
+                                    tracing::warn!(error = %format!("{e:#}"), "saving a pin");
+                                }
+                            } else {
+                                tracing::warn!(host = %fp, "pin toggle: no such saved host");
                             }
                         })
                         .into(),
@@ -428,9 +433,17 @@ fn edit_editor(
         mac_draft.borrow().clone(),
         *clip_draft.borrow(),
     );
-    let _ = initial_name;
-    card(
+    // A centred SHEET (scrim + card), not an in-grid tile: as a tile the editor inherited a
+    // grid cell in the middle of the page, and on an ordinary window its lower half — the
+    // pin switches especially — sat below the fold with nothing hinting at it ("can't pin
+    // hosts", live-diagnosed 2026-07-29: the switch's visible rect was a 9-px sliver). A
+    // sheet centres at its own height, scrolls internally when it must, and matches where
+    // every other edit flow lives.
+    let modal = dialog_surface(
         vstack((
+            text_block(format!("Edit \u{201c}{initial_name}\u{201d}"))
+                .font_size(20.0)
+                .bold(),
             field("Name", name0, "e.g. Living Room", name_draft),
             field("Address", addr0, "IP or hostname", addr_draft),
             field("Port", port0, "9777", port_draft),
@@ -478,11 +491,24 @@ fn edit_editor(
                     .subtle()
                     .on_click(move || set_edit.call(None)),
             ))
-            .spacing(4.0),
+            .spacing(8.0)
+            .horizontal_alignment(HorizontalAlignment::Right),
         ))
         .spacing(10.0),
     )
-    .into()
+    .max_width(460.0)
+    .horizontal_alignment(HorizontalAlignment::Center)
+    .vertical_alignment(VerticalAlignment::Center)
+    .margin(uniform(24.0));
+    // The scrim: blocks the page, closes only via Save/Cancel (same rules as the add modal).
+    border(modal)
+        .background(Color {
+            a: 140,
+            r: 0,
+            g: 0,
+            b: 0,
+        })
+        .into()
 }
 
 pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
@@ -661,21 +687,6 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                 .map(|p| (p.id, p.name, p.accent))
                 .collect();
         for k in &known.hosts {
-            // Rust 2021 (no let-chains): match the "this tile is being edited" case explicitly.
-            if matches!(&rename, Some((fp, _)) if fp == &k.fp_hex) {
-                let (fp, initial) = rename.clone().unwrap();
-                tiles.push(edit_editor(
-                    &fp,
-                    &initial,
-                    name_draft.clone(),
-                    addr_draft.clone(),
-                    port_draft.clone(),
-                    mac_draft.clone(),
-                    clip_draft.clone(),
-                    set_rename.clone(),
-                ));
-                continue;
-            }
             let target = Target {
                 name: k.name.clone(),
                 addr: k.addr.clone(),
@@ -1090,5 +1101,20 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
     } else {
         border(vstack(Vec::<Element>::new())).into()
     };
-    grid(vec![page, add_slot, forget_confirm]).into()
+    // The host editor sheet, in its own stable slot (see the add modal's note).
+    let edit_slot: Element = if let Some((fp, initial)) = &rename {
+        edit_editor(
+            fp,
+            initial,
+            name_draft.clone(),
+            addr_draft.clone(),
+            port_draft.clone(),
+            mac_draft.clone(),
+            clip_draft.clone(),
+            set_rename.clone(),
+        )
+    } else {
+        border(vstack(Vec::<Element>::new())).into()
+    };
+    grid(vec![page, add_slot, edit_slot, forget_confirm]).into()
 }
