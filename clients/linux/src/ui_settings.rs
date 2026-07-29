@@ -35,21 +35,35 @@ pub enum Scope {
 /// (design §4.1). Keys are the overlay's field names, with `resolution` covering the
 /// width/height/match-window tri-state that one row drives.
 #[derive(Clone, Default)]
-struct Touched(Rc<RefCell<HashSet<&'static str>>>);
+struct Touched {
+    keys: Rc<RefCell<HashSet<&'static str>>>,
+    /// Set while a control is being changed BY US (putting a reset row back to the inherited
+    /// value). Without it the programmatic change would read as the user touching the row and
+    /// immediately re-create the override the reset just removed.
+    suspended: Rc<std::cell::Cell<bool>>,
+}
 
 impl Touched {
     fn mark(&self, key: &'static str) {
-        self.0.borrow_mut().insert(key);
+        self.keys.borrow_mut().insert(key);
+    }
+
+    fn suspended(&self) -> bool {
+        self.suspended.get()
+    }
+
+    fn set_suspended(&self, v: bool) {
+        self.suspended.set(v);
     }
 
     fn has(&self, key: &str) -> bool {
-        self.0.borrow().contains(key)
+        self.keys.borrow().contains(key)
     }
 
     /// Undo a touch — the user reset this row after changing it, and "back to inheriting" is
     /// the later, explicit intent.
     fn forget(&self, key: &str) {
-        self.0.borrow_mut().remove(key);
+        self.keys.borrow_mut().remove(key);
     }
 }
 
@@ -67,6 +81,83 @@ const REFRESH: &[u32] = &[0, 30, 60, 90, 120, 144, 165, 240];
 /// `1.0` = Native. Applied at connect and each match-window resize.
 const RENDER_SCALES: &[f64] = &[0.5, 0.67, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0];
 
+/// Where each picker sits for a given settings snapshot. Factored out because two places need
+/// exactly this: seeding the dialog, and putting ONE row back to the inherited value when its
+/// override is reset — and those two must agree, or a reset would land on a different option
+/// than reopening the dialog would show.
+mod index {
+    use super::*;
+
+    pub fn resolution(s: &Settings) -> u32 {
+        // Index 1 is the virtual "Match window" entry; 0 = Native, 2.. = the explicit sizes.
+        let i = if s.match_window {
+            1
+        } else {
+            RESOLUTIONS
+                .iter()
+                .position(|&(w, h)| w == s.width && h == s.height)
+                .map(|i| if i == 0 { 0 } else { i + 1 })
+                .unwrap_or(0)
+        };
+        i as u32
+    }
+
+    pub fn refresh(s: &Settings) -> u32 {
+        REFRESH.iter().position(|&r| r == s.refresh_hz).unwrap_or(0) as u32
+    }
+
+    pub fn render_scale(s: &Settings) -> u32 {
+        RENDER_SCALES
+            .iter()
+            .position(|&x| (x - s.render_scale).abs() < 1e-6)
+            .unwrap_or_else(|| RENDER_SCALES.iter().position(|&x| x == 1.0).unwrap()) as u32
+    }
+
+    pub fn codec(s: &Settings) -> u32 {
+        CODECS.iter().position(|&c| c == s.codec).unwrap_or(0) as u32
+    }
+
+    pub fn compositor(s: &Settings) -> u32 {
+        COMPOSITORS
+            .iter()
+            .position(|&c| c == s.compositor)
+            .unwrap_or(0) as u32
+    }
+
+    pub fn stats(s: &Settings) -> u32 {
+        StatsVerbosity::ALL
+            .iter()
+            .position(|v| *v == s.stats_verbosity())
+            .unwrap_or(0) as u32
+    }
+
+    pub fn touch(s: &Settings) -> u32 {
+        TOUCH_MODES
+            .iter()
+            .position(|&t| t == s.touch_mode)
+            .unwrap_or(0) as u32
+    }
+
+    pub fn mouse(s: &Settings) -> u32 {
+        MOUSE_MODES
+            .iter()
+            .position(|&m| m == s.mouse_mode)
+            .unwrap_or(0) as u32
+    }
+
+    pub fn surround(s: &Settings) -> u32 {
+        match s.audio_channels {
+            6 => 1,
+            8 => 2,
+            _ => 0,
+        }
+    }
+
+    pub fn gamepad(s: &Settings) -> u32 {
+        GAMEPADS.iter().position(|&g| g == s.gamepad).unwrap_or(0) as u32
+    }
+}
+
 /// The chip palette a profile can carry (`StreamProfile.accent`). Eight entries rather than a
 /// full colour picker: the point is telling profiles apart at a glance on a host card, which a
 /// small set of legible, contrast-checked colours does better than free choice — and the
@@ -83,12 +174,52 @@ const SWATCHES: &[(&str, &str, &str)] = &[
     ("#77767b", "pf-swatch-slate", "Slate"),
 ];
 
-/// A row of colour swatches, calling back with the chosen `#RRGGBB` (empty = none). Used both
-/// when creating a profile and when changing one later.
-fn swatch_row(current: Option<&str>, on_pick: impl Fn(String) + 'static) -> gtk::Box {
-    let row = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
+/// A colour picker as its own full-width row: the caption above, the swatches on their own
+/// line beneath, wrapping if the dialog is narrow.
+///
+/// They started as an [`adw::ActionRow`] suffix, which is where a control that size normally
+/// goes — but nine swatches squeeze the row's title until it is unreadable, and squeezing the
+/// label to fit the control is backwards. A `FlowBox` beneath keeps both legible at any width.
+fn colour_row(
+    title: &str,
+    current: Option<&str>,
+    on_pick: impl Fn(String) + 'static,
+) -> adw::PreferencesRow {
+    let box_ = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
         .spacing(8)
+        .margin_top(12)
+        .margin_bottom(12)
+        .margin_start(12)
+        .margin_end(12)
+        .build();
+    box_.append(
+        &gtk::Label::builder()
+            .label(title)
+            .halign(gtk::Align::Start)
+            .build(),
+    );
+    box_.append(&swatch_row(current, on_pick));
+    adw::PreferencesRow::builder()
+        .activatable(false)
+        .child(&box_)
+        .build()
+}
+
+/// The swatches themselves, calling back with the chosen `#RRGGBB` (empty = none).
+fn swatch_row(current: Option<&str>, on_pick: impl Fn(String) + 'static) -> gtk::FlowBox {
+    let row = gtk::FlowBox::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .selection_mode(gtk::SelectionMode::None)
+        .column_spacing(8)
+        .row_spacing(8)
+        .min_children_per_line(5)
+        .max_children_per_line(9)
+        // NOT homogeneous, and start-aligned: a homogeneous FlowBox stretches every child to
+        // the widest one, which turns 26px circles into wide rounded rectangles the moment the
+        // row has space to spare.
+        .homogeneous(false)
+        .halign(gtk::Align::Start)
         .build();
     let on_pick = Rc::new(on_pick);
     let buttons: Rc<RefCell<Vec<(String, gtk::Button)>>> = Rc::default();
@@ -113,7 +244,7 @@ fn swatch_row(current: Option<&str>, on_pick: impl Fn(String) + 'static) -> gtk:
             });
         }
         buttons.borrow_mut().push((hex.to_string(), b.clone()));
-        row.append(&b);
+        row.insert(&b, -1);
     }
     row
 }
@@ -207,24 +338,22 @@ fn scope_group(
     if let Some(active) = active {
         // Colour first: it is what the profile's chips carry on host cards, so it belongs with
         // the profile's identity rather than buried behind a menu.
-        let colour = adw::ActionRow::builder()
-            .title("Colour")
-            .subtitle("Tints this profile's chips on host cards")
-            .use_markup(false)
-            .build();
-        colour.add_suffix(&swatch_row(active.accent.as_deref(), {
-            let id = active.id.clone();
-            move |hex| {
-                let mut catalog = ProfilesFile::load();
-                if let Some(p) = catalog.profiles.iter_mut().find(|p| p.id == id) {
-                    p.accent = (!hex.is_empty()).then(|| hex.clone());
-                    if let Err(e) = catalog.save() {
-                        tracing::warn!(error = %format!("{e:#}"), "saving the profile colour");
+        g.add(&colour_row(
+            "Colour \u{2014} tints this profile's chips on host cards",
+            active.accent.as_deref(),
+            {
+                let id = active.id.clone();
+                move |hex| {
+                    let mut catalog = ProfilesFile::load();
+                    if let Some(p) = catalog.profiles.iter_mut().find(|p| p.id == id) {
+                        p.accent = (!hex.is_empty()).then(|| hex.clone());
+                        if let Err(e) = catalog.save() {
+                            tracing::warn!(error = %format!("{e:#}"), "saving the profile colour");
+                        }
                     }
                 }
-            }
-        }));
-        g.add(&colour);
+            },
+        ));
         let actions = adw::ActionRow::builder()
             .title(&active.name)
             .subtitle("This profile")
@@ -393,15 +522,10 @@ fn prompt_name(
     // for it afterwards is exactly the friction that leaves every profile grey.
     let accent: Rc<RefCell<Option<String>>> = Rc::default();
     if with_colour {
-        let row = adw::ActionRow::builder()
-            .title("Colour")
-            .use_markup(false)
-            .build();
-        row.add_suffix(&swatch_row(None, {
+        list.append(&colour_row("Colour", None, {
             let accent = accent.clone();
             move |hex| *accent.borrow_mut() = (!hex.is_empty()).then(|| hex.clone())
         }));
-        list.append(&row);
     }
     dialog.set_extra_child(Some(&list));
     dialog.add_responses(&[("cancel", "Cancel"), ("ok", accept)]);
@@ -444,12 +568,7 @@ fn prompt_name(
 /// what keeps an older client from erasing a newer one's values just by opening the dialog.
 /// The catalog is re-read here rather than reused, so a profile renamed in another window
 /// between opening and closing this one survives.
-fn commit_profile(
-    active: &StreamProfile,
-    touched: &Touched,
-    cleared: &HashSet<&'static str>,
-    values: &Settings,
-) {
+fn commit_profile(active: &StreamProfile, touched: &Touched, values: &Settings) {
     let mut catalog = ProfilesFile::load();
     let Some(slot) = catalog.profiles.iter_mut().find(|p| p.id == active.id) else {
         return; // deleted from under us — nothing to write to, and nothing to complain about
@@ -509,15 +628,9 @@ fn commit_profile(
     if touched.has("fullscreen_on_stream") {
         o.fullscreen_on_stream = Some(values.fullscreen_on_stream);
     }
-    // Resets last: a row the user reset may also have fired its change handler on the way
-    // (a ComboRow re-seeds), and "back to inheriting" is the later, explicit intent. The field
-    // names are the overlay's own, so the list of what can be cleared lives in ONE place —
-    // this used to be a second `match` here, which is exactly how the two drift.
-    for key in cleared {
-        if !o.clear(key) {
-            tracing::warn!(field = key, "reset of an unknown overlay field");
-        }
-    }
+    // Resets are not handled here: they clear the field and re-seed their row the moment the
+    // user asks, so by the time this runs the catalog already reflects them and the row is no
+    // longer marked touched.
     if let Err(e) = catalog.save() {
         tracing::warn!(error = %format!("{e:#}"), "saving the profile catalog");
     }
@@ -633,6 +746,7 @@ type ChangedFn = Rc<RefCell<Vec<Box<dyn Fn(u32)>>>>;
 /// A titled single-choice preference row. On a desktop this is a stock popover
 /// [`adw::ComboRow`]; under gamescope (see [`gamescope_session`]) it becomes an activatable
 /// row that pushes an in-window selection subpage onto the preferences dialog instead.
+#[derive(Clone)]
 struct ChoiceRow {
     row: adw::PreferencesRow,
     selected: Rc<Cell<u32>>,
@@ -884,9 +998,9 @@ pub fn show_scoped(
         None => settings.borrow().clone(),
     };
     let touched = Touched::default();
-    // Fields whose override a per-row reset dropped — applied at commit, after the touched
-    // ones, so "reset" wins over a value the same row happens to be showing.
-    let cleared: Rc<RefCell<HashSet<&'static str>>> = Rc::default();
+    // The globals as they are right now — what a reset row goes back to showing. Read before
+    // the close handler takes ownership of the cell.
+    let globals: Settings = settings.borrow().clone();
     // Where a scope switch wants to go once this dialog has committed and closed.
     let next_scope: Rc<RefCell<Option<Scope>>> = Rc::default();
 
@@ -1242,52 +1356,24 @@ pub fn show_scoped(
     // ---- Seed from the effective settings for this scope ----
     {
         let s = &seed;
-        let res_i = if s.match_window {
-            1
-        } else {
-            RESOLUTIONS
-                .iter()
-                .position(|&(w, h)| w == s.width && h == s.height)
-                .map(|i| if i == 0 { 0 } else { i + 1 })
-                .unwrap_or(0)
-        };
-        res_row.set_selected(res_i as u32);
-        set_row_subtitle(res_row.widget(), resolution_caption(res_i as u32));
-        let hz_i = REFRESH.iter().position(|&r| r == s.refresh_hz).unwrap_or(0);
-        hz_row.set_selected(hz_i as u32);
-        let scale_i = RENDER_SCALES
-            .iter()
-            .position(|&x| (x - s.render_scale).abs() < 1e-6)
-            .unwrap_or_else(|| RENDER_SCALES.iter().position(|&x| x == 1.0).unwrap());
-        scale_row.set_selected(scale_i as u32);
+        let res_i = index::resolution(s);
+        res_row.set_selected(res_i);
+        set_row_subtitle(res_row.widget(), resolution_caption(res_i));
+        hz_row.set_selected(index::refresh(s));
+        scale_row.set_selected(index::render_scale(s));
         bitrate_row.set_value(f64::from(s.bitrate_kbps) / 1000.0);
-        let pad_i = GAMEPADS.iter().position(|&g| g == s.gamepad).unwrap_or(0);
-        pad_row.set_selected(pad_i as u32);
-        let touch_i = TOUCH_MODES
-            .iter()
-            .position(|&t| t == s.touch_mode)
-            .unwrap_or(0);
-        touch_row.set_selected(touch_i as u32);
+        pad_row.set_selected(index::gamepad(s));
+        let touch_i = index::touch(s);
+        touch_row.set_selected(touch_i);
         // set_selected never fires the changed hook, so seed the dynamic caption directly.
-        set_row_subtitle(touch_row.widget(), TOUCH_MODE_CAPTIONS[touch_i]);
-        let mouse_i = MOUSE_MODES
-            .iter()
-            .position(|&m| m == s.mouse_mode)
-            .unwrap_or(0);
-        mouse_row.set_selected(mouse_i as u32);
-        set_row_subtitle(mouse_row.widget(), MOUSE_MODE_CAPTIONS[mouse_i]);
-        let comp_i = COMPOSITORS
-            .iter()
-            .position(|&c| c == s.compositor)
-            .unwrap_or(0);
-        compositor_row.set_selected(comp_i as u32);
+        set_row_subtitle(touch_row.widget(), TOUCH_MODE_CAPTIONS[touch_i as usize]);
+        let mouse_i = index::mouse(s);
+        mouse_row.set_selected(mouse_i);
+        set_row_subtitle(mouse_row.widget(), MOUSE_MODE_CAPTIONS[mouse_i as usize]);
+        compositor_row.set_selected(index::compositor(s));
         let dec_i = DECODERS.iter().position(|&d| d == s.decoder).unwrap_or(0);
         decoder_row.set_selected(dec_i as u32);
-        let stats_i = StatsVerbosity::ALL
-            .iter()
-            .position(|v| *v == s.stats_verbosity())
-            .unwrap_or(0);
-        stats_row.set_selected(stats_i as u32);
+        stats_row.set_selected(index::stats(s));
         fullscreen_row.set_active(s.fullscreen_on_stream);
         wake_row.set_active(s.auto_wake);
         inhibit_row.set_active(s.inhibit_shortcuts);
@@ -1296,80 +1382,121 @@ pub fn show_scoped(
         hdr_row.set_active(s.hdr_enabled);
         chroma_row.set_active(s.enable_444);
         library_row.set_active(s.library_enabled);
-        surround_row.set_selected(match s.audio_channels {
-            6 => 1,
-            8 => 2,
-            _ => 0,
-        });
-        let codec_i = CODECS.iter().position(|&c| c == s.codec).unwrap_or(0);
-        codec_row.set_selected(codec_i as u32);
-        set_row_subtitle(codec_row.widget(), codec_caption(codec_i as u32));
+        surround_row.set_selected(index::surround(s));
+        let codec_i = index::codec(s);
+        codec_row.set_selected(codec_i);
+        set_row_subtitle(codec_row.widget(), codec_caption(codec_i));
     }
 
     // ---- Override markers, per-row reset, and the touch that creates an override ----
-    // One pass per row, because the three are the same fact seen from different sides: the
-    // marker says "this profile changes this", the reset is the only way back (the override
-    // model never infers "not overridden" from a value comparison), and touching the control
-    // is what creates it. The marker therefore has to appear ON TOUCH, not on the next open —
-    // a user who changes a row and sees nothing has no reason to believe it took.
+    // One pass per row, because the three are the same fact from different sides: the marker
+    // says "this profile changes this", the reset is the only way back (the override model
+    // never infers "not overridden" from a value comparison), and touching the control is what
+    // creates it. The marker appears ON TOUCH — a user who changes a row and sees no
+    // acknowledgement has no reason to believe it took.
+    //
+    // A reset acts IN PLACE: it clears the field, puts that one control back to the inherited
+    // value, and drops the marker. Rebuilding the dialog would be simpler, but it animates the
+    // whole surface for a one-row change and dumps the user back on the first page — a heavy,
+    // disorienting answer to "undo this row".
     //
     // Wired after the seed block on purpose: `set_selected`/`set_active` during setup must not
     // look like the user touching anything, or opening a profile would override every row.
     if let Some(active) = &active {
         let o = &active.overrides;
-        // Build the marker for one row and hand back a "now it's overridden" switch its
-        // control's change handler can pull.
+        let profile_id = active.id.clone();
+
+        // The marker pair, created LAZILY: a hidden prefix still costs its slot in the row's
+        // layout, and every un-overridden row carrying an invisible dot's worth of inset reads
+        // as a misalignment. Returns the "now it is overridden" switch the control's change
+        // handler pulls.
         let mark = |row: &adw::PreferencesRow,
                     key: &'static str,
-                    overridden: bool|
-         -> Option<Box<dyn Fn()>> {
-            let row = row.downcast_ref::<adw::ActionRow>()?;
-            let dot = gtk::Box::builder()
-                .css_classes(["pf-override-dot"])
-                .valign(gtk::Align::Center)
-                .visible(overridden)
-                .build();
-            row.add_prefix(&dot);
-            let reset = gtk::Button::builder()
-                .icon_name("edit-undo-symbolic")
-                .tooltip_text("Reset to Default settings")
-                .valign(gtk::Align::Center)
-                .visible(overridden)
-                .css_classes(["flat"])
-                .build();
-            {
-                let (dialog, next, cleared, scope) = (
-                    dialog.clone(),
-                    next_scope.clone(),
-                    cleared.clone(),
-                    scope.clone(),
+                    overridden: bool,
+                    revert_control: Box<dyn Fn()>|
+         -> Option<Rc<dyn Fn()>> {
+            let row = row.downcast_ref::<adw::ActionRow>()?.clone();
+            let widgets: Rc<RefCell<Option<(gtk::Box, gtk::Button)>>> = Rc::default();
+            let (touched, id) = (touched.clone(), profile_id.clone());
+            let revert = Rc::new(revert_control);
+            let build = {
+                let (widgets, row, touched, id, revert) = (
+                    widgets.clone(),
+                    row.clone(),
+                    touched.clone(),
+                    id.clone(),
+                    revert.clone(),
                 );
-                let touched = touched.clone();
-                reset.connect_clicked(move |_| {
-                    // Queue the clear and re-open in the same scope: the close handler commits
-                    // whatever else was edited first, then drops this field, and the rebuilt
-                    // rows show the inherited value. Dropping it from `touched` too keeps a
-                    // reset-after-touch from re-writing what the reset just removed.
-                    touched.forget(key);
-                    cleared.borrow_mut().insert(key);
-                    *next.borrow_mut() = Some(scope.clone());
-                    dialog.close();
-                });
+                Rc::new(move || {
+                    if widgets.borrow().is_some() {
+                        return;
+                    }
+                    let dot = gtk::Box::builder()
+                        .css_classes(["pf-override-dot"])
+                        .valign(gtk::Align::Center)
+                        .build();
+                    let reset = gtk::Button::builder()
+                        .icon_name("edit-undo-symbolic")
+                        .tooltip_text("Reset to Default settings")
+                        .valign(gtk::Align::Center)
+                        .css_classes(["flat"])
+                        .build();
+                    row.add_prefix(&dot);
+                    row.add_suffix(&reset);
+                    {
+                        let (widgets, row, touched, id, revert) = (
+                            widgets.clone(),
+                            row.clone(),
+                            touched.clone(),
+                            id.clone(),
+                            revert.clone(),
+                        );
+                        reset.connect_clicked(move |_| {
+                            // Drop the override from the catalog now — the close handler
+                            // re-reads it, so there is nothing to reconcile later — and
+                            // un-touch the row so the commit can't re-write what this removed.
+                            touched.forget(key);
+                            let mut catalog = ProfilesFile::load();
+                            if let Some(p) = catalog.profiles.iter_mut().find(|p| p.id == id) {
+                                p.overrides.clear(key);
+                                if let Err(e) = catalog.save() {
+                                    tracing::warn!(error = %format!("{e:#}"), "clearing an override");
+                                }
+                            }
+                            revert();
+                            if let Some((dot, reset)) = widgets.borrow_mut().take() {
+                                row.remove(&dot);
+                                row.remove(&reset);
+                            }
+                        });
+                    }
+                    *widgets.borrow_mut() = Some((dot, reset));
+                }) as Rc<dyn Fn()>
+            };
+            if overridden {
+                build();
             }
-            row.add_suffix(&reset);
-            Some(Box::new(move || {
-                dot.set_visible(true);
-                reset.set_visible(true);
-            }))
+            Some(build)
         };
 
-        // `(row widget, overlay field, is it overridden right now)` — then the control's own
-        // change signal marks it touched AND lights the marker.
+        // Each row: how to put it back to the INHERITED value (the globals, not this
+        // profile's), and what marks it touched.
         macro_rules! choice {
-            ($row:expr, $key:literal, $overridden:expr) => {{
-                let show = mark($row.widget(), $key, $overridden);
+            ($row:expr, $key:literal, $overridden:expr, $idx:path) => {{
+                let revert = {
+                    let (row, globals, touched) = ($row.clone(), globals.clone(), touched.clone());
+                    Box::new(move || {
+                        touched.set_suspended(true);
+                        row.set_selected($idx(&globals));
+                        touched.set_suspended(false);
+                    }) as Box<dyn Fn()>
+                };
+                let show = mark($row.widget(), $key, $overridden, revert);
                 let t = touched.clone();
                 $row.connect_changed(move |_| {
+                    if t.suspended() {
+                        return;
+                    }
                     t.mark($key);
                     if let Some(show) = &show {
                         show();
@@ -1378,10 +1505,21 @@ pub fn show_scoped(
             }};
         }
         macro_rules! toggle {
-            ($row:expr, $key:literal, $overridden:expr) => {{
-                let show = mark($row.upcast_ref(), $key, $overridden);
+            ($row:expr, $key:literal, $overridden:expr, $field:ident) => {{
+                let revert = {
+                    let (row, globals, touched) = ($row.clone(), globals.clone(), touched.clone());
+                    Box::new(move || {
+                        touched.set_suspended(true);
+                        row.set_active(globals.$field);
+                        touched.set_suspended(false);
+                    }) as Box<dyn Fn()>
+                };
+                let show = mark($row.upcast_ref(), $key, $overridden, revert);
                 let t = touched.clone();
                 $row.connect_active_notify(move |_| {
+                    if t.suspended() {
+                        return;
+                    }
                     t.mark($key);
                     if let Some(show) = &show {
                         show();
@@ -1393,39 +1531,90 @@ pub fn show_scoped(
         choice!(
             res_row,
             "resolution",
-            o.width.is_some() || o.height.is_some() || o.match_window.is_some()
+            o.width.is_some() || o.height.is_some() || o.match_window.is_some(),
+            index::resolution
         );
-        choice!(hz_row, "refresh_hz", o.refresh_hz.is_some());
-        choice!(scale_row, "render_scale", o.render_scale.is_some());
-        choice!(codec_row, "codec", o.codec.is_some());
-        choice!(compositor_row, "compositor", o.compositor.is_some());
-        choice!(stats_row, "stats_verbosity", o.stats_verbosity.is_some());
-        choice!(touch_row, "touch_mode", o.touch_mode.is_some());
-        choice!(mouse_row, "mouse_mode", o.mouse_mode.is_some());
-        choice!(surround_row, "audio_channels", o.audio_channels.is_some());
-        choice!(pad_row, "gamepad", o.gamepad.is_some());
-        toggle!(hdr_row, "hdr_enabled", o.hdr_enabled.is_some());
-        toggle!(chroma_row, "enable_444", o.enable_444.is_some());
+        choice!(hz_row, "refresh_hz", o.refresh_hz.is_some(), index::refresh);
+        choice!(
+            scale_row,
+            "render_scale",
+            o.render_scale.is_some(),
+            index::render_scale
+        );
+        choice!(codec_row, "codec", o.codec.is_some(), index::codec);
+        choice!(
+            compositor_row,
+            "compositor",
+            o.compositor.is_some(),
+            index::compositor
+        );
+        choice!(
+            stats_row,
+            "stats_verbosity",
+            o.stats_verbosity.is_some(),
+            index::stats
+        );
+        choice!(
+            touch_row,
+            "touch_mode",
+            o.touch_mode.is_some(),
+            index::touch
+        );
+        choice!(
+            mouse_row,
+            "mouse_mode",
+            o.mouse_mode.is_some(),
+            index::mouse
+        );
+        choice!(
+            surround_row,
+            "audio_channels",
+            o.audio_channels.is_some(),
+            index::surround
+        );
+        choice!(pad_row, "gamepad", o.gamepad.is_some(), index::gamepad);
+        toggle!(hdr_row, "hdr_enabled", o.hdr_enabled.is_some(), hdr_enabled);
+        toggle!(chroma_row, "enable_444", o.enable_444.is_some(), enable_444);
         toggle!(
             fullscreen_row,
             "fullscreen_on_stream",
-            o.fullscreen_on_stream.is_some()
+            o.fullscreen_on_stream.is_some(),
+            fullscreen_on_stream
         );
         toggle!(
             inhibit_row,
             "inhibit_shortcuts",
-            o.inhibit_shortcuts.is_some()
+            o.inhibit_shortcuts.is_some(),
+            inhibit_shortcuts
         );
-        toggle!(invert_row, "invert_scroll", o.invert_scroll.is_some());
-        toggle!(mic_row, "mic_enabled", o.mic_enabled.is_some());
+        toggle!(
+            invert_row,
+            "invert_scroll",
+            o.invert_scroll.is_some(),
+            invert_scroll
+        );
+        toggle!(mic_row, "mic_enabled", o.mic_enabled.is_some(), mic_enabled);
         {
+            let revert = {
+                let (row, globals, touched) =
+                    (bitrate_row.clone(), globals.clone(), touched.clone());
+                Box::new(move || {
+                    touched.set_suspended(true);
+                    row.set_value(f64::from(globals.bitrate_kbps) / 1000.0);
+                    touched.set_suspended(false);
+                }) as Box<dyn Fn()>
+            };
             let show = mark(
                 bitrate_row.upcast_ref(),
                 "bitrate_kbps",
                 o.bitrate_kbps.is_some(),
+                revert,
             );
             let t = touched.clone();
             bitrate_row.connect_value_notify(move |_| {
+                if t.suspended() {
+                    return;
+                }
                 t.mark("bitrate_kbps");
                 if let Some(show) = &show {
                     show();
@@ -1634,7 +1823,7 @@ pub fn show_scoped(
             Some(active) => {
                 let mut values = seed.clone();
                 apply_rows(&mut values);
-                commit_profile(active, &touched, &cleared.borrow(), &values);
+                commit_profile(active, &touched, &values);
             }
             None => {
                 let mut s = settings.borrow_mut();

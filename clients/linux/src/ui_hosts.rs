@@ -91,19 +91,11 @@ enum CardKind {
 #[derive(Debug)]
 pub enum CardOutput {
     Connect(ConnectRequest),
-    /// Set (or clear, with `None`) this host's DEFAULT settings profile — the explicit
-    /// rebinding act; a one-off connect never does this.
-    BindProfile {
-        fp_hex: String,
-        addr: String,
-        port: u16,
-        profile_id: Option<String>,
-    },
     WakeConnect(ConnectRequest),
     Pair(ConnectRequest),
     SpeedTest(ConnectRequest),
     Library(ConnectRequest),
-    /// Open the host edit sheet (name, profile binding, clipboard).
+    /// Open the host edit sheet (name, profile binding, pinned cards, clipboard).
     Edit {
         fp_hex: String,
         name: String,
@@ -311,6 +303,13 @@ impl relm4::factory::FactoryComponent for HostCard {
                 };
                 {
                     let req = req.clone();
+                    add(
+                        "connect",
+                        Box::new(move || CardOutput::Connect(req.clone())),
+                    );
+                }
+                {
+                    let req = req.clone();
                     add("pair", Box::new(move || CardOutput::Pair(req.clone())));
                 }
                 {
@@ -357,10 +356,47 @@ impl relm4::factory::FactoryComponent for HostCard {
                         }),
                     );
                 }
-                // Profiles: a ONE-OFF connect ("Connect with"), and the explicit rebinding
-                // act ("Default profile"). They are separate menus on purpose — the whole
-                // predictability rule is that connecting with a profile never changes what
-                // the card will do next time (design §5.2).
+                // "Copy link" / "Create shortcut…": the self-emitted URL for this card, which
+                // is what an external tool (a Playnite entry, a Stream Deck macro) is
+                // configured with. It carries the stable id AND host+fp, so it still resolves
+                // after a re-address or a reinstall (design/client-deep-links.md §2/§5).
+                {
+                    let (host, profile) = (k.clone(), pinned.clone());
+                    let a = gio::SimpleAction::new("copy-link", None);
+                    let sender = sender.clone();
+                    a.connect_activate(move |_, _| {
+                        let url = pf_client_core::deeplink::DeepLink::for_host(
+                            &host,
+                            None,
+                            profile.as_ref().map(|(id, _)| id.as_str()),
+                        )
+                        .to_url();
+                        let _ = sender.output(CardOutput::CopyLink(url));
+                    });
+                    actions.add_action(&a);
+                }
+                {
+                    let (host, profile) = (k.clone(), pinned.clone());
+                    let a = gio::SimpleAction::new("shortcut", None);
+                    let sender = sender.clone();
+                    a.connect_activate(move |_, _| {
+                        let url = pf_client_core::deeplink::DeepLink::for_host(
+                            &host,
+                            None,
+                            profile.as_ref().map(|(id, _)| id.as_str()),
+                        )
+                        .to_url();
+                        let label = match &profile {
+                            Some((_, name)) => format!("{} \u{00b7} {name}", host.name),
+                            None => host.name.clone(),
+                        };
+                        let _ = sender.output(CardOutput::CreateShortcut { label, url });
+                    });
+                    actions.add_action(&a);
+                }
+                // A one-off connect ("Connect with") never rebinds the host — the whole
+                // predictability rule is that it can't change what the card does next time.
+                // Rebinding, and pinning, live in the edit sheet (design §5.2).
                 {
                     let profile_action =
                         |name: &str, out: Box<dyn Fn(Option<String>) -> CardOutput>| {
@@ -385,56 +421,6 @@ impl relm4::factory::FactoryComponent for HostCard {
                             CardOutput::Connect(req)
                         }),
                     );
-                    let (fp, addr, port) = (k.fp_hex.clone(), k.addr.clone(), k.port);
-                    profile_action(
-                        "bind-profile",
-                        Box::new(move |id| CardOutput::BindProfile {
-                            fp_hex: fp.clone(),
-                            addr: addr.clone(),
-                            port,
-                            profile_id: id,
-                        }),
-                    );
-                    // "Copy link": the self-emitted URL for this card, which is the pairing
-                    // an external tool (a Playnite entry, a Stream Deck macro) is configured
-                    // with. It carries the stable id AND host+fp, so it still resolves after a
-                    // re-address or a reinstall (design/client-deep-links.md §2/§5).
-                    {
-                        let (host, profile) = (k.clone(), pinned.clone());
-                        let a = gio::SimpleAction::new("copy-link", None);
-                        let sender = sender.clone();
-                        a.connect_activate(move |_, _| {
-                            let url = pf_client_core::deeplink::DeepLink::for_host(
-                                &host,
-                                None,
-                                profile.as_ref().map(|(id, _)| id.as_str()),
-                            )
-                            .to_url();
-                            let _ = sender.output(CardOutput::CopyLink(url));
-                        });
-                        actions.add_action(&a);
-                    }
-                    // "Create shortcut…": the same URL as Copy link, wrapped in a desktop
-                    // entry so it is double-clickable from the app grid.
-                    {
-                        let (host, profile) = (k.clone(), pinned.clone());
-                        let a = gio::SimpleAction::new("shortcut", None);
-                        let sender = sender.clone();
-                        a.connect_activate(move |_, _| {
-                            let url = pf_client_core::deeplink::DeepLink::for_host(
-                                &host,
-                                None,
-                                profile.as_ref().map(|(id, _)| id.as_str()),
-                            )
-                            .to_url();
-                            let label = match &profile {
-                                Some((_, name)) => format!("{} \u{00b7} {name}", host.name),
-                                None => host.name.clone(),
-                            };
-                            let _ = sender.output(CardOutput::CreateShortcut { label, url });
-                        });
-                        actions.add_action(&a);
-                    }
                     // The same action pins from a primary card and unpins from a pinned one —
                     // which of the two this card is decides the direction.
                     let (fp, addr, port) = (k.fp_hex.clone(), k.addr.clone(), k.port);
@@ -452,23 +438,33 @@ impl relm4::factory::FactoryComponent for HostCard {
                 }
                 overlay.insert_action_group("card", Some(&actions));
 
+                // The card menu, kept short on purpose. It had grown to eleven entries and
+                // three submenus, at which point the useful ones (connect, library, speed) were
+                // buried in list management. Two rules thin it:
+                //
+                //   * anything that CONFIGURES the host lives in the edit sheet, not here —
+                //     the default profile and the pinned cards are properties of the record,
+                //     and the sheet is where you already go to change its name or address;
+                //   * what remains is grouped into sections, so a glance lands on the right
+                //     third of the menu instead of scanning eleven similar lines.
+                //
+                // What's left is: start something, look at something, take a link, manage the
+                // host itself.
                 let menu = gio::Menu::new();
                 if let Some((pin_id, pin_name)) = pinned {
-                    // A pinned card is a shortcut, not a second host: it offers the one-offs
-                    // and its own removal, and deliberately NOT pair/rename/forget — those
-                    // belong to the host, and offering them here would blur what the card is.
-                    let with = gio::Menu::new();
-                    for (label, target) in std::iter::once(("Default settings", ""))
-                        .chain(profiles.iter().map(|p| (p.name.as_str(), p.id.as_str())))
-                    {
-                        let item = gio::MenuItem::new(Some(label), None);
-                        item.set_action_and_target_value(
-                            Some("card.connect-with"),
-                            Some(&target.to_variant()),
-                        );
-                        with.append_item(&item);
-                    }
-                    menu.append_submenu(Some("Connect with"), &with);
+                    // A pinned card is a shortcut, not a second host: it starts a stream, hands
+                    // out its link, and removes itself. Pair/edit/forget belong to the host and
+                    // offering them here would blur what the card is.
+                    let launch = gio::Menu::new();
+                    launch.append(Some("Connect"), Some("card.connect"));
+                    menu.append_section(None, &launch);
+
+                    let links = gio::Menu::new();
+                    links.append(Some("Copy link"), Some("card.copy-link"));
+                    links.append(Some("Create shortcut\u{2026}"), Some("card.shortcut"));
+                    menu.append_section(None, &links);
+
+                    let manage = gio::Menu::new();
                     let unpin = gio::MenuItem::new(
                         Some(&format!("Unpin \u{201c}{pin_name}\u{201d}")),
                         None,
@@ -477,60 +473,51 @@ impl relm4::factory::FactoryComponent for HostCard {
                         Some("card.toggle-pin"),
                         Some(&pin_id.as_str().to_variant()),
                     );
-                    menu.append_item(&unpin);
-                    menu.append(Some("Copy link"), Some("card.copy-link"));
-                    menu.append(Some("Create shortcut\u{2026}"), Some("card.shortcut"));
+                    manage.append_item(&unpin);
+                    menu.append_section(None, &manage);
                 } else {
+                    // Starting a stream: a plain click already connects with the host's own
+                    // profile, so the menu only needs the one-offs — and only when there are
+                    // profiles to pick between.
                     if !profiles.is_empty() {
                         let with = gio::Menu::new();
-                        let bind = gio::Menu::new();
-                        let pin = gio::Menu::new();
                         for (label, id) in std::iter::once(("Default settings", ""))
                             .chain(profiles.iter().map(|p| (p.name.as_str(), p.id.as_str())))
                         {
-                            // A checkmark would be the natural cue for the current binding, but
-                            // a GMenu radio needs shared state per card; the bound profile is
-                            // named on the card's chip instead, visible without opening a menu.
-                            for (menu, action) in
-                                [(&with, "card.connect-with"), (&bind, "card.bind-profile")]
-                            {
-                                let item = gio::MenuItem::new(Some(label), None);
-                                item.set_action_and_target_value(
-                                    Some(action),
-                                    Some(&id.to_variant()),
-                                );
-                                menu.append_item(&item);
-                            }
-                            // "Default settings" is not pinnable — the primary card is that.
-                            if !id.is_empty() && !k.pinned_profiles.iter().any(|p| p == id) {
-                                let item = gio::MenuItem::new(Some(label), None);
-                                item.set_action_and_target_value(
-                                    Some("card.toggle-pin"),
-                                    Some(&id.to_variant()),
-                                );
-                                pin.append_item(&item);
-                            }
+                            let item = gio::MenuItem::new(Some(label), None);
+                            item.set_action_and_target_value(
+                                Some("card.connect-with"),
+                                Some(&id.to_variant()),
+                            );
+                            with.append_item(&item);
                         }
-                        menu.append_submenu(Some("Connect with"), &with);
-                        menu.append_submenu(Some("Default profile"), &bind);
-                        if pin.n_items() > 0 {
-                            menu.append_submenu(Some("Pin as card"), &pin);
-                        }
+                        let launch = gio::Menu::new();
+                        launch.append_submenu(Some("Connect with"), &with);
+                        menu.append_section(None, &launch);
                     }
-                    menu.append(Some("Pair with PIN\u{2026}"), Some("card.pair"));
-                    menu.append(Some("Test network speed\u{2026}"), Some("card.speed"));
-                    // An explicit wake only when offline and a MAC is known.
-                    if !online && !k.mac.is_empty() {
-                        menu.append(Some("Wake host"), Some("card.wake"));
-                    }
+
+                    let look = gio::Menu::new();
                     // Experimental (Preferences gate): browse the host's game library.
                     if *library_enabled {
-                        menu.append(Some("Browse library\u{2026}"), Some("card.library"));
+                        look.append(Some("Browse library\u{2026}"), Some("card.library"));
                     }
-                    menu.append(Some("Copy link"), Some("card.copy-link"));
-                    menu.append(Some("Create shortcut\u{2026}"), Some("card.shortcut"));
-                    menu.append(Some("Edit\u{2026}"), Some("card.rename"));
-                    menu.append(Some("Forget"), Some("card.forget"));
+                    look.append(Some("Test network speed\u{2026}"), Some("card.speed"));
+                    // An explicit wake only when offline and a MAC is known.
+                    if !online && !k.mac.is_empty() {
+                        look.append(Some("Wake host"), Some("card.wake"));
+                    }
+                    menu.append_section(None, &look);
+
+                    let links = gio::Menu::new();
+                    links.append(Some("Copy link"), Some("card.copy-link"));
+                    links.append(Some("Create shortcut\u{2026}"), Some("card.shortcut"));
+                    menu.append_section(None, &links);
+
+                    let manage = gio::Menu::new();
+                    manage.append(Some("Edit\u{2026}"), Some("card.rename"));
+                    manage.append(Some("Pair with PIN\u{2026}"), Some("card.pair"));
+                    manage.append(Some("Forget"), Some("card.forget"));
+                    menu.append_section(None, &manage);
                 }
                 let menu_btn = gtk::MenuButton::builder()
                     .icon_name("view-more-symbolic")
@@ -967,27 +954,6 @@ impl SimpleComponent for HostsPage {
                 CardOutput::Edit { fp_hex, name } => self.edit_host_dialog(&sender, &fp_hex, &name),
                 CardOutput::Forget { fp_hex, name } => self.forget_dialog(&sender, &fp_hex, &name),
                 CardOutput::Wake { mac, addr } => crate::wol::wake(&mac, addr.parse().ok()),
-                CardOutput::BindProfile {
-                    fp_hex,
-                    addr,
-                    port,
-                    profile_id,
-                } => {
-                    // Written straight onto the host record — the binding IS a field there, so
-                    // there is no map to keep in step (design §4.1). Matched by fingerprint
-                    // when there is one, else by address, like every other per-host lookup.
-                    let mut known = KnownHosts::load();
-                    if let Some(h) = known.hosts.iter_mut().find(|h| {
-                        (!fp_hex.is_empty() && h.fp_hex == fp_hex)
-                            || (h.addr == addr && h.port == port)
-                    }) {
-                        h.profile_id = profile_id;
-                        if let Err(e) = known.save() {
-                            tracing::warn!(error = %format!("{e:#}"), "saving the profile binding");
-                        }
-                    }
-                    self.rebuild(); // the chip follows immediately
-                }
                 CardOutput::CopyLink(url) => {
                     if let Some(display) = gtk::gdk::Display::default() {
                         display.clipboard().set_text(&url);
@@ -1247,6 +1213,26 @@ impl HostsPage {
             .build();
         profile_row.set_selected(selected as u32);
 
+        // Pinned cards: which profiles get their own one-click card for this host. They used
+        // to be a third submenu on the card, which is what tipped that menu over — and this is
+        // where they belong anyway, next to the default they sit beside (design §5.2a).
+        let pin_rows: Vec<(String, adw::SwitchRow)> = catalog
+            .profiles
+            .iter()
+            .map(|p| {
+                let row = adw::SwitchRow::builder()
+                    .title(&p.name)
+                    .subtitle("Show as its own card")
+                    .build();
+                row.set_active(
+                    stored
+                        .as_ref()
+                        .is_some_and(|h| h.pinned_profiles.iter().any(|id| id == &p.id)),
+                );
+                (p.id.clone(), row)
+            })
+            .collect();
+
         let list = gtk::ListBox::builder()
             .selection_mode(gtk::SelectionMode::None)
             .css_classes(["boxed-list"])
@@ -1254,6 +1240,9 @@ impl HostsPage {
         list.append(&name_row);
         list.append(&profile_row);
         list.append(&clipboard_row);
+        for (_, row) in &pin_rows {
+            list.append(row);
+        }
 
         let dialog = adw::AlertDialog::new(Some("Edit Host"), None);
         dialog.set_extra_child(Some(&list));
@@ -1276,6 +1265,13 @@ impl HostsPage {
                         .get(profile_row.selected() as usize)
                         .filter(|id| !id.is_empty())
                         .cloned();
+                    // Rebuilt from the switches rather than toggled, so the card order follows
+                    // the catalog and a profile deleted meanwhile simply drops out.
+                    h.pinned_profiles = pin_rows
+                        .iter()
+                        .filter(|(_, row)| row.is_active())
+                        .map(|(id, _)| id.clone())
+                        .collect();
                     let _ = known.save();
                 }
                 sender.input(HostsMsg::Refresh);
