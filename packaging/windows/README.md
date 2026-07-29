@@ -181,18 +181,28 @@ $c = New-SelfSignedCertificate -Type CodeSigningCert -Subject 'CN=punktfunk-driv
        -NotAfter (Get-Date).AddYears(10)
 $c.Thumbprint      # <- publish this: paste into the "Current fingerprint" line above + SECURITY.md
 
-# 2. Export it, protected by a strong random password.
-$pw = -join ((48..57) + (65..90) + (97..122) | Get-Random -Count 32 | % { [char]$_ })
+# 2. Export it, protected by a strong random password. RandomNumberGenerator, NOT Get-Random —
+#    Get-Random is System.Random, which is not a cryptographic RNG and has no business generating
+#    the passphrase on a signing key. (.Create()/.GetBytes() works on both PS 5.1 and PS 7.)
+$rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+$bytes = [byte[]]::new(24); $rng.GetBytes($bytes); $pw = [Convert]::ToBase64String($bytes)
 $sec = ConvertTo-SecureString $pw -AsPlainText -Force
 Export-PfxCertificate -Cert "Cert:\CurrentUser\My\$($c.Thumbprint)" -FilePath .\driver.pfx -Password $sec | Out-Null
 [Convert]::ToBase64String([IO.File]::ReadAllBytes('.\driver.pfx')) | Set-Clipboard   # -> DRIVER_CERT_PFX_B64
 $pw                # -> DRIVER_CERT_PASSWORD
 
-# 3. Add BOTH as Gitea Actions secrets (org level on `unom`, like RPM_GPG_PRIVATE_KEY, so any repo
-#    that builds drivers inherits them), then destroy the local copies:
+# 3. Add BOTH as **repo**-level Gitea Actions secrets on unom/punktfunk — same scope as the
+#    MSIX_CERT_PFX_B64 signing cert next door, and only this repo builds drivers. (RPM_GPG_PRIVATE_KEY
+#    is org-level because other repos publish RPMs; nothing else needs this one.) Then destroy the
+#    local copies — the .pfx must not linger on the machine that generated it:
 Remove-Item .\driver.pfx -Force
 Remove-Item "Cert:\CurrentUser\My\$($c.Thumbprint)" -Force
 ```
+
+Generate it on a machine you would trust with a signing key, at an **interactive** logon (physical
+console or RDP). Over SSH, `New-SelfSignedCertificate` fails with `NTE_PERM 0x80090010`: a network
+logon has no access to the user's key container. Avoid generating it on the CI runner — that box
+executes build code, which is the one place a signing key should not be sitting.
 
 Keep an offline backup of the .pfx + password somewhere you'd keep a signing key. Losing it means
 the next release ships a cert nobody has trusted before, and every user's installer adds a second
