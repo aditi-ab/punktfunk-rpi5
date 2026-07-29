@@ -53,27 +53,41 @@ on:
 env:
   REGISTRY: git.unom.io
   OWNER: unom
+  # Shared compile cache: sccache -> RustFS S3 (storage.unom.io). NOTE: makepkg runs
+  # behind `sudo -u builder env ...`, which strips ambient env — the makepkg step
+  # re-exports these explicitly.
+  RUSTC_WRAPPER: sccache
+  SCCACHE_BUCKET: unom-ci-sccache
+  SCCACHE_ENDPOINT: https://storage.unom.io
+  SCCACHE_REGION: home-central
+  AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_SECRET_ACCESS_KEY }}
+  CARGO_INCREMENTAL: "0"
 
 jobs:
   build-publish:
     runs-on: ubuntu-24.04
     container:
-      image: docker.io/library/archlinux:base-devel
+      # Everything the two pacman steps below used to download (~1 GB/run) is baked in,
+      # plus bun, sccache and node (ci/arch-ci.Dockerfile). The steps stay as --needed
+      # no-op guards for the one push where :latest lags an image-content change.
+      image: 192.168.1.58:5010/punktfunk-arch-ci:latest
     timeout-minutes: 90
     env:
       CARGO_HOME: /usr/local/cargo
     steps:
       # git + nodejs must exist before actions/checkout — base-devel ships neither, and
       # act_runner runs the action's JS with the CONTAINER's node, it does not inject one.
-      - name: Install build + runtime-dev deps
+      - name: Build + runtime-dev deps (no-op guard — baked into arch-ci)
+        # No -Syu: the image's snapshot IS the build environment (see the Dockerfile's
+        # rolling-release note); with everything installed this resolves locally and
+        # does nothing. It only matters on the push that adds a dep before the image
+        # rebuild lands — same bootstrap note as ci.yml's GTK4 step.
         run: |
-          pacman -Syu --noconfirm --needed \
+          pacman -S --noconfirm --needed \
             git nodejs rust clang cmake ninja nasm pkgconf python vulkan-headers \
             gtk4 libadwaita sdl3 ffmpeg pipewire wayland libxkbcommon opus libei \
-            mesa libglvnd unzip libarchive
-          # bun builds the punktfunk-web console + the punktfunk-scripting runner AND is vendored as
-          # their runtime (PF_WITH_WEB=1 / PF_WITH_SCRIPTING=1); it's AUR-only on Arch, so bootstrap
-          # the official binary.
+            mesa libglvnd unzip libarchive || echo "::warning::pacman guard failed (stale image db?) — proceeding with baked packages"
           command -v bun >/dev/null || {
             curl -fsSL https://bun.sh/install | bash
             install -m0755 "$HOME/.bun/bin/bun" /usr/local/bin/bun
@@ -132,9 +146,15 @@ jobs:
           sudo -u builder git config --global --add safe.directory "$PWD"
           mkdir -p dist && chown builder: dist
           cd packaging/arch
+          # sudo env_reset strips the ambient env, so the sccache wiring must cross the
+          # boundary explicitly (same values as the workflow env block).
           sudo -u builder env PF_SRCDIR="$GITHUB_WORKSPACE" PF_WITH_WEB=1 PF_WITH_SCRIPTING=1 \
             PF_PKGVER="$PF_PKGVER" PF_PKGREL="$PF_PKGREL" \
             CARGO_HOME="$CARGO_HOME" PKGDEST="$GITHUB_WORKSPACE/dist" \
+            RUSTC_WRAPPER="$RUSTC_WRAPPER" CARGO_INCREMENTAL="$CARGO_INCREMENTAL" \
+            SCCACHE_BUCKET="$SCCACHE_BUCKET" SCCACHE_ENDPOINT="$SCCACHE_ENDPOINT" \
+            SCCACHE_REGION="$SCCACHE_REGION" \
+            AWS_ACCESS_KEY_ID="$AWS_ACCESS_KEY_ID" AWS_SECRET_ACCESS_KEY="$AWS_SECRET_ACCESS_KEY" \
             makepkg -f -d --holdver
           ls -lh "$GITHUB_WORKSPACE/dist"
 
@@ -158,6 +178,7 @@ jobs:
         # failure building gamescope must not cost the packages this workflow exists to publish.
         run: |
           set -x
+          # Baked into arch-ci — a no-op guard, like the dep step above.
           pacman -S --noconfirm --needed \
             glslang libcap libdrm libinput libx11 libxcomposite libxdamage libxext \
             libxkbcommon libxmu libxrender libxres libxtst libxxf86vm libavif libdecor \

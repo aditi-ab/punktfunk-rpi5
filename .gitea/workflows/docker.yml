@@ -70,6 +70,10 @@ jobs:
           # image layers.
           - image: punktfunk-android-ci
             dockerfile: ci/android-ci.Dockerfile
+          # Arch builder (base-devel + both makepkg legs' deps + bun + sccache) —
+          # arch.yml runs in it; ~1 GB of per-run pacman traffic became image layers.
+          - image: punktfunk-arch-ci
+            dockerfile: ci/arch-ci.Dockerfile
     steps:
       - uses: actions/checkout@v4
 
