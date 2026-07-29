@@ -144,6 +144,60 @@ fresh install uses the generated random console password — read it from
 > punktfunk-planning: `windows-build-and-packaging.md` (internal planning repo) for the toolchain
 > + signing details.
 
+## Driver signing (`DRIVER_CERT_PFX_B64`)
+
+Our three UMDF drivers are signed with a **stable self-signed code-signing cert**, subject
+`CN=punktfunk-driver`, supplied to `build-pf-vdisplay.ps1` / `build-gamepad-drivers.ps1` as the
+`DRIVER_CERT_PFX_B64` + `DRIVER_CERT_PASSWORD` Actions secrets. On a `v*` tag build a missing cert
+is a **hard failure** (`-RequireSignedCert`, default `auto` off `GITHUB_REF`); canary and local
+builds still fall back to a per-build throwaway.
+
+**Current fingerprint (SHA-1 thumbprint):** `<fill in after generating — see below>`
+
+Why stable matters here. The installer trusts the `.cer` that ships in the bundle
+(`certutil -addstore -f Root` + `TrustedPublisher`, `crates/punktfunk-host/src/windows/install.rs`),
+which is unavoidable for a self-signed cert — a self-signed leaf is its own root, so the chain only
+validates if the root is present. That means the signature does **not** authenticate the download:
+anyone who can alter the bundle can put their own cert next to their own driver. What a stable cert
+buys is everything downstream of that: one anchor imported once instead of two more roots per
+upgrade, a fingerprint we can publish out-of-band so a substituted driver is *detectable*, a
+publisher an admin can allowlist, and continuity across releases. `driver install` purges stale
+`CN=punktfunk-driver` certs before adding the current one, and `driver uninstall` removes them
+entirely — including the pile left by the per-build-cert era.
+
+> ⚠️ **The private key is now worth stealing.** It is trusted as a machine **root** on every
+> punktfunk box, with code-signing EKU and no practical revocation path (nobody removes a stale
+> root, and self-signed roots aren't in any CRL users honour). Keep it in the CI secret and nowhere
+> else — not on a dev laptop. This is the trade for stability, and the reason attestation signing
+> (which chains to Microsoft and needs no root import at all) remains the real fix.
+
+Generating it — **run this yourself**, on a trusted Windows box, elevated:
+
+```powershell
+# 1. Create the cert. 10-year lifetime: an expired driver cert breaks INSTALLS on new machines, and
+#    rotating means every user picks up a new root anyway, so churn buys nothing here.
+$c = New-SelfSignedCertificate -Type CodeSigningCert -Subject 'CN=punktfunk-driver' `
+       -CertStoreLocation Cert:\CurrentUser\My -KeyExportPolicy Exportable `
+       -NotAfter (Get-Date).AddYears(10)
+$c.Thumbprint      # <- publish this: paste into the "Current fingerprint" line above + SECURITY.md
+
+# 2. Export it, protected by a strong random password.
+$pw = -join ((48..57) + (65..90) + (97..122) | Get-Random -Count 32 | % { [char]$_ })
+$sec = ConvertTo-SecureString $pw -AsPlainText -Force
+Export-PfxCertificate -Cert "Cert:\CurrentUser\My\$($c.Thumbprint)" -FilePath .\driver.pfx -Password $sec | Out-Null
+[Convert]::ToBase64String([IO.File]::ReadAllBytes('.\driver.pfx')) | Set-Clipboard   # -> DRIVER_CERT_PFX_B64
+$pw                # -> DRIVER_CERT_PASSWORD
+
+# 3. Add BOTH as Gitea Actions secrets (org level on `unom`, like RPM_GPG_PRIVATE_KEY, so any repo
+#    that builds drivers inherits them), then destroy the local copies:
+Remove-Item .\driver.pfx -Force
+Remove-Item "Cert:\CurrentUser\My\$($c.Thumbprint)" -Force
+```
+
+Keep an offline backup of the .pfx + password somewhere you'd keep a signing key. Losing it means
+the next release ships a cert nobody has trusted before, and every user's installer adds a second
+root — recoverable, but only by re-running the install.
+
 ## Dev iteration on the test box (driver)
 
 Two helpers wrap the painful manual steps of iterating on the pf-vdisplay driver against a live host

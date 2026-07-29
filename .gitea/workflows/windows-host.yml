@@ -352,6 +352,12 @@ jobs:
         env:
           MSIX_CERT_PFX_B64: ${{ secrets.MSIX_CERT_PFX_B64 }}
           MSIX_CERT_PASSWORD: ${{ secrets.MSIX_CERT_PASSWORD }}
+          # The DRIVER cert is separate from the host/MSIX one and reaches the two driver build
+          # scripts through the environment (pack-host-installer.ps1 invokes them, they read
+          # $env:DRIVER_CERT_PFX_B64 themselves). Without it they sign with a per-build throwaway,
+          # which the installer then trusts as a machine root — see packaging/windows/README.md.
+          DRIVER_CERT_PFX_B64: ${{ secrets.DRIVER_CERT_PFX_B64 }}
+          DRIVER_CERT_PASSWORD: ${{ secrets.DRIVER_CERT_PASSWORD }}
         run: |
           & packaging/windows/pack-host-installer.ps1 `
             -Version $env:HOST_VERSION -TargetDir C:\t\release -OutDir C:\t\out

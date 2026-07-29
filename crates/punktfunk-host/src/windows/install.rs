@@ -74,6 +74,40 @@ fn driver_install(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// The subject CN both driver-signing certs carry (`build-pf-vdisplay.ps1` /
+/// `build-gamepad-drivers.ps1`). certutil matches a CertId against the subject, so this is how we
+/// find our own certs again without parsing any localized output — see `purge_driver_certs`.
+const DRIVER_CERT_CN: &str = "punktfunk-driver";
+
+/// Remove every `CN=punktfunk-driver` cert this product ever added, from machine `Root` and
+/// `TrustedPublisher`.
+///
+/// Two reasons this has to exist. Uninstall used to leave the certs behind forever, so removing
+/// punktfunk left a trusted root CA on the machine — trust we asked for and then never gave back.
+/// And before the signing cert was stabilised, every BUILD minted a fresh throwaway cert, so each
+/// upgrade added two more roots under the same name; a box that has been upgraded a dozen times is
+/// carrying two dozen of them. Purging by subject rather than by thumbprint is what lets one
+/// install clean up the whole historical pile.
+///
+/// Deleting the root does NOT unload an already-installed driver: PnP validates the signature when
+/// the package is staged into the driver store, not on every load. So a purge is safe to run before
+/// re-adding the current cert.
+///
+/// Best-effort and silent, like everything else here. `certutil -delstore` deletes one match per
+/// call and fails once nothing matches, so loop until it stops succeeding — bounded, because a
+/// pathological store must not turn an uninstall into an infinite loop.
+fn purge_driver_certs() {
+    for store in ["Root", "TrustedPublisher"] {
+        let mut removed = 0;
+        while removed < 64 && run_quiet("certutil", &["-delstore", store, DRIVER_CERT_CN]) {
+            removed += 1;
+        }
+        if removed > 0 {
+            println!("removed {removed} stale '{DRIVER_CERT_CN}' cert(s) from {store}");
+        }
+    }
+}
+
 /// Trust the bundled self-signed driver cert: machine `Root` (so the chain validates) + `TrustedPublisher`
 /// (so PnP installs without a prompt).
 fn trust_cert(dir: &Path) {
@@ -99,6 +133,12 @@ fn install_pf_vdisplay(dir: &Path) -> Result<()> {
     if !inf.exists() {
         bail!("no pf_vdisplay.inf in {}", dir.display());
     }
+    // Sweep the old certs before adding the current one. Deliberately only on THIS path and not in
+    // `install_gamepad`: the installer runs pf-vdisplay first and gamepad second, so one purge here
+    // clears the pile and both trust_cert calls then add on top. Purging in both would have the
+    // gamepad leg delete the cert the vdisplay leg just installed whenever the two bundles carry
+    // different certs — which is exactly what a canary build's per-build fallback certs are.
+    purge_driver_certs();
     trust_cert(dir);
     // Create the ROOT device node only if absent (a blind re-create spawns a phantom duplicate, and the
     // host binds interface index 0). ALWAYS nefconc (a clean ROOT\DISPLAY node), NEVER devgen (which makes
@@ -213,6 +253,11 @@ fn driver_uninstall(args: &[String]) -> Result<()> {
         // Same best-effort contract as install: never abort the (un)installer over a driver.
         eprintln!("warning: {what} driver uninstall: {e:#}");
     }
+    // Give back the trust we asked for. Here in the dispatcher rather than in the two uninstall
+    // bodies so it runs exactly once per invocation, and idempotently when the installer calls both
+    // legs back to back. Uninstalling punktfunk must not leave a trusted root CA behind — and this
+    // also collects the historical pile from the era when every build signed with a new cert.
+    purge_driver_certs();
     Ok(())
 }
 

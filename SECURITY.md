@@ -73,6 +73,14 @@ us beyond the download itself.
 - **Windows installers and MSIX packages** are Authenticode-signed; a release build that cannot
   reach its code-signing certificate fails to build rather than falling back to a self-signed one.
   Check with `Get-AuthenticodeSignature punktfunk-host-setup-1.2.3.exe`.
+- **The Windows drivers** (virtual display, virtual gamepads) are signed with a stable self-signed
+  certificate, `CN=punktfunk-driver`, whose fingerprint is published in
+  [`packaging/windows/README.md`](packaging/windows/README.md). The installer has to add it to the
+  machine's trusted roots for a self-signed driver to install at all, so — unlike the cases above —
+  this signature does **not** authenticate the download: it gives the drivers a stable publisher
+  identity you can compare against the published fingerprint, and it is removed again on uninstall.
+  Verify with `Get-AuthenticodeSignature` on the installed `pf_vdisplay.dll`, or list what is
+  trusted with `Get-ChildItem Cert:\LocalMachine\Root | ? Subject -like '*punktfunk*'`.
 
 A checksum on its own only tells you the download wasn't corrupted in transit — it says nothing
 about who produced the file, since anyone able to replace an artifact can replace its checksum.

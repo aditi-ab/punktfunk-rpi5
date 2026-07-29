@@ -29,6 +29,8 @@ param(
     [string]$DriverVer,                                   # default: 9.9.MMdd.HHmm (strictly-increasing)
     [string]$CertPfxB64 = $env:DRIVER_CERT_PFX_B64,       # optional stable driver-signing cert (CI secret)
     [string]$CertPassword = $env:DRIVER_CERT_PASSWORD,
+    # 'auto' (default) = required iff this is a v* tag build; 'true'/'false' to force. See below.
+    [ValidateSet('auto', 'true', 'false')][string]$RequireSignedCert = 'auto',
     [switch]$SkipBuild                                    # reuse an existing target\...\release\pf_vdisplay.dll
 )
 $ErrorActionPreference = 'Stop'
@@ -83,6 +85,13 @@ foreach ($t in @($signtool, $stampinf, $inf2cat)) {
 }
 
 # --- 3. signing cert (supplied stable pfx OR fresh self-signed) -------------------------------
+# FAIL CLOSED on a real release, same rule as the host/MSIX pack scripts. The fallback below mints
+# a cert per BUILD, and the installer trusts whatever .cer ships in the bundle — so the signature
+# proves nothing about origin, and each upgrade adds another self-signed root CA to the user's
+# machine under the same name. That is survivable for canary and dev builds; shipping it in a
+# release is not. ('auto' resolves from GITHUB_REF so a new workflow inherits the guard.)
+$requireCert = if ($RequireSignedCert -eq 'auto') { $env:GITHUB_REF -like 'refs/tags/v*' }
+               else { [Convert]::ToBoolean($RequireSignedCert) }
 $cleanupCert = $null
 if ($CertPfxB64) {
     Write-Host '==> signing with supplied driver cert (DRIVER_CERT_PFX_B64)'
@@ -91,6 +100,11 @@ if ($CertPfxB64) {
     $sec = if ($CertPassword) { ConvertTo-SecureString $CertPassword -AsPlainText -Force } else { $null }
     $signArgs = @('/f', $pfx); if ($CertPassword) { $signArgs += @('/p', $CertPassword) }
     $pubForCer = if ($sec) { Get-PfxCertificate -FilePath $pfx -Password $sec } else { Get-PfxCertificate -FilePath $pfx }
+}
+elseif ($requireCert) {
+    throw ("release build ($env:GITHUB_REF) with no DRIVER_CERT_PFX_B64 — refusing to sign drivers " +
+           "with a per-build throwaway cert. Set the DRIVER_CERT_PFX_B64 / DRIVER_CERT_PASSWORD " +
+           "secrets (packaging/windows/README.md), or pass -RequireSignedCert false for a test build.")
 }
 else {
     Write-Host '==> no DRIVER_CERT_PFX_B64 -> generating a fresh self-signed driver cert (the installer trusts the bundled .cer at install time)'
