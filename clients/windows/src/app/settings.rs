@@ -1448,8 +1448,11 @@ pub(crate) fn settings_page(
             let ss = set_screen.clone();
             move || ss.call(Screen::Hosts)
         });
-    // The Edit-profile modal overlays the whole NavigationView (scrim + card), and the delete
-    // confirmation — a ContentDialog, so its own WinUI layer — can sit above either.
+    // One grid, so every layer FILLS the window (a vstack would hand the NavigationView its
+    // desired height — clipped when the window is short, floating when it is tall): the nav,
+    // the Edit-profile scrim + card over it, and the delete confirmation (a ContentDialog,
+    // its own WinUI layer, so its slot in the cell is irrelevant — it just needs to be in
+    // the tree).
     let mut layers: Vec<Element> = vec![nav.into()];
     if edit_open {
         if let Some(p) = &active {
@@ -1458,9 +1461,8 @@ pub(crate) fn settings_page(
             ));
         }
     }
-    let mut surface: Vec<Element> = vec![grid(layers).into()];
     if let Some(dialog) = confirm {
-        surface.push(dialog);
+        layers.push(dialog);
     }
-    vstack(surface).into()
+    grid(layers).into()
 }
