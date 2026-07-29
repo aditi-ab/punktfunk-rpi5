@@ -64,8 +64,19 @@ jobs:
     container:
       # Fedora ships a recent flatpak + flatpak-builder + the kernel userns support.
       # --privileged is required for bubblewrap inside the Docker executor (see header).
+      #
+      # --network host is what finally fixed the years-long "Could not resolve
+      # hostname" on every flathub fetch. MEASURED 2026-07-30 on home-runner-2, all
+      # in ONE container: `getent hosts dl.flathub.org` resolved, `curl` got HTTP
+      # 200 (both auto and -4), and flatpak still failed error [6] — so it was never
+      # DNS config, the resolver, the docker version, or the per-job network. It is
+      # ostree's own resolver refusing to work through Docker's embedded 127.0.0.11
+      # (proven: rewriting resolv.conf to a real nameserver did NOT help, and the
+      # default bridge failed too, while the host netns — no embedded resolver in the
+      # path at all — works every time). Host networking also means this job no
+      # longer needs the nsswitch surgery below to be lucky.
       image: fedora:43
-      options: --privileged
+      options: --privileged --network host
     steps:
       # DNS fix — MUST run before any network step. fedora:43's nsswitch.conf is
       # `hosts: files myhostname resolve [!UNAVAIL=return] dns`: the `resolve`
