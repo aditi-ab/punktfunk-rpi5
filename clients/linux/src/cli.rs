@@ -531,6 +531,9 @@ pub fn run_shot(ctx: &ShotCtx, scene: &str) {
                 "00aabbccddeeff112233445566778899a0b1c2d3e4f5061728394a5b6c7d8e9f",
             )));
         }
+        "about" | "08-about" => {
+            crate::ui_settings::show_about(&ctx.window);
+        }
         "settings" | "03-settings" => {
             // Mock devices so the shot shows the probe-dependent pickers populated.
             let dev = |name: &str, description: &str| pf_client_core::audio::AudioDevice {

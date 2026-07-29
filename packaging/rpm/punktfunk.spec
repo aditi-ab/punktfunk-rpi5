@@ -331,6 +331,10 @@ install -Dm0755 target/release/punktfunk-session %{buildroot}%{_bindir}/punktfun
 install -Dm0755 target/release/punktfunk %{buildroot}%{_bindir}/punktfunk
 install -Dm0644 packaging/linux/io.unom.Punktfunk.desktop \
                 %{buildroot}%{_datadir}/applications/io.unom.Punktfunk.desktop
+# The app icon the desktop entry (and the About dialog) name. Without it the launcher falls
+# back to a generic monitor glyph, which is what shipped until now.
+install -Dm0644 packaging/linux/icons/hicolor/scalable/apps/io.unom.Punktfunk.svg \
+                %{buildroot}%{_datadir}/icons/hicolor/scalable/apps/io.unom.Punktfunk.svg
 # DualSense hidraw access (full pad fidelity through SDL's HIDAPI driver).
 install -Dm0644 scripts/70-punktfunk-client.rules \
                 %{buildroot}%{_udevrulesdir}/70-punktfunk-client.rules
@@ -447,6 +451,7 @@ install -Dm0644 scripts/punktfunk-scripting.service %{buildroot}%{_userunitdir}/
 %{_bindir}/punktfunk-client
 %{_bindir}/punktfunk-session
 %{_datadir}/applications/io.unom.Punktfunk.desktop
+%{_datadir}/icons/hicolor/scalable/apps/io.unom.Punktfunk.svg
 %{_udevrulesdir}/70-punktfunk-client.rules
 %{_prefix}/lib/sysctl.d/99-punktfunk-client-net.conf
 

@@ -258,6 +258,10 @@ in
         # hidraw access for the seated user's DualSense (SDL HIDAPI full-fidelity path).
         install -Dm0644 scripts/70-punktfunk-client.rules "$out/lib/udev/rules.d/70-punktfunk-client.rules"
 
+        # The app icon the desktop entry (and the About dialog) name.
+        install -Dm0644 packaging/linux/icons/hicolor/scalable/apps/io.unom.Punktfunk.svg \
+          "$out/share/icons/hicolor/scalable/apps/io.unom.Punktfunk.svg"
+
         # Desktop launcher — point Exec at the store binary (wrapped below).
         install -Dm0644 packaging/linux/io.unom.Punktfunk.desktop \
           "$out/share/applications/io.unom.Punktfunk.desktop"

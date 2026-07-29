@@ -235,7 +235,9 @@ modules:
       - install -Dm0644 packaging/flatpak/io.unom.Punktfunk.metainfo.xml
           ${FLATPAK_DEST}/share/metainfo/io.unom.Punktfunk.metainfo.xml
       # Scalable icon named for the app id (GNOME runtime renders SVG via librsvg).
-      - install -Dm0644 packaging/flatpak/io.unom.Punktfunk.svg
+      # One icon source for every Linux packaging (it used to live under packaging/flatpak,
+      # which is why the deb/rpm/arch entries shipped a stock `video-display` instead).
+      - install -Dm0644 packaging/linux/icons/hicolor/scalable/apps/io.unom.Punktfunk.svg
           ${FLATPAK_DEST}/share/icons/hicolor/scalable/apps/io.unom.Punktfunk.svg
     sources:
       # The repo checkout. For a Flathub/published build, replace with a pinned git source:
