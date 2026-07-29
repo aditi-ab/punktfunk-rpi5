@@ -275,7 +275,6 @@ extension SettingsView {
                 .accessibilityLabel("Reset to Default settings")
                 .help("Stop overriding this — follow Default settings again")
             }
-            .frame(maxWidth: 360, alignment: .leading) // the described-row caption's line cap
         }
     }
 

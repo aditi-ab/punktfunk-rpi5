@@ -94,7 +94,7 @@ extension SettingsView {
                 .font(.geist(13, relativeTo: .footnote))
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
-                .frame(maxWidth: 360, alignment: .leading) // match the described-row caption cap
+                .modifier(CaptionWidth()) // the same reading cap + control column as `described`
         }
     }
 
@@ -134,6 +134,7 @@ extension SettingsView {
                 .labelsHidden()
                 .pickerStyle(.segmented)
                 overrideMarker("refresh_hz")
+                    .modifier(CaptionWidth())
             }
         } else {
             // A device with a single supported rate (e.g. 60 Hz) has nothing to pick.

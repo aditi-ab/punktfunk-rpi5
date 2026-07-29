@@ -8,6 +8,33 @@ import AppKit
 import PunktfunkKit
 import SwiftUI
 
+/// How wide a `described` row's caption (and its override marker) may run.
+///
+/// Two limits, because they solve different problems. The 360pt CAP is about reading: past roughly
+/// 46 characters a line stops scanning well, and on a wide Mac window or an iPad detail pane an
+/// uncapped caption runs the full cell. The trailing INSET is about collision: an iOS grouped row
+/// puts its switch or value about 60pt in from the trailing edge, and a caption laid out to the
+/// full cell width runs its last line straight under that control — which is what the cap alone
+/// never fixed, because an iPhone cell is narrower than the cap in the first place.
+struct CaptionWidth: ViewModifier {
+    #if os(iOS)
+    /// Reserve the control column. Sized to a `UISwitch` (51pt) plus breathing room — the widest
+    /// of the trailing accessories these rows use.
+    private static let trailingInset: CGFloat = 60
+    #else
+    // macOS lays the control out inline and its cells are wider than the cap; nothing to clear.
+    private static let trailingInset: CGFloat = 0
+    #endif
+
+    func body(content: Content) -> some View {
+        content
+            // Order matters: the padding shrinks what the text is offered, THEN the cap applies —
+            // so a narrow phone cell reserves the control column and a wide pane still caps.
+            .padding(.trailing, Self.trailingInset)
+            .frame(maxWidth: 360, alignment: .leading)
+    }
+}
+
 extension SettingsView {
     // MARK: - Described rows (the 2026-07 revamp's field idiom)
 
@@ -25,17 +52,17 @@ extension SettingsView {
     ) -> some View {
         VStack(alignment: .leading, spacing: 5) {
             content()
-            Text(caption)
-                .font(.geist(13, relativeTo: .footnote))
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true) // wrap, never truncate, in Form cells
-                // Cap the caption's line length well short of the cell: a full-width caption runs
-                // its text right up to the control column (toggles especially), reading as one
-                // colliding block. ~46 chars/line also just measures better.
-                .frame(maxWidth: 360, alignment: .leading)
-            if let field {
-                overrideMarker(field)
+            VStack(alignment: .leading, spacing: 5) {
+                Text(caption)
+                    .font(.geist(13, relativeTo: .footnote))
+                    .foregroundStyle(.secondary)
+                    // Wrap, never truncate, in Form cells.
+                    .fixedSize(horizontal: false, vertical: true)
+                if let field {
+                    overrideMarker(field)
+                }
             }
+            .modifier(CaptionWidth())
         }
         .padding(.vertical, 2)
     }
