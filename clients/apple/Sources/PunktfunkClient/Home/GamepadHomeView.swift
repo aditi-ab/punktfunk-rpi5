@@ -42,6 +42,9 @@ private struct HomeTile: Identifiable {
     /// The profile this tile connects with — shown as a tinted chip. Set on a pinned card; nil on
     /// a plain host tile unless the host is bound to one (then it answers "what will A do?").
     var profile: StreamProfile?
+    /// This tile IS a pinned host+profile card, not a host wearing its binding's chip — the chip
+    /// reads loud on the former (it is the reason the tile exists) and quiet on the latter.
+    var isPinnedCard = false
     var isOnline = false
     var isPaired = false
     var isConnecting = false
@@ -273,6 +276,7 @@ struct GamepadHomeView: View {
                     title: host.displayName,
                     subtitle: "\(host.address):\(String(host.port))",
                     profile: profile ?? bound,
+                    isPinnedCard: profile != nil,
                     isOnline: online,
                     isPaired: host.pinnedSHA256 != nil,
                     isConnecting: connecting,
@@ -374,7 +378,8 @@ private struct GamepadHostTile: View {
                 .lineLimit(1)
                 .minimumScaleFactor(0.7)
             if let profile = tile.profile {
-                ProfileChip(profile: profile, size: Self.statusFont, prominent: true)
+                ProfileChip(
+                    profile: profile, size: Self.statusFont, prominent: tile.isPinnedCard)
                     .padding(.top, 4)
             }
             Text(tile.subtitle)

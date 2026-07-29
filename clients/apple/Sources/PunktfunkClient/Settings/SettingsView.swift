@@ -29,6 +29,9 @@ struct SettingsView: View {
     @State var nameAction: ProfileNameAction?
     @State var nameDraft = ""
     @State var profilePendingDelete: StreamProfile?
+    #if os(macOS)
+    @State private var macTab: MacTab = .general
+    #endif
     @AppStorage(DefaultsKey.streamWidth) var width = 1920
     @AppStorage(DefaultsKey.streamHeight) var height = 1080
     @AppStorage(DefaultsKey.streamHz) var hz = 60
@@ -133,14 +136,24 @@ struct SettingsView: View {
     // MARK: - macOS: tabbed preferences
 
     #if os(macOS)
+    /// The preferences tabs, tagged so the scope control can sit out the one page that isn't a
+    /// settings layer at all.
+    private enum MacTab: Hashable {
+        case general, display, input, audio, controllers, about
+    }
+
     private var macBody: some View {
         // The scope control heads the window — above the tabs, because it is about which layer
-        // every tab is editing, not about any one of them.
+        // every tab is editing, not about any one of them. About is the exception: it edits
+        // nothing, and directly above the acknowledgements the switcher read as belonging to
+        // them.
         VStack(alignment: .leading, spacing: 0) {
-            scopeSwitcher
-                .padding(.horizontal, 20)
-                .padding(.top, 14)
-                .padding(.bottom, 10)
+            if macTab != .about {
+                scopeSwitcher
+                    .padding(.horizontal, 20)
+                    .padding(.top, 14)
+                    .padding(.bottom, 10)
+            }
             macTabs
         }
         .frame(width: 500, height: 580)
@@ -149,7 +162,7 @@ struct SettingsView: View {
     private var macTabs: some View {
         // Tab map mirrors SettingsCategory: General = session/app behavior, Display = the whole
         // picture (resolution lives here), Input = keyboard & mouse.
-        TabView {
+        TabView(selection: $macTab) {
             Form {
                 sessionSection
                 overlaySection
@@ -157,6 +170,7 @@ struct SettingsView: View {
             }
             .formStyle(.grouped)
             .tabItem { Label("General", systemImage: "gearshape") }
+            .tag(MacTab.general)
 
             Form {
                 resolutionSection
@@ -166,12 +180,14 @@ struct SettingsView: View {
             }
             .formStyle(.grouped)
             .tabItem { Label("Display", systemImage: "display") }
+            .tag(MacTab.display)
 
             Form {
                 inputSection
             }
             .formStyle(.grouped)
             .tabItem { Label("Input", systemImage: "keyboard") }
+            .tag(MacTab.input)
 
             Form {
                 audioSection
@@ -188,6 +204,7 @@ struct SettingsView: View {
                 if micChannel > micChannelCount { micChannel = 0 }
             }
             .tabItem { Label("Audio", systemImage: "speaker.wave.2") }
+            .tag(MacTab.audio)
 
             Form {
                 controllersSection
@@ -199,9 +216,11 @@ struct SettingsView: View {
             }
             .onDisappear { gamepads.stopDiscovery() }
             .tabItem { Label("Controllers", systemImage: "gamecontroller") }
+            .tag(MacTab.controllers)
 
             AcknowledgementsView()
                 .tabItem { Label("About", systemImage: "info.circle") }
+                .tag(MacTab.about)
         }
     }
     #endif

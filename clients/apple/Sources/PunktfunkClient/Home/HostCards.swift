@@ -135,12 +135,23 @@ struct HostCardView: View {
             HStack(spacing: m.spacing) {
                 monogramTile(monogram(host.displayName), m: m, connecting: isConnecting, filled: true)
                 VStack(alignment: .leading, spacing: 4) {
-                    Text(host.displayName)
-                        .font(.geist(m.name, .bold, relativeTo: .title3))
-                        .foregroundStyle(.primary)
-                        .lineLimit(1)
-                    if let profile = shownProfile {
-                        ProfileChip(profile: profile, size: m.status, prominent: pinnedProfile != nil)
+                    // The chip rides the TITLE line rather than a line of its own: a card with a
+                    // profile and one without have to be the same height, or a pinned card sticks
+                    // out of its row in the grid. Beside the name is also where it reads as "this
+                    // card connects with that", which is what it means.
+                    HStack(spacing: 6) {
+                        Text(host.displayName)
+                            .font(.geist(m.name, .bold, relativeTo: .title3))
+                            .foregroundStyle(.primary)
+                            .lineLimit(1)
+                        if let profile = shownProfile {
+                            ProfileChip(
+                                profile: profile, size: m.status,
+                                prominent: pinnedProfile != nil)
+                                // The chip is the shorter, more compressible of the two; let the
+                                // host name give up its width first only after the chip has.
+                                .layoutPriority(1)
+                        }
                     }
                     Text("\(host.address):\(String(host.port))")
                         .font(.geist(m.meta, relativeTo: .caption))
@@ -301,6 +312,9 @@ struct HostCardView: View {
 /// The profile a card connects with, as a tinted pill. Quiet on a bound primary card (it only
 /// answers "what will a click do?"); prominent on a pinned card, where the profile IS the reason
 /// the card exists — which is where the catalog's `accent` earns its keep.
+///
+/// Prominence is fill and weight only, never TYPE SIZE: the chip sits on the card's title line,
+/// and a chip taller than the name would make pinned cards taller than their host's.
 struct ProfileChip: View {
     let profile: StreamProfile
     let size: CGFloat
@@ -314,13 +328,13 @@ struct ProfileChip: View {
                 .frame(width: size * 0.55, height: size * 0.55)
                 .accessibilityHidden(true) // the name is right there
             Text(profile.name)
-                .font(.geist(prominent ? size + 2 : size, .semibold, relativeTo: .caption2))
+                .font(.geist(size, prominent ? .bold : .semibold, relativeTo: .caption2))
                 .lineLimit(1)
         }
         .foregroundStyle(tint)
         .padding(.horizontal, 7)
         .padding(.vertical, 2)
-        .background(Capsule().fill(tint.opacity(prominent ? 0.22 : 0.13)))
+        .background(Capsule().fill(tint.opacity(prominent ? 0.24 : 0.12)))
         .accessibilityLabel("Profile \(profile.name)")
     }
 }

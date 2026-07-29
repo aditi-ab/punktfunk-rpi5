@@ -244,9 +244,13 @@ extension SettingsView {
         profiles.clearOverride(id, field: name)
     }
 
-    /// The accent dot + "Reset" affordance a row carries while it overrides the defaults. Rendered
+    /// The accent dot + Reset affordance a row carries while it overrides the defaults. Rendered
     /// inside `described`'s caption line, so it sits with the row it belongs to instead of in some
     /// separate list of exceptions.
+    ///
+    /// Reset is a BORDERED control pushed to the far edge, not tinted text next to the label: as a
+    /// plain button it read as a third word of the notice, and the one action that can undo an
+    /// override must not look like prose.
     @ViewBuilder
     func overrideMarker(_ name: String) -> some View {
         if isOverridden(name) {
@@ -259,12 +263,19 @@ extension SettingsView {
                 Text("Overrides Default settings")
                     .font(.geist(12, .medium, relativeTo: .caption2))
                     .foregroundStyle(Color.brand)
-                Button("Reset") { resetOverride(name) }
-                    .buttonStyle(.plain)
-                    .font(.geist(12, .medium, relativeTo: .caption2))
-                    .foregroundStyle(.tint)
-                    .accessibilityLabel("Reset to Default settings")
+                Spacer(minLength: 12)
+                Button {
+                    resetOverride(name)
+                } label: {
+                    Label("Reset", systemImage: "arrow.uturn.backward")
+                        .font(.geist(11, .medium, relativeTo: .caption2))
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .accessibilityLabel("Reset to Default settings")
+                .help("Stop overriding this — follow Default settings again")
             }
+            .frame(maxWidth: 360, alignment: .leading) // the described-row caption's line cap
         }
     }
 
