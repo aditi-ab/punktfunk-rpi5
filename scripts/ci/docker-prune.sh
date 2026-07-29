@@ -19,7 +19,13 @@ export PATH=/usr/bin:/bin:/usr/local/bin:$PATH
 CACHE_DIR=${CACHE_DIR:-/home/runner/gitea-runner-fleet/cache}
 CAP_MB=${CAP_MB:-20000}                 # clear the cache store once it exceeds ~20 GB
 BURST_PCT=${BURST_PCT:-80}              # full clear once the disk is this % full
-MIN_FREE_GB=${MIN_FREE_GB:-45}          # ...or this little is left, whichever trips first
+MIN_FREE_GB=${MIN_FREE_GB:-60}          # ...or this little is left, whichever trips first.
+                                        # 60, not 45: this has to fire BEFORE the disk is
+                                        # actually tight, because the clear only reclaims idle
+                                        # images (~18 G) while three concurrent jobs can eat
+                                        # the remainder inside one poll interval. Measured
+                                        # 2026-07-29: zero burst clears fired in six hours
+                                        # while deb still died of ENOSPC between polls.
 
 # 1) Routine: trim aged images / build cache / stopped containers. sha-<commit> tags aren't
 #    dangling, so -a is required. until=2h, not 6h: on a busy day every image is younger than six

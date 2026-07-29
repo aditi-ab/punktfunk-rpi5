@@ -1,8 +1,11 @@
-# Runs docker-prune.service every 10 min. It was every 30, and that is how the burst guard never
-# fired once: three concurrent Rust builds fill the disk and drain it again well inside a 30-minute
-# window, so the poll kept landing on a healthy `df` while jobs died of ENOSPC in between. (An arch
-# build failed with `as: BFD assertion fail` — assembler noise for "can't write, No space left on
-# device" — and by the time anyone looked, the disk was back to 37% used.)
+# Runs docker-prune.service every 2 min. It was 30, then 10, and BOTH still lost the race: measured
+# over six hours on 2026-07-29 the burst guard fired zero times while deb died of ENOSPC between
+# polls, because three concurrent Rust builds fill the disk and drain it again inside the interval.
+# (The arch symptom is `as: BFD assertion fail` — assembler noise for "can't write, No space left on
+# device" — and by the time anyone looks, df is back under 40% used.)
+#
+# Every 2 min is affordable: the script is a handful of docker calls and no-ops in about a second
+# when there is nothing to reclaim.
 #
 # Ten minutes is a backstop, not the fix. The fix was capacity: the LXC rootfs went 123 G -> 175 G
 # on 2026-07-29 (`pct resize 116 rootfs +50G` on home-node-1), which is what actually gives three
@@ -10,11 +13,11 @@
 # Persistent=true catches up after downtime. Install: see the header of docker-prune.service.
 
 [Unit]
-Description=Run docker-prune every 10 min (CI runner disk hygiene + cache cap + burst guard)
+Description=Run docker-prune every 2 min (CI runner disk hygiene + cache cap + burst guard)
 
 [Timer]
-OnCalendar=*:0/10
-RandomizedDelaySec=30
+OnCalendar=*:0/2
+RandomizedDelaySec=10
 Persistent=true
 
 [Install]
