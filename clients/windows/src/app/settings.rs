@@ -393,6 +393,7 @@ struct OverrideFlags {
     bitrate_kbps: bool,
     codec: bool,
     hdr_enabled: bool,
+    enable_444: bool,
     compositor: bool,
     audio_channels: bool,
     mic_enabled: bool,
@@ -419,6 +420,7 @@ impl OverrideFlags {
             bitrate_kbps: o.bitrate_kbps.is_some(),
             codec: o.codec.is_some(),
             hdr_enabled: o.hdr_enabled.is_some(),
+            enable_444: o.enable_444.is_some(),
             compositor: o.compositor.is_some(),
             audio_channels: o.audio_channels.is_some(),
             mic_enabled: o.mic_enabled.is_some(),
@@ -511,8 +513,29 @@ fn described_overridable(
     control: impl Into<Element>,
     caption: &str,
 ) -> Element {
-    if scope.is_empty() || !overridden {
+    if scope.is_empty() {
         return described(control, caption);
+    }
+    // Nothing that appears on an edit may move what was edited (the GTK client's rule,
+    // learned there the hard way): both states of a profile-scope row reserve the same
+    // caption-line height, so the marker + Reset materialise IN PLACE instead of shoving
+    // every row below them down by a button's height.
+    const CAPTION_MIN_H: f64 = 34.0;
+    if !overridden {
+        return vstack((
+            control.into(),
+            hstack(vec![text_block(caption)
+                .font_size(12.0)
+                .foreground(ThemeRef::SecondaryText)
+                .wrap()
+                .max_width(420.0)
+                .horizontal_alignment(HorizontalAlignment::Left)
+                .vertical_alignment(VerticalAlignment::Center)
+                .into()])
+            .min_height(CAPTION_MIN_H),
+        ))
+        .spacing(5.0)
+        .into();
     }
     let (rev, set_rev) = (rev.0, rev.1.clone());
     let scope = scope.to_string();
@@ -524,7 +547,8 @@ fn described_overridable(
                 .foreground(ThemeRef::AccentText)
                 .wrap()
                 .max_width(360.0)
-                .horizontal_alignment(HorizontalAlignment::Left),
+                .horizontal_alignment(HorizontalAlignment::Left)
+                .vertical_alignment(VerticalAlignment::Center),
             button("Reset").on_click(move || {
                 let mut catalog = ProfilesFile::load();
                 if let Some(p) = catalog.profiles.iter_mut().find(|p| p.id == scope) {
@@ -539,7 +563,8 @@ fn described_overridable(
                 set_rev.call(rev + 1);
             }),
         ))
-        .spacing(8.0),
+        .spacing(8.0)
+        .min_height(CAPTION_MIN_H),
     ))
     .spacing(5.0)
     .into()
@@ -827,6 +852,14 @@ pub(crate) fn settings_page(
         s.hdr_enabled,
         |s, on| s.hdr_enabled = on,
     );
+    let chroma_toggle = setting_toggle(
+        ctx,
+        scope,
+        (rev, set_rev),
+        "Full chroma (4:4:4)",
+        s.enable_444,
+        |s, on| s.enable_444 = on,
+    );
 
     // --- Input -----------------------------------------------------------------------------
     // Controller forwarding: Automatic forwards EVERY real controller, each as its own pad;
@@ -1057,6 +1090,17 @@ pub(crate) fn settings_page(
                         hdr_toggle,
                         "HDR10, when the host has HDR content and this display supports it. \
                          HEVC only; otherwise the stream stays SDR.",
+                    ),
+                    // Wording shared with the GTK client (its chroma_row) — same setting,
+                    // same constraints.
+                    described_overridable(
+                        (rev, set_rev),
+                        scope,
+                        "enable_444",
+                        over.enable_444,
+                        chroma_toggle,
+                        "Full-colour video: crisp small text and thin lines, at more \
+                         bandwidth. HEVC only, and only where the host can encode it.",
                     ),
                 ],
                 None,
@@ -1580,4 +1624,43 @@ pub(crate) fn settings_page(
         layers.push(dialog);
     }
     grid(layers).into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pf_client_core::profiles::SettingsOverlay;
+
+    /// Every overlay field maps to its row flag — including the tri-state resolution
+    /// (any of width/height/match_window marks the one Resolution row) and the 4:4:4
+    /// switch added for GTK parity. A field that records without marking its row is the
+    /// original Overridden-row bug wearing a new face.
+    #[test]
+    fn override_flags_mirror_the_overlay() {
+        let none = OverrideFlags::of(None);
+        assert!(!none.resolution && !none.enable_444 && !none.codec);
+
+        let mut p = StreamProfile::new("t".to_string());
+        p.overrides = SettingsOverlay {
+            match_window: Some(true),
+            enable_444: Some(true),
+            codec: Some("hevc".into()),
+            bitrate_kbps: Some(20000),
+            ..Default::default()
+        };
+        let f = OverrideFlags::of(Some(&p));
+        assert!(f.resolution, "match_window alone marks the Resolution row");
+        assert!(f.enable_444);
+        assert!(f.codec);
+        assert!(f.bitrate_kbps);
+        assert!(!f.hdr_enabled && !f.compositor && !f.render_scale);
+
+        let mut p2 = StreamProfile::new("t2".to_string());
+        p2.overrides = SettingsOverlay {
+            width: Some(3840),
+            height: Some(2160),
+            ..Default::default()
+        };
+        assert!(OverrideFlags::of(Some(&p2)).resolution);
+    }
 }
