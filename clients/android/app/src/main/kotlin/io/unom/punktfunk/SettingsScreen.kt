@@ -20,9 +20,11 @@ import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -205,16 +207,17 @@ fun SettingsScreen(
                 }
             },
             onDelete = { deleting = active },
-            modifier = Modifier.padding(top = 12.dp, bottom = 4.dp),
+            modifier = Modifier.padding(top = 12.dp),
         )
         if (active != null) {
             Text(
                 "Overrides the default settings for hosts that use “${active.name}”.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.padding(horizontal = 20.dp, vertical = 4.dp),
+                modifier = Modifier.padding(start = 20.dp, end = 20.dp, top = 10.dp),
             )
         }
+        Spacer(Modifier.height(12.dp))
         HorizontalDivider()
 
         CompositionLocalProvider(
@@ -388,15 +391,26 @@ private fun DeviceScopeOnly(content: @Composable () -> Unit) {
 private fun OverrideBadge(field: String?) {
     val scope = LocalSettingsScope.current
     if (!scope.profileScope || field == null || field !in scope.overridden) return
+    // One compact line. A `TextButton` here carried its own 48dp touch target and dwarfed both the
+    // control it annotates and the caption under it; the reset keeps a generous padded hit area
+    // instead, which is the right trade for a secondary action inside a dense settings list.
     Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
-        AccentDot(MaterialTheme.colorScheme.primary, size = 8)
+        AccentDot(MaterialTheme.colorScheme.primary, size = 6)
         Text(
             "Overridden",
-            style = MaterialTheme.typography.labelMedium,
+            style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.primary,
             modifier = Modifier.padding(start = 6.dp).weight(1f),
         )
-        TextButton(onClick = { scope.onReset(field) }) { Text("Reset to default") }
+        Text(
+            "Reset",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.primary,
+            modifier = Modifier
+                .clip(RoundedCornerShape(6.dp))
+                .clickable { scope.onReset(field) }
+                .padding(horizontal = 10.dp, vertical = 6.dp),
+        )
     }
 }
 
@@ -517,9 +531,8 @@ private fun GeneralSettings(s: Settings, update: (Settings) -> Unit) {
         SettingsGroup("Session") {
             ToggleRow(
                 title = "Auto-wake on connect",
-                subtitle = "Connecting to a saved host that isn't seen on the network sends " +
-                    "Wake-on-LAN and waits for it to boot. Turn off if hosts behind a VPN look " +
-                    "offline when they aren't — connects then go straight through.",
+                subtitle = "Wake a sleeping saved host before connecting. Turn off if hosts " +
+                    "behind a VPN look offline when they aren't.",
                 checked = s.autoWakeEnabled,
                 onCheckedChange = { on -> update(s.copy(autoWakeEnabled = on)) },
             )
@@ -531,18 +544,15 @@ private fun GeneralSettings(s: Settings, update: (Settings) -> Unit) {
             options = STATS_VERBOSITY_OPTIONS,
             selected = s.statsVerbosity,
             field = "stats_verbosity",
-            caption = "Live session stats in a corner overlay — Compact is a single " +
-                "fps · latency · bitrate line, Normal adds the resolution and reliability lines, " +
-                "Detailed adds the decoder, colour and latency-breakdown lines. A 3-finger tap " +
-                "cycles the tiers live.",
+            caption = "Compact is one line; Detailed adds the decoder and latency breakdown. " +
+                "A 3-finger tap cycles the tiers in-stream.",
         ) { v -> update(s.copy(statsVerbosity = v)) }
     }
     DeviceScopeOnly {
         SettingsGroup("Library") {
             ToggleRow(
                 title = "Game library",
-                subtitle = "Browse a paired host's Steam and custom games and launch one directly " +
-                    "(press Y on a saved host). No extra host setup.",
+                subtitle = "Browse a paired host's games and launch one directly.",
                 checked = s.libraryEnabled,
                 onCheckedChange = { on -> update(s.copy(libraryEnabled = on)) },
             )
@@ -550,8 +560,8 @@ private fun GeneralSettings(s: Settings, update: (Settings) -> Unit) {
         SettingsGroup("Interface") {
             ToggleRow(
                 title = "Controller-optimized UI",
-                subtitle = "Switch to the console home (host carousel) whenever a controller is " +
-                    "connected. Turn off to keep the touch interface. A TV is always in this mode.",
+                subtitle = "Switch to the console home when a controller is connected. A TV " +
+                    "always uses it.",
                 checked = s.gamepadUiEnabled,
                 onCheckedChange = { on -> update(s.copy(gamepadUiEnabled = on)) },
             )
@@ -576,8 +586,8 @@ private fun DisplaySettings(s: Settings, update: (Settings) -> Unit, context: an
                 ((-1 to -1) to if (s.isCustomResolution()) "Custom (${s.width} × ${s.height})" else "Custom…"),
             selected = if (showCustom) -1 to -1 else s.width to s.height,
             field = SettingsOverlay.FIELD_RESOLUTION,
-            caption = "The host drives a real virtual output at exactly this size — true pixels, " +
-                "no scaling. “Native display” follows this device's panel.",
+            caption = "The host makes a display exactly this size — no scaling. Native follows " +
+                "this device's panel.",
         ) { (w, h) ->
             if (w < 0) {
                 // Seed from the current *effective* size so the fields start from something
@@ -605,7 +615,7 @@ private fun DisplaySettings(s: Settings, update: (Settings) -> Unit, context: an
             options = REFRESH_OPTIONS.map { (hz, lbl) -> hz to (if (hz == 0) "$lbl ($nhz Hz)" else lbl) },
             selected = s.hz,
             field = "refresh_hz",
-            caption = "“Native” resolves to this display's refresh rate at connect.",
+            caption = "Native follows this device's refresh rate.",
         ) { hz -> update(s.copy(hz = hz)) }
     }
 
@@ -617,9 +627,8 @@ private fun DisplaySettings(s: Settings, update: (Settings) -> Unit, context: an
             // exact Double keys match.
             selected = RenderScale.PRESETS.minByOrNull { kotlin.math.abs(it - s.renderScale) } ?: 1.0,
             field = "render_scale",
-            caption = "Above native supersamples for sharpness, at more bandwidth AND decode; " +
-                "below renders lighter on the host and the link. This device resamples the " +
-                "result to the screen.",
+            caption = "Above native is sharper but costs bandwidth and decode; below is " +
+                "lighter on the host.",
         ) { scale -> update(s.copy(renderScale = scale)) }
 
         SettingDropdown(
@@ -627,7 +636,7 @@ private fun DisplaySettings(s: Settings, update: (Settings) -> Unit, context: an
             options = BITRATE_OPTIONS,
             selected = s.bitrateKbps,
             field = "bitrate_kbps",
-            caption = "Automatic lets the host decide (its default, clamped to what it supports).",
+            caption = "Automatic lets the host decide.",
         ) { kbps -> update(s.copy(bitrateKbps = kbps)) }
 
         // Only codecs this device can actually decode are offered — a preference the client never
@@ -647,8 +656,7 @@ private fun DisplaySettings(s: Settings, update: (Settings) -> Unit, context: an
         ToggleRow(
             title = "HDR",
             subtitle = if (hdrCapable) {
-                "Stream 10-bit HDR (BT.2020 PQ) when the host has HDR content. HEVC only; " +
-                    "otherwise the stream stays SDR."
+                "10-bit HDR10, when the host has HDR content to send."
             } else {
                 "This display can't present HDR10 — streams stay SDR"
             },
@@ -666,9 +674,8 @@ private fun DisplaySettings(s: Settings, update: (Settings) -> Unit, context: an
     SettingsGroup("Decoding") {
         ToggleRow(
             title = "Low-latency mode",
-            subtitle = "The fast pipeline (async decode, per-device decoder selection, HDMI game " +
-                "mode). On by default — turn off to fall back to the plain decode path if the " +
-                "stream stutters or glitches on this device.",
+            subtitle = "The fast decode pipeline. Turn it off if the stream stutters or " +
+                "glitches on this device.",
             checked = s.lowLatencyMode,
             field = "low_latency_mode",
             onCheckedChange = { on -> update(s.copy(lowLatencyMode = on)) },
@@ -681,8 +688,7 @@ private fun DisplaySettings(s: Settings, update: (Settings) -> Unit, context: an
             options = COMPOSITOR_OPTIONS.mapIndexed { i, lbl -> i to lbl },
             selected = s.compositor,
             field = "compositor",
-            caption = "The backend the host uses for its virtual output (Linux hosts only). A " +
-                "specific choice falls back to auto-detection when that backend isn't available.",
+            caption = "Linux hosts only; falls back to auto-detection when unavailable.",
         ) { c -> update(s.copy(compositor = c)) }
     }
 }
@@ -695,10 +701,8 @@ private fun InputSettings(s: Settings, update: (Settings) -> Unit) {
             options = TOUCH_MODE_OPTIONS,
             selected = s.touchMode,
             field = "touch_mode",
-            caption = "Trackpad: relative cursor like a laptop touchpad — tap to click, " +
-                "two-finger tap right-clicks, two fingers scroll, tap-then-drag holds the " +
-                "button. Direct pointer: the cursor jumps to your finger. Touch passthrough: " +
-                "real multi-touch reaches the host, for apps that understand touch.",
+            caption = "Trackpad moves the cursor by relative swipes; Direct pointer jumps it " +
+                "to your finger; Passthrough sends real multi-touch.",
         ) { mode -> update(s.copy(touchMode = mode)) }
     }
     SettingsGroup("Keyboard & mouse") {
@@ -707,14 +711,12 @@ private fun InputSettings(s: Settings, update: (Settings) -> Unit) {
             options = MOUSE_MODE_OPTIONS,
             selected = s.mouseMode,
             field = "mouse_mode",
-            caption = "Capture locks a connected mouse to the stream and sends relative motion " +
-                "(mouse-look) — best for games; click the stream to re-capture. Desktop leaves " +
-                "the pointer free to enter and leave the stream and sends absolute positions — " +
-                "best for remote-desktop work. Ctrl+Alt+Shift+Q flips the capture live either way.",
+            caption = "Capture locks the pointer to the stream for mouse-look; Desktop leaves " +
+                "it free. Ctrl+Alt+Shift+Q flips it live.",
         ) { mode -> update(s.copy(mouseMode = mode)) }
         ToggleRow(
             title = "Invert scroll direction",
-            subtitle = "Reverses the wheel and two-finger touch scroll direction sent to the host",
+            subtitle = "Reverses wheel and two-finger scrolling",
             checked = s.invertScroll,
             field = "invert_scroll",
             onCheckedChange = { on -> update(s.copy(invertScroll = on)) },
@@ -732,12 +734,11 @@ private fun AudioSettings(s: Settings, update: (Settings) -> Unit, onMicChange: 
             options = AUDIO_CHANNEL_OPTIONS,
             selected = s.audioChannels,
             field = "audio_channels",
-            caption = "The speaker layout requested from the host. It downmixes if its own " +
-                "output has fewer channels.",
+            caption = "Requested from the host; it downmixes if it has fewer.",
         ) { ch -> update(s.copy(audioChannels = ch)) }
         ToggleRow(
             title = "Microphone",
-            subtitle = "This device's microphone feeds the host's virtual microphone",
+            subtitle = "Feeds this device's microphone to the host",
             checked = s.micEnabled,
             field = "mic_enabled",
             onCheckedChange = onMicChange,
@@ -753,9 +754,8 @@ private fun ControllerSettings(s: Settings, update: (Settings) -> Unit, onOpenCo
             options = GAMEPAD_OPTIONS,
             selected = s.gamepad,
             field = "gamepad",
-            caption = "The virtual pad created on the host. Automatic matches your controller — " +
-                "a DualSense keeps adaptive triggers, lightbar, touchpad and motion. Every " +
-                "connected controller is forwarded, each as its own player.",
+            caption = "The virtual pad the host creates. Automatic matches your controller; " +
+                "every connected one is forwarded as its own player.",
         ) { g -> update(s.copy(gamepad = g)) }
         DeviceScopeOnly {
             ClickableRow(
@@ -770,8 +770,7 @@ private fun ControllerSettings(s: Settings, update: (Settings) -> Unit, onOpenCo
             if (hasBodyVibrator) {
                 ToggleRow(
                     title = "Rumble on this phone",
-                    subtitle = "Also play controller 1's rumble on this phone's own vibration " +
-                        "motor — for clip-on pads without rumble motors",
+                    subtitle = "Also play controller 1's rumble on this phone's motor",
                     checked = s.rumbleOnPhone,
                     onCheckedChange = { on -> update(s.copy(rumbleOnPhone = on)) },
                 )
@@ -781,9 +780,8 @@ private fun ControllerSettings(s: Settings, update: (Settings) -> Unit, onOpenCo
             // that most want it — TV boxes, where a Steam Controller 2 is the whole input story.
             ToggleRow(
                 title = "Steam Controller 2 passthrough",
-                subtitle = "Capture a Steam Controller 2 (wired, Puck dongle, or paired " +
-                    "Bluetooth): it navigates these menus and streams as-is — Steam on the " +
-                    "host drives it like the physical pad (trackpads, gyro, haptics)",
+                subtitle = "Stream a Steam Controller 2 as-is — Steam on the host drives its " +
+                    "trackpads, gyro and haptics directly",
                 checked = s.sc2Capture,
                 onCheckedChange = { on -> update(s.copy(sc2Capture = on)) },
             )
