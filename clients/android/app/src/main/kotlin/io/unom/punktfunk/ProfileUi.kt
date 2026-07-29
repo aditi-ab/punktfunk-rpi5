@@ -11,15 +11,20 @@ import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ArrowDropDown
+import androidx.compose.material.icons.filled.Check
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.AssistChipDefaults
@@ -225,46 +230,139 @@ internal fun ProfileEditorFields(
                 MaterialTheme.colorScheme.onSurfaceVariant
             },
         )
-        FlowRow(
-            horizontalArrangement = Arrangement.spacedBy(10.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp),
+        Text(
+            "Colour",
+            style = MaterialTheme.typography.labelLarge,
+            modifier = Modifier.padding(top = 4.dp),
+        )
+        // A fixed 4×2 grid rather than a flow: eight colours wrapping to whatever fits the dialog
+        // landed 6-then-2, which reads as a mistake. Two even rows read as a palette. The order is
+        // the hue sweep from PROFILE_ACCENTS, so it looks like a spectrum rather than a bag.
+        //
+        // Each row FILLS the width, its swatches sharing it equally, so the palette's edges line up
+        // with the name field above it and every row is the same length. A fixed swatch size left
+        // the rows short of the dialog's edge and wrapped unevenly, which read as the grid having
+        // run out rather than as a deliberate block.
+        Column(
+            verticalArrangement = Arrangement.spacedBy(SWATCH_GAP),
+            modifier = Modifier.fillMaxWidth(),
         ) {
-            PROFILE_ACCENTS.forEach { hex ->
-                Swatch(
-                    colour = accentColor(hex),
-                    selected = accent?.equals(hex, ignoreCase = true) == true,
-                    onClick = { onAccentChange(hex) },
-                )
+            PROFILE_ACCENTS.chunked(SWATCHES_PER_ROW).forEach { row ->
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(SWATCH_GAP),
+                ) {
+                    row.forEach { hex ->
+                        Swatch(
+                            colour = accentColor(hex),
+                            selected = accent?.equals(hex, ignoreCase = true) == true,
+                            onClick = { onAccentChange(hex) },
+                            modifier = Modifier.weight(1f),
+                        )
+                    }
+                }
             }
-            // "No colour" is a real choice, not only an initial state: the chip then falls back to
-            // the theme's own accent, which is what a profile made before colours existed shows.
+        }
+        // "No colour" is a real choice, not only an initial state — the chip then falls back to the
+        // theme's own accent, which is what a profile made before colours existed shows. It sits
+        // apart from the grid and says so in words, rather than hiding as a ninth, colourless
+        // circle that breaks the palette's rhythm.
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(10.dp))
+                .clickable { onAccentChange(null) }
+                .padding(vertical = 4.dp),
+        ) {
             Swatch(colour = null, selected = accent == null, onClick = { onAccentChange(null) })
+            Text(
+                "No colour",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(start = 12.dp),
+            )
         }
     }
 }
 
-/** One colour choice: a filled disc, ringed when it is the current one. `null` = no colour. */
+/**
+ * One colour choice. The selected one keeps its size and grows a ring OUTSIDE the disc with a gap
+ * between the two, plus a check — a border drawn on the disc's own edge reads as a heavier circle
+ * rather than as a selection, and colour-plus-check survives a reader who can't tell two of these
+ * hues apart. The ring's space is always reserved, so picking never nudges the grid.
+ *
+ * `null` is "no colour": the surface's own variant, outlined so it reads as an empty slot rather
+ * than a dark swatch.
+ */
 @Composable
-internal fun Swatch(colour: Color?, selected: Boolean, onClick: () -> Unit) {
+internal fun Swatch(
+    colour: Color?,
+    selected: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier.size(SWATCH_TOTAL),
+) {
     val fill = colour ?: MaterialTheme.colorScheme.surfaceVariant
     Box(
-        Modifier
-            .size(36.dp)
+        modifier = modifier
+            .aspectRatio(1f)
             .clip(CircleShape)
-            .background(fill)
             .then(
                 if (selected) {
-                    Modifier.border(3.dp, MaterialTheme.colorScheme.onSurface, CircleShape)
-                } else if (colour == null) {
-                    Modifier.border(1.dp, MaterialTheme.colorScheme.outline, CircleShape)
+                    Modifier.border(2.dp, MaterialTheme.colorScheme.onSurface, CircleShape)
                 } else {
                     Modifier
                 },
             )
             .clickable(onClick = onClick)
             .semantics { contentDescription = if (colour == null) "No colour" else "Colour" },
-    )
+        contentAlignment = Alignment.Center,
+    ) {
+        Box(
+            Modifier
+                // Padding, not a fixed size: the disc has to scale with a swatch that shares its
+                // row's width, while the gap that makes the selection ring read stays constant.
+                .fillMaxSize()
+                .padding(RING_GAP)
+                .clip(CircleShape)
+                .background(fill)
+                .then(
+                    if (colour == null) {
+                        Modifier.border(1.dp, MaterialTheme.colorScheme.outline, CircleShape)
+                    } else {
+                        Modifier
+                    },
+                ),
+            contentAlignment = Alignment.Center,
+        ) {
+            if (selected) {
+                Icon(
+                    Icons.Filled.Check,
+                    contentDescription = null,
+                    modifier = Modifier.size(18.dp),
+                    // These hues are all light enough that a near-black check is the readable one;
+                    // the empty slot is dark, so it takes the surface's foreground instead.
+                    tint = if (colour == null) {
+                        MaterialTheme.colorScheme.onSurfaceVariant
+                    } else {
+                        Color(0xFF1B1633)
+                    },
+                )
+            }
+        }
+    }
 }
+
+/**
+ * The palette's geometry. [SWATCHES_PER_ROW] divides [PROFILE_ACCENTS] exactly — that is the whole
+ * reason the palette has ten colours — so both rows are full. [SWATCH_TOTAL] is only the fallback
+ * footprint for a swatch outside the grid (the "no colour" one); in the grid a swatch takes an
+ * equal share of the row instead.
+ */
+private const val SWATCHES_PER_ROW = 5
+private val SWATCH_TOTAL = 44.dp
+private val RING_GAP = 5.dp
+private val SWATCH_GAP = 10.dp
 
 /**
  * Deleting a profile is not destructive to anything but the profile — a host bound to it falls
