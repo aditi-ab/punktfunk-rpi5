@@ -274,7 +274,7 @@ fn edit_profile_modal(
         buttons.push(
             {
                 let (id, set_scope) = (id.clone(), set_scope.clone());
-                button("Duplicate").on_click(move || {
+                button("Duplicate").icon(Symbol::Copy).on_click(move || {
                     let mut catalog = ProfilesFile::load();
                     let Some(source) = catalog.find_by_id(&id).cloned() else {
                         return;
@@ -299,7 +299,9 @@ fn edit_profile_modal(
         buttons.push(
             {
                 let set_delete = set_delete.clone();
-                button("Delete\u{2026}").on_click(move || set_delete.call(Some(id.clone())))
+                button("Delete\u{2026}")
+                    .icon(Symbol::Delete)
+                    .on_click(move || set_delete.call(Some(id.clone())))
             }
             .into(),
         );
@@ -307,12 +309,15 @@ fn edit_profile_modal(
     buttons.push(
         {
             let (set_edit, set_rev) = (set_edit.clone(), set_rev.clone());
-            button("Close").accent().on_click(move || {
-                set_edit.call(false);
-                // The deferred repaint: the pane dropdown (and any pinned tiles) pick up the
-                // rename now, in one pass, instead of remounting per keystroke.
-                set_rev.call(rev + 1);
-            })
+            button("Close")
+                .accent()
+                .icon(Symbol::Accept)
+                .on_click(move || {
+                    set_edit.call(false);
+                    // The deferred repaint: the pane dropdown (and any pinned tiles) pick up the
+                    // rename now, in one pass, instead of remounting per keystroke.
+                    set_rev.call(rev + 1);
+                })
         }
         .into(),
     );
@@ -549,7 +554,7 @@ fn described_overridable(
                 .max_width(360.0)
                 .horizontal_alignment(HorizontalAlignment::Left)
                 .vertical_alignment(VerticalAlignment::Center),
-            button("Reset").on_click(move || {
+            button("Reset").icon(Symbol::Undo).on_click(move || {
                 let mut catalog = ProfilesFile::load();
                 if let Some(p) = catalog.profiles.iter_mut().find(|p| p.id == scope) {
                     p.overrides.clear(field);
@@ -1473,6 +1478,7 @@ pub(crate) fn settings_page(
             let set_edit = set_edit.clone();
             rows.push(
                 button("Edit profile\u{2026}")
+                    .icon(Symbol::Edit)
                     .on_click(move || set_edit.call(true))
                     .into(),
             );
