@@ -1361,21 +1361,13 @@ pub(crate) fn settings_page(
     // left inset belongs to WinUI's own template (a string prop is all we can set), so it
     // sat noticeably right of the cards under it. In the content column it shares the cards'
     // left edge by construction.
-    // The scope switcher lives in the NavigationView's PANE FOOTER: it is chrome ("which
-    // layer am I editing"), visible from every section, and down there it reads as part of
-    // the navigation rather than as one more settings row — a bar of profile controls above
-    // the whole surface read as clutter. Editing the profile itself (name, colour, delete)
-    // is a modal behind the "Edit profile…" button, not inline chrome.
-    //
-    // And it must look right in EVERY pane state — open, compact rail, or minimal — even
-    // though reactor exposes no pane-opened/closed event and the USER drives the toggle.
-    // So the footer is built to survive the clip instead of dodging it: WinUI clips
-    // pane-footer content to the compact rail (~48 epx), so the footer's LEADING 48 epx is
-    // a monogram disc for the scope (the compact form, opens the profile sheet) and the
-    // combo + edit button sit after it. Closed pane → the clip line falls between disc and
-    // combo, the rail shows a clean disc. Open pane → disc + combo. No width thresholds,
-    // no pane-state guessing — the same trick NavigationViewItems use (icon leading, label
-    // clipped away).
+    // The scope switcher is a slim BAR ABOVE the whole NavigationView — visible from every
+    // section, at every window size, in every pane state. It went through three homes: a
+    // fat card of profile controls above the page (clutter), the pane footer (WinUI clips
+    // footer content to the compact rail, and reactor exposes no pane-opened event to adapt
+    // by), and a clip-aware footer (looked broken). A single row — label, combo, Edit — is
+    // the version that holds up: profile EDITING lives in the sheet, so the bar carries
+    // only the choice.
     let catalog = ProfilesFile::load();
     let mut scope_names = vec!["Default settings".to_string()];
     let mut scope_ids: Vec<String> = vec![String::new()];
@@ -1386,17 +1378,13 @@ pub(crate) fn settings_page(
     scope_names.push("New profile\u{2026}".to_string());
     scope_ids.push(NEW_PROFILE.to_string());
     let scope_i = scope_ids.iter().position(|i| i == scope).unwrap_or(0);
-    // A factory, not a value: the combo is placed in the pane footer when the pane is
-    // expanded, and inside the profile sheet when the rail's monogram opens it — one
-    // builder, instantiated for whichever surface renders this pass.
     let make_switcher = {
         let (set_scope, set_edit) = (set_scope.clone(), set_edit.clone());
         let (names, ids) = (scope_names.clone(), scope_ids);
         move || {
             ComboBox::new(names.clone())
-                .header("Editing")
                 .selected_index(scope_i as i32)
-                .min_width(200.0)
+                .min_width(220.0)
                 .on_selection_changed({
                     let (set_scope, set_edit, ids) =
                         (set_scope.clone(), set_edit.clone(), ids.clone());
@@ -1428,70 +1416,38 @@ pub(crate) fn settings_page(
                 })
         }
     };
-    let footer: Element = {
-        // The leading 48 epx: the monogram disc — the scope's compact form, and the whole
-        // footer a closed pane shows. Profile accent when set; opens the profile sheet.
-        let scope_label = match &active {
-            Some(p) => p.name.clone(),
-            None => "Default settings".to_string(),
-        };
-        let initial = scope_label
-            .chars()
-            .find(|c| c.is_alphanumeric())
-            .map(|c| c.to_uppercase().to_string())
-            .unwrap_or_else(|| "?".into());
-        let accent = active
-            .as_ref()
-            .and_then(|p| p.accent.as_deref())
-            .and_then(hex_color);
-        let disc = border(
-            text_block(initial)
-                .font_size(17.0)
-                .semibold()
-                // The on-accent brush, not AccentText — see `style::avatar`.
-                .foreground(ThemeRef::custom("TextOnAccentFillColorPrimaryBrush"))
-                .horizontal_alignment(HorizontalAlignment::Center)
+    let scope_bar: Element = {
+        // Every piece is vertically CENTRED against the combo (the tallest control), and
+        // the row shares the content column's 24-left / 28-right page margins, so the bar
+        // reads as part of the page grid rather than floating chrome.
+        let mut row: Vec<Element> = vec![
+            text_block("Editing")
+                .font_size(13.0)
+                .foreground(ThemeRef::SecondaryText)
+                .vertical_alignment(VerticalAlignment::Center)
+                .into(),
+            // Keyed by scope + the name list: a rename/create/delete changes the ComboBox's
+            // items, and an in-place diff re-sets items (clearing WinUI's selection) while
+            // skipping `selected_index` when it compares equal — the combo then renders
+            // blank. A remount applies every prop; the hstack's child list takes the keyed
+            // path (a panel).
+            Element::from(make_switcher())
+                .with_key(format!("{scope}\u{1}{}", scope_names.join("\u{1}")))
                 .vertical_alignment(VerticalAlignment::Center),
-        )
-        .corner_radius(10.0)
-        .width(40.0)
-        .height(40.0)
-        .tooltip(format!("Editing: {scope_label} \u{2014} profiles\u{2026}"))
-        .on_tapped({
-            let set_edit = set_edit.clone();
-            move || set_edit.call(true)
-        })
-        .vertical_alignment(VerticalAlignment::Bottom);
-        let disc = match accent {
-            Some(c) => disc.background(c),
-            None => disc.background(ThemeRef::Accent),
-        };
-        // After the clip line: the combo (+ Edit… when a profile is in scope), visible only
-        // with the pane open. Keyed by scope + the name list: a rename/create/delete changes
-        // the ComboBox's items, and an in-place diff re-sets items (clearing WinUI's
-        // selection) while skipping `selected_index` when it compares equal — the combo then
-        // renders blank. A remount applies every prop; the keyed child sits inside a plain
-        // panel because only a panel's child list takes the keyed path.
-        let switcher_key = format!("{scope}\u{1}{}", scope_names.join("\u{1}"));
-        let mut rows: Vec<Element> = vec![make_switcher().into()];
+        ];
         if profile_mode {
             let set_edit = set_edit.clone();
-            rows.push(
+            row.push(
                 button("Edit profile\u{2026}")
                     .icon(Symbol::Edit)
                     .on_click(move || set_edit.call(true))
+                    .vertical_alignment(VerticalAlignment::Center)
                     .into(),
             );
         }
-        let open_part = vstack(vec![vstack(rows)
-            .spacing(8.0)
-            .with_key(switcher_key)
-            .into()]);
-        // Disc at x 4..44 — dead centre of the 48 rail; the combo column starts past the
-        // clip line, so a closed pane shows exactly the disc and nothing else.
-        hstack(vec![disc.into(), open_part.into()])
+        hstack(row)
             .spacing(12.0)
-            .margin(edges(4.0, 0.0, 12.0, 12.0))
+            .margin(edges(24.0, 12.0, 28.0, 8.0))
             .into()
     };
 
@@ -1590,9 +1546,8 @@ pub(crate) fn settings_page(
                 .into(),
         )
     });
-    let mut nav = NavigationView::new(items, content)
+    let nav = NavigationView::new(items, content)
         .pane_title("Settings")
-        .open_pane_length(280.0)
         .selected_tag(section)
         .on_selection_changed({
             let ss = set_section.clone();
@@ -1604,21 +1559,17 @@ pub(crate) fn settings_page(
             let ss = set_screen.clone();
             move || ss.call(Screen::Hosts)
         });
-    nav = nav.pane_footer(footer);
-    // One grid, so every layer FILLS the window (a vstack would hand the NavigationView its
-    // desired height — clipped when the window is short, floating when it is tall): the nav,
-    // the Edit-profile scrim + card over it, and the delete confirmation (a ContentDialog,
-    // its own WinUI layer, so its slot in the cell is irrelevant — it just needs to be in
-    // the tree).
+    // Overlay layers fill the NAV's cell (grids stretch children; a vstack would hand the
+    // NavigationView its desired height — clipped short, floating tall): the nav, the
+    // profile-sheet scrim + card over it, and the delete confirmation (a ContentDialog, its
+    // own WinUI layer, so its slot is irrelevant — it just needs to be in the tree).
     let mut layers: Vec<Element> = vec![nav.into()];
-    // The profile sheet: reachable via "Edit profile…" (open pane, profile in scope) or
-    // the footer's monogram disc (any pane state). It always carries the scope combo —
-    // whether the pane's own combo is visible depends on a pane state this page cannot
-    // observe, so the sheet is self-sufficient.
-    if edit_open {
+    // The profile sheet — "Edit profile…" in the bar. The bar owns the scope choice, so
+    // the sheet carries only the profile being edited.
+    if edit_open && profile_mode {
         layers.push(edit_profile_modal(
             active.as_ref(),
-            Some(make_switcher()),
+            None,
             set_scope,
             set_delete,
             set_edit,
@@ -1629,7 +1580,14 @@ pub(crate) fn settings_page(
     if let Some(dialog) = confirm {
         layers.push(dialog);
     }
-    grid(layers).into()
+    // The bar rides an Auto row above the nav's Star row, so the nav (and the sheet's scrim
+    // over it) still fills the rest of the window.
+    grid(vec![
+        scope_bar.grid_row(0),
+        Element::from(grid(layers)).grid_row(1),
+    ])
+    .rows([GridLength::Auto, GridLength::STAR])
+    .into()
 }
 
 #[cfg(test)]
