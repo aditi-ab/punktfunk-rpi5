@@ -11,8 +11,8 @@
 //! Kotlin side), `nativeConnect` with identity + pin (TOFU / pinned), and `nativePair` (SPAKE2 PIN).
 //!
 //! Split by concern: [`connect`] (identity + connect/close + the trust surface), [`planes`]
-//! (video/audio/mic start/stop + the stats drain), [`input`] (the input-plane shims). This module
-//! keeps the shared infrastructure they all deref through.
+//! (video/audio/mic start/stop + the stats drain), [`input`] (the input-plane shims), [`probe`]
+//! (the bandwidth speed test). This module keeps the shared infrastructure they all deref through.
 //!
 //! TODO(M4 Android stage 1): client→host DualSense rich input (`send_rich_input`), mode
 //! renegotiation. Port the remaining orchestration from `clients/linux`.
@@ -21,6 +21,7 @@ mod clipboard;
 mod connect;
 mod input;
 mod planes;
+mod probe;
 
 use punktfunk_core::client::NativeClient;
 use std::panic::AssertUnwindSafe;

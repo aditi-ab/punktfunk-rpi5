@@ -146,6 +146,24 @@ object NativeBridge {
     external fun nativeProbe(host: String, port: Int, timeoutMs: Int): Boolean
 
     /**
+     * Start a bandwidth speed test on [handle]: the host bursts filler over the real data plane at
+     * [targetKbps] of goodput for [durationMs] (each clamped host-side to ≤ 3 Gbps / ≤ 5 s),
+     * **briefly pausing video**. Measuring over the stream's own path is the point — the answer is
+     * about the link this host's stream will take, not about generic throughput.
+     *
+     * Non-blocking: poll [nativeProbeResult] until it reports done. Starting a probe resets any
+     * prior measurement. Returns false on a dead handle. Cheap; safe on the main thread.
+     */
+    external fun nativeSpeedTest(handle: Long, targetKbps: Int, durationMs: Int): Boolean
+
+    /**
+     * The current speed-test measurement, partial until `[0] != 0.0`:
+     * `[done, throughputKbps, lossPct, hostDropPct, elapsedMs, recvBytes]`. Zeros before any
+     * probe, null on a dead handle. Cheap (one lock + a copy); safe to poll on the main thread.
+     */
+    external fun nativeProbeResult(handle: Long): DoubleArray?
+
+    /**
      * Apply the user's "Low-latency mode (experimental)" toggle to the process-wide transport
      * defaults — today just DSCP/QoS marking on the media sockets. Must be called BEFORE
      * [nativeConnect] (the tag is applied at socket creation); `HostConnect.connectToHost` does.

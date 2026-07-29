@@ -113,6 +113,12 @@ class ScreenshotTest {
     }
 
     @Test
+    fun speedTest() = shootScreen("speed-test") {
+        HostsScene()
+        SpeedTestScene()
+    }
+
+    @Test
     fun pair() = shootScreen("pair") {
         HostsScene()
         PairDialog()

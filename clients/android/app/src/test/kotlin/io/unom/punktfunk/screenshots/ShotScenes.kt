@@ -39,6 +39,9 @@ import io.unom.punktfunk.StatsOverlay
 import io.unom.punktfunk.StatsVerbosity
 import io.unom.punktfunk.ProfileStore
 import io.unom.punktfunk.SettingsOverlay
+import io.unom.punktfunk.SpeedTestDialog
+import io.unom.punktfunk.SpeedTestPhase
+import io.unom.punktfunk.SpeedTestTarget
 import io.unom.punktfunk.components.HostCard
 import io.unom.punktfunk.components.HostMenuItem
 import io.unom.punktfunk.components.SectionLabel
@@ -210,6 +213,22 @@ internal fun SettingsProfileScene() {
             initialProfileId = profile.id,
         )
     }
+}
+
+/**
+ * The speed test's result, in its most interesting shape: a host bound to a profile that INHERITS
+ * bitrate, so both layers are defensible and both buttons are offered. The note under the numbers
+ * is what stops "Apply" from being a write in an unknown direction.
+ */
+@Composable
+internal fun SpeedTestScene() {
+    SpeedTestDialog(
+        hostName = "Living Room PC",
+        target = SpeedTestTarget.Ask(newProfile("Game")),
+        phase = SpeedTestPhase.Done(throughputKbps = 412_000, lossPct = 0.3, recommendedKbps = 288_400),
+        onApply = {},
+        onDismiss = {},
+    )
 }
 
 /** The real TOFU AlertDialog (mirrors ConnectScreen's PendingTrust.Kind.TRUST_NEW), shown over the host grid. */

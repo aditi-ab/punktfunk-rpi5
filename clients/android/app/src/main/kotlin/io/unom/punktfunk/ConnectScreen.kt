@@ -109,6 +109,9 @@ private class ConnectAttempt(val hostName: String) {
 fun ConnectScreen(
     settings: Settings,
     onConnected: (ActiveSession) -> Unit,
+    // Writes the global defaults back. Only the speed test uses it — that is the one action on this
+    // screen that can land in the defaults layer (design/client-settings-profiles.md §5.3).
+    onSettingsChange: (Settings) -> Unit = {},
     // Console (gamepad) mode: render the host carousel instead of the touch grid, sharing all of this
     // screen's connect/trust/discovery logic. [onOpenSettings]/[onOpenLibrary] are the X/Y actions the
     // gamepad shell owns (the touch UI reaches Settings via the bottom bar and has no library button).
@@ -129,6 +132,10 @@ fun ConnectScreen(
     var port by remember { mutableStateOf("9777") }
     var connecting by remember { mutableStateOf(false) }
     var status by remember { mutableStateOf<String?>(null) }
+    // A confirmation, as opposed to [status]'s failures — "75 Mbit/s set in “Travel”". Separate
+    // state because the two read completely differently: an error banner is red on purpose, and a
+    // successful write dressed as one is a small lie every time it appears.
+    var notice by remember { mutableStateOf<String?>(null) }
     // A plain dial in flight (drives the "Connecting…" phase of the full-screen ConnectOverlay); null
     // when idle or when the request-access / wake flows own the screen instead.
     var attempt by remember { mutableStateOf<ConnectAttempt?>(null) }
@@ -330,6 +337,7 @@ fun ConnectScreen(
         attempt = thisAttempt // shows the ConnectOverlay's "Connecting…" phase immediately
         connecting = true
         status = null
+        notice = null
         discovery.stop() // free the Wi-Fi radio before the stream session
         scope.launch {
             val handle =
@@ -550,6 +558,37 @@ fun ConnectScreen(
         }
     }
 
+    // A speed test in flight: which host+profile it is measuring, and how far it has got. The
+    // measurement is over a real connect, so it takes the same `connecting` gate every dial does.
+    var speedTest by remember { mutableStateOf<HostCardEntry?>(null) }
+    var speedTestPhase by remember { mutableStateOf<SpeedTestPhase>(SpeedTestPhase.Connecting) }
+
+    fun startSpeedTest(entry: HostCardEntry) {
+        val id = identity ?: run {
+            status = "Identity not ready yet — try again in a moment"
+            return
+        }
+        // The magic packet isn't the only thing LNP blocks: without the grant this would EPERM its
+        // way to a timeout and report a dead link on a perfectly good one.
+        if (!lnpGranted) {
+            lnpPrompt = true
+            return
+        }
+        speedTest = entry
+        speedTestPhase = SpeedTestPhase.Connecting
+        notice = null
+        connecting = true
+        discovery.stop() // a browse running through the burst would measure itself
+        scope.launch {
+            runSpeedTest(context, id, entry.host.address, entry.host.port, entry.host.fpHex) { p ->
+                // A dismissed dialog abandons the run; don't drag it back onto the screen.
+                if (speedTest != null) speedTestPhase = p
+            }
+            connecting = false
+            discovery.start()
+        }
+    }
+
     // Toggle a host+profile pin. Presentation only: it never touches the profile itself and never
     // changes the host's default binding.
     fun togglePin(kh: KnownHost, profile: StreamProfile) {
@@ -567,6 +606,9 @@ fun ConnectScreen(
     // "Connect with" is a ONE-OFF on every card: it never rebinds the host, which is why rebinding
     // lives in the Edit sheet instead.
     fun hostMenu(kh: KnownHost, pin: StreamProfile?): List<HostMenuItem> = buildList {
+        if (pin == null) {
+            add(HostMenuItem("Network speed test") { startSpeedTest(HostCardEntry(kh, null)) })
+        }
         if (profiles.isEmpty()) return@buildList
         if (pin != null) {
             add(HostMenuItem("Unpin card", startsSection = true) { togglePin(kh, pin) })
@@ -784,6 +826,23 @@ fun ConnectScreen(
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                     Spacer(Modifier.height(24.dp))
+
+                    notice?.let {
+                        Surface(
+                            color = MaterialTheme.colorScheme.secondaryContainer,
+                            shape = MaterialTheme.shapes.medium,
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            Text(
+                                it,
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSecondaryContainer,
+                                textAlign = TextAlign.Center,
+                                modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
+                            )
+                        }
+                        Spacer(Modifier.height(16.dp))
+                    }
 
                     status?.let {
                         // In-flight progress (connecting / waking) is the full-screen ConnectOverlay's
@@ -1060,6 +1119,11 @@ fun ConnectScreen(
             } else {
                 null
             },
+            onSpeedTest = if (pin == null) {
+                { optionsTarget = null; startSpeedTest(HostCardEntry(kh, null)) }
+            } else {
+                null
+            },
             onEdit = { optionsTarget = null; editTarget = kh },
             onForget = {
                 knownHostStore.remove(kh)
@@ -1071,6 +1135,27 @@ fun ConnectScreen(
             onUnpin = pin?.let { p -> { togglePin(kh, p); optionsTarget = null } },
             profileName = pin?.name,
         )
+    }
+
+    speedTest?.let { entry ->
+        val target = SpeedTestTarget.resolve(entry.host, entry.pin?.id, profileStore)
+        val dismiss = { speedTest = null }
+        val apply: (Boolean) -> Unit = { toProfile ->
+            val done = speedTestPhase as? SpeedTestPhase.Done
+            if (done != null) {
+                val where = applySpeedTestResult(
+                    done.recommendedKbps, target, toProfile, profileStore, settings, onSettingsChange,
+                )
+                profiles = profileStore.all()
+                notice = "%.0f Mbit/s set in %s".format(done.recommendedMbps, where)
+            }
+            speedTest = null
+        }
+        if (gamepadUi) {
+            GamepadSpeedTestDialog(entry.host.name, target, speedTestPhase, apply, dismiss)
+        } else {
+            SpeedTestDialog(entry.host.name, target, speedTestPhase, apply, dismiss)
+        }
     }
 
     editTarget?.let { kh ->

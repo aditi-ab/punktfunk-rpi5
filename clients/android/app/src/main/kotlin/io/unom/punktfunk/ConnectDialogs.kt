@@ -467,3 +467,103 @@ internal fun EditHostDialog(
         },
     )
 }
+
+/**
+ * The network speed test, as a dialog: it narrates while it measures, then offers to apply the
+ * recommendation to the layer the tested host actually reads bitrate from — see [SpeedTestTarget]
+ * for why that is the interesting part. The apply buttons name their destination, so the write is
+ * never a surprise.
+ */
+@Composable
+internal fun SpeedTestDialog(
+    hostName: String,
+    target: SpeedTestTarget,
+    phase: SpeedTestPhase,
+    onApply: (toProfile: Boolean) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val done = phase as? SpeedTestPhase.Done
+    AlertDialog(
+        // Measuring can't be cancelled mid-burst (the host is already sending), so a stray tap
+        // outside shouldn't look like it did something.
+        onDismissRequest = { if (done != null || phase is SpeedTestPhase.Failed) onDismiss() },
+        title = { Text("Network speed test") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Text(hostName, style = MaterialTheme.typography.titleMedium)
+                when (phase) {
+                    SpeedTestPhase.Connecting, SpeedTestPhase.Measuring -> Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    ) {
+                        CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
+                        Text(
+                            if (phase == SpeedTestPhase.Connecting) {
+                                "Connecting…"
+                            } else {
+                                "Measuring — the host is bursting test traffic for two seconds."
+                            },
+                        )
+                    }
+                    is SpeedTestPhase.Failed -> Text(
+                        phase.message,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                    is SpeedTestPhase.Done -> Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Text(
+                            "%.0f Mbit/s measured · %.1f %% loss".format(
+                                phase.measuredMbps,
+                                phase.lossPct,
+                            ),
+                            style = MaterialTheme.typography.bodyLarge,
+                        )
+                        Text(
+                            "Recommended bitrate: %.0f Mbit/s".format(phase.recommendedMbps),
+                            style = MaterialTheme.typography.bodyLarge,
+                        )
+                        Text(
+                            speedTestTargetNote(target),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            if (done != null) {
+                TextButton(onClick = { onApply(true) }) {
+                    Text(
+                        when (target) {
+                            SpeedTestTarget.Global -> "Apply"
+                            is SpeedTestTarget.Profile -> "Apply to “${target.profile.name}”"
+                            is SpeedTestTarget.Ask -> "Set in “${target.profile.name}”"
+                        },
+                    )
+                }
+            }
+        },
+        dismissButton = {
+            Row {
+                // The both-are-defensible case: the user picks the layer, we don't guess.
+                if (done != null && target is SpeedTestTarget.Ask) {
+                    TextButton(onClick = { onApply(false) }) { Text("Set as default") }
+                }
+                TextButton(onClick = onDismiss) { Text("Close") }
+            }
+        },
+    )
+}
+
+/** One line saying which layer an Apply will write to, and why that one. */
+private fun speedTestTargetNote(target: SpeedTestTarget): String = when (target) {
+    SpeedTestTarget.Global ->
+        "This host uses the default settings, so the bitrate goes there."
+    is SpeedTestTarget.Profile ->
+        "This host streams with “${target.profile.name}”, which sets its own bitrate — " +
+            "that override is what it actually reads."
+    is SpeedTestTarget.Ask ->
+        "This host streams with “${target.profile.name}”, which currently inherits the default " +
+            "bitrate. Setting it in the profile affects only this host's profile; setting it as " +
+            "the default affects everything that inherits it."
+}

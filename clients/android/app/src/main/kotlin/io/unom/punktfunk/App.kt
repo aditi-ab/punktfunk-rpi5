@@ -148,6 +148,7 @@ fun App(forceGamepadUi: Boolean = false) {
                         Tab.Connect -> ConnectScreen(
                             settings = settings,
                             onConnected = { session = it },
+                            onSettingsChange = { settings = it; settingsStore.save(it) },
                             deepLink = pendingLink,
                             onDeepLinkHandled = { activity?.pendingDeepLink = null },
                         )
@@ -243,6 +244,7 @@ fun GamepadShell(
             GamepadScreen.Home -> ConnectScreen(
                 settings = settings,
                 onConnected = onConnected,
+                onSettingsChange = onSettingsChange,
                 deepLink = deepLink,
                 onDeepLinkHandled = onDeepLinkHandled,
                 gamepadUi = true,

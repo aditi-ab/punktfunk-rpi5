@@ -213,6 +213,7 @@ fun GamepadHostOptionsDialog(
     onEdit: () -> Unit,
     onForget: () -> Unit,
     onDismiss: () -> Unit,
+    onSpeedTest: (() -> Unit)? = null,
     /**
      * Non-null when this is a PINNED host+profile tile, whose only action is to unpin. A pin is a
      * shortcut, not a second host — offering the host's destructive actions on it would blur
@@ -232,6 +233,7 @@ fun GamepadHostOptionsDialog(
             }
             if (onLibrary != null) add(DialogAction("Library", primary = true, onClick = onLibrary))
             if (canWake) add(DialogAction("Wake host", onClick = onWake))
+            if (onSpeedTest != null) add(DialogAction("Network speed test", onClick = onSpeedTest))
             add(DialogAction("Edit…", primary = onLibrary == null, onClick = onEdit))
             add(DialogAction("Forget", onClick = onForget))
             add(DialogAction("Cancel", onClick = onDismiss))
@@ -245,6 +247,58 @@ fun GamepadHostOptionsDialog(
                 "Manage this saved host."
             },
         )
+    }
+}
+
+/**
+ * Console counterpart of [SpeedTestDialog]. Same measurement, same targeting rule — a TV box on a
+ * powerline adapter is exactly the machine whose link is worth measuring, so this belongs on the
+ * couch surface too, even though profile EDITING doesn't.
+ */
+@Composable
+fun GamepadSpeedTestDialog(
+    hostName: String,
+    target: SpeedTestTarget,
+    phase: SpeedTestPhase,
+    onApply: (toProfile: Boolean) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val done = phase as? SpeedTestPhase.Done
+    GamepadDialog(
+        title = "Network speed test",
+        onDismiss = onDismiss,
+        actions = buildList {
+            if (done != null) {
+                add(
+                    DialogAction(
+                        when (target) {
+                            SpeedTestTarget.Global -> "Apply"
+                            is SpeedTestTarget.Profile -> "Apply to “${target.profile.name}”"
+                            is SpeedTestTarget.Ask -> "Set in “${target.profile.name}”"
+                        },
+                        primary = true,
+                    ) { onApply(true) },
+                )
+                if (target is SpeedTestTarget.Ask) {
+                    add(DialogAction("Set as default") { onApply(false) })
+                }
+            }
+            add(DialogAction("Close", primary = done == null, onClick = onDismiss))
+        },
+    ) {
+        DialogText(hostName)
+        when (phase) {
+            SpeedTestPhase.Connecting -> DialogText("Connecting…")
+            SpeedTestPhase.Measuring ->
+                DialogText("Measuring — the host is bursting test traffic for two seconds.")
+            is SpeedTestPhase.Failed -> DialogText(phase.message)
+            is SpeedTestPhase.Done -> {
+                DialogText(
+                    "%.0f Mbit/s measured · %.1f %% loss".format(phase.measuredMbps, phase.lossPct),
+                )
+                DialogText("Recommended bitrate: %.0f Mbit/s".format(phase.recommendedMbps))
+            }
+        }
     }
 }
 
