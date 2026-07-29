@@ -67,12 +67,16 @@ private data class MockHost(
     val accent: Color? = null,
 )
 
+// Ordered so an UNCHIPPED card sits beside a CHIPPED one in the same grid row, and a long trust
+// label ("Trust on first use") beside a short one ("Paired"). Both are what used to make cards in a
+// row step up and down — the grid sizes a row to its tallest item and doesn't stretch the rest — so
+// this arrangement is the regression net for it.
 private val SAVED = listOf(
+    MockHost("Office", "192.168.1.50:9777", HostStatus.TOFU),
     MockHost(
         "Living Room PC", "192.168.1.42:9777", HostStatus.PAIRED,
         profile = "Game", pin = "Work", accent = Color(0xFFFF8A4C),
     ),
-    MockHost("Office", "192.168.1.50:9777", HostStatus.TOFU),
 )
 private val DISCOVERED = listOf(
     MockHost("studio-deck", "192.168.1.61:9777", HostStatus.PAIRING),
@@ -120,6 +124,9 @@ internal fun HostsScene() {
                             HostMenuItem("Connect with: Default settings", startsSection = true) {},
                             HostMenuItem("Connect with: Game") {},
                         ),
+                        // One card in this section has a chip, so every card reserves its space —
+                        // the shot is here to catch a row that steps.
+                        reserveProfileSlot = true,
                     )
                 }
                 if (h.pin != null) {
@@ -129,6 +136,7 @@ internal fun HostsScene() {
                             onConnect = {}, onForget = null,
                             profileLabel = h.pin, profileProminent = true, accent = h.accent,
                             menuItems = listOf(HostMenuItem("Unpin card", startsSection = true) {}),
+                            reserveProfileSlot = true,
                         )
                     }
                 }

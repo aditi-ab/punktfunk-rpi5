@@ -641,6 +641,10 @@ fun ConnectScreen(
     val savedCards = savedHosts.flatMap { kh ->
         listOf(HostCardEntry(kh, null)) + profileStore.pinsFor(kh).map { HostCardEntry(kh, it) }
     }
+    // Cards in one grid row must be the same height (the grid won't stretch them), so as soon as
+    // ANY saved card carries a profile chip, they all reserve its space. Nobody who doesn't use
+    // profiles ever sees the gap.
+    val anyProfileChip = savedCards.any { it.pin != null || it.host.profileId != null }
 
     // ---- punktfunk:// routing (design/client-deep-links.md §3) --------------------------------
     //
@@ -966,6 +970,7 @@ fun ConnectScreen(
                         profileProminent = pin != null,
                         accent = accentColor(pin?.accent ?: bound?.accent),
                         menuItems = hostMenu(kh, pin),
+                        reserveProfileSlot = anyProfileChip,
                     )
                 }
             }

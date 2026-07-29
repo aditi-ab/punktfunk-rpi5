@@ -5,10 +5,13 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -72,6 +75,7 @@ data class HostMenuItem(
  * card** ([profileProminent]) the host name is still the title, but the profile is the loud part,
  * because the pin exists to make that one combination a single tap.
  */
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun HostCard(
     name: String,
@@ -87,6 +91,14 @@ fun HostCard(
     profileProminent: Boolean = false,
     accent: Color? = null,
     menuItems: List<HostMenuItem> = emptyList(),
+    /**
+     * Keep the profile chip's space even on a card that has no profile. `LazyVerticalGrid` sizes a
+     * row to its tallest item but does NOT stretch the others, so a card that grew a chip would
+     * leave its neighbour visibly short — a row of cards stepping up and down reads as broken
+     * layout. The caller passes true when ANY card in that section carries a chip, so a user with
+     * no profiles never pays for the slot.
+     */
+    reserveProfileSlot: Boolean = false,
 ) {
     // D-pad / controller focus highlight: a clickable card is focusable, but the default state
     // layer is too subtle on a TV across a room — draw a clear primary-colour border when focused.
@@ -130,17 +142,29 @@ fun HostCard(
                     overflow = TextOverflow.Ellipsis,
                     textAlign = TextAlign.Center,
                 )
-                if (profileLabel != null) {
+                if (profileLabel != null || reserveProfileSlot) {
                     Spacer(Modifier.height(8.dp))
-                    ProfileChip(profileLabel, accent, prominent = profileProminent)
+                    Box(
+                        Modifier.heightIn(min = PROFILE_CHIP_SLOT),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        if (profileLabel != null) {
+                            ProfileChip(profileLabel, accent, prominent = profileProminent)
+                        }
+                    }
                 }
                 Spacer(Modifier.height(12.dp))
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(12.dp),
-                ) {
-                    PresencePill(online)
-                    StatusPill(status)
+                // Fixed slot, and pills WRAP as pills rather than wrapping their own text: "Trust
+                // on first use" beside "Online" doesn't fit a narrow card, and letting the label
+                // run to three lines made that card tower over a "Paired" one in the same row.
+                Box(Modifier.heightIn(min = PILL_SLOT), contentAlignment = Alignment.TopCenter) {
+                    FlowRow(
+                        horizontalArrangement = Arrangement.spacedBy(12.dp, Alignment.CenterHorizontally),
+                        verticalArrangement = Arrangement.spacedBy(2.dp),
+                    ) {
+                        PresencePill(online)
+                        StatusPill(status)
+                    }
                 }
             }
 
@@ -231,6 +255,21 @@ private fun ProfileChip(label: String, accent: Color?, prominent: Boolean) {
     }
 }
 
+/**
+ * Reserved heights for the two parts of a card that would otherwise vary: the profile chip, and the
+ * presence/trust pills. `LazyVerticalGrid` sizes a row to its tallest item and does NOT stretch the
+ * others, so anything variable here shows up as cards stepping up and down within one row.
+ *
+ * `heightIn(min =)`, not a fixed height: at a large accessibility font scale the content must be
+ * allowed to grow rather than clip. That is also why the pill slot is sized with room to spare
+ * rather than to a measured two lines — the equal-height guarantee only holds while every card
+ * fits INSIDE the reserved space, so the reservation has to be comfortable, not exact. Past that
+ * (a very large font scale) a row can step again: a rare, self-healing cosmetic cost, and the
+ * right trade against truncating a host's trust state.
+ */
+private val PROFILE_CHIP_SLOT = 26.dp
+private val PILL_SLOT = 48.dp
+
 /** A circular avatar with the host's first letter (Apple-contact style). */
 @Composable
 fun HostAvatar(name: String) {
@@ -267,6 +306,7 @@ fun PresencePill(online: Boolean) {
             if (online) "Online" else "Offline",
             style = MaterialTheme.typography.labelMedium,
             color = color,
+            maxLines = 1,
         )
     }
 }
@@ -282,7 +322,7 @@ fun StatusPill(status: HostStatus) {
     Row(verticalAlignment = Alignment.CenterVertically) {
         Box(Modifier.size(8.dp).clip(CircleShape).background(color))
         Spacer(Modifier.width(6.dp))
-        Text(status.label, style = MaterialTheme.typography.labelMedium, color = color)
+        Text(status.label, style = MaterialTheme.typography.labelMedium, color = color, maxLines = 1)
     }
 }
 
