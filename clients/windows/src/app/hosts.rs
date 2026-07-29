@@ -26,6 +26,10 @@ const MENU_EDIT: &str = "Edit\u{2026}";
 const MENU_WITH: &str = "Connect with: ";
 const MENU_COPY_LINK: &str = "Copy link";
 const MENU_SHORTCUT: &str = "Create shortcut\u{2026}";
+/// Pin/unpin a profile's one-click tile for this host — dynamic per profile, prefix-matched
+/// like [`MENU_WITH`] (same flat-flyout constraint, same collision-proof trailing space).
+const MENU_PIN: &str = "Pin tile: ";
+const MENU_UNPIN: &str = "Unpin tile: ";
 const MENU_FORGET: &str = "Forget\u{2026}";
 
 /// Whether the console (gamepad) UI is available in this build: the session binary ships
@@ -71,10 +75,15 @@ pub(crate) struct HostsProps {
     /// The hovered tile's stable id (saved: fp_hex, discovered: `addr:port`) — root state because
     /// the pointer enter/exit handlers bypass the reconciler flush, like the flyout clicks above.
     pub(crate) hover: Option<String>,
+    /// Bumped when a menu action changes what the page should SHOW without changing any
+    /// state it already reads — pinning/unpinning a profile tile, which rewrites the
+    /// known-hosts store behind the tiles (the hosts-page mirror of `settings_rev`).
+    pub(crate) hosts_rev: u64,
     pub(crate) set_forget: AsyncSetState<Option<(String, String)>>,
     pub(crate) set_rename: AsyncSetState<Option<(String, String)>>,
     pub(crate) set_show_add: AsyncSetState<bool>,
     pub(crate) set_hover: AsyncSetState<Option<String>>,
+    pub(crate) set_hosts_rev: AsyncSetState<u64>,
 }
 
 impl PartialEq for HostsProps {
@@ -90,6 +99,7 @@ impl PartialEq for HostsProps {
             && self.show_add == other.show_add
             && self.add_anim == other.add_anim
             && self.hover == other.hover
+            && self.hosts_rev == other.hosts_rev
     }
 }
 
@@ -362,58 +372,6 @@ fn edit_editor(
                 }
             })
     };
-    // Pinned tiles: which profiles get their own one-click tile for this host. They used to be
-    // two more flat entries in the tile's flyout, which is what tipped that menu over — and this
-    // is where they belong anyway, beside the default they sit next to (design §5.2a). Each
-    // switch writes immediately, like the profile picker above and unlike the text fields, which
-    // need a Save because they have drafts.
-    let pin_switches: Element = {
-        let catalog = pf_client_core::profiles::ProfilesFile::load();
-        let stored = KnownHosts::load()
-            .hosts
-            .iter()
-            .find(|h| h.fp_hex == fp)
-            .cloned();
-        if catalog.profiles.is_empty() {
-            vstack(Vec::<Element>::new()).into()
-        } else {
-            let mut rows: Vec<Element> = vec![text_block("Pinned tiles")
-                .font_size(12.0)
-                .foreground(ThemeRef::SecondaryText)
-                .horizontal_alignment(HorizontalAlignment::Left)
-                .into()];
-            for p in &catalog.profiles {
-                let on = stored
-                    .as_ref()
-                    .is_some_and(|h| h.pinned_profiles.iter().any(|id| id == &p.id));
-                let (fp, id) = (fp.to_string(), p.id.clone());
-                rows.push(
-                    ToggleSwitch::new(on)
-                        .header(&p.name)
-                        .on_content("Shown")
-                        .off_content("Hidden")
-                        .on_toggled(move |v: bool| {
-                            tracing::info!(pin = %id, host = %fp, on = v, "pin toggle");
-                            let mut known = KnownHosts::load();
-                            if let Some(h) = known.hosts.iter_mut().find(|h| h.fp_hex == fp) {
-                                h.pinned_profiles.retain(|x| x != &id);
-                                if v {
-                                    h.pinned_profiles.push(id.clone());
-                                }
-                                if let Err(e) = known.save() {
-                                    tracing::warn!(error = %format!("{e:#}"), "saving a pin");
-                                }
-                            } else {
-                                tracing::warn!(host = %fp, "pin toggle: no such saved host");
-                            }
-                        })
-                        .into(),
-                );
-            }
-            vstack(rows).spacing(6.0).into()
-        }
-    };
-
     let field = |label: &str, value: String, placeholder: &str, draft: HookRef<String>| {
         vstack((
             text_block(label)
@@ -434,12 +392,11 @@ fn edit_editor(
         *clip_draft.borrow(),
     );
     // A centred SHEET (scrim + card), not an in-grid tile: as a tile the editor inherited a
-    // grid cell in the middle of the page, and on an ordinary window its lower half — the
-    // pin switches especially — sat below the fold with nothing hinting at it ("can't pin
-    // hosts", live-diagnosed 2026-07-29: the switch's visible rect was a 9-px sliver). A
-    // sheet centres at its own height, scrolls internally when it must, and matches where
-    // every other edit flow lives.
-    let modal = dialog_surface(
+    // grid cell in the middle of the page, and on an ordinary window its lower half sat
+    // below the fold with nothing hinting at it (live-diagnosed 2026-07-29: a control's
+    // visible rect was a 9-px sliver). A sheet centres at its own height — and its content
+    // sits in a scroll_view, so a short window scrolls the card instead of clipping it.
+    let modal = dialog_surface(scroll_view(
         vstack((
             text_block(format!("Edit \u{201c}{initial_name}\u{201d}"))
                 .font_size(20.0)
@@ -465,7 +422,6 @@ fn edit_editor(
                 .horizontal_alignment(HorizontalAlignment::Left),
             ))
             .spacing(4.0),
-            pin_switches,
             vstack((
                 ToggleSwitch::new(clip0)
                     .header("Share clipboard with this host")
@@ -495,7 +451,7 @@ fn edit_editor(
             .horizontal_alignment(HorizontalAlignment::Right),
         ))
         .spacing(10.0),
-    )
+    ))
     .max_width(460.0)
     .horizontal_alignment(HorizontalAlignment::Center)
     .vertical_alignment(VerticalAlignment::Center)
@@ -585,20 +541,14 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
     let window = cx.use_inner_size();
     let content_w = (window.width - 64.0).clamp(TILE_MIN_WIDTH, 1120.0);
     let cols = (((content_w + TILE_GAP) / (TILE_MIN_WIDTH + TILE_GAP)).floor() as usize).max(1);
-    // Compact header: below this the three labelled buttons would collide with the title
-    // (the Auto grid column can't shrink), so they drop to icon-only with tooltips.
-    let compact = window.width < 700.0;
-    let header_btn = |label: &str, sym: Symbol| {
-        if compact {
-            button("").icon(sym).tooltip(label).automation_name(label)
-        } else {
-            button(label).icon(sym)
-        }
-    };
-
     let mut body: Vec<Element> = Vec::new();
 
-    // Header: title block + Add host / Help / Settings.
+    // Header: title block + the page actions. ONE labelled primary — Add host, in accent —
+    // and the rest icon-only with tooltips: four written-out buttons in a row read as four
+    // competing calls to action (review feedback), and icon-only needs no compact-width
+    // special case either.
+    let icon_btn =
+        |label: &str, sym: Symbol| button("").icon(sym).tooltip(label).automation_name(label);
     body.push(
         grid((
             vstack((
@@ -611,7 +561,8 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
             .grid_column(0)
             .vertical_alignment(VerticalAlignment::Center),
             hstack({
-                let mut actions: Vec<Element> = vec![header_btn("Add host", Symbol::Add)
+                let mut actions: Vec<Element> = vec![button("Add host")
+                    .icon(Symbol::Add)
                     .accent()
                     .on_click({
                         let sa = set_show_add.clone();
@@ -622,23 +573,21 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                 // where the session binary ships without its Skia console.
                 if CONSOLE_UI_AVAILABLE {
                     actions.push(
-                        header_btn("Console UI", Symbol::Play)
-                            .tooltip(
-                                "The controller-driven couch interface \u{2014} host list, \
-                                 pairing and libraries, launching streams in the same window.",
-                            )
-                            .on_click({
-                                let (c, ss, st) =
-                                    (ctx.clone(), set_screen.clone(), set_status.clone());
-                                // No target: the console opens its OWN host view rather than
-                                // one host's library — the couch counterpart of this page.
-                                move || open_console(&c, None, &ss, &st)
-                            })
-                            .into(),
+                        icon_btn(
+                            "Console UI \u{2014} the controller-driven couch interface",
+                            Symbol::Play,
+                        )
+                        .on_click({
+                            let (c, ss, st) = (ctx.clone(), set_screen.clone(), set_status.clone());
+                            // No target: the console opens its OWN host view rather than
+                            // one host's library — the couch counterpart of this page.
+                            move || open_console(&c, None, &ss, &st)
+                        })
+                        .into(),
                     );
                 }
                 actions.push(
-                    header_btn("Shortcuts", Symbol::Keyboard)
+                    icon_btn("Keyboard shortcuts", Symbol::Keyboard)
                         .on_click({
                             let ss = set_screen.clone();
                             move || ss.call(Screen::Help)
@@ -646,7 +595,7 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                         .into(),
                 );
                 actions.push(
-                    header_btn("Settings", Symbol::Setting)
+                    icon_btn("Settings", Symbol::Setting)
                         .on_click({
                             let ss = set_screen.clone();
                             move || ss.call(Screen::Settings)
@@ -723,6 +672,8 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                 let (sf, sr) = (set_forget.clone(), set_rename.clone());
                 let (fp, name) = (k.fp_hex.clone(), k.name.clone());
                 let menu_profiles = profiles.clone();
+                let pinned_now = k.pinned_profiles.clone();
+                let (hosts_rev, set_hosts_rev) = (props.hosts_rev, props.set_hosts_rev.clone());
                 let (link_host, link_profile) = (k.clone(), None::<String>);
                 let shortcut_host = k.clone();
                 button("")
@@ -764,6 +715,15 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                         items.push(menu_separator());
                         items.push(menu_item(MENU_COPY_LINK));
                         items.push(menu_item(MENU_SHORTCUT));
+                        // Pin/unpin a profile's one-click tile, beside the other tile-shaped
+                        // shortcuts (the review moved these here from the editor).
+                        for (id, name, _) in profiles.iter() {
+                            let pinned = pinned_now.iter().any(|x| x == id);
+                            items.push(menu_item(format!(
+                                "{}{name}",
+                                if pinned { MENU_UNPIN } else { MENU_PIN }
+                            )));
+                        }
 
                         items.push(menu_separator());
                         items.push(menu_item(MENU_EDIT));
@@ -773,6 +733,32 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                     .on_item_clicked(move |item: String| match item.as_str() {
                         // The profile items are dynamic, so they are matched by prefix before
                         // the fixed ones.
+                        _ if item.starts_with(MENU_PIN) || item.starts_with(MENU_UNPIN) => {
+                            let (on, name) = if let Some(n) = item.strip_prefix(MENU_PIN) {
+                                (true, n)
+                            } else {
+                                (false, item.trim_start_matches(MENU_UNPIN))
+                            };
+                            let Some((id, ..)) = menu_profiles.iter().find(|(_, n, _)| n == name)
+                            else {
+                                return;
+                            };
+                            tracing::info!(pin = %id, host = %fp, on, "pin toggle");
+                            let mut known = KnownHosts::load();
+                            if let Some(h) = known.hosts.iter_mut().find(|h| h.fp_hex == fp) {
+                                h.pinned_profiles.retain(|x| x != id);
+                                if on {
+                                    h.pinned_profiles.push(id.clone());
+                                }
+                                if let Err(e) = known.save() {
+                                    tracing::warn!(error = %format!("{e:#}"), "saving a pin");
+                                }
+                            }
+                            // The store changed behind the tiles and nothing the page reads
+                            // as state did — the bump is what makes the pinned tile appear
+                            // (or vanish) NOW, not on the next discovery tick.
+                            set_hosts_rev.call(hosts_rev + 1);
+                        }
                         _ if item.starts_with(MENU_WITH) => {
                             let name = item.trim_start_matches(MENU_WITH);
                             let mut target = target.clone();

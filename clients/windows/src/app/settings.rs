@@ -332,7 +332,9 @@ fn edit_profile_modal(
             .margin(edges(0.0, 6.0, 0.0, 0.0))
             .into(),
     );
-    let modal = dialog_surface(vstack(rows).spacing(12.0))
+    // The content scrolls when the window is shorter than the sheet (same rule as the host
+    // editor) — a sheet must never clip its own controls.
+    let modal = dialog_surface(scroll_view(vstack(rows).spacing(12.0)))
         .max_width(420.0)
         .horizontal_alignment(HorizontalAlignment::Center)
         .vertical_alignment(VerticalAlignment::Center)
@@ -1336,21 +1338,41 @@ pub(crate) fn settings_page(
         // Every piece is vertically CENTRED against the combo (the tallest control), and
         // the row shares the content column's 24-left / 28-right page margins, so the bar
         // reads as part of the page grid rather than floating chrome.
-        let mut row: Vec<Element> = vec![
-            text_block("Editing")
-                .font_size(13.0)
-                .foreground(ThemeRef::SecondaryText)
-                .vertical_alignment(VerticalAlignment::Center)
-                .into(),
-            // Keyed by scope + the name list: a rename/create/delete changes the ComboBox's
-            // items, and an in-place diff re-sets items (clearing WinUI's selection) while
-            // skipping `selected_index` when it compares equal — the combo then renders
-            // blank. A remount applies every prop; the hstack's child list takes the keyed
-            // path (a panel).
-            Element::from(make_switcher())
-                .with_key(format!("{scope}\u{1}{}", scope_names.join("\u{1}")))
-                .vertical_alignment(VerticalAlignment::Center),
-        ];
+        // The switcher is ONE combined element (review feedback): the combo and the pencil
+        // share a control-look wrapper — the stock 4-epx control radius and a CardStroke
+        // outline — with the pencil as a borderless icon segment. Only a Border can carry a
+        // corner radius in this toolkit, so the wrapper supplies the joint chrome. In the
+        // defaults scope there is nothing to edit and the bare combo stands alone.
+        let switcher_key = format!("{scope}\u{1}{}", scope_names.join("\u{1}"));
+        let combined: Element = if profile_mode {
+            let set_edit = set_edit.clone();
+            border(
+                hstack(vec![
+                    Element::from(make_switcher()),
+                    button("")
+                        .icon(Symbol::Edit)
+                        .subtle()
+                        .height(36.0)
+                        .width(40.0)
+                        .tooltip("Edit profile\u{2026}")
+                        .automation_name("Edit profile\u{2026}")
+                        .on_click(move || set_edit.call(true))
+                        .into(),
+                ])
+                .spacing(0.0),
+            )
+            .corner_radius(4.0)
+            .border_brush(ThemeRef::CardStroke)
+            .border_thickness(uniform(1.0))
+            .into()
+        } else {
+            make_switcher().into()
+        };
+        let mut row: Vec<Element> = vec![text_block("Editing")
+            .font_size(13.0)
+            .foreground(ThemeRef::SecondaryText)
+            .vertical_alignment(VerticalAlignment::Center)
+            .into()];
         // The profile's colour, right where the choice is made (a ComboBox item is a plain
         // string in this toolkit, so the chip cannot ride inside the dropdown).
         if let Some(c) = active
@@ -1368,18 +1390,15 @@ pub(crate) fn settings_page(
                     .into(),
             );
         }
-        if profile_mode {
-            let set_edit = set_edit.clone();
-            row.push(
-                button("Edit profile\u{2026}")
-                    .icon(Symbol::Edit)
-                    // Matches the combo — the bar's controls share one height.
-                    .height(36.0)
-                    .on_click(move || set_edit.call(true))
-                    .vertical_alignment(VerticalAlignment::Center)
-                    .into(),
-            );
-        }
+        // Keyed by scope + the name list: a rename/create/delete changes the ComboBox's
+        // items, and an in-place diff re-sets items (clearing WinUI's selection) while
+        // skipping `selected_index` when it compares equal — the combo then renders blank.
+        // A remount applies every prop; the hstack's child list takes the keyed path.
+        row.push(
+            combined
+                .with_key(switcher_key)
+                .vertical_alignment(VerticalAlignment::Center),
+        );
         hstack(row)
             .spacing(12.0)
             .margin(edges(24.0, 12.0, 28.0, 8.0))

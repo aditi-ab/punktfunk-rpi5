@@ -298,6 +298,10 @@ fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
     // its marker as immediately as resetting one clears it), a reset, a profile colour change.
     // Root state comparison makes same-value calls free, so a counter is what forces the pass.
     let (settings_rev, set_settings_rev) = cx.use_async_state(0u64);
+    // The hosts page's mirror of the same idea: pin/unpin from a tile's menu rewrites the
+    // known-hosts store behind the tiles, and the bump is what makes the pinned tile appear
+    // in the same gesture instead of on the next discovery tick.
+    let (hosts_rev, set_hosts_rev) = cx.use_async_state(0u64);
     // `punktfunk://` links: the receiver thread queues them (from this launch's argv, or from a
     // later instance over WM_COPYDATA) and this poll pulls them onto the UI thread. Thread-fed
     // state must be root state, like the pad count below.
@@ -620,10 +624,12 @@ fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
                 show_add,
                 add_anim,
                 hover,
+                hosts_rev,
                 set_forget,
                 set_rename,
                 set_show_add,
                 set_hover,
+                set_hosts_rev: set_hosts_rev.clone(),
             },
         ),
         // connecting_page / request_access_page / waking_page / settings_page / licenses_page /
