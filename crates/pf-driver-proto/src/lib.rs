@@ -477,6 +477,52 @@ pub mod edid {
         };
         cv.min(255) as u8
     }
+
+    /// Fixed reduced-blanking geometry for [`dtd`] (CVT-RBv2-shaped): 80 px of horizontal and 45
+    /// lines of vertical blanking, front-porch/sync splits within them. A virtual display has no
+    /// real scan-out, so the blanking only has to be self-consistent — the pixel clock is derived
+    /// from these same totals.
+    const DTD_H_BLANK: u32 = 80;
+    const DTD_V_BLANK: u32 = 45;
+    const DTD_H_SYNC_OFFSET: u32 = 8;
+    const DTD_H_SYNC_WIDTH: u32 = 32;
+    const DTD_V_SYNC_OFFSET: u32 = 3;
+    const DTD_V_SYNC_WIDTH: u32 = 5;
+
+    /// An 18-byte EDID detailed timing descriptor for `width`×`height`@`refresh_hz` with the fixed
+    /// reduced blanking above — the pf-vdisplay EDID's PREFERRED timing, built from the mode the
+    /// session actually asked for instead of a hard-coded 1080p60. `None` when the mode does not
+    /// FIT the DTD encoding — pixel clock above 655.35 MHz (the u16 10 kHz field: 4K120-class) or
+    /// active dimensions above the 12-bit fields — in which case the caller keeps its
+    /// representable fallback descriptor. Flags byte: digital separate sync, +H/+V (0x1E, matching
+    /// the previous hard-coded DTD).
+    pub fn dtd(width: u32, height: u32, refresh_hz: u32) -> Option<[u8; 18]> {
+        if width == 0 || height == 0 || refresh_hz == 0 || width > 4095 || height > 4095 {
+            return None;
+        }
+        let h_total = u64::from(width + DTD_H_BLANK);
+        let v_total = u64::from(height + DTD_V_BLANK);
+        let clock_10khz = h_total * v_total * u64::from(refresh_hz) / 10_000;
+        let clock_10khz = u16::try_from(clock_10khz).ok()?;
+        let mut d = [0u8; 18];
+        d[0..2].copy_from_slice(&clock_10khz.to_le_bytes());
+        d[2] = (width & 0xFF) as u8;
+        d[3] = (DTD_H_BLANK & 0xFF) as u8;
+        d[4] = (((width >> 8) & 0x0F) << 4) as u8 | ((DTD_H_BLANK >> 8) & 0x0F) as u8;
+        d[5] = (height & 0xFF) as u8;
+        d[6] = (DTD_V_BLANK & 0xFF) as u8;
+        d[7] = (((height >> 8) & 0x0F) << 4) as u8 | ((DTD_V_BLANK >> 8) & 0x0F) as u8;
+        d[8] = (DTD_H_SYNC_OFFSET & 0xFF) as u8;
+        d[9] = (DTD_H_SYNC_WIDTH & 0xFF) as u8;
+        d[10] = (((DTD_V_SYNC_OFFSET & 0x0F) << 4) | (DTD_V_SYNC_WIDTH & 0x0F)) as u8;
+        d[11] = ((((DTD_H_SYNC_OFFSET >> 8) & 0x03) << 6)
+            | (((DTD_H_SYNC_WIDTH >> 8) & 0x03) << 4)
+            | (((DTD_V_SYNC_OFFSET >> 4) & 0x03) << 2)
+            | ((DTD_V_SYNC_WIDTH >> 4) & 0x03)) as u8;
+        // Bytes 12..17 (image size mm, borders) stay 0 = undefined, matching the previous DTD.
+        d[17] = 0x1E;
+        Some(d)
+    }
 }
 
 /// The IDD-push frame transport: the host-created shared ring header, the publish token, and the
@@ -1453,6 +1499,31 @@ pub mod cursor {
 mod tests {
     use super::*;
     use bytemuck::Zeroable;
+
+    #[test]
+    fn dtd_encodes_the_session_mode() {
+        // 1920×1080@60 with the fixed RB blanking: totals 2000×1125 → 135.00 MHz = 13500 ×10 kHz.
+        let d = edid::dtd(1920, 1080, 60).expect("1080p60 fits the DTD encoding");
+        assert_eq!(u16::from_le_bytes([d[0], d[1]]), 13_500);
+        // Active dimensions round-trip through the split 8+4-bit fields.
+        assert_eq!(u32::from(d[2]) | (u32::from(d[4] >> 4) << 8), 1920);
+        assert_eq!(u32::from(d[5]) | (u32::from(d[7] >> 4) << 8), 1080);
+        // Blanking fields carry the fixed geometry; flags match the legacy descriptor.
+        assert_eq!(u32::from(d[3]) | (u32::from(d[4] & 0x0F) << 8), 80);
+        assert_eq!(u32::from(d[6]) | (u32::from(d[7] & 0x0F) << 8), 45);
+        assert_eq!(d[17], 0x1E);
+    }
+
+    #[test]
+    fn dtd_rejects_what_the_encoding_cannot_carry() {
+        // 4K120: (3840+80)·(2160+45)·120 ≈ 1.037 GHz — past the u16 10 kHz pixel-clock field.
+        assert_eq!(edid::dtd(3840, 2160, 120), None);
+        // 4K60 fits (≈518 MHz).
+        assert!(edid::dtd(3840, 2160, 60).is_some());
+        // Degenerate and over-wide modes are refused, not mis-encoded.
+        assert_eq!(edid::dtd(0, 1080, 60), None);
+        assert_eq!(edid::dtd(5000, 1080, 10), None);
+    }
 
     #[test]
     fn frame_token_roundtrips() {
