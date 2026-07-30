@@ -460,6 +460,36 @@ jobs:
   # A separate Linux job, not another step in `package`: the deploy actions are Docker-based and do
   # not run on a Windows runner. `needs: package` also gives the ordering that matters — build-data
   # reads the manifests from the release, so it must not run before they are attached.
+  # Publish the SIGNED canary update manifest after the canary installer lands (planning:
+  # host-update-from-web-console.md §3.3 — canary rides this workflow because the installer is
+  # the only artifact the manifest references by URL; other canary channels may trail by minutes,
+  # which the per-PM apply path tolerates). A Linux job: the signer is bash+openssl. Skips (with
+  # a warning) when UPDATE_MANIFEST_KEY is absent — a canary build must not fail over it.
+  canary-manifest:
+    needs: package
+    if: gitea.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Publish the canary update manifest
+        env:
+          REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+          UPDATE_MANIFEST_KEY: ${{ secrets.UPDATE_MANIFEST_KEY }}
+        run: |
+          set -euo pipefail
+          # Same derivation the package job used: canary = <next-minor base>'s major.minor + run#.
+          eval "$(bash scripts/ci/pf-version.sh)"
+          VER="${PF_MAJOR}.${PF_MINOR}.${GITHUB_RUN_NUMBER}"
+          URL="https://${REGISTRY}/api/packages/${OWNER}/generic/${PKG}/${VER}/punktfunk-host-setup-${VER}.exe"
+          curl -fsSL "$URL" -o /tmp/installer.exe
+          SHA="$(sha256sum /tmp/installer.exe | awk '{print $1}')"
+          CHANNEL=canary VERSION="$VER" CI_RUN="${GITHUB_RUN_NUMBER}" \
+            WINDOWS_URL="$URL" WINDOWS_SHA256="$SHA" \
+            NOTES_URL="https://git.unom.io/unom/punktfunk/releases" \
+            bash scripts/ci/publish-update-manifest.sh
+
   winget-source:
     needs: package
     if: startsWith(gitea.ref, 'refs/tags/v')

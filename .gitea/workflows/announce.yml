@@ -31,6 +31,37 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Publish the SIGNED stable update manifest — the moment every host's update check learns
+      # about this release (planning: host-update-from-web-console.md §3.3). Deliberately here in
+      # announce, not on the tag: the manual "fleet is green, go" gate doubles as the gate for the
+      # fleet-wide "update available". Fails the announce loudly if the key is missing (fail-closed)
+      # or the installer's live bytes don't match their .sha256 sidecar. Pre-release tags are
+      # ALWAYS skipped — an -rc must never enter the stable feed, even with allow_prerelease.
+      - name: Publish the stable update manifest
+        env:
+          REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+          UPDATE_MANIFEST_KEY: ${{ secrets.UPDATE_MANIFEST_KEY }}
+        run: |
+          set -euo pipefail
+          TAG="${{ inputs.tag }}"
+          case "$TAG" in
+            *-*) echo "pre-release tag $TAG — not publishing to the stable update feed"; exit 0 ;;
+          esac
+          VER="${TAG#v}"
+          URL="https://git.unom.io/unom/punktfunk/releases/download/${TAG}/punktfunk-host-setup-${VER}.exe"
+          # Re-download and re-hash the real bytes; the sidecar is a cross-check, never the truth.
+          curl -fsSL "$URL" -o /tmp/installer.exe
+          curl -fsSL "$URL.sha256" -o /tmp/installer.sha256
+          SHA="$(sha256sum /tmp/installer.exe | awk '{print $1}')"
+          grep -qi "$SHA" /tmp/installer.sha256 || {
+            echo "ERROR: installer sha256 $SHA does not match the release's .sha256 sidecar" >&2
+            exit 1
+          }
+          CHANNEL=stable VERSION="$VER" REQUIRE_KEY=1 \
+            WINDOWS_URL="$URL" WINDOWS_SHA256="$SHA" \
+            NOTES_URL="https://git.unom.io/unom/punktfunk/releases/tag/${TAG}" \
+            bash scripts/ci/publish-update-manifest.sh
+
       - name: Post release announcement to Discord
         env:
           GITEA_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
