@@ -947,7 +947,7 @@ dependencies = [
 
 [[package]]
 name = "cursor-probe"
-version = "0.22.1"
+version = "0.22.2"
 dependencies = [
  "anyhow",
  "pf-capture",
@@ -1036,7 +1036,7 @@ dependencies = [
 
 [[package]]
 name = "display-disturb"
-version = "0.22.1"
+version = "0.22.2"
 dependencies = [
  "windows 0.62.2 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
@@ -2221,7 +2221,7 @@ dependencies = [
 
 [[package]]
 name = "latency-probe"
-version = "0.22.1"
+version = "0.22.2"
 
 [[package]]
 name = "lazy_static"
@@ -2326,7 +2326,7 @@ dependencies = [
 
 [[package]]
 name = "libvpl-sys"
-version = "0.22.1"
+version = "0.22.2"
 dependencies = [
  "bindgen",
  "cmake",
@@ -2361,7 +2361,7 @@ checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
 name = "loss-harness"
-version = "0.22.1"
+version = "0.22.2"
 dependencies = [
  "punktfunk-core",
 ]
@@ -2850,7 +2850,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "pf-capture"
-version = "0.22.1"
+version = "0.22.2"
 dependencies = [
  "anyhow",
  "ashpd",
@@ -2871,7 +2871,7 @@ dependencies = [
 
 [[package]]
 name = "pf-client-core"
-version = "0.22.1"
+version = "0.22.2"
 dependencies = [
  "anyhow",
  "ash",
@@ -2896,7 +2896,7 @@ dependencies = [
 
 [[package]]
 name = "pf-clipboard"
-version = "0.22.1"
+version = "0.22.2"
 dependencies = [
  "anyhow",
  "ashpd",
@@ -2914,7 +2914,7 @@ dependencies = [
 
 [[package]]
 name = "pf-console-ui"
-version = "0.22.1"
+version = "0.22.2"
 dependencies = [
  "anyhow",
  "ash",
@@ -2935,7 +2935,7 @@ dependencies = [
 
 [[package]]
 name = "pf-encode"
-version = "0.22.1"
+version = "0.22.2"
 dependencies = [
  "anyhow",
  "ash",
@@ -2959,7 +2959,7 @@ dependencies = [
 
 [[package]]
 name = "pf-ffvk"
-version = "0.22.1"
+version = "0.22.2"
 dependencies = [
  "ash",
  "bindgen",
@@ -2968,7 +2968,7 @@ dependencies = [
 
 [[package]]
 name = "pf-frame"
-version = "0.22.1"
+version = "0.22.2"
 dependencies = [
  "anyhow",
  "libc",
@@ -2980,7 +2980,7 @@ dependencies = [
 
 [[package]]
 name = "pf-gpu"
-version = "0.22.1"
+version = "0.22.2"
 dependencies = [
  "anyhow",
  "pf-host-config",
@@ -2994,11 +2994,11 @@ dependencies = [
 
 [[package]]
 name = "pf-host-config"
-version = "0.22.1"
+version = "0.22.2"
 
 [[package]]
 name = "pf-inject"
-version = "0.22.1"
+version = "0.22.2"
 dependencies = [
  "anyhow",
  "ashpd",
@@ -3027,14 +3027,14 @@ dependencies = [
 
 [[package]]
 name = "pf-paths"
-version = "0.22.1"
+version = "0.22.2"
 dependencies = [
  "tracing",
 ]
 
 [[package]]
 name = "pf-presenter"
-version = "0.22.1"
+version = "0.22.2"
 dependencies = [
  "anyhow",
  "ash",
@@ -3049,7 +3049,7 @@ dependencies = [
 
 [[package]]
 name = "pf-vdisplay"
-version = "0.22.1"
+version = "0.22.2"
 dependencies = [
  "anyhow",
  "ashpd",
@@ -3082,7 +3082,7 @@ dependencies = [
 
 [[package]]
 name = "pf-win-display"
-version = "0.22.1"
+version = "0.22.2"
 dependencies = [
  "anyhow",
  "pf-paths",
@@ -3094,7 +3094,7 @@ dependencies = [
 
 [[package]]
 name = "pf-zerocopy"
-version = "0.22.1"
+version = "0.22.2"
 dependencies = [
  "anyhow",
  "ash",
@@ -3302,7 +3302,7 @@ dependencies = [
 
 [[package]]
 name = "punktfunk-cli"
-version = "0.22.1"
+version = "0.22.2"
 dependencies = [
  "pf-client-core",
  "punktfunk-core",
@@ -3313,7 +3313,7 @@ dependencies = [
 
 [[package]]
 name = "punktfunk-client-android"
-version = "0.22.1"
+version = "0.22.2"
 dependencies = [
  "android_logger",
  "jni",
@@ -3329,7 +3329,7 @@ dependencies = [
 
 [[package]]
 name = "punktfunk-client-linux"
-version = "0.22.1"
+version = "0.22.2"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -3346,7 +3346,7 @@ dependencies = [
 
 [[package]]
 name = "punktfunk-client-session"
-version = "0.22.1"
+version = "0.22.2"
 dependencies = [
  "anyhow",
  "pf-client-core",
@@ -3361,7 +3361,7 @@ dependencies = [
 
 [[package]]
 name = "punktfunk-client-windows"
-version = "0.22.1"
+version = "0.22.2"
 dependencies = [
  "async-channel",
  "ffmpeg-next",
@@ -3381,7 +3381,7 @@ dependencies = [
 
 [[package]]
 name = "punktfunk-core"
-version = "0.22.1"
+version = "0.22.2"
 dependencies = [
  "aes-gcm",
  "bytes",
@@ -3413,7 +3413,7 @@ dependencies = [
 
 [[package]]
 name = "punktfunk-host"
-version = "0.22.1"
+version = "0.22.2"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -3497,7 +3497,7 @@ dependencies = [
 
 [[package]]
 name = "punktfunk-probe"
-version = "0.22.1"
+version = "0.22.2"
 dependencies = [
  "anyhow",
  "mdns-sd",
@@ -3511,7 +3511,7 @@ dependencies = [
 
 [[package]]
 name = "punktfunk-tray"
-version = "0.22.1"
+version = "0.22.2"
 dependencies = [
  "anyhow",
  "ksni",
@@ -3534,7 +3534,7 @@ checksum = "d55d956fa96f5ec02be2e13af0e20391a5aa83d6a074e3ad368959d0fab299ea"
 
 [[package]]
 name = "pyrowave-sys"
-version = "0.22.1"
+version = "0.22.2"
 dependencies = [
  "bindgen",
  "cmake",
