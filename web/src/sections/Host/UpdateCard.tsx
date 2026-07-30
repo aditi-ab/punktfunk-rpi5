@@ -396,7 +396,9 @@ const ApplyProgress: FC<{
 					/>
 				</div>
 			)}
-			{timedOut && (
+			{/* A live job (e.g. the Deck's tens-of-minutes source rebuild) is not "timed out" —
+			    the warning is for the host being GONE longer than a restart explains. */}
+			{timedOut && !job && (
 				<p className="rounded-md border border-amber-500/40 bg-amber-500/10 p-3 text-sm">
 					{m.update_apply_timeout()}
 				</p>

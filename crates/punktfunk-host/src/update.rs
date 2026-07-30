@@ -101,6 +101,9 @@ pub(crate) fn apply_support() -> &'static str {
         {
             "full"
         }
+        // The Deck source rebuild is user-owned — no helper, no group.
+        #[cfg(target_os = "linux")]
+        detect::InstallKind::SteamosSource => "full",
         _ => "notify",
     }
 }
@@ -421,12 +424,15 @@ pub(crate) fn start_apply(force: bool, session_active: bool) -> Result<(), Apply
             | detect::InstallKind::Sysext
             | detect::InstallKind::RpmOstree
             | detect::InstallKind::Pacman
+            | detect::InstallKind::SteamosSource
     );
     if !windows_leg && !linux_leg {
         return Err(ApplyError::Unsupported);
     }
     #[cfg(target_os = "linux")]
-    if linux_leg {
+    if linux_leg && kind != detect::InstallKind::SteamosSource {
+        // The Deck source rebuild is user-owned and needs no root helper; every other Linux
+        // leg goes through it.
         if !linux::helper_installed() {
             return Err(ApplyError::Unsupported);
         }
@@ -519,7 +525,12 @@ pub(crate) fn start_apply(force: bool, session_active: bool) -> Result<(), Apply
             #[cfg(target_os = "linux")]
             {
                 let _ = &asset; // the Linux legs resolve through the package manager
-                linux::run_apply(&target_version, serial, &stage).map(|()| {
+                let run = if detect::detect().0 == detect::InstallKind::SteamosSource {
+                    linux::run_apply_steamos(&target_version, serial, &stage)
+                } else {
+                    linux::run_apply(&target_version, serial, &stage)
+                };
+                run.map(|()| {
                     // Staged / nothing-to-do wrote a durable result and this process lives
                     // on; an in-place change wrote the intent and our restart is queued.
                     // Either way the in-process job is finished.

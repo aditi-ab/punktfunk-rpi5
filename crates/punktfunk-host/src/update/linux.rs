@@ -99,6 +99,110 @@ pub(super) fn opt_in_hint() -> String {
         .to_string()
 }
 
+/// The Steam Deck source-rebuild leg (plan U3.1): run `~/punktfunk/scripts/steamdeck/update.sh
+/// --pull` in a TRANSIENT user unit — `systemd-run`, because the script ends by restarting
+/// `punktfunk-host.service`, and a child inside our own cgroup would be killed by that restart
+/// mid-run. No root involved (the Deck install is user-owned). Outcome plumbing:
+/// - build FAILS → the script exits without restarting us → the poll below sees the unit fail
+///   and reports it live, log attached;
+/// - build SUCCEEDS → the script restarts us → we die mid-poll; the `source_build` intent at
+///   next boot IS the success signal (`jobs::reconcile`).
+pub(super) fn run_apply_steamos(
+    target_version: &str,
+    serial: u64,
+    stage: &dyn Fn(&'static str),
+) -> Result<(), (&'static str, String)> {
+    let home = std::env::var("HOME").map_err(|_| ("applying", "no $HOME".to_string()))?;
+    let script = std::path::Path::new(&home).join("punktfunk/scripts/steamdeck/update.sh");
+    if !script.exists() {
+        return Err((
+            "applying",
+            format!(
+                "{} not found — is this the Deck on-device install?",
+                script.display()
+            ),
+        ));
+    }
+    let log = pf_paths::config_dir()
+        .join("logs")
+        .join("update-steamos.log");
+    if let Some(dir) = log.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+
+    jobs::write_json_atomic(
+        &jobs::intent_path(),
+        &IntentRecord {
+            from: env!("PUNKTFUNK_VERSION").into(),
+            to: target_version.into(),
+            serial,
+            started_unix: super::now_unix(),
+            installer_sha256: String::new(),
+            log_path: log.display().to_string(),
+            source_build: true,
+        },
+    )
+    .map_err(|e| ("applying", format!("write intent record: {e}")))?;
+
+    const UNIT: &str = "pf-source-update";
+    // `--collect` reaps the transient unit even on failure, so a retry can reuse the name.
+    let launched = Command::new("systemd-run")
+        .args(["--user", "--collect", "--unit", UNIT, "bash", "-c"])
+        .arg(format!(
+            "exec >> '{}' 2>&1; exec bash '{}' --pull",
+            log.display(),
+            script.display()
+        ))
+        .status();
+    match launched {
+        Ok(s) if s.success() => {}
+        Ok(s) => {
+            let _ = std::fs::remove_file(jobs::intent_path());
+            return Err(("applying", format!("systemd-run exited {s}")));
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(jobs::intent_path());
+            return Err(("applying", format!("launch systemd-run: {e}")));
+        }
+    }
+    stage("applying");
+
+    // Follow the transient unit. A successful build restarts this process before the unit
+    // goes inactive, so leaving this loop alive means either "still building" or "failed".
+    let deadline = Instant::now() + Duration::from_secs(90 * 60);
+    loop {
+        std::thread::sleep(Duration::from_secs(5));
+        let state = capture(Command::new("systemctl").args(["--user", "is-active", UNIT]))
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|| "failed".into());
+        match state.as_str() {
+            "active" | "activating" | "deactivating" | "reloading" => {
+                if Instant::now() > deadline {
+                    // Leave the build running (killing a half-linked build helps nobody) but
+                    // stop claiming it; the intent stays for reconcile if it ever finishes.
+                    return Err((
+                        "applying",
+                        format!(
+                            "the source rebuild is still running after 90 min — following it \
+                             ends here; see {}",
+                            log.display()
+                        ),
+                    ));
+                }
+            }
+            // The unit ended and we are STILL ALIVE ⇒ the script never reached its restart
+            // step ⇒ the build failed (an up-to-date tree still rebuilds+restarts).
+            _ => {
+                let _ = std::fs::remove_file(jobs::intent_path());
+                return Err((
+                    "applying",
+                    format!("the source rebuild failed — see {}", log.display()),
+                ));
+            }
+        }
+    }
+}
+
 /// Run the whole Linux apply: start the oneshot, wait, interpret its result record, and for
 /// an in-place binary change, write the intent and restart ourselves (boot reconciliation
 /// reports the outcome). Blocking — run on a blocking thread.
@@ -244,6 +348,7 @@ pub(super) fn run_apply(
             started_unix: super::now_unix(),
             installer_sha256: String::new(),
             log_path: "journalctl -u punktfunk-update.service".into(),
+            source_build: false,
         },
     )
     .map_err(|e| ("restarting", format!("write intent record: {e}")))?;

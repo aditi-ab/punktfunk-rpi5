@@ -95,6 +95,7 @@ pub(super) fn run_apply(
             started_unix: super::now_unix(),
             installer_sha256: asset.sha256.to_ascii_lowercase(),
             log_path: log.display().to_string(),
+            source_build: false,
         },
     )
     .map_err(|e| ("applying", format!("write intent record: {e}")))?;

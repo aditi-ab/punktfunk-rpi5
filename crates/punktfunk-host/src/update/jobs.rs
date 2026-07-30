@@ -35,6 +35,13 @@ pub(crate) struct IntentRecord {
     pub installer_sha256: String,
     /// Where the installer was told to log (`/LOG=`).
     pub log_path: String,
+    /// A source rebuild (Steam Deck `update.sh`), where version equality proves nothing —
+    /// the workspace version only moves on bumps. The flow's own ordering carries the
+    /// proof instead: the script restarts the host ONLY after a successful build+install,
+    /// and its failure path is reported live (the host survives a failed build). So an
+    /// intent with this flag still present at boot ⟹ the rebuild succeeded.
+    #[serde(default)]
+    pub source_build: bool,
 }
 
 /// The durable outcome of the most recent apply attempt.
@@ -124,6 +131,20 @@ pub(crate) fn reconcile(
     let Some(intent) = intent else {
         return Reconciled::None;
     };
+    if intent.source_build {
+        // See `IntentRecord::source_build`: presence at boot IS the success signal; the
+        // running version is the truthful "to" (a rebuild can legitimately keep it).
+        return Reconciled::Success(ResultRecord {
+            ok: true,
+            from: intent.from,
+            to: current_version.to_string(),
+            finished_unix: now_unix,
+            stage: None,
+            error: None,
+            log_path: Some(intent.log_path),
+            staged: false,
+        });
+    }
     if current_version == intent.to {
         return Reconciled::Success(ResultRecord {
             ok: true,
@@ -167,6 +188,22 @@ mod tests {
             started_unix: started,
             installer_sha256: "ab".repeat(32),
             log_path: "/logs/update-0.23.200.log".into(),
+            source_build: false,
+        }
+    }
+
+    #[test]
+    fn source_build_intent_is_success_with_the_running_version() {
+        let mut i = intent(0);
+        i.source_build = true;
+        // Same version as `from` (a rebuild without a bump) — still success, and `to` is
+        // what actually runs, not the manifest's label.
+        match reconcile(Some(i), "0.23.100", 10_000_000) {
+            Reconciled::Success(r) => {
+                assert!(r.ok);
+                assert_eq!(r.to, "0.23.100");
+            }
+            other => panic!("expected success, got {other:?}"),
         }
     }
 
