@@ -209,8 +209,12 @@ Source: "{#FfmpegBin}\*.dll"; DestDir: "{app}"; Flags: ignoreversion
 #endif
 ; The portable bun runtime -> {app}\bun\bun.exe. Shared by the web console AND the plugin/script
 ; runner (both run on bun), so stage it once when EITHER is bundled.
+; restartreplace is the safety net under StopBunRuntimes: Windows refuses to delete a RUNNING image,
+; so if any bun survives the pre-copy stop, DeleteFile fails with code 5 and - with no reboot-time
+; MoveFileEx fallback - Inno can only show the user a dead-end Retry/Skip/Cancel box. With it, the
+; install completes and the new runtime lands on the next restart instead.
 #if defined(WithWeb) || defined(WithScripting)
-Source: "{#BunExe}"; DestDir: "{app}\bun"; DestName: "bun.exe"; Flags: ignoreversion
+Source: "{#BunExe}"; DestDir: "{app}\bun"; DestName: "bun.exe"; Flags: ignoreversion restartreplace uninsrestartdelete
 #endif
 #ifdef WithWeb
 ; The web management console: the self-contained Nitro SSR bundle (.output = server + public; deps
@@ -325,6 +329,16 @@ Filename: "{app}\punktfunk-host.exe"; Parameters: "web setup {code:WebSetupParam
 Filename: "powershell.exe"; \
   Parameters: "-NoProfile -ExecutionPolicy Bypass -Command ""$a=New-ScheduledTaskAction -Execute '{app}\scripting\scripting-run.cmd'; $t=New-ScheduledTaskTrigger -AtStartup; $p=New-ScheduledTaskPrincipal -UserId 'LocalService' -LogonType ServiceAccount; $s=New-ScheduledTaskSettingsSet -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries; Register-ScheduledTask -TaskName PunktfunkScripting -Action $a -Trigger $t -Principal $p -Settings $s -Force -ErrorAction SilentlyContinue | Out-Null; Disable-ScheduledTask -TaskName PunktfunkScripting -ErrorAction SilentlyContinue | Out-Null"""; \
   StatusMsg: "Registering the Punktfunk script runner (disabled; opt-in)..."; Flags: runhidden waituntilterminated
+#endif
+#if defined(WithWeb) || defined(WithScripting)
+; Put back what StopBunRuntimes disabled to unlock bun.exe. Deliberately the LAST [Run] entry that
+; touches the tasks: it has to follow `web setup`'s re-register AND the scripting entry above, whose
+; unconditional Disable-ScheduledTask is correct for a fresh install but would otherwise silently
+; switch an operator's plugin runner off on every upgrade. Skipped entirely when neither task was
+; enabled beforehand (a fresh install), so it can't enable anything the user never asked for.
+Filename: "powershell.exe"; Parameters: "{code:RestoreTasksParams}"; \
+  StatusMsg: "Restoring the console + script runner tasks..."; \
+  Flags: runhidden waituntilterminated; Check: NeedsTaskRestore
 #endif
 ; Launch the status tray as the SIGNED-IN user (not the elevated install user) right away, so the
 ; icon appears without waiting for the next sign-in.
@@ -593,22 +607,95 @@ begin
     '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
 end;
 
-#ifdef WithWeb
-{ Stop a running web console + free its port BEFORE the file copy, so the old server doesn't lock
-  .output / web-run.cmd / bun.exe and the new task can bind. Killing the listener owner is
-  runtime-agnostic (an early install may have run node on :3000, the current one runs bun on
-  :47992 - sweep both). `web setup` repeats this idempotently after the copy. Best-effort; a
-  fresh install is a no-op. }
-procedure StopWebConsole;
+#if defined(WithWeb) || defined(WithScripting)
+{ Each bun task's enabled state as it was BEFORE StopBunRuntimes disabled it, so the [Run] restore
+  entry can put it back. PunktfunkScripting is OPT-IN, which makes this load-bearing rather than
+  tidy: re-enabling it unconditionally would switch the plugin runner on for everyone, and leaving
+  it disabled would switch it off for everyone who had it on. }
+var
+  WebTaskWasEnabled, ScriptingTaskWasEnabled: Boolean;
+
+{ Escape a value for embedding in a single-quoted PowerShell literal ('' is PS's escaped quote).
+  The install dir is user-chosen, so it can legitimately contain an apostrophe. }
+function PsLiteral(S: String): String;
+begin
+  Result := S;
+  StringChangeEx(Result, '''', '''''', True);
+end;
+
+{ Is the task registered AND not Disabled? Answered through the exit code, so there is no temp file
+  to write, read back, and clean up. A missing task reports False. }
+function TaskEnabled(TaskName: String): Boolean;
 var
   ResultCode: Integer;
 begin
+  Result := False;
+  if Exec('powershell.exe',
+    '-NoProfile -ExecutionPolicy Bypass -Command "' +
+    '$t=Get-ScheduledTask -TaskName ''' + PsLiteral(TaskName) + ''' -ErrorAction SilentlyContinue; ' +
+    'if($t -and $t.State -ne ''Disabled''){exit 1}; exit 0"',
+    '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+    Result := ResultCode = 1;
+end;
+
+{ Free the bundled bun.exe (and the console's own files) BEFORE the copy. Windows will not delete a
+  running image, so a surviving bun means "DeleteFile failed; code 5" on bun\bun.exe - the modal a
+  user hit updating to 0.22.1.
+  Neither bun runs under the host service, so StopHostServiceAndWait does nothing for either: both
+  are Task Scheduler tasks - PunktfunkWeb (SYSTEM, the console) and PunktfunkScripting (LocalService,
+  the plugin runner) - and the runner listens on NO port, so the port sweep below cannot see it at
+  all. That is why this stops tasks by name and processes by image path, not just by socket.
+  DISABLE before stopping: both carry aggressive restart-on-failure (web 10x at 1min, scripting 999x
+  at 1min) and the web task also has a logon trigger, so a force-kill on its own invites a respawn
+  into the middle of a copy that takes well over a minute at lzma2/max. Then WAIT for the processes
+  to actually go - Stop-ScheduledTask returns when termination is merely requested, and Stop-Process
+  is TerminateProcess, also asynchronous.
+  Best-effort throughout; a fresh install is a no-op. }
+procedure StopBunRuntimes;
+var
+  ResultCode: Integer;
+begin
+  WebTaskWasEnabled := TaskEnabled('PunktfunkWeb');
+  ScriptingTaskWasEnabled := TaskEnabled('PunktfunkScripting');
   Exec('powershell.exe',
     '-NoProfile -ExecutionPolicy Bypass -Command "' +
     '$ErrorActionPreference=''SilentlyContinue''; ' +
-    'Stop-ScheduledTask -TaskName PunktfunkWeb; ' +
-    'Get-NetTCPConnection -LocalPort 47992,3000 -State Listen | ForEach-Object { Stop-Process -Id $_.OwningProcess -Force }"',
+    '$app=''' + PsLiteral(ExpandConstant('{app}')) + '''.ToLower(); ' +
+    'foreach($t in ''PunktfunkWeb'',''PunktfunkScripting''){ Disable-ScheduledTask -TaskName $t; Stop-ScheduledTask -TaskName $t }; ' +
+    { Scoped to OUR bun by image path - a blanket kill would take out an unrelated bun (a dev box
+      runs its own). The port half stays runtime-agnostic: a pre-bun install ran node on :3000. }
+    'for($i=0; $i -lt 40; $i++){ ' +
+      '$b=@(Get-Process -Name bun | Where-Object { $_.Path -and $_.Path.ToLower().StartsWith($app) }); ' +
+      '$l=@(Get-NetTCPConnection -LocalPort 47992,3000 -State Listen); ' +
+      'if($b.Count -eq 0 -and $l.Count -eq 0){ break }; ' +
+      '$b | ForEach-Object { Stop-Process -Id $_.Id -Force }; ' +
+      '$l | ForEach-Object { Stop-Process -Id $_.OwningProcess -Force }; ' +
+      'Start-Sleep -Milliseconds 250 }"',
     '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+end;
+
+{ The [Run] restore, built here so it names only the tasks that were actually enabled before the
+  copy. Runs LAST, after `web setup` has re-registered PunktfunkWeb and after the scripting entry has
+  re-registered-then-disabled PunktfunkScripting - that entry is right for a fresh install and wrong
+  for an upgrade, and this is what puts an operator's enabled runner back.
+  The web task is only re-enabled, never started: `web setup` starts it on the builds that ship it,
+  and starting a console whose files a scripting-only build just removed would be worse than leaving
+  it for the next boot. The runner was running, so it is restarted. }
+function RestoreTasksParams(Param: String): String;
+begin
+  Result := '-NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference=''SilentlyContinue''; ';
+  if WebTaskWasEnabled then
+    Result := Result + 'Enable-ScheduledTask -TaskName PunktfunkWeb | Out-Null; ';
+  if ScriptingTaskWasEnabled then
+    Result := Result +
+      'Enable-ScheduledTask -TaskName PunktfunkScripting | Out-Null; ' +
+      'Start-ScheduledTask -TaskName PunktfunkScripting | Out-Null; ';
+  Result := Result + '"';
+end;
+
+function NeedsTaskRestore: Boolean;
+begin
+  Result := WebTaskWasEnabled or ScriptingTaskWasEnabled;
 end;
 #endif
 
@@ -672,11 +759,30 @@ begin
   begin
     StopHostServiceAndWait;
     StopTrays;   { upgrade-safe: unlock punktfunk-tray.exe before the copy }
+#if defined(WithWeb) || defined(WithScripting)
+    StopBunRuntimes;   { upgrade-safe: unlock the bundled bun.exe + free :47992 before the copy }
+#endif
 #ifdef WithWeb
-    StopWebConsole;   { upgrade-safe: free :3000 + unlock the web files before the copy }
     { Stash the chosen password for `web setup` (fresh install only); the temp copy is auto-cleaned. }
     if FreshWebInstall then
       SaveStringToFile(ExpandConstant('{tmp}\webpw.txt'), Trim(WebPwPage.Values[0]), False);
 #endif
   end;
 end;
+
+#if defined(WithWeb) || defined(WithScripting)
+{ The safety net under StopBunRuntimes' Disable-ScheduledTask. Inno calls this even when the user
+  cancels or an install fails, which is the case that matters: the [Run] restore would never have run,
+  and a task left DISABLED does not come back at the next boot the way a merely-stopped one does - an
+  aborted update would take the console down for good. Re-runs the same restore the [Run] entry
+  builds, so in the normal flow it is a no-op (enabling an enabled task does nothing).
+  Also called when Setup exits before ssInstall, where both flags are still False and this does
+  nothing at all. }
+procedure DeinitializeSetup;
+var
+  ResultCode: Integer;
+begin
+  if NeedsTaskRestore then
+    Exec('powershell.exe', RestoreTasksParams(''), '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+end;
+#endif
