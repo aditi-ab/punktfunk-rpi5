@@ -1,4 +1,5 @@
-import { Pause, Play, Trash2 } from "lucide-react";
+import { toast } from "@unom/ui/toast";
+import { Copy, Download, Pause, Play, Share2, Trash2 } from "lucide-react";
 import { type FC, useEffect, useMemo, useRef, useState } from "react";
 import { useLogsGet } from "@/api/gen/logs/logs";
 import type { LogEntry } from "@/api/gen/model/logEntry";
@@ -8,6 +9,14 @@ import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { cn } from "@/lib/utils";
 import { m } from "@/paraglide/messages";
+import {
+	detectShareMode,
+	downloadText,
+	logFilename,
+	logsToText,
+	type ShareMode,
+	shareLogs,
+} from "./export";
 
 const LEVELS = ["DEBUG", "INFO", "WARN", "ERROR"] as const;
 type MinLevel = (typeof LEVELS)[number];
@@ -39,6 +48,13 @@ export const LogsSection: FC = () => {
 	const [entries, setEntries] = useState<LogEntry[]>([]);
 	const [follow, setFollow] = useState(true);
 	const [dropped, setDropped] = useState(false);
+	const [shareMode, setShareMode] = useState<ShareMode | null>(null);
+
+	// Probed after mount: the server render has no `navigator`, and guessing there would mismatch
+	// on hydration. Until then the share button is simply absent.
+	useEffect(() => {
+		setShareMode(detectShareMode());
+	}, []);
 
 	const query = useLogsGet(
 		{ after: cursor > 0 ? cursor : undefined },
@@ -60,6 +76,8 @@ export const LogsSection: FC = () => {
 		setCursor(data.next);
 	}, [data]);
 
+	// The card hands back the entries its filters currently match, so an export carries exactly what
+	// the viewer shows — never the DOM-bounded tail of it.
 	return (
 		<LogsCard
 			entries={entries}
@@ -69,43 +87,71 @@ export const LogsSection: FC = () => {
 				setEntries([]);
 				setDropped(false);
 			}}
+			onDownload={(shown) =>
+				downloadText(logsToText(shown), logFilename(new Date()))
+			}
+			onShare={async (shown) => {
+				const outcome = await shareLogs(
+					logsToText(shown),
+					logFilename(new Date()),
+				);
+				if (outcome === "copied") toast.success(m.logs_copied());
+				else if (outcome === "failed") toast.error(m.logs_share_failed());
+			}}
+			shareMode={shareMode}
 			dropped={dropped}
 		/>
 	);
 };
 
-/** Pure log viewer: level/min filter + text search (local UI state), follow + clear controls. */
+/**
+ * Pure log viewer: level/min filter + text search (local UI state), follow, clear, and export.
+ * Export is the filters' full result, not the rendered tail — the `SHOW` cap is a DOM budget and
+ * has no business truncating a file destined for a bug report.
+ */
 export const LogsCard: FC<{
 	entries: LogEntry[];
 	follow: boolean;
 	onFollow: (follow: boolean) => void;
 	onClear: () => void;
+	onDownload: (shown: LogEntry[]) => void;
+	onShare: (shown: LogEntry[]) => void;
+	shareMode: ShareMode | null;
 	dropped: boolean;
-}> = ({ entries, follow, onFollow, onClear, dropped }) => {
+}> = ({
+	entries,
+	follow,
+	onFollow,
+	onClear,
+	onDownload,
+	onShare,
+	shareMode,
+	dropped,
+}) => {
 	const [minLevel, setMinLevel] = useState<MinLevel>("DEBUG");
 	const [search, setSearch] = useState("");
 	const listRef = useRef<HTMLDivElement>(null);
 
-	const filtered = useMemo(() => {
+	const matched = useMemo(() => {
 		const min = RANK[minLevel] ?? 0;
 		const q = search.trim().toLowerCase();
-		return entries
-			.filter(
-				(e) =>
-					(RANK[e.level] ?? 0) >= min &&
-					(q === "" ||
-						e.msg.toLowerCase().includes(q) ||
-						e.target.toLowerCase().includes(q)),
-			)
-			.slice(-SHOW);
+		return entries.filter(
+			(e) =>
+				(RANK[e.level] ?? 0) >= min &&
+				(q === "" ||
+					e.msg.toLowerCase().includes(q) ||
+					e.target.toLowerCase().includes(q)),
+		);
 	}, [entries, minLevel, search]);
+	const visible = useMemo(() => matched.slice(-SHOW), [matched]);
+	const shareLabel = shareMode === "share" ? m.logs_share() : m.logs_copy();
 
 	// Keep the tail in view while following (entries are append-only, so length is a good signal).
 	useEffect(() => {
 		if (!follow) return;
 		const el = listRef.current;
 		if (el) el.scrollTop = el.scrollHeight;
-	}, [follow, filtered.length]);
+	}, [follow, visible.length]);
 
 	return (
 		<Card>
@@ -132,6 +178,32 @@ export const LogsCard: FC<{
 					<div className="ml-auto flex items-center gap-2">
 						{dropped && <Badge variant="secondary">{m.logs_dropped()}</Badge>}
 						<Button
+							size="icon"
+							variant="ghost"
+							disabled={matched.length === 0}
+							title={m.logs_download()}
+							aria-label={m.logs_download()}
+							onClick={() => onDownload(matched)}
+						>
+							<Download className="size-4" />
+						</Button>
+						{shareMode && (
+							<Button
+								size="icon"
+								variant="ghost"
+								disabled={matched.length === 0}
+								title={shareLabel}
+								aria-label={shareLabel}
+								onClick={() => onShare(matched)}
+							>
+								{shareMode === "share" ? (
+									<Share2 className="size-4" />
+								) : (
+									<Copy className="size-4" />
+								)}
+							</Button>
+						)}
+						<Button
 							size="sm"
 							variant={follow ? "secondary" : "outline"}
 							onClick={() => onFollow(!follow)}
@@ -154,10 +226,10 @@ export const LogsCard: FC<{
 					ref={listRef}
 					className="max-h-[65vh] overflow-auto rounded-md border bg-card/40 p-2 font-mono text-xs leading-5"
 				>
-					{filtered.length === 0 ? (
+					{visible.length === 0 ? (
 						<p className="p-2 text-muted-foreground">{m.logs_empty()}</p>
 					) : (
-						filtered.map((e) => (
+						visible.map((e) => (
 							<div key={e.seq} className="whitespace-pre-wrap break-words">
 								<span className="text-muted-foreground">
 									{fmtTime(e.ts_ms)}{" "}

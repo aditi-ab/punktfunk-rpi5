@@ -36,6 +36,8 @@ export default meta;
 type Story = StoryObj<typeof meta>;
 
 // The real page layout (LogsView) with the pure viewer card + fixture entries in its slot.
+// `shareMode` is probed from the browser on the live page; the stories pin one of each so both the
+// desktop (clipboard) and mobile (share sheet) affordance stay covered by the screenshot run.
 export const Following: Story = {
 	args: {
 		viewer: (
@@ -44,6 +46,9 @@ export const Following: Story = {
 				follow
 				onFollow={noop}
 				onClear={noop}
+				onDownload={noop}
+				onShare={noop}
+				shareMode="copy"
 				dropped={false}
 			/>
 		),
@@ -58,6 +63,9 @@ export const PausedWithGap: Story = {
 				follow={false}
 				onFollow={noop}
 				onClear={noop}
+				onDownload={noop}
+				onShare={noop}
+				shareMode="share"
 				dropped
 			/>
 		),
