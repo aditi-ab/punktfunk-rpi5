@@ -83,7 +83,11 @@ SERIAL="$(date +%s)"
 PUBLISHED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 MANIFEST="$WORK/manifest.json"
 
-AUTH_JSON="$(printf '%s' "${AUTHENTICODE_SHA256:-}" | jq -R 'split(",") | map(select(length > 0))')"
+# `printf '%s\n'`, not '%s': an EMPTY value must still hand jq one (empty) input line —
+# with no line at all, `jq -R` emits nothing and `--argjson auth ""` is invalid JSON
+# (bit the first live canary publish). The fallback belts the suspenders.
+AUTH_JSON="$(printf '%s\n' "${AUTHENTICODE_SHA256:-}" | jq -R 'split(",") | map(select(length > 0))')"
+AUTH_JSON="${AUTH_JSON:-[]}"
 jq -n \
   --arg channel "$CHANNEL" \
   --arg version "$VERSION" \
