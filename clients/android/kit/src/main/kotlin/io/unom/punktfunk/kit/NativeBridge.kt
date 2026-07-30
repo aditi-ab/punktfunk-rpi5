@@ -407,6 +407,30 @@ object NativeBridge {
      */
     external fun nativeSendPadHidReport(handle: Long, pad: Int, buf: java.nio.ByteBuffer, len: Int)
 
+    /**
+     * One touchpad contact from a client-captured controller (the Sony USB capture), forwarded on
+     * the rich-input plane (`RichInput::Touchpad`). [finger] is the contact slot (0/1); [x]/[y]
+     * are normalized 0..65535 in SCREEN convention (+y down — the wire's fixed meaning); active
+     * false lifts the finger. Send on change only — the host holds per-slot state.
+     */
+    external fun nativeSendPadTouch(handle: Long, pad: Int, finger: Int, active: Boolean, x: Int, y: Int)
+
+    /**
+     * One motion-sensor sample from a client-captured controller (`RichInput::Motion`): gyro
+     * pitch/yaw/roll + accel, each a raw signed-16 value in the pad's own units — the host passes
+     * them straight into the virtual DualSense report. Called at the pad's report rate.
+     */
+    external fun nativeSendPadMotion(
+        handle: Long,
+        pad: Int,
+        gyroPitch: Int,
+        gyroYaw: Int,
+        gyroRoll: Int,
+        accelX: Int,
+        accelY: Int,
+        accelZ: Int,
+    )
+
     // ---- Host→client gamepad feedback: Rust pulls block ~100ms, Kotlin renders (see GamepadFeedback) ----
 
     /**

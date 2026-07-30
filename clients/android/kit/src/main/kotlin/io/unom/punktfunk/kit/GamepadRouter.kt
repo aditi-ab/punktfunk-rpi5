@@ -210,6 +210,24 @@ class GamepadRouter(context: Context, private val handle: Long, private val sett
             if (slot != null) NativeBridge.nativeSendPadHidReport(handle, index, buf, len)
         }
 
+        /** One touchpad contact on the rich plane: [finger] 0/1, x/y normalized 0..65535 in
+         *  SCREEN convention (+y down); `active = false` lifts the finger. On-change only. */
+        fun touch(finger: Int, active: Boolean, x: Int, y: Int) {
+            if (slot != null) NativeBridge.nativeSendPadTouch(handle, index, finger, active, x, y)
+        }
+
+        /** One motion sample on the rich plane (gyro pitch/yaw/roll + accel, raw device i16
+         *  units — the host passes them straight into the virtual pad's report). Per report. */
+        fun motion(gyro: IntArray, accel: IntArray) {
+            if (slot != null) {
+                NativeBridge.nativeSendPadMotion(
+                    handle, index,
+                    gyro[0], gyro[1], gyro[2],
+                    accel[0], accel[1], accel[2],
+                )
+            }
+        }
+
         /** Flush held state, signal the removal, and free the wire index. Idempotent. */
         fun close() = closeSlot(syntheticId)
     }
@@ -227,6 +245,16 @@ class GamepadRouter(context: Context, private val handle: Long, private val sett
         slots[syntheticId] = Slot(index, Gamepad.AxisMapper(handle, index))
         return ExternalPad(syntheticId, index)
     }
+
+    /**
+     * Close the slot (if any) for a physical controller a capture link just claimed. The claim
+     * detaches the kernel driver, so the system's own removal callback would close it moments
+     * later anyway — doing it at claim time makes the freed wire index deterministic for the
+     * link's [ExternalPad] instead of racing the link's first report against that callback. Safe
+     * to over-match (a same-VID/PID sibling that still exists as an InputDevice lazily reopens a
+     * slot on its next input event). Main thread, like the hot-plug callbacks.
+     */
+    fun releaseDevice(deviceId: Int) = closeSlot(deviceId)
 
     /**
      * Flush + drop every slot and unregister the hot-plug listener. Call on session teardown, AFTER

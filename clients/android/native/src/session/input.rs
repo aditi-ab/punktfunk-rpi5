@@ -406,3 +406,66 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendPadHidR
         data,
     });
 }
+
+/// `NativeBridge.nativeSendPadTouch(handle, pad, finger, active, x, y)` — one touchpad contact
+/// from a client-captured controller (the Sony USB capture), forwarded on the rich-input plane
+/// (`RichInput::Touchpad`, 0xCC). `finger`: contact slot 0/1; `x`/`y`: normalized 0..=65535 in
+/// SCREEN convention (+y down — the wire's fixed meaning); `active` 0 lifts the finger. The
+/// host's DualSense-family backends scale onto the virtual pad's touch surface. On-change only —
+/// the capture diffs, the host holds per-slot state.
+#[no_mangle]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendPadTouch(
+    _env: JNIEnv,
+    _this: JObject,
+    handle: jlong,
+    pad: jint,
+    finger: jint,
+    active: jboolean,
+    x: jint,
+    y: jint,
+) {
+    if handle == 0 {
+        return;
+    }
+    // SAFETY: live handle per the nativeConnect/nativeClose contract; send_rich_input is &self.
+    let h = unsafe { &*(handle as *const SessionHandle) };
+    let _ = h.client.send_rich_input(RichInput::Touchpad {
+        pad: (pad as u32 & 0xF) as u8,
+        finger: (finger as u32 & 0x1) as u8,
+        active: active != 0,
+        x: (x as i64).clamp(0, 65535) as u16,
+        y: (y as i64).clamp(0, 65535) as u16,
+    });
+}
+
+/// `NativeBridge.nativeSendPadMotion(handle, pad, gp, gy, gr, ax, ay, az)` — one motion sample
+/// from a client-captured controller (`RichInput::Motion`, 0xCC): gyro pitch/yaw/roll + accel,
+/// raw signed-16 values in the pad's own units, passed straight into the host's virtual
+/// DualSense report (the wire is a unit passthrough). Called from the capture thread at the
+/// controller's report rate.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendPadMotion(
+    _env: JNIEnv,
+    _this: JObject,
+    handle: jlong,
+    pad: jint,
+    gyro_pitch: jint,
+    gyro_yaw: jint,
+    gyro_roll: jint,
+    accel_x: jint,
+    accel_y: jint,
+    accel_z: jint,
+) {
+    if handle == 0 {
+        return;
+    }
+    let c = |v: jint| (v as i64).clamp(i64::from(i16::MIN), i64::from(i16::MAX)) as i16;
+    // SAFETY: live handle per the nativeConnect/nativeClose contract; send_rich_input is &self.
+    let h = unsafe { &*(handle as *const SessionHandle) };
+    let _ = h.client.send_rich_input(RichInput::Motion {
+        pad: (pad as u32 & 0xF) as u8,
+        gyro: [c(gyro_pitch), c(gyro_yaw), c(gyro_roll)],
+        accel: [c(accel_x), c(accel_y), c(accel_z)],
+    });
+}

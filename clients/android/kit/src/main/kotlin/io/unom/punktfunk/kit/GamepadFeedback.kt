@@ -46,6 +46,42 @@ class GamepadFeedback(
     private val router: GamepadRouter?,
     private val deviceVibrator: Vibrator? = null,
 ) {
+    /**
+     * A capture link's feedback renderer for the wire pads it owns, consulted BEFORE the
+     * InputDevice vibrator/lights paths. A captured controller has no [android.view.InputDevice]
+     * (its slot is an [GamepadRouter.ExternalPad] on a synthetic id, so [GamepadRouter.deviceForPad]
+     * resolves null and the platform paths no-op) — the link renders instead, by composing USB
+     * output reports on the physical pad. This is also the ONLY route to adaptive triggers:
+     * Android has no platform API for them, so without a sink a Trigger event is log-and-drop.
+     * Invoked on the feedback poll threads; implementations must be thread-safe.
+     */
+    interface PadFeedbackSink {
+        /** True when this sink renders feedback for wire pad [pad]; the render methods are only
+         *  invoked while true. Racing a pad close is fine — a late render is a harmless no-op. */
+        fun ownsPad(pad: Int): Boolean
+
+        /** One effective rumble command (`(0,0)` = stop now; else a one-shot at this level with
+         *  [backstopMs] as the self-termination net — see [GamepadFeedback.renderRumble]). */
+        fun rumble(pad: Int, low: Int, high: Int, backstopMs: Long)
+
+        /** Lightbar RGB. */
+        fun led(pad: Int, r: Int, g: Int, b: Int)
+
+        /** Player-indicator LED bitmask (low 5 bits, hid-playstation layout). */
+        fun playerLeds(pad: Int, bits: Int)
+
+        /** One adaptive-trigger effect: [which] 0 = L2, 1 = R2; [effect] = the raw DS5 trigger
+         *  block (mode byte + parameters) exactly as the game wrote it host-side. */
+        fun trigger(pad: Int, which: Int, effect: ByteArray)
+    }
+
+    /**
+     * The active capture link's sink (a [DsCapture]), or null. Wired by StreamScreen alongside
+     * [onHidRaw]; cleared before the poll threads stop.
+     */
+    @Volatile
+    var sink: PadFeedbackSink? = null
+
     private companion object {
         const val TAG = "pf.feedback"
         const val TAG_LED: Byte = 0x01
@@ -221,6 +257,12 @@ class GamepadFeedback(
         // controller 1 unconditionally rather than only motor-less pads — capability probing
         // already decided the bind, and the user opted in.
         if (pad == 0) renderDeviceRumble(low, high, durationMs)
+        // A captured pad's link renders on the physical controller itself (its slot has no
+        // InputDevice, so the vibrator bind below would resolve null and drop the command).
+        sink?.takeIf { it.ownsPad(pad) }?.let {
+            it.rumble(pad, low, high, durationMs)
+            return
+        }
         val bind = rumbleBindFor(pad) ?: return
         val lo = toAmplitude(low)
         val hi = toAmplitude(high)
@@ -313,23 +355,36 @@ class GamepadFeedback(
                 val g = buf.get().toInt() and 0xFF
                 val b = buf.get().toInt() and 0xFF
                 Log.i(TAG, "hidout pad=$pad Led r=$r g=$g b=$b") // verification line
-                if (Build.VERSION.SDK_INT >= 33) setLightbar(pad, Color.rgb(r, g, b))
+                val s = sink?.takeIf { it.ownsPad(pad) }
+                if (s != null) s.led(pad, r, g, b)
+                else if (Build.VERSION.SDK_INT >= 33) setLightbar(pad, Color.rgb(r, g, b))
             }
             TAG_PLAYER_LEDS -> {
                 val bits = buf.get().toInt() and 0x1F
                 val player = playerIndexForBits(bits)
                 Log.i(TAG, "hidout pad=$pad PlayerLeds bits=$bits player=$player") // verification line
-                if (Build.VERSION.SDK_INT >= 33) setPlayerId(pad, player)
+                val s = sink?.takeIf { it.ownsPad(pad) }
+                if (s != null) s.playerLeds(pad, bits)
+                else if (Build.VERSION.SDK_INT >= 33) setPlayerId(pad, player)
             }
             TAG_TRIGGER -> {
                 val which = buf.get().toInt() and 0xFF // 0 = L2, 1 = R2
                 val effLen = n - 3 // [pad][kind][which] header, then the effect block
-                val mode = if (effLen > 0) buf.get().toInt() and 0xFF else 0
-                // No public adaptive-trigger API on Android — parse-validate the mode + log only.
-                Log.i(
-                    TAG,
-                    "hidout pad=$pad Trigger which=$which effLen=$effLen mode=0x%02x (adaptive triggers unsupported on Android)".format(mode),
-                )
+                val s = sink?.takeIf { it.ownsPad(pad) }
+                if (s != null && effLen > 0) {
+                    // A captured DualSense: the raw trigger block replays onto the physical pad.
+                    val effect = ByteArray(effLen)
+                    buf.get(effect)
+                    Log.i(TAG, "hidout pad=$pad Trigger which=$which effLen=$effLen → captured pad") // verification line
+                    s.trigger(pad, which, effect)
+                } else {
+                    val mode = if (effLen > 0) buf.get().toInt() and 0xFF else 0
+                    // No platform adaptive-trigger API — parse-validate the mode + log only.
+                    Log.i(
+                        TAG,
+                        "hidout pad=$pad Trigger which=$which effLen=$effLen mode=0x%02x (no adaptive-trigger renderer for this pad)".format(mode),
+                    )
+                }
             }
             TAG_HID_RAW -> {
                 // As-is SC2 passthrough: a raw report the host's Steam wrote to the virtual pad —

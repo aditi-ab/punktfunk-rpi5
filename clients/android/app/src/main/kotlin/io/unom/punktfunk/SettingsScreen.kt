@@ -816,6 +816,15 @@ private fun ControllerSettings(s: Settings, update: (Settings) -> Unit, onOpenCo
                 checked = s.sc2Capture,
                 onCheckedChange = { on -> update(s.copy(sc2Capture = on)) },
             )
+            // Same no-vibrator-gate reasoning as the SC2 row: this capture renders feedback on
+            // the CONTROLLER's own motors/LEDs, not this device's.
+            ToggleRow(
+                title = "DualSense / DualShock passthrough (USB)",
+                subtitle = "Drive a USB-connected Sony pad directly — rumble on any phone, " +
+                    "plus adaptive triggers, lightbar and gyro",
+                checked = s.dsCapture,
+                onCheckedChange = { on -> update(s.copy(dsCapture = on)) },
+            )
         }
     }
 }

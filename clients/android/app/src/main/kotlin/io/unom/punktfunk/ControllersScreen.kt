@@ -44,6 +44,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import io.unom.punktfunk.kit.DsDevice
 import io.unom.punktfunk.kit.Gamepad
 import io.unom.punktfunk.kit.Sc2Capture
 import kotlinx.coroutines.delay
@@ -149,13 +150,14 @@ fun ControllersScreen(gamepadSetting: Int, onBack: () -> Unit) {
     ) {
         Text("Controllers", style = MaterialTheme.typography.headlineMedium)
 
-        // Steam Controller 2 detection: never an InputDevice (lizard mode is kb/mouse; the
-        // capture claims even those away), so it's enumerated on the capture side — USB device
-        // list + bonded BLE — and re-checked on USB hot-plug.
-        var sc2Generation by remember { mutableIntStateOf(0) }
+        // Capture-side detection, re-checked on USB hot-plug. The SC2 is never an InputDevice
+        // (lizard mode is kb/mouse; the capture claims even those away) so it's enumerated from
+        // the USB device list + bonded BLE; a Sony pad IS an InputDevice until claimed, so its
+        // row supplements the PadRow below with the capture status + the USB grant.
+        var usbGeneration by remember { mutableIntStateOf(0) }
         DisposableEffect(Unit) {
             val receiver = object : android.content.BroadcastReceiver() {
-                override fun onReceive(c: Context?, i: android.content.Intent?) { sc2Generation++ }
+                override fun onReceive(c: Context?, i: android.content.Intent?) { usbGeneration++ }
             }
             val filter = android.content.IntentFilter().apply {
                 addAction(android.hardware.usb.UsbManager.ACTION_USB_DEVICE_ATTACHED)
@@ -170,16 +172,23 @@ fun ControllersScreen(gamepadSetting: Int, onBack: () -> Unit) {
             onDispose { runCatching { context.unregisterReceiver(receiver) } }
         }
         val sc2Probe = remember { Sc2Capture(context) }
-        val sc2Usb = remember(sc2Generation) { sc2Probe.findUsbDevice() }
-        val sc2Ble = remember(sc2Generation) {
+        val sc2Usb = remember(usbGeneration) { sc2Probe.findUsbDevice() }
+        val sc2Ble = remember(usbGeneration) {
             if (context.checkSelfPermission(android.Manifest.permission.BLUETOOTH_CONNECT) ==
                 android.content.pm.PackageManager.PERMISSION_GRANTED
             ) sc2Probe.pairedBleAddress() else null
         }
         val sc2Present = sc2Usb != null || sc2Ble != null
+        val dsUsb = remember(usbGeneration) {
+            (context.getSystemService(Context.USB_SERVICE) as android.hardware.usb.UsbManager)
+                .deviceList.values.firstOrNull {
+                    it.vendorId == DsDevice.VID_SONY && it.productId in DsDevice.USB_PIDS
+                }
+        }
 
         Group("Gamepads") {
             if (sc2Present) Sc2Row(sc2Usb, activity)
+            dsUsb?.let { DsRow(it) }
             if (pads.isEmpty() && !sc2Present) {
                 Text(
                     "No controller detected. punktfunk can only forward devices Android " +
@@ -311,6 +320,96 @@ private fun Sc2Row(usbDev: android.hardware.usb.UsbDevice?, activity: MainActivi
                 }
                 else -> Text(
                     "Detected — capture engages automatically.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+    }
+}
+
+/**
+ * The Sony USB pad card — capture status + the USB grant, front-loading the permission dialog so
+ * the capture engages silently at stream start instead of interrupting it. Shown ALONGSIDE the
+ * pad's ordinary [PadRow] (unclaimed it is still an InputDevice); the capture itself only runs
+ * inside a stream, so at menu time this card is pure status.
+ */
+@Composable
+private fun DsRow(usbDev: android.hardware.usb.UsbDevice) {
+    val context = LocalContext.current
+    val settingOn = remember { SettingsStore(context).load().dsCapture }
+    val usbManager = context.getSystemService(Context.USB_SERVICE) as android.hardware.usb.UsbManager
+    var permitted by remember(usbDev) { mutableStateOf(usbManager.hasPermission(usbDev)) }
+    val model = DsDevice.modelFor(usbDev.productId)
+    val label = when (model) {
+        DsDevice.Model.DUALSENSE -> "DualSense"
+        DsDevice.Model.DUALSENSE_EDGE -> "DualSense Edge"
+        DsDevice.Model.DUALSHOCK4 -> "DualShock 4"
+        null -> return
+    }
+    // Refresh `permitted` when the grant dialog answers (the grant itself is system-recorded;
+    // this receiver only updates the card).
+    val action = "io.unom.punktfunk.DS_CONTROLLERS_USB_PERMISSION"
+    DisposableEffect(usbDev) {
+        val receiver = object : android.content.BroadcastReceiver() {
+            override fun onReceive(c: Context?, i: android.content.Intent?) {
+                if (i?.action == action) permitted = usbManager.hasPermission(usbDev)
+            }
+        }
+        androidx.core.content.ContextCompat.registerReceiver(
+            context,
+            receiver,
+            android.content.IntentFilter(action),
+            androidx.core.content.ContextCompat.RECEIVER_NOT_EXPORTED,
+        )
+        onDispose { runCatching { context.unregisterReceiver(receiver) } }
+    }
+    OutlinedCard(modifier = Modifier.fillMaxWidth()) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            Text("$label passthrough", style = MaterialTheme.typography.bodyLarge)
+            Text(
+                "Wired (USB)",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            when {
+                !settingOn -> Text(
+                    "Passthrough is disabled in Settings — enable \"DualSense / DualShock " +
+                        "passthrough (USB)\" to capture it.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                !permitted -> {
+                    Text(
+                        "Needs USB access — grant it now and streams capture the pad silently.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    OutlinedButton(onClick = {
+                        usbManager.requestPermission(
+                            usbDev,
+                            android.app.PendingIntent.getBroadcast(
+                                context, 3, // requestCode 3 — 0/1/2 are the SC2/stream grants
+                                android.content.Intent(action).setPackage(context.packageName),
+                                // MUTABLE: the USB stack appends the grant extras to this intent.
+                                android.app.PendingIntent.FLAG_MUTABLE,
+                            ),
+                        )
+                    }) {
+                        Text("Grant USB access")
+                    }
+                }
+                else -> Text(
+                    if (model == DsDevice.Model.DUALSHOCK4) {
+                        "Ready — captured at stream start: rumble, lightbar and gyro are " +
+                            "driven directly."
+                    } else {
+                        "Ready — captured at stream start: rumble, adaptive triggers, lightbar " +
+                            "and gyro are driven directly."
+                    },
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )

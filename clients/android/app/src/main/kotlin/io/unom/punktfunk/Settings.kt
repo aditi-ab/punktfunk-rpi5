@@ -111,6 +111,18 @@ data class Settings(
     val sc2Capture: Boolean = true,
 
     /**
+     * Capture a USB-connected Sony controller (DualSense / DualSense Edge / DualShock 4) and
+     * drive it directly: the app claims the pad's HID interface and renders the host's feedback
+     * by writing USB output reports — rumble works on every phone (no kernel force-feedback
+     * driver needed), and adaptive triggers + lightbar + player LEDs work at all (Android has no
+     * platform API for any of them). ON by default — it engages only when such a pad is attached
+     * over USB at stream start; uncaptured (toggle off / no permission / Bluetooth) the pad stays
+     * on the ordinary InputDevice path. USB only: Android exposes no raw path to a Bluetooth
+     * Classic pad, which is also why Sony's own Remote Play has no Android trigger support.
+     */
+    val dsCapture: Boolean = true,
+
+    /**
      * How a physical mouse drives the host — the cross-client mouse model (see [MouseMode]).
      * [MouseMode.DESKTOP] (default here) points absolutely; [MouseMode.CAPTURE] locks the pointer
      * to the stream ([android.view.View.requestPointerCapture]) and forwards raw relative motion.
@@ -204,6 +216,7 @@ class SettingsStore(context: Context) {
         autoWakeEnabled = prefs.getBoolean(K_AUTO_WAKE, true),
         rumbleOnPhone = prefs.getBoolean(K_RUMBLE_ON_PHONE, false),
         sc2Capture = prefs.getBoolean(K_SC2_CAPTURE, true),
+        dsCapture = prefs.getBoolean(K_DS_CAPTURE, true),
         mouseMode = prefs.getString(K_MOUSE_MODE, null)
             ?.let { name -> MouseMode.entries.firstOrNull { it.storedName == name } }
             // Migration: the pre-enum Boolean "pointer_capture" (true = lock the pointer). Its
@@ -234,6 +247,7 @@ class SettingsStore(context: Context) {
             .putBoolean(K_AUTO_WAKE, s.autoWakeEnabled)
             .putBoolean(K_RUMBLE_ON_PHONE, s.rumbleOnPhone)
             .putBoolean(K_SC2_CAPTURE, s.sc2Capture)
+            .putBoolean(K_DS_CAPTURE, s.dsCapture)
             .putString(K_MOUSE_MODE, s.mouseMode.storedName)
             .putBoolean(K_INVERT_SCROLL, s.invertScroll)
             .apply()
@@ -274,6 +288,7 @@ class SettingsStore(context: Context) {
         const val K_AUTO_WAKE = "auto_wake_enabled"
         const val K_RUMBLE_ON_PHONE = "rumble_on_phone"
         const val K_SC2_CAPTURE = "sc2_capture"
+        const val K_DS_CAPTURE = "ds_capture"
         const val K_MOUSE_MODE = "mouse_mode"
 
         /** Legacy Boolean the [K_MOUSE_MODE] enum replaced — read once for migration, never written. */

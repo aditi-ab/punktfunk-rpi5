@@ -54,6 +54,7 @@ import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.LifecycleOwner
+import io.unom.punktfunk.kit.DsCapture
 import io.unom.punktfunk.kit.GamepadFeedback
 import io.unom.punktfunk.kit.GamepadRouter
 import io.unom.punktfunk.kit.deviceBodyVibrator
@@ -367,13 +368,59 @@ fun StreamScreen(session: ActiveSession, onDisconnect: () -> Unit) {
                 }
             }
         }
+        // Sony pad capture (DualSense / Edge / DualShock 4, opt-out): claim a USB-connected
+        // pad's HID interface and drive it directly — rumble without a kernel force-feedback
+        // driver, plus adaptive triggers, lightbar, player LEDs and gyro/touchpad, none of which
+        // the InputDevice path can render (no platform API for any of them). Uncaptured (toggle
+        // off / permission denied / Bluetooth) the pad stays on the ordinary InputDevice path —
+        // the automatic fallback. Host feedback routes back through feedback.sink; the claim
+        // frees the pad's InputDevice slot itself (see DsCapture.startUsb), so the wire index
+        // hands over deterministically.
+        val ds = if (initialSettings.dsCapture) DsCapture(context, router) else null
+        var dsUsbReceiver: BroadcastReceiver? = null
+        if (ds != null) {
+            feedback.sink = ds
+            val usbManager = context.getSystemService(Context.USB_SERVICE) as UsbManager
+            val usbDev = ds.findUsbDevice()
+            when {
+                usbDev != null && usbManager.hasPermission(usbDev) -> ds.startUsb(usbDev)
+                usbDev != null -> {
+                    // One-time system dialog; capture engages on grant (Android remembers the
+                    // grant for as long as the device stays attached).
+                    val action = "io.unom.punktfunk.DS_USB_PERMISSION"
+                    val receiver = object : BroadcastReceiver() {
+                        override fun onReceive(c: Context?, intent: Intent?) {
+                            if (intent?.action != action) return
+                            val ok = intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)
+                            if (ok) ds.startUsb(usbDev) else Log.i("punktfunk", "Sony pad USB permission denied")
+                        }
+                    }
+                    dsUsbReceiver = receiver
+                    ContextCompat.registerReceiver(
+                        context, receiver, IntentFilter(action), ContextCompat.RECEIVER_NOT_EXPORTED,
+                    )
+                    usbManager.requestPermission(
+                        usbDev,
+                        PendingIntent.getBroadcast(
+                            context, 2, // requestCode 2 — 0/1 are the SC2 stream/menu grants
+                            Intent(action).setPackage(context.packageName),
+                            // MUTABLE: the USB stack appends the grant extras to this intent.
+                            PendingIntent.FLAG_MUTABLE,
+                        ),
+                    )
+                }
+            }
+        }
         onDispose {
             closed.set(true) // from here the handle gets freed; surfaceDestroyed must not touch it
             clip?.stop() // stop + join the clipboard poll thread BEFORE the handle is freed
             feedback.onHidRaw = null
+            feedback.sink = null
             feedback.stop() // stop + join the poll threads BEFORE the router is released / handle freed
             sc2UsbReceiver?.let { runCatching { context.unregisterReceiver(it) } }
             sc2?.stop() // release the USB/BLE link + free the wire slot (host tears the pad down)
+            dsUsbReceiver?.let { runCatching { context.unregisterReceiver(it) } }
+            ds?.stop() // rumble-stop on the physical pad + release the USB link + free the wire slot
             router.onExitArmed = null // don't poke Compose state from release()'s disarm while tearing down
             router.release() // flush every slot (nothing sticks host-side) + drop the hot-plug listener
             activity?.gamepadRouter = null
