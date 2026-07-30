@@ -368,17 +368,14 @@ jobs:
           }
           "SCRIPTING_BUNDLE=C:\t\scripting\runner-cli.js" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
-      # The UMDF drivers build IN-TREE inside the pack step (a relocated CARGO_TARGET_DIR
-      # breaks wdk-build's manifest walk), and checkout's clean wipes that tree every run —
-      # ~1 min of rebuild for crates that rarely change. Cache the in-tree target; cargo's
-      # own fingerprints decide what's still fresh after a restore.
-      - name: Cache drivers workspace target (built in-tree by the pack step)
-        uses: actions/cache@v4
-        with:
-          path: packaging/windows/drivers/target
-          key: drivers-target-${{ hashFiles('packaging/windows/drivers/**', 'crates/pf-driver-proto/**') }}
-          restore-keys: drivers-target-
-
+      # NOT cached, and it must stay that way: the UMDF drivers build IN-TREE inside the pack
+      # step (a relocated CARGO_TARGET_DIR breaks wdk-build's manifest walk), and act rotates
+      # the job workspace path (~/.cache/act/<hash>/hostexecutor) between runs. A cargo target
+      # dir restored under a DIFFERENT absolute path brings state that points at the old one:
+      # measured 2026-07-30, `pf-umdf-util` died with 14 × "unable to create file lock (os
+      # error 3)" and took the whole job with it. ~1 min of rebuild is the correct price; the
+      # same rotation is why the other Windows jobs use a fixed C:\t instead of a cached
+      # workspace-relative target.
       - name: Pack + sign installer
         shell: pwsh
         env:
