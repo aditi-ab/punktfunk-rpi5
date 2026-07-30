@@ -1,0 +1,17 @@
+# The web-console-triggered host update, as a root oneshot (planning:
+# host-update-from-web-console.md §7). Started — never enabled — by the unprivileged host via
+# `systemctl start punktfunk-update.service`, authorized by the polkit rule
+# (49-punktfunk-update.rules) for members of the `punktfunk-update` group. systemd gives us
+# single-flight (a second start while active fails) and journal capture for free; the helper
+# writes its machine-readable outcome to /var/lib/punktfunk/update-result.json.
+[Unit]
+Description=punktfunk host update (root helper)
+# Network is a hard prerequisite for every leg (package manager / sysext feed).
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/punktfunk/pf-update apply
+# The helper drives the distro package manager, which needs the real system — no sandboxing
+# directives here on purpose; the constraint is the FIXED ExecStart (no parameters exist).

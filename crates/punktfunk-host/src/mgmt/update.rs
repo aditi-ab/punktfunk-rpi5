@@ -52,6 +52,9 @@ pub(crate) struct UpdateResultInfo {
     /// The installer's own log file on this host, for diagnosis.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log_path: Option<String>,
+    /// Applied but activates on the next reboot (rpm-ostree).
+    #[serde(default)]
+    pub staged: bool,
 }
 
 /// The full update-check state for this host.
@@ -80,6 +83,10 @@ pub(crate) struct UpdateStatus {
     pub last_checked_unix: Option<u64>,
     /// Why the last check failed, verbatim, if it did.
     pub last_error: Option<String>,
+    /// This install could one-click apply, but the operator hasn't opted in yet — the
+    /// command to run (Linux: join the `punktfunk-update` group).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opt_in_hint: Option<String>,
     /// The apply in flight, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub job: Option<UpdateJobInfo>,
@@ -135,6 +142,7 @@ fn status_from(snap: update::Snapshot) -> UpdateStatus {
         }),
         last_checked_unix: snap.checked.as_ref().map(|c| c.fetched_unix),
         last_error: snap.last_error,
+        opt_in_hint: update::opt_in_hint(),
         job,
         last_result: snap.last_result.as_ref().map(|r| UpdateResultInfo {
             ok: r.ok,
@@ -144,6 +152,7 @@ fn status_from(snap: update::Snapshot) -> UpdateStatus {
             stage: r.stage.clone(),
             error: r.error.clone(),
             log_path: r.log_path.clone(),
+            staged: r.staged,
         }),
     }
 }

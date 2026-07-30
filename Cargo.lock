@@ -3048,6 +3048,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "pf-update"
+version = "0.22.2"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "pf-vdisplay"
 version = "0.22.3"
 dependencies = [

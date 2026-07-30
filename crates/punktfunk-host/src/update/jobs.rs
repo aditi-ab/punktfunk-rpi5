@@ -53,6 +53,9 @@ pub(crate) struct ResultRecord {
     /// The installer log, when one was in play by the time it failed (or succeeded).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log_path: Option<String>,
+    /// The update is applied but activates on the next reboot (rpm-ostree).
+    #[serde(default)]
+    pub staged: bool,
 }
 
 /// The live job the console polls, mirrored into `GET /update/status`.
@@ -130,6 +133,7 @@ pub(crate) fn reconcile(
             stage: None,
             error: None,
             log_path: Some(intent.log_path),
+            staged: false,
         });
     }
     if now_unix.saturating_sub(intent.started_unix) < APPLY_GRACE_SECS {
@@ -147,6 +151,7 @@ pub(crate) fn reconcile(
             intent.from, intent.to
         )),
         log_path: Some(intent.log_path),
+        staged: false,
     })
 }
 

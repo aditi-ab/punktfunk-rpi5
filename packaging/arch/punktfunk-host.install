@@ -1,5 +1,11 @@
 # pacman install scriptlet — mirrors the RPM %post / deb postinst.
+_ensure_update_group() {
+  # The (empty) opt-in group for web-console-triggered updates — nobody is auto-added.
+  getent group punktfunk-update >/dev/null 2>&1 || groupadd --system punktfunk-update 2>/dev/null || true
+}
+
 post_install() {
+  _ensure_update_group
   udevadm control --reload-rules 2>/dev/null || true
   udevadm trigger --subsystem-match=misc 2>/dev/null || true
   # Apply the UDP socket-buffer tuning now (also auto-applied at boot by systemd-sysctl).
@@ -48,6 +54,7 @@ MSG
 }
 
 post_upgrade() {
+  _ensure_update_group
   udevadm control --reload-rules 2>/dev/null || true
   sysctl -p /usr/lib/sysctl.d/99-punktfunk-net.conf >/dev/null 2>&1 || true
 }

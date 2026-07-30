@@ -164,6 +164,9 @@ post_merge() {
   install -Dm0644 /usr/lib/modules-load.d/punktfunk.conf /etc/modules-load.d/punktfunk.conf 2>/dev/null || :
   install -Dm0644 /usr/lib/udev/rules.d/60-punktfunk.rules /etc/udev/rules.d/60-punktfunk.rules 2>/dev/null || :
   udevadm control --reload 2>/dev/null || :
+  # The (empty) opt-in group for web-console-triggered updates (the sysext ships the pf-update
+  # helper + unit + polkit rule in its /usr; the group can't ride an image) — nobody is auto-added.
+  getent group punktfunk-update >/dev/null 2>&1 || groupadd --system punktfunk-update 2>/dev/null || :
   modprobe vhci-hcd 2>/dev/null || :
   # Re-fire the vhci rule against the (possibly already-present) controller so attach/detach pick up
   # the input-group ownership even when the module's original add event predated the reloaded rule.

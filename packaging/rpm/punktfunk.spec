@@ -226,7 +226,8 @@ export PUNKTFUNK_BUILD_VERSION="%{version}-%{release}"
 # back to libav VAAPI), and a failed open falls back to VAAPI so unsupported devices degrade gracefully.
 %if %{with host}
 cargo build --release --locked --features punktfunk-host/nvenc,punktfunk-host/vulkan-encode \
-  -p punktfunk-host -p punktfunk-client-linux -p punktfunk-client-session -p punktfunk-cli
+  -p punktfunk-host -p punktfunk-client-linux -p punktfunk-client-session -p punktfunk-cli \
+  -p pf-update
 %else
 # Client-only (aarch64): no host crate, so none of the encode features apply.
 cargo build --release --locked -p punktfunk-client-linux -p punktfunk-client-session -p punktfunk-cli
@@ -283,6 +284,13 @@ install -Dm0644 scripts/punktfunk-modules.conf %{buildroot}%{_prefix}/lib/module
 # UDP socket-buffer tuning (32 MB) — without it the kernel clamps the host's SO_SNDBUF to ~416 KB
 # and high-bitrate frames overflow it (send-side loss). systemd-sysctl applies it at boot.
 install -Dm0644 scripts/99-punktfunk-net.conf %{buildroot}%{_prefix}/lib/sysctl.d/99-punktfunk-net.conf
+
+# Web-console-triggered updates (host-update-from-web-console.md §7): the dep-free root
+# helper + its oneshot system unit + the polkit rule scoping it to the (shipped-empty)
+# punktfunk-update group. Also rides into the Bazzite sysext image via rpm2cpio.
+install -Dm0755 target/release/pf-update %{buildroot}%{_libexecdir}/punktfunk/pf-update
+install -Dm0644 packaging/linux/punktfunk-update.service %{buildroot}%{_unitdir}/punktfunk-update.service
+install -Dm0644 packaging/linux/49-punktfunk-update.rules %{buildroot}%{_datadir}/polkit-1/rules.d/49-punktfunk-update.rules
 
 # systemd *user* unit (the host runs in the graphical session, not as root).
 install -Dm0644 scripts/punktfunk-host.service %{buildroot}%{_userunitdir}/punktfunk-host.service
@@ -432,6 +440,9 @@ install -Dm0644 scripts/punktfunk-scripting.service %{buildroot}%{_userunitdir}/
 %{_udevrulesdir}/60-punktfunk.rules
 %dir %{_libexecdir}/punktfunk
 %{_libexecdir}/punktfunk/pf-dm-helper
+%{_libexecdir}/punktfunk/pf-update
+%{_unitdir}/punktfunk-update.service
+%{_datadir}/polkit-1/rules.d/49-punktfunk-update.rules
 %{_datadir}/polkit-1/actions/io.unom.punktfunk.dm-helper.policy
 %{_prefix}/lib/modules-load.d/punktfunk.conf
 %{_prefix}/lib/sysctl.d/99-punktfunk-net.conf
@@ -500,6 +511,8 @@ update-desktop-database %{_datadir}/applications >/dev/null 2>&1 || :
 
 %if %{with host}
 %post
+# The (empty) opt-in group for web-console-triggered updates — nobody is auto-added.
+getent group punktfunk-update >/dev/null 2>&1 || groupadd --system punktfunk-update 2>/dev/null || :
 # Reload udev so /dev/uinput picks up the new rule without a reboot (best-effort).
 udevadm control --reload-rules 2>/dev/null || :
 udevadm trigger --subsystem-match=misc 2>/dev/null || :

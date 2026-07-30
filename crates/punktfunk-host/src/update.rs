@@ -18,6 +18,8 @@
 
 pub(crate) mod detect;
 pub(crate) mod jobs;
+#[cfg(target_os = "linux")]
+mod linux;
 pub(crate) mod manifest;
 #[cfg(target_os = "windows")]
 mod windows;
@@ -72,14 +74,56 @@ pub(crate) fn apply_disabled() -> bool {
     )
 }
 
-/// What the console may offer for this install: `full` (one-click apply exists and is enabled)
-/// or `notify` (show the command). `staged` joins with the rpm-ostree leg (U2).
+/// What the console may offer for this install: `full` (one-click apply), `staged` (apply +
+/// reboot to finish — rpm-ostree), or `notify` (show the command). Linux legs additionally
+/// require the packaged root helper AND the operator's group opt-in; pacman also the
+/// root-owned full-sysupgrade config (design §5).
 pub(crate) fn apply_support() -> &'static str {
+    if apply_disabled() {
+        return "notify";
+    }
     let (kind, _) = detect::detect();
     match kind {
-        detect::InstallKind::WindowsInstaller if !apply_disabled() => "full",
+        detect::InstallKind::WindowsInstaller => "full",
+        #[cfg(target_os = "linux")]
+        detect::InstallKind::Apt | detect::InstallKind::Dnf | detect::InstallKind::Sysext
+            if linux::helper_installed() && linux::opted_in() =>
+        {
+            "full"
+        }
+        #[cfg(target_os = "linux")]
+        detect::InstallKind::RpmOstree if linux::helper_installed() && linux::opted_in() => {
+            "staged"
+        }
+        #[cfg(target_os = "linux")]
+        detect::InstallKind::Pacman
+            if linux::helper_installed() && linux::opted_in() && linux::pacman_opted_in() =>
+        {
+            "full"
+        }
         _ => "notify",
     }
+}
+
+/// The opt-in instruction for status: this install COULD one-click apply (helper shipped)
+/// but the operator hasn't joined the `punktfunk-update` group yet.
+pub(crate) fn opt_in_hint() -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        let (kind, _) = detect::detect();
+        let capable = matches!(
+            kind,
+            detect::InstallKind::Apt
+                | detect::InstallKind::Dnf
+                | detect::InstallKind::Sysext
+                | detect::InstallKind::RpmOstree
+                | detect::InstallKind::Pacman
+        );
+        if capable && !apply_disabled() && linux::helper_installed() && !linux::opted_in() {
+            return Some(linux::opt_in_hint());
+        }
+    }
+    None
 }
 
 fn feed_base() -> String {
@@ -369,7 +413,31 @@ pub(crate) fn start_apply(force: bool, session_active: bool) -> Result<(), Apply
         return Err(ApplyError::Disabled);
     }
     let (kind, channel) = detect::detect();
-    if kind != detect::InstallKind::WindowsInstaller {
+    let windows_leg = kind == detect::InstallKind::WindowsInstaller;
+    let linux_leg = matches!(
+        kind,
+        detect::InstallKind::Apt
+            | detect::InstallKind::Dnf
+            | detect::InstallKind::Sysext
+            | detect::InstallKind::RpmOstree
+            | detect::InstallKind::Pacman
+    );
+    if !windows_leg && !linux_leg {
+        return Err(ApplyError::Unsupported);
+    }
+    #[cfg(target_os = "linux")]
+    if linux_leg {
+        if !linux::helper_installed() {
+            return Err(ApplyError::Unsupported);
+        }
+        // The pacman leg additionally requires the root-owned full-sysupgrade opt-in — the
+        // helper enforces it too; refusing here keeps the console honest before any spawn.
+        if kind == detect::InstallKind::Pacman && !linux::pacman_opted_in() {
+            return Err(ApplyError::Unsupported);
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    if linux_leg {
         return Err(ApplyError::Unsupported);
     }
     if session_active && !force {
@@ -402,17 +470,24 @@ pub(crate) fn start_apply(force: bool, session_active: bool) -> Result<(), Apply
             env!("PUNKTFUNK_VERSION"),
             channel,
         );
-        let Some(asset) = checked.manifest.windows_host.clone() else {
-            return Err(ApplyError::NothingToApply);
-        };
         if !newer {
+            return Err(ApplyError::NothingToApply);
+        }
+        // Only the Windows leg needs the manifest's installer asset; the Linux legs resolve
+        // artifacts through the package manager.
+        let asset = checked.manifest.windows_host.clone();
+        if windows_leg && asset.is_none() {
             return Err(ApplyError::NothingToApply);
         }
         let version = checked.manifest.version.clone();
         let serial = checked.manifest.serial;
         rt.job = Some(jobs::JobSnapshot {
             target_version: version.clone(),
-            stage: "downloading",
+            stage: if windows_leg {
+                "downloading"
+            } else {
+                "applying"
+            },
             received_bytes: 0,
             total_bytes: None,
             started_unix: now_unix(),
@@ -420,52 +495,78 @@ pub(crate) fn start_apply(force: bool, session_active: bool) -> Result<(), Apply
         (version, serial, asset)
     };
 
-    #[cfg(target_os = "windows")]
-    {
-        tokio::task::spawn_blocking(move || {
-            let progress = |received: u64, total: Option<u64>| {
-                let mut rt = runtime().lock().unwrap();
-                if let Some(job) = rt.job.as_mut() {
-                    job.received_bytes = received;
-                    job.total_bytes = total;
-                }
-            };
-            let stage = |s: &'static str| {
-                let mut rt = runtime().lock().unwrap();
-                if let Some(job) = rt.job.as_mut() {
-                    job.stage = s;
-                }
-            };
-            match windows::run_apply(&asset, &target_version, serial, &progress, &stage) {
-                Ok(()) => {
-                    // Stage stays `restarting`; the installer is about to stop the service and
-                    // kill this process. Boot reconciliation writes the durable outcome.
-                }
-                Err((stage_name, error)) => {
-                    let record = jobs::ResultRecord {
-                        ok: false,
-                        from: env!("PUNKTFUNK_VERSION").into(),
-                        to: target_version.clone(),
-                        finished_unix: now_unix(),
-                        stage: Some(stage_name.into()),
-                        error: Some(error),
-                        log_path: None,
-                    };
-                    let _ = jobs::write_json_atomic(&jobs::result_path(), &record);
-                    runtime().lock().unwrap().job = None;
-                }
+    tokio::task::spawn_blocking(move || {
+        let stage = |s: &'static str| {
+            let mut rt = runtime().lock().unwrap();
+            if let Some(job) = rt.job.as_mut() {
+                job.stage = s;
             }
-        });
-        Ok(())
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        // Unreachable in practice (`detect` never yields WindowsInstaller off-Windows); undo
-        // the reservation defensively rather than leaking a stuck job.
-        let _ = (target_version, serial, asset);
-        runtime().lock().unwrap().job = None;
-        Err(ApplyError::Unsupported)
-    }
+        };
+        let outcome: Result<PostApply, (&'static str, String)> = {
+            #[cfg(target_os = "windows")]
+            {
+                let progress = |received: u64, total: Option<u64>| {
+                    let mut rt = runtime().lock().unwrap();
+                    if let Some(job) = rt.job.as_mut() {
+                        job.received_bytes = received;
+                        job.total_bytes = total;
+                    }
+                };
+                let asset = asset.expect("windows leg reserved with an asset");
+                windows::run_apply(&asset, &target_version, serial, &progress, &stage)
+                    .map(|()| PostApply::AwaitRestart)
+            }
+            #[cfg(target_os = "linux")]
+            {
+                let _ = &asset; // the Linux legs resolve through the package manager
+                linux::run_apply(&target_version, serial, &stage).map(|()| {
+                    // Staged / nothing-to-do wrote a durable result and this process lives
+                    // on; an in-place change wrote the intent and our restart is queued.
+                    // Either way the in-process job is finished.
+                    PostApply::Done
+                })
+            }
+            #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+            {
+                let _ = (&asset, &target_version, serial, &stage);
+                Err(("applying", "no apply leg for this platform".to_string()))
+            }
+        };
+        match outcome {
+            Ok(PostApply::AwaitRestart) => {
+                // Stage stays `restarting`; the installer is about to stop the service and
+                // kill this process. Boot reconciliation writes the durable outcome.
+            }
+            Ok(PostApply::Done) => {
+                runtime().lock().unwrap().job = None;
+            }
+            Err((stage_name, error)) => {
+                let record = jobs::ResultRecord {
+                    ok: false,
+                    from: env!("PUNKTFUNK_VERSION").into(),
+                    to: target_version.clone(),
+                    finished_unix: now_unix(),
+                    stage: Some(stage_name.into()),
+                    error: Some(error),
+                    log_path: None,
+                    staged: false,
+                };
+                let _ = jobs::write_json_atomic(&jobs::result_path(), &record);
+                runtime().lock().unwrap().job = None;
+            }
+        }
+    });
+    Ok(())
+}
+
+/// What an apply leg leaves behind for the spawn wrapper. (Each platform constructs only
+/// its own variant; the other is matched-but-never-built there.)
+#[allow(dead_code)]
+enum PostApply {
+    /// The process is about to die (installer / self-restart); reconcile owns the outcome.
+    AwaitRestart,
+    /// The leg finished in-process (staged, nothing-to-do) — clear the job.
+    Done,
 }
 
 /// Boot-time reconciliation (design §4.2): close out an intent record left by a previous

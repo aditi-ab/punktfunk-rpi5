@@ -7353,6 +7353,10 @@
             ],
             "description": "The stage that failed; absent on success."
           },
+          "staged": {
+            "type": "boolean",
+            "description": "Applied but activates on the next reboot (rpm-ostree)."
+          },
           "to": {
             "type": "string"
           }
@@ -7447,6 +7451,13 @@
                 "description": "The last verified manifest, if any check has succeeded."
               }
             ]
+          },
+          "opt_in_hint": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "This install could one-click apply, but the operator hasn't opted in yet — the\ncommand to run (Linux: join the `punktfunk-update` group)."
           }
         }
       }

@@ -49,6 +49,9 @@ TRAY_BIN="target/release/punktfunk-tray"
 # when the existing artifact was already resolved that way, and rebuilds it when it wasn't.
 echo "==> building punktfunk-tray (release, own invocation — see comment above)"
 cargo build --release -p punktfunk-tray --locked
+# The web-console-update root helper (dep-free; see crates/pf-update).
+echo "==> building pf-update (release)"
+cargo build --release -p pf-update --locked
 
 STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT
@@ -57,6 +60,14 @@ SHAREDIR="$STAGE/usr/share/$PKG"
 
 # --- file layout (matches the RPM %install) ----------------------------------
 install -Dm0755 "$BIN"                              "$STAGE/usr/bin/$PKG"
+# Web-console-triggered updates (host-update-from-web-console.md §7): root helper + its
+# oneshot unit + the polkit rule scoping `systemctl start punktfunk-update.service` to the
+# (shipped-empty) punktfunk-update group. Opt-in = joining the group; postinst creates it.
+install -Dm0755 target/release/pf-update           "$STAGE/usr/libexec/punktfunk/pf-update"
+install -Dm0644 packaging/linux/punktfunk-update.service \
+                                                   "$STAGE/usr/lib/systemd/system/punktfunk-update.service"
+install -Dm0644 packaging/linux/49-punktfunk-update.rules \
+                                                   "$STAGE/usr/share/polkit-1/rules.d/49-punktfunk-update.rules"
 install -Dm0644 scripts/60-punktfunk.rules         "$STAGE/usr/lib/udev/rules.d/60-punktfunk.rules"
 # Managed gamescope takeover on DM-autologin boxes: root helper + polkit action so the host can
 # stop/restore the display manager for the stream (the helper derives the DM unit itself).
@@ -276,6 +287,8 @@ cat > "$STAGE/DEBIAN/postinst" <<'EOF'
 #!/bin/sh
 set -e
 if [ "$1" = "configure" ]; then
+    # The (empty) opt-in group for web-console-triggered updates — nobody is auto-added.
+    getent group punktfunk-update >/dev/null 2>&1 || addgroup --system punktfunk-update 2>/dev/null || true
     # Pick up the /dev/uinput rule without a reboot (best-effort, no-op in containers).
     udevadm control --reload-rules 2>/dev/null || true
     udevadm trigger --subsystem-match=misc 2>/dev/null || true

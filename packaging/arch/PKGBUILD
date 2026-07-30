@@ -100,7 +100,8 @@ build() {
       -p punktfunk-cli
   else
   cargo build --release --locked --features punktfunk-host/nvenc,punktfunk-host/vulkan-encode \
-    -p punktfunk-host -p punktfunk-client-linux -p punktfunk-client-session -p punktfunk-cli
+    -p punktfunk-host -p punktfunk-client-linux -p punktfunk-client-session -p punktfunk-cli \
+    -p pf-update
   # The status tray in its OWN cargo invocation — load-bearing, not tidiness. Cargo unifies features
   # across everything in one build, so co-building the tray with the host pulls the host's
   # ashpd -> zbus/tokio onto the tray's shared zbus; the tray (ksni async-io + blocking, no tokio
@@ -159,6 +160,17 @@ package_punktfunk-host() {
     "$pkgdir/usr/share/polkit-1/actions/io.unom.punktfunk.dm-helper.policy"
   sed -i 's#/usr/libexec/punktfunk/pf-dm-helper#/usr/lib/punktfunk/pf-dm-helper#' \
     "$pkgdir/usr/share/polkit-1/actions/io.unom.punktfunk.dm-helper.policy"
+  # Web-console-triggered updates (host-update-from-web-console.md §7): root helper + oneshot
+  # unit + group-scoped polkit rule. Same no-libexec relocation as pf-dm-helper, with the
+  # unit's ExecStart rewritten to match. On pacman the helper additionally requires the
+  # explicit PACMAN_FULL_SYSUPGRADE opt-in (partial upgrades are against Arch doctrine).
+  install -Dm0755 "$R/target/release/pf-update"       "$pkgdir/usr/lib/punktfunk/pf-update"
+  install -Dm0644 "$R/packaging/linux/punktfunk-update.service" \
+    "$pkgdir/usr/lib/systemd/system/punktfunk-update.service"
+  sed -i 's#/usr/libexec/punktfunk/pf-update#/usr/lib/punktfunk/pf-update#' \
+    "$pkgdir/usr/lib/systemd/system/punktfunk-update.service"
+  install -Dm0644 "$R/packaging/linux/49-punktfunk-update.rules" \
+    "$pkgdir/usr/share/polkit-1/rules.d/49-punktfunk-update.rules"
   # vhci-hcd autoload — usbip transport for the virtual Steam Deck pad (Steam only adopts USB pads)
   install -Dm0644 "$R/scripts/punktfunk-modules.conf" "$pkgdir/usr/lib/modules-load.d/punktfunk.conf"
   # 32 MB UDP socket buffers (send-side headroom at high bitrate)

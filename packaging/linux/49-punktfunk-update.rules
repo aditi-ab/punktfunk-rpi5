@@ -1,0 +1,21 @@
+// Members of the `punktfunk-update` group may START exactly one unit: the punktfunk
+// root-helper oneshot that updates the punktfunk packages (planning:
+// host-update-from-web-console.md §7). The group ships EMPTY — joining it is the explicit,
+// auditable opt-in for web-console-triggered updates:
+//
+//     sudo usermod -aG punktfunk-update <your user>
+//
+// Scope notes: `verb == "start"` keeps stop/restart/enable out of the grant, and the unit
+// name pin keeps every other unit out. The unit's ExecStart is fixed and parameterless, so
+// this grant authorizes "run the system's normal update for the punktfunk packages" and
+// nothing else.
+polkit.addRule(function (action, subject) {
+    if (
+        action.id == "org.freedesktop.systemd1.manage-units" &&
+        action.lookup("unit") == "punktfunk-update.service" &&
+        action.lookup("verb") == "start" &&
+        subject.isInGroup("punktfunk-update")
+    ) {
+        return polkit.Result.YES;
+    }
+});
