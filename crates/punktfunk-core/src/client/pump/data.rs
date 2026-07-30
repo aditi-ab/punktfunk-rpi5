@@ -28,6 +28,9 @@ pub(super) struct DataPump {
     pub(super) frames_dropped: Arc<std::sync::atomic::AtomicU64>,
     pub(super) fec_recovered: Arc<std::sync::atomic::AtomicU64>,
     pub(super) bitrate_ack: Arc<Mutex<Option<u32>>>,
+    /// Outbound decode-recovery keyframe asks, counted by the control task at its send choke
+    /// point; drained per report window as the ABR's recovery signal.
+    pub(super) recovery_kf: Arc<AtomicU32>,
     /// The embedder's REQUESTED rate (0 = Automatic — the only case the ABR arms).
     pub(super) bitrate_kbps: u32,
     /// The rate the host actually configured (echoed in Welcome).
@@ -52,6 +55,7 @@ impl DataPump {
             frames_dropped,
             fec_recovered,
             bitrate_ack,
+            recovery_kf: pump_recovery_kf,
             bitrate_kbps,
             resolved_bitrate_kbps,
             negotiated_codec,
@@ -425,6 +429,10 @@ impl DataPump {
                     *acc = Default::default();
                     (count > 0).then(|| (sum / count as u64) as i64)
                 };
+                // Decode-recovery keyframe asks this window (counted at the control task's send
+                // choke point). Always drained so a discard window can't leak its count into
+                // the next one.
+                let recovery_kf_reqs = pump_recovery_kf.swap(0, Ordering::Relaxed);
                 // The window's ACTUAL delivered throughput — what the pipeline really carried, vs
                 // the target it was allowed. Wire bytes (headers + FEC) slightly overstate the
                 // media rate the decoder ingests; acceptable for the climb gate / proven-mark
@@ -446,6 +454,7 @@ impl DataPump {
                         encode_mean_us,
                         actual_kbps,
                         flush_in_window,
+                        recovery_kf_reqs,
                     )
                 };
                 if let Some(kbps) = verdict {
@@ -460,6 +469,7 @@ impl DataPump {
                         encode_mean_us = encode_mean_us.unwrap_or(-1),
                         actual_kbps,
                         flushed = flush_in_window,
+                        recovery_kf = recovery_kf_reqs,
                         "adaptive bitrate: requesting encoder re-target"
                     );
                     let _ = ctrl_tx.try_send(CtrlRequest::SetBitrate(kbps));

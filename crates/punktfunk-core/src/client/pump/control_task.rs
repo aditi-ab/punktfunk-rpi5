@@ -16,6 +16,10 @@ pub(super) struct ControlTask {
     pub(super) probe: Arc<Mutex<ProbeState>>,
     /// The latest host `BitrateChanged` ack, drained by the pump's ABR on its report tick.
     pub(super) bitrate_ack: Arc<Mutex<Option<u32>>>,
+    /// Outbound decode-recovery KEYFRAME asks, counted here because this is the one choke point
+    /// every emitter funnels through (embedder, `note_frame_index`, the pump's own asks) — the
+    /// pump drains the count per report window as the ABR's recovery signal.
+    pub(super) recovery_kf: Arc<AtomicU32>,
     pub(super) clock_offset: Arc<std::sync::atomic::AtomicI64>,
     pub(super) clock_gen: Arc<AtomicU32>,
     /// Clipboard metadata events (ClipState/ClipOffer) feed the same event plane the
@@ -40,6 +44,7 @@ impl ControlTask {
             mode_slot,
             probe,
             bitrate_ack,
+            recovery_kf,
             clock_offset,
             clock_gen,
             clip_event_tx,
@@ -72,7 +77,10 @@ impl ControlTask {
                     let bytes = match req {
                         CtrlRequest::Mode(m) => Reconfigure { mode: m }.encode(),
                         CtrlRequest::Probe(p) => p.encode(),
-                        CtrlRequest::Keyframe => RequestKeyframe.encode(),
+                        CtrlRequest::Keyframe => {
+                            recovery_kf.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            RequestKeyframe.encode()
+                        }
                         CtrlRequest::Rfi(r) => r.encode(),
                         CtrlRequest::Loss(r) => r.encode(),
                         CtrlRequest::SetBitrate(k) => SetBitrate { bitrate_kbps: k }.encode(),

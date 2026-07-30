@@ -112,6 +112,10 @@ pub(super) async fn run_pump(args: WorkerArgs) {
     // Adaptive bitrate ack slot: the control task parks the latest BitrateChanged here; the
     // pump's controller drains it on its report tick (`take()` — an ack is consumed once).
     let bitrate_ack: Arc<Mutex<Option<u32>>> = Arc::new(Mutex::new(None));
+    // Decode-recovery keyframe asks (the ABR recovery signal): the control task counts every
+    // outbound `CtrlRequest::Keyframe` — the one choke point all emitters funnel through — and
+    // the pump drains the count per report window.
+    let recovery_kf = Arc::new(AtomicU32::new(0));
     // Host-encode-latency accumulator (the ABR encode signal, see [`EncodeLatAcc`]): the
     // datagram task adds one sample per 0xCF; the pump drains a window mean per report tick.
     let encode_lat = Arc::new(Mutex::new(super::frame_channel::EncodeLatAcc::default()));
@@ -130,6 +134,7 @@ pub(super) async fn run_pump(args: WorkerArgs) {
             mode_slot,
             probe: probe.clone(),
             bitrate_ack: bitrate_ack.clone(),
+            recovery_kf: recovery_kf.clone(),
             clock_offset: clock_offset.clone(),
             clock_gen: clock_gen.clone(),
             clip_event_tx: clip_event_tx.clone(),
@@ -189,6 +194,7 @@ pub(super) async fn run_pump(args: WorkerArgs) {
         frames_dropped,
         fec_recovered,
         bitrate_ack,
+        recovery_kf,
         bitrate_kbps,
         resolved_bitrate_kbps,
         negotiated_codec,

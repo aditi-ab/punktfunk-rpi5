@@ -70,6 +70,17 @@ const CHANGE_COOLDOWN: Duration = Duration::from_millis(1500);
 /// Window shard loss beyond which the window counts bad even without an unrecoverable frame:
 /// 2 % sustained is congestion territory, not the random tail FEC exists for.
 const HEAVY_LOSS_PPM: u32 = 20_000;
+/// Decode-recovery KEYFRAME asks in one window at/above which the window is bad: the decoder
+/// asked for a fresh picture twice inside 750 ms — it is being overdriven (or repeatedly
+/// wedged), whatever loss_ppm says. This is the signal the RX-9070 field trace exposed: 14
+/// requests in 2 s at ~300 Mbps with ZERO loss, and the controller kept the rate because no
+/// loss/OWD/latency signal moved. RFI asks are deliberately NOT counted — they are the routine
+/// loss-recovery mechanism and loss_ppm already prices them in.
+const RECOVERY_KF_BAD: u32 = 2;
+/// One window at/above this many keyframe asks is SEVERE (skips the two-window confirmation):
+/// the emitters throttle at 100 ms, so 4+ inside a window means the decoder spent most of it
+/// unable to produce pictures — the user is already watching the damage.
+const RECOVERY_KF_SEVERE: u32 = 4;
 /// How far the window's mean one-way delay may sit above the rolling baseline before it counts
 /// as queue growth. 25 ms is far beyond jitter at any streamable frame rate.
 const OWD_RISE_US: i64 = 25_000;
@@ -281,7 +292,8 @@ impl BitrateController {
     /// ACTUAL delivered throughput (wire bytes received ÷ window — what the pipeline really
     /// carried, as opposed to the target it was allowed; feeds the utilization climb gate and
     /// the proven-throughput high-water mark), `flushed` = the pump's jump-to-live fired in the
-    /// window.
+    /// window, `recovery_kf` = decode-recovery keyframe asks the client sent in the window (see
+    /// [`RECOVERY_KF_BAD`]).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn on_window(
         &mut self,
@@ -293,6 +305,7 @@ impl BitrateController {
         encode_mean_us: Option<i64>,
         actual_kbps: u32,
         flushed: bool,
+        recovery_kf: u32,
     ) -> Option<u32> {
         if !self.enabled {
             return None;
@@ -366,12 +379,22 @@ impl BitrateController {
             self.proven_kbps = actual_kbps;
         }
         // SEVERE = the user already saw damage (an unrecoverable frame, a jump-to-live flush, a
-        // deep decode-latency excursion) or loss far past any blip — one window is enough.
-        // Ordinary congestion (heavy-but-recoverable loss, an OWD rise, a decode-latency rise)
-        // still needs two consecutive windows.
-        let severe =
-            dropped > 0 || flushed || loss_ppm >= SEVERE_LOSS_PPM || decode_severe || encode_severe;
-        let bad = severe || loss_ppm >= HEAVY_LOSS_PPM || owd_bad || decode_bad || encode_bad;
+        // deep decode-latency excursion, a window spent begging for keyframes) or loss far past
+        // any blip — one window is enough. Ordinary congestion (heavy-but-recoverable loss, an
+        // OWD rise, a decode-latency rise, repeated keyframe asks) still needs two consecutive
+        // windows.
+        let severe = dropped > 0
+            || flushed
+            || loss_ppm >= SEVERE_LOSS_PPM
+            || decode_severe
+            || encode_severe
+            || recovery_kf >= RECOVERY_KF_SEVERE;
+        let bad = severe
+            || loss_ppm >= HEAVY_LOSS_PPM
+            || owd_bad
+            || decode_bad
+            || encode_bad
+            || recovery_kf >= RECOVERY_KF_BAD;
         if bad {
             self.bad_windows += 1;
             self.clean_windows = 0;
@@ -485,6 +508,7 @@ mod tests {
                 None,
                 1_000_000,
                 false,
+                0,
             );
             if out.is_some() {
                 return out;
@@ -499,7 +523,17 @@ mod tests {
         let mut c = BitrateController::new(0);
         let now = Instant::now();
         assert_eq!(
-            c.on_window(now, 5, 900_000, Some(500_000), None, None, 1_000_000, true),
+            c.on_window(
+                now,
+                5,
+                900_000,
+                Some(500_000),
+                None,
+                None,
+                1_000_000,
+                true,
+                0
+            ),
             None
         );
     }
@@ -518,7 +552,8 @@ mod tests {
                 None,
                 None,
                 1_000_000,
-                false
+                false,
+                0
             ),
             None
         );
@@ -532,7 +567,8 @@ mod tests {
                 None,
                 None,
                 1_000_000,
-                false
+                false,
+                0
             ),
             Some(14_000)
         );
@@ -547,7 +583,8 @@ mod tests {
                 None,
                 None,
                 1_000_000,
-                false
+                false,
+                0
             ),
             None
         ); // bad #1 again
@@ -560,7 +597,8 @@ mod tests {
                 None,
                 None,
                 1_000_000,
-                false
+                false,
+                0
             ),
             Some(9_800)
         );
@@ -572,13 +610,13 @@ mod tests {
         let mut c = BitrateController::new(20_000);
         let start = Instant::now();
         assert_eq!(
-            c.on_window(ticks(start, 0), 1, 0, None, None, None, 1_000_000, false),
+            c.on_window(ticks(start, 0), 1, 0, None, None, None, 1_000_000, false, 0),
             Some(14_000)
         );
         // …and so does a jump-to-live flush.
         let mut c = BitrateController::new(20_000);
         assert_eq!(
-            c.on_window(ticks(start, 0), 0, 0, None, None, None, 1_000_000, true),
+            c.on_window(ticks(start, 0), 0, 0, None, None, None, 1_000_000, true, 0),
             Some(14_000)
         );
         // …and ≥6 % window loss.
@@ -592,7 +630,8 @@ mod tests {
                 None,
                 None,
                 1_000_000,
-                false
+                false,
+                0
             ),
             Some(14_000)
         );
@@ -603,18 +642,18 @@ mod tests {
         let mut c = BitrateController::new(20_000);
         let start = Instant::now();
         assert_eq!(
-            c.on_window(ticks(start, 0), 1, 0, None, None, None, 1_000_000, false),
+            c.on_window(ticks(start, 0), 1, 0, None, None, None, 1_000_000, false, 0),
             Some(14_000)
         );
         c.on_ack(14_000);
         // A severe window INSIDE the 1.5 s cooldown (tick 1 = 750 ms) → held; at the cooldown
         // boundary (tick 2 = 1.5 s) it fires.
         assert_eq!(
-            c.on_window(ticks(start, 1), 1, 0, None, None, None, 1_000_000, false),
+            c.on_window(ticks(start, 1), 1, 0, None, None, None, 1_000_000, false, 0),
             None
         );
         assert_eq!(
-            c.on_window(ticks(start, 2), 1, 0, None, None, None, 1_000_000, false),
+            c.on_window(ticks(start, 2), 1, 0, None, None, None, 1_000_000, false, 0),
             Some(9_800)
         );
     }
@@ -625,17 +664,17 @@ mod tests {
         let start = Instant::now();
         // ×0.7 of 6000 = 4200 < floor → clamped to 5000.
         assert_eq!(
-            c.on_window(ticks(start, 0), 1, 0, None, None, None, 1_000_000, false),
+            c.on_window(ticks(start, 0), 1, 0, None, None, None, 1_000_000, false, 0),
             Some(5_000)
         );
         c.on_ack(5_000);
         // At the floor, further bad windows request nothing.
         assert_eq!(
-            c.on_window(ticks(start, 6), 1, 0, None, None, None, 1_000_000, false),
+            c.on_window(ticks(start, 6), 1, 0, None, None, None, 1_000_000, false, 0),
             None
         );
         assert_eq!(
-            c.on_window(ticks(start, 7), 1, 0, None, None, None, 1_000_000, false),
+            c.on_window(ticks(start, 7), 1, 0, None, None, None, 1_000_000, false, 0),
             None
         );
     }
@@ -645,7 +684,7 @@ mod tests {
         let mut c = BitrateController::new(20_000);
         let start = Instant::now();
         assert_eq!(
-            c.on_window(ticks(start, 0), 1, 0, None, None, None, 1_000_000, false),
+            c.on_window(ticks(start, 0), 1, 0, None, None, None, 1_000_000, false, 0),
             Some(14_000)
         );
         c.on_ack(14_000);
@@ -677,6 +716,7 @@ mod tests {
                 None,
                 1_000_000,
                 false,
+                0,
             ) {
                 c.on_ack(k);
                 got.push(k);
@@ -699,7 +739,8 @@ mod tests {
                 None,
                 None,
                 1_000_000,
-                false
+                false,
+                0
             ),
             Some(40_000)
         );
@@ -714,7 +755,8 @@ mod tests {
                 None,
                 None,
                 1_000_000,
-                false
+                false,
+                0
             ),
             Some(28_000)
         );
@@ -731,6 +773,7 @@ mod tests {
                 None,
                 1_000_000,
                 false,
+                0,
             );
             if next.is_some() {
                 assert!(i >= 8, "additive climb must wait for the clean run");
@@ -745,7 +788,7 @@ mod tests {
         let mut c = BitrateController::new(0);
         c.set_ceiling(1_000_000);
         assert_eq!(
-            c.on_window(Instant::now(), 0, 0, None, None, None, 1_000_000, false),
+            c.on_window(Instant::now(), 0, 0, None, None, None, 1_000_000, false, 0),
             None
         );
         let mut c = BitrateController::new(20_000);
@@ -768,7 +811,8 @@ mod tests {
                     None,
                     None,
                     1_000_000,
-                    false
+                    false,
+                    0
                 ),
                 None
             );
@@ -783,7 +827,8 @@ mod tests {
                 None,
                 None,
                 1_000_000,
-                false
+                false,
+                0
             ),
             None
         );
@@ -796,7 +841,8 @@ mod tests {
                 None,
                 None,
                 1_000_000,
-                false
+                false,
+                0
             ),
             Some(14_000)
         );
@@ -819,7 +865,8 @@ mod tests {
                     Some(8_000),
                     None,
                     1_000_000,
-                    false
+                    false,
+                    0
                 ),
                 None
             );
@@ -835,7 +882,8 @@ mod tests {
                 Some(38_000),
                 None,
                 1_000_000,
-                false
+                false,
+                0
             ),
             None
         );
@@ -848,10 +896,94 @@ mod tests {
                 Some(40_000),
                 None,
                 1_000_000,
-                false
+                false,
+                0
             ),
             Some(14_000)
         );
+    }
+
+    #[test]
+    fn keyframe_ask_storm_alone_is_a_congestion_signal() {
+        // The RX-9070 field shape: pristine link (zero loss, flat OWD), no latency signal — but
+        // the decoder keeps begging for keyframes. Two asks per window is ordinary-bad: two
+        // consecutive windows back off ×0.7.
+        let mut c = BitrateController::new(20_000);
+        let start = Instant::now();
+        assert_eq!(
+            c.on_window(
+                ticks(start, 0),
+                0,
+                0,
+                Some(10_000),
+                None,
+                None,
+                1_000_000,
+                false,
+                2
+            ),
+            None
+        );
+        assert_eq!(
+            c.on_window(
+                ticks(start, 1),
+                0,
+                0,
+                Some(10_000),
+                None,
+                None,
+                1_000_000,
+                false,
+                2
+            ),
+            Some(14_000)
+        );
+    }
+
+    #[test]
+    fn keyframe_ask_saturation_is_severe() {
+        // The emitters throttle at 100 ms, so 4+ asks in one 750 ms window means the decoder
+        // spent most of it unable to produce pictures — one window is enough.
+        let mut c = BitrateController::new(20_000);
+        let start = Instant::now();
+        assert_eq!(
+            c.on_window(
+                ticks(start, 0),
+                0,
+                0,
+                Some(10_000),
+                None,
+                None,
+                1_000_000,
+                false,
+                4
+            ),
+            Some(14_000)
+        );
+    }
+
+    #[test]
+    fn a_single_keyframe_ask_is_not_congestion() {
+        // A lone hiccup's recovery ask must not read as congestion — windows carrying one ask
+        // stay clean (no backoff however many in a row).
+        let mut c = BitrateController::new(20_000);
+        let start = Instant::now();
+        for i in 0..4 {
+            assert_eq!(
+                c.on_window(
+                    ticks(start, i),
+                    0,
+                    0,
+                    Some(10_000),
+                    None,
+                    None,
+                    1_000_000,
+                    false,
+                    1
+                ),
+                None
+            );
+        }
     }
 
     #[test]
@@ -870,7 +1002,8 @@ mod tests {
                 Some(8_000),
                 None,
                 1_000_000,
-                false
+                false,
+                0
             ),
             Some(40_000)
         );
@@ -886,7 +1019,8 @@ mod tests {
                 Some(38_000),
                 None,
                 1_000_000,
-                false
+                false,
+                0
             ),
             None
         );
@@ -901,7 +1035,8 @@ mod tests {
                 Some(40_000),
                 None,
                 1_000_000,
-                false
+                false,
+                0
             ),
             Some(28_000)
         );
@@ -925,7 +1060,8 @@ mod tests {
                     Some(8_000),
                     None,
                     2_000,
-                    false
+                    false,
+                    0
                 ),
                 None
             );
@@ -942,7 +1078,8 @@ mod tests {
                 Some(8_000),
                 None,
                 18_000,
-                false
+                false,
+                0
             ),
             Some(27_000)
         );
@@ -966,7 +1103,8 @@ mod tests {
                 Some(8_000),
                 None,
                 20_000,
-                false
+                false,
+                0
             ),
             Some(30_000)
         );
@@ -981,7 +1119,8 @@ mod tests {
                 Some(8_000),
                 None,
                 30_000,
-                false
+                false,
+                0
             ),
             Some(45_000)
         );
@@ -1004,7 +1143,8 @@ mod tests {
                 Some(8_000),
                 None,
                 20_000,
-                false
+                false,
+                0
             ),
             Some(30_000)
         );
@@ -1020,7 +1160,8 @@ mod tests {
                     Some(4_000),
                     None,
                     600,
-                    false
+                    false,
+                    0
                 ),
                 None
             );
@@ -1043,7 +1184,8 @@ mod tests {
                     Some(8_000),
                     None,
                     1_000_000,
-                    false
+                    false,
+                    0
                 ),
                 None
             );
@@ -1059,7 +1201,8 @@ mod tests {
                 Some(60_000),
                 None,
                 1_000_000,
-                false
+                false,
+                0
             ),
             Some(14_000)
         );
@@ -1141,6 +1284,7 @@ mod tests {
                 None,
                 1_000_000,
                 false,
+                0,
             );
         }
         assert_eq!(c.host_cap_kbps, Some(794_000 + 794_000 / 8));
@@ -1163,7 +1307,8 @@ mod tests {
                     None,
                     Some(7_000),
                     1_000_000,
-                    false
+                    false,
+                    0
                 ),
                 None
             );
@@ -1177,7 +1322,8 @@ mod tests {
                 None,
                 Some(11_500),
                 1_000_000,
-                false
+                false,
+                0
             ),
             None
         );
@@ -1190,7 +1336,8 @@ mod tests {
                 None,
                 Some(12_000),
                 1_000_000,
-                false
+                false,
+                0
             ),
             Some(14_000)
         );
@@ -1212,7 +1359,8 @@ mod tests {
                     None,
                     Some(7_000),
                     1_000_000,
-                    false
+                    false,
+                    0
                 ),
                 None
             );
@@ -1226,7 +1374,8 @@ mod tests {
                 None,
                 Some(20_000),
                 1_000_000,
-                false
+                false,
+                0
             ),
             Some(14_000)
         );
@@ -1249,6 +1398,7 @@ mod tests {
                 Some(7_000),
                 1_000_000,
                 false,
+                0,
             );
         }
         let _ = c.on_window(
@@ -1260,6 +1410,7 @@ mod tests {
             Some(12_000),
             1_000_000,
             false,
+            0,
         );
         assert_eq!(
             c.on_window(
@@ -1270,7 +1421,8 @@ mod tests {
                 None,
                 Some(12_500),
                 1_000_000,
-                false
+                false,
+                0
             ),
             Some(14_000)
         );
@@ -1287,7 +1439,8 @@ mod tests {
                     None,
                     Some(15_000),
                     1_000_000,
-                    false
+                    false,
+                    0
                 ),
                 None
             );
@@ -1302,7 +1455,7 @@ mod tests {
         let mut i = 0;
         // Keep every window bad and never ack: exactly MAX_UNACKED requests, then silence.
         while i < 60 {
-            if c.on_window(ticks(start, i), 1, 0, None, None, None, 1_000_000, false)
+            if c.on_window(ticks(start, i), 1, 0, None, None, None, 1_000_000, false, 0)
                 .is_some()
             {
                 sent += 1;
