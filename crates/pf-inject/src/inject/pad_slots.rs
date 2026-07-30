@@ -4,10 +4,17 @@
 use crate::pad_gate::PadGate;
 use anyhow::Result;
 use punktfunk_core::input::MAX_PADS;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 // The unplug sweep walks a u16 `active_mask` (the wire type); every slot must have a bit.
 const _: () = assert!(MAX_PADS <= 16);
+
+/// How long a pad's `active_mask` bit must stay clear before the sweep actually drops it. A pad
+/// teardown is a whole PnP device removal (system-wide device-change broadcasts, and on re-create
+/// a full hidclass re-enumeration), so a client-side mask glitch of a few state frames must not
+/// flap devnodes. A REAL unplug just tears down one grace later; games already saw the pad go
+/// quiet.
+const SWEEP_GRACE: Duration = Duration::from_millis(300);
 
 /// The slot table + lifecycle every virtual-pad manager repeats: `Vec<Option<P>>` keyed by wire pad
 /// index, the `active_mask` unplug sweep, and the [`PadGate`]-guarded create. Extracted verbatim
@@ -21,6 +28,9 @@ const _: () = assert!(MAX_PADS <= 16);
 /// from [`ensure`](Self::ensure).
 pub struct PadSlots<P> {
     pads: Vec<Option<P>>,
+    /// When each ALLOCATED slot's `active_mask` bit was first seen clear (`None` = active, or
+    /// empty) — the [`SWEEP_GRACE`] debounce clock.
+    inactive_since: Vec<Option<Instant>>,
     /// Create-retry gate: a transient backend failure backs off and retries instead of permanently
     /// disabling every pad for the session.
     gate: PadGate,
@@ -39,6 +49,7 @@ impl<P> PadSlots<P> {
     pub fn new(label: &'static str, device: &'static str, hint: &'static str) -> PadSlots<P> {
         PadSlots {
             pads: (0..MAX_PADS).map(|_| None).collect(),
+            inactive_since: (0..MAX_PADS).map(|_| None).collect(),
             gate: PadGate::new(),
             label,
             device,
@@ -51,16 +62,35 @@ impl<P> PadSlots<P> {
         self.label
     }
 
-    /// Drop every allocated pad whose `active_mask` bit cleared (the unplug sweep run on each state
-    /// frame), logging each. Returns the swept indices as a bitmask so the caller resets its
-    /// per-index sibling state; an index another manager owns is `None` here, so it is never swept.
+    /// Drop every allocated pad whose `active_mask` bit has stayed clear for [`SWEEP_GRACE`] (the
+    /// unplug sweep run on each state frame), logging each. Returns the swept indices as a bitmask
+    /// so the caller resets its per-index sibling state; an index another manager owns is `None`
+    /// here, so it is never swept. The grace is the devnode-churn debounce: a mask that glitches
+    /// clear for a few frames and returns re-arms nothing.
     pub fn sweep(&mut self, active_mask: u16) -> u16 {
+        self.sweep_at(active_mask, Instant::now())
+    }
+
+    /// [`Self::sweep`] with an injectable clock (unit tests drive the grace window).
+    fn sweep_at(&mut self, active_mask: u16, now: Instant) -> u16 {
         let mut swept = 0u16;
         for (i, slot) in self.pads.iter_mut().enumerate() {
-            if slot.is_some() && active_mask & (1 << i) == 0 {
-                tracing::info!(index = i, "controller unplugged ({})", self.label);
-                *slot = None;
-                swept |= 1 << i;
+            if active_mask & (1 << i) != 0 {
+                self.inactive_since[i] = None; // active (again): a glitch never reaches the drop
+                continue;
+            }
+            if slot.is_none() {
+                continue;
+            }
+            match self.inactive_since[i] {
+                None => self.inactive_since[i] = Some(now), // newly inactive — start the grace
+                Some(since) if now.duration_since(since) >= SWEEP_GRACE => {
+                    tracing::info!(index = i, "controller unplugged ({})", self.label);
+                    *slot = None;
+                    self.inactive_since[i] = None;
+                    swept |= 1 << i;
+                }
+                Some(_) => {} // inside the grace — hold
             }
         }
         swept
@@ -76,6 +106,7 @@ impl<P> PadSlots<P> {
         match open(idx as u8) {
             Ok(p) => {
                 self.pads[idx] = Some(p);
+                self.inactive_since[idx] = None; // a fresh pad starts its grace clock unarmed
                 self.gate.on_success();
                 true
             }
@@ -139,14 +170,32 @@ mod tests {
         assert!(s.ensure(0, |_| Ok(0)));
         assert!(s.ensure(2, |_| Ok(2)));
         assert!(s.ensure(5, |_| Ok(5)));
-        // Mask keeps 2, clears 0 and 5; empty slots (1, 3, …) are untouched non-events.
-        let swept = s.sweep(0b0000_0100);
+        // Mask keeps 2, clears 0 and 5; empty slots (1, 3, …) are untouched non-events. The
+        // first sweep only ARMS the grace clock…
+        let t0 = Instant::now();
+        assert_eq!(s.sweep_at(0b0000_0100, t0), 0);
+        assert_eq!(s.get(0), Some(&0), "still inside the grace");
+        // …and the drop lands once the bits have stayed clear for the whole grace.
+        let swept = s.sweep_at(0b0000_0100, t0 + SWEEP_GRACE);
         assert_eq!(swept, 0b0010_0001);
         assert_eq!(s.get(0), None);
         assert_eq!(s.get(2), Some(&2));
         assert_eq!(s.get(5), None);
-        // A second identical sweep is a no-op: the indices were returned exactly once.
-        assert_eq!(s.sweep(0b0000_0100), 0);
+        // A further identical sweep is a no-op: the indices were returned exactly once.
+        assert_eq!(s.sweep_at(0b0000_0100, t0 + SWEEP_GRACE * 2), 0);
+    }
+
+    #[test]
+    fn a_mask_glitch_inside_the_grace_never_drops() {
+        // The devnode-churn debounce: a bit that clears for a few state frames and returns must
+        // not tear down (and later re-create) a whole PnP devnode.
+        let mut s = slots();
+        assert!(s.ensure(1, |_| Ok(7)));
+        let t0 = Instant::now();
+        assert_eq!(s.sweep_at(0, t0), 0); // bit clears — grace armed
+        assert_eq!(s.sweep_at(0b0000_0010, t0 + SWEEP_GRACE / 2), 0); // bit returns — disarmed
+        assert_eq!(s.sweep_at(0b0000_0010, t0 + SWEEP_GRACE * 10), 0);
+        assert_eq!(s.get(1), Some(&7), "the glitch never reached the drop");
     }
 
     #[test]
@@ -166,7 +215,9 @@ mod tests {
     fn recreate_after_sweep_resets_freshness() {
         let mut s = slots();
         assert!(s.ensure(4, |_| Ok(1)));
-        s.sweep(0);
+        let t0 = Instant::now();
+        s.sweep_at(0, t0);
+        s.sweep_at(0, t0 + SWEEP_GRACE);
         assert_eq!(s.get(4), None);
         // The slot is free again → a fresh create (true) with a new value.
         assert!(s.ensure(4, |_| Ok(2)));
