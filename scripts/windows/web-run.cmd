@@ -59,4 +59,69 @@ if not exist "%BUN%" (
   echo [punktfunk-web] bundled bun runtime missing at "%BUN%".
   exit /b 1
 )
+
+rem Supervise bun instead of exiting with it. The task registers RestartCount=10/RestartInterval=PT1M,
+rem but Task Scheduler honours restart-on-failure only when the action CRASHES or fails to start -
+rem never for a plain non-zero exit - so before this loop any bun exit parked the console until the
+rem next boot or interactive logon. Seen on glass 2026-07-30 (0.22.3 upgrade): `web setup` started the
+rem task one second after the upgraded host service came up, bun exited at once (Last Run Result
+rem 0xFFFFFFFF), and the console stayed down for hours on a box whose host was streaming perfectly -
+rem which reads to the operator as "the host is gone". A single `schtasks /run /tn PunktfunkWeb`
+rem revived it, i.e. whatever blocked the start was transient. That is exactly what a retry is for.
+rem
+rem Restart indefinitely for a console that served for a while and then died, but refuse to spin
+rem forever on an install that can never work: PFFAILS counts only CONSECUTIVE fast exits and any run
+rem lasting >= PFGOODSEC resets it, so a genuine crash-loop still surfaces as a failed task after
+rem ~1 min of trying (the boot + logon triggers remain the outer backstop). Same shape as the Linux
+rem unit's Restart= + StartLimitIntervalSec=0.
+rem
+rem INVARIANT for anything that STOPS the console (the installer's StopBunRuntimes, the host's
+rem `stop_web_console`): end the TASK - `schtasks /end /tn PunktfunkWeb` / `Stop-ScheduledTask` -
+rem which takes this launcher down with it. Killing bun.exe ALONE is now undone by the loop below,
+rem which will relaunch it and re-lock the file you were trying to replace.
+set /a PFMAXFAILS=10
+set /a PFGOODSEC=60
+rem `timeout` needs a console this task does not have; `ping -n N` sleeps about N-1 seconds.
+set /a PFDELAYPINGS=6
+set /a PFFAILS=0
+
+:pfrun
+call :pfnow PFT0
 "%BUN%" "%SERVER%"
+set "PFRC=%ERRORLEVEL%"
+call :pfnow PFT1
+set /a PFUPSEC=PFT1-PFT0
+if %PFUPSEC% LSS 0 set /a PFUPSEC=0
+if %PFUPSEC% GEQ %PFGOODSEC% (set /a PFFAILS=0) else (set /a PFFAILS+=1)
+echo [punktfunk-web] bun exited rc=%PFRC% after %PFUPSEC%s - consecutive fast exits %PFFAILS%/%PFMAXFAILS%
+if %PFFAILS% GEQ %PFMAXFAILS% (
+  echo [punktfunk-web] giving up after %PFMAXFAILS% consecutive fast exits - check that nothing else holds TCP 47992.
+  exit /b 1
+)
+rem The payload disappearing is a deliberate stop, not a crash: an uninstall deletes it, and an
+rem upgrade replaces it. Exit 0 rather than respawning into a half-written {app} - `web setup` starts
+rem the task again at the end of an upgrade, and an uninstall wants us gone.
+if not exist "%BUN%" (
+  echo [punktfunk-web] "%BUN%" is gone - an install or uninstall is in progress; exiting instead of respawning.
+  exit /b 0
+)
+if not exist "%SERVER%" (
+  echo [punktfunk-web] "%SERVER%" is gone - an install or uninstall is in progress; exiting instead of respawning.
+  exit /b 0
+)
+ping -n %PFDELAYPINGS% 127.0.0.1 >nul 2>&1
+goto pfrun
+
+rem Unix seconds, for the uptime measurement above. Deliberately NOT parsed out of %TIME%: that is
+rem locale-formatted - 12-hour locales append " PM" and many others use ',' as the decimal separator
+rem - which makes hand-parsing it a portability trap in a launcher that ships worldwide. This runs
+rem only after bun has already exited, so the ~0.3 s cost is irrelevant. `-Command` with an inline
+rem expression is unaffected by a Restricted ExecutionPolicy (that gates script FILES). Should it
+rem ever fail, PFN is empty, `set /a` reads that as 0, and the run is counted as a fast exit - the
+rem conservative direction.
+:pfnow
+setlocal EnableExtensions
+set "PFN="
+for /f "usebackq tokens=* delims=" %%s in (`powershell -NoProfile -Command "[DateTimeOffset]::UtcNow.ToUnixTimeSeconds()"`) do set "PFN=%%s"
+endlocal & set "%~1=%PFN%"
+goto :eof

@@ -621,7 +621,31 @@ fn stop_web_console() {
     for pid in web_listener_pids() {
         run_quiet("taskkill", &["/PID", &pid, "/F"]);
     }
-    std::thread::sleep(std::time::Duration::from_secs(1));
+    // Both stops are asynchronous - `schtasks /end` returns once the end has been REQUESTED, and
+    // `taskkill /F` is TerminateProcess - so the outgoing console can still own :47992 after this
+    // returns. The very next thing `web_setup` does is start the new task, and its bun cannot bind a
+    // port the corpse still holds; the blind 1 s sleep this replaces was not always enough. Poll
+    // until the listener is really gone (~10 s), re-killing any straggler halfway through, and warn
+    // rather than block forever if something else owns the port (Apollo/Sunshine, a dev console).
+    for i in 0..40 {
+        let pids = web_listener_pids();
+        if pids.is_empty() {
+            return;
+        }
+        if i == 20 {
+            // Re-end the TASK, not just the listener: `web-run.cmd` now supervises bun and relaunches
+            // it on any exit, so killing bun alone would be undone by its own restart loop. Ending the
+            // task takes the launcher down with it, which is why the `/end` above comes first.
+            run_quiet("schtasks", &["/end", "/tn", WEB_TASK]);
+            for pid in pids {
+                run_quiet("taskkill", &["/PID", &pid, "/F"]);
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    eprintln!(
+        "warning: something still holds TCP 47992 - the web console may not start until it exits"
+    );
 }
 
 /// PIDs owning a LISTEN socket on :47992. Also the console's liveness probe (`start_web_task`).

@@ -35,7 +35,10 @@ Environment=PUNKTFUNK_UI_TLS_CERT=%h/.config/punktfunk/cert.pem
 Environment=PUNKTFUNK_UI_TLS_KEY=%h/.config/punktfunk/key.pem
 Environment=PUNKTFUNK_UI_SECURE=1
 ExecStart=/usr/bin/punktfunk-web-server
-Restart=on-failure
+# `always`, not `on-failure`: a console that exits 0 has still stopped serving, and on-failure would
+# leave it down. An explicit `systemctl --user stop` is still honoured (Restart= never fights that).
+# Windows parity: web-run.cmd likewise relaunches bun on ANY exit.
+Restart=always
 RestartSec=2
 
 [Install]
