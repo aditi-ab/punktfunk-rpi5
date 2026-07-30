@@ -569,6 +569,43 @@ fn grant_runner_secret_reads() {
             );
         }
     }
+    // The runner's OWN bundle, in the install dir rather than under the config dir. Same reason as
+    // RUNNER_UNIT_DIRS: bun opens the file it is asked to run requesting FILE_WRITE_ATTRIBUTES on
+    // top of read, and {app}\scripting only carries Users:(RX), which LocalService reaches through
+    // Authenticated Users. So `bun runner-cli.js` died with
+    //   error: EPERM reading "C:\Program Files\punktfunk\scripting\runner-cli.js"
+    // the task exited 1 within a second of every start, and the console showed the runner as
+    // enabled-but-not-running with nothing to explain it. The unit dirs were given (RX,WA) when
+    // that behaviour was first found on-glass; the entry script itself was missed, so the runner
+    // could never start at all. Verified on glass: without this the task is Ready/lastResult=1,
+    // with it the task is Running and `GET /store/runtime` reports running:true.
+    // WA touches timestamps and the read-only bit, never content, so "code is read-only — a plugin
+    // cannot rewrite itself" still holds for the runner's own bundle.
+    if let Some(dir) = runner_bundle_dir() {
+        let ok = Command::new(icacls_path())
+            .arg(&dir)
+            .args(["/grant:r", &format!("{LOCAL_SERVICE_SID}:(OI)(CI)(RX,WA)")])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if !ok {
+            eprintln!(
+                "warning: could not grant LocalService read on {} - the plugin runner will not \
+                 start (bun exits EPERM on its own entry script)",
+                dir.display()
+            );
+        }
+    }
+}
+
+/// `{app}\scripting` — where the installer lays down `runner-cli.js` + `scripting-run.cmd`
+/// (packaging/windows/punktfunk-host.iss), resolved from the running exe like
+/// [`runner_command`] does. `None` when the exe path cannot be resolved; callers treat that as
+/// "nothing to grant" rather than failing the whole enable.
+#[cfg(target_os = "windows")]
+fn runner_bundle_dir() -> Option<std::path::PathBuf> {
+    Some(std::env::current_exe().ok()?.parent()?.join("scripting"))
 }
 
 /// Best-effort removal of the LocalService read grants when the runner is switched off — the
@@ -602,6 +639,17 @@ fn revoke_runner_secret_reads() {
         let _ = Command::new(icacls_path())
             .arg(&path)
             .args(["/remove:g", USERS_SID])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+    // …and the bundle dir in the install tree, which is not under `cfg` so the loop above misses
+    // it. Removing the explicit ACE leaves the inherited Users:(RX) from Program Files, so it
+    // reverts to plain read-only rather than losing access altogether.
+    if let Some(dir) = runner_bundle_dir().filter(|d| d.exists()) {
+        let _ = Command::new(icacls_path())
+            .arg(&dir)
+            .args(["/remove:g", LOCAL_SERVICE_SID])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status();
