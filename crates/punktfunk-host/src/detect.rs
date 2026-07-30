@@ -19,6 +19,14 @@
 
 use std::sync::OnceLock;
 
+/// Lowercased executable basenames (no `.exe`) of every running process — the same snapshot the
+/// conflicting-host scan uses, exposed for the few callers that need to ask "is X running?"
+/// without duplicating a Toolhelp walk. Best-effort: an empty vec means "could not tell", never
+/// "nothing is running", so callers must not read absence as proof.
+pub(crate) fn running_process_names() -> Vec<String> {
+    platform::running_processes()
+}
+
 #[cfg(target_os = "windows")]
 #[path = "detect/windows.rs"]
 mod platform;

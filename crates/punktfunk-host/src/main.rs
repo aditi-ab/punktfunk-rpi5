@@ -95,6 +95,10 @@ mod session_status;
 mod sleep_inhibit;
 mod spike;
 mod stats_recorder;
+// Start/stop/status for the per-user tray — the recovery path it has never had of its own.
+#[cfg(target_os = "windows")]
+#[path = "windows/tray.rs"]
+mod tray;
 // The plugin store: signed catalogs, tiered trust, and install/uninstall jobs that run through the
 // same runner CLI the `plugins` subcommand uses (design/plugin-store.md).
 mod store;
@@ -275,6 +279,7 @@ fn is_management_cli(args: &[String]) -> bool {
         Some("plugins")
         | Some("driver")
         | Some("web")
+        | Some("tray")
         | Some("openapi")
         | Some("library")
         | Some("detect-conflicts")
@@ -666,6 +671,11 @@ fn real_main() -> Result<()> {
         Some("driver") => install::driver_main(&args[1..]),
         #[cfg(target_os = "windows")]
         Some("web") => install::web_main(&args[1..]),
+        // The tray's only recovery path: it is a per-user GUI process whose HKLM Run value fires
+        // solely at sign-in, so anything that kills one (an upgrade, a crash) otherwise left the
+        // operator iconless until the next logon.
+        #[cfg(target_os = "windows")]
+        Some("tray") => tray::main(&args[1..]),
         Some("-h") | Some("--help") | Some("help") | None => {
             print_usage();
             Ok(())
@@ -899,6 +909,8 @@ USAGE:
                                               (secure default; add --gamestream for Moonlight compat)
     punktfunk-host plugins <CMD>              install/run host plugins (add, remove, list, enable,
                                               disable, status) — `plugins --help` for details
+    punktfunk-host tray <CMD>                 status-tray lifecycle (start, stop, status) — Windows;
+                                              `start` is how you get the icon back without a re-logon
     punktfunk-host openapi                    print the management API's OpenAPI document (codegen)
     punktfunk-host punktfunk1-host [OPTIONS]  native punktfunk/1 host (QUIC control + UDP data plane)
     punktfunk-host probe-compositor           exit 0 iff the compositor is up + ready (bringup gate)
