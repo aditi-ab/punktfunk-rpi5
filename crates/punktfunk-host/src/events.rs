@@ -215,6 +215,10 @@ pub enum EventKind {
         /// tray render the right "how to update" hint without a second call.
         install_kind: String,
     },
+    /// A host update completed: emitted by boot-time reconciliation, i.e. by the NEW binary's
+    /// first start after a successful apply.
+    #[serde(rename = "update.applied")]
+    UpdateApplied { from: String, to: String },
     #[serde(rename = "plugins.changed")]
     PluginsChanged {
         /// The plugin whose registration changed (registered, restarted, deregistered, or
@@ -256,6 +260,7 @@ impl EventKind {
             EventKind::DisplayReleased { .. } => "display.released",
             EventKind::LibraryChanged { .. } => "library.changed",
             EventKind::UpdateAvailable { .. } => "update.available",
+            EventKind::UpdateApplied { .. } => "update.applied",
             EventKind::PluginsChanged { .. } => "plugins.changed",
             EventKind::StoreChanged => "store.changed",
             EventKind::HostStarted { .. } => "host.started",

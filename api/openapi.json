@@ -3433,6 +3433,58 @@
         }
       }
     },
+    "/api/v1/update/apply": {
+      "post": {
+        "tags": [
+          "update"
+        ],
+        "summary": "Apply the available update",
+        "description": "Starts the one-click apply for install kinds that support it (Windows installer). The\nrequest carries no version or URL — the host installs exactly what its verified manifest\nannounced. Progress is polled via `GET /update/status` (`job`); the host restarts as part\nof the apply, and the outcome lands in `last_result` after it comes back.",
+        "operationId": "applyUpdate",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ApplyRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "Apply started — poll `GET /update/status`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UpdateStatus"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Refused: unsupported install kind, apply disabled (PUNKTFUNK_UPDATE_APPLY=0), a job already running, an active streaming session without `force`, or nothing newer to apply",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/update/check": {
       "post": {
         "tags": [
@@ -3845,6 +3897,15 @@
           "vendor": {
             "type": "string",
             "description": "`nvidia` | `amd` | `intel` | `other`."
+          }
+        }
+      },
+      "ApplyRequest": {
+        "type": "object",
+        "properties": {
+          "force": {
+            "type": "boolean",
+            "description": "Proceed even while a streaming session is live (the stream will drop when the host\nrestarts — the console warns before sending this)."
           }
         }
       },
@@ -4910,6 +4971,29 @@
               "version": {
                 "type": "string",
                 "description": "The newer release's version string."
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "A host update completed: emitted by boot-time reconciliation, i.e. by the NEW binary's\nfirst start after a successful apply.",
+            "required": [
+              "from",
+              "to",
+              "kind"
+            ],
+            "properties": {
+              "from": {
+                "type": "string"
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "update.applied"
+                ]
+              },
+              "to": {
+                "type": "string"
               }
             }
           },
@@ -7155,6 +7239,44 @@
           }
         }
       },
+      "UpdateJobInfo": {
+        "type": "object",
+        "description": "A running apply job (or a spawned installer that hasn't resolved yet).",
+        "required": [
+          "target_version",
+          "stage",
+          "received_bytes",
+          "started_unix"
+        ],
+        "properties": {
+          "received_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "stage": {
+            "type": "string",
+            "description": "`downloading` | `verifying` | `applying` | `restarting`."
+          },
+          "started_unix": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "target_version": {
+            "type": "string",
+            "description": "The version being installed."
+          },
+          "total_bytes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
       "UpdateManifestInfo": {
         "type": "object",
         "description": "One channel's manifest facts, as much as the console renders.",
@@ -7187,6 +7309,52 @@
           "version": {
             "type": "string",
             "description": "The released version this manifest announces."
+          }
+        }
+      },
+      "UpdateResultInfo": {
+        "type": "object",
+        "description": "Durable outcome of the most recent apply attempt (survives the host's own restart).",
+        "required": [
+          "ok",
+          "from",
+          "to",
+          "finished_unix"
+        ],
+        "properties": {
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "finished_unix": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "from": {
+            "type": "string"
+          },
+          "log_path": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The installer's own log file on this host, for diagnosis."
+          },
+          "ok": {
+            "type": "boolean"
+          },
+          "stage": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The stage that failed; absent on success."
+          },
+          "to": {
+            "type": "string"
           }
         }
       },
@@ -7231,6 +7399,17 @@
             "type": "string",
             "description": "How this host was installed: `windows-installer` | `sysext` | `rpm-ostree` | `apt` |\n`dnf` | `pacman` | `steamos-source` | `nix` | `source`."
           },
+          "job": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/UpdateJobInfo",
+                "description": "The apply in flight, if any."
+              }
+            ]
+          },
           "last_checked_unix": {
             "type": [
               "integer",
@@ -7246,6 +7425,17 @@
               "null"
             ],
             "description": "Why the last check failed, verbatim, if it did."
+          },
+          "last_result": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/UpdateResultInfo",
+                "description": "Outcome of the most recent apply attempt."
+              }
+            ]
           },
           "manifest": {
             "oneOf": [

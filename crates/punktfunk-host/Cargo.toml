@@ -198,6 +198,14 @@ usbip-sim = { path = "vendor/usbip-sim" }
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Security",
+    # WinVerifyTrust + WTHelper* — Authenticode verification of a downloaded host installer
+    # before the update apply spawns it (update/windows.rs). The WTHelper accessors are gated
+    # behind the Catalog+Sip features in windows-rs, hence the extra two.
+    "Win32_Security_WinTrust",
+    "Win32_Security_Cryptography_Catalog",
+    "Win32_Security_Cryptography_Sip",
+    # CERT_CONTEXT for the signing-leaf fingerprint pin (same file).
+    "Win32_Security_Cryptography",
     # ConvertStringSecurityDescriptorToSecurityDescriptorW — the SDDL on the virtual-DualSense
     # shared-memory section (inject/dualsense_windows.rs) so the UMDF host can open it.
     "Win32_Security_Authorization",

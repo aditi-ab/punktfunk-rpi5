@@ -104,6 +104,10 @@ pub async fn run(
     stats: Arc<crate::stats_recorder::StatsRecorder>,
     gamestream_enabled: bool,
 ) -> Result<()> {
+    // Close out any update-intent record a previous apply left behind (the update reports its
+    // own outcome across its own restart — update/jobs.rs). Once per boot, before serving.
+    crate::update::reconcile_at_boot();
+
     // The mgmt API is HTTPS + token-authenticated ALWAYS (even on loopback): `parse_serve`
     // guarantees a token (CLI flag / env / persisted ~/.config/punktfunk/mgmt-token / generated).
     // A blank token is treated as none — fail loudly rather than ever serve unauthenticated.
@@ -260,7 +264,8 @@ fn api_router_parts() -> (Router<Arc<MgmtState>>, utoipa::openapi::OpenApi) {
                 .routes(routes!(store::put_source, store::delete_source))
                 .routes(routes!(store::get_runtime, store::set_runtime))
                 .routes(routes!(update::get_update_status))
-                .routes(routes!(update::force_update_check)),
+                .routes(routes!(update::force_update_check))
+                .routes(routes!(update::apply_update)),
         )
         .split_for_parts()
 }

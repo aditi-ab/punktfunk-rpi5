@@ -17,7 +17,10 @@
 //! status then reports `check_disabled` and carries whatever identity facts need no network.
 
 pub(crate) mod detect;
+pub(crate) mod jobs;
 pub(crate) mod manifest;
+#[cfg(target_os = "windows")]
+mod windows;
 
 use crate::store::index::PublicKey;
 use manifest::Manifest;
@@ -59,6 +62,26 @@ pub(crate) fn check_disabled() -> bool {
     )
 }
 
+/// One-click apply disabled by operator config — the host-side kill switch (design §4.2): the
+/// apply route 409s and status reports `notify` even on kinds an apply leg exists for. The
+/// check surface is unaffected.
+pub(crate) fn apply_disabled() -> bool {
+    matches!(
+        std::env::var("PUNKTFUNK_UPDATE_APPLY").as_deref(),
+        Ok("0") | Ok("false") | Ok("off")
+    )
+}
+
+/// What the console may offer for this install: `full` (one-click apply exists and is enabled)
+/// or `notify` (show the command). `staged` joins with the rpm-ostree leg (U2).
+pub(crate) fn apply_support() -> &'static str {
+    let (kind, _) = detect::detect();
+    match kind {
+        detect::InstallKind::WindowsInstaller if !apply_disabled() => "full",
+        _ => "notify",
+    }
+}
+
 fn feed_base() -> String {
     std::env::var("PUNKTFUNK_UPDATE_FEED")
         .ok()
@@ -96,6 +119,8 @@ struct Runtime {
     /// The manifest version an `update.available` event was already emitted for, so a
     /// steady-state "newer exists" doesn't re-announce every 6 h.
     announced: Option<String>,
+    /// The live apply job, when one is running (single-flight).
+    job: Option<jobs::JobSnapshot>,
 }
 
 fn runtime() -> &'static Mutex<Runtime> {
@@ -277,6 +302,8 @@ pub(crate) fn snapshot_and_maybe_refresh() -> Snapshot {
         Snapshot {
             checked: rt.checked.clone(),
             last_error: rt.last_error.clone(),
+            job: rt.job.clone(),
+            last_result: jobs::read_result(&jobs::result_path()),
         }
     };
     if kick {
@@ -308,6 +335,8 @@ pub(crate) async fn force_check() -> Result<Snapshot, ForceError> {
     Ok(Snapshot {
         checked: rt.checked.clone(),
         last_error: rt.last_error.clone(),
+        job: rt.job.clone(),
+        last_result: jobs::read_result(&jobs::result_path()),
     })
 }
 
@@ -316,13 +345,188 @@ pub(crate) enum ForceError {
     TooSoon,
 }
 
+// ---------------------------------------------------------------- apply (U1: Windows)
+
+/// Why an apply request was refused (mapped to 409s by the API layer).
+pub(crate) enum ApplyError {
+    /// This install kind has no one-click leg (or the operator kill switch is on) — the
+    /// console shows the command instead.
+    Unsupported,
+    /// `PUNKTFUNK_UPDATE_APPLY=0`.
+    Disabled,
+    /// An apply is already running (or a spawned installer hasn't resolved yet).
+    JobRunning,
+    /// A stream is live and the request didn't say `force`.
+    SessionActive,
+    /// No verified manifest announcing something newer (or it lacks the Windows asset).
+    NothingToApply,
+}
+
+/// Start the (Windows) apply pipeline. The request carries **no version, url, or channel** —
+/// everything comes from the verified cached manifest (invariant §0.3 of the design).
+pub(crate) fn start_apply(force: bool, session_active: bool) -> Result<(), ApplyError> {
+    if apply_disabled() {
+        return Err(ApplyError::Disabled);
+    }
+    let (kind, channel) = detect::detect();
+    if kind != detect::InstallKind::WindowsInstaller {
+        return Err(ApplyError::Unsupported);
+    }
+    if session_active && !force {
+        return Err(ApplyError::SessionActive);
+    }
+
+    let (target_version, serial, asset) = {
+        let mut rt = runtime().lock().unwrap();
+        if rt.job.is_some() {
+            return Err(ApplyError::JobRunning);
+        }
+        // A spawned installer that hasn't resolved (fresh intent, old version) is still an
+        // apply in flight — reconcile owns it; don't start a second one under it.
+        if matches!(
+            jobs::reconcile(
+                jobs::read_intent(&jobs::intent_path()),
+                env!("PUNKTFUNK_VERSION"),
+                now_unix()
+            ),
+            jobs::Reconciled::StillApplying
+        ) {
+            return Err(ApplyError::JobRunning);
+        }
+        let Some(checked) = rt.checked.as_ref() else {
+            return Err(ApplyError::NothingToApply);
+        };
+        let newer = detect::is_newer(
+            &checked.manifest.version,
+            checked.manifest.ci_run,
+            env!("PUNKTFUNK_VERSION"),
+            channel,
+        );
+        let Some(asset) = checked.manifest.windows_host.clone() else {
+            return Err(ApplyError::NothingToApply);
+        };
+        if !newer {
+            return Err(ApplyError::NothingToApply);
+        }
+        let version = checked.manifest.version.clone();
+        let serial = checked.manifest.serial;
+        rt.job = Some(jobs::JobSnapshot {
+            target_version: version.clone(),
+            stage: "downloading",
+            received_bytes: 0,
+            total_bytes: None,
+            started_unix: now_unix(),
+        });
+        (version, serial, asset)
+    };
+
+    #[cfg(target_os = "windows")]
+    {
+        tokio::task::spawn_blocking(move || {
+            let progress = |received: u64, total: Option<u64>| {
+                let mut rt = runtime().lock().unwrap();
+                if let Some(job) = rt.job.as_mut() {
+                    job.received_bytes = received;
+                    job.total_bytes = total;
+                }
+            };
+            let stage = |s: &'static str| {
+                let mut rt = runtime().lock().unwrap();
+                if let Some(job) = rt.job.as_mut() {
+                    job.stage = s;
+                }
+            };
+            match windows::run_apply(&asset, &target_version, serial, &progress, &stage) {
+                Ok(()) => {
+                    // Stage stays `restarting`; the installer is about to stop the service and
+                    // kill this process. Boot reconciliation writes the durable outcome.
+                }
+                Err((stage_name, error)) => {
+                    let record = jobs::ResultRecord {
+                        ok: false,
+                        from: env!("PUNKTFUNK_VERSION").into(),
+                        to: target_version.clone(),
+                        finished_unix: now_unix(),
+                        stage: Some(stage_name.into()),
+                        error: Some(error),
+                        log_path: None,
+                    };
+                    let _ = jobs::write_json_atomic(&jobs::result_path(), &record);
+                    runtime().lock().unwrap().job = None;
+                }
+            }
+        });
+        Ok(())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        // Unreachable in practice (`detect` never yields WindowsInstaller off-Windows); undo
+        // the reservation defensively rather than leaking a stuck job.
+        let _ = (target_version, serial, asset);
+        runtime().lock().unwrap().job = None;
+        Err(ApplyError::Unsupported)
+    }
+}
+
+/// Boot-time reconciliation (design §4.2): close out an intent record left by a previous
+/// apply. Called once from `mgmt::run` before the API serves.
+pub(crate) fn reconcile_at_boot() {
+    let path = jobs::intent_path();
+    match jobs::reconcile(
+        jobs::read_intent(&path),
+        env!("PUNKTFUNK_VERSION"),
+        now_unix(),
+    ) {
+        jobs::Reconciled::None | jobs::Reconciled::StillApplying => {}
+        jobs::Reconciled::Success(record) => {
+            tracing::info!(from = %record.from, to = %record.to, "host update applied");
+            let _ = jobs::write_json_atomic(&jobs::result_path(), &record);
+            let _ = std::fs::remove_file(&path);
+            crate::events::emit(crate::events::EventKind::UpdateApplied {
+                from: record.from,
+                to: record.to,
+            });
+        }
+        jobs::Reconciled::Failed(record) => {
+            tracing::warn!(
+                from = %record.from,
+                to = %record.to,
+                error = record.error.as_deref().unwrap_or(""),
+                "host update did NOT stick"
+            );
+            let _ = jobs::write_json_atomic(&jobs::result_path(), &record);
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
 /// What status hands to the API layer.
 pub(crate) struct Snapshot {
     pub checked: Option<Checked>,
     pub last_error: Option<String>,
+    /// The live apply job, when one runs. When the process was restarted mid-apply this is
+    /// `None` but a fresh intent still reads as in-flight — the API layer surfaces that via
+    /// [`Snapshot::applying_from_intent`].
+    pub job: Option<jobs::JobSnapshot>,
+    /// Durable outcome of the most recent apply attempt.
+    pub last_result: Option<jobs::ResultRecord>,
 }
 
 impl Snapshot {
+    /// An apply is in flight even though no in-process job exists: a fresh intent record from
+    /// a spawn that hasn't resolved (this process may be the OLD host in its last seconds, or
+    /// a restarted host inside the grace window). The API surfaces it as a `restarting` job.
+    pub(crate) fn applying_from_intent(&self) -> Option<jobs::IntentRecord> {
+        if self.job.is_some() {
+            return None;
+        }
+        let intent = jobs::read_intent(&jobs::intent_path())?;
+        match jobs::reconcile(Some(intent.clone()), env!("PUNKTFUNK_VERSION"), now_unix()) {
+            jobs::Reconciled::StillApplying => Some(intent),
+            _ => None,
+        }
+    }
+
     /// The stale-feed hint: last successful check is fine but the manifest itself was
     /// published suspiciously long ago (freeze detection, design §3.2).
     pub(crate) fn stale(&self) -> bool {
@@ -394,6 +598,8 @@ mod tests {
                 fetched_unix: now_unix(),
             }),
             last_error: None,
+            job: None,
+            last_result: None,
         };
         assert!(!mk(now_unix()).stale());
         assert!(mk(now_unix() - STALE_AFTER.as_secs() - 10).stale());
