@@ -95,9 +95,10 @@ build() {
   # Pure Rust `ash` (no new lib, no link-time deps); default on for HEVC (PUNKTFUNK_VULKAN_ENCODE=0
   # opts back to libav VAAPI), and a failed open falls back to VAAPI so unsupported devices are safe.
   if [ "$CARCH" = 'aarch64' ]; then
-    # Client-only: no host crate, so none of the encode features below apply.
+    # Client-only: no host crate, so none of the encode features below apply. pf-update still
+    # builds — the client package ships its own copy for `--apply-update`.
     cargo build --release --locked -p punktfunk-client-linux -p punktfunk-client-session \
-      -p punktfunk-cli
+      -p punktfunk-cli -p pf-update
   else
   cargo build --release --locked --features punktfunk-host/nvenc,punktfunk-host/vulkan-encode \
     -p punktfunk-host -p punktfunk-client-linux -p punktfunk-client-session -p punktfunk-cli \
@@ -164,7 +165,7 @@ package_punktfunk-host() {
   # unit + group-scoped polkit rule. Same no-libexec relocation as pf-dm-helper, with the
   # unit's ExecStart rewritten to match. On pacman the helper additionally requires the
   # explicit PACMAN_FULL_SYSUPGRADE opt-in (partial upgrades are against Arch doctrine).
-  install -Dm0755 "$R/target/release/pf-update"       "$pkgdir/usr/lib/punktfunk/pf-update"
+  install -Dm0755 "$T/pf-update"                      "$pkgdir/usr/lib/punktfunk/pf-update"
   install -Dm0644 "$R/packaging/linux/punktfunk-update.service" \
     "$pkgdir/usr/lib/systemd/system/punktfunk-update.service"
   sed -i 's#/usr/libexec/punktfunk/pf-update#/usr/lib/punktfunk/pf-update#' \
@@ -282,6 +283,27 @@ package_punktfunk-client() {
   # 32 MB UDP recv buffer (so high-bitrate streams don't overflow the kernel socket buffer).
   install -Dm0644 "$R/scripts/99-punktfunk-client-net.conf" \
     "$pkgdir/usr/lib/sysctl.d/99-punktfunk-client-net.conf"
+  # One-tap client updates (`punktfunk-client --apply-update`, which is what the Decky plugin
+  # runs): the same root helper the host package ships, under the CLIENT's own paths — a
+  # client-only box (a Deck) has no host package, and two packages owning one path is a hard
+  # pacman conflict. Same no-libexec relocation as the host's copy, with the unit's ExecStart
+  # rewritten to match. On pacman the helper additionally requires the explicit
+  # PACMAN_FULL_SYSUPGRADE opt-in (partial upgrades are against Arch doctrine).
+  install -Dm0755 "$T/pf-update" "$pkgdir/usr/lib/punktfunk/pf-update-client"
+  install -Dm0644 "$R/packaging/linux/punktfunk-client-update.service" \
+    "$pkgdir/usr/lib/systemd/system/punktfunk-client-update.service"
+  sed -i 's#/usr/libexec/punktfunk/pf-update#/usr/lib/punktfunk/pf-update-client#' \
+    "$pkgdir/usr/lib/systemd/system/punktfunk-client-update.service"
+  install -Dm0644 "$R/packaging/linux/49-punktfunk-client-update.rules" \
+    "$pkgdir/usr/share/polkit-1/rules.d/49-punktfunk-client-update.rules"
+  # Install-kind + channel marker for the CLIENT, read by `punktfunk-client --check-update`
+  # (planning: host-update-from-web-console.md §4.1). Its own directory, matching the RPM (where
+  # the host subpackage's %{_datadir}/punktfunk/* glob would otherwise co-own a sibling file) —
+  # one path per product across every format, so the detector has one answer to remember.
+  local _pf_client_channel=stable
+  [[ $pkgrel == 0.* ]] && _pf_client_channel=canary
+  printf 'pacman %s\n' "$_pf_client_channel" | \
+    install -Dm0644 /dev/stdin "$pkgdir/usr/share/punktfunk-client/install-kind"
   install -Dm0644 "$R/LICENSE-MIT"    "$pkgdir/usr/share/licenses/punktfunk-client/LICENSE-MIT"
   install -Dm0644 "$R/LICENSE-APACHE" "$pkgdir/usr/share/licenses/punktfunk-client/LICENSE-APACHE"
 }

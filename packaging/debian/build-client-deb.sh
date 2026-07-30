@@ -45,9 +45,15 @@ CLI_BIN="$OUTDIR/punktfunk"
 # satisfied the guard, skipped this build, and then died on `install: No such file or directory`
 # for $CLI_BIN — a confusing way to say "the CLI was never built". The arm64 leg never hit it
 # because it pre-builds nothing, so the guard always fired there and built all three.
-if [ ! -x "$BIN" ] || [ ! -x "$SESSION_BIN" ] || [ ! -x "$CLI_BIN" ]; then
-  echo "==> building $CRATE + punktfunk-client-session + punktfunk-cli (release${TARGET:+ for $TARGET})"
-  cargo build --release --locked "${CARGO_TARGET_ARGS[@]}" -p "$CRATE" -p punktfunk-client-session -p punktfunk-cli
+# pf-update joins the list: the client ships its own copy of the root helper for one-tap
+# updates (`punktfunk-client --apply-update`). Same guard rule as above — every binary this
+# script installs is tested here, so a pre-built subset can't skip the build and then die on
+# `install: No such file or directory`.
+UPDATE_BIN="$OUTDIR/pf-update"
+if [ ! -x "$BIN" ] || [ ! -x "$SESSION_BIN" ] || [ ! -x "$CLI_BIN" ] || [ ! -x "$UPDATE_BIN" ]; then
+  echo "==> building $CRATE + punktfunk-client-session + punktfunk-cli + pf-update (release${TARGET:+ for $TARGET})"
+  cargo build --release --locked "${CARGO_TARGET_ARGS[@]}" -p "$CRATE" -p punktfunk-client-session \
+    -p punktfunk-cli -p pf-update
 fi
 
 STAGE="$(mktemp -d)"
@@ -72,6 +78,27 @@ install -Dm0644 scripts/70-punktfunk-client.rules \
 # 32 MB = 0%). systemd-sysctl applies it at boot; the postinst applies it on install.
 install -Dm0644 scripts/99-punktfunk-client-net.conf \
                 "$STAGE/usr/lib/sysctl.d/99-punktfunk-client-net.conf"
+# One-tap client updates (`punktfunk-client --apply-update`, which is what the Decky plugin
+# runs): the same root helper the host package ships, under the CLIENT's own paths + its own
+# unit and polkit rule. Separate paths because dpkg refuses two packages owning one file, and a
+# client-only box must be able to install this without punktfunk-host. Opt-in = joining the
+# (shipped-empty) punktfunk-update group; postinst creates it.
+install -Dm0755 "$UPDATE_BIN"                      "$STAGE/usr/libexec/punktfunk/pf-update-client"
+install -Dm0644 packaging/linux/punktfunk-client-update.service \
+                "$STAGE/usr/lib/systemd/system/punktfunk-client-update.service"
+sed -i 's#/usr/libexec/punktfunk/pf-update#/usr/libexec/punktfunk/pf-update-client#' \
+       "$STAGE/usr/lib/systemd/system/punktfunk-client-update.service"
+install -Dm0644 packaging/linux/49-punktfunk-client-update.rules \
+                "$STAGE/usr/share/polkit-1/rules.d/49-punktfunk-client-update.rules"
+# Install-kind + channel marker for the CLIENT, read by `punktfunk-client --check-update`
+# (planning: host-update-from-web-console.md §4.1). Its own directory, matching the RPM. A
+# canary build's version carries `~ciN`; anything else is stable.
+case "$VERSION" in
+  *~ci*) _pf_client_channel=canary ;;
+  *)     _pf_client_channel=stable ;;
+esac
+printf 'apt %s\n' "$_pf_client_channel" | \
+    install -Dm0644 /dev/stdin "$STAGE/usr/share/punktfunk-client/install-kind"
 install -Dm0644 LICENSE-MIT                              "$DOCDIR/LICENSE-MIT"
 install -Dm0644 LICENSE-APACHE                           "$DOCDIR/LICENSE-APACHE"
 install -Dm0644 README.md                                "$DOCDIR/README.md"
@@ -153,6 +180,10 @@ cat > "$STAGE/DEBIAN/postinst" <<'EOF'
 #!/bin/sh
 set -e
 if [ "$1" = "configure" ]; then
+    # The (empty) opt-in group for one-tap client updates — nobody is auto-added. The host
+    # package's postinst creates the same group; addgroup is idempotent, so whichever is
+    # configured first wins and the other is a no-op.
+    getent group punktfunk-update >/dev/null 2>&1 || addgroup --system punktfunk-update 2>/dev/null || true
     # Pick up the DualSense hidraw rule without a reboot (best-effort, no-op in containers).
     udevadm control --reload-rules 2>/dev/null || true
     udevadm trigger --subsystem-match=hidraw 2>/dev/null || true

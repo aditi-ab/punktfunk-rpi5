@@ -229,8 +229,10 @@ cargo build --release --locked --features punktfunk-host/nvenc,punktfunk-host/vu
   -p punktfunk-host -p punktfunk-client-linux -p punktfunk-client-session -p punktfunk-cli \
   -p pf-update
 %else
-# Client-only (aarch64): no host crate, so none of the encode features apply.
-cargo build --release --locked -p punktfunk-client-linux -p punktfunk-client-session -p punktfunk-cli
+# Client-only (aarch64): no host crate, so none of the encode features apply. pf-update still
+# builds — the client subpackage ships its own copy for `punktfunk-client --apply-update`.
+cargo build --release --locked -p punktfunk-client-linux -p punktfunk-client-session \
+  -p punktfunk-cli -p pf-update
 %endif
 # The status tray in its OWN cargo invocation — load-bearing, not tidiness. Cargo unifies features
 # across everything in one build, so co-building the tray with the host pulls the host's
@@ -357,6 +359,24 @@ install -Dm0644 scripts/70-punktfunk-client.rules \
 install -Dm0644 scripts/99-punktfunk-client-net.conf \
                 %{buildroot}%{_prefix}/lib/sysctl.d/99-punktfunk-client-net.conf
 
+# One-tap client updates (`punktfunk-client --apply-update`, which is what the Decky plugin
+# runs): the same root helper the host subpackage ships, under the CLIENT's own paths. Separate
+# paths are not tidiness — rpm refuses two subpackages owning one file, and a client-only box
+# (a Deck, an aarch64 build with %%{without host}) must be able to install this on its own.
+install -Dm0755 target/release/pf-update %{buildroot}%{_libexecdir}/punktfunk/pf-update-client
+install -Dm0644 packaging/linux/punktfunk-client-update.service \
+                %{buildroot}%{_unitdir}/punktfunk-client-update.service
+sed -i 's#%{_libexecdir}/punktfunk/pf-update#%{_libexecdir}/punktfunk/pf-update-client#' \
+       %{buildroot}%{_unitdir}/punktfunk-client-update.service
+install -Dm0644 packaging/linux/49-punktfunk-client-update.rules \
+                %{buildroot}%{_datadir}/polkit-1/rules.d/49-punktfunk-client-update.rules
+# Install-kind + channel marker for the CLIENT, read by `punktfunk-client --check-update`. Its
+# own DIRECTORY, not just its own filename: the host subpackage claims %{_datadir}/%{name}/*
+# with a glob, so a sibling file there would be owned by both and `dnf install punktfunk
+# punktfunk-client` would fail on the conflict.
+install -d %{buildroot}%{_datadir}/punktfunk-client
+printf 'dnf %{?pf_channel}%{!?pf_channel:stable}\n' > %{buildroot}%{_datadir}/punktfunk-client/install-kind
+
 %if %{with host}
 # Headless session helpers + example config + OpenAPI doc (reference material).
 install -d %{buildroot}%{_datadir}/%{name}/headless
@@ -470,6 +490,14 @@ install -Dm0644 scripts/punktfunk-scripting.service %{buildroot}%{_userunitdir}/
 %{_datadir}/icons/hicolor/scalable/apps/io.unom.Punktfunk.svg
 %{_udevrulesdir}/70-punktfunk-client.rules
 %{_prefix}/lib/sysctl.d/99-punktfunk-client-net.conf
+# Co-owned with the host subpackage (rpm allows that for DIRECTORIES, unlike files) so a
+# client-only install — the aarch64 `%%{without host}` build — still owns the dir it created.
+%dir %{_libexecdir}/punktfunk
+%{_libexecdir}/punktfunk/pf-update-client
+%{_unitdir}/punktfunk-client-update.service
+%{_datadir}/polkit-1/rules.d/49-punktfunk-client-update.rules
+%dir %{_datadir}/punktfunk-client
+%{_datadir}/punktfunk-client/install-kind
 
 %if %{with web}
 %files web
@@ -497,6 +525,10 @@ install -Dm0644 scripts/punktfunk-scripting.service %{buildroot}%{_userunitdir}/
 %endif
 
 %post client
+# The (empty) opt-in group for one-tap client updates — nobody is auto-added. Also created by
+# the host subpackage's %%post; groupadd is idempotent, so whichever lands first wins and the
+# other is a no-op.
+getent group punktfunk-update >/dev/null 2>&1 || groupadd --system punktfunk-update 2>/dev/null || :
 # Pick up the DualSense hidraw rule without a reboot (best-effort; on rpm-ostree it
 # applies on the next boot into the layered deployment).
 udevadm control --reload-rules 2>/dev/null || :

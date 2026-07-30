@@ -1,19 +1,28 @@
-//! `pf-update` — the root helper behind web-console-triggered Linux host updates
+//! `pf-update` — the root helper behind triggered Linux package updates
 //! (planning: `host-update-from-web-console.md` §7, plan U2.1).
 //!
-//! Invoked as `pf-update apply`, normally via the `punktfunk-update.service` oneshot that a
-//! `punktfunk-update`-group member may start through polkit. **It takes zero
-//! attacker-influenceable parameters**: no versions, no URLs, no package names from the
-//! caller — the install kind comes from root-owned markers, the package list from the local
-//! package database, and every payload from the distro package manager's own signed
-//! repositories. Compromising the trigger yields "run the system's normal update for the
+//! Two verbs, one per product:
+//!
+//! * `pf-update apply` — the HOST, via `punktfunk-update.service` (triggered from the web
+//!   console).
+//! * `pf-update apply-client` — the CLIENT, via `punktfunk-client-update.service` (triggered
+//!   by `punktfunk-client --apply-update`, which is what the Decky plugin's one-tap runs).
+//!
+//! Both are started by an unprivileged process through polkit, authorised for members of the
+//! `punktfunk-update` group. **The helper takes zero attacker-influenceable parameters**: no
+//! versions, no URLs, no package names from the caller — the verb comes from a root-owned
+//! unit's fixed `ExecStart`, the install kind from root-owned markers, the package list from
+//! the local package database, and every payload from the distro package manager's own signed
+//! repositories. Compromising a trigger yields "run the system's normal update for the
 //! punktfunk packages", nothing more.
 //!
-//! After a successful package-manager run, the **run-the-binary gate** executes the newly
-//! installed `/usr/bin/punktfunk-host --version` and requires it to exit cleanly — the
-//! CI-green-on-the-wrong-program class (the 0.22.0 clobber) dies here for one binary run's
-//! worth of cost. The outcome is written to `/var/lib/punktfunk/update-result.json`
-//! (root-written, world-readable) for the unprivileged host to read; stdout/stderr land in
+//! Both verbs upgrade every installed `punktfunk*` package — a box with both gets both,
+//! whichever unit ran. What the verb changes is which marker is read (the two packages cannot
+//! own one marker path: that is a hard conflict in deb, rpm and pacman alike) and which binary
+//! the **run-the-binary gate** executes afterwards, requiring a clean exit — the
+//! CI-green-on-the-wrong-program class (the 0.22.0 clobber) dies there for one binary run's
+//! worth of cost. The outcome is written to `/var/lib/punktfunk/{,client-}update-result.json`
+//! (root-written, world-readable) for the unprivileged caller to read; stdout/stderr land in
 //! the unit's journal.
 
 #[cfg(target_os = "linux")]
@@ -22,12 +31,61 @@ mod linux_main {
     use std::path::Path;
     use std::process::Command;
 
-    const MARKER: &str = "/usr/share/punktfunk/install-kind";
-    const SYSEXT_MARKER: &str = "/usr/lib/extension-release.d/extension-release.punktfunk";
     const OSTREE_BOOTED: &str = "/run/ostree-booted";
     const PACMAN_OPTIN_CONF: &str = "/etc/punktfunk/update.conf";
-    const RESULT_PATH: &str = "/var/lib/punktfunk/update-result.json";
-    const HOST_BIN: &str = "/usr/bin/punktfunk-host";
+
+    /// Which product this run was started for. It comes from the VERB in a root-owned unit's
+    /// fixed `ExecStart` — never from an unprivileged caller — so it stays inside the
+    /// zero-attacker-influenceable-parameters rule: the two units differ only in which
+    /// product's marker they read and which binary the run-the-binary gate executes.
+    ///
+    /// Two units exist rather than one because the host and the client are separate packages
+    /// and every packaging format we ship treats two packages owning one path as a hard
+    /// conflict — a client-only box (a Steam Deck, a handheld) must be able to install the
+    /// helper without the host package.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Mode {
+        Host,
+        Client,
+    }
+
+    impl Mode {
+        fn marker(self) -> &'static str {
+            match self {
+                Mode::Host => "/usr/share/punktfunk/install-kind",
+                Mode::Client => "/usr/share/punktfunk-client/install-kind",
+            }
+        }
+
+        fn sysext_marker(self) -> &'static str {
+            match self {
+                Mode::Host => "/usr/lib/extension-release.d/extension-release.punktfunk",
+                Mode::Client => "/usr/lib/extension-release.d/extension-release.punktfunk-client",
+            }
+        }
+
+        /// The binary the run-the-binary gate executes after a package-manager run.
+        fn gate_binary(self) -> &'static str {
+            match self {
+                Mode::Host => "/usr/bin/punktfunk-host",
+                Mode::Client => "/usr/bin/punktfunk-client",
+            }
+        }
+
+        fn result_path(self) -> &'static str {
+            match self {
+                Mode::Host => "/var/lib/punktfunk/update-result.json",
+                Mode::Client => "/var/lib/punktfunk/client-update-result.json",
+            }
+        }
+
+        fn as_str(self) -> &'static str {
+            match self {
+                Mode::Host => "host",
+                Mode::Client => "client",
+            }
+        }
+    }
 
     /// What the host reads back. Field meanings mirror the mgmt API's `UpdateResultInfo`
     /// where they overlap; `changed=false` is the "your package source has nothing newer
@@ -55,12 +113,24 @@ mod linux_main {
 
     /// Root-owned facts → the apply strategy. Mirrors the host's ladder for the kinds a
     /// root helper serves (the helper decides for ITSELF — never trusts its caller).
-    fn detect_kind() -> Result<&'static str, String> {
-        if Path::new(SYSEXT_MARKER).exists() {
-            return Ok("sysext");
+    fn detect_kind(mode: Mode) -> Result<&'static str, String> {
+        if Path::new(mode.sysext_marker()).exists() {
+            return match mode {
+                Mode::Host => Ok("sysext"),
+                // `punktfunk-sysext update` pulls the HOST image from the signed feed; there
+                // is no client feed to pull from (a client sysext is the local
+                // packaging/arch/build-sysext.sh wrapper). Refusing here is the honest answer
+                // — the alternative would install the host over a client-only box.
+                Mode::Client => Err(
+                    "this client is a sysext, and the sysext feed carries the host image only \
+                     — rebuild and re-install the client image instead"
+                        .to_string(),
+                ),
+            };
         }
-        let marker = std::fs::read_to_string(MARKER)
-            .map_err(|e| format!("no install-kind marker at {MARKER}: {e}"))?;
+        let marker_path = mode.marker();
+        let marker = std::fs::read_to_string(marker_path)
+            .map_err(|e| format!("no install-kind marker at {marker_path}: {e}"))?;
         match marker.split_whitespace().next() {
             Some("apt") => Ok("apt"),
             Some("dnf") if Path::new(OSTREE_BOOTED).exists() => Ok("rpm-ostree"),
@@ -109,10 +179,14 @@ mod linux_main {
         Ok(pkgs)
     }
 
-    fn host_version() -> Result<String, String> {
+    /// The run-the-binary gate's reading: execute what we just installed and take its
+    /// `--version`. A binary that cannot run is an update that did NOT stick, whatever the
+    /// package manager reported (the 0.22.0 clobber lesson).
+    fn gate_version(mode: Mode) -> Result<String, String> {
+        let bin = mode.gate_binary();
         run_capture(
-            Command::new(HOST_BIN).arg("--version"),
-            "punktfunk-host --version",
+            Command::new(bin).arg("--version"),
+            &format!("{bin} --version"),
         )
     }
 
@@ -211,8 +285,8 @@ mod linux_main {
         }
     }
 
-    fn write_result(result: &HelperResult) {
-        let path = Path::new(RESULT_PATH);
+    fn write_result(mode: Mode, result: &HelperResult) {
+        let path = Path::new(mode.result_path());
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
@@ -226,10 +300,17 @@ mod linux_main {
 
     pub fn main() {
         let arg = std::env::args().nth(1).unwrap_or_default();
-        if arg != "apply" {
-            eprintln!("usage: pf-update apply   (normally via punktfunk-update.service)");
-            std::process::exit(2);
-        }
+        let mode = match arg.as_str() {
+            "apply" => Mode::Host,
+            "apply-client" => Mode::Client,
+            _ => {
+                eprintln!(
+                    "usage: pf-update apply | apply-client   (normally via \
+                     punktfunk-update.service / punktfunk-client-update.service)"
+                );
+                std::process::exit(2);
+            }
+        };
         // Effective root is required for every leg; refuse early with a clear message
         // rather than half-running.
         // SAFETY: geteuid has no preconditions.
@@ -238,25 +319,28 @@ mod linux_main {
             std::process::exit(1);
         }
 
-        let kind = match detect_kind() {
+        let kind = match detect_kind(mode) {
             Ok(k) => k,
             Err(e) => {
                 eprintln!("pf-update: {e}");
-                write_result(&HelperResult {
-                    ok: false,
-                    kind: "unknown".into(),
-                    before_version: String::new(),
-                    after_version: String::new(),
-                    changed: false,
-                    staged: false,
-                    error: Some(e),
-                    finished_unix: now_unix(),
-                });
+                write_result(
+                    mode,
+                    &HelperResult {
+                        ok: false,
+                        kind: "unknown".into(),
+                        before_version: String::new(),
+                        after_version: String::new(),
+                        changed: false,
+                        staged: false,
+                        error: Some(e),
+                        finished_unix: now_unix(),
+                    },
+                );
                 std::process::exit(1);
             }
         };
-        println!("pf-update: install kind {kind}");
-        let before = host_version().unwrap_or_default();
+        println!("pf-update: {} install kind {kind}", mode.as_str());
+        let before = gate_version(mode).unwrap_or_default();
 
         let outcome = apply_for_kind(kind).and_then(|staged| {
             // The run-the-binary gate: the freshly installed binary must actually run.
@@ -264,7 +348,7 @@ mod linux_main {
             let after = if staged {
                 before.clone()
             } else {
-                host_version()
+                gate_version(mode)
                     .map_err(|e| format!("run-the-binary gate: {e} — the update did NOT stick"))?
             };
             Ok((staged, after))
@@ -296,7 +380,7 @@ mod linux_main {
             }
         };
         let ok = result.ok;
-        write_result(&result);
+        write_result(mode, &result);
         println!(
             "pf-update: {} ({} -> {}, changed: {}, staged: {})",
             if ok { "ok" } else { "FAILED" },

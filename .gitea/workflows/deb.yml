@@ -147,15 +147,16 @@ jobs:
           PUNKTFUNK_BUILD_VERSION: ${{ env.VERSION }}   # stamped into the binaries (build.rs)
         run: |
           git config --global --add safe.directory "$PWD"
-          # THREE binaries ship in the client .deb, so all three are built here: the GTK shell,
-          # punktfunk-client-session (the Vulkan/Skia streamer the shell execs for a connect), and
-          # punktfunk-cli (the headless `punktfunk` front-end). build-client-deb.sh installs all
-          # three; leaving punktfunk-cli out here made it fall over on `install: No such file or
+          # FOUR binaries ship in the client .deb, so all four are built here: the GTK shell,
+          # punktfunk-client-session (the Vulkan/Skia streamer the shell execs for a connect),
+          # punktfunk-cli (the headless `punktfunk` front-end), and pf-update (the root helper
+          # behind `punktfunk-client --apply-update`). build-client-deb.sh installs all four;
+          # leaving punktfunk-cli out here made it fall over on `install: No such file or
           # directory`, because its build-if-missing guard only tested the first two and so decided
           # everything was already built. The HOST is built separately in the build-publish-host
           # job (Ubuntu 24.04 image + bundled FFmpeg 8).
           cargo build --release --locked \
-            -p punktfunk-client-linux -p punktfunk-client-session -p punktfunk-cli
+            -p punktfunk-client-linux -p punktfunk-client-session -p punktfunk-cli -p pf-update
 
       - name: Build + smoke-boot web console (bun preset)
         # Gate the .deb on a real bun boot: the punktfunk-web .deb runs the Nitro `bun` preset
