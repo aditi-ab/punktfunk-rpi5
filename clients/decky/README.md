@@ -54,6 +54,25 @@ Loader's own (SHA-256-verified) install. Installs and updates can take a couple 
 networks: Decky's installer also contacts its plugin store first, which may be slow or blackholed
 before the actual download proceeds.
 
+### Updating the client
+
+The plugin also reports — and where it can, installs — updates for the **client** it launches.
+What is possible depends on how that client was installed, and the About tab names the install
+kind so the answer is never a mystery:
+
+| Install | Update |
+| --- | --- |
+| **Flatpak** (the usual Deck client) | One tap. `flatpak update --user io.unom.Punktfunk` — a per-user install, which is why `sudo flatpak update` never touches it. |
+| **.deb / .rpm** (and rpm-ostree, which stages for the next reboot) | One tap, *after* an explicit opt-in: `sudo usermod -aG punktfunk-update $USER`. The tap starts a fixed, parameterless root oneshot (`punktfunk-client-update.service`) through polkit — nothing about the request is attacker-influenceable, and the payload comes from your distro's own signed repositories. |
+| **pacman** | Same, plus the root-owned `PACMAN_FULL_SYSUPGRADE=1` in `/etc/punktfunk/update.conf` — a partial upgrade is against Arch doctrine, so the only thing the helper will run is a full `pacman -Syu`. |
+| **sysext, nix, a source build** | The plugin shows the command and stops. There is no feed behind those installs, and a button that can only fail is worse than one honest line. |
+
+Whether a *newer* client exists is the client's own answer (`punktfunk-client --check-update`),
+read from the Ed25519-signed per-channel manifest the host's update check already trusts —
+`PUNKTFUNK_UPDATE_CHECK=0` disables the check, `PUNKTFUNK_UPDATE_APPLY=0` keeps the check but
+never offers to install. A client too old to have that mode is reported as such rather than as
+up to date.
+
 ## Build & sideload (development)
 
 ```sh

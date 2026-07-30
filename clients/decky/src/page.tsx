@@ -37,6 +37,8 @@ import {
   PinsApi,
   applyUpdate,
   checkForUpdatesNow,
+  clientInstallLabel,
+  clientUpdateIsManualOnly,
   hasUpdate,
   mergeHosts,
   needsPair,
@@ -391,6 +393,16 @@ const AboutTab: FC<{
         </DialogButton>
       </RowActions>
     </Field>
+    {/* What the client IS, so "why is there no Update button?" has a visible answer. The
+        install kind decides everything below it. */}
+    {!!update?.client_install && (
+      <Field
+        label="Client"
+        description={`${clientInstallLabel(update.client_install)}${
+          update.client_current ? ` · ${update.client_current}` : ""
+        }`}
+      />
+    )}
     {hasUpdate(update) && (
       <Field
         label={
@@ -398,18 +410,36 @@ const AboutTab: FC<{
             ? `Plugin update — v${update!.latest}${
                 update!.client_update_available ? " + client" : ""
               }`
-            : "Client update available"
+            : `Client update — ${update!.client_latest || "available"}`
         }
-        description="Installing can take a couple of minutes; Decky reloads the plugin when done"
+        description={
+          // Only promise a one-tap install when there is one. On a notify-only install the
+          // row becomes the command itself, which is the whole answer for that box.
+          clientUpdateIsManualOnly(update) && !update!.update_available
+            ? update!.client_opt_in || update!.client_command
+            : "Installing can take a couple of minutes; Decky reloads the plugin when done"
+        }
         childrenContainerWidth="max"
       >
-        <RowActions>
-          <DialogButton style={actionButton} onClick={() => applyUpdate(update!, check)}>
-            <FaDownload style={{ marginRight: "0.4em" }} />
-            Update
-          </DialogButton>
-        </RowActions>
+        {clientUpdateIsManualOnly(update) && !update!.update_available ? null : (
+          <RowActions>
+            <DialogButton style={actionButton} onClick={() => applyUpdate(update!, check)}>
+              <FaDownload style={{ marginRight: "0.4em" }} />
+              Update
+            </DialogButton>
+          </RowActions>
+        )}
       </Field>
+    )}
+    {!!update?.client_error && (
+      <Field
+        label="Client update check"
+        description={
+          update.client_error === "client-outdated"
+            ? "This client predates update checks — update it once by hand and the check starts working."
+            : "Couldn’t check the client for updates."
+        }
+      />
     )}
     <Field
       label="Setup guide"

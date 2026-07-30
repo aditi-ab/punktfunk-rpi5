@@ -22,8 +22,14 @@ The backend's jobs are the things Steam can't do:
 * **get_settings() / set_settings()** — read/write the flatpak client's stream settings JSON
   (resolution / bitrate / gamepad), so the Deck UI configures the stream the client reads.
 * **kill_stream()** — force-stop a wedged stream (``flatpak kill``).
-* **check_update()** — poll the registry's per-channel ``manifest.json`` and report whether a
-  newer build is available (the frontend then drives Decky's own install RPC to apply it).
+* **check_update()** — report pending updates for BOTH the plugin and the client. The plugin's
+  comes from the registry's per-channel ``manifest.json`` (the frontend then drives Decky's own
+  install RPC to apply it); the client's depends on how it was installed — a flatpak is compared
+  by OSTree commit here, anything else is asked of the client itself
+  (``punktfunk-client --check-update``, which verifies a signed manifest).
+* **update_client()** — apply the client update by whichever route that install supports:
+  ``flatpak update --user``, ``punktfunk-client --apply-update`` (the packaged root helper), or
+  a refusal carrying the command to run by hand.
 
 The TXT-record keys parsed (``proto`` / ``fp`` / ``pair`` / ``id`` / ``mgmt``) are defined by
 the host advert in ``crates/punktfunk-host/src/discovery.rs``.
@@ -392,6 +398,18 @@ def _client_argv() -> list[str] | None:
     return [native] if native else None
 
 
+def _client_is_flatpak() -> bool:
+    """Is the client this plugin actually drives the FLATPAK one?
+
+    Not the same question as "is the flatpak installed": `PF_DECKY_CLIENT=native` forces the
+    native binary on a box that has both, and the update check has to describe the client the
+    launcher will really run — otherwise a Deck with both would be offered a flatpak update for
+    a client it never starts.
+    """
+    prefix = _client_argv()
+    return bool(prefix) and prefix[0] == _flatpak()
+
+
 def _flatpak_env() -> dict:
     """Environment for a headless client run from the backend (no display needed for pairing).
     Reconstruct the user-session bits flatpak wants; the backend may not inherit them. Harmless
@@ -562,7 +580,12 @@ async def _client_update_state() -> dict:
     **per-user** install (so ``sudo flatpak update``, which is system-scope, never touches it), and
     it versions independently of this plugin — so we compare the installed commit against the
     remote's here and let the QAM offer a user-scope update. Best-effort; all-``False`` on any error
-    (not installed, no flatpak, offline)."""
+    (not installed, no flatpak, offline).
+
+    Flatpak keeps its OWN comparison (commits, not versions) because it is the exact one: a
+    flatpak built from main between releases carries the release's crate version, so the
+    signed-manifest comparison the native path uses would call it up to date when it isn't.
+    Native installs have no commit to compare and go through :func:`_native_update_state`."""
     state = {"available": False, "installed": "", "remote": ""}
     rc, info = await _flatpak_capture(["info", "--user", APP_ID], timeout=10.0)
     if rc != 0:
@@ -579,6 +602,50 @@ async def _client_update_state() -> dict:
         state["installed"] and state["remote"] and state["installed"] != state["remote"]
     )
     return state
+
+
+# --- native (non-flatpak) client updates ----------------------------------------------------
+#
+# A .deb/.rpm/pacman/sysext/nix client is not something this plugin can reason about on its own:
+# working out whether a newer build exists means fetching a per-channel manifest and verifying
+# its Ed25519 signature, and Decky's embedded Python has no crypto library to do that with (nor
+# should the trust rule live in two languages). So the CLIENT answers both questions —
+# `--check-update --json` says what is available and who could install it, `--apply-update`
+# drives the packaged root helper — and this backend is a UI over those, exactly as it already
+# is for `--pair` / `--library` / `--list-hosts`.
+#
+# Shape of `--check-update --json` (pf_client_core::update::Status):
+#   {kind, channel, current, latest, update_available, apply, applier, command,
+#    opt_in_hint?, notes_url, error?}
+# `applier` is what this file routes on: "flatpak" (we run flatpak), "helper" (the client runs
+# the root helper), "none" (show `command` — nothing here can install it).
+
+
+async def _native_update_state() -> dict:
+    """Ask a NATIVE client whether a newer build exists for its channel. Returns the client's
+    own status dict, or ``{}`` when it couldn't be asked (no native client, a client too old to
+    have the mode, offline). Best-effort by design: an unanswerable check must read as "can't
+    tell", never as "up to date"."""
+    rc, out, err = await _run_client(["--check-update", "--json"], timeout=30.0)
+    # The JSON is authoritative whenever there IS JSON, whatever the exit code: the client
+    # exits 0 up-to-date, 10 update-available, and 1 when the check failed — but in that last
+    # case it STILL prints a status carrying `error` plus the install kind and the command for
+    # this box, which is exactly what the UI needs to explain itself. Reading only the exit
+    # code would throw all of that away and report a bare "couldn't check".
+    if out.strip():
+        try:
+            data = json.loads(out)
+            if isinstance(data, dict):
+                return data
+        except json.JSONDecodeError:
+            decky.logger.warning("check-update: unparseable output: %s", out[:200])
+    if rc == -1:
+        return {}
+    # A client predating `--check-update` ignores the flag and falls through to GTK init, which
+    # fails headless — the same signature the other headless modes classify.
+    code = _classify_library_error(err)
+    decky.logger.info("native check-update unavailable (rc=%s, %s)", rc, code)
+    return {"error": code} if code == "client-outdated" else {}
 
 
 def _split_txt(txt: str) -> list[str]:
@@ -1138,14 +1205,71 @@ class Plugin:
             return {"ok": False}
         return {"ok": True}
 
+    async def _update_native_client(self) -> dict:
+        """The non-flatpak leg of :meth:`update_client` — drive the client's own
+        ``--apply-update``, which starts the packaged root helper.
+
+        The timeout is generous because a package-manager run on a stale box is slow; the
+        client caps its own wait at 30 min, so this one sits below that and reports a timeout
+        rather than hanging the QAM forever.
+        """
+        state = await _native_update_state()
+        if not state:
+            # No client answered at all (none installed, or one too old for the mode) — say
+            # that, rather than "this install updates by hand", which would be a guess.
+            return {"ok": False, "updated": False, "error": "client-unavailable"}
+        applier = state.get("applier")
+        if applier != "helper":
+            # Nothing here can install it — hand back the command the client computed, so the
+            # UI shows one true line instead of guessing per install kind.
+            return {
+                "ok": False,
+                "updated": False,
+                "error": "manual",
+                "command": state.get("opt_in_hint") or state.get("command", ""),
+            }
+        rc, out, err = await _run_client(["--apply-update", "--json"], timeout=900.0)
+        if rc == -1:
+            return {"ok": False, "updated": False, "error": "timeout"}
+        outcome: dict = {}
+        if out.strip():
+            try:
+                outcome = json.loads(out)
+            except json.JSONDecodeError:
+                pass
+        if not outcome.get("ok"):
+            detail = outcome.get("error") or (err.strip().splitlines() or ["update failed"])[-1]
+            decky.logger.warning("native client update failed (rc=%s): %s", rc, detail)
+            return {"ok": False, "updated": False, "error": "update-failed", "detail": detail}
+        _update_cache["data"] = None  # invalidate the cached "update available" snapshot
+        decky.logger.info(
+            "native client update: %s -> %s (changed=%s, staged=%s)",
+            outcome.get("before", ""), outcome.get("after", ""),
+            outcome.get("changed"), outcome.get("staged"),
+        )
+        return {
+            "ok": True,
+            "updated": bool(outcome.get("changed")),
+            "staged": bool(outcome.get("staged")),
+        }
+
     async def update_client(self) -> dict:
-        """Update the flatpak **client** (io.unom.Punktfunk) in the USER installation — the scope a
-        Steam Deck install lives in, which ``sudo flatpak update`` (system-scope) never reaches.
-        Returns whether a new commit was actually pulled. Best-effort; non-fatal. A NATIVE client
-        is updated by whatever installed it (distro package manager, sysext, nix), never here —
-        `check_update` reports no client update for one, so the UI never offers this."""
-        if not _flatpak_installed():
-            return {"ok": False, "updated": False, "error": "flatpak-not-found"}
+        """Update the **client**, by whichever route this box's install actually supports.
+
+        * **flatpak** — ``flatpak update --user`` in the USER installation, the scope a Steam
+          Deck install lives in and which ``sudo flatpak update`` (system-scope) never reaches.
+        * **native, one-tap capable** (.deb / .rpm / pacman with the packaged root helper and
+          the operator's group opt-in) — ``punktfunk-client --apply-update``, which starts the
+          fixed, parameterless ``punktfunk-client-update.service`` through polkit. This backend
+          passes nothing to it; the helper derives everything from root-owned state.
+        * **anything else** (sysext, nix, a source build, no opt-in) — refused with the exact
+          command to run, which the UI shows. `check_update` reports the same, so the UI knows
+          not to offer a button in the first place.
+
+        Returns ``{ok, updated, error?, detail?, command?, staged?}``. Best-effort; non-fatal.
+        """
+        if not _client_is_flatpak():
+            return await self._update_native_client()
         _, before = await _flatpak_capture(["info", "--user", APP_ID], timeout=10.0)
         before_commit = _field_from(before, "Commit")
         rc, out = await _flatpak_capture(["update", "--user", "-y", APP_ID], timeout=300.0)
@@ -1183,6 +1307,13 @@ class Plugin:
             "client_update_available": False,
             "client_current": "",
             "client_latest": "",
+            # How the client got here (`flatpak`, `apt`, `dnf`, `sysext`, `nix`, `source`, …),
+            # who could install an update (`flatpak` | `helper` | `none`), and the one line that
+            # does it by hand. Empty on a flatpak-only box that never reaches the native path.
+            "client_install": "",
+            "client_applier": "",
+            "client_command": "",
+            "client_opt_in": "",
         }
 
         now = time.monotonic()
@@ -1190,12 +1321,31 @@ class Plugin:
         if not force and cached and (now - _update_cache["at"]) < _UPDATE_TTL_S:
             return cached
 
-        # Client (flatpak) update — checked ALWAYS, even on a dev/sideloaded plugin build.
+        # Client update — checked ALWAYS, even on a dev/sideloaded plugin build. Which check
+        # runs depends on how the client was installed: the flatpak compares OSTree commits
+        # (exact for a per-user flatpak), everything else asks the client itself, which
+        # verifies the signed per-channel manifest. See _client_update_state / _native_update_state.
         try:
-            cu = await _client_update_state()
-            result["client_update_available"] = bool(cu["available"])
-            result["client_current"] = (cu["installed"] or "")[:10]
-            result["client_latest"] = (cu["remote"] or "")[:10]
+            if _client_is_flatpak():
+                cu = await _client_update_state()
+                result["client_update_available"] = bool(cu["available"])
+                result["client_current"] = (cu["installed"] or "")[:10]
+                result["client_latest"] = (cu["remote"] or "")[:10]
+                result["client_install"] = "flatpak"
+                result["client_applier"] = "flatpak"
+                result["client_command"] = f"flatpak update --user {APP_ID}"
+            else:
+                nu = await _native_update_state()
+                result["client_update_available"] = bool(nu.get("update_available"))
+                result["client_current"] = str(nu.get("current", ""))
+                result["client_latest"] = str(nu.get("latest", ""))
+                result["client_install"] = str(nu.get("kind", ""))
+                result["client_applier"] = str(nu.get("applier", ""))
+                result["client_command"] = str(nu.get("command", ""))
+                result["client_opt_in"] = str(nu.get("opt_in_hint", "") or "")
+                if nu.get("error"):
+                    # "Couldn't tell" — never rendered as up to date; the UI shows the reason.
+                    result["client_error"] = str(nu["error"])
         except Exception:  # noqa: BLE001
             decky.logger.warning("client update check failed", exc_info=True)
 

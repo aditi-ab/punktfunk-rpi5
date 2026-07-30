@@ -240,9 +240,59 @@ export function useUpdate() {
   return { info, checking, check };
 }
 
-/** True when EITHER the plugin or the flatpak client has a pending update. */
+/** True when EITHER the plugin or the client has a pending update. */
 export function hasUpdate(info: UpdateInfo | null | undefined): boolean {
   return !!info && (info.update_available || info.client_update_available);
+}
+
+/**
+ * Can this Deck actually INSTALL the pending client update, or only tell you how?
+ *
+ * A flatpak and a one-tap-capable native install (the packaged root helper + the operator's
+ * group opt-in) get a button; a sysext, a nix profile, a source build or a box that hasn't
+ * opted in gets the command. Offering a button that can only fail is worse than saying so.
+ */
+export function clientUpdateIsOneTap(info: UpdateInfo | null | undefined): boolean {
+  return (
+    !!info &&
+    info.client_update_available &&
+    (info.client_applier === "flatpak" || info.client_applier === "helper")
+  );
+}
+
+/**
+ * How the client got onto this box, in words a Deck user recognises. The raw kind comes from
+ * the client's own detector (`pf_update_check::detect`); anything unmapped falls through as
+ * itself rather than as "unknown", because the raw word is still more useful than a shrug.
+ */
+export function clientInstallLabel(kind: string): string {
+  switch (kind) {
+    case "flatpak":
+      return "Flatpak (per-user)";
+    case "apt":
+      return "System package (apt)";
+    case "dnf":
+      return "System package (dnf)";
+    case "rpm-ostree":
+      return "Layered package (rpm-ostree)";
+    case "pacman":
+      return "System package (pacman)";
+    case "sysext":
+      return "System extension (sysext)";
+    case "nix":
+      return "Nix profile";
+    case "steamos-source":
+      return "On-device build";
+    case "source":
+      return "Built from source";
+    default:
+      return kind;
+  }
+}
+
+/** True when the only pending update is one this Deck can't apply itself. */
+export function clientUpdateIsManualOnly(info: UpdateInfo | null | undefined): boolean {
+  return !!info && info.client_update_available && !clientUpdateIsOneTap(info);
 }
 
 /** The explicit "Check for updates" action — always ends in a toast so the tap has feedback. */
@@ -256,8 +306,20 @@ export async function checkForUpdatesNow(
   } else if (hasUpdate(res)) {
     const parts: string[] = [];
     if (res.update_available) parts.push(`plugin v${res.current} → v${res.latest}`);
-    if (res.client_update_available) parts.push("client");
+    if (res.client_update_available) {
+      parts.push(res.client_latest ? `client ${res.client_latest}` : "client");
+    }
     body = `Update available: ${parts.join(" + ")}.`;
+    if (clientUpdateIsManualOnly(res)) {
+      // Say the honest thing up front rather than letting the user find out at the button.
+      body += " The client updates outside Punktfunk on this install.";
+    }
+  } else if (res.client_error) {
+    // A failed CLIENT check must never read as "up to date" — that is the one wrong answer.
+    body =
+      res.client_error === "client-outdated"
+        ? "Couldn’t check the client — it predates update checks. Update it once by hand."
+        : "Couldn’t check the client for updates.";
   } else if (res.error === "update-channel-unknown") {
     body = "Development build — plugin updates are disabled; the client is up to date.";
   } else {
@@ -266,32 +328,67 @@ export async function checkForUpdatesNow(
   toaster.toast({ title: "Punktfunk", body });
 }
 
+/** One line of user-facing copy for whatever `updateClient()` came back with. */
+function clientUpdateResultBody(r: Awaited<ReturnType<typeof updateClient>>): string {
+  if (r.ok) {
+    if (r.staged) return "Client updated — reboot to finish.";
+    return r.updated ? "Client updated to the latest version." : "Client is already up to date.";
+  }
+  // "manual" is not a failure: the box simply can't install it, and `command` says how.
+  if (r.error === "manual") {
+    return r.command
+      ? `This client updates outside Punktfunk. Run: ${r.command}`
+      : "This client updates outside Punktfunk — use the way you installed it.";
+  }
+  if (r.error === "timeout") return "Client update timed out — check the box and try again.";
+  if (r.error === "client-unavailable")
+    return "Couldn’t reach the client to update it — is it still installed?";
+  return `Client update failed${r.detail ? `: ${r.detail}` : r.error ? ` (${r.error})` : ""}.`;
+}
+
 /**
- * Apply whichever updates are pending. The flatpak CLIENT is updated first (a user-scope
- * `flatpak update`, awaited); then, if the PLUGIN itself has an update, Decky's install RPC
- * reinstalls it — which reloads the plugin and tears this panel down, so it goes last and is
- * fire-and-forget. `check` (when passed) refreshes the panel state after a client-only update so
- * the "Update available" button clears.
+ * Apply whichever updates are pending.
+ *
+ * The CLIENT goes first and is awaited, by whichever route its install supports — a user-scope
+ * `flatpak update`, or the packaged root helper via `punktfunk-client --apply-update`. An
+ * install neither can serve is not attempted at all: the user gets the command in a toast,
+ * because a button that can only fail teaches nothing.
+ *
+ * The PLUGIN goes last and is fire-and-forget: Decky's install RPC reinstalls and reloads the
+ * plugin, tearing this panel down before any result could arrive. `check` (when passed)
+ * refreshes the panel state after a client-only update so the "Update available" button clears.
  */
 export async function applyUpdate(
   info: UpdateInfo,
   check?: (force: boolean) => Promise<UpdateInfo | null>,
 ): Promise<void> {
-  if (info.client_update_available) {
-    toaster.toast({ title: "Punktfunk", body: "Updating the client…" });
+  if (info.client_update_available && clientUpdateIsOneTap(info)) {
+    toaster.toast({
+      title: "Punktfunk",
+      // A package-manager run is not instant; say so before the wait, not after.
+      body:
+        info.client_applier === "helper"
+          ? "Updating the client — this can take a few minutes…"
+          : "Updating the client…",
+    });
     try {
       const r = await updateClient();
-      toaster.toast({
-        title: "Punktfunk",
-        body: !r.ok
-          ? `Client update failed${r.error ? ` (${r.error})` : ""}.`
-          : r.updated
-            ? "Client updated to the latest version."
-            : "Client is already up to date.",
-      });
+      toaster.toast({ title: "Punktfunk", body: clientUpdateResultBody(r) });
     } catch {
       toaster.toast({ title: "Punktfunk", body: "Client update failed." });
     }
+  } else if (info.client_update_available) {
+    // Nothing here can install it — hand over the one line that does, rather than a button
+    // that would fail. `client_opt_in` wins when joining the group is what's missing, since
+    // that is the step that turns this into a one-tap update from then on.
+    const line = info.client_opt_in || info.client_command;
+    toaster.toast({
+      title: "Punktfunk",
+      body: line
+        ? `Client update available (${info.client_latest}). Run: ${line}`
+        : `A newer client (${info.client_latest}) is available — update it the way you installed it.`,
+      duration: 12_000,
+    });
   }
 
   if (info.update_available) {

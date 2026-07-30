@@ -124,11 +124,20 @@ export interface UpdateInfo {
   hash: string; // sha256 of that zip (Decky verifies it)
   channel: string; // "latest" (stable) | "canary"
   update_available: boolean; // a newer PLUGIN build is available
-  // The flatpak CLIENT (io.unom.Punktfunk) versions independently and is a per-user install, so
-  // `sudo flatpak update` never touches it — the plugin offers a user-scope update instead.
+  // The CLIENT versions independently of this plugin, and how it updates depends on how it was
+  // installed. A flatpak is a per-user install `sudo flatpak update` never touches, compared by
+  // OSTree commit; every other install (.deb/.rpm/pacman/sysext/nix/source) is compared by the
+  // client itself against the signed per-channel manifest (`punktfunk-client --check-update`).
   client_update_available: boolean;
-  client_current: string; // installed client commit (short) — informational
-  client_latest: string; // remote client commit (short) — informational
+  client_current: string; // installed client commit (flatpak) or version (native)
+  client_latest: string; // newest client commit (flatpak) or version (native)
+  client_install: string; // "flatpak" | "apt" | "dnf" | "pacman" | "sysext" | "nix" | "source" | ""
+  // Who can perform the update: "flatpak" (this plugin runs it), "helper" (the client drives the
+  // packaged root helper), "none" (nothing here can — show `client_command`).
+  client_applier: string;
+  client_command: string; // one copy-pastable line that updates this install by hand
+  client_opt_in: string; // set when one-tap WOULD work after `usermod -aG punktfunk-update`
+  client_error?: string; // the client check couldn't complete (e.g. "client-outdated")
   error?: string; // "update-channel-unknown" (dev build) | "fetch-failed"
 }
 
@@ -206,8 +215,18 @@ export const probeHost = callable<
   { ok: boolean; online?: boolean; error?: string }
 >("probe_host");
 export const checkUpdate = callable<[force: boolean], UpdateInfo>("check_update");
-// Update the flatpak client in the user installation (`flatpak update --user -y io.unom.Punktfunk`).
+// Update the client by whichever route its install supports: `flatpak update --user` for the
+// flatpak, `punktfunk-client --apply-update` (the packaged root helper) for a one-tap-capable
+// native install. Everything else comes back `ok: false, error: "manual"` with `command` — the
+// line to run by hand. A package-manager run can take minutes; the backend allows 15.
 export const updateClient = callable<
   [],
-  { ok: boolean; updated: boolean; error?: string }
+  {
+    ok: boolean;
+    updated: boolean;
+    staged?: boolean; // installed, but a reboot activates it (rpm-ostree)
+    error?: string;
+    detail?: string;
+    command?: string; // set with error "manual"
+  }
 >("update_client");

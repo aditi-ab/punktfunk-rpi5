@@ -25,6 +25,7 @@ import { PluginErrorBoundary } from "./boundary";
 import {
   applyUpdate,
   checkForUpdatesNow,
+  clientUpdateIsManualOnly,
   hasUpdate,
   mergeHosts,
   needsPair,
@@ -72,27 +73,42 @@ const QamPanel: FC = () => {
 
   return (
     <>
-      {hasUpdate(update) && (
-        <PanelSection title="Update available">
-          <PanelSectionRow>
-            <ButtonItem
-              layout="below"
-              onClick={() => applyUpdate(update!, check)}
-              label={
-                update!.update_available
-                  ? `Plugin v${update!.current} → v${update!.latest}${
-                      update!.client_update_available ? " + client" : ""
-                    }`
-                  : "New client version"
-              }
-              description="Installing can take a couple of minutes"
-            >
-              <FaDownload style={{ marginRight: "0.5em" }} />
-              Update Punktfunk
-            </ButtonItem>
-          </PanelSectionRow>
-        </PanelSection>
-      )}
+      {hasUpdate(update) &&
+        // A client this Deck can't install (a sysext, a nix profile, a source build, or a box
+        // that hasn't opted into one-tap updates) gets the command, not a button — tapping
+        // something that can only fail is worse than reading one line. A pending PLUGIN update
+        // still wins the button, since that half always works.
+        (clientUpdateIsManualOnly(update) && !update!.update_available ? (
+          <PanelSection title="Client update available">
+            <PanelSectionRow>
+              <Field
+                focusable
+                label={update!.client_latest || "Newer version"}
+                description={update!.client_opt_in || update!.client_command}
+              />
+            </PanelSectionRow>
+          </PanelSection>
+        ) : (
+          <PanelSection title="Update available">
+            <PanelSectionRow>
+              <ButtonItem
+                layout="below"
+                onClick={() => applyUpdate(update!, check)}
+                label={
+                  update!.update_available
+                    ? `Plugin v${update!.current} → v${update!.latest}${
+                        update!.client_update_available ? " + client" : ""
+                      }`
+                    : "New client version"
+                }
+                description="Installing can take a couple of minutes"
+              >
+                <FaDownload style={{ marginRight: "0.5em" }} />
+                Update Punktfunk
+              </ButtonItem>
+            </PanelSectionRow>
+          </PanelSection>
+        ))}
 
       <PanelSection title="Punktfunk">
         <PanelSectionRow>
