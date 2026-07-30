@@ -193,29 +193,25 @@ The canonical "decide, don't just observe" pattern — approve pairing from your
 ## Recipe: full controller passthrough (VirtualHere)
 
 To get a controller's *native* features on the host — DualSense gyro, touchpad, adaptive
-triggers, USB rumble — instead of the emulated pad, hand the physical device from the couch to the
-host over [VirtualHere](https://www.virtualhere.com/) (USB-over-IP), bound only while a client is
-connected so the couch keeps its own controller the rest of the time.
+triggers, USB rumble — or to use a device no emulation can stand in for, like a racing wheel or a
+HOTAS, hand the physical device from the couch to the host over
+[VirtualHere](https://www.virtualhere.com/) (USB-over-IP) while you play.
 
-**The two sides.** VirtualHere is a server/client pair, and you run both:
+**Use the plugin.** [VirtualHere passthrough](/docs/plugins#virtualhere-usb-passthrough) does all of
+this for you: it finds the device by name (so it survives the couch rebooting), brackets it around
+the session, gives it back if anything crashes, and tells you which half of the setup is broken when
+it isn't working. That is the supported route, and the rest of this section is only for people who
+would rather not install a plugin.
 
-- **Server — on the couch** (where the pad is physically plugged in). Run the VirtualHere USB
-  Server there; it shares the pad on the LAN. Leave it running.
-- **Client — on the host** (where the game and this automation run). Install the VirtualHere
-  Client (as a service, or the tray app). It auto-discovers the couch's shared pad on the same
-  LAN; across subnets, add it once with `<VH_CLIENT> -t "MANUAL HUB ADD,<couch-ip>:7575"`. The
-  client binary is `vhclientx86_64` on Linux, `vhui64.exe` on Windows, `vhclientosx` on macOS,
-  `vhclientarm64` on ARM Linux.
-
-The client's `-t` flag is a one-shot IPC to the already-running client: `-t LIST` prints every
-visible device with its address (`server.port`, e.g. `couch-deck.11`); `-t "USE,<addr>"` mounts it
-onto the host; `-t "STOP USING,<addr>"` hands it back. The automation just brackets
-`USE` / `STOP USING` around a session.
+**The two sides.** VirtualHere is a server/client pair, and you run both: the **server on the couch**
+(where the device is plugged in) shares it, and the **client on the host** mounts it. The client's
+`-t` flag is a one-shot IPC to the already-running client — `-t LIST` prints every visible device
+with its address (`server.port`, e.g. `couch-deck.11`), `-t "USE,<addr>"` mounts it, and
+`-t "STOP USING,<addr>"` hands it back.
 
 ### Zero-code: two hooks
 
-Bracket it on the stream with two [hooks](#hooks-hooksjson) — mount when video starts, release
-when it stops. This is all most setups need:
+Bracket it on the stream with two [hooks](#hooks-hooksjson):
 
 ```json
 {
@@ -226,42 +222,14 @@ when it stops. This is all most setups need:
 }
 ```
 
-`couch-deck.11` is the device's VirtualHere address from `vhclientx86_64 -t LIST`.
+`couch-deck.11` is the device's address from `vhclientx86_64 -t LIST`.
 
-### Scripted: resolve by name, release on shutdown
-
-The hooks above hard-code the address, and can strand the pad on the host if it's stopped
-mid-stream (the `stream.stopped` hook never fires). The
+Know what this trades away, because the plugin exists to fix exactly these: the address is
+hard-coded, so it breaks when the couch reboots or the device moves port; and if the stream ends
+abnormally the `stream.stopped` hook never fires, leaving the device stranded on the host until
+somebody notices. There is also a
 [`virtualhere-dualsense.ts`](https://git.unom.io/unom/punktfunk/src/branch/main/sdk/examples/virtualhere-dualsense.ts)
-SDK example is the robust version: it resolves the device by **name substring** (survives the
-address changing), can filter to **one couch** in a multi-client setup, and **releases the pad on
-a clean shutdown** (`systemctl stop`, ^C) so the couch always gets its controller back.
+SDK example if you want a worked script to build your own on.
 
-It's a standalone [`@punktfunk/host` script](https://git.unom.io/unom/punktfunk/src/branch/main/sdk#running-a-single-script-as-a-service)
-— run it in its own directory. The one edit is its import: the in-repo copy imports from
-`../src/index.js`; outside the repo it's the published package:
-
-```sh
-mkdir ~/punktfunk-scripts && cd ~/punktfunk-scripts
-bun init -y
-bun add @punktfunk/host          # point the @punktfunk scope at the registry first — see the SDK README
-# save the example as virtualhere-dualsense.ts, and change its first import to the package:
-#   - import { connect } from "../src/index.js";
-#   + import { connect } from "@punktfunk/host";
-VH_DEVICE=DualSense bun virtualhere-dualsense.ts
-```
-
-`VH_DEVICE` is required — a VirtualHere address (`couch-deck.11`) or a device-name substring
-(`DualSense`). Optional: `VH_CLIENT` overrides the client binary (default `vhclientx86_64`);
-`VH_ONLY_CLIENT` binds only for one punktfunk client label. Running on the host box the SDK needs
-no token or URL — it reads the host's loopback credentials itself (see
-[Connection resolution](https://git.unom.io/unom/punktfunk/src/branch/main/sdk#connection-resolution)).
-
-Keep it running as a
-[systemd user unit](https://git.unom.io/unom/punktfunk/src/branch/main/sdk#running-a-single-script-as-a-service)
-(its default `SIGTERM` triggers the script's own release step — so `systemctl stop` hands the pad
-back), or drop it under the [scripting runner](/docs/plugins) with your other units.
-
-> The example brackets on `client.connected` / `client.disconnected` — the pad returns to the
-> couch the moment they disconnect. Switch to `stream.started` / `stream.stopped` if you'd rather
-> pass it through only while video is actually flowing; both are noted in the file's header.
+> VirtualHere is a commercial product, sold separately by VirtualHere Pty. Ltd. — free for one
+> shared device, licensed beyond that. Punktfunk is not affiliated with it.
