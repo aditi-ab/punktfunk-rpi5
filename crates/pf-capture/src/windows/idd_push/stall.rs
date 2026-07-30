@@ -16,6 +16,31 @@ pub(super) struct Stall {
     pub(super) metronomic: Option<Duration>,
 }
 
+/// One degraded stretch, summarized at recovery ([`StallWatch::take_recovery`]). Per-hole stall
+/// lines gate on prior ACTIVE flow, so inside a sustained ~2 fps phase only the first hole is
+/// reported and the log goes quiet exactly while the user suffers — this summary is the stretch's
+/// one visible line.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct Recovery {
+    /// First hole's start → last hole's end.
+    pub(super) degraded: Duration,
+    /// Stall-sized (≥ [`StallWatch::STALL_MIN`]) holes inside the stretch.
+    pub(super) holes: u32,
+    /// Their summed length.
+    pub(super) hole_time: Duration,
+    /// The longest single hole.
+    pub(super) worst: Duration,
+}
+
+/// [`StallWatch`]'s in-flight degraded stretch (see [`Recovery`]).
+struct Episode {
+    started: Instant,
+    last_hole_end: Instant,
+    holes: u32,
+    hole_time: Duration,
+    worst: Duration,
+}
+
 /// Driver-telemetry evidence for one stall window (the v2 header tail — see
 /// `pf_driver_proto::frame::SharedHeader`), sampled by the capturer between the last pre-gap
 /// frame and the frame that ended the stall.
@@ -281,6 +306,11 @@ pub(super) struct StallWatch {
     /// compositor-blocked, content-silence, frame-generation, unattributed) — the verdict
     /// matrix's session summary.
     classes: [u32; 7],
+    /// The degraded stretch currently being accumulated, opened by a reported stall and fed by
+    /// every stall-sized hole until sustained flow returns.
+    episode: Option<Episode>,
+    /// A closed episode's summary, parked for the caller ([`Self::take_recovery`]).
+    pending_recovery: Option<Recovery>,
 }
 
 impl StallWatch {
@@ -293,6 +323,12 @@ impl StallWatch {
     /// The smallest hole that counts as a stall (~9 missed frames at 60 Hz) — well below the
     /// reported 300–700 ms freezes, above encode/present jitter.
     const STALL_MIN: Duration = Duration::from_millis(150);
+    /// A hole this long is a content STOP, not a degraded stretch — an open episode is closed
+    /// (and summarized) before it, so a quit-to-idle pause never folds into the tally.
+    const EPISODE_BREAK: Duration = Duration::from_secs(10);
+    /// Episodes with fewer holes than this dissolve silently — the single stall's own report
+    /// line already covers them.
+    const EPISODE_MIN_HOLES: u32 = 2;
 
     pub(super) fn new() -> Self {
         Self {
@@ -302,13 +338,38 @@ impl StallWatch {
             with_os_events: 0,
             verdicts: [0; 4],
             classes: [0; 7],
+            episode: None,
+            pending_recovery: None,
         }
     }
 
     /// Forget the flow history (a ring recreate's gap is self-inflicted, not a DWM stall — without
-    /// the reset the first post-recreate frame would read as one).
+    /// the reset the first post-recreate frame would read as one). An open episode is closed and
+    /// summarized: its holes predate the recreate and are real evidence.
     pub(super) fn reset(&mut self) {
         self.recent.clear();
+        self.close_episode();
+    }
+
+    /// Close an open episode into [`Self::pending_recovery`] (kept only past the noise bar).
+    fn close_episode(&mut self) {
+        if let Some(ep) = self.episode.take() {
+            if ep.holes >= Self::EPISODE_MIN_HOLES {
+                self.pending_recovery = Some(Recovery {
+                    degraded: ep.last_hole_end.duration_since(ep.started),
+                    holes: ep.holes,
+                    hole_time: ep.hole_time,
+                    worst: ep.worst,
+                });
+            }
+        }
+    }
+
+    /// A closed degraded stretch's summary, if one is waiting — the caller logs it. Check after
+    /// every [`Self::note_fresh`]/[`Self::reset`]: closure rides frames that are NOT stalls (the
+    /// first sustained-flow frame after recovery).
+    pub(super) fn take_recovery(&mut self) -> Option<Recovery> {
+        self.pending_recovery.take()
     }
 
     /// Record a fresh driver frame at `now`; `Some` exactly when it ended a stall.
@@ -325,6 +386,37 @@ impl StallWatch {
             self.recent.pop_front();
         }
         let gap = gap?;
+        if gap >= Self::EPISODE_BREAK {
+            // The content plainly STOPPED (quit to desktop, long idle) — summarize what came
+            // before rather than folding a legitimate pause into the degraded tally.
+            self.close_episode();
+        }
+        if gap >= Self::STALL_MIN {
+            match &mut self.episode {
+                // Inside a degraded stretch every stall-sized hole accumulates — the activity
+                // gate below keeps per-hole reports quiet here (the pre-gap window spans the
+                // slow frames), which is exactly why the episode summary exists.
+                Some(ep) => {
+                    ep.holes += 1;
+                    ep.hole_time += gap;
+                    ep.worst = ep.worst.max(gap);
+                    ep.last_hole_end = now;
+                }
+                None if was_active => {
+                    self.episode = Some(Episode {
+                        started: now - gap,
+                        last_hole_end: now,
+                        holes: 1,
+                        hole_time: gap,
+                        worst: gap,
+                    });
+                }
+                None => {}
+            }
+        } else if was_active {
+            // Sustained flow is back ([`Self::RECENT`] tight frames) — the stretch is over.
+            self.close_episode();
+        }
         if !was_active || gap < Self::STALL_MIN {
             return None;
         }

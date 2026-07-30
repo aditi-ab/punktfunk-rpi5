@@ -1669,6 +1669,20 @@ impl IddPushCapturer {
             self.stall_watch.report(&stall, now, &evidence);
         }
         if !regen {
+            // A degraded stretch just ended (or was cut by a ring recreate): the one line that
+            // makes a sustained ~2 fps phase log-visible — per-hole stall lines gate on prior
+            // ACTIVE flow and go quiet exactly while the stretch runs.
+            if let Some(r) = self.stall_watch.take_recovery() {
+                tracing::info!(
+                    degraded_ms = r.degraded.as_millis() as u64,
+                    holes = r.holes,
+                    hole_time_ms = r.hole_time.as_millis() as u64,
+                    worst_hole_ms = r.worst.as_millis() as u64,
+                    "IDD-push capture recovered from a degraded stretch — fresh frames arrived \
+                     only between stall-sized holes for its whole span; the per-stall lines \
+                     above cover at most its first hole"
+                );
+            }
             // A fresh driver frame: feed the driver-death watch and roll the stall-evidence
             // trackers (a regen re-encodes OLD content — it is not evidence of driver progress).
             self.last_fresh = now;
@@ -2135,6 +2149,84 @@ mod tests {
         t.push(497);
         let out = watch_run(&t);
         assert!(out[10].is_some(), "30 fps flow must pass the activity gate");
+    }
+
+    /// Feed a [`StallWatch`] frames at the given offsets and return the first degraded-stretch
+    /// summary it parks (checking after every frame, the way the capture loop does).
+    fn watch_recovery(offsets_ms: &[u64]) -> (StallWatch, Option<super::stall::Recovery>) {
+        let base = Instant::now();
+        let mut w = StallWatch::new();
+        let mut recovery = None;
+        for ms in offsets_ms {
+            w.note_fresh(base + Duration::from_millis(*ms));
+            if let Some(r) = w.take_recovery() {
+                recovery.get_or_insert(r);
+            }
+        }
+        (w, recovery)
+    }
+
+    #[test]
+    fn a_degraded_stretch_summarizes_on_recovery() {
+        // Active flow, then a ~2 fps phase (10 holes of 500 ms — the sustained-degradation
+        // shape whose holes the activity gate keeps out of the per-stall log), then recovery
+        // flow. One summary, carrying the whole stretch.
+        let mut t = Vec::new();
+        flow(&mut t, 0, 20); // last frame at 304 ms
+        t.extend((1..=10).map(|i| 304 + i * 500)); // 804..5304: ten 500 ms holes
+        t.extend((1..=12).map(|i| 5304 + i * 16)); // sustained flow is back
+        let (_, r) = watch_recovery(&t);
+        let r = r.expect("a multi-hole degraded stretch summarizes at recovery");
+        assert_eq!(r.holes, 10);
+        assert_eq!(r.hole_time.as_millis(), 5000);
+        assert_eq!(r.worst.as_millis(), 500);
+        assert_eq!(r.degraded.as_millis(), 5000);
+    }
+
+    #[test]
+    fn a_single_stall_never_summarizes() {
+        // One hole inside otherwise-healthy flow: its own stall line covers it — a
+        // one-hole "stretch" dissolving silently is what keeps the summary meaningful.
+        let mut t = Vec::new();
+        flow(&mut t, 0, 20);
+        t.push(604); // the lone 300 ms hole
+        t.extend((1..=12).map(|i| 604 + i * 16));
+        let (_, r) = watch_recovery(&t);
+        assert!(
+            r.is_none(),
+            "single stall must not produce a stretch summary"
+        );
+    }
+
+    #[test]
+    fn a_recreate_cut_stretch_still_summarizes() {
+        // A ring recreate resets the flow history mid-stretch; the holes accumulated BEFORE it
+        // are real evidence and must still surface.
+        let mut t = Vec::new();
+        flow(&mut t, 0, 20);
+        t.extend((1..=3).map(|i| 304 + i * 500));
+        let (mut w, r) = watch_recovery(&t);
+        assert!(r.is_none(), "stretch still open — no summary yet");
+        w.reset();
+        let r = w
+            .take_recovery()
+            .expect("reset closes and summarizes the open stretch");
+        assert_eq!(r.holes, 3);
+        assert_eq!(r.hole_time.as_millis(), 1500);
+    }
+
+    #[test]
+    fn a_content_stop_closes_the_stretch_without_folding_the_pause_in() {
+        // Two degraded holes, then the content plainly STOPS (a 20 s pause — quit to desktop).
+        // The summary covers the stretch only; the legitimate pause never joins the tally.
+        let mut t = Vec::new();
+        flow(&mut t, 0, 20);
+        t.extend([804, 1304, 21_304]);
+        let (_, r) = watch_recovery(&t);
+        let r = r.expect("the content stop closes the stretch");
+        assert_eq!(r.holes, 2);
+        assert_eq!(r.hole_time.as_millis(), 1000);
+        assert_eq!(r.degraded.as_millis(), 1000);
     }
 
     #[test]
