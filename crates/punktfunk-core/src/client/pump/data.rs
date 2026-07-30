@@ -103,7 +103,18 @@ impl DataPump {
         // becomes the climb ceiling and slow start does the rest. Old hosts decline (all-zero
         // reply) or never answer (timeout clears the state so LossReports resume) — either way
         // the ceiling stays negotiated, exactly the old behavior. PUNKTFUNK_ABR_PROBE=0 opts out.
-        const CAPACITY_PROBE_KBPS: u32 = 2_000_000;
+        // `PUNKTFUNK_ABR_PROBE_KBPS` lowers the burst target (unset/0/garbage → the 2 Gbps
+        // default): the target is deliberately far above any plausible link so the burst measures
+        // the link and not itself, but on links the burst DISTURBS that backfires — a constrained
+        // Wi-Fi link can black-hole under 2 Gbps (measured on webOS: the probe hitting the 6 s
+        // timeout delayed first video to 14 s, and a "successful" one still reported
+        // send_dropped=20211), and a 2-3 core TV client starves decoding the firehose. An
+        // embedder that caps its own speed test wants this capped to match.
+        let capacity_probe_kbps: u32 = std::env::var("PUNKTFUNK_ABR_PROBE_KBPS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(2_000_000);
         const CAPACITY_PROBE_MS: u32 = 800;
         const CAPACITY_PROBE_DELAY: Duration = Duration::from_secs(2);
         const CAPACITY_PROBE_TIMEOUT: Duration = Duration::from_secs(6);
@@ -245,14 +256,14 @@ impl DataPump {
                 };
                 if ctrl_tx
                     .try_send(CtrlRequest::Probe(ProbeRequest {
-                        target_kbps: CAPACITY_PROBE_KBPS,
+                        target_kbps: capacity_probe_kbps,
                         duration_ms: CAPACITY_PROBE_MS,
                     }))
                     .is_ok()
                 {
                     capacity_probe_deadline = Some(Instant::now() + CAPACITY_PROBE_TIMEOUT);
                     tracing::info!(
-                        target_kbps = CAPACITY_PROBE_KBPS,
+                        target_kbps = capacity_probe_kbps,
                         duration_ms = CAPACITY_PROBE_MS,
                         "adaptive bitrate: startup link-capacity probe"
                     );
