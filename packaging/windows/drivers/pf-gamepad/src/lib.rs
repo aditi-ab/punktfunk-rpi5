@@ -302,8 +302,9 @@ static INPUT_REPORT: std::sync::Mutex<[u8; 64]> = std::sync::Mutex::new(NEUTRAL_
 // ---- the sealed pad channel: layouts + offsets from pf_driver_proto (drift = compile error) ----
 // UMDF runs in WUDFHost.exe (user-mode) and hidclass blocks a control channel on the device stack
 // (custom interface CreateFile → err 31; custom IOCTL on the HID handle → err 1) and UMDF has no
-// control device. So the DATA section (`PadShm`, 256 B — input report @8, output seq @72, output
-// report @76, device_type @140, health marks @144/@148, pad_index @152) is UNNAMED and reached only
+// control device. So the DATA section (`PadShm` — input report @8, output seq @72, output
+// report @76, device_type @140, health marks @144/@148, pad_index @152, output-report ring
+// @156..) is UNNAMED and reached only
 // through a handle the SYSTEM host duplicated into this WUDFHost, bootstrapped over the named mailbox
 // `Global\pfds-boot-<index>`. The handshake + all shared-memory access live in `pf_umdf_util`.
 const SHM_MAGIC: u32 = pf_driver_proto::gamepad::PAD_MAGIC; // "PFDS"
@@ -318,30 +319,56 @@ const OFF_DEVICE_TYPE: usize = core::mem::offset_of!(PadShm, device_type);
 const OFF_DRIVER_PROTO: usize = core::mem::offset_of!(PadShm, driver_proto);
 const OFF_DRIVER_HEARTBEAT: usize = core::mem::offset_of!(PadShm, driver_heartbeat);
 const OFF_PAD_INDEX: usize = core::mem::offset_of!(PadShm, pad_index);
-// v2.1 output-report ring (see PadShm docs in pf_driver_proto).
+// v2.1/v2.2 output-report ring (see PadShm docs in pf_driver_proto).
 const OFF_OUT_RING_VER: usize = core::mem::offset_of!(PadShm, out_ring_ver);
 const OFF_RING_HEAD: usize = core::mem::offset_of!(PadShm, ring_head);
+const OFF_OUT_RING_LEN: usize = core::mem::offset_of!(PadShm, out_ring_len);
 const OFF_OUT_RING: usize = core::mem::offset_of!(PadShm, out_ring);
 const OUT_SLOT_SIZE: usize = core::mem::size_of::<pf_driver_proto::gamepad::OutSlot>();
 const OUT_RING_LEN: u32 = pf_driver_proto::gamepad::OUT_RING_LEN;
+const OUT_RING_LEN_V22: u32 = pf_driver_proto::gamepad::OUT_RING_LEN_V22;
+
+/// The output-ring length this side's slot math uses against the attached section — the driver's
+/// half of the v2.2 negotiation (PadShm docs): the host's `out_ring_ver` stamp declares what it
+/// can drain, the mapped length proves the slots exist in OUR view, and the shorter understanding
+/// wins. `0` = no ring (pre-v2.1 host, or a fallback-size map too small to hold one) — legacy
+/// latest-slot only. Constant per attachment (both inputs are fixed once the view exists).
+fn ring_len(view: &pf_umdf_util::section::MappedView) -> u32 {
+    if view.read_u32(OFF_OUT_RING_VER) == 0
+        || view.mapped_len() < pf_driver_proto::gamepad::PAD_SHM_V21_SIZE
+    {
+        return 0;
+    }
+    if view.read_u32(OFF_OUT_RING_VER) >= 2
+        && view.mapped_len() >= pf_driver_proto::gamepad::PAD_SHM_SIZE
+    {
+        OUT_RING_LEN_V22
+    } else {
+        OUT_RING_LEN
+    }
+}
 
 /// Publish one game output report to the host: the legacy latest-report slot + `out_seq` bump
 /// (every host generation reads this), and — when the host stamped `out_ring_ver` (it created the
-/// ring region) and our view maps it — the lossless report ring: slot bytes first, `ring_head`
-/// bump last, the same publish-then-bump store order the host's Acquire load pairs with on the
-/// legacy `out_seq`. The ring is what stops a rumble-STOP report from being coalesced away by a
-/// following LED/trigger report inside one host poll window (the confirmed stuck-rumble path).
+/// ring region) and our view maps it — the lossless report ring: slot bytes first, then the
+/// [`ring_len`] echo (the v2.2 length negotiation — a pre-v2.2 host never reads it), then the
+/// `ring_head` bump with `Release` so the host's Acquire load can never observe the bump without
+/// the slot bytes and the length that indexed them. The ring is what stops a rumble-STOP report
+/// from being coalesced away by a following LED/trigger report inside one host poll window (the
+/// confirmed stuck-rumble path).
 fn publish_output(view: &pf_umdf_util::section::MappedView, bytes: &[u8]) {
     view.write_bytes(OFF_OUTPUT, bytes);
     let seq = view.read_u32(OFF_OUT_SEQ).wrapping_add(1);
     view.write_u32(OFF_OUT_SEQ, seq);
-    if view.mapped_len() >= SHM_SIZE && view.read_u32(OFF_OUT_RING_VER) != 0 {
+    let len = ring_len(view);
+    if len != 0 {
         let head = view.read_u32(OFF_RING_HEAD);
-        let slot = OFF_OUT_RING + (head % OUT_RING_LEN) as usize * OUT_SLOT_SIZE;
+        let slot = OFF_OUT_RING + (head % len) as usize * OUT_SLOT_SIZE;
         let n = bytes.len().min(64);
         view.write_u32(slot, n as u32);
         view.write_bytes(slot + 4, &bytes[..n]);
-        view.write_u32(OFF_RING_HEAD, head.wrapping_add(1));
+        view.write_u32(OFF_OUT_RING_LEN, len);
+        view.store_u32(OFF_RING_HEAD, head.wrapping_add(1), Ordering::Release);
     }
 }
 

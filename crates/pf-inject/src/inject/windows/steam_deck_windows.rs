@@ -61,8 +61,9 @@ impl DeckWinPad {
         unsafe {
             *base.add(OFF_DEVTYPE) = pf_driver_proto::gamepad::DEVTYPE_STEAMDECK;
             std::ptr::write_unaligned(base.add(OFF_PAD_INDEX) as *mut u32, index as u32);
-            // Ring capability (v2.1), stamped before the magic so the driver sees it on attach.
-            std::ptr::write_unaligned(base.add(OFF_OUT_RING_VER) as *mut u32, 1);
+            // Ring capability `2` = "this host drains the v2.2 long ring", stamped before the
+            // magic so the driver sees it on attach (see the DualSense open path + PadShm docs).
+            std::ptr::write_unaligned(base.add(OFF_OUT_RING_VER) as *mut u32, 2);
             std::ptr::write_unaligned(
                 base.add(OFF_INPUT) as *mut [u8; STEAM_REPORT_LEN],
                 neutral_deck_report(),

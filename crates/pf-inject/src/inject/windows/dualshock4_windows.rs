@@ -56,8 +56,9 @@ impl Ds4WinPad {
         unsafe {
             *base.add(OFF_DEVTYPE) = DEVTYPE_DUALSHOCK4;
             std::ptr::write_unaligned(base.add(OFF_PAD_INDEX) as *mut u32, index as u32);
-            // Ring capability (v2.1), stamped before the magic so the driver sees it on attach.
-            std::ptr::write_unaligned(base.add(OFF_OUT_RING_VER) as *mut u32, 1);
+            // Ring capability `2` = "this host drains the v2.2 long ring", stamped before the
+            // magic so the driver sees it on attach (see the DualSense open path + PadShm docs).
+            std::ptr::write_unaligned(base.add(OFF_OUT_RING_VER) as *mut u32, 2);
             std::ptr::write_unaligned(base.add(OFF_INPUT) as *mut [u8; DS4_INPUT_REPORT_LEN], {
                 let mut r = [0u8; DS4_INPUT_REPORT_LEN];
                 serialize_state(&mut r, &DsState::neutral(), 0, 0);

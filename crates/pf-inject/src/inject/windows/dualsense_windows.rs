@@ -57,22 +57,27 @@ pub(super) const OFF_PAD_INDEX: usize =
     core::mem::offset_of!(pf_driver_proto::gamepad::PadShm, pad_index);
 pub(super) const DEVTYPE_DUALSHOCK4: u8 = pf_driver_proto::gamepad::DEVTYPE_DUALSHOCK4;
 pub(super) const DEVTYPE_DUALSENSE_EDGE: u8 = pf_driver_proto::gamepad::DEVTYPE_DUALSENSE_EDGE;
-// v2.1 output-report ring (see `PadShm` in pf-driver-proto for the layout + version posture).
+// v2.1/v2.2 output-report ring (see `PadShm` in pf-driver-proto for the layout + version posture
+// + the ring-length negotiation).
 pub(super) const OFF_OUT_RING_VER: usize =
     core::mem::offset_of!(pf_driver_proto::gamepad::PadShm, out_ring_ver);
 pub(super) const OFF_RING_HEAD: usize =
     core::mem::offset_of!(pf_driver_proto::gamepad::PadShm, ring_head);
+pub(super) const OFF_OUT_RING_LEN: usize =
+    core::mem::offset_of!(pf_driver_proto::gamepad::PadShm, out_ring_len);
 pub(super) const OFF_OUT_RING: usize =
     core::mem::offset_of!(pf_driver_proto::gamepad::PadShm, out_ring);
 pub(super) const OUT_SLOT_SIZE: usize = core::mem::size_of::<pf_driver_proto::gamepad::OutSlot>();
 pub(super) const OUT_RING_LEN: u32 = pf_driver_proto::gamepad::OUT_RING_LEN;
+pub(super) const OUT_RING_LEN_V22: u32 = pf_driver_proto::gamepad::OUT_RING_LEN_V22;
 
-/// Shared drain over a pad section's output plane — the lossless v2.1 report ring when the driver
-/// publishes one, the legacy latest-report slot otherwise (an old driver package). One per pad;
-/// owns the cursors that used to live as bare `last_out_seq` fields on each backend. The ring is
-/// what guarantees a rumble-STOP report can never be coalesced away by a following LED/trigger
-/// report inside one ~4 ms poll window — the confirmed unbounded stuck-rumble path
-/// (`design/rumble-root-fix.md` §A).
+/// Shared drain over a pad section's output plane — the lossless report ring when the driver
+/// publishes one (8 slots from a v2.1 driver, [`OUT_RING_LEN_V22`] once both sides negotiated the
+/// v2.2 growth — the driver's `out_ring_len` echo decides, see the PadShm docs), the legacy
+/// latest-report slot otherwise (an old driver package). One per pad; owns the cursors that used
+/// to live as bare `last_out_seq` fields on each backend. The ring is what guarantees a
+/// rumble-STOP report can never be coalesced away by a following LED/trigger report inside one
+/// ~4 ms poll window — the confirmed unbounded stuck-rumble path (`design/rumble-root-fix.md` §A).
 pub(super) struct OutputDrain {
     /// Ring cursor: the driver's `ring_head` value up to which we have drained.
     tail: u32,
@@ -94,9 +99,11 @@ impl OutputDrain {
 
     /// Drain every output report published since the last call, oldest → newest, invoking
     /// `per_report` with each report's exact bytes. Returns `true` on ring OVERFLOW — more than
-    /// [`OUT_RING_LEN`] reports landed since the last poll (or the driver lapped us mid-copy): the
-    /// pending reports were DISCARDED as possibly torn and the caller must treat its downstream
-    /// feedback state as unknown (`PadFeedback::resync`).
+    /// the negotiated ring length landed since the last poll (or the driver lapped us mid-copy):
+    /// the pending window was DISCARDED as possibly torn, the legacy latest-report slot was
+    /// salvaged into ONE `per_report` call (the freshest coalesced state — the driver
+    /// dual-publishes every report there), and the caller must still treat its downstream
+    /// feedback state as unknown (`PadFeedback::resync`) for the planes that report didn't carry.
     pub(super) fn drain(&mut self, base: *mut u8, mut per_report: impl FnMut(&[u8])) -> bool {
         // SAFETY: base points at SHM_SIZE bytes; `OFF_RING_HEAD` (== 160) is 4-aligned off the
         // page-aligned base. The driver bumps `ring_head` AFTER writing the slot, so an Acquire
@@ -108,18 +115,35 @@ impl OutputDrain {
             if head == self.tail {
                 return false;
             }
+            // The v2.2 length echo — the modulo the DRIVER's slot math used (0 = a pre-v2.2
+            // driver that never stamps it and hardcodes 8). Loaded after the Acquire on
+            // `ring_head` and re-stamped by the driver before every bump, so any observed head
+            // comes with the length that indexed its slots. Out-of-range values (a torn or
+            // hostile section) clamp to the v2.1 length: the drain then at worst mis-slots and
+            // discards, never reads out of bounds (slot offsets stay ≤ the v2.2 ring's end).
+            // SAFETY: `OFF_OUT_RING_LEN` (== 164) is 4-aligned off the page-aligned base.
+            let echo = unsafe {
+                (*(base.add(OFF_OUT_RING_LEN) as *const AtomicU32)).load(Ordering::Relaxed)
+            };
+            let ring_len = if (1..=OUT_RING_LEN_V22).contains(&echo) {
+                echo
+            } else {
+                OUT_RING_LEN
+            };
             let pending = head.wrapping_sub(self.tail);
-            if pending <= OUT_RING_LEN {
+            if pending <= ring_len {
                 // Copy the pending slots out FIRST, then re-check the head: a writer that lapped
                 // past our window during the copy may have overwritten what we read, so parse only
                 // when the window provably stayed inside the ring.
                 let n = pending as usize;
-                let mut bufs = [([0u8; 64], 0usize); pf_driver_proto::gamepad::OUT_RING_LEN_USIZE];
+                let mut bufs =
+                    [([0u8; 64], 0usize); pf_driver_proto::gamepad::OUT_RING_LEN_V22_USIZE];
                 for (k, buf) in bufs.iter_mut().enumerate().take(n) {
-                    let idx = (self.tail.wrapping_add(k as u32) % OUT_RING_LEN) as usize;
+                    let idx = (self.tail.wrapping_add(k as u32) % ring_len) as usize;
                     let slot = OFF_OUT_RING + idx * OUT_SLOT_SIZE;
-                    // SAFETY: slot .. slot+OUT_SLOT_SIZE is inside the SHM_SIZE section; the len
-                    // field is 4-aligned (`OFF_OUT_RING` == 256, `OUT_SLOT_SIZE` == 68).
+                    // SAFETY: slot .. slot+OUT_SLOT_SIZE is inside the SHM_SIZE section (idx <
+                    // `ring_len` ≤ OUT_RING_LEN_V22, whose last slot ends at 4064 ≤ SHM_SIZE);
+                    // the len field is 4-aligned (`OFF_OUT_RING` == 256, `OUT_SLOT_SIZE` == 68).
                     let len = unsafe { std::ptr::read_unaligned(base.add(slot) as *const u32) };
                     buf.1 = (len as usize).min(64);
                     // SAFETY: the slot's data region is slot+4 .. slot+4+64, inside the section;
@@ -132,7 +156,7 @@ impl OutputDrain {
                 let head2 = unsafe {
                     (*(base.add(OFF_RING_HEAD) as *const AtomicU32)).load(Ordering::Acquire)
                 };
-                if head2.wrapping_sub(self.tail) <= OUT_RING_LEN {
+                if head2.wrapping_sub(self.tail) <= ring_len {
                     for (data, len) in bufs.iter().take(n) {
                         if *len > 0 {
                             per_report(&data[..*len]);
@@ -142,11 +166,23 @@ impl OutputDrain {
                     return false;
                 }
             }
-            // Overflow (or lapped mid-copy): skip to the freshest head, deliver nothing, and
-            // report the resync — parsing possibly-torn reports is worse than a bounded silence.
+            // Overflow (or lapped mid-copy): skip to the freshest head and salvage the legacy
+            // latest-report slot — the driver dual-publishes every report there, so it holds the
+            // newest state the window carried. One salvaged report beats the old total silence: a
+            // rumble-heavy >2 kHz writer used to be force-muted for the storm's whole duration
+            // (field log 2026-07-30). The slot has no seqlock, so the copy can tear against a
+            // mid-write driver — the parser's id/flag gates drop most tears, a plausible-but-torn
+            // value lasts one poll at storm rates, and the caller's resync still silences every
+            // plane the salvaged report doesn't assert. A report that lands between the reload
+            // and the copy is salvaged now AND drained next poll — harmless, reports are
+            // valid-flag-gated state and the caller's dedup drops the repeat.
             // SAFETY: as the first `ring_head` load above.
             self.tail =
                 unsafe { (*(base.add(OFF_RING_HEAD) as *const AtomicU32)).load(Ordering::Acquire) };
+            let mut out = [0u8; 64];
+            // SAFETY: the legacy output slot is OFF_OUTPUT..OFF_OUTPUT+64 within the section.
+            unsafe { std::ptr::copy_nonoverlapping(base.add(OFF_OUTPUT), out.as_mut_ptr(), 64) };
+            per_report(&out);
             return true;
         }
         // Legacy driver (never wrote the ring): the latest-report slot + seq — exactly the old
@@ -422,8 +458,11 @@ impl DsWinPad {
         unsafe {
             *base.add(OFF_DEVTYPE) = id.devtype;
             std::ptr::write_unaligned(base.add(OFF_PAD_INDEX) as *mut u32, index as u32);
-            // Ring capability (v2.1), stamped before the magic so the driver sees it on attach.
-            std::ptr::write_unaligned(base.add(OFF_OUT_RING_VER) as *mut u32, 1);
+            // Ring capability, stamped before the magic so the driver sees it on attach: `2` =
+            // "this host drains the v2.2 long ring" (a v2.1 driver reads it as a boolean and
+            // stays on its 8-slot math — the drain follows the driver's `out_ring_len` echo, so
+            // both generations pair correctly; see the PadShm negotiation docs).
+            std::ptr::write_unaligned(base.add(OFF_OUT_RING_VER) as *mut u32, 2);
             std::ptr::write_unaligned(base.add(OFF_INPUT) as *mut [u8; DS_INPUT_REPORT_LEN], {
                 let mut r = [0u8; DS_INPUT_REPORT_LEN];
                 serialize_state(&mut r, &DsState::neutral(), 0, 0);
@@ -709,14 +748,28 @@ mod drain_tests {
         buf.as_mut_ptr() as *mut u8
     }
 
-    /// Mimic the v2.1 driver's dual write: legacy slot + seq, then ring slot, then head.
+    /// Mimic the v2.1 driver's dual write: legacy slot + seq, then ring slot (8-slot math, no
+    /// length echo), then head.
     fn publish(buf: &mut [u32], bytes: &[u8]) {
+        ring_publish(buf, bytes, OUT_RING_LEN, false);
+    }
+
+    /// Mimic the v2.2 driver's dual write: same, with the long-ring slot math and the
+    /// `out_ring_len` echo stamped before the head bump.
+    fn v22_publish(buf: &mut [u32], bytes: &[u8]) {
+        ring_publish(buf, bytes, OUT_RING_LEN_V22, true);
+    }
+
+    fn ring_publish(buf: &mut [u32], bytes: &[u8], len: u32, echo: bool) {
         legacy_publish(buf, bytes);
         let head = read32(buf, OFF_RING_HEAD);
-        let slot = OFF_OUT_RING + (head % OUT_RING_LEN) as usize * OUT_SLOT_SIZE;
+        let slot = OFF_OUT_RING + (head % len) as usize * OUT_SLOT_SIZE;
         write32(buf, slot, bytes.len() as u32);
         let b = bytes_mut(buf);
         b[slot + 4..slot + 4 + bytes.len()].copy_from_slice(bytes);
+        if echo {
+            write32(buf, OFF_OUT_RING_LEN, len);
+        }
         write32(buf, OFF_RING_HEAD, head.wrapping_add(1));
     }
 
@@ -792,7 +845,7 @@ mod drain_tests {
     }
 
     #[test]
-    fn overflow_discards_and_flags_resync_then_recovers() {
+    fn overflow_salvages_the_latest_slot_and_flags_resync_then_recovers() {
         let mut buf = section();
         let mut d = OutputDrain::new();
         for i in 0..12u8 {
@@ -801,11 +854,89 @@ mod drain_tests {
         }
         let (got, resync) = collect(&mut d, &mut buf);
         assert!(resync, "an overflowed window must be reported");
-        assert!(got.is_empty(), "possibly-torn reports must not be parsed");
+        assert_eq!(
+            got.len(),
+            1,
+            "the possibly-torn ring window must not be parsed — only the legacy latest slot"
+        );
+        assert_eq!(
+            &got[0][..2],
+            &[0x02, 11],
+            "the salvage must be the freshest coalesced state, not silence"
+        );
         publish(&mut buf, &[0x02, 99]);
         let (got, resync) = collect(&mut d, &mut buf);
         assert!(!resync);
         assert_eq!(got, vec![vec![0x02, 99]]);
+    }
+
+    /// The 2026-07-30 field storm: a >2 kHz writer lands more than 8 reports per poll window. A
+    /// v2.2 driver's echoed long ring must absorb it losslessly — this exact burst overflowed
+    /// EVERY poll against the 8-slot ring.
+    #[test]
+    fn v22_ring_absorbs_a_burst_the_v21_ring_could_not() {
+        let mut buf = section();
+        let mut d = OutputDrain::new();
+        for i in 0..40u8 {
+            v22_publish(&mut buf, &[0x02, i]);
+        }
+        let (got, resync) = collect(&mut d, &mut buf);
+        assert!(!resync, "40 pending ≤ 56 slots — no overflow");
+        assert_eq!(
+            got.iter().map(|r| r[1]).collect::<Vec<_>>(),
+            (0..40).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn v22_ring_wraps_across_polls() {
+        let mut buf = section();
+        let mut d = OutputDrain::new();
+        for i in 0..50u8 {
+            v22_publish(&mut buf, &[0x02, i]);
+        }
+        assert_eq!(collect(&mut d, &mut buf).0.len(), 50);
+        for i in 50..100u8 {
+            // wraps past slot 56
+            v22_publish(&mut buf, &[0x02, i]);
+        }
+        let (got, resync) = collect(&mut d, &mut buf);
+        assert!(!resync);
+        assert_eq!(
+            got.iter().map(|r| r[1]).collect::<Vec<_>>(),
+            (50..100).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn v22_overflow_still_salvages_and_recovers() {
+        let mut buf = section();
+        let mut d = OutputDrain::new();
+        for i in 0..60u8 {
+            // 60 > OUT_RING_LEN_V22 pending
+            v22_publish(&mut buf, &[0x02, i]);
+        }
+        let (got, resync) = collect(&mut d, &mut buf);
+        assert!(resync);
+        assert_eq!(got.len(), 1);
+        assert_eq!(&got[0][..2], &[0x02, 59]);
+        v22_publish(&mut buf, &[0x02, 99]);
+        let (got, resync) = collect(&mut d, &mut buf);
+        assert!(!resync);
+        assert_eq!(got, vec![vec![0x02, 99]]);
+    }
+
+    /// An out-of-range `out_ring_len` (torn write / hostile section) must clamp to the v2.1
+    /// length, not drive the slot math out of the ring.
+    #[test]
+    fn garbage_length_echo_clamps_to_the_v21_length() {
+        let mut buf = section();
+        let mut d = OutputDrain::new();
+        publish(&mut buf, &[0x02, 1]); // 8-slot math, like the driver the clamp falls back to
+        write32(&mut buf, OFF_OUT_RING_LEN, 9999);
+        let (got, resync) = collect(&mut d, &mut buf);
+        assert!(!resync);
+        assert_eq!(got, vec![vec![0x02, 1]]);
     }
 
     /// Every hardware id the host puts on a pad devnode must be one the shipped INF actually

@@ -102,6 +102,45 @@ pub struct UhidManager<B: PadProto> {
     /// [`RUMBLE_IDLE_TIMEOUT`] against this is a residual the game abandoned — see
     /// [`pump`](Self::pump).
     last_active: Vec<Instant>,
+    /// Per-pad rate limiter for the ring-overflow WARN — see [`OverflowWarn`].
+    overflow_warn: Vec<OverflowWarn>,
+}
+
+/// Rate limiter for the per-poll ring-overflow WARN. A sustained >2 kHz output-report writer
+/// against a pre-v2.2 8-slot driver ring overflows EVERY ~4 ms poll; unlimited, that is ~230
+/// WARN lines/s — a field log's 5000-line web-console ring was 96 % this one line, which evicted
+/// the whole session history it was needed to diagnose (2026-07-30). One line per
+/// [`Self::PERIOD`] with a `suppressed` count keeps the signal and the log.
+#[derive(Default, Clone)]
+struct OverflowWarn {
+    /// When the last line was emitted (`None` = never — the next overflow logs immediately).
+    last: Option<Instant>,
+    /// Overflow polls swallowed since `last` — carried on the next emitted line.
+    suppressed: u32,
+}
+
+impl OverflowWarn {
+    const PERIOD: Duration = Duration::from_secs(1);
+
+    /// Record one overflow poll; emit (rate-limited) the WARN for it.
+    fn note(&mut self, now: Instant, backend: &'static str, index: usize) {
+        if self
+            .last
+            .is_none_or(|t| now.duration_since(t) >= Self::PERIOD)
+        {
+            tracing::warn!(
+                backend,
+                index,
+                suppressed = self.suppressed,
+                "output-report ring overflow — resyncing feedback state (repeats coalesced, 1 \
+                 line/s; `suppressed` = swallowed since the previous line)"
+            );
+            self.last = Some(now);
+            self.suppressed = 0;
+        } else {
+            self.suppressed = self.suppressed.saturating_add(1);
+        }
+    }
 }
 
 /// How long a latched, non-zero rumble may sit without the game driving the RUMBLE plane before it
@@ -162,6 +201,7 @@ impl<B: PadProto> UhidManager<B> {
             hidout_dedup: vec![HidoutDedup::default(); MAX_PADS],
             last_write: vec![Instant::now(); MAX_PADS],
             last_active: vec![Instant::now(); MAX_PADS],
+            overflow_warn: vec![OverflowWarn::default(); MAX_PADS],
         }
     }
 
@@ -249,14 +289,13 @@ impl<B: PadProto> UhidManager<B> {
             let fb = self.backend.service(pad, i as u8);
             if fb.resync {
                 // The driver's output-report ring overflowed — reports were dropped and the
-                // feedback state is unknown. Conservatively silence the pad (a game still rumbling
-                // re-asserts the level within a poll or two) and re-arm the rich-plane dedup so
-                // the next LED/trigger state re-forwards.
-                tracing::warn!(
-                    backend = B::LABEL,
-                    index = i,
-                    "output-report ring overflow — resyncing feedback state"
-                );
+                // feedback state is unknown beyond what the drain salvaged from the legacy
+                // latest-report slot (delivered through `fb` like any report). Conservatively
+                // silence the pad FIRST (a plane the salvage didn't carry must not stay latched;
+                // the salvaged state re-applies right below) and re-arm the rich-plane dedup so
+                // the next LED/trigger state re-forwards. WARN through the per-pad rate limiter —
+                // a storm overflows every poll and the raw line once flooded a whole log export.
+                self.overflow_warn[i].note(now, B::LABEL, i);
                 if self.last_rumble[i] != (0, 0) {
                     self.last_rumble[i] = (0, 0);
                     rumble(i as u16, 0, 0);
@@ -646,6 +685,24 @@ mod tests {
         m.heartbeat(Duration::from_secs(3600));
         assert_eq!(writes(&m), after_frame + 2);
     }
+    /// The overflow WARN limiter: a storm overflowing every ~4 ms poll must emit one line per
+    /// [`OverflowWarn::PERIOD`] and carry the swallowed count — the raw per-poll line once made
+    /// up 96 % of a field log export and evicted the session history around it.
+    #[test]
+    fn overflow_warn_coalesces_within_the_period() {
+        let mut w = OverflowWarn::default();
+        let t0 = Instant::now();
+        w.note(t0, "Mock", 0); // first overflow logs immediately
+        assert_eq!((w.last, w.suppressed), (Some(t0), 0));
+        for _ in 0..250 {
+            w.note(t0 + Duration::from_millis(4), "Mock", 0);
+        }
+        assert_eq!((w.last, w.suppressed), (Some(t0), 250), "storm coalesced");
+        let t1 = t0 + OverflowWarn::PERIOD;
+        w.note(t1, "Mock", 0); // period elapsed — logs (with suppressed=250) and re-arms
+        assert_eq!((w.last, w.suppressed), (Some(t1), 0));
+    }
+
     /// A ring-overflow resync must silence a latched rumble once and re-arm the rich-plane dedup,
     /// so the game's next asserted state re-forwards even when it equals the pre-overflow state.
     #[test]

@@ -1094,10 +1094,34 @@ pub mod gamepad {
     /// (see `pf_umdf_util::ChannelConfig::min_data_size`).
     pub const PAD_SHM_LEGACY_SIZE: usize = 256;
 
-    /// Output-report ring depth. 8 slots at the host's ~4 ms poll tolerates a sustained 2 kHz
-    /// writer — double any real HID output rate.
+    /// The v2.1 output-report ring depth — the length every pre-v2.2 driver hardcodes in its
+    /// `% OUT_RING_LEN` slot math, kept as the drain length whenever [`PadShm::out_ring_len`]
+    /// reads 0. Its sizing assumption ("8 slots at a ~4 ms poll tolerates a sustained 2 kHz
+    /// writer — double any real HID output rate") was falsified in the field: DS5 compat-vibration
+    /// writers that re-send per audio quantum sustain >2 kHz for tens of seconds (field log
+    /// 2026-07-30), overflowing every poll.
     pub const OUT_RING_LEN: u32 = 8;
     pub const OUT_RING_LEN_USIZE: usize = OUT_RING_LEN as usize;
+
+    /// The v2.2 output-report ring depth — the same ring grown in place to every slot that fits
+    /// the one-page section ([`PAD_SHM_SIZE`] = 4096): 56 slots at the host's ~4 ms poll
+    /// tolerates a sustained 14 kHz writer, ~7× the worst rate observed in the field. Used only
+    /// when BOTH sides negotiated it (host stamped `out_ring_ver >= 2`, driver echoed the length
+    /// in [`PadShm::out_ring_len`]).
+    pub const OUT_RING_LEN_V22: u32 = 56;
+    pub const OUT_RING_LEN_V22_USIZE: usize = OUT_RING_LEN_V22 as usize;
+
+    /// The v2.1 [`PadShm`] size. A v2.1 driver maps this much and gates its 8-slot ring writes on
+    /// `mapped_len() >= 1024`; the v2.2 growth keeps bytes `0..1024` layout-identical (the ring
+    /// slots 8.. extend over what was `_reserved2`).
+    pub const PAD_SHM_V21_SIZE: usize = 1024;
+
+    /// The full v2.2 [`PadShm`] size — exactly one page. This is a hard ceiling, not a choice:
+    /// pagefile-backed sections round up to page granularity, which is what lets every binary
+    /// generation map its own idea of the size against any other generation's section. A layout
+    /// that grows past 4096 breaks that (an old section refuses the larger view) and must ride a
+    /// new negotiation, not this one.
+    pub const PAD_SHM_SIZE: usize = 4096;
 
     /// One slot of the lossless output-report ring: the report bytes as the game wrote them
     /// (report id first), with the exact length — unlike the legacy latest-report slot, whose
@@ -1110,8 +1134,9 @@ pub mod gamepad {
         pub data: [u8; 64],
     }
 
-    /// Virtual DualSense / DualShock 4 shared section (1024 B; bytes `0..256` are the v2 legacy
-    /// layout verbatim — [`PAD_SHM_LEGACY_SIZE`]). The host writes the `0x01`-style HID input
+    /// Virtual DualSense / DualShock 4 shared section (4096 B — [`PAD_SHM_SIZE`]; bytes `0..256`
+    /// are the v2 legacy layout verbatim — [`PAD_SHM_LEGACY_SIZE`]; bytes `0..1024` are the v2.1
+    /// layout verbatim — [`PAD_SHM_V21_SIZE`]). The host writes the `0x01`-style HID input
     /// report into `input`; the driver feeds it to game `READ_REPORT`s and publishes a game's
     /// `0x02` output (rumble / lightbar / player-LEDs / adaptive triggers) twice: into the legacy
     /// latest-report `output` slot (bumping `out_seq` — every host generation reads this), and,
@@ -1126,6 +1151,16 @@ pub mod gamepad {
     /// mismatch (no pad at all), which is the wrong failure mode for a feedback-quality fix. An
     /// old driver never reads the new fields; an old host never stamps `out_ring_ver`, so a new
     /// driver stays on the legacy slot against it.
+    ///
+    /// v2.2 ring-length negotiation (the ring grown 8 → [`OUT_RING_LEN_V22`] in place): the two
+    /// sides must agree on the `% len` slot math, and neither the host binary nor the driver
+    /// binary can assume the other's generation, so each declares and the SHORTER understanding
+    /// wins. The host stamps `out_ring_ver = 2` at section creation ("I can drain the long
+    /// ring"); the driver picks its length from that stamp (`>= 2` and a full-size map → 56,
+    /// `1` → 8, `0` → no ring) and ECHOES the picked length into `out_ring_len` before every
+    /// `ring_head` bump. The host keys its drain off the echo alone (`0` = pre-v2.2 driver = 8),
+    /// and the slot-bytes → echo → head-bump store order means a drain that Acquire-observed a
+    /// head bump always reads the length that wrote those slots.
     #[repr(C)]
     #[derive(Clone, Copy, Pod, Zeroable, Debug)]
     pub struct PadShm {
@@ -1154,16 +1189,23 @@ pub mod gamepad {
         /// the host drains it". The section starts zeroed and an old host never writes it, so `0`
         /// tells a new driver to stay legacy-only. Carved from v2 reserved space (v2.1).
         pub out_ring_ver: u32,
-        /// Driver-bumped (AFTER writing `out_ring[ring_head % OUT_RING_LEN]`) count of reports
-        /// ever published to the ring — the host's drain cursor compares against its own tail and
-        /// detects overflow by `head - tail > OUT_RING_LEN`. Same publish-then-bump store order as
+        /// Driver-bumped (AFTER writing `out_ring[ring_head % len]`) count of reports ever
+        /// published to the ring — the host's drain cursor compares against its own tail and
+        /// detects overflow by `head - tail > len`. Same publish-then-bump store order as
         /// `out_seq` (the host's Acquire load orders the reads). Carved from v2 reserved space
         /// (v2.1).
         pub ring_head: u32,
-        pub _reserved1: [u8; 92],
-        /// The lossless output-report ring (v2.1) — see the struct docs and [`OutSlot`].
-        pub out_ring: [OutSlot; OUT_RING_LEN_USIZE],
-        pub _reserved2: [u8; 224],
+        /// The ring length the driver's slot math is USING — the driver's side of the v2.2
+        /// negotiation (see the struct docs), (re-)stamped before every `ring_head` bump. `0` =
+        /// a pre-v2.2 driver that never writes it = [`OUT_RING_LEN`]. Carved from v2.1 reserved
+        /// space (v2.2).
+        pub out_ring_len: u32,
+        pub _reserved1: [u8; 88],
+        /// The lossless output-report ring — [`OUT_RING_LEN`] slots under a v2.1 negotiation,
+        /// [`OUT_RING_LEN_V22`] under v2.2 (slots 8.. overlay what v2.1 called `_reserved2`,
+        /// which no shipped binary ever read or wrote). See the struct docs and [`OutSlot`].
+        pub out_ring: [OutSlot; OUT_RING_LEN_V22_USIZE],
+        pub _reserved2: [u8; 32],
     }
 
     // Offsets are the wire contract the shipped drivers already read by hand — pin every one. A failing
@@ -1189,7 +1231,7 @@ pub mod gamepad {
         assert!(offset_of!(XusbShm, driver_heartbeat) == 36);
         assert!(offset_of!(XusbShm, pad_index) == 40);
 
-        assert!(size_of::<PadShm>() == 1024);
+        assert!(size_of::<PadShm>() == PAD_SHM_SIZE);
         assert!(offset_of!(PadShm, magic) == 0);
         assert!(offset_of!(PadShm, input) == 8);
         assert!(offset_of!(PadShm, out_seq) == 72);
@@ -1203,6 +1245,14 @@ pub mod gamepad {
         assert!(offset_of!(PadShm, ring_head) == 160);
         assert!(offset_of!(PadShm, out_ring) == PAD_SHM_LEGACY_SIZE);
         assert!(size_of::<OutSlot>() == 68);
+        // v2.2 in-place ring growth — the echo field sits in v2.1 reserved space, the grown ring
+        // stays within the v2.1 slots' historical offsets (slot k at 256 + k*68), and the whole
+        // struct is exactly the one page that keeps cross-generation views mappable.
+        assert!(offset_of!(PadShm, out_ring_len) == 164);
+        assert!(
+            PAD_SHM_LEGACY_SIZE + OUT_RING_LEN_USIZE * size_of::<OutSlot>() <= PAD_SHM_V21_SIZE
+        );
+        assert!(PAD_SHM_SIZE == 4096);
 
         assert!(size_of::<ChannelProof>() == 16);
         assert!(offset_of!(ChannelProof, magic) == 0);
