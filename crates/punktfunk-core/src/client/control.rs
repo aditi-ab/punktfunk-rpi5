@@ -32,6 +32,10 @@ pub(crate) enum CtrlRequest {
     /// desktop mouse model — host excludes + forwards), `false` = host composites into the
     /// video (the capture model). Sent on every mouse-model flip; idempotent, latest-wins.
     CursorRender(crate::quic::CursorRenderMode),
+    /// The client's display-latch grid, ~1 Hz, host-clock timestamps — feeds the host's
+    /// phase-locked capture (design/phase-locked-capture.md). Latest-wins; an old host
+    /// ignores the message.
+    Phase(crate::quic::PhaseReport),
 }
 
 /// What the worker reports to [`NativeClient::connect`] once the handshake lands: the

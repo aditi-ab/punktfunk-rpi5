@@ -30,6 +30,9 @@ pub(super) async fn run(
     encoder_ceiling_kbps: Arc<AtomicU32>,
     cadence_degraded: Arc<AtomicBool>,
     fec_target_ctl: Arc<AtomicU8>,
+    // Phase-locked capture bridge: client PhaseReports land here latest-wins; the encode loop's
+    // controller drains at its own ~1 Hz cadence (design/phase-locked-capture.md).
+    phase_ctl: Arc<super::stream::PhaseCtl>,
     reconfig_tx: std::sync::mpsc::Sender<punktfunk_core::Mode>,
     keyframe_tx: std::sync::mpsc::Sender<()>,
     rfi_tx: std::sync::mpsc::Sender<(u32, u32)>,
@@ -230,6 +233,12 @@ pub(super) async fn run(
                     if io::write_msg(&mut ctrl_send, &echo.encode()).await.is_err() {
                         break;
                     }
+                } else if let Ok(pr) = punktfunk_core::quic::PhaseReport::decode(&msg) {
+                    // Phase-locked capture: latest-wins into the bridge — no data-plane hop, the
+                    // encode loop polls on its own cadence. Only vsync-aware presenters send
+                    // these (CLIENT_CAP_PHASE_LOCK), and PUNKTFUNK_PHASE_LOCK=0 host-side leaves
+                    // the stored report undrained/inert.
+                    phase_ctl.store(pr);
                 } else if let Ok(m) = punktfunk_core::quic::CursorRenderMode::decode(&msg) {
                     // Who renders the pointer (design/remote-desktop-sweep.md §8): the client's
                     // mouse-model flip. Latest-wins into the shared flag; the data-plane loop

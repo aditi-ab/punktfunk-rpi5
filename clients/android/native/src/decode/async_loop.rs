@@ -380,7 +380,29 @@ pub(super) fn run_async(
             if p.pump(&codec, clock, &tracker, &stats, now_monotonic_ns()) {
                 rendered += 1;
             }
-            p.flush_log(&meter, clock);
+            // The 1 Hz window flush doubles as the phase-lock report tick: the measured latch
+            // p50 is the arrival-lead error signal the host's capture controller drives toward
+            // its target (design/phase-locked-capture.md §6). Timestamps convert
+            // monotonic→realtime→host here — the skew offset lives only client-side.
+            if let (Some(latch_p50_ns), Some(c)) = (p.flush_log(&meter, clock), clock) {
+                let period = c.panel_period_ns().max(c.period_ns());
+                if period > 0 {
+                    if let Some(t) = c.next_target(now_monotonic_ns(), 0) {
+                        let mono_now = now_monotonic_ns();
+                        let real_now = now_realtime_ns();
+                        let latch_real_ns = real_now + (t.expected_present_ns - mono_now) as i128;
+                        let latch_host_ns = (latch_real_ns
+                            + clock_offset.load(Ordering::Relaxed) as i128)
+                            .max(0) as u64;
+                        client.report_phase(
+                            latch_host_ns,
+                            period.clamp(0, u32::MAX as i64) as u32,
+                            1_000_000, // skew residual + latch jitter — conservative 1 ms
+                            latch_p50_ns.min(u32::MAX as u64) as u32,
+                        );
+                    }
+                }
+            }
         }
         let presented_now = rendered > rendered_before;
         // Start the vsync clock LAZILY on the first decoded output (eager, it ticks the panel

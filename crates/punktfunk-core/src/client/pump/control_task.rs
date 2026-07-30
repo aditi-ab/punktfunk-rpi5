@@ -94,6 +94,7 @@ impl ControlTask {
                         CtrlRequest::ClipControl(c) => c.encode(),
                         CtrlRequest::ClipOffer(o) => o.encode(),
                         CtrlRequest::CursorRender(m) => m.encode(),
+                        CtrlRequest::Phase(p) => p.encode(),
                     };
                     if io::write_msg(&mut ctrl_send, &bytes).await.is_err() {
                         break;

@@ -1095,6 +1095,11 @@ async fn serve_session(
     let adaptive_fec = fec_static_override().is_none();
     let fec_target = Arc::new(AtomicU8::new(welcome.fec.fec_percent));
     let fec_target_ctl = fec_target.clone();
+    // Phase-locked capture bridge (design/phase-locked-capture.md): the control task stores the
+    // client's PhaseReports here; the encode loop's controller drains them. Inert until a
+    // vsync-aware client actually reports.
+    let phase_ctl = Arc::new(stream::PhaseCtl::new());
+    let phase_ctl_control = phase_ctl.clone();
     // The session's negotiated rate — the pin PyroWave retarget-refusals ack (§4.6).
     let session_bitrate_kbps = welcome.bitrate_kbps;
     // Shared-clipboard enable state (client `ClipControl` → host). The coordinator reads it to
@@ -1120,6 +1125,7 @@ async fn serve_session(
         encoder_ceiling_kbps.clone(),
         cadence_degraded.clone(),
         fec_target_ctl,
+        phase_ctl_control,
         reconfig_tx,
         keyframe_tx,
         rfi_tx,
@@ -1568,6 +1574,7 @@ async fn serve_session(
                         probe_result_tx,
                         reconfig_result_tx,
                         fec_target: fec_target_dp,
+                        phase: phase_ctl,
                         conn: conn_stream,
                         timing_conn,
                         cursor_forward,

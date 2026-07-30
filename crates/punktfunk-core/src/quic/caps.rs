@@ -104,6 +104,13 @@ pub const HOST_CAP_TEXT_INPUT: u8 = 0x04;
 /// an older or incapable host nothing changes.
 pub const CLIENT_CAP_CURSOR: u8 = 0x01;
 
+/// `Hello.client_caps` bit: this client runs a vsync-aware presenter and will send
+/// [`PhaseReport`](super::control::PhaseReport)s (~1 Hz) so the host can phase-lock its
+/// capture/send tick to the client's display latch (design/phase-locked-capture.md). Without
+/// the bit the host never arms the phase controller; toward an older host the reports are
+/// simply ignored — no behavior change in either direction.
+pub const CLIENT_CAP_PHASE_LOCK: u8 = 0x02;
+
 /// [`Welcome::host_caps`] bit: the host CAN forward the cursor out-of-band (it captures cursor
 /// metadata separately from the frame — the Linux portal `SPA_META_Cursor` path; NOT gamescope,
 /// whose capture carries no cursor, and NOT Windows yet, where DWM composites into the IDD

@@ -339,14 +339,21 @@ impl Presenter {
     /// `noBudget` (waits on the closed budget) / `forced` (stale force-opens — 0 when healthy) /
     /// `qDry` (FIFO underflows) / `pace` (decoded→release) / `latch` (release→displayed) /
     /// `vsync` (the measured panel period).
-    pub(super) fn flush_log(&mut self, meter: &PresentMeter, clock: Option<&VsyncShared>) {
+    ///
+    /// Returns this window's measured latch p50 (ns) when a window actually flushed — the
+    /// phase-lock reporter's `arrival_lead` error signal (design/phase-locked-capture.md §6).
+    pub(super) fn flush_log(
+        &mut self,
+        meter: &PresentMeter,
+        clock: Option<&VsyncShared>,
+    ) -> Option<u64> {
         if self.last_flush.elapsed() < std::time::Duration::from_secs(1) {
-            return;
+            return None;
         }
         self.last_flush = Instant::now();
         let (latch, displays) = meter.drain();
         if self.released == 0 && displays == 0 {
-            return; // idle stream — nothing worth a line
+            return None; // idle stream — nothing worth a line
         }
         let (pace_p50, pace_max) = p50_max_ms(std::mem::take(&mut self.pace_us));
         let (latch_p50, latch_max) = p50_max_ms(latch);
@@ -376,6 +383,7 @@ impl Presenter {
         self.no_budget = 0;
         self.forced = 0;
         self.dry = 0;
+        (latch_p50 > 0.0).then(|| (latch_p50 * 1e6) as u64)
     }
 }
 

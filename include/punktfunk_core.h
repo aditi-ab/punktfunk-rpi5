@@ -588,6 +588,15 @@
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
+// `Hello.client_caps` bit: this client runs a vsync-aware presenter and will send
+// [`PhaseReport`](super::control::PhaseReport)s (~1 Hz) so the host can phase-lock its
+// capture/send tick to the client's display latch (design/phase-locked-capture.md). Without
+// the bit the host never arms the phase controller; toward an older host the reports are
+// simply ignored — no behavior change in either direction.
+#define CLIENT_CAP_PHASE_LOCK 2
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
 // [`Welcome::host_caps`] bit: the host CAN forward the cursor out-of-band (it captures cursor
 // metadata separately from the frame — the Linux portal `SPA_META_Cursor` path; NOT gamescope,
 // whose capture carries no cursor, and NOT Windows yet, where DWM composites into the IDD
@@ -754,6 +763,11 @@
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // Type byte of [`ClockEcho`].
 #define MSG_CLOCK_ECHO 49
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Type byte of [`PhaseReport`].
+#define MSG_PHASE_REPORT 50
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
@@ -2768,6 +2782,20 @@ PunktfunkStatus punktfunk_connection_frames_dropped(const PunktfunkConnection *c
 PunktfunkStatus punktfunk_connection_report_decode_us(const PunktfunkConnection *c,
                                                       uint32_t us);
 #endif
+
+// Report this client's display-latch grid so the host can phase-lock its capture tick
+// (design/phase-locked-capture.md). `next_latch_host_ns` must already be host clock — convert
+// with the connection's clock offset (`T_host = T_client + offset`). Fire-and-forget; call ~1 Hz
+// from a vsync-aware presenter. No-op toward a host that never negotiated the capability.
+//
+// # Safety
+// `c` is an opaque handle from a `*_new`/`*_pair` the caller has not yet freed, or null (an
+// error, not UB).
+PunktfunkStatus punktfunk_connection_report_phase(const PunktfunkConnection *c,
+                                                  uint64_t next_latch_host_ns,
+                                                  uint32_t latch_period_ns,
+                                                  uint32_t uncertainty_ns,
+                                                  uint32_t arrival_lead_ns);
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // Whether [`punktfunk_connection_report_decode_us`] is worth calling this session: writes 1 to

@@ -774,6 +774,30 @@ impl NativeClient {
         self.wants_decode
     }
 
+    /// Report this client's display-latch grid so the host can phase-lock its capture tick
+    /// (design/phase-locked-capture.md; the vsync-aware presenters call this ~1 Hz).
+    /// `next_latch_host_ns` must already be HOST clock — convert with
+    /// [`clock_offset_now_ns`](Self::clock_offset_now_ns) (`T_host = T_client + offset`) before
+    /// calling; the offset lives only on this side. Fire-and-forget: dropped silently if the
+    /// control task's queue is momentarily full (the next report supersedes) or toward a host
+    /// that never negotiated the capability.
+    pub fn report_phase(
+        &self,
+        next_latch_host_ns: u64,
+        latch_period_ns: u32,
+        uncertainty_ns: u32,
+        arrival_lead_ns: u32,
+    ) {
+        let _ = self
+            .ctrl_tx
+            .try_send(CtrlRequest::Phase(crate::quic::PhaseReport {
+                next_latch_host_ns,
+                latch_period_ns,
+                uncertainty_ns,
+                arrival_lead_ns,
+            }));
+    }
+
     /// Start a bandwidth speed test: ask the host to burst filler over the data plane at
     /// `target_kbps` of goodput for `duration_ms`, *briefly pausing video*. Non-blocking — the
     /// measurement accumulates in the background; poll [`NativeClient::probe_result`] until its

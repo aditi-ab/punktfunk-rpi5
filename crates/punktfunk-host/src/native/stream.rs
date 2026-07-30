@@ -61,6 +61,7 @@ pub(super) fn synthetic_stream(
                 pts_ns,
                 host_us: (now_ns().saturating_sub(pts_ns) / 1000).min(u32::MAX as u64) as u32,
                 stages: None, // synthetic loop: no capture/encode stages to split
+                applied_phase_ns: None,
             };
             let _ = tc.send_datagram(punktfunk_core::quic::encode_host_timing_datagram(&t).into());
         }
@@ -199,6 +200,112 @@ fn service_probes(
 fn frame_driven_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("PUNKTFUNK_FRAME_DRIVEN").as_deref() != Ok("0"))
+}
+
+/// Phase-locked capture (design/phase-locked-capture.md): `PUNKTFUNK_PHASE_LOCK=0` disarms the
+/// controller — the rebuild-free A/B lever. Armed alone it does nothing until a client actually
+/// sends [`PhaseReport`](punktfunk_core::quic::PhaseReport)s.
+fn phase_lock_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("PUNKTFUNK_PHASE_LOCK").as_deref() != Ok("0"))
+}
+
+/// Control-task → encode-loop bridge for phase-locked capture (the multi-field sibling of the
+/// `fec_target` atomic): the control task stores the client's latest
+/// [`PhaseReport`](punktfunk_core::quic::PhaseReport) (latest-wins), the encode loop drains it on
+/// its ~1 Hz adjust tick, and publishes the hold it is applying for the 0xCF ACK + diagnostics.
+pub(crate) struct PhaseCtl {
+    report: std::sync::Mutex<Option<punktfunk_core::quic::PhaseReport>>,
+    applied_ns: std::sync::atomic::AtomicI64,
+}
+
+impl PhaseCtl {
+    pub(crate) fn new() -> PhaseCtl {
+        PhaseCtl {
+            report: std::sync::Mutex::new(None),
+            applied_ns: std::sync::atomic::AtomicI64::new(0),
+        }
+    }
+
+    /// Latest-wins store (control task).
+    pub(crate) fn store(&self, r: punktfunk_core::quic::PhaseReport) {
+        *self
+            .report
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(r);
+    }
+
+    /// Drain the pending report, if any (encode loop, ~1 Hz).
+    fn take(&self) -> Option<punktfunk_core::quic::PhaseReport> {
+        self.report
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+
+    fn set_applied(&self, ns: i64) {
+        self.applied_ns.store(ns, Ordering::Relaxed);
+    }
+
+    /// The hold currently applied (0 = idle) — the send thread's 0xCF ACK readout.
+    pub(crate) fn applied_ns(&self) -> i64 {
+        self.applied_ns.load(Ordering::Relaxed)
+    }
+}
+
+/// The encode loop's phase controller state (design/phase-locked-capture.md §3): a per-frame
+/// HOLD before submit, walked toward the client's reported arrival lead hitting the target lead.
+/// Plain data — lives as a loop local so it survives every in-loop rebuild path; a new session
+/// (new loop call) starts unlocked, which is correct (new client, new grid).
+struct PhaseController {
+    /// Applied per-frame hold before submit, ns ∈ [0, period).
+    hold_ns: i64,
+    /// Last adjust instant (~1 Hz cadence).
+    last_adjust: std::time::Instant,
+}
+
+impl PhaseController {
+    /// Per-adjustment walk bound: 2 ms per second of reports keeps the wire cadence visually
+    /// undisturbed while converging a worst-case half-period error in ~2-3 s.
+    const MAX_STEP_NS: i64 = 2_000_000;
+    /// Ignore errors under this — a locked loop does nothing (jitter would otherwise dither the
+    /// hold every second).
+    const DEADBAND_NS: i64 = 300_000;
+    /// The lead floor the controller drives toward: SurfaceFlinger-class compositors need the
+    /// frame in the queue ~2.5 ms before latch; the client's own `uncertainty_ns` widens this.
+    const TARGET_LEAD_FLOOR_NS: i64 = 2_500_000;
+
+    fn new() -> PhaseController {
+        PhaseController {
+            hold_ns: 0,
+            last_adjust: std::time::Instant::now(),
+        }
+    }
+
+    /// Fold the client's latest report into the hold. `period_ns` is the wire interval (the
+    /// session's frame period). Sign convention: `arrival_lead` is how long before its latch the
+    /// median frame arrives — a LARGE lead means frames sit waiting at the client, so the host
+    /// should send LATER (grow the hold); a small/zero lead risks missing the latch, so send
+    /// EARLIER (shrink the hold, wrapping through the period when it hits zero — the newest-wins
+    /// capture slot makes a wrapped hold sample a fresher frame, not a staler one).
+    fn adjust(&mut self, r: &punktfunk_core::quic::PhaseReport, period_ns: i64) {
+        if period_ns <= 0 {
+            return;
+        }
+        self.last_adjust = std::time::Instant::now();
+        let target = Self::TARGET_LEAD_FLOOR_NS.max(r.uncertainty_ns as i64 + 1_000_000);
+        let error = r.arrival_lead_ns as i64 - target;
+        if error.abs() < Self::DEADBAND_NS {
+            return;
+        }
+        let step = error.clamp(-Self::MAX_STEP_NS, Self::MAX_STEP_NS);
+        self.hold_ns = (self.hold_ns + step).rem_euclid(period_ns);
+    }
+
+    /// Whether the ~1 Hz adjust window has elapsed.
+    fn due(&self) -> bool {
+        self.last_adjust.elapsed() >= std::time::Duration::from_secs(1)
+    }
 }
 
 /// Adaptive pipeline depth (latency plan, from the 2026-07-17 on-glass finding on a `.173` RTX
@@ -526,6 +633,8 @@ fn send_loop(
     // `Some` = the client advertised VIDEO_CAP_HOST_TIMING: emit one 0xCF datagram per AU right
     // after its last packet left the socket (capture→sent, the whole host pipeline incl. pacing).
     timing_conn: Option<quinn::Connection>,
+    // Phase-lock ACK source: the hold the encode loop currently applies rides the 0xCF tail.
+    phase: Arc<PhaseCtl>,
     // The client advertised VIDEO_CAP_PROBE_SEQ — mid-session speed-test bursts may run in the
     // probe index space (else they're declined; see `run_probe_burst`).
     probe_seq: bool,
@@ -631,6 +740,13 @@ fn send_loop(
                                         encode_us: msg.encode_us,
                                         pace_us: stat.spread_us,
                                     }),
+                                    // Phase-lock ACK: the hold the capture tick is applying
+                                    // right now (0 = controller idle/unarmed) — the client's
+                                    // closed-loop readout.
+                                    applied_phase_ns: Some(
+                                        phase.applied_ns().clamp(i32::MIN as i64, i32::MAX as i64)
+                                            as i32,
+                                    ),
                                 };
                                 let _ = tc.send_datagram(
                                     punktfunk_core::quic::encode_host_timing_datagram(&t).into(),
@@ -968,6 +1084,9 @@ pub(super) struct SessionContext {
     /// thread emits one 0xCF datagram per AU (capture→sent µs) on it, so the client can split its
     /// `host+network` latency stage. `None` = older client, no emission.
     pub(super) timing_conn: Option<quinn::Connection>,
+    /// Phase-locked capture bridge (design/phase-locked-capture.md): the control task stores
+    /// client [`PhaseReport`]s here; the encode loop's controller drains them.
+    pub(super) phase: Arc<PhaseCtl>,
     /// The session negotiated the cursor channel (design/remote-desktop-sweep.md M2 —
     /// `handshake::cursor_forward`): the encode loop forwards shape (via `cursor_shape_tx`)
     /// + per-tick `0xD0` state while the client draws the pointer locally.
@@ -1143,6 +1262,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
         fec_target,
         conn,
         timing_conn,
+        phase,
         cursor_forward,
         cursor_shape_tx,
         cursor_client_draws,
@@ -1484,6 +1604,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
         .name("punktfunk-send".into())
         .spawn({
             let stop = stop.clone();
+            let phase_send = phase.clone();
             move || {
                 send_loop(
                     session,
@@ -1496,6 +1617,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                     fec_target,
                     send_stats,
                     timing_conn,
+                    phase_send,
                     probe_seq,
                 )
             }
@@ -1541,6 +1663,11 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds as u64);
     let mut next = std::time::Instant::now();
     let mut sent: u64 = 0;
+    // Phase-locked capture (design/phase-locked-capture.md): the per-frame hold this loop applies
+    // after a fresh capture, walked ~1 Hz toward the client's reported arrival lead. A loop local
+    // on purpose — it survives every in-loop rebuild path (session switch, mode/stall rebuilds,
+    // encoder backoff), so a mid-stream rebuild keeps the acquired lock.
+    let mut phase_ctl = PhaseController::new();
     // The session's video frame numbering, owned HERE (the wire `frame_index` of the next AU this
     // loop hands to the send thread; the packetizer seals with exactly this via `seal_frame_at`).
     // A submission's future index is predicted as `au_seq + inflight.len()` — exact because AUs
@@ -2256,6 +2383,26 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
             Ok(Some(f)) => {
                 frame = f;
                 diag_new += 1;
+                // Phase-locked capture: hold the fresh frame so its ARRIVAL at the client lands a
+                // constant small lead before the client's display latch (§3 hold-then-submit; the
+                // capture slot is newest-wins, so a long hold samples fresher content next tick,
+                // never staler). Adjusted ~1 Hz from the client's PhaseReports; 0 until a report
+                // arrives or when PUNKTFUNK_PHASE_LOCK=0.
+                if phase_lock_enabled() {
+                    if phase_ctl.due() {
+                        if let Some(r) = phase.take() {
+                            phase_ctl.adjust(&r, interval.as_nanos() as i64);
+                        } else {
+                            phase_ctl.last_adjust = std::time::Instant::now();
+                        }
+                        phase.set_applied(phase_ctl.hold_ns);
+                    }
+                    if phase_ctl.hold_ns > 0 {
+                        std::thread::sleep(std::time::Duration::from_nanos(
+                            phase_ctl.hold_ns as u64,
+                        ));
+                    }
+                }
                 capture_rebuilds = 0; // a delivered frame clears the consecutive-loss counter
                                       // Re-arm the park schedule for a (re)built display: pin the seat pointer to
                                       // the streamed surface (see `park_pointer` and the schedule state above).

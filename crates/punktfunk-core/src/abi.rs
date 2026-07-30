@@ -4013,6 +4013,39 @@ pub unsafe extern "C" fn punktfunk_connection_report_decode_us(
     })
 }
 
+/// Report this client's display-latch grid so the host can phase-lock its capture tick
+/// (design/phase-locked-capture.md). `next_latch_host_ns` must already be host clock — convert
+/// with the connection's clock offset (`T_host = T_client + offset`). Fire-and-forget; call ~1 Hz
+/// from a vsync-aware presenter. No-op toward a host that never negotiated the capability.
+///
+/// # Safety
+/// `c` is an opaque handle from a `*_new`/`*_pair` the caller has not yet freed, or null (an
+/// error, not UB).
+#[no_mangle]
+pub unsafe extern "C" fn punktfunk_connection_report_phase(
+    c: *const PunktfunkConnection,
+    next_latch_host_ns: u64,
+    latch_period_ns: u32,
+    uncertainty_ns: u32,
+    arrival_lead_ns: u32,
+) -> PunktfunkStatus {
+    guard(|| {
+        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
+        // has not yet freed, or null, which `as_ref` reports as `None` and the `match` handles.
+        let c = match unsafe { c.as_ref() } {
+            Some(c) => c,
+            None => return PunktfunkStatus::NullPointer,
+        };
+        c.inner.report_phase(
+            next_latch_host_ns,
+            latch_period_ns,
+            uncertainty_ns,
+            arrival_lead_ns,
+        );
+        PunktfunkStatus::Ok
+    })
+}
+
 /// Whether [`punktfunk_connection_report_decode_us`] is worth calling this session: writes 1 to
 /// `out` only when the adaptive-bitrate controller is armed (Automatic bitrate, non-PyroWave), so a
 /// client can skip the per-frame decode-latency measurement entirely for explicit-bitrate and

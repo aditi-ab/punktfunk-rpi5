@@ -156,6 +156,30 @@ pub struct ClockEcho {
     pub t3_ns: u64,
 }
 
+/// `client → host`, ~1 Hz: the client's display-latch grid, so the host can PHASE-LOCK its
+/// capture/send tick and land frames a constant, small margin before the client's vsync latch
+/// (design/phase-locked-capture.md). Sent only by clients with a vsync-aware presenter, gated on
+/// [`CLIENT_CAP_PHASE_LOCK`](crate::quic::CLIENT_CAP_PHASE_LOCK); an old host ignores it.
+///
+/// Timestamps are HOST clock (`CLOCK_REALTIME`): the client converts before sending
+/// (`T_host = T_client + offset` — the skew offset from the clock handshake lives only
+/// client-side, the host deliberately stores none).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PhaseReport {
+    /// The client's next display latch, host clock. The host extrapolates forward by
+    /// `latch_period_ns` — the report describes a grid, not one instant.
+    pub next_latch_host_ns: u64,
+    /// The client panel's refresh period (its true latch grid — not the app's possibly
+    /// down-rated callback rate).
+    pub latch_period_ns: u32,
+    /// The client's own error bound on this grid (skew residual + latch jitter p95) — the host
+    /// widens its arrival margin by this, never narrows below its floor.
+    pub uncertainty_ns: u32,
+    /// Measured median lead of frame ARRIVAL before latch over the last window (ns; clamped
+    /// ≥ 0). The controller drives this toward its target lead — the error signal.
+    pub arrival_lead_ns: u32,
+}
+
 /// Type byte of [`Reconfigure`] (first byte after the magic).
 pub const MSG_RECONFIGURE: u8 = 0x01;
 /// Type byte of [`Reconfigured`].
@@ -178,6 +202,8 @@ pub const MSG_PROBE_RESULT: u8 = 0x21;
 pub const MSG_CLOCK_PROBE: u8 = 0x30;
 /// Type byte of [`ClockEcho`].
 pub const MSG_CLOCK_ECHO: u8 = 0x31;
+/// Type byte of [`PhaseReport`].
+pub const MSG_PHASE_REPORT: u8 = 0x32;
 
 impl Reconfigure {
     pub fn encode(&self) -> Vec<u8> {
@@ -457,6 +483,33 @@ impl ClockEcho {
             t1_ns: u64::from_le_bytes(b[5..13].try_into().unwrap()),
             t2_ns: u64::from_le_bytes(b[13..21].try_into().unwrap()),
             t3_ns: u64::from_le_bytes(b[21..29].try_into().unwrap()),
+        })
+    }
+}
+
+impl PhaseReport {
+    pub fn encode(&self) -> Vec<u8> {
+        // magic[0..4] type[4] latch[5..13] period[13..17] uncertainty[17..21] lead[21..25]
+        let mut b = Vec::with_capacity(25);
+        b.extend_from_slice(CTL_MAGIC);
+        b.push(MSG_PHASE_REPORT);
+        b.extend_from_slice(&self.next_latch_host_ns.to_le_bytes());
+        b.extend_from_slice(&self.latch_period_ns.to_le_bytes());
+        b.extend_from_slice(&self.uncertainty_ns.to_le_bytes());
+        b.extend_from_slice(&self.arrival_lead_ns.to_le_bytes());
+        b
+    }
+
+    pub fn decode(b: &[u8]) -> Result<PhaseReport> {
+        if b.len() != 25 || &b[0..4] != CTL_MAGIC || b[4] != MSG_PHASE_REPORT {
+            return Err(PunktfunkError::InvalidArg("bad PhaseReport"));
+        }
+        let u32at = |o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+        Ok(PhaseReport {
+            next_latch_host_ns: u64::from_le_bytes(b[5..13].try_into().unwrap()),
+            latch_period_ns: u32at(13),
+            uncertainty_ns: u32at(17),
+            arrival_lead_ns: u32at(21),
         })
     }
 }
@@ -921,6 +974,21 @@ mod tests {
             .encode()
         )
         .is_err());
+    }
+
+    #[test]
+    fn phase_report_roundtrip() {
+        let pr = PhaseReport {
+            next_latch_host_ns: 1_753_900_000_123_456_789,
+            latch_period_ns: 8_333_333,
+            uncertainty_ns: 900_000,
+            arrival_lead_ns: 4_100_000,
+        };
+        assert_eq!(PhaseReport::decode(&pr.encode()).unwrap(), pr);
+        // Wrong type byte (a ClockProbe) must not decode as a PhaseReport.
+        assert!(PhaseReport::decode(&ClockProbe { t1_ns: 7 }.encode()).is_err());
+        // Truncation must not decode.
+        assert!(PhaseReport::decode(&pr.encode()[..24]).is_err());
     }
 
     #[test]
