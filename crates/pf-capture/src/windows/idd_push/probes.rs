@@ -7,6 +7,10 @@
 //!   for the freeze's duration on EVERY engine of that adapter.
 //! - **dwm-tick**: `DwmGetCompositionTimingInfo(NULL)` `cRefresh` advance — the compositor's own
 //!   clock. Frozen tick with live fences = DWM (or something it waits on) is blocked, not the GPU.
+//!   The same sample also tracks `cFrame` (the COMPOSED-frame counter) — the compose-silence
+//!   discriminator: a clock that ticks while `cFrame` freezes means DWM had NOTHING to compose
+//!   (the foreground content stopped presenting); a `cFrame` that keeps advancing through a hole
+//!   means DWM built frames that never reached OUR swap-chain (the OS frame-generation leg).
 //! - **dwm-flush**: a watchdogged `DwmFlush` — its latency IS the composition-wait measurement.
 //! - **scanline**: `D3DKMTGetScanLine` on an active output (Level-Zero reentrant — documented safe
 //!   against every miniport lock, so a BLOCKED call here convicts the KMD itself). Prefers a
@@ -155,6 +159,8 @@ struct Inner {
     /// One per hardware adapter, labelled by LUID (hybrids run two).
     fences: Vec<(String, BlockingProbe)>,
     dwm_tick: Ring,
+    /// `cFrame` (composed-frame counter) frozen spans, sampled by the same dwm-tick thread.
+    dwm_frame: Ring,
     dwm_flush: BlockingProbe,
     scanline: BlockingProbe,
     /// Whether the scanline probe currently targets a PHYSICAL head (see the module docs).
@@ -201,6 +207,7 @@ impl ProbeEngine {
                 .filter_map(|(_, p)| p.window_max(from, to))
                 .max(),
             dwm_tick_frozen_us: i.dwm_tick.window_max(from, to),
+            dwm_frame_frozen_us: i.dwm_frame.window_max(from, to),
             dwm_flush_max_us: i.dwm_flush.window_max(from, to),
             scanline_max_us: if i.scanline_running.load(Ordering::Relaxed) {
                 i.scanline.window_max(from, to)
@@ -221,6 +228,7 @@ impl ProbeEngine {
             stop: AtomicBool::new(false),
             fences,
             dwm_tick: Ring::new(),
+            dwm_frame: Ring::new(),
             dwm_flush: BlockingProbe::new(),
             scanline: BlockingProbe::new(),
             scanline_physical: AtomicBool::new(false),
@@ -397,11 +405,17 @@ fn fence_probe_setup(
     Some((context, ctx4, fence, event, (a, b)))
 }
 
-/// `cRefresh` advance sampling: each tick records how long the compositor's frame counter has been
-/// unchanged. A frozen span covering a stall (with live fences) = DWM blocked, not the GPU.
+/// `cRefresh` + `cFrame` advance sampling: each tick records how long the compositor's refresh
+/// counter and its COMPOSED-frame counter have been unchanged. A frozen refresh span covering a
+/// stall (with live fences) = DWM blocked, not the GPU. A LIVE refresh with a frozen `cFrame` =
+/// DWM ticked but composed nothing — no damage anywhere, i.e. the foreground content itself
+/// stopped presenting; a `cFrame` that advances through a capture hole = DWM composed frames the
+/// IDD swap-chain never received (the OS frame-generation leg dropped them).
 fn dwm_tick_loop(inner: &Inner) {
     let mut last_refresh = 0u64;
     let mut last_change = Instant::now();
+    let mut last_frame = 0u64;
+    let mut last_frame_change = Instant::now();
     while !inner.stop.load(Ordering::Relaxed) {
         let mut info = DWM_TIMING_INFO {
             cbSize: std::mem::size_of::<DWM_TIMING_INFO>() as u32,
@@ -417,6 +431,14 @@ fn dwm_tick_loop(inner: &Inner) {
             }
             let frozen = now.duration_since(last_change);
             inner.dwm_tick.push(now, frozen, frozen.as_micros() as u64);
+            if info.cFrame != last_frame {
+                last_frame = info.cFrame;
+                last_frame_change = now;
+            }
+            let frame_frozen = now.duration_since(last_frame_change);
+            inner
+                .dwm_frame
+                .push(now, frame_frozen, frame_frozen.as_micros() as u64);
         }
         std::thread::sleep(Duration::from_millis(50));
     }

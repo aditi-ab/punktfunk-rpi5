@@ -1618,6 +1618,14 @@ impl IddPushCapturer {
                     now.checked_sub(stall.gap + Duration::from_millis(300))
                         .map(|from| w.summary(from, now))
                 }),
+                // The discriminator counts span the GAP ONLY — no lead-in: presents from the
+                // healthy flow right before the hole would falsely acquit the content. The
+                // stall-ending frame's own present lands at the window edge and stays well
+                // under the acquit bar.
+                etw_counts: self.etw.as_ref().and_then(|w| {
+                    now.checked_sub(stall.gap)
+                        .map(|from| w.window_counts(from, now))
+                }),
             };
             self.stall_watch.report(&stall, now, &evidence);
         }
@@ -2146,6 +2154,7 @@ mod tests {
                     max_heartbeat_age_ms: hb_age_ms,
                     probes: None,
                     etw: None,
+                    etw_counts: None,
                 },
             )
         };
@@ -2167,10 +2176,12 @@ mod tests {
         assert_eq!(verdict(3_000, Some(2), 1_600), StallVerdict::WorkerStalled);
     }
 
-    /// [`stall::classify`]'s verdict matrix — how the micro-probe window refines (or declines to
-    /// refine) the driver-telemetry verdict into a named disturbance class.
+    /// [`stall::classify`]'s verdict matrix — how the micro-probe window and the ETW
+    /// present-vs-queue counts refine (or decline to refine) the driver-telemetry verdict into
+    /// a named disturbance class.
     #[test]
     fn stall_classification_matrix() {
+        use super::dxgkrnl_etw::EtwWindowCounts;
         use super::stall::{classify, ProbeWindow, StallClass, StallVerdict};
         let gap = Duration::from_millis(600);
         let probes = |fence: Option<u64>, dwm: Option<u64>, flush: Option<u64>| ProbeWindow {
@@ -2179,22 +2190,29 @@ mod tests {
             dwm_flush_max_us: flush,
             ..ProbeWindow::default()
         };
+        let counts = |presents: u32, queue_adds: u32| EtwWindowCounts {
+            presents,
+            queue_adds,
+            present_history: true,
+            queue_history: true,
+        };
         // The driver's own verdicts win outright — probes can't overrule "we lost the frames".
         assert_eq!(
             classify(
                 gap,
                 &StallVerdict::WorkerStalled,
-                Some(&probes(Some(500_000), None, None))
+                Some(&probes(Some(500_000), None, None)),
+                None
             ),
             StallClass::OursWorker
         );
         assert_eq!(
-            classify(gap, &StallVerdict::DeliveryLeg, None),
+            classify(gap, &StallVerdict::DeliveryLeg, None, None),
             StallClass::OursDelivery
         );
         // No probes: compose-silence alone can't name a class.
         assert_eq!(
-            classify(gap, &StallVerdict::ComposeSilence, None),
+            classify(gap, &StallVerdict::ComposeSilence, None, None),
             StallClass::Unattributed
         );
         // Fences stalled ≥ gap/2 → the adapter froze — Class 1 (even without driver telemetry).
@@ -2202,7 +2220,8 @@ mod tests {
             classify(
                 gap,
                 &StallVerdict::ComposeSilence,
-                Some(&probes(Some(400_000), Some(400_000), None))
+                Some(&probes(Some(400_000), Some(400_000), None)),
+                None
             ),
             StallClass::AdapterFreeze
         );
@@ -2210,7 +2229,8 @@ mod tests {
             classify(
                 gap,
                 &StallVerdict::NoTelemetry,
-                Some(&probes(Some(400_000), None, None))
+                Some(&probes(Some(400_000), None, None)),
+                None
             ),
             StallClass::AdapterFreeze
         );
@@ -2219,7 +2239,8 @@ mod tests {
             classify(
                 gap,
                 &StallVerdict::ComposeSilence,
-                Some(&probes(Some(16_000), Some(500_000), None))
+                Some(&probes(Some(16_000), Some(500_000), None)),
+                None
             ),
             StallClass::CompositorBlocked
         );
@@ -2227,36 +2248,91 @@ mod tests {
             classify(
                 gap,
                 &StallVerdict::ComposeSilence,
-                Some(&probes(Some(16_000), Some(20_000), Some(450_000)))
+                Some(&probes(Some(16_000), Some(20_000), Some(450_000))),
+                None
             ),
             StallClass::CompositorBlocked
         );
-        // Everything alive + the driver swears E_PENDING → the frame-generation path.
+        // Everything alive + the driver swears E_PENDING, but NO working present witness:
+        // the silence cannot be pinned on either side — UNATTRIBUTED, never a guess. (The
+        // pre-2026-07-30 default of FRAME-GENERATION here mislabeled benign content pauses.)
         assert_eq!(
             classify(
                 gap,
                 &StallVerdict::ComposeSilence,
-                Some(&probes(Some(16_000), Some(20_000), Some(30_000)))
+                Some(&probes(Some(16_000), Some(20_000), Some(30_000))),
+                None
+            ),
+            StallClass::Unattributed
+        );
+        // A witness that exists but has never produced an event is NOT a working witness.
+        assert_eq!(
+            classify(
+                gap,
+                &StallVerdict::ComposeSilence,
+                Some(&probes(Some(16_000), Some(20_000), Some(30_000))),
+                Some(&EtwWindowCounts {
+                    present_history: false,
+                    ..EtwWindowCounts::default()
+                })
+            ),
+            StallClass::Unattributed
+        );
+        // The present witness splits the silence. Presents flowing through the hole while the
+        // virtual display's queue starved → the OS display path dropped composed frames: the
+        // frame-generation leg, POSITIVELY convicted.
+        assert_eq!(
+            classify(
+                gap,
+                &StallVerdict::ComposeSilence,
+                Some(&probes(Some(16_000), Some(20_000), Some(30_000))),
+                Some(&counts(54, 0))
             ),
             StallClass::FrameGeneration
+        );
+        // (Essentially) no presents anywhere across the hole — the stall-ending frame and a
+        // caret blink stay under the bar → the CONTENT stopped presenting: benign for the
+        // display path.
+        assert_eq!(
+            classify(
+                gap,
+                &StallVerdict::ComposeSilence,
+                Some(&probes(Some(16_000), Some(20_000), Some(30_000))),
+                Some(&counts(2, 1))
+            ),
+            StallClass::ContentSilence
+        );
+        // The present witness does NOT overrule the driver's own verdicts or the harder
+        // classes — it only refines compose-silence.
+        assert_eq!(
+            classify(
+                gap,
+                &StallVerdict::ComposeSilence,
+                Some(&probes(Some(400_000), Some(400_000), None)),
+                Some(&counts(54, 0))
+            ),
+            StallClass::AdapterFreeze
         );
         // Healthy probes but a pre-telemetry driver: delivery-leg is equally possible — honest.
         assert_eq!(
             classify(
                 gap,
                 &StallVerdict::NoTelemetry,
-                Some(&probes(Some(16_000), Some(20_000), None))
+                Some(&probes(Some(16_000), Some(20_000), None)),
+                Some(&counts(54, 0))
             ),
             StallClass::Unattributed
         );
-        // An absent probe (None) never reads as "stalled" — absence is stated, not guessed.
+        // An absent probe (None) never reads as "stalled" — absence is stated, not guessed;
+        // with the present witness working, the silence still splits correctly.
         assert_eq!(
             classify(
                 gap,
                 &StallVerdict::ComposeSilence,
-                Some(&probes(None, Some(20_000), Some(30_000)))
+                Some(&probes(None, Some(20_000), Some(30_000))),
+                Some(&counts(1, 0))
             ),
-            StallClass::FrameGeneration
+            StallClass::ContentSilence
         );
     }
 }

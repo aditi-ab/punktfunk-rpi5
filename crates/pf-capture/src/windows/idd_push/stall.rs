@@ -32,6 +32,11 @@ pub(super) struct StallEvidence {
     /// The DxgKrnl DDI activity inside the window (Phase A.3 ETW summary); `None` when the
     /// session is unavailable (non-admin dev run).
     pub(super) etw: Option<String>,
+    /// The structured present-vs-queue counts for the window ([`EtwWatch::window_counts`]) —
+    /// the compose-silence discriminator: presents flowing while the queue starves = the OS
+    /// display path dropped composed frames; both silent = the content stopped presenting.
+    /// `None` when the ETW session is unavailable.
+    pub(super) etw_counts: Option<super::dxgkrnl_etw::EtwWindowCounts>,
 }
 
 /// The micro-probes' window read (Phase A.2, built by `probes::ProbeEngine::window`): per-leg
@@ -43,6 +48,12 @@ pub(super) struct ProbeWindow {
     pub(super) fence_max_us: Option<u64>,
     /// Longest span (µs) with no `DwmGetCompositionTimingInfo` `cRefresh` advance.
     pub(super) dwm_tick_frozen_us: Option<u64>,
+    /// Longest span (µs) with no `cFrame` (composed-frame counter) advance. ADVISORY ONLY —
+    /// never classification evidence: on Win11 `DWM_TIMING_INFO.cFrame` is refresh-synthesized
+    /// and advances without real composes (proven on-glass 2026-07-30 against a kernel trace
+    /// where DWM verifiably presented nothing for 1.6 s while cFrame ticked). The line keeps
+    /// reporting it for older builds' sake; [`classify`] ignores it.
+    pub(super) dwm_frame_frozen_us: Option<u64>,
     /// Worst watchdogged `DwmFlush` latency (µs).
     pub(super) dwm_flush_max_us: Option<u64>,
     /// Worst `D3DKMTGetScanLine` CALL latency (µs) — Level-Zero, so blocking convicts the KMD.
@@ -62,9 +73,11 @@ impl std::fmt::Display for ProbeWindow {
         };
         write!(
             f,
-            "fence={} dwm_tick_frozen={} dwm_flush={} scanline={}({}) cpu_overshoot={}",
+            "fence={} dwm_tick_frozen={} dwm_frames_frozen={} dwm_flush={} scanline={}({}) \
+             cpu_overshoot={}",
             ms(self.fence_max_us),
             ms(self.dwm_tick_frozen_us),
+            ms(self.dwm_frame_frozen_us),
             ms(self.dwm_flush_max_us),
             ms(self.scanline_max_us),
             if self.scanline_physical {
@@ -92,9 +105,17 @@ pub(super) enum StallClass {
     /// Engines alive but DWM's own tick froze: the compositor is blocked on something (DDC/child
     /// I/O vendor lock, win32k display-config queue). Class 2.
     CompositorBlocked,
-    /// Engines alive, DWM ticking, driver drained E_PENDING — composition happened for OTHER
-    /// surfaces but produced no frame for OUR display: the frame-generation path
-    /// (IddCx/dirty-tracking/divider). Ours to chase with IddCx WPP.
+    /// Engines alive, DWM's clock ticking, driver drained E_PENDING, and the ETW present witness
+    /// saw (essentially) NO swapchain presents from ANY process across the hole: the content
+    /// stopped presenting — no damage, DWM correctly composed nothing (a game hitch, a loading
+    /// screen, a menu). Benign for the display path; the content side is where to look if the
+    /// user FELT it.
+    ContentSilence,
+    /// Engines alive, DWM ticking, driver drained E_PENDING — and the ETW present witness saw
+    /// presents FLOWING through the hole while the virtual display's kernel queue
+    /// (`BltQueueAddEntry`) starved: composed frames existed and the OS display path dropped
+    /// them before our swap-chain. The real display-path bug class — never yet observed in the
+    /// field; a report with this label (counts attached) is the specimen we want.
     FrameGeneration,
     /// Not enough evidence to name a class (pre-telemetry driver and/or probes absent).
     Unattributed,
@@ -111,21 +132,39 @@ impl std::fmt::Display for StallClass {
             Self::CompositorBlocked => {
                 "CLASS-2 compositor blocked (engines alive, DWM tick frozen — vendor lock / DDC)"
             }
+            Self::ContentSilence => {
+                "CONTENT-SILENCE (no swapchain presents from any process across the hole — the content stopped presenting; not the display path)"
+            }
             Self::FrameGeneration => {
-                "FRAME-GENERATION (DWM ticked, engines alive, no frame for THIS display — IddCx/dirty/divider)"
+                "FRAME-GENERATION (presents FLOWED while the virtual display's kernel queue starved — the OS display path dropped composed frames)"
             }
             Self::Unattributed => "UNATTRIBUTED (insufficient telemetry)",
         })
     }
 }
 
-/// The verdict matrix: fold the driver-telemetry verdict and the probe window into a class.
-/// Pure — unit-tested beside the [`StallWatch`] tests. A leg is "stalled for the hole" when its
-/// worst reading covers at least half the gap (the same proportional bar as [`attribute`]).
+/// How many window presents acquit the content: ≥8 presents across the hole mirrors
+/// [`attribute`]'s offered-frames bar and [`StallWatch::RECENT`]'s sustained-flow definition —
+/// a caret blink or a stall-ending frame stays under it, a game presenting through the hole
+/// clears it by an order of magnitude.
+const PRESENTS_ACQUIT_CONTENT: u32 = 8;
+
+/// The verdict matrix: fold the driver-telemetry verdict, the probe window and the ETW
+/// present-vs-queue counts into a class. Pure — unit-tested beside the [`StallWatch`] tests.
+/// A leg is "stalled for the hole" when its worst reading covers at least half the gap (the
+/// same proportional bar as [`attribute`]).
+///
+/// Compose-silence is split by the ETW witnesses ONLY (`DWM_TIMING_INFO.cFrame` is
+/// refresh-synthesized on Win11 and convicts nothing — see [`ProbeWindow::dwm_frame_frozen_us`]):
+/// presents flowing while the hole ran = the OS display path dropped them (FRAME-GENERATION,
+/// positively convicted); no presents anywhere = the content stopped (CONTENT-SILENCE). With no
+/// working witness the class stays UNATTRIBUTED — the pre-2026-07-30 default of blaming the
+/// frame-generation path mislabeled benign content pauses and is retired.
 pub(super) fn classify(
     gap: Duration,
     verdict: &StallVerdict,
     probes: Option<&ProbeWindow>,
+    etw_counts: Option<&super::dxgkrnl_etw::EtwWindowCounts>,
 ) -> StallClass {
     match verdict {
         StallVerdict::WorkerStalled => return StallClass::OursWorker,
@@ -144,10 +183,21 @@ pub(super) fn classify(
         return StallClass::CompositorBlocked;
     }
     // Engines alive and DWM ticking: only the driver's own E_PENDING testimony can pin the
-    // frame-generation path — without it (pre-telemetry driver) the delivery leg is equally
-    // possible, so stay honest.
+    // silence on the present path — without it (pre-telemetry driver) the delivery leg is
+    // equally possible, so stay honest.
     if matches!(verdict, StallVerdict::ComposeSilence) {
-        StallClass::FrameGeneration
+        match etw_counts {
+            Some(c) if c.present_history => {
+                if c.presents >= PRESENTS_ACQUIT_CONTENT {
+                    StallClass::FrameGeneration
+                } else {
+                    StallClass::ContentSilence
+                }
+            }
+            // No working present witness (session refused / DXGI enable failed / renumbered
+            // events): the silence cannot be attributed to either side.
+            _ => StallClass::Unattributed,
+        }
     } else {
         StallClass::Unattributed
     }
@@ -228,8 +278,9 @@ pub(super) struct StallWatch {
     /// whole session's beat, not just the stall that tripped the metronome.
     verdicts: [u32; 4],
     /// Running per-class tally ([`StallClass`] order: ours-worker, ours-delivery, adapter-freeze,
-    /// compositor-blocked, frame-generation, unattributed) — the verdict matrix's session summary.
-    classes: [u32; 6],
+    /// compositor-blocked, content-silence, frame-generation, unattributed) — the verdict
+    /// matrix's session summary.
+    classes: [u32; 7],
 }
 
 impl StallWatch {
@@ -250,7 +301,7 @@ impl StallWatch {
             seen: 0,
             with_os_events: 0,
             verdicts: [0; 4],
-            classes: [0; 6],
+            classes: [0; 7],
         }
     }
 
@@ -312,14 +363,20 @@ impl StallWatch {
             StallVerdict::ComposeSilence => 2,
             StallVerdict::DeliveryLeg => 3,
         }] += 1;
-        let class = classify(stall.gap, &verdict, evidence.probes.as_ref());
+        let class = classify(
+            stall.gap,
+            &verdict,
+            evidence.probes.as_ref(),
+            evidence.etw_counts.as_ref(),
+        );
         self.classes[match class {
             StallClass::OursWorker => 0,
             StallClass::OursDelivery => 1,
             StallClass::AdapterFreeze => 2,
             StallClass::CompositorBlocked => 3,
-            StallClass::FrameGeneration => 4,
-            StallClass::Unattributed => 5,
+            StallClass::ContentSilence => 4,
+            StallClass::FrameGeneration => 5,
+            StallClass::Unattributed => 6,
         }] += 1;
         // debug (not warn): a single hole also happens when content legitimately pauses;
         // the reportable signal is the metronomic cycle below. Mounjay-class triage runs
@@ -331,6 +388,11 @@ impl StallWatch {
             class = %class,
             probes = evidence.probes.as_ref().map(tracing::field::display),
             etw = evidence.etw.as_deref().unwrap_or("unavailable"),
+            // The discriminator's numeric read (also embedded in `etw` as prose): swapchain
+            // presents from ANY process vs frames entering the virtual display's kernel queue,
+            // inside the gap window. presents≥bar with adds≈0 = FRAME-GENERATION conviction.
+            etw_presents = evidence.etw_counts.map(|c| c.presents),
+            etw_queue_adds = evidence.etw_counts.map(|c| c.queue_adds),
             offered_during_gap = evidence.offered_delta,
             max_heartbeat_age_ms = evidence.max_heartbeat_age_ms,
             "IDD-push capture stall — the desktop was composing at speed, then the ring \
@@ -351,13 +413,14 @@ impl StallWatch {
             );
             let class_tally = format!(
                 "ours-worker {}, ours-delivery {}, adapter-freeze {}, compositor-blocked {}, \
-                 frame-generation {}, unattributed {}",
+                 content-silence {}, frame-generation {}, unattributed {}",
                 self.classes[0],
                 self.classes[1],
                 self.classes[2],
                 self.classes[3],
                 self.classes[4],
-                self.classes[5]
+                self.classes[5],
+                self.classes[6]
             );
             // Half-or-more of the stalls carrying a coinciding OS event = the reaction
             // cascade is OS-visible; otherwise the disturbance never surfaces above the
