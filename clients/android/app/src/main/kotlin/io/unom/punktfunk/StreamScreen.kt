@@ -235,13 +235,39 @@ fun StreamScreen(session: ActiveSession, onDisconnect: () -> Unit) {
         val priorSoftInput = window?.attributes?.softInputMode
             ?: WindowManager.LayoutParams.SOFT_INPUT_ADJUST_UNSPECIFIED
         window?.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING)
+        // Draw under the display cutout, explicitly. Android 15's SDK-35 edge-to-edge enforcement
+        // makes ALWAYS the immersive default, but pre-15 devices letterbox the notch as a dead
+        // black bar unless asked — and the stream's own letterbox is black anyway, so the cutout
+        // region can never show anything wrong. Captured + restored like the rest of the window
+        // state so the menus keep their platform-default behaviour.
+        val priorCutout = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            window?.attributes?.layoutInDisplayCutoutMode
+        } else {
+            null
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            window?.let { w ->
+                w.attributes = w.attributes.apply {
+                    layoutInDisplayCutoutMode =
+                        WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+                }
+            }
+        }
         // Lock to landscape while streaming — the host streams a landscape desktop, so pin the device
         // there (either landscape direction is fine) and stop it rotating to portrait mid-session. The
         // activity declares configChanges=orientation, so this re-lays out the surface in place without
         // recreating the activity (no stream restart). On TV (fixed landscape) it's a harmless no-op.
         // The prior request is captured and restored on the way out.
+        //
+        // COMPACT devices only (sw < 600 dp): on tablets/foldables/desktop windows the lock is a
+        // large-display anti-pattern (Play flags it; Android 16+ ignores it there outright), and the
+        // stream doesn't need it — the aspect-ratio letterbox renders correctly in any orientation,
+        // the lock is purely a phone-ergonomics choice.
+        val compactDevice = context.resources.configuration.smallestScreenWidthDp < 600
         val priorOrientation = activity?.requestedOrientation
-        activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+        if (compactDevice) {
+            activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+        }
         activity?.streamHandle = handle // route hardware keys to this session
         // Multi-controller router: a stable wire pad index per connected controller, per-device axis
         // state, Arrival/Remove on hot-plug, and feedback routed back by pad index. Forwards every
@@ -463,6 +489,11 @@ fun StreamScreen(session: ActiveSession, onDisconnect: () -> Unit) {
             }
             controller?.hide(WindowInsetsCompat.Type.ime()) // drop any keyboard left showing
             window?.setSoftInputMode(priorSoftInput)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && priorCutout != null) {
+                window?.let { w ->
+                    w.attributes = w.attributes.apply { layoutInDisplayCutoutMode = priorCutout }
+                }
+            }
             controller?.show(WindowInsetsCompat.Type.systemBars())
             window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
             if (lowLatencyMode && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
