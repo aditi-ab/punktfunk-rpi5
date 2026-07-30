@@ -991,6 +991,85 @@ mod drain_tests {
         }
     }
 
+    /// The driver reads its HID identity back off the same hardware id — that mapping is what
+    /// decides which report descriptor and which VID/PID a pad enumerates with, and it is settled
+    /// at `EvtDeviceAdd`, before the sealed channel can possibly say anything (its delivery goes
+    /// through the HID interface that does not exist yet). So every hwid the host uses must appear
+    /// in `devtype_from_hwids`' table against this side's `devtype`, and the table must be ordered
+    /// so no token shadows a longer one — `pf_dualsense` is a prefix of `pf_dualsenseedge`, and an
+    /// Edge listed after it would resolve to a plain DualSense.
+    ///
+    /// Until the driver read the ids, EVERY non-DualSense pad enumerated with the DualSense
+    /// descriptor: a Steam Deck's 64-byte frame parsed as DualSense report `0x01` pins the left
+    /// stick to a corner and holds d-pad UP forever.
+    #[test]
+    fn hwid_devtype_table_matches_the_driver() {
+        let src = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../packaging/windows/drivers/pf-gamepad/src/lib.rs"
+        );
+        let driver = std::fs::read_to_string(src).expect("read pf-gamepad lib.rs");
+        let table = driver
+            .split_once("fn devtype_from_hwids")
+            .expect("devtype_from_hwids not found — did the driver's identity resolution move?")
+            .1;
+        let table = table.split_once("] {").expect("table literal").0;
+        // `("pf_steamdeck", 3u8),` → ("pf_steamdeck", 3), in source order.
+        let entries: Vec<(String, u8)> = table
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix('('))
+            .filter_map(|l| l.split_once(','))
+            .filter_map(|(id, dt)| {
+                let id = id.trim().trim_matches('"').to_ascii_lowercase();
+                let dt = dt
+                    .trim()
+                    .trim_end_matches([')', ','])
+                    .trim_end_matches("u8");
+                dt.parse().ok().map(|dt| (id, dt))
+            })
+            .collect();
+        assert_eq!(
+            entries.len(),
+            4,
+            "parsed {entries:?} out of the driver's table — the shape changed and this test went \
+             vacuous; fix the parse rather than deleting the assert"
+        );
+        for (i, (id, _)) in entries.iter().enumerate() {
+            for (later, _) in &entries[i + 1..] {
+                assert!(
+                    !later.starts_with(id.as_str()),
+                    "the driver tests {id:?} before {later:?}, so a {later:?} devnode would \
+                     resolve to {id:?}'s identity — put the longer id first"
+                );
+            }
+        }
+        for (hwid, devtype) in [
+            (WinDsIdentity::dualsense().hwid, 0),
+            (
+                WinDsIdentity::dualsense_edge().hwid,
+                pf_driver_proto::gamepad::DEVTYPE_DUALSENSE_EDGE,
+            ),
+            (
+                super::super::dualshock4_windows::DS4_HWID,
+                pf_driver_proto::gamepad::DEVTYPE_DUALSHOCK4,
+            ),
+            (
+                super::super::steam_deck_windows::DECK_HWID,
+                pf_driver_proto::gamepad::DEVTYPE_STEAMDECK,
+            ),
+        ] {
+            let want = hwid.to_ascii_lowercase();
+            let got = entries.iter().find(|(id, _)| *id == want);
+            assert_eq!(
+                got.map(|(_, dt)| *dt),
+                Some(devtype),
+                "the host stamps device_type={devtype} for hardware id {hwid:?}, but the driver's \
+                 table says {got:?} — the pad would enumerate with another controller's report \
+                 descriptor"
+            );
+        }
+    }
+
     #[test]
     fn legacy_driver_still_drains_the_latest_slot() {
         let mut buf = section();

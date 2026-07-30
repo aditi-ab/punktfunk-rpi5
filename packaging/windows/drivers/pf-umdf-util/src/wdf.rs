@@ -13,6 +13,9 @@ const STATUS_INVALID_BUFFER_SIZE: NTSTATUS = 0xC000_0206u32 as NTSTATUS;
 /// DEVICE_REGISTRY_PROPERTY: DevicePropertyLocationInformation (the const isn't re-exported at the
 /// wdk_sys root; the value is stable WDM).
 const DEVICE_PROPERTY_LOCATION_INFORMATION: i32 = 10;
+/// DEVICE_REGISTRY_PROPERTY: DevicePropertyHardwareID — the devnode's `REG_MULTI_SZ` hardware-id
+/// list (same caveat: stable WDM value, not re-exported).
+const DEVICE_PROPERTY_HARDWARE_ID: i32 = 1;
 
 #[inline]
 fn nt_success(s: NTSTATUS) -> bool {
@@ -205,4 +208,59 @@ pub unsafe fn query_location_index(device: WDFDEVICE) -> u32 {
         }
     }
     if any { idx } else { 0 }
+}
+
+/// Read the devnode's hardware-id list (`pszzHardwareIds`) as one lowercase ASCII string, ids
+/// separated by `;` (e.g. `"pf_steamdeck;usb\\vid_28de&pid_1205&rev_0100&mi_02;…"`). Empty if the
+/// property is absent.
+///
+/// This is the ONE identity surface available at `EvtDeviceAdd` — before hidclass asks for the
+/// report descriptor and attributes, and long before the sealed channel can deliver (delivery goes
+/// through the HID device interface, which only exists once those very queries are answered). A
+/// driver that must know *which* device it is at descriptor time has to read it here.
+///
+/// # Safety
+/// `device` must be the live `WDFDEVICE` created in the current `EvtDeviceAdd`.
+pub unsafe fn query_hardware_ids(device: WDFDEVICE) -> String {
+    let mut mem: wdk_sys::WDFMEMORY = core::ptr::null_mut();
+    // SAFETY: `device` is live per this fn's contract; property = HardwareID; pool ignored in UMDF;
+    // `mem` receives the handle (device-parented — the framework frees it at device teardown).
+    let st = unsafe {
+        call_unsafe_wdf_function_binding!(
+            WdfDeviceAllocAndQueryProperty,
+            device,
+            DEVICE_PROPERTY_HARDWARE_ID,
+            0,
+            WDF_NO_OBJECT_ATTRIBUTES,
+            &mut mem
+        )
+    };
+    if !nt_success(st) || mem.is_null() {
+        return String::new();
+    }
+    let mut len: usize = 0;
+    // SAFETY: `mem` is the valid memory object just allocated; `len` receives its size.
+    let buf = unsafe { call_unsafe_wdf_function_binding!(WdfMemoryGetBuffer, mem, &mut len) }
+        as *const u16;
+    if buf.is_null() {
+        return String::new();
+    }
+    // SAFETY: `buf` is valid for `len` bytes per `WdfMemoryGetBuffer`; we read exactly `len / 2` u16.
+    let chars = unsafe { core::slice::from_raw_parts(buf, len / 2) };
+    // REG_MULTI_SZ: NUL-separated, double-NUL-terminated. Ids are ASCII in practice; anything else
+    // is dropped rather than lossily transliterated (this string is only ever substring-matched).
+    let mut out = String::with_capacity(chars.len());
+    for &c in chars {
+        match c {
+            0 => {
+                if out.ends_with(';') || out.is_empty() {
+                    break; // the terminating second NUL
+                }
+                out.push(';');
+            }
+            0x20..=0x7E => out.push((c as u8 as char).to_ascii_lowercase()),
+            _ => {}
+        }
+    }
+    out
 }

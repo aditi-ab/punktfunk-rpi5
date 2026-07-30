@@ -65,10 +65,10 @@ const DS_VER: u16 = 0x0100;
 const DS4_PID: u16 = 0x09CC;
 /// DualSense Edge product id — served (same VID/version) when the host stamps device_type=2.
 const DS_EDGE_PID: u16 = 0x0DF2;
-/// **N4 spike** (gamepad-new-types §6): the Steam Deck controller identity (Valve 28DE:1205),
-/// served when the host stamps device_type=3. Exists ONLY to answer the go/no-go question "does
-/// Steam Input on Windows promote a software-devnode HID Deck?" — the host never stamps 3
-/// outside the `deck-windows-spike` subcommand.
+/// The Steam Deck controller identity (Valve 28DE:1205), served when the host stamps
+/// device_type=3. Started as the N4 spike (gamepad-new-types §6) answering "does Steam Input on
+/// Windows promote a software-devnode HID Deck?"; it is now a shipping identity — every Steam Deck
+/// CLIENT streaming to a Windows host declares it, and `steam_deck_windows` builds the pad.
 const DECK_VID: u16 = 0x28DE;
 const DECK_PID: u16 = 0x1205;
 
@@ -375,12 +375,36 @@ fn publish_output(view: &pf_umdf_util::section::MappedView, bytes: &[u8]) {
 /// The sealed-channel client (per-pad: `ProcessSharingDisabled` gives each pad its own WUDFHost, so
 /// this static is per-pad). The handshake/adoption/validation state machine lives in `pf_umdf_util`.
 static CHANNEL: ChannelClient = ChannelClient::new();
-/// The last observed `device_type` (0 = DualSense, 1 = DualShock 4, 2 = DualSense Edge) — the
-/// neutral-report shape when
-/// the channel detaches, and the fallback identity while unattached.
+/// The last observed `device_type` (0 = DualSense, 1 = DualShock 4, 2 = DualSense Edge,
+/// 3 = Steam Deck) — the neutral-report shape when the channel detaches, and the fallback identity
+/// while unattached.
 static LAST_DEVTYPE: AtomicU32 = AtomicU32::new(0);
 /// device_type()'s bounded first-read wait fires at most once (see its docs).
 static DEVTYPE_WAITED: AtomicBool = AtomicBool::new(false);
+/// The identity resolved from the devnode's PnP hardware ids at `EvtDeviceAdd` ([`devtype_from_hwids`]);
+/// `u32::MAX` = not resolved. See [`device_type`] for why this exists.
+static PNP_DEVTYPE: AtomicU32 = AtomicU32::new(u32::MAX);
+
+/// Map a devnode's hardware-id list (lowercase, `;`-separated — see
+/// [`wdf::query_hardware_ids`](pf_umdf_util::wdf::query_hardware_ids)) to the `device_type` the host
+/// stamps into the section. The host picks one `pf_*` id per identity and lists it FIRST (it is the
+/// INF binding contract, pinned by `dualsense_windows::drain_tests::hwid_matches_inf`), so the two
+/// can never disagree.
+///
+/// Order matters: `pf_dualsense` is a prefix of `pf_dualsenseedge`, so the Edge is tested first.
+fn devtype_from_hwids(ids: &str) -> Option<u8> {
+    for (token, devtype) in [
+        ("pf_steamdeck", 3u8),
+        ("pf_dualsenseedge", 2),
+        ("pf_dualshock4", 1),
+        ("pf_dualsense", 0),
+    ] {
+        if ids.contains(token) {
+            return Some(devtype);
+        }
+    }
+    None
+}
 
 /// This pad's channel config (magic/size/pad_index offset + our logger).
 fn channel_cfg() -> ChannelConfig {
@@ -509,6 +533,23 @@ extern "C" fn evt_device_add(_driver: WDFDRIVER, mut device_init: PWDFDEVICE_INI
     let shm_idx = unsafe { wdf::query_location_index(device) };
     CHANNEL.set_index(shm_idx);
     dbglog!("[pf-gamepad] shm index = {shm_idx}");
+
+    // Settle WHICH controller we are before hidclass asks (see `device_type`): the PnP hardware ids
+    // are the only identity available this early, and every descriptor/attribute answer depends on it.
+    // SAFETY: `device` is the live device just created — the exact contract this fn requires.
+    let hwids = unsafe { wdf::query_hardware_ids(device) };
+    match devtype_from_hwids(&hwids) {
+        Some(t) => {
+            PNP_DEVTYPE.store(t as u32, Ordering::Relaxed);
+            LAST_DEVTYPE.store(t as u32, Ordering::Relaxed);
+            dbglog!("[pf-gamepad] identity from PnP hardware ids: device_type={t} ({hwids})");
+        }
+        // No pf_* id: an unexpected devnode (or a property query that failed). Keep the historical
+        // behaviour — wait for the channel, then fall back to DualSense.
+        None => dbglog!(
+            "[pf-gamepad] no pf_* hardware id in ({hwids}) — identity deferred to the channel"
+        ),
+    }
 
     // Default parallel queue handling all IOCTLs.
     // SAFETY: zeroed config then fields set; Size matches the struct.
@@ -922,18 +963,32 @@ fn on_get_string(request: &Request) -> NTSTATUS {
     request.copy_to_output(&wide)
 }
 
-/// The host's device-type selector from the sealed DATA section (`device_type` @140): 0 = DualSense
-/// (default), 1 = DualShock 4, 2 = DualSense Edge, 3 = Steam Deck. Read fresh on each enumeration
-/// query — cheap. If
-/// the channel hasn't attached when hidclass first asks (the host stamps the section + eager-delivers
-/// before `SwDeviceCreate` returns, but the handshake can be a few ms behind), pump the channel
-/// briefly — ONCE — for the delivery: a DS4/Edge pad must not enumerate with the default DualSense
-/// identity because of a lost race. After that one bounded wait, fall back to the last observed type.
+/// The device-type selector: 0 = DualSense, 1 = DualShock 4, 2 = DualSense Edge, 3 = Steam Deck.
+/// Read fresh on each enumeration query — cheap.
+///
+/// ⚠️ **The sealed section cannot answer the enumeration queries.** hidclass asks for
+/// `GET_DEVICE_DESCRIPTOR` / `GET_REPORT_DESCRIPTOR` / `GET_DEVICE_ATTRIBUTES` while it STARTS the
+/// device; the host can only deliver the DATA section over the HID device interface
+/// (`ProofTransport::HidFeatureReport`), which does not exist until those very queries are answered.
+/// So the channel is *structurally* unavailable here, not merely racing — the 1 s wait below always
+/// timed out, and every non-DualSense identity silently enumerated with the DualSense VID/PID **and
+/// the DualSense report descriptor**. For the Deck that meant Windows parsed the 64-byte
+/// `ID_CONTROLLER_DECK_STATE` frame as DualSense report `0x01`: `LX = report[1] = 0x00` (stick hard
+/// left), `LY = report[2] = 0x09` (hard up) and a d-pad hat of 0 (UP held) — the "stuck stick/button"
+/// a Steam Deck client saw on a Windows host.
+///
+/// [`PNP_DEVTYPE`] closes it: the devnode's hardware ids carry the identity and are readable at
+/// `EvtDeviceAdd`, before anything is asked. The section stays authoritative once attached (same
+/// host wrote both), and the bounded wait survives only for a devnode whose ids matched nothing.
 fn device_type() -> u8 {
     if let Some(view) = CHANNEL.data() {
         let t = view.read_u8(OFF_DEVICE_TYPE);
         LAST_DEVTYPE.store(t as u32, Ordering::Relaxed);
         return t;
+    }
+    let pnp = PNP_DEVTYPE.load(Ordering::Relaxed);
+    if pnp != u32::MAX {
+        return pnp as u8;
     }
     if !DEVTYPE_WAITED.swap(true, Ordering::SeqCst) {
         let cfg = channel_cfg();
