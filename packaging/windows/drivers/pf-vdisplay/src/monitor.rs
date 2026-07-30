@@ -777,8 +777,7 @@ pub fn create_monitor(
 
     // EDID (serial = id) describes the monitor; the OS calls back into parse_monitor_description.
     // The session's own mode becomes the preferred-timing DTD when it fits the encoding.
-    let mut edid =
-        crate::edid::Edid::generate_with(id, client_lum, Some((width, height, refresh)));
+    let mut edid = crate::edid::Edid::generate_with(id, client_lum, Some((width, height, refresh)));
     let mut desc = pod_init!(iddcx::IDDCX_MONITOR_DESCRIPTION);
     desc.Size = core::mem::size_of::<iddcx::IDDCX_MONITOR_DESCRIPTION>() as u32;
     desc.Type = iddcx::IDDCX_MONITOR_DESCRIPTION_TYPE::IDDCX_MONITOR_DESCRIPTION_TYPE_EDID;
