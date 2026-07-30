@@ -53,6 +53,12 @@ pub mod profiles;
 pub mod session;
 #[cfg(any(target_os = "linux", windows))]
 pub mod trust;
+// "Is a newer client available, and can this box install it?" — the client half of the
+// signed-manifest update check the host already runs (design: host-update-from-web-console.md).
+// Linux only: the Windows client ships inside the host installer and the Mac one through
+// clients/apple, so neither has a package to reason about here.
+#[cfg(target_os = "linux")]
+pub mod update;
 #[cfg(any(target_os = "linux", windows))]
 pub mod video;
 #[cfg(any(target_os = "linux", windows))]
