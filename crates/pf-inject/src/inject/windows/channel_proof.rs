@@ -33,8 +33,9 @@ use windows::Win32::Devices::DeviceAndDriverInstallation::{
     CM_GET_DEVICE_INTERFACE_LIST_PRESENT, CM_LOCATE_DEVNODE_NORMAL, CR_SUCCESS,
 };
 use windows::Win32::Devices::HumanInterfaceDevice::{
-    HidD_GetFeature, HidD_GetIndexedString, HidD_GetProductString, HidD_GetSerialNumberString,
-    HidD_SetFeature, GUID_DEVINTERFACE_HID,
+    HidD_FreePreparsedData, HidD_GetFeature, HidD_GetIndexedString, HidD_GetPreparsedData,
+    HidD_GetProductString, HidD_GetSerialNumberString, HidD_SetFeature, HidP_GetCaps,
+    GUID_DEVINTERFACE_HID, HIDP_CAPS, PHIDP_PREPARSED_DATA,
 };
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Storage::FileSystem::{
@@ -130,46 +131,85 @@ fn ask_ioctl(path: &str, expect_pad_index: u32) -> Result<u32> {
 /// Open a HID collection and read the proof out of a FEATURE report — the pad transport.
 fn ask_feature_path(path: &str, expect_pad_index: u32) -> Result<u32> {
     let handle = open_device(path)?;
-    let proof = ask_feature(HANDLE(handle.as_raw_handle()))?;
-    proof
-        .check(expect_pad_index)
-        .map_err(|why| anyhow!("{why}"))
+    ask_feature(HANDLE(handle.as_raw_handle()), expect_pad_index)
+}
+
+/// Take a parsed answer only if it VALIDATES; otherwise remember why and let the caller keep
+/// looking. Parsing is not evidence: [`ChannelProof::from_feature_report`] happily reinterprets any
+/// 17 bytes, so a transport that answers with something else entirely yields a proof-shaped struct
+/// full of another report's bytes.
+fn accept(
+    p: Option<ChannelProof>,
+    expect: u32,
+    rejected: &mut Option<&'static str>,
+) -> Option<u32> {
+    match p?.check(expect) {
+        Ok(pid) => Some(pid),
+        Err(why) => {
+            *rejected = Some(why);
+            None
+        }
+    }
 }
 
 /// The PS identities answer on the declared-but-unserved report `0x85`; the Deck answers its
 /// unnumbered report after a private SET_FEATURE command. Both are tried — one driver binary serves
 /// four identities and the host does not know which one this devnode became until the DATA section
 /// is attached, which is precisely what we are trying to earn the right to do.
-fn ask_feature(h: HANDLE) -> Result<ChannelProof> {
-    // Feature buffers are sized by the descriptor; the largest of these reports is 64 bytes, and
-    // Windows accepts a buffer at least that big.
-    const BUF: usize = 64;
+///
+/// So neither answer can be trusted on shape alone: a Deck serves its ONE unnumbered feature report
+/// for *any* requested id, which means it answers the `0x85` probe with Steam attribute bytes that
+/// parse into a proof and fail on magic. Returning that first answer stopped the search and refused
+/// the delivery while the real proof sat one transport away.
+fn ask_feature(h: HANDLE, expect_pad_index: u32) -> Result<u32> {
+    // `HidD_GetFeature`/`HidD_SetFeature` REJECT any buffer shorter than the collection's
+    // `FeatureReportByteLength` — so it must come from the descriptor, not from a constant. The PS
+    // identities land on 64 (63-byte reports + a report id); the Deck's ONE feature report is
+    // unnumbered and 64 bytes wide, which Windows reports as 65 (payload + the report-id slot it
+    // always reserves). Hardcoding 64 silently failed every call on a correctly-enumerated Deck.
+    let buf_len = feature_report_len(h).unwrap_or(64).max(64);
+    let mut rejected = None;
 
     // PS identities: GET_FEATURE 0x85.
-    let mut buf = [0u8; BUF];
+    let mut buf = vec![0u8; buf_len];
     buf[0] = HID_FEATURE_REPORT_CHANNEL_PROOF;
-    // SAFETY: `h` is the live HID interface handle; `buf` is a valid BUF-sized in/out buffer.
-    if unsafe { HidD_GetFeature(h, buf.as_mut_ptr().cast(), BUF as u32) } {
-        if let Some(p) = ChannelProof::from_feature_report(&buf) {
-            return Ok(p);
+    // SAFETY: `h` is the live HID interface handle; `buf` is a valid `buf_len`-sized in/out buffer.
+    if unsafe { HidD_GetFeature(h, buf.as_mut_ptr().cast(), buf_len as u32) } {
+        let p = ChannelProof::from_feature_report(&buf);
+        if let Some(pid) = accept(p, expect_pad_index, &mut rejected) {
+            return Ok(pid);
         }
     }
 
     // Deck: SET the private command, then GET the reply. Byte 0 is the (unnumbered) report id 0.
-    let mut cmd = [0u8; BUF];
+    let mut cmd = vec![0u8; buf_len];
     cmd[1..1 + DECK_PROOF_CMD.len()].copy_from_slice(&DECK_PROOF_CMD);
-    // SAFETY: `h` is live; `cmd` is a valid BUF-sized buffer.
-    let set_ok = unsafe { HidD_SetFeature(h, cmd.as_mut_ptr().cast(), BUF as u32) };
+    // SAFETY: `h` is live; `cmd` is a valid `buf_len`-sized buffer.
+    let set_ok = unsafe { HidD_SetFeature(h, cmd.as_mut_ptr().cast(), buf_len as u32) };
     if set_ok {
-        let mut reply = [0u8; BUF];
+        let mut reply = vec![0u8; buf_len];
         // SAFETY: as above.
-        if unsafe { HidD_GetFeature(h, reply.as_mut_ptr().cast(), BUF as u32) }
-            && reply.starts_with(&DECK_PROOF_CMD)
-        {
-            if let Some(p) = ChannelProof::from_bytes(&reply[DECK_PROOF_CMD.len()..]) {
-                return Ok(p);
+        if unsafe { HidD_GetFeature(h, reply.as_mut_ptr().cast(), buf_len as u32) } {
+            // The driver answers with the payload; on an unnumbered report Windows hands it back
+            // one byte in, behind the report-id slot. Accept either placement rather than pinning a
+            // marshalling detail that differs between the two descriptors this one driver serves.
+            for off in [0usize, 1] {
+                let Some(body) = reply.get(off..) else {
+                    continue;
+                };
+                if let Some(tail) = body.strip_prefix(&DECK_PROOF_CMD[..]) {
+                    let p = ChannelProof::from_bytes(tail);
+                    if let Some(pid) = accept(p, expect_pad_index, &mut rejected) {
+                        return Ok(pid);
+                    }
+                }
             }
         }
+    }
+    // A well-formed answer that failed validation is a different fault from no answer at all, and
+    // says which check refused — do not bury it under the generic "no proof here".
+    if let Some(why) = rejected {
+        bail!("{why}");
     }
     bail!(
         "this HID collection carries no channel proof (feature 0x{:02x}: no; Deck command: {}) — \
@@ -181,6 +221,22 @@ fn ask_feature(h: HANDLE) -> Result<ChannelProof> {
             "SET_FEATURE failed"
         },
     )
+}
+
+/// This collection's `FeatureReportByteLength` — the exact buffer size `HidD_GetFeature` /
+/// `HidD_SetFeature` demand. `None` when the preparsed data can't be read (caller falls back).
+fn feature_report_len(h: HANDLE) -> Option<usize> {
+    let mut pp = PHIDP_PREPARSED_DATA::default();
+    // SAFETY: `h` is the live HID interface handle; `pp` receives an owned preparsed-data handle.
+    if !unsafe { HidD_GetPreparsedData(h, &mut pp) } {
+        return None;
+    }
+    let mut caps = HIDP_CAPS::default();
+    // SAFETY: `pp` is the handle just obtained (freed below); `caps` is a valid out-param.
+    let st = unsafe { HidP_GetCaps(pp, &mut caps) };
+    // SAFETY: `pp` came from `HidD_GetPreparsedData` and is not used after this.
+    let _ = unsafe { HidD_FreePreparsedData(pp) };
+    (st.0 >= 0 && caps.FeatureReportByteLength > 0).then_some(caps.FeatureReportByteLength as usize)
 }
 
 /// Open a HID collection and read the proof out of a string.
@@ -266,15 +322,21 @@ pub fn diagnose(instance_id: &str, transport: ProofTransport, expect_pad_index: 
                     let _ = writeln!(out, "    IOCTL_PF_GET_CHANNEL_PROOF FAILED: {e:#}");
                 }
             },
-            ProofTransport::HidFeatureReport => match ask_feature(h) {
-                Ok(p) => {
-                    let _ = writeln!(out, "    feature proof -> {p:?}");
-                    let _ = writeln!(out, "    check: {:?}", p.check(expect_pad_index));
+            ProofTransport::HidFeatureReport => {
+                let _ = writeln!(
+                    out,
+                    "    feature report length: {:?}",
+                    feature_report_len(h)
+                );
+                match ask_feature(h, expect_pad_index) {
+                    Ok(pid) => {
+                        let _ = writeln!(out, "    feature proof -> wudf pid {pid}");
+                    }
+                    Err(e) => {
+                        let _ = writeln!(out, "    feature proof FAILED: {e:#}");
+                    }
                 }
-                Err(e) => {
-                    let _ = writeln!(out, "    feature proof FAILED: {e:#}");
-                }
-            },
+            }
             ProofTransport::HidSerialString => {
                 // Report each path separately — this is the whole point of the probe.
                 let (indexed, serial, control) = ask_hid_both(h);
