@@ -471,7 +471,7 @@ fn web_setup(args: &[String]) -> Result<()> {
             "firewall",
             "delete",
             "rule",
-            "name=punktfunk web console (TCP 47992)",
+            "name=Punktfunk web console (TCP 47992)",
         ],
     );
     if !run_quiet(
@@ -481,7 +481,7 @@ fn web_setup(args: &[String]) -> Result<()> {
             "firewall",
             "add",
             "rule",
-            "name=punktfunk web console (TCP 47992)",
+            "name=Punktfunk web console (TCP 47992)",
             "dir=in",
             "action=allow",
             "protocol=TCP",

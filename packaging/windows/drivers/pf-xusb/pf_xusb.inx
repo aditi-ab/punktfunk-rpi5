@@ -58,7 +58,7 @@ UmdfLibraryVersion=$UMDFVERSION$
 ServiceBinary=%13%\pf_xusb.dll
 
 [Strings]
-ProviderString = "punktfunk"
+ProviderString = "Punktfunk"
 StdMfg         = "(Standard system devices)"
-DiskId1        = "punktfunk XUSB Installation Disk"
-DeviceDesc     = "punktfunk Virtual Xbox 360 (XUSB)"
+DiskId1        = "Punktfunk XUSB Installation Disk"
+DeviceDesc     = "Punktfunk Virtual Xbox 360 (XUSB)"

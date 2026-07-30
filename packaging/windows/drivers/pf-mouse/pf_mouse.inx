@@ -72,8 +72,8 @@ ServiceBinary="%13%\pf_mouse.dll"
 pf_mouse.dll
 
 [Strings]
-ProviderString     ="punktfunk"
-ManufacturerString ="punktfunk"
+ProviderString     ="Punktfunk"
+ManufacturerString ="Punktfunk"
 ClassName          ="HID device"
-Disk_Description   ="punktfunk Mouse Installation Disk"
-DeviceDesc         ="punktfunk Virtual Mouse"
+Disk_Description   ="Punktfunk Mouse Installation Disk"
+DeviceDesc         ="Punktfunk Virtual Mouse"

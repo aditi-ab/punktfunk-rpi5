@@ -73,7 +73,7 @@ impl Ds4WinPad {
             hwid: DS4_HWID,
             usb_vid_pid: "VID_054C&PID_09CC",
             usb_mi: None,
-            description: "punktfunk Virtual DualShock 4",
+            description: "Punktfunk Virtual DualShock 4",
         })?; // Propagate, do NOT swallow — see below.
         let (hsw, instance_id) = (Some(hsw), instance_id);
         // Swallowing a create failure here (the previous behaviour) latched the pad slot to

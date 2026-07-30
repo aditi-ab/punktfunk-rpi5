@@ -75,10 +75,10 @@ UMDriverCopy=12,UMDF
 pf_vdisplay.dll
 
 [Strings]
-ManufacturerName="punktfunk"
-DiskName="punktfunk Virtual Display Installation Disk"
+ManufacturerName="Punktfunk"
+DiskName="Punktfunk Virtual Display Installation Disk"
 WudfRdDisplayName="Windows Driver Foundation - User-mode Driver Framework Reflector"
-DeviceName="punktfunk Virtual Display"
+DeviceName="Punktfunk Virtual Display"
 
 REG_MULTI_SZ=0x00010000
 REG_SZ=0x00000000

@@ -92,7 +92,7 @@ unsafe fn ioctl(h: HANDLE, code: u32, input: &[u8], output: &mut [u8]) -> Result
 }
 
 /// Reap the ghost (NOT-present) "punktfunk" virtual-monitor device nodes that `IddCxMonitorDeparture`
-/// leaves behind. Each departed monitor leaves a not-present "Generic Monitor (punktfunk)" PDO that keeps
+/// leaves behind. Each departed monitor leaves a not-present "Generic Monitor (Punktfunk)" PDO that keeps
 /// pinning an OS VidPN target against the IddCx adapter's fixed monitor-slot budget; once ~16 accumulate,
 /// `IOCTL_ADD` wedges at 0x80070490 (`ERROR_NOT_FOUND`) and every session black-screens until a manual
 /// reset/reboot. Removing the not-present PDOs frees the slots — the in-process equivalent of
@@ -532,7 +532,7 @@ impl VdisplayDriver for PfVdisplayDriver {
             tracing::warn!("pf-vdisplay IOCTL_CLEAR_ALL failed on startup (continuing)");
         }
         // CLEAR_ALL only departs the driver's own (in-process) monitor list; it can NOT remove the
-        // OS-side not-present "Generic Monitor (punktfunk)" PDOs that a previous host-run's monitor
+        // OS-side not-present "Generic Monitor (Punktfunk)" PDOs that a previous host-run's monitor
         // departures left behind. Reap those here so a fresh host start begins with a clean IddCx
         // monitor-slot budget — prevents the 0x80070490 slot-exhaustion wedge from carrying across
         // restarts (the reason a restart's CLEAR_ALL alone never recovered it before).

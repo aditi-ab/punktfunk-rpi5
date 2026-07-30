@@ -82,8 +82,8 @@ pub fn init_adapter(device: WDFDEVICE) -> NTSTATUS {
     diag.Size = core::mem::size_of::<iddcx::IDDCX_ENDPOINT_DIAGNOSTIC_INFO>() as u32;
     diag.GammaSupport = iddcx::IDDCX_FEATURE_IMPLEMENTATION::IDDCX_FEATURE_IMPLEMENTATION_NONE;
     diag.TransmissionType = iddcx::IDDCX_TRANSMISSION_TYPE::IDDCX_TRANSMISSION_TYPE_WIRED_OTHER;
-    diag.pEndPointFriendlyName = wstr!("punktfunk Virtual Display Adapter");
-    diag.pEndPointManufacturerName = wstr!("punktfunk");
+    diag.pEndPointFriendlyName = wstr!("Punktfunk Virtual Display Adapter");
+    diag.pEndPointManufacturerName = wstr!("Punktfunk");
     diag.pEndPointModelName = wstr!("Virtual Display");
     // SAFETY: `version` is a stack local that outlives this `init_adapter` call; IddCxAdapterInitAsync
     // (below) reads through these pointers SYNCHRONOUSLY, before `version` drops — the pointer never escapes.

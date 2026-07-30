@@ -428,14 +428,14 @@ fn on_get_string(request: &Request) -> NTSTATUS {
     };
     let string_id = id_val & 0xFFFF;
     let s: String = match string_id {
-        0 | 0x000E => "punktfunk".into(),
+        0 | 0x000E => "Punktfunk".into(),
         // (2) The SERIAL carries the channel proof — the one transport measured to reach a UMDF HID
         // minidriver from user mode (`HidD_GetSerialNumberString`, zero-access handle, verified on
         // .173). Safe HERE and only here: nothing reads the virtual mouse's serial, whereas the pads'
         // serials are what SDL and Steam dedup controllers on. The old value was the inert
         // "PFMOUSE00"; the proof text is just as inert and does the security work.
         2 | 0x0010 => ChannelProof::new(CHANNEL.index(), std::process::id()).to_hid_string(),
-        _ => "punktfunk Virtual Mouse".into(),
+        _ => "Punktfunk Virtual Mouse".into(),
     };
     let mut wide: Vec<u8> = Vec::with_capacity(s.len() * 2 + 2);
     for u in s.encode_utf16() {

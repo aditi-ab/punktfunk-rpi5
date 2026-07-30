@@ -66,7 +66,7 @@ impl VirtualMouse {
             // a mouse (nothing fingerprints them); reusing the shared profile keeps one code path.
             usb_vid_pid: "VID_5046&PID_4D4F",
             usb_mi: None,
-            description: "punktfunk Virtual Mouse",
+            description: "Punktfunk Virtual Mouse",
         }) {
             Ok((h, i)) => (Some(h), i),
             Err(e) => {
@@ -386,7 +386,7 @@ pub fn channel_proof_probe() -> Result<()> {
         hwid: "pf_mouse",
         usb_vid_pid: "VID_5046&PID_4D4F",
         usb_mi: None,
-        description: "punktfunk Virtual Mouse (channel-proof probe)",
+        description: "Punktfunk Virtual Mouse (channel-proof probe)",
     })?;
     let _sw = super::gamepad_raii::SwDevice::new(hsw);
     let Some(instance_id) = instance_id else {

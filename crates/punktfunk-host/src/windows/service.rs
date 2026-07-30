@@ -995,7 +995,7 @@ fn add_firewall_rules(allow_public: bool) {
         ("UDP", "UDP", "47998-48010,9777,5353"),
     ];
     for (suffix, proto, ports) in rules {
-        let name = format!("punktfunk {suffix}");
+        let name = format!("Punktfunk {suffix}");
         let ok = run_quiet(
             "netsh",
             &[
@@ -1028,7 +1028,9 @@ fn add_firewall_rules(allow_public: bool) {
 
 fn remove_firewall_rules() {
     for suffix in ["TCP", "UDP"] {
-        let name = format!("punktfunk {suffix}");
+        // Capital P is the brand; netsh matches a rule name case-INSENSITIVELY, so this still
+        // reaps the lowercase rules every release up to 0.22.1 created — no orphans on upgrade.
+        let name = format!("Punktfunk {suffix}");
         let _ = run_quiet(
             "netsh",
             &[

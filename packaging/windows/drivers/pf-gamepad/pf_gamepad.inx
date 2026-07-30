@@ -90,13 +90,13 @@ ServiceBinary="%13%\pf_gamepad.dll"
 pf_gamepad.dll
 
 [Strings]
-ProviderString     ="punktfunk"
-ManufacturerString ="punktfunk"
+ProviderString     ="Punktfunk"
+ManufacturerString ="Punktfunk"
 ClassName          ="HID device"
-Disk_Description   ="punktfunk Gamepad Installation Disk"
+Disk_Description   ="Punktfunk Gamepad Installation Disk"
 ; One per hardware id — these are what Device Manager shows. Keep them aligned with the product
 ; strings the driver serves per device_type (src/lib.rs `on_get_string`).
-DeviceDesc         ="punktfunk Virtual DualSense"
-DeviceDescDS4      ="punktfunk Virtual DualShock 4"
-DeviceDescEdge     ="punktfunk Virtual DualSense Edge"
-DeviceDescDeck     ="punktfunk Virtual Steam Deck Controller"
+DeviceDesc         ="Punktfunk Virtual DualSense"
+DeviceDescDS4      ="Punktfunk Virtual DualShock 4"
+DeviceDescEdge     ="Punktfunk Virtual DualSense Edge"
+DeviceDescDeck     ="Punktfunk Virtual Steam Deck Controller"

@@ -80,7 +80,7 @@ impl DeckWinPad {
             // token, hidapi reports interface 0, and Steam never claims the pad (the N4
             // spike's run-1 failure).
             usb_mi: Some(2),
-            description: "punktfunk Virtual Steam Deck",
+            description: "Punktfunk Virtual Steam Deck",
         })?; // Propagate — swallowing latched the slot to a pad with no devnode (see the DS4 twin).
         let (hsw, instance_id) = (Some(hsw), instance_id);
         // The DATA section goes to whoever THIS devnode says is serving it — not to whatever pid

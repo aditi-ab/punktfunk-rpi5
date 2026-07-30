@@ -6,7 +6,9 @@
 //! made "Use HDR" never appear for the virtual display). The base block declares EDID 1.4 + 10-bit
 //! digital so the panel's bit depth is unambiguous.
 //!
-//! Identity: manufacturer "PNK" (bytes 8-9), product name "punktfunk" (the 0xFC display descriptor). The
+//! Identity: manufacturer "PNK" (bytes 8-9), product name "Punktfunk" (the 0xFC display descriptor —
+//! this is what Windows shows as `Generic Monitor (Punktfunk)`; byte 127's checksum is recomputed in
+//! [`Edid::generate_with`], so editing the name here needs no hand-patched checksum). The
 //! serial-number field (base offset 0x0C, little-endian) encodes the per-monitor index so
 //! `parse_monitor_description` can map an EDID the OS hands back to its monitor; [`Edid::generate_with`]
 //! patches that serial and recomputes BOTH block checksums (base byte 127 + extension byte 255). The
@@ -34,7 +36,7 @@ const BASE: [u8; 128] = [
     0x45, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1E,
     0x00, 0x00, 0x00, 0xFD, 0x00, 0x17, 0xF0, 0x0F, // display range-limits descriptor
     0xFF, 0x0F, 0x00, 0x0A, 0x20, 0x20, 0x20, 0x20,
-    0x20, 0x20, 0x00, 0x00, 0x00, 0xFC, 0x00, 0x70, // name descriptor "punktfunk"
+    0x20, 0x20, 0x00, 0x00, 0x00, 0xFC, 0x00, 0x50, // name descriptor "Punktfunk"
     0x75, 0x6E, 0x6B, 0x74, 0x66, 0x75, 0x6E, 0x6B,
     0x0A, 0x20, 0x20, 0x20, 0x00, 0x00, 0x00, 0x00, // empty 4th descriptor...
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,

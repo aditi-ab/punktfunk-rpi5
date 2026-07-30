@@ -393,7 +393,7 @@ impl WinDsIdentity {
             // child, no channel proof, and a pad no game ever saw. `hwid_matches_inf` pins it now.
             hwid: "pf_dualsense",
             usb_vid_pid: "VID_054C&PID_0CE6",
-            description: "punktfunk Virtual DualSense",
+            description: "Punktfunk Virtual DualSense",
         }
     }
 
@@ -403,7 +403,7 @@ impl WinDsIdentity {
             instance_prefix: "pf_edge",
             hwid: "pf_dualsenseedge",
             usb_vid_pid: "VID_054C&PID_0DF2",
-            description: "punktfunk Virtual DualSense Edge",
+            description: "Punktfunk Virtual DualSense Edge",
         }
     }
 }
@@ -644,7 +644,7 @@ pub fn deck_spike_hold(index: u8, secs: u64) -> Result<()> {
         // The Deck's controller interface — the promotion gate the first spike run hit
         // (hidapi parses MI_ from the child hwids; absent = interface 0, Steam wants 2).
         usb_mi: Some(2),
-        description: "punktfunk Virtual Steam Deck (spike)",
+        description: "Punktfunk Virtual Steam Deck (spike)",
     })?;
     // The spike drives a real pad channel, so it takes the same devnode-proved delivery a session
     // pad does — no special case, and no reason for a bring-up tool to run on the old trust.

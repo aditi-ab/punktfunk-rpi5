@@ -56,7 +56,7 @@ fn create_swdevice(index: u8) -> Result<(HSWDEVICE, Option<String>)> {
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect();
-    let desc: Vec<u16> = "punktfunk Virtual Xbox 360 (XUSB)"
+    let desc: Vec<u16> = "Punktfunk Virtual Xbox 360 (XUSB)"
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect();
