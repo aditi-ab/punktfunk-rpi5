@@ -37,8 +37,21 @@ systemctl --user restart punktfunk-host
 (The Windows installer restarts the service itself; `punktfunk-sysext update` prints the same
 restart hint when it's needed.)
 
-One-click updating from the console is on the way, per install method — the card will grow an
-**Apply** button where the platform supports it.
+## One-click updating (Windows)
+
+On a Windows host the card shows an **Update now** button instead of a command. It asks for the
+console password again (a saved login alone can't restart your host), then the host downloads
+the installer, verifies it against the signed release manifest **and** its code signature, and
+runs it silently — the service restarts at the end and the page reconnects by itself. If a
+stream is live you'll be warned first: updating drops it.
+
+Every attempt leaves a result in the card (and an installer log under
+`C:\ProgramData\punktfunk\logs\update-<version>.log`) — including across the restart, so a
+failed update is never silent. To disable the button entirely on a host, set
+`PUNKTFUNK_UPDATE_APPLY=0` in `host.env`; the card then shows the manual command instead.
+
+One-click updating for the Linux install methods is on the way — it will be opt-in per host
+(joining a `punktfunk-update` group) because it needs a narrowly-scoped root helper.
 
 ## Turning the check off
 

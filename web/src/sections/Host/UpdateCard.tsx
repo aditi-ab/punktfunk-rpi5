@@ -10,20 +10,56 @@ import type { UpdateStatus } from "@/api/gen/model";
 import { QueryState } from "@/components/query-state";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import {
+	Dialog,
+	DialogContent,
+	DialogDescription,
+	DialogFooter,
+	DialogHeader,
+	DialogTitle,
+} from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Spinner } from "@/components/ui/spinner";
 import type { Loadable } from "@/lib/query";
 import { m } from "@/paraglide/messages";
 
+/** Give up waiting for the host to come back this long after apply started. */
+const APPLY_TIMEOUT_MS = 8 * 60 * 1000;
+
 /**
- * Container: the host update-check card (U0 — notify-only). Reading status is what keeps the
- * host's manifest cache warm (the host kicks its own background refresh when the cache is >6 h
- * old), so a modest poll doubles as the check cadence while the console is open. Apply buttons
- * arrive with the per-channel apply legs (U1 Windows, U2 Linux helper); until then the card's
- * action is the exact update command for this install kind.
+ * Container: the host update card. Check everywhere (U0) + one-click apply where the host
+ * reports `apply: "full"` (U1 — Windows installer). The apply flow deliberately survives the
+ * console's own backends dying: once an apply is accepted, the card renders from the LAST
+ * status snapshot (React Query keeps data across failed polls) and treats poll errors as "the
+ * host is restarting", not as failures — until the target version answers or a timeout.
  */
 export const UpdateSection: FC = () => {
 	const qc = useQueryClient();
-	const status = useGetUpdateStatus({ query: { refetchInterval: 60_000 } });
+	const [applying, setApplying] = useState<{
+		target: string;
+		startedAt: number;
+	} | null>(null);
+
+	const status = useGetUpdateStatus({
+		// Poll fast while an apply is in flight so the post-restart status lands promptly.
+		query: { refetchInterval: applying ? 3_000 : 60_000 },
+	});
 	const check = useForceUpdateCheck();
+
+	const s = status.data;
+	// The apply resolved: the host answers with the target version (success — reconcile wrote
+	// last_result), or reports a failed attempt at our target.
+	if (applying && s) {
+		if (
+			s.current_version === applying.target ||
+			(s.last_result &&
+				s.last_result.to === applying.target &&
+				!s.last_result.ok)
+		) {
+			setApplying(null);
+		}
+	}
 
 	const checkNow = () =>
 		check.mutate(undefined, {
@@ -32,25 +68,45 @@ export const UpdateSection: FC = () => {
 			},
 		});
 
-	return <UpdateCard state={status} onCheck={checkNow} busy={check.isPending} />;
+	return (
+		<UpdateCard
+			state={status}
+			onCheck={checkNow}
+			checkBusy={check.isPending}
+			applying={applying}
+			onApplied={(target) =>
+				setApplying({ target, startedAt: Date.now() })
+			}
+		/>
+	);
 };
 
 export const UpdateCard: FC<{
 	state: Loadable<UpdateStatus>;
 	onCheck: () => void;
-	busy: boolean;
-}> = ({ state, onCheck, busy }) => {
+	checkBusy: boolean;
+	applying: { target: string; startedAt: number } | null;
+	onApplied: (target: string) => void;
+}> = ({ state, onCheck, checkBusy, applying, onApplied }) => {
 	const s = state.data;
+	const inFlight = Boolean(applying) || Boolean(s?.job);
+	const timedOut =
+		applying !== null && Date.now() - applying.startedAt > APPLY_TIMEOUT_MS;
 	return (
 		<Card>
 			<CardHeader className="flex flex-row items-center justify-between">
 				<CardTitle>{m.update_title()}</CardTitle>
-				{s?.available && <Badge>{m.update_available_badge()}</Badge>}
+				{s?.available && !inFlight && (
+					<Badge>{m.update_available_badge()}</Badge>
+				)}
 			</CardHeader>
 			<CardContent className="space-y-4">
 				<QueryState
 					isLoading={state.isLoading}
-					error={state.error}
+					// While an apply restarts the host (and, on Windows, this console server),
+					// failed polls are EXPECTED — keep rendering the last snapshot instead of
+					// swapping the card for an error box.
+					error={inFlight ? undefined : state.error}
 					refetch={state.refetch}
 				>
 					{s && (
@@ -94,11 +150,21 @@ export const UpdateCard: FC<{
 								/>
 							</dl>
 
-							{s.available ? (
-								<div className="space-y-2 rounded-md border p-4">
-									<p className="text-sm">{m.update_how()}</p>
-									<CommandLine command={s.channel_hint} />
-								</div>
+							{inFlight ? (
+								<ApplyProgress
+									status={s}
+									reconnecting={Boolean(state.error)}
+									timedOut={timedOut}
+								/>
+							) : s.available ? (
+								s.apply === "full" ? (
+									<ApplyPanel status={s} onApplied={onApplied} />
+								) : (
+									<div className="space-y-2 rounded-md border p-4">
+										<p className="text-sm">{m.update_how()}</p>
+										<CommandLine command={s.channel_hint} />
+									</div>
+								)
 							) : (
 								s.manifest && (
 									<p className="text-sm text-muted-foreground">
@@ -107,12 +173,16 @@ export const UpdateCard: FC<{
 								)
 							)}
 
+							{!inFlight && s.last_result && (
+								<LastResult result={s.last_result} />
+							)}
+
 							{s.manifest?.stale && (
 								<p className="rounded-md border border-amber-500/40 bg-amber-500/10 p-3 text-sm">
 									{m.update_stale()}
 								</p>
 							)}
-							{s.last_error && (
+							{!inFlight && s.last_error && (
 								<p className="text-sm text-destructive">
 									{m.update_error()} {s.last_error}
 								</p>
@@ -122,22 +192,24 @@ export const UpdateCard: FC<{
 									{m.update_disabled()}
 								</p>
 							) : (
-								<div className="flex items-center gap-3">
-									<Button
-										variant="outline"
-										size="sm"
-										onClick={onCheck}
-										disabled={busy}
-									>
-										{busy ? m.update_checking() : m.update_check_now()}
-									</Button>
-									{s.last_checked_unix != null && (
-										<span className="text-xs text-muted-foreground">
-											{m.update_last_checked()}{" "}
-											{new Date(s.last_checked_unix * 1000).toLocaleString()}
-										</span>
-									)}
-								</div>
+								!inFlight && (
+									<div className="flex items-center gap-3">
+										<Button
+											variant="outline"
+											size="sm"
+											onClick={onCheck}
+											disabled={checkBusy}
+										>
+											{checkBusy ? m.update_checking() : m.update_check_now()}
+										</Button>
+										{s.last_checked_unix != null && (
+											<span className="text-xs text-muted-foreground">
+												{m.update_last_checked()}{" "}
+												{new Date(s.last_checked_unix * 1000).toLocaleString()}
+											</span>
+										)}
+									</div>
+								)
 							)}
 						</>
 					)}
@@ -146,6 +218,205 @@ export const UpdateCard: FC<{
 		</Card>
 	);
 };
+
+/** The one-click leg: the Update button + its password-confirm dialog. */
+const ApplyPanel: FC<{
+	status: UpdateStatus;
+	onApplied: (target: string) => void;
+}> = ({ status, onApplied }) => {
+	const [open, setOpen] = useState(false);
+	const [password, setPassword] = useState("");
+	const [error, setError] = useState<string | null>(null);
+	const [needsForce, setNeedsForce] = useState(false);
+	const [busy, setBusy] = useState(false);
+	const target = status.manifest?.version ?? "";
+
+	const submit = async (force: boolean) => {
+		setBusy(true);
+		setError(null);
+		try {
+			// Plain fetch on purpose: apiFetch treats ANY 401 as "session expired → /login",
+			// but here a 401 is just a wrong password confirmation.
+			const res = await fetch("/api/v1/update/apply", {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				credentials: "same-origin",
+				body: JSON.stringify({ password, force }),
+			});
+			if (res.status === 202) {
+				setOpen(false);
+				setPassword("");
+				onApplied(target);
+				return;
+			}
+			const body = (await res.json().catch(() => null)) as {
+				error?: string;
+			} | null;
+			if (res.status === 401) {
+				setError(m.update_apply_wrong_password());
+			} else if (res.status === 429) {
+				setError(m.update_apply_throttled());
+			} else if (res.status === 409 && body?.error?.includes("force")) {
+				// The host refused because a stream is live — escalate to the explicit
+				// "drop the stream" confirmation instead of showing a raw error.
+				setNeedsForce(true);
+			} else {
+				setError(body?.error ?? `HTTP ${res.status}`);
+			}
+		} catch {
+			setError(m.common_error());
+		} finally {
+			setBusy(false);
+		}
+	};
+
+	return (
+		<div className="space-y-2 rounded-md border p-4">
+			<p className="text-sm">{m.update_apply_ready({ version: target })}</p>
+			<div className="flex items-center gap-3">
+				<Button size="sm" onClick={() => setOpen(true)}>
+					{m.update_apply_button()}
+				</Button>
+				<CommandLine command={status.channel_hint} />
+			</div>
+			<Dialog
+				open={open}
+				onOpenChange={(o) => {
+					setOpen(o);
+					if (!o) {
+						setPassword("");
+						setError(null);
+						setNeedsForce(false);
+					}
+				}}
+			>
+				<DialogContent>
+					<DialogHeader>
+						<DialogTitle>
+							{m.update_apply_confirm_title({ version: target })}
+						</DialogTitle>
+						<DialogDescription>
+							{needsForce
+								? m.update_apply_force_warning()
+								: m.update_apply_confirm_body()}
+						</DialogDescription>
+					</DialogHeader>
+					<form
+						className="space-y-3"
+						onSubmit={(e) => {
+							e.preventDefault();
+							void submit(needsForce);
+						}}
+					>
+						<div className="space-y-1.5">
+							<Label htmlFor="update-apply-password">
+								{m.update_apply_password_label()}
+							</Label>
+							<Input
+								id="update-apply-password"
+								type="password"
+								autoFocus
+								value={password}
+								onChange={(e) => setPassword(e.target.value)}
+								autoComplete="current-password"
+							/>
+						</div>
+						{error && <p className="text-sm text-destructive">{error}</p>}
+						<DialogFooter>
+							<Button
+								type="submit"
+								variant={needsForce ? "destructive" : "default"}
+								disabled={busy || password.length === 0}
+							>
+								{busy
+									? m.update_apply_working()
+									: needsForce
+										? m.update_apply_force_button()
+										: m.update_apply_button()}
+							</Button>
+						</DialogFooter>
+					</form>
+				</DialogContent>
+			</Dialog>
+		</div>
+	);
+};
+
+/** The in-flight panel: download progress → applying → restarting → reconnecting. */
+const ApplyProgress: FC<{
+	status: UpdateStatus;
+	reconnecting: boolean;
+	timedOut: boolean;
+}> = ({ status, reconnecting, timedOut }) => {
+	const job = status.job;
+	const pct =
+		job?.total_bytes && job.total_bytes > 0
+			? Math.min(100, Math.round((job.received_bytes / job.total_bytes) * 100))
+			: null;
+	const stageLabel = (() => {
+		if (reconnecting) return m.update_stage_reconnecting();
+		switch (job?.stage) {
+			case "downloading":
+				return pct === null
+					? m.update_stage_downloading_indeterminate()
+					: m.update_stage_downloading({ pct: String(pct) });
+			case "verifying":
+				return m.update_stage_verifying();
+			case "applying":
+				return m.update_stage_applying();
+			default:
+				return m.update_stage_restarting();
+		}
+	})();
+	return (
+		<div className="space-y-3 rounded-md border p-4">
+			<div className="flex items-center gap-3">
+				<Spinner className="size-4" />
+				<p className="text-sm font-medium">
+					{m.update_applying_title({
+						version: job?.target_version ?? status.manifest?.version ?? "",
+					})}
+				</p>
+			</div>
+			<p className="text-sm text-muted-foreground">{stageLabel}</p>
+			{job?.stage === "downloading" && pct !== null && (
+				<div className="h-1.5 w-full overflow-hidden rounded bg-muted">
+					<div
+						className="h-full rounded bg-primary transition-all"
+						style={{ width: `${pct}%` }}
+					/>
+				</div>
+			)}
+			{timedOut && (
+				<p className="rounded-md border border-amber-500/40 bg-amber-500/10 p-3 text-sm">
+					{m.update_apply_timeout()}
+				</p>
+			)}
+		</div>
+	);
+};
+
+/** Durable outcome of the last apply (written by the host across its own restart). */
+const LastResult: FC<{
+	result: NonNullable<UpdateStatus["last_result"]>;
+}> = ({ result }) =>
+	result.ok ? (
+		<p className="rounded-md border border-emerald-500/40 bg-emerald-500/10 p-3 text-sm">
+			{m.update_result_ok({ from: result.from, to: result.to })}
+		</p>
+	) : (
+		<div className="space-y-1 rounded-md border border-destructive/40 bg-destructive/5 p-3 text-sm">
+			<p className="font-medium text-destructive">
+				{m.update_result_failed({ to: result.to, stage: result.stage ?? "?" })}
+			</p>
+			{result.error && <p>{result.error}</p>}
+			{result.log_path && (
+				<p className="text-xs text-muted-foreground">
+					{m.update_result_log()} <code>{result.log_path}</code>
+				</p>
+			)}
+		</div>
+	);
 
 const UpdateRow: FC<{ label: string; value: ReactNode }> = ({
 	label,
@@ -172,7 +443,7 @@ const CommandLine: FC<{ command: string }> = ({ command }) => {
 			});
 	};
 	return (
-		<div className="flex items-center gap-2">
+		<div className="flex min-w-0 flex-1 items-center gap-2">
 			<code className="min-w-0 flex-1 overflow-x-auto rounded bg-muted px-2 py-1.5 text-xs">
 				{command}
 			</code>

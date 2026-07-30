@@ -4,6 +4,7 @@
 // PUNKTFUNK_UI_PASSWORD is unset, so a misconfigured LAN-exposed server admits no one.
 import {
 	defineEventHandler,
+	getRequestHeader,
 	getRequestURL,
 	sendRedirect,
 	setResponseStatus,
@@ -18,6 +19,24 @@ import {
 
 export default defineEventHandler(async (event) => {
 	const { pathname } = getRequestURL(event);
+
+	// Same-origin check for every MUTATING request (defense in depth beyond SameSite=Lax,
+	// added with the update-apply route where CSRF ≈ code execution — design
+	// host-update-from-web-console.md §4.3). `Sec-Fetch-Site` is browser-set and unforgeable
+	// from a page; absent (curl, very old browsers) ⇒ allowed — the console's threat here is
+	// a BROWSER being ridden cross-site, and every riding browser sends the header.
+	// `same-site` is rejected too: with an IP-address origin, another port on the same box
+	// counts as same-site, and nothing on another port has business mutating the console.
+	// Applies to public paths as well (login CSRF), before any session logic.
+	const method = event.method?.toUpperCase?.() ?? "GET";
+	if (method !== "GET" && method !== "HEAD" && method !== "OPTIONS") {
+		const site = getRequestHeader(event, "sec-fetch-site")?.toLowerCase();
+		if (site && site !== "same-origin" && site !== "none") {
+			setResponseStatus(event, 403);
+			return { error: "cross-site request refused" };
+		}
+	}
+
 	if (isPublicPath(pathname)) return;
 
 	// Misconfigured: refuse everything rather than serve open on the LAN.
