@@ -1757,6 +1757,14 @@ pub fn set_virtual_primary_ccd(keep_target_id: u32) -> Option<SavedConfig> {
     Some(saved)
 }
 
+/// The dark-sink futility latch: `(target_id, monitor_device_path)` keys of connected external
+/// displays that stayed dark THROUGH a force-EXTEND. A sink the EXTEND preset demonstrably
+/// cannot light (an off/standby TV, a KVM switched away) will not light on the next teardown
+/// either — without the latch [`restore_displays_ccd`]'s backstop re-warns and re-forces on
+/// EVERY teardown, forever (field: the off-TV box). Process-lifetime on purpose: a host restart
+/// re-probes once, in case the sink meanwhile became lightable.
+static DARK_SINKS_FUTILE: std::sync::Mutex<Vec<(u32, String)>> = std::sync::Mutex::new(Vec::new());
+
 /// Restore the topology saved by [`isolate_displays_ccd`] (teardown, before the virtual output is
 /// removed), re-activating the displays we deactivated.
 // pub so vdisplay::pf_vdisplay can reuse this backend-neutral CCD restore helper.
@@ -1792,15 +1800,41 @@ pub fn restore_displays_ccd(saved: &SavedConfig) {
     // connected, fall back to the OS database EXTEND preset, which re-activates every connected
     // display. Internal panels deliberately don't count as lit-able here — a closed clamshell
     // lid must not be forced back on.
-    let (connected, lit) = target_inventory()
+    let inventory = target_inventory();
+    let (connected, lit) = inventory
         .iter()
         .filter(|t| t.external_physical)
         .fold((0u32, 0u32), |(c, a), t| (c + 1, a + u32::from(t.active)));
     if connected > 0 && lit == 0 {
+        let dark: Vec<(u32, String)> = inventory
+            .iter()
+            .filter(|t| t.external_physical && !t.active)
+            .map(|t| (t.target_id, t.monitor_device_path.clone()))
+            .collect();
+        // The futility latch: if this exact dark set already survived a force-EXTEND, the sink
+        // cannot light (off/standby TV) — re-warning and re-forcing every teardown is noise
+        // that reads like a new failure in every field log. The poisoned-snapshot chain the
+        // backstop exists for is NOT latched away: there the panel CAN light, so the first
+        // force succeeds and the latch stays clear.
+        if *DARK_SINKS_FUTILE.lock().unwrap() == dark {
+            tracing::debug!(
+                connected,
+                "display isolate (CCD): the connected external display(s) stayed dark through \
+                 an earlier force-EXTEND — an unlightable sink (off/standby TV), not a failed \
+                 restore; leaving the topology be"
+            );
+            return;
+        }
         tracing::warn!(
             "display isolate (CCD): no external physical display active after the restore (rc={rc:#x}, connected={connected}) — forcing the EXTEND preset so the desk is not left dark"
         );
         force_extend_topology();
+        // Measure what the force achieved: a sink still dark AFTER the EXTEND preset can never
+        // be lit by it, so remember the set and stop re-forcing. Anything lit clears the latch.
+        let lit_after = target_inventory()
+            .iter()
+            .any(|t| t.external_physical && t.active);
+        *DARK_SINKS_FUTILE.lock().unwrap() = if lit_after { Vec::new() } else { dark };
     }
 }
 
