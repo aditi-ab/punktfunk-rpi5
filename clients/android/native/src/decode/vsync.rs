@@ -79,15 +79,23 @@ impl VsyncShared {
     }
 
     /// The release target for a frame submitted at `now`: the earliest stored timeline whose
-    /// deadline is still `margin` away, extrapolated forward by whole periods once the stored
-    /// set has aged out (timelines refresh once per vsync callback; a frame can decode anywhere
-    /// inside that window). `None` on the 31/32 fallback — the caller releases ASAP.
+    /// EXPECTED PRESENT is still `margin` away, extrapolated forward by whole periods once the
+    /// stored set has aged out (timelines refresh once per vsync callback; a frame can decode
+    /// anywhere inside that window). `None` on the 31/32 fallback — the caller releases ASAP.
+    ///
+    /// Gated on `expected_present`, NOT the timeline's `deadline`, on purpose: the deadline
+    /// budgets for GPU rendering the app has yet to submit (`presDeadline` — 11.3 ms on the
+    /// A024, more than a full 120 Hz period), but a video buffer is already fully rendered —
+    /// the only real constraint is SurfaceFlinger's own latch lead, which is what the caller's
+    /// `margin` represents. Targeting by deadline cost every frame an extra refresh of waiting
+    /// (measured: latch p50 ~21 ms vs the ~2-interval floor); a mis-gamble here just means the
+    /// frame presents one vsync later — exactly what the conservative gate always paid.
     ///
     /// The picked target is then SUBDIVIDED onto the panel grid: the platform reports timelines
     /// at the app's assigned render rate, but the panel latches at its own — when the app is
     /// down-rated (60 Hz callbacks on a 120 Hz panel) the reported timelines are a whole panel
     /// period apart or more, and pacing to them would cap the video. Pulling the target earlier
-    /// by whole panel periods (while its deadline still clears the margin) restores the true
+    /// by whole panel periods (while its present still clears the margin) restores the true
     /// grid; when callbacks run at the panel rate the pull condition is never true and this is
     /// a no-op.
     pub(super) fn next_target(&self, now_ns: i64, margin_ns: i64) -> Option<FrameTimeline> {
@@ -98,7 +106,7 @@ impl VsyncShared {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let found = g
                 .iter()
-                .find(|t| t.deadline_ns > now_ns + margin_ns)
+                .find(|t| t.expected_present_ns > now_ns + margin_ns)
                 .copied();
             match found {
                 Some(t) => t,
@@ -109,8 +117,8 @@ impl VsyncShared {
                         return None;
                     }
                     // All stored timelines have passed — step the last one forward whole
-                    // periods until its deadline clears `now + margin` again.
-                    let behind = (now_ns + margin_ns).saturating_sub(last.deadline_ns);
+                    // periods until its present clears `now + margin` again.
+                    let behind = (now_ns + margin_ns).saturating_sub(last.expected_present_ns);
                     let k = behind / period + 1;
                     FrameTimeline {
                         expected_present_ns: last.expected_present_ns + k * period,
@@ -121,7 +129,7 @@ impl VsyncShared {
         };
         let panel = self.panel_period_ns.load(Ordering::Relaxed);
         if panel > 0 {
-            while t.deadline_ns - panel > now_ns + margin_ns {
+            while t.expected_present_ns - panel > now_ns + margin_ns {
                 t.deadline_ns -= panel;
                 t.expected_present_ns -= panel;
             }

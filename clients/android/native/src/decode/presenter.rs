@@ -27,10 +27,13 @@ use super::display::DisplayTracker;
 use super::latency::now_realtime_ns;
 use super::vsync::VsyncShared;
 
-/// Submit-margin ahead of a timeline's deadline: the released buffer still has to travel
-/// codec → BufferQueue → SurfaceFlinger's latch, so a deadline closer than this is treated as
-/// missed and the next timeline is targeted.
-const DEADLINE_MARGIN_NS: i64 = 1_000_000;
+/// Submit-margin ahead of a timeline's EXPECTED PRESENT — SurfaceFlinger's own latch lead: the
+/// released buffer must be in the BufferQueue by SF's wakeup for that vsync (a few ms before
+/// present). A present closer than this is treated as missed and the next one is targeted. This
+/// is deliberately NOT the timeline's `deadline` (which budgets for GPU rendering a video
+/// buffer doesn't do — see `VsyncShared::next_target`); a too-tight gamble here presents one
+/// vsync later, the exact cost the deadline gate paid on every frame.
+const LATCH_MARGIN_NS: i64 = 4_000_000;
 
 /// The budget's liveness backstop: a release whose predicted latch never seems to arrive
 /// (clock glitch, mode switch) force-reopens the budget this long after the release, counted in
@@ -278,7 +281,7 @@ impl Presenter {
             return false;
         }
         // Release: timeline-timed when the clock has one, ASAP otherwise.
-        let target = clock.and_then(|c| c.next_target(now_mono_ns, DEADLINE_MARGIN_NS));
+        let target = clock.and_then(|c| c.next_target(now_mono_ns, LATCH_MARGIN_NS));
         let released = match target {
             Some(t) => codec
                 .release_output_buffer_at_time_by_index(frame.index, t.expected_present_ns)
@@ -292,12 +295,14 @@ impl Presenter {
             return false; // the buffer is gone either way; nothing to book-keep
         }
         let period = clock.map(|c| c.period_ns()).filter(|&p| p > 0);
-        // Reopen at the target's DEADLINE, not its present time: SurfaceFlinger consumes the
-        // queued buffer at its latch (≈ the deadline) — that is when the queue slot frees and a
-        // new release can target the NEXT refresh. Reopening a period later (at present time)
-        // would cap the sustainable release rate at roughly half the panel rate.
+        // Reopen at SurfaceFlinger's LATCH for the targeted vsync (expected present minus the
+        // latch lead) — the instant SF consumes the queued buffer and the slot frees, so the
+        // next release can target the NEXT refresh. Not the platform `deadline` (with the
+        // aggressive present gate it can already be in the past — an instant reopen would let
+        // two releases pile onto the same vsync) and not the present time itself (a period too
+        // late — it would cap the sustainable rate at roughly half the panel).
         let reopen_at_ns = target
-            .map(|t| t.deadline_ns)
+            .map(|t| t.expected_present_ns - LATCH_MARGIN_NS)
             .unwrap_or(now_mono_ns + period.unwrap_or(FALLBACK_PERIOD_NS));
         self.inflight = Some(InFlight {
             reopen_at_ns,
