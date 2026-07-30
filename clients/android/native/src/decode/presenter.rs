@@ -33,7 +33,13 @@ use super::vsync::VsyncShared;
 /// is deliberately NOT the timeline's `deadline` (which budgets for GPU rendering a video
 /// buffer doesn't do — see `VsyncShared::next_target`); a too-tight gamble here presents one
 /// vsync later, the exact cost the deadline gate paid on every frame.
-const LATCH_MARGIN_NS: i64 = 4_000_000;
+///
+/// 2.5 ms: SF's latch runs ~1-2 ms before present on modern devices (its `sfOffset`), and the
+/// release itself is a binder call well under a ms. 4 ms measured latch p50 8-10; each ms cut
+/// here is a ms off every frame's display stage. If a device misses at this margin the `paced`
+/// counter shows it (a miss presents one vsync later, coalescing the next frame) — that is the
+/// signal to widen, not stutter.
+const LATCH_MARGIN_NS: i64 = 2_500_000;
 
 /// The budget's liveness backstop: a release whose predicted latch never seems to arrive
 /// (clock glitch, mode switch) force-reopens the budget this long after the release, counted in
