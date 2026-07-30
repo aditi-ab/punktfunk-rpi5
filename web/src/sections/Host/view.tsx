@@ -14,7 +14,9 @@ export const HostView: FC<{
 	compositors: Loadable<AvailableCompositor[]>;
 	/** The GPU inventory/selection card (a self-contained container — see `GpuCard.tsx`). */
 	gpu?: ReactNode;
-}> = ({ host, compositors, gpu }) => {
+	/** The update-check card (a self-contained container — see `UpdateCard.tsx`). */
+	update?: ReactNode;
+}> = ({ host, compositors, gpu, update }) => {
 	const h = host.data;
 	return (
 		<Section maxWidth={false}>
@@ -87,6 +89,8 @@ export const HostView: FC<{
 						</div>
 					)}
 				</QueryState>
+
+				{update}
 
 				{gpu}
 

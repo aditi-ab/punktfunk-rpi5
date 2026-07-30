@@ -439,5 +439,22 @@
 	"display_monitor_unsupported": "Streaming one of these screens isn't supported on this host yet — it's available on Linux hosts only. The screens are listed so you can see what this computer has; clients keep getting their own virtual screen.",
 	"display_monitor_primary": "primary",
 	"display_monitor_disabled": "off",
-	"display_monitor_saved": "Streamed screen saved"
+	"display_monitor_saved": "Streamed screen saved",
+	"update_title": "Updates",
+	"update_available_badge": "Update available",
+	"update_current": "Installed",
+	"update_install_kind": "Install type",
+	"update_latest": "Latest release",
+	"update_notes": "Release notes",
+	"update_up_to_date": "You're up to date.",
+	"update_how": "Update this host with:",
+	"update_check_now": "Check now",
+	"update_checking": "Checking…",
+	"update_last_checked": "Last checked",
+	"update_never_checked": "Not checked yet",
+	"update_stale": "The update feed hasn't changed in over 45 days — checks succeed but nothing new arrives. If that seems wrong, check this host's connectivity to git.unom.io.",
+	"update_disabled": "Update checks are disabled on this host (PUNKTFUNK_UPDATE_CHECK=0).",
+	"update_error": "Last check failed:",
+	"update_copy": "Copy",
+	"update_copied": "Copied"
 }

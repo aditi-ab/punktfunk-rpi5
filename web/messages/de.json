@@ -439,5 +439,22 @@
 	"display_monitor_unsupported": "Das Übertragen eines dieser Bildschirme wird auf diesem Host noch nicht unterstützt — das gibt es bisher nur auf Linux-Hosts. Die Bildschirme sind hier aufgeführt, damit du siehst, was dieser Computer hat; Clients bekommen weiterhin ihren eigenen virtuellen Bildschirm.",
 	"display_monitor_primary": "primär",
 	"display_monitor_disabled": "aus",
-	"display_monitor_saved": "Übertragener Bildschirm gespeichert"
+	"display_monitor_saved": "Übertragener Bildschirm gespeichert",
+	"update_title": "Updates",
+	"update_available_badge": "Update verfügbar",
+	"update_current": "Installiert",
+	"update_install_kind": "Installationsart",
+	"update_latest": "Neueste Version",
+	"update_notes": "Versionshinweise",
+	"update_up_to_date": "Du bist auf dem neuesten Stand.",
+	"update_how": "Diesen Host aktualisieren mit:",
+	"update_check_now": "Jetzt prüfen",
+	"update_checking": "Prüfe…",
+	"update_last_checked": "Zuletzt geprüft",
+	"update_never_checked": "Noch nicht geprüft",
+	"update_stale": "Der Update-Feed hat sich seit über 45 Tagen nicht geändert — Prüfungen gelingen, aber es kommt nichts Neues an. Falls das nicht stimmen kann, prüfe die Verbindung dieses Hosts zu git.unom.io.",
+	"update_disabled": "Update-Prüfungen sind auf diesem Host deaktiviert (PUNKTFUNK_UPDATE_CHECK=0).",
+	"update_error": "Letzte Prüfung fehlgeschlagen:",
+	"update_copy": "Kopieren",
+	"update_copied": "Kopiert"
 }
