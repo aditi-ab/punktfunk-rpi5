@@ -391,6 +391,33 @@ jobs:
       # error 3)" and took the whole job with it. ~1 min of rebuild is the correct price; the
       # same rotation is why the other Windows jobs use a fixed C:\t instead of a cached
       # workspace-relative target.
+      # Every payload this job is SUPPOSED to bundle, asserted before packing. The packer treats each
+      # one as optional — correct for a local debug pack, and the reason 0.22.1/0.22.2 shipped with no
+      # web console: an unset WEB_OUTPUT_DIR omitted it behind a single Write-Host. CI knows it bundles
+      # all of these, so here a missing input is a build failure rather than a quietly smaller
+      # installer. (pack-host-installer.ps1 already does this for VB-CABLE, for the same reason.)
+      - name: Verify every installer payload is present
+        shell: pwsh
+        run: |
+          $need = @(
+            @{ n = 'web console (WEB_OUTPUT_DIR)';    p = $env:WEB_OUTPUT_DIR;   f = 'server\index.mjs' }
+            @{ n = 'bun runtime (BUN_EXE)';           p = $env:BUN_EXE;          f = '' }
+            @{ n = 'plugin runner (SCRIPTING_BUNDLE)';p = $env:SCRIPTING_BUNDLE; f = '' }
+            @{ n = 'FFmpeg DLLs (FFMPEG_DIR\bin)';    p = $env:FFMPEG_DIR;       f = 'bin' }
+            @{ n = 'VB-CABLE (VBCABLE_DIR)';          p = $env:VBCABLE_DIR;      f = 'VBCABLE_Setup_x64.exe' }
+          )
+          $missing = @()
+          foreach ($x in $need) {
+            if (-not $x.p) { $missing += "$($x.n): env var not set"; continue }
+            $full = if ($x.f) { Join-Path $x.p $x.f } else { $x.p }
+            if (-not (Test-Path $full)) { $missing += "$($x.n): missing $full" }
+            else { Write-Output "payload OK - $($x.n) -> $full" }
+          }
+          if ($missing.Count) {
+            $missing | ForEach-Object { Write-Output "MISSING PAYLOAD - $_" }
+            throw "$($missing.Count) installer payload(s) missing - refusing to ship an incomplete installer"
+          }
+
       - name: Pack + sign installer
         shell: pwsh
         env:
