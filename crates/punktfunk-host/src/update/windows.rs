@@ -43,6 +43,24 @@ fn staging_dir() -> PathBuf {
     pf_paths::config_dir().join("updates")
 }
 
+/// Put the per-user tray back after an update that killed it.
+///
+/// Runs from boot reconciliation, i.e. in the NEW host, as SYSTEM — so `crate::tray::start` takes
+/// its session-crossing path and lands the tray in the active console session under the logged-in
+/// user's own token. That is the whole reason this is the host's job and not the installer's (see
+/// `IntentRecord::tray_was_running`).
+///
+/// Best-effort throughout: nobody's update outcome depends on the icon, and the common benign
+/// failure is simply that nobody has signed in yet — which the HKLM `Run` value covers at the next
+/// logon. Hence `info`, not a warning the operator must act on.
+pub(crate) fn relaunch_tray() {
+    match crate::tray::start() {
+        Ok((Some(pid), how)) => tracing::info!(pid, how, "status tray relaunched after the update"),
+        Ok((None, _)) => tracing::debug!("status tray was already running after the update"),
+        Err(e) => tracing::info!(error = %e, "could not relaunch the status tray after the update"),
+    }
+}
+
 fn log_path(version: &str) -> PathBuf {
     pf_paths::config_dir()
         .join("logs")
@@ -96,6 +114,10 @@ pub(super) fn run_apply(
             installer_sha256: asset.sha256.to_ascii_lowercase(),
             log_path: log.display().to_string(),
             source_build: false,
+            // Captured BEFORE the installer runs: it force-kills every tray to unlock
+            // punktfunk-tray.exe and, under /VERYSILENT, never runs its relaunch entry. See
+            // `IntentRecord::tray_was_running`; `relaunch_tray` puts it back at reconcile.
+            tray_was_running: crate::tray::is_running(),
         },
     )
     .map_err(|e| ("applying", format!("write intent record: {e}")))?;

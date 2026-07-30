@@ -42,6 +42,23 @@ pub(crate) struct IntentRecord {
     /// intent with this flag still present at boot ⟹ the rebuild succeeded.
     #[serde(default)]
     pub source_build: bool,
+    /// A per-user status tray was running when we spawned the installer, so boot reconciliation
+    /// should put it back.
+    ///
+    /// The installer's `StopTrays` force-kills every session's `punktfunk-tray.exe` (it is one of
+    /// the files being replaced), and its `[Run]` relaunch carries `skipifsilent` — which a
+    /// console-initiated update, spawned with `/VERYSILENT`, always trips. The tray therefore died
+    /// on every in-console update and stayed dead until the next sign-in. The installer cannot fix
+    /// this itself: spawned from the SYSTEM host service, its `runasoriginaluser` resolves to
+    /// SYSTEM, which would put a SYSTEM-owned tray in the user's session squatting the
+    /// `Local\PunktfunkTray` mutex and blocking the real one. The host relaunches it instead — it
+    /// already owns the `WTSQueryUserToken` primitive for landing a process in the interactive
+    /// session as the logged-in user.
+    ///
+    /// `#[serde(default)]`: an intent written by an older host reads as false (no relaunch), which
+    /// is the pre-existing behaviour.
+    #[serde(default)]
+    pub tray_was_running: bool,
 }
 
 /// The durable outcome of the most recent apply attempt.
@@ -189,7 +206,19 @@ mod tests {
             installer_sha256: "ab".repeat(32),
             log_path: "/logs/update-0.23.200.log".into(),
             source_build: false,
+            tray_was_running: false,
         }
+    }
+
+    /// An intent written by a host from before the tray-relaunch field must still load, and read
+    /// as "no tray to put back" — the behaviour that shipped before it existed.
+    #[test]
+    fn an_intent_without_the_tray_field_deserializes_as_false() {
+        let json = r#"{"from":"0.23.100","to":"0.23.200","serial":42,"started_unix":1000,
+            "installer_sha256":"ab","log_path":"/logs/x.log"}"#;
+        let i: IntentRecord = serde_json::from_str(json).expect("older intent still parses");
+        assert!(!i.tray_was_running);
+        assert!(!i.source_build);
     }
 
     #[test]

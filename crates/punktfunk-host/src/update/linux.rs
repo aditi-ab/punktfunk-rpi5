@@ -140,6 +140,9 @@ pub(super) fn run_apply_steamos(
             installer_sha256: String::new(),
             log_path: log.display().to_string(),
             source_build: true,
+            // Windows-only concern: no Linux package force-kills a running tray, and the desktop
+            // autostart entry owns bringing it up.
+            tray_was_running: false,
         },
     )
     .map_err(|e| ("applying", format!("write intent record: {e}")))?;
@@ -349,6 +352,7 @@ pub(super) fn run_apply(
             installer_sha256: String::new(),
             log_path: "journalctl -u punktfunk-update.service".into(),
             source_build: false,
+            tray_was_running: false, // Windows-only concern (see the source-build intent above)
         },
     )
     .map_err(|e| ("restarting", format!("write intent record: {e}")))?;
