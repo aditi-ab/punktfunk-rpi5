@@ -16,7 +16,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(clippy::undocumented_unsafe_blocks)]
 
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 
 use pf_driver_proto::gamepad::PadShm;
 use pf_umdf_util::channel::{ChannelClient, ChannelConfig};
@@ -379,8 +379,6 @@ static CHANNEL: ChannelClient = ChannelClient::new();
 /// 3 = Steam Deck) — the neutral-report shape when the channel detaches, and the fallback identity
 /// while unattached.
 static LAST_DEVTYPE: AtomicU32 = AtomicU32::new(0);
-/// device_type()'s bounded first-read wait fires at most once (see its docs).
-static DEVTYPE_WAITED: AtomicBool = AtomicBool::new(false);
 /// The identity resolved from the devnode's PnP hardware ids at `EvtDeviceAdd` ([`devtype_from_hwids`]);
 /// `u32::MAX` = not resolved. See [`device_type`] for why this exists.
 static PNP_DEVTYPE: AtomicU32 = AtomicU32::new(u32::MAX);
@@ -470,6 +468,13 @@ fn file_appender() -> Option<&'static std::sync::Mutex<std::fs::File>> {
 }
 
 fn log(s: &str) {
+    // Gated as a whole on [`file_log_enabled`] (the pf-xusb/pf-mouse treatment): `OutputDebugStringA`
+    // used to fire unconditionally — a syscall + CString alloc per logged event in a RELEASE driver,
+    // on per-IOCTL paths (the OUTPUT hex dumps during rumble, the cyclic GET_STRING polls). Debug
+    // builds and the env-var opt-in keep the full debug-string + file tee.
+    if !file_log_enabled() {
+        return;
+    }
     if let Ok(c) = std::ffi::CString::new(s) {
         // SAFETY: c is a valid null-terminated string for the duration of the call.
         unsafe { OutputDebugStringA(c.as_ptr().cast()) };
@@ -481,7 +486,8 @@ fn log(s: &str) {
         let _ = writeln!(f, "{s}");
     }
 }
-macro_rules! dbglog { ($($a:tt)*) => { log(&format!($($a)*)) } }
+// The `file_log_enabled()` pre-check skips the `format!` alloc too when logging is off.
+macro_rules! dbglog { ($($a:tt)*) => { if file_log_enabled() { log(&format!($($a)*)) } } }
 
 #[unsafe(export_name = "DriverEntry")]
 pub unsafe extern "system" fn driver_entry(
@@ -979,7 +985,10 @@ fn on_get_string(request: &Request) -> NTSTATUS {
 ///
 /// [`PNP_DEVTYPE`] closes it: the devnode's hardware ids carry the identity and are readable at
 /// `EvtDeviceAdd`, before anything is asked. The section stays authoritative once attached (same
-/// host wrote both), and the bounded wait survives only for a devnode whose ids matched nothing.
+/// host wrote both). NO in-dispatch wait remains: the old 1 s bounded pump loop could only run
+/// for a devnode whose ids matched nothing, where its own premise above guarantees the timeout —
+/// it burned a second of a WUDFHost dispatch thread mid-enumeration and then fell back to
+/// [`LAST_DEVTYPE`] anyway (which the 8 ms timer keeps fresh whenever the section is attached).
 fn device_type() -> u8 {
     if let Some(view) = CHANNEL.data() {
         let t = view.read_u8(OFF_DEVICE_TYPE);
@@ -990,20 +999,6 @@ fn device_type() -> u8 {
     if pnp != u32::MAX {
         return pnp as u8;
     }
-    if !DEVTYPE_WAITED.swap(true, Ordering::SeqCst) {
-        let cfg = channel_cfg();
-        for _ in 0..100 {
-            if let Some(view) = CHANNEL.pump(&cfg) {
-                let t = view.read_u8(OFF_DEVICE_TYPE);
-                LAST_DEVTYPE.store(t as u32, Ordering::Relaxed);
-                return t;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        dbglog!(
-            "[pf-gamepad] device_type: sealed channel not attached within 1s — defaulting to the last observed identity"
-        );
-    }
     LAST_DEVTYPE.load(Ordering::Relaxed) as u8
 }
 
@@ -1012,6 +1007,10 @@ extern "C" fn evt_timer(timer: WDFTIMER) {
     // latest host input report from the attached DATA section (all safe, via pf_umdf_util).
     match CHANNEL.pump(&channel_cfg()) {
         Some(view) => {
+            // Keep the fallback identity fresh: `device_type()`'s last resort (channel detached,
+            // no PnP match) reads LAST_DEVTYPE, and this tick is the one place that always sees
+            // the attached section.
+            LAST_DEVTYPE.store(view.read_u8(OFF_DEVICE_TYPE) as u32, Ordering::Relaxed);
             let mut buf = [0u8; 64];
             view.read_bytes(OFF_INPUT, &mut buf);
             if buf[0] == 0x01
