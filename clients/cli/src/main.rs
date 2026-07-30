@@ -59,7 +59,131 @@ punktfunk — the Punktfunk client, headless
 
 A <host-ref> is a saved host's id, its name, or an address — the same reference a
 punktfunk:// link takes. Exit codes: 0 ok, 2 connect, 3 trust, 4 renderer, 5 not found,
-6 needs a person.";
+6 needs a person.
+
+\"punktfunk help <command>\" (or any command with --help) explains that command.";
+
+    /// The long help for one verb — `punktfunk help <verb>`, or `--help` after the verb.
+    /// Each entry documents its flags and the behaviour a script would need to know
+    /// (what goes to stdout vs stderr, and which exit codes mean what).
+    fn verb_help(verb: &str) -> Option<&'static str> {
+        Some(match verb {
+            "pair" => {
+                "\
+punktfunk pair <host[:port]> — enrol this device with a host (PIN ceremony)
+
+  --pin N       the PIN the host is showing; without it the command asks, and
+                refuses (exit 6) when there is no terminal to ask on
+  --name LABEL  the label the host files this device under
+                (default: this machine's name)
+
+Pairing verifies the host end-to-end and pins its fingerprint in the saved-hosts
+store, so every later connect — here, in the desktop client or the console — is
+silent. The port defaults to 9777. Prints `paired <addr>:<port> fp=<hex>` on
+success; exit 3 if the host refuses or the PIN is wrong."
+            }
+            "hosts" => {
+                "\
+punktfunk hosts — the saved-hosts store (shared with the desktop client)
+
+  punktfunk hosts list [--probe] [--json]
+      Every saved host, name TAB addr:port TAB paired/trusted TAB state.
+      --probe asks each host directly (no mDNS, so routed/VPN hosts answer
+      too); --json emits one object with per-host detail, profiles included.
+
+  punktfunk hosts add <host[:port]> [--name LABEL] [--fp HEX]
+      Save a host by address — the door for a box mDNS never sees (Tailscale,
+      another subnet). Without --fp it is a placeholder to pair later; with a
+      64-hex fingerprint it is pinned immediately (still unpaired).
+
+  punktfunk hosts forget <host-ref>
+      Remove a saved host, its pinned fingerprint included. A later connect
+      must pair or trust it again."
+            }
+            "wake" => {
+                "\
+punktfunk wake <host-ref> [--wait] — Wake-on-LAN
+
+Sends a magic packet to a saved host's MAC (learned from its advert while it
+was awake; exit 5 if none is known yet). With --wait, keeps sending every 6 s
+and polls presence every second for up to 90 s, exiting 0 the moment the host
+answers — the same cadence every graphical shell uses."
+            }
+            "library" => {
+                "\
+punktfunk library <host-ref> [--json] — the host's game library
+
+TSV on stdout by default (id TAB store TAB title), one game per line; --json
+emits {\"games\":[…]} for tools — the Playnite importer shells to exactly
+this. Needs a paired host (exit 6 otherwise)."
+            }
+            "launch" => {
+                "\
+punktfunk launch <host-ref> [--game ID] [--profile REF] [--exec] [--fullscreen]
+
+Start a stream — waking the host first if it is asleep and its MAC is known.
+The stream runs in the punktfunk-session renderer; this command supervises it
+and relays its lifecycle to stderr.
+
+  --game ID      ask the host to launch this library title into the stream
+  --profile REF  use a settings profile (id or name) for this connect only;
+                 without it the host's own binding applies
+  --fullscreen   start the stream window fullscreen
+  --exec         become the session process instead of supervising it — the
+                 gamescope-wrapper mode, where the launched process must BE
+                 the streaming one for focus and lifecycle to work
+
+Exit 0 when the stream ends cleanly, 2 connect failed, 3 the host no longer
+trusts this device (re-pair), 4 the renderer could not start."
+            }
+            "open" => {
+                "\
+punktfunk open <punktfunk://…> — follow a punktfunk:// link, headless
+
+Same parser and same refusal rules as clicking the link in a shell: a
+contradicted fingerprint refuses and says so, an ambiguous name refuses
+rather than guessing, and an unknown host is never trusted from a URL —
+that is a decision for a person, at a surface that can show the fingerprint
+(exit 6 points at `punktfunk pair`). --exec as in launch."
+            }
+            "reachable" => {
+                "\
+punktfunk reachable <host-ref> — one bounded reachability probe
+
+Asks the host directly (no mDNS), so routed/VPN hosts answer too. The
+reference may be an unsaved address — this verb answers \"can I reach it\",
+not \"do I know it\". Exit 0 reachable, 2 not; one line either way."
+            }
+            "speed-test" => {
+                "\
+punktfunk speed-test <host-ref> [--json] — measure the real data plane
+
+Runs the host's bandwidth probe over an actual session connect and prints the
+measured throughput, loss, and the bitrate it recommends. Deliberately does
+NOT apply the result: which layer a bitrate belongs in (a bound profile, the
+global default) is a decision the GUI makes with the user, and a CLI silently
+rewriting settings would be exactly the surprise that rule exists to prevent."
+            }
+            "profiles" => {
+                "\
+punktfunk profiles list [--json] — the settings profiles on this device
+
+One line per profile: id TAB name TAB how many settings it overrides.
+Profiles are created and edited in the desktop client; a connect uses one via
+`punktfunk launch --profile` or a punktfunk:// link that names it."
+            }
+            "reset" => {
+                "\
+punktfunk reset — forget every saved host and reset stream settings
+
+Asks for confirmation, and refuses (exit 6) when there is no terminal to ask
+on. This device's identity keypair is deliberately kept, so hosts that knew
+this machine still recognise it after re-pairing; delete the identity files
+from the config directory for a true factory reset."
+            }
+            _ => return None,
+        })
+    }
 
     /// The value after `--flag`, if any.
     fn value(args: &[String], flag: &str) -> Option<String> {
@@ -138,6 +262,12 @@ punktfunk:// link takes. Exit codes: 0 ok, 2 connect, 3 trust, 4 renderer, 5 not
             return OK;
         };
         let rest: Vec<String> = args[1..].to_vec();
+        // `--help`/`-h` after any verb prints that verb's help — before dispatch, so a verb
+        // never mistakes the flag for its subject (`punktfunk pair -h` must not dial "-h").
+        if rest.iter().any(|a| a == "--help" || a == "-h") {
+            println!("{}", verb_help(&verb).unwrap_or(USAGE));
+            return OK;
+        }
         match verb.as_str() {
             "pair" => pair(&rest),
             "hosts" => hosts(&rest),
@@ -149,10 +279,22 @@ punktfunk:// link takes. Exit codes: 0 ok, 2 connect, 3 trust, 4 renderer, 5 not
             "speed-test" => speed_test(&rest),
             "profiles" => profiles(&rest),
             "reset" => reset(),
-            "-h" | "--help" | "help" => {
-                println!("{USAGE}");
-                OK
-            }
+            "-h" | "--help" | "help" => match positional(&rest, 0) {
+                None => {
+                    println!("{USAGE}");
+                    OK
+                }
+                Some(topic) => match verb_help(&topic) {
+                    Some(h) => {
+                        println!("{h}");
+                        OK
+                    }
+                    None => {
+                        eprintln!("no command called \"{topic}\"\n\n{USAGE}");
+                        UNRESOLVED
+                    }
+                },
+            },
             "--version" | "version" => {
                 println!("punktfunk {}", env!("CARGO_PKG_VERSION"));
                 OK
@@ -600,10 +742,17 @@ punktfunk:// link takes. Exit codes: 0 ok, 2 connect, 3 trust, 4 renderer, 5 not
             return UNRESOLVED;
         };
         // An address that isn't saved is still a legitimate thing to probe — this verb answers
-        // "can I reach this?", not "do I know this?".
-        let (addr, port) = match resolve(&reference) {
-            Ok((known, i)) => (known.hosts[i].addr.clone(), known.hosts[i].port),
-            Err(_) => split_host_port(&reference),
+        // "can I reach this?", not "do I know this?". Resolved QUIETLY for the same reason:
+        // `resolve`'s "pair it first" advice is for verbs that need a saved host, and printing
+        // it here would scold the exact usage this verb documents.
+        let known = KnownHosts::load();
+        let link = DeepLink {
+            host_ref: reference.clone(),
+            ..Default::default()
+        };
+        let (addr, port) = match deeplink::resolve_host(&link, &known) {
+            HostResolution::Known(i) => (known.hosts[i].addr.clone(), known.hosts[i].port),
+            _ => split_host_port(&reference),
         };
         if punktfunk_core::client::NativeClient::probe(&addr, port, PROBE_TIMEOUT) {
             println!("reachable {addr}:{port}");
@@ -769,15 +918,7 @@ punktfunk:// link takes. Exit codes: 0 ok, 2 connect, 3 trust, 4 renderer, 5 not
     /// Is stdin a terminal? Decides whether a verb may ask a question or must refuse with
     /// [`NEEDS_INTERACTION`] — a CLI that blocks a CI job on a prompt is a hang, not a UX.
     fn is_tty() -> bool {
-        #[cfg(unix)]
-        {
-            // SAFETY-free check: `isatty` via the std file descriptor, without libc.
-            std::io::IsTerminal::is_terminal(&std::io::stdin())
-        }
-        #[cfg(not(unix))]
-        {
-            std::io::IsTerminal::is_terminal(&std::io::stdin())
-        }
+        std::io::IsTerminal::is_terminal(&std::io::stdin())
     }
 
     #[cfg(test)]
@@ -818,6 +959,32 @@ punktfunk:// link takes. Exit codes: 0 ok, 2 connect, 3 trust, 4 renderer, 5 not
             assert_eq!(split_host_port("desk:1234"), ("desk".into(), 1234));
             // Not a port: keep the whole thing as the address rather than inventing one.
             assert_eq!(split_host_port("desk:nope"), ("desk:nope".into(), 9777));
+        }
+
+        /// Every advertised verb documents itself — a USAGE line without a help entry is a
+        /// promise `help <verb>` breaks. The overview and each entry must also name the verb.
+        #[test]
+        fn every_usage_verb_has_help() {
+            for verb in [
+                "pair",
+                "hosts",
+                "wake",
+                "library",
+                "launch",
+                "open",
+                "reachable",
+                "speed-test",
+                "profiles",
+                "reset",
+            ] {
+                let h = verb_help(verb).unwrap_or_else(|| panic!("no help for {verb}"));
+                assert!(
+                    h.starts_with(&format!("punktfunk {verb}")),
+                    "help for {verb} must lead with its own invocation"
+                );
+                assert!(USAGE.contains(verb), "USAGE must advertise {verb}");
+            }
+            assert!(verb_help("bogus").is_none());
         }
 
         #[test]
