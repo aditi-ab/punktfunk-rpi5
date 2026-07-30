@@ -476,6 +476,9 @@
 	"update_stage_restarting": "Der Host startet neu…",
 	"update_stage_reconnecting": "Warte, bis der Host wieder da ist…",
 	"update_result_ok": "Aktualisiert {from} → {to}.",
+	"update_result_staged": "Update auf {to} ist vorbereitet — zum Abschließen den Host neu starten.",
+	"update_result_noop": "Deine Paketquelle hatte noch nichts Neueres — in ein paar Minuten erneut versuchen.",
+	"update_opt_in": "Um Ein-Klick-Updates von hier zu aktivieren, einmal auf dem Host ausführen (danach ab- und wieder anmelden):",
 	"update_result_failed": "Update auf {to} ist in Phase {stage} fehlgeschlagen.",
 	"update_result_log": "Installer-Log:"
 }

@@ -50,8 +50,27 @@ Every attempt leaves a result in the card (and an installer log under
 failed update is never silent. To disable the button entirely on a host, set
 `PUNKTFUNK_UPDATE_APPLY=0` in `host.env`; the card then shows the manual command instead.
 
-One-click updating for the Linux install methods is on the way — it will be opt-in per host
-(joining a `punktfunk-update` group) because it needs a narrowly-scoped root helper.
+## One-click updating (Linux — opt-in)
+
+The apt, dnf, Bazzite-sysext, and rpm-ostree installs can one-click update too, via a small
+root helper the packages ship (`pf-update` + a `punktfunk-update.service` oneshot). It's **off
+until you opt in**, because a web button that ends in root deserves an explicit decision:
+
+```bash
+sudo usermod -aG punktfunk-update $USER    # then log out and back in
+```
+
+That group membership is the entire grant — a polkit rule lets its members start exactly that
+one service, whose only job is "run this system's normal package update for the punktfunk
+packages, then prove the new binary runs". The button never chooses versions or URLs; your
+package manager's own signed repositories stay the source of truth. The card shows the opt-in
+command until you've done this, and the manual command always keeps working.
+
+Notes per method: on **rpm-ostree** the update is staged and the card will say so — reboot to
+finish (the console never reboots your machine). On **Arch/pacman** the button additionally
+requires `PACMAN_FULL_SYSUPGRADE=1` in `/etc/punktfunk/update.conf`, because the only safe
+pacman update is a full `pacman -Syu` — partial upgrades are how Arch boxes break, and we
+won't run one. After a successful update the host restarts itself and the page reconnects.
 
 ## Turning the check off
 

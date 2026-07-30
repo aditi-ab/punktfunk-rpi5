@@ -48,14 +48,15 @@ export const UpdateSection: FC = () => {
 	const check = useForceUpdateCheck();
 
 	const s = status.data;
-	// The apply resolved: the host answers with the target version (success — reconcile wrote
-	// last_result), or reports a failed attempt at our target.
+	// The apply resolved: either the host answers with the target version (reconcile wrote
+	// last_result across the restart), or ANY apply outcome newer than our start arrived —
+	// which covers failure, "staged, reboot to finish", and "your package source had nothing
+	// newer yet" (where the version deliberately doesn't change).
 	if (applying && s) {
 		if (
 			s.current_version === applying.target ||
 			(s.last_result &&
-				s.last_result.to === applying.target &&
-				!s.last_result.ok)
+				s.last_result.finished_unix * 1000 >= applying.startedAt - 60_000)
 		) {
 			setApplying(null);
 		}
@@ -157,12 +158,20 @@ export const UpdateCard: FC<{
 									timedOut={timedOut}
 								/>
 							) : s.available ? (
-								s.apply === "full" ? (
+								s.apply === "full" || s.apply === "staged" ? (
 									<ApplyPanel status={s} onApplied={onApplied} />
 								) : (
 									<div className="space-y-2 rounded-md border p-4">
 										<p className="text-sm">{m.update_how()}</p>
 										<CommandLine command={s.channel_hint} />
+										{s.opt_in_hint && (
+											<div className="space-y-1 border-t pt-2">
+												<p className="text-sm text-muted-foreground">
+													{m.update_opt_in()}
+												</p>
+												<CommandLine command={s.opt_in_hint} />
+											</div>
+										)}
 									</div>
 								)
 							) : (
@@ -402,7 +411,11 @@ const LastResult: FC<{
 }> = ({ result }) =>
 	result.ok ? (
 		<p className="rounded-md border border-emerald-500/40 bg-emerald-500/10 p-3 text-sm">
-			{m.update_result_ok({ from: result.from, to: result.to })}
+			{result.staged
+				? m.update_result_staged({ to: result.to })
+				: result.from === result.to
+					? m.update_result_noop()
+					: m.update_result_ok({ from: result.from, to: result.to })}
 		</p>
 	) : (
 		<div className="space-y-1 rounded-md border border-destructive/40 bg-destructive/5 p-3 text-sm">

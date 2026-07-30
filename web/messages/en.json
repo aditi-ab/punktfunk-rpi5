@@ -476,6 +476,9 @@
 	"update_stage_restarting": "The host is restarting…",
 	"update_stage_reconnecting": "Waiting for the host to come back…",
 	"update_result_ok": "Updated {from} → {to}.",
+	"update_result_staged": "Update to {to} is staged — reboot this host to finish.",
+	"update_result_noop": "Your package source had nothing newer yet — try again in a few minutes.",
+	"update_opt_in": "To enable one-click updates from here, run this once on the host (then log out and back in):",
 	"update_result_failed": "Update to {to} failed during {stage}.",
 	"update_result_log": "Installer log:"
 }
