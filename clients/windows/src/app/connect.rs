@@ -287,7 +287,7 @@ fn connect_spawn(
                     ss.call(Screen::Stream);
                 }
                 SpawnEvent::Stats(line) => *shared.stats_line.lock().unwrap() = line,
-                SpawnEvent::Exited { error, ended } => {
+                SpawnEvent::Exited { error, ended, code } => {
                     match error {
                         Some((msg, true)) => {
                             // Pinned-fingerprint mismatch / pairing required → re-pair via
@@ -311,8 +311,14 @@ fn connect_spawn(
                         }
                         // `ended` = the host ended the session (banner); a clean exit
                         // (user closed the stream window / Disconnect) returns silently.
+                        // A child that said nothing AND failed gets the exit code, so the
+                        // return to the host list is never unexplained.
                         None => {
-                            st.call(ended.unwrap_or_default());
+                            st.call(
+                                ended
+                                    .or_else(|| crate::spawn::silent_exit_banner(code))
+                                    .unwrap_or_default(),
+                            );
                             ss.call(Screen::Hosts);
                         }
                     }
@@ -367,11 +373,18 @@ pub(crate) fn open_console(
                     ss.call(Screen::Stream);
                 }
                 SpawnEvent::Stats(line) => *shared.stats_line.lock().unwrap() = line,
-                SpawnEvent::Exited { error, ended } => {
+                SpawnEvent::Exited { error, ended, code } => {
                     crate::shell_window::restore();
                     // Quit from the library (B / closing the window) returns silently;
-                    // a failed start surfaces its error line.
-                    st.call(error.map(|(msg, _)| msg).or(ended).unwrap_or_default());
+                    // a failed start surfaces its error line, or the exit code when it
+                    // died without producing one.
+                    st.call(
+                        error
+                            .map(|(msg, _)| msg)
+                            .or(ended)
+                            .or_else(|| crate::spawn::silent_exit_banner(code))
+                            .unwrap_or_default(),
+                    );
                     ss.call(Screen::Hosts);
                 }
             }

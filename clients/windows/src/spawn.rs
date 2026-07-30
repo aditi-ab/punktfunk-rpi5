@@ -18,11 +18,16 @@ pub(crate) enum SpawnEvent {
     /// One `stats:` line, already human-formatted by the session (per 1 s window).
     Stats(String),
     /// The child exited (stdout EOF + reap; a kill lands here too). `error`/`ended`
-    /// carry the contract lines seen on the way out, when any (the exit code is logged
-    /// by the reader; routing keys off the lines, which say strictly more).
+    /// carry the contract lines seen on the way out, when any — routing keys off those,
+    /// which say strictly more than a number. `code` is the process exit status (-1 = no
+    /// code, i.e. killed) and exists for the case where there were NO lines at all: a
+    /// child that dies before it can speak the contract would otherwise be indistinguishable
+    /// from a clean user-initiated quit, and the shell would bounce to the host list with a
+    /// blank banner. That is exactly how the 0.22.0 session-binary regression presented.
     Exited {
         error: Option<(String, bool)>,
         ended: Option<String>,
+        code: i32,
     },
 }
 
@@ -73,6 +78,19 @@ fn parse_line(line: &str) -> Option<ChildLine> {
         return Some(ChildLine::Ended(msg.to_string()));
     }
     None
+}
+
+/// The banner for a child that exited having said NOTHING on stdout — no `ready`, no
+/// `error`, no `ended`. `None` keeps the silent return the UI has always given a clean
+/// quit: code 0 is the user closing the stream window, and -1 is our own Disconnect/Cancel
+/// kill (no exit code). Anything else is the session dying before it could speak its
+/// contract — a missing runtime DLL, a crash, or the wrong binary sitting next to the
+/// shell — and reporting the code is the difference between a diagnosable failure and a
+/// connect that silently drops back to the host list.
+pub(crate) fn silent_exit_banner(code: i32) -> Option<String> {
+    (code != 0 && code != -1).then(|| {
+        format!("The session didn't start (punktfunk-session exited with code {code}). Check the client log.")
+    })
 }
 
 /// The session binary: installed next to the shell (the MSIX layout and dev
@@ -220,7 +238,7 @@ fn spawn_with(
                 .and_then(|s| s.code())
                 .unwrap_or(-1);
             tracing::info!(code, "session binary exited");
-            on_event(SpawnEvent::Exited { error, ended });
+            on_event(SpawnEvent::Exited { error, ended, code });
         })
         .map_err(|e| format!("session reader thread: {e}"))?;
     Ok(())
@@ -261,5 +279,18 @@ mod tests {
         }
         assert!(parse_line("").is_none());
         assert!(parse_line("{\"other\":1}").is_none());
+    }
+
+    #[test]
+    fn a_silent_failing_exit_is_never_blank() {
+        // Clean quit (stream window closed) and our own kill stay silent.
+        assert!(silent_exit_banner(0).is_none());
+        assert!(silent_exit_banner(-1).is_none());
+        // A child that died without speaking the contract names its code — the 0.22.0
+        // regression (a stub session binary exiting 2) showed as a blank bounce to the
+        // host list precisely because nothing filled this in.
+        let banner = silent_exit_banner(2).expect("failing exit must say something");
+        assert!(banner.contains('2'), "{banner}");
+        assert!(silent_exit_banner(101).is_some());
     }
 }
