@@ -348,6 +348,21 @@ jobs:
           Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
           Write-Output "web console smoke (bun): /login -> $code"
           if ($code -ne 200) { throw "web console failed to boot under bun" }
+
+      # WEB_OUTPUT_DIR has to be exported whether or not the step above ran. It used to be that step's
+      # last line, so a CACHE HIT skipped it and left the variable unset — and pack-host-installer.ps1
+      # treats an unset WEB_OUTPUT_DIR as "don't bundle the console", silently ("installer built
+      # WITHOUT the web console"). That shipped in 0.22.1 and 0.22.2: no {app}\web, so no web-run.cmd,
+      # so `web setup` bails, so no PunktfunkWeb task and no console at all. It also removed the only
+      # thing that stopped bun before the copy (StopBunRuntimes was #ifdef WithWeb), while bun.exe kept
+      # shipping under WithScripting — which is the "DeleteFile failed; code 5" modal on bun.exe.
+      # The throw is the point: never silently ship a console-less installer again.
+      - name: Export the console output dir (cache hit or fresh build)
+        shell: pwsh
+        run: |
+          if (-not (Test-Path 'web\.output\server\index.mjs')) {
+            throw "web\.output is missing - neither the cache restore nor the build produced it, and the installer must not ship without the console"
+          }
           "WEB_OUTPUT_DIR=$((Resolve-Path 'web\.output').Path)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Build plugin/script runner bundle (bun)
