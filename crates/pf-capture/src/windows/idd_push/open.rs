@@ -610,6 +610,7 @@ impl IddPushCapturer {
                 client_10bit,
                 display_hdr,
                 hdr_pin_warned: false,
+                hdr_pin_failures: 0,
                 want_444,
                 pyrowave,
                 pyro_fence: None,
@@ -635,7 +636,9 @@ impl IddPushCapturer {
                 stall_watch: StallWatch::new(),
                 offered_at_fresh: 0,
                 max_hb_age_us: 0,
-                probes: super::probes::acquire(),
+                probes: pf_host_config::config()
+                    .stall_probes
+                    .then(super::probes::acquire),
                 etw: super::dxgkrnl_etw::acquire(),
                 out_ring: Vec::new(),
                 out_idx: 0,

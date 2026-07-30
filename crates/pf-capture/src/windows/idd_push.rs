@@ -429,6 +429,11 @@ pub struct IddPushCapturer {
     /// One-shot latch for [`Self::poll_display_hdr`]'s "could not pin the negotiated depth" error —
     /// the poller samples every ~250 ms, and a display that refuses the flip refuses it every time.
     hdr_pin_warned: bool,
+    /// Consecutive failed depth-pin attempts ([`Self::poll_display_hdr`]) — past
+    /// [`Self::HDR_PIN_EAGER`] the re-pin backs off to every [`Self::HDR_PIN_RETRY_EVERY`]th
+    /// descriptor sample: a display that refuses the flip was costing 4 CCD writes + 8 display-
+    /// config queries per second, forever, all on the session-global display-config lock.
+    hdr_pin_failures: u32,
     /// The session negotiated full-chroma 4:4:4: while the display is SDR the BGRA slot passes
     /// THROUGH (a plain copy into the out ring, no NV12 VideoConverter) so NVENC gets full-chroma
     /// RGB and CSCs to 4:4:4 itself — measured on-glass: `chromaFormatIDC=3` + ARGB input yields
@@ -496,8 +501,11 @@ pub struct IddPushCapturer {
     offered_at_fresh: u64,
     max_hb_age_us: u64,
     /// The Phase A.2 micro-probe engine (refcounted process singleton) — its window read rides
-    /// every stall report so the verdict matrix can name the disturbance class.
-    probes: Arc<probes::ProbeEngine>,
+    /// every stall report so the verdict matrix can name the disturbance class. `None` when
+    /// `PUNKTFUNK_STALL_PROBES=0` opted the box out (the engine costs standing threads); the
+    /// verdict matrix already treats an absent probe window as never-stalled, so reports just
+    /// lose the corroborating legs, never invent them.
+    probes: Option<Arc<probes::ProbeEngine>>,
     /// The Phase A.3 DxgKrnl ETW watch; `None` when the session can't start (non-admin dev run)
     /// — reports then say `etw=unavailable`.
     etw: Option<Arc<dxgkrnl_etw::EtwWatch>>,
@@ -539,6 +547,13 @@ pub struct IddPushCapturer {
 unsafe impl Send for IddPushCapturer {}
 
 impl IddPushCapturer {
+    /// Failed depth-pin attempts before [`Self::poll_display_hdr`] backs its re-pin off
+    /// (≈2 s of eager retries at the descriptor poller's 4 Hz).
+    const HDR_PIN_EAGER: u32 = 8;
+    /// While backed off, re-attempt the depth pin on every this-many-th descriptor sample
+    /// (~4 s at 4 Hz) — self-healing without the 4 Hz CCD-write drumbeat.
+    const HDR_PIN_RETRY_EVERY: u64 = 16;
+
     #[inline]
     fn latest(&self) -> u64 {
         // SAFETY: `self.header` is the live, owned shared-header mapping (page-aligned, sized for a
@@ -832,40 +847,63 @@ impl IddPushCapturer {
         // either direction (its encoder re-inits on the depth change).
         if (self.pyrowave || !self.client_10bit) && now.hdr != self.client_10bit {
             let want = self.client_10bit;
-            // OBSERVE the flip; never assert it. This used to discard `set_advanced_color`'s `bool`
-            // and then write `now.hdr = self.client_10bit` — substituting the DESIRED state for the
-            // observed one, which broke in both directions on a display that cannot be flipped
-            // (the state this file already logs as "Downgrade point D" at open):
-            //   - want HDR, display stays SDR: the fabricated `true` differed from `current`, so two
-            //     samples drove `recreate_ring(true, …)` and rebuilt the ring FP16 while the driver
-            //     composed 8-bit BGRA. Every publish was then dropped by the driver's format guard,
-            //     `recovering_since` expired, and `try_consume` bailed — a permanent 3-second
-            //     reconnect loop.
-            //   - want SDR, display stays HDR: the fabricated `false` MATCHED `current`, so no
-            //     recreate ever fired and the ring stayed BGRA against an FP16 composition. Same
-            //     dropped-publish outcome, silently.
-            // Reading back immediately can catch a flip that has not settled yet; that costs one
-            // debounce cycle (the poller re-samples in ~250 ms) and never a wrong ring, which is why
-            // this does not block the frame path on a settle poll the way `open_on` does.
-            let requested = pf_win_display::win_display::set_advanced_color(self.target_id, want);
-            let observed = pf_win_display::win_display::advanced_color_enabled(self.target_id);
-            // A failed READ is not evidence of a failed flip — keep the poller's sample then.
-            now.hdr = observed.unwrap_or(now.hdr);
-            if now.hdr != want && !self.hdr_pin_warned {
-                self.hdr_pin_warned = true;
-                tracing::error!(
-                    target_id = self.target_id,
-                    want_hdr = want,
-                    observed_hdr = ?observed,
-                    set_advanced_color_returned = requested,
-                    pyrowave = self.pyrowave,
-                    client_10bit = self.client_10bit,
-                    "IDD push: could not pin the display to the NEGOTIATED depth — following what \
-                     it actually composes instead (a physical display forcing HDR, or a driver that \
-                     refuses the flip). The stream's depth will not match the negotiation; the \
-                     encoder's caps cross-check reports the truth to the client"
-                );
+            // A display that refuses the pin refuses it on every 250 ms sample — past
+            // [`Self::HDR_PIN_EAGER`] consecutive failures the write+read-back re-fires only on
+            // every [`Self::HDR_PIN_RETRY_EVERY`]th sample (~4 s), instead of 4 CCD writes +
+            // 8 display-config queries per second forever, all on the session-global
+            // display-config lock. Skipped samples keep the poller's own advanced-color read,
+            // so nothing is fabricated and a display that becomes flippable is re-pinned on
+            // the next retry sample.
+            if self.hdr_pin_failures < Self::HDR_PIN_EAGER
+                || self.desc_seq % Self::HDR_PIN_RETRY_EVERY == 0
+            {
+                // OBSERVE the flip; never assert it. This used to discard `set_advanced_color`'s
+                // `bool` and then write `now.hdr = self.client_10bit` — substituting the DESIRED
+                // state for the observed one, which broke in both directions on a display that
+                // cannot be flipped (the state this file already logs as "Downgrade point D" at
+                // open):
+                //   - want HDR, display stays SDR: the fabricated `true` differed from `current`,
+                //     so two samples drove `recreate_ring(true, …)` and rebuilt the ring FP16
+                //     while the driver composed 8-bit BGRA. Every publish was then dropped by the
+                //     driver's format guard, `recovering_since` expired, and `try_consume`
+                //     bailed — a permanent 3-second reconnect loop.
+                //   - want SDR, display stays HDR: the fabricated `false` MATCHED `current`, so no
+                //     recreate ever fired and the ring stayed BGRA against an FP16 composition.
+                //     Same dropped-publish outcome, silently.
+                // Reading back immediately can catch a flip that has not settled yet; that costs
+                // one debounce cycle (the poller re-samples in ~250 ms) and never a wrong ring,
+                // which is why this does not block the frame path on a settle poll the way
+                // `open_on` does.
+                let requested =
+                    pf_win_display::win_display::set_advanced_color(self.target_id, want);
+                let observed = pf_win_display::win_display::advanced_color_enabled(self.target_id);
+                // A failed READ is not evidence of a failed flip — keep the poller's sample then.
+                now.hdr = observed.unwrap_or(now.hdr);
+                if now.hdr != want {
+                    self.hdr_pin_failures = self.hdr_pin_failures.saturating_add(1);
+                    if !self.hdr_pin_warned {
+                        self.hdr_pin_warned = true;
+                        tracing::error!(
+                            target_id = self.target_id,
+                            want_hdr = want,
+                            observed_hdr = ?observed,
+                            set_advanced_color_returned = requested,
+                            pyrowave = self.pyrowave,
+                            client_10bit = self.client_10bit,
+                            "IDD push: could not pin the display to the NEGOTIATED depth — following what \
+                             it actually composes instead (a physical display forcing HDR, or a driver that \
+                             refuses the flip). The stream's depth will not match the negotiation; the \
+                             encoder's caps cross-check reports the truth to the client"
+                        );
+                    }
+                } else {
+                    self.hdr_pin_failures = 0;
+                }
             }
+        } else {
+            // No mismatch (or the session follows flips): the pin is healthy — a later refusal
+            // starts its eager attempts fresh.
+            self.hdr_pin_failures = 0;
         }
         let current = DisplayDescriptor {
             hdr: self.display_hdr,
@@ -1613,7 +1651,8 @@ impl IddPushCapturer {
                 // uses (the gap plus a lead-in for the disturbance that CAUSED it).
                 probes: now
                     .checked_sub(stall.gap + Duration::from_millis(300))
-                    .map(|from| self.probes.window(from, now)),
+                    .zip(self.probes.as_deref())
+                    .map(|(from, p)| p.window(from, now)),
                 etw: self.etw.as_ref().and_then(|w| {
                     now.checked_sub(stall.gap + Duration::from_millis(300))
                         .map(|from| w.summary(from, now))

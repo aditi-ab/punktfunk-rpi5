@@ -120,6 +120,14 @@ pub struct HostConfig {
     /// backend (the legacy SudoVDA backend was removed), so this is currently informational — kept for the
     /// shipped `host.env` and as a forward seam if a second backend is ever added.
     pub vdisplay: Option<String>,
+    /// `PUNKTFUNK_STALL_PROBES` — run the Windows IDD-push capture's micro-probe engine (per-GPU
+    /// fence probes, DWM tick/flush watchdogs, scanline + CPU sentinels — `idd_push/probes.rs`),
+    /// the corroborating evidence legs on every stall report. Default ON while the
+    /// interval-stutter field program runs; explicit-off grammar for perf-sensitive boxes — the
+    /// engine costs standing threads (a blocking `DwmFlush` waiter, ~10 Hz fence copies per GPU,
+    /// a 5 ms-cadence CPU sentinel). Off, stall lines still carry the driver telemetry + the ETW
+    /// present/queue discriminator (cheap, session-filtered); only the probe legs read absent.
+    pub stall_probes: bool,
     /// `PUNKTFUNK_GAMESCOPE_STEAM` — force the bare headless gamescope spawn into its Steam
     /// integration mode (`--steam`) for EVERY launch. A Steam title auto-enables `--steam` on its
     /// own regardless of this knob; it exists to force it on for non-Steam launches too. Managed
@@ -235,6 +243,8 @@ impl HostConfig {
             // per-session switch; see the field doc).
             chacha20: env_on("PUNKTFUNK_CHACHA20").unwrap_or(true),
             perf: flag("PUNKTFUNK_PERF"),
+            // Default ON while the interval-stutter field program runs (see the field doc).
+            stall_probes: env_on("PUNKTFUNK_STALL_PROBES").unwrap_or(true),
             video_source: val("PUNKTFUNK_VIDEO_SOURCE"),
             // Trimmed + emptied-to-None: `PUNKTFUNK_CAPTURE_MONITOR=` in a host.env means "not
             // set", not "match the monitor named empty string".
