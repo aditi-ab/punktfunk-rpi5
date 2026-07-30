@@ -2880,6 +2880,7 @@ dependencies = [
  "mdns-sd",
  "opus",
  "pf-ffvk",
+ "pf-update-check",
  "pipewire",
  "punktfunk-core",
  "pyrowave-sys",
@@ -3053,6 +3054,18 @@ version = "0.22.3"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "pf-update-check"
+version = "0.22.3"
+dependencies = [
+ "anyhow",
+ "base64",
+ "ring",
+ "serde",
+ "serde_json",
+ "ureq",
 ]
 
 [[package]]
@@ -3457,6 +3470,7 @@ dependencies = [
  "pf-host-config",
  "pf-inject",
  "pf-paths",
+ "pf-update-check",
  "pf-vdisplay",
  "pf-win-display",
  "pf-zerocopy",

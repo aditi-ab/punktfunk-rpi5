@@ -121,47 +121,11 @@ pub(crate) struct Advisory {
 
 // ---------------------------------------------------------------- signature
 
-/// An ed25519 public key pinned by a source record, spelled `ed25519:<base64 of the 32 raw bytes>`.
-#[derive(Debug, Clone)]
-pub(crate) struct PublicKey(Vec<u8>);
-
-impl PublicKey {
-    pub(crate) fn parse(s: &str) -> Result<Self> {
-        use base64::Engine as _;
-        let b64 = s
-            .strip_prefix("ed25519:")
-            .context("public key must be spelled `ed25519:<base64>`")?;
-        let raw = base64::engine::general_purpose::STANDARD
-            .decode(b64.trim())
-            .context("public key is not valid base64")?;
-        if raw.len() != 32 {
-            bail!("ed25519 public key must be 32 bytes, got {}", raw.len());
-        }
-        Ok(Self(raw))
-    }
-}
-
-/// Verify a detached ed25519 signature over the **exact** index bytes against any of the pinned
-/// keys (two slots, so a key rotation is "sign with the new one, ship a host that trusts both,
-/// retire the old" rather than a flag day).
-///
-/// `sig_text` is the `.sig` file's contents: base64, whitespace-tolerant.
-pub(crate) fn verify_signature(bytes: &[u8], sig_text: &str, keys: &[PublicKey]) -> Result<()> {
-    use base64::Engine as _;
-    if keys.is_empty() {
-        bail!("no public key pinned for this source");
-    }
-    let sig = base64::engine::general_purpose::STANDARD
-        .decode(sig_text.trim())
-        .context("signature file is not valid base64")?;
-    for key in keys {
-        let pk = ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, &key.0);
-        if pk.verify(bytes, &sig).is_ok() {
-            return Ok(());
-        }
-    }
-    bail!("index signature does not verify against any pinned key")
-}
+// Ed25519 verification moved to `pf-update-check` when the Linux client grew its own update
+// check: the host's plugin-store index and both products' update manifests are all "verify a
+// detached signature over exact bytes against pinned keys", and that rule must exist once.
+// Re-exported under the old path so every call site here is unchanged.
+pub(crate) use pf_update_check::sig::{verify_signature, PublicKey};
 
 // ---------------------------------------------------------------- parse + validate
 
@@ -509,56 +473,6 @@ mod tests {
         assert!(!valid_integrity("md5-abc"));
         assert!(!valid_integrity("sha512-"));
         assert!(!valid_integrity("sha512"));
-    }
-
-    #[test]
-    fn signature_verifies_only_over_exact_bytes_and_pinned_keys() {
-        use ring::signature::KeyPair as _;
-        let rng = ring::rand::SystemRandom::new();
-        let pkcs8 = ring::signature::Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
-        let kp = ring::signature::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
-        let key = {
-            use base64::Engine as _;
-            PublicKey::parse(&format!(
-                "ed25519:{}",
-                base64::engine::general_purpose::STANDARD.encode(kp.public_key().as_ref())
-            ))
-            .unwrap()
-        };
-        let body = br#"{"schema":1,"plugins":[]}"#;
-        let sig = {
-            use base64::Engine as _;
-            base64::engine::general_purpose::STANDARD.encode(kp.sign(body).as_ref())
-        };
-
-        assert!(verify_signature(body, &sig, std::slice::from_ref(&key)).is_ok());
-        // whitespace in the .sig file is tolerated
-        assert!(verify_signature(body, &format!("{sig}\n"), std::slice::from_ref(&key)).is_ok());
-        // one byte of tampering fails
-        assert!(verify_signature(
-            br#"{"schema":1,"plugins":[ ]}"#,
-            &sig,
-            std::slice::from_ref(&key)
-        )
-        .is_err());
-        // a different key fails
-        let other = ring::signature::Ed25519KeyPair::from_pkcs8(
-            ring::signature::Ed25519KeyPair::generate_pkcs8(&rng)
-                .unwrap()
-                .as_ref(),
-        )
-        .unwrap();
-        let other_key = {
-            use base64::Engine as _;
-            PublicKey::parse(&format!(
-                "ed25519:{}",
-                base64::engine::general_purpose::STANDARD.encode(other.public_key().as_ref())
-            ))
-            .unwrap()
-        };
-        assert!(verify_signature(body, &sig, &[other_key]).is_err());
-        // no pinned key at all fails closed
-        assert!(verify_signature(body, &sig, &[]).is_err());
     }
 
     /// The real published index must parse here, field for field.

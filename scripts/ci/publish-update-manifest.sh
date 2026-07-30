@@ -7,7 +7,7 @@
 #
 # The signature is a raw 64-byte Ed25519 over the EXACT manifest bytes, base64 in the .sig —
 # the same format the plugin index uses and `store::index::verify_signature` checks. The
-# public half is pinned in the host binary (UPDATE_KEYS in crates/punktfunk-host/src/update.rs);
+# public half is pinned in the shared checker (OFFICIAL_UPDATE_KEYS in crates/pf-update-check);
 # before signing, this script cross-checks the signing key against that constant and refuses
 # on mismatch — the most likely deploy mistake is signing with a key no host trusts (the
 # sysext publisher's fingerprint-crosscheck drill).
@@ -68,14 +68,20 @@ fi
 
 # Cross-check: the key we are about to sign with must be one the host binary pins.
 PUB="ed25519:$(openssl pkey -in "$KEY" -pubout -outform DER | tail -c 32 | base64)"
-KEYS_FILE="crates/punktfunk-host/src/update.rs"
-if [ -f "$KEYS_FILE" ]; then
-  if ! grep -qF "\"$PUB\"" "$KEYS_FILE"; then
-    echo "ERROR: signing key $PUB is not pinned in $KEYS_FILE (UPDATE_KEYS) — wrong key?" >&2
-    exit 1
-  fi
-else
-  echo "WARN: $KEYS_FILE not in this checkout — skipping the pinned-key cross-check" >&2
+# The pin list moved to the shared checker when the Linux client started verifying the same
+# manifest (crates/pf-update-check/src/lib.rs, OFFICIAL_UPDATE_KEYS) — one list, so the host
+# and the client can never disagree about who may announce a release.
+KEYS_FILE="crates/pf-update-check/src/lib.rs"
+# A MISSING file is fatal, not a warning. This check is the guard against signing with a key
+# no build trusts; if its path ever goes stale the old `else` branch would have skipped it
+# silently and published an unverifiable manifest — the exact failure it exists to prevent.
+if [ ! -f "$KEYS_FILE" ]; then
+  echo "ERROR: $KEYS_FILE not in this checkout — refusing to sign without the pinned-key cross-check" >&2
+  exit 1
+fi
+if ! grep -qF "\"$PUB\"" "$KEYS_FILE"; then
+  echo "ERROR: signing key $PUB is not pinned in $KEYS_FILE (OFFICIAL_UPDATE_KEYS) — wrong key?" >&2
+  exit 1
 fi
 
 # ---- build the manifest ---------------------------------------------------------------------

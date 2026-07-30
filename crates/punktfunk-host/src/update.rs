@@ -20,28 +20,22 @@ pub(crate) mod detect;
 pub(crate) mod jobs;
 #[cfg(target_os = "linux")]
 mod linux;
-pub(crate) mod manifest;
+// The signed manifest's schema + validation live in `pf-update-check` (shared with the
+// client's check). Re-exported so `manifest::…` call sites below are unchanged.
+pub(crate) use pf_update_check::manifest;
 #[cfg(target_os = "windows")]
 pub(crate) mod windows;
 
-use crate::store::index::PublicKey;
 use manifest::Manifest;
+use pf_update_check::PublicKey;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-/// The Ed25519 public keys this binary trusts for update manifests — two slots so a key
-/// rotation is "sign with the new one, ship a host trusting both, retire the old" (the
-/// plugin-store `OFFICIAL_KEYS` drill). The private half is the `UPDATE_MANIFEST_KEY` CI
-/// secret; it also lives in the operator's offline backup (plan U0.1 DoD).
-pub(crate) const UPDATE_KEYS: [&str; 2] = [
-    "ed25519:6rmlLg1aQ55cgB6icpC5BEpbMJxwPKdGaDQtDcJ0yLI=",
-    "", // rotation slot
-];
-
-/// Feed base — `<base>/<channel>/manifest.json` + `.sig`. Override for tests/dev feeds via
-/// `PUNKTFUNK_UPDATE_FEED` (a base URL, not request-time input: env is operator config).
-const DEFAULT_FEED_BASE: &str = "https://git.unom.io/api/packages/unom/generic/punktfunk-update";
+/// The Ed25519 public keys this binary trusts for update manifests. The list itself lives in
+/// `pf-update-check` (the client verifies the same manifest and must trust the same signers);
+/// this alias keeps the host's call sites and the plan's vocabulary intact.
+pub(crate) use pf_update_check::OFFICIAL_UPDATE_KEYS as UPDATE_KEYS;
 
 /// A cache older than this is refreshed in the background on the next status read.
 const AUTO_REFRESH_AFTER: Duration = Duration::from_secs(6 * 60 * 60);
@@ -52,9 +46,6 @@ pub(crate) const FORCE_MIN_INTERVAL: Duration = Duration::from_secs(30);
 /// A manifest whose publish serial is older than this is flagged stale in status — the
 /// freeze-detection hint (design §3.2), not an error.
 const STALE_AFTER: Duration = Duration::from_secs(45 * 24 * 60 * 60);
-
-/// One fetch's wall-clock budget (mirrors the store catalog fetch).
-const FETCH_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Update checks disabled by operator config (env or `host.env`).
 pub(crate) fn check_disabled() -> bool {
@@ -127,13 +118,6 @@ pub(crate) fn opt_in_hint() -> Option<String> {
         }
     }
     None
-}
-
-fn feed_base() -> String {
-    std::env::var("PUNKTFUNK_UPDATE_FEED")
-        .ok()
-        .filter(|s| s.starts_with("https://") || s.starts_with("http://127.0.0.1"))
-        .unwrap_or_else(|| DEFAULT_FEED_BASE.to_string())
 }
 
 fn pinned_keys() -> Vec<PublicKey> {
@@ -228,55 +212,18 @@ fn store_floor(path: &Path, channel: &str, serial: u64) {
 
 // ---------------------------------------------------------------- refresh
 
-/// Fetch + verify the channel manifest. Blocking (`ureq`) — call from a blocking thread.
+/// Fetch + verify the channel manifest through the shared checker. Blocking — call from a
+/// blocking thread.
 fn fetch_manifest_blocking(channel: &str) -> Result<Manifest, String> {
-    let agent = ureq::AgentBuilder::new()
-        .timeout(FETCH_TIMEOUT)
-        // Follow the registry's 303-to-object-storage redirect; the signature is verified
-        // over the FINAL bytes (the sysext-feed lesson).
-        .redirects(3)
-        .user_agent(&format!(
+    pf_update_check::feed::fetch_manifest_blocking(
+        &pf_update_check::feed::feed_base(),
+        channel,
+        &pinned_keys(),
+        &format!(
             "punktfunk-host/{} (update-check)",
             env!("PUNKTFUNK_VERSION")
-        ))
-        .build();
-    let base = feed_base();
-    let url = format!("{base}/{channel}/manifest.json");
-    let sig_url = format!("{url}.sig");
-
-    let body = read_capped(agent.get(&url).call().map_err(fetch_err)?)?;
-    let sig = read_capped(agent.get(&sig_url).call().map_err(fetch_err)?)?;
-    let sig_text = String::from_utf8(sig).map_err(|_| "signature file is not text".to_string())?;
-
-    let keys = pinned_keys();
-    if keys.is_empty() {
-        // Both slots empty would mean a build with the feature disarmed; refuse rather than
-        // silently skipping verification.
-        return Err("no update key is pinned in this build".into());
-    }
-    manifest::verify_and_parse(&body, &sig_text, &keys, channel).map_err(|e| format!("{e:#}"))
-}
-
-fn fetch_err(e: ureq::Error) -> String {
-    match e {
-        ureq::Error::Status(code, _) => format!("feed returned HTTP {code}"),
-        other => format!("feed fetch failed: {other}"),
-    }
-}
-
-fn read_capped(resp: ureq::Response) -> Result<Vec<u8>, String> {
-    use std::io::Read as _;
-    let mut buf = Vec::new();
-    let mut reader = resp
-        .into_reader()
-        .take(manifest::MAX_MANIFEST_BYTES as u64 + 1);
-    reader
-        .read_to_end(&mut buf)
-        .map_err(|e| format!("read failed: {e}"))?;
-    if buf.len() > manifest::MAX_MANIFEST_BYTES {
-        return Err("response exceeds the manifest size cap".into());
-    }
-    Ok(buf)
+        ),
+    )
 }
 
 /// One full refresh: fetch, verify, enforce + raise the serial floor, update the cache,

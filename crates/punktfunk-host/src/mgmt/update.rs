@@ -130,7 +130,7 @@ fn status_from(snap: update::Snapshot) -> UpdateStatus {
         channel: channel.as_str().into(),
         current_version: current.into(),
         apply: update::apply_support().into(),
-        channel_hint: detect::channel_hint(kind).into(),
+        channel_hint: detect::channel_hint(kind),
         check_disabled: update::check_disabled(),
         available,
         manifest: snap.checked.as_ref().map(|c| UpdateManifestInfo {

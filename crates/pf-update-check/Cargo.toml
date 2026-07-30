@@ -1,0 +1,34 @@
+# The update-CHECK core, shared by the host and the Linux client (planning:
+# host-update-from-web-console.md §3). It exists because both products answer the same
+# question — "does a newer build exist for this box's channel?" — from the same signed
+# manifest, and a trust rule that lives in two places is a trust rule that will diverge.
+#
+# Deliberately check-only: no apply legs, no package managers, no privileged anything. The
+# host keeps its Windows/Linux apply code; the client keeps its own. What is shared here is
+# exactly the part where being wrong is a security bug: signature verification, manifest
+# validation, and the version comparison that decides whether to tell a user to update.
+[package]
+name = "pf-update-check"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Signed update-manifest fetch + verification, install-kind detection and version comparison, shared by the punktfunk host and client."
+publish = false
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Ed25519 over the exact manifest bytes. The workspace is ring-only (no aws-lc-sys — it fails
+# on the Windows CI runner), and this is the same primitive the plugin-store index uses.
+ring = "0.17"
+base64 = "0.22"
+# Small, sync, bundles webpki roots — no system cert store dependency, which matters on the
+# Deck (Decky's embedded Python has no usable roots either; see clients/decky/main.py).
+ureq = "2"
+
+[lints]
+workspace = true

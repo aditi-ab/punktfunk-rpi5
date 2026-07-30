@@ -1,10 +1,14 @@
-//! The signed **update manifest**: the check truth for "a newer host exists"
+//! The signed **update manifest**: the check truth for "a newer build exists"
 //! (design `host-update-from-web-console.md` §3).
 //!
-//! One small JSON document per channel, Ed25519-signed with keys pinned in this binary
-//! ([`super::UPDATE_KEYS`]) and verified by the exact code path the plugin store already
-//! trusts ([`crate::store::index::verify_signature`]). TLS and the registry that serves the
-//! document are transport, never trust.
+//! One small JSON document per channel, Ed25519-signed with keys pinned in the consuming
+//! binary and verified by the exact code path the plugin store already trusts ([`crate::sig`]).
+//! TLS and the registry that serves the document are transport, never trust.
+//!
+//! The document describes a *release*, not a product: the host and the Linux client ship from
+//! one repo at one version, so both compare their own installed version against the same
+//! `version`/`ci_run` here. Only the per-product payload legs (today: `windows_host`) are
+//! product-specific, and a consumer that doesn't need one simply ignores it.
 //!
 //! Rules, all fail-closed (the sysext 303 lesson encoded):
 //! 1. **Signature before parse** — over the exact fetched bytes, then strict JSON. An HTML
@@ -12,27 +16,27 @@
 //! 2. **Channel binding** — the document names its channel and it must match the one we
 //!    asked for, so a validly-signed canary manifest replayed onto the stable URL is refused.
 //! 3. **Monotonic serial** — the publish-time serial can never go backwards for a channel
-//!    (the anti-downgrade/anti-replay floor, persisted by [`super`]).
-//! 4. **Pinned notes origin** — the release-notes link the console renders must live on our
-//!    forge, so a signed-but-wrong document can't send the operator to a lookalike page.
+//!    (the anti-downgrade/anti-replay floor, persisted by the consumer).
+//! 4. **Pinned notes origin** — the release-notes link a UI renders must live on our forge,
+//!    so a signed-but-wrong document can't send the operator to a lookalike page.
 
-use crate::store::index::{verify_signature, PublicKey};
+use crate::sig::{verify_signature, PublicKey};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
-/// The only manifest schema this host understands. A breaking change bumps this; old hosts
+/// The only manifest schema this build understands. A breaking change bumps this; old builds
 /// report "unsupported schema" instead of guessing.
-pub(crate) const SCHEMA: u32 = 1;
+pub const SCHEMA: u32 = 1;
 
 /// Hard cap on a fetched manifest (and its signature). The real document is <1 KB.
-pub(crate) const MAX_MANIFEST_BYTES: usize = 64 * 1024;
+pub const MAX_MANIFEST_BYTES: usize = 64 * 1024;
 
 /// The only origin a manifest may point the operator at for release notes.
 const NOTES_ORIGIN: &str = "https://git.unom.io/";
 
 /// The signed update manifest, as served (and signed) per channel.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub(crate) struct Manifest {
+pub struct Manifest {
     /// Document schema — must equal [`SCHEMA`].
     pub schema: u32,
     /// The channel this document was published for (`stable` | `canary`). Bound-checked
@@ -44,24 +48,24 @@ pub(crate) struct Manifest {
     /// RFC-3339 publish time. Display only.
     #[serde(default)]
     pub published_at: String,
-    /// The released host version this manifest announces.
+    /// The released version this manifest announces.
     pub version: String,
-    /// Release-notes link the console renders. Must be on [`NOTES_ORIGIN`].
+    /// Release-notes link a UI renders. Must be on [`NOTES_ORIGIN`].
     #[serde(default)]
     pub notes_url: String,
     /// Canary only: the CI run number, the definitive "newer" axis where per-channel version
     /// strings differ (`~ciN`, `0.ciN`, a padded pkgrel, `M.m.run`).
     #[serde(default)]
     pub ci_run: Option<u64>,
-    /// The Windows installer leg (design §6) — parsed and carried now so a U0 host is already
-    /// schema-complete, consumed by the U1 apply path.
+    /// The Windows installer leg (design §6) — consumed by the host's Windows apply path and
+    /// ignored everywhere else.
     #[serde(default)]
     pub windows_host: Option<WindowsHostAsset>,
 }
 
 /// Where the Windows host installer for [`Manifest::version`] lives and how to verify it.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub(crate) struct WindowsHostAsset {
+pub struct WindowsHostAsset {
     /// Immutable per-version download URL — never a mutable `latest/` alias, so the hash
     /// below can't race an alias re-upload.
     pub url: String,
@@ -79,7 +83,7 @@ pub(crate) struct WindowsHostAsset {
 
 /// Verify `sig_text` over the exact `bytes` against `keys`, then strictly parse and validate
 /// the document for `expected_channel`. The only constructor — there is no unsigned path.
-pub(crate) fn verify_and_parse(
+pub fn verify_and_parse(
     bytes: &[u8],
     sig_text: &str,
     keys: &[PublicKey],
@@ -91,20 +95,20 @@ pub(crate) fn verify_and_parse(
 
 /// Parse + validate a document whose signature has already been checked. Split out so tests
 /// can exercise validation without minting signatures for every case.
-pub(crate) fn parse_verified(bytes: &[u8], expected_channel: &str) -> Result<Manifest> {
+pub fn parse_verified(bytes: &[u8], expected_channel: &str) -> Result<Manifest> {
     if bytes.len() > MAX_MANIFEST_BYTES {
         bail!("manifest is larger than the {MAX_MANIFEST_BYTES}-byte cap");
     }
     let m: Manifest = serde_json::from_slice(bytes).context("update manifest is not valid JSON")?;
     if m.schema != SCHEMA {
         bail!(
-            "unsupported manifest schema {} (this host understands {SCHEMA})",
+            "unsupported manifest schema {} (this build understands {SCHEMA})",
             m.schema
         );
     }
     if m.channel != expected_channel {
         bail!(
-            "manifest is for channel `{}` but this host asked for `{expected_channel}`",
+            "manifest is for channel `{}` but this build asked for `{expected_channel}`",
             m.channel
         );
     }
@@ -159,14 +163,7 @@ mod tests {
     #[test]
     fn signed_roundtrip_and_tamper() {
         use base64::Engine as _;
-        use ring::signature::KeyPair as _;
-        let rng = ring::rand::SystemRandom::new();
-        let pkcs8 = ring::signature::Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
-        let kp = ring::signature::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
-        let key_str = format!(
-            "ed25519:{}",
-            base64::engine::general_purpose::STANDARD.encode(kp.public_key().as_ref())
-        );
+        let (key_str, kp) = crate::sig::tests::keypair();
         let keys = vec![PublicKey::parse(&key_str).unwrap()];
 
         let body = bytes(&doc());

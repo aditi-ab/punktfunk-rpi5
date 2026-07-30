@@ -13,6 +13,7 @@ members = [
     "crates/pf-driver-proto",
     "crates/pf-paths",
     "crates/pf-update",
+    "crates/pf-update-check",
     "crates/pf-host-config",
     "crates/pf-gpu",
     "crates/pf-zerocopy",

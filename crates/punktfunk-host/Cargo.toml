@@ -10,6 +10,8 @@ repository.workspace = true
 
 [dependencies]
 punktfunk-core = { path = "../punktfunk-core", features = ["quic"] }
+# Signed update-manifest fetch/verify + install-kind detection, shared with the Linux client.
+pf-update-check = { path = "../pf-update-check" }
 # Config-dir + owner-private file helpers (moved out of the gamestream junk drawer, plan §W6).
 pf-paths = { path = "../pf-paths" }
 # Process-wide host config global, extracted to a leaf crate (plan §W6).
