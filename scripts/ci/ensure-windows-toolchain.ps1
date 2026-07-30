@@ -63,3 +63,35 @@ if (-not (Test-Path $sccacheExe)) {
 }
 & $sccacheExe --version
 if ($env:GITHUB_PATH) { Add-Content -Path $env:GITHUB_PATH -Value $sccacheDir }
+
+# --- zstd: what actions/cache compresses with. Without it the toolkit falls back to gzip,
+# and Git's GNU tar then shells out to a `gzip` that is NOT on the runner's PATH — every
+# cache SAVE died with "Child returned status 127" / "Cannot write: Broken pipe" / exit 2,
+# reported only as a ::warning:: so runs stayed green while nothing was ever cached
+# (measured 2026-07-30 on windows-host). Own directory on purpose: putting Git's usr\bin on
+# PATH would shadow Windows' find/sort/echo and break unrelated steps.
+$zstdDir = 'C:\Users\Public\zstd'
+$zstdExe = Join-Path $zstdDir 'zstd.exe'
+if (-not (Test-Path $zstdExe)) {
+  try {
+    $v = '1.5.6'
+    $zip = Join-Path $env:TEMP "zstd-$v.zip"
+    Invoke-WebRequest -Uri "https://github.com/facebook/zstd/releases/download/v$v/zstd-v$v-win64.zip" -OutFile $zip
+    $tmp = Join-Path $env:TEMP 'zstd-extract'
+    Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
+    Expand-Archive -Path $zip -DestinationPath $tmp -Force
+    New-Item -ItemType Directory -Force -Path $zstdDir | Out-Null
+    Get-ChildItem -Path $tmp -Recurse -Filter 'zstd.exe' | Select-Object -First 1 |
+      ForEach-Object { Copy-Item $_.FullName $zstdExe -Force }
+    $gitGzip = 'C:\Program Files\Git\usr\bin\gzip.exe'
+    if ((Test-Path $gitGzip) -and -not (Test-Path (Join-Path $zstdDir 'gzip.exe'))) {
+      Copy-Item $gitGzip (Join-Path $zstdDir 'gzip.exe') -Force
+    }
+    Remove-Item $zip, $tmp -Recurse -Force -ErrorAction SilentlyContinue
+  }
+  catch { Write-Warning "zstd install failed (cache saves will fall back to gzip): $_" }
+}
+if (Test-Path $zstdExe) {
+  & $zstdExe --version
+  if ($env:GITHUB_PATH) { Add-Content -Path $env:GITHUB_PATH -Value $zstdDir }
+}
