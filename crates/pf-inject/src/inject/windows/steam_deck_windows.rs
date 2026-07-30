@@ -30,6 +30,10 @@ use anyhow::Result;
 use punktfunk_core::quic::RichInput;
 use std::time::Duration;
 
+/// The hardware id this pad's devnode carries. Must be one `pf_gamepad.inx` declares — a package
+/// rename must never touch it (`dualsense_windows::tests::hwid_matches_inf` enforces that).
+pub(super) const DECK_HWID: &str = "pf_steamdeck";
+
 /// A single virtual Steam Deck: the `SwDeviceCreate`'d `pf_deck_<index>` devnode plus the sealed
 /// shared-memory channel. Dropping it removes the devnode and closes both sections.
 /// `pub`: the type appears as `type Pad` in the `PadProto` impl (a public trait).
@@ -70,7 +74,7 @@ impl DeckWinPad {
             instance: &inst,
             container_tag: 0x5046_4453, // "PFDS"
             container_index: index,
-            hwid: "pf_steamdeck",
+            hwid: DECK_HWID,
             usb_vid_pid: "VID_28DE&PID_1205",
             // The wired Deck controller interface — WITHOUT this the HID child carries no MI_
             // token, hidapi reports interface 0, and Steam never claims the pad (the N4

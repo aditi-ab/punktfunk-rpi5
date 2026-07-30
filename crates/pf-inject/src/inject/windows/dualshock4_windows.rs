@@ -21,6 +21,10 @@ use anyhow::Result;
 use punktfunk_core::quic::{HidOutput, RichInput};
 use std::time::Duration;
 
+/// The hardware id this pad's devnode carries. Must be one `pf_gamepad.inx` declares — a package
+/// rename must never touch it (`dualsense_windows::tests::hwid_matches_inf` enforces that).
+pub(super) const DS4_HWID: &str = "pf_dualshock4";
+
 /// A single virtual DualShock 4: the `SwDeviceCreate`'d `pf_ds4_<index>` devnode plus the sealed
 /// shared-memory channel. Dropping it removes the devnode and closes both sections.
 /// `pub`: the type appears as `type Pad` in the `PadProto` impl (a public trait), like the
@@ -66,7 +70,7 @@ impl Ds4WinPad {
             instance: &inst,
             container_tag: 0x5046_4453, // "PFDS"
             container_index: index,
-            hwid: "pf_dualshock4",
+            hwid: DS4_HWID,
             usb_vid_pid: "VID_054C&PID_09CC",
             usb_mi: None,
             description: "punktfunk Virtual DualShock 4",

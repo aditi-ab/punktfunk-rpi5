@@ -385,7 +385,13 @@ impl WinDsIdentity {
         WinDsIdentity {
             devtype: 0,
             instance_prefix: "pf_pad",
-            hwid: "pf_gamepad",
+            // ⚠️ A HARDWARE ID, not the package name. `pf-dualsense` became `pf-gamepad` in
+            // 560e663a and this line was renamed with it — but the INF deliberately kept the four
+            // OLD hardware ids, so `pf_gamepad` matched no INF of ours. PnP then fell through to
+            // the devnode's synthesized USB ids, bound Microsoft's inbox `input.inf`/`HidUsb`, and
+            // that cannot start on a software-enumerated devnode: CM_PROB_FAILED_START, no HID
+            // child, no channel proof, and a pad no game ever saw. `hwid_matches_inf` pins it now.
+            hwid: "pf_dualsense",
             usb_vid_pid: "VID_054C&PID_0CE6",
             description: "punktfunk Virtual DualSense",
         }
@@ -633,7 +639,7 @@ pub fn deck_spike_hold(index: u8, secs: u64) -> Result<()> {
         instance: &inst,
         container_tag: 0x5046_4453, // "PFDS"
         container_index: index,
-        hwid: "pf_steamdeck",
+        hwid: super::steam_deck_windows::DECK_HWID,
         usb_vid_pid: "VID_28DE&PID_1205",
         // The Deck's controller interface — the promotion gate the first spike run hit
         // (hidapi parses MI_ from the child hwids; absent = interface 0, Steam wants 2).
@@ -800,6 +806,58 @@ mod drain_tests {
         let (got, resync) = collect(&mut d, &mut buf);
         assert!(!resync);
         assert_eq!(got, vec![vec![0x02, 99]]);
+    }
+
+    /// Every hardware id the host puts on a pad devnode must be one the shipped INF actually
+    /// declares — otherwise PnP matches none of our models, falls through to the synthesized USB
+    /// ids on the same devnode, and binds Microsoft's inbox `input.inf`/`HidUsb`, which cannot
+    /// start on a software-enumerated devnode. The result is a pad that exists, never starts, and
+    /// never answers a channel proof; that is exactly what shipped in 0.22.0/0.22.1 for the plain
+    /// DualSense, because the `pf-dualsense` -> `pf-gamepad` PACKAGE rename also rewrote this
+    /// HARDWARE id (560e663a). The ids are a binding contract with every installed system, so they
+    /// must outlive any future package rename — this test is what makes that structural.
+    #[test]
+    fn hwid_matches_inf() {
+        let inx = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../packaging/windows/drivers/pf-gamepad/pf_gamepad.inx"
+        );
+        let inf = std::fs::read_to_string(inx).expect("read pf_gamepad.inx");
+        // The [Models] lines: `%DeviceDesc…%=pfGamepad, <hwid>[, <hwid>…]`.
+        let declared: Vec<String> = inf
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.starts_with(';'))
+            .filter_map(|l| l.split_once("=pfGamepad,"))
+            .flat_map(|(_, ids)| {
+                ids.split(',')
+                    .map(|id| id.trim().to_ascii_lowercase())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert!(
+            declared.len() >= 4,
+            "parsed {} hardware ids out of {inx} — the [Models] shape changed and this test went \
+             vacuous; fix the parse rather than deleting the assert",
+            declared.len()
+        );
+        for hwid in [
+            WinDsIdentity::dualsense().hwid,
+            WinDsIdentity::dualsense_edge().hwid,
+            super::super::dualshock4_windows::DS4_HWID,
+            super::super::steam_deck_windows::DECK_HWID,
+        ] {
+            let want = hwid.to_ascii_lowercase();
+            let rooted = format!("root\\{want}");
+            assert!(
+                declared
+                    .iter()
+                    .any(|d| d.as_str() == want || d.as_str() == rooted),
+                "the host creates pad devnodes with hardware id {hwid:?}, which pf_gamepad.inx \
+                 does not declare (it has {declared:?}) — PnP would bind inbox input.inf/HidUsb \
+                 instead and the pad would never start"
+            );
+        }
     }
 
     #[test]
