@@ -498,7 +498,12 @@ mod tests {
         let mut m = mgr();
         m.handle(&frame(1, 0b10, 0));
         assert!(m.slots.get(1).is_some());
-        // Bit 1 cleared and the frame IS pad 1's removal — sweep, then early-return (no ensure).
+        // Bit 1 cleared: the first sweep only ARMS the devnode-churn grace — the pad holds (a
+        // mask glitch must not flap PnP devices; see pad_slots::SWEEP_GRACE).
+        m.handle(&frame(1, 0b00, 0));
+        assert!(m.slots.get(1).is_some(), "inside the grace — not yet swept");
+        // Grace elapsed: the frame IS pad 1's removal — sweep, then early-return (no ensure).
+        m.slots.expire_grace();
         m.handle(&frame(1, 0b00, 0));
         assert!(m.slots.get(1).is_none());
     }
@@ -547,7 +552,9 @@ mod tests {
         assert_eq!(collect(&mut m), vec![]); // exact repeat deduped
         assert_eq!(collect(&mut m), vec![(0, 7, 7)]); // change forwards
                                                       // Unplug + recreate re-arms the dedup: the same level forwards again.
-        m.handle(&frame(0, 0b0, 0));
+        m.handle(&frame(0, 0b0, 0)); // arms the sweep grace
+        m.slots.expire_grace();
+        m.handle(&frame(0, 0b0, 0)); // grace elapsed — actually swept
         m.handle(&frame(0, 0b1, 0));
         *m.backend.feedback.borrow_mut() = vec![rumble((7, 7))];
         assert_eq!(collect(&mut m), vec![(0, 7, 7)]);

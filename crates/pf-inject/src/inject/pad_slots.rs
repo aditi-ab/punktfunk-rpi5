@@ -71,6 +71,16 @@ impl<P> PadSlots<P> {
         self.sweep_at(active_mask, Instant::now())
     }
 
+    /// Backdate every armed grace clock by [`SWEEP_GRACE`], so the NEXT sweep drops the pads
+    /// whose bits are still clear — consumer tests (the managers') drive the debounce without
+    /// wall-clock sleeps. Test-only: production code has no business expiring the grace.
+    #[cfg(test)]
+    pub(crate) fn expire_grace(&mut self) {
+        for since in self.inactive_since.iter_mut().flatten() {
+            *since -= SWEEP_GRACE;
+        }
+    }
+
     /// [`Self::sweep`] with an injectable clock (unit tests drive the grace window).
     fn sweep_at(&mut self, active_mask: u16, now: Instant) -> u16 {
         let mut swept = 0u16;
