@@ -28,6 +28,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import io.unom.punktfunk.kit.DsDevice
 import io.unom.punktfunk.kit.Gamepad
 import io.unom.punktfunk.kit.GamepadRouter
 import io.unom.punktfunk.kit.Keymap
@@ -169,6 +170,10 @@ class MainActivity : ComponentActivity() {
     private var sc2Receiver: BroadcastReceiver? = null
     private var sc2PermissionAsked = false
 
+    /** Sony-pad USB grant asked this attach — a deny doesn't re-nag until a fresh attach (or the
+     *  Controllers screen's explicit button). */
+    private var dsPermissionAsked = false
+
     /**
      * Compose focus hook for the SC2's synthetic D-pad (set by [onCreate]'s composition). A
      * synthetic KeyEvent dispatched from OUTSIDE the real input pipeline never reaches
@@ -225,6 +230,8 @@ class MainActivity : ComponentActivity() {
                     UsbManager.ACTION_USB_DEVICE_ATTACHED -> {
                         sc2PermissionAsked = false // a fresh attach may ask once again
                         startSc2MenuNav()
+                        dsPermissionAsked = false
+                        maybeAskDsPermission()
                     }
                     SC2_MENU_PERMISSION -> {
                         if (intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)) {
@@ -281,6 +288,7 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         startSc2MenuNav()
+        maybeAskDsPermission()
     }
 
     override fun onPause() {
@@ -339,6 +347,37 @@ class MainActivity : ComponentActivity() {
     fun stopSc2MenuNav() {
         sc2Menu?.stop()
         sc2MenuActive = false
+    }
+
+    /**
+     * Ask for USB access to an attached Sony pad the moment it appears — a fresh attach while
+     * the app is open, or the app coming to the foreground with one already plugged in — at most
+     * once per attach, so the stream-mode capture ([io.unom.punktfunk.kit.DsCapture]) engages
+     * silently instead of interrupting stream start with the dialog. Unlike the SC2's menu flow
+     * there is nothing to START on the grant: an uncaptured Sony pad is an ordinary InputDevice
+     * at menu time, so the grant is simply recorded (Android keeps it while the pad stays
+     * attached). The broadcast only refreshes the Controllers screen's card if it happens to be
+     * open; a deny leaves that card's explicit button as the re-ask.
+     */
+    private fun maybeAskDsPermission() {
+        if (streamHandle != 0L) return // StreamScreen owns its own permission flow while streaming
+        if (dsPermissionAsked) return
+        if (!SettingsStore(this).load().dsCapture) return
+        val usbManager = getSystemService(Context.USB_SERVICE) as UsbManager
+        val dev = usbManager.deviceList.values.firstOrNull {
+            it.vendorId == DsDevice.VID_SONY && it.productId in DsDevice.USB_PIDS
+        } ?: return
+        if (usbManager.hasPermission(dev)) return
+        dsPermissionAsked = true
+        usbManager.requestPermission(
+            dev,
+            PendingIntent.getBroadcast(
+                this, 4, // requestCode 4 — 0..3 are the SC2 stream/menu + DS stream/card grants
+                Intent(DS_USB_PERMISSION_ACTION).setPackage(packageName),
+                // MUTABLE: the USB stack appends the grant extras to this intent.
+                PendingIntent.FLAG_MUTABLE,
+            ),
+        )
     }
 
     /**

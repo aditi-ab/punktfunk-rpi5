@@ -329,10 +329,18 @@ private fun Sc2Row(usbDev: android.hardware.usb.UsbDevice?, activity: MainActivi
 }
 
 /**
- * The Sony USB pad card — capture status + the USB grant, front-loading the permission dialog so
- * the capture engages silently at stream start instead of interrupting it. Shown ALONGSIDE the
- * pad's ordinary [PadRow] (unclaimed it is still an InputDevice); the capture itself only runs
- * inside a stream, so at menu time this card is pure status.
+ * Broadcast action for the Sony-pad USB grants — fired by both the menu-time auto-ask
+ * ([MainActivity.maybeAskDsPermission]) and [DsRow]'s explicit button, so an open card
+ * refreshes whichever dialog was answered.
+ */
+internal const val DS_USB_PERMISSION_ACTION = "io.unom.punktfunk.DS_CONTROLLERS_USB_PERMISSION"
+
+/**
+ * The Sony USB pad card — capture status + the USB grant. The grant normally arrives via the
+ * menu-time auto-ask the moment the pad attaches ([MainActivity.maybeAskDsPermission]); the
+ * button here is the recovery path after a deny (the auto-ask fires once per attach). Shown
+ * ALONGSIDE the pad's ordinary [PadRow] (unclaimed it is still an InputDevice); the capture
+ * itself only runs inside a stream, so at menu time this card is pure status.
  */
 @Composable
 private fun DsRow(usbDev: android.hardware.usb.UsbDevice) {
@@ -349,7 +357,7 @@ private fun DsRow(usbDev: android.hardware.usb.UsbDevice) {
     }
     // Refresh `permitted` when the grant dialog answers (the grant itself is system-recorded;
     // this receiver only updates the card).
-    val action = "io.unom.punktfunk.DS_CONTROLLERS_USB_PERMISSION"
+    val action = DS_USB_PERMISSION_ACTION
     DisposableEffect(usbDev) {
         val receiver = object : android.content.BroadcastReceiver() {
             override fun onReceive(c: Context?, i: android.content.Intent?) {
