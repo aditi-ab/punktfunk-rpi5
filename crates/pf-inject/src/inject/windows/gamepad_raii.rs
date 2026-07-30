@@ -825,7 +825,7 @@ impl DriverAttach {
             Some(false) => {
                 "driver package NOT in the driver store — run: punktfunk-host.exe driver install --gamepad"
             }
-            None => "driver store could not be queried (pnputil failed)",
+            None => "driver store could not be queried (pnputil failed or still enumerating)",
         };
         let devnode = match &self.instance_id {
             Some(id) => devnode_status_line(id),
@@ -850,28 +850,52 @@ impl DriverAttach {
     }
 }
 
+/// How long [`driver_store_inventory`] lets the caller wait for the background pnputil query
+/// before reporting without it — [`observe`] runs on the pad service thread, which must keep
+/// draining pad slots even when the driver store is wedged.
+const INVENTORY_WAIT: Duration = Duration::from_secs(2);
+
 /// Driver-store inventory (`pnputil /enum-drivers`), lower-cased, fetched once per process — only
-/// consulted on the failure path, so the one-off subprocess cost never hits a healthy session.
-fn driver_store_inventory() -> &'static str {
+/// consulted on the failure path, so the subprocess cost never hits a healthy session. The query
+/// runs on its OWN thread: pnputil can block for tens of seconds on a busy/wedged driver store,
+/// and the caller is the pad service thread. `None` = not available yet (query still running) or
+/// failed; a query that outlives [`INVENTORY_WAIT`] still lands in the cache for later reports.
+fn driver_store_inventory() -> Option<&'static str> {
     static INV: OnceLock<String> = OnceLock::new();
-    INV.get_or_init(|| {
-        // Resolve pnputil by full System32 path — the host runs as SYSTEM and must not trust PATH /
-        // the CreateProcess search (which checks the launching EXE's own dir first), or a planted
-        // `pnputil.exe` beside the host binary would run elevated (security-review 2026-07-17).
-        let pnputil = std::env::var("SystemRoot")
-            .map(|r| format!(r"{r}\System32\pnputil.exe"))
-            .unwrap_or_else(|_| "pnputil.exe".to_string());
-        std::process::Command::new(&pnputil)
-            .arg("/enum-drivers")
-            .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).to_ascii_lowercase())
-            .unwrap_or_default()
-    })
+    static SPAWN: std::sync::Once = std::sync::Once::new();
+    SPAWN.call_once(|| {
+        std::thread::spawn(|| {
+            // Resolve pnputil by full System32 path — the host runs as SYSTEM and must not trust
+            // PATH / the CreateProcess search (which checks the launching EXE's own dir first), or
+            // a planted `pnputil.exe` beside the host binary would run elevated (security-review
+            // 2026-07-17).
+            let pnputil = std::env::var("SystemRoot")
+                .map(|r| format!(r"{r}\System32\pnputil.exe"))
+                .unwrap_or_else(|_| "pnputil.exe".to_string());
+            let inv = std::process::Command::new(&pnputil)
+                .arg("/enum-drivers")
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).to_ascii_lowercase())
+                .unwrap_or_default();
+            let _ = INV.set(inv);
+        });
+    });
+    let deadline = Instant::now() + INVENTORY_WAIT;
+    loop {
+        if let Some(inv) = INV.get() {
+            return Some(inv);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
-/// Whether the driver store holds `inf` (e.g. `pf_xusb.inf`). `None` = pnputil unavailable/failed.
+/// Whether the driver store holds `inf` (e.g. `pf_xusb.inf`). `None` = pnputil unavailable,
+/// failed, or still enumerating.
 fn driver_store_has(inf: &str) -> Option<bool> {
-    let inv = driver_store_inventory();
+    let inv = driver_store_inventory()?;
     if inv.is_empty() {
         return None;
     }
