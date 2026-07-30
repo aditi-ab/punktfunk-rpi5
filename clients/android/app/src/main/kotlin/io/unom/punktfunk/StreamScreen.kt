@@ -78,6 +78,10 @@ fun StreamScreen(session: ActiveSession, onDisconnect: () -> Unit) {
     val micEnabled = initialSettings.micEnabled
     val context = LocalContext.current
     val activity = context as? MainActivity
+    // The View hosting this composition — the one that receives the stream's touch/pointer events
+    // (the gesture Box below is a Compose node inside it), so it is where unbuffered dispatch is
+    // requested.
+    val composeView = androidx.compose.ui.platform.LocalView.current
     val window = activity?.window
     val controller = remember(window) {
         window?.let { WindowCompat.getInsetsController(it, it.decorView) }
@@ -100,6 +104,9 @@ fun StreamScreen(session: ActiveSession, onDisconnect: () -> Unit) {
     var stats by remember { mutableStateOf<DoubleArray?>(null) }
     var decoderLabel by remember { mutableStateOf("") }
     var codecLabel by remember { mutableStateOf("") }
+    // The panel's LIVE refresh rate, re-read each poll — the HUD flags a session whose panel sits
+    // below the stream rate (an OEM governor that ignored both the mode pin and the surface hint).
+    var panelHz by remember { mutableStateOf(0f) }
     var statsVerbosity by remember { mutableStateOf(initialSettings.statsVerbosity) }
     val statsOn = statsVerbosity != StatsVerbosity.OFF
     // Touch model is fixed per session (re-keys the gesture handler below if it ever changes).
@@ -121,6 +128,7 @@ fun StreamScreen(session: ActiveSession, onDisconnect: () -> Unit) {
             while (true) {
                 delay(1000)
                 stats = NativeBridge.nativeVideoStats(handle)
+                panelHz = runCatching { context.display }.getOrNull()?.refreshRate ?: 0f
                 // The decoder is fixed for the session; fetch its label once it's resolved.
                 if (decoderLabel.isEmpty()) decoderLabel = NativeBridge.nativeVideoDecoderLabel(handle)
             }
@@ -305,7 +313,22 @@ fun StreamScreen(session: ActiveSession, onDisconnect: () -> Unit) {
         } else {
             null
         }
-        activity?.setConsoleHighRefreshRate(false) // let the decoder's setFrameRate pick the panel rate
+        // Pin the panel to the stream's refresh (exact / multiple) for the session. The decoder's
+        // own ANativeWindow_setFrameRate hint still aligns vsync, but it is advisory — some OEM
+        // refresh governors ignore it outright and would leave a 120 Hz session on a 60/90 Hz
+        // panel. TV boxes skip the pin: the native side actively drives the HDMI mode there.
+        val streamHz = NativeBridge.nativeVideoSize(handle)?.getOrNull(2) ?: 0
+        if (isTv) {
+            activity?.setConsoleHighRefreshRate(false) // the decoder's HDMI mode switch governs
+        } else {
+            activity?.setStreamDisplayMode(streamHz)
+        }
+        // Touch/pointer events are vsync-batched by default — up to a frame of input latency the
+        // stream shouldn't pay. Unbuffered dispatch delivers them the moment the kernel does.
+        // Undone by passing 0 on the way out (API 30+).
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            composeView.requestUnbufferedDispatch(android.view.InputDevice.SOURCE_CLASS_POINTER)
+        }
         // Host→client feedback (rumble + DualSense lightbar/LEDs), routed to each controller by pad
         // index via the router; poll threads stopped + joined before the router is released and the
         // session closed. "Rumble on this phone" (opt-in) additionally mirrors controller 1's
@@ -435,6 +458,9 @@ fun StreamScreen(session: ActiveSession, onDisconnect: () -> Unit) {
             // Back in the menus: the SC2 (if present) resumes driving the console UI.
             activity?.startSc2MenuNav()
             activity?.setConsoleHighRefreshRate(true) // back to the console UI's max refresh
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                composeView.requestUnbufferedDispatch(0) // back to ordinary batched dispatch
+            }
             controller?.hide(WindowInsetsCompat.Type.ime()) // drop any keyboard left showing
             window?.setSoftInputMode(priorSoftInput)
             controller?.show(WindowInsetsCompat.Type.systemBars())
@@ -555,6 +581,7 @@ fun StreamScreen(session: ActiveSession, onDisconnect: () -> Unit) {
             stats?.let {
                 StatsOverlay(
                     it, statsVerbosity, decoderLabel, codecLabel, session.profileName,
+                    panelHz,
                     Modifier.align(Alignment.TopStart).padding(12.dp),
                 )
             }

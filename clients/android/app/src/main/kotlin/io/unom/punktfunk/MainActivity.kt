@@ -444,14 +444,56 @@ class MainActivity : ComponentActivity() {
     /**
      * Opt the CONSOLE UI into the panel's highest refresh mode. Some OEMs (Nothing OS among them) pin
      * third-party apps to 60Hz unless they explicitly ask for more, which halves the smoothness of the
-     * UI's scrolling/animation on a 120/144Hz panel. [StreamScreen] turns this OFF while streaming so
-     * its own `ANativeWindow_setFrameRate` (matched to the video) governs the panel instead.
+     * UI's scrolling/animation on a 120/144Hz panel. [StreamScreen] replaces this with
+     * [setStreamDisplayMode] while streaming (matched to the video, not to the panel maximum).
      */
     fun setConsoleHighRefreshRate(high: Boolean) {
         if (highRefreshModeId == 0) return
         window.attributes = window.attributes.apply {
             preferredDisplayModeId = if (high) highRefreshModeId else 0
         }
+    }
+
+    /**
+     * Pin the panel to a display mode matching the STREAM's refresh for the session's duration —
+     * exact rate first, else the smallest integer multiple (120 for a 60 stream: judder-free 2:1
+     * pulldown), else the highest available. Same-resolution modes only.
+     *
+     * The window-level mode pin is the belt to the decoder's `ANativeWindow_setFrameRate` braces:
+     * the surface hint alone is advisory, and several OEM refresh governors (Nothing OS's LTPO
+     * logic among them) ignore it entirely for third-party apps — leaving a 120 Hz session
+     * presenting on a 60/90 Hz panel, which reads as judder + a refresh of extra latency. The
+     * preferredDisplayModeId is the one signal they all honor. [hz] ≤ 0 falls back to releasing
+     * the pin (the pre-pin behaviour).
+     */
+    fun setStreamDisplayMode(hz: Int) {
+        if (hz <= 0) {
+            setConsoleHighRefreshRate(false)
+            return
+        }
+        @Suppress("DEPRECATION")
+        val disp = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) display else windowManager.defaultDisplay
+        val current = disp?.mode ?: return
+        val sameRes = disp.supportedModes.filter {
+            it.physicalWidth == current.physicalWidth && it.physicalHeight == current.physicalHeight
+        }
+        fun multiple(rate: Float): Int {
+            val k = (rate / hz).toInt()
+            return if (k >= 2 && kotlin.math.abs(rate - hz * k) < 1f) k else 0
+        }
+        val target = sameRes.minWithOrNull(
+            compareBy(
+                {
+                    when {
+                        kotlin.math.abs(it.refreshRate - hz) < 1f -> 0 // exact
+                        multiple(it.refreshRate) > 0 -> 1 // integer multiple — prefer smallest
+                        else -> 2 // no relation — prefer highest so at least nothing is halved
+                    }
+                },
+                { if (multiple(it.refreshRate) > 0) it.refreshRate else -it.refreshRate },
+            ),
+        ) ?: return
+        window.attributes = window.attributes.apply { preferredDisplayModeId = target.modeId }
     }
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {

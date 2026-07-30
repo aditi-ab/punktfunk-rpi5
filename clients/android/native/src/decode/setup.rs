@@ -180,8 +180,14 @@ pub(super) fn boost_thread_priority() {
 ///     mode (e.g. 60↔120) instead of leaving the panel at its default and judder-matching. The
 ///     forced switch may blank the panel briefly — acceptable once at stream start, not wanted on a
 ///     phone. Falls through to the 2-arg hint on API 30.
-///   - Otherwise: `ANativeWindow_setFrameRate` (**API 30**) with `compatibility = DEFAULT` — the
-///     softer, seamless-preferred hint for phones/tablets and the universal fallback.
+///   - Otherwise: `ANativeWindow_setFrameRate` (**API 30**) — the seamless-preferred hint for
+///     phones/tablets and the universal fallback.
+///
+/// Both paths pass `compatibility = FIXED_SOURCE` (1): the stream is fixed-rate video content the
+/// client cannot re-pace, which is exactly what that value declares — `DEFAULT` (0) told the
+/// platform the app could adapt to whatever rate it picked, an invitation some OEM refresh
+/// governors accepted by simply not switching. (The window-level `preferredDisplayModeId` pin in
+/// `MainActivity.setStreamDisplayMode` is the phone-side belt to this braces.)
 ///
 /// Returns `true` when the platform accepted a hint; `false` on API < 30 (symbols absent) or a
 /// decline.
@@ -200,8 +206,10 @@ pub(super) fn try_set_frame_rate(window: &NativeWindow, frame_rate: f32, is_tv: 
         if lib.is_null() {
             return false;
         }
-        // TV: prefer the API-31 change-strategy form to force the mode switch (strategy 1 = ALWAYS,
-        // compatibility 0 = DEFAULT). Absent on API 30 ⇒ fall through to the 2-arg hint below.
+        // ANATIVEWINDOW_FRAME_RATE_COMPATIBILITY_FIXED_SOURCE — fixed-rate video content.
+        const FIXED_SOURCE: i8 = 1;
+        // TV: prefer the API-31 change-strategy form to force the mode switch (strategy 1 =
+        // ALWAYS). Absent on API 30 ⇒ fall through to the 2-arg hint below.
         if is_tv {
             let sym = libc::dlsym(
                 lib,
@@ -209,7 +217,7 @@ pub(super) fn try_set_frame_rate(window: &NativeWindow, frame_rate: f32, is_tv: 
             );
             if !sym.is_null() {
                 let set = std::mem::transmute::<*mut c_void, SetFrameRateStrategyFn>(sym);
-                return set(window.ptr().as_ptr().cast(), frame_rate, 0, 1) == 0;
+                return set(window.ptr().as_ptr().cast(), frame_rate, FIXED_SOURCE, 1) == 0;
             }
         }
         let sym = libc::dlsym(lib, c"ANativeWindow_setFrameRate".as_ptr());
@@ -217,7 +225,7 @@ pub(super) fn try_set_frame_rate(window: &NativeWindow, frame_rate: f32, is_tv: 
             return false; // device API < 30 — no per-surface frame-rate hint
         }
         let set_frame_rate = std::mem::transmute::<*mut c_void, SetFrameRateFn>(sym);
-        set_frame_rate(window.ptr().as_ptr().cast(), frame_rate, 0) == 0
+        set_frame_rate(window.ptr().as_ptr().cast(), frame_rate, FIXED_SOURCE) == 0
     }
 }
 

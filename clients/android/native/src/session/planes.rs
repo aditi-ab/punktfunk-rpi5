@@ -264,10 +264,12 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeVideoStats(
 }
 
 /// `NativeBridge.nativeVideoSize(handle): IntArray?` — the negotiated video mode as
-/// `[width, height]`. Resolved at the handshake (Welcome), so it is known before a single frame
-/// arrives: the UI sizes the video surface to the STREAM's aspect rather than stretching it to the
-/// panel's. `null` on a `0` handle. Not android-gated — pure `jni` + a connector read, so it links
-/// on the host build too. Cheap; safe on the UI thread.
+/// `[width, height, refreshHz]`. Resolved at the handshake (Welcome), so it is known before a
+/// single frame arrives: the UI sizes the video surface to the STREAM's aspect rather than
+/// stretching it to the panel's, and pins the panel's display mode to the stream refresh. The
+/// trailing `refreshHz` was appended later — old readers index only 0/1 and never see it. `null`
+/// on a `0` handle. Not android-gated — pure `jni` + a connector read, so it links on the host
+/// build too. Cheap; safe on the UI thread.
 #[no_mangle]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeVideoSize(
     env: JNIEnv,
@@ -281,7 +283,11 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeVideoSize(
         // SAFETY: live handle per the nativeConnect/nativeClose contract.
         let h = unsafe { &*(handle as *const SessionHandle) };
         let mode = h.client.mode();
-        let buf: [i32; 2] = [mode.width as i32, mode.height as i32];
+        let buf: [i32; 3] = [
+            mode.width as i32,
+            mode.height as i32,
+            mode.refresh_hz as i32,
+        ];
         let arr = match env.new_int_array(buf.len() as jsize) {
             Ok(a) => a,
             Err(_) => return std::ptr::null_mut(),

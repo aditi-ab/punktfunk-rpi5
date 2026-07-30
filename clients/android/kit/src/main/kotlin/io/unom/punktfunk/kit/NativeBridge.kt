@@ -184,10 +184,12 @@ object NativeBridge {
     external fun nativeVideoMime(handle: Long): String
 
     /**
-     * The negotiated video mode as `[width, height]`, or `null` on a `0` handle. Resolved at the
-     * handshake, so it is known before the first frame — the stream view sizes itself to THIS
-     * aspect rather than stretching the picture to the panel's. Fixed for the session; read once.
-     * Cheap; UI-safe.
+     * The negotiated video mode as `[width, height, refreshHz]`, or `null` on a `0` handle.
+     * Resolved at the handshake, so it is known before the first frame — the stream view sizes
+     * itself to THIS aspect rather than stretching the picture to the panel's, and pins the
+     * panel's display mode to the stream refresh. The trailing `refreshHz` was appended later
+     * (an older native lib returns only `[width, height]` — index defensively). Fixed for the
+     * session; read once. Cheap; UI-safe.
      */
     external fun nativeVideoSize(handle: Long): IntArray?
 
@@ -204,8 +206,8 @@ object NativeBridge {
      * entirely in Rust (NDK AMediaCodec → ANativeWindow) — no per-frame JNI. [decoderName] is the
      * decoder Kotlin ranked from `MediaCodecList` (`""` = let the platform resolve the default for
      * the MIME — what the pre-overhaul client always did); [lowLatencyMode] is the user's
-     * "Low-latency mode (experimental)" toggle (off, the default, runs the original decode
-     * pipeline; on, the aggressive per-SoC tuning + async loop); [lowLatencyFeature] is whether
+     * "Low-latency mode" master toggle (ON by default: async loop + per-SoC tuning; off runs the
+     * original synchronous pipeline as the per-device escape hatch); [lowLatencyFeature] is whether
      * [decoderName] advertised `FEATURE_LowLatency` (HUD label only). [isTv] drives an active HDMI
      * mode switch to the stream refresh on TV boxes when the toggle is on (vs. the softer seamless
      * hint otherwise). No-op if already started.

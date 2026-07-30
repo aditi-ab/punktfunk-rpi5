@@ -46,12 +46,20 @@ internal fun StatsOverlay(
      * common case: no profile) the line is exactly what it always was.
      */
     profileName: String? = null,
+    /**
+     * The panel's live refresh rate (0 = unknown). Shown as a warning on the first line whenever
+     * it sits below the stream rate — the "an OEM governor ignored the mode pin" tell, which
+     * otherwise reads as inexplicable judder and an extra refresh of latency.
+     */
+    panelHz: Float = 0f,
     modifier: Modifier = Modifier,
 ) {
     if (verbosity == StatsVerbosity.OFF || s.size < 10) return
     val w = s[6].toInt()
     val h = s[7].toInt()
     val hz = s[8].toInt()
+    val panelBelowStream = panelHz > 0f && hz > 0 && panelHz + 1f < hz.toFloat()
+    val panelTag = if (panelBelowStream) "   ⚠ panel ${panelHz.roundToInt()} Hz" else ""
     val latValid = s[4] != 0.0
     val skew = s[5] != 0.0
     val lost = s[9].toLong()
@@ -65,12 +73,12 @@ internal fun StatsOverlay(
         val profileTag = profileName?.let { "   · $it" }.orEmpty()
         // Compact: everything the glance-value needs on one line, nothing else.
         if (verbosity == StatsVerbosity.COMPACT) {
-            statLine(compactLine(s, latValid) + profileTag, Color.White)
+            statLine(compactLine(s, latValid) + profileTag + panelTag, Color.White)
             return@Column
         }
 
         statLine(
-            "$w×$h@$hz   ${s[0].roundToInt()} fps   ${"%.1f".format(s[1])} Mb/s$profileTag",
+            "$w×$h@$hz   ${s[0].roundToInt()} fps   ${"%.1f".format(s[1])} Mb/s$profileTag$panelTag",
             Color.White,
         )
         if (detailed && decoderLabel.isNotEmpty()) {
