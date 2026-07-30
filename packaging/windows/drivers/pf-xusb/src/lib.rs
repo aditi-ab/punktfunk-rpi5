@@ -15,13 +15,17 @@
 // unavoidable WDF setup FFI in DriverEntry/EvtDeviceAdd, each with a `// SAFETY:` proof.
 //
 // We answer the WAIT_* IOCTLs with STATUS_INVALID_DEVICE_REQUEST, which makes xinput1_4 fall back to
-// synchronous GET_STATE polling — so no manual queue / timer is needed for classic XInput.
+// synchronous GET_STATE polling — so no manual queue is needed for classic XInput. A periodic WDF
+// timer (the pf-gamepad pattern) owns the sealed-channel pump: adoption, re-delivery and host-gone
+// detection all happen there, so the IOCTL path reads the CACHED view instead of re-opening the
+// bootstrap mailbox (open+map+close+unmap + 2 allocs) on EVERY XInput poll.
 
 #![allow(non_snake_case, non_upper_case_globals, clippy::missing_safety_doc)]
 // Every remaining `unsafe {}` (all WDF setup FFI) must carry a `// SAFETY:` proof.
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(clippy::undocumented_unsafe_blocks)]
 
+use core::sync::atomic::{AtomicBool, Ordering};
 use pf_driver_proto::gamepad::XusbShm;
 use pf_umdf_util::channel::{ChannelClient, ChannelConfig};
 use pf_umdf_util::nt_success;
@@ -29,8 +33,9 @@ use pf_umdf_util::section::MappedView;
 use pf_umdf_util::wdf::{self, Request};
 use wdk_sys::{
     GUID, NTSTATUS, PCUNICODE_STRING, PDRIVER_OBJECT, PWDFDEVICE_INIT, ULONG, WDF_DRIVER_CONFIG,
-    WDF_IO_QUEUE_CONFIG, WDF_NO_HANDLE, WDF_NO_OBJECT_ATTRIBUTES, WDFDEVICE, WDFDRIVER, WDFQUEUE,
-    WDFREQUEST, call_unsafe_wdf_function_binding, windows::OutputDebugStringA,
+    WDF_IO_QUEUE_CONFIG, WDF_NO_HANDLE, WDF_NO_OBJECT_ATTRIBUTES, WDF_OBJECT_ATTRIBUTES,
+    WDF_TIMER_CONFIG, WDFDEVICE, WDFDRIVER, WDFQUEUE, WDFREQUEST, WDFTIMER,
+    call_unsafe_wdf_function_binding, windows::OutputDebugStringA,
 };
 
 // ---- NTSTATUS ----
@@ -74,6 +79,8 @@ const XUSB_VERSION: u16 = 0x0103;
 // ---- WDF enum values ----
 const WdfIoQueueDispatchParallel: i32 = 2;
 const WdfUseDefault: i32 = 2; // WDF_TRI_STATE
+const WdfExecutionLevelInheritFromParent: i32 = 1; // WDF_EXECUTION_LEVEL
+const WdfSynchronizationScopeInheritFromParent: i32 = 1; // WDF_SYNCHRONIZATION_SCOPE
 
 // ---- the sealed host channel: layouts + offsets from pf_driver_proto (drift = compile error) ----
 const SHM_MAGIC: u32 = pf_driver_proto::gamepad::XUSB_MAGIC; // "PFXU"
@@ -99,6 +106,12 @@ const OFF_PAD_INDEX: usize = core::mem::offset_of!(XusbShm, pad_index);
 /// The sealed-channel client (per-pad: `ProcessSharingDisabled` gives each pad its own WUDFHost, so
 /// this static is per-pad). All shared-memory access + the bootstrap handshake live in `pf_umdf_util`.
 static CHANNEL: ChannelClient = ChannelClient::new();
+
+/// Host liveness as observed by the timer's last pump: the mailbox-name existence IS the signal
+/// (`pf_umdf_util::channel`). The IOCTL path consults this instead of pumping, so a vanished host
+/// still reads as a neutral pad within one timer tick (≤8 ms) — the detach semantics the per-IOCTL
+/// pump used to provide instantly.
+static HOST_LIVE: AtomicBool = AtomicBool::new(false);
 
 /// This pad's channel config (magic/size/pad_index offset + our logger).
 fn channel_cfg() -> ChannelConfig {
@@ -149,6 +162,12 @@ fn file_appender() -> Option<&'static std::sync::Mutex<std::fs::File>> {
 }
 
 fn log(s: &str) {
+    // Gated as a whole on [`file_log_enabled`]: `OutputDebugStringA` used to fire unconditionally
+    // — a syscall + CString alloc per logged event in a RELEASE driver, on paths that run per
+    // IOCTL. Debug builds and the env-var opt-in keep the full debug-string + file tee.
+    if !file_log_enabled() {
+        return;
+    }
     if let Ok(c) = std::ffi::CString::new(s) {
         // SAFETY: `c` is a valid NUL-terminated string for the duration of the call.
         unsafe { OutputDebugStringA(c.as_ptr().cast()) };
@@ -160,7 +179,8 @@ fn log(s: &str) {
         let _ = writeln!(f, "{s}");
     }
 }
-macro_rules! dbglog { ($($a:tt)*) => { log(&format!($($a)*)) } }
+// The `file_log_enabled()` pre-check skips the `format!` alloc too when logging is off.
+macro_rules! dbglog { ($($a:tt)*) => { if file_log_enabled() { log(&format!($($a)*)) } } }
 
 #[unsafe(export_name = "DriverEntry")]
 pub unsafe extern "system" fn driver_entry(
@@ -255,13 +275,15 @@ extern "C" fn evt_device_add(_driver: WDFDRIVER, mut device_init: PWDFDEVICE_INI
     // Run the sealed-channel handshake on a worker (must NOT block EvtDeviceAdd): publish our pid in
     // the bootstrap mailbox and poll for the host's delivered DATA handle, so the pad attaches (and
     // the host's driver-attach health check goes green) even before any game polls XInput. Bounded;
-    // a later host (or a re-delivery) is still picked up by the per-IOCTL pump. This closure is 100%
-    // safe — the whole channel state machine lives in pf_umdf_util.
+    // a later host (or a re-delivery) is picked up by the periodic timer below. This closure is 100%
+    // safe — the whole channel state machine lives in pf_umdf_util (whose adopt CAS is explicitly
+    // built for concurrent pumps, so worker + timer coexisting is sound).
     std::thread::spawn(|| {
         let cfg = channel_cfg();
         for _ in 0..500 {
             if let Some(v) = CHANNEL.pump(&cfg) {
                 touch_driver_marks(v);
+                HOST_LIVE.store(true, Ordering::Relaxed);
                 return;
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
@@ -271,8 +293,46 @@ extern "C" fn evt_device_add(_driver: WDFDRIVER, mut device_init: PWDFDEVICE_INI
         );
     });
 
+    // Periodic sealed-channel tick (the pf-gamepad timer pattern, parented to the default queue):
+    // owns the mailbox pump — adoption, re-delivery, host-gone — so the XInput IOCTL path never
+    // re-opens the mailbox (see `evt_io_device_control`).
+    // SAFETY: zeroed config then fields set.
+    let mut tcfg: WDF_TIMER_CONFIG = unsafe { core::mem::zeroed() };
+    tcfg.Size = core::mem::size_of::<WDF_TIMER_CONFIG>() as ULONG;
+    tcfg.EvtTimerFunc = Some(evt_timer);
+    tcfg.Period = 8; // ms
+    tcfg.AutomaticSerialization = 1; // TRUE — UMDF requires a serialized timer (vhidmini2 pattern)
+    // SAFETY: a zeroed WDF_OBJECT_ATTRIBUTES is a valid all-null attributes struct; we set Size + the
+    // fields we use below.
+    let mut tattr: WDF_OBJECT_ATTRIBUTES = unsafe { core::mem::zeroed() };
+    tattr.Size = core::mem::size_of::<WDF_OBJECT_ATTRIBUTES>() as ULONG;
+    tattr.ParentObject = queue.cast();
+    // mem::zeroed leaves these at 0 (Invalid) → set them like WDF_OBJECT_ATTRIBUTES_INIT
+    // (matches the working vhidmini2 UMDF timer setup; avoids 0xc0200209 / 0xc00000bb).
+    tattr.ExecutionLevel = WdfExecutionLevelInheritFromParent;
+    tattr.SynchronizationScope = WdfSynchronizationScopeInheritFromParent;
+    let mut timer: WDFTIMER = core::ptr::null_mut();
+    // SAFETY: config + attributes valid; timer receives the handle.
+    let st = unsafe {
+        call_unsafe_wdf_function_binding!(WdfTimerCreate, &mut tcfg, &mut tattr, &mut timer)
+    };
+    if !nt_success(st) {
+        dbglog!("[pf-xusb] WdfTimerCreate failed 0x{:08x}", st as u32);
+        return st;
+    }
+    // SAFETY: timer valid; -80000 == 8ms relative due time (100ns units, negative = relative).
+    let _started = unsafe { call_unsafe_wdf_function_binding!(WdfTimerStart, timer, -80000i64) };
+
     log("[pf-xusb] device ready (XUSB interface registered)");
     STATUS_SUCCESS
+}
+
+/// One sealed-channel tick: pump the bootstrap mailbox (adopt a delivery / detect host-gone) and
+/// refresh [`HOST_LIVE`]. This is the ONLY steady-state pump — the IOCTL path reads the cached
+/// view. All safe; the channel state machine lives in pf_umdf_util.
+extern "C" fn evt_timer(_timer: WDFTIMER) {
+    let live = CHANNEL.pump(&channel_cfg()).is_some();
+    HOST_LIVE.store(live, Ordering::Relaxed);
 }
 
 /// The current controller state from the attached DATA section (zeros / neutral when unattached).
@@ -369,10 +429,17 @@ extern "C" fn evt_io_device_control(
     // contract `Request::new` requires. From here everything is safe (the token owns completion).
     let request = unsafe { Request::new(request) };
 
-    // Sealed-channel pump + health marks first: adopt a (late) delivery, detach when the host's
-    // mailbox is gone, and stamp the attach/heartbeat marks the host watches (also covers a host
-    // started after this device — the pump attaches on the next XInput poll).
-    let data = CHANNEL.pump(&channel_cfg());
+    // The CACHED data view, gated on the timer's host-liveness read. This path used to call
+    // `CHANNEL.pump()` — a mailbox open+map+close+unmap plus two heap allocs — on EVERY XInput
+    // poll, per pad; the periodic timer owns the pump now (adoption, re-delivery, host-gone), and
+    // a vanished host reads as a neutral pad within one 8 ms tick. The heartbeat mark still
+    // advances per serviced IOCTL, so the host keeps seeing the GAME-visible polling path move,
+    // not the timer.
+    let data = if HOST_LIVE.load(Ordering::Relaxed) {
+        CHANNEL.data()
+    } else {
+        None
+    };
     if let Some(v) = data {
         touch_driver_marks(v);
     }

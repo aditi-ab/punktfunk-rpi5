@@ -210,6 +210,12 @@ fn file_appender() -> Option<&'static std::sync::Mutex<std::fs::File>> {
 }
 
 fn log(s: &str) {
+    // Gated as a whole on [`file_log_enabled`]: `OutputDebugStringA` used to fire unconditionally
+    // — a syscall + CString alloc per logged event in a RELEASE driver, on paths that run per
+    // IOCTL. Debug builds and the env-var opt-in keep the full debug-string + file tee.
+    if !file_log_enabled() {
+        return;
+    }
     if let Ok(c) = std::ffi::CString::new(s) {
         // SAFETY: `c` is a valid NUL-terminated string for the duration of the call.
         unsafe { OutputDebugStringA(c.as_ptr().cast()) };
@@ -221,7 +227,8 @@ fn log(s: &str) {
         let _ = writeln!(f, "{s}");
     }
 }
-macro_rules! dbglog { ($($a:tt)*) => { log(&format!($($a)*)) } }
+// The `file_log_enabled()` pre-check skips the `format!` alloc too when logging is off.
+macro_rules! dbglog { ($($a:tt)*) => { if file_log_enabled() { log(&format!($($a)*)) } } }
 
 #[unsafe(export_name = "DriverEntry")]
 pub unsafe extern "system" fn driver_entry(
