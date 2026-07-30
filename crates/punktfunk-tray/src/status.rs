@@ -194,7 +194,12 @@ fn poll_loop(
     } else {
         format!("https://{mgmt_addr}:{mgmt_port}/api/v1/local/summary")
     };
-    let console_url = format!("https://127.0.0.1:{web_port}/");
+    // `/login`, not `/`: `/` is auth-gated and 302s to `/login`, and ureq follows redirects by
+    // default — so probing `/` spent TLS + `/` + a full cold `/login` SSR render inside one 2 s
+    // budget, and a console that was merely warming up read as down. `/login` is the cheapest page
+    // that proves the server is answering, and the agent below refuses redirects so the probe is
+    // exactly one round trip. (A 302 still counts as up via the `Status` arm in `probe_console`.)
+    let console_url = format!("https://127.0.0.1:{web_port}/login");
     let agent = agent(load_pin());
     let mut last: Option<(TrayStatus, bool)> = None;
     // When the summary became unreachable while the service was running (grace anchor).
@@ -313,6 +318,10 @@ fn agent(pin: Option<[u8; 32]>) -> ureq::Agent {
         .tls_config(Arc::new(cfg))
         .timeout_connect(Duration::from_secs(2))
         .timeout(Duration::from_secs(2))
+        // No redirect-following. Neither user of this agent wants it: the summary is a terminal
+        // JSON route, and the console probe treats any HTTP answer (302 included) as "up", so
+        // chasing the hop only spends the 2 s budget re-rendering a page nobody reads.
+        .redirects(0)
         .build()
 }
 
