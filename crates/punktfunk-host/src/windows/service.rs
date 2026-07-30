@@ -360,6 +360,9 @@ fn supervise(stop: HANDLE, session_ev: HANDLE) -> Result<()> {
     let job = make_job().context("create job object")?;
 
     let mut restarts: u32 = 0;
+    // One-shot latch for the update boot-loop rollback (plan U3.2) — a rollback that itself
+    // fails must not spawn installers in a loop.
+    let mut rollback_attempted = false;
     loop {
         if wait_one(stop, 0) {
             break;
@@ -462,6 +465,7 @@ fn supervise(stop: HANDLE, session_ev: HANDLE) -> Result<()> {
         }
 
         restarts += 1;
+        maybe_boot_loop_rollback(restarts, &mut rollback_attempted);
         let backoff = restarts.min(10) * 500; // 0.5s..5s
         if wait_one(stop, backoff) {
             break;
@@ -1128,4 +1132,108 @@ fn run_quiet(cmd: &str, args: &[&str]) -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+/// Update boot-loop rollback (planning: host-update-from-web-console.md §6, plan U3.2): a
+/// FRESH update-intent record plus a crash-looping child that IS the intent's target version
+/// means the just-installed host doesn't stay up. The supervisor — which survives the upgrade,
+/// making it the right place — rolls back by re-running the CACHED previous installer: once
+/// per intent, Authenticode-checked, outcome written where the console reads it. The service
+/// process is not inside the kill-on-close job, so the spawned installer survives the service
+/// stop it is about to perform.
+fn maybe_boot_loop_rollback(restarts: u32, attempted: &mut bool) {
+    if *attempted || restarts < 3 {
+        return;
+    }
+    let intent_path = crate::update::jobs::intent_path();
+    let Some(intent) = crate::update::jobs::read_intent(&intent_path) else {
+        return;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // A stale intent never triggers rollbacks, and a boot-looping OLD binary (version ≠ the
+    // intent's target) is not an update failure — boot reconciliation owns that story.
+    if now.saturating_sub(intent.started_unix) > 30 * 60 || env!("PUNKTFUNK_VERSION") != intent.to {
+        return;
+    }
+    *attempted = true;
+
+    let updates = pf_paths::config_dir().join("updates");
+    let previous = std::fs::read_dir(&updates)
+        .ok()
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| {
+                    n.starts_with("punktfunk-host-setup-")
+                        && n.ends_with(".exe")
+                        && !n.contains(intent.to.as_str())
+                })
+                .unwrap_or(false)
+        })
+        .max_by_key(|p| {
+            p.metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+        });
+    let Some(previous) = previous else {
+        tracing::error!(
+            to = %intent.to,
+            "updated host is crash-looping and no cached previous installer exists — \
+             leaving the intent for reconcile; manual reinstall required"
+        );
+        return;
+    };
+    // Validity-only Authenticode check: the failed update's manifest pins are gone with it,
+    // and the cached file was fully verified (manifest sha256 + pins) when first downloaded.
+    if let Err(e) = crate::update::windows::verify_authenticode(&previous, &[]) {
+        tracing::error!(
+            installer = %previous.display(),
+            error = %e,
+            "cached previous installer fails its signature check — not rolling back"
+        );
+        return;
+    }
+
+    let log = pf_paths::config_dir()
+        .join("logs")
+        .join(format!("update-rollback-from-{}.log", intent.to));
+    let record = crate::update::jobs::ResultRecord {
+        ok: false,
+        from: intent.from.clone(),
+        to: intent.to.clone(),
+        finished_unix: now,
+        stage: Some("rolled-back".into()),
+        error: Some(format!(
+            "the updated host crash-looped after install; rolled back via {}",
+            previous.display()
+        )),
+        log_path: Some(log.display().to_string()),
+        staged: false,
+    };
+    let _ = crate::update::jobs::write_json_atomic(&crate::update::jobs::result_path(), &record);
+    // Delete the intent BEFORE spawning: the incoming (previous) host must boot clean, and a
+    // missing intent keeps this one-shot even across a service restart.
+    let _ = std::fs::remove_file(&intent_path);
+
+    tracing::warn!(
+        failed_version = %intent.to,
+        back_to = %previous.display(),
+        "updated host is crash-looping — rolling back via the cached previous installer"
+    );
+    match std::process::Command::new(&previous)
+        .args(["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-"])
+        .arg(format!("/LOG={}", log.display()))
+        .spawn()
+    {
+        // Detached on purpose: it stops this service and reinstalls the previous version.
+        Ok(child) => drop(child),
+        Err(e) => tracing::error!(error = %e, "failed to spawn the rollback installer"),
+    }
 }

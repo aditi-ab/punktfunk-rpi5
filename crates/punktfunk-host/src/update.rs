@@ -22,7 +22,7 @@ pub(crate) mod jobs;
 mod linux;
 pub(crate) mod manifest;
 #[cfg(target_os = "windows")]
-mod windows;
+pub(crate) mod windows;
 
 use crate::store::index::PublicKey;
 use manifest::Manifest;

@@ -249,8 +249,9 @@ fn preflight_disk(at: &Path, needed: u64) -> Result<(), String> {
 
 /// Authenticode: valid embedded signature (untrusted root tolerated — self-signed `CN=unom`),
 /// signing-leaf SHA-256 ∈ `pins` when pins are present. The leaf comes out of the same
-/// `WinVerifyTrust` state via `WTHelperGetProvSignerFromChain`.
-fn verify_authenticode(path: &Path, pins: &[String]) -> Result<(), String> {
+/// `WinVerifyTrust` state via `WTHelperGetProvSignerFromChain`. (`pub(crate)`: the service
+/// supervisor's boot-loop rollback re-checks the cached previous installer with it.)
+pub(crate) fn verify_authenticode(path: &Path, pins: &[String]) -> Result<(), String> {
     use windows::core::{GUID, PCWSTR};
     use windows::Win32::Foundation::{CERT_E_UNTRUSTEDROOT, S_OK};
     use windows::Win32::Security::WinTrust::{
