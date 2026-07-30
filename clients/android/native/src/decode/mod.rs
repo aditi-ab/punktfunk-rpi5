@@ -9,8 +9,10 @@
 mod async_loop;
 mod display;
 mod latency;
+mod presenter;
 mod setup;
 mod sync_loop;
+mod vsync;
 
 use async_loop::run_async;
 pub(crate) use setup::{codec_label, codec_mime};
@@ -106,6 +108,13 @@ pub(crate) struct DecodeOptions {
     /// TV form factor (Kotlin's `UiModeManager`): actively drive the HDMI output into the stream's
     /// refresh mode, vs. the softer seamless hint on a phone/tablet.
     pub is_tv: bool,
+    /// The user's presentation intent (`present_priority` setting): 0 = lowest latency
+    /// (newest-wins), 1 = smoothness (a small FIFO). Resolved by
+    /// [`presenter::PresentPriority::resolve`]; anything else = latency.
+    pub present_priority: i32,
+    /// The smoothness buffer depth (`smooth_buffer` setting): 0 = automatic (2), else 1..=3.
+    /// Only meaningful with `present_priority` = smooth.
+    pub smooth_buffer: i32,
 }
 
 /// The decode entry point on the `pf-decode` thread: dispatches to the async or synchronous loop.

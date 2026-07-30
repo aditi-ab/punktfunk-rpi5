@@ -1,0 +1,357 @@
+//! The vsync clock behind the timeline presenter: an `AChoreographer` thread publishing the
+//! panel's vsync grid + upcoming frame timelines, and pulsing the decode loop's event channel so
+//! a frame parked on a closed glass budget gets its retry tick.
+//!
+//! On API 33+ the thread rides `AChoreographer_postVsyncCallback`, whose callback payload carries
+//! the platform's FRAME TIMELINES — for each upcoming refresh, when SurfaceFlinger expects to
+//! present and the deadline by which a frame must be submitted to make it. That pair is exactly
+//! what `AMediaCodec_releaseOutputBufferAtTime` wants as its target. On 31/32 the older
+//! `postFrameCallback64` supplies only the vsync instant; the presenter then releases ASAP
+//! (identical to the legacy path) and uses the measured period purely to predict the latch for
+//! its glass budget.
+//!
+//! Every `AChoreographer_*` symbol is dlsym-resolved from `libandroid.so` (mirrors
+//! [`super::setup::try_set_frame_rate`]): several sit above the crate's API floor, and one hard
+//! import of a too-new symbol fails `System.loadLibrary` on every older device.
+//!
+//! Started LAZILY on the first decoded frame (the Apple deadline presenter's bootstrap lesson:
+//! an eagerly started clock ticks uselessly for the whole connect window), stopped + joined via
+//! [`VsyncClock`]'s `Drop`.
+
+use std::ffi::c_void;
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+/// `CLOCK_MONOTONIC` now in nanoseconds — the clock AChoreographer stamps its timelines on and
+/// the one `AMediaCodec_releaseOutputBufferAtTime` compares against (`System.nanoTime` basis).
+/// Distinct from the stats path's `CLOCK_REALTIME`: presenter scheduling stays monotonic.
+pub(super) fn now_monotonic_ns() -> i64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `clock_gettime` with a valid out-pointer is an always-safe syscall.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    // Explicit widening: timespec's fields are 32-bit on armv7 (time_t/c_long).
+    ts.tv_sec as i64 * 1_000_000_000 + ts.tv_nsec as i64
+}
+
+/// One upcoming frame timeline (API 33+ payload): when SurfaceFlinger expects to present the
+/// frame, and the last instant it can be submitted to make that present. Monotonic ns.
+#[derive(Clone, Copy)]
+pub(super) struct FrameTimeline {
+    pub expected_present_ns: i64,
+    pub deadline_ns: i64,
+}
+
+/// State the choreographer thread publishes and the decode loop reads. All monotonic ns.
+pub(super) struct VsyncShared {
+    stop: AtomicBool,
+    /// The latest vsync callback's frame time (0 = no callback yet).
+    last_vsync_ns: AtomicI64,
+    /// Estimated vsync period (EMA over callback deltas / timeline spacing; 0 = unmeasured).
+    period_ns: AtomicI64,
+    /// The latest callback's upcoming timelines, soonest first. Empty on the 31/32 fallback.
+    timelines: Mutex<Vec<FrameTimeline>>,
+}
+
+impl VsyncShared {
+    /// The measured vsync period, or 0 while unmeasured.
+    pub(super) fn period_ns(&self) -> i64 {
+        self.period_ns.load(Ordering::Relaxed)
+    }
+
+    /// The release target for a frame submitted at `now`: the earliest stored timeline whose
+    /// deadline is still `margin` away, extrapolated forward by whole periods once the stored
+    /// set has aged out (timelines refresh once per vsync callback; a frame can decode anywhere
+    /// inside that window). `None` on the 31/32 fallback — the caller releases ASAP.
+    pub(super) fn next_target(&self, now_ns: i64, margin_ns: i64) -> Option<FrameTimeline> {
+        let g = self
+            .timelines
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for t in g.iter() {
+            if t.deadline_ns > now_ns + margin_ns {
+                return Some(*t);
+            }
+        }
+        let last = g.last().copied()?;
+        let period = self.period_ns();
+        if period <= 0 {
+            return None;
+        }
+        // All stored timelines have passed — step the last one forward whole periods until its
+        // deadline clears `now + margin` again.
+        let behind = (now_ns + margin_ns).saturating_sub(last.deadline_ns);
+        let k = behind / period + 1;
+        Some(FrameTimeline {
+            expected_present_ns: last.expected_present_ns + k * period,
+            deadline_ns: last.deadline_ns + k * period,
+        })
+    }
+}
+
+// ---- dlsym'd AChoreographer surface ----
+
+type PostFrameCallback64 =
+    unsafe extern "C" fn(*mut c_void, unsafe extern "C" fn(i64, *mut c_void), *mut c_void);
+type PostVsyncCallback = unsafe extern "C" fn(
+    *mut c_void,
+    unsafe extern "C" fn(*const c_void, *mut c_void),
+    *mut c_void,
+);
+
+struct ChoreoApi {
+    get_instance: unsafe extern "C" fn() -> *mut c_void,
+    /// API 33: vsync callback with frame-timeline payload. Preferred.
+    post_vsync: Option<PostVsyncCallback>,
+    /// API 29 fallback: frame callback with only the vsync instant.
+    post_frame64: Option<PostFrameCallback64>,
+    // AChoreographerFrameCallbackData accessors (API 33; present iff `post_vsync` is).
+    fcd_frame_time: Option<unsafe extern "C" fn(*const c_void) -> i64>,
+    fcd_timelines_len: Option<unsafe extern "C" fn(*const c_void) -> usize>,
+    fcd_preferred_index: Option<unsafe extern "C" fn(*const c_void) -> usize>,
+    fcd_expected_present: Option<unsafe extern "C" fn(*const c_void, usize) -> i64>,
+    fcd_deadline: Option<unsafe extern "C" fn(*const c_void, usize) -> i64>,
+}
+
+impl ChoreoApi {
+    /// Resolve from `libandroid.so`. `None` when even the baseline symbols are missing.
+    fn resolve() -> Option<ChoreoApi> {
+        // SAFETY: dlopen of the always-mapped libandroid.so (refcount bump, never closed); each
+        // dlsym is null-checked before the transmute to its fn-pointer type.
+        unsafe {
+            let lib = libc::dlopen(c"libandroid.so".as_ptr(), libc::RTLD_NOW);
+            if lib.is_null() {
+                return None;
+            }
+            let sym = |name: &std::ffi::CStr| {
+                let p = libc::dlsym(lib, name.as_ptr());
+                (!p.is_null()).then_some(p)
+            };
+            let get_instance = sym(c"AChoreographer_getInstance")?;
+            let post_vsync = sym(c"AChoreographer_postVsyncCallback");
+            let post_frame64 = sym(c"AChoreographer_postFrameCallback64");
+            post_vsync.or(post_frame64)?; // neither post entry point — no clock on this device
+            Some(ChoreoApi {
+                get_instance: std::mem::transmute::<
+                    *mut c_void,
+                    unsafe extern "C" fn() -> *mut c_void,
+                >(get_instance),
+                post_vsync: post_vsync.map(|p| std::mem::transmute::<*mut c_void, PostVsyncCallback>(p)),
+                post_frame64: post_frame64
+                    .map(|p| std::mem::transmute::<*mut c_void, PostFrameCallback64>(p)),
+                fcd_frame_time: sym(c"AChoreographerFrameCallbackData_getFrameTimeNanos").map(|p| {
+                    std::mem::transmute::<*mut c_void, unsafe extern "C" fn(*const c_void) -> i64>(p)
+                }),
+                fcd_timelines_len: sym(c"AChoreographerFrameCallbackData_getFrameTimelinesLength")
+                    .map(|p| {
+                        std::mem::transmute::<*mut c_void, unsafe extern "C" fn(*const c_void) -> usize>(
+                            p,
+                        )
+                    }),
+                fcd_preferred_index: sym(
+                    c"AChoreographerFrameCallbackData_getPreferredFrameTimelineIndex",
+                )
+                .map(|p| {
+                    std::mem::transmute::<*mut c_void, unsafe extern "C" fn(*const c_void) -> usize>(p)
+                }),
+                fcd_expected_present: sym(
+                    c"AChoreographerFrameCallbackData_getFrameTimelineExpectedPresentationTimeNanos",
+                )
+                .map(|p| {
+                    std::mem::transmute::<
+                        *mut c_void,
+                        unsafe extern "C" fn(*const c_void, usize) -> i64,
+                    >(p)
+                }),
+                fcd_deadline: sym(c"AChoreographerFrameCallbackData_getFrameTimelineDeadlineNanos")
+                    .map(|p| {
+                        std::mem::transmute::<
+                            *mut c_void,
+                            unsafe extern "C" fn(*const c_void, usize) -> i64,
+                        >(p)
+                    }),
+            })
+        }
+    }
+}
+
+/// Everything a callback invocation needs. Owned by the choreographer thread's stack; callbacks
+/// only ever fire inside that thread's looper poll, so the borrow can't outlive the thread.
+struct CallbackCtx {
+    api: ChoreoApi,
+    choreographer: *mut c_void,
+    shared: Arc<VsyncShared>,
+    on_tick: Box<dyn Fn() + Send>,
+}
+
+impl CallbackCtx {
+    /// Common tail of both callback flavours: update the grid estimate, publish, pulse, re-arm.
+    fn tick(&self, frame_time_ns: i64, timelines: Vec<FrameTimeline>) {
+        let prev = self
+            .shared
+            .last_vsync_ns
+            .swap(frame_time_ns, Ordering::Relaxed);
+        // Period: prefer timeline spacing (exact, straight from the platform), else the delta of
+        // successive callbacks (jittery — EMA'd), clamped to sane panel rates (24..500 Hz).
+        let mut period = 0i64;
+        if timelines.len() >= 2 {
+            period = timelines[1].expected_present_ns - timelines[0].expected_present_ns;
+        } else if prev > 0 {
+            period = frame_time_ns - prev;
+        }
+        if (2_000_000..=42_000_000).contains(&period) {
+            let old = self.shared.period_ns.load(Ordering::Relaxed);
+            let smoothed = if old > 0 {
+                (old * 7 + period) / 8
+            } else {
+                period
+            };
+            self.shared.period_ns.store(smoothed, Ordering::Relaxed);
+        }
+        if !timelines.is_empty() {
+            let mut g = self
+                .shared
+                .timelines
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *g = timelines;
+        }
+        (self.on_tick)();
+        if !self.shared.stop.load(Ordering::Relaxed) {
+            self.repost();
+        }
+    }
+
+    fn repost(&self) {
+        // SAFETY: `choreographer` is this thread's instance; the ctx pointer stays valid for the
+        // thread's life and callbacks only fire on this thread (see the struct doc).
+        unsafe {
+            let ud = self as *const CallbackCtx as *mut c_void;
+            if let Some(post) = self.api.post_vsync {
+                post(self.choreographer, on_vsync, ud);
+            } else if let Some(post) = self.api.post_frame64 {
+                post(self.choreographer, on_frame64, ud);
+            }
+        }
+    }
+}
+
+/// API 33+ trampoline: harvest the frame timelines, then the common tick. Panic-free (an unwind
+/// out of an `extern "C"` fn aborts).
+unsafe extern "C" fn on_vsync(data: *const c_void, ud: *mut c_void) {
+    // SAFETY: `ud` is the thread's `CallbackCtx`, alive for the whole poll loop (see struct doc).
+    let ctx = unsafe { &*(ud as *const CallbackCtx) };
+    let api = &ctx.api;
+    let (mut frame_time, mut timelines) = (now_monotonic_ns(), Vec::new());
+    // SAFETY: `data` is the platform's callback payload, valid for this invocation; the accessors
+    // were resolved together with `post_vsync` (same API level) and are only called when present.
+    unsafe {
+        if let Some(f) = api.fcd_frame_time {
+            frame_time = f(data);
+        }
+        if let (Some(len_f), Some(pref_f), Some(exp_f), Some(dl_f)) = (
+            api.fcd_timelines_len,
+            api.fcd_preferred_index,
+            api.fcd_expected_present,
+            api.fcd_deadline,
+        ) {
+            let len = len_f(data).min(8);
+            // From the PREFERRED index on: earlier timelines are ones the platform already
+            // considers missed for a frame starting now.
+            let start = pref_f(data).min(len);
+            timelines = (start..len)
+                .map(|i| FrameTimeline {
+                    expected_present_ns: exp_f(data, i),
+                    deadline_ns: dl_f(data, i),
+                })
+                .collect();
+        }
+    }
+    ctx.tick(frame_time, timelines);
+}
+
+/// API 29 fallback trampoline: vsync instant only.
+unsafe extern "C" fn on_frame64(frame_time_ns: i64, ud: *mut c_void) {
+    // SAFETY: `ud` is the thread's `CallbackCtx` (see `on_vsync`).
+    let ctx = unsafe { &*(ud as *const CallbackCtx) };
+    ctx.tick(frame_time_ns, Vec::new());
+}
+
+/// The clock: a dedicated looper thread the choreographer calls back on. Dropping stops + joins.
+pub(super) struct VsyncClock {
+    shared: Arc<VsyncShared>,
+    join: Option<std::thread::JoinHandle<()>>,
+}
+
+impl VsyncClock {
+    /// Spawn the choreographer thread. `on_tick` fires once per vsync ON THAT THREAD — it must
+    /// only do something cheap and `Send` (the decode loop passes an event-channel send).
+    /// `None` when the platform surface is missing (very old device) — the presenter then runs
+    /// clock-less (ASAP targets, predicted-latch budget).
+    pub(super) fn start(on_tick: Box<dyn Fn() + Send>) -> Option<VsyncClock> {
+        let api = ChoreoApi::resolve()?;
+        let timelines_live = api.post_vsync.is_some();
+        let shared = Arc::new(VsyncShared {
+            stop: AtomicBool::new(false),
+            last_vsync_ns: AtomicI64::new(0),
+            period_ns: AtomicI64::new(0),
+            timelines: Mutex::new(Vec::new()),
+        });
+        let thread_shared = shared.clone();
+        let join = std::thread::Builder::new()
+            .name("pf-vsync".into())
+            .spawn(move || {
+                let looper = ndk::looper::ThreadLooper::prepare();
+                // SAFETY: getInstance on a thread with a prepared looper returns this thread's
+                // choreographer (never null once a looper exists).
+                let choreographer = unsafe { (api.get_instance)() };
+                if choreographer.is_null() {
+                    log::warn!("vsync: AChoreographer_getInstance returned null — no clock");
+                    return;
+                }
+                let ctx = CallbackCtx {
+                    api,
+                    choreographer,
+                    shared: thread_shared,
+                    on_tick,
+                };
+                ctx.repost();
+                // The bounded poll doubles as the stop check: no cross-thread wake needed, worst
+                // case teardown waits one timeout out. Callbacks fire inside poll_once_timeout.
+                while !ctx.shared.stop.load(Ordering::Relaxed) {
+                    let _ = looper.poll_once_timeout(Duration::from_millis(250));
+                }
+                // `ctx` drops here — after the loop, so no queued callback can outlive it (they
+                // only ever fire inside this thread's poll).
+            })
+            .ok()?;
+        log::info!(
+            "vsync: choreographer clock started ({})",
+            if timelines_live {
+                "frame timelines"
+            } else {
+                "frame callback fallback"
+            }
+        );
+        Some(VsyncClock {
+            shared,
+            join: Some(join),
+        })
+    }
+
+    pub(super) fn shared(&self) -> &Arc<VsyncShared> {
+        &self.shared
+    }
+}
+
+impl Drop for VsyncClock {
+    fn drop(&mut self) {
+        self.shared.stop.store(true, Ordering::Relaxed);
+        if let Some(j) = self.join.take() {
+            let _ = j.join();
+        }
+    }
+}

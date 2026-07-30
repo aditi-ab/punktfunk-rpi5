@@ -35,32 +35,37 @@ pub(super) struct DisplayTracker {
     /// loaded per callback so mid-stream re-syncs apply. Holding the handle (not the client)
     /// keeps the leaked render-callback refcount from pinning the whole session alive.
     clock_offset: Arc<AtomicI64>,
-    /// `(pts_us, decoded_real_ns)` of frames released with `render = true`, in release order,
-    /// awaiting their callback. Pushes are HUD-gated by the caller, so this stays empty (and the
-    /// callback early-outs) while the overlay is hidden.
-    rendered: Mutex<VecDeque<(u64, i128)>>,
+    /// Always-on latch/display accumulator for the presenter's 1 Hz `pf-present` line —
+    /// independent of the HUD gate, so a HUD-off A/B stays measurable from logcat.
+    meter: Arc<super::presenter::PresentMeter>,
+    /// `(pts_us, decoded_real_ns, released_real_ns)` of frames released with `render = true`, in
+    /// release order, awaiting their callback. Pushed on EVERY render (no HUD gate — the ring is
+    /// a 64-tuple bound and the latch metric wants to exist when nobody is watching).
+    rendered: Mutex<VecDeque<(u64, i128, i128)>>,
 }
 
 impl DisplayTracker {
     pub(super) fn new(
         stats: Arc<crate::stats::VideoStats>,
         clock_offset: Arc<AtomicI64>,
+        meter: Arc<super::presenter::PresentMeter>,
     ) -> Arc<DisplayTracker> {
         Arc::new(DisplayTracker {
             stats,
             clock_offset,
+            meter,
             rendered: Mutex::new(VecDeque::new()),
         })
     }
 
-    /// Park one just-rendered frame's `(pts, decoded stamp)` for the render callback to pair.
-    /// Caller gates on the HUD being visible.
-    pub(super) fn note_rendered(&self, pts_us: u64, decoded_ns: i128) {
+    /// Park one just-rendered frame's `(pts, decoded stamp, release stamp)` for the render
+    /// callback to pair — the release stamp is the latch metric's start (release→displayed).
+    pub(super) fn note_rendered(&self, pts_us: u64, decoded_ns: i128, released_ns: i128) {
         let mut g = self
             .rendered
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        g.push_back((pts_us, decoded_ns));
+        g.push_back((pts_us, decoded_ns, released_ns));
         if g.len() > RENDERED_CAP {
             g.pop_front(); // render callbacks stopped coming (allowed under load) — evict
         }
@@ -152,36 +157,38 @@ unsafe extern "C" fn on_frame_rendered(
     // `Arc::into_raw` pointer from `install_render_callback`, whose refcount is held for as long as
     // the codec exists, and the codec is what delivers this call.
     let t = unsafe { &*(userdata as *const DisplayTracker) };
-    if !t.stats.enabled() {
-        return; // HUD hidden — the ring is empty too (pushes are caller-gated)
-    }
     let displayed_ns = now_realtime_ns() - (now_monotonic_ns() - system_nano as i128);
     let pts_us = media_time_us.max(0) as u64;
     // Pair the frame back to its release record, evicting older entries (their callbacks were
-    // dropped by the platform, or the entry predates a HUD toggle) — same monotonic-eviction
-    // discipline as `note_decoded_pts`.
-    let mut decoded_ns = None;
+    // dropped by the platform) — same monotonic-eviction discipline as `note_decoded_pts`.
+    let mut paired = None;
     {
         let mut g = t
             .rendered
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        while let Some(&(p, d)) = g.front() {
+        while let Some(&(p, d, r)) = g.front() {
             if p > pts_us {
                 break; // future frame — leave it for its own callback
             }
             g.pop_front();
             if p == pts_us {
-                decoded_ns = Some(d);
+                paired = Some((d, r));
                 break;
             }
         }
     }
+    let display_us = paired.map(|(d, _)| ((displayed_ns - d).max(0) / 1000) as u64);
+    let latch_us = paired.map(|(_, r)| ((displayed_ns - r).max(0) / 1000) as u64);
+    // Always-on half: the presenter's pf-present line reads these with the HUD off.
+    t.meter.note_latch(latch_us);
+    if !t.stats.enabled() {
+        return; // HUD hidden — skip the skew math + the stats lock
+    }
     let e2e_ns =
         displayed_ns + t.clock_offset.load(Ordering::Relaxed) as i128 - pts_us as i128 * 1000;
     let e2e_us = (e2e_ns > 0 && e2e_ns < 10_000_000_000).then_some((e2e_ns / 1000) as u64);
-    let display_us = decoded_ns.map(|d| ((displayed_ns - d).max(0) / 1000) as u64);
-    t.stats.note_displayed(e2e_us, display_us);
+    t.stats.note_displayed(e2e_us, display_us, latch_us);
 }
 
 /// React to an output-format change by signalling the stream's HDR dataspace on the Surface (SDR

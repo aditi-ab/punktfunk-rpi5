@@ -44,6 +44,9 @@ pub(super) fn run_sync(
         ll_feature,
         low_latency_mode,
         is_tv,
+        // The timeline presenter lives in the async loop only; this loop IS the escape hatch.
+        present_priority: _,
+        smooth_buffer: _,
     } = opts;
     boost_thread_priority();
     let mode = client.mode();
@@ -181,7 +184,11 @@ pub(super) fn run_sync(
     // render = true are parked in the tracker; the OnFrameRendered callback pairs them with
     // SurfaceFlinger's render timestamp. `render_cb` is the callback's leaked Arc refcount,
     // reclaimed after the codec is dropped below.
-    let tracker = DisplayTracker::new(stats.clone(), clock_offset.clone());
+    let tracker = DisplayTracker::new(
+        stats.clone(),
+        clock_offset.clone(),
+        std::sync::Arc::new(super::presenter::PresentMeter::new()),
+    );
     let render_cb = install_render_callback(&codec, &tracker);
     // Receipt timestamps keyed by the pts we queue into the codec, so the decoded point (output-
     // buffer dequeue — MediaCodec round-trips presentationTimeUs) can be paired back to its receipt
@@ -598,7 +605,7 @@ fn drain(
             Ok(()) if held_present => {
                 rendered = 1;
                 if let Some((pts_us, decoded_ns)) = meta {
-                    tracker.note_rendered(pts_us, decoded_ns);
+                    tracker.note_rendered(pts_us, decoded_ns, super::latency::now_realtime_ns());
                 }
             }
             Ok(()) => discarded += 1, // held off the screen — awaiting a clean re-anchor

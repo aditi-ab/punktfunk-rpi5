@@ -28,6 +28,9 @@ pub struct VideoStats {
     /// they (and the caller's latency computation — see `enabled`) early-out on this flag alone.
     /// Off until Kotlin shows the HUD.
     enabled: AtomicBool,
+    /// Whether the timeline presenter is active this session (async loop, not sysprop-disabled) —
+    /// stats index 29, so the HUD can label the display split it is (or isn't) getting.
+    presenter_active: AtomicBool,
     /// The resolved decoder identity for the HUD: the codec's actual `AMediaCodec` name (e.g.
     /// `c2.qti.avc.decoder`) and whether it advertised `FEATURE_LowLatency`. Set once when the
     /// decode thread creates the codec (`set_decoder`), read one-shot by `nativeVideoDecoderLabel`.
@@ -67,6 +70,16 @@ struct Inner {
     /// `end-to-end` = capture→displayed samples, µs (skew-corrected) — the spec's headline,
     /// measured directly (not summed from stages). Empty under the same fallback as `display_us`.
     e2e_disp_us: Vec<u64>,
+    /// The `display` stage's presenter split, decoded→release (pace wait: store + glass budget),
+    /// µs. Empty on the legacy release-immediately path.
+    pace_us: Vec<u64>,
+    /// The other half of the split, release→displayed (SurfaceFlinger's latch + scanout), µs —
+    /// from the `OnFrameRendered` render timestamps. `pace + latch ≈ display` per frame.
+    latch_us: Vec<u64>,
+    /// Frames confirmed on glass this window (`OnFrameRendered` callbacks) — the `presents`-vs-
+    /// `fps` health pair: presents ≪ fps means the presenter is dropping/serializing; an fps
+    /// deficit is upstream.
+    presents: u64,
     /// Client-side newest-wins/pacing drops this window (decoded frames released without
     /// rendering, or parked AUs dropped on overflow) — the spec's `skipped` counter.
     skipped: u64,
@@ -101,6 +114,13 @@ pub struct Snapshot {
     /// Whether any capture→displayed sample landed this window — gates the HUD's headline endpoint
     /// (`capture→displayed` vs the capture→decoded fallback) and the equation's `display` term.
     pub disp_valid: bool,
+    /// The `display` stage's presenter split p50s (ms): `pace` = decoded→release (store + glass
+    /// budget), `latch` = release→displayed (SurfaceFlinger). 0.0 when no sample landed (legacy
+    /// path / no render callbacks).
+    pub pace_p50_ms: f64,
+    pub latch_p50_ms: f64,
+    /// Frames confirmed on glass this window (`OnFrameRendered` callbacks).
+    pub presents: u64,
     /// Phase-2 `host` / `network` split p50s (ms) — 0.0 when no 0xCF timing matched this window
     /// (old host / no samples yet), in which case the HUD keeps the combined `host+network` term.
     pub host_p50_ms: f64,
@@ -132,6 +152,7 @@ impl VideoStats {
     pub fn new() -> VideoStats {
         VideoStats {
             enabled: AtomicBool::new(false),
+            presenter_active: AtomicBool::new(false),
             decoder: Mutex::new(None),
             inner: Mutex::new(Inner {
                 window_start: Instant::now(),
@@ -144,6 +165,9 @@ impl VideoStats {
                 decode_us: Vec::with_capacity(256),
                 display_us: Vec::with_capacity(256),
                 e2e_disp_us: Vec::with_capacity(256),
+                pace_us: Vec::with_capacity(256),
+                latch_us: Vec::with_capacity(256),
+                presents: 0,
                 skipped: 0,
                 last_dropped_total: 0,
                 last_fec_total: 0,
@@ -158,6 +182,18 @@ impl VideoStats {
     #[cfg_attr(not(target_os = "android"), allow(dead_code))]
     pub fn enabled(&self) -> bool {
         self.enabled.load(Ordering::Relaxed)
+    }
+
+    /// Record whether the timeline presenter runs this session (decode thread, once at start).
+    // Set only by the android-only decode thread; unreferenced on the host build — expected.
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+    pub fn set_presenter_active(&self, on: bool) {
+        self.presenter_active.store(on, Ordering::Relaxed);
+    }
+
+    /// Whether the timeline presenter is active (stats index 29).
+    pub fn presenter_active(&self) -> bool {
+        self.presenter_active.load(Ordering::Relaxed)
     }
 
     /// Toggle sampling. Enabling resets the window, so the first HUD poll after a show never mixes
@@ -181,6 +217,9 @@ impl VideoStats {
             g.decode_us.clear();
             g.display_us.clear();
             g.e2e_disp_us.clear();
+            g.pace_us.clear();
+            g.latch_us.clear();
+            g.presents = 0;
             g.skipped = 0;
             g.last_dropped_total = dropped_total;
             g.last_fec_total = fec_total;
@@ -298,13 +337,19 @@ impl VideoStats {
     }
 
     /// Record one displayed frame (the `OnFrameRendered` render timestamp, re-based to the
-    /// realtime clock): its capture→displayed `end-to-end` sample and its decoded→displayed
-    /// `display` stage sample (either may be absent — the e2e clamp rejected an out-of-range
-    /// value, or the decoded stamp for this pts was already evicted/pre-HUD). Fired from the
-    /// codec's render-callback thread, not the decode thread — the lock makes that safe.
+    /// realtime clock): its capture→displayed `end-to-end` sample, its decoded→displayed
+    /// `display` stage sample, and the presenter split's `latch` half (release→displayed) — any
+    /// may be absent (the e2e clamp rejected an out-of-range value, or the release record for
+    /// this pts was already evicted). Fired from the codec's render-callback thread, not the
+    /// decode thread — the lock makes that safe.
     // Driven only by the android-only decode path; unreferenced on the host build — expected.
     #[cfg_attr(not(target_os = "android"), allow(dead_code))]
-    pub fn note_displayed(&self, e2e_us: Option<u64>, display_us: Option<u64>) {
+    pub fn note_displayed(
+        &self,
+        e2e_us: Option<u64>,
+        display_us: Option<u64>,
+        latch_us: Option<u64>,
+    ) {
         if !self.enabled.load(Ordering::Relaxed) {
             return; // HUD hidden — skip the lock (the callback already skipped the clock reads)
         }
@@ -313,12 +358,32 @@ impl VideoStats {
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        g.presents += 1;
         if let Some(l) = e2e_us {
             g.e2e_disp_us.push(l);
         }
         if let Some(l) = display_us {
             g.display_us.push(l);
         }
+        if let Some(l) = latch_us {
+            g.latch_us.push(l);
+        }
+    }
+
+    /// Record one released frame's pace-wait (decoded→release: the presenter's store + glass
+    /// budget), µs — the `display` stage's other half. Decode-thread only.
+    // Driven only by the android-only decode thread; unreferenced on the host build — expected.
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+    pub fn note_release(&self, pace_us: u64) {
+        if !self.enabled.load(Ordering::Relaxed) {
+            return; // HUD hidden — skip the lock
+        }
+        // Poison-proof for the same reason as `note_received`.
+        let mut g = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        g.pace_us.push(pace_us);
     }
 
     /// Compute the window's rates + latency percentiles, then reset for the next window.
@@ -341,6 +406,8 @@ impl VideoStats {
         g.decode_us.sort_unstable();
         g.display_us.sort_unstable();
         g.e2e_disp_us.sort_unstable();
+        g.pace_us.sort_unstable();
+        g.latch_us.sort_unstable();
         let snap = Snapshot {
             fps,
             mbps,
@@ -352,6 +419,9 @@ impl VideoStats {
             decode_p50_ms: pctl_ms(&g.decode_us, 0.50),
             display_p50_ms: pctl_ms(&g.display_us, 0.50),
             disp_valid: !g.e2e_disp_us.is_empty(),
+            pace_p50_ms: pctl_ms(&g.pace_us, 0.50),
+            latch_p50_ms: pctl_ms(&g.latch_us, 0.50),
+            presents: g.presents,
             host_p50_ms: pctl_ms(&g.host_us, 0.50),
             net_p50_ms: pctl_ms(&g.net_us, 0.50),
             lat_valid: !g.e2e_us.is_empty(),
@@ -371,6 +441,9 @@ impl VideoStats {
         g.decode_us.clear();
         g.display_us.clear();
         g.e2e_disp_us.clear();
+        g.pace_us.clear();
+        g.latch_us.clear();
+        g.presents = 0;
         g.skipped = 0;
         g.last_dropped_total = dropped_total;
         g.last_fec_total = fec_total;

@@ -210,7 +210,9 @@ object NativeBridge {
      * original synchronous pipeline as the per-device escape hatch); [lowLatencyFeature] is whether
      * [decoderName] advertised `FEATURE_LowLatency` (HUD label only). [isTv] drives an active HDMI
      * mode switch to the stream refresh on TV boxes when the toggle is on (vs. the softer seamless
-     * hint otherwise). No-op if already started.
+     * hint otherwise). [presentPriority]/[smoothBuffer] are the timeline presenter's intent
+     * (0 = lowest latency / 1 = smoothness; buffer 0 = automatic, else 1..3 frames) — the Apple
+     * client's `present_priority`/`smooth_buffer` pair. No-op if already started.
      */
     external fun nativeStartVideo(
         handle: Long,
@@ -219,6 +221,8 @@ object NativeBridge {
         lowLatencyMode: Boolean,
         lowLatencyFeature: Boolean,
         isTv: Boolean,
+        presentPriority: Int,
+        smoothBuffer: Int,
     )
 
     /** Stop + join the decode thread without closing the session. No-op on `0`. */
@@ -233,11 +237,11 @@ object NativeBridge {
 
     /**
      * Drain ~1 s of live decode stats for the on-stream HUD, or `null` when no decode thread runs.
-     * Returns 26 doubles (unified stats spec, `design/stats-unification.md`):
+     * Returns 30 doubles (unified stats spec, `design/stats-unification.md`):
      * `[fps, mbps, e2eP50Ms, e2eP95Ms, latValid, skewCorrected, width, height, refreshHz, framesLost,
      * bitDepth, colorPrimaries, colorTransfer, chromaFormatIdc, hostNetP50Ms, decodeP50Ms, hostP50Ms,
      * netP50Ms, lostWindow, skippedWindow, fecWindow, framesWindow, dispValid, displayP50Ms,
-     * e2eDispP50Ms, e2eDispP95Ms]`
+     * e2eDispP50Ms, e2eDispP95Ms, paceP50Ms, latchP50Ms, presentsWindow, presenterActive]`
      * (the flags are 1.0/0.0; indexes 2/3 are the end-to-end capture→decoded headline; 10–13
      * describe the negotiated video feed — bit depth 8/10, CICP primaries/transfer, and the HEVC
      * chroma_format_idc 1=4:2:0 / 3=4:4:4; 14/15 are the stage p50s tiling the headline —

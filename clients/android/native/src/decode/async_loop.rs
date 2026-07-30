@@ -17,10 +17,12 @@ use super::display::{
     apply_hdr_dataspace, install_render_callback, release_render_callback, DisplayTracker,
 };
 use super::latency::{note_decoded_pts, now_realtime_ns, take_flags};
+use super::presenter::{presenter_disabled_by_sysprop, PresentMeter, PresentPriority, Presenter};
 use super::setup::{
     android_hdr_static_info, boost_hot_threads, boost_thread_priority, codec_mime,
     configure_low_latency, create_codec, try_set_frame_rate,
 };
+use super::vsync::{now_monotonic_ns, VsyncClock};
 use super::{
     DecodeOptions, FRAME_PARK_CAP, IN_FLIGHT_CAP, NO_OUTPUT_PATIENCE, NO_VIDEO_PATIENCE,
     NO_VIDEO_RETRY, PENDING_SPLIT_CAP,
@@ -55,6 +57,8 @@ enum DecodeEvent {
     },
     /// The output format changed — re-check the stream's colour signalling (HDR DataSpace).
     FormatChanged,
+    /// A panel vsync (from the [`VsyncClock`] thread) — the presenter's retry/pacing tick.
+    Vsync,
     /// The codec reported an error; `fatal` when neither recoverable nor transient.
     Error { fatal: bool },
 }
@@ -78,6 +82,8 @@ pub(super) fn run_async(
         ll_feature,
         low_latency_mode,
         is_tv,
+        present_priority,
+        smooth_buffer,
     } = opts;
     boost_thread_priority();
     let mode = client.mode();
@@ -196,8 +202,32 @@ pub(super) fn run_async(
     // parked in the tracker at release; the OnFrameRendered callback pairs it with
     // SurfaceFlinger's render timestamp. `render_cb` is the callback's leaked Arc refcount,
     // reclaimed after the codec is dropped below.
-    let tracker = DisplayTracker::new(stats.clone(), clock_offset.clone());
+    let meter = Arc::new(PresentMeter::new());
+    let tracker = DisplayTracker::new(stats.clone(), clock_offset.clone(), meter.clone());
     let render_cb = install_render_callback(&codec, &tracker);
+
+    // The timeline presenter (see `presenter.rs`): newest-wins / smoothing store, one-in-flight
+    // glass budget, timeline-timed release. `debug.punktfunk.presenter = arrival` selects the
+    // legacy release-immediately path for a rebuild-free on-device A/B.
+    let mut presenter = if presenter_disabled_by_sysprop() {
+        log::info!("decode: presenter = arrival (sysprop) — legacy immediate release");
+        None
+    } else {
+        let priority = PresentPriority::resolve(present_priority, smooth_buffer);
+        log::info!(
+            "decode: presenter = timeline ({})",
+            match priority {
+                PresentPriority::Latency => "lowest latency".to_string(),
+                PresentPriority::Smooth { buffer } => format!("smoothness, buffer {buffer}"),
+            }
+        );
+        Some(Presenter::new(priority))
+    };
+    stats.set_presenter_active(presenter.is_some());
+    // The vsync clock, started LAZILY on the first decoded frame (see `vsync.rs`); its ticks ride
+    // the same event channel. The Sender parks here until that moment.
+    let mut vsync: Option<VsyncClock> = None;
+    let mut vsync_tx = presenter.is_some().then(|| ev_tx.clone());
 
     // Feeder thread: block on the network so this loop doesn't (an AU's arrival becomes an event that
     // wakes us immediately, with no input-side poll latency). It also records the `received` HUD stat.
@@ -277,6 +307,7 @@ pub(super) fn run_async(
         };
         let work_t0 = Instant::now();
         let mut fmt_dirty = false;
+        let mut vsync_tick = false;
         let mut aus_dropped: u64 = 0;
         if let Some(ev) = ev0 {
             aus_dropped += u64::from(dispatch_event(
@@ -285,6 +316,7 @@ pub(super) fn run_async(
                 &mut free_inputs,
                 &mut ready,
                 &mut fmt_dirty,
+                &mut vsync_tick,
                 &mut fatal,
                 &mut gate,
                 &mut recovery_flags,
@@ -299,10 +331,16 @@ pub(super) fn run_async(
                 &mut free_inputs,
                 &mut ready,
                 &mut fmt_dirty,
+                &mut vsync_tick,
                 &mut fatal,
                 &mut gate,
                 &mut recovery_flags,
             ));
+        }
+        if vsync_tick {
+            if let Some(p) = presenter.as_mut() {
+                p.on_vsync();
+            }
         }
         stats.note_skipped(aus_dropped); // parked-AU overflow drops are client-side skips too
         if fmt_dirty {
@@ -317,6 +355,7 @@ pub(super) fn run_async(
             &mut oversized_dropped,
         );
         let had_output = !ready.is_empty();
+        let rendered_before = rendered;
         present_ready(
             &codec,
             &client,
@@ -326,14 +365,39 @@ pub(super) fn run_async(
             &in_flight,
             clock_offset.load(Ordering::Relaxed),
             &tracker,
+            &mut presenter,
             &mut rendered,
             &mut discarded,
             &mut gate,
             &mut recovery_flags,
         );
+        // The presenter's decision point runs EVERY pass — frame arrivals, vsync ticks and the
+        // 5 ms housekeeping wake all land here, which is what reopens the glass budget on time
+        // even when the choreographer clock is absent.
+        if let Some(p) = presenter.as_mut() {
+            let clock = vsync.as_ref().map(|v| v.shared().as_ref());
+            if p.pump(&codec, clock, &tracker, &stats, now_monotonic_ns()) {
+                rendered += 1;
+            }
+            p.flush_log(&meter, clock);
+        }
+        let presented_now = rendered > rendered_before;
+        // Start the vsync clock LAZILY on the first decoded output (eager, it ticks the panel
+        // rate into a session that has no frame yet — the Apple deadline presenter's bootstrap
+        // lesson). A `None` from start (no choreographer surface) simply leaves ASAP targets.
+        if had_output && vsync.is_none() {
+            if let Some(tx) = vsync_tx.take() {
+                vsync = VsyncClock::start(Box::new(move || {
+                    let _ = tx.send(DecodeEvent::Vsync);
+                }));
+                if vsync.is_none() {
+                    log::info!("decode: no choreographer clock — presenter uses ASAP targets");
+                }
+            }
+        }
 
         work_accum_ns += work_t0.elapsed().as_nanos() as i64;
-        if had_output {
+        if presented_now {
             if !hint_tried {
                 hint_tried = true;
                 let tids = client.hot_thread_ids();
@@ -420,6 +484,10 @@ pub(super) fn run_async(
         }
     }
 
+    if let Some(p) = presenter.as_mut() {
+        p.release_all(&codec); // hand every held output buffer back before the codec stops
+    }
+    drop(vsync); // stop + join the choreographer thread; its channel sends are harmless after
     let _ = codec.stop();
     shutdown.store(true, Ordering::SeqCst); // ensure the feeder wakes and exits, then join it
     if let Some(j) = feeder {
@@ -520,6 +588,7 @@ fn dispatch_event(
     free_inputs: &mut VecDeque<usize>,
     ready: &mut Vec<OutputReady>,
     fmt_dirty: &mut bool,
+    vsync_tick: &mut bool,
     fatal: &mut bool,
     gate: &mut ReanchorGate,
     recovery_flags: &mut VecDeque<(u64, u32)>,
@@ -552,6 +621,7 @@ fn dispatch_event(
             decoded_ns,
         }),
         DecodeEvent::FormatChanged => *fmt_dirty = true,
+        DecodeEvent::Vsync => *vsync_tick = true,
         DecodeEvent::Error { fatal: f } => {
             if f {
                 *fatal = true;
@@ -613,13 +683,14 @@ fn feed_ready(
     }
 }
 
-/// Present only the NEWEST ready output (render = true) and release the rest without rendering — a
-/// burst of stale frames on glass is worse than skipping to the freshest (the sync loop's newest-ready
-/// policy, callback-driven). Every dequeued buffer, rendered or not, is the HUD's `decoded`
-/// measurement point (it finished decoding either way); samples are recorded in pts order so the
-/// receipt-map eviction stays monotonic. The presented frame's `(pts, decoded stamp)` is parked in
-/// `tracker` for the OnFrameRendered callback — the `display` stage's other endpoint. `ready` is
-/// drained.
+/// Route the ready outputs toward glass. With the timeline presenter (default): fold each output
+/// through the re-anchor gate in pts order, hand the approved ones to the presenter's store
+/// (newest-wins / smoothing FIFO — the actual release happens in `Presenter::pump`, budgeted and
+/// timeline-timed), and release withheld concealment unrendered. Legacy (`arrival` sysprop):
+/// present only the NEWEST ready output immediately and release the rest unrendered — the
+/// original policy. Every dequeued buffer, rendered or not, is the HUD's `decoded` measurement
+/// point (it finished decoding either way); samples are recorded in pts order so the receipt-map
+/// eviction stays monotonic. `ready` is drained.
 #[allow(clippy::too_many_arguments)] // one call site; mirrors the sync loop's drain
 fn present_ready(
     codec: &MediaCodec,
@@ -630,6 +701,7 @@ fn present_ready(
     in_flight: &Mutex<VecDeque<(u64, i128)>>,
     clock_offset: i64,
     tracker: &DisplayTracker,
+    presenter: &mut Option<Presenter>,
     rendered: &mut u64,
     discarded: &mut u64,
     gate: &mut ReanchorGate,
@@ -657,31 +729,46 @@ fn present_ready(
         }
     }
     // Fold EVERY output through the gate in pts (== decode) order — even the ones newest-wins discards —
-    // so the two-mark re-anchor count stays correct; the newest's verdict decides whether it reaches
-    // glass (`false` = withheld concealment; the SurfaceView keeps the last rendered frame frozen on).
+    // so the two-mark re-anchor count stays correct; a `false` verdict is withheld concealment (the
+    // SurfaceView keeps the last rendered frame frozen on).
     let now = Instant::now();
-    let last = ready.len() - 1;
     let mut skipped: u64 = 0;
-    for (i, o) in ready.drain(..).enumerate() {
-        let flags = take_flags(recovery_flags, o.pts_us);
-        let present = gate.on_decoded(flags, false, now) == GateVerdict::Present;
-        let render = i == last && present;
-        match codec.release_output_buffer_by_index(o.index, render) {
-            Ok(()) if render => {
-                *rendered += 1;
-                if stats.enabled() {
-                    tracker.note_rendered(o.pts_us, o.decoded_ns);
+    if let Some(p) = presenter.as_mut() {
+        for o in ready.drain(..) {
+            let flags = take_flags(recovery_flags, o.pts_us);
+            if gate.on_decoded(flags, false, now) == GateVerdict::Present {
+                let dropped = p.submit(codec, o.index, o.pts_us, o.decoded_ns);
+                skipped += dropped;
+                *discarded += dropped;
+            } else {
+                if let Err(e) = codec.release_output_buffer_by_index(o.index, false) {
+                    log::warn!("decode: release_output_buffer_by_index({}): {e}", o.index);
                 }
-            }
-            Ok(()) => {
                 *discarded += 1;
                 skipped += 1;
             }
-            Err(e) => {
-                log::warn!(
-                    "decode: release_output_buffer_by_index({}, {render}): {e}",
-                    o.index
-                )
+        }
+    } else {
+        let last = ready.len() - 1;
+        for (i, o) in ready.drain(..).enumerate() {
+            let flags = take_flags(recovery_flags, o.pts_us);
+            let present = gate.on_decoded(flags, false, now) == GateVerdict::Present;
+            let render = i == last && present;
+            match codec.release_output_buffer_by_index(o.index, render) {
+                Ok(()) if render => {
+                    *rendered += 1;
+                    tracker.note_rendered(o.pts_us, o.decoded_ns, now_realtime_ns());
+                }
+                Ok(()) => {
+                    *discarded += 1;
+                    skipped += 1;
+                }
+                Err(e) => {
+                    log::warn!(
+                        "decode: release_output_buffer_by_index({}, {render}): {e}",
+                        o.index
+                    )
+                }
             }
         }
     }

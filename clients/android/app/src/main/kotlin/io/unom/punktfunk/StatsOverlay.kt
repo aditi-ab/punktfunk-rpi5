@@ -112,8 +112,27 @@ internal fun StatsOverlay(
                 } else {
                     "host+network ${"%.1f".format(s[14])}"
                 }
-                val displayTerm = if (dispValid) " + display ${"%.1f".format(s[23])}" else ""
-                statLine("= $hostTerms + decode ${"%.1f".format(s[15])}$displayTerm", Color.White)
+                // Timeline-presenter split (s[26]/s[27], when s[29] flags it active): the display
+                // term decomposes into pace (store + glass budget) + latch (SurfaceFlinger), and
+                // s[28] is the on-glass confirm count — presents ≪ fps means the presenter is
+                // dropping/serializing, an fps deficit is upstream.
+                val split = s.size >= 30 && s[29] != 0.0 && (s[26] > 0 || s[27] > 0)
+                val displayTerm = when {
+                    dispValid && split ->
+                        " + display ${"%.1f".format(s[23])} " +
+                            "(pace ${"%.1f".format(s[26])} + latch ${"%.1f".format(s[27])})"
+                    dispValid -> " + display ${"%.1f".format(s[23])}"
+                    else -> ""
+                }
+                val presents = if (s.size >= 30 && s[29] != 0.0) {
+                    "   · presents ${s[28].toInt()}"
+                } else {
+                    ""
+                }
+                statLine(
+                    "= $hostTerms + decode ${"%.1f".format(s[15])}$displayTerm$presents",
+                    Color.White,
+                )
             }
         }
         counterLine(s, lost)?.let { statLine(it, Color(0xFFFFB0B0)) }

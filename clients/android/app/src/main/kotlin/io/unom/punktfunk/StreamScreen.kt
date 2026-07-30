@@ -584,6 +584,8 @@ fun StreamScreen(session: ActiveSession, onDisconnect: () -> Unit) {
                                 lowLatencyMode,
                                 choice?.lowLatencyFeature ?: false,
                                 isTv,
+                                initialSettings.presentPriorityWire(),
+                                initialSettings.smoothBuffer,
                             )
                             NativeBridge.nativeStartAudio(handle, lowLatencyMode)
                             if (micWanted) NativeBridge.nativeStartMic(handle)

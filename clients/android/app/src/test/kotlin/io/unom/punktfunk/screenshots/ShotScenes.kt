@@ -366,6 +366,8 @@ internal fun StreamScene(verbosity: StatsVerbosity = StatsVerbosity.DETAILED) {
                 10.0, 9.0, 16.0, 1.0, 0.9, 0.4, 0.6, 0.3,
                 2.0, 1.0, 5.0, 238.0,
                 1.0, 0.5, 1.8, 2.6,
+                // Timeline-presenter split: pace + latch tile the display term; presents ≈ fps.
+                0.2, 0.3, 236.0, 1.0,
             ),
             verbosity = verbosity,
             decoderLabel = "c2.qti.hevc.decoder · low-latency",

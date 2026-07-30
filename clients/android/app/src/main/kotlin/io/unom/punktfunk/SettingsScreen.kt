@@ -711,6 +711,26 @@ private fun DisplaySettings(s: Settings, update: (Settings) -> Unit, context: an
             field = "low_latency_mode",
             onCheckedChange = { on -> update(s.copy(lowLatencyMode = on)) },
         )
+        // The timeline presenter's intent — the Apple client's "Prioritize" pair, same stored
+        // values, so a profile written on one platform means the same thing here.
+        SettingDropdown(
+            label = "Prioritize",
+            options = PRESENT_PRIORITY_OPTIONS,
+            selected = if (s.presentPriority == "smooth") "smooth" else "latency",
+            field = "present_priority",
+            caption = "Lowest latency shows each frame the moment it can reach the panel; " +
+                "Smoothness buffers a little to absorb network jitter.",
+        ) { v -> update(s.copy(presentPriority = v)) }
+        if (s.presentPriority == "smooth") {
+            SettingDropdown(
+                label = "Smoothness buffer",
+                options = smoothBufferOptions(if (s.hz > 0) s.hz else nhz),
+                selected = if (s.smoothBuffer in 1..3) s.smoothBuffer else 0,
+                field = "smooth_buffer",
+                caption = "Each buffered frame absorbs one refresh of jitter and adds one of " +
+                    "display latency — the cost shown is at the session's refresh rate.",
+            ) { v -> update(s.copy(smoothBuffer = v)) }
+        }
     }
 
     SettingsGroup("Host output", footer = "Display changes apply from the next session.") {

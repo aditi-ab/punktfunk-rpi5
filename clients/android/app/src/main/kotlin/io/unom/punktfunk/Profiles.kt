@@ -48,6 +48,9 @@ data class SettingsOverlay(
      * else, but here it is the one knob a marginal link wants turned off per host.
      */
     val lowLatencyMode: Boolean? = null,
+    /** The timeline presenter's intent pair — cross-client keys, see [Settings.presentPriority]. */
+    val presentPriority: String? = null,
+    val smoothBuffer: Int? = null,
     /**
      * Overlay keys a newer build wrote and this one doesn't model — carried through a load→save
      * round-trip untouched. The don't-clobber rule: opening and saving a profile on an older client
@@ -73,6 +76,8 @@ data class SettingsOverlay(
         gamepad = gamepad ?: base.gamepad,
         statsVerbosity = statsVerbosity ?: base.statsVerbosity,
         lowLatencyMode = lowLatencyMode ?: base.lowLatencyMode,
+        presentPriority = presentPriority ?: base.presentPriority,
+        smoothBuffer = smoothBuffer ?: base.smoothBuffer,
     )
 
     /**
@@ -104,6 +109,8 @@ data class SettingsOverlay(
         gamepad = if (after.gamepad != before.gamepad) after.gamepad else gamepad,
         statsVerbosity = if (after.statsVerbosity != before.statsVerbosity) after.statsVerbosity else statsVerbosity,
         lowLatencyMode = if (after.lowLatencyMode != before.lowLatencyMode) after.lowLatencyMode else lowLatencyMode,
+        presentPriority = if (after.presentPriority != before.presentPriority) after.presentPriority else presentPriority,
+        smoothBuffer = if (after.smoothBuffer != before.smoothBuffer) after.smoothBuffer else smoothBuffer,
     )
 
     /**
@@ -127,6 +134,8 @@ data class SettingsOverlay(
         "gamepad" -> copy(gamepad = null)
         "stats_verbosity" -> copy(statsVerbosity = null)
         "low_latency_mode" -> copy(lowLatencyMode = null)
+        "present_priority" -> copy(presentPriority = null)
+        "smooth_buffer" -> copy(smoothBuffer = null)
         else -> this
     }
 
@@ -147,6 +156,8 @@ data class SettingsOverlay(
         if (gamepad != null) add("gamepad")
         if (statsVerbosity != null) add("stats_verbosity")
         if (lowLatencyMode != null) add("low_latency_mode")
+        if (presentPriority != null) add("present_priority")
+        if (smoothBuffer != null) add("smooth_buffer")
     }
 
     /**
@@ -175,6 +186,8 @@ data class SettingsOverlay(
         gamepad?.let { j.put("gamepad", it) }
         statsVerbosity?.let { j.put("stats_verbosity", it.name) }
         lowLatencyMode?.let { j.put("low_latency_mode", it) }
+        presentPriority?.let { j.put("present_priority", it) }
+        smoothBuffer?.let { j.put("smooth_buffer", it) }
         return j
     }
 
@@ -187,6 +200,7 @@ data class SettingsOverlay(
             "width", "height", "refresh_hz", "bitrate_kbps", "render_scale", "codec",
             "hdr_enabled", "compositor", "audio_channels", "mic_enabled", "touch_mode",
             "mouse_mode", "invert_scroll", "gamepad", "stats_verbosity", "low_latency_mode",
+            "present_priority", "smooth_buffer",
         )
 
         internal fun fromJson(j: JSONObject): SettingsOverlay = SettingsOverlay(
@@ -209,6 +223,8 @@ data class SettingsOverlay(
             statsVerbosity = j.optStringOrNull("stats_verbosity")
                 ?.let { n -> StatsVerbosity.entries.firstOrNull { it.name == n } },
             lowLatencyMode = j.optBooleanOrNull("low_latency_mode"),
+            presentPriority = j.optStringOrNull("present_priority"),
+            smoothBuffer = j.optIntOrNull("smooth_buffer"),
             extra = j.keys().asSequence().filter { it !in KNOWN }.associateWith { j.get(it) },
         )
     }

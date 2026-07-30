@@ -84,6 +84,19 @@ data class Settings(
      */
     val lowLatencyMode: Boolean = true,
     /**
+     * The timeline presenter's intent — the cross-client `present_priority` pair (the Apple
+     * client's "Prioritize" picker, same stored values): `"latency"` (default) = newest-wins,
+     * a frame reaches glass the instant the glass budget opens; `"smooth"` = a small FIFO
+     * drained one frame per vsync, absorbing network/decode jitter at one refresh of added
+     * display latency per buffered frame. Anything unrecognized resolves to latency.
+     */
+    val presentPriority: String = "latency",
+    /**
+     * The smoothness buffer depth (`smooth_buffer`): 0 = Automatic (2 frames), else 1..3.
+     * Only meaningful when [presentPriority] is `"smooth"`.
+     */
+    val smoothBuffer: Int = 0,
+    /**
      * Wake-on-LAN a saved host before connecting when it isn't currently seen on mDNS. On (default):
      * a connect to a host with a learned MAC that isn't advertising sends a magic packet and waits
      * for it to reappear (see [WakeController]) before dialing. Off: always dial straight through,
@@ -213,6 +226,8 @@ class SettingsStore(context: Context) {
         gamepadUiEnabled = prefs.getBoolean(K_GAMEPAD_UI, true),
         libraryEnabled = prefs.getBoolean(K_LIBRARY, true),
         lowLatencyMode = prefs.getBoolean(K_LOW_LATENCY, true),
+        presentPriority = prefs.getString(K_PRESENT_PRIORITY, "latency") ?: "latency",
+        smoothBuffer = prefs.getInt(K_SMOOTH_BUFFER, 0),
         autoWakeEnabled = prefs.getBoolean(K_AUTO_WAKE, true),
         rumbleOnPhone = prefs.getBoolean(K_RUMBLE_ON_PHONE, false),
         sc2Capture = prefs.getBoolean(K_SC2_CAPTURE, true),
@@ -244,6 +259,8 @@ class SettingsStore(context: Context) {
             .putBoolean(K_GAMEPAD_UI, s.gamepadUiEnabled)
             .putBoolean(K_LIBRARY, s.libraryEnabled)
             .putBoolean(K_LOW_LATENCY, s.lowLatencyMode)
+            .putString(K_PRESENT_PRIORITY, s.presentPriority)
+            .putInt(K_SMOOTH_BUFFER, s.smoothBuffer)
             .putBoolean(K_AUTO_WAKE, s.autoWakeEnabled)
             .putBoolean(K_RUMBLE_ON_PHONE, s.rumbleOnPhone)
             .putBoolean(K_SC2_CAPTURE, s.sc2Capture)
@@ -285,6 +302,8 @@ class SettingsStore(context: Context) {
          * on; both stale keys are abandoned unread. The toggle stays as a per-device escape hatch.
          */
         const val K_LOW_LATENCY = "low_latency_mode_v2"
+        const val K_PRESENT_PRIORITY = "present_priority"
+        const val K_SMOOTH_BUFFER = "smooth_buffer"
         const val K_AUTO_WAKE = "auto_wake_enabled"
         const val K_RUMBLE_ON_PHONE = "rumble_on_phone"
         const val K_SC2_CAPTURE = "sc2_capture"
@@ -505,6 +524,29 @@ val COMPOSITOR_OPTIONS = listOf(
 
 /** (verbosity, label) for the stats-overlay detail picker. Order = the live 3-finger-tap cycle. */
 val STATS_VERBOSITY_OPTIONS = StatsVerbosity.entries.map { it to it.label }
+
+/** [Settings.presentPriority] as the wire int `nativeStartVideo` takes (0 = latency, 1 = smooth).
+ * Unrecognized values resolve to latency — same rule as the Apple client. */
+fun Settings.presentPriorityWire(): Int = if (presentPriority == "smooth") 1 else 0
+
+/** (stored value, label) for the presenter-intent picker — the Apple client's table verbatim. */
+val PRESENT_PRIORITY_OPTIONS = listOf(
+    "latency" to "Lowest latency",
+    "smooth" to "Smoothness",
+)
+
+/** (frames, label) for the smoothness-buffer picker; each buffered frame ≈ one refresh interval
+ * of jitter absorbed for one interval of added display latency ([hz] labels the cost). */
+fun smoothBufferOptions(hz: Int): List<Pair<Int, String>> {
+    val periodMs = 1000.0 / maxOf(24, hz)
+    fun cost(frames: Int) = "+%.0f ms".format(periodMs * frames)
+    return listOf(
+        0 to "Automatic",
+        1 to "1 frame (${cost(1)})",
+        2 to "2 frames (${cost(2)})",
+        3 to "3 frames (${cost(3)})",
+    )
+}
 
 /** (mode, label) for the touch-input model. */
 val TOUCH_MODE_OPTIONS = listOf(

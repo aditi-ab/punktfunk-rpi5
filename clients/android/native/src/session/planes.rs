@@ -10,11 +10,13 @@ use jni::JNIEnv;
 
 use super::{jni_guard, SessionHandle};
 
-/// `NativeBridge.nativeStartVideo(handle, surface, decoderName, lowLatencyMode, lowLatencyFeature)`
-/// — wrap the SurfaceView's `Surface` as an `ANativeWindow` and start the decode thread rendering
-/// onto it. `decoderName` is the codec Kotlin ranked from `MediaCodecList` (`""` = let the platform
-/// resolve the default for the MIME); `lowLatencyMode` is the user's master toggle;
-/// `lowLatencyFeature` is whether that decoder advertised `FEATURE_LowLatency` (HUD label only).
+/// `NativeBridge.nativeStartVideo(handle, surface, decoderName, lowLatencyMode, lowLatencyFeature,
+/// isTv, presentPriority, smoothBuffer)` — wrap the SurfaceView's `Surface` as an `ANativeWindow`
+/// and start the decode thread rendering onto it. `decoderName` is the codec Kotlin ranked from
+/// `MediaCodecList` (`""` = let the platform resolve the default for the MIME); `lowLatencyMode`
+/// is the user's master toggle; `lowLatencyFeature` is whether that decoder advertised
+/// `FEATURE_LowLatency` (HUD label only); `presentPriority`/`smoothBuffer` are the timeline
+/// presenter's intent (0 = lowest latency / 1 = smoothness; buffer 0 = auto, 1..=3 frames).
 /// No-op if already started.
 #[cfg(target_os = "android")]
 #[no_mangle]
@@ -27,6 +29,8 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStartVideo(
     low_latency_mode: jboolean,
     ll_feature: jboolean,
     is_tv: jboolean,
+    present_priority: jni::sys::jint,
+    smooth_buffer: jni::sys::jint,
 ) {
     use super::VideoThread;
     use std::sync::atomic::AtomicBool;
@@ -70,6 +74,8 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStartVideo(
         ll_feature: ll_feature != 0,
         low_latency_mode: low_latency_mode != 0,
         is_tv: is_tv != 0,
+        present_priority,
+        smooth_buffer,
     };
     let join = std::thread::Builder::new()
         .name("pf-decode".into())
@@ -173,7 +179,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStopVideo(
 /// `[fps, mbps, e2eP50Ms, e2eP95Ms, latValid, skewCorrected, width, height, refreshHz, framesLost,
 /// bitDepth, colorPrimaries, colorTransfer, chromaFormatIdc, hostNetP50Ms, decodeP50Ms, hostP50Ms,
 /// netP50Ms, lostWindow, skippedWindow, fecWindow, framesWindow, dispValid, displayP50Ms,
-/// e2eDispP50Ms, e2eDispP95Ms]`
+/// e2eDispP50Ms, e2eDispP95Ms, paceP50Ms, latchP50Ms, presentsWindow, presenterActive]`
 /// (the flags are 1.0/0.0; indexes 0–21 match the previous 22-double layout — 0–13 the original
 /// 14-double one with the latency pair re-based to the end-to-end capture→decoded headline, 14/15
 /// the stage p50s tiling it: `host+network` = capture→received, `decode` = received→decoded; 16/17
@@ -186,7 +192,11 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStopVideo(
 /// OnFrameRendered render timestamps — when `dispValid` is 1.0 the HUD headline becomes the
 /// directly-measured capture→displayed pair at 24/25 with `display` = decoded→displayed p50 at 23
 /// closing the equation, and when 0.0 — no render callback landed this window — it falls back to
-/// the capture→decoded headline at 2/3), or `null` when no decode thread is running.
+/// the capture→decoded headline at 2/3; 26–29 are the timeline presenter's split of the `display`
+/// term — `pace` = decoded→release (store + glass budget) p50 at 26, `latch` =
+/// release→displayed (SurfaceFlinger) p50 at 27, the window's on-glass confirm count at 28
+/// (`presents` vs `fps` is the presenter-health pair), and 29 = 1.0 while the timeline presenter
+/// is active this session), or `null` when no decode thread is running.
 /// Poll ~1 Hz from the UI; each call
 /// resets the measurement window. Not android-gated — pure `jni` + connector reads, so it links on
 /// the host build too (Kotlin only ever calls it on device).
@@ -210,7 +220,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeVideoStats(
             .drain(h.client.frames_dropped(), h.client.fec_recovered_shards());
         let mode = h.client.mode();
         let color = h.client.color;
-        let buf: [f64; 26] = [
+        let buf: [f64; 30] = [
             snap.fps,
             snap.mbps,
             snap.e2e_p50_ms,
@@ -251,6 +261,13 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeVideoStats(
             snap.display_p50_ms,
             snap.e2e_disp_p50_ms,
             snap.e2e_disp_p95_ms,
+            // Timeline-presenter split of the `display` term (pace = decoded→release, latch =
+            // release→displayed), the window's on-glass confirm count, and whether the presenter
+            // is active at all (0.0 = legacy release-immediately path — split reads 0 too).
+            snap.pace_p50_ms,
+            snap.latch_p50_ms,
+            snap.presents as f64,
+            if h.stats.presenter_active() { 1.0 } else { 0.0 },
         ];
         let arr = match env.new_double_array(buf.len() as jsize) {
             Ok(a) => a,
