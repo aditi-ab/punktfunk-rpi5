@@ -20,6 +20,10 @@ const WATCHDOG_TIMEOUT_S: u32 = 10;
 static WATCHDOG_PINGS: AtomicU64 = AtomicU64::new(0);
 /// Spawns the watchdog thread exactly once (idempotent across re-entrant adapter inits).
 static WATCHDOG_STARTED: AtomicBool = AtomicBool::new(false);
+/// Asks the watchdog thread to exit ([`stop_watchdog`], from device cleanup). The thread consumes
+/// the flag (swap) and clears [`WATCHDOG_STARTED`] on the way out, so a later adapter init on a
+/// fresh device can re-arm.
+static WATCHDOG_STOP: AtomicBool = AtomicBool::new(false);
 
 /// Start the host-liveness watchdog (once, from `adapter_init_finished`).
 ///
@@ -43,6 +47,16 @@ pub fn start_watchdog() {
         let mut last_change = Instant::now();
         loop {
             std::thread::sleep(tick);
+            // Device cleanup asked us to stop: the WDFDEVICE (and with it every monitor) is going
+            // away — a reap fired after that point would race `cleanup_for_device_removal` over
+            // the same monitor list. Consume the flag and un-mark STARTED so a fresh device's
+            // adapter init can re-arm. (Previously this thread ran forever: it outlived the
+            // device and was reaped only with the WUDFHost process.)
+            if WATCHDOG_STOP.swap(false, Ordering::SeqCst) {
+                WATCHDOG_STARTED.store(false, Ordering::SeqCst);
+                dbglog!("[pf-vd] watchdog: device cleanup — thread exiting");
+                return;
+            }
             let cur = WATCHDOG_PINGS.load(Ordering::Relaxed);
             if cur != last {
                 last = cur;
@@ -62,6 +76,16 @@ pub fn start_watchdog() {
             }
         }
     });
+}
+
+/// Ask the watchdog thread to exit (device cleanup). Takes effect within one tick (~3 s); the
+/// narrow window where a cleanup-then-re-add lands between the flag and the thread noticing it
+/// is unreachable in practice — `ProcessSharingDisabled` gives each device its own WUDFHost, so
+/// a new device means a new process with fresh statics.
+pub fn stop_watchdog() {
+    if WATCHDOG_STARTED.load(Ordering::SeqCst) {
+        WATCHDOG_STOP.store(true, Ordering::SeqCst);
+    }
 }
 
 /// Dispatch one control IOCTL and complete the request.

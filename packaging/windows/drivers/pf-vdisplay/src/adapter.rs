@@ -4,7 +4,7 @@
 //! (`adapter_init_finished` → [`set_adapter`]). FP16 caps + the obligated `*2`/gamma/hdr callbacks (in
 //! `callbacks.rs`) together enable HDR. STEP 3.
 
-use std::sync::OnceLock;
+use std::sync::Mutex;
 
 use wdk_sys::{NTSTATUS, WDFDEVICE, iddcx};
 
@@ -40,7 +40,11 @@ unsafe impl Send for SendAdapter {}
 // shared `&SendAdapter` access across threads is sound.
 unsafe impl Sync for SendAdapter {}
 
-static ADAPTER: OnceLock<SendAdapter> = OnceLock::new();
+// A slot, NOT a OnceLock: `set_adapter` must be last-write-wins so a D0-resume re-init's fresh
+// handle REPLACES the pre-power-cycle one (a OnceLock's second `set` was a silent no-op, leaving
+// every later `IddCxMonitorCreate` pointed at a stale adapter). Poison-recovering lock idiom as
+// in `monitor.rs` (panic = abort here, so poisoning is unreachable anyway).
+static ADAPTER: Mutex<Option<SendAdapter>> = Mutex::new(None);
 
 /// A WDF context type for the adapter object (matches the upstream's `init_context_type`); STEP 4 stores
 /// adapter state here. `WDF_OBJECT_CONTEXT_TYPE_INFO` holds raw pointers (so a Sync wrapper to allow a
@@ -60,7 +64,7 @@ static ADAPTER_CTX: CtxTypeInfo = CtxTypeInfo(wdk_sys::WDF_OBJECT_CONTEXT_TYPE_I
 /// Build the adapter caps (FP16/HDR-capable) and kick off the async adapter creation. Called from
 /// `EvtDeviceD0Entry`; idempotent across re-entrant D0 transitions.
 pub fn init_adapter(device: WDFDEVICE) -> NTSTATUS {
-    if ADAPTER.get().is_some() {
+    if adapter().is_some() {
         return STATUS_SUCCESS;
     }
     dbglog!("[pf-vd] init_adapter");
@@ -125,14 +129,30 @@ pub fn init_adapter(device: WDFDEVICE) -> NTSTATUS {
 }
 
 /// Stash the adapter object delivered by `EvtIddCxAdapterInitFinished` (STEP 4 reads it).
+/// Last write wins — see [`ADAPTER`].
 pub fn set_adapter(adapter: iddcx::IDDCX_ADAPTER) {
-    let _ = ADAPTER.set(SendAdapter(adapter));
+    *ADAPTER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(SendAdapter(adapter));
+}
+
+/// Forget the cached adapter. Called on a D0 re-entry from a REAL low-power state
+/// (`callbacks::device_d0_entry`): the handle belongs to the pre-power-cycle incarnation, and
+/// clearing is what lets `init_adapter` run again instead of short-circuiting on it.
+pub fn clear_adapter() {
+    *ADAPTER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
 }
 
 /// The created adapter handle, once `EvtIddCxAdapterInitFinished` has fired — for `create_monitor`
 /// (`IddCxMonitorCreate`) and SET_RENDER_ADAPTER. `None` before adapter init completes.
 pub(crate) fn adapter() -> Option<iddcx::IDDCX_ADAPTER> {
-    ADAPTER.get().map(|a| a.0)
+    ADAPTER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .map(|a| a.0)
 }
 
 /// Honor the host's `IOCTL_SET_RENDER_ADAPTER`: pin the GPU the IddCx swap-chain renders on. On a hybrid

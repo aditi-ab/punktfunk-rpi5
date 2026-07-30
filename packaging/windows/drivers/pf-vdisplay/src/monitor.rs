@@ -120,6 +120,19 @@ pub fn has_monitors() -> bool {
     !lock_monitors().is_empty()
 }
 
+/// Frame-channel delivery generation: bumped (Release) by every successful [`set_frame_channel`].
+/// The swap-chain drain loop compares it (Acquire) against its last-seen value and only takes
+/// [`MONITOR_MODES`] when a delivery actually landed — the steady state (≥60 loop passes/s per
+/// worker, every one of which used to lock a mutex contended by the whole control plane, the mode
+/// DDIs and the watchdog) runs lock-free. The counter is global, not per-target: a bump for a
+/// sibling target costs one spurious lock peek, and target-scoped state would itself need the lock.
+static FRAME_CHANNEL_GEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// The current frame-channel delivery generation (see [`FRAME_CHANNEL_GEN`]).
+pub fn frame_channel_gen() -> u32 {
+    FRAME_CHANNEL_GEN.load(core::sync::atomic::Ordering::Acquire)
+}
+
 /// Depart every monitor that has existed at least `grace` — the host-gone watchdog reap
 /// ([`crate::control::start_watchdog`]). The grace skips a just-created monitor (the host adds it, then
 /// starts pinging) so a momentarily-stale ping timer can't nuke a brand-new monitor. Returns the count
@@ -258,45 +271,22 @@ fn default_modes() -> Vec<Mode> {
     ]
 }
 
-/// `DISPLAYCONFIG_VIDEO_SIGNAL_INFO` for a monitor mode (vSyncFreqDivider = 0, per the DDI contract).
-pub fn display_info(
+/// THE `DISPLAYCONFIG_VIDEO_SIGNAL_INFO` builder — one formula for both mode DDI families
+/// (IddSampleDriver-exact): pixel rate = rr·w·h, integer sync rationals, total == active (no
+/// fabricated blanking). Monitor (description) and target (scan-out) modes differ ONLY in
+/// `vSyncFreqDivider`, which the caller passes (0 / 1 per the DDI contract).
+///
+/// Until 2026-07 the monitor side used the virtual-display-rs legacy math instead — a WIDTH-LESS
+/// pixel rate (`rr·(h+4)²+1000`) and a deliberately fractional vSync — so the OS saw two
+/// disagreeing signal descriptions for the same `(w,h,rr)` tuple, one of them physically
+/// meaningless. Numerators computed in u64 and saturated: an 8K240-class input would overflow the
+/// u32 rational and panic→abort the extern-"C" mode DDI in a debug build.
+fn signal_info(
     width: u32,
     height: u32,
     refresh_rate: u32,
+    v_sync_freq_divider: u32,
 ) -> wdk_sys::DISPLAYCONFIG_VIDEO_SIGNAL_INFO {
-    // Compute in u64 then saturate the u32 rational numerators: the old u32 `refresh*(h+4)^2` overflows
-    // for a large mode (e.g. 8K@240), which panics→aborts the extern-"C" mode DDI in a debug build.
-    // Identical for every real mode; only an absurd (also now bounds-rejected) mode saturates.
-    let clock_rate: u64 =
-        u64::from(refresh_rate) * u64::from(height + 4) * u64::from(height + 4) + 1000;
-    let clock_rate_u32 = u32::try_from(clock_rate).unwrap_or(u32::MAX);
-    let mut si = pod_init!(wdk_sys::DISPLAYCONFIG_VIDEO_SIGNAL_INFO);
-    si.pixelRate = clock_rate;
-    si.hSyncFreq = wdk_sys::DISPLAYCONFIG_RATIONAL {
-        Numerator: clock_rate_u32,
-        Denominator: height + 4,
-    };
-    si.vSyncFreq = wdk_sys::DISPLAYCONFIG_RATIONAL {
-        Numerator: clock_rate_u32,
-        Denominator: (height + 4) * (height + 4),
-    };
-    si.activeSize = wdk_sys::DISPLAYCONFIG_2DREGION {
-        cx: width,
-        cy: height,
-    };
-    si.totalSize = wdk_sys::DISPLAYCONFIG_2DREGION {
-        cx: width + 4,
-        cy: height + 4,
-    };
-    // union { AdditionalSignalInfo bitfield | videoStandard:u32 }: videoStandard=255, vSyncFreqDivider=0.
-    si.__bindgen_anon_1.videoStandard = 255;
-    si.scanLineOrdering =
-        wdk_sys::DISPLAYCONFIG_SCANLINE_ORDERING::DISPLAYCONFIG_SCANLINE_ORDERING_PROGRESSIVE;
-    si
-}
-
-/// `IDDCX_TARGET_MODE` for a scan-out mode (vSyncFreqDivider = 1, per the DDI contract).
-pub fn target_mode(width: u32, height: u32, refresh_rate: u32) -> iddcx::IDDCX_TARGET_MODE {
     let region = wdk_sys::DISPLAYCONFIG_2DREGION {
         cx: width,
         cy: height,
@@ -304,7 +294,7 @@ pub fn target_mode(width: u32, height: u32, refresh_rate: u32) -> iddcx::IDDCX_T
     let mut si = pod_init!(wdk_sys::DISPLAYCONFIG_VIDEO_SIGNAL_INFO);
     si.pixelRate = u64::from(refresh_rate) * u64::from(width) * u64::from(height);
     si.hSyncFreq = wdk_sys::DISPLAYCONFIG_RATIONAL {
-        Numerator: refresh_rate * height,
+        Numerator: u32::try_from(u64::from(refresh_rate) * u64::from(height)).unwrap_or(u32::MAX),
         Denominator: 1,
     };
     si.vSyncFreq = wdk_sys::DISPLAYCONFIG_RATIONAL {
@@ -315,12 +305,27 @@ pub fn target_mode(width: u32, height: u32, refresh_rate: u32) -> iddcx::IDDCX_T
     si.activeSize = region;
     si.scanLineOrdering =
         wdk_sys::DISPLAYCONFIG_SCANLINE_ORDERING::DISPLAYCONFIG_SCANLINE_ORDERING_PROGRESSIVE;
-    // videoStandard=255, vSyncFreqDivider=1 (bits 16..21) => 255 | (1<<16).
-    si.__bindgen_anon_1.videoStandard = 255 | (1 << 16);
+    // union { AdditionalSignalInfo bitfield | videoStandard:u32 }: videoStandard=255 (other),
+    // vSyncFreqDivider in bits 16..21.
+    si.__bindgen_anon_1.videoStandard = 255 | (v_sync_freq_divider << 16);
+    si
+}
+
+/// `DISPLAYCONFIG_VIDEO_SIGNAL_INFO` for a monitor mode (vSyncFreqDivider = 0, per the DDI contract).
+pub fn display_info(
+    width: u32,
+    height: u32,
+    refresh_rate: u32,
+) -> wdk_sys::DISPLAYCONFIG_VIDEO_SIGNAL_INFO {
+    signal_info(width, height, refresh_rate, 0)
+}
+
+/// `IDDCX_TARGET_MODE` for a scan-out mode (vSyncFreqDivider = 1, per the DDI contract).
+pub fn target_mode(width: u32, height: u32, refresh_rate: u32) -> iddcx::IDDCX_TARGET_MODE {
     let mut tm = pod_init!(iddcx::IDDCX_TARGET_MODE);
     tm.Size = core::mem::size_of::<iddcx::IDDCX_TARGET_MODE>() as u32;
     tm.TargetVideoSignalInfo = wdk_sys::DISPLAYCONFIG_TARGET_MODE {
-        targetVideoSignalInfo: si,
+        targetVideoSignalInfo: signal_info(width, height, refresh_rate, 1),
     };
     tm
 }
@@ -401,6 +406,10 @@ pub fn set_frame_channel(
     let mut lock = lock_monitors();
     if let Some(m) = lock.iter_mut().find(|m| m.target_id == target_id) {
         m.frame_channel = Some(ch);
+        // The channel store above is mutex-ordered; the bump is what lets the drain loop's
+        // lock-free gate ([`frame_channel_gen`]) notice it. Bump-after-store: a loop pass that
+        // reads the old generation misses THIS pass and attaches on the next (~16 ms).
+        FRAME_CHANNEL_GEN.fetch_add(1, core::sync::atomic::Ordering::Release);
         Ok(())
     } else {
         Err(ch)
@@ -767,7 +776,9 @@ pub fn create_monitor(
     };
 
     // EDID (serial = id) describes the monitor; the OS calls back into parse_monitor_description.
-    let mut edid = crate::edid::Edid::generate_with(id, client_lum);
+    // The session's own mode becomes the preferred-timing DTD when it fits the encoding.
+    let mut edid =
+        crate::edid::Edid::generate_with(id, client_lum, Some((width, height, refresh)));
     let mut desc = pod_init!(iddcx::IDDCX_MONITOR_DESCRIPTION);
     desc.Size = core::mem::size_of::<iddcx::IDDCX_MONITOR_DESCRIPTION>() as u32;
     desc.Type = iddcx::IDDCX_MONITOR_DESCRIPTION_TYPE::IDDCX_MONITOR_DESCRIPTION_TYPE_EDID;

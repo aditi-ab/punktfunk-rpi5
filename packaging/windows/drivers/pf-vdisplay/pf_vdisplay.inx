@@ -41,7 +41,9 @@ AddReg=pf_vdisplay_HardwareDeviceSettings
 
 [pf_vdisplay_HardwareDeviceSettings]
 HKR, , "UpperFilters", %REG_MULTI_SZ%, "IndirectKmd"
-HKR, "WUDF", "DeviceGroupId", %REG_SZ%, "pfVDisplayGroup"
+; (no "WUDF"/DeviceGroupId value: it only means anything under ProcessSharingEnabled, and this
+; driver sets UmdfHostProcessSharing=ProcessSharingDisabled below — code in monitor.rs/control.rs
+; reasons from the dedicated-WUDFHost guarantee, so the group id was dead weight.)
 ; Only the host (LocalSystem service) + admins may open the control device. Deliberately NO Everyone
 ; ACE (SudoVDA ships one for its user-mode host): the control plane creates/removes monitors and
 ; bootstraps the sealed frame channel (IOCTL_SET_FRAME_CHANNEL), so it is not for unprivileged callers.
@@ -55,10 +57,15 @@ UmdfService=pf_vdisplay, pf_vdisplay_Install
 UmdfServiceOrder=pf_vdisplay
 UmdfKernelModeClientPolicy=AllowKernelModeClients
 UmdfHostProcessSharing=ProcessSharingDisabled
+UmdfFileObjectPolicy=AllowNullAndUnknownFileObjects
 
 [pf_vdisplay_Install]
 UmdfLibraryVersion=$UMDFVERSION$
 ServiceBinary=%12%\UMDF\pf_vdisplay.dll
+; "IddCx0102" is the extension's REGISTERED IDENTITY string (every IddCx release keeps it — the
+; sample drivers ship it unchanged at IddCx 1.10); the real version floor is the binary's exported
+; IddMinimumVersionRequired=10 (src/lib.rs). Do not "fix" this to IddCx0110 — that identity does
+; not exist and the install would fail.
 UmdfExtensions=IddCx0102
 
 [WUDFRD_ServiceInstall]

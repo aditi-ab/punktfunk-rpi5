@@ -19,9 +19,23 @@ use crate::{
 /// (the adapter object is only valid after D0), not driver_add.
 pub unsafe extern "C" fn device_d0_entry(
     device: WDFDEVICE,
-    _previous_state: wdk_sys::WDF_POWER_DEVICE_STATE,
+    previous_state: wdk_sys::WDF_POWER_DEVICE_STATE,
 ) -> NTSTATUS {
-    dbglog!("[pf-vd] device_d0_entry");
+    dbglog!("[pf-vd] device_d0_entry (previous_state={previous_state})");
+    // A resume from a REAL low-power state (D1/D2/D3 — the initial start reports D3Final): the
+    // cached adapter handle belongs to the pre-power-cycle incarnation, and `init_adapter` would
+    // short-circuit on it forever, leaving every later IOCTL_ADD pointed at a stale adapter. The
+    // MS sample re-inits on every D0 entry; we clear-and-reinit only on genuine resumes so the
+    // common re-entrant D0 (no power cycle) stays the cheap no-op the doc above promises.
+    if matches!(
+        previous_state,
+        wdk_sys::_WDF_POWER_DEVICE_STATE::WdfPowerDeviceD1
+            | wdk_sys::_WDF_POWER_DEVICE_STATE::WdfPowerDeviceD2
+            | wdk_sys::_WDF_POWER_DEVICE_STATE::WdfPowerDeviceD3
+    ) {
+        dbglog!("[pf-vd] device_d0_entry: power-cycle resume — re-initializing the adapter");
+        crate::adapter::clear_adapter();
+    }
     crate::adapter::init_adapter(device)
 }
 
@@ -53,6 +67,9 @@ pub unsafe extern "C" fn adapter_init_finished(
 /// [`crate::monitor::cleanup_for_device_removal`].
 pub unsafe extern "C" fn device_cleanup(_object: WDFOBJECT) {
     dbglog!("[pf-vd] device cleanup — releasing monitors");
+    // Stop the host-liveness watchdog FIRST: a reap that fired mid-cleanup would race this
+    // teardown over the same monitor list (the hazard `monitor.rs` documents).
+    crate::control::stop_watchdog();
     crate::monitor::cleanup_for_device_removal();
 }
 

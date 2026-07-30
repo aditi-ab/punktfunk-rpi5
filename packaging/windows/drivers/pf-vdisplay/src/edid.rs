@@ -12,8 +12,16 @@
 //! serial-number field (base offset 0x0C, little-endian) encodes the per-monitor index so
 //! `parse_monitor_description` can map an EDID the OS hands back to its monitor; [`Edid::generate_with`]
 //! patches that serial and recomputes BOTH block checksums (base byte 127 + extension byte 255). The
-//! detailed-timing / range-limit descriptors are placeholders — the modes we actually advertise come
-//! from the monitor's stored mode list (`monitor.rs` / `callbacks.rs`), not from parsing this EDID.
+//! preferred-timing DTD is patched to the SESSION's mode when it fits the encoding (fallback:
+//! 1080p60), and the range-limits descriptor is sized to cover everything the driver can advertise
+//! — but the modes the OS OFFERS still come from the monitor's stored mode list
+//! (`monitor.rs` / `callbacks.rs`), not from parsing this EDID.
+//!
+//! Deliberately NO HDMI Vendor-Specific Data Block, although `monitor.rs` declares
+//! `DISPLAYCONFIG_OUTPUT_TECHNOLOGY_HDMI`: a VSDB exists to carry physical-sink features (physical
+//! address for CEC, TMDS limits, deep-color caps) that a virtual display has none of, Windows does
+//! not require it to drive the monitor, and inventing a CEC physical address is worse than the
+//! cosmetic parser warning its absence costs.
 
 use std::array::TryFromSliceError;
 
@@ -26,7 +34,7 @@ const SERIAL_OFFSET: usize = 0x0C;
 #[rustfmt::skip]
 const BASE: [u8; 128] = [
     0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, // fixed header
-    0x41, 0xCB, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // mfr "PNK", product, serial (patched)
+    0x41, 0xCB, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, // mfr "PNK", product code 1 (0 = "unset" to EDID tooling), serial (patched)
     0xFF, 0x21, 0x01, 0x04, 0xB0, 0x32, 0x1F, 0x78, // week/year, EDID 1.4, 10-bit digital, size, gamma
     0x03, 0x78, 0xB1, 0xB5, 0x4A, 0x2B, 0xCC, 0x21, // feature (sRGB-default CLEARED), BT.2020 primaries...
     0x0B, 0x50, 0x54, 0x00, 0x00, 0x00, 0x01, 0x01, // ...BT.2020 primaries, established timings, std timings
@@ -34,8 +42,8 @@ const BASE: [u8; 128] = [
     0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x02, 0x3A, // std timings, DTD 1 (placeholder preferred timing)
     0x80, 0x18, 0x71, 0x38, 0x2D, 0x40, 0x58, 0x2C,
     0x45, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1E,
-    0x00, 0x00, 0x00, 0xFD, 0x00, 0x17, 0xF0, 0x0F, // display range-limits descriptor
-    0xFF, 0x0F, 0x00, 0x0A, 0x20, 0x20, 0x20, 0x20,
+    0x00, 0x00, 0x00, 0xFD, 0x08, 0x17, 0xF0, 0x0F, // range-limits: offsets H-max+255, 23-240 Hz, min-H 15 kHz...
+    0xFF, 0xFF, 0x00, 0x0A, 0x20, 0x20, 0x20, 0x20, // ...max-H 255+255=510 kHz, max clock 2550 MHz (was 150 — below the driver's own 1080p120 default)
     0x20, 0x20, 0x00, 0x00, 0x00, 0xFC, 0x00, 0x50, // name descriptor "Punktfunk"
     0x75, 0x6E, 0x6B, 0x74, 0x66, 0x75, 0x6E, 0x6B,
     0x0A, 0x20, 0x20, 0x20, 0x00, 0x00, 0x00, 0x00, // empty 4th descriptor...
@@ -102,12 +110,23 @@ impl Edid {
     /// `lum` is the CLIENT display's luminance volume — coded into the HDR static-metadata block's
     /// desired-content bytes (CTA-861.3, via the shared+unit-tested `pf_driver_proto::edid`
     /// coders) so the OS/apps tone-map to the client's real panel; all-zero keeps the built-in
-    /// ~993-nit defaults.
-    pub fn generate_with(serial: u32, lum: ClientLuminance) -> Vec<u8> {
+    /// ~993-nit defaults. `preferred` is the session's `(width, height, refresh)` — when it fits
+    /// the DTD encoding (≤ 655.35 MHz pixel clock; 4K120-class does not), it REPLACES the
+    /// hard-coded 1080p60 preferred-timing descriptor, so the EDID's preferred mode is the mode
+    /// the session actually asked for (`pf_driver_proto::edid::dtd`, unit-tested there). The modes
+    /// the OS OFFERS still come from the IddCx mode list, not this descriptor.
+    pub fn generate_with(
+        serial: u32,
+        lum: ClientLuminance,
+        preferred: Option<(u32, u32, u32)>,
+    ) -> Vec<u8> {
         let mut edid = [0u8; 256];
         // Block 0: base.
         edid[..128].copy_from_slice(&BASE);
         edid[SERIAL_OFFSET..SERIAL_OFFSET + 4].copy_from_slice(&serial.to_le_bytes());
+        if let Some(dtd) = preferred.and_then(|(w, h, r)| pf_driver_proto::edid::dtd(w, h, r)) {
+            edid[54..72].copy_from_slice(&dtd);
+        }
         // Block 1: CTA-861.3 extension (header + colorimetry + HDR static metadata; rest stays 0).
         edid[128..132].copy_from_slice(&CTA_HEADER);
         edid[132..136].copy_from_slice(&COLORIMETRY_DB);

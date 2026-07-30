@@ -69,6 +69,15 @@ fn hr_success(hr: NTSTATUS) -> bool {
     hr >= 0
 }
 
+/// The `IddCxSetRealtimeGPUPriority` A/B knob: `PFVD_NO_RT_GPU` (any value, MACHINE env — the
+/// driver runs in WUDFHost as LocalService, so `setx /M PFVD_NO_RT_GPU 1` + a device restart)
+/// turns the priority raise OFF. Read once per process, the [`crate::log`] `OnceLock` pattern.
+fn realtime_gpu_priority_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("PFVD_NO_RT_GPU").is_none())
+}
+
 /// A minimal newtype to move a raw pointer / handle across the thread boundary. The wrapped value is a
 /// raw IddCx swap-chain handle or an event HANDLE (both raw pointers, framework-managed) — sending them
 /// to the worker is sound because only this thread touches them and the framework synchronises lifetime.
@@ -249,7 +258,12 @@ impl SwapChainProcessor {
         // guaranteed populated (`IddMinimumVersionRequired = 10`, lib.rs); the DDI itself may
         // still decline (e.g. E_NOTIMPL on pre-WDDM-3.0 hardware) — best-effort, never fatal.
         // Called while our borrowed device reference is still alive; IddCx uses it synchronously.
-        if set_ok {
+        //
+        // Knobbed (PFVD_NO_RT_GPU, machine env, read in the WUDFHost process): no canonical IDD
+        // driver raises this priority, and it preempts the game's and DWM's own queues at a level
+        // apps can't reach — a candidate aggravator in the interval-stutter program that must
+        // stay A/B-able on a field box without a rebuild. Default ON (today's behavior).
+        if set_ok && realtime_gpu_priority_enabled() {
             let mut rt = pod_init!(IDARG_IN_SETREALTIMEGPUPRIORITY);
             rt.pDevice = dxgi_device.as_raw().cast();
             // SAFETY: driver is loaded; `swap_chain` is the live assigned swap-chain whose device
@@ -319,6 +333,11 @@ impl SwapChainProcessor {
 
         let mut logged_pending = false;
         let mut logged_frame = false;
+        // The frame-channel delivery gate (see `monitor::frame_channel_gen`): the loop only takes
+        // the monitors mutex when a delivery LANDED since it last looked. Seeded one behind the
+        // current generation so a delivery that arrived before this worker started (host delivered
+        // ahead of the swap-chain assign) is checked on the very first pass.
+        let mut seen_chan_gen = crate::monitor::frame_channel_gen().wrapping_sub(1);
         loop {
             // Check terminate at the TOP, every iteration. The success branch below does NOT re-check it,
             // so during a CONTINUOUS frame burst (DWM rendering the freshly-activated desktop) a thread the
@@ -330,6 +349,13 @@ impl SwapChainProcessor {
                 break;
             }
 
+            // The lock-free delivery gate: `chan_pending` is true only when a `set_frame_channel`
+            // landed since the last pass — the two mutex-taking checks below (`has_frame_channel`,
+            // `take_frame_channel`) used to run EVERY pass (≥60 locks/s per worker on a mutex
+            // contended by the whole control plane, the mode DDIs and the watchdog); now the
+            // steady state takes no lock at all.
+            let chan_gen = crate::monitor::frame_channel_gen();
+            let chan_pending = chan_gen != seen_chan_gen;
             // Re-attach triggers, either of:
             // * `is_stale` — the host recreated the ring mid-session (HDR flip): it bumps OUR header's
             //   generation and re-delivers; without dropping here we'd keep CopyResource'ing into the
@@ -340,7 +366,9 @@ impl SwapChainProcessor {
             //   fire. The host only delivers after fully (re)creating a ring, so a pending delivery
             //   always supersedes whatever we're attached to.
             if publisher.as_ref().is_some_and(FramePublisher::is_stale)
-                || (publisher.is_some() && crate::monitor::has_frame_channel(target_id))
+                || (publisher.is_some()
+                    && chan_pending
+                    && crate::monitor::has_frame_channel(target_id))
             {
                 // Harvest the superseded ring's last-published frame into the stash BEFORE dropping
                 // the publisher: between sessions the driver keeps publishing into the (host-side
@@ -351,15 +379,16 @@ impl SwapChainProcessor {
                 }
             }
             // Lazy-attach at the loop TOP so we keep trying even while the display is idle (E_PENDING /
-            // no frames presented yet), not only when a frame is acquired. Polled EVERY iteration (a
-            // cheap mutex peek, the same cost the pending-delivery check above already pays): attach
-            // latency is now first-frame latency, since the attach itself republishes the stash. A
-            // taken delivery is consumed whether the attach succeeds or not (on failure its handles are
-            // closed inside from_channel, the host's wait-for-attach reads the status code, and any
-            // retry is a NEW delivery). `target_id` binds the attach: the mapped ring must name THIS
-            // monitor (proto v3 validation inside from_channel — a cross-delivered ring is refused,
-            // never published into).
+            // no frames presented yet), not only when a frame is acquired — gated by `chan_pending`
+            // (a delivery can only appear via `set_frame_channel`, which bumps the generation):
+            // attach latency is still first-frame latency, since the attach itself republishes the
+            // stash. A taken delivery is consumed whether the attach succeeds or not (on failure its
+            // handles are closed inside from_channel, the host's wait-for-attach reads the status
+            // code, and any retry is a NEW delivery — with its own bump). `target_id` binds the
+            // attach: the mapped ring must name THIS monitor (proto v3 validation inside
+            // from_channel — a cross-delivered ring is refused, never published into).
             if publisher.is_none()
+                && chan_pending
                 && let Some(channel) = crate::monitor::take_frame_channel(target_id)
                 && let Ok(mut p) = FramePublisher::from_channel(
                     channel,
@@ -383,6 +412,13 @@ impl SwapChainProcessor {
                     );
                 }
                 publisher = Some(p);
+            }
+            // The pending generation was serviced above — whichever branch ran, a lock-taking
+            // check happened (`has_frame_channel` and/or `take_frame_channel`), so this pass has
+            // seen everything up to `chan_gen`. A delivery racing in between bumps past it and
+            // re-arms the gate on the next pass.
+            if chan_pending {
+                seen_chan_gen = chan_gen;
             }
 
             // ...Buffer2 is required once CAN_PROCESS_FP16 is set. AcquireSystemMemoryBuffer=FALSE keeps
