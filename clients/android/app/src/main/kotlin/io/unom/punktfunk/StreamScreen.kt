@@ -63,6 +63,7 @@ import io.unom.punktfunk.kit.Sc2Capture
 import io.unom.punktfunk.kit.VideoDecoders
 import io.unom.punktfunk.models.ActiveSession
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.math.roundToInt
 import kotlinx.coroutines.delay
 
 /**
@@ -83,6 +84,9 @@ fun StreamScreen(session: ActiveSession, onDisconnect: () -> Unit) {
     // requested.
     val composeView = androidx.compose.ui.platform.LocalView.current
     val window = activity?.window
+    // The negotiated stream refresh, known from the handshake (0 = unknown / older native lib) —
+    // drives the panel mode pin, the render-rate vote, and the presenter's latch grid.
+    val streamHz = remember(handle) { NativeBridge.nativeVideoSize(handle)?.getOrNull(2) ?: 0 }
     val controller = remember(window) {
         window?.let { WindowCompat.getInsetsController(it, it.decorView) }
     }
@@ -343,7 +347,6 @@ fun StreamScreen(session: ActiveSession, onDisconnect: () -> Unit) {
         // own ANativeWindow_setFrameRate hint still aligns vsync, but it is advisory — some OEM
         // refresh governors ignore it outright and would leave a 120 Hz session on a 60/90 Hz
         // panel. TV boxes skip the pin: the native side actively drives the HDMI mode there.
-        val streamHz = NativeBridge.nativeVideoSize(handle)?.getOrNull(2) ?: 0
         if (isTv) {
             activity?.setConsoleHighRefreshRate(false) // the decoder's HDMI mode switch governs
         } else {
@@ -354,6 +357,15 @@ fun StreamScreen(session: ActiveSession, onDisconnect: () -> Unit) {
         // Undone by passing 0 on the way out (API 30+).
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             composeView.requestUnbufferedDispatch(android.view.InputDevice.SOURCE_CLASS_POINTER)
+        }
+        // Vote the app's RENDER rate up to the stream's (API 35+). The mode pin above governs the
+        // panel, but the platform separately down-rates a quiet app's choreographer stream
+        // (frame-rate categories: a non-animating UI reads as "normal" = 60) — observed on-glass
+        // as 16.6 ms vsync callbacks on a 120 Hz panel, which would pace the presenter at half
+        // rate. The native side also subdivides onto the panel grid, so this vote is the belt to
+        // that braces. Reset to no-preference on the way out.
+        if (Build.VERSION.SDK_INT >= 35 && streamHz > 0) {
+            composeView.requestedFrameRate = streamHz.toFloat()
         }
         // Host→client feedback (rumble + DualSense lightbar/LEDs), routed to each controller by pad
         // index via the router; poll threads stopped + joined before the router is released and the
@@ -487,6 +499,9 @@ fun StreamScreen(session: ActiveSession, onDisconnect: () -> Unit) {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                 composeView.requestUnbufferedDispatch(0) // back to ordinary batched dispatch
             }
+            if (Build.VERSION.SDK_INT >= 35) {
+                composeView.requestedFrameRate = View.REQUESTED_FRAME_RATE_CATEGORY_DEFAULT
+            }
             controller?.hide(WindowInsetsCompat.Type.ime()) // drop any keyboard left showing
             window?.setSoftInputMode(priorSoftInput)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && priorCutout != null) {
@@ -586,6 +601,12 @@ fun StreamScreen(session: ActiveSession, onDisconnect: () -> Unit) {
                                 isTv,
                                 initialSettings.presentPriorityWire(),
                                 initialSettings.smoothBuffer,
+                                // The panel's own refresh — from the mode TABLE (streamPanelFps),
+                                // because display.refreshRate reports a per-uid override, not the
+                                // panel. Fallback: the (possibly lying) live rate.
+                                activity?.streamPanelFps(streamHz)?.takeIf { it > 0 }
+                                    ?: (runCatching { context.display }.getOrNull()?.refreshRate ?: 0f)
+                                        .roundToInt(),
                             )
                             NativeBridge.nativeStartAudio(handle, lowLatencyMode)
                             if (micWanted) NativeBridge.nativeStartMic(handle)

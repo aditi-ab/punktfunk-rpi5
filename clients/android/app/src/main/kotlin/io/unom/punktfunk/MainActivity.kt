@@ -471,9 +471,26 @@ class MainActivity : ComponentActivity() {
             setConsoleHighRefreshRate(false)
             return
         }
+        val target = streamModeFor(hz) ?: return
+        window.attributes = window.attributes.apply { preferredDisplayModeId = target.modeId }
+    }
+
+    /**
+     * The panel refresh rate a [hz] stream runs against — [streamModeFor]'s pick, from the mode
+     * TABLE rather than `display.refreshRate`. The distinction matters: under a per-uid frame
+     * rate override (games get a 60 fps default on Android 15+) `refreshRate` reports the
+     * override, not the panel — observed on-glass as a 120 Hz panel reading back as 60. The
+     * supported-modes list is not override-filtered. `0` when unresolvable.
+     */
+    fun streamPanelFps(hz: Int): Int =
+        streamModeFor(hz)?.refreshRate?.let { kotlin.math.round(it).toInt() } ?: 0
+
+    /** The same-resolution display mode [setStreamDisplayMode] pins for a [hz] stream. */
+    private fun streamModeFor(hz: Int): android.view.Display.Mode? {
+        if (hz <= 0) return null
         @Suppress("DEPRECATION")
         val disp = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) display else windowManager.defaultDisplay
-        val current = disp?.mode ?: return
+        val current = disp?.mode ?: return null
         val sameRes = disp.supportedModes.filter {
             it.physicalWidth == current.physicalWidth && it.physicalHeight == current.physicalHeight
         }
@@ -481,7 +498,7 @@ class MainActivity : ComponentActivity() {
             val k = (rate / hz).toInt()
             return if (k >= 2 && kotlin.math.abs(rate - hz * k) < 1f) k else 0
         }
-        val target = sameRes.minWithOrNull(
+        return sameRes.minWithOrNull(
             compareBy(
                 {
                     when {
@@ -492,8 +509,7 @@ class MainActivity : ComponentActivity() {
                 },
                 { if (multiple(it.refreshRate) > 0) it.refreshRate else -it.refreshRate },
             ),
-        ) ?: return
-        window.attributes = window.attributes.apply { preferredDisplayModeId = target.modeId }
+        )
     }
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {

@@ -223,6 +223,9 @@ object NativeBridge {
         isTv: Boolean,
         presentPriority: Int,
         smoothBuffer: Int,
+        /** The display mode's own refresh rate (0 = unknown) — the latch grid the presenter
+         *  subdivides onto when the platform down-rates the app's choreographer stream. */
+        panelFps: Int,
     )
 
     /** Stop + join the decode thread without closing the session. No-op on `0`. */

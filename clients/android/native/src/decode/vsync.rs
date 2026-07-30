@@ -51,7 +51,18 @@ pub(super) struct VsyncShared {
     /// The latest vsync callback's frame time (0 = no callback yet).
     last_vsync_ns: AtomicI64,
     /// Estimated vsync period (EMA over callback deltas / timeline spacing; 0 = unmeasured).
+    ///
+    /// ⚠ This is the APP's render rate, not necessarily the panel's: Android down-rates a
+    /// process's vsync stream (frame-rate categories / per-uid overrides), so a quiet UI can be
+    /// served 60 Hz callbacks while the panel scans at 120 (observed on-glass, A024). Pacing
+    /// video to THIS rate would cap the stream — hence `panel_period_ns` + the subdivision in
+    /// [`Self::next_target`].
     period_ns: AtomicI64,
+    /// The panel's own refresh period (from the display mode Kotlin resolved at stream start;
+    /// 0 = unknown). The grid SurfaceFlinger actually latches on.
+    panel_period_ns: AtomicI64,
+    /// Callback count, for the one-shot cadence diagnostic log.
+    ticks: std::sync::atomic::AtomicU32,
     /// The latest callback's upcoming timelines, soonest first. Empty on the 31/32 fallback.
     timelines: Mutex<Vec<FrameTimeline>>,
 }
@@ -62,33 +73,60 @@ impl VsyncShared {
         self.period_ns.load(Ordering::Relaxed)
     }
 
+    /// The panel's own refresh period (0 = unknown) — for the pf-present line's decomposition.
+    pub(super) fn panel_period_ns(&self) -> i64 {
+        self.panel_period_ns.load(Ordering::Relaxed)
+    }
+
     /// The release target for a frame submitted at `now`: the earliest stored timeline whose
     /// deadline is still `margin` away, extrapolated forward by whole periods once the stored
     /// set has aged out (timelines refresh once per vsync callback; a frame can decode anywhere
     /// inside that window). `None` on the 31/32 fallback — the caller releases ASAP.
+    ///
+    /// The picked target is then SUBDIVIDED onto the panel grid: the platform reports timelines
+    /// at the app's assigned render rate, but the panel latches at its own — when the app is
+    /// down-rated (60 Hz callbacks on a 120 Hz panel) the reported timelines are a whole panel
+    /// period apart or more, and pacing to them would cap the video. Pulling the target earlier
+    /// by whole panel periods (while its deadline still clears the margin) restores the true
+    /// grid; when callbacks run at the panel rate the pull condition is never true and this is
+    /// a no-op.
     pub(super) fn next_target(&self, now_ns: i64, margin_ns: i64) -> Option<FrameTimeline> {
-        let g = self
-            .timelines
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for t in g.iter() {
-            if t.deadline_ns > now_ns + margin_ns {
-                return Some(*t);
+        let mut t = {
+            let g = self
+                .timelines
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let found = g
+                .iter()
+                .find(|t| t.deadline_ns > now_ns + margin_ns)
+                .copied();
+            match found {
+                Some(t) => t,
+                None => {
+                    let last = g.last().copied()?;
+                    let period = self.period_ns();
+                    if period <= 0 {
+                        return None;
+                    }
+                    // All stored timelines have passed — step the last one forward whole
+                    // periods until its deadline clears `now + margin` again.
+                    let behind = (now_ns + margin_ns).saturating_sub(last.deadline_ns);
+                    let k = behind / period + 1;
+                    FrameTimeline {
+                        expected_present_ns: last.expected_present_ns + k * period,
+                        deadline_ns: last.deadline_ns + k * period,
+                    }
+                }
+            }
+        };
+        let panel = self.panel_period_ns.load(Ordering::Relaxed);
+        if panel > 0 {
+            while t.deadline_ns - panel > now_ns + margin_ns {
+                t.deadline_ns -= panel;
+                t.expected_present_ns -= panel;
             }
         }
-        let last = g.last().copied()?;
-        let period = self.period_ns();
-        if period <= 0 {
-            return None;
-        }
-        // All stored timelines have passed — step the last one forward whole periods until its
-        // deadline clears `now + margin` again.
-        let behind = (now_ns + margin_ns).saturating_sub(last.deadline_ns);
-        let k = behind / period + 1;
-        Some(FrameTimeline {
-            expected_present_ns: last.expected_present_ns + k * period,
-            deadline_ns: last.deadline_ns + k * period,
-        })
+        Some(t)
     }
 }
 
@@ -194,6 +232,43 @@ impl CallbackCtx {
             .shared
             .last_vsync_ns
             .swap(frame_time_ns, Ordering::Relaxed);
+        // Panel-grid learner: timeline spacing is SurfaceFlinger's own grid, and the finest
+        // spacing ever observed is the panel's true period — trustworthy where the configured
+        // value is not (under a per-uid frame-rate override, `Display.getRefreshRate` REPORTS
+        // THE OVERRIDE, observed on-glass: a 120 Hz panel read back as 60 while early timelines
+        // ran at 8.28 ms). Corrects DOWNWARD only: subdividing onto a finer real grid is always
+        // valid, widening on a later down-rated window never is.
+        if timelines.len() >= 2 {
+            let spacing = timelines[1].expected_present_ns - timelines[0].expected_present_ns;
+            if (2_000_000..=42_000_000).contains(&spacing) {
+                let cur = self.shared.panel_period_ns.load(Ordering::Relaxed);
+                if cur == 0 || spacing < cur - 200_000 {
+                    self.shared
+                        .panel_period_ns
+                        .store(spacing, Ordering::Relaxed);
+                }
+            }
+        }
+        // One-shot cadence diagnostic (3rd tick, once deltas exist): the callback cadence vs the
+        // panel period is exactly the down-rating question, and this line answers it on-glass.
+        if self.shared.ticks.fetch_add(1, Ordering::Relaxed) == 2 {
+            let spacing = if timelines.len() >= 2 {
+                timelines[1].expected_present_ns - timelines[0].expected_present_ns
+            } else {
+                0
+            };
+            log::info!(
+                "vsync: cadence Δ={:.2}ms timelines={} spacing={:.2}ms panel={:.2}ms",
+                if prev > 0 {
+                    (frame_time_ns - prev) as f64 / 1e6
+                } else {
+                    0.0
+                },
+                timelines.len(),
+                spacing as f64 / 1e6,
+                self.shared.panel_period_ns.load(Ordering::Relaxed) as f64 / 1e6,
+            );
+        }
         // Period: prefer timeline spacing (exact, straight from the platform), else the delta of
         // successive callbacks (jittery — EMA'd), clamped to sane panel rates (24..500 Hz).
         let mut period = 0i64;
@@ -289,15 +364,23 @@ pub(super) struct VsyncClock {
 impl VsyncClock {
     /// Spawn the choreographer thread. `on_tick` fires once per vsync ON THAT THREAD — it must
     /// only do something cheap and `Send` (the decode loop passes an event-channel send).
-    /// `None` when the platform surface is missing (very old device) — the presenter then runs
-    /// clock-less (ASAP targets, predicted-latch budget).
-    pub(super) fn start(on_tick: Box<dyn Fn() + Send>) -> Option<VsyncClock> {
+    /// `panel_hz` is the display mode's own refresh rate (0 = unknown), the latch grid that
+    /// [`VsyncShared::next_target`] subdivides onto. `None` when the platform surface is missing
+    /// (very old device) — the presenter then runs clock-less (ASAP targets, predicted-latch
+    /// budget).
+    pub(super) fn start(panel_hz: i32, on_tick: Box<dyn Fn() + Send>) -> Option<VsyncClock> {
         let api = ChoreoApi::resolve()?;
         let timelines_live = api.post_vsync.is_some();
         let shared = Arc::new(VsyncShared {
             stop: AtomicBool::new(false),
             last_vsync_ns: AtomicI64::new(0),
             period_ns: AtomicI64::new(0),
+            panel_period_ns: AtomicI64::new(if panel_hz > 0 {
+                1_000_000_000 / panel_hz as i64
+            } else {
+                0
+            }),
+            ticks: std::sync::atomic::AtomicU32::new(0),
             timelines: Mutex::new(Vec::new()),
         });
         let thread_shared = shared.clone();

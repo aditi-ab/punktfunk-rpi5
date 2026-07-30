@@ -340,10 +340,13 @@ impl Presenter {
         let (pace_p50, pace_max) = p50_max_ms(std::mem::take(&mut self.pace_us));
         let (latch_p50, latch_max) = p50_max_ms(latch);
         let period_ms = clock.map(|c| c.period_ns() as f64 / 1e6).unwrap_or(0.0);
+        let panel_ms = clock
+            .map(|c| c.panel_period_ns() as f64 / 1e6)
+            .unwrap_or(0.0);
         log::info!(
             target: "pf.present",
             "released={} displays={} paced={} noBudget={} forced={} qDry={} \
-             paceMs p50={:.2} max={:.2} latchMs p50={:.2} max={:.2} vsyncMs={:.2}",
+             paceMs p50={:.2} max={:.2} latchMs p50={:.2} max={:.2} vsyncMs={:.2} panelMs={:.2}",
             self.released,
             displays,
             self.paced_drops,
@@ -355,6 +358,7 @@ impl Presenter {
             latch_p50,
             latch_max,
             period_ms,
+            panel_ms,
         );
         self.released = 0;
         self.paced_drops = 0;

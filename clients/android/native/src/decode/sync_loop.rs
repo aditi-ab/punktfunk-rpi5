@@ -47,6 +47,7 @@ pub(super) fn run_sync(
         // The timeline presenter lives in the async loop only; this loop IS the escape hatch.
         present_priority: _,
         smooth_buffer: _,
+        panel_hz: _,
     } = opts;
     boost_thread_priority();
     let mode = client.mode();

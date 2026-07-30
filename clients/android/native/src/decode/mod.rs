@@ -115,6 +115,10 @@ pub(crate) struct DecodeOptions {
     /// The smoothness buffer depth (`smooth_buffer` setting): 0 = automatic (2), else 1..=3.
     /// Only meaningful with `present_priority` = smooth.
     pub smooth_buffer: i32,
+    /// The display mode's own refresh rate (Kotlin's `display.refreshRate` at stream start;
+    /// 0 = unknown) — the latch grid the presenter subdivides onto when the app's choreographer
+    /// stream is down-rated below the panel (see `vsync.rs`).
+    pub panel_hz: i32,
 }
 
 /// The decode entry point on the `pf-decode` thread: dispatches to the async or synchronous loop.

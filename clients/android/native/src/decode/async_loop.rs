@@ -84,6 +84,7 @@ pub(super) fn run_async(
         is_tv,
         present_priority,
         smooth_buffer,
+        panel_hz,
     } = opts;
     boost_thread_priority();
     let mode = client.mode();
@@ -387,9 +388,12 @@ pub(super) fn run_async(
         // lesson). A `None` from start (no choreographer surface) simply leaves ASAP targets.
         if had_output && vsync.is_none() {
             if let Some(tx) = vsync_tx.take() {
-                vsync = VsyncClock::start(Box::new(move || {
-                    let _ = tx.send(DecodeEvent::Vsync);
-                }));
+                vsync = VsyncClock::start(
+                    panel_hz,
+                    Box::new(move || {
+                        let _ = tx.send(DecodeEvent::Vsync);
+                    }),
+                );
                 if vsync.is_none() {
                     log::info!("decode: no choreographer clock — presenter uses ASAP targets");
                 }

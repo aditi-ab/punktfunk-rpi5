@@ -178,8 +178,12 @@ unsafe extern "C" fn on_frame_rendered(
             }
         }
     }
-    let display_us = paired.map(|(d, _)| ((displayed_ns - d).max(0) / 1000) as u64);
-    let latch_us = paired.map(|(_, r)| ((displayed_ns - r).max(0) / 1000) as u64);
+    // Clamped to (0, 10 s) like the e2e sample: a vendor's first render callbacks can carry a
+    // garbage `system_nano` (observed on-glass: an epoch-sized latch max on the session's first
+    // window), and one such sample would poison every max/percentile it lands in.
+    let clamp = |v: i128| (v > 0 && v < 10_000_000_000).then_some((v / 1000) as u64);
+    let display_us = paired.and_then(|(d, _)| clamp(displayed_ns - d));
+    let latch_us = paired.and_then(|(_, r)| clamp(displayed_ns - r));
     // Always-on half: the presenter's pf-present line reads these with the HUD off.
     t.meter.note_latch(latch_us);
     if !t.stats.enabled() {
