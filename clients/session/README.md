@@ -5,10 +5,15 @@ no widgets, terminal stats. The power-user / gamescope stream client, and the st
 presenter of the Linux client re-architecture (punktfunk-planning:
 `linux-client-rearchitecture.md`).
 
+This binary is deliberately dumb: a renderer the front-ends call INTO — the GTK shell
+(`punktfunk-client`), the WinUI shell, and the `punktfunk` CLI all spawn it through the
+same brain (`pf_client_core::orchestrate`), which resolves policy (profiles, settings,
+wake) and hands the result down, normally as a `--resolved-spec` file. It reads the
+shared stores only as the compat fallback for a bare hand-launched invocation.
+
 ```
 punktfunk-session --connect host[:port] [--fp HEX] [--launch id] [--fullscreen] [--stats]
 punktfunk-session --browse host[:port] [--mgmt PORT] [--fullscreen]
-punktfunk-session --pair <PIN> --connect host[:port] [--name LABEL]
 ```
 
 `--browse` opens the console game library (the Skia coverflow over the animated aurora)
@@ -21,12 +26,10 @@ Reads the same identity / known-hosts / settings stores as the desktop client
 (`punktfunk-client`), so enrolling on either side makes the other work; this binary never
 connects to a host it has no pinned fingerprint for (`--fp HEX` overrides the store).
 
-`--pair <PIN> --connect host[:port]` runs the SPAKE2 ceremony with no window and no
-toolkit, prints `paired <addr>:<port> fp=<hex>`, and exits — the route for a machine that
-has only SSH (an embedded/kiosk client, an image being provisioned). `--name` sets the
-label the host files this client under, defaulting to the hostname. It is in the
-`--no-default-features` build too: enrolling must never be the reason a minimal image has
-to pull in Skia.
+Pairing is `punktfunk pair <host>` — the CLI, which ships alongside this binary in every
+package and needs no window and no toolkit either. `punktfunk-session --pair` still works
+for one release (someone's provisioning script calls it today) but prints a deprecation
+notice: pairing is a trust ceremony and belongs to the brain, not a renderer.
 
 Stdout is the machine interface: `{"ready":true}` after the first presented frame,
 `stats: …` once per second while the overlay tier isn't Off (always the full detailed

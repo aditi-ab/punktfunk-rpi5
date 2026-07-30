@@ -139,16 +139,20 @@ jobs:
       # Both client binaries. ARM64: no skia-binaries prebuilt for the target, so the session
       # drops its `ui` feature there (pf-console-ui excluded; --no-default-features is a no-op
       # for the shell, which has no features).
+      # punktfunk-cli is in every gate: windows-msix.yml ships its `punktfunk.exe` alias, so
+      # a CLI that only the release workflow compiles is a release-day surprise. Its tests
+      # RUN the binary (help contract), as the session's contract_smoke runs the session —
+      # the gate class that catches a compiling-but-wrong binary (the 0.22.0 clobber).
       - name: Build
         shell: pwsh
         run: |
           $sf = @(); if ('${{ matrix.target }}' -eq 'aarch64-pc-windows-msvc') { $sf = @('--no-default-features') }
-          cargo build -p punktfunk-client-windows -p punktfunk-client-session @sf --target ${{ matrix.target }}
+          cargo build -p punktfunk-client-windows -p punktfunk-client-session -p punktfunk-cli @sf --target ${{ matrix.target }}
 
       - name: Clippy (-D warnings)
         shell: pwsh
         run: |
-          $pkgs = @('-p','punktfunk-client-windows','-p','punktfunk-client-session','-p','pf-client-core','-p','pf-presenter','-p','pf-ffvk')
+          $pkgs = @('-p','punktfunk-client-windows','-p','punktfunk-client-session','-p','punktfunk-cli','-p','pf-client-core','-p','pf-presenter','-p','pf-ffvk')
           $sf = @()
           if ('${{ matrix.target }}' -eq 'aarch64-pc-windows-msvc') { $sf = @('--no-default-features') } else { $pkgs += @('-p','pf-console-ui') }
           cargo clippy @pkgs --all-targets @sf --target ${{ matrix.target }} -- -D warnings
@@ -156,9 +160,9 @@ jobs:
       - name: Rustfmt check
         if: matrix.target == 'x86_64-pc-windows-msvc'
         shell: pwsh
-        run: cargo fmt -p punktfunk-client-windows -p punktfunk-client-session -p pf-client-core -p pf-presenter -p pf-console-ui -p pf-ffvk -- --check
+        run: cargo fmt -p punktfunk-client-windows -p punktfunk-client-session -p punktfunk-cli -p pf-client-core -p pf-presenter -p pf-console-ui -p pf-ffvk -- --check
 
       - name: Test
         if: matrix.target == 'x86_64-pc-windows-msvc'
         shell: pwsh
-        run: cargo test -p punktfunk-client-windows -p punktfunk-client-session -p pf-client-core -p pf-presenter -p pf-console-ui -p pf-ffvk --target ${{ matrix.target }}
+        run: cargo test -p punktfunk-client-windows -p punktfunk-client-session -p punktfunk-cli -p pf-client-core -p pf-presenter -p pf-console-ui -p pf-ffvk --target ${{ matrix.target }}
