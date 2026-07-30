@@ -173,6 +173,12 @@ package_punktfunk-host() {
   # operator copies it into ~/.config/systemd/user/punktfunk-host.service.d/ when they want it.
   install -Dm0644 "$R/scripts/punktfunk-host-desktop-session.conf" \
     "$pkgdir/usr/share/punktfunk/punktfunk-host-desktop-session.conf"
+  # Install-kind + channel marker, read by the host's update-check surface (planning:
+  # host-update-from-web-console.md §4.1). A canary build's pkgrel is `0.<zero-padded run>`.
+  local _pf_update_channel=stable
+  [[ $pkgrel == 0.* ]] && _pf_update_channel=canary
+  printf 'pacman %s\n' "$_pf_update_channel" | \
+    install -Dm0644 /dev/stdin "$pkgdir/usr/share/punktfunk/install-kind"
   install -Dm0644 "$R/scripts/punktfunk-kde-session.service" "$pkgdir/usr/lib/systemd/user/punktfunk-kde-session.service"
   sed -i 's#%h/punktfunk/scripts/headless/run-headless-kde.sh#/usr/share/punktfunk/headless/run-headless-kde.sh#' \
     "$pkgdir/usr/lib/systemd/user/punktfunk-kde-session.service"

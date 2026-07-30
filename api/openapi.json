@@ -10,7 +10,7 @@
       "name": "MIT OR Apache-2.0",
       "identifier": "MIT OR Apache-2.0"
     },
-    "version": "0.21.0"
+    "version": "0.22.2"
   },
   "paths": {
     "/api/v1/clients": {
@@ -3432,6 +3432,90 @@
           }
         }
       }
+    },
+    "/api/v1/update/check": {
+      "post": {
+        "tags": [
+          "update"
+        ],
+        "summary": "Check for updates now",
+        "description": "Forces a manifest fetch + verification and returns the refreshed state. Rate-limited to\none forced check per 30 s.",
+        "operationId": "forceUpdateCheck",
+        "responses": {
+          "200": {
+            "description": "Refreshed update-check state (`last_error` carries a failed check)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UpdateStatus"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Update checks are disabled on this host",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "A forced check ran less than 30 s ago",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/update/status": {
+      "get": {
+        "tags": [
+          "update"
+        ],
+        "summary": "Update-check status",
+        "description": "How this host was installed, which channel it follows, whether a newer release is known,\nand how to update. Reading this may kick a background refresh when the cached check is\nolder than 6 h; the response never blocks on the network.",
+        "operationId": "getUpdateStatus",
+        "responses": {
+          "200": {
+            "description": "Current update-check state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UpdateStatus"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -4796,6 +4880,36 @@
               "source": {
                 "type": "string",
                 "description": "What mutated the library: `\"manual\"` today; a provider id once the provider\nAPI (RFC §8) lands."
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "A verified update manifest announced a release newer than the running host. Emitted\nonce per discovered version (a steady-state \"newer exists\" doesn't re-fire on every\nrefresh).",
+            "required": [
+              "version",
+              "channel",
+              "install_kind",
+              "kind"
+            ],
+            "properties": {
+              "channel": {
+                "type": "string",
+                "description": "The channel it was announced on (`stable` | `canary`)."
+              },
+              "install_kind": {
+                "type": "string",
+                "description": "This host's install kind (`apt`, `windows-installer`, …) — lets a hook or the\ntray render the right \"how to update\" hint without a second call."
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "update.available"
+                ]
+              },
+              "version": {
+                "type": "string",
+                "description": "The newer release's version string."
               }
             }
           },
@@ -7040,6 +7154,111 @@
             "type": "string"
           }
         }
+      },
+      "UpdateManifestInfo": {
+        "type": "object",
+        "description": "One channel's manifest facts, as much as the console renders.",
+        "required": [
+          "version",
+          "serial",
+          "published_at",
+          "notes_url",
+          "stale"
+        ],
+        "properties": {
+          "notes_url": {
+            "type": "string",
+            "description": "Release-notes link (pinned to our forge by the manifest validator)."
+          },
+          "published_at": {
+            "type": "string",
+            "description": "RFC-3339 publish time (display only)."
+          },
+          "serial": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Publish serial (unix seconds) — monotonic per channel.",
+            "minimum": 0
+          },
+          "stale": {
+            "type": "boolean",
+            "description": "The last verified manifest is suspiciously old (>45 days) — the freeze/stale hint."
+          },
+          "version": {
+            "type": "string",
+            "description": "The released version this manifest announces."
+          }
+        }
+      },
+      "UpdateStatus": {
+        "type": "object",
+        "description": "The full update-check state for this host.",
+        "required": [
+          "install_kind",
+          "channel",
+          "current_version",
+          "apply",
+          "channel_hint",
+          "check_disabled",
+          "available"
+        ],
+        "properties": {
+          "apply": {
+            "type": "string",
+            "description": "What the console may offer for this install: `notify` (show the command) — later\nphases add `full` (one-click apply) and `staged` (apply + reboot to finish)."
+          },
+          "available": {
+            "type": "boolean",
+            "description": "A newer release than `current_version` exists for this channel (definitive\ncomparisons only — an unparseable version pair never flags)."
+          },
+          "channel": {
+            "type": "string",
+            "description": "Release channel this install follows: `stable` | `canary`."
+          },
+          "channel_hint": {
+            "type": "string",
+            "description": "The copy-pastable update command for this install kind."
+          },
+          "check_disabled": {
+            "type": "boolean",
+            "description": "Update checks are disabled on this host (`PUNKTFUNK_UPDATE_CHECK=0`)."
+          },
+          "current_version": {
+            "type": "string",
+            "description": "The running host version."
+          },
+          "install_kind": {
+            "type": "string",
+            "description": "How this host was installed: `windows-installer` | `sysext` | `rpm-ostree` | `apt` |\n`dnf` | `pacman` | `steamos-source` | `nix` | `source`."
+          },
+          "last_checked_unix": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "When the last successful check happened (unix seconds).",
+            "minimum": 0
+          },
+          "last_error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why the last check failed, verbatim, if it did."
+          },
+          "manifest": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/UpdateManifestInfo",
+                "description": "The last verified manifest, if any check has succeeded."
+              }
+            ]
+          }
+        }
       }
     },
     "securitySchemes": {
@@ -7110,6 +7329,10 @@
     {
       "name": "store",
       "description": "Plugin store: browse signed catalogs (verified first-party entries, attributed third-party sources), install/uninstall as tracked jobs, and switch the plugin runner on"
+    },
+    {
+      "name": "update",
+      "description": "Host update check: install kind + channel, the last verified release manifest, and whether a newer host exists (admin lane only)"
     }
   ]
 }

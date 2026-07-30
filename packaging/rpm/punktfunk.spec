@@ -295,6 +295,11 @@ sed -i 's#%h/punktfunk/target/release/punktfunk-host#%{_bindir}/punktfunk-host#'
 # the operator copies it into ~/.config/systemd/user/punktfunk-host.service.d/ when they want it.
 install -Dm0644 scripts/punktfunk-host-desktop-session.conf %{buildroot}%{_datadir}/%{name}/punktfunk-host-desktop-session.conf
 
+# Install-kind + channel marker, read by the host's update-check surface (planning:
+# host-update-from-web-console.md §4.1). `pf_channel` is defined by build-rpm.sh (canary
+# when the release override starts `0.ci`); a plain local rpmbuild is stable.
+printf 'dnf %{?pf_channel}%{!?pf_channel:stable}\n' > %{buildroot}%{_datadir}/%{name}/install-kind
+
 # Optional headless KDE session unit (the kwin streaming appliance): brings up `kwin --virtual` on
 # wayland-kde via the packaged run-headless-kde.sh, so the host's kwin backend has a session whose
 # privileged screencast protocol it can bind. Repoint its ExecStart from the dev source tree to the

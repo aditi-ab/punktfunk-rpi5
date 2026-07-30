@@ -202,6 +202,19 @@ pub enum EventKind {
         /// API (RFC §8) lands.
         source: String,
     },
+    /// A verified update manifest announced a release newer than the running host. Emitted
+    /// once per discovered version (a steady-state "newer exists" doesn't re-fire on every
+    /// refresh).
+    #[serde(rename = "update.available")]
+    UpdateAvailable {
+        /// The newer release's version string.
+        version: String,
+        /// The channel it was announced on (`stable` | `canary`).
+        channel: String,
+        /// This host's install kind (`apt`, `windows-installer`, …) — lets a hook or the
+        /// tray render the right "how to update" hint without a second call.
+        install_kind: String,
+    },
     #[serde(rename = "plugins.changed")]
     PluginsChanged {
         /// The plugin whose registration changed (registered, restarted, deregistered, or
@@ -242,6 +255,7 @@ impl EventKind {
             EventKind::DisplayCreated { .. } => "display.created",
             EventKind::DisplayReleased { .. } => "display.released",
             EventKind::LibraryChanged { .. } => "library.changed",
+            EventKind::UpdateAvailable { .. } => "update.available",
             EventKind::PluginsChanged { .. } => "plugins.changed",
             EventKind::StoreChanged => "store.changed",
             EventKind::HostStarted { .. } => "host.started",

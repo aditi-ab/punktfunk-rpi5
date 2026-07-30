@@ -45,6 +45,7 @@ mod stats;
 mod store;
 #[cfg(test)]
 mod tests;
+mod update;
 
 /// Default management port — adjacent to the GameStream block (47984…48010), and the same
 /// number Sunshine users already associate with "the config UI".
@@ -257,7 +258,9 @@ fn api_router_parts() -> (Router<Arc<MgmtState>>, utoipa::openapi::OpenApi) {
                 .routes(routes!(store::get_job))
                 .routes(routes!(store::list_sources))
                 .routes(routes!(store::put_source, store::delete_source))
-                .routes(routes!(store::get_runtime, store::set_runtime)),
+                .routes(routes!(store::get_runtime, store::set_runtime))
+                .routes(routes!(update::get_update_status))
+                .routes(routes!(update::force_update_check)),
         )
         .split_for_parts()
 }
@@ -297,6 +300,7 @@ pub fn openapi_json() -> String {
         (name = "hooks", description = "Operator hooks: commands and webhooks fired on lifecycle events (fire-and-forget — hooks observe, never veto)"),
         (name = "plugins", description = "Plugin directory: running `punktfunk-plugin-*` processes register a lease and, optionally, a loopback UI the web console proxies and adds to its nav"),
         (name = "store", description = "Plugin store: browse signed catalogs (verified first-party entries, attributed third-party sources), install/uninstall as tracked jobs, and switch the plugin runner on"),
+        (name = "update", description = "Host update check: install kind + channel, the last verified release manifest, and whether a newer host exists (admin lane only)"),
     )
 )]
 struct ApiDoc;

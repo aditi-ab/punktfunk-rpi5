@@ -64,6 +64,7 @@ rpmbuild -bb --nodeps "${WEB_OPT[@]}" "${SCRIPTING_OPT[@]}" "${HOST_OPT[@]}" \
   --define "_topdir $TOP" \
   --define "pf_version ${PF_VERSION}" \
   --define "pf_release ${PF_RELEASE}" \
+  --define "pf_channel $(case "${PF_RELEASE:-1}" in 0.ci*) echo canary ;; *) echo stable ;; esac)" \
   packaging/rpm/punktfunk.spec
 
 mkdir -p dist

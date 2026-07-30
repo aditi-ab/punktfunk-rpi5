@@ -149,7 +149,12 @@ pub(crate) fn plugin_may_access(method: &Method, path: &str) -> bool {
         || (method == Method::DELETE
             && (path.starts_with("/api/v1/clients/")
                 || path.starts_with("/api/v1/native/clients/")))
-        || (path.starts_with("/api/v1/plugins/") && path.ends_with("/ui-credential"));
+        || (path.starts_with("/api/v1/plugins/") && path.ends_with("/ui-credential"))
+        // The update surface is operator business end to end: today it is only a check, but
+        // the same prefix will carry `apply` (running an installer / the root helper), and a
+        // whole-prefix deny can't be defeated by a route added later.
+        || path == "/api/v1/update"
+        || path.starts_with("/api/v1/update/");
     !denied
 }
 

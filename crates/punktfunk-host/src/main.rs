@@ -99,6 +99,7 @@ mod stats_recorder;
 // same runner CLI the `plugins` subcommand uses (design/plugin-store.md).
 mod store;
 mod stream_marker;
+mod update;
 // `monitor_devnode::startup_recover()` (below) re-enables PnP monitor devnodes disabled by a prior
 // run; it lives in the `pf-win-display` leaf crate (plan §W6).
 #[cfg(target_os = "windows")]

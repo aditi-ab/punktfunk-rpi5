@@ -544,6 +544,31 @@ fn plugin_allowlist_excludes_escalation_routes() {
             "plugin token must not reach {path}"
         );
     }
+
+    // The update surface, wholesale: today a check, tomorrow `apply` (an installer / the root
+    // helper) — operator business end to end, denied by whole-prefix so the apply route added in
+    // U1/U2 is denied by default rather than by remembering to list it. And it is deliberately
+    // NOT on the paired-cert allowlist either: a streaming client has no business knowing or
+    // steering the host's update state.
+    for path in [
+        "/api/v1/update",
+        "/api/v1/update/status",
+        "/api/v1/update/check",
+        "/api/v1/update/apply-does-not-exist-yet",
+    ] {
+        assert!(
+            !auth::plugin_may_access(&Method::GET, path),
+            "plugin token must not reach {path}"
+        );
+        assert!(
+            !auth::plugin_may_access(&Method::POST, path),
+            "plugin token must not reach {path}"
+        );
+        assert!(
+            !auth::cert_may_access(&Method::GET, path),
+            "a paired streaming cert must not reach {path}"
+        );
+    }
     assert!(!auth::plugin_may_access(
         &Method::PUT,
         "/api/v1/store/sources/evil"
