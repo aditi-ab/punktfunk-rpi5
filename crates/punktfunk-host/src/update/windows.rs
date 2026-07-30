@@ -175,6 +175,9 @@ fn download(url: &str, part: &Path, progress: &dyn Fn(u64, Option<u64>)) -> Resu
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
+        // Never truncate at open: on a 206 we append to the existing partial, and the
+        // fresh-download path truncates explicitly via `set_len(0)` below.
+        .truncate(false)
         .open(part)
         .map_err(|e| format!("open staging file: {e}"))?;
     let mut received = if resumed {
@@ -238,6 +241,8 @@ fn preflight_disk(at: &Path, needed: u64) -> Result<(), String> {
     use windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
     let dir = at.parent().unwrap_or(at);
     let mut free: u64 = 0;
+    // SAFETY: the HSTRING is a valid NUL-terminated path living across the call, and the out
+    // param points at a live local u64; the API retains neither.
     unsafe { GetDiskFreeSpaceExW(&HSTRING::from(dir.as_os_str()), Some(&mut free), None, None) }
         .map_err(|e| format!("disk preflight: {e}"))?;
     if free < needed {
@@ -286,6 +291,9 @@ pub(crate) fn verify_authenticode(path: &Path, pins: &[String]) -> Result<(), St
     };
     let mut action: GUID = WINTRUST_ACTION_GENERIC_VERIFY_V2;
 
+    // SAFETY: `data`, the `file_info` it points to, and the path's wide buffer all outlive
+    // the call; `action` is a live mutable GUID. WinVerifyTrust reads the structs and stores
+    // its state into `data.hWVTStateData`, released by the CLOSE call below.
     let status = unsafe {
         WinVerifyTrust(
             Default::default(),
@@ -308,14 +316,22 @@ pub(crate) fn verify_authenticode(path: &Path, pins: &[String]) -> Result<(), St
             return Ok(());
         }
         // Same-state leaf extraction: no second parse of the file.
+        // SAFETY: `hWVTStateData` is the live verification state the VERIFY call above
+        // populated (status checked OK); the returned pointer borrows that state, which stays
+        // alive until the CLOSE call below, and is null-checked before use.
         let prov = unsafe { WTHelperProvDataFromStateData(data.hWVTStateData) };
         if prov.is_null() {
             return Err("WinVerifyTrust returned no provider state".into());
         }
+        // SAFETY: `prov` was null-checked and borrows the same live verification state;
+        // index 0 addresses the primary (only) signer, no counter-signer requested.
         let signer = unsafe { WTHelperGetProvSignerFromChain(prov, 0, false, 0) };
         if signer.is_null() {
             return Err("no signer in the Authenticode chain".into());
         }
+        // SAFETY: `signer` was null-checked and borrows the live verification state; the
+        // chain array is length/null-checked before indexing, and the CERT_CONTEXT borrows
+        // the same state — every read of it happens before the CLOSE call below.
         let leaf = unsafe {
             let s = &*signer;
             if s.csCertChain == 0 || s.pasCertChain.is_null() {
@@ -324,6 +340,8 @@ pub(crate) fn verify_authenticode(path: &Path, pins: &[String]) -> Result<(), St
             // pasCertChain[0] is the SIGNING cert (leaf → root order).
             &*(*s.pasCertChain).pCert
         };
+        // SAFETY: `pbCertEncoded`/`cbCertEncoded` describe the DER buffer owned by the live
+        // cert context above; the slice is consumed (hashed) before the state is closed.
         let der =
             unsafe { std::slice::from_raw_parts(leaf.pbCertEncoded, leaf.cbCertEncoded as usize) };
         let fp = hex(ring::digest::digest(&ring::digest::SHA256, der).as_ref());
@@ -339,6 +357,9 @@ pub(crate) fn verify_authenticode(path: &Path, pins: &[String]) -> Result<(), St
 
     // Always release the verification state.
     data.dwStateAction = WTD_STATEACTION_CLOSE;
+    // SAFETY: same live `data`/`file_info`/`action` as the VERIFY call; CLOSE releases
+    // `hWVTStateData`, after which no borrow of the state remains (the leaf/DER reads all
+    // happened inside `verdict` above).
     unsafe {
         WinVerifyTrust(
             Default::default(),
@@ -373,7 +394,7 @@ fn prune_installers(dir: &Path, keep_newest: &Path) {
             (t, p)
         })
         .collect();
-    exes.sort_by(|a, b| b.0.cmp(&a.0));
+    exes.sort_by_key(|e| std::cmp::Reverse(e.0));
     for (_, p) in exes.into_iter().skip(KEEP_INSTALLERS - 1) {
         let _ = std::fs::remove_file(p);
     }
