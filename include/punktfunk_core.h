@@ -2783,6 +2783,7 @@ PunktfunkStatus punktfunk_connection_report_decode_us(const PunktfunkConnection 
                                                       uint32_t us);
 #endif
 
+#if defined(PUNKTFUNK_FEATURE_QUIC)
 // Report this client's display-latch grid so the host can phase-lock its capture tick
 // (design/phase-locked-capture.md). `next_latch_host_ns` must already be host clock — convert
 // with the connection's clock offset (`T_host = T_client + offset`). Fire-and-forget; call ~1 Hz
@@ -2796,6 +2797,7 @@ PunktfunkStatus punktfunk_connection_report_phase(const PunktfunkConnection *c,
                                                   uint32_t latch_period_ns,
                                                   uint32_t uncertainty_ns,
                                                   uint32_t arrival_lead_ns);
+#endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // Whether [`punktfunk_connection_report_decode_us`] is worth calling this session: writes 1 to

@@ -4021,6 +4021,7 @@ pub unsafe extern "C" fn punktfunk_connection_report_decode_us(
 /// # Safety
 /// `c` is an opaque handle from a `*_new`/`*_pair` the caller has not yet freed, or null (an
 /// error, not UB).
+#[cfg(feature = "quic")]
 #[no_mangle]
 pub unsafe extern "C" fn punktfunk_connection_report_phase(
     c: *const PunktfunkConnection,
