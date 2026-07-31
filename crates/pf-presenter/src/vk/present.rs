@@ -248,9 +248,12 @@ impl Presenter {
                     height: v.height,
                 };
                 let ten_bit = f.is_p010();
+                // No crop: `dmabuf::import` already creates the plane images at the frame
+                // size over the surface's real stride, so 0..1 spans exactly the picture.
                 self.record_csc(
                     v.framebuffer,
                     extent,
+                    [1.0, 1.0],
                     f.color,
                     if ten_bit { 10 } else { 8 },
                     ten_bit,
@@ -322,9 +325,17 @@ impl Presenter {
                 };
                 let ten_bit =
                     f.vk_format == vk::Format::G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16.as_raw();
+                // The one path that samples a surface BIGGER than the picture: FFmpeg's
+                // pool is the coded size (1080 → 1088 rows). Scale the UVs to the visible
+                // crop or the alignment padding — the last picture row, replicated by the
+                // encoder — is stretched into the bottom of the image.
                 self.record_csc(
                     v.framebuffer,
                     extent,
+                    [
+                        f.width as f32 / f.coded_width as f32,
+                        f.height as f32 / f.coded_height as f32,
+                    ],
                     f.color,
                     if ten_bit { 10 } else { 8 },
                     ten_bit,
@@ -625,7 +636,11 @@ impl Presenter {
 
     /// Record the NV12→RGBA CSC pass into the video image (framebuffer): fullscreen
     /// triangle, CICP-driven push-constant rows. Shared by the dmabuf and Vulkan-Video
-    /// paths — only the plane views bound beforehand differ.
+    /// paths — only the plane views bound beforehand, and `uv_scale`, differ.
+    ///
+    /// `extent` is the picture (the framebuffer's own size); `uv_scale` is picture/surface
+    /// per axis, i.e. `[1.0, 1.0]` unless the bound planes are a decode pool allocated
+    /// larger than the picture. See the shader's `params.zw` for why that happens.
     ///
     /// # Safety
     /// `self.cmd_buf` must be in the recording state; the CSC descriptor set must point
@@ -634,6 +649,7 @@ impl Presenter {
         &self,
         framebuffer: vk::Framebuffer,
         extent: vk::Extent2D,
+        uv_scale: [f32; 2],
         color: pf_client_core::video::ColorDesc,
         depth: u8,
         msb_packed: bool,
@@ -702,6 +718,9 @@ impl Presenter {
             pc[..12].copy_from_slice(bytemuck_rows(&rows));
             pc[12] = mode;
             pc[13] = peak;
+            // Crop: 1.0 unless the source image is a decode pool bigger than the picture.
+            pc[14] = uv_scale[0];
+            pc[15] = uv_scale[1];
             let bytes = std::slice::from_raw_parts(pc.as_ptr().cast::<u8>(), 64);
             self.device.cmd_push_constants(
                 self.cmd_buf,

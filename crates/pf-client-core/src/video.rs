@@ -110,6 +110,21 @@ pub struct VkVideoFrame {
     pub decode_done_value: u64,
     pub width: u32,
     pub height: u32,
+    /// The decode POOL's allocated extent (`AVHWFramesContext.width`/`.height`) — the
+    /// CODED picture size (rounded up to the codec's macroblock alignment, then to the
+    /// driver's Vulkan picture-access granularity), so it is `>=` `width`/`height`. At
+    /// 1080p the pool is 1088 rows tall: 1080 is not a multiple of 16.
+    ///
+    /// The presenter samples this image with NORMALIZED coordinates, so it needs both
+    /// numbers — `width`/`height` is what to display, `coded_*` is what the texture
+    /// actually spans. Sampling `0..1` without the ratio stretches the alignment padding
+    /// into view; because encoders fill those rows by replicating the picture's last
+    /// line, that reads as the bottom row smeared over the final few rows of the image
+    /// (field report 2026-07-31). Same class as the D3D11VA source-rect clamp in
+    /// `crate::video_d3d11`, which shows as a green bar there only because DXVA padding
+    /// is left uninitialized rather than replicated.
+    pub coded_width: u32,
+    pub coded_height: u32,
     pub color: ColorDesc,
     /// Intra keyframe (IDR/I): the stream's re-anchor point. The pump resumes display on
     /// one after suppressing the concealed frames a reference loss leaves in its wake (on

@@ -382,6 +382,13 @@ impl VulkanDecoder {
             // sem_value was last written by the decode submission on THIS thread.
             let timeline_sem = (*vkf).sem[0] as u64;
             let decode_done_value = (*vkf).sem_value[0];
+            log_layout_once(
+                (*self.frame).width,
+                (*self.frame).height,
+                (*fc).width,
+                (*fc).height,
+                sw,
+            );
             Ok(VkVideoFrame {
                 vkframe: vkf as usize,
                 frames_ctx: fc as usize,
@@ -392,11 +399,42 @@ impl VulkanDecoder {
                 decode_done_value,
                 width: (*self.frame).width as u32,
                 height: (*self.frame).height as u32,
+                // The pool extent, not the frame's: `avcodec_get_hw_frames_parameters`
+                // sizes it from `coded_width`/`coded_height` and FFmpeg's Vulkan layer
+                // rounds that up again to the driver's picture-access granularity. The
+                // `max` is defensive — a pool SMALLER than the frame would mean sampling
+                // past the surface, so degrade to "no crop" rather than trust it.
+                coded_width: ((*fc).width.max((*self.frame).width)) as u32,
+                coded_height: ((*fc).height.max((*self.frame).height)) as u32,
                 color: ColorDesc::from_raw(self.frame),
                 keyframe: frame_is_keyframe(self.frame),
                 guard: DrmFrameGuard(clone),
             })
         }
+    }
+}
+
+/// One-time dump of the first decoded frame's layout — the forensics for a new GPU/driver.
+/// `pool_*` is the allocated decode surface (`>=` the frame); the gap is the alignment
+/// padding the presenter's UV scale excludes. The D3D11VA path logs the same pair.
+fn log_layout_once(
+    width: i32,
+    height: i32,
+    pool_w: i32,
+    pool_h: i32,
+    sw: ffmpeg::ffi::AVPixelFormat,
+) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static ONCE: AtomicBool = AtomicBool::new(true);
+    if ONCE.swap(false, Ordering::Relaxed) {
+        tracing::info!(
+            width,
+            height,
+            pool_w,
+            pool_h,
+            ?sw,
+            "Vulkan Video first frame"
+        );
     }
 }
 
