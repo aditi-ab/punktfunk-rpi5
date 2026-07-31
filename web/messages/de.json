@@ -229,6 +229,7 @@
 	"library_store_steam": "Steam",
 	"library_store_custom": "Eigene",
 	"library_add_title": "Eigenes Spiel hinzufügen",
+	"library_edit_overwrites": "Beim Speichern wird dieser Eintrag durch das ersetzt, was in diesem Formular steht. Vorbereitungs-/Undo-Befehle und Erkennungs-Hinweise, die außerhalb der Konsole gesetzt wurden, erscheinen hier nicht und gehen verloren.",
 	"library_edit_title": "Eigenes Spiel bearbeiten",
 	"library_add_button": "Eigenes Spiel hinzufügen",
 	"library_field_title": "Titel",

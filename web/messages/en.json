@@ -229,6 +229,7 @@
 	"library_store_steam": "Steam",
 	"library_store_custom": "Custom",
 	"library_add_title": "Add a custom game",
+	"library_edit_overwrites": "Saving replaces this entry with what's in this form. Prep/undo commands and detection hints set outside the console aren't shown here and will be cleared.",
 	"library_edit_title": "Edit custom game",
 	"library_add_button": "Add custom game",
 	"library_field_title": "Title",

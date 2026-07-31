@@ -343,6 +343,18 @@ export const GameForm: FC<{
 							help={m.library_field_tags_help()}
 						/>
 					</fieldset>
+					{/* Data-loss warning, not a nicety.
+					`PUT /library/custom/{id}` REPLACES the entry (host: library/custom.rs
+					`update_custom` assigns `slot.prep = input.prep; slot.detect = input.detect`),
+					but `GET /library` returns a `GameEntry`, which carries neither field. So the
+					console cannot round-trip them — anything configured outside this form is dropped
+					by a save it did not intend to touch. The real fix is host-side (expose `detect`
+					and `prep` on the read model); until then, say so before the operator finds out. */}
+					{mode === "edit" && (
+						<p className="rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-sm">
+							{m.library_edit_overwrites()}
+						</p>
+					)}
 					{error && (
 						<p
 							role="alert"
