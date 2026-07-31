@@ -262,6 +262,10 @@ struct PhaseController {
     hold_ns: i64,
     /// Last adjust instant (~1 Hz cadence).
     last_adjust: std::time::Instant,
+    /// The previous adjust's error (ns) — the dead-signal detector's memory.
+    last_error_ns: Option<i64>,
+    /// Consecutive adjusts whose step failed to move the error (see `DEAD_SIGNAL_ADJUSTS`).
+    unresponsive_adjusts: u32,
 }
 
 impl PhaseController {
@@ -279,8 +283,23 @@ impl PhaseController {
         PhaseController {
             hold_ns: 0,
             last_adjust: std::time::Instant::now(),
+            last_error_ns: None,
+            unresponsive_adjusts: 0,
         }
     }
+
+    /// Consecutive adjusts allowed to move the hold WITHOUT the reported error responding
+    /// before the controller freezes (a dead error signal). Under period-spanning arrival
+    /// jitter the latch DISTRIBUTION is ~uniform mod the refresh: shifting its mean cannot
+    /// move its median, so a naive controller steps one way forever, orbiting the period —
+    /// and every wrap coalesces a burst of frames at the client (the 2026-07-31 on-glass
+    /// finding: `paced` spikes of ~30 every ~4 s, locked to the wraps). Frozen ≠ off: the
+    /// applied hold stays, and a report whose error moved ≥ [`Self::UNFREEZE_DELTA_NS`]
+    /// (the regime changed — jitter tightened) re-arms stepping. Controller v2 replaces the
+    /// median with a circular phase statistic; this freeze is the safety net either way.
+    const DEAD_SIGNAL_ADJUSTS: u32 = 3;
+    /// Error movement that counts as "the signal responded" / re-arms a frozen controller.
+    const UNFREEZE_DELTA_NS: i64 = 1_500_000;
 
     /// Fold the client's latest report into the hold. `period_ns` is the wire interval (the
     /// session's frame period). Sign convention: `arrival_lead` is how long before its latch the
@@ -296,10 +315,38 @@ impl PhaseController {
         let target = Self::TARGET_LEAD_FLOOR_NS.max(r.uncertainty_ns as i64 + 1_000_000);
         let error = r.arrival_lead_ns as i64 - target;
         if error.abs() < Self::DEADBAND_NS {
+            self.unresponsive_adjusts = 0;
+            self.last_error_ns = Some(error);
             return;
         }
+        // Dead-signal detection: if stepping the hold hasn't moved the error, stop stepping —
+        // and while frozen, only a genuinely-moved error re-arms.
+        if let Some(last) = self.last_error_ns {
+            if (error - last).abs() >= Self::UNFREEZE_DELTA_NS {
+                self.unresponsive_adjusts = 0; // the signal responded (or the regime changed)
+            } else if self.frozen() {
+                self.last_error_ns = Some(error);
+                return;
+            } else {
+                self.unresponsive_adjusts += 1;
+                if self.frozen() {
+                    tracing::info!(
+                        error_ms = error as f64 / 1e6,
+                        hold_ms = self.hold_ns as f64 / 1e6,
+                        "phase lock: error signal unresponsive — freezing the hold"
+                    );
+                    self.last_error_ns = Some(error);
+                    return;
+                }
+            }
+        }
+        self.last_error_ns = Some(error);
         let step = error.clamp(-Self::MAX_STEP_NS, Self::MAX_STEP_NS);
         self.hold_ns = (self.hold_ns + step).rem_euclid(period_ns);
+    }
+
+    fn frozen(&self) -> bool {
+        self.unresponsive_adjusts >= Self::DEAD_SIGNAL_ADJUSTS
     }
 
     /// Whether the ~1 Hz adjust window has elapsed.
