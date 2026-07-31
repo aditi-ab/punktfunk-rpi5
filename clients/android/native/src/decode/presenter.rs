@@ -138,29 +138,6 @@ impl PresentMeter {
     }
 }
 
-/// Circular (vector-mean) statistics of latch samples against the panel period: the mean latch
-/// mod the period (ns) and the coherence (‰). The mean is what a phase controller can actually
-/// steer under jitter — a median of a period-spanning distribution is immovable (the v1 lesson);
-/// the coherence says whether ANY phase exists to steer (0 = uniformly smeared, 1000 = locked).
-/// `None` under 8 samples — too little evidence to report a phase at all.
-fn circular_latch(samples_us: &[u64], period_ns: i64) -> Option<(u64, u16)> {
-    if samples_us.len() < 8 || period_ns <= 0 {
-        return None;
-    }
-    let period_us = period_ns as f64 / 1000.0;
-    let (mut x, mut y) = (0.0f64, 0.0f64);
-    for &s in samples_us {
-        let theta = (s as f64 % period_us) / period_us * std::f64::consts::TAU;
-        x += theta.cos();
-        y += theta.sin();
-    }
-    let n = samples_us.len() as f64;
-    let r = (x * x + y * y).sqrt() / n;
-    let mean_theta = y.atan2(x).rem_euclid(std::f64::consts::TAU);
-    let mean_ns = (mean_theta / std::f64::consts::TAU * period_ns as f64) as u64;
-    Some((mean_ns, (r * 1000.0) as u16))
-}
-
 /// p50/max of an unsorted µs sample vec, in ms. (0, 0) when empty.
 fn p50_max_ms(mut v: Vec<u64>) -> (f64, f64) {
     if v.is_empty() {
@@ -380,8 +357,9 @@ impl Presenter {
             return None; // idle stream — nothing worth a line
         }
         let (pace_p50, pace_max) = p50_max_ms(std::mem::take(&mut self.pace_us));
-        let circ =
-            clock.and_then(|c| circular_latch(&latch, c.panel_period_ns().max(c.period_ns())));
+        let circ = clock.and_then(|c| {
+            punktfunk_core::phase::circular_latch(&latch, c.panel_period_ns().max(c.period_ns()))
+        });
         let (latch_p50, latch_max) = p50_max_ms(latch);
         let period_ms = clock.map(|c| c.period_ns() as f64 / 1e6).unwrap_or(0.0);
         let panel_ms = clock

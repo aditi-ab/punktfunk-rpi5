@@ -4280,4 +4280,176 @@ mod tests {
         ));
         assert!(!is_permanent_build_error("open NVENC: device busy"));
     }
+
+    // ---- Phase-controller closed-loop simulation (design/phase-locked-capture.md §3, v2) ----
+    //
+    // The plant models what the on-glass loop actually is: the client's per-frame latch is
+    // `(base_latch − hold + noise) mod P` — a bigger host hold makes frames arrive later, so
+    // the wait-for-latch SHRINKS — and each 1 Hz report carries the CIRCULAR statistics of a
+    // window of those samples, generated through the exact shared `punktfunk_core::phase`
+    // code the real clients use. Both v1 failure modes live here as regression tests: the
+    // 2026-07-31 orbit (a dead statistic chased forever) and the parked-hold e2e tax.
+
+    const SIM_P: i64 = 8_333_333; // 120 Hz
+    const SIM_TARGET: i64 = 3_500_000; // TARGET_LEAD_FLOOR ∨ (uncertainty 1ms + 1ms) → 3.5 ms
+
+    /// Deterministic LCG in ±spread_ns around zero (no OS randomness in tests).
+    struct Lcg(u64);
+    impl Lcg {
+        fn next_noise(&mut self, spread_ns: i64) -> i64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            if spread_ns == 0 {
+                return 0;
+            }
+            ((self.0 >> 33) as i64 % (2 * spread_ns)) - spread_ns
+        }
+    }
+
+    /// One simulated 1 Hz report: 120 latch samples from the plant, folded through the SHARED
+    /// circular statistic — the same bytes-in-bytes-out path the Android reporter takes.
+    fn plant_report(
+        base_latch_ns: i64,
+        hold_ns: i64,
+        noise_spread_ns: i64,
+        rng: &mut Lcg,
+    ) -> punktfunk_core::quic::PhaseReport {
+        let samples_us: Vec<u64> = (0..120)
+            .map(|_| {
+                let latch =
+                    (base_latch_ns - hold_ns + rng.next_noise(noise_spread_ns)).rem_euclid(SIM_P);
+                (latch / 1000) as u64
+            })
+            .collect();
+        let (mean_ns, coherence) =
+            punktfunk_core::phase::circular_latch(&samples_us, SIM_P).expect("120 samples");
+        punktfunk_core::quic::PhaseReport {
+            next_latch_host_ns: 0,
+            latch_period_ns: SIM_P as u32,
+            uncertainty_ns: 1_000_000,
+            arrival_lead_ns: mean_ns as u32,
+            coherence_milli: coherence,
+        }
+    }
+
+    /// The steady-state latch the controller produced: one noise-free plant readout.
+    fn settled_latch(base_latch_ns: i64, hold_ns: i64) -> i64 {
+        (base_latch_ns - hold_ns).rem_euclid(SIM_P)
+    }
+
+    #[test]
+    fn tight_jitter_locks_into_the_deadband_and_stays() {
+        let mut c = PhaseController::new();
+        let mut rng = Lcg(7);
+        for _ in 0..12 {
+            let r = plant_report(7_500_000, c.hold_ns, 500_000, &mut rng);
+            c.adjust(&r, SIM_P);
+        }
+        let err = settled_latch(7_500_000, c.hold_ns) - SIM_TARGET;
+        assert!(
+            err.abs() < 1_000_000,
+            "tight jitter must converge near the target lead, residual {err} ns"
+        );
+        assert!(!c.decaying, "a converged lock never decays");
+        // Locked: further reports keep it in the deadband without dithering away.
+        let before = c.hold_ns;
+        for _ in 0..10 {
+            let r = plant_report(7_500_000, c.hold_ns, 500_000, &mut rng);
+            c.adjust(&r, SIM_P);
+        }
+        assert!(
+            (c.hold_ns - before).abs() <= 2 * PhaseController::MAX_STEP_NS,
+            "a locked loop must not wander"
+        );
+    }
+
+    #[test]
+    fn wrap_side_error_takes_the_shortest_way() {
+        // base 1.0 ms < target 3.5 ms: the SHORT way is −2.5 ms (through the wrap), the long
+        // way is +5.8. v1 walked long ways; v2 must spend well under a period of travel.
+        let mut c = PhaseController::new();
+        let mut rng = Lcg(11);
+        for _ in 0..12 {
+            let r = plant_report(1_000_000, c.hold_ns, 300_000, &mut rng);
+            c.adjust(&r, SIM_P);
+        }
+        let err = settled_latch(1_000_000, c.hold_ns) - SIM_TARGET;
+        assert!(
+            err.abs() < 1_000_000,
+            "wrap-side start must still lock, residual {err}"
+        );
+        assert!(
+            c.cum_travel_ns <= SIM_P / 2,
+            "shortest-way stepping spent {} ns of travel — walked the long way",
+            c.cum_travel_ns
+        );
+    }
+
+    #[test]
+    fn incoherent_phase_never_steps_and_holds_nothing() {
+        // Uniform jitter over the whole period: coherence ~0 — the v1 orbit's regime. The
+        // controller must refuse to step at all: a hold here is a pure e2e tax.
+        let mut c = PhaseController::new();
+        let mut rng = Lcg(13);
+        for _ in 0..20 {
+            let r = plant_report(7_500_000, c.hold_ns, SIM_P, &mut rng);
+            c.adjust(&r, SIM_P);
+        }
+        assert_eq!(
+            c.hold_ns, 0,
+            "an incoherent phase must never accumulate a hold"
+        );
+    }
+
+    #[test]
+    fn v1_median_report_trips_the_travel_budget_and_decays_to_zero() {
+        // A v1 sender (coherence sentinel) whose statistic does not respond to the hold — the
+        // exact on-glass orbit. The budget must trip and the hold must DECAY TO ZERO (not
+        // freeze at a random value: a parked hold taxes e2e by up to a period).
+        let mut c = PhaseController::new();
+        let mut report = punktfunk_core::quic::PhaseReport {
+            next_latch_host_ns: 0,
+            latch_period_ns: SIM_P as u32,
+            uncertainty_ns: 1_000_000,
+            arrival_lead_ns: 7_500_000, // pinned — the dead median
+            coherence_milli: u16::MAX,  // v1: bypasses the coherence gate
+        };
+        let mut max_hold_seen = 0;
+        for _ in 0..40 {
+            c.adjust(&report, SIM_P);
+            report.arrival_lead_ns = 7_500_000; // never responds
+            max_hold_seen = max_hold_seen.max(c.hold_ns);
+        }
+        assert!(
+            max_hold_seen > 0,
+            "the chase must have started before the budget tripped"
+        );
+        assert_eq!(
+            c.hold_ns, 0,
+            "a tripped budget must end at ZERO hold (decay), not parked"
+        );
+    }
+
+    #[test]
+    fn regime_change_relocks_after_decay() {
+        // Incoherent → hold 0; the network tightens → the same controller must lock.
+        let mut c = PhaseController::new();
+        let mut rng = Lcg(17);
+        for _ in 0..10 {
+            let r = plant_report(7_500_000, c.hold_ns, SIM_P, &mut rng);
+            c.adjust(&r, SIM_P);
+        }
+        assert_eq!(c.hold_ns, 0);
+        for _ in 0..12 {
+            let r = plant_report(7_500_000, c.hold_ns, 400_000, &mut rng);
+            c.adjust(&r, SIM_P);
+        }
+        let err = settled_latch(7_500_000, c.hold_ns) - SIM_TARGET;
+        assert!(
+            err.abs() < 1_000_000,
+            "post-decay tightening must re-lock, residual {err}"
+        );
+    }
 }
