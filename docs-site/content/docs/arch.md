@@ -49,6 +49,7 @@ printf '\n[punktfunk]\nServer = https://git.unom.io/api/packages/unom/arch/$repo
 ```sh
 sudo pacman -Sy punktfunk-host      # the streaming host
 sudo pacman -S  punktfunk-web       # optional: the browser management console (pairing + status)
+sudo pacman -S  punktfunk-gamescope # optional: HDR (10-bit BT.2020 PQ) off gamescope sessions
 sudo usermod -aG input "$USER"      # /dev/uinput access for virtual gamepads (re-login to apply)
 ```
 
@@ -155,5 +156,7 @@ sudo pacman -U punktfunk-host-*.pkg.tar.zst
 
 NVENC/EGL come from the NVIDIA driver (`nvidia-utils`); on a GPU-less builder, symlink the CUDA
 stub into the link path first (the `PKGBUILD` header documents this). Full details, the
-Fedora→Arch dependency map, and the SteamOS systemd-sysext path are in
+Fedora→Arch dependency map, and the systemd-sysext mechanism are in
 [`packaging/arch/README.md`](https://git.unom.io/unom/punktfunk/src/branch/main/packaging/arch/README.md).
+(For a **SteamOS host**, use the [on-device installer](/docs/steamos-host) instead — it builds
+the host and the HDR gamescope against the running OS.)

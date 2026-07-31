@@ -245,6 +245,14 @@ else
     [ "$WITH_WEB" = 1 ] && ok "web.env exists (login password unchanged)"
 fi
 
+# --- 3b. HDR gamescope (punktfunk-gamescope, best-effort) ------------------
+# Stock gamescope offers only 8-bit capture, so Game Mode streams SDR. The punktfunk build adds
+# the 10-bit BT.2020 PQ formats, and the host attempts HDR by default the moment it is present
+# (PUNKTFUNK_GAMESCOPE_HDR=0 forces SDR). Best-effort by design: on any failure this warns and
+# the host streams SDR — see build-gamescope.sh, which also wires PUNKTFUNK_GAMESCOPE_BIN into
+# host.env only while the binary provably runs on SteamOS.
+PUNKTFUNK_SRC="$SRC" PUNKTFUNK_BOX="$BOX" bash "$SRC/scripts/steamdeck/build-gamescope.sh"
+
 # --- 4. system tuning (needs sudo: UDP buffers + gamepad udev rule + vhci-hcd + input group) --------
 log "System tuning (UDP buffers + gamepad rules + vhci-hcd + input group)"
 # sudo was acquired up front in preflight (SUDO_OK) so this never stalls behind the long build; a

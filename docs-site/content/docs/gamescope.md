@@ -113,7 +113,7 @@ a model. See the full [Configuration reference](/docs/configuration) for every o
 | `PUNKTFUNK_GAMESCOPE_NODE` | `auto` · node id | Discover and capture a **running** gamescope's PipeWire node at a fixed mode. Do **not** combine with `SESSION`. |
 | `PUNKTFUNK_GAMESCOPE_APP` | command | For an ad-hoc bare-gamescope session, the nested command to run (e.g. `vkcube`). |
 | `PUNKTFUNK_SESSION_WATCH` | `1` · `0` | Follow a Gaming ↔ Desktop switch mid-stream (rebuild in place, no reconnect). On by default on Bazzite/SteamOS; set `0` to disable. |
-| `PUNKTFUNK_GAMESCOPE_HDR` | `1` · `0` *(default off)* | Allow HDR (10-bit BT.2020 PQ) sessions. Needs `punktfunk-gamescope` — see below. |
+| `PUNKTFUNK_GAMESCOPE_HDR` | `1` · `0` *(default on)* | Allow HDR (10-bit BT.2020 PQ) sessions. Needs `punktfunk-gamescope` (SDR otherwise) — see below. Set `0` to force SDR. |
 | `PUNKTFUNK_GAMESCOPE_SDR_NITS` | e.g. `400` | On an HDR session, how bright SDR content (the desktop, the Steam overlay, an SDR game) is inside the PQ container. gamescope's default is 400. |
 | `PUNKTFUNK_GAMESCOPE_BIN` | path | Force a specific gamescope binary. Otherwise the host prefers `punktfunk-gamescope` on `PATH`, then `gamescope`. |
 
@@ -130,17 +130,14 @@ To stream real HDR you need `punktfunk-gamescope`: gamescope plus a small patch 
 own name and does **not** replace your system gamescope — your Gaming Mode keeps using that one.
 
 - **Bazzite / Fedora Atomic** — included in the punktfunk sysext; `punktfunk-sysext update` gets it.
-- **Arch / SteamOS** — the `punktfunk-gamescope` package.
-- **NixOS** — `services.punktfunk.host.gamescopeHdr = true;` (it also sets the env var below).
+- **Arch** — the `punktfunk-gamescope` package.
+- **SteamOS (Steam Deck installer)** — built and wired automatically by
+  `scripts/steamdeck/install.sh` / `update.sh`.
+- **NixOS** — `services.punktfunk.host.gamescopeHdr` (default `true`).
 - **Anything else** — `bash packaging/gamescope/build-punktfunk-gamescope.sh` from the source tree.
 
-Then turn it on:
-
-```sh
-PUNKTFUNK_GAMESCOPE_HDR=1
-```
-
-and check what the host thinks it can do:
+HDR is attempted by default once the build is present (`PUNKTFUNK_GAMESCOPE_HDR=0` forces SDR).
+Check what the host thinks it can do:
 
 ```sh
 punktfunk-host hdr-probe
@@ -186,8 +183,8 @@ These apply to the **Gaming Mode (gamescope)** path only; the desktop path is un
 - **HDR needs the punktfunk gamescope build.** A stock gamescope's capture output is 8-bit SDR, so
   sessions stream SDR — correctly, including SDR versions of HDR games. Install
   `punktfunk-gamescope` (gamescope plus a small patch that teaches its capture node the 10-bit
-  BT.2020 PQ formats) and set `PUNKTFUNK_GAMESCOPE_HDR=1`, and a 10-bit-capable client streams
-  true HDR10. See [HDR on gamescope](#hdr-on-gamescope) below.
+  BT.2020 PQ formats), and a 10-bit-capable client streams true HDR10 — no knob needed.
+  See [HDR on gamescope](#hdr-on-gamescope) below.
 
 To stream the KDE Plasma desktop of a Steam box instead, see [KDE Plasma](/docs/kde). To bring up the
 web console and pair a client, see [The Web Console](/docs/web-console).

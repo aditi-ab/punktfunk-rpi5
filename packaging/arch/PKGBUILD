@@ -138,6 +138,7 @@ package_punktfunk-host() {
   optdepends=('pipewire-pulse: PulseAudio-API audio from games/apps (real `pulseaudio` also works)'
               'nvidia-utils: NVENC hardware encode + GPU EGL/CUDA zero-copy (REQUIRED to encode on NVIDIA)'
               'gamescope: per-session nested compositor backend (no desktop login needed) — needs >=3.16.22'
+              'punktfunk-gamescope: HDR (10-bit BT.2020 PQ) streaming on the gamescope backend — attempted by default when installed'
               'kwin: stream a KDE Plasma desktop (kwin VirtualDisplay backend)'
               'mutter: stream a GNOME desktop (Mutter RecordVirtual backend)'
               'sway: stream a wlroots desktop (Sway VirtualDisplay backend)'

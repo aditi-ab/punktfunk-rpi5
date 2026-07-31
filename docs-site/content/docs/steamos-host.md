@@ -126,6 +126,22 @@ streams it at your client's resolution; in Desktop Mode it streams the KDE deskt
 auto-detects which session is live per connection. See [Steam / gamescope](/docs/gamescope) for the
 attach-vs-managed detail and known limits.
 
+## HDR (10-bit BT.2020 PQ)
+
+The installer also builds `punktfunk-gamescope` — gamescope plus the small patch that adds the
+10-bit PQ formats to its capture node (see [HDR on gamescope](/docs/gamescope#hdr-on-gamescope)) —
+and points the host at it. Nothing to configure: with it in place, a 10-bit-capable client with
+HDR enabled streams true HDR10 from Game Mode; anything missing and the session streams 8-bit SDR
+instead (never a mislabelled picture). Check what the host resolved with:
+
+```sh
+~/punktfunk/target-steamos/release/punktfunk-host hdr-probe
+```
+
+The build is best-effort: if it fails, the installer says so loudly and everything else keeps
+working in SDR — re-run `update.sh` to retry. `PUNKTFUNK_GAMESCOPE_HDR=0` in
+`~/.config/punktfunk/host.env` forces SDR deliberately.
+
 ## Updating
 
 After pulling new source, rebuild and restart in one step (config + pairings persist):

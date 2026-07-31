@@ -18,14 +18,29 @@ export PATH="$HOME/.local/bin:$PATH"
 SRC="${PUNKTFUNK_SRC:-$HOME/punktfunk}"
 BIN="$SRC/target-steamos/release/punktfunk-host"
 
+NEED=0
 if [ ! -x "$BIN" ]; then
     echo "punktfunk-host binary missing at $BIN — running a full rebuild" >&2
-elif ! ldd "$BIN" 2>/dev/null | grep -q "not found"; then
-    exit 0 # every library resolves — nothing to do
-else
+    NEED=1
+elif ldd "$BIN" 2>/dev/null | grep -q "not found"; then
     echo "punktfunk-host no longer loads after a SteamOS update — its missing libraries:" >&2
     ldd "$BIN" 2>/dev/null | grep "not found" >&2 || true
     echo "rebuilding against the new OS tree (this takes a few minutes; streaming resumes after)" >&2
+    NEED=1
 fi
+
+# The HDR gamescope companion chases OS libraries the same way. Probe it only when host.env pins
+# it (build-gamescope.sh wires that line only while the binary works) — a break here would not
+# just lose HDR, it would break gamescope session SPAWNING via the stale absolute override, so it
+# rebuilds with the same urgency as the host binary.
+GS_BIN="$(sed -n 's/^PUNKTFUNK_GAMESCOPE_BIN=//p' "$HOME/.config/punktfunk/host.env" 2>/dev/null | head -1)"
+if [ -n "$GS_BIN" ]; then
+    if [ ! -x "$GS_BIN" ] || ldd "$GS_BIN" 2>/dev/null | grep -q "not found"; then
+        echo "punktfunk-gamescope no longer loads after a SteamOS update — rebuilding it" >&2
+        NEED=1
+    fi
+fi
+
+[ "$NEED" = 0 ] && exit 0 # everything resolves — nothing to do (every normal boot)
 
 exec bash "$SRC/scripts/steamdeck/update.sh"

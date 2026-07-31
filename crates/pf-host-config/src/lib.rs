@@ -151,10 +151,12 @@ pub struct HostConfig {
     /// gamescope's PipeWire node the 10-bit PQ capture formats; the host probes for it and stays
     /// SDR when it isn't installed, so this knob only decides whether HDR is *attempted*.
     ///
-    /// Default OFF for the canary release, then default-on (matching `PUNKTFUNK_10BIT`'s
-    /// explicit-off grammar). It gates the whole feature — spawn flags included — so an operator
-    /// who hits a bad interaction can turn the gamescope backend back into exactly today's 8-bit
-    /// path with one env var and no downgrade path to trip over.
+    /// Default ON (explicit-off grammar, matching `PUNKTFUNK_10BIT`) since the post-0.22.3 flip:
+    /// the capability chain behind it (the `+pfhdr` banner probe, managed spawn, the client's
+    /// 10-bit cap, the per-source downgrade latch) keeps a stock-gamescope box on today's 8-bit
+    /// path, so the knob's remaining job is the emergency escape hatch — an operator who hits a
+    /// bad interaction sets `=0` and the gamescope backend is exactly the old SDR path again,
+    /// spawn flags included.
     pub gamescope_hdr: bool,
     /// `PUNKTFUNK_GAMESCOPE_SDR_NITS` — the luminance SDR content is mapped to inside the PQ
     /// container of an HDR gamescope session (gamescope's `--hdr-sdr-content-nits`, default 400).
@@ -270,7 +272,7 @@ impl HostConfig {
             // its first frames at all; `=0` is the A/B + escape hatch.
             gamescope_splash: env_on("PUNKTFUNK_GAMESCOPE_SPLASH").unwrap_or(true),
             // Default OFF for one canary release (design §4 rollout), then flip the `unwrap_or`.
-            gamescope_hdr: env_on("PUNKTFUNK_GAMESCOPE_HDR").unwrap_or(false),
+            gamescope_hdr: env_on("PUNKTFUNK_GAMESCOPE_HDR").unwrap_or(true),
             gamescope_sdr_nits: val("PUNKTFUNK_GAMESCOPE_SDR_NITS")
                 .and_then(|s| s.trim().parse::<u32>().ok())
                 .filter(|n| (1..=10_000).contains(n)),

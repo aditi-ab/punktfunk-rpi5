@@ -105,7 +105,7 @@ see [Status & Progress](/docs/status).
   (`PUNKTFUNK_VIDEO_SOURCE=portal`) negotiates the 10-bit PQ formats and encodes HEVC Main10
   BT.2020 PQ. The **gamescope** virtual output is no longer blocked either — the
   `punktfunk-gamescope` build carries the small patch its capture node was missing, so
-  `PUNKTFUNK_GAMESCOPE_HDR=1` streams true HDR10 (on-glass validation pending; the patch is
+  installing it streams true HDR10 by default (on-glass validation pending; the patch is
   offered upstream as
   [gamescope#2126](https://github.com/ValveSoftware/gamescope/issues/2126)). What stays blocked
   upstream is HDR on **Mutter's virtual monitors** — `RecordVirtual` streams are still SDR-only

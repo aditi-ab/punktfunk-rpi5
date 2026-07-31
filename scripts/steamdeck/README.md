@@ -40,9 +40,10 @@ serving HTTPS (HTTP/1.1 over TLS) with the host's identity cert), so its service
 
 | Script | What it does |
 |--------|--------------|
-| `install.sh` | Idempotent installer: ensure the `pf2` distrobox + toolchain → build host + web + **plugin runner** → write config → tune sysctl + udev + `vhci-hcd` + `input` group and **register it on SteamOS's atomic-update keep list** (sudo) → install + start `punktfunk-host` / `punktfunk-web` systemd **user** services with linger, plus the **rebuild check** below. |
-| `update.sh` | Rebuild everything from the current source and restart the services (config + pairings persist). `--pull` does `git pull` first. Also retrofits anything a newer install.sh writes (runner, keep-list registration, rebuild check) onto older installs. |
-| `rebuild-check.sh` | The post-OS-update self-heal (run by `punktfunk-rebuild-check.service` before the host at session start): `ldd`-probes the binary — milliseconds when healthy, a full `update.sh` rebuild only when a SteamOS update actually broke its library links. |
+| `install.sh` | Idempotent installer: ensure the `pf2` distrobox + toolchain → build host + web + **plugin runner** → write config → build the **HDR gamescope** below → tune sysctl + udev + `vhci-hcd` + `input` group and **register it on SteamOS's atomic-update keep list** (sudo) → install + start `punktfunk-host` / `punktfunk-web` systemd **user** services with linger, plus the **rebuild check** below. |
+| `update.sh` | Rebuild everything from the current source and restart the services (config + pairings persist). `--pull` does `git pull` first. Also retrofits anything a newer install.sh writes (runner, HDR gamescope, keep-list registration, rebuild check) onto older installs. |
+| `build-gamescope.sh` | Build gamescope + the `pipewire-hdr` patches (`packaging/gamescope`) in the same distrobox and install it as `~/.local/bin/punktfunk-gamescope`, wiring `PUNKTFUNK_GAMESCOPE_BIN` into `host.env` — what lets Game Mode stream **10-bit BT.2020 PQ (HDR)** instead of 8-bit SDR. Best-effort: a failure warns and the host streams SDR. Content-stamped — a no-op unless `packaging/gamescope/` changed or the binary broke. |
+| `rebuild-check.sh` | The post-OS-update self-heal (run by `punktfunk-rebuild-check.service` before the host at session start): `ldd`-probes the host binary **and the HDR gamescope** — milliseconds when healthy, a full `update.sh` rebuild only when a SteamOS update actually broke library links. |
 
 ```sh
 git clone https://git.unom.io/unom/punktfunk ~/punktfunk
@@ -74,6 +75,13 @@ default `pf2`), `PUNKTFUNK_MGMT_PORT` (47990), `PUNKTFUNK_WEB_PORT` (47992).
 - **Plugin runner:** the deb's payload laid out user-scoped (read-only `/usr` can't take the
   package): wrapper `~/.local/bin/punktfunk-scripting`, pinned `bun` in
   `~/.local/lib/punktfunk-scripting/`, bundle in `~/.local/share/punktfunk-scripting/`.
+- **HDR gamescope:** `~/.local/bin/punktfunk-gamescope` (gamescope + the `pipewire-hdr` patches,
+  built in `pf2`, run natively — it does **not** replace the system gamescope; only the sessions
+  the host spawns use it). `host.env` gains `PUNKTFUNK_GAMESCOPE_BIN=` pointing at it — a line
+  `build-gamescope.sh` maintains and removes again if the binary ever stops working, because a
+  stale absolute override would break session spawning, not just HDR. HDR is attempted by
+  default when present; `PUNKTFUNK_GAMESCOPE_HDR=0` in `host.env` forces SDR. Verify with
+  `punktfunk-host hdr-probe`.
 - **System tuning (sudo):** `/etc/sysctl.d/99-punktfunk-net.conf` (32 MB UDP buffers — the #1
   high-bitrate lever), `/etc/udev/rules.d/60-punktfunk.rules` (`uinput`/`uhid` access),
   `/etc/modules-load.d/punktfunk.conf` (`vhci-hcd` for the native Deck pad), `$USER` in the `input`

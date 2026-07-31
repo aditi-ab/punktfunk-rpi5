@@ -52,6 +52,12 @@ sed 's|^ExecStart=.*|ExecStart=%h/.local/bin/punktfunk-scripting|' \
 systemctl --user daemon-reload
 ok "plugin runner rebuilt (opt-in service: systemctl --user enable --now punktfunk-scripting)"
 
+# HDR gamescope (punktfunk-gamescope): rebuild when the packaging tree changed or the installed
+# binary stopped working — also RETROFITS it onto older installs that predate it (fast no-op
+# otherwise). Best-effort; on failure the host streams SDR (see build-gamescope.sh).
+log "HDR gamescope (punktfunk-gamescope)"
+PUNKTFUNK_SRC="$SRC" PUNKTFUNK_BOX="$BOX" bash "$SRC/scripts/steamdeck/build-gamescope.sh"
+
 # Retrofit the post-OS-update rebuild check (install.sh §5) onto older installs: probes the host
 # binary with ldd at session start and re-runs this script when a SteamOS update broke its links.
 if [ ! -f "$HOME/.config/systemd/user/punktfunk-rebuild-check.service" ]; then

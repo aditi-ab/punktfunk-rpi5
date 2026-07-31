@@ -152,9 +152,9 @@ These apply to the **Gaming Mode (gamescope)** path; the KDE Desktop path is una
   current gamescope is fine; this only bites if you've pinned an old one.
 - **The mouse cursor isn't included in the captured image** — a gamescope limitation for now. (The
   KDE Desktop path renders the cursor normally.)
-- **HDR needs the punktfunk gamescope build** (`punktfunk-gamescope`, shipped in the sysext) plus
-  `PUNKTFUNK_GAMESCOPE_HDR=1`. Without it sessions stream SDR — correctly, including SDR versions
-  of HDR games.
+- **HDR needs the punktfunk gamescope build** (`punktfunk-gamescope`, shipped in the sysext) and
+  is attempted by default when it is present (`PUNKTFUNK_GAMESCOPE_HDR=0` forces SDR). Without
+  the build sessions stream SDR — correctly, including SDR versions of HDR games.
 
 Canonical list: [gamescope → Known limits](/docs/gamescope#known-limits).
 

@@ -114,28 +114,37 @@ NVENC/EGL come from the NVIDIA driver: `sudo pacman -S --needed nvidia-utils`. A
 | NVIDIA driver (NVENC/EGL/CUDA) | `nvidia-utils` *(optdepend — never a hard dep)* |
 | Compositor backends | `gamescope` (≥3.16.22) / `kwin` / `mutter` / `sway` *(optdepends)* |
 
-## SteamOS 3 (immutable) — use a systemd-sysext
+## Immutable Arch (SteamOS 3) — the systemd-sysext mechanism
 
 SteamOS has a **read-only `/usr` on A/B partitions**, and every OS update reimages the rootfs —
-so `steamos-readonly disable` + `pacman` (and flatpak/distrobox) are fragile or unusable for a
-host that needs `/dev/uinput`, `/dev/uhid`, the host PipeWire socket, the GPU render node, and the
-right to spawn a compositor. The update-survivable, SteamOS-blessed mechanism is a
-**systemd-sysext**: an overlay image merged read-only over `/usr` at boot, living in the writable
-`/var/lib/extensions/` (so it persists across A/B updates, no readonly-disable).
+so `steamos-readonly disable` + `pacman` is fragile for anything that must survive updates. The
+SteamOS-blessed overlay mechanism is a **systemd-sysext**: an image merged read-only over `/usr`
+at boot, living in the writable `/var/lib/extensions/`.
+
+> **For a SteamOS HOST this is NOT the supported path** — that is
+> [`scripts/steamdeck/install.sh`](../../scripts/steamdeck/) (the on-device distrobox build,
+> which also builds the HDR gamescope). A host sysext carries a prebuilt binary that breaks on
+> the next SteamOS soname bump, and `/var` — where sysexts live — is per-A/B-partition-set.
+> The mechanism below is what the Deck **client** image uses (next section), and an option for
+> operators on other immutable Arch derivatives who accept the prebuilt trade-off.
 
 Build the package, then wrap its `/usr` payload into a sysext image:
 ```sh
-# 1. build the pacman package (needs an Arch environment / container)
+# 1. build the pacman packages (needs an Arch environment / container)
 cd packaging/arch && PF_SRCDIR="$(git rev-parse --show-toplevel)" makepkg -f --holdver
-# 2. turn it into a sysext .raw (extracts the package's /usr into an image + extension-release)
-bash build-sysext.sh punktfunk-host-*.pkg.tar.zst
-# 3. on the SteamOS box:
+( cd ../gamescope && makepkg -f -d --holdver )   # optional: the HDR gamescope companion
+# 2. turn it into a sysext .raw (extracts the packages' /usr into an image + extension-release);
+#    --gamescope folds the HDR build into a HOST image (verified by its +pfhdr banner)
+bash build-sysext.sh --gamescope ../gamescope/punktfunk-gamescope-*.pkg.tar.zst punktfunk-host-*.pkg.tar.zst
+# 3. on the box:
 sudo cp punktfunk-host.raw /var/lib/extensions/
-sudo systemctl enable --now systemd-sysext      # merges it; survives OS updates
+sudo systemctl enable --now systemd-sysext      # merges it
 systemctl --user enable --now punktfunk-host     # the user unit is now under /usr/lib
 ```
 The udev rule, sysctl, and systemd **user** unit all live under `/usr/lib`, so the merged sysext
-exposes them. `systemd-sysext refresh` re-merges after a reboot.
+exposes them. `systemd-sysext refresh` re-merges after a reboot. (One HDR nuance of the sysext
+path: file capabilities don't survive it, so gamescope runs without `CAP_SYS_NICE` — everything
+works, frame pacing is marginally worse than the pacman install, whose `.install` sets the cap.)
 
 ## Steam Deck — the client (what the Decky plugin launches)
 

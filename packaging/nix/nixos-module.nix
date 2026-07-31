@@ -166,19 +166,16 @@ in
 
       gamescopeHdr = mkOption {
         type = types.bool;
-        default = false;
+        default = true;
         description = ''
           Put `punktfunk-gamescope` — gamescope carrying punktfunk's `pipewire-hdr` patches — on
-          the host service's PATH and turn HDR on for the gamescope backend
-          (`PUNKTFUNK_GAMESCOPE_HDR=1`), so a 10-bit-capable client can stream true HDR10
-          (BT.2020 PQ) off a gamescope virtual output.
+          the host service's PATH, so a 10-bit-capable client can stream true HDR10 (BT.2020 PQ)
+          off a gamescope virtual output. HDR is attempted by default once the binary is present
+          (`PUNKTFUNK_GAMESCOPE_HDR=0` in `settings`/`environmentFile` forces SDR).
 
           It does NOT replace the system's `gamescope`: the binary has its own name and the host
-          prefers it only for the sessions it spawns itself. Costs a gamescope build from source.
-
-          Off by default while the feature soaks (design §4 rollout); the host also stays SDR on
-          its own if the patched binary is somehow absent, so this is a policy switch, not a
-          promise.
+          prefers it only for the sessions it spawns itself. Costs a gamescope build from source
+          — set `false` to skip that build; the host then stays SDR on the gamescope backend.
         '';
       };
 
@@ -365,9 +362,9 @@ in
             (optional (cfg.host.settings != { }) "${hostSettingsFile}")
             ++ (optional (cfg.host.environmentFile != null) "-${toString cfg.host.environmentFile}");
         };
-        # Layered UNDER `settings`/`environmentFile` (systemd's Environment= loses to a later
-        # EnvironmentFile), so an explicit `PUNKTFUNK_GAMESCOPE_HDR` in either still wins.
-        environment = mkIf cfg.host.gamescopeHdr { PUNKTFUNK_GAMESCOPE_HDR = "1"; };
+        # No PUNKTFUNK_GAMESCOPE_HDR here: the host defaults it on, and the capability probe on
+        # the resolved binary keeps a build-less box SDR. `gamescopeHdr` only controls whether
+        # the patched binary is on PATH; `settings`/`environmentFile` can still set =0 to force SDR.
       };
     })
 
