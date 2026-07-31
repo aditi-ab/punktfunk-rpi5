@@ -126,6 +126,15 @@ pub(super) struct PresentMeter {
 struct PresentMeterInner {
     latch_us: Vec<u64>,
     displays: u64,
+    /// The `decode` stage's feed split, received→queued µs (P3 science: hand-off + input-slot
+    /// wait). Empty when no receipt stamp matched (HUD off and ABR not measuring decode).
+    feed_us: Vec<u64>,
+    /// The codec-pure half, queued→decoded µs, measured from the AU's LAST piece — always on,
+    /// so a HUD-off logcat A/B still reads the decoder's own time.
+    codec_us: Vec<u64>,
+    /// Capture→decoded end-to-end µs (skew-corrected, clamped) — always on for the same reason:
+    /// the wireless A/B's headline without having to reach the on-screen HUD.
+    e2e_us: Vec<u64>,
 }
 
 impl PresentMeter {
@@ -134,6 +143,9 @@ impl PresentMeter {
             inner: Mutex::new(PresentMeterInner {
                 latch_us: Vec::with_capacity(256),
                 displays: 0,
+                feed_us: Vec::with_capacity(256),
+                codec_us: Vec::with_capacity(256),
+                e2e_us: Vec::with_capacity(256),
             }),
         }
     }
@@ -152,14 +164,51 @@ impl PresentMeter {
         }
     }
 
-    fn drain(&self) -> (Vec<u64>, u64) {
+    /// One decoded frame's always-on measurements: the `decode`-stage split (feed =
+    /// received→queued when a receipt stamp matched; codec = queued→decoded when the queued
+    /// stamp did) and the capture→decoded end-to-end, µs. Decode thread; poison-proof.
+    pub(super) fn note_decode(
+        &self,
+        feed_us: Option<u64>,
+        codec_us: Option<u64>,
+        e2e_us: Option<u64>,
+    ) {
+        let mut g = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(f) = feed_us {
+            if g.feed_us.len() < 4096 {
+                g.feed_us.push(f);
+            }
+        }
+        if let Some(c) = codec_us {
+            if g.codec_us.len() < 4096 {
+                g.codec_us.push(c);
+            }
+        }
+        if let Some(e) = e2e_us {
+            if g.e2e_us.len() < 4096 {
+                g.e2e_us.push(e);
+            }
+        }
+    }
+
+    #[allow(clippy::type_complexity)] // one caller unpacks it in place; a struct would be noise
+    fn drain(&self) -> (Vec<u64>, u64, Vec<u64>, Vec<u64>, Vec<u64>) {
         let mut g = self
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let displays = g.displays;
         g.displays = 0;
-        (std::mem::take(&mut g.latch_us), displays)
+        (
+            std::mem::take(&mut g.latch_us),
+            displays,
+            std::mem::take(&mut g.feed_us),
+            std::mem::take(&mut g.codec_us),
+            std::mem::take(&mut g.e2e_us),
+        )
     }
 }
 
@@ -386,7 +435,9 @@ impl Presenter {
     /// `released` (to glass) / `displays` (OnFrameRendered confirms) / `paced` (policy drops) /
     /// `noBudget` (waits on the closed budget) / `forced` (stale force-opens — 0 when healthy) /
     /// `qDry` (FIFO underflows) / `pace` (decoded→release) / `latch` (release→displayed) /
-    /// `vsync` (the measured panel period).
+    /// `feed`+`codec` (the decode stage split: received→queued hand-off/slot wait + the
+    /// codec-pure queued→decoded time) / `e2e` (capture→decoded, skew-corrected — the wireless
+    /// A/B headline) / `vsync` (the measured panel period).
     ///
     /// Returns this window's CIRCULAR latch statistics `(vector-mean latch ns mod panel period,
     /// coherence ‰)` when a window actually flushed — the phase-lock reporter's v2 error signal
@@ -400,11 +451,14 @@ impl Presenter {
             return None;
         }
         self.last_flush = Instant::now();
-        let (latch, displays) = meter.drain();
+        let (latch, displays, feed, codec, e2e) = meter.drain();
         if self.released == 0 && displays == 0 {
             return None; // idle stream — nothing worth a line
         }
         let (pace_p50, pace_max) = p50_max_ms(std::mem::take(&mut self.pace_us));
+        let (feed_p50, feed_max) = p50_max_ms(feed);
+        let (codec_p50, codec_max) = p50_max_ms(codec);
+        let (e2e_p50, e2e_max) = p50_max_ms(e2e);
         let circ = clock.and_then(|c| {
             punktfunk_core::phase::circular_latch(&latch, c.panel_period_ns().max(c.period_ns()))
         });
@@ -416,7 +470,9 @@ impl Presenter {
         log::info!(
             target: "pf.present",
             "released={} displays={} paced={} noBudget={} forced={} qDry={} \
-             paceMs p50={:.2} max={:.2} latchMs p50={:.2} max={:.2} circ={:.2}ms coh={} \
+             paceMs p50={:.2} max={:.2} latchMs p50={:.2} max={:.2} \
+             feedMs p50={:.2} max={:.2} codecMs p50={:.2} max={:.2} \
+             e2eMs p50={:.2} max={:.2} circ={:.2}ms coh={} \
              vsyncMs={:.2} panelMs={:.2}",
             self.released,
             displays,
@@ -428,6 +484,12 @@ impl Presenter {
             pace_max,
             latch_p50,
             latch_max,
+            feed_p50,
+            feed_max,
+            codec_p50,
+            codec_max,
+            e2e_p50,
+            e2e_max,
             circ.map(|(m, _)| m as f64 / 1e6).unwrap_or(0.0),
             circ.map(|(_, c)| c).unwrap_or(0),
             period_ms,

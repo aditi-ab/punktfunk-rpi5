@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use super::display::{
     apply_hdr_dataspace, install_render_callback, release_render_callback, DisplayTracker,
 };
-use super::latency::{note_decoded_pts, now_realtime_ns, take_flags};
+use super::latency::{note_decoded_pts, now_realtime_ns, take_flags, take_stamp};
 use super::presenter::{presenter_disabled_by_sysprop, PresentMeter, PresentPriority, Presenter};
 use super::setup::{
     android_hdr_static_info, boost_hot_threads, boost_thread_priority, codec_mime,
@@ -280,6 +280,10 @@ pub(super) fn run_async(
     let mut oversized_dropped: u64 = 0;
     // Slice-progressive continuity ledger (see `PartFeed`).
     let mut part_open: Option<PartFeed> = None;
+    // Queued-instant stamps (pts → realtime ns at the AU's LAST piece entering the codec) — the
+    // P3 decode-split ledger: `feed` = received→queued, `codec` = queued→decoded. Always on
+    // (one vDSO clock read per AU); consumed by `present_ready`.
+    let mut queued_stamps: VecDeque<(u64, i128)> = VecDeque::new();
     // Freeze-until-reanchor gate (see the sync loop for the rationale). Armed on a frame-index gap
     // (the feeder's Au verdict), a parked-AU overflow drop, a dropped-count climb, or a recoverable
     // codec error; `recovery_flags` carries each AU's user_flags from `dispatch_event` (feed) to
@@ -349,7 +353,7 @@ pub(super) fn run_async(
                 p.on_vsync();
             }
         }
-        stats.note_skipped(aus_dropped); // parked-AU overflow drops are client-side skips too
+        stats.note_skipped_overflow(aus_dropped); // parked-AU overflow: skips, flagged as such
         if fmt_dirty {
             apply_hdr_dataspace(&codec, &window, &mut applied_ds);
         }
@@ -361,6 +365,7 @@ pub(super) fn run_async(
             &mut fed,
             &mut oversized_dropped,
             &mut part_open,
+            &mut queued_stamps,
             &mut gate,
         );
         let had_output = !ready.is_empty();
@@ -372,6 +377,8 @@ pub(super) fn run_async(
             &mut ready,
             &stats,
             &in_flight,
+            &mut queued_stamps,
+            &meter,
             clock_offset.load(Ordering::Relaxed),
             &tracker,
             &mut presenter,
@@ -762,6 +769,7 @@ pub(super) struct PartFeed {
 /// [`BUFFER_FLAG_PARTIAL_FRAME`] except the AU's last, all at the AU's pts. `part_open` is the
 /// continuity ledger — any break (gap, orphan, oversize) abandons the AU per [`PartFeed::pts_us`]'s
 /// close contract and re-syncs at the next `first`.
+#[allow(clippy::too_many_arguments)] // one call site; the split ledger threads through like the gate
 fn feed_ready(
     codec: &MediaCodec,
     client: &NativeClient,
@@ -770,6 +778,7 @@ fn feed_ready(
     fed: &mut u64,
     oversized_dropped: &mut u64,
     part_open: &mut Option<PartFeed>,
+    queued_stamps: &mut VecDeque<(u64, i128)>,
     gate: &mut ReanchorGate,
 ) {
     while !pending_aus.is_empty() && !free_inputs.is_empty() {
@@ -859,9 +868,15 @@ fn feed_ready(
             }
         } else {
             // `fed` counts ACCESS UNITS toward the HUD's fed/decoded balance — the closing
-            // piece (or a whole AU) bumps it.
+            // piece (or a whole AU) bumps it. The queued stamp marks the same instant (the AU
+            // is fully in the codec's hands): the P3 decode split measures `codec` from here,
+            // so a slice-progressive head start shows up as codec-pure shrink.
             if last {
                 *fed += 1;
+                queued_stamps.push_back((pts_us, now_realtime_ns()));
+                if queued_stamps.len() > IN_FLIGHT_CAP {
+                    queued_stamps.pop_front(); // stale — codec never echoed it back
+                }
             }
             *part_open = if last {
                 None
@@ -876,7 +891,8 @@ fn feed_ready(
     }
 }
 
-/// Route the ready outputs toward glass. With the timeline presenter (default): fold each output
+/// Route the ready outputs toward glass, recording each one's decode-split + e2e first. With the
+/// timeline presenter (default): fold each output
 /// through the re-anchor gate in pts order, hand the approved ones to the presenter's store
 /// (newest-wins / smoothing FIFO — the actual release happens in `Presenter::pump`, budgeted and
 /// timeline-timed), and release withheld concealment unrendered. Legacy (`arrival` sysprop):
@@ -892,6 +908,8 @@ fn present_ready(
     ready: &mut Vec<OutputReady>,
     stats: &crate::stats::VideoStats,
     in_flight: &Mutex<VecDeque<(u64, i128)>>,
+    queued_stamps: &mut VecDeque<(u64, i128)>,
+    meter: &PresentMeter,
     clock_offset: i64,
     tracker: &DisplayTracker,
     presenter: &mut Option<Presenter>,
@@ -903,22 +921,42 @@ fn present_ready(
     if ready.is_empty() {
         return;
     }
-    // Pair each output's decode stage (feeds the ABR decode signal always; the HUD histogram only
-    // while visible) — both consume the receipt map, so enter for either.
-    if stats.enabled() || measure_decode {
+    // Pair each output's decode stage (the ABR decode signal + the HUD histogram consume the
+    // receipt map; the P3 split's codec-pure half needs only the queued stamp, so it records
+    // even with both off — that keeps the 1 Hz pf.present mirror HUD-off readable).
+    {
+        let want_stage = stats.enabled() || measure_decode;
         let mut g = in_flight
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         for o in ready.iter() {
-            note_decoded_pts(
-                client,
-                measure_decode,
-                stats,
-                &mut g,
-                clock_offset,
-                o.pts_us,
-                o.decoded_ns,
-            );
+            let received_ns = if want_stage {
+                note_decoded_pts(
+                    client,
+                    measure_decode,
+                    stats,
+                    &mut g,
+                    clock_offset,
+                    o.pts_us,
+                    o.decoded_ns,
+                )
+            } else {
+                None
+            };
+            let queued = take_stamp(queued_stamps, o.pts_us);
+            let codec_us = queued.map(|q| ((o.decoded_ns - q).max(0) / 1000) as u64);
+            let feed_us = match (queued, received_ns) {
+                (Some(q), Some(r)) => Some(((q - r).max(0) / 1000) as u64),
+                _ => None,
+            };
+            // Always-on e2e for the 1 Hz pf.present mirror (same formula + clamp as the HUD's
+            // capture→decoded headline in `note_decoded_pts`).
+            let e2e_ns = o.decoded_ns + clock_offset as i128 - o.pts_us as i128 * 1000;
+            let e2e_us = (e2e_ns > 0 && e2e_ns < 10_000_000_000).then_some((e2e_ns / 1000) as u64);
+            meter.note_decode(feed_us, codec_us, e2e_us);
+            if let Some(c) = codec_us {
+                stats.note_decode_split(feed_us, c);
+            }
         }
     }
     // Fold EVERY output through the gate in pts (== decode) order — even the ones newest-wins discards —

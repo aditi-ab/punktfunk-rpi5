@@ -99,6 +99,18 @@ pub struct Status {
     /// Why the check couldn't complete. `update_available` is always false when set.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// The feed answered, but this channel has **no release published yet** — an expected
+    /// state rather than a malfunction, so a caller can say so plainly instead of showing a
+    /// raw "HTTP 404".
+    ///
+    /// Deliberately NOT symmetric with the host's `UpdateStatus`, which clears `last_error`
+    /// for this case: there the consumer is a human reading a console, and a red "last check
+    /// failed" on an empty feed is the bug being fixed. Here the consumer is a shell script
+    /// reading an exit code, so `error` stays set and `--check-update` keeps returning 1.
+    /// An empty channel is not evidence that this build is current, and a mistyped
+    /// `PUNKTFUNK_UPDATE_FEED` is indistinguishable from one out here.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub not_published: bool,
 }
 
 /// The Ed25519 keys trusted for update manifests — pinned once in [`pf_update_check`] so the
@@ -302,6 +314,7 @@ pub fn check(current: &str) -> Status {
         opt_in_hint: opt_in_would_help(kind, caps).then(opt_in_hint),
         notes_url: String::new(),
         error: None,
+        not_published: false,
     };
     let (apply, applier) = apply_route(kind, caps);
     status.apply = apply;
@@ -320,7 +333,8 @@ pub fn check(current: &str) -> Status {
     ) {
         Ok(m) => m,
         Err(e) => {
-            status.error = Some(e);
+            status.not_published = e.is_not_published();
+            status.error = Some(e.to_string());
             return status;
         }
     };

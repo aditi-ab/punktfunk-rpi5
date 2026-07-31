@@ -177,11 +177,12 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStopVideo(
 }
 
 /// `NativeBridge.nativeVideoStats(handle): DoubleArray?` — drain ~1 s of decode stats for the HUD
-/// (unified stats spec, `design/stats-unification.md`). Returns 26 doubles
+/// (unified stats spec, `design/stats-unification.md`). Returns 33 doubles
 /// `[fps, mbps, e2eP50Ms, e2eP95Ms, latValid, skewCorrected, width, height, refreshHz, framesLost,
 /// bitDepth, colorPrimaries, colorTransfer, chromaFormatIdc, hostNetP50Ms, decodeP50Ms, hostP50Ms,
 /// netP50Ms, lostWindow, skippedWindow, fecWindow, framesWindow, dispValid, displayP50Ms,
-/// e2eDispP50Ms, e2eDispP95Ms, paceP50Ms, latchP50Ms, presentsWindow, presenterActive]`
+/// e2eDispP50Ms, e2eDispP95Ms, paceP50Ms, latchP50Ms, presentsWindow, presenterActive,
+/// feedP50Ms, codecP50Ms, skippedOverflowWindow]`
 /// (the flags are 1.0/0.0; indexes 0–21 match the previous 22-double layout — 0–13 the original
 /// 14-double one with the latency pair re-based to the end-to-end capture→decoded headline, 14/15
 /// the stage p50s tiling it: `host+network` = capture→received, `decode` = received→decoded; 16/17
@@ -198,7 +199,11 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStopVideo(
 /// term — `pace` = decoded→release (store + glass budget) p50 at 26, `latch` =
 /// release→displayed (SurfaceFlinger) p50 at 27, the window's on-glass confirm count at 28
 /// (`presents` vs `fps` is the presenter-health pair), and 29 = 1.0 while the timeline presenter
-/// is active this session), or `null` when no decode thread is running.
+/// is active this session; 30/31 are the `decode` stage's split p50s — `feed` =
+/// received→queued (hand-off + input-slot wait) at 30 and `codec` = queued→decoded (codec-pure,
+/// from the AU's last piece) at 31, both 0.0 when no sample landed (sync loop); 32 is the
+/// parked-AU overflow subset of the window's `skipped` at 19 (decoder fell behind, vs benign
+/// newest-wins pacing)), or `null` when no decode thread is running.
 /// Poll ~1 Hz from the UI; each call
 /// resets the measurement window. Not android-gated — pure `jni` + connector reads, so it links on
 /// the host build too (Kotlin only ever calls it on device).
@@ -222,7 +227,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeVideoStats(
             .drain(h.client.frames_dropped(), h.client.fec_recovered_shards());
         let mode = h.client.mode();
         let color = h.client.color;
-        let buf: [f64; 30] = [
+        let buf: [f64; 33] = [
             snap.fps,
             snap.mbps,
             snap.e2e_p50_ms,
@@ -270,6 +275,12 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeVideoStats(
             snap.latch_p50_ms,
             snap.presents as f64,
             if h.stats.presenter_active() { 1.0 } else { 0.0 },
+            // The `decode` stage's split (P3 science): feed = received→queued (hand-off +
+            // input-slot wait), codec = queued→decoded (codec-pure) — and the parked-AU
+            // overflow subset of `skipped` (decoder-health vs benign pacing drops).
+            snap.feed_p50_ms,
+            snap.codec_p50_ms,
+            snap.skipped_overflow as f64,
         ];
         let arr = match env.new_double_array(buf.len() as jsize) {
             Ok(a) => a,

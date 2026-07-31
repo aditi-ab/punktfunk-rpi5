@@ -17,6 +17,7 @@ import android.os.Build
 import android.text.InputType
 import android.util.Log
 import android.view.KeyEvent
+import android.view.Surface
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.view.View
@@ -679,7 +680,24 @@ fun StreamScreen(session: ActiveSession, onDisconnect: () -> Unit) {
                             }
                         }
 
-                        override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {}
+                        override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
+                            // Re-assert the frame-rate vote: a buffer-geometry change can reset
+                            // the surface's frame-rate setting on some OEM builds, silently
+                            // dropping the 120 Hz pin mid-stream. Mirrors the native hint's
+                            // policy (FIXED_SOURCE; ALWAYS only on the TV low-latency path —
+                            // phones stay seamless so a re-hint can never force a mode flicker).
+                            if (streamHz > 0) runCatching {
+                                holder.surface.setFrameRate(
+                                    streamHz.toFloat(),
+                                    Surface.FRAME_RATE_COMPATIBILITY_FIXED_SOURCE,
+                                    if (isTv && lowLatencyMode) {
+                                        Surface.CHANGE_FRAME_RATE_ALWAYS
+                                    } else {
+                                        Surface.CHANGE_FRAME_RATE_ONLY_IF_SEAMLESS
+                                    },
+                                )
+                            }
+                        }
 
                         override fun surfaceDestroyed(holder: SurfaceHolder) {
                             // Surface gone (backgrounding, or on the way out). Stop the threads that

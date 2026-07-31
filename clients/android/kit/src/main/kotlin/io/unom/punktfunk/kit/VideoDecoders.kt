@@ -100,6 +100,34 @@ object VideoDecoders {
         }
     }
 
+    /**
+     * One-line per-mime probe readout for the connect log (`adb logcat -s pf.caps`): which
+     * decoder each advertised mime resolves to and whether it declares `FEATURE_PartialFrame` —
+     * the P2 slice-pipeline gate that is otherwise invisible until a stream behaves differently.
+     */
+    fun capsReport(): String {
+        val mimes = buildList {
+            add("video/avc")
+            add("video/hevc")
+            if (decodableCodecBits() and 4 != 0) add("video/av01")
+        }
+        val infos = runCatching { MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos }
+            .getOrNull() ?: return "codec list unavailable"
+        return mimes.joinToString("  ") { mime ->
+            val pick = pickDecoder(mime)?.name
+            val partial = pick?.let { p ->
+                infos.firstOrNull { it.name == p }?.let { info ->
+                    runCatching {
+                        info.getCapabilitiesForType(mime)
+                            .isFeatureSupported(CodecCapabilities.FEATURE_PartialFrame)
+                    }.getOrNull()
+                }
+            }
+            "${mime.removePrefix("video/")}=${pick ?: "platform-default"}" +
+                " partialFrame=${partial ?: "?"}"
+        }
+    }
+
     fun pickDecoder(mime: String): DecoderChoice? {
         if (mime.isEmpty()) return null
         val infos = runCatching { MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos }

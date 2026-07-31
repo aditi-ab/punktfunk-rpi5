@@ -543,6 +543,8 @@
 	"update_checking": "Prüfe…",
 	"update_last_checked": "Zuletzt geprüft",
 	"update_never_checked": "Noch nicht geprüft",
+	"update_none_published": "Noch keine veröffentlicht",
+	"update_not_published": "Auf dem Kanal {channel} wurde noch nichts veröffentlicht. Die Prüfung funktioniert — es gibt nur noch keine Version zum Vergleichen.",
 	"update_stale": "Der Update-Feed hat sich seit über 45 Tagen nicht geändert — Prüfungen gelingen, aber es kommt nichts Neues an. Falls das nicht stimmen kann, prüfe die Verbindung dieses Hosts zu git.unom.io.",
 	"update_disabled": "Update-Prüfungen sind auf diesem Host deaktiviert (PUNKTFUNK_UPDATE_CHECK=0).",
 	"update_error": "Letzte Prüfung fehlgeschlagen:",

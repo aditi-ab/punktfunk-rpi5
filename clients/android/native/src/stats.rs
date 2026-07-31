@@ -76,6 +76,12 @@ struct Inner {
     /// The other half of the split, release→displayed (SurfaceFlinger's latch + scanout), µs —
     /// from the `OnFrameRendered` render timestamps. `pace + latch ≈ display` per frame.
     latch_us: Vec<u64>,
+    /// The `decode` stage's feed split, received→queued (hand-off + input-slot wait), µs. Empty
+    /// when no receipt stamp matched (HUD off and ABR not measuring decode).
+    feed_us: Vec<u64>,
+    /// The other half, queued→decoded (codec-pure: the decoder's own time on the AU, measured
+    /// from its LAST piece so a slice-progressive head start shows up as a shrink here), µs.
+    codec_us: Vec<u64>,
     /// Frames confirmed on glass this window (`OnFrameRendered` callbacks) — the `presents`-vs-
     /// `fps` health pair: presents ≪ fps means the presenter is dropping/serializing; an fps
     /// deficit is upstream.
@@ -83,6 +89,10 @@ struct Inner {
     /// Client-side newest-wins/pacing drops this window (decoded frames released without
     /// rendering, or parked AUs dropped on overflow) — the spec's `skipped` counter.
     skipped: u64,
+    /// The subset of `skipped` that was parked-AU OVERFLOW (the decoder fell behind and whole
+    /// AUs were dropped before feeding) — a decoder-health signal, vs the benign newest-wins
+    /// pacing majority. Always ≤ `skipped`.
+    skipped_overflow: u64,
     /// Baselines for windowing the session-cumulative connector counters: the unrecoverable-drop
     /// and FEC-recovered totals as of the last drain (or the enable that opened the window), so
     /// each snapshot reports only THIS window's `lost` / `FEC` (spec line 4).
@@ -119,6 +129,11 @@ pub struct Snapshot {
     /// path / no render callbacks).
     pub pace_p50_ms: f64,
     pub latch_p50_ms: f64,
+    /// The `decode` stage's split p50s (ms): `feed` = received→queued (hand-off + input-slot
+    /// wait), `codec` = queued→decoded (codec-pure, from the AU's last piece). 0.0 when no
+    /// sample landed (sync loop / no receipt stamps).
+    pub feed_p50_ms: f64,
+    pub codec_p50_ms: f64,
     /// Frames confirmed on glass this window (`OnFrameRendered` callbacks).
     pub presents: u64,
     /// Phase-2 `host` / `network` split p50s (ms) — 0.0 when no 0xCF timing matched this window
@@ -135,6 +150,8 @@ pub struct Snapshot {
     pub lost: u64,
     /// Client-side newest-wins/pacing drops this window (spec `skipped`).
     pub skipped: u64,
+    /// The parked-AU overflow subset of `skipped` (decoder fell behind; ≤ `skipped`).
+    pub skipped_overflow: u64,
     /// FEC shards recovered this window (spec `FEC`, windowed from the cumulative counter).
     pub fec: u64,
 }
@@ -167,8 +184,11 @@ impl VideoStats {
                 e2e_disp_us: Vec::with_capacity(256),
                 pace_us: Vec::with_capacity(256),
                 latch_us: Vec::with_capacity(256),
+                feed_us: Vec::with_capacity(256),
+                codec_us: Vec::with_capacity(256),
                 presents: 0,
                 skipped: 0,
+                skipped_overflow: 0,
                 last_dropped_total: 0,
                 last_fec_total: 0,
                 skew_corrected: false,
@@ -219,8 +239,11 @@ impl VideoStats {
             g.e2e_disp_us.clear();
             g.pace_us.clear();
             g.latch_us.clear();
+            g.feed_us.clear();
+            g.codec_us.clear();
             g.presents = 0;
             g.skipped = 0;
+            g.skipped_overflow = 0;
             g.last_dropped_total = dropped_total;
             g.last_fec_total = fec_total;
         }
@@ -312,6 +335,45 @@ impl VideoStats {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         g.skipped += n;
+    }
+
+    /// Record parked-AU OVERFLOW drops (whole AUs dropped before feeding — the decoder fell
+    /// behind). Counts into `skipped` too, plus the overflow-only counter, so the HUD can tell
+    /// benign newest-wins pacing from a decoder that can't keep up.
+    // Driven only by the android-only decode thread; unreferenced on the host build — expected.
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+    pub fn note_skipped_overflow(&self, n: u64) {
+        if n == 0 || !self.enabled.load(Ordering::Relaxed) {
+            return; // HUD hidden — skip the lock
+        }
+        // Poison-proof for the same reason as `note_received`.
+        let mut g = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        g.skipped += n;
+        g.skipped_overflow += n;
+    }
+
+    /// Record one decoded frame's `decode`-stage split: `feed` = received→queued (hand-off +
+    /// input-slot wait; absent when no receipt stamp matched) and `codec` = queued→decoded
+    /// (codec-pure, measured from the AU's LAST piece — a slice-progressive head start shows
+    /// as a shrink here), both µs.
+    // Driven only by the android-only decode thread; unreferenced on the host build — expected.
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+    pub fn note_decode_split(&self, feed_us: Option<u64>, codec_us: u64) {
+        if !self.enabled.load(Ordering::Relaxed) {
+            return; // HUD hidden — skip the lock
+        }
+        // Poison-proof for the same reason as `note_received`.
+        let mut g = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(f) = feed_us {
+            g.feed_us.push(f);
+        }
+        g.codec_us.push(codec_us);
     }
 
     /// Record one decoded output frame: its capture→decoded `end-to-end` sample and its
@@ -408,6 +470,8 @@ impl VideoStats {
         g.e2e_disp_us.sort_unstable();
         g.pace_us.sort_unstable();
         g.latch_us.sort_unstable();
+        g.feed_us.sort_unstable();
+        g.codec_us.sort_unstable();
         let snap = Snapshot {
             fps,
             mbps,
@@ -421,6 +485,8 @@ impl VideoStats {
             disp_valid: !g.e2e_disp_us.is_empty(),
             pace_p50_ms: pctl_ms(&g.pace_us, 0.50),
             latch_p50_ms: pctl_ms(&g.latch_us, 0.50),
+            feed_p50_ms: pctl_ms(&g.feed_us, 0.50),
+            codec_p50_ms: pctl_ms(&g.codec_us, 0.50),
             presents: g.presents,
             host_p50_ms: pctl_ms(&g.host_us, 0.50),
             net_p50_ms: pctl_ms(&g.net_us, 0.50),
@@ -429,6 +495,7 @@ impl VideoStats {
             frames: g.frames,
             lost: dropped_total.saturating_sub(g.last_dropped_total),
             skipped: g.skipped,
+            skipped_overflow: g.skipped_overflow,
             fec: fec_total.saturating_sub(g.last_fec_total),
         };
         g.window_start = Instant::now();
@@ -443,8 +510,11 @@ impl VideoStats {
         g.e2e_disp_us.clear();
         g.pace_us.clear();
         g.latch_us.clear();
+        g.feed_us.clear();
+        g.codec_us.clear();
         g.presents = 0;
         g.skipped = 0;
+        g.skipped_overflow = 0;
         g.last_dropped_total = dropped_total;
         g.last_fec_total = fec_total;
         snap

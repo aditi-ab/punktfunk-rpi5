@@ -129,10 +129,30 @@ internal fun StatsOverlay(
                 } else {
                     ""
                 }
+                // P3 decode split (s[30]/s[31]): `feed` = received→queued (hand-off + input-slot
+                // wait) + `codec` = queued→decoded (codec-pure) — rendered when a sample landed.
+                val decodeTerm = if (s.size >= 33 && (s[30] > 0 || s[31] > 0)) {
+                    "decode ${"%.1f".format(s[15])} " +
+                        "(feed ${"%.1f".format(s[30])} + codec ${"%.1f".format(s[31])})"
+                } else {
+                    "decode ${"%.1f".format(s[15])}"
+                }
                 statLine(
-                    "= $hostTerms + decode ${"%.1f".format(s[15])}$displayTerm$presents",
+                    "= $hostTerms + $decodeTerm$displayTerm$presents",
                     Color.White,
                 )
+                // Metric fairness: the Apple client's HUD shaves ~2 refresh periods of OS
+                // pipeline floor off its shown display/end-to-end; Android shows raw. This twin
+                // applies the same shave so iPhone↔Android HUD numbers compare directly.
+                if (dispValid && hz > 0) {
+                    val shave = 2000.0 / hz
+                    statLine(
+                        "≈ Apple-HUD equiv: end-to-end " +
+                            "${"%.1f".format((s[24] - shave).coerceAtLeast(0.0))} · display " +
+                            "${"%.1f".format((s[23] - shave).coerceAtLeast(0.0))} (−2 refresh)",
+                        Color(0xFFA8D8B8),
+                    )
+                }
             }
         }
         counterLine(s, lost)?.let { statLine(it, Color(0xFFFFB0B0)) }
@@ -178,12 +198,17 @@ private fun counterLine(s: DoubleArray, lostTotal: Long): String? {
     val fec = s[20].toLong()
     val frames = s[21].toLong()
     if (lost == 0L && skipped == 0L && fec == 0L) return null
+    // The overflow subset of `skipped` (s[32]): whole AUs dropped before feeding — the decoder
+    // fell behind. Absent (0 / old layout) the plain count keeps meaning benign pacing drops.
+    val overflow = if (s.size >= 33) s[32].toLong() else 0L
     return buildList {
         if (lost > 0) {
             val pct = 100.0 * lost / (frames + lost).coerceAtLeast(1)
             add("lost $lost (${"%.1f".format(pct)}%)")
         }
-        if (skipped > 0) add("skipped $skipped")
+        if (skipped > 0) {
+            add(if (overflow > 0) "skipped $skipped (⚠ $overflow overflow)" else "skipped $skipped")
+        }
         if (fec > 0) add("FEC $fec")
     }.joinToString(" · ")
 }

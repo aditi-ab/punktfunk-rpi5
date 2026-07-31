@@ -45,7 +45,7 @@
 use super::nvenc_core::{
     apply_low_latency_config, build_init_params, cached_ceiling, codec_guid, plan_range_recovery,
     resolve_slices, resolve_split_mode, resolve_split_subframe, resolve_subframe, store_ceiling,
-    CeilingKey, LowLatencyConfig, NvStatusExt, RangePlan,
+    subframe_env_forced, CeilingKey, LowLatencyConfig, NvStatusExt, RangePlan,
 };
 use super::nvenc_status;
 use super::{AuChunk, ChromaFormat, Codec, EncodedFrame, Encoder, EncoderCaps};
@@ -588,6 +588,10 @@ pub struct NvencD3d11Encoder {
     input_ring_depth: Option<usize>,
     /// `NV_ENC_CAPS_ASYNC_ENCODE_SUPPORT` from the caps probe — gates the async retrieve mode.
     async_supported: bool,
+    /// `NV_ENC_CAPS_SUPPORT_SUBFRAME_READBACK` from the caps probe — gates the DEFAULT-on
+    /// sub-frame readback (the Linux backend's rule since its Phase 3; Windows joined after the
+    /// 2026-07-31 on-glass A/B), so a GPU without it never has sub-frame forced by default.
+    subframe_cap: bool,
     /// (bitstream, mapped input resource to unmap after retrieval, pts_ns, recovery-anchor) per
     /// in-flight encode. The fourth field tags the first frame encoded after a successful
     /// [`invalidate_ref_frames`](Encoder::invalidate_ref_frames) — the clean re-anchor P-frame the
@@ -748,6 +752,7 @@ impl NvencD3d11Encoder {
             async_rt: None,
             input_ring_depth: None,
             async_supported: false,
+            subframe_cap: false,
             pending: VecDeque::new(),
             frame_idx: 0,
             force_kf: false,
@@ -922,6 +927,7 @@ impl NvencD3d11Encoder {
             nv::NV_ENC_CAPS::NV_ENC_CAPS_SUPPORT_CUSTOM_VBV_BUF_SIZE,
         );
         let async_enc = self.get_cap(enc, nv::NV_ENC_CAPS::NV_ENC_CAPS_ASYNC_ENCODE_SUPPORT);
+        let subframe = self.get_cap(enc, nv::NV_ENC_CAPS::NV_ENC_CAPS_SUPPORT_SUBFRAME_READBACK);
         let _ = (api().destroy_encoder)(enc);
 
         // Reject an over-range mode with a clear message instead of an opaque InvalidParam.
@@ -955,10 +961,12 @@ impl NvencD3d11Encoder {
         self.rfi_supported = rfi != 0;
         self.custom_vbv = custom_vbv != 0;
         self.async_supported = async_enc != 0;
+        self.subframe_cap = subframe != 0;
         tracing::info!(
             rfi = self.rfi_supported,
             custom_vbv = self.custom_vbv,
             async_encode = self.async_supported,
+            subframe_readback = self.subframe_cap,
             max = %format!("{wmax}x{hmax}"),
             ten_bit = ten_bit != 0,
             "NVENC capabilities probed"
@@ -1152,11 +1160,14 @@ impl NvencD3d11Encoder {
             // VIDEO_CAP_MULTI_SLICE / Moonlight slices-per-frame client gets real slices.
             // `PUNKTFUNK_NVENC_SLICES` stays the operator override in both directions.
             self.slices = resolve_slices(self.codec, 4.min(self.max_slices));
-            // Split × sub-frame arbitration (Phase 8) before the ladder/ceiling key. On Windows
-            // sub-frame is env-opt-in only, so resolved == forced by construction.
-            let subframe_req = resolve_subframe(false);
+            // Split × sub-frame arbitration (Phase 8) before the ladder/ceiling key. Sub-frame
+            // defaults ON where the GPU advertises SUBFRAME_READBACK (Linux parity; validated by
+            // the 2026-07-31 .173 on-glass A/B — no regression, and slice-progressive clients
+            // gain the encode/wire overlap); `PUNKTFUNK_NVENC_SUBFRAME` stays the tri-state
+            // operator escape in both directions.
+            let subframe_req = resolve_subframe(self.subframe_cap);
             let (split_mode, subframe_req) =
-                resolve_split_subframe(self.codec, split_mode, subframe_req, subframe_req);
+                resolve_split_subframe(self.codec, split_mode, subframe_req, subframe_env_forced());
             // Find the highest bitrate the GPU's codec LEVEL accepts and CLAMP to it. NVENC rejects
             // `initialize_encoder` (InvalidParam) when the bitrate exceeds the level ceiling (e.g. a
             // 1 Gbps request on HEVC). Strategy: try the requested rate; if the only problem is a forced
@@ -1318,8 +1329,7 @@ impl NvencD3d11Encoder {
             self.session_async = use_async;
             // Sub-frame chunked poll (P2f, the Windows leg of the slice pipeline): sync
             // retrieve only — chunked poll is a depth-1 sync feature; the async retrieve's
-            // thread owns the bitstream lock. Sub-frame write itself stays env-gated
-            // (`PUNKTFUNK_NVENC_SUBFRAME=1`) until the Windows on-glass A/B validates it.
+            // thread owns the bitstream lock.
             self.subframe_chunks = self.slices >= 2 && subframe_req && !use_async;
             if self.subframe_chunks {
                 tracing::info!(
@@ -1659,8 +1669,11 @@ impl Encoder for NvencD3d11Encoder {
             let anchor = std::mem::take(&mut self.pending_anchor) && flags == 0;
             // Submit-time IDR intent: chunked poll must flag an AU's EARLY chunks before the
             // driver reports `pictureType` (only the finishing lock sees it). Exact under
-            // P-only + infinite GOP: IDRs happen only when forced.
-            let idr_hint = flags != 0;
+            // P-only + infinite GOP: IDRs happen only when forced — or on the session-opening
+            // frame, which NVENC emits as an IDR regardless of pic flags (the Linux twin's
+            // `is_idr`; without the `opening` term frame 1's early chunks went out unflagged
+            // and the divergence WARN fired at every session start).
+            let idr_hint = flags != 0 || opening;
             let mut pic = nv::NV_ENC_PIC_PARAMS {
                 version: nv::NV_ENC_PIC_PARAMS_VER,
                 inputWidth: self.width,

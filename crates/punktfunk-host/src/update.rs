@@ -27,7 +27,7 @@ pub(crate) use pf_update_check::manifest;
 pub(crate) mod windows;
 
 use manifest::Manifest;
-use pf_update_check::PublicKey;
+use pf_update_check::{FeedError, PublicKey};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -141,6 +141,9 @@ pub(crate) struct Checked {
 struct Runtime {
     checked: Option<Checked>,
     last_error: Option<String>,
+    /// The channel has nothing published (and never had, for us) — an expected state, kept
+    /// out of `last_error` so a console never paints an empty feed as a broken host.
+    not_published: bool,
     /// Refresh in flight (status kicks at most one).
     refreshing: bool,
     /// Wall-clock guard for the forced-check rate limit.
@@ -214,7 +217,7 @@ fn store_floor(path: &Path, channel: &str, serial: u64) {
 
 /// Fetch + verify the channel manifest through the shared checker. Blocking — call from a
 /// blocking thread.
-fn fetch_manifest_blocking(channel: &str) -> Result<Manifest, String> {
+fn fetch_manifest_blocking(channel: &str) -> Result<Manifest, FeedError> {
     pf_update_check::feed::fetch_manifest_blocking(
         &pf_update_check::feed::feed_base(),
         channel,
@@ -227,18 +230,18 @@ fn fetch_manifest_blocking(channel: &str) -> Result<Manifest, String> {
 }
 
 /// One full refresh: fetch, verify, enforce + raise the serial floor, update the cache,
-/// announce a newly available release on the event bus. Returns the user-facing error string
-/// on failure (also cached for status).
-pub(crate) fn refresh_blocking() -> Result<Checked, String> {
+/// announce a newly available release on the event bus. Returns the user-facing error on
+/// failure (also cached for status).
+pub(crate) fn refresh_blocking() -> Result<Checked, FeedError> {
     let (kind, channel) = detect::detect();
     let result = fetch_manifest_blocking(channel.as_str()).and_then(|m| {
         let path = state_path();
         let floor = load_floor(&path, channel.as_str());
         if m.serial < floor {
-            return Err(format!(
+            return Err(FeedError::Failed(format!(
                 "manifest serial {} is older than the last accepted {} — refusing rollback",
                 m.serial, floor
-            ));
+            )));
         }
         store_floor(&path, channel.as_str(), m.serial);
         Ok(m)
@@ -268,13 +271,29 @@ pub(crate) fn refresh_blocking() -> Result<Checked, String> {
                 });
             }
             rt.last_error = None;
+            rt.not_published = false;
             rt.checked = Some(checked.clone());
             Ok(checked)
         }
         Err(e) => {
-            rt.last_error = Some(e.clone());
+            let (last_error, not_published) = classify_failure(&e, rt.checked.is_some());
+            rt.last_error = last_error;
+            rt.not_published = not_published;
             Err(e)
         }
+    }
+}
+
+/// Split a failed refresh into `(last_error, not_published)` — the two are never both set.
+///
+/// An empty channel is only benign while we have never seen a manifest for it. Once a check
+/// has succeeded, the same 404 means the feed LOST a document it used to serve, which is a
+/// regression that must stay a loud error rather than being excused as "nothing yet".
+fn classify_failure(e: &FeedError, had_manifest: bool) -> (Option<String>, bool) {
+    if e.is_not_published() && !had_manifest {
+        (None, true)
+    } else {
+        (Some(e.to_string()), false)
     }
 }
 
@@ -296,6 +315,7 @@ pub(crate) fn snapshot_and_maybe_refresh() -> Snapshot {
         Snapshot {
             checked: rt.checked.clone(),
             last_error: rt.last_error.clone(),
+            not_published: rt.not_published,
             job: rt.job.clone(),
             last_result: jobs::read_result(&jobs::result_path()),
         }
@@ -329,6 +349,7 @@ pub(crate) async fn force_check() -> Result<Snapshot, ForceError> {
     Ok(Snapshot {
         checked: rt.checked.clone(),
         last_error: rt.last_error.clone(),
+        not_published: rt.not_published,
         job: rt.job.clone(),
         last_result: jobs::read_result(&jobs::result_path()),
     })
@@ -570,6 +591,8 @@ pub(crate) fn reconcile_at_boot() {
 pub(crate) struct Snapshot {
     pub checked: Option<Checked>,
     pub last_error: Option<String>,
+    /// The channel simply has no release yet — mutually exclusive with `last_error`.
+    pub not_published: bool,
     /// The live apply job, when one runs. When the process was restarted mid-apply this is
     /// `None` but a fresh intent still reads as in-flight — the API layer surfaces that via
     /// [`Snapshot::applying_from_intent`].
@@ -640,6 +663,34 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The console paints `last_error` as a failure and `not_published` as a plain sentence,
+    /// so the two must never arrive together — and the benign reading must not survive a
+    /// channel that has already served us a manifest.
+    #[test]
+    fn empty_channel_is_benign_only_until_a_manifest_has_been_seen() {
+        let (err, not_published) = classify_failure(&FeedError::NotPublished, false);
+        assert_eq!(err, None);
+        assert!(not_published);
+
+        // Same 404, but the feed used to answer — that is a regression, not "nothing yet".
+        let (err, not_published) = classify_failure(&FeedError::NotPublished, true);
+        assert_eq!(
+            err.as_deref(),
+            Some("no release has been published on this channel yet")
+        );
+        assert!(!not_published);
+
+        // Every real failure stays an error whether or not we have a cached manifest.
+        for had_manifest in [false, true] {
+            let (err, not_published) = classify_failure(
+                &FeedError::Failed("feed returned HTTP 500".into()),
+                had_manifest,
+            );
+            assert_eq!(err.as_deref(), Some("feed returned HTTP 500"));
+            assert!(!not_published);
+        }
+    }
+
     #[test]
     fn pinned_keys_skip_empty_rotation_slot() {
         let keys = pinned_keys();
@@ -664,6 +715,7 @@ mod tests {
                 fetched_unix: now_unix(),
             }),
             last_error: None,
+            not_published: false,
             job: None,
             last_result: None,
         };

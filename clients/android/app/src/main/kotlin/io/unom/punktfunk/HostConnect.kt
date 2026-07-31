@@ -2,6 +2,7 @@ package io.unom.punktfunk
 
 import android.content.Context
 import android.os.Build
+import android.util.Log
 import io.unom.punktfunk.kit.Gamepad
 import io.unom.punktfunk.kit.NativeBridge
 import io.unom.punktfunk.kit.VideoDecoders
@@ -45,18 +46,40 @@ suspend fun connectToHost(
         // Transport-level half of "Low-latency mode (experimental)" (DSCP marking on the media
         // sockets) — must be applied before connect, since sockets are tagged at creation.
         NativeBridge.nativeSetLowLatencyMode(settings.lowLatencyMode)
+        val multiSlice = VideoDecoders.multiSliceTolerant()
+        val partialFrame = VideoDecoders.partialFrameCapable()
+        // Slice-progressive delivery: decoder truth AND the async decode loop — the legacy
+        // sync loop feeds whole AUs only, so parts must never arrive when it is selected.
+        val frameParts = settings.lowLatencyMode && partialFrame
+        val codecBits = VideoDecoders.decodableCodecBits()
+        // Automatic codec (P5, measured NP3 ↔ RTX 4090): AV1 beat HEVC by ~1.2 ms end-to-end at
+        // identical conditions, so under "Automatic" this device prefers AV1 when it hardware-
+        // decodes it (the AV1 bit is only ever set for a real, non-blocked hardware decoder) AND
+        // it lacks FEATURE_PartialFrame — a partial-frame device keeps HEVC, whose slice overlap
+        // AV1 cannot ride (AV1 has no slices; the host's chunked poll never arms). The host
+        // honors the preference only inside the probed shared codec set, so an AV1-less encoder
+        // still resolves HEVC. An explicit user choice always wins unchanged.
+        val preferredCodec = settings.preferredCodec().takeIf { it != 0 }
+            ?: if (codecBits and 4 != 0 && !partialFrame) 4 else 0
+        // The connect-time capability readout (`adb logcat -s pf.caps`): the P2 slice pipeline
+        // is client-inert unless BOTH probes pass — this line says which decoder failed one.
+        Log.i(
+            "pf.caps",
+            VideoDecoders.capsReport() +
+                " → multiSlice=$multiSlice parts=$frameParts prefer=$preferredCodec" +
+                " (lowLatency=${settings.lowLatencyMode})",
+        )
         NativeBridge.nativeConnect(
             host, port, w, h, hz,
             identity.certPem, identity.privateKeyPem, pinHex,
             settings.bitrateKbps, settings.compositor, gamepadPref,
-            hdrEnabled, VideoDecoders.multiSliceTolerant(),
-            // Slice-progressive delivery: decoder truth AND the async decode loop — the legacy
-            // sync loop feeds whole AUs only, so parts must never arrive when it is selected.
-            settings.lowLatencyMode && VideoDecoders.partialFrameCapable(),
+            hdrEnabled, multiSlice,
+            frameParts,
             settings.audioChannels,
             // What this device can decode (H.264|HEVC always, AV1 when a real decoder exists) +
-            // the user's soft codec preference — the host resolves the emitted codec from both.
-            VideoDecoders.decodableCodecBits(), settings.preferredCodec(), timeoutMs,
+            // the soft codec preference (user choice, or the Automatic AV1 rule above) — the
+            // host resolves the emitted codec from both.
+            codecBits, preferredCodec, timeoutMs,
             launch,
             // The host's approval-list / trust-store label for this device — the same
             // Build.MODEL convention the pairing dialogs use for nativePair.

@@ -480,8 +480,23 @@ fn headless_check_update() -> glib::ExitCode {
             "installed  {} ({}, {})",
             status.current, status.kind, status.channel
         );
-        println!("available  {}", status.latest);
-        if let Some(err) = &status.error {
+        // `latest` falls back to `current` when the check couldn't run — printing that as
+        // "available" would read as a confirmed answer we don't have.
+        if status.error.is_some() {
+            println!("available  unknown");
+        } else {
+            println!("available  {}", status.latest);
+        }
+        if status.not_published {
+            // Says what it is, in words, instead of a raw HTTP status. The exit code still
+            // reports "could not tell" (see the doc comment above): an empty channel is the
+            // absence of evidence that this build is current, and a mistyped
+            // PUNKTFUNK_UPDATE_FEED is indistinguishable from one out here.
+            println!(
+                "update     nothing published on the {} channel yet",
+                status.channel
+            );
+        } else if let Some(err) = &status.error {
             eprintln!("check-update: {err}");
         } else if status.update_available {
             println!("update     yes");
