@@ -29,10 +29,10 @@
 
 mod stream_sink;
 
-use super::{AudioCapturer, VirtualMic, SAMPLE_RATE};
+use super::{AudioCapturer, MicBackendStats, VirtualMic, SAMPLE_RATE};
 use anyhow::{anyhow, Context, Result};
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError};
 use std::sync::Arc;
 use std::thread;
@@ -218,6 +218,26 @@ pub struct PwMicSource {
     alive: Arc<AtomicBool>,
     /// One-shot flush request, consumed by the process callback (clears the jitter ring).
     flush: Arc<AtomicBool>,
+    /// Ring policy/telemetry shared with the RT process callback (see [`MicRingShared`]).
+    ring: Arc<MicRingShared>,
+}
+
+/// Atomics shared between [`PwMicSource`] (the pump's side) and the RT process callback: the
+/// pump's adaptive de-jitter target in, ring depth/prime gauges + reset-on-read counters out.
+/// All `Relaxed` — a slowly-moving target and telemetry, not synchronization.
+#[derive(Default)]
+struct MicRingShared {
+    /// Pump-set jitter target (per-channel samples). `0` = the pump never spoke (legacy mode,
+    /// or its first estimate hasn't landed) → the callback keeps the historical 3-quanta clamp.
+    target: AtomicUsize,
+    /// Ring depth after the last callback (per-channel samples).
+    depth: AtomicUsize,
+    /// Effective prime target of the last callback (per-channel samples).
+    prime: AtomicUsize,
+    /// Full-drain re-prime arms (see [`MicBackendStats`]).
+    reprimes: AtomicU64,
+    /// Per-channel samples dropped by the overflow cap.
+    overflow: AtomicU64,
 }
 
 impl PwMicSource {
@@ -234,11 +254,13 @@ impl PwMicSource {
         // service started before the user session) must surface as an open ERROR — engaging the
         // pump's backoff — not as an instantly-dead instance the pump would churn on.
         let (ready_tx, ready_rx) = sync_channel::<Result<()>>(1);
-        let (alive_t, flush_t) = (alive.clone(), flush.clone());
+        let ring = Arc::new(MicRingShared::default());
+        let (alive_t, flush_t, ring_t) = (alive.clone(), flush.clone(), ring.clone());
         thread::Builder::new()
             .name("punktfunk-pw-mic".into())
             .spawn(move || {
-                if let Err(e) = mic_pw_thread(pcm_rx, quit_rx, channels, flush_t, ready_tx) {
+                if let Err(e) = mic_pw_thread(pcm_rx, quit_rx, channels, flush_t, ring_t, ready_tx)
+                {
                     // Reaching here is always a setup/open failure (once the mainloop runs it exits
                     // Ok) — and it was already reported to the pump via the ready handshake, which
                     // owns the throttled operator-facing warn. Keep only a debug breadcrumb.
@@ -255,6 +277,7 @@ impl PwMicSource {
                 quit: quit_tx,
                 alive,
                 flush,
+                ring,
             }),
             Ok(Err(e)) => Err(e),
             Err(_) => Err(anyhow!("pipewire virtual-mic init timed out")),
@@ -291,6 +314,20 @@ impl VirtualMic for PwMicSource {
     fn channels(&self) -> u32 {
         self.channels
     }
+    fn set_target_depth(&self, samples_per_ch: usize) {
+        self.ring.target.store(samples_per_ch, Ordering::Relaxed);
+    }
+    fn depth(&self) -> Option<(usize, usize)> {
+        let prime = self.ring.prime.load(Ordering::Relaxed);
+        // 0 = the process callback hasn't run yet (no consumer) — nothing meaningful to report.
+        (prime > 0).then(|| (self.ring.depth.load(Ordering::Relaxed), prime))
+    }
+    fn take_stats(&self) -> MicBackendStats {
+        MicBackendStats {
+            reprimes: self.ring.reprimes.swap(0, Ordering::Relaxed),
+            overflow_dropped: self.ring.overflow.swap(0, Ordering::Relaxed),
+        }
+    }
 }
 
 /// Producer-side state for the virtual-mic loop: incoming decoded PCM and a small ring buffer
@@ -303,6 +340,8 @@ struct MicUserData {
     primed: bool,
     /// One-shot flush request from [`PwMicSource::discard`] (stale-audio drop after a gap).
     flush: Arc<AtomicBool>,
+    /// Pump-driven ring policy + telemetry (see [`MicRingShared`]).
+    shared: Arc<MicRingShared>,
     /// When the process callback last ran — a long gap means the ring content predates the
     /// current consumer (the stream idles with no recorder attached) and must be dropped.
     last_run: Option<std::time::Instant>,
@@ -318,6 +357,7 @@ fn mic_pw_thread(
     quit_rx: pipewire::channel::Receiver<Terminate>,
     channels: u32,
     flush: Arc<AtomicBool>,
+    shared: Arc<MicRingShared>,
     ready: std::sync::mpsc::SyncSender<Result<()>>,
 ) -> Result<()> {
     use pipewire as pw;
@@ -400,6 +440,7 @@ fn mic_pw_thread(
             channels: channels as usize,
             primed: false,
             flush,
+            shared,
             last_run: None,
         };
 
@@ -473,15 +514,31 @@ fn mic_pw_thread(
                         );
                     }
 
-                    // Adaptive jitter buffer. The client pushes 5 ms frames; the recorder pulls a
-                    // whole *quantum* (often 20–43 ms) from an independent clock. A drain of one
-                    // quantum must not outrun what's buffered, or every call underruns to silence
-                    // (the original ~58% gaps). So prime to ~3 quanta before producing, hold there,
-                    // and re-prime only after a genuine full drain (the client went quiet). The ring
-                    // is capped at a few quanta so latency stays bounded.
-                    let target = (3 * want).clamp(720 * ud.channels, 9600 * ud.channels);
+                    // Jitter buffer. The client pushes frames on its own clock; the recorder
+                    // pulls a whole *quantum* (often 20–43 ms) from an independent one. A drain
+                    // of one quantum must not outrun what's buffered, or every call underruns
+                    // to silence (the original ~58% gaps). Prime target = one quantum (the pull
+                    // granularity) + the pump's measured-jitter target (arrival burstiness —
+                    // see `mic_jitter`), re-priming only after a genuine full drain (the client
+                    // went quiet). Until the pump's first estimate lands — and forever under
+                    // PUNKTFUNK_MIC_LEGACY_BUFFER — the historical 3-quanta clamp applies; that
+                    // formula scaled with the RECORDING APP's quantum, so a 2048-frame recorder
+                    // bought 128+ ms of standing mic latency for jitter it never had.
+                    let pump_target = ud.shared.target.load(Ordering::Relaxed) * ud.channels;
+                    let target = if pump_target == 0 {
+                        (3 * want).clamp(720 * ud.channels, 9600 * ud.channels)
+                    } else {
+                        want + pump_target
+                    };
+                    let mut dropped = 0usize;
                     while ud.ring.len() > target.max(want) + want {
                         ud.ring.pop_front(); // bound latency: drop the oldest beyond ~1 quantum slack
+                        dropped += 1;
+                    }
+                    if dropped > 0 {
+                        ud.shared
+                            .overflow
+                            .fetch_add((dropped / ud.channels) as u64, Ordering::Relaxed);
                     }
                     if !ud.primed && ud.ring.len() >= target {
                         ud.primed = true;
@@ -501,9 +558,17 @@ fn mic_pw_thread(
                     } else {
                         0
                     };
-                    if ud.ring.is_empty() {
+                    if ud.primed && ud.ring.is_empty() {
                         ud.primed = false; // fully drained — re-prime before producing again
+                        ud.shared.reprimes.fetch_add(1, Ordering::Relaxed);
                     }
+                    // Publish depth/prime for the pump's creep trim + telemetry.
+                    ud.shared
+                        .depth
+                        .store(ud.ring.len() / ud.channels, Ordering::Relaxed);
+                    ud.shared
+                        .prime
+                        .store(target / ud.channels, Ordering::Relaxed);
                     let chunk = data.chunk_mut();
                     *chunk.offset_mut() = 0;
                     *chunk.stride_mut() = stride as _;
