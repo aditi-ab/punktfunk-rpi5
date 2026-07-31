@@ -42,6 +42,19 @@ pub const USER_FLAG_RECOVERY_ANCHOR: u32 = 0x20;
 /// COMPLETE frame must be consumed window-by-window (the padding is not part of the stream).
 pub const USER_FLAG_CHUNK_ALIGNED: u32 = 0x40;
 
+/// `user_flags` bit: this AU was packetized as a **slice-streamed** frame (the P2 slice
+/// pipeline): its sentinel blocks (`block_count == 0`) are SLICE-granularity and carry their
+/// shard-aligned BASE byte offset in `frame_bytes` (the legacy fixed-geometry sentinel is the
+/// degenerate base-0 case), and its FINAL block's base derives from the totals as
+/// `(total_data_shards − final_data_shards) × shard_bytes` — variable-size blocks tile the
+/// frame in shard units, so the uniform-geometry offset formula does not apply to ANY of its
+/// blocks. On every packet of the AU (not just sentinels) because reorder can deliver the final
+/// block first and its placement rule differs. Only emitted toward peers advertising
+/// [`VIDEO_CAP_STREAMED_AU`](crate::quic::VIDEO_CAP_STREAMED_AU) ∧
+/// [`VIDEO_CAP_MULTI_SLICE`](crate::quic::VIDEO_CAP_MULTI_SLICE) — the pair whose receivers
+/// know this contract.
+pub const USER_FLAG_SLICE_STREAM: u32 = 0x80;
+
 /// Widest lost-frame range (frames, wrapping `last - first`) a reference-frame-invalidation
 /// recovery may be asked to repair; anything wider goes straight to the keyframe path on BOTH
 /// ends. RFI can only re-reference history the encoder still holds — NVENC keeps a 5-frame DPB,

@@ -661,13 +661,21 @@ fn streamed_packets(
     let mut src = Vec::new();
     for c in chunks {
         src.extend_from_slice(c);
-        pk.push_streamed(&mut au, c, coder.as_ref(), |h: &PacketHeader, b: &[u8]| {
-            let mut p = Vec::with_capacity(HEADER_LEN + b.len());
-            p.extend_from_slice(h.as_bytes());
-            p.extend_from_slice(b);
-            pkts.push(p);
-            Ok(())
-        })
+        // slice_end = true with USER_FLAG_SLICE_STREAM unset: must be inert (the flag is the
+        // gate) — every legacy-shape assertion downstream proves it.
+        pk.push_streamed(
+            &mut au,
+            c,
+            true,
+            coder.as_ref(),
+            |h: &PacketHeader, b: &[u8]| {
+                let mut p = Vec::with_capacity(HEADER_LEN + b.len());
+                p.extend_from_slice(h.as_bytes());
+                p.extend_from_slice(b);
+                pkts.push(p);
+                Ok(())
+            },
+        )
         .unwrap();
     }
     pk.finish_streamed(au, coder.as_ref(), |h: &PacketHeader, b: &[u8]| {
@@ -904,6 +912,388 @@ fn streamed_lying_final_totals_kill_the_frame_wholesale() {
         before + 1,
         "straggler for a killed frame must be dropped, not re-open it"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Slice-granularity streamed AUs (USER_FLAG_SLICE_STREAM — nvenc-subframe P2b)
+// ---------------------------------------------------------------------------
+
+/// A block geometry big enough that slice cuts land INSIDE a block — variable-K sentinel
+/// blocks with non-uniform bases, the shape the uniform derivation can't describe.
+fn slice_config() -> Config {
+    use crate::config::{FecConfig, ProtocolPhase, Role};
+    Config {
+        role: Role::Host,
+        phase: ProtocolPhase::P2Punktfunk,
+        fec: FecConfig {
+            scheme: FecScheme::Gf16,
+            fec_percent: 50,
+            max_data_per_block: 64,
+        },
+        shard_payload: 16,
+        max_frame_bytes: 4096,
+        encrypt: false,
+        key: SessionKey::Aes128Gcm([0u8; 16]),
+        salt: [0u8; 4],
+        loopback_drop_period: 0,
+    }
+}
+
+/// Slice chunks chosen to exercise every packetizer path: an exact-shard slice, a slice with
+/// a sub-shard remainder, a slice below [`MIN_STREAM_BLOCK_SHARDS`] that must accumulate,
+/// and a finish tail. 1023 B total → blocks (K, base-shard): (20, 0), (25, 20), (18, 45),
+/// final (1, 63) with block_count 4.
+fn slice_chunks() -> Vec<Vec<u8>> {
+    [320usize, 403, 100, 200]
+        .iter()
+        .enumerate()
+        .map(|(c, &n)| (0..n).map(|i| (c * 57 + i * 131 + 7) as u8).collect())
+        .collect()
+}
+
+/// Packetize one SLICE-streamed AU (every chunk is a slice boundary), returning the wire
+/// packets and concatenated source.
+fn slice_streamed_packets() -> (Vec<Vec<u8>>, Vec<u8>) {
+    let cfg = slice_config();
+    let coder = coder_for(FecScheme::Gf16);
+    let mut pk = Packetizer::new(&cfg);
+    let mut au = pk.begin_streamed(12345, USER_FLAG_SLICE_STREAM, Some(0));
+    let mut pkts: Vec<Vec<u8>> = Vec::new();
+    let mut src = Vec::new();
+    for c in slice_chunks() {
+        src.extend_from_slice(&c);
+        pk.push_streamed(&mut au, &c, true, coder.as_ref(), |h, b| {
+            let mut p = Vec::with_capacity(HEADER_LEN + b.len());
+            p.extend_from_slice(h.as_bytes());
+            p.extend_from_slice(b);
+            pkts.push(p);
+            Ok(())
+        })
+        .unwrap();
+    }
+    pk.finish_streamed(au, coder.as_ref(), |h, b| {
+        let mut p = Vec::with_capacity(HEADER_LEN + b.len());
+        p.extend_from_slice(h.as_bytes());
+        p.extend_from_slice(b);
+        pkts.push(p);
+        Ok(())
+    })
+    .unwrap();
+    (pkts, src)
+}
+
+fn push_all(
+    r: &mut Reassembler,
+    coder: &dyn crate::fec::ErasureCoder,
+    stats: &StatsCounters,
+    delivery: &[Vec<u8>],
+) -> Option<crate::session::Frame> {
+    let mut got = None;
+    for p in delivery {
+        if let Some(f) = r.push(p, coder, stats).unwrap() {
+            assert!(got.is_none(), "frame must complete exactly once");
+            got = Some(f);
+        }
+    }
+    got
+}
+
+/// The slice wire shape: the flag on EVERY packet, sentinel `frame_bytes` = shard-aligned
+/// block base, variable K per block, real totals only on the final block — and the AU
+/// reassembles byte-identically from in-order delivery.
+#[test]
+fn slice_streamed_wire_shape_and_roundtrip() {
+    let (pkts, src) = slice_streamed_packets();
+    assert_eq!(src.len(), 1023);
+    // (block_index, K, base bytes) — chunk 2 (100 B) accumulated instead of flushing (6
+    // whole shards < MIN_STREAM_BLOCK_SHARDS) and rode into block 2 with chunk 3's bytes.
+    let expect = [(0u16, 20u16, 0u32), (1, 25, 320), (2, 18, 720)];
+    for p in &pkts {
+        let h = PacketHeader::read_from_bytes(&p[..HEADER_LEN]).unwrap();
+        assert_ne!(
+            h.user_flags & USER_FLAG_SLICE_STREAM,
+            0,
+            "the marker must ride EVERY packet — reorder can deliver any of them first"
+        );
+        if h.block_count == 0 {
+            let (_, k, base) = expect[h.block_index as usize];
+            assert_eq!(h.data_shards, k, "block {} K", h.block_index);
+            assert_eq!(h.frame_bytes, base, "block {} base", h.block_index);
+            assert_eq!(base % 16, 0, "sentinel bases are shard-aligned");
+        } else {
+            assert_eq!(h.block_index, 3);
+            assert_eq!(h.block_count, 4);
+            assert_eq!(h.frame_bytes as usize, src.len());
+            assert_eq!(h.data_shards, 1);
+        }
+    }
+
+    let cfg = slice_config();
+    let mut r = Reassembler::new(ReassemblerLimits::from_config(&cfg));
+    let coder = coder_for(FecScheme::Gf16);
+    let stats = StatsCounters::default();
+    let f = push_all(&mut r, coder.as_ref(), &stats, &pkts)
+        .expect("slice-streamed frame must complete");
+    assert_eq!(f.data, src, "reassembled slice AU must be byte-identical");
+    assert_ne!(f.flags & USER_FLAG_SLICE_STREAM, 0);
+}
+
+/// Loss inside two different variable-K blocks, delivered fully REVERSED (the final block's
+/// totals arrive first and pin the frame; every sentinel is then accepted against them) with
+/// a duplicate — still byte-identical.
+#[test]
+fn slice_streamed_survives_loss_and_reorder() {
+    let (pkts, src) = slice_streamed_packets();
+    let mut delivery: Vec<Vec<u8>> = pkts
+        .iter()
+        .filter(|p| {
+            let h = PacketHeader::read_from_bytes(&p[..HEADER_LEN]).unwrap();
+            // Kill data shards 2/5/17 of block 0 and 3/7 of block 1 — within the 50% parity.
+            !(h.block_count == 0
+                && ((h.block_index == 0 && [2, 5, 17].contains(&h.shard_index))
+                    || (h.block_index == 1 && [3, 7].contains(&h.shard_index))))
+        })
+        .cloned()
+        .collect();
+    delivery.reverse();
+    let dup = delivery.first().cloned().unwrap();
+    delivery.push(dup);
+
+    let cfg = slice_config();
+    let mut r = Reassembler::new(ReassemblerLimits::from_config(&cfg));
+    let coder = coder_for(FecScheme::Gf16);
+    let stats = StatsCounters::default();
+    let f = push_all(&mut r, coder.as_ref(), &stats, &delivery)
+        .expect("slice-streamed frame must complete within the FEC budget");
+    assert_eq!(f.data, src);
+}
+
+/// Post-pin range firewall: once the final block pinned the totals, a sentinel whose base
+/// would reach into (or past) the final block's range is dropped — and the honest copy of
+/// that block still assembles the frame.
+#[test]
+fn slice_streamed_post_pin_out_of_range_sentinel_dropped() {
+    let (pkts, src) = slice_streamed_packets();
+    let hdr_of = |p: &Vec<u8>| PacketHeader::read_from_bytes(&p[..HEADER_LEN]).unwrap();
+
+    let cfg = slice_config();
+    let mut r = Reassembler::new(ReassemblerLimits::from_config(&cfg));
+    let coder = coder_for(FecScheme::Gf16);
+    let stats = StatsCounters::default();
+
+    // Final block first — pins totals (64 data shards, final K = 1).
+    let finals: Vec<Vec<u8>> = pkts
+        .iter()
+        .filter(|p| hdr_of(p).block_count != 0)
+        .cloned()
+        .collect();
+    assert!(push_all(&mut r, coder.as_ref(), &stats, &finals).is_none());
+
+    // A block-0 packet whose base claims shard 60: 60 + 20 > 63 (the final block's base) —
+    // it would overlap the final block's landed shards. Must drop WITHOUT killing the frame.
+    let mut evil = pkts
+        .iter()
+        .find(|p| {
+            let h = hdr_of(p);
+            h.block_count == 0 && h.block_index == 0 && h.shard_index == 0
+        })
+        .cloned()
+        .unwrap();
+    let mut h = PacketHeader::read_from_bytes(&evil[..HEADER_LEN]).unwrap();
+    h.frame_bytes = 60 * 16;
+    evil[..HEADER_LEN].copy_from_slice(h.as_bytes());
+    let before = stats.snapshot().packets_dropped;
+    assert!(r.push(&evil, coder.as_ref(), &stats).unwrap().is_none());
+    assert_eq!(stats.snapshot().packets_dropped, before + 1);
+
+    // The honest packets (including the real block-0) still complete the frame.
+    let rest: Vec<Vec<u8>> = pkts
+        .iter()
+        .filter(|p| hdr_of(p).block_count == 0)
+        .cloned()
+        .collect();
+    let f = push_all(&mut r, coder.as_ref(), &stats, &rest)
+        .expect("the honest blocks must still complete the frame");
+    assert_eq!(f.data, src);
+}
+
+/// Slice retro-validation: final totals under which an already-landed sentinel block would
+/// overlap the final block's range kill the WHOLE frame, and stragglers can't resurrect it.
+#[test]
+fn slice_streamed_lying_final_kills_frame() {
+    let (pkts, _) = slice_streamed_packets();
+    let hdr_of = |p: &Vec<u8>| PacketHeader::read_from_bytes(&p[..HEADER_LEN]).unwrap();
+
+    let cfg = slice_config();
+    let mut r = Reassembler::new(ReassemblerLimits::from_config(&cfg));
+    let coder = coder_for(FecScheme::Gf16);
+    let stats = StatsCounters::default();
+
+    // All sentinel blocks land first.
+    let sentinels: Vec<Vec<u8>> = pkts
+        .iter()
+        .filter(|p| hdr_of(p).block_count == 0)
+        .cloned()
+        .collect();
+    assert!(push_all(&mut r, coder.as_ref(), &stats, &sentinels).is_none());
+
+    // A final header claiming K = 30 puts the final base at shard 34 — under block 2's
+    // landed range (base 45, K 18 → needs base ≥ 63). The frame dies wholesale.
+    let mut lying = pkts
+        .iter()
+        .find(|p| {
+            let h = hdr_of(p);
+            h.block_count != 0 && h.shard_index == 0
+        })
+        .cloned()
+        .unwrap();
+    let mut h = PacketHeader::read_from_bytes(&lying[..HEADER_LEN]).unwrap();
+    h.data_shards = 30;
+    lying[..HEADER_LEN].copy_from_slice(h.as_bytes());
+    assert!(r.push(&lying, coder.as_ref(), &stats).unwrap().is_none());
+    assert_eq!(
+        stats.snapshot().frames_dropped,
+        1,
+        "the lying frame must be counted lost"
+    );
+
+    // The honest final packets are stragglers for a killed index now — no resurrection.
+    let finals: Vec<Vec<u8>> = pkts
+        .iter()
+        .filter(|p| hdr_of(p).block_count != 0)
+        .cloned()
+        .collect();
+    assert!(push_all(&mut r, coder.as_ref(), &stats, &finals).is_none());
+    assert_eq!(stats.snapshot().frames_dropped, 1);
+}
+
+/// One slice bigger than a whole FEC block must cut MULTIPLE blocks from a single push (the
+/// flush loop) — the final block can never be left oversized.
+#[test]
+fn slice_streamed_giant_slice_cuts_multiple_blocks() {
+    let cfg = slice_config(); // max_data_per_block 64
+    let coder = coder_for(FecScheme::Gf16);
+    let mut pk = Packetizer::new(&cfg);
+    let mut au = pk.begin_streamed(1, USER_FLAG_SLICE_STREAM, Some(0));
+    let src: Vec<u8> = (0..70 * 16).map(|i| (i * 131 + 7) as u8).collect();
+    let mut pkts: Vec<Vec<u8>> = Vec::new();
+    pk.push_streamed(&mut au, &src, true, coder.as_ref(), |h, b| {
+        let mut p = Vec::with_capacity(HEADER_LEN + b.len());
+        p.extend_from_slice(h.as_bytes());
+        p.extend_from_slice(b);
+        pkts.push(p);
+        Ok(())
+    })
+    .unwrap();
+    pk.finish_streamed(au, coder.as_ref(), |h, b| {
+        let mut p = Vec::with_capacity(HEADER_LEN + b.len());
+        p.extend_from_slice(h.as_bytes());
+        p.extend_from_slice(b);
+        pkts.push(p);
+        Ok(())
+    })
+    .unwrap();
+    for p in &pkts {
+        let h = PacketHeader::read_from_bytes(&p[..HEADER_LEN]).unwrap();
+        if h.block_count == 0 {
+            assert_eq!((h.block_index, h.data_shards, h.frame_bytes), (0, 64, 0));
+        } else {
+            assert_eq!((h.block_index, h.block_count, h.data_shards), (1, 2, 6));
+            assert_eq!(h.frame_bytes as usize, src.len());
+        }
+    }
+    let mut r = Reassembler::new(ReassemblerLimits::from_config(&cfg));
+    let stats = StatsCounters::default();
+    let f = push_all(&mut r, coder.as_ref(), &stats, &pkts).expect("must complete");
+    assert_eq!(f.data, src);
+}
+
+/// `max_data_per_block` SMALLER than [`MIN_STREAM_BLOCK_SHARDS`]: one slice cut shatters into
+/// several full-K blocks (the flush floor clamps to the block size) and the mirrored
+/// block-count ceilings must still admit the frame end to end.
+#[test]
+fn slice_streamed_small_kmax_roundtrip() {
+    let cfg = e2e_config(FecScheme::Gf16, 50); // max_data_per_block 4 < 16
+    let coder = coder_for(FecScheme::Gf16);
+    let mut pk = Packetizer::new(&cfg);
+    let mut au = pk.begin_streamed(1, USER_FLAG_SLICE_STREAM, Some(0));
+    let mut pkts: Vec<Vec<u8>> = Vec::new();
+    let mut src = Vec::new();
+    for c in 0..2usize {
+        let chunk: Vec<u8> = (0..320 + c * 83)
+            .map(|i| (c * 57 + i * 131 + 7) as u8)
+            .collect();
+        src.extend_from_slice(&chunk);
+        pk.push_streamed(&mut au, &chunk, true, coder.as_ref(), |h, b| {
+            let mut p = Vec::with_capacity(HEADER_LEN + b.len());
+            p.extend_from_slice(h.as_bytes());
+            p.extend_from_slice(b);
+            pkts.push(p);
+            Ok(())
+        })
+        .unwrap();
+    }
+    pk.finish_streamed(au, coder.as_ref(), |h, b| {
+        let mut p = Vec::with_capacity(HEADER_LEN + b.len());
+        p.extend_from_slice(h.as_bytes());
+        p.extend_from_slice(b);
+        pkts.push(p);
+        Ok(())
+    })
+    .unwrap();
+    for p in &pkts {
+        let h = PacketHeader::read_from_bytes(&p[..HEADER_LEN]).unwrap();
+        if h.block_count == 0 {
+            assert_eq!(h.data_shards, 4, "floor clamps to full-K blocks");
+            assert_eq!(h.frame_bytes % (4 * 16), 0, "bases advance block-wise");
+        }
+    }
+    let mut r = Reassembler::new(ReassemblerLimits::from_config(&cfg));
+    let stats = StatsCounters::default();
+    let f = push_all(&mut r, coder.as_ref(), &stats, &pkts).expect("must complete");
+    assert_eq!(f.data, src);
+}
+
+/// A frame's packets must agree on the slice marker: a legacy-shaped header for a
+/// slice-opened frame (or vice versa) is dropped before it can pin or place anything under
+/// the wrong rule.
+#[test]
+fn slice_streamed_mixed_flag_packet_dropped() {
+    let (pkts, _) = slice_streamed_packets();
+    let hdr_of = |p: &Vec<u8>| PacketHeader::read_from_bytes(&p[..HEADER_LEN]).unwrap();
+
+    let cfg = slice_config();
+    let mut r = Reassembler::new(ReassemblerLimits::from_config(&cfg));
+    let coder = coder_for(FecScheme::Gf16);
+    let stats = StatsCounters::default();
+
+    // Open the frame with one honest slice sentinel packet.
+    let first = pkts
+        .iter()
+        .find(|p| hdr_of(p).block_count == 0)
+        .cloned()
+        .unwrap();
+    assert!(r.push(&first, coder.as_ref(), &stats).unwrap().is_none());
+
+    // A LEGACY final for the same frame index that PASSES the legacy firewall (one 16-byte
+    // shard, one block): only the flag-consistency check stands between it and pinning the
+    // slice-opened frame under uniform rules — which would then "catch" the sentinel lying
+    // and kill the frame. It must be dropped as a packet, neither pinning nor killing.
+    let mut h = hdr_of(&first);
+    h.user_flags &= !USER_FLAG_SLICE_STREAM;
+    h.block_index = 0;
+    h.block_count = 1;
+    h.frame_bytes = 16;
+    h.data_shards = 1;
+    h.recovery_shards = 0;
+    h.shard_index = 0;
+    let mut legacy = Vec::with_capacity(HEADER_LEN + 16);
+    legacy.extend_from_slice(h.as_bytes());
+    legacy.extend_from_slice(&[0xEE; 16]);
+    let before = stats.snapshot().packets_dropped;
+    assert!(r.push(&legacy, coder.as_ref(), &stats).unwrap().is_none());
+    assert_eq!(stats.snapshot().packets_dropped, before + 1);
+    assert_eq!(stats.snapshot().frames_dropped, 0, "dropped, not killed");
 }
 
 /// A sentinel first-packet commits a MAX-sized frame buffer, so the in-flight budget must

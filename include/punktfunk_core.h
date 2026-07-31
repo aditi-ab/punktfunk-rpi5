@@ -439,6 +439,19 @@
 // COMPLETE frame must be consumed window-by-window (the padding is not part of the stream).
 #define USER_FLAG_CHUNK_ALIGNED 64
 
+// `user_flags` bit: this AU was packetized as a **slice-streamed** frame (the P2 slice
+// pipeline): its sentinel blocks (`block_count == 0`) are SLICE-granularity and carry their
+// shard-aligned BASE byte offset in `frame_bytes` (the legacy fixed-geometry sentinel is the
+// degenerate base-0 case), and its FINAL block's base derives from the totals as
+// `(total_data_shards − final_data_shards) × shard_bytes` — variable-size blocks tile the
+// frame in shard units, so the uniform-geometry offset formula does not apply to ANY of its
+// blocks. On every packet of the AU (not just sentinels) because reorder can deliver the final
+// block first and its placement rule differs. Only emitted toward peers advertising
+// [`VIDEO_CAP_STREAMED_AU`](crate::quic::VIDEO_CAP_STREAMED_AU) ∧
+// [`VIDEO_CAP_MULTI_SLICE`](crate::quic::VIDEO_CAP_MULTI_SLICE) — the pair whose receivers
+// know this contract.
+#define USER_FLAG_SLICE_STREAM 128
+
 // Widest lost-frame range (frames, wrapping `last - first`) a reference-frame-invalidation
 // recovery may be asked to repair; anything wider goes straight to the keyframe path on BOTH
 // ends. RFI can only re-reference history the encoder still holds — NVENC keeps a 5-frame DPB,
@@ -451,6 +464,12 @@
 // Largest UDP datagram the core will send or accept. `Config::validate` bounds
 // `shard_payload` so `HEADER_LEN + shard_payload + CRYPTO_OVERHEAD ≤ MAX_DATAGRAM_BYTES`.
 #define MAX_DATAGRAM_BYTES 2048
+
+// The slice-flush floor: a sentinel block below this many data shards costs disproportionate
+// per-block FEC parity (`ceil(k × pct/100)` ≥ 1 whatever `k`), so slice boundaries only flush
+// once this much has accumulated (~22 KB at the standard shard payload). Small slices simply
+// ride with the next one; the wire is never worse than one flush per slice.
+#define MIN_STREAM_BLOCK_SHARDS 16
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // [`Hello::video_caps`] bit: the client can decode a 10-bit (Main10) HEVC stream.

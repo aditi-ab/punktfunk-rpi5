@@ -52,30 +52,48 @@ pub struct Packetizer {
     /// streamed AU's size isn't known up front, so this is the only pre-emission guard against
     /// producing a frame the receiver must reject).
     max_blocks: usize,
+    /// The streamed path's block-count ceiling in SLICE mode ([`USER_FLAG_SLICE_STREAM`]) —
+    /// variable-K blocks, floored at `min(MIN_STREAM_BLOCK_SHARDS, max_data_per_block)` shards.
+    slice_block_cap: usize,
 }
 
-/// One in-progress **streamed** access unit (design/nvenc-subframe-slice-output.md Phase 2):
-/// the caller feeds encoder chunks in as they exist ([`Packetizer::push_streamed`]) and every
-/// completed `max_data_per_block × shard_payload` block leaves under SENTINEL headers
-/// (`frame_bytes = 0`, `block_count = 0` — "not final yet") before the AU's total size is
+/// One in-progress **streamed** access unit (design/nvenc-subframe-slice-output.md Phase 2 +
+/// the P2 slice pipeline): the caller feeds encoder chunks in as they exist
+/// ([`Packetizer::push_streamed`]) and slice-granularity blocks leave under SENTINEL headers
+/// (`block_count = 0`, `frame_bytes` = the block's shard-aligned base byte offset — the first
+/// block's base 0 is byte-identical to the legacy sentinel) before the AU's total size is
 /// known; [`Packetizer::finish_streamed`] seals the tail block with the real totals and
-/// `FLAG_EOF`. Only ever sent to a peer that advertised
-/// [`crate::quic::VIDEO_CAP_STREAMED_AU`].
+/// `FLAG_EOF`, which retro-validate the whole layout. Only ever sent to a peer that advertised
+/// [`crate::quic::VIDEO_CAP_STREAMED_AU`] — and slice-granularity (non-zero-base) sentinels
+/// additionally require [`crate::quic::VIDEO_CAP_MULTI_SLICE`], whose receivers know the
+/// base-offset contract (stable pre-multi-slice clients reject a non-zero sentinel
+/// `frame_bytes`, and their hosts never fired this path at real bitrates anyway).
 pub struct StreamedAu {
     frame_index: u32,
     pts_ns: u64,
     user_flags: u32,
-    /// Bytes not yet sealed into a block. Kept ≤ one block by `push_streamed` (it flushes only
-    /// while STRICTLY more than a block is buffered, so the final block always has ≥ 1 byte and
-    /// a sentinel block is never retroactively the frame's last).
+    /// Bytes not yet sealed into a block: the sub-shard remainder plus anything below the
+    /// slice-flush threshold. The final block always has ≥ 1 byte (flushes emit only whole
+    /// shards and never drain to empty on a slice that ends the AU — `finish_streamed` seals
+    /// whatever remains).
     pending: Vec<u8>,
     /// Sentinel blocks already emitted.
     blocks_out: u16,
     /// Total AU bytes accumulated so far (`pending` included).
     total_bytes: u64,
+    /// WHOLE SHARDS already emitted in sentinel blocks — the next block's base offset in shard
+    /// units (bases are always shard-aligned so the frame layout tiles in shard units; the
+    /// receiver derives the final block's base from the totals the same way).
+    emitted_shards: u64,
     /// The frame's first packet (block 0, shard 0 — carries `FLAG_SOF`) has been emitted.
     opened: bool,
 }
+
+/// The slice-flush floor: a sentinel block below this many data shards costs disproportionate
+/// per-block FEC parity (`ceil(k × pct/100)` ≥ 1 whatever `k`), so slice boundaries only flush
+/// once this much has accumulated (~22 KB at the standard shard payload). Small slices simply
+/// ride with the next one; the wire is never worse than one flush per slice.
+pub const MIN_STREAM_BLOCK_SHARDS: usize = 16;
 
 impl StreamedAu {
     /// The wire frame index this AU is sealed with (the caller's RFI bookkeeping domain).
@@ -104,6 +122,10 @@ impl Packetizer {
             max_total_shards: (max_data + config.fec.recovery_for(max_data))
                 .min(config.fec.scheme.max_total_shards()),
             max_blocks: total_data_max.div_ceil(max_data).max(1),
+            // Every non-final SLICE block carries at least `min(MIN_STREAM_BLOCK_SHARDS, K)`
+            // data shards (the flush floor, clamped by the block size), so a max-size frame
+            // bounds the block count. Mirrors the receiver's slice firewall — keep in step.
+            slice_block_cap: total_data_max / MIN_STREAM_BLOCK_SHARDS.min(max_data.max(1)) + 2,
         }
     }
 
@@ -339,55 +361,94 @@ impl Packetizer {
             pending: Vec::new(),
             blocks_out: 0,
             total_bytes: 0,
+            emitted_shards: 0,
             opened: false,
         }
     }
 
-    /// Feed one encoder chunk into a streamed AU, emitting every block that COMPLETES under
-    /// sentinel headers (`frame_bytes = 0`, `block_count = 0`, exactly `max_data_per_block`
-    /// data shards — the receiver's offset formula needs no total). Flushes only while
-    /// STRICTLY more than one block is buffered, so the frame's last block — whose header must
-    /// carry the real totals — is never emitted here. Packets reach `emit` in wire order (the
-    /// caller's nonce order), data then parity per block.
+    /// Feed one encoder chunk into a streamed AU, emitting every SLICE-GRANULARITY block that
+    /// completes under sentinel headers (`block_count = 0`; `frame_bytes` = the block's BASE
+    /// SHARD OFFSET × shard size — see [`PacketHeader`]'s sentinel contract). `slice_end` marks
+    /// an encoder-chunk boundary (an Annex-B slice cut): only there may a partial-frame block
+    /// flush, and only WHOLE shards flush (the sub-shard remainder stays pending so every
+    /// sentinel base is shard-aligned and the layout tiles in shard units — the receiver's
+    /// placement + retro-validation contract). Small tails ride along until
+    /// [`MIN_STREAM_BLOCK_SHARDS`] accumulate: per-block parity makes tiny blocks
+    /// FEC-expensive. The frame's last block — whose header must carry the real totals — is
+    /// never emitted here. Packets reach `emit` in wire order, data then parity per block.
     pub fn push_streamed(
         &mut self,
         au: &mut StreamedAu,
         chunk: &[u8],
+        slice_end: bool,
         coder: &dyn ErasureCoder,
         mut emit: impl FnMut(&PacketHeader, &[u8]) -> Result<()>,
     ) -> Result<()> {
         au.total_bytes += chunk.len() as u64;
         au.pending.extend_from_slice(chunk);
-        let block_bytes = self.fec.max_data_per_block as usize * self.shard_payload;
-        while au.pending.len() > block_bytes {
-            // Room for this sentinel block AND the final block after it, within the peer's
-            // per-frame block ceiling and the u16 wire field.
-            if au.blocks_out as usize + 2 > self.max_blocks.min(u16::MAX as usize) {
+        let payload = self.shard_payload;
+        let block_bytes = self.fec.max_data_per_block as usize * payload;
+        // The AU's own [`USER_FLAG_SLICE_STREAM`] bit is the single gate for the slice wire
+        // shape: without it, `slice_end` is inert and every sentinel goes out byte-identical
+        // to the legacy contract (full-K, `frame_bytes = 0`) — which shipped receivers REQUIRE
+        // (their firewall drops any other sentinel). Callers therefore pass `slice_end`
+        // unconditionally and gate by setting the flag on the AU.
+        let slice_wire = au.user_flags & USER_FLAG_SLICE_STREAM != 0;
+        // A chunk can complete SEVERAL blocks (a slice bigger than one FEC block, or a huge
+        // legacy chunk) — keep cutting until neither flush condition holds, so the final block
+        // can never end up oversized.
+        loop {
+            let whole = au.pending.len() / payload;
+            // Legacy full-block flush stays as the hard ceiling (a frame bigger than one FEC
+            // block must flush regardless of slice geometry); slice boundaries flush earlier.
+            let must_flush = au.pending.len() > block_bytes;
+            let slice_flush = slice_wire && slice_end && whole >= MIN_STREAM_BLOCK_SHARDS;
+            if !(must_flush || slice_flush) {
+                return Ok(());
+            }
+            // Room for this sentinel block AND the final block after it, within the u16 wire
+            // field and the mode's block-count ceiling (the receiver enforces its mirror).
+            let cap = if slice_wire {
+                self.slice_block_cap
+            } else {
+                self.max_blocks
+            };
+            if au.blocks_out as usize + 2 > cap.min(u16::MAX as usize) {
                 return Err(PunktfunkError::Unsupported(
                     "streamed AU exceeds the negotiated max_frame_bytes",
                 ));
             }
+            let k = whole.min(self.fec.max_data_per_block as usize);
             let sof = !au.opened;
             let (bi, pts, uf) = (au.blocks_out, au.pts_ns, au.user_flags);
             let fi = au.frame_index;
+            let base_bytes = if slice_wire {
+                au.emitted_shards
+                    .checked_mul(payload as u64)
+                    .and_then(|b| u32::try_from(b).ok())
+                    .ok_or(PunktfunkError::Unsupported("streamed AU exceeds u32 bytes"))?
+            } else {
+                0 // the legacy sentinel contract: uniform full-K blocks, no base on the wire
+            };
+            let flush_len = k * payload;
             self.emit_streamed_block(
                 fi,
                 pts,
                 uf,
                 bi,
-                &au.pending[..block_bytes],
-                0,
+                &au.pending[..flush_len],
+                base_bytes,
                 0,
                 sof,
                 false,
                 coder,
                 &mut emit,
             )?;
-            au.pending.drain(..block_bytes);
+            au.pending.drain(..flush_len);
+            au.emitted_shards += k as u64;
             au.blocks_out += 1;
             au.opened = true;
         }
-        Ok(())
     }
 
     /// Close a streamed AU: seal the final block — its headers carry the REAL
@@ -419,8 +480,10 @@ impl Packetizer {
     }
 
     /// Seal ONE streamed block (data shards + its parity, in wire order). Sentinel blocks pass
-    /// `frame_bytes = 0` / `block_count = 0`; the final block passes the real totals. `sof`
-    /// marks the frame's very first packet, `eof` its very last.
+    /// `block_count = 0` and REUSE `frame_bytes` as the block's base byte offset (shard-aligned
+    /// by the caller; the first block's base is 0 — byte-identical to the legacy sentinel);
+    /// the final block passes the real totals. `sof` marks the frame's very first packet,
+    /// `eof` its very last.
     #[allow(clippy::too_many_arguments)]
     fn emit_streamed_block(
         &mut self,

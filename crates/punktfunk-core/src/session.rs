@@ -305,17 +305,19 @@ impl Session {
             .begin_streamed(pts_ns, user_flags, Some(frame_index)))
     }
 
-    /// Feed one encoder chunk into a streamed AU, sealing every FEC block it completes under
-    /// sentinel headers (see [`begin_streamed_frame_at`](Self::begin_streamed_frame_at)). The
-    /// returned batch is often EMPTY (the chunk is buffered until a block fills) — that's
-    /// normal, not an error.
+    /// Feed one encoder chunk into a streamed AU, sealing slice-granularity blocks under
+    /// sentinel headers (see [`begin_streamed_frame_at`](Self::begin_streamed_frame_at)).
+    /// `slice_end` marks an encoder slice boundary — the flush points of the P2 slice pipeline
+    /// (with it false the legacy full-FEC-block granularity applies). The returned batch is
+    /// often EMPTY (the chunk is buffered until enough accumulates) — that's normal.
     pub fn seal_streamed_chunk(
         &mut self,
         au: &mut StreamedAu,
         chunk: &[u8],
+        slice_end: bool,
     ) -> Result<Vec<Vec<u8>>> {
         self.seal_run(false, |p, coder, emit| {
-            p.push_streamed(au, chunk, coder, emit)
+            p.push_streamed(au, chunk, slice_end, coder, emit)
         })
     }
 

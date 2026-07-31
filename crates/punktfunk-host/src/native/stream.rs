@@ -623,6 +623,7 @@ fn handle_chunk(
     session: &mut Session,
     open: &mut Option<StreamedOpen>,
     c: ChunkMsg,
+    slice_wire: bool,
     burst_cap: Option<usize>,
     pace_rate_bps: u64,
 ) -> Result<Option<(FrameMsg, PaceStat)>> {
@@ -635,9 +636,19 @@ fn handle_chunk(
                 "streamed AU abandoned mid-flight (encoder rebuild) — client ages it out"
             );
         }
+        // The AU's own flag bit is what switches the wire to slice-granularity blocks —
+        // set only toward a client that negotiated BOTH streamed AUs and multi-slice (the
+        // flag's contract in `punktfunk_core::packet`); without it the sealer stays on the
+        // legacy full-FEC-block shape shipped receivers require.
+        let flags = c.flags
+            | if slice_wire {
+                punktfunk_core::packet::USER_FLAG_SLICE_STREAM
+            } else {
+                0
+            };
         *open = Some(StreamedOpen {
             au: session
-                .begin_streamed_frame_at(c.capture_ns, c.flags, c.frame_index)
+                .begin_streamed_frame_at(c.capture_ns, flags, c.frame_index)
                 .map_err(|e| anyhow!("begin_streamed_frame: {e:?}"))?,
             spread_us: 0,
             paced: false,
@@ -648,8 +659,11 @@ fn handle_chunk(
             "streamed chunk without an open AU (encode-loop bug)"
         ));
     };
+    // Every ChunkMsg IS an encoder slice boundary (the chunked poll returns per-slice
+    // readbacks), so `slice_end` is unconditionally true — the AU's flag gates whether the
+    // sealer may actually cut a block there.
     let wires = session
-        .seal_streamed_chunk(&mut s.au, &c.data)
+        .seal_streamed_chunk(&mut s.au, &c.data, true)
         .map_err(|e| anyhow!("seal_streamed_chunk: {e:?}"))?;
     if !wires.is_empty() {
         let stat = pace_sealed(session, wires, c.deadline, burst_cap, pace_rate_bps)?;
@@ -743,6 +757,9 @@ fn send_loop(
     probe_result_tx: tokio::sync::mpsc::UnboundedSender<ProbeResult>,
     stop: Arc<AtomicBool>,
     perf: bool,
+    // Streamed AUs go out as slice-granularity blocks ([`USER_FLAG_SLICE_STREAM`]'s contract)
+    // instead of the legacy full-FEC-block shape.
+    slice_wire: bool,
     burst_cap: Option<usize>,
     fec_target: Arc<AtomicU8>,
     stats: SendStats,
@@ -822,9 +839,14 @@ fn send_loop(
                         pace_rate,
                     )
                     .map(|stat| Some((msg, stat))),
-                    SendMsg::Chunk(c) => {
-                        handle_chunk(&mut session, &mut streamed, c, burst_cap, pace_rate)
-                    }
+                    SendMsg::Chunk(c) => handle_chunk(
+                        &mut session,
+                        &mut streamed,
+                        c,
+                        slice_wire,
+                        burst_cap,
+                        pace_rate,
+                    ),
                 };
                 match outcome {
                     // Mid-AU chunk: sealed + on the wire; the per-AU accounting runs at `last`.
@@ -1384,8 +1406,9 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
         cursor_client_draws,
         probe_seq,
         streamed_au,
-        // Already folded into `plan.max_slices` by the resolve above — nothing below reads it.
-        multi_slice: _,
+        // Folded into `plan.max_slices` by the resolve above; ALSO gates the slice-granularity
+        // streamed wire below.
+        multi_slice,
         stats,
         client_label,
         client_name,
@@ -1411,6 +1434,13 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
     // reverts to whole-AU sends without touching the encoder's slicing knobs). The third gate —
     // whether the ENCODER actually chunks — is dynamic (`supports_chunked_poll`, per AU).
     let streamed_wire = streamed_au && std::env::var("PUNKTFUNK_STREAMED_AU").as_deref() != Ok("0");
+    // Slice-granularity streamed blocks (P2): needs the streamed wire AND the client's
+    // multi-slice tolerance (the slices only exist when the encoder splits the frame, which
+    // `plan.max_slices` already keyed off the same cap). `PUNKTFUNK_SLICE_STREAM=0` pins the
+    // legacy block granularity for A/B without touching slicing or the streamed wire.
+    let slice_wire = streamed_wire
+        && multi_slice
+        && std::env::var("PUNKTFUNK_SLICE_STREAM").as_deref() != Ok("0");
     // Cursor-forward state (M2): shape-serial diffing + the per-tick 0xD0 state send. The
     // encoder was told not to blend (SessionPlan above), so from the first frame the client's
     // locally-drawn cursor is the only one.
@@ -1729,6 +1759,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                     probe_result_tx,
                     stop,
                     perf,
+                    slice_wire,
                     burst_cap,
                     fec_target,
                     send_stats,

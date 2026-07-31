@@ -53,6 +53,12 @@ struct BlockState {
     /// against every packet of the block.
     data_shards: usize,
     recovery_shards: usize,
+    /// The block's base offset in SHARD units — where its data shards land in the frame buffer.
+    /// Uniform (legacy) frames: `block_index × max_data_shards`. Slice-streamed frames
+    /// ([`USER_FLAG_SLICE_STREAM`]): sentinels carry it on the wire (`frame_bytes ÷
+    /// shard_bytes`), the final block derives it from the totals
+    /// (`total_data − final_data_shards`).
+    base_shard: usize,
     /// Per-data-shard presence: which ranges of the frame buffer hold received bytes (also the
     /// FEC input map — the codec reads only present slots).
     have_data: Vec<bool>,
@@ -296,13 +302,36 @@ impl Reassembler {
         // and no total to lie about. The frame-wide exact check runs retroactively the moment
         // the final block's real totals arrive (the pinning arm below).
         let sentinel = block_count == 0;
+        // Slice-streamed frames (the P2 pipeline): variable-size, base-addressed blocks — the
+        // uniform-geometry rules below don't apply to ANY of their blocks (see
+        // [`USER_FLAG_SLICE_STREAM`]). Flagged on every packet because reorder can deliver the
+        // final block first.
+        let slice_stream = hdr.user_flags & crate::packet::USER_FLAG_SLICE_STREAM != 0;
         let block_idx = hdr.block_index as usize;
         // For a sentinel-opened frame the buffer must hold ANY final geometry the totals may
         // later pin — the maximum the negotiated limits allow (the design's "allocate at
         // max_frame_bytes"; the existing in-flight budget bounds the amplification).
         let total_data_max = lim.max_frame_bytes.div_ceil(shard_bytes).max(1);
+        // The slice pipeline's per-frame block ceiling: every non-final slice block carries at
+        // least `min(MIN_STREAM_BLOCK_SHARDS, max_data_per_block)` data shards (the sender's
+        // flush floor, clamped by the block size), so a max-size frame bounds the block count
+        // (+ the final block and one rounding block). Mirrors `Packetizer::slice_block_cap`.
+        let slice_block_cap = total_data_max
+            / super::packetize::MIN_STREAM_BLOCK_SHARDS.min(lim.max_data_shards.max(1))
+            + 2;
         let total_data = frame_bytes.div_ceil(shard_bytes).max(1);
-        if sentinel {
+        if sentinel && slice_stream {
+            // Slice-granularity sentinel: `frame_bytes` is the block's BASE byte offset —
+            // shard-aligned by contract, and the block's whole range must fit the negotiated
+            // frame budget (placement re-checks against the live buffer too).
+            if frame_bytes % shard_bytes != 0
+                || frame_bytes + data_shards * shard_bytes > lim.max_frame_bytes
+                || block_idx + 1 >= slice_block_cap
+            {
+                drop(stats);
+                return Ok(None);
+            }
+        } else if sentinel {
             if frame_bytes != 0
                 || data_shards != lim.max_data_shards
                 || block_idx + 1 >= lim.max_blocks
@@ -311,28 +340,48 @@ impl Reassembler {
                 return Ok(None);
             }
         } else {
-            if block_count > lim.max_blocks || block_idx >= block_count {
+            let block_cap = if slice_stream {
+                slice_block_cap
+            } else {
+                lim.max_blocks
+            };
+            if block_count > block_cap || block_idx >= block_count {
                 drop(stats);
                 return Ok(None);
             }
-            // Derived-geometry firewall: every sender (our Packetizer, any version) slices a
-            // frame into consecutive blocks of exactly `max_data_per_block` data shards with
-            // only the LAST block smaller, and stamps the exact `frame_bytes` in every
-            // non-sentinel header. That makes every data shard's final AU offset computable on
-            // arrival —
-            //     offset = (block_index × max_data_per_block + shard_index) × shard_bytes
-            // — which is what lets shards land straight in the frame buffer below. Enforce the
-            // invariant so a header lying about its geometry is dropped instead of scribbling
-            // into another shard's range.
-            let expect_blocks = total_data.div_ceil(lim.max_data_shards).max(1);
-            let expect_data_shards = if block_idx + 1 == expect_blocks {
-                total_data - (expect_blocks - 1) * lim.max_data_shards
+            if slice_stream {
+                // Slice-streamed frames: the earlier blocks are variable-size, so the uniform
+                // derivation below is meaningless — only the FINAL block is ever non-sentinel,
+                // and its geometry must be self-consistent: it IS the last block, its K fits
+                // the negotiated block size, and its shards fit inside the frame (its base
+                // derives as `total_data − data_shards`).
+                if block_idx + 1 != block_count
+                    || data_shards > lim.max_data_shards
+                    || data_shards > total_data
+                {
+                    drop(stats);
+                    return Ok(None);
+                }
             } else {
-                lim.max_data_shards
-            };
-            if block_count != expect_blocks || data_shards != expect_data_shards {
-                drop(stats);
-                return Ok(None);
+                // Derived-geometry firewall: every sender (our Packetizer, any version) slices
+                // a frame into consecutive blocks of exactly `max_data_per_block` data shards
+                // with only the LAST block smaller, and stamps the exact `frame_bytes` in every
+                // non-sentinel header. That makes every data shard's final AU offset computable
+                // on arrival —
+                //     offset = (block_index × max_data_per_block + shard_index) × shard_bytes
+                // — which is what lets shards land straight in the frame buffer below. Enforce
+                // the invariant so a header lying about its geometry is dropped instead of
+                // scribbling into another shard's range.
+                let expect_blocks = total_data.div_ceil(lim.max_data_shards).max(1);
+                let expect_data_shards = if block_idx + 1 == expect_blocks {
+                    total_data - (expect_blocks - 1) * lim.max_data_shards
+                } else {
+                    lim.max_data_shards
+                };
+                if block_count != expect_blocks || data_shards != expect_data_shards {
+                    drop(stats);
+                    return Ok(None);
+                }
             }
         }
         let body = &pkt[HEADER_LEN..HEADER_LEN + shard_bytes];
@@ -399,7 +448,9 @@ impl Reassembler {
                 }
                 *in_flight_bytes += buf_len;
                 e.insert(FrameBuf {
-                    frame_bytes,
+                    // A slice-stream sentinel's `frame_bytes` is its block's BASE offset, not a
+                    // frame size — the unpinned marker stays 0 until the final block's totals.
+                    frame_bytes: if sentinel { 0 } else { frame_bytes },
                     block_count,
                     pts_ns: hdr.pts_ns,
                     user_flags: hdr.user_flags,
@@ -409,6 +460,13 @@ impl Reassembler {
                 })
             }
         };
+        // The slice marker must be frame-consistent: a mixed frame would firewall under one
+        // placement rule and place under the other. The per-packet checks above and the
+        // placement bounds guard below stay memory-safe without this — it's the tighter drop.
+        if (frame.user_flags ^ hdr.user_flags) & crate::packet::USER_FLAG_SLICE_STREAM != 0 {
+            drop(stats);
+            return Ok(None);
+        }
         if sentinel {
             // Sentinel packets carry no totals to cross-check: while the frame is unpinned
             // (`block_count == 0`) they match by construction, and once the totals are pinned —
@@ -417,9 +475,26 @@ impl Reassembler {
             // enforced by the firewall, which is exactly what the pinned geometry demands of
             // every non-final block, and its shard offsets are within the pinned range by
             // `block_idx + 1 < block_count`.
-            if frame.block_count != 0 && block_idx + 1 >= frame.block_count {
-                drop(stats);
-                return Ok(None);
+            if frame.block_count != 0 {
+                if block_idx + 1 >= frame.block_count {
+                    drop(stats);
+                    return Ok(None);
+                }
+                if slice_stream {
+                    // The final block pinned the totals, so it exists in `blocks` (the pinning
+                    // packet created it) — a sentinel arriving after the pin must fit strictly
+                    // below its base or it could scribble over the final block's landed shards.
+                    let final_k = frame
+                        .blocks
+                        .get(&((frame.block_count - 1) as u16))
+                        .map(|b| b.data_shards)
+                        .unwrap_or(0);
+                    let pinned_total = frame.frame_bytes.div_ceil(shard_bytes).max(1);
+                    if frame_bytes / shard_bytes + data_shards > pinned_total - final_k {
+                        drop(stats);
+                        return Ok(None);
+                    }
+                }
             }
         } else if frame.block_count == 0 {
             // A streamed frame meets its FINAL block's real totals: retro-validate every block
@@ -429,14 +504,28 @@ impl Reassembler {
             // out of range or not full-K — kills the WHOLE frame: its landed shards can't be
             // trusted to be at the offsets this geometry means, so delivering any of it would
             // hand the decoder spliced bytes.
-            let expect_blocks = total_data.div_ceil(lim.max_data_shards).max(1);
-            let final_k = total_data - (expect_blocks - 1) * lim.max_data_shards;
-            let lied = frame.blocks.iter().any(|(&bi, b)| {
-                let bi = bi as usize;
-                bi >= expect_blocks
-                    || (bi + 1 < expect_blocks && b.data_shards != lim.max_data_shards)
-                    || (bi + 1 == expect_blocks && b.data_shards != final_k)
-            });
+            let lied = if slice_stream {
+                // Slice frames have no uniform shape to demand — the invariant is positional:
+                // every sentinel block must sit strictly below the final block's base
+                // (`total_data − data_shards`; the firewall already proved the subtraction
+                // safe) and be a non-final index. Sentinel-vs-sentinel overlap is not policed —
+                // the sender is AEAD-authenticated, so a lying base can only corrupt this
+                // frame's own pixels, never memory (placement stays in-bounds by these checks).
+                let final_base = total_data - data_shards;
+                frame.blocks.iter().any(|(&bi, b)| {
+                    let bi = bi as usize;
+                    bi + 1 >= block_count || b.base_shard + b.data_shards > final_base
+                })
+            } else {
+                let expect_blocks = total_data.div_ceil(lim.max_data_shards).max(1);
+                let final_k = total_data - (expect_blocks - 1) * lim.max_data_shards;
+                frame.blocks.iter().any(|(&bi, b)| {
+                    let bi = bi as usize;
+                    bi >= expect_blocks
+                        || (bi + 1 < expect_blocks && b.data_shards != lim.max_data_shards)
+                        || (bi + 1 == expect_blocks && b.data_shards != final_k)
+                })
+            };
             if lied {
                 let mut f = win
                     .frames
@@ -483,9 +572,19 @@ impl Reassembler {
         // First packet of a block sizes its state; `data_shards` is already pinned by the
         // derived geometry above, but `recovery_shards` is per-block wire input (adaptive FEC
         // varies it per frame) — later packets must match the block's first.
+        let base_shard = if slice_stream {
+            if sentinel {
+                frame_bytes / shard_bytes // the sentinel's wire base (firewall: shard-aligned)
+            } else {
+                total_data - data_shards // the final block sits at the end of the frame
+            }
+        } else {
+            block_idx * lim.max_data_shards
+        };
         let block = blocks.entry(hdr.block_index).or_insert_with(|| BlockState {
             data_shards,
             recovery_shards,
+            base_shard,
             have_data: vec![false; data_shards],
             data_received: 0,
             recovery: vec![None; recovery_shards],
@@ -494,6 +593,13 @@ impl Reassembler {
             reconstructed: false,
         });
         if block.recovery_shards != recovery_shards {
+            drop(stats);
+            return Ok(None);
+        }
+        // A slice-stream block's base is per-block wire input like `recovery_shards` — later
+        // packets must agree with the block's first, or two packets of "one" block would place
+        // their shards at different frame offsets.
+        if block.base_shard != base_shard {
             drop(stats);
             return Ok(None);
         }
@@ -525,7 +631,13 @@ impl Reassembler {
             // A data shard lands at its final AU offset — the only copy its bytes ever make
             // past decrypt.
             if !block.have_data[shard_index] {
-                let off = (block_idx * lim.max_data_shards + shard_index) * shard_bytes;
+                let off = (block.base_shard + shard_index) * shard_bytes;
+                // The firewall + pin checks keep every accepted base in range; this guard is
+                // the same future-refactor insurance as the `data_shards` check above.
+                if off + shard_bytes > buf.len() {
+                    drop(stats);
+                    return Ok(None);
+                }
                 buf[off..off + shard_bytes].copy_from_slice(body);
                 block.have_data[shard_index] = true;
                 block.data_received += 1;
@@ -547,7 +659,7 @@ impl Reassembler {
             let outcome = if missing == 0 {
                 Ok(()) // every original arrived — its bytes are already in place
             } else {
-                let base = block_idx * lim.max_data_shards * shard_bytes;
+                let base = block.base_shard * shard_bytes;
                 let region = &mut buf[base..base + block.data_shards * shard_bytes];
                 let mut slots: Vec<&mut [u8]> = region.chunks_mut(shard_bytes).collect();
                 let parity: Vec<(usize, &[u8])> = block
