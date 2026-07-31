@@ -105,8 +105,20 @@ internal suspend fun PointerInputScope.streamTouchPassthrough(handle: Long, styl
                                 NativeBridge.nativeSendTouch(handle, it, 2, 0, 0, sw, sh)
                             }
                         c.positionChanged() ->
-                            ids[c.id]?.let {
-                                NativeBridge.nativeSendTouch(handle, it, 1, x, y, sw, sh)
+                            ids[c.id]?.let { id ->
+                                // Batched MotionEvents coalesce intermediate points into the
+                                // historical list — forward them in order so a fast swipe keeps
+                                // its real curvature on the host (usually empty during a stream:
+                                // unbuffered dispatch is requested, so this costs nothing).
+                                for (hs in c.historical) {
+                                    NativeBridge.nativeSendTouch(
+                                        handle, id, 1,
+                                        hs.position.x.roundToInt().coerceIn(0, sw - 1),
+                                        hs.position.y.roundToInt().coerceIn(0, sh - 1),
+                                        sw, sh,
+                                    )
+                                }
+                                NativeBridge.nativeSendTouch(handle, id, 1, x, y, sw, sh)
                             }
                     }
                     c.consume()
@@ -289,7 +301,10 @@ internal suspend fun PointerInputScope.streamTouchInput(
                         accY -= outY
                     }
                 } else {
-                    moveAbs(p.position.x, p.position.y) // direct: cursor follows the finger
+                    // Direct: cursor follows the finger — historical points first (batched
+                    // MotionEvent samples), so the host cursor traces the finger's real path.
+                    for (hs in p.historical) moveAbs(hs.position.x, hs.position.y)
+                    moveAbs(p.position.x, p.position.y)
                 }
             }
             ev.changes.forEach { it.consume() }
