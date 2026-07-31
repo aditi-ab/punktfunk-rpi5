@@ -105,12 +105,16 @@ fn recv_batch_x(
     let mut msgs: Vec<MsghdrX> = iovs
         .iter_mut()
         .map(|iov| {
+            // SAFETY: MsghdrX is a plain-old-data libc-style struct; all-zeroes is its
+            // documented "no ancillary data, no name" initial state.
             let mut m: MsghdrX = unsafe { std::mem::zeroed() };
             m.msg_iov = iov as *mut libc::iovec;
             m.msg_iovlen = 1;
             m
         })
         .collect();
+    // SAFETY: `fd` is a live socket owned by `t`; `msgs` holds `n_bufs` initialized headers
+    // whose iovecs point into `out`'s live buffers — both outlive the call.
     let n = unsafe {
         recvmsg_x(
             fd,
@@ -152,6 +156,8 @@ pub(super) fn recv_batch(
     let mut got = 0usize;
     while got < n_bufs {
         let buf = &mut out[got];
+        // SAFETY: `fd` is a live socket owned by `t`; `buf` is a live mutable buffer whose
+        // pointer/len pair is valid for writes for the duration of the call.
         let r = unsafe {
             libc::recv(
                 fd,
