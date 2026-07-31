@@ -496,12 +496,30 @@ mod pump_tests {
         start_tuned(fail_first, false, Duration::ZERO)
     }
 
-    /// The budget has to clear `backoff_start` (2 s) with room to spare: a reopen test that
-    /// waits exactly as long as the backoff it is waiting for fails whenever the machine is
-    /// busy or the binary is cold, which is precisely what CI is.
     fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
         for _ in 0..600 {
             if cond() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("timed out waiting for: {what}");
+    }
+
+    /// Keep a live uplink running until audio reaches the backend.
+    ///
+    /// A single frame is NOT enough to prove a reopen recovered: a freshly opened backend
+    /// deliberately drops whatever queued while it was down (the `try_recv` drain after the
+    /// open — that audio predates the device), and `opens` counts from the START of the open,
+    /// so a frame sent the moment the counter moves lands inside that drain and is discarded
+    /// by design. A real uplink keeps sending, so the test does too. The sequence has to keep
+    /// advancing or the de-jitter reads the repeats as duplicates and drops them.
+    fn wait_until_pushed(what: &str, h: &Harness, from_seq: u32) {
+        let mut seq = from_seq;
+        for _ in 0..600 {
+            let _ = h.tx.try_send(mic_frame(seq));
+            seq = seq.wrapping_add(1);
+            if h.pushed.load(Ordering::SeqCst) > 0 {
                 return;
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -582,8 +600,7 @@ mod pump_tests {
             .store(false, Ordering::Release);
         h.tx.send(mic_frame(0)).unwrap(); // push sees death → reopen
         wait_until("reopen", || h.opens.load(Ordering::SeqCst) >= 2);
-        h.tx.send(mic_frame(1)).unwrap();
-        wait_until("pcm after reopen", || h.pushed.load(Ordering::SeqCst) > 0);
+        wait_until_pushed("pcm after reopen", &h, 1);
         drop(h.tx);
         h.join.join().unwrap();
     }
