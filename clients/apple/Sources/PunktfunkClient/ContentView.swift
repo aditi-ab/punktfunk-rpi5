@@ -315,7 +315,15 @@ struct ContentView: View {
             clipboardAvailable: model.connection?.hostSupportsClipboard == true,
             clipboardOn: model.clipboardEnabled,
             toggleClipboard: { model.toggleClipboardSync() },
+            micAvailable: model.micAvailable,
+            micMuted: model.micMuted,
+            toggleMicMute: { model.toggleMicMute() },
             disconnect: { model.disconnect() }))
+        // ⌃⌥⇧A fired while input was CAPTURED (InputCapture's chord path posts it — the menu's
+        // identical equivalent can't reach a captured stream). Same toggle either way.
+        .onReceive(NotificationCenter.default.publisher(for: .punktfunkToggleMicMute)) { _ in
+            model.toggleMicMute()
+        }
         #endif
         #if os(macOS)
         // Fullscreen only while a session is up (incl. the trust prompt over the blurred stream),
@@ -724,31 +732,48 @@ struct ContentView: View {
                     }
                     .animation(.smooth(duration: 0.28), value: statsVerbosity)
                 }
-                #if os(macOS) || os(tvOS)
-                // The start-of-stream shortcut banner (Windows-client parity): the platform's
-                // reserved controls on a glass pill, bottom-centre, for the first 6 seconds of
-                // every session — independent of the stats HUD, so the keys are discoverable
-                // even with statistics off. The banner's own task drops it (cancelled cleanly
-                // if the session view goes away first). On tvOS it carries the ONLY exits —
-                // Menu/B is swallowed during a session (the `.onExitCommand {}` in the tvOS
-                // session branch), so the hold gestures must be told to the user.
+                // The bottom-centre stack: the muted-microphone badge over the start-of-stream
+                // shortcut banner. ONE overlay for both, so the two can never land on top of each
+                // other in the seconds where they overlap.
                 .overlay(alignment: .bottom) {
-                    if captureEnabled && showShortcutHint {
-                        Text(Self.shortcutHintText)
-                            .font(.geist(Self.shortcutHintFont, relativeTo: .caption))
-                            .foregroundStyle(.secondary)
-                            .padding(.horizontal, 14)
-                            .padding(.vertical, 8)
-                            .glassBackground(Capsule())
-                            .padding(.bottom, 24)
-                            .transition(.opacity)
-                            .task {
-                                try? await Task.sleep(for: .seconds(6))
-                                withAnimation(.easeOut(duration: 0.6)) { showShortcutHint = false }
-                            }
+                    VStack(spacing: 8) {
+                        #if !os(tvOS)
+                        // Shown for as long as the mic is muted, at every stats tier and with the
+                        // overlay off — see MicMutedBadge. tvOS has no microphone to mute.
+                        if captureEnabled && model.micMuted {
+                            MicMutedBadge { model.setMicMuted(false) }
+                                .transition(.opacity.combined(with: .scale(scale: 0.9)))
+                        }
+                        #endif
+                        #if os(macOS) || os(tvOS)
+                        // The start-of-stream shortcut banner (Windows-client parity): the
+                        // platform's reserved controls on a glass pill for the first 6 seconds of
+                        // every session — independent of the stats HUD, so the keys are
+                        // discoverable even with statistics off. The banner's own task drops it
+                        // (cancelled cleanly if the session view goes away first). On tvOS it
+                        // carries the ONLY exits — Menu/B is swallowed during a session (the
+                        // `.onExitCommand {}` in the tvOS session branch), so the hold gestures
+                        // must be told to the user.
+                        if captureEnabled && showShortcutHint {
+                            Text(shortcutHintText)
+                                .font(.geist(Self.shortcutHintFont, relativeTo: .caption))
+                                .foregroundStyle(.secondary)
+                                .padding(.horizontal, 14)
+                                .padding(.vertical, 8)
+                                .glassBackground(Capsule())
+                                .transition(.opacity)
+                                .task {
+                                    try? await Task.sleep(for: .seconds(6))
+                                    withAnimation(.easeOut(duration: 0.6)) {
+                                        showShortcutHint = false
+                                    }
+                                }
+                        }
+                        #endif
                     }
+                    .padding(.bottom, 24)
+                    .animation(.easeOut(duration: 0.2), value: model.micMuted)
                 }
-                #endif
                 #if os(iOS)
                 // Touch users have no menu / ⌘D, so when the HUD's Disconnect button isn't on
                 // screen — the overlay off, or the compact pill (which carries no button) —
@@ -766,21 +791,24 @@ struct ContentView: View {
                 .overlay(alignment: .topLeading) {
                     if captureEnabled,
                        statsVerbosity == .compact || (statsVerbosity == .off && showTouchExit) {
-                        Button { model.disconnect() } label: {
-                            Image(systemName: "xmark")
-                                .font(.headline.weight(.semibold))
-                                .frame(width: 36, height: 36)
-                                // Floating glass disc over the frame (26+, material fallback).
-                                // interactive: the disc IS the tap target, so the glass reacts
-                                // to press.
-                                .glassBackground(Circle(), interactive: true)
-                                // Match the hit region to the visible disc so every tap also
-                                // triggers the interactive-glass press highlight.
-                                .contentShape(Circle())
+                        HStack(spacing: 10) {
+                            Button { model.disconnect() } label: { touchDisc("xmark") }
+                                .buttonStyle(.plain)
+                                .accessibilityLabel("Disconnect")
+                            // The mic toggle rides the same discs, for the same reason: in these
+                            // tiers the HUD carries no buttons (compact is a stat pill, off is
+                            // nothing), so this is a touch-only user's ONLY way to mute. Absent —
+                            // not greyed — when the session sends no microphone at all.
+                            if model.micAvailable {
+                                Button { model.toggleMicMute() } label: {
+                                    touchDisc(model.micMuted ? "mic.slash.fill" : "mic.fill")
+                                }
+                                .buttonStyle(.plain)
+                                .accessibilityLabel(
+                                    model.micMuted ? "Unmute microphone" : "Mute microphone")
+                            }
                         }
-                        .buttonStyle(.plain)
                         .padding(12)
-                        .accessibilityLabel("Disconnect")
                         .transition(.opacity)
                         .task {
                             guard statsVerbosity == .off else { return }
@@ -794,14 +822,34 @@ struct ContentView: View {
         }
     }
 
+    #if os(iOS)
+    /// One touch-control disc: an SF Symbol on a floating glass disc over the frame (26+,
+    /// material fallback), sized as a comfortable tap target. `interactive`: the disc IS the tap
+    /// target, so the glass reacts to press, and the hit region is matched to the visible disc so
+    /// every tap triggers that press highlight.
+    private func touchDisc(_ symbol: String) -> some View {
+        Image(systemName: symbol)
+            .font(.headline.weight(.semibold))
+            .frame(width: 36, height: 36)
+            .glassBackground(Circle(), interactive: true)
+            .contentShape(Circle())
+    }
+    #endif
+
     #if os(macOS)
-    private static let shortcutHintText =
-        "Click the stream to capture · ⌃⌥⇧Q releases the mouse · ⌃⌥⇧D disconnects · ⌃⌥⇧S stats"
+    /// The reserved combos, told once per session. The mute segment appears only when the session
+    /// actually sends a microphone — teaching a shortcut for a mic that isn't on would be a lie.
+    private var shortcutHintText: String {
+        let base =
+            "Click the stream to capture · ⌃⌥⇧Q releases the mouse · ⌃⌥⇧D disconnects · ⌃⌥⇧S stats"
+        return model.micAvailable ? base + " · ⌃⌥⇧A mutes the mic" : base
+    }
     private static let shortcutHintFont: CGFloat = 12
     #elseif os(tvOS)
-    private static let shortcutHintText =
+    private var shortcutHintText: String {
         "Hold the remote's Back button — or L1+R1+Start+Select on a controller — to disconnect"
         + " · Touch surface moves the pointer · press clicks · Play/Pause right-clicks"
+    }
     private static let shortcutHintFont: CGFloat = 22 // read from the couch
     #endif
 

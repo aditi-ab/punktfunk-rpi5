@@ -200,6 +200,12 @@ extension Notification.Name {
     /// state. macOS only.
     public static let punktfunkToggleFullscreen = Notification.Name("io.unom.punktfunk.toggle-fullscreen")
 
+    /// Posted by InputCapture's chord path (⌃⌥⇧A) when the combo fires while input is CAPTURED —
+    /// the state in which the Stream menu's identical key equivalent never reaches the app. The
+    /// live session's owner (ContentView) flips the session's mic mute. Released, the menu item
+    /// handles the same combo directly; both end at `SessionModel.toggleMicMute`.
+    public static let punktfunkToggleMicMute = Notification.Name("io.unom.punktfunk.toggle-mic-mute")
+
     /// Posted by the Live Activity's / Shortcuts' End-stream intent (`EndStreamIntent.perform`,
     /// which runs in the app's process): the app tears the active session down deliberately
     /// (quit-close the host). Same cross-process-signal pattern as `punktfunkReleaseCapture` —

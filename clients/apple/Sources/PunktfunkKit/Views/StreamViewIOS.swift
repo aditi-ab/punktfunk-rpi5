@@ -424,6 +424,12 @@ public final class StreamViewController: StreamViewControllerBase {
         capture.onReleaseCapture = { [weak self] in
             self?.setCaptured(false)
         }
+        // ⌃⌥⇧A mutes/unmutes the mic uplink. Session state this controller doesn't own, so it
+        // posts to the app exactly as the macOS chord does — the Stream menu's identical
+        // equivalent (which a captured scene swallows) ends at the same toggle.
+        capture.onToggleMicMute = {
+            NotificationCenter.default.post(name: .punktfunkToggleMicMute, object: nil)
+        }
         capture.onPreempted = { [weak self] in
             self?.setCaptured(false)
         }
