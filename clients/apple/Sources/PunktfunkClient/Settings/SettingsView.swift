@@ -65,6 +65,7 @@ struct SettingsView: View {
     @AppStorage(DefaultsKey.libraryEnabled) var libraryEnabled = true
     @AppStorage(DefaultsKey.fullscreenWhileStreaming) var fullscreenWhileStreaming = true
     @AppStorage(DefaultsKey.micEnabled) var micEnabled = true
+    @AppStorage(DefaultsKey.echoCancel) var echoCancel = true
     @AppStorage(DefaultsKey.audioChannels) var audioChannels = 2
     @AppStorage(DefaultsKey.codec) var codec = "auto"
     // The overlay tier's raw string (the pickers tag by rawValue); the absent-key default runs
