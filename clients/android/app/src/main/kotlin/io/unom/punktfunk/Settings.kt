@@ -1,6 +1,7 @@
 package io.unom.punktfunk
 
 import android.content.Context
+import android.hardware.display.DisplayManager
 import android.os.Build
 import android.util.Log
 import android.view.Display
@@ -320,13 +321,30 @@ class SettingsStore(context: Context) {
 }
 
 /**
+ * The display to probe for capability/mode queries: the context's own display when it is already
+ * associated with one, else the DEFAULT display via [DisplayManager]. A `punktfunk://` deep-link
+ * COLD start can reach the connect before the activity is attached to its display —
+ * `context.display` then throws, and the old `false`/1080p60 fallbacks silently downgraded the
+ * whole session (no HDR advertised / non-native mode) with nothing in the log. The default
+ * display IS the panel on phones and TVs; the activity-display distinction only matters on
+ * multi-display setups, where the attached path still wins whenever it is available.
+ */
+private fun probeDisplay(context: Context): Display? =
+    runCatching { context.display }.getOrNull()
+        ?: runCatching {
+            context.getSystemService(DisplayManager::class.java)
+                ?.getDisplay(Display.DEFAULT_DISPLAY)
+        }.getOrNull().also {
+            if (it != null) Log.i("punktfunk", "display probe: context unattached — using DEFAULT_DISPLAY")
+        }
+
+/**
  * The device's native display mode as a landscape `(width, height, hz)` — the long edge is the
- * width, since we stream a desktop. Falls back to 1920×1080@60 if the display can't be read.
- * [context] must be a visual (Activity) context.
+ * width, since we stream a desktop. Falls back to 1920×1080@60 if no display can be read at all
+ * (see [probeDisplay] for the cold-start fallback that makes that a last resort).
  */
 fun nativeDisplayMode(context: Context): Triple<Int, Int, Int> {
-    // getDisplay() throws on a non-visual context rather than returning null — guard it.
-    val display = runCatching { context.display }.getOrNull() ?: return Triple(1920, 1080, 60)
+    val display = probeDisplay(context) ?: return Triple(1920, 1080, 60)
     val mode = display.mode
     val w = mode.physicalWidth
     val h = mode.physicalHeight
@@ -341,7 +359,12 @@ fun nativeDisplayMode(context: Context): Triple<Int, Int, Int> {
  * capability gate the Apple/Windows clients apply.
  */
 fun displaySupportsHdr(context: Context): Boolean {
-    val display = runCatching { context.display }.getOrNull() ?: return false
+    val display = probeDisplay(context)
+    if (display == null) {
+        // Distinguishable from a real SDR verdict — a silent `false` here cost an HDR session.
+        Log.w("punktfunk", "display HDR probe: no display reachable — advertising SDR")
+        return false
+    }
     val types = buildSet {
         // API 34+: the sanctioned per-mode query (Display.Mode.getSupportedHdrTypes). The
         // deprecated Display-level hdrCapabilities can return EMPTY on Android 14+ devices
