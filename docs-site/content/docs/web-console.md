@@ -5,7 +5,7 @@ description: Enable the Punktfunk browser console, read or change its login pass
 
 The web console is the browser UI for a Punktfunk host — live status, pairing, display policy, the
 game library, logs, plugins and host updates. It ships as the **`punktfunk-web`** systemd user unit
-on Linux and the **`PunktfunkWeb`** task on Windows, and serves on **`https://<host-ip>:47992`**
+on Linux and runs under the **Punktfunk Host service** on Windows, and serves on **`https://<host-ip>:47992`**
 (HTTPS with the host's own self-signed identity cert — your browser warns once; trust it and
 continue). It's the surface you expose on the LAN to administer the host; the host's own management
 API (47990) keeps every admin action loopback-only and off-loopback serves only read-only status +
@@ -36,8 +36,9 @@ game-library browsing to paired clients.
   systemctl --user enable --now punktfunk-web
   ```
 
-- **Windows host:** the installer sets up the console, its runtime, and the `PunktfunkWeb` task and
-  starts it at boot. There is nothing to enable — open `https://<this-PC>:47992`.
+- **Windows host:** the installer sets up the console and its runtime; the Punktfunk Host service
+  runs it and automatically brings it back if it ever stops. There is nothing to enable — open
+  `https://<this-PC>:47992`.
 
 - **SteamOS host:** the install script builds and starts the console as a user service for you. It
   prints the URL when it finishes.
@@ -71,11 +72,11 @@ Edit that file and `systemctl --user restart punktfunk-web` to change it.
 **Windows host.** You choose the password during install — a secure random default is pre-filled and
 shown again on the installer's final page. It's stored in `%ProgramData%\punktfunk\web-password` (as
 `PUNKTFUNK_UI_PASSWORD=…`), readable only by Administrators and SYSTEM. To change it, edit the file
-and restart the task in an **elevated** PowerShell:
+and restart the Punktfunk Host service (which runs the console) in an **elevated** PowerShell:
 
 ```powershell
 notepad "$env:ProgramData\punktfunk\web-password"   # set PUNKTFUNK_UI_PASSWORD=<your-password>
-schtasks /End /TN PunktfunkWeb; schtasks /Run /TN PunktfunkWeb
+punktfunk-host service restart
 ```
 
 Forgot it? See [Forgot your Password?](/docs/forgot-password).

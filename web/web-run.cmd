@@ -1,14 +1,13 @@
 @echo off
-rem punktfunk web console launcher - DEV layout (in-repo tree). The PunktfunkWeb scheduled task
-rem (boot trigger, SYSTEM, restart-on-failure) runs this at startup. It sources the host's mgmt bearer
-rem token + the console login password from %ProgramData%\punktfunk\, points the /api proxy at the
-rem host's loopback HTTPS mgmt API, and serves the self-contained (no-node_modules) Nitro console over
-rem HTTPS (HTTP/1.1 over TLS) on :47992 with the host's identity cert. %~dp0 = <repo>\web\ .
-rem
-rem DEV vs the installed launcher (scripts\windows\web-run.cmd): the dev host service runs from
-rem target\release (not the installed {app} tree), so this runs the in-repo web\.output. The console
-rem now runs on bun (the Nitro `bun` preset + Bun.serve TLS entry), so set BUN
-rem below to your bun.exe. Rebuild after a web change with `bun run build` in web\ ; no edit needed.
+rem punktfunk web console launcher - DEV convenience, run BY HAND (in-repo tree). On an installed
+rem host the PunktfunkHost service supervises the console itself (service.rs "web console child" -
+rem no scheduled task, no launcher script); a dev host running from target\release has no installed
+rem web payload next to its exe, so this script is how you serve the in-repo web\.output against it.
+rem It sources the host's mgmt bearer token + the console login password from %ProgramData%\punktfunk\,
+rem points the /api proxy at the host's loopback HTTPS mgmt API, and serves the self-contained
+rem (no-node_modules) Nitro console over HTTPS (HTTP/1.1 over TLS) on :47992 with the host's identity
+rem cert. %~dp0 = <repo>\web\ . The console runs on bun (the Nitro `bun` preset + Bun.serve TLS
+rem entry) - set BUN below to your bun.exe. Rebuild after a web change with `bun run build` in web\ .
 setlocal EnableExtensions
 
 set "PFDATA=%ProgramData%\punktfunk"
@@ -18,9 +17,8 @@ set "CERTFILE=%PFDATA%\cert.pem"
 set "KEYFILE=%PFDATA%\key.pem"
 
 rem The host's `serve` writes the mgmt token + identity cert on first run. Until they exist the proxy
-rem has no credential and no TLS material, so WAIT for them (mirrors the installed launcher) rather
-rem than silently serving plain HTTP - see scripts\windows\web-run.cmd for why waiting here beats
-rem exiting 1 and relying on the task's restart-on-failure. ~5 min at 2 s, then give up.
+rem has no credential and no TLS material, so WAIT for them (mirrors the service supervisor's gate)
+rem rather than silently serving plain HTTP. ~5 min at 2 s, then give up.
 set /a PFWAITS=0
 :pfwait
 if exist "%TOKENFILE%" if exist "%CERTFILE%" goto pfready

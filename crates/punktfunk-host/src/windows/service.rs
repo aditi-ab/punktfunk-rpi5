@@ -10,6 +10,10 @@
 //! `CreateProcessAsUserW`s the host there. This is the Sunshine/Apollo model. The host captures the
 //! virtual display in-process via IDD direct-push (no helper process).
 //!
+//! The service also supervises a SECOND child: the web management console (bun/Nitro on :47992),
+//! spawned plainly into session 0 — see the "web console child" section below for why it is not a
+//! Task Scheduler task anymore.
+//!
 //! Subcommands (Windows only):
 //! ```text
 //!   punktfunk-host service run        SCM entry point (registered as binPath; not run by hand)
@@ -27,9 +31,9 @@
 use anyhow::{bail, Context, Result};
 use std::ffi::{c_void, OsString};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
@@ -45,14 +49,15 @@ use windows::Win32::Storage::FileSystem::{
 use windows::Win32::System::Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock};
 use windows::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
-    SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_BREAKAWAY_OK,
-    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT,
+    JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
 use windows::Win32::System::RemoteDesktop::WTSGetActiveConsoleSessionId;
 use windows::Win32::System::Threading::{
-    CreateEventW, CreateProcessAsUserW, GetCurrentProcess, OpenProcessToken, ResetEvent, SetEvent,
-    TerminateProcess, WaitForMultipleObjects, CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT,
-    INFINITE, PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOW,
+    CreateEventW, CreateProcessAsUserW, CreateProcessW, GetCurrentProcess, GetExitCodeProcess,
+    OpenProcessToken, ResetEvent, ResumeThread, SetEvent, TerminateProcess, WaitForMultipleObjects,
+    CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, INFINITE, PROCESS_INFORMATION,
+    STARTF_USESTDHANDLES, STARTUPINFOW,
 };
 
 /// SCM service name (the key under HKLM\SYSTEM\CurrentControlSet\Services). Stable identity.
@@ -318,7 +323,10 @@ fn run_service() -> Result<()> {
     status_handle
         .set_service_status(running.clone())
         .context("set RUNNING")?;
-    tracing::info!("punktfunk service started — supervising host in the active console session");
+    tracing::info!(
+        "punktfunk service started — supervising the host (active console session) and the web \
+         console (session 0)"
+    );
 
     // Best-effort: warn if this network is Public (streaming ports are firewalled off there unless
     // the operator opted in). Own thread — a slow `Get-NetConnectionProfile` never delays the host.
@@ -340,6 +348,9 @@ fn run_service() -> Result<()> {
 
 /// The supervision loop: (re)launch the host into the active console session and wait on
 /// [stop, session-change, child-exit], relaunching on child exit and on a console-session switch.
+/// The web-console child rides along in every wait (`WebSlot::wait`), so it is (re)started and
+/// reaped no matter which arm of the host state machine is currently blocking — without the host
+/// logic knowing it exists.
 fn supervise(stop: HANDLE, session_ev: HANDLE) -> Result<()> {
     let exe = std::env::current_exe().context("current_exe")?;
     let host_cmd = std::env::var("PUNKTFUNK_HOST_CMD").unwrap_or_else(|_| DEFAULT_HOST_CMD.into());
@@ -355,9 +366,11 @@ fn supervise(stop: HANDLE, session_ev: HANDLE) -> Result<()> {
     // Kill-on-close job so a service crash never orphans the SYSTEM host; BREAKAWAY_OK lets the host
     // still spawn the WGC helper. Owned: dropping it at function exit (KILL_ON_JOB_CLOSE) reaps any
     // straggler still inside it — no manual CloseHandle(job).
-    // SAFETY: `make_job` is unsafe only for its Win32 FFI; it has no caller preconditions and creates +
-    // immediately takes RAII ownership of the job object, so calling it here is sound.
-    let job = make_job().context("create job object")?;
+    let job = make_job(JOB_OBJECT_LIMIT_BREAKAWAY_OK).context("create job object")?;
+
+    // The web console child (session 0). Serviced transparently by every `web.wait` below, so it is
+    // supervised no matter where the host state machine is — including while no one is logged in.
+    let mut web = WebSlot::new(&exe);
 
     let mut restarts: u32 = 0;
     // One-shot latch for the update boot-loop rollback (plan U3.2) — a rollback that itself
@@ -372,8 +385,10 @@ fn supervise(stop: HANDLE, session_ev: HANDLE) -> Result<()> {
         let session = unsafe { WTSGetActiveConsoleSessionId() };
         if session == 0xFFFF_FFFF {
             // No interactive session yet (boot / fully logged out). Wait, but wake on stop/session.
+            // The web console keeps being supervised meanwhile (`web.wait`) — a headless box needs
+            // its management console precisely when no one is logged in.
             tracing::debug!("no active console session — waiting");
-            if wait_any(&[stop, session_ev], 3000) == Some(0) {
+            if web.wait(&[stop, session_ev], 3000) == Some(0) {
                 break;
             }
             // SAFETY: `session_ev` is the SESSION event HANDLE borrowed from the SESSION_EVENT OwnedHandle,
@@ -394,7 +409,7 @@ fn supervise(stop: HANDLE, session_ev: HANDLE) -> Result<()> {
                     session,
                     "failed to launch host into the active console session: {e:#}"
                 );
-                if wait_one(stop, 3000) {
+                if web.wait(&[stop], 3000).is_some() {
                     break;
                 }
                 continue;
@@ -408,8 +423,8 @@ fn supervise(stop: HANDLE, session_ev: HANDLE) -> Result<()> {
         // `break` — so every match arm below only stops/terminates and lets the drop do the closing.
         let proc_h = HANDLE(child.process.as_raw_handle());
 
-        // Wait on stop / session-change / child-exit.
-        let reason = wait_any(&[stop, session_ev, proc_h], INFINITE);
+        // Wait on stop / session-change / child-exit (web-console exits are absorbed by `web.wait`).
+        let reason = web.wait(&[stop, session_ev, proc_h], INFINITE);
         match reason {
             Some(0) => {
                 // Stop: terminate the child and exit (the `child` drop closes its handles).
@@ -443,7 +458,7 @@ fn supervise(stop: HANDLE, session_ev: HANDLE) -> Result<()> {
                     continue;
                 }
                 // Same session (e.g. a stray notification) — keep waiting on the same child.
-                let r = wait_any(&[stop, proc_h], INFINITE);
+                let r = web.wait(&[stop, proc_h], INFINITE);
                 // SAFETY: `proc_h` copies the still-live `child.process` OwnedHandle (dropped only at end
                 // of iteration), so the handle is open; TerminateProcess only signals by handle.
                 unsafe {
@@ -467,14 +482,14 @@ fn supervise(stop: HANDLE, session_ev: HANDLE) -> Result<()> {
         restarts += 1;
         maybe_boot_loop_rollback(restarts, &mut rollback_attempted);
         let backoff = restarts.min(10) * 500; // 0.5s..5s
-        if wait_one(stop, backoff) {
+        if web.wait(&[stop], backoff).is_some() {
             break;
         }
         // `child` drops here (end of iteration) → its process + thread handles close before relaunch.
     }
 
-    // `job` (OwnedHandle) drops at function exit, closing the job object → KILL_ON_JOB_CLOSE reaps
-    // any straggler still inside it.
+    // `job` and `web` (each owning a KILL_ON_JOB_CLOSE job) drop at function exit, closing the job
+    // objects → any straggler host or console process is reaped.
     tracing::info!("supervision loop ended");
     Ok(())
 }
@@ -497,10 +512,12 @@ fn wait_any(handles: &[HANDLE], ms: u32) -> Option<usize> {
     (idx < handles.len() as u32).then_some(idx as usize)
 }
 
-/// A kill-on-close + breakaway-ok job object, returned as an `OwnedHandle` (auto-`CloseHandle` on drop).
-/// Safe: takes no arguments, and the handle it creates is wrapped in an `OwnedHandle` before any
-/// fallible step — so there is no precondition for a caller to uphold and no way to leak it here.
-fn make_job() -> Result<OwnedHandle> {
+/// A kill-on-close job object with the given limit flags, returned as an `OwnedHandle`
+/// (auto-`CloseHandle` on drop). The host child's job adds `BREAKAWAY_OK` (it must spawn the WGC
+/// helper outside the job); the web console's does not — nothing it runs may outlive the service.
+/// Safe: the handle it creates is wrapped in an `OwnedHandle` before any fallible step — so there
+/// is no precondition for a caller to uphold and no way to leak it here.
+fn make_job(limits: JOB_OBJECT_LIMIT) -> Result<OwnedHandle> {
     // SAFETY: a null security descriptor and a null name are both documented as "unnamed, default
     // security"; the returned handle is checked by `?` and owned on the next line.
     let job_raw = unsafe { CreateJobObjectW(None, PCWSTR::null()) }.context("CreateJobObjectW")?;
@@ -509,8 +526,7 @@ fn make_job() -> Result<OwnedHandle> {
     // ownership passes to the `OwnedHandle`, which closes it exactly once.
     let job = unsafe { OwnedHandle::from_raw_handle(job_raw.0) };
     let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-    info.BasicLimitInformation.LimitFlags =
-        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK;
+    info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | limits;
     // SAFETY: `job` is the live job object above; `info` is a local of exactly the type the
     // `JobObjectExtendedLimitInformation` class expects, and the size argument is its `size_of`.
     unsafe {
@@ -530,8 +546,9 @@ fn make_job() -> Result<OwnedHandle> {
 /// `CloseHandle(pi.hProcess/hThread)` the supervise loop used to scatter across its match arms.
 struct Child {
     process: OwnedHandle,
-    /// Held only for its RAII `CloseHandle` (the thread handle is never used after spawn) — `_`-prefixed
-    /// so the `dead_code` lint (CI's `-D warnings`) doesn't flag the never-read field.
+    /// Held mainly for its RAII `CloseHandle`; only the web-console spawn reads it (to `ResumeThread`
+    /// a CREATE_SUSPENDED child) — `_`-prefixed so the `dead_code` lint (CI's `-D warnings`) doesn't
+    /// flag it on paths that never read it.
     _thread: OwnedHandle,
     pid: u32,
 }
@@ -712,11 +729,456 @@ fn open_log_handle(path: &std::path::Path) -> Result<HANDLE> {
     Ok(h)
 }
 
+// ── web console child ────────────────────────────────────────────────────────────────────────────
+//
+// The web management console (bun/Nitro serving HTTPS on :47992) is the service's SECOND supervised
+// child. It used to be a Task Scheduler task (`PunktfunkWeb`) and was found silently dead three
+// times in one week under three different last-run codes (0x1 / 0xFFFFFFFF / 0x41306) — because a
+// task's lifecycle is one best-effort start per boot/logon/install with no watchdog: Task Scheduler
+// never restarts an action that merely exits non-zero, and nothing in the product checked the
+// console was up. Full rationale: punktfunk-planning design/windows-web-console-lifecycle.md.
+//
+// Differences from the host child, all deliberate:
+//   * plain session-0 spawn as self — NOT `spawn_host`, whose token retargeting would put this
+//     LAN-facing server on the signed-in user's window station and tear it down on every session
+//     switch. A web server has no business in the interactive session.
+//   * its own job object WITHOUT `BREAKAWAY_OK`: the console spawns no helpers, so everything it
+//     runs dies with the service, unconditionally.
+//   * session changes never touch it.
+//   * it never gives up: the respawn backoff doubles 0.5 s → 60 s and stays there. Any run that
+//     served ≥ `WEB_GOOD_RUN` resets the backoff, so a console that ran for a while and died comes
+//     back quickly, while a genuinely broken install retries (and logs) once a minute forever
+//     rather than parking silently — the failure mode that produced all three incidents.
+
+/// Stdout/stderr of the console child — `%ProgramData%\punktfunk\logs\web.log`. Bun's output used
+/// to vanish into Task Scheduler; two of the three incidents were unattributable for exactly that
+/// reason.
+fn web_log_path() -> PathBuf {
+    let dir = pf_paths::config_dir().join("logs");
+    let _ = pf_paths::create_private_dir(&dir);
+    dir.join("web.log")
+}
+
+/// A run at least this long is "good": it resets the consecutive-failure backoff.
+const WEB_GOOD_RUN: Duration = Duration::from_secs(60);
+/// Backoff ceiling between respawns of a failing console.
+const WEB_MAX_BACKOFF_MS: u64 = 60_000;
+
+/// The installed console payload ({app} = the directory this exe runs from).
+struct WebConfig {
+    bun: PathBuf,
+    server: PathBuf,
+    /// Working directory for the child ({app}\web, like the old launcher's `%~dp0`).
+    web_dir: PathBuf,
+}
+
+/// The supervised web-console child slot. Owned by `supervise()`; serviced by `wait`, which every
+/// host-loop wait goes through, so the console is managed no matter where the host state machine
+/// currently blocks.
+struct WebSlot {
+    /// `None` = nothing to supervise on this box (payload absent, or opted out via host.env).
+    cfg: Option<WebConfig>,
+    child: Option<Child>,
+    /// The console's own kill-on-close (no breakaway) job. Created at first spawn; dropping it —
+    /// `supervise()` returning for any reason — reaps bun and anything it spawned.
+    job: Option<OwnedHandle>,
+    spawned_at: Instant,
+    /// Consecutive short-lived runs (spawn failures count too); drives the backoff, nothing else.
+    fast_exits: u32,
+    next_spawn: Instant,
+    /// The soft gate's deadline: `web-password` gets this long (from the moment the hard-gate files
+    /// are all present) to appear before we start without it. Without a password the console
+    /// fail-closes (admits no one), so starting is safe — this only avoids a pointless
+    /// "auth not configured" window during a fresh install, where `web setup` writes the password
+    /// around the same time the host writes its identity cert.
+    password_deadline: Option<Instant>,
+    /// One log line per waiting episode (gate files / missing payload), not one per poll.
+    logged_wait: bool,
+}
+
+impl WebSlot {
+    /// Decide what to supervise. host.env is already loaded into this process's environment
+    /// (`load_host_env` runs before `supervise`), so the opt-out is a plain env check.
+    fn new(exe: &Path) -> WebSlot {
+        let app = exe.parent().unwrap_or(Path::new("."));
+        let cfg = WebConfig {
+            bun: app.join("bun").join("bun.exe"),
+            server: app
+                .join("web")
+                .join(".output")
+                .join("server")
+                .join("index.mjs"),
+            web_dir: app.join("web"),
+        };
+        let opted_out = std::env::var("PUNKTFUNK_WEB_CONSOLE").is_ok_and(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "off" | "0" | "false" | "no"
+            )
+        });
+        let cfg = if opted_out {
+            tracing::info!(
+                "web console disabled (PUNKTFUNK_WEB_CONSOLE in host.env) — not supervising it"
+            );
+            None
+        } else if !cfg.bun.exists() || !cfg.server.exists() {
+            // A build without the web payload (host-only / scripting-only): nothing to do. A payload
+            // appearing later always comes from an installer run, which restarts this service.
+            tracing::info!(
+                bun = %cfg.bun.display(),
+                server = %cfg.server.display(),
+                "no web console payload — not supervising it"
+            );
+            None
+        } else {
+            Some(cfg)
+        };
+        let now = Instant::now();
+        WebSlot {
+            cfg,
+            child: None,
+            job: None,
+            spawned_at: now,
+            fast_exits: 0,
+            next_spawn: now,
+            password_deadline: None,
+            logged_wait: false,
+        }
+    }
+
+    /// Wait on the caller's `handles` for up to `ms`, transparently servicing the console child:
+    /// (re)spawning it when due and gated, and absorbing its exits. Returns the index of the
+    /// signalled caller handle, or `None` on timeout — exactly `wait_any`'s contract, which is what
+    /// lets the host loop use this everywhere without knowing the console exists.
+    fn wait(&mut self, handles: &[HANDLE], ms: u32) -> Option<usize> {
+        let deadline =
+            (ms != INFINITE).then(|| Instant::now() + Duration::from_millis(u64::from(ms)));
+        loop {
+            let own_wake = self.converge();
+            let mut set: Vec<HANDLE> = handles.to_vec();
+            if let Some(c) = &self.child {
+                set.push(HANDLE(c.process.as_raw_handle()));
+            }
+            let caller_ms = match deadline {
+                None => INFINITE,
+                Some(d) => d
+                    .saturating_duration_since(Instant::now())
+                    .as_millis()
+                    .min(u128::from(INFINITE)) as u32,
+            };
+            let wait_ms = caller_ms.min(own_wake.unwrap_or(INFINITE));
+            match wait_any(&set, wait_ms) {
+                Some(i) if i < handles.len() => return Some(i),
+                Some(_) => self.on_child_exit(),
+                None => {
+                    if deadline.is_some_and(|d| Instant::now() >= d) {
+                        return None;
+                    }
+                    // Our own wake (gate poll / respawn due) — loop into `converge`.
+                }
+            }
+        }
+    }
+
+    /// Bring the slot toward "running": spawn the child if it is due and every gate passes.
+    /// Returns how soon we want waking for slot-internal reasons (`None` = no appointment — either
+    /// the child runs, and its handle is in the wait set, or there is nothing to supervise).
+    fn converge(&mut self) -> Option<u32> {
+        let Some(cfg) = &self.cfg else { return None };
+        if self.child.is_some() {
+            return None;
+        }
+        let now = Instant::now();
+        if now < self.next_spawn {
+            return Some(
+                (self.next_spawn - now)
+                    .as_millis()
+                    .min(u128::from(INFINITE)) as u32,
+            );
+        }
+        // An install/uninstall replacing or removing the payload mid-run: don't spawn into a
+        // half-written {app}. The installer stops this service before touching files, so this is a
+        // rare belt-and-braces path, polled slowly.
+        if !cfg.bun.exists() || !cfg.server.exists() {
+            if !self.logged_wait {
+                self.logged_wait = true;
+                tracing::warn!(
+                    bun = %cfg.bun.display(),
+                    "web console payload missing — an install/uninstall in progress? waiting"
+                );
+            }
+            return Some(60_000);
+        }
+        // Hard gate: the host writes the mgmt token at argument-parse time and the identity
+        // cert/key after its RSA keygen; the console needs all three (credential + TLS material),
+        // so hold its start until they exist. This replaces the old launcher's 150-iteration wait
+        // loop AND `web setup`'s start-then-verify — the supervisor is the parent of both children,
+        // so it simply starts the console at the right moment.
+        let data = pf_paths::config_dir();
+        let token = data.join("mgmt-token");
+        let cert = data.join("cert.pem");
+        let key = data.join("key.pem");
+        if !(token.exists() && cert.exists() && key.exists()) {
+            if !self.logged_wait {
+                self.logged_wait = true;
+                tracing::info!(
+                    "waiting for the host to write its mgmt token + identity cert before starting \
+                     the web console"
+                );
+            }
+            return Some(1_000);
+        }
+        // Soft gate: give `web setup` a moment to write the login password on a fresh install.
+        let password = data.join("web-password");
+        if !password.exists() {
+            let deadline = *self
+                .password_deadline
+                .get_or_insert_with(|| now + Duration::from_secs(60));
+            if now < deadline {
+                return Some(1_000);
+            }
+            // No password after the grace period: start anyway — the console admits no one until
+            // one exists (web/server/middleware/auth.ts fail-closes), and a respawn picks it up.
+        }
+        self.spawn(&data);
+        // Either a child now runs (waited on by handle) or the failure scheduled `next_spawn`.
+        self.child.is_none().then(|| {
+            (self.next_spawn.saturating_duration_since(Instant::now()))
+                .as_millis()
+                .min(u128::from(INFINITE)) as u32
+        })
+    }
+
+    /// One spawn attempt. On success the child is stored; on failure the backoff is scheduled.
+    /// Borrows `data` (= the config dir) rather than recomputing it, purely to keep converge's gate
+    /// checks and the env construction reading the same paths.
+    fn spawn(&mut self, data: &Path) {
+        let Some(cfg) = &self.cfg else { return };
+        // Create the console's job lazily (first spawn) so a console-less box never makes one.
+        if self.job.is_none() {
+            match make_job(JOB_OBJECT_LIMIT(0)) {
+                Ok(j) => self.job = Some(j),
+                Err(e) => {
+                    tracing::error!("create web console job object: {e:#}");
+                    self.schedule_retry();
+                    return;
+                }
+            }
+        }
+        let job = HANDLE(self.job.as_ref().expect("just set").as_raw_handle());
+        match spawn_web(cfg, data, job) {
+            Ok(child) => {
+                tracing::info!(
+                    pid = child.pid,
+                    "web console launched (https://<host-ip>:47992)"
+                );
+                self.spawned_at = Instant::now();
+                self.password_deadline = None;
+                self.logged_wait = false;
+                self.child = Some(child);
+            }
+            Err(e) => {
+                tracing::error!("failed to launch the web console: {e:#}");
+                self.schedule_retry();
+            }
+        }
+    }
+
+    /// The console child exited: log with its exit code + uptime, then schedule the respawn.
+    fn on_child_exit(&mut self) {
+        let Some(child) = self.child.take() else {
+            return;
+        };
+        let mut code: u32 = 0;
+        // SAFETY: `child.process` is the live OwnedHandle of the just-signalled process (owned until
+        // `child` drops at the end of this fn), and `code` is a live local out-param; the call reads
+        // the handle and writes the u32, retaining neither.
+        let _ = unsafe { GetExitCodeProcess(HANDLE(child.process.as_raw_handle()), &mut code) };
+        let uptime = self.spawned_at.elapsed();
+        if uptime >= WEB_GOOD_RUN {
+            self.fast_exits = 0;
+        }
+        self.schedule_retry();
+        tracing::warn!(
+            pid = child.pid,
+            exit_code = format!("{code:#x}"),
+            uptime_secs = uptime.as_secs(),
+            retry_in_ms = (self.next_spawn - Instant::now()).as_millis() as u64,
+            "web console exited — relaunching"
+        );
+        // `child` drops here → its process/thread handles close.
+    }
+
+    /// Count a failure and set `next_spawn` per the doubling backoff (0.5 s → 60 s cap).
+    fn schedule_retry(&mut self) {
+        self.fast_exits = self.fast_exits.saturating_add(1);
+        let backoff_ms = (500u64 << (self.fast_exits - 1).min(7)).min(WEB_MAX_BACKOFF_MS);
+        self.next_spawn = Instant::now() + Duration::from_millis(backoff_ms);
+    }
+}
+
+/// Read the value out of a one-line `KEY=VALUE` secret file (`mgmt-token` / `web-password` form; a
+/// bare-value line is accepted too, matching `mgmt_token::parse_token`).
+fn read_env_file_value(path: &Path) -> Option<String> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    let line = contents.lines().find(|l| !l.trim().is_empty())?.trim();
+    let value = line.split_once('=').map_or(line, |(_, v)| v).trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+/// Serialize this process's environment with `overrides` (which win, case-insensitively) into the
+/// double-NUL-terminated UTF-16 block `CreateProcessW` takes. Same serialization as
+/// `interactive::merged_env_block`; the base here is simply our own environment (host.env is
+/// already loaded into it), not a user token's block — the console runs as us, in our session.
+fn env_block_with(overrides: &[(&str, String)]) -> Vec<u16> {
+    let mut entries: Vec<(String, String)> = std::env::vars()
+        .filter(|(k, _)| !overrides.iter().any(|(ok, _)| ok.eq_ignore_ascii_case(k)))
+        .collect();
+    entries.extend(overrides.iter().map(|(k, v)| (k.to_string(), v.clone())));
+    // CreateProcess* wants the block sorted case-insensitively (alphabetical by name).
+    entries.sort_by_key(|(k, _)| k.to_uppercase());
+    let mut block: Vec<u16> = Vec::new();
+    for (k, v) in entries {
+        block.extend(format!("{k}={v}").encode_utf16());
+        block.push(0);
+    }
+    block.push(0);
+    block
+}
+
+/// Launch the console: bun serving the Nitro bundle, session 0, stdout→web.log, inside `job`.
+/// The deployment wiring (ports, TLS files, mgmt URL) matches what the deleted `web-run.cmd`
+/// launcher set — and the Linux `scripts/punktfunk-web.service` unit still sets.
+fn spawn_web(cfg: &WebConfig, data: &Path, job: HANDLE) -> Result<Child> {
+    // Secrets resolve env-over-file, the same precedence the host itself uses (`mgmt_token.rs`):
+    // an operator override in host.env must give both processes the same token.
+    let token = std::env::var("PUNKTFUNK_MGMT_TOKEN")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| read_env_file_value(&data.join("mgmt-token")))
+        .context("read mgmt-token")?;
+    let password = std::env::var("PUNKTFUNK_UI_PASSWORD")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| read_env_file_value(&data.join("web-password")));
+
+    let mut overrides: Vec<(&str, String)> = vec![
+        ("PORT", "47992".into()),
+        ("HOST", "0.0.0.0".into()),
+        // The /api proxy hop to the host's loopback HTTPS mgmt API. The host's self-signed cert is
+        // accepted only inside the proxy code (per-request TLS), never process-wide.
+        ("PUNKTFUNK_MGMT_URL", "https://127.0.0.1:47990".into()),
+        // Serve HTTPS with the host's own identity cert; mark the session cookie Secure.
+        (
+            "PUNKTFUNK_UI_TLS_CERT",
+            data.join("cert.pem").to_string_lossy().into_owned(),
+        ),
+        (
+            "PUNKTFUNK_UI_TLS_KEY",
+            data.join("key.pem").to_string_lossy().into_owned(),
+        ),
+        ("PUNKTFUNK_UI_SECURE", "1".into()),
+        ("PUNKTFUNK_MGMT_TOKEN", token),
+    ];
+    if let Some(pw) = password {
+        overrides.push(("PUNKTFUNK_UI_PASSWORD", pw));
+    }
+    let env = env_block_with(&overrides);
+
+    let web_log = web_log_path();
+    rotate_if_large(&web_log);
+    let log = open_log_handle(&web_log)?;
+
+    let si = STARTUPINFOW {
+        cb: std::mem::size_of::<STARTUPINFOW>() as u32,
+        dwFlags: STARTF_USESTDHANDLES,
+        hStdOutput: log,
+        hStdError: log,
+        ..Default::default()
+    };
+    let mut cmd: Vec<u16> = format!("\"{}\" \"{}\"", cfg.bun.display(), cfg.server.display())
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let cwd: Vec<u16> = cfg
+        .web_dir
+        .as_os_str()
+        .to_string_lossy()
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut pi = PROCESS_INFORMATION::default();
+
+    // CREATE_SUSPENDED: the child must be inside the kill-on-close job BEFORE its first instruction
+    // — anything it spawned pre-assignment would escape the job and outlive the service.
+    // SAFETY: `cmd`, `cwd`, `env` and `si` (whose handles are the live inheritable `log`) are live,
+    // NUL-terminated locals for the duration of the call (`env` doubly, per `env_block_with`); `pi`
+    // is a live local out-param; no pointer is retained past the call.
+    let created = unsafe {
+        CreateProcessW(
+            PCWSTR::null(),
+            Some(PWSTR(cmd.as_mut_ptr())),
+            None,
+            None,
+            true, // inherit the log handle
+            CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW | CREATE_SUSPENDED,
+            Some(env.as_ptr() as *const c_void),
+            PCWSTR(cwd.as_ptr()),
+            &si,
+            &mut pi,
+        )
+    };
+    // SAFETY: `log` is live and owned here, closed exactly once and not used after — on success the
+    // child holds its own inherited copy.
+    let _ = unsafe { CloseHandle(log) };
+    created.context("CreateProcessW(web console)")?;
+
+    // Take ownership of the (suspended) process + thread handles first, so every path below —
+    // including the assignment failure — closes them via drop.
+    // SAFETY: `created` was `Ok`, so `pi.hProcess` is an owned handle nothing else closes; wrapping
+    // it transfers that ownership to the `OwnedHandle`, which closes it exactly once.
+    let process = unsafe { OwnedHandle::from_raw_handle(pi.hProcess.0) };
+    // SAFETY: the same, for the distinct thread handle `CreateProcessW` filled in.
+    let thread = unsafe { OwnedHandle::from_raw_handle(pi.hThread.0) };
+    let child = Child {
+        process,
+        _thread: thread,
+        pid: pi.dwProcessId,
+    };
+
+    // NOT best-effort (unlike the host child, whose job is breakaway-ok anyway): containment is the
+    // point of this job, so a child we cannot assign is a child we do not run.
+    // SAFETY: `job` is a live job object per this fn's contract; `child.process` is the live handle
+    // of the still-suspended process just created.
+    if let Err(e) = unsafe { AssignProcessToJobObject(job, HANDLE(child.process.as_raw_handle())) }
+    {
+        // SAFETY: `child.process` is live and owned (dropped at the end of this scope);
+        // TerminateProcess only signals termination by handle. The process never ran (suspended).
+        unsafe {
+            let _ = TerminateProcess(HANDLE(child.process.as_raw_handle()), 1);
+        }
+        return Err(e).context("AssignProcessToJobObject(web console)");
+    }
+    // SAFETY: `child._thread` is the live primary-thread handle of the process just created; a
+    // suspended primary thread is exactly what ResumeThread expects.
+    let resumed = unsafe { ResumeThread(HANDLE(child._thread.as_raw_handle())) };
+    if resumed == u32::MAX {
+        // SAFETY: as in the assignment-failure arm above — live owned handle, process torn down.
+        unsafe {
+            let _ = TerminateProcess(HANDLE(child.process.as_raw_handle()), 1);
+        }
+        bail!("ResumeThread(web console) failed");
+    }
+    Ok(child)
+}
+
 // ── install / uninstall ──────────────────────────────────────────────────────────────────────────
 
 fn install(args: &[String]) -> Result<()> {
     use windows_service::service::{
-        ServiceAccess, ServiceErrorControl, ServiceInfo, ServiceStartType, ServiceType,
+        ServiceAccess, ServiceAction, ServiceActionType, ServiceErrorControl,
+        ServiceFailureActions, ServiceFailureResetPeriod, ServiceInfo, ServiceStartType,
+        ServiceType,
     };
     use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
@@ -766,6 +1228,43 @@ fn install(args: &[String]) -> Result<()> {
             println!("Reconfigured existing service '{SERVICE_NAME}'.");
         }
         Err(e) => return Err(e).context("create service"),
+    }
+
+    // SCM crash recovery: restart at 1 s / 5 s, then every 60 s (the SCM repeats the last action);
+    // the failure counter resets after a clean day. The web console lives and dies with this
+    // process now, so this policy is the outer safety net for BOTH children. It fires only when the
+    // service process dies without reporting SERVICE_STOPPED — a crash — never on a deliberate
+    // stop. Best-effort: a recovery policy is a nicety an install must not fail over.
+    // (Restart actions need SERVICE_START on the handle, hence the fresh open.)
+    let recovery = manager
+        .open_service(
+            SERVICE_NAME,
+            ServiceAccess::CHANGE_CONFIG | ServiceAccess::START,
+        )
+        .and_then(|svc| {
+            svc.update_failure_actions(ServiceFailureActions {
+                reset_period: ServiceFailureResetPeriod::After(Duration::from_secs(24 * 60 * 60)),
+                reboot_msg: None,
+                command: None,
+                actions: Some(vec![
+                    ServiceAction {
+                        action_type: ServiceActionType::Restart,
+                        delay: Duration::from_secs(1),
+                    },
+                    ServiceAction {
+                        action_type: ServiceActionType::Restart,
+                        delay: Duration::from_secs(5),
+                    },
+                    ServiceAction {
+                        action_type: ServiceActionType::Restart,
+                        delay: Duration::from_secs(60),
+                    },
+                ]),
+            })
+        });
+    match recovery {
+        Ok(()) => println!("Crash recovery: the SCM restarts the service at 1s/5s/60s."),
+        Err(e) => eprintln!("warning: could not set the service recovery actions: {e}"),
     }
 
     ensure_default_host_env()?;
@@ -869,6 +1368,10 @@ fn ensure_default_host_env() -> Result<()> {
         # The host subcommand the service launches (default: serve --gamestream = native + Moonlight\n\
         # compat). Use `serve` for a SECURE native-only host (no GameStream #5/#9 surface).\n\
         # PUNKTFUNK_HOST_CMD=serve --gamestream\n\
+        \n\
+        # The web management console (https://<this-PC>:47992) runs as a child of the service.\n\
+        # Set to off to disable it:\n\
+        # PUNKTFUNK_WEB_CONSOLE=off\n\
         \n\
         # Force a specific render GPU by name substring (multi-GPU boxes only):\n\
         # PUNKTFUNK_RENDER_ADAPTER=4090\n\

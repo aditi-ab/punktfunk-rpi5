@@ -429,6 +429,17 @@ fn inf_class(inf: &Path) -> (String, String) {
 }
 
 // ── `web setup --app-dir <app> [--password-file <file>]` ────────────────────────────────────────
+//
+// Provisioning ONLY. The console is a supervised child of the PunktfunkHost service (see
+// `service.rs`'s "web console child" section; design: punktfunk-planning
+// design/windows-web-console-lifecycle.md): the service spawns bun itself, gated on the files the
+// console needs, so this subcommand no longer registers a scheduled task, waits for the host's
+// cert, or starts anything. What remains is what genuinely belongs to install time: the login
+// password (the wizard's --password-file only exists here), the firewall rule, and deleting the
+// legacy `PunktfunkWeb` scheduled task a pre-supervision install left behind — a live legacy task
+// would race the service's own console child for :47992.
+
+/// The RETIRED scheduled task's name — referenced only to migrate old installs off it.
 const WEB_TASK: &str = "PunktfunkWeb";
 
 pub fn web_main(args: &[String]) -> Result<()> {
@@ -444,19 +455,28 @@ fn web_setup(args: &[String]) -> Result<()> {
     let pw_file = flag_val(args, "--password-file");
     let data_dir = pf_paths::config_dir();
     std::fs::create_dir_all(&data_dir).ok();
-    let pw_path = data_dir.join("web-password");
-    let token_path = data_dir.join("mgmt-token");
 
     // 1. login password
-    set_web_password(&pw_path, pw_file.as_deref());
-    // 2. (upgrade-safe) stop any running console so the new task binds :47992 + the files unlock
-    stop_web_console();
-    // 3. register the PunktfunkWeb scheduled task
-    let cmd = app_dir.join("web").join("web-run.cmd");
-    if !cmd.exists() {
-        bail!("web launcher missing: {}", cmd.display());
+    set_web_password(&data_dir.join("web-password"), pw_file.as_deref());
+    // 2. migration: end + delete the legacy scheduled task (idempotent; harmless when absent).
+    //    On the migrating upgrade the installer's StopBunRuntimes DISABLED the task before the file
+    //    copy, so it cannot respawn between the new service's start and this delete.
+    run_quiet("schtasks", &["/end", "/tn", WEB_TASK]);
+    run_quiet("schtasks", &["/delete", "/tn", WEB_TASK, "/f"]);
+    // 3. payload sanity. Purely informational — the supervisor logs and keeps waiting on its own —
+    //    but install time is when a human is watching, and a WithWeb installer whose payload is
+    //    missing has shipped before (the 0.22.1/0.22.2 CI cache bug).
+    let server = app_dir
+        .join("web")
+        .join(".output")
+        .join("server")
+        .join("index.mjs");
+    if !server.exists() {
+        eprintln!(
+            "warning: web console payload missing at {} - the service will not serve a console",
+            server.display()
+        );
     }
-    register_web_task(&cmd)?;
     // 4. firewall: inbound TCP 47992. The console serves HTTPS (HTTP/1.1 over TLS) with the host's
     //    identity cert. (No UDP/HTTP-3: browsers won't use QUIC against a self-signed/no-SAN cert.)
     //    Scoped to the same profiles as the streaming ports — Domain + Private by default, Public
@@ -491,69 +511,13 @@ fn web_setup(args: &[String]) -> Result<()> {
     ) {
         eprintln!("warning: could not add the firewall rule for TCP 47992");
     }
-    // 5. Wait for EVERY file the launcher needs, then start the task and VERIFY it came up.
-    //
-    //    `web-run.cmd` refuses to serve without the mgmt token AND the host identity cert, and the
-    //    host writes them in that order: the token during argument parsing (`main::parse_serve`,
-    //    milliseconds after `serve` starts), the cert only once `serve` reaches
-    //    `gamestream::cert::ServerIdentity::load_or_create` - behind a pure-Rust RSA-2048 keygen
-    //    whose prime search has a multi-second tail. Gating on the token alone therefore fired
-    //    `schtasks /run` while that keygen was still running: the launcher exited 1, and since the
-    //    task carries no trigger other than boot (and Task Scheduler's restart-on-failure does not
-    //    reliably fire for a plain non-zero exit code), a freshly installed console stayed down
-    //    until the next reboot. Gate on `cert.pem` - written LAST, after `key.pem` - so all three
-    //    files are on disk before the first start.
-    let cert_path = data_dir.join("cert.pem");
-    if !wait_for_files(&[token_path.as_path(), cert_path.as_path()], 90) {
-        eprintln!(
-            "warning: the host service has not written {} + {} yet - not starting the console now; \
-             it will start at the next boot (or run: schtasks /run /tn {WEB_TASK})",
-            token_path.display(),
-            cert_path.display()
-        );
-        println!("web console set up (https://<host-ip>:47992)");
-        return Ok(());
-    }
-    if start_web_task() {
-        println!("web console set up + started (https://<host-ip>:47992)");
-    } else {
-        // Never claim "started" when it isn't: the launcher's own diagnostics go to a task with no
-        // console, so this warning is the only trace an operator gets at install time.
-        eprintln!(
-            "warning: the {WEB_TASK} task did not bring up a listener on :47992 - check its Last Run \
-             Result in Task Scheduler; the console will be retried at the next boot"
-        );
-        println!("web console set up (https://<host-ip>:47992)");
-    }
+    // No start step: the PunktfunkHost service supervises the console and starts it the moment the
+    // host has written the files it needs (mgmt token + identity cert/key) — there is nothing an
+    // install-time one-shot start could add except a new way to fail.
+    println!(
+        "web console set up (https://<host-ip>:47992; supervised by the PunktfunkHost service)"
+    );
     Ok(())
-}
-
-/// Poll until every path exists, or `secs` elapse. Returns whether they all showed up.
-fn wait_for_files(paths: &[&Path], secs: u64) -> bool {
-    for _ in 0..secs {
-        if paths.iter().all(|p| p.exists()) {
-            return true;
-        }
-        std::thread::sleep(std::time::Duration::from_secs(1));
-    }
-    paths.iter().all(|p| p.exists())
-}
-
-/// `schtasks /run` + verify: the command reports only that a start was *attempted*, so poll for the
-/// console's own listener and retry a couple of times before giving up. Returns whether :47992 ended
-/// up listening.
-fn start_web_task() -> bool {
-    for _ in 0..3 {
-        run_quiet("schtasks", &["/run", "/tn", WEB_TASK]);
-        // Bun binds the port a second or two after launch on a warm box; allow for a cold one.
-        for _ in 0..10 {
-            std::thread::sleep(std::time::Duration::from_secs(1));
-            if !web_listener_pids().is_empty() {
-                return true;
-            }
-        }
-    }
-    false
 }
 
 /// Source: a non-empty `--password-file` (fresh install) > keep existing (upgrade) > random fallback.
@@ -610,132 +574,6 @@ fn random_password() -> String {
         .filter(|c| !matches!(c, '/' | '+' | '='))
         .take(20)
         .collect()
-}
-
-/// Stop + reap a running console before re-registering (upgrade-safe): end the task AND kill the :47992
-/// listener owner (runtime-agnostic - a prior install may have run node vs the current bun). The listener
-/// is identified by the wildcard foreign address (`0.0.0.0:0`/`[::]:0`), so the localized state word
-/// ("LISTENING"/"ABHOEREN"/...) is never parsed.
-fn stop_web_console() {
-    run_quiet("schtasks", &["/end", "/tn", WEB_TASK]);
-    for pid in web_listener_pids() {
-        run_quiet("taskkill", &["/PID", &pid, "/F"]);
-    }
-    // Both stops are asynchronous - `schtasks /end` returns once the end has been REQUESTED, and
-    // `taskkill /F` is TerminateProcess - so the outgoing console can still own :47992 after this
-    // returns. The very next thing `web_setup` does is start the new task, and its bun cannot bind a
-    // port the corpse still holds; the blind 1 s sleep this replaces was not always enough. Poll
-    // until the listener is really gone (~10 s), re-killing any straggler halfway through, and warn
-    // rather than block forever if something else owns the port (Apollo/Sunshine, a dev console).
-    for i in 0..40 {
-        let pids = web_listener_pids();
-        if pids.is_empty() {
-            return;
-        }
-        if i == 20 {
-            // Re-end the TASK, not just the listener: `web-run.cmd` now supervises bun and relaunches
-            // it on any exit, so killing bun alone would be undone by its own restart loop. Ending the
-            // task takes the launcher down with it, which is why the `/end` above comes first.
-            run_quiet("schtasks", &["/end", "/tn", WEB_TASK]);
-            for pid in pids {
-                run_quiet("taskkill", &["/PID", &pid, "/F"]);
-            }
-        }
-        std::thread::sleep(std::time::Duration::from_millis(250));
-    }
-    eprintln!(
-        "warning: something still holds TCP 47992 - the web console may not start until it exits"
-    );
-}
-
-/// PIDs owning a LISTEN socket on :47992. Also the console's liveness probe (`start_web_task`).
-fn web_listener_pids() -> Vec<String> {
-    run_capture("netstat", &["-ano", "-p", "tcp"])
-        .lines()
-        .filter_map(|line| {
-            let toks: Vec<&str> = line.split_whitespace().collect();
-            let listening = toks.len() >= 5
-                && toks[0].eq_ignore_ascii_case("tcp")
-                && toks[1].ends_with(":47992")
-                && (toks[2] == "0.0.0.0:0" || toks[2] == "[::]:0");
-            let pid = *toks.last()?;
-            (listening && !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()))
-                .then(|| pid.to_string())
-        })
-        .collect()
-}
-
-/// Register the boot+logon/SYSTEM/restart-on-failure task via a generated Task Scheduler XML
-/// (`schtasks /xml`, no COM). The XML declares UTF-16, so it's written UTF-16LE+BOM.
-///
-/// Two triggers, because boot alone left too many holes: a console that lost the install-time start
-/// (or a box where the host service was started only later) had to wait for a full reboot. Logon is
-/// free insurance - `MultipleInstancesPolicy=IgnoreNew` makes a redundant start a no-op. If a
-/// Task Scheduler build rejects the two-trigger XML we fall back to the boot-only form rather than
-/// fail registration outright (no task at all is strictly worse than a boot-only task).
-fn register_web_task(cmd: &Path) -> Result<()> {
-    let cmd_xml = xml_escape(&cmd.to_string_lossy());
-    let boot = "<BootTrigger><Enabled>true</Enabled></BootTrigger>";
-    let boot_and_logon = "<BootTrigger><Enabled>true</Enabled></BootTrigger>\
-                          <LogonTrigger><Enabled>true</Enabled></LogonTrigger>";
-    if try_register_web_task(&cmd_xml, boot_and_logon) || try_register_web_task(&cmd_xml, boot) {
-        println!("registered scheduled task {WEB_TASK} -> {}", cmd.display());
-        Ok(())
-    } else {
-        bail!("schtasks /create {WEB_TASK} failed")
-    }
-}
-
-/// One `schtasks /create /xml` attempt with the given `<Triggers>` body. Returns whether it took.
-fn try_register_web_task(cmd_xml: &str, triggers: &str) -> bool {
-    let xml = format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\n\
-<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\n\
-  <RegistrationInfo><Description>punktfunk web management console (Nitro SSR on bun, :47992)</Description></RegistrationInfo>\n\
-  <Triggers>{triggers}</Triggers>\n\
-  <Principals><Principal id=\"Author\"><UserId>S-1-5-18</UserId><RunLevel>HighestAvailable</RunLevel></Principal></Principals>\n\
-  <Settings>\n\
-    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\n\
-    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\n\
-    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>\n\
-    <StartWhenAvailable>true</StartWhenAvailable>\n\
-    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>\n\
-    <RestartOnFailure><Interval>PT1M</Interval><Count>10</Count></RestartOnFailure>\n\
-  </Settings>\n\
-  <Actions Context=\"Author\"><Exec><Command>{cmd_xml}</Command></Exec></Actions>\n\
-</Task>"
-    );
-    let xml_path = std::env::temp_dir().join("punktfunk-web-task.xml");
-    if write_utf16le_bom(&xml_path, &xml).is_err() {
-        return false;
-    }
-    let ok = run_quiet(
-        "schtasks",
-        &[
-            "/create",
-            "/tn",
-            WEB_TASK,
-            "/xml",
-            &xml_path.to_string_lossy(),
-            "/f",
-        ],
-    );
-    let _ = std::fs::remove_file(&xml_path);
-    ok
-}
-
-fn write_utf16le_bom(path: &Path, s: &str) -> Result<()> {
-    let mut bytes = vec![0xFFu8, 0xFE]; // UTF-16LE BOM
-    for u in s.encode_utf16() {
-        bytes.extend_from_slice(&u.to_le_bytes());
-    }
-    std::fs::write(path, bytes).with_context(|| format!("write {}", path.display()))
-}
-
-fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
 }
 
 fn first_with_ext(dir: &Path, ext: &str) -> Option<PathBuf> {

@@ -132,14 +132,14 @@ See [The Web Console](/docs/web-console) for the console + pairing model shared 
 the Windows specifics follow.
 
 The installer also sets up the **web management console** (status, paired devices, the PIN pairing
-flow): it bundles the console plus its own runtime and runs it as the **`PunktfunkWeb`** task on
-**`https://<this-PC>:47992`**, starting at boot and at sign-in.
+flow): it bundles the console plus its own runtime, and the **`PunktfunkHost`** service runs it on
+**`https://<this-PC>:47992`** — started with the service and restarted automatically if it stops.
 
 #### Console login password
 
 You choose the console **login password** during setup — a secure random default is pre-filled and
 shown on the installer's final page. It's stored in `%ProgramData%\punktfunk\web-password`, readable
-only by Administrators and SYSTEM. To read or change it (with the `schtasks` restart), see
+only by Administrators and SYSTEM. To read or change it (with the service restart), see
 [The Web Console → Login password](/docs/web-console#login-password); forgot it entirely?
 [Forgot your Password?](/docs/forgot-password).
 
@@ -223,8 +223,8 @@ Open **Settings → Apps → Installed apps → Punktfunk Host → Uninstall**, 
 - stops and removes the **`PunktfunkHost`** service and its firewall rules,
 - removes the `pf-vdisplay` and virtual-gamepad drivers — the device nodes *and* their driver-store
   packages — together with the `CN=punktfunk-driver` certificate it had added,
-- removes the **`PunktfunkWeb`** and **`PunktfunkScripting`** scheduled tasks and the console
-  firewall rule,
+- removes the **`PunktfunkScripting`** scheduled task (and the legacy **`PunktfunkWeb`** task older
+  versions used for the console) and the console firewall rule,
 - unregisters the HDR Vulkan layer,
 - takes `C:\Program Files\punktfunk` back off the machine `PATH`.
 

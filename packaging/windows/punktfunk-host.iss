@@ -35,11 +35,6 @@
 #ifndef BrandingDir
   #define BrandingDir "branding"
 #endif
-; The web console launcher (the PunktfunkWeb task action) + its post-install provisioner - committed
-; scripts staged next to the .iss by pack-host-installer.ps1 (absolute paths passed in).
-#ifndef WebRunCmd
-  #define WebRunCmd "..\..\scripts\windows\web-run.cmd"
-#endif
 ; The plugin/script runner launcher (the action the opt-in PunktfunkScripting task runs) - staged
 ; next to the .iss by pack-host-installer.ps1 (absolute path passed in).
 #ifndef ScriptingRunCmd
@@ -218,11 +213,10 @@ Source: "{#BunExe}"; DestDir: "{app}\bun"; DestName: "bun.exe"; Flags: ignorever
 #endif
 #ifdef WithWeb
 ; The web management console: the self-contained Nitro SSR bundle (.output = server + public; deps
-; bundled in, no node_modules) -> {app}\web\.output, and the launcher the PunktfunkWeb task runs ->
-; {app}\web\web-run.cmd. (`punktfunk-host.exe web setup` provisions the console at install time - no
-; staged provisioner script.)
+; bundled in, no node_modules) -> {app}\web\.output. No launcher script anymore: the PunktfunkHost
+; service supervises bun directly (`service.rs` "web console child"); `punktfunk-host.exe web setup`
+; provisions the password/firewall at install time.
 Source: "{#WebDir}\*"; DestDir: "{app}\web\.output"; Flags: ignoreversion recursesubdirs createallsubdirs
-Source: "{#WebRunCmd}"; DestDir: "{app}\web"; DestName: "web-run.cmd"; Flags: ignoreversion
 #endif
 #ifdef WithScripting
 ; The plugin/script runner: one self-contained bundle (effect + the SDK inlined) -> {app}\scripting\
@@ -250,6 +244,12 @@ Source: "{#AudioCableStageDir}\*"; DestDir: "{tmp}\vbcable"; Flags: deleteafteri
 Source: "{#VkLayerDir}\pf_vkhdr_layer.dll"; DestDir: "{app}\vklayer"; Flags: ignoreversion; Tasks: installhdrlayer
 Source: "{#VkLayerDir}\pf_vkhdr_layer.json"; DestDir: "{app}\vklayer"; Flags: ignoreversion; Tasks: installhdrlayer
 #endif
+
+[InstallDelete]
+; The retired web-console launcher: the console runs as a supervised child of the host service now,
+; and Inno never deletes a file it merely stopped shipping — without this a pre-supervision
+; install's copy would linger in {app}\web forever. Unconditional: harmless when absent.
+Type: files; Name: "{app}\web\web-run.cmd"
 
 [Registry]
 ; Auto-start the status tray at sign-in (all users of this host box; uninsdeletevalue removes it
@@ -310,9 +310,12 @@ Filename: "{app}\punktfunk-host.exe"; Parameters: "service install {code:Gamestr
 Filename: "{app}\punktfunk-host.exe"; Parameters: "service start"; WorkingDir: "{app}"; \
   StatusMsg: "Starting the Punktfunk Host service..."; Flags: runhidden waituntilterminated; Tasks: startservice
 #ifdef WithWeb
-; Provision the console AFTER the host service is up (so the mgmt token exists): write the ACL'd
-; login password, register the PunktfunkWeb scheduled task (boot, SYSTEM, restart-on-failure),
-; open TCP 47992, and start it. {code:WebSetupParams} appends -PasswordFile only on a fresh install.
+; Provision the console: write the ACL'd login password, open TCP 47992, and delete the legacy
+; PunktfunkWeb scheduled task (the console runs as a supervised child of the host service now — the
+; service just started above will bring it up once the host has written the mgmt token + identity
+; cert; nothing here starts or registers anything). {code:WebSetupParams} appends -PasswordFile only
+; on a fresh install. Order note: StopBunRuntimes DISABLED any legacy task before the copy, so it
+; cannot respawn between the service start above and this delete.
 Filename: "{app}\punktfunk-host.exe"; Parameters: "web setup {code:WebSetupParams}{code:PublicFwParam}"; WorkingDir: "{app}"; \
   StatusMsg: "Setting up the Punktfunk web console..."; Flags: runhidden waituntilterminated
 #endif
@@ -362,8 +365,10 @@ Filename: "{app}\punktfunk-host.exe"; Parameters: "service uninstall"; Flags: ru
 Filename: "{app}\punktfunk-host.exe"; Parameters: "driver uninstall"; Flags: runhidden waituntilterminated; RunOnceId: "PunktfunkVdisplayDriverUninstall"
 Filename: "{app}\punktfunk-host.exe"; Parameters: "driver uninstall --gamepad"; Flags: runhidden waituntilterminated; RunOnceId: "PunktfunkGamepadDriverUninstall"
 #ifdef WithWeb
-; Stop + remove the PunktfunkWeb task and its firewall rule (leaves %ProgramData%\punktfunk config,
-; like the host uninstall does).
+; Remove the console's firewall rule + any LEGACY PunktfunkWeb task and stray listener (the
+; service-supervised console itself died with `service uninstall` above, via its kill-on-close job;
+; this sweep only covers pre-supervision leftovers). Leaves %ProgramData%\punktfunk config, like the
+; host uninstall does.
 Filename: "powershell.exe"; \
   Parameters: "-NoProfile -ExecutionPolicy Bypass -Command ""Stop-ScheduledTask -TaskName PunktfunkWeb -ErrorAction SilentlyContinue; Get-NetTCPConnection -LocalPort 47992,3000 -State Listen -ErrorAction SilentlyContinue | ForEach-Object {{ Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue }; Unregister-ScheduledTask -TaskName PunktfunkWeb -Confirm:$false -ErrorAction SilentlyContinue; Get-NetFirewallRule -DisplayName 'Punktfunk web console (*' -ErrorAction SilentlyContinue | Remove-NetFirewallRule"""; \
   Flags: runhidden waituntilterminated; RunOnceId: "PunktfunkWebCleanup"
@@ -641,15 +646,17 @@ end;
 { Free the bundled bun.exe (and the console's own files) BEFORE the copy. Windows will not delete a
   running image, so a surviving bun means "DeleteFile failed; code 5" on bun\bun.exe - the modal a
   user hit updating to 0.22.1.
-  Neither bun runs under the host service, so StopHostServiceAndWait does nothing for either: both
-  are Task Scheduler tasks - PunktfunkWeb (SYSTEM, the console) and PunktfunkScripting (LocalService,
-  the plugin runner) - and the runner listens on NO port, so the port sweep below cannot see it at
-  all. That is why this stops tasks by name and processes by image path, not just by socket.
-  DISABLE before stopping: both carry aggressive restart-on-failure (web 10x at 1min, scripting 999x
-  at 1min) and the web task also has a logon trigger, so a force-kill on its own invites a respawn
-  into the middle of a copy that takes well over a minute at lzma2/max. Then WAIT for the processes
-  to actually go - Stop-ScheduledTask returns when termination is merely requested, and Stop-Process
-  is TerminateProcess, also asynchronous.
+  The CONSOLE's bun is a child of the host service now (its kill-on-close job), so for it
+  StopHostServiceAndWait (which precedes this) is the real stop. This routine remains for everything
+  the service does NOT own: the scripting runner (a LocalService Task Scheduler task that listens on
+  NO port, so a port sweep cannot see it), the LEGACY PunktfunkWeb task on the one upgrade that
+  crosses the supervision migration, and strays from even older installs. That is why it stops tasks
+  by name and processes by image path, not just by socket.
+  DISABLE before stopping: both tasks carry aggressive restart-on-failure (and the legacy web task a
+  logon trigger), so a force-kill on its own invites a respawn into the middle of a copy that takes
+  well over a minute at lzma2/max. Then WAIT for the processes to actually go - Stop-ScheduledTask
+  returns when termination is merely requested, and Stop-Process is TerminateProcess, also
+  asynchronous.
   Best-effort throughout; a fresh install is a no-op. }
 procedure StopBunRuntimes;
 var
@@ -675,12 +682,13 @@ begin
 end;
 
 { The [Run] restore, built here so it names only the tasks that were actually enabled before the
-  copy. Runs LAST, after `web setup` has re-registered PunktfunkWeb and after the scripting entry has
-  re-registered-then-disabled PunktfunkScripting - that entry is right for a fresh install and wrong
-  for an upgrade, and this is what puts an operator's enabled runner back.
-  The web task is only re-enabled, never started: `web setup` starts it on the builds that ship it,
-  and starting a console whose files a scripting-only build just removed would be worse than leaving
-  it for the next boot. The runner was running, so it is restarted. }
+  copy. Runs LAST, after the scripting entry has re-registered-then-disabled PunktfunkScripting -
+  that entry is right for a fresh install and wrong for an upgrade, and this is what puts an
+  operator's enabled runner back.
+  The PunktfunkWeb half is the CANCEL-path safety net only: on a completed install `web setup` has
+  DELETED the legacy task (the console runs under the host service now), so Enable-ScheduledTask
+  hits nothing and no-ops under SilentlyContinue. If the user cancels mid-install, though,
+  DeinitializeSetup runs this same restore and puts the old (task-owned) world back intact. }
 function RestoreTasksParams(Param: String): String;
 begin
   Result := '-NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference=''SilentlyContinue''; ';

@@ -304,9 +304,9 @@ one.
 
 ## Windows: the host or the web console won't start
 
-The Windows host is two separate things: the **`PunktfunkHost` service** (streaming) and the
-**`PunktfunkWeb` scheduled task** (the console). One can be down while the other is fine, so check
-them separately. The service commands need an **elevated** PowerShell or Command Prompt.
+The **`PunktfunkHost` service** runs both halves of the Windows host: the streaming host itself and
+the web console. It restarts either one automatically if it stops, so most console outages heal
+themselves within a minute. The service commands need an **elevated** PowerShell or Command Prompt.
 
 1. **Is the service running?**
 
@@ -320,16 +320,17 @@ them separately. The service commands need an **elevated** PowerShell or Command
    itself runs as SYSTEM in session 0, where it can neither capture the screen nor inject input, so
    it launches a second copy into the interactive session and supervises it. One supervises, one
    streams.
-3. **The console page never loads.** It's the scheduled task, not the service. Start it from an
-   elevated prompt and re-check `https://<this-PC>:47992`:
+3. **The console page never loads.** The service restarts the console on any failure, so give it a
+   minute first. If it stays down, the console's own log says why — check
+   `%ProgramData%\punktfunk\logs\web.log` (and `service.log` next to it, which records every console
+   start and exit), then restart the service:
 
    ```powershell
-   schtasks /Run /TN PunktfunkWeb
+   punktfunk-host service restart
    ```
 
-   Right after a fresh install the console is sometimes deliberately still down: setup waits for the
-   host to write its certificate before starting it the first time, and if that takes too long it
-   leaves the console for the next boot. The command above is exactly what setup tells you to run.
+   Right after a very first install the console can lag the host by a few seconds on purpose: it
+   waits for the host to finish writing its certificate before serving.
 4. **The status icon is missing after an update.** Windows only launches the tray at sign-in, and an
    upgrade closes the running ones. Put it back without signing out — from your **normal** (not
    elevated) shell, so it runs as you:

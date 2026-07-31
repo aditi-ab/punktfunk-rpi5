@@ -59,10 +59,11 @@ with the password you typed.
   ```
 
   ```powershell
-  schtasks /End /TN PunktfunkWeb; schtasks /Run /TN PunktfunkWeb
+  punktfunk-host service restart
   ```
 
-  (The PowerShell one is Windows, from an **elevated** prompt.)
+  (The PowerShell one is Windows, from an **elevated** prompt — the console runs under the
+  Punktfunk Host service there.)
 - **No password is configured at all.** If the file is missing or empty, or a line lost its
   `PUNKTFUNK_UI_PASSWORD=` prefix, the console fails closed and admits nobody — a page you open
   answers `auth not configured: set PUNKTFUNK_UI_PASSWORD`. Put the line back —

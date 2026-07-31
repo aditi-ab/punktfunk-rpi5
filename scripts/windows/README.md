@@ -36,13 +36,16 @@ won't start. The service is down only for the build duration.
 
 On an **installed** host (the `setup.exe`) the console is set up automatically — no manual steps.
 The installer bundles the built (self-contained, no-`node_modules`) `.output` server + a portable
-bun and runs `punktfunk-host.exe web setup`, which registers the **`PunktfunkWeb`** scheduled task
-(at boot, as SYSTEM, restart-on-failure) running `{app}\web\web-run.cmd` →
-`bun …\.output\server\index.mjs` on `:47992`, opens inbound TCP 47992, and writes the login password to
-`%ProgramData%\punktfunk\web-password` (ACL'd to Administrators + SYSTEM). The mgmt bearer token it
-proxies with is the host's own `%ProgramData%\punktfunk\mgmt-token`. Browse `https://<host-ip>:47992`
-and log in with the password the installer shows on its final page. To change it, edit
-`web-password` and re-run the task: `schtasks /run /tn PunktfunkWeb`.
+bun; the **`PunktfunkHost` service supervises the console as its own child** (`bun
+{app}\web\.output\server\index.mjs` on `:47992`, session 0, restarted on any exit, stdout in
+`%ProgramData%\punktfunk\logs\web.log`), starting it as soon as the host has written its mgmt token
++ identity cert. `punktfunk-host.exe web setup` provisions the rest: it opens inbound TCP 47992 and
+writes the login password to `%ProgramData%\punktfunk\web-password` (ACL'd to Administrators +
+SYSTEM). The mgmt bearer token it proxies with is the host's own
+`%ProgramData%\punktfunk\mgmt-token`. Browse `https://<host-ip>:47992` and log in with the password
+the installer shows on its final page. To change it, edit `web-password` and restart the service
+(`punktfunk-host service restart`) — or just kill the console's `bun.exe`; the supervisor respawns
+it with the new value.
 
 ### Rebuild + restart the console (dev box)
 
@@ -51,9 +54,9 @@ powershell -ExecutionPolicy Bypass -File scripts\windows\build-web.ps1
 ```
 
 `bun install && bun run build` (Nitro `noExternals` -> a self-contained `.output`, no
-`node_modules`/`.npmrc`), then restarts the `PunktfunkWeb` task and checks `:47992/login`. Use
-this to iterate on the console against an installed host - `punktfunk-host.exe web setup` (or a
-fresh install) is what creates the task in the first place.
+`node_modules`/`.npmrc`), then swaps the fresh `.output` into `{app}\web` around a service
+stop/start (the service's kill-on-close job is what unlocks the console's bun) and checks
+`:47992/login`. Use this to iterate on the console against an installed host.
 
 ## Plugin/script runner
 

@@ -559,8 +559,9 @@ fn elevate_service(hwnd: HWND, verb: &str) {
 /// Open the web console at `path` ("" = dashboard). Deep links land the operator on the page the
 /// menu entry promised — the pairing queue, the virtual displays — instead of the dashboard.
 fn open_web_console(hwnd: HWND, path: &str) {
-    // 127.0.0.1, not `localhost`: the console binds HOST=0.0.0.0 (scripts/windows/web-run.cmd),
-    // which is IPv4-ONLY, while Windows resolves `localhost` to ::1 first. A browser that does not
+    // 127.0.0.1, not `localhost`: the console binds HOST=0.0.0.0 (the service supervisor's
+    // `spawn_web` wiring), which is IPv4-ONLY, while Windows resolves `localhost` to ::1 first. A
+    // browser that does not
     // fall back cleanly got connection-refused on a perfectly healthy console — and because the
     // poller probes 127.0.0.1, the tray would call it up while handing over a URL that fails. Same
     // literal in both places, so the menu can never disagree with the status next to it.

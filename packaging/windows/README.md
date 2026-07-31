@@ -56,10 +56,11 @@ parse breakage that silently failed installs on non-English boxes.
   lays down the built **self-contained** `.output` server (Nitro `noExternals` — deps bundled +
   tree-shaken, ~75 files, no `node_modules`) + a portable **bun**, prompts for a console login
   password (pre-filled with a secure random default, shown again on the final page; kept on upgrade),
-  then `punktfunk-host.exe web setup` writes the ACL'd `%ProgramData%\punktfunk\web-password`, registers the
-  **`PunktfunkWeb`** scheduled task (boot, SYSTEM, restart-on-failure → `web-run.cmd` → `bun` on
-  `:47992`), opens TCP 47992, and starts it. It proxies the host's loopback mgmt API with the host's
-  own `%ProgramData%\punktfunk\mgmt-token`.
+  then `punktfunk-host.exe web setup` writes the ACL'd `%ProgramData%\punktfunk\web-password`, opens
+  TCP 47992, and deletes any legacy `PunktfunkWeb` scheduled task. The console itself runs as a
+  **supervised child of the `PunktfunkHost` service** (`bun` on `:47992`, restarted on any exit,
+  stdout in `logs\web.log`), started the moment the host has written its mgmt token + identity cert.
+  It proxies the host's loopback mgmt API with the host's own `%ProgramData%\punktfunk\mgmt-token`.
 - **GameStream (Moonlight) compatibility is a wizard task** (**unchecked** by default — it pairs over
   plain HTTP, so it is opt-in like the Public-firewall task): the choice is passed to
   `service install --gamestream=on|off`, which writes `PUNKTFUNK_HOST_CMD=serve --gamestream` (or
@@ -128,7 +129,6 @@ fresh install uses the generated random console password — read it from
 | `make-driver-cert.ps1` | Generate the stable `CN=punktfunk-driver` code-signing cert (the `DRIVER_CERT_PFX_B64` / `DRIVER_CERT_PASSWORD` secrets). No key container, so it works over SSH; self-tests with signtool where it can. See *Driver signing* above. |
 | `clear-force-integrity.ps1` | Clear the `/INTEGRITYCHECK` PE bit so a self-signed driver loads (reused by every driver build). |
 | `stage-pf-vdisplay.ps1` | Stage the just-built pf-vdisplay bundle + fetch/verify the **pinned** nefcon release. |
-| `../../scripts/windows/web-run.cmd` | The `PunktfunkWeb` task action: loads the mgmt token + login password env, runs the bundled `bun` on the Nitro server (`:47992`). |
 | `drivers/` | The all-Rust IddCx **driver source** workspace: the `pf-vdisplay` crate on `wdk-sys` / windows-drivers-rs + the owned `pf-driver-proto` ABI + `wdk-iddcx` / `wdk-probe`, plus `deploy-dev.ps1` (build/sign/install for dev). |
 | `reset-pf-vdisplay.ps1` | **Dev:** recover a wedged driver — stop host → reap ghost monitor nodes → reload the adapter → start host (no reboot). See *Dev iteration* below. |
 | `redeploy-pf-vdisplay.ps1` | **Dev:** one-shot redeploy — (optional) build → stop host → `deploy-dev.ps1 -Install` → reload adapter → start host. |

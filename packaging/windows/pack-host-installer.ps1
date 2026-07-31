@@ -292,17 +292,15 @@ if ($wantWeb -or $wantScripting) {
     $defines += "/DBunExe=$bunStage"
 }
 # The web console: the self-contained .output tree (Nitro noExternals - deps bundled + tree-shaken,
-# no node_modules), run by the PunktfunkWeb scheduled task, auto-wired to the host's loopback mgmt API.
+# no node_modules), run as a supervised child of the PunktfunkHost service (no launcher script),
+# auto-wired to the host's loopback mgmt API.
 if ($wantWeb) {
     $webStage = Join-Path $OutDir 'web'
     if (Test-Path $webStage) { Remove-Item $webStage -Recurse -Force }
     New-Item -ItemType Directory -Force -Path $webStage | Out-Null
     Copy-Item (Join-Path $WebDir '*') -Destination $webStage -Recurse -Force
-    $webRun = Join-Path $OutDir 'web-run.cmd'
-    Copy-Item (Join-Path $repoRoot 'scripts\windows\web-run.cmd') -Destination $webRun -Force
     # The console is provisioned by `punktfunk-host.exe web setup` (not a staged web-setup.ps1).
     $defines += "/DWebDir=$webStage"
-    $defines += "/DWebRunCmd=$webRun"
     Write-Host "bundling the web console from $WebDir (+ bun $BunExe)"
 }
 else { Write-Host "no -WebDir/-BunExe -> installer built WITHOUT the web console" }
