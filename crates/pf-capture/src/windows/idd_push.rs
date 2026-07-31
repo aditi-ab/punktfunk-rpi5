@@ -20,8 +20,8 @@
 #![deny(clippy::undocumented_unsafe_blocks)]
 
 use super::dxgi::{
-    make_device, BgraToYuvPlanes, D3d11Frame, HdrP010Converter, PyroFrameShare, VideoConverter,
-    WinCaptureTarget,
+    make_device, BgraToYuvPlanes, D3d11Frame, HdrP010Converter, HdrRgb10Converter, PyroFrameShare,
+    VideoConverter, WinCaptureTarget,
 };
 use super::{CapturedFrame, Capturer, FramePayload, PixelFormat};
 use anyhow::{bail, Context, Result};
@@ -44,8 +44,8 @@ use windows::Win32::Graphics::Direct3D11::{
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_NV12, DXGI_FORMAT_P010,
-    DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R16G16_UNORM, DXGI_FORMAT_R16_UNORM,
-    DXGI_FORMAT_R8G8_UNORM, DXGI_FORMAT_R8_UNORM, DXGI_SAMPLE_DESC,
+    DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R16G16_UNORM,
+    DXGI_FORMAT_R16_UNORM, DXGI_FORMAT_R8G8_UNORM, DXGI_FORMAT_R8_UNORM, DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory4, IDXGIKeyedMutex, IDXGIResource1,
@@ -178,6 +178,9 @@ struct OutSlot {
     /// `(luma R16_UNORM, chroma R16G16_UNORM)` plane views. `None` for NV12/BGRA outputs, which the
     /// video processor or a plain `CopyResource` writes without an RTV of ours.
     p010: Option<(ID3D11RenderTargetView, ID3D11RenderTargetView)>,
+    /// Plain RTV of the packed 10-bit slot, for the HDR + 4:4:4 output ([`HdrRgb10Converter`]).
+    /// `None` for every other format.
+    rgb10: Option<ID3D11RenderTargetView>,
 }
 
 /// One PyroWave output-ring slot: the two SEPARATE shareable plane textures the wavelet encoder
@@ -438,8 +441,9 @@ pub struct IddPushCapturer {
     /// THROUGH (a plain copy into the out ring, no NV12 VideoConverter) so NVENC gets full-chroma
     /// RGB and CSCs to 4:4:4 itself — measured on-glass: `chromaFormatIDC=3` + ARGB input yields
     /// TRUE 4:4:4 and the conversion follows the VUI matrix (BT.709 limited, always written).
-    /// While the display is HDR this is overridden to the P010 path (no 10-bit 4:4:4 source):
-    /// the stream honestly downgrades to 4:2:0 — the encoder's caps cross-check reports it.
+    /// While the display is HDR the same idea runs at 10 bits: [`HdrRgb10Converter`] writes packed
+    /// BT.2020 PQ RGB and NVENC CSCs that to YUV 4:4:4 (Main 4:4:4 10). Either way the chroma the
+    /// Welcome promised is the chroma the wire carries.
     want_444: bool,
     /// A PyroWave (wavelet) session (design/pyrowave-windows-host-zerocopy.md +
     /// design/pyrowave-444-hdr.md). When set, frames come from the separate-plane `pyro_ring`
@@ -521,10 +525,15 @@ pub struct IddPushCapturer {
     /// SDR — keeps the colour-convert OFF the contended 3D/compute engine. Built lazily; rebuilt on a
     /// size/HDR flip.
     video_conv: Option<VideoConverter>,
-    /// FP16 scRGB slot → P010 (BT.2020 PQ limited) via two shader passes, used while the display is HDR
+    /// FP16 scRGB slot → P010 (BT.2020 PQ limited) via two shader passes, used while the display is
+    /// HDR and the session did NOT negotiate 4:4:4 (that case takes [`Self::hdr_rgb10_conv`])
     /// (NVIDIA's VideoProcessor can't do RGB→P010). The passes run on the 3D engine, but it still skips
     /// NVENC's internal SM-side CSC. Built lazily.
     hdr_p010_conv: Option<HdrP010Converter>,
+    /// FP16 scRGB slot → packed 10-bit BT.2020 PQ RGB, used while the display is HDR **and** the
+    /// session negotiated 4:4:4 — the full-chroma twin of [`Self::hdr_p010_conv`]. Rebuilt with the
+    /// ring on a mode/HDR flip.
+    hdr_rgb10_conv: Option<HdrRgb10Converter>,
     last_seq: u64,
     last_present: Option<(ID3D11Texture2D, PixelFormat)>,
     status_logged: bool,
@@ -649,8 +658,10 @@ impl IddPushCapturer {
     /// SM-side CSC, because the video processor can only produce subsampled output). We do NOT
     /// gate HDR on the client's advertised `VIDEO_CAP_10BIT` — clients under-report it (e.g. the
     /// Mac advertises 10-bit only when its OWN display is HDR), yet all decode Main10 +
-    /// auto-switch, exactly as on the WGC path. HDR wins over 4:4:4 (there is no 10-bit
-    /// full-chroma source): the stream downgrades to 4:2:0 with a warning.
+    /// auto-switch, exactly as on the WGC path. HDR and 4:4:4 now COMPOSE: an HDR display that
+    /// negotiated full chroma emits packed 10-bit BT.2020 PQ RGB (`Rgb10a2`) for NVENC to CSC to
+    /// YUV 4:4:4 — HEVC Main 4:4:4 10. (Before, HDR won and the stream silently downgraded to
+    /// 4:2:0 *after* the Welcome had already promised 4:4:4.)
     fn out_format(&self) -> (DXGI_FORMAT, PixelFormat) {
         // PyroWave never uses this out-ring (it has its own separate-plane `pyro_ring`); the
         // format here only labels the frame. SDR sessions label NV12 (BT.709 limited), HDR
@@ -664,7 +675,10 @@ impl IddPushCapturer {
         }
         if self.display_hdr {
             if self.want_444 {
-                warn_444_hdr_downgrade_once();
+                // HDR + full chroma: packed 10-bit RGB (BT.2020 PQ), which NVENC CSCs to YUV
+                // 4:4:4 itself — the HDR twin of the SDR BGRA passthrough below. No subsampling
+                // anywhere on this path (see `HdrRgb10Converter`).
+                return (DXGI_FORMAT_R10G10B10A2_UNORM, PixelFormat::Rgb10a2);
             }
             (DXGI_FORMAT_P010, PixelFormat::P010)
         } else if self.want_444 {
@@ -798,6 +812,7 @@ impl IddPushCapturer {
         self.out_ring.clear(); // the output format changed → rebuild lazily at the new format
         self.video_conv = None; // converters are sized + HDR-specific → rebuild at the new mode
         self.hdr_p010_conv = None;
+        self.hdr_rgb10_conv = None;
         // The PyroWave CSC is mode-baked too (BgraToYuvPlanes picks different SDR vs HDR shaders
         // and R8/R8G8 vs R16/R16G16 outputs). Without this, a display_hdr flip (Downgrade point D:
         // client_10bit=true but HDR couldn't enable at open) reused the stale SDR converter against
@@ -981,7 +996,12 @@ impl IddPushCapturer {
                 } else {
                     None
                 };
-                self.out_ring.push(OutSlot { tex, p010 });
+                let rgb10 = if format == DXGI_FORMAT_R10G10B10A2_UNORM {
+                    Some(HdrRgb10Converter::rtv(&self.device, &tex)?)
+                } else {
+                    None
+                };
+                self.out_ring.push(OutSlot { tex, p010, rgb10 });
             }
         }
         Ok(())
@@ -1076,7 +1096,13 @@ impl IddPushCapturer {
     /// SDR display, or the FP16→P010 shader on an HDR display. Both keep NVENC's RGB→YUV CSC off the SM.
     /// An SDR 4:4:4 session needs NO converter — the BGRA slot passes through (see `out_format`).
     fn ensure_converter(&mut self) -> Result<()> {
-        if self.display_hdr {
+        if self.display_hdr && self.want_444 {
+            // HDR + full chroma: one full-res pass to packed 10-bit BT.2020 PQ RGB; NVENC does
+            // the RGB→YUV444 CSC (there is nothing to subsample, so no second pass).
+            if self.hdr_rgb10_conv.is_none() {
+                self.hdr_rgb10_conv = Some(HdrRgb10Converter::new(&self.device)?);
+            }
+        } else if self.display_hdr {
             if self.hdr_p010_conv.is_none() {
                 self.hdr_p010_conv = Some(HdrP010Converter::new(
                     &self.device,
@@ -1537,7 +1563,7 @@ impl IddPushCapturer {
             self.ensure_out_ring()?;
             self.ensure_converter()?;
             let s = &self.out_ring[i];
-            (Some((s.tex.clone(), s.p010.clone())), None)
+            (Some((s.tex.clone(), s.p010.clone(), s.rgb10.clone())), None)
         };
         let (_, pf) = self.out_format();
         let ring_len = if self.pyrowave {
@@ -1584,11 +1610,20 @@ impl IddPushCapturer {
                         let src = blended.as_ref().map(|(_, srv)| srv).unwrap_or(&slot_srv);
                         conv.convert(&self.context, src, y_rtv, cbcr_rtv, self.width, self.height)?;
                     }
+                } else if self.display_hdr && self.want_444 {
+                    // HDR 4:4:4: FP16 slot SRV → packed 10-bit BT.2020 PQ RGB; NVENC ingests it as
+                    // ABGR10 and CSCs to YUV 4:4:4 under FREXT (HEVC Main 4:4:4 10).
+                    if let Some(conv) = self.hdr_rgb10_conv.as_ref() {
+                        let src = blended.as_ref().map(|(_, srv)| srv).unwrap_or(&slot_srv);
+                        let (_, _, rtv) = out.as_ref().expect("out ring");
+                        let rtv = rtv.as_ref().expect("Rgb10a2 out slot has an RTV");
+                        conv.convert(&self.context, src, rtv, self.width, self.height)?;
+                    }
                 } else if self.display_hdr {
                     // HDR: FP16 slot SRV → P010 (BT.2020 PQ) via the shader; NVENC takes native P010.
                     if let Some(conv) = self.hdr_p010_conv.as_ref() {
                         let src = blended.as_ref().map(|(_, srv)| srv).unwrap_or(&slot_srv);
-                        let (_, rtvs) = out.as_ref().expect("out ring");
+                        let (_, rtvs, _) = out.as_ref().expect("out ring");
                         // The slot's P010 plane views, built once in `ensure_out_ring`.
                         let (y_rtv, uv_rtv) = rtvs.as_ref().expect("P010 out slot has plane RTVs");
                         conv.convert(&self.context, src, y_rtv, uv_rtv, self.width, self.height)?;
@@ -2005,21 +2040,6 @@ impl Capturer for IddPushCapturer {
             return false;
         }
         true
-    }
-}
-
-/// A 4:4:4 session while the display is HDR: there is no 10-bit full-chroma source (the FP16
-/// desktop needs the PQ tone curve, which the P010 shader provides at 4:2:0), so the stream
-/// honestly downgrades — the encoder's `chroma_444` caps cross-check reports it and the in-band
-/// SPS keeps the client decoding correctly. Once per process: the state can flap mid-session.
-fn warn_444_hdr_downgrade_once() {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    static ONCE: AtomicBool = AtomicBool::new(true);
-    if ONCE.swap(false, Ordering::Relaxed) {
-        tracing::warn!(
-            "4:4:4 negotiated but the display is HDR — no 10-bit full-chroma source exists; \
-             encoding HDR 4:2:0 (P010) instead (disable HDR on the virtual display for 4:4:4)"
-        );
     }
 }
 

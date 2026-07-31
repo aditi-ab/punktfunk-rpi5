@@ -644,6 +644,7 @@ impl IddPushCapturer {
                 out_idx: 0,
                 video_conv: None,
                 hdr_p010_conv: None,
+                hdr_rgb10_conv: None,
                 last_seq: 0,
                 last_present: None,
                 status_logged: false,

@@ -44,8 +44,8 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_USAGE_IMMUTABLE, D3D11_USAGE_STAGING, D3D11_VIEWPORT,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_FORMAT, DXGI_FORMAT_P010, DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R16G16_UNORM,
-    DXGI_FORMAT_R16_UNORM, DXGI_SAMPLE_DESC,
+    DXGI_FORMAT, DXGI_FORMAT_P010, DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT,
+    DXGI_FORMAT_R16G16_UNORM, DXGI_FORMAT_R16_UNORM, DXGI_SAMPLE_DESC,
 };
 
 /// How many times DXGI has actually called our hooked `NtGdiDdDDIGetCachedHybridQueryValue`.
@@ -362,11 +362,145 @@ float2 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
 }
 ";
 
+/// scRGB FP16 → **R10G10B10A2** (BT.2020 PQ, FULL-range RGB) — one full-res pass, the HDR twin of
+/// the SDR 4:4:4 BGRA passthrough. Keeps full chroma all the way to the encoder: NVENC ingests the
+/// packed 10-bit RGB (`NV_ENC_BUFFER_FORMAT_ABGR10`) and CSCs it to YUV **4:4:4** itself under
+/// FREXT, per the BT.2020/PQ VUI the encoder writes — HEVC Main 4:4:4 10. Without this the HDR
+/// path had only [`HdrP010Converter`], whose chroma pass subsamples, so a session that negotiated
+/// 4:4:4 on an HDR display silently fell back to 4:2:0.
+///
+/// The colour math is [`HDR_P010_COMMON`]'s `scrgb_to_pq2020` verbatim — the SAME pixels the P010
+/// luma pass starts from — so the two HDR outputs agree bit-for-bit before quantization. Only the
+/// destination differs: no RGB→YUV, no studio-range squeeze and no chroma decimation here, just the
+/// hardware's UNORM quantization of the PQ values into 10 bits per channel.
+///
+/// Channel order: DXGI `R10G10B10A2_UNORM` stores R in the low 10 bits, which is exactly what
+/// NVENC calls `ABGR10` (it names A2B10G10R10 from the MSB down) — the same relationship the SDR
+/// path relies on between DXGI `B8G8R8A8` and NVENC's `ARGB`. So the shader writes natural RGB
+/// order and no swizzle is needed.
+pub(crate) struct HdrRgb10Converter {
+    vs: ID3D11VertexShader,
+    ps: ID3D11PixelShader,
+    sampler: ID3D11SamplerState,
+}
+
+/// R10G10B10A2 pass PS — full-res, writes PQ-encoded BT.2020 RGB straight to the packed 10-bit
+/// target. `saturate` is implicit in the UNORM render target; `scrgb_to_pq2020` already clamps.
+const HDR_RGB10_PS: &str = r"
+#include_common
+float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
+    return float4(scrgb_to_pq2020(uv), 1.0);
+}
+";
+
+impl HdrRgb10Converter {
+    pub(crate) fn new(device: &ID3D11Device) -> Result<Self> {
+        // SAFETY: every call is a `?`-checked D3D11 method on the live `device` borrow, over
+        // fully-initialized stack descriptors and live `Option` out-params; `compile_shader`
+        // receives `s!()` literals (its contract). Each created COM interface owns its own
+        // reference, and no raw pointer outlives the call that produced it.
+        unsafe {
+            let src = HDR_RGB10_PS.replace("#include_common", HDR_P010_COMMON);
+            let vsb = compile_shader(HDR_VS, s!("main"), s!("vs_5_0"))?;
+            let psb = compile_shader(&src, s!("main"), s!("ps_5_0"))?;
+            let mut vs = None;
+            device.CreateVertexShader(&vsb, None, Some(&mut vs))?;
+            let mut ps = None;
+            device.CreatePixelShader(&psb, None, Some(&mut ps))?;
+            // POINT, like the P010 luma pass: this is a 1:1 full-res resample, so every RT pixel
+            // maps to exactly one source texel centre and filtering would only blur it.
+            let sd = D3D11_SAMPLER_DESC {
+                Filter: D3D11_FILTER_MIN_MAG_MIP_POINT,
+                AddressU: D3D11_TEXTURE_ADDRESS_CLAMP,
+                AddressV: D3D11_TEXTURE_ADDRESS_CLAMP,
+                AddressW: D3D11_TEXTURE_ADDRESS_CLAMP,
+                ComparisonFunc: D3D11_COMPARISON_NEVER,
+                MaxLOD: f32::MAX,
+                ..Default::default()
+            };
+            let mut sampler = None;
+            device.CreateSamplerState(&sd, Some(&mut sampler))?;
+            Ok(Self {
+                vs: vs.context("rgb10 vs")?,
+                ps: ps.context("rgb10 ps")?,
+                sampler: sampler.context("rgb10 sampler")?,
+            })
+        }
+    }
+
+    /// A plain (non-planar) RTV of the packed 10-bit output texture. Built once per out-ring slot,
+    /// like the P010 plane views — never per frame.
+    pub(crate) fn rtv(
+        device: &ID3D11Device,
+        dst: &ID3D11Texture2D,
+    ) -> Result<ID3D11RenderTargetView> {
+        // SAFETY: one `?`-checked `CreateRenderTargetView` on the live `device` borrow, with a
+        // fully-initialized descriptor local whose address is taken only for the synchronous call,
+        // plus a live `Option` out-param.
+        unsafe {
+            let desc = D3D11_RENDER_TARGET_VIEW_DESC {
+                Format: DXGI_FORMAT_R10G10B10A2_UNORM,
+                ViewDimension: D3D11_RTV_DIMENSION_TEXTURE2D,
+                Anonymous: D3D11_RENDER_TARGET_VIEW_DESC_0 {
+                    Texture2D: D3D11_TEX2D_RTV { MipSlice: 0 },
+                },
+            };
+            let mut rtv: Option<ID3D11RenderTargetView> = None;
+            device
+                .CreateRenderTargetView(
+                    dst,
+                    Some(&desc as *const D3D11_RENDER_TARGET_VIEW_DESC),
+                    Some(&mut rtv),
+                )
+                .context("CreateRenderTargetView(R10G10B10A2 out slot)")?;
+            rtv.context("rgb10 rtv null")
+        }
+    }
+
+    /// Convert `src_srv` (FP16 scRGB, WxH) into the `R10G10B10A2` texture behind `rtv`.
+    pub(crate) fn convert(
+        &self,
+        ctx: &ID3D11DeviceContext,
+        src_srv: &ID3D11ShaderResourceView,
+        rtv: &ID3D11RenderTargetView,
+        w: u32,
+        h: u32,
+    ) -> Result<()> {
+        // SAFETY: all D3D11 work runs on the caller's live `ctx` borrow (the owning capture
+        // thread's immediate context) over borrowed slices of fully-initialized locals and clones
+        // of the caller's live SRV/RTV. No raw pointers and no mapping on this path.
+        unsafe {
+            ctx.OMSetBlendState(None, None, 0xffff_ffff); // opaque overwrite
+            ctx.VSSetShader(&self.vs, None);
+            ctx.PSSetShaderResources(0, Some(&[Some(src_srv.clone())]));
+            ctx.PSSetSamplers(0, Some(&[Some(self.sampler.clone())]));
+            ctx.IASetInputLayout(None);
+            ctx.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            let vp = D3D11_VIEWPORT {
+                TopLeftX: 0.0,
+                TopLeftY: 0.0,
+                Width: w as f32,
+                Height: h as f32,
+                MinDepth: 0.0,
+                MaxDepth: 1.0,
+            };
+            ctx.RSSetViewports(Some(&[vp]));
+            ctx.OMSetRenderTargets(Some(&[Some(rtv.clone())]), None);
+            ctx.PSSetShader(&self.ps, None);
+            ctx.Draw(3, 0);
+            // Unbind for the next frame's re-RTV / NVENC read.
+            ctx.OMSetRenderTargets(Some(&[None]), None);
+            ctx.PSSetShaderResources(0, Some(&[None]));
+            Ok(())
+        }
+    }
+}
+
 /// scRGB FP16 → **P010** (BT.2020 PQ, 10-bit limited/studio range) conversion, in OUR OWN shader (two
 /// passes: full-res luma + half-res chroma). NVIDIA's D3D11 VideoProcessor cannot do RGB→P010 (renders
 /// green), so we quantize to studio-range 10-bit YUV directly and feed NVENC native P010 — skipping
 /// NVENC's internal RGB→YUV CSC (which runs on the contended SM). One per capture device (rebuilt on
-/// device recreate).
+/// device recreate). The 4:4:4 twin is [`HdrRgb10Converter`].
 ///
 /// Plane writes use per-plane render-target views of the single P010 texture: an `R16_UNORM` RTV
 /// selects plane 0 (luma, full WxH), an `R16G16_UNORM` RTV selects plane 1 (chroma, W/2 x H/2). This
