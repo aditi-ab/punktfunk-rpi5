@@ -380,11 +380,12 @@ pub(super) fn run_async(
             if p.pump(&codec, clock, &tracker, &stats, now_monotonic_ns()) {
                 rendered += 1;
             }
-            // The 1 Hz window flush doubles as the phase-lock report tick: the measured latch
-            // p50 is the arrival-lead error signal the host's capture controller drives toward
-            // its target (design/phase-locked-capture.md §6). Timestamps convert
-            // monotonic→realtime→host here — the skew offset lives only client-side.
-            if let (Some(latch_p50_ns), Some(c)) = (p.flush_log(&meter, clock), clock) {
+            // The 1 Hz window flush doubles as the phase-lock report tick: the CIRCULAR
+            // (vector-mean) latch phase + coherence are the host capture controller's v2 error
+            // signal (design/phase-locked-capture.md §6; a median is immovable under jitter).
+            // Timestamps convert monotonic→realtime→host — the skew offset lives client-side.
+            if let (Some((circ_latch_ns, coherence)), Some(c)) = (p.flush_log(&meter, clock), clock)
+            {
                 let period = c.panel_period_ns().max(c.period_ns());
                 if period > 0 {
                     if let Some(t) = c.next_target(now_monotonic_ns(), 0) {
@@ -398,7 +399,8 @@ pub(super) fn run_async(
                             latch_host_ns,
                             period.clamp(0, u32::MAX as i64) as u32,
                             1_000_000, // skew residual + latch jitter — conservative 1 ms
-                            latch_p50_ns.min(u32::MAX as u64) as u32,
+                            circ_latch_ns.min(u32::MAX as u64) as u32,
+                            coherence,
                         );
                     }
                 }
