@@ -679,6 +679,7 @@ fn open_video_backend(
                         bitrate_bps,
                         bit_depth,
                         chroma,
+                        max_slices,
                     )
                     .map(|e| (Box::new(e) as Box<dyn Encoder>, "nvenc"))
                 }
