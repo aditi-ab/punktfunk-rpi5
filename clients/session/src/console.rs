@@ -140,10 +140,10 @@ pub fn run(target: Option<&str>) -> u8 {
     let settings_at_start = trust::Settings::load();
     // The console's window and its input models are built ONCE, from the global defaults, and
     // live across every launch — so the presentation-tier fields below (stats tier, touch and
-    // mouse model, match-window, render scale) are latched here and a per-host profile cannot
-    // move them in this mode. Everything the HOST is told (mode, bitrate, codec, audio, pad) is
-    // re-resolved per launch and does honor the binding. Closing that gap means rebuilding the
-    // presenter's models per launch — profiles P4 territory, not P0.
+    // mouse model, shortcut inhibit, match-window, render scale) are latched here and a per-host
+    // profile cannot move them in this mode. Everything the HOST is told (mode, bitrate, codec,
+    // audio, pad) is re-resolved per launch and does honor the binding. Closing that gap means
+    // rebuilding the presenter's models per launch — profiles P4 territory, not P0.
     let latched_mouse = settings_at_start.mouse_mode();
 
     // Request-access hand-off: the launch handler stamps this when it starts a delegated-approval
@@ -168,6 +168,7 @@ pub fn run(target: Option<&str>) -> u8 {
         touch_mode: settings_at_start.touch_mode(),
         mouse_mode: settings_at_start.mouse_mode(),
         invert_scroll: settings_at_start.invert_scroll,
+        inhibit_shortcuts: settings_at_start.inhibit_shortcuts,
         json_status,
         on_connected: Some(Box::new(move |fingerprint: [u8; 32]| {
             let fp_hex = trust::hex(&fingerprint);

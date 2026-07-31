@@ -572,6 +572,7 @@ mod session_main {
             touch_mode: settings.touch_mode(),
             mouse_mode: settings.mouse_mode(),
             invert_scroll: settings.invert_scroll,
+            inhibit_shortcuts: settings.inhibit_shortcuts,
             json_status: true,
             on_connected: Some(Box::new(|fingerprint: [u8; 32]| {
                 // This host's card carries the accent bar in the desktop client now.

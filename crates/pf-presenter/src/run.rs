@@ -55,6 +55,11 @@ pub struct SessionOpts {
     pub mouse_mode: MouseMode,
     /// Reverse the scroll direction sent to the host ([`Settings::invert_scroll`]).
     pub invert_scroll: bool,
+    /// Send system chords (Alt+Tab, the Windows key / Super) to the host while input is
+    /// captured ([`Settings::inhibit_shortcuts`], default on). Off keeps them local — the
+    /// work profile that streams on a second screen and still Alt-Tabs here. Never applies
+    /// under the `desktop` mouse model, which is something you Alt-Tab *away* from.
+    pub inhibit_shortcuts: bool,
     /// Emit the `{"ready":true}` stdout line after the first presented frame.
     pub json_status: bool,
     /// Called once on `Connected` with the host's fingerprint (trust persistence is the
@@ -505,6 +510,9 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
     let mouse = sdl.mouse();
 
     let mut fullscreen = opts.fullscreen;
+    // Latched for the loop's life, like the other input models: `opts` is borrowed mutably
+    // for its callbacks at several of the `apply_capture` sites.
+    let inhibit_shortcuts = opts.inhibit_shortcuts;
     let mut stats_verbosity = opts.stats_verbosity;
     let mut overlay_frame: Option<OverlayFrame> = None;
     // SDL text input tracks the overlay's editing state (started = IME/`TextInput`
@@ -548,7 +556,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                     WindowEvent::FocusLost => {
                         if let Some(cap) = stream.as_mut().and_then(|s| s.capture.as_mut()) {
                             if cap.release(false) {
-                                apply_capture(&mut window, &mouse, false, false);
+                                apply_capture(&mut window, &mouse, false, false, inhibit_shortcuts);
                                 tracing::info!("focus lost — input released");
                             }
                         }
@@ -559,7 +567,13 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         if let Some(cap) = stream.as_mut().and_then(|s| s.capture.as_mut()) {
                             if cap.should_reengage() {
                                 cap.engage();
-                                apply_capture(&mut window, &mouse, true, cap.desktop());
+                                apply_capture(
+                                    &mut window,
+                                    &mouse,
+                                    true,
+                                    cap.desktop(),
+                                    inhibit_shortcuts,
+                                );
                                 tracing::info!("focus gained — input recaptured");
                             }
                         }
@@ -595,10 +609,16 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         if let Some(cap) = stream.as_mut().and_then(|s| s.capture.as_mut()) {
                             if cap.captured() {
                                 cap.release(true);
-                                apply_capture(&mut window, &mouse, false, false);
+                                apply_capture(&mut window, &mouse, false, false, inhibit_shortcuts);
                             } else {
                                 cap.engage();
-                                apply_capture(&mut window, &mouse, true, cap.desktop());
+                                apply_capture(
+                                    &mut window,
+                                    &mouse,
+                                    true,
+                                    cap.desktop(),
+                                    inhibit_shortcuts,
+                                );
                             }
                             tracing::info!(captured = cap.captured(), "chord: release/engage");
                         }
@@ -613,7 +633,13 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                                 match cap.toggle_desktop() {
                                     Some(desktop) => {
                                         if cap.captured() {
-                                            apply_capture(&mut window, &mouse, true, desktop);
+                                            apply_capture(
+                                                &mut window,
+                                                &mouse,
+                                                true,
+                                                desktop,
+                                                inhibit_shortcuts,
+                                            );
                                         }
                                         flipped = true;
                                         tracing::info!(desktop, "chord: mouse mode");
@@ -636,7 +662,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         if let Some(st) = &mut stream {
                             tracing::info!("chord: disconnect");
                             st.request_quit();
-                            apply_capture(&mut window, &mouse, false, false);
+                            apply_capture(&mut window, &mouse, false, false, inhibit_shortcuts);
                             // The pump emits Ended(None); the end path routes per mode.
                         }
                         continue;
@@ -704,7 +730,13 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         if !cap.captured() {
                             // The engaging click is suppressed toward the host.
                             cap.engage();
-                            apply_capture(&mut window, &mouse, true, cap.desktop());
+                            apply_capture(
+                                &mut window,
+                                &mouse,
+                                true,
+                                cap.desktop(),
+                                inhibit_shortcuts,
+                            );
                         } else {
                             cap.on_button_down(mouse_btn);
                         }
@@ -851,7 +883,13 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                     if let Some(cap) = st.capture.as_mut() {
                         // Desired model: hint ⇒ capture (desktop off); clear ⇒ desktop on.
                         if cap.captured() && cap.set_desktop(!hint) {
-                            apply_capture(&mut window, &mouse, true, cap.desktop());
+                            apply_capture(
+                                &mut window,
+                                &mouse,
+                                true,
+                                cap.desktop(),
+                                inhibit_shortcuts,
+                            );
                             if cap.desktop() {
                                 // Reappear where the host last had the pointer, so the
                                 // hand-back is seamless (Parsec's positionX/Y idea).
@@ -894,7 +932,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
         while escape_rx.try_recv().is_ok() {
             if let Some(cap) = stream.as_mut().and_then(|s| s.capture.as_mut()) {
                 if cap.release(true) {
-                    apply_capture(&mut window, &mouse, false, false);
+                    apply_capture(&mut window, &mouse, false, false, inhibit_shortcuts);
                 }
             }
             if fullscreen && !opts.fullscreen {
@@ -907,7 +945,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
             if let Some(st) = &mut stream {
                 tracing::info!("controller chord: disconnect");
                 st.request_quit();
-                apply_capture(&mut window, &mouse, false, false);
+                apply_capture(&mut window, &mouse, false, false, inhibit_shortcuts);
             }
         }
 
@@ -1017,7 +1055,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         abs_ok,
                     );
                     cap.engage(); // capture engages when the stream starts (ui_stream parity)
-                    apply_capture(&mut window, &mouse, true, cap.desktop());
+                    apply_capture(&mut window, &mouse, true, cap.desktop(), inhibit_shortcuts);
                     st.capture = Some(cap);
                     st.cursor_chan = Some(crate::cursor::CursorChannel::new(&c));
                     st.connector = Some(c);
@@ -1070,7 +1108,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         if let Some(st) = stream.take() {
                             st.shutdown();
                         }
-                        apply_capture(&mut window, &mouse, false, false);
+                        apply_capture(&mut window, &mouse, false, false, inhibit_shortcuts);
                         if let Some(o) = overlay.as_mut() {
                             // A user-canceled dial ends silently — no error scene.
                             if canceled {
@@ -1087,7 +1125,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                     if let Some(cap) = &mut st.capture {
                         cap.release(true);
                     }
-                    apply_capture(&mut window, &mouse, false, false);
+                    apply_capture(&mut window, &mouse, false, false, inhibit_shortcuts);
                     match &mode {
                         ModeCtl::Single(_) => break 'main Some(Outcome::Ended(reason)),
                         ModeCtl::Browse(_) => {
@@ -1676,11 +1714,17 @@ impl ResizeIndicator {
 }
 
 /// Apply the capture state to the window: pointer lock (relative mouse + hidden cursor)
-/// and — on Windows — a keyboard grab, so system chords (Alt+Tab, the Windows key) reach
-/// the host while captured instead of the local shell. SDL implements the grab there
-/// with a low-level keyboard hook, the same mechanism the WinUI shell's in-process
-/// client used its own WH_KEYBOARD_LL hooks for. Not engaged on Linux: the compositor
-/// shortcut-inhibit story stays the shells' concern (Settings.inhibit_shortcuts).
+/// and a keyboard grab, so system chords (Alt+Tab, the Windows key / Super) reach the
+/// host while captured instead of the local shell. SDL implements the grab per platform:
+/// a low-level keyboard hook on Windows (the same mechanism the WinUI shell's in-process
+/// client used its own WH_KEYBOARD_LL hooks for), `zwp_keyboard_shortcuts_inhibit_manager_v1`
+/// on Wayland, `XGrabKeyboard` (plus the `_XWAYLAND_MAY_GRAB_KEYBOARD` message under
+/// XWayland) on X11.
+///
+/// `inhibit` is [`Settings::inhibit_shortcuts`] — off leaves every system chord with the
+/// local shell mid-stream, which is what a second-screen/work profile wants. It only ever
+/// *removes* a grab: capture state still gates it, so releasing input (focus loss, the
+/// Ctrl+Alt+Shift+Q chord, session end) always hands the chords back.
 ///
 /// The `desktop` mouse model never locks: the pointer roams (and leaves the window)
 /// freely, the local cursor is hidden over the window — the host's composited cursor,
@@ -1692,11 +1736,32 @@ fn apply_capture(
     mouse: &sdl3::mouse::MouseUtil,
     on: bool,
     desktop: bool,
+    inhibit: bool,
 ) {
     mouse.set_relative_mouse_mode(window, on && !desktop);
     mouse.show_cursor(!on);
-    #[cfg(windows)]
-    window.set_keyboard_grab(on && !desktop);
+    let grab = on && !desktop && inhibit;
+    if !window.set_keyboard_grab(grab) && grab {
+        // The one refusal SDL reports is a missing mechanism — a Wayland compositor with no
+        // shortcuts-inhibit global. Said once per process: the answer never changes
+        // mid-session, and this runs on every engage. Under gamescope that is the expected
+        // shape, not a problem — it has no shortcuts of its own and hands the focused window
+        // every key already — so it stays at debug there rather than crying wolf once per
+        // Deck stream.
+        static SAID: AtomicBool = AtomicBool::new(false);
+        if !SAID.swap(true, Ordering::Relaxed) {
+            let err = sdl3::get_error();
+            if std::env::var_os("GAMESCOPE_WAYLAND_DISPLAY").is_some() {
+                tracing::debug!(error = %err, "no keyboard grab under gamescope — chords already ours");
+            } else {
+                tracing::warn!(
+                    error = %err,
+                    "capture system shortcuts is on, but this compositor offers no way to grab \
+                     the keyboard — system chords stay with the local shell"
+                );
+            }
+        }
+    }
 }
 
 /// Is this SDL touch device a real touchscreen (DIRECT, window-relative coordinates)?

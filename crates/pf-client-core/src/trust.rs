@@ -719,7 +719,11 @@ pub struct Settings {
     /// capture — today's behavior.
     #[serde(default = "default_mouse_mode")]
     pub mouse_mode: String,
-    /// Grab compositor shortcuts (Alt+Tab, Super…) while input is captured.
+    /// Send system chords (Alt+Tab, Super / the Windows key) to the host while input is
+    /// captured under the `capture` mouse model; off leaves them with the local shell.
+    /// Read at connect into the presenter's session opts, which turns it into an SDL
+    /// keyboard grab (a low-level hook on Windows, shortcuts-inhibit or `XGrabKeyboard`
+    /// on Linux). The `desktop` mouse model never grabs, whatever this says.
     pub inhibit_shortcuts: bool,
     /// Stream the default microphone to the host's virtual mic source.
     pub mic_enabled: bool,

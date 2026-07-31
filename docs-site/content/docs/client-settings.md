@@ -127,11 +127,16 @@ console home. Pinning one restricts the session to that controller alone — sin
 app has no such picker.
 
 **Capture system shortcuts** — *default: on.* Offered by the Linux and Windows apps only; Windows
-spells the row out as *Capture system shortcuts (Alt+Tab, Win, …)*. **It is not wired up yet.** The
-value is stored, and a profile can even override it, but nothing in a running session reads it, so
-the toggle changes nothing today. What actually happens is fixed: on Windows the session window
-grabs the keyboard whenever input is captured in Capture mouse mode, so Alt+Tab and the Windows key
-reach the host either way, and on Linux nothing inhibits the compositor's own shortcuts either way.
+spells the row out as *Capture system shortcuts (Alt+Tab, Win, …)*. On, Alt+Tab and the Windows key
+(Super on Linux) reach the host while the stream has input captured. Off, they act on this machine
+instead — what you want when the stream shares a screen with local work. Either way the chords come
+back the moment you release capture with **Ctrl+Alt+Shift+Q**, the window loses focus, or the stream
+ends, and [Desktop mouse mode](/docs/input#mouse-modes) never takes them at all. Leaving this on does
+mean **Ctrl+Alt+Shift+Q is your way out** of a captured stream, since Alt+Tab no longer is.
+
+On Linux this needs a compositor that supports keyboard-shortcuts-inhibit — KDE Plasma, GNOME and
+the wlroots compositors all do, and X11 sessions grab the keyboard directly. Under
+[gamescope](/docs/gamescope) there is nothing to inhibit: it hands the session everything already.
 
 **Invert scroll direction** — *default: off*, i.e. the host scrolls the way this machine does.
 

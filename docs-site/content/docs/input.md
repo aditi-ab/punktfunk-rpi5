@@ -76,9 +76,10 @@ an Xbox pad), held on any connected pad.
 There are two, and they are a per-client setting called **Mouse input**:
 
 - **Capture (games)** — the pointer locks to the stream and only relative movement is sent. The only
-  cursor you see is the host's. This is what mouse-look in a game needs. On Windows the session
-  window also grabs the keyboard here, so Alt+Tab and the Windows key reach the host rather than your
-  own desktop. (The Linux session window does not do this.)
+  cursor you see is the host's. This is what mouse-look in a game needs. The session window also
+  grabs the keyboard here, so Alt+Tab and the Windows key (Super on Linux) reach the host rather than
+  your own desktop — turn **Capture system shortcuts** off in
+  [client settings](/docs/client-settings#input) to keep them local.
 - **Desktop (absolute)** — the pointer is not locked. It moves in and out of the stream freely and
   its position is sent as an absolute point — what you want for remote desktop work. Your local
   cursor is hidden over the stream; the one you see there is the host's.

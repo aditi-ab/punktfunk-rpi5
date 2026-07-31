@@ -113,6 +113,10 @@ export interface StreamSettings {
   codec?: string; // "auto" | "hevc" | "h264" | "av1" — soft preference (absent in pre-codec files)
   gamepad: string; // "auto" | "xbox360" | "xboxone" | "dualsense" | "dualshock4" | "steamdeck"
   compositor: string; // "auto" | "kwin" | "wlroots" | "mutter" | "gamescope"
+  // Round-trips only — deliberately NOT offered as a row here. It decides whether the session
+  // grabs the keyboard so Alt+Tab/Super reach the host, and Game Mode is gamescope: it has no
+  // compositor shortcuts to inhibit and hands the focused window every key already. A toggle
+  // here would be a dead one. The desktop client's row still edits this same file.
   inhibit_shortcuts: boolean;
   mic_enabled: boolean;
 }
