@@ -1,6 +1,7 @@
 import { useQueryClient } from "@tanstack/react-query";
 import { Info, KeyRound } from "lucide-react";
 import { type FC, useState } from "react";
+import { getListPairedClientsQueryKey } from "@/api/gen/clients/clients";
 import type { PairingStatus } from "@/api/gen/model/pairingStatus";
 import {
 	getGetPairingStatusQueryKey,
@@ -22,16 +23,23 @@ export const MoonlightPairingSection: FC = () => {
 	const pairing = useGetPairingStatus({ query: { refetchInterval: 2_000 } });
 	const submit = useSubmitPairingPin();
 
-	const onSubmit = () =>
+	const onSubmit = () => {
+		// The mutation's success/error flags outlive the form: without this, starting a SECOND
+		// pairing attempt showed the previous one's "PIN sent" confirmation before a digit was typed.
+		submit.reset();
 		submit.mutate(
 			{ data: { pin } },
 			{
 				onSuccess: () => {
 					setPin("");
 					qc.invalidateQueries({ queryKey: getGetPairingStatusQueryKey() });
+					// The success message tells the operator to check the paired list, so refresh it —
+					// both planes, since this card's count spans them.
+					qc.invalidateQueries({ queryKey: getListPairedClientsQueryKey() });
 				},
 			},
 		);
+	};
 
 	return (
 		<MoonlightPairing

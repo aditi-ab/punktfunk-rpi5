@@ -46,9 +46,19 @@ const ICONS: Record<string, LucideIcon> = {
 	clapperboard: Clapperboard,
 };
 
-/** Resolve a registered icon name to a component (Puzzle fallback). */
-export const pluginIcon = (name?: string): LucideIcon =>
-	(name ? ICONS[name] : undefined) ?? Puzzle;
+/**
+ * Resolve a registered icon name to a component (Puzzle fallback).
+ *
+ * `name` comes from a plugin's own registration, so it is untrusted input to a lookup on a plain
+ * object — and a plain object inherits from Object.prototype. `ICONS["constructor"]` is `Object`,
+ * which is truthy, so a `?? Puzzle` fallback never fires and React is handed `Object` as a
+ * component: it throws out of render, and because this runs inside the AppShell nav that takes
+ * down every page of the console. `Object.hasOwn` keeps the lookup to keys we actually declared.
+ */
+export const pluginIcon = (name?: string): LucideIcon => {
+	if (!name || !Object.hasOwn(ICONS, name)) return Puzzle;
+	return ICONS[name] ?? Puzzle;
+};
 
 /** Live plugin registrations, polled (and refetched on window focus) so the nav stays current. */
 export function usePlugins() {

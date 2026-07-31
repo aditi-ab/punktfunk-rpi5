@@ -9,6 +9,7 @@ import {
 	useStopSession,
 } from "@/api/gen/session/session";
 import { useLocale } from "@/lib/i18n";
+import { m } from "@/paraglide/messages";
 import { DashboardView } from "./view";
 
 export const SectionDashboard: FC = () => {
@@ -33,23 +34,52 @@ export const SectionDashboard: FC = () => {
 	 * game whose session is still live ends by stopping that session (what then happens to the game
 	 * follows the operator's policy — stopping a session is not licence to close a game), while a
 	 * game already waiting out its reconnect window has no session left to stop and is ended directly.
+	 *
+	 * Both paths are wider than the row they are attached to, and neither used to say so:
+	 *
+	 * - `DELETE /session` is the host's ONLY stop and it tears down every live session
+	 *   (mgmt/session.rs calls `quit_session` AND `session_status::stop_all_quit`). With two people
+	 *   streaming, "End now" on one row kicked both. There is no per-session stop to call instead,
+	 *   so the honest fix is to name the blast radius before doing it.
+	 * - `POST /game/end` with `app_id: null` means "end EVERY waiting game" to the host, and a grace
+	 *   row for an operator-typed command carries no `app_id` — so that row ended all of them.
 	 */
 	const onEndGame = (game: ActiveGame) => {
+		const games = status.data?.games ?? [];
 		if (game.state === "grace") {
+			const waiting = games.filter((g) => g.state === "grace").length;
+			if (
+				!game.app_id &&
+				waiting > 1 &&
+				!confirm(m.games_end_all_waiting_confirm({ count: waiting }))
+			)
+				return;
 			endGame.mutate(
 				{ data: { app_id: game.app_id ?? null } },
 				{ onSuccess: invalidate },
 			);
-		} else {
-			stop.mutate(undefined, { onSuccess: invalidate });
+			return;
 		}
+		if (!confirmStopAll()) return;
+		stop.mutate(undefined, { onSuccess: invalidate });
+	};
+
+	/** Shared by "End now" on a live row and the card's own Stop-session button: with more than one
+	 * session live, stopping is not a per-client action and the operator has to know that. */
+	const confirmStopAll = (): boolean => {
+		const active = status.data?.active_sessions ?? 0;
+		if (active <= 1) return true;
+		return confirm(m.action_stop_session_all_confirm({ count: active }));
 	};
 
 	return (
 		<DashboardView
 			status={status}
 			library={library.data}
-			onStopSession={() => stop.mutate(undefined, { onSuccess: invalidate })}
+			onStopSession={() => {
+				if (!confirmStopAll()) return;
+				stop.mutate(undefined, { onSuccess: invalidate });
+			}}
 			onRequestIdr={() => idr.mutate(undefined)}
 			onEndGame={onEndGame}
 			isStopping={stop.isPending}

@@ -31,11 +31,13 @@ export const RunningGames: FC<{
 				</CardTitle>
 			</CardHeader>
 			<CardContent className="flex flex-col gap-3">
-				{games.map((g) => (
+				{games.map((g, i) => (
 					<GameRow
 						// A host can run the same title for two clients at once (native admits concurrent
-						// sessions), so the title alone is not a key.
-						key={`${g.plane}:${g.session_id ?? "grace"}:${g.app_id ?? g.title}`}
+						// sessions), so the title alone is not a key. The index is the last resort: every
+						// grace row has a null `session_id`, so two waiting copies of the same title on the
+						// same plane produced identical keys and React collapsed them into one row.
+						key={`${g.plane}:${g.session_id ?? "grace"}:${g.app_id ?? g.title}:${i}`}
 						game={g}
 						art={coverFor(g, library)}
 						onEnd={() => onEnd(g)}

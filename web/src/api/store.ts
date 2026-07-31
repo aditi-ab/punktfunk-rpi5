@@ -209,14 +209,34 @@ export function useStoreRuntime() {
 /**
  * A single install/uninstall job, polled once a second while it runs and left alone once it
  * settles. Pass `null` to park the query (no job in flight).
+ *
+ * The interval keys off "not finished yet" rather than off `state === "running"`. `data` is
+ * undefined in two live cases — the first poll has not landed, and the first poll FAILED — and
+ * treating those as "stop polling" wedged the card: an install whose very first poll lost the race
+ * with a busy host never polled again and the operator saw nothing at all, while an install that
+ * restarts the runner (every successful one does) could drop a poll mid-flight.
+ *
+ * The failure count bounds it: jobs live in host memory, so a host restart makes the id 404 for
+ * good, and something has to stop asking.
  */
+const JOB_POLL_MS = 1_000;
+const JOB_MAX_FAILURES = 15;
+
 export function useStoreJob(id: string | null) {
 	return useQuery({
 		queryKey: storeKeys.job(id ?? ""),
 		queryFn: () =>
 			apiFetch<StoreJob>(`${BASE}/jobs/${encodeURIComponent(id ?? "")}`),
 		enabled: id !== null,
-		refetchInterval: (q) => (q.state.data?.state === "running" ? 1_000 : false),
+		refetchInterval: (q) => {
+			const state = q.state.data?.state;
+			if (state === "done" || state === "failed") return false;
+			if (q.state.fetchFailureCount > JOB_MAX_FAILURES) return false;
+			return JOB_POLL_MS;
+		},
+		// A job that vanished with its host is gone for good; a transient blip is not. Retry a few
+		// times per poll so a runner restart doesn't surface as an error card.
+		retry: 3,
 	});
 }
 

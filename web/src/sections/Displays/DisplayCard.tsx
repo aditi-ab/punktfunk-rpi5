@@ -7,6 +7,7 @@ import {
 	type MouseEvent,
 	type ReactNode,
 	useEffect,
+	useMemo,
 	useRef,
 	useState,
 } from "react";
@@ -96,6 +97,47 @@ export const DisplaySection: FC = () => {
 			},
 		);
 
+	/**
+	 * Apply ONE orthogonal axis — game-session, DDC, PnP — without dragging unsaved Custom edits
+	 * along for the ride.
+	 *
+	 * These three controls apply immediately by design, but they used to send `{...draft}`: flipping
+	 * DDC while the Custom block held unsaved edits committed those edits too, and the shared
+	 * `apply` then overwrote the draft with the server's answer, clearing the "unsaved" badge — so
+	 * the operator got a policy they never saved with no trace it had happened. Send the axis on top
+	 * of the last SAVED policy, and merge only that axis back into the draft.
+	 */
+	/**
+	 * Save the hand-edited Custom block.
+	 *
+	 * `capture_monitor` (the streamed-screen pin) belongs to the monitor picker below, not to this
+	 * form — but it is a field of the same policy object, so a draft seeded before the operator
+	 * changed the streamed screen still carried the OLD value and Save quietly put it back. Defer
+	 * that one axis to whatever the server currently reports.
+	 */
+	const saveDraft = () => {
+		if (!draft) return;
+		apply({ ...draft, capture_monitor: q.data?.settings.capture_monitor });
+	};
+
+	const applyAxis = (patch: Partial<DisplayPolicy>) => {
+		const base = seeded.current ?? draft;
+		if (!base) return;
+		// Reflect the flip straight away, keeping every other unsaved edit intact.
+		setDraft((d) => (d ? { ...d, ...patch } : d));
+		save.mutate(
+			{ data: { ...base, ...patch } },
+			{
+				onSuccess: (res) => {
+					seeded.current = res.settings;
+					setDraft((d) => (d ? { ...d, ...patch } : res.settings));
+					qc.invalidateQueries({ queryKey: getGetDisplaySettingsQueryKey() });
+					toast.success(m.display_settings_saved());
+				},
+			},
+		);
+	};
+
 	// Pending edits: the Custom fields do NOT auto-apply (unlike a preset click or an experimental
 	// toggle), so the draft can silently diverge from what the host is actually running. Reading the
 	// ref during render is safe here because every write to it is paired with a `setDraft`, so a
@@ -144,6 +186,8 @@ export const DisplaySection: FC = () => {
 								presets={q.data.presets}
 								customPresets={q.data.custom_presets}
 								apply={apply}
+								applyAxis={applyAxis}
+								saveDraft={saveDraft}
 								busy={save.isPending}
 								dirty={dirty}
 								revert={revert}
@@ -181,6 +225,10 @@ const DisplayForm: FC<{
 	presets: { id: string; summary: string; fields: EffectivePolicy }[];
 	customPresets: CustomPreset[];
 	apply: (p: DisplayPolicy) => void;
+	/** Apply one orthogonal axis on top of the SAVED policy — never the unsaved draft. */
+	applyAxis: (patch: Partial<DisplayPolicy>) => void;
+	/** Commit the Custom block, deferring axes this form does not own to the server's value. */
+	saveDraft: () => void;
 	busy: boolean;
 	/** The draft differs from what the host has stored — drives the save bar + the discard guard. */
 	dirty: boolean;
@@ -193,6 +241,8 @@ const DisplayForm: FC<{
 	presets,
 	customPresets,
 	apply,
+	applyAxis,
+	saveDraft,
 	busy,
 	dirty,
 	revert,
@@ -637,7 +687,7 @@ const DisplayForm: FC<{
 								{m.display_revert()}
 							</Button>
 						)}
-						<Button onClick={() => apply(draft)} disabled={busy || !dirty}>
+						<Button onClick={saveDraft} disabled={busy || !dirty}>
 							{m.display_save()}
 						</Button>
 					</div>
@@ -654,11 +704,7 @@ const DisplayForm: FC<{
 					options={["auto", "dedicated"]}
 					labels={GAME_SESSION_LABEL}
 					disabled={busy}
-					onPick={(v) => {
-						const next = { ...draft, game_session: v as GameSession };
-						setDraft(next);
-						apply(next);
-					}}
+					onPick={(v) => applyAxis({ game_session: v as GameSession })}
 				/>
 			</div>
 
@@ -671,11 +717,7 @@ const DisplayForm: FC<{
 				offLabel={m.display_ddc_disabled()}
 				onLabel={m.display_ddc_enabled()}
 				busy={busy}
-				onSet={(on) => {
-					const next = { ...draft, ddc_power_off: on };
-					setDraft(next);
-					apply(next);
-				}}
+				onSet={(on) => applyAxis({ ddc_power_off: on })}
 			/>
 			<ExperimentalToggle
 				label={m.display_pnp()}
@@ -684,11 +726,7 @@ const DisplayForm: FC<{
 				offLabel={m.display_pnp_disabled()}
 				onLabel={m.display_pnp_enabled()}
 				busy={busy}
-				onSet={(on) => {
-					const next = { ...draft, pnp_disable_monitors: on };
-					setDraft(next);
-					apply(next);
-				}}
+				onSet={(on) => applyAxis({ pnp_disable_monitors: on })}
 			/>
 
 			{/* What's in force right now */}
@@ -986,22 +1024,44 @@ const DisplayArrangement: FC<{ displays: ApiDisplayInfo[] }> = ({
 }) => {
 	const qc = useQueryClient();
 	const saveLayout = useSetDisplayLayout();
-	// Only displays with a stable identity slot can be pinned (shared/anonymous ones have no key).
-	const arrangeable = displays.filter((d) => d.identity_slot != null);
+	const settings = useGetDisplaySettings();
+	// Every position the host has on file — including devices that are not connected right now.
+	// `PUT /display/layout` REPLACES the whole map (`with_manual_layout` in pf-vdisplay builds a
+	// fresh `Layout`), so anything missing from our payload is deleted. Seeding only from the live
+	// displays therefore wiped the saved placement of every device that happened to be offline.
+	const saved = settings.data?.settings.layout?.positions;
 
-	// Local edit buffer keyed by identity-slot string → {x, y}, seeded once from the current positions.
+	// Only displays with a stable identity slot can be pinned (shared/anonymous ones have no key).
+	const arrangeable = useMemo(
+		() => displays.filter((d) => d.identity_slot != null),
+		[displays],
+	);
+	// Local edit buffer keyed by identity-slot string → {x, y}. `arrangeable` is memoised, and React
+	// Query's structural sharing keeps `displays` identity-stable across polls that changed nothing,
+	// so this effect runs when the set of displays actually changes rather than on every poll. It is
+	// idempotent regardless — it only ever fills in slots it has not seen before.
 	const [pos, setPos] = useState<Record<
 		string,
 		{ x: number; y: number }
 	> | null>(null);
 	useEffect(() => {
-		if (pos === null && arrangeable.length > 0) {
-			const seed: Record<string, { x: number; y: number }> = {};
-			for (const d of arrangeable)
-				seed[String(d.identity_slot)] = { x: d.x, y: d.y };
-			setPos(seed);
-		}
-	}, [arrangeable, pos]);
+		if (arrangeable.length === 0) return;
+		setPos((prev) => {
+			// Seed a display the first time we see it, and never re-seed one the operator may have
+			// since edited: a display that appears mid-edit used to be left out of the buffer entirely
+			// and so dropped from the save.
+			const next = { ...(prev ?? {}) };
+			let changed = prev === null;
+			for (const d of arrangeable) {
+				const k = String(d.identity_slot);
+				if (!(k in next)) {
+					next[k] = { x: d.x, y: d.y };
+					changed = true;
+				}
+			}
+			return changed ? next : prev;
+		});
+	}, [arrangeable]);
 
 	if (arrangeable.length < 2) return null;
 	const cur = pos ?? {};
@@ -1013,7 +1073,9 @@ const DisplayArrangement: FC<{ displays: ApiDisplayInfo[] }> = ({
 
 	const onSave = () =>
 		saveLayout.mutate(
-			{ data: { positions: cur } },
+			// Saved-first, edits on top: the host replaces the whole map, so an absent device's
+			// placement survives only if we send it back.
+			{ data: { positions: { ...saved, ...cur } } },
 			{
 				onSuccess: () => {
 					qc.invalidateQueries({ queryKey: getGetDisplayStateQueryKey() });
