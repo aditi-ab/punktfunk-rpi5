@@ -69,11 +69,18 @@ fn capture_for(mic_render_lname: &str) -> &'static [&'static str] {
 }
 
 /// A render endpoint no loopback should capture: the VB-CABLE (reserved for the mic even when it
-/// isn't the chosen target — capturing a cable someone else feeds echoes too) and the Steam
-/// Streaming Speakers, whose loopback is silent (validated live). Also the capture-side
-/// watchdog's test for "the operator's new default can never work — snap back to the plan".
+/// isn't the chosen target — capturing a cable someone else feeds echoes too), the Steam
+/// Streaming Speakers, whose loopback is silent (validated live), and any VoiceMeeter or
+/// generically-"virtual" endpoint. VoiceMeeter's strips share one internal mixer: capturing ANY
+/// of its render endpoints re-captures what the mic wrote into another one — a digital feedback
+/// loop with no acoustic path to break it (mic=`Voicemeeter Input`, loopback=`Voicemeeter Aux
+/// Input` used to pass the old name checks). Also the capture-side watchdog's test for "the
+/// operator's new default can never work — snap back to the plan".
 pub(crate) fn excluded_from_loopback(lname: &str) -> bool {
-    lname.contains("cable") || lname.contains("steam streaming speakers")
+    lname.contains("cable")
+        || lname.contains("steam streaming speakers")
+        || lname.contains("voicemeeter")
+        || lname.contains("virtual")
 }
 
 /// A render endpoint that is SILENT on the host but loopback-capturable — the client-only audio
@@ -140,10 +147,14 @@ pub(crate) fn plan(
             .iter()
             .find(|(n, id)| not_mic(id) && silent_sink(&n.to_lowercase()))
     };
+    // `virtualish` here too: a virtual endpoint that slipped past `excluded_from_loopback`'s
+    // name list (a future cable/mixer sibling) is an internal-feedback loop waiting to happen —
+    // no loopback is the honest answer, exactly like the cable-only case.
     let leftover = || {
-        renders
-            .iter()
-            .find(|(n, id)| not_mic(id) && !excluded_from_loopback(&n.to_lowercase()))
+        renders.iter().find(|(n, id)| {
+            let ln = n.to_lowercase();
+            not_mic(id) && !excluded_from_loopback(&ln) && !virtualish(&ln)
+        })
     };
     let loopback_render = if host_audio {
         real_hw().or_else(silent).or_else(leftover)
@@ -358,5 +369,60 @@ mod tests {
         let w = plan(&renders, &[], None, false);
         assert!(w.mic_render.is_none());
         assert_eq!(w.loopback_render.unwrap().0, "Speakers (Realtek HD Audio)");
+    }
+
+    /// VoiceMeeter box with real hardware: no cable, so the mic takes `Voicemeeter Input` — and
+    /// the loopback must NEVER be `Voicemeeter Aux Input` (same internal mixer: capturing any
+    /// VoiceMeeter render re-captures what the mic wrote — a digital feedback loop). Real
+    /// hardware wins the loopback in both modes.
+    #[test]
+    fn voicemeeter_aux_never_pairs_with_voicemeeter_mic() {
+        let renders = [
+            ep("Voicemeeter Input (VB-Audio Voicemeeter VAIO)"),
+            ep("Voicemeeter Aux Input (VB-Audio Voicemeeter AUX VAIO)"),
+            ep("Speakers (Realtek HD Audio)"),
+        ];
+        let captures = [ep("Voicemeeter Out B1 (VB-Audio Voicemeeter VAIO)")];
+        for host_audio in [false, true] {
+            let w = plan(&renders, &captures, None, host_audio);
+            assert_eq!(
+                w.mic_render.as_ref().unwrap().0,
+                "Voicemeeter Input (VB-Audio Voicemeeter VAIO)",
+                "host_audio={host_audio}"
+            );
+            assert_eq!(
+                w.loopback_render.as_ref().unwrap().0,
+                "Speakers (Realtek HD Audio)",
+                "host_audio={host_audio}"
+            );
+        }
+    }
+
+    /// Only VoiceMeeter endpoints (headless mixer box): mic wins one, the loopback is honestly
+    /// absent — like the cable-only case, never another strip of the same mixer.
+    #[test]
+    fn voicemeeter_only_no_loopback() {
+        let renders = [
+            ep("Voicemeeter Input (VB-Audio Voicemeeter VAIO)"),
+            ep("Voicemeeter Aux Input (VB-Audio Voicemeeter AUX VAIO)"),
+        ];
+        for host_audio in [false, true] {
+            let w = plan(&renders, &[], None, host_audio);
+            assert!(w.mic_render.is_some(), "host_audio={host_audio}");
+            assert!(w.loopback_render.is_none(), "host_audio={host_audio}");
+        }
+    }
+
+    /// A generically-"virtual" leftover (unknown vendor cable) is refused too: `leftover()`
+    /// applies `virtualish`, so a virtual endpoint that slips past the name list can't become
+    /// the loopback.
+    #[test]
+    fn unknown_virtual_never_loopback() {
+        let renders = [
+            ep("CABLE Input (VB-Audio Virtual Cable)"),
+            ep("Speakers (Some Virtual Audio Device)"),
+        ];
+        let w = plan(&renders, &[], None, false);
+        assert!(w.loopback_render.is_none());
     }
 }

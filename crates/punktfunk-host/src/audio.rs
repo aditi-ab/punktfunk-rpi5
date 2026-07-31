@@ -115,6 +115,47 @@ pub trait VirtualMic: Send {
     fn channels(&self) -> u32 {
         CHANNELS as u32
     }
+
+    /// The adaptive de-jitter target (per-channel samples) the pump measured from uplink
+    /// arrival jitter (see `mic_jitter`). A backend with a jitter ring primes around this PLUS
+    /// one of its own consumer quanta: the ring must absorb arrival burstiness (the pump's
+    /// number) and pull granularity (the backend's own), and neither may buy the other's depth
+    /// — a 2048-frame recorder gets its one quantum, not three. Never called ⇒ the backend
+    /// keeps its legacy fixed constants, which is also how `PUNKTFUNK_MIC_LEGACY_BUFFER=1`
+    /// works (the pump simply never drives the target). Default: no ring, ignored.
+    fn set_target_depth(&self, _samples_per_ch: usize) {}
+
+    /// `(buffered, prime_target)` of the backend's jitter ring in per-channel samples — read
+    /// by the pump's creep trim + telemetry. `None` while unknown (consumer not yet running,
+    /// or a backend without a ring).
+    fn depth(&self) -> Option<(usize, usize)> {
+        None
+    }
+
+    /// Reset-on-read telemetry counters (see [`MicBackendStats`]). Default: all zero.
+    fn take_stats(&self) -> MicBackendStats {
+        MicBackendStats::default()
+    }
+}
+
+/// Reset-on-read counters a [`VirtualMic`] backend reports into the pump's periodic mic
+/// telemetry line ("mic uplink health").
+#[derive(Debug, Default, Clone, Copy)]
+pub struct MicBackendStats {
+    /// Full-drain re-prime arms: the ring emptied and gates on silence until the target depth
+    /// rebuilds. One per talk spurt is normal; several per second mid-speech is the crackle.
+    pub reprimes: u64,
+    /// Per-channel samples dropped by the ring's overflow cap (drop-oldest).
+    pub overflow_dropped: u64,
+}
+
+/// One-release escape hatch (docs: configuration → Audio / microphone):
+/// `PUNKTFUNK_MIC_LEGACY_BUFFER=1` keeps the pre-adaptive fixed mic buffering — the pump never
+/// drives the backend target (so the rings stay on their legacy constants: 48 ms prime /
+/// 120 ms cap on Windows, the 3-quanta clamp on Linux) and never creep-trims depth.
+pub(crate) fn mic_legacy_buffer() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("PUNKTFUNK_MIC_LEGACY_BUFFER").is_some_and(|v| v != "0"))
 }
 
 /// Open a virtual microphone with `channels` interleaved channels (1 or 2). Linux: a PipeWire
@@ -152,5 +193,6 @@ mod wasapi_mic;
 #[path = "audio/wiring_plan.rs"]
 pub(crate) mod wiring_plan;
 
+mod mic_jitter;
 mod mic_pump;
-pub use mic_pump::MicPump;
+pub use mic_pump::{MicFrame, MicPump};

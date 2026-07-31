@@ -19,19 +19,21 @@
 //! returns `false` and the pump reopens (re-planning, so endpoint churn re-resolves). Before this
 //! existed, the first device change silently killed mic passthrough for the rest of the host's life.
 //!
-//! `push` enqueues decoded interleaved-f32 PCM into a bounded ring (drop-oldest beyond ~120 ms so
-//! mic latency stays bounded); a dedicated COM-apartment thread renders it event-driven through an
-//! adaptive jitter buffer (prime → hold → re-prime, see the render loop — clients arrive in bursts,
-//! the device pulls per-period), filling silence when the client isn't talking. WASAPI objects are
-//! `!Send`, so they live entirely on that thread (mirrors `WasapiLoopbackCapturer`).
+//! `push` enqueues decoded interleaved-f32 PCM into a bounded ring (drop-oldest so mic latency
+//! stays bounded — the bound follows the adaptive prime threshold, or the legacy ~120 ms until
+//! the pump drives it); a dedicated COM-apartment thread renders it event-driven through a
+//! jitter buffer (prime → hold → re-prime, see the render loop — clients arrive in bursts, the
+//! device pulls per-period) whose prime depth the mic pump sets from measured uplink jitter
+//! ([`VirtualMic::set_target_depth`]), filling silence when the client isn't talking. WASAPI
+//! objects are `!Send`, so they live entirely on that thread (mirrors `WasapiLoopbackCapturer`).
 
 // Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it.
 #![deny(clippy::undocumented_unsafe_blocks)]
 
-use super::{audio_control, VirtualMic, SAMPLE_RATE};
+use super::{audio_control, MicBackendStats, VirtualMic, SAMPLE_RATE};
 use anyhow::{anyhow, Context, Result};
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -41,24 +43,51 @@ use wasapi::{Direction, SampleType, StreamMode, WaveFormat};
 const CHANNELS: u32 = 2;
 /// 48 kHz stereo f32: 2 channels * 4 bytes.
 const BLOCK_ALIGN: usize = 2 * 4;
-/// Jitter-buffer priming depth (~48 ms): the render loop emits pure silence until this much PCM
-/// is queued, then plays from the cushion. Clients deliver mic audio in BURSTS (the Mac client's
-/// input tap yields ~two 20 ms Opus packets every ~42 ms) while WASAPI pulls a small block every
-/// device period (~10 ms) — with no cushion the queue sits near-empty and most periods insert
-/// mid-stream silence: the "crackling mic" (heard live, Mac → Windows host 2026-07-03; the Linux
-/// backend's process callback primes the same way and the identical stream was clean there). The
-/// depth must cover the worst inter-burst gap (~42 ms), so ~48 ms with re-prime on a full drain.
+/// LEGACY jitter-buffer priming depth (~48 ms): the render loop emits pure silence until this
+/// much PCM is queued, then plays from the cushion. Old clients deliver mic audio in BURSTS
+/// (the Mac client's input tap yields ~two 20 ms Opus packets every ~42 ms) while WASAPI pulls
+/// a small block every device period (~10 ms) — with no cushion the queue sits near-empty and
+/// most periods insert mid-stream silence: the "crackling mic" (heard live, Mac → Windows host
+/// 2026-07-03; the Linux backend's process callback primes the same way and the identical
+/// stream was clean there). The depth had to cover the worst inter-burst gap (~42 ms), so
+/// ~48 ms with re-prime on a full drain. Today the pump MEASURES that gap and drives the prime
+/// threshold per client ([`VirtualMic::set_target_depth`] — bursty clients still get ~48 ms,
+/// modern 10 ms-cadence ones ~25–35 ms); this constant remains the fallback until the pump's
+/// first estimate, and forever under `PUNKTFUNK_MIC_LEGACY_BUFFER=1`.
 const PRIME_BYTES: usize = (SAMPLE_RATE as usize * 48 / 1000) * BLOCK_ALIGN;
-/// Bound the inject queue at ~120 ms so the passed-through mic stays low-latency (drop oldest
-/// beyond): the priming cushion (~48 ms) plus arrival-burst headroom.
+/// LEGACY bound for the inject queue at ~120 ms (drop oldest beyond): the fixed priming
+/// cushion plus arrival-burst headroom. Applies only while the pump isn't driving the target;
+/// adaptive mode bounds the queue at prime + [`CAP_HEADROOM_BYTES`] instead (≈ 50–105 ms).
 const MAX_QUEUE_BYTES: usize = (SAMPLE_RATE as usize * 120 / 1000) * BLOCK_ALIGN;
+/// Producer-side overflow headroom (~32 ms) over the render loop's prime threshold when the
+/// adaptive target drives the ring.
+const CAP_HEADROOM_BYTES: usize = (SAMPLE_RATE as usize * 32 / 1000) * BLOCK_ALIGN;
 
 pub struct WasapiVirtualMic {
     queue: Arc<Mutex<VecDeque<u8>>>,
     stop: Arc<AtomicBool>,
     /// False once the render thread has exited (device error or stop) — the pump's reopen signal.
     alive: Arc<AtomicBool>,
+    /// Ring policy/telemetry shared with the render thread (see [`RingShared`]).
+    ring: Arc<RingShared>,
     join: Option<JoinHandle<()>>,
+}
+
+/// Atomics shared between the pump-facing handle and the render thread: the pump's adaptive
+/// de-jitter target in, the effective prime threshold + reset-on-read counters out. All
+/// `Relaxed` — a slowly-moving target and telemetry, not synchronization.
+#[derive(Default)]
+struct RingShared {
+    /// Pump-set jitter target in bytes. `0` = the pump never spoke (legacy mode, or its first
+    /// estimate hasn't landed) → the render loop keeps the fixed [`PRIME_BYTES`] and `push`
+    /// keeps the fixed [`MAX_QUEUE_BYTES`].
+    target_bytes: AtomicUsize,
+    /// Effective prime threshold (bytes) of the last render iteration.
+    prime_bytes: AtomicUsize,
+    /// Full-drain re-prime arms (see [`MicBackendStats`]).
+    reprimes: AtomicU64,
+    /// Per-channel samples dropped by the overflow cap.
+    overflow: AtomicU64,
 }
 
 impl WasapiVirtualMic {
@@ -70,14 +99,15 @@ impl WasapiVirtualMic {
         let queue = Arc::new(Mutex::new(VecDeque::<u8>::new()));
         let stop = Arc::new(AtomicBool::new(false));
         let alive = Arc::new(AtomicBool::new(true));
+        let ring = Arc::new(RingShared::default());
         // Bring-up handshake: report the resolved device (or the error) before returning, so a missing
         // virtual-mic device surfaces as Err (the caller retries with backoff) not a silent dead thread.
         let (ready_tx, ready_rx) = sync_channel::<Result<String>>(1);
-        let (q, st, al) = (queue.clone(), stop.clone(), alive.clone());
+        let (q, st, rg, al) = (queue.clone(), stop.clone(), ring.clone(), alive.clone());
         let join = thread::Builder::new()
             .name("punktfunk-wasapi-mic".into())
             .spawn(move || {
-                if let Err(e) = render_thread(q, st, ready_tx) {
+                if let Err(e) = render_thread(q, st, rg, ready_tx) {
                     tracing::error!(error = %format!("{e:#}"), "wasapi virtual-mic thread failed");
                 }
                 // Normal stop or device error alike: this instance is done — the pump reopens.
@@ -92,6 +122,7 @@ impl WasapiVirtualMic {
                     queue,
                     stop,
                     alive,
+                    ring,
                     join: Some(join),
                 })
             }
@@ -122,10 +153,25 @@ impl VirtualMic for WasapiVirtualMic {
         for &s in pcm {
             q.extend(s.to_le_bytes());
         }
-        // Drop-oldest to keep latency bounded (mic is real-time; stale audio is worse than dropped).
-        if q.len() > MAX_QUEUE_BYTES {
-            let excess = q.len() - MAX_QUEUE_BYTES;
+        // Drop-oldest to keep latency bounded (mic is real-time; stale audio is worse than
+        // dropped). With the pump driving the target, the bound follows the render loop's prime
+        // threshold + headroom; otherwise (legacy / no estimate yet) the fixed 120 ms applies.
+        let cap = if self.ring.target_bytes.load(Ordering::Relaxed) == 0 {
+            MAX_QUEUE_BYTES
+        } else {
+            // `max(PRIME_BYTES)` covers the one render period before the loop first publishes.
+            self.ring
+                .prime_bytes
+                .load(Ordering::Relaxed)
+                .max(PRIME_BYTES)
+                + CAP_HEADROOM_BYTES
+        };
+        if q.len() > cap {
+            let excess = q.len() - cap;
             q.drain(..excess);
+            self.ring
+                .overflow
+                .fetch_add((excess / BLOCK_ALIGN) as u64, Ordering::Relaxed);
         }
         true
     }
@@ -142,6 +188,28 @@ impl VirtualMic for WasapiVirtualMic {
 
     fn channels(&self) -> u32 {
         CHANNELS
+    }
+
+    fn set_target_depth(&self, samples_per_ch: usize) {
+        self.ring
+            .target_bytes
+            .store(samples_per_ch * BLOCK_ALIGN, Ordering::Relaxed);
+    }
+
+    fn depth(&self) -> Option<(usize, usize)> {
+        let prime = self.ring.prime_bytes.load(Ordering::Relaxed);
+        if prime == 0 {
+            return None; // render loop hasn't run yet
+        }
+        let q = self.queue.lock().ok()?;
+        Some((q.len() / BLOCK_ALIGN, prime / BLOCK_ALIGN))
+    }
+
+    fn take_stats(&self) -> MicBackendStats {
+        MicBackendStats {
+            reprimes: self.ring.reprimes.swap(0, Ordering::Relaxed),
+            overflow_dropped: self.ring.overflow.swap(0, Ordering::Relaxed),
+        }
     }
 }
 
@@ -273,6 +341,7 @@ fn try_install_steam_audio(inf_name: &str) -> bool {
 fn render_thread(
     queue: Arc<Mutex<VecDeque<u8>>>,
     stop: Arc<AtomicBool>,
+    shared: Arc<RingShared>,
     ready: SyncSender<Result<String>>,
 ) -> Result<()> {
     if let Err(e) = wasapi::initialize_mta()
@@ -284,7 +353,7 @@ fn render_thread(
     }
     // Open + start the render stream. The WASAPI objects must outlive the loop, so build them here and
     // keep them (a closure that *returned* them would drop them); on any failure report Err and exit.
-    let setup = (|| -> Result<(wasapi::AudioClient, wasapi::AudioRenderClient, wasapi::Handle, String)> {
+    let setup = (|| -> Result<(wasapi::AudioClient, wasapi::AudioRenderClient, wasapi::Handle, i64, String)> {
         let (device, name) = resolve_target()?;
         let mut audio_client = device.get_iaudioclient().context("IAudioClient")?;
         // 48 kHz stereo f32; autoconvert lets WASAPI shared-mode SRC match the device mix format.
@@ -312,9 +381,9 @@ fn render_thread(
         let buf_frames = audio_client.get_buffer_size().context("buffer size")? as usize;
         let _ = render_client.write_to_device(buf_frames, &vec![0u8; buf_frames * BLOCK_ALIGN], None);
         audio_client.start_stream().context("start render stream")?;
-        Ok((audio_client, render_client, h_event, name))
+        Ok((audio_client, render_client, h_event, default_period, name))
     })();
-    let (audio_client, render_client, h_event, name) = match setup {
+    let (audio_client, render_client, h_event, default_period, name) = match setup {
         Ok(t) => t,
         Err(e) => {
             let _ = ready.send(Err(anyhow!("{e:#}")));
@@ -322,18 +391,26 @@ fn render_thread(
         }
     };
     let _ = ready.send(Ok(name));
+    // One device period in bytes (period is in 100 ns units; floor 10 ms if it reads absurd) —
+    // the device-side pull granularity the adaptive prime threshold builds on.
+    let period_bytes = ((default_period.max(0) as usize * SAMPLE_RATE as usize / 10_000_000)
+        .max(SAMPLE_RATE as usize / 100))
+        * BLOCK_ALIGN;
 
     // Any error below (endpoint invalidated/removed, engine restart) propagates out of the loop,
     // ending the thread — the `alive` flag flips in the spawn wrapper and the pump reopens.
     //
-    // Adaptive jitter buffer (mirrors the Linux backend's process callback): clients push mic
-    // audio in bursts on their own clock while the device pulls a block every period from an
-    // independent clock, so a greedy per-period drain leaves the queue near-empty and pads most
-    // periods with mid-stream silence — audible as constant crackling. Instead: emit silence
-    // until [`PRIME_BYTES`] is buffered, then play from the cushion (zero-filling only a
-    // momentary shortfall), and re-prime only after a genuine FULL drain (the client went quiet —
-    // between talk spurts the cushion rebuilds, and [`VirtualMic::discard`] resets it across
-    // session gaps).
+    // Jitter buffer (mirrors the Linux backend's process callback): clients push mic audio in
+    // bursts on their own clock while the device pulls a block every period from an independent
+    // clock, so a greedy per-period drain leaves the queue near-empty and pads most periods
+    // with mid-stream silence — audible as constant crackling. Instead: emit silence until the
+    // prime threshold is buffered, then play from the cushion (zero-filling only a momentary
+    // shortfall), and re-prime only after a genuine FULL drain (the client went quiet — between
+    // talk spurts the cushion rebuilds, and [`VirtualMic::discard`] resets it across session
+    // gaps). The threshold = one device period + the pump's measured-jitter target
+    // ([`VirtualMic::set_target_depth`]); the fixed [`PRIME_BYTES`] until the pump's first
+    // estimate, and forever under `PUNKTFUNK_MIC_LEGACY_BUFFER=1` (the pump then never drives
+    // the target).
     let mut buf: Vec<u8> = Vec::new();
     let mut primed = false;
     while !stop.load(Ordering::Relaxed) {
@@ -351,11 +428,18 @@ fn render_thread(
         if buf.len() < need {
             buf.resize(need, 0);
         }
+        let target = shared.target_bytes.load(Ordering::Relaxed);
+        let prime = if target == 0 {
+            PRIME_BYTES
+        } else {
+            period_bytes + target
+        };
+        shared.prime_bytes.store(prime, Ordering::Relaxed);
         // Silence base; overwrite with queued mic PCM once the cushion is primed.
         buf[..need].fill(0);
         {
             let mut q = queue.lock().unwrap();
-            if !primed && q.len() >= PRIME_BYTES {
+            if !primed && q.len() >= prime {
                 primed = true;
             }
             if primed {
@@ -365,6 +449,7 @@ fn render_thread(
                 }
                 if q.is_empty() {
                     primed = false; // fully drained — re-prime before producing again
+                    shared.reprimes.fetch_add(1, Ordering::Relaxed);
                 }
             }
         }
