@@ -15,6 +15,7 @@ import {
 	isPublicPath,
 	type SessionData,
 	sessionConfig,
+	sessionEpoch,
 	uiPassword,
 } from "../util/auth";
 
@@ -64,7 +65,10 @@ export default defineEventHandler(async (event) => {
 	}
 
 	const session = await useSession<SessionData>(event, sessionConfig());
-	if (session.data.authenticated) return; // authenticated — let it through
+	// The epoch check is what makes logout mean something: a cookie sealed before the last
+	// revocation unseals fine but no longer matches, so it is refused like any other bad session.
+	if (session.data.authenticated && session.data.epoch === sessionEpoch())
+		return; // authenticated — let it through
 
 	if (pathname.startsWith("/api")) {
 		setResponseStatus(event, 401);

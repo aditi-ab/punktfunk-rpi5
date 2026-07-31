@@ -48,14 +48,30 @@ const tls =
 		? { cert: Bun.file(certPath), key: Bun.file(keyPath) }
 		: undefined;
 
+// Half-configured TLS is the dangerous shape: one path set and the other missing silently drops to
+// plain HTTP, and if PUNKTFUNK_UI_SECURE is also set the session cookie is marked Secure — which a
+// browser then refuses to store over http://, so login appears to succeed and every next request is
+// unauthenticated. Both failure modes are silent, so say something.
+if (Boolean(certPath) !== Boolean(keyPath)) {
+	console.error(
+		`punktfunk web console: only ${certPath ? "PUNKTFUNK_UI_TLS_CERT" : "PUNKTFUNK_UI_TLS_KEY"} is set — ` +
+			"TLS needs BOTH. Serving plain HTTP.",
+	);
+}
+if (!tls && /^(1|true)$/i.test(process.env.PUNKTFUNK_UI_SECURE ?? "")) {
+	console.error(
+		"punktfunk web console: PUNKTFUNK_UI_SECURE is set but TLS is not configured. The session " +
+			"cookie will be marked Secure and dropped by the browser over http:// — login will not stick.",
+	);
+}
+
 const server = Bun.serve({
 	port: process.env.NITRO_PORT || process.env.PORT || 3000,
 	host: process.env.NITRO_HOST || process.env.HOST,
 	// Bun defaults this to 10 s, which is SHORTER than the host's 15 s SSE keep-alive comment — so a
 	// proxied `/api/v1/events` stream (or any other quiet long-lived response) gets cut by us and
 	// reconnects on a loop. 120 s is comfortably above any keep-alive we forward; still overridable.
-	idleTimeout:
-		Number.parseInt(process.env.NITRO_BUN_IDLE_TIMEOUT, 10) || 120,
+	idleTimeout: Number.parseInt(process.env.NITRO_BUN_IDLE_TIMEOUT, 10) || 120,
 	// `tls: undefined` ⇒ plain HTTP (dev); otherwise HTTPS over HTTP/1.1.
 	tls,
 	websocket: import.meta._websocket ? ws.websocket : undefined,

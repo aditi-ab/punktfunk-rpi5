@@ -1,4 +1,5 @@
 import { useQueryClient } from "@tanstack/react-query";
+import { useBlocker } from "@tanstack/react-router";
 import { Button } from "@unom/ui/button";
 import { toast } from "@unom/ui/toast";
 import { Pencil, Plus, RefreshCw, Trash2 } from "lucide-react";
@@ -150,14 +151,17 @@ export const DisplaySection: FC = () => {
 		if (seeded.current) setDraft(seeded.current);
 	};
 
-	// Last line of defence: a reload/close with pending edits loses them silently otherwise. The
-	// browser shows its own generic wording — the text is ignored, only returning a value counts.
-	useEffect(() => {
-		if (!dirty) return;
-		const warn = (e: BeforeUnloadEvent) => e.preventDefault();
-		window.addEventListener("beforeunload", warn);
-		return () => window.removeEventListener("beforeunload", warn);
-	}, [dirty]);
+	// Don't lose pending edits, whichever way the operator leaves.
+	//
+	// This used to be a bare `beforeunload` listener, which only covers a reload or a tab close —
+	// clicking "Host" in the sidebar is a client-side route change the browser never hears about,
+	// so the draft vanished with no prompt at all. The router's blocker covers in-app navigation
+	// AND still arms `beforeunload` for the reload case, so it replaces the listener outright.
+	useBlocker({
+		shouldBlockFn: () => !confirm(m.display_discard_confirm()),
+		enableBeforeUnload: () => dirty,
+		disabled: !dirty,
+	});
 
 	return (
 		<div className="flex flex-col gap-card">
@@ -174,17 +178,30 @@ export const DisplaySection: FC = () => {
 					<p className="max-w-prose text-sm text-muted-foreground">
 						{m.host_displays_help()}
 					</p>
+					{/* Once the form is on screen, a FAILED BACKGROUND POLL must not replace it — the
+					    operator may be mid-edit, and swapping the card for an error box throws the
+					    draft away to report a refetch we could simply retry. Only a failure with
+					    nothing to show is worth the error state. */}
 					<QueryState
 						isLoading={q.isLoading}
-						error={q.error}
+						error={draft ? undefined : q.error}
 						refetch={q.refetch}
 					>
+						{draft && q.error && (
+							<p
+								role="status"
+								className="rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-sm"
+							>
+								{m.display_refresh_failed()}
+							</p>
+						)}
 						{q.data && draft && (
 							<DisplayForm
 								draft={draft}
 								setDraft={setDraft}
 								presets={q.data.presets}
 								customPresets={q.data.custom_presets}
+								serverEffective={q.data.effective}
 								apply={apply}
 								applyAxis={applyAxis}
 								saveDraft={saveDraft}
@@ -224,6 +241,8 @@ const DisplayForm: FC<{
 	setDraft: (p: DisplayPolicy) => void;
 	presets: { id: string; summary: string; fields: EffectivePolicy }[];
 	customPresets: CustomPreset[];
+	/** What the host reports as IN FORCE right now — not derived from the local draft. */
+	serverEffective: EffectivePolicy;
 	apply: (p: DisplayPolicy) => void;
 	/** Apply one orthogonal axis on top of the SAVED policy — never the unsaved draft. */
 	applyAxis: (patch: Partial<DisplayPolicy>) => void;
@@ -240,6 +259,7 @@ const DisplayForm: FC<{
 	setDraft,
 	presets,
 	customPresets,
+	serverEffective,
 	apply,
 	applyAxis,
 	saveDraft,
@@ -736,25 +756,29 @@ const DisplayForm: FC<{
 				onSet={(on) => applyAxis({ pnp_disable_monitors: on })}
 			/>
 
-			{/* What's in force right now */}
+			{/* What's in force right now — read from the API's `effective`, not from the local draft.
+			    Deriving it from the draft meant the row restated the operator's unsaved edits back to
+			    them as though the host had already adopted them. */}
 			<div className="flex flex-wrap items-center gap-2 border-t pt-3">
 				<span className="text-sm text-muted-foreground">
 					{m.display_effective()}:
 				</span>
-				<Badge variant="secondary">{fmtKeepAlive(effective.keep_alive)}</Badge>
 				<Badge variant="secondary">
-					{tr(TOPOLOGY_LABEL, effective.topology)}
+					{fmtKeepAlive(serverEffective.keep_alive)}
+				</Badge>
+				<Badge variant="secondary">
+					{tr(TOPOLOGY_LABEL, serverEffective.topology)}
 				</Badge>
 				<Badge variant="outline">
-					{tr(CONFLICT_LABEL, effective.mode_conflict)}
+					{tr(CONFLICT_LABEL, serverEffective.mode_conflict)}
 				</Badge>
 				<Badge variant="outline">
-					{tr(IDENTITY_LABEL, effective.identity)}
+					{tr(IDENTITY_LABEL, serverEffective.identity)}
 				</Badge>
 				<Badge variant="outline">
-					{tr(LAYOUT_LABEL, effective.layout.mode)}
+					{tr(LAYOUT_LABEL, serverEffective.layout.mode)}
 				</Badge>
-				<Badge variant="outline">{`${effective.max_displays}×`}</Badge>
+				<Badge variant="outline">{`${serverEffective.max_displays}×`}</Badge>
 				{(draft.game_session ?? "auto") === "dedicated" && (
 					<Badge variant="secondary">
 						{m.display_game_session_dedicated()}
@@ -920,8 +944,13 @@ const CustomPresetCard: FC<{
 			tabIndex={busy ? -1 : 0}
 			aria-pressed={selected}
 			aria-disabled={busy || undefined}
+			aria-label={m.display_preset_apply_named({ name: preset.name })}
 			onClick={() => !busy && onApply()}
 			onKeyDown={(e) => {
+				// Only when the CARD itself has focus. Keydown bubbles, so Enter/Space on the
+				// rename/update/delete icons inside it also reached here and applied the preset
+				// instead of running the icon's action — a keyboard user could not delete a preset.
+				if (e.target !== e.currentTarget) return;
 				if (e.key === "Enter" || e.key === " ") {
 					e.preventDefault();
 					if (!busy) onApply();

@@ -1,13 +1,15 @@
 import Section from "@unom/ui/section";
 import { toast } from "@unom/ui/toast";
-import { type FC, useState } from "react";
+import { type FC, useEffect, useState } from "react";
 import { ApiError } from "@/api/fetcher";
 import {
 	type InstallBody,
 	type InstalledPlugin,
+	runningJob,
 	type StoreEntry,
 	useInstallPlugin,
 	useStoreCatalog,
+	useStoreJobs,
 	useUninstallPlugin,
 } from "@/api/store";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -39,6 +41,14 @@ export const SectionStore: FC = () => {
 	const [jobId, setJobId] = useState<string | null>(null);
 
 	const catalog = useStoreCatalog();
+	// Re-attach to a job that was already running when this page loaded — an install survives a
+	// reload on the host side, and losing sight of it left the Install buttons armed against a host
+	// that answers 409.
+	const jobs = useStoreJobs();
+	const orphan = runningJob(jobs.data);
+	useEffect(() => {
+		if (orphan && !jobId) setJobId(orphan.id);
+	}, [orphan, jobId]);
 	const install = useInstallPlugin();
 	const uninstall = useUninstallPlugin();
 

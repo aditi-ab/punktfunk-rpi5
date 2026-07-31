@@ -31,15 +31,17 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { fmtDateTimeSecs } from "@/lib/format";
 import { m } from "@/paraglide/messages";
 
 /** A source the operator has filled in but not yet agreed to trust. The console password is NOT
  * part of the draft — it is collected by the trust dialog, at the moment the decision is made. */
 type SourceDraft = Omit<SourceBody, "password"> & { name: string };
 
-/** Unix seconds → a locale date-time, or "never" for a source that has never fetched. */
+/** Unix seconds → a locale date-time, or "never" for a source that has never fetched.
+ * Locale-aware via lib/format.ts — `toLocaleString` follows the browser, not the console. */
 const fmtFetched = (secs: number): string =>
-	secs > 0 ? new Date(secs * 1000).toLocaleString() : m.store_source_never();
+	secs > 0 ? fmtDateTimeSecs(secs) : m.store_source_never();
 
 /**
  * Container: the catalog sources. Owns the source listing, the refresh-all action, and add/remove.

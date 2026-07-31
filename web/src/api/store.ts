@@ -81,7 +81,9 @@ export interface StoreCatalog {
 
 export interface InstalledPlugin {
 	pkg: string;
-	version: string;
+	/** Nullable in the contract (`InstalledView.version`) — a CLI-installed plugin may carry no
+	 * recorded version. Typed required here, the Installed tab rendered the literal "vundefined". */
+	version?: string | null;
 	tier: StoreTier;
 	source?: string;
 	entry_id?: string;
@@ -225,6 +227,34 @@ export function useStoreRuntime() {
  */
 const JOB_POLL_MS = 1_000;
 const JOB_MAX_FAILURES = 15;
+
+/**
+ * The host's recent jobs, used to RE-ATTACH after a reload.
+ *
+ * The in-flight job id lived only in component state, so reloading the page (or opening the console
+ * on another device) lost all trace of a running install while the Install buttons stayed armed —
+ * and the host takes one job at a time, so the next click just bounced off a 409. The host keeps
+ * the list; ask it rather than remembering.
+ */
+export function useStoreJobs() {
+	return useQuery({
+		queryKey: [...storeKeys.all, "jobs"] as const,
+		queryFn: () => apiFetch<StoreJob[]>(`${BASE}/jobs`),
+		// Only needed to find an orphaned job on mount; the job query itself does the live polling.
+		staleTime: 5_000,
+	});
+}
+
+/** The newest job that is still running, if any — what a fresh page should re-attach to. */
+export function runningJob(jobs: StoreJob[] | undefined): StoreJob | undefined {
+	if (!jobs) return undefined;
+	// The list is oldest-first, so scan from the end for the most recent live one.
+	for (let i = jobs.length - 1; i >= 0; i--) {
+		const j = jobs[i];
+		if (j?.state === "running") return j;
+	}
+	return undefined;
+}
 
 export function useStoreJob(id: string | null) {
 	return useQuery({

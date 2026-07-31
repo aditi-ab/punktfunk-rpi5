@@ -31,6 +31,11 @@ export const BrowseTab: FC<{
 	onInstallSpec: () => void;
 }> = ({ onInstall, onInstallSpec }) => {
 	const catalog = useStoreCatalog();
+	// Sources that could not be fetched — the difference between "this host has no plugins" and
+	// "the console could not find out".
+	const failedSources = (catalog.data?.sources ?? []).filter(
+		(src) => src.error || src.stale,
+	);
 	const [query, setQuery] = useState("");
 	const [source, setSource] = useState<string | null>(null);
 
@@ -97,7 +102,16 @@ export const BrowseTab: FC<{
 							flush
 							className="p-8 text-center text-sm text-muted-foreground"
 						>
-							{entries.length === 0 ? m.store_empty() : m.store_no_match()}
+							{entries.length > 0
+								? m.store_no_match()
+								: failedSources.length > 0
+									? // An all-sources-failed catalog is a SUCCESSFUL request that happens to
+										// carry nothing, so "no plugins available" was the console reporting a
+										// broken fetch as an empty store. Name the sources that failed.
+										m.store_all_sources_failed({
+											sources: failedSources.map((f) => f.name).join(", "),
+										})
+									: m.store_empty()}
 						</CardContent>
 					</Card>
 				) : (

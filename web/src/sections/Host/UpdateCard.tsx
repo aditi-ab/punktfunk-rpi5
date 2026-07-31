@@ -1,12 +1,14 @@
 import { useQueryClient } from "@tanstack/react-query";
 import { Button } from "@unom/ui/button";
+import { toast } from "@unom/ui/toast";
 import { type FC, type ReactNode, useState } from "react";
+import { ApiError } from "@/api/fetcher";
+import type { UpdateStatus } from "@/api/gen/model";
 import {
 	getGetUpdateStatusQueryKey,
 	useForceUpdateCheck,
 	useGetUpdateStatus,
 } from "@/api/gen/update/update";
-import type { UpdateStatus } from "@/api/gen/model";
 import { QueryState } from "@/components/query-state";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -21,6 +23,8 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Spinner } from "@/components/ui/spinner";
+import { apiErrorMessage } from "@/lib/errors";
+import { fmtDateTimeSecs } from "@/lib/format";
 import type { Loadable } from "@/lib/query";
 import { m } from "@/paraglide/messages";
 
@@ -67,6 +71,14 @@ export const UpdateSection: FC = () => {
 			onSuccess: (fresh) => {
 				qc.setQueryData(getGetUpdateStatusQueryKey(), fresh);
 			},
+			// The host throttles repeat checks (429). Swallowing it made a second click within the
+			// window look like a dead button; say the check was skipped and why.
+			onError: (e) =>
+				toast.error(
+					e instanceof ApiError && e.status === 429
+						? m.update_apply_throttled()
+						: (apiErrorMessage(e) ?? m.update_error()),
+				),
 		});
 
 	return (
@@ -75,9 +87,8 @@ export const UpdateSection: FC = () => {
 			onCheck={checkNow}
 			checkBusy={check.isPending}
 			applying={applying}
-			onApplied={(target) =>
-				setApplying({ target, startedAt: Date.now() })
-			}
+			onApplied={(target) => setApplying({ target, startedAt: Date.now() })}
+			onGiveUp={() => setApplying(null)}
 		/>
 	);
 };
@@ -88,11 +99,18 @@ export const UpdateCard: FC<{
 	checkBusy: boolean;
 	applying: { target: string; startedAt: number } | null;
 	onApplied: (target: string) => void;
-}> = ({ state, onCheck, checkBusy, applying, onApplied }) => {
+	/** Leave the applying state after a timeout — otherwise the card waits forever. */
+	onGiveUp: () => void;
+}> = ({ state, onCheck, checkBusy, applying, onApplied, onGiveUp }) => {
 	const s = state.data;
 	const inFlight = Boolean(applying) || Boolean(s?.job);
 	const timedOut =
 		applying !== null && Date.now() - applying.startedAt > APPLY_TIMEOUT_MS;
+	// Is the snapshot we are rendering still being refreshed? While the host is gone the query
+	// keeps its LAST payload — including a `job` that was in progress when it went away — so the
+	// timeout warning, gated on `!job`, could never fire in the one case it exists for. A failing
+	// poll means the job field describes a host we can no longer see.
+	const snapshotStale = Boolean(state.error);
 	return (
 		<Card>
 			<CardHeader className="flex flex-row items-center justify-between">
@@ -156,6 +174,8 @@ export const UpdateCard: FC<{
 									status={s}
 									reconnecting={Boolean(state.error)}
 									timedOut={timedOut}
+									snapshotStale={snapshotStale}
+									onGiveUp={onGiveUp}
 								/>
 							) : s.available ? (
 								s.apply === "full" || s.apply === "staged" ? (
@@ -214,7 +234,7 @@ export const UpdateCard: FC<{
 										{s.last_checked_unix != null && (
 											<span className="text-xs text-muted-foreground">
 												{m.update_last_checked()}{" "}
-												{new Date(s.last_checked_unix * 1000).toLocaleString()}
+												{fmtDateTimeSecs(s.last_checked_unix)}
 											</span>
 										)}
 									</div>
@@ -356,7 +376,10 @@ const ApplyProgress: FC<{
 	status: UpdateStatus;
 	reconnecting: boolean;
 	timedOut: boolean;
-}> = ({ status, reconnecting, timedOut }) => {
+	/** The rendered snapshot can no longer be refreshed — its `job` may describe a vanished host. */
+	snapshotStale: boolean;
+	onGiveUp: () => void;
+}> = ({ status, reconnecting, timedOut, snapshotStale, onGiveUp }) => {
 	const job = status.job;
 	const pct =
 		job?.total_bytes && job.total_bytes > 0
@@ -396,12 +419,18 @@ const ApplyProgress: FC<{
 					/>
 				</div>
 			)}
-			{/* A live job (e.g. the Deck's tens-of-minutes source rebuild) is not "timed out" —
-			    the warning is for the host being GONE longer than a restart explains. */}
-			{timedOut && !job && (
-				<p className="rounded-md border border-amber-500/40 bg-amber-500/10 p-3 text-sm">
-					{m.update_apply_timeout()}
-				</p>
+			{/* A job we can still SEE progressing (e.g. the Deck's tens-of-minutes source rebuild) is
+			    not "timed out" — the warning is for the host being GONE longer than a restart
+			    explains. A stale snapshot's job does not count as seeing one. */}
+			{timedOut && (!job || snapshotStale) && (
+				<div className="space-y-2 rounded-md border border-amber-500/40 bg-amber-500/10 p-3 text-sm">
+					<p>{m.update_apply_timeout()}</p>
+					{/* Without this the card sits in "applying" forever and the operator cannot even
+					    re-check — the state was only ever cleared by a status that never arrives. */}
+					<Button variant="outline" size="sm" onClick={onGiveUp}>
+						{m.update_apply_give_up()}
+					</Button>
+				</div>
 			)}
 		</div>
 	);

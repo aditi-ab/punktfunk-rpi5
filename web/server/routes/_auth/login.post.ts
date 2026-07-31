@@ -13,6 +13,7 @@ import {
 	peerAddress,
 	type SessionData,
 	sessionConfig,
+	sessionEpoch,
 	timingSafeEqual,
 	uiPassword,
 } from "../../util/auth";
@@ -53,6 +54,6 @@ export default defineEventHandler(async (event) => {
 	}
 	recordLoginSuccess(ip);
 	const session = await useSession<SessionData>(event, sessionConfig());
-	await session.update({ authenticated: true });
+	await session.update({ authenticated: true, epoch: sessionEpoch() });
 	return { ok: true };
 });

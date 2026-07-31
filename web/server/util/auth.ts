@@ -195,4 +195,30 @@ export function safeNextPath(next: string | undefined): string {
 
 export interface SessionData {
 	authenticated?: boolean;
+	/** The epoch this session was sealed under — see `sessionEpoch`. */
+	epoch?: number;
+}
+
+/**
+ * A revocation counter for issued sessions.
+ *
+ * The session is stateless: everything lives inside the sealed cookie, so `session.clear()` only
+ * deletes the BROWSER's copy. A cookie captured beforehand (a shared machine, a shell history, a
+ * TLS-inspecting proxy) stayed valid for its full 7-day TTL with nothing the operator could do
+ * about it — "log out" did not log anything out.
+ *
+ * Bumping this invalidates every previously issued cookie, because the gate compares the stamped
+ * epoch against the current one. It lives in memory, so a host restart also revokes — acceptable
+ * for a single-user console, and the safe direction to fail.
+ */
+let epoch = 1;
+
+/** The epoch a new session is stamped with, and the one the gate requires. */
+export function sessionEpoch(): number {
+	return epoch;
+}
+
+/** Invalidate every session issued so far (the "sign out everywhere" lever). */
+export function revokeAllSessions(): void {
+	epoch += 1;
 }

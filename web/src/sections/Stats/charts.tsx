@@ -4,7 +4,7 @@
 // otherwise render a 0×0 (or warn). The charts adapt to whatever stages a sample
 // carries — native (queue/capture/submit/encode/send) and gamestream
 // (capture/encode/packetize/send) both stack sensibly.
-import { type ReactElement, useEffect, useState } from "react";
+import { type ReactElement, useEffect, useMemo, useState } from "react";
 import {
 	Area,
 	AreaChart,
@@ -85,6 +85,55 @@ function colorFor(name: string, i: number): string {
 	return STAGE_COLORS[name] ?? PALETTE[i % PALETTE.length] ?? "#6c5bf3";
 }
 
+/**
+ * Shared X-axis config for every chart here.
+ *
+ * `type="number"` + an explicit domain, NOT recharts' default category axis. As a category axis
+ * every sample is one evenly-spaced slot, so a capture that idled for two minutes drew that gap as
+ * a single step and the timeline was a lie — precisely the thing you are reading these charts to
+ * find. As a number axis the spacing is the actual elapsed time.
+ */
+const timeAxis = {
+	dataKey: "t",
+	type: "number",
+	domain: ["dataMin", "dataMax"],
+	scale: "time",
+	tick: axisTick,
+	stroke: gridStroke,
+	unit: "s",
+	allowDecimals: false,
+} as const;
+
+/**
+ * Split a capture at every session boundary and insert a gap between the pieces.
+ *
+ * A capture can span more than one session (`StatsSample.session_id`), and joining those samples
+ * into one continuous line implies a continuity that never existed — the stream stopped and a
+ * different client started a new one. Recharts breaks a line wherever a value is `null`, so one
+ * spacer row between sessions renders the discontinuity without any per-chart special-casing.
+ */
+function withSessionBreaks<T extends { t: number }>(
+	samples: StatsSample[],
+	rows: T[],
+): (T | { t: number })[] {
+	const out: (T | { t: number })[] = [];
+	for (let i = 0; i < rows.length; i++) {
+		const row = rows[i];
+		if (!row) continue;
+		const prev = samples[i - 1];
+		const cur = samples[i];
+		if (prev && cur && prev.session_id !== cur.session_id) {
+			// A bare `t` row: every series key is absent ⇒ null ⇒ recharts lifts the pen.
+			out.push({ t: row.t - 0.001 });
+		}
+		out.push(row);
+	}
+	return out;
+}
+
+/** Seconds since the capture began, as a number (see `timeAxis`). */
+const tSeconds = (s: StatsSample): number => s.t_ms / 1000;
+
 /** Latency stacked-area (µs) — the "where does the time go" view. With `toggle`, a
  *  p50/p99 switch flips every stage band between its median and tail. */
 export function LatencyChart({
@@ -95,24 +144,42 @@ export function LatencyChart({
 	toggle?: boolean;
 }) {
 	const [p99, setP99] = useState(false);
-	const names = stageNames(samples);
-	const rows = samples.map((s) => {
-		const row: Record<string, number> = { t: Math.round(s.t_ms / 1000) };
-		const byName = new Map(s.stages.map((st) => [st.name, st] as const));
-		for (const n of names) {
-			const st = byName.get(n);
-			row[n] = st ? (p99 ? st.p99_us : st.p50_us) : 0;
-		}
-		return row;
-	});
+	const names = useMemo(() => stageNames(samples), [samples]);
+	// Memoised: this walks every sample × every stage, and the live card re-renders it on a 2 s
+	// poll. Without this the whole series was rebuilt on every unrelated render too.
+	const rows = useMemo(() => {
+		const built = samples.map((s) => {
+			// `t` is declared on the type so the row satisfies `withSessionBreaks`' constraint;
+			// the stage columns are added by name below.
+			const row: Record<string, number> & { t: number } = { t: tSeconds(s) };
+			const byName = new Map(s.stages.map((st) => [st.name, st] as const));
+			for (const n of names) {
+				const st = byName.get(n);
+				row[n] = st ? (p99 ? st.p99_us : st.p50_us) : 0;
+			}
+			return row;
+		});
+		return withSessionBreaks(samples, built);
+	}, [samples, names, p99]);
 
 	return (
 		<div className="space-y-2">
 			{toggle && (
-				<div className="flex justify-end">
-					<Button variant="outline" size="sm" onClick={() => setP99((v) => !v)}>
-						{p99 ? m.stats_p99() : m.stats_p50()}
-					</Button>
+				// The button used to be labelled with the percentile currently PLOTTED while looking
+				// like an action, so it read as "click to show p99" when p99 was already showing.
+				// Two explicit options, with the active one pressed, says which is which.
+				<div className="flex justify-end gap-1">
+					{([false, true] as const).map((wantP99) => (
+						<Button
+							key={String(wantP99)}
+							variant={p99 === wantP99 ? "default" : "outline"}
+							size="sm"
+							aria-pressed={p99 === wantP99}
+							onClick={() => setP99(wantP99)}
+						>
+							{wantP99 ? m.stats_p99() : m.stats_p50()}
+						</Button>
+					))}
 				</div>
 			)}
 			<ChartFrame>
@@ -121,7 +188,7 @@ export function LatencyChart({
 					margin={{ top: 6, right: 8, left: 0, bottom: 0 }}
 				>
 					<CartesianGrid strokeDasharray="3 3" stroke={gridStroke} />
-					<XAxis dataKey="t" tick={axisTick} stroke={gridStroke} unit="s" />
+					<XAxis {...timeAxis} />
 					<YAxis
 						tick={axisTick}
 						stroke={gridStroke}
@@ -151,19 +218,26 @@ export function LatencyChart({
 
 /** New vs repeat fps (left axis) + tx goodput Mb/s vs the configured target (right axis). */
 export function ThroughputChart({ samples }: { samples: StatsSample[] }) {
-	const rows = samples.map((s) => ({
-		t: Math.round(s.t_ms / 1000),
-		fps: s.fps,
-		repeat: s.repeat_fps,
-		mbps: s.mbps,
-		// The configured encoder target (kbps → Mb/s) so goodput can be read against it.
-		target: s.bitrate_kbps / 1000,
-	}));
+	const rows = useMemo(
+		() =>
+			withSessionBreaks(
+				samples,
+				samples.map((s) => ({
+					t: tSeconds(s),
+					fps: s.fps,
+					repeat: s.repeat_fps,
+					mbps: s.mbps,
+					// The configured encoder target (kbps → Mb/s) so goodput reads against it.
+					target: s.bitrate_kbps / 1000,
+				})),
+			),
+		[samples],
+	);
 	return (
 		<ChartFrame>
 			<LineChart data={rows} margin={{ top: 6, right: 8, left: 0, bottom: 0 }}>
 				<CartesianGrid strokeDasharray="3 3" stroke={gridStroke} />
-				<XAxis dataKey="t" tick={axisTick} stroke={gridStroke} unit="s" />
+				<XAxis {...timeAxis} />
 				<YAxis
 					yAxisId="fps"
 					tick={axisTick}
@@ -233,13 +307,20 @@ export function HealthChart({
 	samples: StatsSample[];
 	kind?: string;
 }) {
-	const rows = samples.map((s) => ({
-		t: Math.round(s.t_ms / 1000),
-		frames: s.frames_dropped,
-		packets: s.packets_dropped,
-		send: s.send_dropped,
-		fec: s.fec_recovered,
-	}));
+	const rows = useMemo(
+		() =>
+			withSessionBreaks(
+				samples,
+				samples.map((s) => ({
+					t: tSeconds(s),
+					frames: s.frames_dropped,
+					packets: s.packets_dropped,
+					send: s.send_dropped,
+					fec: s.fec_recovered,
+				})),
+			),
+		[samples],
+	);
 	return (
 		<>
 			{kind === "gamestream" && (
@@ -253,7 +334,7 @@ export function HealthChart({
 					margin={{ top: 6, right: 8, left: 0, bottom: 0 }}
 				>
 					<CartesianGrid strokeDasharray="3 3" stroke={gridStroke} />
-					<XAxis dataKey="t" tick={axisTick} stroke={gridStroke} unit="s" />
+					<XAxis {...timeAxis} />
 					<YAxis
 						tick={axisTick}
 						stroke={gridStroke}
