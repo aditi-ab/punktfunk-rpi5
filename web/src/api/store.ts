@@ -11,6 +11,7 @@ import {
 	useQueryClient,
 } from "@tanstack/react-query";
 import { apiFetch } from "@/api/fetcher";
+import { boostPluginPolling } from "@/api/plugins";
 
 /**
  * How much a plugin's provenance is worth, from most to least trustworthy:
@@ -166,6 +167,9 @@ const json = (method: string, body: unknown): RequestInit => ({
  * installed list, the runner state (it restarts), and the plugin directory the nav is built from.
  */
 export function invalidateStore(qc: QueryClient): Promise<void> {
+	// The runner restarts AFTER the job reports done, so the plugin registers its UI a few seconds
+	// from now — this invalidation would otherwise refetch the pre-install list and stop looking.
+	boostPluginPolling();
 	return Promise.all([
 		qc.invalidateQueries({ queryKey: storeKeys.catalog }),
 		qc.invalidateQueries({ queryKey: storeKeys.installed }),

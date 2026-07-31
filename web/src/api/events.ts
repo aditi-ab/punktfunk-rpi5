@@ -28,6 +28,7 @@ import { getGetLibraryQueryKey } from "@/api/gen/library/library";
 import { getListNativeClientsQueryKey } from "@/api/gen/native/native";
 import { getGetPairingStatusQueryKey } from "@/api/gen/pairing/pairing";
 import { getGetUpdateStatusQueryKey } from "@/api/gen/update/update";
+import { boostPluginPolling, PLUGINS_KEY } from "@/api/plugins";
 import { storeKeys } from "@/api/store";
 
 /** Which query keys a given event kind invalidates. Unknown kinds are ignored on purpose.
@@ -72,7 +73,7 @@ function keysFor(kind: string): readonly (readonly unknown[])[] {
 		case "plugins.changed":
 		case "store.changed":
 			return [
-				["plugins"],
+				PLUGINS_KEY,
 				storeKeys.catalog,
 				storeKeys.installed,
 				storeKeys.runtime,
@@ -154,6 +155,10 @@ function attach(): void {
 	for (const kind of KINDS) {
 		source.addEventListener(kind, () => {
 			if (!client) return;
+			// The installed set changed — but the runner is probably still restarting, so keep
+			// checking for a while rather than trusting this one refetch (see boostPluginPolling).
+			if (kind === "plugins.changed" || kind === "store.changed")
+				boostPluginPolling();
 			for (const key of keysFor(kind)) invalidate(client, key);
 			// `host.started` names no keys — the host is NEW, so everything we hold predates it.
 			if (kind === "host.started") resyncAll(client);

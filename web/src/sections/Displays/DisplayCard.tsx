@@ -537,11 +537,13 @@ const DisplayForm: FC<{
 					<Field
 						label={m.display_keep_alive()}
 						help={m.display_keep_alive_help()}
+						group
 					>
 						<div className="flex flex-wrap items-center gap-2">
 							<Button
 								size="sm"
 								variant={ka.mode === "off" ? "default" : "outline"}
+								aria-pressed={ka.mode === "off"}
 								disabled={busy}
 								onClick={() =>
 									setDraft({ ...draft, keep_alive: { mode: "off" } })
@@ -552,6 +554,7 @@ const DisplayForm: FC<{
 							<Button
 								size="sm"
 								variant={ka.mode === "duration" ? "default" : "outline"}
+								aria-pressed={ka.mode === "duration"}
 								disabled={busy}
 								onClick={() =>
 									setDraft({
@@ -565,6 +568,7 @@ const DisplayForm: FC<{
 							<Button
 								size="sm"
 								variant={ka.mode === "forever" ? "default" : "outline"}
+								aria-pressed={ka.mode === "forever"}
 								disabled={busy}
 								onClick={() =>
 									setDraft({ ...draft, keep_alive: { mode: "forever" } })
@@ -575,6 +579,8 @@ const DisplayForm: FC<{
 							{ka.mode === "duration" && (
 								<div className="flex items-center gap-2">
 									<Input
+										id="display-keep-alive-seconds"
+										aria-label={m.display_keep_alive_seconds()}
 										type="number"
 										min={0}
 										className="w-24"
@@ -644,8 +650,9 @@ const DisplayForm: FC<{
 						}
 					/>
 
-					<Field label={m.display_max()}>
+					<Field label={m.display_max()} htmlFor="display-max">
 						<Input
+							id="display-max"
 							type="number"
 							min={1}
 							max={16}
@@ -773,19 +780,46 @@ const DisplayForm: FC<{
 
 /** A labeled config field — label, then the control, then optional help. The single source of the
  * label→control→help spacing so every field (keep-alive, the button groups, max-displays) lines up. */
-const Field: FC<{ label: string; help?: string; children: ReactNode }> = ({
-	label,
-	help,
-	children,
-}) => (
-	<div className="space-y-3">
-		<Label className="block">{label}</Label>
-		{children}
-		{help && (
-			<p className="max-w-prose text-xs text-muted-foreground">{help}</p>
-		)}
-	</div>
-);
+const Field: FC<{
+	label: string;
+	help?: string;
+	children: ReactNode;
+	/** The id of the single control this labels, when there is one — see below. */
+	htmlFor?: string;
+	/** Set when the field wraps a GROUP of controls rather than one input. */
+	group?: boolean;
+}> = ({ label, help, children, htmlFor, group }) => {
+	const helpId = help && htmlFor ? `${htmlFor}-help` : undefined;
+	const helpText = help && (
+		<p id={helpId} className="max-w-prose text-xs text-muted-foreground">
+			{help}
+		</p>
+	);
+	// A set of related buttons IS a fieldset, so say so with the element rather than an ARIA role.
+	// (The single-control case keeps a plain <label for>, which is the right pairing there.)
+	if (group) {
+		return (
+			<fieldset className="space-y-3">
+				<legend className="mb-3 block text-sm font-medium leading-none">
+					{label}
+				</legend>
+				{children}
+				{helpText}
+			</fieldset>
+		);
+	}
+	// A bare <Label> with no `htmlFor` next to an <input> with no `id` labels nothing at all: a
+	// screen reader announced these as unnamed spin buttons.
+	return (
+		<div className="space-y-3">
+			<Label className="block" htmlFor={htmlFor}>
+				{label}
+			</Label>
+			{children}
+			{helpText}
+		</div>
+	);
+};
 
 /**
  * An Experimental-badged on/off policy toggle (the DDC/CI and PnP monitor axes) — rendered outside
@@ -801,19 +835,21 @@ const ExperimentalToggle: FC<{
 	onSet: (v: boolean) => void;
 }> = ({ label, help, value, offLabel, onLabel, busy, onSet }) => (
 	<div className="border-t pt-4">
-		<div className="space-y-3">
-			<div className="flex items-center gap-2">
-				<Label className="block">{label}</Label>
+		{/* A labelled group: the pair of buttons is one control, and the label belongs to both. */}
+		<fieldset className="space-y-3">
+			<legend className="mb-3 flex items-center gap-2 text-sm font-medium leading-none">
+				{label}
 				<Badge variant="outline" className="text-amber-600 dark:text-amber-500">
 					{m.display_experimental()}
 				</Badge>
-			</div>
+			</legend>
 			<div className="flex flex-wrap gap-2">
 				{([false, true] as const).map((on) => (
 					<Button
 						key={String(on)}
 						size="sm"
 						variant={value === on ? "default" : "outline"}
+						aria-pressed={value === on}
 						disabled={busy}
 						onClick={() => onSet(on)}
 					>
@@ -822,7 +858,7 @@ const ExperimentalToggle: FC<{
 				))}
 			</div>
 			<p className="max-w-prose text-xs text-muted-foreground">{help}</p>
-		</div>
+		</fieldset>
 	</div>
 );
 
@@ -836,13 +872,17 @@ const Choice: FC<{
 	disabled: boolean;
 	onPick: (v: string) => void;
 }> = ({ label, help, value, options, labels, disabled, onPick }) => (
-	<Field label={label} help={help}>
+	<Field label={label} help={help} group>
 		<div className="flex flex-wrap gap-2">
 			{options.map((o) => (
 				<Button
 					key={o}
 					size="sm"
 					variant={value === o ? "default" : "outline"}
+					// Which option is active was signalled by fill colour alone — invisible to a screen
+					// reader, and to anyone who can't separate the two variants. `aria-pressed` states it.
+					// (The sibling Choice in SessionGameCard already did this; these did not.)
+					aria-pressed={value === o}
 					disabled={disabled}
 					onClick={() => onPick(o)}
 				>
