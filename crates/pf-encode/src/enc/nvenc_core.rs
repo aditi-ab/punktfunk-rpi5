@@ -117,10 +117,11 @@ pub(super) fn resolve_split_mode(bit_depth: u8, pixel_rate: u64) -> u32 {
 /// deserves a `warn`, a default being tuned an `info`. Callers LATCH this once next to their
 /// resolved subframe state (an env re-read at reconfigure would violate the "open and
 /// reconfigure present identical init params" invariant).
-/// Linux-cfg'd like its ONLY caller (the `nvenc_cuda` query_caps latch) — Windows sessions have
-/// `subframe == forced` by construction (env opt-in only) and never consult this; without the
-/// cfg it is dead code on every Windows leg (item-level dead_code, the recurring trap).
-#[cfg(target_os = "linux")]
+/// Both direct-SDK backends latch it now: Linux at the `nvenc_cuda` query_caps latch, Windows at
+/// session init since sub-frame defaults on there too (it used to be env opt-in only, so
+/// `subframe == forced` held by construction and the item was Linux-cfg'd to avoid being dead
+/// code on the Windows leg — the recurring item-level `dead_code` trap).
+#[cfg(any(target_os = "linux", windows))]
 pub(super) fn subframe_env_forced() -> bool {
     matches!(
         std::env::var("PUNKTFUNK_NVENC_SUBFRAME").as_deref(),
