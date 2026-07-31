@@ -15,6 +15,14 @@
 //       reference white, BT.2020→709 primaries, a soft maxRGB rolloff for highlights
 //       (BT.2390-flavored simplicity, not libplacebo), then sRGB encode.
 // params.y = tonemap peak (display-relative, ~= peak_nits / 203).
+// params.zw = the crop→surface UV scale (frame size / decode-pool size). A Vulkan-Video
+//       pool image is the CODED surface, taller than the picture whenever the height is
+//       not a multiple of the driver's alignment (1080 → 1088); sampling the full 0..1
+//       would drag those padding rows into view — and since encoders fill them by
+//       replicating the last picture line, that reads as the bottom row smeared over the
+//       final few rows. 1.0/1.0 for every path whose image is already crop-sized (dmabuf
+//       imports the planes at the crop over the real stride; D3D11VA clamps in its
+//       VideoProcessor blit).
 //
 // Regenerate: shaders/build.sh (committed .spv, no build-time toolchain).
 #version 450
@@ -29,7 +37,7 @@ layout(push_constant) uniform Csc {
     vec4 r0;
     vec4 r1;
     vec4 r2;
-    vec4 params; // x: mode, y: tonemap peak, z/w: reserved
+    vec4 params; // x: mode, y: tonemap peak, zw: crop/pool UV scale
 } pc;
 
 // SMPTE ST.2084 (PQ) EOTF: code value → display-referred linear, normalized to 1.0 =
@@ -62,17 +70,22 @@ vec3 srgb_oetf(vec3 c) {
 }
 
 void main() {
+    // Crop to the visible picture: the triangle spans the whole render target, so its 0..1
+    // maps onto the pool surface only after this scale (see params.zw above).
+    vec2 uv = v_uv * pc.params.zw;
     // 4:2:0 chroma is left-cosited (H.273 type 0 — the default inference when unsignaled, and
     // what the hosts produce), but sampling the half-res plane at the luma UV assumes CENTER
     // siting — a ~0.5-luma-px rightward chroma shift on hard colored edges. Offset +0.25 chroma
     // texels to re-align (the same correction the Apple/Windows clients apply). Self-disables
     // when the plane widths match (a full-size 4:4:4 chroma plane needs no correction).
-    vec2 cuv = v_uv;
+    // textureSize is the POOL's chroma width, which is the space `uv` is already in — so the
+    // offset stays a true quarter-texel whatever the crop.
+    vec2 cuv = uv;
     int cw = textureSize(u_c, 0).x;
     if (cw < textureSize(u_y, 0).x) {
         cuv.x += 0.25 / float(cw);
     }
-    vec3 yuv = vec3(texture(u_y, v_uv).r, texture(u_c, cuv).rg);
+    vec3 yuv = vec3(texture(u_y, uv).r, texture(u_c, cuv).rg);
     vec3 rgb = vec3(
         dot(pc.r0.xyz, yuv) + pc.r0.w,
         dot(pc.r1.xyz, yuv) + pc.r1.w,

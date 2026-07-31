@@ -196,6 +196,10 @@ struct StreamState {
     /// The settings profile this session resolved with, for the stats overlay's first line
     /// ("which profile am I on?"). `None` = the global defaults, and nothing is shown.
     profile: Option<String>,
+    /// The latch grid the pump's PhaseReports read (see `session::LatchGrid`), written by
+    /// the 1 Hz present-timing fold. `None` = the session didn't advertise phase lock
+    /// (no present-wait, or an embedder that opted out).
+    latch_grid: Option<Arc<session::LatchGrid>>,
     /// Live host↔client clock offset handle (None until Connected): loaded per present so
     /// mid-stream re-syncs keep the end-to-end number honest after an NTP step / drift.
     clock_offset: Option<Arc<std::sync::atomic::AtomicI64>>,
@@ -272,6 +276,10 @@ impl StreamState {
         wake: sdl3::event::EventSender,
     ) -> StreamState {
         let profile = params.profile.clone();
+        // The presenter's half of phase-locked capture: it writes the latch grid the
+        // pump reads (see `LatchGrid`), so keep the Arc before the params move. `None`
+        // when the session didn't advertise the cap — the 1 Hz fold then skips the work.
+        let latch_grid = params.phase_lock.then(|| params.latch_grid.clone());
         let handle = session::start(params);
         let (wake_tx, wake_rx) = async_channel::bounded(2);
         let pump_rx = handle.frames.clone();
@@ -297,6 +305,7 @@ impl StreamState {
             ready_announced: false,
             mode_line: String::new(),
             profile,
+            latch_grid,
             clock_offset: None,
             hdr: false,
             win_e2e_us: Vec::with_capacity(256),
@@ -1483,7 +1492,29 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                     .clock_offset
                     .as_ref()
                     .map_or(0, |o| o.load(Ordering::Relaxed));
-                for s in presenter.take_presented_samples() {
+                let samples = presenter.take_presented_samples();
+                // Phase-locked capture, the presenter's half: publish this window's latch
+                // grid — a recent TRUE on-glass instant plus the panel period — for the
+                // pump's ~1 Hz PhaseReport. The period is the min positive spacing of
+                // consecutive on-glass stamps (Apple's method: honest under VRR), capped
+                // by the display mode's refresh — under arrival-paced MAILBOX a stream
+                // running below the panel rate spaces its presents at k×period, and the
+                // cap keeps a 30 fps stream from claiming a 30 Hz panel grid.
+                if let Some(grid) = &st.latch_grid {
+                    if let Some(last) = samples.last() {
+                        let refresh_period = 1_000_000_000u64 / u64::from(native.refresh_hz.max(1));
+                        let min_delta = samples
+                            .windows(2)
+                            .map(|w| w[1].displayed_ns.saturating_sub(w[0].displayed_ns))
+                            .filter(|&d| d > 1_000_000) // < 1 ms apart = queued pair, not a grid step
+                            .min()
+                            .unwrap_or(refresh_period);
+                        grid.period_ns
+                            .store(min_delta.min(refresh_period), Ordering::Relaxed);
+                        grid.anchor_ns.store(last.displayed_ns, Ordering::Relaxed);
+                    }
+                }
+                for s in samples {
                     let e2e = (s.displayed_ns as i128 + clock_offset_ns as i128 - s.pts_ns as i128)
                         .max(0) as u64;
                     if e2e > 0 && e2e < 10_000_000_000 {
@@ -2001,8 +2032,27 @@ fn stats_text(
     }
     let detailed = verbosity == StatsVerbosity::Detailed;
     let mut text = if detailed {
+        // The encoder target next to the measured rate is the figure whose absence let the
+        // settings-drop bug ship four releases: "19 Mb/s" alone can't distinguish "the
+        // encoder is capped at 20" from "my 200 Mb/s grant met a cheap scene". `(auto)`
+        // marks an Automatic session — the ABR moves the target by design, so a shifting
+        // number reads as policy, not a broken setting. Omitted against an old host that
+        // never reported a rate.
+        let target = match (s.target_kbps, s.auto_rate) {
+            (0, _) => String::new(),
+            (t, true) => format!(" · target {:.0} Mb/s (auto)", f64::from(t) / 1000.0),
+            (t, false) => format!(" · target {:.0} Mb/s", f64::from(t) / 1000.0),
+        };
+        // The chroma tag mirrors the HDR tag's honesty: `4:4:4→4:2:0` = the session asked
+        // for full chroma and the host resolved 4:2:0 (its policy/capturer/encoder gates
+        // said no) — otherwise the Settings switch's effect is unobservable.
+        let chroma = match (s.asked_444, s.chroma_444) {
+            (_, true) => " · 4:4:4",
+            (true, false) => " · 4:4:4→4:2:0",
+            _ => "",
+        };
         format!(
-            "{mode_line} · {:.0} fps · {:.1} Mb/s · {}{}",
+            "{mode_line} · {:.0} fps · {:.1} Mb/s{target} · {}{}{chroma}",
             s.fps,
             s.mbps,
             if s.decoder.is_empty() { "-" } else { s.decoder },
@@ -2300,6 +2350,12 @@ mod tests {
                 mic_sent: 0,
                 mic_dropped: 0,
                 decoder: "vulkan",
+                // Old-host baseline (no reported target, 4:2:0 never asked): the tier
+                // texts stay exactly what they were before the target/chroma elements.
+                target_kbps: 0,
+                auto_rate: false,
+                chroma_444: false,
+                asked_444: false,
             },
             PresentedWindow {
                 e2e_p50_ms: 6.4,
@@ -2338,6 +2394,42 @@ mod tests {
             !normal.contains("queue"),
             "host-stage split is Detailed-only"
         );
+    }
+
+    /// Detailed shows the negotiated encoder target next to the measured rate — the
+    /// figure whose absence let the settings-drop bug ship four releases — tagged
+    /// `(auto)` when the ABR owns it, plus the honest chroma tag when 4:4:4 was asked.
+    #[test]
+    fn detailed_shows_target_and_chroma_resolution() {
+        let (mut s, p) = sample();
+        let line1 = |s: &Stats, v| {
+            stats_text(v, "m", s, &p, false, false, None)
+                .lines()
+                .next()
+                .unwrap()
+                .to_string()
+        };
+        // Explicit 200 Mb/s honoured, cheap scene: measured AND target both show — the
+        // exact pair a user needs to tell a capped encoder from an idle one.
+        s.target_kbps = 200_000;
+        assert!(line1(&s, StatsVerbosity::Detailed).contains("24.3 Mb/s · target 200 Mb/s · "));
+        // An Automatic session's moving target reads as policy, not a broken setting.
+        (s.target_kbps, s.auto_rate) = (20_000, true);
+        assert!(line1(&s, StatsVerbosity::Detailed).contains("target 20 Mb/s (auto)"));
+        // Normal keeps its old line — the target is a Detailed element.
+        assert!(!line1(&s, StatsVerbosity::Normal).contains("target"));
+        // An old host that never reported a rate shows no target element at all.
+        s.target_kbps = 0;
+        assert!(!line1(&s, StatsVerbosity::Detailed).contains("target"));
+        // 4:4:4 asked and granted…
+        (s.asked_444, s.chroma_444) = (true, true);
+        assert!(line1(&s, StatsVerbosity::Detailed).ends_with("· 4:4:4"));
+        // …vs asked and declined: the downgrade is said out loud, mirroring `HDR→SDR`.
+        s.chroma_444 = false;
+        assert!(line1(&s, StatsVerbosity::Detailed).ends_with("· 4:4:4→4:2:0"));
+        // Unasked stays untagged (4:2:0 is the default — not noise worth a tag).
+        s.asked_444 = false;
+        assert!(!line1(&s, StatsVerbosity::Detailed).contains("4:4:4"));
     }
 
     /// The mic uplink line: Detailed-only, and only while the uplink is live.

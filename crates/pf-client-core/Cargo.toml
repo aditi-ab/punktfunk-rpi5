@@ -68,6 +68,8 @@ windows = { git = "https://github.com/microsoft/windows-rs", rev = "acb5a1a74410
     "d3dcommon",
     "dxgi",
     "handleapi",
+    # RECT/HMONITOR for DXGI_OUTPUT_DESC1 (the display-HDR volume query).
+    "windef",
     # IDXGIResource1::CreateSharedHandle takes an optional SECURITY_ATTRIBUTES.
     "minwinbase",
     # The GlobalAlloc block the clipboard takes ownership of (clipboard.rs).

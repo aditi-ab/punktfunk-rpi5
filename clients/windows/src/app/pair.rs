@@ -50,8 +50,10 @@ pub(crate) fn pair_page(props: &Svc, cx: &mut RenderCx) -> Element {
                         std::time::Duration::from_secs(90),
                     ) {
                         Ok(fp) => {
+                            // The PIN ceremony is an authorised trust decision, so this also
+                            // retires a dead record for the same address (a re-keyed host).
                             let mut k = KnownHosts::load();
-                            k.upsert(KnownHost {
+                            k.upsert_trusted(KnownHost {
                                 name: target3.name.clone(),
                                 addr: target3.addr.clone(),
                                 port: target3.port,

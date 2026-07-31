@@ -488,12 +488,15 @@ pub(crate) fn note_hdr_capture_failed(source: HdrSource) {
 }
 #[cfg(target_os = "windows")]
 pub fn capturer_supports_444(encoder_ingests_rgb_444: bool) -> bool {
-    // IDD-push delivers full-chroma BGRA for an SDR 4:4:4 session (skipping the NV12 VideoConverter),
-    // but only a backend that ingests RGB and CSCs it to 4:4:4 itself can use it — today just
-    // direct-NVENC (AMF can't 4:4:4 at all; the QSV/ffmpeg path has no RGB-input 4:4:4 wiring). An HDR
-    // display can't be known here (the virtual display's mode settles after the Welcome); that
-    // combination downgrades at capture time — the capturer emits P010 and the encoder's caps
-    // cross-check reports the 4:2:0 truth (the in-band SPS keeps the client correct either way).
+    // IDD-push delivers full-chroma RGB for a 4:4:4 session — BGRA on an SDR display, packed 10-bit
+    // BT.2020 PQ (`Rgb10a2`) on an HDR one — skipping the subsampling converters entirely. Only a
+    // backend that ingests RGB and CSCs it to 4:4:4 itself can use that: today just direct-NVENC
+    // (AMF can't 4:4:4 at all; the QSV/ffmpeg path has no RGB-input 4:4:4 wiring).
+    //
+    // The display's HDR state is deliberately NOT part of this answer, and no longer needs to be:
+    // both depths have a full-chroma source now, so the chroma resolved here — before the Welcome —
+    // is the chroma the stream really carries. (It used to be a lie whenever the display was HDR:
+    // this returned true, the Welcome promised 4:4:4, and the capturer then quietly emitted P010.)
     encoder_ingests_rgb_444
 }
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]

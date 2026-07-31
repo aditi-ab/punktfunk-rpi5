@@ -448,9 +448,8 @@ impl ServiceState {
                 // Manual entries have no fingerprint yet, so `upsert` (fp-keyed) would
                 // collide two of them — key manual saves by address instead.
                 if let Some(h) = known
-                    .hosts
-                    .iter_mut()
-                    .find(|h| h.addr == addr && h.port == port)
+                    .index_by_addr(&addr, port)
+                    .and_then(|i| known.hosts.get_mut(i))
                 {
                     if !name.is_empty() {
                         h.name = name;

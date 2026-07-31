@@ -17,7 +17,8 @@ default = ["ui", "pyrowave"]
 # PyroWave client decode (the wired-LAN wavelet codec) — enables the decode backend + the
 # planar present path. ON by default; each session still opts in explicitly (the Settings
 # codec pick, or PUNKTFUNK_PREFER_PYROWAVE=1). The Windows ARM64 leg builds
-# --no-default-features and so skips it (video decode is Linux-only anyway).
+# --no-default-features and so skips it — note that also drops `ui` (the Skia console/OSD),
+# not just pyrowave; hardware video decode itself (D3D11VA / Vulkan Video) is unaffected.
 pyrowave = ["pf-client-core/pyrowave", "pf-presenter/pyrowave"]
 # The Skia console UI (stats OSD, capture HUD, later the gamepad library). Dropping it
 # (`--no-default-features`) is the ~15 MB-smaller power-user build: same streaming,

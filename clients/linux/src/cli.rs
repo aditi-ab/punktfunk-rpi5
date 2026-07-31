@@ -164,9 +164,7 @@ pub fn cli_wake() -> glib::ExitCode {
     let (addr, port) = parse_host_port(&target);
     let port = port.unwrap_or(9777);
     let mac = crate::trust::KnownHosts::load()
-        .hosts
-        .iter()
-        .find(|h| h.addr == addr && h.port == port)
+        .find_by_addr(&addr, port)
         .map(|h| h.mac.clone())
         .unwrap_or_default();
     if mac.is_empty() {
@@ -201,9 +199,7 @@ pub fn headless_library(target: &str) -> glib::ExitCode {
         .and_then(crate::trust::parse_hex32)
         .or_else(|| {
             crate::trust::KnownHosts::load()
-                .hosts
-                .iter()
-                .find(|h| h.addr == addr)
+                .find_by_addr(&addr, port)
                 .and_then(|h| crate::trust::parse_hex32(&h.fp_hex))
         });
     match crate::library::fetch_games(&addr, port, &identity, pin) {
@@ -343,9 +339,8 @@ pub fn headless_add_host(target: &str) -> glib::ExitCode {
     // No fingerprint yet — an address-keyed placeholder. Refresh the name if it already exists.
     let mut known = KnownHosts::load();
     if let Some(h) = known
-        .hosts
-        .iter_mut()
-        .find(|h| h.addr == addr && h.port == port)
+        .index_by_addr(&addr, port)
+        .and_then(|i| known.hosts.get_mut(i))
     {
         h.name = name;
     } else {

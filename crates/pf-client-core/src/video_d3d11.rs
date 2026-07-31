@@ -898,3 +898,87 @@ fn log_layout_once(width: u32, height: u32, tex_w: u32, tex_h: u32, index: u32, 
         );
     }
 }
+
+/// This desktop's HDR colour volume (`IDXGIOutput6::GetDesc1`) → the Hello's
+/// `display_hdr`, so the host's virtual-display EDID matches THIS panel instead of its
+/// generic defaults (host apps then tone-map to the real glass). `pos` picks the output
+/// containing that desktop point — the `--window-pos` monitor, where the stream window
+/// will open; no `pos` or no match falls back to the output holding the desktop origin
+/// (the primary). Returns `None` when that output's advanced color is off (an SDR
+/// colorspace): claiming an HDR volume for a desktop that won't present HDR would steer
+/// host tone mapping wrong, and the host's EDID defaults are the honest answer there.
+/// (`PUNKTFUNK_CLIENT_PEAK_NITS` still overrides whatever this reports — see
+/// `punktfunk_core::client::display_hdr_env_override`.)
+pub fn display_hdr_volume(pos: Option<(i32, i32)>) -> Option<punktfunk_core::quic::HdrMeta> {
+    use windows::Win32::dxgi::{IDXGIOutput6, DXGI_OUTPUT_DESC1};
+    // SAFETY: plain DXGI factory creation — no arguments to get wrong; the returned
+    // interface is owned by this scope and dropped with it.
+    let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }.ok()?;
+    let mut fallback: Option<DXGI_OUTPUT_DESC1> = None;
+    for a in 0.. {
+        // SAFETY: read-only enumeration on the live factory; the returned adapter is
+        // owned by this scope.
+        let Ok(adapter) = (unsafe { factory.EnumAdapters1(a) }) else {
+            break;
+        };
+        for o in 0.. {
+            // Out-pointer convention in this windows-rs rev (no retval annotation).
+            let mut output: Option<windows::Win32::dxgi::IDXGIOutput> = None;
+            // SAFETY: read-only enumeration on the live adapter, writing a local
+            // out-pointer that outlives the call.
+            if unsafe { adapter.EnumOutputs(o, &mut output) }.ok().is_err() {
+                break;
+            }
+            let Some(output) = output else {
+                break;
+            };
+            let Ok(out6) = output.cast::<IDXGIOutput6>() else {
+                continue; // pre-1809 DXGI — no advanced-color facts to read
+            };
+            let mut desc = DXGI_OUTPUT_DESC1::default();
+            // SAFETY: fills a local, correctly-sized DXGI_OUTPUT_DESC1 that outlives
+            // the call; the interface is live (owned just above).
+            if unsafe { out6.GetDesc1(&mut desc) }.ok().is_err() {
+                continue;
+            }
+            let r = desc.DesktopCoordinates;
+            let contains =
+                |x: i32, y: i32| x >= r.left && x < r.right && y >= r.top && y < r.bottom;
+            if let Some((x, y)) = pos {
+                if contains(x, y) {
+                    return hdr_meta_from_output(&desc);
+                }
+            }
+            if fallback.is_none() || contains(0, 0) {
+                fallback = Some(desc);
+            }
+        }
+    }
+    hdr_meta_from_output(&fallback?)
+}
+
+/// The ST.2086 shape of one output's colour facts; `None` for an SDR colorspace.
+fn hdr_meta_from_output(
+    d: &windows::Win32::dxgi::DXGI_OUTPUT_DESC1,
+) -> Option<punktfunk_core::quic::HdrMeta> {
+    use windows::Win32::dxgi::DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
+    if d.ColorSpace != DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 {
+        return None;
+    }
+    // Chromaticity → 1/50000 units; luminance → 0.0001 cd/m² units (the HdrMeta contract).
+    let c = |v: [f32; 2]| {
+        [
+            (v[0] * 50_000.0).round().clamp(0.0, 65_535.0) as u16,
+            (v[1] * 50_000.0).round().clamp(0.0, 65_535.0) as u16,
+        ]
+    };
+    Some(punktfunk_core::quic::HdrMeta {
+        // ST.2086 primary order is G, B, R (see the HdrMeta docs); DXGI reports R/G/B.
+        display_primaries: [c(d.GreenPrimary), c(d.BluePrimary), c(d.RedPrimary)],
+        white_point: c(d.WhitePoint),
+        max_display_mastering_luminance: (f64::from(d.MaxLuminance) * 10_000.0) as u32,
+        min_display_mastering_luminance: (f64::from(d.MinLuminance) * 10_000.0) as u32,
+        max_cll: d.MaxLuminance.round().clamp(0.0, 65_535.0) as u16,
+        max_fall: d.MaxFullFrameLuminance.round().clamp(0.0, 65_535.0) as u16,
+    })
+}

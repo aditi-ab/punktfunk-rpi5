@@ -749,7 +749,12 @@ impl AppModel {
                         dialog.connect_response(Some("apply"), move |_, _| {
                             let where_to = match &target {
                                 SpeedTestTarget::Global => {
+                                    // Rebase on the file before the whole-file save (same
+                                    // discipline as the settings dialog): another writer — the
+                                    // spawner's window-size persist, a second window's dialog —
+                                    // may have moved it under this shell's snapshot.
                                     let mut s = settings.borrow_mut();
+                                    *s = Settings::load();
                                     s.bitrate_kbps = recommended_kbps;
                                     s.save();
                                     "the default bitrate".to_string()
@@ -765,7 +770,9 @@ impl AppModel {
                         });
                     }
                     dialog.connect_response(Some("apply-global"), move |_, _| {
+                        // Rebase on the file first — see the Global arm above.
                         let mut s = settings.borrow_mut();
+                        *s = Settings::load();
                         s.bitrate_kbps = recommended_kbps;
                         s.save();
                         toasts.add_toast(adw::Toast::new(&format!(
@@ -796,9 +803,7 @@ impl SpeedTestTarget {
         // Resolved exactly the way a connect resolves it: the one-off pick this test was
         // started with (a pinned card carries one), else the host's binding.
         let bound = trust::KnownHosts::load()
-            .hosts
-            .iter()
-            .find(|h| h.addr == req.addr && h.port == req.port)
+            .find_by_addr(&req.addr, req.port)
             .and_then(|h| h.profile_id.clone());
         let reference = match req.profile.as_deref() {
             Some("") => return SpeedTestTarget::Global,

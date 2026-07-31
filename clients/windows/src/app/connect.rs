@@ -80,14 +80,42 @@ fn initiate_opts(
 }
 
 /// Start a stream that launches a library title on connect (`--launch id`) — the library
-/// page's tap-to-play. The library only opens for paired hosts, so the pin resolves like
-/// a normal initiate; a host forgotten mid-visit routes to the PIN ceremony instead.
+/// page's tap-to-play, and a deep link's `launch=` (which this used to drop: the link
+/// opened a plain desktop session). The library only opens for paired hosts, so the pin
+/// resolves like a normal initiate; a host forgotten mid-visit routes to the PIN ceremony
+/// instead.
 pub(crate) fn initiate_launch(
     ctx: &Arc<AppCtx>,
     target: Target,
     launch: String,
     set_screen: &AsyncSetState<Screen>,
     set_status: &AsyncSetState<String>,
+) {
+    initiate_launch_opts(ctx, target, launch, set_screen, set_status, false)
+}
+
+/// [`initiate_launch`] with the dial-first wake of [`initiate_waking`] — a deep link's
+/// `launch=` toward a saved host that isn't advertising but has a known MAC.
+pub(crate) fn initiate_launch_waking(
+    ctx: &Arc<AppCtx>,
+    target: Target,
+    launch: String,
+    set_screen: &AsyncSetState<Screen>,
+    set_status: &AsyncSetState<String>,
+) {
+    if ctx.settings.lock().unwrap().auto_wake {
+        crate::wol::wake(&target.mac, target.addr.parse().ok());
+    }
+    initiate_launch_opts(ctx, target, launch, set_screen, set_status, true)
+}
+
+fn initiate_launch_opts(
+    ctx: &Arc<AppCtx>,
+    target: Target,
+    launch: String,
+    set_screen: &AsyncSetState<Screen>,
+    set_status: &AsyncSetState<String>,
+    wake_on_fail: bool,
 ) {
     *ctx.shared.target.lock().unwrap() = target.clone();
     let known = KnownHosts::load();
@@ -112,6 +140,7 @@ pub(crate) fn initiate_launch(
         set_status,
         ConnectOpts {
             launch: Some(launch),
+            wake_on_fail,
             ..ConnectOpts::default()
         },
     );
@@ -222,16 +251,6 @@ fn connect_spawn(
     *ctx.shared.session.lock().unwrap() = child.clone();
     ctx.shared.stats_line.lock().unwrap().clear();
     ctx.shared.browse.store(false, Ordering::SeqCst);
-    // Through the same resolver the session uses, not the raw globals: "Start streams
-    // fullscreen" is a profileable (tier-P) field, so a host bound to a windowed profile has to
-    // win here too — the child takes this decision from the argv, not from its own settings.
-    let fullscreen = pf_client_core::trust::effective_settings(
-        &target.addr,
-        target.port,
-        target.profile.as_deref(),
-    )
-    .0
-    .fullscreen_on_stream;
     set_status.call(String::new());
     set_screen.call(if opts.awaiting_approval {
         Screen::RequestAccess
@@ -249,13 +268,15 @@ fn connect_spawn(
     // The closure owns `target`/`fp_hex`; the call itself borrows copies.
     let (addr, port, fp_arg) = (target.addr.clone(), target.port, fp_hex.clone());
     let profile_arg = target.profile.clone();
+    // The launch id: an explicit opts pick (the library's tap-to-play), else one riding
+    // the target — a deep link's `launch=` that detoured through the PIN ceremony.
+    let launch_arg = opts.launch.clone().or_else(|| target.launch.clone());
     let spawned = crate::spawn::spawn_session(
         &addr,
         port,
         &fp_arg,
         opts.connect_timeout.as_secs(),
-        fullscreen,
-        opts.launch.as_deref(),
+        launch_arg.as_deref(),
         profile_arg.as_deref(),
         child,
         move |event| {
@@ -277,8 +298,10 @@ fn connect_spawn(
                         // host PAIRED so future connects are silent. Plain TOFU persists
                         // it *unpaired* (pinned): the child connected pinned to the
                         // advertised fingerprint, so ready proves the host holds it.
+                        // Either way an authorised decision, so `upsert_trusted`: a dead
+                        // record for this address is retired instead of shadowing this one.
                         let mut k = KnownHosts::load();
-                        k.upsert(KnownHost {
+                        k.upsert_trusted(KnownHost {
                             name: target.name.clone(),
                             addr: target.addr.clone(),
                             port: target.port,
@@ -502,6 +525,8 @@ fn wake_and_connect(
                     // Came back on a new IP (DHCP): dial the fresh address and re-key the saved
                     // host so the pin stays reachable next time (keyed by fingerprint;
                     // addr/port overwritten, `paired`/`mac` preserved by `upsert`).
+                    // Plain `upsert` on purpose — this is an mDNS advert talking, not a trust
+                    // decision, so it may never retire another saved host at that address.
                     if let Some((addr, port)) =
                         resolved.filter(|(a, p)| *a != target.addr || *p != target.port)
                     {

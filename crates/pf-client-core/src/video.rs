@@ -110,6 +110,21 @@ pub struct VkVideoFrame {
     pub decode_done_value: u64,
     pub width: u32,
     pub height: u32,
+    /// The decode POOL's allocated extent (`AVHWFramesContext.width`/`.height`) — the
+    /// CODED picture size (rounded up to the codec's macroblock alignment, then to the
+    /// driver's Vulkan picture-access granularity), so it is `>=` `width`/`height`. At
+    /// 1080p the pool is 1088 rows tall: 1080 is not a multiple of 16.
+    ///
+    /// The presenter samples this image with NORMALIZED coordinates, so it needs both
+    /// numbers — `width`/`height` is what to display, `coded_*` is what the texture
+    /// actually spans. Sampling `0..1` without the ratio stretches the alignment padding
+    /// into view; because encoders fill those rows by replicating the picture's last
+    /// line, that reads as the bottom row smeared over the final few rows of the image
+    /// (field report 2026-07-31). Same class as the D3D11VA source-rect clamp in
+    /// `crate::video_d3d11`, which shows as a green bar there only because DXVA padding
+    /// is left uninitialized rather than replicated.
+    pub coded_width: u32,
+    pub coded_height: u32,
     pub color: ColorDesc,
     /// Intra keyframe (IDR/I): the stream's re-anchor point. The pump resumes display on
     /// one after suppressing the concealed frames a reference loss leaves in its wake (on
@@ -876,6 +891,10 @@ pub struct VulkanDecodeDevice {
     /// features). The bundle now exists even without it — Windows D3D11 interop rides the
     /// same struct — so consumers gate the FFmpeg-Vulkan decoder on THIS, not on `Some`.
     pub video_decode: bool,
+    /// The presenter has REAL on-glass present timing (`VK_KHR_present_wait` — its
+    /// `PresentTimer` runs). Gates the `CLIENT_CAP_PHASE_LOCK` advertisement: without a
+    /// true latch stamp the desktop has no latch grid and must not claim the cap.
+    pub present_timing: bool,
     /// PyroWave decode (the wired-LAN wavelet codec) is usable: Vulkan 1.3 + the compute
     /// features its kernels need were present AND enabled at device creation
     /// (`shaderInt16`, `storageBuffer8BitAccess`, subgroup size control). Gates the
@@ -950,6 +969,9 @@ pub(crate) fn drm_fourcc_for(sw: ffmpeg_next::ffi::AVPixelFormat) -> Option<u32>
     Some(match sw {
         AV_PIX_FMT_NV12 => fourcc(b'N', b'V', b'1', b'2'),
         AV_PIX_FMT_P010LE => fourcc(b'P', b'0', b'1', b'0'),
+        // Full-chroma 4:4:4 semi-planar (HEVC RExt decode on drivers that export it as
+        // two planes) — the presenter imports the full-size chroma plane like any other.
+        AV_PIX_FMT_NV24 => fourcc(b'N', b'V', b'2', b'4'),
         _ => return None,
     })
 }
@@ -984,6 +1006,7 @@ mod tests {
             queue_families: Vec::new(),
             pyrowave_decode: false,
             video_decode: true,
+            present_timing: false,
             d3d11_import: false,
             d3d11_hdr10: false,
             adapter_luid: None,
@@ -1023,6 +1046,10 @@ mod tests {
         assert_eq!(
             drm_fourcc_for(ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_NV12),
             Some(0x3231_564e)
+        );
+        assert_eq!(
+            drm_fourcc_for(ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_NV24),
+            Some(0x3432_564e)
         );
         assert_eq!(
             drm_fourcc_for(ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_RGBA),

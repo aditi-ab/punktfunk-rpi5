@@ -16,6 +16,9 @@ pub(super) struct ControlTask {
     pub(super) probe: Arc<Mutex<ProbeState>>,
     /// The latest host `BitrateChanged` ack, drained by the pump's ABR on its report tick.
     pub(super) bitrate_ack: Arc<Mutex<Option<u32>>>,
+    /// The live encoder-target mirror ([`NativeClient::current_bitrate_kbps`]): unlike the
+    /// drain-once ack slot above, this one always holds the latest acked rate for stats HUDs.
+    pub(super) live_bitrate: Arc<AtomicU32>,
     /// Outbound decode-recovery KEYFRAME asks, counted here because this is the one choke point
     /// every emitter funnels through (embedder, `note_frame_index`, the pump's own asks) — the
     /// pump drains the count per report window as the ABR's recovery signal.
@@ -44,6 +47,7 @@ impl ControlTask {
             mode_slot,
             probe,
             bitrate_ack,
+            live_bitrate,
             recovery_kf,
             clock_offset,
             clock_gen,
@@ -157,6 +161,11 @@ impl ControlTask {
                             kbps = ack.bitrate_kbps,
                             "host re-targeted encoder bitrate"
                         );
+                        // 0 would be a nonsense ack (the controller ignores it too) — don't
+                        // let it wipe the HUD's live target.
+                        if ack.bitrate_kbps > 0 {
+                            live_bitrate.store(ack.bitrate_kbps, Ordering::Relaxed);
+                        }
                         *bitrate_ack.lock().unwrap() = Some(ack.bitrate_kbps);
                     } else if let Ok(echo) = ClockEcho::decode(&msg) {
                         match resync.on_echo(&echo, wall_clock_ns()) {

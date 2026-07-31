@@ -19,11 +19,13 @@ use skia_safe::{Canvas, Rect};
 enum RowId {
     Resolution,
     Refresh,
+    RenderScale,
     Bitrate,
     Compositor,
     Codec,
     Decoder,
     Hdr,
+    Chroma444,
     Audio,
     Mic,
     EchoCancel,
@@ -31,17 +33,29 @@ enum RowId {
     PadType,
     Touch,
     Mouse,
+    InvertScroll,
+    Shortcuts,
     Stats,
+    Fullscreen,
+    AutoWake,
+    Library,
 }
 
-const ROWS: [RowId; 15] = [
+// The couch-relevant subset grew 2026-07-31: this screen is the ONLY settings editor in
+// Gaming Mode, so a field it omits is simply unreachable there (render scale, 4:4:4,
+// scroll/shortcut behavior, fullscreen-on-stream, auto-wake, the library toggle and echo
+// cancellation all were). Still deliberately smaller than the desktop dialogs — device
+// pickers (GPU/speaker/mic) and the profile catalog stay desktop-only.
+const ROWS: [RowId; 22] = [
     RowId::Resolution,
     RowId::Refresh,
+    RowId::RenderScale,
     RowId::Bitrate,
     RowId::Compositor,
     RowId::Codec,
     RowId::Decoder,
     RowId::Hdr,
+    RowId::Chroma444,
     RowId::Audio,
     RowId::Mic,
     RowId::EchoCancel,
@@ -49,7 +63,12 @@ const ROWS: [RowId; 15] = [
     RowId::PadType,
     RowId::Touch,
     RowId::Mouse,
+    RowId::InvertScroll,
+    RowId::Shortcuts,
     RowId::Stats,
+    RowId::Fullscreen,
+    RowId::AutoWake,
+    RowId::Library,
 ];
 
 const RESOLUTIONS: [(u32, u32); 6] = [
@@ -61,6 +80,8 @@ const RESOLUTIONS: [(u32, u32); 6] = [
     (3840, 2160),
 ];
 const REFRESH: [u32; 5] = [0, 30, 60, 90, 120];
+/// Mirrors [`punktfunk_core::render_scale::PRESETS`] (and the desktop pickers).
+const RENDER_SCALES: [f64; 9] = [0.5, 0.67, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0];
 const BITRATES: [u32; 7] = [0, 5_000, 10_000, 20_000, 30_000, 50_000, 80_000];
 const COMPOSITORS: [(&str, &str); 5] = [
     ("auto", "Automatic"),
@@ -78,10 +99,21 @@ const CODECS: [(&str, &str); 5] = [
     // selected when the host supports it too; anything else falls back to HEVC.
     ("pyrowave", "PyroWave (wired LAN)"),
 ];
+// Per-OS hardware rungs, like the shells' pickers: the console ships on Windows too
+// (`punktfunk-session --browse`), where "vaapi" is a dead option that ALSO hid the real
+// hardware path (d3d11va) — `Decoder::new` has no VAAPI branch there.
+#[cfg(not(windows))]
 const DECODERS: [(&str, &str); 4] = [
     ("auto", "Automatic"),
     ("vulkan", "Vulkan Video"),
     ("vaapi", "VAAPI"),
+    ("software", "Software"),
+];
+#[cfg(windows)]
+const DECODERS: [(&str, &str); 4] = [
+    ("auto", "Automatic"),
+    ("vulkan", "Vulkan Video"),
+    ("d3d11va", "Direct3D 11"),
     ("software", "Software"),
 ];
 const AUDIO: [(u8, &str); 3] = [(2, "Stereo"), (6, "5.1"), (8, "7.1")];
@@ -116,6 +148,15 @@ impl SettingsScreen {
             return None;
         }
         let (msg, pulse) = self.list.menu(ev, ROWS.len());
+        // Rebase the shell-lifetime snapshot on the file before an adjust-then-save: this
+        // screen is one of the settings file's several whole-file writers (profiles.rs
+        // documents the no-merge debt), and adjusting a stale snapshot would silently
+        // revert what another writer (a session's match-window persist, a desktop shell)
+        // stored while the console was open. Only on the mutating events — a cursor move
+        // shouldn't touch the disk.
+        if matches!(msg, ListMsg::Adjust(_) | ListMsg::Activate) {
+            *ctx.settings = pf_client_core::trust::Settings::load();
+        }
         match msg {
             ListMsg::Adjust(delta) => {
                 let changed = adjust(ROWS[self.list.cursor], delta, false, ctx);
@@ -205,6 +246,17 @@ fn row_spec(id: RowId, ctx: &Ctx) -> RowSpec {
                 format!("{} Hz", s.refresh_hz)
             },
         ),
+        RowId::RenderScale => (
+            None,
+            "Render scale",
+            if s.render_scale == 1.0 {
+                "Native".into()
+            } else if s.render_scale > 1.0 {
+                format!("{}× (supersample)", s.render_scale)
+            } else {
+                format!("{}×", s.render_scale)
+            },
+        ),
         RowId::Bitrate => (
             None,
             "Bitrate",
@@ -226,6 +278,7 @@ fn row_spec(id: RowId, ctx: &Ctx) -> RowSpec {
         ),
         RowId::Decoder => (None, "Decoder", label_for(&DECODERS, &s.decoder).into()),
         RowId::Hdr => (None, "10-bit HDR", on_off(s.hdr_enabled).into()),
+        RowId::Chroma444 => (None, "Full chroma (4:4:4)", on_off(s.enable_444).into()),
         RowId::Audio => (
             Some("Audio"),
             "Audio channels",
@@ -260,11 +313,24 @@ fn row_spec(id: RowId, ctx: &Ctx) -> RowSpec {
             s.touch_mode().label().into(),
         ),
         RowId::Mouse => (None, "Mouse mode", s.mouse_mode().label().into()),
+        RowId::InvertScroll => (None, "Invert scroll", on_off(s.invert_scroll).into()),
+        RowId::Shortcuts => (
+            None,
+            "Capture system shortcuts",
+            on_off(s.inhibit_shortcuts).into(),
+        ),
         RowId::Stats => (
             Some("Interface"),
             "Statistics overlay",
             s.stats_verbosity().label().into(),
         ),
+        RowId::Fullscreen => (
+            None,
+            "Start streams fullscreen",
+            on_off(s.fullscreen_on_stream).into(),
+        ),
+        RowId::AutoWake => (None, "Wake hosts automatically", on_off(s.auto_wake).into()),
+        RowId::Library => (None, "Game library", on_off(s.library_enabled).into()),
     };
     RowSpec {
         header,
@@ -284,6 +350,10 @@ fn detail(id: RowId) -> &'static str {
              Match window follows this window, including mid-stream resizes."
         }
         RowId::Refresh => "Native follows the display this window is on.",
+        RowId::RenderScale => {
+            "The host renders larger or smaller than the stream mode and this window \
+             resamples — above 1× supersamples, below saves bandwidth."
+        }
         RowId::Bitrate => "Automatic uses the host's default (20 Mbps).",
         RowId::Compositor => {
             "Which compositor drives the virtual output — honored only if available on the host."
@@ -292,6 +362,10 @@ fn detail(id: RowId) -> &'static str {
         RowId::Decoder => "Automatic prefers Vulkan Video, then VAAPI, then software.",
         RowId::Hdr => {
             "HDR10 — engages when the host sends HDR content and this display supports it."
+        }
+        RowId::Chroma444 => {
+            "Full-colour video: crisp small text and thin lines, at more bandwidth. \
+             HEVC only, and only where the host can encode it."
         }
         RowId::Audio => "The speaker layout requested from the host.",
         RowId::Mic => {
@@ -313,10 +387,21 @@ fn detail(id: RowId) -> &'static str {
              for games), Desktop leaves it free and sends absolute positions. \
              Ctrl+Alt+Shift+M switches live while streaming."
         }
+        RowId::InvertScroll => "Reverses the wheel and trackpad scroll direction sent to the host.",
+        RowId::Shortcuts => {
+            "Alt+Tab, Super and friends reach the host while input is captured. \
+             Off, they act on this device instead."
+        }
         RowId::Stats => {
             "How much the overlay shows: Compact (one line) → Normal → Detailed. \
              Ctrl+Alt+Shift+S cycles it live while streaming."
         }
+        RowId::Fullscreen => "Streams open fullscreen instead of windowed.",
+        RowId::AutoWake => {
+            "Send Wake-on-LAN to a sleeping host before connecting. Turn off for hosts \
+             reached over a VPN, where the wake wait only adds delay."
+        }
+        RowId::Library => "Show paired hosts' game libraries (tap a title to stream it).",
     }
 }
 
@@ -361,6 +446,13 @@ fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
             let cur = REFRESH.iter().position(|r| *r == s.refresh_hz);
             step_option(cur, REFRESH.len(), delta, wrap).map(|i| s.refresh_hz = REFRESH[i])
         }
+        RowId::RenderScale => {
+            // Exact float compare is fine: every writer (here and the desktop pickers)
+            // stores one of these literals; a hand-edited oddball snaps to the first step.
+            let cur = RENDER_SCALES.iter().position(|v| *v == s.render_scale);
+            step_option(cur, RENDER_SCALES.len(), delta, wrap)
+                .map(|i| s.render_scale = RENDER_SCALES[i])
+        }
         RowId::Bitrate => {
             let cur = BITRATES.iter().position(|b| *b == s.bitrate_kbps);
             step_option(cur, BITRATES.len(), delta, wrap).map(|i| s.bitrate_kbps = BITRATES[i])
@@ -369,6 +461,7 @@ fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
         RowId::Codec => step_str(&CODECS, &mut s.codec, delta, wrap),
         RowId::Decoder => step_str(&DECODERS, &mut s.decoder, delta, wrap),
         RowId::Hdr => toggle(&mut s.hdr_enabled, delta, wrap),
+        RowId::Chroma444 => toggle(&mut s.enable_444, delta, wrap),
         RowId::Audio => {
             let cur = AUDIO.iter().position(|(v, _)| *v == s.audio_channels);
             step_option(cur, AUDIO.len(), delta, wrap).map(|i| s.audio_channels = AUDIO[i].0)
@@ -401,6 +494,8 @@ fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
             step_option(cur, MouseMode::ALL.len(), delta, wrap)
                 .map(|i| s.mouse_mode = MouseMode::ALL[i].as_name().to_string())
         }
+        RowId::InvertScroll => toggle(&mut s.invert_scroll, delta, wrap),
+        RowId::Shortcuts => toggle(&mut s.inhibit_shortcuts, delta, wrap),
         RowId::Stats => {
             let cur = StatsVerbosity::ALL
                 .iter()
@@ -408,6 +503,9 @@ fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
             step_option(cur, StatsVerbosity::ALL.len(), delta, wrap)
                 .map(|i| s.set_stats_verbosity(StatsVerbosity::ALL[i]))
         }
+        RowId::Fullscreen => toggle(&mut s.fullscreen_on_stream, delta, wrap),
+        RowId::AutoWake => toggle(&mut s.auto_wake, delta, wrap),
+        RowId::Library => toggle(&mut s.library_enabled, delta, wrap),
     }
     .is_some()
 }

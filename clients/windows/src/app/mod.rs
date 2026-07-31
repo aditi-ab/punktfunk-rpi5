@@ -107,6 +107,10 @@ pub(crate) struct Target {
     /// `None` honors the binding. It never rebinds anything — the default changes only through
     /// the picker in the host editor (design/client-settings-profiles.md §5.2).
     pub(crate) profile: Option<String>,
+    /// A library title id (`steam:570`, …) to launch on connect — carried on the target so it
+    /// survives a detour through the PIN ceremony (a deep link's `launch=` toward an unpaired
+    /// host must still launch the game once pairing succeeds).
+    pub(crate) launch: Option<String>,
 }
 
 /// Stable app services handed to the page components as props. Each routed screen that uses
@@ -392,22 +396,54 @@ fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
                         pair_optional: false,
                         mac: p.host.mac.clone(),
                         profile: p.profile_override.clone(),
+                        launch: None, // routed explicitly below (initiate_launch*)
                     };
                     // With a MAC it takes the dial first wake path, so a sleeping host wakes
-                    // instead of erroring — exactly what clicking its tile would do.
-                    if p.wake && !target.mac.is_empty() {
-                        connect::initiate_waking(&ctx, target, &set_screen, &set_status);
-                    } else {
-                        connect::initiate(&ctx, target, &set_screen, &set_status);
+                    // instead of erroring — exactly what clicking its tile would do. The
+                    // link's `launch=` id must reach the session (`--launch`) — this arm used
+                    // to drop it, so a game link opened a plain desktop session.
+                    match (p.launch.clone(), p.wake && !target.mac.is_empty()) {
+                        (Some(id), true) => {
+                            connect::initiate_launch_waking(
+                                &ctx,
+                                target,
+                                id,
+                                &set_screen,
+                                &set_status,
+                            );
+                        }
+                        (Some(id), false) => {
+                            connect::initiate_launch(&ctx, target, id, &set_screen, &set_status);
+                        }
+                        (None, true) => {
+                            connect::initiate_waking(&ctx, target, &set_screen, &set_status)
+                        }
+                        (None, false) => connect::initiate(&ctx, target, &set_screen, &set_status),
                     }
                 }
-                // Known but never pinned, or not known at all: a link may not pair or trust on
-                // its own, so it lands on the host list with the reason shown. The user pairs
-                // there, under their own eyes.
-                Ok(PlanOutcome::ConfirmUnknown(u)) => refuse(format!(
-                    "{} isn't paired with this device yet \u{2014} pair it, then use the link again.",
-                    u.name.clone().unwrap_or_else(|| u.addr.clone())
-                )),
+                // Known but never pinned, or not known at all: a link may not pair and may not
+                // trust on its own, so it opens the ordinary PIN ceremony seeded with what the
+                // link CLAIMED — name shown as claimed, the fingerprint pre-filling the pin so
+                // the first connect is verified against it rather than blind TOFU, and the
+                // launch/profile surviving the detour (§3.1; GTK-shell parity — this used to
+                // refuse outright and make shared links a dead end on Windows).
+                Ok(PlanOutcome::ConfirmUnknown(u)) => {
+                    let name = u.name.clone().unwrap_or_else(|| u.addr.clone());
+                    *ctx.shared.target.lock().unwrap() = Target {
+                        name: name.clone(),
+                        addr: u.addr.clone(),
+                        port: u.port,
+                        fp_hex: u.fp.clone(),
+                        pair_optional: false,
+                        mac: Vec::new(),
+                        profile: u.profile.clone(),
+                        launch: u.launch.clone(),
+                    };
+                    set_status.call(format!(
+                        "{name} isn't paired with this device yet \u{2014} pair it to continue."
+                    ));
+                    set_screen.call(Screen::Pair);
+                }
                 Ok(PlanOutcome::Unsupported(route)) => refuse(format!(
                     "Punktfunk can't open \u{201c}{}\u{201d} links yet.",
                     route.as_str()

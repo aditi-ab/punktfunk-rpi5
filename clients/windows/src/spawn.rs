@@ -55,9 +55,19 @@ impl SessionChild {
 /// One parsed stdout line of the session contract; `None` for anything unrecognized.
 enum ChildLine {
     Ready,
-    Error { msg: String, trust_rejected: bool },
+    Error {
+        msg: String,
+        trust_rejected: bool,
+    },
     Ended(String),
     Stats(String),
+    /// The session window's logical size settled here under match-window — the SPAWNER
+    /// persists it (design/client-architecture-split.md §5). This shell ignored the line
+    /// until 2026-07-31, so its sessions fell back to persisting from the renderer.
+    Window {
+        w: u32,
+        h: u32,
+    },
 }
 
 fn parse_line(line: &str) -> Option<ChildLine> {
@@ -76,6 +86,12 @@ fn parse_line(line: &str) -> Option<ChildLine> {
     }
     if let Some(msg) = v.get("ended").and_then(|m| m.as_str()) {
         return Some(ChildLine::Ended(msg.to_string()));
+    }
+    if let Some(win) = v.get("window") {
+        let dim = |k: &str| win.get(k).and_then(|n| n.as_u64()).map(|n| n as u32);
+        if let (Some(w), Some(h)) = (dim("w"), dim("h")) {
+            return Some(ChildLine::Window { w, h });
+        }
     }
     None
 }
@@ -107,42 +123,60 @@ pub(crate) fn session_binary() -> std::path::PathBuf {
 
 /// Spawn the session binary for a connect with `fp_hex` pinned and feed its lifecycle to
 /// `on_event` from a reader thread. The child is parked in `slot` so Disconnect/Cancel
-/// can kill it. `fullscreen` starts the stream window fullscreen (the Settings "Start
-/// streams fullscreen" toggle); `launch` carries a library title id for the host to
-/// launch during the handshake. `Err` = the spawn itself failed (binary missing?) —
-/// surfaced as a connect error by the caller.
+/// can kill it. `launch` carries a library title id for the host to launch during the
+/// handshake; `profile` is a ONE-OFF settings-profile pick. `Err` = the spawn itself
+/// failed (binary missing?) — surfaced as a connect error by the caller.
+///
+/// The argv and the `--resolved-spec` both come from the shared brain
+/// ([`ConnectPlan::for_target`] → `session_args()` + `spec()`): this shell hand-assembled
+/// its argv until 2026-07-31, which meant no spec — its sessions took the compat path and
+/// re-resolved every setting from the stores (the drift `orchestrate.rs` documents as a
+/// trap), and any field added to the spec was silently Windows-dead. Fullscreen now also
+/// comes from the plan's EFFECTIVE settings (profile-aware) instead of a caller argument.
 #[allow(clippy::too_many_arguments)] // one cohesive spawn spec (session_params precedent)
 pub(crate) fn spawn_session(
     addr: &str,
     port: u16,
     fp_hex: &str,
     connect_timeout_secs: u64,
-    fullscreen: bool,
     launch: Option<&str>,
     profile: Option<&str>,
     slot: SessionChild,
     on_event: impl FnMut(SpawnEvent) + Send + 'static,
 ) -> Result<(), String> {
+    use pf_client_core::orchestrate::{ConnectPlan, HostTarget};
+    let mut plan = ConnectPlan::for_target(
+        HostTarget {
+            name: String::new(), // display-only; this shell's screens carry their own copy
+            addr: addr.to_string(),
+            port,
+            fp_hex: Some(fp_hex.to_string()),
+            mac: Vec::new(), // wake ran before this spawn (initiate_waking) — not the plan's job
+            id: None,
+        },
+        launch.map(str::to_string),
+        profile.map(str::to_string),
+    );
+    plan.connect_timeout_secs = Some(connect_timeout_secs);
     let mut cmd = Command::new(session_binary());
-    cmd.arg("--connect")
-        .arg(format!("{addr}:{port}"))
-        .arg("--fp")
-        .arg(fp_hex)
-        .arg("--connect-timeout")
-        .arg(connect_timeout_secs.to_string());
-    if fullscreen {
-        cmd.arg("--fullscreen");
-    }
-    if let Some(id) = launch {
-        cmd.arg("--launch").arg(id);
-    }
-    // Only a ONE-OFF pick rides the flag: without it the session resolves the host's own
-    // binding through the same helper this shell would have used, so the two can't disagree.
-    if let Some(reference) = profile {
-        cmd.arg("--profile").arg(reference);
-    }
+    let mut args = plan.session_args();
+    // Spec mode (design/client-architecture-split.md §5): the child reads no stores and
+    // cannot disagree with us about a file either of us might write. A spec we fail to
+    // write is not fatal — the compat path resolves the same values via the same helper.
+    let spec_path = match plan.spec(plan.clipboard).write_temp() {
+        Ok(path) => {
+            args.push("--resolved-spec".into());
+            args.push(path.to_string_lossy().into_owned());
+            Some(path)
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "couldn't write the resolved spec; the session will resolve for itself");
+            None
+        }
+    };
+    cmd.args(args);
     add_window_pos(&mut cmd);
-    spawn_with(cmd, &format!("{addr}:{port}"), slot, on_event)
+    spawn_with(cmd, &format!("{addr}:{port}"), spec_path, slot, on_event)
 }
 
 /// Spawn the session binary in `--browse` mode: the console (gamepad) library for a
@@ -169,7 +203,7 @@ pub(crate) fn spawn_browse(
     }
     add_window_pos(&mut cmd);
     let label = target.map_or_else(|| "console".to_string(), |(a, p)| format!("{a}:{p}"));
-    spawn_with(cmd, &label, slot, on_event)
+    spawn_with(cmd, &label, None, slot, on_event)
 }
 
 /// Hand the shell window's position to the child (`--window-pos`) so the session window
@@ -182,9 +216,11 @@ fn add_window_pos(cmd: &mut Command) {
 }
 
 /// The shared spawn + stdout-contract reader behind [`spawn_session`]/[`spawn_browse`].
+/// `spec_path` is the child's `--resolved-spec` temp file, deleted once the child exits.
 fn spawn_with(
     mut cmd: Command,
     host_label: &str,
+    spec_path: Option<std::path::PathBuf>,
     slot: SessionChild,
     mut on_event: impl FnMut(SpawnEvent) + Send + 'static,
 ) -> Result<(), String> {
@@ -225,8 +261,18 @@ fn spawn_with(
                         trust_rejected,
                     }) => error = Some((msg, trust_rejected)),
                     Some(ChildLine::Ended(msg)) => ended = Some(msg),
+                    // The window size is the spawner's to persist — the renderer only
+                    // reports it (same handling as orchestrate's own reader).
+                    Some(ChildLine::Window { w, h }) => {
+                        pf_client_core::orchestrate::persist_window_size(w, h);
+                    }
                     None => {}
                 }
+            }
+            // The spec has done its job the moment the child has read it; a leftover temp
+            // file in %TEMP% is litter, and one per launch adds up.
+            if let Some(path) = &spec_path {
+                let _ = std::fs::remove_file(path);
             }
             // EOF — reap the child (killed-by-Disconnect lands here too; -1 = no code).
             let code = slot
@@ -276,6 +322,12 @@ mod tests {
         match parse_line("stats: 1280\u{00D7}800@60 \u{00B7} 60 fps") {
             Some(ChildLine::Stats(s)) => assert!(s.starts_with("1280")),
             _ => panic!("stats line"),
+        }
+        // The match-window report: the SPAWNER persists it (§5) — dropping this line was
+        // why Windows sessions fell back to renderer-local persistence.
+        match parse_line("{\"window\":{\"w\":1600,\"h\":900}}") {
+            Some(ChildLine::Window { w, h }) => assert_eq!((w, h), (1600, 900)),
+            _ => panic!("window line"),
         }
         assert!(parse_line("").is_none());
         assert!(parse_line("{\"other\":1}").is_none());

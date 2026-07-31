@@ -670,6 +670,7 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                 pair_optional: false,
                 mac: k.mac.clone(),
                 profile: None,
+                launch: None,
             };
             // Online = advertising on mDNS OR proven reachable by the last probe sweep (the latter
             // covers a routed/Tailscale host that never advertises — the display companion to
@@ -959,6 +960,7 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                 pair_optional: h.pair == "optional",
                 mac: h.mac.clone(),
                 profile: None,
+                launch: None,
             };
             let (ctx2, ss, st) = (ctx.clone(), set_screen.clone(), set_status.clone());
             let (badge, kind) = if h.pair == "required" {
@@ -1052,6 +1054,7 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                     pair_optional: false,
                     mac: Vec::new(),
                     profile: None,
+                    launch: None,
                 },
                 &ss,
                 &st,

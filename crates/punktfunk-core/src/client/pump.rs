@@ -72,6 +72,7 @@ pub(super) async fn run_pump(args: WorkerArgs) {
         hot_tids,
         clock_offset,
         decode_lat,
+        live_bitrate,
         ..
     } = args;
     // Copies the pump needs after `negotiated` is handed over to `connect`.
@@ -81,6 +82,9 @@ pub(super) async fn run_pump(args: WorkerArgs) {
     // Seed the live offset with the connect-time estimate BEFORE the embedder can observe the
     // client (ready_tx): clock_offset_now_ns() never reads a pre-handshake 0 on a skewed pair.
     clock_offset.store(negotiated.clock_offset_ns, Ordering::Relaxed);
+    // Same discipline for the live encoder target: the Welcome resolve is the starting truth
+    // (0 against an old host that reports none); every BitrateChanged ack moves it from there.
+    live_bitrate.store(negotiated.bitrate_kbps, Ordering::Relaxed);
     // Bumped by the control task each time a re-sync batch is APPLIED; the pump watches it to
     // reset its staleness counters and re-arm the clock-based jump-to-live detector.
     let clock_gen = Arc::new(AtomicU32::new(0));
@@ -144,6 +148,7 @@ pub(super) async fn run_pump(args: WorkerArgs) {
             mode_slot,
             probe: probe.clone(),
             bitrate_ack: bitrate_ack.clone(),
+            live_bitrate,
             recovery_kf: recovery_kf.clone(),
             clock_offset: clock_offset.clone(),
             clock_gen: clock_gen.clone(),

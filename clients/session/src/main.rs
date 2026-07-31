@@ -175,10 +175,11 @@ mod session_main {
         // the last store read the compat path still owes. `addr` is moved into the struct
         // below, so read it first.
         let clipboard = clipboard_override.unwrap_or_else(|| {
+            // The record this address RESOLVES to, not "any record mentioning it": a retired
+            // duplicate must never be the one that hands a host the clipboard.
             trust::KnownHosts::load()
-                .hosts
-                .iter()
-                .any(|h| h.addr == addr && h.port == port && h.clipboard_sync)
+                .find_by_addr(&addr, port)
+                .is_some_and(|h| h.clipboard_sync)
         });
         // Re-apply the shell-persisted forwarded-controller pin (stable `vid:pid:name`
         // key) to OUR gamepad service — the shells' in-process services can't reach this
@@ -218,6 +219,8 @@ mod session_main {
             height: sh,
             ..mode
         };
+        // Before the struct literal — `vulkan` moves into it below.
+        let phase_lock = vulkan.as_ref().is_some_and(|v| v.present_timing);
         SessionParams {
             host: addr,
             port,
@@ -248,9 +251,14 @@ mod session_main {
             // 4:4:4 is opt-in and off by default (Settings "Full chroma"): the bit only says
             // "upgrade me if you can" — the host still gates on its own policy, its capturer,
             // HEVC, and a real GPU 4:4:4 encode probe, and answers the resolved chroma in the
-            // Welcome BEFORE we build a decoder. Advertised unconditionally when the user asks
-            // for it because every decode path here can produce it: the hardware ones where the
-            // driver decodes RExt, and swscale for the rest (the decoder demotes on its own).
+            // Welcome BEFORE we build a decoder. Advertised whenever the user asks because
+            // every path can DISPLAY it: the Vulkan presenter samples the 2-plane 4:4:4 pool
+            // formats (hardware RExt decode where the driver offers it — NVIDIA today) and
+            // swscale converts anything else for the software rung, with the decoder ladder
+            // demoting on its own. No capability probe gates the bit — software decode is the
+            // guaranteed floor — but the cost is VISIBLE, not silent: the Detailed stats
+            // overlay prints the resolved chroma ("4:4:4→4:2:0" when the host declined) and
+            // the decode path frames actually took.
             video_caps: punktfunk_core::quic::VIDEO_CAP_MULTI_SLICE
                 | if settings.hdr_enabled {
                     punktfunk_core::quic::VIDEO_CAP_10BIT | punktfunk_core::quic::VIDEO_CAP_HDR
@@ -262,9 +270,19 @@ mod session_main {
                 } else {
                     0
                 },
-            // No portable Wayland/X11 display-volume query yet, so the host keeps its EDID
-            // defaults for Linux clients; `PUNKTFUNK_CLIENT_PEAK_NITS` (read in the session
-            // pump) pins one manually.
+            // This panel's HDR colour volume → the host's virtual-display EDID, so host
+            // apps tone-map to the real glass. Windows reads it from DXGI (the
+            // `--window-pos` monitor; advanced-color outputs only) — gated on the HDR
+            // setting, since with 10-bit/HDR unadvertised above the volume is noise. No
+            // portable Wayland/X11 query exists yet, so Linux keeps the host's EDID
+            // defaults; `PUNKTFUNK_CLIENT_PEAK_NITS` (read in the session pump) pins one
+            // manually on either OS and wins over both.
+            #[cfg(windows)]
+            display_hdr: settings
+                .hdr_enabled
+                .then(|| pf_client_core::video_d3d11::display_hdr_volume(window_pos()))
+                .flatten(),
+            #[cfg(not(windows))]
             display_hdr: None,
             // The presenter renders the host cursor locally in desktop mouse mode (M2 cursor
             // channel); capture-mode sessions keep the composited cursor, so only advertise
@@ -285,6 +303,13 @@ mod session_main {
             connect_timeout: connect_timeout(),
             force_software,
             profile,
+            // Phase-locked capture (design/phase-locked-capture.md, Apple/Android parity):
+            // advertised only when the presenter has real on-glass latch stamps
+            // (VK_KHR_present_wait) — without them there is no latch grid to report. The
+            // grid itself is written by the presenter (run_session clones the Arc out of
+            // these params) and folded into ~1 Hz PhaseReports by the session pump.
+            phase_lock,
+            latch_grid: std::sync::Arc::new(pf_client_core::session::LatchGrid::default()),
         }
     }
 
@@ -439,11 +464,21 @@ mod session_main {
 
         // The Settings device picks → env, unless the user already forced one by hand:
         // the GPU (the shells' pickers store the adapter's marketing name) for the
-        // presenter's device selection, and the audio endpoints (PipeWire node names)
-        // for the playback/mic streams' `target.object`. Before any Vulkan call, like
-        // the RADV knob (covers --connect and --browse).
+        // presenter's device selection, and the audio endpoints (PipeWire node names /
+        // WASAPI endpoint ids) for the playback/mic streams. Before any Vulkan call,
+        // like the RADV knob (covers --connect and --browse).
+        //
+        // Spec mode takes them from the SPEC's settings — the spawner's resolve — which
+        // keeps the §5 zero-store-reads invariant and lets a profile overlay reach these
+        // fields if they ever become profileable. Parsed leniently here (the `--connect`
+        // flow re-reads the spec authoritatively and errors there); the compat path and
+        // `--browse` (which never carries a spec) still load the store.
         {
-            let s = trust::Settings::load();
+            let s = arg_value("--resolved-spec")
+                .and_then(|p| {
+                    pf_client_core::orchestrate::ResolvedSpec::read(std::path::Path::new(&p)).ok()
+                })
+                .map_or_else(trust::Settings::load, |spec| spec.settings);
             for (var, value) in [
                 ("PUNKTFUNK_VK_ADAPTER", &s.adapter),
                 ("PUNKTFUNK_AUDIO_SINK", &s.speaker_device),
@@ -541,10 +576,7 @@ mod session_main {
         // connects silently; an unknown host is REFUSED — there is no dialog here, and a
         // silent TOFU would defeat the pinning model. Pair via the desktop client.
         let known = trust::KnownHosts::load();
-        let known_host = known
-            .hosts
-            .iter()
-            .find(|h| h.addr == addr && h.port == port);
+        let known_host = known.find_by_addr(&addr, port);
         let pin = arg_value("--fp")
             .as_deref()
             .and_then(trust::parse_hex32)

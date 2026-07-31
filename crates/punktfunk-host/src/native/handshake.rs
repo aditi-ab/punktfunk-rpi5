@@ -326,14 +326,15 @@ pub(super) async fn negotiate(
     let client_supports_444 = hello.video_caps & punktfunk_core::quic::VIDEO_CAP_444 != 0;
     // The active capturer must be able to deliver a full-chroma (RGB) source — the honest-downgrade
     // gate. Linux's portal capturer always can (`capturer_supports_444` returns `true`
-    // unconditionally). On WINDOWS the IDD-push path CAN too — for an SDR 4:4:4 session it passes
-    // the BGRA ring slot straight through, skipping the NV12 VideoConverter — but only a backend
-    // that ingests RGB and CSCs it to 4:4:4 itself can consume that, so the Windows arm forwards
+    // unconditionally). On WINDOWS the IDD-push path CAN too, at either depth: an SDR session
+    // passes the BGRA ring slot straight through and an HDR one converts the FP16 desktop to
+    // packed 10-bit BT.2020 PQ RGB — both skip the subsampling converters. Only a backend that
+    // ingests RGB and CSCs it to 4:4:4 itself can consume that, so the Windows arm forwards
     // `resolved_backend_ingests_rgb_444()` (today: direct-NVENC only; AMF can't 4:4:4 at all and
-    // the QSV/ffmpeg path has no RGB-input 4:4:4 wiring). An HDR display still downgrades to 4:2:0
-    // at capture time — there is no 10-bit full-chroma source — and the encoder's caps cross-check
-    // reports that truth. (Replaces the old `single_process` gate — single-process is now the only
-    // topology, and 4:4:4 routed to DDA, which was removed.)
+    // the QSV/ffmpeg path has no RGB-input 4:4:4 wiring). HDR no longer costs the chroma: 10-bit
+    // 4:4:4 is HEVC Main 4:4:4 10, which is what this resolves to. (Replaces the old
+    // `single_process` gate — single-process is now the only topology, and 4:4:4 routed to DDA,
+    // which was removed.)
     // PyroWave does its own RGB→YCbCr CSC and its capture mode always delivers a full-chroma
     // (RGB/BGRA) source on both OSes — the capturer gate is inherently satisfied; the real
     // gate is `can_encode_444` (the full-res-chroma CSC variant existing on this OS).

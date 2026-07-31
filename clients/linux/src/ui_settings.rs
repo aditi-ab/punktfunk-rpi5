@@ -1937,7 +1937,14 @@ pub fn show_scoped(
                 commit_profile(active, &touched, &values);
             }
             None => {
+                // Rebase on the file, not the shell's start-of-app snapshot: the settings file
+                // has other whole-file writers (the spawner persists `last_window_w/h` after a
+                // match-window resize — see `profiles.rs` on why there's no merge), and saving
+                // the stale snapshot here would silently revert whatever they stored while this
+                // app was open. The rows carry every value this dialog owns, so applying them
+                // onto a fresh load loses nothing.
                 let mut s = settings.borrow_mut();
+                *s = Settings::load();
                 apply_rows(&mut s);
                 s.save();
             }
