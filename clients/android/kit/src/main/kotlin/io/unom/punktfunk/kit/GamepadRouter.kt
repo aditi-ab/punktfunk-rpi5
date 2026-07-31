@@ -65,6 +65,16 @@ class GamepadRouter(context: Context, private val handle: Long, private val sett
      */
     var onExitArmed: ((armed: Boolean) -> Unit)? = null
 
+    /**
+     * Invoked (main thread) each time the mic-mute chord ([MIC_CHORD], Select + Y) is COMPLETED on
+     * a pad — the couch equivalent of the stream's on-screen mute button, which a gamepad user
+     * cannot reach. `StreamScreen` wires it to the mute toggle. Unlike the exit chord this fires
+     * immediately: muting is the kind of thing you want to have already happened, and the on-screen
+     * indicator makes an accidental toggle self-evident. The buttons still go to the host — the
+     * chord adds a meaning to them rather than swallowing them, exactly as the exit chord does.
+     */
+    var onMicChord: (() -> Unit)? = null
+
     private val mainHandler = Handler(Looper.getMainLooper())
     /** The pending exit-chord hold timer, or null when the chord isn't currently armed. */
     private var pendingExit: Runnable? = null
@@ -108,14 +118,23 @@ class GamepadRouter(context: Context, private val handle: Long, private val sett
 
     /**
      * One button transition on [slot] — the shared body behind [onButton] and an [ExternalPad]'s
-     * transitions: forward the wire event, track held state, and arm/disarm the exit chord.
+     * transitions: forward the wire event, track held state, arm/disarm the exit chord, and fire
+     * the mic-mute chord ([MIC_CHORD]).
      */
     private fun slotButton(slot: Slot, bit: Int, down: Boolean, send: Boolean) {
         if (down) {
             if (send) NativeBridge.nativeSendGamepadButton(handle, bit, true, slot.index)
+            val wasHeld = slot.held
             slot.held = slot.held or bit
             // Full chord now held on this pad → start the hold countdown (idempotent while held).
             if (slot.held and EXIT_CHORD == EXIT_CHORD) armExit()
+            // Mic mute, edge-triggered on the button that COMPLETES the chord: a genuine press
+            // (`wasHeld` lacks the bit, so an auto-repeat DOWN can't re-fire it) of a chord member
+            // that leaves the whole chord held. Any other button pressed while Select + Y are down
+            // fails the middle test, so the toggle happens once per chord, not once per press.
+            if (wasHeld and bit == 0 && bit and MIC_CHORD != 0 && slot.held and MIC_CHORD == MIC_CHORD) {
+                onMicChord?.invoke()
+            }
         } else {
             if (send) NativeBridge.nativeSendGamepadButton(handle, bit, false, slot.index)
             slot.held = slot.held and bit.inv()
@@ -350,6 +369,14 @@ class GamepadRouter(context: Context, private val handle: Long, private val sett
          * on-screen hint covers the gap). Roughly matches SDL/Apple `DISCONNECT_HOLD`.
          */
         const val EXIT_HOLD_MS = 1000L
+
+        /**
+         * Mic-mute chord: Select + Y. Y is deliberately NOT one of [EXIT_CHORD]'s buttons, so no
+         * way of reaching the exit chord can pass through this one on the way (and vice versa) —
+         * and Select is a menu button rather than a twitch action, which makes the pair unlikely
+         * to occur inside real play.
+         */
+        const val MIC_CHORD = Gamepad.BTN_BACK or Gamepad.BTN_Y
 
         /** Synthetic slot-key base for [ExternalPad]s — below every real (positive) InputDevice id. */
         const val EXTERNAL_ID_BASE = -1000

@@ -61,6 +61,13 @@ pub(crate) struct SessionHandle {
     audio: Mutex<Option<crate::audio::AudioPlayback>>,
     #[cfg(target_os = "android")]
     mic: Mutex<Option<crate::mic::MicCapture>>,
+    /// In-stream mic mute, set via `nativeSetMicMuted` and read per 10 ms frame by the mic's
+    /// encode loop ([`crate::mic`]). Session-lifetime rather than per-[`crate::mic::MicCapture`]
+    /// for the same reason the stats gate is: the mic stops and restarts across a surface
+    /// recreate, and a mute the user set must come back with it — with no window in which the
+    /// fresh capture could send an unmuted frame. Per session and never persisted: a new session
+    /// starts unmuted.
+    pub mic_muted: Arc<AtomicBool>,
 }
 
 struct VideoThread {

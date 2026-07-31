@@ -28,12 +28,20 @@ import android.view.inputmethod.InputMethodManager
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Mic
+import androidx.compose.material.icons.filled.MicOff
+import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -44,6 +52,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
@@ -106,6 +115,31 @@ fun StreamScreen(session: ActiveSession, onDisconnect: () -> Unit) {
     // so a surface recreate re-attaches to the fresh stream instead of leaking effect engines.
     // All three touch points run on the main thread; a plain list is race-free.
     val micEffects = remember { mutableListOf<AudioEffect>() }
+
+    // In-stream mic mute. Per SESSION and never persisted (no setting backs it): a new stream
+    // always starts unmuted. The authoritative flag lives on the native handle, which is why a mute
+    // survives the mic stop/start a surface recreate performs — this state is the UI's mirror of
+    // it, and survives the same recreate because the composition outlives the surface.
+    var micMuted by remember(handle) { mutableStateOf(false) }
+    // Whether a capture is actually RUNNING, not merely wanted — set from surfaceCreated on what
+    // nativeMicActive reports. A device that refused every AAudio input rung gets no mute control
+    // rather than one that lies about a mic being heard.
+    var micRunning by remember(handle) { mutableStateOf(false) }
+    // Transient confirmation of a mic-chord toggle (null = nothing showing). Only the gamepad path
+    // needs it: the touch button confirms itself by changing under the finger, but a chord has no
+    // on-screen state of its own, and "did that register?" is exactly the doubt to answer.
+    var micHint by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(micHint) {
+        if (micHint != null) {
+            delay(1600)
+            micHint = null
+        }
+    }
+    // The one place mute is toggled — Compose state + the native flag, always together.
+    val setMicMuted = { muted: Boolean ->
+        micMuted = muted
+        NativeBridge.nativeSetMicMuted(handle, muted)
+    }
 
     // Live decode stats for the HUD. `statsOn` (verbosity != OFF) gates the whole native pipeline:
     // the per-frame sampling (nativeSetVideoStatsEnabled — a hidden HUD costs one atomic load per
@@ -297,6 +331,16 @@ fun StreamScreen(session: ActiveSession, onDisconnect: () -> Unit) {
         // Show a "hold to quit" hint the moment the chord completes (the router debounces the actual
         // exit); it clears when the buttons release early or the hold elapses. Runs on the main thread.
         router.onExitArmed = { armed -> exitArming = armed }
+        // Select + Y toggles the mic — the couch reach for the on-screen mute button, which a
+        // gamepad/TV user has no pointer for. Ignored when no capture is running (there is nothing
+        // to mute, and claiming otherwise would be the lie the control exists to avoid).
+        router.onMicChord = {
+            if (micRunning) {
+                val next = !micMuted
+                setMicMuted(next)
+                micHint = if (next) "Microphone muted" else "Microphone live"
+            }
+        }
         // Physical mouse: uncaptured hover/click/wheel forwards as absolute pointing; captured
         // (setting or the Ctrl+Alt+Shift+Q chord) raw deltas forward as relative mouse-look.
         // The local cursor is hidden over the stream — the host's own cursor, composited into
@@ -493,6 +537,7 @@ fun StreamScreen(session: ActiveSession, onDisconnect: () -> Unit) {
             dsUsbReceiver?.let { runCatching { context.unregisterReceiver(it) } }
             ds?.stop() // rumble-stop on the physical pad + release the USB link + free the wire slot
             router.onExitArmed = null // don't poke Compose state from release()'s disarm while tearing down
+            router.onMicChord = null // same: no mute toggle on buttons released during teardown
             router.release() // flush every slot (nothing sticks host-side) + drop the hot-plug listener
             activity?.gamepadRouter = null
             // Mouse/remote-pointer teardown: lift held buttons, drop the grab, restore the cursor.
@@ -626,6 +671,11 @@ fun StreamScreen(session: ActiveSession, onDisconnect: () -> Unit) {
                                 if (initialSettings.echoCancel) {
                                     attachMicEffects(sessionId, micEffects)
                                 }
+                                // Did a capture actually open? That — not the setting — is what
+                                // puts the mute control on screen. A restart after a surface
+                                // recreate comes back already muted if the user muted: the flag
+                                // lives on the session handle, so nothing has to be re-applied.
+                                micRunning = NativeBridge.nativeMicActive(handle)
                             }
                         }
 
@@ -639,6 +689,10 @@ fun StreamScreen(session: ActiveSession, onDisconnect: () -> Unit) {
                             if (!closed.get()) {
                                 releaseMicEffects(micEffects)
                                 NativeBridge.nativeStopMic(handle)
+                                // No capture, no control — but the MUTE state is deliberately left
+                                // standing (native keeps it on the handle), so the restart in
+                                // surfaceCreated brings the user's choice back with it.
+                                micRunning = false
                                 NativeBridge.nativeStopAudio(handle)
                                 NativeBridge.nativeStopVideo(handle)
                             }
@@ -713,6 +767,20 @@ fun StreamScreen(session: ActiveSession, onDisconnect: () -> Unit) {
                 }
             },
         )
+        // Mic mute, LAST in the stack — the one in-stream control, so unlike the purely visual
+        // overlays above it has to sit on top of the gesture layer to receive its own taps (it
+        // costs the stream that small corner of touch area, which is why it exists only while a
+        // capture actually runs). On TV it is the indicator alone: the Select + Y chord is the
+        // control there, and a focusable button would fight the game for the D-pad.
+        if (micRunning && (micMuted || !isTv)) {
+            MicMuteControl(
+                muted = micMuted,
+                onToggle = if (isTv) null else ({ setMicMuted(!micMuted) }),
+                modifier = Modifier.align(Alignment.TopEnd).padding(12.dp),
+            )
+        }
+        // Chord confirmation (gamepad/TV) — the counterpart to the button changing under a finger.
+        micHint?.let { MicChordHint(it, Modifier.align(Alignment.TopCenter).padding(top = 16.dp)) }
     }
 }
 
@@ -740,6 +808,63 @@ private fun attachMicEffects(sessionId: Int, into: MutableList<AudioEffect>) {
 private fun releaseMicEffects(effects: MutableList<AudioEffect>) {
     effects.forEach { runCatching { it.release() } }
     effects.clear()
+}
+
+/**
+ * The in-stream mic control and its muted indicator, in one element: a dim mic glyph while the
+ * uplink is live, a red **Muted** badge while it isn't — so the state that matters is the loud one,
+ * readable at couch distance and impossible to mistake for the stream's own picture.
+ *
+ * [onToggle] `null` makes it a pure indicator (the TV/gamepad surface, where the Select + Y chord
+ * is the control); non-null makes the badge itself the touch target. Rendering it at all is the
+ * caller's decision — it means a capture is genuinely running.
+ */
+@Composable
+private fun MicMuteControl(muted: Boolean, onToggle: (() -> Unit)?, modifier: Modifier = Modifier) {
+    val shape = RoundedCornerShape(10.dp)
+    Row(
+        modifier = modifier
+            .clip(shape)
+            .background(if (muted) Color(0xE0B3261E) else Color.Black.copy(alpha = 0.45f))
+            .then(if (onToggle != null) Modifier.clickable(onClick = onToggle) else Modifier)
+            .padding(horizontal = 12.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Icon(
+            imageVector = if (muted) Icons.Filled.MicOff else Icons.Filled.Mic,
+            // Spoken state first, then the action — a talkback user needs to know they are muted
+            // before they need to know how to stop being muted.
+            contentDescription = if (muted) {
+                "Microphone muted. Activate to unmute."
+            } else {
+                "Microphone live. Activate to mute."
+            },
+            tint = Color.White,
+            modifier = Modifier.size(20.dp),
+        )
+        if (muted) {
+            Spacer(Modifier.width(6.dp))
+            Text("Muted", color = Color.White, fontSize = 14.sp)
+        }
+    }
+}
+
+/**
+ * Transient confirmation that the mic chord (Select + Y) registered. The badge above already says
+ * *muted*, but nothing on screen says *un*muted — and "did that press do anything?" is the whole
+ * doubt a chord with no button under the finger creates. Same pill vocabulary as the other
+ * in-stream cues; the caller clears it after a beat.
+ */
+@Composable
+private fun MicChordHint(text: String, modifier: Modifier = Modifier) {
+    Text(
+        text,
+        modifier = modifier
+            .background(Color.Black.copy(alpha = 0.55f), RoundedCornerShape(8.dp))
+            .padding(horizontal = 14.dp, vertical = 8.dp),
+        color = Color.White,
+        fontSize = 15.sp,
+    )
 }
 
 /**

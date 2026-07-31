@@ -415,7 +415,9 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStartMic(
     if let Some(m) = guard.as_ref() {
         return m.session_id(); // already capturing — same stream, same session
     }
-    match crate::mic::MicCapture::start(h.client.clone(), echo_cancel != 0) {
+    // The capture SHARES the session's mute flag, so one started while muted stays muted (and
+    // sends nothing) from its very first frame — see `SessionHandle::mic_muted`.
+    match crate::mic::MicCapture::start(h.client.clone(), echo_cancel != 0, h.mic_muted.clone()) {
         Some(m) => {
             let session_id = m.session_id();
             *guard = Some(m);
@@ -429,7 +431,8 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStartMic(
 }
 
 /// `NativeBridge.nativeStopMic(handle)` — stop + join the mic thread and close the AAudio input
-/// stream (without closing the session). No-op on `0`.
+/// stream (without closing the session). No-op on `0`. Leaves the session's mute state alone: a
+/// surface recreate stops and restarts the mic, and a user who muted must stay muted through it.
 #[cfg(target_os = "android")]
 #[no_mangle]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStopMic(
@@ -443,5 +446,61 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStopMic(
             let h = unsafe { &*(handle as *const SessionHandle) };
             h.stop_mic();
         }
+    })
+}
+
+/// `NativeBridge.nativeSetMicMuted(handle, muted)` — mute/unmute the mic uplink mid-stream.
+///
+/// Muting deliberately does NOT stop the capture: the AAudio input stream, the input-preset rung
+/// it settled on and its primed buffers all stay exactly as they are, and the encode loop simply
+/// drops each 10 ms frame instead of encoding + sending it. A stop/start would re-run the preset
+/// fallback ladder and re-prime buffers on every toggle — hundreds of ms, and possibly a different
+/// rung (echo cancellation silently lost). This way a toggle costs one atomic store here and one
+/// relaxed load per frame there, and takes effect on the very next 10 ms boundary.
+///
+/// Sticky for the SESSION (the flag lives on the handle, not on the capture), so the mic restart a
+/// surface recreate performs comes back muted with no window for an unmuted frame to escape; a
+/// fresh session always starts unmuted. No-op on `0`. Not android-gated — pure `jni` + an atomic
+/// store, so it links on the host build too.
+///
+/// One honest consequence of keeping the stream open: the platform's own recording indicator stays
+/// lit while muted, because the mic really is still open. What stops is the encode and the send —
+/// no captured audio leaves the process.
+#[no_mangle]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSetMicMuted(
+    _env: JNIEnv,
+    _this: JObject,
+    handle: jlong,
+    muted: jboolean,
+) {
+    jni_guard((), || {
+        if handle != 0 {
+            // SAFETY: live handle per the nativeConnect/nativeClose contract.
+            let h = unsafe { &*(handle as *const SessionHandle) };
+            h.mic_muted
+                .store(muted != 0, std::sync::atomic::Ordering::Relaxed);
+        }
+    })
+}
+
+/// `NativeBridge.nativeMicActive(handle): Boolean` — is a mic capture actually RUNNING? `true` only
+/// between a `nativeStartMic` that opened a stream and the matching `nativeStopMic`. The in-stream
+/// mute control is offered on this evidence rather than on the user's setting, so a device that
+/// refused every AAudio input rung (or a missing RECORD_AUDIO grant) shows no control instead of a
+/// lie about a mic that is being heard. `false` on a `0` handle. Cheap (one uncontended lock).
+#[cfg(target_os = "android")]
+#[no_mangle]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeMicActive(
+    _env: JNIEnv,
+    _this: JObject,
+    handle: jlong,
+) -> jboolean {
+    jni_guard(0, || {
+        if handle == 0 {
+            return 0;
+        }
+        // SAFETY: live handle per the nativeConnect/nativeClose contract.
+        let h = unsafe { &*(handle as *const SessionHandle) };
+        jboolean::from(h.mic.lock().unwrap().is_some())
     })
 }
