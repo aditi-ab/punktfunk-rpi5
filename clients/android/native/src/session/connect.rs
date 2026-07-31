@@ -115,6 +115,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConnect<'lo
     compositor_pref: jint,
     gamepad_pref: jint,
     hdr_enabled: jboolean,
+    multi_slice_ok: jboolean,
     audio_channels: jint,
     video_codecs: jint,
     preferred_codec: jint,
@@ -182,11 +183,19 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConnect<'lo
         // sends a proper 8-bit BT.709 stream rather than PQ the panel would mis-tone-map. AMediaCodec
         // decodes Main10 from the SPS and the decode loop signals the Surface HDR dataspace + static
         // metadata (see crate::decode).
-        if hdr_enabled != 0 {
+        // 10-bit/HDR by panel truth (above) + multi-slice by DECODER truth: Kotlin probes every
+        // decoder this device would use (`VideoDecoders.multiSliceTolerant` — Amlogic wedges the
+        // whole device on multi-slice AUs, the 0.17.0 field regression) and only then may the
+        // host default to >1 slice per frame (its sub-frame readback / the P2 slice pipeline).
+        (if hdr_enabled != 0 {
             punktfunk_core::quic::VIDEO_CAP_10BIT | punktfunk_core::quic::VIDEO_CAP_HDR
         } else {
             0
-        },
+        }) | (if multi_slice_ok != 0 {
+            punktfunk_core::quic::VIDEO_CAP_MULTI_SLICE
+        } else {
+            0
+        }),
         // Requested surround layout (2 = stereo / 6 = 5.1 / 8 = 7.1). The host clamps to what it can
         // capture and echoes the resolved count in `connector.audio_channels`, which drives the
         // decoder + AAudio layout (read in `crate::audio::AudioPlayback::start`). Anything else

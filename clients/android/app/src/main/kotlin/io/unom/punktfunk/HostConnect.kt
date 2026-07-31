@@ -49,7 +49,7 @@ suspend fun connectToHost(
             host, port, w, h, hz,
             identity.certPem, identity.privateKeyPem, pinHex,
             settings.bitrateKbps, settings.compositor, gamepadPref,
-            hdrEnabled, settings.audioChannels,
+            hdrEnabled, VideoDecoders.multiSliceTolerant(), settings.audioChannels,
             // What this device can decode (H.264|HEVC always, AV1 when a real decoder exists) +
             // the user's soft codec preference — the host resolves the emitted codec from both.
             VideoDecoders.decodableCodecBits(), settings.preferredCodec(), timeoutMs,

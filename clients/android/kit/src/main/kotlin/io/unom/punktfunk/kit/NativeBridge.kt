@@ -47,6 +47,10 @@ object NativeBridge {
         compositorPref: Int,
         gamepadPref: Int,
         hdrEnabled: Boolean,
+        /** Every decoder this device would use tolerates multi-slice AUs
+         *  ([VideoDecoders.multiSliceTolerant]) — advertises `VIDEO_CAP_MULTI_SLICE`; false keeps
+         *  the host at single-slice frames (the safe pre-0.17 wire shape). */
+        multiSliceOk: Boolean,
         audioChannels: Int,
         /** `quic::CODEC_*` bitfield of codecs this device decodes ([VideoDecoders.decodableCodecBits]);
          *  `0` falls back to H.264|HEVC. The host resolves the emitted codec from this ∩ its GPU. */

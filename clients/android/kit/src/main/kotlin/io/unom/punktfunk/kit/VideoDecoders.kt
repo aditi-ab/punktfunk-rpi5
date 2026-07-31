@@ -53,6 +53,28 @@ object VideoDecoders {
     fun decodableCodecBits(): Int =
         1 or 2 or (if (pickDecoder("video/av01") != null) 4 else 0)
 
+    /**
+     * Whether EVERY decoder this device would use tolerates multi-slice access units — the
+     * `VIDEO_CAP_MULTI_SLICE` advertisement (decoder truth, per the 0.17.0 field regression:
+     * Amlogic HEVC decoders wedge the whole DEVICE on multi-slice frames — Chromecast with
+     * Google TV, onn 4K — which is why Moonlight requests single-slice for every hardware
+     * decoder). We advertise per-family instead: tolerant unless the pick for ANY advertised
+     * codec is an Amlogic decoder or can't be inspected (a null pick = the platform default —
+     * uninspectable, so conservatively single-slice). Probed once at connect time; the host
+     * defaults to >1 slice only toward clients that set the bit.
+     */
+    fun multiSliceTolerant(): Boolean {
+        val mimes = buildList {
+            add("video/avc")
+            add("video/hevc")
+            if (decodableCodecBits() and 4 != 0) add("video/av01")
+        }
+        return mimes.all { mime ->
+            val name = pickDecoder(mime)?.name?.lowercase() ?: return@all false
+            !name.startsWith("omx.amlogic") && !name.startsWith("c2.amlogic")
+        }
+    }
+
     fun pickDecoder(mime: String): DecoderChoice? {
         if (mime.isEmpty()) return null
         val infos = runCatching { MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos }
