@@ -184,6 +184,19 @@ mod tests {
     }
 
     #[test]
+    fn nobara_takes_rhel_the_first_recognized_ancestor() {
+        // Verified against a real Nobara 44 box: it declares `ID_LIKE="rhel centos fedora"`,
+        // so the family token is *rhel*, not the fedora one might expect. Clients ship a
+        // `nobara` mark, so the leaf matches before the family ever gets a say — but a
+        // RHEL-family distro we have no art for lands on plain Tux, not on Fedora.
+        let (chain, pretty) = parsed(
+            "NAME=\"Nobara Linux\"\nID=nobara\nID_LIKE=\"rhel centos fedora\"\nPRETTY_NAME=\"Nobara Linux 44 (KDE Plasma Desktop Edition)\"\n",
+        );
+        assert_eq!(chain, "linux/rhel/nobara");
+        assert_eq!(pretty, "Nobara Linux 44 (KDE Plasma Desktop Edition)");
+    }
+
+    #[test]
     fn nixos_without_id_like_is_two_segments() {
         let (chain, _) = parsed("ID=nixos\nPRETTY_NAME=\"NixOS 25.05 (Warbler)\"\n");
         assert_eq!(chain, "linux/nixos");

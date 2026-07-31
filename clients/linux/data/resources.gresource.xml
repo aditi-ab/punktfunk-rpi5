@@ -14,5 +14,8 @@
     <file>icons/scalable/actions/pf-os-debian-symbolic.svg</file>
     <file>icons/scalable/actions/pf-os-nixos-symbolic.svg</file>
     <file>icons/scalable/actions/pf-os-opensuse-symbolic.svg</file>
+    <file>icons/scalable/actions/pf-os-bazzite-symbolic.svg</file>
+    <file>icons/scalable/actions/pf-os-cachyos-symbolic.svg</file>
+    <file>icons/scalable/actions/pf-os-nobara-symbolic.svg</file>
   </gresource>
 </gresources>

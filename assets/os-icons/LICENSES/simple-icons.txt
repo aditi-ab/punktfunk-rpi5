@@ -1,5 +1,6 @@
-Simple Icons — brand icons (arch, nixos, debian in assets/os-icons/) are from
-Simple Icons (https://simpleicons.org, https://github.com/simple-icons/simple-icons).
+Simple Icons — brand icons (arch, nixos, debian, cachyos, nobara in assets/os-icons/)
+are from Simple Icons
+(https://simpleicons.org, https://github.com/simple-icons/simple-icons).
 
 The Simple Icons SVG path data is released under CC0 1.0 Universal (public domain
 dedication), https://creativecommons.org/publicdomain/zero/1.0/ — no attribution

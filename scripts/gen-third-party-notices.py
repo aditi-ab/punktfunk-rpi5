@@ -68,14 +68,17 @@ VENDORED_TREES = [
     ("Vulkan-Headers (vendored, crates/pyrowave-sys)",
      "crates/pyrowave-sys/vendor/pyrowave/Granite/third_party/khronos/vulkan-headers/LICENSE.md",
      "https://github.com/KhronosGroup/Vulkan-Headers"),
-    # OS brand marks for the host-card OS icon (assets/os-icons/, CC BY 4.0 / CC0 —
-    # see assets/os-icons/README.md; clients embed per-platform derivatives).
+    # OS brand marks for the host-card OS icon (assets/os-icons/, CC BY 4.0 / CC0 /
+    # Apache-2.0 — see assets/os-icons/README.md; clients embed per-platform derivatives).
     ("Font Awesome Free brand icons (vendored, assets/os-icons)",
      "assets/os-icons/LICENSES/font-awesome-brands.txt",
      "https://fontawesome.com"),
     ("Simple Icons (vendored, assets/os-icons)",
      "assets/os-icons/LICENSES/simple-icons.txt",
      "https://simpleicons.org"),
+    ("Bazzite logo (vendored, assets/os-icons)",
+     "assets/os-icons/LICENSES/bazzite.txt",
+     "https://github.com/ublue-os/bazzite"),
 ]
 
 

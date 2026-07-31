@@ -33,6 +33,18 @@ export const WindowsHost: Story = {
 	},
 };
 
+/** A gaming distro wears its OWN mark, not its family's: `cachyos` is resolved before the
+ * `arch` it descends from, which is the whole point of shipping art for the leaf. */
+export const CachyOsHost: Story = {
+	args: {
+		host: {
+			data: { ...hostInfo, os: "linux/arch/cachyos", os_name: "CachyOS Linux" },
+			isLoading: false,
+			error: null,
+		},
+	},
+};
+
 /** An unrecognized distro chain walks up to its family mark — here neither `chimera` nor
  * `frontier` have art, so the icon degrades all the way to generic Tux. */
 export const UnknownDistro: Story = {

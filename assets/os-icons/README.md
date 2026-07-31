@@ -7,7 +7,7 @@ Android `ImageVector`s). One file per **icon token** of the host's OS-identity c
 
 | token | mark | source |
 |---|---|---|
-| `windows` | Windows | Font Awesome Free brands (CC BY 4.0) |
+| `windows` | Windows (the current four-pane mark, no perspective skew) | own geometry |
 | `apple` | Apple (also `macos` via alias) | Font Awesome Free brands (CC BY 4.0) |
 | `linux` | Tux | Font Awesome Free brands (CC BY 4.0) |
 | `steam` | Steam (also `steamos` via alias) | Font Awesome Free brands (CC BY 4.0) |
@@ -17,14 +17,36 @@ Android `ImageVector`s). One file per **icon token** of the host's OS-identity c
 | `arch` | Arch Linux | Simple Icons (CC0 1.0) |
 | `nixos` | NixOS | Simple Icons (CC0 1.0) |
 | `debian` | Debian | Simple Icons (CC0 1.0) |
+| `bazzite` | Bazzite | ublue-os/bazzite (Apache-2.0) |
+| `cachyos` | CachyOS | Simple Icons (CC0 1.0) |
+| `nobara` | Nobara | Simple Icons (CC0 1.0, slug `nobaralinux`) |
 
-Distros with no file here (Bazzite, CachyOS, Nobara, Pop!_OS, Mint, …) are intentional:
-the host advertises the full chain (`linux/fedora/bazzite`), and clients walk it
-most-specific-first, so they degrade to the family mark and finally to Tux.
+The last three are **distro leaves, not families**: a chain walks most-specific-first, so
+`linux/fedora/bazzite` would otherwise draw the Fedora mark. They earn their own art because
+"a Bazzite box" and "a Fedora box" are different machines to the person reading the card, and
+they are what this project's hosts actually run. Every other distro with no file here (Pop!_OS,
+Mint, …) still degrades to its family's mark and finally to Tux — that fallback is the design,
+not a gap.
 
-All files are monochrome (`fill="currentColor"`), original per-icon viewBoxes preserved.
-Licensing: attribution notices live in `LICENSES/` and are folded into
-`THIRD-PARTY-NOTICES.txt` by `scripts/gen-third-party-notices.py`. The marks are
-trademarks of their respective owners; they are used here nominatively — to *identify*
-the operating system a host runs, the standard practice in this ecosystem — and imply no
-affiliation or endorsement.
+Windows is the one mark drawn here rather than sourced: every icon set that ships a "Windows"
+brand glyph still carries the **Windows 8/10 flag with the perspective skew**, which reads as
+dated next to the flat four-pane mark Microsoft has used since Windows 11. Four equal squares
+(11.377 + 1.246 gap) is the current proportion.
+
+All files are monochrome (`fill="currentColor"`), original per-icon viewBoxes preserved. Because
+those viewBoxes are not all square, a client must letterbox rather than stretch — see the aspect
+note in `clients/android/.../components/OsIcons.kt`.
+
+## Regenerating the per-client derivatives
+
+`bash scripts/gen-os-icons.sh [token ...]` turns a master into the three baked forms (GTK
+symbolic SVG, Windows PNG, Apple template PDF) and prints the path data for the three clients
+that inline it (web console, Decky plugin, Android). Adding a **new** token also means adding it
+to each client's shipped-token list — the script prints that checklist too.
+
+## Licensing
+
+Attribution notices live in `LICENSES/` and are folded into `THIRD-PARTY-NOTICES.txt` by
+`scripts/gen-third-party-notices.py`. The marks are trademarks of their respective owners; they
+are used here nominatively — to *identify* the operating system a host runs, the standard
+practice in this ecosystem — and imply no affiliation or endorsement.

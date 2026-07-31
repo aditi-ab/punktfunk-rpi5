@@ -1,5 +1,5 @@
-Font Awesome Free — brand icons (windows, apple, linux, steam, ubuntu, fedora,
-opensuse in assets/os-icons/) are from Font Awesome Free.
+Font Awesome Free — brand icons (apple, linux, steam, ubuntu, fedora, opensuse in
+assets/os-icons/) are from Font Awesome Free.
 
 Copyright (c) Fonticons, Inc. (https://fontawesome.com)
 

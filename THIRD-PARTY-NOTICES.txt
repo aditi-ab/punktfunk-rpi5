@@ -18,6 +18,7 @@ VENDORED THIRD-PARTY SOURCE (inside first-party crates)
   Vulkan-Headers (vendored, crates/pyrowave-sys) — https://github.com/KhronosGroup/Vulkan-Headers
   Font Awesome Free brand icons (vendored, assets/os-icons) — https://fontawesome.com
   Simple Icons (vendored, assets/os-icons) — https://simpleicons.org
+  Bazzite logo (vendored, assets/os-icons) — https://github.com/ublue-os/bazzite
 
 ----------------------------------------------------------------------------
 MANIFEST (crate version — SPDX license — source)
@@ -2928,6 +2929,25 @@ CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
 OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
 IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
+
+
+----------------------------------------------------------------------------
+The following license (bazzite.txt) applies to: Bazzite logo (vendored, assets/os-icons)
+----------------------------------------------------------------------------
+Bazzite — the `bazzite` mark in assets/os-icons/ is derived from the Bazzite logo in
+the Bazzite source repository (repo_content/Bazzite.svg).
+
+Copyright (c) Universal Blue (https://github.com/ublue-os/bazzite)
+
+Licensed under the Apache License, Version 2.0,
+https://www.apache.org/licenses/LICENSE-2.0.
+
+Modifications: the logo's "b" letterform was lifted out of the surrounding badge, the
+gradient and decorative overlays were dropped, and the path was translated and scaled
+into a 24x24 box with a monochrome fill (fill="currentColor").
+
+Brand icons are trademarks of their respective owners and are used for identification
+purposes only; their use does not imply endorsement.
 
 
 ----------------------------------------------------------------------------
@@ -6283,8 +6303,8 @@ the following restrictions:
 ----------------------------------------------------------------------------
 The following license (font-awesome-brands.txt) applies to: Font Awesome Free brand icons (vendored, assets/os-icons)
 ----------------------------------------------------------------------------
-Font Awesome Free — brand icons (windows, apple, linux, steam, ubuntu, fedora,
-opensuse in assets/os-icons/) are from Font Awesome Free.
+Font Awesome Free — brand icons (apple, linux, steam, ubuntu, fedora, opensuse in
+assets/os-icons/) are from Font Awesome Free.
 
 Copyright (c) Fonticons, Inc. (https://fontawesome.com)
 
@@ -12997,8 +13017,9 @@ SOFTWARE.
 ----------------------------------------------------------------------------
 The following license (simple-icons.txt) applies to: Simple Icons (vendored, assets/os-icons)
 ----------------------------------------------------------------------------
-Simple Icons — brand icons (arch, nixos, debian in assets/os-icons/) are from
-Simple Icons (https://simpleicons.org, https://github.com/simple-icons/simple-icons).
+Simple Icons — brand icons (arch, nixos, debian, cachyos, nobara in assets/os-icons/)
+are from Simple Icons
+(https://simpleicons.org, https://github.com/simple-icons/simple-icons).
 
 The Simple Icons SVG path data is released under CC0 1.0 Universal (public domain
 dedication), https://creativecommons.org/publicdomain/zero/1.0/ — no attribution

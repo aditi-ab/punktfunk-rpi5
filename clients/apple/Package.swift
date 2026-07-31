@@ -34,9 +34,10 @@ let package = Package(
                 // Geist (SIL OFL 1.1) — the brand typeface, shared with punktfunk-website.
                 // Registered with Core Text at first use; see BrandFont.swift.
                 .copy("Resources/Fonts"),
-                // The host cards' OS marks (template vector imagesets derived from the
-                // assets/os-icons masters — FA brands CC BY 4.0 + Simple Icons CC0, see that
-                // README). `.process` compiles the catalog; loaded via OsIcon.swift.
+                // The host cards' OS marks (template vector imagesets generated from the
+                // assets/os-icons masters by scripts/gen-os-icons.sh — per-mark provenance and
+                // licensing in that README). `.process` compiles the catalog; loaded via
+                // OsIcon.swift.
                 .process("Resources/OsIcons.xcassets"),
             ],
             linkerSettings: [
