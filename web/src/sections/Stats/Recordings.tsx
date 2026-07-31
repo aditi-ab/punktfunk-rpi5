@@ -1,4 +1,5 @@
 import { useQueryClient } from "@tanstack/react-query";
+import { toast } from "@unom/ui/toast";
 import { Download, Eye, Trash2 } from "lucide-react";
 import type { FC } from "react";
 import type { CaptureMeta } from "@/api/gen/model/captureMeta";
@@ -20,6 +21,7 @@ import {
 	TableHeader,
 	TableRow,
 } from "@/components/ui/table";
+import { apiErrorMessage } from "@/lib/errors";
 import type { Loadable } from "@/lib/query";
 import { m } from "@/paraglide/messages";
 import { fmtDuration, fmtTimestamp, kindLabel } from "./helpers";
@@ -46,6 +48,8 @@ export const RecordingsSection: FC<{
 					if (selectedId === id) onSelect(null);
 					qc.invalidateQueries({ queryKey: getStatsRecordingsListQueryKey() });
 				},
+				onError: (e) =>
+					toast.error(apiErrorMessage(e) ?? m.stats_delete_failed()),
 			},
 		);
 	};
@@ -65,8 +69,11 @@ export const RecordingsSection: FC<{
 			a.click();
 			a.remove();
 			URL.revokeObjectURL(url);
-		} catch {
-			// Best-effort export; the recording GET surfaces its own errors via the detail view.
+		} catch (e) {
+			// The old comment claimed the detail view surfaces this — it only does so for the SELECTED
+			// recording, and Download is offered on every row. Downloading an unselected one that
+			// failed produced a button that visibly did nothing.
+			toast.error(apiErrorMessage(e) ?? m.stats_download_failed());
 		}
 	};
 

@@ -1,5 +1,6 @@
 import { useQueryClient } from "@tanstack/react-query";
 import { Button } from "@unom/ui/button";
+import { toast } from "@unom/ui/toast";
 import type { FC } from "react";
 import {
 	getListGpusQueryKey,
@@ -10,6 +11,7 @@ import type { GpuState } from "@/api/gen/model";
 import { QueryState } from "@/components/query-state";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { apiErrorMessage } from "@/lib/errors";
 import type { Loadable } from "@/lib/query";
 import { m } from "@/paraglide/messages";
 
@@ -25,12 +27,15 @@ export const GpuSection: FC = () => {
 	const gpus = useListGpus({ query: { refetchInterval: 20_000 } });
 	const setPref = useSetGpuPreference();
 
+	// A refused GPU preference used to vanish: nothing read `setPref.error`, so the card simply
+	// stayed on the old selection as though the click had missed.
 	const apply = (mode: "auto" | "manual", gpuId?: string) =>
 		setPref.mutate(
 			{ data: { mode, gpu_id: gpuId ?? null } },
 			{
 				onSuccess: () =>
 					qc.invalidateQueries({ queryKey: getListGpusQueryKey() }),
+				onError: (e) => toast.error(apiErrorMessage(e) ?? m.gpu_apply_failed()),
 			},
 		);
 

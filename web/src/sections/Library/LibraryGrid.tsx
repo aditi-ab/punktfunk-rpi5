@@ -1,4 +1,5 @@
 import { useQueryClient } from "@tanstack/react-query";
+import { toast } from "@unom/ui/toast";
 import { motion, stagger } from "motion/react";
 import type { FC } from "react";
 import {
@@ -9,6 +10,7 @@ import {
 import type { GameEntry } from "@/api/gen/model/gameEntry";
 import { QueryState } from "@/components/query-state";
 import { Card, CardContent } from "@/components/ui/card";
+import { apiErrorMessage } from "@/lib/errors";
 import type { Loadable } from "@/lib/query";
 import { m } from "@/paraglide/messages";
 import { GameCard } from "./GameCard";
@@ -26,11 +28,18 @@ export const LibraryGridSection: FC<{ onEdit: (entry: GameEntry) => void }> = ({
 	const library = useGetLibrary();
 	const remove = useDeleteCustomGame();
 
+	// A refused delete has to say so. The host has real reasons to say no (a provider-owned entry
+	// answers 409 with what to do instead), and an un-caught `mutateAsync` rejection reported none
+	// of them — the card just stayed put as if nothing had been clicked.
 	const onDelete = async (entry: GameEntry) => {
 		if (!confirm(m.library_delete_confirm())) return;
-		await remove
-			.mutateAsync({ id: customId(entry) })
-			.then(() => qc.invalidateQueries({ queryKey: getGetLibraryQueryKey() }));
+		try {
+			await remove.mutateAsync({ id: customId(entry) });
+		} catch (e) {
+			toast.error(apiErrorMessage(e) ?? m.library_delete_failed());
+			return;
+		}
+		qc.invalidateQueries({ queryKey: getGetLibraryQueryKey() });
 	};
 
 	return (

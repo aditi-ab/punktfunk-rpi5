@@ -12,6 +12,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { apiErrorMessage } from "@/lib/errors";
 import { m } from "@/paraglide/messages";
 import { customId } from "./helpers";
 
@@ -133,10 +134,18 @@ export const GameFormSection: FC<{
 	const invalidate = () =>
 		qc.invalidateQueries({ queryKey: getGetLibraryQueryKey() });
 
+	// A rejected save must not close the form and must not look like a success. It used to do both:
+	// nothing read `create.error`/`update.error`, and the un-caught `mutateAsync` rejection meant
+	// the entry silently didn't save while the dialog disappeared — taking the operator's typing
+	// with it.
 	const onSubmit = async (data: CustomInput) => {
-		if (target === "new") await create.mutateAsync({ data }).then(invalidate);
-		else
-			await update.mutateAsync({ id: customId(target), data }).then(invalidate);
+		try {
+			if (target === "new") await create.mutateAsync({ data });
+			else await update.mutateAsync({ id: customId(target), data });
+		} catch {
+			return; // the message is rendered from the mutation's own error state below
+		}
+		invalidate();
 		onClose();
 	};
 
@@ -147,6 +156,7 @@ export const GameFormSection: FC<{
 			onSubmit={onSubmit}
 			onCancel={onClose}
 			isSaving={create.isPending || update.isPending}
+			error={apiErrorMessage(create.error ?? update.error)}
 		/>
 	);
 };
@@ -187,7 +197,9 @@ export const GameForm: FC<{
 	onSubmit: (data: CustomInput) => void;
 	onCancel: () => void;
 	isSaving: boolean;
-}> = ({ initial, mode, onSubmit, onCancel, isSaving }) => {
+	/** The host's refusal, if the last save failed — shown next to the button that caused it. */
+	error?: string;
+}> = ({ initial, mode, onSubmit, onCancel, isSaving, error }) => {
 	const [form, setForm] = useState<FormState>(initial);
 	const set = (key: keyof FormState) => (value: string) =>
 		setForm((f) => ({ ...f, [key]: value }));
@@ -331,6 +343,14 @@ export const GameForm: FC<{
 							help={m.library_field_tags_help()}
 						/>
 					</fieldset>
+					{error && (
+						<p
+							role="alert"
+							className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive"
+						>
+							{error}
+						</p>
+					)}
 					<div className="flex gap-2">
 						<Button type="submit" disabled={isSaving || !form.title.trim()}>
 							{mode === "edit" ? m.library_save() : m.library_create()}

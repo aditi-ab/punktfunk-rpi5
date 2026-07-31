@@ -1,4 +1,5 @@
 import { useQueryClient } from "@tanstack/react-query";
+import { toast } from "@unom/ui/toast";
 import type { FC } from "react";
 import { getGetStatusQueryKey, useGetStatus } from "@/api/gen/host/host";
 import { useGetLibrary } from "@/api/gen/library/library";
@@ -8,6 +9,7 @@ import {
 	useRequestIdr,
 	useStopSession,
 } from "@/api/gen/session/session";
+import { apiErrorMessage } from "@/lib/errors";
 import { useLocale } from "@/lib/i18n";
 import { m } from "@/paraglide/messages";
 import { DashboardView } from "./view";
@@ -39,6 +41,11 @@ export const SectionDashboard: FC = () => {
 	const invalidate = () =>
 		qc.invalidateQueries({ queryKey: getGetStatusQueryKey() });
 
+	/** Every session control reports its failure. These are the console's most consequential
+	 * buttons — stopping a session, ending a game — and a refusal used to be completely silent. */
+	const failed = (fallback: string) => (e: unknown) =>
+		toast.error(apiErrorMessage(e) ?? fallback);
+
 	/**
 	 * "End now" means two different things, and which one is right follows from the row's state: a
 	 * game whose session is still live ends by stopping that session (what then happens to the game
@@ -66,12 +73,15 @@ export const SectionDashboard: FC = () => {
 				return;
 			endGame.mutate(
 				{ data: { app_id: game.app_id ?? null } },
-				{ onSuccess: invalidate },
+				{ onSuccess: invalidate, onError: failed(m.games_end_failed()) },
 			);
 			return;
 		}
 		if (!confirmStopAll()) return;
-		stop.mutate(undefined, { onSuccess: invalidate });
+		stop.mutate(undefined, {
+			onSuccess: invalidate,
+			onError: failed(m.action_stop_failed()),
+		});
 	};
 
 	/** Shared by "End now" on a live row and the card's own Stop-session button: with more than one
@@ -88,9 +98,14 @@ export const SectionDashboard: FC = () => {
 			library={library.data}
 			onStopSession={() => {
 				if (!confirmStopAll()) return;
-				stop.mutate(undefined, { onSuccess: invalidate });
+				stop.mutate(undefined, {
+					onSuccess: invalidate,
+					onError: failed(m.action_stop_failed()),
+				});
 			}}
-			onRequestIdr={() => idr.mutate(undefined)}
+			onRequestIdr={() =>
+				idr.mutate(undefined, { onError: failed(m.action_idr_failed()) })
+			}
 			onEndGame={onEndGame}
 			isStopping={stop.isPending}
 			isRequestingIdr={idr.isPending}

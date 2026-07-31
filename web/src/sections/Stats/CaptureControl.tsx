@@ -1,4 +1,5 @@
 import { useQueryClient } from "@tanstack/react-query";
+import { toast } from "@unom/ui/toast";
 import { Circle, Square } from "lucide-react";
 import type { FC } from "react";
 import type { StatsStatus } from "@/api/gen/model/statsStatus";
@@ -13,6 +14,7 @@ import { QueryState } from "@/components/query-state";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { apiErrorMessage } from "@/lib/errors";
 import type { Loadable } from "@/lib/query";
 import { m } from "@/paraglide/messages";
 import { fmtDuration, kindLabel, Stat } from "./helpers";
@@ -29,13 +31,21 @@ export const CaptureControlSection: FC = () => {
 
 	const refreshStatus = () =>
 		qc.invalidateQueries({ queryKey: getStatsCaptureStatusQueryKey() });
-	const onStart = () => start.mutate(undefined, { onSuccess: refreshStatus });
+	// Both paths report failure. A failed STOP is the one that matters: it is "stop & save", so
+	// swallowing the error let a capture the operator had been recording for minutes disappear with
+	// no recording written and nothing on screen to say so.
+	const onStart = () =>
+		start.mutate(undefined, {
+			onSuccess: refreshStatus,
+			onError: (e) => toast.error(apiErrorMessage(e) ?? m.stats_start_failed()),
+		});
 	const onStop = () =>
 		stop.mutate(undefined, {
 			onSuccess: () => {
 				refreshStatus();
 				qc.invalidateQueries({ queryKey: getStatsRecordingsListQueryKey() });
 			},
+			onError: (e) => toast.error(apiErrorMessage(e) ?? m.stats_stop_failed()),
 		});
 
 	return (

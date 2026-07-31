@@ -11,7 +11,6 @@ import {
 	useRef,
 	useState,
 } from "react";
-import { ApiError } from "@/api/fetcher";
 import {
 	getGetDisplaySettingsQueryKey,
 	getGetDisplayStateQueryKey,
@@ -42,6 +41,7 @@ import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { apiErrorMessage } from "@/lib/errors";
 import { cn } from "@/lib/utils";
 import { m } from "@/paraglide/messages";
 
@@ -98,16 +98,6 @@ export const DisplaySection: FC = () => {
 		);
 
 	/**
-	 * Apply ONE orthogonal axis — game-session, DDC, PnP — without dragging unsaved Custom edits
-	 * along for the ride.
-	 *
-	 * These three controls apply immediately by design, but they used to send `{...draft}`: flipping
-	 * DDC while the Custom block held unsaved edits committed those edits too, and the shared
-	 * `apply` then overwrote the draft with the server's answer, clearing the "unsaved" badge — so
-	 * the operator got a policy they never saved with no trace it had happened. Send the axis on top
-	 * of the last SAVED policy, and merge only that axis back into the draft.
-	 */
-	/**
 	 * Save the hand-edited Custom block.
 	 *
 	 * `capture_monitor` (the streamed-screen pin) belongs to the monitor picker below, not to this
@@ -120,6 +110,16 @@ export const DisplaySection: FC = () => {
 		apply({ ...draft, capture_monitor: q.data?.settings.capture_monitor });
 	};
 
+	/**
+	 * Apply ONE orthogonal axis — game-session, DDC, PnP — without dragging unsaved Custom edits
+	 * along for the ride.
+	 *
+	 * These three controls apply immediately by design, but they used to send `{...draft}`: flipping
+	 * DDC while the Custom block held unsaved edits committed those edits too, and the shared
+	 * `apply` then overwrote the draft with the server's answer, clearing the "unsaved" badge — so
+	 * the operator got a policy they never saved with no trace it had happened. Send the axis on top
+	 * of the last SAVED policy, and merge only that axis back into the draft.
+	 */
 	const applyAxis = (patch: Partial<DisplayPolicy>) => {
 		const base = seeded.current ?? draft;
 		if (!base) return;
@@ -1196,15 +1196,6 @@ const DisplayRow: FC<{
 			)}
 		</li>
 	);
-};
-
-/** The server's `{ error }` message from a thrown `ApiError` (its `.data` body), for inline display. */
-const apiErrorMessage = (err: unknown): string | undefined => {
-	if (err instanceof ApiError) {
-		const data = err.data as { error?: string } | undefined;
-		return data?.error ?? err.message;
-	}
-	return err ? String(err) : undefined;
 };
 
 /** Presets the host can't honor yet (one-click apply would 400) are surfaced but disabled. Empty
