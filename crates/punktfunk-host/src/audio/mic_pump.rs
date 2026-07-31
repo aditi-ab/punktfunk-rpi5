@@ -496,8 +496,11 @@ mod pump_tests {
         start_tuned(fail_first, false, Duration::ZERO)
     }
 
+    /// The budget has to clear `backoff_start` (2 s) with room to spare: a reopen test that
+    /// waits exactly as long as the backoff it is waiting for fails whenever the machine is
+    /// busy or the binary is cold, which is precisely what CI is.
     fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
-        for _ in 0..200 {
+        for _ in 0..600 {
             if cond() {
                 return;
             }
