@@ -9,7 +9,7 @@ import { QueryState } from "@/components/query-state";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import type { Loadable } from "@/lib/query";
 import { m } from "@/paraglide/messages";
-import { LatencyChart, ThroughputChart } from "./charts";
+import { HealthChart, LatencyChart, ThroughputChart } from "./charts";
 import { ChartBlock } from "./helpers";
 
 /**
@@ -75,6 +75,13 @@ export const LiveCard: FC<{ live: Loadable<Capture> }> = ({ live }) => {
 							</ChartBlock>
 							<ChartBlock title={m.stats_throughput_title()}>
 								<ThroughputChart samples={samples} />
+							</ChartBlock>
+							{/* Loss/recovery was only ever visible AFTER stopping and reopening the
+							    saved recording — which is backwards: dropped frames and FEC recovery
+							    are what you watch a live capture FOR. The `kind` note keeps the
+							    GameStream caveat (only `frames` is instrumented there). */}
+							<ChartBlock title={m.stats_health_title()}>
+								<HealthChart samples={samples} kind={live.data?.meta?.kind} />
 							</ChartBlock>
 							{(live.data?.samples?.length ?? 0) > LIVE_WINDOW && (
 								<p className="text-xs text-muted-foreground">

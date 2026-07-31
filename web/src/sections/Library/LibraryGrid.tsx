@@ -1,7 +1,7 @@
 import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "@unom/ui/toast";
 import { motion, stagger } from "motion/react";
-import type { FC } from "react";
+import { type FC, useEffect, useMemo } from "react";
 import {
 	getGetLibraryQueryKey,
 	useDeleteCustomGame,
@@ -21,11 +21,32 @@ import { customId } from "./helpers";
  * Editing is escalated to the parent (it opens the separate add/edit form), so
  * this subsection knows nothing about the form beyond firing `onEdit`.
  */
-export const LibraryGridSection: FC<{ onEdit: (entry: GameEntry) => void }> = ({
-	onEdit,
-}) => {
+export const LibraryGridSection: FC<{
+	onEdit: (entry: GameEntry) => void;
+	/** Show only entries owned by this provider, or everything when null. */
+	providerFilter?: string | null;
+	/** Reports the full (unfiltered) list up, so the providers card can count owners. */
+	onEntries?: (entries: GameEntry[]) => void;
+}> = ({ onEdit, providerFilter, onEntries }) => {
 	const qc = useQueryClient();
 	const library = useGetLibrary();
+	const all = library.data;
+	useEffect(() => {
+		if (all) onEntries?.(all);
+	}, [all, onEntries]);
+	// Filtering CLIENT-side: `GET /library?provider=` exists, but the page already holds the whole
+	// list for the grid, and a second parameterised query would just be a second cache entry of the
+	// same data going stale independently.
+	const filtered = useMemo(
+		() =>
+			providerFilter
+				? {
+						...library,
+						data: all?.filter((e) => e.provider === providerFilter),
+					}
+				: library,
+		[library, all, providerFilter],
+	);
 	const remove = useDeleteCustomGame();
 
 	// A refused delete has to say so. The host has real reasons to say no (a provider-owned entry
@@ -44,7 +65,7 @@ export const LibraryGridSection: FC<{ onEdit: (entry: GameEntry) => void }> = ({
 
 	return (
 		<LibraryGrid
-			library={library}
+			library={filtered}
 			onEdit={onEdit}
 			onDelete={onDelete}
 			// The custom id whose delete is in flight (if any), so only that card's button disables.

@@ -8,6 +8,7 @@ import { QueryState } from "@/components/query-state";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { fmtNumber } from "@/lib/format";
 import type { Loadable } from "@/lib/query";
 import { m } from "@/paraglide/messages";
 import { RunningGames } from "./RunningGames";
@@ -73,8 +74,13 @@ export const DashboardView: FC<{
 										<span className="text-sm text-muted-foreground">
 											{m.status_pin_pending()}
 										</span>
+										{/* The whole value used to be "●" or "—": no text, no state, colour
+										    doing all the work — nothing for a screen reader to read out and
+										    nothing for anyone who can't tell the two badges apart. */}
 										<Badge variant={s.pin_pending ? "default" : "outline"}>
-											{s.pin_pending ? "●" : "—"}
+											{s.pin_pending
+												? m.status_pin_waiting()
+												: m.status_pin_none()}
 										</Badge>
 									</CardContent>
 								</Card>
@@ -138,7 +144,34 @@ export const DashboardView: FC<{
 											/>
 											<Field
 												label={m.stream_bitrate()}
-												value={`${(s.stream.bitrate_kbps / 1000).toFixed(1)} Mbps`}
+												value={`${fmtNumber(s.stream.bitrate_kbps / 1000, 1)} Mbps`}
+											/>
+											{/* Bring-up and reconfigure cost, the parity floor and the packet
+											    size: the host has reported all four for as long as this
+											    endpoint has existed and the console showed none of them, so
+											    "it takes ages to start" and "it hitches when I resize" had no
+											    number attached anywhere. Native-plane only — null on
+											    GameStream and null until the first frame lands, so the two
+											    timings appear only once they mean something. */}
+											{s.stream.time_to_first_frame_ms != null && (
+												<Field
+													label={m.stream_first_frame()}
+													value={`${fmtNumber(s.stream.time_to_first_frame_ms)} ms`}
+												/>
+											)}
+											{s.stream.last_resize_ms != null && (
+												<Field
+													label={m.stream_last_resize()}
+													value={`${fmtNumber(s.stream.last_resize_ms)} ms`}
+												/>
+											)}
+											<Field
+												label={m.stream_packet_size()}
+												value={`${fmtNumber(s.stream.packet_size)} B`}
+											/>
+											<Field
+												label={m.stream_min_fec()}
+												value={fmtNumber(s.stream.min_fec)}
 											/>
 										</dl>
 									) : (
