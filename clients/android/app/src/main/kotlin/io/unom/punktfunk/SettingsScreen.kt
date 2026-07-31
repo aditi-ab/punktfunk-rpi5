@@ -794,6 +794,14 @@ private fun AudioSettings(s: Settings, update: (Settings) -> Unit, onMicChange: 
             field = "mic_enabled",
             onCheckedChange = onMicChange,
         )
+        ToggleRow(
+            title = "Echo cancellation",
+            subtitle = "Filters the stream's own audio out of the mic pickup",
+            checked = s.echoCancel,
+            enabled = s.micEnabled,
+            field = "echo_cancel",
+            onCheckedChange = { on -> update(s.copy(echoCancel = on)) },
+        )
     }
 }
 
