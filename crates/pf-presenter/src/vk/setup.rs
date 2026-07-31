@@ -424,6 +424,9 @@ impl Presenter {
                 queue_families: queue_info.iter().map(|q| q.queue_family_index).collect(),
                 pyrowave_decode: pyrowave_ok,
                 video_decode: video_ok,
+                // The phase-lock gate: real on-glass latch stamps exist only when the
+                // present-wait timer runs (see `PresentTimer`).
+                present_timing: present_timer.is_some(),
                 #[cfg(windows)]
                 d3d11_import: win_capable,
                 #[cfg(not(windows))]

@@ -230,6 +230,12 @@ impl ConnectPlan {
         if self.settings.fullscreen_on_stream {
             args.push("--fullscreen".into());
         }
+        // Deliberately NO `--window-pos` here. The Windows shell appends its own (its
+        // window's desktop coordinates place the session on the same monitor), but on
+        // Wayland neither GTK can read global window coordinates nor can SDL apply
+        // them — the compositor owns placement — so from the GTK/CLI spawners the flag
+        // would be a silent no-op everywhere it matters. X11 could carry it, but a
+        // Linux-only special case that most Linux sessions ignore isn't worth the drift.
         args
     }
 }

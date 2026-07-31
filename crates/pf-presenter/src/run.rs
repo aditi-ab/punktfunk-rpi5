@@ -193,6 +193,10 @@ struct StreamState {
     /// The settings profile this session resolved with, for the stats overlay's first line
     /// ("which profile am I on?"). `None` = the global defaults, and nothing is shown.
     profile: Option<String>,
+    /// The latch grid the pump's PhaseReports read (see `session::LatchGrid`), written by
+    /// the 1 Hz present-timing fold. `None` = the session didn't advertise phase lock
+    /// (no present-wait, or an embedder that opted out).
+    latch_grid: Option<Arc<session::LatchGrid>>,
     /// Live host↔client clock offset handle (None until Connected): loaded per present so
     /// mid-stream re-syncs keep the end-to-end number honest after an NTP step / drift.
     clock_offset: Option<Arc<std::sync::atomic::AtomicI64>>,
@@ -269,6 +273,10 @@ impl StreamState {
         wake: sdl3::event::EventSender,
     ) -> StreamState {
         let profile = params.profile.clone();
+        // The presenter's half of phase-locked capture: it writes the latch grid the
+        // pump reads (see `LatchGrid`), so keep the Arc before the params move. `None`
+        // when the session didn't advertise the cap — the 1 Hz fold then skips the work.
+        let latch_grid = params.phase_lock.then(|| params.latch_grid.clone());
         let handle = session::start(params);
         let (wake_tx, wake_rx) = async_channel::bounded(2);
         let pump_rx = handle.frames.clone();
@@ -294,6 +302,7 @@ impl StreamState {
             ready_announced: false,
             mode_line: String::new(),
             profile,
+            latch_grid,
             clock_offset: None,
             hdr: false,
             win_e2e_us: Vec::with_capacity(256),
@@ -1458,7 +1467,29 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                     .clock_offset
                     .as_ref()
                     .map_or(0, |o| o.load(Ordering::Relaxed));
-                for s in presenter.take_presented_samples() {
+                let samples = presenter.take_presented_samples();
+                // Phase-locked capture, the presenter's half: publish this window's latch
+                // grid — a recent TRUE on-glass instant plus the panel period — for the
+                // pump's ~1 Hz PhaseReport. The period is the min positive spacing of
+                // consecutive on-glass stamps (Apple's method: honest under VRR), capped
+                // by the display mode's refresh — under arrival-paced MAILBOX a stream
+                // running below the panel rate spaces its presents at k×period, and the
+                // cap keeps a 30 fps stream from claiming a 30 Hz panel grid.
+                if let Some(grid) = &st.latch_grid {
+                    if let Some(last) = samples.last() {
+                        let refresh_period = 1_000_000_000u64 / u64::from(native.refresh_hz.max(1));
+                        let min_delta = samples
+                            .windows(2)
+                            .map(|w| w[1].displayed_ns.saturating_sub(w[0].displayed_ns))
+                            .filter(|&d| d > 1_000_000) // < 1 ms apart = queued pair, not a grid step
+                            .min()
+                            .unwrap_or(refresh_period);
+                        grid.period_ns
+                            .store(min_delta.min(refresh_period), Ordering::Relaxed);
+                        grid.anchor_ns.store(last.displayed_ns, Ordering::Relaxed);
+                    }
+                }
+                for s in samples {
                     let e2e = (s.displayed_ns as i128 + clock_offset_ns as i128 - s.pts_ns as i128)
                         .max(0) as u64;
                     if e2e > 0 && e2e < 10_000_000_000 {

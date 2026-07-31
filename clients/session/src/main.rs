@@ -218,6 +218,8 @@ mod session_main {
             height: sh,
             ..mode
         };
+        // Before the struct literal — `vulkan` moves into it below.
+        let phase_lock = vulkan.as_ref().is_some_and(|v| v.present_timing);
         SessionParams {
             host: addr,
             port,
@@ -267,9 +269,19 @@ mod session_main {
                 } else {
                     0
                 },
-            // No portable Wayland/X11 display-volume query yet, so the host keeps its EDID
-            // defaults for Linux clients; `PUNKTFUNK_CLIENT_PEAK_NITS` (read in the session
-            // pump) pins one manually.
+            // This panel's HDR colour volume → the host's virtual-display EDID, so host
+            // apps tone-map to the real glass. Windows reads it from DXGI (the
+            // `--window-pos` monitor; advanced-color outputs only) — gated on the HDR
+            // setting, since with 10-bit/HDR unadvertised above the volume is noise. No
+            // portable Wayland/X11 query exists yet, so Linux keeps the host's EDID
+            // defaults; `PUNKTFUNK_CLIENT_PEAK_NITS` (read in the session pump) pins one
+            // manually on either OS and wins over both.
+            #[cfg(windows)]
+            display_hdr: settings
+                .hdr_enabled
+                .then(|| pf_client_core::video_d3d11::display_hdr_volume(window_pos()))
+                .flatten(),
+            #[cfg(not(windows))]
             display_hdr: None,
             // The presenter renders the host cursor locally in desktop mouse mode (M2 cursor
             // channel); capture-mode sessions keep the composited cursor, so only advertise
@@ -289,6 +301,13 @@ mod session_main {
             connect_timeout: connect_timeout(),
             force_software,
             profile,
+            // Phase-locked capture (design/phase-locked-capture.md, Apple/Android parity):
+            // advertised only when the presenter has real on-glass latch stamps
+            // (VK_KHR_present_wait) — without them there is no latch grid to report. The
+            // grid itself is written by the presenter (run_session clones the Arc out of
+            // these params) and folded into ~1 Hz PhaseReports by the session pump.
+            phase_lock,
+            latch_grid: std::sync::Arc::new(pf_client_core::session::LatchGrid::default()),
         }
     }
 
@@ -443,11 +462,21 @@ mod session_main {
 
         // The Settings device picks → env, unless the user already forced one by hand:
         // the GPU (the shells' pickers store the adapter's marketing name) for the
-        // presenter's device selection, and the audio endpoints (PipeWire node names)
-        // for the playback/mic streams' `target.object`. Before any Vulkan call, like
-        // the RADV knob (covers --connect and --browse).
+        // presenter's device selection, and the audio endpoints (PipeWire node names /
+        // WASAPI endpoint ids) for the playback/mic streams. Before any Vulkan call,
+        // like the RADV knob (covers --connect and --browse).
+        //
+        // Spec mode takes them from the SPEC's settings — the spawner's resolve — which
+        // keeps the §5 zero-store-reads invariant and lets a profile overlay reach these
+        // fields if they ever become profileable. Parsed leniently here (the `--connect`
+        // flow re-reads the spec authoritatively and errors there); the compat path and
+        // `--browse` (which never carries a spec) still load the store.
         {
-            let s = trust::Settings::load();
+            let s = arg_value("--resolved-spec")
+                .and_then(|p| {
+                    pf_client_core::orchestrate::ResolvedSpec::read(std::path::Path::new(&p)).ok()
+                })
+                .map_or_else(trust::Settings::load, |spec| spec.settings);
             for (var, value) in [
                 ("PUNKTFUNK_VK_ADAPTER", &s.adapter),
                 ("PUNKTFUNK_AUDIO_SINK", &s.speaker_device),

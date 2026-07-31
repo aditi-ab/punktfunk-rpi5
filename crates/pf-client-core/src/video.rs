@@ -876,6 +876,10 @@ pub struct VulkanDecodeDevice {
     /// features). The bundle now exists even without it — Windows D3D11 interop rides the
     /// same struct — so consumers gate the FFmpeg-Vulkan decoder on THIS, not on `Some`.
     pub video_decode: bool,
+    /// The presenter has REAL on-glass present timing (`VK_KHR_present_wait` — its
+    /// `PresentTimer` runs). Gates the `CLIENT_CAP_PHASE_LOCK` advertisement: without a
+    /// true latch stamp the desktop has no latch grid and must not claim the cap.
+    pub present_timing: bool,
     /// PyroWave decode (the wired-LAN wavelet codec) is usable: Vulkan 1.3 + the compute
     /// features its kernels need were present AND enabled at device creation
     /// (`shaderInt16`, `storageBuffer8BitAccess`, subgroup size control). Gates the
@@ -987,6 +991,7 @@ mod tests {
             queue_families: Vec::new(),
             pyrowave_decode: false,
             video_decode: true,
+            present_timing: false,
             d3d11_import: false,
             d3d11_hdr10: false,
             adapter_luid: None,

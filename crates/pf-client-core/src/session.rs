@@ -78,6 +78,30 @@ pub struct SessionParams {
     /// above; it rides along so the stats overlay can answer "which profile am I on?" without
     /// re-reading any store (design/client-settings-profiles.md §5.2).
     pub profile: Option<String>,
+    /// Advertise `quic::CLIENT_CAP_PHASE_LOCK`: this embedder's presenter has REAL on-glass
+    /// latch stamps (`VK_KHR_present_wait`) and will feed [`latch_grid`](Self::latch_grid),
+    /// so the pump sends the ~1 Hz `PhaseReport`s the host phase-locks its capture tick to
+    /// (design/phase-locked-capture.md — previously Apple/Android only). Never set without
+    /// present timing: the host arms on report receipt, but the Hello should say what the
+    /// client actually does.
+    pub phase_lock: bool,
+    /// The presenter-written latch grid the pump's reports are computed from.
+    pub latch_grid: Arc<LatchGrid>,
+}
+
+/// The presenter's display-latch grid, shared presenter → pump (the `force_software`
+/// pattern in the other direction): the presenter's 1 Hz present-timing fold writes a
+/// recent on-glass latch instant plus the panel period; the pump's stats window folds its
+/// per-AU arrival stamps against them into the ~1 Hz `PhaseReport`. All zeros until the
+/// first fold — and forever when present timing isn't available — so the pump simply
+/// stays quiet then.
+#[derive(Default)]
+pub struct LatchGrid {
+    /// A recent on-glass latch instant (client `CLOCK_REALTIME` ns — the same domain as
+    /// the AU arrival stamps). Any grid point works; the report extrapolates forward.
+    pub anchor_ns: std::sync::atomic::AtomicU64,
+    /// The panel's latch period (ns). `0` = no grid yet.
+    pub period_ns: std::sync::atomic::AtomicU64,
 }
 
 /// The session pump's share of the unified stats window (design/stats-unification.md):
@@ -282,11 +306,17 @@ fn pump(
         // This display's HDR volume → the host's virtual-display EDID. The env hatch wins so an
         // A/B run can pin an exact peak (PUNKTFUNK_CLIENT_PEAK_NITS=600).
         punktfunk_core::client::display_hdr_env_override().or(params.display_hdr),
-        if params.cursor_forward {
+        // CURSOR: this embedder renders the host cursor locally in desktop mouse mode.
+        // PHASE_LOCK: the presenter has real latch stamps and the pump reports them below.
+        (if params.cursor_forward {
             punktfunk_core::quic::CLIENT_CAP_CURSOR
         } else {
             0
-        },
+        }) | (if params.phase_lock {
+            punktfunk_core::quic::CLIENT_CAP_PHASE_LOCK
+        } else {
+            0
+        }),
         // Slice-progressive delivery: off — this presenter feeds FFmpeg whole AUs; a partial
         // avcodec feed path can flip it later.
         false,
@@ -412,6 +442,13 @@ fn pump(
     // Live host↔client clock offset: loaded per frame (Relaxed) so mid-stream re-syncs (an NTP
     // step, drift) keep the capture-clock latency stats honest — never cached at session start.
     let clock_offset_live = connector.clock_offset_shared();
+    // Phase-lock (advertised above): every received AU's arrival stamp, folded per stats
+    // window against the presenter's latch grid into the ~1 Hz PhaseReport. Desktop
+    // sessions receive whole AUs only (no frame parts), so every arrival counts — the
+    // reference reporters (Apple/Android) sample the same signal. 256 ≈ 2 s at 120 Hz.
+    let latch_grid = params.latch_grid.clone();
+    let mut phase_arrivals: Vec<u64> = Vec::new();
+    let mut last_applied_phase: Option<i32> = None;
     // PUNKTFUNK_DEBUG_RECONFIGURE=WxH@HZ:SECS — lab lever: request ONE mid-stream mode
     // switch N seconds in, so a headless session (no window manager to drag a window in)
     // can exercise the resize path deterministically — host pipeline rebuild, decoder
@@ -501,6 +538,9 @@ fn pump(
                 } else {
                     now_ns()
                 };
+                if params.phase_lock && phase_arrivals.len() < 256 {
+                    phase_arrivals.push(received_ns);
+                }
                 // fps / goodput count every received AU (spec), decoded or not.
                 frames_n += 1;
                 bytes_n += frame.data.len() as u64;
@@ -754,6 +794,19 @@ fn pump(
         // host never emits any — the deque fills to its cap and the OSD keeps the
         // combined `host+network` stage.
         while let Ok(t) = connector.next_host_timing(Duration::ZERO) {
+            // Phase-lock closed loop: the host's applied grid offset rides the 0xCF tail.
+            // Log transitions so an on-glass run can watch the controller engage/settle
+            // (the Android reporter's parity log).
+            if params.phase_lock
+                && t.applied_phase_ns.is_some()
+                && t.applied_phase_ns != last_applied_phase
+            {
+                last_applied_phase = t.applied_phase_ns;
+                tracing::info!(
+                    applied_phase_ns = t.applied_phase_ns.unwrap_or(0),
+                    "host phase-lock: applied capture-grid offset"
+                );
+            }
             if let Some(i) = pending_split.iter().position(|(p, _)| *p == t.pts_ns) {
                 let (_, hn_us) = pending_split.remove(i).unwrap();
                 host_us_win.push(t.host_us as u64);
@@ -796,6 +849,41 @@ fn pump(
         }
 
         if window_start.elapsed() >= Duration::from_secs(1) {
+            // Phase-lock report (~1 Hz, riding the stats window — the reference reporters'
+            // cadence): this window's arrival leads before the presenter's latch grid,
+            // folded with the SHARED circular statistic (the host controller was tuned
+            // against it). Quiet until the presenter has a grid (period 0 — no
+            // present-timing samples yet) or the window is thin (< 8 arrivals —
+            // `circular_latch` declines). 1 ms uncertainty = Apple/Android parity.
+            if params.phase_lock {
+                let period = latch_grid.period_ns.load(Ordering::Relaxed);
+                let anchor = latch_grid.anchor_ns.load(Ordering::Relaxed);
+                if period > 0 && anchor > 0 {
+                    let leads_us: Vec<u64> = phase_arrivals
+                        .iter()
+                        .map(|a| {
+                            ((anchor as i128 - *a as i128).rem_euclid(period as i128) / 1000) as u64
+                        })
+                        .collect();
+                    if let Some((lead_ns, coherence)) =
+                        punktfunk_core::phase::circular_latch(&leads_us, period as i64)
+                    {
+                        // Extrapolate the (possibly ~1 s old) anchor to the next latch at
+                        // or after now, then express it on the host clock.
+                        let (now, p, a) = (now_ns() as i128, period as i128, anchor as i128);
+                        let k = ((now - a).max(0) + p - 1) / p;
+                        let offset = clock_offset_live.load(Ordering::Relaxed) as i128;
+                        connector.report_phase(
+                            (a + k * p + offset).max(0) as u64,
+                            period.min(u32::MAX as u64) as u32,
+                            1_000_000,
+                            lead_ns.min(u32::MAX as u64) as u32,
+                            coherence,
+                        );
+                    }
+                }
+                phase_arrivals.clear();
+            }
             let secs = window_start.elapsed().as_secs_f32();
             let (hn_p50, _) = window_percentiles(&mut hostnet_us);
             let (dec_p50, _) = window_percentiles(&mut decode_us);
