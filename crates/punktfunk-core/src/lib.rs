@@ -114,7 +114,13 @@ pub use stats::Stats;
 /// v13: added `punktfunk_connection_send_pen` — the stylus wire plane
 /// (design/pen-tablet-input.md): a client sends `RICH_PEN` sample batches once the host
 /// advertises `HOST_CAP_PEN`. Additive and capability-gated, so [`WIRE_VERSION`] is unchanged.
-pub const ABI_VERSION: u32 = 13;
+/// v14: added `punktfunk_connection_report_phase` + the `PUNKTFUNK_CLIENT_CAP_PHASE_LOCK` mirror
+/// — the phase-locked capture reporter (design/phase-locked-capture.md): a client that advertises
+/// the cap reports its next display latch (already converted to host clock), the panel period, an
+/// uncertainty and the circular arrival-lead statistic the host's controller steers on. Additive;
+/// the wire grows only a new control message (`PhaseReport`, 0x32) an old host never reads and a
+/// strict-prefix append on the 0xCF host-timing tail, so [`WIRE_VERSION`] is unchanged.
+pub const ABI_VERSION: u32 = 14;
 
 /// The punktfunk/1 **wire** version — what `Hello`/`Welcome` carry and hosts equality-check.
 /// Deliberately its own constant: [`ABI_VERSION`] tracks the embeddable **C surface**
