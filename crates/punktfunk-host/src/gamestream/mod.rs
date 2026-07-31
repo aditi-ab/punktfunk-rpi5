@@ -52,8 +52,8 @@ pub const SCM_AV1_MAIN10: u32 = 0x0002_0000;
 /// The **SDR baseline** codec mask: H.264, HEVC Main, AV1 Main 8-bit (= 65793). HEVC Main10 (HDR) is
 /// layered on top of this at runtime by `serverinfo::codec_mode_support` when — and only when — the
 /// host can actually deliver it ([`host_hdr_capable`]); it is never a static claim, because a non-HDR
-/// host (a host without the `PUNKTFUNK_10BIT` opt-in, or a Linux host whose video source / encoder
-/// can't do Main10) must not invite a client into an HDR mode it can't produce. (The previous placeholder 3843 = 0xF03 wrongly claimed HEVC Main10 +
+/// host (a host where `PUNKTFUNK_10BIT` was explicitly turned off, or a Linux host whose video
+/// source / encoder can't do Main10) must not invite a client into an HDR mode it can't produce. (The previous placeholder 3843 = 0xF03 wrongly claimed HEVC Main10 +
 /// 4:4:4 and *no* AV1.) 4:4:4 stays off entirely on GameStream: stock Moonlight is 4:2:0 —
 /// full-chroma is a punktfunk/1-native negotiation only (`crate::capture::capturer_supports_444`).
 pub const SERVER_CODEC_MODE_SUPPORT: u32 = SCM_H264 | SCM_HEVC | SCM_AV1_MAIN8;
@@ -62,8 +62,9 @@ pub const SERVER_CODEC_MODE_SUPPORT: u32 = SCM_H264 | SCM_HEVC | SCM_AV1_MAIN8;
 /// `IsHdrSupported` per app, for layering the 10-bit codec bits in serverinfo, and (together with
 /// the live capture-side check and the session's own codec at RTSP time) for honoring a client's
 /// `dynamicRangeMode` request. Host-wide and codec-agnostic on purpose: the per-codec depth
-/// question belongs to whoever knows which codec is in play. Behind the operator's `PUNKTFUNK_10BIT` opt-in — the same policy gate the native
-/// punktfunk/1 plane honors — on both OSes.
+/// question belongs to whoever knows which codec is in play. Behind the host's `PUNKTFUNK_10BIT`
+/// policy gate — **default ON**, explicit-off grammar (`=0`/`false`/`off`/`no` disables), the same
+/// gate the native punktfunk/1 plane honors — on both OSes.
 ///
 /// **Windows**: the IDD-push capturer streams HEVC Main10 PQ whenever the desktop is HDR, and a
 /// client HDR request proactively enables advanced color on the per-session virtual display so PQ

@@ -45,7 +45,13 @@ After=pipewire.service punktfunk-kde-session.service
 PartOf=punktfunk-kde-session.service
 
 [Service]
-EnvironmentFile=%h/.config/punktfunk/host.env
+# '-' optional: NO package creates this file — deb/RPM/Arch ship only host.env.* templates under
+# /usr/share and the postinst merely prints the copy command — so a mandatory read would fail a
+# fresh install outright ("Failed to load environment files"), before the host ever ran. Absent
+# just means every knob at its default (pf-host-config has one for each), which is exactly what
+# `punktfunk-host serve` by hand already does. Contrast punktfunk-web.service, which marks
+# mgmt-token mandatory ON PURPOSE so Restart waits for the host to write it — this is not that.
+EnvironmentFile=-%h/.config/punktfunk/host.env
 ExecStart=%h/punktfunk/target/release/punktfunk-host serve --gamestream
 Restart=on-failure
 RestartSec=2

@@ -393,6 +393,15 @@ install -Dm0644 packaging/kde/host.env                 %{buildroot}%{_datadir}/%
 # screencast/virtual-output grant ships as io.unom.Punktfunk.Host.desktop, installed above).
 install -d %{buildroot}%{_datadir}/%{name}/bazzite
 install -Dm0755 packaging/bazzite/kde-desktop-setup.sh %{buildroot}%{_datadir}/%{name}/bazzite/kde-desktop-setup.sh
+# Layered-update helper for rpm-ostree hosts: `rpm-ostree upgrade` only re-resolves layered
+# packages when the BASE changes, so a frozen Bazzite base pins punktfunk forever. The script
+# forces a re-resolve of just this layer (--uninstall + --install of the same names in one
+# transaction). It is exactly the command pf-update-check hands an rpm-ostree host
+# (`sudo /usr/share/punktfunk/update-punktfunk.sh`, crates/pf-update-check/src/detect.rs), so it
+# has to exist at that path — an ostree box has no repo checkout to run it from. It only shells
+# out to rpm-ostree/rpm/systemctl, so the installed copy is self-contained. Top level, not
+# bazzite/, because the hint (and any Fedora-Atomic host) names that path.
+install -Dm0755 packaging/bazzite/update-punktfunk.sh %{buildroot}%{_datadir}/%{name}/update-punktfunk.sh
 # Headless GAME-mode fix: a gamescope-session-plus sessions.d drop-in that falls back to gamescope's
 # headless backend when no display is connected (so "Switch to Game Mode" works on a display-less
 # streaming host instead of crashing + 5-striking back to desktop). No-op on display-attached boxes.

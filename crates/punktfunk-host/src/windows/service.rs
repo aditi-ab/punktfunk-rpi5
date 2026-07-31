@@ -861,9 +861,9 @@ fn ensure_default_host_env() -> Result<()> {
         PUNKTFUNK_ENCODER=auto\n\
         PUNKTFUNK_VIDEO_SOURCE=virtual\n\
         # Virtual display = the bundled pf-vdisplay driver; capture is IDD-push from its shared ring\n\
-        # (the sole capture path — zero-copy, includes the secure desktop; DDA/WGC were removed).\n\
+        # (the sole capture path — zero-copy; DDA/WGC were removed). The secure desktop (UAC / lock /\n\
+        # login) is always captured — there is no setting for it.\n\
         PUNKTFUNK_VDISPLAY=pf\n\
-        PUNKTFUNK_SECURE_DDA=1\n\
         RUST_LOG=info\n\
         \n\
         # The host subcommand the service launches (default: serve --gamestream = native + Moonlight\n\

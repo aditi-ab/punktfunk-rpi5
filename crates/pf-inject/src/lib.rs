@@ -58,7 +58,8 @@ pub enum Backend {
     /// KWin `org_kde_kwin_fake_input` — direct injection, no RemoteDesktop portal / approval dialog
     /// (authorized by the host's `.desktop`). The headless KDE-Desktop path; what krdpserver uses.
     KwinFakeInput,
-    /// libei via `reis` — Wayland-native (RemoteDesktop portal).
+    /// libei via `reis` — Wayland-native. Reaches EIS through the RemoteDesktop portal, or on
+    /// GNOME through Mutter's direct RemoteDesktop API (see `libei_ei_source`).
     Libei,
     /// libei directly against gamescope's own EIS socket (no portal): input lands in the
     /// nested game — the SteamOS-like session.
@@ -173,9 +174,10 @@ pub fn absolute_anchor() -> Option<AbsoluteAnchor> {
 /// portal), so a gamescope session injects directly into it. wlroots/Sway only implements the
 /// ScreenCast portal (no RemoteDesktop), so libei can't run there — use the wlr virtual-input
 /// protocols. **KWin** exposes `org_kde_kwin_fake_input` (direct injection, no portal / approval
-/// dialog — the only headless-capable path; what krdpserver uses), so prefer it there. **GNOME**
-/// has neither fake_input nor the wlr protocols, so it uses libei via the RemoteDesktop portal
-/// (which needs a user to approve, or a pre-seeded grant — not truly headless).
+/// dialog — authorized by the host's `.desktop`; what krdpserver uses), so prefer it there.
+/// **GNOME** has neither fake_input nor the wlr protocols, so it uses libei — reaching EIS through
+/// Mutter's *direct* `org.gnome.Mutter.RemoteDesktop` API rather than the portal
+/// (`libei_ei_source`), so it is headless-capable too: no interactive approval to answer.
 /// `PUNKTFUNK_INPUT_BACKEND=wlr|kwin|libei|gamescope` overrides the auto-detection.
 #[cfg(target_os = "linux")]
 pub fn default_backend() -> Backend {

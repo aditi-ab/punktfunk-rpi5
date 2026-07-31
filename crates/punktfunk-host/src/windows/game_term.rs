@@ -7,8 +7,10 @@
 //! ### Why the desktop dance
 //!
 //! The polite half is the reason this module is not three lines. `EnumWindows` enumerates the windows
-//! of the **calling thread's desktop** — and the host runs as SYSTEM in session 0, whose desktop has
-//! none of the interactive user's windows on it. Without first binding the thread to the input desktop
+//! of the **calling thread's desktop** — and the host runs as SYSTEM. It is in the right *session*
+//! (the supervisor launches it into the active interactive console session — see [`super::service`]),
+//! but a SYSTEM process does not start on the interactive user's *desktop* within it, so the
+//! enumeration sees none of their windows. Without first binding the thread to the input desktop
 //! the enumeration comes back empty and the ladder silently degrades to killing every game outright,
 //! which is exactly the unsaved-progress outcome the grace window exists to avoid.
 //!

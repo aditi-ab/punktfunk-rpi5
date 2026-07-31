@@ -26,7 +26,8 @@ pub enum CaptureBackend {
     /// Linux: the xdg ScreenCast portal → PipeWire (the only Linux capture path).
     Portal,
     /// Windows: IDD direct-push — frames pulled straight from the pf-vdisplay driver's shared ring
-    /// (in-process, Session 0; captures the secure desktop too). The sole Windows capture path —
+    /// (in-process; the host runs as SYSTEM in the interactive console session, so it captures the
+    /// secure desktop too). The sole Windows capture path —
     /// DXGI Desktop Duplication (DDA) and the WGC two-process relay were removed.
     IddPush,
 }
@@ -55,7 +56,8 @@ impl CaptureBackend {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SessionTopology {
     /// One process captures + encodes. The only topology: Linux (portal) and Windows (in-process
-    /// IDD-push in Session 0). The SYSTEM-host + user-session WGC relay was removed with DDA/WGC.
+    /// IDD-push, in the host's SYSTEM process in the interactive console session). The SYSTEM-host
+    /// + user-session WGC relay was removed with DDA/WGC.
     SingleProcess,
 }
 
@@ -237,7 +239,8 @@ impl SessionPlan {
 }
 
 /// Process topology. Single-process is the only topology now: Linux (portal) and Windows (in-process
-/// IDD-push in Session 0). The Windows SYSTEM-host + user-session WGC relay was removed with DDA/WGC.
+/// IDD-push, in the host's SYSTEM process in the interactive console session). The Windows
+/// SYSTEM-host + user-session WGC relay was removed with DDA/WGC.
 pub(crate) fn resolve_topology() -> SessionTopology {
     SessionTopology::SingleProcess
 }

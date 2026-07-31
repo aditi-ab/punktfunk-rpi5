@@ -212,8 +212,10 @@ pub fn capture_virtual_output(
         },
     );
     // IDD direct-push is the sole Windows capture path: consume frames straight from the pf-vdisplay
-    // driver's shared ring (in-process, Session 0 — it captures the secure desktop too; no Desktop
-    // Duplication, no WGC helper). A FRESH monitor + ring is created per session. `want.hdr`
+    // driver's shared ring (in-process — no Desktop Duplication, no WGC helper). The host itself runs
+    // as SYSTEM in the active interactive console session (1+), spawned there by the session-0 SCM
+    // supervisor (`windows/service.rs`), which is what lets it capture the secure desktop too.
+    // A FRESH monitor + ring is created per session. `want.hdr`
     // proactively enables advanced color and selects the per-frame conversion. There is NO fallback:
     // if it can't open or the driver doesn't attach, the session fails cleanly and the client
     // reconnects.

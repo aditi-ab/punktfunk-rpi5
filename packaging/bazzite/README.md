@@ -148,11 +148,20 @@ sudo rpm-ostree update \
 systemctl reboot
 ```
 
-Or just run the helper, which detects what's layered and does the above:
+Or just run the helper, which detects what's layered and does the above. The `punktfunk` RPM
+installs it, so on a layered box it's already there — no checkout needed (it's the same command the
+web console's update hint prints):
 
 ```sh
-sudo bash packaging/bazzite/update-punktfunk.sh          # stage; reboot when ready
-sudo bash packaging/bazzite/update-punktfunk.sh --reboot # stage + reboot now
+sudo /usr/share/punktfunk/update-punktfunk.sh          # stage; reboot when ready
+sudo /usr/share/punktfunk/update-punktfunk.sh --reboot # stage + reboot now
+```
+
+From a repo checkout (e.g. before the first install, or to run a newer helper than the layered RPM
+carries) the same script runs directly — it only shells out to `rpm-ostree`/`rpm`/`systemctl`:
+
+```sh
+sudo bash packaging/bazzite/update-punktfunk.sh --reboot
 ```
 
 > **Channel gotcha:** the re-resolve picks the highest version across **every enabled**
@@ -231,8 +240,10 @@ KERNEL=="hidraw*", KERNELS=="*054C:0CE6*", GROUP="input", MODE="0660", TAG+="uac
 ## 4. Configure `host.env`
 
 The systemd user unit reads its environment from **`~/.config/punktfunk/host.env`**
-(`EnvironmentFile=%h/.config/punktfunk/host.env` in `scripts/punktfunk-host.service`). The RPM
-ships a Bazzite-tuned template at `/usr/share/punktfunk/host.env.bazzite`. Copy it into place:
+(`EnvironmentFile=-%h/.config/punktfunk/host.env` in `scripts/punktfunk-host.service` — the `-`
+makes it optional, since no package creates the file; absent just means every knob at its default).
+The RPM ships a Bazzite-tuned template at `/usr/share/punktfunk/host.env.bazzite`. Copy it into
+place:
 
 ```sh
 mkdir -p ~/.config/punktfunk

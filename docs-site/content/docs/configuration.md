@@ -168,8 +168,8 @@ the host needs a clipboard backend underneath. Both, and what a greyed-out toggl
 
 Capture of the **secure desktop** — UAC prompts, the lock screen, the login screen — is always on
 and has no setting: the host reads the pf-vdisplay driver's ring directly, and those surfaces are in
-it. The service still writes a `PUNKTFUNK_SECURE_DDA=1` line into a freshly generated `host.env` and
-nothing reads it — leave it or delete it, it makes no difference.
+it. If an older `host.env` on your machine still carries a `PUNKTFUNK_SECURE_DDA` line, nothing reads
+it — leave it or delete it, it makes no difference.
 
 | Setting | Values | Meaning |
 |---|---|---|

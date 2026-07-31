@@ -39,7 +39,7 @@ if [[ ${#layered[@]} -eq 0 ]]; then
   mapfile -t layered < <(rpm -qa --qf '%{NAME}\n' 'punktfunk' 'punktfunk-web' 2>/dev/null | sort -u)
 fi
 if [[ ${#layered[@]} -eq 0 ]]; then
-  echo "no punktfunk packages are layered — install first (see packaging/bazzite/README.md)" >&2
+  echo "no punktfunk packages are layered — install first (see https://docs.punktfunk.unom.io/docs/bazzite)" >&2
   exit 1
 fi
 echo "layered punktfunk packages: ${layered[*]}"
