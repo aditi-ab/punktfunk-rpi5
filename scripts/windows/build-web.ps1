@@ -31,9 +31,20 @@ if (-not (Test-Path $appWeb)) {
 }
 
 Write-Host "swapping $appWeb\.output (stopping the PunktfunkHost service) ..."
+$dst = Join-Path $appWeb '.output'
 & net stop PunktfunkHost | Out-Null
 try {
-  Remove-Item (Join-Path $appWeb '.output') -Recurse -Force -ErrorAction SilentlyContinue
+  # The removal MUST succeed before the copy. A merge of two builds is not a degraded
+  # install, it is a dead one: Nitro's entry.mjs imports its siblings by content hash, so a
+  # stale chunks/_ next to a new entry.mjs makes every page 200 with a bun ResolveMessage
+  # body instead of the app. Observed on .173 2026-07-31 (an older task-based copy of this
+  # script could not unlock the files under the supervised-child host, its
+  # -ErrorAction SilentlyContinue swallowed that, and the console served a JSON error for
+  # hours while the probe below reported success).
+  Remove-Item $dst -Recurse -Force -ErrorAction SilentlyContinue
+  if (Test-Path $dst) {
+    throw "could not remove $dst (files still locked - is another bun/host still running?). Refusing to copy over it: a mixed .output serves errors, not the console."
+  }
   Copy-Item (Join-Path $web '.output') -Destination $appWeb -Recurse -Force
 }
 finally {
@@ -43,14 +54,20 @@ finally {
 # The console serves HTTPS-only (PUNKTFUNK_UI_SECURE=1, the host's own cert) - probe with curl.exe
 # (-k for the self-signed cert; Invoke-WebRequest under Windows PowerShell 5.1, which this script
 # runs under, has no -SkipCertificateCheck), retrying while the service/bun cold-starts.
-$code = $null
+#
+# The BODY is the check, not the status code: a bun that started but cannot resolve its own
+# chunks answers 200 with a ResolveMessage JSON, so a code-only probe reports a healthy
+# console that serves nothing but an error (exactly how the .173 breakage stayed invisible).
+$body = $null
 for ($i = 0; $i -lt 15; $i++) {
   Start-Sleep 2
-  $code = & curl.exe -sk -o NUL -w '%{http_code}' --max-time 5 'https://127.0.0.1:47992/login' 2>$null
-  if ($code -eq '200') { break }
+  $body = & curl.exe -sk --max-time 5 'https://127.0.0.1:47992/login' 2>$null
+  if ($body -match '<html|<!DOCTYPE html') { break }
 }
-if ($code -eq '200') {
-  Write-Host "DONE - web /login -> HTTP $code"
+if ($body -match '<html|<!DOCTYPE html') {
+  Write-Host "DONE - the console serves the app (/login returned HTML)"
+} elseif ($body -match 'Cannot find module|ResolveMessage') {
+  Write-Error "BROKEN - /login answered with a bun module-resolution error, i.e. .output is inconsistent: $body"
 } else {
-  Write-Warning "console swapped but /login did not return 200 yet (last: $code) - check %ProgramData%\punktfunk\logs\web.log"
+  Write-Warning "console swapped but /login did not serve HTML yet - check %ProgramData%\punktfunk\logs\web.log. Last body: $body"
 }
