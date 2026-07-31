@@ -7,7 +7,7 @@
 //
 //   mic → host: a second AVAudioEngine taps the input device, folds it to one mono bus (the
 //   chosen channel of a multi-channel interface, or a sum of all channels), resamples to 48 kHz
-//   stereo, slices 20 ms chunks, Opus-encodes, and sendMic()s each packet — the host feeds them
+//   mono, slices 10 ms chunks, Opus-encodes, and sendMic()s each packet — the host feeds them
 //   into a virtual PipeWire source.
 //
 // Devices are chosen by UID ("" = system default: the engine is then never pinned to a
@@ -104,6 +104,12 @@ public final class SessionAudio {
                 try session.setCategory(
                     .playAndRecord, mode: .default,
                     options: [.allowBluetoothA2DP, .defaultToSpeaker])
+                // Uplink latency: ask for 5 ms IO quanta at the wire rate (the default ~10-23 ms
+                // quantum is most of the mic path's burst latency). Best-effort — the hardware
+                // has the final word (a Bluetooth route will ignore both), and whatever quantum
+                // is actually granted, the capture tap handles the buffers it gets.
+                try? session.setPreferredIOBufferDuration(0.005)
+                try? session.setPreferredSampleRate(48_000)
             } else {
                 try session.setCategory(.playback, mode: .default)
             }
@@ -378,22 +384,38 @@ public final class SessionAudio {
         #endif
 
         // Encode a single mono bus (folded from `inFormat` in the tap): the resampler goes
-        // mono@inputSR → the encoder's 48 kHz stereo, so it handles both the rate change and the
-        // mono→stereo duplication, and the wrong-channel downmix never happens.
+        // mono@inputSR → the encoder's 48 kHz mono, so it handles the rate change and the
+        // wrong-channel downmix never happens. Mono end to end — the host's decoder upmixes,
+        // so the old duplicate-into-stereo step only cost bits and cycles.
+        //
+        // `mono`/`staging` are the per-callback scratch buffers, preallocated HERE (grown only
+        // if a larger-than-expected device quantum ever arrives) — the steady-state tap path
+        // allocates nothing.
+        let scratchFrames: AVAudioFrameCount = 8192
+        let stagingCapacity = { (frames: AVAudioFrameCount) -> AVAudioFrameCount in
+            AVAudioFrameCount(
+                (Double(frames) * 48_000 / inFormat.sampleRate).rounded(.up)) + 64
+        }
         guard let monoFormat = AVAudioFormat(
                   commonFormat: .pcmFormatFloat32, sampleRate: inFormat.sampleRate,
                   channels: 1, interleaved: false),
               let encoder = try? OpusEncoder(),
               let resampler = AVAudioConverter(from: monoFormat, to: encoder.pcmFormat),
               let chunk = AVAudioPCMBuffer(
-                  pcmFormat: encoder.pcmFormat, frameCapacity: OpusEncoder.framesPerPacket)
+                  pcmFormat: encoder.pcmFormat, frameCapacity: encoder.framesPerPacket),
+              let monoScratch = AVAudioPCMBuffer(
+                  pcmFormat: monoFormat, frameCapacity: scratchFrames),
+              let stagingScratch = AVAudioPCMBuffer(
+                  pcmFormat: encoder.pcmFormat, frameCapacity: stagingCapacity(scratchFrames))
         else {
             log.error("Opus encoder unavailable — mic uplink disabled")
             return
         }
 
-        // Tap-thread-confined state: resample into `staging`, accumulate in `fifo`,
-        // slice 960-frame chunks for the encoder.
+        // Tap-thread-confined state: fold into `mono`, resample into `staging`, accumulate in
+        // `fifo`, slice `framesPerPacket` (10 ms) chunks for the encoder.
+        var mono = monoScratch
+        var staging = stagingScratch
         var fifo: [Float] = []
         fifo.reserveCapacity(48_000)
         var seq: UInt32 = 0
@@ -412,14 +434,26 @@ public final class SessionAudio {
         var inputPeak: Float = 0
         var levelReported = false
 
-        input.installTap(onBus: 0, bufferSize: 2048, format: inFormat) { buffer, _ in
+        // 480 frames = 10 ms, matching the packet duration. Advisory — CoreAudio delivers the
+        // device quantum whatever we ask (the old 2048 request came back as 42.7 ms bursts, most
+        // of the uplink's latency) — but where the system honors it, the tap fires per-packet.
+        input.installTap(onBus: 0, bufferSize: 480, format: inFormat) { buffer, _ in
             if flag.isStopped { return }
             let frames = Int(buffer.frameLength)
-            guard frames > 0, let src = buffer.floatChannelData,
-                  let mono = AVAudioPCMBuffer(
-                      pcmFormat: monoFormat, frameCapacity: buffer.frameLength),
-                  let dst = mono.floatChannelData?[0]
-            else { return }
+            guard frames > 0, let src = buffer.floatChannelData else { return }
+            if frames > Int(mono.frameCapacity) {
+                // A quantum larger than the scratch (bufferSize is advisory both ways) — regrow
+                // once to the new high-water mark; the steady state stays allocation-free.
+                guard let biggerMono = AVAudioPCMBuffer(
+                          pcmFormat: monoFormat, frameCapacity: buffer.frameLength),
+                      let biggerStaging = AVAudioPCMBuffer(
+                          pcmFormat: encoder.pcmFormat,
+                          frameCapacity: stagingCapacity(buffer.frameLength))
+                else { return }
+                mono = biggerMono
+                staging = biggerStaging
+            }
+            guard let dst = mono.floatChannelData?[0] else { return }
             mono.frameLength = buffer.frameLength
 
             // Fold the multi-channel input down to the one mono bus we encode.
@@ -451,11 +485,6 @@ public final class SessionAudio {
                 }
             }
 
-            let ratio = 48_000 / inFormat.sampleRate
-            let outCapacity = AVAudioFrameCount((Double(frames) * ratio).rounded(.up) + 64)
-            guard let staging = AVAudioPCMBuffer(
-                pcmFormat: encoder.pcmFormat, frameCapacity: outCapacity)
-            else { return }
             var fed = false
             var convError: NSError?
             let status = resampler.convert(to: staging, error: &convError) { _, outStatus in
@@ -469,16 +498,20 @@ public final class SessionAudio {
             }
             guard status != .error, let p = staging.floatChannelData?[0] else { return }
             fifo.append(contentsOf: UnsafeBufferPointer(
-                start: p, count: Int(staging.frameLength) * 2))
+                start: p, count: Int(staging.frameLength)))
 
-            let samplesPerChunk = Int(OpusEncoder.framesPerPacket) * 2
-            while fifo.count >= samplesPerChunk {
-                chunk.frameLength = OpusEncoder.framesPerPacket
+            // Consume whole chunks through a head index, then drop the eaten prefix in ONE
+            // move of the sub-chunk remainder. The old per-chunk removeFirst memmoved the
+            // entire backlog for every packet — O(n) on the render-adjacent tap thread.
+            let samplesPerChunk = Int(encoder.framesPerPacket)
+            var head = 0
+            while fifo.count - head >= samplesPerChunk {
+                chunk.frameLength = encoder.framesPerPacket
                 fifo.withUnsafeBufferPointer { src in
                     chunk.floatChannelData![0].update(
-                        from: src.baseAddress!, count: samplesPerChunk)
+                        from: src.baseAddress! + head, count: samplesPerChunk)
                 }
-                fifo.removeFirst(samplesPerChunk)
+                head += samplesPerChunk
                 guard let packets = try? encoder.encode(chunk) else { continue }
                 for packet in packets {
                     connection.sendMic(
@@ -486,6 +519,7 @@ public final class SessionAudio {
                     seq &+= 1
                 }
             }
+            if head > 0 { fifo.removeFirst(head) } // keeps capacity — no realloc
         }
 
         engine.prepare()

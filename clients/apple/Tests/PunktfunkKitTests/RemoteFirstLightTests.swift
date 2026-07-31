@@ -62,29 +62,30 @@ final class RemoteFirstLightTests: XCTestCase {
             host: host, port: port, width: 1280, height: 720, refreshHz: 60)
         defer { conn.close() }
 
-        // Mic uplink: 2 s of 440 Hz tone (the host's mic service opens its virtual
+        // Mic uplink: 2 s of 440 Hz mono tone (the host's mic service opens its virtual
         // source on the first frame — check its log).
         let encoder = try OpusEncoder()
         let chunk = AVAudioPCMBuffer(
-            pcmFormat: encoder.pcmFormat, frameCapacity: OpusEncoder.framesPerPacket)!
+            pcmFormat: encoder.pcmFormat, frameCapacity: encoder.framesPerPacket)!
         var phase: Float = 0
         let step = 2 * Float.pi * 440 / 48_000
         var seq: UInt32 = 0
-        for _ in 0..<100 {
-            chunk.frameLength = OpusEncoder.framesPerPacket
-            let p = chunk.floatChannelData![0]
-            for f in 0..<Int(OpusEncoder.framesPerPacket) {
-                let s = sin(phase) * 0.25
+        let chunks = 2 * 48_000 / Int(encoder.framesPerPacket)
+        let packetNs = UInt64(encoder.framesPerPacket) * 1_000_000_000 / 48_000
+        for _ in 0..<chunks {
+            chunk.frameLength = encoder.framesPerPacket
+            let p = chunk.floatChannelData![0] // mono: one plane
+            for f in 0..<Int(encoder.framesPerPacket) {
+                p[f] = sin(phase) * 0.25
                 phase += step
-                p[f * 2] = s
-                p[f * 2 + 1] = s
             }
             for packet in try encoder.encode(chunk) {
-                conn.sendMic(packet, seq: seq, ptsNs: UInt64(seq) * 20_000_000)
+                conn.sendMic(packet, seq: seq, ptsNs: UInt64(seq) * packetNs)
                 seq &+= 1
             }
         }
-        XCTAssertGreaterThanOrEqual(seq, 95, "mic encoder must emit ~one packet per chunk")
+        XCTAssertGreaterThanOrEqual(
+            seq, UInt32(chunks - 5), "mic encoder must emit ~one packet per chunk")
 
         // Downlink: pull host audio packets and decode them (the host streams its sink
         // monitor — silence still produces packets).

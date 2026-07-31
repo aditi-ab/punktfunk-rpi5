@@ -9,32 +9,34 @@ import XCTest
 @testable import PunktfunkKit
 
 final class OpusCodecTests: XCTestCase {
-    /// Encode a 440 Hz stereo tone, decode it back, and require the result to be
-    /// recognizably the same signal (Opus is lossy — check correlation, not bytes).
+    /// Encode a 440 Hz mono tone (the uplink's shape), decode it back through the
+    /// STEREO-configured decoder (the host-plane shape — Opus upmixes mono packets), and
+    /// require the result to be recognizably the same signal (Opus is lossy — check
+    /// correlation, not bytes).
     func testEncodeDecodeRoundTripPreservesTone() throws {
         let encoder = try OpusEncoder()
-        let decoder = try OpusDecoder(framesPerPacket: UInt32(OpusEncoder.framesPerPacket))
+        let decoder = try OpusDecoder(framesPerPacket: UInt32(encoder.framesPerPacket))
         let pcmFormat = encoder.pcmFormat
 
-        let frames = OpusEncoder.framesPerPacket
+        let frames = encoder.framesPerPacket
         var packets: [Data] = []
         var phase: Float = 0
         let step = 2 * Float.pi * 440 / 48_000
 
-        // 50 packets = 1 s of tone.
-        for _ in 0..<50 {
+        // 1 s of tone, whatever packet duration the encoder chose (10 ms → 100 chunks).
+        let chunks = Int(48_000 / frames)
+        for _ in 0..<chunks {
             let buf = AVAudioPCMBuffer(pcmFormat: pcmFormat, frameCapacity: frames)!
             buf.frameLength = frames
-            let p = buf.floatChannelData![0] // interleaved: one plane, L R L R …
+            let p = buf.floatChannelData![0] // mono: one plane
             for f in 0..<Int(frames) {
-                let s = sin(phase) * 0.5
+                p[f] = sin(phase) * 0.5
                 phase += step
-                p[f * 2] = s
-                p[f * 2 + 1] = s
             }
             packets.append(contentsOf: try encoder.encode(buf))
         }
-        XCTAssertGreaterThanOrEqual(packets.count, 45, "encoder must emit ~one packet per buffer")
+        XCTAssertGreaterThanOrEqual(
+            packets.count, chunks - 5, "encoder must emit ~one packet per buffer")
         XCTAssertTrue(packets.allSatisfy { !$0.isEmpty })
 
         var decoded: [Float] = []
