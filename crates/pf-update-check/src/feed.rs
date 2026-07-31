@@ -19,6 +19,43 @@ pub const DEFAULT_FEED_BASE: &str =
 /// One fetch's wall-clock budget.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Why a fetch didn't produce a manifest.
+///
+/// Exactly one failure mode is an *expected* steady state: a channel nobody has published to
+/// answers `manifest.json` with a 404. Collapsing that into the same string as a transport or
+/// signature failure is what made an empty stable feed render as "last check failed: feed
+/// returned HTTP 404" — telling operators their box is broken when the feed is merely empty.
+/// Everything else stays a real failure, loudly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FeedError {
+    /// This channel has no manifest at all. Note the deliberate narrowness: only a 404 on
+    /// `manifest.json` itself counts. A 404 on the *signature* means the manifest exists
+    /// without its proof — a half-published pair (the publisher's manifest-then-signature
+    /// window, or a botched upload), which must stay fail-closed and noisy.
+    NotPublished,
+    /// A real failure: transport, an HTTP status that isn't the empty-channel 404, the size
+    /// cap, or signature/schema rejection.
+    Failed(String),
+}
+
+impl FeedError {
+    /// Is this the benign "nothing published on this channel yet" state?
+    pub fn is_not_published(&self) -> bool {
+        matches!(self, Self::NotPublished)
+    }
+}
+
+impl std::fmt::Display for FeedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotPublished => f.write_str("no release has been published on this channel yet"),
+            Self::Failed(msg) => f.write_str(msg),
+        }
+    }
+}
+
+impl std::error::Error for FeedError {}
+
 /// The feed base, with a `PUNKTFUNK_UPDATE_FEED` override for tests and dev feeds. This is
 /// operator config (an env var on the process), never request-time input; the `https://` (or
 /// loopback) requirement keeps a stray value from silently downgrading the transport.
@@ -36,9 +73,11 @@ pub fn fetch_manifest_blocking(
     channel: &str,
     keys: &[PublicKey],
     user_agent: &str,
-) -> Result<Manifest, String> {
+) -> Result<Manifest, FeedError> {
     if keys.is_empty() {
-        return Err("no update key is pinned in this build".into());
+        return Err(FeedError::Failed(
+            "no update key is pinned in this build".into(),
+        ));
     }
     let agent = ureq::AgentBuilder::new()
         .timeout(FETCH_TIMEOUT)
@@ -48,29 +87,42 @@ pub fn fetch_manifest_blocking(
     let url = format!("{base}/{channel}/manifest.json");
     let sig_url = format!("{url}.sig");
 
-    let body = read_capped(agent.get(&url).call().map_err(fetch_err)?)?;
+    // Only the MANIFEST leg can report an empty channel; see [`FeedError::NotPublished`].
+    let body = read_capped(agent.get(&url).call().map_err(manifest_err)?)?;
     let sig = read_capped(agent.get(&sig_url).call().map_err(fetch_err)?)?;
-    let sig_text = String::from_utf8(sig).map_err(|_| "signature file is not text".to_string())?;
+    let sig_text = String::from_utf8(sig)
+        .map_err(|_| FeedError::Failed("signature file is not text".into()))?;
 
-    manifest::verify_and_parse(&body, &sig_text, keys, channel).map_err(|e| format!("{e:#}"))
+    manifest::verify_and_parse(&body, &sig_text, keys, channel)
+        .map_err(|e| FeedError::Failed(format!("{e:#}")))
 }
 
-fn fetch_err(e: ureq::Error) -> String {
+/// The manifest leg: a 404 here means the channel is empty, not broken.
+fn manifest_err(e: ureq::Error) -> FeedError {
     match e {
-        ureq::Error::Status(code, _) => format!("feed returned HTTP {code}"),
-        other => format!("feed fetch failed: {other}"),
+        ureq::Error::Status(404, _) => FeedError::NotPublished,
+        other => fetch_err(other),
     }
 }
 
-fn read_capped(resp: ureq::Response) -> Result<Vec<u8>, String> {
+fn fetch_err(e: ureq::Error) -> FeedError {
+    FeedError::Failed(match e {
+        ureq::Error::Status(code, _) => format!("feed returned HTTP {code}"),
+        other => format!("feed fetch failed: {other}"),
+    })
+}
+
+fn read_capped(resp: ureq::Response) -> Result<Vec<u8>, FeedError> {
     use std::io::Read as _;
     let mut buf = Vec::new();
     let mut reader = resp.into_reader().take(MAX_MANIFEST_BYTES as u64 + 1);
     reader
         .read_to_end(&mut buf)
-        .map_err(|e| format!("read failed: {e}"))?;
+        .map_err(|e| FeedError::Failed(format!("read failed: {e}")))?;
     if buf.len() > MAX_MANIFEST_BYTES {
-        return Err("response exceeds the manifest size cap".into());
+        return Err(FeedError::Failed(
+            "response exceeds the manifest size cap".into(),
+        ));
     }
     Ok(buf)
 }
@@ -85,7 +137,42 @@ mod tests {
         // licence to trust whatever the feed serves.
         let err =
             fetch_manifest_blocking("https://127.0.0.1:1", "stable", &[], "test").unwrap_err();
-        assert!(err.contains("no update key"), "{err}");
+        assert!(err.to_string().contains("no update key"), "{err}");
+        // And it is a real failure — never the benign empty-channel state.
+        assert!(!err.is_not_published());
+    }
+
+    fn status(code: u16) -> ureq::Error {
+        ureq::Error::Status(code, ureq::Response::new(code, "status", "").unwrap())
+    }
+
+    /// The whole point of the split: an empty channel is not a broken feed.
+    #[test]
+    fn manifest_404_is_not_published_but_other_statuses_are_failures() {
+        assert_eq!(manifest_err(status(404)), FeedError::NotPublished);
+        for code in [403, 500, 502] {
+            let e = manifest_err(status(code));
+            assert!(!e.is_not_published(), "HTTP {code} must stay a failure");
+            assert!(e.to_string().contains(&code.to_string()), "{e}");
+        }
+    }
+
+    /// A missing SIGNATURE is a half-published pair, not an empty channel — the manifest leg
+    /// already answered 200. Treating it as "nothing published yet" would quietly excuse the
+    /// one window where a manifest exists without its proof.
+    #[test]
+    fn signature_404_stays_a_failure() {
+        let e = fetch_err(status(404));
+        assert!(!e.is_not_published());
+        assert_eq!(e.to_string(), "feed returned HTTP 404");
+    }
+
+    #[test]
+    fn not_published_reads_as_plain_english() {
+        assert_eq!(
+            FeedError::NotPublished.to_string(),
+            "no release has been published on this channel yet"
+        );
     }
 
     #[test]

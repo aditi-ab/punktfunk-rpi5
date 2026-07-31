@@ -162,7 +162,9 @@ export const UpdateCard: FC<{
 											</span>
 										) : (
 											<span className="text-sm text-muted-foreground">
-												{m.update_never_checked()}
+												{s.not_published
+													? m.update_none_published()
+													: m.update_never_checked()}
 											</span>
 										)
 									}
@@ -209,6 +211,17 @@ export const UpdateCard: FC<{
 							{s.manifest?.stale && (
 								<p className="rounded-md border border-amber-500/40 bg-amber-500/10 p-3 text-sm">
 									{m.update_stale()}
+								</p>
+							)}
+							{/* An empty channel is a normal state, not a fault: it looks like a
+							    404 down at the transport, but it means "nobody has announced a
+							    release here yet". Rendering it in the failure style told
+							    operators their host was broken when nothing was. The host keeps
+							    the two apart (`not_published` is never set alongside
+							    `last_error`), so this stays a straight either/or. */}
+							{!inFlight && s.not_published && (
+								<p className="text-sm text-muted-foreground">
+									{m.update_not_published({ channel: s.channel })}
 								</p>
 							)}
 							{!inFlight && s.last_error && (

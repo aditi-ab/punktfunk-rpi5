@@ -543,6 +543,8 @@
 	"update_checking": "Checking…",
 	"update_last_checked": "Last checked",
 	"update_never_checked": "Not checked yet",
+	"update_none_published": "None published yet",
+	"update_not_published": "Nothing has been published to the {channel} channel yet. The check itself is working — there's just no release to compare against.",
 	"update_stale": "The update feed hasn't changed in over 45 days — checks succeed but nothing new arrives. If that seems wrong, check this host's connectivity to git.unom.io.",
 	"update_disabled": "Update checks are disabled on this host (PUNKTFUNK_UPDATE_CHECK=0).",
 	"update_error": "Last check failed:",

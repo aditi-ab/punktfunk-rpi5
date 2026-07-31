@@ -3495,7 +3495,7 @@
         "operationId": "forceUpdateCheck",
         "responses": {
           "200": {
-            "description": "Refreshed update-check state (`last_error` carries a failed check)",
+            "description": "Refreshed update-check state (`last_error` carries a failed check; `not_published` an empty channel, which is not one)",
             "content": {
               "application/json": {
                 "schema": {
@@ -7372,7 +7372,8 @@
           "apply",
           "channel_hint",
           "check_disabled",
-          "available"
+          "available",
+          "not_published"
         ],
         "properties": {
           "apply": {
@@ -7451,6 +7452,10 @@
                 "description": "The last verified manifest, if any check has succeeded."
               }
             ]
+          },
+          "not_published": {
+            "type": "boolean",
+            "description": "The check reached the feed and found this channel has **no release published yet** —\nan expected state (a channel nobody has announced to answers with a 404), not a\nfailure. Mutually exclusive with `last_error`, so a UI can say \"nothing published yet\"\ninstead of painting an empty feed as a broken host. Never set once a manifest has been\nseen for this channel: a feed that loses a document it used to serve stays an error."
           },
           "opt_in_hint": {
             "type": [

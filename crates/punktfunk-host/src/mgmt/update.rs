@@ -83,6 +83,12 @@ pub(crate) struct UpdateStatus {
     pub last_checked_unix: Option<u64>,
     /// Why the last check failed, verbatim, if it did.
     pub last_error: Option<String>,
+    /// The check reached the feed and found this channel has **no release published yet** —
+    /// an expected state (a channel nobody has announced to answers with a 404), not a
+    /// failure. Mutually exclusive with `last_error`, so a UI can say "nothing published yet"
+    /// instead of painting an empty feed as a broken host. Never set once a manifest has been
+    /// seen for this channel: a feed that loses a document it used to serve stays an error.
+    pub not_published: bool,
     /// This install could one-click apply, but the operator hasn't opted in yet — the
     /// command to run (Linux: join the `punktfunk-update` group).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -142,6 +148,7 @@ fn status_from(snap: update::Snapshot) -> UpdateStatus {
         }),
         last_checked_unix: snap.checked.as_ref().map(|c| c.fetched_unix),
         last_error: snap.last_error,
+        not_published: snap.not_published,
         opt_in_hint: update::opt_in_hint(),
         job,
         last_result: snap.last_result.as_ref().map(|r| UpdateResultInfo {
@@ -186,7 +193,7 @@ pub(crate) async fn get_update_status() -> Json<UpdateStatus> {
     tag = "update",
     operation_id = "forceUpdateCheck",
     responses(
-        (status = OK, description = "Refreshed update-check state (`last_error` carries a failed check)", body = UpdateStatus),
+        (status = OK, description = "Refreshed update-check state (`last_error` carries a failed check; `not_published` an empty channel, which is not one)", body = UpdateStatus),
         (status = CONFLICT, description = "Update checks are disabled on this host", body = ApiError),
         (status = TOO_MANY_REQUESTS, description = "A forced check ran less than 30 s ago", body = ApiError),
         (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),

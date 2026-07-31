@@ -35,6 +35,7 @@ pub mod sig;
 pub mod version;
 
 pub use detect::{InstallKind, Product};
+pub use feed::FeedError;
 pub use manifest::{Manifest, MAX_MANIFEST_BYTES, SCHEMA};
 pub use sig::{verify_signature, PublicKey};
 pub use version::{canary_run, is_newer, triple, Channel};
