@@ -278,6 +278,8 @@ pub(super) fn run_async(
     let mut discarded: u64 = 0;
     // AUs larger than the codec input buffer, dropped whole (see `feed`/`feed_ready`).
     let mut oversized_dropped: u64 = 0;
+    // Slice-progressive continuity ledger (see `PartFeed`).
+    let mut part_open: Option<PartFeed> = None;
     // Freeze-until-reanchor gate (see the sync loop for the rationale). Armed on a frame-index gap
     // (the feeder's Au verdict), a parked-AU overflow drop, a dropped-count climb, or a recoverable
     // codec error; `recovery_flags` carries each AU's user_flags from `dispatch_event` (feed) to
@@ -358,6 +360,8 @@ pub(super) fn run_async(
             &mut free_inputs,
             &mut fed,
             &mut oversized_dropped,
+            &mut part_open,
+            &mut gate,
         );
         let had_output = !ready.is_empty();
         let rendered_before = rendered;
@@ -580,11 +584,15 @@ fn feeder_loop(
                 // invalidation request so an RFI-capable host recovers with a cheap clean P-frame
                 // instead of a full IDR (the frames_dropped keyframe path is the backstop). The gap
                 // verdict rides the Au event so the decode loop arms its freeze gate on the same signal.
-                let gap = client.note_frame_index(frame.frame_index);
+                // Slice-progressive parts repeat their AU's index — note it once, on the
+                // AU's first piece (or a whole delivery), so the RFI gap detector keeps
+                // counting AUs.
+                let au_first = frame.part.is_none_or(|p| p.first);
+                let gap = au_first && client.note_frame_index(frame.frame_index);
                 // Park the receipt stamp (keyed by the pts the codec echoes) whenever the `decode`
                 // stage is consumed: the HUD, or the ABR decode signal (`measure_decode`). The
                 // HUD-only `received` point + host/network split stay gated on the overlay.
-                if stats.enabled() || measure_decode {
+                if (stats.enabled() || measure_decode) && frame.complete {
                     // Core reassembly-completion stamp (ABI v9), NOT the pull instant: stamping
                     // here would fold the hand-off queue wait into the network latency figure
                     // (a client-side standing backlog masquerading as network). 0 = older core.
@@ -607,7 +615,10 @@ fn feeder_loop(
                         let lat_ns = received_ns + clock_offset - frame.pts_ns as i128;
                         let lat_us = (lat_ns > 0 && lat_ns < 10_000_000_000)
                             .then_some((lat_ns / 1000) as u64);
-                        stats.note_received(frame.data.len(), lat_us, clock_offset != 0);
+                        // On a parts stream the completing delivery carries only the AU's
+                        // suffix — its offset restores the full AU byte count for bitrate.
+                        let au_len = frame.part.map_or(0, |p| p.offset as usize) + frame.data.len();
+                        stats.note_received(au_len, lat_us, clock_offset != 0);
                         if let Some(hostnet_us) = lat_us {
                             pending_split.push_back((frame.pts_ns, hostnet_us));
                             if pending_split.len() > PENDING_SPLIT_CAP {
@@ -669,20 +680,27 @@ fn dispatch_event(
             if gap {
                 gate.arm(Instant::now());
             }
-            recovery_flags.push_back((f.pts_ns / 1000, f.flags));
-            if recovery_flags.len() > IN_FLIGHT_CAP {
-                recovery_flags.pop_front();
+            // One entry per AU (parts share the pts): the completing delivery carries it.
+            if f.complete {
+                recovery_flags.push_back((f.pts_ns / 1000, f.flags));
+                if recovery_flags.len() > IN_FLIGHT_CAP {
+                    recovery_flags.pop_front();
+                }
             }
             // Phase-lock v3 sensor: the ARRIVAL stamp (reassembly completion, realtime) — the
             // phase the host actually controls. The latch-based v2 sensor measured downstream
             // of the decoder pipeline, which absorbed the host's actuation (on-glass 07-31).
-            arrival_stamps.push(if f.received_ns > 0 {
-                f.received_ns as i128
-            } else {
-                now_realtime_ns()
-            });
-            if arrival_stamps.len() > 256 {
-                arrival_stamps.remove(0);
+            // Phase sensor: AU completion is the arrival the host's hold actually moves —
+            // prefix parts would smear the phase toward the first slice's landing.
+            if f.complete {
+                arrival_stamps.push(if f.received_ns > 0 {
+                    f.received_ns as i128
+                } else {
+                    now_realtime_ns()
+                });
+                if arrival_stamps.len() > 256 {
+                    arrival_stamps.remove(0);
+                }
             }
             pending_aus.push_back(f);
             if pending_aus.len() > FRAME_PARK_CAP {
@@ -715,10 +733,35 @@ fn dispatch_event(
     false
 }
 
+/// `AMEDIACODEC_BUFFER_FLAG_PARTIAL_FRAME` (NDK ≥ 26, gated by the Kotlin
+/// `FEATURE_PartialFrame` probe): this input buffer is a PIECE of an AU — the codec assembles
+/// pieces until a buffer WITHOUT the flag closes the AU.
+const BUFFER_FLAG_PARTIAL_FRAME: u32 = 8;
+
+/// The slice-progressive feed's open access unit: parts already queued into the codec under
+/// [`BUFFER_FLAG_PARTIAL_FRAME`], awaiting the rest. Loop-local — a codec rebuild tears the
+/// whole loop down, so the state can never outlive the codec instance it fed.
+pub(super) struct PartFeed {
+    index: u32,
+    /// The AU byte offset the next part must carry — a mismatch means the hand-off dropped a
+    /// piece (memory cap / jump-to-live clear) and the AU is unrecoverable.
+    expected: usize,
+    /// The dead-close pts: an abandoned AU is CLOSED with an empty non-PARTIAL buffer at its
+    /// own pts — the codec then emits (concealed garbage) at that pts, which the reanchor
+    /// freeze gate withholds from glass while the keyframe request recovers the chain. No
+    /// mid-stream codec flush needed.
+    pts_us: u64,
+}
+
 /// Queue as many parked AUs as there are free input buffer slots (async mode: the indices come from
 /// `InputAvailable` callbacks, not a dequeue). Each AU is copied into its codec input buffer and
 /// submitted; an AU larger than the buffer is DROPPED (+ a recovery keyframe requested) — a
 /// truncated AU is corrupt input the decoder chews on silently, poisoning the reference chain.
+///
+/// Slice-progressive deliveries ([`Frame::part`]) feed as they arrive: every piece rides
+/// [`BUFFER_FLAG_PARTIAL_FRAME`] except the AU's last, all at the AU's pts. `part_open` is the
+/// continuity ledger — any break (gap, orphan, oversize) abandons the AU per [`PartFeed::pts_us`]'s
+/// close contract and re-syncs at the next `first`.
 fn feed_ready(
     codec: &MediaCodec,
     client: &NativeClient,
@@ -726,11 +769,49 @@ fn feed_ready(
     free_inputs: &mut VecDeque<usize>,
     fed: &mut u64,
     oversized_dropped: &mut u64,
+    part_open: &mut Option<PartFeed>,
+    gate: &mut ReanchorGate,
 ) {
     while !pending_aus.is_empty() && !free_inputs.is_empty() {
         let idx = free_inputs.pop_front().unwrap();
         let frame = pending_aus.pop_front().unwrap();
         let pts_us = frame.pts_ns / 1000;
+        let (first, last, offset) = match frame.part {
+            None => (true, true, 0usize),
+            Some(p) => (p.first, p.last, p.offset as usize),
+        };
+        // Continuity ledger. `continues` = this piece extends the open AU exactly;
+        // anything else with an AU open means that AU died mid-flight and must be closed
+        // (empty non-PARTIAL buffer at ITS pts) before this frame may touch the codec.
+        let continues = part_open
+            .as_ref()
+            .is_some_and(|o| frame.frame_index == o.index && offset == o.expected && !first);
+        if !continues {
+            if let Some(o) = part_open.take() {
+                // Spend THIS slot on the close; the current frame re-queues for the next one.
+                if let Err(e) = codec.queue_input_buffer_by_index(idx, 0, 0, o.pts_us, 0) {
+                    log::warn!("decode: close of abandoned partial AU {}: {e}", o.index);
+                }
+                log::warn!(
+                    "decode: partial AU {} abandoned mid-feed — closed empty, requesting keyframe",
+                    o.index
+                );
+                // The close makes the codec emit concealed garbage at the dead pts — freeze it
+                // off the glass until the recovery keyframe re-anchors.
+                gate.arm(Instant::now());
+                let _ = client.request_keyframe();
+                pending_aus.push_front(frame);
+                continue;
+            }
+            // No AU open: an orphan non-first piece lost its head upstream — discard and
+            // re-sync at the next `first` (the recovery request rides the same loss).
+            if !first {
+                free_inputs.push_front(idx);
+                gate.arm(Instant::now());
+                let _ = client.request_keyframe();
+                continue;
+            }
+        }
         let Some(dst) = codec.input_buffer(idx) else {
             log::warn!("decode: input_buffer({idx}) returned None — dropping AU");
             continue;
@@ -747,6 +828,16 @@ fn feed_ready(
                 *oversized_dropped
             );
             let _ = client.request_keyframe();
+            if frame.part.is_some() {
+                gate.arm(Instant::now());
+                // Pieces already queued can't be unqueued: poison the ledger so the next
+                // delivery mismatches and takes the close-empty path above.
+                *part_open = Some(PartFeed {
+                    index: frame.frame_index,
+                    expected: usize::MAX,
+                    pts_us,
+                });
+            }
             continue;
         }
         let n = au.len();
@@ -755,10 +846,32 @@ fn feed_ready(
         unsafe {
             std::ptr::copy_nonoverlapping(au.as_ptr(), dst.as_mut_ptr().cast::<u8>(), n);
         }
-        if let Err(e) = codec.queue_input_buffer_by_index(idx, 0, n, pts_us, 0) {
+        let flags = if last { 0 } else { BUFFER_FLAG_PARTIAL_FRAME };
+        if let Err(e) = codec.queue_input_buffer_by_index(idx, 0, n, pts_us, flags) {
             log::warn!("decode: queue_input_buffer_by_index: {e}");
+            if frame.part.is_some() && !last {
+                // The piece never reached the codec — same unrecoverable-AU shape as oversize.
+                *part_open = Some(PartFeed {
+                    index: frame.frame_index,
+                    expected: usize::MAX,
+                    pts_us,
+                });
+            }
         } else {
-            *fed += 1;
+            // `fed` counts ACCESS UNITS toward the HUD's fed/decoded balance — the closing
+            // piece (or a whole AU) bumps it.
+            if last {
+                *fed += 1;
+            }
+            *part_open = if last {
+                None
+            } else {
+                Some(PartFeed {
+                    index: frame.frame_index,
+                    expected: offset + n,
+                    pts_us,
+                })
+            };
         }
     }
 }

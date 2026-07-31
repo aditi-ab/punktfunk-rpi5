@@ -116,6 +116,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConnect<'lo
     gamepad_pref: jint,
     hdr_enabled: jboolean,
     multi_slice_ok: jboolean,
+    frame_parts_ok: jboolean,
     audio_channels: jint,
     video_codecs: jint,
     preferred_codec: jint,
@@ -225,9 +226,10 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConnect<'lo
         // No non-video caps: this client does not render the host cursor locally (no shape/state
         // planes in the jni surface), so advertising CLIENT_CAP_CURSOR would stream cursor-less.
         0,
-        // Slice-progressive delivery: off until the decode loop feeds MediaCodec with
-        // BUFFER_FLAG_PARTIAL_FRAME (P2d flips this behind a FEATURE_PartialFrame probe).
-        false,
+        // Slice-progressive delivery, by decoder truth (Kotlin probes FEATURE_PartialFrame on
+        // every decoder this device would use): AU prefixes then arrive as `Frame::part`
+        // pieces and the decode loop feeds them with BUFFER_FLAG_PARTIAL_FRAME.
+        frame_parts_ok != 0,
         launch, // a store-qualified library id to boot into a game, or None for the desktop
         device_name, // Kotlin's Build.MODEL — the host's approval-list / trust-store label
         pin,    // Some → Crypto on host-fp mismatch

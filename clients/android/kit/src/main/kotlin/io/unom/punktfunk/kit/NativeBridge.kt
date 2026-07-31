@@ -51,6 +51,10 @@ object NativeBridge {
          *  ([VideoDecoders.multiSliceTolerant]) — advertises `VIDEO_CAP_MULTI_SLICE`; false keeps
          *  the host at single-slice frames (the safe pre-0.17 wire shape). */
         multiSliceOk: Boolean,
+        /** Every decoder this device would use accepts partial-frame input
+         *  ([VideoDecoders.partialFrameCapable]) — opts into slice-progressive delivery (the
+         *  decode loop then feeds slices with `BUFFER_FLAG_PARTIAL_FRAME` as they arrive). */
+        framePartsOk: Boolean,
         audioChannels: Int,
         /** `quic::CODEC_*` bitfield of codecs this device decodes ([VideoDecoders.decodableCodecBits]);
          *  `0` falls back to H.264|HEVC. The host resolves the emitted codec from this ∩ its GPU. */

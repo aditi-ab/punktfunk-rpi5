@@ -49,7 +49,11 @@ suspend fun connectToHost(
             host, port, w, h, hz,
             identity.certPem, identity.privateKeyPem, pinHex,
             settings.bitrateKbps, settings.compositor, gamepadPref,
-            hdrEnabled, VideoDecoders.multiSliceTolerant(), settings.audioChannels,
+            hdrEnabled, VideoDecoders.multiSliceTolerant(),
+            // Slice-progressive delivery: decoder truth AND the async decode loop — the legacy
+            // sync loop feeds whole AUs only, so parts must never arrive when it is selected.
+            settings.lowLatencyMode && VideoDecoders.partialFrameCapable(),
+            settings.audioChannels,
             // What this device can decode (H.264|HEVC always, AV1 when a real decoder exists) +
             // the user's soft codec preference — the host resolves the emitted codec from both.
             VideoDecoders.decodableCodecBits(), settings.preferredCodec(), timeoutMs,

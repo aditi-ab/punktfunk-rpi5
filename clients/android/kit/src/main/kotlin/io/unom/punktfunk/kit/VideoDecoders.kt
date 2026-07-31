@@ -75,6 +75,31 @@ object VideoDecoders {
         }
     }
 
+    /**
+     * True when EVERY decoder this device would stream with supports partial-frame input
+     * (MediaCodec `FEATURE_PartialFrame`): the client may then opt into slice-progressive
+     * delivery and feed slices with `BUFFER_FLAG_PARTIAL_FRAME` ahead of the AU's tail.
+     * Codec selection happens after connect, so all advertised mimes must qualify — the same
+     * conservative shape as [multiSliceTolerant] (an unprobeable pick disqualifies).
+     */
+    fun partialFrameCapable(): Boolean {
+        val mimes = buildList {
+            add("video/avc")
+            add("video/hevc")
+            if (decodableCodecBits() and 4 != 0) add("video/av01")
+        }
+        val infos = runCatching { MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos }
+            .getOrNull() ?: return false
+        return mimes.all { mime ->
+            val pick = pickDecoder(mime)?.name ?: return@all false
+            val info = infos.firstOrNull { it.name == pick } ?: return@all false
+            runCatching {
+                info.getCapabilitiesForType(mime)
+                    .isFeatureSupported(CodecCapabilities.FEATURE_PartialFrame)
+            }.getOrDefault(false)
+        }
+    }
+
     fun pickDecoder(mime: String): DecoderChoice? {
         if (mime.isEmpty()) return null
         val infos = runCatching { MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos }
