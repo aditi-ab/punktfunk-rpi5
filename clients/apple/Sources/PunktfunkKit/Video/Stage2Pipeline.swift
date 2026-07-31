@@ -279,10 +279,27 @@ final class LatestBox<T>: @unchecked Sendable {
 private final class FrameRateHint: @unchecked Sendable {
     private let lock = NSLock()
     private var pending: CAFrameRateRange?
+    private var streamHz: Float = 0
+    private var boosted = false
     func stage(hz: Float) {
         guard hz > 0 else { return }
         lock.lock()
-        pending = CAFrameRateRange(minimum: hz, maximum: max(hz, 120), preferred: hz)
+        streamHz = hz
+        pending = Self.range(hz: hz, boosted: boosted)
+        lock.unlock()
+    }
+    /// Pen-proximity boost: pin `minimum = preferred` at the range's CEILING instead of the
+    /// stream rate. UIKit delivers touch/Pencil events at the PANEL's cadence, and the panel
+    /// follows this link's vote — so a 60 fps stream on a 120 Hz iPad halves pencil sampling
+    /// unless a boost lifts the panel while the Pencil is in range. Presents still pace at
+    /// stream rate (extra link updates just vend into the newest-wins stash), so the cost is
+    /// empty wakes, scoped to pen proximity.
+    func setBoost(_ on: Bool) {
+        lock.lock()
+        if boosted != on {
+            boosted = on
+            if streamHz > 0 { pending = Self.range(hz: streamHz, boosted: on) }
+        }
         lock.unlock()
     }
     func drain() -> CAFrameRateRange? {
@@ -291,6 +308,11 @@ private final class FrameRateHint: @unchecked Sendable {
         let p = pending
         pending = nil
         return p
+    }
+    private static func range(hz: Float, boosted: Bool) -> CAFrameRateRange {
+        let cap = max(hz, 120)
+        let preferred = boosted ? cap : hz
+        return CAFrameRateRange(minimum: preferred, maximum: cap, preferred: preferred)
     }
 }
 
@@ -1228,6 +1250,15 @@ public final class Stage2Pipeline {
     /// is the hinted link.
     public func setFrameRateHint(hz: Float) {
         frameRateHint.stage(hz: hz)
+    }
+
+    /// Pen-proximity rate boost (drawing workloads): drive the deadline link — and with it the
+    /// panel, whose cadence paces UIKit's touch/Pencil event delivery — at the range ceiling
+    /// while a Pencil is in range, so a sub-panel-rate stream stops halving pencil sampling.
+    /// Staged like the rate hint; no-op under arrival/glass pacing. MAIN thread.
+    public func setInteractionBoost(_ on: Bool) {
+        frameRateHint.setBoost(on)
+        presentLog.info("pen boost \(on ? "engaged" : "released", privacy: .public)")
     }
 
     /// Forward the layout-derived drawable pixel size to the presenter (MAIN thread — see

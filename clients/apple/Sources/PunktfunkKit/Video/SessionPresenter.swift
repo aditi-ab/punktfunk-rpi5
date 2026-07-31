@@ -355,6 +355,13 @@ final class SessionPresenter {
     /// behavior — iOS keeps a 30 Hz floor; macOS leaves the NSView link at its display's native
     /// rate (it already tracks the display and must NOT be capped to the stream rate).
     /// Re-applied from `layout` so a mid-session `Reconfigure` picks up a new refresh.
+    /// Pen-proximity panel-rate boost pass-through (Stage2Pipeline.setInteractionBoost):
+    /// deadline pacing only — under arrival/glass the staged hint feeds no link, so this
+    /// is a no-op there. MAIN thread.
+    func setInteractionBoost(_ on: Bool) {
+        stage2?.setInteractionBoost(on)
+    }
+
     private func syncFrameRate(hz: UInt32) {
         guard hz > 0 else { return }
         // Deadline pacing: the hint goes to the pipeline's CAMetalDisplayLink instead (staged;
