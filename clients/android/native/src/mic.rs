@@ -328,17 +328,16 @@ fn encode_loop(
         }
         while ring.len() >= frame {
             // Muted: drop the frame at the last point before it would become an Opus packet —
-            // room audio is never encoded and nothing goes on the wire. `seq` still advances,
-            // because it numbers the captured 10 ms TIMELINE rather than the datagrams: the gap
-            // the host then sees is exactly the audio that never came, which its de-jitter reads
-            // as at most a few concealment frames before the pump's 600 ms stale-gap flush resets
-            // the chain outright — the right reading of a mute. (Encoding silence instead would
-            // keep a pointless uplink and a host-side ring alive for the whole mute.) `peak` is
-            // the loudest sample the UPLINK carried since the last log, so a dropped frame resets
-            // rather than raises it.
+            // room audio is never encoded and nothing goes on the wire. `seq` does NOT advance:
+            // it numbers the datagrams the host de-jitters, and that side reads a seq jump as
+            // loss (conceal + a counted gap) where a mute is a pause. Freezing it means the
+            // frame after an unmute continues the chain, which is what the host's own
+            // `reset_stream` doc calls for and what the desktop uplink does. (Encoding silence
+            // instead would keep a pointless uplink and a host-side ring alive for the whole
+            // mute.) `peak` is the loudest sample the UPLINK carried since the last log, so a
+            // dropped frame resets rather than raises it.
             if muted.load(Ordering::Relaxed) {
                 ring.drain(..frame);
-                seq = seq.wrapping_add(1);
                 muted_frames += 1;
                 peak = 0.0;
                 continue;
