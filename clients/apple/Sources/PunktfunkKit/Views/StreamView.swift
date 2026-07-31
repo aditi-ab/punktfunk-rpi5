@@ -881,6 +881,12 @@ public final class StreamLayerView: NSView {
             guard self?.window?.isKeyWindow == true else { return }
             NotificationCenter.default.post(name: .punktfunkToggleFullscreen, object: nil)
         }
+        capture.onToggleMicMute = { [weak self] in
+            // Session-level state the view doesn't own — post to the app (same routing as the
+            // fullscreen chord), so the captured and released paths end at one toggle.
+            guard self?.window?.isKeyWindow == true else { return }
+            NotificationCenter.default.post(name: .punktfunkToggleMicMute, object: nil)
+        }
         capture.onCycleStats = { [weak self] in
             guard self?.window?.isKeyWindow == true else { return }
             // Advance the shared tier setting directly — every @AppStorage reader (the HUD's

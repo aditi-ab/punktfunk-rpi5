@@ -128,10 +128,18 @@ public final class InputCapture {
     /// carries the same key equivalents for discoverability) can't see them, so the monitor is the
     /// captured-state delivery path; released, the events pass through and the menu handles them.
     /// ⌃⌥⇧Q releases the captured mouse/keyboard; ⌃⌥⇧D disconnects; ⌃⌥⇧S cycles the stats
-    /// overlay tier (off → compact → normal → detailed). Main queue.
+    /// overlay tier (off → compact → normal → detailed). ⌃⌥⇧A (`onToggleMicMute`, below) rides
+    /// the same path. Main queue.
     public var onReleaseCapture: (() -> Void)?
     public var onDisconnect: (() -> Void)?
     public var onCycleStats: (() -> Void)?
+
+    /// Fired on ⌃⌥⇧A — mute/unmute the microphone uplink, the one in-stream control a captured
+    /// session can't otherwise reach (the HUD's button is behind a grabbed cursor). Same delivery
+    /// rule as the combos above: only WHILE FORWARDING, because that's when the menu's identical
+    /// key equivalent can't fire. ⌃⌥⇧M — the obvious letter — is long since the mouse-model flip
+    /// (cross-client), so A ("audio in") is the mic's. Main queue.
+    public var onToggleMicMute: (() -> Void)?
 
     /// Fired on ⌃⌘F (macOS) — toggle the streaming window in/out of fullscreen. Detected in the
     /// monitor only WHILE FORWARDING, for the same reason as the ⌃⌥⇧ combos: a captured stream view
@@ -140,13 +148,13 @@ public final class InputCapture {
     public var onToggleFullscreen: (() -> Void)?
 
     #if os(iOS)
-    /// Windows VKs of the three modifier classes in the ⌃⌥⇧Q release chord, both L/R sides:
+    /// Windows VKs of the three modifier classes in the ⌃⌥⇧ chords, both L/R sides:
     /// control (0xA2/0xA3), option (0xA4/0xA5), shift (0xA0/0xA1). Used to sift the HID key stream.
     private static let chordModifierVKs: Set<UInt32> = [0xA2, 0xA3, 0xA4, 0xA5, 0xA0, 0xA1]
 
     /// Whether Control AND Option AND Shift are all currently held (either side of each counts) —
-    /// the modifier precondition for the iPad ⌃⌥⇧Q release chord.
-    private var hasReleaseChordModifiers: Bool {
+    /// the modifier precondition for the iPad ⌃⌥⇧ chords (Q releases capture, A mutes the mic).
+    private var hasChordModifiers: Bool {
         let m = chordModifiersDown
         return (m.contains(0xA2) || m.contains(0xA3)) // control
             && (m.contains(0xA4) || m.contains(0xA5)) // option
@@ -283,6 +291,10 @@ public final class InputCapture {
                 case 1 /* S */:
                     self.suppressedVK = 0x53
                     self.onCycleStats?()
+                    return nil
+                case 0 /* A */:
+                    self.suppressedVK = 0x41
+                    self.onToggleMicMute?()
                     return nil
                 default:
                     break
@@ -704,7 +716,7 @@ public final class InputCapture {
                 }
             }
             #if os(iOS)
-            // Track Control/Option/Shift for the ⌃⌥⇧Q release chord below — in both forwarding
+            // Track Control/Option/Shift for the ⌃⌥⇧ chords below — in both forwarding
             // states (like `cmdKeysDown`) so a modifier held before capture engaged still counts.
             if Self.chordModifierVKs.contains(vk) {
                 if pressed { self.chordModifiersDown.insert(vk) } else { self.chordModifiersDown.remove(vk) }
@@ -732,9 +744,17 @@ public final class InputCapture {
             // otherwise). The Q is latched (`suppressedVK`) so its keyUp can't type into the host;
             // the ⌃⌥⇧ modifiers were forwarded as they went down and are flushed by the release
             // path (setCaptured(false) → releaseAll). VK 0x51 is layout-independent (physical Q).
-            if pressed, vk == 0x51, self.hasReleaseChordModifiers {
+            if pressed, vk == 0x51, self.hasChordModifiers {
                 self.suppressedVK = 0x51
                 self.onReleaseCapture?()
+                return
+            }
+            // ⌃⌥⇧A mutes/unmutes the mic uplink — same detection, same latching, and needed here
+            // for the same reason as on macOS: a captured iPad swallows the Stream menu's
+            // identical key equivalent. VK 0x41 is layout-independent (physical A).
+            if pressed, vk == 0x41, self.hasChordModifiers {
+                self.suppressedVK = 0x41
+                self.onToggleMicMute?()
                 return
             }
             #endif

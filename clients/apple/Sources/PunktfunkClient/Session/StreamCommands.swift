@@ -1,7 +1,8 @@
 // The app's "Stream" menu (macOS menu bar + iPad hardware-keyboard shortcuts). These live at
 // the Scene level so they keep working when the HUD overlay is hidden. The shortcuts are the
 // CROSS-CLIENT set every punktfunk client reserves — Ctrl+Alt+Shift+Q (release the captured
-// mouse) / +D (disconnect) / +S (stats) — and the menu is their discoverable surface on macOS
+// mouse) / +D (disconnect) / +S (stats), plus +A (mute the microphone), the Apple clients'
+// addition to it — and the menu is their discoverable surface on macOS
 // (the Linux client has its GTK Shortcuts window, Windows its start-of-stream banner). While
 // input is CAPTURED these key equivalents never reach the menu (the stream view swallows
 // keys); InputCapture's monitor detects the same combos there and performs the same actions —
@@ -27,6 +28,12 @@ struct SessionFocus {
     /// Clipboard sync is live (host-acked) — drives the item's Stop/Share title.
     var clipboardOn: Bool
     var toggleClipboard: () -> Void
+    /// The session has a mic uplink at all (its resolved `micEnabled`) — gates the mute item, so
+    /// it is never an enabled control over a session that sends no microphone.
+    var micAvailable: Bool
+    /// The user's mic mute is engaged — drives the item's Mute/Unmute title.
+    var micMuted: Bool
+    var toggleMicMute: () -> Void
     var disconnect: () -> Void
 }
 
@@ -60,6 +67,17 @@ struct StreamCommands: Commands {
             }
             .keyboardShortcut("q", modifiers: [.control, .option, .shift])
             .disabled(session?.isStreaming != true)
+            // Mic mute, local and instant (it gates capture on this device — the host is never
+            // asked). Per SESSION: it starts off every time, so this item is a live toggle, not a
+            // setting. Greyed when the session sends no microphone at all (Settings → mic off, or
+            // a profile that turns it off) rather than pretending there is something to mute.
+            // Captured, the combo is handled by InputCapture's chord path before menus see it;
+            // this item is the released-state path and the shortcut's documentation.
+            Button(session?.micMuted == true ? "Unmute Microphone" : "Mute Microphone") {
+                session?.toggleMicMute()
+            }
+            .keyboardShortcut("a", modifiers: [.control, .option, .shift])
+            .disabled(session?.isStreaming != true || session?.micAvailable != true)
             #if os(macOS)
             // Mid-session clipboard flip (design/clipboard-and-file-transfer.md §5.3). Greyed
             // when the host doesn't advertise the cap (older host / operator policy off).

@@ -179,6 +179,18 @@ struct StreamHUDView: View {
                     .foregroundStyle(.secondary)
             }
             #endif
+            // Mic mute — the in-stream toggle, on the same card as the other in-overlay action.
+            // Absent (not greyed) when the session sends no microphone: the HUD is a status card,
+            // and a dead control on it would read as "there is a mic, and it is on". The muted
+            // STATE is not this button's job — the badge over the stream says that at every tier
+            // and with the overlay off entirely. tvOS gets no control: no microphone, and a
+            // focusable one would steal the controller's A press from the host.
+            #if !os(tvOS)
+            if model.micAvailable {
+                Button(micButtonTitle) { model.toggleMicMute() }
+                    .font(.geist(12, relativeTo: .caption))
+            }
+            #endif
             // ⌃⌥⇧D lives on the app's Stream menu (so it still works when the HUD is hidden)
             // and in InputCapture's monitor while captured; this button is the in-overlay,
             // click-to-disconnect affordance. tvOS deliberately gets NEITHER a button (a
@@ -194,6 +206,19 @@ struct StreamHUDView: View {
             #endif
         }
     }
+
+    #if !os(tvOS)
+    /// The mute button's wording. macOS names the chord, exactly as its Disconnect button does;
+    /// iOS/iPadOS spells the action out (the HUD's buttons there carry no shortcuts, even where a
+    /// hardware keyboard could fire one — the Stream menu is that keyboard's surface).
+    private var micButtonTitle: String {
+        #if os(macOS)
+        return model.micMuted ? "Unmute Mic (⌃⌥⇧A)" : "Mute Mic (⌃⌥⇧A)"
+        #else
+        return model.micMuted ? "Unmute Microphone" : "Mute Microphone"
+        #endif
+    }
+    #endif
 
     // MARK: - Card metrics
 
@@ -241,6 +266,42 @@ struct StreamHUDView: View {
         RoundedRectangle(cornerRadius: cardCornerRadius, style: .continuous)
     }
 }
+
+#if !os(tvOS)
+/// The muted-microphone badge — the mute STATE, as opposed to the buttons that flip it. It rides
+/// over the stream whenever the mic is muted, INDEPENDENT of the stats overlay (which the user
+/// may have cycled off, and which the compact tier reduces to a stat line): "am I muted?" is not a
+/// statistic, and a mute you can't see is how people talk to nobody for a minute. Same glass
+/// language as the HUD, sized like the start-of-stream banner it shares the bottom edge with.
+///
+/// It is also a control: tapping it unmutes. That is the guaranteed way back for a touch user who
+/// muted with the overlay off, and it costs the badge nothing (it is on screen either way).
+struct MicMutedBadge: View {
+    let onUnmute: () -> Void
+
+    var body: some View {
+        Button(action: onUnmute) {
+            HStack(spacing: 7) {
+                Image(systemName: "mic.slash.fill")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(.red)
+                Text("Microphone muted")
+                    .font(.geist(12, .medium, relativeTo: .caption))
+                    .foregroundStyle(.white.opacity(0.9))
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 8)
+            // interactive: the badge IS the tap target, so the glass reacts to press.
+            .glassBackground(Capsule(), interactive: true)
+            .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .environment(\.colorScheme, .dark) // reads over any frame, like the resize overlay
+        .accessibilityLabel("Microphone muted")
+        .accessibilityHint("Unmutes the microphone")
+    }
+}
+#endif
 
 #if os(iOS)
 /// Device display geometry the overlay needs but UIKit doesn't expose publicly.

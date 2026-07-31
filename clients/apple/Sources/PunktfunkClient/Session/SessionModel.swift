@@ -1,6 +1,9 @@
 // Session state for the app shell: owns the connection, the input capture, the trust
 // handshake phase, and the pump-thread → main-actor stats relay.
 
+// AVFoundation: AVCaptureDevice.authorizationStatus (the mic TCC grant behind `micAvailable`)
+// and, on tvOS, AVPlayer.eligibleForHDRPlayback (the TV-capability HDR gate).
+import AVFoundation
 import Foundation
 import os
 import PunktfunkKit
@@ -10,9 +13,6 @@ import SwiftUI
     import AppKit
 #elseif canImport(UIKit)
     import UIKit
-#endif
-#if os(tvOS)
-    import AVFoundation // AVPlayer.eligibleForHDRPlayback — the TV-capability HDR gate
 #endif
 
 /// 1 Hz latency-stage line mirrored to the unified log so the stages can be read WITHOUT the
@@ -137,6 +137,14 @@ final class SessionModel: ObservableObject {
     /// Mirrors StreamView's capture state (it owns the input capture; this drives the
     /// HUD's "click to capture" / "⌘⎋ releases" hint).
     @Published var mouseCaptured = false
+    /// The USER's in-stream mic mute (the HUD button, the Stream menu's ⌃⌥⇧A, the captured-state
+    /// chord, the iOS mic disc) — session state, deliberately NOT persisted: a mute is for the
+    /// people in the room right now, so every new session starts live if the mic is on at all.
+    /// One of the two inputs to the effective mute; `isBackgrounded` is the other, and
+    /// `applyMicMute` composes them — a user mute survives a trip through the background, and the
+    /// background's privacy mute never clears the user's choice. Local and instant: it gates
+    /// capture on this device, nothing is sent to the host.
+    @Published private(set) var micMuted = false
     /// Resize overlay (design/midstream-resolution-resize.md — client resize UX): true from the
     /// instant a Match-window resize starts steering toward a new size until a frame at that size
     /// decodes (or a safety timeout). Drives the blur+spinner so the unavoidable host-rebuild delay
@@ -440,7 +448,7 @@ final class SessionModel: ObservableObject {
         guard phase == .streaming, let conn = connection, !isBackgrounded else { return }
         isBackgrounded = true
         conn.setVideoDropped(true)
-        audio?.setMicMuted(true)
+        applyMicMute() // now muted for privacy — on top of the user's own mute, not instead of it
         // Non-deliberate on fire (keep the host linger) so a user who returns late reconnects fast,
         // exactly like today's network-drop path. min 1 minute guards a nonsense setting.
         let minutes = max(1, timeoutMinutes)
@@ -465,11 +473,55 @@ final class SessionModel: ObservableObject {
         backgroundDeadline = nil
         backgroundTimer?.cancel()
         backgroundTimer = nil
-        audio?.setMicMuted(false)
+        applyMicMute() // back to the user's own choice — which may well still be "muted"
         if let conn = connection {
             conn.setVideoDropped(false)
             conn.requestKeyframe()
         }
+    }
+
+    // MARK: - Microphone mute (in-stream, per session)
+
+    /// Whether this session has a mic uplink there is any point in muting: the mic must be on in
+    /// the session's RESOLVED settings (a profile can turn it on or off), the platform must have
+    /// an app-accessible input at all, and the OS must not have refused us one. Drives whether the
+    /// mute control is offered — a live-looking mute button over a session that sends no
+    /// microphone would be a lie. Same three conditions `SessionAudio` starts an uplink on
+    /// (`.notDetermined` counts: the prompt is pending and a grant starts the uplink mid-session).
+    var micAvailable: Bool {
+        #if os(tvOS)
+        return false // no app-accessible microphone — SessionAudio never opens an uplink either
+        #else
+        guard settings.micEnabled else { return false }
+        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+        case .authorized, .notDetermined: return true
+        default: return false // denied / restricted — there is no uplink to mute
+        }
+        #endif
+    }
+
+    /// Flip the user's mute. The in-stream surfaces (HUD button, Stream menu, ⌃⌥⇧A while
+    /// captured, the iOS mic disc) all land here.
+    func toggleMicMute() {
+        setMicMuted(!micMuted)
+    }
+
+    /// Set the user's mute directly (the badge's tap-to-unmute). Ignored when the session has no
+    /// microphone, so a stale surface can't leave a phantom "muted" badge over a session that was
+    /// never sending anything.
+    func setMicMuted(_ muted: Bool) {
+        guard micAvailable, micMuted != muted else { return }
+        micMuted = muted
+        applyMicMute()
+    }
+
+    /// Push the EFFECTIVE mute — the user's choice OR the background keep-alive's privacy mute —
+    /// onto the audio engine. The two reasons are composed here and nowhere else: whichever one
+    /// changed, the other still holds, so returning from the background can't un-mute a user who
+    /// muted mid-stream, and a user unmuting while backgrounded (Live Activity, another window)
+    /// doesn't open the mic behind their back.
+    private func applyMicMute() {
+        audio?.setMicMuted(micMuted || isBackgrounded)
     }
 
     /// Follow a live stats-overlay cycle (⌃⌥⇧S, the three-finger tap, the Stream menu). Those
@@ -509,6 +561,9 @@ final class SessionModel: ObservableObject {
         backgroundTimer = nil
         isBackgrounded = false
         backgroundDeadline = nil
+        // The mic mute is per-session and never persisted: the next stream starts live (if the
+        // mic is enabled), rather than silently carrying a mute nobody remembers making.
+        micMuted = false
         let audio = self.audio
         self.audio = nil
         // Gamepad capture is main-actor (releases held buttons on the wire while the

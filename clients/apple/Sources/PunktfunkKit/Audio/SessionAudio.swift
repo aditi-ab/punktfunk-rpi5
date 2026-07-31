@@ -51,6 +51,12 @@ public final class SessionAudio {
     /// `playbackEngine`/`captureEngine` stay nil while this is set.
     private var combinedEngine: AVAudioEngine?
     private var drainStarted = false
+    /// The mute LATCH: the effective mute the owner last asked for (see `setMicMuted`). Held
+    /// because the uplink engine can appear LATER than the request — the mic permission prompt
+    /// is answered at the user's leisure, and the engine is built on the grant — so a mute set
+    /// in the meantime must be waiting for it. Applied by whichever start path wins the race.
+    /// Guarded by `stateLock`, like the engines it applies to.
+    private var micMuted = false
     /// The playback jitter ring — created by whichever engine starts playback first and KEPT
     /// across an engine rebuild (the permission-grant upgrade in `startEngines` swaps engines,
     /// not the ring, so the drain thread never has to be re-pointed). Main-thread confined,
@@ -259,19 +265,34 @@ public final class SessionAudio {
         }
     }
 
-    /// Background keep-alive: silence the mic uplink while backgrounded (privacy — no room audio
-    /// leaves the device) and restore it on return. Two-engine sessions pause/resume the capture
-    /// engine; a combined session instead mutes the voice processor's input (playback shares that
-    /// engine and must keep running, so the engine itself never pauses — the mute zeroes the mic
-    /// at the IO unit, and the tap encodes silence). A no-op when there's no uplink (playback-only
-    /// / tvOS / mic disabled). The audio SESSION stays active for background playback, so iOS may
-    /// keep showing the recording indicator until a full reconfigure — either path stops room
-    /// audio leaving the device, which is the privacy-relevant part. Main thread.
+    /// Silence the mic uplink (no room audio leaves the device) or restore it. THE one muting
+    /// mechanism: the owner composes its reasons — the user's in-stream mute and the background
+    /// keep-alive's privacy mute — into one effective state and passes that here, so neither can
+    /// clear the other (see `SessionModel.applyMicMute`).
+    ///
+    /// Two-engine sessions pause/resume the capture engine; a combined session instead mutes the
+    /// voice processor's input (playback shares that engine and must keep running, so the engine
+    /// itself never pauses — the mute zeroes the mic at the IO unit, and the tap encodes silence).
+    /// Local and instant either way: nothing is negotiated with the host, and the packets that do
+    /// leave carry silence. A no-op when there's no uplink (playback-only / tvOS / mic disabled),
+    /// except that the state is LATCHED for an uplink that starts later. The audio SESSION stays
+    /// active for background playback, so iOS may keep showing the recording indicator until a
+    /// full reconfigure — either path stops room audio leaving the device, which is the
+    /// privacy-relevant part. Main thread.
     public func setMicMuted(_ muted: Bool) {
         stateLock.lock()
+        micMuted = muted
         let capture = captureEngine
         let combined = combinedEngine
         stateLock.unlock()
+        apply(micMuted: muted, capture: capture, combined: combined)
+    }
+
+    /// Push the latched mute onto whichever engine carries the uplink. Split out from
+    /// `setMicMuted` because the start paths call it too, with the engine they just started —
+    /// that's how a mute requested before the permission grant lands on the engine the grant
+    /// creates. Never resumes a stopped session's engine.
+    private func apply(micMuted muted: Bool, capture: AVAudioEngine?, combined: AVAudioEngine?) {
         if let combined {
             combined.inputNode.isVoiceProcessingInputMuted = muted
             return
@@ -473,7 +494,9 @@ public final class SessionAudio {
             return
         }
         combinedEngine = engine
+        let muted = micMuted // latched before this engine existed (a mute during the prompt)
         stateLock.unlock()
+        apply(micMuted: muted, capture: nil, combined: engine)
         startDrain(into: ring)
         log.info("audio engines joined — voice processing (echo cancellation) active")
     }
@@ -517,7 +540,9 @@ public final class SessionAudio {
             return
         }
         captureEngine = engine
+        let muted = micMuted // latched before this engine existed (a mute during the prompt)
         stateLock.unlock()
+        apply(micMuted: muted, capture: engine, combined: nil)
         log.info("mic uplink started (\(micUID.isEmpty ? "default input" : micUID))")
     }
 
