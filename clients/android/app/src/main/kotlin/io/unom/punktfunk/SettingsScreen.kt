@@ -673,12 +673,22 @@ private fun DisplaySettings(s: Settings, update: (Settings) -> Unit, context: an
         // Only codecs this device can actually decode are offered — a preference the client never
         // advertises would be a dead setting (see [codecOptionsFor]).
         val av1Capable = remember { VideoDecoders.pickDecoder("video/av01") != null }
+        // Mirror the Automatic AV1 rule in HostConnect (hardware AV1 AND no partial-frame
+        // support) so the picker says what "Automatic" actually does on THIS device.
+        val autoPrefersAv1 = remember {
+            VideoDecoders.decodableCodecBits() and 4 != 0 && !VideoDecoders.partialFrameCapable()
+        }
         SettingDropdown(
             label = "Video codec",
             options = codecOptionsFor(s.codec, av1Capable),
             selected = s.codec,
             field = "codec",
-            caption = "A preference — the host falls back if it can't encode this one.",
+            caption = if (autoPrefersAv1) {
+                "A preference — the host falls back if it can't encode this one. " +
+                    "Automatic prefers AV1 on this device."
+            } else {
+                "A preference — the host falls back if it can't encode this one."
+            },
         ) { c -> update(s.copy(codec = c)) }
 
         // HDR is only meaningful on a panel that can present HDR10; on an SDR display the toggle is
