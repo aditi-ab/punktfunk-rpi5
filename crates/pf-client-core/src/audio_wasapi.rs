@@ -233,13 +233,23 @@ pub struct MicStreamer {
 }
 
 impl MicStreamer {
-    pub fn spawn(connector: Arc<NativeClient>) -> Result<MicStreamer> {
+    /// `muted` is the in-stream mute (B4), shared live with the capture loop: set, the loop
+    /// keeps reading the endpoint and discarding whole frames but sends nothing. Muting by
+    /// STOPPING the client was rejected — an `IAudioClient` stop/start re-primes the endpoint
+    /// buffers and re-runs the category negotiation below on every unmute.
+    ///
+    /// `echo_cancel` is the Settings toggle; `PUNKTFUNK_NO_AEC=1` overrides it off.
+    pub fn spawn(
+        connector: Arc<NativeClient>,
+        muted: Arc<AtomicBool>,
+        echo_cancel: bool,
+    ) -> Result<MicStreamer> {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_t = stop.clone();
         let thread = std::thread::Builder::new()
             .name("punktfunk-mic".into())
             .spawn(move || {
-                if let Err(e) = mic_thread(&connector, stop_t) {
+                if let Err(e) = mic_thread(&connector, stop_t, muted, echo_cancel) {
                     tracing::warn!(error = %format!("{e:#}"), "mic uplink thread ended");
                 }
             })
@@ -260,7 +270,21 @@ impl Drop for MicStreamer {
     }
 }
 
-fn mic_thread(connector: &Arc<NativeClient>, stop: Arc<AtomicBool>) -> Result<()> {
+/// Whether the mic echo-cancellation hooks run this session: the `echo_cancel` setting, with
+/// `PUNKTFUNK_NO_AEC=1` as a one-way override OFF. The env var wins — it is the escape hatch
+/// for a box whose canceller misbehaves, and it predates the setting; nothing turns AEC back
+/// on once it is set. Here the hook is the Communications stream category below; the PipeWire
+/// twin gates its echo-cancelled-source preference the same way.
+fn aec_enabled(echo_cancel: bool) -> bool {
+    echo_cancel && !std::env::var("PUNKTFUNK_NO_AEC").is_ok_and(|v| !v.is_empty() && v != "0")
+}
+
+fn mic_thread(
+    connector: &Arc<NativeClient>,
+    stop: Arc<AtomicBool>,
+    muted: Arc<AtomicBool>,
+    echo_cancel: bool,
+) -> Result<()> {
     wasapi::initialize_mta()
         .ok()
         .context("CoInitializeEx (MTA)")?;
@@ -289,8 +313,9 @@ fn mic_thread(connector: &Arc<NativeClient>, stop: Arc<AtomicBool>) -> Result<()
     // this box fed straight back into the host's virtual mic. Must precede Initialize
     // (SetClientProperties is a pre-init call; the wasapi crate QIs IAudioClient2 inside).
     // Best-effort: an endpoint without IAudioClient2 just keeps the default category.
-    // PUNKTFUNK_NO_AEC=1 opts out (same lever as the Linux echo-cancel-source preference).
-    if !std::env::var("PUNKTFUNK_NO_AEC").is_ok_and(|v| !v.is_empty() && v != "0") {
+    // The "Echo cancellation" setting opts out, and PUNKTFUNK_NO_AEC=1 overrides that off
+    // (same lever as the Linux echo-cancel-source preference) — see `aec_enabled`.
+    if aec_enabled(echo_cancel) {
         if let Err(e) = audio_client.set_properties(
             AudioClientProperties::new().set_category(StreamCategory::Communications),
         ) {
@@ -348,6 +373,16 @@ fn mic_thread(connector: &Arc<NativeClient>, stop: Arc<AtomicBool>) -> Result<()
             let l = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
             let r = f32::from_le_bytes([c[4], c[5], c[6], c[7]]);
             ring.push_back((l + r) * 0.5);
+        }
+        // Muted (B4): the capture client stays started and keeps its primed buffers — only
+        // the sending stops. Whole frames are discarded so the ring can't grow, and `seq`
+        // deliberately does NOT advance: the host sees one continuous sequence with a silent
+        // pause in the middle rather than a gap the size of the mute, which its de-jitter
+        // would try to conceal frame by frame.
+        if muted.load(Ordering::Relaxed) {
+            let drop_n = (ring.len() / MIC_FRAME) * MIC_FRAME;
+            ring.drain(..drop_n);
+            continue;
         }
         // Ship every complete 10 ms mono frame.
         while ring.len() >= MIC_FRAME {

@@ -607,6 +607,9 @@ fn commit_profile(active: &StreamProfile, touched: &Touched, values: &Settings) 
     if touched.has("mic_enabled") {
         o.mic_enabled = Some(values.mic_enabled);
     }
+    if touched.has("echo_cancel") {
+        o.echo_cancel = Some(values.echo_cancel);
+    }
     if touched.has("touch_mode") {
         o.touch_mode = Some(values.touch_mode.clone());
     }
@@ -1301,7 +1304,11 @@ pub fn show_scoped(
     );
     let mic_row = adw::SwitchRow::builder()
         .title("Stream microphone")
-        .subtitle("Sends your microphone to the host's virtual mic")
+        .subtitle("Sends your microphone to the host's virtual mic — Ctrl+Alt+Shift+V mutes it mid-stream")
+        .build();
+    let echo_row = adw::SwitchRow::builder()
+        .title("Echo cancellation")
+        .subtitle("Keeps the host's audio, playing from this machine's speakers, out of the uplink")
         .build();
     // Endpoint pickers (from the PipeWire probe): visible labels are descriptions, the
     // stored value is the node name. Hidden when the probe found nothing; a saved
@@ -1345,9 +1352,20 @@ pub fn show_scoped(
         "Microphone",
         "The input that feeds the host's virtual mic",
     );
-    // The device pick only matters while the mic streams at all.
+    // The device pick and the echo canceller only matter while the mic streams at all — both
+    // follow it. One handler each (the pickers are optional, the echo row never is), and the
+    // initial state is set here because the seed block further down fires these too.
+    //
+    // Insensitivity covers the whole row, including the per-row Reset a profile scope adds:
+    // an echo_cancel override can only be reset while the mic row is on. Turn it on, reset,
+    // turn it back off — the alternative is a control that looks live and isn't.
     if let Some(r) = &micdev_row {
         let w = r.widget().clone();
+        w.set_sensitive(mic_row.is_active());
+        mic_row.connect_active_notify(move |m| w.set_sensitive(m.is_active()));
+    }
+    {
+        let w = echo_row.clone();
         w.set_sensitive(mic_row.is_active());
         mic_row.connect_active_notify(move |m| w.set_sensitive(m.is_active()));
     }
@@ -1453,6 +1471,7 @@ pub fn show_scoped(
         inhibit_row.set_active(s.inhibit_shortcuts);
         invert_row.set_active(s.invert_scroll);
         mic_row.set_active(s.mic_enabled);
+        echo_row.set_active(s.echo_cancel);
         hdr_row.set_active(s.hdr_enabled);
         chroma_row.set_active(s.enable_444);
         library_row.set_active(s.library_enabled);
@@ -1673,6 +1692,12 @@ pub fn show_scoped(
             invert_scroll
         );
         toggle!(mic_row, "mic_enabled", o.mic_enabled.is_some(), mic_enabled);
+        toggle!(
+            echo_row,
+            "echo_cancel",
+            o.echo_cancel.is_some(),
+            echo_cancel
+        );
         {
             let revert = {
                 let (row, globals, touched) =
@@ -1781,6 +1806,7 @@ pub fn show_scoped(
         audio_group.add(r.widget());
     }
     audio_group.add(&mic_row);
+    audio_group.add(&echo_row);
     if let (Some(r), false) = (&micdev_row, profile_mode) {
         audio_group.add(r.widget());
     }
@@ -1890,6 +1916,7 @@ pub fn show_scoped(
             s.inhibit_shortcuts = inhibit_row.is_active();
             s.invert_scroll = invert_row.is_active();
             s.mic_enabled = mic_row.is_active();
+            s.echo_cancel = echo_row.is_active();
             s.hdr_enabled = hdr_row.is_active();
             s.enable_444 = chroma_row.is_active();
             s.audio_channels = match surround_row.selected() {

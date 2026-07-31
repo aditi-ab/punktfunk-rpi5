@@ -14,9 +14,15 @@ phone, tablet or laptop without headphones — its microphone picks that sound b
 it to the host along with your voice. Everyone in your voice chat hears the game twice, and you
 hear yourself whenever anything routes the mic back.
 
-**Fix: use headphones on the device you're streaming on.** Newer clients cancel this
-automatically (acoustic echo cancellation is rolling out per platform); headphones are the
-reliable fix everywhere today.
+**Fix: use headphones on the device you're streaming on.** Clients also try to cancel it for
+you: **Echo cancellation** in [client settings](/docs/client-settings#audio) is on by default on
+Linux, Windows, the console home, the Apple apps and Android, and hands the microphone to the
+system's own canceller. How much it removes depends on the device — a laptop with a good array
+mic can clear it entirely, a cheap USB mic next to a speaker can't — so headphones remain the
+reliable fix everywhere.
+
+If you just need to stop talking for a moment, **Ctrl+Alt+Shift+V** mutes the microphone without
+leaving the stream; see [Input](/docs/input#getting-your-input-back).
 
 ## "Listen to this device" and app monitoring (Windows hosts)
 

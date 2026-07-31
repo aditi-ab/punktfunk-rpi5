@@ -41,6 +41,9 @@ pub struct SessionParams {
     pub display_hdr: Option<punktfunk_core::quic::HdrMeta>,
     /// Stream the default microphone to the host's virtual mic source.
     pub mic_enabled: bool,
+    /// Run the uplink through the platform's echo cancellation ([`Settings::echo_cancel`]).
+    /// Ignored when `mic_enabled` is false; `PUNKTFUNK_NO_AEC=1` overrides it off.
+    pub echo_cancel: bool,
     /// Share the clipboard with this host (the per-host `KnownHost::clipboard_sync`). The
     /// bridge additionally needs the host to advertise `HOST_CAP_CLIPBOARD`.
     pub clipboard: bool,
@@ -123,8 +126,9 @@ pub struct Stats {
     pub lost_pct: f32,
     /// Mic uplink frames this window: handed to the QUIC datagram send, and shed anywhere
     /// client-side (queue-full at the producer + the pump's stale-oldest backlog governor —
-    /// see [`NativeClient::mic_stats`]). Both stay 0 while the mic is off, so the OSD
-    /// renders the mic line only when the uplink is live.
+    /// see [`NativeClient::mic_stats`]). Both stay 0 while the mic is off OR muted (a mute
+    /// stops the sending, not the capture), so the OSD renders the mic line only while voice
+    /// is actually going out — the muted case has its own badge, which does not need stats on.
     pub mic_sent: u32,
     pub mic_dropped: u32,
     /// The decode path frames actually took this window (`"vaapi"`/`"software"`, empty
@@ -166,10 +170,61 @@ pub enum SessionEvent {
     Stats(Stats),
 }
 
+/// The in-stream microphone mute (B4), shared between the embedder's toggle (a keyboard chord
+/// in the presenter) and the capture callback that reads it every quantum.
+///
+/// Two flags, not one, so the indicator can never lie: `live` is raised by the pump only once
+/// the uplink is actually running, so a session whose mic is off in Settings — or whose capture
+/// device failed to open — reports "no mic here" and the chord is a documented no-op instead of
+/// silently latching a mute nothing implements. Per session by design: the mute is a moment
+/// ("don't send the doorbell"), not a preference, so it is never persisted and every new
+/// session starts unmuted.
+#[derive(Clone, Default)]
+pub struct MicControl {
+    muted: Arc<AtomicBool>,
+    live: Arc<AtomicBool>,
+}
+
+impl MicControl {
+    /// True when this session has a running uplink to mute at all.
+    pub fn live(&self) -> bool {
+        self.live.load(Ordering::Relaxed)
+    }
+
+    /// True when the user has muted a uplink that exists — what the OSD indicator draws.
+    pub fn muted(&self) -> bool {
+        self.live() && self.muted.load(Ordering::Relaxed)
+    }
+
+    /// Flip the mute. `Some(now_muted)` when it applied, `None` when this session has no
+    /// uplink (the caller says so rather than pretending something happened).
+    pub fn toggle(&self) -> Option<bool> {
+        if !self.live() {
+            return None;
+        }
+        let next = !self.muted.load(Ordering::Relaxed);
+        self.muted.store(next, Ordering::Relaxed);
+        Some(next)
+    }
+
+    /// The capture side's handle on the flag (the streamer reads it per quantum).
+    fn flag(&self) -> Arc<AtomicBool> {
+        self.muted.clone()
+    }
+
+    /// The pump's report that the uplink came up (or went away).
+    fn set_live(&self, live: bool) {
+        self.live.store(live, Ordering::Relaxed);
+    }
+}
+
 pub struct SessionHandle {
     pub events: async_channel::Receiver<SessionEvent>,
     pub frames: async_channel::Receiver<DecodedFrame>,
     pub stop: Arc<AtomicBool>,
+    /// The in-stream mic mute. Inert (`live()` false) until the pump has the uplink running,
+    /// and for the whole session when the mic is off in Settings.
+    pub mic: MicControl,
     /// The pump thread. A Vulkan-Video pump SUBMITS to the shared device's decode
     /// queue — the presenter must join this before any `vkDeviceWaitIdle`/teardown
     /// (external-sync rule over every device queue).
@@ -182,14 +237,17 @@ pub fn start(params: SessionParams) -> SessionHandle {
     let (frame_tx, frame_rx) = async_channel::bounded(2);
     let stop = Arc::new(AtomicBool::new(false));
     let stop_w = stop.clone();
+    let mic = MicControl::default();
+    let mic_w = mic.clone();
     let thread = std::thread::Builder::new()
         .name("punktfunk-session".into())
-        .spawn(move || pump(params, ev_tx, frame_tx, stop_w))
+        .spawn(move || pump(params, ev_tx, frame_tx, stop_w, mic_w))
         .expect("spawn session thread");
     SessionHandle {
         events: ev_rx,
         frames: frame_rx,
         stop,
+        mic,
         thread: Some(thread),
     }
 }
@@ -242,6 +300,7 @@ fn pump(
     ev_tx: async_channel::Sender<SessionEvent>,
     frame_tx: async_channel::Sender<DecodedFrame>,
     stop: Arc<AtomicBool>,
+    mic: MicControl,
 ) {
     // PUNKTFUNK_PREFER_PYROWAVE=1 — the Phase-2 lab opt-in for the wired-LAN wavelet codec
     // (a Settings toggle is the Phase-3 productization). Riding `preferred_codec` is exactly
@@ -385,14 +444,18 @@ fn pump(
                 .ok()
         })
         .flatten();
+    // The uplink, and with it the mute the embedder's chord drives. `set_live` is what makes
+    // the chord (and its indicator) real: a mic turned off in Settings, or a capture device
+    // that wouldn't open, leaves it false and the chord stays an honest no-op.
     let _mic = params
         .mic_enabled
         .then(|| {
-            audio::MicStreamer::spawn(connector.clone())
+            audio::MicStreamer::spawn(connector.clone(), mic.flag(), params.echo_cancel)
                 .map_err(|e| tracing::warn!(error = %e, "mic uplink disabled"))
                 .ok()
         })
         .flatten();
+    mic.set_live(_mic.is_some());
 
     // Live host↔client clock offset: loaded per frame (Relaxed) so mid-stream re-syncs (an NTP
     // step, drift) keep the capture-clock latency stats honest — never cached at session start.
@@ -863,6 +926,10 @@ fn pump(
         "session ended"
     );
     stop.store(true, Ordering::SeqCst);
+    // The uplink is about to be dropped with the rest of this frame — stop claiming a mute
+    // surface, so an embedder still holding the handle through its end path (browse mode
+    // returns to the console with it) can't draw a muted mic that no longer exists.
+    mic.set_live(false);
     if let Some(t) = audio_thread {
         let _ = t.join(); // exits within its 100 ms pull timeout once `stop` is set
     }
@@ -972,5 +1039,29 @@ mod tests {
         ] {
             assert!(parse_debug_reconfigure(bad).is_none(), "{bad:?} parsed");
         }
+    }
+
+    /// The mute is inert until the pump reports a live uplink — a session without a mic must
+    /// answer "nothing to mute" rather than latching a mute and drawing the indicator.
+    #[test]
+    fn mic_mute_is_a_no_op_without_an_uplink() {
+        let mic = MicControl::default();
+        assert!(!mic.live());
+        assert_eq!(mic.toggle(), None, "no uplink, nothing to toggle");
+        assert!(!mic.muted(), "and nothing to show");
+
+        mic.set_live(true);
+        assert_eq!(mic.toggle(), Some(true));
+        assert!(mic.muted());
+        // The capture side reads the same flag the toggle writes.
+        assert!(mic.flag().load(Ordering::Relaxed));
+        assert_eq!(mic.toggle(), Some(false));
+        assert!(!mic.muted());
+
+        // A mute that outlives its uplink stops being shown (session end clears `live`).
+        assert_eq!(mic.toggle(), Some(true));
+        mic.set_live(false);
+        assert!(!mic.muted());
+        assert_eq!(mic.toggle(), None);
     }
 }

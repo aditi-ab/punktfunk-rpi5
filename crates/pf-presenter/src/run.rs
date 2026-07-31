@@ -12,6 +12,9 @@
 //! overlay tier isn't Off (Ctrl+Alt+Shift+S cycles Off → Compact → Normal → Detailed;
 //! the stdout line always carries the full Detailed text so parsers see a stable
 //! shape). Logs go to stderr (the binary configures tracing so).
+//!
+//! In-stream chords all share the Ctrl+Alt+Shift prefix: Q release/engage, M mouse model,
+//! D disconnect, S stats tier, V microphone mute.
 
 use crate::input::{Capture, FingerPhase};
 use crate::overlay::{FrameCtx, Overlay, OverlayAction, OverlayFrame, SessionPhase};
@@ -672,6 +675,23 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         tracing::info!(tier = ?stats_verbosity, "chord: stats verbosity");
                         continue;
                     }
+                    // Mic mute (B4) — "V" for voice; M and S are taken. Per session and never
+                    // persisted: this is the doorbell/cough key, not a settings change. The
+                    // uplink keeps running while muted (see `MicStreamer::spawn`); only the
+                    // sending stops. A session streaming no mic says so instead of silently
+                    // swallowing the chord — the overlay would have nothing to show either.
+                    if chord && sc == Scancode::V {
+                        if let Some(st) = &stream {
+                            match st.handle.mic.toggle() {
+                                Some(muted) => tracing::info!(muted, "chord: microphone mute"),
+                                None => tracing::info!(
+                                    "chord: microphone mute — this session streams no \
+                                     microphone (turn it on in Settings)"
+                                ),
+                            }
+                        }
+                        continue;
+                    }
                     // F11 or Alt+Enter (some keyboards' Fn layer sends a media key for
                     // plain F11 — the Moonlight-standard alias always exists).
                     let alt_enter =
@@ -1199,6 +1219,10 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
             let resizing = stream
                 .as_ref()
                 .is_some_and(|st| st.connector.is_some() && st.resize_overlay.active());
+            // Read live from the session's control rather than mirrored into StreamState: the
+            // pump is what knows whether an uplink exists (it may have failed to open), and a
+            // mirrored copy would be the thing that goes stale at session end.
+            let mic_muted = stream.as_ref().is_some_and(|st| st.handle.mic.muted());
             let ctx = FrameCtx {
                 width: pw,
                 height: ph,
@@ -1208,6 +1232,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                 scale: overlay_scale(window.display_scale(), osd_scale_pref),
                 stats,
                 hint,
+                mic_muted,
                 resizing,
                 pad: pad.as_ref().map(|p| p.name.as_str()),
                 pad_pref: pad.as_ref().map(|p| p.pref),
@@ -2017,8 +2042,10 @@ fn stats_text(
     if s.lost > 0 {
         text.push_str(&format!("\nlost {} ({:.1}%)", s.lost, s.lost_pct));
     }
-    // The mic uplink line renders only while the mic is live (a healthy 10 ms-frame uplink
-    // reads ~100 f/s) and only in Detailed — drops here are the client shedding backlog.
+    // The mic uplink line renders only while voice is actually going out (a healthy 10 ms-frame
+    // uplink reads ~100 f/s) and only in Detailed — drops here are the client shedding backlog.
+    // A muted mic reads 0 and drops the line; the mute has its own always-on badge instead, so
+    // this stays a throughput readout rather than doubling as a mute indicator.
     if detailed && (s.mic_sent > 0 || s.mic_dropped > 0) {
         text.push_str(&format!("\nmic {} f/s", s.mic_sent));
         if s.mic_dropped > 0 {

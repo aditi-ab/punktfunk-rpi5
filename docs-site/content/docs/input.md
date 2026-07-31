@@ -21,9 +21,10 @@ window — see [Mouse modes](#mouse-modes) below.
 | **Ctrl+Alt+Shift+M** | Switch the mouse mode (capture ⇄ desktop) |
 | **Ctrl+Alt+Shift+D** | Disconnect |
 | **Ctrl+Alt+Shift+S** | Cycle the [stats overlay](/docs/stats) — off · compact · normal · detailed |
+| **Ctrl+Alt+Shift+V** | Mute or unmute your microphone |
 | **F11** or **Alt+Enter** | Toggle fullscreen |
 
-While input is released the session window prints the list over the stream:
+While input is released the session window prints the shortest list over the stream:
 
 ```text
 Click the stream to capture input · Ctrl+Alt+Shift+Q releases · Ctrl+Alt+Shift+M mouse mode ·
@@ -31,7 +32,25 @@ Ctrl+Alt+Shift+D disconnects · Ctrl+Alt+Shift+S stats
 ```
 
 With a controller in use the same hint names the controller chord instead of the mouse-mode and
-stats entries.
+stats entries. The full list is always available without a stream running — see below.
+
+### Muting your microphone
+
+**Ctrl+Alt+Shift+V** stops sending your microphone to the host, and pressing it again resumes.
+The uplink itself keeps running underneath, so unmuting is instant rather than a second of the
+device warming back up.
+
+While you are muted a **Microphone muted** badge sits in the top-right corner of the stream. It
+is deliberately separate from the [stats overlay](/docs/stats): it shows even with stats off,
+because "am I still muted?" is a question you ask ten minutes later.
+
+The mute lasts for that stream only — the next session starts unmuted, and nothing is written to
+your settings. If the stream isn't sending a microphone at all (**Stream microphone** off in
+[client settings](/docs/client-settings#audio)) the shortcut does nothing and no badge appears,
+rather than pretending to mute something.
+
+This is on the **Linux and Windows** clients. The Apple, Android and Decky clients have no mute
+shortcut yet; turn **Stream microphone** off in their settings instead.
 
 Alt-Tabbing away releases input on its own and takes it back when you return. A release you asked
 for with the chord stays released until you opt back in. Either way, keys and buttons you were
@@ -39,11 +58,13 @@ holding are released on the host, so nothing sticks down.
 
 You can look the shortcuts up again without a stream running: the Linux client has **Keyboard
 Shortcuts** in its main menu, and the Windows client has a **Shortcuts** screen reached from its
-host list.
+host list. Both list the microphone mute; the in-stream hint over the video doesn't, to keep it
+to one readable line.
 
 ### On the other clients
 
-- **macOS** honours the same four combos, written **⌃⌥⇧Q / M / D / S**. **⌘⎋** also toggles capture,
+- **macOS** honours the release, mouse-mode, disconnect and stats combos, written
+  **⌃⌥⇧Q / M / D / S** — but not the microphone mute. **⌘⎋** also toggles capture,
   **⌃⌘F** toggles fullscreen, and **⌃⌥⇧C** starts or stops [clipboard sharing](/docs/clipboard). The
   **Stream** menu lists them all except the mouse-mode combo, which works but has no menu item.
 - **iPhone and iPad** with a hardware keyboard: **⌃⌥⇧Q** releases input while it is captured, and

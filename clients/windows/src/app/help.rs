@@ -22,6 +22,10 @@ const STREAM_SHORTCUTS: &[(&str, &str)] = &[
         "Cycle the statistics overlay (off \u{00B7} compact \u{00B7} normal \u{00B7} detailed)",
     ),
     (
+        "Ctrl+Alt+Shift+V",
+        "Mute or unmute your microphone (only while the stream sends one)",
+    ),
+    (
         "LB+RB+Start+Back",
         "Controller: release input / leave fullscreen \u{2014} hold to disconnect",
     ),

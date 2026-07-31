@@ -62,6 +62,8 @@ pub struct SettingsOverlay {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mic_enabled: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub echo_cancel: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub touch_mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mouse_mode: Option<String>,
@@ -121,6 +123,9 @@ impl SettingsOverlay {
         }
         if let Some(v) = self.mic_enabled {
             s.mic_enabled = v;
+        }
+        if let Some(v) = self.echo_cancel {
+            s.echo_cancel = v;
         }
         if let Some(v) = &self.touch_mode {
             s.touch_mode = v.clone();
@@ -197,6 +202,9 @@ impl SettingsOverlay {
         if after.mic_enabled != before.mic_enabled {
             self.mic_enabled = Some(after.mic_enabled);
         }
+        if after.echo_cancel != before.echo_cancel {
+            self.echo_cancel = Some(after.echo_cancel);
+        }
         if after.touch_mode != before.touch_mode {
             self.touch_mode = Some(after.touch_mode.clone());
         }
@@ -243,6 +251,7 @@ impl SettingsOverlay {
             "compositor" => self.compositor = None,
             "audio_channels" => self.audio_channels = None,
             "mic_enabled" => self.mic_enabled = None,
+            "echo_cancel" => self.echo_cancel = None,
             "touch_mode" => self.touch_mode = None,
             "mouse_mode" => self.mouse_mode = None,
             "invert_scroll" => self.invert_scroll = None,
@@ -437,6 +446,7 @@ mod tests {
             compositor: Some("gamescope".into()),
             audio_channels: Some(6),
             mic_enabled: Some(true),
+            echo_cancel: Some(false),
             touch_mode: Some("pointer".into()),
             mouse_mode: Some("desktop".into()),
             invert_scroll: Some(true),
@@ -457,6 +467,7 @@ mod tests {
         assert_eq!(out.compositor, "gamescope");
         assert_eq!(out.audio_channels, 6);
         assert!(out.mic_enabled);
+        assert!(!out.echo_cancel);
         assert_eq!(out.touch_mode, "pointer");
         assert_eq!(out.mouse_mode, "desktop");
         assert!(out.invert_scroll);
@@ -527,6 +538,39 @@ mod tests {
         let mut o2 = o.clone();
         o2.absorb(&before, &before);
         assert_eq!(o2, o);
+    }
+
+    /// `echo_cancel` is a first-class overlay field, not an `extra` passenger: it applies,
+    /// absorbs, clears, and serialises under the `echo_cancel` key the Apple and Android
+    /// clients write — one catalog has to round-trip through all three.
+    #[test]
+    fn echo_cancel_is_a_first_class_override() {
+        let base = Settings::default();
+        assert!(base.echo_cancel, "the setting ships on");
+
+        let mut o = SettingsOverlay::default();
+        let before = o.apply(&base);
+        let mut after = before.clone();
+        after.echo_cancel = false;
+        o.absorb(&before, &after);
+        assert_eq!(o.echo_cancel, Some(false));
+        assert!(!o.apply(&base).echo_cancel);
+        assert!(
+            o.extra.is_empty(),
+            "modelled fields must never land in the passthrough"
+        );
+
+        // Serialised under the shared key, and read back from a foreign client's file.
+        let text = serde_json::to_string(&o).unwrap();
+        assert!(text.contains("\"echo_cancel\":false"), "{text}");
+        let from_apple: SettingsOverlay =
+            serde_json::from_str(r#"{"mic_enabled":true,"echo_cancel":false}"#).unwrap();
+        assert_eq!(from_apple.echo_cancel, Some(false));
+        assert!(from_apple.extra.is_empty());
+
+        assert!(o.clear("echo_cancel"));
+        assert_eq!(o.echo_cancel, None);
+        assert!(o.is_empty());
     }
 
     /// `clear` is the explicit way back to inheriting, including the resolution tri-state.

@@ -272,6 +272,7 @@ mod session_main {
             // compositors only).
             cursor_forward: settings.mouse_mode() == trust::MouseMode::Desktop,
             mic_enabled: settings.mic_enabled,
+            echo_cancel: settings.echo_cancel,
             clipboard,
             // The Settings preference (auto → VAAPI where it exists; the presenter
             // demotes to software on boxes whose Vulkan can't import the dmabufs).

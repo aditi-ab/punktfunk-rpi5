@@ -99,7 +99,20 @@ claims a sink advertising exactly that many channels, so applications produce re
 from a stereo endpoint is an upmix, not new channels. Offered everywhere except the Decky plugin.
 
 **Microphone** — *default: off on Linux, Windows, Android, the console home and Decky; on in the
-Apple app.* Sends this device's microphone to the host's virtual mic.
+Apple app.* Sends this device's microphone to the host's virtual mic. On Linux and Windows the
+row is spelled *Stream microphone*, and **Ctrl+Alt+Shift+V** mutes it mid-stream without ending
+anything — see [Muting your microphone](/docs/input#muting-your-microphone).
+
+**Echo cancellation** — *default: on.* Stops the host's audio, playing out of this device's
+speakers, from being picked up by the microphone and sent straight back. It hands the microphone
+to the system's own canceller rather than doing the work itself: on **Linux** that means capturing
+from an echo-cancelled PipeWire source when your desktop provides one, on **Windows** asking WASAPI
+for the Communications stream category so the endpoint's processing engages, and on **Apple** and
+**Android** the platform's voice-processing mode. Turn it off if your microphone already runs its
+own processing, or if the canceller makes your voice sound thin. The row sits under the microphone
+toggle and greys out while the microphone is off. Offered by the Linux, Windows, Apple, Android and
+console-home clients; Decky has no toggle. What it can and can't fix is in
+[Why do I hear myself](/docs/echo).
 
 **Speaker** and **Microphone** device pickers — *default: System default.* Which endpoint stream
 audio plays out of, and which input feeds the uplink. Only the Linux app (PipeWire nodes) and the

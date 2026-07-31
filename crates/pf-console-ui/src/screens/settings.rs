@@ -26,6 +26,7 @@ enum RowId {
     Hdr,
     Audio,
     Mic,
+    EchoCancel,
     Pad,
     PadType,
     Touch,
@@ -33,7 +34,7 @@ enum RowId {
     Stats,
 }
 
-const ROWS: [RowId; 14] = [
+const ROWS: [RowId; 15] = [
     RowId::Resolution,
     RowId::Refresh,
     RowId::Bitrate,
@@ -43,6 +44,7 @@ const ROWS: [RowId; 14] = [
     RowId::Hdr,
     RowId::Audio,
     RowId::Mic,
+    RowId::EchoCancel,
     RowId::Pad,
     RowId::PadType,
     RowId::Touch,
@@ -179,6 +181,9 @@ impl SettingsScreen {
 
 fn row_spec(id: RowId, ctx: &Ctx) -> RowSpec {
     let s = &ctx.settings;
+    // Echo cancellation only means anything while the mic streams — dimmed and inert while it
+    // doesn't, the same relationship the desktop shells draw with a greyed-out row.
+    let enabled = !matches!(id, RowId::EchoCancel) || s.mic_enabled;
     let (header, label, value): (Option<&'static str>, &str, String) = match id {
         RowId::Resolution => (
             Some("Stream"),
@@ -231,6 +236,7 @@ fn row_spec(id: RowId, ctx: &Ctx) -> RowSpec {
                 .into(),
         ),
         RowId::Mic => (None, "Microphone", on_off(s.mic_enabled).into()),
+        RowId::EchoCancel => (None, "Echo cancellation", on_off(s.echo_cancel).into()),
         RowId::Pad => (
             Some("Controller"),
             "Use controller",
@@ -264,10 +270,10 @@ fn row_spec(id: RowId, ctx: &Ctx) -> RowSpec {
         header,
         label: label.into(),
         value: Some(value),
-        value_dim: false,
+        value_dim: !enabled,
         caret: false,
-        adjustable: true,
-        enabled: true,
+        adjustable: enabled,
+        enabled,
     }
 }
 
@@ -288,7 +294,14 @@ fn detail(id: RowId) -> &'static str {
             "HDR10 — engages when the host sends HDR content and this display supports it."
         }
         RowId::Audio => "The speaker layout requested from the host.",
-        RowId::Mic => "Send this device's microphone to the host's virtual mic.",
+        RowId::Mic => {
+            "Send this device's microphone to the host's virtual mic. \
+             Ctrl+Alt+Shift+V mutes and unmutes it while streaming."
+        }
+        RowId::EchoCancel => {
+            "Stops the host's audio, playing from this device's speakers, being picked up \
+             and sent back. Turn it off if your microphone already runs its own processing."
+        }
         RowId::Pad => "Which pad is forwarded to the host, as player 1.",
         RowId::PadType => "The virtual pad the host creates — Automatic matches this controller.",
         RowId::Touch => {
@@ -361,6 +374,14 @@ fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
             step_option(cur, AUDIO.len(), delta, wrap).map(|i| s.audio_channels = AUDIO[i].0)
         }
         RowId::Mic => toggle(&mut s.mic_enabled, delta, wrap),
+        // Inert while the mic is off — a boundary thud, matching what the dimmed row shows.
+        RowId::EchoCancel => {
+            if s.mic_enabled {
+                toggle(&mut s.echo_cancel, delta, wrap)
+            } else {
+                None
+            }
+        }
         RowId::Pad => {
             // Automatic first, then every connected pad by stable key.
             let keys: Vec<String> = std::iter::once(String::new())
@@ -492,6 +513,40 @@ mod tests {
         assert!(ctx.settings.mic_enabled);
         assert!(adjust(RowId::Mic, 1, true, &mut ctx), "A always flips");
         assert!(!ctx.settings.mic_enabled);
+    }
+
+    /// Echo cancellation follows the microphone: inert and dimmed while the mic is off, live
+    /// the moment it goes on. A row that silently accepted a change nobody could act on would
+    /// be the same lie as an enabled-looking control.
+    #[test]
+    fn echo_cancellation_follows_the_microphone() {
+        let (mut settings, pads) = ctx_parts();
+        settings.mic_enabled = false;
+        assert!(settings.echo_cancel, "it ships on");
+        let library = crate::library::LibraryShared::default();
+        let mut ctx = Ctx {
+            hosts: &[],
+            library: &library,
+            settings: &mut settings,
+            pads: &pads,
+            deck: false,
+            device_name: "t",
+            t: 0.0,
+        };
+        assert!(!row_spec(RowId::EchoCancel, &ctx).enabled);
+        assert!(
+            !adjust(RowId::EchoCancel, -1, false, &mut ctx),
+            "mic off = thud"
+        );
+        assert!(!adjust(RowId::EchoCancel, 1, true, &mut ctx), "A too");
+        assert!(ctx.settings.echo_cancel, "and nothing was written");
+
+        ctx.settings.mic_enabled = true;
+        assert!(row_spec(RowId::EchoCancel, &ctx).enabled);
+        assert!(adjust(RowId::EchoCancel, -1, false, &mut ctx));
+        assert!(!ctx.settings.echo_cancel);
+        assert!(adjust(RowId::EchoCancel, 1, true, &mut ctx));
+        assert!(ctx.settings.echo_cancel);
     }
 
     #[test]

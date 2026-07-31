@@ -339,12 +339,22 @@ pub struct MicStreamer {
 }
 
 impl MicStreamer {
-    pub fn spawn(connector: Arc<NativeClient>) -> Result<MicStreamer> {
+    /// `muted` is the in-stream mute (B4), shared live with the capture callback: set, the
+    /// callback keeps pulling and discarding whole frames but sends nothing. Muting by
+    /// STOPPING the stream was rejected — it re-primes the device buffers and re-runs the
+    /// source selection below on every unmute, so the first second back is glitchy.
+    ///
+    /// `echo_cancel` is the Settings toggle; `PUNKTFUNK_NO_AEC=1` overrides it off.
+    pub fn spawn(
+        connector: Arc<NativeClient>,
+        muted: Arc<std::sync::atomic::AtomicBool>,
+        echo_cancel: bool,
+    ) -> Result<MicStreamer> {
         let (quit_tx, quit_rx) = pipewire::channel::channel::<Terminate>();
         let thread = std::thread::Builder::new()
             .name("punktfunk-mic".into())
             .spawn(move || {
-                if let Err(e) = mic_thread(&connector, quit_rx) {
+                if let Err(e) = mic_thread(&connector, quit_rx, muted, echo_cancel) {
                     tracing::warn!(error = %e, "mic uplink thread ended");
                 }
             })
@@ -373,12 +383,17 @@ struct MicData {
     encoder: opus::Encoder,
     seq: u32,
     out: Vec<u8>,
+    /// The in-stream mute (B4), flipped by the session's chord. Read per callback.
+    muted: Arc<std::sync::atomic::AtomicBool>,
 }
 
-/// `PUNKTFUNK_NO_AEC=1` — the opt-out for every mic echo-cancellation hook (here: the
-/// echo-cancelled-source preference; the WASAPI twin gates its Communications category on it).
-fn aec_disabled() -> bool {
-    std::env::var("PUNKTFUNK_NO_AEC").is_ok_and(|v| !v.is_empty() && v != "0")
+/// Whether the mic echo-cancellation hooks run this session: the `echo_cancel` setting, with
+/// `PUNKTFUNK_NO_AEC=1` as a one-way override OFF. The env var wins — it is the escape hatch
+/// for a box whose canceller misbehaves, and it predates the setting; nothing turns AEC back
+/// on once it is set. Here the hook is the echo-cancelled-source preference below; the WASAPI
+/// twin gates its Communications stream category the same way.
+fn aec_enabled(echo_cancel: bool) -> bool {
+    echo_cancel && !std::env::var("PUNKTFUNK_NO_AEC").is_ok_and(|v| !v.is_empty() && v != "0")
 }
 
 /// The capture stream's `target.object`, in preference order: the Settings microphone pick
@@ -390,19 +405,20 @@ fn aec_disabled() -> bool {
 /// Preference-only by design: loading `libpipewire-module-echo-cancel` ourselves needs
 /// `pw_context_load_module`, which the pipewire crate (0.9) doesn't expose safely — until it
 /// does, we only ever target processing the user (or their session) already set up.
-fn mic_capture_target() -> Option<String> {
+fn mic_capture_target(echo_cancel: bool) -> Option<String> {
     if let Ok(target) = std::env::var("PUNKTFUNK_AUDIO_SOURCE") {
         if !target.is_empty() {
             return Some(target);
         }
     }
-    if aec_disabled() {
+    if !aec_enabled(echo_cancel) {
         return None;
     }
     let name = echo_cancel_source()?;
     tracing::info!(
         source = %name,
-        "mic capture targets the echo-cancelled source (PUNKTFUNK_NO_AEC=1 to disable)"
+        "mic capture targets the echo-cancelled source (Echo cancellation off, or \
+         PUNKTFUNK_NO_AEC=1, disables this)"
     );
     Some(name)
 }
@@ -427,6 +443,8 @@ fn echo_cancel_source() -> Option<String> {
 fn mic_thread(
     connector: &Arc<NativeClient>,
     quit_rx: pipewire::channel::Receiver<Terminate>,
+    muted: Arc<std::sync::atomic::AtomicBool>,
+    echo_cancel: bool,
 ) -> Result<()> {
     use pipewire as pw;
     use pw::{properties::properties, spa};
@@ -468,7 +486,7 @@ fn mic_thread(
         // sat ahead of the encoder as latency (the playback stream always asked for 5 ms).
         *pw::keys::NODE_LATENCY     => "480/48000",
     };
-    if let Some(target) = mic_capture_target() {
+    if let Some(target) = mic_capture_target(echo_cancel) {
         // Raw key: the `keys::TARGET_OBJECT` constant is feature-gated on a newer
         // libpipewire than we require; the wire name is stable.
         props.insert("target.object", target);
@@ -482,6 +500,7 @@ fn mic_thread(
         encoder,
         seq: 0,
         out: vec![0u8; 4000],
+        muted,
     };
 
     let _listener = stream
@@ -505,6 +524,17 @@ fn mic_thread(
                         ud.ring
                             .push_back(f32::from_le_bytes([s[0], s[1], s[2], s[3]]));
                     }
+                }
+                // Muted (B4): the stream stays open and the device keeps its primed buffers —
+                // only the sending stops. Whole frames are discarded so the ring can't grow,
+                // and `seq` deliberately does NOT advance: the host sees one continuous
+                // sequence with a silent pause in the middle rather than a gap the size of the
+                // mute, which its de-jitter would try to conceal frame by frame.
+                if ud.muted.load(std::sync::atomic::Ordering::Relaxed) {
+                    let whole =
+                        (ud.ring.len() / (MIC_FRAME * MIC_CHANNELS)) * (MIC_FRAME * MIC_CHANNELS);
+                    ud.ring.drain(..whole);
+                    return;
                 }
                 // Ship every complete 10 ms mono frame.
                 while ud.ring.len() >= MIC_FRAME * MIC_CHANNELS {

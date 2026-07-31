@@ -40,7 +40,7 @@ in-stream:
 | Android · iPhone | a **three-finger tap** |
 
 **Ctrl+Alt+Shift+S** is one of a small set of shortcuts a stream reserves; the others — release
-captured input, switch mouse mode, disconnect — are in
+captured input, switch mouse mode, disconnect, mute the microphone — are in
 [Getting your input back](/docs/input#getting-your-input-back).
 
 **Compact** is a one-line pill (fps · end-to-end ms · Mb/s, plus a loss flag when frames are being
