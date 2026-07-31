@@ -51,8 +51,11 @@ const tls =
 const server = Bun.serve({
 	port: process.env.NITRO_PORT || process.env.PORT || 3000,
 	host: process.env.NITRO_HOST || process.env.HOST,
+	// Bun defaults this to 10 s, which is SHORTER than the host's 15 s SSE keep-alive comment — so a
+	// proxied `/api/v1/events` stream (or any other quiet long-lived response) gets cut by us and
+	// reconnects on a loop. 120 s is comfortably above any keep-alive we forward; still overridable.
 	idleTimeout:
-		Number.parseInt(process.env.NITRO_BUN_IDLE_TIMEOUT, 10) || undefined,
+		Number.parseInt(process.env.NITRO_BUN_IDLE_TIMEOUT, 10) || 120,
 	// `tls: undefined` ⇒ plain HTTP (dev); otherwise HTTPS over HTTP/1.1.
 	tls,
 	websocket: import.meta._websocket ? ws.websocket : undefined,

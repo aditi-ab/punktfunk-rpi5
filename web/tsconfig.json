@@ -20,5 +20,12 @@
 			"@/*": ["./src/*"]
 		}
 	},
-	"include": ["src", "server", "vite.config.ts", "orval.config.ts"]
+	"include": [
+		"src",
+		"server",
+		".storybook",
+		"vite.config.ts",
+		"vite.storybook.config.ts",
+		"orval.config.ts"
+	]
 }
