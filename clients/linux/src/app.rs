@@ -417,15 +417,11 @@ impl SimpleComponent for AppModel {
                 self.hosts.emit(HostsMsg::ClearError);
                 self.hosts
                     .emit(HostsMsg::SetConnecting(Some(req.card_key())));
-                let fullscreen = self.settings.borrow().fullscreen_on_stream;
-                if let Err(e) = spawn::spawn_session(
-                    sender.input_sender().clone(),
-                    req,
-                    fp_hex,
-                    tofu,
-                    fullscreen,
-                    opts,
-                ) {
+                // No settings ride along: the spawner resolves this host's effective ones
+                // (globals + its profile) for both the argv and the child's spec.
+                if let Err(e) =
+                    spawn::spawn_session(sender.input_sender().clone(), req, fp_hex, tofu, opts)
+                {
                     self.busy = false;
                     self.hosts.emit(HostsMsg::SetConnecting(None));
                     self.hosts.emit(HostsMsg::ShowError(e));

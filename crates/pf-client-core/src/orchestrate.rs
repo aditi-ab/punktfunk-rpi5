@@ -110,6 +110,48 @@ impl ConnectPlan {
         }
     }
 
+    /// The plan for a host a front-end carries in its OWN request type rather than as a stored
+    /// [`KnownHost`] (the GTK shell's `ConnectRequest`, a resolved link target). Settings,
+    /// profile and the clipboard decision are resolved here, through the same helpers
+    /// [`ConnectPlan::for_host`] uses; the caller then sets only what is genuinely its own
+    /// (`wake` when it runs its own wake fallback, `tofu`, `connect_timeout_secs`).
+    ///
+    /// It exists because hand-building the struct is a trap. [`spawn_session`] writes
+    /// `settings` into the child's `--resolved-spec`, and a session running from a spec reads
+    /// NO stores — so a `..Settings::default()` in a front-end does not fall back to the
+    /// user's settings, it silently streams at every default: the host's fallback bitrate, the
+    /// native resolution, `auto` codec, stereo audio. That shipped on the GTK shell (fixed
+    /// 2026-07-31) and presented as "my bitrate is stuck at 20 Mbps".
+    pub fn for_target(
+        host: HostTarget,
+        launch: Option<String>,
+        one_off_profile: Option<String>,
+    ) -> ConnectPlan {
+        let known = KnownHosts::load();
+        // No record yet — a first connect straight off an advert. A default record says
+        // exactly the right thing: no profile binding, no clipboard opt-in.
+        let fallback = KnownHost::default();
+        let stored = known
+            .hosts
+            .iter()
+            .find(|h| h.addr == host.addr && h.port == host.port)
+            .unwrap_or(&fallback);
+        let mut plan = ConnectPlan::resolve(
+            stored,
+            launch.as_deref(),
+            one_off_profile.as_deref(),
+            &ProfilesFile::load(),
+            &Settings::load(),
+        );
+        // The CALLER's target wins over the stored record's: its fingerprint can be one the
+        // host just advertised and we haven't persisted (trust on first use), and its name/MAC
+        // come from the same discovery snapshot the card was drawn from — so `wake` has to be
+        // re-decided against that MAC rather than the record's.
+        plan.wake = plan.settings.auto_wake && !host.mac.is_empty();
+        plan.host = host;
+        plan
+    }
+
     /// The same plan, built from stores the caller already has — no disk, no clock, no
     /// environment. This is the form the URL router uses: a front-end loads the three stores
     /// once per event and every decision below is a pure function of them.
@@ -492,8 +534,16 @@ impl ResolvedSpec {
     /// than a pipe because the session already takes a file path elsewhere and a crashed
     /// spawner leaves something inspectable; the name carries the pid so concurrent launches
     /// (a shell and a CLI, or two Decky invocations) never overwrite each other's spec.
+    ///
+    /// The pid alone was not enough: it is the SPAWNER's, so two launches from one shell — a
+    /// cancelled connect and the retry right behind it — shared a single path, and the first
+    /// child's exit deleted the file the second was still starting up to read ("resolved spec:
+    /// No such file"). A per-launch counter separates them.
     pub fn write_temp(&self) -> std::io::Result<std::path::PathBuf> {
-        let path = std::env::temp_dir().join(format!("punktfunk-spec-{}.json", std::process::id()));
+        static LAUNCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = LAUNCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("punktfunk-spec-{}-{n}.json", std::process::id()));
         let json = serde_json::to_vec_pretty(self)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         std::fs::write(&path, json)?;

@@ -193,7 +193,7 @@ mod session_main {
             } else {
                 settings.width
             },
-            height: if settings.width == 0 {
+            height: if settings.height == 0 {
                 native.height
             } else {
                 settings.height
@@ -245,9 +245,20 @@ mod session_main {
             // slice NALs, so the host may keep its multi-slice low-latency default (§7 LN1).
             // The mobile/TV embedders must NOT copy this blindly — Amlogic MediaCodec wedges
             // on multi-slice AUs (see `VIDEO_CAP_MULTI_SLICE`), so they advertise per-decoder.
+            // 4:4:4 is opt-in and off by default (Settings "Full chroma"): the bit only says
+            // "upgrade me if you can" — the host still gates on its own policy, its capturer,
+            // HEVC, and a real GPU 4:4:4 encode probe, and answers the resolved chroma in the
+            // Welcome BEFORE we build a decoder. Advertised unconditionally when the user asks
+            // for it because every decode path here can produce it: the hardware ones where the
+            // driver decodes RExt, and swscale for the rest (the decoder demotes on its own).
             video_caps: punktfunk_core::quic::VIDEO_CAP_MULTI_SLICE
                 | if settings.hdr_enabled {
                     punktfunk_core::quic::VIDEO_CAP_10BIT | punktfunk_core::quic::VIDEO_CAP_HDR
+                } else {
+                    0
+                }
+                | if settings.enable_444 {
+                    punktfunk_core::quic::VIDEO_CAP_444
                 } else {
                     0
                 },

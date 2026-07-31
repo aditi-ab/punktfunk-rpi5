@@ -222,7 +222,16 @@ fn connect_spawn(
     *ctx.shared.session.lock().unwrap() = child.clone();
     ctx.shared.stats_line.lock().unwrap().clear();
     ctx.shared.browse.store(false, Ordering::SeqCst);
-    let fullscreen = ctx.settings.lock().unwrap().fullscreen_on_stream;
+    // Through the same resolver the session uses, not the raw globals: "Start streams
+    // fullscreen" is a profileable (tier-P) field, so a host bound to a windowed profile has to
+    // win here too — the child takes this decision from the argv, not from its own settings.
+    let fullscreen = pf_client_core::trust::effective_settings(
+        &target.addr,
+        target.port,
+        target.profile.as_deref(),
+    )
+    .0
+    .fullscreen_on_stream;
     set_status.call(String::new());
     set_screen.call(if opts.awaiting_approval {
         Screen::RequestAccess
