@@ -23,7 +23,9 @@
 	"include": [
 		"src",
 		"server",
-		".storybook",
+		// A BARE directory name that starts with a dot is silently skipped by tsc, so the
+		// previous `.storybook` entry typechecked nothing at all. The glob is what pulls it in.
+		".storybook/**/*",
 		"vite.config.ts",
 		"vite.storybook.config.ts",
 		"orval.config.ts"

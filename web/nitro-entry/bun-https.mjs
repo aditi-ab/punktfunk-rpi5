@@ -48,21 +48,32 @@ const tls =
 		? { cert: Bun.file(certPath), key: Bun.file(keyPath) }
 		: undefined;
 
-// Half-configured TLS is the dangerous shape: one path set and the other missing silently drops to
-// plain HTTP, and if PUNKTFUNK_UI_SECURE is also set the session cookie is marked Secure — which a
-// browser then refuses to store over http://, so login appears to succeed and every next request is
-// unauthenticated. Both failure modes are silent, so say something.
+// Half-configured TLS is not a warning, it is a refusal.
+//
+// Two silent failures hide here, and both end with the operator staring at a console that looks
+// fine. One path set and the other missing drops to plain HTTP — the login password then crosses
+// the LAN in the clear on a server the operator believes is TLS. And PUNKTFUNK_UI_SECURE without
+// TLS marks the session cookie Secure, which a browser refuses to store over http://, so login
+// "succeeds" and every request after it is unauthenticated, forever.
+//
+// Neither state can serve a working console, so exiting is strictly better than serving a broken
+// one: a supervisor logs the reason and the operator sees a stopped service instead of a subtly
+// wrong one.
+const secureFlag = /^(1|true)$/i.test(process.env.PUNKTFUNK_UI_SECURE ?? "");
 if (Boolean(certPath) !== Boolean(keyPath)) {
 	console.error(
 		`punktfunk web console: only ${certPath ? "PUNKTFUNK_UI_TLS_CERT" : "PUNKTFUNK_UI_TLS_KEY"} is set — ` +
-			"TLS needs BOTH. Serving plain HTTP.",
+			"TLS needs BOTH. Refusing to start rather than serve the login password in the clear.",
 	);
+	process.exit(1);
 }
-if (!tls && /^(1|true)$/i.test(process.env.PUNKTFUNK_UI_SECURE ?? "")) {
+if (!tls && secureFlag) {
 	console.error(
 		"punktfunk web console: PUNKTFUNK_UI_SECURE is set but TLS is not configured. The session " +
-			"cookie will be marked Secure and dropped by the browser over http:// — login will not stick.",
+			"cookie would be marked Secure and dropped by the browser over http://, so login could " +
+			"never stick. Refusing to start — set PUNKTFUNK_UI_TLS_CERT/_KEY, or unset PUNKTFUNK_UI_SECURE.",
 	);
+	process.exit(1);
 }
 
 const server = Bun.serve({

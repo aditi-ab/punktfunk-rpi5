@@ -32,11 +32,18 @@ export const SessionGameCard: FC = () => {
 	const q = useGetSessionSettings();
 	const save = useSetSessionSettings();
 	const server = q.data?.settings;
-	// Which axes this build acts on. Empty on a platform with no launch path (macOS), where the
-	// controls are shown disabled rather than hidden — "does nothing here" is information.
-	const enforced = q.data?.enforced ?? [];
-	const acts = (field: string) =>
-		enforced.length === 0 || enforced.includes(field);
+	// Which axes this build acts on. An EMPTY list means the build enforces nothing — the contract
+	// says so outright ("Empty on a platform with no launch path (macOS), so the console can say so
+	// instead of offering a switch that does nothing"), and this card's own comment promises the
+	// controls are "shown disabled rather than hidden".
+	//
+	// The old `enforced.length === 0 || …` read empty as "enforces EVERYTHING", so on exactly the
+	// platform the flag exists for, every control stayed live: clicking one PUT the setting and
+	// toasted success for an axis the host would never act on. Absent (an older host that never
+	// sent the field) still means "assume it acts" — that is the compatible reading, and it is a
+	// different case from present-and-empty.
+	const enforced = q.data?.enforced;
+	const acts = (field: string) => !enforced || enforced.includes(field);
 
 	// The grace field is free text while being typed, so it gets a local buffer; the other two axes
 	// are discrete and go straight to the host.
@@ -162,7 +169,10 @@ export const SessionGameCard: FC = () => {
 								</Field>
 							)}
 
-							{enforced.length === 0 && (
+							{/* Present-and-empty is the "this build acts on none of it" signal; ABSENT
+							    is an older host that never sent the field, where claiming inertness
+							    would be a guess. Same distinction `acts()` makes above. */}
+							{enforced?.length === 0 && (
 								<Badge variant="outline">{m.session_game_inert()}</Badge>
 							)}
 							{error && <p className="text-sm text-destructive">{error}</p>}

@@ -1,6 +1,6 @@
 import { useQueryClient } from "@tanstack/react-query";
 import { Info, KeyRound } from "lucide-react";
-import { type FC, useState } from "react";
+import { type FC, useEffect, useRef, useState } from "react";
 import { getListPairedClientsQueryKey } from "@/api/gen/clients/clients";
 import type { PairingStatus } from "@/api/gen/model/pairingStatus";
 import {
@@ -23,10 +23,24 @@ export const MoonlightPairingSection: FC = () => {
 	const pairing = useGetPairingStatus({ query: { refetchInterval: 2_000 } });
 	const submit = useSubmitPairingPin();
 
+	// Clear the previous attempt's outcome when a NEW pairing knock arrives.
+	//
+	// The mutation's success flag outlives the form — the section never unmounts, only the inner
+	// <form> is conditional — so the green "PIN sent" note was still on screen above an empty PIN
+	// box the next time Moonlight asked. Resetting inside `onSubmit` (the first attempt at this)
+	// does nothing: `mutate` moves the status to pending in the same update, so `isSuccess` was
+	// already about to go false. The transition that matters is `pin_pending` going false → true.
+	const pending = pairing.data?.pin_pending ?? false;
+	const wasPending = useRef(pending);
+	useEffect(() => {
+		if (pending && !wasPending.current) {
+			submit.reset();
+			setPin("");
+		}
+		wasPending.current = pending;
+	}, [pending, submit.reset]);
+
 	const onSubmit = () => {
-		// The mutation's success/error flags outlive the form: without this, starting a SECOND
-		// pairing attempt showed the previous one's "PIN sent" confirmation before a digit was typed.
-		submit.reset();
 		submit.mutate(
 			{ data: { pin } },
 			{

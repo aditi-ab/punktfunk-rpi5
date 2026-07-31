@@ -1,3 +1,55 @@
+/**
+ * A revocation marker for issued sessions, PERSISTED across restarts.
+ *
+ * The session is stateless: everything lives inside the sealed cookie, so `session.clear()` only
+ * deletes the BROWSER's copy. A cookie captured beforehand stayed valid for its full 7-day TTL —
+ * "log out" did not log anything out.
+ *
+ * The counter has to survive a restart or it does not do its job: an in-memory `let epoch = 1`
+ * revokes within one process run, then resets to 1 the next time the service starts, and a cookie
+ * captured from that first run is accepted again for the rest of its TTL. (The seal key cannot save
+ * us — it is derived from the stable mgmt token, so pre-restart cookies still unseal fine.) So it
+ * lives in a file next to the host's own config.
+ *
+ * Best-effort by design: if the file cannot be read or written the console still works, it just
+ * falls back to in-memory revocation for this process. Refusing to log anyone out because a state
+ * file is unwritable would be the wrong trade for a LAN console.
+ */
+const EPOCH_FILE = (): string =>
+	process.env.PUNKTFUNK_UI_EPOCH_FILE ??
+	join(
+		process.env.PUNKTFUNK_CONFIG_DIR ?? join(homedir(), ".config", "punktfunk"),
+		"web-session-epoch",
+	);
+
+let epochCache: number | null = null;
+
+/** The epoch a new session is stamped with, and the one the gate requires. */
+export function sessionEpoch(): number {
+	if (epochCache !== null) return epochCache;
+	try {
+		const raw = readFileSync(EPOCH_FILE(), "utf8").trim();
+		const n = Number.parseInt(raw, 10);
+		epochCache = Number.isFinite(n) && n > 0 ? n : 1;
+	} catch {
+		epochCache = 1; // no file yet — first run
+	}
+	return epochCache;
+}
+
+/** Invalidate every session issued so far (what logging out does). */
+export function revokeAllSessions(): void {
+	const next = sessionEpoch() + 1;
+	epochCache = next;
+	try {
+		mkdirSync(dirname(EPOCH_FILE()), { recursive: true });
+		writeFileSync(EPOCH_FILE(), String(next), { mode: 0o600 });
+	} catch {
+		// Unwritable state dir: the bump still holds for this process, which is the common case
+		// (log out, walk away). It is weaker than persisted, and better than refusing to log out.
+	}
+}
+
 // Shared auth helpers for the Nitro server (the deployed Bun server). Single-user,
 // shared-password gate: the user logs in with PUNKTFUNK_UI_PASSWORD, which sets a SEALED
 // (h3 useSession — AES-GCM) cookie; every request is gated by server/middleware/auth.ts.
@@ -8,6 +60,9 @@ import {
 	createHash,
 	timingSafeEqual as nodeTimingSafeEqual,
 } from "node:crypto";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
 import {
 	getRequestHeader,
 	getRequestIP,
@@ -200,28 +255,4 @@ export interface SessionData {
 	authenticated?: boolean;
 	/** The epoch this session was sealed under — see `sessionEpoch`. */
 	epoch?: number;
-}
-
-/**
- * A revocation counter for issued sessions.
- *
- * The session is stateless: everything lives inside the sealed cookie, so `session.clear()` only
- * deletes the BROWSER's copy. A cookie captured beforehand (a shared machine, a shell history, a
- * TLS-inspecting proxy) stayed valid for its full 7-day TTL with nothing the operator could do
- * about it — "log out" did not log anything out.
- *
- * Bumping this invalidates every previously issued cookie, because the gate compares the stamped
- * epoch against the current one. It lives in memory, so a host restart also revokes — acceptable
- * for a single-user console, and the safe direction to fail.
- */
-let epoch = 1;
-
-/** The epoch a new session is stamped with, and the one the gate requires. */
-export function sessionEpoch(): number {
-	return epoch;
-}
-
-/** Invalidate every session issued so far (the "sign out everywhere" lever). */
-export function revokeAllSessions(): void {
-	epoch += 1;
 }
