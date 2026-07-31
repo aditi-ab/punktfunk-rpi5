@@ -68,6 +68,7 @@ pub(super) async fn run_pump(args: WorkerArgs) {
         probe,
         frames_dropped,
         fec_recovered,
+        mic_stats,
         hot_tids,
         clock_offset,
         decode_lat,
@@ -92,11 +93,20 @@ pub(super) async fn run_pump(args: WorkerArgs) {
     tokio::spawn(input_task::run(conn.clone(), input_rx, gamepad_snapshots));
 
     // Mic task: embedder Opus mic frames → 0xCB uplink datagrams (best-effort, dropped on loss).
+    // Self-healing latency bound: every frame still queued once this task catches up is standing
+    // mic delay from then on, so a frame with more than [`MIC_BACKLOG_MAX`] successors already
+    // waiting is shed as stale instead of sent — a stall costs a short dropout, not a
+    // session-long lag (see [`MIC_QUEUE`]). The counters feed [`NativeClient::mic_stats`].
     let mic_conn = conn.clone();
     tokio::spawn(async move {
         while let Some((seq, pts_ns, opus)) = mic_rx.recv().await {
+            if mic_rx.len() > MIC_BACKLOG_MAX {
+                mic_stats.dropped_stale.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
             let d = crate::quic::encode_mic_datagram(seq, pts_ns, &opus);
             let _ = mic_conn.send_datagram(d.into());
+            mic_stats.sent.fetch_add(1, Ordering::Relaxed);
         }
     });
 

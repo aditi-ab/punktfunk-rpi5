@@ -63,11 +63,45 @@ fn join_host_port(host: &str, port: u16) -> String {
     }
 }
 
-/// Outbound mic uplink queue depth: 5 ms Opus frames, so 64 is ~320 ms of audio — far beyond
-/// any worker stall a live mic session survives anyway. On overflow the FRESH frame is dropped
-/// (a tokio mpsc can't shed from the head; by the time 320 ms are queued the stream is broken
-/// either way, and the bound is about memory, not audio quality) and logged at debug.
-const MIC_QUEUE: usize = 64;
+/// Outbound mic uplink queue depth: desktop clients send 10 ms Opus frames (mobile still 20 ms),
+/// so 12 is ~120–240 ms of audio — the hard memory cap, not the working depth. (The old 64 was
+/// mislabeled "~320 ms of 5 ms frames"; the frames were 20 ms, so it really allowed 1.28 s, and
+/// since a filled tokio mpsc can only drop the FRESH frame, every queued frame became permanent
+/// standing latency once a stall filled it.) The pump's mic task now sheds the OLDEST frames
+/// whenever more than [`MIC_BACKLOG_MAX`] are still waiting, so a stall costs a short dropout
+/// and heals the moment the worker catches up. The producer stays non-blocking: on overflow it
+/// still drops the fresh frame (logged at debug) — the shed loop keeps that a rare event.
+const MIC_QUEUE: usize = 12;
+
+/// The mic backlog the pump tolerates before shedding oldest-first: ~60 ms of 10 ms frames —
+/// enough slack to ride out an encode/send hiccup, small enough that voice stays conversational
+/// and never accrues a session-long standing delay.
+pub(crate) const MIC_BACKLOG_MAX: usize = 6;
+
+/// Mic uplink counters, shared between the producer side ([`NativeClient::send_mic`]) and the
+/// pump's mic task. All monotonic for the session; a stats HUD windows them by diffing
+/// successive [`NativeClient::mic_stats`] snapshots (the `frames_dropped` pattern).
+#[derive(Debug, Default)]
+pub(crate) struct MicUplinkCounters {
+    /// Frames handed to the QUIC datagram send (past every client-side queue).
+    pub(crate) sent: AtomicU64,
+    /// Frames shed at enqueue — the worker queue was full ([`MIC_QUEUE`]).
+    pub(crate) dropped_full: AtomicU64,
+    /// Frames shed by the pump's backlog governor (stale-oldest past [`MIC_BACKLOG_MAX`]).
+    pub(crate) dropped_stale: AtomicU64,
+}
+
+/// A [`NativeClient::mic_stats`] snapshot: cumulative mic uplink frame counts per stage.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MicUplinkStats {
+    /// Frames handed to the QUIC datagram send.
+    pub sent: u64,
+    /// Frames shed at enqueue (worker queue full).
+    pub dropped_full: u64,
+    /// Frames shed by the pump's backlog governor (stale-oldest — see [`MIC_QUEUE`]'s
+    /// self-healing note).
+    pub dropped_stale: u64,
+}
 
 /// Outbound control-request queue depth. The requests are sparse (mode switches, keyframe
 /// requests, ~1.3 loss reports/s, clock re-syncs) — 32 is hours of headroom; a full queue means
@@ -101,9 +135,12 @@ pub struct NativeClient {
     cursor_state: Mutex<Receiver<crate::quic::CursorState>>,
     input_tx: tokio::sync::mpsc::UnboundedSender<InputEvent>,
     /// Outbound mic frames `(seq, pts_ns, opus)` → encoded as 0xCB datagrams by the worker.
-    /// Bounded ([`MIC_QUEUE`]): a wedged worker drops fresh frames (logged) instead of queueing
-    /// audio-latency (and memory) without limit — mic is best-effort end to end.
+    /// Bounded ([`MIC_QUEUE`]): the pump sheds stale frames oldest-first and a full queue drops
+    /// the fresh one (logged) instead of queueing audio-latency (and memory) without limit —
+    /// mic is best-effort end to end, and a standing backlog is worse than a dropout.
     mic_tx: tokio::sync::mpsc::Sender<(u32, u64, Vec<u8>)>,
+    /// Mic uplink counters (sent / dropped per stage) — see [`NativeClient::mic_stats`].
+    mic_stats: Arc<MicUplinkCounters>,
     /// Outbound 0xCC rich-input plane, PRE-ENCODED datagrams: [`RichInput`] touchpad/motion
     /// (encoded in [`NativeClient::send_rich_input`]) and stylus [`crate::quic::PenBatch`]es
     /// (encoded in [`NativeClient::send_pen`]) share the channel — the worker's task just
@@ -396,6 +433,7 @@ impl NativeClient {
         let probe = Arc::new(Mutex::new(ProbeState::default()));
         let frames_dropped = Arc::new(AtomicU64::new(0));
         let fec_recovered = Arc::new(AtomicU64::new(0));
+        let mic_stats = Arc::new(MicUplinkCounters::default());
         let hot_tids = Arc::new(Mutex::new(Vec::new()));
         let clock_offset = Arc::new(AtomicI64::new(0));
         let decode_lat = Arc::new(Mutex::new(DecodeLatAcc::default()));
@@ -408,6 +446,7 @@ impl NativeClient {
         let probe_w = probe.clone();
         let frames_dropped_w = frames_dropped.clone();
         let fec_recovered_w = fec_recovered.clone();
+        let mic_stats_w = mic_stats.clone();
         let hot_tids_w = hot_tids.clone();
         let clock_offset_w = clock_offset.clone();
         let decode_lat_w = decode_lat.clone();
@@ -472,6 +511,7 @@ impl NativeClient {
                     probe: probe_w,
                     frames_dropped: frames_dropped_w,
                     fec_recovered: fec_recovered_w,
+                    mic_stats: mic_stats_w,
                     hot_tids: hot_tids_w,
                     clock_offset: clock_offset_w,
                     decode_lat: decode_lat_w,
@@ -506,6 +546,7 @@ impl NativeClient {
             cursor_state: Mutex::new(cursor_state_rx),
             input_tx,
             mic_tx,
+            mic_stats,
             rich_input_tx,
             ctrl_tx,
             clip: Mutex::new(clip_event_rx),
@@ -707,6 +748,18 @@ impl NativeClient {
     /// [`frames_dropped`](Self::frames_dropped) (the losses FEC could NOT absorb).
     pub fn fec_recovered_shards(&self) -> u64 {
         self.fec_recovered.load(Ordering::Relaxed)
+    }
+
+    /// Cumulative mic uplink frame counts per stage: handed to the QUIC datagram send, shed at
+    /// enqueue (worker queue full), and shed by the pump's backlog governor (stale-oldest — see
+    /// [`MIC_QUEUE`]'s self-healing note). All monotonic for the session; a stats HUD windows
+    /// them by diffing successive reads, like [`frames_dropped`](Self::frames_dropped).
+    pub fn mic_stats(&self) -> MicUplinkStats {
+        MicUplinkStats {
+            sent: self.mic_stats.sent.load(Ordering::Relaxed),
+            dropped_full: self.mic_stats.dropped_full.load(Ordering::Relaxed),
+            dropped_stale: self.mic_stats.dropped_stale.load(Ordering::Relaxed),
+        }
     }
 
     /// Whether the underlying QUIC session has ended — the worker's connection-close watcher set the
@@ -1124,8 +1177,10 @@ impl NativeClient {
         match self.mic_tx.try_send((seq, pts_ns, opus)) {
             Ok(()) => Ok(()),
             Err(TrySendError::Full(_)) => {
-                // Bounded queue full = the worker stalled for ~MIC_QUEUE x 5 ms. Shed this
-                // frame (mic is best-effort end to end) instead of queueing latency/memory.
+                // Bounded queue full = the worker stalled long enough to outrun even the
+                // pump's oldest-first shed. Drop this frame (mic is best-effort end to end)
+                // instead of queueing latency/memory; the counter keeps the loss visible.
+                self.mic_stats.dropped_full.fetch_add(1, Ordering::Relaxed);
                 tracing::debug!("mic uplink queue full — dropping frame");
                 Ok(())
             }
