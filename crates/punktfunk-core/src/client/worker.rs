@@ -6,7 +6,7 @@ use crate::config::{CompositorPref, GamepadPref, Mode};
 use crate::error::Result;
 use crate::input::InputEvent;
 use crate::quic::{HdrMeta, HidOutput};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64};
 use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex};
 
@@ -73,6 +73,9 @@ pub(crate) struct WorkerArgs {
     /// Decode-stage latency samples from the embedder (see [`NativeClient::decode_lat`]): the pump
     /// drains a window mean into the adaptive-bitrate controller's decode signal.
     pub(crate) decode_lat: Arc<Mutex<DecodeLatAcc>>,
+    /// The live encoder-target mirror (see [`NativeClient::live_bitrate_kbps`]): the worker seeds
+    /// it from the Welcome; the control task updates it on every `BitrateChanged` ack.
+    pub(crate) live_bitrate: Arc<AtomicU32>,
 }
 
 /// The worker: QUIC handshake, then the input/datagram/control tasks + the blocking

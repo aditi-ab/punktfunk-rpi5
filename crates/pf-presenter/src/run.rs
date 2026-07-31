@@ -1976,8 +1976,27 @@ fn stats_text(
     }
     let detailed = verbosity == StatsVerbosity::Detailed;
     let mut text = if detailed {
+        // The encoder target next to the measured rate is the figure whose absence let the
+        // settings-drop bug ship four releases: "19 Mb/s" alone can't distinguish "the
+        // encoder is capped at 20" from "my 200 Mb/s grant met a cheap scene". `(auto)`
+        // marks an Automatic session — the ABR moves the target by design, so a shifting
+        // number reads as policy, not a broken setting. Omitted against an old host that
+        // never reported a rate.
+        let target = match (s.target_kbps, s.auto_rate) {
+            (0, _) => String::new(),
+            (t, true) => format!(" · target {:.0} Mb/s (auto)", f64::from(t) / 1000.0),
+            (t, false) => format!(" · target {:.0} Mb/s", f64::from(t) / 1000.0),
+        };
+        // The chroma tag mirrors the HDR tag's honesty: `4:4:4→4:2:0` = the session asked
+        // for full chroma and the host resolved 4:2:0 (its policy/capturer/encoder gates
+        // said no) — otherwise the Settings switch's effect is unobservable.
+        let chroma = match (s.asked_444, s.chroma_444) {
+            (_, true) => " · 4:4:4",
+            (true, false) => " · 4:4:4→4:2:0",
+            _ => "",
+        };
         format!(
-            "{mode_line} · {:.0} fps · {:.1} Mb/s · {}{}",
+            "{mode_line} · {:.0} fps · {:.1} Mb/s{target} · {}{}{chroma}",
             s.fps,
             s.mbps,
             if s.decoder.is_empty() { "-" } else { s.decoder },
@@ -2263,6 +2282,12 @@ mod tests {
                 lost: 3,
                 lost_pct: 0.4,
                 decoder: "vulkan",
+                // Old-host baseline (no reported target, 4:2:0 never asked): the tier
+                // texts stay exactly what they were before the target/chroma elements.
+                target_kbps: 0,
+                auto_rate: false,
+                chroma_444: false,
+                asked_444: false,
             },
             PresentedWindow {
                 e2e_p50_ms: 6.4,
@@ -2301,6 +2326,42 @@ mod tests {
             !normal.contains("queue"),
             "host-stage split is Detailed-only"
         );
+    }
+
+    /// Detailed shows the negotiated encoder target next to the measured rate — the
+    /// figure whose absence let the settings-drop bug ship four releases — tagged
+    /// `(auto)` when the ABR owns it, plus the honest chroma tag when 4:4:4 was asked.
+    #[test]
+    fn detailed_shows_target_and_chroma_resolution() {
+        let (mut s, p) = sample();
+        let line1 = |s: &Stats, v| {
+            stats_text(v, "m", s, &p, false, false, None)
+                .lines()
+                .next()
+                .unwrap()
+                .to_string()
+        };
+        // Explicit 200 Mb/s honoured, cheap scene: measured AND target both show — the
+        // exact pair a user needs to tell a capped encoder from an idle one.
+        s.target_kbps = 200_000;
+        assert!(line1(&s, StatsVerbosity::Detailed).contains("24.3 Mb/s · target 200 Mb/s · "));
+        // An Automatic session's moving target reads as policy, not a broken setting.
+        (s.target_kbps, s.auto_rate) = (20_000, true);
+        assert!(line1(&s, StatsVerbosity::Detailed).contains("target 20 Mb/s (auto)"));
+        // Normal keeps its old line — the target is a Detailed element.
+        assert!(!line1(&s, StatsVerbosity::Normal).contains("target"));
+        // An old host that never reported a rate shows no target element at all.
+        s.target_kbps = 0;
+        assert!(!line1(&s, StatsVerbosity::Detailed).contains("target"));
+        // 4:4:4 asked and granted…
+        (s.asked_444, s.chroma_444) = (true, true);
+        assert!(line1(&s, StatsVerbosity::Detailed).ends_with("· 4:4:4"));
+        // …vs asked and declined: the downgrade is said out loud, mirroring `HDR→SDR`.
+        s.chroma_444 = false;
+        assert!(line1(&s, StatsVerbosity::Detailed).ends_with("· 4:4:4→4:2:0"));
+        // Unasked stays untagged (4:2:0 is the default — not noise worth a tag).
+        s.asked_444 = false;
+        assert!(!line1(&s, StatsVerbosity::Detailed).contains("4:4:4"));
     }
 
     /// Compact omits the latency term until the presenter's first e2e window lands.

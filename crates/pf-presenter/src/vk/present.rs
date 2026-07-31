@@ -815,19 +815,12 @@ impl Presenter {
 
     /// Per-plane views over a Vulkan-Video frame's multiplanar image — the CSC pass's
     /// exact sampling contract (the frames pool was created MUTABLE_FORMAT for this).
-    /// 8-bit NV12 (R8 + R8G8) and 10-bit P010/X6 (R10X6 + R10X6G10X6).
+    /// See [`vkframe_plane_formats`] for the accepted pool formats.
     fn vkframe_plane_views(&self, f: &VkVideoFrame) -> Result<[vk::ImageView; 2]> {
-        let (luma_fmt, chroma_fmt) = if f.vk_format == vk::Format::G8_B8R8_2PLANE_420_UNORM.as_raw()
-        {
-            (vk::Format::R8_UNORM, vk::Format::R8G8_UNORM)
-        } else if f.vk_format == vk::Format::G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16.as_raw() {
-            (
-                vk::Format::R10X6_UNORM_PACK16,
-                vk::Format::R10X6G10X6_UNORM_2PACK16,
-            )
-        } else {
+        let Some((luma_fmt, chroma_fmt)) = vkframe_plane_formats(f.vk_format) else {
             bail!(
-                "Vulkan-Video pool format {} unsupported (expected 2-plane 4:2:0, 8/10-bit)",
+                "Vulkan-Video pool format {} unsupported (expected 2-plane 4:2:0 or 4:4:4, \
+                 8/10-bit — 3-plane layouts need a third CSC binding)",
                 f.vk_format
             );
         };
@@ -873,6 +866,36 @@ impl Presenter {
         };
         Ok([luma, chroma])
     }
+}
+
+/// The (luma, chroma) per-plane view formats for a Vulkan-Video pool format, or `None`
+/// when this presenter can't sample it (the caller bails; the decoder demotes to
+/// software — never a black screen).
+///
+/// The decision table IS the desktop 4:4:4 display contract, so it's a pure function
+/// with a test pinning it:
+/// - 2-plane 4:2:0, 8-bit (NV12-layout) and 10-bit (P010/X6) — the classic pair.
+/// - 2-plane 4:4:4, 8- and 10-bit — what NVIDIA's Vulkan Video reports for HEVC RExt
+///   full-chroma decode (semi-planar, like all NVDEC output). The CSC shader already
+///   handles the full-size chroma plane (its 4:2:0 siting correction self-disables when
+///   the plane widths match), so accepting the format here is all hardware 4:4:4 needs.
+/// - 3-plane 4:4:4 stays rejected: the CSC pass samples exactly two planes (luma +
+///   interleaved chroma); a triplanar pool needs a third binding + shader variant. No
+///   supported driver reports it for HEVC decode today — revisit when one does.
+fn vkframe_plane_formats(raw: i32) -> Option<(vk::Format, vk::Format)> {
+    let eight = (vk::Format::R8_UNORM, vk::Format::R8G8_UNORM);
+    let ten = (
+        vk::Format::R10X6_UNORM_PACK16,
+        vk::Format::R10X6G10X6_UNORM_2PACK16,
+    );
+    [
+        (vk::Format::G8_B8R8_2PLANE_420_UNORM, eight),
+        (vk::Format::G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16, ten),
+        (vk::Format::G8_B8R8_2PLANE_444_UNORM, eight),
+        (vk::Format::G10X6_B10X6R10X6_2PLANE_444_UNORM_3PACK16, ten),
+    ]
+    .into_iter()
+    .find_map(|(f, planes)| (f.as_raw() == raw).then_some(planes))
 }
 
 /// Flatten the 3×vec4 rows for the push-constant block.
@@ -932,5 +955,44 @@ fn unlock_vkframe(f: &VkVideoFrame, sync: &VkFrameSync, submitted: bool, graphic
         let unlock: unsafe extern "C" fn(*mut pf_ffvk::AVHWFramesContext, *mut pf_ffvk::AVVkFrame) =
             std::mem::transmute(f.unlock_frame);
         unlock(f.frames_ctx as *mut pf_ffvk::AVHWFramesContext, vkf);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The pool-format decision table (what this presenter can sample → what stays on the
+    /// hardware path, everything else demotes to software decode). Pinned so a format
+    /// added or dropped here is a deliberate act, not a drive-by.
+    #[test]
+    fn vkframe_pool_format_decision_table() {
+        let eight = Some((vk::Format::R8_UNORM, vk::Format::R8G8_UNORM));
+        let ten = Some((
+            vk::Format::R10X6_UNORM_PACK16,
+            vk::Format::R10X6G10X6_UNORM_2PACK16,
+        ));
+        // 2-plane 4:2:0, both depths — the classic pair.
+        let f = |fmt: vk::Format| vkframe_plane_formats(fmt.as_raw());
+        assert_eq!(f(vk::Format::G8_B8R8_2PLANE_420_UNORM), eight);
+        assert_eq!(
+            f(vk::Format::G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16),
+            ten
+        );
+        // 2-plane 4:4:4, both depths — hardware full-chroma (NVIDIA RExt decode). Same
+        // per-plane view formats; the full-size chroma plane is the shader's business.
+        assert_eq!(f(vk::Format::G8_B8R8_2PLANE_444_UNORM), eight);
+        assert_eq!(
+            f(vk::Format::G10X6_B10X6R10X6_2PLANE_444_UNORM_3PACK16),
+            ten
+        );
+        // 3-plane 4:4:4 and 2-plane 4:2:2: real formats a driver could report, NOT
+        // sampleable by the two-binding CSC — they must demote, not corrupt.
+        assert_eq!(f(vk::Format::G8_B8_R8_3PLANE_444_UNORM), None);
+        assert_eq!(f(vk::Format::G8_B8R8_2PLANE_422_UNORM), None);
+        assert_eq!(f(vk::Format::G16_B16R16_2PLANE_444_UNORM), None);
+        // Garbage never maps.
+        assert_eq!(vkframe_plane_formats(0), None);
+        assert_eq!(vkframe_plane_formats(-1), None);
     }
 }

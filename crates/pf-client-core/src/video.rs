@@ -950,6 +950,9 @@ pub(crate) fn drm_fourcc_for(sw: ffmpeg_next::ffi::AVPixelFormat) -> Option<u32>
     Some(match sw {
         AV_PIX_FMT_NV12 => fourcc(b'N', b'V', b'1', b'2'),
         AV_PIX_FMT_P010LE => fourcc(b'P', b'0', b'1', b'0'),
+        // Full-chroma 4:4:4 semi-planar (HEVC RExt decode on drivers that export it as
+        // two planes) — the presenter imports the full-size chroma plane like any other.
+        AV_PIX_FMT_NV24 => fourcc(b'N', b'V', b'2', b'4'),
         _ => return None,
     })
 }
@@ -1023,6 +1026,10 @@ mod tests {
         assert_eq!(
             drm_fourcc_for(ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_NV12),
             Some(0x3231_564e)
+        );
+        assert_eq!(
+            drm_fourcc_for(ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_NV24),
+            Some(0x3432_564e)
         );
         assert_eq!(
             drm_fourcc_for(ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_RGBA),

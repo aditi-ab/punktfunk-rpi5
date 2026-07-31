@@ -248,9 +248,14 @@ mod session_main {
             // 4:4:4 is opt-in and off by default (Settings "Full chroma"): the bit only says
             // "upgrade me if you can" — the host still gates on its own policy, its capturer,
             // HEVC, and a real GPU 4:4:4 encode probe, and answers the resolved chroma in the
-            // Welcome BEFORE we build a decoder. Advertised unconditionally when the user asks
-            // for it because every decode path here can produce it: the hardware ones where the
-            // driver decodes RExt, and swscale for the rest (the decoder demotes on its own).
+            // Welcome BEFORE we build a decoder. Advertised whenever the user asks because
+            // every path can DISPLAY it: the Vulkan presenter samples the 2-plane 4:4:4 pool
+            // formats (hardware RExt decode where the driver offers it — NVIDIA today) and
+            // swscale converts anything else for the software rung, with the decoder ladder
+            // demoting on its own. No capability probe gates the bit — software decode is the
+            // guaranteed floor — but the cost is VISIBLE, not silent: the Detailed stats
+            // overlay prints the resolved chroma ("4:4:4→4:2:0" when the host declined) and
+            // the decode path frames actually took.
             video_caps: punktfunk_core::quic::VIDEO_CAP_MULTI_SLICE
                 | if settings.hdr_enabled {
                     punktfunk_core::quic::VIDEO_CAP_10BIT | punktfunk_core::quic::VIDEO_CAP_HDR

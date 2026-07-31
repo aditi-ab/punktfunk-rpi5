@@ -1,5 +1,5 @@
-//! VAAPI dmabuf → Vulkan import: per-plane `VkImage`s (R8/GR88 for NV12, R16/GR1616
-//! for 10-bit P010) with the
+//! VAAPI dmabuf → Vulkan import: per-plane `VkImage`s (R8/GR88 for NV12 and full-chroma
+//! NV24, R16/GR1616 for 10-bit P010) with the
 //! surface's explicit DRM format modifier — the same layer-wise import the EGL presenter
 //! (`video_gl.rs`) proved on this hardware, minus the toolkit. Same-Mesa export/import
 //! is the contract; anything a driver rejects surfaces as a clean error and the caller
@@ -14,6 +14,13 @@ use std::os::fd::{BorrowedFd, IntoRawFd as _};
 const DRM_FORMAT_NV12: u32 = 0x3231_564e;
 /// `fourcc('P','0','1','0')` — 10-bit 4:2:0, 10 bits MSB-aligned in 16 (the HDR path).
 const DRM_FORMAT_P010: u32 = 0x3031_3050;
+/// `fourcc('N','V','2','4')` — 8-bit 4:4:4 semi-planar (full-size interleaved chroma
+/// plane): the 2-plane full-chroma export a VAAPI HEVC RExt decode can hand over. Same
+/// R8 + R8G8 views as NV12; the CSC shader keys chroma siting off the plane widths, so
+/// the full-size plane needs nothing else. (Intel's iHD prefers PACKED 4:4:4 exports —
+/// AYUV/Y410 — which are single-plane and would need their own CSC arm; those still
+/// demote to software decode. 10-bit 4:4:4 has no settled dmabuf fourcc at all.)
+const DRM_FORMAT_NV24: u32 = 0x3432_564e;
 const DRM_FORMAT_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
 /// `DRM_FORMAT_MOD_LINEAR` — the fallback when the export carried no explicit modifier.
 const DRM_FORMAT_MOD_LINEAR: u64 = 0;
@@ -92,13 +99,14 @@ pub fn import(
     if std::env::var_os("PUNKTFUNK_HW_FAULT").is_some_and(|v| v == "import") {
         bail!("injected import failure (PUNKTFUNK_HW_FAULT=import)");
     }
-    let (luma_fmt, chroma_fmt) = match frame.fourcc {
-        DRM_FORMAT_NV12 => (vk::Format::R8_UNORM, vk::Format::R8G8_UNORM),
-        DRM_FORMAT_P010 => (vk::Format::R16_UNORM, vk::Format::R16G16_UNORM),
-        other => bail!("hw presenter handles NV12/P010 only (got {other:#x})"),
+    let (luma_fmt, chroma_fmt, chroma_full_res) = match frame.fourcc {
+        DRM_FORMAT_NV12 => (vk::Format::R8_UNORM, vk::Format::R8G8_UNORM, false),
+        DRM_FORMAT_P010 => (vk::Format::R16_UNORM, vk::Format::R16G16_UNORM, false),
+        DRM_FORMAT_NV24 => (vk::Format::R8_UNORM, vk::Format::R8G8_UNORM, true),
+        other => bail!("hw presenter handles NV12/P010/NV24 only (got {other:#x})"),
     };
     if frame.planes.len() < 2 {
-        bail!("2-plane 4:2:0 needs 2 planes (got {})", frame.planes.len());
+        bail!("2-plane YCbCr needs 2 planes (got {})", frame.planes.len());
     }
     // EGL could leave an INVALID modifier to the driver's implied choice; explicit-
     // modifier images can't — LINEAR is the only honest guess (debug-visible if wrong).
@@ -123,16 +131,14 @@ pub fn import(
         modifier,
     )
     .context("luma plane")?;
+    // 4:2:0 subsamples the chroma plane both ways; 4:4:4 (NV24) keeps it full-size.
+    let (cw, ch) = if chroma_full_res {
+        (frame.width, frame.height)
+    } else {
+        (frame.width.div_ceil(2), frame.height.div_ceil(2))
+    };
     let (chroma_img, chroma_mem) = match plane_image(
-        device,
-        ext_mem_fd,
-        frame.width.div_ceil(2),
-        frame.height.div_ceil(2),
-        chroma_fmt,
-        c.fd,
-        c.offset,
-        c.stride,
-        modifier,
+        device, ext_mem_fd, cw, ch, chroma_fmt, c.fd, c.offset, c.stride, modifier,
     )
     .context("chroma plane")
     {

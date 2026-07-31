@@ -45,8 +45,9 @@ captured input, switch mouse mode, disconnect — are in
 
 **Compact** is a one-line pill (fps · end-to-end ms · Mb/s, plus a loss flag when frames are being
 lost). **Normal** adds the stream line and the p50/p95 headline. **Detailed** adds the per-stage
-breakdown everywhere; on Linux/Windows it also adds the decode path and an HDR tag, on Android the
-decoder plus the full codec/bit-depth/colour line, and on iOS/tvOS the excluded OS present floor.
+breakdown everywhere; on Linux/Windows it also adds the encoder's target bitrate, the decode path,
+an HDR tag and a chroma tag, on Android the decoder plus the full codec/bit-depth/colour line, and
+on iOS/tvOS the excluded OS present floor.
 You can also set the level a stream starts at in each client's
 [Settings](/docs/client-settings#overlay). The examples below are the **Detailed** view.
 
@@ -60,7 +61,7 @@ Every client reports the same measurements, but each family lays them out a litt
 differently. Linux · Windows · Steam Deck:
 
 ```
-1920×1080@120 · 120 fps · 24.3 Mb/s · vulkan · HDR
+1920×1080@120 · 120 fps · 24.3 Mb/s · target 30 Mb/s (auto) · vulkan · HDR
 e2e 14.2/19.8 ms (p50/p95) · host 3.1 · net 6.7 · decode 2.1 · display 2.3 ms
 host: queue 0.6 · encode 1.8 · xfer 0.2 · pace 0.5 ms
 lost 3 (2.4%)
@@ -90,10 +91,18 @@ lost 3 (2.4%)
 ```
 
 - **Line 1 — the stream.** Resolution@refresh, frames received per second, and the
-  received video bitrate (goodput — FEC overhead not counted). Linux/Windows append the
-  decode path and an [HDR](/docs/hdr) tag (`HDR`, or `HDR→SDR` when a PQ stream is tone-mapped onto
-  an SDR screen); Android puts its decoder and the negotiated codec, bit depth, colour and
-  chroma on rows of their own underneath; the Apple clients don't report a codec at all.
+  received video bitrate (goodput — FEC overhead not counted). Linux/Windows follow the
+  measured rate with `target N Mb/s` — what the host's encoder is currently *allowed* to
+  produce — so a quiet desktop under a large grant (measured far below target) reads
+  differently from an encoder pinned at its cap (measured hugging the target). `(auto)`
+  means the [Automatic bitrate](/docs/client-settings#bitrate) controller owns the target
+  and moves it with network conditions; no target at all means an older host that doesn't
+  report one. Then the decode path, an [HDR](/docs/hdr) tag (`HDR`, or `HDR→SDR` when a PQ
+  stream is tone-mapped onto an SDR screen), and — when you asked for
+  [full chroma](/docs/client-settings) — the resolved chroma: `4:4:4` when the host
+  granted it, `4:4:4→4:2:0` when it couldn't. Android puts its decoder and the negotiated
+  codec, bit depth, colour and chroma on rows of their own underneath; the Apple clients
+  don't report a codec at all.
   If the session resolved to a [settings profile](/docs/profiles-and-links), its name closes this
   line. On **Android** a `⚠ panel NN Hz` warning joins it whenever the device's panel is refreshing
   *below* the stream's rate — the tell for a phone or TV governor that ignored the requested mode,

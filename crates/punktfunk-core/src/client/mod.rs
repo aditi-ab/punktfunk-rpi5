@@ -166,6 +166,12 @@ pub struct NativeClient {
     /// drained per window by the data-plane pump to feed the adaptive-bitrate controller's decode
     /// signal. Shared with the pump; see [`DecodeLatAcc`].
     decode_lat: Arc<Mutex<DecodeLatAcc>>,
+    /// The encoder's CURRENT target bitrate (kbps): seeded with the Welcome resolve, then updated
+    /// by every host `BitrateChanged` ack (the ABR's re-targets, host-side clamps). Where
+    /// [`resolved_bitrate_kbps`](Self::resolved_bitrate_kbps) is the session-start negotiation
+    /// frozen for the ABI, this one moves — it's what a stats HUD should print as "target".
+    /// `0` = an old host that never reported a rate.
+    live_bitrate_kbps: Arc<AtomicU32>,
     /// Whether the adaptive-bitrate controller is armed for this session (Automatic bitrate and not
     /// a rate-pinned PyroWave stream) — exposed via [`wants_decode_latency`](Self::wants_decode_latency)
     /// so an embedder skips the per-frame decode measurement when the controller wouldn't use it.
@@ -399,6 +405,8 @@ impl NativeClient {
         let hot_tids = Arc::new(Mutex::new(Vec::new()));
         let clock_offset = Arc::new(AtomicI64::new(0));
         let decode_lat = Arc::new(Mutex::new(DecodeLatAcc::default()));
+        // Seeded by the pump from the Welcome (before ready_tx), then follows every ack.
+        let live_bitrate = Arc::new(AtomicU32::new(0));
 
         let host = host.to_string();
         let frame_chan_w = frame_chan.clone();
@@ -411,6 +419,7 @@ impl NativeClient {
         let hot_tids_w = hot_tids.clone();
         let clock_offset_w = clock_offset.clone();
         let decode_lat_w = decode_lat.clone();
+        let live_bitrate_w = live_bitrate.clone();
         let ctrl_tx_pump = ctrl_tx.clone(); // the data-plane pump sends adaptive-FEC LossReports
         let worker = std::thread::Builder::new()
             .name("punktfunk-client".into())
@@ -475,6 +484,7 @@ impl NativeClient {
                     hot_tids: hot_tids_w,
                     clock_offset: clock_offset_w,
                     decode_lat: decode_lat_w,
+                    live_bitrate: live_bitrate_w,
                 }));
             })
             .map_err(PunktfunkError::Io)?;
@@ -523,6 +533,7 @@ impl NativeClient {
             hot_tids,
             clock_offset,
             decode_lat,
+            live_bitrate_kbps: live_bitrate,
             // The controller arms exactly when the pump does — all three terms, not two: Automatic
             // (the user asked for bitrate 0), not a rate-pinned PyroWave stream, AND the host
             // echoed the rate it actually configured. Dropping the last term made this
@@ -778,6 +789,15 @@ impl NativeClient {
     /// PyroWave sessions (where the signal is ignored). Constant for the session — check once.
     pub fn wants_decode_latency(&self) -> bool {
         self.wants_decode
+    }
+
+    /// The encoder's CURRENT target bitrate (kbps): the Welcome-resolved rate, live-updated by
+    /// every host `BitrateChanged` ack — an Automatic session's ABR re-targets and the host's
+    /// own clamps included. This is the figure a stats HUD should show as "target" next to
+    /// measured throughput (the [`resolved_bitrate_kbps`](Self::resolved_bitrate_kbps) field
+    /// stays the frozen session-start value). `0` = an old host that never reported one.
+    pub fn current_bitrate_kbps(&self) -> u32 {
+        self.live_bitrate_kbps.load(Ordering::Relaxed)
     }
 
     /// Report this client's display-latch grid so the host can phase-lock its capture tick

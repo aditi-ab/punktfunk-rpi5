@@ -347,10 +347,16 @@ impl VulkanDecoder {
             }
             let fc = (*hwfc_ref).data as *mut ffi::AVHWFramesContext;
             let sw = (*fc).sw_format;
+            // The 2-plane layouts the presenter's CSC can sample: 4:2:0 (NV12/P010) and
+            // full-chroma 4:4:4 (NV24/P410 — HEVC RExt decode, semi-planar like all
+            // NVDEC output). The presenter's `vkframe_plane_formats` table is the final
+            // authority; anything else bails here so the session demotes cleanly.
             if sw != ffi::AVPixelFormat::AV_PIX_FMT_NV12
                 && sw != ffi::AVPixelFormat::AV_PIX_FMT_P010LE
+                && sw != ffi::AVPixelFormat::AV_PIX_FMT_NV24
+                && sw != ffi::AVPixelFormat::AV_PIX_FMT_P410LE
             {
-                bail!("Vulkan decode output {sw:?} unsupported (NV12/P010 only)");
+                bail!("Vulkan decode output {sw:?} unsupported (NV12/P010/NV24/P410 only)");
             }
             let vkfc = (*fc).hwctx as *const pf_ffvk::AVVulkanFramesContext;
             let vk_format = (*vkfc).format[0] as i32;

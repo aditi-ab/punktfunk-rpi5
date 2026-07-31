@@ -124,6 +124,21 @@ pub struct Stats {
     /// The decode path frames actually took this window (`"vaapi"`/`"software"`, empty
     /// until the first frame) — the OSD's trailing tag; tracks a mid-session fallback.
     pub decoder: &'static str,
+    /// The encoder's CURRENT target bitrate (kbps): the Welcome resolve, then live per
+    /// `BitrateChanged` ack. What `mbps` (measured goodput) is judged AGAINST — a user
+    /// staring at "19 Mb/s" can't otherwise tell "the encoder is capped at 20" from "my
+    /// 200 Mb/s ask was honoured and this scene is cheap" (the gap that let the
+    /// settings-drop bug ship four releases). `0` = an old host that never reported one.
+    pub target_kbps: u32,
+    /// Automatic bitrate is armed (ABR moves `target_kbps` on its own) — the OSD tags the
+    /// target `(auto)` so a moving figure reads as policy, not a broken setting.
+    pub auto_rate: bool,
+    /// The host resolved full-chroma 4:4:4 for this session (`Welcome::chroma_format`).
+    pub chroma_444: bool,
+    /// This session ADVERTISED `VIDEO_CAP_444` (the Settings "Full chroma" opt-in): with
+    /// `chroma_444` false, the host declined — the OSD says so instead of leaving the
+    /// switch's effect unobservable.
+    pub asked_444: bool,
 }
 
 /// Frames the pump keeps waiting for their 0xCF host timing (pts → capture→received µs).
@@ -361,6 +376,12 @@ fn pump(
         }
     };
     let force_software = params.force_software.clone();
+    // Session-constant stats facts (design/stats-unification.md): what the target figure is
+    // judged against and whether the 4:4:4 opt-in was honoured. `target_kbps` itself is read
+    // live per window — an Automatic session's ABR moves it.
+    let auto_rate = connector.wants_decode_latency();
+    let chroma_444 = connector.chroma_format == punktfunk_core::quic::CHROMA_IDC_444;
+    let asked_444 = params.video_caps & punktfunk_core::quic::VIDEO_CAP_444 != 0;
     // Audio is best-effort: a session without it still streams. Gamepads are the
     // app-lifetime service's job (the UI attaches it on Connected). Audio runs on its own
     // thread (one puller per plane), blocking on the audio queue like the Apple client.
@@ -823,6 +844,10 @@ fn pump(
                     0.0
                 },
                 decoder: dec_path,
+                target_kbps: connector.current_bitrate_kbps(),
+                auto_rate,
+                chroma_444,
+                asked_444,
             }));
             window_start = Instant::now();
             frames_n = 0;
