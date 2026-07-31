@@ -1,10 +1,32 @@
 ---
 title: Host CLI
-description: The punktfunk-host commands and the flags you'll actually use.
+description: The punktfunk-host commands and the flags you'll actually use — plus punktfunk, the command on the client machine.
 ---
 
 The host is one binary, `punktfunk-host`. Most of the time you'll run a single command; the rest reads
-its settings from [`host.env`](/docs/configuration).
+its settings from [`host.env`](/docs/configuration). On the machine you stream *to*, there's a second
+command — [`punktfunk`](#punktfunk-on-the-client-machine), which ships with the client.
+
+| Command | What it does | Platform |
+|---|---|---|
+| [`serve`](#serve) | Run the host. | all |
+| [`punktfunk1-host`](#punktfunk1-host) | Standalone native-only test host. | all |
+| [`service`](#service-windows) | Register, start, stop and remove the Windows service. | Windows |
+| [`tray`](#tray-windows) | Start, stop or query the status-tray icon. | Windows |
+| [`driver`](#driver-windows) | Install or remove the bundled virtual-display / virtual-gamepad drivers. | Windows |
+| [`plugins`](#plugins) | Install, remove and list plugins, and switch the runner on. | all |
+| [`list-monitors`](#list-monitors) | List the physical monitors, by connector name. | Linux |
+| `mirror-test` | Prove capture works from one of them — see [`list-monitors`](#list-monitors). | Linux |
+| [`hdr-probe`](#hdr-probe-and-probe-compositor) | Report whether this box can deliver a 10-bit HDR stream, and what's missing. | Linux |
+| [`hdr-p010-selftest`](#hdr-probe-and-probe-compositor) | Check the GPU's HDR capture colour conversion, with no display or session. | Windows |
+| [`probe-compositor`](#hdr-probe-and-probe-compositor) | Exit 0 when the compositor is up and can create a virtual output. | Linux |
+| [`detect-conflicts`](#detect-conflicts) | Report other Moonlight-compatible hosts on this machine. | all |
+| `library` | Print [the resolved game library](/docs/game-library) as JSON — "does the host see my games?". | all |
+| `openapi` | Print the management API's OpenAPI document. | all |
+| `--version` | Print the host version. | all |
+
+`punktfunk-host --help` prints the most-used of these. `plugins`, `service`, `driver` and `tray`
+print their own usage when you run them with no arguments.
 
 ## `serve`
 
@@ -81,10 +103,70 @@ On `serve` you arm pairing from the web console instead (`--open` is its serve-a
 and concurrency is fixed at the built-in default (4 sessions) rather than settable from the command
 line.
 
-Both `serve` and `punktfunk1-host` advertise the host on the network so clients can discover it. List
-hosts from another machine with `punktfunk-probe --discover`. Where multicast doesn't work (some
-Docker/VLAN setups), pass `--no-mdns` (or set `PUNKTFUNK_MDNS=0`) and add the host in the client by
-address instead.
+Both `serve` and `punktfunk1-host` advertise the host on the network so clients can discover it. The
+graphical client browses the LAN for you, so it needs no command; from a terminal on the client
+machine, [`punktfunk hosts list --probe`](/docs/clients#scripting-the-punktfunk-cli) re-checks the hosts you
+have already saved by asking each one directly — which is how you confirm a routed or VPN host that mDNS never reaches.
+(`punktfunk-probe --discover` also browses the LAN, but it is a developer tool built from the repo,
+`cargo run -p punktfunk-probe -- --discover`, and no package installs it.)
+Where multicast doesn't work (some Docker/VLAN setups), pass `--no-mdns` (or set
+`PUNKTFUNK_MDNS=0`) and add the host in the client by address instead.
+
+## `service` (Windows)
+
+The Windows lifecycle surface. The installer runs `service install` for you, so you only need these
+when you change something or when the service needs a nudge. Run them from an **Administrator**
+prompt.
+
+```powershell
+punktfunk-host service install [--gamestream=on|off] [--allow-public-network]
+punktfunk-host service uninstall
+punktfunk-host service start | stop | restart | status
+```
+
+| Subcommand | What it does |
+|---|---|
+| `install` | Registers the auto-start `PunktfunkHost` service, adds the firewall rules, and writes a default `%ProgramData%\punktfunk\host.env` if there isn't one. Safe to re-run: it's also how you change the two options below. |
+| `--gamestream=on\|off` | Sets `PUNKTFUNK_HOST_CMD` in `host.env` — `on` adds the GameStream/Moonlight planes, `off` goes back to the native-only host. A command line you edited by hand is left alone. |
+| `--allow-public-network` | Also opens the ports on networks Windows classifies **Public**. By default only Private and Domain are opened. |
+| `uninstall` | Stops and deletes the service and removes its firewall rules. It does **not** remove the host itself — see [Uninstalling](/docs/uninstall) for that. |
+| `start` / `stop` / `restart` | Service control. `restart` waits for the old process to exit first — this is what picks up a `host.env` edit. |
+| `status` | Queries the service (the same thing `sc query PunktfunkHost` prints). |
+
+See [Running as a Service](/docs/running-as-a-service) and [Windows Host](/docs/windows-host).
+
+## `tray` (Windows)
+
+The status tray is a per-user program started at sign-in, so an update or a crash otherwise leaves
+you without the icon until the next logon. This is how you get it back without signing out:
+
+```powershell
+punktfunk-host tray start
+punktfunk-host tray status
+punktfunk-host tray stop
+```
+
+`start` reports the process it started, or says the tray is already running; `status` says whether
+the tray is installed at all (it's an optional component at install time) and whether it's running.
+
+## `driver` (Windows)
+
+The installer installs and removes the bundled drivers, so you rarely touch this. It exists for
+removing one without uninstalling the host:
+
+```powershell
+punktfunk-host driver uninstall            # the pf-vdisplay virtual display driver
+punktfunk-host driver uninstall --gamepad  # the virtual-gamepad driver instead
+```
+
+`driver install --dir <stage> [--gamepad]` is the install half; it takes the staged driver files the
+installer lays down, which is why it isn't something you run by hand.
+
+## `plugins`
+
+`punktfunk-host plugins add|remove|list|enable|disable|status` installs plugins and switches the
+plugin/scripting runner on — the same thing the web console's **Plugins** page does. Plugins run
+with the host's privileges, so read [Plugins](/docs/plugins) before installing one.
 
 ## `list-monitors`
 
@@ -103,8 +185,9 @@ Kwin:
   DP-2            2560x1440@144 at +1920,+0  scale 1  ACME 27  [PINNED]
 ```
 
-Tags flag what's worth knowing before you pick: `primary`, `disabled` (nothing to stream), `punktfunk
-virtual display` (one of ours, not a real head), and `PINNED` for the one currently selected. Linux
+Tags flag what's worth knowing before you pick: `primary`, `disabled` (nothing to stream),
+`punktfunk virtual display` (one of ours, not a real head), and `PINNED` for the one currently
+selected. Linux
 only — it reads the live compositor, so run it in (or with the environment of) the session you want
 to stream.
 
@@ -113,14 +196,58 @@ mirror, capture, frames — with no client involved. It reports the first frame,
 the negotiated size. Screen recording is damage-driven, so move the mouse on the host while it runs;
 an idle desktop legitimately yields almost nothing.
 
+## `hdr-probe` and `probe-compositor`
+
+Two Linux readiness checks that need no client and no session of their own.
+
+```sh
+punktfunk-host hdr-probe
+punktfunk-host probe-compositor
+```
+
+`hdr-probe` answers "why isn't my stream HDR?" — it reports, for both Linux HDR routes, whether the
+box can deliver 10-bit PQ right now: is a monitor in HDR colour mode (the GNOME monitor-mirror
+route), is the resolved gamescope the `punktfunk-gamescope` build with the knob on, and does the
+encoder probe Main10 for HEVC/AV1. Run it with the same environment the host service has, or the
+answers describe your shell rather than the host — [HDR → Check it](/docs/hdr#check-it) has that
+one-liner and reads the output line by line. See
+[HDR on gamescope](/docs/gamescope#hdr-on-gamescope) for the gamescope half.
+
+`probe-compositor` exits **0** only when the compositor is up and can create a virtual output now —
+what a session-bringup script should gate on instead of a blind `sleep`.
+
+There is no `hdr-probe` on Windows. The Windows equivalent is a GPU colour self-test of the HDR
+capture conversion — it needs no display and no session, and prints PASS or FAIL with the largest
+error it saw:
+
+```powershell
+punktfunk-host hdr-p010-selftest 1920x1080 nvidia
+```
+
+Both arguments are optional: your real capture size (heights like 1080 aren't 16-aligned and take a
+different driver path — the default is a token `64x64`) and, on a dual-GPU box, the vendor that
+encodes: `intel`, `nvidia` or `amd`.
+
 ## `detect-conflicts`
 
 `punktfunk-host detect-conflicts` reports other Moonlight-compatible hosts (Sunshine, Apollo, and
 forks) installed or running on this machine. Running one alongside Punktfunk is **unsupported** —
 they fight over the same ports and virtual-display driver. Prints what it found and exits **1** if
 any conflict exists, **0** if clean (so installers and scripts can gate on it). The host also runs
-this check at `serve` startup and surfaces it in the logs, tray, and — on Windows — the installer.
+this check at `serve` startup and reports it in the logs and in the management API's status
+summary; on Windows the installer warns you before it installs. (The tray stays quiet about it on
+purpose — an installed-but-idle Sunshine isn't a conflict until it runs.)
 See [Troubleshooting → another streaming host is installed](/docs/troubleshooting#another-streaming-host-sunshine-apollo--is-installed).
+
+## `punktfunk` on the client machine
+
+The client half has its own command, `punktfunk` — the same core the graphical apps use, with no
+window, so a script gets what a click gets, including waking a sleeping host and waiting for it.
+
+Its verbs, where it ships, the `<host-ref>` grammar and the stable exit codes are on [Clients → the
+`punktfunk` CLI](/docs/clients#scripting-the-punktfunk-cli); `punktfunk help <command>` prints one
+verb's flags. `punktfunk wake` has its own exit codes, on [Wake on LAN → From the command
+line](/docs/wake-on-lan#from-the-command-line).
 
 ## Environment
 

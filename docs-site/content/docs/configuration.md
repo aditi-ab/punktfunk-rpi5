@@ -1,19 +1,43 @@
 ---
 title: Configuration
-description: Every host.env setting and PUNKTFUNK_* environment variable — compositor, video, input, gamepads, tuning — and how to use them.
+description: The host.env settings and PUNKTFUNK_* environment variables you'd actually set — compositor, video, audio, input, gamepads, clipboard, tuning — and what each one does.
 ---
 
 The host reads its settings from **`~/.config/punktfunk/host.env`** (a simple `KEY=value` file, `#`
 starts a comment; keys are **case-sensitive** — `punktfunk_compositor` sets nothing, use the exact
 uppercase names). On Windows the service reads **`%ProgramData%\punktfunk\host.env`** instead. Your
 [setup guide](/docs/requirements) gives you a starting `host.env` for your desktop; this page is the
-full reference for every setting.
+reference for the settings you set there. A few settings are documented on the page that owns their
+feature instead — they're listed under [Settings documented
+elsewhere](#settings-documented-elsewhere) at the end.
+
+The file is read when the host starts, so **an edit does nothing until you restart the host.** On
+Linux, where the file is loaded by the `punktfunk-host` user service:
+
+```bash
+systemctl --user restart punktfunk-host
+```
+
+On Windows, where it is loaded by the `PunktfunkHost` service — from an Administrator prompt:
+
+```powershell
+punktfunk-host service restart
+```
 
 > **You rarely need most of these.** The host **auto-detects** the compositor, input backend, and
 > encoder from your live session — a box that flips between Steam Gaming Mode and a KDE/GNOME desktop
 > is followed automatically. The `PUNKTFUNK_*` knobs below are mostly **optional overrides** for
 > forcing a specific backend, tuning performance, or debugging. The starter `host.env` for your
 > platform sets only the few you actually need.
+
+**Finding your way.** The sections below go in this order: what session the host attaches to
+(*Session anchors*, *Core*, *gamescope / session following*, *Compositor-specific*, *Session
+recovery*), what it streams (*Video quality*, *Gamepads*, *Audio / microphone*, *Clipboard*), the
+platform and network bits (*Windows host*, *Network & discovery*, *Auth, API & paths*, *Updates*),
+then *Advanced performance tuning* and *Diagnostics*. The last few sections are background rather
+than host settings: the handful of variables the **clients** read, bitrate, several devices at once,
+and codecs. Two things people come here for are **not** host settings: **resolution and refresh**
+are chosen by the client, and so is the **bitrate** — see [Bitrate](#bitrate) near the end.
 
 ## Session anchors
 
@@ -35,12 +59,21 @@ redundant or stale.
 | Setting | Values | Meaning |
 |---|---|---|
 | `PUNKTFUNK_COMPOSITOR` | `kwin` · `mutter` · `gamescope` · `wlroots` · `hyprland` (aliases: `kde`/`plasma`, `gnome`, `sway`/`wlr`) | Which backend creates the virtual display. `wlroots` is sway/River; `hyprland` is its own backend. **Leave unset.** Setting it **pins** the backend and turns session-following **off** — per connect *and* mid-stream, so a Desktop ↔ Gaming switch kills the stream instead of being followed. For CI/tests and dedicated single-session appliances only. |
-| `PUNKTFUNK_VIDEO_SOURCE` | `virtual` · `portal` | `virtual` creates a per-client display at the client's exact mode (the normal choice). `portal` captures an existing monitor instead. |
+| `PUNKTFUNK_VIDEO_SOURCE` | `virtual` · `portal` | **GameStream/Moonlight sessions only** — it has no effect on the native `punktfunk/1` plane. `virtual` creates a per-client display at the client's exact mode (the normal choice); `portal` captures an existing monitor instead, and is what the GNOME 50+ HDR monitor mirror needs — see [HDR](/docs/hdr#linux--gnome). To stream a physical monitor to a Punktfunk app, use `PUNKTFUNK_CAPTURE_MONITOR` below, or the console's **Streamed screen**. |
 | `PUNKTFUNK_CAPTURE_MONITOR` | a connector name (`HDMI-A-1`, `DP-2`, …) | Stream a **physical** monitor this host already has instead of creating a virtual display — see [Streamed screen](/docs/virtual-displays#stream-a-real-monitor-instead). List the names with `punktfunk-host list-monitors`. Setting it here **outranks the web console's** choice, so an appliance stays aimed where its operator pointed it; leave it unset to steer from the console. A name that matches no monitor fails the session loudly rather than streaming a different screen. Linux only. |
 | `PUNKTFUNK_ZEROCOPY` | `1` · `0` *(default on)* | GPU zero-copy capture→encode (dmabuf → CUDA → NVENC, or D3D11 on Windows). **On by default** — no need to set it; it falls back to a CPU path automatically. Set `0` to force the CPU path. One exception: Windows **Intel/QSV** keeps the CPU path by default until zero-copy is validated on Intel hardware — set `1` to try it there. |
-| `PUNKTFUNK_INPUT_BACKEND` | `libei` · `gamescope` · `wlr` · `uinput` | How input is injected. `libei` for GNOME/KDE, `gamescope` for Bazzite/gamescope, `wlr` for Sway/wlroots **and Hyprland**. Auto-detected with the compositor. |
-| `PUNKTFUNK_ENCODER` | `auto` · `nvenc` · `vaapi` (Linux) · `amf` · `qsv` (Windows) · `software` | Encoder backend. `auto` (default) detects the GPU vendor: NVIDIA→NVENC, AMD→VAAPI/AMF, Intel→VAAPI/QSV. `software` (aliases `sw`/`openh264`) is the GPU-less H.264 path on both platforms — on Windows `auto` falls back to it when no GPU is found; on Linux it is **explicit-only** (`auto` never picks it). On a multi-GPU Windows box a forced hardware backend whose vendor contradicts the selected GPU (web-console preference) is **overridden** — the adapter wins and the host logs a warning; remove the stale pin. |
-| `PUNKTFUNK_RENDER_NODE` | path | Linux DRM render node for zero-copy (default `/dev/dri/renderD128`). Set on multi-GPU boxes to pick the right GPU. |
+| `PUNKTFUNK_INPUT_BACKEND` | `libei` · `kwin` · `gamescope` · `wlr` | How input is injected. `kwin` (KWin fake-input) for KDE — direct injection with no portal approval dialog, so it also works on a headless KDE box; `libei` (the RemoteDesktop portal) for GNOME; `gamescope` for Bazzite/gamescope; `wlr` for Sway/wlroots **and Hyprland**. Auto-detected with the compositor; a value that isn't one of the four is ignored and detection runs anyway. |
+| `PUNKTFUNK_PEN` | `1` · `0` *(default on)* | Full-fidelity stylus input — pressure, tilt, hover, eraser, barrel buttons — for the clients that send it. **On by default**; `0` stops the host advertising pen at all and every client folds the stylus back into ordinary touch. The host also needs `/dev/uinput` on Linux (the same `input` group the virtual gamepads use) or Windows 10 1809+. See [Pen and stylus](/docs/input#pen-and-stylus). |
+| `PUNKTFUNK_ENCODER` | `auto` · `nvenc` · `vaapi` · `vulkan` (Linux) · `amf` · `qsv` (Windows) · `software` | Encoder backend. `auto` (default) detects the GPU vendor: NVIDIA→NVENC; on **Linux** AMD/Intel→**Vulkan Video** for HEVC and AV1 (falling back to VAAPI when the device or the codec can't take it — H.264 is always VAAPI), on **Windows** AMD→AMF and Intel→QSV. `software` (aliases `sw`/`openh264`) is the GPU-less H.264 path on both platforms — on Windows `auto` falls back to it when no GPU is found; on Linux it is **explicit-only** (`auto` never picks it). On a multi-GPU Windows box a forced hardware backend whose vendor contradicts the selected GPU (web-console preference) is **overridden** — the adapter wins and the host logs a warning; remove the stale pin. |
+| `PUNKTFUNK_VULKAN_ENCODE` | `1` · `0` *(default on)* | **(Linux, AMD/Intel)** Use the Vulkan Video encoder for HEVC/AV1 sessions. **On by default** — it recovers from packet loss without a full keyframe, which the VAAPI path can't express. `0` pins the libav VAAPI path; so does a device that can't encode the profile (the host falls back on its own). See [Requirements](/docs/requirements). |
+| `PUNKTFUNK_VAAPI_LOW_POWER` | `1` · `0` | **(Linux, Intel)** Pin the VAAPI entrypoint. Modern Intel (Gen12/Tiger Lake and newer, incl. Arc) only offers the low-power (VDEnc) entrypoint and the host detects that by itself; set this only to force one way or the other. See [Requirements](/docs/requirements). |
+| `PUNKTFUNK_RENDER_NODE` | path | Linux DRM render node for zero-copy (default `/dev/dri/renderD128`). Set on multi-GPU boxes to pick the right GPU. Superseded by a manual GPU preference in the console — see below. |
+
+> **Picking a GPU** — on a multi-GPU box, choose the GPU in the **web console** (Host → *GPUs*),
+> which writes `gpu-settings.json`. A **manual** preference there outranks both
+> `PUNKTFUNK_RENDER_NODE` (Linux) and `PUNKTFUNK_RENDER_ADAPTER` (Windows); while the console is
+> left on **Automatic** — or the preferred GPU isn't present — those two still decide. They stay
+> useful on a headless/appliance box nobody opens the console on.
 
 Resolution and refresh are **not** set here — **the client chooses them.** When a device connects,
 the host creates a virtual display at that device's resolution and refresh rate. A 1080p60 laptop and
@@ -63,6 +96,9 @@ the full picture (and [Bazzite](/docs/bazzite) for that distro's specifics).
 | `PUNKTFUNK_GAMESCOPE_SDR_NITS` | e.g. `400` | On an HDR gamescope session, the luminance SDR content (desktop, Steam overlay, SDR games) is mapped to inside the PQ container. Unset = gamescope's own default of 400. |
 | `PUNKTFUNK_GAMESCOPE_BIN` | path | Force a specific gamescope binary for the sessions the host spawns. Unset = prefer `punktfunk-gamescope` on `PATH`, then `gamescope`. |
 | `PUNKTFUNK_SESSION_WATCH` | `1` · `0` | Follow a Gaming ↔ Desktop switch **mid-stream** (rebuild the backend in place, no reconnect). **On by default** on Bazzite/SteamOS; set `0` to disable. |
+| `PUNKTFUNK_GAMESCOPE_GRAB_CURSOR` | `1` | Add `--force-grab-cursor` to a bare gamescope session the host spawns **to run an app or game** (never the empty keep-alive session), forcing relative-mouse capture so FPS mouselook works over the injected pointer. **Off by default** — relative mode breaks absolute-pointer titles and menus, so turn it on per host. |
+| `PUNKTFUNK_GAMESCOPE_SPLASH` | `1` · `0` *(default on)* | Run the built-in splash client inside each bare gamescope session the host spawns. **Leave it on**: gamescope only produces capture buffers once something paints, and a Steam launch paints nothing for its whole bootstrap — without the splash a fresh session starves and times out. `0` is a debugging escape hatch. |
+| `PUNKTFUNK_GAMESCOPE_STEAM` | `1` | Launch every bare gamescope session the host spawns in Steam integration mode (`--steam`). A Steam title turns that on by itself; this forces it for non-Steam launches too. Managed / `gamescope-session-plus` sessions own their own flags and ignore it. |
 
 ## Compositor-specific (Linux)
 
@@ -91,13 +127,13 @@ See your desktop page ([KDE](/docs/kde), [GNOME](/docs/gnome)) for when to set t
 
 | Setting | Values | Meaning |
 |---|---|---|
-| `PUNKTFUNK_FEC_PCT` | `N` (percent) | Forward-error-correction redundancy for lossy links (the default is sensible for a normal LAN). Higher = more loss-resilient, more bandwidth. |
-| `PUNKTFUNK_10BIT` | `1` · `0` *(default on)* | HEVC Main10 / HDR. **On by default** — the host permits 10-bit; a session goes 10-bit only when the client advertises it (behind the client's HDR setting). Set `0` to force 8-bit. Windows host, plus the Linux **GNOME 50+ GameStream desktop mirror** (`PUNKTFUNK_VIDEO_SOURCE=portal`, mirrored monitor in HDR mode — check with `punktfunk-host hdr-probe`). Also the Linux **gamescope** backend with the `punktfunk-gamescope` build (on by default too). The other Linux virtual displays (Mutter, KWin, wlroots) stay 8-bit: their virtual-monitor screencasts are SDR-only upstream. |
-| `PUNKTFUNK_444` | `1` · `0` *(default on)* | Full-chroma HEVC 4:4:4 (Range Extensions) — sharper text/desktop, no chroma loss. **On by default** on the host; the client's own 4:4:4 setting (default off) is the real switch. Set `0` to force 4:2:0. **punktfunk/1 native only** (Moonlight stays 4:2:0), HEVC-only, honored only when the client advertises 4:4:4 **and** the GPU supports it (probed; NVENC is the validated path — VAAPI/AMF/QSV decline). Independent of 10-bit. |
+| `PUNKTFUNK_FEC_PCT` | `0`–`90` (percent) | **Pins** forward-error-correction redundancy and turns adaptive FEC **off**. Leave it unset on the native protocol: the host normally sizes recovery to the loss the client reports (a 1–50 % band, starting at 10 %), so pinning a number can leave a lossy link *worse* off than letting it adapt. Set it only when a fixed, known overhead matters — a measurement or a speed test; `0` disables FEC entirely. On the GameStream/Moonlight plane it is a plain override of that plane's fixed 20 %. |
+| `PUNKTFUNK_10BIT` | `1` · `0` *(default on)* | Allow 10-bit (HEVC Main10 / AV1 10-bit) sessions at all; `0` forces every session to 8-bit SDR. Which hosts can actually deliver it, and the client half of the switch, are on [HDR](/docs/hdr). |
+| `PUNKTFUNK_444` | `1` · `0` *(default on)* | Host **policy gate** for full chroma 4:4:4 — sharper text and thin lines, no chroma loss. **On by default**; `0` forces every session to 4:2:0. It only ever *allows*: the client's own 4:4:4 setting (default off) is the real per-session switch, and the codec, capture-path and GPU gates behind it are on [Client settings → Full chroma](/docs/client-settings#video). Which GPUs and which clients can actually do it is in the [support matrix](/docs/support-matrix#encoders); how it interacts with HDR is on [HDR](/docs/hdr). **punktfunk/1 native only** — Moonlight stays 4:2:0. |
 | `PUNKTFUNK_CHACHA20` | `1` · `0` *(default on)* | ChaCha20-Poly1305 session encryption for clients without hardware AES (old ARM TVs, e.g. webOS), lifting their ~100 Mbps software-AES decrypt ceiling. **On by default** on the host; a session uses it only when the client requests it — everyone else stays on AES-GCM. Purely a performance choice (both ciphers are full-strength); set `0` to force AES-GCM for all sessions. |
 | `PUNKTFUNK_PYROWAVE_MAX_MBPS` | `N` (Mbps) | Cap the [PyroWave](/docs/pyrowave) Automatic bitrate pin, for a host on a link that the open-loop pin can outrun (e.g. 4:4:4 + HDR at 5120×1440@240 pins ~5.3 Gbps, over a 5GbE link). Unset = no cap. Only affects Automatic (bitrate `0`) PyroWave sessions; an explicit client bitrate bypasses it. |
 | `PUNKTFUNK_DSCP` | `1` | Opt-in DSCP / `SO_PRIORITY` QoS tagging on the media sockets. No-op on the wire on Windows without a qWAVE policy. |
-| `PUNKTFUNK_OH264_THREADS` / `PUNKTFUNK_OH264_GOP` | `N` | Software (openh264) encoder tuning: encode threads (default 2 — latency over throughput) and GOP length (default 0 = encoder-auto). Only relevant with `PUNKTFUNK_ENCODER=software`. |
+| `PUNKTFUNK_OH264_THREADS` / `PUNKTFUNK_OH264_GOP` | `N` | Software (openh264) encoder tuning: encode threads (default 2 — latency over throughput) and GOP length in frames (unset = about ten minutes' worth, `fps × 600`; set `0` for encoder-auto). Only relevant with `PUNKTFUNK_ENCODER=software`. |
 | `PUNKTFUNK_MAX_FPS` | `N` (fps) *(default: no limit)* | **Frame limiter for the game** — how fast the compositor lets it render. It does *not* cap the stream: the client still negotiates and receives its full rate, because the encode loop re-encodes the held frame whenever the compositor produced no new one (an almost-empty P-frame). A 60-capped game on a 120 Hz session still sends 120 frames a second, and the GPU time the game gives up goes to capture and encode instead — and to heat and battery on a laptop or handheld. **gamescope only today**: it takes this as `--nested-refresh`, the rate it clamps the game to; that is the nested output's rate, so everything gamescope composites moves at it. Other compositors have no equivalent lever and ignore it. |
 | `PUNKTFUNK_VDISPLAY_HZ_MULT` | `1`–`4` *(default `1` = off)* | Run the **virtual display** at a multiple of the session's frame rate without sending a single extra frame. A compositor paints on its own vblank, so a frame finished just after the capture sampled waits nearly a whole interval to be picked up — the jittery part of the latency budget. At `2` that worst case halves. Costs the compositor and GPU the extra composites, so it's opt-in. If the backend won't give the multiplied rate it reports what it achieved and the stream paces to that. |
 
@@ -112,20 +148,37 @@ See your desktop page ([KDE](/docs/kde), [GNOME](/docs/gnome)) for when to set t
 
 | Setting | Values | Meaning |
 |---|---|---|
-| `PUNKTFUNK_AUDIO_GAIN` | float (default `1.0`) | Linear gain applied to capture — bump it for a quiet source. |
+| `PUNKTFUNK_AUDIO_GAIN` | float (default `1.0`) | **(Moonlight/GameStream sessions only)** Linear gain applied to captured desktop audio — bump it for a quiet source. The native `punktfunk/1` path ignores it; adjust the source's own volume there instead. |
 | `PUNKTFUNK_MIC_DEVICE` | name substring | **(Windows)** Target mic-uplink device by friendly-name substring (first match wins). |
 | `PUNKTFUNK_NO_MIC_INSTALL` | set | **(Windows)** Skip installing the virtual-mic driver (e.g. when the host runs as SYSTEM). |
+| `PUNKTFUNK_HOST_AUDIO` | set | **(Windows)** Also play the stream's audio on the host's own speakers. While a session is capturing desktop audio the host parks the default playback device on a silent sink, so sound comes out of the *client* only — that's why the PC goes quiet when a stream starts. Set this to prefer a real output device instead (audible on both ends). The default is put back when the capture closes. |
+| `PUNKTFUNK_KEEP_DEFAULT` | set | **(Windows)** Never touch the default playback/recording devices at all — the host leaves whatever you chose in Sound settings in place. The mic uplink still picks a target device; you may then have to select it yourself. |
+
+## Clipboard
+
+| Setting | Values | Meaning |
+|---|---|---|
+| `PUNKTFUNK_CLIPBOARD` | `off` *(default)* · `on`/`1` · `text-only` | Share the clipboard between client and host. `on` allows text, HTML/RTF and images **plus file transfer**; `text-only` (alias `no-files`) allows the text and image formats but refuses files. |
+
+This line is only half the switch — your client has a per-host toggle that also has to be on, and
+the host needs a clipboard backend underneath. Both, and what a greyed-out toggle means, are on
+[Shared clipboard](/docs/clipboard).
 
 ## Windows host
+
+Capture of the **secure desktop** — UAC prompts, the lock screen, the login screen — is always on
+and has no setting: the host reads the pf-vdisplay driver's ring directly, and those surfaces are in
+it. The service still writes a `PUNKTFUNK_SECURE_DDA=1` line into a freshly generated `host.env` and
+nothing reads it — leave it or delete it, it makes no difference.
 
 | Setting | Values | Meaning |
 |---|---|---|
 | `PUNKTFUNK_VDISPLAY` | `pf` | Virtual-display backend. The bundled pf-vdisplay IddCx driver is the only backend now — informational; leave as `pf`. |
-| `PUNKTFUNK_SECURE_DDA` | `1` | Capture the secure desktop (UAC / lock / login) so the stream survives those transitions. |
 | `PUNKTFUNK_MONITOR_LINGER_MS` | ms (default `10000`) | Defer tearing a per-client virtual display down after disconnect. A reconnect inside the window preempts it and creates a fresh one (a reused IddCx swap-chain is dead); the stable per-client monitor id keeps Windows' saved display config applying either way. Superseded by the console's **Keep alive** setting — see [Virtual displays](/docs/virtual-displays). |
 | `PUNKTFUNK_EXCLUSIVE_REASSERT_MS` | ms (default `2000`), `0` = off | How often the host re-checks that **exclusive** display topology actually held. Windows (or a GPU driver / display-poller tool) can quietly re-activate a physical panel moments after the host disabled it — seen on hybrid Intel+NVIDIA laptops — putting windows, the cursor, and the lock screen on a screen that isn't streamed. The host re-asserts and logs when that happens; `0` restores the old fire-and-forget behavior. |
-| `PUNKTFUNK_RENDER_ADAPTER` | description substring | Multi-GPU boxes only: force the NVENC/capture GPU by adapter Description substring (e.g. `4090`). Leave unset on single-GPU machines. |
-| `PUNKTFUNK_HOST_CMD` | e.g. `serve --gamestream` | The host subcommand the service launches. Default `serve --gamestream`; use `serve` for a secure native-only host. |
+| `PUNKTFUNK_RENDER_ADAPTER` | description substring | Multi-GPU boxes only: force the NVENC/capture GPU by adapter Description substring (e.g. `4090`). Leave unset on single-GPU machines. Superseded by a manual GPU preference in the console — see the *Picking a GPU* note under [Core](/docs/configuration#core); it still decides while the console is on Automatic. |
+| `PUNKTFUNK_NO_ISOLATE` | set | Legacy topology knob: leave the virtual display **extended** alongside your physical monitors instead of making it the sole desktop. Superseded by the console's **Topology** setting — see [Virtual displays](/docs/virtual-displays). |
+| `PUNKTFUNK_HOST_CMD` | `serve` · `serve --gamestream` | The host subcommand the service launches. A fresh install from the setup .exe writes **`serve`** — the secure, native-only host. `serve --gamestream` adds the Moonlight-compat planes; turn that on with `punktfunk-host service install --gamestream=on` (and `=off` to go back) rather than editing this by hand. If the line is missing entirely the service falls back to `serve --gamestream`. |
 
 ## Network & discovery
 
@@ -134,6 +187,7 @@ See your desktop page ([KDE](/docs/kde), [GNOME](/docs/gnome)) for when to set t
 | `PUNKTFUNK_HOST_NAME` | free text, e.g. `Living Room` | The name this host shows up under in Moonlight and in the Punktfunk clients. Default: the machine's own hostname — so a box called `bazzite-htpc` can present itself as `Living Room` without renaming the machine. Takes effect on host restart. Spaces and accents are fine; `.` becomes `-` (a dot would split the name in client lists) and it's capped at 63 characters. The machine's real hostname is still what the host answers to on the network. |
 | `PUNKTFUNK_MDNS` | `1` · `0` *(default on)* | mDNS adverts (native + GameStream). `0` skips them (same as `--no-mdns`) — for networks/containers where multicast doesn't work; add the host by address in the client instead. |
 | `PUNKTFUNK_DATA_PORT` | port | Pin the per-session video data plane to a fixed UDP port and stream direct (no hole-punch) — open exactly that port in the host firewall. Same as `serve --data-port`; see [Troubleshooting](/docs/troubleshooting). Default: random port + hole-punch. |
+| `PUNKTFUNK_IDLE_TIMEOUT_MS` | ms (default `8000`) | How long the host waits before declaring a client that vanished (cable pulled, Wi-Fi dropped) gone — which is when a kept virtual display starts its linger. Lower it (e.g. `3000`) to reclaim displays sooner; it's clamped to ≥1 s and the keep-alive scales with it, so a live session never false-disconnects. A deliberate quit is instant regardless. Same as `--idle-timeout-ms` on `punktfunk1-host`. |
 
 ## Auth, API & paths
 
@@ -141,7 +195,18 @@ See your desktop page ([KDE](/docs/kde), [GNOME](/docs/gnome)) for when to set t
 |---|---|---|
 | `PUNKTFUNK_MGMT_TOKEN` | token | Bearer token for the management API. If unset it's auto-generated and persisted to `~/.config/punktfunk/mgmt-token` (the bundled web console sources it). Set only to pin a specific token. |
 | `PUNKTFUNK_UI_PASSWORD` | password | Web-console login password. Normally generated on first start and stored in `~/.config/punktfunk/web-password` — see [Forgot your Password?](/docs/forgot-password). |
+| `PUNKTFUNK_PLUGIN_TOKEN` | token | The scoped token the [plugin/scripting runner](/docs/plugins) uses — a narrower credential than `PUNKTFUNK_MGMT_TOKEN`, never full admin. Same precedence: if unset it's generated and persisted to `~/.config/punktfunk/plugin-token`. Set only to pin a specific token. |
 | `PUNKTFUNK_CONFIG_DIR` | path | Override the config directory (default `~/.config/punktfunk`) — pairing state, certs, apps.json, captures. |
+
+## Updates
+
+The host checks for a newer release and, where the platform allows it, can install it from the web
+console. Both halves have a kill switch — see [Updating the Host](/docs/updating).
+
+| Setting | Values | Meaning |
+|---|---|---|
+| `PUNKTFUNK_UPDATE_CHECK` | `0` · `false` · `off` | Never contact the update feed. The console's Updates card then shows checks as disabled; everything else keeps working. |
+| `PUNKTFUNK_UPDATE_APPLY` | `0` · `false` · `off` | Keep the check but remove the **Update now** button, so the console only ever tells you the command to run. |
 
 ## Advanced performance tuning
 
@@ -150,7 +215,7 @@ notes for context.
 
 | Setting | Values | Meaning |
 |---|---|---|
-| `PUNKTFUNK_GSO` | `1` · `0` | UDP Generic Segmentation Offload on the send path (coalesce a frame's packets into kernel super-buffers) — cuts send CPU ~30%, but its line-rate packet trains can cost delivered throughput on constrained links (measured on a 2.5GbE hop). Off by default until send pacing spaces the super-buffers; set `1` to opt in (auto-falls back to `sendmmsg` on kernels/paths without support). |
+| `PUNKTFUNK_GSO` | `1` · `0` | UDP segmentation offload on the send path (coalesce a frame's packets into kernel super-buffers) — cuts send CPU ~30%, but its line-rate packet trains can cost delivered throughput on constrained links (measured on a 2.5GbE hop). The default differs by platform. **Windows: on by default** (Send Offload — the lever that gets past ~1 Gbps, since Windows otherwise does one send call per packet); set `0` if a constrained link shows lost throughput. It also latches itself off for the rest of the run the first time the OS/NIC/path rejects an offloaded send. **Linux: off by default** until send pacing spaces the super-buffers; set `1` to opt in (auto-falls back to `sendmmsg` on kernels/paths without support). |
 | `PUNKTFUNK_SPLIT_ENCODE` | `0`/`disable` · `1`/`auto` · `2` · `3` | NVENC N-way split-encode for very high pixel rates (5K@240). `auto` picks automatically above ~1 Gpix/s. H.264 never splits (not applicable per the SDK); on HEVC a *forced* split disables sub-frame readback (mutually unsupported) — set `0` to choose sub-frame instead. |
 | `PUNKTFUNK_NVENC_SUBFRAME` | `0` · `1` | NVENC sub-frame (slice-level) readback for lower latency on sync sessions. Default: on where the GPU supports it (Linux direct NVENC). `0` = never; `1` = force. On HEVC it yields to a forced split-encode (the SDK documents the pair unsupported). |
 | `PUNKTFUNK_GPU_PRIORITY_CLASS` | `off` · `normal` · `high` · `realtime` · `auto` | **(Windows)** GPU scheduling priority for capture/encode under a GPU-saturating game. Default `auto` (starts `high`, upgrades to `realtime` when it's safe — e.g. HAGS off); `high` pins the static pre-gate behaviour; `realtime` is the strongest lever but can freeze NVENC on some setups. |
@@ -171,7 +236,8 @@ A few knobs are read by the native **clients**, not the host:
 
 | Setting | Values | Meaning |
 |---|---|---|
-| `PUNKTFUNK_DECODER` | `software` · `vaapi` · `vulkan` (Linux) · `d3d11va` (Windows) | Force the decode path. Default auto-selects hardware per vendor (Linux: VAAPI on Intel/AMD, Vulkan Video on NVIDIA and the Steam Deck; Windows: Vulkan Video on NVIDIA/AMD, D3D11VA on Intel and others) with a software fallback. |
+| `PUNKTFUNK_DECODER` | `software` · `vaapi` · `vulkan` (Linux) · `d3d11va` (Windows) | Force the decode path. Default auto-selects hardware per GPU vendor and falls back on its own: **Linux** — Vulkan Video first on NVIDIA and AMD, VAAPI first on Intel and anything else; **Windows** — Vulkan Video first on NVIDIA and AMD, D3D11VA first on Intel and anything else. Whichever isn't first is the next thing tried, with software last. |
+| `PUNKTFUNK_PREFER_PYROWAVE` | `1` | Ask for the [PyroWave](/docs/pyrowave) wavelet codec on a wired link, where the client's own setting isn't reachable (the gamepad console, a headless launch). |
 | `PUNKTFUNK_OSD_SCALE` | multiplier, e.g. `1.5` *(default `1`)* | Size of the in-stream overlay — the stats OSD, the capture hint and the start banner. They already follow your display's scaling setting (200 % display → twice the pixels), so set this only to nudge that: bigger for a TV across the room, smaller if your compositor reports an aggressive scale. Clamped to 0.5×–4×, and a line that would run off the screen is shrunk to fit. |
 
 ## Bitrate
@@ -196,3 +262,26 @@ exposes it as `--max-concurrent N` (see the [Host CLI](/docs/host-cli) reference
 - Client and host **negotiate the codec**: **HEVC (H.265)** by default, **AV1** for clients that
   support it, and **H.264** when the session runs on the GPU-less software encoder.
 - The native protocol adds forward error correction for lossy links — see `PUNKTFUNK_FEC_PCT` above.
+
+## Settings documented elsewhere
+
+Not everything you can configure is a `host.env` line, and a few knobs are explained on the page
+that owns their feature:
+
+- **Virtual-display policy** — keep-alive, topology, per-client scaling — lives in the web console
+  and `display-settings.json`: [Virtual displays](/docs/virtual-displays).
+- **Which GPU to use** on a multi-GPU box is a console choice (`gpu-settings.json`) that outranks
+  `PUNKTFUNK_RENDER_NODE` / `PUNKTFUNK_RENDER_ADAPTER` — see *Picking a GPU* above.
+- **Event hooks and webhooks** are `hooks.json`, not environment variables:
+  [Events & hooks](/docs/automation).
+- **Updating**, including the one-click opt-in on Linux: [Updating the Host](/docs/updating).
+- **Encoder prerequisites** (Mesa/VAAPI packages, Intel HuC firmware, NVIDIA driver bits):
+  [Requirements](/docs/requirements).
+- **Full chroma (4:4:4)** — which codecs, capture paths, GPUs and clients can carry it:
+  [Client settings](/docs/client-settings#video).
+- **Client settings** — resolution, bitrate, codec, decoder, HDR — are set in the client app, with
+  what each one defaults to and which of them the host can overrule:
+  [Client settings](/docs/client-settings).
+
+The host also reads a number of debugging and development variables that aren't listed here; they
+change between releases and are not meant for everyday use.

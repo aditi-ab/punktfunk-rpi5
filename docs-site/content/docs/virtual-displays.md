@@ -1,24 +1,27 @@
 ---
 title: Virtual displays
-description: Control how punktfunk creates, keeps alive, and arranges the virtual displays it streams — presets, keep-alive, exclusive vs. extend, and persistent per-client scaling.
+description: Control how Punktfunk creates, keeps alive, and arranges the virtual displays it streams — presets, keep-alive, exclusive vs. extend, and persistent per-client scaling.
 ---
 
-When a client connects, punktfunk creates a **virtual display** sized to exactly that client's
+When a client connects, Punktfunk creates a **virtual display** sized to exactly that client's
 resolution and refresh, renders your desktop or game onto it, and streams it. This page is about the
 **policy** for that display: how long it survives a disconnect, whether it takes over your physical
 monitors, what happens when a second client connects, and how desktop environments remember
 per-client settings like scaling.
 
-You set this policy in the **web console** (Host → *Virtual displays*), or by editing
+You set this policy in the **web console** (the **Virtual displays** page), or by editing
 `~/.config/punktfunk/display-settings.json` directly (`%ProgramData%\punktfunk\display-settings.json`
 on Windows). A change applies to the **next** connection — a running session keeps the display it
 opened on.
 
-> **You rarely need to touch this.** The default behavior matches how punktfunk has always worked.
+> **You rarely need to touch this.** The default behavior matches how Punktfunk has always worked.
 > Reach for a preset when you want a specific experience — a dedicated box you only stream from, a
 > desktop you also use in person, or a multi-monitor workstation.
+>
+> Here for one specific problem — monitors that stayed dark, or a streamed screen showing nothing
+> but wallpaper? Go straight to [Troubleshooting](#troubleshooting) at the bottom.
 
-If you'd rather stream a monitor the host **already has** than have punktfunk make one, that's a
+If you'd rather stream a monitor the host **already has** than have Punktfunk make one, that's a
 different setting and it turns most of this page off — see
 [Stream a real monitor instead](#stream-a-real-monitor-instead) right below.
 
@@ -31,15 +34,19 @@ different setting and it turns most of this page off — see
 
 ## Stream a real monitor instead
 
+> **Linux only.** A Windows host enumerates its monitors but has no backend that can capture one, so
+> the Streamed screen card is read-only there and every Windows session gets a virtual display.
+
 Sometimes you don't want a new screen — you want *that* screen. A shop-floor PC on a wall mount, a
 lab bench machine, a media box whose TV output you'd like to watch from the couch: what matters is
 seeing the monitor that's already there, exactly as the person in front of it sees it.
 
-Set **Host → *Virtual displays* → Streamed screen** to one of the listed monitors and punktfunk stops
-creating a virtual display altogether. It streams that physical monitor instead, and every client
-sees it at *its* resolution — you're a viewer of a screen, not the owner of your own.
+Set **Virtual displays → Streamed screen** in the console to one of the listed monitors and
+Punktfunk stops creating a virtual display altogether. It streams that physical monitor instead,
+and every client sees it at *its* resolution — you're a viewer of a screen, not the owner of your
+own.
 
-- The monitor is **never touched**. punktfunk doesn't resize it, move it, disable it or restore it —
+- The monitor is **never touched**. Punktfunk doesn't resize it, move it, disable it or restore it —
   it only watches. Keep-alive, topology and the multi-monitor layout options above simply don't
   apply, because there's no display of ours to apply them to.
 - **The resolution is the monitor's**, not yours. A client asking for a different one is politely
@@ -47,21 +54,30 @@ sees it at *its* resolution — you're a viewer of a screen, not the owner of yo
   rude, and the mid-stream resize machinery is switched off for this reason.
 - **Every client sees the same screen.** Two clients means two viewers of one monitor, not two
   desktops.
-- Naming a monitor that isn't there is a **hard error**, not a fallback: the session fails with
-  `no monitor named "DP-9" — this host has: HDMI-1`. Showing you the wrong screen would be worse
-  than showing you none.
+- Naming a monitor this host **doesn't have, while it has others**, is a **hard error**, not a
+  fallback: the session fails with `no monitor named "DP-9" — this host has: HDMI-1`. Showing you
+  the wrong screen would be worse than showing you none. The one exception is a session with **no
+  physical heads at all** — a nested or headless compositor: there the pin is set aside with a
+  warning in the log and you get an ordinary virtual display, and it applies again the next time a
+  session with real heads runs. Streaming the *wrong* screen is refused; streaming a virtual one
+  when there's no screen to mirror is not.
 - Choosing **Virtual screen (default)** in the same card puts you back on the normal path.
 
-Supported on **KDE/KWin**, **GNOME/Mutter**, **Sway/wlroots** and **Hyprland** — each through the
+Supported on **KDE/KWin**, **GNOME/Mutter**, **Sway/wlroots**, **Hyprland** and **gamescope Game
+Mode** (a Steam Deck / Bazzite couch box, where gamescope drives the screen) — each through the
 compositor's own screen-recording API, so there is **no chooser dialog** and nothing to click. That
 matters most for a host running unattended as a [service](/docs/running-as-a-service): a background
 `systemd --user` daemon has nobody to answer a permission prompt, so the monitor has to be
-configuration rather than a question. (A nested gamescope session has no physical monitors of its
-own, so the setting doesn't appear there.)
+configuration rather than a question. On gamescope only the one head the session is driving is
+listed and mirrorable — mirroring attaches to the session's own composited stream, so that screen
+keeps showing exactly what the person in front of it sees and nothing is relaunched. A *nested* or
+headless gamescope (the per-client sessions the host spawns itself) has no head of its own, so the
+picker is empty there.
 
 ### Naming the monitor from the host
 
-Monitors are named by **connector** — `HDMI-A-1`, `DP-2`, `eDP-1`. List what this host has:
+Monitors are named by **connector** — `HDMI-A-1`, `DP-2`, `eDP-1`. List what this host has (these
+subcommands are Linux-only, like the setting itself):
 
 ```sh
 punktfunk-host list-monitors
@@ -94,6 +110,28 @@ punktfunk-host mirror-test --monitor HDMI-A-1 --seconds 20
 Compositor screen recording is **damage-driven**: an idle desktop legitimately produces almost no
 frames, so move the mouse on the host while it runs or a working mirror reads as a stall.
 
+### Absolute input follows the pin
+
+Pinning a monitor also re-aims **absolute** mouse and pen input: the host anchors it to that head's
+origin, so a click lands where you point on *that* screen. It's matched by position rather than by
+size, because two monitors can be the same size — and getting that wrong puts the pointer silently
+on the wrong screen. The host resolves the pin at startup and again whenever the console writes it,
+so a change needs no restart; the log line to look for is `capture monitor: …`.
+
+To check it with no client involved:
+
+```sh
+punktfunk-host anchor-test --monitor HDMI-A-1
+```
+
+It lists this host's heads, says whether the box even has the same-size pair the matching exists
+for, walks the pointer through the centre and the corners so you can watch which screen it moves
+on, and prints the region it mapped into. `--none` runs the same walk unanchored, as an A/B.
+
+The anchor rides the **libei** injector — the backend a GNOME/Mutter host uses. On KWin, Sway and
+Hyprland the host injects through a different protocol, and `anchor-test` stops with a message
+saying so rather than reporting a green run that proves nothing.
+
 ## Pick a preset
 
 A preset is the easy way in — select one in the console and you're done. Each expands to a bundle of
@@ -103,7 +141,7 @@ the individual options documented further down.
 |---|---|
 | **Default** | Good for most setups. Reconnects resume quickly, the streamed output becomes the whole desktop, and extra viewers each get their own screen. |
 | **Headless box** | A machine with no monitor that you only ever stream from. The game and its display survive disconnects indefinitely (keep-alive **forever**), and whoever connects next takes the box over. Release it from the console when you're done. |
-| **Shared desktop** | A PC you also use in person. punktfunk never blanks your real monitors and never leaves a leftover display behind; extra viewers each get their own screen. |
+| **Shared desktop** | A PC you also use in person. Punktfunk never blanks your real monitors and never leaves a leftover display behind; extra viewers each get their own screen. |
 | **Hot-desk** | One person at a time — roam between your own devices with an instant reconnect. Anyone else is told the box is busy, and each device+resolution keeps its own scaling. |
 | **Workstation** | Your multi-monitor daily driver. Displays come back exactly where you arranged them, each client keeps its own settings, and the desktop is yours alone. |
 
@@ -137,8 +175,8 @@ this also keeps the **game itself running** so you can reconnect straight back i
 - **Off** — tear the display down at session end (nothing lingers).
 - **A duration** (seconds) — keep it for that long; a reconnect inside the window drops you straight
   back in, with no re-negotiation and no desktop reshuffle.
-- **Forever** — keep it until you stop the host or **release it** from the console (Host → *Virtual
-  displays* → *Release*). This is the headless-box model.
+- **Forever** — keep it until you stop the host or **release it** from the console (**Virtual
+  displays** → *Release*). This is the headless-box model.
 
 Default: **10 seconds**. Windows has always lingered 10 s; the Linux backends previously tore down
 immediately — a short linger makes reconnects smoother on both.
@@ -157,7 +195,7 @@ the QUIC idle timeout — 8 s by default, tunable with `PUNKTFUNK_IDLE_TIMEOUT_M
 
 ### Topology
 
-What punktfunk does with your monitor layout while it streams.
+What Punktfunk does with your monitor layout while it streams.
 
 - **Extend** — add the virtual display alongside your real monitors; touch nothing else.
 - **Primary** — make the virtual display your primary output; your physical monitors stay on.
@@ -190,13 +228,13 @@ Per-backend support:
   **per client**, or one **per client + resolution**.
 - **Layout / max displays** — when several clients each become a monitor of one desktop, this places
   them side by side (**auto**) or exactly where you arrange them in the console (**manual**, keyed to
-  each client), up to **max displays**. Arrange them under Host → *Virtual displays* once two or more
+  each client), up to **max displays**. Arrange them on the **Virtual displays** page once two or more
   are streaming.
 
 ### Dedicated game sessions
 
-**Dedicated game sessions** control how a session that *launches a game from your library* is served
-(Linux hosts):
+**Dedicated game sessions** control how a session that *launches a game from
+[your library](/docs/game-library)* is served (Linux hosts):
 
 - **Auto** (default) — the launch rides whatever session the box is in: the managed Steam session on a
   Steam Deck / Bazzite couch box, a bare gamescope on a plain distro, or spawned into your live KDE /
@@ -208,14 +246,14 @@ Per-backend support:
   the game keeps running when you disconnect and you re-attach straight back into it.
 
 Dedicated needs `gamescope` installed on the host; if it isn't, a launch falls back to **Auto**
-routing. This axis is independent of the preset — pick it under Host → *Virtual displays*. On a box
+routing. This axis is independent of the preset — pick it on the **Virtual displays** page. On a box
 that's already in Steam game mode, a dedicated Steam launch frees game mode's Steam first and restores
 it when the session ends. (GameStream / Moonlight launches follow the same routing.)
 
 ## When a game ends, and when a session does
 
-A streaming session and the game the host launched for it can share a fate. Two switches, under
-Host → *Virtual displays* → **When a game or a session ends**. They apply to every store and both
+A streaming session and the game the host launched for it can share a fate. Two switches, on the
+**Virtual displays** page under **When a game or a session ends**. They apply to every store and both
 protocols — and only ever to a game **this host launched for the session**: a game you started
 yourself is never touched.
 
@@ -306,14 +344,16 @@ One knob has no console equivalent — it's a transport tuning, not display poli
 
 **My physical monitors stayed off after I disconnected.** You have keep-alive set together with
 Exclusive topology — the display (and your isolated desktop) is being kept for the linger window.
-Release it from the console (Host → *Virtual displays*), or switch to the **Shared desktop** preset
+Release it from the console (**Virtual displays**), or switch to the **Shared desktop** preset
 so streaming never disables your real monitors.
 
 **The virtual output shows only my wallpaper.** Your topology is Extend, so the streamed display is
 an empty extension. Use **Primary** or **Exclusive** so your desktop actually lands on it.
 
-**KWin virtual outputs need KWin ≥ 6.5.6.** Older KWin can't create the virtual output at all —
-see [requirements](/docs/requirements).
+**KWin can't create the virtual output.** On a normal Plasma session KWin runs its **DRM backend**,
+which creates virtual outputs at any version. The 6.5.6 floor applies only to the **virtual backend**
+(`kwin_wayland --virtual`, used for headless and test sessions) — below that the request fails with
+"Could not find output". See [requirements](/docs/requirements).
 
 **Reconnecting into game mode reconnects cleanly now.** On a Steam Deck / Bazzite box, disconnecting
 and reconnecting within game mode reuses the still-warm session (or cleanly recreates it) instead of
@@ -322,7 +362,7 @@ follows the switch. If a launched game **exits**, a dedicated session ends and r
 library; a game mode / desktop session keeps streaming.
 
 **My keep-alive / topology / layout settings do nothing.** Check whether **Streamed screen** is set
-to a real monitor. Those options are all about a display punktfunk created; when it's mirroring one
+to a real monitor. Those options are all about a display Punktfunk created; when it's mirroring one
 of yours there is nothing of ours to keep alive or rearrange. Switch the card back to *Virtual screen
 (default)* to get them back.
 
@@ -332,7 +372,7 @@ the host) to choose from the console instead.
 
 **My session fails with "no monitor named …".** The pinned connector isn't among this host's
 monitors — it was renamed, unplugged, or the host is now in a different session. Run
-`punktfunk-host list-monitors` on the host to see the real names. punktfunk will not quietly stream a
+`punktfunk-host list-monitors` on the host to see the real names. Punktfunk will not quietly stream a
 different screen instead.
 
 **My couch box's TV stayed on the streamed session after I disconnected.** With the **Headless box**

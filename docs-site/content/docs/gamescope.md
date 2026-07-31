@@ -1,6 +1,6 @@
 ---
 title: Steam / gamescope
-description: Configure a gamescope/Steam host — attach vs managed, session following, and limits.
+description: Configure a gamescope/Steam host — how the host gets a gamescope, session following, and limits.
 ---
 
 gamescope is the compositor behind Steam **Gaming Mode** — the couch/handheld game UI on Bazzite,
@@ -15,11 +15,11 @@ from the install guide for your OS: [Bazzite](/docs/bazzite) or [SteamOS (Host)]
 > New here? Read [Security & Safe Use](/docs/security) first — a streaming host is remote control of
 > the machine, so keep it on a trusted LAN or VPN and require pairing.
 
-## Attach vs managed
+## How the host gets a gamescope
 
-There are two mutually-exclusive models for a gamescope box; pick one. With **nothing set**, a box
-that has gamescope session infrastructure (Bazzite, SteamOS, Nobara) gets **managed**; the
-[Bazzite template](/docs/bazzite) ships with **attach** chosen instead.
+There are three models; the host picks one per session, and you rarely have to. With **nothing
+set**, a box that has gamescope session infrastructure (Bazzite, SteamOS, Nobara) gets **managed**;
+the [Bazzite template](/docs/bazzite) ships with **attach** chosen instead.
 
 - **Attach** (`PUNKTFUNK_GAMESCOPE_ATTACH=1`) — the **box** owns its gamescope session and decides
   Gaming vs Desktop via the normal Steam UI. Game Mode stays on the box's own (physical) display;
@@ -32,6 +32,11 @@ that has gamescope session infrastructure (Bazzite, SteamOS, Nobara) gets **mana
   takes the box's gamescope session over and relaunches it **headless** at the *client's* exact
   resolution and refresh — Game Mode runs on the virtual screen, physical displays drop out of it —
   restoring the box on idle after disconnect.
+- **Bare spawn** (the default on a plain distro with no gamescope session infrastructure and no
+  gamescope already running, and the route a dedicated game launch takes unless you've forced
+  managed or attach) — the host starts its own headless gamescope per session at the client's mode
+  and runs the session's launch command (or `PUNKTFUNK_GAMESCOPE_APP`) inside it. Nothing on the
+  box is taken over, because there is nothing to take over.
 
 ### Nobara and other autologin display managers
 
@@ -41,8 +46,9 @@ depends on the display manager driving the autologin:
 - **SDDM** (Bazzite, SteamOS): handled automatically — no setup.
 - **plasmalogin** (Nobara) and other display managers: the host must stop the display manager
   itself for the length of the stream and restart it afterwards, which needs privilege. The
-  packages ship that privilege: a root helper (`/usr/libexec/punktfunk/pf-dm-helper`) behind its
-  own polkit action (`io.unom.punktfunk.dm-helper`), invoked automatically when the plain
+  packages ship that privilege: a root helper (`/usr/libexec/punktfunk/pf-dm-helper`, or
+  `/usr/lib/punktfunk/pf-dm-helper` from the Arch package) behind its own polkit action
+  (`io.unom.punktfunk.dm-helper`), invoked automatically when the plain
   `systemctl` verbs are denied — no setup. The helper only stops/restores the unit the
   `display-manager.service` symlink points at, the same class of local-seat operation these
   distros already authorize for their own session switcher (Nobara's `os-session-select`).
@@ -81,6 +87,27 @@ depends on the display manager driving the autologin:
   Steam's "Switch to Desktop" inside the streamed Game Mode returns the box to its desktop session
   and the stream follows it there; the desktop's "Return to Gaming Mode" switches it forward again.
 
+## Stream the screen the box is already driving
+
+There is a fourth thing you can ask for, and it isn't a gamescope model at all: **mirror the head
+Gaming Mode is lighting**. A Gaming Mode gamescope is the DRM master of a real connector, so that
+head is listed by `punktfunk-host list-monitors` and appears in the web console under **Virtual
+displays → Streamed screen**. Pick it there, or pin it from
+[`host.env`](/docs/configuration):
+
+```sh
+PUNKTFUNK_CAPTURE_MONITOR=HDMI-A-1
+```
+
+The host then attaches to the session's own composited output: nothing is stopped, nothing is
+relaunched, no mode is imposed, and what you see is exactly what is on the TV. That is the
+difference from **managed**, which deliberately takes the session over and blanks the panel.
+
+Only the one head the session drives is listed — a nested or headless gamescope (including the
+per-session ones the host spawns itself) has none of its own, so the picker is empty there. Full
+details, including what the setting turns off, are in
+[Stream a real monitor instead](/docs/virtual-displays#stream-a-real-monitor-instead).
+
 ## Session following
 
 `PUNKTFUNK_SESSION_WATCH` follows a Gaming ↔ Desktop switch **mid-stream** — the host rebuilds the
@@ -98,38 +125,42 @@ gamescope session and picks the model for it:
 systemctl --user enable --now punktfunk-host
 ```
 
+Which of the three it picked is logged per session:
+
+```sh
+journalctl --user -u punktfunk-host | grep 'gamescope sub-mode'
+```
+
 Then bring up [The Web Console](/docs/web-console) to arm pairing.
 
 ## gamescope knobs
 
-The gamescope-specific settings in `host.env`. Leave them unset to auto-detect; set one only to force
-a model. See the full [Configuration reference](/docs/configuration) for every other knob.
+Every gamescope setting — the three models above, `PUNKTFUNK_GAMESCOPE_NODE`, the bare-spawn flags
+(`APP`, `SPLASH`, `STEAM`, `GRAB_CURSOR`), the binary override, the two HDR knobs, and
+`PUNKTFUNK_SESSION_WATCH` — lives in the `host.env` reference, under *gamescope / session
+following*: [Configuration](/docs/configuration). Leave them unset to auto-detect; set one only to
+force a model.
 
-| Setting | Values | Meaning |
-|---|---|---|
-| `PUNKTFUNK_GAMESCOPE_ATTACH` | `1` | **Attach** model: the box owns its gamescope session (on its own display); the host captures whatever's live and never tears it down. On a **headless** box the box-owned autologin session is restarted at the client's resolution on a mismatch; a box driving a physical display, and any foreign/bare gamescope, streams at its own mode. |
-| `PUNKTFUNK_GAMESCOPE_MANAGED` | `1` | **Managed** model (the default where session infra is detected): the host takes the box's gamescope over and relaunches it headless at the client's exact mode, restoring on idle. |
-| `PUNKTFUNK_GAMESCOPE_SESSION` | `steam` | The host owns a `gamescope-session-plus` (Steam) session at the client's mode — a headless appliance with no physical session running. |
-| `PUNKTFUNK_GAMESCOPE_NODE` | `auto` · node id | Discover and capture a **running** gamescope's PipeWire node at a fixed mode. Do **not** combine with `SESSION`. |
-| `PUNKTFUNK_GAMESCOPE_APP` | command | For an ad-hoc bare-gamescope session, the nested command to run (e.g. `vkcube`). |
-| `PUNKTFUNK_SESSION_WATCH` | `1` · `0` | Follow a Gaming ↔ Desktop switch mid-stream (rebuild in place, no reconnect). On by default on Bazzite/SteamOS; set `0` to disable. |
-| `PUNKTFUNK_GAMESCOPE_HDR` | `1` · `0` *(default on)* | Allow HDR (10-bit BT.2020 PQ) sessions. Needs `punktfunk-gamescope` (SDR otherwise) — see below. Set `0` to force SDR. |
-| `PUNKTFUNK_GAMESCOPE_SDR_NITS` | e.g. `400` | On an HDR session, how bright SDR content (the desktop, the Steam overlay, an SDR game) is inside the PQ container. gamescope's default is 400. |
-| `PUNKTFUNK_GAMESCOPE_BIN` | path | Force a specific gamescope binary. Otherwise the host prefers `punktfunk-gamescope` on `PATH`, then `gamescope`. |
+Two are worth naming here, because the sections below turn on them:
+
+- `PUNKTFUNK_GAMESCOPE_HDR` — on by default; see [HDR on gamescope](#hdr-on-gamescope).
+- `PUNKTFUNK_GAMESCOPE_BIN` — forces one gamescope binary. Unset, the host prefers
+  `punktfunk-gamescope` on `PATH` and falls back to `gamescope`.
 
 ## HDR on gamescope
 
 Games can render HDR on a headless gamescope today, but a stock gamescope's **capture** output is
 8-bit SDR: its PipeWire node offers only 8-bit formats, and it tone-maps the composite down before
 handing it over. So a stock setup streams SDR — correctly, including a correct SDR rendition of an
-HDR game — and there is nothing to configure.
+HDR game — and there is nothing to configure. This section is the gamescope half; the rest of the
+chain, and what to check when a stream comes out SDR, is on [HDR](/docs/hdr#linux--gamescope).
 
 To stream real HDR you need `punktfunk-gamescope`: gamescope plus a small patch that adds the
 10-bit BT.2020 PQ formats to that node (offered upstream as
 [gamescope#2126](https://github.com/ValveSoftware/gamescope/issues/2126)). It installs under its
 own name and does **not** replace your system gamescope — your Gaming Mode keeps using that one.
 
-- **Bazzite / Fedora Atomic** — included in the punktfunk sysext; `punktfunk-sysext update` gets it.
+- **Bazzite / Fedora Atomic** — included in the Punktfunk sysext; `punktfunk-sysext update` gets it.
 - **Arch** — the `punktfunk-gamescope` package.
 - **SteamOS (Steam Deck installer)** — built and wired automatically by
   `scripts/steamdeck/install.sh` / `update.sh`.
@@ -137,54 +168,57 @@ own name and does **not** replace your system gamescope — your Gaming Mode kee
 - **Anything else** — `bash packaging/gamescope/build-punktfunk-gamescope.sh` from the source tree.
 
 HDR is attempted by default once the build is present (`PUNKTFUNK_GAMESCOPE_HDR=0` forces SDR).
-Check what the host thinks it can do:
 
-```sh
-punktfunk-host hdr-probe
-```
+**The build only reaches sessions the host starts itself** — managed, `PUNKTFUNK_GAMESCOPE_SESSION`,
+or a bare spawn. In **attach** mode the running session is the box's own, started by the display
+manager with the distro's `gamescope`, so it offers neither the 10-bit formats nor the in-node
+cursor — but the host answers both questions by asking the *installed* binary, so an installed
+`punktfunk-gamescope` makes it believe the attached session has them. Attach *plus* that build is
+the combination to avoid: [HDR → Linux + gamescope](/docs/hdr#linux--gamescope) has what it costs
+you and the two ways out.
 
-A session goes HDR when **all** of: the host allows it (`PUNKTFUNK_10BIT`, on by default, plus the
-knob above), the resolved gamescope offers the 10-bit formats, the client advertises 10-bit
-decoding with HDR enabled in its settings, the codec is HEVC or AV1 (never H.264), and the GPU
-encodes Main10. Anything missing and the session streams 8-bit SDR — decided **before** the stream
-starts, so you never get a mislabelled picture. The client overlay shows `10-bit · HDR (BT.2020
-PQ)` when it worked.
+The cursor is the half this page owns. The host leaves the pointer to the compositor whenever the
+installed build can paint it (below) — so on an attached session, which can't, nothing draws it and
+the stream has no cursor at all. Commenting
+`PUNKTFUNK_GAMESCOPE_ATTACH=1` out of the [Bazzite template](/docs/bazzite) and letting the managed
+default take over fixes that along with HDR. To stay on attach, point `PUNKTFUNK_GAMESCOPE_BIN` at
+your distro's own `gamescope` (`/usr/bin/gamescope`) instead: the host goes back to compositing the
+cursor itself, and — since the HDR answer comes from the same binary — stops attempting HDR too.
 
-Two things to know:
-
-- **SDR content rides the same PQ stream.** The desktop, the Steam overlay and SDR games are mapped
-  into the HDR container at `PUNKTFUNK_GAMESCOPE_SDR_NITS` (400 by default). If white looks too
-  bright or too dim on your TV, that is the knob.
-- **On AMD and Intel, HDR follows what the GPU can encode.** The host asks the driver whether it
-  can encode your codec at 10 bits and picks the fast path when it can — which current AMD and
-  Intel GPUs do for HEVC, and newer ones for AV1 too. On a GPU that declines, the session still
-  streams HDR through a slower path. That slower path is also the only one that can draw a pointer
-  back into the picture — so on a declining GPU, a *stock* gamescope would cost you the cursor.
-  `punktfunk-gamescope` puts the pointer in the capture itself, which is why it is worth installing
-  even on a box where you never turn HDR on. `punktfunk-host hdr-probe` reports what your box
-  answered, including which side is drawing the cursor.
+One thing to know beyond HDR itself: **the pointer rides on the same build.** When the compositor
+paints the cursor into the capture node the host stops blending one in, which is also what frees the
+session to take the encoder's fastest source — a front end with no blend stage. That is why
+`punktfunk-gamescope` is worth installing even on a box where you never turn HDR on.
 
 ## Known limits
 
 These apply to the **Gaming Mode (gamescope)** path only; the desktop path is unaffected.
 
-- **gamescope 3.16.22 or newer is required.** Older versions can deadlock during capture. Bazzite's
-  and SteamOS's current gamescope is fine; this only bites if you've pinned an old one.
-- **gamescope leaves the mouse cursor out of its captured image.** You still see a pointer: the
-  host reads it separately and draws it into every frame. That costs a full pass over the picture,
-  and on the fastest encode paths it cannot be done at all (see the AMD/Intel note above).
-  `punktfunk-gamescope` fixes it at the source — that build paints the pointer straight into the
-  capture, so the host stops redrawing it and the frame reaches the encoder untouched. Nothing to
-  configure; installing the build is enough, HDR or not.
+- **gamescope 3.16.22 or newer is required; 3.16.23 or newer for the Steam overlay.** Below
+  3.16.22, headless capture can deadlock against PipeWire 1.6. Between 3.16.22 and 3.16.23 capture
+  works, but gamescope doesn't paint the Steam overlay (Shift+Tab / the Quick Access Menu) into its
+  capture node, so the overlay is missing from an otherwise perfect picture. Either case is logged
+  at startup with the version found. Bazzite's and SteamOS's current gamescope is past both; this
+  only bites if you've pinned an old one.
+- **The cursor comes from the compositor when it can, and from the host otherwise.** A stock
+  gamescope leaves the pointer out of its captured image, so the host reads it separately and draws
+  it into every frame — a full pass over the picture, and the fastest encode source cannot blend at
+  all. `punktfunk-gamescope` paints the pointer into the capture instead, so the host stops
+  redrawing it and the frame reaches the encoder untouched — but only in a session the host starts
+  itself, not in **attach** mode (see [HDR on gamescope](#hdr-on-gamescope) above).
 - **Touch arrives as a single-finger pointer.** gamescope's virtual input device has no
   touchscreen, so the host maps a client's touchscreen to an absolute pointer: taps click exactly
   where you touch and drags work, but multi-touch gestures (pinch) aren't available in Gaming
-  Mode. The desktop path has full multi-touch.
-- **HDR needs the punktfunk gamescope build.** A stock gamescope's capture output is 8-bit SDR, so
-  sessions stream SDR — correctly, including SDR versions of HDR games. Install
-  `punktfunk-gamescope` (gamescope plus a small patch that teaches its capture node the 10-bit
-  BT.2020 PQ formats), and a 10-bit-capable client streams true HDR10 — no knob needed.
-  See [HDR on gamescope](#hdr-on-gamescope) below.
+  Mode. The desktop path has full multi-touch, and the client's other two
+  [touch modes](/docs/input#touch-modes) — trackpad and direct pointer — are unaffected either way,
+  because they send ordinary mouse events.
+- **Desktop (absolute) mouse mode is unavailable.** A client asking for it quietly stays captured
+  against a Gaming Mode session, and the [mouse-mode](/docs/input#mouse-modes) shortcut has nothing
+  to switch to.
+- **There is no clipboard.** A gamescope session offers neither mechanism the host can read and
+  write a clipboard through, so [clipboard sharing](/docs/clipboard) does nothing in Gaming Mode,
+  even with both of its switches on.
+- **HDR needs the Punktfunk gamescope build** — see [HDR on gamescope](#hdr-on-gamescope) above.
 
 To stream the KDE Plasma desktop of a Steam box instead, see [KDE Plasma](/docs/kde). To bring up the
 web console and pair a client, see [The Web Console](/docs/web-console).

@@ -1,6 +1,6 @@
 # punktfunk-docs
 
-The punktfunk documentation site: [Fumadocs](https://fumadocs.dev) on
+The Punktfunk documentation site: [Fumadocs](https://fumadocs.dev) on
 [TanStack Start](https://tanstack.com/start) (Vite + Nitro/bun preset).
 
 Content lives in [`content/docs/`](content/docs) as `.md`/`.mdx`. This site is the source of truth
@@ -19,12 +19,26 @@ cargo run -p punktfunk-host -- openapi > api/openapi.json
 cp api/openapi.json docs-site/public/openapi.json
 ```
 
+Nothing in CI diffs the two, so the snapshot goes stale silently — that manual `cp` is the only
+thing keeping them in sync. Before publishing docs, check that they match:
+
+```bash
+diff <(jq -S . api/openapi.json) <(jq -S . docs-site/public/openapi.json)
+```
+
+That should print nothing. Right now it doesn't: the committed snapshot predates the
+`/api/v1/update/check`, `/api/v1/update/apply` and `/api/v1/update/status` endpoints, so the
+published `/api` reference is missing the host self-update surface — re-copy it.
+
 ## Develop
 
 ```sh
 bun install
 bun run dev        # http://localhost:3001  (docs at /docs)
 ```
+
+CI gates every change on `bun run build` followed by `bun run lint` (the TypeScript typecheck), in
+that order — the build emits the `.source` typegen the typecheck imports. Run both before you push.
 
 ## Build & serve
 

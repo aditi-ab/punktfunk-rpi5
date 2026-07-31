@@ -4,8 +4,8 @@ description: First-party plugins — sync your ROM collection or Playnite librar
 ---
 
 Plugins extend the host through the **scripting runner** (see [Events & hooks](/docs/automation)). A
-plugin runs alongside the host, reconciles titles into your **game library** as a provider — so they
-appear in the grid on every client — and can add its own page to the [web console](/docs/web-console).
+plugin runs alongside the host, reconciles titles into your [game library](/docs/game-library) as a
+provider — so they appear in the grid on every client — and can add its own page to the [web console](/docs/web-console).
 
 Three first-party plugins today:
 
@@ -17,14 +17,21 @@ Three first-party plugins today:
 
 ## Installing from the console
 
-Open the [web console](/docs/web-console) → **Plugins**. The **Browse** tab lists the plugin
-catalog; pick one, confirm, and the host installs it and restarts the runner for you. **Installed**
-shows what you have (and switches the runner on and off), **Sources** is where the catalog comes
-from.
+Every plugin runs inside the **plugin runner**, a separate service that is off until you switch it
+on. Installing a plugin while it's off succeeds and starts nothing, so do this first:
 
-That is the whole install. The rest of this page covers the CLI, which does the same thing, and the
-trust model behind the badges — worth reading once, because a plugin runs with the same privileges
-as the host.
+1. Open the [web console](/docs/web-console) → **Plugins** → **Installed** and look at the **Plugin
+   runner** card. If it says *Not installed*, install the runner package first (see
+   [Troubleshooting](#troubleshooting) below). If it says *Disabled*, press **Enable runner** —
+   once per host. *Running* means you're set; *Stopped* means the runner is enabled but not up right
+   now, and its log says why (see [Troubleshooting](#troubleshooting)).
+2. Go to **Browse**, pick a plugin from the catalog and confirm. The host installs it and restarts
+   the runner, and the plugin's own page appears in the console's nav.
+
+**Sources** is the third tab: where catalogs come from.
+
+The rest of this page covers the CLI, which does the same thing, and the trust model behind the
+badges — worth reading once, because a plugin runs with the same privileges as the host.
 
 ### What "Verified" means
 
@@ -35,12 +42,17 @@ until the new release is reviewed too. Before anything is downloaded, the host r
 hash against the registry, so a package that was quietly republished under the same version number
 is refused rather than installed.
 
+A catalog can also **revoke** a version. When an advisory covers an entry, the console shows the
+reason against it and won't install that version — on **Browse** as a red-ringed panel with the
+install button disabled, on **Installed** as a warning against the plugin you already have. It
+never removes running code for you; that stays your decision.
+
 Three things a plugin can be:
 
 | Badge | Where it came from |
 |---|---|
 | **Verified** | The built-in catalog. unom reviewed this exact package. |
-| **Unverified**, *from &lt;source&gt;* | A catalog **you** added. Still pinned and hash-checked, but curated by somebody else — unom has not looked at the code. |
+| **External source**, *from &lt;source&gt;* | A catalog **you** added. Still pinned and hash-checked, but curated by somebody else — unom has not looked at the code. This badge is amber, not the red **Unverified** below. |
 | **Unverified** | Installed by hand from a package spec. Nobody reviewed it and nothing pins it; the console asks you to type the name to confirm, and the plugin stays marked this way for as long as it is installed. |
 
 ### Adding another catalog
@@ -125,6 +137,29 @@ onto your host.
 > Plugins are operator-installed code with operator privileges — they can launch games and run
 > commands. Install only plugins you trust, from a registry you control.
 
+## Updating and removing a plugin
+
+**Update.** The console's **Installed** tab grows an **Update to &lt;version&gt;** button whenever the
+catalog pins a newer version than the one you have; it installs through the same confirmation as a
+fresh install, and the console restarts the runner for you. There is no `plugins update` command —
+from a terminal, re-run `punktfunk-host plugins add <name>`. That installs the newest version the
+package registry has rather than the version the catalog pins, and it does **not** restart the
+runner: restart it yourself so the new code is picked up
+(`systemctl --user restart punktfunk-scripting`, or `Restart` the `PunktfunkScripting` task).
+
+**Remove.** The **Uninstall** (bin) button on the **Installed** tab removes the package *and*
+restarts the runner, so the plugin stops straight away. `punktfunk-host plugins remove <name>`
+removes the package only — restart the runner yourself, as above, to stop a plugin that is still
+running.
+
+Uninstalling removes the package and nothing else. A plugin's own config and cache stay where it
+wrote them — `~/.config/punktfunk/plugin-state/<plugin>/` on Linux,
+`%ProgramData%\punktfunk\plugin-state\<plugin>\` on Windows — so re-installing later picks your
+settings back up. Delete that directory yourself if you want it gone.
+
+To stop *every* plugin without uninstalling anything, turn the runner off: **Disable runner** on the
+Installed tab, or `punktfunk-host plugins disable`.
+
 ## ROM Manager
 
 `@punktfunk/plugin-rom-manager` — point it at your ROM directories and it scans them, matches each
@@ -142,7 +177,7 @@ Then add a root or two — from the console's **ROM Manager** page, or in the co
 <Tabs items={['Linux', 'Windows']}>
 <Tab value="Linux">
 
-`~/.config/punktfunk/rom-manager/config.json`:
+`~/.config/punktfunk/plugin-state/rom-manager/config.json`:
 
 ```jsonc
 {
@@ -157,7 +192,7 @@ Then add a root or two — from the console's **ROM Manager** page, or in the co
 </Tab>
 <Tab value="Windows">
 
-`%ProgramData%\punktfunk\rom-manager\config.json`:
+`%ProgramData%\punktfunk\plugin-state\rom-manager\config.json`:
 
 ```jsonc
 {
@@ -171,6 +206,10 @@ Then add a root or two — from the console's **ROM Manager** page, or in the co
 
 </Tab>
 </Tabs>
+
+`plugin-state` is where a plugin reads and writes its own files — on Windows it is the one
+directory `plugins enable` grants the low-privilege runner write access to. A config file placed
+anywhere else under `%ProgramData%\punktfunk` is not read.
 
 Full options and the platform/emulator list are in
 [the plugin's repo](https://git.unom.io/unom/punktfunk-plugin-rom-manager).
@@ -198,7 +237,7 @@ keeps its library locked while running, there are **two parts**:
 
 Open the console's **Playnite** page — it shows "Exporter connected", and your games sync within
 seconds of any library change. Filters (installed-only, per-store, hidden) live on that page or in
-`%ProgramData%\punktfunk\playnite\config.json`. Details are in
+`%ProgramData%\punktfunk\plugin-state\playnite\config.json`. Details are in
 [the plugin's repo](https://git.unom.io/unom/punktfunk-plugin-playnite).
 
 ## VirtualHere (USB passthrough)
@@ -249,9 +288,12 @@ Full configuration is in
 installer's `PATH` change, or call the exe by full path. On Linux the host package installs it to
 `/usr/bin/punktfunk-host`.
 
-**"the plugin runner isn't installed"** — the runner ships as its own package. On Debian/Ubuntu:
-`sudo apt install punktfunk-scripting`. On Windows, re-run the installer and keep the scripting
-component.
+**"the plugin runner isn't installed"** — the runner ships as its own package. On Ubuntu:
+`sudo apt install punktfunk-scripting`. On Fedora: `sudo dnf install punktfunk-scripting` from the
+[same RPM repo you installed the host from](/docs/fedora). On Arch:
+`sudo pacman -Syu punktfunk-scripting` (a full `-Syu`, like every other install from that repo).
+On SteamOS, re-run `scripts/steamdeck/install.sh` (or
+`scripts/steamdeck/update.sh`). On Windows, re-run the installer and keep the scripting component.
 
 **The plugin doesn't show up in the console** — check the runner is actually running with
 `punktfunk-host plugins status`, then look at its log:
@@ -278,6 +320,10 @@ plugins (stop it with <kbd>Ctrl</kbd>+<kbd>C</kbd>):
 
 ## Writing your own
 
-A plugin is a small TypeScript module built on `@punktfunk/host` (`definePlugin`), supervised by the
-runner. Start from the [SDK README](https://git.unom.io/unom/punktfunk/src/branch/main/sdk) — or the
-two plugins above, which are worked examples of the same shape.
+A plugin is a TypeScript module built on **`@punktfunk/plugin-kit`** (`definePluginKit`), supervised
+by the runner. The kit owns lifecycle, config and state, the library sync engine, and serving the
+plugin's console page; `@punktfunk/host` (`definePlugin`) is the lower-level host client underneath
+it. Start from the
+[plugin-kit README](https://git.unom.io/unom/punktfunk/src/branch/main/plugin-kit) and
+[ROM Manager](https://git.unom.io/unom/punktfunk-plugin-rom-manager), which is the reference
+implementation — or any of the three plugins above.

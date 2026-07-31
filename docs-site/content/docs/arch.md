@@ -1,12 +1,13 @@
 ---
 title: Arch Linux
-description: Install a punktfunk host on Arch (and Arch-derived distros) from the signed pacman binary repo.
+description: Install a Punktfunk host on Arch (and Arch-derived distros) from the signed pacman binary repo.
 ---
 
-Set up a punktfunk host on **Arch Linux** (or an Arch-derived distro like CachyOS/EndeavourOS). The
+Set up a Punktfunk host on **Arch Linux** (or an Arch-derived distro like CachyOS/EndeavourOS). The
 host installs from a **signed pacman binary repo**, so it updates with `pacman -Syu` like the rest
-of your system — no building required. Host encode is **NVENC on NVIDIA** and **VAAPI on
-AMD/Intel** (`PUNKTFUNK_ENCODER=auto` picks per GPU).
+of your system — no building required. Host encode is **NVENC on NVIDIA**; on **AMD/Intel** HEVC
+and AV1 go through **Vulkan Video**, with **VAAPI** for H.264 and as the fallback
+(`PUNKTFUNK_ENCODER=auto` picks per GPU).
 
 > New here? Read [Security & Safe Use](/docs/security) first — a streaming host is remote control of
 > the machine, so keep it on a trusted LAN or VPN and require pairing.
@@ -19,8 +20,10 @@ AMD/Intel** (`PUNKTFUNK_ENCODER=auto` picks per GPU).
 
 - **NVIDIA:** `sudo pacman -S --needed nvidia-utils` (provides NVENC + the EGL/CUDA zero-copy path).
   Arch's stock `ffmpeg` already has NVENC built in — no RPM-Fusion-style swap like Fedora needs.
-- **AMD / Intel:** the Mesa stack (`mesa`, `libva-mesa-driver` for AMD, `intel-media-driver` for
-  Intel) provides the VAAPI encoder — usually already installed on a desktop.
+- **AMD / Intel:** the Mesa stack. HEVC/AV1 encode goes through **Vulkan Video** by default, so
+  install the Vulkan driver — `vulkan-radeon` (AMD) or `vulkan-intel` (Intel) — alongside the VAAPI
+  drivers (`libva-mesa-driver` for AMD, `intel-media-driver` for Intel), which carry H.264 and the
+  fallback path. Both are usually already installed on a desktop.
 
 ## 2. Add the signed repo
 
@@ -47,15 +50,29 @@ printf '\n[punktfunk]\nServer = https://git.unom.io/api/packages/unom/arch/$repo
 ## 3. Install the host
 
 ```sh
-sudo pacman -Sy punktfunk-host      # the streaming host
-sudo pacman -S  punktfunk-web       # optional: the browser management console (pairing + status)
-sudo pacman -S  punktfunk-gamescope # optional: HDR (10-bit BT.2020 PQ) off gamescope sessions
-sudo usermod -aG input "$USER"      # /dev/uinput access for virtual gamepads (re-login to apply)
+sudo pacman -Syu punktfunk-host      # the streaming host
+sudo pacman -Syu punktfunk-web       # optional: the browser management console (pairing + status)
+sudo pacman -Syu punktfunk-gamescope # optional: HDR (10-bit BT.2020 PQ) off gamescope sessions
+sudo pacman -Syu punktfunk-scripting # optional: the plugin/script runner (see below)
+sudo usermod -aG input "$USER"       # /dev/uinput access for virtual gamepads (re-login to apply)
 ```
 
-`punktfunk-client` (the native GTK4 Linux client) is in the same repo if this box is also a client.
-The host package ships the systemd **user** units, the udev rule, the UDP socket-buffer sysctl
-tuning, and example configs. Updates later are just `sudo pacman -Syu`.
+Each install is a **full** `-Syu`, on purpose: our packages are built against current Arch
+sonames, and `pacman -Sy <pkg>` would drop one onto a system whose other packages are still old —
+the classic partial upgrade that breaks Arch boxes. To take several in one go, name them on a
+single line: `sudo pacman -Syu punktfunk-host punktfunk-web punktfunk-gamescope`.
+
+`punktfunk-scripting` is the runner behind [Plugins](/docs/plugins); it isn't started for you —
+`systemctl --user enable --now punktfunk-scripting` when you want it. `punktfunk-client` (the native
+GTK4 Linux client) is in the same repo if this box is also a client. The host package ships the
+systemd **user** units, the udev rule, the UDP socket-buffer sysctl tuning, and example configs.
+
+Updates later are a normal `sudo pacman -Syu`, then `systemctl --user restart punktfunk-host` so the
+running host picks up the new binary. A `-Syu` moves every Punktfunk package you installed, so
+restart `punktfunk-web` the same way if you run the console. The web console can run the update for
+you — see [Updating the Host](/docs/updating); on Arch that button additionally needs
+`PACMAN_FULL_SYSUPGRADE=1` in `/etc/punktfunk/update.conf`, because the only pacman update we will
+run is a full one.
 
 ## 4. Configure and run
 
@@ -73,6 +90,7 @@ edit `host.env` for the desktop you run, following its page for the exact settin
 - [KDE Plasma (KWin)](/docs/kde)
 - [GNOME (Mutter)](/docs/gnome)
 - [Steam / gamescope](/docs/gamescope)
+- [Hyprland](/docs/hyprland)
 - [Sway / wlroots](/docs/sway)
 
 Then enable the service and turn on linger so it starts at boot without a login:
@@ -102,21 +120,31 @@ enables `ufw` by default** (firewalld is not installed), and some other spins (e
 enable **`firewalld`** — an Arch package never opens ports for you, so on those the host is
 unreachable until you allow it.
 
-The `punktfunk-host` package installs openers for **both**, so it's a one-liner whichever you run:
+The `punktfunk-host` package installs openers for **both**, so it's a one-liner whichever you run.
+The unit you enabled in step 4 runs `serve --gamestream` — the package installs it as it ships and
+only rewrites the binary path — so that host serves **both** the native `punktfunk/1` plane and
+stock [Moonlight](/docs/moonlight) clients, and needs **both** openers:
 
 ```sh
 # ufw — CachyOS (and Ubuntu, once you enable ufw):
-sudo ufw allow punktfunk-native        # the secure native host (the default)
-sudo ufw allow punktfunk-gamestream    # …also this if you run `serve --gamestream` (Moonlight)
+sudo ufw allow punktfunk-native
+sudo ufw allow punktfunk-gamestream
 
 # firewalld — Fedora-like spins (EndeavourOS, …):
-sudo firewall-cmd --reload                                    # load the installed definition
+sudo firewall-cmd --reload                                        # load the installed definitions
 sudo firewall-cmd --permanent --add-service=punktfunk-native
+sudo firewall-cmd --permanent --add-service=punktfunk-gamestream
 sudo firewall-cmd --reload
 ```
 
-`punktfunk-native` opens the QUIC control port (UDP 9777) + mDNS discovery; add
-`punktfunk-gamestream` as well if you run `serve --gamestream` (the fixed Moonlight ports + mDNS).
+Switched the host to **native-only** — dropped `--gamestream` with a
+`systemctl --user edit punktfunk-host` drop-in, or you run `punktfunk-host serve` by hand? Then open
+`punktfunk-native` alone and leave `punktfunk-gamestream` closed. `systemctl --user cat
+punktfunk-host` shows which one yours is.
+
+`punktfunk-native` opens the QUIC control port (UDP 9777), mDNS discovery and the mgmt/library API
+(TCP 47990); `punktfunk-gamestream` opens the fixed Moonlight ports — TCP 47984, 47989 and 48010,
+UDP 47998–48000 — plus the same mDNS.
 The media **data plane** uses an *ephemeral* UDP port that the client opens with a hole-punch — the
 host streams back out through the path the client opened, so there's **nothing fixed to open** as
 long as the firewall allows outbound UDP (the default for both ufw and firewalld).
@@ -141,11 +169,17 @@ the **PIN pairing**: arm it from [The Web Console](/docs/web-console#arm-pairing
 4-digit PIN to type into the client. (Pairing is required by default; pass `serve --open` only if
 you deliberately want to disable it.) See [Clients](/docs/clients) for per-platform setup.
 
+## Next steps
+
+- **Keep it current** — [Updating the Host](/docs/updating).
+- **Remove it again** — [Uninstalling](/docs/uninstall).
+- **Something not working?** — [Troubleshooting](/docs/troubleshooting).
+
 ## Appendix — build from source (PKGBUILD)
 
 To build instead of using the binary repo, use the split `PKGBUILD` in `packaging/arch/` (produces
-`punktfunk-host` + `punktfunk-client`; set `PF_WITH_WEB=1` to also build `punktfunk-web`, which needs
-`bun`):
+`punktfunk-host` + `punktfunk-client`; set `PF_WITH_WEB=1` to also build `punktfunk-web` and
+`PF_WITH_SCRIPTING=1` to also build `punktfunk-scripting` — both need `bun`):
 
 ```sh
 git clone https://git.unom.io/unom/punktfunk.git && cd punktfunk/packaging/arch

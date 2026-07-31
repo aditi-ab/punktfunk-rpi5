@@ -1,9 +1,9 @@
 ---
 title: Bazzite
-description: Set up a punktfunk host on Bazzite — it follows the box between Steam Gaming Mode (gamescope) and the KDE Plasma desktop automatically.
+description: Set up a Punktfunk host on Bazzite — it follows the box between Steam Gaming Mode (gamescope) and the KDE Plasma desktop automatically.
 ---
 
-[Bazzite](https://bazzite.gg/) already ships everything a punktfunk host needs — the NVIDIA driver,
+[Bazzite](https://bazzite.gg/) already ships everything a Punktfunk host needs — the NVIDIA driver,
 NVENC, PipeWire, **gamescope**, and the **KDE Plasma desktop**. So a Bazzite host is the most
 "appliance-like" setup, and it streams **both** of Bazzite's faces:
 
@@ -37,30 +37,82 @@ curl -fsSLO https://git.unom.io/unom/punktfunk/raw/branch/main/packaging/bazzite
 sudo bash punktfunk-sysext.sh install          # add `--channel canary` for rolling builds
 ```
 
-That downloads the newest image (host + tray + web console, SHA-256-verified over HTTPS from
-punktfunk's package registry), merges it, and applies the udev/sysctl setup on the spot — the
-host is usable immediately, no reboot. From then on:
+That downloads the newest image — host + tray + web console + the plugin runner
+(`punktfunk-scripting`), plus the HDR `punktfunk-gamescope` build — merges it, and applies the
+udev/sysctl setup on the spot; the host is usable immediately, no reboot. The feed's checksum
+manifest is OpenPGP-signed by packages@unom.io (key `AF245C506F4E4763`, the same one that signs our
+RPMs), and `punktfunk-sysext` checks that signature against a key baked into the script before it
+trusts a single checksum — so it needs `gpg` on the box, and it refuses a feed it can't verify.
+
+The plugin runner rides along in the image but isn't started: run
+`systemctl --user enable --now punktfunk-scripting` when you want [plugins](/docs/plugins).
+
+From then on:
 
 ```sh
 sudo punktfunk-sysext update     # fetch + merge the newest build
 sudo punktfunk-sysext status     # channel, installed vs latest version
-sudo punktfunk-sysext remove     # unmerge and delete — the box is back to stock
+sudo punktfunk-sysext remove     # unmerge and delete the image (~/.config/punktfunk is kept)
 ```
 
-Two things to know:
+After an update, restart the host so it runs the new binary (the updater prints this reminder too).
+The image carries the console as well, so restart that first if you enabled it:
+
+```sh
+systemctl --user restart punktfunk-web     # only if you run the console
+systemctl --user restart punktfunk-host
+```
+
+To **switch channel** later, re-run the install: `sudo punktfunk-sysext install --channel canary`
+(or `--channel stable`). `update` takes no channel flag — it follows whatever the last install wrote
+to `/etc/punktfunk-sysext.conf`. To be able to **go back** to a build that worked, keep a copy of the
+image before you update, and re-install that file afterwards:
+
+```sh
+sudo cp /var/lib/extensions/punktfunk.raw ~/punktfunk-known-good.raw   # before updating
+sudo punktfunk-sysext install --from-file ~/punktfunk-known-good.raw   # to go back to it
+```
+
+The web console can also run the update for you — see [Updating the Host](/docs/updating), which
+needs the one-time `sudo usermod -aG punktfunk-update $USER`.
+
+`remove` deletes the image and the `/etc` files it seeded (the tray autostart entry, and the
+gamescope session drop-in unless you've edited it), but three things it created outside `/usr` stay
+behind. To clear those too — services first, because once the image unmerges their binaries are
+gone and the units just keep failing:
+
+```sh
+systemctl --user disable --now punktfunk-host punktfunk-web
+sudo punktfunk-sysext remove
+sudo rm -f /etc/modules-load.d/punktfunk.conf /etc/udev/rules.d/60-punktfunk.rules
+sudo groupdel punktfunk-update     # the (empty) group for web-console updates
+```
+
+[Uninstalling](/docs/uninstall) has the same walkthrough for the other install methods, and for the
+clients.
+
+Three things to know:
 
 - **After a Bazzite major rebase** (Fedora 43 → 44) the old image **refuses to load** rather than
   run against mismatched system libraries — run `sudo punktfunk-sysext update` once and it fetches
   the image built for the new base.
-- **Already layering punktfunk?** Install the sysext (it shadows the layered copy immediately),
+- **Already layering Punktfunk?** Install the sysext (it shadows the layered copy immediately),
   then drop the layer so it stops slowing your updates:
   `sudo rpm-ostree uninstall punktfunk punktfunk-web && systemctl reboot`.
+- **If it refuses the feed.** `refusing to install from an unsigned feed` means that Fedora major's
+  feed predates signing; it gets sealed on the next publish. To install from it anyway, accepting
+  that the images are unauthenticated, run
+  `sudo env PUNKTFUNK_SYSEXT_ALLOW_UNSIGNED=1 bash punktfunk-sysext.sh install`. The other message,
+  `the feed's SHA256SUMS is NOT signed by packages@unom.io`, is not the same thing — don't install;
+  re-download the script and try again.
 
 For a fully baked appliance image there's also a **bootc** Containerfile that installs the RPMs
 from the registry at image-build time — see `packaging/bootc/` in the repo. Plain `rpm-ostree`
-layering from the [RPM registry](https://git.unom.io/unom/-/packages) keeps working too (see
-`packaging/bazzite/README.md`), but the sysext is the supported default. Building from source
-also works (Bazzite is Fedora Atomic underneath — same steps as [Fedora](/docs/fedora)).
+layering from the [RPM registry](https://git.unom.io/unom/-/packages) keeps working too: add the
+repo exactly as on [Fedora](/docs/fedora), with the `baseurl` group matching your Fedora base, then
+`sudo rpm-ostree install punktfunk punktfunk-web` and reboot. The sysext is still the supported
+default. Building from source also works (Bazzite is Fedora Atomic underneath — same steps as
+[Fedora](/docs/fedora)).
 
 ## Allow controller input
 
@@ -91,7 +143,7 @@ The only settings that matter (GPU zero-copy is on by default):
 ```sh
 PUNKTFUNK_VIDEO_SOURCE=virtual
 # GPU zero-copy (dmabuf → CUDA → NVENC) is ON by default; auto-falls back to CPU. Set =0 to force CPU.
-PUNKTFUNK_GAMESCOPE_ATTACH=1    # Gaming Mode = attach to the box's own session (see below)
+PUNKTFUNK_GAMESCOPE_ATTACH=1    # Gaming Mode = attach to the box's own session — SDR, and no cursor (see below)
 ```
 
 ### Gaming Mode: attach vs managed
@@ -107,7 +159,8 @@ For Gaming Mode there are two models (pick one; the shipped default is **attach*
   box's gamescope over and relaunches it **headless** at the *client's* exact resolution and
   refresh — Game Mode on the virtual screen — restoring the box on idle.
 
-Full treatment: [Steam / gamescope → Attach vs managed](/docs/gamescope#attach-vs-managed).
+Full treatment: [Steam / gamescope → How the host gets a
+gamescope](/docs/gamescope#how-the-host-gets-a-gamescope).
 
 Mid-stream Gaming ↔ Desktop following (`PUNKTFUNK_SESSION_WATCH`) is **on by default** on
 Bazzite/SteamOS. See [Configuration](/docs/configuration) for the full list of knobs.
@@ -139,7 +192,11 @@ Desktop; it follows whichever the box is in.
 ```sh
 systemctl --user enable --now punktfunk-host
 systemctl --user enable --now punktfunk-web     # web console: pairing + status
+sudo loginctl enable-linger "$USER"             # start at boot with nobody logged in
 ```
+
+Without that last line the `--user` units don't start until someone logs in — which on a headless box
+never happens.
 
 Then open [The Web Console](/docs/web-console) for the login password and to
 [arm pairing](/docs/web-console#arm-pairing).
@@ -148,15 +205,21 @@ Then open [The Web Console](/docs/web-console) for the login password and to
 
 These apply to the **Gaming Mode (gamescope)** path; the KDE Desktop path is unaffected:
 
-- **gamescope 3.16.22 or newer is required.** Older versions can deadlock during capture. Bazzite's
-  current gamescope is fine; this only bites if you've pinned an old one.
-- **The mouse cursor isn't included in the captured image** — a gamescope limitation for now. (The
-  KDE Desktop path renders the cursor normally.)
-- **HDR needs the punktfunk gamescope build** (`punktfunk-gamescope`, shipped in the sysext) and
-  is attempted by default when it is present (`PUNKTFUNK_GAMESCOPE_HDR=0` forces SDR). Without
-  the build sessions stream SDR — correctly, including SDR versions of HDR games.
+- **gamescope 3.16.22 or newer is required; 3.16.23 or newer for the Steam overlay.** Below 3.16.22
+  headless capture can deadlock; between the two, capture works but the Steam overlay (Shift+Tab /
+  the Quick Access Menu) is never painted into the captured node. Bazzite's current gamescope is
+  past both; this only bites if you've pinned an old one.
+- **The template pins attach, and that costs you both the cursor and HDR.** The sysext ships the
+  `punktfunk-gamescope` build, but it only reaches a session the host starts itself — and the
+  `host.env` template above sets `PUNKTFUNK_GAMESCOPE_ATTACH=1`, where the live session is
+  Bazzite's own stock gamescope. Comment that line out and let the managed default take over: you
+  get the compositor-drawn pointer and real HDR. To stay on attach instead, set
+  `PUNKTFUNK_GAMESCOPE_HDR=0` and `PUNKTFUNK_GAMESCOPE_BIN=/usr/bin/gamescope`. Why each half
+  breaks: [gamescope → Known limits](/docs/gamescope#known-limits) for the cursor,
+  [HDR → Linux + gamescope](/docs/hdr#linux--gamescope) for the failed connect.
 
-Canonical list: [gamescope → Known limits](/docs/gamescope#known-limits).
+Those are the two that bite on Bazzite. The full set — touch, mouse modes, the clipboard — is on
+[gamescope → Known limits](/docs/gamescope#known-limits).
 
 Then [connect a client](/docs/clients) — Moonlight works great for couch gaming, and the Apple app for
-Apple TV / iPad.
+Apple TV / iPad. Trouble? See [Troubleshooting](/docs/troubleshooting).

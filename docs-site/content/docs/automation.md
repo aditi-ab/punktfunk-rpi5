@@ -31,6 +31,8 @@ and nothing you configure here runs anywhere near the streaming path.
 | `pairing.completed` / `pairing.denied` | a pairing is approved+stored / denied | device name, fingerprint, plane |
 | `display.created` / `display.released` | a virtual display is minted / kept displays are released | backend + mode / count |
 | `library.changed` | the game library is mutated | source: `manual`, or the provider id that reconciled (`PUT /api/v1/library/provider/{p}`) |
+| `update.available` | a verified manifest announces a release newer than the running host — once per discovered version, not on every check | version, channel (`stable`/`canary`), and this host's install kind (`apt`, `windows-installer`, …) |
+| `update.applied` | the new binary's first start after a successful update | `from`, `to` |
 | `plugins.changed` | a plugin's registration changes (registered, restarted, deregistered, or its lease expired) | plugin id |
 | `store.changed` | an install or uninstall finished, or a plugin catalog was refreshed | none — re-read `GET /api/v1/store/catalog` / `…/installed` |
 | `host.started` / `host.stopping` | the serve planes come up / wind down | version, whether GameStream is enabled |
@@ -53,8 +55,8 @@ the same document to `/api/v1/hooks` from a script — changes apply immediately
 ```json
 {
   "hooks": [
-    { "on": "stream.started",  "run": "~/.config/punktfunk/scripts/on-stream.sh" },
-    { "on": "stream.stopped",  "run": "~/.config/punktfunk/scripts/off-stream.sh" },
+    { "on": "stream.started",  "run": "/home/me/.config/punktfunk/scripts/on-stream.sh" },
+    { "on": "stream.stopped",  "run": "/home/me/.config/punktfunk/scripts/off-stream.sh" },
     { "on": "client.connected", "filter": { "client": "Living Room TV" },
       "run": "kscreen-doctor output.HDMI-A-1.mode.3840x2160@60" },
     { "on": "pairing.pending",
@@ -70,11 +72,29 @@ Each entry:
 |---|---|
 | `on` | Which events fire it: an exact kind (`stream.started`) or a `domain.*` prefix (`pairing.*`). |
 | `run` | A shell command (`sh -c` on Linux). Gets the event JSON on **stdin** and flat **`PF_EVENT_*`** env vars. |
-| `webhook` | A URL the event JSON is POSTed to. TLS-verified, redirects are never followed, no punktfunk credentials attached. |
+| `webhook` | A URL the event JSON is POSTed to. TLS-verified, redirects are never followed, no Punktfunk credentials attached. |
 | `filter` | Optional exact-match constraints: `client` (device name), `fingerprint`, `plane` (`native`/`gamestream`), `app`. All present fields must match. |
 | `timeout_s` | Command timeout (default 30, max 600) — on expiry the whole process group is killed. |
 | `debounce_ms` | Minimum interval between firings of this hook (0 = every event). |
 | `hmac_secret_file` | File with a secret; the webhook gains `X-Punktfunk-Signature: sha256=<hex HMAC-SHA256 of the body>` so your receiver can authenticate the host. |
+
+### What the host refuses
+
+The document is validated as a whole, and **one bad entry disables every hook** — the host logs
+`hooks.json invalid — hooks disabled until fixed` and runs none of them until you correct it. The
+rules:
+
+- An entry needs a non-empty `on`, plus `run` and/or `webhook`.
+- `webhook` must be an `http(s)://` URL, and must **not** point at loopback, `localhost` or a
+  link-local address (which is also what blocks the cloud metadata endpoint). A receiver on this
+  same machine is what a `run` command is for. Ordinary LAN addresses — `192.168.x.x`, a ULA, a
+  hostname — are fine, so Home Assistant on another box on your network works as written.
+- `timeout_s` must be 1–600.
+- If `hmac_secret_file` is set but unreadable, the host **skips** that POST rather than sending it
+  unsigned.
+
+So check the log after editing the file: `journalctl --user -u punktfunk-host` on Linux, or the web
+console's **Logs** page on either platform.
 
 A `run` command's shell one-liner vocabulary — the event flattened to env, values sanitized:
 
@@ -102,9 +122,13 @@ ok = hmac.compare_digest(request.headers["X-Punktfunk-Signature"], expected)
 
 **Rules of the road:** hooks are fire-and-forget and bounded — at most 8 in flight (extra
 firings are dropped with a log line, never queued), and a command that outlives its timeout is
-killed. Because hook commands run as the host user, `hooks.json` is operator-privileged config;
-a hook **script** must be owned by you (or root) and not group/world-writable, or the host
-refuses to run it — loudly, in the log.
+killed. Hook commands run as the host user, so `hooks.json` is operator-privileged config. On
+Linux, when a command starts with an **absolute path** to a script, the host checks that file is
+owned by you (or root) and not group/world-writable, and refuses to run it — loudly, in the log —
+if it isn't. Write the full path (`/home/me/.config/punktfunk/scripts/on-stream.sh`, not `~/…`) if
+you want that check: the shell expands `~` and looks up PATH names like `makoctl` only afterwards,
+so those are never checked. On Windows there is no per-script check — the ACL on the config
+directory is the boundary.
 
 The two simplest cases also exist as plain [host.env](/docs/configuration) settings, no
 `hooks.json` needed: `PUNKTFUNK_ON_CONNECT_CMD` and `PUNKTFUNK_ON_DISCONNECT_CMD`.
@@ -112,7 +136,8 @@ The two simplest cases also exist as plain [host.env](/docs/configuration) setti
 ## Per-app prep/undo
 
 For per-title setup (HDR toggle, MangoHud, a VRR tweak), attach `prep` steps to a GameStream
-`apps.json` entry or a custom library entry — each `do` runs **before** the title launches
+`apps.json` entry or to a [custom library entry](/docs/game-library#adding-a-game-by-hand) — each
+`do` runs **before** the title launches
 (synchronously — the launch waits), each `undo` runs at session end in **reverse order**,
 best-effort, even if the session crashed:
 
@@ -136,8 +161,8 @@ If you have been polling the host to work out when a game finished, you don't ne
 
 ```json
 { "hooks": [
-    { "on": "game.running", "run": "~/.config/punktfunk/scripts/game-up.sh" },
-    { "on": "game.exited",  "run": "~/.config/punktfunk/scripts/game-down.sh" }
+    { "on": "game.running", "run": "/home/me/.config/punktfunk/scripts/game-up.sh" },
+    { "on": "game.exited",  "run": "/home/me/.config/punktfunk/scripts/game-down.sh" }
 ] }
 ```
 
@@ -146,7 +171,7 @@ Both carry the title in `PF_EVENT_GAME_TITLE` / `PF_EVENT_GAME_APP`, and `game.e
 (`terminated`) — worth checking before you, say, power the TV off.
 
 Ending the session yourself when a game exits needs no script at all: it is the default behavior,
-under Host → *Virtual displays* →
+on the console's **Virtual displays** page under
 [When a game or a session ends](/docs/virtual-displays#when-a-game-ends-and-when-a-session-does).
 
 ## The event stream (`GET /api/v1/events`)
@@ -155,9 +180,14 @@ For code, subscribe to the SSE stream on the management API (loopback + bearer t
 same credentials as the rest of the admin surface):
 
 ```sh
-curl -Nk -H "Authorization: Bearer $(cat ~/.config/punktfunk/mgmt-token)" \
+. ~/.config/punktfunk/mgmt-token   # sets PUNKTFUNK_MGMT_TOKEN
+curl -Nk -H "Authorization: Bearer $PUNKTFUNK_MGMT_TOKEN" \
   "https://127.0.0.1:47990/api/v1/events?kinds=pairing.*,stream.*"
 ```
+
+The token file holds `PUNKTFUNK_MGMT_TOKEN=<token>`, not a bare token, so it can be sourced (or
+handed to a systemd unit as an `EnvironmentFile`) — `cat` it straight into the header and every
+request comes back 401. The runner's `plugin-token` file has the same shape.
 
 - Frames carry `id:` (the event's `seq`), `event:` (the kind), `data:` (the event JSON).
 - Reconnect with the standard `Last-Event-ID` header (or `?since=<seq>`) and the host replays
@@ -174,9 +204,11 @@ directory of scripts and installed plugins as one service: crash-restarts with b
 `systemctl stop` that interrupts plugins structurally so their cleanup runs. See the SDK README
 for the five-line quickstart and unit templates.
 
-For ready-made plugins — sync your ROM collection or your Playnite library into the game library,
-with a console page to manage them — see [Plugins](/docs/plugins). Installing one is two commands:
-`punktfunk-host plugins add <name>`, then `punktfunk-host plugins enable`.
+For ready-made plugins — sync your ROM collection or your Playnite library into the game library, or
+hand a USB device on the couch to the host — see [Plugins](/docs/plugins). Install one from the web
+console's **Plugins** page (Browse → pick → confirm; the host installs it and restarts the runner),
+or from a terminal with `punktfunk-host plugins add <name>` followed by
+`punktfunk-host plugins enable`.
 
 The canonical "decide, don't just observe" pattern — approve pairing from your phone: watch
 `pairing.pending`, send yourself a notification, and call
@@ -185,8 +217,10 @@ The canonical "decide, don't just observe" pattern — approve pairing from your
 
 > A unit under the runner auto-connects with the host's **scoped plugin token**, which covers
 > the everyday surface (status, library, sessions, events) but deliberately not **hook
-> registration** or **pairing administration** — so a plugin defect can't admit new devices or
-> install commands. A script that should administer pairing (like the approval pattern above)
+> registration**, **pairing administration**, the **plugin store** (`/api/v1/store…`, reads
+> included), the **update endpoints** (`/api/v1/update…`), or another plugin's UI credential — so a
+> plugin defect can't admit new devices, install code, or trigger an update. Those routes answer
+> 403 on the plugin token. A script that should administer pairing (like the approval pattern above)
 > opts into the full-admin credential explicitly: set `PUNKTFUNK_MGMT_TOKEN` on the unit (e.g.
 > a `systemctl --user edit punktfunk-scripting` drop-in) or pass `{ token }` to `connect()`.
 

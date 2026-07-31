@@ -1,7 +1,16 @@
 # Security Policy
 
-punktfunk is a low-latency desktop/game streaming stack. A host is effectively remote control of a
+Punktfunk is a low-latency desktop/game streaming stack. A host is effectively remote control of a
 machine, so we take security reports seriously and appreciate responsible disclosure.
+
+## Supported versions
+
+Punktfunk ships on two tracks — **stable** (a `vX.Y.Z` tag; the current line is **0.22.x**) and
+**canary** (built from `main`). Fixes ship as a new release on those tracks; in practice
+we don't backport to older minor versions, so the supported versions are the latest stable release
+and the current canary build. If you're on an older build, please check that the issue still
+reproduces on the latest stable before reporting it. See
+[Release Channels](https://docs.punktfunk.unom.io/docs/channels).
 
 ## Reporting a vulnerability
 
@@ -14,7 +23,7 @@ exposes other users before a fix exists.
 
 The more of this you can give us, the faster we can act:
 
-- The component and version (e.g. `punktfunk-host 0.9.0`, Windows or Linux, which client).
+- The component and version (e.g. `punktfunk-host 0.22.3`, Windows or Linux, which client).
 - The impact — what an attacker can do, and from what position (same LAN, a local service account,
   admin, a paired client, …).
 - Steps to reproduce, a proof-of-concept, or a crash/log if you have one.
@@ -98,4 +107,4 @@ pursue legal action against researchers who:
 - give us reasonable time to remediate before public disclosure,
 - don't exfiltrate more data than needed to demonstrate the issue.
 
-Thank you for helping keep punktfunk and its users safe.
+Thank you for helping keep Punktfunk and its users safe.

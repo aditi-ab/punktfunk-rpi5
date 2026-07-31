@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/punktfunk-logo.svg" alt="punktfunk" width="320" />
+  <img src="assets/punktfunk-logo.svg" alt="Punktfunk" width="320" />
 </p>
 
 <p align="center"><b>Low-latency desktop and game streaming with first-class Linux and Windows hosts.</b></p>
@@ -18,7 +18,7 @@ access** · **[r/Punktfunk](https://www.reddit.com/r/Punktfunk/)**.
 🔒 **Security:** found a vulnerability? Report it privately to **security@punktfunk.com** — see
 [SECURITY.md](SECURITY.md). Please don't open a public issue.
 
-punktfunk pairs a **virtual-display streaming host** with native clients on every platform. It speaks
+Punktfunk pairs a **virtual-display streaming host** with native clients on every platform. It speaks
 the existing **GameStream** protocol, so any [Moonlight](https://moonlight-stream.org/) client works
 day one — and adds its own faster **`punktfunk/1`** protocol that breaks the ~1 Gbps FEC wall with a
 **GF(2¹⁶) Leopard-RS** transport. A single shared **Rust core** (`punktfunk-core`) holds the
@@ -43,8 +43,13 @@ on Linux and Windows, and over a stable C ABI from the Apple and Android apps.
 - **Low latency, GPU end to end.** Frames go straight from the compositor to the NVENC encoder with
   zero CPU copies (dmabuf → CUDA/Vulkan → NVENC), over a transport tuned for responsiveness rather
   than throughput. Stable 240 fps at 5120×1440; sub-millisecond capture-to-reassembly on-box,
-  ~1.3 ms cross-machine on a LAN. (AMD/Intel encode via VAAPI, and a GPU-less software H.264
-  encoder exists as a fallback.)
+  ~1.3 ms cross-machine on a LAN. (On Linux AMD/Intel, Vulkan Video for HEVC and AV1 with VAAPI for
+  H.264 and as the fallback; a GPU-less software H.264 encoder exists as a last resort.)
+- **A library that fills itself.** Steam and non-Steam titles show up as a grid on every client, and
+  plugins add their own sources — ROM Manager (your ROM collection, matched to installed emulators),
+  Playnite, VirtualHere. Install them from the console's **Plugins** page or with
+  `punktfunk-host plugins add`. See
+  [Plugins](https://docs.punktfunk.unom.io/docs/plugins).
 - **Works with what you already have.** Any Moonlight/Artemis client connects over GameStream — and
   native apps for macOS, Linux, Windows, and Android use the lower-latency `punktfunk/1` protocol.
 - **Secure by default.** Hosts require a one-time SPAKE2 **PIN pairing**; after that, devices
@@ -58,12 +63,12 @@ on Linux and Windows, and over a stable C ABI from the Apple and Android apps.
 | **Core** — `punktfunk-core` + C ABI (protocol · FEC · crypto · QUIC) | ✅ Complete & hardened |
 | **GameStream host** → stock Moonlight | ✅ Live end-to-end: pairing, RTSP, audio, per-client virtual output at native resolution, GPU zero-copy NVENC, gamepads |
 | **Native protocol** — `punktfunk/1` | ✅ Validated live: QUIC control + GF(2¹⁶) FEC/AES-GCM data plane, PIN pairing, mDNS discovery, mid-stream mode renegotiation |
-| **Windows host** (Windows 11 22H2+, x64) | 🟡 Implemented & shipping as a signed installer: its own all-Rust IddCx **virtual display** (secure-desktop capable) with a **sealed IDD-push** capture path — finished frames pushed straight into its own driver, not screen-scraped (no DDA/WGC) · GPU encode (NVENC on NVIDIA, AMF/QSV on AMD/Intel, software H.264 without a GPU) · WASAPI audio · bundled virtual-gamepad drivers (no ViGEmBus) · HDR incl. Vulkan-game HDR. NVIDIA live-validated; AMD/Intel CI-green |
+| **Windows host** (Windows 11 22H2+, x64) | ✅ Beta — shipping as a signed installer: its own all-Rust IddCx **virtual display** (secure-desktop capable) with a **sealed IDD-push** capture path — finished frames pushed straight into its own driver, not screen-scraped (no DDA/WGC) · GPU encode (NVENC on NVIDIA, AMF/QSV on AMD/Intel, software H.264 without a GPU) · WASAPI audio · bundled virtual-gamepad drivers (no ViGEmBus) · HDR incl. Vulkan-game HDR. NVIDIA live-validated; AMD/Intel CI-green |
 | **macOS / iOS / tvOS client** (`clients/apple`) | ✅ Streaming live: VideoToolbox decode (HEVC, and AV1 on hardware that decodes it), controllers incl. DualSense, discovery, pairing, speed test |
 | **Linux client** (`clients/linux` + `clients/session`) | ✅ Streaming live: relm4/GTK4 launcher shell that spawns a Vulkan session binary — Vulkan Video / VAAPI / software decode, PipeWire audio, SDL3 controllers, Skia console UI; ships as Flatpak/apt/rpm/Arch |
 | **Android client** (`clients/android`, phone + TV) | ✅ Streaming live: AMediaCodec decode + HDR10, AAudio audio, controllers, discovery, pairing |
-| **Windows client** (`clients/windows`, WinUI 3) | ✅ Streaming live: WinUI 3 shell + Vulkan session presenter, hardware decode on all GPU vendors via Vulkan Video → D3D11VA → software (NVIDIA + Intel validated on glass), WASAPI audio, SDL3 controllers, discovery, pairing; ships as signed MSIX (x64 + ARM64). HDR10 implemented, on-glass validation pending |
-| **Web console + management API** (`web/`) | ✅ TanStack console over the OpenAPI mgmt API: host status, paired devices, on-demand PIN pairing, GPU selection, performance capture graphs, live host logs |
+| **Windows client** (`clients/windows`, WinUI 3) | ✅ Streaming live: WinUI 3 shell + Vulkan session presenter, hardware decode on all GPU vendors via Vulkan Video → D3D11VA → software (NVIDIA + Intel validated on glass), WASAPI audio, SDL3 controllers, discovery, pairing; ships as signed MSIX (x64 + ARM64). Hardware decode and HDR10 present validated on glass on NVIDIA and Intel, including HDR pass-through on the Intel D3D11VA path |
+| **Web console + management API** (`web/`) | ✅ TanStack console over the OpenAPI mgmt API: host status, paired devices, on-demand PIN pairing, game library, virtual-display presets, plugin store, GPU selection, performance capture graphs, live host logs, host updates |
 
 Every native client also ships a tiered **stats overlay** (Compact / Normal / Detailed) with a
 shared vocabulary across platforms, and the session client carries a full gamepad-driven **console
@@ -81,36 +86,76 @@ Both run from **one process**: bare `punktfunk-host serve` is the **secure nativ
 GameStream/Moonlight-compat planes (opt-in, trusted-LAN only — GameStream has inherent on-path
 weaknesses). The host is managed through a REST API and web console. Builds against FFmpeg 7 or 8.
 
-Full milestone status: **[docs.punktfunk.unom.io/docs/status](https://docs.punktfunk.unom.io/docs/status)** ·
-roadmap: **[/docs/roadmap](https://docs.punktfunk.unom.io/docs/roadmap)**.
+What works where: **[the support matrix](https://docs.punktfunk.unom.io/docs/support-matrix)** ·
+where it's heading: **[the roadmap](https://docs.punktfunk.unom.io/docs/roadmap)**.
 
 ## Install the host
 
 Pick your platform and install from its package registry — the per-platform guide covers adding the
-repo, first run, and the web console. The Linux host is the primary, most battle-tested path; a
-Windows host also ships as a signed installer (all-vendor: NVIDIA, AMD, Intel).
+repo, first run, and the web console. The Linux host is the primary, most battle-tested path; on
+SteamOS the host is built on-device by a script instead, and a Windows host ships as a signed
+installer (all-vendor: NVIDIA, AMD, Intel).
 
 | Platform | Install | Guide |
 |--------|---------|-------|
-| **Ubuntu / Debian** (apt) | `sudo apt install punktfunk-host` *(after adding the repo)* | [Ubuntu — GNOME](https://docs.punktfunk.unom.io/docs/ubuntu-gnome) · [KDE](https://docs.punktfunk.unom.io/docs/ubuntu-kde) |
-| **Bazzite / Fedora Atomic** (systemd-sysext) | `sudo bash punktfunk-sysext.sh install` *(no layering, no reboot; rpm-ostree + bootc also supported)* | [Bazzite](https://docs.punktfunk.unom.io/docs/bazzite) |
-| **Fedora** (dnf) | `dnf install punktfunk punktfunk-web` *(after adding the repo)* | [Fedora — KDE](https://docs.punktfunk.unom.io/docs/fedora-kde) |
-| **Arch / Steam Deck** (pacman / sysext) | `pacman -Sy punktfunk-host` *(binary repo)* · sysext `.raw` *(SteamOS)* | [packaging/arch](packaging/arch/README.md) |
+| **Ubuntu / Debian** (apt) | `sudo apt install punktfunk-host` *(after adding the repo)* | [Ubuntu / Debian](https://docs.punktfunk.unom.io/docs/ubuntu) · [packaging/debian](packaging/debian/README.md) |
+| **Bazzite / Fedora Atomic** (systemd-sysext) | `curl -fsSLO https://git.unom.io/unom/punktfunk/raw/branch/main/packaging/bazzite/punktfunk-sysext.sh && sudo bash punktfunk-sysext.sh install` *(no layering, no reboot; rpm-ostree + bootc also supported)* | [Bazzite](https://docs.punktfunk.unom.io/docs/bazzite) |
+| **Fedora** (dnf) | `sudo dnf install punktfunk` *(after adding the repo; the console comes with it)* | [Fedora](https://docs.punktfunk.unom.io/docs/fedora) · [packaging/rpm](packaging/rpm/README.md) |
+| **Arch / CachyOS** (pacman) | `sudo pacman -Syu punktfunk-host` *(binary repo — always a full `-Syu`)* | [Arch Linux](https://docs.punktfunk.unom.io/docs/arch) · [packaging/arch](packaging/arch/README.md) |
+| **SteamOS / Steam Deck** (on-device build) | `bash ~/punktfunk/scripts/steamdeck/install.sh` *(after cloning this repo to `~/punktfunk`)* | [SteamOS (Host)](https://docs.punktfunk.unom.io/docs/steamos-host) |
 | **Windows** (11 22H2+, x64) | `winget install unom.PunktfunkHost` *(after `winget source add -n punktfunk https://winget.punktfunk.unom.io -t Microsoft.Rest`)* · or the signed `setup.exe` from the package registry | [Windows Host](https://docs.punktfunk.unom.io/docs/windows-host) · [packaging/winget](packaging/winget/README.md) |
 
 `punktfunk-host` is the streaming host; `punktfunk-web` is the browser console (pairing + status).
-After install, run `punktfunk-host serve` inside your desktop session (the secure native default;
-add `--gamestream` on a trusted LAN if you also want stock Moonlight clients), then pair from the web
-console. Full instructions: **[docs.punktfunk.unom.io/docs/install](https://docs.punktfunk.unom.io/docs/install)**.
+
+**Linux:** every package ships systemd **user** units, so you don't launch the host by hand. The
+host unit won't start until `~/.config/punktfunk/host.env` exists, so copy the template your package
+installed first:
+
+```sh
+mkdir -p ~/.config/punktfunk
+# /usr/share/punktfunk/ on Fedora/Arch/Bazzite, /usr/share/punktfunk-host/ on Debian/Ubuntu
+# (on Bazzite take host.env.bazzite instead)
+cp /usr/share/punktfunk/host.env.example ~/.config/punktfunk/host.env
+
+systemctl --user enable --now punktfunk-host   # the streaming host
+systemctl --user enable --now punktfunk-web    # the web console (Arch: install punktfunk-web first)
+```
+
+The shipped host unit runs `serve --gamestream` — the native `punktfunk/1` plane **plus** the
+GameStream/Moonlight-compat planes, which belong on a trusted LAN only; for a native-only host drop
+the flag with a `systemctl --user edit punktfunk-host` drop-in (which needs an empty `ExecStart=`
+line before the replacement — the install guide has the snippet). Then open
+`https://<host-ip>:47992` and pair.
+
+How the virtual display and input are wired up depends on your desktop — see
+[KDE](https://docs.punktfunk.unom.io/docs/kde) · [GNOME](https://docs.punktfunk.unom.io/docs/gnome) ·
+[Steam / gamescope](https://docs.punktfunk.unom.io/docs/gamescope) ·
+[Sway](https://docs.punktfunk.unom.io/docs/sway).
+
+**Windows:** the installer registers and starts the host as a `LocalSystem` service, so there is
+nothing to run by hand — open the web console and pair. Use
+`punktfunk-host service start|stop|restart|status` if you need to control it. Upgrades happen in
+place — the console's **Updates** card, `winget upgrade unom.PunktfunkHost`, or the newer
+`setup.exe` over the old install; uninstall from Add/Remove Programs.
+
+Full instructions: **[docs.punktfunk.unom.io/docs/install](https://docs.punktfunk.unom.io/docs/install)**.
+
+The console's **Host** page also shows when a newer host is out, along with the exact command for
+how *this* box was installed (or a one-click **Update now** on Windows) — see
+[Updating the host](https://docs.punktfunk.unom.io/docs/updating). To remove it again, or to go back
+to an earlier version, see [Uninstalling](https://docs.punktfunk.unom.io/docs/uninstall) and
+[Release Channels](https://docs.punktfunk.unom.io/docs/channels#pin-a-version-or-roll-back).
 
 ## Connect a client
 
 | Streaming to… | Use |
 |---|---|
 | Mac, iPhone, iPad, Apple TV | The **Apple app** (`clients/apple`) — also on TestFlight |
-| Linux desktop / laptop, Steam Deck | **`punktfunk-client`** (Flatpak / apt / rpm / Arch) |
+| Linux desktop / laptop | **`punktfunk-client`** (Flatpak / apt / rpm / Arch) |
+| Steam Deck | The **Decky plugin** in Gaming Mode — it launches the client for you ([Steam Deck](https://docs.punktfunk.unom.io/docs/steam-deck)); in Desktop Mode, the Flatpak directly |
 | Android phone or TV | The **Android app** (`clients/android`) |
 | Windows | Native **`punktfunk-client`** (signed MSIX) or **Moonlight** |
+| Scripts, automation, another launcher | **`punktfunk`** — the headless CLI shipped in the Linux client packages (`punktfunk pair`, `punktfunk hosts list --json`, `punktfunk launch <host>`) |
 | Anything else (browser, old phone, smart TV) | **Moonlight** over GameStream |
 
 Each client discovers hosts on the network automatically and does a one-time
@@ -122,7 +167,7 @@ Each client discovers hosts on the network automatically and does a one-time
 For development, or as an install fallback where no package is available:
 
 ```sh
-cargo build --workspace          # core, host, tray, shared client crates, Linux shell + session client, probe (Linux & macOS)
+cargo build --workspace          # core, host, tray, shared client crates, Linux shell + session client, the `punktfunk` CLI, probe (Linux & macOS)
 cargo test  --workspace          # unit + loopback + proptest + C ABI harness
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
@@ -154,11 +199,14 @@ clients/
   session/  punktfunk-session, the Vulkan streaming session (Rust · SDL3 · ash · Skia console UI) — also runs standalone (gamescope, Decky)
   windows/  Windows desktop app (Rust · WinUI 3 · D3D11 · WASAPI · SDL3)
   android/  Android phone + TV app (Kotlin · Rust JNI core · AMediaCodec · AAudio)
+  cli/      punktfunk, the headless client CLI — pair · hosts · wake · library · launch · punktfunk:// links
   probe/    headless reference / measurement client for punktfunk/1
   decky/    Steam Deck Decky plugin
-web/                         web console (TanStack) over the management API — status · devices · pairing · GPUs · performance · logs
+web/                         web console (TanStack) over the management API — status · devices · pairing · library · displays · plugins · GPUs · performance · logs · updates
 api/openapi.json             management-API OpenAPI spec (regenerated via `punktfunk-host openapi`, checked in)
-packaging/                   apt · rpm / COPR · Arch · Flatpak · Bazzite bootc image
+sdk/                         `@punktfunk/host` — TypeScript management-API client + event stream (Effect)
+plugin-kit/                  `@punktfunk/plugin-kit` — the plugin authoring kit (bun / TypeScript)
+packaging/                   apt · rpm / COPR · Arch · Flatpak · Bazzite sysext + bootc · Windows installer + drivers · winget · Nix · gamescope
 docs-site/                   public documentation site (Fumadocs) — https://docs.punktfunk.unom.io
 include/punktfunk_core.h     cbindgen-generated C header (checked in)
 tools/                       latency-probe · loss-harness (measurement)
@@ -195,7 +243,7 @@ additional terms or conditions. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ### Third-party components
 
-punktfunk's own source is MIT/Apache-2.0. Shipped binaries additionally link third-party components
+Punktfunk's own source is MIT/Apache-2.0. Shipped binaries additionally link third-party components
 under their own (permissive) licenses — see [`THIRD-PARTY-NOTICES.txt`](THIRD-PARTY-NOTICES.txt)
 (regenerate with `scripts/gen-third-party-notices.sh`). The Windows host and client builds also
 bundle FFmpeg under the **LGPL v2.1+** (dynamically linked, replaceable DLLs; the license text and
@@ -203,7 +251,7 @@ notice ship in the installed `licenses/` folder).
 
 ### Trademarks
 
-punktfunk is an independent project and is **not affiliated with, endorsed by, or sponsored by**
+Punktfunk is an independent project and is **not affiliated with, endorsed by, or sponsored by**
 NVIDIA, Microsoft, Sony, Valve, or the Moonlight project. "GameStream", "Moonlight", "Xbox",
 "DualSense", "DualShock", and "PlayStation" are trademarks of their respective owners and are used
 here only to describe interoperability.

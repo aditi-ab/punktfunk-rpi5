@@ -1,6 +1,6 @@
 ---
 title: Hyprland
-description: Configure a punktfunk host on a Hyprland session — headless output via hyprctl, capture via xdg-desktop-portal-hyprland.
+description: Configure a Punktfunk host on a Hyprland session — headless output via hyprctl, capture via xdg-desktop-portal-hyprland.
 ---
 
 Hyprland is a **first-class backend.** The host adds a per-client headless output at the client's
@@ -59,8 +59,20 @@ For how long the virtual output lives, and extend-vs-exclusive topology, see
   releases share the same `hyprctl` surface).
 - **xdg-desktop-portal-hyprland (xdph)** installed and running — the host captures through its
   ScreenCast portal, and steers its custom picker. Without it there is no video.
-- The ScreenCast interface routed to xdph — see `scripts/headless/portals.conf` (a `[Hyprland]`
-  section pins `org.freedesktop.impl.portal.ScreenCast=hyprland`).
+- **ScreenCast routed to xdph** — only if another portal backend (gtk, wlr) is installed alongside
+  it. `xdg-desktop-portal` picks one implementation per interface, and if it hands ScreenCast to the
+  wrong backend the host steers an xdph picker nobody is reading. Pin it for your session by creating
+  `~/.config/xdg-desktop-portal/hyprland-portals.conf` (the name is your session's desktop —
+  `XDG_CURRENT_DESKTOP`, which is `Hyprland` here — lowercased):
+
+  ```ini
+  [preferred]
+  default=gtk
+  org.freedesktop.impl.portal.ScreenCast=hyprland
+  ```
+
+  Then `systemctl --user restart xdg-desktop-portal`. On a box with only xdph installed there is
+  nothing to choose between, so you can skip this.
 
 ## Troubleshooting: black / no video (headless output at 0×0)
 
@@ -100,6 +112,10 @@ With the backend selected, start the host from **inside your Hyprland session**:
 systemctl --user enable --now punktfunk-host
 journalctl --user -u punktfunk-host -f
 ```
+
+This unit runs `serve --gamestream`, so it serves stock [Moonlight](/docs/moonlight) clients as well
+as the native ones. For a native-only host, see
+[What the unit starts](/docs/running-as-a-service#what-the-unit-starts).
 
 ## Bring up the console and pair
 

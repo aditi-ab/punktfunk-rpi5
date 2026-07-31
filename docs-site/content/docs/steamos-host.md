@@ -1,6 +1,6 @@
 ---
 title: "SteamOS (Host)"
-description: "Run a punktfunk host on SteamOS — stream its Game Mode (or desktop) to your other devices. One script, built on-device and ABI-matched to SteamOS."
+description: "Run a Punktfunk host on SteamOS — stream its Game Mode (or desktop) to your other devices. One script, built on-device and ABI-matched to SteamOS."
 ---
 
 This is for using a **SteamOS device as the host** — streaming *from* it to a laptop, TV, phone, or
@@ -19,8 +19,11 @@ SteamOS is an immutable, read-only Arch base, so the host isn't a system package
 script builds the host **natively inside a Debian-trixie distrobox** (ABI-matched to SteamOS's
 FFmpeg/glibc — the binary then runs natively on SteamOS) and wires it up as systemd user services.
 Building on-device means a rebuild always matches the running OS, so a SteamOS update can't leave you
-with a binary linked against the wrong libraries. Encode is **VAAPI** on the AMD GPU (auto-detected;
-NVENC on NVIDIA).
+with a binary linked against the wrong libraries. Encode is auto-detected: **Vulkan Video** on the
+Deck's AMD GPU (with libav **VAAPI** as the fallback), **NVENC** on NVIDIA. The installer writes
+`RADV_PERFTEST=video_encode` into `~/.config/punktfunk/host.env` — Van Gogh's RADV driver hides
+Vulkan encode behind that flag, and without it sessions quietly fall back to VAAPI. Set
+`PUNKTFUNK_VULKAN_ENCODE=0` in `host.env` to force the libav VAAPI path.
 
 > **Heads up:** in our testing the Steam Deck's WiFi *tx* topped out around ~250 Mbps of goodput
 > regardless of band — enough for 1080p/1440p60, not 4K. This looked like a hardware/driver
@@ -31,13 +34,24 @@ NVENC on NVIDIA).
 ## Prerequisites
 
 - A SteamOS device on **SteamOS 3** (e.g. a Steam Deck, LCD or OLED). Steady WiFi or, better, a wired dock.
+- **A `sudo` password.** A stock SteamOS `deck` account has none at all, so `sudo` can't work
+  until you set one. Do it once, before you start:
+  ```sh
+  passwd
+  ```
+  Without it the installer runs, but skips every root step: gamepad passthrough, `vhci-hcd`, the
+  UDP buffer tuning, the atomic-update keep list and linger.
+- **Run the installer on a real terminal** — Konsole in Desktop Mode, or `ssh -t`. A
+  non-interactive ssh session has no TTY for the `sudo` prompt, and the same steps get skipped.
 - **distrobox** installed (no root needed). If `distrobox` isn't found:
   ```sh
   curl -sfL https://raw.githubusercontent.com/89luca89/distrobox/main/install | sh -s -- --prefix ~/.local
   ```
   Make sure `~/.local/bin` is on your `PATH` (re-open the terminal).
-- The first build downloads a container image + toolchain (~1 GB) and takes ~10–15 minutes. Later
-  rebuilds are incremental.
+- The first build downloads a container image + toolchain (~1 GB) and takes ~10–15 minutes, then
+  another ~5–10 minutes for the HDR gamescope build (a second set of dependencies plus a fresh
+  gamescope clone). Budget around 25 minutes for a first install. Later rebuilds are incremental,
+  and the gamescope step is a no-op unless its sources changed.
 
 ## 1. Get the source
 
@@ -62,8 +76,8 @@ It is idempotent — safe to re-run. In one pass it:
 4. raises the UDP socket buffers to 32 MB, installs the gamepad udev rule + the `vhci-hcd` autoload
    and adds you to the `input` group (virtual gamepads / **native Steam Deck controller passthrough**),
    seeds the KDE RemoteDesktop grant for Desktop-mode input, and **registers all of it on SteamOS's
-   atomic-update keep list** so OS updates carry it over — this step **prompts for your `sudo`
-   password** (a stock Steam Deck requires one; without it gamepad passthrough and the UDP tuning are skipped),
+   atomic-update keep list** so OS updates carry it over — the installer asks for your `sudo`
+   password **first, before the long build**, so you can authorise once and walk away,
 5. installs + starts the `punktfunk-host` and `punktfunk-web` **systemd user services** (with linger,
    so they run without a login session) plus a boot-time **rebuild check** that repairs the host
    automatically if a SteamOS update ever breaks its library links.
@@ -75,12 +89,12 @@ Useful flags:
 | `--open` | Accept **unpaired** clients (trust-on-first-use) — convenient on a fully trusted LAN. Default is PIN pairing required. |
 | `--no-gamestream` | Run a **secure native-only** host — skip the GameStream/Moonlight-compat planes (see below). Default keeps them on so stock Moonlight works. |
 | `--no-web` | Skip the management web console. |
-| `--src=DIR` | Build from source at `DIR` instead of `~/punktfunk`. |
+| `--src=DIR` | Build from source at `DIR` instead of `~/punktfunk`. **Only if you must** — the post-OS-update rebuild check and the web console's one-click update both look for `~/punktfunk/scripts/steamdeck/update.sh`, so with a relocated source you have to update by hand: `PUNKTFUNK_SRC=DIR bash DIR/scripts/steamdeck/update.sh --pull` (without `PUNKTFUNK_SRC` the script still looks for `~/punktfunk`). A symlink (`ln -s DIR ~/punktfunk`) restores both. |
 
 When it finishes it prints the web-console URL and how to pair.
 
 > **GameStream/Moonlight compat is on by default.** The native `punktfunk/1` plane (used by
-> punktfunk's own clients — SPAKE2 PIN pairing, per-direction AEAD) is **always on** and is the secure
+> Punktfunk's own clients — SPAKE2 PIN pairing, per-direction AEAD) is **always on** and is the secure
 > path. The installer also enables the **GameStream/Moonlight-compat planes** so stock
 > [Moonlight](/docs/moonlight) works — but those carry inherent on-path weaknesses (pairing over plain
 > HTTP; legacy control encryption that can reuse GCM nonces), so enable them only on a **trusted LAN**.
@@ -135,8 +149,13 @@ HDR enabled streams true HDR10 from Game Mode; anything missing and the session 
 instead (never a mislabelled picture). Check what the host resolved with:
 
 ```sh
-~/punktfunk/target-steamos/release/punktfunk-host hdr-probe
+( set -a; . ~/.config/punktfunk/host.env; set +a
+  ~/punktfunk/target-steamos/release/punktfunk-host hdr-probe )
 ```
+
+Run it exactly like this — the probe reads its answers from the environment, and `host.env` is what
+the service runs with (including which gamescope the host uses). A bare shell doesn't have it, so
+the probe would describe an environment your host never runs in.
 
 The build is best-effort: if it fails, the installer says so loudly and everything else keeps
 working in SDR — re-run `update.sh` to retry. `PUNKTFUNK_GAMESCOPE_HDR=0` in
@@ -144,12 +163,93 @@ working in SDR — re-run `update.sh` to retry. `PUNKTFUNK_GAMESCOPE_HDR=0` in
 
 ## Updating
 
-After pulling new source, rebuild and restart in one step (config + pairings persist):
+Two ways, and both keep your config and pairings.
+
+**From the web console (easiest).** The Updates card shows an **Update now** button — no opt-in and
+no root, because this install is owned by your own user. It asks for the console password, then
+rebuilds on the device, so expect several minutes; the card shows progress and the full log lands in
+`~/.config/punktfunk/logs/update-steamos.log`. See [Updating](/docs/updating).
+
+**From a terminal.** One command — `--pull` fetches the new source first:
 
 ```sh
-git -C ~/punktfunk pull          # or rsync new source in
+bash ~/punktfunk/scripts/steamdeck/update.sh --pull
+```
+
+Drop `--pull` if you rsync source in yourself. `update.sh` also retrofits anything a newer installer
+adds — the plugin runner, the HDR gamescope, the atomic-update keep list, the rebuild check — onto an
+older install.
+
+> **This install follows the canary channel.** An on-device source build tracks `main`, not stable
+> `vX.Y.Z` releases, so the console offers you the newest `main` build. See
+> [Release Channels](/docs/channels).
+
+### Going back to an earlier version
+
+Because this is a source build, "roll back" means "check out an older commit and rebuild":
+
+```sh
+git -C ~/punktfunk checkout v0.22.3      # any release tag
 bash ~/punktfunk/scripts/steamdeck/update.sh
 ```
+
+That leaves the checkout on a detached tag, where `git pull` has no branch to fast-forward — so a
+later `update.sh --pull`, **and the console's Update now button** (which runs exactly that), stops
+with *"You are not currently on a branch."* Run `git -C ~/punktfunk checkout main` first when you
+want to follow `main` again.
+
+## Uninstalling
+
+There is no uninstall script — the install is spread across your user session and a few root-owned
+files, so remove it in that order. Stop and forget the services first:
+
+```sh
+systemctl --user disable --now punktfunk-host punktfunk-web \
+  punktfunk-scripting punktfunk-rebuild-check
+rm -f ~/.config/systemd/user/punktfunk-*.service
+systemctl --user daemon-reload
+sudo loginctl disable-linger "$USER"      # only if nothing else on this device needs linger
+```
+
+Then the build container and everything the installer put under your home:
+
+```sh
+distrobox rm -f pf2                       # the build container (~1 GB)
+rm -f  ~/.local/bin/punktfunk-scripting ~/.local/bin/punktfunk-gamescope
+rm -rf ~/.local/lib/punktfunk-scripting ~/.local/share/punktfunk-scripting
+rm -f  ~/.local/share/punktfunk/gamescope.stamp
+rm -f  ~/.local/share/applications/io.unom.Punktfunk.Host.desktop
+rm -rf ~/punktfunk                        # the source checkout and its target-steamos build dir
+```
+
+The build container shares your real home directory, so the toolchains it installed are in there
+too: `~/.cargo`, `~/.rustup` and `~/.bun` (plus the cargo download cache). Delete those only if
+nothing else of yours uses Rust or bun.
+
+Then the root-owned tuning. Don't skip this: the keep-list entry is what carries the other three
+files through every SteamOS update, so left alone they stay on the device indefinitely.
+
+```sh
+sudo rm -f /etc/atomic-update.conf.d/punktfunk.conf \
+           /etc/udev/rules.d/60-punktfunk.rules \
+           /etc/modules-load.d/punktfunk.conf \
+           /etc/sysctl.d/99-punktfunk-net.conf
+sudo udevadm control --reload-rules
+```
+
+Two things are deliberately left alone. `~/.config/punktfunk/` holds your identity certificate,
+paired devices and the console password — delete it only if you're not coming back:
+
+```sh
+rm -rf ~/.config/punktfunk
+```
+
+And the installer may have seeded a KDE RemoteDesktop portal grant at
+`~/.local/share/flatpak/db/kde-authorized` (only if you had none); remove that file if nothing
+else on the device relies on it. Your `input` group membership is harmless to keep — drop it with
+`sudo gpasswd -d "$USER" input` if you'd rather not.
+
+See [Uninstalling](/docs/uninstall) for the other install methods and what each one leaves behind.
 
 ## Notes & limits
 

@@ -1,116 +1,98 @@
 ---
 title: "Roadmap"
-description: "What's shipped, what's in progress, and what's next for punktfunk."
+description: "Where Punktfunk is heading — the themes being worked on now, what comes after them, and what is deliberately not planned."
 ---
 
-A quick map of where punktfunk is today and where it's heading. For the detailed, dated changelog,
-see [Status & Progress](/docs/status).
+This page is about **intent**, not inventory. It says what the project is pushing on and why, in
+themes rather than checkboxes, because a checklist of forty features is stale the week it is written.
 
-**Legend:** ✅ shipped · 🟡 in progress · 🔭 planned · ⛔ blocked upstream
+Three other pages answer the questions people usually bring to a roadmap, and they answer them
+better:
 
-## At a glance
+- **"Does it do X on my machine?"** — the [Support matrix](/docs/support-matrix). Every cell there
+  was read out of the code that makes the decision. It is the arbiter: where this page and the
+  matrix disagree, the matrix is right.
+- **"What changed recently?"** — the [release notes](https://git.unom.io/unom/punktfunk/releases),
+  per version.
+- **"How finished is this?"** — [How finished each part is](/docs/support-matrix#how-finished-each-part-is).
 
-| Area | |
-|---|---|
-| Protocol core — FEC · crypto · C ABI | ✅ |
-| GameStream host (works with Moonlight) | ✅ |
-| Native `punktfunk/1` protocol | ✅ |
-| Linux host (KWin · GNOME · gamescope · Sway) | ✅ |
-| Windows host (NVIDIA · AMD · Intel) | ✅ beta |
-| Apple client (macOS · iOS · iPadOS · tvOS) | ✅ |
-| Linux client (GTK4 shell + Vulkan session) | ✅ |
-| Android client (phone · TV) | ✅ |
-| Windows client | 🟡 |
-| Web console + pairing | ✅ |
-| Concurrent sessions (shared desktop) | ✅ |
-| Network speed test + bitrate | ✅ |
-| HDR / 10-bit streaming | ✅ Windows host · 🚧 Linux host (GNOME 50+ desktop mirror; virtual displays blocked upstream) |
-| Surround audio (5.1 / 7.1) | ✅ |
-| Sub-frame pipelining (latency) | 🔭 |
+**Nothing on this page is shipped unless it says so.** Recently shipped work — pen and stylus input,
+mirroring one of the host's real monitors, a stream that ends when the game does, settings profiles
+and `punktfunk://` links, the `punktfunk` command line, HDR on gamescope hosts, and update checks
+with one-click host updating — is described in the release notes for 0.19 through 0.22.3, and its
+present-day behaviour is in the matrix.
 
-## ✅ Shipped
+## Working on now
 
-- **The host, two ways.** The lower-latency native [`punktfunk/1`](/docs/how-it-works) protocol (QUIC
-  control + UDP data with GF(2¹⁶) Leopard FEC + AES-GCM) — the secure default — and, opt-in via
-  `serve --gamestream`, a GameStream host any [Moonlight](/docs/moonlight) client can use. Both run
-  from one process.
-- **Native-resolution virtual displays** on Linux across KWin, GNOME/Mutter, gamescope, and
-  Sway/wlroots, with a fully zero-copy GPU path to NVENC (stable 240 fps at 5120×1440).
-- **A native Windows host** (x64; NVIDIA/AMD/Intel encode) — a signed installer with secure-desktop capture and a
-  bundled virtual-display driver, and the only host that can stream **HDR** (10-bit BT.2020 PQ,
-  captured from an HDR Windows desktop and encoded as HEVC Main10). See
-  [Windows Host](/docs/windows-host). *(Beta — newer than the Linux host.)*
-- **Clients on every platform** — native apps for **Apple** (macOS, iOS, iPadOS, tvOS), **Linux**,
-  **Android** (phone + TV), and **Windows**, each with hardware decode, controllers including
-  DualSense, audio + mic, and automatic host discovery. See [Clients](/docs/clients).
-- **Secure by default** — SPAKE2 PIN pairing with pinned reconnects, one-click delegated approval from
-  the web console, and mDNS LAN auto-discovery.
-- **Tuned for latency** — concurrent sessions (stream one desktop to several devices at once),
-  mid-stream resolution renegotiation, a cross-machine clock-skew handshake, a 1 Gbps+ data plane,
-  an in-app network speed test that informs the bitrate picker, and **automatic adaptive bitrate**
-  (the encoder re-targets mid-stream when bitrate is set to Automatic).
-- **Surround sound** — 5.1 and 7.1 end to end: the host encodes multichannel via multistream Opus and
-  the native clients render more than two channels, with clean, synchronous stereo where the path is stereo.
-- **Clipboard sync** — bidirectional **text and images** between host and client, carried on a side
-  plane over the native protocol's QUIC channel.
+**Windows host hardening.** The Windows host is the newest large surface in the project and gets the
+most attention. Two strands: on-glass validation of the AMD (AMF) and Intel (QSV) encode paths,
+which are CI-green but far less exercised than NVENC; and capture-stall attribution — the host now
+carries dedicated instrumentation that says *which* link went quiet when a stream stutters — the
+content that stopped being drawn, or the display path that stopped presenting it — so field reports
+stop being guesswork.
 
-## 🟡 In progress
+**Latency under load.** The remaining wins are no longer in the encoder. They are in when a frame is
+handed to the display: client-side presentation phase control, keeping a decoded frame from waiting
+out a refresh interval it did not need to, and holding the frame rate when the link degrades rather
+than de-escalating and staying degraded. The next structural lever is **sub-frame pipelining** —
+overlapping encode and transmit inside a single frame via a direct slice path — which matters most
+at high resolutions.
 
-- **Windows client on-glass validation.** Hardware decode and the GUI are validated on NVIDIA and
-  Intel; the HDR present path still needs verification on real HDR hardware.
-- **Apple presenter polish.** The lower-latency `VTDecompressionSession` → `CAMetalLayer` stage-2
-  path is now the default; HDR brightness and 4:4:4 still need on-glass validation.
-- **Web console parity.** Surfacing the speed test and bitrate picker the apps already have.
-- **Windows host hardening.** Broader real-world testing — especially on-glass validation of the
-  AMD (AMF) and Intel (QSV) encode paths, which are CI-green but newer than NVENC.
+**Finishing the clipboard.** Text crosses today from a Windows, macOS or Android client to a host
+whose operator turned the feature on, with images on the first two. Two pieces are genuinely
+unfinished: the **Linux client's** side of the bridge is a stub, so a Linux client offers and
+applies nothing; and **file transfer** has a wire format and a host-side policy but no client that
+offers files, so a copied file never crosses. See [Clipboard](/docs/clipboard).
 
-## 🔭 Planned
+**Console parity with the apps.** The web console still cannot run a speed test or set a bitrate —
+it shows the bitrate a live session is using and stops there, while the client apps can measure the
+link and act on the result.
 
-- **Magic multi-user support.** Map a connecting client to a real user account on the host and log
-  them in automatically. The client picks an identity — e.g. an **Apple TV profile** — which maps to
-  an available host profile (likely behind a second per-user auth layer); on connect to an idle host,
-  the user lands in *their own* desktop/session, signed in, without touching the host. Turns one box
-  into a personal, profile-aware streaming target for a household.
-- **Object-based spatial audio.** With 5.1/7.1 surround shipped, the frontier is object-based sound.
-  Capturing game audio objects on native Windows is blocked by a closed renderer API, but **Proton
-  already routes them through Wine's `ISpatialAudioClient`** — where it currently *discards* the
-  dynamic/height objects and their 3D positions. Finishing that rendering would give every Proton gamer
-  real spatial sound, and tunnelling the objects + positions to the client would let punktfunk spatialize
-  them *on the client* — head-tracked remote spatial audio (to AirPods and the like) that no streaming
-  stack does today.
-- **Sub-frame pipelining.** Overlap encode and transmit within a single frame (a direct NVENC slice
-  path) — the next big latency lever at high resolutions.
-- **True glass-to-glass latency** measured end to end (capture → on-screen present).
-- **gamescope multi-user isolation.** Per-session input and audio so concurrent clients are fully
-  independent desktops (the shared-desktop case already works).
-- **Peer-approved pairing.** Approve a new device from an already-paired device's own app.
-- **WAN / anywhere access.** Reach a host beyond the LAN — NAT traversal (ICE/STUN/TURN) plus a
-  self-hostable relay for when no direct path can be punched, and **QUIC connection migration** so a
-  client roams between networks (Wi-Fi ↔ cellular) without dropping the session. The control plane is
-  already QUIC over UDP, so this is mostly signalling and relay rather than a protocol change.
-- **VRR / adaptive-sync passthrough.** Variable refresh end to end — the host renders at a variable
-  rate and the client presents with tearing-control/VRR instead of a fixed cadence, for tear- and
-  judder-free gaming. Builds on the client's presentation-feedback path and the per-session virtual
-  outputs.
-- **Desktop quality-of-life.** More of the essentials that make remote *work* pleasant, each a new side
-  plane over the existing QUIC datagram channel: **multi-monitor streaming** (present the host's several
-  outputs as separate client windows) and **virtual-webcam redirection** (the client's camera shows up
-  as a webcam on the host, so video calls run on the remote machine). *(Clipboard sync already shipped —
-  see above.)*
+**Closing the unverified cells.** The matrix's [What is not
+verified](/docs/support-matrix#what-is-not-verified) list is a work list, not a disclaimer: a
+Hyprland virtual output on real display hardware, client-drawn cursors on sway/wlroots and Hyprland,
+gamescope headless capture on the proprietary NVIDIA driver, touch input from a Windows client. Most
+are settled by a single session log on the right machine.
 
-## ⛔ Parked / blocked
+## Next
 
-- **HDR / 10-bit on the *Linux* host — Mutter/KWin/wlroots virtual displays.** GNOME 50 added HDR
-  screencasting for **monitor** streams, and the host uses it: the GameStream desktop mirror
-  (`PUNKTFUNK_VIDEO_SOURCE=portal`) negotiates the 10-bit PQ formats and encodes HEVC Main10
-  BT.2020 PQ. The **gamescope** virtual output is no longer blocked either — the
-  `punktfunk-gamescope` build carries the small patch its capture node was missing, so
-  installing it streams true HDR10 by default (on-glass validation pending; the patch is
-  offered upstream as
-  [gamescope#2126](https://github.com/ValveSoftware/gamescope/issues/2126)). What stays blocked
-  upstream is HDR on **Mutter's virtual monitors** — `RecordVirtual` streams are still SDR-only
-  (through the GNOME 51 dev branch) — so a GNOME/KWin/wlroots virtual display streams 8-bit until
-  that lands; the host is ready the moment it does.
-- **Advanced DualSense voice-coil haptics.** Scoped and shelved (it rides the controller's USB audio
-  interface, with near-zero game support on Linux). Adaptive triggers, rumble, and the lightbar
-  already ship.
+**Reach beyond the LAN.** Today a client and host have to be on the same network. The intent is NAT
+traversal (ICE/STUN/TURN) with a self-hostable relay for when no direct path can be punched, plus
+QUIC connection migration so a client roams between Wi-Fi and cellular without dropping the session.
+The control plane is already QUIC over UDP, so this is mostly signalling and relay rather than a
+protocol change.
+
+**A host that knows who is connecting.** Two related pieces. *Per-user sessions*: a connecting
+client picks an identity — an Apple TV profile, say — which maps to a real account on the host, and
+that person lands in their own desktop, signed in, without touching the machine. And *gamescope
+multi-user isolation*: per-session input and audio, so concurrent clients are fully independent
+desktops rather than several views of one (the shared-desktop case already works).
+
+**The rest of remote work.** Multi-monitor streaming (the host's several outputs as separate client
+windows), virtual-webcam redirection (the client's camera appears as a webcam on the host, so video
+calls run on the remote machine), and peer-approved pairing (approve a new device from an
+already-paired device's own app, rather than only from the web console). Each is a new side plane
+over the QUIC channel that already exists.
+
+**Picture and sound frontier.** End-to-end variable refresh — the host rendering at a variable rate
+and the client presenting with tearing control instead of a fixed cadence (the Apple client already
+varies its own display link; the host half does not exist). True glass-to-glass latency measured
+capture-to-present rather than capture-to-receipt. And object-based spatial audio: capturing game
+audio objects on native Windows is blocked by a closed renderer API, but Proton already routes them
+through Wine's `ISpatialAudioClient`, where the dynamic objects and their positions are currently
+discarded — finishing that, and tunnelling objects plus positions to the client, would give
+head-tracked remote spatial audio that no streaming stack does today.
+
+## Not planned, or blocked upstream
+
+- **HDR on Mutter, KWin and wlroots virtual displays.** Those compositors' virtual-monitor
+  screencasts are SDR-only upstream, through the GNOME 51 development branch. The host is ready the
+  moment that changes. gamescope's virtual output and the GNOME 50+ real-monitor mirror are the two
+  Linux routes that do carry HDR today — see [HDR](/docs/hdr) and the
+  [matrix](/docs/support-matrix#input-cursor-and-hdr).
+- **Hosting on macOS, iOS, tvOS or Android.** Client-only platforms by construction: every host
+  entry point fails at compile time. There is no setting that changes this.
+- **4:4:4 on AMD and Intel encoders.** A limitation of those encode blocks, not a gap in Punktfunk.
+- **DualSense voice-coil haptics.** Scoped and shelved — it rides the controller's USB audio
+  interface and has near-zero game support on Linux. Rumble, adaptive triggers and the lightbar
+  already work.

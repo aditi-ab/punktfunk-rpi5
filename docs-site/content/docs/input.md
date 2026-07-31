@@ -1,0 +1,172 @@
+---
+title: Mouse, touch and pen
+description: The in-stream keyboard shortcuts that give your mouse back, the two mouse modes, the three touch modes, and full-fidelity stylus input.
+---
+
+A stream takes your mouse and keyboard the moment you click into it. This page starts with how to
+get them back, then covers driving the host with a mouse, a touchscreen and a pen. The rows that
+pick these modes sit in your client's **Input** settings; the toggles that share that page with
+them are in [Client settings](/docs/client-settings#input).
+
+## Getting your input back
+
+On the Linux and Windows clients the stream runs in its own session window. Input is **captured**
+when the stream starts and whenever you click the video: your local cursor disappears and keys go to
+the host instead of your desktop. In the default mouse mode the pointer is also locked to the
+window — see [Mouse modes](#mouse-modes) below.
+
+| Shortcut | What it does |
+|---|---|
+| **Ctrl+Alt+Shift+Q** | Release captured input (press again, or click the stream, to take it back) |
+| **Ctrl+Alt+Shift+M** | Switch the mouse mode (capture ⇄ desktop) |
+| **Ctrl+Alt+Shift+D** | Disconnect |
+| **Ctrl+Alt+Shift+S** | Cycle the [stats overlay](/docs/stats) — off · compact · normal · detailed |
+| **F11** or **Alt+Enter** | Toggle fullscreen |
+
+While input is released the session window prints the list over the stream:
+
+```text
+Click the stream to capture input · Ctrl+Alt+Shift+Q releases · Ctrl+Alt+Shift+M mouse mode ·
+Ctrl+Alt+Shift+D disconnects · Ctrl+Alt+Shift+S stats
+```
+
+With a controller in use the same hint names the controller chord instead of the mouse-mode and
+stats entries.
+
+Alt-Tabbing away releases input on its own and takes it back when you return. A release you asked
+for with the chord stays released until you opt back in. Either way, keys and buttons you were
+holding are released on the host, so nothing sticks down.
+
+You can look the shortcuts up again without a stream running: the Linux client has **Keyboard
+Shortcuts** in its main menu, and the Windows client has a **Shortcuts** screen reached from its
+host list.
+
+### On the other clients
+
+- **macOS** honours the same four combos, written **⌃⌥⇧Q / M / D / S**. **⌘⎋** also toggles capture,
+  **⌃⌘F** toggles fullscreen, and **⌃⌥⇧C** starts or stops [clipboard sharing](/docs/clipboard). The
+  **Stream** menu lists them all except the mouse-mode combo, which works but has no menu item.
+- **iPhone and iPad** with a hardware keyboard: **⌃⌥⇧Q** releases input while it is captured, and
+  **⌘⎋** toggles capture in either direction. **⌃⌥⇧D** (disconnect) and **⌃⌥⇧S** (stats) come from
+  the app's Stream shortcuts rather than from the stream itself; if they don't respond while you're
+  captured, release first or use the on-screen controls.
+- **Android and Android TV** honour **Ctrl+Alt+Shift+Q** only; it toggles pointer capture. The
+  system Back button leaves the stream.
+- **Apple TV** has no keyboard path, and a short press of the Siri Remote's Back button deliberately
+  does nothing — so a controller's B button can't end your session by accident. To leave, **hold
+  Back for about a second and let go**. During a session the remote's touch surface drives the host
+  cursor, a press is a left click, and Play/Pause is a right click.
+
+### Leaving with a controller
+
+Every client reserves one controller chord: **L1 + R1 + Start + Select** (LB + RB + Start + Back on
+an Xbox pad), held on any connected pad.
+
+- **Linux, Windows** — a press releases captured input, and leaves fullscreen if you didn't start
+  fullscreen. Keep it held about 1.5 seconds and it disconnects.
+- **Steam Deck** — a press releases captured input only. The Decky plugin always launches the client
+  fullscreen, and a stream that started fullscreen stays that way. Holding disconnects, as above.
+- **macOS, iPhone/iPad, Apple TV** — holding it about 1.5 seconds disconnects. There is no
+  quick-press step.
+- **Android** — holding it about a second disconnects. A quick press does nothing; the moment the
+  chord completes a **Hold to quit…** cue appears so you know it registered.
+
+## Mouse modes
+
+There are two, and they are a per-client setting called **Mouse input**:
+
+- **Capture (games)** — the pointer locks to the stream and only relative movement is sent. The only
+  cursor you see is the host's. This is what mouse-look in a game needs. On Windows the session
+  window also grabs the keyboard here, so Alt+Tab and the Windows key reach the host rather than your
+  own desktop. (The Linux session window does not do this.)
+- **Desktop (absolute)** — the pointer is not locked. It moves in and out of the stream freely and
+  its position is sent as an absolute point — what you want for remote desktop work. Your local
+  cursor is hidden over the stream; the one you see there is the host's.
+
+**Capture is the default** on the Linux, Windows and macOS clients. **Android defaults to Desktop**
+— a phone or TV is more often driven by touch or a pad than by a locked mouse.
+
+Switch live with **Ctrl+Alt+Shift+M** (**⌃⌥⇧M** on macOS), whether input is captured or not. On
+Android, Ctrl+Alt+Shift+Q flips the capture instead. The picker is macOS-only among the Apple apps;
+on iPad the equivalent is the **Capture pointer for games** toggle (on by default), which needs the
+stream fullscreen and frontmost.
+
+Two things can override your choice. **gamescope hosts can't take absolute pointer input**: ask for
+desktop mode against one and the session quietly stays captured, and the chord has nothing to offer
+(see [gamescope](/docs/gamescope)). And against a host that forwards its cursor separately instead of
+drawing it into the video, the Linux and Windows clients flip to relative motion by themselves when
+an app on the host grabs or hides the pointer, then back when it lets go. Using the chord yourself
+overrides that until the host's intent next changes. The macOS client ignores the signal on purpose.
+
+## Touch modes
+
+On a touchscreen client the **Touch input** setting picks one of three models. All three exist on
+Android, iPhone/iPad, Linux and Windows.
+
+- **Trackpad** (the default) — your finger drives the host cursor like a laptop touchpad. The cursor
+  stays put when you touch down and moves by your finger's travel, so you can lift and re-swipe to
+  walk it across a screen far larger than your own.
+- **Direct pointer** — the cursor jumps to your finger and follows it.
+- **Touch passthrough** — every finger is forwarded as a real touch contact, with no gesture
+  interpretation at all. Only useful for apps and games that genuinely understand touch.
+
+Trackpad and Direct pointer share one gesture vocabulary: tap = left click, two-finger tap = right
+click, two-finger drag = scroll, tap-then-press-and-drag = a held left drag, **three-finger tap =
+cycle the stats overlay**. On Android and iPhone/iPad a **three-finger swipe up or down** summons or
+dismisses the local on-screen keyboard for typing on the host; the Linux and Windows clients have no
+such keyboard, and there any two-or-more-finger drag scrolls.
+
+Touch passthrough depends on the host being able to inject touch, and that varies:
+
+| Host | Touch passthrough |
+|---|---|
+| KDE Plasma (KWin), GNOME | Full multi-touch |
+| Windows 10 1809 and newer | Full multi-touch |
+| Sway, Hyprland and other wlroots compositors | Not injected — contacts are dropped |
+| gamescope Gaming Mode | Degraded to a single absolute pointer — see [gamescope](/docs/gamescope) |
+
+The gamescope row is a rule, not an exception: wherever the compositor offers no touchscreen device
+to drive, only the first finger is used, as an absolute pointer. Tapping still clicks; pinches and
+other multi-finger gestures do not survive.
+
+The trackpad and pointer models are unaffected by all of this: they send ordinary mouse events.
+
+## Pen and stylus
+
+A stylus is not treated as a finger. Punktfunk carries **position, tip pressure, tilt angle and tilt
+direction, barrel roll, hover distance, the eraser end, and two barrel buttons** on their own input
+plane, so drawing and handwriting behave the way they do locally.
+
+**Clients that send pen input:**
+
+- **iPhone and iPad** with an Apple Pencil, including hover. The Pencil has no hardware eraser or
+  barrel buttons, so a **double-tap** is sent as barrel button 2, and on iOS 17.5 or newer a
+  **squeeze** is sent as barrel button 1. Pencil Pro's barrel roll also needs iOS 17.5.
+- **Android** phones and tablets with an active stylus — pressure, tilt, hover, the eraser tool and
+  both barrel buttons. Android exposes no barrel-roll axis, so roll is not sent from there.
+- **[Moonlight](/docs/moonlight) clients** that send pen events reach the same host-side pen.
+
+The Linux, Windows, macOS and Apple TV clients do not send stylus input.
+
+**What the host presents it as:**
+
+- On **Linux**, a virtual tablet named **Punktfunk Pen** appears the first time you use the stylus
+  and is removed when the session ends. Applications see a real pen through the usual tablet path,
+  so Krita, GIMP and Xournal++ treat it as a graphics tablet. It is a screen tablet, mapped by your
+  compositor's own default tablet mapping — correct on a single output; multi-monitor pinning is up
+  to the compositor.
+- On **Windows**, a per-session synthetic pen pointer feeds Windows' normal pen system: pressure,
+  tilt, rotation, the barrel button and the eraser. This needs **Windows 10 1809 or newer**.
+
+**Before it can work on Linux**, the host needs access to `/dev/uinput` — the same `input` group step
+the virtual gamepads need, covered under [After installing](/docs/install#after-installing). Without
+it the host never offers pen at all.
+
+**If the host is too old, or pen is switched off**, nothing breaks: the client keeps folding the
+stylus into its ordinary touch or pointer path. You can still draw — just without pressure and tilt.
+Whether pen splits out is decided by the host, not by your touch mode: you can be in Trackpad mode
+and still draw with full fidelity.
+
+**Operators** can turn the whole feature off by setting `PUNKTFUNK_PEN=0` in the host's `host.env`
+(see [Configuration](/docs/configuration)). The host then stops advertising pen to Punktfunk and
+Moonlight clients alike, and every client falls back to touch.

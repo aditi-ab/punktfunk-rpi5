@@ -1,13 +1,16 @@
 ---
 title: Release Channels
-description: How punktfunk ships — the canary (every main push) and stable (vX.Y.Z) tracks, how to subscribe to each, and how to cut a release.
+description: How Punktfunk ships — the canary (main pushes) and stable (vX.Y.Z) tracks, how to subscribe to each, and how to cut a release.
 ---
 
-punktfunk ships on **two tracks**. Every push to `main` publishes a **canary** build to the
-canary channels (fast iteration, possibly broken). A `vX.Y.Z` git tag cuts a **stable** release:
+Punktfunk ships on **two tracks**. A push to `main` that touches a platform's sources publishes a
+new **canary** build for that platform (fast iteration, possibly broken) — each workflow only
+rebuilds from the paths its artifact is built from, so a docs-only push publishes nothing, and two
+channels can sit on different commits. A `vX.Y.Z` git tag cuts a **stable** release:
 every platform is built at that one version, published to the stable channels, and all the
-artifacts (`.deb`, `.rpm`, `.msix`, host installer, `.apk`/`.aab`, `.dmg`, flatpak, Decky zip)
-are attached to a single [Gitea Release](https://git.unom.io/unom/punktfunk/releases).
+artifacts (`.deb`, `.rpm`, `.msix`, host installer, `.apk`/`.aab`, `.dmg`, `.ipa`, flatpak, Decky
+zip, winget manifests) are attached to a single
+[Gitea Release](https://git.unom.io/unom/punktfunk/releases).
 
 The two tracks are **separate repos / tracks per platform**, never a shared version line — so a
 stable box never gets pulled onto a canary build, and a canary box always moves forward. Pick the
@@ -16,7 +19,7 @@ track per machine; switching is a one-line change.
 ## Which track should I be on?
 
 - **Canary** — dev boxes, your own test fleet, "I want the latest main build." Updates land minutes
-  after a merge.
+  after a merge that touched the parts you run; some merges won't move your channel at all.
 - **Stable** — anything you don't want to babysit. Only moves when a `vX.Y.Z` tag is cut.
 
 ## Subscribe — per platform
@@ -31,6 +34,7 @@ track per machine; switching is a one-line change.
 | **Decky** (Steam Deck) | install-from-URL `…/generic/punktfunk-decky/canary/punktfunk.zip` | `…/punktfunk-decky/latest/punktfunk.zip` |
 | **Windows client** (MSIX) | `…/generic/punktfunk-client-windows/canary/punktfunk-client-windows_x64.msix` | `…/latest/…` + the release page |
 | **Windows host** (installer) | `…/generic/punktfunk-host-windows/canary/punktfunk-host-setup.exe` | `…/latest/…` + the release page |
+| **Windows host** (winget) | — *(stable only)* | `winget install unom.PunktfunkHost` / `winget upgrade unom.PunktfunkHost`, after `winget source add -n punktfunk https://winget.punktfunk.unom.io -t Microsoft.Rest` |
 | **Android** | Play **Internal testing** + sideload `…/generic/punktfunk-android/canary/punktfunk-android.apk` | Play **closed (alpha)** track + the release page |
 | **Apple** (mac/iOS/tvOS) | **TestFlight** | TestFlight + a notarized `.dmg` on the release page |
 
@@ -41,6 +45,40 @@ one-line edit of `/etc/apt/sources.list.d/punktfunk.list` (`stable` ↔ `canary`
 
 > The OS-package channels (apt/rpm) are how Linux hosts get canary builds — they are **not**
 > attached to a canary release page. The Gitea Releases page is stable-only.
+
+**winget is stable-only by design.** A winget manifest pins one immutable artifact per version, so
+there is nothing a rolling canary alias could point at. A Windows host on the canary channel updates
+by running the canary installer again.
+
+## How a box learns about a new build
+
+You don't have to watch the release page. The host works out how it was installed and which channel
+that install follows — from the marker its package wrote (`/usr/share/punktfunk/install-kind`), the
+sysext's own `/etc/punktfunk-sysext.conf`, or, on Windows, from the installer having put it under
+`Program Files\punktfunk` (with the version number itself saying which channel) — then checks a small
+signed manifest for **that** channel and shows the answer in the web console's **Host → Updates**
+card: the version you run, the channel you follow, and the exact command that updates this install
+(or a one-click **Update now** button on Windows). See [Updating the Host](/docs/updating).
+
+## Pin a version, or roll back
+
+A build broke something and you want the previous one? Every channel can serve an exact version.
+
+| How you installed | Pin / roll back |
+|---|---|
+| **apt** | `apt-cache madison punktfunk-host` to list versions, then `sudo apt install punktfunk-host=<version>`. Add `sudo apt-mark hold punktfunk-host` to stay there (`apt-mark unhold` to resume). |
+| **dnf** | `sudo dnf --showduplicates list punktfunk` to list versions, then `sudo dnf install punktfunk-<version>` (or `sudo dnf downgrade punktfunk`). |
+| **pacman** | Reinstall from the package cache: `sudo pacman -U /var/cache/pacman/pkg/punktfunk-host-<version>-x86_64.pkg.tar.zst`, then add `IgnorePkg = punktfunk-host` to `/etc/pacman.conf` so the next `-Syu` leaves it alone. |
+| **Bazzite sysext** | `punktfunk-sysext status` prints your feed URL; download the `punktfunk-<version>-x86-64.raw` you want from it, then `sudo punktfunk-sysext install --from-file punktfunk-<version>-x86-64.raw`. |
+| **Windows installer** | Run the older `punktfunk-host-setup-<version>.exe` over the current install. |
+| **Windows / winget** | `winget install unom.PunktfunkHost --version <x.y.z>` — the source serves per-version manifests. |
+| **Decky plugin** | Install-from-URL with an exact version: `https://git.unom.io/api/packages/unom/generic/punktfunk-decky/<version>/punktfunk.zip`. |
+| **SteamOS (on-device build)** | `git -C ~/punktfunk checkout v<x.y.z>` then `bash ~/punktfunk/scripts/steamdeck/update.sh` (no `--pull` — that would fetch `main` again). |
+| **NixOS** | `sudo nixos-rebuild switch --rollback` for the previous generation, or pin the flake input to a `v<x.y.z>` tag and rebuild. |
+
+Downgrading the host does **not** downgrade `~/.config/punktfunk` (Linux/SteamOS) or
+`%ProgramData%\punktfunk` (Windows), so your config, console password and paired devices carry
+across in both directions.
 
 ## Cut a stable release (maintainer)
 
