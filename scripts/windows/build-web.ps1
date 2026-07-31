@@ -7,7 +7,7 @@
   into the self-contained .output (no node_modules, nothing for bun to fail to resolve). The
   console runs as a supervised child of the PunktfunkHost service (bun {app}\web\.output\server\
   index.mjs on :47992), so the swap is: stop the service (its kill-on-close job takes the console's
-  bun down and unlocks the files), replace {app}\web\.output, start the service — the supervisor
+  bun down and unlocks the files), replace {app}\web\.output, start the service - the supervisor
   brings the console back by itself. Needs an elevated shell (service control + Program Files).
 #>
 $ErrorActionPreference = 'Stop'
