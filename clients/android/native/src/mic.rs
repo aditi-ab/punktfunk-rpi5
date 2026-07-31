@@ -11,8 +11,8 @@
 //! buffering interval off the uplink.
 
 use ndk::audio::{
-    AudioCallbackResult, AudioDirection, AudioFormat, AudioPerformanceMode, AudioSharingMode,
-    AudioStream, AudioStreamBuilder,
+    AudioCallbackResult, AudioDirection, AudioFormat, AudioInputPreset, AudioPerformanceMode,
+    AudioSharingMode, AudioStream, AudioStreamBuilder, SessionId,
 };
 use punktfunk_core::client::NativeClient;
 use std::collections::VecDeque;
@@ -48,15 +48,22 @@ const BACKLOG_KEEP_FRAMES: usize = 2;
 /// Owned by [`crate::session::SessionHandle`]: the live AAudio input stream + the encode thread.
 pub struct MicCapture {
     _stream: AudioStream, // dropping it stops + closes the AAudio input stream
+    /// The audio-session id AAudio allocated (`> 0`) when echo cancellation asked for one — the
+    /// hook Kotlin hangs the Java `AcousticEchoCanceler`/`NoiseSuppressor` on. `0` = none.
+    session_id: i32,
     shutdown: Arc<AtomicBool>,
     join: Option<std::thread::JoinHandle<()>>,
 }
 
 impl MicCapture {
     /// Open AAudio (LowLatency, 48 kHz/mono/f32) for **input** with a realtime callback that
-    /// forwards captured PCM to a channel, then spawn the Opus encode + uplink thread. `None` on
-    /// failure (the caller leaves the rest of the session streaming).
-    pub fn start(client: Arc<NativeClient>) -> Option<MicCapture> {
+    /// forwards captured PCM to a channel, then spawn the Opus encode + uplink thread. With
+    /// `echo_cancel` the stream opens under the `VoiceCommunication` input preset — the HAL's own
+    /// echo canceller / noise suppressor on the capture path (the default `VoiceRecognition`
+    /// preset deliberately bypasses them, which is why the host used to hear its own stream back
+    /// from a speaker-playing phone) — and allocates an audio session id for Kotlin's Java-effect
+    /// backstop. `None` on failure (the caller leaves the rest of the session streaming).
+    pub fn start(client: Arc<NativeClient>, echo_cancel: bool) -> Option<MicCapture> {
         let captured = Arc::new(AtomicU64::new(0));
         // Chunks discarded on the capture thread (free-list empty / encoder lagging); logged
         // throttled from the encode worker.
@@ -64,7 +71,9 @@ impl MicCapture {
 
         // One open attempt at a given sharing mode (same pattern as [`crate::audio`]: `open_stream`
         // consumes the builder AND the callback, so each try rebuilds the channels it captures).
-        let try_open = |sharing: AudioSharingMode| -> ndk::audio::Result<(
+        let try_open = |sharing: AudioSharingMode,
+                        voice: bool|
+         -> ndk::audio::Result<(
             AudioStream,
             Receiver<Vec<f32>>,
             SyncSender<Vec<f32>>,
@@ -111,13 +120,25 @@ impl MicCapture {
                 AudioCallbackResult::Continue
             };
 
-            let stream = AudioStreamBuilder::new()?
+            // NOTE: no `.frames_per_data_callback(...)`: AAudio's own docs call leaving it unset
+            // the lowest-latency path (the callback then runs at the device's optimal burst,
+            // while pinning a size inserts an adaptation buffer), and the encode side re-chunks
+            // to 10 ms frames regardless of how the bursts arrive.
+            let mut builder = AudioStreamBuilder::new()?
                 .direction(AudioDirection::Input)
                 .sample_rate(SAMPLE_RATE)
                 .channel_count(CHANNELS as i32)
                 .format(AudioFormat::PCM_Float)
                 .performance_mode(AudioPerformanceMode::LowLatency)
-                .sharing_mode(sharing)
+                .sharing_mode(sharing);
+            if voice {
+                // VoiceCommunication routes the capture through the HAL's AEC/NS; the allocated
+                // session id (`None` = allocate) is what Kotlin attaches the Java effects to.
+                builder = builder
+                    .input_preset(AudioInputPreset::VoiceCommunication)
+                    .session_id(None);
+            }
+            let stream = builder
                 .data_callback(Box::new(callback))
                 .error_callback(Box::new(|_s, e| {
                     log::warn!("mic: AAudio error (device reroute/disconnect?): {e:?}");
@@ -126,21 +147,52 @@ impl MicCapture {
             Ok((stream, rx, free_tx))
         };
 
-        // Exclusive first — MMAP-exclusive is AAudio's lowest-latency path — falling back to Shared
-        // when the device refuses (no MMAP, mic claimed, …). The started-log below prints the mode
-        // the device actually GRANTED (`share=`).
-        let (stream, rx, free_tx) = match try_open(AudioSharingMode::Exclusive) {
-            Ok(opened) => opened,
-            Err(e) => {
-                log::info!("mic: Exclusive open failed ({e}) — retrying Shared");
-                match try_open(AudioSharingMode::Shared) {
-                    Ok(opened) => opened,
-                    Err(e) => {
-                        log::error!("mic: open_stream (RECORD_AUDIO granted?): {e}");
-                        return None;
-                    }
+        // Exclusive first — MMAP-exclusive is AAudio's lowest-latency path — falling back to
+        // Shared when the device refuses (no MMAP, mic claimed, …); and each sharing mode with
+        // the voice preset before without it, because some HALs reject VoiceCommunication (or a
+        // session id) outright and a mic without echo cancellation still beats no mic. The
+        // ladder's last rungs are exactly the preset-less open this always did. The started-log
+        // below prints what the device actually GRANTED (`share=`/`session=`).
+        let attempts: &[(AudioSharingMode, bool)] = if echo_cancel {
+            &[
+                (AudioSharingMode::Exclusive, true),
+                (AudioSharingMode::Shared, true),
+                (AudioSharingMode::Exclusive, false),
+                (AudioSharingMode::Shared, false),
+            ]
+        } else {
+            &[
+                (AudioSharingMode::Exclusive, false),
+                (AudioSharingMode::Shared, false),
+            ]
+        };
+        let mut opened = None;
+        for &(sharing, voice) in attempts {
+            match try_open(sharing, voice) {
+                Ok(o) => {
+                    opened = Some(o);
+                    break;
                 }
+                Err(e) => log::info!(
+                    "mic: open {sharing:?}{} failed ({e}) — trying the next fallback",
+                    if voice { "+VoiceCommunication" } else { "" },
+                ),
             }
+        }
+        let (stream, rx, free_tx) = match opened {
+            Some(o) => o,
+            None => {
+                log::error!("mic: open_stream (RECORD_AUDIO granted?): every mode refused");
+                return None;
+            }
+        };
+
+        // The session id AAudio actually allocated (only a voice rung asks for one): `> 0` is the
+        // handle Kotlin hangs the Java AcousticEchoCanceler/NoiseSuppressor off as the HAL
+        // preset's backstop; `0` = none, nothing to attach.
+        let session_id = match stream.session_id() {
+            SessionId::Allocated(id) => id.get(),
+            SessionId::None => 0,
         };
 
         if let Err(e) = stream.request_start() {
@@ -148,7 +200,7 @@ impl MicCapture {
             return None;
         }
         log::info!(
-            "mic: AAudio input started rate={} ch={} fmt={:?} share={:?}",
+            "mic: AAudio input started rate={} ch={} fmt={:?} share={:?} session={session_id}",
             stream.sample_rate(),
             stream.channel_count(),
             stream.format(),
@@ -164,9 +216,15 @@ impl MicCapture {
 
         Some(MicCapture {
             _stream: stream,
+            session_id,
             shutdown,
             join,
         })
+    }
+
+    /// The audio-session id AAudio allocated (`> 0`; see [`MicCapture::start`]), `0` = none.
+    pub fn session_id(&self) -> i32 {
+        self.session_id
     }
 }
 

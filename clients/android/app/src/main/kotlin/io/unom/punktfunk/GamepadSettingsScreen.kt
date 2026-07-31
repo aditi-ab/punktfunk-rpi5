@@ -395,6 +395,11 @@ private fun buildSettingsRows(
             "mic", null, "Microphone", "Send this device's microphone to the host's virtual mic.",
             s.micEnabled,
         ) { update(s.copy(micEnabled = it)) },
+        toggle(
+            "echoCancel", null, "Echo cancellation",
+            "Filter the stream's own audio out of the mic pickup. Applies while the microphone is on.",
+            s.echoCancel,
+        ) { update(s.copy(echoCancel = it)) },
 
         choice(
             "padType", "Controllers", "Controller type",

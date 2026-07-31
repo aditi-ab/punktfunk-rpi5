@@ -42,6 +42,15 @@ data class Settings(
     val codec: String = "auto",
     val micEnabled: Boolean = false,
     /**
+     * Cancel acoustic echo on the mic uplink (plus noise suppression): the capture opens under
+     * the VoiceCommunication preset so the HAL's own AEC/NS process it, with the Java effects
+     * attached as a backstop where available. On by default — a phone/tablet plays the game audio
+     * out of the same device its mic hears, so without this the host hears its own stream back.
+     * Turn off for a headset-only setup where the untouched full-band capture sounds better.
+     * Only meaningful while [micEnabled] is on.
+     */
+    val echoCancel: Boolean = true,
+    /**
      * How much the in-stream stats overlay shows — see [StatsVerbosity]. Defaults to
      * [StatsVerbosity.NORMAL] (the res/fps line + latency headline + reliability counters); the full
      * decoder/feed/equation HUD is [StatsVerbosity.DETAILED], and a single terse line is
@@ -209,6 +218,7 @@ class SettingsStore(context: Context) {
         audioChannels = prefs.getInt(K_AUDIO_CH, 2),
         codec = prefs.getString(K_CODEC, "auto") ?: "auto",
         micEnabled = prefs.getBoolean(K_MIC, false),
+        echoCancel = prefs.getBoolean(K_ECHO_CANCEL, true),
         statsVerbosity = prefs.getString(K_STATS_VERBOSITY, null)
             ?.let { name -> StatsVerbosity.entries.firstOrNull { it.name == name } }
             // Migration from the pre-tier Boolean "stats_hud_enabled": an explicit OFF stays off;
@@ -254,6 +264,7 @@ class SettingsStore(context: Context) {
             .putInt(K_AUDIO_CH, s.audioChannels)
             .putString(K_CODEC, s.codec)
             .putBoolean(K_MIC, s.micEnabled)
+            .putBoolean(K_ECHO_CANCEL, s.echoCancel)
             .putString(K_STATS_VERBOSITY, s.statsVerbosity.name)
             .putString(K_TOUCH_MODE, s.touchMode.name)
             .putBoolean(K_GAMEPAD_UI, s.gamepadUiEnabled)
@@ -282,6 +293,7 @@ class SettingsStore(context: Context) {
         const val K_AUDIO_CH = "audio_channels"
         const val K_CODEC = "codec"
         const val K_MIC = "mic_enabled"
+        const val K_ECHO_CANCEL = "echo_cancel"
         const val K_STATS_VERBOSITY = "stats_verbosity"
 
         /** Pre-tier Boolean the [K_STATS_VERBOSITY] enum replaced — read once for migration, never

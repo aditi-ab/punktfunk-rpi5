@@ -288,11 +288,17 @@ object NativeBridge {
     external fun nativeStopAudio(handle: Long)
 
     /**
-     * Start mic uplink: AAudio input → Opus (48 kHz stereo, 20 ms) → host (`send_mic` / 0xCB), all in
-     * Rust. No-op if already running. The caller MUST hold RECORD_AUDIO; otherwise the AAudio input
-     * stream fails to open and the rest of the session keeps streaming.
+     * Start mic uplink: AAudio input → Opus (48 kHz mono, 10 ms) → host (`send_mic` / 0xCB), all in
+     * Rust. [echoCancel] opens the capture under the VoiceCommunication preset (the HAL's own echo
+     * canceller / noise suppressor) and allocates an audio session id; the return value is that id
+     * (`> 0`) so the caller can attach the Java [android.media.audiofx.AcousticEchoCanceler] /
+     * [android.media.audiofx.NoiseSuppressor] as a backstop — `0` when none was allocated
+     * (echoCancel off, the device refused the preset and the open fell back to the plain path, or
+     * the mic failed entirely). No-op if already running (returns the running capture's id). The
+     * caller MUST hold RECORD_AUDIO; otherwise the AAudio input stream fails to open and the rest
+     * of the session keeps streaming.
      */
-    external fun nativeStartMic(handle: Long)
+    external fun nativeStartMic(handle: Long, echoCancel: Boolean): Int
 
     /** Stop + join the mic thread and close the AAudio input stream. No-op on `0`. */
     external fun nativeStopMic(handle: Long)

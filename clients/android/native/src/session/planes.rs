@@ -390,28 +390,41 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStopAudio(
     })
 }
 
-/// `NativeBridge.nativeStartMic(handle)` — start mic capture (AAudio input → Opus → host `send_mic`).
-/// No-op if already running or on a `0` handle. Caller MUST hold RECORD_AUDIO; a failure (e.g. no
-/// permission) leaves the rest of the session streaming.
+/// `NativeBridge.nativeStartMic(handle, echoCancel): Int` — start mic capture (AAudio input →
+/// Opus → host `send_mic`). `echoCancel` opens the capture under the `VoiceCommunication` preset
+/// (the HAL's echo canceller / noise suppressor) and allocates an audio session id; the return
+/// value is that id (`> 0`), so Kotlin can attach the Java `AcousticEchoCanceler`/`NoiseSuppressor`
+/// as a backstop — `0` when none was allocated (echoCancel off, the preset fell back to the plain
+/// open, a `0` handle, or the mic failed entirely). Already running (a surface recreate) returns
+/// the running capture's id. Caller MUST hold RECORD_AUDIO; a failure (e.g. no permission) leaves
+/// the rest of the session streaming.
 #[cfg(target_os = "android")]
 #[no_mangle]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStartMic(
     _env: JNIEnv,
     _this: JObject,
     handle: jlong,
-) {
+    echo_cancel: jboolean,
+) -> jni::sys::jint {
     if handle == 0 {
-        return;
+        return 0;
     }
     // SAFETY: live handle per the nativeConnect/nativeClose contract.
     let h = unsafe { &*(handle as *const SessionHandle) };
     let mut guard = h.mic.lock().unwrap();
-    if guard.is_some() {
-        return; // already capturing
+    if let Some(m) = guard.as_ref() {
+        return m.session_id(); // already capturing — same stream, same session
     }
-    match crate::mic::MicCapture::start(h.client.clone()) {
-        Some(m) => *guard = Some(m),
-        None => log::error!("nativeStartMic: mic init failed (RECORD_AUDIO? — session unaffected)"),
+    match crate::mic::MicCapture::start(h.client.clone(), echo_cancel != 0) {
+        Some(m) => {
+            let session_id = m.session_id();
+            *guard = Some(m);
+            session_id
+        }
+        None => {
+            log::error!("nativeStartMic: mic init failed (RECORD_AUDIO? — session unaffected)");
+            0
+        }
     }
 }
 

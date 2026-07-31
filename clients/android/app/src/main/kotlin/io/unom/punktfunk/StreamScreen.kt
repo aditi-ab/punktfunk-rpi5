@@ -9,6 +9,9 @@ import android.content.IntentFilter
 import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
 import android.hardware.usb.UsbManager
+import android.media.audiofx.AcousticEchoCanceler
+import android.media.audiofx.AudioEffect
+import android.media.audiofx.NoiseSuppressor
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.text.InputType
@@ -96,6 +99,13 @@ fun StreamScreen(session: ActiveSession, onDisconnect: () -> Unit) {
         context,
         Manifest.permission.RECORD_AUDIO,
     ) == PackageManager.PERMISSION_GRANTED
+
+    // The Java AEC/NS pair backstopping the native VoiceCommunication capture preset, hung off the
+    // audio session id `nativeStartMic` returns. Attached in surfaceCreated (where the mic starts)
+    // and released on every path that stops the mic — the surface teardown AND the final dispose —
+    // so a surface recreate re-attaches to the fresh stream instead of leaking effect engines.
+    // All three touch points run on the main thread; a plain list is race-free.
+    val micEffects = remember { mutableListOf<AudioEffect>() }
 
     // Live decode stats for the HUD. `statsOn` (verbosity != OFF) gates the whole native pipeline:
     // the per-frame sampling (nativeSetVideoStatsEnabled — a hidden HUD costs one atomic load per
@@ -519,6 +529,7 @@ fun StreamScreen(session: ActiveSession, onDisconnect: () -> Unit) {
             activity?.requestedOrientation =
                 priorOrientation ?: ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
             // Leaving the stream: stop the mic + audio + decode threads and tear down the session.
+            releaseMicEffects(micEffects)
             NativeBridge.nativeStopMic(handle)
             NativeBridge.nativeStopAudio(handle)
             NativeBridge.nativeStopVideo(handle)
@@ -609,7 +620,13 @@ fun StreamScreen(session: ActiveSession, onDisconnect: () -> Unit) {
                                         .roundToInt(),
                             )
                             NativeBridge.nativeStartAudio(handle, lowLatencyMode)
-                            if (micWanted) NativeBridge.nativeStartMic(handle)
+                            if (micWanted) {
+                                val sessionId =
+                                    NativeBridge.nativeStartMic(handle, initialSettings.echoCancel)
+                                if (initialSettings.echoCancel) {
+                                    attachMicEffects(sessionId, micEffects)
+                                }
+                            }
                         }
 
                         override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {}
@@ -620,6 +637,7 @@ fun StreamScreen(session: ActiveSession, onDisconnect: () -> Unit) {
                             // DisposableEffect has closed it, the handle is freed; dereferencing it
                             // here is the use-after-free that crashed on back-navigation.
                             if (!closed.get()) {
+                                releaseMicEffects(micEffects)
                                 NativeBridge.nativeStopMic(handle)
                                 NativeBridge.nativeStopAudio(handle)
                                 NativeBridge.nativeStopVideo(handle)
@@ -696,6 +714,32 @@ fun StreamScreen(session: ActiveSession, onDisconnect: () -> Unit) {
             },
         )
     }
+}
+
+/**
+ * Attach the Java echo-canceller + noise-suppressor pair to the mic stream's audio session — the
+ * backstop for HALs whose VoiceCommunication capture path doesn't cancel on its own (the native
+ * side already opened the stream under that preset). [sessionId] `<= 0` means native allocated no
+ * session (echo cancellation off, or the preset fell back to the plain open), so there is nothing
+ * to hang an effect on. Created effects land in [into] for [releaseMicEffects]; `create()`
+ * returning null (unsupported / claimed) is quietly nothing — the HAL preset still does its part.
+ * Needs no extra permission: the effect APIs attach to our own recording session.
+ */
+private fun attachMicEffects(sessionId: Int, into: MutableList<AudioEffect>) {
+    if (sessionId <= 0) return
+    if (AcousticEchoCanceler.isAvailable()) {
+        AcousticEchoCanceler.create(sessionId)?.let { it.setEnabled(true); into.add(it) }
+    }
+    if (NoiseSuppressor.isAvailable()) {
+        NoiseSuppressor.create(sessionId)?.let { it.setEnabled(true); into.add(it) }
+    }
+}
+
+/** Release every attached mic effect engine. Idempotent — the list is cleared, and both stop
+ * paths (surface teardown, final dispose) may call it in either order. */
+private fun releaseMicEffects(effects: MutableList<AudioEffect>) {
+    effects.forEach { runCatching { it.release() } }
+    effects.clear()
 }
 
 /**
