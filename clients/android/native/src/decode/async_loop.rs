@@ -542,6 +542,9 @@ fn feeder_loop(
 ) {
     // Received AUs awaiting their 0xCF host timing (Phase-2 split), as (pts_ns, capture→received µs).
     let mut pending_split: VecDeque<(u64, u64)> = VecDeque::new();
+    // Last logged phase-lock ACK (the host's applied capture hold, from the 0xCF tail) — logged
+    // on change so `adb logcat -s pf.phase` shows the closed loop working (or not) at a glance.
+    let mut last_phase_ack: Option<i32> = None;
     while !shutdown.load(Ordering::Relaxed) {
         match client.next_frame(Duration::from_millis(5)) {
             Ok(frame) => {
@@ -584,6 +587,17 @@ fn feeder_loop(
                             }
                         }
                         while let Ok(t) = client.next_host_timing(Duration::ZERO) {
+                            // Phase-lock closed-loop readout: the host's applied hold rides the
+                            // 0xCF tail; log transitions (~1 Hz worst case — the host updates it
+                            // once a second). None = a host without the tail (pre-phase-lock).
+                            if t.applied_phase_ns != last_phase_ack {
+                                log::info!(
+                                    target: "pf.phase",
+                                    "host applied_phase={:?}us",
+                                    t.applied_phase_ns.map(|n| n / 1000)
+                                );
+                                last_phase_ack = t.applied_phase_ns;
+                            }
                             if let Some(i) = pending_split.iter().position(|&(p, _)| p == t.pts_ns)
                             {
                                 let (_, hostnet_us) = pending_split.remove(i).unwrap();
