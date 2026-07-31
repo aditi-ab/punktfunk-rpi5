@@ -2,6 +2,7 @@ package io.unom.punktfunk
 
 import android.content.Context
 import android.os.Build
+import android.util.Log
 import io.unom.punktfunk.kit.Gamepad
 import io.unom.punktfunk.kit.NativeBridge
 import io.unom.punktfunk.kit.VideoDecoders
@@ -45,14 +46,23 @@ suspend fun connectToHost(
         // Transport-level half of "Low-latency mode (experimental)" (DSCP marking on the media
         // sockets) — must be applied before connect, since sockets are tagged at creation.
         NativeBridge.nativeSetLowLatencyMode(settings.lowLatencyMode)
+        val multiSlice = VideoDecoders.multiSliceTolerant()
+        // Slice-progressive delivery: decoder truth AND the async decode loop — the legacy
+        // sync loop feeds whole AUs only, so parts must never arrive when it is selected.
+        val frameParts = settings.lowLatencyMode && VideoDecoders.partialFrameCapable()
+        // The connect-time capability readout (`adb logcat -s pf.caps`): the P2 slice pipeline
+        // is client-inert unless BOTH probes pass — this line says which decoder failed one.
+        Log.i(
+            "pf.caps",
+            VideoDecoders.capsReport() +
+                " → multiSlice=$multiSlice parts=$frameParts (lowLatency=${settings.lowLatencyMode})",
+        )
         NativeBridge.nativeConnect(
             host, port, w, h, hz,
             identity.certPem, identity.privateKeyPem, pinHex,
             settings.bitrateKbps, settings.compositor, gamepadPref,
-            hdrEnabled, VideoDecoders.multiSliceTolerant(),
-            // Slice-progressive delivery: decoder truth AND the async decode loop — the legacy
-            // sync loop feeds whole AUs only, so parts must never arrive when it is selected.
-            settings.lowLatencyMode && VideoDecoders.partialFrameCapable(),
+            hdrEnabled, multiSlice,
+            frameParts,
             settings.audioChannels,
             // What this device can decode (H.264|HEVC always, AV1 when a real decoder exists) +
             // the user's soft codec preference — the host resolves the emitted codec from both.

@@ -20,7 +20,8 @@ pub(super) fn now_realtime_ns() -> i128 {
 /// entries older than it are evicted (decode order == input order here — low-latency, no
 /// B-frames — so anything before it was dropped inside the codec or stamped before a flush).
 /// `decoded_ns` is the availability instant: the dequeue (sync loop) or the output callback's
-/// stamp (async loop).
+/// stamp (async loop). Returns the receipt stamp it paired (if any) so the caller can split the
+/// `decode` stage further (feed wait vs codec-pure) without re-walking the map.
 pub(super) fn note_decoded_pts(
     client: &NativeClient,
     measure_decode: bool,
@@ -29,7 +30,7 @@ pub(super) fn note_decoded_pts(
     clock_offset: i64,
     pts_us: u64,
     decoded_ns: i128,
-) {
+) -> Option<i128> {
     // Pair the echoed pts back to its receipt stamp, evicting stale (older) entries as we go.
     let mut received_ns = None;
     while let Some(&(p, r)) = in_flight.front() {
@@ -61,6 +62,24 @@ pub(super) fn note_decoded_pts(
         let e2e_us = (e2e_ns > 0 && e2e_ns < 10_000_000_000).then_some((e2e_ns / 1000) as u64);
         stats.note_decoded(e2e_us, decode_us);
     }
+    received_ns
+}
+
+/// The queued-instant stamp for a decoded output, keyed by the echoed `presentationTimeUs` — the
+/// same monotonic evict-as-you-go pairing as [`take_flags`], over an `(pts_us, realtime_ns)` map
+/// (the feed side stamps each AU as its last piece enters the codec). A miss returns `None` —
+/// the split is simply not recorded for that frame.
+pub(super) fn take_stamp(map: &mut VecDeque<(u64, i128)>, pts_us: u64) -> Option<i128> {
+    while let Some(&(p, t)) = map.front() {
+        if p > pts_us {
+            break; // future frame — leave it for its own output buffer
+        }
+        map.pop_front();
+        if p == pts_us {
+            return Some(t);
+        }
+    }
+    None
 }
 
 /// The AU `user_flags` for a decoded output, keyed by the echoed `presentationTimeUs`. Recovery

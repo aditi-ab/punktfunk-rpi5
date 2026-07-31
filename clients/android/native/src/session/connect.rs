@@ -83,6 +83,28 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSetLowLaten
     punktfunk_core::transport::set_dscp_default(enabled != 0);
 }
 
+/// `debug.punktfunk.force_parts` = 1: arm slice-progressive parts delivery even when the
+/// Kotlin `FEATURE_PartialFrame` probe said no — the rebuild-free on-glass experiment for a
+/// decoder that may accept `BUFFER_FLAG_PARTIAL_FRAME` without declaring the feature (the NP3's
+/// c2.qti decoders declare nothing). Android-only; everywhere else the probe verdict stands.
+#[cfg(target_os = "android")]
+fn force_parts_sysprop() -> bool {
+    let mut buf = [0u8; 92]; // PROP_VALUE_MAX
+                             // SAFETY: __system_property_get with a valid name + PROP_VALUE_MAX buffer is always safe.
+    let n = unsafe {
+        libc::__system_property_get(
+            c"debug.punktfunk.force_parts".as_ptr(),
+            buf.as_mut_ptr().cast(),
+        )
+    };
+    n > 0 && std::str::from_utf8(&buf[..n as usize]).unwrap_or("").trim() == "1"
+}
+
+#[cfg(not(target_os = "android"))]
+fn force_parts_sysprop() -> bool {
+    false
+}
+
 /// `NativeBridge.nativeConnect(host, port, w, h, hz, certPem, keyPem, pinHex, bitrateKbps,
 /// compositorPref, gamepadPref, hdrEnabled, audioChannels, preferredCodec, timeoutMs, launch,
 /// deviceName): Long`.
@@ -155,6 +177,24 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConnect<'lo
     } else {
         Some((cert, key))
     };
+    // Slice-progressive parts, by decoder truth (Kotlin's FEATURE_PartialFrame probe) — with a
+    // sysprop escape hatch for the on-glass science question the probe can't answer: does the
+    // decoder ACTUALLY choke on BUFFER_FLAG_PARTIAL_FRAME input, or does it merely not declare
+    // the feature? (`adb shell setprop debug.punktfunk.force_parts 1` + stream restart; a codec
+    // that can't take parts errors recoverably and the reanchor gate + keyframe path recovers.)
+    let force_parts = force_parts_sysprop();
+    let frame_parts = frame_parts_ok != 0 || force_parts;
+    // The connect-time capability readout (`adb logcat -s pf.caps`): the P2 slice pipeline is
+    // inert client-side unless BOTH probes pass — this line is the one place that says which.
+    log::info!(
+        target: "pf.caps",
+        "decoder caps: multi_slice={} partial_frame={}{} hdr={} codec_bits={:#x}",
+        multi_slice_ok != 0,
+        frame_parts_ok != 0,
+        if force_parts { " (FORCED by sysprop)" } else { "" },
+        hdr_enabled != 0,
+        video_codecs,
+    );
     let pin: Option<[u8; 32]> = if pin_hex.is_empty() {
         None
     } else {
@@ -230,9 +270,10 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConnect<'lo
         // should say what the client does).
         punktfunk_core::quic::CLIENT_CAP_PHASE_LOCK,
         // Slice-progressive delivery, by decoder truth (Kotlin probes FEATURE_PartialFrame on
-        // every decoder this device would use): AU prefixes then arrive as `Frame::part`
-        // pieces and the decode loop feeds them with BUFFER_FLAG_PARTIAL_FRAME.
-        frame_parts_ok != 0,
+        // every decoder this device would use; `debug.punktfunk.force_parts` overrides for the
+        // on-glass experiment): AU prefixes then arrive as `Frame::part` pieces and the decode
+        // loop feeds them with BUFFER_FLAG_PARTIAL_FRAME.
+        frame_parts,
         launch, // a store-qualified library id to boot into a game, or None for the desktop
         device_name, // Kotlin's Build.MODEL — the host's approval-list / trust-store label
         pin,    // Some → Crypto on host-fp mismatch
