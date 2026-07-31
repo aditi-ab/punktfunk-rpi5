@@ -101,6 +101,20 @@ NOTES:
 /// Locate the runner and hand it the argv verbatim, inheriting stdio so bun's progress output goes
 /// straight to the user's terminal. Exits with the runner's own status code.
 fn forward_to_runner(args: &[String]) -> Result<()> {
+    // `bun add` installs into the nearest ancestor `package.json`, not into its working directory,
+    // so the plugins dir has to own one before the runner runs or a stray `~/package.json` captures
+    // the install — silently, exit 0 (see `store::ensure_plugin_root`). The runner seeds it too, but
+    // the installed scripting package can predate this binary, so do it on this side as well.
+    if args.first().map(String::as_str) == Some("add") {
+        let dir = args
+            .iter()
+            .position(|a| a == "--plugins")
+            .and_then(|i| args.get(i + 1))
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(crate::store::plugins_dir);
+        crate::store::ensure_plugin_root(&dir)
+            .with_context(|| format!("prepare {}", dir.display()))?;
+    }
     let (program, prefix) = runner_command()?;
     let status = Command::new(&program)
         .args(&prefix)

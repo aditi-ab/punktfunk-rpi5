@@ -199,6 +199,48 @@ pub(crate) fn ensure_bunfig_scope(dir: &Path, scope: &str, url: &str) -> Result<
     Ok(())
 }
 
+/// Anchor bun's install root at the plugins dir by giving it a `package.json`.
+///
+/// **This is load-bearing.** `bun add` does not install into its working directory — it walks *up*
+/// to the nearest ancestor `package.json` and installs into THAT tree. A fresh plugins dir has no
+/// `package.json`, so any stray one above it (a `~/package.json` from someone's one-off `bun add`
+/// or `npm init`) silently captures the install: bun reports success and **exits 0**, the packages
+/// land in the ancestor's `node_modules`, and the plugins dir gets nothing. Reproduced on-glass
+/// 2026-07-31 (Nobara 44, host + runner 0.22.3): the runner exits 0 in ~100 ms and the install then
+/// fails the presence check with the unhelpful "not present after install" — a user report that
+/// looked like a broken store and was a stray `~/package.json` all along.
+///
+/// The host writes this itself rather than leaving it to the runner, for the same reason as
+/// [`ensure_bunfig_scope`]: the installed scripting package can be older than this binary.
+///
+/// Only seeds a tree that has no `node_modules` yet. A dir with packages but no `package.json` is
+/// hand-assembled or an older layout, and [`installed_packages`] deliberately falls back to the
+/// naming convention there — dropping an empty `dependencies` on it would make every plugin already
+/// installed vanish from the store.
+pub(crate) fn ensure_plugin_root(dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    let path = dir.join("package.json");
+    if path.exists() || dir.join("node_modules").exists() {
+        return Ok(());
+    }
+    std::fs::write(
+        &path,
+        "{\n  \"name\": \"punktfunk-plugins\",\n  \"private\": true\n}\n",
+    )
+    .with_context(|| format!("write {}", path.display()))?;
+    Ok(())
+}
+
+/// The nearest `package.json` **above** `dir`, if any — the thing that would capture a `bun add`
+/// run inside `dir` (see [`ensure_plugin_root`]). Used to turn a silent mis-install into an error
+/// the operator can act on.
+pub(crate) fn capturing_ancestor(dir: &Path) -> Option<PathBuf> {
+    dir.ancestors()
+        .skip(1)
+        .map(|a| a.join("package.json"))
+        .find(|p| p.exists())
+}
+
 /// Is `pkg` a name the runner would supervise? Guards the uninstall route so a stray
 /// `POST /store/uninstall {"pkg": "effect"}` can't rip a shared dependency out of the tree.
 pub(crate) fn valid_installed_pkg(pkg: &str) -> Result<()> {
@@ -493,6 +535,72 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         touch_pkg(dir.path(), "punktfunk-plugin-legacy", "0.1.0");
         assert_eq!(installed_packages(dir.path()).len(), 1);
+    }
+
+    /// A fresh plugins dir must own its install root, or `bun add` installs somewhere else.
+    ///
+    /// Field bug 2026-07-31: with no `package.json` here, bun walked up to the operator's stray
+    /// `~/package.json`, installed the plugin into `~/node_modules`, and exited 0 — the store then
+    /// failed the presence check on an empty dir.
+    #[test]
+    fn a_fresh_dir_is_seeded_as_its_own_install_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("plugins");
+        ensure_plugin_root(&root).unwrap();
+        let seeded = std::fs::read_to_string(root.join("package.json")).unwrap();
+        assert!(seeded.contains("punktfunk-plugins"), "{seeded}");
+        // Seeding must not make the dir look like it has installs, nor lose the ones it gets.
+        assert!(installed_packages(&root).is_empty());
+    }
+
+    #[test]
+    fn seeding_never_touches_an_existing_package_json() {
+        let dir = tempfile::tempdir().unwrap();
+        touch_pkg(dir.path(), "@punktfunk/plugin-rom-manager", "0.3.1");
+        let manifest = r#"{"dependencies":{"@punktfunk/plugin-rom-manager":"0.3.1"}}"#;
+        std::fs::write(dir.path().join("package.json"), manifest).unwrap();
+        ensure_plugin_root(dir.path()).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("package.json")).unwrap(),
+            manifest
+        );
+    }
+
+    /// The one tree we must NOT seed: packages present, no `package.json`. `installed_packages`
+    /// falls back to the naming convention there, and a seeded empty `dependencies` would report
+    /// every plugin the operator already runs as uninstalled (see
+    /// `an_emptied_dependency_list_means_nothing_is_installed`).
+    #[test]
+    fn seeding_skips_a_tree_that_already_has_packages() {
+        let dir = tempfile::tempdir().unwrap();
+        touch_pkg(dir.path(), "punktfunk-plugin-legacy", "0.1.0");
+        ensure_plugin_root(dir.path()).unwrap();
+        assert!(!dir.path().join("package.json").exists());
+        assert_eq!(installed_packages(dir.path()).len(), 1);
+    }
+
+    #[test]
+    fn capturing_ancestor_looks_strictly_upwards() {
+        let dir = tempfile::tempdir().unwrap();
+        let plugins = dir.path().join("config/punktfunk/plugins");
+        std::fs::create_dir_all(&plugins).unwrap();
+        std::fs::write(dir.path().join("package.json"), "{}").unwrap();
+        assert_eq!(
+            capturing_ancestor(&plugins),
+            Some(dir.path().join("package.json"))
+        );
+
+        // The nearest one wins — that is the tree bun would pick.
+        let nearer = dir.path().join("config/package.json");
+        std::fs::write(&nearer, "{}").unwrap();
+        assert_eq!(capturing_ancestor(&plugins), Some(nearer));
+
+        // The dir's OWN manifest is not a capture — it is the anchor that prevents one.
+        std::fs::write(plugins.join("package.json"), "{}").unwrap();
+        assert_ne!(
+            capturing_ancestor(&plugins),
+            Some(plugins.join("package.json"))
+        );
     }
 
     /// Uninstalling the last plugin must not resurrect its library as an installed plugin.

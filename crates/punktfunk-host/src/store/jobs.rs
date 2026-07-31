@@ -353,6 +353,10 @@ fn run_install(id: &str, plan: Plan) -> Result<()> {
 
     // ---- install ------------------------------------------------------------------------------
     set_phase(id, "installing");
+    // Before anything else: make this dir bun's install root. Without a `package.json` here, `bun
+    // add` walks up and installs into the nearest ancestor that has one — successfully, exit 0,
+    // into somebody else's tree (see `ensure_plugin_root`).
+    super::ensure_plugin_root(&dir).with_context(|| format!("prepare {}", dir.display()))?;
     let before = super::installed_packages(&dir);
     // Map the entry's scope to its registry ourselves rather than through a runner flag: the
     // installed scripting package can be older than this binary, and an older runner would read an
@@ -397,10 +401,22 @@ fn run_install(id: &str, plan: Plan) -> Result<()> {
             "the install finished but no new plugin package appeared — is this package a \
              punktfunk plugin? (it must be named `@scope/plugin-*` or `punktfunk-plugin-*`)",
         )?;
-    let installed = after
-        .iter()
-        .find(|p| p.pkg == pkg)
-        .with_context(|| format!("{pkg} is not present after install"))?;
+    let installed = after.iter().find(|p| p.pkg == pkg).with_context(|| {
+        // The runner said it succeeded and the package still isn't here. The one field cause is a
+        // capturing ancestor `package.json` (`ensure_plugin_root`) — which this job now seeds
+        // against, so reaching here means a tree we deliberately don't seed (packages present, no
+        // `package.json`). Name the file rather than leaving the operator with a dead end.
+        match super::capturing_ancestor(&dir) {
+            Some(p) => format!(
+                "the runner reported success but {pkg} is not in {} — `{}` is capturing the \
+                 install (bun installs into the nearest package.json ABOVE the working directory). \
+                 Move or delete it, or add a package.json to the plugins dir.",
+                dir.display(),
+                p.display()
+            ),
+            None => format!("{pkg} is not present after install"),
+        }
+    })?;
 
     if let (Some(want), Some(got)) = (plan.version.as_deref(), installed.version.as_deref()) {
         if want != got {

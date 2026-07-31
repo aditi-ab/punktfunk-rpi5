@@ -194,4 +194,38 @@ describe("ensurePluginsDir", () => {
 		expect(fs.statSync(dir).isDirectory()).toBe(true);
 		ensurePluginsDir(dir); // idempotent
 	});
+
+	// Field bug 2026-07-31: `bun add` installs into the nearest ancestor package.json, not into
+	// its working dir. With none here, a stray ~/package.json captured every plugin install — bun
+	// exited 0, the packages landed in the home dir, and the plugins dir stayed empty.
+	test("seeds a package.json so bun cannot install into an ancestor", () => {
+		const dir = path.join(tmp("ensure-root"), "plugins");
+		ensurePluginsDir(dir);
+		const seeded = JSON.parse(
+			fs.readFileSync(path.join(dir, "package.json"), "utf8"),
+		) as { name: string; private: boolean };
+		expect(seeded.name).toBe("punktfunk-plugins");
+		expect(seeded.private).toBe(true);
+	});
+
+	test("never overwrites an existing package.json", () => {
+		const dir = tmp("ensure-keep");
+		const manifest = '{"dependencies":{"@punktfunk/plugin-playnite":"0.3.0"}}';
+		fs.writeFileSync(path.join(dir, "package.json"), manifest);
+		ensurePluginsDir(dir);
+		expect(fs.readFileSync(path.join(dir, "package.json"), "utf8")).toBe(manifest);
+	});
+
+	// The one tree we must not seed: packages present, no package.json. Discovery falls back to
+	// the naming convention there, and an empty `dependencies` would report every installed plugin
+	// as gone (the host's installed-package scan narrows to that list).
+	test("leaves a tree that already has packages alone", () => {
+		const dir = tmp("ensure-existing");
+		writePkg(dir, "punktfunk-plugin-legacy", "0.1.0");
+		ensurePluginsDir(dir);
+		expect(fs.existsSync(path.join(dir, "package.json"))).toBe(false);
+		expect(listInstalled(dir).map((p) => p.pkg)).toEqual([
+			"punktfunk-plugin-legacy",
+		]);
+	});
 });

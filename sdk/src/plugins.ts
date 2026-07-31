@@ -54,9 +54,27 @@ export const resolvePackage = (
 /** Does this resolved package name install from Punktfunk's own (Gitea) registry? */
 const isFirstParty = (pkg: string): boolean => pkg.startsWith("@punktfunk/");
 
-/** Create the plugins dir (and parents) if needed. On Windows the ACL lockdown is the host's job. */
+/**
+ * Create the plugins dir (and parents) if needed, and make it bun's install ROOT. On Windows the
+ * ACL lockdown is the host's job.
+ *
+ * The `package.json` is load-bearing, not decoration: `bun add` installs into the nearest ancestor
+ * `package.json`, not into its working directory. Without one here, a stray `~/package.json` — one
+ * old `bun add`/`npm init` in a home dir — silently captures every plugin install. bun reports
+ * success and exits 0, the packages land in that tree, and the plugins dir stays empty (reproduced
+ * on-glass 2026-07-31; it presented as a plugin store that installs nothing).
+ *
+ * Only seeds a tree with no `node_modules`. A dir with packages but no `package.json` is
+ * hand-assembled or an older layout, and both this module's [`listInstalled`] and the host's
+ * installed-package scan fall back to the naming convention there; an empty `dependencies` would
+ * make the host report every plugin already installed as gone.
+ */
 export const ensurePluginsDir = (dir = pluginsDirDefault()): string => {
 	fs.mkdirSync(dir, { recursive: true });
+	const manifest = path.join(dir, "package.json");
+	if (!fs.existsSync(manifest) && !fs.existsSync(path.join(dir, "node_modules"))) {
+		fs.writeFileSync(manifest, '{\n  "name": "punktfunk-plugins",\n  "private": true\n}\n');
+	}
 	return dir;
 };
 
