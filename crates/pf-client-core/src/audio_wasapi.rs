@@ -32,6 +32,91 @@ const CHANNELS: usize = 2;
 /// Mic frames are 20 ms (960 samples/channel) — any size ≤ 120 ms is fine host-side.
 const MIC_FRAME: usize = 960;
 
+/// A selectable WASAPI endpoint for the settings pickers.
+#[derive(Clone, Debug)]
+pub struct AudioDevice {
+    /// The `IMMDevice` endpoint id (`{0.0.0.00000000}.{…}`) — the stable key the render and
+    /// capture threads resolve via [`DeviceEnumerator::get_device`]. (The PipeWire twin
+    /// stores `node.name` here; both are "the stable key", so the Settings fields and env
+    /// contract stay OS-agnostic.)
+    pub name: String,
+    /// The endpoint's friendly name ("Speakers (Realtek …)") — what the picker shows.
+    pub description: String,
+}
+
+/// Enumerate active audio endpoints: `(sinks, sources)` — the WASAPI twin of the PipeWire
+/// probe (same tuple shape; no devices → the caller simply shows no pickers). Runs on its
+/// own short-lived MTA thread: the caller is typically a UI thread whose COM apartment is
+/// STA, where a direct `CoInitializeEx(MTA)` would fail with `RPC_E_CHANGED_MODE`.
+pub fn devices() -> Result<(Vec<AudioDevice>, Vec<AudioDevice>)> {
+    std::thread::Builder::new()
+        .name("pf-audio-enum".into())
+        .spawn(|| -> Result<(Vec<AudioDevice>, Vec<AudioDevice>)> {
+            wasapi::initialize_mta()
+                .ok()
+                .context("CoInitializeEx (MTA)")?;
+            let enumerator = DeviceEnumerator::new().context("DeviceEnumerator")?;
+            let mut out = (Vec::new(), Vec::new());
+            for (direction, list) in [
+                (Direction::Render, &mut out.0),
+                (Direction::Capture, &mut out.1),
+            ] {
+                let coll = enumerator
+                    .get_device_collection(&direction)
+                    .context("device collection")?;
+                for i in 0..coll.get_nbr_devices().context("device count")? {
+                    // One broken endpoint (driver limbo) must not hide the rest.
+                    let Ok(dev) = coll.get_device_at_index(i) else {
+                        continue;
+                    };
+                    let (Ok(id), Ok(name)) = (dev.get_id(), dev.get_friendlyname()) else {
+                        continue;
+                    };
+                    list.push(AudioDevice {
+                        name: id,
+                        description: name,
+                    });
+                }
+            }
+            Ok(out)
+        })
+        .context("spawn audio enumeration thread")?
+        .join()
+        .map_err(|_| anyhow!("audio enumeration thread panicked"))?
+}
+
+/// The endpoint an env pick names (`PUNKTFUNK_AUDIO_SINK`/`SOURCE` — endpoint ids, the
+/// Settings device pickers via session main), or the OS default. A picked device that's
+/// gone (unplugged USB DAC, remote session) falls back to the default with a warning —
+/// audio keeps working, like the PipeWire twin's `target.object` behavior.
+fn pick_device(
+    enumerator: &DeviceEnumerator,
+    direction: &Direction,
+    var: &str,
+) -> Result<wasapi::Device> {
+    if let Some(id) = std::env::var(var).ok().filter(|v| !v.is_empty()) {
+        match enumerator.get_device(&id) {
+            Ok(d) => {
+                tracing::info!(
+                    var,
+                    endpoint = %d.get_friendlyname().unwrap_or_else(|_| id.clone()),
+                    "using the picked audio endpoint"
+                );
+                return Ok(d);
+            }
+            Err(e) => tracing::warn!(
+                var,
+                endpoint_id = %id,
+                error = %e,
+                "picked audio endpoint not found — using the default"
+            ),
+        }
+    }
+    enumerator
+        .get_default_device(direction)
+        .context("default endpoint")
+}
+
 pub struct AudioPlayer {
     pcm_tx: SyncSender<Vec<f32>>,
     /// Drained chunk Vecs coming back from the render thread for reuse (the pool half of
@@ -66,7 +151,8 @@ impl AudioPlayer {
             .context("spawn audio thread")?;
         match ready_rx.recv_timeout(Duration::from_secs(3)) {
             Ok(Ok(())) => {
-                tracing::info!(channels, "WASAPI render: 48 kHz f32 (default endpoint)");
+                // Default endpoint unless PUNKTFUNK_AUDIO_SINK picked one (logged there).
+                tracing::info!(channels, "WASAPI render: 48 kHz f32");
                 Ok(AudioPlayer {
                     pcm_tx,
                     recycle_rx,
@@ -124,10 +210,9 @@ fn render_thread(
         // F32LE interleaved: channels × 4 bytes/sample. Stereo (channels == 2) is byte-identical
         // to the old fixed path (mask 0x3, block align 8).
         let block_align = channels as usize * 4;
-        let device = DeviceEnumerator::new()
-            .context("DeviceEnumerator")?
-            .get_default_device(&Direction::Render)
-            .context("default render endpoint")?;
+        let enumerator = DeviceEnumerator::new().context("DeviceEnumerator")?;
+        let device = pick_device(&enumerator, &Direction::Render, "PUNKTFUNK_AUDIO_SINK")
+            .context("render endpoint")?;
         let mut audio_client = device.get_iaudioclient().context("IAudioClient")?;
         // The explicit dwChannelMask is the wire order (FL FR FC LFE RL RR SL SR); 5.1 = 0x3F,
         // 7.1 = 0x63F. WASAPI delivers channels in ascending mask-bit order, which equals the wire
@@ -265,10 +350,9 @@ fn mic_thread(connector: &Arc<NativeClient>, stop: Arc<AtomicBool>) -> Result<()
     .map_err(|e| anyhow!("opus encoder: {e}"))?;
     let _ = encoder.set_bitrate(opus::Bitrate::Bits(64_000));
 
-    let device = DeviceEnumerator::new()
-        .context("DeviceEnumerator")?
-        .get_default_device(&Direction::Capture)
-        .context("default capture endpoint (no microphone?)")?;
+    let enumerator = DeviceEnumerator::new().context("DeviceEnumerator")?;
+    let device = pick_device(&enumerator, &Direction::Capture, "PUNKTFUNK_AUDIO_SOURCE")
+        .context("capture endpoint (no microphone?)")?;
     let mut audio_client = device.get_iaudioclient().context("IAudioClient")?;
     let desired = WaveFormat::new(32, 32, &SampleType::Float, SAMPLE_RATE, CHANNELS, None);
     let (default_period, _min_period) =

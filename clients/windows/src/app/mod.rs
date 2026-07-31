@@ -394,11 +394,18 @@ fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
                         profile: p.profile_override.clone(),
                     };
                     // With a MAC it takes the dial first wake path, so a sleeping host wakes
-                    // instead of erroring — exactly what clicking its tile would do.
-                    if p.wake && !target.mac.is_empty() {
-                        connect::initiate_waking(&ctx, target, &set_screen, &set_status);
-                    } else {
-                        connect::initiate(&ctx, target, &set_screen, &set_status);
+                    // instead of erroring — exactly what clicking its tile would do. The
+                    // link's `launch=` id must reach the session (`--launch`) — this arm used
+                    // to drop it, so a game link opened a plain desktop session.
+                    match (p.launch.clone(), p.wake && !target.mac.is_empty()) {
+                        (Some(id), true) => {
+                            connect::initiate_launch_waking(&ctx, target, id, &set_screen, &set_status);
+                        }
+                        (Some(id), false) => {
+                            connect::initiate_launch(&ctx, target, id, &set_screen, &set_status);
+                        }
+                        (None, true) => connect::initiate_waking(&ctx, target, &set_screen, &set_status),
+                        (None, false) => connect::initiate(&ctx, target, &set_screen, &set_status),
                     }
                 }
                 // Known but never pinned, or not known at all: a link may not pair or trust on

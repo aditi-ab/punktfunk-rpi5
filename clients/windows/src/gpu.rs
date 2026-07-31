@@ -3,7 +3,8 @@
 //! Streaming (decode + present) runs in the spawned `punktfunk-session` binary; the shell only
 //! needs the list of real (hardware) adapters to offer on a multi-GPU box (a hybrid laptop or an
 //! eGPU). The picked adapter description is persisted (`crate::trust::Settings::adapter`) and read
-//! by the session child at connect (`PUNKTFUNK_ADAPTER` remains the session binary's env override).
+//! by the session child at connect (`PUNKTFUNK_VK_ADAPTER` remains the session binary's env
+//! override).
 
 use windows::core::Interface;
 use windows::Win32::dxgi::{CreateDXGIFactory1, IDXGIAdapter, IDXGIFactory1};

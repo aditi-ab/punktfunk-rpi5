@@ -785,9 +785,10 @@ pub struct Settings {
     #[serde(default)]
     pub invert_scroll: bool,
     /// Playback endpoint for stream audio — on Linux the PipeWire `node.name` the
-    /// playback stream targets (`target.object`); empty = the session default (the
-    /// Apple client's Speaker picker). The session maps it onto `PUNKTFUNK_AUDIO_SINK`.
-    /// Ignored on Windows until the WASAPI endpoint leg exists.
+    /// playback stream targets (`target.object`); on Windows the WASAPI `IMMDevice`
+    /// endpoint id; empty = the OS default (the Apple client's Speaker picker). The
+    /// session maps it onto `PUNKTFUNK_AUDIO_SINK`. A picked endpoint that's gone
+    /// falls back to the default on both OSes.
     #[serde(default)]
     pub speaker_device: String,
     /// Capture endpoint for the mic uplink (same semantics as `speaker_device`;

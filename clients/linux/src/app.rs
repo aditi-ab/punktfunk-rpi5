@@ -749,7 +749,12 @@ impl AppModel {
                         dialog.connect_response(Some("apply"), move |_, _| {
                             let where_to = match &target {
                                 SpeedTestTarget::Global => {
+                                    // Rebase on the file before the whole-file save (same
+                                    // discipline as the settings dialog): another writer — the
+                                    // spawner's window-size persist, a second window's dialog —
+                                    // may have moved it under this shell's snapshot.
                                     let mut s = settings.borrow_mut();
+                                    *s = Settings::load();
                                     s.bitrate_kbps = recommended_kbps;
                                     s.save();
                                     "the default bitrate".to_string()
@@ -765,7 +770,9 @@ impl AppModel {
                         });
                     }
                     dialog.connect_response(Some("apply-global"), move |_, _| {
+                        // Rebase on the file first — see the Global arm above.
                         let mut s = settings.borrow_mut();
+                        *s = Settings::load();
                         s.bitrate_kbps = recommended_kbps;
                         s.save();
                         toasts.add_toast(adw::Toast::new(&format!(

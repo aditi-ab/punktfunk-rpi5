@@ -80,14 +80,42 @@ fn initiate_opts(
 }
 
 /// Start a stream that launches a library title on connect (`--launch id`) — the library
-/// page's tap-to-play. The library only opens for paired hosts, so the pin resolves like
-/// a normal initiate; a host forgotten mid-visit routes to the PIN ceremony instead.
+/// page's tap-to-play, and a deep link's `launch=` (which this used to drop: the link
+/// opened a plain desktop session). The library only opens for paired hosts, so the pin
+/// resolves like a normal initiate; a host forgotten mid-visit routes to the PIN ceremony
+/// instead.
 pub(crate) fn initiate_launch(
     ctx: &Arc<AppCtx>,
     target: Target,
     launch: String,
     set_screen: &AsyncSetState<Screen>,
     set_status: &AsyncSetState<String>,
+) {
+    initiate_launch_opts(ctx, target, launch, set_screen, set_status, false)
+}
+
+/// [`initiate_launch`] with the dial-first wake of [`initiate_waking`] — a deep link's
+/// `launch=` toward a saved host that isn't advertising but has a known MAC.
+pub(crate) fn initiate_launch_waking(
+    ctx: &Arc<AppCtx>,
+    target: Target,
+    launch: String,
+    set_screen: &AsyncSetState<Screen>,
+    set_status: &AsyncSetState<String>,
+) {
+    if ctx.settings.lock().unwrap().auto_wake {
+        crate::wol::wake(&target.mac, target.addr.parse().ok());
+    }
+    initiate_launch_opts(ctx, target, launch, set_screen, set_status, true)
+}
+
+fn initiate_launch_opts(
+    ctx: &Arc<AppCtx>,
+    target: Target,
+    launch: String,
+    set_screen: &AsyncSetState<Screen>,
+    set_status: &AsyncSetState<String>,
+    wake_on_fail: bool,
 ) {
     *ctx.shared.target.lock().unwrap() = target.clone();
     let known = KnownHosts::load();
@@ -112,6 +140,7 @@ pub(crate) fn initiate_launch(
         set_status,
         ConnectOpts {
             launch: Some(launch),
+            wake_on_fail,
             ..ConnectOpts::default()
         },
     );

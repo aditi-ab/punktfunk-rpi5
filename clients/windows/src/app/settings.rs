@@ -75,6 +75,9 @@ const GAMEPADS: &[(&str, &str)] = &[
     ("dualsense", "DualSense"),
     ("xboxone", "Xbox One"),
     ("dualshock4", "DualShock 4"),
+    // Kept in lockstep with the GTK picker: this row was missing here, so a Windows
+    // user could not ask the host for the Deck-shaped pad (trackpads, back grips).
+    ("steamdeck", "Steam Deck"),
 ];
 /// Stats-overlay tiers: `(stored value, display label)` — the cross-client verbosity ladder
 /// (Compact ⊂ Normal ⊂ Detailed); Ctrl+Alt+Shift+S cycles it live in the session window.
@@ -393,7 +396,15 @@ fn commit(
     edit: impl FnOnce(&mut Settings),
 ) {
     if scope.is_empty() {
+        // Rebase on the file before the whole-struct save: the process-lifetime snapshot
+        // in `ctx.settings` is not the only writer — a spawned session persists its
+        // match-window size, the console's own settings screen saves too — and saving the
+        // stale snapshot would silently revert whatever they stored (the same
+        // load-modify-save family as the GTK dialog's 2026-07-31 fix; profiles.rs
+        // documents why there's no merge). The edit lands on the fresh load, and the
+        // snapshot follows so every row keeps rendering what's on disk.
         let mut s = ctx.settings.lock().unwrap();
+        *s = Settings::load();
         edit(&mut s);
         s.save();
         rev.1.call(rev.0 + 1);
@@ -913,6 +924,33 @@ pub(crate) fn settings_page(
     let mic_toggle = setting_toggle(ctx, scope, (rev, set_rev), s.mic_enabled, |s, on| {
         s.mic_enabled = on
     });
+    // Endpoint pickers (the WASAPI probe — the GTK client's PipeWire twins): visible
+    // labels are friendly names, the stored value is the endpoint id. Hidden when the
+    // probe found at most the default; a saved device that's gone keeps a revertable
+    // "(not detected)" entry, like the GPU row. Device facts — defaults scope only.
+    let (speakers, mics) = pf_client_core::audio::devices().unwrap_or_default();
+    let dev_combo = |saved: &str,
+                     devs: &[pf_client_core::audio::AudioDevice],
+                     apply: fn(&mut Settings, String)| {
+        let mut names = vec!["System default".to_string()];
+        let mut keys = vec![String::new()];
+        for d in devs {
+            names.push(d.description.clone());
+            keys.push(d.name.clone());
+        }
+        if !saved.is_empty() && !keys.iter().any(|k| k == saved) {
+            names.push(format!("{saved} (not detected)"));
+            keys.push(saved.to_string());
+        }
+        (keys.len() > 1).then(|| {
+            let current = keys.iter().position(|k| k == saved).unwrap_or(0);
+            setting_combo(ctx, scope, (rev, set_rev), names, current, move |s, i| {
+                apply(s, keys[i.min(keys.len() - 1)].clone());
+            })
+        })
+    };
+    let speaker_combo = dev_combo(&s.speaker_device, &speakers, |s, v| s.speaker_device = v);
+    let mic_dev_combo = dev_combo(&s.mic_device, &mics, |s, v| s.mic_device = v);
 
     let (hud_names, hud_i) = presets(STATS_TIERS, |v| *v == s.stats_verbosity());
     let hud_combo = setting_combo(ctx, scope, (rev, set_rev), hud_names, hud_i, |s, i| {
@@ -1168,8 +1206,8 @@ pub(crate) fn settings_page(
             "Audio",
             group(
                 None,
-                vec![
-                    described_overridable(
+                [
+                    Some(described_overridable(
                         (rev, set_rev),
                         scope,
                         "audio_channels",
@@ -1178,8 +1216,22 @@ pub(crate) fn settings_page(
                         channels_combo,
                         "The speaker layout requested from the host. It downmixes if its own \
                          output has fewer channels.",
-                    ),
-                    described_overridable(
+                    )),
+                    // The endpoint picks are facts about THIS device's hardware — never
+                    // per profile, like Decoder/GPU.
+                    (!profile_mode)
+                        .then(|| {
+                            speaker_combo.map(|c| {
+                                described_labeled(
+                                    "Speaker",
+                                    c,
+                                    "Host audio plays here \u{2014} System default follows \
+                                     the Windows output device.",
+                                )
+                            })
+                        })
+                        .flatten(),
+                    Some(described_overridable(
                         (rev, set_rev),
                         scope,
                         "mic_enabled",
@@ -1187,8 +1239,22 @@ pub(crate) fn settings_page(
                         over.mic_enabled,
                         mic_toggle,
                         "This device\u{2019}s microphone feeds the host\u{2019}s virtual mic.",
-                    ),
-                ],
+                    )),
+                    (!profile_mode)
+                        .then(|| {
+                            mic_dev_combo.map(|c| {
+                                described_labeled(
+                                    "Microphone",
+                                    c,
+                                    "The input that feeds the host\u{2019}s virtual mic.",
+                                )
+                            })
+                        })
+                        .flatten(),
+                ]
+                .into_iter()
+                .flatten()
+                .collect(),
                 Some("Applies from the next session."),
             ),
         ),

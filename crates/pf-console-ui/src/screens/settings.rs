@@ -76,10 +76,21 @@ const CODECS: [(&str, &str); 5] = [
     // selected when the host supports it too; anything else falls back to HEVC.
     ("pyrowave", "PyroWave (wired LAN)"),
 ];
+// Per-OS hardware rungs, like the shells' pickers: the console ships on Windows too
+// (`punktfunk-session --browse`), where "vaapi" is a dead option that ALSO hid the real
+// hardware path (d3d11va) — `Decoder::new` has no VAAPI branch there.
+#[cfg(not(windows))]
 const DECODERS: [(&str, &str); 4] = [
     ("auto", "Automatic"),
     ("vulkan", "Vulkan Video"),
     ("vaapi", "VAAPI"),
+    ("software", "Software"),
+];
+#[cfg(windows)]
+const DECODERS: [(&str, &str); 4] = [
+    ("auto", "Automatic"),
+    ("vulkan", "Vulkan Video"),
+    ("d3d11va", "Direct3D 11"),
     ("software", "Software"),
 ];
 const AUDIO: [(u8, &str); 3] = [(2, "Stereo"), (6, "5.1"), (8, "7.1")];
@@ -114,6 +125,15 @@ impl SettingsScreen {
             return None;
         }
         let (msg, pulse) = self.list.menu(ev, ROWS.len());
+        // Rebase the shell-lifetime snapshot on the file before an adjust-then-save: this
+        // screen is one of the settings file's several whole-file writers (profiles.rs
+        // documents the no-merge debt), and adjusting a stale snapshot would silently
+        // revert what another writer (a session's match-window persist, a desktop shell)
+        // stored while the console was open. Only on the mutating events — a cursor move
+        // shouldn't touch the disk.
+        if matches!(msg, ListMsg::Adjust(_) | ListMsg::Activate) {
+            *ctx.settings = pf_client_core::trust::Settings::load();
+        }
         match msg {
             ListMsg::Adjust(delta) => {
                 let changed = adjust(ROWS[self.list.cursor], delta, false, ctx);
