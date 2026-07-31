@@ -760,7 +760,7 @@ async fn serve_session(
     opts: &Punktfunk1Options,
     audio_cap: &AudioCapSlot,
     inj_tx: std::sync::mpsc::Sender<InputEvent>,
-    mic_tx: std::sync::mpsc::SyncSender<Vec<u8>>,
+    mic_tx: std::sync::mpsc::SyncSender<crate::audio::MicFrame>,
     host_fp: &[u8; 32],
     np: &NativePairing,
     last_pairing: &std::sync::Mutex<Option<std::time::Instant>>,
@@ -1178,11 +1178,17 @@ async fn serve_session(
     tokio::spawn(async move {
         let (mut input_count, mut mic_count, mut rich_count) = (0u64, 0u64, 0u64);
         while let Ok(d) = input_conn.read_datagram().await {
-            if let Some((_seq, _pts, opus)) = punktfunk_core::quic::decode_mic_datagram(&d) {
+            if let Some((seq, pts, opus)) = punktfunk_core::quic::decode_mic_datagram(&d) {
                 mic_count += 1;
                 // Host-lifetime mic service (bounded queue): `try_send` drops the frame when the
                 // service is full or gone, never blocking this datagram loop (security-review S6).
-                let _ = mic_tx.try_send(opus.to_vec());
+                // seq + pts ride along — the pump's de-jitter reorders, conceals losses and
+                // tracks cadence with them (they used to be decoded here and thrown away).
+                let _ = mic_tx.try_send(crate::audio::MicFrame {
+                    seq,
+                    pts_ns: pts,
+                    opus: opus.to_vec(),
+                });
             } else if let Some(rich) = punktfunk_core::quic::RichInput::decode(&d) {
                 rich_count += 1;
                 if rich_tx.send(ClientInput::Rich(rich)).is_err() {

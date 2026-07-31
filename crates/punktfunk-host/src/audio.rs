@@ -153,4 +153,4 @@ mod wasapi_mic;
 pub(crate) mod wiring_plan;
 
 mod mic_pump;
-pub use mic_pump::MicPump;
+pub use mic_pump::{MicFrame, MicPump};
