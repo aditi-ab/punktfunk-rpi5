@@ -101,7 +101,9 @@ pub struct HostConfig {
     pub chacha20: bool,
     /// `PUNKTFUNK_PERF` — per-stage timing instrumentation.
     pub perf: bool,
-    /// `PUNKTFUNK_VIDEO_SOURCE` — GameStream video source select (`virtual` / `portal` / unset → synthetic).
+    /// `PUNKTFUNK_VIDEO_SOURCE` — GameStream video source select. `virtual` (the default — a
+    /// per-client virtual output at the client's own mode) / `portal` (capture an existing
+    /// monitor); anything else, including the literal `synthetic`, gets the test pattern.
     pub video_source: Option<String>,
     /// `PUNKTFUNK_CAPTURE_MONITOR` — pin capture at a NAMED physical monitor (`DP-1`, `HDMI-A-2`),
     /// instead of creating a virtual display or taking whichever head the portal hands back. The
@@ -247,7 +249,11 @@ impl HostConfig {
             perf: flag("PUNKTFUNK_PERF"),
             // Default ON while the interval-stutter field program runs (see the field doc).
             stall_probes: env_on("PUNKTFUNK_STALL_PROBES").unwrap_or(true),
-            video_source: val("PUNKTFUNK_VIDEO_SOURCE"),
+            // Defaults to `virtual` — the flagship per-client virtual output. It used to be unset,
+            // which fell through to the synthetic test pattern: fine for a dev box that always has
+            // a host.env, wrong for a packaged install, whose unit no longer requires that file at
+            // all. `synthetic` is still reachable by naming it (any unrecognised value lands there).
+            video_source: val("PUNKTFUNK_VIDEO_SOURCE").or_else(|| Some("virtual".to_string())),
             // Trimmed + emptied-to-None: `PUNKTFUNK_CAPTURE_MONITOR=` in a host.env means "not
             // set", not "match the monitor named empty string".
             capture_monitor: val("PUNKTFUNK_CAPTURE_MONITOR")
