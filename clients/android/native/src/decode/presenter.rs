@@ -41,6 +41,31 @@ use super::vsync::VsyncShared;
 /// signal to widen, not stutter.
 const LATCH_MARGIN_NS: i64 = 2_500_000;
 
+/// `debug.punktfunk.latch_margin_us` (0..=8000 µs): PIN the submit margin for a sweep —
+/// setprop + stream restart, no rebuild. Unset/invalid = `None` = the adaptive default.
+fn latch_margin_ns() -> Option<i64> {
+    let mut buf = [0u8; 92]; // PROP_VALUE_MAX
+                             // SAFETY: __system_property_get with a valid name + PROP_VALUE_MAX buffer is always safe.
+    let n = unsafe {
+        libc::__system_property_get(
+            c"debug.punktfunk.latch_margin_us".as_ptr(),
+            buf.as_mut_ptr().cast(),
+        )
+    };
+    if n > 0 {
+        if let Ok(us) = std::str::from_utf8(&buf[..n as usize])
+            .unwrap_or("")
+            .trim()
+            .parse::<i64>()
+        {
+            if (0..=8_000).contains(&us) {
+                return Some(us * 1_000);
+            }
+        }
+    }
+    None
+}
+
 /// The budget's liveness backstop: a release whose predicted latch never seems to arrive
 /// (clock glitch, mode switch) force-reopens the budget this long after the release, counted in
 /// `forced` — reads 0 on healthy systems (Apple's `PresentGate.staleAfter`, same value).
@@ -167,10 +192,31 @@ pub(super) struct Presenter {
     dry: u64,
     pace_us: Vec<u64>,
     last_flush: Instant,
+    /// The live submit margin. Starts at 0 (P2e on-glass: SurfaceFlinger latched every
+    /// release with NO lead on the NP3 — the fixed 2.5 ms was pure display latency) and
+    /// widens by measurement: `paced` misses in a 1 Hz window push it +500 µs toward
+    /// [`LATCH_MARGIN_NS`], the pre-sweep known-safe ceiling. A sysprop override PINS it.
+    margin_ns: i64,
+    /// `debug.punktfunk.latch_margin_us` was set — the margin is pinned, never adapted.
+    margin_pinned: bool,
 }
 
 impl Presenter {
     pub(super) fn new(priority: PresentPriority) -> Presenter {
+        let pinned = latch_margin_ns();
+        let (margin_ns, margin_pinned) = match pinned {
+            Some(ns) => (ns, true),
+            None => (0, false),
+        };
+        log::info!(
+            "presenter: latch margin {}us{}",
+            margin_ns / 1_000,
+            if margin_pinned {
+                " (debug.punktfunk.latch_margin_us pin)"
+            } else {
+                " (adaptive — widens on latch misses)"
+            }
+        );
         Presenter {
             fifo_capacity: match priority {
                 PresentPriority::Latency => 0,
@@ -187,6 +233,8 @@ impl Presenter {
             dry: 0,
             pace_us: Vec::with_capacity(256),
             last_flush: Instant::now(),
+            margin_ns,
+            margin_pinned,
         }
     }
 
@@ -287,7 +335,7 @@ impl Presenter {
             return false;
         }
         // Release: timeline-timed when the clock has one, ASAP otherwise.
-        let target = clock.and_then(|c| c.next_target(now_mono_ns, LATCH_MARGIN_NS));
+        let target = clock.and_then(|c| c.next_target(now_mono_ns, self.margin_ns));
         let released = match target {
             Some(t) => codec
                 .release_output_buffer_at_time_by_index(frame.index, t.expected_present_ns)
@@ -308,7 +356,7 @@ impl Presenter {
         // two releases pile onto the same vsync) and not the present time itself (a period too
         // late — it would cap the sustainable rate at roughly half the panel).
         let reopen_at_ns = target
-            .map(|t| t.expected_present_ns - LATCH_MARGIN_NS)
+            .map(|t| t.expected_present_ns - self.margin_ns)
             .unwrap_or(now_mono_ns + period.unwrap_or(FALLBACK_PERIOD_NS));
         self.inflight = Some(InFlight {
             reopen_at_ns,
@@ -386,6 +434,18 @@ impl Presenter {
             panel_ms,
         );
         self.released = 0;
+        // Margin adaptation: repeated latch misses in one window (a miss presents a vsync
+        // late and coalesces the next frame into `paced`) mean this device's SF does need
+        // lead — widen toward the pre-sweep ceiling. One-way by design: a margin that once
+        // proved necessary is never re-gambled mid-stream (the next stream restarts at 0).
+        if !self.margin_pinned && self.paced_drops > 2 && self.margin_ns < LATCH_MARGIN_NS {
+            self.margin_ns = (self.margin_ns + 500_000).min(LATCH_MARGIN_NS);
+            log::warn!(
+                "presenter: {} latch misses in 1s — margin widened to {}us",
+                self.paced_drops,
+                self.margin_ns / 1_000
+            );
+        }
         self.paced_drops = 0;
         self.no_budget = 0;
         self.forced = 0;
