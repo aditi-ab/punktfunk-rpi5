@@ -727,6 +727,15 @@ pub struct Settings {
     pub inhibit_shortcuts: bool,
     /// Stream the default microphone to the host's virtual mic source.
     pub mic_enabled: bool,
+    /// Run the mic uplink through the platform's echo cancellation (the Apple/Android clients'
+    /// "Echo cancellation" toggle, same `echo_cancel` key). On Linux that means preferring an
+    /// echo-cancelled PipeWire source; on Windows, asking WASAPI for the Communications stream
+    /// category so the endpoint's own canceller engages. Default ON — without it, a laptop
+    /// speaker playing the host's audio is heard by this device's mic and sent straight back.
+    /// Only meaningful while `mic_enabled`. `PUNKTFUNK_NO_AEC=1` overrides it off (see
+    /// `audio::aec_enabled`). `default` so pre-existing stores load with it on.
+    #[serde(default = "default_true")]
+    pub echo_cancel: bool,
     /// Requested audio channel count: 2 (stereo), 6 (5.1) or 8 (7.1). The host clamps to what it
     /// can capture; the resolved count drives the decoder + playback layout.
     pub audio_channels: u8,
@@ -882,6 +891,7 @@ impl Default for Settings {
             mouse_mode: "capture".into(),
             inhibit_shortcuts: true,
             mic_enabled: false,
+            echo_cancel: true,
             audio_channels: 2,
             codec: "auto".into(),
             decoder: "auto".into(),
@@ -1063,6 +1073,9 @@ mod tests {
         assert_eq!(s.forward_pad, "");
         assert!(s.fullscreen_on_stream);
         assert!(!s.library_enabled);
+        // Echo cancellation post-dates every stored file: it must load ON, or an upgrade
+        // would silently turn a user's echo protection off.
+        assert!(s.echo_cancel);
     }
 
     /// Stats-tier resolution: a pre-tier store falls back to `show_stats` (off → Off,

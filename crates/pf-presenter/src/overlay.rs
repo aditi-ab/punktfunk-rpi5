@@ -43,6 +43,11 @@ pub struct FrameCtx<'a> {
     pub stats: Option<&'a str>,
     /// The capture hint (bottom-center pill, "click to capture…"); `None` = hidden.
     pub hint: Option<&'a str>,
+    /// The user muted their microphone mid-stream (Ctrl+Alt+Shift+V). Draws a persistent
+    /// badge, deliberately independent of the stats tier: a muted mic is a fact about what
+    /// the host is hearing, and "did my mute take?" must be answerable with the overlay off.
+    /// False whenever this session has no mic uplink at all — the badge never invents one.
+    pub mic_muted: bool,
     /// A mid-stream Match-window resize is in flight (design/midstream-resolution-resize.md,
     /// client UX): draw a full-screen scrim + spinner so the host's 0.3–2 s virtual-display
     /// and encoder rebuild reads as an intentional pause rather than the stream stretching to

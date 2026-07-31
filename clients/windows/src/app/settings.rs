@@ -428,6 +428,7 @@ struct OverrideFlags {
     compositor: bool,
     audio_channels: bool,
     mic_enabled: bool,
+    echo_cancel: bool,
     touch_mode: bool,
     mouse_mode: bool,
     invert_scroll: bool,
@@ -455,6 +456,7 @@ impl OverrideFlags {
             compositor: o.compositor.is_some(),
             audio_channels: o.audio_channels.is_some(),
             mic_enabled: o.mic_enabled.is_some(),
+            echo_cancel: o.echo_cancel.is_some(),
             touch_mode: o.touch_mode.is_some(),
             mouse_mode: o.mouse_mode.is_some(),
             invert_scroll: o.invert_scroll.is_some(),
@@ -913,6 +915,12 @@ pub(crate) fn settings_page(
     let mic_toggle = setting_toggle(ctx, scope, (rev, set_rev), s.mic_enabled, |s, on| {
         s.mic_enabled = on
     });
+    // Echo cancellation is meaningless without an uplink, so it greys out with the mic above
+    // it. Every commit bumps `rev` and re-renders this screen, so the two stay in step live.
+    let echo_toggle = setting_toggle(ctx, scope, (rev, set_rev), s.echo_cancel, |s, on| {
+        s.echo_cancel = on
+    })
+    .enabled(s.mic_enabled);
 
     let (hud_names, hud_i) = presets(STATS_TIERS, |v| *v == s.stats_verbosity());
     let hud_combo = setting_combo(ctx, scope, (rev, set_rev), hud_names, hud_i, |s, i| {
@@ -1186,7 +1194,19 @@ pub(crate) fn settings_page(
                         "Stream microphone to the host",
                         over.mic_enabled,
                         mic_toggle,
-                        "This device\u{2019}s microphone feeds the host\u{2019}s virtual mic.",
+                        "This device\u{2019}s microphone feeds the host\u{2019}s virtual mic. \
+                         Ctrl+Alt+Shift+V mutes and unmutes it during a stream.",
+                    ),
+                    described_overridable(
+                        (rev, set_rev),
+                        scope,
+                        "echo_cancel",
+                        "Echo cancellation",
+                        over.echo_cancel,
+                        echo_toggle,
+                        "Keeps the host\u{2019}s audio, playing from this machine\u{2019}s \
+                         speakers, from being picked up and sent straight back. Turn it off if \
+                         your microphone already does its own processing.",
                     ),
                 ],
                 Some("Applies from the next session."),
@@ -1587,5 +1607,16 @@ mod tests {
             ..Default::default()
         };
         assert!(OverrideFlags::of(Some(&p2)).resolution);
+
+        // The audio pair: the mic and its echo canceller are separate overrides, so a profile
+        // can pin one without claiming the other.
+        let mut p3 = StreamProfile::new("t3".to_string());
+        p3.overrides = SettingsOverlay {
+            echo_cancel: Some(false),
+            ..Default::default()
+        };
+        let f3 = OverrideFlags::of(Some(&p3));
+        assert!(f3.echo_cancel);
+        assert!(!f3.mic_enabled);
     }
 }

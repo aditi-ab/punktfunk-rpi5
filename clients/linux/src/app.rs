@@ -1014,6 +1014,12 @@ pub fn shortcuts_window(parent: &adw::ApplicationWindow) -> gtk::ShortcutsWindow
                 <property name="accelerator">&lt;Control&gt;&lt;Alt&gt;&lt;Shift&gt;s</property>
               </object>
             </child>
+            <child>
+              <object class="GtkShortcutsShortcut">
+                <property name="title">Mute or unmute your microphone (only while the stream sends one)</property>
+                <property name="accelerator">&lt;Control&gt;&lt;Alt&gt;&lt;Shift&gt;v</property>
+              </object>
+            </child>
           </object>
         </child>
       </object>

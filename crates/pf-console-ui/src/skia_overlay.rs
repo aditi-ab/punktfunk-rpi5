@@ -48,6 +48,9 @@ struct Drawn {
     height: u32,
     stats: Option<String>,
     hint: Option<String>,
+    /// The mic-mute badge is up. Part of the damage key like everything else here — the badge
+    /// is static once drawn, so a muted stream still re-renders nothing per frame.
+    mic_muted: bool,
     /// The UI scale this was drawn at, in percent — part of the damage key so dragging the window
     /// to a differently-scaled monitor re-renders the chrome at the new size instead of keeping
     /// the stale one (the text is identical, so nothing else here would notice).
@@ -390,7 +393,12 @@ impl Overlay for SkiaOverlay {
         // spinning through the damage gate; `+ 1` keeps an active resize's step nonzero
         // even on its first frame (phase 0) so the guard below doesn't skip it.
         let resize_step = resize_phase.map_or(0, |p| (p * 120.0) as u16 + 1);
-        if ctx.stats.is_none() && ctx.hint.is_none() && banner_step == 0 && resize_step == 0 {
+        if ctx.stats.is_none()
+            && ctx.hint.is_none()
+            && !ctx.mic_muted
+            && banner_step == 0
+            && resize_step == 0
+        {
             self.drawn = Drawn::default(); // forget content so re-show re-renders
             return Ok(None);
         }
@@ -402,6 +410,7 @@ impl Overlay for SkiaOverlay {
             height: ctx.height,
             stats: ctx.stats.map(str::to_owned),
             hint: ctx.hint.map(str::to_owned),
+            mic_muted: ctx.mic_muted,
             scale_pct: (scale * 100.0).round() as u16,
             banner_step,
             resize_step,
@@ -436,6 +445,11 @@ impl Overlay for SkiaOverlay {
         }
         if let Some(stats) = &want.stats {
             draw_osd_panel(canvas, font, stats, ctx.width, scale);
+        }
+        // Top-RIGHT, so it never collides with the stats panel or the bottom pill: the badge
+        // has to stay readable at every stats tier, including Off.
+        if want.mic_muted {
+            draw_mic_muted_badge(canvas, font, ctx.width, scale);
         }
         if let Some(hint) = &want.hint {
             draw_hint_pill(canvas, font, hint, ctx.width, ctx.height, 1.0, scale);
@@ -658,6 +672,49 @@ fn draw_osd_panel(canvas: &Canvas, base_font: &Font, text: &str, width: u32, sca
             &text_paint,
         );
     }
+}
+
+/// The mic-mute badge: a dot in the error colour plus the words, on the same translucent pill
+/// as the rest of the chrome, pinned to the TOP-RIGHT corner.
+///
+/// It is drawn from `FrameCtx::mic_muted` alone — not from the stats text — because it must
+/// survive the stats overlay being Off, which is where most people leave it. Words, not a
+/// glyph: the chrome font is a system monospace resolved at runtime and cannot be relied on to
+/// carry a crossed-out microphone. Persistent by design (no fade): a fading indicator answers
+/// "did the chord register?" but not "am I muted right now?", and the second question is the
+/// one that matters ten minutes later.
+fn draw_mic_muted_badge(canvas: &Canvas, base_font: &Font, width: u32, scale: f32) {
+    const LABEL: &str = "Microphone muted";
+    // Short line — it fits any window the stream runs in, so it takes the display scale as-is.
+    let font = &chrome_font(base_font, scale);
+    let (_, metrics) = font.metrics();
+    let line_h = metrics.descent - metrics.ascent;
+    let (pad_x, pad_y) = (base::PILL_PAD_X * scale, base::PILL_PAD_Y * scale);
+    let dot_r = 4.0 * scale;
+    let dot_gap = 8.0 * scale;
+    let text_w = font.measure_str(LABEL, None).0;
+    let w = text_w + 2.0 * dot_r + dot_gap + 2.0 * pad_x;
+    let h = line_h + 2.0 * pad_y;
+    let margin = base::OSD_MARGIN * scale;
+    let (x, y) = (width as f32 - w - margin, margin);
+    canvas.draw_rrect(
+        RRect::new_rect_xy(Rect::from_xywh(x, y, w, h), h / 2.0, h / 2.0),
+        &Paint::new(Color4f::new(0.0, 0.0, 0.0, 0.62), None),
+    );
+    canvas.draw_circle(
+        Point::new(x + pad_x + dot_r, y + h / 2.0),
+        dot_r,
+        &Paint::new(crate::theme::ERROR, None),
+    );
+    canvas.draw_str(
+        LABEL,
+        Point::new(
+            x + pad_x + 2.0 * dot_r + dot_gap,
+            y + pad_y - metrics.ascent,
+        ),
+        font,
+        &Paint::new(Color4f::new(1.0, 1.0, 1.0, 0.92), None),
+    );
 }
 
 /// The mid-stream-resize cover: a full-screen dark scrim, the shared rotating spinner, and

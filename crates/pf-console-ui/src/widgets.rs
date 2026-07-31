@@ -6,7 +6,7 @@
 
 use crate::anim::{approach, Spring, TRAY_C, TRAY_K};
 use crate::library::{BUMP_C, BUMP_K};
-use crate::theme::{brand, white, Fonts, PanelStroke, BRAND, FAINT, W, WHITE};
+use crate::theme::{brand, white, Fonts, PanelStroke, BRAND, DIM, FAINT, W, WHITE};
 use pf_client_core::gamepad::{MenuDir, MenuEvent, MenuPulse};
 use skia_safe::{Canvas, Paint, Path, RRect, Rect};
 
@@ -35,7 +35,9 @@ pub(crate) struct RowSpec {
     pub caret: bool,
     /// Show ‹ › chevrons while focused (left/right steps the value).
     pub adjustable: bool,
-    /// Action rows render dimmed when not yet actionable.
+    /// Rows render dimmed when they aren't actionable: an action row's centered label loses
+    /// its brand tint, a value row's label greys — the look for a setting that depends on
+    /// another one being on (Echo cancellation under Microphone).
     pub enabled: bool,
 }
 
@@ -229,7 +231,7 @@ impl MenuList {
                     baseline,
                     W::SemiBold,
                     16.0 * k,
-                    WHITE,
+                    if row.enabled { WHITE } else { DIM },
                 );
                 let value = row.value.as_deref().unwrap_or_default();
                 let vcolor = if row.value_dim {

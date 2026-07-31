@@ -240,6 +240,7 @@ A few knobs are read by the native **clients**, not the host:
 | `PUNKTFUNK_DECODER` | `software` · `vaapi` · `vulkan` (Linux) · `d3d11va` (Windows) | Force the decode path. Default auto-selects hardware per GPU vendor and falls back on its own: **Linux** — Vulkan Video first on NVIDIA and AMD, VAAPI first on Intel and anything else; **Windows** — Vulkan Video first on NVIDIA and AMD, D3D11VA first on Intel and anything else. Whichever isn't first is the next thing tried, with software last. |
 | `PUNKTFUNK_PREFER_PYROWAVE` | `1` | Ask for the [PyroWave](/docs/pyrowave) wavelet codec on a wired link, where the client's own setting isn't reachable (the gamepad console, a headless launch). |
 | `PUNKTFUNK_OSD_SCALE` | multiplier, e.g. `1.5` *(default `1`)* | Size of the in-stream overlay — the stats OSD, the capture hint and the start banner. They already follow your display's scaling setting (200 % display → twice the pixels), so set this only to nudge that: bigger for a TV across the room, smaller if your compositor reports an aggressive scale. Clamped to 0.5×–4×, and a line that would run off the screen is shrunk to fit. |
+| `PUNKTFUNK_NO_AEC` | `1` | Turn the microphone's echo cancellation off for this run, whatever **Echo cancellation** says in [client settings](/docs/client-settings#audio). One-way: it can only switch the processing off, never back on, and the setting is the normal way to control it. Linux and Windows clients. |
 
 ## Bitrate
 
