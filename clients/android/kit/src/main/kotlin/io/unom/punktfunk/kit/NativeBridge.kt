@@ -248,11 +248,12 @@ object NativeBridge {
 
     /**
      * Drain ~1 s of live decode stats for the on-stream HUD, or `null` when no decode thread runs.
-     * Returns 30 doubles (unified stats spec, `design/stats-unification.md`):
+     * Returns 33 doubles (unified stats spec, `design/stats-unification.md`):
      * `[fps, mbps, e2eP50Ms, e2eP95Ms, latValid, skewCorrected, width, height, refreshHz, framesLost,
      * bitDepth, colorPrimaries, colorTransfer, chromaFormatIdc, hostNetP50Ms, decodeP50Ms, hostP50Ms,
      * netP50Ms, lostWindow, skippedWindow, fecWindow, framesWindow, dispValid, displayP50Ms,
-     * e2eDispP50Ms, e2eDispP95Ms, paceP50Ms, latchP50Ms, presentsWindow, presenterActive]`
+     * e2eDispP50Ms, e2eDispP95Ms, paceP50Ms, latchP50Ms, presentsWindow, presenterActive,
+     * feedP50Ms, codecP50Ms, skippedOverflowWindow]`
      * (the flags are 1.0/0.0; indexes 2/3 are the end-to-end capture→decoded headline; 10–13
      * describe the negotiated video feed — bit depth 8/10, CICP primaries/transfer, and the HEVC
      * chroma_format_idc 1=4:2:0 / 3=4:4:4; 14/15 are the stage p50s tiling the headline —
@@ -263,7 +264,12 @@ object NativeBridge {
      * `display` stage from the OnFrameRendered render timestamps — when `dispValid` is 1.0 the
      * headline becomes the directly-measured capture→displayed pair at 24/25, tiled by
      * `host+network` + `decode` + `display` (23), and when 0.0 the HUD falls back to the
-     * capture→decoded headline at 2/3 without the `display` term).
+     * capture→decoded headline at 2/3 without the `display` term; 26–29 split the `display`
+     * term the timeline presenter owns — `pace` = decoded→release, `latch` = release→displayed,
+     * the window's on-glass confirm count, and whether the presenter is active at all; 30/31
+     * split `decode` (15) the same way — `feed` = received→queued (hand-off + input-slot wait),
+     * `codec` = queued→decoded, the decoder's own time; 32 is the parked-AU overflow subset of
+     * `skipped` (19), i.e. the decoder falling behind rather than benign newest-wins pacing).
      * Poll ~1 Hz; each call resets the measurement window.
      */
     external fun nativeVideoStats(handle: Long): DoubleArray?
