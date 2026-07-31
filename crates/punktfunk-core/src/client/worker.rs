@@ -66,6 +66,9 @@ pub(crate) struct WorkerArgs {
     pub(crate) probe: Arc<Mutex<ProbeState>>,
     pub(crate) frames_dropped: Arc<AtomicU64>,
     pub(crate) fec_recovered: Arc<AtomicU64>,
+    /// Mic uplink counters (see [`NativeClient::mic_stats`]): the pump's mic task counts wire
+    /// sends and its own stale-shed drops here; the producer counts queue-full drops.
+    pub(crate) mic_stats: Arc<MicUplinkCounters>,
     pub(crate) hot_tids: Arc<Mutex<Vec<i32>>>,
     /// The live clock offset (see [`NativeClient::clock_offset`]): the worker seeds it with the
     /// connect-time estimate; the control task's mid-stream re-syncs update it.
