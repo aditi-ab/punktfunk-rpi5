@@ -49,6 +49,8 @@ export const LogsSection: FC = () => {
 	const [follow, setFollow] = useState(true);
 	const [dropped, setDropped] = useState(false);
 	const [shareMode, setShareMode] = useState<ShareMode | null>(null);
+	// Set while a poll has failed and we have not yet re-read the ring from the start.
+	const [resync, setResync] = useState(false);
 
 	// Probed after mount: the server render has no `navigator`, and guessing there would mismatch
 	// on hydration. Until then the share button is simply absent.
@@ -58,22 +60,58 @@ export const LogsSection: FC = () => {
 
 	const query = useLogsGet(
 		{ after: cursor > 0 ? cursor : undefined },
-		{ query: { refetchInterval: follow ? 2_000 : false } },
+		{
+			query: {
+				refetchInterval: follow ? 2_000 : false,
+				// Pausing must actually pause. Stopping only the interval left React Query's default
+				// focus/reconnect refetches landing, and the append effect consumed them
+				// unconditionally — so tabbing away and back evicted the lines the operator had
+				// paused on, from behind the pause button.
+				refetchOnWindowFocus: follow,
+				refetchOnReconnect: follow,
+			},
+		},
 	);
+
+	// Resync after the host goes away and comes back.
+	//
+	// The host's log ring restarts at seq 1 on every restart, while our cursor stays wherever it
+	// got to. `GET /logs?after=8000` against a fresh ring is not an error — it is a permanently
+	// EMPTY page (`next` echoes `after`), so the page would poll forever showing stale lines with
+	// no error, no dropped badge and no way back short of a full reload. The console's own update
+	// flow restarts the host, so this was reachable from two clicks away.
+	//
+	// A restart always breaks the poll first, so a failed query is the trigger: on the next success
+	// we re-read from the start of the ring once and let the effect below decide whether the
+	// sequence actually regressed.
+	const failed = query.isError;
+	useEffect(() => {
+		if (failed) setResync(true);
+	}, [failed]);
+	useEffect(() => {
+		if (resync && cursor !== 0) setCursor(0);
+	}, [resync, cursor]);
 
 	const data = query.data;
 	useEffect(() => {
 		if (!data || data.entries.length === 0) return;
 		setEntries((prev) => {
-			// Only append entries newer than what we already hold — dedup by the monotonic `seq`.
-			// Guards a double-invoked mount effect (React StrictMode, or `data` warm in cache) from
-			// appending the same page twice (duplicate rows + duplicate React keys).
 			const lastSeq = prev.at(-1)?.seq ?? -1;
+			// A page whose newest entry is OLDER than what we already hold can only mean the host's
+			// sequence restarted underneath us — the buffer describes a host that no longer exists,
+			// so replace it wholesale rather than filtering every new line away as "already seen".
+			const newest = data.entries.at(-1)?.seq ?? -1;
+			if (newest < lastSeq) return data.entries.slice(-KEEP);
+			// Otherwise append only what's newer — dedup by the monotonic `seq`. Guards a
+			// double-invoked mount effect (React StrictMode, or `data` warm in cache) from appending
+			// the same page twice (duplicate rows + duplicate React keys), and makes the post-resync
+			// re-read from 0 a no-op when the host did NOT restart.
 			const fresh = data.entries.filter((e) => e.seq > lastSeq);
 			return fresh.length ? [...prev, ...fresh].slice(-KEEP) : prev;
 		});
 		setDropped((d) => d || data.dropped);
 		setCursor(data.next);
+		setResync(false);
 	}, [data]);
 
 	// The card hands back the entries its filters currently match, so an export carries exactly what
@@ -100,6 +138,9 @@ export const LogsSection: FC = () => {
 			}}
 			shareMode={shareMode}
 			dropped={dropped}
+			error={query.error}
+			isLoading={query.isLoading}
+			onRetry={() => query.refetch()}
 		/>
 	);
 };
@@ -118,6 +159,10 @@ export const LogsCard: FC<{
 	onShare: (shown: LogEntry[]) => void;
 	shareMode: ShareMode | null;
 	dropped: boolean;
+	/** The poll's failure, if any — without it a broken /logs is indistinguishable from a quiet host. */
+	error?: unknown;
+	isLoading?: boolean;
+	onRetry?: () => void;
 }> = ({
 	entries,
 	follow,
@@ -127,6 +172,9 @@ export const LogsCard: FC<{
 	onShare,
 	shareMode,
 	dropped,
+	error,
+	isLoading,
+	onRetry,
 }) => {
 	const [minLevel, setMinLevel] = useState<MinLevel>("DEBUG");
 	const [search, setSearch] = useState("");
@@ -146,16 +194,32 @@ export const LogsCard: FC<{
 	const visible = useMemo(() => matched.slice(-SHOW), [matched]);
 	const shareLabel = shareMode === "share" ? m.logs_share() : m.logs_copy();
 
-	// Keep the tail in view while following (entries are append-only, so length is a good signal).
+	// Keep the tail in view while following.
+	//
+	// Keyed on the newest RENDERED seq, not on `visible.length`: `visible` is `matched.slice(-SHOW)`,
+	// so once the filter matches SHOW rows its length is pinned at SHOW forever. The effect then
+	// stopped re-running and follow-mode quietly stopped following — exactly when the log is busy
+	// enough to need it. The newest seq keeps changing for as long as lines arrive.
+	const newestVisible = visible.at(-1)?.seq ?? -1;
+	// NOTE: biome flags `newestVisible` as an unnecessary dependency (it is not read in the body) and
+	// offers to remove it. Do NOT take that fix — it is a TRIGGER, the signal that new lines arrived.
+	// Removing it reinstates the bug this replaced: the effect stops re-running and follow-mode
+	// quietly stops following. The same warning was here before, on `visible.length`.
 	useEffect(() => {
 		if (!follow) return;
 		const el = listRef.current;
 		if (el) el.scrollTop = el.scrollHeight;
-	}, [follow, visible.length]);
+	}, [follow, newestVisible]);
 
 	return (
 		<Card>
-			<CardContent className="flex flex-col gap-3 pt-6">
+			{/* This card has no CardHeader, so it has to put the top padding back itself — and it
+			    must do so at BOTH breakpoints. `CardContent` is `p-4 pt-0 sm:p-6 sm:pt-0`, and
+			    tailwind-merge only resolves conflicts within the same variant: a bare `pt-6` cancels
+			    `pt-0` but leaves `sm:pt-0` standing, so the padding was 24px on a phone and 0 on a
+			    desktop, with the filter row touching the card's edge. (Same trap the `p-0` note in
+			    components/ui/card.tsx describes, in the other direction.) */}
+			<CardContent className="flex flex-col gap-3 pt-4 sm:pt-6">
 				<div className="flex flex-wrap items-center gap-2">
 					<div className="flex items-center gap-1">
 						{LEVELS.map((l) => (
@@ -222,12 +286,41 @@ export const LogsCard: FC<{
 					</div>
 				</div>
 
+				{/* A failing poll while lines are already on screen keeps them there — during a host
+				    restart the last lines before it went away are the interesting ones — but says so,
+				    instead of letting a frozen view read as a quiet host. */}
+				{error != null && entries.length > 0 && (
+					<p
+						role="status"
+						className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-sm text-destructive"
+					>
+						{m.logs_stalled()}
+					</p>
+				)}
+
 				<div
 					ref={listRef}
 					className="max-h-[65vh] overflow-auto rounded-md border bg-card/40 p-2 font-mono text-xs leading-5"
 				>
 					{visible.length === 0 ? (
-						<p className="p-2 text-muted-foreground">{m.logs_empty()}</p>
+						// An empty list has three quite different causes and used to render one sentence
+						// for all of them: the host is quiet, the request failed, or it hasn't answered yet.
+						<div className="p-2">
+							{error ? (
+								<div className="space-y-2 font-sans">
+									<p className="text-destructive">{m.common_error()}</p>
+									{onRetry && (
+										<Button size="sm" variant="outline" onClick={onRetry}>
+											{m.common_retry()}
+										</Button>
+									)}
+								</div>
+							) : (
+								<p className="text-muted-foreground">
+									{isLoading ? m.common_loading() : m.logs_empty()}
+								</p>
+							)}
+						</div>
 					) : (
 						visible.map((e) => (
 							<div key={e.seq} className="whitespace-pre-wrap break-words">

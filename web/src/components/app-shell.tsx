@@ -10,9 +10,11 @@ import {
 	ScrollText,
 	Server,
 	Settings,
+	Workflow,
 } from "lucide-react";
 import { motion, stagger } from "motion/react";
 import { type ReactNode, useState } from "react";
+import { useHostEvents } from "@/api/events";
 import { pluginIcon, uiPlugins, usePlugins } from "@/api/plugins";
 import { BrandMark } from "@/components/brand-mark";
 import { Wordmark } from "@/components/wordmark";
@@ -30,6 +32,7 @@ const NAV = [
 	{ to: "/stats", icon: GaugeCircle, label: () => m.nav_stats() },
 	{ to: "/logs", icon: ScrollText, label: () => m.nav_logs() },
 	{ to: "/pairing", icon: KeyRound, label: () => m.nav_pairing() },
+	{ to: "/automation", icon: Workflow, label: () => m.nav_automation() },
 	{ to: "/plugins", icon: Puzzle, label: () => m.nav_plugins() },
 	{ to: "/settings", icon: Settings, label: () => m.nav_settings() },
 ] as const;
@@ -47,6 +50,10 @@ const MOBILE_OVERFLOW = NAV.slice(4);
 export function AppShell({ children }: { children: ReactNode }) {
 	// Read the locale so the whole shell re-renders on a language switch.
 	useLocale();
+	// One subscription to the host's event stream for the whole console — it invalidates the queries
+	// each event affects, so pages update on the transition instead of on their own timer. The
+	// polling intervals stay as a floor in case the stream is unavailable.
+	useHostEvents();
 	return (
 		<div className="flex min-h-screen">
 			{/* Desktop sidebar (≥ sm). Sticky at viewport height: the page (body) scrolls with
@@ -136,32 +143,57 @@ function PluginNavSection() {
 	const plugins = uiPlugins(data);
 	if (plugins.length === 0) return null;
 	return (
-		<div className="mt-6 flex flex-col gap-1">
-			<p className="px-3 pb-1 text-xs font-medium uppercase tracking-wide text-muted-foreground/70">
+		// Its own animation container, with the same variants + stagger as the main nav above. These
+		// were plain links: the group sits OUTSIDE that `motion.nav`, so it inherited neither the
+		// stagger nor the variants and plugin entries simply appeared. They arrive asynchronously
+		// (and a fresh install adds one to a nav that is already on screen), which is exactly when
+		// the animation earns its keep.
+		<motion.div
+			animate="enter"
+			initial="from"
+			transition={{ delayChildren: stagger(0.1) }}
+			variants={{ enter: {}, from: {} }}
+			className="mt-6 flex flex-col gap-1"
+		>
+			<motion.p
+				variants={{ from: { opacity: 0 }, enter: { opacity: 1 } }}
+				className="px-3 pb-1 text-xs font-medium uppercase tracking-wide text-muted-foreground/70"
+			>
 				{m.nav_plugins()}
-			</p>
+			</motion.p>
 			{plugins.map((p) => {
 				const Icon = pluginIcon(p.ui?.icon);
 				return (
-					<Link
+					// The motion wrapper is a DIV around the link, not `motion(Link)`: wrapping Link
+					// erases TanStack's typed `params`, and these entries need `$pluginId`.
+					<motion.div
 						key={p.id}
-						to="/plugins/$pluginId/$"
-						params={{ pluginId: p.id, _splat: "" }}
-						className="group relative flex items-center gap-3 rounded-md px-3 py-2 text-sm text-muted-foreground transition-colors hover:text-foreground"
-						activeProps={{
-							className: "bg-primary/15 text-foreground font-medium",
+						variants={{
+							from: { opacity: 0, x: -20 },
+							enter: { opacity: 1, x: 0 },
 						}}
+						whileHover={{ scale: 1.02 }}
+						whileTap={{ scale: 0.98 }}
 					>
-						<span
-							aria-hidden
-							className="pointer-events-none absolute inset-0 rounded-md bg-primary/0 transition-colors duration-200 group-hover:bg-primary/15"
-						/>
-						<Icon className="relative size-4" />
-						<span className="relative truncate">{p.title}</span>
-					</Link>
+						<Link
+							to="/plugins/$pluginId/$"
+							params={{ pluginId: p.id, _splat: "" }}
+							className="group relative flex items-center gap-3 rounded-md px-3 py-2 text-sm text-muted-foreground transition-colors hover:text-foreground"
+							activeProps={{
+								className: "bg-primary/15 text-foreground font-medium",
+							}}
+						>
+							<span
+								aria-hidden
+								className="pointer-events-none absolute inset-0 rounded-md bg-primary/0 transition-colors duration-200 group-hover:bg-primary/15"
+							/>
+							<Icon className="relative size-4" />
+							<span className="relative truncate">{p.title}</span>
+						</Link>
+					</motion.div>
 				);
 			})}
-		</div>
+		</motion.div>
 	);
 }
 
@@ -189,7 +221,7 @@ function MobileNav() {
 			{moreOpen && (
 				<button
 					type="button"
-					aria-label="Close menu"
+					aria-label={m.nav_close_menu()}
 					className="fixed inset-0 z-40 bg-black/40 sm:hidden"
 					onClick={() => setMoreOpen(false)}
 				/>
@@ -270,7 +302,7 @@ function LanguageSwitcher() {
 	const current = useLocale();
 	return (
 		// biome-ignore lint/a11y/useSemanticElements: an aria-labelled role="group" is the right pattern for this small control cluster — no single semantic element fits.
-		<div className="flex gap-1" role="group" aria-label="Language">
+		<div className="flex gap-1" role="group" aria-label={m.settings_language()}>
 			{locales.map((l: Locale) => (
 				<button
 					key={l}

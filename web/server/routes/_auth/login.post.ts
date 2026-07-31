@@ -5,14 +5,15 @@
 import {
 	createError,
 	defineEventHandler,
-	getRequestIP,
 	readBody,
 	setResponseHeader,
 	useSession,
 } from "h3";
 import {
+	peerAddress,
 	type SessionData,
 	sessionConfig,
+	sessionEpoch,
 	timingSafeEqual,
 	uiPassword,
 } from "../../util/auth";
@@ -31,9 +32,9 @@ export default defineEventHandler(async (event) => {
 		});
 	}
 	// The socket peer address — deliberately NOT trusting X-Forwarded-For (spoofable unless we sit
-	// behind a known proxy, which the packaged console does not). Falls back to a single shared bucket
-	// if the address is somehow unavailable, so the throttle still applies.
-	const ip = getRequestIP(event) ?? "unknown";
+	// behind a known proxy, which the packaged console does not). See `peerAddress`: under the Bun
+	// entry this is the real peer; the shared "unknown" bucket is only a last-resort fallback.
+	const ip = peerAddress(event);
 
 	// Throttle BEFORE touching the password so a locked-out client can't keep the guess loop spinning.
 	const wait = throttleRetryAfterMs(ip);
@@ -53,6 +54,6 @@ export default defineEventHandler(async (event) => {
 	}
 	recordLoginSuccess(ip);
 	const session = await useSession<SessionData>(event, sessionConfig());
-	await session.update({ authenticated: true });
+	await session.update({ authenticated: true, epoch: sessionEpoch() });
 	return { ok: true };
 });

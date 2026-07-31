@@ -115,16 +115,63 @@ function pluginUiDevProxy(): Plugin {
 	};
 }
 
+/**
+ * Drop @unom/ui's game-UI sound sprites from the build.
+ *
+ * `@unom/ui/button` pulls in `sound/defaults.js`, which resolves two sprite sheets with
+ * `new URL(…, import.meta.url)` at module scope — a 4.8 MB .wav and a 2.2 MB .mp3. Vite therefore
+ * emits both into `.output/public/assets/`, where they were ~7 MB of an 8.2 MB asset payload, and
+ * they ride along into the Windows installer and the .deb.
+ *
+ * The console never mounts `UnomProviders`, so no sound player is bundled and not one byte of that
+ * can ever be played. Stub the two files to an empty URL instead of shipping them.
+ *
+ * If the console ever DOES want click sounds, delete this plugin — that is the whole revert.
+ */
+function dropUnomSoundSprites(): Plugin {
+	// The module that names them, and the `new URL(<sprite>, import.meta.url).href` expressions
+	// inside it. Rewriting the EXPRESSION is what works: Vite emits these assets from its own
+	// `new URL(…, import.meta.url)` transform, so intercepting the .wav/.mp3 module id never fires.
+	const DEFAULTS = /@unom[\\/]ui[\\/].*sound[\\/]defaults\.(?:js|mjs)$/;
+	const SPRITE_URL =
+		/new URL\(\s*(["'])[^"']*\.(?:wav|mp3)\1\s*,\s*import\.meta\.url\s*\)\.href/g;
+	return {
+		name: "punktfunk-drop-unom-sound-sprites",
+		enforce: "pre",
+		transform(code, id) {
+			if (!DEFAULTS.test(id)) return null;
+			const out = code.replace(SPRITE_URL, '""');
+			return out === code ? null : { code: out, map: null };
+		},
+	};
+}
+
 export default defineConfig({
 	server: {
 		proxy: {
 			// `secure: false`: the host serves its own self-signed identity cert on loopback.
-			"/api": { target: MGMT_URL, changeOrigin: true, secure: false },
+			"/api": {
+				target: MGMT_URL,
+				changeOrigin: true,
+				secure: false,
+				// Inject the management bearer, exactly as the deployed BFF does
+				// (server/routes/api/[...].ts). The host requires a token on every route now, so
+				// without this `bun run dev` 401s on every call and `apiFetch` bounces the developer
+				// to /login — where logging in doesn't help, because dev has no login gate at all.
+				configure(proxy) {
+					const token = process.env.PUNKTFUNK_MGMT_TOKEN;
+					if (!token) return;
+					proxy.on("proxyReq", (proxyReq) => {
+						proxyReq.setHeader("authorization", `Bearer ${token}`);
+					});
+				},
+			},
 		},
 	},
 	plugins: [
 		// First, so it intercepts /plugin-ui before the SSR catch-all in dev.
 		pluginUiDevProxy(),
+		dropUnomSoundSprites(),
 		viteTsConfigPaths({ projects: ["./tsconfig.json"] }),
 		tailwindcss(),
 		paraglideVitePlugin({

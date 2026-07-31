@@ -34,19 +34,32 @@ export const SectionPlugin: FC = () => {
 	const { data: installed } = useInstalledPlugins();
 	const provenance = installed?.find((p) => p.plugin_id === pluginId);
 
-	// Liveness: a 200 from /__health means the plugin is up. On failure we stop polling and show the
-	// offline card (the manual Retry re-probes).
+	// Liveness: a 200 from /__health means the plugin is up.
+	//
+	// Two subtleties, both learned the hard way:
+	//
+	//  - A 200 is not enough. `fetch` follows redirects, so an expired session — where the gate
+	//    answers 302 → /login → 200 HTML — looked exactly like a healthy plugin, and the console
+	//    rendered its own login page inside the plugin's iframe. `redirect: "manual"` makes that
+	//    an opaque response we can reject instead.
+	//  - One failure must not be terminal. The runner is restarted at the end of every successful
+	//    install, so a single missed probe is routine; giving up on the first one threw away
+	//    whatever the operator had open in another plugin. Retry a few times, and keep probing on a
+	//    slower beat while down so it recovers on its own.
 	const health = useQuery({
 		queryKey: ["plugin-health", pluginId],
 		queryFn: async () => {
 			const r = await fetch(`/plugin-ui/${pluginId}/__health`, {
 				credentials: "same-origin",
+				redirect: "manual",
 			});
+			// `type === "opaqueredirect"` is the gate bouncing us to /login, not the plugin answering.
+			if (r.type === "opaqueredirect") throw new Error("session expired");
 			if (!r.ok) throw new Error(`health ${r.status}`);
 			return true;
 		},
-		retry: false,
-		refetchInterval: (q) => (q.state.status === "error" ? false : 20_000),
+		retry: 2,
+		refetchInterval: (q) => (q.state.status === "error" ? 5_000 : 20_000),
 	});
 
 	// The iframe src is fixed at the initial deep-link path; the plugin's own in-app navigation drives

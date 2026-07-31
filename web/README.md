@@ -35,8 +35,9 @@ WAYLAND_DISPLAY=wayland-kde XDG_CURRENT_DESKTOP=KDE \
 # loopback :47990, no token (a token is mandatory for non-loopback binds).
 ```
 
-If the host runs with `--mgmt-token`, set it under **Settings → API token** (stored in
-`localStorage`, sent as `Authorization: Bearer …` by the orval fetcher).
+The management token is **server-side only** — set `PUNKTFUNK_MGMT_TOKEN` in the console's
+environment and the BFF injects it when proxying (`server/routes/api/[...].ts`). It never reaches
+the browser, so there is no token field in the UI; the browser only ever holds the session cookie.
 
 ## Build & run (Nitro + Bun)
 
@@ -115,7 +116,7 @@ src/
     app-shell.tsx    sidebar nav (brand lens + wordmark) + language switcher
     brand-mark/wordmark/logo.tsx   punktfunk lens mark + wordmark (shared with the site/docs)
     ui/              @unom/ui-backed primitives (button, input, label, card; badge/table/skeleton)
-    query-state.tsx  loading/error wrapper (incl. 401 → "set a token")
+    query-state.tsx  loading/error wrapper (401 → the session is gone, re-login)
   api/
     fetcher.ts       orval mutator: base URL, bearer token, JSON, throwing ApiError
     gen/             GENERATED react-query hooks + models (orval)

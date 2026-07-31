@@ -10,9 +10,9 @@ import {
 	useSetDisplaySettings,
 } from "@/api/gen/display/display";
 import type { ApiMonitorInfo } from "@/api/gen/model";
+import { QueryState } from "@/components/query-state";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { QueryState } from "@/components/query-state";
 import { cn } from "@/lib/utils";
 import { m } from "@/paraglide/messages";
 
@@ -41,7 +41,11 @@ export const MonitorCard: FC = () => {
 	// `PUNKTFUNK_CAPTURE_MONITOR` outranks the stored policy, so a host pinned in its unit's
 	// environment is read-only here: offering controls that silently lose to the env would be worse
 	// than saying so.
-	const envLocked = !!pinned && policy?.capture_monitor !== pinned;
+	//
+	// Requires the policy to have LOADED: while `/display/settings` is in flight (or has failed)
+	// `policy` is undefined, which is never equal to `pinned` — so the card used to announce an env
+	// pin that may not exist and go read-only on every slow load.
+	const envLocked = !!pinned && !!policy && policy.capture_monitor !== pinned;
 	// The host says whether it can honor a pin at all. Windows enumerates its heads but has no
 	// backend that can capture one (see `MonitorsResponse.pin_supported`), and this card used to
 	// offer the choice anyway: the PUT persisted, nothing consumed it, and a virtual display was
@@ -85,7 +89,11 @@ export const MonitorCard: FC = () => {
 			className={cn(
 				"flex w-full items-start justify-between gap-4 rounded-md border p-3 text-left transition-colors",
 				selected ? "border-primary bg-primary/5" : "hover:bg-muted/50",
-				(busy || locked) && "cursor-not-allowed opacity-60",
+				// `!onSelect` is a row that cannot be picked at all — a disabled head, or one of our own
+				// virtual displays. It was styled exactly like a selectable row and silently swallowed
+				// every click; it is listed so "why isn't my monitor here?" has an answer, so it has to
+				// LOOK unavailable too.
+				(busy || locked || !onSelect) && "cursor-not-allowed opacity-60",
 			)}
 		>
 			<span className="flex flex-col gap-1">

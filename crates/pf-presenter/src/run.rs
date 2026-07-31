@@ -1545,6 +1545,16 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
         let browse_idle = matches!(mode, ModeCtl::Browse(_))
             && stream.as_ref().is_none_or(|s| s.connector.is_none());
         if !presented_video && (resize_scrim || browse_idle) {
+            // The UI owns the screen again: hand the swapchain back to SDR before drawing
+            // it. A finished PQ stream leaves HDR10 live, and nothing else would ever turn
+            // it off — `present` re-evaluates the mode only from a frame's colour
+            // signalling, and these UI presents carry no frame. Guarded inside, so this is
+            // free on every ordinary idle iteration. (Deliberately NOT applied to
+            // `resize_scrim`: that scrim is a mid-stream gap in a session that is still
+            // HDR, and flipping there would rebuild the swapchain twice per resize.)
+            if browse_idle {
+                presenter.leave_hdr(&window)?;
+            }
             presenter.present(&window, FrameInput::Redraw, overlay_frame.as_ref())?;
         }
     };

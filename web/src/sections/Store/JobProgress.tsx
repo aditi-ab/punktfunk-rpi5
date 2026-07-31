@@ -48,7 +48,33 @@ export const JobProgressSection: FC<{
 		invalidateStore(qc);
 	}, [settled, jobId, qc]);
 
-	if (!job.data) return null;
+	// A job the host can no longer tell us about — it restarted, and jobs live in memory. This used
+	// to render `null`, so the card simply vanished while the Install buttons stayed armed and the
+	// query kept polling a dead id once a second forever. Say what happened and offer the way out.
+	if (!job.data) {
+		if (!job.isError) return null;
+		return (
+			<Card className="ring-2 ring-destructive/60">
+				<CardContent className="flex items-start gap-3 p-card pt-card sm:pt-card">
+					<XCircle className="mt-0.5 size-5 shrink-0 text-destructive" />
+					<div className="min-w-0 flex-1">
+						<p className="text-sm font-medium">{m.store_job_lost()}</p>
+						<p className="text-sm text-muted-foreground">
+							{m.store_job_lost_hint()}
+						</p>
+					</div>
+					<Button
+						variant="ghost"
+						size="icon"
+						aria-label={m.store_job_dismiss()}
+						onClick={onDismiss}
+					>
+						<X className="size-4" />
+					</Button>
+				</CardContent>
+			</Card>
+		);
+	}
 	return <JobProgressCard job={job.data} onDismiss={onDismiss} />;
 };
 

@@ -32,11 +32,18 @@ export const SessionGameCard: FC = () => {
 	const q = useGetSessionSettings();
 	const save = useSetSessionSettings();
 	const server = q.data?.settings;
-	// Which axes this build acts on. Empty on a platform with no launch path (macOS), where the
-	// controls are shown disabled rather than hidden — "does nothing here" is information.
-	const enforced = q.data?.enforced ?? [];
-	const acts = (field: string) =>
-		enforced.length === 0 || enforced.includes(field);
+	// Which axes this build acts on. An EMPTY list means the build enforces nothing — the contract
+	// says so outright ("Empty on a platform with no launch path (macOS), so the console can say so
+	// instead of offering a switch that does nothing"), and this card's own comment promises the
+	// controls are "shown disabled rather than hidden".
+	//
+	// The old `enforced.length === 0 || …` read empty as "enforces EVERYTHING", so on exactly the
+	// platform the flag exists for, every control stayed live: clicking one PUT the setting and
+	// toasted success for an axis the host would never act on. Absent (an older host that never
+	// sent the field) still means "assume it acts" — that is the compatible reading, and it is a
+	// different case from present-and-empty.
+	const enforced = q.data?.enforced;
+	const acts = (field: string) => !enforced || enforced.includes(field);
 
 	// The grace field is free text while being typed, so it gets a local buffer; the other two axes
 	// are discrete and go straight to the host.
@@ -76,6 +83,7 @@ export const SessionGameCard: FC = () => {
 							<Field
 								label={m.session_game_on_exit()}
 								help={m.session_game_on_exit_help()}
+								group
 							>
 								<div className="flex flex-wrap gap-2">
 									<Choice
@@ -98,6 +106,7 @@ export const SessionGameCard: FC = () => {
 							<Field
 								label={m.session_game_end_game()}
 								help={m.session_game_end_game_help()}
+								group
 							>
 								<div className="flex flex-wrap gap-2">
 									{END_POLICIES.map((p) => (
@@ -130,9 +139,11 @@ export const SessionGameCard: FC = () => {
 								<Field
 									label={m.session_game_grace()}
 									help={m.session_game_grace_help()}
+									htmlFor="session-grace-seconds"
 								>
 									<div className="flex items-center gap-2">
 										<Input
+											id="session-grace-seconds"
 											type="number"
 											min={10}
 											max={86400}
@@ -162,7 +173,10 @@ export const SessionGameCard: FC = () => {
 								</Field>
 							)}
 
-							{enforced.length === 0 && (
+							{/* Present-and-empty is the "this build acts on none of it" signal; ABSENT
+							    is an older host that never sent the field, where claiming inertness
+							    would be a guess. Same distinction `acts()` makes above. */}
+							{enforced?.length === 0 && (
 								<Badge variant="outline">{m.session_game_inert()}</Badge>
 							)}
 							{error && <p className="text-sm text-destructive">{error}</p>}
@@ -180,19 +194,45 @@ const END_POLICY_LABEL: Record<GameOnSessionEnd, () => string> = {
 	always: () => m.session_game_end_always(),
 };
 
-const Field: FC<{ label: string; help?: string; children: ReactNode }> = ({
-	label,
-	help,
-	children,
-}) => (
-	<div className="space-y-3">
-		<Label className="block">{label}</Label>
-		{children}
-		{help && (
-			<p className="max-w-prose text-xs text-muted-foreground">{help}</p>
-		)}
-	</div>
-);
+/**
+ * A labelled block. `htmlFor` pairs the label with a single control; without one it is a group.
+ *
+ * A bare `<Label>` beside an `<input>` with no `id` labels nothing at all — the grace input was
+ * announced as an unnamed spin button. Mirrors the same fix in DisplayCard's `Field`; the two stay
+ * separate on purpose (this card's axes are its own).
+ */
+const Field: FC<{
+	label: string;
+	help?: string;
+	children: ReactNode;
+	htmlFor?: string;
+	group?: boolean;
+}> = ({ label, help, children, htmlFor, group }) => {
+	const body = (
+		<>
+			<Label className="block" htmlFor={htmlFor}>
+				{label}
+			</Label>
+			{children}
+			{help && (
+				<p className="max-w-prose text-xs text-muted-foreground">{help}</p>
+			)}
+		</>
+	);
+	return group ? (
+		<fieldset className="space-y-3">
+			<legend className="mb-3 block text-sm font-medium leading-none">
+				{label}
+			</legend>
+			{children}
+			{help && (
+				<p className="max-w-prose text-xs text-muted-foreground">{help}</p>
+			)}
+		</fieldset>
+	) : (
+		<div className="space-y-3">{body}</div>
+	);
+};
 
 const Choice: FC<{
 	selected: boolean;

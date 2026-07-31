@@ -11,6 +11,7 @@ import {
 	useQueryClient,
 } from "@tanstack/react-query";
 import { apiFetch } from "@/api/fetcher";
+import { boostPluginPolling } from "@/api/plugins";
 
 /**
  * How much a plugin's provenance is worth, from most to least trustworthy:
@@ -80,7 +81,9 @@ export interface StoreCatalog {
 
 export interface InstalledPlugin {
 	pkg: string;
-	version: string;
+	/** Nullable in the contract (`InstalledView.version`) — a CLI-installed plugin may carry no
+	 * recorded version. Typed required here, the Installed tab rendered the literal "vundefined". */
+	version?: string | null;
 	tier: StoreTier;
 	source?: string;
 	entry_id?: string;
@@ -123,14 +126,24 @@ export interface JobAccepted {
 	job: string;
 }
 
-/** Install a curated catalog entry, or — deliberately awkward — a raw package spec. */
+/**
+ * Install a curated catalog entry, or — deliberately awkward — a raw package spec.
+ *
+ * The raw-spec branch carries the console `password`: it runs unreviewed code, so the BFF
+ * re-confirms it (server/routes/api/v1/store/install.post.ts) and strips it before the host ever
+ * sees the request. A catalog install needs no password — that trust decision was made when the
+ * source was added.
+ */
 export type InstallBody =
 	| { source: string; id: string }
-	| { spec: string; accept_unverified: true };
+	| { spec: string; accept_unverified: true; password: string };
 
+/** Adding or repointing a source is a trust-root change, so it carries the console password too
+ * (stripped at the BFF — server/routes/api/v1/store/sources/[name].put.ts). */
 export interface SourceBody {
 	url: string;
 	public_key?: string;
+	password: string;
 }
 
 const BASE = "/api/v1/store";
@@ -156,6 +169,9 @@ const json = (method: string, body: unknown): RequestInit => ({
  * installed list, the runner state (it restarts), and the plugin directory the nav is built from.
  */
 export function invalidateStore(qc: QueryClient): Promise<void> {
+	// The runner restarts AFTER the job reports done, so the plugin registers its UI a few seconds
+	// from now — this invalidation would otherwise refetch the pre-install list and stop looking.
+	boostPluginPolling();
 	return Promise.all([
 		qc.invalidateQueries({ queryKey: storeKeys.catalog }),
 		qc.invalidateQueries({ queryKey: storeKeys.installed }),
@@ -199,14 +215,62 @@ export function useStoreRuntime() {
 /**
  * A single install/uninstall job, polled once a second while it runs and left alone once it
  * settles. Pass `null` to park the query (no job in flight).
+ *
+ * The interval keys off "not finished yet" rather than off `state === "running"`. `data` is
+ * undefined in two live cases — the first poll has not landed, and the first poll FAILED — and
+ * treating those as "stop polling" wedged the card: an install whose very first poll lost the race
+ * with a busy host never polled again and the operator saw nothing at all, while an install that
+ * restarts the runner (every successful one does) could drop a poll mid-flight.
+ *
+ * The failure count bounds it: jobs live in host memory, so a host restart makes the id 404 for
+ * good, and something has to stop asking.
  */
+const JOB_POLL_MS = 1_000;
+const JOB_MAX_FAILURES = 15;
+
+/**
+ * The host's recent jobs, used to RE-ATTACH after a reload.
+ *
+ * The in-flight job id lived only in component state, so reloading the page (or opening the console
+ * on another device) lost all trace of a running install while the Install buttons stayed armed —
+ * and the host takes one job at a time, so the next click just bounced off a 409. The host keeps
+ * the list; ask it rather than remembering.
+ */
+export function useStoreJobs() {
+	return useQuery({
+		queryKey: [...storeKeys.all, "jobs"] as const,
+		queryFn: () => apiFetch<StoreJob[]>(`${BASE}/jobs`),
+		// Only needed to find an orphaned job on mount; the job query itself does the live polling.
+		staleTime: 5_000,
+	});
+}
+
+/** The newest job that is still running, if any — what a fresh page should re-attach to. */
+export function runningJob(jobs: StoreJob[] | undefined): StoreJob | undefined {
+	if (!jobs) return undefined;
+	// The list is oldest-first, so scan from the end for the most recent live one.
+	for (let i = jobs.length - 1; i >= 0; i--) {
+		const j = jobs[i];
+		if (j?.state === "running") return j;
+	}
+	return undefined;
+}
+
 export function useStoreJob(id: string | null) {
 	return useQuery({
 		queryKey: storeKeys.job(id ?? ""),
 		queryFn: () =>
 			apiFetch<StoreJob>(`${BASE}/jobs/${encodeURIComponent(id ?? "")}`),
 		enabled: id !== null,
-		refetchInterval: (q) => (q.state.data?.state === "running" ? 1_000 : false),
+		refetchInterval: (q) => {
+			const state = q.state.data?.state;
+			if (state === "done" || state === "failed") return false;
+			if (q.state.fetchFailureCount > JOB_MAX_FAILURES) return false;
+			return JOB_POLL_MS;
+		},
+		// A job that vanished with its host is gone for good; a transient blip is not. Retry a few
+		// times per poll so a runner restart doesn't surface as an error card.
+		retry: 3,
 	});
 }
 

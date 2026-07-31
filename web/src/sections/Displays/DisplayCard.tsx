@@ -1,4 +1,5 @@
 import { useQueryClient } from "@tanstack/react-query";
+import { useBlocker } from "@tanstack/react-router";
 import { Button } from "@unom/ui/button";
 import { toast } from "@unom/ui/toast";
 import { Pencil, Plus, RefreshCw, Trash2 } from "lucide-react";
@@ -7,10 +8,10 @@ import {
 	type MouseEvent,
 	type ReactNode,
 	useEffect,
+	useMemo,
 	useRef,
 	useState,
 } from "react";
-import { ApiError } from "@/api/fetcher";
 import {
 	getGetDisplaySettingsQueryKey,
 	getGetDisplayStateQueryKey,
@@ -41,6 +42,7 @@ import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { apiErrorMessage } from "@/lib/errors";
 import { cn } from "@/lib/utils";
 import { m } from "@/paraglide/messages";
 
@@ -96,6 +98,53 @@ export const DisplaySection: FC = () => {
 			},
 		);
 
+	/**
+	 * Save the hand-edited Custom block.
+	 *
+	 * `capture_monitor` (the streamed-screen pin) belongs to the monitor picker below, not to this
+	 * form — but it is a field of the same policy object, so a draft seeded before the operator
+	 * changed the streamed screen still carried the OLD value and Save quietly put it back. Defer
+	 * that one axis to whatever the server currently reports.
+	 */
+	/** The streamed-screen pin as the HOST currently has it. Every write path defers to this rather
+	 * than to the draft: the draft is only re-seeded while it is CLEAN, so once the operator has an
+	 * unsaved edit its `capture_monitor` is frozen at whatever it was before they used the picker
+	 * below — and any write that spreads the draft would put the old pin back. */
+	const serverCaptureMonitor = () => q.data?.settings.capture_monitor ?? null;
+
+	const saveDraft = () => {
+		if (!draft) return;
+		apply({ ...draft, capture_monitor: serverCaptureMonitor() });
+	};
+
+	/**
+	 * Apply ONE orthogonal axis — game-session, DDC, PnP — without dragging unsaved Custom edits
+	 * along for the ride.
+	 *
+	 * These three controls apply immediately by design, but they used to send `{...draft}`: flipping
+	 * DDC while the Custom block held unsaved edits committed those edits too, and the shared
+	 * `apply` then overwrote the draft with the server's answer, clearing the "unsaved" badge — so
+	 * the operator got a policy they never saved with no trace it had happened. Send the axis on top
+	 * of the last SAVED policy, and merge only that axis back into the draft.
+	 */
+	const applyAxis = (patch: Partial<DisplayPolicy>) => {
+		const base = seeded.current ?? draft;
+		if (!base) return;
+		// Reflect the flip straight away, keeping every other unsaved edit intact.
+		setDraft((d) => (d ? { ...d, ...patch } : d));
+		save.mutate(
+			{ data: { ...base, capture_monitor: serverCaptureMonitor(), ...patch } },
+			{
+				onSuccess: (res) => {
+					seeded.current = res.settings;
+					setDraft((d) => (d ? { ...d, ...patch } : res.settings));
+					qc.invalidateQueries({ queryKey: getGetDisplaySettingsQueryKey() });
+					toast.success(m.display_settings_saved());
+				},
+			},
+		);
+	};
+
 	// Pending edits: the Custom fields do NOT auto-apply (unlike a preset click or an experimental
 	// toggle), so the draft can silently diverge from what the host is actually running. Reading the
 	// ref during render is safe here because every write to it is paired with a `setDraft`, so a
@@ -108,14 +157,17 @@ export const DisplaySection: FC = () => {
 		if (seeded.current) setDraft(seeded.current);
 	};
 
-	// Last line of defence: a reload/close with pending edits loses them silently otherwise. The
-	// browser shows its own generic wording — the text is ignored, only returning a value counts.
-	useEffect(() => {
-		if (!dirty) return;
-		const warn = (e: BeforeUnloadEvent) => e.preventDefault();
-		window.addEventListener("beforeunload", warn);
-		return () => window.removeEventListener("beforeunload", warn);
-	}, [dirty]);
+	// Don't lose pending edits, whichever way the operator leaves.
+	//
+	// This used to be a bare `beforeunload` listener, which only covers a reload or a tab close —
+	// clicking "Host" in the sidebar is a client-side route change the browser never hears about,
+	// so the draft vanished with no prompt at all. The router's blocker covers in-app navigation
+	// AND still arms `beforeunload` for the reload case, so it replaces the listener outright.
+	useBlocker({
+		shouldBlockFn: () => !confirm(m.display_discard_confirm()),
+		enableBeforeUnload: () => dirty,
+		disabled: !dirty,
+	});
 
 	return (
 		<div className="flex flex-col gap-card">
@@ -132,18 +184,34 @@ export const DisplaySection: FC = () => {
 					<p className="max-w-prose text-sm text-muted-foreground">
 						{m.host_displays_help()}
 					</p>
+					{/* Once the form is on screen, a FAILED BACKGROUND POLL must not replace it — the
+					    operator may be mid-edit, and swapping the card for an error box throws the
+					    draft away to report a refetch we could simply retry. Only a failure with
+					    nothing to show is worth the error state. */}
 					<QueryState
 						isLoading={q.isLoading}
-						error={q.error}
+						error={draft ? undefined : q.error}
 						refetch={q.refetch}
 					>
+						{draft && q.error && (
+							<p
+								role="status"
+								className="rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-sm"
+							>
+								{m.display_refresh_failed()}
+							</p>
+						)}
 						{q.data && draft && (
 							<DisplayForm
 								draft={draft}
 								setDraft={setDraft}
 								presets={q.data.presets}
 								customPresets={q.data.custom_presets}
+								serverEffective={q.data.effective}
+								serverCaptureMonitor={serverCaptureMonitor}
 								apply={apply}
+								applyAxis={applyAxis}
+								saveDraft={saveDraft}
 								busy={save.isPending}
 								dirty={dirty}
 								revert={revert}
@@ -180,7 +248,15 @@ const DisplayForm: FC<{
 	setDraft: (p: DisplayPolicy) => void;
 	presets: { id: string; summary: string; fields: EffectivePolicy }[];
 	customPresets: CustomPreset[];
+	/** What the host reports as IN FORCE right now — not derived from the local draft. */
+	serverEffective: EffectivePolicy;
+	/** The streamed-screen pin as the host has it — the draft's copy goes stale while dirty. */
+	serverCaptureMonitor: () => string | null;
 	apply: (p: DisplayPolicy) => void;
+	/** Apply one orthogonal axis on top of the SAVED policy — never the unsaved draft. */
+	applyAxis: (patch: Partial<DisplayPolicy>) => void;
+	/** Commit the Custom block, deferring axes this form does not own to the server's value. */
+	saveDraft: () => void;
 	busy: boolean;
 	/** The draft differs from what the host has stored — drives the save bar + the discard guard. */
 	dirty: boolean;
@@ -192,7 +268,11 @@ const DisplayForm: FC<{
 	setDraft,
 	presets,
 	customPresets,
+	serverEffective,
+	serverCaptureMonitor,
 	apply,
+	applyAxis,
+	saveDraft,
 	busy,
 	dirty,
 	revert,
@@ -254,8 +334,8 @@ const DisplayForm: FC<{
 				pnp_disable_monitors: draft.pnp_disable_monitors ?? false,
 				// Which screen we stream is not a display-behavior axis at all — swapping the
 				// streamed screen out from under the operator because they changed a preset would be
-				// the worst kind of surprise.
-				capture_monitor: draft.capture_monitor ?? null,
+				// the worst kind of surprise. From the SERVER, not the draft (see serverCaptureMonitor).
+				capture_monitor: serverCaptureMonitor(),
 			});
 		} else {
 			apply({ ...draft, preset: id as Preset });
@@ -277,8 +357,9 @@ const DisplayForm: FC<{
 			// Nor is the streamed screen: this builds a FRESH policy object rather than spreading
 			// the draft, so anything not named here is silently dropped — which is exactly how
 			// applying a saved preset used to switch a mirroring host back to a virtual display
-			// (found on-glass, .136). Every orthogonal axis has to be listed.
-			capture_monitor: draft.capture_monitor ?? null,
+			// (found on-glass, .136). Every orthogonal axis has to be listed, and this one comes
+			// from the SERVER (see serverCaptureMonitor).
+			capture_monitor: serverCaptureMonitor(),
 		});
 	};
 
@@ -487,11 +568,13 @@ const DisplayForm: FC<{
 					<Field
 						label={m.display_keep_alive()}
 						help={m.display_keep_alive_help()}
+						group
 					>
 						<div className="flex flex-wrap items-center gap-2">
 							<Button
 								size="sm"
 								variant={ka.mode === "off" ? "default" : "outline"}
+								aria-pressed={ka.mode === "off"}
 								disabled={busy}
 								onClick={() =>
 									setDraft({ ...draft, keep_alive: { mode: "off" } })
@@ -502,6 +585,7 @@ const DisplayForm: FC<{
 							<Button
 								size="sm"
 								variant={ka.mode === "duration" ? "default" : "outline"}
+								aria-pressed={ka.mode === "duration"}
 								disabled={busy}
 								onClick={() =>
 									setDraft({
@@ -515,6 +599,7 @@ const DisplayForm: FC<{
 							<Button
 								size="sm"
 								variant={ka.mode === "forever" ? "default" : "outline"}
+								aria-pressed={ka.mode === "forever"}
 								disabled={busy}
 								onClick={() =>
 									setDraft({ ...draft, keep_alive: { mode: "forever" } })
@@ -525,6 +610,8 @@ const DisplayForm: FC<{
 							{ka.mode === "duration" && (
 								<div className="flex items-center gap-2">
 									<Input
+										id="display-keep-alive-seconds"
+										aria-label={m.display_keep_alive_seconds()}
 										type="number"
 										min={0}
 										className="w-24"
@@ -594,8 +681,9 @@ const DisplayForm: FC<{
 						}
 					/>
 
-					<Field label={m.display_max()}>
+					<Field label={m.display_max()} htmlFor="display-max">
 						<Input
+							id="display-max"
 							type="number"
 							min={1}
 							max={16}
@@ -637,7 +725,7 @@ const DisplayForm: FC<{
 								{m.display_revert()}
 							</Button>
 						)}
-						<Button onClick={() => apply(draft)} disabled={busy || !dirty}>
+						<Button onClick={saveDraft} disabled={busy || !dirty}>
 							{m.display_save()}
 						</Button>
 					</div>
@@ -654,11 +742,7 @@ const DisplayForm: FC<{
 					options={["auto", "dedicated"]}
 					labels={GAME_SESSION_LABEL}
 					disabled={busy}
-					onPick={(v) => {
-						const next = { ...draft, game_session: v as GameSession };
-						setDraft(next);
-						apply(next);
-					}}
+					onPick={(v) => applyAxis({ game_session: v as GameSession })}
 				/>
 			</div>
 
@@ -671,11 +755,7 @@ const DisplayForm: FC<{
 				offLabel={m.display_ddc_disabled()}
 				onLabel={m.display_ddc_enabled()}
 				busy={busy}
-				onSet={(on) => {
-					const next = { ...draft, ddc_power_off: on };
-					setDraft(next);
-					apply(next);
-				}}
+				onSet={(on) => applyAxis({ ddc_power_off: on })}
 			/>
 			<ExperimentalToggle
 				label={m.display_pnp()}
@@ -684,32 +764,32 @@ const DisplayForm: FC<{
 				offLabel={m.display_pnp_disabled()}
 				onLabel={m.display_pnp_enabled()}
 				busy={busy}
-				onSet={(on) => {
-					const next = { ...draft, pnp_disable_monitors: on };
-					setDraft(next);
-					apply(next);
-				}}
+				onSet={(on) => applyAxis({ pnp_disable_monitors: on })}
 			/>
 
-			{/* What's in force right now */}
+			{/* What's in force right now — read from the API's `effective`, not from the local draft.
+			    Deriving it from the draft meant the row restated the operator's unsaved edits back to
+			    them as though the host had already adopted them. */}
 			<div className="flex flex-wrap items-center gap-2 border-t pt-3">
 				<span className="text-sm text-muted-foreground">
 					{m.display_effective()}:
 				</span>
-				<Badge variant="secondary">{fmtKeepAlive(effective.keep_alive)}</Badge>
 				<Badge variant="secondary">
-					{tr(TOPOLOGY_LABEL, effective.topology)}
+					{fmtKeepAlive(serverEffective.keep_alive)}
+				</Badge>
+				<Badge variant="secondary">
+					{tr(TOPOLOGY_LABEL, serverEffective.topology)}
 				</Badge>
 				<Badge variant="outline">
-					{tr(CONFLICT_LABEL, effective.mode_conflict)}
+					{tr(CONFLICT_LABEL, serverEffective.mode_conflict)}
 				</Badge>
 				<Badge variant="outline">
-					{tr(IDENTITY_LABEL, effective.identity)}
+					{tr(IDENTITY_LABEL, serverEffective.identity)}
 				</Badge>
 				<Badge variant="outline">
-					{tr(LAYOUT_LABEL, effective.layout.mode)}
+					{tr(LAYOUT_LABEL, serverEffective.layout.mode)}
 				</Badge>
-				<Badge variant="outline">{`${effective.max_displays}×`}</Badge>
+				<Badge variant="outline">{`${serverEffective.max_displays}×`}</Badge>
 				{(draft.game_session ?? "auto") === "dedicated" && (
 					<Badge variant="secondary">
 						{m.display_game_session_dedicated()}
@@ -735,19 +815,46 @@ const DisplayForm: FC<{
 
 /** A labeled config field — label, then the control, then optional help. The single source of the
  * label→control→help spacing so every field (keep-alive, the button groups, max-displays) lines up. */
-const Field: FC<{ label: string; help?: string; children: ReactNode }> = ({
-	label,
-	help,
-	children,
-}) => (
-	<div className="space-y-3">
-		<Label className="block">{label}</Label>
-		{children}
-		{help && (
-			<p className="max-w-prose text-xs text-muted-foreground">{help}</p>
-		)}
-	</div>
-);
+const Field: FC<{
+	label: string;
+	help?: string;
+	children: ReactNode;
+	/** The id of the single control this labels, when there is one — see below. */
+	htmlFor?: string;
+	/** Set when the field wraps a GROUP of controls rather than one input. */
+	group?: boolean;
+}> = ({ label, help, children, htmlFor, group }) => {
+	const helpId = help && htmlFor ? `${htmlFor}-help` : undefined;
+	const helpText = help && (
+		<p id={helpId} className="max-w-prose text-xs text-muted-foreground">
+			{help}
+		</p>
+	);
+	// A set of related buttons IS a fieldset, so say so with the element rather than an ARIA role.
+	// (The single-control case keeps a plain <label for>, which is the right pairing there.)
+	if (group) {
+		return (
+			<fieldset className="space-y-3">
+				<legend className="mb-3 block text-sm font-medium leading-none">
+					{label}
+				</legend>
+				{children}
+				{helpText}
+			</fieldset>
+		);
+	}
+	// A bare <Label> with no `htmlFor` next to an <input> with no `id` labels nothing at all: a
+	// screen reader announced these as unnamed spin buttons.
+	return (
+		<div className="space-y-3">
+			<Label className="block" htmlFor={htmlFor}>
+				{label}
+			</Label>
+			{children}
+			{helpText}
+		</div>
+	);
+};
 
 /**
  * An Experimental-badged on/off policy toggle (the DDC/CI and PnP monitor axes) — rendered outside
@@ -763,19 +870,21 @@ const ExperimentalToggle: FC<{
 	onSet: (v: boolean) => void;
 }> = ({ label, help, value, offLabel, onLabel, busy, onSet }) => (
 	<div className="border-t pt-4">
-		<div className="space-y-3">
-			<div className="flex items-center gap-2">
-				<Label className="block">{label}</Label>
+		{/* A labelled group: the pair of buttons is one control, and the label belongs to both. */}
+		<fieldset className="space-y-3">
+			<legend className="mb-3 flex items-center gap-2 text-sm font-medium leading-none">
+				{label}
 				<Badge variant="outline" className="text-amber-600 dark:text-amber-500">
 					{m.display_experimental()}
 				</Badge>
-			</div>
+			</legend>
 			<div className="flex flex-wrap gap-2">
 				{([false, true] as const).map((on) => (
 					<Button
 						key={String(on)}
 						size="sm"
 						variant={value === on ? "default" : "outline"}
+						aria-pressed={value === on}
 						disabled={busy}
 						onClick={() => onSet(on)}
 					>
@@ -784,7 +893,7 @@ const ExperimentalToggle: FC<{
 				))}
 			</div>
 			<p className="max-w-prose text-xs text-muted-foreground">{help}</p>
-		</div>
+		</fieldset>
 	</div>
 );
 
@@ -798,13 +907,17 @@ const Choice: FC<{
 	disabled: boolean;
 	onPick: (v: string) => void;
 }> = ({ label, help, value, options, labels, disabled, onPick }) => (
-	<Field label={label} help={help}>
+	<Field label={label} help={help} group>
 		<div className="flex flex-wrap gap-2">
 			{options.map((o) => (
 				<Button
 					key={o}
 					size="sm"
 					variant={value === o ? "default" : "outline"}
+					// Which option is active was signalled by fill colour alone — invisible to a screen
+					// reader, and to anyone who can't separate the two variants. `aria-pressed` states it.
+					// (The sibling Choice in SessionGameCard already did this; these did not.)
+					aria-pressed={value === o}
 					disabled={disabled}
 					onClick={() => onPick(o)}
 				>
@@ -842,8 +955,13 @@ const CustomPresetCard: FC<{
 			tabIndex={busy ? -1 : 0}
 			aria-pressed={selected}
 			aria-disabled={busy || undefined}
+			aria-label={m.display_preset_apply_named({ name: preset.name })}
 			onClick={() => !busy && onApply()}
 			onKeyDown={(e) => {
+				// Only when the CARD itself has focus. Keydown bubbles, so Enter/Space on the
+				// rename/update/delete icons inside it also reached here and applied the preset
+				// instead of running the icon's action — a keyboard user could not delete a preset.
+				if (e.target !== e.currentTarget) return;
 				if (e.key === "Enter" || e.key === " ") {
 					e.preventDefault();
 					if (!busy) onApply();
@@ -918,7 +1036,17 @@ const CustomPresetCard: FC<{
  */
 const LiveDisplays: FC = () => {
 	const qc = useQueryClient();
-	const state = useGetDisplayState({ query: { refetchInterval: 2_000 } });
+	// Create/release arrive on the event stream (api/events.ts), so the timer is only here for the
+	// one thing events cannot express: the per-second "tears down in Ns" countdown on a lingering
+	// display. With nothing lingering it drops to a slow safety net.
+	const state = useGetDisplayState({
+		query: {
+			refetchInterval: (q) =>
+				q.state.data?.displays?.some((d) => d.expires_in_ms != null)
+					? 2_000
+					: 15_000,
+		},
+	});
 	const release = useReleaseDisplay();
 	const displays = state.data?.displays ?? [];
 	const kept = displays.filter((d) => d.state !== "active");
@@ -986,22 +1114,44 @@ const DisplayArrangement: FC<{ displays: ApiDisplayInfo[] }> = ({
 }) => {
 	const qc = useQueryClient();
 	const saveLayout = useSetDisplayLayout();
-	// Only displays with a stable identity slot can be pinned (shared/anonymous ones have no key).
-	const arrangeable = displays.filter((d) => d.identity_slot != null);
+	const settings = useGetDisplaySettings();
+	// Every position the host has on file — including devices that are not connected right now.
+	// `PUT /display/layout` REPLACES the whole map (`with_manual_layout` in pf-vdisplay builds a
+	// fresh `Layout`), so anything missing from our payload is deleted. Seeding only from the live
+	// displays therefore wiped the saved placement of every device that happened to be offline.
+	const saved = settings.data?.settings.layout?.positions;
 
-	// Local edit buffer keyed by identity-slot string → {x, y}, seeded once from the current positions.
+	// Only displays with a stable identity slot can be pinned (shared/anonymous ones have no key).
+	const arrangeable = useMemo(
+		() => displays.filter((d) => d.identity_slot != null),
+		[displays],
+	);
+	// Local edit buffer keyed by identity-slot string → {x, y}. `arrangeable` is memoised, and React
+	// Query's structural sharing keeps `displays` identity-stable across polls that changed nothing,
+	// so this effect runs when the set of displays actually changes rather than on every poll. It is
+	// idempotent regardless — it only ever fills in slots it has not seen before.
 	const [pos, setPos] = useState<Record<
 		string,
 		{ x: number; y: number }
 	> | null>(null);
 	useEffect(() => {
-		if (pos === null && arrangeable.length > 0) {
-			const seed: Record<string, { x: number; y: number }> = {};
-			for (const d of arrangeable)
-				seed[String(d.identity_slot)] = { x: d.x, y: d.y };
-			setPos(seed);
-		}
-	}, [arrangeable, pos]);
+		if (arrangeable.length === 0) return;
+		setPos((prev) => {
+			// Seed a display the first time we see it, and never re-seed one the operator may have
+			// since edited: a display that appears mid-edit used to be left out of the buffer entirely
+			// and so dropped from the save.
+			const next = { ...(prev ?? {}) };
+			let changed = prev === null;
+			for (const d of arrangeable) {
+				const k = String(d.identity_slot);
+				if (!(k in next)) {
+					next[k] = { x: d.x, y: d.y };
+					changed = true;
+				}
+			}
+			return changed ? next : prev;
+		});
+	}, [arrangeable]);
 
 	if (arrangeable.length < 2) return null;
 	const cur = pos ?? {};
@@ -1013,7 +1163,9 @@ const DisplayArrangement: FC<{ displays: ApiDisplayInfo[] }> = ({
 
 	const onSave = () =>
 		saveLayout.mutate(
-			{ data: { positions: cur } },
+			// Saved-first, edits on top: the host replaces the whole map, so an absent device's
+			// placement survives only if we send it back.
+			{ data: { positions: { ...saved, ...cur } } },
 			{
 				onSuccess: () => {
 					qc.invalidateQueries({ queryKey: getGetDisplayStateQueryKey() });
@@ -1124,15 +1276,6 @@ const DisplayRow: FC<{
 			)}
 		</li>
 	);
-};
-
-/** The server's `{ error }` message from a thrown `ApiError` (its `.data` body), for inline display. */
-const apiErrorMessage = (err: unknown): string | undefined => {
-	if (err instanceof ApiError) {
-		const data = err.data as { error?: string } | undefined;
-		return data?.error ?? err.message;
-	}
-	return err ? String(err) : undefined;
 };
 
 /** Presets the host can't honor yet (one-click apply would 400) are surfaced but disabled. Empty

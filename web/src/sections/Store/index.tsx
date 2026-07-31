@@ -1,13 +1,15 @@
 import Section from "@unom/ui/section";
 import { toast } from "@unom/ui/toast";
-import { type FC, useState } from "react";
+import { type FC, useEffect, useState } from "react";
 import { ApiError } from "@/api/fetcher";
 import {
 	type InstallBody,
 	type InstalledPlugin,
+	runningJob,
 	type StoreEntry,
 	useInstallPlugin,
 	useStoreCatalog,
+	useStoreJobs,
 	useUninstallPlugin,
 } from "@/api/store";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -33,11 +35,20 @@ export const SectionStore: FC = () => {
 	// The catalog entry awaiting its install confirmation, and the raw-spec dialog's open state.
 	const [target, setTarget] = useState<StoreEntry | null>(null);
 	const [specOpen, setSpecOpen] = useState(false);
+	const [specWrongPassword, setSpecWrongPassword] = useState(false);
 	// The job the host is running for us, if any. Cleared by the operator, not by completion — a
 	// finished job's log is the only record of what happened.
 	const [jobId, setJobId] = useState<string | null>(null);
 
 	const catalog = useStoreCatalog();
+	// Re-attach to a job that was already running when this page loaded — an install survives a
+	// reload on the host side, and losing sight of it left the Install buttons armed against a host
+	// that answers 409.
+	const jobs = useStoreJobs();
+	const orphan = runningJob(jobs.data);
+	useEffect(() => {
+		if (orphan && !jobId) setJobId(orphan.id);
+	}, [orphan, jobId]);
 	const install = useInstallPlugin();
 	const uninstall = useUninstallPlugin();
 
@@ -61,15 +72,48 @@ export const SectionStore: FC = () => {
 		await start({ source: entry.source, id: entry.id });
 	};
 
-	const onConfirmSpec = async (spec: string) => {
-		setSpecOpen(false);
-		await start({ spec, accept_unverified: true });
+	const onConfirmSpec = async (spec: string, password: string) => {
+		setSpecWrongPassword(false);
+		try {
+			const { job } = await install.mutateAsync({
+				spec,
+				accept_unverified: true,
+				password,
+			});
+			setSpecOpen(false);
+			setJobId(job);
+		} catch (e) {
+			// A rejected password keeps the dialog open with everything the operator typed still in
+			// it; anything else is an ordinary install failure.
+			if (e instanceof ApiError && e.status === 401) {
+				setSpecWrongPassword(true);
+				return;
+			}
+			setSpecOpen(false);
+			failed(e, m.store_install_failed());
+		}
 	};
 
 	// An update from the Installed tab installs the CATALOG version — so it goes through the very
 	// same tier-appropriate dialog a fresh install would, warning included.
+	//
+	// Resolve by the entry the plugin was actually installed FROM (source + entry id) before falling
+	// back to the package name: two sources may carry the same `pkg`, and matching on the name alone
+	// could offer a row badged "verified" an entry from somebody else's source at a different version.
 	const onUpdate = (plugin: InstalledPlugin) => {
-		const entry = catalog.data?.plugins.find((e) => e.pkg === plugin.pkg);
+		const entries = catalog.data?.plugins ?? [];
+		const entry =
+			(plugin.source && plugin.entry_id
+				? entries.find(
+						(e) => e.source === plugin.source && e.id === plugin.entry_id,
+					)
+				: undefined) ??
+			(plugin.source
+				? entries.find(
+						(e) => e.source === plugin.source && e.pkg === plugin.pkg,
+					)
+				: undefined) ??
+			entries.find((e) => e.pkg === plugin.pkg);
 		if (!entry) {
 			toast.error(m.store_update_no_entry());
 			return;
@@ -140,7 +184,11 @@ export const SectionStore: FC = () => {
 				<SpecInstallDialog
 					open={specOpen}
 					isPending={install.isPending}
-					onCancel={() => setSpecOpen(false)}
+					wrongPassword={specWrongPassword}
+					onCancel={() => {
+						setSpecOpen(false);
+						setSpecWrongPassword(false);
+					}}
 					onConfirm={onConfirmSpec}
 				/>
 			</div>

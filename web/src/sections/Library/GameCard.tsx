@@ -40,7 +40,12 @@ export const GameCard: FC<GameCardProps> = ({
 	onDelete,
 	deleting,
 }) => {
-	const isCustom = game.store === "custom";
+	// Editable only if the operator actually owns this entry. A custom-store entry SYNCED by a
+	// provider plugin also has `store === "custom"`, but the host refuses to hand-edit or delete it
+	// (409 CONFLICT, "owned by provider … — update it through its reconcile"), so offering the
+	// buttons produced a failure the card never surfaced. Provider-owned entries are attributed
+	// instead.
+	const isCustom = game.store === "custom" && !game.provider;
 	// Track which sources have failed so the <img> can step down portrait → header → placeholder.
 	const [failed, setFailed] = useState<Record<string, boolean>>({});
 
@@ -77,6 +82,13 @@ export const GameCard: FC<GameCardProps> = ({
 					{game.platform && game.platform.toUpperCase() !== "PC" && (
 						<Badge variant="outline" className="bg-background/80 backdrop-blur">
 							{game.platform}
+						</Badge>
+					)}
+					{/* Who owns this entry, when it isn't the operator — the reason the edit/delete
+					    buttons are absent here and present on the card next to it. */}
+					{game.provider && (
+						<Badge variant="outline" className="bg-background/80 backdrop-blur">
+							{m.library_owned_by({ provider: game.provider })}
 						</Badge>
 					)}
 				</div>

@@ -39,15 +39,31 @@ export async function apiFetch<T>(
 	return body as T;
 }
 
-/** On lost session, send the user to the login screen, remembering where they were. */
+/**
+ * On lost session, send the user to the login screen, remembering where they were.
+ *
+ * Deferred by a beat rather than navigating inline. This runs inside whichever call noticed the
+ * 401 — very often a background poll the user never asked for — and a synchronous
+ * `location.href =` there tears the page down mid-render, taking any unsaved editing state with it
+ * (the Displays page models exactly such a draft). Letting the current task finish first means the
+ * caller's own error handling still runs, and a `beforeunload` guard can still speak up.
+ *
+ * Guarded so a burst of parallel 401s (every card on a page polling at once) schedules one
+ * navigation, not one per request.
+ */
+let redirecting = false;
 function redirectToLogin(): void {
 	if (typeof window === "undefined") return;
 	if (window.location.pathname === "/login") return;
+	if (redirecting) return;
+	redirecting = true;
 	// Keep the full path (query + hash too), so re-login returns to the exact view.
 	const next = encodeURIComponent(
 		window.location.pathname + window.location.search + window.location.hash,
 	);
-	window.location.href = `/login?next=${next}`;
+	setTimeout(() => {
+		window.location.href = `/login?next=${next}`;
+	}, 0);
 }
 
 function safeJson(text: string): unknown {

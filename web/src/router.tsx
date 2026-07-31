@@ -3,8 +3,8 @@ import { createRouter as createTanStackRouter } from "@tanstack/react-router";
 import { ApiError } from "./api/fetcher";
 import { routeTree } from "./routeTree.gen";
 
-export function getRouter() {
-	const queryClient = new QueryClient({
+function createQueryClient() {
+	return new QueryClient({
 		defaultOptions: {
 			queries: {
 				staleTime: 2_000,
@@ -21,6 +21,31 @@ export function getRouter() {
 			},
 		},
 	});
+}
+
+/**
+ * The browser's ONE QueryClient.
+ *
+ * `getRouter()` can run more than once per page load (hydration discards and rebuilds the tree),
+ * and a fresh client each time means a fresh, empty cache that nothing else holds a reference to.
+ * That is how the event stream ended up invalidating a cache no component was reading: the
+ * subscription captured the client from the first router, the live pages read the second one, and
+ * every invalidation went to the dead one. One client per browser session fixes that and keeps the
+ * cache across a router rebuild.
+ *
+ * Deliberately browser-only: on the SERVER every request must get its OWN client, or one visitor's
+ * data would be served from another's cache.
+ */
+let browserQueryClient: QueryClient | undefined;
+
+export function getRouter() {
+	let queryClient: QueryClient;
+	if (typeof window === "undefined") {
+		queryClient = createQueryClient();
+	} else {
+		if (!browserQueryClient) browserQueryClient = createQueryClient();
+		queryClient = browserQueryClient;
+	}
 
 	return createTanStackRouter({
 		routeTree,

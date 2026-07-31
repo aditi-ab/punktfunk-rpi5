@@ -171,6 +171,34 @@ impl Presenter {
         self.hdr_active
     }
 
+    /// Drop back to the SDR swapchain. A no-op unless HDR10 is actually live, so it is
+    /// cheap to call on every idle iteration (the flip itself rebuilds the CSC pass, the
+    /// video image, the overlay pipe and the swapchain).
+    ///
+    /// The console/gamepad UI is SDR content, and it is composited into whatever swapchain
+    /// the last STREAM left behind. [`Presenter::present`] only re-evaluates the mode when a
+    /// frame carries colour signalling, and a UI-only present is `FrameInput::Redraw`, which
+    /// carries none — so once a PQ session ended, the UI kept being written into the HDR10
+    /// swapchain and its sRGB mid-tones were emitted as PQ code points, i.e. near-peak nits.
+    /// That is the "gamepad UI is blown out after disconnecting from an HDR host" report:
+    /// the UI looks right until the first HDR session, and wrong forever after.
+    pub fn leave_hdr(&mut self, window: &sdl3::video::Window) -> Result<()> {
+        if !self.hdr_active {
+            return Ok(());
+        }
+        // Minimized is not just "pointless work": `recreate_swapchain` deliberately keeps
+        // the old swapchain at a zero extent, but `set_hdr_mode` would already have rebuilt
+        // the CSC and overlay pipes against the SDR format — leaving them mismatched against
+        // the live HDR10 swapchain images. [`Presenter::present`] carries the same guard,
+        // which is why the flip could never reach this state before; the mode change just
+        // waits for the window to have a size again.
+        if self.extent.width == 0 || self.extent.height == 0 {
+            return Ok(());
+        }
+        tracing::info!("stream over — leaving HDR10 so the console UI composites as SDR");
+        self.set_hdr_mode(window, false)
+    }
+
     /// Record the host's ST.2086 mastering + content-light metadata (the 0xCE plane),
     /// pushing it to the swapchain immediately when HDR10 mode is live. Cheap and
     /// idempotent per distinct value — callers just drain the plane into it.

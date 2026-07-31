@@ -1,3 +1,55 @@
+/**
+ * A revocation marker for issued sessions, PERSISTED across restarts.
+ *
+ * The session is stateless: everything lives inside the sealed cookie, so `session.clear()` only
+ * deletes the BROWSER's copy. A cookie captured beforehand stayed valid for its full 7-day TTL —
+ * "log out" did not log anything out.
+ *
+ * The counter has to survive a restart or it does not do its job: an in-memory `let epoch = 1`
+ * revokes within one process run, then resets to 1 the next time the service starts, and a cookie
+ * captured from that first run is accepted again for the rest of its TTL. (The seal key cannot save
+ * us — it is derived from the stable mgmt token, so pre-restart cookies still unseal fine.) So it
+ * lives in a file next to the host's own config.
+ *
+ * Best-effort by design: if the file cannot be read or written the console still works, it just
+ * falls back to in-memory revocation for this process. Refusing to log anyone out because a state
+ * file is unwritable would be the wrong trade for a LAN console.
+ */
+const EPOCH_FILE = (): string =>
+	process.env.PUNKTFUNK_UI_EPOCH_FILE ??
+	join(
+		process.env.PUNKTFUNK_CONFIG_DIR ?? join(homedir(), ".config", "punktfunk"),
+		"web-session-epoch",
+	);
+
+let epochCache: number | null = null;
+
+/** The epoch a new session is stamped with, and the one the gate requires. */
+export function sessionEpoch(): number {
+	if (epochCache !== null) return epochCache;
+	try {
+		const raw = readFileSync(EPOCH_FILE(), "utf8").trim();
+		const n = Number.parseInt(raw, 10);
+		epochCache = Number.isFinite(n) && n > 0 ? n : 1;
+	} catch {
+		epochCache = 1; // no file yet — first run
+	}
+	return epochCache;
+}
+
+/** Invalidate every session issued so far (what logging out does). */
+export function revokeAllSessions(): void {
+	const next = sessionEpoch() + 1;
+	epochCache = next;
+	try {
+		mkdirSync(dirname(EPOCH_FILE()), { recursive: true });
+		writeFileSync(EPOCH_FILE(), String(next), { mode: 0o600 });
+	} catch {
+		// Unwritable state dir: the bump still holds for this process, which is the common case
+		// (log out, walk away). It is weaker than persisted, and better than refusing to log out.
+	}
+}
+
 // Shared auth helpers for the Nitro server (the deployed Bun server). Single-user,
 // shared-password gate: the user logs in with PUNKTFUNK_UI_PASSWORD, which sets a SEALED
 // (h3 useSession — AES-GCM) cookie; every request is gated by server/middleware/auth.ts.
@@ -8,9 +60,40 @@ import {
 	createHash,
 	timingSafeEqual as nodeTimingSafeEqual,
 } from "node:crypto";
-import type { SessionConfig } from "h3";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
+import {
+	getRequestHeader,
+	getRequestIP,
+	type H3Event,
+	type SessionConfig,
+} from "h3";
 
 export const SESSION_NAME = "pf_session";
+
+/** Set by the Bun entry (nitro-entry/bun-https.mjs) to the real socket peer, after deleting any
+ * inbound copy. Keep the name in sync with that file. */
+const PEER_IP_HEADER = "x-pf-peer-ip";
+
+/**
+ * The requesting peer, as the key for every per-peer budget (currently the login throttle).
+ *
+ * `getRequestIP()` alone does NOT work under the deployed server: Nitro's `localFetch` builds a
+ * synthetic request whose socket carries no `remoteAddress`, so h3 finds nothing and every caller
+ * collapses onto one shared bucket — which turned the "per-IP" login throttle into a lockout any
+ * LAN peer could trigger for everyone. The Bun entry stamps the real peer into PEER_IP_HEADER
+ * (unforgeable: it deletes any client-supplied copy first), so prefer that.
+ *
+ * `getRequestIP` is kept as the fallback for any other ingress (a plain `node`/dev run), and
+ * "unknown" as the last resort — a SHARED bucket, deliberately: an unattributable request must
+ * still be rate-limited, and failing open would make brute force unbounded.
+ */
+export function peerAddress(event: H3Event): string {
+	const stamped = getRequestHeader(event, PEER_IP_HEADER)?.trim();
+	if (stamped) return stamped;
+	return getRequestIP(event) ?? "unknown";
+}
 
 /** The login password. Empty string ⇒ auth is MISCONFIGURED (the gate fails closed). */
 export function uiPassword(): string {
@@ -18,8 +101,9 @@ export function uiPassword(): string {
 }
 
 /** The management API the proxy forwards to (loopback by default — never LAN-exposed). It serves
- * HTTPS with the host's self-signed identity cert, so the deployment also sets
- * NODE_TLS_REJECT_UNAUTHORIZED=0 for the (loopback-only) proxy fetch — see .env.example. */
+ * HTTPS with the host's self-signed identity cert, so the proxy relaxes verification for that ONE
+ * loopback hop via Bun's per-request `tls` option (routes/api/[...].ts, util/forward.ts). There is
+ * deliberately no process-wide NODE_TLS_REJECT_UNAUTHORIZED — see .env.example. */
 export function mgmtUrl(): string {
 	return process.env.PUNKTFUNK_MGMT_URL ?? "https://127.0.0.1:47990";
 }
@@ -118,7 +202,38 @@ export function isPublicPath(pathname: string): boolean {
 	if (pathname.startsWith("/_auth/")) return true;
 	if (pathname.startsWith("/assets/")) return true;
 	if (pathname === "/favicon.ico" || pathname === "/robots.txt") return true;
+	// The web manifest must be fetchable to install the app, and it says nothing a logged-out
+	// visitor cannot already see from the login page (name, colours, the brand mark).
+	if (pathname === "/manifest.webmanifest") return true;
 	return false;
+}
+
+/**
+ * Collapse a request path to the shape an upstream router will actually see: percent-decoded,
+ * with empty (`//`) and `.` segments dropped and `..` resolved. Used to test denylists against
+ * something an attacker cannot re-spell — `/api//v1/x`, `/api/./v1/x` and `/api/v1/%78` all reach
+ * the same handler, so matching only the literal path is not a security boundary.
+ *
+ * Decoding is per segment and failure-tolerant: a malformed escape keeps the raw segment rather
+ * than throwing, so a bad path degrades to "does not match the canonical form" instead of a 500.
+ */
+export function normalizePath(pathname: string): string {
+	const out: string[] = [];
+	for (const raw of pathname.split("/")) {
+		let seg = raw;
+		try {
+			seg = decodeURIComponent(raw);
+		} catch {
+			// Malformed escape — keep the raw segment.
+		}
+		if (seg === "" || seg === ".") continue;
+		if (seg === "..") {
+			out.pop();
+			continue;
+		}
+		out.push(seg);
+	}
+	return `/${out.join("/")}`;
 }
 
 /** Validate a post-login redirect target: a same-origin path only. Resolves `next` against a
@@ -138,4 +253,6 @@ export function safeNextPath(next: string | undefined): string {
 
 export interface SessionData {
 	authenticated?: boolean;
+	/** The epoch this session was sealed under — see `sessionEpoch`. */
+	epoch?: number;
 }

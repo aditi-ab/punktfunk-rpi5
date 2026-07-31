@@ -1,4 +1,4 @@
-import type { FC } from "react";
+import { type FC, useMemo } from "react";
 import { ApiError } from "@/api/fetcher";
 import type { Capture } from "@/api/gen/model/capture";
 import {
@@ -9,7 +9,7 @@ import { QueryState } from "@/components/query-state";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import type { Loadable } from "@/lib/query";
 import { m } from "@/paraglide/messages";
-import { LatencyChart, ThroughputChart } from "./charts";
+import { HealthChart, LatencyChart, ThroughputChart } from "./charts";
 import { ChartBlock } from "./helpers";
 
 /**
@@ -27,9 +27,27 @@ export const LiveSection: FC = () => {
 	return <LiveCard live={live} />;
 };
 
+/**
+ * How many samples the live charts plot.
+ *
+ * The live endpoint returns the capture SO FAR, which grows without bound — a capture left running
+ * over an evening is tens of thousands of samples, re-serialised and re-plotted every 2 s. The tail
+ * is also the only part anyone watches live (the full series is what the saved recording is for),
+ * so plot a bounded window and leave the rest to the detail view.
+ */
+const LIVE_WINDOW = 600;
+
 /** Live graphs while a capture is armed: latency stack + throughput. */
 export const LiveCard: FC<{ live: Loadable<Capture> }> = ({ live }) => {
-	const samples = live.data?.samples ?? [];
+	const all = live.data?.samples;
+	// Memoised on the array identity: React Query keeps it stable when a poll changed nothing, so
+	// an unchanged poll costs no re-slice and — because `samples` keeps its identity — no chart
+	// rebuild either (the charts memoise on exactly this).
+	const samples = useMemo(
+		() =>
+			all && all.length > LIVE_WINDOW ? all.slice(-LIVE_WINDOW) : (all ?? []),
+		[all],
+	);
 	// A 404 is the expected transient right after arming (the capture isn't there yet) — treat it as
 	// "waiting". Surface any OTHER error (500, network drop) instead of silently showing "waiting".
 	const error =
@@ -58,6 +76,18 @@ export const LiveCard: FC<{ live: Loadable<Capture> }> = ({ live }) => {
 							<ChartBlock title={m.stats_throughput_title()}>
 								<ThroughputChart samples={samples} />
 							</ChartBlock>
+							{/* Loss/recovery was only ever visible AFTER stopping and reopening the
+							    saved recording — which is backwards: dropped frames and FEC recovery
+							    are what you watch a live capture FOR. The `kind` note keeps the
+							    GameStream caveat (only `frames` is instrumented there). */}
+							<ChartBlock title={m.stats_health_title()}>
+								<HealthChart samples={samples} kind={live.data?.meta?.kind} />
+							</ChartBlock>
+							{(live.data?.samples?.length ?? 0) > LIVE_WINDOW && (
+								<p className="text-xs text-muted-foreground">
+									{m.stats_live_window({ count: LIVE_WINDOW })}
+								</p>
+							)}
 						</>
 					)}
 				</QueryState>

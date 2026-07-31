@@ -24,7 +24,10 @@ import { m } from "@/paraglide/messages";
  */
 export const PendingDevicesSection: FC = () => {
 	const qc = useQueryClient();
-	const pending = useListPendingDevices({ query: { refetchInterval: 3_000 } });
+	// A knock arrives as a `pairing.pending` event (api/events.ts), so the timer is the fallback —
+	// but it stays reasonably brisk: this list is the one the operator is actively waiting on, and
+	// the rows carry an age that should not visibly lag.
+	const pending = useListPendingDevices({ query: { refetchInterval: 10_000 } });
 	const approve = useApprovePendingDevice();
 	const deny = useDenyPendingDevice();
 

@@ -1,6 +1,7 @@
 import { motion, useReducedMotion, useTime, useTransform } from "motion/react";
 import { useEffect, useRef } from "react";
 import { cn } from "@/lib/utils";
+import { m } from "@/paraglide/messages";
 
 // The punktfunk lens, alive. The two overlapping circles of the brand mark are
 // recreated from divs and animated as if orbiting on a path whose long axis points
@@ -76,7 +77,7 @@ export function Spinner({
 		<div
 			ref={ref}
 			role="status"
-			aria-label="Loading"
+			aria-label={m.common_loading()}
 			className={cn("relative inline-block size-6 isolate", className)}
 			{...props}
 		>

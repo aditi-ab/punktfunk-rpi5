@@ -7,7 +7,7 @@ import {
 	ShieldOff,
 	Trash2,
 } from "lucide-react";
-import { type FC, type FormEvent, useState } from "react";
+import { type FC, type FormEvent, useEffect, useState } from "react";
 import { ApiError } from "@/api/fetcher";
 import {
 	type SourceBody,
@@ -31,14 +31,17 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { fmtDateTimeSecs } from "@/lib/format";
 import { m } from "@/paraglide/messages";
 
-/** A source the operator has filled in but not yet agreed to trust. */
-type SourceDraft = SourceBody & { name: string };
+/** A source the operator has filled in but not yet agreed to trust. The console password is NOT
+ * part of the draft — it is collected by the trust dialog, at the moment the decision is made. */
+type SourceDraft = Omit<SourceBody, "password"> & { name: string };
 
-/** Unix seconds → a locale date-time, or "never" for a source that has never fetched. */
+/** Unix seconds → a locale date-time, or "never" for a source that has never fetched.
+ * Locale-aware via lib/format.ts — `toLocaleString` follows the browser, not the console. */
 const fmtFetched = (secs: number): string =>
-	secs > 0 ? new Date(secs * 1000).toLocaleString() : m.store_source_never();
+	secs > 0 ? fmtDateTimeSecs(secs) : m.store_source_never();
 
 /**
  * Container: the catalog sources. Owns the source listing, the refresh-all action, and add/remove.
@@ -53,19 +56,27 @@ export const SourcesTab: FC = () => {
 	// The draft waiting on the trust dialog, and a key that re-mounts (and so clears) the form.
 	const [draft, setDraft] = useState<SourceDraft | null>(null);
 	const [formKey, setFormKey] = useState(0);
+	const [wrongPassword, setWrongPassword] = useState(false);
 
 	const onRefresh = () =>
 		refresh.mutate(undefined, {
 			onError: () => toast.error(m.store_refresh_failed()),
 		});
 
-	const onConfirmAdd = async () => {
+	const onConfirmAdd = async (password: string) => {
 		if (!draft) return;
+		setWrongPassword(false);
 		try {
-			await save.mutateAsync(draft);
+			await save.mutateAsync({ ...draft, password });
 			setDraft(null);
 			setFormKey((k) => k + 1);
-		} catch {
+		} catch (e) {
+			// A rejected password keeps the dialog open so the operator can retry without refilling
+			// the form; anything else is a genuine failure to write the source.
+			if (e instanceof ApiError && e.status === 401) {
+				setWrongPassword(true);
+				return;
+			}
 			toast.error(m.store_add_source_failed());
 		}
 	};
@@ -103,7 +114,11 @@ export const SourcesTab: FC = () => {
 			<TrustSourceDialog
 				draft={draft}
 				isSaving={save.isPending}
-				onCancel={() => setDraft(null)}
+				wrongPassword={wrongPassword}
+				onCancel={() => {
+					setDraft(null);
+					setWrongPassword(false);
+				}}
 				onConfirm={onConfirmAdd}
 			/>
 		</div>
@@ -308,40 +323,73 @@ export const TrustSourceDialog: FC<{
 	draft: SourceDraft | null;
 	isSaving: boolean;
 	onCancel: () => void;
-	onConfirm: () => void;
-}> = ({ draft, isSaving, onCancel, onConfirm }) => (
-	<Dialog open={draft !== null} onOpenChange={(open) => !open && onCancel()}>
-		{draft && (
-			<DialogContent>
-				<DialogHeader>
-					<DialogTitle className="flex items-center gap-2">
-						<AlertTriangle className="size-5 shrink-0 text-amber-600 dark:text-amber-500" />
-						{m.store_source_trust_title()}
-					</DialogTitle>
-					<DialogDescription>
-						{m.store_source_trust_body({ name: draft.name })}
-					</DialogDescription>
-				</DialogHeader>
+	onConfirm: (password: string) => void;
+	/** Set when the BFF rejected the password (401) — say so and keep the dialog open. */
+	wrongPassword?: boolean;
+}> = ({ draft, isSaving, onCancel, onConfirm, wrongPassword }) => {
+	const [password, setPassword] = useState("");
+	// The dialog stays mounted between drafts; clear the password whenever it closes.
+	useEffect(() => {
+		if (!draft) setPassword("");
+	}, [draft]);
+	return (
+		<Dialog open={draft !== null} onOpenChange={(open) => !open && onCancel()}>
+			{draft && (
+				<DialogContent>
+					<DialogHeader>
+						<DialogTitle className="flex items-center gap-2">
+							<AlertTriangle className="size-5 shrink-0 text-amber-600 dark:text-amber-500" />
+							{m.store_source_trust_title()}
+						</DialogTitle>
+						<DialogDescription>
+							{m.store_source_trust_body({ name: draft.name })}
+						</DialogDescription>
+					</DialogHeader>
 
-				<p className="rounded-md bg-muted px-3 py-2 font-mono text-xs break-all text-muted-foreground">
-					{draft.url}
-				</p>
-
-				{!draft.public_key && (
-					<p className="rounded-md border border-amber-600/40 bg-amber-500/10 px-3 py-2 text-sm text-amber-600 dark:border-amber-500/40 dark:text-amber-500">
-						{m.store_source_trust_unsigned()}
+					<p className="rounded-md bg-muted px-3 py-2 font-mono text-xs break-all text-muted-foreground">
+						{draft.url}
 					</p>
-				)}
 
-				<DialogFooter>
-					<Button variant="outline" onClick={onCancel} disabled={isSaving}>
-						{m.common_cancel()}
-					</Button>
-					<Button disabled={isSaving} onClick={onConfirm}>
-						{m.store_source_trust_confirm()}
-					</Button>
-				</DialogFooter>
-			</DialogContent>
-		)}
-	</Dialog>
-);
+					{!draft.public_key && (
+						<p className="rounded-md border border-amber-600/40 bg-amber-500/10 px-3 py-2 text-sm text-amber-600 dark:border-amber-500/40 dark:text-amber-500">
+							{m.store_source_trust_unsigned()}
+						</p>
+					)}
+
+					{/* Adding a source is a trust-root change: every future install rides on it, so the
+				    console password is re-entered here and verified at the BFF, exactly as for a
+				    host update. */}
+					<div className="space-y-2">
+						<Label htmlFor="store-source-password">
+							{m.store_source_password()}
+						</Label>
+						<Input
+							id="store-source-password"
+							type="password"
+							autoComplete="current-password"
+							value={password}
+							onChange={(e) => setPassword(e.target.value)}
+						/>
+						{wrongPassword && (
+							<p role="alert" className="text-xs text-destructive">
+								{m.update_apply_wrong_password()}
+							</p>
+						)}
+					</div>
+
+					<DialogFooter>
+						<Button variant="outline" onClick={onCancel} disabled={isSaving}>
+							{m.common_cancel()}
+						</Button>
+						<Button
+							disabled={isSaving || password.length === 0}
+							onClick={() => onConfirm(password)}
+						>
+							{m.store_source_trust_confirm()}
+						</Button>
+					</DialogFooter>
+				</DialogContent>
+			)}
+		</Dialog>
+	);
+};

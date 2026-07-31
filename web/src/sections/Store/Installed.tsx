@@ -89,7 +89,7 @@ export const InstalledList: FC<{
 											</div>
 										</TableCell>
 										<TableCell className="py-4 text-sm tabular-nums text-muted-foreground">
-											v{p.version}
+											{p.version ? `v${p.version}` : m.store_version_unknown()}
 										</TableCell>
 										<TableCell className="py-4">
 											<span className="inline-flex items-center gap-1.5 text-xs text-muted-foreground">
