@@ -234,9 +234,10 @@ pub fn start(
         });
 }
 
-/// Stub — the audio plane needs an audio-capture backend (PipeWire on Linux, WASAPI on Windows)
-/// + libopus; this keeps the remaining targets (e.g. macOS) compiling (crate doc: "the crate
-/// compiles everywhere"). Reports failure the same way the real stream thread does: clears `running`.
+/// Stub — the audio plane needs an audio-capture backend (PipeWire on Linux, WASAPI on
+/// Windows) + libopus; this keeps the remaining targets (e.g. macOS) compiling (crate doc:
+/// "the crate compiles everywhere"). Reports failure the same way the real stream thread
+/// does: clears `running`.
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
 pub fn start(
     running: std::sync::Arc<std::sync::atomic::AtomicBool>,

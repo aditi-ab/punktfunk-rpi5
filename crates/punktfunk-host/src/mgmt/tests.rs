@@ -1649,10 +1649,11 @@ async fn hooks_get_shape_and_put_validation() {
 
 // ------------------------------------------------------------------ library scanners
 
-/// The scanner list is platform-shaped and read-only-safe; the toggle rejects unknown ids with
-/// 404. (A successful toggle PUT would write the developer's real `library-scanners.json`, so the
-/// write path is exercised only through the unknown-id rejection here — the settings round-trip
-/// itself is unit-tested in `library::scanners` against pure shapes.)
+/// The scanner list is platform-shaped and read-only-safe; the toggle rejects unknown ids
+/// with 404. (A successful toggle PUT would write the developer's real
+/// `library-scanners.json`, so the write path is exercised only through the unknown-id
+/// rejection here — the settings round-trip itself is unit-tested in `library::scanners`
+/// against pure shapes.)
 #[tokio::test]
 async fn library_scanner_list_and_unknown_toggle() {
     let app = test_app(test_state(), None);

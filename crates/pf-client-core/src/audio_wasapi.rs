@@ -32,9 +32,9 @@ const SAMPLE_RATE: usize = 48_000;
 /// Mic capture requests STEREO from WASAPI (autoconvert matrixes any endpoint layout down to
 /// it — the proven path; `read_from_device_to_deque` then delivers our requested format) and
 /// downmixes to MONO in code before the encoder: voice is mono at the source, the host accepts
-/// any Opus channel layout (its stereo decoder upmixes), and half the samples halve the encode
-/// + wire cost. The render path is multichannel — its channel count + block align are runtime,
-/// driven by the host-resolved layout.
+/// any Opus channel layout (its stereo decoder upmixes), and half the samples halve the
+/// encode + wire cost. The render path is multichannel — its channel count + block align are
+/// runtime, driven by the host-resolved layout.
 const CAPT_CHANNELS: usize = 2;
 /// Mic frames are 10 ms (480 mono samples) — any size ≤ 120 ms is fine host-side; 10 ms
 /// halves the frame-fill share of mouth-to-ear latency vs the old 20 ms.
