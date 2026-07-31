@@ -18,11 +18,13 @@ import kotlin.math.roundToInt
  * The live stats overlay — the unified HUD (`design/stats-unification.md`): headline is
  * `capture→displayed` tiled by `host+network` + `decode` + `display` when the platform delivered
  * OnFrameRendered render callbacks this window (`dispValid`), falling back to the v1
- * `capture→decoded` headline without the `display` term when it didn't. Reads the 26-double
- * layout from [NativeBridge.nativeVideoStats]:
+ * `capture→decoded` headline without the `display` term when it didn't. Reads the 33-double
+ * layout from [NativeBridge.nativeVideoStats] (that KDoc is the authoritative index list):
  * `[fps, mbps, e2eP50Ms, e2eP95Ms, latValid, skew, w, h, hz, lostTotal, bitDepth, colorPrimaries,
  * colorTransfer, chromaFormatIdc, hostNetP50Ms, decodeP50Ms, hostP50Ms, netP50Ms, lost, skipped,
- * fec, frames, dispValid, displayP50Ms, e2eDispP50Ms, e2eDispP95Ms]`.
+ * fec, frames, dispValid, displayP50Ms, e2eDispP50Ms, e2eDispP95Ms, paceP50Ms, latchP50Ms,
+ * presentsWindow, presenterActive, feedP50Ms, codecP50Ms, skippedOverflowWindow]`. Every read
+ * is length-guarded, so an older native lib simply omits the lines it can't feed.
  *
  * [verbosity] selects how many lines render (each tier a superset of the last — see
  * [StatsVerbosity]):
