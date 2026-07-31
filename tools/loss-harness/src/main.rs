@@ -60,7 +60,9 @@ fn run(
         if streamed {
             let mut au = host.begin_streamed_frame_at(f as u64, 0, f as u32).unwrap();
             for chunk in frame.chunks(frame_len / 3 + 1) {
-                let wires = host.seal_streamed_chunk(&mut au, chunk).unwrap();
+                // slice_end=false: the harness exercises the legacy full-FEC-block granularity
+                // (its loopback client never advertises the P2 slice wire).
+                let wires = host.seal_streamed_chunk(&mut au, chunk, false).unwrap();
                 send_wires(&mut host, wires);
             }
             let wires = host.seal_streamed_finish(au).unwrap();
