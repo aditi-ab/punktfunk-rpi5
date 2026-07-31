@@ -20,7 +20,9 @@ import { m } from "@/paraglide/messages";
  */
 export const GpuSection: FC = () => {
 	const qc = useQueryClient();
-	const gpus = useListGpus({ query: { refetchInterval: 5_000 } });
+	// GPU state only moves when a session starts or ends, which the event stream reports — so this
+	// is a slow safety net rather than a 5 s poll of a device enumeration.
+	const gpus = useListGpus({ query: { refetchInterval: 20_000 } });
 	const setPref = useSetGpuPreference();
 
 	const apply = (mode: "auto" | "manual", gpuId?: string) =>

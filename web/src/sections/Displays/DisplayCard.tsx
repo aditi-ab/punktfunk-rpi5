@@ -956,7 +956,17 @@ const CustomPresetCard: FC<{
  */
 const LiveDisplays: FC = () => {
 	const qc = useQueryClient();
-	const state = useGetDisplayState({ query: { refetchInterval: 2_000 } });
+	// Create/release arrive on the event stream (api/events.ts), so the timer is only here for the
+	// one thing events cannot express: the per-second "tears down in Ns" countdown on a lingering
+	// display. With nothing lingering it drops to a slow safety net.
+	const state = useGetDisplayState({
+		query: {
+			refetchInterval: (q) =>
+				q.state.data?.displays?.some((d) => d.expires_in_ms != null)
+					? 2_000
+					: 15_000,
+		},
+	});
 	const release = useReleaseDisplay();
 	const displays = state.data?.displays ?? [];
 	const kept = displays.filter((d) => d.state !== "active");

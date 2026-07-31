@@ -16,12 +16,17 @@ export const HostView: FC<{
 	gpu?: ReactNode;
 	/** The update-check card (a self-contained container — see `UpdateCard.tsx`). */
 	update?: ReactNode;
-}> = ({ host, compositors, gpu, update }) => {
+	/** Warning about other Moonlight-compatible servers on this machine — renders nothing when
+	 * there are none (see `ConflictsCard.tsx`). Sits at the top: it explains "nothing can connect". */
+	conflicts?: ReactNode;
+}> = ({ host, compositors, gpu, update, conflicts }) => {
 	const h = host.data;
 	return (
 		<Section maxWidth={false}>
 			<div className="flex flex-col gap-card">
 				<h1 className="text-2xl font-semibold">{m.nav_host()}</h1>
+
+				{conflicts}
 
 				<QueryState
 					isLoading={host.isLoading}

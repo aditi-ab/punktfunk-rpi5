@@ -15,8 +15,18 @@ import { DashboardView } from "./view";
 export const SectionDashboard: FC = () => {
 	useLocale();
 	const qc = useQueryClient();
-	// Poll live status every 2s so the console tracks an active session.
-	const status = useGetStatus({ query: { refetchInterval: 2_000 } });
+	// Session/game transitions arrive on the event stream now (api/events.ts invalidates this key),
+	// so the timer only has to cover what events cannot: the live stream numbers — codec, resolution,
+	// fps, bitrate — which change continuously while something is streaming. Idle, it is a slow
+	// safety net in case the stream is unavailable.
+	const status = useGetStatus({
+		query: {
+			refetchInterval: (q) =>
+				q.state.data?.video_streaming || (q.state.data?.games?.length ?? 0) > 0
+					? 2_000
+					: 15_000,
+		},
+	});
 	// The catalog, for the running-game card's box art. Fetched once and held: a library scan touches
 	// every installed store's on-disk metadata, so it must not ride the 2 s status poll.
 	const library = useGetLibrary(undefined, {

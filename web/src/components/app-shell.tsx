@@ -10,9 +10,11 @@ import {
 	ScrollText,
 	Server,
 	Settings,
+	Workflow,
 } from "lucide-react";
 import { motion, stagger } from "motion/react";
 import { type ReactNode, useState } from "react";
+import { useHostEvents } from "@/api/events";
 import { pluginIcon, uiPlugins, usePlugins } from "@/api/plugins";
 import { BrandMark } from "@/components/brand-mark";
 import { Wordmark } from "@/components/wordmark";
@@ -30,6 +32,7 @@ const NAV = [
 	{ to: "/stats", icon: GaugeCircle, label: () => m.nav_stats() },
 	{ to: "/logs", icon: ScrollText, label: () => m.nav_logs() },
 	{ to: "/pairing", icon: KeyRound, label: () => m.nav_pairing() },
+	{ to: "/automation", icon: Workflow, label: () => m.nav_automation() },
 	{ to: "/plugins", icon: Puzzle, label: () => m.nav_plugins() },
 	{ to: "/settings", icon: Settings, label: () => m.nav_settings() },
 ] as const;
@@ -47,6 +50,10 @@ const MOBILE_OVERFLOW = NAV.slice(4);
 export function AppShell({ children }: { children: ReactNode }) {
 	// Read the locale so the whole shell re-renders on a language switch.
 	useLocale();
+	// One subscription to the host's event stream for the whole console — it invalidates the queries
+	// each event affects, so pages update on the transition instead of on their own timer. The
+	// polling intervals stay as a floor in case the stream is unavailable.
+	useHostEvents();
 	return (
 		<div className="flex min-h-screen">
 			{/* Desktop sidebar (≥ sm). Sticky at viewport height: the page (body) scrolls with
