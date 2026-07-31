@@ -886,9 +886,12 @@ pub(crate) fn settings_page(
                     keys.get(sel - 1).cloned()
                 };
                 // Apply live to the gamepad service and persist — the spawned session
-                // reads `forward_pad` at connect.
+                // reads `forward_pad` at connect. Rebase on the file first (the same
+                // discipline as `commit()`): this handler bypasses commit and a stale
+                // whole-struct save would revert other writers.
                 svc.set_pinned(key.clone());
                 let mut s = ctx2.settings.lock().unwrap();
+                *s = Settings::load();
                 s.forward_pad = key.unwrap_or_default();
                 s.save();
             })
@@ -1172,6 +1175,46 @@ pub(crate) fn settings_page(
             group(
                 None,
                 [
+                    // The read-only pad inventory (GTK parity): what THIS device sees right
+                    // now — the fastest answer to "is my controller even detected?". A
+                    // device fact, so defaults scope only, like the forward picker below.
+                    (!profile_mode).then(|| {
+                        let inventory: Element = if pads.is_empty() {
+                            text_block("No controllers detected")
+                                .font_size(12.0)
+                                .foreground(ThemeRef::SecondaryText)
+                                .into()
+                        } else {
+                            vstack(
+                                pads.iter()
+                                    .map(|p| {
+                                        let sub = if p.steam_virtual {
+                                            "Steam Input's virtual pad \u{2014} Automatic skips \
+                                             it while a real pad is connected"
+                                                .to_string()
+                                        } else {
+                                            p.kind_label().to_string()
+                                        };
+                                        vstack((
+                                            text_block(p.name.clone()).semibold(),
+                                            text_block(sub)
+                                                .font_size(11.0)
+                                                .foreground(ThemeRef::SecondaryText),
+                                        ))
+                                        .spacing(1.0)
+                                        .into()
+                                    })
+                                    .collect::<Vec<Element>>(),
+                            )
+                            .spacing(8.0)
+                            .into()
+                        };
+                        described_labeled(
+                            "Detected controllers",
+                            inventory,
+                            "Plug in or pair a controller and it appears here.",
+                        )
+                    }),
                     // NOT Apple's wording: Apple forwards ONE pad as player 1, this client
                     // forwards every controller as its own player. Same picker, different rule.
                     // Which physical pad this device forwards is a device fact (tier G), so it

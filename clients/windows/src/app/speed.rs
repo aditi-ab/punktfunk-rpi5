@@ -140,39 +140,80 @@ pub(crate) fn speed_page(props: &SpeedProps, cx: &mut RenderCx) -> Element {
                 None => bound,
             }
             .and_then(|reference| ProfilesFile::load().resolve(&reference).0.cloned());
-            let apply_btn = {
-                let (ctx, ss, kbps) = (ctx.clone(), set_screen.clone(), *recommended_kbps);
-                let profile = profile.clone();
-                button(match &profile {
-                    Some(p) => format!(
-                        "Set {recommended_mbps:.0} Mb/s in \u{201c}{}\u{201d}",
-                        p.name
-                    ),
-                    None => format!("Use {recommended_mbps:.0} Mb/s"),
-                })
-                .accent()
-                .icon(Symbol::Accept)
-                .on_click(move || {
-                    match &profile {
-                        Some(p) => {
-                            let mut catalog = ProfilesFile::load();
-                            if let Some(slot) = catalog.profiles.iter_mut().find(|x| x.id == p.id) {
-                                slot.overrides.bitrate_kbps = Some(kbps);
-                                if let Err(e) = catalog.save() {
-                                    tracing::warn!(error = %format!("{e:#}"),
-                                        "saving the measured bitrate");
-                                }
-                            }
-                        }
-                        None => {
-                            let mut s = ctx.settings.lock().unwrap();
-                            s.bitrate_kbps = kbps;
-                            s.save();
+            let kbps = *recommended_kbps;
+            let write_global = {
+                let (ctx, ss) = (ctx.clone(), set_screen.clone());
+                move || {
+                    // Rebase on the file before the whole-struct save — same discipline as
+                    // `commit()`; another writer may have moved it under this snapshot.
+                    let mut s = ctx.settings.lock().unwrap();
+                    *s = crate::trust::Settings::load();
+                    s.bitrate_kbps = kbps;
+                    s.save();
+                    ss.call(Screen::Hosts);
+                }
+            };
+            let write_profile = |id: String| {
+                let ss = set_screen.clone();
+                move || {
+                    let mut catalog = ProfilesFile::load();
+                    if let Some(slot) = catalog.profiles.iter_mut().find(|x| x.id == id) {
+                        slot.overrides.bitrate_kbps = Some(kbps);
+                        if let Err(e) = catalog.save() {
+                            tracing::warn!(error = %format!("{e:#}"),
+                                "saving the measured bitrate");
                         }
                     }
                     ss.call(Screen::Hosts);
-                })
+                }
             };
+            // Which button(s): no binding → the global; a binding that already overrides
+            // bitrate → that override (it's what this host reads). Bound but INHERITING
+            // bitrate could legitimately mean either layer — offer both rather than
+            // guessing (the GTK client's Ask tier; this shell used to silently CREATE an
+            // override on the profile).
+            let mut buttons: Vec<Element> = Vec::new();
+            match &profile {
+                None => buttons.push(
+                    button(format!("Use {recommended_mbps:.0} Mb/s"))
+                        .accent()
+                        .icon(Symbol::Accept)
+                        .on_click(write_global.clone())
+                        .into(),
+                ),
+                Some(p) if p.overrides.bitrate_kbps.is_some() => buttons.push(
+                    button(format!(
+                        "Set {recommended_mbps:.0} Mb/s in \u{201c}{}\u{201d}",
+                        p.name
+                    ))
+                    .accent()
+                    .icon(Symbol::Accept)
+                    .on_click(write_profile(p.id.clone()))
+                    .into(),
+                ),
+                Some(p) => {
+                    buttons.push(
+                        button("Set as default")
+                            .icon(Symbol::Accept)
+                            .on_click(write_global.clone())
+                            .into(),
+                    );
+                    buttons.push(
+                        button(format!("Set in \u{201c}{}\u{201d}", p.name))
+                            .accent()
+                            .icon(Symbol::Accept)
+                            .on_click(write_profile(p.id.clone()))
+                            .into(),
+                    );
+                }
+            }
+            buttons.push({
+                let ss = set_screen.clone();
+                button("Close")
+                    .icon(Symbol::Cancel)
+                    .on_click(move || ss.call(Screen::Hosts))
+                    .into()
+            });
             let results = card(
                 vstack((
                     text_block(format!("{mbps:.0} Mbit/s"))
@@ -190,14 +231,9 @@ pub(crate) fn speed_page(props: &SpeedProps, cx: &mut RenderCx) -> Element {
                     .font_size(12.0)
                     .foreground(ThemeRef::SecondaryText)
                     .horizontal_alignment(HorizontalAlignment::Center),
-                    hstack((apply_btn, {
-                        let ss = set_screen.clone();
-                        button("Close")
-                            .icon(Symbol::Cancel)
-                            .on_click(move || ss.call(Screen::Hosts))
-                    }))
-                    .spacing(8.0)
-                    .horizontal_alignment(HorizontalAlignment::Center),
+                    hstack(buttons)
+                        .spacing(8.0)
+                        .horizontal_alignment(HorizontalAlignment::Center),
                 ))
                 .spacing(12.0),
             );

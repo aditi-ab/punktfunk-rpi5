@@ -251,16 +251,6 @@ fn connect_spawn(
     *ctx.shared.session.lock().unwrap() = child.clone();
     ctx.shared.stats_line.lock().unwrap().clear();
     ctx.shared.browse.store(false, Ordering::SeqCst);
-    // Through the same resolver the session uses, not the raw globals: "Start streams
-    // fullscreen" is a profileable (tier-P) field, so a host bound to a windowed profile has to
-    // win here too — the child takes this decision from the argv, not from its own settings.
-    let fullscreen = pf_client_core::trust::effective_settings(
-        &target.addr,
-        target.port,
-        target.profile.as_deref(),
-    )
-    .0
-    .fullscreen_on_stream;
     set_status.call(String::new());
     set_screen.call(if opts.awaiting_approval {
         Screen::RequestAccess
@@ -278,13 +268,15 @@ fn connect_spawn(
     // The closure owns `target`/`fp_hex`; the call itself borrows copies.
     let (addr, port, fp_arg) = (target.addr.clone(), target.port, fp_hex.clone());
     let profile_arg = target.profile.clone();
+    // The launch id: an explicit opts pick (the library's tap-to-play), else one riding
+    // the target — a deep link's `launch=` that detoured through the PIN ceremony.
+    let launch_arg = opts.launch.clone().or_else(|| target.launch.clone());
     let spawned = crate::spawn::spawn_session(
         &addr,
         port,
         &fp_arg,
         opts.connect_timeout.as_secs(),
-        fullscreen,
-        opts.launch.as_deref(),
+        launch_arg.as_deref(),
         profile_arg.as_deref(),
         child,
         move |event| {
