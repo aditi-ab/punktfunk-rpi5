@@ -4029,6 +4029,7 @@ pub unsafe extern "C" fn punktfunk_connection_report_phase(
     latch_period_ns: u32,
     uncertainty_ns: u32,
     arrival_lead_ns: u32,
+    coherence_milli: u16,
 ) -> PunktfunkStatus {
     guard(|| {
         // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
@@ -4042,6 +4043,7 @@ pub unsafe extern "C" fn punktfunk_connection_report_phase(
             latch_period_ns,
             uncertainty_ns,
             arrival_lead_ns,
+            coherence_milli,
         );
         PunktfunkStatus::Ok
     })

@@ -2796,7 +2796,8 @@ PunktfunkStatus punktfunk_connection_report_phase(const PunktfunkConnection *c,
                                                   uint64_t next_latch_host_ns,
                                                   uint32_t latch_period_ns,
                                                   uint32_t uncertainty_ns,
-                                                  uint32_t arrival_lead_ns);
+                                                  uint32_t arrival_lead_ns,
+                                                  uint16_t coherence_milli);
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)

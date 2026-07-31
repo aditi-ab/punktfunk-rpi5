@@ -175,9 +175,15 @@ pub struct PhaseReport {
     /// The client's own error bound on this grid (skew residual + latch jitter p95) — the host
     /// widens its arrival margin by this, never narrows below its floor.
     pub uncertainty_ns: u32,
-    /// Measured median lead of frame ARRIVAL before latch over the last window (ns; clamped
-    /// ≥ 0). The controller drives this toward its target lead — the error signal.
+    /// Measured lead of frame arrival before latch over the last window (ns; clamped ≥ 0).
+    /// v2 senders put the CIRCULAR (vector-mean) lead mod the panel period here; v1 senders put
+    /// the window median. The controller drives this toward its target lead — the error signal.
     pub arrival_lead_ns: u32,
+    /// v2 tail: circular coherence of the arrival phase, ‰ (0 = phase uniformly smeared over the
+    /// period — alignment is physically pointless; 1000 = perfectly phase-locked arrivals).
+    /// [`u16::MAX`] = a v1 sender (25-byte wire form) that reported a median with no coherence —
+    /// the host then relies on its travel-cap safety net alone.
+    pub coherence_milli: u16,
 }
 
 /// Type byte of [`Reconfigure`] (first byte after the magic).
@@ -490,18 +496,23 @@ impl ClockEcho {
 impl PhaseReport {
     pub fn encode(&self) -> Vec<u8> {
         // magic[0..4] type[4] latch[5..13] period[13..17] uncertainty[17..21] lead[21..25]
-        let mut b = Vec::with_capacity(25);
+        // coherence[25..27] — the v2 tail; a MAX sentinel encodes as the 25-byte v1 form so a
+        // v1-shaped report stays byte-identical (append discipline, like the 0xCF tail).
+        let mut b = Vec::with_capacity(27);
         b.extend_from_slice(CTL_MAGIC);
         b.push(MSG_PHASE_REPORT);
         b.extend_from_slice(&self.next_latch_host_ns.to_le_bytes());
         b.extend_from_slice(&self.latch_period_ns.to_le_bytes());
         b.extend_from_slice(&self.uncertainty_ns.to_le_bytes());
         b.extend_from_slice(&self.arrival_lead_ns.to_le_bytes());
+        if self.coherence_milli != u16::MAX {
+            b.extend_from_slice(&self.coherence_milli.to_le_bytes());
+        }
         b
     }
 
     pub fn decode(b: &[u8]) -> Result<PhaseReport> {
-        if b.len() != 25 || &b[0..4] != CTL_MAGIC || b[4] != MSG_PHASE_REPORT {
+        if !(b.len() == 25 || b.len() == 27) || &b[0..4] != CTL_MAGIC || b[4] != MSG_PHASE_REPORT {
             return Err(PunktfunkError::InvalidArg("bad PhaseReport"));
         }
         let u32at = |o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
@@ -510,6 +521,11 @@ impl PhaseReport {
             latch_period_ns: u32at(13),
             uncertainty_ns: u32at(17),
             arrival_lead_ns: u32at(21),
+            coherence_milli: if b.len() == 27 {
+                u16::from_le_bytes(b[25..27].try_into().unwrap())
+            } else {
+                u16::MAX // v1 sender — no coherence signal
+            },
         })
     }
 }
@@ -983,12 +999,25 @@ mod tests {
             latch_period_ns: 8_333_333,
             uncertainty_ns: 900_000,
             arrival_lead_ns: 4_100_000,
+            coherence_milli: 742,
         };
-        assert_eq!(PhaseReport::decode(&pr.encode()).unwrap(), pr);
+        let d = pr.encode();
+        assert_eq!(d.len(), 27, "a real coherence rides the v2 tail");
+        assert_eq!(PhaseReport::decode(&d).unwrap(), pr);
+        // The MAX sentinel encodes as the 25-byte v1 form and roundtrips back to the sentinel.
+        let v1 = PhaseReport {
+            coherence_milli: u16::MAX,
+            ..pr
+        };
+        let d1 = v1.encode();
+        assert_eq!(d1.len(), 25);
+        assert_eq!(&d1[..25], &d[..25], "v1 form is a strict prefix of v2");
+        assert_eq!(PhaseReport::decode(&d1).unwrap(), v1);
         // Wrong type byte (a ClockProbe) must not decode as a PhaseReport.
         assert!(PhaseReport::decode(&ClockProbe { t1_ns: 7 }.encode()).is_err());
-        // Truncation must not decode.
-        assert!(PhaseReport::decode(&pr.encode()[..24]).is_err());
+        // Truncation to a length that is neither form must not decode.
+        assert!(PhaseReport::decode(&d[..24]).is_err());
+        assert!(PhaseReport::decode(&d[..26]).is_err());
     }
 
     #[test]

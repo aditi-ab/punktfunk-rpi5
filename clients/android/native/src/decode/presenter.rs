@@ -138,6 +138,29 @@ impl PresentMeter {
     }
 }
 
+/// Circular (vector-mean) statistics of latch samples against the panel period: the mean latch
+/// mod the period (ns) and the coherence (‰). The mean is what a phase controller can actually
+/// steer under jitter — a median of a period-spanning distribution is immovable (the v1 lesson);
+/// the coherence says whether ANY phase exists to steer (0 = uniformly smeared, 1000 = locked).
+/// `None` under 8 samples — too little evidence to report a phase at all.
+fn circular_latch(samples_us: &[u64], period_ns: i64) -> Option<(u64, u16)> {
+    if samples_us.len() < 8 || period_ns <= 0 {
+        return None;
+    }
+    let period_us = period_ns as f64 / 1000.0;
+    let (mut x, mut y) = (0.0f64, 0.0f64);
+    for &s in samples_us {
+        let theta = (s as f64 % period_us) / period_us * std::f64::consts::TAU;
+        x += theta.cos();
+        y += theta.sin();
+    }
+    let n = samples_us.len() as f64;
+    let r = (x * x + y * y).sqrt() / n;
+    let mean_theta = y.atan2(x).rem_euclid(std::f64::consts::TAU);
+    let mean_ns = (mean_theta / std::f64::consts::TAU * period_ns as f64) as u64;
+    Some((mean_ns, (r * 1000.0) as u16))
+}
+
 /// p50/max of an unsorted µs sample vec, in ms. (0, 0) when empty.
 fn p50_max_ms(mut v: Vec<u64>) -> (f64, f64) {
     if v.is_empty() {
@@ -340,13 +363,14 @@ impl Presenter {
     /// `qDry` (FIFO underflows) / `pace` (decoded→release) / `latch` (release→displayed) /
     /// `vsync` (the measured panel period).
     ///
-    /// Returns this window's measured latch p50 (ns) when a window actually flushed — the
-    /// phase-lock reporter's `arrival_lead` error signal (design/phase-locked-capture.md §6).
+    /// Returns this window's CIRCULAR latch statistics `(vector-mean latch ns mod panel period,
+    /// coherence ‰)` when a window actually flushed — the phase-lock reporter's v2 error signal
+    /// (design/phase-locked-capture.md §6; the v1 median was immovable under jitter).
     pub(super) fn flush_log(
         &mut self,
         meter: &PresentMeter,
         clock: Option<&VsyncShared>,
-    ) -> Option<u64> {
+    ) -> Option<(u64, u16)> {
         if self.last_flush.elapsed() < std::time::Duration::from_secs(1) {
             return None;
         }
@@ -356,6 +380,8 @@ impl Presenter {
             return None; // idle stream — nothing worth a line
         }
         let (pace_p50, pace_max) = p50_max_ms(std::mem::take(&mut self.pace_us));
+        let circ =
+            clock.and_then(|c| circular_latch(&latch, c.panel_period_ns().max(c.period_ns())));
         let (latch_p50, latch_max) = p50_max_ms(latch);
         let period_ms = clock.map(|c| c.period_ns() as f64 / 1e6).unwrap_or(0.0);
         let panel_ms = clock
@@ -364,7 +390,8 @@ impl Presenter {
         log::info!(
             target: "pf.present",
             "released={} displays={} paced={} noBudget={} forced={} qDry={} \
-             paceMs p50={:.2} max={:.2} latchMs p50={:.2} max={:.2} vsyncMs={:.2} panelMs={:.2}",
+             paceMs p50={:.2} max={:.2} latchMs p50={:.2} max={:.2} circ={:.2}ms coh={} \
+             vsyncMs={:.2} panelMs={:.2}",
             self.released,
             displays,
             self.paced_drops,
@@ -375,6 +402,8 @@ impl Presenter {
             pace_max,
             latch_p50,
             latch_max,
+            circ.map(|(m, _)| m as f64 / 1e6).unwrap_or(0.0),
+            circ.map(|(_, c)| c).unwrap_or(0),
             period_ms,
             panel_ms,
         );
@@ -383,7 +412,7 @@ impl Presenter {
         self.no_budget = 0;
         self.forced = 0;
         self.dry = 0;
-        (latch_p50 > 0.0).then(|| (latch_p50 * 1e6) as u64)
+        circ
     }
 }
 

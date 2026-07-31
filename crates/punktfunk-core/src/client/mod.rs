@@ -787,6 +787,7 @@ impl NativeClient {
         latch_period_ns: u32,
         uncertainty_ns: u32,
         arrival_lead_ns: u32,
+        coherence_milli: u16,
     ) {
         let _ = self
             .ctrl_tx
@@ -795,6 +796,7 @@ impl NativeClient {
                 latch_period_ns,
                 uncertainty_ns,
                 arrival_lead_ns,
+                coherence_milli,
             }));
     }
 

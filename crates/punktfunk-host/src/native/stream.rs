@@ -253,19 +253,34 @@ impl PhaseCtl {
     }
 }
 
-/// The encode loop's phase controller state (design/phase-locked-capture.md §3): a per-frame
-/// HOLD before submit, walked toward the client's reported arrival lead hitting the target lead.
+/// The encode loop's phase controller state (design/phase-locked-capture.md §3, controller
+/// v2): a per-frame HOLD before submit, driven by the client's CIRCULAR arrival-phase report.
 /// Plain data — lives as a loop local so it survives every in-loop rebuild path; a new session
 /// (new loop call) starts unlocked, which is correct (new client, new grid).
+///
+/// v2 lessons (both measured on-glass 2026-07-31, NP3 ↔ .173):
+///  * A median lead is a DEAD signal under period-spanning jitter (the distribution is ~uniform
+///    mod the refresh; shifting its mean can't move its median) — v1 orbited the period at
+///    2 ms/s forever, and every wrap coalesced ~30 frames at the client.
+///  * A HELD hold is not free: it delays sampling AFTER the capture stamp, so an orbiting or
+///    parked hold taxes e2e by up to a period (user-visible: ~+4 ms average during the orbit).
+///    The failure response is therefore DECAY TO ZERO — the pre-phase-lock behavior — never
+///    freeze-in-place.
+///
+/// The v2 signal is the circular (vector-mean) lead + coherence; stepping happens only while
+/// the phase is coherent, along the signed SHORTEST way around the period, under a cumulative
+/// travel budget that catches any residual chase the statistics miss.
 struct PhaseController {
     /// Applied per-frame hold before submit, ns ∈ [0, period).
     hold_ns: i64,
     /// Last adjust instant (~1 Hz cadence).
     last_adjust: std::time::Instant,
-    /// The previous adjust's error (ns) — the dead-signal detector's memory.
-    last_error_ns: Option<i64>,
-    /// Consecutive adjusts whose step failed to move the error (see `DEAD_SIGNAL_ADJUSTS`).
-    unresponsive_adjusts: u32,
+    /// |step| integrated since the last convergence/decay — the chase detector. Any true lock
+    /// needs at most ~one period of travel, so exceeding the budget proves the error is not
+    /// converging regardless of what the (noisy) reports claim.
+    cum_travel_ns: i64,
+    /// The travel budget tripped — decay the hold to zero, then re-arm.
+    decaying: bool,
 }
 
 impl PhaseController {
@@ -278,75 +293,71 @@ impl PhaseController {
     /// The lead floor the controller drives toward: SurfaceFlinger-class compositors need the
     /// frame in the queue ~2.5 ms before latch; the client's own `uncertainty_ns` widens this.
     const TARGET_LEAD_FLOOR_NS: i64 = 2_500_000;
+    /// Below this circular coherence (‰) the arrival phase is smeared over the period and
+    /// alignment is physically pointless — decay instead of stepping. `u16::MAX` (a v1 report,
+    /// median semantics) bypasses the gate and relies on the travel budget alone.
+    const COHERENCE_FLOOR_MILLI: u16 = 300;
 
     fn new() -> PhaseController {
         PhaseController {
             hold_ns: 0,
             last_adjust: std::time::Instant::now(),
-            last_error_ns: None,
-            unresponsive_adjusts: 0,
+            cum_travel_ns: 0,
+            decaying: false,
         }
     }
 
-    /// Consecutive adjusts allowed to move the hold WITHOUT the reported error responding
-    /// before the controller freezes (a dead error signal). Under period-spanning arrival
-    /// jitter the latch DISTRIBUTION is ~uniform mod the refresh: shifting its mean cannot
-    /// move its median, so a naive controller steps one way forever, orbiting the period —
-    /// and every wrap coalesces a burst of frames at the client (the 2026-07-31 on-glass
-    /// finding: `paced` spikes of ~30 every ~4 s, locked to the wraps). Frozen ≠ off: the
-    /// applied hold stays, and a report whose error moved ≥ [`Self::UNFREEZE_DELTA_NS`]
-    /// (the regime changed — jitter tightened) re-arms stepping. Controller v2 replaces the
-    /// median with a circular phase statistic; this freeze is the safety net either way.
-    const DEAD_SIGNAL_ADJUSTS: u32 = 3;
-    /// Error movement that counts as "the signal responded" / re-arms a frozen controller.
-    const UNFREEZE_DELTA_NS: i64 = 1_500_000;
-
     /// Fold the client's latest report into the hold. `period_ns` is the wire interval (the
-    /// session's frame period). Sign convention: `arrival_lead` is how long before its latch the
-    /// median frame arrives — a LARGE lead means frames sit waiting at the client, so the host
-    /// should send LATER (grow the hold); a small/zero lead risks missing the latch, so send
-    /// EARLIER (shrink the hold, wrapping through the period when it hits zero — the newest-wins
-    /// capture slot makes a wrapped hold sample a fresher frame, not a staler one).
+    /// session's frame period). Sign convention: a positive (shortest-way) error means frames
+    /// arrive too early and wait at the client — send LATER (grow the hold); negative — send
+    /// EARLIER. `rem_euclid` wraps the hold through the period; the newest-wins capture slot
+    /// makes a wrapped hold sample a fresher frame, not a staler one.
     fn adjust(&mut self, r: &punktfunk_core::quic::PhaseReport, period_ns: i64) {
         if period_ns <= 0 {
             return;
         }
         self.last_adjust = std::time::Instant::now();
-        let target = Self::TARGET_LEAD_FLOOR_NS.max(r.uncertainty_ns as i64 + 1_000_000);
-        let error = r.arrival_lead_ns as i64 - target;
-        if error.abs() < Self::DEADBAND_NS {
-            self.unresponsive_adjusts = 0;
-            self.last_error_ns = Some(error);
+        // Incoherent phase, or a tripped travel budget: the hold is a pure e2e tax buying no
+        // alignment — walk it back to zero and wait for the regime to tighten.
+        let coherent =
+            r.coherence_milli == u16::MAX || r.coherence_milli >= Self::COHERENCE_FLOOR_MILLI;
+        if !coherent || self.decaying {
+            self.decay();
             return;
         }
-        // Dead-signal detection: if stepping the hold hasn't moved the error, stop stepping —
-        // and while frozen, only a genuinely-moved error re-arms.
-        if let Some(last) = self.last_error_ns {
-            if (error - last).abs() >= Self::UNFREEZE_DELTA_NS {
-                self.unresponsive_adjusts = 0; // the signal responded (or the regime changed)
-            } else if self.frozen() {
-                self.last_error_ns = Some(error);
-                return;
-            } else {
-                self.unresponsive_adjusts += 1;
-                if self.frozen() {
-                    tracing::info!(
-                        error_ms = error as f64 / 1e6,
-                        hold_ms = self.hold_ns as f64 / 1e6,
-                        "phase lock: error signal unresponsive — freezing the hold"
-                    );
-                    self.last_error_ns = Some(error);
-                    return;
-                }
-            }
+        let target = Self::TARGET_LEAD_FLOOR_NS.max(r.uncertainty_ns as i64 + 1_000_000);
+        // Signed SHORTEST-WAY error around the period — the controller never walks the long way.
+        let raw = (r.arrival_lead_ns as i64 - target).rem_euclid(period_ns);
+        let error = if raw > period_ns / 2 {
+            raw - period_ns
+        } else {
+            raw
+        };
+        if error.abs() < Self::DEADBAND_NS {
+            self.cum_travel_ns = 0; // locked — the budget re-arms for the next disturbance
+            return;
         }
-        self.last_error_ns = Some(error);
         let step = error.clamp(-Self::MAX_STEP_NS, Self::MAX_STEP_NS);
         self.hold_ns = (self.hold_ns + step).rem_euclid(period_ns);
+        self.cum_travel_ns += step.abs();
+        if self.cum_travel_ns > period_ns + period_ns / 4 {
+            tracing::info!(
+                hold_ms = self.hold_ns as f64 / 1e6,
+                "phase lock: travel budget exhausted without convergence — decaying the hold"
+            );
+            self.decaying = true;
+        }
     }
 
-    fn frozen(&self) -> bool {
-        self.unresponsive_adjusts >= Self::DEAD_SIGNAL_ADJUSTS
+    /// One decay tick: walk the hold toward zero; once there, re-arm the travel budget so a
+    /// later coherent regime can lock again.
+    fn decay(&mut self) {
+        if self.hold_ns > 0 {
+            self.hold_ns = (self.hold_ns - Self::MAX_STEP_NS).max(0);
+        } else {
+            self.decaying = false;
+            self.cum_travel_ns = 0;
+        }
     }
 
     /// Whether the ~1 Hz adjust window has elapsed.
