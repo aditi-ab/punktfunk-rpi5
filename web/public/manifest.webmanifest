@@ -1,0 +1,19 @@
+{
+	"name": "Punktfunk",
+	"short_name": "Punktfunk",
+	"description": "Management console for a punktfunk streaming host.",
+	"start_url": "/",
+	"scope": "/",
+	"display": "standalone",
+	"orientation": "any",
+	"background_color": "#0a0a0f",
+	"theme_color": "#6c5bf3",
+	"icons": [
+		{
+			"src": "/favicon.svg",
+			"type": "image/svg+xml",
+			"sizes": "any",
+			"purpose": "any"
+		}
+	]
+}

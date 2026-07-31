@@ -147,6 +147,9 @@ export function isPublicPath(pathname: string): boolean {
 	if (pathname.startsWith("/_auth/")) return true;
 	if (pathname.startsWith("/assets/")) return true;
 	if (pathname === "/favicon.ico" || pathname === "/robots.txt") return true;
+	// The web manifest must be fetchable to install the app, and it says nothing a logged-out
+	// visitor cannot already see from the login page (name, colours, the brand mark).
+	if (pathname === "/manifest.webmanifest") return true;
 	return false;
 }
 

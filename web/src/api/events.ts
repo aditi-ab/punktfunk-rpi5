@@ -20,7 +20,7 @@
 //     that (nitro-entry/bun-https.mjs) so we don't sever our own stream.
 //   - An `event: dropped` frame means we fell off the ring and must resync — invalidate everything.
 import { type QueryClient, useQueryClient } from "@tanstack/react-query";
-import { useEffect } from "react";
+import { useEffect, useSyncExternalStore } from "react";
 import { getListPairedClientsQueryKey } from "@/api/gen/clients/clients";
 import { getGetDisplayStateQueryKey } from "@/api/gen/display/display";
 import { getGetStatusQueryKey } from "@/api/gen/host/host";
@@ -104,6 +104,55 @@ function resyncAll(qc: QueryClient): void {
 	qc.invalidateQueries({ refetchType: "all" });
 }
 
+// ---------------------------------------------------------------------------------------------
+// The activity log.
+//
+// The same frames that drive invalidation are also, in themselves, the answer to "what has this
+// host been doing?" — a question the console could not answer at all. Nothing else records this:
+// the REST snapshots describe the present, and the host's own log is a developer artifact, not a
+// narrative. So keep a small in-memory ring alongside the cache work.
+//
+// Deliberately NOT persisted and deliberately bounded: it is a live tail for someone watching, not
+// an audit trail, and a page load starts fresh from whatever the ring replays.
+// ---------------------------------------------------------------------------------------------
+
+/** One thing that happened, as the feed renders it. */
+export interface ActivityEntry {
+	/** The host's monotonic sequence number — stable, and a good React key. */
+	seq: number;
+	/** Unix ms, from the host's clock (never the browser's). */
+	ts_ms: number;
+	kind: string;
+	/** The event payload, shape depending on `kind` (see the EventKind schema). */
+	data: Record<string, unknown>;
+}
+
+const ACTIVITY_MAX = 200;
+let activity: ActivityEntry[] = [];
+const activityListeners = new Set<() => void>();
+
+function pushActivity(entry: ActivityEntry): void {
+	// Guard against a replayed frame after a reconnect (`Last-Event-ID` can re-deliver the cursor).
+	if (activity.some((e) => e.seq === entry.seq)) return;
+	activity = [entry, ...activity].slice(0, ACTIVITY_MAX);
+	for (const l of activityListeners) l();
+}
+
+/** The activity tail, newest first. Re-renders as frames arrive. */
+export function useActivity(): ActivityEntry[] {
+	return useSyncExternalStore(
+		(cb) => {
+			activityListeners.add(cb);
+			return () => activityListeners.delete(cb);
+		},
+		() => activity,
+		// The server has no stream, so SSR renders an empty feed and hydrates into the live one.
+		() => EMPTY_ACTIVITY,
+	);
+}
+
+const EMPTY_ACTIVITY: ActivityEntry[] = [];
+
 /** Every kind we act on. A kind the host adds later simply has no listener — never a mis-handle. */
 const KINDS = [
 	"client.connected",
@@ -153,7 +202,9 @@ function attach(): void {
 	if (source) return;
 	source = new EventSource("/api/v1/events");
 	for (const kind of KINDS) {
-		source.addEventListener(kind, () => {
+		source.addEventListener(kind, (ev) => {
+			// Record it first: the feed should show an event even for a kind we invalidate nothing for.
+			recordActivity(kind, ev);
 			if (!client) return;
 			// The installed set changed — but the runner is probably still restarting, so keep
 			// checking for a while rather than trusting this one refetch (see boostPluginPolling).
@@ -168,6 +219,21 @@ function attach(): void {
 	source.addEventListener("dropped", () => {
 		if (client) resyncAll(client);
 	});
+}
+
+/** Parse one SSE frame into the activity ring. A malformed frame is dropped, never thrown. */
+function recordActivity(kind: string, ev: Event): void {
+	const raw = (ev as MessageEvent<string>).data;
+	if (typeof raw !== "string") return;
+	try {
+		const data = JSON.parse(raw) as Record<string, unknown>;
+		const seq = typeof data.seq === "number" ? data.seq : Number.NaN;
+		const ts = typeof data.ts_ms === "number" ? data.ts_ms : Number.NaN;
+		if (!Number.isFinite(seq) || !Number.isFinite(ts)) return;
+		pushActivity({ seq, ts_ms: ts, kind, data });
+	} catch {
+		// A frame we cannot parse is not worth breaking the stream over.
+	}
 }
 
 function release(): void {
