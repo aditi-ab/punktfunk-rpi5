@@ -28,6 +28,18 @@ const ws = import.meta._websocket
 	? wsAdapter(nitroApp.h3App.websocket)
 	: undefined;
 
+// The socket peer, handed to the app as a trusted header.
+//
+// Nitro's `localFetch` (below) hands the app a SYNTHETIC request whose socket has no
+// `remoteAddress`, so h3's `getRequestIP()` returns undefined *inside* the app and every
+// per-peer decision collapses onto one shared bucket. That silently defeated the login
+// throttle: five wrong passwords from anywhere locked out everyone, including the operator
+// (and, since the update-apply route shares that budget, locked out host updates too).
+// `server.requestIP(req)` is the only place the real peer is knowable, so we stamp it here.
+// Any inbound copy is deleted first, so a client cannot forge it.
+// Read back by `peerAddress()` in server/util/auth.ts — keep the two names in sync.
+const PEER_IP_HEADER = "x-pf-peer-ip";
+
 // TLS from the host's identity cert (file PATHS → Bun.file, not PEM-in-env). Absent ⇒ plain HTTP.
 const certPath = process.env.PUNKTFUNK_UI_TLS_CERT;
 const keyPath = process.env.PUNKTFUNK_UI_TLS_KEY;
@@ -53,10 +65,15 @@ const server = Bun.serve({
 		if (req.body) {
 			body = await req.arrayBuffer();
 		}
+		// Strip any client-supplied value BEFORE stamping the real one (see PEER_IP_HEADER).
+		const headers = new Headers(req.headers);
+		headers.delete(PEER_IP_HEADER);
+		const peer = server.requestIP(req)?.address;
+		if (peer) headers.set(PEER_IP_HEADER, peer);
 		return nitroApp.localFetch(url.pathname + url.search, {
 			host: url.hostname,
 			protocol: url.protocol,
-			headers: req.headers,
+			headers,
 			method: req.method,
 			redirect: req.redirect,
 			body,

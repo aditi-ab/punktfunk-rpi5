@@ -8,9 +8,37 @@ import {
 	createHash,
 	timingSafeEqual as nodeTimingSafeEqual,
 } from "node:crypto";
-import type { SessionConfig } from "h3";
+import {
+	getRequestHeader,
+	getRequestIP,
+	type H3Event,
+	type SessionConfig,
+} from "h3";
 
 export const SESSION_NAME = "pf_session";
+
+/** Set by the Bun entry (nitro-entry/bun-https.mjs) to the real socket peer, after deleting any
+ * inbound copy. Keep the name in sync with that file. */
+const PEER_IP_HEADER = "x-pf-peer-ip";
+
+/**
+ * The requesting peer, as the key for every per-peer budget (currently the login throttle).
+ *
+ * `getRequestIP()` alone does NOT work under the deployed server: Nitro's `localFetch` builds a
+ * synthetic request whose socket carries no `remoteAddress`, so h3 finds nothing and every caller
+ * collapses onto one shared bucket — which turned the "per-IP" login throttle into a lockout any
+ * LAN peer could trigger for everyone. The Bun entry stamps the real peer into PEER_IP_HEADER
+ * (unforgeable: it deletes any client-supplied copy first), so prefer that.
+ *
+ * `getRequestIP` is kept as the fallback for any other ingress (a plain `node`/dev run), and
+ * "unknown" as the last resort — a SHARED bucket, deliberately: an unattributable request must
+ * still be rate-limited, and failing open would make brute force unbounded.
+ */
+export function peerAddress(event: H3Event): string {
+	const stamped = getRequestHeader(event, PEER_IP_HEADER)?.trim();
+	if (stamped) return stamped;
+	return getRequestIP(event) ?? "unknown";
+}
 
 /** The login password. Empty string ⇒ auth is MISCONFIGURED (the gate fails closed). */
 export function uiPassword(): string {
@@ -18,8 +46,9 @@ export function uiPassword(): string {
 }
 
 /** The management API the proxy forwards to (loopback by default — never LAN-exposed). It serves
- * HTTPS with the host's self-signed identity cert, so the deployment also sets
- * NODE_TLS_REJECT_UNAUTHORIZED=0 for the (loopback-only) proxy fetch — see .env.example. */
+ * HTTPS with the host's self-signed identity cert, so the proxy relaxes verification for that ONE
+ * loopback hop via Bun's per-request `tls` option (routes/api/[...].ts, util/forward.ts). There is
+ * deliberately no process-wide NODE_TLS_REJECT_UNAUTHORIZED — see .env.example. */
 export function mgmtUrl(): string {
 	return process.env.PUNKTFUNK_MGMT_URL ?? "https://127.0.0.1:47990";
 }
@@ -119,6 +148,34 @@ export function isPublicPath(pathname: string): boolean {
 	if (pathname.startsWith("/assets/")) return true;
 	if (pathname === "/favicon.ico" || pathname === "/robots.txt") return true;
 	return false;
+}
+
+/**
+ * Collapse a request path to the shape an upstream router will actually see: percent-decoded,
+ * with empty (`//`) and `.` segments dropped and `..` resolved. Used to test denylists against
+ * something an attacker cannot re-spell — `/api//v1/x`, `/api/./v1/x` and `/api/v1/%78` all reach
+ * the same handler, so matching only the literal path is not a security boundary.
+ *
+ * Decoding is per segment and failure-tolerant: a malformed escape keeps the raw segment rather
+ * than throwing, so a bad path degrades to "does not match the canonical form" instead of a 500.
+ */
+export function normalizePath(pathname: string): string {
+	const out: string[] = [];
+	for (const raw of pathname.split("/")) {
+		let seg = raw;
+		try {
+			seg = decodeURIComponent(raw);
+		} catch {
+			// Malformed escape — keep the raw segment.
+		}
+		if (seg === "" || seg === ".") continue;
+		if (seg === "..") {
+			out.pop();
+			continue;
+		}
+		out.push(seg);
+	}
+	return `/${out.join("/")}`;
 }
 
 /** Validate a post-login redirect target: a same-origin path only. Resolves `next` against a

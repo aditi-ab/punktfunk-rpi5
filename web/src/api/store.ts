@@ -123,14 +123,24 @@ export interface JobAccepted {
 	job: string;
 }
 
-/** Install a curated catalog entry, or — deliberately awkward — a raw package spec. */
+/**
+ * Install a curated catalog entry, or — deliberately awkward — a raw package spec.
+ *
+ * The raw-spec branch carries the console `password`: it runs unreviewed code, so the BFF
+ * re-confirms it (server/routes/api/v1/store/install.post.ts) and strips it before the host ever
+ * sees the request. A catalog install needs no password — that trust decision was made when the
+ * source was added.
+ */
 export type InstallBody =
 	| { source: string; id: string }
-	| { spec: string; accept_unverified: true };
+	| { spec: string; accept_unverified: true; password: string };
 
+/** Adding or repointing a source is a trust-root change, so it carries the console password too
+ * (stripped at the BFF — server/routes/api/v1/store/sources/[name].put.ts). */
 export interface SourceBody {
 	url: string;
 	public_key?: string;
+	password: string;
 }
 
 const BASE = "/api/v1/store";

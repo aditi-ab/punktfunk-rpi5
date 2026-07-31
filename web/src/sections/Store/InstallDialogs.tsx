@@ -1,6 +1,6 @@
 import { Checkbox } from "@unom/ui/form/checkbox";
 import { BadgeCheck, ShieldAlert, ShieldQuestion } from "lucide-react";
-import { type FC, useState } from "react";
+import { type FC, useEffect, useState } from "react";
 import type { StoreEntry } from "@/api/store";
 import { Button } from "@/components/ui/button";
 import {
@@ -95,31 +95,42 @@ export const InstallDialog: FC<{
 export const SpecInstallDialog: FC<{
 	open: boolean;
 	onCancel: () => void;
-	onConfirm: (spec: string) => void;
+	onConfirm: (spec: string, password: string) => void;
 	isPending: boolean;
-}> = ({ open, onCancel, onConfirm, isPending }) => {
+	/** Set when the BFF rejected the password (401), so the dialog can say so and stay open. */
+	wrongPassword?: boolean;
+}> = ({ open, onCancel, onConfirm, isPending, wrongPassword }) => {
 	const [spec, setSpec] = useState("");
 	const [echo, setEcho] = useState("");
 	const [accepted, setAccepted] = useState(false);
+	const [password, setPassword] = useState("");
 
-	// Both confirmations are cleared on every exit, cancel AND confirm alike: reopening this dialog
-	// must never find it pre-armed with the last spec and a ticked box.
-	const reset = () => {
+	// Every confirmation is cleared on exit, cancel AND confirm alike: reopening this dialog must
+	// never find it pre-armed with the last spec, a ticked box, or a typed password.
+	//
+	// Clearing hangs off `open` rather than off the two exit paths, because only one of them runs in
+	// this component: cancel goes through `onCancel`, but SUCCESS is the parent flipping `open`, and
+	// the dialog stays mounted either way. Setter identities are stable, so the effect needs no other
+	// dependency — a `reset()` helper in the list would be a new function every render.
+	useEffect(() => {
+		if (open) return;
 		setSpec("");
 		setEcho("");
 		setAccepted(false);
-	};
-	const close = () => {
-		reset();
-		onCancel();
-	};
+		setPassword("");
+	}, [open]);
 
 	const wanted = spec.trim();
-	// Both gates must pass: the retyped spec matches exactly, AND the box is ticked.
-	const ready = wanted.length > 0 && echo.trim() === wanted && accepted;
+	// Every gate must pass: the retyped spec matches exactly, the box is ticked, and the console
+	// password is re-entered (the BFF verifies it — a session cookie alone must not run new code).
+	const ready =
+		wanted.length > 0 &&
+		echo.trim() === wanted &&
+		accepted &&
+		password.length > 0;
 
 	return (
-		<Dialog open={open} onOpenChange={(next) => !next && close()}>
+		<Dialog open={open} onOpenChange={(next) => !next && onCancel()}>
 			<DialogContent className="max-w-xl">
 				<DialogHeader>
 					<DialogTitle className="flex items-center gap-2">
@@ -170,16 +181,36 @@ export const SpecInstallDialog: FC<{
 					<span>{m.store_spec_checkbox()}</span>
 				</Label>
 
+				<div className="space-y-2">
+					<Label htmlFor="store-spec-password">{m.store_spec_password()}</Label>
+					<Input
+						id="store-spec-password"
+						type="password"
+						autoComplete="current-password"
+						value={password}
+						onChange={(e) => setPassword(e.target.value)}
+					/>
+					<p className="text-xs text-muted-foreground">
+						{m.store_spec_password_help()}
+					</p>
+					{wrongPassword && (
+						<p role="alert" className="text-xs text-destructive">
+							{m.update_apply_wrong_password()}
+						</p>
+					)}
+				</div>
+
 				<DialogFooter>
-					<Button variant="outline" onClick={close} disabled={isPending}>
+					<Button variant="outline" onClick={onCancel} disabled={isPending}>
 						{m.common_cancel()}
 					</Button>
 					<Button
 						variant="destructive"
 						disabled={!ready || isPending}
 						onClick={() => {
-							reset();
-							onConfirm(wanted);
+							// Keep the dialog's state until the call settles: a rejected password must
+							// leave the operator's typed spec in place, not make them start over.
+							onConfirm(wanted, password);
 						}}
 					>
 						{m.store_spec_confirm()}

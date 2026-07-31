@@ -7,6 +7,7 @@ import {
 	getRequestHeader,
 	getRequestURL,
 	sendRedirect,
+	setResponseHeader,
 	setResponseStatus,
 	useSession,
 } from "h3";
@@ -19,6 +20,23 @@ import {
 
 export default defineEventHandler(async (event) => {
 	const { pathname } = getRequestURL(event);
+
+	// Baseline response headers for everything this server emits. Deliberately modest: a plugin's
+	// own UI is proxied onto THIS origin (/plugin-ui/**), so a script-src policy tight enough to be
+	// worth having would break third-party plugin pages we don't control. What is safe to assert
+	// unconditionally still closes the cheap holes:
+	//   nosniff        — a plugin serving text/plain that "looks like" HTML can't be sniffed into it
+	//   frame-ancestors— only our own pages may frame the console (the plugin iframes are same-origin)
+	//   object-src     — no Flash/applet embedding anywhere
+	//   base-uri       — a stray <base> can't repoint every relative URL on the page
+	//   Referrer-Policy— never leak a console path (which can carry ids) to an external homepage link
+	setResponseHeader(event, "X-Content-Type-Options", "nosniff");
+	setResponseHeader(event, "Referrer-Policy", "no-referrer");
+	setResponseHeader(
+		event,
+		"Content-Security-Policy",
+		"frame-ancestors 'self'; object-src 'none'; base-uri 'self'",
+	);
 
 	// Same-origin check for every MUTATING request (defense in depth beyond SameSite=Lax,
 	// added with the update-apply route where CSRF ≈ code execution — design

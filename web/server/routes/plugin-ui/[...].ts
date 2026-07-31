@@ -39,10 +39,12 @@ export default defineEventHandler(async (event) => {
 	delete headers.authorization;
 	headers["x-forwarded-prefix"] = prefix;
 	const method = event.method;
-	const body =
-		method === "GET" || method === "HEAD"
-			? undefined
-			: ((await readRawBody(event, false)) as Uint8Array | undefined);
+	// Only read a body for the methods that can carry one. `readRawBody` asserts a payload method,
+	// so calling it for OPTIONS (a plugin UI's CORS preflight, or any client probing Allow) threw
+	// 405 out of the CONSOLE before the plugin was ever dialed.
+	const body = BODY_METHODS.has(method)
+		? ((await readRawBody(event, false)) as Uint8Array | undefined)
+		: undefined;
 
 	// One proxied attempt; `null` means the plugin is unreachable (unregistered, or its port died).
 	const attempt = async (bustCache: boolean): Promise<Response | null> => {
@@ -74,5 +76,35 @@ export default defineEventHandler(async (event) => {
 		setResponseStatus(event, 502);
 		return { error: `plugin "${id}" is not running` };
 	}
-	return sendWebResponse(event, resp);
+	return sendWebResponse(event, sanitize(resp));
 });
+
+/** Methods that may carry a request body. Anything else (GET, HEAD, OPTIONS, TRACE) must not be
+ * handed to `readRawBody`. */
+const BODY_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
+
+/**
+ * Fix up a plugin's response before it goes out on the console's origin.
+ *
+ * - `content-encoding` / `content-length` / `transfer-encoding`: `fetch` already decoded the body,
+ *   but the plugin's original headers survive on the Response. Re-emitting `content-encoding: gzip`
+ *   over plaintext makes the browser fail to decode the page, and a stale `content-length` truncates
+ *   it. The framing belongs to OUR response, so drop the plugin's and let it be recomputed.
+ * - `set-cookie`: a plugin runs on the console's own origin, so any cookie it sets is scoped to the
+ *   console — it could collide with (or shadow) `pf_session`. A plugin UI has no business setting
+ *   cookies on this origin; it authenticates with the injected per-boot bearer.
+ */
+function sanitize(resp: Response): Response {
+	const headers = new Headers(resp.headers);
+	headers.delete("content-encoding");
+	headers.delete("content-length");
+	headers.delete("transfer-encoding");
+	headers.delete("set-cookie");
+	// 204/304 must not carry a body — passing one through throws in the Response constructor.
+	const bodyless = resp.status === 204 || resp.status === 304;
+	return new Response(bodyless ? null : resp.body, {
+		status: resp.status,
+		statusText: resp.statusText,
+		headers,
+	});
+}
