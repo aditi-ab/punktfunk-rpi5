@@ -215,7 +215,8 @@ private final class VsyncClock: @unchecked Sendable {
 ///   ~2–3 refreshes of queue (the measured 23–30 ms display stage on 120 Hz ProMotion panels), and
 ///   the full-queue regime is where host↔panel clock drift turns into periodic repeats/drops (the
 ///   "fixed-interval" jitter reports).
-/// - `glass` (stage-3, the tvOS default): at most a small BOUNDED number of presented-but-
+/// - `glass` (stage-3; tvOS's default until the 2026-07 rebuild moved it to stage-4, now an
+///   on-device A/B rung): at most a small BOUNDED number of presented-but-
 ///   undisplayed drawables in flight (`PresentGate`; depth 1 — see `SessionPresenter.gateDepth`
 ///   for why deeper is a regression). The render thread presents only while a gate slot is free
 ///   (a drawable's presented handler reopens its slot and re-signals); frames decoded meanwhile
@@ -293,6 +294,108 @@ private final class FrameRateHint: @unchecked Sendable {
     }
 }
 
+/// The client half of phase-locked capture (design/phase-locked-capture.md): the decode
+/// callback deposits per-AU arrival stamps (client CLOCK_REALTIME — the core's reassembly-
+/// completion time), the deadline link's thread deposits the latch grid, and ~1 Hz that same
+/// thread flushes the circular arrival-phase statistic to the host. The statistic is a
+/// verbatim port of `punktfunk_core::phase::circular_latch` — the host's v3 controller
+/// (grid-locked submits, coherence-gated engage) was tuned against exactly it, and a
+/// period-smeared Wi-Fi link correctly reads coherence ≈ 0 there, so the controller never
+/// engages where alignment is physically pointless. Shared box (never captures the pipeline);
+/// a session's connection binds/unbinds like DecodeReport/KeyframeRecovery.
+final class PhaseReporter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var connection: PunktfunkConnection?
+    /// Arrival stamps since the last flush, client CLOCK_REALTIME. Bounded: ~1 s at 240 fps.
+    private var arrivalsNs: [Int64] = []
+    /// Smallest update-to-update spacing this window: successive `nextLatch` values sit one
+    /// panel period apart except across skipped link updates (2×, 3×, …), so the window
+    /// minimum IS the period. Re-learned every flush so VRR/mode switches track both ways.
+    private var periodNs: Int64 = 0
+    private var prevLatchRealNs: Int64 = 0
+    private var lastFlushRealNs: Int64 = 0
+
+    func bind(_ c: PunktfunkConnection?) {
+        lock.lock()
+        connection = c
+        arrivalsNs.removeAll()
+        periodNs = 0
+        prevLatchRealNs = 0
+        lastFlushRealNs = 0
+        lock.unlock()
+    }
+
+    /// Decode-callback side: one AU's arrival (reassembly-completion) stamp.
+    func noteArrival(receivedNs: Int64) {
+        lock.lock()
+        if connection != nil, arrivalsNs.count < 256 { arrivalsNs.append(receivedNs) }
+        lock.unlock()
+    }
+
+    /// Link-thread side, once per update: where the NEXT latch sits on the client's realtime
+    /// clock (the arrival stamps' domain). Learns the period from update spacing and ~1 Hz
+    /// converts the window's arrivals into leads against this grid, then reports — a
+    /// fire-and-forget datagram push on the control plane.
+    func noteGrid(nextLatchRealNs: Int64) {
+        lock.lock()
+        if prevLatchRealNs > 0 {
+            let delta = nextLatchRealNs - prevLatchRealNs
+            // 2–100 ms accepts 10–500 Hz panels, rejects wakeup hiccups and clock jumps.
+            if delta > 2_000_000, delta < 100_000_000, periodNs == 0 || delta < periodNs {
+                periodNs = delta
+            }
+        }
+        prevLatchRealNs = nextLatchRealNs
+        guard let c = connection, periodNs > 0, arrivalsNs.count >= 8,
+            nextLatchRealNs - lastFlushRealNs >= 1_000_000_000
+        else {
+            lock.unlock()
+            return
+        }
+        lastFlushRealNs = nextLatchRealNs
+        let period = periodNs
+        let leadsUs = arrivalsNs.map { a -> UInt64 in
+            let m = (nextLatchRealNs - a) % period
+            return UInt64(m < 0 ? m + period : m) / 1000
+        }
+        arrivalsNs.removeAll(keepingCapacity: true)
+        periodNs = 0
+        let offsetNs = c.clockOffsetNs
+        lock.unlock()
+        guard
+            let (leadMeanNs, coherence) = Self.circularLatch(
+                samplesUs: leadsUs, periodNs: period)
+        else { return }
+        c.reportPhase(
+            nextLatchHostNs: UInt64(max(0, nextLatchRealNs + offsetNs)),
+            latchPeriodNs: UInt32(clamping: period),
+            uncertaintyNs: 1_000_000, // skew residual — same conservative 1 ms as Android
+            arrivalLeadNs: UInt32(clamping: leadMeanNs),
+            coherenceMilli: coherence)
+    }
+
+    /// Verbatim port of `punktfunk_core::phase::circular_latch` (µs samples against an ns
+    /// period; nil under 8 samples). The MEAN is what a phase controller can steer under
+    /// jitter — a period-spanning distribution's median is immovable — and the coherence
+    /// (resultant length, ‰) says whether any phase exists to steer at all.
+    static func circularLatch(samplesUs: [UInt64], periodNs: Int64) -> (UInt64, UInt16)? {
+        guard samplesUs.count >= 8, periodNs > 0 else { return nil }
+        let periodUs = Double(periodNs) / 1000.0
+        var x = 0.0
+        var y = 0.0
+        for s in samplesUs {
+            let theta = Double(s).truncatingRemainder(dividingBy: periodUs) / periodUs * 2 * .pi
+            x += cos(theta)
+            y += sin(theta)
+        }
+        let n = Double(samplesUs.count)
+        let r = (x * x + y * y).squareRoot() / n
+        var meanTheta = atan2(y, x)
+        if meanTheta < 0 { meanTheta += 2 * .pi }
+        return (UInt64(meanTheta / (2 * .pi) * Double(periodNs)), UInt16(r * 1000.0))
+    }
+}
+
 /// The CAMetalDisplayLink delegate for deadline pacing: each per-refresh update stashes its
 /// vended drawable (newest wins) and nudges the render thread — which also wakes on decoder
 /// arrivals, so whichever half completes the (frame, drawable) pair triggers the present. Also
@@ -304,6 +407,8 @@ private final class DeadlineLinkDelegate: NSObject, CAMetalDisplayLinkDelegate {
     private let renderSignal: DispatchSemaphore
     private let hint: FrameRateHint
     private let stats: PresentDebugStats?
+    /// Phase-locked capture's grid feed — this link IS the latch grid presents pace against.
+    private let phase: PhaseReporter?
     /// The OS-floor sampler (design/apple-presentation-rebuild.md): every update's vend→glass
     /// lead is recorded so its p50 becomes the "OS present floor" the HUD subtracts from the
     /// shown display/e2e numbers. Self-adapting — reads ~2 refresh periods composited today,
@@ -316,13 +421,15 @@ private final class DeadlineLinkDelegate: NSObject, CAMetalDisplayLinkDelegate {
 
     init(
         stash: LatestBox<CAMetalDrawable>, renderSignal: DispatchSemaphore,
-        hint: FrameRateHint, stats: PresentDebugStats?, floorMeter: LatencyMeter?
+        hint: FrameRateHint, stats: PresentDebugStats?, floorMeter: LatencyMeter?,
+        phase: PhaseReporter?
     ) {
         self.stash = stash
         self.renderSignal = renderSignal
         self.hint = hint
         self.stats = stats
         self.floorMeter = floorMeter
+        self.phase = phase
     }
 
     func metalDisplayLink(_ link: CAMetalDisplayLink, needsUpdate update: CAMetalDisplayLink.Update) {
@@ -353,6 +460,15 @@ private final class DeadlineLinkDelegate: NSObject, CAMetalDisplayLinkDelegate {
             let nowNs = Int64(ts.tv_sec) * 1_000_000_000 + Int64(ts.tv_nsec)
             floorMeter.record(
                 ptsNs: UInt64(nowNs - Int64(leadS * 1_000_000_000)), atNs: nowNs, offsetNs: 0)
+        }
+        // Phase-locked capture: this update's target present, converted into the arrival
+        // stamps' CLOCK_REALTIME domain. Per-update cost is one clock read; the reporter
+        // itself flushes ~1 Hz.
+        if let phase {
+            var ts = timespec()
+            clock_gettime(CLOCK_REALTIME, &ts)
+            let nowNs = Int64(ts.tv_sec) * 1_000_000_000 + Int64(ts.tv_nsec)
+            phase.noteGrid(nextLatchRealNs: nowNs + Int64(leadS * 1_000_000_000))
         }
         stash.put(update.drawable)
         renderSignal.signal()
@@ -583,6 +699,7 @@ public final class Stage2Pipeline {
     /// Feeds the core Automatic-bitrate controller's decode signal from the decode callback; `start`
     /// binds the live connection + arming flag (see DecodeReport).
     private let decodeReport = DecodeReport()
+    private let phaseReporter = PhaseReporter()
     /// Post-loss freeze-until-reanchor gate (shared core policy via the C ABI). Created here seeded 0;
     /// `start` reseeds it to the live connection's drop count. Captured by the decoder callbacks
     /// (which withhold concealed frames) and driven by the pump (arm on a gap, poll per iteration).
@@ -649,6 +766,7 @@ public final class Stage2Pipeline {
         let renderSignal = renderSignal
         let gate = gate
         let decodeReport = decodeReport
+        let phaseReporter = phaseReporter
         self.decoder = VideoDecoder(
             onDecoded: { frame in
                 // Decode stage = received→decoded, both client CLOCK_REALTIME (offset 0 — no
@@ -660,6 +778,9 @@ public final class Stage2Pipeline {
                 // device's real decode limit instead of the network link ceiling. Every decoded
                 // frame (not just presented ones), so a newest-wins drop can't hide the backlog.
                 decodeReport.record(receivedNs: frame.receivedNs, decodedNs: frame.decodedNs)
+                // Phase-locked capture's arrival half: the stamp VALUE is reassembly
+                // completion, so recording it at decode adds no bias to the 1 Hz aggregate.
+                phaseReporter.noteArrival(receivedNs: frame.receivedNs)
                 // Freeze-until-reanchor: WITHHOLD a decoder-concealed post-loss frame (the gray/
                 // garbage VideoToolbox returns Ok for a reference-missing delta) — don't submit it,
                 // so the CAMetalLayer keeps its last good drawable on glass. The gate lifts (returns
@@ -689,6 +810,7 @@ public final class Stage2Pipeline {
         offsetNs = connection.clockOffsetNs
         recovery.bind(connection) // arm host-keyframe recovery for this session
         decodeReport.bind(connection) // arm the Automatic-bitrate decode signal for this session
+        phaseReporter.bind(connection) // arm phase reports (flushed only by the deadline link)
         gate.reseed(framesDropped: connection.framesDropped()) // baseline the freeze to this session
         token = StopFlag() // fresh token per start — a stop is permanent (like StreamPump)
 
@@ -975,6 +1097,7 @@ public final class Stage2Pipeline {
         let stash = LatestBox<CAMetalDrawable>()
 
         let floorMeter = presentFloorMeter
+        let phaseReporter = phaseReporter
         // The link starts LAZILY — the render thread triggers this after the FIRST decoded
         // frame's reconcileLayer. Started eagerly it vends into the layer's initial 0×0
         // drawableSize for the whole connect window: every vend fails allocation and the system
@@ -985,7 +1108,7 @@ public final class Stage2Pipeline {
             let linkThread = Thread {
                 let delegate = DeadlineLinkDelegate(
                     stash: stash, renderSignal: renderSignal, hint: hint, stats: debugStats,
-                    floorMeter: floorMeter)
+                    floorMeter: floorMeter, phase: phaseReporter)
                 let link = CAMetalDisplayLink(metalLayer: layer)
                 link.preferredFrameLatency = 1 // wake as late as fits: latch the NEXT refresh
                 if let range = hint.drain() { link.preferredFrameRateRange = range }
@@ -1154,6 +1277,7 @@ public final class Stage2Pipeline {
         }
         decoder.reset()
         recovery.bind(nil) // stop requesting keyframes once the session is torn down
+        phaseReporter.bind(nil) // and stop phase reports toward the dead connection
     }
 
     deinit {

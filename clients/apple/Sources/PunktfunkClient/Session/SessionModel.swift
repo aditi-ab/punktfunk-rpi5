@@ -338,7 +338,10 @@ final class SessionModel: ObservableObject {
             let clientCaps: UInt8 =
                 (MouseInputMode(rawValue: effective.mouseMode) ?? .capture) == .desktop ? 0x01 : 0
             #else
-            let clientCaps: UInt8 = 0
+            // iOS/tvOS run the stage-4 deadline presenter, whose link thread feeds
+            // reportPhase — advertise the vsync-aware presenter (0x02, CLIENT_CAP_PHASE_LOCK).
+            // macOS stays without it: the stage-2 arrival presenter has no latch grid.
+            let clientCaps: UInt8 = 0x02
             #endif
             let result = Result { try PunktfunkConnection(
                 host: host.address, port: host.port,

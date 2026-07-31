@@ -761,6 +761,21 @@ public final class PunktfunkConnection {
         return out
     }
 
+    /// Report the display-latch grid + circular arrival-phase statistic so the host can
+    /// phase-lock its capture tick (design/phase-locked-capture.md). Fire-and-forget; call
+    /// ~1 Hz from a vsync-aware presenter. `nextLatchHostNs` must already be HOST clock —
+    /// convert with `clockOffsetNs` (host − client). No-op toward a host that never armed.
+    public func reportPhase(
+        nextLatchHostNs: UInt64, latchPeriodNs: UInt32, uncertaintyNs: UInt32,
+        arrivalLeadNs: UInt32, coherenceMilli: UInt16
+    ) {
+        abiLock.lock()
+        defer { abiLock.unlock() }
+        guard let h = handle, !closeRequested else { return }
+        _ = punktfunk_connection_report_phase(
+            h, nextLatchHostNs, latchPeriodNs, uncertaintyNs, arrivalLeadNs, coherenceMilli)
+    }
+
     /// The currently active session mode (updated by accepted `requestMode` switches).
     public func currentMode() -> (width: UInt32, height: UInt32, refreshHz: UInt32) {
         abiLock.lock()

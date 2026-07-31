@@ -1762,6 +1762,12 @@ pub unsafe extern "C" fn punktfunk_connect_ex9(
 /// channel, `design/remote-desktop-sweep.md` M2).
 pub const PUNKTFUNK_CLIENT_CAP_CURSOR: u8 = 0x01;
 
+/// [`punktfunk_connect_ex9`] `client_caps` bit: this client's presenter is vsync-aware and
+/// feeds [`punktfunk_connection_report_phase`] (design/phase-locked-capture.md). Advisory in
+/// v1 — the host arms on report receipt — but honest advertisement keeps the negotiation
+/// forward-compatible.
+pub const PUNKTFUNK_CLIENT_CAP_PHASE_LOCK: u8 = 0x02;
+
 /// Shared body of [`punktfunk_connect_ex7`] / [`punktfunk_connect_ex8`]: `status_out`
 /// (nullable) is written on EVERY path — `Ok`, the mapped [`PunktfunkError`],
 /// `InvalidArg` for bad arguments, `Panic` if the connect panicked.

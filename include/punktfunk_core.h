@@ -264,6 +264,12 @@
 // channel, `design/remote-desktop-sweep.md` M2).
 #define PUNKTFUNK_CLIENT_CAP_CURSOR 1
 
+// [`punktfunk_connect_ex9`] `client_caps` bit: this client's presenter is vsync-aware and
+// feeds [`punktfunk_connection_report_phase`] (design/phase-locked-capture.md). Advisory in
+// v1 — the host arms on report receipt — but honest advertisement keeps the negotiation
+// forward-compatible.
+#define PUNKTFUNK_CLIENT_CAP_PHASE_LOCK 2
+
 // `*ttl_ms` sentinel written by [`punktfunk_connection_next_rumble2`] for a legacy (v1) rumble
 // datagram — an old host that sent no self-termination lease. The client then falls back to its
 // own staleness heuristic for that update instead of a host-supplied deadline.
