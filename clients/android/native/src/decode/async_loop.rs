@@ -269,6 +269,8 @@ pub(super) fn run_async(
 
     let mut free_inputs: VecDeque<usize> = VecDeque::new();
     let mut pending_aus: VecDeque<Frame> = VecDeque::new();
+    // Phase-lock v3: per-AU arrival stamps for the circular arrival-lead report (drained 1 Hz).
+    let mut arrival_stamps: Vec<i128> = Vec::new();
     let mut ready: Vec<OutputReady> = Vec::new();
     let mut applied_ds: Option<DataSpace> = None;
     let mut fed: u64 = 0;
@@ -321,6 +323,7 @@ pub(super) fn run_async(
                 &mut fatal,
                 &mut gate,
                 &mut recovery_flags,
+                &mut arrival_stamps,
             ));
         }
         // Coalesce every other event already queued into this one work pass — correct newest-only
@@ -336,6 +339,7 @@ pub(super) fn run_async(
                 &mut fatal,
                 &mut gate,
                 &mut recovery_flags,
+                &mut arrival_stamps,
             ));
         }
         if vsync_tick {
@@ -380,28 +384,50 @@ pub(super) fn run_async(
             if p.pump(&codec, clock, &tracker, &stats, now_monotonic_ns()) {
                 rendered += 1;
             }
-            // The 1 Hz window flush doubles as the phase-lock report tick: the CIRCULAR
-            // (vector-mean) latch phase + coherence are the host capture controller's v2 error
-            // signal (design/phase-locked-capture.md §6; a median is immovable under jitter).
-            // Timestamps convert monotonic→realtime→host — the skew offset lives client-side.
-            if let (Some((circ_latch_ns, coherence)), Some(c)) = (p.flush_log(&meter, clock), clock)
-            {
+            // The 1 Hz window flush doubles as the phase-lock report tick. v3 sensor: the
+            // CIRCULAR mean + coherence of the ARRIVAL lead — each AU's reassembly stamp
+            // against the panel's latch grid — because arrival is the phase the host actually
+            // controls; the v2 latch statistic measured downstream of the decoder pipeline,
+            // which absorbed the actuation (on-glass 2026-07-31). Timestamps convert
+            // monotonic→realtime→host — the skew offset lives client-side.
+            if let (Some(_), Some(c)) = (p.flush_log(&meter, clock), clock) {
                 let period = c.panel_period_ns().max(c.period_ns());
                 if period > 0 {
                     if let Some(t) = c.next_target(now_monotonic_ns(), 0) {
                         let mono_now = now_monotonic_ns();
                         let real_now = now_realtime_ns();
-                        let latch_real_ns = real_now + (t.expected_present_ns - mono_now) as i128;
-                        let latch_host_ns = (latch_real_ns
-                            + clock_offset.load(Ordering::Relaxed) as i128)
-                            .max(0) as u64;
-                        client.report_phase(
-                            latch_host_ns,
-                            period.clamp(0, u32::MAX as i64) as u32,
-                            1_000_000, // skew residual + latch jitter — conservative 1 ms
-                            circ_latch_ns.min(u32::MAX as u64) as u32,
-                            coherence,
-                        );
+                        let leads_us: Vec<u64> = arrival_stamps
+                            .iter()
+                            .map(|&r_ns| {
+                                let arrival_mono = mono_now as i128 - (real_now - r_ns);
+                                ((t.expected_present_ns as i128 - arrival_mono)
+                                    .rem_euclid(period as i128)
+                                    / 1000) as u64
+                            })
+                            .collect();
+                        arrival_stamps.clear();
+                        if let Some((lead_mean_ns, coherence)) =
+                            punktfunk_core::phase::circular_latch(&leads_us, period)
+                        {
+                            log::info!(
+                                target: "pf.phase",
+                                "arrival lead circ={:.2}ms coh={}",
+                                lead_mean_ns as f64 / 1e6,
+                                coherence
+                            );
+                            let latch_real_ns =
+                                real_now + (t.expected_present_ns - mono_now) as i128;
+                            let latch_host_ns = (latch_real_ns
+                                + clock_offset.load(Ordering::Relaxed) as i128)
+                                .max(0) as u64;
+                            client.report_phase(
+                                latch_host_ns,
+                                period.clamp(0, u32::MAX as i64) as u32,
+                                1_000_000, // skew residual — conservative 1 ms
+                                lead_mean_ns.min(u32::MAX as u64) as u32,
+                                coherence,
+                            );
+                        }
                     }
                 }
             }
@@ -634,6 +660,7 @@ fn dispatch_event(
     fatal: &mut bool,
     gate: &mut ReanchorGate,
     recovery_flags: &mut VecDeque<(u64, u32)>,
+    arrival_stamps: &mut Vec<i128>,
 ) -> bool {
     match ev {
         DecodeEvent::Au(f, gap) => {
@@ -645,6 +672,17 @@ fn dispatch_event(
             recovery_flags.push_back((f.pts_ns / 1000, f.flags));
             if recovery_flags.len() > IN_FLIGHT_CAP {
                 recovery_flags.pop_front();
+            }
+            // Phase-lock v3 sensor: the ARRIVAL stamp (reassembly completion, realtime) — the
+            // phase the host actually controls. The latch-based v2 sensor measured downstream
+            // of the decoder pipeline, which absorbed the host's actuation (on-glass 07-31).
+            arrival_stamps.push(if f.received_ns > 0 {
+                f.received_ns as i128
+            } else {
+                now_realtime_ns()
+            });
+            if arrival_stamps.len() > 256 {
+                arrival_stamps.remove(0);
             }
             pending_aus.push_back(f);
             if pending_aus.len() > FRAME_PARK_CAP {

@@ -253,80 +253,111 @@ impl PhaseCtl {
     }
 }
 
-/// The encode loop's phase controller state (design/phase-locked-capture.md §3, controller
-/// v2): a per-frame HOLD before submit, driven by the client's CIRCULAR arrival-phase report.
-/// Plain data — lives as a loop local so it survives every in-loop rebuild path; a new session
-/// (new loop call) starts unlocked, which is correct (new client, new grid).
+/// The encode loop's phase controller (design/phase-locked-capture.md §3, controller v3):
+/// submits lock to an ABSOLUTE grid the host owns — `epoch + k×period + offset` — and the
+/// controller walks only the grid OFFSET. Plain data — a loop local, so it survives every
+/// in-loop rebuild path; a new session starts disengaged.
 ///
-/// v2 lessons (both measured on-glass 2026-07-31, NP3 ↔ .173):
-///  * A median lead is a DEAD signal under period-spanning jitter (the distribution is ~uniform
-///    mod the refresh; shifting its mean can't move its median) — v1 orbited the period at
-///    2 ms/s forever, and every wrap coalesced ~30 frames at the client.
-///  * A HELD hold is not free: it delays sampling AFTER the capture stamp, so an orbiting or
-///    parked hold taxes e2e by up to a period (user-visible: ~+4 ms average during the orbit).
-///    The failure response is therefore DECAY TO ZERO — the pre-phase-lock behavior — never
-///    freeze-in-place.
+/// Why a grid and not a hold (v2's on-glass lesson, 2026-07-31 midday): a per-frame ADDITIVE
+/// hold on an arrival-slaved loop saturates once `hold + work ≥ interval` — submits then
+/// self-pace at `hold + work` free-running against every grid, and the commanded phase shift
+/// dissolves instead of arriving at the client (measured: ±2 ms hold steps, zero response in
+/// the client's phase). A periodic grid cannot free-run: occupancy is exactly one frame per
+/// period whatever the offset, so the phase actuation is linear by construction. Disengaged =
+/// no grid sleeps at all — zero added latency, the pre-phase-lock loop.
 ///
-/// The v2 signal is the circular (vector-mean) lead + coherence; stepping happens only while
-/// the phase is coherent, along the signed SHORTEST way around the period, under a cumulative
-/// travel budget that catches any residual chase the statistics miss.
+/// Inherited v1/v2 lessons: the median was a dead statistic (v2 moved to circular+coherence);
+/// a parked actuation is an e2e tax (failure response = DISENGAGE, never park); the travel
+/// budget catches any residual chase the statistics miss. New in v3: ANTIPODE DAMPING — an
+/// error within 1 ms of ±period/2 flips sign on sampling noise (measured as 0↔2↔4 ms offset
+/// chatter), so near-antipode steps are halved until the error commits to a side.
 struct PhaseController {
-    /// Applied per-frame hold before submit, ns ∈ [0, period).
-    hold_ns: i64,
+    /// Grid offset, ns ∈ [0, period). Meaningful only while engaged.
+    offset_ns: i64,
+    /// The grid's epoch; `None` = disengaged (no submit-grid sleeps, zero cost).
+    epoch: Option<std::time::Instant>,
     /// Last adjust instant (~1 Hz cadence).
     last_adjust: std::time::Instant,
-    /// |step| integrated since the last convergence/decay — the chase detector. Any true lock
-    /// needs at most ~one period of travel, so exceeding the budget proves the error is not
-    /// converging regardless of what the (noisy) reports claim.
+    /// |step| integrated since engage/lock — the chase detector.
     cum_travel_ns: i64,
-    /// The travel budget tripped — decay the hold to zero, then re-arm.
-    decaying: bool,
+    /// Consecutive incoherent reports; 3 disengage.
+    incoherent_streak: u32,
+    /// Adjust ticks to sit out after a disengage before re-engaging.
+    reengage_backoff: u32,
 }
 
 impl PhaseController {
     /// Per-adjustment walk bound: 2 ms per second of reports keeps the wire cadence visually
     /// undisturbed while converging a worst-case half-period error in ~2-3 s.
     const MAX_STEP_NS: i64 = 2_000_000;
-    /// Ignore errors under this — a locked loop does nothing (jitter would otherwise dither the
-    /// hold every second).
+    /// Ignore errors under this — a locked loop does nothing.
     const DEADBAND_NS: i64 = 300_000;
     /// The lead floor the controller drives toward: SurfaceFlinger-class compositors need the
     /// frame in the queue ~2.5 ms before latch; the client's own `uncertainty_ns` widens this.
     const TARGET_LEAD_FLOOR_NS: i64 = 2_500_000;
     /// Below this circular coherence (‰) the arrival phase is smeared over the period and
-    /// alignment is physically pointless — decay instead of stepping. `u16::MAX` (a v1 report,
-    /// median semantics) bypasses the gate and relies on the travel budget alone.
+    /// alignment is physically pointless. `u16::MAX` (a v1 report) bypasses the gate and
+    /// relies on the travel budget alone.
     const COHERENCE_FLOOR_MILLI: u16 = 300;
+    /// Errors within this of ±period/2 sit at the antipode discontinuity, where sampling noise
+    /// flips the sign — damp the step until the error commits to a side.
+    const ANTIPODE_GUARD_NS: i64 = 1_000_000;
+    /// Adjust ticks sat out after a disengage (travel exhaustion) before trying again.
+    const REENGAGE_BACKOFF: u32 = 10;
 
     fn new() -> PhaseController {
         PhaseController {
-            hold_ns: 0,
+            offset_ns: 0,
+            epoch: None,
             last_adjust: std::time::Instant::now(),
             cum_travel_ns: 0,
-            decaying: false,
+            incoherent_streak: 0,
+            reengage_backoff: 0,
         }
     }
 
-    /// Fold the client's latest report into the hold. `period_ns` is the wire interval (the
-    /// session's frame period). Sign convention: a positive (shortest-way) error means frames
-    /// arrive too early and wait at the client — send LATER (grow the hold); negative — send
-    /// EARLIER. `rem_euclid` wraps the hold through the period; the newest-wins capture slot
-    /// makes a wrapped hold sample a fresher frame, not a staler one.
+    fn engaged(&self) -> bool {
+        self.epoch.is_some()
+    }
+
+    fn disengage(&mut self, reason: &'static str, backoff: u32) {
+        if self.engaged() {
+            tracing::info!(
+                offset_ms = self.offset_ns as f64 / 1e6,
+                reason,
+                "phase lock: disengaging the submit grid"
+            );
+        }
+        self.epoch = None;
+        self.offset_ns = 0;
+        self.cum_travel_ns = 0;
+        self.reengage_backoff = backoff;
+    }
+
+    /// Fold the client's latest report into the grid offset. `period_ns` is the wire interval.
+    /// Sign convention: a positive (shortest-way) error means frames arrive too early and wait
+    /// at the client — submit LATER (grow the offset); negative — earlier.
     fn adjust(&mut self, r: &punktfunk_core::quic::PhaseReport, period_ns: i64) {
         if period_ns <= 0 {
             return;
         }
         self.last_adjust = std::time::Instant::now();
-        // Incoherent phase, or a tripped travel budget: the hold is a pure e2e tax buying no
-        // alignment — walk it back to zero and wait for the regime to tighten.
-        let coherent =
-            r.coherence_milli == u16::MAX || r.coherence_milli >= Self::COHERENCE_FLOOR_MILLI;
-        if !coherent || self.decaying {
-            self.decay();
+        if self.reengage_backoff > 0 {
+            self.reengage_backoff -= 1;
             return;
         }
+        let coherent =
+            r.coherence_milli == u16::MAX || r.coherence_milli >= Self::COHERENCE_FLOOR_MILLI;
+        if !coherent {
+            self.incoherent_streak += 1;
+            if self.incoherent_streak >= 3 {
+                self.disengage("incoherent arrival phase", 0);
+            }
+            return;
+        }
+        self.incoherent_streak = 0;
         let target = Self::TARGET_LEAD_FLOOR_NS.max(r.uncertainty_ns as i64 + 1_000_000);
-        // Signed SHORTEST-WAY error around the period — the controller never walks the long way.
+        // Signed SHORTEST-WAY error around the period.
         let raw = (r.arrival_lead_ns as i64 - target).rem_euclid(period_ns);
         let error = if raw > period_ns / 2 {
             raw - period_ns
@@ -337,26 +368,53 @@ impl PhaseController {
             self.cum_travel_ns = 0; // locked — the budget re-arms for the next disturbance
             return;
         }
-        let step = error.clamp(-Self::MAX_STEP_NS, Self::MAX_STEP_NS);
-        self.hold_ns = (self.hold_ns + step).rem_euclid(period_ns);
+        if !self.engaged() {
+            self.epoch = Some(std::time::Instant::now());
+            tracing::info!("phase lock: engaging the submit grid");
+        }
+        let mut step = error.clamp(-Self::MAX_STEP_NS, Self::MAX_STEP_NS);
+        // Antipode damping: this error sits where its sign is a coin flip — half steps until
+        // it commits to a side.
+        if error.abs() > period_ns / 2 - Self::ANTIPODE_GUARD_NS {
+            step /= 2;
+        }
+        self.offset_ns = (self.offset_ns + step).rem_euclid(period_ns);
         self.cum_travel_ns += step.abs();
         if self.cum_travel_ns > period_ns + period_ns / 4 {
-            tracing::info!(
-                hold_ms = self.hold_ns as f64 / 1e6,
-                "phase lock: travel budget exhausted without convergence — decaying the hold"
-            );
-            self.decaying = true;
+            tracing::info!("phase lock: travel budget exhausted without convergence — disengaging");
+            self.disengage("travel budget", Self::REENGAGE_BACKOFF);
         }
     }
 
-    /// One decay tick: walk the hold toward zero; once there, re-arm the travel budget so a
-    /// later coherent regime can lock again.
-    fn decay(&mut self) {
-        if self.hold_ns > 0 {
-            self.hold_ns = (self.hold_ns - Self::MAX_STEP_NS).max(0);
+    /// The next submit-grid instant at or after `now` — the loop sleeps until it before
+    /// submitting a fresh frame (newest-wins keeps the content fresh across the wait).
+    /// `None` while disengaged: no sleep, no cost.
+    fn next_submit_target(
+        &self,
+        now: std::time::Instant,
+        period_ns: i64,
+    ) -> Option<std::time::Instant> {
+        let epoch = self.epoch?;
+        if period_ns <= 0 {
+            return None;
+        }
+        let elapsed = now.duration_since(epoch).as_nanos() as i64;
+        let k = (elapsed - self.offset_ns).div_euclid(period_ns) + 1;
+        let target_ns = k * period_ns + self.offset_ns;
+        // Guard: never schedule more than one period out (clock skew paranoia).
+        let target = epoch + std::time::Duration::from_nanos(target_ns.max(0) as u64);
+        if target.duration_since(now).as_nanos() as i64 > period_ns {
+            return Some(now);
+        }
+        Some(target)
+    }
+
+    /// ACK readout: the engaged grid offset (0 while disengaged).
+    fn applied_readout(&self) -> i64 {
+        if self.engaged() {
+            self.offset_ns
         } else {
-            self.decaying = false;
-            self.cum_travel_ns = 0;
+            0
         }
     }
 
@@ -2453,12 +2511,18 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                         } else {
                             phase_ctl.last_adjust = std::time::Instant::now();
                         }
-                        phase.set_applied(phase_ctl.hold_ns);
+                        phase.set_applied(phase_ctl.applied_readout());
                     }
-                    if phase_ctl.hold_ns > 0 {
-                        std::thread::sleep(std::time::Duration::from_nanos(
-                            phase_ctl.hold_ns as u64,
-                        ));
+                    // v3 grid actuation: sleep to the next submit-grid instant (an absolute
+                    // grid — a per-frame additive hold free-runs once it saturates the loop and
+                    // the phase dissolves; a periodic grid cannot). Disengaged = no sleep.
+                    if let Some(t) = phase_ctl
+                        .next_submit_target(std::time::Instant::now(), interval.as_nanos() as i64)
+                    {
+                        let now = std::time::Instant::now();
+                        if t > now {
+                            std::thread::sleep(t.duration_since(now));
+                        }
                     }
                 }
                 capture_rebuilds = 0; // a delivered frame clears the consecutive-loss counter
@@ -4281,17 +4345,22 @@ mod tests {
         assert!(!is_permanent_build_error("open NVENC: device busy"));
     }
 
-    // ---- Phase-controller closed-loop simulation (design/phase-locked-capture.md §3, v2) ----
+    // ---- Phase-controller closed-loop simulation (design/phase-locked-capture.md §3, v3) ----
     //
-    // The plant models what the on-glass loop actually is: the client's per-frame latch is
-    // `(base_latch − hold + noise) mod P` — a bigger host hold makes frames arrive later, so
-    // the wait-for-latch SHRINKS — and each 1 Hz report carries the CIRCULAR statistics of a
-    // window of those samples, generated through the exact shared `punktfunk_core::phase`
-    // code the real clients use. Both v1 failure modes live here as regression tests: the
-    // 2026-07-31 orbit (a dead statistic chased forever) and the parked-hold e2e tax.
+    // Plants model what glass falsified, not what a controller would like:
+    //  * GRID plant — v3's actuator: measured lead responds linearly to the grid offset
+    //    (lead = (base − offset) mod P). Linear BY CONSTRUCTION of the absolute grid.
+    //  * DECOUPLED plant — v2's on-glass failure: the measured lead ignores the actuation
+    //    entirely (a saturated additive hold / a decoder pipeline re-anchoring the phase).
+    //    The controller must give up (disengage), never orbit or chatter.
+    // Reports are generated through the SHARED punktfunk_core::phase statistic.
 
     const SIM_P: i64 = 8_333_333; // 120 Hz
-    const SIM_TARGET: i64 = 3_500_000; // TARGET_LEAD_FLOOR ∨ (uncertainty 1ms + 1ms) → 3.5 ms
+    /// The controller's ACTUAL target with the reports' 1 ms uncertainty:
+    /// `max(TARGET_LEAD_FLOOR = 2.5 ms, uncertainty + 1 ms = 2 ms)` — the floor dominates.
+    /// (The first harness draft claimed 3.5 ms from a mis-derived max; the controller locked
+    /// at 2.5 exactly as coded and the assertions measured it against the wrong number.)
+    const SIM_TARGET: i64 = 2_500_000;
 
     /// Deterministic LCG in ±spread_ns around zero (no OS randomness in tests).
     struct Lcg(u64);
@@ -4308,19 +4377,17 @@ mod tests {
         }
     }
 
-    /// One simulated 1 Hz report: 120 latch samples from the plant, folded through the SHARED
-    /// circular statistic — the same bytes-in-bytes-out path the Android reporter takes.
-    fn plant_report(
-        base_latch_ns: i64,
-        hold_ns: i64,
+    /// One simulated 1 Hz report: 120 lead samples folded through the SHARED circular
+    /// statistic — the identical path the Android reporter ships.
+    fn report_from_lead(
+        base_lead_ns: i64,
         noise_spread_ns: i64,
         rng: &mut Lcg,
     ) -> punktfunk_core::quic::PhaseReport {
         let samples_us: Vec<u64> = (0..120)
             .map(|_| {
-                let latch =
-                    (base_latch_ns - hold_ns + rng.next_noise(noise_spread_ns)).rem_euclid(SIM_P);
-                (latch / 1000) as u64
+                let lead = (base_lead_ns + rng.next_noise(noise_spread_ns)).rem_euclid(SIM_P);
+                (lead / 1000) as u64
             })
             .collect();
         let (mean_ns, coherence) =
@@ -4334,122 +4401,153 @@ mod tests {
         }
     }
 
-    /// The steady-state latch the controller produced: one noise-free plant readout.
-    fn settled_latch(base_latch_ns: i64, hold_ns: i64) -> i64 {
-        (base_latch_ns - hold_ns).rem_euclid(SIM_P)
+    /// GRID plant readout: the lead the client would measure given the engaged offset.
+    fn grid_lead(base_lead_ns: i64, c: &PhaseController) -> i64 {
+        (base_lead_ns - c.applied_readout()).rem_euclid(SIM_P)
     }
 
     #[test]
-    fn tight_jitter_locks_into_the_deadband_and_stays() {
+    fn grid_plant_tight_jitter_locks_and_stays() {
         let mut c = PhaseController::new();
         let mut rng = Lcg(7);
         for _ in 0..12 {
-            let r = plant_report(7_500_000, c.hold_ns, 500_000, &mut rng);
+            let r = report_from_lead(grid_lead(7_500_000, &c), 500_000, &mut rng);
             c.adjust(&r, SIM_P);
         }
-        let err = settled_latch(7_500_000, c.hold_ns) - SIM_TARGET;
+        let err = grid_lead(7_500_000, &c) - SIM_TARGET;
+        assert!(c.engaged(), "a coherent linear plant must engage");
         assert!(
             err.abs() < 1_000_000,
             "tight jitter must converge near the target lead, residual {err} ns"
         );
-        assert!(!c.decaying, "a converged lock never decays");
-        // Locked: further reports keep it in the deadband without dithering away.
-        let before = c.hold_ns;
+        let before = c.offset_ns;
         for _ in 0..10 {
-            let r = plant_report(7_500_000, c.hold_ns, 500_000, &mut rng);
+            let r = report_from_lead(grid_lead(7_500_000, &c), 500_000, &mut rng);
             c.adjust(&r, SIM_P);
         }
         assert!(
-            (c.hold_ns - before).abs() <= 2 * PhaseController::MAX_STEP_NS,
+            (c.offset_ns - before).abs() <= 2 * PhaseController::MAX_STEP_NS,
             "a locked loop must not wander"
         );
     }
 
     #[test]
-    fn wrap_side_error_takes_the_shortest_way() {
-        // base 1.0 ms < target 3.5 ms: the SHORT way is −2.5 ms (through the wrap), the long
-        // way is +5.8. v1 walked long ways; v2 must spend well under a period of travel.
+    fn grid_plant_antipode_start_converges_without_chatter() {
+        // base lead ≈ target + P/2: the initial error sits AT the antipode where its sign is a
+        // coin flip — the exact 0↔2↔4 ms offset chatter measured on-glass 2026-07-31 midday.
+        // Damped half-steps must carry it through; convergence within a bounded travel proves
+        // no sign-flip oscillation.
         let mut c = PhaseController::new();
         let mut rng = Lcg(11);
-        for _ in 0..12 {
-            let r = plant_report(1_000_000, c.hold_ns, 300_000, &mut rng);
+        let base = (SIM_TARGET + SIM_P / 2).rem_euclid(SIM_P);
+        for _ in 0..25 {
+            let r = report_from_lead(grid_lead(base, &c), 400_000, &mut rng);
             c.adjust(&r, SIM_P);
         }
-        let err = settled_latch(1_000_000, c.hold_ns) - SIM_TARGET;
+        let err = grid_lead(base, &c) - SIM_TARGET;
         assert!(
             err.abs() < 1_000_000,
-            "wrap-side start must still lock, residual {err}"
+            "an antipode start must still converge, residual {err} ns"
         );
         assert!(
-            c.cum_travel_ns <= SIM_P / 2,
-            "shortest-way stepping spent {} ns of travel — walked the long way",
+            c.cum_travel_ns <= SIM_P,
+            "damped antipode stepping spent {} ns of travel — it chattered",
             c.cum_travel_ns
         );
     }
 
     #[test]
-    fn incoherent_phase_never_steps_and_holds_nothing() {
-        // Uniform jitter over the whole period: coherence ~0 — the v1 orbit's regime. The
-        // controller must refuse to step at all: a hold here is a pure e2e tax.
+    fn decoupled_plant_disengages_and_holds_nothing() {
+        // The measured lead IGNORES the actuation (v2's saturated-hold regime, and any client
+        // pipeline that re-anchors phase): the travel budget must trip, the grid must
+        // DISENGAGE (zero cost — no residual sleeps), and stay out through the backoff.
         let mut c = PhaseController::new();
         let mut rng = Lcg(13);
-        for _ in 0..20 {
-            let r = plant_report(7_500_000, c.hold_ns, SIM_P, &mut rng);
-            c.adjust(&r, SIM_P);
-        }
-        assert_eq!(
-            c.hold_ns, 0,
-            "an incoherent phase must never accumulate a hold"
-        );
-    }
-
-    #[test]
-    fn v1_median_report_trips_the_travel_budget_and_decays_to_zero() {
-        // A v1 sender (coherence sentinel) whose statistic does not respond to the hold — the
-        // exact on-glass orbit. The budget must trip and the hold must DECAY TO ZERO (not
-        // freeze at a random value: a parked hold taxes e2e by up to a period).
-        let mut c = PhaseController::new();
-        let mut report = punktfunk_core::quic::PhaseReport {
-            next_latch_host_ns: 0,
-            latch_period_ns: SIM_P as u32,
-            uncertainty_ns: 1_000_000,
-            arrival_lead_ns: 7_500_000, // pinned — the dead median
-            coherence_milli: u16::MAX,  // v1: bypasses the coherence gate
-        };
-        let mut max_hold_seen = 0;
+        let mut engaged_at_some_point = false;
         for _ in 0..40 {
-            c.adjust(&report, SIM_P);
-            report.arrival_lead_ns = 7_500_000; // never responds
-            max_hold_seen = max_hold_seen.max(c.hold_ns);
+            // Pinned lead + tight noise: coherent, so the gate passes — only the budget saves us.
+            let r = report_from_lead(7_500_000, 300_000, &mut rng);
+            c.adjust(&r, SIM_P);
+            engaged_at_some_point |= c.engaged();
         }
         assert!(
-            max_hold_seen > 0,
+            engaged_at_some_point,
             "the chase must have started before the budget tripped"
         );
+        assert!(
+            !c.engaged(),
+            "a decoupled plant must end DISENGAGED, not parked"
+        );
         assert_eq!(
-            c.hold_ns, 0,
-            "a tripped budget must end at ZERO hold (decay), not parked"
+            c.applied_readout(),
+            0,
+            "disengaged means zero applied offset"
         );
     }
 
     #[test]
-    fn regime_change_relocks_after_decay() {
-        // Incoherent → hold 0; the network tightens → the same controller must lock.
+    fn incoherent_phase_never_engages() {
         let mut c = PhaseController::new();
         let mut rng = Lcg(17);
-        for _ in 0..10 {
-            let r = plant_report(7_500_000, c.hold_ns, SIM_P, &mut rng);
+        for _ in 0..20 {
+            let r = report_from_lead(7_500_000, SIM_P, &mut rng); // full-period smear
             c.adjust(&r, SIM_P);
         }
-        assert_eq!(c.hold_ns, 0);
-        for _ in 0..12 {
-            let r = plant_report(7_500_000, c.hold_ns, 400_000, &mut rng);
-            c.adjust(&r, SIM_P);
-        }
-        let err = settled_latch(7_500_000, c.hold_ns) - SIM_TARGET;
         assert!(
-            err.abs() < 1_000_000,
-            "post-decay tightening must re-lock, residual {err}"
+            !c.engaged(),
+            "an incoherent phase must never engage the grid"
+        );
+    }
+
+    #[test]
+    fn regime_change_reengages_after_backoff() {
+        // Decoupled → budget trip → backoff; then the plant becomes linear (regime change):
+        // the controller must re-engage and lock.
+        let mut c = PhaseController::new();
+        let mut rng = Lcg(19);
+        for _ in 0..40 {
+            let r = report_from_lead(7_500_000, 300_000, &mut rng);
+            c.adjust(&r, SIM_P);
+        }
+        assert!(!c.engaged());
+        for _ in 0..30 {
+            let r = report_from_lead(grid_lead(7_500_000, &c), 400_000, &mut rng);
+            c.adjust(&r, SIM_P);
+        }
+        let err = grid_lead(7_500_000, &c) - SIM_TARGET;
+        assert!(
+            c.engaged(),
+            "a linearized plant after backoff must re-engage"
+        );
+        assert!(err.abs() < 1_000_000, "…and lock, residual {err} ns");
+    }
+
+    #[test]
+    fn submit_grid_is_periodic_and_offset_shifted() {
+        // The actuator itself: targets advance by exactly one period, and an offset change
+        // moves the target by the same amount mod the period — the linearity the whole design
+        // rests on (a per-frame additive hold has no such property once saturated).
+        let mut c = PhaseController::new();
+        c.epoch = Some(std::time::Instant::now() - std::time::Duration::from_millis(50));
+        c.offset_ns = 1_000_000;
+        let now = std::time::Instant::now();
+        let t1 = c.next_submit_target(now, SIM_P).unwrap();
+        let t2 = c
+            .next_submit_target(t1 + std::time::Duration::from_nanos(1), SIM_P)
+            .unwrap();
+        let dt = t2.duration_since(t1).as_nanos() as i64;
+        assert!(
+            (dt - SIM_P).abs() < 1_000,
+            "grid ticks must advance by exactly one period, got {dt}"
+        );
+        c.offset_ns = 3_000_000;
+        let t1b = c.next_submit_target(now, SIM_P).unwrap();
+        let shift =
+            t1b.duration_since(now).as_nanos() as i64 - t1.duration_since(now).as_nanos() as i64;
+        assert!(
+            (shift - 2_000_000).rem_euclid(SIM_P) < 1_000
+                || (shift - 2_000_000).rem_euclid(SIM_P) > SIM_P - 1_000,
+            "a +2 ms offset must shift the next target by +2 ms mod P, got {shift}"
         );
     }
 }
