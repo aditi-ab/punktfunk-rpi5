@@ -121,6 +121,12 @@ pub struct Stats {
     /// received+lost (%). The OSD renders the counter line only when nonzero.
     pub lost: u32,
     pub lost_pct: f32,
+    /// Mic uplink frames this window: handed to the QUIC datagram send, and shed anywhere
+    /// client-side (queue-full at the producer + the pump's stale-oldest backlog governor —
+    /// see [`NativeClient::mic_stats`]). Both stay 0 while the mic is off, so the OSD
+    /// renders the mic line only when the uplink is live.
+    pub mic_sent: u32,
+    pub mic_dropped: u32,
     /// The decode path frames actually took this window (`"vaapi"`/`"software"`, empty
     /// until the first frame) — the OSD's trailing tag; tracks a mid-session fallback.
     pub decoder: &'static str,
@@ -434,6 +440,9 @@ fn pump(
     let mut dec_path: &'static str = "";
     // The stats window keeps its own drop cursor — the OSD shows the per-window delta.
     let mut window_dropped = connector.frames_dropped();
+    // Mic uplink cursor (same per-window diffing): a healthy 10 ms-frame mic reads ~100
+    // sent/s; a nonzero drop delta is the queue shedding backlog (see NativeClient::mic_stats).
+    let mut window_mic = connector.mic_stats();
     let mut last_kf_req: Option<Instant> = None;
     // Freeze-until-reanchor: the shared post-loss gate ([`punktfunk_core::reanchor::ReanchorGate`]).
     // Armed on any loss signal (frame-index gap, dropped-count climb, decoder wedge/demotion), it
@@ -789,6 +798,12 @@ fn pump(
             let (pace_p50, _) = window_percentiles(&mut pace_us_win);
             let lost = dropped.saturating_sub(window_dropped) as u32;
             window_dropped = dropped;
+            let mic_now = connector.mic_stats();
+            let mic_sent = mic_now.sent.saturating_sub(window_mic.sent) as u32;
+            let mic_dropped = (mic_now.dropped_full + mic_now.dropped_stale)
+                .saturating_sub(window_mic.dropped_full + window_mic.dropped_stale)
+                as u32;
+            window_mic = mic_now;
             tracing::debug!(
                 fps = frames_n,
                 hostnet_p50_us = hn_p50,
@@ -800,6 +815,8 @@ fn pump(
                 pace_p50_us = pace_p50,
                 decode_p50_us = dec_p50,
                 lost,
+                mic_sent,
+                mic_dropped,
                 total_frames,
                 "stream window"
             );
@@ -822,6 +839,8 @@ fn pump(
                 } else {
                     0.0
                 },
+                mic_sent,
+                mic_dropped,
                 decoder: dec_path,
             }));
             window_start = Instant::now();

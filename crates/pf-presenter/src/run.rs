@@ -2017,6 +2017,14 @@ fn stats_text(
     if s.lost > 0 {
         text.push_str(&format!("\nlost {} ({:.1}%)", s.lost, s.lost_pct));
     }
+    // The mic uplink line renders only while the mic is live (a healthy 10 ms-frame uplink
+    // reads ~100 f/s) and only in Detailed — drops here are the client shedding backlog.
+    if detailed && (s.mic_sent > 0 || s.mic_dropped > 0) {
+        text.push_str(&format!("\nmic {} f/s", s.mic_sent));
+        if s.mic_dropped > 0 {
+            text.push_str(&format!(" · dropped {}", s.mic_dropped));
+        }
+    }
     text
 }
 
@@ -2262,6 +2270,8 @@ mod tests {
                 decode_ms: 1.8,
                 lost: 3,
                 lost_pct: 0.4,
+                mic_sent: 0,
+                mic_dropped: 0,
                 decoder: "vulkan",
             },
             PresentedWindow {
@@ -2301,6 +2311,30 @@ mod tests {
             !normal.contains("queue"),
             "host-stage split is Detailed-only"
         );
+    }
+
+    /// The mic uplink line: Detailed-only, and only while the uplink is live.
+    #[test]
+    fn stats_text_mic_line() {
+        let (mut s, p) = sample();
+        let text = |s: &Stats, v| stats_text(v, "m", s, &p, false, false, None);
+        assert!(
+            !text(&s, StatsVerbosity::Detailed).contains("mic"),
+            "no mic line while the mic is off"
+        );
+        s.mic_sent = 100;
+        let detailed = text(&s, StatsVerbosity::Detailed);
+        assert!(detailed.contains("\nmic 100 f/s"));
+        assert!(
+            !detailed.contains("dropped"),
+            "a healthy uplink shows no drop term"
+        );
+        assert!(
+            !text(&s, StatsVerbosity::Normal).contains("mic"),
+            "mic line is Detailed-only"
+        );
+        s.mic_dropped = 7;
+        assert!(text(&s, StatsVerbosity::Detailed).contains("mic 100 f/s · dropped 7"));
     }
 
     /// Compact omits the latency term until the presenter's first e2e window lands.
