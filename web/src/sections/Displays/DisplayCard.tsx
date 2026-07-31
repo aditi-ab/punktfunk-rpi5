@@ -106,9 +106,15 @@ export const DisplaySection: FC = () => {
 	 * changed the streamed screen still carried the OLD value and Save quietly put it back. Defer
 	 * that one axis to whatever the server currently reports.
 	 */
+	/** The streamed-screen pin as the HOST currently has it. Every write path defers to this rather
+	 * than to the draft: the draft is only re-seeded while it is CLEAN, so once the operator has an
+	 * unsaved edit its `capture_monitor` is frozen at whatever it was before they used the picker
+	 * below — and any write that spreads the draft would put the old pin back. */
+	const serverCaptureMonitor = () => q.data?.settings.capture_monitor ?? null;
+
 	const saveDraft = () => {
 		if (!draft) return;
-		apply({ ...draft, capture_monitor: q.data?.settings.capture_monitor });
+		apply({ ...draft, capture_monitor: serverCaptureMonitor() });
 	};
 
 	/**
@@ -127,7 +133,7 @@ export const DisplaySection: FC = () => {
 		// Reflect the flip straight away, keeping every other unsaved edit intact.
 		setDraft((d) => (d ? { ...d, ...patch } : d));
 		save.mutate(
-			{ data: { ...base, ...patch } },
+			{ data: { ...base, capture_monitor: serverCaptureMonitor(), ...patch } },
 			{
 				onSuccess: (res) => {
 					seeded.current = res.settings;
@@ -202,6 +208,7 @@ export const DisplaySection: FC = () => {
 								presets={q.data.presets}
 								customPresets={q.data.custom_presets}
 								serverEffective={q.data.effective}
+								serverCaptureMonitor={serverCaptureMonitor}
 								apply={apply}
 								applyAxis={applyAxis}
 								saveDraft={saveDraft}
@@ -243,6 +250,8 @@ const DisplayForm: FC<{
 	customPresets: CustomPreset[];
 	/** What the host reports as IN FORCE right now — not derived from the local draft. */
 	serverEffective: EffectivePolicy;
+	/** The streamed-screen pin as the host has it — the draft's copy goes stale while dirty. */
+	serverCaptureMonitor: () => string | null;
 	apply: (p: DisplayPolicy) => void;
 	/** Apply one orthogonal axis on top of the SAVED policy — never the unsaved draft. */
 	applyAxis: (patch: Partial<DisplayPolicy>) => void;
@@ -260,6 +269,7 @@ const DisplayForm: FC<{
 	presets,
 	customPresets,
 	serverEffective,
+	serverCaptureMonitor,
 	apply,
 	applyAxis,
 	saveDraft,
@@ -324,8 +334,8 @@ const DisplayForm: FC<{
 				pnp_disable_monitors: draft.pnp_disable_monitors ?? false,
 				// Which screen we stream is not a display-behavior axis at all — swapping the
 				// streamed screen out from under the operator because they changed a preset would be
-				// the worst kind of surprise.
-				capture_monitor: draft.capture_monitor ?? null,
+				// the worst kind of surprise. From the SERVER, not the draft (see serverCaptureMonitor).
+				capture_monitor: serverCaptureMonitor(),
 			});
 		} else {
 			apply({ ...draft, preset: id as Preset });
@@ -347,8 +357,9 @@ const DisplayForm: FC<{
 			// Nor is the streamed screen: this builds a FRESH policy object rather than spreading
 			// the draft, so anything not named here is silently dropped — which is exactly how
 			// applying a saved preset used to switch a mirroring host back to a virtual display
-			// (found on-glass, .136). Every orthogonal axis has to be listed.
-			capture_monitor: draft.capture_monitor ?? null,
+			// (found on-glass, .136). Every orthogonal axis has to be listed, and this one comes
+			// from the SERVER (see serverCaptureMonitor).
+			capture_monitor: serverCaptureMonitor(),
 		});
 	};
 
