@@ -32,6 +32,7 @@ struct GamepadSettingsView: View {
     @AppStorage(DefaultsKey.enable444) private var enable444 = false
     @AppStorage(DefaultsKey.codec) private var codec = "auto"
     @AppStorage(DefaultsKey.micEnabled) private var micEnabled = true
+    @AppStorage(DefaultsKey.echoCancel) private var echoCancel = true
     // The overlay tier's raw string (rows tag by rawValue); the absent-key default runs the
     // legacy-hudEnabled migration (same pattern as ContentView/SettingsView).
     @AppStorage(DefaultsKey.statsVerbosity) private var statsVerbosityRaw
@@ -316,6 +317,11 @@ struct GamepadSettingsView: View {
                 id: "mic", icon: "mic", label: "Microphone",
                 detail: "Send this device's microphone to the host's virtual mic.",
                 value: $micEnabled),
+            toggleRow(
+                id: "echoCancel", icon: "waveform", label: "Echo cancellation",
+                detail: "Cancel the audio this device plays out of the mic signal — stops "
+                    + "speaker setups feeding the game back to the host.",
+                value: $echoCancel),
 
             choiceRow(
                 id: "pad", header: "Controller", icon: "gamecontroller", label: "Use controller",

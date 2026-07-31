@@ -609,7 +609,8 @@ final class SessionModel: ObservableObject {
             speakerUID: settings.speakerUID,
             micUID: settings.micUID,
             micChannel: settings.micChannel,
-            micEnabled: settings.micEnabled)
+            micEnabled: settings.micEnabled,
+            echoCancel: settings.echoCancel)
         self.audio = audio
         // Gamepads: forward every controller GamepadManager selected — each on its own wire pad
         // index (a pin forwards only one, Automatic forwards all) — and render the host's feedback

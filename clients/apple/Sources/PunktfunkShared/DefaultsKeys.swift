@@ -42,6 +42,13 @@ public enum DefaultsKey {
     /// falls back. Drives the decoder via `Welcome.codec`.
     public static let codec = "punktfunk.codec"
     public static let micEnabled = "punktfunk.micEnabled"
+    /// Echo cancellation for the mic uplink (on by default): playback + capture share ONE
+    /// audio engine so the system voice processor can subtract what this device is playing
+    /// from what its mic hears — without it a loudspeaker client feeds the game audio straight
+    /// back to the host. Off = the raw two-engine capture path. macOS: an explicitly pinned
+    /// speaker/mic or mic channel also bypasses it (the voice processor only follows the
+    /// system default devices) — see SessionAudio's topology note.
+    public static let echoCancel = "punktfunk.echoCancel"
     public static let speakerUID = "punktfunk.speakerUID"
     public static let micUID = "punktfunk.micUID"
     /// macOS: which input channel of the chosen mic device feeds the host. 0 = "Auto" (sum every

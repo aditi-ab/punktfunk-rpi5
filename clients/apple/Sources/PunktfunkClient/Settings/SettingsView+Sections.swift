@@ -581,6 +581,10 @@ extension SettingsView {
                       field: "mic_enabled") {
                 Toggle("Send microphone to the host", isOn: scoped(SettingsFields.micEnabled))
             }
+            described(echoCancelCaption, field: "echo_cancel") {
+                Toggle("Echo cancellation", isOn: scoped(SettingsFields.echoCancel))
+                    .disabled(!effective.micEnabled)
+            }
             #if os(macOS)
             if !inProfileScope {
                 Picker("Microphone", selection: $micUID) {
@@ -617,6 +621,20 @@ extension SettingsView {
                 .font(.geist(12, relativeTo: .caption))
                 .foregroundStyle(.secondary)
         }
+    }
+
+    /// Honest about the macOS escape hatch: the voice processor only follows the system
+    /// default devices, so hand-picked endpoints silently keep the raw path (see
+    /// SessionAudio's topology note) — better said here than discovered mid-call.
+    private var echoCancelCaption: String {
+        let base = "Voice processing cancels the audio this device plays out of the mic "
+            + "signal, so a speaker setup doesn't feed the game back to the host."
+        #if os(macOS)
+        return base + " Follows the system default devices — a hand-picked speaker, "
+            + "microphone or input channel streams the raw mic instead."
+        #else
+        return base
+        #endif
     }
 
     // MARK: - Controllers

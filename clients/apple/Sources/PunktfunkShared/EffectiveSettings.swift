@@ -29,6 +29,7 @@ public struct EffectiveSettings: Equatable, Sendable {
     public var compositor = 0
     public var audioChannels = 2
     public var micEnabled = true
+    public var echoCancel = true
     public var touchMode = "trackpad"
     public var mouseMode = "capture"
     public var invertScroll = false
@@ -87,6 +88,7 @@ public struct EffectiveSettings: Equatable, Sendable {
         compositor = int(DefaultsKey.compositor, compositor)
         audioChannels = int(DefaultsKey.audioChannels, audioChannels)
         micEnabled = bool(DefaultsKey.micEnabled, micEnabled)
+        echoCancel = bool(DefaultsKey.echoCancel, echoCancel)
         touchMode = str(DefaultsKey.touchMode, touchMode)
         mouseMode = str(DefaultsKey.mouseMode, mouseMode)
         invertScroll = bool(DefaultsKey.invertScroll, invertScroll)
@@ -133,6 +135,7 @@ public struct EffectiveSettings: Equatable, Sendable {
         if let v = overlay.compositor { s.compositor = v }
         if let v = overlay.audioChannels { s.audioChannels = v }
         if let v = overlay.micEnabled { s.micEnabled = v }
+        if let v = overlay.echoCancel { s.echoCancel = v }
         if let v = overlay.touchMode { s.touchMode = v }
         if let v = overlay.mouseMode { s.mouseMode = v }
         if let v = overlay.invertScroll { s.invertScroll = v }
