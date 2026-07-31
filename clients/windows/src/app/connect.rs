@@ -298,8 +298,10 @@ fn connect_spawn(
                         // host PAIRED so future connects are silent. Plain TOFU persists
                         // it *unpaired* (pinned): the child connected pinned to the
                         // advertised fingerprint, so ready proves the host holds it.
+                        // Either way an authorised decision, so `upsert_trusted`: a dead
+                        // record for this address is retired instead of shadowing this one.
                         let mut k = KnownHosts::load();
-                        k.upsert(KnownHost {
+                        k.upsert_trusted(KnownHost {
                             name: target.name.clone(),
                             addr: target.addr.clone(),
                             port: target.port,
@@ -523,6 +525,8 @@ fn wake_and_connect(
                     // Came back on a new IP (DHCP): dial the fresh address and re-key the saved
                     // host so the pin stays reachable next time (keyed by fingerprint;
                     // addr/port overwritten, `paired`/`mac` preserved by `upsert`).
+                    // Plain `upsert` on purpose — this is an mDNS advert talking, not a trust
+                    // decision, so it may never retire another saved host at that address.
                     if let Some((addr, port)) =
                         resolved.filter(|(a, p)| *a != target.addr || *p != target.port)
                     {

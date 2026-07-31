@@ -132,9 +132,7 @@ impl ConnectPlan {
         // exactly the right thing: no profile binding, no clipboard opt-in.
         let fallback = KnownHost::default();
         let stored = known
-            .hosts
-            .iter()
-            .find(|h| h.addr == host.addr && h.port == host.port)
+            .find_by_addr(&host.addr, host.port)
             .unwrap_or(&fallback);
         let mut plan = ConnectPlan::resolve(
             stored,

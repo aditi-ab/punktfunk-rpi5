@@ -366,11 +366,7 @@ pub fn resolve_host(link: &DeepLink, known: &KnownHosts) -> HostResolution {
         .then(|| parse_addr_port(&link.host_ref))
         .flatten();
     for candidate in [literal.clone(), link.host.clone()].into_iter().flatten() {
-        if let Some(i) = known
-            .hosts
-            .iter()
-            .position(|h| h.addr == candidate.0 && h.port == candidate.1)
-        {
+        if let Some(i) = known.index_by_addr(&candidate.0, candidate.1) {
             return HostResolution::Known(i);
         }
     }

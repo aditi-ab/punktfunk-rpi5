@@ -175,10 +175,11 @@ mod session_main {
         // the last store read the compat path still owes. `addr` is moved into the struct
         // below, so read it first.
         let clipboard = clipboard_override.unwrap_or_else(|| {
+            // The record this address RESOLVES to, not "any record mentioning it": a retired
+            // duplicate must never be the one that hands a host the clipboard.
             trust::KnownHosts::load()
-                .hosts
-                .iter()
-                .any(|h| h.addr == addr && h.port == port && h.clipboard_sync)
+                .find_by_addr(&addr, port)
+                .is_some_and(|h| h.clipboard_sync)
         });
         // Re-apply the shell-persisted forwarded-controller pin (stable `vid:pid:name`
         // key) to OUR gamepad service — the shells' in-process services can't reach this
@@ -574,10 +575,7 @@ mod session_main {
         // connects silently; an unknown host is REFUSED — there is no dialog here, and a
         // silent TOFU would defeat the pinning model. Pair via the desktop client.
         let known = trust::KnownHosts::load();
-        let known_host = known
-            .hosts
-            .iter()
-            .find(|h| h.addr == addr && h.port == port);
+        let known_host = known.find_by_addr(&addr, port);
         let pin = arg_value("--fp")
             .as_deref()
             .and_then(trust::parse_hex32)

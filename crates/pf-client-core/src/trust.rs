@@ -268,8 +268,40 @@ impl KnownHosts {
         self.hosts.iter().find(|h| h.fp_hex == fp_hex)
     }
 
+    /// The record an address-keyed lookup resolves to, by index (so callers that go on to
+    /// mutate the store don't fight the borrow checker).
+    ///
+    /// One address cannot host two live identities at once, but the store can still hold more
+    /// than one record claiming `addr:port`: an fp-less placeholder waiting for its first
+    /// ceremony, or — before [`KnownHosts::upsert_trusted`] existed — a re-keyed host whose new
+    /// record was appended beside the dead one. Resolving that positionally is what turned a
+    /// host reinstall into a permanent lockout: the dead pin, written first, won every later
+    /// connect, including right after a successful re-pair.
+    ///
+    /// So the rule is "the newest trust decision wins": a real fingerprint beats a placeholder,
+    /// and among real ones the LAST record — records are only ever appended by an explicit
+    /// trust decision, so the last one is the most recent thing the user actually authorised.
+    /// That is a lookup order, never an authorisation: whichever record this picks, the pin it
+    /// yields still has to match the certificate the host presents, or the connect fails closed.
+    pub fn index_by_addr(&self, addr: &str, port: u16) -> Option<usize> {
+        let mut best: Option<usize> = None;
+        for (i, h) in self.hosts.iter().enumerate() {
+            if h.addr != addr || h.port != port {
+                continue;
+            }
+            let better = match best {
+                None => true,
+                Some(b) => !h.fp_hex.is_empty() || self.hosts[b].fp_hex.is_empty(),
+            };
+            if better {
+                best = Some(i);
+            }
+        }
+        best
+    }
+
     pub fn find_by_addr(&self, addr: &str, port: u16) -> Option<&KnownHost> {
-        self.hosts.iter().find(|h| h.addr == addr && h.port == port)
+        self.index_by_addr(addr, port).map(|i| &self.hosts[i])
     }
 
     /// Forget the entry with this fingerprint. Returns true if one was removed (the user
@@ -322,6 +354,70 @@ impl KnownHosts {
             self.hosts.push(entry);
         }
     }
+
+    /// [`upsert`](Self::upsert) for an **authorised trust decision** — a PIN ceremony, a
+    /// delegated approval, a TOFU accept, a headless pair — which additionally retires every
+    /// other record claiming the same `addr:port`.
+    ///
+    /// `upsert` alone keys on the fingerprint, deliberately: that is how a host which moved
+    /// address keeps its record and the fields the user set on it. The cost was that a host
+    /// which changed IDENTITY — a reinstall, a wiped `ProgramData`, a re-key — matched nothing
+    /// and got a SECOND record appended for the address it already had, and every later
+    /// connect then pinned the dead fingerprint from the older one. No way out from the UI,
+    /// and re-pairing didn't help: the ceremony succeeded and appended yet another record.
+    ///
+    /// A record retired here carries what describes the BOX rather than the identity onto the
+    /// record that survives — its MAC, its OS chain, the profile bound to it, its pinned cards,
+    /// when it was last used — so a reinstall doesn't quietly cost the user their setup.
+    /// Deliberately NOT carried: `paired` and `clipboard_sync`, which are decisions about one
+    /// specific certificate and have to be made again for a new one, and the stable record id
+    /// (a deep link written from the retired record falls through to the `host=` recovery the
+    /// link grammar already specifies, rather than silently pointing at a new identity).
+    ///
+    /// **Only trust decisions may call this.** Everything that merely LEARNS something about a
+    /// host — a rediscovery, the wake path's address re-key — stays on plain `upsert`: those
+    /// are driven by unauthenticated mDNS, and letting an advert delete a saved host by
+    /// claiming its address would trade this bug for a much worse one.
+    pub fn upsert_trusted(&mut self, entry: KnownHost) {
+        let (addr, port, fp_hex) = (entry.addr.clone(), entry.port, entry.fp_hex.clone());
+        self.upsert(entry);
+        // Nothing to supersede *with*: an fp-less record is a placeholder, not an identity.
+        if fp_hex.is_empty() {
+            return;
+        }
+        let (keep, retired): (Vec<KnownHost>, Vec<KnownHost>) = std::mem::take(&mut self.hosts)
+            .into_iter()
+            .partition(|h| !(h.addr == addr && h.port == port && h.fp_hex != fp_hex));
+        self.hosts = keep;
+        if retired.is_empty() {
+            return;
+        }
+        let Some(h) = self.hosts.iter_mut().find(|h| h.fp_hex == fp_hex) else {
+            return;
+        };
+        for old in retired {
+            tracing::info!(
+                addr = %addr, port,
+                retired_fp = %old.fp_hex, kept_fp = %fp_hex,
+                "host re-keyed — retiring the superseded record for this address"
+            );
+            if h.mac.is_empty() {
+                h.mac = old.mac;
+            }
+            if h.os.is_empty() {
+                h.os = old.os;
+            }
+            if h.profile_id.is_none() {
+                h.profile_id = old.profile_id;
+            }
+            if h.pinned_profiles.is_empty() {
+                h.pinned_profiles = old.pinned_profiles;
+            }
+            if h.last_used.is_none() {
+                h.last_used = old.last_used;
+            }
+        }
+    }
 }
 
 /// Load-upsert-save in one step — the pin every trust decision (TOFU accept, PIN
@@ -332,7 +428,10 @@ pub fn persist_host(name: &str, addr: &str, port: u16, fp_hex: &str, paired: boo
     // so every user-set field (clipboard, profile binding, pins) must arrive as "not carried"
     // — `upsert` then leaves an existing host's own settings alone. A hand-written literal
     // here is how those fields would get silently reset on the next re-pair.
-    known.upsert(KnownHost {
+    //
+    // `upsert_trusted`, not `upsert`: this IS the authorised decision, so it is also the point
+    // at which a host that re-keyed retires its own dead record for this address.
+    known.upsert_trusted(KnownHost {
         name: name.to_string(),
         addr: addr.to_string(),
         port,
@@ -366,6 +465,23 @@ pub fn forget_placeholder(addr: &str, port: u16) {
     }
 }
 
+/// The record [`learn_mac`]/[`learn_os`] should write what an advert taught them onto:
+/// the fingerprint match if there is one, else whatever the address resolves to. Fingerprint
+/// FIRST — a single pass that took "either" would hand a stale record at the same address the
+/// data the live host advertised, purely because it came earlier in the file.
+fn learn_target<'a>(
+    known: &'a mut KnownHosts,
+    fp_hex: &str,
+    addr: &str,
+    port: u16,
+) -> Option<&'a mut KnownHost> {
+    let i = (!fp_hex.is_empty())
+        .then(|| known.hosts.iter().position(|h| h.fp_hex == fp_hex))
+        .flatten()
+        .or_else(|| known.index_by_addr(addr, port))?;
+    known.hosts.get_mut(i)
+}
+
 /// Learn/refresh a saved host's Wake-on-LAN MAC(s) from its live advert (called while the host
 /// is online, matched by fingerprint or address). No-op — and no disk write — when unchanged, so
 /// the hosts page can call it on every discovery tick without churning the store.
@@ -374,11 +490,7 @@ pub fn learn_mac(fp_hex: &str, addr: &str, port: u16, mac: &[String]) {
         return;
     }
     let mut known = KnownHosts::load();
-    let Some(h) = known
-        .hosts
-        .iter_mut()
-        .find(|h| (!fp_hex.is_empty() && h.fp_hex == fp_hex) || (h.addr == addr && h.port == port))
-    else {
+    let Some(h) = learn_target(&mut known, fp_hex, addr, port) else {
         return;
     };
     if h.mac == mac {
@@ -396,11 +508,7 @@ pub fn learn_os(fp_hex: &str, addr: &str, port: u16, os: &str) {
         return;
     }
     let mut known = KnownHosts::load();
-    let Some(h) = known
-        .hosts
-        .iter_mut()
-        .find(|h| (!fp_hex.is_empty() && h.fp_hex == fp_hex) || (h.addr == addr && h.port == port))
-    else {
+    let Some(h) = learn_target(&mut known, fp_hex, addr, port) else {
         return;
     };
     if h.os == os {
@@ -961,10 +1069,9 @@ pub fn effective_settings(
 ) -> (Settings, Option<StreamProfile>) {
     let base = Settings::load();
     let catalog = ProfilesFile::load();
-    let bound = KnownHosts::load()
-        .hosts
-        .iter()
-        .find(|h| h.addr == addr && h.port == port)
+    let known = KnownHosts::load();
+    let bound = known
+        .find_by_addr(addr, port)
         .and_then(|h| h.profile_id.clone());
 
     match resolve_profile(&catalog, bound.as_deref(), one_off) {
@@ -1003,6 +1110,12 @@ fn resolve_profile(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A 64-hex fingerprint of one repeated digit — readable in an assertion, and distinct
+    /// per letter, which is all the known-hosts tests need one to be.
+    fn fp(c: char) -> String {
+        std::iter::repeat_n(c, 64).collect()
+    }
 
     /// A settings file predating the touch-input model loads as `trackpad` (the shipped
     /// default), and the name round-trips through the enum both ways.
@@ -1219,6 +1332,243 @@ mod tests {
         });
         assert_eq!(k.hosts[0].profile_id.as_deref(), Some("cccccccccccc"));
         assert_eq!(k.hosts[0].pinned_profiles, vec!["dddddddddddd".to_string()]);
+    }
+
+    /// A host that regenerated its identity (reinstall, wiped ProgramData, re-key) ends up with
+    /// ONE record for its address — the live one. This is the `.173` lockout: `upsert` keys on
+    /// the fingerprint, so the re-paired host used to be appended beside the dead record, and
+    /// every later connect pinned the dead one — forever, re-pairing included.
+    #[test]
+    fn upsert_trusted_supersedes_a_rekeyed_host() {
+        let (dead, live) = (fp('c'), fp('a'));
+        let mut k = KnownHosts {
+            hosts: vec![KnownHost {
+                name: "ENRICOS-DESKTOP (local)".into(),
+                addr: "127.0.0.1".into(),
+                port: 9777,
+                fp_hex: dead.clone(),
+                paired: true,
+                last_used: Some(1000),
+                mac: vec!["aa:bb:cc:dd:ee:ff".into()],
+                os: "windows".into(),
+                clipboard_sync: true,
+                profile_id: Some("aaaaaaaaaaaa".into()),
+                pinned_profiles: vec!["bbbbbbbbbbbb".into()],
+                id: Some("11111111-2222-4333-8444-555555555555".into()),
+            }],
+        };
+        // The re-pair: same box, same address, a certificate the client has never seen.
+        k.upsert_trusted(KnownHost {
+            name: "127.0.0.1".into(),
+            addr: "127.0.0.1".into(),
+            port: 9777,
+            fp_hex: live.clone(),
+            paired: true,
+            ..Default::default()
+        });
+        assert_eq!(k.hosts.len(), 1);
+        let h = &k.hosts[0];
+        assert_eq!(h.fp_hex, live);
+        // …and the address now resolves to the live pin, which is the whole bug.
+        assert_eq!(k.find_by_addr("127.0.0.1", 9777).unwrap().fp_hex, live);
+        assert!(k.find_by_fp(&dead).is_none());
+        // What describes the BOX rides along, so a reinstall doesn't cost the user their setup.
+        assert_eq!(h.mac, vec!["aa:bb:cc:dd:ee:ff".to_string()]);
+        assert_eq!(h.os, "windows");
+        assert_eq!(h.profile_id.as_deref(), Some("aaaaaaaaaaaa"));
+        assert_eq!(h.pinned_profiles, vec!["bbbbbbbbbbbb".to_string()]);
+        assert_eq!(h.last_used, Some(1000));
+        // What described the dead IDENTITY does not: the clipboard grant is a decision about
+        // one certificate, and the retired record's stable id must not follow a new one.
+        assert!(!h.clipboard_sync);
+        assert_ne!(
+            h.id.as_deref(),
+            Some("11111111-2222-4333-8444-555555555555")
+        );
+    }
+
+    /// The case fingerprint-keying exists for still works through the trusted path: a host that
+    /// only MOVED keeps its one record, its `paired` bit and everything the user set on it —
+    /// including the clipboard grant and the stable id, which a same-identity re-pair must not
+    /// disturb (that would be the fix trading one silent reset for another).
+    #[test]
+    fn upsert_trusted_keeps_a_host_that_only_moved_address() {
+        let same = fp('a');
+        let mut k = KnownHosts {
+            hosts: vec![KnownHost {
+                name: "Desk".into(),
+                addr: "192.168.1.50".into(),
+                port: 9777,
+                fp_hex: same.clone(),
+                paired: true,
+                clipboard_sync: true,
+                profile_id: Some("aaaaaaaaaaaa".into()),
+                id: Some("11111111-2222-4333-8444-555555555555".into()),
+                ..Default::default()
+            }],
+        };
+        k.upsert_trusted(KnownHost {
+            name: "Desk".into(),
+            addr: "192.168.1.51".into(),
+            port: 9777,
+            fp_hex: same.clone(),
+            paired: false, // must not demote
+            ..Default::default()
+        });
+        assert_eq!(k.hosts.len(), 1);
+        let h = &k.hosts[0];
+        assert_eq!(h.addr, "192.168.1.51");
+        assert!(h.paired);
+        assert!(h.clipboard_sync);
+        assert_eq!(h.profile_id.as_deref(), Some("aaaaaaaaaaaa"));
+        assert_eq!(
+            h.id.as_deref(),
+            Some("11111111-2222-4333-8444-555555555555")
+        );
+    }
+
+    /// Superseding is scoped to the address the decision was made for, and only ever runs off
+    /// one: a trust decision for `.51` leaves a different host saved at `.50` alone, and an
+    /// fp-less save (a manual entry, `--add-host` without `--fp`) retires nothing at all — it
+    /// carries no identity to supersede anything WITH.
+    #[test]
+    fn upsert_trusted_leaves_other_addresses_and_placeholders_alone() {
+        let mut k = KnownHosts {
+            hosts: vec![
+                KnownHost {
+                    name: "Other box".into(),
+                    addr: "192.168.1.50".into(),
+                    port: 9777,
+                    fp_hex: fp('c'),
+                    paired: true,
+                    ..Default::default()
+                },
+                // Same address, DIFFERENT port: a distinct endpoint, not a duplicate.
+                KnownHost {
+                    name: "Second host".into(),
+                    addr: "192.168.1.51".into(),
+                    port: 9778,
+                    fp_hex: fp('d'),
+                    paired: true,
+                    ..Default::default()
+                },
+            ],
+        };
+        k.upsert_trusted(KnownHost {
+            name: "New box".into(),
+            addr: "192.168.1.51".into(),
+            port: 9777,
+            fp_hex: fp('a'),
+            paired: true,
+            ..Default::default()
+        });
+        assert_eq!(k.hosts.len(), 3);
+        assert_eq!(
+            k.find_by_addr("192.168.1.50", 9777).unwrap().fp_hex,
+            fp('c')
+        );
+        assert_eq!(
+            k.find_by_addr("192.168.1.51", 9778).unwrap().fp_hex,
+            fp('d')
+        );
+
+        // An fp-less save alongside a real record: nothing is retired, and the address still
+        // resolves to the record that HAS a pin.
+        k.upsert_trusted(KnownHost {
+            name: "Typed by hand".into(),
+            addr: "192.168.1.50".into(),
+            port: 9777,
+            ..Default::default()
+        });
+        assert_eq!(k.hosts.len(), 4);
+        assert_eq!(
+            k.find_by_addr("192.168.1.50", 9777).unwrap().fp_hex,
+            fp('c')
+        );
+    }
+
+    /// A store that ALREADY holds the duplicate (every client shipped so far can have written
+    /// one) connects again on the next connect, before any re-pair: an address resolves to the
+    /// newest trust decision for it, not to whichever record happens to sit first in the file.
+    /// Nothing is deleted at load — which record is live isn't knowable there, and guessing
+    /// wrong would throw away the good one; the retirement waits for the next trust decision.
+    #[test]
+    fn a_duplicated_store_resolves_to_the_newest_record() {
+        let (dead, live) = (fp('c'), fp('a'));
+        let mut k = KnownHosts {
+            hosts: vec![
+                KnownHost {
+                    name: "ENRICOS-DESKTOP (local)".into(),
+                    addr: "127.0.0.1".into(),
+                    port: 9777,
+                    fp_hex: dead.clone(),
+                    paired: true,
+                    last_used: Some(9999), // the stale record is the one that HAS connected
+                    ..Default::default()
+                },
+                KnownHost {
+                    name: "127.0.0.1".into(),
+                    addr: "127.0.0.1".into(),
+                    port: 9777,
+                    fp_hex: live.clone(),
+                    paired: true,
+                    ..Default::default()
+                },
+            ],
+        };
+        assert_eq!(k.find_by_addr("127.0.0.1", 9777).unwrap().fp_hex, live);
+        // Loading is non-destructive: both records are still there to be looked up by pin.
+        assert!(k.find_by_fp(&dead).is_some());
+        // A placeholder appended later never displaces a real pin.
+        k.hosts.push(KnownHost {
+            addr: "127.0.0.1".into(),
+            port: 9777,
+            ..Default::default()
+        });
+        assert_eq!(k.find_by_addr("127.0.0.1", 9777).unwrap().fp_hex, live);
+        // …and the next trust decision cleans the store up.
+        k.upsert_trusted(KnownHost {
+            name: "127.0.0.1".into(),
+            addr: "127.0.0.1".into(),
+            port: 9777,
+            fp_hex: live.clone(),
+            paired: true,
+            ..Default::default()
+        });
+        assert_eq!(k.hosts.len(), 1);
+        assert_eq!(k.hosts[0].fp_hex, live);
+    }
+
+    /// An advert's learned MAC/OS lands on the record it identified, not on a stale namesake
+    /// at the same address that merely came first in the file.
+    #[test]
+    fn learn_target_prefers_the_fingerprint_match() {
+        let (dead, live) = (fp('c'), fp('a'));
+        let mut k = KnownHosts {
+            hosts: vec![
+                KnownHost {
+                    addr: "127.0.0.1".into(),
+                    port: 9777,
+                    fp_hex: dead.clone(),
+                    ..Default::default()
+                },
+                KnownHost {
+                    addr: "127.0.0.1".into(),
+                    port: 9777,
+                    fp_hex: live.clone(),
+                    ..Default::default()
+                },
+            ],
+        };
+        learn_target(&mut k, &live, "127.0.0.1", 9777).unwrap().os = "windows".into();
+        assert_eq!(k.find_by_fp(&live).unwrap().os, "windows");
+        assert_eq!(k.find_by_fp(&dead).unwrap().os, "");
+        // No fingerprint to go on (an advert that carries none) → the address's own answer.
+        learn_target(&mut k, "", "127.0.0.1", 9777).unwrap().os = "linux".into();
+        assert_eq!(k.find_by_fp(&live).unwrap().os, "linux");
+        assert_eq!(k.find_by_fp(&dead).unwrap().os, "");
+        // An advert for a host this store has never seen writes nothing.
+        assert!(learn_target(&mut k, &fp('e'), "10.0.0.9", 9777).is_none());
     }
 
     /// Pins render in card order, deduplicated, with deleted profiles simply gone — a pin is
