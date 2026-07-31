@@ -23,14 +23,22 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
 use std::sync::Arc;
 use std::time::Duration;
-use wasapi::{DeviceEnumerator, Direction, SampleType, StreamMode, WaveFormat};
+use wasapi::{
+    AudioClientProperties, DeviceEnumerator, Direction, SampleType, StreamCategory, StreamMode,
+    WaveFormat,
+};
 
 const SAMPLE_RATE: usize = 48_000;
-/// The microphone uplink stays stereo (the host's virtual mic is stereo). The render path is
-/// multichannel — its channel count + block align are runtime, driven by the host-resolved layout.
-const CHANNELS: usize = 2;
-/// Mic frames are 20 ms (960 samples/channel) — any size ≤ 120 ms is fine host-side.
-const MIC_FRAME: usize = 960;
+/// Mic capture requests STEREO from WASAPI (autoconvert matrixes any endpoint layout down to
+/// it — the proven path; `read_from_device_to_deque` then delivers our requested format) and
+/// downmixes to MONO in code before the encoder: voice is mono at the source, the host accepts
+/// any Opus channel layout (its stereo decoder upmixes), and half the samples halve the encode
+/// + wire cost. The render path is multichannel — its channel count + block align are runtime,
+/// driven by the host-resolved layout.
+const CAPT_CHANNELS: usize = 2;
+/// Mic frames are 10 ms (480 mono samples) — any size ≤ 120 ms is fine host-side; 10 ms
+/// halves the frame-fill share of mouth-to-ear latency vs the old 20 ms.
+const MIC_FRAME: usize = 480;
 
 pub struct AudioPlayer {
     pcm_tx: SyncSender<Vec<f32>>,
@@ -217,8 +225,8 @@ fn render_thread(
     res
 }
 
-/// The microphone uplink: capture the default input device, Opus-encode 20 ms chunks, ship
-/// them as 0xCB datagrams into the host's virtual mic source.
+/// The microphone uplink: capture the default input device, Opus-encode 10 ms mono chunks,
+/// ship them as 0xCB datagrams into the host's virtual mic source.
 pub struct MicStreamer {
     stop: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -259,18 +267,37 @@ fn mic_thread(connector: &Arc<NativeClient>, stop: Arc<AtomicBool>) -> Result<()
 
     let mut encoder = opus::Encoder::new(
         SAMPLE_RATE as u32,
-        opus::Channels::Stereo,
+        opus::Channels::Mono,
         opus::Application::Voip,
     )
     .map_err(|e| anyhow!("opus encoder: {e}"))?;
-    let _ = encoder.set_bitrate(opus::Bitrate::Bits(64_000));
+    // Voice tuning: 48 kbps mono is transparent for speech; in-band FEC + an assumed 10 %
+    // loss let the host's decoder rebuild a lost 0xCB datagram from its successor instead
+    // of concealing (datagrams are fire-and-forget — this FEC is the only redundancy).
+    let _ = encoder.set_bitrate(opus::Bitrate::Bits(48_000));
+    let _ = encoder.set_inband_fec(true);
+    let _ = encoder.set_packet_loss_perc(10);
 
     let device = DeviceEnumerator::new()
         .context("DeviceEnumerator")?
         .get_default_device(&Direction::Capture)
         .context("default capture endpoint (no microphone?)")?;
     let mut audio_client = device.get_iaudioclient().context("IAudioClient")?;
-    let desired = WaveFormat::new(32, 32, &SampleType::Float, SAMPLE_RATE, CHANNELS, None);
+    // Communications category → the endpoint's communications signal-processing chain. A
+    // driver/APO stack with an echo canceller only engages it for communications-category
+    // streams; the default (Other) category never did, so the downlink audio playing on
+    // this box fed straight back into the host's virtual mic. Must precede Initialize
+    // (SetClientProperties is a pre-init call; the wasapi crate QIs IAudioClient2 inside).
+    // Best-effort: an endpoint without IAudioClient2 just keeps the default category.
+    // PUNKTFUNK_NO_AEC=1 opts out (same lever as the Linux echo-cancel-source preference).
+    if !std::env::var("PUNKTFUNK_NO_AEC").is_ok_and(|v| !v.is_empty() && v != "0") {
+        if let Err(e) = audio_client.set_properties(
+            AudioClientProperties::new().set_category(StreamCategory::Communications),
+        ) {
+            tracing::debug!(error = %e, "mic capture: Communications category not set");
+        }
+    }
+    let desired = WaveFormat::new(32, 32, &SampleType::Float, SAMPLE_RATE, CAPT_CHANNELS, None);
     let (default_period, _min_period) =
         audio_client.get_device_period().context("device period")?;
     let mode = StreamMode::EventsShared {
@@ -308,13 +335,23 @@ fn mic_thread(connector: &Arc<NativeClient>, stop: Arc<AtomicBool>) -> Result<()
                 Err(e) => return Err(anyhow!("get_next_packet_size: {e}")),
             }
         }
-        let whole = (bytes.len() / 4) * 4;
-        for c in bytes.drain(..whole).collect::<Vec<u8>>().chunks_exact(4) {
-            ring.push_back(f32::from_le_bytes([c[0], c[1], c[2], c[3]]));
+        // One stereo capture frame (8 bytes) → one mono sample: average L/R. Autoconvert
+        // already matrixed the endpoint's real layout (mono/stereo/array mic) into the
+        // stereo stream we initialized, so this is the only downmix left to do.
+        let stereo_frame = 4 * CAPT_CHANNELS;
+        let whole = (bytes.len() / stereo_frame) * stereo_frame;
+        for c in bytes
+            .drain(..whole)
+            .collect::<Vec<u8>>()
+            .chunks_exact(stereo_frame)
+        {
+            let l = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+            let r = f32::from_le_bytes([c[4], c[5], c[6], c[7]]);
+            ring.push_back((l + r) * 0.5);
         }
-        // Ship every complete 20 ms stereo frame.
-        while ring.len() >= MIC_FRAME * CHANNELS {
-            let pcm: Vec<f32> = ring.drain(..MIC_FRAME * CHANNELS).collect();
+        // Ship every complete 10 ms mono frame.
+        while ring.len() >= MIC_FRAME {
+            let pcm: Vec<f32> = ring.drain(..MIC_FRAME).collect();
             match encoder.encode_float(&pcm, &mut out) {
                 Ok(len) => {
                     let pts = std::time::SystemTime::now()

@@ -14,9 +14,12 @@ use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
 use std::sync::Arc;
 
 const SAMPLE_RATE: u32 = 48_000;
-const CHANNELS: usize = 2;
-/// Mic frames are 20 ms (960 samples/channel) — any size ≤ 120 ms is fine host-side.
-const MIC_FRAME: usize = 960;
+/// Mic capture is MONO: voice is mono at the source, the host accepts any Opus channel
+/// layout (its stereo decoder upmixes), and half the samples halve the encode + wire cost.
+const MIC_CHANNELS: usize = 1;
+/// Mic frames are 10 ms (480 mono samples) — any size ≤ 120 ms is fine host-side; 10 ms
+/// halves the frame-fill share of mouth-to-ear latency vs the old 20 ms.
+const MIC_FRAME: usize = 480;
 
 struct Terminate;
 
@@ -327,8 +330,9 @@ fn pw_thread(
     Ok(())
 }
 
-/// The microphone uplink: capture the default input device, Opus-encode 20 ms chunks,
-/// ship them as 0xCB datagrams into the host's virtual PipeWire source.
+/// The microphone uplink: capture the default input device (or the picked / echo-cancelled
+/// source), Opus-encode 10 ms mono chunks, ship them as 0xCB datagrams into the host's
+/// virtual PipeWire source.
 pub struct MicStreamer {
     quit_tx: pipewire::channel::Sender<Terminate>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -361,14 +365,63 @@ impl Drop for MicStreamer {
     }
 }
 
-/// Capture-side state: accumulated PCM and the Opus encoder (encoding a 20 ms frame is
-/// ~100 µs — fine inside the process callback).
+/// Capture-side state: accumulated PCM and the Opus encoder (encoding a 10 ms frame is
+/// well under 100 µs — fine inside the process callback).
 struct MicData {
     connector: Arc<NativeClient>,
     ring: VecDeque<f32>,
     encoder: opus::Encoder,
     seq: u32,
     out: Vec<u8>,
+}
+
+/// `PUNKTFUNK_NO_AEC=1` — the opt-out for every mic echo-cancellation hook (here: the
+/// echo-cancelled-source preference; the WASAPI twin gates its Communications category on it).
+fn aec_disabled() -> bool {
+    std::env::var("PUNKTFUNK_NO_AEC").is_ok_and(|v| !v.is_empty() && v != "0")
+}
+
+/// The capture stream's `target.object`, in preference order: the Settings microphone pick
+/// (`Settings::mic_device` via session main's `PUNKTFUNK_AUDIO_SOURCE`) verbatim, else — so a
+/// desktop that already runs `module-echo-cancel` stops feeding its own downlink audio back
+/// into the host's virtual mic — the first echo-cancelled source in the graph. `None` = the
+/// user picked nothing and no such source exists: PipeWire's default routing, as before.
+///
+/// Preference-only by design: loading `libpipewire-module-echo-cancel` ourselves needs
+/// `pw_context_load_module`, which the pipewire crate (0.9) doesn't expose safely — until it
+/// does, we only ever target processing the user (or their session) already set up.
+fn mic_capture_target() -> Option<String> {
+    if let Ok(target) = std::env::var("PUNKTFUNK_AUDIO_SOURCE") {
+        if !target.is_empty() {
+            return Some(target);
+        }
+    }
+    if aec_disabled() {
+        return None;
+    }
+    let name = echo_cancel_source()?;
+    tracing::info!(
+        source = %name,
+        "mic capture targets the echo-cancelled source (PUNKTFUNK_NO_AEC=1 to disable)"
+    );
+    Some(name)
+}
+
+/// Find an existing echo-cancelled capture node: the first `Audio/Source` whose `node.name`
+/// or description says echo-cancel (`module-echo-cancel`'s convention — `echo-cancel-*`
+/// nodes, "Echo-Cancel …" descriptions; PulseAudio-compat setups match too). One registry
+/// roundtrip via [`devices`]; any failure reads as "none".
+fn echo_cancel_source() -> Option<String> {
+    let (_, sources) = devices().ok()?;
+    sources.into_iter().find_map(|d| {
+        let name = d.name.to_ascii_lowercase();
+        let desc = d.description.to_ascii_lowercase();
+        (name.contains("echo-cancel")
+            || name.contains("echo_cancel")
+            || desc.contains("echo-cancel")
+            || desc.contains("echo cancel"))
+        .then_some(d.name)
+    })
 }
 
 fn mic_thread(
@@ -384,9 +437,14 @@ fn mic_thread(
     PW_INIT.call_once(pw::init);
 
     let mut encoder =
-        opus::Encoder::new(SAMPLE_RATE, opus::Channels::Stereo, opus::Application::Voip)
+        opus::Encoder::new(SAMPLE_RATE, opus::Channels::Mono, opus::Application::Voip)
             .map_err(|e| anyhow::anyhow!("opus encoder: {e}"))?;
-    let _ = encoder.set_bitrate(opus::Bitrate::Bits(64_000));
+    // Voice tuning: 48 kbps mono is transparent for speech; in-band FEC + an assumed 10 %
+    // loss let the host's decoder rebuild a lost 0xCB datagram from its successor instead
+    // of concealing (datagrams are fire-and-forget — this FEC is the only redundancy).
+    let _ = encoder.set_bitrate(opus::Bitrate::Bits(48_000));
+    let _ = encoder.set_inband_fec(true);
+    let _ = encoder.set_packet_loss_perc(10);
 
     let mainloop = pw::main_loop::MainLoopRc::new(None).context("pw mic MainLoop")?;
     let context = pw::context::ContextRc::new(&mainloop, None).context("pw mic Context")?;
@@ -405,14 +463,15 @@ fn mic_thread(
         *pw::keys::MEDIA_ROLE       => "Communication",
         *pw::keys::NODE_NAME        => "punktfunk-mic-capture",
         *pw::keys::NODE_DESCRIPTION => "Punktfunk Microphone",
+        // ~10 ms quantum (one mic frame). Without it the capture stream inherits the graph
+        // quantum — commonly 1024–2048 samples, so the mic arrived in 21–43 ms bursts that
+        // sat ahead of the encoder as latency (the playback stream always asked for 5 ms).
+        *pw::keys::NODE_LATENCY     => "480/48000",
     };
-    // The Settings microphone pick (`Settings::mic_device` via session main).
-    if let Ok(target) = std::env::var("PUNKTFUNK_AUDIO_SOURCE") {
-        if !target.is_empty() {
-            // Raw key: the `keys::TARGET_OBJECT` constant is feature-gated on a newer
-            // libpipewire than we require; the wire name is stable.
-            props.insert("target.object", target);
-        }
+    if let Some(target) = mic_capture_target() {
+        // Raw key: the `keys::TARGET_OBJECT` constant is feature-gated on a newer
+        // libpipewire than we require; the wire name is stable.
+        props.insert("target.object", target);
     }
     let stream = pw::stream::StreamBox::new(&core, "punktfunk-mic-capture", props)
         .context("pw mic Stream")?;
@@ -447,9 +506,9 @@ fn mic_thread(
                             .push_back(f32::from_le_bytes([s[0], s[1], s[2], s[3]]));
                     }
                 }
-                // Ship every complete 20 ms stereo frame.
-                while ud.ring.len() >= MIC_FRAME * CHANNELS {
-                    let pcm: Vec<f32> = ud.ring.drain(..MIC_FRAME * CHANNELS).collect();
+                // Ship every complete 10 ms mono frame.
+                while ud.ring.len() >= MIC_FRAME * MIC_CHANNELS {
+                    let pcm: Vec<f32> = ud.ring.drain(..MIC_FRAME * MIC_CHANNELS).collect();
                     match ud.encoder.encode_float(&pcm, &mut ud.out) {
                         Ok(len) => {
                             let pts = std::time::SystemTime::now()
@@ -473,7 +532,8 @@ fn mic_thread(
     let mut info = AudioInfoRaw::new();
     info.set_format(AudioFormat::F32LE);
     info.set_rate(SAMPLE_RATE);
-    info.set_channels(CHANNELS as u32);
+    // Mono: the stream's adapter downmixes whatever layout the source really has.
+    info.set_channels(MIC_CHANNELS as u32);
     let obj = pw::spa::pod::Object {
         type_: pw::spa::utils::SpaTypes::ObjectParamFormat.as_raw(),
         id: pw::spa::param::ParamType::EnumFormat.as_raw(),
