@@ -40,6 +40,8 @@ final class PencilStream: NSObject, UIPencilInteractionDelegate {
     private(set) var hoverActive = false
     private var last = PencilStream.idleSample()
     private var heartbeat: Timer?
+    /// When the last batch (event or keepalive) went out — the heartbeat tick's idle test.
+    private var lastSendTs: TimeInterval = 0
 
     // MARK: - Contact path (UITouch, `.pencil` only)
 
@@ -52,11 +54,12 @@ final class PencilStream: NSObject, UIPencilInteractionDelegate {
             touching = true
             inRange = true
             // Coalesced samples restore the Pencil's full capture rate (UIKit delivers at
-            // display cadence); oldest first, `dt_us` preserving their spacing.
+            // display cadence); oldest first, `dt_us` preserving their spacing. The whole run
+            // is kept — emit() splits anything over the wire's batch cap.
             let raw = event?.coalescedTouches(for: touch) ?? [touch]
             var batch: [PunktfunkPenSample] = []
             var prevTs: TimeInterval?
-            for t in raw.suffix(Int(PUNKTFUNK_PEN_BATCH_MAX)) {
+            for t in raw {
                 guard let s = contactSample(t, in: view, prevTs: prevTs) else { continue }
                 prevTs = t.timestamp
                 batch.append(s)
@@ -202,27 +205,46 @@ final class PencilStream: NSObject, UIPencilInteractionDelegate {
         guard !batch.isEmpty else { return }
         last = batch[batch.count - 1]
         last.dt_us = 0
-        send?(batch)
-        armHeartbeat()
+        // A run longer than the wire's batch cap is SPLIT into consecutive sends, never
+        // truncated (the send_pen contract): an over-cap run means the main thread hitched
+        // past a frame of 240 Hz samples, and dropping its head would notch exactly the
+        // stroke geometry a drawing app can least afford to lose.
+        var start = 0
+        while start < batch.count {
+            let end = min(start + Int(PUNKTFUNK_PEN_BATCH_MAX), batch.count)
+            send?(Array(batch[start..<end]))
+            start = end
+        }
+        lastSendTs = CACurrentMediaTime()
+        syncHeartbeat()
     }
 
-    /// The ≤100 ms keepalive while in range (see the file header). 80 ms leaves headroom
-    /// under the host's 200 ms failsafe even with one lost datagram.
-    private func armHeartbeat() {
-        heartbeat?.invalidate()
+    /// The ≤100 ms keepalive while in range (see the file header): ONE long-lived 50 ms timer
+    /// in `.common` run-loop mode, armed on range entry and torn down on exit. `.default`-mode
+    /// scheduling pauses during run-loop tracking, where a stationary pen would silently cross
+    /// the host's 200 ms force-release mid-stroke; the old per-emit re-arm also churned the run
+    /// loop once per event during a stroke. The tick resends only after ≥50 ms of send silence,
+    /// so an active stroke costs nothing and the worst-case gap stays ≈100 ms — the wire bound.
+    private func syncHeartbeat() {
         guard inRange || touching else {
+            heartbeat?.invalidate()
             heartbeat = nil
             return
         }
-        heartbeat = Timer.scheduledTimer(withTimeInterval: 0.08, repeats: true) {
-            [weak self] _ in
+        guard heartbeat == nil else { return }
+        let timer = Timer(timeInterval: 0.05, repeats: true) { [weak self] t in
             guard let self, self.inRange || self.touching else {
-                self?.heartbeat?.invalidate()
+                t.invalidate()
                 self?.heartbeat = nil
                 return
             }
-            self.send?([self.last])
+            if CACurrentMediaTime() - self.lastSendTs >= 0.05 {
+                self.send?([self.last])
+                self.lastSendTs = CACurrentMediaTime()
+            }
         }
+        heartbeat = timer
+        RunLoop.main.add(timer, forMode: .common)
     }
 
     // MARK: - Angle conversions

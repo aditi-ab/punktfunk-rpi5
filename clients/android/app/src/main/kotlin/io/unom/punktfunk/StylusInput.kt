@@ -14,7 +14,11 @@ private const val PEN_TOUCHING = 2f
 private const val PEN_BARREL1 = 4f
 private const val PEN_BARREL2 = 8f
 private const val STRIDE = 10
-private const val MAX_SAMPLES = 8
+// Ceiling on samples per emit, NOT the wire batch size: the JNI layer splits an over-8 run into
+// consecutive wire batches (never truncates — a long historical run means the UI thread hitched,
+// which is exactly when dropping its head would notch the stroke). 64 samples ≈ >250 ms of
+// 240 Hz history; anything past that clamp is a pathological stall, not stroke geometry.
+private const val MAX_SAMPLES = 64
 
 /**
  * Android stylus → the state-full pen plane (design/pen-tablet-input.md §7): pressure, tilt
@@ -117,7 +121,8 @@ internal class StylusStream(private val handle: Long) {
         NativeBridge.nativeSendPen(handle, last, 1)
     }
 
-    /** Historical (coalesced) samples oldest-first, then the current one — a single batch. */
+    /** Historical (coalesced) samples oldest-first, then the current one — one emit; the JNI
+     * layer splits runs longer than the wire's 8-sample batch cap into consecutive sends. */
     private fun emitSamples(me: MotionEvent, idx: Int, size: IntSize) {
         val history = minOf(me.historySize, MAX_SAMPLES - 1)
         var count = 0

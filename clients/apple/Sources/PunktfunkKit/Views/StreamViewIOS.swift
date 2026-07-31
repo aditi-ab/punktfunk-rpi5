@@ -320,12 +320,22 @@ public final class StreamViewController: StreamViewControllerBase {
         // prior session (stop() doesn't clear it). Otherwise a stale `true` could later
         // re-engage capture on a foreground that the new session never asked for.
         wasCapturedOnResign = false
-        // Read the LIVE mode per touch batch — an accepted requestMode() mid-stream
-        // changes the letterbox, and touches must follow it.
+        // The letterbox must follow an accepted requestMode() mid-stream, so this stays a live
+        // read — but behind a short TTL: the pencil path maps every coalesced sample through
+        // here (≤8 per event at panel rate, main thread), and a per-sample FFI read re-takes
+        // the ABI lock the batch send itself needs next. 250 ms staleness is invisible next to
+        // the video reconfigure a mode switch performs anyway. Main-thread-only closure.
+        var cachedMode = CGSize.zero
+        var cachedAt = CACurrentMediaTime() - 1
         streamView.currentHostMode = { [weak connection] in
-            guard let connection else { return .zero }
-            let mode = connection.currentMode()
-            return CGSize(width: Double(mode.width), height: Double(mode.height))
+            let now = CACurrentMediaTime()
+            if now - cachedAt > 0.25 {
+                guard let connection else { return .zero }
+                let mode = connection.currentMode()
+                cachedMode = CGSize(width: Double(mode.width), height: Double(mode.height))
+                cachedAt = now
+            }
+            return cachedMode
         }
         streamView.onTouchEvent = { [weak self, weak connection] event in
             // Touch IS the intent during a trusted session, but must not leak to the host
