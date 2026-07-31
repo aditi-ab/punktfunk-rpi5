@@ -250,6 +250,8 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConnect<'lo
                 audio: Mutex::new(None),
                 #[cfg(target_os = "android")]
                 mic: Mutex::new(None),
+                // A fresh session is never muted (mute is per-session UI state, not a setting).
+                mic_muted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             };
             Box::into_raw(Box::new(handle)) as jlong
         }

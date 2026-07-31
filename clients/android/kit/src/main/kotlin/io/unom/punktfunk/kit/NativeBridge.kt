@@ -300,8 +300,40 @@ object NativeBridge {
      */
     external fun nativeStartMic(handle: Long, echoCancel: Boolean): Int
 
-    /** Stop + join the mic thread and close the AAudio input stream. No-op on `0`. */
+    /**
+     * Stop + join the mic thread and close the AAudio input stream. No-op on `0`. Leaves the
+     * session's mute state ([nativeSetMicMuted]) alone — a surface recreate stops and restarts the
+     * mic, and a user who muted must stay muted through it.
+     */
     external fun nativeStopMic(handle: Long)
+
+    /**
+     * Mute/unmute the mic uplink mid-stream. Muting does NOT stop the capture: the AAudio input
+     * stream, the input preset it settled on and its primed buffers stay as they are, and the
+     * encode loop drops each 10 ms frame instead of encoding + sending it — so room audio is never
+     * encoded and nothing goes on the wire, while a toggle costs an atomic store and takes effect
+     * on the next 10 ms boundary (a stop/start would re-run the preset fallback ladder and re-prime
+     * buffers every time).
+     *
+     * Sticky for the SESSION — the flag lives on the handle, not on the capture — so the mic
+     * restart a surface recreate performs comes back muted, with no window for an unmuted frame to
+     * escape; a fresh session always starts unmuted. Nothing here is persisted. No-op on `0`.
+     * Cheap (one atomic store); UI-safe.
+     *
+     * One honest consequence of keeping the stream open: the platform's own recording indicator
+     * stays lit while muted, because the mic really is still open. What stops is the encode and the
+     * send — no captured audio leaves the process.
+     */
+    external fun nativeSetMicMuted(handle: Long, muted: Boolean)
+
+    /**
+     * Is a mic capture actually RUNNING — i.e. did [nativeStartMic] open a stream, and has
+     * [nativeStopMic] not been called since? Offer the in-stream mute control on THIS rather than
+     * on the user's setting: a device that refused every AAudio input rung (or a missing
+     * RECORD_AUDIO grant) then shows no control instead of a lie about a mic being heard. `false`
+     * on a `0` handle. Cheap; UI-safe.
+     */
+    external fun nativeMicActive(handle: Long): Boolean
 
     // ---- Input: Kotlin captures, Rust forwards to the host (send_input) ----
 

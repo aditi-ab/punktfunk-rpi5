@@ -9,6 +9,10 @@
 //! the host decodes any Opus frame ≤ 120 ms with its stereo decoder (mono packets upmix), so this
 //! needs no protocol change; speech gains nothing from stereo, and the shorter frame shaves a
 //! buffering interval off the uplink.
+//!
+//! **Mute** is a flag the encode loop reads per 10 ms frame, never a stream teardown: the AAudio
+//! input stream, the input-preset ladder it settled on and its primed buffers all survive a
+//! mute/unmute untouched, so toggling costs an atomic load and nothing else.
 
 use ndk::audio::{
     AudioCallbackResult, AudioDirection, AudioFormat, AudioInputPreset, AudioPerformanceMode,
@@ -63,7 +67,16 @@ impl MicCapture {
     /// preset deliberately bypasses them, which is why the host used to hear its own stream back
     /// from a speaker-playing phone) — and allocates an audio session id for Kotlin's Java-effect
     /// backstop. `None` on failure (the caller leaves the rest of the session streaming).
-    pub fn start(client: Arc<NativeClient>, echo_cancel: bool) -> Option<MicCapture> {
+    ///
+    /// `muted` is the SESSION's live mic-mute flag (owned by `SessionHandle`, not by this capture),
+    /// honoured per frame by [`encode_loop`]. Sharing it rather than owning it is what makes mute
+    /// survive the mic stop/start a surface recreate performs — and means a capture started while
+    /// muted never encodes its first frame, so there is no window for one to escape.
+    pub fn start(
+        client: Arc<NativeClient>,
+        echo_cancel: bool,
+        muted: Arc<AtomicBool>,
+    ) -> Option<MicCapture> {
         let captured = Arc::new(AtomicU64::new(0));
         // Chunks discarded on the capture thread (free-list empty / encoder lagging); logged
         // throttled from the encode worker.
@@ -211,7 +224,7 @@ impl MicCapture {
         let sd = shutdown.clone();
         let join = std::thread::Builder::new()
             .name("pf-mic".into())
-            .spawn(move || encode_loop(client, rx, free_tx, sd, captured, dropped))
+            .spawn(move || encode_loop(client, rx, free_tx, sd, muted, captured, dropped))
             .ok();
 
         Some(MicCapture {
@@ -241,11 +254,16 @@ impl Drop for MicCapture {
 /// Consumer: drain captured f32 → accumulate → Opus `encode_float` 10 ms mono frames → `send_mic`.
 /// Drained chunk buffers go back to the callback's free-list; the encode scratch is reused across
 /// frames (only the packet Vec handed to `send_mic` is allocated per frame — it's sent away owned).
+///
+/// While `muted` is set a formed frame is dropped instead of encoded (see the frame loop) — the
+/// capture side keeps running exactly as it does unmuted, so nothing about the stream, its ring or
+/// its backlog behaviour changes across a toggle.
 fn encode_loop(
     client: Arc<NativeClient>,
     rx: Receiver<Vec<f32>>,
     free_tx: SyncSender<Vec<f32>>,
     shutdown: Arc<AtomicBool>,
+    muted: Arc<AtomicBool>,
     captured: Arc<AtomicU64>,
     dropped: Arc<AtomicU64>,
 ) {
@@ -279,6 +297,7 @@ fn encode_loop(
     let mut seq: u32 = 0;
     let mut sent: u64 = 0;
     let mut stale: u64 = 0; // frames shed by the backlog self-heal (see BACKLOG_MAX_FRAMES)
+    let mut muted_frames: u64 = 0; // frames dropped unencoded because the user muted
     let mut peak = 0f32; // loudest |sample| since the last log — tells speech from silence
 
     while !shutdown.load(Ordering::Relaxed) {
@@ -308,6 +327,22 @@ fn encode_loop(
             stale += (excess / frame) as u64;
         }
         while ring.len() >= frame {
+            // Muted: drop the frame at the last point before it would become an Opus packet —
+            // room audio is never encoded and nothing goes on the wire. `seq` still advances,
+            // because it numbers the captured 10 ms TIMELINE rather than the datagrams: the gap
+            // the host then sees is exactly the audio that never came, which its de-jitter reads
+            // as at most a few concealment frames before the pump's 600 ms stale-gap flush resets
+            // the chain outright — the right reading of a mute. (Encoding silence instead would
+            // keep a pointless uplink and a host-side ring alive for the whole mute.) `peak` is
+            // the loudest sample the UPLINK carried since the last log, so a dropped frame resets
+            // rather than raises it.
+            if muted.load(Ordering::Relaxed) {
+                ring.drain(..frame);
+                seq = seq.wrapping_add(1);
+                muted_frames += 1;
+                peak = 0.0;
+                continue;
+            }
             for (dst, src) in pcm.iter_mut().zip(ring.drain(..frame)) {
                 *dst = src;
             }
@@ -326,7 +361,7 @@ fn encode_loop(
                     if sent % 500 == 0 {
                         log::info!(
                             "mic: sent={sent} captured_frames={} dropped_chunks={} \
-                             stale_frames={stale} peak={peak:.3}",
+                             stale_frames={stale} muted_frames={muted_frames} peak={peak:.3}",
                             captured.load(Ordering::Relaxed),
                             dropped.load(Ordering::Relaxed),
                         );
@@ -338,7 +373,8 @@ fn encode_loop(
         }
     }
     log::info!(
-        "mic: stopped (sent={sent} captured_frames={} dropped_chunks={} stale_frames={stale})",
+        "mic: stopped (sent={sent} captured_frames={} dropped_chunks={} stale_frames={stale} \
+         muted_frames={muted_frames})",
         captured.load(Ordering::Relaxed),
         dropped.load(Ordering::Relaxed),
     );
