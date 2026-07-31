@@ -5,7 +5,7 @@ use super::*;
 use crate::config::Config;
 use crate::error::Result;
 use crate::fec::ErasureCoder;
-use crate::session::Frame;
+use crate::session::{Frame, FramePart};
 use crate::stats::StatsCounters;
 use std::collections::HashMap;
 use zerocopy::FromBytes;
@@ -85,6 +85,11 @@ struct FrameBuf {
     block_count: usize,
     pts_ns: u64,
     user_flags: u32,
+    /// Slice-progressive delivery cursor ([`Reassembler::deliver_parts`]): count of leading
+    /// blocks already handed up as prefix parts...
+    next_part_block: u16,
+    /// ...and their total data shards — the AU shard offset where the next part starts.
+    delivered_shards: usize,
     /// The whole frame's data region — `total_data_shards × shard_bytes` zeroed bytes. Data
     /// shards are copied to their final offset on arrival; FEC reconstruction writes only the
     /// missing shards' ranges. On completion this Vec IS [`Frame::data`] (truncated to
@@ -187,6 +192,11 @@ pub struct Reassembler {
     deliver_partial: bool,
     /// The newest such partial awaiting pickup (newest-wins: partials are a lossy byproduct).
     pending_partial: Option<Frame>,
+    /// Deliver each video AU's newly-contiguous PREFIX as [`Frame`]s with
+    /// [`Frame::part`]`= Some` while the rest is still in flight (client opt-in — the
+    /// slice-progressive decode path). Works for any multi-block frame — both streamed shapes
+    /// and legacy uniform frames tile their blocks contiguously (`BlockState::base_shard`).
+    deliver_parts: bool,
     /// The video stream's window — its aged-out incomplete frames count into `frames_dropped`
     /// (the client's loss-recovery trigger).
     video: ReassemblyWindow,
@@ -210,6 +220,7 @@ impl Reassembler {
             limits,
             deliver_partial: false,
             pending_partial: None,
+            deliver_parts: false,
             video: ReassemblyWindow::default(),
             probe: ReassemblyWindow::default(),
             recovery_pool: Vec::new(),
@@ -223,6 +234,11 @@ impl Reassembler {
         if !on {
             self.pending_partial = None;
         }
+    }
+
+    /// Opt into slice-progressive prefix delivery (see [`Reassembler::deliver_parts`]).
+    pub fn set_deliver_parts(&mut self, on: bool) {
+        self.deliver_parts = on;
     }
 
     /// Take the newest aged-out partial frame, if one is pending (see `set_deliver_partial`).
@@ -260,11 +276,13 @@ impl Reassembler {
             limits,
             deliver_partial,
             pending_partial,
+            deliver_parts,
             video,
             probe,
             recovery_pool,
             in_flight_bytes,
         } = self;
+        let deliver_parts = *deliver_parts;
         let lim = *limits;
         let shard_bytes = hdr.shard_bytes as usize;
         let data_shards = hdr.data_shards as usize;
@@ -454,6 +472,8 @@ impl Reassembler {
                     block_count,
                     pts_ns: hdr.pts_ns,
                     user_flags: hdr.user_flags,
+                    next_part_block: 0,
+                    delivered_shards: 0,
                     buf: vec![0; buf_len],
                     blocks: HashMap::new(),
                     blocks_ok: 0,
@@ -566,8 +586,13 @@ impl Reassembler {
             blocks,
             blocks_ok,
             block_count: frame_block_count,
+            pts_ns: frame_pts_ns,
+            user_flags: frame_user_flags,
+            next_part_block,
+            delivered_shards,
             ..
         } = frame;
+        let (frame_pts_ns, frame_user_flags) = (*frame_pts_ns, *frame_user_flags);
 
         // First packet of a block sizes its state; `data_shards` is already pinned by the
         // derived geometry above, but `recovery_shards` is per-block wire input (adaptive FEC
@@ -713,14 +738,68 @@ impl Reassembler {
             );
             *in_flight_bytes -= done.buf.len();
             done.buf.truncate(done.frame_bytes); // trim trailing-shard zero padding
+                                                 // Slice-progressive consumers already hold the delivered prefix — the completing
+                                                 // packet hands up only the SUFFIX (with `last`), or the degenerate whole-AU part
+                                                 // when nothing was delivered early. Probe filler stays whole either way — the
+                                                 // speed test accounts AUs, not slices.
+            let (data, part) = if deliver_parts && !is_probe {
+                let lo = (done.delivered_shards * shard_bytes).min(done.frame_bytes);
+                let part = FramePart {
+                    offset: lo as u32,
+                    first: lo == 0,
+                    last: true,
+                };
+                if lo == 0 {
+                    (done.buf, Some(part))
+                } else {
+                    (done.buf[lo..].to_vec(), Some(part))
+                }
+            } else {
+                (done.buf, None)
+            };
             return Ok(Some(Frame {
-                data: done.buf,
+                data,
                 frame_index: hdr.frame_index,
                 pts_ns: done.pts_ns,
                 flags: done.user_flags,
                 complete: true,
+                part,
                 received_ns: 0, // stamped by Session::poll_frame at the session boundary
             }));
+        }
+        // Slice-progressive delivery: when this packet completed a block that extends the AU's
+        // contiguous prefix (possibly unlocking blocks that finished out of order behind it),
+        // hand the newly-contiguous bytes up as ONE part. Only successfully-completed blocks
+        // count (`done` alone includes failed reconstructs), and the cursor stops short of the
+        // FINAL block — its zero-padded tail is only trimmed at completion above.
+        if deliver_parts && !is_probe {
+            let start = *delivered_shards;
+            while let Some(b) = blocks.get(&*next_part_block) {
+                if !(b.done && (b.reconstructed || b.data_received == b.data_shards)) {
+                    break;
+                }
+                if block_count != 0 && (*next_part_block as usize) + 1 >= block_count {
+                    break;
+                }
+                *delivered_shards = b.base_shard + b.data_shards;
+                *next_part_block += 1;
+            }
+            if *delivered_shards > start {
+                let (lo, hi) = (start * shard_bytes, *delivered_shards * shard_bytes);
+                return Ok(Some(Frame {
+                    data: buf[lo..hi].to_vec(),
+                    frame_index: hdr.frame_index,
+                    pts_ns: frame_pts_ns,
+                    flags: frame_user_flags,
+                    complete: false,
+                    part: Some(FramePart {
+                        offset: lo as u32,
+                        first: start == 0,
+                        last: false,
+                    }),
+                    received_ns: 0, // stamped by Session::poll_frame at the session boundary
+                }));
+            }
         }
         Ok(None)
     }
@@ -830,6 +909,7 @@ impl ReassemblyWindow {
                                 pts_ns: f.pts_ns,
                                 flags: f.user_flags,
                                 complete: false,
+                                part: None,
                                 received_ns: 0, // stamped by Session::poll_frame at the session boundary
                             });
                         }
@@ -894,6 +974,7 @@ mod reset_tests {
             pts_ns: 1,
             flags: 0,
             complete: false,
+            part: None,
             received_ns: 0,
         });
         r.reset();

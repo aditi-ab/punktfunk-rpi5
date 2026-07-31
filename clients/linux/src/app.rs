@@ -696,9 +696,10 @@ impl AppModel {
                     2,                                // audio_channels: stereo
                     crate::video::decodable_codecs(), // codecs (unused by the probe, but honest)
                     0,                                // preferred_codec: no preference
-                    None, // display_hdr: probe connect, nothing presents
-                    0,    // client_caps: probe connect, nothing renders a cursor
-                    None, // launch: probe connect, no game
+                    None,  // display_hdr: probe connect, nothing presents
+                    0,     // client_caps: probe connect, nothing renders a cursor
+                    false, // frame_parts: probe/whole-AU consumer
+                    None,  // launch: probe connect, no game
                     // Knock under this device's name, not a fingerprint placeholder, when the
                     // probed host doesn't know us yet.
                     Some(pf_client_core::trust::device_name()),

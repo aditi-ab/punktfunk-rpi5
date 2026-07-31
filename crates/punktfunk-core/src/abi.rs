@@ -1871,6 +1871,11 @@ unsafe fn connect_ex_impl(
             // compositing the pointer — only an embedder that renders the cursor planes
             // ([`punktfunk_connection_next_cursor_shape`]/`_state`) may set it. ex7/ex8 pass 0.
             client_caps,
+            // The C ABI cannot carry slice-progressive parts yet — `PunktfunkFrame` has no
+            // part/completeness fields, so a part would be indistinguishable from a whole AU.
+            // An `ex10` variant adds the opt-in together with those fields when an ABI embedder
+            // (Apple) grows a partial-feed decode path.
+            false,
             launch,
             // The C ABI has no device-name parameter (only `punktfunk_pair` takes one), so every
             // embedder gets the OS hostname default — this is what the host's pending-approval

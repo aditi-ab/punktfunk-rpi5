@@ -20,6 +20,27 @@ use crate::stats::{Stats, StatsCounters};
 use crate::transport::Transport;
 use zerocopy::IntoBytes;
 
+/// Slice-progressive delivery metadata ([`Session::set_deliver_frame_parts`]): this [`Frame`]
+/// carries one contiguous piece of an access unit, handed up while the rest is still on the
+/// wire so a `PARTIAL_FRAME`-capable decoder can start ahead of the last packet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FramePart {
+    /// Byte offset of `data` within the whole AU. The reassembler emits parts in order with
+    /// no gaps — but the pre-decode hand-off may drop entries under memory pressure or a
+    /// jump-to-live clear, so a consumer must still verify `offset` equals its open AU's next
+    /// expected byte and treat a mismatch as the AU lost (abandon + flush the decoder's
+    /// partial input, then discard until the next `first`). The same discard applies to a
+    /// non-`first` part arriving with no AU open.
+    pub offset: u32,
+    /// The AU's first part. A `first` part for a NEW `frame_index` while an earlier AU is
+    /// still open means that AU died mid-flight (aged out or was cleared) — abandon it and
+    /// flush the decoder's partial input; no explicit abort part is ever sent.
+    pub first: bool,
+    /// The AU's final part — the whole AU has now been delivered ([`Frame::complete`] is set
+    /// on exactly this part) and the input may be submitted to the decoder as finished.
+    pub last: bool,
+}
+
 /// A reassembled, FEC-recovered access unit, ready to hand to the platform decoder.
 pub struct Frame {
     pub data: Vec<u8>,
@@ -32,6 +53,10 @@ pub struct Frame {
     /// ([`crate::packet::USER_FLAG_CHUNK_ALIGNED`]) are ever delivered partial; missing
     /// shard ranges are zero-filled at their exact offsets.
     pub complete: bool,
+    /// `Some` = slice-progressive delivery is on and this is ONE PIECE of an AU (see
+    /// [`FramePart`]); `data` holds only the part's bytes. `None` = a whole AU (or an
+    /// aged-out chunk-aligned partial — `complete` distinguishes).
+    pub part: Option<FramePart>,
     /// Wall-clock instant (ns since the Unix epoch, CLOCK_REALTIME basis — the same clock the
     /// skew handshake compares and the host stamps `pts_ns` with) at which this AU finished
     /// reassembly, stamped by [`Session::poll_frame`] as the frame leaves the session. Embedders
@@ -611,6 +636,16 @@ impl Session {
         self.reassembler.set_deliver_partial(on);
     }
 
+    /// Client opt-in: deliver each AU's newly-contiguous prefix as [`Frame`]s with
+    /// [`Frame::part`]` = Some` while the rest is still on the wire, instead of one whole-AU
+    /// delivery (the slice-progressive decode path — [`crate::packet::USER_FLAG_SLICE_STREAM`]).
+    /// With it on, EVERY video frame delivery carries `part: Some` (a frame with no early
+    /// parts arrives as the degenerate `{offset: 0, first, last}` whole). Do not combine with
+    /// an all-intra (PyroWave) stream: its newest-wins draining assumes whole AUs.
+    pub fn set_deliver_frame_parts(&mut self, on: bool) {
+        self.reassembler.set_deliver_parts(on);
+    }
+
     /// The session's negotiated wire shard payload size (bytes of AU per datagram) —
     /// the window size for chunk-aligned AUs (`USER_FLAG_CHUNK_ALIGNED`).
     pub fn shard_payload(&self) -> usize {
@@ -710,7 +745,11 @@ impl Session {
                 p.packets += 1;
             }
             if let Some(frame) = pushed {
-                StatsCounters::add(&self.stats.frames_completed, 1);
+                // A prefix part is not a completed frame — only the delivery that closes the
+                // AU counts, or parts would multiply the completion rate.
+                if frame.complete {
+                    StatsCounters::add(&self.stats.frames_completed, 1);
+                }
                 return Ok(stamp_received(frame));
             }
             // A push that completed nothing may still have aged a partial out — deliver it

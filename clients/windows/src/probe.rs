@@ -54,10 +54,11 @@ pub fn run_speed_probe(
         0, // video_caps: probe connect, nothing is decoded
         2, // audio_channels: stereo baseline
         decodable_codecs(),
-        0,    // preferred_codec: no preference
-        None, // display_hdr: probe connect, nothing presents
-        0,    // client_caps: probe connect, nothing renders a cursor
-        None, // launch: no game
+        0,     // preferred_codec: no preference
+        None,  // display_hdr: probe connect, nothing presents
+        0,     // client_caps: probe connect, nothing renders a cursor
+        false, // frame_parts: probe/whole-AU consumer
+        None,  // launch: no game
         // Same label a real session sends — a speed test against a host that doesn't know us yet
         // should knock under this device's name, not a fingerprint placeholder.
         Some(punktfunk_core::client::device_name()),

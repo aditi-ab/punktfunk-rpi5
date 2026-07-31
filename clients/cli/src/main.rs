@@ -798,14 +798,15 @@ from the config directory for a true factory reset."
             },
             punktfunk_core::config::CompositorPref::Auto,
             punktfunk_core::config::GamepadPref::Auto,
-            0,    // bitrate_kbps: the host's default; this connect never presents
-            0,    // video_caps: nothing decodes here
-            2,    // audio_channels
-            0,    // video_codecs: the probe carries no video
-            0,    // preferred_codec
-            None, // display_hdr
-            0,    // client_caps: nothing renders a cursor
-            None, // launch
+            0,     // bitrate_kbps: the host's default; this connect never presents
+            0,     // video_caps: nothing decodes here
+            2,     // audio_channels
+            0,     // video_codecs: the probe carries no video
+            0,     // preferred_codec
+            None,  // display_hdr
+            0,     // client_caps: nothing renders a cursor
+            false, // frame_parts: probe/whole-AU consumer
+            None,  // launch
             Some(punktfunk_core::client::device_name()),
             Some(pin),
             Some(identity),

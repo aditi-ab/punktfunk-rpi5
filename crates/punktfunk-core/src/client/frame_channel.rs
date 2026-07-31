@@ -321,9 +321,18 @@ impl FrameChannel {
         self.ready.notify_one();
     }
 
-    /// Pump side: current queued depth — the clock-free standing-queue signal.
+    /// Pump side: current queued depth in ACCESS UNITS — the clock-free standing-queue
+    /// signal. Slice-progressive parts of a still-open AU don't count (the detector's
+    /// thresholds are in frames; counting parts would trip it at a fraction of the real
+    /// backlog), and a queue that stops draining still accumulates completed AUs.
     pub(crate) fn depth(&self) -> usize {
-        self.inner.lock().unwrap().q.len()
+        self.inner
+            .lock()
+            .unwrap()
+            .q
+            .iter()
+            .filter(|f| f.complete)
+            .count()
     }
 
     /// Pump side: discard the whole backlog (the jump-to-live path); returns how many were dropped.
@@ -378,8 +387,32 @@ mod frame_channel_tests {
             pts_ns: i as u64,
             flags: 0,
             complete: true,
+            part: None,
             received_ns: 0,
         }
+    }
+
+    /// `depth()` is the standing-queue detector's signal, in AU units: parts of a
+    /// still-open AU must not count (the thresholds are frames — parts would trip
+    /// jump-to-live at a fraction of the real backlog), while completed AUs always do.
+    #[test]
+    fn depth_counts_aus_not_parts() {
+        let ch = FrameChannel::new();
+        let mut p = frame(1);
+        p.complete = false;
+        p.part = Some(crate::session::FramePart {
+            offset: 0,
+            first: true,
+            last: false,
+        });
+        ch.push(p);
+        assert_eq!(
+            ch.depth(),
+            0,
+            "an open AU's prefix part is not a queued frame"
+        );
+        ch.push(frame(2));
+        assert_eq!(ch.depth(), 1);
     }
 
     fn popped(ch: &FrameChannel) -> Option<u32> {

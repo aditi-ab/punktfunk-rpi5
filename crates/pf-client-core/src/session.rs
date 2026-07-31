@@ -272,6 +272,9 @@ fn pump(
         } else {
             0
         },
+        // Slice-progressive delivery: off — this presenter feeds FFmpeg whole AUs; a partial
+        // avcodec feed path can flip it later.
+        false,
         params.launch.clone(),
         // The host's approval-list / trust-store label for this client. Without it every no-PIN
         // "request access" knock showed up as the fingerprint placeholder "device abcd1234".

@@ -221,6 +221,12 @@ pub(super) async fn connect_and_handshake(args: &WorkerArgs) -> Result<Handshake
         if welcome.codec == crate::quic::CODEC_PYROWAVE {
             session.set_deliver_partial_frames(true);
         }
+        // Slice-progressive delivery (the embedder's opt-in): AU prefixes hand up as
+        // `Frame::part` pieces while the tail is still on the wire. Never on PyroWave — its
+        // all-intra frame channel drains newest-wins, which assumes whole AUs.
+        if args.frame_parts && welcome.codec != crate::quic::CODEC_PYROWAVE {
+            session.set_deliver_frame_parts(true);
+        }
         Ok::<_, PunktfunkError>((
             session,
             send,

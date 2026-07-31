@@ -1296,6 +1296,188 @@ fn slice_streamed_mixed_flag_packet_dropped() {
     assert_eq!(stats.snapshot().frames_dropped, 0, "dropped, not killed");
 }
 
+// ---------------------------------------------------------------------------
+// Slice-progressive prefix delivery (Frame::part — P2c)
+// ---------------------------------------------------------------------------
+
+/// Push packets collecting EVERY delivery (parts and completions), returning them in order.
+fn push_collect(
+    r: &mut Reassembler,
+    coder: &dyn crate::fec::ErasureCoder,
+    stats: &StatsCounters,
+    delivery: &[Vec<u8>],
+) -> Vec<crate::session::Frame> {
+    let mut out = Vec::new();
+    for p in delivery {
+        if let Some(f) = r.push(p, coder, stats).unwrap() {
+            out.push(f);
+        }
+    }
+    out
+}
+
+/// In-order slice delivery streams one part per completed block, offsets tiling exactly, the
+/// final delivery carrying only the suffix with `last` + `complete`.
+#[test]
+fn parts_stream_in_order() {
+    let (pkts, src) = slice_streamed_packets();
+    let cfg = slice_config();
+    let mut r = Reassembler::new(ReassemblerLimits::from_config(&cfg));
+    r.set_deliver_parts(true);
+    let coder = coder_for(FecScheme::Gf16);
+    let stats = StatsCounters::default();
+    let got = push_collect(&mut r, coder.as_ref(), &stats, &pkts);
+    assert_eq!(
+        got.len(),
+        4,
+        "three sentinel-block parts + the final suffix"
+    );
+    let mut rebuilt = Vec::new();
+    for (i, f) in got.iter().enumerate() {
+        let part = f
+            .part
+            .expect("parts mode: every delivery carries part meta");
+        assert_eq!(
+            part.offset as usize,
+            rebuilt.len(),
+            "parts tile with no gaps"
+        );
+        assert_eq!(part.first, i == 0);
+        assert_eq!(part.last, i + 1 == got.len());
+        assert_eq!(
+            f.complete, part.last,
+            "complete rides exactly the last part"
+        );
+        rebuilt.extend_from_slice(&f.data);
+    }
+    assert_eq!(rebuilt, src, "concatenated parts must be the byte-exact AU");
+    assert_eq!(
+        stats.snapshot().frames_completed,
+        0,
+        "the reassembler leaves the completion count to the session boundary"
+    );
+}
+
+/// A block completing BEHIND the prefix emits nothing; the block that closes the gap emits
+/// ONE coalesced part spanning everything unlocked.
+#[test]
+fn parts_coalesce_across_reordered_blocks() {
+    let (pkts, src) = slice_streamed_packets();
+    let hdr_of = |p: &Vec<u8>| PacketHeader::read_from_bytes(&p[..HEADER_LEN]).unwrap();
+    // Blocks 1 and 2 fully first, then block 0, then the final block.
+    let mut delivery: Vec<Vec<u8>> = Vec::new();
+    for want in [1u16, 2, 0] {
+        delivery.extend(
+            pkts.iter()
+                .filter(|p| {
+                    let h = hdr_of(p);
+                    h.block_count == 0 && h.block_index == want
+                })
+                .cloned(),
+        );
+    }
+    delivery.extend(pkts.iter().filter(|p| hdr_of(p).block_count != 0).cloned());
+
+    let cfg = slice_config();
+    let mut r = Reassembler::new(ReassemblerLimits::from_config(&cfg));
+    r.set_deliver_parts(true);
+    let coder = coder_for(FecScheme::Gf16);
+    let stats = StatsCounters::default();
+    let got = push_collect(&mut r, coder.as_ref(), &stats, &delivery);
+    assert_eq!(got.len(), 2, "one coalesced prefix part + the final suffix");
+    let p0 = got[0].part.unwrap();
+    assert_eq!((p0.offset, p0.first, p0.last), (0, true, false));
+    assert_eq!(got[0].data.len(), 720 + 288, "blocks 0-2 in one part");
+    let p1 = got[1].part.unwrap();
+    assert!(p1.last && got[1].complete);
+    let mut rebuilt = got[0].data.clone();
+    rebuilt.extend_from_slice(&got[1].data);
+    assert_eq!(rebuilt, src);
+}
+
+/// Loss inside a block delays its part until FEC reconstructs it — the part then carries the
+/// recovered bytes, still byte-exact.
+#[test]
+fn parts_wait_for_fec_reconstruction() {
+    let (pkts, src) = slice_streamed_packets();
+    let hdr_of = |p: &Vec<u8>| PacketHeader::read_from_bytes(&p[..HEADER_LEN]).unwrap();
+    // Kill two data shards of block 0 — within the 50% parity budget.
+    let delivery: Vec<Vec<u8>> = pkts
+        .iter()
+        .filter(|p| {
+            let h = hdr_of(p);
+            !(h.block_count == 0 && h.block_index == 0 && [1, 7].contains(&h.shard_index))
+        })
+        .cloned()
+        .collect();
+    let cfg = slice_config();
+    let mut r = Reassembler::new(ReassemblerLimits::from_config(&cfg));
+    r.set_deliver_parts(true);
+    let coder = coder_for(FecScheme::Gf16);
+    let stats = StatsCounters::default();
+    let got = push_collect(&mut r, coder.as_ref(), &stats, &delivery);
+    let mut rebuilt = Vec::new();
+    for f in &got {
+        rebuilt.extend_from_slice(&f.data);
+    }
+    assert_eq!(
+        rebuilt, src,
+        "reconstructed prefix parts must be byte-exact"
+    );
+    assert!(got.last().unwrap().complete);
+}
+
+/// With parts on, a legacy single-block frame degenerates to ONE whole-AU delivery carrying
+/// `{offset 0, first, last}` — the consumer's feed logic stays uniform.
+#[test]
+fn parts_degenerate_whole_frame() {
+    let cfg = e2e_config(FecScheme::Gf16, 50);
+    let coder = coder_for(FecScheme::Gf16);
+    let mut pk = Packetizer::new(&cfg);
+    let src: Vec<u8> = (0..40).map(|i| i as u8).collect();
+    let pkts = pk.packetize(&src, 7, 0, coder.as_ref()).unwrap();
+    let mut r = Reassembler::new(ReassemblerLimits::from_config(&cfg));
+    r.set_deliver_parts(true);
+    let stats = StatsCounters::default();
+    let got = push_collect(&mut r, coder.as_ref(), &stats, &pkts);
+    assert_eq!(got.len(), 1);
+    let f = &got[0];
+    assert_eq!(
+        f.part,
+        Some(crate::session::FramePart {
+            offset: 0,
+            first: true,
+            last: true
+        })
+    );
+    assert!(f.complete);
+    assert_eq!(f.data, src);
+}
+
+/// Parts also flow for the LEGACY streamed shape (uniform full-K sentinels) — the prefix
+/// cursor rides `base_shard`, which both wire shapes maintain.
+#[test]
+fn parts_flow_for_legacy_streamed_frames() {
+    let chunks: Vec<Vec<u8>> = (0..3)
+        .map(|c| (0..50).map(|i| (c * 57 + i * 131 + 7) as u8).collect())
+        .collect();
+    let chunk_refs: Vec<&[u8]> = chunks.iter().map(|c| c.as_slice()).collect();
+    let (pkts, src) = streamed_packets(FecScheme::Gf16, 50, &chunk_refs);
+    let cfg = e2e_config(FecScheme::Gf16, 50);
+    let mut r = Reassembler::new(ReassemblerLimits::from_config(&cfg));
+    r.set_deliver_parts(true);
+    let coder = coder_for(FecScheme::Gf16);
+    let stats = StatsCounters::default();
+    let got = push_collect(&mut r, coder.as_ref(), &stats, &pkts);
+    assert!(got.len() > 1, "sentinel blocks must deliver early parts");
+    let mut rebuilt = Vec::new();
+    for f in &got {
+        rebuilt.extend_from_slice(&f.data);
+    }
+    assert_eq!(rebuilt, src);
+    assert!(got.last().unwrap().complete);
+}
+
 /// A sentinel first-packet commits a MAX-sized frame buffer, so the in-flight budget must
 /// bite after IN_FLIGHT_BUF_FACTOR frames — the amplification bound for one-datagram opens.
 #[test]

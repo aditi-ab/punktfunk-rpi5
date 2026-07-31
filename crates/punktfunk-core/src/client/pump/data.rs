@@ -520,7 +520,12 @@ impl DataPump {
                     if frame.flags & FLAG_PROBE as u32 != 0 {
                         continue; // speed-test filler, not video — measured via the counters above
                     }
-                    if pump_perf_on {
+                    // A prefix part is not an AU arrival: the inter-arrival series, the OWD
+                    // window and the clock-based staleness detector below all measure per-AU
+                    // signals, so only the delivery that completes an AU feeds them (parts
+                    // would bias OWD low and constantly reset the staleness run).
+                    let is_au = frame.complete;
+                    if pump_perf_on && is_au {
                         let now = Instant::now();
                         if let Some(prev) = last_arrival.replace(now) {
                             // 4096 ≈ 17 s at 240 fps — a stuck window can't grow it unbounded.
@@ -552,7 +557,7 @@ impl DataPump {
                         stale_since = None;
                         standing_since = None;
                     } else {
-                        let lat_ns = if clock_offset_ns != 0 {
+                        let lat_ns = if clock_offset_ns != 0 && is_au {
                             now_realtime_ns() + clock_offset_ns as i128 - frame.pts_ns as i128
                         } else {
                             0
@@ -576,7 +581,7 @@ impl DataPump {
                             && lat_ns > FLUSH_LATENCY.as_nanos() as i128
                         {
                             stale_since.get_or_insert_with(Instant::now);
-                        } else {
+                        } else if is_au {
                             stale_since = None;
                         }
                         let depth = frames.depth();

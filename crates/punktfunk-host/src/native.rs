@@ -2282,17 +2282,18 @@ mod tests {
             mode,
             CompositorPref::Auto,
             GamepadPref::Auto,
-            0,    // bitrate_kbps
-            0,    // video_caps
-            2,    // audio_channels
-            0,    // video_codecs (HEVC-only)
-            0,    // preferred_codec
-            None, // display_hdr
-            0,    // client_caps
-            None, // launch
-            None, // name
-            None, // pin (TOFU)
-            None, // identity (host doesn't require pairing)
+            0,     // bitrate_kbps
+            0,     // video_caps
+            2,     // audio_channels
+            0,     // video_codecs (HEVC-only)
+            0,     // preferred_codec
+            None,  // display_hdr
+            0,     // client_caps
+            false, // frame_parts (whole-AU delivery)
+            None,  // launch
+            None,  // name
+            None,  // pin (TOFU)
+            None,  // identity (host doesn't require pairing)
             std::time::Duration::from_secs(10),
         )
         .expect("client connects to synthetic host");
@@ -2455,15 +2456,16 @@ mod tests {
             CompositorPref::Auto,
             GamepadPref::Auto,
             0,
-            0,    // video_caps
-            2,    // audio_channels (stereo)
-            0,    // video_codecs (0 → HEVC-only)
-            0,    // preferred_codec (auto)
-            None, // display_hdr
-            0,    // client_caps
-            None, // launch
-            None, // name: absent on purpose — this test asserts the fingerprint-derived label
-            None, // pin: TOFU — the operator's approval (not a PIN) authorizes this client
+            0,     // video_caps
+            2,     // audio_channels (stereo)
+            0,     // video_codecs (0 → HEVC-only)
+            0,     // preferred_codec (auto)
+            None,  // display_hdr
+            0,     // client_caps
+            false, // frame_parts (whole-AU delivery)
+            None,  // launch
+            None,  // name: absent on purpose — this test asserts the fingerprint-derived label
+            None,  // pin: TOFU — the operator's approval (not a PIN) authorizes this client
             Some((cert, key)),
             std::time::Duration::from_secs(15),
         )
@@ -2524,14 +2526,15 @@ mod tests {
                 CompositorPref::Auto,
                 GamepadPref::Auto,
                 0,
-                0,    // video_caps
-                2,    // audio_channels (stereo)
-                0,    // video_codecs
-                0,    // preferred_codec
-                None, // display_hdr
-                0,    // client_caps
-                None, // launch
-                None, // name
+                0,     // video_caps
+                2,     // audio_channels (stereo)
+                0,     // video_codecs
+                0,     // preferred_codec
+                None,  // display_hdr
+                0,     // client_caps
+                false, // frame_parts (whole-AU delivery)
+                None,  // launch
+                None,  // name
                 None,
                 None,
                 timeout
@@ -2555,14 +2558,15 @@ mod tests {
             CompositorPref::Auto,
             GamepadPref::Auto,
             0,
-            0,    // video_caps
-            2,    // audio_channels (stereo)
-            0,    // video_codecs
-            0,    // preferred_codec
-            None, // display_hdr
-            0,    // client_caps
-            None, // launch
-            None, // name
+            0,     // video_caps
+            2,     // audio_channels (stereo)
+            0,     // video_codecs
+            0,     // preferred_codec
+            None,  // display_hdr
+            0,     // client_caps
+            false, // frame_parts (whole-AU delivery)
+            None,  // launch
+            None,  // name
             Some(host_fp),
             Some((cert.clone(), key.clone())),
             timeout,

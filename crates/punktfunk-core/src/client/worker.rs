@@ -23,6 +23,10 @@ pub(crate) struct WorkerArgs {
     pub(crate) preferred_codec: u8,
     pub(crate) display_hdr: Option<HdrMeta>,
     pub(crate) client_caps: u8,
+    /// Slice-progressive delivery opt-in ([`crate::session::Session::set_deliver_frame_parts`]):
+    /// only an embedder whose decode path understands [`crate::session::Frame::part`] may set
+    /// it. Ignored on all-intra (PyroWave) sessions — their newest-wins draining needs whole AUs.
+    pub(crate) frame_parts: bool,
     pub(crate) launch: Option<String>,
     /// This device's display name, sent in `Hello` (the host's approval list / trust store label).
     pub(crate) name: Option<String>,

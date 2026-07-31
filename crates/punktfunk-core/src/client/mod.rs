@@ -354,6 +354,11 @@ impl NativeClient {
         // the video for a session that advertises it, so a non-rendering embedder that sets it
         // streams with NO visible cursor at all. `0` = today's composited behavior.
         client_caps: u8,
+        // Slice-progressive delivery opt-in: AU prefixes arrive as [`Frame`]s with
+        // [`crate::session::Frame::part`]` = Some` while the rest is still on the wire. Set it
+        // ONLY when this embedder's decode path understands parts (e.g. feeds MediaCodec with
+        // BUFFER_FLAG_PARTIAL_FRAME); with it false every AU arrives whole, exactly as before.
+        frame_parts: bool,
         launch: Option<String>,
         // This device's display name, carried in [`crate::quic::Hello::name`]: what the host's
         // pending-approval list shows when an unpaired client knocks, and what its trust store
@@ -438,6 +443,7 @@ impl NativeClient {
                     preferred_codec,
                     display_hdr,
                     client_caps,
+                    frame_parts,
                     launch,
                     name,
                     pin,
