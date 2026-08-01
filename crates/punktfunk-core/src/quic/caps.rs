@@ -111,6 +111,16 @@ pub const CLIENT_CAP_CURSOR: u8 = 0x01;
 /// simply ignored — no behavior change in either direction.
 pub const CLIENT_CAP_PHASE_LOCK: u8 = 0x02;
 
+/// [`Hello::client_caps`] bit: the client understands the pad-audio plane
+/// ([`PAD_AUDIO_MAGIC`](super::datagram::PAD_AUDIO_MAGIC), `0xD1`) — per-gamepad DualSense
+/// voice-coil haptics + speaker Opus frames, plus the [`HidOutput::AudioCtl`]
+/// (super::datagram::HidOutput) routing/volume events. Active only when the host answers with
+/// [`HOST_CAP_PAD_AUDIO`] AND the pad's arrival declared a renderer for the kind
+/// ([`crate::input::ARRIVAL_FLAG_PAD_AUDIO_HAPTICS`]/`_SPEAKER`) — the capable-and-agreed
+/// precedent, per pad; toward an older or incapable host nothing changes. `0x04` — `0x01` is
+/// [`CLIENT_CAP_CURSOR`], `0x02` is [`CLIENT_CAP_PHASE_LOCK`].
+pub const CLIENT_CAP_PAD_AUDIO: u8 = 0x04;
+
 /// [`Welcome::host_caps`] bit: the host CAN forward the cursor out-of-band (it captures cursor
 /// metadata separately from the frame — the Linux portal `SPA_META_Cursor` path; NOT gamescope,
 /// whose capture carries no cursor, and NOT Windows yet, where DWM composites into the IDD
@@ -131,6 +141,17 @@ pub const HOST_CAP_CURSOR: u8 = 0x08;
 /// which is exactly why the gate exists. `0x10` — `0x08` is [`HOST_CAP_CURSOR`], `0x04` is
 /// [`HOST_CAP_TEXT_INPUT`], `0x01`/`0x02` are gamepad-state / clipboard.
 pub const HOST_CAP_PEN: u8 = 0x10;
+
+/// [`Welcome::host_caps`] bit: the host can capture pad audio — its virtual DualSense exposes
+/// the pad's audio endpoints (voice-coil haptics + speaker), so a game's per-pad audio can be
+/// captured and shipped on the [`PAD_AUDIO_MAGIC`](super::datagram::PAD_AUDIO_MAGIC) plane.
+/// Set only when the client asked via [`CLIENT_CAP_PAD_AUDIO`]; when both bits agree, a
+/// capable client marks its pads' render capabilities on their arrivals
+/// ([`crate::input::ARRIVAL_FLAG_PAD_AUDIO_HAPTICS`]/`_SPEAKER`) and the host emits `0xD1`
+/// toward exactly those pads. `0x20` — `0x10` is [`HOST_CAP_PEN`], `0x08` is
+/// [`HOST_CAP_CURSOR`], `0x04` is [`HOST_CAP_TEXT_INPUT`], `0x01`/`0x02` are gamepad-state /
+/// clipboard.
+pub const HOST_CAP_PAD_AUDIO: u8 = 0x20;
 
 /// [`Hello::video_codecs`] bit: the client can decode H.264 / AVC. The GPU-less **software**
 /// encode path (openh264) emits H.264, so a client that wants to stream from a software host MUST
@@ -312,6 +333,28 @@ mod tests {
             Welcome::decode(&w.encode()).unwrap().host_caps & HOST_CAP_CLIPBOARD,
             0
         );
+    }
+
+    #[test]
+    fn pad_audio_cap_bits_are_distinct() {
+        // The new pad-audio bits pack into the existing caps bytes without colliding with any
+        // taken bit (a collision would silently negotiate an unrelated feature).
+        assert_eq!(
+            CLIENT_CAP_PAD_AUDIO & (CLIENT_CAP_CURSOR | CLIENT_CAP_PHASE_LOCK),
+            0
+        );
+        assert_eq!(
+            HOST_CAP_PAD_AUDIO
+                & (HOST_CAP_GAMEPAD_STATE
+                    | HOST_CAP_CLIPBOARD
+                    | HOST_CAP_TEXT_INPUT
+                    | HOST_CAP_CURSOR
+                    | HOST_CAP_PEN),
+            0
+        );
+        // Single-bit values (a multi-bit cap would OR neighbours in).
+        assert_eq!(CLIENT_CAP_PAD_AUDIO.count_ones(), 1);
+        assert_eq!(HOST_CAP_PAD_AUDIO.count_ones(), 1);
     }
 
     #[test]

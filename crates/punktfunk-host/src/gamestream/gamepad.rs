@@ -65,6 +65,8 @@ pub fn decode(plaintext: &[u8]) -> Option<GamepadEvent> {
             index: *b.first()?,
             kind: *b.get(1)?,
             capabilities: le16(2)? as u16,
+            // GameStream's LI_CCAP vocabulary can't express pad audio — native-plane only.
+            audio_caps: 0,
         }),
         _ => None,
     }
@@ -138,6 +140,7 @@ mod tests {
             index,
             kind,
             capabilities,
+            ..
         }) = decode(&wrap(MAGIC_CONTROLLER_ARRIVAL, &body))
         else {
             panic!("expected Arrival");

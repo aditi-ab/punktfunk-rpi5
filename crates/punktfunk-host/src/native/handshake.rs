@@ -544,6 +544,16 @@ pub(super) async fn negotiate(
                 punktfunk_core::quic::HOST_CAP_PEN
             } else {
                 0
+            }
+            // Per-pad DualSense audio (0xD1 + HidOutput::AudioCtl): granted only when the
+            // client asked AND this host can capture it — Windows with the feature enabled
+            // and at least one pad endpoint provisioned at startup. A capable client then
+            // marks its pads' renderers on their arrivals; the input thread streams toward
+            // exactly those pads (`super::pad_audio`).
+            | if super::pad_audio::host_cap(hello.client_caps) {
+                punktfunk_core::quic::HOST_CAP_PAD_AUDIO
+            } else {
+                0
             },
         // The negotiated session AEAD (resolved above) + its 32-byte key toward a ChaCha
         // client; toward everyone else cipher 0 keeps the Welcome byte-identical to the

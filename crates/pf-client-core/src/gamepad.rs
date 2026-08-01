@@ -336,6 +336,9 @@ enum Ctl {
     Detach,
     Pin(Option<String>),
     KindOverride(GamepadPref),
+    /// Which pad-audio streams the session's settings want rendered (bit0 = haptics, bit1 =
+    /// speaker) — the settings half of the per-pad tier-A capability declared at slot open.
+    PadAudioPrefs(u8),
     MenuMode(bool),
     MenuRumble(MenuPulse),
 }
@@ -482,6 +485,18 @@ impl GamepadService {
         let _ = self.ctl.send(Ctl::KindOverride(pref));
     }
 
+    /// Declare which pad-audio streams this session's settings want rendered (`haptics` =
+    /// [`Settings::pad_haptics`](crate::trust::Settings::pad_haptics), `speaker` =
+    /// `pad_speaker == "pad"` via [`crate::pad_audio::speaker_active`]). Drives the per-pad
+    /// tier-A capability bits declared to the core at slot open — a WIRED DualSense/Edge
+    /// declares exactly these; every other pad declares 0. Call before [`Self::attach`],
+    /// like [`Self::set_kind_override`]: slots declare at open time. Defaults to "nothing"
+    /// for an embedder that never calls it, keeping the wire bytes exactly as before.
+    pub fn set_pad_audio_prefs(&self, haptics: bool, speaker: bool) {
+        let bits = (haptics as u8) | ((speaker as u8) << 1);
+        let _ = self.ctl.send(Ctl::PadAudioPrefs(bits));
+    }
+
     pub fn attach(&self, connector: Arc<NativeClient>) {
         let _ = self.ctl.send(Ctl::Attach(connector));
     }
@@ -611,6 +626,11 @@ fn axis_value(axis: sdl3::gamepad::Axis, v: i16) -> (u32, i32) {
 struct Ds5Feedback;
 
 impl Ds5Feedback {
+    /// The audio-control region (`ucHeadphoneVolume`…`ucAudioMuteBits`, struct offsets 4..=9).
+    /// The 47-byte effect struct is the USB report 0x02 minus its report-id byte, so struct
+    /// offset 4 = report byte 5 (the same −1 shift that maps report offset 11 to
+    /// [`Self::RIGHT_TRIGGER`] = 10 in [`trigger_packet`](Self::trigger_packet)).
+    const AUDIO: usize = 4;
     const RIGHT_TRIGGER: usize = 10;
     const LEFT_TRIGGER: usize = 21;
     const PAD_LIGHTS: usize = 43;
@@ -642,6 +662,29 @@ impl Ds5Feedback {
         let mut p = [0u8; 47];
         p[1] = 0x10; // player-LED enable
         p[Self::PAD_LIGHTS] = bits & 0x1F;
+        p
+    }
+
+    /// The one-shot tier-A activation packet — the SDL disable-bit trap undone. `p[0]`
+    /// (`ucEnableBits1`) bit0 = "enable rumble emulation" and bit1 = "disable audio haptics"
+    /// (SDL_hidapi_ps5.c); SDL sets BOTH whenever its rumble path runs, which mutes the very
+    /// voice coils the 0xD1 haptics stream drives. Per SDL's own comment — "Leaving emulated
+    /// rumble bits off will restore audio haptics" — a packet with those bits CLEARED (and no
+    /// other valid flag, so nothing else is touched) puts the pad back on audio haptics.
+    fn audio_haptics_packet() -> [u8; 47] {
+        [0u8; 47]
+    }
+
+    /// Fold a host [`HidOutput::AudioCtl`] into an effects packet: `raw` is DS5 output report
+    /// `0x02` bytes 5..=10 verbatim → struct offsets 4..=9 ([`Self::AUDIO`] — headphone/
+    /// speaker/mic volumes + routing), and `p[0]` re-asserts the report's audio-valid flags
+    /// (`flags` bits1..4 = report `flag0` bits 4..7). `flags` bit0 (haptics-select, `flag0`
+    /// bit1 = SDL's "disable audio haptics") is deliberately NOT replayed: bits 0/1 stay
+    /// clear so the pad's audio haptics stay live (see [`audio_haptics_packet`]).
+    fn audio_ctl_packet(flags: u8, raw: &[u8; 6]) -> [u8; 47] {
+        let mut p = [0u8; 47];
+        p[0] = (flags & 0x1E) << 3;
+        p[Self::AUDIO..Self::AUDIO + 6].copy_from_slice(raw);
         p
     }
 }
@@ -677,6 +720,14 @@ struct Slot {
     /// close lift a click held across detach/unplug.
     held_clicks: [bool; 2],
     last_accel: [i16; 3],
+    /// Pad-audio render capabilities declared for this slot (bit0 = haptics, bit1 = speaker
+    /// — the [`NativeClient::set_pad_audio_caps`] bits). Nonzero only for a tier-A pad (a
+    /// WIRED DualSense/Edge, see [`crate::pad_audio::is_tier_a_ds5`]) under matching
+    /// settings; bit0 set additionally suppresses wire rumble for this slot (the SDL
+    /// disable-bit trap — see [`Worker::render_feedback`]).
+    audio_caps: u8,
+    /// The wire-rumble-suppressed notice fired for this slot (log once, not per command).
+    rumble_suppressed_logged: bool,
 }
 
 impl Slot {
@@ -692,6 +743,8 @@ impl Slot {
             surface_last: [(0, 0, false); 2],
             held_clicks: [false; 2],
             last_accel: [0; 3],
+            audio_caps: 0,
+            rumble_suppressed_logged: false,
         }
     }
 
@@ -725,6 +778,10 @@ struct Worker {
     /// `Auto` = per-pad detection. Applied at slot open to the kind DECLARED to the host, never
     /// to [`Slot::pref`] — the local feedback paths must keep reading the physical pad.
     kind_override: GamepadPref,
+    /// Pad-audio streams the session's settings want rendered (bit0 = haptics, bit1 =
+    /// speaker — [`GamepadService::set_pad_audio_prefs`]). `0` (the default) until an embedder
+    /// declares some: tier-A detection then never runs and every arrival stays caps-less.
+    pad_audio_prefs: u8,
     attached: Option<Arc<NativeClient>>,
     /// Raises the UI escape signal; the escape chord fires it once per press.
     escape_tx: async_channel::Sender<()>,
@@ -925,11 +982,18 @@ impl Worker {
             Ok(pad) => {
                 let mut slot = Slot::new(id, index, pref, pad);
                 Self::set_slot_sensors(&mut slot, true);
+                slot.audio_caps = self.pad_audio_caps_for(id, &slot.pad);
                 // Declare this pad's kind BEFORE any of its input, so the host builds a matching
                 // virtual device (mixed types — pad 0 a DualSense, pad 1 an Xbox pad). The core
                 // re-sends it a few times against datagram loss; an older host ignores it and
                 // uses the session-default kind.
                 if let Some(c) = &self.attached {
+                    // Pad-audio render caps go in FIRST — the core ORs them into this (and
+                    // every re-sent) arrival's flags bits 8/9 toward a capable host. ALWAYS
+                    // set (0 for non-tier-A): wire indices are reused within a connection, so
+                    // a tier-A slot that closes must not leave its bits behind for the next
+                    // pad on the same index (the set_rumble_quirks rule).
+                    c.set_pad_audio_caps(index, slot.audio_caps);
                     send(
                         c,
                         InputKind::GamepadArrival,
@@ -952,6 +1016,27 @@ impl Worker {
                     };
                     c.set_rumble_quirks(index as u16, quirks);
                 }
+                if slot.audio_caps != 0 {
+                    if slot.audio_caps & 0x01 != 0 {
+                        // Tier-A haptics activation: the SDL disable-bit trap. SDL's DS5
+                        // driver sets ucEnableBits1 0x01|0x02 ("enable rumble emulation" +
+                        // "disable audio haptics") whenever its rumble path runs — which
+                        // would MUTE the voice coils the 0xD1 stream drives. One effects
+                        // packet with those bits CLEARED puts the pad back on audio haptics
+                        // ("Leaving emulated rumble bits off will restore audio haptics" —
+                        // SDL_hidapi_ps5.c); wire rumble for this slot is suppressed in
+                        // render_feedback so SDL never re-arms them.
+                        let _ = slot.pad.send_effect(&Ds5Feedback::audio_haptics_packet());
+                    }
+                    // Hand the pad to the session's renderer worker. Windows correlation
+                    // needs the HID interface path; Linux matches the sink by signature.
+                    crate::pad_audio::register_tier_a(index, slot.pad.path());
+                    tracing::info!(
+                        index,
+                        caps = slot.audio_caps,
+                        "tier-A DualSense: pad-audio render caps declared"
+                    );
+                }
                 tracing::info!(
                     id,
                     index,
@@ -962,6 +1047,35 @@ impl Worker {
                 self.slots.push(slot);
             }
             Err(e) => tracing::warn!(id, error = %e, "gamepad open failed"),
+        }
+    }
+
+    /// This pad's pad-audio render capabilities (the bits [`NativeClient::set_pad_audio_caps`]
+    /// takes): the settings prefs for a tier-A pad — a physical DualSense/Edge (by VID:PID,
+    /// never the DECLARED kind: the stream renders on the controller in the user's hands) on
+    /// a WIRED connection — and `0` for everything else (tier B/C are out of scope). Wired
+    /// comes from `SDL_GetGamepadConnectionState`; when SDL answers Unknown, the pad's 4-ch
+    /// audio sibling existing is the fallback signal (Bluetooth exposes no audio device).
+    fn pad_audio_caps_for(&self, id: u32, pad: &sdl3::gamepad::Gamepad) -> u8 {
+        if self.pad_audio_prefs == 0 {
+            return 0; // nothing wanted — skip the (possibly probing) wired check entirely
+        }
+        let jid = sdl3::sys::joystick::SDL_JoystickID(id);
+        let vid = self.subsystem.vendor_for_id(jid).unwrap_or(0);
+        let pid = self.subsystem.product_for_id(jid).unwrap_or(0);
+        if !crate::pad_audio::is_tier_a_ds5(vid, pid, true) {
+            return 0; // not a DualSense/Edge — no wired check needed
+        }
+        use sdl3::joystick::ConnectionState;
+        let wired = match pad.connection_state() {
+            Ok(ConnectionState::Wired) => true,
+            Ok(ConnectionState::Wireless) => false,
+            _ => crate::pad_audio::wired_audio_sibling(pad.path().as_deref()),
+        };
+        if crate::pad_audio::is_tier_a_ds5(vid, pid, wired) {
+            self.pad_audio_prefs
+        } else {
+            0
         }
     }
 
@@ -981,6 +1095,11 @@ impl Worker {
             send(&c, InputKind::GamepadRemove, 0, 0, self.slots[i].index);
         }
         let slot = self.slots.remove(i);
+        if slot.audio_caps != 0 {
+            // Take the pad back from the pad-audio renderer (its device-gone path then
+            // re-correlates — and finds nothing until a tier-A pad registers again).
+            crate::pad_audio::unregister_tier_a(slot.index);
+        }
         tracing::info!(
             id = slot.id,
             index = slot.index,
@@ -1269,6 +1388,7 @@ impl Worker {
                     self.refresh_active();
                 }
                 Ok(Ctl::KindOverride(pref)) => self.kind_override = pref,
+                Ok(Ctl::PadAudioPrefs(bits)) => self.pad_audio_prefs = bits & 0x03,
                 Ok(Ctl::MenuMode(on)) => {
                     self.menu_mode = on;
                     if on {
@@ -1540,6 +1660,20 @@ impl Worker {
         // first; the physical silence backstop is in `close_slot_at`).
         while let Ok(cmd) = connector.next_rumble_command(Duration::ZERO) {
             if let Some(slot) = self.slots.iter_mut().find(|s| s.index as u16 == cmd.pad) {
+                // The SDL disable-bit trap: ANY SDL rumble write sets ucEnableBits1
+                // 0x01|0x02, muting the very voice coils the 0xD1 haptics stream drives —
+                // so a slot with tier-A haptics active never issues wire rumble (the stream
+                // carries the feedback; the game's rumble is in its haptics mix).
+                if slot.audio_caps & 0x01 != 0 {
+                    if !slot.rumble_suppressed_logged {
+                        slot.rumble_suppressed_logged = true;
+                        tracing::info!(
+                            pad = slot.index,
+                            "wire rumble suppressed — the pad-audio haptics stream carries feedback"
+                        );
+                    }
+                    continue;
+                }
                 Self::issue_rumble(slot, cmd.low, cmd.high, cmd.backstop_ms);
             }
         }
@@ -1572,6 +1706,17 @@ impl Worker {
                         .pad
                         .send_effect(&Ds5Feedback::trigger_packet(which, effect));
                 }
+                // The audio-control region of a DS5 output report a game wrote host-side
+                // (volumes + routing; the SAMPLES ride 0xD1) — folded back into the physical
+                // pad's effects packet, but only where a tier-A renderer is actually live
+                // (`audio_caps`): replaying speaker volumes at a pad whose audio device
+                // nothing streams to would just mute/blast a future session's start state.
+                // Non-tier-A pads keep dropping it (the pre-pad-audio behaviour).
+                HidOutput::AudioCtl { flags, raw, .. } if is_ds && slot.audio_caps != 0 => {
+                    let _ = slot
+                        .pad
+                        .send_effect(&Ds5Feedback::audio_ctl_packet(flags, &raw));
+                }
                 _ => {}
             }
         }
@@ -1586,6 +1731,8 @@ fn hidout_pad(h: &HidOutput) -> u8 {
         | HidOutput::Trigger { pad, .. }
         | HidOutput::TrackpadHaptic { pad, .. }
         | HidOutput::HidRaw { pad, .. } => *pad,
+        // AudioCtl's pad is u16 on the wire; the index space is 0..MAX_PADS end to end.
+        HidOutput::AudioCtl { pad, .. } => *pad as u8,
     }
 }
 
@@ -1609,6 +1756,7 @@ impl Worker {
             order: Vec::new(),
             pinned: None,
             kind_override: GamepadPref::Auto,
+            pad_audio_prefs: 0,
             attached: None,
             escape_tx,
             disconnect_tx,
@@ -1944,5 +2092,43 @@ mod slot_tests {
             }),
             6
         );
+        // AudioCtl's wire pad is u16; the index space is 0..MAX_PADS end to end.
+        assert_eq!(
+            hidout_pad(&HidOutput::AudioCtl {
+                pad: 7,
+                flags: 0,
+                raw: [0; 6]
+            }),
+            7
+        );
+    }
+
+    /// The AudioCtl fold: the 6 raw bytes (DS5 report 0x02 bytes 5..=10) land at effect-struct
+    /// offsets 4..=9, the report's audio-valid flags (AudioCtl.flags bits1..4) come back as
+    /// p[0] bits 4..7, and the rumble-emulation / disable-audio-haptics bits (p[0] bits 0/1)
+    /// stay CLEAR — setting either would mute the voice coils the 0xD1 stream drives.
+    #[test]
+    fn audio_ctl_folds_report_bytes_into_effect_offsets() {
+        let raw = [0x50, 0x60, 0x70, 0x05, 0x11, 0x22];
+        // flags 0b1_0111: haptics-select (bit0) + audio-valid bits 1/2/4 of the condensed form.
+        let p = Ds5Feedback::audio_ctl_packet(0b1_0111, &raw);
+        assert_eq!(&p[4..10], &raw, "report bytes 5..=10 → struct 4..=9");
+        // bits1..4 (0b1011) → flag0 bits 4..7.
+        assert_eq!(p[0], 0b1011_0000);
+        assert_eq!(
+            p[0] & 0x03,
+            0,
+            "haptics-select must NOT replay into p[0] bits 0/1"
+        );
+        // Nothing else is touched: no trigger/LED enable bits, no stray bytes.
+        assert!(p[1..4].iter().all(|&b| b == 0));
+        assert!(p[10..].iter().all(|&b| b == 0));
+        // No audio-valid flags condenses to no enable bits (raw still carried verbatim).
+        let p = Ds5Feedback::audio_ctl_packet(0b0_0001, &raw);
+        assert_eq!(p[0], 0);
+        assert_eq!(&p[4..10], &raw);
+        // The tier-A activation packet is the all-clear: every enable bit off — per
+        // SDL_hidapi_ps5.c, leaving the emulated-rumble bits off restores audio haptics.
+        assert_eq!(Ds5Feedback::audio_haptics_packet(), [0u8; 47]);
     }
 }

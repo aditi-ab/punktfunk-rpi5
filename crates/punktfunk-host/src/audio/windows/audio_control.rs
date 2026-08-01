@@ -75,6 +75,17 @@ pub(crate) fn host_audio_requested() -> bool {
     std::env::var_os("PUNKTFUNK_HOST_AUDIO").is_some()
 }
 
+/// Endpoint ids among `renders` that are the host's own pad-audio endpoints — the exclusion
+/// data [`plan`] runs on. Detection lives in [`super::pad_endpoint`] (stamped PFDS container /
+/// devnode marker, registry-only reads); this is just the per-pass collection.
+fn pad_render_ids(renders: &[Endpoint]) -> Vec<String> {
+    renders
+        .iter()
+        .filter(|(_, id)| super::pad_endpoint::is_pad_render_endpoint(id))
+        .map(|(_, id)| id.clone())
+        .collect()
+}
+
 /// Enumerate endpoints, compute the assignment, apply the default-device changes (unless
 /// `PUNKTFUNK_KEEP_DEFAULT`), and return the plan for the caller to act on (mic target / loopback
 /// echo guard). `set_playback` — true only from the desktop-audio capture open — additionally
@@ -90,7 +101,17 @@ pub(crate) fn wire_now(set_playback: bool) -> Wiring {
     let want = std::env::var("PUNKTFUNK_MIC_DEVICE")
         .ok()
         .map(|s| s.to_lowercase());
-    let wiring = plan(&renders, &captures, want.as_deref(), host_audio_requested());
+    // The host's own pad-audio ("DualSense speaker") endpoints, by id — the pure plan filters
+    // them out of every role. Identity is platform data (stamped container / devnode marker),
+    // so it is collected HERE and passed in, like the candidate lists themselves.
+    let pad_ids = pad_render_ids(&renders);
+    let wiring = plan(
+        &renders,
+        &captures,
+        want.as_deref(),
+        host_audio_requested(),
+        &pad_ids,
+    );
 
     // Log assignment changes exactly once (first plan included).
     static LAST: Mutex<Option<Wiring>> = Mutex::new(None);
@@ -135,7 +156,7 @@ pub(crate) fn wire_now(set_playback: bool) -> Wiring {
     if let Some((mic_name, mic_id)) = &wiring.mic_render {
         if default_render_id().as_deref() == Some(mic_id.as_str()) {
             // Audible preference = the host_audio plan's loopback pick (real hardware first).
-            match plan(&renders, &captures, want.as_deref(), true).loopback_render {
+            match plan(&renders, &captures, want.as_deref(), true, &pad_ids).loopback_render {
                 Some((name, id)) => match set_default_endpoint(&id) {
                     Ok(()) => tracing::info!(mic = %mic_name, device = %name,
                         "default playback was the virtual-mic target — moved it so desktop \
@@ -184,8 +205,10 @@ fn park_marker_path() -> std::path::PathBuf {
     pf_paths::config_dir().join("audio-default.prev")
 }
 
-/// The current default RENDER endpoint id, if any.
-fn default_render_id() -> Option<String> {
+/// The current default RENDER endpoint id, if any. pub(crate): the pad-endpoint provisioning
+/// uses it for its default-device guard (a freshly minted pad endpoint must never stay the
+/// default playback device).
+pub(crate) fn default_render_id() -> Option<String> {
     wasapi::DeviceEnumerator::new()
         .ok()?
         .get_default_device(&Direction::Render)
@@ -332,8 +355,9 @@ const _: () = {
 
 /// Set `device_id` as the default audio endpoint for eConsole/eMultimedia/eCommunications via the
 /// undocumented `IPolicyConfig::SetDefaultEndpoint` (the call `mmsys.cpl` makes). Errs if any role
-/// fails.
-fn set_default_endpoint(device_id: &str) -> Result<()> {
+/// fails. pub(crate): the pad-endpoint default-device guard restores the operator's default
+/// through the same machinery.
+pub(crate) fn set_default_endpoint(device_id: &str) -> Result<()> {
     use windows::core::{IUnknown, Interface, GUID, PCWSTR};
     use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL};
 

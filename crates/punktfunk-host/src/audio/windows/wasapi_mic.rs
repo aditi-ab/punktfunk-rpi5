@@ -253,25 +253,16 @@ pub(crate) fn install_steam_audio_pair() -> bool {
     mic || spk
 }
 
-/// Install one Steam Streaming driver INF by filename via `DiInstallDriverW` (loaded from
-/// `newdev.dll`, like Apollo, to avoid an extra windows-crate feature). See
-/// [`install_steam_audio_pair`] for the contract; `inf_name` is a bare filename under Steam's
-/// per-arch `drivers\Windows10\{arch}\` directory.
-///
-/// Safe: `inf_name` is a `&str` and every FFI argument is built locally from it, so there is no
-/// precondition a caller could break — the `unsafe` is the `LoadLibraryExW`/`transmute`/call chain
-/// inside, which is this function's own business.
-fn try_install_steam_audio(inf_name: &str) -> bool {
-    use windows::core::{s, w, PCWSTR};
-    use windows::Win32::Foundation::HWND;
+/// Full path of a Steam Remote Play driver INF under Steam's per-arch driver directory
+/// (`%CommonProgramFiles(x86)%\Steam\drivers\Windows10\{arch}\<inf_name>`), as a NUL-terminated
+/// UTF-16 buffer. Shared by [`try_install_steam_audio`] and the pad-endpoint provisioning
+/// ([`super::pad_endpoint`]), which feeds the same INF to `UpdateDriverForPlugAndPlayDevicesW`
+/// when no installed Steam Streaming Speakers devnode exposes its `oemNN.inf`. `None` when the
+/// environment expansion fails (existence is the caller's check).
+pub(crate) fn steam_driver_inf_path(inf_name: &str) -> Option<Vec<u16>> {
+    use windows::core::PCWSTR;
     use windows::Win32::System::Environment::ExpandEnvironmentStringsW;
-    use windows::Win32::System::LibraryLoader::{
-        GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32,
-    };
 
-    if std::env::var_os("PUNKTFUNK_NO_MIC_INSTALL").is_some() {
-        return false;
-    }
     // Steam ships per-arch driver INFs under `Steam\drivers\Windows10\{arch}\`.
     #[cfg(target_arch = "x86_64")]
     let subdir = "x64";
@@ -290,8 +281,33 @@ fn try_install_steam_audio(inf_name: &str) -> bool {
     let n =
         unsafe { ExpandEnvironmentStringsW(PCWSTR(template.as_ptr()), Some(path.as_mut_slice())) };
     if n == 0 || n as usize > path.len() {
+        return None;
+    }
+    path.truncate(n as usize); // keeps the NUL
+    Some(path)
+}
+
+/// Install one Steam Streaming driver INF by filename via `DiInstallDriverW` (loaded from
+/// `newdev.dll`, like Apollo, to avoid an extra windows-crate feature). See
+/// [`install_steam_audio_pair`] for the contract; `inf_name` is a bare filename under Steam's
+/// per-arch `drivers\Windows10\{arch}\` directory.
+///
+/// Safe: `inf_name` is a `&str` and every FFI argument is built locally from it, so there is no
+/// precondition a caller could break — the `unsafe` is the `LoadLibraryExW`/`transmute`/call chain
+/// inside, which is this function's own business.
+fn try_install_steam_audio(inf_name: &str) -> bool {
+    use windows::core::{s, w, PCWSTR};
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::System::LibraryLoader::{
+        GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32,
+    };
+
+    if std::env::var_os("PUNKTFUNK_NO_MIC_INSTALL").is_some() {
         return false;
     }
+    let Some(path) = steam_driver_inf_path(inf_name) else {
+        return false;
+    };
 
     // SAFETY: a static NUL-terminated literal, loaded from System32 only (the flag), so this cannot
     // pick up a planted `newdev.dll` from the working directory. The handle is checked before use.

@@ -183,6 +183,12 @@ pub fn open_virtual_mic(_channels: u32) -> Result<Box<dyn VirtualMic>> {
 mod audio_control;
 #[cfg(target_os = "linux")]
 mod linux;
+// DualSense pad-audio endpoint provisioning + loopback capture (design: pad haptics/audio).
+// pub(crate): the session layer queries endpoints by pad index and the CLI exposes the
+// `pad-endpoint` devtest.
+#[cfg(target_os = "windows")]
+#[path = "audio/windows/pad_endpoint.rs"]
+pub(crate) mod pad_endpoint;
 #[cfg(target_os = "windows")]
 #[path = "audio/windows/wasapi_cap.rs"]
 mod wasapi_cap;

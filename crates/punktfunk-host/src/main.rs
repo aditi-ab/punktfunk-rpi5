@@ -602,6 +602,10 @@ fn real_main() -> Result<()> {
         // hold it, driving the real *WindowsManager end to end. `--index N`, `--seconds N`.
         #[cfg(target_os = "windows")]
         Some("dualsense-windows-test") => devtest::dualsense_windows_test(&args),
+        // Windows: pad-audio endpoint provisioning (`ensure`/`status`) + the pnputil removal
+        // escape hatch (`remove`). `--index N` selects the pad slot (default 0).
+        #[cfg(target_os = "windows")]
+        Some("pad-endpoint") => devtest::pad_endpoint(&args),
         // Capture→encode→file pipeline spike (dev tool).
         Some("spike") => spike::run(parse_spike(&args[1..])?),
         // Native punktfunk/1 host (QUIC control plane + UDP data plane).

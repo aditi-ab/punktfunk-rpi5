@@ -515,6 +515,75 @@ impl Pads {
     }
 }
 
+/// Per-pad 0xD1 streamers (`super::pad_audio`), keyed by pad index like every per-pad table
+/// here (bounded by [`MAX_WIRE_PADS`]; only slots 0..4 can ever have a provisioned endpoint —
+/// `spawn` refuses the rest). Spawned when a negotiated session's DualSense-family arrival
+/// declares renderer bits, reaped on remove / re-declare / session teardown.
+struct PadAudioSlots {
+    /// `(kinds, handle)` per running pad — `kinds` is the arrival's audio-caps mask, kept so
+    /// an identical re-arrival (they are re-sent against datagram loss) is a no-op.
+    slots: [Option<(u8, pad_audio::PadAudioHandle)>; MAX_WIRE_PADS],
+}
+
+impl PadAudioSlots {
+    fn new() -> PadAudioSlots {
+        PadAudioSlots {
+            slots: std::array::from_fn(|_| None),
+        }
+    }
+
+    /// Idempotent spawn: same kinds → keep the running streamer; changed kinds → restart with
+    /// the new mask; not running → spawn (a slot without an endpoint stays empty — bounded
+    /// retries, since arrivals are only re-sent a few times per slot open).
+    fn ensure(&mut self, conn: &quinn::Connection, pad: u8, kinds: u8) {
+        let idx = pad as usize;
+        if idx >= MAX_WIRE_PADS {
+            return;
+        }
+        if let Some((have, _)) = &self.slots[idx] {
+            if *have == kinds {
+                return; // identical re-arrival — keep the running streamer
+            }
+            tracing::info!(
+                pad = idx,
+                "pad-audio kinds changed — restarting the streamer"
+            );
+            self.stop(idx);
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        if let Some(h) = pad_audio::spawn(conn.clone(), pad, kinds, stop) {
+            self.slots[idx] = Some((kinds, h));
+        }
+    }
+
+    /// Stop + reap one pad's streamer. The join rides a detached reaper thread: a quiet pad's
+    /// capturer can sit out its ~5 s recv timeout, and this thread must keep its ≤4 ms
+    /// feedback cadence (games block on GET_REPORT handshakes) — the reaper still joins, just
+    /// not here. A failed reaper spawn falls back to the handle's own drop (signal + join).
+    fn stop(&mut self, idx: usize) {
+        if let Some((_, h)) = self.slots.get_mut(idx).and_then(|s| s.take()) {
+            h.signal();
+            let _ = std::thread::Builder::new()
+                .name("punktfunk1-padreap".into())
+                .spawn(move || h.stop());
+        }
+    }
+
+    /// Session teardown: flag every streamer FIRST so they wind down concurrently, then join —
+    /// the worst case is ONE quiet-endpoint recv timeout (~5 s), well inside the session's
+    /// 10 s side-thread join grace, not one per pad.
+    fn stop_all(&mut self) {
+        for s in self.slots.iter().flatten() {
+            s.1.signal();
+        }
+        for s in &mut self.slots {
+            if let Some((_, h)) = s.take() {
+                h.stop();
+            }
+        }
+    }
+}
+
 /// One client→host input item, both planes on ONE channel so the input thread wakes the
 /// moment either arrives (a second rich channel drained after the 4 ms recv timeout cost
 /// every pure-gyro motion sample up to 4 ms of quantization).
@@ -669,8 +738,13 @@ pub(super) fn input_thread(
     conn: quinn::Connection,
     inj_tx: std::sync::mpsc::Sender<InputEvent>,
     gamepad: GamepadPref,
+    pad_audio_on: bool,
 ) {
     let mut pads = Pads::new(gamepad);
+    // Per-pad 0xD1 audio streamers, live only when the Welcome granted the cap (`pad_audio_on`
+    // — read back off the negotiated host_caps). Spawned on DualSense-family arrivals that
+    // declare renderer bits, reaped on remove/teardown below.
+    let mut pad_streams = PadAudioSlots::new();
     // Motion-cadence observability (debug level): inter-arrival percentiles per 5 s window,
     // the measurement a "gyro feels floaty" report needs. Bounded: 5 s at even a 1 kHz pad
     // is 5000 u32s.
@@ -829,16 +903,53 @@ pub(super) fn input_thread(
                         rumble_seen[idx] = false;
                         rumble_seq[idx] = 0;
                         rumble_stop_burst[idx] = 0;
+                        // The unplugged pad's 0xD1 streamer goes with it (seq-gated like the
+                        // rest of this arm, so a reordered stale removal can't kill the
+                        // stream of a re-plugged pad). A re-plug re-arrives and re-spawns.
+                        pad_streams.stop(idx);
                     }
                 }
                 InputKind::GamepadArrival => {
                     // Per-pad controller kind declaration (mixed types): route this pad's future
-                    // frames to a backend of the declared kind. `code` = the GamepadPref wire byte,
-                    // `flags` = pad index. Applied before the pad's first frame (the client sends it
-                    // on slot open), so the device is built as the right type from the start.
-                    let idx = ev.flags as usize;
+                    // frames to a backend of the declared kind. `code` = the GamepadPref wire
+                    // byte, `flags` = pad index in the LOW BYTE — bits 8/9 carry the pad's
+                    // audio-render caps (haptics/speaker) from a pad-audio-capable client, so
+                    // the index MUST come from `decode_gamepad_arrival`, never the whole word.
+                    // Applied before the pad's first frame (the client sends it on slot open),
+                    // so the device is built as the right type from the start. The audio caps
+                    // are surfaced here for the 0xD1 capture path (which emits pad audio only
+                    // toward pads that declared a renderer).
+                    let (pad, audio_caps) = punktfunk_core::input::decode_gamepad_arrival(ev.flags);
+                    let idx = pad as usize;
                     let kind = GamepadPref::from_u8(ev.code as u8);
+                    if audio_caps != 0 {
+                        tracing::debug!(
+                            pad = idx,
+                            haptics = audio_caps & 0x01 != 0,
+                            speaker = audio_caps & 0x02 != 0,
+                            "pad-audio render caps declared (arrival flags bits 8/9)"
+                        );
+                    }
                     pads.set_kind(idx, kind);
+                    // Pad audio (0xD1): stream toward DualSense-family pads that declared a
+                    // renderer, only on a session that negotiated the cap. Idempotent across
+                    // the arrival re-sends (same kinds keeps the running streamer); a
+                    // re-declare without bits — or as a kind with no pad audio — stops it.
+                    if pad_audio_on {
+                        let want = if matches!(
+                            kind,
+                            GamepadPref::DualSense | GamepadPref::DualSenseEdge
+                        ) {
+                            audio_caps
+                        } else {
+                            0
+                        };
+                        if want != 0 {
+                            pad_streams.ensure(&conn, pad, want);
+                        } else {
+                            pad_streams.stop(idx);
+                        }
+                    }
                 }
                 _ => {
                     // Track press/release so a mid-press disconnect can be undone below.
@@ -994,6 +1105,9 @@ pub(super) fn input_thread(
             flags: 0,
         });
     }
+    // Reap the per-pad 0xD1 streamers with the session (after the instant release sends above
+    // — this can block on a quiet pad's capturer timeout, see PadAudioSlots::stop_all).
+    pad_streams.stop_all();
 }
 
 #[cfg(test)]

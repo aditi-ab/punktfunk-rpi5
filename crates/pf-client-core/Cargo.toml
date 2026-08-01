@@ -57,6 +57,10 @@ sdl3 = { version = "0.18", features = ["hidapi"] }
 
 [target.'cfg(windows)'.dependencies]
 wasapi = "0.23"
+# Pad-audio correlation (pad_audio.rs): the HID devnode's ContainerID and a render endpoint's
+# stamped PKEY_Device_ContainerId both live in the registry — read-only, which sidesteps COM
+# property stores entirely (the same version the host pins).
+winreg = "0.56"
 sdl3 = { version = "0.18", features = ["hidapi", "build-from-source"] }
 # D3D11VA decode (video_d3d11.rs): device/adapter selection, DXVA probes, and the shared
 # NT-handle hand-off ring. Same pinned rev as clients/windows so the workspace builds ONE

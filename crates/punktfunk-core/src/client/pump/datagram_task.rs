@@ -12,6 +12,7 @@ pub(super) async fn run(
     rumble_tx: std::sync::mpsc::SyncSender<RumbleUpdate>,
     rumble_feed: super::super::rumble::RumbleFeed,
     hidout_tx: std::sync::mpsc::SyncSender<crate::quic::HidOutput>,
+    pad_audio_tx: std::sync::mpsc::SyncSender<crate::quic::PadAudioFrame>,
     hdr_meta_tx: std::sync::mpsc::SyncSender<crate::quic::HdrMeta>,
     host_timing_tx: std::sync::mpsc::SyncSender<crate::quic::HostTiming>,
     // The ABR encode signal's accumulator (see [`EncodeLatAcc`]) — fed HERE, not off
@@ -68,6 +69,11 @@ pub(super) async fn run(
             Some(&crate::quic::HIDOUT_MAGIC) => {
                 if let Some(h) = HidOutput::decode(&d) {
                     let _ = hidout_tx.try_send(h);
+                }
+            }
+            Some(&crate::quic::PAD_AUDIO_MAGIC) => {
+                if let Some(f) = crate::quic::decode_pad_audio_datagram(&d) {
+                    let _ = pad_audio_tx.try_send(f);
                 }
             }
             Some(&crate::quic::HDR_META_MAGIC) => {

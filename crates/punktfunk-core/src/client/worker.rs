@@ -5,8 +5,8 @@ use crate::clipboard::{ClipCommand, ClipEventCore};
 use crate::config::{CompositorPref, GamepadPref, Mode};
 use crate::error::Result;
 use crate::input::InputEvent;
-use crate::quic::{HdrMeta, HidOutput};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64};
+use crate::quic::{HdrMeta, HidOutput, PadAudioFrame};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicU8};
 use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex};
 
@@ -43,6 +43,14 @@ pub(crate) struct WorkerArgs {
     /// closed, so the command API always observes connection teardown.
     pub(crate) rumble_feed: super::rumble::RumbleFeed,
     pub(crate) hidout_tx: SyncSender<HidOutput>,
+    /// Inbound pad-audio frames (`0xD1` — DualSense voice-coil haptics + speaker), drained by
+    /// [`NativeClient::next_pad_audio`].
+    pub(crate) pad_audio_tx: SyncSender<PadAudioFrame>,
+    /// Per-pad pad-audio render capabilities (bit0 haptics, bit1 speaker), written by
+    /// [`NativeClient::set_pad_audio_caps`] and OR'd into outgoing
+    /// [`GamepadArrival`](crate::input::InputKind::GamepadArrival) flags (bits 8/9) by the input
+    /// task — toward a `HOST_CAP_PAD_AUDIO` host only.
+    pub(crate) pad_audio_caps: Arc<[AtomicU8; crate::input::MAX_PADS]>,
     pub(crate) hdr_meta_tx: SyncSender<HdrMeta>,
     pub(crate) host_timing_tx: SyncSender<crate::quic::HostTiming>,
     pub(crate) cursor_shape_tx: SyncSender<crate::quic::CursorShape>,

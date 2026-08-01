@@ -475,6 +475,7 @@ mod tests {
             index: 2,
             kind: 1,
             capabilities: 0,
+            audio_caps: 0,
         });
         assert!(m.slots.get(2).is_some());
     }

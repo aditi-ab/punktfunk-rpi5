@@ -156,6 +156,11 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeNextHidout(
                 out[3..n].copy_from_slice(&data);
                 n
             }
+            HidOutput::AudioCtl { .. } => {
+                // DS5 pad-audio routing/volumes — no Android replay path yet (the 0xD1 sample
+                // plane isn't rendered here either); drop it like TrackpadHaptic.
+                return -1;
+            }
         };
         n as jint
     })

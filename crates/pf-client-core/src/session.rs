@@ -44,6 +44,14 @@ pub struct SessionParams {
     /// Run the uplink through the platform's echo cancellation ([`Settings::echo_cancel`]).
     /// Ignored when `mic_enabled` is false; `PUNKTFUNK_NO_AEC=1` overrides it off.
     pub echo_cancel: bool,
+    /// Render the host's per-pad DualSense voice-coil haptics stream (0xD1 kind 0) on a wired
+    /// physical DualSense ([`crate::trust::Settings::pad_haptics`]). With `pad_speaker` it
+    /// gates the `CLIENT_CAP_PAD_AUDIO` advertisement and the pad-audio renderer thread.
+    pub pad_haptics: bool,
+    /// Where the DualSense built-in-speaker stream (0xD1 kind 1) goes: `"pad"` | `"mix"` |
+    /// `"off"` ([`crate::trust::Settings::pad_speaker`]; `"mix"` is a TODO that renders as
+    /// off — see [`crate::pad_audio::speaker_active`]).
+    pub pad_speaker: String,
     /// Share the clipboard with this host (the per-host `KnownHost::clipboard_sync`). The
     /// bridge additionally needs the host to advertise `HOST_CAP_CLIPBOARD`.
     pub clipboard: bool,
@@ -356,6 +364,11 @@ fn pump(
             );
         }
     }
+    // Pad audio (0xD1): advertise only when the settings could render a stream — the per-pad
+    // tier-A detection at slot open (gamepad.rs) still decides which pads declare render caps
+    // on their arrivals, so this bit alone changes nothing without a wired DualSense.
+    let pad_speaker_on = crate::pad_audio::speaker_active(&params.pad_speaker);
+    let pad_audio_on = params.pad_haptics || pad_speaker_on;
     let connector = match NativeClient::connect(
         &params.host,
         params.port,
@@ -379,6 +392,11 @@ fn pump(
             0
         }) | (if params.phase_lock {
             punktfunk_core::quic::CLIENT_CAP_PHASE_LOCK
+        } else {
+            0
+            // PAD_AUDIO: the embedder can render per-pad DualSense haptics/speaker (see above).
+        }) | (if pad_audio_on {
+            punktfunk_core::quic::CLIENT_CAP_PAD_AUDIO
         } else {
             0
         }),
@@ -481,6 +499,20 @@ fn pump(
     // app-lifetime service's job (the UI attaches it on Connected). Audio runs on its own
     // thread (one puller per plane), blocking on the audio queue like the Apple client.
     let audio_thread = spawn_audio(connector.clone(), stop.clone());
+    // Pad audio (0xD1): its own drain thread (that plane's single consumer), spawned whenever
+    // the settings could render. The output device is opened LAZILY once frames actually
+    // arrive — which only happens after a tier-A pad declared render caps on its arrival — so
+    // a session without a wired DualSense costs one idle 10 ms poll loop.
+    let pad_audio_thread = pad_audio_on
+        .then(|| {
+            crate::pad_audio::spawn(
+                connector.clone(),
+                stop.clone(),
+                params.pad_haptics,
+                pad_speaker_on,
+            )
+        })
+        .flatten();
     // The shared clipboard (design/clipboard-and-file-transfer.md §5): its own thread, since
     // `next_clip` blocks and the OS clipboard calls can wait on other apps. Returns straight
     // away when the host has no clipboard capability, so spawning is unconditional.
@@ -1045,6 +1077,9 @@ fn pump(
     mic.set_live(false);
     if let Some(t) = audio_thread {
         let _ = t.join(); // exits within its 100 ms pull timeout once `stop` is set
+    }
+    if let Some(t) = pad_audio_thread {
+        let _ = t.join(); // exits within its 10 ms pull timeout once `stop` is set
     }
     if let Some(t) = clipboard_thread {
         let _ = t.join(); // exits within its next_clip wait once `stop` is set

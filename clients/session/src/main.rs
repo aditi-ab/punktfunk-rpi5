@@ -188,6 +188,12 @@ mod session_main {
         if !settings.forward_pad.is_empty() {
             gamepad.set_pinned(Some(settings.forward_pad.clone()));
         }
+        // Pad-audio prefs to OUR gamepad service (same reasoning as the pin above): tier-A
+        // slots declare their render caps at open time, which happens on attach — after this.
+        gamepad.set_pad_audio_prefs(
+            settings.pad_haptics,
+            pf_client_core::pad_audio::speaker_active(&settings.pad_speaker),
+        );
         let mode = Mode {
             width: if settings.width == 0 {
                 native.width
@@ -291,6 +297,11 @@ mod session_main {
             cursor_forward: settings.mouse_mode() == trust::MouseMode::Desktop,
             mic_enabled: settings.mic_enabled,
             echo_cancel: settings.echo_cancel,
+            // Pad audio (0xD1): the DualSense haptics/speaker render settings. The gamepad
+            // service learns the same prefs below so tier-A slots declare their render caps
+            // at open; the session pump gates CLIENT_CAP_PAD_AUDIO + the renderer on these.
+            pad_haptics: settings.pad_haptics,
+            pad_speaker: settings.pad_speaker.clone(),
             clipboard,
             // The Settings preference (auto → VAAPI where it exists; the presenter
             // demotes to software on boxes whose Vulkan can't import the dmabufs).

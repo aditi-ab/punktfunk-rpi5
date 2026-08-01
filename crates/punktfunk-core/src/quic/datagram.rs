@@ -1,12 +1,15 @@
-//! The QUIC-datagram side planes, demultiplexed by their first byte (0xC9–0xCF):
-//! audio, rumble, mic uplink, rich input, HID output, HDR metadata, host timing.
+//! The QUIC-datagram side planes, demultiplexed by their first byte (0xC9–0xD1):
+//! audio, rumble, mic uplink, rich input, HID output, HDR metadata, host timing,
+//! cursor state, pad audio.
 
 /// Datagram wire tags. Video rides UDP; everything low-rate rides QUIC datagrams,
 /// demultiplexed by the first byte: input = [`crate::input::INPUT_MAGIC`] (0xC8, client→host),
 /// audio = [`AUDIO_MAGIC`] (0xC9, host→client), rumble = [`RUMBLE_MAGIC`] (0xCA, host→client),
 /// mic = [`MIC_MAGIC`] (0xCB, client→host), rich-input = [`RICH_INPUT_MAGIC`] (0xCC, client→host),
 /// HID-output = [`HIDOUT_MAGIC`] (0xCD, host→client), HDR metadata = [`HDR_META_MAGIC`]
-/// (0xCE, host→client).
+/// (0xCE, host→client), host timing = [`HOST_TIMING_MAGIC`] (0xCF, host→client), cursor state =
+/// [`CURSOR_STATE_MAGIC`] (0xD0, host→client), pad audio = [`PAD_AUDIO_MAGIC`] (0xD1,
+/// host→client).
 pub const AUDIO_MAGIC: u8 = 0xC9;
 pub const RUMBLE_MAGIC: u8 = 0xCA;
 /// Microphone uplink: the client's mic, Opus-encoded, client → host (the inverse of
@@ -332,6 +335,7 @@ const HIDOUT_PLAYER_LEDS: u8 = 0x02;
 const HIDOUT_TRIGGER: u8 = 0x03;
 const HIDOUT_TRACKPAD_HAPTIC: u8 = 0x04;
 const HIDOUT_HID_RAW: u8 = 0x05;
+const HIDOUT_AUDIO_CTL: u8 = 0x06;
 
 /// [`HidOutput::HidRaw`] `kind`: an OUTPUT report — what the host's hidraw client wrote with
 /// `write()`/`SDL_hid_write` (Triton rumble `0x80`, haptic pulse `0x81`, …). The client replays
@@ -372,6 +376,16 @@ pub enum HidOutput {
     /// hardware safety timeout, and settings (lizard/IMU) are refreshed every ~3 s against the
     /// firmware watchdog — a lost datagram heals on the next refresh.
     HidRaw { pad: u8, kind: u8, data: Vec<u8> },
+    /// The audio-control region of a DS5 output report `0x02` a game wrote to the host's virtual
+    /// pad — the routing/volume side of pad audio (the audio SAMPLES ride the [`PAD_AUDIO_MAGIC`]
+    /// plane). `raw` is bytes 5..=10 of the report verbatim (headphone/speaker/mic volumes +
+    /// audio routing); `flags` condenses the report's audio valid-flags: bit0 = haptics-select
+    /// (`valid_flag0` bit1 — the title asked for audio haptics on the voice coils), bits1..4 =
+    /// `valid_flag0` bits 4..7 (the audio-valid flags gating `raw`). Wire form
+    /// `[0xCD][0x06][u16 pad LE][u8 flags][6 raw bytes]`. Forwarded change-only (deduped by
+    /// value host-side, like `Led`/`Trigger`) — a merely-rumbling pad re-sends unchanged audio
+    /// state on every output report.
+    AudioCtl { pad: u16, flags: u8, raw: [u8; 6] },
 }
 
 impl HidOutput {
@@ -403,6 +417,12 @@ impl HidOutput {
             HidOutput::HidRaw { pad, kind, data } => {
                 out.extend_from_slice(&[HIDOUT_HID_RAW, *pad, *kind]);
                 out.extend_from_slice(&data[..data.len().min(HID_REPORT_MAX)]);
+            }
+            HidOutput::AudioCtl { pad, flags, raw } => {
+                out.push(HIDOUT_AUDIO_CTL);
+                out.extend_from_slice(&pad.to_le_bytes());
+                out.push(*flags);
+                out.extend_from_slice(raw);
             }
         }
         out
@@ -440,6 +460,11 @@ impl HidOutput {
                 kind: b[3],
                 // Bounded: at most HID_REPORT_MAX bytes are kept from the (attacker-sized) tail.
                 data: b[4..b.len().min(4 + HID_REPORT_MAX)].to_vec(),
+            }),
+            HIDOUT_AUDIO_CTL if b.len() >= 11 => Some(HidOutput::AudioCtl {
+                pad: u16::from_le_bytes([b[2], b[3]]),
+                flags: b[4],
+                raw: b[5..11].try_into().unwrap(),
             }),
             _ => None,
         }
@@ -696,6 +721,72 @@ pub fn decode_cursor_state_datagram(b: &[u8]) -> Option<CursorState> {
         flags: b[5],
         x: i32::from_le_bytes(b[6..10].try_into().unwrap()),
         y: i32::from_le_bytes(b[10..14].try_into().unwrap()),
+    })
+}
+
+/// Pad-audio datagram tag, host → client: per-gamepad audio a game routed
+/// to the host's virtual DualSense — voice-coil haptics and the built-in speaker — for the client
+/// to render on the matching real controller. Next tag after [`CURSOR_STATE_MAGIC`]. The
+/// per-pad AUDIO plane (Opus frames, the [`AUDIO_MAGIC`]/[`MIC_MAGIC`] shape plus pad + kind);
+/// the routing/volume CONTROL side rides [`HidOutput::AudioCtl`]. Emitted only when the session
+/// negotiated it ([`CLIENT_CAP_PAD_AUDIO`](super::caps::CLIENT_CAP_PAD_AUDIO) ∧
+/// [`HOST_CAP_PAD_AUDIO`](super::caps::HOST_CAP_PAD_AUDIO)) and the pad's arrival declared a
+/// renderer for the kind ([`crate::input::ARRIVAL_FLAG_PAD_AUDIO_HAPTICS`]/`_SPEAKER`).
+/// Best-effort like every audio datagram: a lost frame is a concealed gap, never state.
+pub const PAD_AUDIO_MAGIC: u8 = 0xD1;
+
+/// [`PadAudioFrame::kind`]: the BACK channel pair — the DualSense voice-coil actuators (audio
+/// haptics). 5 ms Opus frames, matching the [`AUDIO_MAGIC`] cadence: haptics are felt latency.
+pub const PAD_AUDIO_KIND_HAPTICS: u8 = 0;
+/// [`PadAudioFrame::kind`]: the FRONT channel pair — the controller's built-in speaker. 10 ms
+/// Opus frames (speaker content tolerates the extra buffering for the better coding efficiency).
+pub const PAD_AUDIO_KIND_SPEAKER: u8 = 1;
+
+/// Wire length of a pad-audio datagram header: tag + pad + kind + u32 seq + u64 pts = 15 bytes.
+const PAD_AUDIO_HEADER_LEN: usize = 1 + 1 + 1 + 4 + 8;
+
+/// One decoded pad-audio frame (owned — the client's plane queue stores it). `seq`/`pts_ns` are
+/// per-(pad, kind) counters from the host's capture clock, for gap concealment and lip-sync
+/// against the main audio plane.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PadAudioFrame {
+    /// Gamepad index (the wire pad space, same as rumble/HID-output).
+    pub pad: u8,
+    /// [`PAD_AUDIO_KIND_HAPTICS`] or [`PAD_AUDIO_KIND_SPEAKER`].
+    pub kind: u8,
+    pub seq: u32,
+    pub pts_ns: u64,
+    /// The raw Opus payload — feed it to an Opus decoder as one frame. Empty = DTX silence.
+    pub opus: Vec<u8>,
+}
+
+/// Pad-audio datagram, host → client:
+/// `[0xD1][u8 pad][u8 kind][u32 seq LE][u64 pts_ns LE][opus payload]` — the
+/// [`encode_audio_datagram`]/[`encode_mic_datagram`] layout with a pad + kind prefix, one Opus
+/// frame per datagram (5/10 ms — well under any MTU); QUIC already encrypts.
+pub fn encode_pad_audio_datagram(pad: u8, kind: u8, seq: u32, pts_ns: u64, opus: &[u8]) -> Vec<u8> {
+    let mut b = Vec::with_capacity(PAD_AUDIO_HEADER_LEN + opus.len());
+    b.push(PAD_AUDIO_MAGIC);
+    b.push(pad);
+    b.push(kind);
+    b.extend_from_slice(&seq.to_le_bytes());
+    b.extend_from_slice(&pts_ns.to_le_bytes());
+    b.extend_from_slice(opus);
+    b
+}
+
+/// Parse a pad-audio datagram → [`PadAudioFrame`]. `None` on bad tag/length (the fixed header
+/// length bounds every read before it happens).
+pub fn decode_pad_audio_datagram(buf: &[u8]) -> Option<PadAudioFrame> {
+    if buf.len() < PAD_AUDIO_HEADER_LEN || buf[0] != PAD_AUDIO_MAGIC {
+        return None;
+    }
+    Some(PadAudioFrame {
+        pad: buf[1],
+        kind: buf[2],
+        seq: u32::from_le_bytes(buf[3..7].try_into().unwrap()),
+        pts_ns: u64::from_le_bytes(buf[7..15].try_into().unwrap()),
+        opus: buf[15..].to_vec(),
     })
 }
 
@@ -1027,6 +1118,12 @@ mod tests {
                     f
                 },
             },
+            // The DS5 audio-control region (haptics-select + speaker volume asserted).
+            HidOutput::AudioCtl {
+                pad: 1,
+                flags: 0b0_0101,
+                raw: [0x50, 0x60, 0x70, 0x05, 0x00, 0x00],
+            },
         ];
         for ev in &cases {
             let d = ev.encode();
@@ -1045,6 +1142,47 @@ mod tests {
         )
         .is_none());
     }
+
+    #[test]
+    fn audio_ctl_wire_layout_and_truncation() {
+        // The exact 11-byte layout: [0xCD][0x06][u16 pad LE][u8 flags][6 raw bytes].
+        let a = HidOutput::AudioCtl {
+            pad: 0x0201,
+            flags: 0x17,
+            raw: [1, 2, 3, 4, 5, 6],
+        };
+        let d = a.encode();
+        assert_eq!(d, [0xCD, 0x06, 0x01, 0x02, 0x17, 1, 2, 3, 4, 5, 6]);
+        assert_eq!(HidOutput::decode(&d), Some(a));
+        // Truncated buffers are rejected outright (fixed length — never a partial read).
+        for n in 2..d.len() {
+            assert_eq!(HidOutput::decode(&d[..n]), None);
+        }
+    }
+
+    #[test]
+    fn pad_audio_datagram_roundtrip_and_truncation() {
+        let opus = [0x5Au8; 61];
+        let d = encode_pad_audio_datagram(3, PAD_AUDIO_KIND_HAPTICS, 42, 9_999, &opus);
+        assert_eq!(d[0], PAD_AUDIO_MAGIC);
+        assert_eq!(d.len(), 15 + opus.len());
+        let f = decode_pad_audio_datagram(&d).unwrap();
+        assert_eq!((f.pad, f.kind, f.seq, f.pts_ns), (3, 0, 42, 9_999));
+        assert_eq!(f.opus, opus);
+        // Truncated headers are rejected outright (never partially read).
+        for n in 0..15 {
+            assert_eq!(decode_pad_audio_datagram(&d[..n]), None);
+        }
+        // Tag separation: a pad-audio datagram is not a session-audio/mic datagram and vice-versa.
+        assert!(decode_audio_datagram(&d).is_none());
+        assert!(decode_mic_datagram(&d).is_none());
+        assert!(decode_pad_audio_datagram(&encode_audio_datagram(1, 2, &opus)).is_none());
+        // Empty payload (DTX) is legal — header-only datagram.
+        let hdr = encode_pad_audio_datagram(0, PAD_AUDIO_KIND_SPEAKER, 0, 0, &[]);
+        assert_eq!(hdr.len(), 15);
+        assert!(decode_pad_audio_datagram(&hdr).unwrap().opus.is_empty());
+    }
+
     #[test]
     fn cursor_state_roundtrip() {
         for (flags, x, y) in [

@@ -16,11 +16,13 @@ use crate::config::{CompositorPref, GamepadPref, Mode};
 use crate::error::{PunktfunkError, Result};
 use crate::input::InputEvent;
 use crate::quic::{
-    endpoint, ClipControl, ClipKind, ClipOffer, ColorInfo, HdrMeta, HidOutput, ProbeRequest,
-    RfiRequest, RichInput,
+    endpoint, ClipControl, ClipKind, ClipOffer, ColorInfo, HdrMeta, HidOutput, PadAudioFrame,
+    ProbeRequest, RfiRequest, RichInput,
 };
 use crate::session::Frame;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU16, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{
+    AtomicBool, AtomicI64, AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering,
+};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -43,7 +45,7 @@ use self::control::{CtrlRequest, Negotiated};
 use self::frame_channel::{DecodeLatAcc, FrameChannel, FramePop};
 use self::planes::{
     RumbleUpdate, AUDIO_QUEUE, CLIP_EVENT_QUEUE, CURSOR_SHAPE_QUEUE, CURSOR_STATE_QUEUE,
-    HDR_META_QUEUE, HIDOUT_QUEUE, HOST_TIMING_QUEUE, RUMBLE_QUEUE,
+    HDR_META_QUEUE, HIDOUT_QUEUE, HOST_TIMING_QUEUE, PAD_AUDIO_QUEUE, RUMBLE_QUEUE,
 };
 use self::probe::ProbeState;
 use self::pump::run_pump;
@@ -122,6 +124,14 @@ pub struct NativeClient {
     rumble_sched: Arc<rumble::RumbleShared>,
     /// Inbound DualSense feedback (lightbar / player LEDs / adaptive triggers) — 0xCD datagrams.
     hidout: Mutex<Receiver<HidOutput>>,
+    /// Inbound pad audio (DualSense voice-coil haptics + speaker Opus frames) — 0xD1 datagrams.
+    /// Only a session that advertised [`quic::CLIENT_CAP_PAD_AUDIO`] against a
+    /// [`quic::HOST_CAP_PAD_AUDIO`] host ever receives any.
+    pad_audio: Mutex<Receiver<PadAudioFrame>>,
+    /// Per-pad pad-audio render capabilities (bit0 haptics, bit1 speaker), written by
+    /// [`NativeClient::set_pad_audio_caps`] and OR'd into outgoing gamepad-arrival flags
+    /// (bits 8/9) by the worker's input task — toward a `HOST_CAP_PAD_AUDIO` host only.
+    pad_audio_caps: Arc<[AtomicU8; crate::input::MAX_PADS]>,
     /// Inbound static HDR metadata (ST.2086 mastering + content light level) — 0xCE datagrams.
     hdr_meta: Mutex<Receiver<HdrMeta>>,
     /// Inbound per-AU host capture→send timings — 0xCF datagrams (the client always advertises
@@ -418,6 +428,10 @@ impl NativeClient {
         let rumble_sched = Arc::new(rumble::RumbleShared::new());
         let rumble_feed = rumble::RumbleFeed(rumble_sched.clone());
         let (hidout_tx, hidout_rx) = std::sync::mpsc::sync_channel::<HidOutput>(HIDOUT_QUEUE);
+        let (pad_audio_tx, pad_audio_rx) =
+            std::sync::mpsc::sync_channel::<PadAudioFrame>(PAD_AUDIO_QUEUE);
+        let pad_audio_caps: Arc<[AtomicU8; crate::input::MAX_PADS]> =
+            Arc::new(std::array::from_fn(|_| AtomicU8::new(0)));
         let (hdr_meta_tx, hdr_meta_rx) = std::sync::mpsc::sync_channel::<HdrMeta>(HDR_META_QUEUE);
         let (host_timing_tx, host_timing_rx) =
             std::sync::mpsc::sync_channel::<crate::quic::HostTiming>(HOST_TIMING_QUEUE);
@@ -459,6 +473,7 @@ impl NativeClient {
         let clock_offset_w = clock_offset.clone();
         let decode_lat_w = decode_lat.clone();
         let live_bitrate_w = live_bitrate.clone();
+        let pad_audio_caps_w = pad_audio_caps.clone();
         let ctrl_tx_pump = ctrl_tx.clone(); // the data-plane pump sends adaptive-FEC LossReports
         let worker = std::thread::Builder::new()
             .name("punktfunk-client".into())
@@ -502,6 +517,8 @@ impl NativeClient {
                     rumble_tx,
                     rumble_feed,
                     hidout_tx,
+                    pad_audio_tx,
+                    pad_audio_caps: pad_audio_caps_w,
                     hdr_meta_tx,
                     host_timing_tx,
                     cursor_shape_tx,
@@ -550,6 +567,8 @@ impl NativeClient {
             rumble: Mutex::new(rumble_rx),
             rumble_sched,
             hidout: Mutex::new(hidout_rx),
+            pad_audio: Mutex::new(pad_audio_rx),
+            pad_audio_caps,
             hdr_meta: Mutex::new(hdr_meta_rx),
             host_timing: Mutex::new(host_timing_rx),
             cursor_shape: Mutex::new(cursor_shape_rx),
@@ -1048,6 +1067,33 @@ impl NativeClient {
             Ok(h) => Ok(h),
             Err(RecvTimeoutError::Timeout) => Err(PunktfunkError::NoFrame),
             Err(RecvTimeoutError::Disconnected) => Err(PunktfunkError::Closed),
+        }
+    }
+
+    /// Pull the next pad-audio frame (0xD1): one Opus frame of DualSense voice-coil haptics
+    /// ([`quic::PAD_AUDIO_KIND_HAPTICS`], 5 ms) or built-in-speaker audio
+    /// ([`quic::PAD_AUDIO_KIND_SPEAKER`], 10 ms) for gamepad `pad`. All pads/kinds share the
+    /// queue — the embedder fans out by `pad`/`kind` to per-actuator Opus decoders. `None` on
+    /// timeout AND once the session ended ([`is_session_ended`](Self::is_session_ended)
+    /// distinguishes, and the plane is best-effort either way). Only a session that advertised
+    /// [`quic::CLIENT_CAP_PAD_AUDIO`] against a [`quic::HOST_CAP_PAD_AUDIO`] host — with the
+    /// pad's render caps declared via [`set_pad_audio_caps`](Self::set_pad_audio_caps) — ever
+    /// receives any. Drain on a dedicated thread like [`next_audio`](Self::next_audio); one
+    /// puller per the plane contract.
+    pub fn next_pad_audio(&self, timeout: Duration) -> Option<PadAudioFrame> {
+        self.pad_audio.lock().unwrap().recv_timeout(timeout).ok()
+    }
+
+    /// Declare wire pad `pad`'s pad-audio render capabilities: `audio_caps` bit0 = the pad can
+    /// play the HAPTICS stream (a real DualSense's voice coils), bit1 = the SPEAKER stream.
+    /// Call at controller attach, BEFORE the pad's arrival is sent (like
+    /// [`set_rumble_quirks`](Self::set_rumble_quirks)) — the worker ORs the bits into the
+    /// arrival's flags (bits 8/9), and only toward a [`quic::HOST_CAP_PAD_AUDIO`] host, so an
+    /// embedder that never calls this (or a host that can't capture pad audio) leaves the wire
+    /// bytes exactly as before. Latest-wins per pad; unknown bits are masked off.
+    pub fn set_pad_audio_caps(&self, pad: u8, audio_caps: u8) {
+        if let Some(slot) = self.pad_audio_caps.get(pad as usize) {
+            slot.store(audio_caps & 0x03, Ordering::Relaxed);
         }
     }
 

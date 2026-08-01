@@ -670,6 +670,12 @@ pub const PUNKTFUNK_HIDOUT_TRIGGER: u8 = 3;
 /// side (0 = right pad, 1 = left pad); `effect[0..6]` packs `amplitude` / `period` / `count` as
 /// little-endian `u16`s with `effect_len = 6`. Clients without trackpad coils drop it.
 pub const PUNKTFUNK_HIDOUT_TRACKPAD_HAPTIC: u8 = 4;
+/// `PunktfunkHidOutput::kind` — the audio-control region of a DS5 output report (pad-audio
+/// routing/volumes; the audio SAMPLES arrive via [`punktfunk_connection_next_pad_audio`]).
+/// `which` = the condensed audio flags (bit0 = haptics-select, bits1..4 = the report's
+/// audio-valid flags); `effect[0..6]` = bytes 5..=10 of the report verbatim
+/// (headphone/speaker/mic volumes + routing) with `effect_len = 6`. Forwarded change-only.
+pub const PUNKTFUNK_HIDOUT_AUDIO_CTL: u8 = 5;
 /// Capacity of `PunktfunkHidOutput::effect` (the DualSense trigger parameter block).
 pub const PUNKTFUNK_HID_EFFECT_MAX: u8 = 11;
 
@@ -759,6 +765,16 @@ impl PunktfunkHidOutput {
                 out.effect_len = 6;
             }
             HidOutput::HidRaw { .. } => return None,
+            HidOutput::AudioCtl { pad, flags, raw } => {
+                // Same packing idiom as TrackpadHaptic: `which` carries the flags byte,
+                // `effect[0..6]` the raw audio region. The u16 wire pad narrows losslessly —
+                // pads are 0..16 (`input::MAX_PADS`) end to end.
+                out.kind = PUNKTFUNK_HIDOUT_AUDIO_CTL;
+                out.pad = *pad as u8;
+                out.which = *flags;
+                out.effect[0..6].copy_from_slice(raw);
+                out.effect_len = 6;
+            }
         }
         Some(out)
     }
@@ -1172,6 +1188,25 @@ pub const PUNKTFUNK_HOST_CAP_CLIPBOARD: u8 = 0x02;
 /// the client keeps its pen-as-touch fallback. (Mirrors `quic::HOST_CAP_PEN`;
 /// design/pen-tablet-input.md.)
 pub const PUNKTFUNK_HOST_CAP_PEN: u8 = 0x10;
+/// Host-capability bit in [`punktfunk_connection_host_caps`]: the host can capture per-gamepad
+/// audio (DualSense voice-coil haptics + speaker) and emit it on the 0xD1 plane toward pads
+/// declared capable via [`punktfunk_connection_set_pad_audio_caps`]. Set only when the client
+/// asked via [`PUNKTFUNK_CLIENT_CAP_PAD_AUDIO`]. (Mirrors `quic::HOST_CAP_PAD_AUDIO`.)
+pub const PUNKTFUNK_HOST_CAP_PAD_AUDIO: u8 = 0x20;
+
+/// Pad-audio `kind` ([`punktfunk_connection_next_pad_audio`]): the BACK channel pair — DualSense
+/// voice-coil haptics, 5 ms Opus frames. (Mirrors `quic::PAD_AUDIO_KIND_HAPTICS`.)
+pub const PUNKTFUNK_PAD_AUDIO_KIND_HAPTICS: u8 = 0;
+/// Pad-audio `kind`: the FRONT channel pair — the controller's built-in speaker, 10 ms Opus
+/// frames. (Mirrors `quic::PAD_AUDIO_KIND_SPEAKER`.)
+pub const PUNKTFUNK_PAD_AUDIO_KIND_SPEAKER: u8 = 1;
+
+/// [`punktfunk_connection_set_pad_audio_caps`] `audio_caps` bit: the pad renders the HAPTICS
+/// stream (a real DualSense's voice coils).
+pub const PUNKTFUNK_PAD_AUDIO_CAP_HAPTICS: u8 = 0x01;
+/// [`punktfunk_connection_set_pad_audio_caps`] `audio_caps` bit: the pad renders the SPEAKER
+/// stream.
+pub const PUNKTFUNK_PAD_AUDIO_CAP_SPEAKER: u8 = 0x02;
 
 // Keep the ABI cap bits in lockstep with the wire constants (compile-time guard against drift).
 #[cfg(feature = "quic")]
@@ -1186,6 +1221,20 @@ const _: () = {
     assert!(PUNKTFUNK_HOST_CAP_GAMEPAD_STATE == crate::quic::HOST_CAP_GAMEPAD_STATE);
     assert!(PUNKTFUNK_HOST_CAP_CLIPBOARD == crate::quic::HOST_CAP_CLIPBOARD);
     assert!(PUNKTFUNK_HOST_CAP_PEN == crate::quic::HOST_CAP_PEN);
+    assert!(PUNKTFUNK_HOST_CAP_PAD_AUDIO == crate::quic::HOST_CAP_PAD_AUDIO);
+    assert!(PUNKTFUNK_CLIENT_CAP_PAD_AUDIO == crate::quic::CLIENT_CAP_PAD_AUDIO);
+    assert!(PUNKTFUNK_PAD_AUDIO_KIND_HAPTICS == crate::quic::PAD_AUDIO_KIND_HAPTICS);
+    assert!(PUNKTFUNK_PAD_AUDIO_KIND_SPEAKER == crate::quic::PAD_AUDIO_KIND_SPEAKER);
+    // The setter's caps bits are the arrival flags bits 8/9 shifted down (the wire packing
+    // `input::encode_gamepad_arrival` applies).
+    assert!(
+        (PUNKTFUNK_PAD_AUDIO_CAP_HAPTICS as u32) << 8
+            == crate::input::ARRIVAL_FLAG_PAD_AUDIO_HAPTICS
+    );
+    assert!(
+        (PUNKTFUNK_PAD_AUDIO_CAP_SPEAKER as u32) << 8
+            == crate::input::ARRIVAL_FLAG_PAD_AUDIO_SPEAKER
+    );
     assert!(PUNKTFUNK_PEN_IN_RANGE == crate::quic::PEN_IN_RANGE);
     assert!(PUNKTFUNK_PEN_TOUCHING == crate::quic::PEN_TOUCHING);
     assert!(PUNKTFUNK_PEN_BARREL1 == crate::quic::PEN_BARREL1);
@@ -1768,6 +1817,13 @@ pub const PUNKTFUNK_CLIENT_CAP_CURSOR: u8 = 0x01;
 /// forward-compatible.
 pub const PUNKTFUNK_CLIENT_CAP_PHASE_LOCK: u8 = 0x02;
 
+/// [`punktfunk_connect_ex9`] `client_caps` bit: the client understands the pad-audio plane
+/// (0xD1 — per-gamepad DualSense voice-coil haptics + speaker). The embedder MUST then drain
+/// [`punktfunk_connection_next_pad_audio`] and declare each capable pad via
+/// [`punktfunk_connection_set_pad_audio_caps`]; the host emits pad audio only when it answers
+/// with [`PUNKTFUNK_HOST_CAP_PAD_AUDIO`]. (Mirrors `quic::CLIENT_CAP_PAD_AUDIO`.)
+pub const PUNKTFUNK_CLIENT_CAP_PAD_AUDIO: u8 = 0x04;
+
 /// Shared body of [`punktfunk_connect_ex7`] / [`punktfunk_connect_ex8`]: `status_out`
 /// (nullable) is written on EVERY path — `Ok`, the mapped [`PunktfunkError`],
 /// `InvalidArg` for bad arguments, `Panic` if the connect panicked.
@@ -2309,6 +2365,117 @@ pub unsafe extern "C" fn punktfunk_connection_next_audio_pcm(
             }
             Err(_) => PunktfunkStatus::BadPacket,
         }
+    })
+}
+
+/// Pull the next pad-audio frame (0xD1) — one Opus frame of DualSense voice-coil haptics
+/// (`kind` = [`PUNKTFUNK_PAD_AUDIO_KIND_HAPTICS`], 5 ms) or built-in-speaker audio
+/// ([`PUNKTFUNK_PAD_AUDIO_KIND_SPEAKER`], 10 ms) for gamepad `*out_pad` — waiting up to
+/// `timeout_ms`. The payload is COPIED into `buf` (no borrow-until-next-call slot); the return
+/// value is its length in bytes, `0` = nothing this poll (timeout — or a DTX/oversized frame,
+/// both of which an embedder treats the same way), `-1` = the session ended (or an invalid
+/// handle/buffer). All pads/kinds share one queue — fan out by `*out_pad`/`*out_kind` to
+/// per-actuator Opus decoders. A frame larger than `buf_len` is dropped like the timeout case
+/// (the plane is lossy by design; any real Opus frame fits a 1500-byte buffer). Only a session
+/// connected with [`PUNKTFUNK_CLIENT_CAP_PAD_AUDIO`] against a
+/// [`PUNKTFUNK_HOST_CAP_PAD_AUDIO`] host — with the pad declared via
+/// [`punktfunk_connection_set_pad_audio_caps`] — ever receives any. Drain from a dedicated
+/// thread (one puller, may run alongside the other planes' pullers).
+///
+/// # Safety
+/// `c` is a valid connection handle; the `out_*` pointers are writable (NULLs are skipped);
+/// `buf` is writable for `buf_len` bytes.
+#[cfg(feature = "quic")]
+#[no_mangle]
+pub unsafe extern "C" fn punktfunk_connection_next_pad_audio(
+    c: *mut PunktfunkConnection,
+    out_pad: *mut u8,
+    out_kind: *mut u8,
+    out_seq: *mut u32,
+    out_pts_ns: *mut u64,
+    buf: *mut u8,
+    buf_len: usize,
+    timeout_ms: u32,
+) -> i32 {
+    let r = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
+        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
+        // here handles.
+        let c = match unsafe { c.as_ref() } {
+            Some(c) => c,
+            None => return -1,
+        };
+        if buf.is_null() && buf_len != 0 {
+            return -1;
+        }
+        match c
+            .inner
+            .next_pad_audio(std::time::Duration::from_millis(timeout_ms as u64))
+        {
+            Some(f) => {
+                if f.opus.is_empty() || f.opus.len() > buf_len {
+                    // DTX silence (skipped like the audio-PCM path — decoding an empty payload
+                    // as loss would synthesize concealment) or doesn't fit — report "nothing
+                    // this poll" (the next_hidout HidRaw-skip precedent; truncated Opus would
+                    // be undecodable anyway).
+                    return 0;
+                }
+                // SAFETY: per the ABI contract - each out-param below is OPTIONAL, so it is null-
+                // checked before it is written; `buf` is a caller-owned writable region of
+                // `buf_len` bytes and the copy length was just bounds-checked against it.
+                unsafe {
+                    if !out_pad.is_null() {
+                        *out_pad = f.pad;
+                    }
+                    if !out_kind.is_null() {
+                        *out_kind = f.kind;
+                    }
+                    if !out_seq.is_null() {
+                        *out_seq = f.seq;
+                    }
+                    if !out_pts_ns.is_null() {
+                        *out_pts_ns = f.pts_ns;
+                    }
+                    std::ptr::copy_nonoverlapping(f.opus.as_ptr(), buf, f.opus.len());
+                }
+                f.opus.len() as i32
+            }
+            // `None` folds timeout and closed; the shutdown flag tells them apart so the
+            // embedder's plane loop can exit instead of polling a dead session forever.
+            None if c.inner.is_session_ended() => -1,
+            None => 0,
+        }
+    }));
+    r.unwrap_or(-1)
+}
+
+/// Declare wire pad `pad`'s pad-audio render capabilities (`audio_caps`: OR of
+/// [`PUNKTFUNK_PAD_AUDIO_CAP_HAPTICS`] / [`PUNKTFUNK_PAD_AUDIO_CAP_SPEAKER`]) — how a client
+/// tells the host WHICH pads can actually play the 0xD1 streams. Call at controller attach,
+/// BEFORE the pad's arrival event is sent (the [`punktfunk_connection_set_rumble_quirks`]
+/// timing): the core folds the bits into the arrival's flags (bits 8/9), and only toward a
+/// [`PUNKTFUNK_HOST_CAP_PAD_AUDIO`] host — never calling this leaves the wire bytes exactly as
+/// before. Latest-wins per pad; unknown bits are masked off.
+///
+/// # Safety
+/// `c` is a valid connection handle. Callable from any thread.
+#[cfg(feature = "quic")]
+#[no_mangle]
+pub unsafe extern "C" fn punktfunk_connection_set_pad_audio_caps(
+    c: *mut PunktfunkConnection,
+    pad: u8,
+    audio_caps: u8,
+) -> PunktfunkStatus {
+    guard(|| {
+        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
+        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
+        // here handles.
+        let c = match unsafe { c.as_ref() } {
+            Some(c) => c,
+            None => return PunktfunkStatus::NullPointer,
+        };
+        c.inner.set_pad_audio_caps(pad, audio_caps);
+        PunktfunkStatus::Ok
     })
 }
 
@@ -4407,4 +4574,37 @@ pub unsafe extern "C" fn punktfunk_reanchor_gate_is_holding(
         }
         PunktfunkStatus::Ok
     })
+}
+
+#[cfg(all(test, feature = "quic"))]
+mod tests {
+    use super::*;
+
+    /// The `AudioCtl` → `PunktfunkHidOutput` mapping: kind 5, pad narrowed, `which` carries the
+    /// flags byte, `effect[0..6]` the raw audio region with `effect_len = 6` (the TrackpadHaptic
+    /// packing idiom — no struct growth, so the size guard above stays at 19).
+    #[test]
+    fn hidout_abi_maps_audio_ctl() {
+        let out = PunktfunkHidOutput::from_hid(&crate::quic::HidOutput::AudioCtl {
+            pad: 3,
+            flags: 0x17,
+            raw: [0x50, 0x60, 0x70, 0x05, 0, 0],
+        })
+        .unwrap();
+        assert_eq!(out.kind, PUNKTFUNK_HIDOUT_AUDIO_CTL);
+        assert_eq!(out.pad, 3);
+        assert_eq!(out.which, 0x17);
+        assert_eq!(out.effect_len, 6);
+        assert_eq!(out.effect[..6], [0x50, 0x60, 0x70, 0x05, 0, 0]);
+        assert_eq!(out.effect[6..], [0; 5]);
+        // A raw passthrough report still has no C representation (skipped at the pull site).
+        assert!(
+            PunktfunkHidOutput::from_hid(&crate::quic::HidOutput::HidRaw {
+                pad: 0,
+                kind: 0,
+                data: vec![0x80],
+            })
+            .is_none()
+        );
+    }
 }

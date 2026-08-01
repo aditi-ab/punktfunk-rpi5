@@ -120,7 +120,13 @@ pub use stats::Stats;
 /// uncertainty and the circular arrival-lead statistic the host's controller steers on. Additive;
 /// the wire grows only a new control message (`PhaseReport`, 0x32) an old host never reads and a
 /// strict-prefix append on the 0xCF host-timing tail, so [`WIRE_VERSION`] is unchanged.
-pub const ABI_VERSION: u32 = 14;
+/// v15: added the pad-audio client surface — `punktfunk_connection_next_pad_audio` (the 0xD1
+/// per-gamepad DualSense haptics/speaker plane) + `punktfunk_connection_set_pad_audio_caps` and
+/// the `PUNKTFUNK_CLIENT_CAP_PAD_AUDIO` / `PUNKTFUNK_HOST_CAP_PAD_AUDIO` mirrors. Additive and
+/// capability-gated end to end: the wire grows a new datagram tag (0xD1) an old client never
+/// receives (double-gated caps), a new 0xCD kind (0x06, dropped as unknown by old clients) and
+/// arrival flag bits 8/9 sent only toward a capable host, so [`WIRE_VERSION`] is unchanged.
+pub const ABI_VERSION: u32 = 15;
 
 /// The punktfunk/1 **wire** version — what `Hello`/`Welcome` carry and hosts equality-check.
 /// Deliberately its own constant: [`ABI_VERSION`] tracks the embeddable **C surface**

@@ -259,6 +259,17 @@ windows = { version = "0.62", features = [
     # CoCreateInstance(PolicyConfigClient) — set the default audio playback/recording endpoints via the
     # undocumented IPolicyConfig (audio/windows/audio_control.rs) so mic + desktop audio auto-wire.
     "Win32_System_Com",
+    # Pad-audio endpoint provisioning (audio/windows/pad_endpoint.rs): IMMDevice + IPropertyStore
+    # to stamp the DualSense identity onto the minted endpoints (PROPVARIANT lives in
+    # StructuredStorage and is gated on the Variant feature), DEVPKEY_Device_DriverInfPath to
+    # resolve the installed Steam Streaming Speakers INF, and raw Reg* calls behind the MMDevices
+    # ACL repair + the devnode's pad-index marker value.
+    "Win32_Media_Audio",
+    "Win32_UI_Shell_PropertiesSystem",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+    "Win32_Devices_Properties",
+    "Win32_System_Registry",
     # SetUnhandledExceptionFilter + EXCEPTION_POINTERS — the last-resort native-crash logger
     # (src/windows/crash.rs); Kernel gates the CONTEXT type EXCEPTION_POINTERS embeds.
     "Win32_System_Diagnostics_Debug",

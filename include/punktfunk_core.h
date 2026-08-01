@@ -58,7 +58,13 @@
 // uncertainty and the circular arrival-lead statistic the host's controller steers on. Additive;
 // the wire grows only a new control message (`PhaseReport`, 0x32) an old host never reads and a
 // strict-prefix append on the 0xCF host-timing tail, so [`WIRE_VERSION`] is unchanged.
-#define ABI_VERSION 14
+// v15: added the pad-audio client surface — `punktfunk_connection_next_pad_audio` (the 0xD1
+// per-gamepad DualSense haptics/speaker plane) + `punktfunk_connection_set_pad_audio_caps` and
+// the `PUNKTFUNK_CLIENT_CAP_PAD_AUDIO` / `PUNKTFUNK_HOST_CAP_PAD_AUDIO` mirrors. Additive and
+// capability-gated end to end: the wire grows a new datagram tag (0xD1) an old client never
+// receives (double-gated caps), a new 0xCD kind (0x06, dropped as unknown by old clients) and
+// arrival flag bits 8/9 sent only toward a capable host, so [`WIRE_VERSION`] is unchanged.
+#define ABI_VERSION 15
 
 // The punktfunk/1 **wire** version — what `Hello`/`Welcome` carry and hosts equality-check.
 // Deliberately its own constant: [`ABI_VERSION`] tracks the embeddable **C surface**
@@ -81,6 +87,13 @@
 // side (0 = right pad, 1 = left pad); `effect[0..6]` packs `amplitude` / `period` / `count` as
 // little-endian `u16`s with `effect_len = 6`. Clients without trackpad coils drop it.
 #define PUNKTFUNK_HIDOUT_TRACKPAD_HAPTIC 4
+
+// `PunktfunkHidOutput::kind` — the audio-control region of a DS5 output report (pad-audio
+// routing/volumes; the audio SAMPLES arrive via [`punktfunk_connection_next_pad_audio`]).
+// `which` = the condensed audio flags (bit0 = haptics-select, bits1..4 = the report's
+// audio-valid flags); `effect[0..6]` = bytes 5..=10 of the report verbatim
+// (headphone/speaker/mic volumes + routing) with `effect_len = 6`. Forwarded change-only.
+#define PUNKTFUNK_HIDOUT_AUDIO_CTL 5
 
 // Capacity of `PunktfunkHidOutput::effect` (the DualSense trigger parameter block).
 #define PUNKTFUNK_HID_EFFECT_MAX 11
@@ -266,6 +279,28 @@
 // design/pen-tablet-input.md.)
 #define PUNKTFUNK_HOST_CAP_PEN 16
 
+// Host-capability bit in [`punktfunk_connection_host_caps`]: the host can capture per-gamepad
+// audio (DualSense voice-coil haptics + speaker) and emit it on the 0xD1 plane toward pads
+// declared capable via [`punktfunk_connection_set_pad_audio_caps`]. Set only when the client
+// asked via [`PUNKTFUNK_CLIENT_CAP_PAD_AUDIO`]. (Mirrors `quic::HOST_CAP_PAD_AUDIO`.)
+#define PUNKTFUNK_HOST_CAP_PAD_AUDIO 32
+
+// Pad-audio `kind` ([`punktfunk_connection_next_pad_audio`]): the BACK channel pair — DualSense
+// voice-coil haptics, 5 ms Opus frames. (Mirrors `quic::PAD_AUDIO_KIND_HAPTICS`.)
+#define PUNKTFUNK_PAD_AUDIO_KIND_HAPTICS 0
+
+// Pad-audio `kind`: the FRONT channel pair — the controller's built-in speaker, 10 ms Opus
+// frames. (Mirrors `quic::PAD_AUDIO_KIND_SPEAKER`.)
+#define PUNKTFUNK_PAD_AUDIO_KIND_SPEAKER 1
+
+// [`punktfunk_connection_set_pad_audio_caps`] `audio_caps` bit: the pad renders the HAPTICS
+// stream (a real DualSense's voice coils).
+#define PUNKTFUNK_PAD_AUDIO_CAP_HAPTICS 1
+
+// [`punktfunk_connection_set_pad_audio_caps`] `audio_caps` bit: the pad renders the SPEAKER
+// stream.
+#define PUNKTFUNK_PAD_AUDIO_CAP_SPEAKER 2
+
 // [`punktfunk_connect_ex9`] `client_caps` bit: render the host cursor locally (the cursor
 // channel, `design/remote-desktop-sweep.md` M2).
 #define PUNKTFUNK_CLIENT_CAP_CURSOR 1
@@ -275,6 +310,13 @@
 // v1 — the host arms on report receipt — but honest advertisement keeps the negotiation
 // forward-compatible.
 #define PUNKTFUNK_CLIENT_CAP_PHASE_LOCK 2
+
+// [`punktfunk_connect_ex9`] `client_caps` bit: the client understands the pad-audio plane
+// (0xD1 — per-gamepad DualSense voice-coil haptics + speaker). The embedder MUST then drain
+// [`punktfunk_connection_next_pad_audio`] and declare each capable pad via
+// [`punktfunk_connection_set_pad_audio_caps`]; the host emits pad audio only when it answers
+// with [`PUNKTFUNK_HOST_CAP_PAD_AUDIO`]. (Mirrors `quic::CLIENT_CAP_PAD_AUDIO`.)
+#define PUNKTFUNK_CLIENT_CAP_PAD_AUDIO 4
 
 // `*ttl_ms` sentinel written by [`punktfunk_connection_next_rumble2`] for a legacy (v1) rumble
 // datagram — an old host that sent no self-termination lease. The client then falls back to its
@@ -341,6 +383,19 @@
 
 // Fixed serialized size of an [`InputEvent`] on the wire (tag + fields).
 #define INPUT_WIRE_LEN (((((1 + 1) + 4) + 4) + 4) + 4)
+
+// [`InputKind::GamepadArrival`] `flags` bit: this pad renders pad-audio HAPTICS — it is (or
+// forwards to) a real DualSense whose voice-coil actuators can play the
+// [`PAD_AUDIO_KIND_HAPTICS`](crate::quic::PAD_AUDIO_KIND_HAPTICS) stream. Rides above the pad
+// index byte; sent only toward a [`HOST_CAP_PAD_AUDIO`](crate::quic::HOST_CAP_PAD_AUDIO) host
+// (an older host reads the whole `flags` word as the index, so unexpected high bits would make
+// it drop the declaration).
+#define ARRIVAL_FLAG_PAD_AUDIO_HAPTICS (1 << 8)
+
+// [`InputKind::GamepadArrival`] `flags` bit: this pad renders pad-audio SPEAKER — the
+// [`PAD_AUDIO_KIND_SPEAKER`](crate::quic::PAD_AUDIO_KIND_SPEAKER) stream. Same wire discipline
+// as [`ARRIVAL_FLAG_PAD_AUDIO_HAPTICS`].
+#define ARRIVAL_FLAG_PAD_AUDIO_SPEAKER (1 << 9)
 
 // The number of gamepads addressable on the wire (`flags` pad index 0..15). Shared by the
 // client's snapshot fold and the host's per-pad accumulators.
@@ -628,6 +683,18 @@
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
+// [`Hello::client_caps`] bit: the client understands the pad-audio plane
+// ([`PAD_AUDIO_MAGIC`](super::datagram::PAD_AUDIO_MAGIC), `0xD1`) — per-gamepad DualSense
+// voice-coil haptics + speaker Opus frames, plus the [`HidOutput::AudioCtl`]
+// (super::datagram::HidOutput) routing/volume events. Active only when the host answers with
+// [`HOST_CAP_PAD_AUDIO`] AND the pad's arrival declared a renderer for the kind
+// ([`crate::input::ARRIVAL_FLAG_PAD_AUDIO_HAPTICS`]/`_SPEAKER`) — the capable-and-agreed
+// precedent, per pad; toward an older or incapable host nothing changes. `0x04` — `0x01` is
+// [`CLIENT_CAP_CURSOR`], `0x02` is [`CLIENT_CAP_PHASE_LOCK`].
+#define CLIENT_CAP_PAD_AUDIO 4
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
 // [`Welcome::host_caps`] bit: the host CAN forward the cursor out-of-band (it captures cursor
 // metadata separately from the frame — the Linux portal `SPA_META_Cursor` path; NOT gamescope,
 // whose capture carries no cursor, and NOT Windows yet, where DWM composites into the IDD
@@ -650,6 +717,19 @@
 // which is exactly why the gate exists. `0x10` — `0x08` is [`HOST_CAP_CURSOR`], `0x04` is
 // [`HOST_CAP_TEXT_INPUT`], `0x01`/`0x02` are gamepad-state / clipboard.
 #define HOST_CAP_PEN 16
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// [`Welcome::host_caps`] bit: the host can capture pad audio — its virtual DualSense exposes
+// the pad's audio endpoints (voice-coil haptics + speaker), so a game's per-pad audio can be
+// captured and shipped on the [`PAD_AUDIO_MAGIC`](super::datagram::PAD_AUDIO_MAGIC) plane.
+// Set only when the client asked via [`CLIENT_CAP_PAD_AUDIO`]; when both bits agree, a
+// capable client marks its pads' render capabilities on their arrivals
+// ([`crate::input::ARRIVAL_FLAG_PAD_AUDIO_HAPTICS`]/`_SPEAKER`) and the host emits `0xD1`
+// toward exactly those pads. `0x20` — `0x10` is [`HOST_CAP_PEN`], `0x08` is
+// [`HOST_CAP_CURSOR`], `0x04` is [`HOST_CAP_TEXT_INPUT`], `0x01`/`0x02` are gamepad-state /
+// clipboard.
+#define HOST_CAP_PAD_AUDIO 32
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
@@ -939,7 +1019,9 @@
 // audio = [`AUDIO_MAGIC`] (0xC9, host→client), rumble = [`RUMBLE_MAGIC`] (0xCA, host→client),
 // mic = [`MIC_MAGIC`] (0xCB, client→host), rich-input = [`RICH_INPUT_MAGIC`] (0xCC, client→host),
 // HID-output = [`HIDOUT_MAGIC`] (0xCD, host→client), HDR metadata = [`HDR_META_MAGIC`]
-// (0xCE, host→client).
+// (0xCE, host→client), host timing = [`HOST_TIMING_MAGIC`] (0xCF, host→client), cursor state =
+// [`CURSOR_STATE_MAGIC`] (0xD0, host→client), pad audio = [`PAD_AUDIO_MAGIC`] (0xD1,
+// host→client).
 #define PUNKTFUNK_AUDIO_MAGIC 201
 #endif
 
@@ -1041,6 +1123,31 @@
 // [`CursorState::flags`] bit: a host app captured/hid the pointer — the client SHOULD run
 // relative/captured (M3 auto-flip; advisory, user override always wins).
 #define CURSOR_RELATIVE_HINT 2
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Pad-audio datagram tag, host → client: per-gamepad audio a game routed
+// to the host's virtual DualSense — voice-coil haptics and the built-in speaker — for the client
+// to render on the matching real controller. Next tag after [`CURSOR_STATE_MAGIC`]. The
+// per-pad AUDIO plane (Opus frames, the [`AUDIO_MAGIC`]/[`MIC_MAGIC`] shape plus pad + kind);
+// the routing/volume CONTROL side rides [`HidOutput::AudioCtl`]. Emitted only when the session
+// negotiated it ([`CLIENT_CAP_PAD_AUDIO`](super::caps::CLIENT_CAP_PAD_AUDIO) ∧
+// [`HOST_CAP_PAD_AUDIO`](super::caps::HOST_CAP_PAD_AUDIO)) and the pad's arrival declared a
+// renderer for the kind ([`crate::input::ARRIVAL_FLAG_PAD_AUDIO_HAPTICS`]/`_SPEAKER`).
+// Best-effort like every audio datagram: a lost frame is a concealed gap, never state.
+#define PAD_AUDIO_MAGIC 209
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// [`PadAudioFrame::kind`]: the BACK channel pair — the DualSense voice-coil actuators (audio
+// haptics). 5 ms Opus frames, matching the [`AUDIO_MAGIC`] cadence: haptics are felt latency.
+#define PAD_AUDIO_KIND_HAPTICS 0
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// [`PadAudioFrame::kind`]: the FRONT channel pair — the controller's built-in speaker. 10 ms
+// Opus frames (speaker content tolerates the extra buffering for the better coding efficiency).
+#define PAD_AUDIO_KIND_SPEAKER 1
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
@@ -1357,7 +1464,11 @@ enum PunktfunkInputKind
     PUNKTFUNK_INPUT_KIND_GAMEPAD_REMOVE = 13,
     // Declares which controller KIND a pad presents so a session can MIX types (pad 0 a
     // DualSense, pad 1 an Xbox pad). `code` = the [`GamepadPref`](crate::config::GamepadPref)
-    // wire byte, `flags` = pad index. Sent when the client opens a pad slot — before that pad's
+    // wire byte, `flags` = pad index in the low byte plus the pad's render capabilities in bits
+    // 8/9 ([`ARRIVAL_FLAG_PAD_AUDIO_HAPTICS`]/[`ARRIVAL_FLAG_PAD_AUDIO_SPEAKER`] — sent only
+    // toward a [`HOST_CAP_PAD_AUDIO`](crate::quic::HOST_CAP_PAD_AUDIO) host, so an older host
+    // keeps reading the whole word as the index; hosts decode via [`decode_gamepad_arrival`]).
+    // Sent when the client opens a pad slot — before that pad's
     // first input — and re-sent a few times against datagram loss (like [`GamepadRemove`]). The
     // host resolves the kind to a buildable backend and routes that pad's virtual device to it; a
     // pad the client never declares (an older client, or a fully-lost declaration) falls back to
@@ -2260,6 +2371,50 @@ PunktfunkStatus punktfunk_connection_audio_channels(PunktfunkConnection *c, uint
 PunktfunkStatus punktfunk_connection_next_audio_pcm(PunktfunkConnection *c,
                                                     PunktfunkAudioPcm *out,
                                                     uint32_t timeout_ms);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Pull the next pad-audio frame (0xD1) — one Opus frame of DualSense voice-coil haptics
+// (`kind` = [`PUNKTFUNK_PAD_AUDIO_KIND_HAPTICS`], 5 ms) or built-in-speaker audio
+// ([`PUNKTFUNK_PAD_AUDIO_KIND_SPEAKER`], 10 ms) for gamepad `*out_pad` — waiting up to
+// `timeout_ms`. The payload is COPIED into `buf` (no borrow-until-next-call slot); the return
+// value is its length in bytes, `0` = nothing this poll (timeout — or a DTX/oversized frame,
+// both of which an embedder treats the same way), `-1` = the session ended (or an invalid
+// handle/buffer). All pads/kinds share one queue — fan out by `*out_pad`/`*out_kind` to
+// per-actuator Opus decoders. A frame larger than `buf_len` is dropped like the timeout case
+// (the plane is lossy by design; any real Opus frame fits a 1500-byte buffer). Only a session
+// connected with [`PUNKTFUNK_CLIENT_CAP_PAD_AUDIO`] against a
+// [`PUNKTFUNK_HOST_CAP_PAD_AUDIO`] host — with the pad declared via
+// [`punktfunk_connection_set_pad_audio_caps`] — ever receives any. Drain from a dedicated
+// thread (one puller, may run alongside the other planes' pullers).
+//
+// # Safety
+// `c` is a valid connection handle; the `out_*` pointers are writable (NULLs are skipped);
+// `buf` is writable for `buf_len` bytes.
+int32_t punktfunk_connection_next_pad_audio(PunktfunkConnection *c,
+                                            uint8_t *out_pad,
+                                            uint8_t *out_kind,
+                                            uint32_t *out_seq,
+                                            uint64_t *out_pts_ns,
+                                            uint8_t *buf,
+                                            uintptr_t buf_len,
+                                            uint32_t timeout_ms);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Declare wire pad `pad`'s pad-audio render capabilities (`audio_caps`: OR of
+// [`PUNKTFUNK_PAD_AUDIO_CAP_HAPTICS`] / [`PUNKTFUNK_PAD_AUDIO_CAP_SPEAKER`]) — how a client
+// tells the host WHICH pads can actually play the 0xD1 streams. Call at controller attach,
+// BEFORE the pad's arrival event is sent (the [`punktfunk_connection_set_rumble_quirks`]
+// timing): the core folds the bits into the arrival's flags (bits 8/9), and only toward a
+// [`PUNKTFUNK_HOST_CAP_PAD_AUDIO`] host — never calling this leaves the wire bytes exactly as
+// before. Latest-wins per pad; unknown bits are masked off.
+//
+// # Safety
+// `c` is a valid connection handle. Callable from any thread.
+PunktfunkStatus punktfunk_connection_set_pad_audio_caps(PunktfunkConnection *c,
+                                                        uint8_t pad,
+                                                        uint8_t audio_caps);
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
