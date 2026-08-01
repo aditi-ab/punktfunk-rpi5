@@ -108,16 +108,34 @@ trusted certificate, which is what the edge vhost provides in production.
 
 1. **DNS** — `winget.punktfunk.unom.io` → the unom-1 hcloud box, in the `unom.io` Cloudflare zone
    (DNS-only, same as `docs`). ✅ *done*
-2. **Caddy vhost** on unom-1, next to the existing `docs.punktfunk.unom.io` block:
+2. **Caddy vhost** — in **`unom/infra`, `caddy/Caddyfile`**, next to the existing
+   `docs.punktfunk.unom.io` block. ✅ *done*
 
    ```caddyfile
    winget.punktfunk.unom.io {
-       reverse_proxy 127.0.0.1:3240
+       import security_headers
+       reverse_proxy localhost:3240
    }
    ```
 
-   Until this exists the hostname resolves but the TLS handshake fails — Caddy has no certificate
-   for a name it does not serve. That is the expected state, not a broken deploy.
+   ⚠ **Not by hand on the box.** `~/caddy/Caddyfile` on unom-1 looks like the config but is a copy
+   that `deploy-all.sh` rsyncs over from `unom/infra`, and there is no `.git` there to warn you. A
+   vhost added only on the box survives until the next deploy and no longer: this one was
+   hand-added on 2026-07-26, and the 2026-07-31 hardening commit rewrote the file from the repo's
+   own copy and deleted it — its message says "all 7 vhosts" when there were 8 live.
+
+   Until the vhost exists the hostname resolves but the TLS handshake fails — Caddy has no
+   certificate for a name it does not serve. That is the expected state on first setup, not a
+   broken deploy, but it is also exactly how the clobber presents later: an `internal_error`
+   (alert 80) with no peer certificate, which winget reports as
+   `WINHTTP_CALLBACK_STATUS_FLAG_SECURITY_CHANNEL_ERROR` / `0x8a15003b` and which looks like a
+   client bug. Diagnose by SNI, not by port 80 — Caddy 308s *every* Host to https, including names
+   it has never heard of, so a redirect there proves nothing:
+
+   ```bash
+   openssl s_client -connect winget.punktfunk.unom.io:443 \
+     -servername winget.punktfunk.unom.io </dev/null 2>&1 | grep -E '^subject=|alert'
+   ```
 3. Run `deploy-services.yml` to place the compose file and start the container. It serves 503 until
    a catalogue exists — expected, and visible on `/healthz`.
 4. Publish a stable tag, or build and ship the catalogue by hand:
