@@ -6,13 +6,23 @@ Why hand-rolled: stdlib + `openssl` only (no pip on the runner), and it prints G
 error at the stage it fails instead of a catch-all. Reuses the SERVICE_ACCOUNT_JSON secret and
 tolerates it being raw JSON *or* base64-encoded JSON.
 
-Usage:
+Usage (upload a new build):
   SERVICE_ACCOUNT_JSON='<raw-or-base64 SA key>' \
     python3 play-upload.py --package io.unom.punktfunk \
       --aab path/to/app-release.aab --track internal --status completed [--no-commit]
 
---no-commit: do insert -> upload -> track-update -> validate, then delete the edit (publishes
-nothing). Use it to dry-run the credentials/AAB without touching the live track.
+Usage (promote a build that is already on Play, no rebuild):
+  python3 play-upload.py --package io.unom.punktfunk \
+      --promote 10816 --promote-from alpha --track production
+
+Promotion assigns an EXISTING versionCode to another track, so what ships to production is the
+byte-identical artifact the testers ran — rebuilding would burn a fresh versionCode and ship
+something nobody has tested. --promote-from additionally asserts the code really is on that track
+(catches a typo'd versionCode before it reaches production) and empties it in the SAME edit, so
+the move is atomic: testers are never left pinned to a code that production also serves.
+
+--no-commit: do insert -> upload/assign -> track-update -> validate, then delete the edit
+(publishes nothing). Use it to dry-run the credentials/AAB/notes without touching the live track.
 """
 import argparse, base64, json, os, subprocess, sys, tempfile, time
 import urllib.request, urllib.parse, urllib.error
@@ -104,17 +114,78 @@ def access_token(sa) -> str:
     return tok["access_token"]
 
 
+# Play's "What's new" is capped at 500 characters per language. The cap lives in the Console
+# (the REST reference does not state it) and the API rejects longer text at commit — i.e. AFTER
+# the AAB has uploaded — so check it up front and print the actual count.
+NOTES_MAX = 500
+
+
+def load_release_notes(path, language):
+    with open(path, encoding="utf-8") as f:
+        text = f.read().strip()
+    if not text:
+        sys.exit(f"ERROR: release-notes file is empty: {path}")
+    if len(text) > NOTES_MAX:
+        sys.exit(f"ERROR: release notes are {len(text)} chars, Play allows {NOTES_MAX}: {path}")
+    print(f"release notes: {len(text)}/{NOTES_MAX} chars ({language})")
+    return [{"language": language, "text": text}]
+
+
+def put_track(app, edit, tok, track, version_codes, status, user_fraction=None, notes=None):
+    """PUT one track. An empty version_codes list clears the track (what promotion does to the
+    track it promoted OUT of)."""
+    release = {"status": status, "versionCodes": [str(v) for v in version_codes]}
+    if user_fraction is not None:
+        release["userFraction"] = user_fraction
+    if notes:
+        release["releaseNotes"] = notes
+    # Clearing a track means "no active releases", not "an empty release".
+    body = {"track": track, "releases": [release] if version_codes else []}
+    call("PUT", f"{app}/edits/{edit}/tracks/{track}", token=tok,
+         data=json.dumps(body).encode(), content_type="application/json")
+
+
+def assert_on_track(app, edit, tok, track, vc):
+    """Fail before anything is written if --promote names a versionCode that is not actually on
+    the track we claim to be promoting out of."""
+    got = call("GET", f"{app}/edits/{edit}/tracks/{track}", token=tok)
+    live = [c for r in got.get("releases", []) for c in r.get("versionCodes", [])]
+    if str(vc) not in live:
+        sys.exit(f"ERROR: versionCode {vc} is not on track '{track}' (it has: {live or 'nothing'})")
+    print(f"verified versionCode={vc} is live on '{track}'")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--package", required=True)
-    ap.add_argument("--aab", required=True)
+    ap.add_argument("--aab", help="upload this bundle (mutually exclusive with --promote)")
+    ap.add_argument("--promote", type=int, metavar="VERSIONCODE",
+                    help="assign an already-uploaded versionCode instead of uploading")
+    ap.add_argument("--promote-from", metavar="TRACK",
+                    help="with --promote: assert the code is on TRACK, then clear TRACK")
     ap.add_argument("--track", default="internal")
     ap.add_argument("--status", default="completed")
+    ap.add_argument("--user-fraction", type=float,
+                    help="staged rollout fraction, 0<f<1; required by --status inProgress")
+    ap.add_argument("--release-notes-file", help="Play 'What's new' text (<=500 chars)")
+    ap.add_argument("--release-notes-language", default="en-US")
     ap.add_argument("--no-commit", action="store_true")
     a = ap.parse_args()
 
-    if not os.path.isfile(a.aab):
+    if bool(a.aab) == bool(a.promote):
+        sys.exit("ERROR: pass exactly one of --aab (upload) or --promote (assign an existing code)")
+    if a.promote_from and not a.promote:
+        sys.exit("ERROR: --promote-from only applies to --promote")
+    # inProgress without a fraction is an API error; halted/completed with one is also rejected.
+    if a.status == "inProgress" and a.user_fraction is None:
+        sys.exit("ERROR: --status inProgress requires --user-fraction")
+    if a.user_fraction is not None and not (0 < a.user_fraction < 1):
+        sys.exit(f"ERROR: --user-fraction must be strictly between 0 and 1 (got {a.user_fraction})")
+    if a.aab and not os.path.isfile(a.aab):
         sys.exit(f"ERROR: AAB not found: {a.aab}")
+
+    notes = load_release_notes(a.release_notes_file, a.release_notes_language) \
+        if a.release_notes_file else None
 
     sa = load_sa()
     tok = access_token(sa)
@@ -123,17 +194,25 @@ def main():
 
     try:
         edit = call("POST", f"{app}/edits", token=tok)["id"]
-        with open(a.aab, "rb") as f:
-            blob = f.read()
-        print(f"uploading {a.aab} ({len(blob)} bytes) ...")
-        vc = call("POST", f"{UPLOAD}/{a.package}/edits/{edit}/bundles?uploadType=media",
-                  token=tok, data=blob, content_type="application/octet-stream")["versionCode"]
-        print(f"uploaded versionCode={vc}")
-        call("PUT", f"{app}/edits/{edit}/tracks/{a.track}", token=tok,
-             data=json.dumps({"track": a.track,
-                              "releases": [{"status": a.status, "versionCodes": [str(vc)]}]}).encode(),
-             content_type="application/json")
-        print(f"assigned versionCode={vc} -> track={a.track} status={a.status}")
+        if a.promote:
+            vc = a.promote
+            if a.promote_from:
+                assert_on_track(app, edit, tok, a.promote_from, vc)
+        else:
+            with open(a.aab, "rb") as f:
+                blob = f.read()
+            print(f"uploading {a.aab} ({len(blob)} bytes) ...")
+            vc = call("POST", f"{UPLOAD}/{a.package}/edits/{edit}/bundles?uploadType=media",
+                      token=tok, data=blob, content_type="application/octet-stream")["versionCode"]
+            print(f"uploaded versionCode={vc}")
+
+        put_track(app, edit, tok, a.track, [vc], a.status, a.user_fraction, notes)
+        print(f"assigned versionCode={vc} -> track={a.track} status={a.status}"
+              + (f" userFraction={a.user_fraction}" if a.user_fraction is not None else ""))
+        # Same edit as the assignment above, so the code is never active on both tracks at once.
+        if a.promote_from:
+            put_track(app, edit, tok, a.promote_from, [], a.status)
+            print(f"cleared track '{a.promote_from}'")
 
         if a.no_commit:
             call("POST", f"{app}/edits/{edit}:validate", token=tok)
