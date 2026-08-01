@@ -76,6 +76,56 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # FIRST, because it costs a second and everything after it costs ten minutes.
+      #
+      # A release tag MUST carry its own Play "What's new". If the file is absent Play does not
+      # show nothing — it carries the PREVIOUS release's text onto this version, so production
+      # users read notes for a build they are not getting. That is the same defect the v0.22.3
+      # notes shipped (see docs/releases/README.md), and it is invisible until someone reads the
+      # store listing. Failing here also means a missing file cannot leave a half-published
+      # release: nothing is built, nothing is attached to the Gitea release, nothing reaches Play.
+      #
+      # Canary is exempt on purpose: it has no curated notes, and Play reusing text for internal
+      # testers costs nothing.
+      - name: Play release notes gate (tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          NOTES="docs/releases/whatsnew/${GITHUB_REF_NAME}.txt"
+          if [ ! -f "$NOTES" ]; then
+            echo "ERROR: $NOTES does not exist."
+            echo "A production release needs its own Play 'What's new' (<=500 chars, written for"
+            echo "phone/TV users). Without it Play reuses the previous release's text."
+            echo "See docs/releases/README.md; copy docs/releases/whatsnew/TEMPLATE.txt."
+            exit 1
+          fi
+          # A verbatim copy of another release's file is the same bug wearing a hat: the store
+          # listing still describes the wrong build. Cheap to check, and only ever trips on an
+          # actual copy-paste that was never edited.
+          for other in docs/releases/whatsnew/*.txt; do
+            if [ "$other" != "$NOTES" ] && [ "$other" != "docs/releases/whatsnew/TEMPLATE.txt" ]; then
+              if cmp -s "$NOTES" "$other"; then
+                echo "ERROR: $NOTES is byte-identical to $other."
+                echo "Write notes describing THIS release, not the one before it."
+                exit 1
+              fi
+            fi
+          done
+          # Length is checked here as well as in play-upload.py. Not redundant: the uploader is
+          # the last line of defence (and the only one android-promote.yml gets), but it runs at
+          # step 9 — this catches an unedited TEMPLATE copy at step 1 instead of after the build.
+          # Must count CHARACTERS, not bytes: Play's cap is 500 chars and `•` is 3 bytes in UTF-8,
+          # so `wc -c` would reject a file that is comfortably legal.
+          python3 - "$NOTES" <<'PY'
+          import sys
+          path = sys.argv[1]
+          text = open(path, encoding="utf-8").read().strip()
+          if not text:
+              sys.exit(f"ERROR: {path} is empty.")
+          if len(text) > 500:
+              sys.exit(f"ERROR: {path} is {len(text)} chars; Play allows 500. Trim it.")
+          print(f"Play release notes OK: {path} ({len(text)}/500 chars)")
+          PY
+
       # Everything below the checkout used to be four download steps (JDK, SDK,
       # NDK+CMake, cargo-ndk — the flakiest, heaviest part of the job); it is all baked
       # into the image now. This guard only re-asserts the Android targets so a
@@ -129,13 +179,13 @@ jobs:
           echo "VERSION_NAME=$VN" >> "$GITHUB_ENV"
           echo "PLAY_TRACK=$TRACK" >> "$GITHUB_ENV"
           # Play's own "What's new" (500-char cap, its own file — the vX.Y.Z.md body is ~34 KB).
-          # Only a tag has one: canary is a moving target, and for internal testers Play carrying
-          # the previous text over is fine. See docs/releases/README.md.
+          # On a tag the gate step above already proved this exists, so the else branch is only
+          # ever the canary path. See docs/releases/README.md.
           NOTES="docs/releases/whatsnew/${GITHUB_REF_NAME}.txt"
           if [ -f "$NOTES" ]; then
             echo "PLAY_NOTES=$NOTES" >> "$GITHUB_ENV"
           else
-            echo "no Play release notes at $NOTES"
+            echo "no Play release notes at $NOTES (canary — Play keeps the previous text)"
           fi
           echo "android version $VN -> Play track '$TRACK'"
 

@@ -38,13 +38,27 @@ them at **500 characters per language** — the `vX.Y.Z.md` body is two orders o
 long, so it gets its own short file: `docs/releases/whatsnew/vX.Y.Z.txt`.
 
 Write it for a **phone/TV user**, not a host operator: only what changed in the Android app is
-worth their 500 characters. Plain text, one `•` bullet per line, same voice rules as below.
-`clients/android/ci/play-upload.py` refuses to run if the file is over the cap and prints the
-actual count, so a too-long file fails the release job instead of reaching Play.
+worth their 500 characters. Plain text (Play renders no markdown), one `•` bullet per line, same
+voice rules as below. Copy `whatsnew/TEMPLATE.txt`.
 
-Same freeze rule as the notes: once the tag exists, this file describes what that versionCode
-shipped. If it is missing, the release still publishes — Play just carries the previous release's
-text over, which is worse than a rushed sentence, so write it with the bump.
+**A `vX.Y.Z` tag without this file fails the android job before it builds.** This is a hard gate,
+not a warning, because the failure it prevents is silent: when the file is missing Play does not
+show an empty "What's new" — it **carries the previous release's text onto the new version**, so
+the store listing describes a build nobody is getting, and nothing surfaces that but reading the
+listing. It is the same shape as the v0.22.3 notes announcing a feature that release never
+contained. The gate also rejects a file byte-identical to another release's, which is that bug
+reached by copy-paste instead of by omission.
+
+The gate runs first in the job, so a miss costs a second and leaves nothing half-published —
+no build, no assets on the Gitea release, nothing on Play. Two more checks sit downstream:
+`play-upload.py` refuses text over the 500-char cap (printing the real count) before it uploads,
+because the API only rejects oversized notes at commit, by which point the AAB is already on Play.
+
+Canary is exempt: it has no curated notes, and Play reusing text for internal testers costs
+nothing.
+
+Same freeze rule as the notes: once the tag exists, this file is the record of what that
+versionCode shipped.
 
 ## Voice & format
 

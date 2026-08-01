@@ -1,0 +1,27 @@
+• <The headline change, in what the user gets — not what was built.>
+• <Second thing. Name devices they recognize: a phone, an Android TV, a DualSense.>
+• <Third. Stop at what fits; 500 characters is the hard cap, and it is small.>
+
+HOW TO USE THIS FILE
+  Copy to vX.Y.Z.txt, replace every line, delete this block. It is skipped by the CI gate by
+  name, so leaving it in place never blocks a release — but a copy that still says "<The
+  headline change>" will ship to the Play Store exactly as written. Nothing checks your prose.
+
+WHAT BELONGS HERE
+  Only what changed in the ANDROID APP. Host-side work — Windows installers, gamescope, the web
+  console — means nothing to someone reading a phone app's store listing, and it is spending
+  characters you do not have. The full release notes in ../vX.Y.Z.md are where that lives.
+
+RULES THE CI GATE ENFORCES (.gitea/workflows/android.yml)
+  * The file must exist for a vX.Y.Z tag, or the release fails before it builds. Play does not
+    show "no notes" when the file is missing — it carries the PREVIOUS release's text onto the
+    new version, and nobody notices until they read the store listing.
+  * It must not be byte-identical to another release's file.
+  * play-upload.py refuses anything over 500 characters and prints the real count.
+
+RULES NOTHING ENFORCES
+  * Plain text. No markdown — Play renders none of it, so `**bold**` ships as asterisks.
+  * One `•` bullet per line.
+  * Same voice as ../README.md: lead with what the user can now do, no internal vocabulary.
+  * Frozen once the tag exists. Editing it later does not change what already shipped; it only
+    misleads the next person who reads it as the record of that versionCode.
