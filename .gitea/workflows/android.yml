@@ -34,9 +34,10 @@ on:
       - 'rust-toolchain.toml'
       - 'scripts/ci/**'
       - '.gitea/workflows/android.yml'
-    # Single project version: a `vX.Y.Z` tag is THE release (uploads to Play's `alpha` closed
-    # track for manual promotion + attaches the .aab/.apk to the unified Gitea Release). A main
-    # push is canary (Play `internal`).
+    # Single project version: a `vX.Y.Z` tag is THE release (publishes to Play `production` at
+    # 100% + attaches the .aab/.apk to the unified Gitea Release). A main push is canary
+    # (Play `internal`). Production access was granted 2026-08-01; before that a tag could only
+    # reach `alpha` and someone had to promote it by hand in the Console.
     tags: ['v*']
   pull_request:
     paths:
@@ -122,11 +123,20 @@ jobs:
         run: |
           eval "$(bash scripts/ci/pf-version.sh)"   # -> PF_BASE (one minor ahead of the latest stable tag)
           case "$GITHUB_REF" in
-            refs/tags/v*) VN="${GITHUB_REF_NAME#v}"; TRACK="alpha" ;;   # alpha = built-in closed testing
+            refs/tags/v*) VN="${GITHUB_REF_NAME#v}"; TRACK="production" ;;
             *)            VN="${PF_BASE}-ci${GITHUB_RUN_NUMBER}"; TRACK="internal" ;;
           esac
           echo "VERSION_NAME=$VN" >> "$GITHUB_ENV"
           echo "PLAY_TRACK=$TRACK" >> "$GITHUB_ENV"
+          # Play's own "What's new" (500-char cap, its own file — the vX.Y.Z.md body is ~34 KB).
+          # Only a tag has one: canary is a moving target, and for internal testers Play carrying
+          # the previous text over is fine. See docs/releases/README.md.
+          NOTES="docs/releases/whatsnew/${GITHUB_REF_NAME}.txt"
+          if [ -f "$NOTES" ]; then
+            echo "PLAY_NOTES=$NOTES" >> "$GITHUB_ENV"
+          else
+            echo "no Play release notes at $NOTES"
+          fi
           echo "android version $VN -> Play track '$TRACK'"
 
       - name: Build Release (signed AAB + universal APK)
@@ -199,15 +209,21 @@ jobs:
       # Direct Publishing-API upload instead of r0adkll/upload-google-play — that action hides the
       # real API error behind "Unknown error occurred."; this prints it. stdlib + openssl only (no
       # pip), reuses SERVICE_ACCOUNT_JSON (raw JSON or base64), auto-handles changesNotSentForReview.
-      # Track: canary main -> `internal`; a vX.Y.Z release -> `alpha` (closed testing) for manual
-      # promotion to production in the Play console.
+      # Track: canary main -> `internal`; a vX.Y.Z release -> `production` at 100% (`completed`).
+      #
+      # A tag therefore ships to real users with no further click. Two things keep that honest:
+      # the tag is only pushed once every platform is green, and Play reviews each production
+      # release before it reaches anyone. To ramp instead of going straight to 100%, this is
+      # `--status inProgress --user-fraction 0.2`; to undo a bad one, halt or roll back from the
+      # Console (or `android-promote.yml`, which can re-point production at an older versionCode).
       - name: Upload to Google Play
         if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
         env:
           SERVICE_ACCOUNT_JSON: ${{ secrets.SERVICE_ACCOUNT_JSON }}
         run: |
           echo "uploading to Play track '$PLAY_TRACK'"
-          python3 clients/android/ci/play-upload.py \
-            --package io.unom.punktfunk \
-            --aab clients/android/app/build/outputs/bundle/release/app-release.aab \
-            --track "$PLAY_TRACK" --status completed
+          set -- --package io.unom.punktfunk \
+                 --aab clients/android/app/build/outputs/bundle/release/app-release.aab \
+                 --track "$PLAY_TRACK" --status completed
+          if [ -n "${PLAY_NOTES:-}" ]; then set -- "$@" --release-notes-file "$PLAY_NOTES"; fi
+          python3 clients/android/ci/play-upload.py "$@"

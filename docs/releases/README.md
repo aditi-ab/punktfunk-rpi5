@@ -31,6 +31,21 @@ even across a tag re-point.
 Canary / `-rc` builds have **no** file here on purpose: they get no curated body and are not
 announced.
 
+## Google Play "What's new": `whatsnew/vX.Y.Z.txt`
+
+Play shows its own release notes on the Play Store listing and in the Play Store app, and caps
+them at **500 characters per language** — the `vX.Y.Z.md` body is two orders of magnitude too
+long, so it gets its own short file: `docs/releases/whatsnew/vX.Y.Z.txt`.
+
+Write it for a **phone/TV user**, not a host operator: only what changed in the Android app is
+worth their 500 characters. Plain text, one `•` bullet per line, same voice rules as below.
+`clients/android/ci/play-upload.py` refuses to run if the file is over the cap and prints the
+actual count, so a too-long file fails the release job instead of reaching Play.
+
+Same freeze rule as the notes: once the tag exists, this file describes what that versionCode
+shipped. If it is missing, the release still publishes — Play just carries the previous release's
+text over, which is worse than a rushed sentence, so write it with the bump.
+
 ## Voice & format
 
 **Write for the people who USE Punktfunk to stream their games and desktops — not for the people who

@@ -1,0 +1,95 @@
+# Move a versionCode that is ALREADY on Google Play between tracks — no rebuild.
+#
+# Why this is separate from android.yml: promotion must not rebuild. A rebuild produces a fresh
+# versionCode (github.run_number) from possibly-newer sources, so it ships something nobody tested;
+# promoting assigns the byte-identical artifact the testers already ran. Bolting this onto
+# android.yml would mean an `if:` on all ten of its build steps.
+#
+# What it is for:
+#   * promote a tested build up a track (alpha -> production)
+#   * roll production back by re-pointing it at an older versionCode (to_track=production,
+#     version_code=<the good one>, from_track blank)
+#   * halt a rollout (status=halted)
+#
+# Defaults are deliberately the safe ones: dry_run starts TRUE, so a mis-typed versionCode
+# validates and deletes the edit instead of publishing. Flip it to false only when the dry run
+# printed what you meant.
+name: android-promote
+
+# Two concurrent promotions would race on the same Play edit; the loser fails with a stale-edit
+# error. One at a time, and never cancel one mid-flight — a half-applied track change is worse
+# than a queued one.
+concurrency:
+  group: android-promote
+  cancel-in-progress: false
+
+on:
+  workflow_dispatch:
+    inputs:
+      version_code:
+        description: 'versionCode already on Play (e.g. 10816)'
+        required: true
+      to_track:
+        description: 'destination track'
+        required: true
+        default: 'production'
+      from_track:
+        description: 'track to verify it is on, then clear (blank = touch nothing else)'
+        required: false
+        default: 'alpha'
+      notes_tag:
+        description: "tag whose docs/releases/whatsnew/<tag>.txt to attach, e.g. v0.23.0 (blank = none)"
+        required: false
+        default: ''
+      status:
+        description: 'completed (100%) | inProgress (needs user_fraction) | halted | draft'
+        required: true
+        default: 'completed'
+      user_fraction:
+        description: 'staged rollout fraction for inProgress, e.g. 0.2 (blank otherwise)'
+        required: false
+        default: ''
+      dry_run:
+        description: 'validate only, publish nothing'
+        required: true
+        default: 'true'
+
+jobs:
+  promote:
+    runs-on: ubuntu-24.04
+    # Same image as android.yml purely for python3 + openssl (play-upload.py's only deps); it is
+    # already warm on the runner. Nothing here builds.
+    container:
+      image: 192.168.1.58:5010/punktfunk-android-ci:latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Promote
+        env:
+          SERVICE_ACCOUNT_JSON: ${{ secrets.SERVICE_ACCOUNT_JSON }}
+          VERSION_CODE: ${{ inputs.version_code }}
+          TO_TRACK: ${{ inputs.to_track }}
+          FROM_TRACK: ${{ inputs.from_track }}
+          NOTES_TAG: ${{ inputs.notes_tag }}
+          STATUS: ${{ inputs.status }}
+          USER_FRACTION: ${{ inputs.user_fraction }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -- --package io.unom.punktfunk \
+                 --promote "$VERSION_CODE" \
+                 --track "$TO_TRACK" --status "$STATUS"
+          # Explicit `if`, not `[ ] && …`: under `sh -e` a false AND-OR list that ends up LAST in
+          # the script aborts the step, and these get reordered.
+          if [ -n "$FROM_TRACK" ]; then set -- "$@" --promote-from "$FROM_TRACK"; fi
+          if [ -n "$USER_FRACTION" ]; then set -- "$@" --user-fraction "$USER_FRACTION"; fi
+          if [ -n "$NOTES_TAG" ]; then
+            NOTES="docs/releases/whatsnew/${NOTES_TAG}.txt"
+            # Fail loudly rather than silently publishing with the PREVIOUS release's text still
+            # showing on the store listing.
+            [ -f "$NOTES" ] || { echo "ERROR: no such notes file: $NOTES"; exit 1; }
+            set -- "$@" --release-notes-file "$NOTES"
+          fi
+          if [ "$DRY_RUN" = "true" ]; then set -- "$@" --no-commit; fi
+          echo "promoting versionCode=$VERSION_CODE -> $TO_TRACK (dry_run=$DRY_RUN)"
+          python3 clients/android/ci/play-upload.py "$@"

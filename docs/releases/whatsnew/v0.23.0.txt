@@ -1,0 +1,4 @@
+• Much lower latency: a new frame scheduler cut glass-to-glass delay by about a third on the phones we measured, and the host can now line its capture up with your screen.
+• Microphone: mute it mid-stream, and echo cancellation is on by default.
+• DualSense controllers work over USB.
+• AV1 is picked automatically when your phone and host both support it.
