@@ -35,10 +35,14 @@ pub const DS_FEATURE_PAIRING: &[u8] = &[ // report 0x09 (pairing info: MAC at by
     0x00, 0x00, 0x00, 0x00,
 ];
 #[rustfmt::skip]
-pub const DS_FEATURE_FIRMWARE: &[u8] = &[ // report 0x20 (firmware info / build date)
+pub const DS_FEATURE_FIRMWARE: &[u8] = &[ // report 0x20 (firmware info / build date); bytes 44..46
+    // = update version, kept ABOVE Sony's real releases (0x0630 as of 2026-08) — an older value
+    // makes PlayStation Accessories and libScePad titles demand a firmware update the virtual pad
+    // cannot take ("can't complete the update"), and ≥ 0x0224 is what puts writers on the
+    // COMPATIBLE_VIBRATION2 convention parse_ds_output accepts alongside flag0.
     0x20, 0x4A, 0x75, 0x6E, 0x20, 0x31, 0x39, 0x20, 0x32, 0x30, 0x32, 0x33, 0x31, 0x34, 0x3A, 0x34,
     0x37, 0x3A, 0x33, 0x34, 0x03, 0x00, 0x44, 0x00, 0x08, 0x02, 0x00, 0x01, 0x36, 0x00, 0x00, 0x01,
-    0xC1, 0xC8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x54, 0x01, 0x00, 0x00,
+    0xC1, 0xC8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x99, 0x09, 0x00, 0x00,
     0x14, 0x00, 0x00, 0x00, 0x0B, 0x00, 0x01, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 ];
 
@@ -494,10 +498,13 @@ pub fn parse_ds_output(pad: u8, data: &[u8], fb: &mut DsFeedback) {
                          // data[4]. Scale 0..255 → 0..0xFFFF, same (low, high) convention as the uinput pad's mixer,
                          // and route to the universal rumble plane (0xCA).
                          // Writers on firmware ≥ 2.24 signal rumble via COMPATIBLE_VIBRATION2 in valid_flag2
-                         // (data[39] BIT2) instead of flag0 BIT0. Our feature report advertises 0x0154 so the
-                         // kernel and SDL stay on the flag0 convention, but a writer that hardcodes v2 would
-                         // otherwise have its rumble — including stops — silently ignored, and a missed stop
-                         // buzzes for the rest of the session (the 500 ms refresh re-sends stale state forever).
+                         // (data[39] BIT2) instead of flag0 BIT0. Our feature report advertises a version
+                         // above 2.24 (DS_FEATURE_FIRMWARE bytes 44..46, chosen to keep Sony's updater
+                         // quiet), so the kernel and SDL write the v2 flag — while older writers, and any
+                         // that never read the version, stay on flag0. Both conventions must land here: a
+                         // rumble dropped on either — including stops — is silently ignored, and a missed
+                         // stop buzzes for the rest of the session (the 500 ms refresh re-sends stale state
+                         // forever).
     if flag0 & 0x03 != 0 || data[39] & 0x04 != 0 {
         let high = (data[3] as u16) << 8;
         let low = (data[4] as u16) << 8;
