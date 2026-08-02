@@ -62,8 +62,9 @@ differently. Linux · Windows · Steam Deck:
 
 ```
 1920×1080@120 · 120 fps · 24.3 Mb/s · target 30 Mb/s (auto) · vulkan · HDR
-e2e 14.2/19.8 ms (p50/p95) · host 3.1 · net 6.7 · decode 2.1 · display 2.3 ms
+e2e 14.2/19.8 ms (p50/p95) · host 3.1 · net 6.7 · decode 2.1 · display 2.3 ms (pace 0.6 + latch 1.7)
 host: queue 0.6 · encode 1.8 · xfer 0.2 · pace 0.5 ms
+present: mailbox
 lost 3 (2.4%)
 ```
 
@@ -109,10 +110,11 @@ lost 3 (2.4%)
   which otherwise reads as inexplicable judder plus a refresh of extra latency.
 - **Line 2 — the headline.** `end-to-end` (`e2e` on Linux/Windows) is the *directly
   measured* time from host capture to the endpoint named at the end of the line —
-  `capture→on-glass` or `capture→displayed`. Linux/Windows don't spell the endpoint out,
-  because their presenter always measures to the present instant. `p50` = the typical
-  frame (median), `p95` = the slow outliers. This is the one number that summarizes your
-  stream.
+  `capture→on-glass` or `capture→displayed`. On Linux/Windows the endpoint is the moment
+  the frame is genuinely **visible** wherever the GPU driver can report it (most can);
+  where it can't, the measurement stops at the instant the frame is handed to the display
+  and so reads slightly optimistic. `p50` = the typical frame (median), `p95` = the slow
+  outliers. This is the one number that summarizes your stream.
 - **Line 3 — where the time goes.** The first four stages **tile the end-to-end interval** —
   each starts where the previous one ends, so they add up to the headline. The two extra
   terms under them are not extra time: one is excluded from the total, the other sits inside a
@@ -123,7 +125,12 @@ lost 3 (2.4%)
     reassembly on your device.
   - `decode` — received → decoded, on your device.
   - `display` — decoded → displayed: waiting for the right screen refresh, rendering,
-    and vsync.
+    and vsync. On Linux/Windows it splits into `(pace + latch)` when your driver reports
+    true on-glass timing: **pace** is Punktfunk's own work — getting the decoded frame
+    submitted — and **latch** is the wait for the display to take it. A large `latch` is
+    the screen's refresh cycle, not the stream; a large `pace` is us. (`pace` is also the
+    fair number to compare against an iPhone or iPad, whose figure already has its
+    equivalent of `latch` removed.)
   - `os present` *(iOS and tvOS)* — the fixed depth of the OS present pipeline, which is
     excluded from both the headline and `display` and printed here so you can add it
     back.
@@ -142,6 +149,15 @@ lost 3 (2.4%)
   one split fewer. On Linux/Windows, Detailed adds one further line — `host: queue … ·
   encode … · xfer … · pace …` — splitting the host's own share into its stages, when the
   host reports them.
+
+  Linux/Windows Detailed also carries a **`present:`** line naming how frames are reaching
+  your screen: the display mode in use (`mailbox`, `fifo`, `fifo-latest-ready`, …), `vrr yes`/`vrr no` once the
+  client has *measured* whether your screen is following the stream's cadence (it is
+  reported only when measured — no guess from what the display claims), and, when the
+  [presentation setting](/docs/client-settings#video) is *Smoothness*, the word
+  `smoothing`. Counters join it only when they're doing something — `qdrop`/`qdry` mean
+  the smoothing buffer overflowed or ran dry (a jittery link), and `gated`/`forced`
+  belong to the pacing that keeps frames from stacking up behind the display.
 
   (Stage values are per-stage medians, so they sum only *approximately* to the
   headline median — percentiles aren't perfectly additive. The headline is measured

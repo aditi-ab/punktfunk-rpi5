@@ -172,6 +172,10 @@ pub(crate) struct Shared {
 
 pub struct AppCtx {
     pub(crate) identity: (String, String),
+    /// The settings snapshot the UI renders from. Loaded once at startup, and RE-BASED on
+    /// the file when the settings page is (re)entered (`settings::refresh_snapshot`) and
+    /// inside every `commit` — this process is not the file's only writer (session resize,
+    /// console UI, Decky), so a plain process-lifetime snapshot goes stale on screen.
     pub(crate) settings: Mutex<Settings>,
     pub(crate) gamepad: GamepadService,
     pub(crate) shared: Arc<Shared>,
@@ -688,7 +692,7 @@ fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
             &set_settings_rev,
             nav_progress,
         ),
-        Screen::Licenses => licenses::licenses_page(&set_screen),
+        Screen::Licenses => licenses::licenses_page(ctx, &set_screen),
         Screen::Help => help::help_page(&set_screen),
         Screen::Pair => component(pair::pair_page, svc),
         Screen::SpeedTest => component(speed::speed_page, SpeedProps { svc, state: speed }),

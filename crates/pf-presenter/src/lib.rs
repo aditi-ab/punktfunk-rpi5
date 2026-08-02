@@ -52,6 +52,8 @@ pub mod keymap_sdl;
 #[cfg(any(target_os = "linux", windows))]
 pub mod overlay;
 #[cfg(any(target_os = "linux", windows))]
+mod present_pace;
+#[cfg(any(target_os = "linux", windows))]
 mod run;
 #[cfg(any(target_os = "linux", windows))]
 pub mod touch;

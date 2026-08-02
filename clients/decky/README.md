@@ -28,8 +28,9 @@ the panel looks and feels native to Gaming Mode.
    own Settings: a left rail of categories (`SidebarNavigation`), one page each, so no page needs
    scrolling. The categories and their order are the console settings screen's — Stream (resolution
    / refresh / render scale / bitrate / compositor), Video (codec / decoder / GPU / HDR / 4:4:4),
-   Audio (channels / output + mic device / echo cancellation), Controllers, Touch & mouse,
-   Interface (stats overlay / auto-wake / library / fullscreen). The device pickers are populated
+   Presentation (prioritize / smoothness buffer / V-Sync / VRR), Audio (channels / output + mic
+   device / echo cancellation), Controllers, Touch & mouse, Interface (stats overlay / auto-wake /
+   library / fullscreen). The device pickers are populated
    from the session binary (`--list-adapters` / `--list-audio`); the GPU row appears only where
    there is more than one adapter.
 6. **About** — plugin version, an explicit "Check for updates" button, the setup-guide link, and
@@ -99,7 +100,7 @@ restart is required for an out-of-band install to appear.
 | --- | --- |
 | `src/index.tsx` | Plugin entry: the QAM panel + route registration. |
 | `src/page.tsx` | The `/punktfunk` fullscreen page — Hosts (with per-host details) / Settings / About tabs. |
-| `src/settings.tsx` · `src/pair.tsx` | The settings screen (a `SidebarNavigation` of six category pages over one shared settings object); the gamepad-navigable PIN-pairing modal. |
+| `src/settings.tsx` · `src/pair.tsx` | The settings screen (a `SidebarNavigation` of seven category pages over one shared settings object); the gamepad-navigable PIN-pairing modal. |
 | `src/library.tsx` | The per-host game picker (pin/unpin, "Open library on screen") + the pinned-game launch helper. |
 | `src/hostmgmt.tsx` | Add / edit host dialogs — mutate the shared known-hosts store (`client-known-hosts.json`) via the flatpak client's headless modes, so a host saved here shows up in the desktop client too. |
 | `src/ui.tsx` | Shared UI primitives for the fullscreen page + modals (right-aligned row actions, consistent Field layout). |

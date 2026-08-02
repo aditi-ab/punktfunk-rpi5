@@ -982,6 +982,10 @@ mod tests {
                 height: 1440,
                 bitrate_kbps: 55000,
                 codec: "av1".into(),
+                present_priority: "smooth".into(),
+                smooth_buffer: 2,
+                vsync: false,
+                allow_vrr: false,
                 ..Default::default()
             },
             clipboard: true,

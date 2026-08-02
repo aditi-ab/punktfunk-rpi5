@@ -40,6 +40,7 @@ import {
   FaGamepad,
   FaHandPointer,
   FaSlidersH,
+  FaTv,
   FaVideo,
   FaVolumeUp,
 } from "react-icons/fa";
@@ -111,6 +112,19 @@ const DECODERS: [string, string][] = [
   ["vulkan", "Vulkan Video"],
   ["vaapi", "VAAPI"],
   ["software", "Software"],
+];
+// Presentation intent — the `present_priority` key shared with the Apple and Android clients, so
+// one profile reads the same on every device.
+const PRESENT_PRIORITIES: [string, string][] = [
+  ["latency", "Lowest latency"],
+  ["smooth", "Smoothness"],
+];
+// Smoothness buffer depth in frames; 0 = Automatic (resolves to 2).
+const SMOOTH_BUFFERS: [number, string][] = [
+  [0, "Automatic"],
+  [1, "1 frame"],
+  [2, "2 frames"],
+  [3, "3 frames"],
 ];
 const AUDIO_CHANNELS: [number, string][] = [
   [2, "Stereo"],
@@ -227,7 +241,7 @@ const DeviceRow: FC<{
 };
 
 // ----------------------------------------------------------------------------------------
-// The pages. One settings object, six views on it — every page takes the same context rather
+// The pages. One settings object, seven views on it — every page takes the same context rather
 // than fetching or holding state of its own, so a change on one page is visible on the others
 // the moment you switch.
 // ----------------------------------------------------------------------------------------
@@ -354,6 +368,43 @@ const VideoPage: FC<PageCtx> = ({ s, patch, devices }) => {
         description="Full-colour video: crisp small text and thin lines, at more bandwidth. Needs an NVIDIA host (NVENC) or the PyroWave codec — other encoders stream 4:2:0 and the session falls back silently."
         checked={s.enable_444 ?? false}
         onChange={(v) => patch({ enable_444: v })}
+      />
+    </div>
+  );
+};
+
+const PresentationPage: FC<PageCtx> = ({ s, patch }) => {
+  const smooth = (s.present_priority ?? "latency") === "smooth";
+  return (
+    <div style={pageBody}>
+      <SelectRow
+        label="Prioritize"
+        description="What to optimise for when a decoded frame is ready. Lowest latency shows each frame the moment the display can take it — a network hiccup becomes an occasional repeated or skipped frame. Smoothness buffers a little to even those out."
+        options={PRESENT_PRIORITIES}
+        value={s.present_priority ?? "latency"}
+        onChange={(v) => patch({ present_priority: v })}
+      />
+      <SelectRow
+        label="Smoothness buffer"
+        description="Frames held back before showing. Each one absorbs about a refresh of network hiccup and adds a refresh of delay. Automatic holds two."
+        options={SMOOTH_BUFFERS}
+        value={s.smooth_buffer ?? 0}
+        formatUnknown={(v) => `${v} frames`}
+        onChange={(v) => patch({ smooth_buffer: v })}
+        disabled={!smooth}
+        indent
+      />
+      <ToggleField
+        label="V-Sync"
+        description="Tear-free. Off removes the wait for the screen's refresh — the lowest possible delay, at the cost of visible tearing. Best-effort: not every driver offers it, and the Detailed stats overlay names the mode actually in use."
+        checked={s.vsync ?? true}
+        onChange={(v) => patch({ vsync: v })}
+      />
+      <ToggleField
+        label="Follow variable refresh"
+        description="On a VRR screen, let the panel refresh in step with the stream instead of on a fixed cadence. Applies to fullscreen sessions — which a Gaming-Mode stream always is — and is harmless on a fixed-refresh screen."
+        checked={s.allow_vrr ?? true}
+        onChange={(v) => patch({ allow_vrr: v })}
       />
     </div>
   );
@@ -575,6 +626,12 @@ export const SettingsSection: FC = () => {
       pages={[
         { title: "Stream", identifier: "stream", icon: <FaDesktop />, content: <StreamPage {...ctx} /> },
         { title: "Video", identifier: "video", icon: <FaVideo />, content: <VideoPage {...ctx} /> },
+        {
+          title: "Presentation",
+          identifier: "presentation",
+          icon: <FaTv />,
+          content: <PresentationPage {...ctx} />,
+        },
         { title: "Audio", identifier: "audio", icon: <FaVolumeUp />, content: <AudioPage {...ctx} /> },
         {
           title: "Controllers",

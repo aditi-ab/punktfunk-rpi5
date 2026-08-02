@@ -105,7 +105,14 @@ fn parse_line(line: &str) -> Option<ChildLine> {
 /// connect that silently drops back to the host list.
 pub(crate) fn silent_exit_banner(code: i32) -> Option<String> {
     (code != 0 && code != -1).then(|| {
-        format!("The session didn't start (punktfunk-session exited with code {code}). Check the client log.")
+        // Name the log's actual location — "check the client log" without a path is a
+        // scavenger hunt (Settings ▸ About's "Open log folder" reaches it too).
+        let log = crate::logfile::path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "the client log".into());
+        format!(
+            "The session didn't start (punktfunk-session exited with code {code}). Check {log}."
+        )
     })
 }
 

@@ -85,10 +85,38 @@ Full detail: [HDR](/docs/hdr).
 **Full chroma (4:4:4)** — *default: off.* Crisp small text and thin lines, at more bandwidth. It
 needs HEVC or PyroWave, the host's own 4:4:4 policy left on, a capture path that delivers full
 chroma, and a GPU that can encode it; if any gate fails the host says 4:2:0 before your decoder is
-built. **Today only the Apple app actually advertises 4:4:4**, and only when its hardware decode
-probe passes — the Linux and Windows apps store the toggle but their session doesn't advertise the
-capability yet, so it has no effect there. The console home and Decky offer the toggle; Android
-doesn't.
+built. The Apple, Linux and Windows apps all advertise it (Apple additionally requires its hardware
+decode probe to pass). The console home and Decky offer the toggle; Android doesn't.
+
+**Prioritize** — *default: Lowest latency.* What the client optimizes for when a decoded frame is
+ready. **Lowest latency** shows every frame the moment the display can take it, so a network hiccup
+becomes an occasional repeated or skipped frame. **Smoothness** holds a small buffer that evens
+those hiccups out, at that buffer's worth of added delay. Linux and Windows apps, the console home
+and Decky; the Apple and Android apps have carried the same setting for a while, and it is stored
+under the same name, so a [profile](/docs/profiles-and-links) means the same thing on every device.
+
+**Smoothness buffer** — *default: Automatic (two frames).* Only shown under **Smoothness**. How
+many frames are held back before showing. Each frame absorbs roughly one screen refresh of network
+hiccup and costs one refresh of delay — so on a 120 Hz screen, two frames is about 17 ms of extra
+delay bought against 17 ms of jitter. If you never see stutter, you don't need this. Wherever
+**Prioritize** is offered, and greyed out until you pick Smoothness.
+
+**V-Sync** — *default: on.* Tear-free presentation. Turning it off asks the GPU to show each frame
+the instant it's ready instead of waiting for the screen's next refresh: the lowest delay a display
+can give you, at the cost of visible tearing on fast motion. It is **best-effort** — not every
+driver or compositor offers a tearing mode, and where none is available the stream stays tear-free.
+The Detailed [stats overlay](/docs/stats) names the mode actually in use, so you can tell "off"
+from "off but unavailable". Linux and Windows apps, the console home and Decky.
+
+**Follow variable refresh rate** — *default: on.* On a VRR / FreeSync / G-Sync screen, let the panel
+refresh in step with the stream rather than on a fixed cadence — which removes the wait between a
+frame being ready and the screen being willing to show it. Applies to **fullscreen** sessions (a
+windowed one is at the compositor's mercy) and is harmless on a fixed-refresh screen. It needs a
+graphics driver that offers the modern queue-free display mode; on an older driver it does nothing
+unless you also set `PUNKTFUNK_VRR_FIFO=1` (see [configuration](/docs/configuration)), because the
+older way of following a panel costs noticeable latency on a fixed-refresh screen. The stats overlay
+reports `vrr yes` once it has *measured* that the panel really is following. Linux and Windows apps,
+the console home and Decky.
 
 **Host compositor** — *default: Automatic.* Which backend a **Linux** host uses to drive the virtual
 output. Advisory: a host without that backend quietly auto-detects instead.

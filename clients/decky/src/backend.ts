@@ -104,7 +104,7 @@ export interface RunnerInfo {
 // The flatpak client's settings JSON — the SAME `client-gtk-settings.json` the desktop client
 // and the console's settings screen own, so a value changed in any of them shows in the others.
 //
-// Every field the client's `Settings` struct persists is modelled here EXCEPT the four that
+// Every field the client's `Settings` struct persists is modelled here EXCEPT the ones that
 // cannot be answered from a plugin backend or aren't settings at all:
 //   • `forward_pad`   — which physical pad is player 1. Needs SDL's live device list, which only
 //                       the client process has; there is no CLI that enumerates pads.
@@ -135,6 +135,14 @@ export interface StreamSettings {
   hdr_enabled?: boolean; // default ON — advertise 10-bit/HDR10
   enable_444?: boolean; // default off — ask for full chroma
   adapter?: string; // decode/present GPU by marketing name; "" = automatic
+
+  // ---- Presentation ----
+  // What the client optimises for when a decoded frame is ready: "latency" | "smooth". Shared
+  // with the Apple and Android clients under this name, so one profile reads the same everywhere.
+  present_priority?: string;
+  smooth_buffer?: number; // frames held back under "smooth"; 0 = Automatic (resolves to 2), else 1–3
+  vsync?: boolean; // default ON — tear-free; off asks for a tearing present mode (best-effort)
+  allow_vrr?: boolean; // default ON — let a VRR panel refresh in step with the stream
 
   // ---- Audio ----
   audio_channels?: number; // 2 (stereo) | 6 (5.1) | 8 (7.1)
