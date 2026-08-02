@@ -411,7 +411,16 @@ fn commit(
         return;
     }
     let mut catalog = ProfilesFile::load();
-    let base = ctx.settings.lock().unwrap().clone();
+    // The same rebase as the global arm above: `base` is what `absorb`'s before/after
+    // effective settings derive from, and the snapshot is not the file — another process
+    // (session resize, console UI, Decky) may have moved a global under us. The historical
+    // rebase fix ("settings saves stop reverting each other") covered the whole-file
+    // writers but missed this arm.
+    let base = {
+        let mut s = ctx.settings.lock().unwrap();
+        *s = Settings::load();
+        s.clone()
+    };
     let Some(p) = catalog.profiles.iter_mut().find(|p| p.id == scope) else {
         return; // deleted from under us; the next render falls back to the defaults scope
     };
@@ -423,6 +432,17 @@ fn commit(
         tracing::warn!(error = %format!("{e:#}"), "saving the profile catalog");
     }
     rev.1.call(rev.0 + 1);
+}
+
+/// Re-base the process-lifetime settings snapshot on the file — called from the navigation
+/// handlers that (re)enter this page, NOT per render pass. `ctx.settings` is loaded once at
+/// process start and this process is not the file's only writer (a spawned session persists
+/// its match-window size, the console UI and Decky save too — profiles.rs documents the
+/// family), so without this the page opens showing values another process already replaced,
+/// which then visibly "jump" the moment a row is touched and `commit`'s rebase pulls the
+/// file in. The field report this fixes: a codec setting that "changed by itself".
+pub(crate) fn refresh_snapshot(ctx: &Arc<AppCtx>) {
+    *ctx.settings.lock().unwrap() = Settings::load();
 }
 
 /// Which tier-P rows the profile in scope overrides. Plain bools rather than a lookup so the
@@ -978,6 +998,16 @@ pub(crate) fn settings_page(
         let ss = set_screen.clone();
         button("Third-party licenses").on_click(move || ss.call(Screen::Licenses))
     };
+    // The client log's home (%LOCALAPPDATA%\punktfunk\logs) — the file every "check the
+    // client log" message means, which until this row had no way in from the UI at all.
+    // The folder rather than the file so the rotated `.old` generation is in reach too.
+    // Best-effort, like the log itself: a missing dir or a failed spawn stays silent.
+    let logs_button = button("Open log folder").on_click(|| {
+        if let Some(dir) = crate::logfile::log_dir() {
+            let _ = std::fs::create_dir_all(&dir);
+            let _ = std::process::Command::new("explorer.exe").arg(&dir).spawn();
+        }
+    });
     let library_toggle = setting_toggle(ctx, scope, (rev, set_rev), s.library_enabled, |s, on| {
         s.library_enabled = on
     });
@@ -1071,8 +1101,9 @@ pub(crate) fn settings_page(
                         "HDR10, when the host has HDR content and this display supports it. \
                          HEVC only; otherwise the stream stays SDR.",
                     ),
-                    // Wording shared with the GTK client (its chroma_row) — same setting,
-                    // same constraints.
+                    // First sentence shared with the GTK client (its chroma_row); the
+                    // constraint sentence names the real gate (host: PyroWave || NVENC) —
+                    // "where the host can encode it" cost field users the discovery time.
                     described_overridable(
                         (rev, set_rev),
                         scope,
@@ -1081,7 +1112,8 @@ pub(crate) fn settings_page(
                         over.enable_444,
                         chroma_toggle,
                         "Full-colour video: crisp small text and thin lines, at more \
-                         bandwidth. HEVC only, and only where the host can encode it.",
+                         bandwidth. Requires an NVIDIA host (NVENC) or the PyroWave \
+                         codec \u{2014} other encoders stream 4:2:0.",
                     ),
                 ],
                 None,
@@ -1348,7 +1380,16 @@ pub(crate) fn settings_page(
             "About",
             group(
                 None,
-                vec![about_identity.into(), licenses_button.into()],
+                vec![
+                    about_identity.into(),
+                    described_labeled(
+                        "Diagnostics",
+                        logs_button,
+                        "The client log (client.log, plus the session\u{2019}s whole \
+                         receive/decode/present trail) \u{2014} attach it to a bug report.",
+                    ),
+                    licenses_button.into(),
+                ],
                 None,
             ),
         ),

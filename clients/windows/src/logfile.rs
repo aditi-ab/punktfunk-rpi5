@@ -21,11 +21,12 @@ const ROTATE_BYTES: u64 = 10 * 1024 * 1024;
 
 static SINK: OnceLock<Option<Arc<Mutex<File>>>> = OnceLock::new();
 
-fn log_dir() -> Option<PathBuf> {
+/// The log directory — Settings ▸ About's "Open log folder" opens it in Explorer.
+pub(crate) fn log_dir() -> Option<PathBuf> {
     Some(PathBuf::from(std::env::var_os("LOCALAPPDATA")?).join(r"punktfunk\logs"))
 }
 
-/// The log file's path, for the "logs land here" startup line (and any future UI affordance).
+/// The log file's path, for the "logs land here" startup line and the failed-spawn banner.
 pub(crate) fn path() -> Option<PathBuf> {
     Some(log_dir()?.join("client.log"))
 }

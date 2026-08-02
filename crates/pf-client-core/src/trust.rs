@@ -14,6 +14,7 @@ use anyhow::{anyhow, Context, Result};
 use punktfunk_core::client::NativeClient;
 use punktfunk_core::quic::endpoint;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 pub fn config_dir() -> Result<PathBuf> {
@@ -940,6 +941,14 @@ pub struct Settings {
     /// the user will be looking at. `0` = never stored → the 1280×720 default.
     pub last_window_w: u32,
     pub last_window_h: u32,
+    /// Settings keys this build doesn't model (a newer client's field), carried through a
+    /// load→save round-trip untouched — [`crate::profiles::SettingsOverlay`]'s `extra`
+    /// pattern extended to the globals. Without it, every whole-file writer of this store
+    /// (two shells, the console settings screen, the session's resize callback, Decky)
+    /// running as an OLDER binary silently drops what a newer one persisted. Empty on
+    /// every existing store, and an empty map serializes to nothing, so files don't churn.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
 }
 
 fn default_codec() -> String {
@@ -1034,6 +1043,7 @@ impl Default for Settings {
             match_window: false,
             last_window_w: 0,
             last_window_h: 0,
+            extra: BTreeMap::new(),
         }
     }
 }
@@ -1206,6 +1216,28 @@ mod tests {
         // Echo cancellation post-dates every stored file: it must load ON, or an upgrade
         // would silently turn a user's echo protection off.
         assert!(s.echo_cancel);
+    }
+
+    /// A key this build doesn't model (a newer client's setting) survives a load→save
+    /// round trip instead of being dropped by the next whole-file write — the same
+    /// contract `SettingsOverlay.extra` gives profiles. And when there are no unknown
+    /// keys, the flatten map adds nothing, so existing files don't churn.
+    #[test]
+    fn settings_unknown_keys_survive_round_trip() {
+        let newer = r#"{"width":1920,"height":1080,"frob_mode":"fancy","frob_level":3}"#;
+        let s: Settings = serde_json::from_str(newer).unwrap();
+        assert_eq!((s.width, s.height), (1920, 1080));
+        assert_eq!(
+            s.extra.get("frob_mode").and_then(|v| v.as_str()),
+            Some("fancy")
+        );
+        let out = serde_json::to_string(&s).unwrap();
+        assert!(out.contains(r#""frob_mode":"fancy""#), "{out}");
+        assert!(out.contains(r#""frob_level":3"#), "{out}");
+        // No unknown keys → no artifact of the passthrough field in the file.
+        let plain = serde_json::to_string(&Settings::default()).unwrap();
+        assert!(!plain.contains("extra"), "{plain}");
+        assert!(!plain.contains("frob"), "{plain}");
     }
 
     /// Stats-tier resolution: a pre-tier store falls back to `show_stats` (off → Off,
