@@ -492,7 +492,15 @@ impl DataPump {
                         recovery_kf = recovery_kf_reqs,
                         "adaptive bitrate: requesting encoder re-target"
                     );
-                    let _ = ctrl_tx.try_send(CtrlRequest::SetBitrate(kbps));
+                    if ctrl_tx.try_send(CtrlRequest::SetBitrate(kbps)).is_err() {
+                        // Never reached the control task — tell the controller, or three of
+                        // these retire it for the session as "the host never acked".
+                        abr.on_request_dropped();
+                        tracing::warn!(
+                            kbps,
+                            "adaptive bitrate: control queue full — re-target dropped"
+                        );
+                    }
                 }
                 flush_in_window = false;
                 last_report = Instant::now();
