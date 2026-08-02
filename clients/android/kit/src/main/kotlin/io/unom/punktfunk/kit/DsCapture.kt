@@ -97,6 +97,15 @@ class DsCapture(
     /** True once [PadAudioHook.start] has run for the current capture, so it fires exactly once. */
     @Volatile private var padAudioStarted = false
 
+    /**
+     * The renderer's OWN connection to the pad.
+     *
+     * It must not share [usb]'s descriptor: two transfer engines on one usbfs descriptor reap each
+     * other's completions (see [HidUsbLink.openAuxConnection]), which strands both the HID reader
+     * and the audio ring. Closed only after the hook's stop has returned.
+     */
+    @Volatile private var padAudioConn: android.hardware.usb.UsbDeviceConnection? = null
+
     val isActive: Boolean get() = model != null
 
     /** First attached Sony USB pad, for the permission flow. Needs no permission to enumerate. */
@@ -135,7 +144,11 @@ class DsCapture(
         // joined, so ordering this first is what makes the borrow sound.
         if (padAudioStarted) {
             padAudioStarted = false
+            // stop() joins the render thread, so nothing is using the descriptor after it returns
+            // — only then is it safe to close the connection that owns it.
             pad?.let { padAudio?.stop(it.index) }
+            padAudioConn?.close()
+            padAudioConn = null
         }
         val m = model
         if (m != null) {
@@ -161,11 +174,38 @@ class DsCapture(
             pad = it
             // The wire index exists from here on, and the host addresses pad audio by it. Fired on
             // the link thread, once per capture.
-            if (!padAudioStarted) {
-                val fd = usb.fileDescriptor
+            if (!padAudioStarted && padAudio != null) {
+                // A dedicated connection, NOT usb.fileDescriptor — see padAudioConn.
+                val conn = usb.openAuxConnection()
+                val fd = conn?.fileDescriptor ?: -1
                 if (fd >= 0) {
+                    padAudioConn = conn
                     padAudioStarted = true
-                    padAudio?.start(it.index, fd)
+                    // Real-world self test, opt-in: `adb shell setprop debug.punktfunk.pad_audio_selftest 3`
+                    // drives the voice coils for N seconds through the actual client path before
+                    // the renderer takes over — the one check that proves the descriptor, the
+                    // interface claim and the write path all work on THIS device, without needing
+                    // a host to be streaming. Same convention as debug.punktfunk.force_parts.
+                    val secs = runCatching {
+                        Class.forName("android.os.SystemProperties")
+                            .getMethod("get", String::class.java, String::class.java)
+                            .invoke(null, "debug.punktfunk.pad_audio_selftest", "0") as String
+                    }.getOrNull()?.toIntOrNull() ?: 0
+                    if (secs > 0) {
+                        // Diagnostic mode: the self test OWNS this descriptor for the capture, and
+                        // the renderer must not also drive it — two engines on one usbfs
+                        // descriptor reap each other's completions, which is precisely the fault
+                        // this test exists to expose.
+                        Thread({
+                            val r = NativeBridge.nativePadAudioSelfTest(fd, secs, 60)
+                            Log.i(TAG, "pad audio self-test → ${if (r > 0) "PASS ($r frames)" else "FAIL ($r)"}")
+                        }, "pf-pad-selftest").start()
+                    } else {
+                        padAudio?.start(it.index, fd)
+                    }
+                } else {
+                    conn?.close()
+                    Log.w(TAG, "pad audio: could not open a second USB connection")
                 }
             }
             Log.i(TAG, "captured $m → wire pad ${it.index}")

@@ -280,6 +280,106 @@ mod sink {
     }
 }
 
+// ---- the self test ------------------------------------------------------------------------------
+
+/// Drive the pad directly with a synthetic tone, through **the real client path**.
+///
+/// This exists because the two things most likely to be wrong here cannot be unit-tested and are
+/// invisible without a host: whether the descriptor Kotlin handed over is one this renderer may
+/// drive exclusively, and whether the interface claim succeeds on this kernel. A standalone
+/// harness proves neither — it owns its descriptor by construction, which is exactly the condition
+/// that was violated when this renderer was handed the HID link's fd and the two engines began
+/// stealing each other's URB completions.
+///
+/// Opens the sink the same way [`render`] does and writes a sine into the voice-coil pair, which
+/// is felt rather than heard. Returns sample frames written, or a negative [`SelfTest`] code.
+///
+/// # Safety
+///
+/// `fd` must be a live usbfs descriptor whose connection outlives the call, and which **nothing
+/// else is driving transfers on**.
+#[cfg(target_os = "android")]
+pub(crate) unsafe fn self_test(fd: i32, seconds: i32, hz: i32) -> i32 {
+    // SAFETY: the caller's contract.
+    let dev = unsafe { sink::device(fd) };
+    let mut playback = match sink::open(&dev) {
+        Ok(p) => p,
+        Err(e) => {
+            log::warn!("pad audio self-test: could not open the stream: {e}");
+            return SelfTest::OPEN_FAILED;
+        }
+    };
+    log::info!(
+        "pad audio self-test: {} ch {} at {} Hz, {} us in flight",
+        playback.channels(),
+        playback.format(),
+        playback.rate(),
+        playback.schedule().in_flight_us()
+    );
+
+    let rate = playback.rate();
+    let channels = playback.channels() as usize;
+    let frames_per_chunk = (rate as usize / 1000).max(1);
+    let mut chunk = vec![0i16; frames_per_chunk * channels];
+    let mut phase = 0.0f32;
+    let step = std::f32::consts::TAU * hz.clamp(20, 500) as f32 / rate as f32;
+    let total = u64::from(rate) * seconds.clamp(1, 30) as u64;
+    let mut written = 0u64;
+
+    while written < total {
+        for frame in chunk.chunks_mut(channels) {
+            let sample = (phase.sin() * 16_384.0) as i16;
+            phase += step;
+            if phase >= std::f32::consts::TAU {
+                phase -= std::f32::consts::TAU;
+            }
+            frame.fill(0);
+            // Channels 2 and 3 are the voice coils; the speaker pair stays silent so a pass is
+            // unambiguously FELT rather than merely audible.
+            for c in 2..channels {
+                frame[c] = sample;
+            }
+        }
+        if let Err(e) = playback.write_interleaved(&chunk) {
+            log::warn!("pad audio self-test: write failed after {written} frames: {e}");
+            return SelfTest::WRITE_FAILED;
+        }
+        written += frames_per_chunk as u64;
+    }
+    let _ = playback.drain(Duration::from_millis(500));
+
+    let stats = playback.stats();
+    log::info!(
+        "pad audio self-test: {} frames, {} urbs, {} underruns, {} short bytes, {} urb errors",
+        playback.frames_written(),
+        stats.urbs_completed,
+        stats.underruns,
+        stats.short_bytes,
+        stats.urb_errors
+    );
+    // Underruns are a producer-pacing property and deliberately NOT a failure here: the question
+    // this answers is whether the client can drive the pad at all. Data reaching the bus is the
+    // pass condition.
+    if stats.urb_errors > 0 || playback.frames_written() == 0 {
+        return SelfTest::NO_DATA;
+    }
+    playback.frames_written().min(i32::MAX as u64) as i32
+}
+
+/// Negative results from [`self_test`]. Positive values are sample frames written.
+#[cfg(target_os = "android")]
+pub(crate) struct SelfTest;
+
+#[cfg(target_os = "android")]
+impl SelfTest {
+    /// The claim or stream open failed — the OEM-kernel case, or a descriptor another engine owns.
+    pub(crate) const OPEN_FAILED: i32 = -1;
+    /// The stream opened but a write failed part-way.
+    pub(crate) const WRITE_FAILED: i32 = -2;
+    /// It ran, but nothing reached the bus.
+    pub(crate) const NO_DATA: i32 = -3;
+}
+
 // ---- the renderer worker -----------------------------------------------------------------------
 
 /// A running renderer: the stop flag and the thread, joined on drop.

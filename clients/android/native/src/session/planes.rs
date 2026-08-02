@@ -512,6 +512,31 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStartPadAud
     })
 }
 
+/// `NativeBridge.nativePadAudioSelfTest(fd, seconds, hz): Int` — drive the pad directly with a
+/// tone through the real client render path, with no host and no session involved.
+///
+/// The check a standalone harness cannot make: it owns its descriptor by construction, so it can
+/// never reveal that the client handed the renderer a descriptor something else was already
+/// driving. Returns sample frames written, or negative on failure (see `pad_audio::SelfTest`).
+#[no_mangle]
+#[cfg(target_os = "android")]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativePadAudioSelfTest(
+    _env: JNIEnv,
+    _this: JObject,
+    fd: jni::sys::jint,
+    seconds: jni::sys::jint,
+    hz: jni::sys::jint,
+) -> jni::sys::jint {
+    jni_guard(-1, || {
+        if fd < 0 {
+            return -1;
+        }
+        // SAFETY: Kotlin holds the owning UsbDeviceConnection open across this call and drives no
+        // other transfers on it (it opens a dedicated connection for exactly this).
+        unsafe { crate::pad_audio::self_test(fd, seconds, hz) }
+    })
+}
+
 /// `NativeBridge.nativeStopPadAudio(handle, pad)` — stop tier-A pad audio and join its thread.
 ///
 /// Returns only once the render thread is joined, which is the point: Kotlin may close the

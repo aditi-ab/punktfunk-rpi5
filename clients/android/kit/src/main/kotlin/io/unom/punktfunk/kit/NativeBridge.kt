@@ -368,6 +368,15 @@ object NativeBridge {
     external fun nativeStopPadAudio(handle: Long, pad: Int)
 
     /**
+     * Drive the pad with a test tone through the real render path — no host, no session.
+     *
+     * [fd] must come from a connection **nothing else is driving transfers on**: two engines on
+     * one usbfs descriptor reap each other's completions. Blocks for roughly [seconds]; run it off
+     * the main thread. Returns sample frames written, or negative on failure.
+     */
+    external fun nativePadAudioSelfTest(fd: Int, seconds: Int, hz: Int): Int
+
+    /**
      * Is a mic capture actually RUNNING — i.e. did [nativeStartMic] open a stream, and has
      * [nativeStopMic] not been called since? Offer the in-stream mute control on THIS rather than
      * on the user's setting: a device that refused every AAudio input rung (or a missing
