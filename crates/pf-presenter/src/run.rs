@@ -18,7 +18,9 @@
 
 use crate::input::{Capture, FingerPhase};
 use crate::overlay::{FrameCtx, Overlay, OverlayAction, OverlayFrame, SessionPhase};
-use crate::present_pace::{FrameStore, LatchClock, PresentGate, MARGIN_MAX_NS, MARGIN_STEP_NS};
+use crate::present_pace::{
+    Cadence, CadenceProbe, FrameStore, LatchClock, PresentGate, MARGIN_MAX_NS, MARGIN_STEP_NS,
+};
 use crate::touch::Abs;
 use crate::vk::{FrameInput, Presenter};
 use anyhow::{Context as _, Result};
@@ -70,6 +72,14 @@ pub struct SessionOpts {
     /// (design/desktop-presentation-rebuild.md). `PUNKTFUNK_PRESENTER=arrival` overrides
     /// the whole engine back to the legacy drain for field A/B without a rebuild.
     pub present_priority: PresentPriority,
+    /// Tear-free presentation ([`Settings::vsync`], default on). Off asks for a tearing
+    /// present mode for the lowest possible latch — best-effort, and the mode that
+    /// actually took is named in the stats line.
+    pub vsync: bool,
+    /// Let a variable-refresh display follow the stream cadence ([`Settings::allow_vrr`],
+    /// default on) — prefers the present mode that drives VRR panels directly when the
+    /// session starts fullscreen.
+    pub allow_vrr: bool,
     /// Emit the `{"ready":true}` stdout line after the first presented frame.
     pub json_status: bool,
     /// Called once on `Connected` with the host's fingerprint (trust persistence is the
@@ -239,6 +249,9 @@ struct StreamState {
     /// The FIFO glass budget (one undisplayed present in flight) — inert off FIFO modes
     /// or without present timing.
     gate: PresentGate,
+    /// Is variable refresh actually live? Measured from the same on-glass stamps (no
+    /// portable query exists) — see [`CadenceProbe`].
+    cadence: CadenceProbe,
     /// The latch slot the last smoothness present served (one present per slot); 0 =
     /// none yet.
     last_target_ns: u64,
@@ -364,6 +377,7 @@ impl StreamState {
             store: FrameStore::new(usize::from(priority.fifo_capacity())),
             clock: LatchClock::new(native_refresh_hz),
             gate: PresentGate::default(),
+            cadence: CadenceProbe::new(),
             last_target_ns: 0,
             margin_ns: 0,
             win_misses: 0,
@@ -509,7 +523,16 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
     let instance_exts = window
         .vulkan_instance_extensions()
         .map_err(|e| anyhow::anyhow!("vulkan instance extensions: {e}"))?;
-    let mut presenter = Presenter::new(&window, &instance_exts).context("vulkan presenter")?;
+    let mut presenter = Presenter::new(
+        &window,
+        &instance_exts,
+        crate::vk::PresentPref {
+            vsync: opts.vsync,
+            allow_vrr: opts.allow_vrr,
+            fullscreen: opts.fullscreen,
+        },
+    )
+    .context("vulkan presenter")?;
     // A valid black frame immediately — the window is honest while the connect runs.
     presenter.present(&window, FrameInput::Redraw, None)?;
 
@@ -702,6 +725,28 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                             if let Some(st) = stream.as_mut() {
                                 st.resize_pending = Some(Instant::now());
                             }
+                        }
+                    }
+                    // Dragged to another monitor (or the mode changed under us): the
+                    // latch grid and the VRR verdict both belong to the OLD panel. The
+                    // refresh rate used to be read once at startup and never revisited,
+                    // so a 60 Hz-seeded clock would keep pacing a 144 Hz panel.
+                    WindowEvent::DisplayChanged(..) => {
+                        let hz = window
+                            .get_display()
+                            .and_then(|d| d.get_mode())
+                            .map(|m| m.refresh_rate.round().max(0.0) as u32)
+                            .unwrap_or(0);
+                        if let Some(st) = stream.as_mut() {
+                            if hz > 0 {
+                                st.clock = LatchClock::new(hz);
+                            }
+                            st.cadence.reset();
+                            st.last_target_ns = 0;
+                            tracing::info!(
+                                refresh_hz = hz,
+                                "display changed — relearning the latch grid"
+                            );
                         }
                     }
                     WindowEvent::Exposed => {
@@ -1406,17 +1451,25 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                             .push(s.submitted_ns.saturating_sub(s.decoded_ns) / 1000);
                         st.win_latch_us
                             .push(s.displayed_ns.saturating_sub(s.submitted_ns) / 1000);
-                        // Latch miss (the adaptive margin's error signal): glass more
-                        // than 1.5 latch periods after submit = the intended slot was
-                        // overshot.
+                        // Latch miss (the adaptive margin's error signal): glass later
+                        // than one panel period past submit, PLUS the lead we already
+                        // applied — i.e. the slot we aimed at was missed. Measuring the
+                        // real latch rather than the store's own evictions is the
+                        // Android 0.23.0 correction: policy drops happen whenever the
+                        // stream out-runs the panel and say nothing about the latch, and
+                        // widening on them walked the margin to its ceiling on healthy
+                        // devices, re-imposing the very display latency it had removed.
                         if st.store.is_smoothing()
-                            && s.displayed_ns.saturating_sub(s.submitted_ns) > period + period / 2
+                            && s.displayed_ns.saturating_sub(s.submitted_ns) > period + st.margin_ns
                         {
                             st.win_misses += 1;
                         }
                         stamps.push(s.displayed_ns);
                     }
                     st.clock.note_batch(&stamps);
+                    // Same stamps answer "is VRR live" — the panel either quantizes them
+                    // to its grid or follows our cadence.
+                    st.cadence.note(&stamps, st.clock.period_ns());
                     // Phase-locked capture, the presenter's half: publish the grid the
                     // local clock just learned — a recent TRUE on-glass instant plus
                     // the latch period — for the pump's ~1 Hz PhaseReport. One learner
@@ -1733,6 +1786,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                     pace_ms: pace_p50 as f32 / 1000.0,
                     latch_ms: latch_p50 as f32 / 1000.0,
                     mode: presenter.present_mode_name(),
+                    vrr: st.cadence.verdict(),
                     smoothing: st.store.is_smoothing(),
                     q_drop,
                     q_dry,
@@ -1763,6 +1817,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                     tracing::info!(
                         smoothing = st.presented.smoothing,
                         mode = st.presented.mode,
+                        vrr = st.presented.vrr.label(),
                         replaced,
                         q_drop,
                         q_dry,
@@ -2255,6 +2310,8 @@ struct PresentedWindow {
     /// chosen from what the surface offers, so "why is my latch a refresh long" is
     /// usually answered by a MAILBOX request having landed on FIFO.
     mode: &'static str,
+    /// Whether variable refresh is measurably live (never claimed without evidence).
+    vrr: Cadence,
     /// Presenter-engine counters for the window: the smoothing FIFO's overflow drops and
     /// post-preroll underflows, and the FIFO glass gate's holds/stale force-opens.
     smoothing: bool,
@@ -2390,6 +2447,10 @@ fn stats_text(
         // they are non-zero, so a healthy latency session shows just the mode.
         if !p.mode.is_empty() {
             text.push_str(&format!("\npresent: {}", p.mode));
+            // Only once measured — an unproven "vrr no" would be a claim, not a reading.
+            if p.vrr != Cadence::Unknown {
+                text.push_str(&format!(" · vrr {}", p.vrr.label()));
+            }
             if p.smoothing {
                 text.push_str(" · smoothing");
             }

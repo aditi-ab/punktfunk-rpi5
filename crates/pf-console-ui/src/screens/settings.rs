@@ -28,6 +28,8 @@ enum RowId {
     Chroma444,
     PresentPriority,
     SmoothBuffer,
+    Vsync,
+    AllowVrr,
     Audio,
     Mic,
     EchoCancel,
@@ -49,7 +51,7 @@ enum RowId {
 // scroll/shortcut behavior, fullscreen-on-stream, auto-wake, the library toggle and echo
 // cancellation all were). Still deliberately smaller than the desktop dialogs — device
 // pickers (GPU/speaker/mic) and the profile catalog stay desktop-only.
-const ROWS: [RowId; 25] = [
+const ROWS: [RowId; 27] = [
     RowId::Resolution,
     RowId::Refresh,
     RowId::RenderScale,
@@ -61,6 +63,8 @@ const ROWS: [RowId; 25] = [
     RowId::Chroma444,
     RowId::PresentPriority,
     RowId::SmoothBuffer,
+    RowId::Vsync,
+    RowId::AllowVrr,
     RowId::Audio,
     RowId::Mic,
     RowId::EchoCancel,
@@ -319,6 +323,8 @@ fn row_spec(id: RowId, ctx: &Ctx) -> RowSpec {
                 .map_or("Automatic", |(_, l)| l)
                 .into(),
         ),
+        RowId::Vsync => (None, "V-Sync", on_off(s.vsync).into()),
+        RowId::AllowVrr => (None, "Follow variable refresh", on_off(s.allow_vrr).into()),
         RowId::Audio => (
             Some("Audio"),
             "Audio channels",
@@ -421,6 +427,15 @@ fn detail(id: RowId) -> &'static str {
         RowId::SmoothBuffer => {
             "Frames held back before showing. Each one absorbs about a refresh of network \
              hiccup and adds a refresh of delay. Automatic holds two."
+        }
+        RowId::Vsync => {
+            "Tear-free. Off removes the wait for the screen's refresh — the lowest \
+             possible delay, at the cost of visible tearing. Not every driver offers it; \
+             the stats overlay names the mode actually in use."
+        }
+        RowId::AllowVrr => {
+            "On a VRR screen, let the panel refresh in step with the stream instead of on \
+             a fixed cadence. Applies to fullscreen sessions; harmless on a fixed screen."
         }
         RowId::Audio => "The speaker layout requested from the host.",
         RowId::Mic => {
@@ -541,6 +556,8 @@ fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
                 None
             }
         }
+        RowId::Vsync => toggle(&mut s.vsync, delta, wrap),
+        RowId::AllowVrr => toggle(&mut s.allow_vrr, delta, wrap),
         RowId::Audio => {
             let cur = AUDIO.iter().position(|(v, _)| *v == s.audio_channels);
             step_option(cur, AUDIO.len(), delta, wrap).map(|i| s.audio_channels = AUDIO[i].0)

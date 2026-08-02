@@ -654,6 +654,12 @@ fn commit_profile(active: &StreamProfile, touched: &Touched, values: &Settings) 
     if touched.has("smooth_buffer") {
         o.smooth_buffer = Some(values.smooth_buffer);
     }
+    if touched.has("vsync") {
+        o.vsync = Some(values.vsync);
+    }
+    if touched.has("allow_vrr") {
+        o.allow_vrr = Some(values.allow_vrr);
+    }
     // Resets are not handled here: they clear the field and re-seed their row the moment the
     // user asks, so by the time this runs the catalog already reflects them and the row is no
     // longer marked touched.
@@ -1277,6 +1283,22 @@ pub fn show_scoped(
             buffer.set_visible(PRESENT_PRIORITIES[i] == "smooth");
         });
     }
+    let vsync_row = adw::SwitchRow::builder()
+        .title("V-Sync")
+        .subtitle(
+            "Tear-free. Turning it off removes the wait for the screen's refresh — the \
+             lowest possible delay, at the cost of visible tearing. Not every driver \
+             offers it; the stats overlay names the mode actually in use",
+        )
+        .build();
+    let vrr_row = adw::SwitchRow::builder()
+        .title("Follow variable refresh rate")
+        .subtitle(
+            "On a VRR/FreeSync/G-Sync screen, let the panel refresh in step with the \
+             stream instead of on a fixed cadence. Applies to fullscreen sessions; \
+             harmless on a fixed-refresh screen",
+        )
+        .build();
 
     // ---- Display: Host output ----
     let compositor_row = ChoiceRow::new(
@@ -1579,6 +1601,8 @@ pub fn show_scoped(
         buffer_row
             .widget()
             .set_visible(PRESENT_PRIORITIES[present_i as usize] == "smooth");
+        vsync_row.set_active(s.vsync);
+        vrr_row.set_active(s.allow_vrr);
     }
 
     // ---- Override markers, per-row reset, and the touch that creates an override ----
@@ -1789,6 +1813,8 @@ pub fn show_scoped(
             o.smooth_buffer.is_some(),
             index::smooth_buffer
         );
+        toggle!(vsync_row, "vsync", o.vsync.is_some(), vsync);
+        toggle!(vrr_row, "allow_vrr", o.allow_vrr.is_some(), allow_vrr);
         toggle!(hdr_row, "hdr_enabled", o.hdr_enabled.is_some(), hdr_enabled);
         toggle!(chroma_row, "enable_444", o.enable_444.is_some(), enable_444);
         toggle!(
@@ -1896,6 +1922,8 @@ pub fn show_scoped(
     let presentation_group = group("Presentation", "");
     presentation_group.add(present_row.widget());
     presentation_group.add(buffer_row.widget());
+    presentation_group.add(&vsync_row);
+    presentation_group.add(&vrr_row);
     // The one form-level note (deliberately not repeated on every row).
     let output_group = group(
         "Host output",
@@ -2058,6 +2086,8 @@ pub fn show_scoped(
             // The index IS the value (0 = Automatic).
             s.smooth_buffer =
                 (buffer_row.selected() as u8).min(SMOOTH_BUFFER_LABELS.len() as u8 - 1);
+            s.vsync = vsync_row.is_active();
+            s.allow_vrr = vrr_row.is_active();
             s.library_enabled = library_row.is_active();
         };
 

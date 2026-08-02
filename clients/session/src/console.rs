@@ -172,6 +172,8 @@ pub fn run(target: Option<&str>) -> u8 {
         // Presentation-tier like the rows above: latched at console start, a per-host
         // profile cannot move it in this mode (the documented P4 gap).
         present_priority: settings_at_start.present_priority(),
+        vsync: settings_at_start.vsync,
+        allow_vrr: settings_at_start.allow_vrr,
         json_status,
         on_connected: Some(Box::new(move |fingerprint: [u8; 32]| {
             let fp_hex = trust::hex(&fingerprint);

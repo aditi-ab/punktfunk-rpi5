@@ -97,6 +97,20 @@ many frames are held back before showing. Each frame absorbs roughly one screen 
 hiccup and costs one refresh of delay — so on a 120 Hz screen, two frames is about 17 ms of extra
 delay bought against 17 ms of jitter. If you never see stutter, you don't need this.
 
+**V-Sync** — *default: on.* Tear-free presentation. Turning it off asks the GPU to show each frame
+the instant it's ready instead of waiting for the screen's next refresh: the lowest delay a display
+can give you, at the cost of visible tearing on fast motion. It is **best-effort** — not every
+driver or compositor offers a tearing mode, and where none is available the stream stays tear-free.
+The Detailed [stats overlay](/docs/stats) names the mode actually in use, so you can tell "off"
+from "off but unavailable". Linux and Windows apps.
+
+**Follow variable refresh rate** — *default: on.* On a VRR / FreeSync / G-Sync screen, let the panel
+refresh in step with the stream rather than on a fixed cadence — which removes the wait between a
+frame being ready and the screen being willing to show it. Applies to **fullscreen** sessions (a
+windowed one is at the compositor's mercy) and is harmless on a fixed-refresh screen. The stats
+overlay reports `vrr yes` once it has measured that the panel really is following. Linux and
+Windows apps.
+
 **Host compositor** — *default: Automatic.* Which backend a **Linux** host uses to drive the virtual
 output. Advisory: a host without that backend quietly auto-detects instead.
 

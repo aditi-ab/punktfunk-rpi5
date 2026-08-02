@@ -145,16 +145,26 @@ impl<T> FrameStore<T> {
 }
 
 /// The panel latch grid: a recent on-glass instant + the latch period, extrapolated
-/// forward for slot targeting. Fed per sample batch; the period is the min positive
-/// spacing of consecutive stamps (< 1 ms apart = a queued pair, not a grid step),
-/// capped by the display mode's refresh — under arrival-paced MAILBOX a stream running
-/// below the panel rate spaces its presents at k×period, and the cap keeps a 30 fps
-/// stream from claiming a 30 Hz panel grid. Same rule as the host-facing `LatchGrid`
-/// fold this clock also feeds, so the phase-lock report and the local scheduler can
-/// never disagree about the grid.
+/// forward for slot targeting.
+///
+/// The period learner is the SHARED [`punktfunk_core::phase::PanelGrid`], not a local
+/// rule. An earlier version of this clock capped the learned period at the display
+/// mode's refresh, on the reasoning that a stream running below panel rate spaces its
+/// presents at k×period and the cap stops a 30 fps stream claiming a 30 Hz panel. That
+/// cap is the same defect the Android presenter shipped in 0.23.0: the seed is only what
+/// the *mode* claims, and when the real panel is slower (a refused mode switch, a
+/// compositor running its own rate) a downward-only learner pins a grid that never
+/// arrives, for the whole session, with no way back. `PanelGrid` moves both ways —
+/// narrowing at once, widening only after eight consecutive agreeing observations and
+/// then to the narrowest of them.
+///
+/// What is fed to it is still the window's MIN spacing: within one window that resists
+/// the k×period inflation the old cap was aimed at, while the streak requirement means a
+/// genuinely slower panel is still discovered. Same grid the host-facing `LatchGrid`
+/// publish reads, so the phase-lock report and the local scheduler cannot disagree.
 pub(crate) struct LatchClock {
     anchor_ns: u64,
-    period_ns: u64,
+    grid: punktfunk_core::phase::PanelGrid,
     fallback_period_ns: u64,
 }
 
@@ -162,7 +172,7 @@ impl LatchClock {
     pub(crate) fn new(refresh_hz: u32) -> LatchClock {
         LatchClock {
             anchor_ns: 0,
-            period_ns: 0,
+            grid: punktfunk_core::phase::PanelGrid::seeded(refresh_hz as i32),
             fallback_period_ns: 1_000_000_000 / u64::from(refresh_hz.max(1)),
         }
     }
@@ -178,16 +188,17 @@ impl LatchClock {
         let min_delta = stamps
             .windows(2)
             .map(|w| w[1].saturating_sub(w[0]))
-            .filter(|&d| d > 1_000_000)
+            .filter(|&d| d > 1_000_000) // < 1 ms apart = a queued pair, not a grid step
             .min();
         if let Some(d) = min_delta {
-            self.period_ns = d.min(self.fallback_period_ns);
+            self.grid.observe(d as i64);
         }
     }
 
     pub(crate) fn period_ns(&self) -> u64 {
-        if self.period_ns > 0 {
-            self.period_ns
+        let learned = self.grid.period_ns();
+        if learned > 0 {
+            learned as u64
         } else {
             self.fallback_period_ns
         }
@@ -206,6 +217,104 @@ impl LatchClock {
         }
         let k = (after_ns - self.anchor_ns) / p + 1;
         self.anchor_ns + k * p
+    }
+}
+
+/// Whether the panel is refreshing on a fixed grid or following our cadence.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub(crate) enum Cadence {
+    /// Not enough evidence yet — say nothing rather than guess.
+    #[default]
+    Unknown,
+    /// On-glass instants land on multiples of the panel period: a fixed-refresh panel.
+    Fixed,
+    /// On-glass instants track our present spacing instead: variable refresh is live.
+    Variable,
+}
+
+impl Cadence {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Cadence::Unknown => "",
+            Cadence::Fixed => "no",
+            Cadence::Variable => "yes",
+        }
+    }
+}
+
+/// Is variable refresh actually live? **Measured, never queried** — no portable query
+/// exists (SDL exposes none, Wayland does not report adaptive-sync state, and Windows
+/// surfaces nothing through Vulkan), and the platforms that *do* answer have been caught
+/// lying before (Android reports a game-uid's down-rated refresh as the panel's).
+///
+/// The discriminator is quantization. On a fixed-refresh panel every on-glass instant
+/// lands on the vblank grid, so the spacing between consecutive presents is always
+/// ~k×period for whole k — even when the stream runs slower than the panel, where it just
+/// picks a larger k. Under real VRR the panel refreshes *when we present*, so the spacing
+/// follows our own cadence and sits wherever it likes relative to the grid.
+///
+/// So: fold each delta to its distance from the nearest multiple of the period. Tight
+/// against the grid ⇒ Fixed; consistently off it ⇒ Variable. A stream running exactly at
+/// panel rate is indistinguishable either way (both give delta ≈ period), which is
+/// harmless — at that rate VRR has nothing to do.
+pub(crate) struct CadenceProbe {
+    /// Off-grid distances as a fraction of the period, in thousandths.
+    off_grid_milli: Vec<u32>,
+    verdict: Cadence,
+}
+
+/// Enough deltas to distinguish jitter from a real off-grid cadence.
+const CADENCE_MIN_SAMPLES: usize = 24;
+/// Median off-grid distance under this fraction of a period reads as grid-locked. Present
+/// stamps carry real measurement jitter (the wait returns, then we read the clock), so
+/// this is deliberately loose — the two regimes differ by far more than this in practice.
+const CADENCE_FIXED_MILLI: u32 = 150;
+
+impl CadenceProbe {
+    pub(crate) fn new() -> CadenceProbe {
+        CadenceProbe {
+            off_grid_milli: Vec::with_capacity(64),
+            verdict: Cadence::Unknown,
+        }
+    }
+
+    /// Fold one window's on-glass stamps against the learned panel period.
+    pub(crate) fn note(&mut self, stamps: &[u64], period_ns: u64) {
+        if period_ns == 0 {
+            return;
+        }
+        for w in stamps.windows(2) {
+            let delta = w[1].saturating_sub(w[0]);
+            if delta == 0 {
+                continue;
+            }
+            let rem = delta % period_ns;
+            // Distance to the NEAREST multiple, so a delta just under k×period reads as
+            // close to the grid rather than a whole period away from k-1.
+            let off = rem.min(period_ns - rem);
+            self.off_grid_milli
+                .push((off.saturating_mul(1000) / period_ns) as u32);
+        }
+        if self.off_grid_milli.len() >= CADENCE_MIN_SAMPLES {
+            self.off_grid_milli.sort_unstable();
+            let median = self.off_grid_milli[self.off_grid_milli.len() / 2];
+            self.verdict = if median <= CADENCE_FIXED_MILLI {
+                Cadence::Fixed
+            } else {
+                Cadence::Variable
+            };
+            self.off_grid_milli.clear();
+        }
+    }
+
+    pub(crate) fn verdict(&self) -> Cadence {
+        self.verdict
+    }
+
+    /// A mode switch / display change invalidates the evidence.
+    pub(crate) fn reset(&mut self) {
+        self.off_grid_milli.clear();
+        self.verdict = Cadence::Unknown;
     }
 }
 
@@ -370,11 +479,12 @@ mod tests {
         assert_eq!(c.period_ns(), P);
         assert_eq!(c.anchor_ns(), 2_000_000_500, "the anchor still advances");
 
-        // A stream presenting every OTHER refresh spaces its glass stamps at 2×P — the
-        // panel grid is still P, so the mode-refresh cap holds the learned period down
-        // (this is what keeps a 30 fps stream from claiming a 30 Hz panel).
+        // A stream presenting every OTHER refresh spaces its glass stamps at 2×P. One
+        // such window must NOT move the grid — the shared learner needs a streak before
+        // it will widen, which is what keeps a briefly-slow stream from claiming a slow
+        // panel while still allowing a genuinely slower display to be discovered.
         c.note_batch(&[3_000_000_000, 3_000_000_000 + 2 * P]);
-        assert_eq!(c.period_ns(), P, "capped at the mode refresh");
+        assert_eq!(c.period_ns(), P, "one wide window is not a slower panel");
 
         // A single stamp re-anchors without touching the period.
         c.note_batch(&[5_000_000_000]);
@@ -385,6 +495,86 @@ mod tests {
         let mut fast = LatchClock::new(120);
         fast.note_batch(&[1_000_000_000, 1_008_333_333]);
         assert_eq!(fast.period_ns(), 8_333_333);
+    }
+
+    /// The mode's refresh is a CLAIM, not a measurement — a refused mode switch or a
+    /// compositor running its own rate leaves the seed too fast. The old downward-only
+    /// cap pinned that wrong grid for the session (the Android 0.23.0 defect); the
+    /// shared learner climbs back out once the evidence is consistent.
+    #[test]
+    fn latch_clock_recovers_from_a_seed_faster_than_the_real_panel() {
+        const REAL: u64 = 16_666_666; // the panel is really 60 Hz…
+        let mut c = LatchClock::new(120); // …but the mode claimed 120
+        assert_eq!(c.period_ns(), 8_333_333, "seeded from the claim");
+
+        // Consistent 60 Hz evidence, one window at a time.
+        for i in 0..8 {
+            let t = 1_000_000_000 + i * 2 * REAL;
+            c.note_batch(&[t, t + REAL]);
+        }
+        assert_eq!(
+            c.period_ns(),
+            REAL,
+            "a sustained slower grid is adopted instead of aimed past forever"
+        );
+    }
+
+    /// The VRR discriminator: presents landing on the vblank grid read Fixed, presents
+    /// landing wherever our own cadence puts them read Variable — including the case that
+    /// matters most, a stream SLOWER than the panel, where a fixed panel still quantizes
+    /// to a larger whole multiple.
+    #[test]
+    fn cadence_probe_separates_grid_locked_from_variable() {
+        const P: u64 = 8_333_333; // 120 Hz
+
+        // Fixed panel, stream at panel rate: every delta is exactly one period.
+        let mut probe = CadenceProbe::new();
+        assert_eq!(probe.verdict(), Cadence::Unknown, "no evidence yet");
+        let stamps: Vec<u64> = (0..40).map(|i| 1_000_000_000 + i * P).collect();
+        probe.note(&stamps, P);
+        assert_eq!(probe.verdict(), Cadence::Fixed);
+
+        // Fixed panel, stream at HALF panel rate: deltas are 2×P — still grid-locked.
+        let mut probe = CadenceProbe::new();
+        let stamps: Vec<u64> = (0..40).map(|i| 1_000_000_000 + i * 2 * P).collect();
+        probe.note(&stamps, P);
+        assert_eq!(
+            probe.verdict(),
+            Cadence::Fixed,
+            "a slower stream on a fixed panel picks a larger k, it does not leave the grid"
+        );
+
+        // Fixed panel with realistic measurement jitter (±0.5 ms on an 8.3 ms period)
+        // must not read as variable.
+        let mut probe = CadenceProbe::new();
+        let jitter = [0i64, 300_000, -250_000, 120_000, -400_000, 80_000];
+        let stamps: Vec<u64> = (0..40)
+            .map(|i| (1_000_000_000 + i as i64 * P as i64 + jitter[i % jitter.len()]) as u64)
+            .collect();
+        probe.note(&stamps, P);
+        assert_eq!(probe.verdict(), Cadence::Fixed, "jitter is not VRR");
+
+        // VRR live: a 100 fps stream on a 120 Hz-max panel. 10 ms is not a multiple of
+        // 8.33 ms, so every present sits off the grid.
+        let mut probe = CadenceProbe::new();
+        let stamps: Vec<u64> = (0..40).map(|i| 1_000_000_000 + i * 10_000_000).collect();
+        probe.note(&stamps, P);
+        assert_eq!(probe.verdict(), Cadence::Variable);
+
+        // A display change throws the evidence away rather than carrying a stale verdict.
+        probe.reset();
+        assert_eq!(probe.verdict(), Cadence::Unknown);
+
+        // Below the sample floor nothing is claimed.
+        let mut probe = CadenceProbe::new();
+        probe.note(&[1_000_000_000, 1_010_000_000, 1_020_000_000], P);
+        assert_eq!(probe.verdict(), Cadence::Unknown);
+
+        // A period we never learned can't discriminate anything.
+        let mut probe = CadenceProbe::new();
+        let stamps: Vec<u64> = (0..40).map(|i| 1_000_000_000 + i * 10_000_000).collect();
+        probe.note(&stamps, 0);
+        assert_eq!(probe.verdict(), Cadence::Unknown);
     }
 
     /// Gate: open at zero outstanding, closed at one, force-open past the stale bound.

@@ -151,7 +151,9 @@ lost 3 (2.4%)
   host reports them.
 
   Linux/Windows Detailed also carries a **`present:`** line naming how frames are reaching
-  your screen: the display mode in use (`mailbox`, `fifo`, …) and, when the
+  your screen: the display mode in use (`mailbox`, `fifo`, …), `vrr yes`/`vrr no` once the
+  client has *measured* whether your screen is following the stream's cadence (it is
+  reported only when measured — no guess from what the display claims), and, when the
   [presentation setting](/docs/client-settings#video) is *Smoothness*, the word
   `smoothing`. Counters join it only when they're doing something — `qdrop`/`qdry` mean
   the smoothing buffer overflowed or ran dry (a jittery link), and `gated`/`forced`

@@ -483,6 +483,8 @@ struct OverrideFlags {
     fullscreen_on_stream: bool,
     present_priority: bool,
     smooth_buffer: bool,
+    vsync: bool,
+    allow_vrr: bool,
 }
 
 impl OverrideFlags {
@@ -514,6 +516,8 @@ impl OverrideFlags {
             fullscreen_on_stream: o.fullscreen_on_stream.is_some(),
             present_priority: o.present_priority.is_some(),
             smooth_buffer: o.smooth_buffer.is_some(),
+            vsync: o.vsync.is_some(),
+            allow_vrr: o.allow_vrr.is_some(),
         }
     }
 }
@@ -912,6 +916,10 @@ pub(crate) fn settings_page(
         buffer_i,
         |s, i| s.smooth_buffer = SMOOTH_BUFFERS[i].0,
     );
+    let vsync_toggle = setting_toggle(ctx, scope, (rev, set_rev), s.vsync, |s, on| s.vsync = on);
+    let vrr_toggle = setting_toggle(ctx, scope, (rev, set_rev), s.allow_vrr, |s, on| {
+        s.allow_vrr = on
+    });
 
     // --- Input -----------------------------------------------------------------------------
     // Controller forwarding: Automatic forwards EVERY real controller, each as its own pad;
@@ -1209,6 +1217,29 @@ pub(crate) fn settings_page(
                              Automatic holds two.",
                         ));
                     }
+                    fields.push(described_overridable(
+                        (rev, set_rev),
+                        scope,
+                        "vsync",
+                        "V-Sync",
+                        over.vsync,
+                        vsync_toggle,
+                        "Tear-free. Turning it off removes the wait for the screen\u{2019}s \
+                         refresh \u{2014} the lowest possible delay, at the cost of visible \
+                         tearing. Not every driver offers it; the stats overlay names the \
+                         mode actually in use.",
+                    ));
+                    fields.push(described_overridable(
+                        (rev, set_rev),
+                        scope,
+                        "allow_vrr",
+                        "Follow variable refresh rate",
+                        over.allow_vrr,
+                        vrr_toggle,
+                        "On a VRR/FreeSync/G-Sync screen, let the panel refresh in step with \
+                         the stream instead of on a fixed cadence. Applies to fullscreen \
+                         sessions; harmless on a fixed-refresh screen.",
+                    ));
                     fields
                 },
                 None,
@@ -1872,5 +1903,15 @@ mod tests {
         let f4 = OverrideFlags::of(Some(&p4));
         assert!(f4.present_priority);
         assert!(!f4.smooth_buffer);
+
+        // V-Sync and VRR are independent of each other and of the intent pair.
+        let mut p5 = StreamProfile::new("t5".to_string());
+        p5.overrides = SettingsOverlay {
+            vsync: Some(false),
+            ..Default::default()
+        };
+        let f5 = OverrideFlags::of(Some(&p5));
+        assert!(f5.vsync);
+        assert!(!f5.allow_vrr && !f5.present_priority);
     }
 }
