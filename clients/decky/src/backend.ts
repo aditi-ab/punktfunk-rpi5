@@ -122,6 +122,13 @@ export interface StreamSettings {
   // here would be a dead one. The desktop client's row still edits this same file.
   inhibit_shortcuts: boolean;
   mic_enabled: boolean;
+  // Stats-overlay tier: "off" | "compact" | "normal" | "detailed". Absent in a pre-tier file,
+  // which resolves through `show_stats` — read both the way the client's
+  // `Settings::stats_verbosity` does, and write both the way `set_stats_verbosity` does.
+  stats_verbosity?: string;
+  // The legacy on/off the tier supersedes; kept written in sync so a client that predates the
+  // tiers still honours an Off chosen here.
+  show_stats?: boolean;
 }
 
 export interface UpdateInfo {

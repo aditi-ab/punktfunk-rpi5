@@ -55,6 +55,15 @@ const COMPOSITOR_LABELS: Record<string, string> = {
   mutter: "GNOME (Mutter)",
   gamescope: "gamescope",
 };
+// The stats-overlay tiers, in the cycle order every other client's picker uses
+// (punktfunk_core `StatsVerbosity::ALL`). Stored lowercase — the enum is `rename_all`.
+const STATS_TIERS = ["off", "compact", "normal", "detailed"];
+const STATS_LABELS: Record<string, string> = {
+  off: "Off",
+  compact: "Compact",
+  normal: "Normal",
+  detailed: "Detailed",
+};
 
 export const SettingsSection: FC = () => {
   const [s, setS] = useState<StreamSettings | null>(null);
@@ -73,6 +82,12 @@ export const SettingsSection: FC = () => {
   };
 
   if (!s) return <Spinner style={{ height: "1.5em" }} />;
+
+  // Mirrors `Settings::stats_verbosity`: an absent tier is a pre-tier store, which resolves
+  // through the legacy `show_stats` bool — and an absent bool is the client's serde default
+  // (true), so a file this plugin wrote before it carried either key reads as Normal, exactly
+  // as the stream sees it.
+  const statsTier = s.stats_verbosity ?? ((s.show_stats ?? true) ? "normal" : "off");
 
   const resIdx = Math.max(
     0,
@@ -206,6 +221,26 @@ export const SettingsSection: FC = () => {
         checked={s.mic_enabled}
         onChange={(v) => patch({ mic_enabled: v })}
       />
+      <Field
+        label="Statistics overlay"
+        description="The fps / latency / bitrate panel in the stream. Each tier is a superset of the one before; a three-finger tap on the touchscreen cycles them mid-stream."
+        childrenContainerWidth="max"
+      >
+        <RowActions>
+          <div style={selectShell}>
+            <Dropdown
+              rgOptions={STATS_TIERS.map((t) => ({ data: t, label: STATS_LABELS[t] ?? t }))}
+              selectedOption={statsTier}
+              // Both keys, in sync — the same pairing `Settings::set_stats_verbosity` keeps, so a
+              // client too old for the tier still reads the on/off it understands.
+              onChange={(o) => {
+                const tier = o.data as string;
+                patch({ stats_verbosity: tier, show_stats: tier !== "off" });
+              }}
+            />
+          </div>
+        </RowActions>
+      </Field>
     </>
   );
 };

@@ -197,7 +197,8 @@ when you return to the host list. iPhone, iPad, Apple TV and Android have no equ
 superset of the one before. This setting only picks the tier a session *starts* at — you can cycle
 them live in-stream, with a shortcut that differs by platform. The Apple app additionally lets you
 choose which corner the overlay sits in (Top Left, Top Right, Bottom Left, Bottom Right). The Decky
-plugin has no stats setting. The shortcuts, and every number in the overlay, are in
+plugin has the tier picker too, in its Settings section. The shortcuts, and every number in the
+overlay, are in
 [Understanding the stats overlay](/docs/stats).
 
 ## Settings that are facts about your device

@@ -1044,20 +1044,36 @@ class Plugin:
         try:
             return json.loads(_settings_path().read_text())
         except (OSError, json.JSONDecodeError):
-            # The client's own defaults (native display, host-default bitrate, auto pad).
+            # The client's own defaults (native display, host-default bitrate, auto pad,
+            # stats overlay at Normal — `Settings::default` is `show_stats: true`).
             return {
                 "width": 0, "height": 0, "refresh_hz": 0, "render_scale": 1.0,
                 "bitrate_kbps": 0, "codec": "auto", "gamepad": "auto",
                 "gamepad_forwarding": True, "compositor": "auto",
                 "inhibit_shortcuts": True, "mic_enabled": False,
+                "stats_verbosity": "normal", "show_stats": True,
             }
 
     async def set_settings(self, settings: dict) -> dict:
-        """Write the stream settings JSON the (sandboxed) client reads on launch."""
+        """Write the stream settings JSON the (sandboxed) client reads on launch.
+
+        MERGED onto whatever is on disk, never a wholesale replace: this file is shared with
+        the desktop client and the console's settings screen, and it holds far more keys than
+        this panel models (decoder, GPU, profiles, touch/mouse model…). The panel reads it once
+        when it mounts, so a straight write would post a snapshot that predates anything those
+        other editors stored in the meantime — silently reverting it.
+        """
         try:
             d = _client_config_dir()
             d.mkdir(parents=True, exist_ok=True)
-            _settings_path().write_text(json.dumps(settings, indent=2))
+            try:
+                on_disk = json.loads(_settings_path().read_text())
+                if not isinstance(on_disk, dict):
+                    on_disk = {}
+            except (OSError, json.JSONDecodeError):
+                on_disk = {}  # no file yet (or an unreadable one): this write creates it
+            on_disk.update(settings)
+            _settings_path().write_text(json.dumps(on_disk, indent=2))
             return {"ok": True}
         except OSError as exc:
             decky.logger.exception("could not write settings")
