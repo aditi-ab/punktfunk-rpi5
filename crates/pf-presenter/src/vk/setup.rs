@@ -836,6 +836,16 @@ fn pick_present_mode(
             "PUNKTFUNK_PRESENT_MODE not offered by this surface — falling back"
         );
     }
+    // What the surface ACTUALLY offers, logged unconditionally. "AMD's Windows driver
+    // has no MAILBOX" is the premise the FIFO glass gate is built on, and it has been
+    // carried in comments rather than measured — present modes are a property of the
+    // (surface, device) pair, so they vary by platform surface, driver version and
+    // fullscreen state, and the only way to settle it is to read it back from real
+    // machines. One line here makes every field log answer the question.
+    tracing::info!(
+        available = ?modes,
+        "surface present modes"
+    );
     let chain = present_mode_chain(pref);
     let chosen = chain
         .iter()
