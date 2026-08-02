@@ -822,8 +822,21 @@ fn feed_ready(
             }
         }
         let Some(dst) = codec.input_buffer(idx) else {
-            log::warn!("decode: input_buffer({idx}) returned None — dropping AU");
-            continue;
+            // Nothing was written and nothing was queued, so BOTH stay ours. Dropping the slot
+            // here leaked one of the codec's input buffers per occurrence — we forget it and the
+            // codec never frees what it never received, so the pipeline quietly runs out of input
+            // slots, `pending_aus` overflows, and the resulting drop storm reads as a decode
+            // fault. Dropping the AU on top of that punched a hole in the reference chain with no
+            // keyframe request behind it, unlike every sibling path here.
+            //
+            // `break`, not `continue`: a codec that cannot hand out an input buffer it just
+            // advertised is in no state to be fed the rest of the parked queue this pass, and
+            // retrying the same index against every parked AU would burn the whole backlog. The
+            // loop re-runs within the housekeeping wake (≤ 5 ms) if it was transient.
+            log::warn!("decode: input_buffer({idx}) returned None — retrying next pass");
+            free_inputs.push_front(idx);
+            pending_aus.push_front(frame);
+            break;
         };
         let au = &frame.data;
         if au.len() > dst.len() {
