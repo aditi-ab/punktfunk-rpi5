@@ -492,23 +492,19 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStartPadAud
         // Replace any previous renderer first: dropping it joins the old thread, so two of them
         // can never hold the same descriptor at once.
         h.stop_pad_audio();
+        // The capability declaration and the rumble suppression are NOT done here: the renderer
+        // makes both only once its USB stream actually opens (see `pad_audio::render`). Doing them
+        // at spawn time would, on a kernel that refuses the interface claim, take the pad off wire
+        // rumble and give it nothing in return — no haptics of any kind.
         match crate::pad_audio::start(
             std::sync::Arc::clone(&h.client),
+            pad as u8,
             fd,
             haptics != 0,
             speaker != 0,
         ) {
             Some(p) => {
                 *h.pad_audio.lock().unwrap() = Some(p);
-                // Declare what this pad can render. Without these bits the host never emits 0xD1
-                // for it at all, so the renderer would sit on an empty plane forever — the bits
-                // ride the gamepad arrival (flags 8/9) toward a HOST_CAP_PAD_AUDIO host.
-                let caps =
-                    (if haptics != 0 { 0x01 } else { 0 }) | (if speaker != 0 { 0x02 } else { 0 });
-                h.client.set_pad_audio_caps(pad as u8, caps);
-                // And take this pad off wire rumble: tier A and tier C are mutually exclusive in
-                // the pad's firmware (see `pad_audio::is_tier_a`).
-                crate::pad_audio::set_tier_a(pad as u8, true);
                 1
             }
             None => 0,

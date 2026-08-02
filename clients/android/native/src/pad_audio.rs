@@ -289,6 +289,7 @@ mod sink {
 /// about to close.
 #[cfg(target_os = "android")]
 pub(crate) struct PadAudio {
+    pad: u8,
     stop: Arc<AtomicBool>,
     join: Option<JoinHandle<()>>,
 }
@@ -300,6 +301,9 @@ impl Drop for PadAudio {
         if let Some(j) = self.join.take() {
             let _ = j.join();
         }
+        // Belt and braces: the thread clears these itself on the way out, but if it died in a way
+        // that skipped that, leaving the pad off wire rumble would cost the user all feedback.
+        set_tier_a(self.pad, false);
     }
 }
 
@@ -311,6 +315,7 @@ impl Drop for PadAudio {
 #[cfg(target_os = "android")]
 pub(crate) fn start(
     client: Arc<NativeClient>,
+    pad: u8,
     fd: i32,
     haptics: bool,
     speaker: bool,
@@ -319,8 +324,9 @@ pub(crate) fn start(
         return None;
     }
     let stop = Arc::new(AtomicBool::new(false));
-    let join = spawn(client, Arc::clone(&stop), fd, haptics, speaker)?;
+    let join = spawn(client, Arc::clone(&stop), pad, fd, haptics, speaker)?;
     Some(PadAudio {
+        pad,
         stop,
         join: Some(join),
     })
@@ -335,19 +341,20 @@ pub(crate) fn start(
 pub(crate) fn spawn(
     client: Arc<NativeClient>,
     stop: Arc<AtomicBool>,
+    pad: u8,
     fd: i32,
     haptics: bool,
     speaker: bool,
 ) -> Option<JoinHandle<()>> {
     std::thread::Builder::new()
         .name("pf-pad-audio".into())
-        .spawn(move || run(&client, &stop, fd, haptics, speaker))
+        .spawn(move || run(&client, &stop, pad, fd, haptics, speaker))
         .map_err(|e| log::warn!("pad-audio thread failed to start: {e}"))
         .ok()
 }
 
 #[cfg(target_os = "android")]
-fn run(client: &NativeClient, stop: &AtomicBool, fd: i32, haptics: bool, speaker: bool) {
+fn run(client: &NativeClient, stop: &AtomicBool, pad: u8, fd: i32, haptics: bool, speaker: bool) {
     // Ask the scheduler for audio priority. Android does not hand SCHED_FIFO to ordinary app
     // threads, so -16 (ANDROID_PRIORITY_AUDIO) is the realistic knob — and WP7 measured that it
     // both applies and is enough to hold the 4 ms floor against eight busy cores.
@@ -360,7 +367,7 @@ fn run(client: &NativeClient, stop: &AtomicBool, fd: i32, haptics: bool, speaker
     let dev = unsafe { sink::device(fd) };
     // Through a reference, deliberately: `UsbFsDevice` has a `Drop`, and opening the stream in
     // this same scope would make the borrow outlive the value it borrows.
-    render(&dev, client, stop, haptics, speaker);
+    render(&dev, client, stop, pad, haptics, speaker);
 }
 
 /// Open the pad's stream and render on it until the session stops or the device goes away.
@@ -369,25 +376,38 @@ fn render(
     dev: &usbfs_iso::UsbFsDevice,
     client: &NativeClient,
     stop: &AtomicBool,
+    pad: u8,
     haptics: bool,
     speaker: bool,
 ) {
     match sink::open(dev) {
         Ok(mut playback) => {
             log::info!(
-                "pad audio: {} ch {} at {} Hz, {} us in flight",
+                "pad audio: pad={pad} {} ch {} at {} Hz, {} us in flight",
                 playback.channels(),
                 playback.format(),
                 playback.rate(),
                 playback.schedule().in_flight_us()
             );
+            // ONLY NOW commit the trade. Declaring the pad's render capability makes the host
+            // emit 0xD1, and taking the pad off wire rumble is what makes tier A and tier C
+            // mutually exclusive — doing either before the stream is known to open would, on a
+            // kernel that refuses the claim, leave the user with no haptics of any kind.
+            let caps = (if haptics { 0x01 } else { 0 }) | (if speaker { 0x02 } else { 0 });
+            client.set_pad_audio_caps(pad, caps);
+            set_tier_a(pad, true);
+
             pump(client, stop, haptics, speaker, &mut playback);
+
+            // Give the pad back to wire rumble before this thread goes away.
+            client.set_pad_audio_caps(pad, 0);
+            set_tier_a(pad, false);
         }
         Err(e) => {
-            // The interesting failure is a kernel that refuses the claim: some OEM kernels do, and
-            // there is no app-side fix, so the session carries on without tier A rather than
-            // treating it as fatal.
-            log::warn!("pad audio unavailable, falling back: {e}");
+            // A kernel that refuses the claim: some OEM kernels do, and there is no app-side fix.
+            // Nothing was declared and nothing was suppressed, so the session simply carries on
+            // at tier C with ordinary rumble — a clean degrade rather than silent total loss.
+            log::warn!("pad audio unavailable on pad {pad}, staying on rumble: {e}");
             drain_until_stop(client, stop);
         }
     }
