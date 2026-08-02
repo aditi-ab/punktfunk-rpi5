@@ -365,7 +365,8 @@ fn detail(id: RowId) -> &'static str {
         }
         RowId::Chroma444 => {
             "Full-colour video: crisp small text and thin lines, at more bandwidth. \
-             HEVC only, and only where the host can encode it."
+             Needs an NVIDIA host (NVENC) or the PyroWave codec — other encoders \
+             stream 4:2:0 and the session falls back silently."
         }
         RowId::Audio => "The speaker layout requested from the host.",
         RowId::Mic => {

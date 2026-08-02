@@ -338,7 +338,10 @@ pub(super) async fn negotiate(
     // PyroWave does its own RGB→YCbCr CSC and its capture mode always delivers a full-chroma
     // (RGB/BGRA) source on both OSes — the capturer gate is inherently satisfied; the real
     // gate is `can_encode_444` (the full-res-chroma CSC variant existing on this OS).
-    let capture_supports_444 = codec == crate::encode::Codec::PyroWave
+    // Named for the whole capture→encoder INGEST chain, not the capturer: on Windows the
+    // deciding fact is the encoder backend (direct NVENC only), and a field report burned
+    // real time hunting a capture problem because the old `capture_supports_444` key said so.
+    let ingest_chain_supports_444 = codec == crate::encode::Codec::PyroWave
         || crate::capture::capturer_supports_444(crate::encode::resolved_backend_ingests_rgb_444());
     // The GPU probe opens a real (tiny) encoder on first use, so run it off the reactor like the
     // compositor probe above (blocking probes → spawn_blocking). Short-circuit so it only runs when
@@ -350,7 +353,7 @@ pub(super) async fn negotiate(
         crate::encode::Codec::H265 | crate::encode::Codec::PyroWave
     ) && host_wants_444
         && client_supports_444
-        && capture_supports_444
+        && ingest_chain_supports_444
     {
         tokio::task::spawn_blocking(move || crate::encode::can_encode_444(codec))
             .await
@@ -358,6 +361,23 @@ pub(super) async fn negotiate(
     } else {
         false
     };
+    // The client's 4:4:4 setting IS the VIDEO_CAP_444 bit — when the user flipped it on and
+    // the session still resolves 4:2:0, name the losing gate. (The PyroWave mode-size gate
+    // below warns for itself.)
+    if host_wants_444 && client_supports_444 && !gpu_supports_444 {
+        let reason = if !matches!(
+            codec,
+            crate::encode::Codec::H265 | crate::encode::Codec::PyroWave
+        ) {
+            "the negotiated codec only carries 4:2:0 — 4:4:4 needs HEVC or PyroWave"
+        } else if !ingest_chain_supports_444 {
+            "this host's encoder backend can't ingest full chroma — 4:4:4 needs direct \
+             NVENC (NVIDIA) or the PyroWave codec"
+        } else {
+            "the GPU declined the 4:4:4 encode profile probe"
+        };
+        tracing::info!(reason, "4:4:4 requested but the session negotiates 4:2:0");
+    }
     let chroma = if gpu_supports_444 {
         crate::encode::ChromaFormat::Yuv444
     } else {
@@ -383,7 +403,7 @@ pub(super) async fn negotiate(
         chroma = ?chroma,
         host_wants_444,
         client_supports_444,
-        capture_supports_444,
+        ingest_chain_supports_444,
         "encode chroma"
     );
 
