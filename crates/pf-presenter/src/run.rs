@@ -535,9 +535,11 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
             vsync: opts.vsync,
             allow_vrr: opts.allow_vrr,
             fullscreen: opts.fullscreen,
-            // Resolved from the env inside `Presenter::new` — the swapchain owns that
-            // decision so every caller gets the same (opt-in) default.
-            vrr_fifo_opt_in: false,
+            // `vrr_fifo_opt_in` (env) and `fifo_latest_ready` (device capability) are
+            // both resolved inside `Presenter::new` — the swapchain owns those, so every
+            // caller gets the same answer. `..Default` keeps this site from breaking each
+            // time the struct learns another one.
+            ..Default::default()
         },
     )
     .context("vulkan presenter")?;
@@ -1500,7 +1502,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                     // (correct, period 16.56 ms), mailbox read `yes` (wrong). Outside
                     // FIFO the honest answer is "cannot tell", i.e. Unknown.
                     let healthy = st.presented.forced == 0;
-                    if presenter.fifo_present_mode() {
+                    if presenter.vblank_locked() {
                         st.cadence.note(&stamps, st.mode_period_ns, healthy);
                     }
                     // Phase-locked capture, the presenter's half: publish the grid the
@@ -1560,7 +1562,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
             // 11-13 ms at 60 Hz on MAILBOX-less drivers). Only FIFO modes queue and
             // only present timing can count, so everywhere else this stays inert and
             // behavior is the shipped arrival pacing.
-            if pacing_active && presenter.fifo_present_mode() && presenter.present_timing_active() {
+            if pacing_active && presenter.needs_glass_gate() && presenter.present_timing_active() {
                 if let Some(f) = to_present.take() {
                     if st.gate.open(presenter.presents_outstanding(), now_ns) {
                         to_present = Some(f);

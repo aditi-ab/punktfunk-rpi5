@@ -283,17 +283,36 @@ impl Presenter {
             vk::PresentModeKHR::FIFO => "fifo",
             vk::PresentModeKHR::FIFO_RELAXED => "fifo-relaxed",
             vk::PresentModeKHR::IMMEDIATE => "immediate",
+            setup::fifo_latest_ready::MODE => "fifo-latest-ready",
             _ => "other",
         }
     }
 
-    /// The active present mode queues presents (FIFO family): the only modes where the
-    /// swapchain itself can become a standing queue, and so the only ones the glass
-    /// gate governs. MAILBOX/IMMEDIATE replace/flip and never queue.
-    pub(crate) fn fifo_present_mode(&self) -> bool {
+    /// The active present mode QUEUES presents — the only modes where the swapchain
+    /// itself can become a standing queue, and so the only ones the glass gate governs.
+    ///
+    /// MAILBOX and IMMEDIATE replace/flip and never queue. Nor does
+    /// `FIFO_LATEST_READY`, which retires stale images in the driver: gating on top of it
+    /// would hold frames back to emulate something the presentation engine is already
+    /// doing, paying the serialisation twice.
+    pub(crate) fn needs_glass_gate(&self) -> bool {
         matches!(
             self.present_mode,
             vk::PresentModeKHR::FIFO | vk::PresentModeKHR::FIFO_RELAXED
+        )
+    }
+
+    /// The active present mode shows images ON THE VBLANK GRID — the premise the VRR
+    /// cadence probe rests on ("with VRR off, a present waits for vblank"). The whole
+    /// FIFO family qualifies, `FIFO_LATEST_READY` included: it drops stale images but
+    /// still presents on the refresh boundary. MAILBOX/IMMEDIATE do not, and under them
+    /// the probe reports Unknown rather than calling every session VRR.
+    pub(crate) fn vblank_locked(&self) -> bool {
+        matches!(
+            self.present_mode,
+            vk::PresentModeKHR::FIFO
+                | vk::PresentModeKHR::FIFO_RELAXED
+                | setup::fifo_latest_ready::MODE
         )
     }
 

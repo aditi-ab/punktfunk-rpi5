@@ -107,9 +107,11 @@ from "off but unavailable". Linux and Windows apps.
 **Follow variable refresh rate** — *default: on.* On a VRR / FreeSync / G-Sync screen, let the panel
 refresh in step with the stream rather than on a fixed cadence — which removes the wait between a
 frame being ready and the screen being willing to show it. Applies to **fullscreen** sessions (a
-windowed one is at the compositor's mercy) and is harmless on a fixed-refresh screen. The stats
-overlay reports `vrr yes` once it has measured that the panel really is following. Linux and
-Windows apps.
+windowed one is at the compositor's mercy) and is harmless on a fixed-refresh screen. It needs a
+graphics driver that offers the modern queue-free display mode; on an older driver it does nothing
+unless you also set `PUNKTFUNK_VRR_FIFO=1` (see [configuration](/docs/configuration)), because the
+older way of following a panel costs noticeable latency on a fixed-refresh screen. The stats overlay
+reports `vrr yes` once it has *measured* that the panel really is following. Linux and Windows apps.
 
 **Host compositor** — *default: Automatic.* Which backend a **Linux** host uses to drive the virtual
 output. Advisory: a host without that backend quietly auto-detects instead.
