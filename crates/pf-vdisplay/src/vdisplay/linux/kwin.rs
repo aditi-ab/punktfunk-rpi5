@@ -138,7 +138,14 @@ impl KwinDisplay {
         let kind = match topology {
             Topology::Exclusive => TopologyKind::Exclusive,
             Topology::Primary => TopologyKind::Primary,
-            Topology::Extend | Topology::Auto => return Vec::new(),
+            Topology::Extend | Topology::Auto => {
+                // No topology to apply — but the output must still be its OWN desktop rather than a
+                // mirror of someone's panel, and KWin restores a stored `replicationSource` onto our
+                // (stable) output name for whatever monitor set it was saved under. Applies only if
+                // it really is mirroring; nothing else about the user's arrangement is touched.
+                crate::kwin_output_mgmt::clear_replication_source(our_prefix, dims.0, dims.1);
+                return Vec::new();
+            }
         };
         // In-process over Wayland — immune to whatever wedges the standalone kscreen-doctor.
         let outcome = crate::kwin_output_mgmt::apply_topology(our_prefix, dims.0, dims.1, kind);
