@@ -434,6 +434,16 @@ impl BitrateController {
                 }
             }
             self.current_kbps = kbps;
+            // The host may run ABOVE our climb ceiling, and be right to: it sends an unsolicited
+            // `BitrateChanged` when a rebuild re-resolves an Automatic rate for what it actually
+            // encodes (a 1080p session mirroring a 4K panel resolves ~3× higher), and that is
+            // the host's own Automatic answer, not a climb we asked for. Let the ceiling follow
+            // — `set_ceiling` only ever raises, and still clamps to the operator's
+            // `PUNKTFUNK_ABR_MAX_MBPS`, which is what must bind here if anything does. Without
+            // this the ceiling stays at the stale negotiated rate and the step-down below
+            // immediately drags the host back off the rate it just chose. A no-op for ordinary
+            // acks: we never request above the effective ceiling in the first place.
+            self.set_ceiling(kbps);
         }
         self.unacked = 0;
     }
@@ -1665,6 +1675,28 @@ mod tests {
         );
         // And the disproven cap is gone, not merely nudged upward.
         assert!(c.host_cap_kbps.is_none());
+    }
+
+    #[test]
+    fn a_host_retarget_above_the_ceiling_raises_it() {
+        // The host sends an unsolicited `BitrateChanged` when a rebuild re-resolves an Automatic
+        // rate for what it ACTUALLY encodes — a 1080p session mirroring a 4K panel resolves far
+        // above the negotiated rate. That is the host's own Automatic answer, so the climb
+        // ceiling has to follow it; otherwise the ceiling stays stale and the step-down drags
+        // the host straight back off the rate it just chose.
+        let mut c = BitrateController::new(20_000);
+        assert_eq!(c.ceiling_kbps, 20_000);
+        c.on_ack(60_000); // unsolicited: no request was outstanding
+        assert_eq!(c.current_kbps, 60_000);
+        assert_eq!(c.ceiling_kbps, 60_000);
+        let start = Instant::now();
+        // No step-down, and no spurious re-target of any kind.
+        assert_eq!(run_clean(&mut c, start, 0, 4), None);
+        // The operator's cap still outranks it — that is the one thing that must bind here.
+        let mut c = BitrateController::with_ceiling_cap(20_000, Some(50_000));
+        c.on_ack(60_000);
+        assert_eq!(c.ceiling_kbps, 50_000);
+        assert_eq!(run_clean(&mut c, start, 0, 1), Some(50_000));
     }
 
     #[test]
