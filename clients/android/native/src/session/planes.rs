@@ -460,7 +460,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStopMic(
     })
 }
 
-/// `NativeBridge.nativeStartPadAudio(handle, fd, haptics, speaker): Boolean` — start tier-A
+/// `NativeBridge.nativeStartPadAudio(handle, pad, fd, haptics, speaker): Boolean` — start tier-A
 /// DualSense pad audio on a descriptor Kotlin has already obtained.
 ///
 /// `fd` comes from `UsbDeviceConnection.getFileDescriptor()` **after** claiming the pad's audio
@@ -478,12 +478,13 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStartPadAud
     _env: JNIEnv,
     _this: JObject,
     handle: jlong,
+    pad: jni::sys::jint,
     fd: jni::sys::jint,
     haptics: jboolean,
     speaker: jboolean,
 ) -> jboolean {
     jni_guard(0, || {
-        if handle == 0 || fd < 0 {
+        if handle == 0 || fd < 0 || !(0..16).contains(&pad) {
             return 0;
         }
         // SAFETY: live handle per the nativeConnect/nativeClose contract.
@@ -499,6 +500,15 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStartPadAud
         ) {
             Some(p) => {
                 *h.pad_audio.lock().unwrap() = Some(p);
+                // Declare what this pad can render. Without these bits the host never emits 0xD1
+                // for it at all, so the renderer would sit on an empty plane forever — the bits
+                // ride the gamepad arrival (flags 8/9) toward a HOST_CAP_PAD_AUDIO host.
+                let caps =
+                    (if haptics != 0 { 0x01 } else { 0 }) | (if speaker != 0 { 0x02 } else { 0 });
+                h.client.set_pad_audio_caps(pad as u8, caps);
+                // And take this pad off wire rumble: tier A and tier C are mutually exclusive in
+                // the pad's firmware (see `pad_audio::is_tier_a`).
+                crate::pad_audio::set_tier_a(pad as u8, true);
                 1
             }
             None => 0,
@@ -506,7 +516,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStartPadAud
     })
 }
 
-/// `NativeBridge.nativeStopPadAudio(handle)` — stop tier-A pad audio and join its thread.
+/// `NativeBridge.nativeStopPadAudio(handle, pad)` — stop tier-A pad audio and join its thread.
 ///
 /// Returns only once the render thread is joined, which is the point: Kotlin may close the
 /// `UsbDeviceConnection` as soon as this returns and not before.
@@ -516,12 +526,19 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStopPadAudi
     _env: JNIEnv,
     _this: JObject,
     handle: jlong,
+    pad: jni::sys::jint,
 ) {
     jni_guard((), || {
         if handle != 0 {
             // SAFETY: live handle per the nativeConnect/nativeClose contract.
             let h = unsafe { &*(handle as *const SessionHandle) };
             h.stop_pad_audio();
+            if (0..16).contains(&pad) {
+                // Withdraw the capability and hand the pad back to wire rumble, in that order:
+                // the host stops sending 0xD1 before tier C resumes, so the two never overlap.
+                h.client.set_pad_audio_caps(pad as u8, 0);
+                crate::pad_audio::set_tier_a(pad as u8, false);
+            }
         }
     })
 }

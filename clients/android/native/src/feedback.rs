@@ -54,6 +54,12 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeNextRumble(
         // handle.
         let h = unsafe { &*(handle as *const SessionHandle) };
         match h.client.next_rumble_command(PULL_TIMEOUT) {
+            // A pad rendering tier-A audio must never see wire rumble. `DsDevice` sets
+            // `valid_flag0` bit 1 (`HAPTICS_SELECT`) on every rumble write, and that bit
+            // *disables* audio haptics — so one replayed command would silently mute the voice
+            // coils the 0xD1 stream is driving, for the rest of the session. Dropping it here
+            // (rather than in Kotlin) keeps the rule next to the reason, and covers every caller.
+            Ok(cmd) if crate::pad_audio::is_tier_a((cmd.pad & 0xF) as u8) => -1,
             Ok(cmd) => {
                 (jlong::from(cmd.pad & 0xF) << 49)
                     | (jlong::from(cmd.backstop_ms.min(0xFFFF) as u16) << 32)

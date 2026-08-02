@@ -71,6 +71,38 @@ const MAX_FRAME_SAMPLES: usize = 5760;
 #[cfg_attr(not(target_os = "android"), allow(dead_code))]
 const IN_FLIGHT_MS: u32 = 6;
 
+// ---- tier-A registry ---------------------------------------------------------------------------
+
+/// Which wire pad indices are currently rendering tier-A audio, as a bitmask over the 16 wire
+/// slots.
+///
+/// Read on the rumble poll thread and written on the JNI thread, so it is an atomic rather than a
+/// lock: the reader is on a latency path and must never block behind a start/stop.
+static TIER_A_PADS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Mark (or clear) a pad as rendering tier-A audio.
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+pub(crate) fn set_tier_a(pad: u8, on: bool) {
+    use std::sync::atomic::Ordering;
+    let bit = 1u32 << (pad & 0x0f);
+    if on {
+        TIER_A_PADS.fetch_or(bit, Ordering::Relaxed);
+    } else {
+        TIER_A_PADS.fetch_and(!bit, Ordering::Relaxed);
+    }
+}
+
+/// Is this pad rendering tier-A audio, and therefore forbidden from receiving wire rumble?
+///
+/// **This is a firmware constraint, not a preference.** `valid_flag0` bit 1 (`HAPTICS_SELECT`)
+/// *disables* audio haptics and selects classic rumble, and `DsDevice` sets it on every rumble
+/// write — as Linux's `hid-playstation` and SDL both do. So a single rumble command reaching a
+/// tier-A pad silently mutes the voice coils this stream drives, for the rest of the session.
+/// Tier A and tier C are mutually exclusive **in the pad**: the arbitration selects, never blends.
+pub(crate) fn is_tier_a(pad: u8) -> bool {
+    TIER_A_PADS.load(std::sync::atomic::Ordering::Relaxed) & (1u32 << (pad & 0x0f)) != 0
+}
+
 // ---- the 4-channel mixer ---------------------------------------------------------------------
 
 /// Interleave the two independent stereo streams into one 4-channel frame stream.
@@ -558,6 +590,32 @@ mod tests {
         m.push(PAD_AUDIO_KIND_HAPTICS, &[1, 2]);
         assert_eq!(m.pop(&mut out), 1);
         assert_eq!(out, vec![0, 0, 1, 2]);
+    }
+
+    #[test]
+    fn tier_a_registry_tracks_pads_independently() {
+        // A rumble command reaching a tier-A pad mutes its coils for the session, so this gate
+        // has to be exact rather than approximately right.
+        set_tier_a(3, true);
+        assert!(is_tier_a(3));
+        assert!(!is_tier_a(4));
+        set_tier_a(4, true);
+        assert!(is_tier_a(3) && is_tier_a(4));
+        set_tier_a(3, false);
+        assert!(!is_tier_a(3), "clearing one pad must not clear another");
+        assert!(is_tier_a(4));
+        set_tier_a(4, false);
+        assert!(!is_tier_a(4));
+    }
+
+    #[test]
+    fn tier_a_registry_wraps_the_pad_index_into_the_wire_slot_space() {
+        // The wire pad space is 4 bits; an out-of-range index must not shift the mask into
+        // undefined territory (a shift >= 32 is a panic in debug and garbage in release).
+        set_tier_a(0x1f, true);
+        assert!(is_tier_a(0x0f), "0x1f and 0x0f are the same wire slot");
+        set_tier_a(0x0f, false);
+        assert!(!is_tier_a(0x1f));
     }
 
     #[test]
