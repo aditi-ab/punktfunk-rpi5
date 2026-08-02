@@ -200,10 +200,23 @@ impl DataPump {
             let probe_active = {
                 let mut p = pump_probe.lock().unwrap();
                 if p.active && !p.done {
-                    p.rx_packets_now = st.packets_received;
-                    p.rx_bytes_now = st.bytes_received;
-                    p.base_packets.get_or_insert(st.packets_received);
-                    p.base_bytes.get_or_insert(st.bytes_received);
+                    // Arm edge (first mirror tick): zero the arrival stamps before the burst can
+                    // claim them — the ProbeRequest is still queued locally (the burst starts a
+                    // round trip later), so the reset cannot race a probe packet. `st` predates
+                    // the reset, so the stamps mirror 0 on this tick and live values after.
+                    let arming = p.base_bytes.is_none();
+                    if arming {
+                        session.reset_probe_arrivals();
+                    }
+                    p.rx_packets_now = st.probe_packets_received;
+                    p.rx_bytes_now = st.probe_bytes_received;
+                    (p.first_arrival_ns, p.last_arrival_ns) = if arming {
+                        (0, 0)
+                    } else {
+                        (st.probe_first_arrival_ns, st.probe_last_arrival_ns)
+                    };
+                    p.base_packets.get_or_insert(st.probe_packets_received);
+                    p.base_bytes.get_or_insert(st.probe_bytes_received);
                 }
                 p.active && !p.done
             };
@@ -280,16 +293,23 @@ impl DataPump {
                 if p.done {
                     capacity_probe_deadline = None;
                     // An all-zero reply is a decline (old host / probe-less build) — keep the
-                    // negotiated ceiling. Otherwise: delivered wire kbps × 0.7.
+                    // negotiated ceiling. Otherwise: delivered wire kbps × 0.7, over the
+                    // CLIENT-measured receive interval (the host's send window closes while the
+                    // bottleneck queue is still draining toward us, so dividing by ITS duration
+                    // overstates the link — a 1 GbE link "measured" 1266 Mbps, and the inflated
+                    // ceiling is permanent because set_ceiling never lowers); the host duration
+                    // is the fallback when the burst delivered too few packets for an interval.
                     if p.host_duration_ms > 0 && p.delivered_bytes > 0 {
-                        let delivered_kbps = (p.delivered_bytes.saturating_mul(8)
-                            / p.host_duration_ms.max(1) as u64)
-                            as u32;
+                        let window_ms = p.throughput_window_ms();
+                        let delivered_kbps =
+                            (p.delivered_bytes.saturating_mul(8) / window_ms.max(1) as u64) as u32;
                         let ceiling = delivered_kbps.saturating_mul(7) / 10;
                         abr.set_ceiling(ceiling);
                         tracing::info!(
                             delivered_kbps,
                             ceiling_kbps = ceiling,
+                            client_interval_ms = p.client_interval_ms,
+                            host_duration_ms = p.host_duration_ms,
                             "adaptive bitrate: link-capacity probe done — climb ceiling set"
                         );
                     } else {

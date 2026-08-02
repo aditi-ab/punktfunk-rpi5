@@ -31,6 +31,10 @@
 //! after ~4.5 s clean, ceilinged). Changes are rate-limited (each one costs the IDR the host's
 //! rebuilt encoder opens with) and the whole controller disables itself against a host that never
 //! answers [`crate::quic::BitrateChanged`] (an older build that ignores unknown control messages).
+//! Standing limits are LEARNED rather than re-poked: two identical short host acks latch the
+//! encoder's ceiling (`host_cap_kbps`), two consecutive decode-severe backoffs at a similar rate
+//! latch the client decoder's knee (`decode_cap_kbps`) — and both re-probe slowly
+//! ([`CAP_REPROBE_WINDOWS`]) so neither latch outlives the condition that taught it.
 //!
 //! Climbs are additionally **evidence-gated**. The target is only a *promise* to the encoder —
 //! how many bits it actually emits depends on the content — so on calm content (a menu, an idle
@@ -129,13 +133,39 @@ const ENCODE_SEVERE_US: i64 = 12_000;
 /// evidence, not a spec limit — without a re-probe, one heavy scene would cap the whole
 /// session. A still-standing limit just re-teaches itself in two short acks, which the host
 /// pre-clamps without touching the encoder — the re-probe costs no rebuild, no IDR.
+/// The [`decode cap`](BitrateController::decode_cap_kbps) re-probes on the same clock for the
+/// same reason: the decoder's knee moves with content and thermals, so its latch must not be
+/// permanent either.
 const CAP_REPROBE_WINDOWS: u32 = 80;
+/// Two consecutive decode-driven backoffs latch the
+/// [`decode cap`](BitrateController::decode_cap_kbps) only when their pre-backoff rates agree
+/// within ±1/8: the decoder's knee is a RATE, so repeated chokes at the same rate are its
+/// signature — two unrelated events (a Wi-Fi flush at 300 Mbps, a decode spike at 500) share
+/// no knee and must not teach one.
+const DECODE_CAP_SIMILAR_DIV: u32 = 8;
 /// Rolling window (in 750 ms report windows, ~30 s) whose minimum mean is the OWD baseline.
 /// Long enough to remember the uncongested floor, short enough to follow genuine path changes.
 const BASELINE_WINDOWS: usize = 40;
 /// Requests sent without a single [`crate::quic::BitrateChanged`] ack before concluding the host
 /// predates bitrate renegotiation and going quiet for the rest of the session.
 const MAX_UNACKED: u32 = 3;
+
+/// Operator escape hatch: `PUNKTFUNK_ABR_MAX_MBPS` (megabits/second, the
+/// `PUNKTFUNK_PYROWAVE_MAX_MBPS` convention) caps the climb ceiling however it is learned.
+/// The startup link-capacity probe MEASURES the ceiling, and
+/// [`set_ceiling`](BitrateController::set_ceiling)'s deliberate monotonicity makes an inflated
+/// measurement permanent for the session — a link that mis-measures (a bursty middlebox, a
+/// queue-flattered interval) needs a knob that binds regardless of what any probe claims.
+/// `PUNKTFUNK_ABR_PROBE_KBPS` is NOT that knob: it only shrinks the burst target, not what the
+/// measurement may conclude. Unset/0/garbage → no cap. Read once per controller, at
+/// construction.
+fn ceiling_cap_from_env() -> Option<u32> {
+    std::env::var("PUNKTFUNK_ABR_MAX_MBPS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|&m| m > 0)
+        .map(|m| m.saturating_mul(1_000))
+}
 
 /// One decision per report window; `Some(kbps)` = send a [`crate::quic::SetBitrate`].
 pub(crate) struct BitrateController {
@@ -147,6 +177,10 @@ pub(crate) struct BitrateController {
     /// raises it via [`set_ceiling`](Self::set_ceiling) — that measurement is what lets an
     /// Automatic session scale past its conservative start.
     ceiling_kbps: u32,
+    /// The `PUNKTFUNK_ABR_MAX_MBPS` cap in kbps (see [`ceiling_cap_from_env`]), injected at
+    /// construction so tests exercise the clamp without touching the process environment.
+    /// `None` = no cap.
+    ceiling_cap_kbps: Option<u32>,
     floor_kbps: u32,
     /// Slow start: true until the first congestion signal — clean windows DOUBLE the rate
     /// (cooldown-paced) instead of the +6 % additive step.
@@ -178,6 +212,24 @@ pub(crate) struct BitrateController {
     short_acks: u32,
     /// Clean windows spent parked at the learned cap (the re-probe clock).
     cap_probe_windows: u32,
+    /// The client-decoder rate cap, mirroring [`host_cap_kbps`](Self::host_cap_kbps) for the
+    /// OTHER end of the pipe: latched when two CONSECUTIVE backoffs carried decode-severe
+    /// evidence (a deep decode-latency excursion, or a jump-to-live flush — in the
+    /// decoder-saturation regime the flushed backlog formed BEHIND a decoder that stopped
+    /// keeping up) at a similar pre-backoff rate. Without it a decoder knee below the link
+    /// ceiling is a permanent 30–60 s sawtooth: every ×0.7 backoff re-climbs toward a ceiling
+    /// the decoder can't hold, and each cycle costs a flush plus a dropped-frame burst (the
+    /// 1440p120 HEVC field case: knee ~490 Mbps under a ~658 Mbps ceiling). Slowly re-probed
+    /// on the [`CAP_REPROBE_WINDOWS`] clock, exactly like the host cap, so a decoder that
+    /// recovers (lighter content, thermal headroom) climbs again — the latch is never
+    /// permanent.
+    decode_cap_kbps: Option<u32>,
+    /// The previous decode-driven backoff's pre-backoff rate (0 = the last backoff wasn't
+    /// decode-driven): the reference the next one must land near ([`DECODE_CAP_SIMILAR_DIV`])
+    /// to latch the cap — one spurious flush teaches nothing.
+    decode_backoff_kbps: u32,
+    /// Clean windows spent parked at the learned decode cap (its re-probe clock).
+    decode_cap_probe_windows: u32,
     /// Proven throughput: the session's highest windowed ACTUAL delivered rate seen with flat
     /// decode latency — the known-good high-water mark climbs are bounded against. Never decays;
     /// shrinking capacity (thermals, a heavier scene) is the reactive decode signal's job. On
@@ -196,10 +248,17 @@ impl BitrateController {
     /// to build a permanently-disabled controller (explicit bitrate / an old host that didn't
     /// echo one — no known ceiling to work against).
     pub(crate) fn new(start_kbps: u32) -> Self {
+        Self::with_ceiling_cap(start_kbps, ceiling_cap_from_env())
+    }
+
+    /// [`new`](Self::new) with the `PUNKTFUNK_ABR_MAX_MBPS` cap injected — the seam the unit
+    /// tests use so the clamp's behavior never depends on the test process's environment.
+    fn with_ceiling_cap(start_kbps: u32, ceiling_cap_kbps: Option<u32>) -> Self {
         BitrateController {
             enabled: start_kbps > 0,
             current_kbps: start_kbps,
             ceiling_kbps: start_kbps,
+            ceiling_cap_kbps,
             floor_kbps: FLOOR_KBPS.min(start_kbps.max(1)),
             probing: true,
             owd_means: VecDeque::with_capacity(BASELINE_WINDOWS),
@@ -210,6 +269,9 @@ impl BitrateController {
             short_ack_kbps: 0,
             short_acks: 0,
             cap_probe_windows: 0,
+            decode_cap_kbps: None,
+            decode_backoff_kbps: 0,
+            decode_cap_probe_windows: 0,
             proven_kbps: 0,
             bad_windows: 0,
             clean_windows: 0,
@@ -222,8 +284,12 @@ impl BitrateController {
     /// delivered throughput with headroom already subtracted by the caller). Without this call
     /// the ceiling stays the negotiated start rate — exactly the old behavior. Never lowers:
     /// a congested-moment measurement must not shrink authority below what was negotiated
-    /// (descent is the congestion signals' job).
+    /// (descent is the congestion signals' job). The `PUNKTFUNK_ABR_MAX_MBPS` cap clamps HERE
+    /// — the one funnel every learned ceiling passes through — so it binds no matter how the
+    /// ceiling was learned; monotonicity is precisely why the user needs it (one inflated
+    /// measurement is otherwise permanent for the session).
     pub(crate) fn set_ceiling(&mut self, kbps: u32) {
+        let kbps = kbps.min(self.ceiling_cap_kbps.unwrap_or(u32::MAX));
         if self.enabled && kbps > self.ceiling_kbps {
             self.ceiling_kbps = kbps;
         }
@@ -274,11 +340,16 @@ impl BitrateController {
 
     /// An accepted mode switch: the encoder's ceiling and compute knee are properties of the
     /// MODE (4K120 caps where 1080p60 never would) — drop the mode-scoped learned state. The
-    /// probe-measured `ceiling_kbps` (a LINK property) survives.
+    /// decoder's knee is just as mode-scoped (pixel rate drives both ends of the codec), so
+    /// the decode cap goes with it. The probe-measured `ceiling_kbps` (a LINK property)
+    /// survives.
     pub(crate) fn on_mode_switch(&mut self) {
         self.host_cap_kbps = None;
         self.short_acks = 0;
         self.cap_probe_windows = 0;
+        self.decode_cap_kbps = None;
+        self.decode_backoff_kbps = 0;
+        self.decode_cap_probe_windows = 0;
         self.encode_means.clear();
     }
 
@@ -427,6 +498,30 @@ impl BitrateController {
                 }
             }
         }
+        // The decode cap re-probes on the same clock and for the same reason: the knee is
+        // content- and thermals-dependent evidence, not a spec limit — a decoder that recovers
+        // must get its headroom back, so the latch clears UPWARD through here rather than ever
+        // being permanent. A still-standing knee re-latches from the next pair of
+        // decode-driven backoffs.
+        if let Some(cap) = self.decode_cap_kbps {
+            if bad {
+                self.decode_cap_probe_windows = 0;
+            } else if self.current_kbps >= cap.saturating_sub(cap / 16) {
+                self.decode_cap_probe_windows += 1;
+                if self.decode_cap_probe_windows >= CAP_REPROBE_WINDOWS {
+                    self.decode_cap_probe_windows = 0;
+                    let lifted = cap.saturating_add(cap / 8).min(self.ceiling_kbps);
+                    if lifted > cap {
+                        tracing::debug!(
+                            from_kbps = cap,
+                            to_kbps = lifted,
+                            "adaptive bitrate: re-probing above the learned decode cap"
+                        );
+                        self.decode_cap_kbps = Some(lifted);
+                    }
+                }
+            }
+        }
         let cooled = self
             .last_change
             .is_none_or(|t| now.duration_since(t) >= CHANGE_COOLDOWN);
@@ -436,6 +531,31 @@ impl BitrateController {
         if (self.bad_windows >= BAD_WINDOWS_TO_DECREASE || (severe && self.bad_windows >= 1))
             && self.current_kbps > self.floor_kbps
         {
+            // Decode-cap learning (see [`decode_cap_kbps`](Self::decode_cap_kbps)): a backoff
+            // with decode-severe evidence — the deep decode excursion, or the flush that
+            // drained the queue behind a stalled decoder — remembers its pre-backoff rate; the
+            // SECOND consecutive one at a similar rate latches that rate as the decoder's
+            // knee. One event never latches (a spurious flush must stay a one-off), and a
+            // backoff without decode evidence in between breaks the streak — whatever it saw,
+            // it wasn't the same knee.
+            if decode_severe || flushed {
+                let rate = self.current_kbps;
+                let similar = self.decode_backoff_kbps > 0
+                    && rate.abs_diff(self.decode_backoff_kbps)
+                        <= self.decode_backoff_kbps / DECODE_CAP_SIMILAR_DIV;
+                if similar && self.decode_cap_kbps.is_none_or(|c| rate < c) {
+                    tracing::info!(
+                        cap_kbps = rate,
+                        "adaptive bitrate: decode cap learned (decoder knee) — climbs stop \
+                         here until it lifts"
+                    );
+                    self.decode_cap_kbps = Some(rate.max(self.floor_kbps));
+                    self.decode_cap_probe_windows = 0;
+                }
+                self.decode_backoff_kbps = rate;
+            } else {
+                self.decode_backoff_kbps = 0;
+            }
             let next = ((self.current_kbps as u64 * 7 / 10) as u32).max(self.floor_kbps);
             self.bad_windows = 0;
             return self.request(next, now);
@@ -447,11 +567,13 @@ impl BitrateController {
         // utilized window after a long-enough clean run climbs immediately.
         let utilized =
             actual_kbps as u64 * UTILIZATION_DEN >= self.current_kbps as u64 * UTILIZATION_NUM;
-        // The effective ceiling folds in the host-taught cap: the probe measured the LINK, but
-        // the host's short acks measured the ENCODER — whichever binds first is the limit.
+        // The effective ceiling folds in both learned caps: the probe measured the LINK, the
+        // host's short acks measured the ENCODER, and the decode cap measured the CLIENT
+        // DECODER — whichever binds first is the limit.
         let eff_ceiling = self
             .ceiling_kbps
-            .min(self.host_cap_kbps.unwrap_or(u32::MAX));
+            .min(self.host_cap_kbps.unwrap_or(u32::MAX))
+            .min(self.decode_cap_kbps.unwrap_or(u32::MAX));
         let cap = eff_ceiling
             .min(self.proven_kbps.saturating_mul(PROVEN_HEADROOM_NUM) / PROVEN_HEADROOM_DEN);
         if self.current_kbps < eff_ceiling && utilized && cap > self.current_kbps {
@@ -1445,6 +1567,243 @@ mod tests {
                 None
             );
         }
+    }
+
+    #[test]
+    fn env_max_mbps_caps_every_learned_ceiling() {
+        // PUNKTFUNK_ABR_MAX_MBPS=50 (injected — `new` reads the env exactly once, at
+        // construction): a probe "measuring" 886 Mbps (the divisor bug's field figure) must
+        // not out-rank the user's cap…
+        let mut c = BitrateController::with_ceiling_cap(20_000, Some(50_000));
+        c.set_ceiling(886_312);
+        assert_eq!(c.ceiling_kbps, 50_000);
+        // …while a measurement under the cap stands untouched.
+        let mut c = BitrateController::with_ceiling_cap(20_000, Some(50_000));
+        c.set_ceiling(40_000);
+        assert_eq!(c.ceiling_kbps, 40_000);
+        // And the climb honors it: slow start doubles 20→40, the capped ceiling truncates the
+        // next step to 50, then quiet — never a request past the user's limit.
+        let mut c = BitrateController::with_ceiling_cap(20_000, Some(50_000));
+        c.set_ceiling(886_312);
+        let start = Instant::now();
+        assert_eq!(run_clean(&mut c, start, 0, 1), Some(40_000));
+        c.on_ack(40_000);
+        assert_eq!(run_clean(&mut c, start, 2, 1), Some(50_000));
+        c.on_ack(50_000);
+        assert_eq!(run_clean(&mut c, start, 4, 20), None);
+    }
+
+    #[test]
+    fn decode_cap_latches_after_two_consecutive_decode_severe_backoffs() {
+        // The 1440p120 field sawtooth: a decoder knee (~500 Mbps) well under the (inflated)
+        // link ceiling — nothing ever LEARNED the knee, so every re-climb ended in a flush +
+        // dropped-frame burst. Establish a decode baseline on calm windows, choke twice at the
+        // same rate, and the second decode-severe backoff must latch the knee.
+        let mut c = BitrateController::new(500_000);
+        c.set_ceiling(900_000);
+        let start = Instant::now();
+        // Calm baseline windows (2 Mb/s actual: unutilized, so no climb interferes).
+        for i in 0..4 {
+            assert_eq!(
+                c.on_window(
+                    ticks(start, i),
+                    0,
+                    0,
+                    Some(10_000),
+                    Some(8_000),
+                    None,
+                    2_000,
+                    false,
+                    0
+                ),
+                None
+            );
+        }
+        // First deep decode excursion → immediate ×0.7, but ONE event must not latch.
+        assert_eq!(
+            c.on_window(
+                ticks(start, 4),
+                0,
+                0,
+                Some(10_000),
+                Some(60_000),
+                None,
+                490_000,
+                false,
+                0
+            ),
+            Some(350_000)
+        );
+        assert!(c.decode_cap_kbps.is_none());
+        // Second consecutive decode-severe backoff at the same pre-backoff rate: latch.
+        assert_eq!(
+            c.on_window(
+                ticks(start, 6),
+                0,
+                0,
+                Some(10_000),
+                Some(60_000),
+                None,
+                490_000,
+                false,
+                0
+            ),
+            Some(350_000)
+        );
+        assert_eq!(c.decode_cap_kbps, Some(500_000));
+        // The backoff applies; from here every climb must stop AT the knee — not the 900 Mbps
+        // link ceiling the old sawtooth kept re-poking.
+        c.on_ack(350_000);
+        let mut max_req = 0;
+        for i in 8..70 {
+            if let Some(k) = c.on_window(
+                ticks(start, i),
+                0,
+                0,
+                Some(10_000),
+                Some(8_000),
+                None,
+                1_000_000,
+                false,
+                0,
+            ) {
+                assert!(k <= 500_000, "climb past the decode cap: {k}");
+                max_req = max_req.max(k);
+                c.on_ack(k);
+            }
+        }
+        assert_eq!(max_req, 500_000);
+        assert_eq!(c.current_kbps, 500_000);
+        assert_eq!(c.decode_cap_kbps, Some(500_000));
+    }
+
+    #[test]
+    fn a_single_flush_or_dissimilar_backoffs_never_latch_a_decode_cap() {
+        // The latch's false-positive guards. A lone jump-to-live flush (a Wi-Fi clump can
+        // flush once at ANY rate) backs off but teaches nothing…
+        let mut c = BitrateController::new(500_000);
+        c.set_ceiling(900_000);
+        let start = Instant::now();
+        assert_eq!(
+            c.on_window(ticks(start, 0), 0, 0, None, None, None, 490_000, true, 0),
+            Some(350_000)
+        );
+        assert!(c.decode_cap_kbps.is_none());
+        c.on_ack(350_000);
+        // …a LOSS-driven backoff in between breaks the streak…
+        assert_eq!(
+            c.on_window(ticks(start, 2), 1, 0, None, None, None, 340_000, false, 0),
+            Some(245_000)
+        );
+        assert!(c.decode_cap_kbps.is_none());
+        c.on_ack(245_000);
+        // …so the next flush counts as a FIRST decode event again — still no latch…
+        assert_eq!(
+            c.on_window(ticks(start, 4), 0, 0, None, None, None, 240_000, true, 0),
+            Some(171_500)
+        );
+        assert!(c.decode_cap_kbps.is_none());
+        c.on_ack(171_500);
+        // …and two consecutive decode events at DISSIMILAR rates (245 vs 171.5 Mbps — no
+        // common knee) must not latch either.
+        assert_eq!(
+            c.on_window(ticks(start, 6), 0, 0, None, None, None, 170_000, true, 0),
+            Some(120_050)
+        );
+        assert!(c.decode_cap_kbps.is_none());
+    }
+
+    #[test]
+    fn decode_cap_reprobes_after_a_sustained_clean_run() {
+        // The knee is content/thermals evidence, not a spec limit: after ~60 s parked clean at
+        // the latched cap, it lifts one step (+12.5 %, ceiling-bounded) — the re-probe path is
+        // how the latch clears (never permanent), and a still-standing knee just re-latches
+        // from the next pair of decode-driven backoffs.
+        let mut c = BitrateController::new(500_000);
+        c.set_ceiling(900_000);
+        let start = Instant::now();
+        for i in 0..4 {
+            let _ = c.on_window(
+                ticks(start, i),
+                0,
+                0,
+                Some(10_000),
+                Some(8_000),
+                None,
+                2_000,
+                false,
+                0,
+            );
+        }
+        for i in [4, 6] {
+            let _ = c.on_window(
+                ticks(start, i),
+                0,
+                0,
+                Some(10_000),
+                Some(60_000),
+                None,
+                490_000,
+                false,
+                0,
+            );
+        }
+        assert_eq!(c.decode_cap_kbps, Some(500_000));
+        // The host's ack parks the session at the knee (its clamp is authoritative).
+        c.on_ack(500_000);
+        for i in 0..CAP_REPROBE_WINDOWS {
+            let _ = c.on_window(
+                ticks(start, 8 + i),
+                0,
+                0,
+                Some(10_000),
+                Some(8_000),
+                None,
+                490_000,
+                false,
+                0,
+            );
+        }
+        assert_eq!(c.decode_cap_kbps, Some(500_000 + 500_000 / 8));
+    }
+
+    #[test]
+    fn mode_switch_clears_the_decode_cap() {
+        // A 1440p120 knee means nothing at the new mode's pixel rate — the decode cap must
+        // not survive the switch (the probe-measured link ceiling does).
+        let mut c = BitrateController::new(500_000);
+        c.set_ceiling(900_000);
+        let start = Instant::now();
+        for i in 0..4 {
+            let _ = c.on_window(
+                ticks(start, i),
+                0,
+                0,
+                Some(10_000),
+                Some(8_000),
+                None,
+                2_000,
+                false,
+                0,
+            );
+        }
+        for i in [4, 6] {
+            let _ = c.on_window(
+                ticks(start, i),
+                0,
+                0,
+                Some(10_000),
+                Some(60_000),
+                None,
+                490_000,
+                false,
+                0,
+            );
+        }
+        assert_eq!(c.decode_cap_kbps, Some(500_000));
+        c.on_mode_switch();
+        assert!(c.decode_cap_kbps.is_none());
+        assert_eq!(c.ceiling_kbps, 900_000);
     }
 
     #[test]

@@ -883,7 +883,7 @@ impl NativeClient {
     /// `target_kbps` of goodput for `duration_ms`, *briefly pausing video*. Non-blocking — the
     /// measurement accumulates in the background; poll [`NativeClient::probe_result`] until its
     /// `done` flag is set. Starting a probe resets any prior measurement. The host clamps both
-    /// fields (≤ 3 Gbps, ≤ 5 s).
+    /// fields (≤ 10 Gbps, ≤ 5 s).
     pub fn request_probe(&self, target_kbps: u32, duration_ms: u32) -> Result<()> {
         // Reset the accumulator so a fresh run doesn't blend into the previous one.
         *self.probe.lock().unwrap() = ProbeState {
@@ -922,8 +922,12 @@ impl NativeClient {
                 p.rx_bytes_now.saturating_sub(base_b),
             )
         };
-        // The host's burst duration is the throughput denominator. bytes × 8 / ms = kilobits/second.
-        let window_ms = p.host_duration_ms;
+        // The throughput denominator: the client-measured receive interval once the report
+        // froze one, the host's send-window duration as the fallback (see
+        // `ProbeState::measured_interval_ms` for why the host window alone overstates the
+        // link). Both are 0 until the report lands, so a partial read reports 0 throughput —
+        // unchanged. bytes × 8 / ms = kilobits/second.
+        let window_ms = p.throughput_window_ms();
         let throughput_kbps = if window_ms > 0 {
             (delivered_bytes.saturating_mul(8) / window_ms as u64) as u32
         } else {

@@ -409,6 +409,27 @@ impl Reassembler {
         // can neither advance the video anchor nor be dropped as stale against it (and its aged-out
         // frames never count as `frames_dropped`, which would fire video loss recovery).
         let is_probe = hdr.user_flags & (FLAG_PROBE as u32) != 0;
+        if is_probe {
+            // Probe-scoped receive accounting (the speed-test numerator + denominator, see
+            // `Stats::probe_first_arrival_ns`), stamped at the routing decision so video in
+            // flight around the burst contaminates neither the byte count nor the arrival
+            // stamps. Byte unit mirrors `bytes_received` (whole plaintext packet). The first
+            // probe packet since the pump armed the probe claims the first-arrival slot (the
+            // pump zeroes it before the burst can reach the host); every probe packet
+            // refreshes the last-arrival stamp.
+            let now_ns = crate::stats::now_monotonic_ns();
+            StatsCounters::add(&stats.probe_packets_received, 1);
+            StatsCounters::add(&stats.probe_bytes_received, pkt.len() as u64);
+            let _ = stats.probe_first_arrival_ns.compare_exchange(
+                0,
+                now_ns,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            stats
+                .probe_last_arrival_ns
+                .store(now_ns, std::sync::atomic::Ordering::Relaxed);
+        }
         let win = if is_probe { probe } else { video };
         win.advance_window(
             hdr.frame_index,

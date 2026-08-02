@@ -132,12 +132,24 @@ impl ControlTask {
                         }
                     } else if let Ok(result) = ProbeResult::decode(&msg) {
                         let mut p = probe.lock().unwrap();
-                        // Freeze the delivered figures now (the burst is done), before resumed
-                        // video can inflate the packet counters.
+                        // Freeze the delivered figures now (the burst is done). The mirrored
+                        // counters are probe-scoped (stamped at the reassembler's FLAG_PROBE
+                        // routing), so video around the burst inflates nothing; the client's
+                        // first→last arrival interval is frozen with them — the denominator
+                        // that measures when the bytes actually ARRIVED, not when the host
+                        // stopped sending (its window closes while the bottleneck queue is
+                        // still draining this way, which is how a 1 GbE link once "measured"
+                        // 1266 Mbps).
                         let base_p = p.base_packets.unwrap_or(p.rx_packets_now);
                         let base_b = p.base_bytes.unwrap_or(p.rx_bytes_now);
                         p.delivered_packets = p.rx_packets_now.saturating_sub(base_p);
                         p.delivered_bytes = p.rx_bytes_now.saturating_sub(base_b);
+                        p.client_interval_ms = ProbeState::measured_interval_ms(
+                            p.first_arrival_ns,
+                            p.last_arrival_ns,
+                            p.delivered_packets,
+                        )
+                        .unwrap_or(0);
                         p.host_goodput_bytes = result.bytes_sent;
                         p.host_au = result.packets_sent;
                         p.host_wire_packets = result.wire_packets_sent;
@@ -151,6 +163,7 @@ impl ControlTask {
                             send_dropped = result.send_dropped,
                             duration_ms = result.duration_ms,
                             delivered_packets = p.delivered_packets,
+                            client_interval_ms = p.client_interval_ms,
                             "speed-test probe result"
                         );
                     } else if let Ok(ack) = BitrateChanged::decode(&msg) {

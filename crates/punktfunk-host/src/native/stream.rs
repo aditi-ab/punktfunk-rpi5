@@ -71,7 +71,7 @@ pub(super) fn synthetic_stream(
     Ok(())
 }
 
-/// Bounds a speed-test [`ProbeRequest`] before bursting: a 3 Gbps / 5 s ceiling keeps a probe from
+/// Bounds a speed-test [`ProbeRequest`] before bursting: a 10 Gbps / 5 s ceiling keeps a probe from
 /// monopolizing the link or stalling the stream for too long. The ceiling is set ABOVE the session
 /// bitrate cap ([`MAX_BITRATE_KBPS`], 2 Gbps) on purpose — a probe should be able to demonstrate
 /// headroom past the rate a session will actually be configured to use, so the client can pick a
