@@ -118,6 +118,7 @@ pub fn run(opts: Options) -> Result<()> {
                 vout,
                 capture::OutputFormat::resolve(false, crate::encode::resolved_backend_is_gpu()),
                 crate::session_plan::CaptureBackend::resolve(),
+                compositor == crate::vdisplay::Compositor::Kwin,
             )
             .context("capture virtual output")?
         }

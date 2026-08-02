@@ -110,6 +110,11 @@ pub fn capture_virtual_output(
     vout: crate::vdisplay::VirtualOutput,
     want: OutputFormat,
     _capture: crate::session_plan::CaptureBackend,
+    // The output's compositor rewrites `SPA_META_Cursor` on every buffer (KWin), so an id-0 meta
+    // is an authoritative "pointer hidden" — the caller derives it from the backend that created
+    // `vout` (which also covers registry-pooled reuse: a kept display only ever matches its own
+    // backend). See `pf_capture`'s `cursor_id0_hides` contract.
+    cursor_id0_hides: bool,
 ) -> Result<Box<dyn Capturer>> {
     // The portal negotiates its own pixel format, so `want.gpu` gates GPU zero-copy capture (the
     // capture backend is always the portal — the `CaptureBackend` arg is a Windows-only dispatch)
@@ -132,6 +137,7 @@ pub fn capture_virtual_output(
         want.hdr,
         zero_copy_policy(want.pyrowave, want.nv12_native),
         vout.expect_exact_dims,
+        cursor_id0_hides,
     )
 }
 
@@ -171,6 +177,9 @@ pub fn capture_virtual_output(
     vout: crate::vdisplay::VirtualOutput,
     want: OutputFormat,
     _capture: crate::session_plan::CaptureBackend,
+    // Linux-only fact (the PipeWire cursor-meta contract); the IDD-push path has no
+    // `SPA_META_Cursor` and its own CURSOR_SUPPRESSED hide source.
+    _cursor_id0_hides: bool,
 ) -> Result<Box<dyn Capturer>> {
     let target = vout.win_capture.clone().ok_or_else(|| {
         anyhow::anyhow!(
@@ -285,6 +294,7 @@ pub fn capture_virtual_output(
     _vout: crate::vdisplay::VirtualOutput,
     _want: OutputFormat,
     _capture: crate::session_plan::CaptureBackend,
+    _cursor_id0_hides: bool,
 ) -> Result<Box<dyn Capturer>> {
     anyhow::bail!("virtual-output capture requires Linux or Windows")
 }

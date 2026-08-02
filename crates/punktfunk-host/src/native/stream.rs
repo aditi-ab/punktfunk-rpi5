@@ -4122,9 +4122,19 @@ fn build_pipeline(
     // VIDEO_CAP_10BIT + host opted in via PUNKTFUNK_10BIT) is our HDR path → BT.2020 PQ Rgb10a2;
     // otherwise the FP16 IDD frames are converted to 8-bit SDR. (Ignored by non-IDD-push backends,
     // which auto-detect HDR from the monitor state.)
-    let mut capturer =
-        crate::capture::capture_virtual_output(vout, plan.output_format(), plan.capture)
-            .context("capture virtual output")?;
+    //
+    // KWin rewrites `SPA_META_Cursor` on every buffer, so its id-0 metas are an authoritative
+    // "pointer hidden" the cursor blend/forward must honor — without this, the composited arrow
+    // outlives every in-game/Big Picture hide (0.22.0 field report). Derived from the backend
+    // (correct for pooled reuse too — a kept display only matches its own backend).
+    let cursor_id0_hides = vd.name() == pf_vdisplay::Compositor::Kwin.id();
+    let mut capturer = crate::capture::capture_virtual_output(
+        vout,
+        plan.output_format(),
+        plan.capture,
+        cursor_id0_hides,
+    )
+    .context("capture virtual output")?;
     // gamescope (Phase C): gamescope paints no `SPA_META_Cursor`, so hand the capturer a way to
     // reach gamescope's nested Xwaylands — it reads the pointer over X11 (XFixes shape +
     // QueryPointer position) and feeds `cursor()`, which the encode loop composites.

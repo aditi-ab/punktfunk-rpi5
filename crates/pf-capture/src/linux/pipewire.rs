@@ -811,6 +811,7 @@ pub fn pipewire_thread(
         want_444,
         want_hdr,
         expect_exact_dims,
+        cursor_id0_hides,
         ..
     } = opts;
     crate::pwinit::ensure_init();
@@ -985,7 +986,7 @@ pub fn pipewire_thread(
         yuv444: want_444,
         linear_nv12_failed: false,
         dbg_log_n: 0,
-        cursor: CursorState::default(),
+        cursor: CursorState::new(cursor_id0_hides),
         expect_dims: if expect_exact_dims {
             preferred.map(|(w, h, _)| (w, h))
         } else {

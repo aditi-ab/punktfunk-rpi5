@@ -570,6 +570,7 @@ fn open_gs_mirror_source(
         vout,
         pf_frame::OutputFormat::resolve(cfg.hdr, crate::zerocopy::enabled()),
         crate::session_plan::CaptureBackend::resolve(),
+        compositor == crate::vdisplay::Compositor::Kwin,
     )
     .context("attach a capturer to the mirrored monitor")
 }
@@ -782,6 +783,7 @@ fn open_gs_virtual_source(
         vout,
         capture::OutputFormat::resolve(cfg.hdr, crate::encode::resolved_backend_is_gpu()),
         crate::session_plan::CaptureBackend::resolve(),
+        compositor == crate::vdisplay::Compositor::Kwin,
     )
     .context("capture virtual output")?;
     capturer.set_active(true);

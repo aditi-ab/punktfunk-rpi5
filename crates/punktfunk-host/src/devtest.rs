@@ -559,6 +559,7 @@ pub fn mirror_test(args: &[String]) -> Result<()> {
         vout,
         fmt,
         crate::session_plan::CaptureBackend::resolve(),
+        compositor == crate::vdisplay::Compositor::Kwin,
     )
     .context("attach a capturer to the mirrored monitor")?;
     cap.set_active(true);

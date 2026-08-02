@@ -72,6 +72,11 @@ struct CaptureOpts {
     /// the doomed birth mode. `false` everywhere else (Mutter SIZES the monitor from negotiation and
     /// gamescope fixates its own — gating those would starve legitimate first frames).
     expect_exact_dims: bool,
+    /// The producer rewrites `SPA_META_Cursor` on EVERY buffer, so an `id == 0` meta is an
+    /// authoritative "pointer hidden / off this output" the blend must honor (KWin). `false` for
+    /// the stale-meta producers (Mutter recycles buffers without rewriting the region) — see
+    /// [`pw_cursor::CursorState::id0_hides`](pw_cursor) for the full contract.
+    cursor_id0_hides: bool,
 }
 
 /// The shared state the PipeWire thread PUBLISHES and the capturer READS — one struct instead of
@@ -301,6 +306,10 @@ impl PortalCapturer {
                 want_444: false,
                 want_hdr,
                 expect_exact_dims: false,
+                // The portal-monitor path today is Mutter (the GNOME HDR mirror) — the stale-meta
+                // id-0 contract. A KDE portal capture would rewrite per buffer, but nothing routes
+                // one through here yet; the virtual-output path below carries the real flag.
+                cursor_id0_hides: false,
             },
             policy,
         )?
@@ -316,7 +325,8 @@ impl PortalCapturer {
     /// the GPU zero-copy path subject to `PUNKTFUNK_ZEROCOPY`. `want_444` (a 4:4:4 session) makes the
     /// zero-copy worker convert tiled dmabufs to planar YUV444 on the GPU instead of NV12/RGB.
     /// `want_hdr` runs the 10-bit PQ/BT.2020 offer instead of the SDR set — see
-    /// [`crate::open_virtual_output`] for who is allowed to pass it.
+    /// [`crate::open_virtual_output`] for who is allowed to pass it. `cursor_id0_hides` declares
+    /// the producer's cursor-meta contract ([`CaptureOpts::cursor_id0_hides`]).
     #[allow(clippy::too_many_arguments)]
     pub fn from_virtual_output(
         remote_fd: Option<OwnedFd>,
@@ -328,6 +338,7 @@ impl PortalCapturer {
         want_hdr: bool,
         policy: ZeroCopyPolicy,
         expect_exact_dims: bool,
+        cursor_id0_hides: bool,
     ) -> Result<PortalCapturer> {
         tracing::info!(
             node_id,
@@ -335,6 +346,7 @@ impl PortalCapturer {
             want_444,
             want_hdr,
             expect_exact_dims,
+            cursor_id0_hides,
             "connecting PipeWire to virtual output"
         );
         // Most virtual outputs are SDR-only upstream (Mutter's RecordVirtual streams advertise
@@ -350,6 +362,7 @@ impl PortalCapturer {
                 want_444,
                 want_hdr,
                 expect_exact_dims,
+                cursor_id0_hides,
             },
             policy,
         )?
