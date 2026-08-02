@@ -941,8 +941,9 @@ fn slice_config() -> Config {
 
 /// Slice chunks chosen to exercise every packetizer path: an exact-shard slice, a slice with
 /// a sub-shard remainder, a slice below [`MIN_STREAM_BLOCK_SHARDS`] that must accumulate,
-/// and a finish tail. 1023 B total → blocks (K, base-shard): (20, 0), (25, 20), (18, 45),
-/// final (1, 63) with block_count 4.
+/// and a finish tail. 1023 B total → blocks (K, base-shard): (19, 0), (26, 19), (18, 45),
+/// final (1, 63) with block_count 4. Chunk 0 is an exact 20-shard multiple and flushes 19:
+/// a flush never drains `pending` to empty, so `finish_streamed` always seals real bytes.
 fn slice_chunks() -> Vec<Vec<u8>> {
     [320usize, 403, 100, 200]
         .iter()
@@ -1007,7 +1008,8 @@ fn slice_streamed_wire_shape_and_roundtrip() {
     assert_eq!(src.len(), 1023);
     // (block_index, K, base bytes) — chunk 2 (100 B) accumulated instead of flushing (6
     // whole shards < MIN_STREAM_BLOCK_SHARDS) and rode into block 2 with chunk 3's bytes.
-    let expect = [(0u16, 20u16, 0u32), (1, 25, 320), (2, 18, 720)];
+    // Block 0 keeps one shard back (chunk 0 is an exact multiple), which rides into block 1.
+    let expect = [(0u16, 19u16, 0u32), (1, 26, 304), (2, 18, 720)];
     for p in &pkts {
         let h = PacketHeader::read_from_bytes(&p[..HEADER_LEN]).unwrap();
         assert_ne!(
@@ -1478,15 +1480,24 @@ fn parts_flow_for_legacy_streamed_frames() {
     assert!(got.last().unwrap().complete);
 }
 
-/// A sentinel first-packet commits a MAX-sized frame buffer, so the in-flight budget must
-/// bite after IN_FLIGHT_BUF_FACTOR frames — the amplification bound for one-datagram opens.
+/// A one-datagram open commits only the buffer its OWN header proves it needs, and the
+/// in-flight budget still bounds the ones that claim a lot.
+///
+/// Both halves matter. A sentinel that claims little must cost little: sizing every
+/// sentinel-opened frame at `max_frame_bytes` (the 0.23.0 shape) was survivable only while
+/// sentinels were rare, and the slice wire made every ordinary AU one — after which the budget
+/// was spent on ~3 frames and everything else on the link was dropped. A sentinel that claims a
+/// lot must still be bounded: its wire base can point near the frame ceiling, which is the
+/// amplification this budget exists for.
 #[test]
-fn streamed_open_amplification_is_budget_bounded() {
-    let mut r = Reassembler::new(limits());
+fn streamed_open_commits_its_own_extent_and_stays_bounded() {
     let coder = coder_for(FecScheme::Gf8);
+    // limits(): shard 16 B, max_data_shards 8, max_frame_bytes 4096 → budget = 4 × 4096.
+    // Modest legacy sentinels (block 0, full K = 8 → 128 B each): far more than
+    // IN_FLIGHT_BUF_FACTOR of them must fit, because none of them claims the ceiling.
+    let mut r = Reassembler::new(limits());
     let stats = StatsCounters::default();
-    // limits(): max_frame_bytes 4096 → each sentinel open commits 4096 B; budget = 4×4096.
-    for fi in 0..5u32 {
+    for fi in 0..32u32 {
         let mut h = base_header();
         h.block_count = 0;
         h.frame_bytes = 0;
@@ -1500,8 +1511,33 @@ fn streamed_open_amplification_is_budget_bounded() {
     }
     assert_eq!(
         stats.snapshot().packets_dropped,
+        0,
+        "ordinary one-datagram opens must not exhaust the in-flight budget"
+    );
+
+    // A SLICE sentinel whose wire base sits just under the ceiling really does commit a
+    // max-sized frame (base 3968 B + K 8 = 256 shards = 4096 B) — four fit the budget, the
+    // fifth must be refused.
+    let mut r = Reassembler::new(limits());
+    let stats = StatsCounters::default();
+    for fi in 0..5u32 {
+        let mut h = base_header();
+        h.user_flags = USER_FLAG_SLICE_STREAM;
+        h.block_count = 0;
+        h.frame_bytes = 4096 - 8 * 16;
+        h.block_index = 1;
+        h.data_shards = 8;
+        h.recovery_shards = 0;
+        h.frame_index = fi;
+        assert!(r
+            .push(&packet(h), coder.as_ref(), &stats)
+            .unwrap()
+            .is_none());
+    }
+    assert_eq!(
+        stats.snapshot().packets_dropped,
         1,
-        "the fifth max-sized open must be refused by the in-flight budget"
+        "the fifth ceiling-claiming open must be refused by the in-flight budget"
     );
 }
 
@@ -1611,4 +1647,125 @@ fn streamed_second_final_with_different_totals_is_rejected() {
         .unwrap()
         .expect("frame completes under the first pinned totals");
     assert_eq!(got.data.len(), 160);
+}
+
+/// Production-shaped slice geometry: a 1500-MTU shard payload and the smallest frame ceiling
+/// the QUIC handshake ever negotiates (`max_frame_bytes` is clamped to ≥ 8 MiB there).
+fn prod_slice_config() -> Config {
+    use crate::config::{FecConfig, ProtocolPhase, Role};
+    Config {
+        role: Role::Host,
+        phase: ProtocolPhase::P2Punktfunk,
+        fec: FecConfig {
+            scheme: FecScheme::Gf16,
+            fec_percent: 20,
+            max_data_per_block: 200,
+        },
+        shard_payload: crate::config::mtu1500_shard_payload(),
+        max_frame_bytes: 8 << 20,
+        encrypt: false,
+        key: SessionKey::Aes128Gcm([0u8; 16]),
+        salt: [0u8; 4],
+        loopback_drop_period: 0,
+    }
+}
+
+/// Packetize one streamed AU of `chunks`, each chunk an encoder slice boundary.
+fn streamed_packets_with(
+    cfg: &Config,
+    frame_index: u32,
+    pts_ns: u64,
+    slice: bool,
+    chunks: &[usize],
+) -> (Vec<Vec<u8>>, Vec<u8>) {
+    let coder = coder_for(cfg.fec.scheme);
+    let mut pk = Packetizer::new(cfg);
+    let uf = if slice { USER_FLAG_SLICE_STREAM } else { 0 };
+    let mut au = pk.begin_streamed(pts_ns, uf, Some(frame_index));
+    let (mut pkts, mut src) = (Vec::new(), Vec::new());
+    let sink = |pkts: &mut Vec<Vec<u8>>, h: &PacketHeader, b: &[u8]| {
+        let mut p = Vec::with_capacity(HEADER_LEN + b.len());
+        p.extend_from_slice(h.as_bytes());
+        p.extend_from_slice(b);
+        pkts.push(p);
+    };
+    for (c, &n) in chunks.iter().enumerate() {
+        let data: Vec<u8> = (0..n).map(|i| (c * 57 + i * 131 + 7) as u8).collect();
+        src.extend_from_slice(&data);
+        pk.push_streamed(&mut au, &data, true, coder.as_ref(), |h, b| {
+            sink(&mut pkts, h, b);
+            Ok(())
+        })
+        .unwrap();
+    }
+    pk.finish_streamed(au, coder.as_ref(), |h, b| {
+        sink(&mut pkts, h, b);
+        Ok(())
+    })
+    .unwrap();
+    (pkts, src)
+}
+
+/// An AU whose length is an exact multiple of the shard payload must still reassemble.
+///
+/// Regression: the slice flush drained `pending` to empty, so `finish_streamed` sealed a final
+/// block of one zero-padded FILLER shard. Its derived base (`total_data − 1`) overlapped the
+/// sentinel block flushed a moment earlier, the receiver's retro-validation read that as a lying
+/// header, and the whole AU was destroyed — one frame in every `shard_payload` (~12 s at 120 fps),
+/// each costing a re-anchor freeze and a recovery keyframe.
+#[test]
+fn slice_streamed_exact_shard_multiple_completes() {
+    let cfg = prod_slice_config();
+    let coder = coder_for(FecScheme::Gf16);
+    let payload = cfg.shard_payload;
+    for shards in [16usize, 29, 30, 64] {
+        let (pkts, src) = streamed_packets_with(&cfg, 1, 1000, true, &[shards * payload]);
+        // Whatever the block split, the final block must carry real bytes — never a lone
+        // zero-pad shard sitting on top of the previous block's range.
+        let mut r = Reassembler::new(ReassemblerLimits::from_config(&cfg));
+        let stats = StatsCounters::default();
+        let f = push_all(&mut r, coder.as_ref(), &stats, &pkts)
+            .unwrap_or_else(|| panic!("{shards}-shard AU (exact multiple) must complete"));
+        assert_eq!(f.data, src, "{shards}-shard AU must be byte-identical");
+    }
+    // ...and the sweep around one of them, so an off-by-one in the keep-back can't hide.
+    for extra in 0..3usize {
+        let n = 30 * payload + extra;
+        let (pkts, src) = streamed_packets_with(&cfg, 2, 2000, true, &[n]);
+        let mut r = Reassembler::new(ReassemblerLimits::from_config(&cfg));
+        let stats = StatsCounters::default();
+        let f = push_all(&mut r, coder.as_ref(), &stats, &pkts)
+            .unwrap_or_else(|| panic!("{n}-byte AU must complete"));
+        assert_eq!(f.data, src);
+    }
+}
+
+/// A slice-streamed frame must cost the reassembler its OWN size, not the negotiated ceiling.
+///
+/// Regression: sentinel-opened frames allocated `max_frame_bytes` (8-64 MiB) each. Since the
+/// slice wire makes every ordinary AU sentinel-opened, the in-flight budget
+/// (`IN_FLIGHT_BUF_FACTOR × max_frame_bytes`) was spent after ~3 concurrent frames and every
+/// packet of every further frame was dropped outright — a permanent loss storm on any link with
+/// normal reorder, plus a multi-megabyte zeroing per access unit.
+#[test]
+fn slice_streamed_in_flight_budget_matches_legacy() {
+    let cfg = prod_slice_config();
+    let coder = coder_for(FecScheme::Gf16);
+    // A normal 40 KB access unit, opened but not completed — the shape a link with reorder
+    // holds several of at once.
+    for slice in [false, true] {
+        let mut r = Reassembler::new(ReassemblerLimits::from_config(&cfg));
+        let stats = StatsCounters::default();
+        for i in 0..12u32 {
+            let (pkts, _) = streamed_packets_with(&cfg, i, 1_000_000 * i as u64, slice, &[40_000]);
+            r.push(&pkts[0], coder.as_ref(), &stats).unwrap();
+        }
+        assert_eq!(
+            stats
+                .packets_dropped
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "slice={slice}: 12 ordinary AUs in flight must fit the in-flight budget"
+        );
+    }
 }
