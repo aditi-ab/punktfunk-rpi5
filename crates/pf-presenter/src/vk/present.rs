@@ -40,7 +40,27 @@ impl Presenter {
         // PQ→sRGB pass.
         let frame_pq = match &input {
             FrameInput::Redraw => None,
-            FrameInput::Cpu(_) => Some(false),
+            FrameInput::Cpu(f) => {
+                // The swapchain answer stays `false` (above) — but a PQ stream on this
+                // lane is then shown RAW: no PQ→sRGB pass exists here (the CSC mode-1
+                // tonemap is hardware-lane only; CPU frames are a straight RGBA upload),
+                // so the picture is washed out and the pq-downgrade warn below never
+                // fires. Say so once, or the only trace is an OSD badge. (A process-once
+                // latch, same idiom as the decoders' first-frame layout dumps — the
+                // condition is a property of the lane, not of one Presenter.)
+                if f.color.is_pq() {
+                    use std::sync::atomic::{AtomicBool, Ordering};
+                    static WARNED: AtomicBool = AtomicBool::new(false);
+                    if !WARNED.swap(true, Ordering::Relaxed) {
+                        tracing::warn!(
+                            "HDR10 (PQ) stream on the software-decode lane — it has no \
+                             PQ→sRGB pass, so the picture is shown untonemapped (washed \
+                             out). Hardware decode restores correct colour."
+                        );
+                    }
+                }
+                Some(false)
+            }
             #[cfg(target_os = "linux")]
             FrameInput::Dmabuf(d) => Some(d.color.is_pq()),
             FrameInput::VkFrame(v) => Some(v.color.is_pq()),

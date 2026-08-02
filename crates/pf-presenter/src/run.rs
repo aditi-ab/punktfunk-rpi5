@@ -204,6 +204,11 @@ struct StreamState {
     /// mid-stream re-syncs keep the end-to-end number honest after an NTP step / drift.
     clock_offset: Option<Arc<std::sync::atomic::AtomicI64>>,
     hdr: bool,
+    /// The presented lane was the CPU/software one, where a PQ stream is shown RAW — the
+    /// software path has no tone-map pass at all (the presenter uploads swscale RGBA
+    /// as-is; the CSC mode-1 tonemap is hardware-lane only) — so the OSD badge reads
+    /// `HDR→SDR (raw)` there instead of claiming a tone-map that never ran.
+    hdr_untonemapped: bool,
     // Presenter-side 1 s window (design/stats-unification.md): end-to-end
     // capture→displayed (host-clock corrected) p50+p95, display = decoded→displayed p50.
     win_e2e_us: Vec<u64>,
@@ -308,6 +313,7 @@ impl StreamState {
             latch_grid,
             clock_offset: None,
             hdr: false,
+            hdr_untonemapped: false,
             win_e2e_us: Vec::with_capacity(256),
             win_disp_us: Vec::with_capacity(256),
             win_start: Instant::now(),
@@ -1103,6 +1109,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         &st.presented,
                         st.hdr,
                         presenter.hdr_active(),
+                        st.hdr_untonemapped,
                         st.profile.as_deref(),
                     );
                     if stats_verbosity != StatsVerbosity::Off {
@@ -1115,6 +1122,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                             &st.presented,
                             st.hdr,
                             presenter.hdr_active(),
+                            st.hdr_untonemapped,
                             st.profile.as_deref(),
                         );
                         println!("stats: {}", full.replace('\n', " | "));
@@ -1296,6 +1304,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         // HDR (PQ) pyrowave session presents through the HDR10 path exactly
                         // like the H.26x codecs (design/pyrowave-444-hdr.md Phase 3).
                         st.hdr = f.color.is_pq();
+                        st.hdr_untonemapped = false;
                         match presenter.present(
                             &window,
                             FrameInput::PyroWave(f),
@@ -1323,6 +1332,9 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                     }
                     DecodedImage::Cpu(c) => {
                         st.hdr = c.color.is_pq();
+                        // The software lane shows PQ raw (no tone-map pass exists there)
+                        // — the OSD badge must not claim `HDR→SDR` for it.
+                        st.hdr_untonemapped = true;
                         presenter.present(&window, FrameInput::Cpu(&c), overlay_frame.as_ref())?
                     }
                     #[cfg(target_os = "linux")]
@@ -1330,6 +1342,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         if presenter.supports_dmabuf() && !st.dmabuf_demoted =>
                     {
                         st.hdr = d.color.is_pq();
+                        st.hdr_untonemapped = false;
                         match presenter.present(
                             &window,
                             FrameInput::Dmabuf(d),
@@ -1380,6 +1393,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                     #[cfg(windows)]
                     DecodedImage::D3d11(d) if presenter.supports_d3d11() && !st.dmabuf_demoted => {
                         st.hdr = d.color.is_pq();
+                        st.hdr_untonemapped = false;
                         match presenter.present(
                             &window,
                             FrameInput::D3d11(d),
@@ -1426,6 +1440,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                     // demotion contract as the dmabuf path.
                     DecodedImage::VkFrame(v) if !st.dmabuf_demoted => {
                         st.hdr = v.color.is_pq();
+                        st.hdr_untonemapped = false;
                         match presenter.present(
                             &window,
                             FrameInput::VkFrame(v),
@@ -1910,6 +1925,7 @@ fn bump_stats_tier(
                 &st.presented,
                 st.hdr,
                 presenter.hdr_active(),
+                st.hdr_untonemapped,
                 st.profile.as_deref(),
             ),
             None => String::new(),
@@ -2007,11 +2023,15 @@ const HINT_WITH_PAD: &str = "Click the stream to capture input · Ctrl+Alt+Shift
 ///
 /// The HDR tag is honest about the display path: `HDR` only when the swapchain actually
 /// runs HDR10 (`hdr_display`); a PQ stream tone-mapped onto an SDR surface (no HDR10
-/// format offered, HDR off in the compositor) shows `HDR→SDR` instead.
+/// format offered, HDR off in the compositor) shows `HDR→SDR`; and a PQ stream on the
+/// software-decode lane (`hdr_untonemapped`) shows `HDR→SDR (raw)` — that lane has no
+/// tone-map pass at all, so the washed-out picture is named for what it is rather than
+/// passed off as a tone-map.
 ///
 /// `profile` (the session's settings profile, `None` for the global defaults) closes the
 /// first line at every tier — the cheapest possible answer to "which profile am I on?"
 /// (design/client-settings-profiles.md §5.2).
+#[allow(clippy::too_many_arguments)]
 fn stats_text(
     verbosity: StatsVerbosity,
     mode_line: &str,
@@ -2019,6 +2039,7 @@ fn stats_text(
     p: &PresentedWindow,
     hdr_stream: bool,
     hdr_display: bool,
+    hdr_untonemapped: bool,
     profile: Option<&str>,
 ) -> String {
     let profile_tag = profile.map(|n| format!(" · {n}")).unwrap_or_default();
@@ -2068,6 +2089,7 @@ fn stats_text(
             if s.decoder.is_empty() { "-" } else { s.decoder },
             match (hdr_stream, hdr_display) {
                 (true, true) => " · HDR",
+                (true, false) if hdr_untonemapped => " · HDR→SDR (raw)",
                 (true, false) => " · HDR→SDR",
                 _ => "",
             },
@@ -2380,7 +2402,7 @@ mod tests {
     #[test]
     fn stats_text_tiers() {
         let (s, p) = sample();
-        let text = |v| stats_text(v, "1920×1080@120", &s, &p, true, false, None);
+        let text = |v| stats_text(v, "1920×1080@120", &s, &p, true, false, false, None);
 
         assert_eq!(text(StatsVerbosity::Off), "");
 
@@ -2397,6 +2419,10 @@ mod tests {
 
         let detailed = text(StatsVerbosity::Detailed);
         assert!(detailed.contains("vulkan · HDR→SDR"));
+        assert!(
+            !detailed.contains("(raw)"),
+            "the hardware lane tone-maps — no raw tag"
+        );
         assert!(detailed.contains("host 1.2 · net 0.9 · decode 1.8 · display 1.1 ms"));
         assert!(detailed.contains("host: queue 0.3 · encode 0.5 · xfer 0.1 · pace 0.3 ms"));
         assert!(detailed.contains("lost 3 (0.4%)"));
@@ -2406,6 +2432,32 @@ mod tests {
         );
     }
 
+    /// The honest HDR badges: a PQ stream on the software-decode lane is shown WITHOUT
+    /// tone-mapping (that lane has no PQ→sRGB pass), so its badge must not read as the
+    /// hardware lane's `HDR→SDR` tone-map — and an HDR10 swapchain shows plain `HDR`
+    /// whatever the lane claims (a CPU frame forces the swapchain to SDR anyway).
+    #[test]
+    fn hdr_badge_names_the_untonemapped_cpu_lane() {
+        let (s, p) = sample();
+        let badge = |hdr_display, raw| {
+            stats_text(
+                StatsVerbosity::Detailed,
+                "m",
+                &s,
+                &p,
+                true,
+                hdr_display,
+                raw,
+                None,
+            )
+        };
+        assert!(badge(false, true).contains(" · HDR→SDR (raw)"));
+        assert!(!badge(false, false).contains("(raw)"));
+        assert!(badge(false, false).contains(" · HDR→SDR"));
+        assert!(badge(true, false).contains(" · HDR"));
+        assert!(!badge(true, false).contains("HDR→SDR"));
+    }
+
     /// Detailed shows the negotiated encoder target next to the measured rate — the
     /// figure whose absence let the settings-drop bug ship four releases — tagged
     /// `(auto)` when the ABR owns it, plus the honest chroma tag when 4:4:4 was asked.
@@ -2413,7 +2465,7 @@ mod tests {
     fn detailed_shows_target_and_chroma_resolution() {
         let (mut s, p) = sample();
         let line1 = |s: &Stats, v| {
-            stats_text(v, "m", s, &p, false, false, None)
+            stats_text(v, "m", s, &p, false, false, false, None)
                 .lines()
                 .next()
                 .unwrap()
@@ -2446,7 +2498,7 @@ mod tests {
     #[test]
     fn stats_text_mic_line() {
         let (mut s, p) = sample();
-        let text = |s: &Stats, v| stats_text(v, "m", s, &p, false, false, None);
+        let text = |s: &Stats, v| stats_text(v, "m", s, &p, false, false, false, None);
         assert!(
             !text(&s, StatsVerbosity::Detailed).contains("mic"),
             "no mic line while the mic is off"
@@ -2473,7 +2525,16 @@ mod tests {
         s.lost = 0;
         let p = PresentedWindow::default();
         assert_eq!(
-            stats_text(StatsVerbosity::Compact, "m", &s, &p, false, false, None),
+            stats_text(
+                StatsVerbosity::Compact,
+                "m",
+                &s,
+                &p,
+                false,
+                false,
+                false,
+                None
+            ),
             "120 fps · 24 Mb/s"
         );
     }
@@ -2491,6 +2552,7 @@ mod tests {
                 &p,
                 false,
                 false,
+                false,
                 Some("Game")
             ),
             "120 fps · 6.4 ms · 24 Mb/s · lost 3 · Game"
@@ -2500,6 +2562,7 @@ mod tests {
             "1920×1080@120",
             &s,
             &p,
+            false,
             false,
             false,
             Some("Work"),
@@ -2515,13 +2578,22 @@ mod tests {
             &p,
             true,
             true,
+            false,
             Some("Work"),
         );
         assert!(detailed.lines().next().unwrap().ends_with("· HDR · Work"));
         // No profile → the line is exactly what it always was.
-        assert!(
-            !stats_text(StatsVerbosity::Normal, "m", &s, &p, false, false, None).contains(" ·  ")
-        );
+        assert!(!stats_text(
+            StatsVerbosity::Normal,
+            "m",
+            &s,
+            &p,
+            false,
+            false,
+            false,
+            None
+        )
+        .contains(" ·  "));
     }
 
     #[test]
