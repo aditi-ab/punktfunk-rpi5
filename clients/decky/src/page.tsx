@@ -334,8 +334,14 @@ const HostsTab: FC<{
   </div>
 );
 
+// NOT `tabScroll`: the settings screen is a SidebarNavigation, which lays out its own rail +
+// content pane and scrolls the pane itself. Wrapping it in an outer scroll area would give it an
+// indefinite height to fill, collapsing the rail — so this pane only hands it the full height and
+// keeps its hands off the overflow. The footer inset lives inside the pages instead.
+const settingsPane: CSSProperties = { height: "100%", overflow: "hidden" };
+
 const SettingsTab: FC = () => (
-  <div style={tabScroll}>
+  <div style={settingsPane}>
     <SettingsSection />
   </div>
 );

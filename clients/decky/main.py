@@ -21,6 +21,10 @@ The backend's jobs are the things Steam can't do:
   the frontend so it can create/point the Steam shortcut.
 * **get_settings() / set_settings()** — read/write the flatpak client's stream settings JSON
   (resolution / bitrate / gamepad), so the Deck UI configures the stream the client reads.
+  ``set_settings`` MERGES onto the file: it is shared with the desktop client and the console.
+* **list_devices() / refresh_devices()** — the GPUs and audio endpoints the settings tab's
+  device pickers offer, read from the session binary (``--list-adapters`` / ``--list-audio``)
+  and cached, since enumerating them costs a Vulkan + PipeWire init.
 * **kill_stream()** — force-stop a wedged stream (``flatpak kill``).
 * **check_update()** — report pending updates for BOTH the plugin and the client. The plugin's
   comes from the registry's per-channel ``manifest.json`` (the frontend then drives Decky's own
@@ -343,6 +347,9 @@ def _flatpak() -> str | None:
 # settings in the same ~/.config/punktfunk (the flatpak's sandbox HOME resolves to the real
 # home), so nothing else in this file has to care which one answered.
 NATIVE_BIN = "punktfunk-client"
+# The Vulkan session binary the shell execs to stream — and the only thing that can enumerate
+# this device's GPUs and audio endpoints for the settings pickers.
+SESSION_BIN = "punktfunk-session"
 
 # Prefixes to try when PATH doesn't have it. The Decky backend runs with a minimal PATH, and
 # SteamOS's read-only /usr pushes native installs into a sysext or the user's own prefix.
@@ -396,6 +403,25 @@ def _client_argv() -> list[str] | None:
     if _flatpak_installed():
         return [_flatpak(), "run", "--arch=x86_64", APP_ID]
     return [native] if native else None
+
+
+def _session_argv() -> list[str] | None:
+    """The argv PREFIX that runs the SESSION binary headlessly, or None when it isn't there.
+
+    The device enumerations the settings pickers need (`--list-adapters`, `--list-audio`) live on
+    `punktfunk-session`, not on the client: the GTK shell deliberately links no Vulkan itself and
+    shells out to the session for exactly the same two lists (clients/linux/src/app.rs). The
+    flatpak installs both binaries into /app/bin, so `--command=` picks the other one; a native
+    install puts them in the same bindir, so the session is the client's sibling.
+    """
+    prefix = _client_argv()
+    if not prefix:
+        return None
+    if prefix[0] == _flatpak():
+        # `flatpak run --command=<bin> <app>` — the app id must stay LAST.
+        return [*prefix[:-1], f"--command={SESSION_BIN}", prefix[-1]]
+    sibling = Path(prefix[0]).with_name(SESSION_BIN)
+    return [str(sibling)] if sibling.exists() else None
 
 
 def _client_is_flatpak() -> bool:
@@ -511,12 +537,74 @@ async def _run_client(client_args: list[str], timeout: float = 20.0) -> tuple[in
         return -1, "", ""
 
 
+def _parse_audio_endpoints(out: str) -> tuple[list[dict], list[dict]]:
+    """Split `punktfunk-session --list-audio` into ``(sinks, sources)``.
+
+    Its format is one endpoint per line, ``sink|source<TAB>node.name<TAB>description``. The
+    node.name is what gets STORED (it is the stable id the client resolves against), so a line
+    without one is unusable and dropped; a missing description falls back to the name rather than
+    rendering a picker entry with no label. Anything else on the line is ignored, so an extra
+    trailing column in a future client can't break this.
+    """
+    sinks: list[dict] = []
+    sources: list[dict] = []
+    for line in out.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 3 or not parts[1].strip():
+            continue
+        kind, name, description = parts[0].strip(), parts[1].strip(), parts[2].strip()
+        entry = {"name": name, "description": description or name}
+        if kind == "sink":
+            sinks.append(entry)
+        elif kind == "source":
+            sources.append(entry)
+    return sinks, sources
+
+
+async def _run_session(session_args: list[str], timeout: float = 25.0) -> tuple[int, str]:
+    """Run the SESSION binary headlessly, returning ``(returncode, stdout)``; ``(-1, "")`` when
+    it isn't installed or the call errors/times out.
+
+    Only ever used for the two read-only device enumerations — the launch path goes through the
+    Steam shortcut and the wrapper script, never through here. The timeout is generous because
+    `--list-adapters` initialises Vulkan on a cold flatpak."""
+    prefix = _session_argv()
+    if not prefix:
+        return -1, ""
+    proc = None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *prefix, *session_args,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+            env=_flatpak_env(),
+        )
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        rc = proc.returncode if proc.returncode is not None else -1
+        return rc, (out or b"").decode("utf-8", "replace")
+    except asyncio.TimeoutError:
+        decky.logger.warning("session %s timed out", " ".join(session_args))
+        if proc:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+        return -1, ""
+    except Exception:  # noqa: BLE001
+        decky.logger.exception("session %s failed", " ".join(session_args))
+        return -1, ""
+
+
 # The QAM panel and the full page each mount their own hosts view, and Gaming Mode remounts the
 # QAM often — every mount calls list_hosts, which spawns a flatpak cold-start plus a reachability
 # probe. Cache the last result briefly so back-to-back opens reuse it instead of re-probing; any
 # mutation (add/edit/forget/reset/pair) invalidates it so a change shows up immediately.
 _HOSTS_TTL_S = 12.0
 _hosts_cache: dict = {"at": 0.0, "probed": None, "data": None}
+
+# The settings tab's device lists (GPUs / audio endpoints). No TTL: this is hardware, and reading
+# it costs a Vulkan + PipeWire init. Held for the life of the plugin backend; `refresh_devices`
+# clears it for the user who just plugged a headset in.
+_devices_cache: dict = {"data": None}
 
 
 def _invalidate_hosts_cache() -> None:
@@ -1078,6 +1166,49 @@ class Plugin:
         except OSError as exc:
             decky.logger.exception("could not write settings")
             return {"ok": False, "error": str(exc)}
+
+    async def list_devices(self) -> dict:
+        """GPUs + audio endpoints for the settings tab's device pickers.
+
+        Two subprocesses that initialise Vulkan and PipeWire, so the result is cached for the
+        Decky session: hardware doesn't come and go often enough to justify paying that on every
+        remount of the page, and a stale entry is harmless — a picked device that has since
+        vanished falls back to the OS default in the client anyway. `refresh_devices` clears it.
+
+        Best-effort in the same way every other client call here is: no session binary (an old
+        flatpak that predates the two-binary split, or a native install missing its sibling) just
+        means empty lists and `ok: false`, which the UI shows as "couldn't read" rather than as
+        "you have no devices".
+        """
+        if _devices_cache["data"] is not None:
+            return _devices_cache["data"]
+
+        adapters: list[str] = []
+        sinks: list[dict] = []
+        sources: list[dict] = []
+        rc_a, out_a = await _run_session(["--list-adapters"])
+        if rc_a == 0:
+            adapters = [ln.strip() for ln in out_a.splitlines() if ln.strip()]
+        rc_d, out_d = await _run_session(["--list-audio"])
+        if rc_d == 0:
+            sinks, sources = _parse_audio_endpoints(out_d)
+
+        result = {
+            "ok": rc_a == 0 or rc_d == 0,
+            "adapters": adapters,
+            "sinks": sinks,
+            "sources": sources,
+        }
+        # Only a run that actually answered is worth remembering — caching a failure would make
+        # a client installed after the page was first opened stay invisible until a Decky restart.
+        if result["ok"]:
+            _devices_cache["data"] = result
+        return result
+
+    async def refresh_devices(self) -> dict:
+        """Drop the cached enumeration and read it again (a headset was just plugged in)."""
+        _devices_cache["data"] = None
+        return await self.list_devices()
 
     # ---- Shared known-hosts store (the SAME file the desktop client reads/writes) ----
 

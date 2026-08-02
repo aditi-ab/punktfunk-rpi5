@@ -101,27 +101,62 @@ export interface RunnerInfo {
   client_bin?: string;
 }
 
-// The slice of the flatpak client's settings JSON this UI surfaces. The file can hold more
-// keys (decoder, … set from the desktop client's own UI) — they round-trip untouched
-// because get_settings returns the whole parsed file and patches are object spreads.
+// The flatpak client's settings JSON — the SAME `client-gtk-settings.json` the desktop client
+// and the console's settings screen own, so a value changed in any of them shows in the others.
+//
+// Every field the client's `Settings` struct persists is modelled here EXCEPT the four that
+// cannot be answered from a plugin backend or aren't settings at all:
+//   • `forward_pad`   — which physical pad is player 1. Needs SDL's live device list, which only
+//                       the client process has; there is no CLI that enumerates pads.
+//   • `last_window_w/h` — the session's remembered window size, written BY the client, not a
+//                       preference anyone sets.
+// Both round-trip untouched: get_settings returns the whole parsed file, patches are object
+// spreads, and set_settings merges onto what's on disk.
+//
+// Optional (`?`) marks a key the client writes with a serde `default`, so a store written before
+// that key existed simply lacks it. Read those through the same fallback the client uses —
+// `?? true` for the default-on ones, never `!!` — or a pre-existing file reads as "off" here
+// while the stream runs with it on.
 export interface StreamSettings {
+  // ---- Stream mode ----
   width: number; // 0 = native
   height: number; // 0 = native
   refresh_hz: number; // 0 = native
   render_scale?: number; // render-resolution multiplier; 1.0 = native (absent in pre-scale files)
   bitrate_kbps: number; // 0 = host default
-  codec?: string; // "auto" | "hevc" | "h264" | "av1" — soft preference (absent in pre-codec files)
+  compositor: string; // "auto" | "kwin" | "wlroots" | "mutter" | "gamescope"
+  // Stream mode follows the session window instead of width/height, renegotiating on resize.
+  // Overrides width/height while on; degenerates to the display's native mode on fullscreen.
+  match_window?: boolean;
+
+  // ---- Video ----
+  codec?: string; // "auto" | "hevc" | "h264" | "av1" | "pyrowave" (absent in pre-codec files)
+  decoder?: string; // "auto" | "vulkan" | "vaapi" | "software"
+  hdr_enabled?: boolean; // default ON — advertise 10-bit/HDR10
+  enable_444?: boolean; // default off — ask for full chroma
+  adapter?: string; // decode/present GPU by marketing name; "" = automatic
+
+  // ---- Audio ----
+  audio_channels?: number; // 2 (stereo) | 6 (5.1) | 8 (7.1)
+  speaker_device?: string; // PipeWire node.name for playback; "" = system default
+  mic_enabled: boolean;
+  mic_device?: string; // PipeWire node.name for capture; "" = system default
+  echo_cancel?: boolean; // default ON; only meaningful while mic_enabled
+
+  // ---- Controllers ----
   gamepad: string; // "auto" | "xbox360" | "xboxone" | "dualsense" | "dualshock4" | "steamdeck"
   // Forward this device's controllers at all. Absent in pre-forwarding files, where the
   // client's own serde default (true) applies — so `?? true` at every read, never `!!`.
   gamepad_forwarding?: boolean;
-  compositor: string; // "auto" | "kwin" | "wlroots" | "mutter" | "gamescope"
-  // Round-trips only — deliberately NOT offered as a row here. It decides whether the session
-  // grabs the keyboard so Alt+Tab/Super reach the host, and Game Mode is gamescope: it has no
-  // compositor shortcuts to inhibit and hands the focused window every key already. A toggle
-  // here would be a dead one. The desktop client's row still edits this same file.
+
+  // ---- Touchscreen, mouse & keyboard ----
+  touch_mode?: string; // "trackpad" | "pointer" | "touch"
+  mouse_mode?: string; // "capture" | "desktop"
+  invert_scroll?: boolean;
+  // Whether the session grabs the keyboard so Alt+Tab/Super reach the host.
   inhibit_shortcuts: boolean;
-  mic_enabled: boolean;
+
+  // ---- Interface & behaviour ----
   // Stats-overlay tier: "off" | "compact" | "normal" | "detailed". Absent in a pre-tier file,
   // which resolves through `show_stats` — read both the way the client's
   // `Settings::stats_verbosity` does, and write both the way `set_stats_verbosity` does.
@@ -129,6 +164,26 @@ export interface StreamSettings {
   // The legacy on/off the tier supersedes; kept written in sync so a client that predates the
   // tiers still honours an Off chosen here.
   show_stats?: boolean;
+  fullscreen_on_stream?: boolean;
+  auto_wake?: boolean; // default ON — Wake-on-LAN a sleeping host before connecting
+  library_enabled?: boolean; // the CLIENT's own library browser (this plugin has its own)
+}
+
+// One audio endpoint from the client's enumeration: the stable id that gets stored, plus the
+// human name to show.
+export interface AudioDevice {
+  name: string; // PipeWire node.name — what `speaker_device` / `mic_device` store
+  description: string; // human label ("Steam Deck Speakers")
+}
+
+// What the device pickers need, read from the session binary (`--list-adapters` / `--list-audio`).
+// `ok: false` = the session binary couldn't be run or failed; every list is then empty and the
+// pickers stay on their stored value rather than pretending the device is gone.
+export interface DeviceLists {
+  ok: boolean;
+  adapters: string[]; // Vulkan physical devices, discrete first
+  sinks: AudioDevice[]; // playback endpoints
+  sources: AudioDevice[]; // capture endpoints
 }
 
 export interface UpdateInfo {
@@ -195,6 +250,11 @@ export const getSettings = callable<[], StreamSettings>("get_settings");
 export const setSettings = callable<[settings: StreamSettings], { ok: boolean }>(
   "set_settings",
 );
+// GPUs + audio endpoints for the device pickers. Costs a subprocess that initialises Vulkan and
+// PipeWire, so it is called ONCE when the settings tab mounts and never on the launch path.
+export const listDevices = callable<[], DeviceLists>("list_devices");
+// The same, bypassing the backend's cache — for the user who just plugged in a headset.
+export const refreshDevices = callable<[], DeviceLists>("refresh_devices");
 export const killStream = callable<[], { ok: boolean }>("kill_stream");
 // Send a Wake-on-LAN magic packet to a saved host (headless flatpak --wake) so a sleeping host is
 // up by the time the stream connects. The MAC is looked up from the flatpak client's own
