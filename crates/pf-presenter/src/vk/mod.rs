@@ -33,7 +33,7 @@ mod reconfig;
 mod resources;
 mod setup;
 
-pub use setup::list_adapters;
+pub use setup::{list_adapters, PresentPref};
 
 /// One presenter iteration's video input.
 pub enum FrameInput<'a> {
@@ -247,8 +247,73 @@ impl Presenter {
     /// (the presenter itself never sees them). No-op when timing is inactive.
     pub(crate) fn note_presented(&mut self, pts_ns: u64, decoded_ns: u64) {
         if let (Some(t), Some((sc, id))) = (&self.present_timer, self.last_presented.take()) {
-            t.enqueue(sc, id, pts_ns, decoded_ns);
+            // The submit stamp: `present()` already returned, so "now" is within the
+            // present-call tail — the pace/latch split point.
+            t.enqueue(
+                sc,
+                id,
+                pts_ns,
+                decoded_ns,
+                pf_client_core::session::now_ns(),
+            );
         }
+    }
+
+    /// Undisplayed id-carrying presents in flight (0 when timing is inactive) — the
+    /// FIFO glass gate's budget count.
+    pub(crate) fn presents_outstanding(&self) -> usize {
+        self.present_timer.as_ref().map_or(0, |t| t.outstanding())
+    }
+
+    /// Install the run loop's wake for present completions (an SDL event push). No-op
+    /// without present timing — there is nothing to wake on then.
+    pub(crate) fn set_present_wake(&self, cb: Box<dyn Fn() + Send>) {
+        if let Some(t) = &self.present_timer {
+            t.set_wake(cb);
+        }
+    }
+
+    /// The live swapchain present mode, for the stats overlay: a mode is picked from
+    /// what the surface actually offers, so the requested one and this can differ (a
+    /// MAILBOX request lands on FIFO wherever the driver has no mailbox — AMD's Windows
+    /// driver, notably). Showing it is what makes that visible instead of puzzling.
+    pub(crate) fn present_mode_name(&self) -> &'static str {
+        match self.present_mode {
+            vk::PresentModeKHR::MAILBOX => "mailbox",
+            vk::PresentModeKHR::FIFO => "fifo",
+            vk::PresentModeKHR::FIFO_RELAXED => "fifo-relaxed",
+            vk::PresentModeKHR::IMMEDIATE => "immediate",
+            setup::fifo_latest_ready::MODE => "fifo-latest-ready",
+            _ => "other",
+        }
+    }
+
+    /// The active present mode QUEUES presents — the only modes where the swapchain
+    /// itself can become a standing queue, and so the only ones the glass gate governs.
+    ///
+    /// MAILBOX and IMMEDIATE replace/flip and never queue. Nor does
+    /// `FIFO_LATEST_READY`, which retires stale images in the driver: gating on top of it
+    /// would hold frames back to emulate something the presentation engine is already
+    /// doing, paying the serialisation twice.
+    pub(crate) fn needs_glass_gate(&self) -> bool {
+        matches!(
+            self.present_mode,
+            vk::PresentModeKHR::FIFO | vk::PresentModeKHR::FIFO_RELAXED
+        )
+    }
+
+    /// The active present mode shows images ON THE VBLANK GRID — the premise the VRR
+    /// cadence probe rests on ("with VRR off, a present waits for vblank"). The whole
+    /// FIFO family qualifies, `FIFO_LATEST_READY` included: it drops stale images but
+    /// still presents on the refresh boundary. MAILBOX/IMMEDIATE do not, and under them
+    /// the probe reports Unknown rather than calling every session VRR.
+    pub(crate) fn vblank_locked(&self) -> bool {
+        matches!(
+            self.present_mode,
+            vk::PresentModeKHR::FIFO
+                | vk::PresentModeKHR::FIFO_RELAXED
+                | setup::fifo_latest_ready::MODE
+        )
     }
 
     /// Take the window's completed on-glass samples (empty when timing is inactive).

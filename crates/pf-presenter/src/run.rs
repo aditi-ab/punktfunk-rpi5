@@ -18,12 +18,15 @@
 
 use crate::input::{Capture, FingerPhase};
 use crate::overlay::{FrameCtx, Overlay, OverlayAction, OverlayFrame, SessionPhase};
+use crate::present_pace::{
+    Cadence, CadenceProbe, FrameStore, LatchClock, PresentGate, MARGIN_MAX_NS, MARGIN_STEP_NS,
+};
 use crate::touch::Abs;
 use crate::vk::{FrameInput, Presenter};
 use anyhow::{Context as _, Result};
 use pf_client_core::gamepad::GamepadService;
 use pf_client_core::session::{self, SessionEvent, SessionHandle, SessionParams, Stats};
-use pf_client_core::trust::{MouseMode, StatsVerbosity, TouchMode};
+use pf_client_core::trust::{MouseMode, PresentPriority, StatsVerbosity, TouchMode};
 use pf_client_core::video::VulkanDecodeDevice;
 use pf_client_core::video::{DecodedFrame, DecodedImage};
 use punktfunk_core::client::NativeClient;
@@ -63,6 +66,20 @@ pub struct SessionOpts {
     /// work profile that streams on a second screen and still Alt-Tabs here. Never applies
     /// under the `desktop` mouse model, which is something you Alt-Tab *away* from.
     pub inhibit_shortcuts: bool,
+    /// Presentation intent ([`Settings::present_priority`] resolved): `Latency` keeps the
+    /// shipped arrival pacing (newest-wins, present the moment a frame can go out);
+    /// `Smooth { buffer }` runs the smoothing FIFO drained one frame per latch slot
+    /// (design/desktop-presentation-rebuild.md). `PUNKTFUNK_PRESENTER=arrival` overrides
+    /// the whole engine back to the legacy drain for field A/B without a rebuild.
+    pub present_priority: PresentPriority,
+    /// Tear-free presentation ([`Settings::vsync`], default on). Off asks for a tearing
+    /// present mode for the lowest possible latch — best-effort, and the mode that
+    /// actually took is named in the stats line.
+    pub vsync: bool,
+    /// Let a variable-refresh display follow the stream cadence ([`Settings::allow_vrr`],
+    /// default on) — prefers the present mode that drives VRR panels directly when the
+    /// session starts fullscreen.
+    pub allow_vrr: bool,
     /// Emit the `{"ready":true}` stdout line after the first presented frame.
     pub json_status: bool,
     /// Called once on `Connected` with the host's fingerprint (trust persistence is the
@@ -213,8 +230,47 @@ struct StreamState {
     // capture→displayed (host-clock corrected) p50+p95, display = decoded→displayed p50.
     win_e2e_us: Vec<u64>,
     win_disp_us: Vec<u64>,
+    /// The display stage's two halves (present-timing sessions only): decoded→submit and
+    /// submit→on-glass. See [`PresentedWindow::pace_ms`].
+    win_pace_us: Vec<u64>,
+    win_latch_us: Vec<u64>,
     win_start: Instant,
     presented: PresentedWindow,
+    /// The intent engine (design/desktop-presentation-rebuild.md WP2): the decoded-frame
+    /// store between the wake channel and the present call — a newest-wins slot under
+    /// the latency intent (behaviorally the shipped drain), the smoothing FIFO under
+    /// smoothness. NOTE: a smoothing store holds decoder-pool frames (Vulkan-Video
+    /// AVFrames) up to `buffer` deep on top of the depth-2 wake channels — within pool
+    /// headroom for 1..=3, but any deeper store must revisit pool sizing.
+    store: FrameStore<DecodedFrame>,
+    /// The panel latch grid (present-wait glass stamps; submit-anchored fallback) — the
+    /// smoothness slot clock, and the values published to the host-facing `latch_grid`.
+    clock: LatchClock,
+    /// The FIFO glass budget (one undisplayed present in flight) — inert off FIFO modes
+    /// or without present timing.
+    gate: PresentGate,
+    /// Is variable refresh actually live? Measured from the same on-glass stamps (no
+    /// portable query exists) — see [`CadenceProbe`].
+    cadence: CadenceProbe,
+    /// The DISPLAY MODE's refresh period — the vblank grid presents quantize to when
+    /// VRR is off, and so the cadence probe's reference. Deliberately not the learned
+    /// period (see the probe's call site).
+    mode_period_ns: u64,
+    /// The latch slot the last smoothness present served (one present per slot); 0 =
+    /// none yet.
+    last_target_ns: u64,
+    /// Smoothness slot-pick margin: starts 0 (a fixed lead is pure display tax —
+    /// measured on Android), widens +500 µs per >2-miss window toward 2.5 ms.
+    margin_ns: u64,
+    /// This window's latch misses (a present that reached glass > 1.5 latch periods
+    /// after submit) — the adaptive margin's error signal.
+    win_misses: u32,
+    /// This window's peak undisplayed-presents-in-flight (present timing only).
+    win_out_max: usize,
+    /// One-shot log latch: smoothness was requested but a PyroWave stream collapsed the
+    /// store to latency (its plane-ring retirement assumes the newest-wins hand-off).
+    #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
+    pyro_latency_forced: bool,
     // Hardware-path health: a failure streak (or a device with no import support at
     // all) demotes the decoder to software via the shared flag — once per session.
     dmabuf_demoted: bool,
@@ -279,6 +335,8 @@ impl StreamState {
         params: SessionParams,
         force_software: Arc<AtomicBool>,
         wake: sdl3::event::EventSender,
+        priority: PresentPriority,
+        native_refresh_hz: u32,
     ) -> StreamState {
         let profile = params.profile.clone();
         // The presenter's half of phase-locked capture: it writes the latch grid the
@@ -316,8 +374,21 @@ impl StreamState {
             hdr_untonemapped: false,
             win_e2e_us: Vec::with_capacity(256),
             win_disp_us: Vec::with_capacity(256),
+            win_pace_us: Vec::with_capacity(256),
+            win_latch_us: Vec::with_capacity(256),
             win_start: Instant::now(),
             presented: PresentedWindow::default(),
+            store: FrameStore::new(usize::from(priority.fifo_capacity())),
+            clock: LatchClock::new(native_refresh_hz),
+            gate: PresentGate::default(),
+            cadence: CadenceProbe::new(),
+            mode_period_ns: 1_000_000_000 / u64::from(native_refresh_hz.max(1)),
+            last_target_ns: 0,
+            margin_ns: 0,
+            win_misses: 0,
+            win_out_max: 0,
+            #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
+            pyro_latency_forced: false,
             dmabuf_demoted: false,
             #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
             pyro_present_warned: false,
@@ -355,6 +426,25 @@ impl StreamState {
             c.disconnect_quit();
         }
         self.handle.stop.store(true, Ordering::SeqCst);
+    }
+
+    /// The event-loop wait bound: a smoothness stream with buffered frames sleeps only
+    /// to its next latch-slot deadline; everything else keeps the 15 ms housekeeping
+    /// tick (frames, input, and present completions all wake the loop early anyway).
+    fn wake_timeout(&self) -> Duration {
+        const TICK: Duration = Duration::from_millis(15);
+        if !self.store.is_smoothing() || self.store.is_empty() {
+            return TICK;
+        }
+        let now = session::now_ns();
+        let mut target = self
+            .clock
+            .next_slot_after(now.saturating_add(self.margin_ns));
+        if target == self.last_target_ns {
+            // This slot is already served — the next boundary is the deadline.
+            target += self.clock.period_ns();
+        }
+        Duration::from_nanos(target.saturating_sub(now)).clamp(Duration::from_millis(1), TICK)
     }
 }
 
@@ -438,9 +528,43 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
     let instance_exts = window
         .vulkan_instance_extensions()
         .map_err(|e| anyhow::anyhow!("vulkan instance extensions: {e}"))?;
-    let mut presenter = Presenter::new(&window, &instance_exts).context("vulkan presenter")?;
+    let mut presenter = Presenter::new(
+        &window,
+        &instance_exts,
+        crate::vk::PresentPref {
+            vsync: opts.vsync,
+            allow_vrr: opts.allow_vrr,
+            fullscreen: opts.fullscreen,
+            // `vrr_fifo_opt_in` (env) and `fifo_latest_ready` (device capability) are
+            // both resolved inside `Presenter::new` — the swapchain owns those, so every
+            // caller gets the same answer. `..Default` keeps this site from breaking each
+            // time the struct learns another one.
+            ..Default::default()
+        },
+    )
+    .context("vulkan presenter")?;
     // A valid black frame immediately — the window is honest while the connect runs.
     presenter.present(&window, FrameInput::Redraw, None)?;
+
+    // `PUNKTFUNK_PRESENTER=arrival` — the legacy drain, the intent engine's field-A/B
+    // kill switch (the Android sysprop pattern: no rebuild to bisect a pacing suspicion).
+    let arrival_override = std::env::var("PUNKTFUNK_PRESENTER").ok().as_deref() == Some("arrival");
+    let present_priority = if arrival_override {
+        tracing::info!("PUNKTFUNK_PRESENTER=arrival — presentation pacing disabled");
+        PresentPriority::Latency
+    } else {
+        opts.present_priority
+    };
+    let pacing_active = !arrival_override;
+    let present_debug = std::env::var_os("PUNKTFUNK_PRESENT_DEBUG").is_some();
+    // Present completions wake the loop exactly like decoded frames: a glass-gate
+    // reopen or a smoothness slot must not wait out the event timeout.
+    {
+        let sender = events.event_sender();
+        presenter.set_present_wake(Box::new(move || {
+            let _ = sender.push_custom_event(FrameWake);
+        }));
+    }
     // Browse mode is "ready" the moment the library window presents — there may never be
     // a stream. (Single mode announces on the first VIDEO frame instead, further down, so
     // a shell only yields to a window that actually shows the stream.)
@@ -517,6 +641,8 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                 params,
                 force_software,
                 events.event_sender(),
+                present_priority,
+                native.refresh_hz,
             ))
         }
         ModeCtl::Browse(_) => None,
@@ -544,8 +670,11 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
         // forwarder's FrameWake) all land in this one queue, so the loop wakes exactly
         // when there is work — a short-timeout poll here burned a full core (measured;
         // the timeout only bounds stop-flag/pump-tick latency now). In browse-idle the
-        // per-iteration FIFO present vsync-throttles the loop anyway.
-        let timeout = Duration::from_millis(15);
+        // per-iteration FIFO present vsync-throttles the loop anyway. A smoothness
+        // stream tightens the bound to its next latch-slot deadline.
+        let timeout = stream
+            .as_ref()
+            .map_or(Duration::from_millis(15), |st| st.wake_timeout());
         let first = event_pump.wait_event_timeout(timeout);
         let mut queued: Vec<Event> = Vec::new();
         if let Some(e) = first {
@@ -606,6 +735,29 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                             if let Some(st) = stream.as_mut() {
                                 st.resize_pending = Some(Instant::now());
                             }
+                        }
+                    }
+                    // Dragged to another monitor (or the mode changed under us): the
+                    // latch grid and the VRR verdict both belong to the OLD panel. The
+                    // refresh rate used to be read once at startup and never revisited,
+                    // so a 60 Hz-seeded clock would keep pacing a 144 Hz panel.
+                    WindowEvent::DisplayChanged(..) => {
+                        let hz = window
+                            .get_display()
+                            .and_then(|d| d.get_mode())
+                            .map(|m| m.refresh_rate.round().max(0.0) as u32)
+                            .unwrap_or(0);
+                        if let Some(st) = stream.as_mut() {
+                            if hz > 0 {
+                                st.clock = LatchClock::new(hz);
+                                st.mode_period_ns = 1_000_000_000 / u64::from(hz);
+                            }
+                            st.cadence.reset();
+                            st.last_target_ns = 0;
+                            tracing::info!(
+                                refresh_hz = hz,
+                                "display changed — relearning the latch grid"
+                            );
                         }
                     }
                     WindowEvent::Exposed => {
@@ -1032,6 +1184,8 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                                     *params,
                                     force_software,
                                     events.event_sender(),
+                                    present_priority,
+                                    native.refresh_hz,
                                 ));
                                 if let Some(o) = overlay.as_mut() {
                                     o.session_phase(SessionPhase::Connecting);
@@ -1279,11 +1433,148 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                     presenter.set_hdr_metadata(m);
                 }
             }
-            let mut newest: Option<DecodedFrame> = None;
-            while let Ok(f) = st.frames.try_recv() {
-                newest = Some(f);
+            // Present-wait completions drive the latch clock, the glass gate, and the
+            // host-facing grid — drained every pass (a 1 Hz batch would starve all
+            // three; the waiter's SDL wake pairs with this so completions never wait
+            // out the event timeout).
+            if presenter.present_timing_active() {
+                let samples = presenter.take_presented_samples();
+                if !samples.is_empty() {
+                    let clock_offset_ns = st
+                        .clock_offset
+                        .as_ref()
+                        .map_or(0, |o| o.load(Ordering::Relaxed));
+                    let period = st.clock.period_ns();
+                    let mut stamps = Vec::with_capacity(samples.len());
+                    for s in &samples {
+                        let e2e = (s.displayed_ns as i128 + clock_offset_ns as i128
+                            - s.pts_ns as i128)
+                            .max(0) as u64;
+                        if e2e > 0 && e2e < 10_000_000_000 {
+                            st.win_e2e_us.push(e2e / 1000);
+                        }
+                        st.win_disp_us
+                            .push(s.displayed_ns.saturating_sub(s.decoded_ns) / 1000);
+                        // The display split (WP4): our pipeline vs the vsync latch. Only
+                        // meaningful with true glass stamps, which is exactly when this
+                        // branch runs.
+                        st.win_pace_us
+                            .push(s.submitted_ns.saturating_sub(s.decoded_ns) / 1000);
+                        st.win_latch_us
+                            .push(s.displayed_ns.saturating_sub(s.submitted_ns) / 1000);
+                        // Latch miss (the adaptive margin's error signal): glass later
+                        // than one panel period past submit, PLUS the lead we already
+                        // applied — i.e. the slot we aimed at was missed. Measuring the
+                        // real latch rather than the store's own evictions is the
+                        // Android 0.23.0 correction: policy drops happen whenever the
+                        // stream out-runs the panel and say nothing about the latch, and
+                        // widening on them walked the margin to its ceiling on healthy
+                        // devices, re-imposing the very display latency it had removed.
+                        if st.store.is_smoothing()
+                            && s.displayed_ns.saturating_sub(s.submitted_ns) > period + st.margin_ns
+                        {
+                            st.win_misses += 1;
+                        }
+                        stamps.push(s.displayed_ns);
+                    }
+                    st.clock.note_batch(&stamps);
+                    // Same stamps answer "is VRR live" — the panel either quantizes them
+                    // to its grid or follows our cadence. Evidence only counts from a
+                    // window whose presents were flowing normally: a distressed pipeline
+                    // (stale force-opens) smears spacings for reasons that have nothing
+                    // to do with the panel, and on glass that flapped the verdict.
+                    //
+                    // ⚠ The reference is the DISPLAY MODE's period, NOT the learned one.
+                    // The learned grid comes from our own present spacings, and a stream
+                    // running below panel rate only ever produces multiples ≥ its frame
+                    // interval — so the learner adopts our cadence as "the grid" and every
+                    // delta then looks on-grid by construction. Measured on .21
+                    // (2026-08-02): a 40-50 fps stream on a 60 Hz panel learned 18-22 ms
+                    // and the probe reported VRR on a display with VRR provably disabled.
+                    // The vblank grid is the mode's refresh; that is what presents
+                    // quantize to when VRR is off.
+                    //
+                    // ⚠⚠ And it is only asked under a FIFO-family mode. The whole test
+                    // rests on "with VRR off, a present waits for vblank" — MAILBOX and
+                    // IMMEDIATE deliberately break that, so their stamps are never
+                    // grid-quantized and the probe would call every mailbox session VRR.
+                    // Measured on .21: same panel, same second — fifo read `no`
+                    // (correct, period 16.56 ms), mailbox read `yes` (wrong). Outside
+                    // FIFO the honest answer is "cannot tell", i.e. Unknown.
+                    let healthy = st.presented.forced == 0;
+                    if presenter.vblank_locked() {
+                        st.cadence.note(&stamps, st.mode_period_ns, healthy);
+                    }
+                    // Phase-locked capture, the presenter's half: publish the grid the
+                    // local clock just learned — a recent TRUE on-glass instant plus
+                    // the latch period — for the pump's ~1 Hz PhaseReport. One learner
+                    // feeds both, so the report and the scheduler cannot disagree.
+                    if let Some(grid) = &st.latch_grid {
+                        grid.period_ns
+                            .store(st.clock.period_ns(), Ordering::Relaxed);
+                        grid.anchor_ns
+                            .store(st.clock.anchor_ns(), Ordering::Relaxed);
+                    }
+                }
             }
-            if let Some(f) = newest {
+
+            // Intake into the intent store: a newest-wins slot under latency (the
+            // shipped drain, now with displacement counters), the smoothing FIFO under
+            // smoothness. PyroWave collapses smoothness to latency for the stream: its
+            // plane-ring retirement accounting assumes the newest-wins hand-off
+            // (`video_pyrowave::RETIRE_HANDOVERS`), and all-intra frames make
+            // buffering moot anyway.
+            while let Ok(f) = st.frames.try_recv() {
+                #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
+                if st.store.is_smoothing() && matches!(f.image, DecodedImage::PyroWave(_)) {
+                    st.store.force_latency();
+                    if !st.pyro_latency_forced {
+                        st.pyro_latency_forced = true;
+                        tracing::info!(
+                            "PyroWave stream — smoothness buffering does not apply \
+                             (latency pacing)"
+                        );
+                    }
+                }
+                st.store.submit(f);
+            }
+
+            // One frame out, by intent: latency takes the newest whenever the glass
+            // gate allows; smoothness serves at most one frame per latch slot (the
+            // preroll/underflow behavior lives in the store).
+            let now_ns = session::now_ns();
+            let mut slot_target = 0u64;
+            let mut to_present = if st.store.is_smoothing() {
+                let target = st
+                    .clock
+                    .next_slot_after(now_ns.saturating_add(st.margin_ns));
+                if target != st.last_target_ns {
+                    slot_target = target;
+                    st.store.take()
+                } else {
+                    None
+                }
+            } else {
+                st.store.take()
+            };
+            // The FIFO glass budget: one undisplayed present in flight, so the
+            // swapchain's own FIFO can never become a standing queue (a measured
+            // 11-13 ms at 60 Hz on MAILBOX-less drivers). Only FIFO modes queue and
+            // only present timing can count, so everywhere else this stays inert and
+            // behavior is the shipped arrival pacing.
+            if pacing_active && presenter.needs_glass_gate() && presenter.present_timing_active() {
+                if let Some(f) = to_present.take() {
+                    if st.gate.open(presenter.presents_outstanding(), now_ns) {
+                        to_present = Some(f);
+                    } else {
+                        // Parked: a newest-wins store replaces it if a fresher frame
+                        // lands; the waiter's wake (or the 100 ms stale force-open)
+                        // retries.
+                        st.store.put_back(f);
+                    }
+                }
+            }
+            if let Some(f) = to_present {
                 // Resize END: a frame at the steered target size means the sharp new-mode
                 // picture is here — lift the scrim. A no-op unless a switch is in flight.
                 let (fw, fh) = f.image.dimensions();
@@ -1472,6 +1763,12 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                 };
                 if did_present {
                     presented_video = true;
+                    // Smoothness: this latch slot is served — one present per slot.
+                    // (Set only on success: a gated or failed present leaves the slot
+                    // open for the retry.)
+                    if slot_target != 0 {
+                        st.last_target_ns = slot_target;
+                    }
                     if opts.json_status && !st.ready_announced {
                         st.ready_announced = true;
                         println!("{{\"ready\":true}}");
@@ -1481,6 +1778,8 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         // e2e/display samples arrive via `take_presented_samples` with a
                         // TRUE on-glass stamp instead of the submit-time one below.
                         presenter.note_presented(pts_ns, decoded_ns);
+                        st.gate.note_present(now_ns);
+                        st.win_out_max = st.win_out_max.max(presenter.presents_outstanding());
                     } else {
                         let displayed_ns = session::now_ns();
                         // The `displayed` stamp (same clamp rules as the pump's windows).
@@ -1495,59 +1794,81 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         }
                         st.win_disp_us
                             .push(displayed_ns.saturating_sub(decoded_ns) / 1000);
+                        // No glass stamps on this stack: the submit instant anchors an
+                        // approximate grid on the mode's refresh period, so smoothness
+                        // still drains one frame per (approximate) slot.
+                        st.clock.note_batch(&[displayed_ns]);
                     }
                 }
             }
 
             // Fold the presenter window into the shared stats line once per second.
+            // (The on-glass samples themselves are drained every pass above — they
+            // drive the latch clock and glass gate, not just this fold.)
             if st.win_start.elapsed() >= Duration::from_secs(1) {
-                // On-glass samples the present-wait waiter completed this window (empty
-                // when timing is inactive — the legacy submit-time pushes fill in then).
-                let clock_offset_ns = st
-                    .clock_offset
-                    .as_ref()
-                    .map_or(0, |o| o.load(Ordering::Relaxed));
-                let samples = presenter.take_presented_samples();
-                // Phase-locked capture, the presenter's half: publish this window's latch
-                // grid — a recent TRUE on-glass instant plus the panel period — for the
-                // pump's ~1 Hz PhaseReport. The period is the min positive spacing of
-                // consecutive on-glass stamps (Apple's method: honest under VRR), capped
-                // by the display mode's refresh — under arrival-paced MAILBOX a stream
-                // running below the panel rate spaces its presents at k×period, and the
-                // cap keeps a 30 fps stream from claiming a 30 Hz panel grid.
-                if let Some(grid) = &st.latch_grid {
-                    if let Some(last) = samples.last() {
-                        let refresh_period = 1_000_000_000u64 / u64::from(native.refresh_hz.max(1));
-                        let min_delta = samples
-                            .windows(2)
-                            .map(|w| w[1].displayed_ns.saturating_sub(w[0].displayed_ns))
-                            .filter(|&d| d > 1_000_000) // < 1 ms apart = queued pair, not a grid step
-                            .min()
-                            .unwrap_or(refresh_period);
-                        grid.period_ns
-                            .store(min_delta.min(refresh_period), Ordering::Relaxed);
-                        grid.anchor_ns.store(last.displayed_ns, Ordering::Relaxed);
-                    }
-                }
-                for s in samples {
-                    let e2e = (s.displayed_ns as i128 + clock_offset_ns as i128 - s.pts_ns as i128)
-                        .max(0) as u64;
-                    if e2e > 0 && e2e < 10_000_000_000 {
-                        st.win_e2e_us.push(e2e / 1000);
-                    }
-                    st.win_disp_us
-                        .push(s.displayed_ns.saturating_sub(s.decoded_ns) / 1000);
-                }
                 let (e2e_p50, e2e_p95) = session::window_percentiles(&mut st.win_e2e_us);
                 let (disp_p50, _) = session::window_percentiles(&mut st.win_disp_us);
+                let (pace_p50, _) = session::window_percentiles(&mut st.win_pace_us);
+                let (latch_p50, _) = session::window_percentiles(&mut st.win_latch_us);
+                // Drained ONCE per window and shared by the HUD and the log line below —
+                // a second `take_counters` would read zeros.
+                let (replaced, q_drop, q_dry) = st.store.take_counters();
+                let (gated, forced) = st.gate.take_counters();
                 st.presented = PresentedWindow {
                     e2e_p50_ms: e2e_p50 as f32 / 1000.0,
                     e2e_p95_ms: e2e_p95 as f32 / 1000.0,
                     display_ms: disp_p50 as f32 / 1000.0,
+                    pace_ms: pace_p50 as f32 / 1000.0,
+                    latch_ms: latch_p50 as f32 / 1000.0,
+                    mode: presenter.present_mode_name(),
+                    vrr: st.cadence.verdict(),
+                    smoothing: st.store.is_smoothing(),
+                    q_drop,
+                    q_dry,
+                    gated,
+                    forced,
                 };
                 st.win_e2e_us.clear();
                 st.win_disp_us.clear();
+                st.win_pace_us.clear();
+                st.win_latch_us.clear();
                 st.win_start = Instant::now();
+                // Adaptive slot margin (the Android presenter's measured recipe):
+                // start at 0 — a fixed lead is pure display tax — and widen one step
+                // per window whose measured latch misses demand it. One-way per
+                // stream; the next stream restarts at 0.
+                if st.store.is_smoothing() && st.win_misses > 2 && st.margin_ns < MARGIN_MAX_NS {
+                    st.margin_ns = (st.margin_ns + MARGIN_STEP_NS).min(MARGIN_MAX_NS);
+                    tracing::info!(
+                        margin_us = st.margin_ns / 1000,
+                        misses = st.win_misses,
+                        "smoothness slot margin widened (measured latch misses)"
+                    );
+                }
+                // The 1 Hz presenter line (the Apple `pf-present` analogue): emitted
+                // when anything moved, or always under PUNKTFUNK_PRESENT_DEBUG=1 —
+                // the field-triage instrument for the intent engine.
+                if pacing_active && (present_debug || q_drop + q_dry + gated + forced > 0) {
+                    tracing::info!(
+                        smoothing = st.presented.smoothing,
+                        mode = st.presented.mode,
+                        vrr = st.presented.vrr.label(),
+                        replaced,
+                        q_drop,
+                        q_dry,
+                        gated,
+                        forced,
+                        misses = st.win_misses,
+                        out_max = st.win_out_max,
+                        pace_ms = st.presented.pace_ms,
+                        latch_ms = st.presented.latch_ms,
+                        period_us = st.clock.period_ns() / 1000,
+                        margin_us = st.margin_ns / 1000,
+                        "presenter window"
+                    );
+                }
+                st.win_misses = 0;
+                st.win_out_max = 0;
             }
         }
 
@@ -2007,6 +2328,32 @@ struct PresentedWindow {
     e2e_p50_ms: f32,
     e2e_p95_ms: f32,
     display_ms: f32,
+    /// The display stage split (design/desktop-presentation-rebuild.md WP4):
+    /// `pace` = decoded → present-submit (our own pipeline), `latch` = submit → on-glass
+    /// (the presentation engine's queue + the vblank wait). Both `0` without
+    /// `VK_KHR_present_wait`, where the two are not separable — the HUD then shows the
+    /// unsplit figure rather than inventing a zero latch.
+    ///
+    /// This split is what makes a high `display` self-diagnosing: latch dominating means
+    /// the vsync/queue floor (or a standing queue), pace dominating means us.
+    /// `pace` is also the honest cross-platform twin of the Apple client's shaved
+    /// number — Apple subtracts its measured OS present floor, and the latch IS our
+    /// floor, so `pace` is what remains on both sides of that comparison.
+    pace_ms: f32,
+    latch_ms: f32,
+    /// The live swapchain present mode (`mailbox`/`fifo`/…). Shown because a mode is
+    /// chosen from what the surface offers, so "why is my latch a refresh long" is
+    /// usually answered by a MAILBOX request having landed on FIFO.
+    mode: &'static str,
+    /// Whether variable refresh is measurably live (never claimed without evidence).
+    vrr: Cadence,
+    /// Presenter-engine counters for the window: the smoothing FIFO's overflow drops and
+    /// post-preroll underflows, and the FIFO glass gate's holds/stale force-opens.
+    smoothing: bool,
+    q_drop: u32,
+    q_dry: u32,
+    gated: u32,
+    forced: u32,
 }
 
 /// The capture hints (`ui_stream` parity — the words the user reads while released).
@@ -2112,6 +2459,15 @@ fn stats_text(
             " · decode {:.1} · display {:.1} ms",
             s.decode_ms, p.display_ms
         ));
+        // The display split (WP4). Only with true on-glass stamps — without them the
+        // two halves are not separable and the unsplit figure stands alone rather than
+        // implying a zero latch.
+        if p.latch_ms > 0.0 || p.pace_ms > 0.0 {
+            text.push_str(&format!(
+                " (pace {:.1} + latch {:.1})",
+                p.pace_ms, p.latch_ms
+            ));
+        }
         // Extended 0xCF host-stage split (T0.1): its own line so the per-stage attribution
         // (queue → encode → seal/xfer → pace) reads as the host pipeline in order.
         if s.staged {
@@ -2119,6 +2475,32 @@ fn stats_text(
                 "\nhost: queue {:.1} · encode {:.1} · xfer {:.1} · pace {:.1} ms",
                 s.host_queue_ms, s.host_encode_ms, s.host_xfer_ms, s.host_pace_ms
             ));
+        }
+        // The presenter line: the swapchain mode that is actually live, the chosen
+        // intent, and the engine's own counters. Present-mode alone answers most
+        // "why is my latch a whole refresh" questions; the counters only render when
+        // they are non-zero, so a healthy latency session shows just the mode.
+        if !p.mode.is_empty() {
+            text.push_str(&format!("\npresent: {}", p.mode));
+            // Only once measured — an unproven "vrr no" would be a claim, not a reading.
+            if p.vrr != Cadence::Unknown {
+                text.push_str(&format!(" · vrr {}", p.vrr.label()));
+            }
+            if p.smoothing {
+                text.push_str(" · smoothing");
+            }
+            if p.q_drop > 0 {
+                text.push_str(&format!(" · qdrop {}", p.q_drop));
+            }
+            if p.q_dry > 0 {
+                text.push_str(&format!(" · qdry {}", p.q_dry));
+            }
+            if p.gated > 0 {
+                text.push_str(&format!(" · gated {}", p.gated));
+            }
+            if p.forced > 0 {
+                text.push_str(&format!(" · forced {}", p.forced));
+            }
         }
     }
     if s.lost > 0 {
@@ -2393,6 +2775,7 @@ mod tests {
                 e2e_p50_ms: 6.4,
                 e2e_p95_ms: 9.1,
                 display_ms: 1.1,
+                ..Default::default()
             },
         )
     }
@@ -2430,6 +2813,70 @@ mod tests {
             !normal.contains("queue"),
             "host-stage split is Detailed-only"
         );
+        assert!(
+            !detailed.contains("pace 1.1"),
+            "no glass stamps in this sample — the display stage stays unsplit"
+        );
+    }
+
+    /// WP4: with true on-glass stamps the display stage reads as its two halves, the
+    /// live present mode is named, and the engine counters render only when non-zero —
+    /// so a healthy latency session shows the mode and nothing else. Without glass
+    /// stamps (no `VK_KHR_present_wait`) the split is absent rather than a zero latch.
+    #[test]
+    fn detailed_splits_display_into_pace_and_latch() {
+        let (s, mut p) = sample();
+        p.display_ms = 12.4;
+        p.pace_ms = 1.1;
+        p.latch_ms = 11.3;
+        p.mode = "fifo";
+        let split = stats_text(
+            StatsVerbosity::Detailed,
+            "m",
+            &s,
+            &p,
+            false,
+            false,
+            false,
+            None,
+        );
+        assert!(split.contains("display 12.4 ms (pace 1.1 + latch 11.3)"));
+        assert!(split.contains("\npresent: fifo"));
+        assert!(
+            !split.contains("qdrop") && !split.contains("gated") && !split.contains("smoothing"),
+            "quiet counters stay off the HUD: {split}"
+        );
+
+        // The smoothing FIFO and the glass gate surface once they actually do something.
+        p.smoothing = true;
+        p.q_drop = 2;
+        p.q_dry = 1;
+        p.gated = 7;
+        p.forced = 1;
+        let busy = stats_text(
+            StatsVerbosity::Detailed,
+            "m",
+            &s,
+            &p,
+            false,
+            false,
+            false,
+            None,
+        );
+        assert!(busy.contains("present: fifo · smoothing · qdrop 2 · qdry 1 · gated 7 · forced 1"));
+
+        // A tier below Detailed never carries any of it.
+        let normal = stats_text(
+            StatsVerbosity::Normal,
+            "m",
+            &s,
+            &p,
+            false,
+            false,
+            false,
+            None,
+        );
+        assert!(!normal.contains("present:") && !normal.contains("pace"));
     }
 
     /// The honest HDR badges: a PQ stream on the software-decode lane is shown WITHOUT

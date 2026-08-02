@@ -788,6 +788,45 @@ impl MouseMode {
     }
 }
 
+/// Presentation intent — what the presenter optimizes for
+/// (design/desktop-presentation-rebuild.md; the Apple/Android clients' shared
+/// `present_priority`/`smooth_buffer` pair). Stored stringly in
+/// [`Settings::present_priority`] + [`Settings::smooth_buffer`]; resolved with
+/// [`PresentPriority::resolve`], whose rules match the Android reference
+/// (`decode/presenter.rs`): anything but an explicit `"smooth"` is latency, and a
+/// smooth buffer outside 1..=3 (including 0 = Automatic) becomes 2.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PresentPriority {
+    /// Every frame presents the moment the display can take it; a network hiccup is an
+    /// occasional repeated or skipped frame. The default.
+    Latency,
+    /// A small frame buffer (1–3 frames) evens out network/decode jitter, at the
+    /// buffer's worth of added display latency.
+    Smooth { buffer: u8 },
+}
+
+impl PresentPriority {
+    /// The shared cross-client resolution rule — pure, so every embedder agrees on what
+    /// a foreign profile's values mean.
+    pub fn resolve(name: &str, buffer: u8) -> PresentPriority {
+        if name == "smooth" {
+            PresentPriority::Smooth {
+                buffer: if (1..=3).contains(&buffer) { buffer } else { 2 },
+            }
+        } else {
+            PresentPriority::Latency
+        }
+    }
+
+    /// Frames the smoothing store holds; `0` = newest-wins (the latency intent).
+    pub fn fifo_capacity(self) -> u8 {
+        match self {
+            PresentPriority::Latency => 0,
+            PresentPriority::Smooth { buffer } => buffer,
+        }
+    }
+}
+
 /// App settings, persisted as JSON. Stringly-typed gamepad/compositor prefs so the file
 /// stays readable; parsed with `*Pref::from_name` at connect time.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -890,6 +929,32 @@ pub struct Settings {
     /// `default = true`: the Linux stores never carried this and always advertised.
     #[serde(default = "default_true")]
     pub hdr_enabled: bool,
+    /// Presentation intent: `"latency"` (default) or `"smooth"` — the Apple/Android
+    /// clients' shared `present_priority` profile key, resolved with
+    /// [`PresentPriority::resolve`] (via [`Settings::present_priority`]). Anything
+    /// unknown reads as latency, so a newer client's future value degrades safely.
+    #[serde(default = "default_present_priority")]
+    pub present_priority: String,
+    /// Smoothness buffer size in frames: `0` = Automatic (resolves to 2), else 1–3.
+    /// Only meaningful under `present_priority = "smooth"` (the shared `smooth_buffer`
+    /// key). Each buffered frame absorbs about one refresh of jitter and adds one
+    /// refresh of display latency.
+    #[serde(default)]
+    pub smooth_buffer: u8,
+    /// Tear-free presentation (default ON = today's behavior: MAILBOX, FIFO fallback).
+    /// Off asks for a tearing present mode (IMMEDIATE) for the lowest possible latch
+    /// latency — best-effort: platforms/drivers without tearing silently stay tear-free
+    /// and the active mode is visible in the detailed stats. The shared `vsync` profile
+    /// key; the desktop default differs from macOS's (`false` there) deliberately —
+    /// sync-off means something different on each platform, the key is the contract.
+    #[serde(default = "default_true")]
+    pub vsync: bool,
+    /// Let a variable-refresh display follow the stream cadence: prefers the present
+    /// mode that drives VRR panels directly when fullscreen. Inert on fixed-refresh
+    /// displays (detection is measured from on-glass timestamps, not queried). The
+    /// shared `allow_vrr` profile key. Default ON, like the Apple client.
+    #[serde(default = "default_true")]
+    pub allow_vrr: bool,
     /// Legacy on/off for the stats overlay — superseded by `stats_verbosity` but kept
     /// written in sync (`set_stats_verbosity`) so pre-tier binaries reading the same
     /// file keep working. `alias`: the pre-unification WinUI shell (≤ 0.8.4) persisted
@@ -963,6 +1028,10 @@ fn default_mouse_mode() -> String {
     "capture".into()
 }
 
+fn default_present_priority() -> String {
+    "latency".into()
+}
+
 fn default_true() -> bool {
     true
 }
@@ -992,6 +1061,12 @@ impl Settings {
 
     pub fn mouse_mode(&self) -> MouseMode {
         MouseMode::from_name(&self.mouse_mode)
+    }
+
+    /// The presentation intent for this session (the resolved
+    /// `present_priority` × `smooth_buffer` pair).
+    pub fn present_priority(&self) -> PresentPriority {
+        PresentPriority::resolve(&self.present_priority, self.smooth_buffer)
     }
 
     /// The `codec` setting as a `quic::CODEC_*` preference bit (`0` = auto).
@@ -1032,6 +1107,10 @@ impl Default for Settings {
             adapter: String::new(),
             enable_444: false,
             hdr_enabled: true,
+            present_priority: "latency".into(),
+            smooth_buffer: 0,
+            vsync: true,
+            allow_vrr: true,
             show_stats: true,
             stats_verbosity: None,
             fullscreen_on_stream: true,
@@ -1168,6 +1247,43 @@ mod tests {
         for m in TouchMode::ALL {
             assert_eq!(TouchMode::from_name(m.as_name()), m);
         }
+    }
+
+    /// A settings file predating the presentation cluster loads with the shipped
+    /// defaults (latency intent, Automatic buffer, tear-free, VRR allowed), and the
+    /// resolution rules match the Apple/Android reference: anything but an explicit
+    /// `"smooth"` is latency, and a smooth buffer outside 1..=3 becomes 2.
+    #[test]
+    fn settings_presentation_defaults_and_resolution() {
+        let old = r#"{"width":1280,"height":720,"gamepad":"auto","compositor":"auto"}"#;
+        let s: Settings = serde_json::from_str(old).unwrap();
+        assert_eq!(s.present_priority, "latency");
+        assert_eq!(s.smooth_buffer, 0);
+        assert!(s.vsync);
+        assert!(s.allow_vrr);
+        assert_eq!(s.present_priority(), PresentPriority::Latency);
+
+        assert_eq!(
+            PresentPriority::resolve("smooth", 0),
+            PresentPriority::Smooth { buffer: 2 },
+            "Automatic resolves to 2"
+        );
+        assert_eq!(
+            PresentPriority::resolve("smooth", 3),
+            PresentPriority::Smooth { buffer: 3 }
+        );
+        assert_eq!(
+            PresentPriority::resolve("smooth", 9),
+            PresentPriority::Smooth { buffer: 2 },
+            "out-of-range pins to the Automatic resolution"
+        );
+        assert_eq!(
+            PresentPriority::resolve("balanced-from-the-future", 2),
+            PresentPriority::Latency,
+            "unknown intents degrade to latency"
+        );
+        assert_eq!(PresentPriority::Latency.fifo_capacity(), 0);
+        assert_eq!(PresentPriority::Smooth { buffer: 3 }.fifo_capacity(), 3);
     }
 
     /// A pre-`forward_pad` settings file (≤ 0.5.0) loads with the pin on automatic.
