@@ -84,6 +84,9 @@ suspend fun connectToHost(
             // The host's approval-list / trust-store label for this device — the same
             // Build.MODEL convention the pairing dialogs use for nativePair.
             Build.MODEL ?: "Android",
+            // Tier-A pad audio: ask for the 0xD1 plane only when a setting would render it, so a
+            // user with it off does not make the host provision endpoints it will never feed.
+            settings.padHaptics || settings.padSpeaker,
         )
     }
 }

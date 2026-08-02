@@ -69,6 +69,10 @@ object NativeBridge {
          *  list and trust store show for it, same convention as [nativePair]'s `name`. `null`/blank ⇒
          *  the host falls back to a fingerprint-derived "device abcd1234" label. */
         deviceName: String?,
+        /** Advertise `CLIENT_CAP_PAD_AUDIO` — the SESSION-level negotiation for the 0xD1 per-pad
+         *  DualSense plane. Without it the host never sets `HOST_CAP_PAD_AUDIO` and emits nothing,
+         *  so a captured pad's own render capabilities would have nothing to gate. */
+        padAudioOk: Boolean,
     ): Long
 
     /** 64-hex SHA-256 of the cert the host presented on [handle]; valid after a successful connect. */
