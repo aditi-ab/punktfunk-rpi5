@@ -429,6 +429,13 @@ impl Reassembler {
             stats
                 .probe_last_arrival_ns
                 .store(now_ns, std::sync::atomic::Ordering::Relaxed);
+        } else if hdr.shard_index < hdr.data_shards {
+            // Media accounting (see `Stats::media_bytes_received`): DATA shards only, payload
+            // only. Stamped at the same routing decision as the probe counters and for the same
+            // reason — the adaptive-bitrate utilization gate compares delivered throughput
+            // against an ENCODER target, so parity, headers and probe filler have no business
+            // in the numerator.
+            StatsCounters::add(&stats.media_bytes_received, shard_bytes as u64);
         }
         let win = if is_probe { probe } else { video };
         win.advance_window(

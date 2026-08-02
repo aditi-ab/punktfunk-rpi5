@@ -232,7 +232,7 @@ impl DataPump {
                 last_late = st.fec_late_shards;
                 last_received = st.packets_received;
                 last_dropped = st.frames_dropped;
-                last_bytes = st.bytes_received;
+                last_bytes = st.media_bytes_received;
                 last_report = Instant::now();
                 discard_abr_window = true;
                 flush_in_window = false;
@@ -317,11 +317,12 @@ impl DataPump {
                             "adaptive bitrate: capacity probe declined — keeping negotiated ceiling"
                         );
                     }
-                    // The probe's FLAG_PROBE filler landed in `bytes_received` but never reached
-                    // the decoder — rebase the ABR window's byte counter past it, or the next
-                    // window's "actual throughput" reads as the burst rate and poisons the
-                    // controller's proven-throughput high-water mark with the LINK rate.
-                    last_bytes = st.bytes_received;
+                    // Rebase the ABR window's byte anchor past the burst. (Probe filler is
+                    // routed out of `media_bytes_received` at the reassembler, so it can no
+                    // longer read as the burst rate on its own — but the anchor still has to
+                    // skip the video that landed around the burst under a suppressed report
+                    // tick, which would otherwise divide a long span's bytes by one window.)
+                    last_bytes = st.media_bytes_received;
                 } else if Instant::now() >= deadline {
                     // The host never answered (a build that ignores ProbeRequest): clear the
                     // stuck-active state so LossReports resume, keep the negotiated ceiling.
@@ -454,11 +455,17 @@ impl DataPump {
                 // the next one.
                 let recovery_kf_reqs = pump_recovery_kf.swap(0, Ordering::Relaxed);
                 // The window's ACTUAL delivered throughput — what the pipeline really carried, vs
-                // the target it was allowed. Wire bytes (headers + FEC) slightly overstate the
-                // media rate the decoder ingests; acceptable for the climb gate / proven-mark
-                // semantics (both compare against targets with their own headroom).
+                // the target it was allowed. MEDIA bytes (data-shard payload: no headers, no FEC
+                // parity, no probe filler, no audio), because both consumers compare it against
+                // the ENCODER's target: the utilization gate asks "was the target genuinely
+                // tested?" and the proven mark bounds every later climb. Wire bytes answered a
+                // different question — they rise with the redundancy the host adds in answer to
+                // loss, so the gate read ~25 % high precisely on the links it exists for.
                 let window_ms = last_report.elapsed().as_millis().max(1) as u64;
-                let actual_kbps = (st.bytes_received.wrapping_sub(last_bytes).saturating_mul(8)
+                let actual_kbps = (st
+                    .media_bytes_received
+                    .wrapping_sub(last_bytes)
+                    .saturating_mul(8)
                     / window_ms) as u32;
                 // A discard window feeds the controller NOTHING — its signals are probe-tail
                 // residue, and one "congestion" verdict here ends slow start for good.
@@ -508,7 +515,7 @@ impl DataPump {
                 last_late = st.fec_late_shards;
                 last_received = st.packets_received;
                 last_dropped = st.frames_dropped;
-                last_bytes = st.bytes_received;
+                last_bytes = st.media_bytes_received;
                 if pump_perf_on {
                     if let Some(p) = session.take_pump_perf() {
                         let per_pkt_ns = |ns: u64| ns.checked_div(p.packets).unwrap_or(0);
