@@ -57,7 +57,7 @@ pub(super) struct StallEvidence {
     /// The DxgKrnl DDI activity inside the window (Phase A.3 ETW summary); `None` when the
     /// session is unavailable (non-admin dev run).
     pub(super) etw: Option<String>,
-    /// The structured present-vs-queue counts for the window ([`EtwWatch::window_counts`]) —
+    /// The structured present-vs-queue counts for the window ([`EtwWatch::window_report`]) —
     /// the compose-silence discriminator: presents flowing while the queue starves = the OS
     /// display path dropped composed frames; both silent = the content stopped presenting.
     /// `None` when the ETW session is unavailable.

@@ -18,7 +18,7 @@
 //! A second provider rides the same session: `Microsoft-Windows-DXGI` (user-mode), filtered to
 //! `Present`/`PresentMultiplaneOverlay` starts (ids 42/55) — one event per swapchain present,
 //! stamped with the PRESENTING process id. Together they are the compose-silence discriminator
-//! ([`EtwWatch::window_counts`]): DXGI presents flowing while `BltQueueAddEntry` gaps = the OS
+//! ([`EtwWatch::window_report`]): DXGI presents flowing while `BltQueueAddEntry` gaps = the OS
 //! display path dropped composed frames (the real display-path bug); BOTH silent = the content
 //! stopped presenting (benign pause — menus/loading/game hitch). The predecessor witnesses are
 //! retired for cause: DxgKrnl id 184 `Present` never fires on the modern redirected path, and
@@ -48,7 +48,8 @@ use windows::Win32::System::Diagnostics::Etw::{
     EVENT_CONTROL_CODE_ENABLE_PROVIDER, EVENT_FILTER_DESCRIPTOR, EVENT_FILTER_TYPE_EVENT_ID,
     EVENT_RECORD, EVENT_TRACE_CONTROL_STOP, EVENT_TRACE_LOGFILEW, EVENT_TRACE_PROPERTIES,
     EVENT_TRACE_REAL_TIME_MODE, PROCESSTRACE_HANDLE, PROCESS_TRACE_MODE_EVENT_RECORD,
-    PROCESS_TRACE_MODE_REAL_TIME, TRACE_LEVEL_INFORMATION, WNODE_FLAG_TRACED_GUID,
+    PROCESS_TRACE_MODE_RAW_TIMESTAMP, PROCESS_TRACE_MODE_REAL_TIME, TRACE_LEVEL_INFORMATION,
+    WNODE_FLAG_TRACED_GUID,
 };
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use windows::Win32::System::Threading::{
@@ -122,8 +123,13 @@ fn qpc_freq() -> i64 {
     })
 }
 
-/// The consumer's per-event callback — record id + QPC timestamp (the session's `ClientContext`
-/// is 1, so `TimeStamp` IS a QPC value) and return; runs on the consumer thread.
+/// The consumer's per-event callback — record id + timestamp + pid into the ring and return;
+/// runs on the consumer thread. `TimeStamp` is a raw QPC value only because BOTH halves of the
+/// clock contract hold: `ClientContext = 1` makes QPC the session clock, and the consumer is
+/// opened with `PROCESS_TRACE_MODE_RAW_TIMESTAMP`, which is what stops ProcessTrace converting
+/// every event's timestamp to FILETIME (100 ns units since 1601) on delivery. Without the flag
+/// the conversion happens REGARDLESS of the session clock, and every `ts <= to_q` comparison
+/// downstream is against the wrong clock — never true, a witness that silently reads empty.
 unsafe extern "system" fn on_event(record: *mut EVENT_RECORD) {
     if record.is_null() {
         return;
@@ -150,10 +156,10 @@ pub(super) struct EtwWatch {
 }
 
 // SAFETY: both fields are plain kernel handle VALUES (u64 wrappers) owned by this watch; every
-// operation on them (summary reads the static ring; Drop stops/closes) is thread-safe by the ETW
-// API contract, and the singleton hands out only `Arc<EtwWatch>`.
+// operation on them (window_report reads the static ring; Drop stops/closes) is thread-safe by
+// the ETW API contract, and the singleton hands out only `Arc<EtwWatch>`.
 unsafe impl Send for EtwWatch {}
-// SAFETY: as above — `&EtwWatch` exposes only `summary` (static-ring reads).
+// SAFETY: as above — `&EtwWatch` exposes only `window_report` (static-ring reads).
 unsafe impl Sync for EtwWatch {}
 
 static WATCH: Mutex<Weak<EtwWatch>> = Mutex::new(Weak::new());
@@ -201,8 +207,10 @@ impl EtwWatch {
         let mut session = CONTROLTRACE_HANDLE::default();
         // SAFETY: `buf` is a live, zeroed allocation of base + name bytes; every write below is a
         // field of the properties struct at its head; `LoggerNameOffset = base` points at the
-        // appended name space (ETW copies the name there itself). ClientContext 1 = QPC clock —
-        // what makes event timestamps comparable to our probe windows.
+        // appended name space (ETW copies the name there itself). ClientContext 1 selects QPC as
+        // the SESSION clock — necessary but not sufficient for QPC comparisons: ProcessTrace
+        // still converts every event's timestamp to FILETIME on delivery unless the consumer is
+        // opened with PROCESS_TRACE_MODE_RAW_TIMESTAMP (set below).
         let rc = unsafe {
             let props = buf.as_mut_ptr().cast::<EVENT_TRACE_PROPERTIES>();
             (*props).Wnode.BufferSize = buf.len() as u32;
@@ -224,6 +232,11 @@ impl EtwWatch {
             );
             return None;
         }
+        // A fresh session gets a fresh ring: the static [`RING`] outlives any `EtwWatch`, so
+        // whatever is in it belongs to a DEAD session — leaking it forward would let a previous
+        // session's presents pose as this session's witness history. Race-free here: the
+        // consumer thread that repopulates it is spawned below.
+        RING.lock().unwrap().clear();
 
         // Enable DxgKrnl with a kernel-side event-id filter — the whole point: the provider's
         // vblank/DPC keywords never reach us. Fatal on failure (the DDI families + queue
@@ -240,7 +253,7 @@ impl EtwWatch {
             return None;
         }
         // The DXGI (user-mode) present witness rides the same session. Degraded-not-fatal: a
-        // refusal only costs the per-process present counts — `window_counts` then reports
+        // refusal only costs the per-process present counts — `window_report` then reports
         // no present history and classification stays honest (Unattributed, never a guess).
         if !enable_provider(session, &DXGI, &DXGI_FILTER_IDS) {
             tracing::debug!(
@@ -252,8 +265,12 @@ impl EtwWatch {
             LoggerName: PWSTR(name.as_ptr() as *mut _),
             ..Default::default()
         };
-        log.Anonymous1.ProcessTraceMode =
-            PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_EVENT_RECORD;
+        // RAW_TIMESTAMP is load-bearing: it stops ProcessTrace converting `EVENT_HEADER.TimeStamp`
+        // to FILETIME on delivery, so events arrive stamped in the session clock (QPC, per the
+        // ClientContext above) — the only clock the window edges are computed in.
+        log.Anonymous1.ProcessTraceMode = PROCESS_TRACE_MODE_REAL_TIME
+            | PROCESS_TRACE_MODE_EVENT_RECORD
+            | PROCESS_TRACE_MODE_RAW_TIMESTAMP;
         log.Anonymous2.EventRecordCallback = Some(on_event);
         // SAFETY: `log` is a fully-initialized local; `name` outlives the call (OpenTrace copies
         // what it needs before returning).
@@ -303,14 +320,34 @@ impl EtwWatch {
         Some(Self { session, consumer })
     }
 
-    /// Summarize the DDI activity inside `[from, to]` — the correlation line a stall report
-    /// carries. Brackets that merely SPAN the window count too (a freeze-long `SetPowerState`
-    /// has both edges outside the hole it caused). `"none"` when the window is clean.
-    pub(super) fn summary(&self, from: Instant, to: Instant) -> String {
-        // Instant → QPC: anchor both clocks now and offset backwards.
+    /// One stall window's ETW evidence, both halves from a SINGLE ring snapshot under a SINGLE
+    /// `(Instant::now(), qpc_now())` anchor: the DDI/present prose summary a stall report
+    /// carries, and the structured discriminator counts the classifier folds in. The summary
+    /// covers `[hole_from - lead_in, hole_to]` — the disturbance that CAUSED a hole lands just
+    /// before DWM stops delivering, so the prose needs the lead-in. The counts cover
+    /// `[hole_from, hole_to]` ONLY — presents from the healthy flow inside the lead-in would
+    /// falsely acquit the content. Two separate reads (two locks, two anchors, syscalls in
+    /// between) would let events arriving between them make the prose and the verdict disagree
+    /// about the same hole — hence one method returning both.
+    ///
+    /// Brackets that merely SPAN the summary window count too (a freeze-long `SetPowerState`
+    /// has both edges outside the hole it caused). The summary reads `"none"` when the window
+    /// is clean.
+    pub(super) fn window_report(
+        &self,
+        hole_from: Instant,
+        hole_to: Instant,
+        lead_in: Duration,
+    ) -> (String, EtwWindowCounts) {
+        // Instant → QPC: anchor both clocks once and offset backwards; every window edge below
+        // derives from this one anchor.
         let (now_i, now_q, freq) = (Instant::now(), qpc_now(), qpc_freq());
-        let to_q = now_q - duration_qpc(now_i.saturating_duration_since(to), freq);
-        let from_q = now_q - duration_qpc(now_i.saturating_duration_since(from), freq);
+        let to_q = now_q - duration_qpc(now_i.saturating_duration_since(hole_to), freq);
+        let from_q = now_q - duration_qpc(now_i.saturating_duration_since(hole_from), freq);
+        let summary_from_q = from_q - duration_qpc(lead_in, freq);
+        // One snapshot, then the lock drops: everything below — including the OpenProcess
+        // syscalls behind `process_name` — runs off the copy, so the consumer callback never
+        // queues behind a stall report.
         let events: Vec<(i64, u16, u32)> = {
             let ring = RING.lock().unwrap();
             ring.iter()
@@ -318,6 +355,7 @@ impl EtwWatch {
                 .copied()
                 .collect()
         };
+        let counts = count_window(&events, from_q, to_q, duration_qpc(LOOKBACK, freq));
         let ms = |dq: i64| dq.max(0) * 1_000 / freq;
         let mut parts = Vec::new();
         for (start_id, stop_id, label) in [
@@ -335,7 +373,7 @@ impl EtwWatch {
                 } else if id == stop_id {
                     if let Some(s) = open.take() {
                         // The bracket [s, ts] counts when it intersects the window.
-                        if s <= to_q && ts >= from_q {
+                        if s <= to_q && ts >= summary_from_q {
                             count += 1;
                             max_ms = max_ms.max(ms(ts - s));
                         }
@@ -362,43 +400,34 @@ impl EtwWatch {
         ] {
             let count = events
                 .iter()
-                .filter(|(ts, i, _)| *i == id && *ts >= from_q && *ts <= to_q)
+                .filter(|(ts, i, _)| *i == id && *ts >= summary_from_q && *ts <= to_q)
                 .count();
             if count > 0 {
                 parts.push(format!("{label}×{count}"));
             }
         }
         // Present + queue accounting (DXGI 42/55 + BltQueueAddEntry/Complete): total presents
-        // inside the window plus the top presenters, NAMED — the line that splits a
+        // inside the summary window plus the top presenters, NAMED — the line that splits a
         // compose-silence hole into "the content stopped presenting" (no presents anywhere)
         // versus "presents flowed and the display path dropped them" (presents at rate while
-        // the queue starves). "Present×0" is printed explicitly when the stream has history
-        // but the window is empty — silence is a finding, not an absence.
+        // the queue starves). "Present×0" is printed explicitly when the witness was LIVE
+        // before the hole ([`LOOKBACK`]) but the window is empty — silence is a finding, not
+        // an absence; a dead witness's window prints nothing rather than a fake zero.
         let mut per_pid: Vec<(u32, u32)> = Vec::new();
-        let mut have_present_history = false;
         let (mut adds, mut completes) = (0u32, 0u32);
-        let mut have_queue_history = false;
         for &(ts, id, pid) in &events {
+            if ts < summary_from_q || ts > to_q {
+                continue;
+            }
             match id {
                 DXGI_PRESENT_ID | DXGI_PRESENT_MPO_ID => {
-                    have_present_history = true;
-                    if ts >= from_q && ts <= to_q {
-                        match per_pid.iter_mut().find(|(p, _)| *p == pid) {
-                            Some((_, c)) => *c += 1,
-                            None => per_pid.push((pid, 1)),
-                        }
+                    match per_pid.iter_mut().find(|(p, _)| *p == pid) {
+                        Some((_, c)) => *c += 1,
+                        None => per_pid.push((pid, 1)),
                     }
                 }
-                BLT_ADD_ID | BLT_COMPLETE_ID => {
-                    have_queue_history = true;
-                    if ts >= from_q && ts <= to_q {
-                        if id == BLT_ADD_ID {
-                            adds += 1;
-                        } else {
-                            completes += 1;
-                        }
-                    }
-                }
+                BLT_ADD_ID => adds += 1,
+                BLT_COMPLETE_ID => completes += 1,
                 _ => {}
             }
         }
@@ -415,61 +444,80 @@ impl EtwWatch {
                 .collect::<Vec<_>>()
                 .join(",");
             parts.push(format!("Present×{total}({top})"));
-        } else if have_present_history {
+        } else if counts.present_history {
             parts.push("Present×0".to_string());
         }
-        if have_queue_history {
+        if counts.queue_history || adds > 0 || completes > 0 {
             parts.push(format!("blt-queue add×{adds} complete×{completes}"));
         }
-        if parts.is_empty() {
+        let summary = if parts.is_empty() {
             "none".to_string()
         } else {
             parts.join(" ")
-        }
-    }
-
-    /// The structured discriminator read for `[from, to]` (the stall classifier's evidence):
-    /// how many swapchain presents (DXGI 42/55, any process) and how many virtual-display
-    /// queue entries (`BltQueueAddEntry`) landed in the window, plus whether each stream has
-    /// EVER produced an event (distinguishing a true zero from a witness that is not working —
-    /// e.g. the DXGI enable was refused, or an OS build renumbered the BltQueue events).
-    pub(super) fn window_counts(&self, from: Instant, to: Instant) -> EtwWindowCounts {
-        let (now_i, now_q, freq) = (Instant::now(), qpc_now(), qpc_freq());
-        let to_q = now_q - duration_qpc(now_i.saturating_duration_since(to), freq);
-        let from_q = now_q - duration_qpc(now_i.saturating_duration_since(from), freq);
-        let ring = RING.lock().unwrap();
-        let mut out = EtwWindowCounts::default();
-        for &(ts, id, _) in ring.iter() {
-            match id {
-                DXGI_PRESENT_ID | DXGI_PRESENT_MPO_ID => {
-                    out.present_history = true;
-                    if ts >= from_q && ts <= to_q {
-                        out.presents += 1;
-                    }
-                }
-                BLT_ADD_ID => {
-                    out.queue_history = true;
-                    if ts >= from_q && ts <= to_q {
-                        out.queue_adds += 1;
-                    }
-                }
-                _ => {}
-            }
-        }
-        out
+        };
+        (summary, counts)
     }
 }
 
-/// [`EtwWatch::window_counts`]'s read: the compose-silence discriminator's structured evidence.
+/// Witness-liveness lookback: the [`EtwWindowCounts`] history flags are true only when the
+/// stream produced at least one event inside the `LOOKBACK` window ENDING at the hole's start.
+/// "Ever produced an event" would be wrong in both directions: an event that arrived only AFTER
+/// the hole (the resume burst, the stall-ending frame) proves nothing about whether the witness
+/// was working DURING it, and a provider that died mid-session (or whose events aged out of the
+/// ring) would keep flying a stale known-working flag forever. Demonstrated life immediately
+/// BEFORE the hole is the claim the classifier actually needs; 5 s is far longer than any
+/// pre-stall active-flow gate, so a genuinely working witness cannot blink false across a
+/// frame-time lull.
+const LOOKBACK: Duration = Duration::from_secs(5);
+
+/// The discriminator's windowing math, factored pure (plain i64 QPC-tick arithmetic, no ETW,
+/// no clock reads) so the ring→counts contract is unit-testable without a session: presents
+/// (DXGI 42/55, any process) and queue entries (`BltQueueAddEntry`) inside `[from_q, to_q]`,
+/// witness liveness from `[from_q - lookback_q, from_q]` (see [`LOOKBACK`]). A
+/// `BltQueueCompleteIndirectPresent` proves the queue witness works exactly as an add does —
+/// both ride the same provider enable — so either satisfies `queue_history`.
+fn count_window(
+    events: &[(i64, u16, u32)],
+    from_q: i64,
+    to_q: i64,
+    lookback_q: i64,
+) -> EtwWindowCounts {
+    let mut out = EtwWindowCounts::default();
+    for &(ts, id, _) in events {
+        let in_window = ts >= from_q && ts <= to_q;
+        let in_lookback = ts >= from_q.saturating_sub(lookback_q) && ts <= from_q;
+        match id {
+            DXGI_PRESENT_ID | DXGI_PRESENT_MPO_ID => {
+                out.present_history |= in_lookback;
+                if in_window {
+                    out.presents += 1;
+                }
+            }
+            BLT_ADD_ID => {
+                out.queue_history |= in_lookback;
+                if in_window {
+                    out.queue_adds += 1;
+                }
+            }
+            BLT_COMPLETE_ID => out.queue_history |= in_lookback,
+            _ => {}
+        }
+    }
+    out
+}
+
+/// [`EtwWatch::window_report`]'s structured half: the compose-silence discriminator's evidence.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(super) struct EtwWindowCounts {
     /// Swapchain presents (any process — the game AND dwm both count) inside the window.
     pub(super) presents: u32,
     /// `BltQueueAddEntry` events (frames entering the virtual display's kernel queue) inside it.
     pub(super) queue_adds: u32,
-    /// The present stream has produced at least one event EVER (witness known-working).
+    /// The present stream demonstrated liveness inside [`LOOKBACK`] BEFORE the hole opened — a
+    /// working witness whose in-window zero is a reading, not a dead one whose zero is noise.
     pub(super) present_history: bool,
-    /// The queue stream has produced at least one event EVER (witness known-working).
+    /// Queue-stream liveness inside [`LOOKBACK`] before the hole (`BltQueueAddEntry` or
+    /// `BltQueueCompleteIndirectPresent` — either proves the witness works).
     pub(super) queue_history: bool,
 }
 
@@ -559,5 +607,74 @@ impl Drop for EtwWatch {
             let _ = ControlTraceW(self.session, PWSTR::null(), props, EVENT_TRACE_CONTROL_STOP);
             let _ = CloseTrace(self.consumer);
         }
+    }
+}
+
+// The module only compiles on Windows (lib.rs gates `mod windows`), so plain `cfg(test)` here
+// already means "Windows tests" — and [`count_window`] itself is pure tick math, no session.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// [`count_window`]'s contract: counts come from the hole window `[from, to]`; liveness
+    /// comes ONLY from the lookback window ending at the hole's start. An event after the hole
+    /// (the resume burst) or older than the lookback (a dead provider's leftovers) must not fly
+    /// the known-working flag — those are exactly the shapes that used to convict every
+    /// compose-silence hole as content.
+    #[test]
+    fn count_window_liveness_and_windowing() {
+        // Hole [1000, 2000], lookback 500 → liveness window [500, 1000]. Plain ticks.
+        let (from, to, lb) = (1_000i64, 2_000i64, 500i64);
+        let ev = |ts: i64, id: u16| (ts, id, 42u32);
+
+        // The healthy shape: liveness demonstrated before the hole, activity inside it.
+        let events = [
+            ev(600, DXGI_PRESENT_ID),       // lookback → present witness live
+            ev(700, BLT_COMPLETE_ID),       // lookback → queue witness live (completes count)
+            ev(1_100, DXGI_PRESENT_ID),     // in-window present
+            ev(1_200, DXGI_PRESENT_MPO_ID), // in-window present (MPO path)
+            ev(1_300, BLT_ADD_ID),          // in-window queue add
+            ev(1_400, 430),                 // non-witness id: never counted here
+        ];
+        assert_eq!(
+            count_window(&events, from, to, lb),
+            EtwWindowCounts {
+                presents: 2,
+                queue_adds: 1,
+                present_history: true,
+                queue_history: true,
+            }
+        );
+
+        // In-window events count but do NOT confer liveness — the witness must have worked
+        // BEFORE the hole for its zeros elsewhere to mean anything.
+        let window_only = [ev(1_500, DXGI_PRESENT_ID), ev(1_600, BLT_ADD_ID)];
+        let c = count_window(&window_only, from, to, lb);
+        assert_eq!((c.presents, c.queue_adds), (1, 1));
+        assert!(!c.present_history && !c.queue_history);
+
+        // An event only AFTER the hole proves nothing about the witness during it.
+        let after_only = [ev(2_100, DXGI_PRESENT_ID), ev(2_200, BLT_ADD_ID)];
+        assert_eq!(
+            count_window(&after_only, from, to, lb),
+            EtwWindowCounts::default()
+        );
+
+        // Events that aged past the lookback (a previous session's leftovers) don't either.
+        let stale = [ev(499, DXGI_PRESENT_ID), ev(1, BLT_ADD_ID)];
+        assert_eq!(
+            count_window(&stale, from, to, lb),
+            EtwWindowCounts::default()
+        );
+
+        // Both lookback edges are inclusive; the hole-start event is both liveness and count.
+        let edges = [ev(500, DXGI_PRESENT_ID), ev(1_000, BLT_ADD_ID)];
+        let c = count_window(&edges, from, to, lb);
+        assert!(c.present_history && c.queue_history);
+        assert_eq!((c.presents, c.queue_adds), (0, 1));
+
+        // A lookback reaching below tick 0 saturates instead of wrapping.
+        let c = count_window(&[ev(0, DXGI_PRESENT_ID)], 3, to, i64::MAX);
+        assert!(c.present_history);
     }
 }
