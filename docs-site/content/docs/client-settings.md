@@ -82,9 +82,20 @@ Full detail: [HDR](/docs/hdr).
 **Full chroma (4:4:4)** — *default: off.* Crisp small text and thin lines, at more bandwidth. It
 needs HEVC or PyroWave, the host's own 4:4:4 policy left on, a capture path that delivers full
 chroma, and a GPU that can encode it; if any gate fails the host says 4:2:0 before your decoder is
-built. **Today only the Apple app actually advertises 4:4:4**, and only when its hardware decode
-probe passes — the Linux and Windows apps store the toggle but their session doesn't advertise the
-capability yet, so it has no effect there. Android, Decky and the console home don't offer it.
+built. The Apple, Linux and Windows apps all advertise it (Apple additionally requires its hardware
+decode probe to pass). Android, Decky and the console home don't offer it.
+
+**Prioritize** — *default: Lowest latency.* What the client optimizes for when a decoded frame is
+ready. **Lowest latency** shows every frame the moment the display can take it, so a network hiccup
+becomes an occasional repeated or skipped frame. **Smoothness** holds a small buffer that evens
+those hiccups out, at that buffer's worth of added delay. Linux and Windows apps; the Apple and
+Android apps have carried the same setting for a while, and it is stored under the same name, so a
+[profile](/docs/profiles-and-links) means the same thing on every device.
+
+**Smoothness buffer** — *default: Automatic (two frames).* Only shown under **Smoothness**. How
+many frames are held back before showing. Each frame absorbs roughly one screen refresh of network
+hiccup and costs one refresh of delay — so on a 120 Hz screen, two frames is about 17 ms of extra
+delay bought against 17 ms of jitter. If you never see stutter, you don't need this.
 
 **Host compositor** — *default: Automatic.* Which backend a **Linux** host uses to drive the virtual
 output. Advisory: a host without that backend quietly auto-detects instead.

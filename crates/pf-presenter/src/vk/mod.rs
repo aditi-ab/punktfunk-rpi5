@@ -273,6 +273,20 @@ impl Presenter {
         }
     }
 
+    /// The live swapchain present mode, for the stats overlay: a mode is picked from
+    /// what the surface actually offers, so the requested one and this can differ (a
+    /// MAILBOX request lands on FIFO wherever the driver has no mailbox — AMD's Windows
+    /// driver, notably). Showing it is what makes that visible instead of puzzling.
+    pub(crate) fn present_mode_name(&self) -> &'static str {
+        match self.present_mode {
+            vk::PresentModeKHR::MAILBOX => "mailbox",
+            vk::PresentModeKHR::FIFO => "fifo",
+            vk::PresentModeKHR::FIFO_RELAXED => "fifo-relaxed",
+            vk::PresentModeKHR::IMMEDIATE => "immediate",
+            _ => "other",
+        }
+    }
+
     /// The active present mode queues presents (FIFO family): the only modes where the
     /// swapchain itself can become a standing queue, and so the only ones the glass
     /// gate governs. MAILBOX/IMMEDIATE replace/flip and never queue.

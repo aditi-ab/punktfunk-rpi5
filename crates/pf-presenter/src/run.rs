@@ -220,6 +220,10 @@ struct StreamState {
     // capture→displayed (host-clock corrected) p50+p95, display = decoded→displayed p50.
     win_e2e_us: Vec<u64>,
     win_disp_us: Vec<u64>,
+    /// The display stage's two halves (present-timing sessions only): decoded→submit and
+    /// submit→on-glass. See [`PresentedWindow::pace_ms`].
+    win_pace_us: Vec<u64>,
+    win_latch_us: Vec<u64>,
     win_start: Instant,
     presented: PresentedWindow,
     /// The intent engine (design/desktop-presentation-rebuild.md WP2): the decoded-frame
@@ -353,6 +357,8 @@ impl StreamState {
             hdr_untonemapped: false,
             win_e2e_us: Vec::with_capacity(256),
             win_disp_us: Vec::with_capacity(256),
+            win_pace_us: Vec::with_capacity(256),
+            win_latch_us: Vec::with_capacity(256),
             win_start: Instant::now(),
             presented: PresentedWindow::default(),
             store: FrameStore::new(usize::from(priority.fifo_capacity())),
@@ -1393,6 +1399,13 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         }
                         st.win_disp_us
                             .push(s.displayed_ns.saturating_sub(s.decoded_ns) / 1000);
+                        // The display split (WP4): our pipeline vs the vsync latch. Only
+                        // meaningful with true glass stamps, which is exactly when this
+                        // branch runs.
+                        st.win_pace_us
+                            .push(s.submitted_ns.saturating_sub(s.decoded_ns) / 1000);
+                        st.win_latch_us
+                            .push(s.displayed_ns.saturating_sub(s.submitted_ns) / 1000);
                         // Latch miss (the adaptive margin's error signal): glass more
                         // than 1.5 latch periods after submit = the intended slot was
                         // overshot.
@@ -1707,13 +1720,29 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
             if st.win_start.elapsed() >= Duration::from_secs(1) {
                 let (e2e_p50, e2e_p95) = session::window_percentiles(&mut st.win_e2e_us);
                 let (disp_p50, _) = session::window_percentiles(&mut st.win_disp_us);
+                let (pace_p50, _) = session::window_percentiles(&mut st.win_pace_us);
+                let (latch_p50, _) = session::window_percentiles(&mut st.win_latch_us);
+                // Drained ONCE per window and shared by the HUD and the log line below —
+                // a second `take_counters` would read zeros.
+                let (replaced, q_drop, q_dry) = st.store.take_counters();
+                let (gated, forced) = st.gate.take_counters();
                 st.presented = PresentedWindow {
                     e2e_p50_ms: e2e_p50 as f32 / 1000.0,
                     e2e_p95_ms: e2e_p95 as f32 / 1000.0,
                     display_ms: disp_p50 as f32 / 1000.0,
+                    pace_ms: pace_p50 as f32 / 1000.0,
+                    latch_ms: latch_p50 as f32 / 1000.0,
+                    mode: presenter.present_mode_name(),
+                    smoothing: st.store.is_smoothing(),
+                    q_drop,
+                    q_dry,
+                    gated,
+                    forced,
                 };
                 st.win_e2e_us.clear();
                 st.win_disp_us.clear();
+                st.win_pace_us.clear();
+                st.win_latch_us.clear();
                 st.win_start = Instant::now();
                 // Adaptive slot margin (the Android presenter's measured recipe):
                 // start at 0 — a fixed lead is pure display tax — and widen one step
@@ -1730,13 +1759,10 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                 // The 1 Hz presenter line (the Apple `pf-present` analogue): emitted
                 // when anything moved, or always under PUNKTFUNK_PRESENT_DEBUG=1 —
                 // the field-triage instrument for the intent engine.
-                let (replaced, q_drop, q_dry) = st.store.take_counters();
-                let (gated, forced) = st.gate.take_counters();
-                if pacing_active
-                    && (present_debug || replaced + q_drop + q_dry + gated + forced > 0)
-                {
+                if pacing_active && (present_debug || q_drop + q_dry + gated + forced > 0) {
                     tracing::info!(
-                        smoothing = st.store.is_smoothing(),
+                        smoothing = st.presented.smoothing,
+                        mode = st.presented.mode,
                         replaced,
                         q_drop,
                         q_dry,
@@ -1744,6 +1770,8 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         forced,
                         misses = st.win_misses,
                         out_max = st.win_out_max,
+                        pace_ms = st.presented.pace_ms,
+                        latch_ms = st.presented.latch_ms,
                         period_us = st.clock.period_ns() / 1000,
                         margin_us = st.margin_ns / 1000,
                         "presenter window"
@@ -2210,6 +2238,30 @@ struct PresentedWindow {
     e2e_p50_ms: f32,
     e2e_p95_ms: f32,
     display_ms: f32,
+    /// The display stage split (design/desktop-presentation-rebuild.md WP4):
+    /// `pace` = decoded → present-submit (our own pipeline), `latch` = submit → on-glass
+    /// (the presentation engine's queue + the vblank wait). Both `0` without
+    /// `VK_KHR_present_wait`, where the two are not separable — the HUD then shows the
+    /// unsplit figure rather than inventing a zero latch.
+    ///
+    /// This split is what makes a high `display` self-diagnosing: latch dominating means
+    /// the vsync/queue floor (or a standing queue), pace dominating means us.
+    /// `pace` is also the honest cross-platform twin of the Apple client's shaved
+    /// number — Apple subtracts its measured OS present floor, and the latch IS our
+    /// floor, so `pace` is what remains on both sides of that comparison.
+    pace_ms: f32,
+    latch_ms: f32,
+    /// The live swapchain present mode (`mailbox`/`fifo`/…). Shown because a mode is
+    /// chosen from what the surface offers, so "why is my latch a refresh long" is
+    /// usually answered by a MAILBOX request having landed on FIFO.
+    mode: &'static str,
+    /// Presenter-engine counters for the window: the smoothing FIFO's overflow drops and
+    /// post-preroll underflows, and the FIFO glass gate's holds/stale force-opens.
+    smoothing: bool,
+    q_drop: u32,
+    q_dry: u32,
+    gated: u32,
+    forced: u32,
 }
 
 /// The capture hints (`ui_stream` parity — the words the user reads while released).
@@ -2315,6 +2367,15 @@ fn stats_text(
             " · decode {:.1} · display {:.1} ms",
             s.decode_ms, p.display_ms
         ));
+        // The display split (WP4). Only with true on-glass stamps — without them the
+        // two halves are not separable and the unsplit figure stands alone rather than
+        // implying a zero latch.
+        if p.latch_ms > 0.0 || p.pace_ms > 0.0 {
+            text.push_str(&format!(
+                " (pace {:.1} + latch {:.1})",
+                p.pace_ms, p.latch_ms
+            ));
+        }
         // Extended 0xCF host-stage split (T0.1): its own line so the per-stage attribution
         // (queue → encode → seal/xfer → pace) reads as the host pipeline in order.
         if s.staged {
@@ -2322,6 +2383,28 @@ fn stats_text(
                 "\nhost: queue {:.1} · encode {:.1} · xfer {:.1} · pace {:.1} ms",
                 s.host_queue_ms, s.host_encode_ms, s.host_xfer_ms, s.host_pace_ms
             ));
+        }
+        // The presenter line: the swapchain mode that is actually live, the chosen
+        // intent, and the engine's own counters. Present-mode alone answers most
+        // "why is my latch a whole refresh" questions; the counters only render when
+        // they are non-zero, so a healthy latency session shows just the mode.
+        if !p.mode.is_empty() {
+            text.push_str(&format!("\npresent: {}", p.mode));
+            if p.smoothing {
+                text.push_str(" · smoothing");
+            }
+            if p.q_drop > 0 {
+                text.push_str(&format!(" · qdrop {}", p.q_drop));
+            }
+            if p.q_dry > 0 {
+                text.push_str(&format!(" · qdry {}", p.q_dry));
+            }
+            if p.gated > 0 {
+                text.push_str(&format!(" · gated {}", p.gated));
+            }
+            if p.forced > 0 {
+                text.push_str(&format!(" · forced {}", p.forced));
+            }
         }
     }
     if s.lost > 0 {
@@ -2596,6 +2679,7 @@ mod tests {
                 e2e_p50_ms: 6.4,
                 e2e_p95_ms: 9.1,
                 display_ms: 1.1,
+                ..Default::default()
             },
         )
     }
@@ -2633,6 +2717,70 @@ mod tests {
             !normal.contains("queue"),
             "host-stage split is Detailed-only"
         );
+        assert!(
+            !detailed.contains("pace 1.1"),
+            "no glass stamps in this sample — the display stage stays unsplit"
+        );
+    }
+
+    /// WP4: with true on-glass stamps the display stage reads as its two halves, the
+    /// live present mode is named, and the engine counters render only when non-zero —
+    /// so a healthy latency session shows the mode and nothing else. Without glass
+    /// stamps (no `VK_KHR_present_wait`) the split is absent rather than a zero latch.
+    #[test]
+    fn detailed_splits_display_into_pace_and_latch() {
+        let (s, mut p) = sample();
+        p.display_ms = 12.4;
+        p.pace_ms = 1.1;
+        p.latch_ms = 11.3;
+        p.mode = "fifo";
+        let split = stats_text(
+            StatsVerbosity::Detailed,
+            "m",
+            &s,
+            &p,
+            false,
+            false,
+            false,
+            None,
+        );
+        assert!(split.contains("display 12.4 ms (pace 1.1 + latch 11.3)"));
+        assert!(split.contains("\npresent: fifo"));
+        assert!(
+            !split.contains("qdrop") && !split.contains("gated") && !split.contains("smoothing"),
+            "quiet counters stay off the HUD: {split}"
+        );
+
+        // The smoothing FIFO and the glass gate surface once they actually do something.
+        p.smoothing = true;
+        p.q_drop = 2;
+        p.q_dry = 1;
+        p.gated = 7;
+        p.forced = 1;
+        let busy = stats_text(
+            StatsVerbosity::Detailed,
+            "m",
+            &s,
+            &p,
+            false,
+            false,
+            false,
+            None,
+        );
+        assert!(busy.contains("present: fifo · smoothing · qdrop 2 · qdry 1 · gated 7 · forced 1"));
+
+        // A tier below Detailed never carries any of it.
+        let normal = stats_text(
+            StatsVerbosity::Normal,
+            "m",
+            &s,
+            &p,
+            false,
+            false,
+            false,
+            None,
+        );
+        assert!(!normal.contains("present:") && !normal.contains("pace"));
     }
 
     /// The honest HDR badges: a PQ stream on the software-decode lane is shown WITHOUT

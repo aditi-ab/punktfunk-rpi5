@@ -156,6 +156,20 @@ mod index {
     pub fn gamepad(s: &Settings) -> u32 {
         GAMEPADS.iter().position(|&g| g == s.gamepad).unwrap_or(0) as u32
     }
+
+    pub fn present_priority(s: &Settings) -> u32 {
+        // Unknown values (a newer client's intent) read as the default, exactly as
+        // `PresentPriority::resolve` treats them.
+        PRESENT_PRIORITIES
+            .iter()
+            .position(|&p| p == s.present_priority)
+            .unwrap_or(0) as u32
+    }
+
+    pub fn smooth_buffer(s: &Settings) -> u32 {
+        // The index IS the stored value: 0 = Automatic, 1..3 = frames.
+        u32::from(s.smooth_buffer).min(SMOOTH_BUFFER_LABELS.len() as u32 - 1)
+    }
 }
 
 /// The chip palette a profile can carry (`StreamProfile.accent`). Eight entries rather than a
@@ -634,6 +648,12 @@ fn commit_profile(active: &StreamProfile, touched: &Touched, values: &Settings) 
     if touched.has("fullscreen_on_stream") {
         o.fullscreen_on_stream = Some(values.fullscreen_on_stream);
     }
+    if touched.has("present_priority") {
+        o.present_priority = Some(values.present_priority.clone());
+    }
+    if touched.has("smooth_buffer") {
+        o.smooth_buffer = Some(values.smooth_buffer);
+    }
     // Resets are not handled here: they clear the field and re-seed their row the moment the
     // user asks, so by the time this runs the catalog already reflects them and the row is no
     // longer marked touched.
@@ -687,6 +707,20 @@ const TOUCH_MODE_CAPTIONS: &[&str] = &[
     "The cursor jumps to your finger — a tap clicks there",
     "Real multi-touch reaches the host — for touch-native apps",
 ];
+/// Presentation-intent values (persisted under the `present_priority` key the Apple and
+/// Android clients share) + labels + dynamic captions. Captions stay ONE line, like the
+/// touch/mouse rows.
+const PRESENT_PRIORITIES: &[&str] = &["latency", "smooth"];
+const PRESENT_PRIORITY_LABELS: &[&str] = &["Lowest latency", "Smoothness"];
+const PRESENT_PRIORITY_CAPTIONS: &[&str] = &[
+    "Each frame shows the moment the display can take it",
+    "Buffers a little to even out network hiccups",
+];
+/// Smoothness buffer depth, in frames — the index IS the stored `smooth_buffer` value
+/// (0 = Automatic, which resolves to 2). No millisecond hints: the cost is one refresh
+/// per frame, and the session's refresh isn't known here when the mode is Native.
+const SMOOTH_BUFFER_LABELS: &[&str] = &["Automatic", "1 frame", "2 frames", "3 frames"];
+
 /// Physical-mouse model values (persisted) + labels + dynamic captions — same idiom as
 /// the touch rows. Ctrl+Alt+Shift+M flips the model live in-stream.
 const MOUSE_MODES: &[&str] = &["capture", "desktop"];
@@ -1216,6 +1250,34 @@ pub fn show_scoped(
         row
     });
 
+    // ---- Display: Presentation ----
+    // The intent pair the Apple and Android clients already carry. The buffer row only
+    // means anything under Smoothness, so it hides itself the rest of the time rather
+    // than sitting there inert.
+    let present_row = ChoiceRow::new(
+        &dialog,
+        inline,
+        "Prioritize",
+        PRESENT_PRIORITY_CAPTIONS[0],
+        PRESENT_PRIORITY_LABELS,
+    );
+    let buffer_row = ChoiceRow::new(
+        &dialog,
+        inline,
+        "Smoothness buffer",
+        "Each frame held absorbs one refresh of hiccup and adds one of delay",
+        SMOOTH_BUFFER_LABELS,
+    );
+    {
+        let w = present_row.widget().clone();
+        let buffer = buffer_row.widget().clone();
+        present_row.connect_changed(move |i| {
+            let i = (i as usize).min(PRESENT_PRIORITY_CAPTIONS.len() - 1);
+            set_row_subtitle(&w, PRESENT_PRIORITY_CAPTIONS[i]);
+            buffer.set_visible(PRESENT_PRIORITIES[i] == "smooth");
+        });
+    }
+
     // ---- Display: Host output ----
     let compositor_row = ChoiceRow::new(
         &dialog,
@@ -1506,6 +1568,17 @@ pub fn show_scoped(
         let codec_i = index::codec(s);
         codec_row.set_selected(codec_i);
         set_row_subtitle(codec_row.widget(), codec_caption(codec_i));
+        let present_i = index::present_priority(s);
+        present_row.set_selected(present_i);
+        set_row_subtitle(
+            present_row.widget(),
+            PRESENT_PRIORITY_CAPTIONS[present_i as usize],
+        );
+        buffer_row.set_selected(index::smooth_buffer(s));
+        // `set_selected` never fires the changed hook, so mirror its visibility rule here.
+        buffer_row
+            .widget()
+            .set_visible(PRESENT_PRIORITIES[present_i as usize] == "smooth");
     }
 
     // ---- Override markers, per-row reset, and the touch that creates an override ----
@@ -1704,6 +1777,18 @@ pub fn show_scoped(
             o.gamepad_forwarding.is_some(),
             gamepad_forwarding
         );
+        choice!(
+            present_row,
+            "present_priority",
+            o.present_priority.is_some(),
+            index::present_priority
+        );
+        choice!(
+            buffer_row,
+            "smooth_buffer",
+            o.smooth_buffer.is_some(),
+            index::smooth_buffer
+        );
         toggle!(hdr_row, "hdr_enabled", o.hdr_enabled.is_some(), hdr_enabled);
         toggle!(chroma_row, "enable_444", o.enable_444.is_some(), enable_444);
         toggle!(
@@ -1808,6 +1893,9 @@ pub fn show_scoped(
     if let (Some(r), false) = (&gpu_row, profile_mode) {
         quality_group.add(r.widget());
     }
+    let presentation_group = group("Presentation", "");
+    presentation_group.add(present_row.widget());
+    presentation_group.add(buffer_row.widget());
     // The one form-level note (deliberately not repeated on every row).
     let output_group = group(
         "Host output",
@@ -1816,6 +1904,7 @@ pub fn show_scoped(
     output_group.add(compositor_row.widget());
     display.add(&resolution_group);
     display.add(&quality_group);
+    display.add(&presentation_group);
     display.add(&output_group);
 
     let input = page("Input", "input-keyboard-symbolic");
@@ -1963,6 +2052,12 @@ pub fn show_scoped(
                 _ => 2,
             };
             s.codec = CODECS[(codec_row.selected() as usize).min(CODECS.len() - 1)].to_string();
+            s.present_priority = PRESENT_PRIORITIES
+                [(present_row.selected() as usize).min(PRESENT_PRIORITIES.len() - 1)]
+            .to_string();
+            // The index IS the value (0 = Automatic).
+            s.smooth_buffer =
+                (buffer_row.selected() as u8).min(SMOOTH_BUFFER_LABELS.len() as u8 - 1);
             s.library_enabled = library_row.is_active();
         };
 
