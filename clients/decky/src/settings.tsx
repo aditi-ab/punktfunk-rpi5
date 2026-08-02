@@ -154,26 +154,36 @@ export const SettingsSection: FC = () => {
           </div>
         </RowActions>
       </Field>
-      <Field
-        label="Gamepad type"
-        description="Which virtual controller the host creates for your inputs"
-        childrenContainerWidth="max"
-      >
-        <RowActions>
-          <div style={selectShell}>
-            <Dropdown
-              rgOptions={GAMEPADS.map((g) => ({ data: g, label: GAMEPAD_LABELS[g] ?? g }))}
-              selectedOption={s.gamepad}
-              onChange={(o) => patch({ gamepad: o.data as string })}
+      <ToggleField
+        label="Forward controllers"
+        description="Send this Deck's controllers to the host. Turn it off when your controller already reaches the host another way — USB passthrough such as VirtualHere, or a pad plugged into the host — so games don't see two of them."
+        checked={s.gamepad_forwarding ?? true}
+        onChange={(v) => patch({ gamepad_forwarding: v })}
+      />
+      {(s.gamepad_forwarding ?? true) && (
+        <>
+          <Field
+            label="Gamepad type"
+            description="Which virtual controller the host creates for your inputs"
+            childrenContainerWidth="max"
+          >
+            <RowActions>
+              <div style={selectShell}>
+                <Dropdown
+                  rgOptions={GAMEPADS.map((g) => ({ data: g, label: GAMEPAD_LABELS[g] ?? g }))}
+                  selectedOption={s.gamepad}
+                  onChange={(o) => patch({ gamepad: o.data as string })}
+                />
+              </div>
+            </RowActions>
+          </Field>
+          {(s.gamepad === "steamdeck" || s.gamepad === "auto") && (
+            <Field
+              label="⚠ Disable Steam Input"
+              description="On a Deck, Automatic forwards the built-in controller as a Steam Deck pad — paddles, both trackpads, and gyro included. For that, Steam Input must be OFF for Punktfunk: on the game page tap ⚙ → Controller Settings → set Steam Input to Off. Otherwise Steam keeps the Deck's controls and only the sticks + buttons reach the host."
             />
-          </div>
-        </RowActions>
-      </Field>
-      {(s.gamepad === "steamdeck" || s.gamepad === "auto") && (
-        <Field
-          label="⚠ Disable Steam Input"
-          description="On a Deck, Automatic forwards the built-in controller as a Steam Deck pad — paddles, both trackpads, and gyro included. For that, Steam Input must be OFF for Punktfunk: on the game page tap ⚙ → Controller Settings → set Steam Input to Off. Otherwise Steam keeps the Deck's controls and only the sticks + buttons reach the host."
-        />
+          )}
+        </>
       )}
       <Field
         label="Host compositor"

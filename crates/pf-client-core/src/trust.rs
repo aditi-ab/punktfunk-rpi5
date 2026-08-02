@@ -808,6 +808,21 @@ pub struct Settings {
     /// container `#[serde(default)]`.
     pub render_scale: f64,
     pub gamepad: String,
+    /// Forward this device's controllers to the host at all. Default ON — that was the
+    /// unconditional behaviour before this became a setting.
+    ///
+    /// Off is for the couch whose controller reaches the host by some *other* route: a USB
+    /// passthrough tool (VirtualHere and friends), or a pad simply plugged into the host
+    /// itself. Leaving forwarding on there gives the host two controllers for one pair of
+    /// hands, and games read both.
+    ///
+    /// It is deliberately stronger than "send no input": with it off the client never
+    /// *opens* the controller, and opening is what grabs the hardware (SDL's HIDAPI drivers
+    /// take the hidraw node) — a held device is one a passthrough tool cannot bind. Menu
+    /// navigation in the launcher still opens the active pad, and the session releases it;
+    /// see [`crate::gamepad::GamepadService::set_forwarding`].
+    #[serde(default = "default_true")]
+    pub gamepad_forwarding: bool,
     /// Stable identity (`vid:pid:name`, see `PadInfo::key`) of the physical controller
     /// forwarded as pad 0; empty = automatic (most recently connected). Applied to the
     /// gamepad service at startup so the choice survives restarts.
@@ -994,6 +1009,7 @@ impl Default for Settings {
             bitrate_kbps: 0,
             render_scale: 1.0,
             gamepad: "auto".into(),
+            gamepad_forwarding: true,
             forward_pad: String::new(),
             compositor: "auto".into(),
             touch_mode: "trackpad".into(),

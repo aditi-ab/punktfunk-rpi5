@@ -49,6 +49,7 @@ struct SettingsView: View {
     @AppStorage(DefaultsKey.renderScale) var renderScale = 1.0
     @AppStorage(DefaultsKey.compositor) var compositor = 0
     @AppStorage(DefaultsKey.gamepadType) var gamepadType = 0
+    @AppStorage(DefaultsKey.gamepadForwarding) var gamepadForwarding = true
     @AppStorage(DefaultsKey.bitrateKbps) var bitrateKbps = 0
     @AppStorage(DefaultsKey.presentPriority) var presentPriority =
         SettingsOptions.presentPriorityDefault

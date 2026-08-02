@@ -112,6 +112,9 @@ export interface StreamSettings {
   bitrate_kbps: number; // 0 = host default
   codec?: string; // "auto" | "hevc" | "h264" | "av1" — soft preference (absent in pre-codec files)
   gamepad: string; // "auto" | "xbox360" | "xboxone" | "dualsense" | "dualshock4" | "steamdeck"
+  // Forward this device's controllers at all. Absent in pre-forwarding files, where the
+  // client's own serde default (true) applies — so `?? true` at every read, never `!!`.
+  gamepad_forwarding?: boolean;
   compositor: string; // "auto" | "kwin" | "wlroots" | "mutter" | "gamescope"
   // Round-trips only — deliberately NOT offered as a row here. It decides whether the session
   // grabs the keyboard so Alt+Tab/Super reach the host, and Game Mode is gamescope: it has no

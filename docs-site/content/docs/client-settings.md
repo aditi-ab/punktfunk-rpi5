@@ -123,8 +123,28 @@ than silently snapping back to the default; the Mac shows it as "Unavailable dev
 
 ## Input
 
-Touch modes, mouse modes and the in-stream chords have their own page: [Input](/docs/input). Four
+Touch modes, mouse modes and the in-stream chords have their own page: [Input](/docs/input). Five
 more settings are worth naming here.
+
+**Forward controllers** — *default: on*, on every client. Off, the controllers connected to *this*
+device are not sent to the host at all. That is what you want when your controller already reaches
+the host by some other route — [USB passthrough](/docs/automation#recipe-full-controller-passthrough-virtualhere)
+such as VirtualHere, or simply a pad plugged into the host itself. Leaving forwarding on in that
+situation hands the host two controllers for one pair of hands, and games read both: a stick drifts
+because the second pad is centred, or a menu takes every input twice.
+
+On Linux and Windows it does more than stay quiet. Opening a controller is what *claims* it — the
+client's SDL takes the device node — and a claimed device is one a passthrough tool cannot bind. So
+with this off the session never opens the controller at all, which is precisely what leaves it free
+for VirtualHere to hand over. The consequence to know: the
+[controller escape chord](/docs/input#leaving-with-a-controller) is read off forwarded pads, so it is
+unavailable on those two while this is off — leave a stream with the keyboard chord or the client's
+own UI. The Apple and Android apps claim nothing, so their chords keep working either way; the
+Android app does stop its DualSense and Steam Controller 2 USB captures, which *do* claim the
+device.
+
+The rows below it — which pad, and what type — have nothing to act on while this is off, and every
+client greys them out to say so.
 
 **Gamepad type** (*Controller type* on Apple, Android and the console home) — *default: Automatic*,
 which matches each physical controller. The pickers offer Xbox 360, Xbox One, DualSense and
@@ -193,7 +213,9 @@ stay global and **cannot be put in a settings profile**:
   more than one adapter. The Apple and Android apps have neither.
 - **Speaker** and **Microphone** device pickers — this device's audio endpoints.
 - **Forwarded controller** — which physical pad is in your hands. The *type* the host creates is a
-  preference and can live in a profile; which pad you hold cannot.
+  preference and can live in a profile; which pad you hold cannot. **Forward controllers** is a
+  preference too, and does live in a profile — a work profile can decline to forward what a game
+  profile forwards.
 - **Auto-wake on connect** and **Show game library** — decisions about this device and this network,
   not about how a given host is streamed.
 

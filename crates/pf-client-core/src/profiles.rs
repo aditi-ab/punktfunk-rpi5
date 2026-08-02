@@ -74,6 +74,8 @@ pub struct SettingsOverlay {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gamepad: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub gamepad_forwarding: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub stats_verbosity: Option<StatsVerbosity>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fullscreen_on_stream: Option<bool>,
@@ -141,6 +143,9 @@ impl SettingsOverlay {
         }
         if let Some(v) = &self.gamepad {
             s.gamepad = v.clone();
+        }
+        if let Some(v) = self.gamepad_forwarding {
+            s.gamepad_forwarding = v;
         }
         if let Some(v) = self.stats_verbosity {
             // Through the setter so the legacy `show_stats` bool stays coherent for
@@ -220,6 +225,9 @@ impl SettingsOverlay {
         if after.gamepad != before.gamepad {
             self.gamepad = Some(after.gamepad.clone());
         }
+        if after.gamepad_forwarding != before.gamepad_forwarding {
+            self.gamepad_forwarding = Some(after.gamepad_forwarding);
+        }
         if after.stats_verbosity() != before.stats_verbosity() {
             self.stats_verbosity = Some(after.stats_verbosity());
         }
@@ -257,6 +265,7 @@ impl SettingsOverlay {
             "invert_scroll" => self.invert_scroll = None,
             "inhibit_shortcuts" => self.inhibit_shortcuts = None,
             "gamepad" => self.gamepad = None,
+            "gamepad_forwarding" => self.gamepad_forwarding = None,
             "stats_verbosity" => self.stats_verbosity = None,
             "fullscreen_on_stream" => self.fullscreen_on_stream = None,
             _ => return false,
@@ -433,6 +442,10 @@ mod tests {
         assert_eq!((out.width, out.height), (1920, 1080));
         assert_eq!(out.bitrate_kbps, 20000);
         assert_eq!(out.codec, "hevc");
+        assert!(
+            out.gamepad_forwarding,
+            "default on, and an empty overlay leaves it alone"
+        );
         assert!(empty.is_empty());
 
         let overlay = SettingsOverlay {
@@ -452,6 +465,7 @@ mod tests {
             invert_scroll: Some(true),
             inhibit_shortcuts: Some(false),
             gamepad: Some("dualsense".into()),
+            gamepad_forwarding: Some(false),
             match_window: Some(true),
             fullscreen_on_stream: Some(false),
             stats_verbosity: Some(StatsVerbosity::Detailed),
@@ -473,6 +487,7 @@ mod tests {
         assert!(out.invert_scroll);
         assert!(!out.inhibit_shortcuts);
         assert_eq!(out.gamepad, "dualsense");
+        assert!(!out.gamepad_forwarding);
         assert!(out.match_window);
         assert!(!out.fullscreen_on_stream);
         assert_eq!(out.stats_verbosity(), StatsVerbosity::Detailed);
@@ -589,6 +604,29 @@ mod tests {
         assert_eq!((o.width, o.height, o.match_window), (None, None, None));
         assert!(o.is_empty());
         assert!(!o.clear("no_such_field"));
+    }
+
+    /// Controller forwarding defaults ON, so its interesting override is the FALSE one — and a
+    /// `false` that `apply` dropped would silently forward a pad the profile said not to.
+    /// `absorb` must record it, `clear` must undo it, and the serialized name both carry is the
+    /// one every client's reset button sends.
+    #[test]
+    fn gamepad_forwarding_overrides_off_and_resets_back() {
+        let base = Settings::default();
+        assert!(base.gamepad_forwarding, "the shipped default");
+
+        let mut o = SettingsOverlay::default();
+        let mut after = base.clone();
+        after.gamepad_forwarding = false;
+        o.absorb(&base, &after);
+        assert_eq!(o.gamepad_forwarding, Some(false));
+        assert!(!o.apply(&base).gamepad_forwarding);
+
+        assert!(o.clear("gamepad_forwarding"));
+        assert_eq!(o.gamepad_forwarding, None);
+        assert!(o.is_empty());
+        // Back to inheriting: the global's live value, not a remembered false.
+        assert!(o.apply(&base).gamepad_forwarding);
     }
 
     /// Stats verbosity Off must survive `apply` — it is a legitimate override, and going

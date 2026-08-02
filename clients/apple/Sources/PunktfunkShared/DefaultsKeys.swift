@@ -32,6 +32,12 @@ public enum DefaultsKey {
     public static let compositor = "punktfunk.compositor"
     public static let gamepadType = "punktfunk.gamepadType"
     public static let gamepadID = "punktfunk.gamepadID"
+    /// Forward this device's controllers to the host at all (default true). Off is for a
+    /// couch whose controller reaches the host another way — USB passthrough such as
+    /// VirtualHere, or a pad plugged into the host — where forwarding as well would give the
+    /// host two pads for one pair of hands. Read at connect: `SessionModel` then never starts
+    /// `GamepadCapture`, so no slot opens, no arrival is sent and no virtual pad is built.
+    public static let gamepadForwarding = "punktfunk.gamepadForwarding"
     public static let bitrateKbps = "punktfunk.bitrateKbps"
     /// Requested audio channel count: 2 (stereo), 6 (5.1) or 8 (7.1). The host clamps to what it
     /// can capture; the resolved count drives the in-core decode + AVAudioEngine layout.

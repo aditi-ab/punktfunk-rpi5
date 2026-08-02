@@ -26,6 +26,7 @@ struct GamepadSettingsView: View {
     @AppStorage(DefaultsKey.streamHz) private var hz = 60
     @AppStorage(DefaultsKey.compositor) private var compositor = 0
     @AppStorage(DefaultsKey.gamepadType) private var gamepadType = 0
+    @AppStorage(DefaultsKey.gamepadForwarding) private var gamepadForwarding = true
     @AppStorage(DefaultsKey.bitrateKbps) private var bitrateKbps = 0
     @AppStorage(DefaultsKey.audioChannels) private var audioChannels = 2
     @AppStorage(DefaultsKey.hdrEnabled) private var hdrEnabled = true
@@ -323,8 +324,15 @@ struct GamepadSettingsView: View {
                     + "speaker setups feeding the game back to the host.",
                 value: $echoCancel),
 
+            toggleRow(
+                id: "padForward", header: "Controller", icon: "gamecontroller",
+                label: "Forward controllers",
+                detail: "Send this device's controllers to the host. Turn it off when your "
+                    + "controller already reaches the host another way — USB passthrough such "
+                    + "as VirtualHere — so games don't see two of them.",
+                value: $gamepadForwarding),
             choiceRow(
-                id: "pad", header: "Controller", icon: "gamecontroller", label: "Use controller",
+                id: "pad", icon: "gamecontroller", label: "Use controller",
                 detail: "Which pad is forwarded to the host, as player 1.",
                 options: controllers, current: gamepads.preferredID
             ) { gamepads.preferredID = $0 },
