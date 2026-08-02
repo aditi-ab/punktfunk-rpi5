@@ -392,7 +392,7 @@ pub(super) fn run_async(
         // even when the choreographer clock is absent.
         if let Some(p) = presenter.as_mut() {
             let clock = vsync.as_ref().map(|v| v.shared().as_ref());
-            if p.pump(&codec, clock, &tracker, &stats, now_monotonic_ns()) {
+            if p.pump(&codec, clock, &tracker, &meter, &stats, now_monotonic_ns()) {
                 rendered += 1;
             }
             // The 1 Hz window flush doubles as the phase-lock report tick. v3 sensor: the
