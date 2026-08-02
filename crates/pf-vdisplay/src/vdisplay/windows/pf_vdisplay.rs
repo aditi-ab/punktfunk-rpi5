@@ -21,6 +21,7 @@ use std::ffi::c_void;
 use std::mem::size_of;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use windows::core::{GUID, PCWSTR};
@@ -143,31 +144,70 @@ fn reap_ghost_monitors() -> u32 {
     }
 }
 
-/// Kick the pf-vdisplay ADAPTER device (disable → enable) — the in-process equivalent of
-/// `reset-pf-vdisplay.ps1` step 3. A crashed/killed WUDFHost can leave the devnode "started" yet
-/// HOSTLESS (PnP Status OK, no WUDFHost process, zero device-interface instances) — a zombie no
-/// session can open until the stack reloads; on-glass, only a device cycle recovered it. Called by
-/// [`VdisplayDriver::open`] when `open_device` finds no openable interface; the caller retries the
-/// open afterwards. Best-effort + bounded (~7 s inside the script). Returns whether a punktfunk
-/// adapter devnode was found (and therefore cycled) — `false` means the driver genuinely is not
-/// installed and a retry is pointless.
-fn restart_vdisplay_device() -> bool {
+/// What an adapter-cycle attempt actually DID — deliberately NOT the devnode's PnP status afterwards.
+/// The old script reported that status, and a device it had failed to touch at all still reads `OK`,
+/// so a no-op cycle was indistinguishable from a real one in the log (field report 2026-08-02: a
+/// woken host logged `cycled … status=OK` and then failed the session for a missing interface).
+enum AdapterCycle {
+    /// The driver stack was genuinely reloaded. `how` names the lever that worked.
+    Reloaded { how: &'static str, status: String },
+    /// No punktfunk adapter devnode exists at all — the driver is not installed and retrying is
+    /// pointless.
+    NotInstalled,
+    /// A devnode exists but could not be reloaded; carries the reason (already whitespace-collapsed).
+    Refused(String),
+}
+
+/// Reload the pf-vdisplay ADAPTER device — the in-process equivalent of `reset-pf-vdisplay.ps1`
+/// step 3. A crashed/killed WUDFHost can leave the devnode "started" yet HOSTLESS (PnP Status OK, no
+/// WUDFHost process, zero device-interface instances) — a zombie no session can open until the stack
+/// reloads; on-glass, only a device reload recovered it.
+///
+/// Two levers, in order. `Disable-PnpDevice` + `Enable-PnpDevice` is the one `reset-pf-vdisplay.ps1`
+/// uses — but that script stops the host service FIRST, precisely because the host holds the driver's
+/// control device open (its step 1), and a disable can be refused for a device in use. This runs
+/// INSIDE the host, so it structurally cannot take that step: the retired-but-never-closed handles in
+/// [`DeviceSlot`](super::manager) are still open on the very device being disabled. So a refusal is
+/// the expected case here, not the exotic one, and `pnputil /restart-device` — which reloads a device
+/// that is in use — is the fallback. Whichever runs, the failure paths re-enable, so a half-completed
+/// cycle can never leave the adapter DISABLED.
+///
+/// Best-effort + bounded (~6 s inside the script).
+fn reload_vdisplay_adapter() -> AdapterCycle {
     // Mirrors reset-pf-vdisplay.ps1's Get-PfAdapter selector ('punktfunk Virtual Display' is the INF
-    // device description — locale-invariant). Same spawn shape as `reap_ghost_monitors` above.
+    // device description — locale-invariant). Same spawn shape as `reap_ghost_monitors` above; the
+    // reported tokens are ours, so parsing them is locale-invariant too.
+    //
+    // Every step that can fail is `-ErrorAction Stop` inside a `try` — the old script ran the whole
+    // cycle under `SilentlyContinue` and then reported `(Get-PnpDevice …).Status`, which reports the
+    // DEVICE, not the cycle: a disable that was refused left the device untouched, started, and
+    // reading `OK`, so the host logged a successful recovery it had never performed.
+    //
+    // `$LASTEXITCODE = 1` before the pnputil call for the same reason: no native command runs before
+    // it, so an unlaunchable pnputil would otherwise leave the variable holding whatever it held and
+    // let "never ran" read as "returned 0". Pre-seeding a failure means only a real exit 0 reports a
+    // reload. pnputil is resolved by full path — a LocalSystem service's PATH need not include
+    // System32.
     const CYCLE_PS: &str = "$ErrorActionPreference='SilentlyContinue'; \
         $ad = Get-PnpDevice -Class Display | Where-Object { $_.FriendlyName -match 'punktfunk Virtual Display' } | Select-Object -First 1; \
-        if ($ad) { \
-            Disable-PnpDevice -InstanceId $ad.InstanceId -Confirm:$false; Start-Sleep -Seconds 3; \
-            Enable-PnpDevice -InstanceId $ad.InstanceId -Confirm:$false; Start-Sleep -Seconds 3; \
-            $st = (Get-PnpDevice -InstanceId $ad.InstanceId).Status; \
-            if ($st -ne 'OK') { Enable-PnpDevice -InstanceId $ad.InstanceId -Confirm:$false; Start-Sleep -Seconds 2; \
-                $st = (Get-PnpDevice -InstanceId $ad.InstanceId).Status }; \
-            Write-Output $st \
-        } else { Write-Output 'ABSENT' }";
+        if (-not $ad) { Write-Output 'ABSENT'; exit }; \
+        $id = $ad.InstanceId; $err = ''; \
+        try { \
+            Disable-PnpDevice -InstanceId $id -Confirm:$false -ErrorAction Stop; Start-Sleep -Seconds 2; \
+            try { Enable-PnpDevice -InstanceId $id -Confirm:$false -ErrorAction Stop } \
+            catch { Start-Sleep -Seconds 2; Enable-PnpDevice -InstanceId $id -Confirm:$false -ErrorAction Stop }; \
+            Start-Sleep -Seconds 2; \
+            Write-Output ('RELOADED cycle ' + (Get-PnpDevice -InstanceId $id).Status); exit \
+        } catch { $err = ($_.Exception.Message -replace '\\s+', ' ') }; \
+        $pnp = ($env:SystemRoot + '\\System32\\pnputil.exe'); $LASTEXITCODE = 1; \
+        if (Test-Path $pnp) { & $pnp /restart-device $id *> $null }; \
+        if ($LASTEXITCODE -eq 0) { Start-Sleep -Seconds 2; \
+            Write-Output ('RELOADED restart ' + (Get-PnpDevice -InstanceId $id).Status) } \
+        else { Enable-PnpDevice -InstanceId $id -Confirm:$false; Write-Output ('REFUSED ' + $err) }";
     let ps = std::env::var("SystemRoot")
         .map(|r| format!(r"{r}\System32\WindowsPowerShell\v1.0\powershell.exe"))
         .unwrap_or_else(|_| "powershell.exe".to_string());
-    match std::process::Command::new(&ps)
+    let out = match std::process::Command::new(&ps)
         .args([
             "-NoProfile",
             "-NonInteractive",
@@ -178,22 +218,65 @@ fn restart_vdisplay_device() -> bool {
         ])
         .output()
     {
-        Ok(o) => {
-            let status = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            if status == "ABSENT" {
-                tracing::warn!("pf-vdisplay: no adapter devnode to cycle — driver not installed");
-            } else {
-                tracing::warn!(
-                    %status,
-                    "pf-vdisplay: cycled the adapter device (hostless-zombie recovery)"
-                );
-            }
-            status != "ABSENT"
-        }
+        Ok(o) => String::from_utf8_lossy(&o.stdout).trim().to_string(),
         Err(e) => {
-            tracing::warn!(error = %e, "pf-vdisplay: adapter cycle could not spawn powershell");
-            false
+            tracing::warn!(error = %e, "pf-vdisplay: adapter reload could not spawn powershell");
+            return AdapterCycle::Refused(format!("could not spawn powershell: {e}"));
         }
+    };
+    let outcome = classify_reload_output(&out);
+    match &outcome {
+        AdapterCycle::NotInstalled => {
+            tracing::warn!("pf-vdisplay: no adapter devnode to reload — driver not installed");
+        }
+        AdapterCycle::Reloaded { how, status } => tracing::warn!(
+            how,
+            %status,
+            "pf-vdisplay: reloaded the adapter device (hostless-zombie recovery)"
+        ),
+        AdapterCycle::Refused(why) => tracing::warn!(
+            reason = %why,
+            "pf-vdisplay: the adapter devnode exists but could NOT be reloaded — a session cannot \
+             recover from this without a host-service restart or a reboot"
+        ),
+    }
+    outcome
+}
+
+/// Parse [`reload_vdisplay_adapter`]'s script output. Split out to be testable without a box: the
+/// bug this whole change answers was a recovery that MISreported its own outcome, so the decoding of
+/// that outcome is worth pinning down.
+fn classify_reload_output(out: &str) -> AdapterCycle {
+    let out = out.trim();
+    let (verb, rest) = out.split_once(char::is_whitespace).unwrap_or((out, ""));
+    match verb {
+        "ABSENT" => AdapterCycle::NotInstalled,
+        "RELOADED" => {
+            let (how, status) = rest
+                .trim()
+                .split_once(char::is_whitespace)
+                .unwrap_or((rest.trim(), ""));
+            // Held as `&'static str` so the two levers stay distinguishable in a field report:
+            // `restart` means the disable was refused, i.e. something still holds the device open —
+            // worth knowing when a reload does not fix the box.
+            let how: &'static str = if how == "restart" {
+                "pnputil /restart-device"
+            } else {
+                "disable+enable"
+            };
+            AdapterCycle::Reloaded {
+                how,
+                status: status.trim().to_string(),
+            }
+        }
+        // Covers `REFUSED <reason>` and anything unrecognised, including an empty stdout (powershell
+        // died before writing). All of them mean an un-reloaded devnode, which is the only thing
+        // callers act on; the text rides along for the log.
+        _ => AdapterCycle::Refused(if rest.trim().is_empty() {
+            format!("unexpected adapter-reload output: {out:?}")
+        } else {
+            rest.trim().to_string()
+        }),
     }
 }
 
@@ -325,6 +408,55 @@ impl Drop for DevInfoList {
     }
 }
 
+/// What a device-interface enumeration found. The counts are what let [`ensure_available`] tell a
+/// devnode that is MID-TRANSITION (present, interface registered, not started yet — resuming from
+/// sleep, restarting, reloading) apart from one that is genuinely gone. Only the second is worth
+/// answering with device surgery; cycling the first only lengthens the outage it is waiting out.
+struct Probe {
+    /// The control handle, if any interface instance opened.
+    handle: Option<OwnedHandle>,
+    /// Instances seen with `SPINT_ACTIVE` set — the owning device is started.
+    active: u32,
+    /// Instances seen with `SPINT_ACTIVE` clear — registered, but the owning device is not started.
+    inactive: u32,
+    /// The last enumeration/open failure, kept for the diagnostic.
+    last_err: Option<anyhow::Error>,
+}
+
+impl Probe {
+    /// No interface instance of ANY kind. With an adapter devnode present this is the hostless-zombie
+    /// state a WUDFHost crash leaves; with none, the driver is not installed. Either way, waiting
+    /// alone will not fix it.
+    fn is_absent(&self) -> bool {
+        self.handle.is_none() && self.active == 0 && self.inactive == 0
+    }
+
+    /// Why no handle came back, NAMING what was seen — "0 interfaces" and "1 inactive interface" are
+    /// completely different diagnoses (not installed vs. still coming up), and the old message
+    /// collapsed both into "is the driver installed?". Call only on a miss; a hit reports as much.
+    fn into_error(self) -> anyhow::Error {
+        let seen = format!("{} active, {} inactive", self.active, self.inactive);
+        if self.handle.is_some() {
+            return anyhow::anyhow!("pf-vdisplay device interface opened ({seen})");
+        }
+        match self.last_err {
+            Some(e) => e.context(format!("no openable pf-vdisplay device interface ({seen})")),
+            None => anyhow::anyhow!(
+                "no pf-vdisplay device interface found ({seen}) — is the pf-vdisplay driver \
+                 installed and its device started?"
+            ),
+        }
+    }
+
+    /// Consume into the [`open_device`] result.
+    fn into_result(mut self) -> Result<OwnedHandle> {
+        match self.handle.take() {
+            Some(h) => Ok(h),
+            None => Err(self.into_error()),
+        }
+    }
+}
+
 /// Open the pf-vdisplay control device.
 ///
 /// SAFE, and owning. It has no caller obligation — it takes no arguments and every precondition is
@@ -333,26 +465,40 @@ impl Drop for DevInfoList {
 /// this file has already leaked from once (see the wrap-IMMEDIATELY comment in `open`). Returning an
 /// `OwnedHandle` makes the close a `Drop`, so there is exactly one way to get it wrong: not at all.
 fn open_device() -> Result<OwnedHandle> {
+    probe_device().into_result()
+}
+
+/// [`open_device`], reporting WHAT it found rather than only whether it succeeded.
+fn probe_device() -> Probe {
+    let mut probe = Probe {
+        handle: None,
+        active: 0,
+        inactive: 0,
+        last_err: None,
+    };
     // SAFETY: plain SetupAPI enumeration call; the returned list is solely owned by the RAII wrapper.
-    let hdev = DevInfoList(
-        unsafe {
-            SetupDiGetClassDevsW(
-                Some(&PF_VDISPLAY_INTERFACE),
-                PCWSTR::null(),
-                None,
-                DIGCF_DEVICEINTERFACE | DIGCF_PRESENT,
-            )
+    let hdev = match unsafe {
+        SetupDiGetClassDevsW(
+            Some(&PF_VDISPLAY_INTERFACE),
+            PCWSTR::null(),
+            None,
+            DIGCF_DEVICEINTERFACE | DIGCF_PRESENT,
+        )
+    }
+    .context("SetupDiGetClassDevsW(pf-vdisplay) — is the pf-vdisplay driver installed?")
+    {
+        Ok(h) => DevInfoList(h),
+        Err(e) => {
+            probe.last_err = Some(e);
+            return probe;
         }
-        .context("SetupDiGetClassDevsW(pf-vdisplay) — is the pf-vdisplay driver installed?")?,
-    );
+    };
 
     // Enumerate EVERY interface instance, not just index 0: after a driver upgrade a present-but-
     // failed devnode (Code 10) can hold index 0 while the LIVE node's interface sits at a later
     // index — the old single-index read then failed every session with "driver not installed"
     // even though a working interface existed. `SPINT_ACTIVE` filters dead interfaces (an interface
     // is active only while its owning device is started); the first active + openable one wins.
-    let mut inactive = 0u32;
-    let mut last_err: Option<anyhow::Error> = None;
     for index in 0..64u32 {
         let mut idata = SP_DEVICE_INTERFACE_DATA {
             cbSize: size_of::<SP_DEVICE_INTERFACE_DATA>() as u32,
@@ -367,9 +513,10 @@ fn open_device() -> Result<OwnedHandle> {
             break; // ERROR_NO_MORE_ITEMS — no further candidates
         }
         if idata.Flags & SPINT_ACTIVE == 0 {
-            inactive += 1;
+            probe.inactive += 1;
             continue;
         }
+        probe.active += 1;
         let mut required = 0u32;
         // SAFETY: sizing call — null buffer plus a valid `required` out-param; the expected
         // ERROR_INSUFFICIENT_BUFFER "failure" is ignored and only `required` is consumed.
@@ -409,20 +556,18 @@ fn open_device() -> Result<OwnedHandle> {
                 })
         };
         match opened {
-            // SAFETY: `h` is the handle `CreateFileW` just returned to THIS call and nothing else
-            // holds it, so transferring it into the `OwnedHandle` gives it a single owner that
-            // closes it exactly once on drop.
-            Ok(h) => return Ok(unsafe { OwnedHandle::from_raw_handle(h.0 as _) }),
+            Ok(h) => {
+                // SAFETY: `h` is the handle `CreateFileW` just returned to THIS call and nothing
+                // else holds it, so transferring it into the `OwnedHandle` gives it a single owner
+                // that closes it exactly once on drop.
+                probe.handle = Some(unsafe { OwnedHandle::from_raw_handle(h.0 as _) });
+                return probe;
+            }
             // A raced-away or wedged device — remember the error, try the next interface.
-            Err(e) => last_err = Some(e),
+            Err(e) => probe.last_err = Some(e),
         }
     }
-    Err(last_err.unwrap_or_else(|| {
-        anyhow::anyhow!(
-            "no ACTIVE pf-vdisplay device interface found ({inactive} inactive) — is the \
-             pf-vdisplay driver installed and its device started?"
-        )
-    }))
+    probe
 }
 
 /// The pf-vdisplay IOCTL surface behind the shared [`VirtualDisplayManager`](super::manager::VirtualDisplayManager)
@@ -435,29 +580,14 @@ impl VdisplayDriver for PfVdisplayDriver {
     }
 
     unsafe fn open(&self, reap_orphans: bool) -> Result<(OwnedHandle, u32, u32)> {
-        let device = match open_device() {
-            Ok(d) => d,
-            Err(first) => {
-                // No openable interface. If a WUDFHost crash left the devnode a hostless zombie
-                // (validated on-glass: PnP Status OK, zero interface instances), a device cycle
-                // reloads the stack — kick it once and retry the open over a short arrival window.
-                if !restart_vdisplay_device() {
-                    return Err(first); // no adapter devnode at all — genuinely not installed
-                }
-                let mut reopened = Err(first);
-                for _ in 0..8 {
-                    std::thread::sleep(std::time::Duration::from_millis(500));
-                    match open_device() {
-                        Ok(d) => {
-                            reopened = Ok(d);
-                            break;
-                        }
-                        Err(e) => reopened = Err(e),
-                    }
-                }
-                reopened.context("pf-vdisplay interface still absent after an adapter cycle")?
-            }
-        };
+        // A short re-probe, and deliberately NO adapter reload — this replaces the second, impatient
+        // copy of the recovery that used to live here. Session bring-up already ran the full
+        // `ensure_available` before constructing the backend, so anything left for this open to
+        // absorb is a race, not a wedge. `hw_cursor_capable` also lands here, mid client handshake,
+        // where a reload's tens of seconds would be entirely the wrong trade for one capability bool
+        // — and where reloading would deadlock besides, since `ensure_device` calls us holding the
+        // manager's `device` mutex (see the `RECOVERY` ordering contract).
+        let device = wait_for_interface(BRIEF_RETRY, false).0?;
         // `open_device` hands back an `OwnedHandle`, so every `?` below closes the device exactly
         // once by construction — the shape this used to reach by wrapping the raw handle here, and
         // which leaked whenever GET_INFO itself failed before that wrap was moved up.
@@ -879,25 +1009,159 @@ pub fn is_available() -> bool {
     open_device().is_ok()
 }
 
-/// [`is_available`], with self-heal: an interface-less driver whose adapter devnode EXISTS is the
-/// hostless-zombie state a WUDFHost crash leaves behind (validated on-glass — PnP reports Status OK
-/// with no WUDFHost process and zero interface instances, and every session fails at this gate until
-/// the device reloads). Cycle the adapter once and re-probe over a short arrival window. A genuinely
-/// uninstalled driver (no adapter devnode) fails fast without the wait.
-pub fn ensure_available() -> bool {
-    if is_available() {
-        return true;
+/// How often the interface is re-probed while waiting.
+const PROBE_INTERVAL: Duration = Duration::from_millis(500);
+
+/// How long a devnode whose interface exists but is NOT-READY (no active instance, or `CreateFileW`
+/// refused) is given to come up on its own before the adapter is reloaded.
+///
+/// This is the wake-from-sleep window. Resuming re-enters D0 and re-registers the interface while
+/// the rest of the resume storm is still running, and a client reconnecting a second after wake
+/// arrives inside that gap — which the old code, probing exactly ONCE, answered by disabling and
+/// re-enabling a display adapter that was seconds from being ready anyway.
+const NOT_READY_GRACE: Duration = Duration::from_secs(15);
+
+/// How long a fully ABSENT interface is given before the adapter is reloaded. Short — a hostless
+/// devnode does not heal itself, and that is the case this recovery exists for — but non-zero, so a
+/// resume that briefly de-registers the interface is not met with device surgery either.
+const ABSENT_SETTLE: Duration = Duration::from_secs(3);
+
+/// How long the interface is given to ARRIVE after a reload.
+///
+/// Was 4 s, which a quiet box meets and a box still finishing a resume does not: PnP is contended
+/// right after wake. Field report 2026-08-02 — a woken host logged a successful adapter cycle and
+/// then failed the session 4 s later for a missing interface, and the client could not connect.
+const ARRIVAL_AFTER_RELOAD: Duration = Duration::from_secs(15);
+
+/// Hard ceiling on the whole wait, so display prep can never block for an unbounded sum of the
+/// windows above. Without it a devnode wedged NOT-READY costs the full grace, then the reload, then
+/// the full arrival window before failing — the pathological case paying nearly a minute per session.
+/// Patience for a device that is coming back is the point; patience for one that never will is not.
+const TOTAL_BUDGET: Duration = Duration::from_secs(30);
+
+/// The budget a caller that must NOT stall gives the interface: no adapter reload, just a short
+/// re-probe to ride out a race. [`VdisplayDriver::open`] uses it — by the time the manager opens,
+/// session bring-up has already run the full [`ensure_available`] above, and the OTHER path that
+/// reaches it (`manager::hw_cursor_capable`, a best-effort capability answer during the client
+/// handshake) must never hold the Welcome for tens of seconds to decide one bool.
+const BRIEF_RETRY: Duration = Duration::from_secs(3);
+
+/// Serializes the recovery so N sessions racing in after a wake perform ONE adapter reload between
+/// them rather than N interleaved ones — each of which tears down the stack the others are waiting
+/// on. The second caller through typically finds the interface already up and returns at once.
+///
+/// Taken ONLY by [`ensure_available`], which holds no manager lock, and released before the retire
+/// hook below takes the manager's `device` mutex. That is what keeps the lock order one-way:
+/// [`VdisplayDriver::open`] runs *inside* that same `device` mutex, so if it could also take this
+/// lock the two orders would invert and deadlock. It cannot — it never reloads.
+static RECOVERY: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// [`is_available`], with self-heal — and with PATIENCE, which is the part that matters after a
+/// wake from sleep.
+///
+/// Returns the reason on failure instead of a bare `false`: the caller used to replace it with a
+/// flat "the driver is not installed", which is what a field report showed on a box whose driver was
+/// installed, started, and merely mid-resume.
+pub fn ensure_available() -> Result<()> {
+    // Poisoning carries no meaning here — the guard protects a `()`, not state a panic could leave
+    // inconsistent — so a previous panic must not wedge every later session out of recovery.
+    let (result, reloaded) = {
+        let _serialize = RECOVERY.lock().unwrap_or_else(|e| e.into_inner());
+        wait_for_interface(NOT_READY_GRACE, true)
+    };
+    // OUTSIDE the recovery lock, by the ordering contract on `RECOVERY`. A reload tore the driver
+    // stack down and back up, so any control handle a previous session cached is dead by
+    // construction — retire it while we know that for certain, rather than leaving the next session
+    // to discover it by having an IOCTL fail. No-op before any backend opened the device.
+    if reloaded {
+        super::manager::invalidate_cached_device(
+            "the pf-vdisplay adapter was reloaded (hostless-zombie recovery)",
+        );
     }
-    if !restart_vdisplay_device() {
-        return false;
-    }
-    for _ in 0..8 {
-        std::thread::sleep(std::time::Duration::from_millis(500));
-        if is_available() {
-            return true;
+    result.map(|_| ())
+}
+
+/// Wait for an openable control interface, reloading the adapter if `reload` and the devnode looks
+/// genuinely hostless. Returns the handle (so the manager's own open can keep it) alongside whether
+/// a reload ran.
+///
+/// Two distinguishable states hide behind "cannot open the interface", and they want opposite
+/// treatment:
+///
+/// * **Not ready** — instances are registered but none is active (or the open is refused). The
+///   devnode is THERE and coming up: resuming from sleep, restarting, reloading. It heals itself;
+///   reloading the adapter underneath it only lengthens the outage.
+/// * **Absent** — no instance at all. With an adapter devnode present this is the hostless-zombie
+///   state a WUDFHost crash leaves (validated on-glass: PnP Status OK, no WUDFHost process, zero
+///   interface instances). Only a reload clears it.
+///
+/// So: probe, wait out a not-ready device, reload an absent one after a short settle, and give the
+/// interface a real arrival window afterwards. A reload is still attempted once at the end of
+/// `not_ready_grace`, so a devnode wedged not-ready (a failed start) recovers exactly as it did
+/// before. A genuinely uninstalled driver — no adapter devnode — still fails FAST, with no wait.
+fn wait_for_interface(not_ready_grace: Duration, reload: bool) -> (Result<OwnedHandle>, bool) {
+    let started = Instant::now();
+    let mut deadline = started + not_ready_grace;
+    let mut absent_since: Option<Instant> = None;
+    let mut reloaded = false;
+    loop {
+        let mut probe = probe_device();
+        if let Some(h) = probe.handle.take() {
+            if reloaded || started.elapsed() > PROBE_INTERVAL {
+                tracing::info!(
+                    waited_ms = started.elapsed().as_millis() as u64,
+                    reloaded,
+                    "pf-vdisplay: control interface available"
+                );
+            }
+            return (Ok(h), reloaded);
         }
+        // Track how long we have seen NOTHING. Reset by any sighting, so a device that flickers
+        // between absent and not-ready is treated as the transition it is.
+        if probe.is_absent() {
+            absent_since.get_or_insert_with(Instant::now);
+        } else {
+            absent_since = None;
+        }
+        let absent_long_enough = absent_since.is_some_and(|t| t.elapsed() >= ABSENT_SETTLE);
+        if reload && !reloaded && (absent_long_enough || Instant::now() >= deadline) {
+            match reload_vdisplay_adapter() {
+                // No devnode at all — waiting cannot conjure a driver. Fail immediately rather than
+                // burning the arrival window on a box that simply does not have it installed.
+                AdapterCycle::NotInstalled => {
+                    let e = Err(probe.into_error()).context(
+                        "no punktfunk virtual-display adapter devnode exists — the driver is not \
+                         installed",
+                    );
+                    return (e, reloaded);
+                }
+                AdapterCycle::Refused(why) => {
+                    let e = Err(probe.into_error()).context(format!(
+                        "the pf-vdisplay adapter devnode could not be reloaded ({why})"
+                    ));
+                    return (e, reloaded);
+                }
+                AdapterCycle::Reloaded { .. } => {
+                    reloaded = true;
+                    absent_since = None;
+                    deadline = (Instant::now() + ARRIVAL_AFTER_RELOAD).min(started + TOTAL_BUDGET);
+                }
+            }
+        }
+        if Instant::now() >= deadline {
+            let e = Err(probe.into_error()).context(format!(
+                "the pf-vdisplay control interface did not appear within {:?}{}",
+                started.elapsed(),
+                if reloaded {
+                    " (including an adapter reload)"
+                } else {
+                    ""
+                }
+            ));
+            return (e, reloaded);
+        }
+        std::thread::sleep(PROBE_INTERVAL);
     }
-    false
 }
 
 #[cfg(test)]
@@ -905,6 +1169,96 @@ mod tests {
     use super::*;
     use std::thread;
     use std::time::Duration;
+
+    /// The recovery must not be able to claim success it did not achieve. This is the whole bug:
+    /// the old script ran the cycle under `SilentlyContinue` and reported `(Get-PnpDevice).Status`,
+    /// so a device whose disable had been REFUSED — untouched, still started — reported `OK`, and
+    /// the host logged `cycled the adapter device … status=OK` while nothing had been cycled at all
+    /// (field report 2026-08-02). A refusal must decode as a refusal, carrying its reason.
+    #[test]
+    fn a_refused_reload_is_not_reported_as_a_reload() {
+        let refused =
+            classify_reload_output("REFUSED This device cannot be disabled because it is in use.");
+        match refused {
+            AdapterCycle::Refused(why) => {
+                assert!(why.contains("in use"), "the reason must survive: {why:?}")
+            }
+            other => panic!("a refused reload decoded as {}", variant(&other)),
+        }
+        // A bare device status — what the OLD script emitted on every path — must NEVER decode as a
+        // successful reload now, however healthy it looks.
+        for stale in ["OK", "Error", "Unknown"] {
+            assert!(
+                matches!(classify_reload_output(stale), AdapterCycle::Refused(_)),
+                "{stale:?} is a device status, not a reload outcome"
+            );
+        }
+    }
+
+    /// The outcomes callers branch on: `NotInstalled` fails a session fast, `Reloaded` earns the
+    /// arrival window, and the lever that worked stays visible in the log (`restart` means the
+    /// disable was refused and something still holds the device open).
+    #[test]
+    fn reload_outcomes_decode() {
+        assert!(matches!(
+            classify_reload_output("ABSENT"),
+            AdapterCycle::NotInstalled
+        ));
+        match classify_reload_output("RELOADED cycle OK") {
+            AdapterCycle::Reloaded { how, status } => {
+                assert_eq!(how, "disable+enable");
+                assert_eq!(status, "OK");
+            }
+            other => panic!("expected Reloaded, got {}", variant(&other)),
+        }
+        match classify_reload_output("RELOADED restart OK\r\n") {
+            AdapterCycle::Reloaded { how, status } => {
+                assert_eq!(how, "pnputil /restart-device");
+                assert_eq!(status, "OK");
+            }
+            other => panic!("expected Reloaded, got {}", variant(&other)),
+        }
+        // powershell died before writing anything — an un-reloaded devnode, so `Refused`, not a
+        // silent success.
+        assert!(matches!(
+            classify_reload_output("   "),
+            AdapterCycle::Refused(_)
+        ));
+    }
+
+    /// `is_absent` is what decides between WAITING and performing device surgery, so the two states
+    /// it separates are pinned here. An interface that is registered but not yet ACTIVE is a devnode
+    /// mid-transition — the wake-from-sleep case — and reloading the adapter under it only lengthens
+    /// the outage it is already recovering from.
+    #[test]
+    fn only_a_total_absence_counts_as_absent() {
+        let probe = |active, inactive| Probe {
+            handle: None,
+            active,
+            inactive,
+            last_err: None,
+        };
+        assert!(probe(0, 0).is_absent(), "no instances at all = absent");
+        assert!(
+            !probe(0, 1).is_absent(),
+            "a registered-but-inactive instance is a device coming up, not a missing one"
+        );
+        assert!(
+            !probe(1, 0).is_absent(),
+            "an active instance we merely failed to open is not a missing device"
+        );
+        // And the diagnostic names what was seen — the old message collapsed every one of these
+        // into "is the driver installed?", which sent a field report down the wrong path.
+        assert!(probe(0, 2).into_error().to_string().contains("2 inactive"));
+    }
+
+    fn variant(c: &AdapterCycle) -> &'static str {
+        match c {
+            AdapterCycle::Reloaded { .. } => "Reloaded",
+            AdapterCycle::NotInstalled => "NotInstalled",
+            AdapterCycle::Refused(_) => "Refused",
+        }
+    }
 
     /// Live hardware round trip — `#[ignore]`d (needs the pf-vdisplay driver installed); run with
     /// `cargo test -p pf-vdisplay -- --ignored live_create_drop`. Exercises the real trait path: open -> create -> hold -> drop (REMOVE).

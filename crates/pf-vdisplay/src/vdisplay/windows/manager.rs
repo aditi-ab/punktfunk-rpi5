@@ -425,6 +425,20 @@ pub fn control_device_handle() -> Option<HANDLE> {
     VDM.get().and_then(VirtualDisplayManager::device_handle)
 }
 
+/// Retire the cached control handle from OUTSIDE the manager, for a caller that KNOWS the device
+/// died — the adapter-reload recovery in [`crate::driver`], which tears the driver stack down and
+/// back up. Without it the stale handle survives into the next session's `IOCTL_ADD` and is only
+/// recovered by the gone-classified retry one failed IOCTL later.
+///
+/// Takes the `device` mutex, so it must NOT be called from inside it (notably not from
+/// `VdisplayDriver::open`, which `ensure_device` invokes while holding it). No-op before any backend
+/// opened the device.
+pub(crate) fn invalidate_cached_device(why: &str) {
+    if let Some(m) = VDM.get() {
+        m.invalidate_device(&anyhow::anyhow!("{why}"));
+    }
+}
+
 /// Re-commit the CURRENT display config under the manager `state` lock (the sole-topology-mutator
 /// contract of [`force_mode_reenumeration`]). The secure-desktop guard's actuator: the OS only
 /// reverts a path to its software-cursor default ON a mode commit, so standing the hardware-cursor
