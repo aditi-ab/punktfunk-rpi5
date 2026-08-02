@@ -123,6 +123,11 @@ impl<T> FrameStore<T> {
     /// Collapse to newest-wins for the rest of the stream (PyroWave: its plane-ring
     /// retirement accounting assumes the depth-2 newest-wins hand-off, and its all-intra
     /// frames make buffering pointless anyway).
+    ///
+    /// Gated with its only caller: the power-user build (`--no-default-features`, which
+    /// the Windows ARM64 leg ships) has no PyroWave decode path, and an ungated helper
+    /// is dead code there.
+    #[cfg(feature = "pyrowave")]
     pub(crate) fn force_latency(&mut self) {
         if self.capacity == 0 {
             return;
@@ -164,34 +169,64 @@ impl<T> FrameStore<T> {
 /// publish reads, so the phase-lock report and the local scheduler cannot disagree.
 pub(crate) struct LatchClock {
     anchor_ns: u64,
+    /// The previous stamp, kept ACROSS calls. The run loop drains present-wait samples
+    /// every pass, so a "batch" is very often a single stamp — computing spacings only
+    /// within a batch (`windows(2)`) observed nothing at all on glass, and the learner
+    /// silently ran on its seed forever.
+    last_ns: u64,
+    /// Narrowest spacing seen since the last handoff to the grid, and how many have
+    /// accumulated. The grid is fed the MIN of a run rather than every spacing: our
+    /// observations are the spacing of OUR presents, which is k×period whenever the
+    /// stream runs below panel rate, and the min over a run is the best available
+    /// estimate of the true grid step.
+    pending_min_ns: u64,
+    pending_count: u32,
     grid: punktfunk_core::phase::PanelGrid,
     fallback_period_ns: u64,
 }
+
+/// Spacings per handoff to [`punktfunk_core::phase::PanelGrid`]. Small enough that a real
+/// mode change is picked up in well under a second at any sane frame rate.
+const GRID_OBSERVE_EVERY: u32 = 16;
 
 impl LatchClock {
     pub(crate) fn new(refresh_hz: u32) -> LatchClock {
         LatchClock {
             anchor_ns: 0,
+            last_ns: 0,
+            pending_min_ns: 0,
+            pending_count: 0,
             grid: punktfunk_core::phase::PanelGrid::seeded(refresh_hz as i32),
             fallback_period_ns: 1_000_000_000 / u64::from(refresh_hz.max(1)),
         }
     }
 
-    /// Fold a batch of on-glass stamps (ascending submission order). A single stamp
-    /// re-anchors without touching the learned period — that is also the no-present-wait
-    /// degradation, where each submit stamp anchors an approximate grid on the mode's
-    /// refresh period.
+    /// Fold on-glass stamps (ascending). Spacings are measured against the previous
+    /// stamp whatever the batching, so the loop's one-sample-per-pass drain still feeds
+    /// the learner.
     pub(crate) fn note_batch(&mut self, stamps: &[u64]) {
+        for &s in stamps {
+            if self.last_ns != 0 && s > self.last_ns {
+                let d = s - self.last_ns;
+                // < 1 ms apart = a queued pair, not a grid step.
+                if d > 1_000_000 {
+                    self.pending_min_ns = if self.pending_min_ns == 0 {
+                        d
+                    } else {
+                        self.pending_min_ns.min(d)
+                    };
+                    self.pending_count += 1;
+                    if self.pending_count >= GRID_OBSERVE_EVERY {
+                        self.grid.observe(self.pending_min_ns as i64);
+                        self.pending_min_ns = 0;
+                        self.pending_count = 0;
+                    }
+                }
+            }
+            self.last_ns = s;
+        }
         if let Some(&last) = stamps.last() {
             self.anchor_ns = last;
-        }
-        let min_delta = stamps
-            .windows(2)
-            .map(|w| w[1].saturating_sub(w[0]))
-            .filter(|&d| d > 1_000_000) // < 1 ms apart = a queued pair, not a grid step
-            .min();
-        if let Some(d) = min_delta {
-            self.grid.observe(d as i64);
         }
     }
 
@@ -260,11 +295,29 @@ impl Cadence {
 pub(crate) struct CadenceProbe {
     /// Off-grid distances as a fraction of the period, in thousandths.
     off_grid_milli: Vec<u32>,
+    /// Previous stamp, kept across calls for the same reason [`LatchClock`] does: the
+    /// live drain hands over one sample at a time.
+    last_ns: u64,
+    /// The last round's raw reading and how many rounds have agreed — a verdict is only
+    /// published once [`CADENCE_STABLE_ROUNDS`] agree.
+    candidate: Cadence,
+    agree_rounds: u8,
     verdict: Cadence,
 }
 
 /// Enough deltas to distinguish jitter from a real off-grid cadence.
 const CADENCE_MIN_SAMPLES: usize = 24;
+/// Consecutive agreeing rounds before a verdict is published.
+///
+/// ⭐ On glass (GNOME/Wayland, .21, 2026-08-02) the raw per-round verdict FLAPPED between
+/// runs with VRR provably disabled. The cause is structural, not a tuning miss: under a
+/// compositor our on-glass stamp is the compositor's release, so anything that perturbs
+/// delivery — an occluded or unfocused surface being throttled, a distressed pipeline
+/// missing vblanks — smears the spacings exactly the way real VRR does. This probe can
+/// therefore only ever say "presents are not landing on the grid", so it demands
+/// agreement across rounds and refuses evidence from a distressed window (see
+/// [`CadenceProbe::note`]'s `healthy` flag) before claiming anything.
+const CADENCE_STABLE_ROUNDS: u8 = 2;
 /// Median off-grid distance under this fraction of a period reads as grid-locked. Present
 /// stamps carry real measurement jitter (the wait returns, then we read the clock), so
 /// this is deliberately loose — the two regimes differ by far more than this in practice.
@@ -274,35 +327,64 @@ impl CadenceProbe {
     pub(crate) fn new() -> CadenceProbe {
         CadenceProbe {
             off_grid_milli: Vec::with_capacity(64),
+            last_ns: 0,
+            candidate: Cadence::Unknown,
+            agree_rounds: 0,
             verdict: Cadence::Unknown,
         }
     }
 
-    /// Fold one window's on-glass stamps against the learned panel period.
-    pub(crate) fn note(&mut self, stamps: &[u64], period_ns: u64) {
-        if period_ns == 0 {
+    /// Fold on-glass stamps against the learned panel period. Spacings are measured
+    /// against the previous stamp whatever the batching.
+    ///
+    /// `healthy` is the caller's statement that this window's presents were flowing
+    /// normally (no stale force-opens). A distressed pipeline smears spacings for reasons
+    /// that have nothing to do with the panel, so its evidence is dropped — the timeline
+    /// continuity is still advanced, it simply does not count as a sample.
+    pub(crate) fn note(&mut self, stamps: &[u64], period_ns: u64, healthy: bool) {
+        if period_ns == 0 || !healthy {
+            self.last_ns = stamps.last().copied().unwrap_or(self.last_ns);
             return;
         }
-        for w in stamps.windows(2) {
-            let delta = w[1].saturating_sub(w[0]);
-            if delta == 0 {
+        for &s in stamps {
+            let prev = std::mem::replace(&mut self.last_ns, s);
+            if prev == 0 || s <= prev {
                 continue;
             }
+            let delta = s - prev;
             let rem = delta % period_ns;
             // Distance to the NEAREST multiple, so a delta just under k×period reads as
             // close to the grid rather than a whole period away from k-1.
             let off = rem.min(period_ns - rem);
             self.off_grid_milli
                 .push((off.saturating_mul(1000) / period_ns) as u32);
+            // A round closes on the SAMPLE count, inside the loop — not once per call.
+            // Evaluating per call would make the verdict depend on how the caller happens
+            // to batch its stamps (one big batch = one round, forever short of the
+            // agreement requirement), and the live drain and the tests batch differently.
+            self.close_round_if_ready();
         }
+    }
+
+    /// Publish a verdict once a round's worth of spacings agree with the previous round.
+    fn close_round_if_ready(&mut self) {
         if self.off_grid_milli.len() >= CADENCE_MIN_SAMPLES {
             self.off_grid_milli.sort_unstable();
             let median = self.off_grid_milli[self.off_grid_milli.len() / 2];
-            self.verdict = if median <= CADENCE_FIXED_MILLI {
+            let round = if median <= CADENCE_FIXED_MILLI {
                 Cadence::Fixed
             } else {
                 Cadence::Variable
             };
+            if round == self.candidate {
+                self.agree_rounds = self.agree_rounds.saturating_add(1);
+            } else {
+                self.candidate = round;
+                self.agree_rounds = 1;
+            }
+            if self.agree_rounds >= CADENCE_STABLE_ROUNDS {
+                self.verdict = round;
+            }
             self.off_grid_milli.clear();
         }
     }
@@ -314,6 +396,9 @@ impl CadenceProbe {
     /// A mode switch / display change invalidates the evidence.
     pub(crate) fn reset(&mut self) {
         self.off_grid_milli.clear();
+        self.last_ns = 0;
+        self.candidate = Cadence::Unknown;
+        self.agree_rounds = 0;
         self.verdict = Cadence::Unknown;
     }
 }
@@ -440,6 +525,7 @@ mod tests {
     }
 
     /// force_latency collapses a smoothing store to a newest-wins slot mid-stream.
+    #[cfg(feature = "pyrowave")]
     #[test]
     fn force_latency_collapses_to_one_slot() {
         let mut s: FrameStore<u32> = FrameStore::new(3);
@@ -497,6 +583,28 @@ mod tests {
         assert_eq!(fast.period_ns(), 8_333_333);
     }
 
+    /// ⭐ The live loop drains present-wait samples EVERY pass, so stamps arrive one at a
+    /// time. Measuring spacings only within a batch meant the learner observed nothing on
+    /// glass and silently ran on its seed (found on .21, 2026-08-02: `period_us` read back
+    /// exactly the 60 Hz fallback while the panel really was 60 Hz — correct by luck, and
+    /// wrong the moment the mode lies).
+    #[test]
+    fn latch_clock_learns_from_one_sample_at_a_time() {
+        const REAL: u64 = 16_666_666;
+        let mut c = LatchClock::new(120); // seeded too fast, as a refused mode switch would
+        let mut t = 1_000_000_000u64;
+        for _ in 0..(GRID_OBSERVE_EVERY * 8 + 8) {
+            t += REAL;
+            c.note_batch(&[t]); // ONE stamp per call — the live shape
+        }
+        assert_eq!(
+            c.period_ns(),
+            REAL,
+            "single-stamp batches must still feed the grid learner"
+        );
+        assert_eq!(c.anchor_ns(), t);
+    }
+
     /// The mode's refresh is a CLAIM, not a measurement — a refused mode switch or a
     /// compositor running its own rate leaves the seed too fast. The old downward-only
     /// cap pinned that wrong grid for the session (the Android 0.23.0 defect); the
@@ -507,10 +615,14 @@ mod tests {
         let mut c = LatchClock::new(120); // …but the mode claimed 120
         assert_eq!(c.period_ns(), 8_333_333, "seeded from the claim");
 
-        // Consistent 60 Hz evidence, one window at a time.
-        for i in 0..8 {
-            let t = 1_000_000_000 + i * 2 * REAL;
-            c.note_batch(&[t, t + REAL]);
+        // Consistent 60 Hz evidence. The grid is fed the MIN of every
+        // GRID_OBSERVE_EVERY spacings, and PanelGrid widens only after 8 agreeing
+        // observations, so a real widen needs 8 × GRID_OBSERVE_EVERY spacings — the
+        // deliberate cost of not letting one slow patch redefine the panel.
+        let mut t = 1_000_000_000u64;
+        for _ in 0..(GRID_OBSERVE_EVERY * 8 + GRID_OBSERVE_EVERY) {
+            t += REAL;
+            c.note_batch(&[t]);
         }
         assert_eq!(
             c.period_ns(),
@@ -526,18 +638,21 @@ mod tests {
     #[test]
     fn cadence_probe_separates_grid_locked_from_variable() {
         const P: u64 = 8_333_333; // 120 Hz
+                                  // Enough spacings for CADENCE_STABLE_ROUNDS full rounds: a verdict is published
+                                  // only once consecutive rounds agree (on glass a single round FLAPPED).
+        const ROUNDS: u64 = (CADENCE_MIN_SAMPLES as u64) * (CADENCE_STABLE_ROUNDS as u64) + 4;
 
         // Fixed panel, stream at panel rate: every delta is exactly one period.
         let mut probe = CadenceProbe::new();
         assert_eq!(probe.verdict(), Cadence::Unknown, "no evidence yet");
-        let stamps: Vec<u64> = (0..40).map(|i| 1_000_000_000 + i * P).collect();
-        probe.note(&stamps, P);
+        let stamps: Vec<u64> = (0..ROUNDS).map(|i| 1_000_000_000 + i * P).collect();
+        probe.note(&stamps, P, true);
         assert_eq!(probe.verdict(), Cadence::Fixed);
 
         // Fixed panel, stream at HALF panel rate: deltas are 2×P — still grid-locked.
         let mut probe = CadenceProbe::new();
-        let stamps: Vec<u64> = (0..40).map(|i| 1_000_000_000 + i * 2 * P).collect();
-        probe.note(&stamps, P);
+        let stamps: Vec<u64> = (0..ROUNDS).map(|i| 1_000_000_000 + i * 2 * P).collect();
+        probe.note(&stamps, P, true);
         assert_eq!(
             probe.verdict(),
             Cadence::Fixed,
@@ -548,17 +663,19 @@ mod tests {
         // must not read as variable.
         let mut probe = CadenceProbe::new();
         let jitter = [0i64, 300_000, -250_000, 120_000, -400_000, 80_000];
-        let stamps: Vec<u64> = (0..40)
+        let stamps: Vec<u64> = (0..ROUNDS as usize)
             .map(|i| (1_000_000_000 + i as i64 * P as i64 + jitter[i % jitter.len()]) as u64)
             .collect();
-        probe.note(&stamps, P);
+        probe.note(&stamps, P, true);
         assert_eq!(probe.verdict(), Cadence::Fixed, "jitter is not VRR");
 
         // VRR live: a 100 fps stream on a 120 Hz-max panel. 10 ms is not a multiple of
         // 8.33 ms, so every present sits off the grid.
         let mut probe = CadenceProbe::new();
-        let stamps: Vec<u64> = (0..40).map(|i| 1_000_000_000 + i * 10_000_000).collect();
-        probe.note(&stamps, P);
+        let stamps: Vec<u64> = (0..ROUNDS)
+            .map(|i| 1_000_000_000 + i * 10_000_000)
+            .collect();
+        probe.note(&stamps, P, true);
         assert_eq!(probe.verdict(), Cadence::Variable);
 
         // A display change throws the evidence away rather than carrying a stale verdict.
@@ -567,14 +684,52 @@ mod tests {
 
         // Below the sample floor nothing is claimed.
         let mut probe = CadenceProbe::new();
-        probe.note(&[1_000_000_000, 1_010_000_000, 1_020_000_000], P);
+        probe.note(&[1_000_000_000, 1_010_000_000, 1_020_000_000], P, true);
         assert_eq!(probe.verdict(), Cadence::Unknown);
+
+        // ⭐ THE SHAPE THE LIVE LOOP ACTUALLY PRODUCES: the run loop drains present-wait
+        // samples every pass, so stamps arrive ONE AT A TIME. Measuring spacings only
+        // within a batch observed nothing at all on glass — `vrr` stayed Unknown and the
+        // latch clock ran on its seed forever. Found on .21, 2026-08-02.
+        let mut probe = CadenceProbe::new();
+        for i in 0..ROUNDS {
+            probe.note(&[1_000_000_000 + i * 10_000_000], P, true); // 100 fps, off a 120 Hz grid
+        }
+        assert_eq!(
+            probe.verdict(),
+            Cadence::Variable,
+            "one-sample batches must still yield spacings"
+        );
 
         // A period we never learned can't discriminate anything.
         let mut probe = CadenceProbe::new();
-        let stamps: Vec<u64> = (0..40).map(|i| 1_000_000_000 + i * 10_000_000).collect();
-        probe.note(&stamps, 0);
+        let stamps: Vec<u64> = (0..ROUNDS)
+            .map(|i| 1_000_000_000 + i * 10_000_000)
+            .collect();
+        probe.note(&stamps, 0, true);
         assert_eq!(probe.verdict(), Cadence::Unknown);
+    }
+
+    /// ⭐ Batching must not change the verdict. The same spacings delivered as one big
+    /// batch, or one stamp at a time, must reach the same conclusion — the live loop
+    /// drains one at a time while tests hand over vectors, and an evaluation keyed to
+    /// call boundaries silently made the two disagree.
+    #[test]
+    fn cadence_verdict_is_independent_of_batching() {
+        const P: u64 = 8_333_333;
+        let n = (CADENCE_MIN_SAMPLES as u64) * (CADENCE_STABLE_ROUNDS as u64) + 4;
+
+        let stamps: Vec<u64> = (0..n).map(|i| 1_000_000_000 + i * P).collect();
+        let mut bulk = CadenceProbe::new();
+        bulk.note(&stamps, P, true);
+
+        let mut drip = CadenceProbe::new();
+        for s in &stamps {
+            drip.note(&[*s], P, true);
+        }
+
+        assert_eq!(bulk.verdict(), Cadence::Fixed);
+        assert_eq!(drip.verdict(), bulk.verdict(), "batching must not matter");
     }
 
     /// Gate: open at zero outstanding, closed at one, force-open past the stale bound.

@@ -454,6 +454,8 @@ impl Presenter {
         if let Some(v) = video_export.as_mut() {
             v.d3d11_hdr10 = win_capable && import_rgb10 && hdr10_format.is_some();
         }
+        let mut pref = pref;
+        pref.vrr_fifo_opt_in = vrr_fifo_opt_in();
         let present_mode = pick_present_mode(&surface_i, pdev, surface, pref)?;
         tracing::info!(
             ?format,
@@ -744,6 +746,9 @@ pub struct PresentPref {
     pub vsync: bool,
     /// Let a variable-refresh display follow the stream cadence (`allow_vrr`, default on).
     pub allow_vrr: bool,
+    /// Opt-in for the VRR FIFO-first ladder (`PUNKTFUNK_VRR_FIFO=1`). Off by default on
+    /// measured evidence — see [`present_mode_chain`].
+    pub vrr_fifo_opt_in: bool,
     /// The session STARTED fullscreen. The mode is chosen once, at swapchain creation, so
     /// this is the starting state and an F11 mid-session does not re-pick — consistent
     /// with the shells' "Display changes apply from the next session" footer, and why
@@ -757,11 +762,21 @@ pub struct PresentPref {
 /// * **V-Sync off** — IMMEDIATE (tears, no wait at all), then FIFO_RELAXED (tears only on
 ///   a late frame), then the tear-free modes. Asking for tearing and silently getting
 ///   vsync is a lie the stats line now exposes, but the ladder still degrades safely.
-/// * **V-Sync on + VRR allowed + fullscreen** — FIFO first. On a variable-refresh panel
-///   with direct scanout the FIFO present IS the flip, so the panel follows the stream's
-///   cadence and the latch collapses; MAILBOX would decouple presents from scanout and
-///   re-quantize to the compositor's clock. Safe even when VRR turns out not to be live,
-///   because the FIFO glass gate bounds the standing queue that used to make FIFO costly.
+/// * **V-Sync on + VRR allowed + fullscreen + `PUNKTFUNK_VRR_FIFO=1`** — FIFO first. On a
+///   variable-refresh panel with direct scanout the FIFO present IS the flip, so the panel
+///   follows the stream's cadence; MAILBOX would decouple presents from scanout and
+///   re-quantize to the compositor's clock.
+///
+///   ⚠ **Opt-in, not default, on measured evidence.** It was default-on until an on-glass
+///   A/B (.21, GNOME/Wayland, NVIDIA, *non*-VRR 60 Hz panel, 2026-08-02) showed this
+///   route costs ~27 ms of display stage versus MAILBOX on the same box, reproducibly:
+///   `display 28.4 ms (pace 11.8 + latch 16.6)` on FIFO against `1.4 ms (0.2 + 1.2)` on
+///   MAILBOX. Under a compositor the FIFO present's on-glass confirmation arrives a whole
+///   refresh later, and the presenter serialises behind it. The upside on a genuine VRR
+///   panel is real but UNMEASURED — no VRR display was available — and a default that is
+///   measurably worse on the hardware we could test, in exchange for an unproven win on
+///   hardware we could not, is the wrong way round. Flip the default once a VRR panel
+///   confirms the win (WP6 open item).
 /// * **Otherwise** — MAILBOX, then FIFO: the shipped default. MAILBOX never queues more
 ///   than the newest frame, so an arrival-paced presenter doesn't block in the present
 ///   queue (a measured 11-13 ms standing wait at 60 Hz when the compositor holds images
@@ -773,11 +788,18 @@ fn present_mode_chain(pref: PresentPref) -> [vk::PresentModeKHR; 4] {
     use vk::PresentModeKHR as M;
     if !pref.vsync {
         [M::IMMEDIATE, M::FIFO_RELAXED, M::MAILBOX, M::FIFO]
-    } else if pref.allow_vrr && pref.fullscreen {
+    } else if pref.allow_vrr && pref.fullscreen && pref.vrr_fifo_opt_in {
         [M::FIFO, M::MAILBOX, M::FIFO_RELAXED, M::IMMEDIATE]
     } else {
         [M::MAILBOX, M::FIFO, M::FIFO_RELAXED, M::IMMEDIATE]
     }
+}
+
+/// `PUNKTFUNK_VRR_FIFO=1` — opt into the FIFO-first ladder for variable-refresh panels.
+/// See [`present_mode_chain`] for the measurement that made this opt-in rather than
+/// default.
+fn vrr_fifo_opt_in() -> bool {
+    std::env::var("PUNKTFUNK_VRR_FIFO").is_ok_and(|v| v != "0")
 }
 
 /// Resolve the present mode: `PUNKTFUNK_PRESENT_MODE` pins one outright (the debug lever,
@@ -848,6 +870,7 @@ mod tests {
             vsync,
             allow_vrr,
             fullscreen,
+            vrr_fifo_opt_in: true, // the ladder under test; the DEFAULT is off (see below)
         };
 
         // V-Sync off asks to tear, hardest first, and outranks the VRR rule (tearing
@@ -864,8 +887,20 @@ mod tests {
         );
 
         // Tear-free + VRR allowed + fullscreen prefers FIFO, so the flip IS the present
-        // and a variable-refresh panel follows the stream.
+        // and a variable-refresh panel follows the stream — but ONLY when opted in.
         assert_eq!(present_mode_chain(pref(true, true, true))[0], M::FIFO);
+        // Without the opt-in the shipped MAILBOX-first default stands: measured on glass
+        // to be ~27 ms of display stage better on a non-VRR panel.
+        assert_eq!(
+            present_mode_chain(PresentPref {
+                vsync: true,
+                allow_vrr: true,
+                fullscreen: true,
+                vrr_fifo_opt_in: false,
+            })[0],
+            M::MAILBOX,
+            "the VRR ladder is opt-in until a VRR panel confirms the win"
+        );
         // Windowed, or VRR declined: the shipped MAILBOX-first default.
         assert_eq!(present_mode_chain(pref(true, true, false))[0], M::MAILBOX);
         assert_eq!(present_mode_chain(pref(true, false, true))[0], M::MAILBOX);

@@ -252,6 +252,10 @@ struct StreamState {
     /// Is variable refresh actually live? Measured from the same on-glass stamps (no
     /// portable query exists) — see [`CadenceProbe`].
     cadence: CadenceProbe,
+    /// The DISPLAY MODE's refresh period — the vblank grid presents quantize to when
+    /// VRR is off, and so the cadence probe's reference. Deliberately not the learned
+    /// period (see the probe's call site).
+    mode_period_ns: u64,
     /// The latch slot the last smoothness present served (one present per slot); 0 =
     /// none yet.
     last_target_ns: u64,
@@ -378,6 +382,7 @@ impl StreamState {
             clock: LatchClock::new(native_refresh_hz),
             gate: PresentGate::default(),
             cadence: CadenceProbe::new(),
+            mode_period_ns: 1_000_000_000 / u64::from(native_refresh_hz.max(1)),
             last_target_ns: 0,
             margin_ns: 0,
             win_misses: 0,
@@ -530,6 +535,9 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
             vsync: opts.vsync,
             allow_vrr: opts.allow_vrr,
             fullscreen: opts.fullscreen,
+            // Resolved from the env inside `Presenter::new` — the swapchain owns that
+            // decision so every caller gets the same (opt-in) default.
+            vrr_fifo_opt_in: false,
         },
     )
     .context("vulkan presenter")?;
@@ -740,6 +748,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         if let Some(st) = stream.as_mut() {
                             if hz > 0 {
                                 st.clock = LatchClock::new(hz);
+                                st.mode_period_ns = 1_000_000_000 / u64::from(hz);
                             }
                             st.cadence.reset();
                             st.last_target_ns = 0;
@@ -1468,8 +1477,32 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                     }
                     st.clock.note_batch(&stamps);
                     // Same stamps answer "is VRR live" — the panel either quantizes them
-                    // to its grid or follows our cadence.
-                    st.cadence.note(&stamps, st.clock.period_ns());
+                    // to its grid or follows our cadence. Evidence only counts from a
+                    // window whose presents were flowing normally: a distressed pipeline
+                    // (stale force-opens) smears spacings for reasons that have nothing
+                    // to do with the panel, and on glass that flapped the verdict.
+                    //
+                    // ⚠ The reference is the DISPLAY MODE's period, NOT the learned one.
+                    // The learned grid comes from our own present spacings, and a stream
+                    // running below panel rate only ever produces multiples ≥ its frame
+                    // interval — so the learner adopts our cadence as "the grid" and every
+                    // delta then looks on-grid by construction. Measured on .21
+                    // (2026-08-02): a 40-50 fps stream on a 60 Hz panel learned 18-22 ms
+                    // and the probe reported VRR on a display with VRR provably disabled.
+                    // The vblank grid is the mode's refresh; that is what presents
+                    // quantize to when VRR is off.
+                    //
+                    // ⚠⚠ And it is only asked under a FIFO-family mode. The whole test
+                    // rests on "with VRR off, a present waits for vblank" — MAILBOX and
+                    // IMMEDIATE deliberately break that, so their stamps are never
+                    // grid-quantized and the probe would call every mailbox session VRR.
+                    // Measured on .21: same panel, same second — fifo read `no`
+                    // (correct, period 16.56 ms), mailbox read `yes` (wrong). Outside
+                    // FIFO the honest answer is "cannot tell", i.e. Unknown.
+                    let healthy = st.presented.forced == 0;
+                    if presenter.fifo_present_mode() {
+                        st.cadence.note(&stamps, st.mode_period_ns, healthy);
+                    }
                     // Phase-locked capture, the presenter's half: publish the grid the
                     // local clock just learned — a recent TRUE on-glass instant plus
                     // the latch period — for the pump's ~1 Hz PhaseReport. One learner
