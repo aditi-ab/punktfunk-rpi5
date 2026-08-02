@@ -18,9 +18,14 @@
 //! device changing under us — the operator picked a different output mid-stream — and reacts:
 //! a loopback-capturable choice is FOLLOWED (their explicit choice wins; audio then also plays
 //! on the host), a known-dud choice (cable/Steam Speakers/the mic target) snaps back to the
-//! plan. Device errors (endpoint invalidated, engine restart) reopen with backoff instead of
-//! killing audio for the rest of the session. On thread exit (capturer dropped at stream end)
-//! the parked default playback device is restored.
+//! plan. Device errors (endpoint invalidated, engine restart) reopen with a capped exponential
+//! backoff that an endpoint-set change cuts short. A plan with NO loopback endpoint at all is
+//! never retried: `wiring_plan::plan` is pure in the endpoint set, so that verdict holds until
+//! the set changes — the thread says why once, then parks on a cheap fingerprint poll and
+//! re-plans the instant the set moves (the 2026-08 field case hammered a full wiring pass —
+//! IPolicyConfig writes included — every 2 s for 8+ minutes without ever being able to
+//! succeed). On thread exit (capturer dropped at stream end) the parked default playback
+//! device is restored.
 
 use super::{audio_control, wiring_plan, AudioCapturer, SAMPLE_RATE};
 use anyhow::{anyhow, Context, Result};
@@ -131,8 +136,20 @@ enum Next {
     Reopen(TargetMode),
 }
 
-/// Backoff between self-heal reopen attempts after a capture failure.
-const REOPEN_BACKOFF: Duration = Duration::from_secs(2);
+/// Reopen backoff after a TRANSIENT capture failure: starts here and doubles per consecutive
+/// failure up to [`REOPEN_BACKOFF_CAP`], resetting on success or on an endpoint-set change
+/// (mirrors the mic pump's `PUMP_TUNING` shape). The predecessor was a FLAT 2 s retry whose
+/// every attempt re-ran the full wiring pass, IPolicyConfig writes included — tolerable for a
+/// genuinely transient error, an 8-minute hammer in the 2026-08 field case where the failure
+/// was structural.
+const REOPEN_BACKOFF_START: Duration = Duration::from_secs(2);
+const REOPEN_BACKOFF_CAP: Duration = Duration::from_secs(60);
+/// Endpoint-set poll cadence while waiting out a failure (both the transient backoff sleep and
+/// the unsatisfiable-plan wait): one enumerate-and-hash per tick, nothing else. A fingerprint
+/// change ends the wait immediately — a (re)arrived endpoint (the display coming back, plugged
+/// headphones) is exactly the recovery moment — so recovery stays as fast as the old 2 s hammer
+/// without its side effects.
+const ENDPOINT_POLL_EVERY: Duration = Duration::from_secs(2);
 /// Watchdog cadence for "did the default render device change under us?" checks.
 const DEFAULT_CHECK_EVERY: Duration = Duration::from_secs(1);
 /// Total attempts for the FIRST open before its failure surfaces through the `ready` handshake.
@@ -168,14 +185,30 @@ fn capture_thread(
     let mut mode = TargetMode::Assert;
     let mut failures: u64 = 0;
     let mut first_attempts: u32 = 0;
+    let mut backoff = REOPEN_BACKOFF_START;
+    // Endpoint-set fingerprint under which an unsatisfiable plan was already error-logged: an
+    // unchanged set means an unchanged verdict (`wiring_plan::plan` is pure), so the diagnosis
+    // is said once per topology — the field log drowned in 256+ copies of the same line.
+    let mut unsat_logged: Option<u64> = None;
     while !stop.load(Ordering::Relaxed) {
         match capture_once(&tx, &stop, &mut ready, channels, mode) {
             Ok(Next::Stopped) => break,
             Ok(Next::Reopen(m)) => {
                 mode = m;
                 failures = 0;
+                backoff = REOPEN_BACKOFF_START;
+                unsat_logged = None;
             }
             Err(e) if ready.is_some() => {
+                // An unsatisfiable PLAN cannot improve within the handshake window — the
+                // once-per-process Steam-pair install already ran inside `capture_once` — so
+                // fail the open now with the full diagnosis instead of spending the transient
+                // retry budget on a structural verdict. The native plane owns first-open
+                // retries and backs off on its own.
+                if e.downcast_ref::<PlanUnsatisfiable>().is_some() {
+                    let _ = ready.take().unwrap().send(Err(anyhow!("{e:#}")));
+                    break;
+                }
                 first_attempts += 1;
                 if first_attempts >= FIRST_OPEN_ATTEMPTS || stop.load(Ordering::Relaxed) {
                     let _ = ready.take().unwrap().send(Err(anyhow!("{e:#}")));
@@ -190,16 +223,43 @@ fn capture_thread(
                 }
             }
             Err(e) => {
-                failures += 1;
-                if failures.is_power_of_two() {
-                    tracing::warn!(error = %format!("{e:#}"), count = failures,
-                        "audio loopback capture failed — reopening");
-                }
                 mode = TargetMode::Assert;
-                // Backoff in stop-responsive slices.
-                let until = Instant::now() + REOPEN_BACKOFF;
-                while Instant::now() < until && !stop.load(Ordering::Relaxed) {
-                    thread::sleep(Duration::from_millis(100));
+                if let Some(unsat) = e.downcast_ref::<PlanUnsatisfiable>() {
+                    // Structural: retrying against the same endpoints repeats the same verdict,
+                    // and every retry used to re-run the wiring pass — IPolicyConfig writes
+                    // included, stomping any operator default-recording change within 2 s. Say
+                    // why once per topology, then park on the cheap fingerprint poll; the set
+                    // changing IS the recovery moment and re-plans immediately.
+                    failures = 0;
+                    backoff = REOPEN_BACKOFF_START;
+                    if unsat_logged != Some(unsat.fingerprint) {
+                        unsat_logged = Some(unsat.fingerprint);
+                        tracing::error!(
+                            "desktop audio unavailable, and retrying cannot help until the \
+                             audio endpoint set changes — waiting for that change. {unsat}"
+                        );
+                    }
+                    if wait_endpoint_change(&stop, unsat.fingerprint, None) == EndpointWait::Stopped
+                    {
+                        break;
+                    }
+                } else {
+                    unsat_logged = None;
+                    failures += 1;
+                    if failures.is_power_of_two() {
+                        tracing::warn!(error = %format!("{e:#}"), count = failures,
+                            backoff_secs = backoff.as_secs(),
+                            "audio loopback capture failed — reopening after backoff");
+                    }
+                    // Capped exponential backoff, cut short (and reset) the moment the
+                    // endpoint set changes — a re-arrived device is the likeliest cure for
+                    // whatever killed the capture, and it must not wait out a 60 s sleep.
+                    let fp = audio_control::endpoint_fingerprint();
+                    match wait_endpoint_change(&stop, fp, Some(Instant::now() + backoff)) {
+                        EndpointWait::Stopped => break,
+                        EndpointWait::Changed => backoff = REOPEN_BACKOFF_START,
+                        EndpointWait::Elapsed => backoff = (backoff * 2).min(REOPEN_BACKOFF_CAP),
+                    }
                 }
             }
         }
@@ -208,6 +268,75 @@ fn capture_thread(
     // they changed it themselves mid-stream). COM is initialized on this thread.
     audio_control::restore_default_playback();
     Ok(())
+}
+
+/// A wiring plan with NO loopback endpoint, as a typed error: [`wiring_plan::plan`] is pure in
+/// the enumerated endpoint set, so unlike every other capture error this one is PERMANENT until
+/// the topology changes — retrying it is guaranteed futile (the 2026-08 field case retried it
+/// flat-out for 8+ minutes, one full wiring pass per retry). Carries the set's fingerprint
+/// (what the reopen loop waits on) and the full diagnosis: inventory, per-endpoint rejection
+/// reasons, and only the remedies not already taken.
+#[derive(Debug)]
+struct PlanUnsatisfiable {
+    fingerprint: u64,
+    detail: String,
+}
+
+impl PlanUnsatisfiable {
+    fn from_plan(plan: &audio_control::WiredPlan) -> PlanUnsatisfiable {
+        debug_assert!(plan.wiring.loopback_unsatisfiable());
+        PlanUnsatisfiable {
+            fingerprint: plan.fingerprint,
+            detail: wiring_plan::describe_no_loopback(&plan.renders, &plan.wiring),
+        }
+    }
+}
+
+impl std::fmt::Display for PlanUnsatisfiable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.detail)
+    }
+}
+
+impl std::error::Error for PlanUnsatisfiable {}
+
+/// How a [`wait_endpoint_change`] ended.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EndpointWait {
+    /// `stop` was set — the capturer is being dropped.
+    Stopped,
+    /// The endpoint-set fingerprint moved — re-plan NOW (this is the recovery moment).
+    Changed,
+    /// The deadline passed without a change (backoff waits only; `deadline: None` never ends
+    /// this way).
+    Elapsed,
+}
+
+/// Stop-responsive wait that polls the endpoint-set fingerprint every [`ENDPOINT_POLL_EVERY`] —
+/// an enumerate-and-hash, no wiring pass, no IPolicyConfig writes, no logs — until the set
+/// changes, `deadline` passes, or `stop` is set. `deadline: None` waits indefinitely: used while
+/// the plan is unsatisfiable, where ONLY a topology change can alter the verdict.
+fn wait_endpoint_change(
+    stop: &AtomicBool,
+    fingerprint: u64,
+    deadline: Option<Instant>,
+) -> EndpointWait {
+    let mut next_poll = Instant::now() + ENDPOINT_POLL_EVERY;
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return EndpointWait::Stopped;
+        }
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            return EndpointWait::Elapsed;
+        }
+        thread::sleep(Duration::from_millis(100));
+        if Instant::now() >= next_poll {
+            next_poll = Instant::now() + ENDPOINT_POLL_EVERY;
+            if audio_control::endpoint_fingerprint() != fingerprint {
+                return EndpointWait::Changed;
+            }
+        }
+    }
 }
 
 /// The current default render endpoint, with its id (`None` on any enumeration failure —
@@ -220,7 +349,7 @@ fn default_render(en: &DeviceEnumerator) -> Option<(Device, String)> {
 
 /// One endpoint open + capture loop. Returns how to continue ([`Next`]) or an error (first open:
 /// retried [`FIRST_OPEN_ATTEMPTS`] times, then fatal via the `ready` handshake; later: reopen
-/// with backoff).
+/// with capped backoff — or, for a typed [`PlanUnsatisfiable`], an endpoint-set wait).
 fn capture_once(
     tx: &SyncSender<Vec<f32>>,
     stop: &AtomicBool,
@@ -233,26 +362,23 @@ fn capture_once(
     let keep_default = std::env::var_os("PUNKTFUNK_KEEP_DEFAULT").is_some();
     // Assert-mode without KEEP_DEFAULT is the only shape that parks the playback default.
     let assert_plan = mode == TargetMode::Assert && !keep_default;
-    let mut wiring = audio_control::wire_now(assert_plan);
+    let mut plan = audio_control::wire_now_full(assert_plan);
 
     // Client-only audio needs a silent-on-host sink with a working loopback (the Steam Streaming
     // Microphone's render side). If the plan had to settle for real hardware (or nothing), try —
     // once per process — to install the Steam pair (present when Steam is), then re-plan.
     if assert_plan && !audio_control::host_audio_requested() {
-        let have_silent = wiring
-            .loopback_render
-            .as_ref()
-            .is_some_and(|(n, _)| wiring_plan::silent_sink(&n.to_lowercase()));
-        static INSTALL_TRIED: AtomicBool = AtomicBool::new(false);
-        if !have_silent && !INSTALL_TRIED.swap(true, Ordering::SeqCst) {
-            if super::wasapi_mic::install_steam_audio_pair() {
-                wiring = audio_control::wire_now(true);
-            }
-            if !wiring
-                .loopback_render
+        let have_silent = |w: &wiring_plan::Wiring| {
+            w.loopback_render
                 .as_ref()
                 .is_some_and(|(n, _)| wiring_plan::silent_sink(&n.to_lowercase()))
-            {
+        };
+        static INSTALL_TRIED: AtomicBool = AtomicBool::new(false);
+        if !have_silent(&plan.wiring) && !INSTALL_TRIED.swap(true, Ordering::SeqCst) {
+            if super::wasapi_mic::install_steam_audio_pair() {
+                plan = audio_control::wire_now_full(true);
+            }
+            if !have_silent(&plan.wiring) {
                 tracing::info!(
                     "no silent virtual sink for client-only audio — desktop audio will also play \
                      on the host (install Steam, whose Remote Play streaming drivers provide one)"
@@ -260,6 +386,12 @@ fn capture_once(
             }
         }
     }
+    let wiring = &plan.wiring;
+    // Only the Assert path can knowingly sit on the plan's LAST-RESORT endpoint: Follow captures
+    // the operator's chosen default, and `judge_default` never routes Follow onto the Steam
+    // Speakers (they are `excluded_from_loopback` — a Dud that snaps back to the plan).
+    let last_resort = assert_plan && wiring.loopback_last_resort;
+    let plan_fp = plan.fingerprint;
 
     let en = DeviceEnumerator::new().context("DeviceEnumerator")?;
     // Resolve the endpoint to capture. ECHO GUARD (Follow/KEEP_DEFAULT shapes): the wiring plan
@@ -268,11 +400,11 @@ fn capture_once(
     // fall back to the plan's loopback endpoint, or refuse — no desktop audio beats an echo loop.
     let (device, dev_name, dev_id) = if assert_plan {
         let Some(ep) = wiring.loopback_render.clone() else {
-            anyhow::bail!(
-                "no loopback-capturable render endpoint (every usable endpoint is reserved for \
-                 the virtual mic or has a silent loopback) — attach an output device or install \
-                 the Steam Streaming pair to get desktop audio"
-            );
+            // Detected BEFORE any open attempt, and typed: the plan is a pure function of the
+            // endpoint set, so this cannot resolve until the set changes — the reopen loop
+            // waits on the fingerprint instead of retrying (the old untyped bail was retried
+            // flat-out every 2 s, forever, in the 2026-08 field case).
+            return Err(PlanUnsatisfiable::from_plan(&plan).into());
         };
         let d = audio_control::open_endpoint(&ep)?;
         (d, ep.0, ep.1)
@@ -285,10 +417,15 @@ fn capture_once(
             .is_some_and(|(_, mic_id)| *mic_id == id);
         if default_is_mic {
             let Some(lb) = wiring.loopback_render.clone() else {
+                // Same inventory shape as the Assert bail, but NOT typed as unsatisfiable:
+                // Follow's inputs include the DEFAULT device, which the operator can change
+                // without a topology change (especially under PUNKTFUNK_KEEP_DEFAULT) — the
+                // capped backoff must keep retrying rather than a fingerprint wait sleeping
+                // through a default-only change.
                 anyhow::bail!(
-                    "the only render endpoint is reserved for the virtual mic (capturing it would \
-                     echo the client's voice back) — attach another output device or install the \
-                     Steam Streaming pair to get desktop audio"
+                    "the default render endpoint is reserved for the virtual mic (capturing it \
+                     would echo the client's voice back) — {}",
+                    wiring_plan::describe_no_loopback(&plan.renders, wiring)
                 );
             };
             tracing::warn!(mic = %wiring.mic_render.as_ref().unwrap().0, loopback = %lb.0,
@@ -338,6 +475,7 @@ fn capture_once(
     }
     tracing::info!(device = %dev_name,
         follow = matches!(mode, TargetMode::Follow) || keep_default,
+        last_resort,
         "audio loopback capturing");
 
     // Watchdog seed: the default as it stands right after our open. In Assert mode the plan just
@@ -349,7 +487,7 @@ fn capture_once(
     if assert_plan {
         if let Some(d) = seen_default.as_deref() {
             if d != dev_id {
-                match judge_default(&en, &wiring, d) {
+                match judge_default(&en, wiring, d) {
                     DefaultKind::Capturable(name) => {
                         tracing::info!(default = %name, planned = %dev_name,
                             "could not park the default playback on the planned endpoint — \
@@ -367,10 +505,12 @@ fn capture_once(
 
     let mut bytes: VecDeque<u8> = VecDeque::new();
     let mut last_check = Instant::now();
+    let mut last_fp_check = Instant::now();
     // Triage breadcrumb: a broken loopback (endpoint renders but its loopback tap delivers
     // nothing — the Steam Streaming Speakers failure shape) is indistinguishable from a simply
-    // quiet desktop, so after 30 s with zero packets say so ONCE. Info, not warn: an idle host
-    // is legitimately silent.
+    // quiet desktop, so after 30 s with zero packets say so ONCE. Info, not warn — an idle host
+    // is legitimately silent — EXCEPT on a last-resort endpoint, where the plan already knew
+    // the loopback is silent and zero packets all but confirms the quality risk materialized.
     let opened_at = Instant::now();
     let mut saw_packets = false;
     let mut silence_noted = false;
@@ -396,10 +536,18 @@ fn capture_once(
         }
         if !saw_packets && !silence_noted && opened_at.elapsed() >= Duration::from_secs(30) {
             silence_noted = true;
-            tracing::info!(device = %dev_name,
-                "no audio captured in the first 30 s — fine if the host is quiet; if it should \
-                 be playing audio, this endpoint's loopback may be broken (set \
-                 PUNKTFUNK_HOST_AUDIO=1 to prefer real hardware)");
+            if last_resort {
+                tracing::warn!(device = %dev_name,
+                    "no audio captured in the first 30 s from the LAST-RESORT loopback — the \
+                     Steam Streaming Speakers' loopback is known-silent, so desktop audio is \
+                     most likely not reaching the client; attach any output device to give the \
+                     plan a working endpoint (it re-plans on the change)");
+            } else {
+                tracing::info!(device = %dev_name,
+                    "no audio captured in the first 30 s — fine if the host is quiet; if it \
+                     should be playing audio, this endpoint's loopback may be broken (set \
+                     PUNKTFUNK_HOST_AUDIO=1 to prefer real hardware)");
+            }
         }
         let whole = (bytes.len() / block_align) * block_align;
         if whole > 0 {
@@ -428,7 +576,7 @@ fn capture_once(
                             );
                             return Ok(Next::Reopen(TargetMode::Follow));
                         }
-                        return Ok(match judge_default(&en, &wiring, &nid) {
+                        return Ok(match judge_default(&en, wiring, &nid) {
                             DefaultKind::Capturable(name) => {
                                 tracing::info!(device = %name,
                                     "operator changed the output device mid-stream — following \
@@ -445,6 +593,24 @@ fn capture_once(
                         });
                     }
                 }
+            }
+        }
+
+        // A LAST-RESORT capture is a stopgap, not a steady state: the plan chose the
+        // known-silent Steam Speakers only because nothing better existed, so any endpoint-set
+        // change — the display's audio endpoint re-arriving, headphones plugged in — may unlock
+        // a real plan. Re-plan on the change; without this the session would ride the silent
+        // loopback forever AFTER the real endpoint returned (the original field defect in a
+        // quieter costume). Preferred endpoints don't get this watch: mid-stream re-routing
+        // there is the default-device watchdog's job, on the operator's terms.
+        if last_resort && last_fp_check.elapsed() >= ENDPOINT_POLL_EVERY {
+            last_fp_check = Instant::now();
+            if audio_control::endpoint_fingerprint() != plan_fp {
+                audio_client.stop_stream().ok();
+                tracing::info!(
+                    "endpoint set changed while capturing the last-resort loopback — re-planning"
+                );
+                return Ok(Next::Reopen(TargetMode::Assert));
             }
         }
     }

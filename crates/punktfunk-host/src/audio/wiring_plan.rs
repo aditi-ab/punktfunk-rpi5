@@ -26,6 +26,19 @@
 //! out of the host's speakers. Real hardware is the fallback (audio then plays on both ends).
 //! With `host_audio` (the `PUNKTFUNK_HOST_AUDIO` opt-in) the order flips back: real hardware
 //! first, so the operator hears the stream locally.
+//!
+//! **Last resort, and the honest failure.** When neither a silent sink nor real hardware
+//! survives the mic reservation, the Steam Streaming *Speakers* are taken as a flagged LAST
+//! resort ([`Wiring::loopback_last_resort`]): their loopback is known-silent (validated live) —
+//! a QUALITY risk the capture side warns about and treats as a stopgap — but holding a parked
+//! endpoint beats holding none (2026-08 field case: the display isolate invalidated the only
+//! real render endpoint mid-session, the mic held the Streaming Microphone, and a plan with no
+//! loopback left the session unrecoverable). Cables, VoiceMeeter strips and generically-
+//! "virtual" endpoints are never a last resort — capturing them re-captures what the mic writes,
+//! an echo/feedback CORRECTNESS risk, unlike silence — so with only those left the plan is
+//! honestly unsatisfiable ([`Wiring::loopback_unsatisfiable`]): a pure verdict on the endpoint
+//! set that cannot change until the set does. Callers must wait for an endpoint-set change
+//! ([`fingerprint`]), not retry.
 
 /// A `(friendly_name, endpoint_id)` pair as enumerated from WASAPI.
 pub(crate) type Endpoint = (String, String);
@@ -42,6 +55,22 @@ pub(crate) struct Wiring {
     pub mic_capture: Option<Endpoint>,
     /// Render endpoint for the desktop-audio loopback; made the default playback device.
     pub loopback_render: Option<Endpoint>,
+    /// `loopback_render` is the flagged LAST RESORT (the Steam Streaming Speakers, whose
+    /// loopback is known-silent — validated live), taken only because nothing better survived
+    /// the mic reservation. The capture side treats it as a stopgap: it warns when the silence
+    /// materializes and re-plans on any endpoint-set change instead of riding it out.
+    pub loopback_last_resort: bool,
+}
+
+impl Wiring {
+    /// This plan has NO loopback endpoint — not even the last resort. Because [`plan`] is pure,
+    /// this is a STRUCTURAL verdict on the endpoint set, not a transient device error:
+    /// reattempting a capture open without an endpoint-set change must fail identically (the
+    /// 2026-08 field case spent 8+ minutes of flat 2 s retries proving exactly that). Callers
+    /// wait for the set's [`fingerprint`] to move instead of retrying.
+    pub(crate) fn loopback_unsatisfiable(&self) -> bool {
+        self.loopback_render.is_none()
+    }
 }
 
 /// Render-endpoint friendly-name substrings (lowercased) usable as the virtual-mic write target,
@@ -134,7 +163,8 @@ pub(crate) fn plan(
 
     // 3. Loopback from the REMAINING renders. Client-only (default): the silent sink (Steam
     //    Streaming Microphone — its loopback works, unlike the Speakers') > real hardware
-    //    (audible fallback) > any non-excluded leftover. `host_audio`: real hardware first.
+    //    (audible fallback). `host_audio`: real hardware first. Either order can fall through
+    //    to the flagged last resort below.
     let not_mic = |id: &str| mic_render.as_ref().is_none_or(|(_, mid)| mid != id);
     let real_hw = || {
         renders.iter().find(|(n, id)| {
@@ -147,27 +177,129 @@ pub(crate) fn plan(
             .iter()
             .find(|(n, id)| not_mic(id) && silent_sink(&n.to_lowercase()))
     };
-    // `virtualish` here too: a virtual endpoint that slipped past `excluded_from_loopback`'s
-    // name list (a future cable/mixer sibling) is an internal-feedback loop waiting to happen —
-    // no loopback is the honest answer, exactly like the cable-only case.
-    let leftover = || {
-        renders.iter().find(|(n, id)| {
-            let ln = n.to_lowercase();
-            not_mic(id) && !excluded_from_loopback(&ln) && !virtualish(&ln)
-        })
+    // LAST RESORT — the Steam Streaming Speakers, and ONLY them. Their loopback is known-silent
+    // (validated live): a QUALITY risk, flagged so the capture side can warn when the silence
+    // materializes and re-plan when the endpoint set changes — but a parked endpoint beats none
+    // (2026-08: the display isolate invalidated the only real render endpoint mid-session and a
+    // loopback-less plan left the session unrecoverable). Never a cable, a VoiceMeeter strip, or
+    // a generically-"virtual" endpoint: those re-capture what the mic writes — echo/feedback
+    // CORRECTNESS risks — so "no loopback" stays the honest answer there. NOTE
+    // `excluded_from_loopback` itself stays untouched: it also powers the capture watchdog's
+    // judgement of a NEW operator-chosen default, where admitting the Speakers would change
+    // mid-stream snap-back semantics.
+    let last_resort = || {
+        renders
+            .iter()
+            .find(|(n, id)| not_mic(id) && n.to_lowercase().contains("steam streaming speakers"))
     };
-    let loopback_render = if host_audio {
-        real_hw().or_else(silent).or_else(leftover)
+    let preferred = if host_audio {
+        real_hw().or_else(silent)
     } else {
-        silent().or_else(real_hw).or_else(leftover)
-    }
-    .cloned();
+        silent().or_else(real_hw)
+    };
+    let (loopback_render, loopback_last_resort) = match preferred {
+        Some(ep) => (Some(ep.clone()), false),
+        None => match last_resort() {
+            Some(ep) => (Some(ep.clone()), true),
+            None => (None, false),
+        },
+    };
 
     Wiring {
         mic_render,
         mic_capture,
         loopback_render,
+        loopback_last_resort,
     }
+}
+
+/// Order-independent fingerprint of an enumerated endpoint set. [`plan`] is a pure function of
+/// these inputs (the env knobs are process-stable), so an unchanged fingerprint PROVES an
+/// unchanged verdict: re-planning an unsatisfiable set before the fingerprint moves only repeats
+/// the same answer, with IPolicyConfig default-device writes as the side effect. The capture
+/// loop polls this instead of re-planning, and treats a change as the recovery moment.
+pub(crate) fn fingerprint(renders: &[Endpoint], captures: &[Endpoint]) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    // Each direction hashes as a length-prefixed sorted slice, so renders and captures cannot
+    // alias each other and endpoint order (enumeration order churns) never matters.
+    for eps in [renders, captures] {
+        let mut sorted: Vec<&Endpoint> = eps.iter().collect();
+        sorted.sort();
+        sorted.hash(&mut h);
+    }
+    h.finish()
+}
+
+/// The one-shot diagnosis for a plan with no loopback endpoint: every enumerated render with WHY
+/// it was rejected, then ONLY the remedies not already taken. The static advice this replaces
+/// ("attach one, or let the host install the Steam Streaming pair") was already satisfied in the
+/// 2026-08 field case — the pair WAS installed, its Microphone half reserved by the mic — so the
+/// message pointed at a fix the box already had. Pure, like [`plan`]: callers pass the same
+/// enumeration the plan consumed.
+pub(crate) fn describe_no_loopback(renders: &[Endpoint], wiring: &Wiring) -> String {
+    debug_assert!(wiring.loopback_unsatisfiable());
+    let mic_id = wiring.mic_render.as_ref().map(|(_, id)| id.as_str());
+    let rejected: Vec<String> = renders
+        .iter()
+        .map(|(name, id)| {
+            let ln = name.to_lowercase();
+            let why = if Some(id.as_str()) == mic_id {
+                "reserved for the virtual mic (its loopback would echo the client's voice back)"
+            } else if ln.contains("cable") {
+                "virtual cable (its loopback re-captures what is written into it)"
+            } else if ln.contains("voicemeeter") {
+                "VoiceMeeter strip (shares the mixer the mic writes into — a feedback loop)"
+            } else if ln.contains("steam streaming speakers") {
+                // Reachable only when the Speakers ARE the mic target (operator override) —
+                // the last-resort tier takes them otherwise.
+                "known-silent loopback (validated live)"
+            } else if ln.contains("virtual") {
+                "unrecognized virtual endpoint (assumed feedback/silence risk)"
+            } else {
+                // `plan` accepts any non-virtual render — reaching this arm means a tier
+                // changed without updating this diagnosis.
+                "rejected by the wiring plan"
+            };
+            format!("{name:?}: {why}")
+        })
+        .collect();
+    let inventory = if rejected.is_empty() {
+        "no render endpoints exist at all".to_string()
+    } else {
+        rejected.join("; ")
+    };
+    let has = |needle: &str| {
+        renders
+            .iter()
+            .any(|(n, _)| n.to_lowercase().contains(needle))
+    };
+    let mut remedies = vec!["attach any output device (headphones, or a monitor/TV with audio)"];
+    // Only useful when the mic would actually vacate a loopback-capable endpoint: with the mic
+    // on the Steam Streaming Microphone, a cable frees that silent sink for the loopback. A mic
+    // on a VoiceMeeter strip frees nothing capturable, so the advice is withheld there.
+    if !has("cable")
+        && wiring
+            .mic_render
+            .as_ref()
+            .is_some_and(|(n, _)| silent_sink(&n.to_lowercase()))
+    {
+        remedies.push(
+            "install VB-Audio Virtual Cable — the mic then takes the cable and frees the Steam \
+             Streaming Microphone's render side for the loopback",
+        );
+    }
+    if !has("steam streaming microphone") {
+        remedies.push(
+            "install Steam — its Remote Play streaming drivers add a loopback-capable virtual \
+             sink",
+        );
+    }
+    format!(
+        "no loopback-capturable render endpoint: {inventory}. Remedies: {}",
+        remedies.join("; or ")
+    )
 }
 
 #[cfg(test)]
@@ -296,6 +428,10 @@ mod tests {
             w.loopback_render.unwrap().0,
             "Speakers (Steam Streaming Microphone)"
         );
+        assert!(
+            !w.loopback_last_resort,
+            "the silent sink is a PREFERRED pick"
+        );
         assert_eq!(
             w.mic_capture.unwrap().0,
             "CABLE Output (VB-Audio Virtual Cable)"
@@ -330,16 +466,88 @@ mod tests {
         assert!(w.loopback_render.is_none());
     }
 
-    /// Steam Streaming Speakers never become the loopback (silent loopback, validated live) —
-    /// even when they're the only non-mic endpoint.
+    /// Steam Streaming Speakers are never a PREFERRED loopback (their loopback is silent —
+    /// validated live) — but when they are the only non-mic endpoint they ARE taken, flagged as
+    /// the last resort: a silent loopback the capture side can warn about beats a plan with no
+    /// endpoint at all (which is unrecoverable until the topology changes).
     #[test]
-    fn steam_speakers_never_loopback() {
+    fn steam_speakers_only_as_last_resort() {
         let renders = [
             ep("CABLE Input (VB-Audio Virtual Cable)"),
             ep("Speakers (Steam Streaming Speakers)"),
         ];
-        let w = plan(&renders, &[], None, false);
-        assert!(w.loopback_render.is_none());
+        for host_audio in [false, true] {
+            let w = plan(&renders, &[], None, host_audio);
+            assert_eq!(
+                w.loopback_render.as_ref().unwrap().0,
+                "Speakers (Steam Streaming Speakers)",
+                "host_audio={host_audio}"
+            );
+            assert!(w.loopback_last_resort, "host_audio={host_audio}");
+        }
+    }
+
+    /// THE 2026-08 field case: no cable, only the Steam pair left after the display isolate
+    /// invalidated the monitor's DP audio endpoint. The mic reserves the Streaming Microphone
+    /// (the only mic candidate), and the plan must then take the Speakers as the last resort —
+    /// the old plan yielded no loopback here and the session never recovered.
+    #[test]
+    fn field_case_steam_pair_only_takes_speakers_as_last_resort() {
+        let renders = [
+            ep("Altavoces (Steam Streaming Speakers)"),
+            ep("Altavoces (Steam Streaming Microphone)"),
+        ];
+        let captures = [ep("Microphone (Steam Streaming Microphone)")];
+        let w = plan(&renders, &captures, None, false);
+        assert_eq!(
+            w.mic_render.unwrap().0,
+            "Altavoces (Steam Streaming Microphone)"
+        );
+        assert_eq!(
+            w.loopback_render.unwrap().0,
+            "Altavoces (Steam Streaming Speakers)"
+        );
+        assert!(w.loopback_last_resort);
+    }
+
+    /// The last resort never shadows a real pick: with real hardware present the Speakers stay
+    /// unchosen and the flag stays down, in both preference modes.
+    #[test]
+    fn last_resort_never_beats_real_hardware() {
+        let renders = [
+            ep("Speakers (Steam Streaming Microphone)"),
+            ep("Speakers (Steam Streaming Speakers)"),
+            ep("Speakers (Realtek HD Audio)"),
+        ];
+        let captures = [ep("Microphone (Steam Streaming Microphone)")];
+        for host_audio in [false, true] {
+            let w = plan(&renders, &captures, None, host_audio);
+            assert_eq!(
+                w.loopback_render.as_ref().unwrap().0,
+                "Speakers (Realtek HD Audio)",
+                "host_audio={host_audio}"
+            );
+            assert!(!w.loopback_last_resort, "host_audio={host_audio}");
+        }
+    }
+
+    /// Cables and VoiceMeeter strips are CORRECTNESS risks (they re-capture what the mic
+    /// writes — echo/feedback), not quality risks: never the loopback, not even as a last
+    /// resort. The plan stays honestly unsatisfiable.
+    #[test]
+    fn cable_and_voicemeeter_never_last_resort() {
+        let renders = [
+            ep("CABLE Input (VB-Audio Virtual Cable)"),
+            ep("CABLE In 16ch (VB-Audio Virtual Cable)"),
+            ep("Voicemeeter Aux Input (VB-Audio Voicemeeter AUX VAIO)"),
+        ];
+        let captures = [ep("CABLE Output (VB-Audio Virtual Cable)")];
+        for host_audio in [false, true] {
+            let w = plan(&renders, &captures, None, host_audio);
+            assert!(w.loopback_render.is_none(), "host_audio={host_audio}");
+            assert!(!w.loopback_last_resort, "host_audio={host_audio}");
+            assert!(w.loopback_unsatisfiable(), "host_audio={host_audio}");
+        }
     }
 
     /// Operator override beats the candidate order.
@@ -413,9 +621,9 @@ mod tests {
         }
     }
 
-    /// A generically-"virtual" leftover (unknown vendor cable) is refused too: `leftover()`
-    /// applies `virtualish`, so a virtual endpoint that slips past the name list can't become
-    /// the loopback.
+    /// A generically-"virtual" leftover (unknown vendor cable) is refused too: the last resort
+    /// accepts ONLY the Steam Streaming Speakers, so a virtual endpoint that slips past
+    /// `excluded_from_loopback`'s name list still can't become the loopback.
     #[test]
     fn unknown_virtual_never_loopback() {
         let renders = [
@@ -424,5 +632,45 @@ mod tests {
         ];
         let w = plan(&renders, &[], None, false);
         assert!(w.loopback_render.is_none());
+    }
+
+    /// The fingerprint keys the capture loop's "wait for an endpoint change" state: it must
+    /// ignore enumeration order (Windows churns it), react to any topology change, and never
+    /// alias the render and capture directions.
+    #[test]
+    fn fingerprint_order_independent_topology_sensitive() {
+        let a = [ep("Speakers (Realtek HD Audio)"), ep("CABLE Input")];
+        let a_rev = [ep("CABLE Input"), ep("Speakers (Realtek HD Audio)")];
+        let caps = [ep("CABLE Output")];
+        assert_eq!(fingerprint(&a, &caps), fingerprint(&a_rev, &caps));
+        assert_ne!(fingerprint(&a, &caps), fingerprint(&a[..1], &caps));
+        assert_ne!(fingerprint(&a, &caps), fingerprint(&caps, &a));
+    }
+
+    /// The unsatisfiable-plan diagnosis must name what the mic reserved and advise ONLY the
+    /// remedies not already taken: in the field case the Steam pair was installed (so "install
+    /// Steam" would point at a fix the box already had) and the cable was missing (so VB-CABLE
+    /// is the advice that actually frees the silent sink).
+    #[test]
+    fn describe_no_loopback_skips_satisfied_remedies() {
+        // Field shape minus the Speakers (mic holds the Streaming Microphone, nothing else).
+        let renders = [ep("Altavoces (Steam Streaming Microphone)")];
+        let captures = [ep("Microphone (Steam Streaming Microphone)")];
+        let w = plan(&renders, &captures, None, false);
+        assert!(w.loopback_unsatisfiable());
+        let msg = describe_no_loopback(&renders, &w);
+        assert!(msg.contains("reserved for the virtual mic"), "{msg}");
+        assert!(msg.contains("VB-Audio Virtual Cable"), "{msg}");
+        assert!(!msg.contains("install Steam"), "{msg}");
+
+        // Cable-only headless box: VB-CABLE is already installed (and freeing it wouldn't help
+        // anyway), while the Steam pair is the remedy that adds a capturable sink.
+        let renders = [ep("CABLE Input (VB-Audio Virtual Cable)")];
+        let captures = [ep("CABLE Output (VB-Audio Virtual Cable)")];
+        let w = plan(&renders, &captures, None, false);
+        assert!(w.loopback_unsatisfiable());
+        let msg = describe_no_loopback(&renders, &w);
+        assert!(msg.contains("install Steam"), "{msg}");
+        assert!(!msg.contains("install VB-Audio Virtual Cable"), "{msg}");
     }
 }
