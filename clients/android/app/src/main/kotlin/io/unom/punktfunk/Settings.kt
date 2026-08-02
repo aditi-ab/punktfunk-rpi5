@@ -34,6 +34,17 @@ data class Settings(
     val hdrEnabled: Boolean = true,
     val compositor: Int = 0,
     val gamepad: Int = 0,
+    /**
+     * Forward this device's controllers to the host at all. Default on — that was the
+     * unconditional behaviour before this became a setting.
+     *
+     * Off is for a couch whose controller reaches the host another way: a USB passthrough tool
+     * (VirtualHere and friends), or a pad simply plugged into the host itself. Leaving it on
+     * there gives the host two controllers for one pair of hands, and games read both. It also
+     * stops this device CLAIMING the pad — a device held open is one a passthrough tool can't
+     * bind — which is why it gates the USB capture paths, not just the wire sends.
+     */
+    val gamepadForwarding: Boolean = true,
     /** Requested audio channel count: 2 (stereo), 6 (5.1) or 8 (7.1). The host clamps to what it
      * can capture; the resolved count drives the decoder + AAudio layout. */
     val audioChannels: Int = 2,
@@ -216,6 +227,7 @@ class SettingsStore(context: Context) {
         hdrEnabled = prefs.getBoolean(K_HDR, true),
         compositor = prefs.getInt(K_COMPOSITOR, 0),
         gamepad = prefs.getInt(K_GAMEPAD, 0),
+        gamepadForwarding = prefs.getBoolean(K_GAMEPAD_FORWARDING, true),
         audioChannels = prefs.getInt(K_AUDIO_CH, 2),
         codec = prefs.getString(K_CODEC, "auto") ?: "auto",
         micEnabled = prefs.getBoolean(K_MIC, false),
@@ -262,6 +274,7 @@ class SettingsStore(context: Context) {
             .putBoolean(K_HDR, s.hdrEnabled)
             .putInt(K_COMPOSITOR, s.compositor)
             .putInt(K_GAMEPAD, s.gamepad)
+            .putBoolean(K_GAMEPAD_FORWARDING, s.gamepadForwarding)
             .putInt(K_AUDIO_CH, s.audioChannels)
             .putString(K_CODEC, s.codec)
             .putBoolean(K_MIC, s.micEnabled)
@@ -291,6 +304,7 @@ class SettingsStore(context: Context) {
         const val K_HDR = "hdr_enabled"
         const val K_COMPOSITOR = "compositor"
         const val K_GAMEPAD = "gamepad"
+        const val K_GAMEPAD_FORWARDING = "gamepad_forwarding"
         const val K_AUDIO_CH = "audio_channels"
         const val K_CODEC = "codec"
         const val K_MIC = "mic_enabled"

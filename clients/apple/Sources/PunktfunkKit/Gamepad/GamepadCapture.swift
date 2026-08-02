@@ -98,9 +98,27 @@ public final class GamepadCapture {
     /// gameplay can't end it (see ContentView's tvOS session branch).
     public var onDisconnectRequest: (() -> Void)?
 
-    public init(connection: PunktfunkConnection, manager: GamepadManager) {
+    /// Forward this device's controllers to the host at all (`Settings.gamepadForwarding`,
+    /// default true). Off is for a couch whose controller reaches the host another way — USB
+    /// passthrough such as VirtualHere, or a pad plugged into the host itself — where
+    /// forwarding as well would give the host two pads for one pair of hands.
+    ///
+    /// Off still opens slots and tracks button state; it just sends nothing (see `wire`). That
+    /// is deliberate, not laziness: the escape chord is read off the same slots, and on tvOS it
+    /// is the ONLY controller way out of a stream — a session that silently lost its exit
+    /// because a forwarding preference was off would be a worse bug than the one this fixes.
+    /// Unlike pf-client-core's slots, GameController claims nothing exclusive, so holding one
+    /// open costs the host nothing and blocks no passthrough tool.
+    public let forwarding: Bool
+
+    /// The connection, or nil while forwarding is off — every wire send goes through this, so
+    /// "don't forward" is one fact in one place rather than a condition at twelve call sites.
+    private var wire: PunktfunkConnection? { forwarding ? connection : nil }
+
+    public init(connection: PunktfunkConnection, manager: GamepadManager, forwarding: Bool = true) {
         self.connection = connection
         self.manager = manager
+        self.forwarding = forwarding
     }
 
     public func start() {
@@ -205,8 +223,8 @@ public final class GamepadCapture {
         // core re-sends it a few times against datagram loss; an older host ignores it and uses
         // the session-default kind. Then wake the host pad (pads are created lazily from the first
         // event; a DualSense's UHID handshake + initial lightbar write only start then).
-        connection.send(.gamepadArrival(pref: slot.pref.rawValue, pad: slot.pad))
-        connection.send(.gamepadAxis(GamepadWire.axisLSX, value: 0, pad: slot.pad))
+        wire?.send(.gamepadArrival(pref: slot.pref.rawValue, pad: slot.pad))
+        wire?.send(.gamepadAxis(GamepadWire.axisLSX, value: 0, pad: slot.pad))
         sync(slot, ext)
 
         if let tp = Self.touchpad(ext) {
@@ -233,7 +251,7 @@ public final class GamepadCapture {
         flush(slot)
         // Sent after the flush so the core stamps it with a seq past the zeroing snapshots; the host
         // seq-gates it, so a reordered snapshot can't resurrect the removed pad.
-        connection.send(.gamepadRemove(pad: slot.pad))
+        wire?.send(.gamepadRemove(pad: slot.pad))
         let c = slot.controller
         if let ext = c.extendedGamepad {
             ext.valueChangedHandler = nil
@@ -275,7 +293,7 @@ public final class GamepadCapture {
         let changed = newButtons ^ slot.buttons
         if changed != 0 {
             for bit in GamepadWire.allButtons where changed & bit != 0 {
-                connection.send(.gamepadButton(bit, down: newButtons & bit != 0, pad: slot.pad))
+                wire?.send(.gamepadButton(bit, down: newButtons & bit != 0, pad: slot.pad))
             }
             slot.buttons = newButtons
         }
@@ -288,7 +306,7 @@ public final class GamepadCapture {
             Int32(g.rightTrigger.value * 255),
         ]
         for (i, v) in newAxes.enumerated() where v != slot.axes[i] {
-            connection.send(.gamepadAxis(UInt32(i), value: v, pad: slot.pad))
+            wire?.send(.gamepadAxis(UInt32(i), value: v, pad: slot.pad))
             slot.axes[i] = v
         }
         updateEscapeChord()
@@ -302,7 +320,7 @@ public final class GamepadCapture {
         let bit = GamepadWire.guide
         let now = down ? (slot.buttons | bit) : (slot.buttons & ~bit)
         guard now != slot.buttons else { return }
-        connection.send(.gamepadButton(bit, down: down, pad: slot.pad))
+        wire?.send(.gamepadButton(bit, down: down, pad: slot.pad))
         slot.buttons = now
     }
 
@@ -365,13 +383,13 @@ public final class GamepadCapture {
         if lifted {
             if slot.fingerActive[finger] {
                 slot.fingerActive[finger] = false
-                connection.sendTouchpad(pad: UInt8(slot.pad), finger: UInt8(finger), active: false, x: 0, y: 0)
+                wire?.sendTouchpad(pad: UInt8(slot.pad), finger: UInt8(finger), active: false, x: 0, y: 0)
             }
             return
         }
         slot.fingerActive[finger] = true
         let w = GamepadWire.touchpad(x: x, y: y)
-        connection.sendTouchpad(pad: UInt8(slot.pad), finger: UInt8(finger), active: true, x: w.x, y: w.y)
+        wire?.sendTouchpad(pad: UInt8(slot.pad), finger: UInt8(finger), active: true, x: w.x, y: w.y)
     }
 
     private func forwardMotion(_ slot: Slot, _ m: GCMotion) {
@@ -394,7 +412,7 @@ public final class GamepadCapture {
         }
         let gs = GamepadWire.gyroLSBPerRadS
         let as_ = GamepadWire.accelLSBPerG
-        connection.sendMotion(
+        wire?.sendMotion(
             pad: UInt8(slot.pad),
             gyro: (
                 GamepadWire.motionRaw(Float(m.rotationRate.x), scale: gs),
@@ -432,15 +450,15 @@ public final class GamepadCapture {
     /// GamepadRemove (that's `closeSlot`).
     private func flush(_ slot: Slot) {
         for bit in GamepadWire.allButtons where slot.buttons & bit != 0 {
-            connection.send(.gamepadButton(bit, down: false, pad: slot.pad))
+            wire?.send(.gamepadButton(bit, down: false, pad: slot.pad))
         }
         slot.buttons = 0
         for (i, v) in slot.axes.enumerated() where v != 0 {
-            connection.send(.gamepadAxis(UInt32(i), value: 0, pad: slot.pad))
+            wire?.send(.gamepadAxis(UInt32(i), value: 0, pad: slot.pad))
             slot.axes[i] = 0
         }
         for (f, active) in slot.fingerActive.enumerated() where active {
-            connection.sendTouchpad(pad: UInt8(slot.pad), finger: UInt8(f), active: false, x: 0, y: 0)
+            wire?.sendTouchpad(pad: UInt8(slot.pad), finger: UInt8(f), active: false, x: 0, y: 0)
             slot.fingerActive[f] = false
         }
     }

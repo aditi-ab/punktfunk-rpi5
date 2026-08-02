@@ -92,6 +92,12 @@ an Xbox pad), held on any connected pad.
 - **Android** — holding it about a second disconnects. A quick press does nothing; the moment the
   chord completes a **Hold to quit…** cue appears so you know it registered.
 
+The chord is read off the pads a client forwards, so turning
+[**Forward controllers**](/docs/client-settings#input) off takes it away on **Linux and Windows** —
+there the client stops opening the controller at all, which is the point of the setting. Use
+**Ctrl+Alt+Shift+D** or the client's own UI to leave instead. The Apple and Android apps keep
+watching for the chord either way.
+
 ## Mouse modes
 
 There are two, and they are a per-client setting called **Mouse input**:

@@ -625,6 +625,9 @@ fn commit_profile(active: &StreamProfile, touched: &Touched, values: &Settings) 
     if touched.has("gamepad") {
         o.gamepad = Some(values.gamepad.clone());
     }
+    if touched.has("gamepad_forwarding") {
+        o.gamepad_forwarding = Some(values.gamepad_forwarding);
+    }
     if touched.has("stats_verbosity") {
         o.stats_verbosity = Some(values.stats_verbosity());
     }
@@ -1376,6 +1379,17 @@ pub fn show_scoped(
     // controller (single-player). The pin is persisted by stable key (`Settings::forward_pad`),
     // so it survives restarts — and disconnects: an offline pinned pad keeps its entry here
     // instead of silently snapping back to Automatic.
+    // Off = this device's controllers are not sent at all, because they reach the host
+    // another way (USB passthrough such as VirtualHere, or a pad plugged into the host).
+    // It also stops the session OPENING the pad, which is what frees the device for a
+    // passthrough tool to bind — so the two rows below have nothing to act on while it is
+    // off, and are desensitised to say so.
+    let pad_forward_row = adw::SwitchRow::builder()
+        .title("Forward controllers")
+        .subtitle(
+            "Send this device's controllers to the host — off if it already has them another way",
+        )
+        .build();
     let pads = gamepads.pads();
     let saved_pin = settings.borrow().forward_pad.clone();
     let mut pad_names = vec!["Automatic (all controllers)".to_string()];
@@ -1444,6 +1458,18 @@ pub fn show_scoped(
             "Steam Deck",
         ],
     );
+    // Both pad rows only mean something while something is being forwarded (the same
+    // relationship mic → echo cancellation draws just above, initial state included: the
+    // seed's `set_active` fires this only when it CHANGES the switch).
+    {
+        let (f, t) = (forward_row.widget().clone(), pad_row.widget().clone());
+        f.set_sensitive(seed.gamepad_forwarding);
+        t.set_sensitive(seed.gamepad_forwarding);
+        pad_forward_row.connect_active_notify(move |r| {
+            f.set_sensitive(r.is_active());
+            t.set_sensitive(r.is_active());
+        });
+    }
 
     // ---- Seed from the effective settings for this scope ----
     {
@@ -1454,6 +1480,7 @@ pub fn show_scoped(
         hz_row.set_selected(index::refresh(s));
         scale_row.set_selected(index::render_scale(s));
         bitrate_row.set_value(f64::from(s.bitrate_kbps) / 1000.0);
+        pad_forward_row.set_active(s.gamepad_forwarding);
         pad_row.set_selected(index::gamepad(s));
         let touch_i = index::touch(s);
         touch_row.set_selected(touch_i);
@@ -1671,6 +1698,12 @@ pub fn show_scoped(
             index::surround
         );
         choice!(pad_row, "gamepad", o.gamepad.is_some(), index::gamepad);
+        toggle!(
+            pad_forward_row,
+            "gamepad_forwarding",
+            o.gamepad_forwarding.is_some(),
+            gamepad_forwarding
+        );
         toggle!(hdr_row, "hdr_enabled", o.hdr_enabled.is_some(), hdr_enabled);
         toggle!(chroma_row, "enable_444", o.enable_444.is_some(), enable_444);
         toggle!(
@@ -1843,6 +1876,10 @@ pub fn show_scoped(
             controllers_group.add(&row);
         }
     }
+    // Profileable, so it shows in both scopes — unlike the pin below it, which is about
+    // which of THIS device's pads goes first: a "Work" profile can decline to forward
+    // controllers to a host that a "Game" profile forwards them to.
+    controllers_group.add(&pad_forward_row);
     if !profile_mode {
         controllers_group.add(forward_row.widget());
     }
@@ -1915,6 +1952,7 @@ pub fn show_scoped(
             s.auto_wake = wake_row.is_active();
             s.inhibit_shortcuts = inhibit_row.is_active();
             s.invert_scroll = invert_row.is_active();
+            s.gamepad_forwarding = pad_forward_row.is_active();
             s.mic_enabled = mic_row.is_active();
             s.echo_cancel = echo_row.is_active();
             s.hdr_enabled = hdr_row.is_active();

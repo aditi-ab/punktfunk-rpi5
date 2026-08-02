@@ -29,6 +29,7 @@ enum RowId {
     Audio,
     Mic,
     EchoCancel,
+    PadForward,
     Pad,
     PadType,
     Touch,
@@ -46,7 +47,7 @@ enum RowId {
 // scroll/shortcut behavior, fullscreen-on-stream, auto-wake, the library toggle and echo
 // cancellation all were). Still deliberately smaller than the desktop dialogs — device
 // pickers (GPU/speaker/mic) and the profile catalog stay desktop-only.
-const ROWS: [RowId; 22] = [
+const ROWS: [RowId; 23] = [
     RowId::Resolution,
     RowId::Refresh,
     RowId::RenderScale,
@@ -59,6 +60,7 @@ const ROWS: [RowId; 22] = [
     RowId::Audio,
     RowId::Mic,
     RowId::EchoCancel,
+    RowId::PadForward,
     RowId::Pad,
     RowId::PadType,
     RowId::Touch,
@@ -222,9 +224,14 @@ impl SettingsScreen {
 
 fn row_spec(id: RowId, ctx: &Ctx) -> RowSpec {
     let s = &ctx.settings;
-    // Echo cancellation only means anything while the mic streams — dimmed and inert while it
-    // doesn't, the same relationship the desktop shells draw with a greyed-out row.
-    let enabled = !matches!(id, RowId::EchoCancel) || s.mic_enabled;
+    // Echo cancellation only means anything while the mic streams, and which controller to
+    // forward as which virtual pad only while any controller is forwarded at all — dimmed and
+    // inert otherwise, the same relationship the desktop shells draw with a greyed-out row.
+    let enabled = match id {
+        RowId::EchoCancel => s.mic_enabled,
+        RowId::Pad | RowId::PadType => s.gamepad_forwarding,
+        _ => true,
+    };
     let (header, label, value): (Option<&'static str>, &str, String) = match id {
         RowId::Resolution => (
             Some("Stream"),
@@ -290,8 +297,13 @@ fn row_spec(id: RowId, ctx: &Ctx) -> RowSpec {
         ),
         RowId::Mic => (None, "Microphone", on_off(s.mic_enabled).into()),
         RowId::EchoCancel => (None, "Echo cancellation", on_off(s.echo_cancel).into()),
-        RowId::Pad => (
+        RowId::PadForward => (
             Some("Controller"),
+            "Forward controllers",
+            on_off(s.gamepad_forwarding).into(),
+        ),
+        RowId::Pad => (
+            None,
             "Use controller",
             if s.forward_pad.is_empty() {
                 "Automatic".into()
@@ -376,6 +388,11 @@ fn detail(id: RowId) -> &'static str {
         RowId::EchoCancel => {
             "Stops the host's audio, playing from this device's speakers, being picked up \
              and sent back. Turn it off if your microphone already runs its own processing."
+        }
+        RowId::PadForward => {
+            "Send controllers connected to this device to the host. Turn it off when your \
+             controller already reaches the host another way — USB passthrough such as \
+             VirtualHere, or a pad plugged into the host — so games don't see two of them."
         }
         RowId::Pad => "Which pad is forwarded to the host, as player 1.",
         RowId::PadType => "The virtual pad the host creates — Automatic matches this controller.",
@@ -476,7 +493,11 @@ fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
                 None
             }
         }
+        RowId::PadForward => toggle(&mut s.gamepad_forwarding, delta, wrap),
         RowId::Pad => {
+            if !s.gamepad_forwarding {
+                return false;
+            }
             // Automatic first, then every connected pad by stable key.
             let keys: Vec<String> = std::iter::once(String::new())
                 .chain(ctx.pads.iter().map(|p| p.key.clone()))
@@ -484,7 +505,12 @@ fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
             let cur = keys.iter().position(|c| *c == s.forward_pad);
             step_option(cur, keys.len(), delta, wrap).map(|i| s.forward_pad = keys[i].clone())
         }
-        RowId::PadType => step_str(&PAD_TYPES, &mut s.gamepad, delta, wrap),
+        RowId::PadType => {
+            if !s.gamepad_forwarding {
+                return false;
+            }
+            step_str(&PAD_TYPES, &mut s.gamepad, delta, wrap)
+        }
         RowId::Touch => {
             let cur = TouchMode::ALL.iter().position(|m| *m == s.touch_mode());
             step_option(cur, TouchMode::ALL.len(), delta, wrap)

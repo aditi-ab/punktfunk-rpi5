@@ -34,6 +34,7 @@ public struct EffectiveSettings: Equatable, Sendable {
     public var mouseMode = "capture"
     public var invertScroll = false
     public var gamepadType = 0
+    public var gamepadForwarding = true
     /// A `StatsVerbosity` raw value; the enum lives in PunktfunkKit, which this module can't see.
     public var statsVerbosity = "normal"
     public var fullscreenWhileStreaming = true
@@ -93,6 +94,7 @@ public struct EffectiveSettings: Equatable, Sendable {
         mouseMode = str(DefaultsKey.mouseMode, mouseMode)
         invertScroll = bool(DefaultsKey.invertScroll, invertScroll)
         gamepadType = int(DefaultsKey.gamepadType, gamepadType)
+        gamepadForwarding = bool(DefaultsKey.gamepadForwarding, gamepadForwarding)
         statsVerbosity = Self.storedStatsVerbosity(defaults)
         fullscreenWhileStreaming = bool(
             DefaultsKey.fullscreenWhileStreaming, fullscreenWhileStreaming)
@@ -140,6 +142,7 @@ public struct EffectiveSettings: Equatable, Sendable {
         if let v = overlay.mouseMode { s.mouseMode = v }
         if let v = overlay.invertScroll { s.invertScroll = v }
         if let v = overlay.gamepadType { s.gamepadType = v }
+        if let v = overlay.gamepadForwarding { s.gamepadForwarding = v }
         if let v = overlay.statsVerbosity { s.statsVerbosity = v }
         if let v = overlay.fullscreenWhileStreaming { s.fullscreenWhileStreaming = v }
         if let v = overlay.enable444 { s.enable444 = v }

@@ -445,6 +445,7 @@ struct OverrideFlags {
     invert_scroll: bool,
     inhibit_shortcuts: bool,
     gamepad: bool,
+    gamepad_forwarding: bool,
     stats_verbosity: bool,
     fullscreen_on_stream: bool,
 }
@@ -473,6 +474,7 @@ impl OverrideFlags {
             invert_scroll: o.invert_scroll.is_some(),
             inhibit_shortcuts: o.inhibit_shortcuts.is_some(),
             gamepad: o.gamepad.is_some(),
+            gamepad_forwarding: o.gamepad_forwarding.is_some(),
             stats_verbosity: o.stats_verbosity.is_some(),
             fullscreen_on_stream: o.fullscreen_on_stream.is_some(),
         }
@@ -898,6 +900,10 @@ pub(crate) fn settings_page(
                 s.save();
             })
     };
+    let pad_forward_toggle =
+        setting_toggle(ctx, scope, (rev, set_rev), s.gamepad_forwarding, |s, on| {
+            s.gamepad_forwarding = on
+        });
     let (pad_names, pad_i) = presets(GAMEPADS, |v| {
         GamepadPref::from_name(v) == GamepadPref::from_name(&s.gamepad)
     });
@@ -1223,6 +1229,23 @@ pub(crate) fn settings_page(
                             "Plug in or pair a controller and it appears here.",
                         )
                     }),
+                    // Whether ANY controller is forwarded — profileable, so it renders in
+                    // both scopes (a "Work" profile can decline what "Game" forwards),
+                    // unlike the device-fact picker below it.
+                    Some(described_overridable(
+                        (rev, set_rev),
+                        scope,
+                        "gamepad_forwarding",
+                        "Forward controllers",
+                        over.gamepad_forwarding,
+                        pad_forward_toggle,
+                        "Sends controllers connected to this PC to the host. Turn it off when \
+                         your controller already reaches the host another way \u{2014} USB \
+                         passthrough such as VirtualHere, or a pad plugged into the host \
+                         itself \u{2014} so games don't see two of them. Off, this PC never \
+                         opens the controller at all, which is what leaves it free for a \
+                         passthrough tool to claim.",
+                    )),
                     // NOT Apple's wording: Apple forwards ONE pad as player 1, this client
                     // forwards every controller as its own player. Same picker, different rule.
                     // Which physical pad this device forwards is a device fact (tier G), so it

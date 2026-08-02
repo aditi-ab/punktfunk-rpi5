@@ -401,8 +401,15 @@ private fun buildSettingsRows(
             s.echoCancel,
         ) { update(s.copy(echoCancel = it)) },
 
+        toggle(
+            "padForward", "Controllers", "Forward controllers",
+            "Send this device's controllers to the host. Turn it off when your controller " +
+                "already reaches the host another way — USB passthrough such as VirtualHere — " +
+                "so games don't see two of them.",
+            s.gamepadForwarding,
+        ) { update(s.copy(gamepadForwarding = it)) },
         choice(
-            "padType", "Controllers", "Controller type",
+            "padType", null, "Controller type",
             "The virtual pad the host creates — Automatic matches this controller.",
             GAMEPAD_OPTIONS, s.gamepad,
         ) { update(s.copy(gamepad = it)) },

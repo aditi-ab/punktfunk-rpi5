@@ -818,11 +818,23 @@ private fun AudioSettings(s: Settings, update: (Settings) -> Unit, onMicChange: 
 @Composable
 private fun ControllerSettings(s: Settings, update: (Settings) -> Unit, onOpenControllers: () -> Unit) {
     SettingsGroup(footer = "Applies from the next session.") {
+        // The master switch, above everything it governs. Profileable, so it shows in both
+        // scopes: a "Work" profile can decline to forward what "Game" forwards.
+        ToggleRow(
+            title = "Forward controllers",
+            subtitle = "Send this device's controllers to the host. Turn it off when your " +
+                "controller already reaches the host another way — USB passthrough such as " +
+                "VirtualHere, or a pad plugged into the host — so games don't see two of them",
+            checked = s.gamepadForwarding,
+            field = "gamepad_forwarding",
+            onCheckedChange = { on -> update(s.copy(gamepadForwarding = on)) },
+        )
         SettingDropdown(
             label = "Controller type",
             options = GAMEPAD_OPTIONS,
             selected = s.gamepad,
             field = "gamepad",
+            enabled = s.gamepadForwarding,
             caption = "The virtual pad the host creates. Automatic matches your controller; " +
                 "every connected one is forwarded as its own player.",
         ) { g -> update(s.copy(gamepad = g)) }
@@ -852,6 +864,7 @@ private fun ControllerSettings(s: Settings, update: (Settings) -> Unit, onOpenCo
                 subtitle = "Stream a Steam Controller 2 as-is — Steam on the host drives its " +
                     "trackpads, gyro and haptics directly",
                 checked = s.sc2Capture,
+                enabled = s.gamepadForwarding,
                 onCheckedChange = { on -> update(s.copy(sc2Capture = on)) },
             )
             // Same no-vibrator-gate reasoning as the SC2 row: this capture renders feedback on
@@ -861,6 +874,7 @@ private fun ControllerSettings(s: Settings, update: (Settings) -> Unit, onOpenCo
                 subtitle = "Drive a USB-connected Sony pad directly — rumble on any phone, " +
                     "plus adaptive triggers, lightbar and gyro",
                 checked = s.dsCapture,
+                enabled = s.gamepadForwarding,
                 onCheckedChange = { on -> update(s.copy(dsCapture = on)) },
             )
         }
@@ -1013,6 +1027,7 @@ private fun <T> SettingDropdown(
     selected: T,
     field: String? = null,
     caption: String? = null,
+    enabled: Boolean = true,
     onSelect: (T) -> Unit,
 ) {
     var expanded by remember { mutableStateOf(false) }
@@ -1020,18 +1035,25 @@ private fun <T> SettingDropdown(
         ?: options.firstOrNull()?.second.orEmpty()
     Column {
         OverrideBadge(field)
-        ExposedDropdownMenuBox(expanded = expanded, onExpandedChange = { expanded = it }) {
+        ExposedDropdownMenuBox(
+            expanded = expanded && enabled,
+            onExpandedChange = { if (enabled) expanded = it },
+        ) {
             OutlinedTextField(
                 value = selectedLabel,
                 onValueChange = {},
                 readOnly = true,
+                enabled = enabled,
                 label = { Text(label) },
                 trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded) },
                 modifier = Modifier
                     .menuAnchor(ExposedDropdownMenuAnchorType.PrimaryNotEditable)
                     .fillMaxWidth(),
             )
-            ExposedDropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+            ExposedDropdownMenu(
+                expanded = expanded && enabled,
+                onDismissRequest = { expanded = false },
+            ) {
                 options.forEach { (value, lbl) ->
                     DropdownMenuItem(
                         text = { Text(lbl) },

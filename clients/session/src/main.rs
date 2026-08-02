@@ -188,6 +188,12 @@ mod session_main {
         if !settings.forward_pad.is_empty() {
             gamepad.set_pinned(Some(settings.forward_pad.clone()));
         }
+        // Whether to forward controllers AT ALL (off = the pad reaches the host by some other
+        // route — VirtualHere and friends). Set unconditionally, not only when off: browse mode
+        // reuses one service across launches, so a stream that follows one with it off must put
+        // it back. It goes on before the attach below, so a non-forwarding session never opens
+        // — never grabs — the device.
+        gamepad.set_forwarding(settings.gamepad_forwarding);
         let mode = Mode {
             width: if settings.width == 0 {
                 native.width

@@ -1047,7 +1047,8 @@ class Plugin:
             # The client's own defaults (native display, host-default bitrate, auto pad).
             return {
                 "width": 0, "height": 0, "refresh_hz": 0, "render_scale": 1.0,
-                "bitrate_kbps": 0, "codec": "auto", "gamepad": "auto", "compositor": "auto",
+                "bitrate_kbps": 0, "codec": "auto", "gamepad": "auto",
+                "gamepad_forwarding": True, "compositor": "auto",
                 "inhibit_shortcuts": True, "mic_enabled": False,
             }
 
