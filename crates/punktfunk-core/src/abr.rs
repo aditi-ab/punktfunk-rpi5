@@ -416,6 +416,21 @@ impl BitrateController {
                     }
                 } else {
                     self.short_acks = 0;
+                    // GRANTED in full at or above the learned cap: the limit that taught it is
+                    // gone, and we have the host's own word for it. Drop the cap outright rather
+                    // than keep crawling up in +12.5 % re-probe steps — for a cap latched from a
+                    // transient (a host briefly behind cadence) that crawl is the entire
+                    // remaining cost of the transient, and it is measured in minutes.
+                    if self.host_cap_kbps.is_some_and(|c| kbps >= c) {
+                        tracing::info!(
+                            granted_kbps = kbps,
+                            "adaptive bitrate: host granted a climb at the learned cap — the \
+                             limit has lifted, dropping it"
+                        );
+                        self.host_cap_kbps = None;
+                        self.cap_probe_windows = 0;
+                        self.cap_reprobe_after = CAP_REPROBE_WINDOWS_MIN;
+                    }
                 }
             }
             self.current_kbps = kbps;
@@ -1594,6 +1609,62 @@ mod tests {
             );
         }
         assert_eq!(c.host_cap_kbps, Some(794_000 + 794_000 / 8));
+    }
+
+    #[test]
+    fn a_transient_refusal_does_not_pin_the_session() {
+        // The field failure this whole cap-escape change exists for. A host that escalates its
+        // capture/encode pipeline once — a startup hitch is enough — used to refuse every climb
+        // for the rest of the session; the client latched that refusal as a cap, at whatever
+        // rate slow start had reached, which is routinely the 20 Mbps default. Escaping cost
+        // +12.5 % per ~60 s: north of twenty minutes to reach a 300 Mbps link ceiling, which the
+        // user experiences as "Automatic is broken".
+        let mut c = BitrateController::new(20_000);
+        c.set_ceiling(300_000); // the startup probe measured a fat link
+        let start = Instant::now();
+        let mut tick = 0u32;
+        let mut windows_pinned = 0u32;
+        // Two refused climbs at the same rate → the cap latches at 20 Mbps.
+        for _ in 0..2 {
+            let k = run_clean(&mut c, start, tick, 4).expect("slow start should ask to climb");
+            tick += 4;
+            assert!(k > 20_000);
+            c.on_ack(20_000); // "behind cadence — held at the current rate"
+        }
+        assert_eq!(c.host_cap_kbps, Some(20_000));
+        // The host recovers immediately (its bucket drains; the escalation bought the headroom
+        // it was for), but the client has no way to know that except by asking again. Drive
+        // clean windows and grant whatever it asks for.
+        while c.current_kbps < 150_000 && windows_pinned < 400 {
+            if let Some(k) = c.on_window(
+                ticks(start, tick),
+                0,
+                0,
+                Some(10_000),
+                None,
+                None,
+                1_000_000,
+                false,
+                0,
+            ) {
+                c.on_ack(k);
+            }
+            tick += 1;
+            windows_pinned += 1;
+        }
+        assert!(
+            c.current_kbps >= 150_000,
+            "still pinned at {} after {windows_pinned} windows",
+            c.current_kbps
+        );
+        // ~750 ms a window: this must be tens of seconds, not the old tens of minutes.
+        assert!(
+            windows_pinned <= 40,
+            "took {windows_pinned} windows (~{} s) to escape a transient refusal",
+            windows_pinned * 3 / 4
+        );
+        // And the disproven cap is gone, not merely nudged upward.
+        assert!(c.host_cap_kbps.is_none());
     }
 
     #[test]
