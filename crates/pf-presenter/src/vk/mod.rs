@@ -247,8 +247,40 @@ impl Presenter {
     /// (the presenter itself never sees them). No-op when timing is inactive.
     pub(crate) fn note_presented(&mut self, pts_ns: u64, decoded_ns: u64) {
         if let (Some(t), Some((sc, id))) = (&self.present_timer, self.last_presented.take()) {
-            t.enqueue(sc, id, pts_ns, decoded_ns);
+            // The submit stamp: `present()` already returned, so "now" is within the
+            // present-call tail — the pace/latch split point.
+            t.enqueue(
+                sc,
+                id,
+                pts_ns,
+                decoded_ns,
+                pf_client_core::session::now_ns(),
+            );
         }
+    }
+
+    /// Undisplayed id-carrying presents in flight (0 when timing is inactive) — the
+    /// FIFO glass gate's budget count.
+    pub(crate) fn presents_outstanding(&self) -> usize {
+        self.present_timer.as_ref().map_or(0, |t| t.outstanding())
+    }
+
+    /// Install the run loop's wake for present completions (an SDL event push). No-op
+    /// without present timing — there is nothing to wake on then.
+    pub(crate) fn set_present_wake(&self, cb: Box<dyn Fn() + Send>) {
+        if let Some(t) = &self.present_timer {
+            t.set_wake(cb);
+        }
+    }
+
+    /// The active present mode queues presents (FIFO family): the only modes where the
+    /// swapchain itself can become a standing queue, and so the only ones the glass
+    /// gate governs. MAILBOX/IMMEDIATE replace/flip and never queue.
+    pub(crate) fn fifo_present_mode(&self) -> bool {
+        matches!(
+            self.present_mode,
+            vk::PresentModeKHR::FIFO | vk::PresentModeKHR::FIFO_RELAXED
+        )
     }
 
     /// Take the window's completed on-glass samples (empty when timing is inactive).

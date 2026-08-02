@@ -26,6 +26,9 @@ pub(crate) struct PresentedSample {
     pub pts_ns: u64,
     /// Decode-complete stamp (client clock) — the display-stage anchor.
     pub decoded_ns: u64,
+    /// `vkQueuePresentKHR`-return stamp (client clock) — the pace/latch split point:
+    /// `submitted − decoded` is our pipeline, `displayed − submitted` the vsync latch.
+    pub submitted_ns: u64,
     /// `vkWaitForPresentKHR` completion = the image is visible (client clock).
     pub displayed_ns: u64,
 }
@@ -35,15 +38,24 @@ struct Job {
     present_id: u64,
     pts_ns: u64,
     decoded_ns: u64,
+    submitted_ns: u64,
 }
+
+/// The run loop's wake callback (an SDL event push), shared with the waiter thread.
+type WakeSlot = Arc<Mutex<Option<Box<dyn Fn() + Send>>>>;
 
 /// The waiter: a channel-fed thread turning (swapchain, present-id) pairs into
 /// [`PresentedSample`]s. One frame in flight upstream keeps the queue depth ~1.
 pub(crate) struct PresentTimer {
     tx: Option<mpsc::Sender<Job>>,
-    /// Jobs enqueued but not yet finished — the drain barrier for swapchain teardown.
+    /// Jobs enqueued but not yet finished — the drain barrier for swapchain teardown,
+    /// and the glass gate's "undisplayed presents in flight" count.
     pending: Arc<AtomicUsize>,
     results: Arc<Mutex<Vec<PresentedSample>>>,
+    /// Called by the waiter after each completed wait (sample or not) — the run loop
+    /// installs an SDL wake here so a gate reopen / smoothness slot never waits out the
+    /// event-loop timeout.
+    wake: WakeSlot,
     join: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -52,7 +64,8 @@ impl PresentTimer {
         let (tx, rx) = mpsc::channel::<Job>();
         let pending = Arc::new(AtomicUsize::new(0));
         let results = Arc::new(Mutex::new(Vec::with_capacity(256)));
-        let (pending_t, results_t) = (pending.clone(), results.clone());
+        let wake: WakeSlot = Arc::new(Mutex::new(None));
+        let (pending_t, results_t, wake_t) = (pending.clone(), results.clone(), wake.clone());
         let join = std::thread::Builder::new()
             .name("pf-present-wait".into())
             .spawn(move || {
@@ -69,12 +82,20 @@ impl PresentTimer {
                         results_t.lock().unwrap().push(PresentedSample {
                             pts_ns: job.pts_ns,
                             decoded_ns: job.decoded_ns,
+                            submitted_ns: job.submitted_ns,
                             displayed_ns,
                         });
                     }
                     // SUBOPTIMAL/TIMEOUT/DEVICE_LOST: no sample; the frame still showed
                     // (or the loop is about to find out) — never poison the window.
                     pending_t.fetch_sub(1, Ordering::AcqRel);
+                    // Wake the run loop AFTER the count dropped: what it observes on
+                    // wake is the post-completion state (the gate may now be open).
+                    // Called under the slot lock — the callback is a bare SDL event
+                    // push and never reenters this type.
+                    if let Some(cb) = wake_t.lock().unwrap().as_ref() {
+                        cb();
+                    }
                 }
             })
             .expect("spawn pf-present-wait");
@@ -82,8 +103,21 @@ impl PresentTimer {
             tx: Some(tx),
             pending,
             results,
+            wake,
             join: Some(join),
         }
+    }
+
+    /// Install the run loop's wake callback (an SDL event push — thread-safe by design).
+    pub(crate) fn set_wake(&self, cb: Box<dyn Fn() + Send>) {
+        *self.wake.lock().unwrap() = Some(cb);
+    }
+
+    /// Presents handed to the waiter and not yet resolved to glass — the glass gate's
+    /// budget count. (Also counts a wait that will end SUBOPTIMAL/TIMEOUT; those resolve
+    /// within the 250 ms cap, far past the gate's own 100 ms stale force-open.)
+    pub(crate) fn outstanding(&self) -> usize {
+        self.pending.load(Ordering::Acquire)
     }
 
     /// Hand a successfully submitted present to the waiter.
@@ -93,6 +127,7 @@ impl PresentTimer {
         present_id: u64,
         pts_ns: u64,
         decoded_ns: u64,
+        submitted_ns: u64,
     ) {
         if let Some(tx) = &self.tx {
             self.pending.fetch_add(1, Ordering::AcqRel);
@@ -102,6 +137,7 @@ impl PresentTimer {
                     present_id,
                     pts_ns,
                     decoded_ns,
+                    submitted_ns,
                 })
                 .is_err()
             {
