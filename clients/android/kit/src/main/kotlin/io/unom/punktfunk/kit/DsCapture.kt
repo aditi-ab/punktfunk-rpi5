@@ -78,6 +78,25 @@ class DsCapture(
     @Volatile
     var onActiveChanged: ((active: Boolean) -> Unit)? = null
 
+    /**
+     * Tier-A pad audio, bound by the app layer (which owns the session handle).
+     *
+     * [start] is called once the router has assigned this pad a wire index — not at claim time,
+     * because the index does not exist until the first report arrives and the host addresses the
+     * `0xD1` stream by that index. [stop] is called **before** the USB link closes, and must not
+     * return until nothing is still writing to the descriptor.
+     */
+    interface PadAudioHook {
+        fun start(pad: Int, fd: Int)
+        fun stop(pad: Int)
+    }
+
+    @Volatile
+    var padAudio: PadAudioHook? = null
+
+    /** True once [PadAudioHook.start] has run for the current capture, so it fires exactly once. */
+    @Volatile private var padAudioStarted = false
+
     val isActive: Boolean get() = model != null
 
     /** First attached Sony USB pad, for the permission flow. Needs no permission to enumerate. */
@@ -111,6 +130,13 @@ class DsCapture(
 
     /** Stop the link and free the wire slot (host tears the virtual pad down). Idempotent. */
     fun stop() {
+        // Before anything touches the link: the pad-audio renderer borrows this connection's
+        // descriptor, and `usb.stop()` closes it. The hook does not return until its thread is
+        // joined, so ordering this first is what makes the borrow sound.
+        if (padAudioStarted) {
+            padAudioStarted = false
+            pad?.let { padAudio?.stop(it.index) }
+        }
         val m = model
         if (m != null) {
             // The interfaces are about to release with the kernel driver still detached — a
@@ -133,6 +159,15 @@ class DsCapture(
         if (!DsDevice.parseState(m, report, len, state)) return
         val p = pad ?: router.openExternal(m.pref)?.also {
             pad = it
+            // The wire index exists from here on, and the host addresses pad audio by it. Fired on
+            // the link thread, once per capture.
+            if (!padAudioStarted) {
+                val fd = usb.fileDescriptor
+                if (fd >= 0) {
+                    padAudioStarted = true
+                    padAudio?.start(it.index, fd)
+                }
+            }
             Log.i(TAG, "captured $m → wire pad ${it.index}")
         } ?: return // all 16 wire indices taken — drop until one frees
         mirrorTyped(p)

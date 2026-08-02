@@ -146,6 +146,26 @@ data class Settings(
     val dsCapture: Boolean = true,
 
     /**
+     * Render the host's DualSense **voice-coil haptics** on a captured USB pad (tier A).
+     *
+     * The pad's own 4-channel audio device carries them, driven directly over usbfs — Android's
+     * audio framework denylists that device by VID/PID, so there is no supported route to it. When
+     * this is on and the pad is captured, wire rumble for that pad is SUPPRESSED rather than mixed:
+     * the DualSense's firmware treats audio haptics and classic rumble as mutually exclusive, so
+     * the arbitration is a selection. Off, or on an uncaptured/Bluetooth pad, the pad stays on
+     * ordinary rumble (tier C), which on this client already drives the same actuators.
+     */
+    val padHaptics: Boolean = true,
+
+    /**
+     * Render the pad's **built-in speaker** on a captured USB pad. Independent of [padHaptics] —
+     * the host sends the two as separate streams and either can play alone. Off by default: the
+     * speaker is a small, easily-startling loudspeaker in the user's hands, and unlike haptics it
+     * duplicates audio they are already hearing.
+     */
+    val padSpeaker: Boolean = false,
+
+    /**
      * How a physical mouse drives the host — the cross-client mouse model (see [MouseMode]).
      * [MouseMode.DESKTOP] (default here) points absolutely; [MouseMode.CAPTURE] locks the pointer
      * to the stream ([android.view.View.requestPointerCapture]) and forwards raw relative motion.
@@ -243,6 +263,8 @@ class SettingsStore(context: Context) {
         rumbleOnPhone = prefs.getBoolean(K_RUMBLE_ON_PHONE, false),
         sc2Capture = prefs.getBoolean(K_SC2_CAPTURE, true),
         dsCapture = prefs.getBoolean(K_DS_CAPTURE, true),
+        padHaptics = prefs.getBoolean(K_PAD_HAPTICS, true),
+        padSpeaker = prefs.getBoolean(K_PAD_SPEAKER, false),
         mouseMode = prefs.getString(K_MOUSE_MODE, null)
             ?.let { name -> MouseMode.entries.firstOrNull { it.storedName == name } }
             // Migration: the pre-enum Boolean "pointer_capture" (true = lock the pointer). Its
@@ -277,6 +299,8 @@ class SettingsStore(context: Context) {
             .putBoolean(K_RUMBLE_ON_PHONE, s.rumbleOnPhone)
             .putBoolean(K_SC2_CAPTURE, s.sc2Capture)
             .putBoolean(K_DS_CAPTURE, s.dsCapture)
+            .putBoolean(K_PAD_HAPTICS, s.padHaptics)
+            .putBoolean(K_PAD_SPEAKER, s.padSpeaker)
             .putString(K_MOUSE_MODE, s.mouseMode.storedName)
             .putBoolean(K_INVERT_SCROLL, s.invertScroll)
             .apply()
@@ -321,6 +345,8 @@ class SettingsStore(context: Context) {
         const val K_RUMBLE_ON_PHONE = "rumble_on_phone"
         const val K_SC2_CAPTURE = "sc2_capture"
         const val K_DS_CAPTURE = "ds_capture"
+        const val K_PAD_HAPTICS = "pad_haptics"
+        const val K_PAD_SPEAKER = "pad_speaker"
         const val K_MOUSE_MODE = "mouse_mode"
 
         /** Legacy Boolean the [K_MOUSE_MODE] enum replaced — read once for migration, never written. */

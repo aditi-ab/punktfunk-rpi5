@@ -93,6 +93,20 @@ class HidUsbLink(
     fun findDevice(): UsbDevice? = usb.deviceList.values.firstOrNull(config.deviceMatch)
 
     /**
+     * The open connection's usbfs file descriptor, or -1 when the link is not running.
+     *
+     * Handed to native code that drives interfaces this link deliberately does NOT claim — the
+     * pad's isochronous audio endpoint (see `pad_audio` on the native side), which Android's own
+     * USB API cannot reach because `UsbRequest` rejects anything that is not bulk or interrupt.
+     * usbfs claims are per interface, so a native claim of the audio interface leaves this link's
+     * HID claim untouched.
+     *
+     * **The borrower must stop using it before [stop] runs**: closing the connection while a
+     * transfer is in flight pulls the descriptor out from under the kernel.
+     */
+    val fileDescriptor: Int get() = connection?.fileDescriptor ?: -1
+
+    /**
      * Claim [dev]'s controller interface(s) and start the read loop. The caller has already
      * obtained USB permission. Returns false when nothing could be claimed.
      */

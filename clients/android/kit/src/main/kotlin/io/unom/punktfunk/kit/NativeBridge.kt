@@ -333,6 +333,37 @@ object NativeBridge {
     external fun nativeSetMicMuted(handle: Long, muted: Boolean)
 
     /**
+     * Start tier-A DualSense pad audio: render the host's `0xD1` streams on the pad's own
+     * 4-channel USB audio device.
+     *
+     * [fd] is an open [android.hardware.usb.UsbDeviceConnection]'s file descriptor. Native code
+     * **borrows** it — it claims the pad's audio interface through usbfs (which leaves any HID
+     * claim on the same device alone) and never closes the descriptor. The caller must keep the
+     * connection open until [nativeStopPadAudio] returns.
+     *
+     * This also declares the pad's render capability to the host; without it no `0xD1` is sent.
+     *
+     * Returns false when there is nothing to render. A kernel that refuses the interface claim is
+     * NOT reported here — the renderer discovers that on its own thread and the session simply
+     * carries on without tier A, because some OEM kernels refuse and no app-side fix exists.
+     */
+    external fun nativeStartPadAudio(
+        handle: Long,
+        pad: Int,
+        fd: Int,
+        haptics: Boolean,
+        speaker: Boolean,
+    ): Boolean
+
+    /**
+     * Stop tier-A pad audio and join its render thread, and hand the pad back to wire rumble.
+     *
+     * Returns only once the thread is joined — so the `UsbDeviceConnection` may be closed as soon
+     * as this returns, and not before.
+     */
+    external fun nativeStopPadAudio(handle: Long, pad: Int)
+
+    /**
      * Is a mic capture actually RUNNING — i.e. did [nativeStartMic] open a stream, and has
      * [nativeStopMic] not been called since? Offer the in-stream mute control on THIS rather than
      * on the user's setting: a device that refused every AAudio input rung (or a missing

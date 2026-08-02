@@ -496,6 +496,28 @@ fun StreamScreen(session: ActiveSession, onDisconnect: () -> Unit) {
         var dsUsbReceiver: BroadcastReceiver? = null
         if (ds != null) {
             feedback.sink = ds
+            // Tier-A pad audio: render the host's 0xD1 streams on the pad's own 4-channel USB
+            // audio device. Bound here rather than inside DsCapture because the session handle
+            // lives at this layer; DsCapture decides WHEN (it knows the wire index and the link
+            // lifetime), this decides WHETHER.
+            if (initialSettings.padHaptics || initialSettings.padSpeaker) {
+                ds.padAudio = object : DsCapture.PadAudioHook {
+                    override fun start(pad: Int, fd: Int) {
+                        val ok = NativeBridge.nativeStartPadAudio(
+                            handle,
+                            pad,
+                            fd,
+                            initialSettings.padHaptics,
+                            initialSettings.padSpeaker,
+                        )
+                        Log.i("punktfunk", "pad audio on pad $pad: ${if (ok) "started" else "unavailable"}")
+                    }
+
+                    // Returns only once the render thread is joined — DsCapture calls this before
+                    // closing the connection whose descriptor that thread borrows.
+                    override fun stop(pad: Int) = NativeBridge.nativeStopPadAudio(handle, pad)
+                }
+            }
             val usbManager = context.getSystemService(Context.USB_SERVICE) as UsbManager
             val usbDev = ds.findUsbDevice()
             when {
