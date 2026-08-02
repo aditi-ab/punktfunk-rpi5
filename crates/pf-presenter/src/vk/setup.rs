@@ -731,12 +731,17 @@ pub(super) fn pick_formats(
 }
 
 /// MAILBOX when the surface offers it, FIFO otherwise (`PUNKTFUNK_PRESENT_MODE=
-/// fifo|mailbox|immediate` overrides). Both are tear-free, but an arrival-paced
-/// presenter must not block in FIFO's present queue: when the compositor holds images
-/// for a vblank pass (gamescope's composite path) or arrival cadence drifts against
-/// refresh, `acquire_next_image` stalls most of a refresh — a standing 11-13 ms added
-/// to every frame at 60 Hz. MAILBOX never queues more than the newest frame, so the
+/// fifo|mailbox|immediate|fifo_relaxed` overrides). Both defaults are tear-free, but an
+/// arrival-paced presenter must not block in FIFO's present queue: when the compositor
+/// holds images for a vblank pass (gamescope's composite path) or arrival cadence drifts
+/// against refresh, `acquire_next_image` stalls most of a refresh — a standing 11-13 ms
+/// added to every frame at 60 Hz. MAILBOX never queues more than the newest frame, so the
 /// pipeline stays at decode latency and a late frame is replaced, not waited for.
+///
+/// AMD's Windows driver offers no MAILBOX (NVIDIA does), so those clients land on FIFO —
+/// expected, not a client misconfiguration. FIFO_RELAXED is opt-in only: it tears exactly
+/// when a stream frame misses the vblank it was pacing for, which on a drifting arrival
+/// cadence is often — a trade the user must choose, never a silent fallback.
 fn pick_present_mode(
     surface_i: &ash::khr::surface::Instance,
     pdev: vk::PhysicalDevice,
@@ -748,7 +753,15 @@ fn pick_present_mode(
     let want = match std::env::var("PUNKTFUNK_PRESENT_MODE").ok().as_deref() {
         Some("fifo") => vk::PresentModeKHR::FIFO,
         Some("immediate") => vk::PresentModeKHR::IMMEDIATE,
-        _ => vk::PresentModeKHR::MAILBOX,
+        Some("fifo_relaxed") => vk::PresentModeKHR::FIFO_RELAXED,
+        Some("mailbox") | None => vk::PresentModeKHR::MAILBOX,
+        Some(other) => {
+            tracing::warn!(
+                value = other,
+                "unknown PUNKTFUNK_PRESENT_MODE (expected fifo|mailbox|immediate|fifo_relaxed) — using mailbox"
+            );
+            vk::PresentModeKHR::MAILBOX
+        }
     };
     Ok(if modes.contains(&want) {
         want
