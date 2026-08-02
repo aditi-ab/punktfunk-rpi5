@@ -37,6 +37,8 @@ mod discovery;
 mod feedback;
 #[cfg(target_os = "android")]
 mod mic;
+/// Tier-A DualSense pad audio: the 0xD1 plane rendered on the pad's own USB endpoint.
+mod pad_audio;
 mod session;
 mod stats;
 // Ungated like `discovery`: pure `jni` + `punktfunk_core::wol` (no Android framework), so it links

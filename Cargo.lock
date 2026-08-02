@@ -3347,6 +3347,8 @@ dependencies = [
  "opus",
  "punktfunk-core",
  "tracing",
+ "uac-host",
+ "usbfs-iso",
 ]
 
 [[package]]
@@ -4987,6 +4989,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
 
 [[package]]
+name = "uac-host"
+version = "0.1.0"
+source = "git+https://github.com/unom-io/usbfs-iso?rev=fb01ea69c59e3bf08b3918f53a159287b5187ed2#fb01ea69c59e3bf08b3918f53a159287b5187ed2"
+dependencies = [
+ "usbfs-iso",
+]
+
+[[package]]
 name = "uds_windows"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5063,6 +5073,14 @@ dependencies = [
  "idna",
  "percent-encoding",
  "serde",
+]
+
+[[package]]
+name = "usbfs-iso"
+version = "0.1.0"
+source = "git+https://github.com/unom-io/usbfs-iso?rev=fb01ea69c59e3bf08b3918f53a159287b5187ed2#fb01ea69c59e3bf08b3918f53a159287b5187ed2"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

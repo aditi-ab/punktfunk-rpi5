@@ -64,6 +64,14 @@ libc = "0.2"
 # host + Linux client use. audiopus_sys vendors libopus (pure C) and builds it static via cmake —
 # the cargo-ndk build sets LIBOPUS_STATIC=1/LIBOPUS_NO_PKG=1 so it links the bundled lib, not the host's.
 opus = "0.3"
+# Tier-A pad audio (WP9). Android's audio framework denylists the DualSense's output by VID/PID,
+# so the pad's isochronous endpoint is driven directly on the fd `UsbDeviceConnection` hands over.
+# Our own crates, developed openly because the hole they fill — isochronous USB in Rust — is an
+# ecosystem-wide one: https://github.com/unom-io/usbfs-iso
+# Pinned by revision rather than floating: this is a transport under a real-time deadline and it
+# should move when we choose to. Becomes a plain version dependency once the crates are published.
+uac-host = { git = "https://github.com/unom-io/usbfs-iso", rev = "fb01ea69c59e3bf08b3918f53a159287b5187ed2" }
+usbfs-iso = { git = "https://github.com/unom-io/usbfs-iso", rev = "fb01ea69c59e3bf08b3918f53a159287b5187ed2" }
 
 [lints]
 workspace = true
