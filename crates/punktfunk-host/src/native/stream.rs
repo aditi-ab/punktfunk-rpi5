@@ -1214,6 +1214,9 @@ pub(super) struct SessionContext {
     /// `Reconfigured { accepted: true, mode: <actually live> }` when a rebuild failed (stayed at
     /// the old mode) or the backend honored a different refresh than requested.
     pub(super) reconfig_result_tx: tokio::sync::mpsc::UnboundedSender<Reconfigured>,
+    /// Host-initiated bitrate re-target → control task → the client's `BitrateChanged`. Fired
+    /// by [`adopt_built_bitrate`] when a rebuild lands on a rate the client wasn't told about.
+    pub(super) retarget_tx: tokio::sync::mpsc::UnboundedSender<u32>,
     /// Adaptive-FEC target the control task updates from the client's loss reports.
     pub(super) fec_target: Arc<AtomicU8>,
     /// The QUIC control connection (carries host→client 0xCE source-HDR metadata mid-stream).
@@ -1397,6 +1400,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
         probe_rx,
         probe_result_tx,
         reconfig_result_tx,
+        retarget_tx,
         fec_target,
         conn,
         timing_conn,
@@ -1597,7 +1601,12 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
     ) = pipe;
     // The encoder may have opened at a re-resolved rate (a mirrored head delivering a size this
     // session never negotiated). Adopt it before anything downstream reads `bitrate_kbps`.
-    adopt_built_bitrate(&mut bitrate_kbps, built_bitrate, &live_bitrate);
+    adopt_built_bitrate(
+        &mut bitrate_kbps,
+        built_bitrate,
+        &live_bitrate,
+        &retarget_tx,
+    );
 
     // Capture is live — launch the requested title so it renders onto the streamed output and
     // grabs focus. Windows spawns the library id into the interactive user session; Linux spawns
@@ -2037,7 +2046,12 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                         // The new compositor may deliver a different size than the old one did (a
                         // Game→Desktop switch onto a mirrored 4K panel is exactly that), so adopt
                         // the rate the rebuilt encoder actually opened at.
-                        adopt_built_bitrate(&mut bitrate_kbps, new_bitrate, &live_bitrate);
+                        adopt_built_bitrate(
+                            &mut bitrate_kbps,
+                            new_bitrate,
+                            &live_bitrate,
+                            &retarget_tx,
+                        );
                         vd = new_vd;
                         compositor = sw.compositor;
                         next = std::time::Instant::now();
@@ -2177,7 +2191,12 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                     }
                 };
             if rebuilt {
-                adopt_built_bitrate(&mut bitrate_kbps, built_bitrate, &live_bitrate);
+                adopt_built_bitrate(
+                    &mut bitrate_kbps,
+                    built_bitrate,
+                    &live_bitrate,
+                    &retarget_tx,
+                );
                 cur_mode = new_mode;
                 next = std::time::Instant::now();
                 // H2/H3: the backend may have honored a different mode than requested — KWin caps
@@ -2306,6 +2325,11 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                 );
                 if applied_kbps < new_kbps {
                     encoder_ceiling_kbps.store(applied_kbps, Ordering::Relaxed);
+                    // The control task already acked the client with its own resolve, which was
+                    // higher than what the encoder took. Correct it, or the controller climbs
+                    // from a rate the encoder never ran at until its NEXT request happens to be
+                    // pre-clamped by the ceiling we just stored.
+                    let _ = retarget_tx.send(applied_kbps);
                 }
                 if applied_kbps < bitrate_kbps {
                     // Down-step: the behind-cadence backlog was scored against the old,
@@ -2356,6 +2380,9 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                         enc = new_enc;
                         if applied_kbps < new_kbps {
                             encoder_ceiling_kbps.store(applied_kbps, Ordering::Relaxed);
+                            // As in the in-place arm: the ack the client already has promises
+                            // more than the fresh encoder accepted — correct it.
+                            let _ = retarget_tx.send(applied_kbps);
                         }
                         bitrate_kbps = applied_kbps;
                         live_bitrate.store(applied_kbps, Ordering::Relaxed);
@@ -2797,7 +2824,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                 // A capture-loss rebuild can land on a different source than it lost (this loop
                 // re-detects the session every cycle, precisely so it can follow a switch), so the
                 // delivered size — and with it an Automatic rate — may have changed under us.
-                adopt_built_bitrate(&mut bitrate_kbps, new_bitrate, &live_bitrate);
+                adopt_built_bitrate(&mut bitrate_kbps, new_bitrate, &live_bitrate, &retarget_tx);
                 enc.request_keyframe(); // belt-and-suspenders; a fresh encoder opens on an IDR anyway
                 last_forced_idr = Some(std::time::Instant::now()); // anchor the IDR cooldown from the rebuild
                 next = std::time::Instant::now();
@@ -3397,11 +3424,22 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                 };
                 let escalated = cur_depth > 1 || pipelined_active || deescalating;
                 // Export "encode can't hold cadence" for the control task's climb refusal.
-                // An escalated session stays flagged even with the bucket drained: its climb
-                // headroom is spent, and letting climbs resume would saw against the
+                // An escalated session is held to a stricter standard — ANY net behind-frame
+                // keeps it flagged, where an unescalated one is given the full bucket — because
+                // its climb headroom really is partly spent and a climb would saw against the
                 // escalation and starve the de-escalation clean run below.
+                //
+                // But being escalated cannot flag it BY ITSELF, which is what this used to do.
+                // The client can't tell a transient refusal from an encoder's real ceiling: two
+                // identical short acks latch a cap, so a session that escalated once — the
+                // bucket needs ~20 net misses, which a startup hitch supplies while the ABR is
+                // still in slow start at the 20 Mbps default — got pinned there, and stayed
+                // pinned long after the escalation had bought back the headroom it was for.
+                // Escalating exists precisely so cadence CAN be held; once it is (bucket
+                // drained, every frame on time), refusing climbs is refusing the thing that
+                // worked.
                 cadence_degraded.store(
-                    escalated || behind_score >= DEPTH_DEGRADE,
+                    encode_behind_cadence(escalated, behind_score, DEPTH_DEGRADE),
                     Ordering::Relaxed,
                 );
                 if deescalating {
@@ -4068,13 +4106,42 @@ impl PaceBudget {
     }
 }
 
+/// Does the encoder currently fail to hold the frame cadence? Exported to the control task, which
+/// refuses bitrate CLIMBS while it is true (descents always pass — they are the cure).
+///
+/// `escalated` = the session has already spent an adaptive-depth / pipelined-retrieve step to buy
+/// headroom; `behind_score` is the leaky bucket of frames whose work overran the cadence deadline.
+/// An escalated session is judged strictly — ANY net behind-frame keeps it flagged — but being
+/// escalated does not flag it on its own. That distinction is the whole point: the client cannot
+/// tell a transient refusal from an encoder's hard ceiling (two identical short acks latch a cap),
+/// so "escalated ⇒ degraded, permanently" pinned Automatic sessions at whatever rate they happened
+/// to hold when a startup hitch escalated them — routinely the 20 Mbps default, while slow start
+/// had barely begun. Escalation exists so cadence CAN be held; once it is, refusing climbs refuses
+/// the thing that worked.
+fn encode_behind_cadence(escalated: bool, behind_score: u32, degrade_at: u32) -> bool {
+    behind_score >= degrade_at || (escalated && behind_score > 0)
+}
+
 /// Adopt the rate a freshly built pipeline's encoder was actually opened at.
 ///
 /// The session's own `bitrate_kbps` is the number every later decision reads — the ABR controller's
 /// climb base, the console's sample, what a `SetBitrate` ack is measured against — so letting it
 /// disagree with the live encoder means each of those reasons about a stream that doesn't exist.
 /// Silent when nothing changed, which is the overwhelmingly common case.
-fn adopt_built_bitrate(current: &mut u32, built: u32, live: &Arc<AtomicU32>) {
+///
+/// The client keeps its OWN copy of that number, and it used to move only on an ack — so a
+/// rebuild that re-resolved an Automatic rate (`build_pipeline` does, whenever the source
+/// delivers a size the session did not negotiate) left the two disagreeing for the rest of the
+/// session. The ABR's next climb then computed from the stale base and asked for a rate BELOW
+/// what the host was already sending: a re-target downward, paying an encoder rebuild to get
+/// there. So tell the client too — `BitrateChanged` is the same message the `SetBitrate` path
+/// answers with, and means the same thing arriving unprompted.
+fn adopt_built_bitrate(
+    current: &mut u32,
+    built: u32,
+    live: &Arc<AtomicU32>,
+    retarget: &tokio::sync::mpsc::UnboundedSender<u32>,
+) {
     if built == *current {
         return;
     }
@@ -4085,6 +4152,7 @@ fn adopt_built_bitrate(current: &mut u32, built: u32, live: &Arc<AtomicU32>) {
     );
     *current = built;
     live.store(built, Ordering::Relaxed);
+    let _ = retarget.send(built); // control task gone ⇒ the session is ending anyway
 }
 
 /// Encode-stall recovery: rebuild the encoder in place (keeping capture + the session up) and
@@ -4328,6 +4396,38 @@ fn build_pipeline(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_escalated_but_caught_up_encoder_stops_refusing_climbs() {
+        const DEGRADE: u32 = 10;
+        // Not escalated: the full bucket is allowed before climbs are refused.
+        assert!(!encode_behind_cadence(false, 0, DEGRADE));
+        assert!(!encode_behind_cadence(false, 9, DEGRADE));
+        assert!(encode_behind_cadence(false, 10, DEGRADE));
+        // Escalated and still missing deadlines: strict — one net behind-frame is enough.
+        assert!(encode_behind_cadence(true, 1, DEGRADE));
+        // Escalated, bucket fully drained: cadence is being HELD, which is what escalating was
+        // for. This is the case that used to stay latched for the rest of the session and pin an
+        // Automatic client at its slow-start rate.
+        assert!(!encode_behind_cadence(true, 0, DEGRADE));
+    }
+
+    #[test]
+    fn adopting_a_rebuilt_rate_tells_the_client() {
+        let live = Arc::new(AtomicU32::new(20_000));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<u32>();
+        let mut current = 20_000;
+        // The overwhelmingly common case: the rebuild landed on the same rate — silent.
+        adopt_built_bitrate(&mut current, 20_000, &live, &tx);
+        assert_eq!(rx.try_recv().ok(), None);
+        // A re-resolve (the client asked 1080p, the source delivers a mirrored 4K panel): the
+        // host's rate moves, so the client has to hear about it — its controller's climb base is
+        // its own copy of this number, and a stale one makes the next "climb" a cut.
+        adopt_built_bitrate(&mut current, 60_000, &live, &tx);
+        assert_eq!(current, 60_000);
+        assert_eq!(live.load(Ordering::Relaxed), 60_000);
+        assert_eq!(rx.try_recv().ok(), Some(60_000));
+    }
 
     #[test]
     fn pacing_never_exceeds_the_session_rate_or_the_display() {
