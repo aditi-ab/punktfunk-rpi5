@@ -620,6 +620,23 @@ async fn plugin_token_lane_is_scoped_and_loopback_only() {
         StatusCode::NO_CONTENT
     );
 
+    // Log ingest. This is the ONLY token the scripting runner holds (on Windows its LocalService
+    // principal cannot even read the admin one), so if this lane ever stopped reaching this route
+    // the console's plugin logs would go quiet with nothing else failing — pin it here rather than
+    // rely on `plugin_may_access`'s denylist continuing to not match `/plugins/logs`.
+    let body = serde_json::json!({"entries": [{
+        "ts_ms": 1_700_000_000_000u64,
+        "level": "INFO",
+        "source": "virtualhere",
+        "msg": "hello from the runner",
+    }]});
+    let req = axum::http::Request::post("/api/v1/plugins/logs")
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer plugin-secret")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    assert_eq!(send(&app, req).await.0, StatusCode::NO_CONTENT);
+
     // The carve-outs answer 403 (authenticated but not authorized), not 401.
     for (method, path) in [
         (Method::GET, "/api/v1/hooks"),
@@ -967,6 +984,59 @@ async fn plugin_registry_roundtrip() {
             &format!("/api/v1/plugins/{id}"),
             serde_json::json!({ "title": "x", "ui": { "port": 80, "secret": secret } }),
         ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+/// Runner log ingest: lines reach the same ring `GET /logs` serves, tagged so the console can tell
+/// them from the host's own, and one chatty plugin can't evict the ring in a single request.
+#[tokio::test]
+async fn plugin_log_ingest_lands_in_the_ring() {
+    let app = test_app(test_state(), None);
+    let marker = "vh-ingest-marker-3f9a";
+
+    let (status, _) = send(
+        &app,
+        post_json(
+            "/api/v1/plugins/logs",
+            serde_json::json!({"entries": [
+                {"ts_ms": 1_700_000_000_123u64, "level": "warn", "source": "virtualhere", "msg": marker},
+                // No source: attributed to the runner rather than to nothing.
+                {"ts_ms": 1_700_000_000_124u64, "level": "NOTICE", "source": "", "msg": "orphan"},
+            ]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let (status, body) = send(&app, get_req("/api/v1/logs?limit=1000")).await;
+    assert_eq!(status, StatusCode::OK);
+    let entries = body["entries"].as_array().unwrap();
+
+    let mine = entries
+        .iter()
+        .find(|e| e["msg"] == marker)
+        .expect("ingested line is served by GET /logs");
+    // `plugin:` is what the console's Host/Plugins filter keys on.
+    assert_eq!(mine["target"], "plugin:virtualhere");
+    // Lowercase in, canonical out — the console ranks these five and nothing else.
+    assert_eq!(mine["level"], "WARN");
+    // Stamped when the line happened, not when the batch arrived.
+    assert_eq!(mine["ts_ms"], 1_700_000_000_123u64);
+
+    let orphan = entries.iter().find(|e| e["msg"] == "orphan").unwrap();
+    assert_eq!(orphan["target"], "plugin:runner");
+    // An unranked level would sort as 0 in the console's filter and hide under every setting.
+    assert_eq!(orphan["level"], "INFO");
+
+    // An oversized batch is refused whole rather than half-ingested.
+    let big: Vec<serde_json::Value> = (0..300)
+        .map(|i| serde_json::json!({"ts_ms": 1u64, "level": "INFO", "source": "x", "msg": format!("f{i}")}))
+        .collect();
+    let (status, _) = send(
+        &app,
+        post_json("/api/v1/plugins/logs", serde_json::json!({"entries": big})),
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);

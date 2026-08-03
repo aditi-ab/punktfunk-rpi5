@@ -295,8 +295,23 @@ installer's `PATH` change, or call the exe by full path. On Linux the host packa
 On SteamOS, re-run `scripts/steamdeck/install.sh` (or
 `scripts/steamdeck/update.sh`). On Windows, re-run the installer and keep the scripting component.
 
-**The plugin doesn't show up in the console** — check the runner is actually running with
-`punktfunk-host plugins status`, then look at its log:
+**Where a plugin's log output goes** — the console's **Logs** page, under the **Plugins** filter.
+The runner ships everything your plugins print to the host, so a plugin's own lines sit next to the
+host's, on one timeline, with the same search and download. Each is tagged `plugin:<name>` — the
+plugin's own name for lines it logged itself, `plugin:runner` for the supervisor's (starting a
+plugin, restarting a crashed one, refusing an unsafe file).
+
+An empty Plugins view almost always means the runner isn't running — it is a separate service, and
+opt-in on Linux. Check with `punktfunk-host plugins status`.
+
+<Callout>
+Nothing is lost if the host is down: the runner keeps buffering and sends the backlog when the host
+comes back. It says so in the log if the buffer overflowed, rather than presenting a gap as
+continuity.
+</Callout>
+
+**Reading the runner's log directly** — rarely needed now, but it is the ground truth if the runner
+can't reach the host at all:
 
 <Tabs items={['Linux', 'Windows']}>
 <Tab value="Linux">
@@ -317,6 +332,22 @@ plugins (stop it with <kbd>Ctrl</kbd>+<kbd>C</kbd>):
 
 </Tab>
 </Tabs>
+
+**A plugin can't reach a service running on the same box (Linux)** — plugins that drive a local
+daemon usually talk to it over a socket or FIFO in `/tmp`. The runner's unit shipped with
+`PrivateTmp=yes` in earlier releases, which gave it a private `/tmp` and hid all of it: the plugin would
+launch the vendor's binary happily and then time out reaching the daemon behind it, while the same
+command worked perfectly in your own shell. If you are on an older host, or you have a drop-in that
+reinstates it, put the real `/tmp` back:
+
+```sh
+systemctl --user edit punktfunk-scripting
+```
+```ini
+[Service]
+PrivateTmp=no
+ReadWritePaths=/tmp
+```
 
 ## Writing your own
 

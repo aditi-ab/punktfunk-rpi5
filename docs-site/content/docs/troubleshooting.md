@@ -360,7 +360,10 @@ Read the host's log around the failed connect or capture.
 
 1. Open the web console's **Logs** page. It always holds the host's recent output at *debug* detail,
    whatever the log level is set to — there's nothing to switch on and no restart needed.
-2. Filter it down to the level or the text you're after.
+2. Filter it down to the level or the text you're after. The **Host / Plugins** switch beside the
+   level buttons picks the producer: your [plugins](/docs/plugins) log to the same page, tagged
+   `plugin:<name>`, so a misbehaving plugin is one click away rather than a separate hunt through
+   the journal.
 3. Use **Download logs** to save exactly what you're filtering on as a timestamped `.log` file you
    can attach to a bug report. The button beside it hands the same text to your phone or tablet's
    share sheet, or copies it to the clipboard on a desktop.
