@@ -560,11 +560,18 @@ pub fn pad_endpoint(args: &[String]) -> Result<()> {
                     ep.endpoint_id
                 }
             };
+            // `--pair front` drives the pad's SPEAKER instead of the voice coils — the only way to
+            // exercise the speaker kind without a game that renders one.
+            let pair = args
+                .iter()
+                .skip_while(|a| *a != "--pair")
+                .nth(1)
+                .map_or(pe::TonePair::Back, |s| pe::TonePair::parse(s));
             println!(
-                "pad-endpoint tone: {hz} Hz into the BACK pair (haptics) of {endpoint_id} for \
-                 {secs}s"
+                "pad-endpoint tone: {hz} Hz into the {} of {endpoint_id} for {secs}s",
+                pair.label()
             );
-            pe::render_test_tone(&endpoint_id, secs, hz)?;
+            pe::render_test_tone(&endpoint_id, secs, hz, pair)?;
             println!(
                 "pad-endpoint tone: done. A connected client with pad audio enabled should have \
                  buzzed; the host log shows whether the gate opened."

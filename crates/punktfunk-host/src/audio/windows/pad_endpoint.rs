@@ -1586,10 +1586,55 @@ impl PadLoopbackCapturer {
 /// directly, so the rest of the chain (loopback capture → gate → Opus → 0xD1 → client → the pad's
 /// actuators) can be tested in seconds and in isolation from whether any game cooperates.
 ///
-/// The tone goes into the BACK channel pair, because that is the pair the framer routes to the
-/// haptics kind — the voice coils. The front pair stays silent, so a pass is felt in the grips and
-/// cannot be confused with the pad's speaker.
-pub(crate) fn render_test_tone(endpoint_id: &str, seconds: u32, hz: f32) -> Result<()> {
+/// Which channel pair carries the tone. The pad's 4 channels split FL|FR|BL|BR: the FRONT pair is
+/// the pad's built-in speaker, the BACK pair the voice coils. Driving one and leaving the other
+/// silent is what makes a result attributable — the capture (and the client) can then say which
+/// kind the framer actually routed, instead of "some audio arrived".
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum TonePair {
+    /// The pad's built-in speaker.
+    Front,
+    /// The voice coils.
+    Back,
+    Both,
+}
+
+impl TonePair {
+    /// Parse the `--pair` devtest argument; anything unrecognised keeps the haptics default.
+    pub(crate) fn parse(s: &str) -> TonePair {
+        match s {
+            "front" | "speaker" => TonePair::Front,
+            "both" => TonePair::Both,
+            _ => TonePair::Back,
+        }
+    }
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            TonePair::Front => "FRONT pair (the pad's speaker)",
+            TonePair::Back => "BACK pair (the voice coils)",
+            TonePair::Both => "BOTH pairs (speaker + voice coils)",
+        }
+    }
+    /// Does channel `c` (0..4, FL|FR|BL|BR) carry the tone?
+    fn carries(self, c: usize) -> bool {
+        match self {
+            TonePair::Front => c < 2,
+            TonePair::Back => c >= 2,
+            TonePair::Both => true,
+        }
+    }
+}
+
+/// The tone defaults to the BACK channel pair, because that is the pair the framer routes to the
+/// haptics kind — the voice coils. The front pair then stays silent, so a pass is felt in the grips
+/// and cannot be confused with the pad's speaker. `--pair front` drives the speaker instead, which
+/// is the only way to exercise the speaker kind without a game that renders one.
+pub(crate) fn render_test_tone(
+    endpoint_id: &str,
+    seconds: u32,
+    hz: f32,
+    pair: TonePair,
+) -> Result<()> {
     wasapi::initialize_mta()
         .ok()
         .context("initialize COM (MTA) for the tone render")?;
@@ -1653,8 +1698,7 @@ pub(crate) fn render_test_tone(endpoint_id: &str, seconds: u32, hz: f32) -> Resu
                 phase -= std::f32::consts::TAU;
             }
             for c in 0..PAD_CHANNELS as usize {
-                // Back pair only — the haptics kind.
-                let v: f32 = if c >= 2 { s } else { 0.0 };
+                let v: f32 = if pair.carries(c) { s } else { 0.0 };
                 let at = (f * PAD_CHANNELS as usize + c) * 4;
                 bytes[at..at + 4].copy_from_slice(&v.to_le_bytes());
             }
@@ -1700,20 +1744,28 @@ pub(crate) fn capture_probe(endpoint_id: &str, seconds: u32) -> Result<()> {
         "pad-endpoint capture: {frames} frames over {seconds}s, peak_front={peak_front:.4} \
          peak_back={peak_back:.4}"
     );
-    if frames == 0 {
-        println!("  VERDICT: FAIL — the capture opened but delivered nothing.");
-    } else if peak_back <= 0.0001 {
-        println!(
-            "  VERDICT: silent — capture works, but nothing was rendered into the back pair. \
-             Run `pad-endpoint tone` against this endpoint at the same time."
-        );
-    } else if peak_front > 0.0001 {
-        println!(
-            "  VERDICT: FAIL — front pair carries {peak_front:.4}; the haptics pair is leaking \
-             into the pad's speaker."
-        );
-    } else {
-        println!("  VERDICT: PASS — back pair only, front pair silent (channel-exact).");
+    // The capture cannot know which pair the tone was aimed at, so it reports what it SAW rather
+    // than judging against an assumed one — an earlier haptics-shaped verdict called a perfectly
+    // good `--pair front` run "silent".
+    const FLOOR: f32 = 0.0001;
+    match (frames, peak_front > FLOOR, peak_back > FLOOR) {
+        (0, _, _) => println!("  VERDICT: FAIL — the capture opened but delivered nothing."),
+        (_, false, false) => println!(
+            "  VERDICT: silent — capture works, but nothing was rendered. Run `pad-endpoint \
+             tone` against this endpoint at the same time."
+        ),
+        (_, false, true) => println!(
+            "  VERDICT: BACK pair only (the voice coils), front silent — channel-exact for \
+             haptics."
+        ),
+        (_, true, false) => println!(
+            "  VERDICT: FRONT pair only (the pad's speaker), back silent — channel-exact for \
+             the speaker."
+        ),
+        (_, true, true) => println!(
+            "  VERDICT: BOTH pairs carry signal — correct for `--pair both`, otherwise the pairs \
+             are leaking into each other."
+        ),
     }
     Ok(())
 }
