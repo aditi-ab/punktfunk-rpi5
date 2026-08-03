@@ -533,9 +533,11 @@ pub fn pad_endpoint(args: &[String]) -> Result<()> {
         Some("tone") => {
             let secs: u32 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(5);
             let hz: f32 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(60.0);
-            let Some(ep) = pe::endpoint_for(idx) else {
+            // `find` (a system lookup), NOT `endpoint_for` (the service's in-process cache):
+            // this runs as a separate CLI process and has no cache of its own.
+            let Some(ep) = pe::find(idx)? else {
                 println!(
-                    "pad-endpoint tone: no provisioned endpoint for pad {idx} — run `ensure` first"
+                    "pad-endpoint tone: no pad-audio devnode for pad {idx} — run `ensure` first"
                 );
                 return Ok(());
             };
