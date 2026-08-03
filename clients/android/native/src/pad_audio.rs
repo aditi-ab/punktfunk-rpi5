@@ -537,10 +537,34 @@ fn pump(
 ) {
     let mut mixer = QuadMixer::new();
     let mut streams: [Option<KindStream>; 2] = [None, None];
+    // Periodic accounting. Without it the only way to tell "the host is sending nothing" from
+    // "frames arrive but render silently" is to guess, and those two have completely different
+    // causes — one is host-side routing, the other is here.
+    let mut frames_in = 0u64;
+    let mut samples_in = 0u64;
+    let mut peak = 0i32;
+    let mut last_report = std::time::Instant::now();
     let mut pcm: Vec<i16> = Vec::with_capacity(MAX_FRAME_SAMPLES * 2);
     let mut out: Vec<i16> = Vec::with_capacity(MAX_BUFFER_FRAMES * PAD_CHANNELS);
 
     while !stop.load(Ordering::Relaxed) {
+        // Report BEFORE the frame gate. Silence on the plane is a legitimate — and highly
+        // diagnostic — state: it means the host's capture hears nothing, which is a routing
+        // problem upstream rather than anything here. Reporting only when a frame arrives makes
+        // that state indistinguishable from the renderer being dead.
+        if last_report.elapsed() >= Duration::from_secs(1) {
+            let st = playback.stats();
+            log::info!(
+                "pad audio: {frames_in} frames in, {samples_in} samples, peak={peak}, \
+                 {} written, {} underruns, {} short",
+                playback.frames_written(),
+                st.underruns,
+                st.short_bytes
+            );
+            last_report = std::time::Instant::now();
+            peak = 0;
+        }
+
         let Some(frame) = client.next_pad_audio(Duration::from_millis(10)) else {
             continue;
         };
@@ -556,6 +580,7 @@ fn pump(
             continue;
         }
 
+        frames_in += 1;
         let k = usize::from(frame.kind).min(1);
         let st = match &mut streams[k] {
             Some(s) => s,
@@ -589,6 +614,17 @@ fn pump(
             match st.dec.decode(&frame.opus, &mut pcm, false) {
                 Ok(n) => {
                     st.frame_samples = n;
+                    samples_in += n as u64;
+                    // Peak of what actually decoded: distinguishes "frames arriving but silent"
+                    // (a host-side routing problem) from "frames arriving with signal that is not
+                    // reaching the actuators" (a problem here).
+                    peak = peak.max(
+                        pcm[..n * 2]
+                            .iter()
+                            .map(|s| i32::from(s.abs()))
+                            .max()
+                            .unwrap_or(0),
+                    );
                     mixer.push(frame.kind, &pcm[..n * 2]);
                 }
                 Err(e) => log::debug!("pad audio: opus decode failed: {e}"),
