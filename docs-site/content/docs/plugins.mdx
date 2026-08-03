@@ -335,7 +335,7 @@ plugins (stop it with <kbd>Ctrl</kbd>+<kbd>C</kbd>):
 
 **A plugin can't reach a service running on the same box (Linux)** — plugins that drive a local
 daemon usually talk to it over a socket or FIFO in `/tmp`. The runner's unit shipped with
-`PrivateTmp=yes` until 0.23.1, which gave it a private `/tmp` and hid all of it: the plugin would
+`PrivateTmp=yes` in earlier releases, which gave it a private `/tmp` and hid all of it: the plugin would
 launch the vendor's binary happily and then time out reaching the daemon behind it, while the same
 command worked perfectly in your own shell. If you are on an older host, or you have a drop-in that
 reinstates it, put the real `/tmp` back:
