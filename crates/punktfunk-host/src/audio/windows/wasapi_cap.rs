@@ -349,7 +349,7 @@ fn capture_once(
     if assert_plan {
         if let Some(d) = seen_default.as_deref() {
             if d != dev_id {
-                match judge_default(&en, &wiring, d) {
+                match judge_default(&wiring, d) {
                     DefaultKind::Capturable(name) => {
                         tracing::info!(default = %name, planned = %dev_name,
                             "could not park the default playback on the planned endpoint — \
@@ -428,7 +428,7 @@ fn capture_once(
                             );
                             return Ok(Next::Reopen(TargetMode::Follow));
                         }
-                        return Ok(match judge_default(&en, &wiring, &nid) {
+                        return Ok(match judge_default(&wiring, &nid) {
                             DefaultKind::Capturable(name) => {
                                 tracing::info!(device = %name,
                                     "operator changed the output device mid-stream — following \
@@ -461,8 +461,11 @@ enum DefaultKind {
     Unknown,
 }
 
-fn judge_default(en: &DeviceEnumerator, wiring: &wiring_plan::Wiring, id: &str) -> DefaultKind {
-    let Ok(dev) = en.get_device(id) else {
+/// Resolves through [`super::pad_endpoint::open_wasapi_device`], NOT the `wasapi` crate's
+/// `DeviceEnumerator::get_device` — that one hands `GetDevice` a freed string (see the helper's
+/// docs), and a spurious miss here silently downgrades a capturable default to `Unknown`.
+fn judge_default(wiring: &wiring_plan::Wiring, id: &str) -> DefaultKind {
+    let Ok(dev) = super::pad_endpoint::open_wasapi_device(id) else {
         return DefaultKind::Unknown;
     };
     let name = dev.get_friendlyname().unwrap_or_default();

@@ -304,11 +304,13 @@ pub(crate) fn restore_default_playback() {
 }
 
 /// Open a device by endpoint id, with a name for error context.
+///
+/// Resolves through [`super::pad_endpoint::open_wasapi_device`], NOT the `wasapi` crate's
+/// `DeviceEnumerator::get_device` — that one hands `GetDevice` a freed string (see the helper's
+/// docs), so it fails at random on ids that are perfectly valid.
 pub(crate) fn open_endpoint(ep: &Endpoint) -> Result<wasapi::Device> {
-    wasapi::DeviceEnumerator::new()
-        .map_err(|e| anyhow!("DeviceEnumerator: {e}"))?
-        .get_device(&ep.1)
-        .map_err(|e| anyhow!("open endpoint {:?}: {e}", ep.0))
+    super::pad_endpoint::open_wasapi_device(&ep.1)
+        .map_err(|e| anyhow!("open endpoint {:?}: {e:#}", ep.0))
 }
 
 // --- IPolicyConfig (undocumented): set a default audio endpoint by id, for all three roles. ---

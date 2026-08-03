@@ -95,6 +95,12 @@ const MMDEV_RENDER_PATH: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\MMDe
 const ENDPOINT_ID_PREFIX: &str = "{0.0.0.00000000}.";
 /// How long [`ensure`] waits for the new render endpoint to materialise after driver install.
 const ENDPOINT_WAIT: Duration = Duration::from_secs(10);
+/// How many times [`ensure`] re-stamps before giving up and asking for an AudioEndpointBuilder
+/// kick (AEB reverts the format keys behind a fresh endpoint — see the loop in [`ensure`]).
+const STAMP_ATTEMPTS: usize = 5;
+/// How long to let AudioEndpointBuilder settle after a stamp BEFORE checking whether it held.
+/// Checking immediately always reports success, including on the passes that get reverted.
+const STAMP_SETTLE: Duration = Duration::from_millis(1200);
 
 /// One provisioned pad-audio endpoint. Persistent by design (endpoints survive host restarts);
 /// [`remove`] exists for tests + the `pad-endpoint remove` escape hatch only.
@@ -844,7 +850,7 @@ fn open_mmdevice(endpoint_id: &str) -> Result<IMMDevice> {
 /// leave behind — a heisenbug whose failure mode is `0x80070002` (ERROR_FILE_NOT_FOUND) for an id
 /// that is perfectly valid. [`open_mmdevice`] keeps its wide buffer alive across the call, so
 /// resolve there and only borrow the crate's wrapper around the resulting interface.
-fn open_wasapi_device(endpoint_id: &str) -> Result<wasapi::Device> {
+pub(crate) fn open_wasapi_device(endpoint_id: &str) -> Result<wasapi::Device> {
     let dev = open_mmdevice(endpoint_id)?;
     wasapi::Device::from_immdevice(dev)
         .map_err(|e| anyhow!("wrap IMMDevice {endpoint_id} as a wasapi Device: {e}"))
@@ -1162,8 +1168,35 @@ pub fn ensure(pad_index: u8) -> Result<PadEndpoint> {
             wait_for_endpoint(&device_instance)?
         }
     };
-    stamp_endpoint(&endpoint_id, pad_index)
-        .with_context(|| format!("stamp pad endpoint {endpoint_id}"))?;
+    // Stamp until it STAYS stamped. On a freshly created endpoint the write lands — a check run
+    // straight afterwards reports all seven served — and AudioEndpointBuilder then quietly reverts
+    // the three format keys behind us, leaving 4/7 for good. So the check has to happen after a
+    // settle, not immediately: verifying too early is exactly how this looked like "the stamps
+    // never took" for one debugging session and "the stamps took fine" for the next.
+    //
+    // Converging here matters beyond tidiness: `needs_aeb_kick` is what makes
+    // [`provision_at_startup`] restart AudioEndpointBuilder + Audiosrv, so latching the transient
+    // means bouncing the whole machine's audio stack on EVERY host start, forever, chasing stamps
+    // a re-pass would have landed. Once the endpoint has finished settling a re-stamp sticks
+    // permanently (measured stable over 30 s), and `stamp_endpoint` skips already-served keys, so
+    // the extra passes cost nothing once it has taken.
+    let mut served = false;
+    for attempt in 0..STAMP_ATTEMPTS {
+        stamp_endpoint(&endpoint_id, pad_index)
+            .with_context(|| format!("stamp pad endpoint {endpoint_id}"))?;
+        thread::sleep(STAMP_SETTLE);
+        served = all_served(&endpoint_id, pad_index);
+        if served {
+            if attempt > 0 {
+                tracing::debug!(
+                    pad = pad_index,
+                    attempt = attempt + 1,
+                    "pad endpoint stamps held after a re-pass"
+                );
+            }
+            break;
+        }
+    }
     // Default-device guard: a freshly registered render endpoint can grab the default. A pad
     // "speaker" as default playback would swallow ALL desktop audio — put the previous default
     // back via the IPolicyConfig machinery audio_control already owns.
@@ -1181,7 +1214,6 @@ pub fn ensure(pad_index: u8) -> Result<PadEndpoint> {
                 "default playback moved to the new pad endpoint and no previous default is known"),
         }
     }
-    let served = all_served(&endpoint_id, pad_index);
     Ok(PadEndpoint {
         endpoint_id,
         device_instance,
