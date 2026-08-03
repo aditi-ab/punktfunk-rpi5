@@ -1,0 +1,4 @@
+• Fixes a fault from 0.23.0 that could freeze the picture on a busy connection. Worth updating for this alone.
+• Fixes a refresh-rate mix-up that left the picture juddering for a whole session when a phone refused the rate the app asked for.
+• A decoder hiccup no longer snowballs into a burst of broken frames.
+• New "Forward controllers" switch, for setups where your pad already reaches the PC another way.
