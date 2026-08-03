@@ -40,6 +40,9 @@ pub(super) async fn run(
     probe_tx: std::sync::mpsc::Sender<ProbeRequest>,
     mut probe_result_rx: tokio::sync::mpsc::UnboundedReceiver<ProbeResult>,
     mut reconfig_result_rx: tokio::sync::mpsc::UnboundedReceiver<Reconfigured>,
+    // Host-initiated bitrate re-target (a rebuild re-resolved an Automatic rate): forwarded to
+    // the client as a `BitrateChanged` so its controller's climb base tracks the real encoder.
+    mut retarget_rx: tokio::sync::mpsc::UnboundedReceiver<u32>,
     mut cursor_shape_rx: tokio::sync::mpsc::UnboundedReceiver<punktfunk_core::quic::CursorShape>,
     cursor_client_draws: Arc<AtomicBool>,
     clip_enabled: Arc<AtomicBool>,
@@ -336,6 +339,27 @@ pub(super) async fn run(
                         }
                     }
                     None => clip_offer_closed = true,
+                }
+            }
+            retarget = retarget_rx.recv() => {
+                // A pipeline rebuild re-resolved the Automatic rate (see `retarget_tx`). Same
+                // message the `SetBitrate` path answers with — the client's controller treats
+                // any `BitrateChanged` as authoritative for what the encoder now targets, which
+                // is exactly right here: it IS what the encoder now targets, we just weren't
+                // asked. PyroWave reaches this too, and should: its rate is pinned against
+                // mid-stream RETARGETS, but a mode switch legitimately re-resolves the pin
+                // (~1.6 bpp for the new pixel rate) and the client's live-rate display is
+                // otherwise stuck on the old one. Its controller is off, so nothing acts on it.
+                let Some(kbps) = retarget else { break }; // data plane gone
+                tracing::info!(
+                    kbps,
+                    "encoder re-targeted by a pipeline rebuild — telling the client"
+                );
+                if io::write_msg(&mut ctrl_send, &BitrateChanged { bitrate_kbps: kbps }.encode())
+                    .await
+                    .is_err()
+                {
+                    break;
                 }
             }
             correction = reconfig_result_rx.recv() => {

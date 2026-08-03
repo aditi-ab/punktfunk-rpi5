@@ -1087,6 +1087,17 @@ async fn serve_session(
     // accepted ack as "the active mode is now X" and fixes itself; old clients just log it.
     let (reconfig_result_tx, reconfig_result_rx) =
         tokio::sync::mpsc::unbounded_channel::<Reconfigured>();
+    // Unsolicited bitrate re-target, data plane → control task (the `reconfig_result_tx` pattern
+    // again, for the same reason). A pipeline rebuild can RE-RESOLVE an Automatic rate — most
+    // visibly when the source delivers a different size than the session negotiated, e.g. a
+    // client that asked for 1080p mirroring a 4K panel — and that number is what everything
+    // downstream reasons about: the send pacer, the console, and the base a `SetBitrate` ack is
+    // measured against. The client's copy only ever moved on an ack, so it stayed on the
+    // negotiated rate while the host encoded at another one, and the ABR's first climb computed
+    // from that stale base asked for LESS than the host was already sending — a re-target
+    // downward, with the rebuild it costs. Tell the client instead; `BitrateChanged` already
+    // means exactly this and old clients already handle one arriving unprompted.
+    let (retarget_tx, retarget_rx) = tokio::sync::mpsc::unbounded_channel::<u32>();
     // Cursor-forward bridge (M2): the encode loop diffs each frame's cursor serial and hands
     // changed SHAPES here; the control task (the control stream's sole writer) sends them.
     // Same shape as `probe_result_tx`. Wired even when the channel wasn't negotiated — it
@@ -1147,6 +1158,7 @@ async fn serve_session(
         probe_tx,
         probe_result_rx,
         reconfig_result_rx,
+        retarget_rx,
         cursor_shape_rx,
         cursor_client_draws,
         clip_enabled,
@@ -1598,6 +1610,7 @@ async fn serve_session(
                         probe_rx,
                         probe_result_tx,
                         reconfig_result_tx,
+                        retarget_tx,
                         fec_target: fec_target_dp,
                         phase: phase_ctl,
                         conn: conn_stream,
