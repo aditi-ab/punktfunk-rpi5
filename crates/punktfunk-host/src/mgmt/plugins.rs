@@ -29,6 +29,12 @@ use std::time::{Duration, Instant};
 /// this tolerates two missed ticks before a plugin drops out of the listing.
 const LEASE_TTL: Duration = Duration::from_secs(90);
 
+/// Lines accepted per `POST /plugins/logs`. The runner batches on a short timer, so a batch this
+/// size means a plugin is logging faster than the ring can usefully hold — the shipper drops its
+/// own backlog (and says so in a line of its own) rather than letting one chatty plugin evict the
+/// whole ring in a single request.
+const MAX_LOG_BATCH: usize = 256;
+
 // ---------------------------------------------------------------- wire shapes
 
 /// A plugin's UI surface as it registers it. Carries the secret — this shape is only ever a request
@@ -58,6 +64,26 @@ pub(crate) struct PluginRegistration {
     /// entry only (e.g. a future runner-management listing) and grows no nav entry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ui: Option<PluginUi>,
+}
+
+/// One log line produced by the runner or a plugin inside it (`POST /plugins/logs`).
+#[derive(Deserialize, ToSchema)]
+pub(crate) struct PluginLogLine {
+    /// When the line was produced, unix milliseconds. Kept verbatim — see
+    /// [`crate::log_capture::LogRing::push_remote`].
+    pub ts_ms: u64,
+    /// `ERROR` | `WARN` | `INFO` | `DEBUG` | `TRACE`. Anything else is coerced to `INFO`.
+    pub level: String,
+    /// Which unit emitted it — a plugin's `definePlugin` name, a package name, or `runner`.
+    /// Surfaced in the console's target column as `plugin:<source>`.
+    pub source: String,
+    pub msg: String,
+}
+
+/// A batch of runner log lines.
+#[derive(Deserialize, ToSchema)]
+pub(crate) struct PluginLogBatch {
+    pub entries: Vec<PluginLogLine>,
 }
 
 /// The secret-free view of a plugin's UI surface — what [`list_plugins`] returns to the browser.
@@ -264,6 +290,26 @@ fn sanitize(s: &str) -> String {
         .to_string()
 }
 
+/// The console target for a runner-supplied line: `plugin:<source>`.
+///
+/// The source is NOT a [`valid_plugin_id`] — the runner names a unit by its `definePlugin` name
+/// (`virtualhere`), its package name (`@punktfunk/plugin-virtualhere`), a bare script's file stem,
+/// or `runner` for its own supervision lines, and all four are worth telling apart in the log. So
+/// this sanitizes rather than validates: control characters go (a log target is rendered in a
+/// terminal by `logs download` as readily as in the console), length is capped, and an empty source
+/// becomes `runner` so a line is never attributed to nothing.
+fn log_target(source: &str) -> String {
+    let mut s = sanitize(source);
+    if s.is_empty() {
+        s = "runner".into();
+    }
+    // Cap on CHARS, not bytes — truncating a multi-byte name mid-sequence would panic.
+    if s.chars().count() > 64 {
+        s = s.chars().take(64).collect();
+    }
+    format!("plugin:{s}")
+}
+
 /// Validate a registration body into the internal [`Valid`] form, or a human-readable reason.
 fn validate(reg: PluginRegistration) -> Result<Valid, String> {
     let title = sanitize(&reg.title);
@@ -365,6 +411,63 @@ pub(crate) async fn register_plugin(
         emit(EventKind::PluginsChanged { id });
     }
     StatusCode::NO_CONTENT.into_response()
+}
+
+/// Ingest runner log lines
+///
+/// The plugin/script runner ships its output here so the console's **Logs** page can show it.
+///
+/// Plugins are not host child processes — the runner is a separate `bun` process that `import()`s
+/// each plugin in-process — so nothing a plugin logs passes through the host's own `tracing`, and
+/// before this endpoint the console's log page could not show a single plugin line. On Linux the
+/// fallback was `journalctl --user -u punktfunk-scripting`; on Windows the runner task writes no
+/// log file at all, so a failing plugin was diagnosable only by stopping the scheduled task and
+/// re-running the runner by hand. Both are shell access on the host box, which is exactly what the
+/// console exists to avoid.
+///
+/// Lines land in the same ring as the host's own, sharing one `seq` cursor, targeted
+/// `plugin:<source>` — so `GET /logs` needs no second cursor and the console needs no second poll.
+#[utoipa::path(
+    post,
+    path = "/plugins/logs",
+    tag = "plugins",
+    operation_id = "ingestPluginLogs",
+    request_body = PluginLogBatch,
+    responses(
+        (status = NO_CONTENT, description = "Lines ingested"),
+        (status = BAD_REQUEST, description = "Batch too large", body = ApiError),
+        (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
+    )
+)]
+pub(crate) async fn ingest_plugin_logs(ApiJson(batch): ApiJson<PluginLogBatch>) -> Response {
+    if batch.entries.len() > MAX_LOG_BATCH {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            &format!("at most {MAX_LOG_BATCH} entries per batch"),
+        );
+    }
+    for line in batch.entries {
+        crate::log_capture::ring().push_remote(
+            &line.level,
+            &log_target(&line.source),
+            &sanitize_msg(&line.msg),
+            line.ts_ms,
+        );
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// Strip control characters from an ingested message, keeping tabs.
+///
+/// Same reasoning as [`sanitize`], one exception wider: a plugin's messages routinely carry a
+/// stack trace or a vendor CLI's output, and an embedded newline would let one line forge several
+/// in the downloaded log file. Tabs survive because they are load-bearing in that kind of output.
+fn sanitize_msg(s: &str) -> String {
+    s.chars()
+        .map(|c| if c == '\t' || !c.is_control() { c } else { ' ' })
+        .collect::<String>()
+        .trim_end()
+        .to_string()
 }
 
 /// List registered plugins

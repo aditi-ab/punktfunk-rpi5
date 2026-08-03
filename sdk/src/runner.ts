@@ -41,9 +41,23 @@ export interface RunnerOptions {
 	connect?: ConnectOptions;
 	/** Restart backoff base (test seam). Default 1 s, capped at 60 s, jittered. */
 	restartBase?: Duration.Input;
-	/** Line sink. Default: stamped stdout. */
-	log?: (line: string) => void;
+	/**
+	 * Line sink. Default: stamped stdout, with `warn`/`error` going to the matching console method
+	 * (hence stderr, and hence the right level in the console's log page — see `log-ship.ts`).
+	 *
+	 * `level` is optional so an existing `(line: string) => void` sink stays assignable.
+	 */
+	log?: (line: string, level?: RunnerLogLevel) => void;
 }
+
+/**
+ * Severity of a runner line. Only three, because that is all the runner distinguishes: it is
+ * reporting on units, not producing application logs.
+ */
+export type RunnerLogLevel = "info" | "warn" | "error";
+
+/** The sink shape used internally, with the level always supplied by the caller's default. */
+type LogSink = (line: string, level?: RunnerLogLevel) => void;
 
 export interface Unit {
 	/** Display name: the file stem, or the plugin package name. */
@@ -52,8 +66,12 @@ export interface Unit {
 	file: string;
 }
 
-const defaultLog = (line: string) =>
-	console.log(`${new Date().toISOString()} ${line}`);
+const defaultLog: LogSink = (line, level = "info") => {
+	const stamped = `${new Date().toISOString()} ${line}`;
+	if (level === "error") console.error(stamped);
+	else if (level === "warn") console.warn(stamped);
+	else console.log(stamped);
+};
 
 // ---- unit-file trust (the sshd rule, both halves) ---------------------------------------------
 
@@ -225,7 +243,7 @@ const windowsPowershellEnv = (): Record<string, string | undefined> => {
 };
 
 /** Read a file's SDDL and apply [`windowsSddlUnsafeReason`]. Unreadable ACL ⇒ refuse. */
-const windowsFileIsSafe = (file: string, log: (l: string) => void): boolean => {
+const windowsFileIsSafe = (file: string, log: LogSink): boolean => {
 	const escaped = file.replace(/'/g, "''");
 	const res = spawnSync(
 		windowsPowershell(),
@@ -244,7 +262,7 @@ const windowsFileIsSafe = (file: string, log: (l: string) => void): boolean => {
 	);
 	const sddl = res.status === 0 ? (res.stdout ?? "").trim() : "";
 	if (!sddl) {
-		log(`[runner] REFUSING ${file} — could not read its ACL`);
+		log(`[runner] REFUSING ${file} — could not read its ACL`, "error");
 		return false;
 	}
 	const reason = windowsSddlUnsafeReason(sddl, processSid());
@@ -253,6 +271,7 @@ const windowsFileIsSafe = (file: string, log: (l: string) => void): boolean => {
 			`[runner] REFUSING ${file} — ${reason}. Reinstall the plugin with ` +
 				`\`punktfunk-host plugins add\`, or re-own the file to Administrators and strip ` +
 				`non-admin write ACEs (icacls).`,
+			"error",
 		);
 		return false;
 	}
@@ -264,13 +283,14 @@ const windowsFileIsSafe = (file: string, log: (l: string) => void): boolean => {
  * could have written — group/world-writable mode on Unix; on Windows, an owner outside
  * SYSTEM/Administrators/TrustedInstaller or a write-capable ACE for a non-admin principal.
  */
-const fileIsSafe = (file: string, log: (l: string) => void): boolean => {
+const fileIsSafe = (file: string, log: LogSink): boolean => {
 	if (process.platform === "win32") return windowsFileIsSafe(file, log);
 	try {
 		const mode = fs.statSync(file).mode & 0o022;
 		if (mode !== 0) {
 			log(
 				`[runner] REFUSING ${file} — group/world-writable (chmod go-w it first)`,
+				"error",
 			);
 			return false;
 		}
@@ -285,7 +305,7 @@ const SCRIPT_EXTENSIONS = new Set([".ts", ".js", ".mjs", ".mts", ".cjs"]);
 /** Enumerate the operator's units: loose scripts plus installed plugin packages. */
 export const discoverUnits = (
 	options: RunnerOptions = {},
-	log: (l: string) => void = options.log ?? defaultLog,
+	log: LogSink = options.log ?? defaultLog,
 ): Unit[] => {
 	const units: Unit[] = [];
 	const scriptsDir = options.scriptsDir ?? path.join(configDir(), "scripts");
@@ -332,7 +352,7 @@ export const discoverUnits = (
 			if (!fileIsSafe(file, log)) return;
 			units.push({ name, file });
 		} catch (e) {
-			log(`[runner] skipping ${name}: unreadable package.json (${e})`);
+			log(`[runner] skipping ${name}: unreadable package.json (${e})`, "warn");
 		}
 	};
 	try {
@@ -379,7 +399,7 @@ const attemptUnit = (
 	unit: Unit,
 	attempt: number,
 	options: RunnerOptions,
-	log: (l: string) => void,
+	log: LogSink,
 ): Effect.Effect<"plugin" | "script", unknown> =>
 	Effect.gen(function* () {
 		const mod = (yield* Effect.tryPromise(
@@ -431,7 +451,8 @@ export const superviseUnit = (
 	let attempt = 0;
 	const once = Effect.suspend(() => {
 		attempt += 1;
-		if (attempt > 1) log(`[${unit.name}] restarting (attempt ${attempt})`);
+		if (attempt > 1)
+			log(`[${unit.name}] restarting (attempt ${attempt})`, "warn");
 		return attemptUnit(unit, attempt, options, log);
 	});
 	return once.pipe(
@@ -446,13 +467,18 @@ export const superviseUnit = (
 		),
 		Effect.tapCause((cause) =>
 			Effect.sync(() =>
-				log(`[${unit.name}] failed: ${Cause.pretty(cause).split("\n")[0]}`),
+				log(
+					`[${unit.name}] failed: ${Cause.pretty(cause).split("\n")[0]}`,
+					"error",
+				),
 			),
 		),
 		Effect.retry(restart),
 		Effect.catchCause((cause) =>
 			// A retry schedule that gives up (it doesn't, but stay total) — log and end.
-			Effect.sync(() => log(`[${unit.name}] gave up: ${Cause.pretty(cause)}`)),
+			Effect.sync(() =>
+				log(`[${unit.name}] gave up: ${Cause.pretty(cause)}`, "error"),
+			),
 		),
 		Effect.asVoid,
 	);

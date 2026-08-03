@@ -33,16 +33,24 @@ KillSignal=SIGTERM
 TimeoutStopSec=30
 # Sandbox: free hardening for well-behaved plugins. The filesystem is read-only outside the home
 # directory (ReadWritePaths keeps plugin state, download dirs, and ~/.config/punktfunk writable);
-# /tmp is private; no setuid re-escalation; sockets limited to what automation actually uses
-# (loopback mgmt API, LAN/IPv6 webhooks, unix sockets). A plugin that must write OUTSIDE $HOME
-# (e.g. a library on another mount) gets a drop-in:
+# no setuid re-escalation; sockets limited to what automation actually uses (loopback mgmt API,
+# LAN/IPv6 webhooks, unix sockets). A plugin that must write OUTSIDE $HOME (e.g. a library on
+# another mount) gets a drop-in:
 #   systemctl --user edit punktfunk-scripting   →   [Service]\nReadWritePaths=/mnt/games
-# NOTE: the mount-namespace options (ProtectSystem/PrivateTmp) need unprivileged user namespaces
-# for a *user* unit; on kernels/distros that restrict those, drop them via the same drop-in.
+# NOTE: the mount-namespace options (ProtectSystem) need unprivileged user namespaces for a
+# *user* unit; on kernels/distros that restrict those, drop them via the same drop-in.
+#
+# PrivateTmp is deliberately OFF (field report 2026-08-03, the VirtualHere plugin). A plugin's
+# whole job is integrating with things already running on this box, and on Linux those talk over
+# /tmp: VirtualHere's client IPC is the FIFO pair /tmp/vhclient + /tmp/vhclient_response, and X11
+# is /tmp/.X11-unix. A private /tmp namespace hides all of it — the plugin launches the vendor
+# binary fine and then cannot reach the daemon behind it, which presents as an unexplained error
+# that no amount of config fixes (the operator's own shell works, because that has the real /tmp).
+# ReadWritePaths=/tmp puts the write bit back that ProtectSystem=strict takes away.
 NoNewPrivileges=yes
-PrivateTmp=yes
+PrivateTmp=no
 ProtectSystem=strict
-ReadWritePaths=%h
+ReadWritePaths=%h /tmp
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 
 [Install]

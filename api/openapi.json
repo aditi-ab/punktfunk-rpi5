@@ -10,7 +10,7 @@
       "name": "MIT OR Apache-2.0",
       "identifier": "MIT OR Apache-2.0"
     },
-    "version": "0.22.3"
+    "version": "0.23.0"
   },
   "paths": {
     "/api/v1/clients": {
@@ -2153,6 +2153,51 @@
                   "items": {
                     "$ref": "#/components/schemas/PluginSummary"
                   }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/plugins/logs": {
+      "post": {
+        "tags": [
+          "plugins"
+        ],
+        "summary": "Ingest runner log lines",
+        "description": "The plugin/script runner ships its output here so the console's **Logs** page can show it.\n\nPlugins are not host child processes — the runner is a separate `bun` process that `import()`s\neach plugin in-process — so nothing a plugin logs passes through the host's own `tracing`, and\nbefore this endpoint the console's log page could not show a single plugin line. On Linux the\nfallback was `journalctl --user -u punktfunk-scripting`; on Windows the runner task writes no\nlog file at all, so a failing plugin was diagnosable only by stopping the scheduled task and\nre-running the runner by hand. Both are shell access on the host box, which is exactly what the\nconsole exists to avoid.\n\nLines land in the same ring as the host's own, sharing one `seq` cursor, targeted\n`plugin:<source>` — so `GET /logs` needs no second cursor and the console needs no second poll.",
+        "operationId": "ingestPluginLogs",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PluginLogBatch"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Lines ingested"
+          },
+          "400": {
+            "description": "Batch too large",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
                 }
               }
             }
@@ -6237,6 +6282,50 @@
           "native",
           "gamestream"
         ]
+      },
+      "PluginLogBatch": {
+        "type": "object",
+        "description": "A batch of runner log lines.",
+        "required": [
+          "entries"
+        ],
+        "properties": {
+          "entries": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PluginLogLine"
+            }
+          }
+        }
+      },
+      "PluginLogLine": {
+        "type": "object",
+        "description": "One log line produced by the runner or a plugin inside it (`POST /plugins/logs`).",
+        "required": [
+          "ts_ms",
+          "level",
+          "source",
+          "msg"
+        ],
+        "properties": {
+          "level": {
+            "type": "string",
+            "description": "`ERROR` | `WARN` | `INFO` | `DEBUG` | `TRACE`. Anything else is coerced to `INFO`."
+          },
+          "msg": {
+            "type": "string"
+          },
+          "source": {
+            "type": "string",
+            "description": "Which unit emitted it — a plugin's `definePlugin` name, a package name, or `runner`.\nSurfaced in the console's target column as `plugin:<source>`."
+          },
+          "ts_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "When the line was produced, unix milliseconds. Kept verbatim — see\n[`crate::log_capture::LogRing::push_remote`].",
+            "minimum": 0
+          }
+        }
       },
       "PluginRegistration": {
         "type": "object",
