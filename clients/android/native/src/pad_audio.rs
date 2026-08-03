@@ -20,13 +20,25 @@
 //! underrun-free floor is **4 ms in flight** — including under eight-core load with the SoC in
 //! severe thermal throttling.
 //!
-//! # The firmware exclusivity that shapes everything here
+//! # The exclusivity that shapes everything here, and what is actually known about it
 //!
-//! `valid_flag0` bit 1 (`HAPTICS_SELECT`) *disables* audio haptics and selects classic rumble, and
-//! Linux's `hid-playstation` sets it on every force-feedback update — as does SDL, and as does our
-//! own [`crate::feedback`] path. **Tier A and tier C are mutually exclusive in the pad's firmware**,
-//! so a pad rendering this stream must have its wire rumble suppressed rather than mixed. The
-//! arbitration is a selection, never a blend.
+//! `valid_flag0` bit 1 (`HAPTICS_SELECT`) disables the audio-haptics path, and every rumble write
+//! that exists — `hid-playstation`, SDL, and our own [`crate::feedback`] path via `DsDevice` —
+//! asserts it. So haptics and classic rumble cannot both drive the coils **as coded**, and the
+//! arbitration selects rather than blends.
+//!
+//! What is NOT established is the stronger claim this module used to make: that the coils and the
+//! rumble motors are the same physical actuators, exclusive *in the firmware*. No teardown, vendor
+//! document or measurement supports it here; it traces to one reverse-engineered comment in SDL,
+//! and SDL's own modern path sets `HAPTICS_SELECT` **alone** (amplitude rides `ucEnableBits3`),
+//! which reads more like an independent mute for the audio path than a shared-actuator interlock.
+//! The combination that would settle it — rumble asserted with `HAPTICS_SELECT` CLEARED — is
+//! emitted by no code anywhere, so nothing here writes it either.
+//!
+//! The arbitration is therefore built on **evidence, not prediction**: haptics owns the coils only
+//! while haptics frames are actually arriving (see [`haptics_owns_coils`]). That is correct under
+//! either hypothesis, and it is what keeps a rumble-only title rumbling — it renders no haptics
+//! audio, the host's silence gate emits nothing, and the pad simply keeps its motors.
 
 use std::collections::VecDeque;
 
@@ -92,15 +104,75 @@ pub(crate) fn set_tier_a(pad: u8, on: bool) {
     }
 }
 
-/// Is this pad rendering tier-A audio, and therefore forbidden from receiving wire rumble?
+/// Is this pad's HAPTICS lane armed — i.e. did a renderer open a stream that wants the coils?
 ///
-/// **This is a firmware constraint, not a preference.** `valid_flag0` bit 1 (`HAPTICS_SELECT`)
-/// *disables* audio haptics and selects classic rumble, and `DsDevice` sets it on every rumble
-/// write — as Linux's `hid-playstation` and SDL both do. So a single rumble command reaching a
-/// tier-A pad silently mutes the voice coils this stream drives, for the rest of the session.
-/// Tier A and tier C are mutually exclusive **in the pad**: the arbitration selects, never blends.
-pub(crate) fn is_tier_a(pad: u8) -> bool {
+/// Armed is necessary but NOT sufficient to take the pad off wire rumble; see
+/// [`haptics_owns_coils`]. Speaker-only rendering never arms this: the speaker pair is a
+/// different pair of channels and cannot be disturbed by a rumble write.
+pub(crate) fn haptics_armed(pad: u8) -> bool {
     TIER_A_PADS.load(std::sync::atomic::Ordering::Relaxed) & (1u32 << (pad & 0x0f)) != 0
+}
+
+/// Last instant a real (non-concealed) haptics frame was decoded for each pad, as ms on the
+/// process clock; `0` = never. Written by the render thread, read by the rumble poll thread.
+static HAPTICS_SEEN_MS: [std::sync::atomic::AtomicU64; 16] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 16];
+
+/// Process epoch for [`HAPTICS_SEEN_MS`] — `Instant` is not `const`-constructible.
+fn epoch() -> std::time::Instant {
+    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    *EPOCH.get_or_init(std::time::Instant::now)
+}
+
+/// Milliseconds since [`epoch`], **1-based**. The `+ 1` reserves `0` as an unambiguous "never
+/// stamped" sentinel: without it, a haptics frame arriving in the first millisecond of the process
+/// would stamp `0` and be read as never-arrived, handing the coils to wire rumble mid-effect.
+/// Stamp and comparison share this clock, so the offset cancels and adds no skew.
+fn now_ms() -> u64 {
+    epoch().elapsed().as_millis() as u64 + 1
+}
+
+/// A pad is only silent for haptics once the host has stopped sending for longer than its own
+/// silence gate can explain. The host gates at −60 dBFS with a 250 ms hangover, so a title that
+/// renders no haptics audio emits NOTHING on the 0xD1 plane; doubling the hangover covers wire
+/// jitter and concealment without letting a real gap read as "live".
+const HAPTICS_IDLE_MS: u64 = 500;
+
+/// Stamp a decoded haptics frame. Concealment (PLC) deliberately does not count — filling a gap
+/// is not evidence that the game is still driving the coils.
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+pub(crate) fn note_haptics_frame(pad: u8) {
+    HAPTICS_SEEN_MS[(pad & 0x0f) as usize].store(now_ms(), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Clear a pad's liveness (slot teardown). Wire indices are recycled, so a stale stamp would let
+/// a fresh pad inherit the previous one's ownership.
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+pub(crate) fn clear_haptics_liveness(pad: u8) {
+    HAPTICS_SEEN_MS[(pad & 0x0f) as usize].store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The arbitration, pure and testable: haptics owns the coils only while frames are ACTUALLY
+/// arriving. `seen_ms == 0` (never) is never live.
+pub(crate) fn haptics_owns_at(armed: bool, seen_ms: u64, now: u64) -> bool {
+    armed && seen_ms != 0 && now.saturating_sub(seen_ms) < HAPTICS_IDLE_MS
+}
+
+/// Does this pad's haptics stream currently own the coils, so wire rumble must stand down?
+///
+/// Arbitrating on **evidence** rather than on a prediction about the hardware is deliberate. Every
+/// rumble write this tree emits asserts `valid_flag0` bit 1 (`HAPTICS_SELECT`), which disables the
+/// audio-haptics path, so the two cannot both drive the coils *as coded* — whatever the firmware
+/// would allow. But a title that never renders haptics audio produces no 0xD1 frames at all, and
+/// suppressing its rumble on the assumption that "the stream carries the feedback" silences it
+/// outright. Frame arrival is the signal that tells the two cases apart, and it costs nothing.
+pub(crate) fn haptics_owns_coils(pad: u8) -> bool {
+    let i = (pad & 0x0f) as usize;
+    haptics_owns_at(
+        haptics_armed(pad),
+        HAPTICS_SEEN_MS[i].load(std::sync::atomic::Ordering::Relaxed),
+        now_ms(),
+    )
 }
 
 // ---- the 4-channel mixer ---------------------------------------------------------------------
@@ -404,6 +476,7 @@ impl Drop for PadAudio {
         // Belt and braces: the thread clears these itself on the way out, but if it died in a way
         // that skipped that, leaving the pad off wire rumble would cost the user all feedback.
         set_tier_a(self.pad, false);
+        clear_haptics_liveness(self.pad);
     }
 }
 
@@ -480,6 +553,16 @@ fn render(
     haptics: bool,
     speaker: bool,
 ) {
+    // A host that cannot send 0xD1 will never render anything here, so opening the stream would
+    // claim the interface and (before the arbitration below) take the pad off wire rumble in
+    // exchange for nothing. Against every released host this is the DEFAULT path — `pad_haptics`
+    // is on with no UI to turn it off — so without this gate a wired DualSense simply stops
+    // rumbling. Checked before `sink::open` so the iso interface is never claimed pointlessly.
+    if client.host_caps() & punktfunk_core::quic::HOST_CAP_PAD_AUDIO == 0 {
+        log::warn!("pad audio: host cannot send it (no HOST_CAP_PAD_AUDIO) — pad {pad} stays on wire rumble");
+        drain_until_stop(client, stop);
+        return;
+    }
     match sink::open(dev) {
         Ok(mut playback) => {
             log::info!(
@@ -495,13 +578,17 @@ fn render(
             // kernel that refuses the claim, leave the user with no haptics of any kind.
             let caps = (if haptics { 0x01 } else { 0 }) | (if speaker { 0x02 } else { 0 });
             client.set_pad_audio_caps(pad, caps);
-            set_tier_a(pad, true);
+            // Arm the HAPTICS lane only — a speaker-only setup drives channels 0/1, which no
+            // rumble write can disturb, so taking the motors away would kill rumble with nothing
+            // rendering haptics in exchange.
+            set_tier_a(pad, haptics);
 
-            pump(client, stop, haptics, speaker, &mut playback);
+            pump(client, stop, pad, haptics, speaker, &mut playback);
 
             // Give the pad back to wire rumble before this thread goes away.
             client.set_pad_audio_caps(pad, 0);
             set_tier_a(pad, false);
+            clear_haptics_liveness(pad);
         }
         Err(e) => {
             // A kernel that refuses the claim: some OEM kernels do, and there is no app-side fix.
@@ -531,6 +618,7 @@ fn drain_until_stop(client: &NativeClient, stop: &AtomicBool) {
 fn pump(
     client: &NativeClient,
     stop: &AtomicBool,
+    pad: u8,
     haptics: bool,
     speaker: bool,
     playback: &mut uac_host::Playback<'_>,
@@ -578,6 +666,14 @@ fn pump(
         };
         if !wanted {
             continue;
+        }
+
+        // A real haptics frame is the evidence that the game is driving the coils, and therefore
+        // that wire rumble must stand down for this pad (see `haptics_owns_coils`). Stamped on
+        // arrival rather than after decode so a decoder hiccup cannot hand the coils back
+        // mid-effect; concealment never reaches here, so PLC still does not count.
+        if frame.kind == PAD_AUDIO_KIND_HAPTICS {
+            note_haptics_frame(pad);
         }
 
         frames_in += 1;
@@ -753,15 +849,15 @@ mod tests {
         // A rumble command reaching a tier-A pad mutes its coils for the session, so this gate
         // has to be exact rather than approximately right.
         set_tier_a(3, true);
-        assert!(is_tier_a(3));
-        assert!(!is_tier_a(4));
+        assert!(haptics_armed(3));
+        assert!(!haptics_armed(4));
         set_tier_a(4, true);
-        assert!(is_tier_a(3) && is_tier_a(4));
+        assert!(haptics_armed(3) && haptics_armed(4));
         set_tier_a(3, false);
-        assert!(!is_tier_a(3), "clearing one pad must not clear another");
-        assert!(is_tier_a(4));
+        assert!(!haptics_armed(3), "clearing one pad must not clear another");
+        assert!(haptics_armed(4));
         set_tier_a(4, false);
-        assert!(!is_tier_a(4));
+        assert!(!haptics_armed(4));
     }
 
     #[test]
@@ -769,9 +865,66 @@ mod tests {
         // The wire pad space is 4 bits; an out-of-range index must not shift the mask into
         // undefined territory (a shift >= 32 is a panic in debug and garbage in release).
         set_tier_a(0x1f, true);
-        assert!(is_tier_a(0x0f), "0x1f and 0x0f are the same wire slot");
+        assert!(haptics_armed(0x0f), "0x1f and 0x0f are the same wire slot");
         set_tier_a(0x0f, false);
-        assert!(!is_tier_a(0x1f));
+        assert!(!haptics_armed(0x1f));
+    }
+
+    /// The arbitration that keeps a rumble-only game working. Armed alone is NOT ownership: a
+    /// title that never renders haptics audio produces no frames, so the host's silence gate
+    /// emits nothing on 0xD1 and the pad must keep its motors.
+    #[test]
+    fn haptics_owns_the_coils_only_while_frames_actually_arrive() {
+        // Never seen a frame — armed, but the game is not driving the coils.
+        assert!(
+            !haptics_owns_at(true, 0, 10_000),
+            "an armed pad that has never received a frame must keep its rumble"
+        );
+        // A frame just arrived: haptics owns, rumble stands down.
+        assert!(haptics_owns_at(true, 10_000, 10_000));
+        // Still inside the idle window (the host's own 250 ms hangover, doubled).
+        assert!(haptics_owns_at(true, 10_000, 10_000 + HAPTICS_IDLE_MS - 1));
+        // The stream went quiet: the coils go back to wire rumble.
+        assert!(
+            !haptics_owns_at(true, 10_000, 10_000 + HAPTICS_IDLE_MS),
+            "the coils must return to rumble once haptics stops arriving"
+        );
+        // Not armed (speaker-only, or no renderer): frames or not, rumble always owns.
+        assert!(!haptics_owns_at(false, 10_000, 10_000));
+    }
+
+    /// Clock skew must never strand a pad in the suppressed state.
+    #[test]
+    fn a_stamp_ahead_of_now_does_not_wrap_the_idle_window() {
+        // The clock is monotonic so this should not arise, but an unsigned underflow would wrap
+        // to ~2^64 ms and read as EXPIRED — handing the coils back mid-effect. `saturating_sub`
+        // pins it to 0 (still live), and it self-corrects once the clock catches up.
+        assert!(haptics_owns_at(true, 10_000, 9_000));
+        // The 1-based clock is what makes this distinguishable: a frame stamped in the process's
+        // first millisecond must read as LIVE, not as never-stamped.
+        assert!(
+            haptics_owns_at(true, 1, 1),
+            "a frame stamped at t=0 must not be mistaken for never-stamped"
+        );
+        assert!(
+            !haptics_owns_at(true, 0, 0),
+            "never-seen stays never-seen at t=0"
+        );
+    }
+
+    /// Teardown drops the liveness stamp: wire indices are recycled, and a fresh pad must not
+    /// inherit the previous occupant's ownership of the coils.
+    #[test]
+    fn clearing_liveness_hands_the_coils_back() {
+        set_tier_a(2, true);
+        note_haptics_frame(2);
+        assert!(haptics_owns_coils(2));
+        clear_haptics_liveness(2);
+        assert!(
+            !haptics_owns_coils(2),
+            "a cleared stamp must release the coils"
+        );
+        set_tier_a(2, false);
     }
 
     #[test]

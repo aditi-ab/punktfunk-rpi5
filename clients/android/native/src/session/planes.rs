@@ -559,6 +559,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStopPadAudi
                 // the host stops sending 0xD1 before tier C resumes, so the two never overlap.
                 h.client.set_pad_audio_caps(pad as u8, 0);
                 crate::pad_audio::set_tier_a(pad as u8, false);
+                crate::pad_audio::clear_haptics_liveness(pad as u8);
             }
         }
     })
