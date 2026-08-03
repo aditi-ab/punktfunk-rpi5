@@ -410,17 +410,68 @@ private fun DsRow(usbDev: android.hardware.usb.UsbDevice) {
                         Text("Grant USB access")
                     }
                 }
-                else -> Text(
-                    if (model == DsDevice.Model.DUALSHOCK4) {
-                        "Ready — captured at stream start: rumble, lightbar and gyro are " +
-                            "driven directly."
-                    } else {
-                        "Ready — captured at stream start: rumble, adaptive triggers, lightbar " +
-                            "and gyro are driven directly."
-                    },
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
+                else -> {
+                    Text(
+                        if (model == DsDevice.Model.DUALSHOCK4) {
+                            "Ready — captured at stream start: rumble, lightbar and gyro are " +
+                                "driven directly."
+                        } else {
+                            "Ready — captured at stream start: rumble, adaptive triggers, lightbar " +
+                                "and gyro are driven directly."
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    // Pad-audio self test. Deliberately reachable WITHOUT a stream: it exists to
+                    // answer "can this phone drive this pad's audio endpoint at all", and gating
+                    // that behind a live session would make it depend on the very thing one wants
+                    // to rule out when a session misbehaves. DualSense only — the DS4 has no
+                    // 4-channel haptics device.
+                    if (model != DsDevice.Model.DUALSHOCK4) {
+                        var testing by remember { mutableStateOf(false) }
+                        var result by remember { mutableStateOf<String?>(null) }
+                        result?.let {
+                            Text(
+                                it,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                        OutlinedButton(
+                            enabled = !testing,
+                            onClick = {
+                                testing = true
+                                result = null
+                                Thread({
+                                    // Its OWN connection: the renderer's descriptor must never be
+                                    // shared with another transfer engine, and that applies to
+                                    // this test as much as to the real path.
+                                    val conn = runCatching { usbManager.openDevice(usbDev) }.getOrNull()
+                                    val fd = conn?.fileDescriptor ?: -1
+                                    val r = if (fd >= 0) {
+                                        io.unom.punktfunk.kit.NativeBridge.nativePadAudioSelfTest(fd, 3, 60)
+                                    } else {
+                                        -1
+                                    }
+                                    conn?.close()
+                                    val msg = when {
+                                        r > 0 -> "Haptics test passed — $r frames to the pad."
+                                        r == -1 -> "Could not open the pad's audio interface. " +
+                                            "Some kernels refuse it; the pad still works normally."
+                                        r == -2 -> "The audio stream stopped part-way."
+                                        else -> "The stream opened but no audio reached the pad."
+                                    }
+                                    android.os.Handler(android.os.Looper.getMainLooper()).post {
+                                        result = msg
+                                        testing = false
+                                    }
+                                }, "pf-pad-selftest-ui").start()
+                            },
+                        ) {
+                            Text(if (testing) "Testing…" else "Test haptics")
+                        }
+                    }
+                }
             }
         }
     }
