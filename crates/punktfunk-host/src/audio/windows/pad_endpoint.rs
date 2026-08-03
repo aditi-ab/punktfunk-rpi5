@@ -233,6 +233,25 @@ fn stamps_for(pad_index: u8) -> [Stamp; 7] {
     ]
 }
 
+/// The stamps to actually apply, honouring the `PUNKTFUNK_PAD_AUDIO_STAMPS` bisect hook.
+///
+/// Unset (the shipping path) means all seven. Set to a comma-separated list of labels — e.g.
+/// `desc,name,container` — and only those are written or checked. This exists because a fully
+/// stamped endpoint cannot be opened at all (`IAudioClient::Initialize` → `AUDCLNT_E_UNSUPPORTED
+/// _FORMAT` for EVERY format, including its own mix format) while a bare one opens fine, and the
+/// MMDevices ACL blocks editing the values directly — so the only way to find the poison stamp is
+/// to re-provision with subsets.
+fn active_stamps(pad_index: u8) -> Vec<Stamp> {
+    let all = stamps_for(pad_index);
+    match std::env::var("PUNKTFUNK_PAD_AUDIO_STAMPS") {
+        Err(_) => all.into_iter().collect(),
+        Ok(list) => {
+            let want: HashSet<&str> = list.split(',').map(str::trim).collect();
+            all.into_iter().filter(|s| want.contains(s.label)).collect()
+        }
+    }
+}
+
 // --- small encoding helpers ----------------------------------------------------------------
 
 /// NUL-terminated UTF-16.
@@ -901,7 +920,7 @@ fn set_store_value(store: &IPropertyStore, s: &Stamp) -> Result<()> {
 /// restart), raw registry for whatever it rejects. Idempotent — already-served keys are
 /// skipped entirely.
 fn stamp_endpoint(endpoint_id: &str, pad_index: u8) -> Result<()> {
-    let stamps = stamps_for(pad_index);
+    let stamps = active_stamps(pad_index);
     let dev = open_mmdevice(endpoint_id)?;
     let pending: Vec<&Stamp> = {
         // SAFETY: read-only property store on a COM-initialized thread.
@@ -1114,7 +1133,7 @@ fn all_served(endpoint_id: &str, pad_index: u8) -> bool {
     let Ok(store) = (unsafe { dev.OpenPropertyStore(STGM_READ) }) else {
         return false;
     };
-    stamps_for(pad_index)
+    active_stamps(pad_index)
         .iter()
         .all(|s| stamp_served(&store, s))
 }
@@ -1238,7 +1257,7 @@ pub(crate) fn print_status(pad_index: u8) -> Result<()> {
     // SAFETY: read-only property store on the MTA-initialized current thread.
     let store = unsafe { dev.OpenPropertyStore(STGM_READ) }.context("OpenPropertyStore")?;
     let mut all = true;
-    for s in stamps_for(pad_index) {
+    for s in active_stamps(pad_index) {
         let stored = match &s.value {
             StampValue::Str(v) => props
                 .get_value::<String, _>(reg_value_name(&s.key))
