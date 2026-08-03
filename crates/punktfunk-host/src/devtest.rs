@@ -571,6 +571,24 @@ pub fn pad_endpoint(args: &[String]) -> Result<()> {
             );
             Ok(())
         }
+        // `punktfunk-host pad-endpoint capture [seconds]` — the receiving half of `tone`. Run
+        // both at once to exercise render -> engine -> loopback -> pair routing with no game and
+        // no client attached.
+        Some("capture") => {
+            let secs: u32 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(5);
+            let endpoint_id = match endpoint_override {
+                Some(id) => id,
+                None => match pe::find(idx)? {
+                    Some(ep) if !ep.endpoint_id.is_empty() => ep.endpoint_id,
+                    _ => {
+                        println!("pad-endpoint capture: pad {idx} has no endpoint — run `ensure`");
+                        return Ok(());
+                    }
+                },
+            };
+            println!("pad-endpoint capture: listening on {endpoint_id} for {secs}s");
+            pe::capture_probe(&endpoint_id, secs)
+        }
         Some("status") => pe::print_status(idx),
         _ => anyhow::bail!("usage: punktfunk-host pad-endpoint <ensure|remove|status> [--index N]"),
     }

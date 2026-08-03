@@ -1670,6 +1670,54 @@ pub(crate) fn render_test_tone(endpoint_id: &str, seconds: u32, hz: f32) -> Resu
     Ok(())
 }
 
+/// `pad-endpoint capture` devtest body: open the REAL loopback capture on a pad endpoint and
+/// report what actually arrives, split by channel pair.
+///
+/// The other half of [`render_test_tone`]. Run the two together — tone in one process, this in
+/// another — and the entire host side is exercised with no game and no client: a render client
+/// opens the endpoint, the engine loops it back, and the capture must see the tone in the BACK
+/// pair only. That is the exact signal the `0xD1` framer routes to the voice coils, so a pass here
+/// means everything upstream of the wire is sound.
+///
+/// Reading the result: `peak_back` well above zero with `peak_front` at exactly zero is a pass.
+/// Front energy means the pair routing is wrong. Silence in both means the endpoint provisioned
+/// but carries no audio — which is what a stamped-but-unservable endpoint looked like, and is
+/// precisely the state that used to be invisible until a client sat on an empty plane.
+pub(crate) fn capture_probe(endpoint_id: &str, seconds: u32) -> Result<()> {
+    let mut cap = PadLoopbackCapturer::open(endpoint_id)
+        .with_context(|| format!("open pad loopback on {endpoint_id}"))?;
+    let deadline = Instant::now() + Duration::from_secs(u64::from(seconds.clamp(1, 60)));
+    let (mut frames, mut peak_front, mut peak_back) = (0u64, 0f32, 0f32);
+    while Instant::now() < deadline {
+        let chunk = cap.next_chunk().context("read pad loopback")?;
+        for f in chunk.chunks_exact(PAD_CHANNELS as usize) {
+            frames += 1;
+            peak_front = peak_front.max(f[0].abs()).max(f[1].abs());
+            peak_back = peak_back.max(f[2].abs()).max(f[3].abs());
+        }
+    }
+    println!(
+        "pad-endpoint capture: {frames} frames over {seconds}s, peak_front={peak_front:.4} \
+         peak_back={peak_back:.4}"
+    );
+    if frames == 0 {
+        println!("  VERDICT: FAIL — the capture opened but delivered nothing.");
+    } else if peak_back <= 0.0001 {
+        println!(
+            "  VERDICT: silent — capture works, but nothing was rendered into the back pair. \
+             Run `pad-endpoint tone` against this endpoint at the same time."
+        );
+    } else if peak_front > 0.0001 {
+        println!(
+            "  VERDICT: FAIL — front pair carries {peak_front:.4}; the haptics pair is leaking \
+             into the pad's speaker."
+        );
+    } else {
+        println!("  VERDICT: PASS — back pair only, front pair silent (channel-exact).");
+    }
+    Ok(())
+}
+
 impl Drop for PadLoopbackCapturer {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
