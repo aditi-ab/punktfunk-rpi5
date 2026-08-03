@@ -336,6 +336,7 @@ enum Ctl {
     Detach,
     Pin(Option<String>),
     KindOverride(GamepadPref),
+    Forwarding(bool),
     /// Which pad-audio streams the session's settings want rendered (bit0 = haptics, bit1 =
     /// speaker) — the settings half of the per-pad tier-A capability declared at slot open.
     PadAudioPrefs(u8),
@@ -483,6 +484,26 @@ impl GamepadService {
     /// hot-swap a device that already exists.
     pub fn set_kind_override(&self, pref: GamepadPref) {
         let _ = self.ctl.send(Ctl::KindOverride(pref));
+    }
+
+    /// Forward this device's controllers to the host at all ([`Settings::gamepad_forwarding`],
+    /// default on). Off is for a couch whose pad reaches the host another way — a USB
+    /// passthrough tool like VirtualHere, or a controller plugged into the host itself —
+    /// where forwarding as well would give the host two pads for one pair of hands.
+    ///
+    /// Off holds no slot open, so nothing is sent AND nothing is *grabbed*: no arrival, no
+    /// virtual pad host-side, and the hidraw node stays free for the passthrough tool to
+    /// bind (SDL's HIDAPI drivers take it at open — a held device cannot be bound away).
+    /// It follows that the escape chord, which only listens on forwarded pads, is not
+    /// available while off; the keyboard chord and the client's own UI still end a session.
+    ///
+    /// Menu navigation is untouched: the launcher still opens the active pad to drive its
+    /// UI, and a session — which supersedes menu mode whether it forwards or not — releases
+    /// it again, so the pad is free for the whole time a stream is up.
+    ///
+    /// [`Settings::gamepad_forwarding`]: crate::trust::Settings::gamepad_forwarding
+    pub fn set_forwarding(&self, on: bool) {
+        let _ = self.ctl.send(Ctl::Forwarding(on));
     }
 
     /// Declare which pad-audio streams this session's settings want rendered (`haptics` =
@@ -774,6 +795,10 @@ struct Worker {
     /// connected pads, so it survives restarts and disconnects. A pin forwards ONLY that pad
     /// (an explicit single-player choice); Automatic forwards every real controller.
     pinned: Option<String>,
+    /// Forward controllers to an attached session at all ([`GamepadService::set_forwarding`]).
+    /// Off makes [`Self::forwarded_ids`] empty, so a session opens no slot — the whole point
+    /// being that the hardware stays ungrabbed for a USB passthrough tool.
+    forwarding: bool,
     /// The user's explicit "controller type" setting ([`GamepadService::set_kind_override`]);
     /// `Auto` = per-pad detection. Applied at slot open to the kind DECLARED to the host, never
     /// to [`Slot::pref`] — the local feedback paths must keep reading the physical pad.
@@ -872,6 +897,11 @@ impl Worker {
     /// back to the single most-recent pad when only a Steam-virtual pad is present (the Deck
     /// game-mode case — otherwise its gyro/paddles/input would have nowhere to land).
     fn forwarded_ids(&self) -> Vec<u32> {
+        // Forwarding off: nothing is forwarded, so nothing is opened either — the device stays
+        // free for whatever route the user's controller actually takes to the host.
+        if !self.forwarding {
+            return Vec::new();
+        }
         if let Some(key) = &self.pinned {
             if let Some(id) = self
                 .order
@@ -1362,10 +1392,16 @@ impl Worker {
                 Ok(Ctl::Attach(c)) => {
                     self.attached = Some(c);
                     self.reset_chord(); // every session starts un-latched (Attach doesn't flush)
-                                        // The Valve HIDAPI drivers run only in-session (see set_valve_hidapi);
-                                        // enabling them re-enumerates a Deck's built-in pad with paddles/
-                                        // trackpads/gyro first-class — sync_open opens a slot per forwarded pad.
-                    set_valve_hidapi(true);
+
+                    // The Valve HIDAPI drivers run only in-session (see set_valve_hidapi);
+                    // enabling them re-enumerates a Deck's built-in pad with paddles/
+                    // trackpads/gyro first-class — sync_open opens a slot per forwarded pad.
+                    // Not with forwarding off: this session opens no slot, and the drivers'
+                    // mere enumeration both kills the Deck's trackpad-mouse and is the
+                    // opposite of leaving the hardware alone for a passthrough tool.
+                    if self.forwarding {
+                        set_valve_hidapi(true);
+                    }
                     self.sync_open();
                 }
                 Ok(Ctl::Detach) => {
@@ -1388,6 +1424,31 @@ impl Worker {
                     self.refresh_active();
                 }
                 Ok(Ctl::KindOverride(pref)) => self.kind_override = pref,
+                Ok(Ctl::Forwarding(on)) => {
+                    if self.forwarding == on {
+                        continue;
+                    }
+                    self.forwarding = on;
+                    self.reset_chord(); // no forwarded pad can be mid-chord across the flip
+
+                    // Applied live rather than at attach only, so a mid-session flip (an
+                    // in-stream settings screen) takes effect on the pad in your hands.
+                    //
+                    // The Valve HIDAPI drivers are an in-session-only thing (see
+                    // set_valve_hidapi), and forwarding off is — for their purpose — not in
+                    // session. Order matters and differs by direction: ON must enable them
+                    // BEFORE `sync_open`, or a Deck's built-in pad opens under its old
+                    // identity; OFF must disable them AFTER, so no slot outlives the driver
+                    // that opened it.
+                    let attached = self.attached.is_some();
+                    if on && attached {
+                        set_valve_hidapi(true);
+                    }
+                    self.sync_open();
+                    if !on && attached {
+                        set_valve_hidapi(false);
+                    }
+                }
                 Ok(Ctl::PadAudioPrefs(bits)) => self.pad_audio_prefs = bits & 0x03,
                 Ok(Ctl::MenuMode(on)) => {
                     self.menu_mode = on;
@@ -1755,6 +1816,7 @@ impl Worker {
             menu_open: None,
             order: Vec::new(),
             pinned: None,
+            forwarding: true,
             kind_override: GamepadPref::Auto,
             pad_audio_prefs: 0,
             attached: None,

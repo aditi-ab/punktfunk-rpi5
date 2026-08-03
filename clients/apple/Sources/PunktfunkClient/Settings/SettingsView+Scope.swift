@@ -122,6 +122,10 @@ enum SettingsFields {
         .init(name: "gamepad", key: DefaultsKey.gamepadType,
               overlay: \.gamepadType, effective: \.gamepadType)
     }
+    static var gamepadForwarding: SettingsField<Bool> {
+        .init(name: "gamepad_forwarding", key: DefaultsKey.gamepadForwarding,
+              overlay: \.gamepadForwarding, effective: \.gamepadForwarding)
+    }
     static var statsVerbosity: SettingsField<String> {
         .init(name: "stats_verbosity", key: DefaultsKey.statsVerbosity,
               overlay: \.statsVerbosity, effective: \.statsVerbosity)
@@ -181,6 +185,7 @@ extension SettingsView {
         base.micEnabled = micEnabled
         base.echoCancel = echoCancel
         base.gamepadType = gamepadType
+        base.gamepadForwarding = gamepadForwarding
         base.statsVerbosity = statsVerbosityRaw
         base.fullscreenWhileStreaming = fullscreenWhileStreaming
         base.presentPriority = presentPriority

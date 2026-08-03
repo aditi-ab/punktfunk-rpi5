@@ -39,7 +39,7 @@
 // Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it.
 #![deny(clippy::undocumented_unsafe_blocks)]
 
-use super::wiring_plan::{plan, Endpoint, Wiring};
+use super::wiring_plan::{self, plan, Endpoint, Wiring};
 use anyhow::{anyhow, bail, Result};
 use std::ffi::c_void;
 use std::sync::Mutex;
@@ -75,6 +75,33 @@ pub(crate) fn host_audio_requested() -> bool {
     std::env::var_os("PUNKTFUNK_HOST_AUDIO").is_some()
 }
 
+/// One wiring pass plus the inputs the desktop-audio capture loop's failure handling needs:
+/// the endpoint-set fingerprint ([`wiring_plan::fingerprint`] — the wait key while a plan is
+/// unsatisfiable, snapshotted from the SAME enumeration the plan consumed so a device arriving
+/// mid-pass can't leave the waiter keyed to a set the plan never saw) and the render inventory
+/// (the one-shot "why is there no loopback" diagnosis).
+pub(crate) struct WiredPlan {
+    pub wiring: Wiring,
+    pub fingerprint: u64,
+    pub renders: Vec<Endpoint>,
+}
+
+/// Fingerprint of the CURRENT endpoint set (both directions) WITHOUT a wiring pass: enumeration
+/// and a hash — no plan, no default-device writes, no logs. This is the cheap poll the capture
+/// loop runs while waiting out a failure; the full [`wire_now`] only runs again once this moves.
+/// Must run on a COM-initialized thread, like [`wire_now`].
+pub(crate) fn endpoint_fingerprint() -> u64 {
+    wiring_plan::fingerprint(
+        &list_endpoints(Direction::Render),
+        &list_endpoints(Direction::Capture),
+    )
+}
+
+/// [`wire_now_full`] for callers that only need the assignment (the mic paths).
+pub(crate) fn wire_now(set_playback: bool) -> Wiring {
+    wire_now_full(set_playback).wiring
+}
+
 /// Endpoint ids among `renders` that are the host's own pad-audio endpoints — the exclusion
 /// data [`plan`] runs on. Detection lives in [`super::pad_endpoint`] (stamped PFDS container /
 /// devnode marker, registry-only reads); this is just the per-pass collection.
@@ -94,10 +121,11 @@ fn pad_render_ids(renders: &[Endpoint]) -> Vec<String> {
 /// Must run on a COM-initialized thread (the WASAPI worker threads all `initialize_mta` first).
 /// Logged only when the assignment changes, so per-open recomputation stays quiet in the steady
 /// state.
-pub(crate) fn wire_now(set_playback: bool) -> Wiring {
+pub(crate) fn wire_now_full(set_playback: bool) -> WiredPlan {
     recover_orphaned_default();
     let renders = list_endpoints(Direction::Render);
     let captures = list_endpoints(Direction::Capture);
+    let fingerprint = wiring_plan::fingerprint(&renders, &captures);
     let want = std::env::var("PUNKTFUNK_MIC_DEVICE")
         .ok()
         .map(|s| s.to_lowercase());
@@ -112,6 +140,11 @@ pub(crate) fn wire_now(set_playback: bool) -> Wiring {
         host_audio_requested(),
         &pad_ids,
     );
+    let done = |wiring: Wiring| WiredPlan {
+        wiring,
+        fingerprint,
+        renders: renders.clone(),
+    };
 
     // Log assignment changes exactly once (first plan included).
     static LAST: Mutex<Option<Wiring>> = Mutex::new(None);
@@ -126,14 +159,17 @@ pub(crate) fn wire_now(set_playback: bool) -> Wiring {
             mic_render = wiring.mic_render.as_ref().map(|(n, _)| n.as_str()),
             mic_capture = wiring.mic_capture.as_ref().map(|(n, _)| n.as_str()),
             loopback_render = wiring.loopback_render.as_ref().map(|(n, _)| n.as_str()),
+            loopback_last_resort = wiring.loopback_last_resort,
             renders = ?renders.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
             "audio wiring plan"
         );
-        if wiring.mic_render.is_some() && wiring.loopback_render.is_none() {
+        if wiring.mic_render.is_some() && wiring.loopback_unsatisfiable() {
+            // Inventory + per-endpoint reasons + ONLY the remedies not already taken — the old
+            // static advice here suggested installing the Steam pair to a field box that had it
+            // installed (its Microphone half was exactly what the mic had reserved).
             tracing::warn!(
-                "the virtual mic reserved the only usable render endpoint — desktop audio will be \
-                 unavailable until another output device exists (attach one, or let the host \
-                 install the Steam Streaming pair)"
+                "desktop audio unavailable: {}",
+                wiring_plan::describe_no_loopback(&renders, &wiring)
             );
         }
     }
@@ -144,7 +180,7 @@ pub(crate) fn wire_now(set_playback: bool) -> Wiring {
                 "PUNKTFUNK_KEEP_DEFAULT set — leaving the audio default devices untouched"
             );
         }
-        return wiring;
+        return done(wiring);
     }
     // Default-playback hygiene, on EVERY wire (mic pump at boot included): if the default render
     // endpoint IS the mic target — VB-CABLE installs have been seen grabbing the default — every
@@ -181,18 +217,26 @@ pub(crate) fn wire_now(set_playback: bool) -> Wiring {
         }
     }
     if let Some((name, id)) = &wiring.mic_capture {
-        match set_default_endpoint(id) {
-            Ok(()) => {
-                if changed {
-                    tracing::info!(device = %name,
-                        "audio wiring: default recording = virtual mic (apps record the client's mic)");
+        // `set_default_endpoint` is NOT a no-op on an unchanged default: it unconditionally
+        // fires SetDefaultEndpoint for all three roles (an audio-policy write plus a
+        // device-graph notification, each). Re-asserting on every wiring pass therefore both
+        // churned the policy store AND silently stomped an operator's own recording-device
+        // choice within one reopen cycle — write only when the plan changed or the default
+        // actually drifted off the target.
+        if changed || default_capture_id().as_deref() != Some(id.as_str()) {
+            match set_default_endpoint(id) {
+                Ok(()) => {
+                    if changed {
+                        tracing::info!(device = %name,
+                            "audio wiring: default recording = virtual mic (apps record the client's mic)");
+                    }
                 }
+                Err(e) => tracing::warn!(device = %name, error = %format!("{e:#}"),
+                    "audio wiring: failed to set the default recording device"),
             }
-            Err(e) => tracing::warn!(device = %name, error = %format!("{e:#}"),
-                "audio wiring: failed to set the default recording device"),
         }
     }
-    wiring
+    done(wiring)
 }
 
 /// The operator's default playback endpoint while we have it parked on the loopback sink:
@@ -212,6 +256,18 @@ pub(crate) fn default_render_id() -> Option<String> {
     wasapi::DeviceEnumerator::new()
         .ok()?
         .get_default_device(&Direction::Render)
+        .ok()?
+        .get_id()
+        .ok()
+}
+
+/// The current default CAPTURE endpoint id, if any — the recording-side analogue of
+/// [`default_render_id`], read before asserting the recording default so an already-correct
+/// default costs zero IPolicyConfig writes.
+fn default_capture_id() -> Option<String> {
+    wasapi::DeviceEnumerator::new()
+        .ok()?
+        .get_default_device(&Direction::Capture)
         .ok()?
         .get_id()
         .ok()

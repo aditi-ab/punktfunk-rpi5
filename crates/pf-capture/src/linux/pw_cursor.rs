@@ -39,9 +39,23 @@ pub(super) struct CursorState {
     /// negotiated). Per-stream deliberately — a host serves many sessions per process, and a
     /// process-wide latch made the second session's triage read as "no meta".
     seen_meta: bool,
+    /// This stream's producer rewrites the cursor meta on EVERY buffer, so an `id == 0` meta is
+    /// an authoritative "pointer hidden / off this output" rather than a stale recycled region.
+    /// True for KWin virtual outputs; false for the stale-meta producers (Mutter) — see
+    /// [`note_cursor_id`].
+    id0_hides: bool,
 }
 
 impl CursorState {
+    /// The per-stream state, declaring which `id == 0` contract the producer follows
+    /// ([`Self::id0_hides`]).
+    pub(super) fn new(id0_hides: bool) -> CursorState {
+        CursorState {
+            id0_hides,
+            ..CursorState::default()
+        }
+    }
+
     /// A shareable overlay for the encode/forward paths, or `None` before the first bitmap
     /// arrived. A HIDDEN pointer still yields `Some` (with `visible: false`): the
     /// cursor-forward channel needs "known but hidden" — an app grabbed the pointer, the
@@ -77,6 +91,31 @@ pub(super) fn decode_bitmap_pixel(vfmt: u32, s: &[u8]) -> (u8, u8, u8, u8) {
         x if x == spa::sys::SPA_VIDEO_FORMAT_ABGR => (s[3], s[2], s[1], s[0]),
         _ => (s[0], s[1], s[2], s[3]),
     }
+}
+
+/// Apply one parsed `spa_meta_cursor.id` to the visibility state; returns whether the rest of the
+/// meta region (position, bitmap) is worth parsing.
+///
+/// Two producer contracts meet on `id == 0`. **KWin** rewrites the cursor meta on EVERY enqueued
+/// buffer, and writes id 0 whenever `Cursor::isOnOutput` says the pointer is not in this stream —
+/// which covers a globally hidden cursor AND a client null-cursor surface (empty cursor geometry
+/// intersects nothing). There id 0 is the authoritative hide, and honoring it is what lets a game
+/// or Big Picture hide the pointer mid-stream ([`CursorState::id0_hides`], set for KWin virtual
+/// outputs; without it the composited arrow outlived every hide — the 0.22.0 field report).
+/// **Mutter** only rewrites a buffer's meta region when the cursor changed, so recycled buffers
+/// between damage frames carry a stale id-0 meta — treating that as hidden flickered the cursor
+/// off between hovers (on-glass round 5). There the last-known state holds, and a pointer that
+/// really left/hid simply stops producing updates (the M3 hidden hint has no Mutter signal —
+/// Windows has its own CURSOR_SUPPRESSED source).
+fn note_cursor_id(cursor: &mut CursorState, id: u32) -> bool {
+    if id == 0 {
+        if cursor.id0_hides {
+            cursor.visible = false;
+        }
+        return false;
+    }
+    cursor.visible = true;
+    true
 }
 
 /// Update `cursor` from the newest buffer's `SPA_META_Cursor` (no-op when the buffer carries no
@@ -121,16 +160,9 @@ pub(super) fn update_cursor_meta(cursor: &mut CursorState, spa_buf: *mut spa::sy
             (*cur).bitmap_offset,
         )
     };
-    if id == 0 {
-        // SPA contract: id 0 = "no cursor information", NOT "cursor hidden". Mutter only
-        // REWRITES a buffer's meta region when the cursor changed, so recycled buffers
-        // between damage frames carry a stale id-0 meta — treating that as hidden flickered
-        // the cursor off between hovers (on-glass round 5). Keep the last-known state; a
-        // pointer that really left/hid simply stops producing updates. (The M3 hidden hint
-        // loses its Mutter signal — Windows has its own CURSOR_SUPPRESSED source.)
+    if !note_cursor_id(cursor, id) {
         return;
     }
-    cursor.visible = true;
     cursor.x = pos_x - hot_x;
     cursor.y = pos_y - hot_y;
     cursor.hot_x = hot_x;
@@ -367,7 +399,42 @@ mod tests {
             hot_x: 0,
             hot_y: 0,
             seen_meta: true,
+            id0_hides: false,
         }
+    }
+
+    // ---- note_cursor_id: the two producer id-0 contracts --------------------------------------
+
+    #[test]
+    fn id_zero_hides_only_on_a_rewriting_producer() {
+        // KWin contract (`id0_hides`): id 0 is written fresh on every buffer, so it IS the hide —
+        // a game or Big Picture hiding the pointer must reach the stream.
+        let mut kwin = cursor(10, 10, 8, 8, (255, 255, 255), 255);
+        kwin.id0_hides = true;
+        assert!(!note_cursor_id(&mut kwin, 0), "id 0 parses no further");
+        let o = kwin.overlay().expect("bitmap stays cached across a hide");
+        assert!(!o.visible, "KWin id 0 must hide the overlay");
+        // The pointer coming back re-shows the SAME cached bitmap.
+        assert!(note_cursor_id(&mut kwin, 1));
+        assert!(kwin.overlay().expect("still cached").visible);
+
+        // Mutter contract: recycled buffers carry stale id-0 metas — the last-known state holds
+        // (honoring them flickered the cursor off between hovers, on-glass round 5).
+        let mut mutter = cursor(10, 10, 8, 8, (255, 255, 255), 255);
+        assert!(!note_cursor_id(&mut mutter, 0));
+        assert!(
+            mutter.overlay().expect("cached").visible,
+            "a stale-meta producer's id 0 must NOT hide"
+        );
+    }
+
+    #[test]
+    fn id_zero_before_any_bitmap_yields_no_overlay() {
+        // A KWin stream whose pointer was never on the output: hides arrive before any bitmap —
+        // `overlay()` must stay `None` (nothing to blend), not a phantom empty cursor.
+        let mut c = CursorState::new(true);
+        assert!(!note_cursor_id(&mut c, 0));
+        assert!(c.overlay().is_none());
     }
 
     // ---- bitmap_extent: the guard whose absence SIGSEGVs uncatchably -------------------------

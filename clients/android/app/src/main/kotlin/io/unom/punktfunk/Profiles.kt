@@ -43,6 +43,7 @@ data class SettingsOverlay(
     val mouseMode: MouseMode? = null,
     val invertScroll: Boolean? = null,
     val gamepad: Int? = null,
+    val gamepadForwarding: Boolean? = null,
     val statsVerbosity: StatsVerbosity? = null,
     /**
      * Android-only tier-P addition (design §3): the decode pipeline is a device fact everywhere
@@ -76,6 +77,7 @@ data class SettingsOverlay(
         mouseMode = mouseMode ?: base.mouseMode,
         invertScroll = invertScroll ?: base.invertScroll,
         gamepad = gamepad ?: base.gamepad,
+        gamepadForwarding = gamepadForwarding ?: base.gamepadForwarding,
         statsVerbosity = statsVerbosity ?: base.statsVerbosity,
         lowLatencyMode = lowLatencyMode ?: base.lowLatencyMode,
         presentPriority = presentPriority ?: base.presentPriority,
@@ -110,6 +112,9 @@ data class SettingsOverlay(
         mouseMode = if (after.mouseMode != before.mouseMode) after.mouseMode else mouseMode,
         invertScroll = if (after.invertScroll != before.invertScroll) after.invertScroll else invertScroll,
         gamepad = if (after.gamepad != before.gamepad) after.gamepad else gamepad,
+        gamepadForwarding =
+            if (after.gamepadForwarding != before.gamepadForwarding) after.gamepadForwarding
+            else gamepadForwarding,
         statsVerbosity = if (after.statsVerbosity != before.statsVerbosity) after.statsVerbosity else statsVerbosity,
         lowLatencyMode = if (after.lowLatencyMode != before.lowLatencyMode) after.lowLatencyMode else lowLatencyMode,
         presentPriority = if (after.presentPriority != before.presentPriority) after.presentPriority else presentPriority,
@@ -136,6 +141,7 @@ data class SettingsOverlay(
         "mouse_mode" -> copy(mouseMode = null)
         "invert_scroll" -> copy(invertScroll = null)
         "gamepad" -> copy(gamepad = null)
+        "gamepad_forwarding" -> copy(gamepadForwarding = null)
         "stats_verbosity" -> copy(statsVerbosity = null)
         "low_latency_mode" -> copy(lowLatencyMode = null)
         "present_priority" -> copy(presentPriority = null)
@@ -159,6 +165,7 @@ data class SettingsOverlay(
         if (mouseMode != null) add("mouse_mode")
         if (invertScroll != null) add("invert_scroll")
         if (gamepad != null) add("gamepad")
+        if (gamepadForwarding != null) add("gamepad_forwarding")
         if (statsVerbosity != null) add("stats_verbosity")
         if (lowLatencyMode != null) add("low_latency_mode")
         if (presentPriority != null) add("present_priority")
@@ -190,6 +197,7 @@ data class SettingsOverlay(
         mouseMode?.let { j.put("mouse_mode", it.storedName) }
         invertScroll?.let { j.put("invert_scroll", it) }
         gamepad?.let { j.put("gamepad", it) }
+        gamepadForwarding?.let { j.put("gamepad_forwarding", it) }
         statsVerbosity?.let { j.put("stats_verbosity", it.name) }
         lowLatencyMode?.let { j.put("low_latency_mode", it) }
         presentPriority?.let { j.put("present_priority", it) }
@@ -205,7 +213,8 @@ data class SettingsOverlay(
         private val KNOWN = setOf(
             "width", "height", "refresh_hz", "bitrate_kbps", "render_scale", "codec",
             "hdr_enabled", "compositor", "audio_channels", "mic_enabled", "echo_cancel",
-            "touch_mode", "mouse_mode", "invert_scroll", "gamepad", "stats_verbosity",
+            "touch_mode", "mouse_mode", "invert_scroll", "gamepad", "gamepad_forwarding",
+            "stats_verbosity",
             "low_latency_mode", "present_priority", "smooth_buffer",
         )
 
@@ -227,6 +236,7 @@ data class SettingsOverlay(
                 ?.let { n -> MouseMode.entries.firstOrNull { it.storedName == n } },
             invertScroll = j.optBooleanOrNull("invert_scroll"),
             gamepad = j.optIntOrNull("gamepad"),
+            gamepadForwarding = j.optBooleanOrNull("gamepad_forwarding"),
             statsVerbosity = j.optStringOrNull("stats_verbosity")
                 ?.let { n -> StatsVerbosity.entries.firstOrNull { it.name == n } },
             lowLatencyMode = j.optBooleanOrNull("low_latency_mode"),

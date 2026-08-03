@@ -552,6 +552,10 @@ pub(crate) struct D3d11vaDecoder {
     /// ([`crate::video::VulkanDecodeDevice::d3d11_hdr10`]) — PQ streams get the HDR
     /// pass-through ring; without it they keep the tonemap-to-sRGB ring.
     hdr10_out: bool,
+    /// The selected decoder's registry name (`(*codec).name`) — `"av1"` vs `"libdav1d"`
+    /// is the difference between hardware decode and a silent CPU fallback, so every
+    /// log a field report leans on carries it.
+    name: String,
 }
 
 // SAFETY: the libav pointers are this decoder's own allocations (freed once in `Drop`) and the COM
@@ -609,10 +613,16 @@ impl D3d11vaDecoder {
             if !d3d11va_decode_supported(hw_device.as_ptr()) {
                 bail!("GPU can't create the D3D11VA decode surface pool");
             }
-            let codec = ffi::avcodec_find_decoder(codec_id.into());
-            if codec.is_null() {
-                bail!("no {codec_id:?} decoder");
-            }
+            // NOT `avcodec_find_decoder`: the ID lookup returns the registry's FIRST
+            // decoder, and for AV1 that is libdav1d (upstream orders the hwaccel-only
+            // native decoder last) — a software decoder that silently ignores
+            // `hw_device_ctx` and fails every frame's D3D11-format guard mid-stream,
+            // even when the DXVA profile + pool probes above all passed. Select by
+            // capability instead: the first decoder that can drive AV_PIX_FMT_D3D11
+            // via hw_device_ctx, or fail here at open.
+            let codec =
+                crate::video::find_hw_decoder(codec_id, ffi::AVPixelFormat::AV_PIX_FMT_D3D11)?;
+            let name = crate::video::codec_name(codec);
             let ctx = ffi::avcodec_alloc_context3(codec);
             (*ctx).hw_device_ctx = ffi::av_buffer_ref(hw_device.as_ptr());
             (*ctx).get_format = Some(get_format_d3d11);
@@ -638,8 +648,14 @@ impl D3d11vaDecoder {
                 video_context1,
                 ring: None,
                 hdr10_out,
+                name,
             })
         }
+    }
+
+    /// The selected decoder's registry name (e.g. `"av1"`) — see the field doc.
+    pub(crate) fn name(&self) -> &str {
+        &self.name
     }
 
     pub(crate) fn decode(&mut self, au: &[u8]) -> Result<Option<D3d11Frame>> {
@@ -830,6 +846,7 @@ impl D3d11vaDecoder {
                 src_desc.Height,
                 index,
                 color.is_pq(),
+                &self.name,
             );
             Ok(D3d11Frame {
                 width,
@@ -883,7 +900,15 @@ impl Drop for D3d11vaDecoder {
 /// One-time dump of the first decoded surface's layout — the forensics for a new GPU/driver.
 /// `tex_*` is the DXVA-aligned decode surface (>= the frame); the gap is the padding the
 /// stream source rect excludes.
-fn log_layout_once(width: u32, height: u32, tex_w: u32, tex_h: u32, index: u32, pq: bool) {
+fn log_layout_once(
+    width: u32,
+    height: u32,
+    tex_w: u32,
+    tex_h: u32,
+    index: u32,
+    pq: bool,
+    decoder: &str,
+) {
     use std::sync::atomic::{AtomicBool, Ordering};
     static ONCE: AtomicBool = AtomicBool::new(true);
     if ONCE.swap(false, Ordering::Relaxed) {
@@ -894,6 +919,7 @@ fn log_layout_once(width: u32, height: u32, tex_w: u32, tex_h: u32, index: u32, 
             tex_h,
             slice = index,
             pq,
+            decoder,
             "D3D11VA first frame"
         );
     }

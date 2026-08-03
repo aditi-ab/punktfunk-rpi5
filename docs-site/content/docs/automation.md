@@ -237,6 +237,13 @@ the session, gives it back if anything crashes, and tells you which half of the 
 it isn't working. That is the supported route, and the rest of this section is only for people who
 would rather not install a plugin.
 
+**Turn off controller forwarding on the couch.** Whatever route you take below, the client that
+hands the device over should stop *also* forwarding it: Settings → **Forward controllers**, off
+([Client settings](/docs/client-settings#input)). Otherwise the host ends up with two controllers
+for one pair of hands and games read both. On Linux and Windows it matters twice over — while the
+client has the pad open it has *claimed* the device node, and VirtualHere cannot bind a device
+somebody else is holding.
+
 **The two sides.** VirtualHere is a server/client pair, and you run both: the **server on the couch**
 (where the device is plugged in) shares it, and the **client on the host** mounts it. The client's
 `-t` flag is a one-shot IPC to the already-running client — `-t LIST` prints every visible device

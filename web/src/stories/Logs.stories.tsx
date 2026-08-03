@@ -64,6 +64,22 @@ const fixtureEntries: LogEntry[] = [
 		"punktfunk_host::encode",
 		"NVENC opened 1920x1080 nv12 gop=inf rfi=on",
 	),
+	// Lines the plugin runner shipped up (`POST /api/v1/plugins/logs`), targeted `plugin:<name>`.
+	// They share the ring and the cursor with the host's own, which is what the Host/Plugins
+	// filter exists to separate — so the fixture has to carry both to be worth screenshotting.
+	entry(9, "INFO", "plugin:runner", "starting virtualhere"),
+	entry(
+		10,
+		"INFO",
+		"plugin:virtualhere",
+		"bound couch-deck.11 (Thrustmaster T300RS) for stream",
+	),
+	entry(
+		11,
+		"ERROR",
+		"plugin:virtualhere",
+		"vhclientx86_64 failed (ETIMEDOUT) — the VirtualHere client is not answering on /tmp/vhclient",
+	),
 ];
 
 const meta = {

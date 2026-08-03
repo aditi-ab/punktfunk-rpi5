@@ -71,7 +71,7 @@ pub(super) fn synthetic_stream(
     Ok(())
 }
 
-/// Bounds a speed-test [`ProbeRequest`] before bursting: a 3 Gbps / 5 s ceiling keeps a probe from
+/// Bounds a speed-test [`ProbeRequest`] before bursting: a 10 Gbps / 5 s ceiling keeps a probe from
 /// monopolizing the link or stalling the stream for too long. The ceiling is set ABOVE the session
 /// bitrate cap ([`MAX_BITRATE_KBPS`], 2 Gbps) on purpose — a probe should be able to demonstrate
 /// headroom past the rate a session will actually be configured to use, so the client can pick a
@@ -1815,6 +1815,10 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
     // on purpose — it survives every in-loop rebuild path (session switch, mode/stall rebuilds,
     // encoder backoff), so a mid-stream rebuild keeps the acquired lock.
     let mut phase_ctl = PhaseController::new();
+    // Frame-driven wire-rate cap (see [`PaceBudget`]): a loop local like `phase_ctl`, and for the
+    // same reason — it must survive every in-loop rebuild path so a mid-stream rebuild can't
+    // reopen the overshoot. Bounded burst (CAP) is all a rebuild gap can buy.
+    let mut pace = PaceBudget::new(std::time::Instant::now());
     // The session's video frame numbering, owned HERE (the wire `frame_index` of the next AU this
     // loop hands to the send thread; the packetizer seals with exactly this via `seal_frame_at`).
     // A submission's future index is predicted as `au_seq + inflight.len()` — exact because AUs
@@ -3117,8 +3121,12 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
         // up to here. Each in-flight frame carries its own (capture_ns, deadline) for when it's polled.
         // Frame-driven mode (T1.1) re-anchors to the ACTUAL submit — arrivals are the clock, and a
         // fixed `+= interval` grid would drift against them and squeeze the pacing budget; the
-        // legacy tick keeps its fixed grid (with the catch-up reset in the tail).
+        // legacy tick keeps its fixed grid (with the catch-up reset in the tail). The rate-cap
+        // charge lives under the same guard as the tail's gate: the legacy tick paces by its grid
+        // alone, and charging it without ever accruing would bank unbounded debt that stalls the
+        // loop if a rebuild later flips the capturer to arrival-wait.
         next = if frame_driven_enabled() && capturer.supports_arrival_wait() {
+            pace.charge();
             std::time::Instant::now() + interval
         } else {
             next + interval
@@ -3477,9 +3485,12 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
             // T1.1 frame-driven trigger: instead of sleeping out the whole tick and then
             // SAMPLING (which holds a frame that arrived just after the previous sample for up
             // to a full interval — ~half on average), sleep only to the rate floor and then
-            // wake on the capture's actual arrival. The 0.9×interval floor caps the encode
-            // rate at ~1.11× target when the source runs faster (compositor Hz > session fps);
-            // the +0.5×interval keepalive keeps a static desktop re-encoding (bitrate shape,
+            // wake on the capture's actual arrival. The 0.9×interval floor leaves per-gap jitter
+            // headroom; the `pace` budget pins the long-run AVERAGE at the pacing rate — the
+            // floor alone let a source that always has a frame pending (an HZ_MULT-overdriven
+            // display under uncapped content) settle at 0.9-interval spacing, 1.11× the
+            // negotiated rate on the wire, frames the client's panel can only drop. The
+            // +0.5×interval keepalive keeps a static desktop re-encoding (bitrate shape,
             // client liveness) at 1.5×interval cadence and bounds control-servicing latency.
             //
             // Anchor the floor to THIS frame's arrival (`t_cap`), not to `next` — `next` is
@@ -3489,9 +3500,12 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
             // period becomes interval + encode (≈158 fps off a 240 Hz source; 360 Hz → ~200).
             // An async encoder (NVENC) returns from submit in ≈0, so t_cap ≈ post-submit and this
             // is a no-op for it — which is why H.26x already holds full rate. Arrival-anchoring
-            // lets the synchronous encode overlap the interval; the ≥0.9×interval spacing from
-            // the last grab still caps the rate at ~1.11× target.
-            let earliest = t_cap + interval.mul_f32(0.9);
+            // lets the synchronous encode overlap the interval; the budget, not the floor, is
+            // what bounds the sustained rate.
+            let earliest = std::cmp::max(
+                t_cap + interval.mul_f32(0.9),
+                pace.earliest(std::time::Instant::now(), interval),
+            );
             if let Some(d) = earliest.checked_duration_since(std::time::Instant::now()) {
                 std::thread::sleep(d);
             }
@@ -4001,6 +4015,59 @@ fn pacing_hz(session_hz: u32, achieved_hz: u32) -> u32 {
     achieved_hz.min(session_hz).max(1)
 }
 
+/// Long-run rate limiter for the frame-driven trigger (T1.1): pins the AVERAGE encode rate at the
+/// pacing rate while the 0.9×interval arrival floor keeps its jitter headroom.
+///
+/// The floor alone bounds only each gap, so a source that always has a frame pending — a display
+/// overdriven by `PUNKTFUNK_VDISPLAY_HZ_MULT`, uncapped content — settles at 0.9-interval spacing:
+/// 1.11× the negotiated rate on the wire (field report: 132 fps on a 120 fps session, frames the
+/// client's 120 Hz panel can only drop). Credit accrues at one frame per interval of real elapsed
+/// time (capped at [`Self::CAP`]) and every submitted frame spends one; a grab may run early only
+/// against banked credit, so per-gap jitter still passes while the average cannot exceed the
+/// pacing rate. A source at or below the pacing rate banks credit faster than it spends and is
+/// never delayed.
+struct PaceBudget {
+    /// Banked frames, in `[-1.0, CAP]`. Transiently dips below 0 when a grab spent credit it had
+    /// only partly banked; the owed fraction is repaid before the next grab.
+    credit: f32,
+    /// When credit last accrued (the previous [`Self::earliest`] call).
+    last: std::time::Instant,
+}
+
+impl PaceBudget {
+    /// Burst allowance: at most this many frames may follow a stall back-to-back before the
+    /// bucket re-gates. One frame of instant catch-up plus the floor's own headroom.
+    const CAP: f32 = 1.25;
+
+    fn new(now: std::time::Instant) -> PaceBudget {
+        PaceBudget {
+            credit: Self::CAP,
+            last: now,
+        }
+    }
+
+    /// Accrue the elapsed credit and return the earliest instant the next grab may run: `now`
+    /// once a full frame is banked, else the missing fraction of an interval out.
+    fn earliest(
+        &mut self,
+        now: std::time::Instant,
+        interval: std::time::Duration,
+    ) -> std::time::Instant {
+        let secs = interval.as_secs_f32();
+        if secs > 0.0 {
+            let accrued = now.duration_since(self.last).as_secs_f32() / secs;
+            self.credit = (self.credit + accrued).min(Self::CAP);
+        }
+        self.last = now;
+        now + interval.mul_f32((1.0 - self.credit).max(0.0))
+    }
+
+    /// One frame submitted — spend its credit.
+    fn charge(&mut self) {
+        self.credit -= 1.0;
+    }
+}
+
 /// Adopt the rate a freshly built pipeline's encoder was actually opened at.
 ///
 /// The session's own `bitrate_kbps` is the number every later decision reads — the ABR controller's
@@ -4122,9 +4189,19 @@ fn build_pipeline(
     // VIDEO_CAP_10BIT + host opted in via PUNKTFUNK_10BIT) is our HDR path → BT.2020 PQ Rgb10a2;
     // otherwise the FP16 IDD frames are converted to 8-bit SDR. (Ignored by non-IDD-push backends,
     // which auto-detect HDR from the monitor state.)
-    let mut capturer =
-        crate::capture::capture_virtual_output(vout, plan.output_format(), plan.capture)
-            .context("capture virtual output")?;
+    //
+    // KWin rewrites `SPA_META_Cursor` on every buffer, so its id-0 metas are an authoritative
+    // "pointer hidden" the cursor blend/forward must honor — without this, the composited arrow
+    // outlives every in-game/Big Picture hide (0.22.0 field report). Derived from the backend
+    // (correct for pooled reuse too — a kept display only matches its own backend).
+    let cursor_id0_hides = vd.name() == pf_vdisplay::Compositor::Kwin.id();
+    let mut capturer = crate::capture::capture_virtual_output(
+        vout,
+        plan.output_format(),
+        plan.capture,
+        cursor_id0_hides,
+    )
+    .context("capture virtual output")?;
     // gamescope (Phase C): gamescope paints no `SPA_META_Cursor`, so hand the capturer a way to
     // reach gamescope's nested Xwaylands — it reads the pointer over X11 (XFixes shape +
     // QueryPointer position) and feeds `cursor()`, which the encode loop composites.
@@ -4268,6 +4345,105 @@ mod tests {
         assert_eq!(pacing_hz(60, 90), 60);
         // Never zero: a 0 would divide into an infinite interval.
         assert_eq!(pacing_hz(60, 0), 1);
+    }
+
+    /// Drive [`PaceBudget`] against a source that ALWAYS has a frame pending (the overdriven
+    /// display + uncapped content case): each cycle grabs the instant the gate opens, the next
+    /// `earliest` call runs right after (encode folded into the wait, like the loop). Returns the
+    /// grab instants.
+    fn grab_saturated(
+        b: &mut PaceBudget,
+        start: std::time::Instant,
+        interval: std::time::Duration,
+        n: usize,
+    ) -> Vec<std::time::Instant> {
+        let mut now = start;
+        let mut grabs = Vec::with_capacity(n);
+        for _ in 0..n {
+            let gate = b.earliest(now, interval);
+            let grab = gate.max(now);
+            b.charge();
+            grabs.push(grab);
+            now = grab;
+        }
+        grabs
+    }
+
+    #[test]
+    fn pace_budget_pins_a_saturated_source_at_the_interval() {
+        let interval = std::time::Duration::from_millis(10);
+        let t0 = std::time::Instant::now();
+        let mut b = PaceBudget::new(t0);
+        let grabs = grab_saturated(&mut b, t0, interval, 120);
+        // Whatever the initial credit bought, the total may exceed the on-rate schedule by at
+        // most the burst cap — 120 grabs span no less than (120 - 1 - CAP) intervals.
+        let span = grabs[119].duration_since(grabs[0]);
+        assert!(
+            span >= interval.mul_f32(120.0 - 1.0 - PaceBudget::CAP),
+            "span {span:?} admits more than CAP frames of overshoot"
+        );
+        // And the steady state is EXACTLY the interval: past the warmup, consecutive grabs are
+        // one interval apart (not 0.9 — the 132-fps bug).
+        for w in grabs[20..].windows(2) {
+            let gap = w[1].duration_since(w[0]);
+            assert!(
+                gap >= interval.mul_f32(0.999) && gap <= interval.mul_f32(1.001),
+                "steady-state gap {gap:?} != interval {interval:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pace_budget_never_delays_an_on_rate_or_slow_source() {
+        let interval = std::time::Duration::from_millis(10);
+        let t0 = std::time::Instant::now();
+        let mut b = PaceBudget::new(t0);
+        // A source at half the pacing rate (a 60 fps game on a 120 fps session): every arrival
+        // banks two frames of credit and spends one — the gate is always already open.
+        let mut now = t0;
+        for _ in 0..50 {
+            now += interval * 2;
+            assert_eq!(
+                b.earliest(now, interval),
+                now,
+                "slow source must not be gated"
+            );
+            b.charge();
+        }
+        // Exactly on-rate: still never gated (credit hovers at the cap, never below 1).
+        let mut b = PaceBudget::new(t0);
+        let mut now = t0;
+        for _ in 0..50 {
+            now += interval;
+            assert_eq!(
+                b.earliest(now, interval),
+                now,
+                "on-rate source must not be gated"
+            );
+            b.charge();
+        }
+    }
+
+    #[test]
+    fn pace_budget_burst_after_a_stall_is_capped() {
+        let interval = std::time::Duration::from_millis(10);
+        let t0 = std::time::Instant::now();
+        let mut b = PaceBudget::new(t0);
+        // Settle into the gated steady state, then stall the source for 10 intervals.
+        let grabs = grab_saturated(&mut b, t0, interval, 20);
+        let stall_end = grabs[19] + interval * 10;
+        // However long the stall, the recovery may run ahead of the on-rate schedule by at most
+        // CAP frames: the second post-stall grab is already re-gated.
+        let after = grab_saturated(&mut b, stall_end, interval, 3);
+        assert_eq!(after[0], stall_end, "first post-stall grab is immediate");
+        assert!(
+            after[1].duration_since(after[0]) >= interval.mul_f32(2.0 - PaceBudget::CAP),
+            "second post-stall grab spent more than the burst cap"
+        );
+        assert!(
+            after[2].duration_since(after[1]) >= interval.mul_f32(0.999),
+            "third post-stall grab must be back on the interval grid"
+        );
     }
 
     #[test]

@@ -1670,6 +1670,22 @@ impl IddPushCapturer {
             // the running correlated/total tally — lives on `StallWatch` (sweep Phase 5.4). It was
             // ~65 lines of log prose inside `try_consume`, which is the hot loop, and its two
             // counters were capturer fields that nothing else touched.
+            // One ETW read serves both evidence fields: the prose summary spans the gap plus
+            // the same 300 ms lead-in the report's OS-event correlation uses (the disturbance
+            // that CAUSED the hole lands just before it), while the discriminator counts span
+            // the GAP ONLY — no lead-in: presents from the healthy flow right before the hole
+            // would falsely acquit the content (the stall-ending frame's own present lands at
+            // the window edge and stays well under the acquit bar). Both halves must come from
+            // the same ring snapshot under the same clock anchor, or the prose and the verdict
+            // can disagree about the same hole.
+            let (etw, etw_counts) = self
+                .etw
+                .as_ref()
+                .and_then(|w| {
+                    now.checked_sub(stall.gap)
+                        .map(|from| w.window_report(from, now, Duration::from_millis(300)))
+                })
+                .unzip();
             let evidence = StallEvidence {
                 // A publisher re-attach restarts `offered_total` near zero; a ring recreate resets
                 // the stall watch before that can matter, but guard the delta anyway (a restarted
@@ -1682,24 +1698,14 @@ impl IddPushCapturer {
                     }
                 }),
                 max_heartbeat_age_ms: self.max_hb_age_us / 1_000,
-                // The probe + ETW reads span the same window the report's OS-event correlation
-                // uses (the gap plus a lead-in for the disturbance that CAUSED it).
+                // The probe read spans the same window the report's OS-event correlation uses
+                // (the gap plus a lead-in for the disturbance that CAUSED it).
                 probes: now
                     .checked_sub(stall.gap + Duration::from_millis(300))
                     .zip(self.probes.as_deref())
                     .map(|(from, p)| p.window(from, now)),
-                etw: self.etw.as_ref().and_then(|w| {
-                    now.checked_sub(stall.gap + Duration::from_millis(300))
-                        .map(|from| w.summary(from, now))
-                }),
-                // The discriminator counts span the GAP ONLY — no lead-in: presents from the
-                // healthy flow right before the hole would falsely acquit the content. The
-                // stall-ending frame's own present lands at the window edge and stays well
-                // under the acquit bar.
-                etw_counts: self.etw.as_ref().and_then(|w| {
-                    now.checked_sub(stall.gap)
-                        .map(|from| w.window_counts(from, now))
-                }),
+                etw,
+                etw_counts,
             };
             self.stall_watch.report(&stall, now, &evidence);
         }
@@ -2450,6 +2456,18 @@ mod tests {
                 &StallVerdict::ComposeSilence,
                 Some(&probes(Some(16_000), Some(20_000), Some(30_000))),
                 Some(&counts(2, 1))
+            ),
+            StallClass::ContentSilence
+        );
+        // A LIVE witness (history true = it demonstrably worked just before the hole) reading
+        // an exact zero is the strongest content conviction — the zero is a measurement, not
+        // an absence.
+        assert_eq!(
+            classify(
+                gap,
+                &StallVerdict::ComposeSilence,
+                Some(&probes(Some(16_000), Some(20_000), Some(30_000))),
+                Some(&counts(0, 0))
             ),
             StallClass::ContentSilence
         );

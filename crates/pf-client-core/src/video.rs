@@ -321,6 +321,88 @@ pub fn ffmpeg_codec_id(wire: u8) -> ffmpeg::codec::Id {
     }
 }
 
+/// Select a decoder for `codec_id` that can actually drive `hw_pix_fmt` through
+/// `hw_device_ctx` — the open-time capability check every hardware backend needs.
+///
+/// `avcodec_find_decoder(id)` is NOT that: it returns the registry's FIRST decoder for
+/// the id, and upstream orders the native `av1` decoder LAST on purpose ("hwaccel hooks
+/// only, so prefer external decoders" — allcodecs.c), behind libdav1d/libaom. The ID
+/// lookup therefore hands every AV1 session a pure software decoder that silently
+/// ignores `hw_device_ctx` and never calls `get_format`; each frame then fails the
+/// backend's hw-format guard and the session burns the demotion ladder MID-STREAM
+/// (~1 s per rung — field-logged as 68 Vulkan fails → D3D11VA → 102 fails → software,
+/// ~3 s of black) instead of failing here at open in milliseconds. H.264/HEVC never hit
+/// this only because their native decoders happen to be registered first.
+///
+/// The walk mirrors what `avcodec_find_decoder` would do, restricted to decoders whose
+/// `avcodec_get_hw_config` advertises the wanted surface via
+/// `AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX` — registry order still wins among those,
+/// so H.264/HEVC keep selecting exactly the decoder they always did. The error names
+/// the decoders that WERE found, so a log reader can tell "this build has no AV1
+/// hwaccel at all" from "no AV1 decoder exists, period".
+pub(crate) fn find_hw_decoder(
+    codec_id: ffmpeg::codec::Id,
+    hw_pix_fmt: ffmpeg::ffi::AVPixelFormat,
+) -> Result<*const ffmpeg::ffi::AVCodec> {
+    use ffmpeg::ffi;
+    let want: ffi::AVCodecID = codec_id.into();
+    let mut found: Vec<String> = Vec::new();
+    // SAFETY: `av_codec_iterate` walks libav's static codec registry (`opaque` is its
+    // cursor) and returns static `AVCodec`s; `avcodec_get_hw_config` only reads the
+    // codec's own static hw-config table, NULL-terminated by returning null past the end.
+    unsafe {
+        let mut opaque = std::ptr::null_mut();
+        loop {
+            let codec = ffi::av_codec_iterate(&mut opaque);
+            if codec.is_null() {
+                break;
+            }
+            if (*codec).id != want || ffi::av_codec_is_decoder(codec) == 0 {
+                continue;
+            }
+            for i in 0.. {
+                let cfg = ffi::avcodec_get_hw_config(codec, i);
+                if cfg.is_null() {
+                    break;
+                }
+                if (*cfg).methods & ffi::AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX as i32 != 0
+                    && (*cfg).pix_fmt == hw_pix_fmt
+                {
+                    return Ok(codec);
+                }
+            }
+            found.push(
+                std::ffi::CStr::from_ptr((*codec).name)
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+    }
+    if found.is_empty() {
+        bail!("no {codec_id:?} decoder in this FFmpeg build");
+    }
+    bail!(
+        "no {codec_id:?} decoder in this FFmpeg build can drive {hw_pix_fmt:?} via \
+         hw_device_ctx (found: {})",
+        found.join(", ")
+    );
+}
+
+/// The name of a registry `AVCodec` (`(*codec).name`), owned — the field every decode
+/// log carries so `decoder="av1"` vs `decoder="libdav1d"` is one glance, not a debugger.
+///
+/// # Safety
+/// `codec` must point to a registered `AVCodec` (their `name` is a static NUL-terminated
+/// string, valid for the process).
+pub(crate) unsafe fn codec_name(codec: *const ffmpeg::ffi::AVCodec) -> String {
+    // SAFETY: caller guarantees a registered AVCodec; `name` is its static C string.
+    unsafe {
+        std::ffi::CStr::from_ptr((*codec).name)
+            .to_string_lossy()
+            .into_owned()
+    }
+}
+
 /// The `quic` codec bitfield this client can decode — whatever FFmpeg has a decoder for (HEVC/H.264
 /// always; AV1 when built in). Advertised to the host so it never emits a codec we can't decode.
 pub fn decodable_codecs() -> u8 {
@@ -435,7 +517,11 @@ impl Decoder {
             vaapi_tried = true;
             match VaapiDecoder::new(codec_id) {
                 Ok(v) => {
-                    tracing::info!(?codec_id, "VAAPI hardware decode active (zero-copy dmabuf)");
+                    tracing::info!(
+                        ?codec_id,
+                        decoder = v.name(),
+                        "VAAPI hardware decode active (zero-copy dmabuf)"
+                    );
                     return done(Backend::Vaapi(v));
                 }
                 Err(e) => {
@@ -470,6 +556,7 @@ impl Decoder {
                     Ok(d) => {
                         tracing::info!(
                             ?codec_id,
+                            decoder = d.name(),
                             "D3D11VA hardware decode active (shared-texture hand-off)"
                         );
                         return done(Backend::D3d11va(d));
@@ -490,6 +577,7 @@ impl Decoder {
                     Ok(v) => {
                         tracing::info!(
                             ?codec_id,
+                            decoder = v.name(),
                             "Vulkan Video hardware decode active (presenter-shared device)"
                         );
                         return done(Backend::Vulkan(v));
@@ -520,7 +608,11 @@ impl Decoder {
         if choice != "software" && choice != "vulkan" && !vaapi_tried {
             match VaapiDecoder::new(codec_id) {
                 Ok(v) => {
-                    tracing::info!(?codec_id, "VAAPI hardware decode active (zero-copy dmabuf)");
+                    tracing::info!(
+                        ?codec_id,
+                        decoder = v.name(),
+                        "VAAPI hardware decode active (zero-copy dmabuf)"
+                    );
                     return done(Backend::Vaapi(v));
                 }
                 Err(e) => {
@@ -548,6 +640,7 @@ impl Decoder {
                         Ok(d) => {
                             tracing::info!(
                                 ?codec_id,
+                                decoder = d.name(),
                                 "D3D11VA hardware decode active (shared-texture hand-off)"
                             );
                             return done(Backend::D3d11va(d));
@@ -724,6 +817,7 @@ impl Decoder {
                         match VaapiDecoder::new(self.codec_id) {
                             Ok(v) => {
                                 tracing::warn!(error = %e, fails = self.vaapi_fails,
+                                    decoder = v.name(),
                                     "Vulkan Video decode failing repeatedly — demoting to VAAPI");
                                 self.backend = Backend::Vaapi(v);
                                 self.vaapi_fails = 0;
@@ -745,6 +839,7 @@ impl Decoder {
                         ) {
                             Ok(d) => {
                                 tracing::warn!(error = %e, fails = self.vaapi_fails,
+                                    decoder = d.name(),
                                     "Vulkan Video decode failing repeatedly — demoting to D3D11VA");
                                 self.backend = Backend::D3d11va(d);
                                 self.vaapi_fails = 0;

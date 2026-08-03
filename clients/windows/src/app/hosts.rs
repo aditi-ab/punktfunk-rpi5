@@ -623,8 +623,14 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                 actions.push(
                     icon_btn("Settings", Symbol::Setting)
                         .on_click({
-                            let ss = set_screen.clone();
-                            move || ss.call(Screen::Settings)
+                            let (c, ss) = (ctx.clone(), set_screen.clone());
+                            move || {
+                                // Re-base the settings snapshot on the file before the page
+                                // renders — this process is not its only writer (see
+                                // settings::refresh_snapshot).
+                                super::settings::refresh_snapshot(&c);
+                                ss.call(Screen::Settings)
+                            }
                         })
                         .into(),
                 );

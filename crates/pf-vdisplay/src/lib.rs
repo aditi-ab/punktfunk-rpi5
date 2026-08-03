@@ -407,13 +407,21 @@ pub fn open(compositor: Compositor) -> Result<Box<dyn VirtualDisplay>> {
         // The pf-vdisplay all-Rust IddCx driver is the sole virtual-display backend (the legacy SudoVDA
         // fallback was removed — its driver is no longer shipped). The compositor arg is moot on Windows.
         let _ = compositor;
-        // `ensure_available` self-heals the hostless-zombie state a WUDFHost crash leaves (adapter
-        // devnode present, interface gone): one device cycle + re-probe before giving up.
-        anyhow::ensure!(
-            driver::ensure_available(),
-            "pf-vdisplay driver interface not found — the pf-vdisplay IddCx driver is not installed or \
-             not loaded (the host installer bundles it; reinstall or check the driver state)"
-        );
+        // `ensure_available` waits out a devnode that is merely coming up (the wake-from-sleep case:
+        // the adapter re-enters D0 and re-registers its interface while a reconnecting client is
+        // already knocking) and self-heals the hostless-zombie state a WUDFHost crash leaves (adapter
+        // devnode present, interface gone) by reloading the adapter.
+        //
+        // `context`, not a replacement message: it reports WHY — how long it waited, whether a reload
+        // ran, how many interface instances were seen and in what state. A flat "the driver is not
+        // installed" is what a field report carried from a box whose driver was installed, started,
+        // and simply mid-resume, and it pointed every reader at the wrong problem.
+        use anyhow::Context as _;
+        driver::ensure_available().context(
+            "pf-vdisplay driver interface not available — the pf-vdisplay IddCx driver is not \
+             installed, not loaded, or did not finish coming back up (the host installer bundles \
+             it; reinstall or check the driver state)",
+        )?;
         Ok(Box::new(driver::PfVdisplayDisplay::new()?))
     }
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]

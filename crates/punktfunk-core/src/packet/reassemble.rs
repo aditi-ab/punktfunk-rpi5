@@ -409,6 +409,27 @@ impl Reassembler {
         // can neither advance the video anchor nor be dropped as stale against it (and its aged-out
         // frames never count as `frames_dropped`, which would fire video loss recovery).
         let is_probe = hdr.user_flags & (FLAG_PROBE as u32) != 0;
+        if is_probe {
+            // Probe-scoped receive accounting (the speed-test numerator + denominator, see
+            // `Stats::probe_first_arrival_ns`), stamped at the routing decision so video in
+            // flight around the burst contaminates neither the byte count nor the arrival
+            // stamps. Byte unit mirrors `bytes_received` (whole plaintext packet). The first
+            // probe packet since the pump armed the probe claims the first-arrival slot (the
+            // pump zeroes it before the burst can reach the host); every probe packet
+            // refreshes the last-arrival stamp.
+            let now_ns = crate::stats::now_monotonic_ns();
+            StatsCounters::add(&stats.probe_packets_received, 1);
+            StatsCounters::add(&stats.probe_bytes_received, pkt.len() as u64);
+            let _ = stats.probe_first_arrival_ns.compare_exchange(
+                0,
+                now_ns,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            stats
+                .probe_last_arrival_ns
+                .store(now_ns, std::sync::atomic::Ordering::Relaxed);
+        }
         let win = if is_probe { probe } else { video };
         win.advance_window(
             hdr.frame_index,
@@ -446,14 +467,33 @@ impl Reassembler {
             return Ok(None);
         }
 
-        // First packet of a frame allocates its whole (zeroed) buffer, budget-gated; later
-        // packets must agree with its geometry. A sentinel-opened (streamed) frame allocates at
-        // the limits' maximum — its real size doesn't exist yet.
-        let buf_len = if sentinel {
-            total_data_max * shard_bytes
+        // How many shards of frame buffer THIS packet proves the frame needs. A sentinel carries
+        // no total, but it does pin its own block's extent — a slice sentinel by its wire base,
+        // a legacy one by its full-K position — and that is what the buffer must cover to place
+        // the shard. The frame grows as later blocks reveal more, and the final (non-sentinel)
+        // block's totals settle it.
+        //
+        // ⚠ NOT `total_data_max` (= the negotiated `max_frame_bytes`, 8-64 MiB): that shape
+        // shipped in 0.23.0 and was survivable only while sentinels were rare — the streamed
+        // path emitted one solely for an AU exceeding a whole FEC block (~281 KB). The slice
+        // wire flushes at `MIN_STREAM_BLOCK_SHARDS`, so EVERY ordinary AU became sentinel-opened
+        // and every one of them committed the full ceiling: a multi-megabyte zeroed allocation
+        // per access unit, and an in-flight budget (`IN_FLIGHT_BUF_FACTOR × max_frame_bytes`)
+        // exhausted after ~3 concurrent frames — beyond which every packet of every further
+        // frame was dropped outright. On a jittery link that is a permanent loss storm.
+        let need_shards = if sentinel && slice_stream {
+            frame_bytes / shard_bytes + data_shards
+        } else if sentinel {
+            // Legacy sentinels are full-K uniform blocks (firewall-enforced), so the block's
+            // index alone gives its end.
+            (block_idx + 1).saturating_mul(lim.max_data_shards)
         } else {
-            total_data * shard_bytes
-        };
+            total_data
+        }
+        .min(total_data_max);
+        // First packet of a frame allocates its (zeroed) buffer, budget-gated; later packets must
+        // agree with its geometry.
+        let buf_len = need_shards * shard_bytes;
         let frame = match win.frames.entry(hdr.frame_index) {
             std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
             std::collections::hash_map::Entry::Vacant(e) => {
@@ -580,6 +620,21 @@ impl Reassembler {
         } else if frame.block_count != block_count || frame.frame_bytes != frame_bytes {
             drop(stats);
             return Ok(None);
+        }
+        // Grow to this packet's proven extent. A streamed frame opens at whichever block arrived
+        // first and learns its real size from the final block's totals (or a later, higher
+        // sentinel base) — reorder means either can come first, so the buffer is sized by
+        // whatever the frame has proven so far. Never shrinks: the totals only settle the frame's
+        // END, and completion truncates to `frame_bytes` anyway. The budget is re-checked here
+        // for exactly the reason it is checked at open — growth commits memory too.
+        if buf_len > frame.buf.len() {
+            let delta = buf_len - frame.buf.len();
+            if *in_flight_bytes + delta > IN_FLIGHT_BUF_FACTOR * lim.max_frame_bytes {
+                drop(stats);
+                return Ok(None);
+            }
+            *in_flight_bytes += delta;
+            frame.buf.resize(buf_len, 0);
         }
         let FrameBuf {
             buf,

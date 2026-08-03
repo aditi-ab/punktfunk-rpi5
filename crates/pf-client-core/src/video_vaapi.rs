@@ -46,6 +46,10 @@ pub(crate) struct VaapiDecoder {
     hw_device: AvBuffer,
     packet: *mut ffmpeg::ffi::AVPacket,
     frame: *mut ffmpeg::ffi::AVFrame,
+    /// The selected decoder's registry name (`(*codec).name`) — `"av1"` vs `"libdav1d"`
+    /// is the difference between hardware decode and a silent CPU fallback, so every
+    /// log a field report leans on carries it.
+    name: String,
 }
 
 // SAFETY: the three raw pointers (`ctx`, `packet`, `frame`) are allocations this decoder makes in
@@ -80,11 +84,15 @@ impl VaapiDecoder {
             // Owned from here: every `bail!` below drops it, so none of them unref by hand.
             let hw_device = AvBuffer::from_raw(hw_device)
                 .context("av_hwdevice_ctx_create(VAAPI) gave no device")?;
-            // The negotiated codec's decoder id (av_codec_id maps 1:1 from ffmpeg::codec::Id).
-            let codec = ffi::avcodec_find_decoder(codec_id.into());
-            if codec.is_null() {
-                bail!("no {codec_id:?} decoder");
-            }
+            // NOT `avcodec_find_decoder`: the ID lookup returns the registry's FIRST
+            // decoder, and for AV1 that is libdav1d (upstream orders the hwaccel-only
+            // native decoder last) — a software decoder that silently ignores
+            // `hw_device_ctx` and fails every frame's VAAPI-format guard mid-stream.
+            // Select by capability instead: the first decoder that can drive
+            // AV_PIX_FMT_VAAPI via hw_device_ctx, or fail here at open.
+            let codec =
+                crate::video::find_hw_decoder(codec_id, ffi::AVPixelFormat::AV_PIX_FMT_VAAPI)?;
+            let name = crate::video::codec_name(codec);
             let ctx = ffi::avcodec_alloc_context3(codec);
             (*ctx).hw_device_ctx = ffi::av_buffer_ref(hw_device.as_ptr());
             (*ctx).get_format = Some(pick_vaapi);
@@ -109,8 +117,14 @@ impl VaapiDecoder {
                 hw_device,
                 packet: ffi::av_packet_alloc(),
                 frame: ffi::av_frame_alloc(),
+                name,
             })
         }
+    }
+
+    /// The selected decoder's registry name (e.g. `"av1"`) — see the field doc.
+    pub(crate) fn name(&self) -> &str {
+        &self.name
     }
 
     pub(crate) fn decode(&mut self, au: &[u8]) -> Result<Option<DmabufFrame>> {
@@ -207,7 +221,7 @@ impl VaapiDecoder {
             // a single modifier for the texture.
             let modifier = d.objects[0].format_modifier;
 
-            log_descriptor_once(d, sw_format, fourcc, modifier);
+            log_descriptor_once(d, sw_format, fourcc, modifier, &self.name);
 
             Ok(DmabufFrame {
                 width: (*self.frame).width as u32,
@@ -233,6 +247,7 @@ fn log_descriptor_once(
     sw: ffmpeg_next::ffi::AVPixelFormat,
     fourcc: u32,
     modifier: u64,
+    decoder: &str,
 ) {
     use std::sync::atomic::{AtomicBool, Ordering};
     static ONCE: AtomicBool = AtomicBool::new(true);
@@ -250,6 +265,7 @@ fn log_descriptor_once(
         nb_layers = d.nb_layers,
         ?layers,
         modifier = format_args!("{:#018x}", modifier),
+        decoder,
         "VAAPI dmabuf descriptor layout (first frame)"
     );
 }

@@ -26,9 +26,14 @@ enum RowId {
     Decoder,
     Hdr,
     Chroma444,
+    PresentPriority,
+    SmoothBuffer,
+    Vsync,
+    AllowVrr,
     Audio,
     Mic,
     EchoCancel,
+    PadForward,
     Pad,
     PadType,
     Touch,
@@ -46,7 +51,7 @@ enum RowId {
 // scroll/shortcut behavior, fullscreen-on-stream, auto-wake, the library toggle and echo
 // cancellation all were). Still deliberately smaller than the desktop dialogs — device
 // pickers (GPU/speaker/mic) and the profile catalog stay desktop-only.
-const ROWS: [RowId; 22] = [
+const ROWS: [RowId; 27] = [
     RowId::Resolution,
     RowId::Refresh,
     RowId::RenderScale,
@@ -56,9 +61,14 @@ const ROWS: [RowId; 22] = [
     RowId::Decoder,
     RowId::Hdr,
     RowId::Chroma444,
+    RowId::PresentPriority,
+    RowId::SmoothBuffer,
+    RowId::Vsync,
+    RowId::AllowVrr,
     RowId::Audio,
     RowId::Mic,
     RowId::EchoCancel,
+    RowId::PadForward,
     RowId::Pad,
     RowId::PadType,
     RowId::Touch,
@@ -117,6 +127,17 @@ const DECODERS: [(&str, &str); 4] = [
     ("software", "Software"),
 ];
 const AUDIO: [(u8, &str); 3] = [(2, "Stereo"), (6, "5.1"), (8, "7.1")];
+/// Presentation intent — the `present_priority` key shared with the Apple and Android
+/// clients, so one profile reads the same on every device.
+const PRESENT_PRIORITIES: [(&str, &str); 2] =
+    [("latency", "Lowest latency"), ("smooth", "Smoothness")];
+/// Smoothness buffer depth in frames; `0` = Automatic (resolves to 2).
+const SMOOTH_BUFFERS: [(u8, &str); 4] = [
+    (0, "Automatic"),
+    (1, "1 frame"),
+    (2, "2 frames"),
+    (3, "3 frames"),
+];
 const PAD_TYPES: [(&str, &str); 6] = [
     ("auto", "Automatic"),
     ("xbox360", "Xbox 360"),
@@ -222,9 +243,18 @@ impl SettingsScreen {
 
 fn row_spec(id: RowId, ctx: &Ctx) -> RowSpec {
     let s = &ctx.settings;
-    // Echo cancellation only means anything while the mic streams — dimmed and inert while it
-    // doesn't, the same relationship the desktop shells draw with a greyed-out row.
-    let enabled = !matches!(id, RowId::EchoCancel) || s.mic_enabled;
+    // Several rows follow another: echo cancellation only means anything while the mic
+    // streams, the pad rows only while any controller is forwarded at all, and the
+    // smoothness buffer only while that intent is chosen. All go dim and inert otherwise
+    // — the same relationship the desktop shells draw by greying a row out (they hide the
+    // buffer row entirely; a fixed row list can't, and a row that vanished mid-list would
+    // move everything under the cursor).
+    let enabled = match id {
+        RowId::EchoCancel => s.mic_enabled,
+        RowId::Pad | RowId::PadType => s.gamepad_forwarding,
+        RowId::SmoothBuffer => s.present_priority == "smooth",
+        _ => true,
+    };
     let (header, label, value): (Option<&'static str>, &str, String) = match id {
         RowId::Resolution => (
             Some("Stream"),
@@ -279,6 +309,22 @@ fn row_spec(id: RowId, ctx: &Ctx) -> RowSpec {
         RowId::Decoder => (None, "Decoder", label_for(&DECODERS, &s.decoder).into()),
         RowId::Hdr => (None, "10-bit HDR", on_off(s.hdr_enabled).into()),
         RowId::Chroma444 => (None, "Full chroma (4:4:4)", on_off(s.enable_444).into()),
+        RowId::PresentPriority => (
+            Some("Presentation"),
+            "Prioritize",
+            label_for(&PRESENT_PRIORITIES, &s.present_priority).into(),
+        ),
+        RowId::SmoothBuffer => (
+            None,
+            "Smoothness buffer",
+            SMOOTH_BUFFERS
+                .iter()
+                .find(|(v, _)| *v == s.smooth_buffer)
+                .map_or("Automatic", |(_, l)| l)
+                .into(),
+        ),
+        RowId::Vsync => (None, "V-Sync", on_off(s.vsync).into()),
+        RowId::AllowVrr => (None, "Follow variable refresh", on_off(s.allow_vrr).into()),
         RowId::Audio => (
             Some("Audio"),
             "Audio channels",
@@ -290,8 +336,13 @@ fn row_spec(id: RowId, ctx: &Ctx) -> RowSpec {
         ),
         RowId::Mic => (None, "Microphone", on_off(s.mic_enabled).into()),
         RowId::EchoCancel => (None, "Echo cancellation", on_off(s.echo_cancel).into()),
-        RowId::Pad => (
+        RowId::PadForward => (
             Some("Controller"),
+            "Forward controllers",
+            on_off(s.gamepad_forwarding).into(),
+        ),
+        RowId::Pad => (
+            None,
             "Use controller",
             if s.forward_pad.is_empty() {
                 "Automatic".into()
@@ -365,7 +416,26 @@ fn detail(id: RowId) -> &'static str {
         }
         RowId::Chroma444 => {
             "Full-colour video: crisp small text and thin lines, at more bandwidth. \
-             HEVC only, and only where the host can encode it."
+             Needs an NVIDIA host (NVENC) or the PyroWave codec — other encoders \
+             stream 4:2:0 and the session falls back silently."
+        }
+        RowId::PresentPriority => {
+            "Lowest latency shows each frame the moment the display can take it — a \
+             network hiccup becomes an occasional repeated or skipped frame. Smoothness \
+             buffers a little to even those out."
+        }
+        RowId::SmoothBuffer => {
+            "Frames held back before showing. Each one absorbs about a refresh of network \
+             hiccup and adds a refresh of delay. Automatic holds two."
+        }
+        RowId::Vsync => {
+            "Tear-free. Off removes the wait for the screen's refresh — the lowest \
+             possible delay, at the cost of visible tearing. Not every driver offers it; \
+             the stats overlay names the mode actually in use."
+        }
+        RowId::AllowVrr => {
+            "On a VRR screen, let the panel refresh in step with the stream instead of on \
+             a fixed cadence. Applies to fullscreen sessions; harmless on a fixed screen."
         }
         RowId::Audio => "The speaker layout requested from the host.",
         RowId::Mic => {
@@ -375,6 +445,11 @@ fn detail(id: RowId) -> &'static str {
         RowId::EchoCancel => {
             "Stops the host's audio, playing from this device's speakers, being picked up \
              and sent back. Turn it off if your microphone already runs its own processing."
+        }
+        RowId::PadForward => {
+            "Send controllers connected to this device to the host. Turn it off when your \
+             controller already reaches the host another way — USB passthrough such as \
+             VirtualHere, or a pad plugged into the host — so games don't see two of them."
         }
         RowId::Pad => "Which pad is forwarded to the host, as player 1.",
         RowId::PadType => "The virtual pad the host creates — Automatic matches this controller.",
@@ -462,6 +537,27 @@ fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
         RowId::Decoder => step_str(&DECODERS, &mut s.decoder, delta, wrap),
         RowId::Hdr => toggle(&mut s.hdr_enabled, delta, wrap),
         RowId::Chroma444 => toggle(&mut s.enable_444, delta, wrap),
+        RowId::PresentPriority => {
+            let cur = PRESENT_PRIORITIES
+                .iter()
+                .position(|(v, _)| *v == s.present_priority);
+            step_option(cur, PRESENT_PRIORITIES.len(), delta, wrap)
+                .map(|i| s.present_priority = PRESENT_PRIORITIES[i].0.to_string())
+        }
+        // Inert unless smoothness is chosen — a boundary thud, matching the dimmed row.
+        RowId::SmoothBuffer => {
+            if s.present_priority == "smooth" {
+                let cur = SMOOTH_BUFFERS
+                    .iter()
+                    .position(|(v, _)| *v == s.smooth_buffer);
+                step_option(cur, SMOOTH_BUFFERS.len(), delta, wrap)
+                    .map(|i| s.smooth_buffer = SMOOTH_BUFFERS[i].0)
+            } else {
+                None
+            }
+        }
+        RowId::Vsync => toggle(&mut s.vsync, delta, wrap),
+        RowId::AllowVrr => toggle(&mut s.allow_vrr, delta, wrap),
         RowId::Audio => {
             let cur = AUDIO.iter().position(|(v, _)| *v == s.audio_channels);
             step_option(cur, AUDIO.len(), delta, wrap).map(|i| s.audio_channels = AUDIO[i].0)
@@ -475,7 +571,11 @@ fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
                 None
             }
         }
+        RowId::PadForward => toggle(&mut s.gamepad_forwarding, delta, wrap),
         RowId::Pad => {
+            if !s.gamepad_forwarding {
+                return false;
+            }
             // Automatic first, then every connected pad by stable key.
             let keys: Vec<String> = std::iter::once(String::new())
                 .chain(ctx.pads.iter().map(|p| p.key.clone()))
@@ -483,7 +583,12 @@ fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
             let cur = keys.iter().position(|c| *c == s.forward_pad);
             step_option(cur, keys.len(), delta, wrap).map(|i| s.forward_pad = keys[i].clone())
         }
-        RowId::PadType => step_str(&PAD_TYPES, &mut s.gamepad, delta, wrap),
+        RowId::PadType => {
+            if !s.gamepad_forwarding {
+                return false;
+            }
+            step_str(&PAD_TYPES, &mut s.gamepad, delta, wrap)
+        }
         RowId::Touch => {
             let cur = TouchMode::ALL.iter().position(|m| *m == s.touch_mode());
             step_option(cur, TouchMode::ALL.len(), delta, wrap)
@@ -645,6 +750,45 @@ mod tests {
         assert!(!ctx.settings.echo_cancel);
         assert!(adjust(RowId::EchoCancel, 1, true, &mut ctx));
         assert!(ctx.settings.echo_cancel);
+    }
+
+    /// The smoothness buffer follows the presentation intent, exactly as echo cancellation
+    /// follows the mic: dimmed and inert under Lowest latency (where holding frames means
+    /// nothing), live under Smoothness. The desktop shells hide the row instead; a fixed
+    /// row list dims it, because a row vanishing mid-list would shift everything under the
+    /// cursor.
+    #[test]
+    fn smoothness_buffer_follows_the_intent() {
+        let (mut settings, pads) = ctx_parts();
+        assert_eq!(settings.present_priority, "latency", "the shipped default");
+        let library = crate::library::LibraryShared::default();
+        let mut ctx = Ctx {
+            hosts: &[],
+            library: &library,
+            settings: &mut settings,
+            pads: &pads,
+            deck: false,
+            device_name: "t",
+            t: 0.0,
+        };
+        assert!(!row_spec(RowId::SmoothBuffer, &ctx).enabled);
+        assert!(
+            !adjust(RowId::SmoothBuffer, 1, false, &mut ctx),
+            "latency intent = thud"
+        );
+        assert_eq!(ctx.settings.smooth_buffer, 0, "and nothing was written");
+
+        // Stepping the intent to Smoothness brings the buffer row to life.
+        assert!(adjust(RowId::PresentPriority, 1, false, &mut ctx));
+        assert_eq!(ctx.settings.present_priority, "smooth");
+        assert!(row_spec(RowId::SmoothBuffer, &ctx).enabled);
+        assert!(adjust(RowId::SmoothBuffer, 1, false, &mut ctx));
+        assert_eq!(ctx.settings.smooth_buffer, 1);
+
+        // The intent wraps back and the row goes inert again.
+        assert!(adjust(RowId::PresentPriority, -1, false, &mut ctx));
+        assert_eq!(ctx.settings.present_priority, "latency");
+        assert!(!row_spec(RowId::SmoothBuffer, &ctx).enabled);
     }
 
     #[test]

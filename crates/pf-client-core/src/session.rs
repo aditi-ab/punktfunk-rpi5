@@ -442,11 +442,31 @@ fn pump(
     // Build the decoder for the codec the host resolved (never assume HEVC), honoring the
     // Settings backend preference (auto/vaapi/software).
     let codec_id = crate::video::ffmpeg_codec_id(connector.codec);
-    tracing::info!(
-        ?codec_id,
-        welcome_codec = connector.codec,
-        "negotiated video codec"
-    );
+    // The WIRE codec is the negotiated truth; the FFmpeg id is meaningful only where
+    // FFmpeg decodes it. `ffmpeg_codec_id`'s fallthrough maps every unknown wire bit —
+    // PyroWave included — to HEVC, so logging it unconditionally claimed
+    // `codec_id=HEVC` for wavelet sessions that never touch FFmpeg at all.
+    let codec = match connector.codec {
+        punktfunk_core::quic::CODEC_H264 => "H264",
+        punktfunk_core::quic::CODEC_HEVC => "HEVC",
+        punktfunk_core::quic::CODEC_AV1 => "AV1",
+        punktfunk_core::quic::CODEC_PYROWAVE => "PyroWave",
+        _ => "unknown",
+    };
+    if connector.codec == punktfunk_core::quic::CODEC_PYROWAVE {
+        tracing::info!(
+            codec,
+            welcome_codec = connector.codec,
+            "negotiated video codec"
+        );
+    } else {
+        tracing::info!(
+            codec,
+            ?codec_id,
+            welcome_codec = connector.codec,
+            "negotiated video codec"
+        );
+    }
     // A negotiated PyroWave session decodes on the presenter's device, no FFmpeg —
     // reachable only through the explicit preference above (resolve_codec never
     // auto-picks the bit), so failing loudly here is failing an opted-in experiment.

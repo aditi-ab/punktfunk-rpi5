@@ -101,6 +101,19 @@ const MOUSE_MODES: &[(&str, &str)] = &[
     ("capture", "Capture (games)"),
     ("desktop", "Desktop (absolute)"),
 ];
+/// Presentation intent: `(stored value, display label)` — the `present_priority` key the
+/// Apple and Android clients share, so one profile means the same thing everywhere.
+const PRESENT_PRIORITIES: &[(&str, &str)] =
+    &[("latency", "Lowest latency"), ("smooth", "Smoothness")];
+/// Smoothness buffer depth in frames: `(stored value, display label)`. `0` = Automatic,
+/// which resolves to 2 (`PresentPriority::resolve`). No millisecond hints — the cost is
+/// one refresh per frame, and the refresh isn't known here when the mode is Native.
+const SMOOTH_BUFFERS: &[(u8, &str)] = &[
+    (0, "Automatic"),
+    (1, "1 frame"),
+    (2, "2 frames"),
+    (3, "3 frames"),
+];
 /// Host compositor presets: `(stored value, display label)`. Advisory — the host falls back to
 /// auto-detect when the choice is unavailable. Only meaningful against a Linux host.
 const COMPOSITORS: &[(&str, &str)] = &[
@@ -411,7 +424,16 @@ fn commit(
         return;
     }
     let mut catalog = ProfilesFile::load();
-    let base = ctx.settings.lock().unwrap().clone();
+    // The same rebase as the global arm above: `base` is what `absorb`'s before/after
+    // effective settings derive from, and the snapshot is not the file — another process
+    // (session resize, console UI, Decky) may have moved a global under us. The historical
+    // rebase fix ("settings saves stop reverting each other") covered the whole-file
+    // writers but missed this arm.
+    let base = {
+        let mut s = ctx.settings.lock().unwrap();
+        *s = Settings::load();
+        s.clone()
+    };
     let Some(p) = catalog.profiles.iter_mut().find(|p| p.id == scope) else {
         return; // deleted from under us; the next render falls back to the defaults scope
     };
@@ -423,6 +445,17 @@ fn commit(
         tracing::warn!(error = %format!("{e:#}"), "saving the profile catalog");
     }
     rev.1.call(rev.0 + 1);
+}
+
+/// Re-base the process-lifetime settings snapshot on the file — called from the navigation
+/// handlers that (re)enter this page, NOT per render pass. `ctx.settings` is loaded once at
+/// process start and this process is not the file's only writer (a spawned session persists
+/// its match-window size, the console UI and Decky save too — profiles.rs documents the
+/// family), so without this the page opens showing values another process already replaced,
+/// which then visibly "jump" the moment a row is touched and `commit`'s rebase pulls the
+/// file in. The field report this fixes: a codec setting that "changed by itself".
+pub(crate) fn refresh_snapshot(ctx: &Arc<AppCtx>) {
+    *ctx.settings.lock().unwrap() = Settings::load();
 }
 
 /// Which tier-P rows the profile in scope overrides. Plain bools rather than a lookup so the
@@ -445,8 +478,13 @@ struct OverrideFlags {
     invert_scroll: bool,
     inhibit_shortcuts: bool,
     gamepad: bool,
+    gamepad_forwarding: bool,
     stats_verbosity: bool,
     fullscreen_on_stream: bool,
+    present_priority: bool,
+    smooth_buffer: bool,
+    vsync: bool,
+    allow_vrr: bool,
 }
 
 impl OverrideFlags {
@@ -473,8 +511,13 @@ impl OverrideFlags {
             invert_scroll: o.invert_scroll.is_some(),
             inhibit_shortcuts: o.inhibit_shortcuts.is_some(),
             gamepad: o.gamepad.is_some(),
+            gamepad_forwarding: o.gamepad_forwarding.is_some(),
             stats_verbosity: o.stats_verbosity.is_some(),
             fullscreen_on_stream: o.fullscreen_on_stream.is_some(),
+            present_priority: o.present_priority.is_some(),
+            smooth_buffer: o.smooth_buffer.is_some(),
+            vsync: o.vsync.is_some(),
+            allow_vrr: o.allow_vrr.is_some(),
         }
     }
 }
@@ -851,6 +894,32 @@ pub(crate) fn settings_page(
     let chroma_toggle = setting_toggle(ctx, scope, (rev, set_rev), s.enable_444, |s, on| {
         s.enable_444 = on
     });
+    // Presentation intent (design/desktop-presentation-rebuild.md). The buffer row is
+    // rendered only under Smoothness — `commit` bumps the revision, so flipping the
+    // intent re-renders the section and the row appears/disappears with it.
+    let (present_names, present_i) = presets(PRESENT_PRIORITIES, |v| *v == s.present_priority);
+    let present_combo = setting_combo(
+        ctx,
+        scope,
+        (rev, set_rev),
+        present_names,
+        present_i,
+        |s, i| s.present_priority = PRESENT_PRIORITIES[i].0.to_string(),
+    );
+    let smoothing = s.present_priority == "smooth";
+    let (buffer_names, buffer_i) = presets(SMOOTH_BUFFERS, |v| *v == s.smooth_buffer);
+    let buffer_combo = setting_combo(
+        ctx,
+        scope,
+        (rev, set_rev),
+        buffer_names,
+        buffer_i,
+        |s, i| s.smooth_buffer = SMOOTH_BUFFERS[i].0,
+    );
+    let vsync_toggle = setting_toggle(ctx, scope, (rev, set_rev), s.vsync, |s, on| s.vsync = on);
+    let vrr_toggle = setting_toggle(ctx, scope, (rev, set_rev), s.allow_vrr, |s, on| {
+        s.allow_vrr = on
+    });
 
     // --- Input -----------------------------------------------------------------------------
     // Controller forwarding: Automatic forwards EVERY real controller, each as its own pad;
@@ -898,6 +967,10 @@ pub(crate) fn settings_page(
                 s.save();
             })
     };
+    let pad_forward_toggle =
+        setting_toggle(ctx, scope, (rev, set_rev), s.gamepad_forwarding, |s, on| {
+            s.gamepad_forwarding = on
+        });
     let (pad_names, pad_i) = presets(GAMEPADS, |v| {
         GamepadPref::from_name(v) == GamepadPref::from_name(&s.gamepad)
     });
@@ -972,6 +1045,16 @@ pub(crate) fn settings_page(
         let ss = set_screen.clone();
         button("Third-party licenses").on_click(move || ss.call(Screen::Licenses))
     };
+    // The client log's home (%LOCALAPPDATA%\punktfunk\logs) — the file every "check the
+    // client log" message means, which until this row had no way in from the UI at all.
+    // The folder rather than the file so the rotated `.old` generation is in reach too.
+    // Best-effort, like the log itself: a missing dir or a failed spawn stays silent.
+    let logs_button = button("Open log folder").on_click(|| {
+        if let Some(dir) = crate::logfile::log_dir() {
+            let _ = std::fs::create_dir_all(&dir);
+            let _ = std::process::Command::new("explorer.exe").arg(&dir).spawn();
+        }
+    });
     let library_toggle = setting_toggle(ctx, scope, (rev, set_rev), s.library_enabled, |s, on| {
         s.library_enabled = on
     });
@@ -1065,8 +1148,9 @@ pub(crate) fn settings_page(
                         "HDR10, when the host has HDR content and this display supports it. \
                          HEVC only; otherwise the stream stays SDR.",
                     ),
-                    // Wording shared with the GTK client (its chroma_row) — same setting,
-                    // same constraints.
+                    // First sentence shared with the GTK client (its chroma_row); the
+                    // constraint sentence names the real gate (host: PyroWave || NVENC) —
+                    // "where the host can encode it" cost field users the discovery time.
                     described_overridable(
                         (rev, set_rev),
                         scope,
@@ -1075,7 +1159,8 @@ pub(crate) fn settings_page(
                         over.enable_444,
                         chroma_toggle,
                         "Full-colour video: crisp small text and thin lines, at more \
-                         bandwidth. HEVC only, and only where the host can encode it.",
+                         bandwidth. Requires an NVIDIA host (NVENC) or the PyroWave \
+                         codec \u{2014} other encoders stream 4:2:0.",
                     ),
                 ],
                 None,
@@ -1101,6 +1186,60 @@ pub(crate) fn settings_page(
                              GPU driving this window\u{2019}s display.",
                         ));
                     }
+                    fields
+                },
+                None,
+            ));
+            out.extend(group(
+                Some("Presentation"),
+                {
+                    let mut fields = vec![described_overridable(
+                        (rev, set_rev),
+                        scope,
+                        "present_priority",
+                        "Prioritize",
+                        over.present_priority,
+                        present_combo,
+                        "Lowest latency shows each frame the moment the display can take \
+                         it \u{2014} a network hiccup becomes an occasional repeated or \
+                         skipped frame. Smoothness buffers a little to even those out.",
+                    )];
+                    if smoothing {
+                        fields.push(described_overridable(
+                            (rev, set_rev),
+                            scope,
+                            "smooth_buffer",
+                            "Smoothness buffer",
+                            over.smooth_buffer,
+                            buffer_combo,
+                            "Frames held back before showing. Each one absorbs about a \
+                             refresh of network hiccup and adds a refresh of delay. \
+                             Automatic holds two.",
+                        ));
+                    }
+                    fields.push(described_overridable(
+                        (rev, set_rev),
+                        scope,
+                        "vsync",
+                        "V-Sync",
+                        over.vsync,
+                        vsync_toggle,
+                        "Tear-free. Turning it off removes the wait for the screen\u{2019}s \
+                         refresh \u{2014} the lowest possible delay, at the cost of visible \
+                         tearing. Not every driver offers it; the stats overlay names the \
+                         mode actually in use.",
+                    ));
+                    fields.push(described_overridable(
+                        (rev, set_rev),
+                        scope,
+                        "allow_vrr",
+                        "Follow variable refresh rate",
+                        over.allow_vrr,
+                        vrr_toggle,
+                        "On a VRR/FreeSync/G-Sync screen, let the panel refresh in step with \
+                         the stream instead of on a fixed cadence. Applies to fullscreen \
+                         sessions; harmless on a fixed-refresh screen.",
+                    ));
                     fields
                 },
                 None,
@@ -1223,6 +1362,23 @@ pub(crate) fn settings_page(
                             "Plug in or pair a controller and it appears here.",
                         )
                     }),
+                    // Whether ANY controller is forwarded — profileable, so it renders in
+                    // both scopes (a "Work" profile can decline what "Game" forwards),
+                    // unlike the device-fact picker below it.
+                    Some(described_overridable(
+                        (rev, set_rev),
+                        scope,
+                        "gamepad_forwarding",
+                        "Forward controllers",
+                        over.gamepad_forwarding,
+                        pad_forward_toggle,
+                        "Sends controllers connected to this PC to the host. Turn it off when \
+                         your controller already reaches the host another way \u{2014} USB \
+                         passthrough such as VirtualHere, or a pad plugged into the host \
+                         itself \u{2014} so games don't see two of them. Off, this PC never \
+                         opens the controller at all, which is what leaves it free for a \
+                         passthrough tool to claim.",
+                    )),
                     // NOT Apple's wording: Apple forwards ONE pad as player 1, this client
                     // forwards every controller as its own player. Same picker, different rule.
                     // Which physical pad this device forwards is a device fact (tier G), so it
@@ -1325,7 +1481,16 @@ pub(crate) fn settings_page(
             "About",
             group(
                 None,
-                vec![about_identity.into(), licenses_button.into()],
+                vec![
+                    about_identity.into(),
+                    described_labeled(
+                        "Diagnostics",
+                        logs_button,
+                        "The client log (client.log, plus the session\u{2019}s whole \
+                         receive/decode/present trail) \u{2014} attach it to a bug report.",
+                    ),
+                    licenses_button.into(),
+                ],
                 None,
             ),
         ),
@@ -1727,5 +1892,26 @@ mod tests {
         let f3 = OverrideFlags::of(Some(&p3));
         assert!(f3.echo_cancel);
         assert!(!f3.mic_enabled);
+
+        // The presentation pair, likewise independent: pinning the intent doesn't claim
+        // the buffer (a "Smoothness, whatever the global buffer is" profile is valid).
+        let mut p4 = StreamProfile::new("t4".to_string());
+        p4.overrides = SettingsOverlay {
+            present_priority: Some("smooth".into()),
+            ..Default::default()
+        };
+        let f4 = OverrideFlags::of(Some(&p4));
+        assert!(f4.present_priority);
+        assert!(!f4.smooth_buffer);
+
+        // V-Sync and VRR are independent of each other and of the intent pair.
+        let mut p5 = StreamProfile::new("t5".to_string());
+        p5.overrides = SettingsOverlay {
+            vsync: Some(false),
+            ..Default::default()
+        };
+        let f5 = OverrideFlags::of(Some(&p5));
+        assert!(f5.vsync);
+        assert!(!f5.allow_vrr && !f5.present_priority);
     }
 }

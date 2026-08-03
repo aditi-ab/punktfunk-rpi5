@@ -33,6 +33,10 @@ pub(crate) struct VulkanDecoder {
     /// (resolved through the same get_proc_addr chain FFmpeg uses).
     wait_semaphores: pf_ffvk::PFN_vkWaitSemaphores,
     vk_device: pf_ffvk::VkDevice,
+    /// The selected decoder's registry name (`(*codec).name`) — `"av1"` vs `"libdav1d"`
+    /// is the difference between hardware decode and a silent CPU fallback, so every
+    /// log a field report leans on carries it.
+    name: String,
     /// Storage `AVVulkanDeviceContext` points into (extension string arrays + the
     /// feature chain) — FFmpeg reads the extension lists past init (frames-context
     /// setup keys code paths off them), so this lives exactly as long as `hw_device`.
@@ -245,10 +249,15 @@ impl VulkanDecoder {
             }
             let vk_device = (*hwctx).act_dev;
 
-            let codec = ffi::avcodec_find_decoder(codec_id.into());
-            if codec.is_null() {
-                bail!("no {codec_id:?} decoder");
-            }
+            // NOT `avcodec_find_decoder`: the ID lookup returns the registry's FIRST
+            // decoder, and for AV1 that is libdav1d (upstream orders the hwaccel-only
+            // native decoder last) — a software decoder that silently ignores
+            // `hw_device_ctx` and fails every frame's Vulkan-format guard mid-stream.
+            // Select by capability instead: the first decoder that can drive
+            // AV_PIX_FMT_VULKAN via hw_device_ctx, or fail here at open.
+            let codec =
+                crate::video::find_hw_decoder(codec_id, ffi::AVPixelFormat::AV_PIX_FMT_VULKAN)?;
+            let name = crate::video::codec_name(codec);
             let ctx = ffi::avcodec_alloc_context3(codec);
             (*ctx).hw_device_ctx = ffi::av_buffer_ref(hw_device.as_ptr());
             (*ctx).get_format = Some(pick_vulkan);
@@ -270,9 +279,15 @@ impl VulkanDecoder {
                 frame: ffi::av_frame_alloc(),
                 wait_semaphores,
                 vk_device,
+                name,
                 _ctx_storage: store,
             })
         }
+    }
+
+    /// The selected decoder's registry name (e.g. `"av1"`) — see the field doc.
+    pub(crate) fn name(&self) -> &str {
+        &self.name
     }
 
     pub(crate) fn decode(&mut self, au: &[u8]) -> Result<Option<VkVideoFrame>> {
@@ -388,6 +403,7 @@ impl VulkanDecoder {
                 (*fc).width,
                 (*fc).height,
                 sw,
+                &self.name,
             );
             Ok(VkVideoFrame {
                 vkframe: vkf as usize,
@@ -423,6 +439,7 @@ fn log_layout_once(
     pool_w: i32,
     pool_h: i32,
     sw: ffmpeg::ffi::AVPixelFormat,
+    decoder: &str,
 ) {
     use std::sync::atomic::{AtomicBool, Ordering};
     static ONCE: AtomicBool = AtomicBool::new(true);
@@ -433,6 +450,7 @@ fn log_layout_once(
             pool_w,
             pool_h,
             ?sw,
+            decoder,
             "Vulkan Video first frame"
         );
     }

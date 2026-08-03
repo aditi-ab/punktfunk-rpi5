@@ -33,7 +33,24 @@ import java.util.concurrent.ConcurrentHashMap
  * InputManager hot-plug callbacks both land there). [deviceForPad] is read from the feedback poll
  * threads, so the slot table is a [ConcurrentHashMap].
  */
-class GamepadRouter(context: Context, private val handle: Long, private val setting: Int) {
+class GamepadRouter(
+    context: Context,
+    private val handle: Long,
+    private val setting: Int,
+    /**
+     * Forward this device's controllers to the host at all (`Settings.gamepadForwarding`,
+     * default true). Off is for a couch whose controller reaches the host another way — USB
+     * passthrough such as VirtualHere, or a pad plugged into the host itself — where forwarding
+     * as well would give the host two pads for one pair of hands.
+     *
+     * Off still opens slots and tracks held state; it only stops the wire sends. That is
+     * deliberate: the exit and mic chords are read off the same slots, and a couch that lost its
+     * quit shortcut because a forwarding preference was off would be the worse bug. Nothing is
+     * claimed by keeping a slot — the Android input stack shares controllers — unlike the USB
+     * capture links, which `StreamScreen` does not start at all while this is off.
+     */
+    private val forwarding: Boolean = true,
+) {
 
     /** One forwarded controller: its stable wire pad index, per-device axis state, and held buttons. */
     private class Slot(val index: Int, val mapper: Gamepad.AxisMapper) {
@@ -123,7 +140,9 @@ class GamepadRouter(context: Context, private val handle: Long, private val sett
      */
     private fun slotButton(slot: Slot, bit: Int, down: Boolean, send: Boolean) {
         if (down) {
-            if (send) NativeBridge.nativeSendGamepadButton(handle, bit, true, slot.index)
+            if (send && forwarding) {
+                NativeBridge.nativeSendGamepadButton(handle, bit, true, slot.index)
+            }
             val wasHeld = slot.held
             slot.held = slot.held or bit
             // Full chord now held on this pad → start the hold countdown (idempotent while held).
@@ -136,7 +155,9 @@ class GamepadRouter(context: Context, private val handle: Long, private val sett
                 onMicChord?.invoke()
             }
         } else {
-            if (send) NativeBridge.nativeSendGamepadButton(handle, bit, false, slot.index)
+            if (send && forwarding) {
+                NativeBridge.nativeSendGamepadButton(handle, bit, false, slot.index)
+            }
             slot.held = slot.held and bit.inv()
             // A chord button lifted before the hold elapsed → cancel, unless another pad still
             // holds the full chord.
@@ -186,7 +207,7 @@ class GamepadRouter(context: Context, private val handle: Long, private val sett
         val dev = event.device ?: return false
         if (!isForwardable(dev)) return false
         val slot = slotFor(dev) ?: return false
-        slot.mapper.onMotion(event)
+        if (forwarding) slot.mapper.onMotion(event)
         return true
     }
 
@@ -221,24 +242,26 @@ class GamepadRouter(context: Context, private val handle: Long, private val sett
 
         /** One axis update ([Gamepad].AXIS_*: stick i16 +y=up / trigger 0..255). On-change only. */
         fun axis(id: Int, value: Int) {
-            if (slot != null) NativeBridge.nativeSendGamepadAxis(handle, id, value, index)
+            if (slot != null && forwarding) NativeBridge.nativeSendGamepadAxis(handle, id, value, index)
         }
 
         /** One raw HID report, forwarded verbatim for the host's as-is virtual pad. */
         fun hidReport(buf: java.nio.ByteBuffer, len: Int) {
-            if (slot != null) NativeBridge.nativeSendPadHidReport(handle, index, buf, len)
+            if (slot != null && forwarding) NativeBridge.nativeSendPadHidReport(handle, index, buf, len)
         }
 
         /** One touchpad contact on the rich plane: [finger] 0/1, x/y normalized 0..65535 in
          *  SCREEN convention (+y down); `active = false` lifts the finger. On-change only. */
         fun touch(finger: Int, active: Boolean, x: Int, y: Int) {
-            if (slot != null) NativeBridge.nativeSendPadTouch(handle, index, finger, active, x, y)
+            if (slot != null && forwarding) {
+                NativeBridge.nativeSendPadTouch(handle, index, finger, active, x, y)
+            }
         }
 
         /** One motion sample on the rich plane (gyro pitch/yaw/roll + accel, raw device i16
          *  units — the host passes them straight into the virtual pad's report). Per report. */
         fun motion(gyro: IntArray, accel: IntArray) {
-            if (slot != null) {
+            if (slot != null && forwarding) {
                 NativeBridge.nativeSendPadMotion(
                     handle, index,
                     gyro[0], gyro[1], gyro[2],
@@ -260,7 +283,7 @@ class GamepadRouter(context: Context, private val handle: Long, private val sett
         // Synthetic ids live below any real InputDevice id (those are positive), so they can't
         // collide and InputDevice.getDevice(id) resolves them to null for the feedback path.
         val syntheticId = EXTERNAL_ID_BASE - index
-        NativeBridge.nativeSendGamepadArrival(handle, pref, index)
+        if (forwarding) NativeBridge.nativeSendGamepadArrival(handle, pref, index)
         slots[syntheticId] = Slot(index, Gamepad.AxisMapper(handle, index))
         return ExternalPad(syntheticId, index)
     }
@@ -317,7 +340,7 @@ class GamepadRouter(context: Context, private val handle: Long, private val sett
         // Automatic resolves the pad's type from its VID/PID; an explicit setting forces every pad
         // to that type (a single global choice — matches the handshake's session-default pref).
         val pref = if (setting == Gamepad.PREF_AUTO) Gamepad.prefFor(dev) else setting
-        NativeBridge.nativeSendGamepadArrival(handle, pref, index)
+        if (forwarding) NativeBridge.nativeSendGamepadArrival(handle, pref, index)
         val slot = Slot(index, Gamepad.AxisMapper(handle, index))
         slots[dev.id] = slot
         return slot
@@ -330,7 +353,7 @@ class GamepadRouter(context: Context, private val handle: Long, private val sett
     private fun closeSlot(deviceId: Int) {
         val slot = slots.remove(deviceId) ?: return
         releaseHeld(slot)
-        NativeBridge.nativeSendGamepadRemove(handle, slot.index)
+        if (forwarding) NativeBridge.nativeSendGamepadRemove(handle, slot.index)
         // If this pad was mid-exit-chord, its removal may have left no pad holding it — drop the timer.
         if (slots.values.none { it.held and EXIT_CHORD == EXIT_CHORD }) disarmExit()
         // Release this controller's feedback bindings (close its lights session / cancel rumble).
@@ -342,11 +365,11 @@ class GamepadRouter(context: Context, private val handle: Long, private val sett
         var bits = slot.held
         while (bits != 0) {
             val bit = bits and -bits // lowest set bit
-            NativeBridge.nativeSendGamepadButton(handle, bit, false, slot.index)
+            if (forwarding) NativeBridge.nativeSendGamepadButton(handle, bit, false, slot.index)
             bits = bits and bit.inv()
         }
         slot.held = 0
-        slot.mapper.reset() // zero sticks/triggers + release the HAT dpad
+        if (forwarding) slot.mapper.reset() // zero sticks/triggers + release the HAT dpad
     }
 
     /** Lowest wire index 0..[MAX_PADS) not held by a slot, or null when full — stable lowest-free keeps indices from shuffling on hot-plug. */

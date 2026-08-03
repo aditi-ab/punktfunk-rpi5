@@ -22,6 +22,7 @@
 // plugin store (crates/punktfunk-host/src/store), which installs one reviewed version of a
 // package that may live on somebody else's registry — but they are ordinary CLI flags too.
 import { Effect, Fiber } from "effect";
+import { installLogShipper } from "./log-ship.js";
 import { addPlugins, listInstalled, removePlugins } from "./plugins.js";
 import { discoverUnits, runner } from "./runner.js";
 
@@ -157,16 +158,30 @@ if (process.argv.includes("--list")) {
 // nothing at all: field report 2026-07-25 had it pinning a full core indefinitely, `strace`
 // showing a bare `clock_gettime` loop and nothing else. One idle handle is the whole fix.
 const keepAlive = setInterval(() => {}, 2 ** 31 - 1);
+
+// Tee this process's output to the host so the console's Logs page can show it. Installed HERE and
+// not in `runner.ts`, so it covers the supervised run only: a plugin's own CLI builds the same
+// layer graph, and an operator running `punktfunk-plugin-x doctor` in their terminal is not asking
+// to write into the host's log. Must be installed before the runner starts — the lines that explain
+// a plugin failing to load are the first ones out.
+const shipper = installLogShipper();
+
 const fiber = Effect.runFork(runner(options));
 let stopping = false;
 const shutdown = (signal: string) => {
 	if (stopping) return process.exit(1); // second signal = get out now
 	stopping = true;
 	console.log(`${new Date().toISOString()} [runner] ${signal} — interrupting units…`);
-	void Effect.runPromise(Fiber.interrupt(fiber)).finally(() => process.exit(0));
+	void Effect.runPromise(Fiber.interrupt(fiber))
+		// Ship what the finalizers just said before the process goes away — a clean shutdown's
+		// last lines are the ones that tell you whether it WAS clean.
+		.finally(() => shipper.flush())
+		.finally(() => process.exit(0));
 };
 process.on("SIGINT", () => shutdown("SIGINT"));
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 
 await Effect.runPromise(Fiber.await(fiber));
-clearInterval(keepAlive); // every unit ended on its own — let the process exit
+await shipper.flush(); // every unit ended on its own — don't leave their last lines unsent
+shipper.stop();
+clearInterval(keepAlive); // …then let the process exit

@@ -14,6 +14,7 @@ use anyhow::{anyhow, Context, Result};
 use punktfunk_core::client::NativeClient;
 use punktfunk_core::quic::endpoint;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 pub fn config_dir() -> Result<PathBuf> {
@@ -787,6 +788,45 @@ impl MouseMode {
     }
 }
 
+/// Presentation intent — what the presenter optimizes for
+/// (design/desktop-presentation-rebuild.md; the Apple/Android clients' shared
+/// `present_priority`/`smooth_buffer` pair). Stored stringly in
+/// [`Settings::present_priority`] + [`Settings::smooth_buffer`]; resolved with
+/// [`PresentPriority::resolve`], whose rules match the Android reference
+/// (`decode/presenter.rs`): anything but an explicit `"smooth"` is latency, and a
+/// smooth buffer outside 1..=3 (including 0 = Automatic) becomes 2.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PresentPriority {
+    /// Every frame presents the moment the display can take it; a network hiccup is an
+    /// occasional repeated or skipped frame. The default.
+    Latency,
+    /// A small frame buffer (1–3 frames) evens out network/decode jitter, at the
+    /// buffer's worth of added display latency.
+    Smooth { buffer: u8 },
+}
+
+impl PresentPriority {
+    /// The shared cross-client resolution rule — pure, so every embedder agrees on what
+    /// a foreign profile's values mean.
+    pub fn resolve(name: &str, buffer: u8) -> PresentPriority {
+        if name == "smooth" {
+            PresentPriority::Smooth {
+                buffer: if (1..=3).contains(&buffer) { buffer } else { 2 },
+            }
+        } else {
+            PresentPriority::Latency
+        }
+    }
+
+    /// Frames the smoothing store holds; `0` = newest-wins (the latency intent).
+    pub fn fifo_capacity(self) -> u8 {
+        match self {
+            PresentPriority::Latency => 0,
+            PresentPriority::Smooth { buffer } => buffer,
+        }
+    }
+}
+
 /// App settings, persisted as JSON. Stringly-typed gamepad/compositor prefs so the file
 /// stays readable; parsed with `*Pref::from_name` at connect time.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -808,6 +848,21 @@ pub struct Settings {
     /// container `#[serde(default)]`.
     pub render_scale: f64,
     pub gamepad: String,
+    /// Forward this device's controllers to the host at all. Default ON — that was the
+    /// unconditional behaviour before this became a setting.
+    ///
+    /// Off is for the couch whose controller reaches the host by some *other* route: a USB
+    /// passthrough tool (VirtualHere and friends), or a pad simply plugged into the host
+    /// itself. Leaving forwarding on there gives the host two controllers for one pair of
+    /// hands, and games read both.
+    ///
+    /// It is deliberately stronger than "send no input": with it off the client never
+    /// *opens* the controller, and opening is what grabs the hardware (SDL's HIDAPI drivers
+    /// take the hidraw node) — a held device is one a passthrough tool cannot bind. Menu
+    /// navigation in the launcher still opens the active pad, and the session releases it;
+    /// see [`crate::gamepad::GamepadService::set_forwarding`].
+    #[serde(default = "default_true")]
+    pub gamepad_forwarding: bool,
     /// Stable identity (`vid:pid:name`, see `PadInfo::key`) of the physical controller
     /// forwarded as pad 0; empty = automatic (most recently connected). Applied to the
     /// gamepad service at startup so the choice survives restarts.
@@ -874,6 +929,32 @@ pub struct Settings {
     /// `default = true`: the Linux stores never carried this and always advertised.
     #[serde(default = "default_true")]
     pub hdr_enabled: bool,
+    /// Presentation intent: `"latency"` (default) or `"smooth"` — the Apple/Android
+    /// clients' shared `present_priority` profile key, resolved with
+    /// [`PresentPriority::resolve`] (via [`Settings::present_priority`]). Anything
+    /// unknown reads as latency, so a newer client's future value degrades safely.
+    #[serde(default = "default_present_priority")]
+    pub present_priority: String,
+    /// Smoothness buffer size in frames: `0` = Automatic (resolves to 2), else 1–3.
+    /// Only meaningful under `present_priority = "smooth"` (the shared `smooth_buffer`
+    /// key). Each buffered frame absorbs about one refresh of jitter and adds one
+    /// refresh of display latency.
+    #[serde(default)]
+    pub smooth_buffer: u8,
+    /// Tear-free presentation (default ON = today's behavior: MAILBOX, FIFO fallback).
+    /// Off asks for a tearing present mode (IMMEDIATE) for the lowest possible latch
+    /// latency — best-effort: platforms/drivers without tearing silently stay tear-free
+    /// and the active mode is visible in the detailed stats. The shared `vsync` profile
+    /// key; the desktop default differs from macOS's (`false` there) deliberately —
+    /// sync-off means something different on each platform, the key is the contract.
+    #[serde(default = "default_true")]
+    pub vsync: bool,
+    /// Let a variable-refresh display follow the stream cadence: prefers the present
+    /// mode that drives VRR panels directly when fullscreen. Inert on fixed-refresh
+    /// displays (detection is measured from on-glass timestamps, not queried). The
+    /// shared `allow_vrr` profile key. Default ON, like the Apple client.
+    #[serde(default = "default_true")]
+    pub allow_vrr: bool,
     /// Legacy on/off for the stats overlay — superseded by `stats_verbosity` but kept
     /// written in sync (`set_stats_verbosity`) so pre-tier binaries reading the same
     /// file keep working. `alias`: the pre-unification WinUI shell (≤ 0.8.4) persisted
@@ -940,6 +1021,14 @@ pub struct Settings {
     /// the user will be looking at. `0` = never stored → the 1280×720 default.
     pub last_window_w: u32,
     pub last_window_h: u32,
+    /// Settings keys this build doesn't model (a newer client's field), carried through a
+    /// load→save round-trip untouched — [`crate::profiles::SettingsOverlay`]'s `extra`
+    /// pattern extended to the globals. Without it, every whole-file writer of this store
+    /// (two shells, the console settings screen, the session's resize callback, Decky)
+    /// running as an OLDER binary silently drops what a newer one persisted. Empty on
+    /// every existing store, and an empty map serializes to nothing, so files don't churn.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
 }
 
 fn default_codec() -> String {
@@ -952,6 +1041,10 @@ fn default_touch_mode() -> String {
 
 fn default_mouse_mode() -> String {
     "capture".into()
+}
+
+fn default_present_priority() -> String {
+    "latency".into()
 }
 
 fn default_true() -> bool {
@@ -989,6 +1082,12 @@ impl Settings {
         MouseMode::from_name(&self.mouse_mode)
     }
 
+    /// The presentation intent for this session (the resolved
+    /// `present_priority` × `smooth_buffer` pair).
+    pub fn present_priority(&self) -> PresentPriority {
+        PresentPriority::resolve(&self.present_priority, self.smooth_buffer)
+    }
+
     /// The `codec` setting as a `quic::CODEC_*` preference bit (`0` = auto).
     pub fn preferred_codec(&self) -> u8 {
         match self.codec.as_str() {
@@ -1013,6 +1112,7 @@ impl Default for Settings {
             bitrate_kbps: 0,
             render_scale: 1.0,
             gamepad: "auto".into(),
+            gamepad_forwarding: true,
             forward_pad: String::new(),
             compositor: "auto".into(),
             touch_mode: "trackpad".into(),
@@ -1026,6 +1126,10 @@ impl Default for Settings {
             adapter: String::new(),
             enable_444: false,
             hdr_enabled: true,
+            present_priority: "latency".into(),
+            smooth_buffer: 0,
+            vsync: true,
+            allow_vrr: true,
             show_stats: true,
             stats_verbosity: None,
             fullscreen_on_stream: true,
@@ -1039,6 +1143,7 @@ impl Default for Settings {
             match_window: false,
             last_window_w: 0,
             last_window_h: 0,
+            extra: BTreeMap::new(),
         }
     }
 }
@@ -1165,6 +1270,43 @@ mod tests {
         }
     }
 
+    /// A settings file predating the presentation cluster loads with the shipped
+    /// defaults (latency intent, Automatic buffer, tear-free, VRR allowed), and the
+    /// resolution rules match the Apple/Android reference: anything but an explicit
+    /// `"smooth"` is latency, and a smooth buffer outside 1..=3 becomes 2.
+    #[test]
+    fn settings_presentation_defaults_and_resolution() {
+        let old = r#"{"width":1280,"height":720,"gamepad":"auto","compositor":"auto"}"#;
+        let s: Settings = serde_json::from_str(old).unwrap();
+        assert_eq!(s.present_priority, "latency");
+        assert_eq!(s.smooth_buffer, 0);
+        assert!(s.vsync);
+        assert!(s.allow_vrr);
+        assert_eq!(s.present_priority(), PresentPriority::Latency);
+
+        assert_eq!(
+            PresentPriority::resolve("smooth", 0),
+            PresentPriority::Smooth { buffer: 2 },
+            "Automatic resolves to 2"
+        );
+        assert_eq!(
+            PresentPriority::resolve("smooth", 3),
+            PresentPriority::Smooth { buffer: 3 }
+        );
+        assert_eq!(
+            PresentPriority::resolve("smooth", 9),
+            PresentPriority::Smooth { buffer: 2 },
+            "out-of-range pins to the Automatic resolution"
+        );
+        assert_eq!(
+            PresentPriority::resolve("balanced-from-the-future", 2),
+            PresentPriority::Latency,
+            "unknown intents degrade to latency"
+        );
+        assert_eq!(PresentPriority::Latency.fifo_capacity(), 0);
+        assert_eq!(PresentPriority::Smooth { buffer: 3 }.fifo_capacity(), 3);
+    }
+
     /// A pre-`forward_pad` settings file (≤ 0.5.0) loads with the pin on automatic.
     #[test]
     fn settings_forward_pad_defaults_empty() {
@@ -1211,6 +1353,28 @@ mod tests {
         // Echo cancellation post-dates every stored file: it must load ON, or an upgrade
         // would silently turn a user's echo protection off.
         assert!(s.echo_cancel);
+    }
+
+    /// A key this build doesn't model (a newer client's setting) survives a load→save
+    /// round trip instead of being dropped by the next whole-file write — the same
+    /// contract `SettingsOverlay.extra` gives profiles. And when there are no unknown
+    /// keys, the flatten map adds nothing, so existing files don't churn.
+    #[test]
+    fn settings_unknown_keys_survive_round_trip() {
+        let newer = r#"{"width":1920,"height":1080,"frob_mode":"fancy","frob_level":3}"#;
+        let s: Settings = serde_json::from_str(newer).unwrap();
+        assert_eq!((s.width, s.height), (1920, 1080));
+        assert_eq!(
+            s.extra.get("frob_mode").and_then(|v| v.as_str()),
+            Some("fancy")
+        );
+        let out = serde_json::to_string(&s).unwrap();
+        assert!(out.contains(r#""frob_mode":"fancy""#), "{out}");
+        assert!(out.contains(r#""frob_level":3"#), "{out}");
+        // No unknown keys → no artifact of the passthrough field in the file.
+        let plain = serde_json::to_string(&Settings::default()).unwrap();
+        assert!(!plain.contains("extra"), "{plain}");
+        assert!(!plain.contains("frob"), "{plain}");
     }
 
     /// Stats-tier resolution: a pre-tier store falls back to `show_stats` (off → Off,

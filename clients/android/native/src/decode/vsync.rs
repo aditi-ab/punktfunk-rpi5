@@ -58,8 +58,10 @@ pub(super) struct VsyncShared {
     /// video to THIS rate would cap the stream — hence `panel_period_ns` + the subdivision in
     /// [`Self::next_target`].
     period_ns: AtomicI64,
-    /// The panel's own refresh period (from the display mode Kotlin resolved at stream start;
-    /// 0 = unknown). The grid SurfaceFlinger actually latches on.
+    /// The panel's own refresh period — the grid SurfaceFlinger actually latches on (0 = unknown).
+    /// Seeded from the display mode Kotlin resolved at stream start and then corrected by
+    /// measurement; the learner itself is [`punktfunk_core::phase::PanelGrid`], owned by the
+    /// choreographer thread (see [`CallbackCtx::panel`]) and published here for the decode loop.
     panel_period_ns: AtomicI64,
     /// Callback count, for the one-shot cadence diagnostic log.
     ticks: std::sync::atomic::AtomicU32,
@@ -231,6 +233,11 @@ struct CallbackCtx {
     choreographer: *mut c_void,
     shared: Arc<VsyncShared>,
     on_tick: Box<dyn Fn() + Send>,
+    /// The panel-period learner. `Cell` rather than an atomic because it is touched from exactly
+    /// one thread — callbacks only ever fire inside this thread's looper poll (see the struct
+    /// doc) — and its streak state is nobody else's business; only the settled period is
+    /// published, to `shared.panel_period_ns`.
+    panel: std::cell::Cell<punktfunk_core::phase::PanelGrid>,
 }
 
 impl CallbackCtx {
@@ -240,22 +247,25 @@ impl CallbackCtx {
             .shared
             .last_vsync_ns
             .swap(frame_time_ns, Ordering::Relaxed);
-        // Panel-grid learner: timeline spacing is SurfaceFlinger's own grid, and the finest
-        // spacing ever observed is the panel's true period — trustworthy where the configured
-        // value is not (under a per-uid frame-rate override, `Display.getRefreshRate` REPORTS
-        // THE OVERRIDE, observed on-glass: a 120 Hz panel read back as 60 while early timelines
-        // ran at 8.28 ms). Corrects DOWNWARD only: subdividing onto a finer real grid is always
-        // valid, widening on a later down-rated window never is.
+        // Panel-grid learner: timeline spacing is SurfaceFlinger's own grid, and therefore the
+        // only honest witness to what the panel is doing — the configured mode is not (under a
+        // per-uid frame-rate override `Display.getRefreshRate` REPORTS THE OVERRIDE, observed
+        // on-glass: a 120 Hz panel read back as 60 while its timelines ran at 8.28 ms), and
+        // neither is the mode Kotlin *requested* (`preferredDisplayModeId` is a hint the system
+        // may refuse). Both directions matter and the asymmetry lives in `PanelGrid`.
         if timelines.len() >= 2 {
             let spacing = timelines[1].expected_present_ns - timelines[0].expected_present_ns;
-            if (2_000_000..=42_000_000).contains(&spacing) {
-                let cur = self.shared.panel_period_ns.load(Ordering::Relaxed);
-                if cur == 0 || spacing < cur - 200_000 {
-                    self.shared
-                        .panel_period_ns
-                        .store(spacing, Ordering::Relaxed);
-                }
+            let mut grid = self.panel.get();
+            if grid.observe(spacing) {
+                self.shared
+                    .panel_period_ns
+                    .store(grid.period_ns(), Ordering::Relaxed);
+                log::info!(
+                    "vsync: panel grid now {:.2}ms",
+                    grid.period_ns() as f64 / 1e6
+                );
             }
+            self.panel.set(grid);
         }
         // One-shot cadence diagnostic (3rd tick, once deltas exist): the callback cadence vs the
         // panel period is exactly the down-rating question, and this line answers it on-glass.
@@ -372,8 +382,9 @@ pub(super) struct VsyncClock {
 impl VsyncClock {
     /// Spawn the choreographer thread. `on_tick` fires once per vsync ON THAT THREAD — it must
     /// only do something cheap and `Send` (the decode loop passes an event-channel send).
-    /// `panel_hz` is the display mode's own refresh rate (0 = unknown), the latch grid that
-    /// [`VsyncShared::next_target`] subdivides onto. `None` when the platform surface is missing
+    /// `panel_hz` SEEDS the panel-grid learner (0 = unknown) — the latch grid that
+    /// [`VsyncShared::next_target`] subdivides onto. A seed, not a fact: it names the display
+    /// mode Kotlin *requested*, and the observed timeline spacing is what settles it. `None` when the platform surface is missing
     /// (very old device) — the presenter then runs clock-less (ASAP targets, predicted-latch
     /// budget).
     pub(super) fn start(panel_hz: i32, on_tick: Box<dyn Fn() + Send>) -> Option<VsyncClock> {
@@ -383,11 +394,9 @@ impl VsyncClock {
             stop: AtomicBool::new(false),
             last_vsync_ns: AtomicI64::new(0),
             period_ns: AtomicI64::new(0),
-            panel_period_ns: AtomicI64::new(if panel_hz > 0 {
-                1_000_000_000 / panel_hz as i64
-            } else {
-                0
-            }),
+            panel_period_ns: AtomicI64::new(
+                punktfunk_core::phase::PanelGrid::seeded(panel_hz).period_ns(),
+            ),
             ticks: std::sync::atomic::AtomicU32::new(0),
             timelines: Mutex::new(Vec::new()),
         });
@@ -408,6 +417,7 @@ impl VsyncClock {
                     choreographer,
                     shared: thread_shared,
                     on_tick,
+                    panel: std::cell::Cell::new(punktfunk_core::phase::PanelGrid::seeded(panel_hz)),
                 };
                 ctx.repost();
                 // The bounded poll doubles as the stop check: no cross-thread wake needed, worst

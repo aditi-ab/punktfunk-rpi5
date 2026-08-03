@@ -34,6 +34,12 @@ impl SoftwareDecoder {
             (*raw).thread_count = 0; // auto
         }
         let decoder = ctx.decoder().video().context("open video decoder")?;
+        // Every construction site (session open, preference, mid-stream demotion) says
+        // which decoder actually opened: for AV1 the ID lookup means libdav1d here —
+        // deliberately (fastest CPU path; the native `av1` decoder has no software
+        // path at all) — and the name in the log is what keeps that distinguishable
+        // from the hardware lanes' capability-selected decoders.
+        tracing::info!(?codec_id, decoder = codec.name(), "software decoder opened");
         Ok(SoftwareDecoder { decoder, sws: None })
     }
 

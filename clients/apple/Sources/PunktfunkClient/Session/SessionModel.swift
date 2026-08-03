@@ -672,7 +672,11 @@ final class SessionModel: ObservableObject {
         // back to the pad it's addressed to (rumble always; lightbar/player-LEDs/adaptive-triggers
         // when a pad's virtual device is a DualSense). Same trust gate as audio — nothing is
         // forwarded during the trust prompt.
-        let capture = GamepadCapture(connection: conn, manager: .shared)
+        // `gamepadForwarding` off means the host gets this device's pads from somewhere else
+        // (USB passthrough, or a pad plugged into the host) — capture still runs, and still
+        // watches for the escape chord, but puts nothing on the wire.
+        let capture = GamepadCapture(
+            connection: conn, manager: .shared, forwarding: settings.gamepadForwarding)
         // The cross-client escape chord (hold L1+R1+Start+Select 1.5 s) — on tvOS the only
         // controller way out of a stream (B/Menu is swallowed during sessions; see ContentView).
         capture.onDisconnectRequest = { [weak self] in self?.disconnect() }

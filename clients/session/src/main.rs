@@ -188,6 +188,12 @@ mod session_main {
         if !settings.forward_pad.is_empty() {
             gamepad.set_pinned(Some(settings.forward_pad.clone()));
         }
+        // Whether to forward controllers AT ALL (off = the pad reaches the host by some other
+        // route — VirtualHere and friends). Set unconditionally, not only when off: browse mode
+        // reuses one service across launches, so a stream that follows one with it off must put
+        // it back. It goes on before the attach below, so a non-forwarding session never opens
+        // — never grabs — the device.
+        gamepad.set_forwarding(settings.gamepad_forwarding);
         // Pad-audio prefs to OUR gamepad service (same reasoning as the pin above): tier-A
         // slots declare their render caps at open time, which happens on attach — after this.
         gamepad.set_pad_audio_prefs(
@@ -628,6 +634,9 @@ mod session_main {
             mouse_mode: settings.mouse_mode(),
             invert_scroll: settings.invert_scroll,
             inhibit_shortcuts: settings.inhibit_shortcuts,
+            present_priority: settings.present_priority(),
+            vsync: settings.vsync,
+            allow_vrr: settings.allow_vrr,
             json_status: true,
             on_connected: Some(Box::new(|fingerprint: [u8; 32]| {
                 // This host's card carries the accent bar in the desktop client now.

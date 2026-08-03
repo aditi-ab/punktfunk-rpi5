@@ -218,6 +218,18 @@ impl Session {
         self.stats.snapshot()
     }
 
+    /// Re-arm the probe-scoped arrival stamps (see [`Stats::probe_first_arrival_ns`]): zero
+    /// them so the NEXT burst's first packet claims the first-arrival slot. Called by the
+    /// client pump when it arms a probe, strictly before the burst can have reached the host
+    /// (the `ProbeRequest` is still queued locally) — so the reset cannot race a probe packet.
+    /// The cumulative probe byte/packet counters are left alone: per-burst deltas come from
+    /// base snapshots, the same pattern the total counters use.
+    pub fn reset_probe_arrivals(&self) {
+        let l = std::sync::atomic::Ordering::Relaxed;
+        self.stats.probe_first_arrival_ns.store(0, l);
+        self.stats.probe_last_arrival_ns.store(0, l);
+    }
+
     /// Wrap a packet for the wire: when encrypting, prepend the 8-byte big-endian
     /// sequence (the receiver derives the GCM nonce from it) then the ciphertext.
     /// Seal one plaintext packet into the reused `wire` buffer in place (no allocation): the wire is

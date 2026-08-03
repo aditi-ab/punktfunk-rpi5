@@ -112,6 +112,34 @@ const POLL_MS: i32 = 100;
 /// asked — matches `kwin::CVT_H_GRANULARITY`. Used when matching the generated mode back.
 const CVT_H_GRANULARITY: u32 = 8;
 
+/// `kde_output_management_v2.set_replication_source` (and the device's `replication_source` event)
+/// arrived in v13. wayland-rs does not range-check requests, so sending one to a lower-version bind
+/// would be a protocol error that kills the connection — every call site gates on this.
+const REPLICATION_SOURCE_SINCE: u32 = 13;
+
+/// The `source` value that means "this output mirrors nothing" — KWin's `applyMirroring` looks the
+/// source UUID up among the enabled outputs and treats an EMPTY string as no replication at all.
+const NO_REPLICATION_SOURCE: &str = "";
+
+/// Is this output currently a MIRROR of another one?
+///
+/// KWin persists output config per *setup* — the exact set of connected outputs, matched by
+/// EDID/connector — in `kwinoutputconfig.json`, and `replicationSource` is one of the fields it
+/// stores and restores (`OutputConfigurationStore::storeConfig` / `setupToConfig`). Our virtual
+/// output carries a STABLE name across sessions (that is deliberate — KWin keys per-output scale by
+/// it), so a stored `replicationSource` for that name is re-applied to OUR output on every session
+/// that reproduces the same monitor set. The output then shows the source's viewport instead of
+/// being its own desktop, which is the whole point of creating it — and per the protocol's own note
+/// on `priority`, "an output may not be in the output order if it's disabled **or mirroring another
+/// screen**", so the primary assertion silently stops meaning anything too.
+///
+/// The event carries an empty string for the ordinary case, so `Some("")` must read as "not
+/// mirroring" — treating the mere presence of the event as a mirror would de-mirror every output on
+/// every apply.
+fn is_mirroring(replication_source: Option<&str>) -> bool {
+    replication_source.is_some_and(|s| !s.is_empty())
+}
+
 /// Which topology to apply once our output is resolved.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TopologyKind {
@@ -154,6 +182,9 @@ struct DeviceState {
     scale: Option<f64>,
     /// KWin's output priority; 1 is the primary. `None` until the `priority` event (device ≥ v18).
     priority: Option<u32>,
+    /// UUID of the output this one MIRRORS, from the `replication_source` event (device ≥ v13).
+    /// Empty / `None` ⇒ it is its own desktop. See [`is_mirroring`] for why this matters to us.
+    replication_source: Option<String>,
     /// The `current_mode` object id; its size is looked up in [`State::mode_dims`].
     current_mode: Option<ObjectId>,
     /// Every mode this output advertised, in announce order — `(mode object id, proxy)` — so restore
@@ -307,6 +338,7 @@ impl Dispatch<OutputDevice, u32> for State {
             DeviceEvent::Scale { factor } => entry.scale = Some(factor),
             DeviceEvent::Enabled { enabled } => entry.enabled = enabled != 0,
             DeviceEvent::Priority { priority } => entry.priority = Some(priority),
+            DeviceEvent::ReplicationSource { source } => entry.replication_source = Some(source),
             DeviceEvent::CurrentMode { mode } => entry.current_mode = Some(mode.id()),
             DeviceEvent::Mode { mode } => entry.modes.push((mode.id(), mode)),
             DeviceEvent::Done => entry.seen_done = true,
@@ -626,6 +658,17 @@ pub(crate) fn apply_topology(
     };
     let our_uuid = ours.uuid.clone();
     let our_id = ours.proxy.as_ref().map(|p| p.id());
+    if is_mirroring(ours.replication_source.as_deref()) {
+        // Worth a line of its own: this is the state a user experiences as "the stream just shows my
+        // monitor", and it comes from KWin's stored config for THIS monitor set, so it reproduces
+        // every session until something clears it. The config below does.
+        tracing::warn!(
+            source_uuid = ?ours.replication_source,
+            our_prefix,
+            "KWin had our streamed output MIRRORING another screen (a stored kwinoutputconfig.json \
+             replicationSource for this monitor set) — clearing it so the output is its own desktop"
+        );
+    }
 
     // First-slot-wins (§6.1): don't steal primary if another managed sibling already holds it
     // (priority 1) — a 2nd exclusive session joins as a secondary of the shared desktop. A
@@ -681,6 +724,17 @@ pub(crate) fn apply_topology(
     let config = sess.new_config();
     if let Some(proxy) = ours.proxy.as_ref() {
         config.enable(proxy, 1);
+        // State that ours is its OWN desktop, not a replica of somebody's panel. A stored
+        // `replicationSource` for our (stable) output name is re-applied by KWin on every session
+        // that reproduces the same monitor set, and it survives everything else this config says:
+        // enabling and prioritising a mirror still leaves it showing the source's viewport, scaled
+        // to the source's size (`OutputConfigurationStore::applyMirroring`). See [`is_mirroring`].
+        // Unconditional rather than conditional on what we enumerated: KWin may apply the stored
+        // setup config between our enumerate and this apply, and clearing a source that is already
+        // empty is exactly what KWin does for a non-mirroring output anyway.
+        if mgmt_version >= REPLICATION_SOURCE_SINCE {
+            config.set_replication_source(proxy, NO_REPLICATION_SOURCE.to_string());
+        }
         if !sibling_is_primary {
             config.set_primary_output(proxy);
             if mgmt_version >= 3 {
@@ -778,6 +832,68 @@ pub(crate) fn apply_topology(
         our_uuid,
         disabled,
         handled: true,
+    }
+}
+
+/// De-mirror the just-created virtual output (name starts with `our_prefix`, current size
+/// `our_w`×`our_h`) **without touching the rest of the topology** — the `Extend`/`Auto` counterpart
+/// to the clear [`apply_topology`] folds into its own config.
+///
+/// Those topologies deliberately issue no output-management calls: the streamed output is meant to
+/// join the desk as one more head, and re-arranging the user's screens would be the rudeness the
+/// setting exists to avoid. But a stored `replicationSource` (see [`is_mirroring`]) is not an
+/// arrangement — it makes our output show a *physical panel's* viewport instead of its own desktop,
+/// which is broken under every topology equally. So this reads the state and applies **only** when
+/// our output really is mirroring; the ordinary session pays one bounded enumerate and no apply.
+pub(crate) fn clear_replication_source(our_prefix: &str, our_w: u32, our_h: u32) {
+    let Some(mut sess) = Session::open() else {
+        return;
+    };
+    let deadline = Instant::now() + OP_BUDGET;
+    let mgmt_version = sess
+        .state
+        .mgmt_name_version
+        .map(|(_, v)| v)
+        .unwrap_or_default();
+    if mgmt_version < REPLICATION_SOURCE_SINCE {
+        return;
+    }
+    // Same resolve as `apply_topology`: managed-prefix name AND the birth size, newest global wins.
+    let Some(ours) = sess
+        .state
+        .devices
+        .values()
+        .filter(|d| {
+            d.name.as_deref().is_some_and(|n| n.starts_with(our_prefix))
+                && sess.current_dims(d).map(|(w, h, _)| (w, h)) == Some((our_w, our_h))
+        })
+        .max_by_key(|d| d.global)
+        .cloned()
+    else {
+        return;
+    };
+    if !is_mirroring(ours.replication_source.as_deref()) {
+        return;
+    }
+    let Some(proxy) = ours.proxy.as_ref() else {
+        return;
+    };
+    tracing::warn!(
+        source_uuid = ?ours.replication_source,
+        our_prefix,
+        "KWin had our streamed output MIRRORING another screen (a stored kwinoutputconfig.json \
+         replicationSource for this monitor set) — clearing it so the output is its own desktop"
+    );
+    let config = sess.new_config();
+    config.set_replication_source(proxy, NO_REPLICATION_SOURCE.to_string());
+    let ok = sess.apply(&config, deadline);
+    config.destroy();
+    if !ok {
+        tracing::warn!(
+            reason = ?sess.state.failure_reason,
+            "KWin output management: could not clear the streamed output's replication source — \
+             the stream will show the mirrored screen's content"
+        );
     }
 }
 
@@ -1009,6 +1125,37 @@ fn find_mode(sess: &Session, dev: &DeviceState, spec: &str) -> Option<DeviceMode
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// KWin sends `replication_source` with an EMPTY string for the ordinary, non-mirroring output.
+    /// Reading the event's mere presence as "mirroring" would make every apply issue a pointless
+    /// de-mirror — and, worse, would make the warn fire on every healthy session.
+    #[test]
+    fn an_empty_replication_source_is_not_mirroring() {
+        assert!(!is_mirroring(None));
+        assert!(!is_mirroring(Some("")));
+    }
+
+    /// A real source UUID is the state the field report describes: the streamed output shows a
+    /// physical panel's viewport instead of its own desktop.
+    #[test]
+    fn a_uuid_replication_source_is_mirroring() {
+        assert!(is_mirroring(Some("f7a3c1e2-0b44-4c19-9a1d-6f2b8e0c5d31")));
+    }
+
+    /// The clear we send must be the value KWin reads as "mirrors nothing" — an empty source, which
+    /// its `applyMirroring` fails to resolve to any enabled output and so treats as no replication.
+    #[test]
+    fn the_clear_value_is_the_empty_source() {
+        assert!(!is_mirroring(Some(NO_REPLICATION_SOURCE)));
+    }
+
+    /// The request/event pair is `since 13`; wayland-rs does not range-check requests, so a bind
+    /// below this must never reach `set_replication_source` (it would be a fatal protocol error).
+    #[test]
+    fn replication_source_version_gate_matches_the_protocol() {
+        assert_eq!(REPLICATION_SOURCE_SINCE, 13);
+        const { assert!(MGMT_MAX >= REPLICATION_SOURCE_SINCE) };
+    }
 
     /// The `WxH@Hz` capture rounds mHz to whole Hz — the shape teardown parses back.
     #[test]

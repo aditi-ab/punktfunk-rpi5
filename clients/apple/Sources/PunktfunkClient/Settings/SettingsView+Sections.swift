@@ -641,6 +641,15 @@ extension SettingsView {
 
     @ViewBuilder var controllersSection: some View {
         Section {
+            // The master switch, above everything it governs. Profileable, so it renders in
+            // both scopes: a "Work" profile can decline to forward what "Game" forwards.
+            described("Sends controllers connected to this device to the host. Turn it off when "
+                + "your controller already reaches the host another way — USB passthrough such "
+                + "as VirtualHere, or a pad plugged into the host itself — so games don't see "
+                + "two of them.",
+                field: "gamepad_forwarding") {
+                Toggle("Forward controllers", isOn: scoped(SettingsFields.gamepadForwarding))
+            }
             // Which physical pad this device forwards, and what its own haptics do, are facts
             // about THIS device (tier G) — only the virtual pad the host creates is profileable.
             if !inProfileScope {
@@ -659,6 +668,7 @@ extension SettingsView {
                             Text(option.label).tag(option.tag)
                         }
                     }
+                    .disabled(!effective.gamepadForwarding)
                 }
             }
             described("The virtual pad created on the host. Automatic matches your controller "
@@ -669,6 +679,7 @@ extension SettingsView {
                         Text(option.label).tag(option.tag)
                     }
                 }
+                .disabled(!effective.gamepadForwarding)
             }
             #if os(iOS)
             // iPhone only in practice: hidden where the device itself can't play haptics (iPad).

@@ -612,7 +612,10 @@ pub fn open_portal_monitor(
 /// 10-bit PQ/BT.2020 formats instead of the SDR set — pass it only when the output was actually
 /// brought up HDR (a gamescope spawned with `--hdr-enabled` off our `pipewire-hdr` build); the
 /// host resolves that in `capture::capturer_supports_hdr_for` **before** the Welcome, because a
-/// session that negotiated PQ cannot fall back to SDR afterwards.
+/// session that negotiated PQ cannot fall back to SDR afterwards. `cursor_id0_hides` declares the
+/// producer's cursor-meta contract — pass it for outputs whose compositor rewrites
+/// `SPA_META_Cursor` on every buffer (KWin), where an `id == 0` meta is an authoritative
+/// "pointer hidden" the composited/forwarded cursor must honor.
 #[cfg(target_os = "linux")]
 #[allow(clippy::too_many_arguments)]
 pub fn open_virtual_output(
@@ -625,6 +628,7 @@ pub fn open_virtual_output(
     want_hdr: bool,
     policy: ZeroCopyPolicy,
     expect_exact_dims: bool,
+    cursor_id0_hides: bool,
 ) -> Result<Box<dyn Capturer>> {
     linux::PortalCapturer::from_virtual_output(
         remote_fd,
@@ -636,6 +640,7 @@ pub fn open_virtual_output(
         want_hdr && !hdr_capture_failed(HdrSource::VirtualOutput),
         policy,
         expect_exact_dims,
+        cursor_id0_hides,
     )
     .map(|c| Box::new(c) as Box<dyn Capturer>)
 }

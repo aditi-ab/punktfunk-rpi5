@@ -88,6 +88,7 @@ mod linux {
             false,
             policy,
             vout.expect_exact_dims,
+            compositor == pf_vdisplay::Compositor::Kwin,
         )
         .context("attach the PipeWire capturer")?;
         cap.set_active(true);

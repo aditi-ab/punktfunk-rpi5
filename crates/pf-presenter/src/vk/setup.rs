@@ -13,10 +13,55 @@ use ash::vk;
 use ash::vk::Handle as _;
 use std::ffi::{c_char, CString};
 
+/// `VK_EXT_present_mode_fifo_latest_ready`, hand-declared: it postdates the Vulkan headers
+/// ash 0.38 is generated from (1.3.281), so there is no binding for it — which is also why
+/// an unenabled driver reports the mode back as the bare number `1000361000`.
+///
+/// The mode is FIFO's tear-free vblank pacing that presents the **latest ready** image at
+/// each refresh and retires the older ones, instead of draining a queue. That is precisely
+/// what [`super::super::present_pace::PresentGate`] emulates in software, done by the
+/// driver — and it matters most exactly where the gate does: on a surface that offers no
+/// MAILBOX, this restores newest-wins behaviour without the app holding frames back.
+pub(crate) mod fifo_latest_ready {
+    use ash::vk;
+
+    /// `VK_EXT_present_mode_fifo_latest_ready` (extension 361).
+    pub(super) const NAME: &std::ffi::CStr = c"VK_EXT_present_mode_fifo_latest_ready";
+    /// `VK_PRESENT_MODE_FIFO_LATEST_READY_EXT`.
+    pub(crate) const MODE: vk::PresentModeKHR = vk::PresentModeKHR::from_raw(1000361000);
+    /// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_MODE_FIFO_LATEST_READY_FEATURES_EXT`.
+    const S_TYPE: vk::StructureType = vk::StructureType::from_raw(1000361000);
+
+    /// `VkPhysicalDevicePresentModeFifoLatestReadyFeaturesEXT`. The mode is usable only
+    /// when this feature is enabled at device creation, so the surface advertising the
+    /// mode is NOT on its own permission to request it.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub(super) struct Features {
+        pub s_type: vk::StructureType,
+        pub p_next: *mut std::ffi::c_void,
+        pub present_mode_fifo_latest_ready: vk::Bool32,
+    }
+
+    impl Default for Features {
+        fn default() -> Features {
+            Features {
+                s_type: S_TYPE,
+                p_next: std::ptr::null_mut(),
+                present_mode_fifo_latest_ready: vk::FALSE,
+            }
+        }
+    }
+}
+
 impl Presenter {
     /// Bring up instance → surface → device → swapchain over an SDL window.
     /// `instance_extensions` comes from `VideoSubsystem::vulkan_instance_extensions()`.
-    pub fn new(window: &sdl3::video::Window, instance_extensions: &[String]) -> Result<Presenter> {
+    pub fn new(
+        window: &sdl3::video::Window,
+        instance_extensions: &[String],
+        pref: PresentPref,
+    ) -> Result<Presenter> {
         // SAFETY: per the Vulkan contract above - a create/allocate call on the live device, over
         // builder structs that are locals outliving the call; the handle it returns is owned by
         // the value being built here.
@@ -176,6 +221,21 @@ impl Presenter {
         // structs through its pNext chain, so any later use of it would pin those borrows —
         // every read of a chained struct below must come after this, have_f2's last use.
         let have_shader_int16 = have_f2.features.shader_int16;
+        // FIFO_LATEST_READY: the surface may list the mode even with the extension
+        // disabled, so the device feature is the real gate on using it.
+        let flr_ok = if has(fifo_latest_ready::NAME) {
+            let mut feat = fifo_latest_ready::Features::default();
+            let mut probe = vk::PhysicalDeviceFeatures2 {
+                p_next: (&mut feat) as *mut _ as *mut std::ffi::c_void,
+                ..Default::default()
+            };
+            // SAFETY: per the Vulkan contract above - a read-only query on the live
+            // instance/device, filling locals returned by value; `feat` outlives the call.
+            unsafe { instance.get_physical_device_features2(pdev, &mut probe) };
+            feat.present_mode_fifo_latest_ready == vk::TRUE
+        } else {
+            false
+        };
         let present_wait_ok = present_wait_exts
             && have_pid.present_id == vk::TRUE
             && have_pwait.present_wait == vk::TRUE;
@@ -273,6 +333,13 @@ impl Presenter {
             dev_exts.push(ash::khr::present_id::NAME.as_ptr());
             dev_exts.push(ash::khr::present_wait::NAME.as_ptr());
         }
+        if flr_ok {
+            dev_exts.push(fifo_latest_ready::NAME.as_ptr());
+        }
+        let mut en_flr = fifo_latest_ready::Features {
+            present_mode_fifo_latest_ready: vk::TRUE,
+            ..Default::default()
+        };
         let mut en_pid = vk::PhysicalDevicePresentIdFeaturesKHR::default().present_id(true);
         let mut en_pwait = vk::PhysicalDevicePresentWaitFeaturesKHR::default().present_wait(true);
 
@@ -294,6 +361,11 @@ impl Presenter {
             .push_next(&mut en_f13);
         if present_wait_ok {
             en_f2 = en_f2.push_next(&mut en_pid).push_next(&mut en_pwait);
+        }
+        if flr_ok {
+            // Hand-rolled struct, so chain it by hand: splice into the pNext list head.
+            en_flr.p_next = en_f2.p_next;
+            en_f2.p_next = (&mut en_flr) as *mut _ as *mut std::ffi::c_void;
         }
         en_f2.features.shader_int16 = if pyrowave_ok { vk::TRUE } else { vk::FALSE };
 
@@ -450,11 +522,17 @@ impl Presenter {
         if let Some(v) = video_export.as_mut() {
             v.d3d11_hdr10 = win_capable && import_rgb10 && hdr10_format.is_some();
         }
-        let present_mode = pick_present_mode(&surface_i, pdev, surface)?;
+        let mut pref = pref;
+        pref.vrr_fifo_opt_in = vrr_fifo_opt_in();
+        pref.fifo_latest_ready = flr_ok;
+        let present_mode = pick_present_mode(&surface_i, pdev, surface, pref)?;
         tracing::info!(
             ?format,
             ?hdr10_format,
             ?present_mode,
+            vsync = pref.vsync,
+            allow_vrr = pref.allow_vrr,
+            fifo_latest_ready = flr_ok,
             hdr_metadata = has_hdr_metadata,
             "swapchain config"
         );
@@ -730,29 +808,275 @@ pub(super) fn pick_formats(
     Ok((sdr, hdr10))
 }
 
-/// MAILBOX when the surface offers it, FIFO otherwise (`PUNKTFUNK_PRESENT_MODE=
-/// fifo|mailbox|immediate` overrides). Both are tear-free, but an arrival-paced
-/// presenter must not block in FIFO's present queue: when the compositor holds images
-/// for a vblank pass (gamescope's composite path) or arrival cadence drifts against
-/// refresh, `acquire_next_image` stalls most of a refresh — a standing 11-13 ms added
-/// to every frame at 60 Hz. MAILBOX never queues more than the newest frame, so the
-/// pipeline stays at decode latency and a late frame is replaced, not waited for.
+/// What the user asked the presentation to be, resolved into a swapchain present mode by
+/// [`present_mode_chain`] (design/desktop-presentation-rebuild.md WP3).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PresentPref {
+    /// Tear-free presentation (the `vsync` setting, default on).
+    pub vsync: bool,
+    /// Let a variable-refresh display follow the stream cadence (`allow_vrr`, default on).
+    pub allow_vrr: bool,
+    /// Opt-in for the VRR FIFO-first ladder (`PUNKTFUNK_VRR_FIFO=1`). Off by default on
+    /// measured evidence — see [`present_mode_chain`].
+    pub vrr_fifo_opt_in: bool,
+    /// `VK_EXT_present_mode_fifo_latest_ready` is enabled on the device, so the mode may
+    /// be requested. Resolved during device creation; never set by callers.
+    pub fifo_latest_ready: bool,
+    /// The session STARTED fullscreen. The mode is chosen once, at swapchain creation, so
+    /// this is the starting state and an F11 mid-session does not re-pick — consistent
+    /// with the shells' "Display changes apply from the next session" footer, and why
+    /// live present-mode switching is an explicit non-goal.
+    pub fullscreen: bool,
+}
+
+/// The preference ladder, most to least wanted. The caller takes the first entry the
+/// surface actually offers; FIFO ends every chain because the spec guarantees it.
+///
+/// * **V-Sync off** — IMMEDIATE (tears, no wait at all), then FIFO_RELAXED (tears only on
+///   a late frame), then the tear-free modes. Asking for tearing and silently getting
+///   vsync is a lie the stats line now exposes, but the ladder still degrades safely.
+/// * **V-Sync on + VRR allowed + fullscreen + `PUNKTFUNK_VRR_FIFO=1`** — FIFO first. On a
+///   variable-refresh panel with direct scanout the FIFO present IS the flip, so the panel
+///   follows the stream's cadence; MAILBOX would decouple presents from scanout and
+///   re-quantize to the compositor's clock.
+///
+///   **Automatic where a queue-free vblank mode exists, opt-in otherwise.** The history is
+///   worth keeping: this was default-on, then measured on glass (.21, GNOME/Wayland,
+///   NVIDIA, *non*-VRR 60 Hz panel, 2026-08-02) to cost ~27 ms of display stage against
+///   MAILBOX — `28.4 ms (pace 11.8 + latch 16.6)` versus `1.4 ms (0.2 + 1.2)` — because a
+///   plain-FIFO present's on-glass confirmation lands a whole refresh later and the
+///   presenter serialises behind it. It became opt-in on that evidence.
+///
+///   `FIFO_LATEST_READY` removes the cause rather than working around it: the driver
+///   retires stale images, so the vblank-locked path measured **2.6 ms** on the same box —
+///   0.6 ms over MAILBOX instead of 27. So where the device offers it, following the panel
+///   is cheap enough to be the default again; where it does not, the ladder would fall
+///   back to plain FIFO and the regression returns, so it stays behind
+///   `PUNKTFUNK_VRR_FIFO=1` there. The win on a genuine VRR panel is still UNMEASURED —
+///   no VRR display was available — but the cost of trying is now small and bounded.
+/// * **Otherwise** — MAILBOX, then FIFO: the shipped default. MAILBOX never queues more
+///   than the newest frame, so an arrival-paced presenter doesn't block in the present
+///   queue (a measured 11-13 ms standing wait at 60 Hz when the compositor holds images
+///   for a vblank pass, or when arrival cadence drifts against refresh).
+///
+/// AMD's Windows driver offers no MAILBOX (NVIDIA does), so those clients land on FIFO —
+/// expected, not a misconfiguration, and now visible in the `present:` stats line.
+fn present_mode_chain(pref: PresentPref) -> Vec<vk::PresentModeKHR> {
+    use vk::PresentModeKHR as M;
+    let flr = pref.fifo_latest_ready.then_some(fifo_latest_ready::MODE);
+    let mut chain: Vec<M> = if !pref.vsync {
+        vec![M::IMMEDIATE, M::FIFO_RELAXED, M::MAILBOX]
+    } else if pref.allow_vrr && pref.fullscreen && (pref.fifo_latest_ready || pref.vrr_fifo_opt_in)
+    {
+        // The VRR ladder wants the vblank-locked family; LATEST_READY is that with the
+        // queue removed, so it outranks plain FIFO here too.
+        vec![]
+            .into_iter()
+            .chain(flr)
+            .chain([M::FIFO, M::MAILBOX, M::FIFO_RELAXED, M::IMMEDIATE])
+            .collect()
+    } else {
+        // MAILBOX first (measured good), then LATEST_READY — which is what gives a
+        // MAILBOX-less surface the same newest-wins behaviour, in the driver instead of
+        // in our glass gate.
+        vec![M::MAILBOX]
+            .into_iter()
+            .chain(flr)
+            .chain([M::FIFO_RELAXED, M::IMMEDIATE])
+            .collect()
+    };
+    if !pref.vsync {
+        chain.extend(flr);
+    }
+    // FIFO ends every chain: the spec guarantees it exists, so there is always a landing.
+    chain.push(M::FIFO);
+    chain
+}
+
+/// `PUNKTFUNK_VRR_FIFO=1` — opt into the FIFO-first ladder for variable-refresh panels.
+/// See [`present_mode_chain`] for the measurement that made this opt-in rather than
+/// default.
+fn vrr_fifo_opt_in() -> bool {
+    std::env::var("PUNKTFUNK_VRR_FIFO").is_ok_and(|v| v != "0")
+}
+
+/// Resolve the present mode: `PUNKTFUNK_PRESENT_MODE` pins one outright (the debug lever,
+/// unchanged), otherwise the first entry of [`present_mode_chain`] the surface offers.
 fn pick_present_mode(
     surface_i: &ash::khr::surface::Instance,
     pdev: vk::PhysicalDevice,
     surface: vk::SurfaceKHR,
+    pref: PresentPref,
 ) -> Result<vk::PresentModeKHR> {
     // SAFETY: per the Vulkan contract above - a read-only query on the live instance/device,
     // filling locals returned by value.
     let modes = unsafe { surface_i.get_physical_device_surface_present_modes(pdev, surface) }?;
-    let want = match std::env::var("PUNKTFUNK_PRESENT_MODE").ok().as_deref() {
-        Some("fifo") => vk::PresentModeKHR::FIFO,
-        Some("immediate") => vk::PresentModeKHR::IMMEDIATE,
-        _ => vk::PresentModeKHR::MAILBOX,
+    let pinned = match std::env::var("PUNKTFUNK_PRESENT_MODE").ok().as_deref() {
+        Some("fifo") => Some(vk::PresentModeKHR::FIFO),
+        Some("immediate") => Some(vk::PresentModeKHR::IMMEDIATE),
+        Some("fifo_relaxed") => Some(vk::PresentModeKHR::FIFO_RELAXED),
+        Some("mailbox") => Some(vk::PresentModeKHR::MAILBOX),
+        None => None,
+        Some(other) => {
+            tracing::warn!(
+                value = other,
+                "unknown PUNKTFUNK_PRESENT_MODE (expected fifo|mailbox|immediate|fifo_relaxed) — following the settings"
+            );
+            None
+        }
     };
-    Ok(if modes.contains(&want) {
-        want
-    } else {
-        vk::PresentModeKHR::FIFO // always available per spec
-    })
+    if let Some(want) = pinned {
+        if modes.contains(&want) {
+            return Ok(want);
+        }
+        tracing::warn!(
+            ?want,
+            "PUNKTFUNK_PRESENT_MODE not offered by this surface — falling back"
+        );
+    }
+    // What the surface ACTUALLY offers, logged unconditionally. "AMD's Windows driver
+    // has no MAILBOX" is the premise the FIFO glass gate is built on, and it has been
+    // carried in comments rather than measured — present modes are a property of the
+    // (surface, device) pair, so they vary by platform surface, driver version and
+    // fullscreen state, and the only way to settle it is to read it back from real
+    // machines. One line here makes every field log answer the question.
+    tracing::info!(
+        available = ?modes,
+        "surface present modes"
+    );
+    let chain = present_mode_chain(pref);
+    let chosen = chain
+        .iter()
+        .copied()
+        .find(|m| modes.contains(m))
+        .unwrap_or(vk::PresentModeKHR::FIFO); // always available per spec
+                                              // The one line that answers "did V-Sync off actually take?" — a request the surface
+                                              // can't serve is a fact about the driver, and it must not look like our choice.
+    if chosen != chain[0] {
+        tracing::info!(
+            requested = ?chain[0],
+            active = ?chosen,
+            vsync = pref.vsync,
+            allow_vrr = pref.allow_vrr,
+            "the surface does not offer the preferred present mode"
+        );
+    }
+    Ok(chosen)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vk::PresentModeKHR as M;
+
+    /// The preference ladders (WP3). Every chain must end at FIFO, which the spec
+    /// guarantees exists — a chain whose entries a surface all refuses would otherwise
+    /// have no landing.
+    #[test]
+    fn present_mode_chains_rank_by_intent() {
+        let pref = |vsync, allow_vrr, fullscreen| PresentPref {
+            vsync,
+            allow_vrr,
+            fullscreen,
+            vrr_fifo_opt_in: true, // the ladder under test; the DEFAULT is off (see below)
+            fifo_latest_ready: false,
+        };
+        let flr = fifo_latest_ready::MODE;
+
+        // V-Sync off asks to tear, hardest first, and outranks the VRR rule (tearing
+        // already gives a VRR-like latch, so the two never fight).
+        assert_eq!(present_mode_chain(pref(false, true, true))[0], M::IMMEDIATE);
+        assert_eq!(
+            present_mode_chain(pref(false, false, false))[0],
+            M::IMMEDIATE
+        );
+        assert_eq!(
+            present_mode_chain(pref(false, true, true))[1],
+            M::FIFO_RELAXED,
+            "tears only on a late frame — the gentler tearing rung"
+        );
+
+        // Tear-free + VRR allowed + fullscreen prefers the vblank-locked family — but
+        // ONLY when opted in.
+        assert_eq!(present_mode_chain(pref(true, true, true))[0], M::FIFO);
+        // Without the opt-in the shipped MAILBOX-first default stands: measured on glass
+        // to be ~27 ms of display stage better on a non-VRR panel.
+        assert_eq!(
+            present_mode_chain(PresentPref {
+                vsync: true,
+                allow_vrr: true,
+                fullscreen: true,
+                vrr_fifo_opt_in: false,
+                fifo_latest_ready: false,
+            })[0],
+            M::MAILBOX,
+            "without a queue-free vblank mode the VRR ladder would lead with plain FIFO, \
+             which measured ~27 ms worse — so it stays opt-in there"
+        );
+        assert_eq!(
+            present_mode_chain(PresentPref {
+                vsync: true,
+                allow_vrr: true,
+                fullscreen: true,
+                vrr_fifo_opt_in: false,
+                fifo_latest_ready: true,
+            })[0],
+            fifo_latest_ready::MODE,
+            "with LATEST_READY available, following the panel costs 0.6 ms over MAILBOX \
+             instead of 27 — cheap enough to be automatic"
+        );
+
+        // FIFO_LATEST_READY only appears where the device enabled it, and it outranks
+        // plain FIFO everywhere: it is FIFO's vblank pacing WITHOUT the queue, which is
+        // what a MAILBOX-less surface otherwise needs the software glass gate for.
+        let with_flr = |vsync, allow_vrr, fullscreen| PresentPref {
+            vsync,
+            allow_vrr,
+            fullscreen,
+            vrr_fifo_opt_in: true,
+            fifo_latest_ready: true,
+        };
+        for p in [
+            pref(true, false, false),
+            pref(true, true, true),
+            pref(false, true, true),
+        ] {
+            assert!(
+                !present_mode_chain(p).contains(&flr),
+                "never requested unless the device enabled the extension"
+            );
+        }
+        let default_flr = present_mode_chain(with_flr(true, false, false));
+        assert_eq!(
+            default_flr[0],
+            M::MAILBOX,
+            "MAILBOX still leads by measurement"
+        );
+        assert_eq!(default_flr[1], flr, "then the driver-native newest-wins");
+        assert!(
+            default_flr.iter().position(|m| *m == flr)
+                < default_flr.iter().position(|m| *m == M::FIFO),
+            "LATEST_READY must outrank plain FIFO — it is FIFO minus the standing queue"
+        );
+        assert_eq!(
+            present_mode_chain(with_flr(true, true, true))[0],
+            flr,
+            "the VRR ladder takes the queue-free vblank mode first"
+        );
+
+        // Every ladder can land: FIFO appears in all of them.
+        for p in [
+            pref(true, true, true),
+            pref(true, true, false),
+            pref(true, false, true),
+            pref(false, true, true),
+            pref(false, false, false),
+            with_flr(true, false, false),
+        ] {
+            assert!(
+                present_mode_chain(p).contains(&M::FIFO),
+                "FIFO is the guaranteed landing"
+            );
+        }
+    }
 }

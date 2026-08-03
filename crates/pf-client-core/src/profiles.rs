@@ -74,9 +74,23 @@ pub struct SettingsOverlay {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gamepad: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub gamepad_forwarding: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub stats_verbosity: Option<StatsVerbosity>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fullscreen_on_stream: Option<bool>,
+    /// The presentation cluster — the keys the Apple client already writes into this
+    /// same catalog shape (`present_priority`/`smooth_buffer`/`vsync`/`allow_vrr`;
+    /// Android carries the first two). First-class here so a profile authored on any
+    /// client applies on all of them instead of riding `extra` unapplied.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub present_priority: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub smooth_buffer: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vsync: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allow_vrr: Option<bool>,
     /// Overlay keys a newer client wrote and this one doesn't model — carried through a
     /// load→save round-trip untouched.
     #[serde(flatten)]
@@ -142,6 +156,9 @@ impl SettingsOverlay {
         if let Some(v) = &self.gamepad {
             s.gamepad = v.clone();
         }
+        if let Some(v) = self.gamepad_forwarding {
+            s.gamepad_forwarding = v;
+        }
         if let Some(v) = self.stats_verbosity {
             // Through the setter so the legacy `show_stats` bool stays coherent for
             // pre-tier binaries reading the same settings file.
@@ -149,6 +166,18 @@ impl SettingsOverlay {
         }
         if let Some(v) = self.fullscreen_on_stream {
             s.fullscreen_on_stream = v;
+        }
+        if let Some(v) = &self.present_priority {
+            s.present_priority = v.clone();
+        }
+        if let Some(v) = self.smooth_buffer {
+            s.smooth_buffer = v;
+        }
+        if let Some(v) = self.vsync {
+            s.vsync = v;
+        }
+        if let Some(v) = self.allow_vrr {
+            s.allow_vrr = v;
         }
         s
     }
@@ -220,11 +249,26 @@ impl SettingsOverlay {
         if after.gamepad != before.gamepad {
             self.gamepad = Some(after.gamepad.clone());
         }
+        if after.gamepad_forwarding != before.gamepad_forwarding {
+            self.gamepad_forwarding = Some(after.gamepad_forwarding);
+        }
         if after.stats_verbosity() != before.stats_verbosity() {
             self.stats_verbosity = Some(after.stats_verbosity());
         }
         if after.fullscreen_on_stream != before.fullscreen_on_stream {
             self.fullscreen_on_stream = Some(after.fullscreen_on_stream);
+        }
+        if after.present_priority != before.present_priority {
+            self.present_priority = Some(after.present_priority.clone());
+        }
+        if after.smooth_buffer != before.smooth_buffer {
+            self.smooth_buffer = Some(after.smooth_buffer);
+        }
+        if after.vsync != before.vsync {
+            self.vsync = Some(after.vsync);
+        }
+        if after.allow_vrr != before.allow_vrr {
+            self.allow_vrr = Some(after.allow_vrr);
         }
     }
 
@@ -257,8 +301,13 @@ impl SettingsOverlay {
             "invert_scroll" => self.invert_scroll = None,
             "inhibit_shortcuts" => self.inhibit_shortcuts = None,
             "gamepad" => self.gamepad = None,
+            "gamepad_forwarding" => self.gamepad_forwarding = None,
             "stats_verbosity" => self.stats_verbosity = None,
             "fullscreen_on_stream" => self.fullscreen_on_stream = None,
+            "present_priority" => self.present_priority = None,
+            "smooth_buffer" => self.smooth_buffer = None,
+            "vsync" => self.vsync = None,
+            "allow_vrr" => self.allow_vrr = None,
             _ => return false,
         }
         true
@@ -433,6 +482,10 @@ mod tests {
         assert_eq!((out.width, out.height), (1920, 1080));
         assert_eq!(out.bitrate_kbps, 20000);
         assert_eq!(out.codec, "hevc");
+        assert!(
+            out.gamepad_forwarding,
+            "default on, and an empty overlay leaves it alone"
+        );
         assert!(empty.is_empty());
 
         let overlay = SettingsOverlay {
@@ -452,9 +505,14 @@ mod tests {
             invert_scroll: Some(true),
             inhibit_shortcuts: Some(false),
             gamepad: Some("dualsense".into()),
+            gamepad_forwarding: Some(false),
             match_window: Some(true),
             fullscreen_on_stream: Some(false),
             stats_verbosity: Some(StatsVerbosity::Detailed),
+            present_priority: Some("smooth".into()),
+            smooth_buffer: Some(3),
+            vsync: Some(false),
+            allow_vrr: Some(false),
             ..Default::default()
         };
         assert!(!overlay.is_empty());
@@ -473,9 +531,14 @@ mod tests {
         assert!(out.invert_scroll);
         assert!(!out.inhibit_shortcuts);
         assert_eq!(out.gamepad, "dualsense");
+        assert!(!out.gamepad_forwarding);
         assert!(out.match_window);
         assert!(!out.fullscreen_on_stream);
         assert_eq!(out.stats_verbosity(), StatsVerbosity::Detailed);
+        assert_eq!(out.present_priority, "smooth");
+        assert_eq!(out.smooth_buffer, 3);
+        assert!(!out.vsync);
+        assert!(!out.allow_vrr);
         // The tier goes through the setter, so the legacy bool a pre-tier binary reads
         // stays coherent with it.
         assert!(out.show_stats);
@@ -573,6 +636,59 @@ mod tests {
         assert!(o.is_empty());
     }
 
+    /// The presentation cluster is first-class, not `extra` passengers: it applies,
+    /// absorbs, clears, and serialises under the exact keys the Apple client already
+    /// writes (`present_priority`/`smooth_buffer`/`vsync`/`allow_vrr`) — one catalog
+    /// has to round-trip through every platform, and a mismatched key would be carried
+    /// but never applied.
+    #[test]
+    fn presentation_cluster_is_first_class() {
+        let base = Settings::default();
+        let mut o = SettingsOverlay::default();
+        let before = o.apply(&base);
+        let mut after = before.clone();
+        after.present_priority = "smooth".into();
+        o.absorb(&before, &after);
+        let before = o.apply(&base);
+        let mut after = before.clone();
+        after.smooth_buffer = 1;
+        o.absorb(&before, &after);
+        assert_eq!(o.present_priority.as_deref(), Some("smooth"));
+        assert_eq!(o.smooth_buffer, Some(1));
+        assert!(
+            o.extra.is_empty(),
+            "modelled fields must never land in the passthrough"
+        );
+        let out = o.apply(&base);
+        assert_eq!(
+            out.present_priority(),
+            crate::trust::PresentPriority::Smooth { buffer: 1 }
+        );
+
+        // Serialised under the shared keys, and read back from a foreign client's file.
+        let text = serde_json::to_string(&o).unwrap();
+        assert!(text.contains("\"present_priority\":\"smooth\""), "{text}");
+        assert!(text.contains("\"smooth_buffer\":1"), "{text}");
+        let from_apple: SettingsOverlay = serde_json::from_str(
+            r#"{"present_priority":"latency","smooth_buffer":2,"vsync":true,"allow_vrr":false}"#,
+        )
+        .unwrap();
+        assert_eq!(from_apple.present_priority.as_deref(), Some("latency"));
+        assert_eq!(from_apple.smooth_buffer, Some(2));
+        assert_eq!(from_apple.vsync, Some(true));
+        assert_eq!(from_apple.allow_vrr, Some(false));
+        assert!(from_apple.extra.is_empty());
+
+        assert!(o.clear("present_priority"));
+        assert!(o.clear("smooth_buffer"));
+        assert_eq!(o.present_priority, None);
+        assert!(o.is_empty());
+        let mut vrr = from_apple;
+        assert!(vrr.clear("vsync"));
+        assert!(vrr.clear("allow_vrr"));
+        assert_eq!((vrr.vsync, vrr.allow_vrr), (None, None));
+    }
+
     /// `clear` is the explicit way back to inheriting, including the resolution tri-state.
     #[test]
     fn clear_drops_one_override() {
@@ -589,6 +705,29 @@ mod tests {
         assert_eq!((o.width, o.height, o.match_window), (None, None, None));
         assert!(o.is_empty());
         assert!(!o.clear("no_such_field"));
+    }
+
+    /// Controller forwarding defaults ON, so its interesting override is the FALSE one — and a
+    /// `false` that `apply` dropped would silently forward a pad the profile said not to.
+    /// `absorb` must record it, `clear` must undo it, and the serialized name both carry is the
+    /// one every client's reset button sends.
+    #[test]
+    fn gamepad_forwarding_overrides_off_and_resets_back() {
+        let base = Settings::default();
+        assert!(base.gamepad_forwarding, "the shipped default");
+
+        let mut o = SettingsOverlay::default();
+        let mut after = base.clone();
+        after.gamepad_forwarding = false;
+        o.absorb(&base, &after);
+        assert_eq!(o.gamepad_forwarding, Some(false));
+        assert!(!o.apply(&base).gamepad_forwarding);
+
+        assert!(o.clear("gamepad_forwarding"));
+        assert_eq!(o.gamepad_forwarding, None);
+        assert!(o.is_empty());
+        // Back to inheriting: the global's live value, not a remembered false.
+        assert!(o.apply(&base).gamepad_forwarding);
     }
 
     /// Stats verbosity Off must survive `apply` — it is a legitimate override, and going

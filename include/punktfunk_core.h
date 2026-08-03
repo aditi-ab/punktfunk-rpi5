@@ -1878,7 +1878,11 @@ typedef struct {
     // Application goodput bytes / access units the host offered.
     uint64_t host_bytes;
     uint32_t host_packets;
-    // The host's measured burst duration, milliseconds (the throughput denominator).
+    // The throughput denominator, milliseconds: the client-measured burst receive interval
+    // (first → last probe-packet arrival) once `done`; the host's measured send-window
+    // duration when fewer than two probe packets arrived (no interval to measure from). The
+    // host duration alone overstates throughput — its window closes while the bottleneck
+    // queue is still draining toward the client.
     uint32_t elapsed_ms;
     // Delivered wire throughput = `recv_bytes * 8 / elapsed_ms` (kilobits/second).
     uint32_t throughput_kbps;
@@ -3001,7 +3005,7 @@ PunktfunkStatus punktfunk_connection_wants_decode_latency(const PunktfunkConnect
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // Start a bandwidth speed test: ask the host to burst filler over the data plane at
-// `target_kbps` of goodput for `duration_ms` (each clamped host-side to ≤ 3 Gbps / ≤ 5 s),
+// `target_kbps` of goodput for `duration_ms` (each clamped host-side to ≤ 10 Gbps / ≤ 5 s),
 // *briefly pausing video*. Non-blocking — poll [`punktfunk_connection_probe_result`] until its
 // `done` field is 1. Starting a probe resets any prior measurement.
 //

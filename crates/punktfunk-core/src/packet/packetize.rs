@@ -73,9 +73,9 @@ pub struct StreamedAu {
     pts_ns: u64,
     user_flags: u32,
     /// Bytes not yet sealed into a block: the sub-shard remainder plus anything below the
-    /// slice-flush threshold. The final block always has ≥ 1 byte (flushes emit only whole
-    /// shards and never drain to empty on a slice that ends the AU — `finish_streamed` seals
-    /// whatever remains).
+    /// slice-flush threshold. The final block always has ≥ 1 byte — flushes emit only whole
+    /// shards, and a flush that WOULD empty this keeps one shard back (see `push_streamed`),
+    /// so `finish_streamed` always has something real to seal.
     pending: Vec<u8>,
     /// Sentinel blocks already emitted.
     blocks_out: u16,
@@ -418,7 +418,18 @@ impl Packetizer {
                     "streamed AU exceeds the negotiated max_frame_bytes",
                 ));
             }
-            let k = whole.min(self.fec.max_data_per_block as usize);
+            // Never drain `pending` to EMPTY. [`finish_streamed`] must have bytes left to seal,
+            // or the final block degenerates to a single zero-padded filler shard whose derived
+            // base (`total_data − 1`) overlaps the block flushed just now — which the receiver's
+            // retro-validation correctly reads as a lying header and kills the whole AU. It bites
+            // exactly when the AU's length is a multiple of `shard_payload` (~1 in 1408 frames on
+            // a 1500-MTU link), and only on the slice arm: the legacy `must_flush` is a strict
+            // `>`, so its remainder is never empty. Keeping one whole shard back costs nothing —
+            // it rides out in the final block, which has to exist regardless.
+            let mut k = whole.min(self.fec.max_data_per_block as usize);
+            if k > 1 && k == whole && au.pending.len() == whole * payload {
+                k -= 1;
+            }
             let sof = !au.opened;
             let (bi, pts, uf) = (au.blocks_out, au.pts_ns, au.user_flags);
             let fi = au.frame_index;

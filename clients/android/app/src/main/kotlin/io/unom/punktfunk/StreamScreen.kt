@@ -321,7 +321,9 @@ fun StreamScreen(session: ActiveSession, onDisconnect: () -> Unit) {
         // Multi-controller router: a stable wire pad index per connected controller, per-device axis
         // state, Arrival/Remove on hot-plug, and feedback routed back by pad index. Forwards every
         // controller (Automatic). Built here, released on dispose.
-        val router = GamepadRouter(context, handle, initialSettings.gamepad)
+        val router = GamepadRouter(
+            context, handle, initialSettings.gamepad, initialSettings.gamepadForwarding,
+        )
         activity?.gamepadRouter = router
         // Select+Start+L1+R1 chord leaves the stream — a deliberate quit (signal it so the host skips
         // the keep-alive linger), unlike a host-ended / backgrounded drop. The router debounces it
@@ -442,7 +444,11 @@ fun StreamScreen(session: ActiveSession, onDisconnect: () -> Unit) {
         // The menu-time capture (UI navigation) must let go before the stream-mode capture can
         // claim the interfaces; it resumes in onDispose once the stream releases them.
         activity?.stopSc2MenuNav()
-        val sc2 = if (initialSettings.sc2Capture) Sc2Capture(context, router) else null
+        val sc2 = if (initialSettings.sc2Capture && initialSettings.gamepadForwarding) {
+            Sc2Capture(context, router)
+        } else {
+            null
+        }
         var sc2UsbReceiver: BroadcastReceiver? = null
         if (sc2 != null) {
             feedback.onHidRaw = sc2::onHidRaw
@@ -492,7 +498,11 @@ fun StreamScreen(session: ActiveSession, onDisconnect: () -> Unit) {
         // the automatic fallback. Host feedback routes back through feedback.sink; the claim
         // frees the pad's InputDevice slot itself (see DsCapture.startUsb), so the wire index
         // hands over deterministically.
-        val ds = if (initialSettings.dsCapture) DsCapture(context, router) else null
+        val ds = if (initialSettings.dsCapture && initialSettings.gamepadForwarding) {
+            DsCapture(context, router)
+        } else {
+            null
+        }
         var dsUsbReceiver: BroadcastReceiver? = null
         if (ds != null) {
             feedback.sink = ds

@@ -4,10 +4,12 @@
 //!  * a **newest-wins slot** (or a small smoothing FIFO, by user intent) between decode and
 //!    release, so a burst coalesces in the app — as an explicit, counted drop — instead of
 //!    queueing behind the display;
-//!  * a **glass budget of exactly one**: at most one undisplayed release in flight to
-//!    SurfaceFlinger, reopened on the clock-predicted latch (with a 100 ms stale force-open as
-//!    the liveness backstop, mirroring Apple's `PresentGate.staleAfter`). The BufferQueue can
-//!    hold at most the frame being scanned out plus one — a standing queue is unconstructible;
+//!  * a **glass budget of one**: at most one undisplayed release in flight to SurfaceFlinger,
+//!    reopened on the clock-predicted latch (with a 100 ms stale force-open as the liveness
+//!    backstop, mirroring Apple's `PresentGate.staleAfter`), and bounded underneath by what
+//!    `OnFrameRendered` actually confirmed reached glass ([`UNDISPLAYED_CAP`]) — because the
+//!    prediction is only as good as the panel grid behind it, and 0.23.0 shipped a grid that
+//!    could be wrong in one direction forever;
 //!  * a **timed release**: `AMediaCodec_releaseOutputBufferAtTime` targeting the platform's own
 //!    frame timeline (API 33+, via [`super::vsync`]), so the latch phase is deterministic instead
 //!    of inheriting network + decode jitter. On the 31/32 fallback the release is ASAP —
@@ -20,6 +22,7 @@
 
 use ndk::media::media_codec::MediaCodec;
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
 
@@ -36,9 +39,9 @@ use super::vsync::VsyncShared;
 ///
 /// 2.5 ms: SF's latch runs ~1-2 ms before present on modern devices (its `sfOffset`), and the
 /// release itself is a binder call well under a ms. 4 ms measured latch p50 8-10; each ms cut
-/// here is a ms off every frame's display stage. If a device misses at this margin the `paced`
-/// counter shows it (a miss presents one vsync later, coalescing the next frame) — that is the
-/// signal to widen, not stutter.
+/// here is a ms off every frame's display stage. A device that misses at the live margin shows it
+/// as a measured latch beyond one panel period (see the adaptation in
+/// [`Presenter::flush_log`]) — that, not a drop counter, is the signal to widen.
 const LATCH_MARGIN_NS: i64 = 2_500_000;
 
 /// `debug.punktfunk.latch_margin_us` (0..=8000 µs): PIN the submit margin for a sweep —
@@ -70,6 +73,26 @@ fn latch_margin_ns() -> Option<i64> {
 /// (clock glitch, mode switch) force-reopens the budget this long after the release, counted in
 /// `forced` — reads 0 on healthy systems (Apple's `PresentGate.staleAfter`, same value).
 const STALE_REOPEN_NS: i64 = 100_000_000;
+
+/// Releases still unconfirmed by `OnFrameRendered` at which the presenter stops handing
+/// SurfaceFlinger more work.
+///
+/// The reopen above is a PREDICTION off the learned panel grid. A grid finer than the panel
+/// (0.23.0 could pin one permanently — see [`punktfunk_core::phase::PanelGrid`]) reopens the
+/// budget before the display has consumed anything, and the presenter then releases faster than
+/// the panel scans: the BufferQueue fills, MediaCodec runs out of output buffers, the decoder
+/// stalls, and the no-output backstop starts begging for keyframes. The render callback is the
+/// ground truth about what actually reached glass, so it bounds the prediction.
+///
+/// Six, not one: the platform is explicitly allowed to deliver these callbacks BATCHED, and this
+/// module's own `RENDERED_CAP` note records them trailing a release by a vsync or two — so a
+/// healthy device sits at 1-3 outstanding and a tight cap would throttle it for nothing (a held
+/// frame in the newest-wins slot is a DROPPED frame the moment a fresher one decodes). This is
+/// not a pacing knob; it is the "something is structurally wrong" rail, and a presenter genuinely
+/// out-running its display climbs past any fixed cap within a second. If a device's BufferQueue
+/// is shallower than this the rail simply never engages and the no-output backstop handles it,
+/// exactly as before — best-effort, never worse than not having it.
+const UNDISPLAYED_CAP: i32 = 6;
 
 /// Fallback latch-prediction period while the vsync clock is unmeasured/absent: one 120 Hz frame.
 const FALLBACK_PERIOD_NS: i64 = 8_333_333;
@@ -121,6 +144,14 @@ struct InFlight {
 /// a HUD-off wireless A/B readable from logcat.
 pub(super) struct PresentMeter {
     inner: Mutex<PresentMeterInner>,
+    /// Frames released to SurfaceFlinger that `OnFrameRendered` has not yet confirmed reached
+    /// glass. The presenter's structural rail (see [`UNDISPLAYED_CAP`]) and the pf-present line's
+    /// queue-depth readout. Lock-free because the release side runs on the decode loop and the
+    /// confirm side on the codec's callback thread, once per frame each.
+    undisplayed: AtomicI32,
+    /// This device delivers render callbacks at all (API ≥ 33 and the platform accepted the
+    /// registration). Until one arrives, `undisplayed` is meaningless and the rail stays down.
+    confirms: AtomicBool,
 }
 
 struct PresentMeterInner {
@@ -147,11 +178,23 @@ impl PresentMeter {
                 codec_us: Vec::with_capacity(256),
                 e2e_us: Vec::with_capacity(256),
             }),
+            undisplayed: AtomicI32::new(0),
+            confirms: AtomicBool::new(false),
         }
     }
 
     /// One displayed frame's release→displayed latch, µs. Callback thread; poison-proof.
+    ///
+    /// Also the glass budget's CONFIRM: this frame left the BufferQueue, so one outstanding
+    /// release is settled. Clamped at zero — the legacy `arrival` path renders without going
+    /// through [`Presenter::pump`], so confirms can outnumber counted releases.
     pub(super) fn note_latch(&self, latch_us: Option<u64>) {
+        self.confirms.store(true, Ordering::Relaxed);
+        let _ = self
+            .undisplayed
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some((v - 1).max(0))
+            });
         let mut g = self
             .inner
             .lock()
@@ -162,6 +205,26 @@ impl PresentMeter {
                 g.latch_us.push(l);
             }
         }
+    }
+
+    /// One frame handed to SurfaceFlinger, awaiting its confirm. Decode thread.
+    fn note_released(&self) {
+        self.undisplayed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Releases still unconfirmed, and whether confirms happen on this device at all.
+    fn outstanding(&self) -> (i32, bool) {
+        (
+            self.undisplayed.load(Ordering::Relaxed),
+            self.confirms.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Write off the outstanding releases: the platform stopped confirming (it is allowed to
+    /// drop callbacks under load) or SurfaceFlinger discarded the buffers without presenting
+    /// them. Never stall the stream on a ledger we cannot audit.
+    fn forgive_outstanding(&self) {
+        self.undisplayed.store(0, Ordering::Relaxed);
     }
 
     /// One decoded frame's always-on measurements: the `decode`-stage split (feed =
@@ -239,6 +302,13 @@ pub(super) struct Presenter {
     no_budget: u64,
     forced: u64,
     dry: u64,
+    /// Pump passes that held a frame back because too many earlier releases were still
+    /// unconfirmed ([`UNDISPLAYED_CAP`]) — reads 0 on a healthy device, and a climbing value is
+    /// the signature of a presenter out-running its display.
+    queue_waits: u64,
+    /// When the unconfirmed-release rail first engaged, so it can be forgiven if the confirms
+    /// simply stopped coming. `None` while the rail is down.
+    backed_up_since: Option<i64>,
     pace_us: Vec<u64>,
     last_flush: Instant,
     /// The live submit margin. Starts at 0 (P2e on-glass: SurfaceFlinger latched every
@@ -280,6 +350,8 @@ impl Presenter {
             no_budget: 0,
             forced: 0,
             dry: 0,
+            queue_waits: 0,
+            backed_up_since: None,
             pace_us: Vec::with_capacity(256),
             last_flush: Instant::now(),
             margin_ns,
@@ -334,6 +406,7 @@ impl Presenter {
         codec: &MediaCodec,
         clock: Option<&VsyncShared>,
         tracker: &DisplayTracker,
+        meter: &PresentMeter,
         stats: &crate::stats::VideoStats,
         now_mono_ns: i64,
     ) -> bool {
@@ -346,6 +419,10 @@ impl Presenter {
                 self.inflight = None;
             }
         }
+        // The measured rail beneath that prediction (see `UNDISPLAYED_CAP`). Evaluated on every
+        // pass — frame waiting or not — so its forgiveness timer measures real elapsed time
+        // rather than how often a frame happened to be ready.
+        let backlogged = self.unconfirmed_backlog(meter, now_mono_ns);
         // Pick the frame this pump may release.
         let frame = if self.fifo_capacity == 0 {
             self.frames.pop_back() // submit() kept it a single slot; back == the newest
@@ -373,9 +450,12 @@ impl Presenter {
             self.frames.pop_front()
         };
         let Some(frame) = frame else { return false };
-        if self.inflight.is_some() {
+        if self.inflight.is_some() || backlogged {
             // Budget closed — park it back; a fresher submit replaces it (newest-wins), the next
             // vsync tick / loop pass retries the pairing.
+            if backlogged {
+                self.queue_waits += 1;
+            }
             self.no_budget += 1;
             match self.fifo_capacity {
                 0 => self.frames.push_back(frame),
@@ -412,6 +492,7 @@ impl Presenter {
             released_at_ns: now_mono_ns,
         });
         self.released += 1;
+        meter.note_released();
         let release_real_ns = now_realtime_ns();
         let pace_us = ((release_real_ns - frame.decoded_ns).max(0) / 1000) as u64;
         if self.pace_us.len() < 4096 {
@@ -420,6 +501,33 @@ impl Presenter {
         stats.note_release(pace_us);
         tracker.note_rendered(frame.pts_us, frame.decoded_ns, release_real_ns);
         true
+    }
+
+    /// Whether SurfaceFlinger is sitting on too many unconfirmed releases to be handed another.
+    ///
+    /// The predicted reopen is only as good as the panel grid behind it; this is the measured
+    /// rail underneath it (see [`UNDISPLAYED_CAP`]). It self-clears two ways — the confirms catch
+    /// up, or [`STALE_REOPEN_NS`] passes with the backlog stuck, which means the ledger itself is
+    /// unreliable (callbacks dropped under load, or SF discarded the buffers) and is written off
+    /// rather than allowed to wedge the stream.
+    fn unconfirmed_backlog(&mut self, meter: &PresentMeter, now_ns: i64) -> bool {
+        let (outstanding, confirms_live) = meter.outstanding();
+        if !confirms_live || outstanding < UNDISPLAYED_CAP {
+            self.backed_up_since = None;
+            return false;
+        }
+        match self.backed_up_since {
+            Some(t) if now_ns - t > STALE_REOPEN_NS => {
+                meter.forgive_outstanding();
+                self.backed_up_since = None;
+                self.forced += 1;
+                false
+            }
+            _ => {
+                self.backed_up_since.get_or_insert(now_ns);
+                true
+            }
+        }
     }
 
     /// Release every held buffer unrendered — the teardown path, BEFORE `codec.stop()`.
@@ -434,7 +542,9 @@ impl Presenter {
     /// `pf-present` line, so a HUD-off on-device A/B is readable wirelessly:
     /// `released` (to glass) / `displays` (OnFrameRendered confirms) / `paced` (policy drops) /
     /// `noBudget` (waits on the closed budget) / `forced` (stale force-opens — 0 when healthy) /
-    /// `qDry` (FIFO underflows) / `pace` (decoded→release) / `latch` (release→displayed) /
+    /// `qDry` (FIFO underflows) / `qWait` (pumps held back by unconfirmed releases — 0 when
+    /// healthy) / `unconfirmed` (releases OnFrameRendered hasn't settled) /
+    /// `pace` (decoded→release) / `latch` (release→displayed) /
     /// `feed`+`codec` (the decode stage split: received→queued hand-off/slot wait + the
     /// codec-pure queued→decoded time) / `e2e` (capture→decoded, skew-corrected — the wireless
     /// A/B headline) / `vsync` (the measured panel period).
@@ -462,14 +572,15 @@ impl Presenter {
         let circ = clock.and_then(|c| {
             punktfunk_core::phase::circular_latch(&latch, c.panel_period_ns().max(c.period_ns()))
         });
+        let latch_samples = latch.len();
         let (latch_p50, latch_max) = p50_max_ms(latch);
         let period_ms = clock.map(|c| c.period_ns() as f64 / 1e6).unwrap_or(0.0);
-        let panel_ms = clock
-            .map(|c| c.panel_period_ns() as f64 / 1e6)
-            .unwrap_or(0.0);
+        let panel_ns = clock.map(|c| c.panel_period_ns()).unwrap_or(0);
+        let (outstanding, _) = meter.outstanding();
         log::info!(
             target: "pf.present",
             "released={} displays={} paced={} noBudget={} forced={} qDry={} \
+             qWait={} unconfirmed={} \
              paceMs p50={:.2} max={:.2} latchMs p50={:.2} max={:.2} \
              feedMs p50={:.2} max={:.2} codecMs p50={:.2} max={:.2} \
              e2eMs p50={:.2} max={:.2} circ={:.2}ms coh={} \
@@ -480,6 +591,8 @@ impl Presenter {
             self.no_budget,
             self.forced,
             self.dry,
+            self.queue_waits,
+            outstanding,
             pace_p50,
             pace_max,
             latch_p50,
@@ -493,25 +606,48 @@ impl Presenter {
             circ.map(|(m, _)| m as f64 / 1e6).unwrap_or(0.0),
             circ.map(|(_, c)| c).unwrap_or(0),
             period_ms,
-            panel_ms,
+            panel_ns as f64 / 1e6,
         );
         self.released = 0;
-        // Margin adaptation: repeated latch misses in one window (a miss presents a vsync
-        // late and coalesces the next frame into `paced`) mean this device's SF does need
-        // lead — widen toward the pre-sweep ceiling. One-way by design: a margin that once
-        // proved necessary is never re-gambled mid-stream (the next stream restarts at 0).
-        if !self.margin_pinned && self.paced_drops > 2 && self.margin_ns < LATCH_MARGIN_NS {
+        // Margin adaptation, off the MEASURED latch. A release targets the first grid point past
+        // `now + margin`, so a frame that makes its vsync is on glass within one panel period of
+        // that margin; beyond it, SurfaceFlinger wanted more lead and the frame waited out an
+        // extra refresh. Widen toward the pre-sweep ceiling. One-way by design: a margin that
+        // once proved necessary is never re-gambled mid-stream (the next stream restarts at 0).
+        //
+        // ⚠ NOT `paced_drops`, which 0.23.0 used: those are the newest-wins store's own policy
+        // evictions — a second frame decoding while one is held — which happen whenever the
+        // stream out-runs the panel and say nothing at all about SF's latch lead. Driving the
+        // margin from them widened it to the ceiling on healthy devices, re-imposing the 2.5 ms
+        // of pure display latency the P2e sweep had just measured away.
+        let latch_p50_ns = (latch_p50 * 1e6) as i64;
+        if !self.margin_pinned
+            && self.margin_ns < LATCH_MARGIN_NS
+            && panel_ns > 0
+            && latch_samples >= 8
+            && latch_p50_ns > panel_ns + self.margin_ns
+        {
             self.margin_ns = (self.margin_ns + 500_000).min(LATCH_MARGIN_NS);
             log::warn!(
-                "presenter: {} latch misses in 1s — margin widened to {}us",
-                self.paced_drops,
+                "presenter: latch p50 {:.2}ms over the {:.2}ms panel period — margin widened to {}us",
+                latch_p50,
+                panel_ns as f64 / 1e6,
                 self.margin_ns / 1_000
+            );
+        }
+        if self.queue_waits > 0 {
+            log::warn!(
+                "presenter: {} pump(s) held back — {} release(s) still unconfirmed by \
+                 OnFrameRendered (the display is not keeping up with the release rate)",
+                self.queue_waits,
+                outstanding
             );
         }
         self.paced_drops = 0;
         self.no_budget = 0;
         self.forced = 0;
         self.dry = 0;
+        self.queue_waits = 0;
         circ
     }
 }
