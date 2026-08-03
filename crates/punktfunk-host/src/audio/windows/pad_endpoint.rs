@@ -1615,7 +1615,7 @@ pub(crate) fn render_test_tone(endpoint_id: &str, seconds: u32, hz: f32) -> Resu
             continue;
         }
         for f in 0..n {
-            let s = (phase.sin() * 0.5) as f32;
+            let s = phase.sin() * 0.5;
             phase += step;
             if phase >= std::f32::consts::TAU {
                 phase -= std::f32::consts::TAU;
