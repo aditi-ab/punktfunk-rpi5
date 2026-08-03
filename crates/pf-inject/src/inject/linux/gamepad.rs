@@ -669,6 +669,11 @@ impl GamepadManager {
     /// Service every pad's FF protocol; `send(index, low, high)` is invoked for each pad whose
     /// mixed rumble level changed. Call frequently (games block in `EVIOCSFF` until answered).
     pub fn pump_rumble(&mut self, mut send: impl FnMut(u16, u16, u16)) {
+        // Finish any unplug whose removal frame only armed the grace — the producer sends that
+        // frame once, so without this the uinput node would outlive the controller. The swept
+        // mask is discarded because this manager keeps no per-index sibling state (the pads mix
+        // rumble internally); if that ever changes, consume it like the other two backends do.
+        self.slots.reap();
         for (i, pad) in self.slots.iter_mut() {
             if let Some((low, high)) = pad.pump_ff() {
                 send(i as u16, low, high);

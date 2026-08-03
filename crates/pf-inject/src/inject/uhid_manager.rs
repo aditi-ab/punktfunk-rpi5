@@ -217,13 +217,10 @@ impl<B: PadProto> UhidManager<B> {
                 if idx >= MAX_PADS {
                     return;
                 }
-                // Unplugs: drop any allocated pad whose mask bit cleared, resetting its state.
+                // Unplugs: arm the grace for any pad whose mask bit cleared (the drop itself lands
+                // on a later `pump` tick — this frame is the only one the producer sends).
                 let swept = self.slots.sweep(f.active_mask);
-                for i in 0..MAX_PADS {
-                    if swept & (1 << i) != 0 {
-                        self.reset_pad(i);
-                    }
-                }
+                self.reset_swept(swept);
                 if f.active_mask & (1 << idx) == 0 {
                     return; // this event WAS the unplug
                 }
@@ -282,6 +279,12 @@ impl<B: PadProto> UhidManager<B> {
         mut hidout: impl FnMut(HidOutput),
     ) {
         let now = Instant::now();
+        // Finish any unplug whose removal frame only armed the grace. The producer emits that
+        // frame exactly once, so without this a detached pad — the single-pad session being the
+        // common case — would never be destroyed. Runs BEFORE the loop so a reaped index is
+        // already gone for `get_mut` here and for `heartbeat`'s `get` later in the same tick.
+        let swept = self.slots.reap();
+        self.reset_swept(swept);
         for i in 0..MAX_PADS {
             let Some(pad) = self.slots.get_mut(i) else {
                 continue;
@@ -357,6 +360,18 @@ impl<B: PadProto> UhidManager<B> {
         let backend = &mut self.backend;
         if self.slots.ensure(idx, |i| backend.open(i)) {
             self.reset_pad(idx);
+        }
+    }
+
+    /// Reset the sibling state of every index a sweep or reap just dropped. Both halves of the
+    /// unplug land here, so a pad torn down on the pump tick clears exactly what one torn down on
+    /// a state frame would — in particular `hidout_dedup`, which has no watchdog to re-arm it and
+    /// would otherwise swallow an identical lightbar/trigger re-assert after a re-plug.
+    fn reset_swept(&mut self, swept: u16) {
+        for i in 0..MAX_PADS {
+            if swept & (1 << i) != 0 {
+                self.reset_pad(i);
+            }
         }
     }
 
@@ -494,18 +509,36 @@ mod tests {
     }
 
     #[test]
-    fn removal_frame_never_recreates_the_pad_it_swept() {
+    fn one_removal_frame_plus_a_pump_tick_completes_the_unplug() {
+        // The producer emits the cleared-mask frame exactly ONCE — `native/input.rs` guards it on
+        // the bit still being set — so the teardown has to finish on the periodic pump. The
+        // previous version of this test hand-fed a SECOND removal frame, which is what let the
+        // never-reaped pad hide: with one frame and no pump, the device outlived the session.
         let mut m = mgr();
         m.handle(&frame(1, 0b10, 0));
         assert!(m.slots.get(1).is_some());
-        // Bit 1 cleared: the first sweep only ARMS the devnode-churn grace — the pad holds (a
-        // mask glitch must not flap PnP devices; see pad_slots::SWEEP_GRACE).
+        // The one removal frame: arms the devnode-churn grace, drops nothing.
         m.handle(&frame(1, 0b00, 0));
         assert!(m.slots.get(1).is_some(), "inside the grace — not yet swept");
-        // Grace elapsed: the frame IS pad 1's removal — sweep, then early-return (no ensure).
+        // A tick inside the grace must NOT flap the devnode (pad_slots::SWEEP_GRACE).
+        m.pump(|_, _, _| {}, |_| {});
+        assert!(
+            m.slots.get(1).is_some(),
+            "a tick inside the grace dropped it"
+        );
+        // Grace elapsed: the next tick completes the unplug, with no further frame.
         m.slots.expire_grace();
+        m.pump(|_, _, _| {}, |_| {});
+        assert!(
+            m.slots.get(1).is_none(),
+            "the pump tick never completed the unplug"
+        );
+        // …and a further cleared-mask frame must not resurrect it (the arm branch early-returns).
         m.handle(&frame(1, 0b00, 0));
-        assert!(m.slots.get(1).is_none());
+        assert!(
+            m.slots.get(1).is_none(),
+            "a cleared-mask frame recreated the pad"
+        );
     }
 
     #[test]
@@ -551,10 +584,15 @@ mod tests {
         assert_eq!(collect(&mut m), vec![(0, 100, 0)]); // first value forwards
         assert_eq!(collect(&mut m), vec![]); // exact repeat deduped
         assert_eq!(collect(&mut m), vec![(0, 7, 7)]); // change forwards
-                                                      // Unplug + recreate re-arms the dedup: the same level forwards again.
-        m.handle(&frame(0, 0b0, 0)); // arms the sweep grace
+                                                      // Unplug + recreate re-arms the dedup: the same level forwards again. The unplug completes
+                                                      // on a PUMP tick, not on a second frame — that is all production ever sends.
+        m.handle(&frame(0, 0b0, 0)); // the one removal frame — arms the grace
         m.slots.expire_grace();
-        m.handle(&frame(0, 0b0, 0)); // grace elapsed — actually swept
+        assert_eq!(collect(&mut m), vec![]); // this tick reaps; nothing queued to forward
+        assert!(
+            m.slots.get(0).is_none(),
+            "the pump tick completed the unplug"
+        );
         m.handle(&frame(0, 0b1, 0));
         *m.backend.feedback.borrow_mut() = vec![rumble((7, 7))];
         assert_eq!(collect(&mut m), vec![(0, 7, 7)]);
