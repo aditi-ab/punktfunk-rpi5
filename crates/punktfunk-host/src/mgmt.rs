@@ -253,6 +253,7 @@ fn api_router_parts() -> (Router<Arc<MgmtState>>, utoipa::openapi::OpenApi) {
                 .routes(routes!(plugins::list_plugins))
                 .routes(routes!(plugins::register_plugin, plugins::delete_plugin))
                 .routes(routes!(plugins::get_ui_credential))
+                .routes(routes!(plugins::ingest_plugin_logs))
                 .routes(routes!(store::get_catalog))
                 .routes(routes!(store::refresh_catalog))
                 .routes(routes!(store::list_installed))

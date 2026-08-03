@@ -45,6 +45,16 @@ pub struct Stats {
     /// so a speed-test numerator built from it inherits whatever video was in flight around
     /// the burst — these keep video out of the probe math. Deliberately NOT mirrored into the
     /// C-ABI `PunktfunkStats` (probe measurements surface via `ProbeOutcome`).
+    /// Media bytes delivered to the video reassembler: DATA-shard payload only — no packet
+    /// headers, no FEC parity, no probe filler, no audio. This is the rate the encoder's target
+    /// is a promise about, and the only honest thing to compare that target against.
+    /// `bytes_received` counts every accepted datagram, so a "delivered throughput" built from
+    /// it rises with the FEC redundancy the host adds in answer to loss — which meant the
+    /// adaptive-bitrate utilization gate ("did the pipeline actually carry ~the target?") read
+    /// 25 % high exactly on the lossy links it exists for, and the never-decaying
+    /// proven-throughput mark inherited the same inflation. Deliberately NOT mirrored into the
+    /// C-ABI `PunktfunkStats`.
+    pub media_bytes_received: u64,
     pub probe_packets_received: u64,
     pub probe_bytes_received: u64,
     /// First / last probe-packet arrival (monotonic ns, see [`now_monotonic_ns`]; 0 = none
@@ -75,6 +85,7 @@ pub struct StatsCounters {
     pub fec_late_shards: AtomicU64,
     pub bytes_sent: AtomicU64,
     pub bytes_received: AtomicU64,
+    pub media_bytes_received: AtomicU64,
     pub probe_packets_received: AtomicU64,
     pub probe_bytes_received: AtomicU64,
     pub probe_first_arrival_ns: AtomicU64,
@@ -101,6 +112,7 @@ impl StatsCounters {
             fec_late_shards: self.fec_late_shards.load(l),
             bytes_sent: self.bytes_sent.load(l),
             bytes_received: self.bytes_received.load(l),
+            media_bytes_received: self.media_bytes_received.load(l),
             probe_packets_received: self.probe_packets_received.load(l),
             probe_bytes_received: self.probe_bytes_received.load(l),
             probe_first_arrival_ns: self.probe_first_arrival_ns.load(l),
