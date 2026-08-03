@@ -504,6 +504,14 @@ pub fn pad_endpoint(args: &[String]) -> Result<()> {
         .nth(1)
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
+    // `--endpoint <id>` drives ANY render endpoint, not just a provisioned pad one. It is the
+    // discriminator between "this process cannot activate anything" and "our endpoint is broken":
+    // aim the same binary at a known-good endpoint and see whether it succeeds there.
+    let endpoint_override: Option<String> = args
+        .iter()
+        .skip_while(|a| *a != "--endpoint")
+        .nth(1)
+        .cloned();
     match args.get(1).map(String::as_str) {
         Some("ensure") => {
             let p = pe::ensure(idx)?;
@@ -533,23 +541,30 @@ pub fn pad_endpoint(args: &[String]) -> Result<()> {
         Some("tone") => {
             let secs: u32 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(5);
             let hz: f32 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(60.0);
-            // `find` (a system lookup), NOT `endpoint_for` (the service's in-process cache):
-            // this runs as a separate CLI process and has no cache of its own.
-            let Some(ep) = pe::find(idx)? else {
-                println!(
-                    "pad-endpoint tone: no pad-audio devnode for pad {idx} — run `ensure` first"
-                );
-                return Ok(());
+            let endpoint_id = match endpoint_override {
+                Some(id) => id,
+                None => {
+                    // `find` (a system lookup), NOT `endpoint_for` (the service's in-process
+                    // cache): this runs as a separate CLI process and has no cache of its own.
+                    let Some(ep) = pe::find(idx)? else {
+                        println!(
+                            "pad-endpoint tone: no pad-audio devnode for pad {idx} — run \
+                             `ensure` first"
+                        );
+                        return Ok(());
+                    };
+                    if ep.endpoint_id.is_empty() {
+                        println!("pad-endpoint tone: pad {idx} has no endpoint id yet");
+                        return Ok(());
+                    }
+                    ep.endpoint_id
+                }
             };
-            if ep.endpoint_id.is_empty() {
-                println!("pad-endpoint tone: pad {idx} has no endpoint id yet");
-                return Ok(());
-            }
             println!(
-                "pad-endpoint tone: {hz} Hz into the BACK pair (haptics) of {} for {secs}s",
-                ep.endpoint_id
+                "pad-endpoint tone: {hz} Hz into the BACK pair (haptics) of {endpoint_id} for \
+                 {secs}s"
             );
-            pe::render_test_tone(&ep.endpoint_id, secs, hz)?;
+            pe::render_test_tone(&endpoint_id, secs, hz)?;
             println!(
                 "pad-endpoint tone: done. A connected client with pad audio enabled should have \
                  buzzed; the host log shows whether the gate opened."

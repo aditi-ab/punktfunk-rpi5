@@ -62,7 +62,9 @@ use windows::Win32::Devices::Properties::{
     DEVPKEY_Device_DriverInfPath, DEVPROPTYPE, DEVPROP_TYPE_STRING,
 };
 use windows::Win32::Foundation::PROPERTYKEY;
-use windows::Win32::Media::Audio::{IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator};
+use windows::Win32::Media::Audio::{
+    IAudioClient, IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator,
+};
 use windows::Win32::System::Com::StructuredStorage::{
     PropVariantClear, PROPVARIANT, PROPVARIANT_0, PROPVARIANT_0_0, PROPVARIANT_0_0_0,
 };
@@ -326,11 +328,19 @@ fn endpoint_guid_part(endpoint_id: &str) -> Result<&str> {
         .ok_or_else(|| anyhow!("unrecognised endpoint id shape: {endpoint_id}"))
 }
 
-// --- PROPVARIANT plumbing (windows-rs PROPVARIANTs have no Drop: building borrowed ones is
-// --- safe; owned ones from GetValue are cleared explicitly) ---------------------------------
+// --- PROPVARIANT plumbing -------------------------------------------------------------------
+//
+// ⚠ `windows 0.62` DOES implement `Drop for PROPVARIANT`, as `PropVariantClear(self)`. Every
+// variant below points at memory Rust owns — a `Vec<u16>`, a borrowed `&GUID`, a `&'static
+// [u8]` — so letting one drop hands that pointer to `CoTaskMemFree` and corrupts the heap. The
+// symptom is not local: provisioning died later with STATUS_HEAP_CORRUPTION (0xC0000374),
+// leaving the endpoint half-stamped, which then looked like a stamping-permissions problem.
+// Hence `ManuallyDrop`: these variants borrow, so nothing must ever clear them. (Variants that
+// come back OWNED from `GetValue` are a different matter and ARE cleared, in `stamp_served`.)
 
-fn pv_lpwstr(w: &[u16]) -> PROPVARIANT {
-    PROPVARIANT {
+/// A `VT_LPWSTR` variant borrowing `w`, which must outlive it and stay NUL-terminated.
+fn pv_lpwstr(w: &[u16]) -> ManuallyDrop<PROPVARIANT> {
+    ManuallyDrop::new(PROPVARIANT {
         Anonymous: PROPVARIANT_0 {
             Anonymous: ManuallyDrop::new(PROPVARIANT_0_0 {
                 vt: VT_LPWSTR,
@@ -342,11 +352,12 @@ fn pv_lpwstr(w: &[u16]) -> PROPVARIANT {
                 },
             }),
         },
-    }
+    })
 }
 
-fn pv_clsid(g: &GUID) -> PROPVARIANT {
-    PROPVARIANT {
+/// A `VT_CLSID` variant borrowing `g`, which must outlive it.
+fn pv_clsid(g: &GUID) -> ManuallyDrop<PROPVARIANT> {
+    ManuallyDrop::new(PROPVARIANT {
         Anonymous: PROPVARIANT_0 {
             Anonymous: ManuallyDrop::new(PROPVARIANT_0_0 {
                 vt: VT_CLSID,
@@ -358,11 +369,12 @@ fn pv_clsid(g: &GUID) -> PROPVARIANT {
                 },
             }),
         },
-    }
+    })
 }
 
-fn pv_blob(b: &[u8]) -> PROPVARIANT {
-    PROPVARIANT {
+/// A `VT_BLOB` variant borrowing `b`, which must outlive it.
+fn pv_blob(b: &[u8]) -> ManuallyDrop<PROPVARIANT> {
+    ManuallyDrop::new(PROPVARIANT {
         Anonymous: PROPVARIANT_0 {
             Anonymous: ManuallyDrop::new(PROPVARIANT_0_0 {
                 vt: VT_BLOB,
@@ -377,7 +389,7 @@ fn pv_blob(b: &[u8]) -> PROPVARIANT {
                 },
             }),
         },
-    }
+    })
 }
 
 fn pv_string(pv: &PROPVARIANT) -> Option<String> {
@@ -804,6 +816,46 @@ fn open_mmdevice(endpoint_id: &str) -> Result<IMMDevice> {
     }
 }
 
+/// Open a [`wasapi::Device`] for an endpoint id WITHOUT the crate's `DeviceEnumerator::get_device`.
+///
+/// `wasapi 0.23` builds that call's argument as
+/// `PCWSTR::from_raw(HSTRING::from(device_id).as_ptr())`. The `HSTRING` is a temporary, so it is
+/// dropped at the end of THAT statement and `IMMDeviceEnumerator::GetDevice` reads freed memory on
+/// the next line. Whether the endpoint is found then depends on what the allocator happened to
+/// leave behind — a heisenbug whose failure mode is `0x80070002` (ERROR_FILE_NOT_FOUND) for an id
+/// that is perfectly valid. [`open_mmdevice`] keeps its wide buffer alive across the call, so
+/// resolve there and only borrow the crate's wrapper around the resulting interface.
+fn open_wasapi_device(endpoint_id: &str) -> Result<wasapi::Device> {
+    let dev = open_mmdevice(endpoint_id)?;
+    wasapi::Device::from_immdevice(dev)
+        .map_err(|e| anyhow!("wrap IMMDevice {endpoint_id} as a wasapi Device: {e}"))
+}
+
+/// Log whether this endpoint can be activated IN THIS PROCESS, at both layers.
+///
+/// The whole pad-audio bring-up stalled on an `IAudioClient: 0x80070002` that named no layer: the
+/// endpoint resolved, the property store opened, and only activation failed — which is equally
+/// consistent with a dead endpoint, a process that cannot activate anything, and a bad argument
+/// handed to the COM call. Reporting the raw `IMMDevice::Activate` result next to the crate's
+/// tells them apart in one run instead of one rebuild each.
+fn probe_activation(endpoint_id: &str) {
+    match open_mmdevice(endpoint_id) {
+        Err(e) => tracing::error!(endpoint = %endpoint_id, error = %format!("{e:#}"),
+            "activation probe: GetDevice failed"),
+        Ok(dev) => {
+            // SAFETY: standard COM activation on a COM-initialized thread; the returned
+            // interface is dropped immediately (the probe only wants the HRESULT).
+            match unsafe { dev.Activate::<IAudioClient>(CLSCTX_ALL, None) } {
+                Ok(_) => tracing::info!(endpoint = %endpoint_id,
+                    "activation probe: raw IMMDevice::Activate(IAudioClient) OK"),
+                Err(e) => tracing::error!(endpoint = %endpoint_id,
+                    hr = %format!("{:#010x}", e.code().0),
+                    "activation probe: raw IMMDevice::Activate(IAudioClient) FAILED"),
+            }
+        }
+    }
+}
+
 /// Does the property store SERVE this stamp's value right now?
 fn stamp_served(store: &IPropertyStore, s: &Stamp) -> bool {
     // SAFETY: the key is a valid PROPERTYKEY; GetValue returns an owned variant that is
@@ -829,17 +881,17 @@ fn set_store_value(store: &IPropertyStore, s: &Stamp) -> Result<()> {
             let buf = wide(v);
             let pv = pv_lpwstr(&buf);
             // SAFETY: the variant borrows `buf`, which outlives the call; SetValue copies.
-            unsafe { store.SetValue(&s.key, &pv) }.context(s.label)?;
+            unsafe { store.SetValue(&s.key, &*pv) }.context(s.label)?;
         }
         StampValue::Container(g) => {
             let pv = pv_clsid(g);
-            // SAFETY: the variant borrows `g`, which outlives the call; SetValue copies.
-            unsafe { store.SetValue(&s.key, &pv) }.context(s.label)?;
+            // SAFETY: the variant borrows `*g`, which outlives the call; SetValue copies.
+            unsafe { store.SetValue(&s.key, &*pv) }.context(s.label)?;
         }
         StampValue::Format(wfx) => {
             let pv = pv_blob(&wfx[..]);
             // SAFETY: the variant borrows the static format bytes; SetValue copies.
-            unsafe { store.SetValue(&s.key, &pv) }.context(s.label)?;
+            unsafe { store.SetValue(&s.key, &*pv) }.context(s.label)?;
         }
     }
     Ok(())
@@ -1491,11 +1543,10 @@ pub(crate) fn render_test_tone(endpoint_id: &str, seconds: u32, hz: f32) -> Resu
         .ok()
         .context("initialize COM (MTA) for the tone render")?;
 
+    probe_activation(endpoint_id);
     // By id, never a default-device resolve: the whole question being answered is whether THIS
     // endpoint is the one the capture sees.
-    let device = wasapi::DeviceEnumerator::new()
-        .context("device enumerator")?
-        .get_device(endpoint_id)
+    let device = open_wasapi_device(endpoint_id)
         .with_context(|| format!("pad endpoint {endpoint_id} not found"))?;
     let mut audio_client = device.get_iaudioclient().context("IAudioClient")?;
     let desired = WaveFormat::new(
@@ -1614,10 +1665,8 @@ fn pad_capture_thread(
     // hands us the contract format regardless of the endpoint's current mix format; capturing
     // a RENDER device with Direction::Capture in shared mode is WASAPI loopback.
     let setup = (|| -> Result<(wasapi::AudioClient, wasapi::AudioCaptureClient, wasapi::Handle)> {
-        let device = wasapi::DeviceEnumerator::new()
-            .map_err(|e| anyhow!("DeviceEnumerator: {e}"))?
-            .get_device(endpoint_id)
-            .map_err(|e| anyhow!("open pad endpoint {endpoint_id}: {e}"))?;
+        let device = open_wasapi_device(endpoint_id)
+            .map_err(|e| anyhow!("open pad endpoint {endpoint_id}: {e:#}"))?;
         let mut audio_client = device.get_iaudioclient().context("IAudioClient")?;
         let desired = WaveFormat::new(
             32,
