@@ -527,6 +527,33 @@ pub fn pad_endpoint(args: &[String]) -> Result<()> {
                 Ok(())
             }
         },
+        // `punktfunk-host pad-endpoint <n> tone [seconds] [hz]` — drive the endpoint directly so
+        // the whole pad-audio chain can be exercised without a game. Without this, every attempt
+        // costs a game launch and a failure does not say which link broke.
+        Some("tone") => {
+            let secs: u32 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(5);
+            let hz: f32 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(60.0);
+            let Some(ep) = pe::endpoint_for(idx) else {
+                println!(
+                    "pad-endpoint tone: no provisioned endpoint for pad {idx} — run `ensure` first"
+                );
+                return Ok(());
+            };
+            if ep.endpoint_id.is_empty() {
+                println!("pad-endpoint tone: pad {idx} has no endpoint id yet");
+                return Ok(());
+            }
+            println!(
+                "pad-endpoint tone: {hz} Hz into the BACK pair (haptics) of {} for {secs}s",
+                ep.endpoint_id
+            );
+            pe::render_test_tone(&ep.endpoint_id, secs, hz)?;
+            println!(
+                "pad-endpoint tone: done. A connected client with pad audio enabled should have \
+                 buzzed; the host log shows whether the gate opened."
+            );
+            Ok(())
+        }
         Some("status") => pe::print_status(idx),
         _ => anyhow::bail!("usage: punktfunk-host pad-endpoint <ensure|remove|status> [--index N]"),
     }

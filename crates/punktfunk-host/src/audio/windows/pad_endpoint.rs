@@ -1475,6 +1475,99 @@ impl PadLoopbackCapturer {
     }
 }
 
+/// Render a test tone straight into a pad's audio endpoint.
+///
+/// The point is iteration speed. Without this, exercising the pad-audio chain means launching a
+/// game that renders DualSense haptics and hoping it targets the right endpoint — minutes per
+/// attempt, and a failure tells you nothing about *which* link broke. This drives the endpoint
+/// directly, so the rest of the chain (loopback capture → gate → Opus → 0xD1 → client → the pad's
+/// actuators) can be tested in seconds and in isolation from whether any game cooperates.
+///
+/// The tone goes into the BACK channel pair, because that is the pair the framer routes to the
+/// haptics kind — the voice coils. The front pair stays silent, so a pass is felt in the grips and
+/// cannot be confused with the pad's speaker.
+pub(crate) fn render_test_tone(endpoint_id: &str, seconds: u32, hz: f32) -> Result<()> {
+    wasapi::initialize_mta()
+        .ok()
+        .context("initialize COM (MTA) for the tone render")?;
+
+    // By id, never a default-device resolve: the whole question being answered is whether THIS
+    // endpoint is the one the capture sees.
+    let device = wasapi::DeviceEnumerator::new()
+        .context("device enumerator")?
+        .get_device(endpoint_id)
+        .with_context(|| format!("pad endpoint {endpoint_id} not found"))?;
+    let mut audio_client = device.get_iaudioclient().context("IAudioClient")?;
+    let desired = WaveFormat::new(
+        32,
+        32,
+        &SampleType::Float,
+        SAMPLE_RATE as usize,
+        PAD_CHANNELS as usize,
+        None,
+    );
+    let (default_period, _min) = audio_client.get_device_period().context("device period")?;
+    audio_client
+        .initialize_client(
+            &desired,
+            &Direction::Render,
+            &StreamMode::EventsShared {
+                autoconvert: true,
+                buffer_duration_hns: default_period,
+            },
+        )
+        .context("initialize render client")?;
+    let h_event = audio_client.set_get_eventhandle().context("event handle")?;
+    let render = audio_client
+        .get_audiorenderclient()
+        .context("IAudioRenderClient")?;
+    let buf_frames = audio_client.get_buffer_size().context("buffer size")? as usize;
+    let block = PAD_CHANNELS as usize * std::mem::size_of::<f32>();
+    // Start on silence so the stream opens without a glitch, exactly as the mic pump does.
+    let _ = render.write_to_device(buf_frames, &vec![0u8; buf_frames * block], None);
+    audio_client.start_stream().context("start render stream")?;
+
+    let total = u64::from(SAMPLE_RATE) * u64::from(seconds.clamp(1, 60));
+    let step = std::f32::consts::TAU * hz / SAMPLE_RATE as f32;
+    let mut phase = 0.0f32;
+    let mut written = 0u64;
+    let mut bytes = vec![0u8; buf_frames * block];
+
+    while written < total {
+        if h_event.wait_for_event(1000).is_err() {
+            anyhow::bail!("render event timed out after {written} frames");
+        }
+        let free = audio_client
+            .get_available_space_in_frames()
+            .context("available space")? as usize;
+        let n = free.min((total - written) as usize);
+        if n == 0 {
+            continue;
+        }
+        for f in 0..n {
+            let s = (phase.sin() * 0.5) as f32;
+            phase += step;
+            if phase >= std::f32::consts::TAU {
+                phase -= std::f32::consts::TAU;
+            }
+            for c in 0..PAD_CHANNELS as usize {
+                // Back pair only — the haptics kind.
+                let v: f32 = if c >= 2 { s } else { 0.0 };
+                let at = (f * PAD_CHANNELS as usize + c) * 4;
+                bytes[at..at + 4].copy_from_slice(&v.to_le_bytes());
+            }
+        }
+        render
+            .write_to_device(n, &bytes[..n * block], None)
+            .context("write tone")?;
+        written += n as u64;
+    }
+    // Let the tail drain before tearing the stream down.
+    std::thread::sleep(Duration::from_millis(200));
+    let _ = audio_client.stop_stream();
+    Ok(())
+}
+
 impl Drop for PadLoopbackCapturer {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
