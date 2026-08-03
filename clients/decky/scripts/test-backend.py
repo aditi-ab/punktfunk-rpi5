@@ -144,6 +144,33 @@ got = asyncio.run(plugin.get_pins())["pins"]
 check("pins: paired via known-hosts fp (case-insensitive)", got[0]["paired"] is True)
 shutil.rmtree(decky.DECKY_USER_HOME, ignore_errors=True)
 
+# ---- `--list-audio` parsing (the settings tab's device pickers) --------------------------
+sinks, sources = main._parse_audio_endpoints(
+    "sink\talsa_output.pci-0000_04_00.6.analog-stereo\tSteam Deck Speakers\n"
+    "sink\tbluez_output.AC_12_2F.1\tWH-1000XM4\n"
+    "source\talsa_input.pci-0000_04_00.6.analog-stereo\tSteam Deck Microphone\n"
+)
+check("audio: sinks parsed", [d["name"] for d in sinks] == [
+    "alsa_output.pci-0000_04_00.6.analog-stereo", "bluez_output.AC_12_2F.1"
+])
+check("audio: sources parsed", len(sources) == 1)
+check("audio: description kept", sinks[1]["description"] == "WH-1000XM4")
+
+# Junk the picker must not offer: no node.name is unusable (it is the id that gets stored), a
+# short line is malformed, and an unknown kind belongs to neither list. A blank description
+# falls back to the name so no entry renders unlabelled.
+sinks, sources = main._parse_audio_endpoints(
+    "sink\t\tNo node name\n"
+    "sink\tonly-two-columns\n"
+    "monitor\tsome.monitor\tNot a sink or source\n"
+    "source\tbare.node\t\n"
+    "\n"
+)
+check("audio: junk lines dropped", sinks == [])
+check("audio: blank description falls back to the node name", sources == [
+    {"name": "bare.node", "description": "bare.node"}
+])
+
 print()
 if failures:
     print(f"{failures} check(s) FAILED")
