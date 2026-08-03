@@ -1,5 +1,6 @@
 • Automatic bitrate no longer gets stuck at 20 Mbps for a whole session. It now climbs to what your connection really carries in seconds, not minutes.
 • Fixes a fault from 0.23.0 that could freeze the picture on a busy connection.
 • Fixes a refresh-rate mix-up that left the picture juddering for a whole session.
-• A decoder hiccup no longer snowballs into a burst of broken frames.
+• A decoder hiccup no longer causes a burst of broken frames.
+• Controllers rumble again after a reconnect.
 • New "Forward controllers" switch, for pads that reach the PC another way.
