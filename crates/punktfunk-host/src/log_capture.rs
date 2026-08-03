@@ -77,6 +77,32 @@ impl LogRing {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
+        self.push_entry(level.to_string(), target.to_string(), msg, ts_ms);
+    }
+
+    /// Ingest a line that was produced in **another process** — the plugin/script runner, via
+    /// `POST /plugins/logs` (see `mgmt::plugins::ingest_plugin_logs`).
+    ///
+    /// Plugins are not host child processes: the runner is a separate bun process that `import()`s
+    /// each plugin in-process, so a plugin's output never passes through this process's `tracing`
+    /// and [`RingLayer`] can't see it. Without this door the console's log page shows nothing about
+    /// the plugins at all, and on Windows nothing else does either — the runner task writes no log
+    /// file, so a failing plugin was diagnosable only by stopping the task and re-running it by
+    /// hand (field report 2026-08-03, the VirtualHere plugin).
+    ///
+    /// The caller's `ts_ms` is kept — the line was stamped when it happened, and re-stamping it on
+    /// arrival would collapse a whole batch onto the moment it was flushed. `seq` stays ours: it is
+    /// the cursor for a single ring with several producers, so only the ring can mint it.
+    pub fn push_remote(&self, level: &str, target: &str, msg: &str, ts_ms: u64) {
+        self.push_entry(
+            normalize_level(level).to_string(),
+            target.to_string(),
+            truncate_msg(msg.to_string()),
+            ts_ms,
+        );
+    }
+
+    fn push_entry(&self, level: String, target: String, msg: String, ts_ms: u64) {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let seq = inner.next_seq;
         inner.next_seq += 1;
@@ -86,8 +112,8 @@ impl LogRing {
         inner.entries.push_back(LogEntry {
             seq,
             ts_ms,
-            level: level.to_string(),
-            target: target.to_string(),
+            level,
+            target,
             msg,
         });
     }
@@ -123,6 +149,33 @@ impl LogRing {
 pub fn ring() -> &'static LogRing {
     static RING: OnceLock<LogRing> = OnceLock::new();
     RING.get_or_init(LogRing::new)
+}
+
+/// Coerce an externally-supplied level to the five the console's filter ranks. Anything else —
+/// a plugin inventing `NOTICE`, a truncated line, empty — becomes `INFO` rather than being
+/// rejected: an unfamiliar level is not a reason to drop the operator's diagnostics on the floor,
+/// and an unranked string would sort as `0` in the console's `RANK` map and hide under every filter.
+fn normalize_level(level: &str) -> &'static str {
+    match level.trim().to_ascii_uppercase().as_str() {
+        "ERROR" | "FATAL" | "SEVERE" => "ERROR",
+        "WARN" | "WARNING" => "WARN",
+        "DEBUG" => "DEBUG",
+        "TRACE" | "VERBOSE" => "TRACE",
+        _ => "INFO",
+    }
+}
+
+/// Cap a message at [`MAX_MSG`], cutting on a char boundary and marking the elision.
+fn truncate_msg(mut msg: String) -> String {
+    if msg.len() > MAX_MSG {
+        let mut end = MAX_MSG;
+        while !msg.is_char_boundary(end) {
+            end -= 1;
+        }
+        msg.truncate(end);
+        msg.push('…');
+    }
+    msg
 }
 
 /// Targets whose DEBUG/TRACE output is steady-state chatter, not diagnostics — left in, they evict
@@ -223,15 +276,7 @@ impl FieldFmt {
         } else {
             self.msg.push_str(&self.fields);
         }
-        if self.msg.len() > MAX_MSG {
-            let mut end = MAX_MSG;
-            while !self.msg.is_char_boundary(end) {
-                end -= 1;
-            }
-            self.msg.truncate(end);
-            self.msg.push('…');
-        }
-        self.msg
+        truncate_msg(self.msg)
     }
 }
 
@@ -358,6 +403,45 @@ mod tests {
         assert!(!warn.msg.contains("log.target"), "msg: {}", warn.msg);
         // Prefix match respects module-path boundaries.
         assert!(page.entries.iter().any(|e| e.target == "mdns_sdx"));
+    }
+
+    #[test]
+    fn remote_entries_keep_their_own_timestamp_and_share_the_cursor() {
+        let ring = LogRing::new();
+        ring.push(&tracing::Level::INFO, "punktfunk_host", "local".into());
+        ring.push_remote("WARN", "plugin:virtualhere", "remote", 1_700_000_000_123);
+
+        let page = ring.since(0, 10);
+        assert_eq!(page.entries.len(), 2);
+        // One sequence across both producers — the console's cursor cannot see two rings.
+        assert_eq!(page.entries[0].seq, 1);
+        assert_eq!(page.entries[1].seq, 2);
+        let remote = &page.entries[1];
+        assert_eq!(remote.level, "WARN");
+        assert_eq!(remote.target, "plugin:virtualhere");
+        assert_eq!(remote.msg, "remote");
+        // Stamped when it happened, not when the batch arrived.
+        assert_eq!(remote.ts_ms, 1_700_000_000_123);
+    }
+
+    #[test]
+    fn remote_levels_are_coerced_not_rejected() {
+        assert_eq!(normalize_level("error"), "ERROR");
+        assert_eq!(normalize_level(" Warning "), "WARN");
+        assert_eq!(normalize_level("TRACE"), "TRACE");
+        // An unranked level would sort as 0 in the console's filter and hide under every setting.
+        assert_eq!(normalize_level("NOTICE"), "INFO");
+        assert_eq!(normalize_level(""), "INFO");
+    }
+
+    #[test]
+    fn remote_messages_are_truncated_like_local_ones() {
+        let ring = LogRing::new();
+        ring.push_remote("INFO", "plugin:x", &"ä".repeat(MAX_MSG), 1);
+        let page = ring.since(0, 10);
+        let msg = &page.entries[0].msg;
+        assert!(msg.ends_with('…'));
+        assert!(msg.len() <= MAX_MSG + '…'.len_utf8());
     }
 
     #[test]

@@ -39,6 +39,29 @@ const KEEP = 5_000; // accumulated entries (client memory bound)
 const SHOW = 1_000; // rendered rows (DOM bound)
 
 /**
+ * Producer filter. The ring carries the host's own `tracing` events AND whatever the plugin runner
+ * ships up (`POST /api/v1/plugins/logs`), the latter targeted `plugin:<name>`. Without this the two
+ * are interleaved with nothing but the target column to tell them apart, and "show me what my
+ * plugin said" — the question that sends people to `journalctl` — means knowing to type `plugin:`
+ * into the search box.
+ */
+const SOURCES = ["all", "host", "plugins"] as const;
+type Source = (typeof SOURCES)[number];
+
+/** The target prefix the host stamps on every runner-shipped line. */
+const PLUGIN_TARGET_PREFIX = "plugin:";
+
+const matchesSource = (target: string, source: Source): boolean =>
+	source === "all" ||
+	(source === "plugins") === target.startsWith(PLUGIN_TARGET_PREFIX);
+
+const SOURCE_LABEL: Record<Source, () => string> = {
+	all: () => m.logs_source_all(),
+	host: () => m.logs_source_host(),
+	plugins: () => m.logs_source_plugins(),
+};
+
+/**
  * Container: cursor-paged log polling. A non-empty page advances the cursor — a new query key,
  * so the next page fetches immediately and a backlog drains fast; an empty page leaves the key
  * unchanged and `refetchInterval` paces the idle poll. Pausing (follow off) stops the interval.
@@ -177,6 +200,7 @@ export const LogsCard: FC<{
 	onRetry,
 }) => {
 	const [minLevel, setMinLevel] = useState<MinLevel>("DEBUG");
+	const [source, setSource] = useState<Source>("all");
 	const [search, setSearch] = useState("");
 	const listRef = useRef<HTMLDivElement>(null);
 
@@ -186,11 +210,12 @@ export const LogsCard: FC<{
 		return entries.filter(
 			(e) =>
 				(RANK[e.level] ?? 0) >= min &&
+				matchesSource(e.target, source) &&
 				(q === "" ||
 					e.msg.toLowerCase().includes(q) ||
 					e.target.toLowerCase().includes(q)),
 		);
-	}, [entries, minLevel, search]);
+	}, [entries, minLevel, source, search]);
 	const visible = useMemo(() => matched.slice(-SHOW), [matched]);
 	const shareLabel = shareMode === "share" ? m.logs_share() : m.logs_copy();
 
@@ -230,6 +255,18 @@ export const LogsCard: FC<{
 								onClick={() => setMinLevel(l)}
 							>
 								{l}
+							</Button>
+						))}
+					</div>
+					<div className="flex items-center gap-1 border-l pl-2">
+						{SOURCES.map((s) => (
+							<Button
+								key={s}
+								size="sm"
+								variant={source === s ? "secondary" : "ghost"}
+								onClick={() => setSource(s)}
+							>
+								{SOURCE_LABEL[s]()}
 							</Button>
 						))}
 					</div>
@@ -317,7 +354,15 @@ export const LogsCard: FC<{
 								</div>
 							) : (
 								<p className="text-muted-foreground">
-									{isLoading ? m.common_loading() : m.logs_empty()}
+									{isLoading
+										? m.common_loading()
+										: // "No plugin output" has a specific, actionable cause that the generic
+											// "adjust the filter" line actively misdirects from: the runner is a
+											// separate service and is opt-in on Linux, so the usual reason for an
+											// empty Plugins view is that it simply isn't running.
+											source === "plugins"
+											? m.logs_empty_plugins()
+											: m.logs_empty()}
 								</p>
 							)}
 						</div>
