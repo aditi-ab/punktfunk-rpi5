@@ -4991,7 +4991,7 @@ checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
 [[package]]
 name = "uac-host"
 version = "0.1.0"
-source = "git+https://github.com/unom-io/usbfs-iso?rev=fb01ea69c59e3bf08b3918f53a159287b5187ed2#fb01ea69c59e3bf08b3918f53a159287b5187ed2"
+source = "git+https://github.com/unom-io/usbfs-iso?rev=f3de1fd62cec271d07f45664dc464f23e423e721#f3de1fd62cec271d07f45664dc464f23e423e721"
 dependencies = [
  "usbfs-iso",
 ]
@@ -5078,7 +5078,7 @@ dependencies = [
 [[package]]
 name = "usbfs-iso"
 version = "0.1.0"
-source = "git+https://github.com/unom-io/usbfs-iso?rev=fb01ea69c59e3bf08b3918f53a159287b5187ed2#fb01ea69c59e3bf08b3918f53a159287b5187ed2"
+source = "git+https://github.com/unom-io/usbfs-iso?rev=f3de1fd62cec271d07f45664dc464f23e423e721#f3de1fd62cec271d07f45664dc464f23e423e721"
 dependencies = [
  "libc",
 ]
