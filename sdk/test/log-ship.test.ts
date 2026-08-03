@@ -228,6 +228,51 @@ describe("shipping", () => {
 		expect(all).toContain("during");
 	});
 
+	test("an explicit flush waits for an in-flight one instead of no-opping", async () => {
+		// This is the shutdown path. The runner flushes once more after its units' finalizers have
+		// run, and those last lines are the ones that say whether the shutdown WAS clean. If a
+		// periodic flush happened to be mid-POST, an explicit flush that simply returned would
+		// leave them unsent — and the window is widest exactly when the host is slow, which is when
+		// the logs matter most.
+		let release: (() => void) | undefined;
+		const held = new Promise<void>((r) => {
+			release = r;
+		});
+		let arrived: (() => void) | undefined;
+		const received = new Promise<void>((r) => {
+			arrived = r;
+		});
+		let first = true;
+		const batches: Captured[] = [];
+		const server = Bun.serve({
+			port: 0,
+			fetch: async (req) => {
+				batches.push((await req.json()) as Captured);
+				if (first) {
+					first = false;
+					arrived?.();
+					await held;
+				}
+				return new Response(null, { status: 204 });
+			},
+		});
+		stopHost = () => server.stop(true);
+
+		await withShipper(`http://127.0.0.1:${server.port}`, async (shipper) => {
+			console.log("2026-08-03T10:11:12.345Z [x] first");
+			const slow = shipper.flush();
+			await received;
+			console.log("2026-08-03T10:11:12.345Z [x] shutdown line");
+			release?.();
+			// The shutdown flush: must not return until the tail is actually sent.
+			await shipper.flush();
+			await slow;
+		});
+
+		const all = batches.flatMap((b) => b.entries.map((e) => e.msg));
+		expect(all).toContain("shutdown line");
+	});
+
 	test("overlapping flushes do not double-send", async () => {
 		// The timer can fire while a slow POST is still open. Two concurrent flushes would splice
 		// disjoint batches out of one queue and deliver them out of order.

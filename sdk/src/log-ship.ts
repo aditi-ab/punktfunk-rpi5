@@ -244,12 +244,23 @@ export const installLogShipper = (
 		}
 	};
 
+	// The most recent flush, so an explicit `flush()` can WAIT for a periodic one rather than hit
+	// the re-entry guard and return having sent nothing. That matters on the shutdown path: the
+	// runner flushes once more after its units' finalizers have run, and those last lines are the
+	// ones that say whether the shutdown was clean. The window is widest exactly when the host is
+	// slow — which is when the logs are worth most.
+	let inFlight: Promise<void> = Promise.resolve();
+	const runFlush = (): Promise<void> => {
+		inFlight = flush();
+		return inFlight;
+	};
+
 	const timer = setInterval(() => {
 		if (skipTicks > 0) {
 			skipTicks -= 1;
 			return;
 		}
-		void flush();
+		void runFlush();
 	}, options.intervalMs ?? 2_000);
 	// The runner parks on its own keep-alive handle; this timer must not be what holds the process
 	// open, or a runner with nothing to run would never exit.
@@ -258,7 +269,9 @@ export const installLogShipper = (
 	return {
 		flush: async () => {
 			skipTicks = 0;
-			await flush();
+			// `flush` never rejects (every path is caught); `.catch` only keeps that a guarantee.
+			await inFlight.catch(() => {});
+			await runFlush();
 		},
 		stop: () => {
 			stopped = true;
