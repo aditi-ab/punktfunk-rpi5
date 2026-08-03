@@ -62,13 +62,28 @@ impl<P> PadSlots<P> {
         self.label
     }
 
-    /// Drop every allocated pad whose `active_mask` bit has stayed clear for [`SWEEP_GRACE`] (the
-    /// unplug sweep run on each state frame), logging each. Returns the swept indices as a bitmask
-    /// so the caller resets its per-index sibling state; an index another manager owns is `None`
-    /// here, so it is never swept. The grace is the devnode-churn debounce: a mask that glitches
-    /// clear for a few frames and returns re-arms nothing.
+    /// Fold one state frame's `active_mask` into the grace clocks, then drop whatever has run out
+    /// (see [`Self::reap`]). Returns the dropped indices as a bitmask so the caller resets its
+    /// per-index sibling state; an index another manager owns is `None` here, so it is never
+    /// touched. The grace is the devnode-churn debounce: a mask that glitches clear for a few
+    /// frames and returns re-arms nothing.
+    ///
+    /// A frame can only ARM the grace, never complete it — no time has passed at the instant the
+    /// clock starts. Since the producer emits exactly ONE frame per detach, [`Self::reap`] on the
+    /// manager's periodic pump is what actually finishes the unplug; a backend that only ever
+    /// called `sweep` would keep the detached pad alive for the rest of the session.
     pub fn sweep(&mut self, active_mask: u16) -> u16 {
         self.sweep_at(active_mask, Instant::now())
+    }
+
+    /// Drop every allocated pad whose grace has run out, logging each — the half of the unplug
+    /// that needs no state frame. Returns the dropped indices as a bitmask, same as [`Self::sweep`].
+    ///
+    /// This can only ever *complete* an unplug some frame already started: it never arms a clock,
+    /// so however often it runs it cannot drop a pad whose `active_mask` bit never went clear.
+    /// That is what makes it safe to call from a hot pump loop.
+    pub fn reap(&mut self) -> u16 {
+        self.reap_at(Instant::now())
     }
 
     /// Backdate every armed grace clock by [`SWEEP_GRACE`], so the NEXT sweep drops the pads
@@ -81,26 +96,37 @@ impl<P> PadSlots<P> {
         }
     }
 
-    /// [`Self::sweep`] with an injectable clock (unit tests drive the grace window).
+    /// [`Self::sweep`] with an injectable clock (unit tests drive the grace window): arm or disarm
+    /// each slot's clock from the mask, then reap whatever has already run out.
     fn sweep_at(&mut self, active_mask: u16, now: Instant) -> u16 {
-        let mut swept = 0u16;
-        for (i, slot) in self.pads.iter_mut().enumerate() {
+        for i in 0..MAX_PADS {
             if active_mask & (1 << i) != 0 {
                 self.inactive_since[i] = None; // active (again): a glitch never reaches the drop
+            } else if self.pads[i].is_some() && self.inactive_since[i].is_none() {
+                self.inactive_since[i] = Some(now); // newly inactive — start the grace
+            }
+        }
+        self.reap_at(now)
+    }
+
+    /// [`Self::reap`] with an injectable clock. Deliberately arms nothing — it only ever reads
+    /// `inactive_since` and clears it, so a pad whose bit never went clear has no clock to run out
+    /// and cannot be dropped here.
+    fn reap_at(&mut self, now: Instant) -> u16 {
+        let mut swept = 0u16;
+        for i in 0..MAX_PADS {
+            let Some(since) = self.inactive_since[i] else {
+                continue; // active, or never went clear — nothing to complete
+            };
+            if self.pads[i].is_none() {
+                self.inactive_since[i] = None; // the slot went away by some other route
                 continue;
             }
-            if slot.is_none() {
-                continue;
-            }
-            match self.inactive_since[i] {
-                None => self.inactive_since[i] = Some(now), // newly inactive — start the grace
-                Some(since) if now.duration_since(since) >= SWEEP_GRACE => {
-                    tracing::info!(index = i, "controller unplugged ({})", self.label);
-                    *slot = None;
-                    self.inactive_since[i] = None;
-                    swept |= 1 << i;
-                }
-                Some(_) => {} // inside the grace — hold
+            if now.duration_since(since) >= SWEEP_GRACE {
+                tracing::info!(index = i, "controller unplugged ({})", self.label);
+                self.pads[i] = None;
+                self.inactive_since[i] = None;
+                swept |= 1 << i;
             }
         }
         swept
@@ -159,6 +185,56 @@ mod tests {
 
     fn slots() -> PadSlots<u32> {
         PadSlots::new("Test", "test pad", "")
+    }
+
+    #[test]
+    fn a_single_frame_plus_a_reap_completes_the_unplug() {
+        // The shape production actually produces: ONE cleared-mask frame, then time, then a reap
+        // with no further frame. Before the arm/reap split the pad survived here forever.
+        let mut s = slots();
+        assert!(s.ensure(2, |i| Ok(i as u32)));
+        assert_eq!(
+            s.sweep(0b0),
+            0,
+            "a frame arms the grace but cannot itself drop"
+        );
+        assert!(s.get(2).is_some());
+        s.expire_grace();
+        assert_eq!(s.reap(), 1 << 2, "the reap did not complete the unplug");
+        assert!(s.get(2).is_none());
+        assert_eq!(s.reap(), 0, "nothing left to reap");
+    }
+
+    #[test]
+    fn reap_never_drops_a_pad_no_frame_ever_deactivated() {
+        // Reaping COMPLETES an unplug; it must never invent one. A pad whose bit never went clear
+        // has no armed clock, so any number of reaps — even with the clock backdated — leaves it.
+        let mut s = slots();
+        assert!(s.ensure(0, |i| Ok(i as u32)));
+        for _ in 0..10 {
+            assert_eq!(s.reap(), 0);
+            s.expire_grace();
+        }
+        assert!(
+            s.get(0).is_some(),
+            "reap dropped a pad that never went inactive"
+        );
+    }
+
+    #[test]
+    fn a_glitch_that_returns_inside_the_grace_never_drops_the_pad() {
+        // The anti-flap guarantee, now that reaps are frequent: a client mask that blips clear and
+        // comes back must not churn a PnP devnode.
+        let mut s = slots();
+        assert!(s.ensure(0, |i| Ok(i as u32)));
+        assert_eq!(s.sweep(0b0), 0); // bit clears — arms only
+        for _ in 0..5 {
+            assert_eq!(s.reap(), 0, "dropped a pad inside its grace");
+        }
+        assert_eq!(s.sweep(0b1), 0); // the bit returns — disarms
+        s.expire_grace();
+        assert_eq!(s.reap(), 0, "a returned bit must leave nothing armed");
+        assert!(s.get(0).is_some());
     }
 
     #[test]

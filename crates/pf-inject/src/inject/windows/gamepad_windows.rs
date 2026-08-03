@@ -318,14 +318,10 @@ impl GamepadManager {
                 if idx >= MAX_PADS {
                     return;
                 }
-                // Unplugs: drop any allocated pad whose mask bit cleared.
+                // Unplugs: arm the grace for any pad whose mask bit cleared (the drop itself lands
+                // on a later `pump_rumble` tick — this frame is the only one the producer sends).
                 let swept = self.slots.sweep(f.active_mask);
-                for i in 0..MAX_PADS {
-                    if swept & (1 << i) != 0 {
-                        self.last_rumble[i] = (0, 0);
-                        self.last_active[i] = Instant::now();
-                    }
-                }
+                self.reset_swept(swept);
                 if f.active_mask & (1 << idx) == 0 {
                     return;
                 }
@@ -345,10 +341,25 @@ impl GamepadManager {
         }
     }
 
+    /// Reset the sibling state of every index a sweep or reap just dropped, so both halves of the
+    /// unplug clear the same things.
+    fn reset_swept(&mut self, swept: u16) {
+        for i in 0..MAX_PADS {
+            if swept & (1 << i) != 0 {
+                self.last_rumble[i] = (0, 0);
+                self.last_active[i] = Instant::now();
+            }
+        }
+    }
+
     /// Relay any changed rumble level to the client. XUSB motors are 0..255; the wire carries
     /// 0..65535, so scale by 257. `large` (low-frequency) → the datagram's `low`, `small`
     /// (high-frequency) → `high` — matching the other backends.
     pub fn pump_rumble(&mut self, mut send: impl FnMut(u16, u16, u16)) {
+        // Finish any unplug whose removal frame only armed the grace — the producer sends that
+        // frame once, so without this the XUSB devnode would outlive the controller.
+        let swept = self.slots.reap();
+        self.reset_swept(swept);
         for (i, pad) in self.slots.iter_mut() {
             if let Some((large, small)) = pad.service() {
                 // The game drove the pad this poll (SET_STATE bumped the seq) — refresh the
