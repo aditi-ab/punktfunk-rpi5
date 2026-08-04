@@ -1003,6 +1003,7 @@ impl Worker {
         // unplug) must not depend on what SDL does to a rumbling device at close. Errors are
         // expected for an already-unplugged pad.
         let _ = self.slots[i].pad.set_rumble(0, 0, 100);
+        Self::reset_slot_feedback(&mut self.slots[i]);
         if let Some(c) = self.attached.clone() {
             Self::flush_slot(&c, &mut self.slots[i]);
             // Signal the host to tear down this pad's virtual device (native hot-unplug). Sent
@@ -1016,6 +1017,35 @@ impl Worker {
             index = slot.index,
             "gamepad forwarding stopped (slot closed)"
         );
+    }
+
+    /// Hand the physical controller back in a neutral state before its handle closes.
+    ///
+    /// Rumble stops on its own the moment nothing renews it, but the rich planes do not: an
+    /// adaptive-trigger effect and a lightbar colour are LATCHED in the pad's firmware and survive
+    /// the stream, the app, and being unplugged. Ending a session on a weapon's trigger resistance
+    /// left the physical trigger stiff on the desktop afterwards, with nothing to clear it but
+    /// another game. Apple's client already resets on teardown; this is the desktop half.
+    ///
+    /// Best-effort throughout: the pad may already be gone (that is one of the ways we get here).
+    fn reset_slot_feedback(slot: &mut Slot) {
+        if matches!(
+            slot.pref,
+            GamepadPref::DualSense | GamepadPref::DualSenseEdge
+        ) {
+            // An all-zero trigger block is mode 0x00 — no effect — which is what releases the
+            // trigger. Both sides, then the lightbar dark and the player indicator clear.
+            for which in [0u8, 1] {
+                let _ = slot
+                    .pad
+                    .send_effect(&Ds5Feedback::trigger_packet(which, &[0u8; 11]));
+            }
+            let _ = slot.pad.send_effect(&Ds5Feedback::lightbar_packet(0, 0, 0));
+            let _ = slot.pad.send_effect(&Ds5Feedback::player_packet(0));
+        } else {
+            // Anything else with an LED goes dark through SDL, which owns the per-device details.
+            let _ = slot.pad.set_led(0, 0, 0);
+        }
     }
 
     fn close_all_slots(&mut self) {
@@ -2006,5 +2036,48 @@ mod slot_tests {
             }),
             6
         );
+    }
+}
+
+#[cfg(test)]
+mod reset_packet_tests {
+    use super::*;
+
+    /// The exact bytes a teardown sends to hand a DualSense back neutral. The *timing* of this
+    /// (slot close) needs a live SDL handle and stays untestable, so pin the payloads: a wrong
+    /// enable flag or a non-zero mode byte would silently leave the effect latched, which is the
+    /// bug this reset exists to prevent.
+    #[test]
+    fn reset_packets_release_the_triggers_and_darken_the_lights() {
+        // Trigger release: mode 0x00 with no parameters, on the side's own enable bit.
+        let l = Ds5Feedback::trigger_packet(0, &[0u8; 11]);
+        assert_eq!(l[0], 0x08, "left-trigger enable bit");
+        assert!(
+            l[Ds5Feedback::LEFT_TRIGGER..Ds5Feedback::LEFT_TRIGGER + 11]
+                .iter()
+                .all(|&b| b == 0),
+            "an all-zero block is mode 0x00 = no effect"
+        );
+        let r = Ds5Feedback::trigger_packet(1, &[0u8; 11]);
+        assert_eq!(r[0], 0x04, "right-trigger enable bit");
+        assert!(
+            r[Ds5Feedback::RIGHT_TRIGGER..Ds5Feedback::RIGHT_TRIGGER + 11]
+                .iter()
+                .all(|&b| b == 0)
+        );
+
+        // Lightbar off: enable bit set, RGB all zero. The enable bit matters — without it the pad
+        // ignores the payload and keeps the game's last colour.
+        let bar = Ds5Feedback::lightbar_packet(0, 0, 0);
+        assert_eq!(bar[1], 0x04, "lightbar enable bit");
+        assert_eq!(
+            &bar[Ds5Feedback::LED_RGB..Ds5Feedback::LED_RGB + 3],
+            &[0, 0, 0]
+        );
+
+        // Player indicator cleared.
+        let pl = Ds5Feedback::player_packet(0);
+        assert_eq!(pl[1], 0x10, "player-LED enable bit");
+        assert_eq!(pl[Ds5Feedback::PAD_LIGHTS], 0);
     }
 }

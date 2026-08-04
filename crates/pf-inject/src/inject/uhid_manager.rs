@@ -338,9 +338,16 @@ impl<B: PadProto> UhidManager<B> {
             for h in fb.hidout {
                 // Skip rich feedback that repeats the last-forwarded value (a game's output report
                 // re-sends unchanged lightbar/LED/trigger state alongside every rumble update).
-                if self.hidout_dedup[i].should_forward(&h) {
+                if self.hidout_dedup[i].should_forward(&h, now) {
                     hidout(h);
                 }
+            }
+            // Re-assert the latched rich state on a slow cadence. Deduping a plane that rides
+            // unreliable datagrams means a dropped update is never re-derived from the game — it
+            // keeps sending the same value and the dedup eats every copy — so without this one
+            // lost datagram leaves the pad on the previous weapon's trigger effect indefinitely.
+            for h in self.hidout_dedup[i].renewals(i as u8, now) {
+                hidout(h);
             }
         }
     }

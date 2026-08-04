@@ -117,6 +117,7 @@ class DsCapture(
             // mid-rumble teardown would leave the motors running with nobody to stop them.
             // EP0-direct (the reader thread is stopping; the queue would never drain).
             usb.writeControl(stopReport(m))
+            resetRichFeedback(m)
         }
         disarmBackstop()
         usb.stop()
@@ -262,6 +263,35 @@ class DsCapture(
             ds4Rgb and 0xFF,
         ),
     )
+
+    /**
+     * Hand the pad back neutral: adaptive triggers released, lightbar dark, player LEDs clear.
+     *
+     * Rumble stops the moment nothing renews it, but these are LATCHED in the controller's
+     * firmware — they outlive the stream, the app, and being unplugged. Ending a session while a
+     * game held a weapon's trigger resistance left the physical trigger stiff afterwards, with
+     * nothing to release it but another game that happens to set one.
+     *
+     * EP0-direct like the rumble stop above: the reader thread is stopping, so the interrupt-OUT
+     * queue would never drain. Writes are best-effort — the pad may already be gone.
+     */
+    private fun resetRichFeedback(m: DsDevice.Model) {
+        if (m == DsDevice.Model.DUALSHOCK4) {
+            // No adaptive triggers or player LEDs on a DS4, and its write is full-state, so
+            // blacking the lightbar is a single composed report.
+            ds4Rgb = 0
+            usb.writeControl(DsDevice.ds4Report(0, 0, 0, 0, 0))
+            return
+        }
+        // An all-zero effect block is mode 0x00 — no effect — which is what releases the trigger.
+        for (which in 0..1) {
+            usb.writeControl(
+                DsDevice.ds5TriggerReport(m, which, ByteArray(DsDevice.TRIGGER_EFFECT_LEN)),
+            )
+        }
+        usb.writeControl(DsDevice.ds5LightbarReport(m, 0, 0, 0))
+        usb.writeControl(DsDevice.ds5PlayerLedsReport(m, 0))
+    }
 
     /** The report that stops the motors. The DS4's is a full-state write, so it zeroes the
      *  composed motor state and carries the current lightbar rather than blacking it out. */
