@@ -84,6 +84,11 @@ pub enum OverlayAction {
         fp_hex: String,
         launch: Option<String>,
         title: String,
+        /// One-off settings-profile override for THIS launch (a profile id — a pinned
+        /// card's connect). `None` resolves the host's default binding as before; the
+        /// binary feeds it to `trust::effective_settings`, so a dangling id quietly
+        /// falls back to the defaults and never blocks the connect.
+        profile: Option<String>,
         /// The no-PIN delegated-approval path: pin the host's advertised fingerprint and
         /// open a connect the host PARKS until the operator approves this device in its
         /// console (a long connect budget), then persist it as paired. `false` = an

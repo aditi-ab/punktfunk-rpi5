@@ -7,9 +7,20 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
+/// A settings profile as the console shows it (design client-settings-profiles.md §5.2a):
+/// the resolved name and accent of a catalog entry, keyed by its stable id. The service
+/// thread resolves these against the catalog; the shell never opens the profiles file.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProfileChip {
+    pub id: String,
+    pub name: String,
+    /// `#RRGGBB`, the catalog's optional tint for pinned cards.
+    pub accent: Option<String>,
+}
+
 /// One row on the console home carousel — a saved host, a discovered-but-unsaved one,
-/// or (client-side) the trailing Add Host tile. Fully resolved by the service thread;
-/// the shell renders it verbatim.
+/// a pinned profile card, or (client-side) the trailing Add Host tile. Fully resolved by
+/// the service thread; the shell renders it verbatim.
 #[derive(Clone, Debug, PartialEq)]
 pub struct HostRow {
     /// Stable identity across refreshes: the pinned fingerprint when known, else
@@ -35,6 +46,14 @@ pub struct HostRow {
     /// future tile OS glyph. Empty = unknown (older host). Plumbed now; drawing is a
     /// follow-up — the Skia glyph set doesn't exist yet.
     pub os: String,
+    /// `Some` = this row is a pinned profile card (§5.2a): a shortcut tile rendered right
+    /// after its host's primary tile, sharing its live state, that connects with THIS
+    /// profile. `None` = the host's primary tile.
+    pub pin: Option<ProfileChip>,
+    /// The primary tile's default-profile chip: the profile bound as this host's default
+    /// (`KnownHost::profile_id`), resolved, so the tile can say what a plain A-press uses.
+    /// Always `None` on pinned rows — there the profile IS `pin`.
+    pub bound_profile: Option<ProfileChip>,
 }
 
 /// The pairing ceremony's observable state (one at a time — the ceremony is modal).
@@ -143,6 +162,16 @@ pub enum ConsoleCmd {
     CancelWake,
     /// Sweep reachability now (the home screen refreshes its presence pips).
     Probe,
+    /// Pin (or unpin) a profile as an extra connect card on a saved host
+    /// (`KnownHost::pinned_profiles`, design §5.2a). `key` is the HOST row's key
+    /// (fingerprint or `addr:port`); presentation only — never touches the host's
+    /// default binding or the profile itself. Idempotent: re-pinning a pinned profile
+    /// (or unpinning an absent one) is a no-op.
+    SetPin {
+        key: String,
+        profile_id: String,
+        pin: bool,
+    },
 }
 
 /// The overlay→binary command queue. A plain deque under the same locking discipline as
@@ -184,6 +213,8 @@ mod tests {
             can_wake: false,
             last_used: None,
             os: String::new(),
+            pin: None,
+            bound_profile: None,
         };
         shared.set_hosts(vec![row.clone()]);
         let g1 = shared.hosts_gen();
