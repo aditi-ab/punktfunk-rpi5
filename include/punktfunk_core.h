@@ -45,6 +45,10 @@
 // v10: added `punktfunk_connection_clock_offset_now_ns` — the LIVE (mid-stream re-synced)
 // clock offset ongoing latency math must use; the connect-time getter stays frozen by
 // contract. Additive, client-local — no wire change, so [`WIRE_VERSION`] is unchanged.
+// v11: added `punktfunk_connect_ex9` — `connect_ex8` plus a `client_caps` bitfield
+// (`PUNKTFUNK_CLIENT_CAP_CURSOR`, later `…_PHASE_LOCK`), which is how a client tells the host it
+// renders the pointer itself. Additive; the caps ride the existing Hello, so [`WIRE_VERSION`] is
+// unchanged. (Documented late — the bump shipped without its line here.)
 // v12: added `punktfunk_connection_set_cursor_render` — the mid-stream cursor-render flip
 // (design/remote-desktop-sweep.md §8): the client's mouse-model chord tells the host who
 // renders the pointer. Additive; rides the existing control stream (a new message TYPE, which
@@ -58,7 +62,15 @@
 // uncertainty and the circular arrival-lead statistic the host's controller steers on. Additive;
 // the wire grows only a new control message (`PhaseReport`, 0x32) an old host never reads and a
 // strict-prefix append on the 0xCF host-timing tail, so [`WIRE_VERSION`] is unchanged.
-#define ABI_VERSION 14
+// v15: versions the shared rumble policy engine's C surface —
+// `punktfunk_connection_next_rumble_cmd`, `punktfunk_connection_set_rumble_quirks` and the
+// `PUNKTFUNK_RUMBLE_QUIRK_*` bits. These symbols are NOT new: they landed while this constant
+// still read 7 and no bump was made, so every core since has exported them while advertising a
+// version that never promised them. That cannot be corrected retroactively — a shipped binary
+// says what it says — so v15 is the floor that *guarantees* them: at or above it the surface is
+// present, below it an embedder must probe for the symbol. Purely a version statement; no code
+// changed with this bump, and no wire change, so [`WIRE_VERSION`] is unchanged.
+#define PUNKTFUNK_ABI_VERSION 15
 
 // The punktfunk/1 **wire** version — what `Hello`/`Welcome` carry and hosts equality-check.
 // Deliberately its own constant: [`ABI_VERSION`] tracks the embeddable **C surface**
@@ -66,7 +78,7 @@
 // `punktfunk_wake_on_lan` is client-local, and riding the C-ABI bump onto the wire locked
 // every new client out of every deployed host ("ABI mismatch: client 3 host 2", observed
 // live). Bump this ONLY when the handshake/planes actually change incompatibly.
-#define WIRE_VERSION 2
+#define PUNKTFUNK_WIRE_VERSION 2
 
 // `PunktfunkHidOutput::kind` — lightbar RGB (`r`/`g`/`b` valid).
 #define PUNKTFUNK_HIDOUT_LED 1
@@ -323,41 +335,41 @@
 // The uniform no-TTL-host staleness bound: a legacy host refreshes state every 500 ms, so two
 // missed refreshes = quiet host → silence. Replaces the per-platform zoo (1.6 s / 60 s / 1.5 s /
 // 1 s), and matches the ratio the Steam Deck ceiling shipped with.
-#define LEGACY_STALE_MS 1000
+#define PUNKTFUNK_LEGACY_STALE_MS 1000
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // Per-fetch requester-side size cap (bytes). A holder that streams more than this is treated as a
 // cap breach and the fetch fails rather than buffering unboundedly (§7). Phase 0 uses one fixed
 // value; a future host-policy `PUNKTFUNK_CLIP_MAX_MB` tightens it per session.
-#define CLIP_FETCH_CAP (64 << 20)
+#define PUNKTFUNK_CLIP_FETCH_CAP (64 << 20)
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // Inbound-serve `req_id`s carry this high bit so they never collide with the client-assigned
 // outbound-fetch `xfer_id`s (which count up from 1). A single [`ClipCommand::Cancel`] `id` can
 // then be routed to the right table.
-#define INBOUND_REQ_FLAG 2147483648
+#define PUNKTFUNK_INBOUND_REQ_FLAG 2147483648
 #endif
 
 // Floor for a negotiated `shard_payload` (even, well under every real path). A path whose UDP
 // budget lands below this can't carry the QUIC control plane either (QUIC's own minimum is a
 // 1200-byte UDP payload), so shrinking video shards further buys nothing — the clamp helpers
 // bottom out here instead of producing degenerate confetti-sized shards.
-#define MIN_SHARD_PAYLOAD 512
+#define PUNKTFUNK_MIN_SHARD_PAYLOAD 512
 
 // 16-byte AEAD authentication tag appended by either session cipher.
-#define TAG_LEN 16
+#define PUNKTFUNK_TAG_LEN 16
 
 // Wire tag distinguishing an input datagram from a video packet.
-#define INPUT_MAGIC 200
+#define PUNKTFUNK_INPUT_MAGIC 200
 
 // Fixed serialized size of an [`InputEvent`] on the wire (tag + fields).
-#define INPUT_WIRE_LEN (((((1 + 1) + 4) + 4) + 4) + 4)
+#define PUNKTFUNK_INPUT_WIRE_LEN (((((1 + 1) + 4) + 4) + 4) + 4)
 
 // The number of gamepads addressable on the wire (`flags` pad index 0..15). Shared by the
 // client's snapshot fold and the host's per-pad accumulators.
-#define MAX_PADS 16
+#define PUNKTFUNK_MAX_PADS 16
 
 #define PUNKTFUNK_BTN_DPAD_UP 1
 
@@ -390,16 +402,16 @@
 #define PUNKTFUNK_BTN_Y 32768
 
 // Back grip R4 — SDL `RightPaddle1` / GameStream `PADDLE1`.
-#define BTN_PADDLE1 65536
+#define PUNKTFUNK_BTN_PADDLE1 65536
 
 // Back grip L4 — SDL `LeftPaddle1` / GameStream `PADDLE2`.
-#define BTN_PADDLE2 131072
+#define PUNKTFUNK_BTN_PADDLE2 131072
 
 // Back grip R5 — SDL `RightPaddle2` / GameStream `PADDLE3`.
-#define BTN_PADDLE3 262144
+#define PUNKTFUNK_BTN_PADDLE3 262144
 
 // Back grip L5 — SDL `LeftPaddle2` / GameStream `PADDLE4`.
-#define BTN_PADDLE4 524288
+#define PUNKTFUNK_BTN_PADDLE4 524288
 
 // DualSense touchpad click. Moonlight's extended-button position (`buttonFlags2`
 // merges in at `<< 16`, see `gamestream/gamepad.rs`), so GameStream clients land on
@@ -407,7 +419,7 @@
 #define PUNKTFUNK_BTN_TOUCHPAD 1048576
 
 // Misc / capture button — the Deck `…`/quick-access, Share/Capture / GameStream `MISC`.
-#define BTN_MISC1 2097152
+#define PUNKTFUNK_BTN_MISC1 2097152
 
 // Axis ids for `InputKind::GamepadAxis`.
 #define PUNKTFUNK_AXIS_LS_X 0
@@ -426,16 +438,16 @@
 // Identifies a punktfunk video packet (vs. an input datagram, see [`crate::input`]).
 #define PUNKTFUNK_MAGIC 201
 
-#define FLAG_PIC 1
+#define PUNKTFUNK_FLAG_PIC 1
 
-#define FLAG_EOF 2
+#define PUNKTFUNK_FLAG_EOF 2
 
-#define FLAG_SOF 4
+#define PUNKTFUNK_FLAG_SOF 4
 
 // Bandwidth-probe filler, not decodable video: a [`crate::quic::ProbeRequest`] speed test makes
 // the host burst access units carrying this flag so the client measures throughput/loss without
 // feeding them to the decoder. Punktfunk/1 only (GameStream never sets it).
-#define FLAG_PROBE 8
+#define PUNKTFUNK_FLAG_PROBE 8
 
 // Application `user_flags` bit (the u32 [`PacketHeader::user_flags`] word, surfaced to the client
 // as [`crate::session::Frame::flags`]) — NOT a transport packet flag. Marks the access unit that
@@ -444,7 +456,7 @@
 // post-loss display freeze on this bit as well as on a real keyframe — the only bitstream-invisible
 // clean point it can honor without forcing a full IDR. Lives above the low nibble because the host
 // reuses `FLAG_PIC`/`FLAG_SOF`/`FLAG_PROBE` bit values inside `user_flags`; `0x10` clears all four.
-#define USER_FLAG_RECOVERY_POINT 16
+#define PUNKTFUNK_USER_FLAG_RECOVERY_POINT 16
 
 // Application `user_flags` bit — a **definitive single-frame clean re-anchor**. Unlike
 // [`USER_FLAG_RECOVERY_POINT`] (an intra-refresh wave boundary, where the first boundary after a loss
@@ -454,7 +466,7 @@
 // already has, not an IDR. The picture is loss-free the instant this AU decodes, so the client lifts
 // its post-loss freeze on the **first** such mark. Coded `P` (no IDR), so the decoder never sets
 // `AV_FRAME_FLAG_KEY` — this host flag is the only signal.
-#define USER_FLAG_RECOVERY_ANCHOR 32
+#define PUNKTFUNK_USER_FLAG_RECOVERY_ANCHOR 32
 
 // `user_flags` bit: the AU's content is **shard-aligned self-delimiting chunks** — every
 // `shard_payload`-sized window of the frame buffer starts a fresh codec packet, padded to the
@@ -462,7 +474,7 @@
 // consequences: a receiver that opted into partial delivery can use an aged-out frame's buffer
 // AS-IS (missing shards stay zeroed; the codec's block walk skips zero windows), and even a
 // COMPLETE frame must be consumed window-by-window (the padding is not part of the stream).
-#define USER_FLAG_CHUNK_ALIGNED 64
+#define PUNKTFUNK_USER_FLAG_CHUNK_ALIGNED 64
 
 // `user_flags` bit: this AU was packetized as a **slice-streamed** frame (the P2 slice
 // pipeline): its sentinel blocks (`block_count == 0`) are SLICE-granularity and carry their
@@ -475,7 +487,7 @@
 // [`VIDEO_CAP_STREAMED_AU`](crate::quic::VIDEO_CAP_STREAMED_AU) ∧
 // [`VIDEO_CAP_MULTI_SLICE`](crate::quic::VIDEO_CAP_MULTI_SLICE) — the pair whose receivers
 // know this contract.
-#define USER_FLAG_SLICE_STREAM 128
+#define PUNKTFUNK_USER_FLAG_SLICE_STREAM 128
 
 // Widest lost-frame range (frames, wrapping `last - first`) a reference-frame-invalidation
 // recovery may be asked to repair; anything wider goes straight to the keyframe path on BOTH
@@ -484,7 +496,7 @@
 // reference anywhere, so an RFI request for it is either hopeless or (worse) a phantom range
 // from a desynced counter. Shared by the host's RFI dispatch (range → keyframe fallback) and the
 // client-side gap detectors (huge gap → resync + keyframe request, no RFI).
-#define RFI_MAX_RANGE 256
+#define PUNKTFUNK_RFI_MAX_RANGE 256
 
 // Largest UDP datagram the core will send or accept. `Config::validate` bounds
 // `shard_payload` so `HEADER_LEN + shard_payload + CRYPTO_OVERHEAD ≤ MAX_DATAGRAM_BYTES`.
@@ -498,22 +510,22 @@
 // for never having to resize buffers on a mid-session grow. Senders still derive their
 // shard payload from the path MTU (`config::mtu1500_shard_payload*`, the wire-MTU clamps);
 // this is the acceptance ceiling, not a transmit size.
-#define MAX_DATAGRAM_BYTES 9216
+#define PUNKTFUNK_MAX_DATAGRAM_BYTES 9216
 
 // The slice-flush floor: a sentinel block below this many data shards costs disproportionate
 // per-block FEC parity (`ceil(k × pct/100)` ≥ 1 whatever `k`), so slice boundaries only flush
 // once this much has accumulated (~22 KB at the standard shard payload). Small slices simply
 // ride with the next one; the wire is never worse than one flush per slice.
-#define MIN_STREAM_BLOCK_SHARDS 16
+#define PUNKTFUNK_MIN_STREAM_BLOCK_SHARDS 16
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // [`Hello::video_caps`] bit: the client can decode a 10-bit (Main10) HEVC stream.
-#define VIDEO_CAP_10BIT 1
+#define PUNKTFUNK_VIDEO_CAP_10BIT 1
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // [`Hello::video_caps`] bit: the client can present BT.2020 PQ HDR10 (implies 10-bit).
-#define VIDEO_CAP_HDR 2
+#define PUNKTFUNK_VIDEO_CAP_HDR 2
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
@@ -525,7 +537,7 @@
 // 4:2:0 and [`Welcome::chroma_format`] reflects the real resolved value. Independent of
 // 10-bit/HDR (4:4:4 is a chroma decision, bit depth is a depth decision; the two may combine
 // where the hardware allows).
-#define VIDEO_CAP_444 4
+#define PUNKTFUNK_VIDEO_CAP_444 4
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
@@ -535,7 +547,7 @@
 // (design/stats-unification.md Phase 2). The host emits 0xCF ONLY when this bit is set (an older
 // host ignores it and simply never sends any); a client that doesn't set it keeps the combined
 // stage. Purely observability — never changes what the host encodes.
-#define VIDEO_CAP_HOST_TIMING 8
+#define PUNKTFUNK_VIDEO_CAP_HOST_TIMING 8
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
@@ -550,7 +562,7 @@
 // depends on. The host runs mid-session probe bursts ONLY against clients that set this bit — an
 // older client gets a declined (zeroed) [`ProbeResult`] instead of a measurement its single-window
 // reassembler would silently drop as stale.
-#define VIDEO_CAP_PROBE_SEQ 16
+#define PUNKTFUNK_VIDEO_CAP_PROBE_SEQ 16
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
@@ -565,7 +577,7 @@
 // — a mismatch drops the frame wholesale. The host streams ONLY to clients advertising this
 // bit; every other client gets today's whole-AU path (chunks concatenated before sealing), so
 // the fallback is zero-risk.
-#define VIDEO_CAP_STREAMED_AU 32
+#define PUNKTFUNK_VIDEO_CAP_STREAMED_AU 32
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
@@ -579,7 +591,7 @@
 // toward every other client the Welcome stays byte-identical AES-128-GCM. Purely a
 // performance choice — both AEADs are full-strength, and Hello/Welcome ride the pinned-TLS
 // control channel, so there is no downgrade surface.
-#define VIDEO_CAP_CHACHA20 64
+#define PUNKTFUNK_VIDEO_CAP_CHACHA20 64
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
@@ -595,7 +607,7 @@
 // bit (`PUNKTFUNK_NVENC_SLICES` stays the explicit operator override in both directions);
 // every other client gets single-slice frames — the pre-0.17 wire shape. NOTE: this takes the
 // video_caps byte's last free bit — the next video cap needs a second byte (ABI bump).
-#define VIDEO_CAP_MULTI_SLICE 128
+#define PUNKTFUNK_VIDEO_CAP_MULTI_SLICE 128
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
@@ -604,7 +616,7 @@
 // sequence number. A capable client then sends gamepad state as snapshots (idempotent on the
 // lossy datagram plane, periodically refreshed) instead of the fragile per-transition
 // button/axis events; toward a host that doesn't set the bit it keeps the legacy events.
-#define HOST_CAP_GAMEPAD_STATE 1
+#define PUNKTFUNK_HOST_CAP_GAMEPAD_STATE 1
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
@@ -614,7 +626,7 @@
 // out. Purely additive: nothing clipboard-related happens until a [`ClipControl`]`{ enabled:
 // true }` crosses (see `design/clipboard-and-file-transfer.md` §3.1). Packs into the existing
 // trailing `host_caps` byte — no wire-layout change.
-#define HOST_CAP_CLIPBOARD 2
+#define PUNKTFUNK_HOST_CAP_CLIPBOARD 2
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
@@ -626,7 +638,7 @@
 // non-Latin scripts, emoji) through `TextInput` instead of lossy VK synthesis; absent the bit it
 // keeps the VK fallback. Packs into the existing trailing `host_caps` byte — no wire-layout
 // change; an older host ignores the unknown input tag anyway (input is lossy by design).
-#define HOST_CAP_TEXT_INPUT 4
+#define PUNKTFUNK_HOST_CAP_TEXT_INPUT 4
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
@@ -638,7 +650,7 @@
 // (`SessionPlan.cursor_blend = false`) or the user sees it twice. Active only when the host
 // answers with [`HOST_CAP_CURSOR`] (capable-and-agreed, the 444/clipboard precedent); toward
 // an older or incapable host nothing changes.
-#define CLIENT_CAP_CURSOR 1
+#define PUNKTFUNK_CLIENT_CAP_CURSOR 1
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
@@ -647,7 +659,7 @@
 // capture/send tick to the client's display latch (design/phase-locked-capture.md). Without
 // the bit the host never arms the phase controller; toward an older host the reports are
 // simply ignored — no behavior change in either direction.
-#define CLIENT_CAP_PHASE_LOCK 2
+#define PUNKTFUNK_CLIENT_CAP_PHASE_LOCK 2
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
@@ -660,7 +672,7 @@
 // cursor/clipboard precedent). Toward an older host, or a host that declines because the link is
 // clean, the client keeps receiving the plain `0xC9` plane — so a client may always set this bit.
 // `0x04` — `0x01`/`0x02` are cursor / phase-lock.
-#define CLIENT_CAP_AUDIO_RED 4
+#define PUNKTFUNK_CLIENT_CAP_AUDIO_RED 4
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
@@ -671,7 +683,7 @@
 // host stops blending and ships [`CursorShape`](super::control::CursorShape) +
 // [`CursorState`](super::datagram::CursorState) instead. `0x08` — `0x04` is
 // [`HOST_CAP_TEXT_INPUT`], `0x01`/`0x02` are gamepad-state / clipboard.
-#define HOST_CAP_CURSOR 8
+#define PUNKTFUNK_HOST_CAP_CURSOR 8
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
@@ -685,7 +697,7 @@
 // wire ships ahead of the backend (P0): no host sets this bit until the P1 injector lands —
 // which is exactly why the gate exists. `0x10` — `0x08` is [`HOST_CAP_CURSOR`], `0x04` is
 // [`HOST_CAP_TEXT_INPUT`], `0x01`/`0x02` are gamepad-state / clipboard.
-#define HOST_CAP_PEN 16
+#define PUNKTFUNK_HOST_CAP_PEN 16
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
@@ -699,25 +711,25 @@
 // loss-gated — a clean LAN shouldn't pay for it), which is why clients decode BOTH tags
 // unconditionally and treat this bit as "expect redundancy", not "only redundancy".
 // `0x20` — `0x10` is [`HOST_CAP_PEN`], `0x08` is [`HOST_CAP_CURSOR`].
-#define HOST_CAP_AUDIO_RED 32
+#define PUNKTFUNK_HOST_CAP_AUDIO_RED 32
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // [`Hello::video_codecs`] bit: the client can decode H.264 / AVC. The GPU-less **software**
 // encode path (openh264) emits H.264, so a client that wants to stream from a software host MUST
 // advertise this.
-#define CODEC_H264 1
+#define PUNKTFUNK_CODEC_H264 1
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // [`Hello::video_codecs`] bit: the client can decode H.265 / HEVC — the default every existing
 // build produces and decodes (a peer that omits [`Hello::video_codecs`] is treated as HEVC-only).
-#define CODEC_HEVC 2
+#define PUNKTFUNK_CODEC_HEVC 2
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // [`Hello::video_codecs`] bit: the client can decode AV1.
-#define CODEC_AV1 4
+#define PUNKTFUNK_CODEC_AV1 4
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
@@ -731,18 +743,18 @@
 // (`crates/pyrowave-sys/vendor/pyrowave/PUNKTFUNK-VENDOR.txt`): upstream has no bitstream
 // version field, so a vendored bump that changes the bitstream bumps the punktfunk protocol
 // version instead (plan §4.2).
-#define CODEC_PYROWAVE 8
+#define PUNKTFUNK_CODEC_PYROWAVE 8
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // HEVC `chroma_format_idc` for 4:2:0 — what every pre-4:4:4 build produced and the back-compat
 // default when a peer omits [`Welcome::chroma_format`].
-#define CHROMA_IDC_420 1
+#define PUNKTFUNK_CHROMA_IDC_420 1
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // HEVC `chroma_format_idc` for full-chroma 4:4:4 (Range Extensions).
-#define CHROMA_IDC_444 3
+#define PUNKTFUNK_CHROMA_IDC_444 3
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
@@ -793,195 +805,195 @@
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // Type byte of [`Reconfigure`] (first byte after the magic).
-#define MSG_RECONFIGURE 1
+#define PUNKTFUNK_MSG_RECONFIGURE 1
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // Type byte of [`Reconfigured`].
-#define MSG_RECONFIGURED 2
+#define PUNKTFUNK_MSG_RECONFIGURED 2
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // Type byte of [`RequestKeyframe`].
-#define MSG_REQUEST_KEYFRAME 3
+#define PUNKTFUNK_MSG_REQUEST_KEYFRAME 3
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // Type byte of [`LossReport`].
-#define MSG_LOSS_REPORT 4
+#define PUNKTFUNK_MSG_LOSS_REPORT 4
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // Type byte of [`SetBitrate`].
-#define MSG_SET_BITRATE 5
+#define PUNKTFUNK_MSG_SET_BITRATE 5
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // Type byte of [`BitrateChanged`].
-#define MSG_BITRATE_CHANGED 6
+#define PUNKTFUNK_MSG_BITRATE_CHANGED 6
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // Type byte of [`RfiRequest`].
-#define MSG_RFI_REQUEST 7
+#define PUNKTFUNK_MSG_RFI_REQUEST 7
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // Type byte of [`ShardPayloadChanged`].
-#define MSG_SHARD_PAYLOAD_CHANGED 8
+#define PUNKTFUNK_MSG_SHARD_PAYLOAD_CHANGED 8
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // Type byte of [`ShardPayloadAck`].
-#define MSG_SHARD_PAYLOAD_ACK 9
+#define PUNKTFUNK_MSG_SHARD_PAYLOAD_ACK 9
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // Type byte of [`ProbeRequest`].
-#define MSG_PROBE_REQUEST 32
+#define PUNKTFUNK_MSG_PROBE_REQUEST 32
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // Type byte of [`ProbeResult`].
-#define MSG_PROBE_RESULT 33
+#define PUNKTFUNK_MSG_PROBE_RESULT 33
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // Type byte of [`ClockProbe`].
-#define MSG_CLOCK_PROBE 48
+#define PUNKTFUNK_MSG_CLOCK_PROBE 48
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // Type byte of [`ClockEcho`].
-#define MSG_CLOCK_ECHO 49
+#define PUNKTFUNK_MSG_CLOCK_ECHO 49
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // Type byte of [`PhaseReport`].
-#define MSG_PHASE_REPORT 50
+#define PUNKTFUNK_MSG_PHASE_REPORT 50
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // Type byte of [`ClipControl`] (client → host): enable/disable the shared clipboard for this
 // session. Idempotent; opt-in is enforced here, not just in UI.
-#define MSG_CLIP_CONTROL 64
+#define PUNKTFUNK_MSG_CLIP_CONTROL 64
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // Type byte of [`ClipState`] (host → client): ack + unsolicited policy/backend updates.
-#define MSG_CLIP_STATE 65
+#define PUNKTFUNK_MSG_CLIP_STATE 65
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // Type byte of [`ClipOffer`] (symmetric): the lazy announcement — format list only, no bytes.
-#define MSG_CLIP_OFFER 66
+#define PUNKTFUNK_MSG_CLIP_OFFER 66
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // Type byte of [`ClipFetch`] (requester → holder, **fetch stream only**): pull one format of the
 // current offer.
-#define MSG_CLIP_FETCH 67
+#define PUNKTFUNK_MSG_CLIP_FETCH 67
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // Type byte of [`ClipFetchHdr`] (holder → requester, **fetch stream only**): the fetch response
 // header that precedes the data chunks.
-#define MSG_CLIP_FETCH_HDR 68
+#define PUNKTFUNK_MSG_CLIP_FETCH_HDR 68
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // [`ClipControl::flags`] bit: the client permits file kinds to be offered/fetched this session.
 // Absent ⇒ files are filtered out of offers in both directions (text/rich/image only).
-#define CLIP_FLAG_FILES 1
+#define PUNKTFUNK_CLIP_FLAG_FILES 1
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // [`ClipState::policy`] bit: the host permits non-file formats (text/RTF/HTML/image). Always set
 // while enabled unless a future direction limit clears it.
-#define CLIP_POLICY_TEXT 1
+#define PUNKTFUNK_CLIP_POLICY_TEXT 1
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // [`ClipState::policy`] bit: the host permits file formats. Cleared by the operator `no-files`
 // / `text-only` policy so the client can grey out "Include files".
-#define CLIP_POLICY_FILES 2
+#define PUNKTFUNK_CLIP_POLICY_FILES 2
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // [`ClipState::reason`]: normal ack, nothing exceptional.
-#define CLIP_REASON_OK 0
+#define PUNKTFUNK_CLIP_REASON_OK 0
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // [`ClipState::reason`]: this session type has no working clipboard backend (e.g. a gamescope
 // session with no data-control global) — the client shows "not supported in this session type".
-#define CLIP_REASON_BACKEND_UNAVAILABLE 1
+#define PUNKTFUNK_CLIP_REASON_BACKEND_UNAVAILABLE 1
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // [`ClipState::reason`]: another client took over the single per-desktop clipboard binding; this
 // one was disabled (last `ClipControl{enabled}` wins).
-#define CLIP_REASON_TAKEN_OVER 2
+#define PUNKTFUNK_CLIP_REASON_TAKEN_OVER 2
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // [`ClipState::reason`]: the host operator policy (`PUNKTFUNK_CLIPBOARD=off`) disables clipboard.
-#define CLIP_REASON_POLICY_DISABLED 3
+#define PUNKTFUNK_CLIP_REASON_POLICY_DISABLED 3
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // [`ClipState::reason`]: enabled, but the host policy forbids file transfer (`no-files` /
 // `text-only`) — surfaced so the client greys "Include files" with a footnote.
-#define CLIP_REASON_NO_FILES 4
+#define PUNKTFUNK_CLIP_REASON_NO_FILES 4
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // [`ClipFetchHdr::status`]: the requested format is being served; data chunks follow until FIN.
-#define CLIP_FETCH_OK 0
+#define PUNKTFUNK_CLIP_FETCH_OK 0
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // [`ClipFetchHdr::status`]: the fetch named a `seq` that is no longer the holder's current offer;
 // the requester degrades the paste to "nothing inserted" rather than wrong data. No chunks follow.
-#define CLIP_FETCH_STALE 1
+#define PUNKTFUNK_CLIP_FETCH_STALE 1
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // [`ClipFetchHdr::status`]: the format/index is not available (no backend, or it vanished). No
 // chunks follow.
-#define CLIP_FETCH_UNAVAILABLE 2
+#define PUNKTFUNK_CLIP_FETCH_UNAVAILABLE 2
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // [`ClipFetchHdr::status`]: policy/cap denies this fetch (e.g. a file fetch under `no-files`). No
 // chunks follow.
-#define CLIP_FETCH_DENIED 3
+#define PUNKTFUNK_CLIP_FETCH_DENIED 3
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // Maximum number of [`ClipKind`] entries in one [`ClipOffer`] (resource cap, §7).
-#define CLIP_MAX_KINDS 16
+#define PUNKTFUNK_CLIP_MAX_KINDS 16
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // Maximum length in bytes of a [`ClipKind::mime`] string (resource cap, §7).
-#define CLIP_MAX_MIME 128
+#define PUNKTFUNK_CLIP_MAX_MIME 128
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // [`ClipFetch::file_index`] sentinel meaning "not a file fetch" (a whole non-file format, or the
 // file *manifest* itself). Real file fetches use `0..n`.
-#define CLIP_FILE_INDEX_NONE UINT32_MAX
+#define PUNKTFUNK_CLIP_FILE_INDEX_NONE UINT32_MAX
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // Type byte of [`CursorShape`] (host → client): the pointer's bitmap + hotspot changed.
-#define MSG_CURSOR_SHAPE 80
+#define PUNKTFUNK_MSG_CURSOR_SHAPE 80
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // Type byte of [`CursorRenderMode`] (client → host): who renders the pointer right now.
-#define MSG_CURSOR_RENDER 81
+#define PUNKTFUNK_MSG_CURSOR_RENDER 81
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
@@ -990,7 +1002,7 @@
 // overshoots before the 17-byte header. 120² (57.6 KiB + header) fits with headroom and covers
 // real cursors (typically ≤ 64 px, ≤ 96 px at HiDPI scale); the HOST downscales anything
 // larger before forwarding, so the cap is invisible to clients.
-#define CURSOR_SHAPE_MAX_SIDE 120
+#define PUNKTFUNK_CURSOR_SHAPE_MAX_SIDE 120
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
@@ -1010,21 +1022,21 @@
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // Microphone uplink: the client's mic, Opus-encoded, client → host (the inverse of
 // [`AUDIO_MAGIC`]). The host feeds it into a virtual PipeWire source so its apps can record it.
-#define MIC_MAGIC 203
+#define PUNKTFUNK_MIC_MAGIC 203
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // Rich client→host input: events too big for the fixed 18-byte [`InputEvent`]
 // (crate::input::InputEvent) — the DualSense touchpad and motion sensors. Variable-length,
 // kind-tagged (see [`RichInput`]).
-#define RICH_INPUT_MAGIC 204
+#define PUNKTFUNK_RICH_INPUT_MAGIC 204
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // HID output, host → client: DualSense feedback a game wrote to the host's virtual controller
 // (lightbar, player LEDs, adaptive triggers) — the rich analog of [`RUMBLE_MAGIC`]. See
 // [`HidOutput`].
-#define HIDOUT_MAGIC 205
+#define PUNKTFUNK_HIDOUT_MAGIC 205
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
@@ -1064,7 +1076,7 @@
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // Wire length of a v1 (legacy, level) rumble datagram.
-#define RUMBLE_V1_LEN 7
+#define PUNKTFUNK_RUMBLE_V1_LEN 7
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
@@ -1072,48 +1084,60 @@
 // tail. Decoders are length-tolerant (see [`decode_rumble_envelope`]): an old client reads the
 // first 7 bytes as a plain level and ignores the tail, so no wire-version bump is needed — the
 // same dual-size idiom the HDR-luminance `AddRequest` tail uses.
-#define RUMBLE_V2_LEN 10
+#define PUNKTFUNK_RUMBLE_V2_LEN 10
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // Longest raw HID report a [`RichInput::HidReport`] / [`HidOutput::HidRaw`] can carry — the
 // 64-byte interrupt/feature report size every Valve controller uses (Triton input reports are
 // 46–54 bytes; feature and output reports are at most 64).
-#define HID_REPORT_MAX 64
+#define PUNKTFUNK_HID_REPORT_MAX 64
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Longest [`HidOutput::Trigger`] `effect` the wire carries: the DualSense adaptive-trigger
+// parameter block is a mode byte plus ten parameters, and every consumer copies at most this many
+// into its report.
+//
+// The single source for the clamp on BOTH sides. `Trigger` was the only variable-length variant
+// bounded on neither: encode appended whatever it was handed and decode took the entire tail, so
+// an attacker-sized datagram was reproduced verbatim into a `Vec` while its sibling `HidRaw` had
+// been bounded on both ends all along.
+#define PUNKTFUNK_TRIGGER_EFFECT_MAX 11
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // [`HidOutput::HidRaw`] `kind`: an OUTPUT report — what the host's hidraw client wrote with
 // `write()`/`SDL_hid_write` (Triton rumble `0x80`, haptic pulse `0x81`, …). The client replays
 // it on the physical device's interrupt-OUT endpoint / GATT write.
-#define HID_RAW_OUTPUT 0
+#define PUNKTFUNK_HID_RAW_OUTPUT 0
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // [`HidOutput::HidRaw`] `kind`: a FEATURE report — what the host's hidraw client sent with
 // `SET_REPORT` (`SDL_hid_send_feature_report`: lizard mode, IMU enable, settings). The client
 // replays it as a USB `SET_REPORT(Feature)` control transfer / GATT feature write.
-#define HID_RAW_FEATURE 1
+#define PUNKTFUNK_HID_RAW_FEATURE 1
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // HDR static-metadata datagram tag, host → client (the static analog of the per-frame VUI;
 // see [`HdrMeta`]). Next tag after [`HIDOUT_MAGIC`].
-#define HDR_META_MAGIC 206
+#define PUNKTFUNK_HDR_META_MAGIC 206
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // Wire length of an [`HdrMeta`] body (no tag byte): 6×u16 primaries + 2×u16 white + 2×u32
 // luminance + 2×u16 CLL/FALL = 28 bytes. Shared by the [`HDR_META_MAGIC`] datagram (which
 // prefixes the tag) and the `Hello::display_hdr` trailing field (which carries the bare body).
-#define HDR_META_BODY_LEN (((12 + 4) + 8) + 4)
+#define PUNKTFUNK_HDR_META_BODY_LEN (((12 + 4) + 8) + 4)
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // Per-AU host-timing datagram tag, host → client (see [`HostTiming`]). Next tag after
 // [`HDR_META_MAGIC`]. Emitted once per access unit, right after its last packet left the host's
 // socket, and only when the client advertised [`VIDEO_CAP_HOST_TIMING`].
-#define HOST_TIMING_MAGIC 207
+#define PUNKTFUNK_HOST_TIMING_MAGIC 207
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
@@ -1124,18 +1148,18 @@
 // self-healing under loss (latest-wins, no refresh timer). The bitmap itself rides the
 // reliable control stream ([`CursorShape`](super::control::CursorShape)); this 14-byte
 // datagram only moves/hides the pointer.
-#define CURSOR_STATE_MAGIC 208
+#define PUNKTFUNK_CURSOR_STATE_MAGIC 208
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // [`CursorState::flags`] bit: the host cursor is visible.
-#define CURSOR_VISIBLE 1
+#define PUNKTFUNK_CURSOR_VISIBLE 1
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // [`CursorState::flags`] bit: a host app captured/hid the pointer — the client SHOULD run
 // relative/captured (M3 auto-flip; advisory, user override always wins).
-#define CURSOR_RELATIVE_HINT 2
+#define PUNKTFUNK_CURSOR_RELATIVE_HINT 2
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
@@ -1144,7 +1168,7 @@
 // `ApplicationClosed` reason and tears the session's virtual display down immediately, skipping the
 // keep-alive linger; any other close reason (idle timeout, reset, a bare code 0) still lingers so a
 // reconnect can resume. Shared so host + every client agree on the code.
-#define QUIT_CLOSE_CODE 81
+#define PUNKTFUNK_QUIT_CLOSE_CODE 81
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
@@ -1154,107 +1178,107 @@
 // surfacing a failure (`design/gamemode-and-dedicated-sessions.md` §5.3). Sibling of
 // [`QUIT_CLOSE_CODE`]; a client that doesn't special-case it still ends the session (every client
 // returns to its launcher on session end), so it is purely refinement. Shared so host + clients agree.
-#define APP_EXITED_CLOSE_CODE 82
+#define PUNKTFUNK_APP_EXITED_CLOSE_CODE 82
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // Longest device name carried in a [`Hello`] (bytes of UTF-8; longer names are truncated on
 // encode, rejected on decode — a one-byte length prefix caps it at 255 anyway).
-#define HELLO_NAME_MAX 64
+#define PUNKTFUNK_HELLO_NAME_MAX 64
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // Longest library id carried in a [`Hello::launch`] (bytes of UTF-8). Ids are short
 // (`steam:<appid>` / `custom:<12 hex>`); the cap just bounds an attacker-controlled field.
-#define HELLO_LAUNCH_MAX 128
+#define PUNKTFUNK_HELLO_LAUNCH_MAX 128
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // [`Welcome::cipher`] id: AES-128-GCM — the default session AEAD every peer speaks (and the
 // only one pre-cipher builds know).
-#define CIPHER_AES_128_GCM 0
+#define PUNKTFUNK_CIPHER_AES_128_GCM 0
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // [`Welcome::cipher`] id: ChaCha20-Poly1305 (RFC 8439) — negotiated via
 // [`VIDEO_CAP_CHACHA20`] for clients without hardware AES.
-#define CIPHER_CHACHA20_POLY1305 1
+#define PUNKTFUNK_CIPHER_CHACHA20_POLY1305 1
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // Type byte of [`PairRequest`].
-#define MSG_PAIR_REQUEST 16
+#define PUNKTFUNK_MSG_PAIR_REQUEST 16
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // Type byte of [`PairChallenge`].
-#define MSG_PAIR_CHALLENGE 17
+#define PUNKTFUNK_MSG_PAIR_CHALLENGE 17
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // Type byte of [`PairProof`].
-#define MSG_PAIR_PROOF 18
+#define PUNKTFUNK_MSG_PAIR_PROOF 18
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // Type byte of [`PairResult`].
-#define MSG_PAIR_RESULT 19
+#define PUNKTFUNK_MSG_PAIR_RESULT 19
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // [`PenSample::state`] bit: the pen is in the hover range of the surface. Implied by
 // [`PEN_TOUCHING`] (decode normalizes, so a client that only sets TOUCHING still produces a
 // coherent contact).
-#define PEN_IN_RANGE 1
+#define PUNKTFUNK_PEN_IN_RANGE 1
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // [`PenSample::state`] bit: the tip is in contact with the surface.
-#define PEN_TOUCHING 2
+#define PUNKTFUNK_PEN_TOUCHING 2
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // [`PenSample::state`] bit: the primary barrel button (or the client's squeeze mapping) is held.
-#define PEN_BARREL1 4
+#define PUNKTFUNK_PEN_BARREL1 4
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // [`PenSample::state`] bit: the secondary barrel button (or the client's double-tap mapping)
 // is held.
-#define PEN_BARREL2 8
+#define PUNKTFUNK_PEN_BARREL2 8
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // [`PenSample::state`] bit, RESERVED: a predicted (not yet observed) sample. Never sent v1;
 // receivers MUST ignore samples carrying it until a capability negotiates otherwise
 // (design/pen-tablet-input.md §8).
-#define PEN_PREDICTED 128
+#define PUNKTFUNK_PEN_PREDICTED 128
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // [`PenSample::tilt_deg`] sentinel: the client has no tilt sensor / no reading.
-#define PEN_TILT_UNKNOWN 255
+#define PUNKTFUNK_PEN_TILT_UNKNOWN 255
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // [`PenSample::azimuth_deg`] / [`PenSample::roll_deg`] sentinel: no reading.
-#define PEN_ANGLE_UNKNOWN 65535
+#define PUNKTFUNK_PEN_ANGLE_UNKNOWN 65535
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // [`PenSample::distance`] sentinel: no hover-distance reading.
-#define PEN_DISTANCE_UNKNOWN 65535
+#define PUNKTFUNK_PEN_DISTANCE_UNKNOWN 65535
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // Most samples one [`PenBatch`] can carry. Sized for coalesced capture at video-frame cadence
 // (240 Hz pen ÷ 30 fps = 8); a client producing more splits into consecutive batches.
-#define PEN_BATCH_MAX 8
+#define PUNKTFUNK_PEN_BATCH_MAX 8
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // Wire length of one encoded [`PenSample`].
-#define PEN_SAMPLE_WIRE_LEN 21
+#define PUNKTFUNK_PEN_SAMPLE_WIRE_LEN 21
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
@@ -1265,13 +1289,13 @@
 // pen is naturally silent — senders MUST repeat the last sample at least every ~100 ms while
 // the pen is in range or touching (it re-decodes as pure Motion, harmless), keeping a live
 // stationary stroke two heartbeats clear of the deadline.
-#define PEN_TOUCH_TIMEOUT_MS 200
+#define PUNKTFUNK_PEN_TOUCH_TIMEOUT_MS 200
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // Stream-kind byte: a clipboard fetch (request/response of one format). Future stream kinds
 // (e.g. a bulk file-content push) mux under the same [`STREAM_MAGIC`] with a different byte.
-#define CLIP_STREAM_KIND_FETCH 1
+#define PUNKTFUNK_CLIP_STREAM_KIND_FETCH 1
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
@@ -1281,18 +1305,18 @@
 // `0x52`), the connection reject code `0x42`, and the pairing-rejection close block
 // `0x60`–`0x67` — stream reset codes and connection close codes are separate QUIC namespaces,
 // but the vocabularies stay disjoint on purpose so a captured code is unambiguous.
-#define CLIP_CANCELLED_CODE 112
+#define PUNKTFUNK_CLIP_CANCELLED_CODE 112
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // Chunk size for streaming fetch data (64 KiB writes — matches the control-frame bound).
-#define CLIP_CHUNK (64 * 1024)
+#define PUNKTFUNK_CLIP_CHUNK (64 * 1024)
 #endif
 
 // Consecutive no-output AUs that force a keyframe request. ~50 ms at 60 Hz — long enough not to fire
 // on a one-frame decoder hiccup, short enough that a lost initial IDR (or a mid-GOP join) unfreezes
 // almost immediately instead of never.
-#define NO_OUTPUT_KEYFRAME_STREAK 3
+#define PUNKTFUNK_NO_OUTPUT_KEYFRAME_STREAK 3
 
 // How many host intra-refresh recovery marks ([`USER_FLAG_RECOVERY_POINT`]) must arrive since the
 // latest loss before the gate lifts its freeze on an IDR-free stream. TWO, not one: with a continuous
@@ -1304,12 +1328,12 @@
 // deliberate "hold longer, never show garbage" trade.
 //
 // [`USER_FLAG_RECOVERY_POINT`]: crate::packet::USER_FLAG_RECOVERY_POINT
-#define REANCHOR_MARKS_TO_LIFT 2
+#define PUNKTFUNK_REANCHOR_MARKS_TO_LIFT 2
 
 // QUIC application error code the host closes with on a `mode_conflict = reject` admission
 // refusal, carrying the human-readable busy reason (live mode + client label). A distinct code
 // lets a client tell "host busy" apart from a transport failure. Shared so clients can render it.
-#define REJECT_BUSY_CLOSE_CODE 66
+#define PUNKTFUNK_REJECT_BUSY_CLOSE_CODE 66
 
 // QUIC application close codes the host sends on **pairing-gate rejections**, so a client can
 // tell the user WHY it was turned away instead of collapsing every close into a generic
@@ -1318,44 +1342,44 @@
 // their own 0x60 block, disjoint from [`REJECT_BUSY_CLOSE_CODE`] (0x42) and the deliberate-end
 // codes (0x51/0x52). Purely additive: an older client treats them as a bare close (exactly the
 // pre-code behavior), an older host never sends them. Decode with [`RejectReason::from_close_code`].
-#define PAIR_NOT_ARMED_CLOSE_CODE 96
+#define PUNKTFUNK_PAIR_NOT_ARMED_CLOSE_CODE 96
 
 // Pairing window armed, but bound to a DIFFERENT device fingerprint (the attempt does not
 // consume the window). See [`PAIR_NOT_ARMED_CLOSE_CODE`] for the block's contract.
-#define PAIR_BOUND_OTHER_CLOSE_CODE 97
+#define PUNKTFUNK_PAIR_BOUND_OTHER_CLOSE_CODE 97
 
 // PIN attempt inside the host's global pairing cooldown — retry shortly.
-#define PAIR_RATE_LIMITED_CLOSE_CODE 98
+#define PUNKTFUNK_PAIR_RATE_LIMITED_CLOSE_CODE 98
 
 // Unpaired client presented no certificate: nothing to approve, and the SPAKE2 ceremony needs an
 // identity to bind — the PIN flow with a client identity is the way in.
-#define PAIR_NO_IDENTITY_CLOSE_CODE 99
+#define PUNKTFUNK_PAIR_NO_IDENTITY_CLOSE_CODE 99
 
 // The operator explicitly denied this pairing request in the host console.
-#define PAIR_DENIED_CLOSE_CODE 100
+#define PUNKTFUNK_PAIR_DENIED_CLOSE_CODE 100
 
 // Nobody decided on the parked pairing request before the host's approval wait elapsed.
-#define PAIR_APPROVAL_TIMEOUT_CLOSE_CODE 101
+#define PUNKTFUNK_PAIR_APPROVAL_TIMEOUT_CLOSE_CODE 101
 
 // This parked knock was superseded by a newer connection from the same device — only the
 // newest is admitted on approval.
-#define PAIR_SUPERSEDED_CLOSE_CODE 102
+#define PUNKTFUNK_PAIR_SUPERSEDED_CLOSE_CODE 102
 
 // The client's wire (protocol) version does not match the host's — one side needs updating.
-#define WIRE_VERSION_CLOSE_CODE 103
+#define PUNKTFUNK_WIRE_VERSION_CLOSE_CODE 103
 
 // The host admitted the connection but could not stand the stream session up (compositor /
 // capture / encoder setup failed host-side). The close reason bytes carry the specific error
 // text for logs/diagnostics; clients render a stable "host-side failure" sentence. Before this
 // code, a setup failure reached the client as a bare dropped connection ("control stream
 // finished mid-frame") — indistinguishable from transport trouble.
-#define SETUP_FAILED_CLOSE_CODE 104
+#define PUNKTFUNK_SETUP_FAILED_CLOSE_CODE 104
 
 // Minimum supported multiplier (renders under native, upscaled on present).
-#define MIN_SCALE 0.5
+#define PUNKTFUNK_MIN_SCALE 0.5
 
 // Maximum supported multiplier (supersamples, clamped to the codec ceiling per axis).
-#define MAX_SCALE 4.0
+#define PUNKTFUNK_MAX_SCALE 4.0
 
 // Stable C ABI status codes. `Ok` is 0; all errors are negative so callers can
 // test `rc < 0`. Do not renumber existing variants — only append.
@@ -1901,7 +1925,7 @@ typedef struct {
 
 // The multipliers a picker offers. `1.0` (Native) is the default; the rest are the round stops
 // users reason about. Shared so every client's list stays identical.
-#define PRESETS { 0.5, 0.67, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0, }
+#define PUNKTFUNK_PRESETS { 0.5, 0.67, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0, }
 
 #ifdef __cplusplus
 extern "C" {
