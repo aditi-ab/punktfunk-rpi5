@@ -426,7 +426,9 @@ async def _cli_json(args: list[str], timeout: float = 20.0) -> dict:
         try:
             data = json.loads(out)
             if isinstance(data, dict):
-                return {"ok": True, **data}
+                # `ok` last: a payload that ever grows its own `ok` key must not be able to
+                # report failure through the field this layer owns.
+                return {**data, "ok": True}
         except json.JSONDecodeError:
             decky.logger.warning("cli %s: unparseable output: %s", args[0], out[:200])
         return {"ok": False, "error": "client-error", "detail": "unreadable output"}
