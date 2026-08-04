@@ -135,7 +135,7 @@ struct GamepadHomeView: View {
         // fullScreenCover, so they become generously sized sheets over the dimmed launcher.
         #if os(macOS)
         .sheet(isPresented: $showSettings) {
-            GamepadSettingsView()
+            GamepadSettingsView(store: store)
                 .frame(width: 720, height: 640)
         }
         .sheet(isPresented: $showAddHost) {
@@ -144,7 +144,7 @@ struct GamepadHomeView: View {
         }
         .frame(minWidth: 640, minHeight: 420)
         #else
-        .fullScreenCover(isPresented: $showSettings) { GamepadSettingsView() }
+        .fullScreenCover(isPresented: $showSettings) { GamepadSettingsView(store: store) }
         .fullScreenCover(isPresented: $showAddHost) {
             GamepadAddHostView { store.add($0) }
         }

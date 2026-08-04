@@ -88,8 +88,9 @@ pub enum ConsoleEntry {
     /// The host list (bare `--browse`).
     Home,
     /// Home with this host's library already pushed (`--browse host` — the Decky
-    /// per-host launch; B backs out to Home).
-    Library(HostRow),
+    /// per-host launch; B backs out to Home). Boxed: `HostRow` outgrew the dataless
+    /// `Home` variant when it learned its profile chips.
+    Library(Box<HostRow>),
 }
 
 /// The binary's ends of the console: models to write, commands to serve.

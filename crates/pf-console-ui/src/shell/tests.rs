@@ -32,6 +32,8 @@ fn hosts() -> Vec<HostRow> {
         can_wake: false,
         last_used: None,
         os: String::new(),
+        pin: None,
+        bound_profile: None,
     };
     vec![
         HostRow {

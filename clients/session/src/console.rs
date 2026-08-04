@@ -79,20 +79,22 @@ pub fn run(target: Option<&str>) -> u8 {
                 can_wake: false,
                 last_used: k.and_then(|h| h.last_used),
                 os: k.map(|h| h.os.clone()).unwrap_or_default(),
+                pin: None,
+                bound_profile: None,
             };
             let label = row.name.clone();
             if k.is_none() {
                 seed = Some(row.clone());
             }
             if row.paired {
-                (ConsoleEntry::Library(row), Some(label))
+                (ConsoleEntry::Library(Box::new(row)), Some(label))
             } else {
                 (ConsoleEntry::Home, Some(label))
             }
         }
         None if fake => {
             let row = fake_host_row();
-            (ConsoleEntry::Library(row), None)
+            (ConsoleEntry::Library(Box::new(row)), None)
         }
         None => (ConsoleEntry::Home, None),
     };
@@ -207,6 +209,7 @@ pub fn run(target: Option<&str>) -> u8 {
                     launch,
                     title,
                     request_access,
+                    profile,
                 } => {
                     let Some(pin) = trust::parse_hex32(&fp_hex) else {
                         // Connect (and request-access) pin the host's advertised fingerprint;
@@ -221,9 +224,11 @@ pub fn run(target: Option<&str>) -> u8 {
                     // have changed the defaults since the last stream, and the host may carry
                     // a profile binding. Console (and therefore Decky, which spawns this
                     // binary) honors bindings with no console-side work — the resolver is the
-                    // same one `--connect` goes through. No one-off here: picking a profile is
-                    // a desktop-shell affordance in v1, pinned cards are the console's.
-                    let (settings, profile) = trust::effective_settings(&addr, port, None);
+                    // same one `--connect` goes through. A pinned card's connect arrives as a
+                    // one-off profile id; the resolver prefers it over the binding, and a
+                    // dangling id falls back to the defaults without blocking the connect.
+                    let (settings, profile) =
+                        trust::effective_settings(&addr, port, profile.as_deref());
                     let mut params = session_params(
                         &settings,
                         profile.map(|p| p.name),
@@ -303,6 +308,8 @@ fn fake_host_row() -> HostRow {
         can_wake: false,
         last_used: None,
         os: "linux/arch/steamos".into(),
+        pin: None,
+        bound_profile: None,
     }
 }
 
@@ -506,6 +513,38 @@ impl ServiceState {
             ConsoleCmd::Probe => {
                 self.last_probe = Instant::now() - Duration::from_secs(60);
             }
+            ConsoleCmd::SetPin {
+                key,
+                profile_id,
+                pin,
+            } => {
+                // Presentation only (design §5.2a): order = card order, appended at the
+                // end; never touches `profile_id` (the default binding). Idempotent, so
+                // a repeated press inside one refresh window can't double-pin.
+                let mut known = trust::KnownHosts::load();
+                let idx = known
+                    .hosts
+                    .iter()
+                    .position(|h| !h.fp_hex.is_empty() && h.fp_hex == key)
+                    .or_else(|| {
+                        let (addr, port) = key.rsplit_once(':')?;
+                        known.index_by_addr(addr, port.parse().ok()?)
+                    });
+                let Some(h) = idx.and_then(|i| known.hosts.get_mut(i)) else {
+                    tracing::warn!(%key, "pin toggle for an unknown host — ignoring");
+                    return;
+                };
+                if pin && !h.pinned_profiles.contains(&profile_id) {
+                    h.pinned_profiles.push(profile_id);
+                } else if !pin {
+                    h.pinned_profiles.retain(|id| *id != profile_id);
+                }
+                if let Err(e) = known.save() {
+                    tracing::warn!(error = %format!("{e:#}"), "saving known hosts");
+                }
+                // `run` refreshes the rows right after this drain, so the carousel and
+                // the pin screen reflect the new card within the same service pass.
+            }
         }
     }
 
@@ -544,12 +583,21 @@ impl ServiceState {
         })
     }
 
-    /// The console home's rows: saved hosts (most recent first), then
-    /// discovered-but-unsaved ones, then a still-uncovered `--browse` seed.
+    /// The console home's rows: saved hosts (most recent first) — each followed by its
+    /// pinned profile cards (design §5.2a) — then discovered-but-unsaved ones, then a
+    /// still-uncovered `--browse` seed.
     fn rows(&self) -> Vec<HostRow> {
         let known = trust::KnownHosts::load();
+        let catalog = pf_client_core::profiles::ProfilesFile::load();
         let probed = self.probed.lock().unwrap();
-        let mut rows: Vec<HostRow> = known
+        let chip = |p: &pf_client_core::profiles::StreamProfile| pf_console_ui::ProfileChip {
+            id: p.id.clone(),
+            name: p.name.clone(),
+            accent: p.accent.clone(),
+        };
+        // Primary rows paired with their pinned cards, so the sort below can order hosts
+        // while every host's cards stay glued behind its primary tile.
+        let mut saved: Vec<(HostRow, Vec<HostRow>)> = known
             .hosts
             .iter()
             .map(|h| {
@@ -563,8 +611,8 @@ impl ServiceState {
                         || (d.addr == h.addr && d.port == h.port)
                 });
                 let online = advert.is_some() || probed.get(&key).copied().unwrap_or(false);
-                HostRow {
-                    key,
+                let row = HostRow {
+                    key: key.clone(),
                     name: host_display_name(&h.name, &h.addr),
                     addr: h.addr.clone(),
                     port: h.port,
@@ -581,10 +629,34 @@ impl ServiceState {
                         .filter(|d| !d.os.is_empty())
                         .map(|d| d.os.clone())
                         .unwrap_or_else(|| h.os.clone()),
-                }
+                    pin: None,
+                    bound_profile: h
+                        .profile_id
+                        .as_deref()
+                        .and_then(|id| catalog.find_by_id(id))
+                        .map(chip),
+                };
+                // A pinned card shares the primary tile's live state; its key rides the
+                // profile id behind a NUL (impossible in a fingerprint or `addr:port`),
+                // so cursor-follow and the wake path address the card itself.
+                let pins = h
+                    .resolved_pins(&catalog)
+                    .into_iter()
+                    .map(|p| HostRow {
+                        key: format!("{key}\0{}", p.id),
+                        pin: Some(chip(p)),
+                        bound_profile: None,
+                        ..row.clone()
+                    })
+                    .collect();
+                (row, pins)
             })
             .collect();
-        rows.sort_by(|a, b| b.last_used.cmp(&a.last_used).then(a.name.cmp(&b.name)));
+        saved.sort_by(|(a, _), (b, _)| b.last_used.cmp(&a.last_used).then(a.name.cmp(&b.name)));
+        let mut rows: Vec<HostRow> = saved
+            .into_iter()
+            .flat_map(|(row, pins)| std::iter::once(row).chain(pins))
+            .collect();
 
         let mut extra: Vec<HostRow> = self
             .discovered
@@ -612,6 +684,8 @@ impl ServiceState {
                 can_wake: false,
                 last_used: None,
                 os: d.os.clone(),
+                pin: None,
+                bound_profile: None,
             })
             .collect();
         extra.sort_by(|a, b| a.name.cmp(&b.name));

@@ -120,6 +120,8 @@ impl LibraryScreen {
                         launch: Some(g.id.clone()),
                         title: g.title.clone(),
                         request_access: false,
+                        // Game launches follow the host's default binding.
+                        profile: None,
                     });
                     Some(MenuPulse::Confirm)
                 }
