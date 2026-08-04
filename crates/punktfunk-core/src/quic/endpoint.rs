@@ -47,6 +47,20 @@ fn stream_transport_idle(idle: std::time::Duration) -> Arc<quinn::TransportConfi
     // plane latest-wins at the source — ~200 ms of stereo Opus (proportionally less at
     // surround bitrates), so sustained congestion costs concealable drops, never lag.
     t.datagram_send_buffer_size(4 * 1024);
+    // MTU discovery probes up to EXACTLY the sealed size of a full IPv4 video datagram (1472)
+    // instead of quinn's stock 1452. Two reasons: (a) on a clean 1500-MTU path QUIC gets the
+    // last 20 bytes per packet; (b) the ceiling turns discovery into a video-path verdict the
+    // host's wire-MTU watcher reads (`punktfunk-host` `native/wire_mtu.rs`) — settled == ceiling
+    // proves the path carries full-size video datagrams, settled BELOW it proves it cannot (a
+    // VPN/overlay adapter at MTU ~1280 blackholes every video packet while all the small flows
+    // pass: the "connects fine, black screen forever" field shape). With the stock 1452 ceiling
+    // a healthy path and a constrained one are indistinguishable at the top. This is the ONLY
+    // behavioral change on healthy paths, and it's confined to discovery: probes are padded
+    // PINGs quinn already expects to lose above a constrained hop — a lost probe settles the
+    // search lower, exactly as it did before.
+    let mut mtud = quinn::MtuDiscoveryConfig::default();
+    mtud.upper_bound(crate::config::video_datagram_udp_ceiling() as u16);
+    t.mtu_discovery_config(Some(mtud));
     Arc::new(t)
 }
 

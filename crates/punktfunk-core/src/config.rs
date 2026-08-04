@@ -341,6 +341,50 @@ pub fn mtu1500_shard_payload_for(peer: core::net::IpAddr) -> usize {
     }
 }
 
+/// Floor for a negotiated `shard_payload` (even, well under every real path). A path whose UDP
+/// budget lands below this can't carry the QUIC control plane either (QUIC's own minimum is a
+/// 1200-byte UDP payload), so shrinking video shards further buys nothing — the clamp helpers
+/// bottom out here instead of producing degenerate confetti-sized shards.
+pub const MIN_SHARD_PAYLOAD: usize = 512;
+
+/// The sealed wire size of a video datagram carrying `shard_payload` bytes of shard — what
+/// actually leaves the socket as UDP payload (punktfunk header + shard + crypto overhead).
+pub const fn sealed_datagram_bytes(shard_payload: usize) -> usize {
+    HEADER_LEN + shard_payload + CRYPTO_OVERHEAD
+}
+
+/// The UDP-payload size a path must carry for full-size IPv4 video datagrams: the sealed size
+/// of the [`mtu1500_shard_payload`] default (= 1472, the exact 1500-MTU IPv4 ceiling). Doubles
+/// as the QUIC MTU-discovery probe ceiling (`quic/endpoint.rs`): with the ceiling set to
+/// exactly this value, a control connection whose discovery settles AT the ceiling has proven
+/// the path carries full-size video datagrams, and one that settles BELOW it has proven the
+/// path cannot — a discrimination quinn's stock 1452 ceiling can't make in either direction.
+pub const fn video_datagram_udp_ceiling() -> usize {
+    sealed_datagram_bytes(mtu1500_shard_payload())
+}
+
+/// Largest even shard payload whose sealed datagram fits in `udp_budget` bytes of UDP payload
+/// (the quantity QUIC MTU discovery measures — [`video_datagram_udp_ceiling`] is its probe
+/// ceiling). Clamped to the peer's family default ([`mtu1500_shard_payload_for`]) so a generous
+/// budget never grows packets past today's wire, and floored at [`MIN_SHARD_PAYLOAD`].
+pub fn shard_payload_for_udp_budget(udp_budget: usize, peer: core::net::IpAddr) -> usize {
+    let p = udp_budget.saturating_sub(HEADER_LEN + CRYPTO_OVERHEAD);
+    let p = p - p % 2; // FEC requires even shards
+    p.clamp(MIN_SHARD_PAYLOAD, mtu1500_shard_payload_for(peer))
+}
+
+/// [`shard_payload_for_udp_budget`] for an operator-supplied ON-WIRE IP MTU (the number
+/// `netsh interface ipv4 show subinterfaces` / `ip link` shows): subtracts the family's IP+UDP
+/// headers first — 28 for IPv4 (and IPv4-mapped), 48 for IPv6.
+pub fn shard_payload_for_wire_mtu(wire_mtu: usize, peer: core::net::IpAddr) -> usize {
+    let ip_udp = match peer {
+        core::net::IpAddr::V4(_) => 28,
+        core::net::IpAddr::V6(v6) if v6.to_ipv4_mapped().is_some() => 28,
+        core::net::IpAddr::V6(_) => 48,
+    };
+    shard_payload_for_udp_budget(wire_mtu.saturating_sub(ip_udp), peer)
+}
+
 /// Everything needed to construct a [`Session`](crate::session::Session).
 ///
 /// `Debug` is implemented by hand to redact `key`/`salt`, and `key`/`salt` are zeroized
@@ -512,6 +556,74 @@ mod tests {
             "sealed datagram {wire} B exceeds a 1500-MTU IPv6 hop"
         );
         assert!(HEADER_LEN + (p + 2) + CRYPTO_OVERHEAD > 1452, "not maximal");
+    }
+
+    /// The video-datagram ceiling IS the exact v4 sealed size — the QUIC MTU-discovery probe
+    /// ceiling (endpoint.rs) relies on this equality for its settled-at-vs-below verdict.
+    #[test]
+    fn video_datagram_ceiling_is_the_sealed_default() {
+        assert_eq!(
+            video_datagram_udp_ceiling(),
+            HEADER_LEN + mtu1500_shard_payload() + CRYPTO_OVERHEAD
+        );
+        assert_eq!(video_datagram_udp_ceiling(), 1472);
+    }
+
+    /// Budget-derived sizing: even, sealed-fits-the-budget, clamped to the family default
+    /// above and [`MIN_SHARD_PAYLOAD`] below.
+    #[test]
+    fn shard_payload_for_udp_budget_math() {
+        use core::net::IpAddr;
+        let v4: IpAddr = "192.168.1.50".parse().unwrap();
+        let v6: IpAddr = "fd00::50".parse().unwrap();
+        // The full ceiling reproduces the default exactly.
+        assert_eq!(
+            shard_payload_for_udp_budget(video_datagram_udp_ceiling(), v4),
+            mtu1500_shard_payload()
+        );
+        // A WARP/Tailscale-shaped 1280 budget: sealed result must fit the budget, stay even.
+        let p = shard_payload_for_udp_budget(1280, v4);
+        assert_eq!(p % 2, 0);
+        assert!(sealed_datagram_bytes(p) <= 1280);
+        assert!(sealed_datagram_bytes(p + 2) > 1280, "not maximal");
+        // Odd budgets round down to even shards.
+        assert_eq!(shard_payload_for_udp_budget(1281, v4) % 2, 0);
+        // A generous budget never grows past the family default (either family).
+        assert_eq!(
+            shard_payload_for_udp_budget(9000, v4),
+            mtu1500_shard_payload()
+        );
+        assert_eq!(
+            shard_payload_for_udp_budget(9000, v6),
+            mtu1500_shard_payload_v6()
+        );
+        // Degenerate budgets bottom out at the floor instead of confetti.
+        assert_eq!(shard_payload_for_udp_budget(100, v4), MIN_SHARD_PAYLOAD);
+    }
+
+    /// Operator-facing wire-MTU sizing subtracts the right IP+UDP header per family, and 1500
+    /// reproduces today's defaults exactly.
+    #[test]
+    fn shard_payload_for_wire_mtu_math() {
+        use core::net::IpAddr;
+        let v4: IpAddr = "192.168.1.50".parse().unwrap();
+        let v6: IpAddr = "fd00::50".parse().unwrap();
+        let mapped: IpAddr = "::ffff:192.168.1.50".parse().unwrap();
+        assert_eq!(
+            shard_payload_for_wire_mtu(1500, v4),
+            mtu1500_shard_payload()
+        );
+        assert_eq!(
+            shard_payload_for_wire_mtu(1500, mapped),
+            mtu1500_shard_payload()
+        );
+        assert_eq!(
+            shard_payload_for_wire_mtu(1500, v6),
+            mtu1500_shard_payload_v6()
+        );
+        // 1280 wire − 28 − 64 = 1188 (v4); − 48 − 64 = 1168 (v6).
+        assert_eq!(shard_payload_for_wire_mtu(1280, v4), 1188);
+        assert_eq!(shard_payload_for_wire_mtu(1280, v6), 1168);
     }
 
     /// Family selection: genuine v6 remotes get the v6 size; v4 — including the IPv4-mapped v6

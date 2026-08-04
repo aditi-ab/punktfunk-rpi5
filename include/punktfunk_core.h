@@ -333,6 +333,12 @@
 #define INBOUND_REQ_FLAG 2147483648
 #endif
 
+// Floor for a negotiated `shard_payload` (even, well under every real path). A path whose UDP
+// budget lands below this can't carry the QUIC control plane either (QUIC's own minimum is a
+// 1200-byte UDP payload), so shrinking video shards further buys nothing — the clamp helpers
+// bottom out here instead of producing degenerate confetti-sized shards.
+#define MIN_SHARD_PAYLOAD 512
+
 // 16-byte AEAD authentication tag appended by either session cipher.
 #define TAG_LEN 16
 
