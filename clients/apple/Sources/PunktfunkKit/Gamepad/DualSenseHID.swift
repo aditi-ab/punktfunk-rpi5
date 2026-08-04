@@ -21,8 +21,12 @@ import os
 
 private let log = Logger(subsystem: "io.unom.punktfunk", category: "gamepad")
 
-/// Opens the first connected Sony DualSense and forwards motor rumble to it over raw HID.
-/// Single-pad model (we forward exactly one controller), so the first match is the right one.
+/// Opens one connected Sony DualSense and forwards motor rumble to it over raw HID.
+///
+/// A caller that owns a particular pad passes the location id it wants (see
+/// `open(preferringLocationID:)`); the renderer takes that from the `GCController` it is bound to,
+/// so with two DualSenses attached each renderer drives its own device. Without a preference the
+/// lowest location id wins — an arbitrary but *stable* choice, where `Set.first` was neither.
 final class DualSenseHID {
     private let manager: IOHIDManager
     private var device: IOHIDDevice?
@@ -43,9 +47,57 @@ final class DualSenseHID {
 
     deinit { close() }
 
-    /// Find and open the first connected DualSense. Returns false if none is present or it can't
-    /// be opened (caller then falls back to CoreHaptics).
-    func open() -> Bool {
+    /// The IOKit location id of the device this instance opened — the handle a caller correlates
+    /// with its `GCController`. `nil` until a successful `open`.
+    private(set) var locationID: UInt32?
+
+    /// A device's location id, or `nil` if IOKit does not report one.
+    static func locationID(of dev: IOHIDDevice) -> UInt32? {
+        IOHIDDeviceGetProperty(dev, kIOHIDLocationIDKey as CFString) as? UInt32
+    }
+
+    /// Every connected DualSense/Edge, by location id — what a caller pairs against its controllers.
+    static func attachedLocationIDs() -> [UInt32] {
+        let mgr = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
+        let matches = productIDs.map { pid in
+            [kIOHIDVendorIDKey: vendorSony, kIOHIDProductIDKey: pid] as CFDictionary
+        }
+        IOHIDManagerSetDeviceMatchingMultiple(mgr, matches as CFArray)
+        guard IOHIDManagerOpen(mgr, IOOptionBits(kIOHIDOptionsTypeNone)) == kIOReturnSuccess else {
+            return []
+        }
+        defer { IOHIDManagerClose(mgr, IOOptionBits(kIOHIDOptionsTypeNone)) }
+        let devices = IOHIDManagerCopyDevices(mgr) as? Set<IOHIDDevice> ?? []
+        return devices.compactMap(locationID(of:)).sorted()
+    }
+
+    /// Which attached device to drive, as an index into `ids` — the whole selection rule, pure so
+    /// it can be tested without an `IOHIDDevice` (which cannot be constructed).
+    ///
+    /// `IOHIDManagerCopyDevices` returns an unordered `Set`, so the previous `Set.first` was not
+    /// merely arbitrary — it can differ between two calls in one process. With two DualSenses that
+    /// made each renderer's pad→device binding a coin flip: both could land on the same device
+    /// (one pad's rumble coming out of the other, and the two per-instance write dedupes fighting
+    /// over it) or split by luck. An explicit location id makes the binding deterministic; the
+    /// lowest-id fallback at least makes it stable. `nil` ids sort last so a device IOKit cannot
+    /// place never displaces one it can.
+    static func preferredIndex(among ids: [UInt32?], preferring wanted: UInt32?) -> Int? {
+        if let wanted, let hit = ids.firstIndex(where: { $0 == wanted }) { return hit }
+        return ids.indices.min { (ids[$0] ?? .max) < (ids[$1] ?? .max) }
+    }
+
+    /// Pick the device to drive from everything attached (see [`preferredIndex`]).
+    static func pick(_ devices: Set<IOHIDDevice>, preferring wanted: UInt32?) -> IOHIDDevice? {
+        let ordered = Array(devices)
+        guard let i = preferredIndex(among: ordered.map(locationID(of:)), preferring: wanted) else {
+            return nil
+        }
+        return ordered[i]
+    }
+
+    /// Find and open a connected DualSense, preferring the one at `preferredLocationID`. Returns
+    /// false if none is present or it can't be opened (caller then falls back to CoreHaptics).
+    func open(preferringLocationID preferred: UInt32? = nil) -> Bool {
         let matches = Self.productIDs.map { pid in
             [kIOHIDVendorIDKey: Self.vendorSony, kIOHIDProductIDKey: pid] as CFDictionary
         }
@@ -55,13 +107,21 @@ final class DualSenseHID {
             return false
         }
         guard let devices = IOHIDManagerCopyDevices(manager) as? Set<IOHIDDevice>,
-              let dev = devices.first
+              let dev = Self.pick(devices, preferring: preferred)
         else {
             log.info("rumble: no DualSense HID device found — falling back to CoreHaptics")
             IOHIDManagerClose(manager, IOOptionBits(kIOHIDOptionsTypeNone))
             return false
         }
         device = dev
+        locationID = Self.locationID(of: dev)
+        if let preferred, locationID != preferred {
+            // Not fatal — one pad still gets rumble — but with two pads attached it means this
+            // renderer is driving the wrong one, and it is invisible without the log line.
+            log.error(
+                "rumble: wanted DualSense at location \(preferred, privacy: .public) but opened \(self.locationID.map(String.init) ?? "unknown", privacy: .public)"
+            )
+        }
         let transport = IOHIDDeviceGetProperty(dev, kIOHIDTransportKey as CFString) as? String
         bluetooth = transport?.lowercased().contains("bluetooth") ?? false
         log.info("rumble: DualSense raw-HID rumble active (transport=\(self.transport, privacy: .public))")
@@ -70,8 +130,16 @@ final class DualSenseHID {
 
     /// Drive the motors. `low` = left/heavy (low-frequency), `high` = right/light (high-frequency),
     /// each 0...255. (0, 0) stops.
-    func rumble(low: UInt8, high: UInt8) {
-        guard let dev = device else { return }
+    ///
+    /// Returns whether the write reached the device. The caller needs this: it used to be logged
+    /// and swallowed, so a failed write still counted as a successful render. That matters most
+    /// for a **stop**, which has nothing behind it — the renderer stamps its write clock even on
+    /// failure, the keepalive re-write only fires for non-zero levels, and the ticker is cancelled
+    /// once the target is `(0, 0)`. On USB there is no firmware timeout either, so a swallowed
+    /// stop left the motors running with nothing scheduled to try again.
+    @discardableResult
+    func rumble(low: UInt8, high: UInt8) -> Bool {
+        guard let dev = device else { return false }
         let report = bluetooth
             ? Self.bluetoothReport(low: low, high: high)
             : Self.usbReport(low: low, high: high)
@@ -81,7 +149,9 @@ final class DualSenseHID {
         }
         if rc != kIOReturnSuccess {
             log.error("rumble: IOHIDDeviceSetReport failed (0x\(String(format: "%08x", rc), privacy: .public))")
+            return false
         }
+        return true
     }
 
     func close() {

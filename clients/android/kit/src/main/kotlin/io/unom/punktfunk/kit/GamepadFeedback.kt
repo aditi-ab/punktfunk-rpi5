@@ -88,6 +88,9 @@ class GamepadFeedback(
         const val TAG_PLAYER_LEDS: Byte = 0x02
         const val TAG_TRIGGER: Byte = 0x03
         const val TAG_HID_RAW: Byte = 0x05
+
+        /** Sparse-log cadence for swallowed render failures — see [noteRenderFailure]. */
+        const val LOG_EVERY = 128L
     }
 
     /** One controller's rumble binding — VibratorManager (API 31+) OR the legacy single Vibrator (API 28–30). */
@@ -125,24 +128,49 @@ class GamepadFeedback(
     fun start() {
         running = true
         rumbleThread = Thread({
+            var failures = 0L
             while (running) {
                 val ev = NativeBridge.nativeNextRumble(handle)
                 // Layout + semantics live in `unpackRumbleEvent` (RumbleWire.kt), tested there
                 // against the Rust packer.
                 val cmd = unpackRumbleEvent(ev) ?: continue // timeout / closed
-                renderRumble(cmd.pad, cmd.low, cmd.high, cmd.backstopMs)
+                // Rendering is binder calls into the vibrator service, and every one of them can
+                // throw unchecked — DeadSystemRuntimeException when system_server goes down, and
+                // the ordinary RuntimeException a dying service wraps its RemoteException in.
+                // Unguarded, ONE of those killed this thread outright: `running` stayed true, so
+                // nothing noticed and nothing restarted it, and rumble was gone for the rest of
+                // the session. Losing a single command is recoverable; losing the loop is not.
+                runCatching {
+                    renderRumble(cmd.pad, cmd.low, cmd.high, cmd.backstopMs)
+                }.onFailure { failures = noteRenderFailure("rumble", it, failures) }
             }
         }, "pf-rumble").apply { isDaemon = true; start() }
 
         hidoutThread = Thread({
             // 128: the raw as-is passthrough events are [pad][kind tag][report kind][≤64 bytes].
             val buf = ByteBuffer.allocateDirect(128)
+            var failures = 0L
             while (running) {
                 val n = NativeBridge.nativeNextHidout(handle, buf)
                 if (n < 0) continue // timeout / closed
-                dispatchHidout(buf, n)
+                // Same hazard as the rumble loop above: lights/trigger rendering is binder and USB
+                // calls, and an unchecked throw here would silently end the rich-feedback plane.
+                runCatching { dispatchHidout(buf, n) }
+                    .onFailure { failures = noteRenderFailure("hidout", it, failures) }
             }
         }, "pf-hidout").apply { isDaemon = true; start() }
+    }
+
+    /**
+     * Record a render failure the poll loop swallowed, and return the updated count. Logged on the
+     * first occurrence and sparsely after: a genuinely dead vibrator service fails on *every*
+     * command, which at a rumble plane's rate would bury the log.
+     */
+    private fun noteRenderFailure(plane: String, t: Throwable, seen: Long): Long {
+        if (seen == 0L || seen % LOG_EVERY == 0L) {
+            Log.w(TAG, "$plane render failed (#${seen + 1}) — command dropped, poll loop alive", t)
+        }
+        return seen + 1
     }
 
     /** Idempotent. Stops + joins the poll threads (must complete before the router is released / handle freed). */
@@ -258,7 +286,7 @@ class GamepadFeedback(
         val m = bind.vm
         if (m != null) {
             if (lo == 0 && hi == 0) {
-                m.cancel() // (0,0) = stop
+                runCatching { m.cancel() } // (0,0) = stop
                 return
             }
             val combo = CombinedVibration.startParallel()
@@ -283,7 +311,7 @@ class GamepadFeedback(
         // API 28–30 legacy single-motor path: blend both motors into one effect.
         val lv = bind.legacy ?: return
         if (lo == 0 && hi == 0) {
-            lv.cancel() // (0,0) = stop
+            runCatching { lv.cancel() } // (0,0) = stop
             return
         }
         val a = (lo * 0.8 + hi * 0.33).toInt().coerceIn(1, 255)

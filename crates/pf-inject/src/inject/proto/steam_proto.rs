@@ -183,8 +183,9 @@ impl SteamState {
 
     /// Map an `XInput`/GameStream pad frame (button bitmask + i16 sticks + u8 triggers) into the Deck
     /// state. Sticks pass through (the kernel negates Y, which yields the conventional direction —
-    /// validated on-box); triggers scale u8 0..255 → u16 0..32640 and set the full-pull bit when
-    /// pressed. Trackpad + motion + the back grips arrive separately ([`apply_rich`], the M3 wire).
+    /// validated on-box); triggers scale u8 0..255 → u16 0..32767 ([`trigger_u16`]) and set the
+    /// full-pull bit when pressed. Trackpad + motion + the back grips arrive separately
+    /// ([`apply_rich`], the M3 wire).
     pub fn from_gamepad(
         buttons: u32,
         lx: i16,
@@ -200,8 +201,8 @@ impl SteamState {
             ly,
             rx,
             ry,
-            lt: (lt as u16) * 128,
-            rt: (rt as u16) * 128,
+            lt: trigger_u16(lt),
+            rt: trigger_u16(rt),
             ..SteamState::neutral()
         };
         let mut b = 0u64;
@@ -375,8 +376,8 @@ pub fn sc_from_gamepad(
         ly,
         rx: 0,
         ry: 0,
-        lt: (lt as u16) * 128,
-        rt: (rt as u16) * 128,
+        lt: trigger_u16(lt),
+        rt: trigger_u16(rt),
         // The wire right stick becomes a right-pad contact (see the doc above).
         rpad_x: rx,
         rpad_y: ry,
@@ -466,6 +467,18 @@ pub fn serialize_sc_state(r: &mut [u8; STEAM_REPORT_LEN], st: &SteamState, seq: 
     r[38..40].copy_from_slice(&st.gyro[2].to_le_bytes());
 }
 
+/// Scale a wire trigger (u8 `0..=255`) onto the Deck's full axis (u16 `0..=32767`).
+///
+/// This was `v * 128`, which tops out at 32640 — a fully-pulled trigger reported 99.6% and the top
+/// 127 counts of the declared range were unreachable, so a game reading the axis could never see a
+/// true full pull. One multiply gets both ends exact (`0 → 0`, `255 → 32767`) and stays monotonic.
+///
+/// `serialize_report`'s inverse (`>> 7`, for the legacy u8 trigger bytes) still round-trips both
+/// ends against this: `32767 >> 7 == 255`.
+fn trigger_u16(v: u8) -> u16 {
+    ((v as u32 * 32767) / 255) as u16
+}
+
 /// Build the `steam_get_serial` GET_REPORT reply. The Steam feature path is report-id-0 with a
 /// leading report-id byte the kernel strips (`steam_recv_report` does `memcpy(data, buf+1, …)`), so
 /// the wire is `[0x00, 0xAE, len, 0x01, ascii…]`; the kernel then validates `reply[0]==0xAE`,
@@ -473,7 +486,12 @@ pub fn serialize_sc_state(r: &mut [u8; STEAM_REPORT_LEN], st: &SteamState, seq: 
 pub fn serial_reply(serial: &str) -> [u8; STEAM_REPORT_LEN] {
     let mut buf = [0u8; STEAM_REPORT_LEN];
     let bytes = serial.as_bytes();
-    let len = bytes.len().clamp(1, 21);
+    // `min`, not `clamp(1, 21)`. Clamping the LOW end to 1 and then slicing `bytes[..len]` asks a
+    // zero-byte slice for one byte, which panics — on the service thread, for an input the kernel
+    // already has a graceful answer to. Reporting the true length lets its own validation
+    // (`1 <= reply[1] <= 21`) reject an empty serial and fall back to "XXXXXXXXXX", which is the
+    // documented behaviour for a reply it does not like.
+    let len = bytes.len().min(21);
     buf[0] = 0x00; // report id 0 — stripped by steam_recv_report
     buf[1] = ID_GET_STRING_ATTRIBUTE;
     buf[2] = len as u8;
@@ -704,7 +722,7 @@ mod tests {
         assert_ne!(s.buttons & btn::STEAM, 0);
         assert_ne!(s.buttons & btn::LB, 0);
         assert_ne!(s.buttons & btn::LT_FULL, 0); // lt=255 → full-pull bit
-        assert_eq!(s.lt, 255 * 128);
+        assert_eq!(s.lt, 32767); // full pull reaches the TOP of the declared range
         assert_eq!(s.lx, 1000);
         assert_eq!(s.ly, -2000);
 
@@ -728,6 +746,30 @@ mod tests {
         });
         assert_eq!(s.gyro, [800, -1600, 0]);
         assert_eq!(s.accel, [16384, -8192, 0]);
+    }
+
+    /// An empty serial must not panic. `clamp(1, 21)` asked a zero-byte slice for one byte, which
+    /// is an out-of-range slice index — on the service thread. The kernel rejects a zero length by
+    /// its own rule (`1 <= reply[1] <= 21`) and falls back, which is the graceful answer.
+    #[test]
+    fn empty_serial_reply_does_not_panic() {
+        let r = serial_reply("");
+        assert_eq!(r[1], ID_GET_STRING_ATTRIBUTE);
+        assert_eq!(
+            r[2], 0,
+            "length the kernel will reject, rather than a panic"
+        );
+
+        // Normal and over-long serials still behave.
+        let r = serial_reply("ABC123");
+        assert_eq!(r[2], 6);
+        assert_eq!(&r[4..10], b"ABC123");
+        let long = "X".repeat(40);
+        assert_eq!(
+            serial_reply(&long)[2],
+            21,
+            "clamped to the protocol maximum"
+        );
     }
 
     /// M3: the wire back-button bits map to the four Deck grips + QAM, and `TouchpadEx` routes the

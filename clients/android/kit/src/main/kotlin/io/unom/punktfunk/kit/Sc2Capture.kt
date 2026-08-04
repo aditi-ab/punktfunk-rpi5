@@ -273,10 +273,20 @@ class Sc2Capture(
 
     private fun onLinkClosed() {
         Log.i(TAG, "SC2 link closed (unplug / power-off)")
+        // Both transports share this callback, so read which one was live BEFORE clearing it —
+        // releasing the other would tear down a link that never dropped.
+        val dropped = activeLink
         activeLink = LINK_NONE
         dongleLink = false
         releaseSlot()
         releaseUiKeys()
+        // Release the transport too — see the note in DsCapture.onLinkClosed. The Puck makes this
+        // worse than a single leak: it is the pad that gets power-cycled, so the same process can
+        // round-trip a link many times in one session.
+        when (dropped) {
+            LINK_USB -> usb.stop()
+            LINK_BLE -> ble.stop()
+        }
         onActiveChanged?.invoke(false)
     }
 

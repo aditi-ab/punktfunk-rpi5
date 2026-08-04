@@ -358,19 +358,47 @@ fn read_state(data: Option<&MappedView>) -> (u32, u16, u8, u8, i16, i16, i16, i1
 /// host can tell "driver bound and alive" apart from "driver package missing/failed to bind" and see
 /// the game-visible polling path advance.
 fn touch_driver_marks(data: &MappedView) {
+    let _marks = SECTION_PUBLISH
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     data.write_u32(OFF_DRIVER_PROTO, GAMEPAD_PROTO_VERSION);
     let hb = data.read_u32(OFF_DRIVER_HEARTBEAT).wrapping_add(1);
     data.write_u32(OFF_DRIVER_HEARTBEAT, hb);
 }
 
 /// Publish a game's rumble (from SET_STATE) into the DATA section for the host to forward.
+///
+/// Serialized and Release-published, because IOCTLs arrive concurrently and neither property held
+/// before. `seq` was a read-modify-write across the two motor bytes: two `SET_STATE` calls could
+/// both read the same value and both write back `seq + 1`, so the host — which treats an unchanged
+/// seq as "nothing new" — saw one bump for two writes and skipped a level entirely. A skipped
+/// **stop** is the one that hurts: the pad keeps buzzing until the host's ~2.5 s idle force-off
+/// notices the game went quiet, which is where the bound on this bug comes from.
+///
+/// The seq store is Release for the same reason as `pf-gamepad`'s `out_seq`: the host loads it with
+/// Acquire and documents that as ordering its read of the motor bytes ("the driver bumps
+/// `rumble_seq` AFTER writing the rumble bytes", `gamepad_windows.rs`). A plain write gives that
+/// Acquire nothing to pair with, so the guarantee the host's comment claims did not exist in either
+/// direction — the host could read a fresh seq against stale motor levels on a weakly-ordered core.
 fn publish_rumble(data: Option<&MappedView>, large: u8, small: u8) {
     let Some(v) = data else { return };
+    let _publish = SECTION_PUBLISH
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     v.write_u8(OFF_RUMBLE_LARGE, large);
     v.write_u8(OFF_RUMBLE_SMALL, small);
     let seq = v.read_u32(OFF_RUMBLE_SEQ).wrapping_add(1);
-    v.write_u32(OFF_RUMBLE_SEQ, seq);
+    v.store_u32(OFF_RUMBLE_SEQ, seq, Ordering::Release);
 }
+
+/// Serializes the section's read-modify-write publishes ([`publish_rumble`], [`touch_driver_marks`])
+/// against each other. One lock rather than one per field: they are all short byte writes into the
+/// same mapped view, and the contention is nil compared to the IOCTL round trip that reaches them.
+///
+/// Poison-tolerant deliberately — poison is sticky, so bailing out on it would silently stop
+/// forwarding rumble for the rest of the process. The protected state is bytes in a shared section,
+/// not an invariant a panic elsewhere could have violated.
+static SECTION_PUBLISH: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 // Build the 29-byte GET_STATE buffer (the layout xinput1_4 parses).
 fn build_get_state(data: Option<&MappedView>) -> [u8; 29] {

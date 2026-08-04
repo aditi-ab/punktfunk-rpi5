@@ -250,11 +250,19 @@ impl DsState {
         use punktfunk_core::input::gamepad as gs;
         let to_u8 = |v: i16| (((v as i32) + 32768) >> 8) as u8;
         let on = |bit: u32| buttons & bit != 0;
+        // Invert in i16 space, BEFORE the quantisation, rather than as `255 - to_u8(v)`.
+        // 0..=255 has no exact midpoint: `to_u8` puts centre at 0x80, which leaves 128 codes below
+        // it and 127 above, so mirroring the *output* (`255 - 0x80` = 0x7F) lands a centred stick
+        // one LSB off the 0x80 that `DsState::neutral` — and the pad's own resting report — use.
+        // Games idle-poll a centred stick constantly, so that off-by-one showed up as a permanent
+        // sub-deadzone tilt on the Y axes only. Negating first maps centre to centre by
+        // construction and keeps both extremes exact (+32767 → 0, -32768 → 255); the only cost is
+        // that i16::MIN and -32767 share the 255 code, one LSB at the very end of the travel.
         let mut s = DsState {
             lx: to_u8(lx),
-            ly: 255 - to_u8(ly),
+            ly: to_u8(ly.saturating_neg()),
             rx: to_u8(rx),
-            ry: 255 - to_u8(ry),
+            ry: to_u8(ry.saturating_neg()),
             l2: lt,
             r2: rt,
             ..DsState::neutral()
@@ -825,6 +833,29 @@ mod tests {
                                         // status byte (struct off 52): discharging (high nibble 0) + full capacity (low nibble
                                         // 0xA → 100 %), so SteamOS/hid-playstation never reports a false "low battery".
         assert_eq!(r[53], 0x0A);
+    }
+
+    /// A centred stick must encode as the pad's own neutral on BOTH axes. Inverting the quantised
+    /// byte (`255 - v`) put Y one LSB below it, which games idle-poll constantly — a permanent
+    /// sub-deadzone tilt. Extremes must stay exact either way.
+    #[test]
+    fn centred_sticks_encode_as_neutral_on_every_axis() {
+        let n = DsState::neutral();
+        let s = DsState::from_gamepad(0, 0, 0, 0, 0, 0, 0);
+        assert_eq!((s.lx, s.ly), (n.lx, n.ly), "left stick centre");
+        assert_eq!((s.rx, s.ry), (n.rx, n.ry), "right stick centre");
+
+        // Y is still inverted (XInput +y = up, DualSense 0 = up) and both ends stay exact.
+        let up = DsState::from_gamepad(0, 0, i16::MAX, 0, i16::MAX, 0, 0);
+        assert_eq!((up.ly, up.ry), (0, 0), "full up = 0");
+        let down = DsState::from_gamepad(0, 0, i16::MIN, 0, i16::MIN, 0, 0);
+        assert_eq!((down.ly, down.ry), (255, 255), "full down = 255");
+
+        // X keeps its existing mapping.
+        let right = DsState::from_gamepad(0, i16::MAX, 0, i16::MAX, 0, 0, 0);
+        assert_eq!((right.lx, right.rx), (255, 255));
+        let left = DsState::from_gamepad(0, i16::MIN, 0, i16::MIN, 0, 0, 0);
+        assert_eq!((left.lx, left.rx), (0, 0));
     }
 
     /// The wire touchpad-click / guide / mute bits (Moonlight's extended positions) land in

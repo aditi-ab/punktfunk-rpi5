@@ -453,6 +453,18 @@ final class RumbleRenderer: @unchecked Sendable {
         if split {
             low = makeMotor(haptics, .leftHandle, sharpness: RumbleTuning.sharpnessLow)
             high = makeMotor(haptics, .rightHandle, sharpness: RumbleTuning.sharpnessHigh)
+            // HALF a split is worse than none, and it used to pass silently: only the all-nil case
+            // below counts as failure, so one surviving handle left `ok` true and `reportHealth(nil)`
+            // announced HEALTHY. What actually rendered was wrong in a direction that depends on
+            // which handle died — lose `high` and `render` falls to the combined branch (selected
+            // purely by `high != nil`), playing max(low, high) on the LEFT handle at the combined
+            // sharpness; lose `low` and the split branch's reconcile no-ops on the nil slot, so the
+            // heavy motor is discarded outright. Tear the survivor down and take the combined path,
+            // which at least renders both motors somewhere.
+            if low == nil || high == nil {
+                log.warning("rumble: only one split-handle engine came up — falling back to combined")
+                teardown() // disarms handlers, stops the survivor's players + engine, nils both
+            }
         } else {
             low = makeMotor(haptics, .default, sharpness: RumbleTuning.sharpnessCombined)
         }
@@ -581,13 +593,33 @@ final class RumbleRenderer: @unchecked Sendable {
         #if os(macOS)
         guard let c, c.extendedGamepad is GCDualSenseGamepad else { return false }
         let hid = DualSenseHID()
-        guard hid.open() else { return false }
+        // Ask for the device this renderer's controller actually is, so two attached DualSenses
+        // do not both get driven through whichever one an unordered Set happened to yield first.
+        guard hid.open(preferringLocationID: Self.hidLocationID(for: c)) else { return false }
         dualSenseHID = hid
         return true
         #else
         return false
         #endif
     }
+
+    #if os(macOS)
+    /// Correlate a `GCController` with an IOKit location id.
+    ///
+    /// GameController exposes no location id, so there is no direct mapping. What it does expose is
+    /// a stable per-controller ordering, and IOKit's location ids are stable per port: pairing the
+    /// two by rank makes each renderer pick a *distinct* device, which is the property that was
+    /// missing. With one pad attached this is the same device it always was.
+    static func hidLocationID(for c: GCController) -> UInt32? {
+        let ids = DualSenseHID.attachedLocationIDs()
+        guard ids.count > 1 else { return ids.first }
+        let peers = GCController.controllers().filter { $0.extendedGamepad is GCDualSenseGamepad }
+        guard let rank = peers.firstIndex(where: { $0 === c }), rank < ids.count else {
+            return ids.first
+        }
+        return ids[rank]
+    }
+    #endif
 
     /// Write the target to the DualSense over HID if that's the active backend; false → not a
     /// HID pad, so the caller renders via CoreHaptics. Deduped on the pad's 0...255 resolution,
@@ -599,8 +631,20 @@ final class RumbleRenderer: @unchecked Sendable {
         let keepalive = levels != (0, 0)
             && seconds(since: lastHidWrite.at) > RumbleTuning.hidKeepaliveSeconds
         if levels != lastHidWrite.levels || keepalive {
-            hid.rumble(low: levels.0, high: levels.1)
-            lastHidWrite = (levels, .now())
+            if hid.rumble(low: levels.0, high: levels.1) {
+                lastHidWrite = (levels, .now())
+            } else {
+                // The write did not reach the device. Do NOT stamp the clock — that would claim a
+                // render that never happened, and for a stop there is nothing behind it: the
+                // keepalive only re-writes non-zero levels and the ticker is cancelled once the
+                // target is (0, 0), so the motors would keep running with nothing scheduled.
+                // Drop the handle instead: the pad reverts to CoreHaptics, and a reconnect
+                // rebuilds it. Health is reported so the state is visible rather than silent.
+                log.error("rumble: HID write failed — dropping the handle, falling back")
+                closeHID()
+                reportHealth("Lost the direct connection to this DualSense; using the system path.")
+                return false
+            }
         }
         return true
         #else

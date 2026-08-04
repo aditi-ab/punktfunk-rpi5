@@ -466,6 +466,13 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
     #[cfg(windows)]
     crate::win32::set_app_user_model_id();
     sdl3::hint::set("SDL_JOYSTICK_THREAD", "1");
+    // Hold SDL's Valve HIDAPI drivers off BEFORE SDL_Init: the Deck driver clears the pad's
+    // digital mappings at *enumeration*, which is part of bringing the gamepad subsystem up, so a
+    // hint set after `sdl.gamepad()` — where this used to live, inside GamepadService::pumped —
+    // only detached a driver that had already killed the built-in trackpad-mouse system-wide. The
+    // symptom was the Deck losing its trackpad cursor at the start of every session until the
+    // firmware watchdog restored lizard mode. They are still enabled for an attached session.
+    pf_client_core::gamepad::preinit_disable_valve_hidapi();
     // A touchscreen (the Deck's glass) is forwarded as REAL touch passthrough below — so
     // suppress SDL's default synthesis of mouse events from touch. Left on, every touch
     // ALSO warps a synthetic mouse to the touch point, which under the stream's relative
@@ -1895,6 +1902,13 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
         }
     };
 
+    // Every exit from the loop above converges here, which is why the gamepad teardown belongs
+    // here and not on the individual `break`s. `gamepad.detach()` only queues the detach; the
+    // close — flush, host-side GamepadRemove, and the explicit rumble-stop backstop — runs when
+    // the pump drains it. Single mode broke out of the loop immediately after detaching and
+    // Event::Quit never detached at all, so both left forwarded pads unflushed and, if the game
+    // was rumbling at the time, still buzzing.
+    pump.shutdown();
     // Join the pump BEFORE the device-wide idle: its decode submissions on the shared
     // device would race vkDeviceWaitIdle otherwise.
     if let Some(st) = stream.take() {
