@@ -57,8 +57,12 @@ pub struct OpusLayout {
     pub coupled: u8,
     /// libopus multistream channel mapping — identity `[0, 1, …, channels-1]`.
     pub mapping: &'static [u8],
-    /// Target Opus bitrate in bits/sec (hard CBR; constant packet size, which GameStream's
-    /// audio FEC relies on).
+    /// Target Opus bitrate in bits/sec at [`AudioTier::Standard`] — see
+    /// [`OpusLayout::bitrate_for`], which is what callers should use. These are the historical
+    /// values, kept exactly so `Standard` reproduces the pre-tier wire byte-for-byte.
+    ///
+    /// The GameStream plane encodes hard-CBR from these (its audio FEC needs a constant packet
+    /// size); the native plane uses constrained VBR, where that constraint does not apply.
     pub bitrate: i32,
 }
 

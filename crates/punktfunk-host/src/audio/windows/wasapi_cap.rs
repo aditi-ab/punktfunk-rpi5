@@ -27,6 +27,7 @@
 //! succeed). On thread exit (capturer dropped at stream end) the parked default playback
 //! device is restored.
 
+use super::capture_policy::{CaptureStats, FightDamper, FIGHT_BACKOFF, STATS_EVERY};
 use super::{audio_control, wiring_plan, AudioCapturer, SAMPLE_RATE};
 use anyhow::{anyhow, Context, Result};
 use std::collections::VecDeque;
@@ -359,7 +360,7 @@ fn capture_once(
 ) -> Result<Next> {
     // Interleaved f32: channels * 4 bytes per frame.
     let block_align = channels as usize * 4;
-    let keep_default = std::env::var_os("PUNKTFUNK_KEEP_DEFAULT").is_some();
+    let keep_default = audio_control::keep_default_devices();
     // Assert-mode without KEEP_DEFAULT is the only shape that parks the playback default.
     let assert_plan = mode == TargetMode::Assert && !keep_default;
     let mut plan = audio_control::wire_now_full(assert_plan);
@@ -454,12 +455,25 @@ fn capture_once(
         channels as usize,
         Some(mask),
     );
-    let (default_period, _min_period) =
-        audio_client.get_device_period().context("device period")?;
+    // WP0.1 — the endpoint's ACTUAL engine mix format, read BEFORE we initialize. Everything the
+    // old log printed ("48 kHz f32 channels=2") was our REQUEST; with `autoconvert` WASAPI
+    // silently converts from whatever the endpoint really runs, so a voice-carrier endpoint
+    // narrowing the desktop mix to mono or 24 kHz was invisible in a 3,600-line field log. This
+    // line is what makes an audio-quality report triageable without a round trip.
+    let engine = audio_client.get_mixformat().ok();
+    // NB the plan's WP4.5 ("open the loopback at the MINIMUM device period, worth ~5–10 ms") is
+    // deliberately NOT done here, because its premise is wrong: in shared mode
+    // `IAudioClient::Initialize` cannot change the engine period at all — `hnsBufferDuration` sizes
+    // the buffer, and the callback still fires at the engine's fixed default period. Lowering it
+    // needs `IAudioClient3::InitializeSharedAudioStream`, which the `wasapi` crate does not wrap.
+    // Passing `min_period` here would therefore be a no-op at best and a new Initialize failure
+    // path at worst, on a device this tree cannot compile for, let alone test. Left as real work.
+    let (default_period, min_period) = audio_client.get_device_period().context("device period")?;
     let stream_mode = StreamMode::EventsShared {
         autoconvert: true,
         buffer_duration_hns: default_period,
     };
+    let used_period = default_period;
     audio_client
         .initialize_client(&desired, &Direction::Capture, &stream_mode)
         .context("initialize loopback client")?;
@@ -476,7 +490,17 @@ fn capture_once(
     tracing::info!(device = %dev_name,
         follow = matches!(mode, TargetMode::Follow) || keep_default,
         last_resort,
+        // The endpoint's own format — NOT the one we asked for.
+        engine_hz = engine.as_ref().map(|f| f.get_samplespersec()),
+        engine_ch = engine.as_ref().map(|f| f.get_nchannels()),
+        engine_bits = engine.as_ref().map(|f| f.get_bitspersample()),
+        buffer_ms = used_period as f32 / 10_000.0,
+        min_buffer_ms = min_period as f32 / 10_000.0,
         "audio loopback capturing");
+    if let Some(why) = &wiring.loopback_narrowing {
+        tracing::warn!(device = %dev_name,
+            "capturing an endpoint that {why} — the stream cannot sound better than this source");
+    }
 
     // Watchdog seed: the default as it stands right after our open. In Assert mode the plan just
     // parked the default on our endpoint — if it did NOT stick (IPolicyConfig denied) converge
@@ -514,6 +538,15 @@ fn capture_once(
     let opened_at = Instant::now();
     let mut saw_packets = false;
     let mut silence_noted = false;
+    // WP0.2 — the audio plane's own vitals, logged periodically. Before this, a host log said
+    // nothing whatsoever about audio between "capturing" and the session ending: no level, no
+    // cadence, and in particular no sign of the SILENT, uncounted drop below, where a stalled
+    // encode thread loses chunks and the encoder simply concatenates across the hole (a click,
+    // and a permanent A/V offset, with nothing in any log).
+    let mut stats = CaptureStats::default();
+    let mut last_stats = Instant::now();
+    // WP2.4 — damping for the default-playback tug-of-war.
+    let mut fight = FightDamper::new(Instant::now());
     loop {
         if stop.load(Ordering::Relaxed) {
             audio_client.stop_stream().ok();
@@ -556,7 +589,34 @@ fn capture_once(
             for c in raw.chunks_exact(4) {
                 samples.push(f32::from_le_bytes([c[0], c[1], c[2], c[3]]));
             }
-            let _ = tx.try_send(samples); // non-blocking, lossy — same discipline as PipeWire
+            stats.observe(&samples, channels);
+            // Non-blocking, lossy — same discipline as PipeWire. Now COUNTED: a full channel
+            // means the encode thread is not keeping up, and every dropped chunk is a click plus
+            // a permanent shift of everything after it.
+            if tx.try_send(samples).is_err() {
+                stats.dropped_chunks += 1;
+            }
+        }
+        if last_stats.elapsed() >= STATS_EVERY {
+            let (peak_db, rms_db, delivered_pct) = stats.summary(last_stats.elapsed(), SAMPLE_RATE);
+            if stats.dropped_chunks > 0 {
+                tracing::warn!(
+                    device = %dev_name,
+                    dropped_chunks = stats.dropped_chunks,
+                    "the audio encode thread could not keep up — captured audio was DROPPED; the \
+                     stream will click and everything after it shifts"
+                );
+            }
+            tracing::info!(
+                device = %dev_name,
+                peak_db = format!("{peak_db:.1}"),
+                rms_db = format!("{rms_db:.1}"),
+                delivered_pct = format!("{delivered_pct:.0}"),
+                dropped_chunks = stats.dropped_chunks,
+                "desktop audio capture"
+            );
+            last_stats = Instant::now();
+            stats = CaptureStats::default();
         }
 
         // Watchdog: react when the default render device CHANGES from what we last observed —
@@ -568,29 +628,68 @@ fn capture_once(
                 if seen_default.as_deref() != Some(nid.as_str()) {
                     seen_default = Some(nid.clone());
                     if nid != dev_id {
-                        audio_client.stop_stream().ok();
+                        // NB the stream is stopped per-branch below, NOT here: the WP2.4 Dud
+                        // path deliberately keeps capturing, and stopping first would have made
+                        // the "no teardown" fix silently useless.
                         if keep_default {
+                            audio_client.stop_stream().ok();
                             tracing::info!(
                                 "default render device changed (PUNKTFUNK_KEEP_DEFAULT) — \
                                  following it"
                             );
                             return Ok(Next::Reopen(TargetMode::Follow));
                         }
-                        return Ok(match judge_default(&en, wiring, &nid) {
+                        match judge_default(&en, wiring, &nid) {
                             DefaultKind::Capturable(name) => {
+                                audio_client.stop_stream().ok();
                                 tracing::info!(device = %name,
                                     "operator changed the output device mid-stream — following \
                                      it (audio now also plays on the host)");
-                                Next::Reopen(TargetMode::Follow)
+                                return Ok(Next::Reopen(TargetMode::Follow));
                             }
+                            // WP2.4 — a DUD default does not affect what we are capturing:
+                            // Assert mode binds the capture to the plan's endpoint EXPLICITLY,
+                            // not to whatever the default happens to be. Only where *apps*
+                            // render has moved. So put the default back and KEEP THE STREAM —
+                            // the old full reopen tore the capture down for nothing, and the
+                            // 2026-08-03 field log shows what that cost: something re-set the
+                            // default to CABLE Input every ~4 s and each round trip was a
+                            // teardown, a re-plan with IPolicyConfig writes, and an audible
+                            // dropout — seven of them in sixteen seconds, one ending in a 2 s
+                            // error backoff.
                             DefaultKind::Dud(name) => {
-                                tracing::warn!(device = %name,
-                                    "default playback moved to an endpoint whose loopback cannot \
-                                     work — re-asserting the audio wiring plan");
-                                Next::Reopen(TargetMode::Assert)
+                                if !assert_plan {
+                                    // Follow/KEEP_DEFAULT shapes still need the old behaviour:
+                                    // there the capture IS bound to the default.
+                                    audio_client.stop_stream().ok();
+                                    return Ok(Next::Reopen(TargetMode::Assert));
+                                }
+                                fight.observed_at(Instant::now());
+                                if fight.should_reassert() {
+                                    audio_control::reassert_default_playback(&dev_id);
+                                    // Believe our own write: the next watchdog tick sees the
+                                    // default back on our endpoint and stays quiet.
+                                    seen_default = Some(dev_id.clone());
+                                    if fight.warn_now() {
+                                        tracing::warn!(device = %name, planned = %dev_name,
+                                            "something keeps moving the default playback to an \
+                                             endpoint whose loopback cannot work — putting it \
+                                             back (the capture is unaffected)");
+                                    }
+                                } else if fight.warn_giving_up() {
+                                    tracing::warn!(device = %name, planned = %dev_name,
+                                        backoff_s = FIGHT_BACKOFF.as_secs(),
+                                        "another program is repeatedly taking the default \
+                                         playback device — backing off rather than fighting it. \
+                                         Desktop audio keeps streaming from the planned endpoint, \
+                                         but apps rendering to the other device will not be heard");
+                                }
                             }
-                            DefaultKind::Unknown => Next::Reopen(TargetMode::Assert),
-                        });
+                            DefaultKind::Unknown => {
+                                audio_client.stop_stream().ok();
+                                return Ok(Next::Reopen(TargetMode::Assert));
+                            }
+                        }
                     }
                 }
             }

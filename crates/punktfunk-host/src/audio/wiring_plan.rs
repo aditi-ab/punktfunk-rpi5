@@ -43,6 +43,59 @@
 /// A `(friendly_name, endpoint_id)` pair as enumerated from WASAPI.
 pub(crate) type Endpoint = (String, String);
 
+/// A render endpoint's ENGINE MIX FORMAT, as `IAudioClient::GetMixFormat` reports it.
+///
+/// This is the number the 2026-08-03 field report needed and the log did not have. The capture
+/// side opens with `autoconvert: true` and asks for 48 kHz f32 in the wire layout, so WASAPI
+/// silently converts whatever the endpoint really runs — and the "48 kHz f32 channels=2" we
+/// logged was our REQUEST, not the source. An endpoint that mixes at 24 kHz mono therefore
+/// produced a 48 kHz stereo stream that had already been through a 24 kHz mono bottleneck, with
+/// nothing in any log to say so.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct MixFormat {
+    pub rate_hz: u32,
+    pub channels: u16,
+    pub bits: u16,
+}
+
+impl MixFormat {
+    /// Why this endpoint would NARROW a `want`-channel desktop mix, or `None` if it carries it
+    /// intact. Bit depth is deliberately not a criterion: 16-bit is ~96 dB of headroom, far below
+    /// Opus's own noise floor, whereas a lost channel or halved bandwidth is plainly audible.
+    pub(crate) fn narrowing(&self, want: u8) -> Option<String> {
+        if self.rate_hz < 48_000 && self.channels < want as u16 {
+            return Some(format!(
+                "mixes at {} Hz and only {} channel(s)",
+                self.rate_hz, self.channels
+            ));
+        }
+        if self.rate_hz < 48_000 {
+            return Some(format!(
+                "mixes at {} Hz, so the stream is band-limited to ~{} kHz before Opus sees it",
+                self.rate_hz,
+                self.rate_hz / 2000
+            ));
+        }
+        if self.channels < want as u16 {
+            return Some(format!(
+                "mixes {} channel(s), so a {want}-channel desktop mix is downmixed and re-expanded",
+                self.channels
+            ));
+        }
+        None
+    }
+}
+
+/// Looks up a render endpoint's mix format by endpoint id. `None` = unknown (enumeration failed,
+/// or the caller has no way to ask) — treated as "assume it is fine", so a probe failure can
+/// never make the plan worse than it was before formats existed.
+pub(crate) type FormatProbe<'a> = &'a dyn Fn(&Endpoint) -> Option<MixFormat>;
+
+/// A [`FormatProbe`] that knows nothing — the pre-WP2.1 behaviour.
+pub(crate) fn no_formats(_: &Endpoint) -> Option<MixFormat> {
+    None
+}
+
 /// The coherent endpoint assignment for one wiring pass. Computed fresh on every mic/capture
 /// (re)open — Windows endpoints churn (boot-time registration, hotplug, driver installs), so a
 /// once-per-process plan goes stale.
@@ -60,6 +113,11 @@ pub(crate) struct Wiring {
     /// the mic reservation. The capture side treats it as a stopgap: it warns when the silence
     /// materializes and re-plans on any endpoint-set change instead of riding it out.
     pub loopback_last_resort: bool,
+    /// Set when the chosen loopback endpoint's mix format NARROWS the desktop mix (see
+    /// [`MixFormat::narrowing`]) and the plan took it anyway because nothing better existed. Carries
+    /// the human-readable reason for the capture side to log — a quality risk the operator can act
+    /// on (attach a real output, or set the output mode to prefer hardware), not a failure.
+    pub loopback_narrowing: Option<String>,
 }
 
 impl Wiring {
@@ -138,6 +196,32 @@ pub(crate) fn plan(
     mic_want: Option<&str>,
     host_audio: bool,
 ) -> Wiring {
+    plan_with_formats(renders, captures, mic_want, host_audio, &no_formats, 2)
+}
+
+/// [`plan`] with knowledge of each render endpoint's engine mix format, and the channel count the
+/// session wants to carry.
+///
+/// **The 2026-08-03 field report is this function's reason to exist.** The default client-only
+/// preference takes the "silent sink" — Steam's Streaming *Microphone* render endpoint — over real
+/// hardware unconditionally, because it is silent on the host. But that endpoint exists to carry
+/// remote *voice*, and nothing checked whether it could carry music. On the reporter's box it won
+/// all 31 loopback opens across 25 sessions while a clean AMD HD Audio endpoint sat idle, and the
+/// whole desktop mix went through it before reaching Opus.
+///
+/// So a silent sink now has to EARN its preference: if its mix format narrows the mix (see
+/// [`MixFormat::narrowing`]) it drops below real hardware. It is still taken when nothing better
+/// exists — narrow audio beats no audio — but flagged in [`Wiring::loopback_narrowing`] so the
+/// capture side can say why. An unknown format (probe failed) counts as fine, so this can never
+/// make the plan worse than it was before formats existed.
+pub(crate) fn plan_with_formats(
+    renders: &[Endpoint],
+    captures: &[Endpoint],
+    mic_want: Option<&str>,
+    host_audio: bool,
+    format_of: FormatProbe,
+    want_channels: u8,
+) -> Wiring {
     let find_render = |needle: &str| {
         renders
             .iter()
@@ -172,10 +256,18 @@ pub(crate) fn plan(
             not_mic(id) && !excluded_from_loopback(&ln) && !virtualish(&ln)
         })
     };
-    let silent = || {
-        renders
-            .iter()
-            .find(|(n, id)| not_mic(id) && silent_sink(&n.to_lowercase()))
+    // A silent sink splits in two: one that carries the mix intact, and one that narrows it. The
+    // first keeps the historical preference; the second falls BELOW real hardware.
+    let narrowing_of = |ep: &Endpoint| format_of(ep).and_then(|f| f.narrowing(want_channels));
+    let silent_intact = || {
+        renders.iter().find(|ep| {
+            not_mic(&ep.1) && silent_sink(&ep.0.to_lowercase()) && narrowing_of(ep).is_none()
+        })
+    };
+    let silent_narrow = || {
+        renders.iter().find(|ep| {
+            not_mic(&ep.1) && silent_sink(&ep.0.to_lowercase()) && narrowing_of(ep).is_some()
+        })
     };
     // LAST RESORT — the Steam Streaming Speakers, and ONLY them. Their loopback is known-silent
     // (validated live): a QUALITY risk, flagged so the capture side can warn when the silence
@@ -192,10 +284,13 @@ pub(crate) fn plan(
             .iter()
             .find(|(n, id)| not_mic(id) && n.to_lowercase().contains("steam streaming speakers"))
     };
+    // A narrowing silent sink sits below real hardware in BOTH modes: preferring silence on the
+    // host is a routing choice, but it must not silently cost audio quality when a clean endpoint
+    // is right there.
     let preferred = if host_audio {
-        real_hw().or_else(silent)
+        real_hw().or_else(silent_intact).or_else(silent_narrow)
     } else {
-        silent().or_else(real_hw)
+        silent_intact().or_else(real_hw).or_else(silent_narrow)
     };
     let (loopback_render, loopback_last_resort) = match preferred {
         Some(ep) => (Some(ep.clone()), false),
@@ -204,12 +299,16 @@ pub(crate) fn plan(
             None => (None, false),
         },
     };
+    // Report narrowing for whatever we actually chose — including real hardware, which can also
+    // be a 24 kHz mono endpoint (a headset's hands-free profile is exactly that).
+    let loopback_narrowing = loopback_render.as_ref().and_then(narrowing_of);
 
     Wiring {
         mic_render,
         mic_capture,
         loopback_render,
         loopback_last_resort,
+        loopback_narrowing,
     }
 }
 
@@ -548,6 +647,169 @@ mod tests {
             assert!(!w.loopback_last_resort, "host_audio={host_audio}");
             assert!(w.loopback_unsatisfiable(), "host_audio={host_audio}");
         }
+    }
+
+    // ---- format-aware loopback selection (WP2.1) -----------------------------------------
+
+    fn fmt(rate_hz: u32, channels: u16) -> MixFormat {
+        MixFormat {
+            rate_hz,
+            channels,
+            bits: 32,
+        }
+    }
+
+    /// Probe helper: give endpoints whose (lowercased) name contains a needle that format,
+    /// everything else unknown. Owns its table so call sites can pass a literal inline.
+    fn probe(table: Vec<(&'static str, MixFormat)>) -> impl Fn(&Endpoint) -> Option<MixFormat> {
+        move |ep: &Endpoint| {
+            let name = ep.0.to_lowercase();
+            table
+                .iter()
+                .find_map(|(needle, f)| name.contains(needle).then_some(*f))
+        }
+    }
+
+    /// THE 2026-08-03 field case, with formats. The reporter's exact endpoint inventory: the plan
+    /// took the Steam Streaming Microphone on all 31 opens while a clean AMD HD Audio endpoint sat
+    /// idle. Once we can see that the silent sink narrows the mix, real hardware must win.
+    #[test]
+    fn narrowing_silent_sink_loses_to_real_hardware() {
+        let renders = [
+            ep("CABLE In 16ch (VB-Audio Virtual Cable)"),
+            ep("Altavoces (Steam Streaming Speakers)"),
+            ep("Altavoces (Steam Streaming Microphone)"),
+            ep("CABLE Input (VB-Audio Virtual Cable)"),
+            ep("1 - Odyssey G60SD (AMD High Definition Audio Device)"),
+        ];
+        let captures = [
+            ep("CABLE Output (VB-Audio Virtual Cable)"),
+            ep("Microphone (Steam Streaming Microphone)"),
+        ];
+        // A voice-carrier endpoint: 24 kHz mono.
+        let p = probe(vec![
+            ("steam streaming microphone", fmt(24_000, 1)),
+            ("odyssey", fmt(48_000, 2)),
+        ]);
+        let w = plan_with_formats(&renders, &captures, None, false, &p, 2);
+        assert_eq!(
+            w.loopback_render.as_ref().unwrap().0,
+            "1 - Odyssey G60SD (AMD High Definition Audio Device)",
+            "a narrowing silent sink must not beat clean real hardware"
+        );
+        assert!(
+            w.loopback_narrowing.is_none(),
+            "the chosen endpoint is intact"
+        );
+        // The mic assignment is untouched by any of this.
+        assert_eq!(
+            w.mic_render.unwrap().0,
+            "CABLE Input (VB-Audio Virtual Cable)"
+        );
+    }
+
+    /// …but a silent sink that carries the mix intact keeps its historical preference: the
+    /// client-only routing default is not being abandoned, only made conditional on quality.
+    #[test]
+    fn intact_silent_sink_still_wins() {
+        let renders = [
+            ep("Speakers (Realtek HD Audio)"),
+            ep("CABLE Input (VB-Audio Virtual Cable)"),
+            ep("Speakers (Steam Streaming Microphone)"),
+        ];
+        let p = probe(vec![
+            ("steam streaming microphone", fmt(48_000, 2)),
+            ("realtek", fmt(48_000, 2)),
+        ]);
+        let w = plan_with_formats(&renders, &[], None, false, &p, 2);
+        assert_eq!(
+            w.loopback_render.unwrap().0,
+            "Speakers (Steam Streaming Microphone)"
+        );
+    }
+
+    /// Narrow audio still beats NO audio: with nothing else available the narrowing sink is taken
+    /// and flagged, not refused.
+    #[test]
+    fn narrowing_sink_is_taken_when_it_is_all_there_is() {
+        let renders = [
+            ep("CABLE Input (VB-Audio Virtual Cable)"),
+            ep("Speakers (Steam Streaming Microphone)"),
+        ];
+        let p = probe(vec![("steam streaming microphone", fmt(16_000, 1))]);
+        let w = plan_with_formats(&renders, &[], None, false, &p, 2);
+        assert_eq!(
+            w.loopback_render.as_ref().unwrap().0,
+            "Speakers (Steam Streaming Microphone)"
+        );
+        let why = w.loopback_narrowing.expect("must be flagged");
+        assert!(why.contains("16000"), "{why}");
+    }
+
+    /// Real hardware can narrow too — a headset in its hands-free profile is 16 kHz mono — and
+    /// must be flagged just the same. The flag is about the CHOSEN endpoint, not about which tier
+    /// it came from.
+    #[test]
+    fn narrowing_is_reported_for_real_hardware_too() {
+        let renders = [ep("Headset (Hands-Free AG Audio)")];
+        let p = probe(vec![("headset", fmt(16_000, 1))]);
+        let w = plan_with_formats(&renders, &[], None, false, &p, 2);
+        assert_eq!(
+            w.loopback_render.as_ref().unwrap().0,
+            "Headset (Hands-Free AG Audio)"
+        );
+        assert!(w.loopback_narrowing.is_some());
+    }
+
+    /// An unknown format must never make the plan WORSE than it was before formats existed: a
+    /// probe that answers nothing has to reproduce `plan` exactly.
+    #[test]
+    fn unknown_formats_reproduce_the_formatless_plan() {
+        let renders = [
+            ep("Speakers (Apple Audio Device)"),
+            ep("CABLE Input (VB-Audio Virtual Cable)"),
+            ep("Speakers (Steam Streaming Speakers)"),
+            ep("Speakers (Steam Streaming Microphone)"),
+        ];
+        let captures = [ep("CABLE Output (VB-Audio Virtual Cable)")];
+        for host_audio in [false, true] {
+            let a = plan(&renders, &captures, None, host_audio);
+            let b = plan_with_formats(&renders, &captures, None, host_audio, &no_formats, 2);
+            assert_eq!(a, b, "host_audio={host_audio}");
+            assert!(a.loopback_narrowing.is_none());
+        }
+    }
+
+    /// `host_audio` still prefers real hardware, and a narrowing silent sink stays last in that
+    /// mode too.
+    #[test]
+    fn host_audio_ordering_survives_formats() {
+        let renders = [
+            ep("Speakers (Realtek HD Audio)"),
+            ep("Speakers (Steam Streaming Microphone)"),
+        ];
+        let p = probe(vec![
+            ("steam streaming microphone", fmt(24_000, 1)),
+            ("realtek", fmt(48_000, 2)),
+        ]);
+        let w = plan_with_formats(&renders, &[], None, true, &p, 2);
+        assert_eq!(w.loopback_render.unwrap().0, "Speakers (Realtek HD Audio)");
+    }
+
+    /// The narrowing test is channel-count aware: an endpoint that is fine for stereo narrows a
+    /// 5.1 session.
+    #[test]
+    fn narrowing_depends_on_the_session_channel_count() {
+        let stereo_only = fmt(48_000, 2);
+        assert_eq!(stereo_only.narrowing(2), None);
+        assert!(stereo_only.narrowing(6).is_some());
+        // Rate is judged independently of channels.
+        assert!(fmt(44_100, 8).narrowing(2).is_some());
+        // And an endpoint wider than the session is never "narrowing".
+        assert_eq!(fmt(48_000, 8).narrowing(2), None);
+        // Both wrong: the message must name both problems.
+        let both = fmt(16_000, 1).narrowing(6).unwrap();
+        assert!(both.contains("16000") && both.contains("channel"), "{both}");
     }
 
     /// Operator override beats the candidate order.

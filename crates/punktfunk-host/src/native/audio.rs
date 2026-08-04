@@ -1,8 +1,13 @@
 //! The native audio plane (plan §W1 — carved out of the [`super`] module): desktop capture → Opus
-//! (48 kHz, 5 ms, CBR — the same tuning as the GameStream path) → `AUDIO_MAGIC` QUIC datagrams, at
-//! the negotiated channel count. The encoder ([`NativeAudioEnc`]) and the capture/encode/send loop
-//! ([`audio_thread`]) are gated to linux/windows (libopus + a real capturer); other targets get the
-//! stub, so a dev build streams video-only rather than failing to compile.
+//! (48 kHz, 5 ms, constrained VBR at the configured [`AudioTier`](punktfunk_core::audio::AudioTier))
+//! → `AUDIO_MAGIC` QUIC datagrams — or `AUDIO_RED_MAGIC` when the session negotiated redundancy —
+//! at the negotiated channel count. The encoder ([`NativeAudioEnc`]) and the capture/encode/send
+//! loop ([`audio_thread`]) are gated to linux/windows (libopus + a real capturer); other targets
+//! get the stub, so a dev build streams video-only rather than failing to compile.
+//!
+//! Two things here deliberately DIVERGE from the GameStream plane, which used to share this
+//! tuning: hard CBR (its audio FEC needs fixed-size packets; this plane has no FEC, so CBR was a
+//! pure quality tax) and the fixed 128 kbps stereo bitrate. See [`NativeAudioEnc::new`].
 
 use super::*;
 
@@ -17,20 +22,36 @@ enum NativeAudioEnc {
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 impl NativeAudioEnc {
-    /// Build the encoder for `channels` (2/6/8), hard-CBR + RESTRICTED_LOWDELAY like the
-    /// GameStream path; bitrate from the shared layout table (stereo keeps the validated 128 kbps).
-    fn new(channels: u8) -> Result<NativeAudioEnc, opus::Error> {
+    /// Build the encoder for `channels` (2/6/8) at `tier`, RESTRICTED_LOWDELAY like the GameStream
+    /// path but — unlike it — in CONSTRAINED VBR.
+    ///
+    /// **Why not hard CBR (WP1.2).** The layout table's comment justifies `set_vbr(false)` with
+    /// "constant packet size, which GameStream's audio FEC relies on" — true of the GameStream
+    /// plane, and irrelevant here: the native `punktfunk/1` audio plane has no FEC at all (see
+    /// `punktfunk_core::audio::AudioGapTracker`, which exists precisely because a lost packet has
+    /// nothing to rebuild it from). So this path was paying a pure quality tax for a constraint
+    /// that does not apply to it. Constrained VBR keeps the same average bitrate and the same
+    /// bounded packet size, and spends the bits where the signal needs them.
+    ///
+    /// The GameStream encoder (`crate::gamestream::audio`) is deliberately NOT changed: its FEC
+    /// really does need fixed-size packets.
+    fn new(
+        channels: u8,
+        tier: punktfunk_core::audio::AudioTier,
+    ) -> Result<NativeAudioEnc, opus::Error> {
+        let l = punktfunk_core::audio::layout_for(channels, false);
+        let bitrate = l.bitrate_for(tier);
         if channels == 2 {
             let mut e = opus::Encoder::new(
                 crate::audio::SAMPLE_RATE,
                 opus::Channels::Stereo,
                 opus::Application::LowDelay,
             )?;
-            e.set_bitrate(opus::Bitrate::Bits(128_000)).ok();
-            e.set_vbr(false).ok();
+            e.set_bitrate(opus::Bitrate::Bits(bitrate)).ok();
+            e.set_vbr(true).ok();
+            e.set_vbr_constraint(true).ok();
             Ok(NativeAudioEnc::Stereo(e))
         } else {
-            let l = punktfunk_core::audio::layout_for(channels, false);
             let mut e = opus::MSEncoder::new(
                 crate::audio::SAMPLE_RATE,
                 l.streams,
@@ -38,8 +59,9 @@ impl NativeAudioEnc {
                 l.mapping,
                 opus::Application::LowDelay,
             )?;
-            e.set_bitrate(opus::Bitrate::Bits(l.bitrate)).ok();
-            e.set_vbr(false).ok();
+            e.set_bitrate(opus::Bitrate::Bits(bitrate)).ok();
+            e.set_vbr(true).ok();
+            e.set_vbr_constraint(true).ok();
             Ok(NativeAudioEnc::Surround(e))
         }
     }
@@ -52,8 +74,8 @@ impl NativeAudioEnc {
     }
 }
 
-/// The audio thread: desktop capture → Opus (48 kHz, 5 ms, CBR — same tuning as the GameStream
-/// path) → `AUDIO_MAGIC` datagrams, at the negotiated `channels` (2 stereo / 6 = 5.1 / 8 = 7.1,
+/// The audio thread: desktop capture → Opus (48 kHz, 5 ms, constrained VBR at the configured
+/// tier) → `AUDIO_MAGIC` (or `AUDIO_RED_MAGIC`) datagrams, at the negotiated `channels` (2 stereo / 6 = 5.1 / 8 = 7.1,
 /// canonical wire order FL FR FC LFE RL RR SL SR). QUIC already encrypts; no extra layer. The
 /// capturer comes from (and returns to) the persistent slot — see [`AudioCapSlot`].
 #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -62,11 +84,27 @@ pub(super) fn audio_thread(
     stop: Arc<AtomicBool>,
     audio_cap: AudioCapSlot,
     channels: u8,
+    redundancy: bool,
 ) {
     use crate::audio::SAMPLE_RATE;
     const FRAME_MS: usize = 5;
     const SAMPLES_PER_FRAME: usize = SAMPLE_RATE as usize * FRAME_MS / 1000; // 240
     let want = punktfunk_core::audio::normalize_channels(channels);
+    // WP1.1 — encode tier. Unknown spellings warn and fall back rather than silently downgrading
+    // someone's audio (the whole point of the setting is that quality stopped being invisible).
+    let tier = match pf_host_config::config().audio_quality.as_deref() {
+        None => punktfunk_core::audio::AudioTier::default(),
+        Some(s) => match punktfunk_core::audio::AudioTier::parse(s) {
+            Some(t) => t,
+            None => {
+                tracing::warn!(
+                    value = %s,
+                    "PUNKTFUNK_AUDIO_QUALITY is not one of low/standard/high — using the default"
+                );
+                punktfunk_core::audio::AudioTier::default()
+            }
+        },
+    };
 
     // Reuse the cached capturer ONLY when its channel count matches this session's; a stereo
     // capturer left by a prior session must not feed a 5.1/7.1 session (the encoder + the client's
@@ -92,7 +130,7 @@ pub(super) fn audio_thread(
             }
         }
     };
-    let mut enc = match NativeAudioEnc::new(want) {
+    let mut enc = match NativeAudioEnc::new(want, tier) {
         Ok(e) => e,
         Err(e) => {
             tracing::warn!(error = %e, "opus encoder init failed — session continues without audio");
@@ -120,9 +158,16 @@ pub(super) fn audio_thread(
     // A stuck Opus encoder would fail on every 5 ms frame (~200/s); power-of-two throttle the
     // warn so it can't flood stderr + the log ring while still surfacing that it's failing.
     let mut opus_encode_errs: u64 = 0;
+    // WP3.1 — the previous frame's Opus bytes, for the redundant `0xD2` plane. Cleared whenever
+    // continuity breaks (a capture reopen), so we never advertise a predecessor the client's
+    // sequence numbering does not agree with.
+    let mut prev_frame: Vec<u8> = Vec::new();
     if capturer.is_some() {
         tracing::info!(
             channels = want,
+            tier = tier.as_str(),
+            kbps = punktfunk_core::audio::layout_for(want, false).bitrate_for(tier) / 1000,
+            redundancy,
             "punktfunk/1 audio streaming (Opus 48 kHz, 5 ms datagrams)"
         );
     }
@@ -138,6 +183,10 @@ pub(super) fn audio_thread(
                     capturer = Some(c);
                     last_failed = None;
                     acc.clear(); // drop the partial frame straddling the gap
+                                 // The next frame has no valid predecessor across the gap: sending the
+                                 // pre-gap frame as "the previous one" would hand the client audio from
+                                 // before the discontinuity to splice in.
+                    prev_frame.clear();
                 }
                 Err(e) => {
                     tracing::debug!(error = %format!("{e:#}"), "audio reopen failed — will retry");
@@ -162,10 +211,23 @@ pub(super) fn audio_thread(
             let pts_ns = now_ns();
             match enc.encode_float(&frame, &mut opus_buf) {
                 Ok(n) => {
-                    let d =
-                        punktfunk_core::quic::encode_audio_datagram(seq, pts_ns, &opus_buf[..n]);
+                    let opus = &opus_buf[..n];
+                    let d = if redundancy {
+                        punktfunk_core::quic::encode_audio_red_datagram(
+                            seq,
+                            pts_ns,
+                            opus,
+                            &prev_frame,
+                        )
+                    } else {
+                        punktfunk_core::quic::encode_audio_datagram(seq, pts_ns, opus)
+                    };
                     if conn.send_datagram(d.into()).is_err() {
                         break 'session; // connection gone
+                    }
+                    if redundancy {
+                        prev_frame.clear();
+                        prev_frame.extend_from_slice(opus);
                     }
                     seq = seq.wrapping_add(1);
                 }
@@ -199,6 +261,7 @@ pub(super) fn audio_thread(
     _stop: Arc<AtomicBool>,
     _audio_cap: AudioCapSlot,
     _channels: u8,
+    _redundancy: bool,
 ) {
     tracing::warn!("punktfunk/1 audio requires Linux or Windows — session continues without it");
 }

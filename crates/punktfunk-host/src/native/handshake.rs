@@ -24,6 +24,26 @@ use super::*;
 /// paints on a Mutter virtual stream), and only a can't-blend backend falls back to the
 /// compositor EMBED. THE single predicate: the Welcome's `HOST_CAP_CURSOR` bit is computed
 /// from it, and the session wiring reads that bit back.
+/// Whether this session sends the REDUNDANT desktop-audio plane (`0xD2`) — THE single predicate
+/// behind the Welcome's `HOST_CAP_AUDIO_RED` bit, which `serve_session` reads back to configure the
+/// audio thread.
+///
+/// Capable-and-agreed: the client must have advertised `CLIENT_CAP_AUDIO_RED`, so a session with an
+/// older client keeps the plain `0xC9` wire byte-for-byte. `audio.redundancy` (
+/// `PUNKTFUNK_AUDIO_REDUNDANCY`) can force it off on a link where the extra ~1 % is unwelcome, or
+/// force it on for testing.
+///
+/// NB the plan's "only while the link is actually losing packets" gate is deliberately not here:
+/// turning redundancy on and off mid-session changes the wire tag, and the client's decoder would
+/// have to re-derive which plane it is on from every datagram. The cost being avoided is ~1 % of a
+/// video budget, which is not worth that fragility — so the decision is made once, at handshake.
+pub(super) fn audio_redundancy(client_caps: u8) -> bool {
+    if client_caps & punktfunk_core::quic::CLIENT_CAP_AUDIO_RED == 0 {
+        return false;
+    }
+    pf_host_config::config().audio_redundancy.unwrap_or(true)
+}
+
 pub(super) fn cursor_forward(
     client_caps: u8,
     compositor: Option<crate::vdisplay::Compositor>,
@@ -562,6 +582,14 @@ pub(super) async fn negotiate(
             // refuses toward us if we don't set it).
             | if crate::inject::pen_supported() {
                 punktfunk_core::quic::HOST_CAP_PEN
+            } else {
+                0
+            }
+            // Redundant desktop-audio plane (0xD2): the client asked, and the operator has not
+            // forced it off. Capable-and-agreed, like the cursor bit — a client that did not ask
+            // keeps the plain 0xC9 wire byte-for-byte.
+            | if audio_redundancy(hello.client_caps) {
+                punktfunk_core::quic::HOST_CAP_AUDIO_RED
             } else {
                 0
             },

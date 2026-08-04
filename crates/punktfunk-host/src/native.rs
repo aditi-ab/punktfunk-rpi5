@@ -1307,9 +1307,12 @@ async fn serve_session(
         let stop = stop.clone();
         let cap = audio_cap.clone();
         let channels = welcome.audio_channels;
+        // Read the granted bit back off the Welcome (the cursor plane's precedent), so the wire
+        // the client was promised and the wire we actually send cannot disagree.
+        let redundancy = welcome.host_caps & punktfunk_core::quic::HOST_CAP_AUDIO_RED != 0;
         std::thread::Builder::new()
             .name("punktfunk1-audio".into())
-            .spawn(move || audio_thread(conn, stop, cap, channels))
+            .spawn(move || audio_thread(conn, stop, cap, channels, redundancy))
             .map_err(|e| tracing::warn!(error = %e, "audio thread spawn failed — session continues without audio"))
             .ok()
     } else {
