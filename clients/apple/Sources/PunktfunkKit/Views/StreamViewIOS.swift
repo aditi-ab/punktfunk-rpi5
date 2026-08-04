@@ -186,6 +186,16 @@ public final class StreamViewController: StreamViewControllerBase {
     // pointer back to iPadOS, so an unwanted drop is re-requested below. The DELIBERATE releases
     // (⌘⎋, ⌃⌥⇧Q, the Stream menu, backgrounding) all clear `captured` first, so `wantsPointerLock`
     // is already false when their drop is observed and none of them are fought here.
+    //
+    // Recovery is TWO-STAGE, because either stage alone leaves a hole:
+    //   1. the burst below, fired the instant the drop is observed — wins back a lock the system
+    //      is willing to return immediately (a transient drop that wasn't Escape at all);
+    //   2. a CLICK into the video while still captured (`onPointerButton`) — the fallback for the
+    //      Escape case proper, where the platform declines during the moment right after its own
+    //      release gesture and the burst therefore expires having achieved nothing.
+    // Stage 2 is what keeps a lost burst from being permanent: `captured` is still true, so no
+    // other path would ever ask again, and the capture would spend the rest of its life on the
+    // absolute pointer — clicking correctly, aiming not at all.
     /// Whether this capture ever actually held the lock. Only a lock we HELD is worth winning back
     /// — never having been granted one means the scene doesn't qualify, not that Esc took it.
     /// Cleared when capture ends, so each capture starts from a clean slate.
@@ -446,6 +456,31 @@ public final class StreamViewController: StreamViewControllerBase {
             }
             guard self.inputCapture?.gcMouseForwarding == false else { return }
             self.inputCapture?.sendMouseButton(button, pressed: down)
+            // …and if we're captured but NOT locked, this click is also the recovery gesture for an
+            // Escape-drop the burst lost. iPadOS refuses to re-lock in the moment right after its
+            // own "let me out" gesture, so the burst fired at the drop can spend its whole budget
+            // and give up while the capture is still wanted. Nothing else would ever re-ask —
+            // setCaptured is the only other requester and a bare Esc never clears `captured` — so
+            // without this the session stays on the absolute path for the rest of the capture:
+            // clicks still land where you aim (absolute positions keep forwarding) but the game
+            // gets no relative deltas, so camera look is dead. A click is a real user gesture,
+            // which is exactly what the platform wants before it will hand the lock back.
+            //
+            // On the button UP, so the click has fully forwarded on ONE transport first: asking on
+            // the DOWN can flip `gcMouseForwarding` mid-click and strand the release on the GCMouse
+            // path. Gated on `pointerLockWasEngaged` exactly as the drop path is, so a scene that
+            // never qualifies (Stage Manager, Split View) is never bursted at, and on a burst not
+            // already being in flight — a pending burst mutes absolute motion, so re-arming one on
+            // every click of a menu the user is still aiming around would freeze the cursor between
+            // clicks. Only once it has settled does a further click buy a fresh budget (clearing the
+            // attempt counter, so a gesture isn't refused inside the 2 s window the drop's own burst
+            // may have just spent).
+            if !down, self.wantsPointerLock, self.pointerLockWasEngaged,
+                !self.pointerRelockPending, self.pointerLockEngaged() != true {
+                self.pointerRelockAttempt = 0
+                self.updatePointerLockChain() // a reparent since the drop would break the walk to us
+                self.requestPointerRelock()
+            }
         }
         // Scroll is the ONE indirect channel that is NOT gated on the lock. The scroll pan keeps
         // firing while the scene is pointer-locked (it is the only way trackpad two-finger scrolling
