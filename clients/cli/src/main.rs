@@ -41,6 +41,11 @@ mod cli {
 
     const PROBE_TIMEOUT: Duration = Duration::from_millis(2500);
 
+    /// The handshake budget `--request-access` runs on. Matches the host's `PENDING_APPROVAL_WAIT`
+    /// — the connect is PARKED for that long while an operator decides, so anything shorter would
+    /// give up while the approval prompt is still on their screen.
+    const REQUEST_ACCESS_TIMEOUT_SECS: u64 = 185;
+
     const USAGE: &str = "\
 punktfunk — the Punktfunk client, headless
 
@@ -51,7 +56,8 @@ punktfunk — the Punktfunk client, headless
   punktfunk hosts forget <host-ref>
   punktfunk wake <host-ref> [--wait]
   punktfunk library <host-ref> [--json]
-  punktfunk launch <host-ref> [--game ID] [--profile REF] [--exec] [--fullscreen]
+  punktfunk launch <host-ref> [--game ID] [--profile REF] [--request-access]
+                              [--exec] [--fullscreen]
   punktfunk open <punktfunk://…>
   punktfunk reachable <host-ref>
   punktfunk speed-test <host-ref>
@@ -138,7 +144,8 @@ this. Needs a paired host (exit 6 otherwise)."
             }
             "launch" => {
                 "\
-punktfunk launch <host-ref> [--game ID] [--profile REF] [--exec] [--fullscreen]
+punktfunk launch <host-ref> [--game ID] [--profile REF] [--request-access]
+                            [--exec] [--fullscreen]
 
 Start a stream — waking the host first if it is asleep and its MAC is known.
 The stream runs in the punktfunk-session renderer; this command supervises it
@@ -151,6 +158,16 @@ and relays its lifecycle to stderr.
   --exec         become the session process instead of supervising it — the
                  gamescope-wrapper mode, where the launched process must BE
                  the streaming one for focus and lifecycle to work
+  --request-access
+                 ask the host's operator to let this device in instead of
+                 typing a PIN. The host PARKS the connect until somebody
+                 approves it in its console or web UI (up to ~185 s), then
+                 admits it and the stream starts by itself; the host is
+                 recorded as paired once that happens, so later streams are
+                 silent. Needs the host's fingerprint pinned already
+                 (`punktfunk hosts add <addr> --fp <hex>`), and cannot be
+                 combined with --exec — under --exec there is no process
+                 left to record the approval.
 
 Exit 0 when the stream ends cleanly, 2 connect failed, 3 the host no longer
 trusts this device (re-pair), 4 the renderer could not start."
@@ -776,6 +793,19 @@ from the config directory for a true factory reset."
             eprintln!("usage: punktfunk launch <host-ref> [--game ID] [--profile REF] [--exec]");
             return UNRESOLVED;
         };
+        let exec = has(args, "--exec");
+        let request_access = has(args, "--request-access");
+        // Refused rather than silently downgraded: under `--exec` this process BECOMES the
+        // session, so nothing survives to see `Ready` and record the approval. A launch that
+        // quietly dropped the persistence would leave hosts reading "trusted" forever with
+        // nobody able to say why.
+        if request_access && exec {
+            eprintln!(
+                "--request-access can't be combined with --exec: under --exec there is no \
+                 process left to record the host's approval"
+            );
+            return UNRESOLVED;
+        }
         let (known, i) = match resolve(&reference) {
             Ok(v) => v,
             Err(code) => return code,
@@ -788,7 +818,10 @@ from the config directory for a true factory reset."
         if has(args, "--fullscreen") {
             plan.settings.fullscreen_on_stream = true;
         }
-        run_plan(plan, has(args, "--exec"))
+        if request_access {
+            plan.connect_timeout_secs = Some(REQUEST_ACCESS_TIMEOUT_SECS);
+        }
+        run_plan(plan, exec, request_access)
     }
 
     /// `open <url>` — the `punktfunk://` grammar, headless. Same parser, same refusal rules and
@@ -813,7 +846,7 @@ from the config directory for a true factory reset."
             &trust::Settings::load(),
         );
         match outcome {
-            Ok(PlanOutcome::Connect(plan)) => run_plan(*plan, has(args, "--exec")),
+            Ok(PlanOutcome::Connect(plan)) => run_plan(*plan, has(args, "--exec"), false),
             // A URL may never pair or trust on its own — that is a decision for a person, at a
             // surface that can show them the fingerprint.
             Ok(PlanOutcome::ConfirmUnknown(u)) => {
@@ -837,7 +870,13 @@ from the config directory for a true factory reset."
     }
 
     /// Wake if needed, then run the session — supervising it, or becoming it under `--exec`.
-    fn run_plan(plan: ConnectPlan, exec: bool) -> u8 {
+    ///
+    /// `persist_paired` records the host as *paired* when the child reports ready. Only
+    /// `launch --request-access` passes true: there, the host parked the connect until an
+    /// operator approved this device, so `Ready` IS the approval arriving — the same thing
+    /// `SpawnOpts::persist_paired` means in the GTK shell. Every other launch records nothing,
+    /// which is correct: a plain connect proves reachability, not a new trust decision.
+    fn run_plan(plan: ConnectPlan, exec: bool, persist_paired: bool) -> u8 {
         if plan.host.fp_hex.is_none() {
             eprintln!(
                 "{} has no pinned fingerprint — punktfunk pair {}",
@@ -899,7 +938,24 @@ from the config directory for a true factory reset."
         let mut failure: Option<(String, bool)> = None;
         while let Ok(ev) = rx.recv() {
             match ev {
-                SessionEvent::Ready => eprintln!("streaming"),
+                SessionEvent::Ready => {
+                    eprintln!("streaming");
+                    // The pin we connected WITH, not one re-derived from the store: the record
+                    // is what we are about to rewrite, and the session proved the host holds
+                    // exactly this identity by completing a pinned handshake against it.
+                    if persist_paired {
+                        if let Some(fp_hex) = &plan.host.fp_hex {
+                            trust::persist_host(
+                                &plan.host.name,
+                                &plan.host.addr,
+                                plan.host.port,
+                                fp_hex,
+                                true,
+                            );
+                            trust::forget_placeholder(&plan.host.addr, plan.host.port);
+                        }
+                    }
+                }
                 SessionEvent::Error {
                     msg,
                     trust_rejected,
