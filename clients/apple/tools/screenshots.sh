@@ -11,8 +11,14 @@
 # The captured pixels are exactly App Store Connect's required sizes:
 #   mac        2880×1800   (a 1× display yields 1440×900 — also accepted)
 #   iphone-6.9 1320×2868   (portrait)  /  2868×1320 (the landscape hero)
-#   ipad-13    2064×2752   (portrait)  /  2752×2064 (the landscape hero)
+#   ipad-13    2064×2752   (portrait)
 #   appletv    1920×1080
+#
+# A `.landscape` scene rotates on iPhone but NOT on iPad: an iPad app that supports multitasking
+# is resizable, and iPadOS ignores `requestGeometryUpdate` orientation requests for it — the app
+# follows the device, and simctl cannot rotate a simulated device. The iPad set is therefore
+# portrait throughout (a valid App Store size, and uniform, which the gallery prefers). To get a
+# landscape iPad hero, rotate the Simulator by hand (⌘←) and re-run just that scene.
 #
 # Requirements:
 #   • macOS target: just the Swift toolchain (`swift build`) + a one-time Screen Recording grant

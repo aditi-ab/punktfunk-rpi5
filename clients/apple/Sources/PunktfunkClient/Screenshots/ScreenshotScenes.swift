@@ -87,6 +87,8 @@ enum ShotMock {
     static let livingRoomID = UUID(uuidString: "5B0D1E00-0000-4000-8000-000000000002")!
     static let workshopID = UUID(uuidString: "5B0D1E00-0000-4000-8000-000000000003")!
     static let officeID = UUID(uuidString: "5B0D1E00-0000-4000-8000-000000000004")!
+    static let editingID = UUID(uuidString: "5B0D1E00-0000-4000-8000-000000000005")!
+    static let bedroomID = UUID(uuidString: "5B0D1E00-0000-4000-8000-000000000006")!
 
     static let hdrProfileID = "a71c4e0d9f22"
     static let couchProfileID = "3e88b107c4da"
@@ -133,6 +135,14 @@ enum ShotMock {
                 id: workshopID, name: "Workshop", address: "10.0.0.7", port: 9777,
                 pinnedSHA256: hostFingerprint(2), macAddresses: ["de:ad:be:ef:00:07"],
                 osChain: "linux/arch"),
+            StoredHost(
+                id: editingID, name: "Editing Rig", address: "192.168.1.62", port: 9777,
+                pinnedSHA256: hostFingerprint(5), lastConnected: Date().addingTimeInterval(-604_800),
+                osChain: "linux/nobara"),
+            StoredHost(
+                id: bedroomID, name: "Bedroom Mini", address: "192.168.1.77", port: 9777,
+                pinnedSHA256: hostFingerprint(6), macAddresses: ["00:1a:2b:3c:4d:5e"],
+                osChain: "windows/11"),
         ]
         return store
     }
@@ -335,9 +345,9 @@ private struct ShotSettings: View {
         #elseif os(iOS)
         // SettingsView owns its NavigationSplitView (sidebar + detail) and Done button, so it is
         // rendered directly — a wrapping NavigationStack would nest a split view in a stack. Open
-        // on General so the shot lands on real controls (iPad: sidebar + General detail; iPhone:
-        // the General page) instead of the bare category list.
-        SettingsView(initialCategory: .general)
+        // on Display rather than the bare category list: resolution, frame rate, bitrate, HDR and
+        // codec are what someone reads a streaming app's settings shot to find out.
+        SettingsView(initialCategory: .display)
         #else
         NavigationStack { SettingsView() }
         #endif

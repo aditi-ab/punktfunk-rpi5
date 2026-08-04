@@ -190,7 +190,12 @@ final class ShotOrientationController: UIViewController {
         let scene = view.window?.windowScene
             ?? UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first
         guard let scene else { return }
-        scene.requestGeometryUpdate(.iOS(interfaceOrientations: mask))
+        // Report a refusal instead of silently shipping the wrong orientation — that is exactly
+        // how every landscape scene went out as a portrait PNG for as long as it did.
+        scene.requestGeometryUpdate(.iOS(interfaceOrientations: mask)) { error in
+            print("PF_SHOT_ORIENTATION_REFUSED \(error.localizedDescription)")
+            fflush(stdout)
+        }
         setNeedsUpdateOfSupportedInterfaceOrientations()
     }
 }
