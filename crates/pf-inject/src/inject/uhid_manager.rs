@@ -159,6 +159,22 @@ impl OverflowWarn {
 /// real firmware decays, and that re-assert is what keeps a legitimately-held long rumble alive
 /// here. The XUSB path shares this window via [`rumble_idle_timeout`] (every XUSB write IS a
 /// rumble write, so its any-activity keying is already rumble-keyed by construction).
+///
+/// KNOWN COST, deliberately accepted. That invariant only covers writers that re-assert. A game
+/// driving the pad through the kernel's *evdev* FF interface does not: `ff-memless` sends one
+/// output report when an effect starts and one when it stops, with nothing in between, so a finite
+/// effect longer than this window is cut in half here. The uinput path
+/// (`linux/gamepad.rs`) exempts exactly that case — but it can, because evdev FF hands it an
+/// explicit `replay.length`. Nothing equivalent reaches this layer: [`PadFeedback`] carries motor
+/// levels, and the protocols it speaks (DualSense / DS4 / Deck / Switch Pro) are all
+/// level-triggered with no duration field anywhere in a report. So the choice is between cutting a
+/// long finite effect and letting an abandoned residual drone forever, and the residual is the one
+/// with field evidence behind it (a stuck level resent every 500 ms for 5.5 minutes). Switch Pro is
+/// not affected either way — `hid-nintendo` re-sends rumble continuously, and a physical Pro's
+/// HD-rumble decays faster than this window regardless.
+///
+/// Do not "fix" this by widening or disabling the window without evidence about which failure real
+/// titles actually hit; the hatch below exists for exactly that experiment.
 const RUMBLE_IDLE_TIMEOUT: Duration = Duration::from_millis(2500);
 
 /// The abandoned-rumble force-off window, env-hatched: `PUNKTFUNK_RUMBLE_IDLE_MS` overrides

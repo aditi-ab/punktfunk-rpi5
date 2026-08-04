@@ -254,13 +254,45 @@ fn ioctl_ptr<T>(fd: i32, req: libc::c_ulong, arg: *mut T, what: &str) -> Result<
     Ok(())
 }
 
+/// The window a played effect occupies: `replay.delay` of silence, then `replay.length` of rumble.
+#[derive(Clone, Copy)]
+struct Playback {
+    /// When the effect starts contributing — `play + replay.delay`. Until then it is armed but
+    /// silent, which is the whole point of the delay.
+    starts: Instant,
+    /// When it stops, or `None` for replay length 0 (until explicitly stopped).
+    ends: Option<Instant>,
+}
+
 /// One FF effect a game uploaded: rumble magnitudes + playback state.
 struct Effect {
     strong: u16,
     weak: u16,
-    /// `Some(deadline)` while playing (replay length 0 = until stopped).
-    playing: Option<Option<Instant>>,
+    /// `Some(window)` while playing.
+    playing: Option<Playback>,
     replay_ms: u16,
+    /// `replay.delay` — how long after the play command the effect stays silent. Decoded from the
+    /// upload since forever and, until now, never acted on: the effect started immediately and
+    /// ended `replay.length` later, so anything scheduling a delayed effect (DirectInput under
+    /// Wine does this routinely) fired early AND finished early by the same amount.
+    delay_ms: u16,
+}
+
+impl Effect {
+    /// The window a play command at `at` opens: silent for `replay.delay`, then `replay.length` of
+    /// rumble (or until stopped, when the length is 0).
+    ///
+    /// `replay.length` is measured from the END of the delay, not from the play command, so the
+    /// delay shifts the whole window instead of eating into it. Split out from the `EV_FF` handler
+    /// purely so this is testable — the handler itself needs a live uinput fd.
+    fn window(&self, at: Instant) -> Playback {
+        let starts = at + Duration::from_millis(self.delay_ms as u64);
+        Playback {
+            starts,
+            ends: (self.replay_ms > 0)
+                .then(|| starts + Duration::from_millis(self.replay_ms as u64)),
+        }
+    }
 }
 
 /// The force-feedback half of a virtual pad — the game-side effect table plus the mixdown policy
@@ -299,17 +331,29 @@ impl FfState {
     /// Mix: sum playing effects (expiring finished ones, force-stopping abandoned infinite ones),
     /// scale by gain. Returns the new `(low, high)` only when it changed since the last call.
     fn mix(&mut self, now: Instant, idle: Option<Duration>) -> Option<(u16, u16)> {
-        let stale = idle.is_some_and(|t| now.duration_since(self.last_activity) >= t);
+        let quiet_since = |t: Instant| idle.is_some_and(|d| now.duration_since(t) >= d);
+        let plane_stale = quiet_since(self.last_activity);
         let (mut strong, mut weak) = (0u32, 0u32);
         for e in self.effects.values_mut() {
-            let Some(deadline) = e.playing else { continue };
-            match deadline {
+            let Some(p) = e.playing else { continue };
+            // Still inside `replay.delay`: armed, silent, and NOT a candidate for expiry or the
+            // abandoned-effect force-off — it has not had its turn yet.
+            if now < p.starts {
+                continue;
+            }
+            match p.ends {
                 Some(d) if now >= d => e.playing = None,
                 // An infinite-replay effect the game stopped driving (no FF traffic for the whole
                 // idle window) — the alive-but-abandoned case the kernel's close-time auto-erase
                 // cannot see. Stop it once; a later EV_FF play re-arms it (and refreshes the
                 // clock). Mirrors the XUSB/UHID abandoned-rumble force-off.
-                None if stale => {
+                //
+                // "Abandoned" needs the effect to have been AUDIBLE for the window too, not just
+                // the plane quiet: the play command is itself the last activity, so an effect with
+                // a `replay.delay` longer than the window would otherwise be force-stopped the
+                // instant it finally started — silent the whole time it waited, then killed on its
+                // first contributing tick.
+                None if plane_stale && quiet_since(p.starts) => {
                     tracing::info!(
                         strong = e.strong,
                         weak = e.weak,
@@ -544,10 +588,12 @@ impl VirtualPad {
                                 weak: 0,
                                 playing: None,
                                 replay_ms: 0,
+                                delay_ms: 0,
                             });
                             slot.strong = strong;
                             slot.weak = weak;
                             slot.replay_ms = e.replay_length;
+                            slot.delay_ms = e.replay_delay;
                         }
                         up.effect.id = e.id; // hand the assigned slot back to the kernel
                         up.retval = 0;
@@ -574,14 +620,7 @@ impl VirtualPad {
                 (EV_FF, code) => {
                     self.ff.note_activity();
                     if let Some(e) = self.ff.effects.get_mut(&(code as i16)) {
-                        e.playing = if ev.value != 0 {
-                            Some((e.replay_ms > 0).then(|| {
-                                Instant::now()
-                                    + std::time::Duration::from_millis(e.replay_ms as u64)
-                            }))
-                        } else {
-                            None
-                        };
+                        e.playing = (ev.value != 0).then(|| e.window(Instant::now()));
                     }
                 }
                 _ => {}
@@ -802,15 +841,34 @@ mod ff_state_tests {
         ff
     }
 
+    /// Playing from `at`, no delay, until explicitly stopped.
+    fn playing(at: Instant) -> Option<Playback> {
+        Some(Playback {
+            starts: at,
+            ends: None,
+        })
+    }
+
+    /// Playing from `at`, no delay, for `len`.
+    fn playing_for(at: Instant, len: Duration) -> Option<Playback> {
+        Some(Playback {
+            starts: at,
+            ends: Some(at + len),
+        })
+    }
+
     #[test]
     fn abandoned_infinite_effect_is_forced_off_after_idle_window() {
+        let now = Instant::now();
         let mut ff = ff_with(Effect {
             strong: 0x8000,
             weak: 0,
-            playing: Some(None),
+            // Playing since before the window: "abandoned" means audible AND unattended, so an
+            // effect that only just started is not a candidate however stale the plane is.
+            playing: playing(now - Duration::from_millis(2600)),
             replay_ms: 0,
+            delay_ms: 0,
         });
-        let now = Instant::now();
         assert_eq!(ff.mix(now, IDLE), Some((scaled(0x8000), 0)));
         assert_eq!(ff.mix(now, IDLE), None); // unchanged level dedups, still playing
                                              // The game goes silent on the FF plane past the idle window: cut, exactly once.
@@ -825,8 +883,9 @@ mod ff_state_tests {
         let mut ff = ff_with(Effect {
             strong: 0x4000,
             weak: 0,
-            playing: Some(Some(now + Duration::from_secs(10))),
+            playing: playing_for(now, Duration::from_secs(10)),
             replay_ms: 10_000,
+            delay_ms: 0,
         });
         // FF plane long stale, but the effect declared a finite replay — the declared duration is
         // the contract (a real pad honors it too), so it keeps playing…
@@ -842,16 +901,124 @@ mod ff_state_tests {
         let mut ff = ff_with(Effect {
             strong: 0x8000,
             weak: 0,
-            playing: Some(None),
+            playing: playing(now - Duration::from_millis(3000)),
             replay_ms: 0,
+            delay_ms: 0,
         });
         assert_eq!(ff.mix(now, IDLE), Some((scaled(0x8000), 0)));
         ff.last_activity = now - Duration::from_millis(3000);
         assert_eq!(ff.mix(now, IDLE), Some((0, 0)));
         // The game plays the effect again — an FF event refreshes the clock and re-arms playback.
         ff.last_activity = now;
-        ff.effects.get_mut(&0).unwrap().playing = Some(None);
+        ff.effects.get_mut(&0).unwrap().playing = playing(now);
         assert_eq!(ff.mix(now, IDLE), Some((scaled(0x8000), 0)));
+    }
+
+    /// `replay.delay` shifts the whole window: silent until it elapses, then the FULL
+    /// `replay.length`. Before this the delay was decoded and dropped, so a delayed effect both
+    /// started early and finished early — DirectInput under Wine schedules these routinely.
+    #[test]
+    fn replay_delay_holds_the_effect_off_then_gives_it_its_full_length() {
+        let now = Instant::now();
+        let starts = now + Duration::from_millis(500);
+        let mut ff = ff_with(Effect {
+            strong: 0x8000,
+            weak: 0,
+            playing: Some(Playback {
+                starts,
+                ends: Some(starts + Duration::from_secs(1)),
+            }),
+            replay_ms: 1000,
+            delay_ms: 500,
+        });
+        // Inside the delay: armed but silent.
+        assert_eq!(ff.mix(now, IDLE), None);
+        assert_eq!(ff.mix(now + Duration::from_millis(499), IDLE), None);
+        // Delay elapsed: it plays.
+        assert_eq!(
+            ff.mix(now + Duration::from_millis(501), IDLE),
+            Some((scaled(0x8000), 0))
+        );
+        // Still playing at 1400 ms — it gets its full second FROM the delay, not from the play.
+        assert_eq!(ff.mix(now + Duration::from_millis(1400), IDLE), None);
+        // And ends at delay + length, not at length.
+        assert_eq!(
+            ff.mix(now + Duration::from_millis(1600), IDLE),
+            Some((0, 0))
+        );
+    }
+
+    /// The window a play opens, straight from the uploaded fields — this is the half that reads
+    /// `replay.delay` at all. Pinned separately because the `EV_FF` handler that calls it needs a
+    /// live uinput fd, so a test driving `mix` alone would pass with the delay ignored entirely.
+    #[test]
+    fn window_offsets_the_whole_playback_by_replay_delay() {
+        let at = Instant::now();
+
+        let delayed = Effect {
+            strong: 0,
+            weak: 0,
+            playing: None,
+            replay_ms: 1000,
+            delay_ms: 500,
+        };
+        let w = delayed.window(at);
+        assert_eq!(
+            w.starts,
+            at + Duration::from_millis(500),
+            "delay defers the start"
+        );
+        assert_eq!(
+            w.ends,
+            Some(at + Duration::from_millis(1500)),
+            "length runs from the END of the delay, so the effect keeps its full second"
+        );
+
+        // No delay: starts immediately, unchanged from before.
+        let plain = Effect {
+            strong: 0,
+            weak: 0,
+            playing: None,
+            replay_ms: 1000,
+            delay_ms: 0,
+        };
+        let w = plain.window(at);
+        assert_eq!(w.starts, at);
+        assert_eq!(w.ends, Some(at + Duration::from_millis(1000)));
+
+        // Length 0 = until stopped, but the delay still applies.
+        let infinite = Effect {
+            strong: 0,
+            weak: 0,
+            playing: None,
+            replay_ms: 0,
+            delay_ms: 250,
+        };
+        let w = infinite.window(at);
+        assert_eq!(w.starts, at + Duration::from_millis(250));
+        assert_eq!(w.ends, None);
+    }
+
+    /// A delayed effect must not be force-stopped as "abandoned" while it is still waiting: it has
+    /// not had its turn, and the idle window is shorter than a delay can legitimately be.
+    #[test]
+    fn a_waiting_effect_is_not_cut_by_the_idle_watchdog() {
+        let now = Instant::now();
+        let starts = now + Duration::from_secs(5);
+        let mut ff = ff_with(Effect {
+            strong: 0x8000,
+            weak: 0,
+            playing: Some(Playback { starts, ends: None }),
+            replay_ms: 0,
+            delay_ms: 5000,
+        });
+        ff.last_activity = now - Duration::from_secs(60); // long stale
+        assert_eq!(ff.mix(now, IDLE), None); // silent, but NOT cut
+                                             // It still plays when its delay elapses.
+        assert_eq!(
+            ff.mix(now + Duration::from_millis(5001), IDLE),
+            Some((scaled(0x8000), 0))
+        );
     }
 
     #[test]
@@ -860,8 +1027,9 @@ mod ff_state_tests {
         let mut ff = ff_with(Effect {
             strong: 0x8000,
             weak: 0,
-            playing: Some(None),
+            playing: playing(now),
             replay_ms: 0,
+            delay_ms: 0,
         });
         ff.last_activity = now - Duration::from_secs(600);
         assert_eq!(ff.mix(now, None), Some((scaled(0x8000), 0)));
