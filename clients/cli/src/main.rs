@@ -44,6 +44,7 @@ mod cli {
     const USAGE: &str = "\
 punktfunk — the Punktfunk client, headless
 
+  punktfunk discover [--json] [--timeout SECS]
   punktfunk pair <host[:port]> [--pin N] [--name LABEL]
   punktfunk hosts list [--probe] [--json]
   punktfunk hosts add <host[:port]> [--name LABEL] [--fp HEX]
@@ -68,6 +69,24 @@ punktfunk:// link takes. Exit codes: 0 ok, 2 connect, 3 trust, 4 renderer, 5 not
     /// (what goes to stdout vs stderr, and which exit codes mean what).
     fn verb_help(verb: &str) -> Option<&'static str> {
         Some(match verb {
+            "discover" => {
+                "\
+punktfunk discover [--json] [--timeout SECS] — browse the LAN for hosts
+
+Listens for Punktfunk hosts advertising over mDNS and prints what answered:
+name TAB addr:port TAB saved|new TAB paired|unpaired. `saved` means this
+device already has a record for it, matched by fingerprint first and address
+second — the same rule every other surface joins the two lists by.
+
+  --timeout SECS  how long to browse (default 3, capped at 30) — a bounded
+                  call, so a panel can wait for it
+  --json          {\"hosts\":[{\"name\",\"addr\",\"port\",\"fp\",\"pair\",\"id\",\"mgmt\",
+                  \"os\",\"saved\",\"paired\"}]}
+
+Nothing answering is an answer, not a failure: an empty list exits 0. A host
+mDNS never sees (Tailscale, another subnet) will not appear here — save it by
+address with `punktfunk hosts add` and it shows in `hosts list --probe`."
+            }
             "pair" => {
                 "\
 punktfunk pair <host[:port]> — enrol this device with a host (PIN ceremony)
@@ -222,7 +241,7 @@ from the config directory for a true factory reset."
     fn flag_takes_value(flag: &str) -> bool {
         matches!(
             flag,
-            "--pin" | "--name" | "--fp" | "--game" | "--profile" | "--port"
+            "--pin" | "--name" | "--fp" | "--game" | "--profile" | "--port" | "--timeout"
         )
     }
 
@@ -269,6 +288,7 @@ from the config directory for a true factory reset."
             return OK;
         }
         match verb.as_str() {
+            "discover" => discover(&rest),
             "pair" => pair(&rest),
             "hosts" => hosts(&rest),
             "wake" => wake(&rest),
@@ -304,6 +324,100 @@ from the config directory for a true factory reset."
                 UNRESOLVED
             }
         }
+    }
+
+    /// How long `discover` browses when nobody says, and the ceiling on what they can ask for.
+    /// The cap is not politeness: this verb is called from a Quick Access panel, and a typo'd
+    /// `--timeout 3000` would hang that panel with no way to cancel it.
+    const DISCOVER_DEFAULT_SECS: f64 = 3.0;
+    const DISCOVER_MAX_SECS: f64 = 30.0;
+
+    /// `discover [--json] [--timeout SECS]` — browse the LAN over mDNS and print what answered,
+    /// annotated against the saved-hosts store.
+    ///
+    /// The annotation is the point: a caller wants "can I stream this", which is a question
+    /// about BOTH lists, and joining them itself is how two surfaces end up disagreeing about
+    /// the same host. So the match rule lives here, once, and is the same one every other
+    /// surface uses — fingerprint first (survives a DHCP move), address second.
+    fn discover(args: &[String]) -> u8 {
+        let secs = value(args, "--timeout")
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|s| *s > 0.0)
+            .unwrap_or(DISCOVER_DEFAULT_SECS)
+            .min(DISCOVER_MAX_SECS);
+        let found = pf_client_core::discovery::discover_for(Duration::from_secs_f64(secs));
+        let known = KnownHosts::load();
+        let rows: Vec<(
+            &pf_client_core::discovery::DiscoveredHost,
+            Option<&KnownHost>,
+        )> = found.iter().map(|d| (d, match_saved(&known, d))).collect();
+        if has(args, "--json") {
+            let hosts: Vec<serde_json::Value> = rows
+                .iter()
+                .map(|(d, saved)| {
+                    serde_json::json!({
+                        "name": d.name,
+                        "addr": d.addr,
+                        "port": d.port,
+                        "fp": d.fp_hex,
+                        "pair": d.pair,
+                        "id": d.advertised_id(),
+                        // 0 = not advertised, which is what a consumer's own "no mgmt port"
+                        // already means — an older host simply omits the TXT.
+                        "mgmt": d.mgmt_port.unwrap_or(0),
+                        "os": d.os,
+                        "saved": saved.is_some(),
+                        "paired": saved.is_some_and(|h| h.paired),
+                    })
+                })
+                .collect();
+            println!("{}", serde_json::json!({ "hosts": hosts }));
+        } else {
+            for (d, saved) in &rows {
+                println!(
+                    "{}\t{}:{}\t{}\t{}",
+                    d.name,
+                    d.addr,
+                    d.port,
+                    if saved.is_some() { "saved" } else { "new" },
+                    if saved.is_some_and(|h| h.paired) {
+                        "paired"
+                    } else {
+                        "unpaired"
+                    },
+                );
+            }
+        }
+        // An empty LAN is an answer, not a failure — a caller branching on the exit code is
+        // asking "did the browse run", and it did.
+        OK
+    }
+
+    /// The saved record an advert belongs to, if any: fingerprint first, address second.
+    ///
+    /// Fingerprint FIRST is deliberate and load-bearing — a host that moved to a new DHCP lease
+    /// still matches its record, and a *different* host that inherited the old address does not
+    /// inherit its pairing. This is the rule the plugin's `mergeHosts` and the shells' hosts
+    /// pages already use; keeping one copy is what stops two surfaces disagreeing about whether
+    /// the box in front of you is paired.
+    fn match_saved<'a>(
+        known: &'a KnownHosts,
+        advert: &pf_client_core::discovery::DiscoveredHost,
+    ) -> Option<&'a KnownHost> {
+        known
+            .hosts
+            .iter()
+            .find(|h| {
+                !h.fp_hex.is_empty()
+                    && !advert.fp_hex.is_empty()
+                    && h.fp_hex.eq_ignore_ascii_case(&advert.fp_hex)
+            })
+            .or_else(|| {
+                known
+                    .hosts
+                    .iter()
+                    .find(|h| h.addr == advert.addr && h.port == advert.port)
+            })
     }
 
     /// `pair <host[:port]> [--pin N]` — the SPAKE2 ceremony. Without `--pin` it prompts, which
@@ -967,6 +1081,7 @@ from the config directory for a true factory reset."
         #[test]
         fn every_usage_verb_has_help() {
             for verb in [
+                "discover",
                 "pair",
                 "hosts",
                 "wake",
