@@ -538,16 +538,44 @@ from the config directory for a true factory reset."
                     return UNRESOLVED;
                 };
                 let (addr, port) = split_host_port(&target);
+                let fp = value(args, "--fp").unwrap_or_default();
+                let name = value(args, "--name");
                 let mut known = KnownHosts::load();
-                if known.hosts.iter().any(|h| h.addr == addr && h.port == port) {
-                    eprintln!("{addr}:{port} is already saved");
-                    return OK;
+                if let Some(i) = known
+                    .hosts
+                    .iter()
+                    .position(|h| h.addr == addr && h.port == port)
+                {
+                    return match merge_saved_host(&mut known, i, &fp, name.as_deref()) {
+                        AddOutcome::Unchanged => {
+                            eprintln!("{addr}:{port} is already saved");
+                            OK
+                        }
+                        AddOutcome::Conflict => {
+                            eprintln!(
+                                "{addr}:{port} is already saved with a different fingerprint — \
+                                 forget it first if you really mean to replace it \
+                                 (punktfunk hosts forget {addr}:{port})"
+                            );
+                            TRUST_REJECTED
+                        }
+                        AddOutcome::Pinned => match known.save() {
+                            Ok(()) => {
+                                println!("updated {addr}:{port}");
+                                OK
+                            }
+                            Err(e) => {
+                                eprintln!("saving: {e:#}");
+                                CONNECT_FAILED
+                            }
+                        },
+                    };
                 }
                 known.hosts.push(KnownHost {
-                    name: value(args, "--name").unwrap_or_else(|| addr.clone()),
+                    name: name.unwrap_or_else(|| addr.clone()),
                     addr: addr.clone(),
                     port,
-                    fp_hex: value(args, "--fp").unwrap_or_default(),
+                    fp_hex: fp,
                     ..Default::default()
                 });
                 match known.save() {
@@ -587,6 +615,55 @@ from the config directory for a true factory reset."
                 UNRESOLVED
             }
         }
+    }
+
+    /// What `hosts add` did to a record that was ALREADY saved for this address.
+    #[derive(Debug, PartialEq, Eq)]
+    enum AddOutcome {
+        /// Nothing to do — no fingerprint was offered, or the record already carries this one.
+        /// Exits 0 on purpose: a panel retrying step 1 of request access must not have to
+        /// invent an error to show for a state that is already correct.
+        Unchanged,
+        /// The record had no fingerprint and now has this one.
+        Pinned,
+        /// The record carries a DIFFERENT fingerprint. Refused, never overwritten.
+        Conflict,
+    }
+
+    /// `hosts add --fp` against an address that is already saved. The difference between these
+    /// three is a trust decision, not bookkeeping.
+    ///
+    /// Filling in an empty fingerprint is step 1 of request access (design §5): a host found by
+    /// advert is saved by address first and pinned second. Without it the `--fp` is dropped on
+    /// the floor and the launch that follows refuses for want of a pin — which is what this did
+    /// before, silently and with exit 0.
+    ///
+    /// A *different* fingerprint is refused because a changed identity is a decision for a
+    /// person, at a surface that can show them both. That is what `upsert_trusted` exists to
+    /// enforce; quietly overwriting it here would be a back door through the pinning the rest
+    /// of the client is built on.
+    fn merge_saved_host(
+        known: &mut KnownHosts,
+        i: usize,
+        fp: &str,
+        name: Option<&str>,
+    ) -> AddOutcome {
+        let existing = known.hosts[i].fp_hex.clone();
+        if fp.is_empty() || existing.eq_ignore_ascii_case(fp) {
+            return AddOutcome::Unchanged;
+        }
+        if !existing.is_empty() {
+            return AddOutcome::Conflict;
+        }
+        known.hosts[i].fp_hex = fp.to_string();
+        // Only a record still named after its own address is renamed: a label the user chose is
+        // theirs, and an advert's name must not quietly overwrite it.
+        if let Some(label) = name {
+            if known.hosts[i].name == known.hosts[i].addr {
+                known.hosts[i].name = label.to_string();
+            }
+        }
+        AddOutcome::Pinned
     }
 
     /// `wake <host-ref> [--wait]` — a magic packet, and with `--wait` the same bounded
@@ -1101,6 +1178,83 @@ from the config directory for a true factory reset."
                 assert!(USAGE.contains(verb), "USAGE must advertise {verb}");
             }
             assert!(verb_help("bogus").is_none());
+        }
+
+        fn saved(name: &str, addr: &str, fp: &str) -> KnownHost {
+            KnownHost {
+                name: name.into(),
+                addr: addr.into(),
+                port: 9777,
+                fp_hex: fp.into(),
+                ..Default::default()
+            }
+        }
+
+        /// Step 1 of request access: a host saved by address gains the fingerprint its advert
+        /// carried. Before this, `hosts add --fp` on an existing record exited 0 having done
+        /// NOTHING — the launch that followed then refused for want of a pin, and the panel had
+        /// no way to tell why.
+        #[test]
+        fn adding_a_fingerprint_to_a_placeholder_fills_it_in() {
+            let mut known = KnownHosts {
+                hosts: vec![saved("192.168.1.9", "192.168.1.9", "")],
+            };
+            assert_eq!(
+                merge_saved_host(&mut known, 0, "abc123", Some("living-room")),
+                AddOutcome::Pinned
+            );
+            assert_eq!(known.hosts[0].fp_hex, "abc123");
+            assert_eq!(
+                known.hosts[0].name, "living-room",
+                "a record still named after its address takes the offered label"
+            );
+        }
+
+        /// A label the user chose is theirs — an advert's name must not overwrite it.
+        #[test]
+        fn filling_in_a_fingerprint_keeps_a_user_chosen_name() {
+            let mut known = KnownHosts {
+                hosts: vec![saved("Basement rig", "192.168.1.9", "")],
+            };
+            merge_saved_host(&mut known, 0, "abc123", Some("living-room"));
+            assert_eq!(known.hosts[0].name, "Basement rig");
+        }
+
+        /// Idempotent: the panel may retry step 1, and re-offering the fingerprint a record
+        /// already carries is a state that is already correct, not an error to render.
+        #[test]
+        fn re_adding_the_same_fingerprint_changes_nothing() {
+            let mut known = KnownHosts {
+                hosts: vec![saved("desk", "192.168.1.9", "ABC123")],
+            };
+            assert_eq!(
+                merge_saved_host(&mut known, 0, "abc123", None),
+                AddOutcome::Unchanged,
+                "fingerprints compare case-insensitively"
+            );
+            // And a bare `hosts add` with no --fp at all leaves the pin alone.
+            assert_eq!(
+                merge_saved_host(&mut known, 0, "", None),
+                AddOutcome::Unchanged
+            );
+            assert_eq!(known.hosts[0].fp_hex, "ABC123");
+        }
+
+        /// A changed identity is a decision for a person. Never a silent overwrite — this is the
+        /// same rule `upsert_trusted` enforces, and a back door here would defeat it everywhere.
+        #[test]
+        fn a_different_fingerprint_is_refused_not_overwritten() {
+            let mut known = KnownHosts {
+                hosts: vec![saved("desk", "192.168.1.9", "abc123")],
+            };
+            assert_eq!(
+                merge_saved_host(&mut known, 0, "deadbeef", None),
+                AddOutcome::Conflict
+            );
+            assert_eq!(
+                known.hosts[0].fp_hex, "abc123",
+                "the pin must survive intact"
+            );
         }
 
         #[test]
