@@ -1045,13 +1045,18 @@ pub(crate) fn settings_page(
         let ss = set_screen.clone();
         button("Third-party licenses").on_click(move || ss.call(Screen::Licenses))
     };
-    // The client log's home (%LOCALAPPDATA%\punktfunk\logs) — the file every "check the
-    // client log" message means, which until this row had no way in from the UI at all.
-    // The folder rather than the file so the rotated `.old` generation is in reach too.
-    // Best-effort, like the log itself: a missing dir or a failed spawn stays silent.
+    // The client log's home — the file every "check the client log" message means, which until
+    // this row had no way in from the UI at all. The folder rather than the file so the rotated
+    // `.old` generation is in reach too.
+    //
+    // `real_dir` (not the literal %LOCALAPPDATA% path) because Explorer lives outside our MSIX
+    // container: handed a path the package redirection keeps from ever existing, it silently
+    // opens the user's Documents folder instead of failing, which is precisely what this button
+    // shipped doing. The `is_dir` guard keeps that fallback unreachable — if the resolve ever
+    // comes back wrong, the click does nothing rather than landing somewhere misleading.
+    // Best-effort otherwise, like the log itself: a failed spawn stays silent.
     let logs_button = button("Open log folder").on_click(|| {
-        if let Some(dir) = crate::logfile::log_dir() {
-            let _ = std::fs::create_dir_all(&dir);
+        if let Some(dir) = crate::logfile::real_dir().filter(|d| d.is_dir()) {
             let _ = std::process::Command::new("explorer.exe").arg(&dir).spawn();
         }
     });
