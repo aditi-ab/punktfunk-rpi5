@@ -339,8 +339,17 @@ PUNKTFUNK_AUDIO_QUALITY=high    # low | standard | high (default high — stereo
 PUNKTFUNK_AUDIO_REDUNDANCY=1    # force the loss-resilient audio plane on (default: automatic)
 ```
 
-Audio is a fraction of a percent of a stream's bandwidth, so `high` costs nothing worth counting.
-`standard` reproduces the pre-0.25 encoder exactly if you want to compare.
+Both are a **request**, not a guarantee: the host budgets audio against the session's video
+bitrate and steps it down on a narrow link, because audio is not managed by adaptive bitrate — so
+whatever it takes is taken off the top. On a roomy link you get 256 kbps plus loss redundancy; as
+the link narrows the host drops redundancy first, then the tier, and never goes below ~96 kbps. The
+session log line says what it settled on:
+
+```
+INFO  punktfunk/1 audio streaming … tier=high kbps=512 redundancy=true
+```
+
+`standard` reproduces the pre-0.25 encoder exactly if you want to A/B it.
 
 ## Audio lags behind the picture
 
