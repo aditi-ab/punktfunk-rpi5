@@ -62,6 +62,12 @@ use pairing::pair_ceremony;
 mod audio;
 use audio::audio_thread;
 
+/// Per-pad DualSense audio (the 0xD1 plane): loopback capture of the pre-provisioned pad
+/// endpoints → per-kind silence gate → stereo Opus → `PAD_AUDIO_MAGIC` datagrams. The input
+/// thread spawns/reaps one streamer per arriving pad (`input`); the Welcome advertises the cap
+/// via `pad_audio::host_cap` (`handshake`).
+mod pad_audio;
+
 /// The native input plane (plan §W1); the session setup spawns `input_thread` and feeds it a
 /// channel of `ClientInput`. The `Pads` router + rumble live there too.
 mod input;
@@ -345,6 +351,14 @@ pub(crate) async fn serve(
     // binds its capture device) and self-heals when the backend dies (PipeWire restart, Windows
     // endpoint churn).
     let mic_service = crate::audio::MicPump::start();
+    // Windows, env-gated (PUNKTFUNK_PAD_AUDIO / _SLOTS): pre-provision the per-pad "DualSense
+    // speaker" render endpoints once per host lifetime — idempotent devnode + stamp work on a
+    // dedicated COM thread, results published for sessions to query by pad index
+    // (crate::audio::pad_endpoint::endpoint_for). If any stamp is stored-but-not-served, the
+    // worker performs ONE AudioEndpointBuilder+Audiosrv restart now, before any session exists.
+    // Failures log once and leave the feature off: pads still work, just without pad audio.
+    #[cfg(target_os = "windows")]
+    crate::audio::pad_endpoint::provision_at_startup();
     // Host-lifetime worker that fires debounced TV-session restores (the managed gamescope path
     // restores the box's autologin gaming session on idle, not per-disconnect — see
     // `vdisplay::restore_managed_session`). Held for serve()'s lifetime; dropping it stops it.
@@ -1203,9 +1217,14 @@ async fn serve_session(
     let input_handle = {
         let conn = conn.clone();
         let gamepad = welcome.gamepad;
+        // Pad audio (0xD1) negotiated: the Welcome advertised the cap (Windows + provisioned
+        // endpoints + the client asked — handshake reads `pad_audio::host_cap`). Read back off
+        // the Welcome rather than recomputed, so the input thread's spawns cannot disagree
+        // with what the client was told.
+        let pad_audio_on = welcome.host_caps & punktfunk_core::quic::HOST_CAP_PAD_AUDIO != 0;
         std::thread::Builder::new()
             .name("punktfunk1-input".into())
-            .spawn(move || input_thread(input_rx, conn, inj_tx, gamepad))
+            .spawn(move || input_thread(input_rx, conn, inj_tx, gamepad, pad_audio_on))
             .context("spawn input thread")?
     };
     // One reader for ALL client→host datagrams, demuxed by magic byte (two read_datagram loops

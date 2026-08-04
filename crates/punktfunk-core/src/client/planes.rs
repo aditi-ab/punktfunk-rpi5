@@ -20,6 +20,12 @@ pub(crate) type RumbleUpdate = (u16, u16, u16, Option<u16>);
 /// Same overflow discipline as rumble; the host re-sends on the next feedback change.
 pub(crate) const HIDOUT_QUEUE: usize = 32;
 
+/// Pad-audio frames (`0xD1` — DualSense voice-coil haptics + speaker) buffered for the embedder,
+/// ALL pads and kinds on one queue (the embedder fans out by `pad`/`kind`): 64 × 5 ms = 320 ms of
+/// slack on a haptics-only stream, the [`AUDIO_QUEUE`] discipline. A lagging embedder drops the
+/// newest frame (the renderer conceals the gap).
+pub(crate) const PAD_AUDIO_QUEUE: usize = 64;
+
 /// Static HDR metadata (ST.2086 mastering + content light level) buffered for the embedder. Tiny
 /// and low-rate (one on start, re-sent on mastering changes / keyframes); a small ring is ample.
 pub(crate) const HDR_META_QUEUE: usize = 8;

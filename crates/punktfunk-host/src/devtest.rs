@@ -384,6 +384,7 @@ pub fn dualsense_windows_test(args: &[String]) -> Result<()> {
                 index: idx,
                 kind: 2,
                 capabilities: 0,
+                audio_caps: 0,
             });
             println!(
                 "virtual {} up — cycling Cross + sweeping the left stick for {secs}s. Watch \
@@ -430,6 +431,7 @@ pub fn dualsense_windows_test(args: &[String]) -> Result<()> {
             index: idx,
             kind: 1,
             capabilities: 0,
+            audio_caps: 0,
         });
         println!(
             "virtual Xbox 360 (XUSB) up — sweeping LS + toggling A for {secs}s. Check with \
@@ -484,6 +486,119 @@ pub fn dualsense_windows_test(args: &[String]) -> Result<()> {
     }
     println!("dualsense-windows-test: done (devnode removed)");
     Ok(())
+}
+
+/// Windows: pad-audio endpoint provisioning — `pad-endpoint ensure|remove|status [--index N]`.
+/// `ensure` runs the idempotent startup path (reuse-or-create the devnode, bind the Steam
+/// Streaming Speakers driver, stamp the DualSense identity + 4ch/48k formats, report whether
+/// the stamps are SERVED); `status` prints the devnode/endpoint and per-stamp stored vs served
+/// state without changing anything; `remove` deletes the devnode via pnputil — the escape
+/// hatch only, endpoints are persistent by design. Stamping needs SYSTEM (the MMDevices ACL);
+/// run `ensure` under the service account or PsExec when the property-store route is denied.
+#[cfg(target_os = "windows")]
+pub fn pad_endpoint(args: &[String]) -> Result<()> {
+    use crate::audio::pad_endpoint as pe;
+    let idx: u8 = args
+        .iter()
+        .skip_while(|a| *a != "--index")
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    // `--endpoint <id>` drives ANY render endpoint, not just a provisioned pad one. It is the
+    // discriminator between "this process cannot activate anything" and "our endpoint is broken":
+    // aim the same binary at a known-good endpoint and see whether it succeeds there.
+    let endpoint_override: Option<String> = args
+        .iter()
+        .skip_while(|a| *a != "--endpoint")
+        .nth(1)
+        .cloned();
+    match args.get(1).map(String::as_str) {
+        Some("ensure") => {
+            let p = pe::ensure(idx)?;
+            println!(
+                "pad-endpoint ensure: pad {} devnode {} endpoint {} needs_aeb_kick={}",
+                p.pad_index, p.device_instance, p.endpoint_id, p.needs_aeb_kick
+            );
+            Ok(())
+        }
+        Some("remove") => match pe::find(idx)? {
+            Some(p) => {
+                pe::remove(&p);
+                println!(
+                    "pad-endpoint remove: requested removal of {}",
+                    p.device_instance
+                );
+                Ok(())
+            }
+            None => {
+                println!("pad-endpoint remove: no pad-audio devnode for index {idx}");
+                Ok(())
+            }
+        },
+        // `punktfunk-host pad-endpoint <n> tone [seconds] [hz]` — drive the endpoint directly so
+        // the whole pad-audio chain can be exercised without a game. Without this, every attempt
+        // costs a game launch and a failure does not say which link broke.
+        Some("tone") => {
+            let secs: u32 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(5);
+            let hz: f32 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(60.0);
+            let endpoint_id = match endpoint_override {
+                Some(id) => id,
+                None => {
+                    // `find` (a system lookup), NOT `endpoint_for` (the service's in-process
+                    // cache): this runs as a separate CLI process and has no cache of its own.
+                    let Some(ep) = pe::find(idx)? else {
+                        println!(
+                            "pad-endpoint tone: no pad-audio devnode for pad {idx} — run \
+                             `ensure` first"
+                        );
+                        return Ok(());
+                    };
+                    if ep.endpoint_id.is_empty() {
+                        println!("pad-endpoint tone: pad {idx} has no endpoint id yet");
+                        return Ok(());
+                    }
+                    ep.endpoint_id
+                }
+            };
+            // `--pair front` drives the pad's SPEAKER instead of the voice coils — the only way to
+            // exercise the speaker kind without a game that renders one.
+            let pair = args
+                .iter()
+                .skip_while(|a| *a != "--pair")
+                .nth(1)
+                .map_or(pe::TonePair::Back, |s| pe::TonePair::parse(s));
+            println!(
+                "pad-endpoint tone: {hz} Hz into the {} of {endpoint_id} for {secs}s",
+                pair.label()
+            );
+            pe::render_test_tone(&endpoint_id, secs, hz, pair)?;
+            println!(
+                "pad-endpoint tone: done. A connected client with pad audio enabled should have \
+                 buzzed; the host log shows whether the gate opened."
+            );
+            Ok(())
+        }
+        // `punktfunk-host pad-endpoint capture [seconds]` — the receiving half of `tone`. Run
+        // both at once to exercise render -> engine -> loopback -> pair routing with no game and
+        // no client attached.
+        Some("capture") => {
+            let secs: u32 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(5);
+            let endpoint_id = match endpoint_override {
+                Some(id) => id,
+                None => match pe::find(idx)? {
+                    Some(ep) if !ep.endpoint_id.is_empty() => ep.endpoint_id,
+                    _ => {
+                        println!("pad-endpoint capture: pad {idx} has no endpoint — run `ensure`");
+                        return Ok(());
+                    }
+                },
+            };
+            println!("pad-endpoint capture: listening on {endpoint_id} for {secs}s");
+            pe::capture_probe(&endpoint_id, secs)
+        }
+        Some("status") => pe::print_status(idx),
+        _ => anyhow::bail!("usage: punktfunk-host pad-endpoint <ensure|remove|status> [--index N]"),
+    }
 }
 
 /// Mirror a physical monitor and pull frames from it — the on-glass gate for per-monitor capture

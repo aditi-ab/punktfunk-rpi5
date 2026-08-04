@@ -64,7 +64,11 @@ pub enum InputKind {
     GamepadRemove = 13,
     /// Declares which controller KIND a pad presents so a session can MIX types (pad 0 a
     /// DualSense, pad 1 an Xbox pad). `code` = the [`GamepadPref`](crate::config::GamepadPref)
-    /// wire byte, `flags` = pad index. Sent when the client opens a pad slot — before that pad's
+    /// wire byte, `flags` = pad index in the low byte plus the pad's render capabilities in bits
+    /// 8/9 ([`ARRIVAL_FLAG_PAD_AUDIO_HAPTICS`]/[`ARRIVAL_FLAG_PAD_AUDIO_SPEAKER`] — sent only
+    /// toward a [`HOST_CAP_PAD_AUDIO`](crate::quic::HOST_CAP_PAD_AUDIO) host, so an older host
+    /// keeps reading the whole word as the index; hosts decode via [`decode_gamepad_arrival`]).
+    /// Sent when the client opens a pad slot — before that pad's
     /// first input — and re-sent a few times against datagram loss (like [`GamepadRemove`]). The
     /// host resolves the kind to a buildable backend and routes that pad's virtual device to it; a
     /// pad the client never declares (an older client, or a fully-lost declaration) falls back to
@@ -95,6 +99,34 @@ pub fn encode_gamepad_remove(pad: u8, seq: u8) -> u32 {
 /// Unpack a [`InputKind::GamepadRemove`] `flags` word into `(pad, seq)`.
 pub fn decode_gamepad_remove(flags: u32) -> (u8, u8) {
     (flags as u8, (flags >> 24) as u8)
+}
+
+/// [`InputKind::GamepadArrival`] `flags` bit: this pad renders pad-audio HAPTICS — it is (or
+/// forwards to) a real DualSense whose voice-coil actuators can play the
+/// [`PAD_AUDIO_KIND_HAPTICS`](crate::quic::PAD_AUDIO_KIND_HAPTICS) stream. Rides above the pad
+/// index byte; sent only toward a [`HOST_CAP_PAD_AUDIO`](crate::quic::HOST_CAP_PAD_AUDIO) host
+/// (an older host reads the whole `flags` word as the index, so unexpected high bits would make
+/// it drop the declaration).
+pub const ARRIVAL_FLAG_PAD_AUDIO_HAPTICS: u32 = 1 << 8;
+/// [`InputKind::GamepadArrival`] `flags` bit: this pad renders pad-audio SPEAKER — the
+/// [`PAD_AUDIO_KIND_SPEAKER`](crate::quic::PAD_AUDIO_KIND_SPEAKER) stream. Same wire discipline
+/// as [`ARRIVAL_FLAG_PAD_AUDIO_HAPTICS`].
+pub const ARRIVAL_FLAG_PAD_AUDIO_SPEAKER: u32 = 1 << 9;
+
+/// Pack a [`InputKind::GamepadArrival`] `flags` word: the pad index in the low byte plus
+/// `audio_caps` (bit0 = haptics, bit1 = speaker) as bits 8/9. `audio_caps = 0` reproduces the
+/// pre-pad-audio wire bytes exactly.
+pub fn encode_gamepad_arrival(pad: u8, audio_caps: u8) -> u32 {
+    (pad as u32) | (((audio_caps & 0x03) as u32) << 8)
+}
+
+/// Unpack a [`InputKind::GamepadArrival`] `flags` word into `(pad, audio_caps)`. The pad index
+/// is `flags & 0xFF` — hosts MUST mask rather than take the whole word, or a capability bit
+/// reads as a phantom index; `audio_caps` is bits 8/9 (bit0 = haptics, bit1 = speaker — the
+/// [`ARRIVAL_FLAG_PAD_AUDIO_HAPTICS`]/[`ARRIVAL_FLAG_PAD_AUDIO_SPEAKER`] bits shifted down).
+/// An old-format word (index only) yields `audio_caps = 0`.
+pub fn decode_gamepad_arrival(flags: u32) -> (u8, u8) {
+    (flags as u8, ((flags >> 8) & 0x03) as u8)
 }
 
 /// The gamepad wire contract for [`InputKind::GamepadButton`]/[`InputKind::GamepadAxis`].
@@ -348,6 +380,11 @@ pub enum GamepadEvent {
         kind: u8,
         /// LI_CCAP_* bits (0x02 = rumble).
         capabilities: u16,
+        /// Pad-audio render capabilities from a NATIVE-plane arrival's `flags` bits 8/9
+        /// (bit0 = haptics, bit1 = speaker — see [`decode_gamepad_arrival`]). NOT a GameStream
+        /// LI_CCAP bit (that vocabulary lives in `capabilities`); the GameStream plane cannot
+        /// express pad audio and always sets `0`, as does an old client.
+        audio_caps: u8,
     },
 }
 
@@ -441,6 +478,31 @@ mod tests {
         };
         let (pad, seq) = decode_gamepad_remove(snap.to_event().flags);
         assert_eq!((pad, seq), (9, 123));
+    }
+
+    #[test]
+    fn gamepad_arrival_flags_roundtrip() {
+        // The capability bits ride bits 8/9; the index stays the low byte.
+        for (pad, caps) in [(0u8, 0u8), (3, 0b01), (15, 0b10), (7, 0b11)] {
+            let flags = encode_gamepad_arrival(pad, caps);
+            assert_eq!(decode_gamepad_arrival(flags), (pad, caps));
+            assert_eq!(flags & 0xFF, pad as u32);
+        }
+        assert_eq!(
+            encode_gamepad_arrival(2, 0b11),
+            2 | ARRIVAL_FLAG_PAD_AUDIO_HAPTICS | ARRIVAL_FLAG_PAD_AUDIO_SPEAKER
+        );
+        // Old-format compat both ways: a caps-less word (an old client, or a new one toward an
+        // old host) is byte-identical to the plain index, and decodes with caps 0.
+        assert_eq!(encode_gamepad_arrival(5, 0), 5);
+        assert_eq!(decode_gamepad_arrival(5), (5, 0));
+        // Undefined high bits (a future extension) never leak into the index OR the caps.
+        assert_eq!(
+            decode_gamepad_arrival(0xFFFF_0000 | (0b01 << 8) | 9),
+            (9, 1)
+        );
+        // encode masks unknown caps bits, so a sloppy embedder can't corrupt the index space.
+        assert_eq!(encode_gamepad_arrival(1, 0xFF), 1 | (0b11 << 8));
     }
 
     #[test]

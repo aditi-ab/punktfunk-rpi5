@@ -47,6 +47,11 @@ pub mod os;
 // Client settings profiles: the override catalog + the one connect-time resolver
 // (design/client-settings-profiles.md §4). Sits beside `trust`, which owns the host records
 // the bindings live on.
+// Pad audio (the 0xD1 plane): DualSense voice-coil haptics + speaker rendered on the wired
+// physical pad's own 4-ch audio device — correlation, the per-session renderer worker, and
+// the tier-A pad registry the gamepad worker feeds it through.
+#[cfg(any(target_os = "linux", windows))]
+pub mod pad_audio;
 #[cfg(any(target_os = "linux", windows))]
 pub mod profiles;
 #[cfg(any(target_os = "linux", windows))]

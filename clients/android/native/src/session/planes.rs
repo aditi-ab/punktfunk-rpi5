@@ -460,6 +460,111 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStopMic(
     })
 }
 
+/// `NativeBridge.nativeStartPadAudio(handle, pad, fd, haptics, speaker): Boolean` — start tier-A
+/// DualSense pad audio on a descriptor Kotlin has already obtained.
+///
+/// `fd` comes from `UsbDeviceConnection.getFileDescriptor()` **after** claiming the pad's audio
+/// streaming interface. Kotlin owns that connection and **must keep it open until
+/// `nativeStopPadAudio` returns**: the renderer borrows the descriptor and never closes it, so
+/// closing early would pull it out from under an in-flight isochronous transfer.
+///
+/// Returns `false` when there is nothing to render (both kinds disabled) or the thread would not
+/// start. A kernel that refuses the interface claim is NOT reported here — the renderer discovers
+/// that on its own thread and degrades to tier C, because some OEM kernels refuse and there is no
+/// app-side fix worth blocking a session on.
+#[no_mangle]
+#[cfg(target_os = "android")]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStartPadAudio(
+    _env: JNIEnv,
+    _this: JObject,
+    handle: jlong,
+    pad: jni::sys::jint,
+    fd: jni::sys::jint,
+    haptics: jboolean,
+    speaker: jboolean,
+) -> jboolean {
+    jni_guard(0, || {
+        if handle == 0 || fd < 0 || !(0..16).contains(&pad) {
+            return 0;
+        }
+        // SAFETY: live handle per the nativeConnect/nativeClose contract.
+        let h = unsafe { &*(handle as *const SessionHandle) };
+        // Replace any previous renderer first: dropping it joins the old thread, so two of them
+        // can never hold the same descriptor at once.
+        h.stop_pad_audio();
+        // The capability declaration and the rumble suppression are NOT done here: the renderer
+        // makes both only once its USB stream actually opens (see `pad_audio::render`). Doing them
+        // at spawn time would, on a kernel that refuses the interface claim, take the pad off wire
+        // rumble and give it nothing in return — no haptics of any kind.
+        match crate::pad_audio::start(
+            std::sync::Arc::clone(&h.client),
+            pad as u8,
+            fd,
+            haptics != 0,
+            speaker != 0,
+        ) {
+            Some(p) => {
+                *h.pad_audio.lock().unwrap() = Some(p);
+                1
+            }
+            None => 0,
+        }
+    })
+}
+
+/// `NativeBridge.nativePadAudioSelfTest(fd, seconds, hz): Int` — drive the pad directly with a
+/// tone through the real client render path, with no host and no session involved.
+///
+/// The check a standalone harness cannot make: it owns its descriptor by construction, so it can
+/// never reveal that the client handed the renderer a descriptor something else was already
+/// driving. Returns sample frames written, or negative on failure (see `pad_audio::SelfTest`).
+#[no_mangle]
+#[cfg(target_os = "android")]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativePadAudioSelfTest(
+    _env: JNIEnv,
+    _this: JObject,
+    fd: jni::sys::jint,
+    seconds: jni::sys::jint,
+    hz: jni::sys::jint,
+) -> jni::sys::jint {
+    jni_guard(-1, || {
+        if fd < 0 {
+            return -1;
+        }
+        // SAFETY: Kotlin holds the owning UsbDeviceConnection open across this call and drives no
+        // other transfers on it (it opens a dedicated connection for exactly this).
+        unsafe { crate::pad_audio::self_test(fd, seconds, hz) }
+    })
+}
+
+/// `NativeBridge.nativeStopPadAudio(handle, pad)` — stop tier-A pad audio and join its thread.
+///
+/// Returns only once the render thread is joined, which is the point: Kotlin may close the
+/// `UsbDeviceConnection` as soon as this returns and not before.
+#[no_mangle]
+#[cfg(target_os = "android")]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStopPadAudio(
+    _env: JNIEnv,
+    _this: JObject,
+    handle: jlong,
+    pad: jni::sys::jint,
+) {
+    jni_guard((), || {
+        if handle != 0 {
+            // SAFETY: live handle per the nativeConnect/nativeClose contract.
+            let h = unsafe { &*(handle as *const SessionHandle) };
+            h.stop_pad_audio();
+            if (0..16).contains(&pad) {
+                // Withdraw the capability and hand the pad back to wire rumble, in that order:
+                // the host stops sending 0xD1 before tier C resumes, so the two never overlap.
+                h.client.set_pad_audio_caps(pad as u8, 0);
+                crate::pad_audio::set_tier_a(pad as u8, false);
+                crate::pad_audio::clear_haptics_liveness(pad as u8);
+            }
+        }
+    })
+}
+
 /// `NativeBridge.nativeSetMicMuted(handle, muted)` — mute/unmute the mic uplink mid-stream.
 ///
 /// Muting deliberately does NOT stop the capture: the AAudio input stream, the input-preset rung

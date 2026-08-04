@@ -15,8 +15,16 @@ pub(super) async fn run(
     conn: quinn::Connection,
     mut input_rx: tokio::sync::mpsc::UnboundedReceiver<InputEvent>,
     gamepad_snapshots: bool,
+    // Whether the host advertised HOST_CAP_PAD_AUDIO: only then do arrivals carry the per-pad
+    // audio-render bits (flags 8/9) — an older host reads the whole flags word as the pad index,
+    // so unexpected high bits would make it drop the kind declaration entirely.
+    pad_audio: bool,
+    // Per-pad audio-render capabilities (bit0 haptics, bit1 speaker), fed by the embedder via
+    // [`NativeClient::set_pad_audio_caps`] and by arrival events already carrying the bits.
+    pad_audio_caps: std::sync::Arc<[std::sync::atomic::AtomicU8; crate::input::MAX_PADS]>,
 ) {
     use crate::input::{GamepadSnapshot, InputKind, MAX_PADS};
+    use std::sync::atomic::Ordering;
     // Touched pads only: an entry appears on the first gamepad event for that index, so the
     // refresh never conjures a virtual pad the embedder didn't drive.
     let mut pads: [Option<GamepadSnapshot>; MAX_PADS] = [None; MAX_PADS];
@@ -37,6 +45,28 @@ pub(super) async fn run(
     const ARRIVAL_RESENDS: u8 = 2;
     let mut arrival: [Option<u8>; MAX_PADS] = [None; MAX_PADS];
     let mut arrival_owed: [u8; MAX_PADS] = [0; MAX_PADS];
+    // An arrival's outgoing flags word: the pad index, plus the pad's audio-render bits (8/9)
+    // toward a HOST_CAP_PAD_AUDIO host. With no declared caps (or an older host) this is
+    // byte-identical to the plain index — the pre-pad-audio wire.
+    // B7: the caps a pad's LAST arrival actually carried. `set_pad_audio_caps` only stores into
+    // the registry — it cannot reach this task — so a declaration that lands after the arrival
+    // burst has drained (the renderer commits the trade only once its sink opens, which is well
+    // past the two 100 ms ticks) used to never reach the host at all: the client believed it had
+    // pad audio and the host emitted nothing on 0xD1, silently, forever. Comparing this against
+    // the live registry on every tick re-arms the burst by itself, with no new plumbing and no
+    // extra traffic when nothing changed.
+    let mut arrival_caps_sent: [u8; MAX_PADS] = [0; MAX_PADS];
+    let caps_now = |idx: usize| -> u8 {
+        if pad_audio {
+            pad_audio_caps[idx].load(Ordering::Relaxed)
+        } else {
+            0
+        }
+    };
+    let arrival_flags = |idx: usize| -> u32 {
+        let caps = caps_now(idx);
+        crate::input::encode_gamepad_arrival(idx as u8, caps)
+    };
     let mut refresh = tokio::time::interval(Duration::from_millis(100));
     refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
@@ -81,30 +111,56 @@ pub(super) async fn run(
                     let _ = conn.send_datagram(rem.encode().to_vec().into());
                     continue;
                 }
-                if gamepad_snapshots && ev.kind == InputKind::GamepadArrival && idx < MAX_PADS {
-                    // Remember the declared kind (`code`) and forward it, arming a re-send burst
-                    // so the host learns it before the pad's first frame even under loss.
-                    arrival[idx] = Some(ev.code as u8);
-                    arrival_owed[idx] = ARRIVAL_RESENDS;
-                    let _ = conn.send_datagram(ev.encode().to_vec().into());
-                    continue;
+                if gamepad_snapshots && ev.kind == InputKind::GamepadArrival {
+                    // The index is the LOW BYTE only — bits 8/9 may carry the pad's audio-render
+                    // caps (an embedder building raw events; the `set_pad_audio_caps` registry is
+                    // the usual source). Fold event-carried bits into the registry so the re-send
+                    // burst keeps them, then send with the negotiation-gated flags word.
+                    let (pad, ev_caps) = crate::input::decode_gamepad_arrival(ev.flags);
+                    let idx = pad as usize;
+                    if idx < MAX_PADS {
+                        if ev_caps != 0 {
+                            pad_audio_caps[idx].fetch_or(ev_caps, Ordering::Relaxed);
+                        }
+                        // Remember the declared kind (`code`) and forward it, arming a re-send
+                        // burst so the host learns it before the pad's first frame even under loss.
+                        arrival[idx] = Some(ev.code as u8);
+                        arrival_owed[idx] = ARRIVAL_RESENDS;
+                        arrival_caps_sent[idx] = caps_now(idx);
+                        let arr = crate::input::InputEvent {
+                            flags: arrival_flags(idx),
+                            ..ev
+                        };
+                        let _ = conn.send_datagram(arr.encode().to_vec().into());
+                        continue;
+                    }
                 }
                 let _ = conn.send_datagram(ev.encode().to_vec().into());
             }
             _ = refresh.tick() => {
                 for idx in 0..MAX_PADS {
+                    // B7: caps declared after the burst drained — re-announce this pad's arrival.
+                    // Only for a pad that HAS an arrival (so it is a live, declared controller),
+                    // and only when the value actually moved, so a steady session sends nothing.
+                    if arrival[idx].is_some()
+                        && arrival_owed[idx] == 0
+                        && caps_now(idx) != arrival_caps_sent[idx]
+                    {
+                        arrival_owed[idx] = ARRIVAL_RESENDS;
+                    }
                     // Re-send an owed kind declaration (independent of whether the pad has state
                     // yet — it may be idle-but-connected). Idempotent on the host.
                     if arrival_owed[idx] > 0 {
                         if let Some(kind) = arrival[idx] {
                             arrival_owed[idx] -= 1;
+                            arrival_caps_sent[idx] = caps_now(idx);
                             let arr = crate::input::InputEvent {
                                 kind: InputKind::GamepadArrival,
                                 _pad: [0; 3],
                                 code: kind as u32,
                                 x: 0,
                                 y: 0,
-                                flags: idx as u32,
+                                flags: arrival_flags(idx),
                             };
                             let _ = conn.send_datagram(arr.encode().to_vec().into());
                         } else {

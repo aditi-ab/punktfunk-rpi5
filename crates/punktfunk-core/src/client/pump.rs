@@ -50,6 +50,8 @@ pub(super) async fn run_pump(args: WorkerArgs) {
         rumble_tx,
         rumble_feed,
         hidout_tx,
+        pad_audio_tx,
+        pad_audio_caps,
         hdr_meta_tx,
         host_timing_tx,
         cursor_shape_tx,
@@ -92,9 +94,17 @@ pub(super) async fn run_pump(args: WorkerArgs) {
 
     // Input task: embedder events → uplink datagrams, with per-transition gamepad events
     // folded into idempotent seq-stamped snapshots toward a HOST_CAP_GAMEPAD_STATE host
-    // (see [`input_task`]).
+    // (see [`input_task`]). Pad-audio render caps ride arrival flags bits 8/9 ONLY toward a
+    // HOST_CAP_PAD_AUDIO host — an older host reads the whole flags word as the pad index.
     let gamepad_snapshots = host_caps & crate::quic::HOST_CAP_GAMEPAD_STATE != 0;
-    tokio::spawn(input_task::run(conn.clone(), input_rx, gamepad_snapshots));
+    let pad_audio_arrivals = host_caps & crate::quic::HOST_CAP_PAD_AUDIO != 0;
+    tokio::spawn(input_task::run(
+        conn.clone(),
+        input_rx,
+        gamepad_snapshots,
+        pad_audio_arrivals,
+        pad_audio_caps,
+    ));
 
     // Mic task: embedder Opus mic frames → 0xCB uplink datagrams (best-effort, dropped on loss).
     // Self-healing latency bound: every frame still queued once this task catches up is standing
@@ -166,6 +176,7 @@ pub(super) async fn run_pump(args: WorkerArgs) {
         rumble_tx,
         rumble_feed,
         hidout_tx,
+        pad_audio_tx,
         hdr_meta_tx,
         host_timing_tx,
         encode_lat.clone(),

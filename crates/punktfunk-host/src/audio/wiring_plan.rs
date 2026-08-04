@@ -186,6 +186,17 @@ fn virtualish(lname: &str) -> bool {
         || lname.contains("voicemeeter")
 }
 
+/// Is this render endpoint id one of the virtual pad's audio endpoints?
+///
+/// Pulled out of [`plan`] because the plan is NOT the only place that must not treat these as
+/// ordinary hardware — see [`excluded_from_loopback`]'s callers. A pad endpoint is deliberately
+/// stamped with the controller's own name ("DualSense Wireless Controller") so games read it as
+/// the pad's speaker, which means no name-based rule can recognise one; the only reliable test is
+/// identity against the ids the pad-endpoint provisioner created.
+pub(crate) fn is_pad_render(id: &str, pad_renders: &[String]) -> bool {
+    pad_renders.iter().any(|p| p == id)
+}
+
 /// Compute the assignment. `mic_want` is the operator override (`PUNKTFUNK_MIC_DEVICE`,
 /// lowercased): when set it beats the built-in candidate order for the mic target. `host_audio`
 /// flips the loopback preference to real hardware (audio audible on the host too); the default
@@ -195,8 +206,17 @@ pub(crate) fn plan(
     captures: &[Endpoint],
     mic_want: Option<&str>,
     host_audio: bool,
+    pad_renders: &[String],
 ) -> Wiring {
-    plan_with_formats(renders, captures, mic_want, host_audio, &no_formats, 2)
+    plan_with_formats(
+        renders,
+        captures,
+        mic_want,
+        host_audio,
+        &no_formats,
+        2,
+        pad_renders,
+    )
 }
 
 /// [`plan`] with knowledge of each render endpoint's engine mix format, and the channel count the
@@ -221,7 +241,20 @@ pub(crate) fn plan_with_formats(
     host_audio: bool,
     format_of: FormatProbe,
     want_channels: u8,
+    pad_renders: &[String],
 ) -> Wiring {
+    // 0. Pad-audio endpoints are invisible to the plan: never the mic target (client voice
+    //    would play out of a pad "speaker"), never a loopback source (a game's controller
+    //    audio cues would stream as desktop audio), and — since this shadows `renders` for
+    //    every tier below — never the flagged last resort either. Their names carry no virtual
+    //    marker (they are stamped "DualSense Wireless Controller" on purpose, so games read
+    //    them as the pad's speaker), so the name rules alone would take one for real hardware.
+    let renders: Vec<Endpoint> = renders
+        .iter()
+        .filter(|(_, id)| !is_pad_render(id, pad_renders))
+        .cloned()
+        .collect();
+    let renders = renders.as_slice();
     let find_render = |needle: &str| {
         renders
             .iter()
@@ -422,7 +455,7 @@ mod tests {
             ep("Microphone (Webcam)"),
             ep("CABLE Output (VB-Audio Virtual Cable)"),
         ];
-        let w = plan(&renders, &captures, None, false);
+        let w = plan(&renders, &captures, None, false, &[]);
         assert_eq!(
             w.mic_render.unwrap().0,
             "CABLE Input (VB-Audio Virtual Cable)"
@@ -451,7 +484,7 @@ mod tests {
             ep("CABLE Output (VB-Audio Virtual Cable)"),
             ep("Microphone (Steam Streaming Microphone)"),
         ];
-        let w = plan(&renders, &captures, None, false);
+        let w = plan(&renders, &captures, None, false, &[]);
         assert_eq!(
             w.mic_render.unwrap().0,
             "CABLE Input (VB-Audio Virtual Cable)"
@@ -471,7 +504,7 @@ mod tests {
             ep("CABLE Input (VB-Audio Virtual Cable)"),
             ep("Speakers (Steam Streaming Microphone)"),
         ];
-        let w = plan(&renders, &[], None, true);
+        let w = plan(&renders, &[], None, true, &[]);
         assert_eq!(
             w.loopback_render.unwrap().0,
             "Speakers (Apple Audio Device)"
@@ -488,7 +521,7 @@ mod tests {
             ep("CABLE In 16ch (VB-Audio Virtual Cable)"),
         ];
         for host_audio in [false, true] {
-            let w = plan(&renders, &[], None, host_audio);
+            let w = plan(&renders, &[], None, host_audio, &[]);
             assert!(w.loopback_render.is_none(), "host_audio={host_audio}");
         }
     }
@@ -500,7 +533,7 @@ mod tests {
     fn headless_cable_only_mic_wins() {
         let renders = [ep("CABLE Input (VB-Audio Virtual Cable)")];
         let captures = [ep("CABLE Output (VB-Audio Virtual Cable)")];
-        let w = plan(&renders, &captures, None, false);
+        let w = plan(&renders, &captures, None, false, &[]);
         assert!(w.mic_render.is_some(), "mic must claim the only cable");
         assert!(w.loopback_render.is_none(), "no echo-safe loopback exists");
     }
@@ -518,7 +551,7 @@ mod tests {
             ep("CABLE Output (VB-Audio Virtual Cable)"),
             ep("Microphone (Steam Streaming Microphone)"),
         ];
-        let w = plan(&renders, &captures, None, false);
+        let w = plan(&renders, &captures, None, false, &[]);
         assert_eq!(
             w.mic_render.unwrap().0,
             "CABLE Input (VB-Audio Virtual Cable)"
@@ -546,7 +579,7 @@ mod tests {
             ep("Speakers (Realtek HD Audio)"),
         ];
         let captures = [ep("Microphone (Steam Streaming Microphone)")];
-        let w = plan(&renders, &captures, None, false);
+        let w = plan(&renders, &captures, None, false, &[]);
         assert_eq!(
             w.mic_render.unwrap().0,
             "Speakers (Steam Streaming Microphone)"
@@ -560,7 +593,7 @@ mod tests {
     fn steam_mic_only_no_echo() {
         let renders = [ep("Speakers (Steam Streaming Microphone)")];
         let captures = [ep("Microphone (Steam Streaming Microphone)")];
-        let w = plan(&renders, &captures, None, false);
+        let w = plan(&renders, &captures, None, false, &[]);
         assert!(w.mic_render.is_some());
         assert!(w.loopback_render.is_none());
     }
@@ -576,7 +609,7 @@ mod tests {
             ep("Speakers (Steam Streaming Speakers)"),
         ];
         for host_audio in [false, true] {
-            let w = plan(&renders, &[], None, host_audio);
+            let w = plan(&renders, &[], None, host_audio, &[]);
             assert_eq!(
                 w.loopback_render.as_ref().unwrap().0,
                 "Speakers (Steam Streaming Speakers)",
@@ -597,7 +630,7 @@ mod tests {
             ep("Altavoces (Steam Streaming Microphone)"),
         ];
         let captures = [ep("Microphone (Steam Streaming Microphone)")];
-        let w = plan(&renders, &captures, None, false);
+        let w = plan(&renders, &captures, None, false, &[]);
         assert_eq!(
             w.mic_render.unwrap().0,
             "Altavoces (Steam Streaming Microphone)"
@@ -620,7 +653,7 @@ mod tests {
         ];
         let captures = [ep("Microphone (Steam Streaming Microphone)")];
         for host_audio in [false, true] {
-            let w = plan(&renders, &captures, None, host_audio);
+            let w = plan(&renders, &captures, None, host_audio, &[]);
             assert_eq!(
                 w.loopback_render.as_ref().unwrap().0,
                 "Speakers (Realtek HD Audio)",
@@ -642,7 +675,7 @@ mod tests {
         ];
         let captures = [ep("CABLE Output (VB-Audio Virtual Cable)")];
         for host_audio in [false, true] {
-            let w = plan(&renders, &captures, None, host_audio);
+            let w = plan(&renders, &captures, None, host_audio, &[]);
             assert!(w.loopback_render.is_none(), "host_audio={host_audio}");
             assert!(!w.loopback_last_resort, "host_audio={host_audio}");
             assert!(w.loopback_unsatisfiable(), "host_audio={host_audio}");
@@ -691,7 +724,7 @@ mod tests {
             ("steam streaming microphone", fmt(24_000, 1)),
             ("odyssey", fmt(48_000, 2)),
         ]);
-        let w = plan_with_formats(&renders, &captures, None, false, &p, 2);
+        let w = plan_with_formats(&renders, &captures, None, false, &p, 2, &[]);
         assert_eq!(
             w.loopback_render.as_ref().unwrap().0,
             "1 - Odyssey G60SD (AMD High Definition Audio Device)",
@@ -721,7 +754,7 @@ mod tests {
             ("steam streaming microphone", fmt(48_000, 2)),
             ("realtek", fmt(48_000, 2)),
         ]);
-        let w = plan_with_formats(&renders, &[], None, false, &p, 2);
+        let w = plan_with_formats(&renders, &[], None, false, &p, 2, &[]);
         assert_eq!(
             w.loopback_render.unwrap().0,
             "Speakers (Steam Streaming Microphone)"
@@ -737,7 +770,7 @@ mod tests {
             ep("Speakers (Steam Streaming Microphone)"),
         ];
         let p = probe(vec![("steam streaming microphone", fmt(16_000, 1))]);
-        let w = plan_with_formats(&renders, &[], None, false, &p, 2);
+        let w = plan_with_formats(&renders, &[], None, false, &p, 2, &[]);
         assert_eq!(
             w.loopback_render.as_ref().unwrap().0,
             "Speakers (Steam Streaming Microphone)"
@@ -753,7 +786,7 @@ mod tests {
     fn narrowing_is_reported_for_real_hardware_too() {
         let renders = [ep("Headset (Hands-Free AG Audio)")];
         let p = probe(vec![("headset", fmt(16_000, 1))]);
-        let w = plan_with_formats(&renders, &[], None, false, &p, 2);
+        let w = plan_with_formats(&renders, &[], None, false, &p, 2, &[]);
         assert_eq!(
             w.loopback_render.as_ref().unwrap().0,
             "Headset (Hands-Free AG Audio)"
@@ -773,8 +806,8 @@ mod tests {
         ];
         let captures = [ep("CABLE Output (VB-Audio Virtual Cable)")];
         for host_audio in [false, true] {
-            let a = plan(&renders, &captures, None, host_audio);
-            let b = plan_with_formats(&renders, &captures, None, host_audio, &no_formats, 2);
+            let a = plan(&renders, &captures, None, host_audio, &[]);
+            let b = plan_with_formats(&renders, &captures, None, host_audio, &no_formats, 2, &[]);
             assert_eq!(a, b, "host_audio={host_audio}");
             assert!(a.loopback_narrowing.is_none());
         }
@@ -792,7 +825,7 @@ mod tests {
             ("steam streaming microphone", fmt(24_000, 1)),
             ("realtek", fmt(48_000, 2)),
         ]);
-        let w = plan_with_formats(&renders, &[], None, true, &p, 2);
+        let w = plan_with_formats(&renders, &[], None, true, &p, 2, &[]);
         assert_eq!(w.loopback_render.unwrap().0, "Speakers (Realtek HD Audio)");
     }
 
@@ -820,7 +853,7 @@ mod tests {
             ep("Voicemeeter Input (VB-Audio Voicemeeter VAIO)"),
         ];
         let captures = [ep("Voicemeeter Out B1 (VB-Audio Voicemeeter VAIO)")];
-        let w = plan(&renders, &captures, Some("voicemeeter input"), false);
+        let w = plan(&renders, &captures, Some("voicemeeter input"), false, &[]);
         assert_eq!(
             w.mic_render.unwrap().0,
             "Voicemeeter Input (VB-Audio Voicemeeter VAIO)"
@@ -836,7 +869,7 @@ mod tests {
     #[test]
     fn no_virtual_device() {
         let renders = [ep("Speakers (Realtek HD Audio)")];
-        let w = plan(&renders, &[], None, false);
+        let w = plan(&renders, &[], None, false, &[]);
         assert!(w.mic_render.is_none());
         assert_eq!(w.loopback_render.unwrap().0, "Speakers (Realtek HD Audio)");
     }
@@ -854,7 +887,7 @@ mod tests {
         ];
         let captures = [ep("Voicemeeter Out B1 (VB-Audio Voicemeeter VAIO)")];
         for host_audio in [false, true] {
-            let w = plan(&renders, &captures, None, host_audio);
+            let w = plan(&renders, &captures, None, host_audio, &[]);
             assert_eq!(
                 w.mic_render.as_ref().unwrap().0,
                 "Voicemeeter Input (VB-Audio Voicemeeter VAIO)",
@@ -877,7 +910,7 @@ mod tests {
             ep("Voicemeeter Aux Input (VB-Audio Voicemeeter AUX VAIO)"),
         ];
         for host_audio in [false, true] {
-            let w = plan(&renders, &[], None, host_audio);
+            let w = plan(&renders, &[], None, host_audio, &[]);
             assert!(w.mic_render.is_some(), "host_audio={host_audio}");
             assert!(w.loopback_render.is_none(), "host_audio={host_audio}");
         }
@@ -892,7 +925,7 @@ mod tests {
             ep("CABLE Input (VB-Audio Virtual Cable)"),
             ep("Speakers (Some Virtual Audio Device)"),
         ];
-        let w = plan(&renders, &[], None, false);
+        let w = plan(&renders, &[], None, false, &[]);
         assert!(w.loopback_render.is_none());
     }
 
@@ -918,7 +951,7 @@ mod tests {
         // Field shape minus the Speakers (mic holds the Streaming Microphone, nothing else).
         let renders = [ep("Altavoces (Steam Streaming Microphone)")];
         let captures = [ep("Microphone (Steam Streaming Microphone)")];
-        let w = plan(&renders, &captures, None, false);
+        let w = plan(&renders, &captures, None, false, &[]);
         assert!(w.loopback_unsatisfiable());
         let msg = describe_no_loopback(&renders, &w);
         assert!(msg.contains("reserved for the virtual mic"), "{msg}");
@@ -929,10 +962,70 @@ mod tests {
         // anyway), while the Steam pair is the remedy that adds a capturable sink.
         let renders = [ep("CABLE Input (VB-Audio Virtual Cable)")];
         let captures = [ep("CABLE Output (VB-Audio Virtual Cable)")];
-        let w = plan(&renders, &captures, None, false);
+        let w = plan(&renders, &captures, None, false, &[]);
         assert!(w.loopback_unsatisfiable());
         let msg = describe_no_loopback(&renders, &w);
         assert!(msg.contains("install Steam"), "{msg}");
         assert!(!msg.contains("install VB-Audio Virtual Cable"), "{msg}");
+    }
+
+    /// A stamped pad endpoint is invisible to the plan. Its name carries NO virtual marker — on
+    /// purpose, games must read it as the pad's speaker — so the name rules alone would classify
+    /// it as real hardware and hand it the loopback; only the id exclusion prevents that.
+    /// Measured fact: the wiring plan on the target box already enumerated a stamped endpoint.
+    #[test]
+    fn pad_endpoints_invisible() {
+        let renders = [
+            ep("DualSense Wireless Controller"),
+            ep("Speakers (Realtek HD Audio)"),
+        ];
+        let pads = [renders[0].1.clone()];
+        let w = plan(&renders, &[], None, false, &pads);
+        assert_eq!(w.loopback_render.unwrap().0, "Speakers (Realtek HD Audio)");
+        // Even an operator mic override matching the pad's name must not claim it; with the
+        // pad as the only render endpoint there is honestly no mic target and no loopback.
+        let w = plan(
+            &renders[..1],
+            &[],
+            Some("wireless controller"),
+            false,
+            &pads,
+        );
+        assert!(w.mic_render.is_none());
+        assert!(w.loopback_render.is_none());
+    }
+
+    /// The exclusion has to survive the LAST RESORT tier, which this merge introduced alongside
+    /// pad audio. `last_resort` matches on the Steam-Speakers name, but it reads the same
+    /// shadowed `renders`, so a pad can never be reached through it either — otherwise the whole
+    /// desktop mix would be routed into the controller's voice coils.
+    #[test]
+    fn a_pad_is_never_the_last_resort() {
+        // Only the pad and the Steam pair exist; the mic reserves the Streaming Microphone, so
+        // the plan falls all the way through to the last resort.
+        let renders = [
+            ep("DualSense Wireless Controller"),
+            ep("Speakers (Steam Streaming Microphone)"),
+            ep("Speakers (Steam Streaming Speakers)"),
+        ];
+        let captures = [ep("Microphone (Steam Streaming Microphone)")];
+        let pads = [renders[0].1.clone()];
+        let w = plan(&renders, &captures, None, false, &pads);
+        assert_eq!(
+            w.loopback_render.as_ref().unwrap().0,
+            "Speakers (Steam Streaming Speakers)",
+            "the last resort must skip the pad"
+        );
+        assert!(w.loopback_last_resort);
+
+        // …and with the pad as the ONLY candidate left, the plan stays honestly unsatisfiable
+        // rather than falling back onto the coils.
+        let w = plan(&renders[..1], &captures, None, false, &pads);
+        assert!(
+            w.loopback_render.is_none(),
+            "a pad was taken as the last resort"
+        );
+        assert!(!w.loopback_last_resort);
+        assert!(w.loopback_unsatisfiable());
     }
 }

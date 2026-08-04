@@ -535,7 +535,7 @@ pub mod out_report {
 
 /// Parse a DualSense USB output report (`0x02`) into a [`DsFeedback`], indexed off
 /// [`out_report`]. Only the well-understood fields (motor rumble, lightbar RGB, player LEDs) are
-/// surfaced — adaptive-trigger blocks are forwarded raw for the client.
+/// surfaced — adaptive-trigger blocks and the audio-control region are forwarded raw for the client.
 ///
 /// Every field is gated on the report's valid-flags (`valid_flag0` at data[1], `valid_flag1`
 /// at data[2]) — writers only set the bits for fields they mean to change (the rest is zeroed),
@@ -591,6 +591,21 @@ pub fn parse_ds_output(pad: u8, data: &[u8], fb: &mut DsFeedback) {
                 effect: data[o::LEFT_TRIGGER..o::LEFT_TRIGGER + o::TRIGGER_LEN].to_vec(),
             });
         }
+    }
+    // The audio-control region (bytes 5..=10: headphone/speaker/mic volumes + routing), for the
+    // pad-audio path. The wire flags condense the report's audio bits: bit0 = haptics-select
+    // (flag0 BIT1 — set on every SDL rumble write too, which is why it alone never triggers an
+    // emission), bits1..4 = flag0 bits 4..7 (the audio-valid flags gating the region). Emitted
+    // whenever an audio-valid flag is present or the region carries data; downstream dedup
+    // ([`crate::hidout_dedup`]) reduces the per-report repeats to genuine changes.
+    let raw: [u8; 6] = data[5..11].try_into().unwrap();
+    if flag0 & 0xF0 != 0 || raw != [0u8; 6] {
+        let flags = ((flag0 >> 1) & 0x01) | ((flag0 >> 3) & 0x1E);
+        fb.hidout.push(HidOutput::AudioCtl {
+            pad: pad.into(),
+            flags,
+            raw,
+        });
     }
 }
 
@@ -915,6 +930,48 @@ mod tests {
         assert_eq!(DUALSENSE_RDESC[109], 0x2F);
         assert_eq!(DUALSENSE_EDGE_RDESC[109], 0x3F);
         assert_eq!(*DUALSENSE_EDGE_RDESC.last().unwrap(), 0xC0);
+    }
+
+    /// A 0x02 report driving the pad's audio (haptics-select + audio-valid flags + the volume/
+    /// routing bytes) surfaces an `AudioCtl` with the exact raw region and the condensed flags;
+    /// a plain rumble write (haptics-select but a silent audio region — every SDL rumble) does
+    /// NOT — that is what `parse_output_respects_valid_flags` pins with its `hidout.is_empty()`.
+    #[test]
+    fn parse_output_surfaces_audio_ctl() {
+        let mut data = vec![0u8; 48];
+        data[0] = 0x02;
+        data[1] = 0xB2; // flag0: haptics-select (BIT1) + audio-valid bits 4/5/7
+        data[5] = 0x50; // headphone volume
+        data[6] = 0x60; // speaker volume
+        data[7] = 0x70; // mic volume
+        data[8] = 0x05; // audio routing / enable bits
+        let mut fb = DsFeedback::default();
+        parse_ds_output(3, &data, &mut fb);
+        // flags: bit0 = flag0 bit1, bits1..4 = flag0 bits 4..7 (0b1011 → 0b10110).
+        assert_eq!(
+            fb.hidout,
+            vec![HidOutput::AudioCtl {
+                pad: 3,
+                flags: 0b1_0111,
+                raw: [0x50, 0x60, 0x70, 0x05, 0x00, 0x00],
+            }]
+        );
+        // A non-zero audio region with NO audio-valid flags still surfaces (dedup collapses the
+        // repeats downstream) — some writers leave stale volumes gated off; the host side wants
+        // the honest bytes either way.
+        let mut data = vec![0u8; 48];
+        data[0] = 0x02;
+        data[9] = 0x01;
+        let mut fb = DsFeedback::default();
+        parse_ds_output(0, &data, &mut fb);
+        assert_eq!(
+            fb.hidout,
+            vec![HidOutput::AudioCtl {
+                pad: 0,
+                flags: 0,
+                raw: [0, 0, 0, 0, 0x01, 0],
+            }]
+        );
     }
 
     /// A short / wrong-id report yields nothing.

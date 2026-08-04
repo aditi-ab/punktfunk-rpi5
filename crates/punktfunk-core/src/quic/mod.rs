@@ -25,7 +25,7 @@
 //! Split by concern (networking-audit deferred plan §3 — a pure move): `handshake` the
 //! positional Hello/Welcome/Start codecs, `caps` the capability/codec-negotiation
 //! vocabulary, `control` the typed control + clipboard messages, `pairing` the pairing
-//! message codecs with [`pake`] the SPAKE2 itself, `datagram` the 0xC9–0xCF plane codecs,
+//! message codecs with [`pake`] the SPAKE2 itself, `datagram` the 0xC9–0xD1 plane codecs,
 //! `pen` the stylus batch (0xCC kind 0x05) + host stroke tracker,
 //! [`io`] framed stream IO, `clock` skew estimation + mid-stream re-sync, [`endpoint`] the
 //! quinn constructors, [`clipstream`] the per-transfer clipboard fetch streams. Every item

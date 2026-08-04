@@ -132,7 +132,13 @@ pub use stats::Stats;
 /// says what it says — so v15 is the floor that *guarantees* them: at or above it the surface is
 /// present, below it an embedder must probe for the symbol. Purely a version statement; no code
 /// changed with this bump, and no wire change, so [`WIRE_VERSION`] is unchanged.
-pub const ABI_VERSION: u32 = 15;
+/// v16: added the pad-audio client surface — `punktfunk_connection_next_pad_audio` (the 0xD1
+/// per-gamepad DualSense haptics/speaker plane) + `punktfunk_connection_set_pad_audio_caps` and
+/// the `PUNKTFUNK_CLIENT_CAP_PAD_AUDIO` / `PUNKTFUNK_HOST_CAP_PAD_AUDIO` mirrors. Additive and
+/// capability-gated end to end: the wire grows a new datagram tag (0xD1) an old client never
+/// receives (double-gated caps), a new 0xCD kind (0x06, dropped as unknown by old clients) and
+/// arrival flag bits 8/9 sent only toward a capable host, so [`WIRE_VERSION`] is unchanged.
+pub const ABI_VERSION: u32 = 16;
 
 /// The punktfunk/1 **wire** version — what `Hello`/`Welcome` carry and hosts equality-check.
 /// Deliberately its own constant: [`ABI_VERSION`] tracks the embeddable **C surface**

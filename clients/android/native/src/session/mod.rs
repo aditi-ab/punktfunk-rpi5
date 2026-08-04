@@ -61,6 +61,11 @@ pub(crate) struct SessionHandle {
     audio: Mutex<Option<crate::audio::AudioPlayback>>,
     #[cfg(target_os = "android")]
     mic: Mutex<Option<crate::mic::MicCapture>>,
+    /// Tier-A DualSense pad audio (the 0xD1 plane), started by `nativeStartPadAudio` once Kotlin
+    /// has claimed the pad's audio interface and handed its descriptor over. Session-lifetime and
+    /// `Option` because a session may have no wired DualSense at all, which is the common case.
+    #[cfg(target_os = "android")]
+    pub(crate) pad_audio: Mutex<Option<crate::pad_audio::PadAudio>>,
     /// In-stream mic mute, set via `nativeSetMicMuted` and read per 10 ms frame by the mic's
     /// encode loop ([`crate::mic`]). Session-lifetime rather than per-[`crate::mic::MicCapture`]
     /// for the same reason the stats gate is: the mic stops and restarts across a surface
@@ -99,6 +104,14 @@ impl SessionHandle {
     fn stop_mic(&self) {
         let _ = self.mic.lock().unwrap().take();
     }
+
+    /// Stop pad audio. Dropping the [`crate::pad_audio::PadAudio`] joins its render thread, which
+    /// is what guarantees nothing is still writing to the descriptor when Kotlin closes the
+    /// `UsbDeviceConnection`. Idempotent.
+    #[cfg(target_os = "android")]
+    pub(crate) fn stop_pad_audio(&self) {
+        let _ = self.pad_audio.lock().unwrap().take();
+    }
 }
 
 impl Drop for SessionHandle {
@@ -108,6 +121,8 @@ impl Drop for SessionHandle {
         self.stop_audio();
         #[cfg(target_os = "android")]
         self.stop_mic();
+        #[cfg(target_os = "android")]
+        self.stop_pad_audio();
     }
 }
 

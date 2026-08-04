@@ -1024,6 +1024,21 @@ pub struct Settings {
     /// `PUNKTFUNK_AUDIO_SOURCE`).
     #[serde(default)]
     pub mic_device: String,
+    /// Render the host's per-pad DualSense voice-coil haptics stream (the 0xD1 plane, kind 0)
+    /// on a WIRED physical DualSense's own audio device (tier A — Bluetooth pads expose no
+    /// audio device). Gates the `CLIENT_CAP_PAD_AUDIO` advertisement and the per-pad arrival
+    /// capability bit; wire rumble is suppressed for a pad whose haptics stream is live (the
+    /// stream carries the feedback — see `gamepad.rs`, the SDL disable-bit trap). Default ON:
+    /// the capable-and-agreed negotiation means it changes nothing without a capable host AND
+    /// a wired DS5. `default` so pre-existing stores load with it on.
+    #[serde(default = "default_true")]
+    pub pad_haptics: bool,
+    /// Where the DualSense built-in-speaker stream (0xD1 kind 1) is rendered: `"pad"` (default
+    /// — the physical pad's own speaker), `"mix"` (fold it into the main stream audio — a
+    /// declared TODO that renders as `"off"` today; see `pad_audio::speaker_active`), or
+    /// `"off"`. `default` so pre-existing stores load as `"pad"`.
+    #[serde(default = "default_pad_speaker")]
+    pub pad_speaker: String,
     /// Match-window resolution policy (design/midstream-resolution-resize.md D1): the
     /// stream mode follows the session window — the connect asks for the window's pixel
     /// size and a mid-session resize renegotiates the host's virtual display + encoder
@@ -1069,6 +1084,10 @@ fn default_present_priority() -> String {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_pad_speaker() -> String {
+    "pad".into()
 }
 
 impl Settings {
@@ -1179,6 +1198,8 @@ impl Default for Settings {
             invert_scroll: false,
             speaker_device: String::new(),
             mic_device: String::new(),
+            pad_haptics: true,
+            pad_speaker: "pad".into(),
             match_window: false,
             last_window_w: 0,
             last_window_h: 0,

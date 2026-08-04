@@ -99,6 +99,40 @@ class HidUsbLink(
     fun findDevice(): UsbDevice? = usb.deviceList.values.firstOrNull(config.deviceMatch)
 
     /**
+     * Open a SECOND connection to the same device, for a consumer that needs its own descriptor.
+     *
+     * **Not a convenience — a correctness requirement.** `UsbDeviceConnection.requestWait()`
+     * returns *any* completed request on that connection, and the same is true of the usbfs reap
+     * ioctl underneath it: two independent transfer engines sharing one descriptor steal each
+     * other's completions. This link's reader owns its connection exclusively (see the note on
+     * [outQueue]), so anything else driving transfers on this device — the isochronous audio
+     * renderer — must open its own.
+     *
+     * usbfs allows the same device to be opened many times, and claims are per (descriptor,
+     * interface), so a claim made on this connection does not conflict with one made on that.
+     *
+     * The caller owns the returned connection and must close it.
+     */
+    fun openAuxConnection(): UsbDeviceConnection? {
+        val dev = device ?: return null
+        return usb.openDevice(dev)
+    }
+
+    /**
+     * The open connection's usbfs file descriptor, or -1 when the link is not running.
+     *
+     * Handed to native code that drives interfaces this link deliberately does NOT claim — the
+     * pad's isochronous audio endpoint (see `pad_audio` on the native side), which Android's own
+     * USB API cannot reach because `UsbRequest` rejects anything that is not bulk or interrupt.
+     * usbfs claims are per interface, so a native claim of the audio interface leaves this link's
+     * HID claim untouched.
+     *
+     * **The borrower must stop using it before [stop] runs**: closing the connection while a
+     * transfer is in flight pulls the descriptor out from under the kernel.
+     */
+    val fileDescriptor: Int get() = connection?.fileDescriptor ?: -1
+
+    /**
      * Claim [dev]'s controller interface(s) and start the read loop. The caller has already
      * obtained USB permission. Returns false when nothing could be claimed.
      */

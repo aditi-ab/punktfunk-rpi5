@@ -69,6 +69,10 @@ object NativeBridge {
          *  list and trust store show for it, same convention as [nativePair]'s `name`. `null`/blank ⇒
          *  the host falls back to a fingerprint-derived "device abcd1234" label. */
         deviceName: String?,
+        /** Advertise `CLIENT_CAP_PAD_AUDIO` — the SESSION-level negotiation for the 0xD1 per-pad
+         *  DualSense plane. Without it the host never sets `HOST_CAP_PAD_AUDIO` and emits nothing,
+         *  so a captured pad's own render capabilities would have nothing to gate. */
+        padAudioOk: Boolean,
     ): Long
 
     /** 64-hex SHA-256 of the cert the host presented on [handle]; valid after a successful connect. */
@@ -331,6 +335,46 @@ object NativeBridge {
      * send — no captured audio leaves the process.
      */
     external fun nativeSetMicMuted(handle: Long, muted: Boolean)
+
+    /**
+     * Start tier-A DualSense pad audio: render the host's `0xD1` streams on the pad's own
+     * 4-channel USB audio device.
+     *
+     * [fd] is an open [android.hardware.usb.UsbDeviceConnection]'s file descriptor. Native code
+     * **borrows** it — it claims the pad's audio interface through usbfs (which leaves any HID
+     * claim on the same device alone) and never closes the descriptor. The caller must keep the
+     * connection open until [nativeStopPadAudio] returns.
+     *
+     * This also declares the pad's render capability to the host; without it no `0xD1` is sent.
+     *
+     * Returns false when there is nothing to render. A kernel that refuses the interface claim is
+     * NOT reported here — the renderer discovers that on its own thread and the session simply
+     * carries on without tier A, because some OEM kernels refuse and no app-side fix exists.
+     */
+    external fun nativeStartPadAudio(
+        handle: Long,
+        pad: Int,
+        fd: Int,
+        haptics: Boolean,
+        speaker: Boolean,
+    ): Boolean
+
+    /**
+     * Stop tier-A pad audio and join its render thread, and hand the pad back to wire rumble.
+     *
+     * Returns only once the thread is joined — so the `UsbDeviceConnection` may be closed as soon
+     * as this returns, and not before.
+     */
+    external fun nativeStopPadAudio(handle: Long, pad: Int)
+
+    /**
+     * Drive the pad with a test tone through the real render path — no host, no session.
+     *
+     * [fd] must come from a connection **nothing else is driving transfers on**: two engines on
+     * one usbfs descriptor reap each other's completions. Blocks for roughly [seconds]; run it off
+     * the main thread. Returns sample frames written, or negative on failure.
+     */
+    external fun nativePadAudioSelfTest(fd: Int, seconds: Int, hz: Int): Int
 
     /**
      * Is a mic capture actually RUNNING — i.e. did [nativeStartMic] open a stream, and has

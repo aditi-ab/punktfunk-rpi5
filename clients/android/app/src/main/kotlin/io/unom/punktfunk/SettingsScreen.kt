@@ -896,6 +896,22 @@ private fun ControllerSettings(s: Settings, update: (Settings) -> Unit, onOpenCo
                 enabled = s.gamepadForwarding,
                 onCheckedChange = { on -> update(s.copy(dsCapture = on)) },
             )
+            // Both only ever apply to a captured pad, so they follow that row and gate on it.
+            ToggleRow(
+                title = "Controller haptics",
+                subtitle = "Play the host's fine-grained DualSense haptics on the pad itself — " +
+                    "the pad keeps ordinary rumble for games that don't send them",
+                checked = s.padHaptics,
+                enabled = s.gamepadForwarding && s.dsCapture,
+                onCheckedChange = { on -> update(s.copy(padHaptics = on)) },
+            )
+            ToggleRow(
+                title = "Controller speaker",
+                subtitle = "Play audio the game sends to the controller's own speaker",
+                checked = s.padSpeaker,
+                enabled = s.gamepadForwarding && s.dsCapture,
+                onCheckedChange = { on -> update(s.copy(padSpeaker = on)) },
+            )
         }
     }
 }

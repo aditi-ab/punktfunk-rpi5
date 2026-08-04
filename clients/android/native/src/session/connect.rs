@@ -145,6 +145,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConnect<'lo
     timeout_ms: jint,
     launch: JString<'local>,
     device_name: JString<'local>,
+    pad_audio_ok: jboolean,
 ) -> jlong {
     let host: String = match env.get_string(&host) {
         Ok(s) => s.into(),
@@ -268,7 +269,16 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConnect<'lo
         // CLIENT_CAP_PHASE_LOCK is honest: the async decode loop's presenter feeds
         // report_phase (advisory in v1 — the host arms on report receipt — but the Hello
         // should say what the client does).
-        punktfunk_core::quic::CLIENT_CAP_PHASE_LOCK,
+        // CLIENT_CAP_PAD_AUDIO is the SESSION-level negotiation, separate from the per-pad
+        // arrival bits: without it the host never sets HOST_CAP_PAD_AUDIO and never emits 0xD1,
+        // so declaring a pad's render caps later would have nothing to gate. Gated on the
+        // settings so a user with pad audio off does not make the host provision endpoints.
+        punktfunk_core::quic::CLIENT_CAP_PHASE_LOCK
+            | if pad_audio_ok != 0 {
+                punktfunk_core::quic::CLIENT_CAP_PAD_AUDIO
+            } else {
+                0
+            },
         // Slice-progressive delivery, by decoder truth (Kotlin probes FEATURE_PartialFrame on
         // every decoder this device would use; `debug.punktfunk.force_parts` overrides for the
         // on-glass experiment): AU prefixes then arrive as `Frame::part` pieces and the decode
@@ -291,6 +301,8 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConnect<'lo
                 audio: Mutex::new(None),
                 #[cfg(target_os = "android")]
                 mic: Mutex::new(None),
+                #[cfg(target_os = "android")]
+                pad_audio: Mutex::new(None),
                 // A fresh session is never muted (mute is per-session UI state, not a setting).
                 mic_muted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             };

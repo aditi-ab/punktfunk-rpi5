@@ -511,7 +511,7 @@ fn capture_once(
     if assert_plan {
         if let Some(d) = seen_default.as_deref() {
             if d != dev_id {
-                match judge_default(&en, wiring, d) {
+                match judge_default(wiring, d) {
                     DefaultKind::Capturable(name) => {
                         tracing::info!(default = %name, planned = %dev_name,
                             "could not park the default playback on the planned endpoint — \
@@ -639,7 +639,7 @@ fn capture_once(
                             );
                             return Ok(Next::Reopen(TargetMode::Follow));
                         }
-                        match judge_default(&en, wiring, &nid) {
+                        match judge_default(wiring, &nid) {
                             DefaultKind::Capturable(name) => {
                                 audio_client.stop_stream().ok();
                                 tracing::info!(device = %name,
@@ -726,8 +726,11 @@ enum DefaultKind {
     Unknown,
 }
 
-fn judge_default(en: &DeviceEnumerator, wiring: &wiring_plan::Wiring, id: &str) -> DefaultKind {
-    let Ok(dev) = en.get_device(id) else {
+/// Resolves through [`super::pad_endpoint::open_wasapi_device`], NOT the `wasapi` crate's
+/// `DeviceEnumerator::get_device` — that one hands `GetDevice` a freed string (see the helper's
+/// docs), and a spurious miss here silently downgrades a capturable default to `Unknown`.
+fn judge_default(wiring: &wiring_plan::Wiring, id: &str) -> DefaultKind {
+    let Ok(dev) = super::pad_endpoint::open_wasapi_device(id) else {
         return DefaultKind::Unknown;
     };
     let name = dev.get_friendlyname().unwrap_or_default();
@@ -736,7 +739,15 @@ fn judge_default(en: &DeviceEnumerator, wiring: &wiring_plan::Wiring, id: &str) 
         .mic_render
         .as_ref()
         .is_some_and(|(_, mic_id)| mic_id == id);
-    if is_mic || wiring_plan::excluded_from_loopback(&ln) {
+    // B10: a pad's audio endpoint is not ordinary hardware, and the name rules cannot see that —
+    // it is deliberately stamped with the controller's own name ("DualSense Wireless Controller")
+    // so games treat it as the pad's speaker, which means `excluded_from_loopback` passes it
+    // straight through as `Capturable`. The pure plan filtered these out, but the plan is not the
+    // only reader: this classifier drives the watchdog, Follow mode and the parked default, so a
+    // pad endpoint that happened to be the system default could be adopted as the desktop capture
+    // source — sending the whole desktop mix to a controller's voice coils. Identity, not name.
+    let is_pad = super::pad_endpoint::is_pad_render_endpoint(id);
+    if is_mic || is_pad || wiring_plan::excluded_from_loopback(&ln) {
         DefaultKind::Dud(name)
     } else {
         DefaultKind::Capturable(name)

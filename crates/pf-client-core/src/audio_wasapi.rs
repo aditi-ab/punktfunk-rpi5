@@ -98,13 +98,43 @@ pub fn devices() -> Result<(Vec<AudioDevice>, Vec<AudioDevice>)> {
 /// Settings device pickers via session main), or the OS default. A picked device that's
 /// gone (unplugged USB DAC, remote session) falls back to the default with a warning —
 /// audio keeps working, like the PipeWire twin's `target.object` behavior.
+/// Resolve an active endpoint by id WITHOUT `DeviceEnumerator::get_device`.
+///
+/// That helper builds its argument as `PCWSTR::from_raw(HSTRING::from(id).as_ptr())` — the
+/// `HSTRING` is a temporary, dropped at the end of that statement, so `GetDevice` reads freed
+/// memory and misses ids that are perfectly valid. Scanning the active collection touches only
+/// safe crate APIs, so it cannot regress the same way. (`punktfunk-host` fixes the same bug with
+/// raw COM instead; this crate cannot, because it pins a different `windows` revision than
+/// `wasapi` does, making the two `IMMDevice` types incompatible.)
+pub(crate) fn device_by_id(
+    enumerator: &DeviceEnumerator,
+    direction: &Direction,
+    id: &str,
+) -> Result<wasapi::Device> {
+    let devices = enumerator
+        .get_device_collection(direction)
+        .map_err(|e| anyhow!("enumerate {direction:?} endpoints: {e}"))?;
+    let count = devices
+        .get_nbr_devices()
+        .map_err(|e| anyhow!("endpoint count: {e}"))?;
+    for i in 0..count {
+        let dev = devices
+            .get_device_at_index(i)
+            .map_err(|e| anyhow!("endpoint {i}: {e}"))?;
+        if dev.get_id().is_ok_and(|got| got == id) {
+            return Ok(dev);
+        }
+    }
+    anyhow::bail!("no active {direction:?} endpoint with id {id}")
+}
+
 fn pick_device(
     enumerator: &DeviceEnumerator,
     direction: &Direction,
     var: &str,
 ) -> Result<wasapi::Device> {
     if let Some(id) = std::env::var(var).ok().filter(|v| !v.is_empty()) {
-        match enumerator.get_device(&id) {
+        match device_by_id(enumerator, direction, &id) {
             Ok(d) => {
                 tracing::info!(
                     var,

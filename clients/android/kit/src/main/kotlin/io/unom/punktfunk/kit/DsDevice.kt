@@ -276,6 +276,21 @@ object DsDevice {
      * the classic compat-vibration path AND `VIBRATION2` (firmware ≥ 2.24's full-range replot;
      * older firmware ignores the unknown flag2 bit) — the host parser accepts either.
      */
+    /**
+     * B6: hand the voice coils back to the audio-haptics path.
+     *
+     * Every [ds5RumbleReport] asserts `HAPTICS_SELECT` (flag0 bit1), which is SDL's
+     * "disable audio haptics" bit — the firmware mutes the coils the 0xD1 haptics stream drives.
+     * Until now NOTHING ever cleared it again, so a single rumble anywhere in a session left tier-A
+     * haptics silent for the rest of that pad's life, with no error and nothing in a log.
+     *
+     * The undo is a report whose flag0 has BOTH bits clear (SDL's own comment: "Leaving emulated
+     * rumble bits off will restore audio haptics"). No other valid flag is set, so nothing else
+     * about the pad's state is touched. Mirrors `Ds5Feedback::audio_haptics_packet` on the desktop
+     * client, which is the same packet one transport over.
+     */
+    fun ds5AudioHapticsReport(model: Model): ByteArray = newDs5(model)
+
     fun ds5RumbleReport(model: Model, low: Int, high: Int): ByteArray = newDs5(model).also {
         it[1] = (DS5_FLAG0_COMPAT_VIBRATION or DS5_FLAG0_HAPTICS_SELECT).toByte()
         it[39] = DS5_FLAG2_VIBRATION2.toByte()

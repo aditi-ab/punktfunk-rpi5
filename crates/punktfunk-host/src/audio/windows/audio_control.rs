@@ -143,6 +143,17 @@ pub(crate) fn wire_now(set_playback: bool) -> Wiring {
     wire_now_full(set_playback).wiring
 }
 
+/// Endpoint ids among `renders` that are the host's own pad-audio endpoints — the exclusion
+/// data [`plan`] runs on. Detection lives in [`super::pad_endpoint`] (stamped PFDS container /
+/// devnode marker, registry-only reads); this is just the per-pass collection.
+fn pad_render_ids(renders: &[Endpoint]) -> Vec<String> {
+    renders
+        .iter()
+        .filter(|(_, id)| super::pad_endpoint::is_pad_render_endpoint(id))
+        .map(|(_, id)| id.clone())
+        .collect()
+}
+
 /// Enumerate endpoints, compute the assignment, apply the default-device changes (unless
 /// `PUNKTFUNK_KEEP_DEFAULT`), and return the plan for the caller to act on (mic target / loopback
 /// echo guard). `set_playback` — true only from the desktop-audio capture open — additionally
@@ -159,6 +170,10 @@ pub(crate) fn wire_now_full(set_playback: bool) -> WiredPlan {
     let want = std::env::var("PUNKTFUNK_MIC_DEVICE")
         .ok()
         .map(|s| s.to_lowercase());
+    // The host's own pad-audio ("DualSense speaker") endpoints, by id — the pure plan filters
+    // them out of every role. Identity is platform data (stamped container / devnode marker),
+    // so it is collected HERE and passed in, like the candidate lists themselves.
+    let pad_ids = pad_render_ids(&renders);
     // Mix formats are read only when we are actually going to park the playback default (i.e. a
     // desktop-audio capture is opening). The mic pump wires on every open while the host is idle
     // and does not care which loopback endpoint wins, so it must not pay an IAudioClient
@@ -179,6 +194,7 @@ pub(crate) fn wire_now_full(set_playback: bool) -> WiredPlan {
         // only count a *narrowing* verdict can be made against without guessing: an endpoint that
         // cannot carry stereo cannot carry 5.1 either.
         2,
+        &pad_ids,
     );
     let done = |wiring: Wiring| WiredPlan {
         wiring,
@@ -245,7 +261,7 @@ pub(crate) fn wire_now_full(set_playback: bool) -> WiredPlan {
     if let Some((mic_name, mic_id)) = &wiring.mic_render {
         if default_render_id().as_deref() == Some(mic_id.as_str()) {
             // Audible preference = the host_audio plan's loopback pick (real hardware first).
-            match plan(&renders, &captures, want.as_deref(), true).loopback_render {
+            match plan(&renders, &captures, want.as_deref(), true, &pad_ids).loopback_render {
                 Some((name, id)) => match set_default_endpoint(&id) {
                     Ok(()) => tracing::info!(mic = %mic_name, device = %name,
                         "default playback was the virtual-mic target — moved it so desktop \
@@ -302,8 +318,10 @@ fn park_marker_path() -> std::path::PathBuf {
     pf_paths::config_dir().join("audio-default.prev")
 }
 
-/// The current default RENDER endpoint id, if any.
-fn default_render_id() -> Option<String> {
+/// The current default RENDER endpoint id, if any. pub(crate): the pad-endpoint provisioning
+/// uses it for its default-device guard (a freshly minted pad endpoint must never stay the
+/// default playback device).
+pub(crate) fn default_render_id() -> Option<String> {
     wasapi::DeviceEnumerator::new()
         .ok()?
         .get_default_device(&Direction::Render)
@@ -430,11 +448,13 @@ pub(crate) fn restore_default_playback() {
 }
 
 /// Open a device by endpoint id, with a name for error context.
+///
+/// Resolves through [`super::pad_endpoint::open_wasapi_device`], NOT the `wasapi` crate's
+/// `DeviceEnumerator::get_device` — that one hands `GetDevice` a freed string (see the helper's
+/// docs), so it fails at random on ids that are perfectly valid.
 pub(crate) fn open_endpoint(ep: &Endpoint) -> Result<wasapi::Device> {
-    wasapi::DeviceEnumerator::new()
-        .map_err(|e| anyhow!("DeviceEnumerator: {e}"))?
-        .get_device(&ep.1)
-        .map_err(|e| anyhow!("open endpoint {:?}: {e}", ep.0))
+    super::pad_endpoint::open_wasapi_device(&ep.1)
+        .map_err(|e| anyhow!("open endpoint {:?}: {e:#}", ep.0))
 }
 
 // --- IPolicyConfig (undocumented): set a default audio endpoint by id, for all three roles. ---
@@ -481,8 +501,9 @@ const _: () = {
 
 /// Set `device_id` as the default audio endpoint for eConsole/eMultimedia/eCommunications via the
 /// undocumented `IPolicyConfig::SetDefaultEndpoint` (the call `mmsys.cpl` makes). Errs if any role
-/// fails.
-fn set_default_endpoint(device_id: &str) -> Result<()> {
+/// fails. pub(crate): the pad-endpoint default-device guard restores the operator's default
+/// through the same machinery.
+pub(crate) fn set_default_endpoint(device_id: &str) -> Result<()> {
     use windows::core::{IUnknown, Interface, GUID, PCWSTR};
     use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL};
 
