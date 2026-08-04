@@ -279,8 +279,8 @@ object DsDevice {
     fun ds5RumbleReport(model: Model, low: Int, high: Int): ByteArray = newDs5(model).also {
         it[1] = (DS5_FLAG0_COMPAT_VIBRATION or DS5_FLAG0_HAPTICS_SELECT).toByte()
         it[39] = DS5_FLAG2_VIBRATION2.toByte()
-        it[3] = amp8(high).toByte()
-        it[4] = amp8(low).toByte()
+        it[3] = wireAmplitudeToByte(high).toByte()
+        it[4] = wireAmplitudeToByte(low).toByte()
     }
 
     /**
@@ -324,17 +324,11 @@ object DsDevice {
         ByteArray(Model.DUALSHOCK4.outputSize).also {
             it[0] = 0x05
             it[1] = (DS4_FLAG0_MOTORS or DS4_FLAG0_LED).toByte()
-            it[4] = amp8(high).toByte()
-            it[5] = amp8(low).toByte()
+            it[4] = wireAmplitudeToByte(high).toByte()
+            it[5] = wireAmplitudeToByte(low).toByte()
             it[6] = r.toByte()
             it[7] = g.toByte()
             it[8] = b.toByte()
         }
 
-    // Wire u16 amplitude → motor byte; a nonzero command never collapses to 0 (parity with the
-    // vibrator path's toAmplitude).
-    private fun amp8(v16: Int): Int {
-        val a = (v16 ushr 8) and 0xFF
-        return if (v16 != 0 && a == 0) 1 else a
-    }
 }

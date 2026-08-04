@@ -43,8 +43,14 @@ enum RumbleTuning {
 
     /// Wire amplitude (0...0xFFFF) → CoreHaptics intensity (0...1).
     static func amplitude(_ wire: UInt16) -> Float { Float(wire) / 65535 }
-    /// Wire amplitude → DualSense HID motor byte.
-    static func hidByte(_ wire: UInt16) -> UInt8 { UInt8(wire >> 8) }
+    /// Wire amplitude → DualSense HID motor byte. A nonzero command never collapses to silence:
+    /// the top byte of anything below 0x0100 is 0, so a weak-but-real rumble used to render as
+    /// nothing at all on this path. Floored at 1 — imperceptibly light, but moving. (Android's
+    /// `toAmplitude` has always done this; this was the odd one out.)
+    static func hidByte(_ wire: UInt16) -> UInt8 {
+        let b = UInt8(wire >> 8)
+        return wire != 0 && b == 0 ? 1 : b
+    }
     /// Single-actuator pads render whichever motor is stronger.
     static func combined(low: UInt16, high: UInt16) -> UInt16 { max(low, high) }
     /// Are two baked levels the same (skip the rebuild)?
@@ -81,10 +87,11 @@ enum RumbleTuning {
 ///  4. **Escalating stop.** A throwing `player.stop` means the engine's state is unknown — the
 ///     whole engine is stopped (silencing every player it hosts) and lazily rebuilt behind the
 ///     exponential backoff.
-///  5. **Staleness watchdog** (`Policy.session`): audible with no wire command for
-///     `sessionStaleSeconds` → force silence. A lost stop can outlive the host's 500 ms heal
-///     only if the channel itself died, and then the pad must not buzz forever. `Policy.manual`
-///     (the settings test panel) instead holds a level until it is changed.
+///  5. **No staleness watchdog here.** There was one, keyed off a `Policy` type and a
+///     `sessionStaleSeconds`; both are gone. Every liveness decision — lease expiry, legacy-host
+///     staleness, session close — now belongs to punktfunk-core's shared policy engine
+///     (`client/rumble.rs`), which emits explicit zero commands, so this renderer applies what it
+///     is told and never decides on its own when a level should end.
 ///
 /// Engines are created lazily on the first nonzero amplitude and torn down on retarget;
 /// failures (pads without haptics, engine resets) downgrade to silence — rumble is best-effort
@@ -93,17 +100,6 @@ enum RumbleTuning {
 /// `@unchecked Sendable` is sound because every property is read and written only inside
 /// `queue` closures — the serial queue is the synchronization.
 final class RumbleRenderer: @unchecked Sendable {
-    /// Who ends an un-refreshed nonzero target. Session mode applies the core policy engine's
-    /// commands verbatim — the engine (punktfunk-core `client/rumble.rs`) owns every lease,
-    /// staleness, and close decision and emits explicit zeros, so the renderer keeps NO
-    /// staleness policy of its own anymore. The controller test panel (`manual`) holds a slider
-    /// level indefinitely; both are identical renderer-side today, the distinction is kept for
-    /// the call sites' intent.
-    struct Policy {
-        static let session = Policy()
-        static let manual = Policy()
-    }
-
     /// Which physical actuator this renderer drives: the forwarded controller's haptics engine
     /// (the default), or THIS device's own Taptic Engine (`CHHapticEngine()`) — the opt-in
     /// "rumble on this device" mirror for phone-clip pads that ship without rumble motors.
@@ -115,7 +111,6 @@ final class RumbleRenderer: @unchecked Sendable {
     }
 
     private let queue = DispatchQueue(label: "io.unom.punktfunk.haptics", qos: .userInteractive)
-    private let policy: Policy
     private let actuator: Actuator
 
     /// One finite haptic play on a motor: the player plus when (engine timeline) it expires.
@@ -190,8 +185,7 @@ final class RumbleRenderer: @unchecked Sendable {
         ((0, 0), DispatchTime(uptimeNanoseconds: 0))
     #endif
 
-    init(policy: Policy = .session, actuator: Actuator = .controller) {
-        self.policy = policy
+    init(actuator: Actuator = .controller) {
         self.actuator = actuator
     }
 

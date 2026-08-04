@@ -1673,7 +1673,10 @@ typedef struct {
     // Trigger: number of valid bytes in `effect` (≤ `PUNKTFUNK_HID_EFFECT_MAX`).
     uint8_t effect_len;
     // Trigger: the raw DualSense trigger parameter block (mode + params).
-    uint8_t effect[11];
+    // Sized off [`PUNKTFUNK_HID_EFFECT_MAX`] rather than a second literal `11` — the constant is
+    // exported precisely so embedders can size their own buffers against it, and it declaring one
+    // number while the struct it describes hardcoded another was the whole hazard.
+    uint8_t effect[PUNKTFUNK_HID_EFFECT_MAX];
 } PunktfunkHidOutput;
 #endif
 
@@ -2469,10 +2472,12 @@ PunktfunkStatus punktfunk_connection_next_rumble_cmd(PunktfunkConnection *c,
 // Declare a physical actuator's quirks for wire pad `pad` — how a platform parameterizes the
 // shared rumble policy engine instead of forking it (typically called at controller attach).
 // `keepalive_ms`: re-emit an unchanged non-zero level at this cadence for actuators whose
-// hardware output decays between wire renewals (Steam Deck ≈ 40, DualSense-over-BT raw HID
-// ≈ 900); `0` = none. `min_pulse_ms`: floor for `backstop_ms` on non-zero commands. `flags`:
+// hardware output decays between wire renewals (the Steam Deck's ≈ 40 is the one in-tree user);
+// `0` = none. `min_pulse_ms`: floor for `backstop_ms` on non-zero commands — no in-tree caller
+// sets it, it exists for embedders whose duration-taking API rejects short values. `flags`:
 // [`PUNKTFUNK_RUMBLE_QUIRK_DEDUP_JITTER`]. All-zero (the initial state) describes a well-behaved
-// actuator.
+// actuator. See [`ActuatorQuirks`](crate::client::rumble::ActuatorQuirks) for why a renderer that
+// dedupes its own writes (the Apple HID path) cannot use `keepalive_ms` and keeps its own.
 //
 // # Safety
 // `c` is a valid connection handle. Callable from any thread.
