@@ -819,46 +819,77 @@ impl DriverAttach {
 
     /// One-shot WARN with everything the host can find out about WHY the driver isn't attached:
     /// driver-store presence, the devnode's PnP status/problem code, and where to look next.
+    ///
+    /// Runs on its own thread and returns immediately. The caller is the session's pad service
+    /// thread — the one feeding input and rumble — and everything below is slow: the driver-store
+    /// check waits up to [`INVENTORY_WAIT`] for a `pnputil` enumeration that can take tens of
+    /// seconds, and the devnode lookup is a synchronous PnP call. Blocking there stalled input for
+    /// up to two seconds *per unattached pad* (the wait is a deadline, not a one-off: while the
+    /// enumeration is still outstanding every pad pays it again), at exactly the moment a session
+    /// is already going wrong. Diagnostics must never be able to hurt the thing they diagnose.
+    ///
+    /// Off the hot path the wait also stops being a compromise — it can afford to be patient and
+    /// report what it actually found rather than "still enumerating".
     fn diagnose(&self) {
-        let store = match driver_store_has(self.inf) {
-            Some(true) => "driver package present in the driver store",
-            Some(false) => {
-                "driver package NOT in the driver store — run: punktfunk-host.exe driver install --gamepad"
-            }
-            None => "driver store could not be queried (pnputil failed or still enumerating)",
-        };
-        let devnode = match &self.instance_id {
-            Some(id) => devnode_status_line(id),
-            None => {
-                "no per-session devnode (SwDeviceCreate failed earlier — see the warning above)"
-                    .to_string()
-            }
-        };
-        tracing::warn!(
-            driver = self.driver,
-            shm = %self.shm_name,
-            grace_secs = ATTACH_GRACE.as_secs(),
-            store,
-            devnode = %devnode,
-            driver_log = self.driver_log,
-            "gamepad driver has not attached to the shared section — the virtual pad exists but no \
-             driver is serving it (games will not see it); an old (pre-sealed-channel) driver also \
-             reads as not-attached: update with punktfunk-host.exe driver install --gamepad \
-             (driver_log is only written by debug driver builds, or with the PFXUSB_DEBUG_LOG / \
-             PFGAMEPAD_DEBUG_LOG / PFMOUSE_DEBUG_LOG system env var set + the device restarted)"
-        );
+        let (driver, inf, driver_log) = (self.driver, self.inf, self.driver_log);
+        let shm_name = self.shm_name.clone();
+        let instance_id = self.instance_id.clone();
+        std::thread::Builder::new()
+            .name("pf-driver-diagnose".into())
+            .spawn(move || diagnose_blocking(driver, inf, driver_log, &shm_name, instance_id))
+            .ok();
     }
 }
 
-/// How long [`driver_store_inventory`] lets the caller wait for the background pnputil query
-/// before reporting without it — [`observe`] runs on the pad service thread, which must keep
-/// draining pad slots even when the driver store is wedged.
-const INVENTORY_WAIT: Duration = Duration::from_secs(2);
+/// The body of [`DriverAttach::diagnose`], on its own thread. Split out rather than inlined into
+/// the closure so the blocking calls stay visible as blocking.
+fn diagnose_blocking(
+    driver: &'static str,
+    inf: &'static str,
+    driver_log: &'static str,
+    shm_name: &str,
+    instance_id: Option<String>,
+) {
+    let store = match driver_store_has(inf) {
+        Some(true) => "driver package present in the driver store",
+        Some(false) => {
+            "driver package NOT in the driver store — run: punktfunk-host.exe driver install --gamepad"
+        }
+        None => "driver store could not be queried (pnputil failed or still enumerating)",
+    };
+    let devnode = match &instance_id {
+        Some(id) => devnode_status_line(id),
+        None => "no per-session devnode (SwDeviceCreate failed earlier — see the warning above)"
+            .to_string(),
+    };
+    tracing::warn!(
+        driver,
+        shm = %shm_name,
+        grace_secs = ATTACH_GRACE.as_secs(),
+        store,
+        devnode = %devnode,
+        driver_log,
+        "gamepad driver has not attached to the shared section — the virtual pad exists but no \
+         driver is serving it (games will not see it); an old (pre-sealed-channel) driver also \
+         reads as not-attached: update with punktfunk-host.exe driver install --gamepad \
+         (driver_log is only written by debug driver builds, or with the PFXUSB_DEBUG_LOG / \
+         PFGAMEPAD_DEBUG_LOG / PFMOUSE_DEBUG_LOG system env var set + the device restarted)"
+    );
+}
+
+/// How long [`driver_store_inventory`] waits for the background pnputil query before reporting
+/// without it. Only [`diagnose_blocking`] waits, and that has a thread to itself, so this is
+/// generous: pnputil routinely takes longer than a couple of seconds on a busy driver store, and
+/// the old two-second budget — chosen to limit the damage while this ran on the pad service thread
+/// — meant the diagnosis usually gave up and printed "still enumerating", which is the one answer
+/// that helps nobody. Nothing waits on this thread, so patience costs only a late log line.
+const INVENTORY_WAIT: Duration = Duration::from_secs(30);
 
 /// Driver-store inventory (`pnputil /enum-drivers`), lower-cased, fetched once per process — only
 /// consulted on the failure path, so the subprocess cost never hits a healthy session. The query
 /// runs on its OWN thread: pnputil can block for tens of seconds on a busy/wedged driver store,
-/// and the caller is the pad service thread. `None` = not available yet (query still running) or
+/// and this keeps one wedged query from being re-run per pad. `None` = not available yet (query
+/// still running past [`INVENTORY_WAIT`]) or
 /// failed; a query that outlives [`INVENTORY_WAIT`] still lands in the cache for later reports.
 fn driver_store_inventory() -> Option<&'static str> {
     static INV: OnceLock<String> = OnceLock::new();
