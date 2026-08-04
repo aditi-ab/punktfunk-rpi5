@@ -67,6 +67,17 @@ public final class GamepadCapture {
         var axes: [Int32] = [0, 0, 0, 0, 0, 0]
         var fingerActive: [Bool] = [false, false]
         var lastMotionNs: UInt64 = 0
+        // Hold-Select→guide gesture state (pf-client-core's `SelectGesture`, adapted to
+        // this class's mask-diff model): a Select pressed ALONE is held out of the mask
+        // until it resolves into a tap (delivered on release) or — past `guideHold` — a
+        // synthetic guide, down until release.
+        var selectPending = false
+        var selectAsGuide = false
+        /// A delivered tap's release is owed (`tapTimer` scheduled) — its down went out
+        /// outside `buttons`, so `flush` must know to lift it.
+        var tapReleaseOwed = false
+        var gestureTimer: Timer?
+        var tapTimer: Timer?
         init(controller: GCController, pad: UInt32, pref: PunktfunkConnection.GamepadType) {
             self.controller = controller
             self.pad = pad
@@ -91,6 +102,16 @@ public final class GamepadCapture {
         GamepadWire.leftShoulder | GamepadWire.rightShoulder | GamepadWire.start | GamepadWire.back
     /// pf-client-core's `DISCONNECT_HOLD` — the same 1.5 s on every client.
     private static let disconnectHold: TimeInterval = 1.5
+    /// pf-client-core's `GUIDE_HOLD`: hold Select alone this long → the HOST's guide goes
+    /// down (until release, so a long hold is the host's long-press — a Gaming-Mode
+    /// host's QAM). The gesture exists because iOS reserves the physical Home press (the
+    /// Game Overlay; sanctioned opt-out only via the user's iOS 27+ Home-button setting)
+    /// and tvOS never delivers it at all.
+    private static let guideHold: TimeInterval = 0.35
+    /// pf-client-core's `TAP_PRESS`: a held-back Select tap is delivered as a press with
+    /// its release this far behind — back-to-back transitions can fold into nothing in
+    /// the host's per-pad input fold.
+    private static let tapPress: TimeInterval = 0.05
     private var chordTimer: Timer?
     /// Fired ON MAIN once the escape chord has been held `disconnectHold` — the session owner
     /// disconnects. On tvOS this (plus the Siri Remote's hold-Back) is the ONLY way out of a
@@ -115,10 +136,23 @@ public final class GamepadCapture {
     /// "don't forward" is one fact in one place rather than a condition at twelve call sites.
     private var wire: PunktfunkConnection? { forwarding ? connection : nil }
 
-    public init(connection: PunktfunkConnection, manager: GamepadManager, forwarding: Bool = true) {
+    /// Forward the raw guide + share/QAM presses (`EffectiveSettings.systemButtonsForward`,
+    /// default true on Apple — where the OS shows its own overlay for them, that's the OS's
+    /// business; local mode exists for profile parity with the Gaming-Mode clients).
+    public let systemForward: Bool
+    /// The hold-Select guide gesture (`EffectiveSettings.guideGestureEnabled` — auto = on
+    /// everywhere but macOS). See `guideHold`.
+    public let guideGesture: Bool
+
+    public init(
+        connection: PunktfunkConnection, manager: GamepadManager, forwarding: Bool = true,
+        systemForward: Bool = true, guideGesture: Bool = false
+    ) {
         self.connection = connection
         self.manager = manager
         self.forwarding = forwarding
+        self.systemForward = systemForward
+        self.guideGesture = guideGesture
     }
 
     public func start() {
@@ -206,7 +240,14 @@ public final class GamepadCapture {
             element.preferredSystemGestureState = .disabled
         }
         // The Home/PS button (→ guide; the host maps it to the DualSense PS / Xbox guide bit,
-        // BTN_MODE on the virtual xpad — the Steam-overlay button). Driven DIRECTLY from this
+        // BTN_MODE on the virtual xpad — the Steam-overlay button). On iOS 26 the OS opens its
+        // Game Overlay for this press regardless of the gesture claim below (the app is
+        // LSApplicationCategoryType=games, which enrolls it); the sanctioned per-controller
+        // opt-out is the USER's iOS 27+ Home-button setting. TODO(iOS 27 SDK): read
+        // `GCControllerHomeButtonSettingsManager` and surface a one-time
+        // `openControllerHomeButtonSettings(for:)` deep-link so users can hand the button to
+        // the stream — the class is Swift-only and 27.0+, so it needs the Xcode 27 SDK to
+        // even compile. Until then hold-Select is the reliable route. Driven DIRECTLY from this
         // handler's pressed value (not via buttonMask), because the legacy
         // `extendedGamepad.buttonHome` is unreliable/often nil even when the physical element
         // exists. On tvOS the element is absent (reserved) → nil, the whole block no-ops.
@@ -289,7 +330,14 @@ public final class GamepadCapture {
         // as "changed" — otherwise the first stick/button move after a guide press would emit a
         // spurious guide-UP while the button is still physically held (and drop the bit from
         // `slot.buttons`, swallowing the real release too). `flush`/`allButtons` still release it.
-        let newButtons = Self.buttonMask(g) | (slot.buttons & GamepadWire.guide)
+        var raw = Self.buttonMask(g)
+        // Raw system buttons stay local when passthrough is off: misc1 (share/QAM) is
+        // masked here, guide is gated at its own handler.
+        if !systemForward { raw &= ~GamepadWire.misc1 }
+        // The hold-Select gesture rewrites the mask: a Select pressed alone is held out
+        // until it resolves (tap on release / synthetic guide past the threshold).
+        if guideGesture { raw = gestureFiltered(slot, raw) }
+        let newButtons = raw | (slot.buttons & GamepadWire.guide)
         let changed = newButtons ^ slot.buttons
         if changed != 0 {
             for bit in GamepadWire.allButtons where changed & bit != 0 {
@@ -312,10 +360,106 @@ public final class GamepadCapture {
         updateEscapeChord()
     }
 
+    /// The hold-Select→guide state machine over one sync's raw mask (pf-client-core's
+    /// `SelectGesture` rules): Select pressed ALONE is suppressed while pending; another
+    /// button joining makes it real (unsuppressed — the diff sends its down); released
+    /// inside `guideHold` it's a tap, delivered out-of-band on release with the release
+    /// `tapPress` behind; past the threshold `gestureHoldFired` turned it into a synthetic
+    /// guide, lifted here when Select physically releases.
+    ///
+    /// One deliberate divergence from the Rust worker: while transformed into a guide the
+    /// Select stays OUT of `slot.buttons`, so the escape chord doesn't complete on top of
+    /// an in-flight guide-hold — release Select and press the chord plainly instead (the
+    /// chord's four-at-once press never lingers in pending long enough to be affected).
+    private func gestureFiltered(_ slot: Slot, _ raw: UInt32) -> UInt32 {
+        let back = GamepadWire.back
+        let backDown = raw & back != 0
+        let othersDown = raw & ~back != 0
+        if slot.selectAsGuide {
+            if backDown { return raw & ~back }
+            slot.selectAsGuide = false
+            sendGuide(slot, down: false, raw: false)
+            return raw
+        }
+        if slot.selectPending {
+            if !backDown {
+                endPending(slot)
+                deliverTap(slot)
+                return raw
+            }
+            if othersDown {
+                // A combo after all — Select unsuppresses and the diff sends its down.
+                endPending(slot)
+                return raw
+            }
+            return raw & ~back
+        }
+        if backDown, !othersDown, slot.buttons & back == 0 {
+            // Newly pressed, alone: hold it back. An owed tap release goes out first so
+            // the host never sees two downs in a row.
+            if slot.tapReleaseOwed { finishTap(slot) }
+            slot.selectPending = true
+            let timer = Timer(timeInterval: Self.guideHold, repeats: false) { [weak self, weak slot] _ in
+                Task { @MainActor in
+                    if let self, let slot { self.gestureHoldFired(slot) }
+                }
+            }
+            RunLoop.main.add(timer, forMode: .common)
+            slot.gestureTimer?.invalidate()
+            slot.gestureTimer = timer
+            return raw & ~back
+        }
+        return raw
+    }
+
+    /// The hold threshold passed with Select still pending → it IS the guide now, down
+    /// until the physical release (`gestureFiltered`'s `selectAsGuide` branch lifts it).
+    private func gestureHoldFired(_ slot: Slot) {
+        guard slot.selectPending else { return }
+        slot.selectPending = false
+        slot.gestureTimer = nil
+        slot.selectAsGuide = true
+        sendGuide(slot, down: true, raw: false)
+    }
+
+    private func endPending(_ slot: Slot) {
+        slot.selectPending = false
+        slot.gestureTimer?.invalidate()
+        slot.gestureTimer = nil
+    }
+
+    /// Deliver a held-back Select tap: the press now, its release `tapPress` behind. Both
+    /// sends bypass `slot.buttons` (the raw mask no longer carries Select, so the diff
+    /// stays consistent); `tapReleaseOwed` is what `flush` checks so the press can't
+    /// outlive the slot.
+    private func deliverTap(_ slot: Slot) {
+        wire?.send(.gamepadButton(GamepadWire.back, down: true, pad: slot.pad))
+        slot.tapReleaseOwed = true
+        let timer = Timer(timeInterval: Self.tapPress, repeats: false) { [weak self, weak slot] _ in
+            Task { @MainActor in
+                if let self, let slot { self.finishTap(slot) }
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        slot.tapTimer?.invalidate()
+        slot.tapTimer = timer
+    }
+
+    private func finishTap(_ slot: Slot) {
+        guard slot.tapReleaseOwed else { return }
+        slot.tapReleaseOwed = false
+        slot.tapTimer?.invalidate()
+        slot.tapTimer = nil
+        wire?.send(.gamepadButton(GamepadWire.back, down: false, pad: slot.pad))
+    }
+
     /// Forward the guide (Home/PS) transition directly — it's kept out of `buttonMask` (the legacy
     /// `buttonHome` element is unreliable). Folds into the slot's `buttons` so a held PS button is
-    /// released by `flush` on focus loss / close just like the others.
-    private func sendGuide(_ slot: Slot, down: Bool) {
+    /// released by `flush` on focus loss / close just like the others. `raw: true` marks the
+    /// physical Home handler's calls, which the system-buttons policy can keep local; the
+    /// gesture's synthetic transitions pass `raw: false` and always go out.
+    private func sendGuide(_ slot: Slot, down: Bool, raw: Bool = true) {
+        if raw, !systemForward { return }
         guard !suspended else { return }
         let bit = GamepadWire.guide
         let now = down ? (slot.buttons | bit) : (slot.buttons & ~bit)
@@ -449,6 +593,12 @@ public final class GamepadCapture {
     /// (no GC calls) — safe against an already-removed device. Does NOT close the slot or send
     /// GamepadRemove (that's `closeSlot`).
     private func flush(_ slot: Slot) {
+        // Gesture first: a pending (never-sent) Select just drops, an owed tap release
+        // goes out, and a transformed guide's bit — folded into `buttons` by `sendGuide`
+        // — is lifted by the loop below like any held button.
+        endPending(slot)
+        slot.selectAsGuide = false
+        if slot.tapReleaseOwed { finishTap(slot) }
         for bit in GamepadWire.allButtons where slot.buttons & bit != 0 {
             wire?.send(.gamepadButton(bit, down: false, pad: slot.pad))
         }

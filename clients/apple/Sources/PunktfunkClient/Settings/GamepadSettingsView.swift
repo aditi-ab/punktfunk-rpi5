@@ -39,6 +39,8 @@ struct GamepadSettingsView: View {
     @AppStorage(DefaultsKey.compositor) private var compositor = 0
     @AppStorage(DefaultsKey.gamepadType) private var gamepadType = 0
     @AppStorage(DefaultsKey.gamepadForwarding) private var gamepadForwarding = true
+    @AppStorage(DefaultsKey.systemButtons) private var systemButtons = "auto"
+    @AppStorage(DefaultsKey.guideGesture) private var guideGesture = "auto"
     @AppStorage(DefaultsKey.bitrateKbps) private var bitrateKbps = 0
     @AppStorage(DefaultsKey.audioChannels) private var audioChannels = 2
     @AppStorage(DefaultsKey.hdrEnabled) private var hdrEnabled = true
@@ -399,6 +401,18 @@ struct GamepadSettingsView: View {
                 detail: "The virtual pad the host creates — Automatic matches this controller.",
                 options: SettingsOptions.padTypes, current: gamepadType
             ) { gamepadType = $0 },
+            choiceRow(
+                id: "systemButtons", icon: "house.circle", label: "Guide button",
+                detail: "Where the guide (Xbox/PS) and share presses go while streaming — "
+                    + "Automatic sends them to the host whenever this device delivers them.",
+                options: SettingsOptions.systemButtons, current: systemButtons
+            ) { systemButtons = $0 },
+            choiceRow(
+                id: "guideGesture", icon: "hand.point.up.left", label: "Hold Select for guide",
+                detail: "Hold Select alone to press the host's guide button — keep holding "
+                    + "for a Gaming-Mode host's quick-access menu. A tap still goes through.",
+                options: SettingsOptions.guideGestures, current: guideGesture
+            ) { guideGesture = $0 },
 
             choiceRow(
                 id: "hud", header: "Interface", icon: "chart.bar", label: "Statistics overlay",

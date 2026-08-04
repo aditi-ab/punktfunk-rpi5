@@ -170,6 +170,15 @@ export const applyControllerConfig = callable<
   { ok: boolean; applied?: string[]; errors?: string[]; accounts?: number; error?: string; detail?: string }
 >("apply_controller_config");
 export const killStream = callable<[], { ok: boolean }>("kill_stream");
+// Whether the streaming client's control socket exists (a stream/console client is up) —
+// gates the QAM panel's host-button section.
+export const streamRunning = callable<[], { running: boolean }>("stream_running");
+// Press a HOST system button on the running stream: "guide" | "qam". The raw Steam/QAM
+// presses stay on the Deck by default (the client's Controllers settings), so this — and
+// holding Select — is how the host's own menus are reached.
+export const hostAction = callable<[action: string], { ok: boolean; error?: string }>(
+  "host_action",
+);
 export const checkUpdate = callable<[force: boolean], UpdateInfo>("check_update");
 // Update the client by whichever route its install supports: `flatpak update --user` for the
 // flatpak, `punktfunk-client --apply-update` (the packaged root helper) for a one-tap-capable

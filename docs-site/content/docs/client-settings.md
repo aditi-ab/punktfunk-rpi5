@@ -194,6 +194,21 @@ which forwards *every* connected controller, each as its own player, on Linux, W
 console home. Pinning one restricts the session to that controller alone — single-player. The Android
 app has no such picker.
 
+**Steam / guide button** (*Guide button* on Apple and Android) — *default: Automatic*, on every
+client. Where the guide (Xbox/PS/Steam) and quick-access presses go while streaming: **Send to
+host** forwards them raw, **This device** keeps them local. Automatic forwards everywhere except
+Gaming Mode, where SteamOS opens its own menus for those buttons no matter what — forwarding raw
+there opens *both* menus at once, the local one covering the stream. The full story, including how
+to reach the host's menus when the raw press stays local, is on the
+[Input page](/docs/input#the-guide-button-xbox--ps--steam-and-quick-access).
+
+**Hold Select for guide** — *default: Automatic*, on every client. The gesture that presses the
+host's guide button from any controller: hold Select (Back/View) on its own for about a third of a
+second, and keep holding for the host's long-press (a Gaming-Mode host's Quick Access Menu, on a
+regular pad). Automatic arms it only where the raw guide press can't reach the host cleanly —
+Gaming Mode, iPhone/iPad, Apple TV — because the gesture has a cost: a Select *tap* arrives a beat
+late, and a game that expects a *held* Select would trigger it. Set **On** or **Off** to overrule.
+
 **Capture system shortcuts** — *default: on.* Offered by the Linux and Windows apps and the console
 home; Windows spells the row out as *Capture system shortcuts (Alt+Tab, Win, …)*. On a Deck it
 matters only for a keyboard you attached yourself, for the reason the paragraph below gives: Gaming

@@ -143,6 +143,15 @@ for about a second and a half, or close the "game" from the Steam overlay. Eithe
 and drops you straight back to Gaming Mode. A quick press of the same four only releases captured
 input, so it is safe to hit by accident.
 
+**The Steam and `…` buttons stay with the Deck while streaming.** SteamOS opens its own menus for
+them no matter what, so forwarding the raw press as well opened *both* menus at once — the Deck's
+covering the stream. To reach the **host's** menus instead: **hold Select** for the host's Steam
+menu ([how it works](/docs/input#the-guide-button-xbox--ps--steam-and-quick-access)), or open the
+Punktfunk panel — while a stream runs it grows a **Host menus** section whose two buttons,
+**Steam menu on host** and **Quick access on host**, press the button on the host and close the
+Deck's own menu so the host's shows through. Want the raw forwarding back? **Open Punktfunk →
+Settings → Steam / guide button** → *Send to host*.
+
 ## Updating
 
 The plugin **checks for updates itself** — no Decky store needed. It covers **both** the plugin *and*

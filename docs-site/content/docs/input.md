@@ -99,6 +99,39 @@ there the client stops opening the controller at all, which is the point of the 
 **Ctrl+Alt+Shift+D** or the client's own UI to leave instead. The Apple and Android apps keep
 watching for the chord either way.
 
+### The guide button (Xbox / PS / Steam) and Quick Access
+
+A controller's **guide button** — the Xbox logo, the PS button, the Deck's **Steam** button — is
+meant to open menus **on the host**: the Steam overlay, or a Gaming-Mode host's Steam menu. Some
+devices want that button for themselves, so every client also carries a gesture that works
+everywhere:
+
+**Hold Select (Back / View) on its own for about a third of a second.** The host sees its guide
+button go down, and it stays down for as long as you hold — so keeping it held reads as a long
+press on the host, which is how SteamOS opens the **Quick Access Menu** for a regular pad. A quick
+tap of Select still reaches the game, delivered when you let go (a beat late). Select pressed as
+part of a combo — including the leave chord above — passes through untouched.
+
+What the raw button does, per client:
+
+- **Linux & Windows desktop, macOS, Android** — the guide press is forwarded to the host. If
+  Steam Big Picture or the Xbox Game Bar is also watching for it *on the device in your hands*,
+  both may react — that's a local setting on that device, not something the stream can suppress.
+- **Steam Deck / Gaming Mode** — the **Steam** and **`…`** buttons stay with the Deck by default:
+  SteamOS always opens its own menus for them, so forwarding the raw press as well opened BOTH
+  menus at once, the Deck's on top of the stream. Reach the host's menus with **hold-Select**, or
+  with the Punktfunk panel's **Host menus** buttons ([Steam Deck page](/docs/steam-deck)). The
+  old behavior is one setting away: **Steam / guide button → Send to host**.
+- **iPhone / iPad** — iOS reserves the Home press for its own Game Overlay, so hold-Select is the
+  reliable route to the host's overlay. On iOS 27 or later you can also hand the button to the
+  app yourself, in the system's per-controller Home-button setting.
+- **Apple TV** — tvOS never delivers the Home press to apps; hold-Select is the only route.
+
+Both halves are [settings](/docs/client-settings#input), per profile like everything else:
+**Steam / guide button** (Automatic / Send to host / This device) and **Hold Select for guide**
+(Automatic / On / Off). Automatic picks the behavior above for each platform — the gesture stays
+off where the raw button already works, so games that use a *held* Select keep it.
+
 ## Mouse modes
 
 There are two, and they are a per-client setting called **Mouse input**:

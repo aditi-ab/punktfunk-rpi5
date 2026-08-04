@@ -38,6 +38,17 @@ public enum DefaultsKey {
     /// host two pads for one pair of hands. Read at connect: `SessionModel` then never starts
     /// `GamepadCapture`, so no slot opens, no arrival is sent and no virtual pad is built.
     public static let gamepadForwarding = "punktfunk.gamepadForwarding"
+    /// Where a controller's SYSTEM buttons (guide + the share/QAM misc) land while streaming:
+    /// `"auto"` | `"forward"` | `"local"` — the cross-client `system_buttons` key. Auto
+    /// forwards on every Apple platform: the local Game Overlay is the OS's business (and on
+    /// iOS 27+ the user can hand the Home button to the app in Settings), so suppressing our
+    /// send would gain nothing.
+    public static let systemButtons = "punktfunk.systemButtons"
+    /// The hold-Select guide gesture: `"auto"` | `"on"` | `"off"` — the cross-client
+    /// `guide_gesture` key. Auto arms it everywhere but macOS: iOS reserves the physical Home
+    /// press for the Game Overlay (uncapturable pre-27) and tvOS never delivers it at all, so
+    /// holding Select is the controller route to the host's guide there.
+    public static let guideGesture = "punktfunk.guideGesture"
     public static let bitrateKbps = "punktfunk.bitrateKbps"
     /// Requested audio channel count: 2 (stereo), 6 (5.1) or 8 (7.1). The host clamps to what it
     /// can capture; the resolved count drives the in-core decode + AVAudioEngine layout.

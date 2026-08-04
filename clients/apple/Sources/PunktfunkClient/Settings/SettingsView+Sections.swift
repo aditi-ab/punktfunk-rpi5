@@ -681,6 +681,29 @@ extension SettingsView {
                 }
                 .disabled(!effective.gamepadForwarding)
             }
+            described("Where the guide (Xbox/PS) and share presses go while streaming. "
+                + "Automatic sends them to the host whenever this device delivers them "
+                + "— the hold-Select gesture below reaches the host regardless.",
+                field: "system_buttons") {
+                Picker("Guide button", selection: scoped(SettingsFields.systemButtons)) {
+                    Text("Automatic").tag("auto")
+                    Text("Send to host").tag("forward")
+                    Text("This device").tag("local")
+                }
+                .disabled(!effective.gamepadForwarding)
+            }
+            described("Hold Select on its own to press the host's guide button — keep "
+                + "holding for a Gaming-Mode host's quick-access menu. A Select tap still "
+                + "goes through, slightly delayed. Automatic arms it wherever the real "
+                + "button can't reach the host (this device reserves it).",
+                field: "guide_gesture") {
+                Picker("Hold Select for guide", selection: scoped(SettingsFields.guideGesture)) {
+                    Text("Automatic").tag("auto")
+                    Text("On").tag("on")
+                    Text("Off").tag("off")
+                }
+                .disabled(!effective.gamepadForwarding)
+            }
             #if os(iOS)
             // iPhone only in practice: hidden where the device itself can't play haptics (iPad).
             if !inProfileScope, CHHapticEngine.capabilitiesForHardware().supportsHaptics {

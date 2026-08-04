@@ -647,6 +647,19 @@ async def _native_update_state() -> dict:
     return {"error": "client-outdated"} if outdated else {}
 
 
+def _ctl_sockets() -> list[Path]:
+    """Candidate paths of the streaming client's control socket (guide/QAM injection):
+    the flatpak app runtime dir first (the one runtime path the sandbox and this backend
+    see identically), then the plain runtime dir (native installs). Mirrors the session
+    binary's ``ctl_socket::path``."""
+    uid = os.environ.get("PF_UID") or "1000"
+    run = Path(f"/run/user/{uid}")
+    return [
+        run / "app" / APP_ID / "punktfunk-session-ctl.sock",
+        run / "punktfunk-session-ctl.sock",
+    ]
+
+
 class Plugin:
     # ---- Thin shells over the headless CLI -------------------------------------------------
     #
@@ -841,6 +854,46 @@ class Plugin:
             decky.logger.exception("kill_stream (%s) failed", argv[0])
             return {"ok": False}
         return {"ok": True}
+
+    async def stream_running(self) -> dict:
+        """Whether the streaming client's control socket exists — i.e. the client is up.
+
+        The socket appears at the client's first stream and lives for the process, so
+        between console-mode streams it lingers; that only leaves the panel's host
+        buttons harmlessly visible.
+        """
+        return {"running": any(p.is_socket() for p in _ctl_sockets())}
+
+    async def host_action(self, action: str) -> dict:
+        """Press a HOST system button on the running stream: ``guide`` (the Steam/Xbox/PS
+        menu button) or ``qam`` (the quick-access ``…``).
+
+        Talks to the session binary's control socket (one text verb per connection,
+        ``ok``/``err`` back) — the flatpak app runtime dir first (the sandboxed client;
+        that dir is the one runtime path host and sandbox see identically), then the
+        plain runtime dir (native installs). No socket = no running stream.
+        """
+        if action not in ("guide", "qam"):
+            return {"ok": False, "error": f"unknown action {action!r}"}
+        for sock in _ctl_sockets():
+            if not sock.is_socket():
+                continue
+            try:
+                reader, writer = await asyncio.wait_for(
+                    asyncio.open_unix_connection(str(sock)), timeout=2.0
+                )
+            except Exception:  # noqa: BLE001 — a stale socket file; try the next path
+                continue
+            try:
+                writer.write(f"{action}\n".encode())
+                await writer.drain()
+                reply = await asyncio.wait_for(reader.readline(), timeout=2.0)
+                return {"ok": reply.strip() == b"ok"}
+            except Exception as e:  # noqa: BLE001
+                return {"ok": False, "error": str(e)}
+            finally:
+                writer.close()
+        return {"ok": False, "error": "no-stream"}
 
     async def _update_native_client(self) -> dict:
         """The non-flatpak leg of :meth:`update_client` — drive the client's own
