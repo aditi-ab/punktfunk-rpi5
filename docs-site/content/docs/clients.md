@@ -100,11 +100,10 @@ capture state, and the switch that turns this off is *DualSense / DualShock pass
 Settings. Over **Bluetooth** the pad still works as an ordinary gamepad, but adaptive triggers and
 the lightbar need the USB connection.
 
-The app is on Google Play as a **test track** (closed testing for stable, internal testing for
-canary) — request a tester invite on our [**Discord**](https://discord.gg/kaPNvzMuGU) and we'll add
-you, or sideload the public APK instead (see
-[Install a Client](/docs/install-client#android)). Then open the app, pick your host,
-[pair](/docs/pairing) once, and stream.
+The app is on **[Google Play](https://play.google.com/store/apps/details?id=io.unom.punktfunk)** as a
+public listing — no invite — or you can sideload the public APK instead (see
+[Install a Client](/docs/install-client#android)); canary builds ride a separate, invite-only Play
+Internal testing track. Then open the app, pick your host, [pair](/docs/pairing) once, and stream.
 
 ## Windows desktop client
 

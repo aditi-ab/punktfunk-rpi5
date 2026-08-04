@@ -35,7 +35,7 @@ track per machine; switching is a one-line change.
 | **Windows client** (MSIX) | `…/generic/punktfunk-client-windows/canary/punktfunk-client-windows_x64.msix` | `…/latest/…` + the release page |
 | **Windows host** (installer) | `…/generic/punktfunk-host-windows/canary/punktfunk-host-setup.exe` | `…/latest/…` + the release page |
 | **Windows host** (winget) | — *(stable only)* | `winget install unom.PunktfunkHost` / `winget upgrade unom.PunktfunkHost`, after `winget source add -n punktfunk https://winget.punktfunk.unom.io -t Microsoft.Rest` |
-| **Android** | Play **Internal testing** + sideload `…/generic/punktfunk-android/canary/punktfunk-android.apk` | Play **closed (alpha)** track + the release page |
+| **Android** | Play **Internal testing** (invite-only) + sideload `…/generic/punktfunk-android/canary/punktfunk-android.apk` | **[Google Play](https://play.google.com/store/apps/details?id=io.unom.punktfunk)** (production) + the release page |
 | **Apple** (mac/iOS/tvOS) | **TestFlight** | TestFlight + a notarized `.dmg` on the release page |
 
 The apt distribution and the rpm group are just path segments in the URL — switching tracks is a
@@ -120,14 +120,16 @@ major bump, or a patch), just tag it — the canary base re-derives from whateve
 Pre-release tags work too: `v0.2.0-rc1` builds a real release (the `-rc1` suffix is dropped where a
 strictly-numeric version is required — MSIX, the App Store marketing version).
 
-### App-store promotion (manual, after the tag)
+### App-store publication (after the tag)
 
-CI uploads stable to **testing** tracks only — it never auto-publishes to the public stores:
-
-- **Apple** — the build lands in **TestFlight**. Promote to the App Store from App Store Connect
-  (submit for review). The notarized `.dmg` on the release page is the direct-download path.
-- **Android** — the build lands in Play's **closed (alpha)** track. Promote alpha → production in
-  the Play Console when ready.
+- **Android** — a `vX.Y.Z` tag publishes straight to Google Play **production** at 100%, with no
+  further click. Canary `main` builds go to Play **Internal testing**. To ramp a release gradually
+  instead of shipping it to everyone at once — or to halt or roll one back — use the Play Console,
+  or `android-promote.yml`, which moves a versionCode already on Play between tracks without
+  rebuilding.
+- **Apple** — still manual. The build lands in **TestFlight**; promote it to the App Store from App
+  Store Connect (submit for review). The notarized `.dmg` on the release page is the
+  direct-download path.
 
 ## Why two tracks (the version-shadow trap)
 
