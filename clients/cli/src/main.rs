@@ -363,7 +363,11 @@ from the config directory for a true factory reset."
             .unwrap_or(DISCOVER_DEFAULT_SECS)
             .min(DISCOVER_MAX_SECS);
         let found = pf_client_core::discovery::discover_for(Duration::from_secs_f64(secs));
-        let known = KnownHosts::load();
+        // `read`, not `load`: this verb only LOOKS at the records to annotate what it found, and
+        // never hands their ids back. `load` would mint ids for a pre-mint store and save them —
+        // a write from a read-only verb, and one that races the `hosts list` a caller is very
+        // likely running at the same moment (the Decky panel issues both together).
+        let known = KnownHosts::read();
         let rows: Vec<(
             &pf_client_core::discovery::DiscoveredHost,
             Option<&KnownHost>,
