@@ -20,7 +20,14 @@ final class ProfileStore: ObservableObject {
     static let shared = ProfileStore()
 
     @Published private(set) var catalog: ProfileCatalog {
-        didSet { catalog.save() }
+        didSet {
+            #if DEBUG
+            // Shot mode seeds this SINGLETON with mock profiles to populate the host cards.
+            // Saving would write them into the tester's real catalog — see HostStore.persist().
+            if ScreenshotMode.isActive { return }
+            #endif
+            catalog.save()
+        }
     }
 
     var profiles: [StreamProfile] { catalog.profiles }
@@ -32,6 +39,14 @@ final class ProfileStore: ObservableObject {
     func profile(id: String?) -> StreamProfile? {
         id.flatMap { catalog.profile(id: $0) }
     }
+
+    #if DEBUG
+    /// Shot-mode seed: replace the catalog outright so a capture shows a known set of profiles
+    /// rather than the tester's. Safe because `didSet` suppresses the write-back in shot mode.
+    func debugSet(_ profiles: [StreamProfile]) {
+        catalog = ProfileCatalog(profiles: profiles)
+    }
+    #endif
 
     /// This host's default profile, dangling ids dropped — a deleted profile resolves as "Default
     /// settings", never an error (§4.4).
