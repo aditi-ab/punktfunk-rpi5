@@ -7,11 +7,14 @@ use crate::stats::StatsCounters;
 use zerocopy::{FromBytes, IntoBytes};
 
 fn limits() -> ReassemblerLimits {
+    // `min == max` pins the whole stream to 16-byte shards — the strictest geometry, so the
+    // firewall tests below exercise the bounds checks; per-frame-pinning tests build their own
+    // limits with a real range. Derived per-frame block ceiling: 4096/16 = 256 shards → 32.
     ReassemblerLimits {
-        shard_bytes: 16,
+        min_shard_bytes: 16,
+        max_shard_bytes: 16,
         max_data_shards: 8,
         max_total_shards: 12,
-        max_blocks: 4,
         max_frame_bytes: 4096,
     }
 }
@@ -840,7 +843,7 @@ fn streamed_sentinel_firewall_bounds() {
         .unwrap()
         .is_none());
     // Sits on the last block the limits allow (no room for the final block after it).
-    let h = sentinel(|h| h.block_index = 3); // limits().max_blocks == 4
+    let h = sentinel(|h| h.block_index = 31); // derived max_blocks == 32 (see `limits()`)
     assert!(r
         .push(&packet(h), coder.as_ref(), &stats)
         .unwrap()
@@ -1767,5 +1770,410 @@ fn slice_streamed_in_flight_budget_matches_legacy() {
             0,
             "slice={slice}: 12 ordinary AUs in flight must fit the in-flight budget"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-frame shard geometry (mid-session shard-payload renegotiation — W0.1,
+// design/shard-payload-reneg.md). The 0.23.0 lesson applies in full: geometry
+// changes breed sizing bugs, so the slice/sentinel suite re-runs at every
+// production shard size and mixed-geometry streams are tortured under reorder.
+// ---------------------------------------------------------------------------
+
+/// The shard sizes the renegotiation actually moves between: the clamp floor (512), a
+/// WARP/Tailscale-shaped 1280-MTU path (1216), the 1500-MTU default (1408), and 9000-MTU
+/// jumbo (8908 — sealed 8972, inside [`MAX_DATAGRAM_BYTES`]).
+const PRODUCTION_SHARDS: [usize; 4] = [512, 1216, 1408, 8908];
+
+/// [`prod_slice_config`] at an arbitrary shard payload.
+fn geo_config(shard_payload: usize) -> Config {
+    let mut c = prod_slice_config();
+    c.shard_payload = shard_payload;
+    c.validate().expect("geometry config must be valid");
+    c
+}
+
+/// Packetize one legacy AU at the packetizer's CURRENT shard payload with an explicit
+/// frame index, returning wire packets + source bytes.
+fn legacy_packets_with(
+    pk: &mut Packetizer,
+    frame_index: u32,
+    pts_ns: u64,
+    len: usize,
+    coder: &dyn crate::fec::ErasureCoder,
+) -> (Vec<Vec<u8>>, Vec<u8>) {
+    let src: Vec<u8> = (0..len)
+        .map(|i| (i * 131 + frame_index as usize * 7 + 3) as u8)
+        .collect();
+    let mut pkts: Vec<Vec<u8>> = Vec::new();
+    pk.packetize_each(&src, pts_ns, 0, Some(frame_index), coder, |h, b| {
+        let mut p = Vec::with_capacity(HEADER_LEN + b.len());
+        p.extend_from_slice(h.as_bytes());
+        p.extend_from_slice(b);
+        pkts.push(p);
+        Ok(())
+    })
+    .unwrap();
+    (pkts, src)
+}
+
+/// The slice-wire regression suite re-run at every production shard size (the design's
+/// non-negotiable verification): the exact-multiple sweep (the 0.23.0 filler-shard bug
+/// shape), lossy + reversed slice roundtrips, the legacy-streamed sentinel path, and the
+/// in-flight budget — each asserting DELIVERED byte-identical frames, never just an
+/// absence of errors.
+#[test]
+fn slice_wire_suite_at_production_shard_sizes() {
+    let coder = coder_for(FecScheme::Gf16);
+    for &shard in &PRODUCTION_SHARDS {
+        let cfg = geo_config(shard);
+
+        // Exact-shard-multiple AUs + the off-by-one sweep around one of them.
+        for shards in [16usize, 30, 64] {
+            for extra in 0..3usize {
+                let n = shards * shard + extra;
+                let (pkts, src) = streamed_packets_with(&cfg, 1, 1000, true, &[n]);
+                let mut r = Reassembler::new(ReassemblerLimits::from_config(&cfg));
+                let stats = StatsCounters::default();
+                let f = push_all(&mut r, coder.as_ref(), &stats, &pkts)
+                    .unwrap_or_else(|| panic!("shard {shard}: {n}-byte slice AU must complete"));
+                assert_eq!(
+                    f.data, src,
+                    "shard {shard}: {n}-byte AU must be byte-identical"
+                );
+                assert_eq!(
+                    r.in_flight(),
+                    0,
+                    "shard {shard}: budget must return to zero"
+                );
+            }
+        }
+
+        // A multi-slice AU under loss (one data shard of the first flushed block — within
+        // its ≥ 20% parity) in both delivery orders. Reversed is the critical order: the
+        // final block's totals arrive first and every sentinel validates against the pin.
+        for reverse in [false, true] {
+            let chunks = [20 * shard + 13, 7 * shard + 1, 17 * shard];
+            let (pkts, src) = streamed_packets_with(&cfg, 2, 2000, true, &chunks);
+            let killed = pkts
+                .iter()
+                .position(|p| {
+                    let h = PacketHeader::read_from_bytes(&p[..HEADER_LEN]).unwrap();
+                    h.shard_index < h.data_shards && h.recovery_shards >= 1
+                })
+                .expect("suite frame must have a recoverable data shard");
+            let mut delivery: Vec<Vec<u8>> = pkts
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != killed)
+                .map(|(_, p)| p.clone())
+                .collect();
+            if reverse {
+                delivery.reverse();
+            }
+            let mut r = Reassembler::new(ReassemblerLimits::from_config(&cfg));
+            let stats = StatsCounters::default();
+            let f = push_all(&mut r, coder.as_ref(), &stats, &delivery).unwrap_or_else(|| {
+                panic!("shard {shard} reverse={reverse}: lossy slice AU must complete")
+            });
+            assert_eq!(f.data, src, "shard {shard} reverse={reverse}");
+            assert_eq!(r.in_flight(), 0);
+        }
+
+        // Legacy-streamed (uniform full-K sentinel) path: one AU spanning a sentinel block
+        // (K = 200) plus a final block.
+        {
+            let (pkts, src) = streamed_packets_with(&cfg, 3, 3000, false, &[230 * shard]);
+            let mut r = Reassembler::new(ReassemblerLimits::from_config(&cfg));
+            let stats = StatsCounters::default();
+            let f = push_all(&mut r, coder.as_ref(), &stats, &pkts)
+                .unwrap_or_else(|| panic!("shard {shard}: legacy-streamed AU must complete"));
+            assert_eq!(f.data, src);
+            assert_eq!(r.in_flight(), 0);
+        }
+
+        // The budget regression at this size: 12 ordinary AUs opened concurrently, no drops.
+        for slice in [false, true] {
+            let mut r = Reassembler::new(ReassemblerLimits::from_config(&cfg));
+            let stats = StatsCounters::default();
+            for i in 0..12u32 {
+                let (pkts, _) =
+                    streamed_packets_with(&cfg, i, 1_000_000 * i as u64, slice, &[40_000]);
+                r.push(&pkts[0], coder.as_ref(), &stats).unwrap();
+            }
+            assert_eq!(
+                stats
+                    .packets_dropped
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                0,
+                "shard {shard} slice={slice}: 12 AUs in flight must fit the budget"
+            );
+        }
+    }
+}
+
+/// One packetizer, one reassembler, one continuous stream — the shard payload swapped
+/// live between AUs ([`Packetizer::set_shard_payload`], the Phase 1 host seam): every
+/// frame across shrink → grow-to-jumbo → shrink-again delivers byte-identically under its
+/// own per-frame pin, and the budget returns to zero.
+#[test]
+fn mid_stream_shard_swap_delivers_every_frame() {
+    let cfg = geo_config(1408);
+    let coder = coder_for(FecScheme::Gf16);
+    let mut pk = Packetizer::new(&cfg);
+    let mut r = Reassembler::new(ReassemblerLimits::from_config(&cfg));
+    let stats = StatsCounters::default();
+
+    // (shard size to swap to, AU length) — swaps happen between AUs, as Phase 1 will.
+    let schedule = [
+        (1408usize, 3 * 1408 + 100),
+        (1408, 9 * 1408),
+        (512, 5 * 512 + 17), // shrink (the VPN heal)
+        (512, 512),
+        (8908, 12 * 8908 + 1), // grow (jumbo)
+        (1216, 4 * 1216 + 9),  // revert (a mis-proven jumbo hop self-corrects)
+    ];
+    for (i, &(shard, len)) in schedule.iter().enumerate() {
+        pk.set_shard_payload(shard);
+        let pts = 1_000_000 * (i as u64 + 1);
+        let (pkts, src) = legacy_packets_with(&mut pk, i as u32, pts, len, coder.as_ref());
+        for p in &pkts {
+            let h = PacketHeader::read_from_bytes(&p[..HEADER_LEN]).unwrap();
+            assert_eq!(
+                h.shard_bytes as usize, shard,
+                "sender must stamp the live size"
+            );
+        }
+        let f = push_all(&mut r, coder.as_ref(), &stats, &pkts)
+            .unwrap_or_else(|| panic!("frame {i} at shard {shard} must complete"));
+        assert_eq!(
+            f.data, src,
+            "frame {i} at shard {shard} must be byte-identical"
+        );
+        assert!(f.complete);
+    }
+    assert_eq!(
+        r.in_flight(),
+        0,
+        "budget must be exact across geometry swaps"
+    );
+    assert_eq!(stats.snapshot().frames_dropped, 0);
+}
+
+/// The reorder race the design kills structurally: an old-geometry frame still in flight
+/// when new-geometry frames start arriving completes under its OWN pin — its straggler
+/// lands in its own buffer, not the new geometry's.
+#[test]
+fn old_geometry_frame_completes_after_new_geometry_arrived() {
+    let cfg = geo_config(1408);
+    let coder = coder_for(FecScheme::Gf16);
+    let mut pk = Packetizer::new(&cfg);
+    let mut r = Reassembler::new(ReassemblerLimits::from_config(&cfg));
+    let stats = StatsCounters::default();
+
+    // Frame 0 at 1408: 7 data shards + 2 parity (20% FEC), data-first wire order. Withhold
+    // THREE data shards — more than parity can bridge — so the frame genuinely stays
+    // incomplete until a straggler returns (fewer, and FEC would complete it early).
+    let (pkts0, src0) = legacy_packets_with(&mut pk, 0, 1_000_000, 6 * 1408 + 50, coder.as_ref());
+    assert_eq!(
+        pkts0.len(),
+        9,
+        "expected geometry changed — update the split"
+    );
+    let head: Vec<Vec<u8>> = pkts0[..4].iter().chain(&pkts0[7..]).cloned().collect();
+    let straggler = &pkts0[4];
+    assert!(
+        push_all(&mut r, coder.as_ref(), &stats, &head).is_none(),
+        "frame 0 must still be incomplete"
+    );
+
+    // The stream re-keys to 512: frames 1..=2 arrive whole and deliver.
+    pk.set_shard_payload(512);
+    for i in 1..=2u32 {
+        let pts = 1_000_000 + 1_000_000 * i as u64;
+        let (pkts, src) = legacy_packets_with(&mut pk, i, pts, 3 * 512 + 7, coder.as_ref());
+        let f = push_all(&mut r, coder.as_ref(), &stats, &pkts).expect("new-geometry frame");
+        assert_eq!(f.data, src);
+    }
+
+    // Frame 0's old-geometry straggler arrives last — the frame completes byte-identically.
+    let f = r
+        .push(straggler, coder.as_ref(), &stats)
+        .unwrap()
+        .expect("old-geometry frame must complete under its own pin");
+    assert_eq!(f.data, src0);
+    assert_eq!(f.frame_index, 0);
+    assert_eq!(r.in_flight(), 0);
+    assert_eq!(stats.snapshot().frames_dropped, 0);
+}
+
+/// The anti-splice pin: a packet claiming a DIFFERENT (but in-bounds) shard size for an
+/// already-pinned frame is dropped — and the frame still completes from its real packets.
+#[test]
+fn cross_geometry_packet_for_a_pinned_frame_is_dropped() {
+    let cfg = geo_config(1408);
+    let coder = coder_for(FecScheme::Gf16);
+    let mut r = Reassembler::new(ReassemblerLimits::from_config(&cfg));
+    let stats = StatsCounters::default();
+
+    let mut pk_a = Packetizer::new(&geo_config(1408));
+    let mut pk_b = Packetizer::new(&geo_config(1216));
+    let (pkts, src) = legacy_packets_with(&mut pk_a, 0, 1_000_000, 5 * 1408 + 9, coder.as_ref());
+    // The impostor: the same frame index packetized at 1216 — self-consistent (it passes
+    // the firewall standalone), wrong for THIS frame's pin.
+    let (impostor, _) = legacy_packets_with(&mut pk_b, 0, 1_000_000, 5 * 1216, coder.as_ref());
+
+    assert!(r.push(&pkts[0], coder.as_ref(), &stats).unwrap().is_none());
+    let before = stats.snapshot().packets_dropped;
+    assert!(r
+        .push(&impostor[1], coder.as_ref(), &stats)
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        stats.snapshot().packets_dropped,
+        before + 1,
+        "cross-geometry packet must be dropped by the frame pin"
+    );
+    let f = push_all(&mut r, coder.as_ref(), &stats, &pkts[1..])
+        .expect("the pinned frame must still complete from its real packets");
+    assert_eq!(f.data, src, "no impostor bytes may reach the frame");
+}
+
+/// The firewall bounds on a frame's pinned size: below the floor, above the receive
+/// ceiling, or odd ⇒ dropped before any allocation; the exact floor and ceiling are
+/// accepted AND deliver (proving the rejections aren't vacuous).
+#[test]
+fn shard_size_firewall_bounds() {
+    let cfg = geo_config(1408);
+    let lim = ReassemblerLimits::from_config(&cfg);
+    assert_eq!(lim.min_shard_bytes, crate::config::MIN_SHARD_PAYLOAD);
+    assert_eq!(lim.max_shard_bytes, crate::config::max_shard_payload());
+    let coder = coder_for(FecScheme::Gf16);
+    let mut r = Reassembler::new(lim);
+    let stats = StatsCounters::default();
+
+    let single = |shard: usize, frame_index: u32| {
+        let mut h = base_header();
+        h.frame_index = frame_index;
+        h.shard_bytes = shard as u16;
+        h.frame_bytes = shard as u32;
+        h
+    };
+    // Below the floor (even), above the ceiling (even), odd within bounds: all dropped.
+    for (i, shard) in [510usize, 9154, 1409].into_iter().enumerate() {
+        let before = stats.snapshot().packets_dropped;
+        assert!(r
+            .push(&packet(single(shard, i as u32)), coder.as_ref(), &stats)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            stats.snapshot().packets_dropped,
+            before + 1,
+            "shard {shard} must be firewalled"
+        );
+    }
+    // The exact bounds deliver whole single-shard frames.
+    for (i, shard) in [
+        crate::config::MIN_SHARD_PAYLOAD,
+        crate::config::max_shard_payload(),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let f = r
+            .push(
+                &packet(single(shard, 10 + i as u32)),
+                coder.as_ref(),
+                &stats,
+            )
+            .unwrap()
+            .unwrap_or_else(|| panic!("boundary shard {shard} must deliver"));
+        assert_eq!(f.data.len(), shard);
+    }
+}
+
+mod geometry_proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// One generated frame: shard size, slice-vs-legacy wire, size factor, and whether to
+    /// kill one recoverable data shard.
+    type GenFrame = (usize, bool, usize, bool);
+
+    fn frame_strategy() -> impl Strategy<Value = GenFrame> {
+        (
+            proptest::sample::select(&PRODUCTION_SHARDS[..]),
+            any::<bool>(),
+            1usize..30,
+            any::<bool>(),
+        )
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(48))]
+
+        /// Mixed-geometry reorder torture: frames of DIFFERENT shard sizes and wire shapes
+        /// interleaved into one shuffled delivery, with per-frame recoverable loss — every
+        /// frame must deliver byte-identically and the in-flight budget must return to
+        /// exactly zero (the 0.23.0 budget-drift shape, now across geometries).
+        #[test]
+        fn mixed_geometry_reorder_torture(
+            frames in proptest::collection::vec(frame_strategy(), 2..6),
+            seed in any::<u64>(),
+        ) {
+            let coder = coder_for(FecScheme::Gf16);
+            let mut r = Reassembler::new(ReassemblerLimits::from_config(&geo_config(1408)));
+            let stats = StatsCounters::default();
+
+            let mut all: Vec<(u64, u32, Vec<u8>)> = Vec::new(); // (shuffle key, frame, pkt)
+            let mut sources: Vec<(u32, Vec<u8>)> = Vec::new();
+            for (i, &(shard, slice, factor, kill)) in frames.iter().enumerate() {
+                let cfg = geo_config(shard);
+                let pts = 1_000_000 * (i as u64 + 1);
+                let len = factor * shard + (factor % shard.min(7));
+                let (mut pkts, src) = if slice {
+                    streamed_packets_with(&cfg, i as u32, pts, true, &[len.max(1)])
+                } else {
+                    let mut pk = Packetizer::new(&cfg);
+                    legacy_packets_with(&mut pk, i as u32, pts, len.max(1), coder.as_ref())
+                };
+                if kill {
+                    if let Some(k) = pkts.iter().position(|p| {
+                        let h = PacketHeader::read_from_bytes(&p[..HEADER_LEN]).unwrap();
+                        h.shard_index < h.data_shards && h.recovery_shards >= 1
+                    }) {
+                        pkts.remove(k);
+                    }
+                }
+                for (j, p) in pkts.into_iter().enumerate() {
+                    // Deterministic pseudo-shuffle key: interleaves frames and reorders
+                    // within a frame, differently per proptest case.
+                    let key = (seed | 1)
+                        .wrapping_mul(j as u64 + 1)
+                        .wrapping_add((i as u64) << 17)
+                        .rotate_left((j % 61) as u32);
+                    all.push((key, i as u32, p));
+                }
+                sources.push((i as u32, src));
+            }
+            all.sort_by_key(|(k, _, _)| *k);
+
+            let mut delivered: std::collections::HashMap<u32, Vec<u8>> =
+                std::collections::HashMap::new();
+            for (_, _, p) in &all {
+                if let Some(f) = r.push(p, coder.as_ref(), &stats).unwrap() {
+                    prop_assert!(f.complete);
+                    prop_assert!(delivered.insert(f.frame_index, f.data).is_none(),
+                        "a frame must deliver exactly once");
+                }
+            }
+            for (i, src) in &sources {
+                let got = delivered.get(i);
+                prop_assert!(got.is_some(), "frame {i} must be DELIVERED, not merely error-free");
+                prop_assert_eq!(got.unwrap(), src, "frame {} must be byte-identical", i);
+            }
+            prop_assert_eq!(r.in_flight(), 0, "budget must be exact after all frames terminate");
+            prop_assert_eq!(stats.snapshot().frames_dropped, 0u64);
+        }
     }
 }

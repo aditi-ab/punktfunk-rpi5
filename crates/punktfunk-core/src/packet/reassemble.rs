@@ -76,6 +76,12 @@ struct BlockState {
 }
 
 struct FrameBuf {
+    /// The frame's PINNED shard payload — set by its first-arriving packet (bounds-checked by
+    /// the firewall), matched by every later packet of the frame. Geometry is per-frame so a
+    /// mid-session `shard_payload` change (design/shard-payload-reneg.md) is safe on an
+    /// unordered wire: frames in flight complete under their own pin while new frames arrive
+    /// under the new one, and no cross-geometry splice can land in one buffer.
+    shard_bytes: usize,
     /// Exact AU size. 0 = unknown: the frame was opened by a streamed-AU SENTINEL packet
     /// ([`crate::quic::VIDEO_CAP_STREAMED_AU`]) and the final block's real totals haven't
     /// arrived yet — the frame can't complete before they do (and retro-validate).
@@ -105,16 +111,28 @@ struct FrameBuf {
 /// Per-session bounds the reassembler enforces on every packet header *before*
 /// allocating, so a hostile or corrupt header cannot drive unbounded memory use. All
 /// derived from the negotiated [`Config`].
+///
+/// Shard geometry is PER-FRAME, not per-session (mid-session shard-payload renegotiation,
+/// design/shard-payload-reneg.md W0.1): a frame's first-arriving packet pins the frame's
+/// `shard_bytes` within `[min_shard_bytes, max_shard_bytes]`, later packets must match the
+/// pin, and the per-frame block ceiling derives from the pinned size (a shrunk shard needs
+/// more blocks for the same bytes). The reorder race between an ordered control-stream
+/// geometry change and the unordered video datagrams is thereby killed structurally — every
+/// frame is wholly one geometry, whichever order its packets and the change arrive in.
 #[derive(Clone, Copy, Debug)]
 pub struct ReassemblerLimits {
-    /// Expected shard payload length; every shard in the stream must match exactly.
-    pub shard_bytes: usize,
+    /// Floor for a frame's pinned shard payload — [`crate::config::MIN_SHARD_PAYLOAD`] in
+    /// production (or the negotiated value when a session legitimately starts below it).
+    pub min_shard_bytes: usize,
+    /// Ceiling for a frame's pinned shard payload — what this receive path accepts and what
+    /// the client advertises in `Hello::max_shard_payload`
+    /// ([`crate::config::max_shard_payload`]): the transport recv buffers are sized for a
+    /// sealed datagram of exactly this shard size.
+    pub max_shard_bytes: usize,
     /// Max data shards per block (the negotiated `max_data_per_block`).
     pub max_data_shards: usize,
     /// Max total shards per block (data + recovery), capped by the FEC scheme ceiling.
     pub max_total_shards: usize,
-    /// Max FEC blocks per frame.
-    pub max_blocks: usize,
     /// Max accepted access-unit size.
     pub max_frame_bytes: usize,
 }
@@ -135,12 +153,13 @@ impl ReassemblerLimits {
         // snapshot of it.
         let max_total =
             (max_data + (max_data * 90).div_ceil(100)).min(c.fec.scheme.max_total_shards());
-        let total_data = c.max_frame_bytes.div_ceil(c.shard_payload.max(1)).max(1);
         ReassemblerLimits {
-            shard_bytes: c.shard_payload,
+            // `.min(c.shard_payload)`: never reject the session's own negotiated value — a
+            // hand-configured session below the production floor still reassembles itself.
+            min_shard_bytes: crate::config::MIN_SHARD_PAYLOAD.min(c.shard_payload),
+            max_shard_bytes: crate::config::max_shard_payload(),
             max_data_shards: max_data,
             max_total_shards: max_total,
-            max_blocks: total_data.div_ceil(max_data).max(1),
             max_frame_bytes: c.max_frame_bytes,
         }
     }
@@ -179,6 +198,9 @@ const IN_FLIGHT_BUF_FACTOR: usize = 4;
 
 /// Recovery-shard buffer pool ceiling (shard-sized buffers): enough for several max-recovery
 /// blocks in flight, small enough (~720 KB at a 1408-byte shard) to keep after a loss burst.
+/// Entries size themselves to the largest shard they ever held, so a jumbo session (opt-in,
+/// desktop-LAN — shards up to [`ReassemblerLimits::max_shard_bytes`]) retains proportionally
+/// more; it also needs ~6× fewer buffers per block, so the pool rarely fills there.
 const RECOVERY_POOL_MAX: usize = 512;
 
 /// Buffers incoming shards, recovers lost ones via FEC, and emits whole access units.
@@ -295,11 +317,16 @@ impl Reassembler {
         // Bound every attacker-controllable header field against the negotiated limits
         // BEFORE allocating anything keyed on it — this is the firewall against a tiny
         // datagram triggering a huge `vec![None; total]` / `Vec::with_capacity`.
+        // `shard_bytes` is bounds-checked (not equality-checked) because geometry is
+        // per-frame — the frame-pin check below is what rejects a size CHANGE mid-frame;
+        // the even requirement mirrors `Config::validate` (FEC requires even shards).
         let drop = |stats: &StatsCounters| {
             StatsCounters::add(&stats.packets_dropped, 1);
         };
         if hdr.magic != PUNKTFUNK_MAGIC
-            || shard_bytes != lim.shard_bytes
+            || shard_bytes < lim.min_shard_bytes
+            || shard_bytes > lim.max_shard_bytes
+            || shard_bytes % 2 != 0
             || pkt.len() < HEADER_LEN + shard_bytes
             || data_shards == 0
             || data_shards > lim.max_data_shards
@@ -330,6 +357,11 @@ impl Reassembler {
         // later pin — the maximum the negotiated limits allow (the design's "allocate at
         // max_frame_bytes"; the existing in-flight budget bounds the amplification).
         let total_data_max = lim.max_frame_bytes.div_ceil(shard_bytes).max(1);
+        // The per-frame FEC-block ceiling under THIS packet's shard size (geometry is
+        // per-frame: a shrunk shard needs more blocks for the same bytes, so a session-level
+        // cap from the negotiated size would reject legitimate post-shrink frames). Mirrors
+        // the sender's `Packetizer::new` for whatever size it currently packetizes at.
+        let max_blocks = total_data_max.div_ceil(lim.max_data_shards).max(1);
         // The slice pipeline's per-frame block ceiling: every non-final slice block carries at
         // least `min(MIN_STREAM_BLOCK_SHARDS, max_data_per_block)` data shards (the sender's
         // flush floor, clamped by the block size), so a max-size frame bounds the block count
@@ -350,9 +382,7 @@ impl Reassembler {
                 return Ok(None);
             }
         } else if sentinel {
-            if frame_bytes != 0
-                || data_shards != lim.max_data_shards
-                || block_idx + 1 >= lim.max_blocks
+            if frame_bytes != 0 || data_shards != lim.max_data_shards || block_idx + 1 >= max_blocks
             {
                 drop(stats);
                 return Ok(None);
@@ -361,7 +391,7 @@ impl Reassembler {
             let block_cap = if slice_stream {
                 slice_block_cap
             } else {
-                lim.max_blocks
+                max_blocks
             };
             if block_count > block_cap || block_idx >= block_count {
                 drop(stats);
@@ -513,6 +543,7 @@ impl Reassembler {
                 }
                 *in_flight_bytes += buf_len;
                 e.insert(FrameBuf {
+                    shard_bytes,
                     // A slice-stream sentinel's `frame_bytes` is its block's BASE offset, not a
                     // frame size — the unpinned marker stays 0 until the final block's totals.
                     frame_bytes: if sentinel { 0 } else { frame_bytes },
@@ -527,6 +558,15 @@ impl Reassembler {
                 })
             }
         };
+        // Per-frame geometry pin: the frame's first packet pinned its shard size; a later
+        // packet claiming a different (even in-bounds) size is dropped — otherwise two
+        // geometries would compute different offsets into one buffer (a splice). This is
+        // also what makes a mid-session `shard_payload` change safe against reorder: a
+        // straggler of the old geometry can only ever land in ITS OWN frame's buffer.
+        if frame.shard_bytes != shard_bytes {
+            drop(stats);
+            return Ok(None);
+        }
         // The slice marker must be frame-consistent: a mixed frame would firewall under one
         // placement rule and place under the other. The per-packet checks above and the
         // placement bounds guard below stay memory-safe without this — it's the tighter drop.
@@ -883,6 +923,16 @@ impl Reassembler {
         // jump-to-live, exactly the stale content the flush existed to discard.
         self.pending_partial = None;
     }
+
+    /// Test-only: the current in-flight frame-buffer byte commitment (see
+    /// [`IN_FLIGHT_BUF_FACTOR`]). The mixed-geometry budget tests assert it returns to
+    /// exactly zero once every frame has terminated — the 0.23.0 lesson: geometry changes
+    /// breed sizing bugs, and accounting drift here surfaces in the field as a permanent
+    /// loss storm once the budget wedges.
+    #[cfg(test)]
+    pub(crate) fn in_flight(&self) -> usize {
+        self.in_flight_bytes
+    }
 }
 
 /// The data shards of a terminating frame that only exist because parity restored them
@@ -1024,10 +1074,10 @@ mod reset_tests {
     #[test]
     fn reset_drops_a_parked_partial() {
         let mut r = Reassembler::new(ReassemblerLimits {
-            shard_bytes: 64,
+            min_shard_bytes: 64,
+            max_shard_bytes: 64,
             max_data_shards: 8,
             max_total_shards: 16,
-            max_blocks: 4,
             max_frame_bytes: 4096,
         });
         r.pending_partial = Some(Frame {

@@ -558,6 +558,10 @@ async fn session(args: Args) -> Result<()> {
             } else {
                 0
             },
+            // Like STREAMED_AU above: the shared-core reassembler pins geometry per-frame, so
+            // the probe accepts a mid-session shard change (and jumbo growth) up to the
+            // receive ceiling — and it's exactly the tool to measure both.
+            max_shard_payload: punktfunk_core::config::max_shard_payload() as u16,
         }
         .encode(),
     )

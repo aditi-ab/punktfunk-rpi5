@@ -25,6 +25,10 @@ pub struct Packetizer {
     next_probe_index: u32,
     next_seq: u32,
     shard_payload: usize,
+    /// The negotiated frame-size cap — kept so a live shard-payload swap
+    /// ([`set_shard_payload`](Self::set_shard_payload)) can re-derive the per-frame block
+    /// ceilings from the same formulas construction used.
+    max_frame_bytes: usize,
     fec: crate::config::FecConfig,
     version: u8,
     /// Reusable zero-padded scratch for the frame's final data shard when the frame isn't an
@@ -47,10 +51,12 @@ pub struct Packetizer {
     /// where every packet of the block is dropped wholesale, the frame never completes, and the
     /// resulting loss pushes adaptive FEC *higher*. See the `recovery_for` clamp in `packetize_each`.
     max_total_shards: usize,
-    /// The peer's per-frame block ceiling, mirroring [`ReassemblerLimits::from_config`]'s
-    /// `max_blocks` — the streamed path's bound on how many sentinel blocks it may emit (a
-    /// streamed AU's size isn't known up front, so this is the only pre-emission guard against
-    /// producing a frame the receiver must reject).
+    /// The peer's per-frame block ceiling — the streamed path's bound on how many sentinel
+    /// blocks it may emit (a streamed AU's size isn't known up front, so this is the only
+    /// pre-emission guard against producing a frame the receiver must reject). The receiver
+    /// derives the same ceiling per packet from the packet's own `shard_bytes`
+    /// (`Reassembler::push` — geometry is per-frame), so this stays in step as long as it is
+    /// computed from the shard size this packetizer actually stamps.
     max_blocks: usize,
     /// The streamed path's block-count ceiling in SLICE mode ([`USER_FLAG_SLICE_STREAM`]) —
     /// variable-K blocks, floored at `min(MIN_STREAM_BLOCK_SHARDS, max_data_per_block)` shards.
@@ -105,15 +111,12 @@ impl StreamedAu {
 impl Packetizer {
     pub fn new(config: &Config) -> Self {
         let max_data = config.fec.max_data_per_block as usize;
-        let total_data_max = config
-            .max_frame_bytes
-            .div_ceil(config.shard_payload.max(1))
-            .max(1);
-        Packetizer {
+        let mut p = Packetizer {
             next_frame_index: 0,
             next_probe_index: 0,
             next_seq: 0,
             shard_payload: config.shard_payload,
+            max_frame_bytes: config.max_frame_bytes,
             fec: config.fec,
             version: config.phase as u8,
             tail: Vec::new(),
@@ -121,12 +124,37 @@ impl Packetizer {
             // Mirrors `ReassemblerLimits::from_config` — keep the two in step.
             max_total_shards: (max_data + config.fec.recovery_for(max_data))
                 .min(config.fec.scheme.max_total_shards()),
-            max_blocks: total_data_max.div_ceil(max_data).max(1),
-            // Every non-final SLICE block carries at least `min(MIN_STREAM_BLOCK_SHARDS, K)`
-            // data shards (the flush floor, clamped by the block size), so a max-size frame
-            // bounds the block count. Mirrors the receiver's slice firewall — keep in step.
-            slice_block_cap: total_data_max / MIN_STREAM_BLOCK_SHARDS.min(max_data.max(1)) + 2,
-        }
+            // Derived from the shard size below (single source of truth for the formulas).
+            max_blocks: 0,
+            slice_block_cap: 0,
+        };
+        p.set_shard_payload(config.shard_payload);
+        p
+    }
+
+    /// Live-swap the wire shard payload (mid-session shard renegotiation,
+    /// design/shard-payload-reneg.md Phase 1). Takes effect on the next packetized AU — call
+    /// ONLY between AUs, never with a [`StreamedAu`] in flight: an open streamed AU's
+    /// shard-aligned tiling derives from the size it began with, and re-keying under it would
+    /// corrupt the frame's layout. The per-frame block ceilings follow the new size here; the
+    /// receiver re-derives its side per packet from the header's own `shard_bytes` (geometry
+    /// is per-frame there), so the two stay in step by construction. Bounds are the caller's
+    /// contract — go through [`Session::set_shard_payload`](crate::session::Session::set_shard_payload),
+    /// which enforces the `Config::validate` rules.
+    pub fn set_shard_payload(&mut self, shard_payload: usize) {
+        let max_data = self.fec.max_data_per_block as usize;
+        let total_data_max = self.max_frame_bytes.div_ceil(shard_payload.max(1)).max(1);
+        self.shard_payload = shard_payload;
+        self.max_blocks = total_data_max.div_ceil(max_data).max(1);
+        // Every non-final SLICE block carries at least `min(MIN_STREAM_BLOCK_SHARDS, K)`
+        // data shards (the flush floor, clamped by the block size), so a max-size frame
+        // bounds the block count. Mirrors the receiver's slice firewall — keep in step.
+        self.slice_block_cap = total_data_max / MIN_STREAM_BLOCK_SHARDS.min(max_data.max(1)) + 2;
+    }
+
+    /// The wire shard payload AUs are currently packetized at.
+    pub fn shard_payload(&self) -> usize {
+        self.shard_payload
     }
 
     /// Allocate the next **probe-space** frame index (speed-test filler). A separate counter from

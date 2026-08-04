@@ -90,8 +90,19 @@ pub struct Hello {
     /// disambiguated by REMAINING LENGTH at decode: fewer than `HDR_META_BODY_LEN` bytes after
     /// `preferred_codec` ⇒ no HDR block, the tail bytes are the post-HDR fields directly. This
     /// caps everything after `display_hdr` at `HDR_META_BODY_LEN − 1` bytes total — document any
-    /// future field here and mind the budget. Omitted when zero and by older clients (→ `0`).
+    /// future field here and mind the budget (`client_caps` 1 + `max_shard_payload` 2 = 3 of the
+    /// 27 spent). Omitted when zero and by older clients (→ `0`).
     pub client_caps: u8,
+    /// The largest video shard payload this client's receive path accepts — sealed datagrams for
+    /// shards up to this size fit its transport buffers ([`crate::config::max_shard_payload`]).
+    /// One field carries BOTH facts the host needs for mid-session shard renegotiation
+    /// (design/shard-payload-reneg.md W0.3): non-zero ⇒ the client reassembles per-frame
+    /// geometry (a mid-session `shard_payload` change is safe to send), and the value is the
+    /// hard ceiling a jumbo grow may never exceed. Appended after `client_caps` as 2 trailing
+    /// LE bytes (forcing the earlier placeholders). Omitted by older clients (decodes to `0`
+    /// = legacy: the host must not change the sealed geometry mid-session, and never above
+    /// the `Welcome` value).
+    pub max_shard_payload: u16,
 }
 
 /// QUIC application error code a punktfunk/1 client closes the control connection with on a
@@ -254,12 +265,14 @@ impl Hello {
         let pref_present = self.preferred_codec != 0;
         let hdr_present = self.display_hdr.is_some();
         let ccaps_present = self.client_caps != 0;
+        let msp_present = self.max_shard_payload != 0;
         let need_placeholders = self.video_caps != 0
             || ac_present
             || vcodecs_present
             || pref_present
             || hdr_present
-            || ccaps_present;
+            || ccaps_present
+            || msp_present;
         match (&self.name, &self.launch) {
             (None, None) if !need_placeholders => {}
             (name, _) => {
@@ -280,15 +293,21 @@ impl Hello {
             b.push(self.video_caps);
         }
         // audio_channels: emitted when non-stereo OR a later field follows.
-        if ac_present || vcodecs_present || pref_present || hdr_present || ccaps_present {
+        if ac_present
+            || vcodecs_present
+            || pref_present
+            || hdr_present
+            || ccaps_present
+            || msp_present
+        {
             b.push(self.audio_channels);
         }
         // video_codecs: emitted when non-zero OR a later field follows.
-        if vcodecs_present || pref_present || hdr_present || ccaps_present {
+        if vcodecs_present || pref_present || hdr_present || ccaps_present || msp_present {
             b.push(self.video_codecs);
         }
         // preferred_codec: emitted when non-zero OR a later field follows.
-        if pref_present || hdr_present || ccaps_present {
+        if pref_present || hdr_present || ccaps_present || msp_present {
             b.push(self.preferred_codec);
         }
         // display_hdr: fixed HDR_META_BODY_LEN-byte HdrMeta body; omitted when `None` even if
@@ -297,9 +316,14 @@ impl Hello {
         if let Some(m) = &self.display_hdr {
             super::datagram::write_hdr_meta_body(m, &mut b);
         }
-        // client_caps: single byte after the (optional) HDR block. Emitted when non-zero.
-        if ccaps_present {
+        // client_caps: single byte after the (optional) HDR block. Emitted when non-zero OR a
+        // later field follows.
+        if ccaps_present || msp_present {
             b.push(self.client_caps);
+        }
+        // max_shard_payload: 2 trailing LE bytes after client_caps. Emitted when non-zero.
+        if msp_present {
+            b.extend_from_slice(&self.max_shard_payload.to_le_bytes());
         }
         b
     }
@@ -385,6 +409,19 @@ impl Hello {
                     tail + 4
                 };
                 b.get(off).copied().unwrap_or(0)
+            },
+            // max_shard_payload: 2 LE bytes after client_caps (same post-HDR offset rule).
+            // Absent on an older client → 0 = no mid-session renegotiation, no jumbo.
+            max_shard_payload: {
+                let off = if b.len().saturating_sub(tail + 4) >= super::datagram::HDR_META_BODY_LEN
+                {
+                    tail + 4 + super::datagram::HDR_META_BODY_LEN
+                } else {
+                    tail + 4
+                };
+                b.get(off + 1..off + 3)
+                    .map(|s| u16::from_le_bytes(s.try_into().unwrap()))
+                    .unwrap_or(0)
             },
         })
     }
@@ -867,6 +904,7 @@ mod tests {
             preferred_codec: CODEC_H264,
             display_hdr: None,
             client_caps: 0,
+            max_shard_payload: 0,
         };
         let enc = h.encode();
         let dec = Hello::decode(&enc).unwrap();
@@ -944,6 +982,7 @@ mod tests {
             preferred_codec: CODEC_HEVC,
             display_hdr: None,
             client_caps: 0,
+            max_shard_payload: 0,
         };
         assert_eq!(Hello::decode(&h.encode()).unwrap(), h);
         let s = Start {
@@ -975,6 +1014,7 @@ mod tests {
             preferred_codec: 0,
             display_hdr: None,
             client_caps: 0,
+            max_shard_payload: 0,
         };
         let enc = h.encode();
         assert_eq!(enc.len(), 26);
@@ -1093,6 +1133,7 @@ mod tests {
             preferred_codec: 0,
             display_hdr: None,
             client_caps: 0,
+            max_shard_payload: 0,
         };
         let enc = base.encode();
         assert_eq!(
@@ -1145,6 +1186,7 @@ mod tests {
             preferred_codec: 0,
             display_hdr: None,
             client_caps: 0,
+            max_shard_payload: 0,
         };
         // launch alone (no name): a zero-length name placeholder keeps the offset deterministic.
         let with_launch = Hello {
@@ -1205,6 +1247,7 @@ mod tests {
             preferred_codec: 0,
             display_hdr: None,
             client_caps: 0,
+            max_shard_payload: 0,
         };
         // A real client-panel volume (P3 primaries, 800-nit peak, 0.05-nit floor, 400-nit FALL).
         let vol = HdrMeta {
@@ -1273,6 +1316,7 @@ mod tests {
                 preferred_codec: 0,
                 display_hdr: None,
                 client_caps: 0,
+                max_shard_payload: 0,
             }
             .encode();
             assert!(PairRequest::decode(&h).is_err(), "abi {abi} parsed as pair");
@@ -1306,6 +1350,7 @@ mod tests {
             preferred_codec: 0,
             display_hdr: None,
             client_caps: 0,
+            max_shard_payload: 0,
         };
         let vol = HdrMeta {
             display_primaries: [[13250, 34500], [7500, 3000], [34000, 16000]],
@@ -1319,6 +1364,7 @@ mod tests {
         // fixed block length, so the decoder must NOT read it as a truncated HdrMeta).
         let caps_only = Hello {
             client_caps: CLIENT_CAP_CURSOR,
+            max_shard_payload: 0,
             ..base.clone()
         };
         assert_eq!(Hello::decode(&caps_only.encode()).unwrap(), caps_only);
@@ -1326,6 +1372,7 @@ mod tests {
         let both = Hello {
             display_hdr: Some(vol),
             client_caps: CLIENT_CAP_CURSOR,
+            max_shard_payload: 0,
             ..base.clone()
         };
         assert_eq!(Hello::decode(&both.encode()).unwrap(), both);
@@ -1344,7 +1391,72 @@ mod tests {
             Hello::decode(&enc[..enc.len() - 1]).unwrap(),
             Hello {
                 client_caps: 0,
+                max_shard_payload: 0,
                 ..both.clone()
+            }
+        );
+    }
+
+    /// `max_shard_payload` (mid-session shard renegotiation, design/shard-payload-reneg.md
+    /// W0.3): roundtrips, forces the earlier placeholders (deterministic offset), composes
+    /// with the optional HDR block, and degrades to 0 = legacy in BOTH directions.
+    #[test]
+    fn hello_max_shard_payload_roundtrip_and_back_compat() {
+        let base = Hello {
+            abi_version: 2,
+            mode: Mode {
+                width: 1920,
+                height: 1080,
+                refresh_hz: 60,
+            },
+            compositor: CompositorPref::Auto,
+            gamepad: GamepadPref::Auto,
+            bitrate_kbps: 0,
+            name: None,
+            launch: None,
+            video_caps: 0,
+            audio_channels: 2,
+            video_codecs: 0,
+            preferred_codec: 0,
+            display_hdr: None,
+            client_caps: 0,
+            max_shard_payload: 0,
+        };
+        // The advertisement alone: every earlier trailing field is emitted as a placeholder
+        // so the 2 LE bytes land at a deterministic offset — and the whole thing roundtrips.
+        let adv = Hello {
+            max_shard_payload: crate::config::max_shard_payload() as u16,
+            ..base.clone()
+        };
+        assert_eq!(Hello::decode(&adv.encode()).unwrap(), adv);
+        // Composes with client_caps AND the fixed HDR block (the remaining-length
+        // disambiguation must still find both fields after it).
+        let vol = HdrMeta {
+            display_primaries: [[13250, 34500], [7500, 3000], [34000, 16000]],
+            white_point: [15635, 16450],
+            max_display_mastering_luminance: 8_000_000,
+            min_display_mastering_luminance: 500,
+            max_cll: 0,
+            max_fall: 400,
+        };
+        let full = Hello {
+            display_hdr: Some(vol),
+            client_caps: CLIENT_CAP_CURSOR,
+            max_shard_payload: 8908,
+            ..base.clone()
+        };
+        assert_eq!(Hello::decode(&full.encode()).unwrap(), full);
+        // An older client (no trailing bytes at all) decodes to 0 = legacy: the host must
+        // not change the sealed geometry mid-session.
+        assert_eq!(Hello::decode(&base.encode()).unwrap().max_shard_payload, 0);
+        // An older HOST reading an advertising Hello never looks past the fields it knows —
+        // truncating the 2 trailing bytes yields the same Hello minus the advertisement.
+        let enc = full.encode();
+        assert_eq!(
+            Hello::decode(&enc[..enc.len() - 2]).unwrap(),
+            Hello {
+                max_shard_payload: 0,
+                ..full.clone()
             }
         );
     }
