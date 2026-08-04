@@ -120,8 +120,12 @@ fun GamepadSettingsScreen(
         savedHosts = knownHostStore.all()
     }
 
+    // On a TV "the touch interface" is confusing advice (no touch to reach it with) — the honest
+    // path there is this screen's own Controller-optimized UI toggle, which swaps in the standard
+    // interface remote-navigably. The strings branch on it.
+    val tv = remember { isTvDevice(context) }
     val rows = buildSettingsRows(s, hasBodyVibrator, av1Capable, ::update) +
-        buildProfileRows(profiles, savedHosts) { pinProfile = it }
+        buildProfileRows(profiles, savedHosts, tv) { pinProfile = it }
     var focus by remember { mutableIntStateOf(0) }
     if (focus > rows.lastIndex) focus = rows.lastIndex
     // The direction the focused value last stepped (+1 forward / -1 back) — drives which way the
@@ -505,15 +509,25 @@ private fun buildSettingsRows(
 /**
  * The trailing Profiles section — the Android mirror of the desktop console's (design §5.2a, §5.4):
  * one row per catalog profile, valued with how many saved hosts pin it, activating into the
- * pin-to-hosts picker. Read-only beyond pinning: profiles are created and edited in the touch
+ * pin-to-hosts picker. Read-only beyond pinning: profiles are created and edited in the standard
  * interface, so an empty catalog shows one dimmed placeholder explaining where they come from
- * instead of a dead-looking empty header.
+ * instead of a dead-looking empty header. On a TV that phrasing changes: "touch interface" points
+ * nowhere useful on a touchless device, so the strings name the actual route — the
+ * Controller-optimized UI toggle a few rows up, which swaps the standard interface in
+ * (d-pad-navigable; the profile editor lives there on every device, unlike tvOS where none exists).
  */
 private fun buildProfileRows(
     profiles: List<StreamProfile>,
     savedHosts: List<KnownHost>,
+    tv: Boolean,
     openPinPicker: (StreamProfile) -> Unit,
 ): List<GpRow> {
+    val createHint = if (tv) {
+        "To create or edit profiles on this device, turn off Controller-optimized UI above " +
+            "and use the standard interface."
+    } else {
+        "Profiles are created and edited in the touch interface."
+    }
     if (profiles.isEmpty()) {
         return listOf(
             GpRow(
@@ -521,8 +535,8 @@ private fun buildProfileRows(
                 header = "Profiles",
                 label = "No profiles yet",
                 value = "",
-                detail = "Profiles bundle stream settings for different uses. Create them in the " +
-                    "touch interface, then pin them here as one-press connect cards.",
+                detail = "Profiles bundle stream settings for different uses — pinned ones become " +
+                    "one-press connect cards here. " + createHint,
                 adjust = { false },
                 activate = {},
                 adjustable = false,
@@ -543,7 +557,7 @@ private fun buildProfileRows(
                 else -> "Pinned to $pins hosts"
             },
             detail = "Pin this profile to a host and it appears as its own card — one press " +
-                "connects with it. Profiles are created and edited in the touch interface.",
+                "connects with it. " + createHint,
             adjust = { false },
             activate = { openPinPicker(p) },
             adjustable = false,
