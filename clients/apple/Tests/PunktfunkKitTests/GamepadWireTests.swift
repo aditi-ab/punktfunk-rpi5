@@ -79,7 +79,7 @@ final class GamepadWireTests: XCTestCase {
         XCTAssertEqual(GamepadWire.axisRSY, UInt32(PUNKTFUNK_AXIS_RS_Y))
         XCTAssertEqual(GamepadWire.axisLT, UInt32(PUNKTFUNK_AXIS_LT))
         XCTAssertEqual(GamepadWire.axisRT, UInt32(PUNKTFUNK_AXIS_RT))
-        XCTAssertEqual(GamepadWire.maxPads, Int(MAX_PADS))
+        XCTAssertEqual(GamepadWire.maxPads, Int(PUNKTFUNK_MAX_PADS))
     }
 
     func testPadIndexRidesFlagsOnEveryPerPadEvent() {
