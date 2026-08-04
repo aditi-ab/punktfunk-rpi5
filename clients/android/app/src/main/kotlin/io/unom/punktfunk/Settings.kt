@@ -45,6 +45,20 @@ data class Settings(
      * bind — which is why it gates the USB capture paths, not just the wire sends.
      */
     val gamepadForwarding: Boolean = true,
+    /**
+     * Where the guide (Xbox/PS) and misc/share presses land while streaming — the
+     * cross-client `system_buttons` key: `"auto"` (forward on Android — the press reaches
+     * the app on most devices) | `"forward"` | `"local"`.
+     */
+    val systemButtons: String = "auto",
+    /**
+     * The hold-Select guide gesture — the cross-client `guide_gesture` key: `"auto"` (off
+     * on Android) | `"on"` | `"off"`. On: holding Select alone ≥350 ms sends the HOST's
+     * guide, down until release (long hold = the host's long-press → a Gaming-Mode host's
+     * QAM); a Select tap is delivered on release, slightly delayed. For devices whose
+     * shell intercepts the physical guide button.
+     */
+    val guideGesture: String = "auto",
     /** Requested audio channel count: 2 (stereo), 6 (5.1) or 8 (7.1). The host clamps to what it
      * can capture; the resolved count drives the decoder + AAudio layout. */
     val audioChannels: Int = 2,
@@ -248,6 +262,8 @@ class SettingsStore(context: Context) {
         compositor = prefs.getInt(K_COMPOSITOR, 0),
         gamepad = prefs.getInt(K_GAMEPAD, 0),
         gamepadForwarding = prefs.getBoolean(K_GAMEPAD_FORWARDING, true),
+        systemButtons = prefs.getString(K_SYSTEM_BUTTONS, "auto") ?: "auto",
+        guideGesture = prefs.getString(K_GUIDE_GESTURE, "auto") ?: "auto",
         audioChannels = prefs.getInt(K_AUDIO_CH, 2),
         codec = prefs.getString(K_CODEC, "auto") ?: "auto",
         micEnabled = prefs.getBoolean(K_MIC, false),
@@ -297,6 +313,8 @@ class SettingsStore(context: Context) {
             .putInt(K_COMPOSITOR, s.compositor)
             .putInt(K_GAMEPAD, s.gamepad)
             .putBoolean(K_GAMEPAD_FORWARDING, s.gamepadForwarding)
+            .putString(K_SYSTEM_BUTTONS, s.systemButtons)
+            .putString(K_GUIDE_GESTURE, s.guideGesture)
             .putInt(K_AUDIO_CH, s.audioChannels)
             .putString(K_CODEC, s.codec)
             .putBoolean(K_MIC, s.micEnabled)
@@ -329,6 +347,8 @@ class SettingsStore(context: Context) {
         const val K_COMPOSITOR = "compositor"
         const val K_GAMEPAD = "gamepad"
         const val K_GAMEPAD_FORWARDING = "gamepad_forwarding"
+        const val K_SYSTEM_BUTTONS = "system_buttons"
+        const val K_GUIDE_GESTURE = "guide_gesture"
         const val K_AUDIO_CH = "audio_channels"
         const val K_CODEC = "codec"
         const val K_MIC = "mic_enabled"
@@ -565,6 +585,15 @@ fun codecOptionsFor(stored: String, av1Capable: Boolean): List<Pair<String, Stri
         }
     }
 
+/** Resolved [Settings.systemButtons]: forward the raw guide/misc presses? Auto = forward on
+ * Android — the press reaches the app on most devices, and where the shell shows its own UI
+ * for it that's the shell's business. */
+fun Settings.systemButtonsForward(): Boolean = systemButtons != "local"
+
+/** Resolved [Settings.guideGesture]: auto = OFF on Android (the raw press already reaches the
+ * host); "on" is for devices whose shell intercepts the physical guide button. */
+fun Settings.guideGestureEnabled(): Boolean = guideGesture == "on"
+
 /** The [Settings.codec] string as a `quic::CODEC_*` preference byte (`0` = auto). H264=1, HEVC=2,
  * AV1=4, PyroWave=8 (never decodable here, but the byte is the shared contract). */
 fun Settings.preferredCodec(): Int = when (codec) {
@@ -646,4 +675,18 @@ val GAMEPAD_OPTIONS = listOf(
     io.unom.punktfunk.kit.Gamepad.PREF_XBOXONE to "Xbox One",
     io.unom.punktfunk.kit.Gamepad.PREF_DUALSHOCK4 to "DualShock 4",
     io.unom.punktfunk.kit.Gamepad.PREF_STEAMDECK to "Steam Deck",
+)
+
+/** (stored `system_buttons` value, label) — where the guide/share presses land while streaming. */
+val SYSTEM_BUTTON_OPTIONS = listOf(
+    "auto" to "Automatic",
+    "forward" to "Send to host",
+    "local" to "This device",
+)
+
+/** (stored `guide_gesture` value, label) — the hold-Select guide gesture. */
+val GUIDE_GESTURE_OPTIONS = listOf(
+    "auto" to "Automatic",
+    "on" to "On",
+    "off" to "Off",
 )

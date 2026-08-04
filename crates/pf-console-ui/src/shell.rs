@@ -239,8 +239,14 @@ impl Shell {
                             port: h.port,
                             fp_hex: h.fp_hex.clone(),
                             launch: None,
-                            title: h.name.clone(),
+                            // A wake started from a pinned card carries its profile
+                            // through to the connect (the row's key found it again).
+                            title: match &h.pin {
+                                Some(p) => format!("{} · {}", h.name, p.name),
+                                None => h.name.clone(),
+                            },
                             request_access: false,
+                            profile: h.pin.as_ref().map(|p| p.id.clone()),
                         })
                 });
                 self.bus.send(ConsoleCmd::CancelWake);
@@ -269,6 +275,7 @@ impl Shell {
             launch: intent.launch,
             title: intent.title,
             request_access: intent.request_access,
+            profile: intent.profile,
         });
     }
 

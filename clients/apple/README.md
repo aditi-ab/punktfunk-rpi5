@@ -121,7 +121,11 @@ PUNKTFUNK_AUTOCONNECT=<box-ip> PUNKTFUNK_MODE=1280x720x60 swift run PunktfunkCli
   host's virtual pad.
 - **App Store screenshots** are automated — `tools/screenshots.sh all` renders the real UI at the
   required pixel sizes via a DEBUG-only shot mode; the `apple` CI workflow captures the iOS sizes on
-  every main push. See the script header for details.
+  every main push. See the script header for details. The script's `SCENES` array is the listing
+  set, in listing order; override it (`SCENES="06-gamepad-home 10-edithost" tools/screenshots.sh ios`)
+  to capture any of the other scenes in `ShotScenes.all`. Mock data — hosts, adverts, profiles — is
+  seeded in `ShotMock` so a capture is byte-for-byte deterministic and never browses the real LAN
+  (a stranger's hostname reached the live listing that way once).
 - Deeper design notes live in the internal planning repo (punktfunk-planning:
   `apple-stage2-presenter.md`).
 

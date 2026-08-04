@@ -18,7 +18,12 @@ use std::time::{Duration, Instant};
 /// 0xCD feedback events (lightbar / player LEDs / adaptive triggers), deduped via [`HidoutDedup`].
 #[derive(Default)]
 pub struct PadFeedback {
-    /// `(low, high)` motor levels (0..=0xFF00), if the pass saw a rumble report.
+    /// `(low, high)` motor levels, if the pass saw a rumble report.
+    ///
+    /// Range is `0..=0xFFFF` — this said `0..=0xFF00`, which is only true of the backends that
+    /// widen the device's 8-bit motor byte by `<< 8` (the UHID/DualSense path). The Windows
+    /// backend widens by `× 257` and does reach 0xFFFF, and this type carries both. Neither is a
+    /// defect: consumers narrow with `>> 8`, and 0xFF00 and 0xFFFF both narrow back to 255.
     pub rumble: Option<(u16, u16)>,
     pub hidout: Vec<HidOutput>,
     /// Whether the game drove this pad's RUMBLE plane this poll — at least one output report
@@ -159,6 +164,22 @@ impl OverflowWarn {
 /// real firmware decays, and that re-assert is what keeps a legitimately-held long rumble alive
 /// here. The XUSB path shares this window via [`rumble_idle_timeout`] (every XUSB write IS a
 /// rumble write, so its any-activity keying is already rumble-keyed by construction).
+///
+/// KNOWN COST, deliberately accepted. That invariant only covers writers that re-assert. A game
+/// driving the pad through the kernel's *evdev* FF interface does not: `ff-memless` sends one
+/// output report when an effect starts and one when it stops, with nothing in between, so a finite
+/// effect longer than this window is cut in half here. The uinput path
+/// (`linux/gamepad.rs`) exempts exactly that case — but it can, because evdev FF hands it an
+/// explicit `replay.length`. Nothing equivalent reaches this layer: [`PadFeedback`] carries motor
+/// levels, and the protocols it speaks (DualSense / DS4 / Deck / Switch Pro) are all
+/// level-triggered with no duration field anywhere in a report. So the choice is between cutting a
+/// long finite effect and letting an abandoned residual drone forever, and the residual is the one
+/// with field evidence behind it (a stuck level resent every 500 ms for 5.5 minutes). Switch Pro is
+/// not affected either way — `hid-nintendo` re-sends rumble continuously, and a physical Pro's
+/// HD-rumble decays faster than this window regardless.
+///
+/// Do not "fix" this by widening or disabling the window without evidence about which failure real
+/// titles actually hit; the hatch below exists for exactly that experiment.
 const RUMBLE_IDLE_TIMEOUT: Duration = Duration::from_millis(2500);
 
 /// The abandoned-rumble force-off window, env-hatched: `PUNKTFUNK_RUMBLE_IDLE_MS` overrides
@@ -217,13 +238,10 @@ impl<B: PadProto> UhidManager<B> {
                 if idx >= MAX_PADS {
                     return;
                 }
-                // Unplugs: drop any allocated pad whose mask bit cleared, resetting its state.
+                // Unplugs: arm the grace for any pad whose mask bit cleared (the drop itself lands
+                // on a later `pump` tick — this frame is the only one the producer sends).
                 let swept = self.slots.sweep(f.active_mask);
-                for i in 0..MAX_PADS {
-                    if swept & (1 << i) != 0 {
-                        self.reset_pad(i);
-                    }
-                }
+                self.reset_swept(swept);
                 if f.active_mask & (1 << idx) == 0 {
                     return; // this event WAS the unplug
                 }
@@ -282,6 +300,12 @@ impl<B: PadProto> UhidManager<B> {
         mut hidout: impl FnMut(HidOutput),
     ) {
         let now = Instant::now();
+        // Finish any unplug whose removal frame only armed the grace. The producer emits that
+        // frame exactly once, so without this a detached pad — the single-pad session being the
+        // common case — would never be destroyed. Runs BEFORE the loop so a reaped index is
+        // already gone for `get_mut` here and for `heartbeat`'s `get` later in the same tick.
+        let swept = self.slots.reap();
+        self.reset_swept(swept);
         for i in 0..MAX_PADS {
             let Some(pad) = self.slots.get_mut(i) else {
                 continue;
@@ -335,9 +359,16 @@ impl<B: PadProto> UhidManager<B> {
             for h in fb.hidout {
                 // Skip rich feedback that repeats the last-forwarded value (a game's output report
                 // re-sends unchanged lightbar/LED/trigger state alongside every rumble update).
-                if self.hidout_dedup[i].should_forward(&h) {
+                if self.hidout_dedup[i].should_forward(&h, now) {
                     hidout(h);
                 }
+            }
+            // Re-assert the latched rich state on a slow cadence. Deduping a plane that rides
+            // unreliable datagrams means a dropped update is never re-derived from the game — it
+            // keeps sending the same value and the dedup eats every copy — so without this one
+            // lost datagram leaves the pad on the previous weapon's trigger effect indefinitely.
+            for h in self.hidout_dedup[i].renewals(i as u8, now) {
+                hidout(h);
             }
         }
     }
@@ -357,6 +388,18 @@ impl<B: PadProto> UhidManager<B> {
         let backend = &mut self.backend;
         if self.slots.ensure(idx, |i| backend.open(i)) {
             self.reset_pad(idx);
+        }
+    }
+
+    /// Reset the sibling state of every index a sweep or reap just dropped. Both halves of the
+    /// unplug land here, so a pad torn down on the pump tick clears exactly what one torn down on
+    /// a state frame would — in particular `hidout_dedup`, which has no watchdog to re-arm it and
+    /// would otherwise swallow an identical lightbar/trigger re-assert after a re-plug.
+    fn reset_swept(&mut self, swept: u16) {
+        for i in 0..MAX_PADS {
+            if swept & (1 << i) != 0 {
+                self.reset_pad(i);
+            }
         }
     }
 
@@ -495,18 +538,36 @@ mod tests {
     }
 
     #[test]
-    fn removal_frame_never_recreates_the_pad_it_swept() {
+    fn one_removal_frame_plus_a_pump_tick_completes_the_unplug() {
+        // The producer emits the cleared-mask frame exactly ONCE — `native/input.rs` guards it on
+        // the bit still being set — so the teardown has to finish on the periodic pump. The
+        // previous version of this test hand-fed a SECOND removal frame, which is what let the
+        // never-reaped pad hide: with one frame and no pump, the device outlived the session.
         let mut m = mgr();
         m.handle(&frame(1, 0b10, 0));
         assert!(m.slots.get(1).is_some());
-        // Bit 1 cleared: the first sweep only ARMS the devnode-churn grace — the pad holds (a
-        // mask glitch must not flap PnP devices; see pad_slots::SWEEP_GRACE).
+        // The one removal frame: arms the devnode-churn grace, drops nothing.
         m.handle(&frame(1, 0b00, 0));
         assert!(m.slots.get(1).is_some(), "inside the grace — not yet swept");
-        // Grace elapsed: the frame IS pad 1's removal — sweep, then early-return (no ensure).
+        // A tick inside the grace must NOT flap the devnode (pad_slots::SWEEP_GRACE).
+        m.pump(|_, _, _| {}, |_| {});
+        assert!(
+            m.slots.get(1).is_some(),
+            "a tick inside the grace dropped it"
+        );
+        // Grace elapsed: the next tick completes the unplug, with no further frame.
         m.slots.expire_grace();
+        m.pump(|_, _, _| {}, |_| {});
+        assert!(
+            m.slots.get(1).is_none(),
+            "the pump tick never completed the unplug"
+        );
+        // …and a further cleared-mask frame must not resurrect it (the arm branch early-returns).
         m.handle(&frame(1, 0b00, 0));
-        assert!(m.slots.get(1).is_none());
+        assert!(
+            m.slots.get(1).is_none(),
+            "a cleared-mask frame recreated the pad"
+        );
     }
 
     #[test]
@@ -552,10 +613,15 @@ mod tests {
         assert_eq!(collect(&mut m), vec![(0, 100, 0)]); // first value forwards
         assert_eq!(collect(&mut m), vec![]); // exact repeat deduped
         assert_eq!(collect(&mut m), vec![(0, 7, 7)]); // change forwards
-                                                      // Unplug + recreate re-arms the dedup: the same level forwards again.
-        m.handle(&frame(0, 0b0, 0)); // arms the sweep grace
+                                                      // Unplug + recreate re-arms the dedup: the same level forwards again. The unplug completes
+                                                      // on a PUMP tick, not on a second frame — that is all production ever sends.
+        m.handle(&frame(0, 0b0, 0)); // the one removal frame — arms the grace
         m.slots.expire_grace();
-        m.handle(&frame(0, 0b0, 0)); // grace elapsed — actually swept
+        assert_eq!(collect(&mut m), vec![]); // this tick reaps; nothing queued to forward
+        assert!(
+            m.slots.get(0).is_none(),
+            "the pump tick completed the unplug"
+        );
         m.handle(&frame(0, 0b1, 0));
         *m.backend.feedback.borrow_mut() = vec![rumble((7, 7))];
         assert_eq!(collect(&mut m), vec![(0, 7, 7)]);

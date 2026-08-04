@@ -18,6 +18,29 @@ use std::time::Duration;
 /// observes its `running=false` flag promptly on teardown.
 const PULL_TIMEOUT: Duration = Duration::from_millis(100);
 
+/// Width of the packed `pad` field in [`pack_rumble`] — 4 bits, i.e. indices 0..15.
+const PAD_BITS: u32 = 4;
+/// The packing is only lossless while every representable pad index fits in [`PAD_BITS`]. This was
+/// a comment before; growing `MAX_PADS` past 16 would have silently aliased pad 16 onto pad 0
+/// rather than failing the build.
+const _: () = assert!(
+    punktfunk_core::input::MAX_PADS <= 1usize << PAD_BITS,
+    "MAX_PADS no longer fits the 4-bit pad field in the packed rumble long"
+);
+
+/// Pack one effective rumble command into the `jlong` `nativeNextRumble` returns.
+///
+/// Layout — mirrored by `unpackRumbleEvent` in `RumbleWire.kt`: bits 49..52 `pad`, 32..47
+/// `backstop_ms`, 16..31 `low`, 0..15 `high`. Always non-negative, so the `-1` timeout/closed
+/// sentinel stays unambiguous. Split out from the JNI entry point purely so it can be tested
+/// without a live session handle — the shift arithmetic is the part worth pinning.
+fn pack_rumble(pad: u16, low: u16, high: u16, backstop_ms: u32) -> jlong {
+    (jlong::from(pad & ((1 << PAD_BITS) - 1)) << 49)
+        | (jlong::from(backstop_ms.min(0xFFFF) as u16) << 32)
+        | (jlong::from(low) << 16)
+        | jlong::from(high)
+}
+
 // HID-output kind tags written into the returned ByteBuffer (Kotlin reads them back).
 const TAG_LED: u8 = 0x01;
 const TAG_PLAYER_LEDS: u8 = 0x02;
@@ -62,12 +85,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeNextRumble(
             // haptics audio, so the host emits nothing on 0xD1 and the pad keeps its rumble.
             // Dropping it here rather than in Kotlin keeps the rule next to the reason.
             Ok(cmd) if crate::pad_audio::haptics_owns_coils((cmd.pad & 0xF) as u8) => -1,
-            Ok(cmd) => {
-                (jlong::from(cmd.pad & 0xF) << 49)
-                    | (jlong::from(cmd.backstop_ms.min(0xFFFF) as u16) << 32)
-                    | (jlong::from(cmd.low) << 16)
-                    | jlong::from(cmd.high)
-            }
+            Ok(cmd) => pack_rumble(cmd.pad, cmd.low, cmd.high, cmd.backstop_ms),
             Err(_) => -1, // NoFrame (timeout) or Closed — Kotlin loops on its running flag
         }
     })
@@ -172,4 +190,66 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeNextHidout(
         };
         n as jint
     })
+}
+
+#[cfg(test)]
+mod pack_rumble_tests {
+    use super::*;
+    use punktfunk_core::input::MAX_PADS;
+
+    /// Kotlin's `unpackRumbleEvent`, transcribed — if these two ever disagree the boundary is
+    /// broken, and nothing else in the build would say so.
+    fn unpack(ev: jlong) -> (u16, u16, u16, u32) {
+        let pad = ((ev >> 49) & 0xF) as u16;
+        let backstop = ((ev >> 32) & 0xFFFF) as u32;
+        let low = ((ev >> 16) & 0xFFFF) as u16;
+        let high = (ev & 0xFFFF) as u16;
+        (pad, low, high, backstop)
+    }
+
+    #[test]
+    fn round_trips_every_field_at_its_extremes() {
+        for &(pad, low, high, backstop) in &[
+            (0u16, 0u16, 0u16, 0u32),
+            (15, 0xFFFF, 0xFFFF, 0xFFFF),
+            (1, 0x1234, 0x5678, 500),
+            (7, 0, 0xFFFF, 2000),
+        ] {
+            let ev = pack_rumble(pad, low, high, backstop);
+            assert_eq!(unpack(ev), (pad, low, high, backstop), "pad {pad}");
+        }
+    }
+
+    #[test]
+    fn every_representable_pad_survives_the_four_bit_field() {
+        for pad in 0..MAX_PADS as u16 {
+            let (got, ..) = unpack(pack_rumble(pad, 1, 2, 3));
+            assert_eq!(got, pad, "pad {pad} aliased in the packed long");
+        }
+    }
+
+    #[test]
+    fn a_packed_command_is_never_negative() {
+        // `-1` is the timeout/closed sentinel; any packed value colliding with it would read as
+        // "no command" and the rumble would simply vanish.
+        assert!(pack_rumble(15, 0xFFFF, 0xFFFF, 0xFFFF) >= 0);
+        assert!(pack_rumble(0, 0, 0, 0) >= 0);
+    }
+
+    #[test]
+    fn an_oversized_backstop_saturates_instead_of_corrupting_the_pad_field() {
+        let ev = pack_rumble(3, 0, 0, u32::MAX);
+        let (pad, _, _, backstop) = unpack(ev);
+        assert_eq!(pad, 3, "a huge backstop must not bleed into the pad bits");
+        assert_eq!(backstop, 0xFFFF);
+    }
+
+    #[test]
+    fn a_stop_is_distinguishable_from_a_hold() {
+        let stop = pack_rumble(2, 0, 0, 0);
+        let hold = pack_rumble(2, 0x8000, 0x8000, 500);
+        assert_ne!(stop, hold);
+        assert_eq!(unpack(stop).1, 0);
+        assert_eq!(unpack(stop).2, 0);
+    }
 }

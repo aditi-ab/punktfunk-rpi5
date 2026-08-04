@@ -26,9 +26,7 @@
 #![deny(clippy::undocumented_unsafe_blocks)]
 
 use anyhow::{anyhow, Context, Result};
-use punktfunk_core::config::{
-    mtu1500_shard_payload_for, CompositorPref, FecConfig, FecScheme, GamepadPref, Role,
-};
+use punktfunk_core::config::{CompositorPref, FecConfig, FecScheme, GamepadPref, Role};
 use punktfunk_core::input::{InputEvent, InputKind};
 use punktfunk_core::packet::{FLAG_PIC, FLAG_PROBE, FLAG_SOF};
 use punktfunk_core::quic::{
@@ -78,6 +76,9 @@ use input::{input_thread, ClientInput};
 /// The Hello→Welcome→Start negotiation (plan §W1); `serve_session` calls `handshake::negotiate`
 /// after the pairing gate.
 mod handshake;
+/// MTU resilience for the video data plane: `PUNKTFUNK_WIRE_MTU` override, the per-session
+/// path-MTU watch on the control connection, and the per-peer learned shard-payload clamp.
+mod wire_mtu;
 
 /// The mid-stream control task (plan §W1); `serve_session` spawns `control::run` after the
 /// handshake to multiplex renegotiation / speed-test control messages onto the data-plane channels.
@@ -1104,6 +1105,30 @@ async fn serve_session(
     // just never fires then.
     let (cursor_shape_tx, cursor_shape_rx) =
         tokio::sync::mpsc::unbounded_channel::<punktfunk_core::quic::CursorShape>();
+    // Mid-session shard renegotiation (design/shard-payload-reneg.md Phase 2): the wire-MTU
+    // watcher decides (constrained-path shrink / ack-gated jumbo grow), the control task
+    // writes the `ShardPayloadChanged` and routes the acks back, and the data-plane loop
+    // applies `Session::set_shard_payload` between AUs (drained next to `bitrate_rx`).
+    // Channels are wired unconditionally (they just never fire); the DRIVER exists only for
+    // a client that advertised `Hello::max_shard_payload` on a non-chunk-aligned session —
+    // PyroWave clients parse chunk-aligned AUs in windows of the `Welcome` value pinned at
+    // session start (read once over the C ABI), so those sessions keep the leg-1
+    // next-session clamp instead of a mid-stream re-key.
+    let (shard_change_tx, shard_change_rx) = tokio::sync::mpsc::unbounded_channel::<u16>();
+    let (shard_ack_tx, shard_ack_rx) = tokio::sync::mpsc::unbounded_channel::<u16>();
+    let (shard_apply_tx, shard_apply_rx) = std::sync::mpsc::channel::<usize>();
+    let shard_reneg = (hello.max_shard_payload > 0 && codec != crate::encode::Codec::PyroWave)
+        .then_some(wire_mtu::ShardReneg {
+            client_ceiling: hello.max_shard_payload,
+            change_tx: shard_change_tx,
+            ack_rx: shard_ack_rx,
+            apply_tx: shard_apply_tx,
+        });
+    // The session is real: watch this connection's MTU discovery settle and turn it into a
+    // path verdict (WARN + learned clamp for the next session on a constrained path; clears
+    // a stale clamp on a healthy one) — and, with the driver above, heal or grow THIS
+    // session mid-stream. Bounded ~10 s task unless a jumbo grow leaves it as revert guard.
+    wire_mtu::spawn_watch(conn.clone(), welcome.shard_payload as usize, shard_reneg);
     // Negotiated cursor forwarding: the HOST_CAP_CURSOR bit the Welcome advertised, read back
     // rather than recomputed (`handshake::cursor_forward` computed it once, with the encoder
     // blend-capability gate — re-running it here could drift, and would re-probe).
@@ -1159,6 +1184,8 @@ async fn serve_session(
         probe_result_rx,
         reconfig_result_rx,
         retarget_rx,
+        shard_change_rx,
+        shard_ack_tx,
         cursor_shape_rx,
         cursor_client_draws,
         clip_enabled,
@@ -1326,9 +1353,18 @@ async fn serve_session(
         let stop = stop.clone();
         let cap = audio_cap.clone();
         let channels = welcome.audio_channels;
+        // Read the granted bit back off the Welcome (the cursor plane's precedent), so the wire
+        // the client was promised and the wire we actually send cannot disagree — then re-derive
+        // the SAME budget rung from it, so the encode tier and the redundancy decision are one
+        // choice made once rather than two settings that can drift apart.
+        let budget = handshake::audio_budget(
+            welcome.host_caps & punktfunk_core::quic::HOST_CAP_AUDIO_RED != 0,
+            welcome.bitrate_kbps,
+            channels,
+        );
         std::thread::Builder::new()
             .name("punktfunk1-audio".into())
-            .spawn(move || audio_thread(conn, stop, cap, channels))
+            .spawn(move || audio_thread(conn, stop, cap, channels, budget))
             .map_err(|e| tracing::warn!(error = %e, "audio thread spawn failed — session continues without audio"))
             .ok()
     } else {
@@ -1597,6 +1633,7 @@ async fn serve_session(
                         keyframe: keyframe_rx,
                         rfi: rfi_rx,
                         bitrate_rx,
+                        shard_rx: shard_apply_rx,
                         compositor,
                         gamescope_route,
                         bitrate_kbps,

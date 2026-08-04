@@ -57,6 +57,82 @@ pub fn env_on(name: &str) -> Option<bool> {
     })
 }
 
+/// Where desktop audio should be audible — which decides the render endpoint the loopback captures.
+///
+/// Supersedes the two env-only knobs that used to encode this (`PUNKTFUNK_HOST_AUDIO`,
+/// `PUNKTFUNK_KEEP_DEFAULT`), which stay honoured as back-compat spellings so nobody's `host.env`
+/// breaks. Named modes exist because "which endpoint do we capture" is a routing decision an
+/// operator has to be able to make deliberately — the 2026-08-03 field report is what happens when
+/// the only way to express it is an undocumented environment variable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AudioOutputMode {
+    /// Default. Prefer a render endpoint that is silent on the host, so streamed audio does not
+    /// also play out of the host's speakers. Since 2026-08 a silent sink has to be able to carry
+    /// the mix without narrowing it — otherwise real hardware wins anyway.
+    #[default]
+    ClientOnly,
+    /// Prefer real hardware: audio plays on the host as well as the client. The old
+    /// `PUNKTFUNK_HOST_AUDIO=1`.
+    HostAndClient,
+    /// Touch nothing — capture whatever the operator's own default playback device is, and never
+    /// write the default-device policy. The old `PUNKTFUNK_KEEP_DEFAULT=1`.
+    FollowDefault,
+}
+
+impl AudioOutputMode {
+    /// `PUNKTFUNK_AUDIO_OUTPUT_MODE` wins; otherwise fall back to the legacy flags, `follow_default`
+    /// first (it is the more restrictive promise — "do not touch my devices" must not be overridden
+    /// by a stale `PUNKTFUNK_HOST_AUDIO` in the same `host.env`).
+    fn from_env() -> AudioOutputMode {
+        if let Ok(raw) = std::env::var("PUNKTFUNK_AUDIO_OUTPUT_MODE") {
+            if !raw.trim().is_empty() {
+                if let Some(m) = AudioOutputMode::parse(&raw) {
+                    return m;
+                }
+                // Never silently fall through to a different routing than the operator asked for.
+                eprintln!(
+                    "punktfunk: PUNKTFUNK_AUDIO_OUTPUT_MODE={raw:?} is not one of \
+                     client_only/host_and_client/follow_default — using client_only"
+                );
+            }
+        }
+        if std::env::var_os("PUNKTFUNK_KEEP_DEFAULT").is_some() {
+            return AudioOutputMode::FollowDefault;
+        }
+        if std::env::var_os("PUNKTFUNK_HOST_AUDIO").is_some() {
+            return AudioOutputMode::HostAndClient;
+        }
+        AudioOutputMode::ClientOnly
+    }
+
+    pub fn parse(s: &str) -> Option<AudioOutputMode> {
+        match s.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+            "client_only" | "client" => Some(AudioOutputMode::ClientOnly),
+            "host_and_client" | "both" | "host" => Some(AudioOutputMode::HostAndClient),
+            "follow_default" | "follow" => Some(AudioOutputMode::FollowDefault),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AudioOutputMode::ClientOnly => "client_only",
+            AudioOutputMode::HostAndClient => "host_and_client",
+            AudioOutputMode::FollowDefault => "follow_default",
+        }
+    }
+
+    /// The loopback plan should prefer real hardware over a silent sink.
+    pub fn prefers_host_hardware(self) -> bool {
+        matches!(self, AudioOutputMode::HostAndClient)
+    }
+
+    /// Leave the operator's default playback/recording devices completely alone.
+    pub fn keeps_default(self) -> bool {
+        matches!(self, AudioOutputMode::FollowDefault)
+    }
+}
+
 /// Resolved host configuration. Holds the genuinely-constant operator/dispatch knobs (see module docs for
 /// what is deliberately excluded). Fields read on only one platform are kept alive cross-platform by the
 /// derived `Debug` impl, so the parser can stay a single platform-neutral function.
@@ -99,6 +175,24 @@ pub struct HostConfig {
     /// e.g. webOS TVs, whose GCM decrypt caps at ~100 Mbps); everyone else stays AES-128-GCM.
     /// `PUNKTFUNK_CHACHA20=0`/`false`/`off`/`no` disables.
     pub chacha20: bool,
+    /// `PUNKTFUNK_AUDIO_OUTPUT_MODE` — where desktop audio should be audible, and therefore which
+    /// render endpoint the loopback captures (`client_only` / `host_and_client` / `follow_default`).
+    ///
+    /// A first-class setting because the 2026-08-03 field report needed one: the default
+    /// client-only routing sent that box's whole desktop mix through Steam's voice-carrier virtual
+    /// endpoint for 25 sessions, and the only way to change it was an undocumented environment
+    /// variable. See [`AudioOutputMode`].
+    pub audio_output_mode: AudioOutputMode,
+    /// `PUNKTFUNK_AUDIO_QUALITY` — desktop-audio encode tier (`low` / `standard` / `high`; default
+    /// `high`). Kept as the raw string here because the tier table lives in `punktfunk-core`, and
+    /// this crate is deliberately dependency-free (see the crate doc). The audio thread resolves it
+    /// via `punktfunk_core::audio::AudioTier::parse` and warns on an unknown spelling rather than
+    /// silently downgrading someone's audio.
+    pub audio_quality: Option<String>,
+    /// `PUNKTFUNK_AUDIO_REDUNDANCY` — force the redundant `0xD2` audio plane on or off. `None`
+    /// (the default) = automatic: sent only to a client that asked for it, and only while the link
+    /// is actually losing packets.
+    pub audio_redundancy: Option<bool>,
     /// `PUNKTFUNK_PERF` — per-stage timing instrumentation.
     pub perf: bool,
     /// `PUNKTFUNK_VIDEO_SOURCE` — GameStream video source select. `virtual` (the default — a
@@ -246,6 +340,9 @@ impl HostConfig {
             // Default ON, explicit-off grammar (the client's VIDEO_CAP_CHACHA20 bit is the real
             // per-session switch; see the field doc).
             chacha20: env_on("PUNKTFUNK_CHACHA20").unwrap_or(true),
+            audio_output_mode: AudioOutputMode::from_env(),
+            audio_quality: val("PUNKTFUNK_AUDIO_QUALITY").map(|s| s.trim().to_lowercase()),
+            audio_redundancy: env_on("PUNKTFUNK_AUDIO_REDUNDANCY"),
             perf: flag("PUNKTFUNK_PERF"),
             // Default ON while the interval-stutter field program runs (see the field doc).
             stall_probes: env_on("PUNKTFUNK_STALL_PROBES").unwrap_or(true),
@@ -347,5 +444,51 @@ mod tests {
         assert_eq!(c.game_fps(30), 30);
         // An invalid rate stays invalid rather than being laundered into a real one.
         assert_eq!(c.game_fps(0), 0);
+    }
+
+    #[test]
+    fn audio_output_mode_parses_its_spellings() {
+        for (s, want) in [
+            ("client_only", AudioOutputMode::ClientOnly),
+            ("client-only", AudioOutputMode::ClientOnly),
+            ("  CLIENT  ", AudioOutputMode::ClientOnly),
+            ("host_and_client", AudioOutputMode::HostAndClient),
+            ("both", AudioOutputMode::HostAndClient),
+            ("follow_default", AudioOutputMode::FollowDefault),
+            ("follow", AudioOutputMode::FollowDefault),
+        ] {
+            assert_eq!(AudioOutputMode::parse(s), Some(want), "{s:?}");
+        }
+        // Unknown spellings are rejected so the caller can say so, not silently re-routed.
+        for s in ["", "silent", "off", "true"] {
+            assert_eq!(AudioOutputMode::parse(s), None, "{s:?}");
+        }
+        // Round-trip through the canonical spelling.
+        for m in [
+            AudioOutputMode::ClientOnly,
+            AudioOutputMode::HostAndClient,
+            AudioOutputMode::FollowDefault,
+        ] {
+            assert_eq!(AudioOutputMode::parse(m.as_str()), Some(m));
+        }
+    }
+
+    /// The two predicates are what the wiring plan and the capture loop actually branch on, and
+    /// they must stay mutually exclusive: "prefer host hardware" and "touch nothing" are different
+    /// promises, and conflating them would either silence the host or stomp the operator's devices.
+    #[test]
+    fn audio_output_mode_predicates_are_disjoint() {
+        assert_eq!(AudioOutputMode::default(), AudioOutputMode::ClientOnly);
+        for m in [
+            AudioOutputMode::ClientOnly,
+            AudioOutputMode::HostAndClient,
+            AudioOutputMode::FollowDefault,
+        ] {
+            assert!(!(m.prefers_host_hardware() && m.keeps_default()), "{m:?}");
+        }
+        assert!(AudioOutputMode::HostAndClient.prefers_host_hardware());
+        assert!(AudioOutputMode::FollowDefault.keeps_default());
+        assert!(!AudioOutputMode::ClientOnly.prefers_host_hardware());
+        assert!(!AudioOutputMode::ClientOnly.keeps_default());
     }
 }

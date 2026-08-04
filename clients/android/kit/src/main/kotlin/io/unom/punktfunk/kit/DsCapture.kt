@@ -149,7 +149,12 @@ class DsCapture(
             // The interfaces are about to release with the kernel driver still detached — a
             // mid-rumble teardown would leave the motors running with nobody to stop them.
             // EP0-direct (the reader thread is stopping; the queue would never drain).
-            usb.writeControl(stopReport(m))
+            // Nothing can retry after this point, so a failure is worth saying out loud: it is
+            // the difference between a quiet pad and one that buzzes until it is unplugged.
+            if (!usb.writeControl(stopReport(m))) Log.w(TAG, "teardown rumble stop was not written")
+            // Motors silenced above; this hands back the lightbar, player LEDs and adaptive
+            // triggers the game was holding, which outlive the link just as stubbornly.
+            resetRichFeedback(m)
         }
         disarmBackstop()
         usb.stop()
@@ -256,6 +261,9 @@ class DsCapture(
         val wasActive = model != null
         model = null
         releaseSlot()
+        // Release the transport too: the link only *signals* the drop, so without this an unplug
+        // left its connection open, its interfaces claimed and its detach receiver registered.
+        usb.stop()
         if (wasActive) onActiveChanged?.invoke(false)
     }
 
@@ -327,17 +335,20 @@ class DsCapture(
 
     override fun rumble(pad: Int, low: Int, high: Int, backstopMs: Long) {
         val m = model ?: return
-        if (low == 0 && high == 0) {
-            disarmBackstop()
-        } else {
-            armBackstop(backstopMs)
-        }
-        if (m == DsDevice.Model.DUALSHOCK4) {
+        val stop = low == 0 && high == 0
+        if (!stop) armBackstop(backstopMs)
+        val sent = if (m == DsDevice.Model.DUALSHOCK4) {
             ds4Low = low
             ds4High = high
             writeDs4()
         } else {
-            usb.writeRaw(0, DsDevice.ds5RumbleReport(m, low, high))
+            usb.writeRaw(0, DsDevice.ds5RumbleReport(m, low, high), OutReportQueue.KEY_RUMBLE)
+        }
+        if (stop) {
+            // Disarm only once the stop is actually on its way. Dropping the net *before* the
+            // write — as this used to — meant a discarded stop left the motors running with
+            // nothing scheduled to try again; a USB pad holds its last level until told zero.
+            if (sent) disarmBackstop() else armBackstop(STOP_RETRY_MS)
         }
     }
 
@@ -363,6 +374,9 @@ class DsCapture(
         usb.writeRaw(0, DsDevice.ds5TriggerReport(m, which, effect))
     }
 
+    // Coalescable: the DS4's write is full-state (motors AND lightbar, rebuilt from the current
+    // fields on every call), so a newer one supersedes an older one wholesale — nothing is lost by
+    // collapsing a backlog of them down to the last.
     private fun writeDs4() = usb.writeRaw(
         0,
         DsDevice.ds4Report(
@@ -372,7 +386,37 @@ class DsCapture(
             (ds4Rgb shr 8) and 0xFF,
             ds4Rgb and 0xFF,
         ),
+        OutReportQueue.KEY_RUMBLE,
     )
+
+    /**
+     * Hand the pad back neutral: adaptive triggers released, lightbar dark, player LEDs clear.
+     *
+     * Rumble stops the moment nothing renews it, but these are LATCHED in the controller's
+     * firmware — they outlive the stream, the app, and being unplugged. Ending a session while a
+     * game held a weapon's trigger resistance left the physical trigger stiff afterwards, with
+     * nothing to release it but another game that happens to set one.
+     *
+     * EP0-direct like the rumble stop above: the reader thread is stopping, so the interrupt-OUT
+     * queue would never drain. Writes are best-effort — the pad may already be gone.
+     */
+    private fun resetRichFeedback(m: DsDevice.Model) {
+        if (m == DsDevice.Model.DUALSHOCK4) {
+            // No adaptive triggers or player LEDs on a DS4, and its write is full-state, so
+            // blacking the lightbar is a single composed report.
+            ds4Rgb = 0
+            usb.writeControl(DsDevice.ds4Report(0, 0, 0, 0, 0))
+            return
+        }
+        // An all-zero effect block is mode 0x00 — no effect — which is what releases the trigger.
+        for (which in 0..1) {
+            usb.writeControl(
+                DsDevice.ds5TriggerReport(m, which, ByteArray(DsDevice.TRIGGER_EFFECT_LEN)),
+            )
+        }
+        usb.writeControl(DsDevice.ds5LightbarReport(m, 0, 0, 0))
+        usb.writeControl(DsDevice.ds5PlayerLedsReport(m, 0))
+    }
 
     /** The report that stops the motors. The DS4's is a full-state write, so it zeroes the
      *  composed motor state and carries the current lightbar rather than blacking it out. */
@@ -395,7 +439,12 @@ class DsCapture(
         backstop?.let { mainHandler.removeCallbacks(it) }
         val r = Runnable {
             backstop = null
-            model?.let { usb.writeRaw(0, stopReport(it)) }
+            val m = model ?: return@Runnable
+            // The net itself can be refused (a full queue, a connection going away). Re-arm rather
+            // than give up: this is the last thing between a stalled poll thread and a pad that
+            // buzzes until it is unplugged. It stops re-arming as soon as the link closes, which
+            // clears `model` and disarms.
+            if (!usb.writeRaw(0, stopReport(m), OutReportQueue.KEY_RUMBLE)) armBackstop(STOP_RETRY_MS)
         }
         backstop = r
         mainHandler.postDelayed(r, ms.coerceAtLeast(1))
@@ -408,5 +457,9 @@ class DsCapture(
 
     private companion object {
         const val TAG = "DsCapture"
+
+        /** How soon to retry a rumble stop whose write was rejected. Short: the motors are running
+         *  and the host has already moved on, so nothing else is coming to silence them. */
+        const val STOP_RETRY_MS = 100L
     }
 }

@@ -25,7 +25,7 @@ Already installed? Skip to [Keeping a client up to date](#keeping-a-client-up-to
 | **Windows** | [Signed MSIX](#windows) from the package registry |
 | **macOS** | [Notarized `.dmg`](#macos) from the releases page |
 | **iPhone / iPad / Apple TV** | [TestFlight beta](#ios-ipados-apple-tv) |
-| **Android / Android TV** | [Beta — a Play test track, or sideload the APK](#android) |
+| **Android / Android TV** | [Google Play](#android), or sideload the APK |
 | **LG webOS TV** | [Community client](#lg-webos-tv-community) (sideloaded `.ipk`) |
 | Anything else (browser, old phone, TV) | [Moonlight](/docs/moonlight) |
 
@@ -79,9 +79,11 @@ list: [Clients → the `punktfunk` CLI](/docs/clients#scripting-the-punktfunk-cl
 ## Steam Deck
 
 Most Deck users want **Gaming Mode**: install the **[Decky plugin](/docs/steam-deck)** and a
-**Punktfunk** panel lands in the Quick Access Menu, so you can discover hosts, pair with a PIN, and
-stream **without dropping to the desktop**. Follow the **[Steam Deck (Decky) guide](/docs/steam-deck)**
-— it walks through Decky Loader, the plugin, and the one-time client install.
+**Punktfunk** panel lands in the Quick Access Menu, so you can find a host, get let in (a PIN, or a
+request the host's operator approves), and stream **without dropping to the desktop**. Everything
+else — settings, the game library, adding a host by address — is one tap away in the client's own
+gamepad UI. Follow the **[Steam Deck (Decky) guide](/docs/steam-deck)** — it walks through Decky
+Loader, the plugin, and the one-time client install.
 
 > The plugin doesn't decode video itself — it drives whichever `punktfunk-client` is installed on
 > the Deck. The Flatpak below is the tested default; a native package or a sysext works too. If your
@@ -162,19 +164,15 @@ Open the app, and your hosts appear automatically under *On this network*.
 
 ## Android
 
-The Android client (phone + Android TV) is on Google Play as a **test track** — **closed testing**
-for stable releases, **internal testing** for canary builds. To join, request a tester invite on our
-[**Discord**](https://discord.gg/kaPNvzMuGU) and we'll add your Google account:
-
-**[Request access on Discord →](https://discord.gg/kaPNvzMuGU)**
-
-Once you're added, install it from Google Play, then open the app and pick your host:
+The Android client (phone + Android TV — one package, the TV layout is the same app in leanback
+mode) is published on **Google Play**. It's a public listing: no invite, no tester list.
 
 **[Get Punktfunk on Google Play →](https://play.google.com/store/apps/details?id=io.unom.punktfunk)**
-_(only resolves once your account is on the tester list)_
 
-**Prefer not to wait for an invite?** The signed APK is published publicly on every build, so you can
-sideload it instead — no account, no invite:
+Install it, open the app, and pick your host.
+
+**Prefer not to go through Play?** The signed APK is published publicly on every build, so you can
+sideload it instead — no Play account needed:
 
 ```text
 https://git.unom.io/api/packages/unom/generic/punktfunk-android/latest/punktfunk-android.apk
@@ -183,6 +181,10 @@ https://git.unom.io/api/packages/unom/generic/punktfunk-android/latest/punktfunk
 Swap `latest` for `canary` to track `main`. Release APKs are also attached to each
 [release](https://git.unom.io/unom/punktfunk/releases). Android asks you to allow installs from your
 browser or file manager the first time.
+
+**Canary on Play** is a separate **Internal testing** track, and that one *is* invite-only — ask on
+[Discord](https://discord.gg/kaPNvzMuGU) and we'll add your Google account. The `canary` APK above
+needs no invite.
 
 ## LG webOS TV (community)
 

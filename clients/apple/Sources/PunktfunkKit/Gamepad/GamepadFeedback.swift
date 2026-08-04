@@ -65,7 +65,7 @@ public final class GamepadFeedback {
         #if os(iOS)
         if UserDefaults.standard.bool(forKey: DefaultsKey.rumbleOnDevice),
             CHHapticEngine.capabilitiesForHardware().supportsHaptics {
-            deviceRumble = RumbleRenderer(policy: .session, actuator: .device)
+            deviceRumble = RumbleRenderer(actuator: .device)
         } else {
             deviceRumble = nil
         }
@@ -117,7 +117,15 @@ public final class GamepadFeedback {
             reset(slot.controller)
             slots[pad] = nil
             let renderer = withRouting { rumbleByPad.removeValue(forKey: pad) }
-            renderer?.stop()
+            // OFF the main actor. `RumbleRenderer.stop()` is a `queue.sync`, and its body is a
+            // per-motor `CHHapticEngine.stop()` — an XPC round trip to gamecontrollerd, which the
+            // renderer's own notes record as able to hang — plus `DualSenseHID.close()`, whose
+            // blocking `IOHIDDeviceSetReport` goes to a device that has just departed. It also
+            // queues behind any in-flight `setup()`. This runs on every unplug and every pin
+            // change, and the main thread is what drives the presenter's CADisplayLink, so
+            // blocking here hitches the picture mid-stream. The renderer is already detached from
+            // routing above, so nothing observes it after this point.
+            if let renderer { Task.detached { renderer.stop() } }
         }
         for (pad, controller) in want {
             if let slot = slots[pad] {
@@ -128,7 +136,7 @@ public final class GamepadFeedback {
                 replay(slot)
             } else {
                 slots[pad] = Slot(controller: controller)
-                let renderer = RumbleRenderer(policy: .session)
+                let renderer = RumbleRenderer()
                 renderer.retarget(controller)
                 withRouting { rumbleByPad[pad] = renderer }
             }
@@ -282,6 +290,12 @@ public final class GamepadFeedback {
     private func reset(_ controller: GCController?) {
         guard let c = controller else { return }
         c.playerIndex = .indexUnset
+        // Put the lightbar out too. This class is what turned it on (see the `Led` and
+        // `PlayerLeds` arms), and every DS write is valid-flag-selective, so a colour the game
+        // set stays lit in firmware after the stream ends — back at the launcher, or for a pad
+        // that merely left the forwarded set. A DS4 is cleared incidentally because its player
+        // indicator IS the lightbar; a DualSense is not.
+        c.light?.color = GCColor(red: 0, green: 0, blue: 0)
         if let ds = c.extendedGamepad as? GCDualSenseGamepad {
             ds.leftTrigger.setModeOff()
             ds.rightTrigger.setModeOff()

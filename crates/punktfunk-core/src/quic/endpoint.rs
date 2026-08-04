@@ -47,6 +47,38 @@ fn stream_transport_idle(idle: std::time::Duration) -> Arc<quinn::TransportConfi
     // plane latest-wins at the source — ~200 ms of stereo Opus (proportionally less at
     // surround bitrates), so sustained congestion costs concealable drops, never lag.
     t.datagram_send_buffer_size(4 * 1024);
+    // MTU discovery probes up to EXACTLY the sealed size of a full IPv4 video datagram (1472)
+    // instead of quinn's stock 1452. Two reasons: (a) on a clean 1500-MTU path QUIC gets the
+    // last 20 bytes per packet; (b) the ceiling turns discovery into a video-path verdict the
+    // host's wire-MTU watcher reads (`punktfunk-host` `native/wire_mtu.rs`) — settled == ceiling
+    // proves the path carries full-size video datagrams, settled BELOW it proves it cannot (a
+    // VPN/overlay adapter at MTU ~1280 blackholes every video packet while all the small flows
+    // pass: the "connects fine, black screen forever" field shape). With the stock 1452 ceiling
+    // a healthy path and a constrained one are indistinguishable at the top. This is the ONLY
+    // behavioral change on healthy paths, and it's confined to discovery: probes are padded
+    // PINGs quinn already expects to lose above a constrained hop — a lost probe settles the
+    // search lower, exactly as it did before.
+    let mut mtud = quinn::MtuDiscoveryConfig::default();
+    // Jumbo opt-in (design/shard-payload-reneg.md Phase 2): with `PUNKTFUNK_JUMBO=1` /
+    // `PUNKTFUNK_WIRE_MTU` > 1500 set, discovery probes up to the sealed JUMBO datagram
+    // size so a settled connection can PROVE a jumbo path — the actual grow stays
+    // client-ack-gated (`native/wire_mtu.rs`). The ceiling is per-ENDPOINT, not
+    // per-connection: with the opt-in set, connections to non-jumbo peers spend a few extra
+    // failed probes (one PTO each) settling lower; zero cost for anyone who doesn't opt in.
+    // Derived with the IPv4 overhead — a v6 peer's sealed jumbo target is smaller, so the
+    // ceiling covers it and discovery settles at the v6 path's own budget.
+    let probe_ceiling = match crate::config::jumbo_wire_mtu() {
+        Some(mtu) => {
+            let shard = crate::config::jumbo_shard_payload_for(
+                mtu,
+                std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+            );
+            crate::config::sealed_datagram_bytes(shard) as u16
+        }
+        None => crate::config::video_datagram_udp_ceiling() as u16,
+    };
+    mtud.upper_bound(probe_ceiling);
+    t.mtu_discovery_config(Some(mtud));
     Arc::new(t)
 }
 

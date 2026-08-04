@@ -79,6 +79,17 @@ const GAMEPADS: &[(&str, &str)] = &[
     // user could not ask the host for the Deck-shaped pad (trackpads, back grips).
     ("steamdeck", "Steam Deck"),
 ];
+/// System-button routing: `(stored value, display label)` — where the guide (Xbox/PS)
+/// and quick-access presses land while streaming. The cross-client `system_buttons` key;
+/// Automatic forwards on desktop and stays local under Gaming Mode.
+const SYSTEM_BUTTONS: &[(&str, &str)] = &[
+    ("auto", "Automatic"),
+    ("forward", "Send to host"),
+    ("local", "This device"),
+];
+/// The hold-Select guide gesture: `(stored value, display label)` — the cross-client
+/// `guide_gesture` key. Automatic arms it only where the raw press can't reach the host.
+const GUIDE_GESTURES: &[(&str, &str)] = &[("auto", "Automatic"), ("on", "On"), ("off", "Off")];
 /// Stats-overlay tiers: `(stored value, display label)` — the cross-client verbosity ladder
 /// (Compact ⊂ Normal ⊂ Detailed); Ctrl+Alt+Shift+S cycles it live in the session window.
 const STATS_TIERS: &[(StatsVerbosity, &str)] = &[
@@ -479,6 +490,8 @@ struct OverrideFlags {
     inhibit_shortcuts: bool,
     gamepad: bool,
     gamepad_forwarding: bool,
+    system_buttons: bool,
+    guide_gesture: bool,
     stats_verbosity: bool,
     fullscreen_on_stream: bool,
     present_priority: bool,
@@ -512,6 +525,8 @@ impl OverrideFlags {
             inhibit_shortcuts: o.inhibit_shortcuts.is_some(),
             gamepad: o.gamepad.is_some(),
             gamepad_forwarding: o.gamepad_forwarding.is_some(),
+            system_buttons: o.system_buttons.is_some(),
+            guide_gesture: o.guide_gesture.is_some(),
             stats_verbosity: o.stats_verbosity.is_some(),
             fullscreen_on_stream: o.fullscreen_on_stream.is_some(),
             present_priority: o.present_priority.is_some(),
@@ -966,6 +981,13 @@ pub(crate) fn settings_page(
                 s.forward_pad = key.unwrap_or_default();
                 s.save();
             })
+            // Dimmed with the master switch above it, like echo cancellation under the mic
+            // (see that row) — this and the three below have nothing to act on while no
+            // controller is forwarded at all. Every commit bumps `rev` and re-renders this
+            // screen, so they follow the toggle live. Brings this client in line with how GTK
+            // (`set_sensitive`), the touch settings on both mobile clients (`enabled`) and the
+            // console UI (dim + refuse the step) have always drawn the same relationship.
+            .enabled(s.gamepad_forwarding)
     };
     let pad_forward_toggle =
         setting_toggle(ctx, scope, (rev, set_rev), s.gamepad_forwarding, |s, on| {
@@ -976,7 +998,32 @@ pub(crate) fn settings_page(
     });
     let pad_combo = setting_combo(ctx, scope, (rev, set_rev), pad_names, pad_i, |s, i| {
         s.gamepad = GAMEPADS[i].0.to_string();
-    });
+    })
+    .enabled(s.gamepad_forwarding);
+    let (sysbtn_names, sysbtn_i) = presets(SYSTEM_BUTTONS, |v| *v == s.system_buttons);
+    let sysbtn_combo = setting_combo(
+        ctx,
+        scope,
+        (rev, set_rev),
+        sysbtn_names,
+        sysbtn_i,
+        |s, i| {
+            s.system_buttons = SYSTEM_BUTTONS[i].0.to_string();
+        },
+    )
+    .enabled(s.gamepad_forwarding);
+    let (gesture_names, gesture_i) = presets(GUIDE_GESTURES, |v| *v == s.guide_gesture);
+    let gesture_combo = setting_combo(
+        ctx,
+        scope,
+        (rev, set_rev),
+        gesture_names,
+        gesture_i,
+        |s, i| {
+            s.guide_gesture = GUIDE_GESTURES[i].0.to_string();
+        },
+    )
+    .enabled(s.gamepad_forwarding);
     let (touch_names, touch_i) = presets(TOUCH_MODES, |v| *v == s.touch_mode);
     let touch_combo = setting_combo(ctx, scope, (rev, set_rev), touch_names, touch_i, |s, i| {
         s.touch_mode = TOUCH_MODES[i].0.to_string();
@@ -1045,13 +1092,18 @@ pub(crate) fn settings_page(
         let ss = set_screen.clone();
         button("Third-party licenses").on_click(move || ss.call(Screen::Licenses))
     };
-    // The client log's home (%LOCALAPPDATA%\punktfunk\logs) — the file every "check the
-    // client log" message means, which until this row had no way in from the UI at all.
-    // The folder rather than the file so the rotated `.old` generation is in reach too.
-    // Best-effort, like the log itself: a missing dir or a failed spawn stays silent.
+    // The client log's home — the file every "check the client log" message means, which until
+    // this row had no way in from the UI at all. The folder rather than the file so the rotated
+    // `.old` generation is in reach too.
+    //
+    // `real_dir` (not the literal %LOCALAPPDATA% path) because Explorer lives outside our MSIX
+    // container: handed a path the package redirection keeps from ever existing, it silently
+    // opens the user's Documents folder instead of failing, which is precisely what this button
+    // shipped doing. The `is_dir` guard keeps that fallback unreachable — if the resolve ever
+    // comes back wrong, the click does nothing rather than landing somewhere misleading.
+    // Best-effort otherwise, like the log itself: a failed spawn stays silent.
     let logs_button = button("Open log folder").on_click(|| {
-        if let Some(dir) = crate::logfile::log_dir() {
-            let _ = std::fs::create_dir_all(&dir);
+        if let Some(dir) = crate::logfile::real_dir().filter(|d| d.is_dir()) {
             let _ = std::process::Command::new("explorer.exe").arg(&dir).spawn();
         }
     });
@@ -1401,6 +1453,30 @@ pub(crate) fn settings_page(
                         "The virtual pad created on the host. Automatic matches your controller \
                          \u{2014} a DualSense keeps adaptive triggers, lightbar, touchpad and \
                          motion.",
+                    )),
+                    Some(described_overridable(
+                        (rev, set_rev),
+                        scope,
+                        "system_buttons",
+                        "Steam / guide button",
+                        over.system_buttons,
+                        sysbtn_combo,
+                        "Where the guide (Xbox/PS) and quick-access presses go while \
+                         streaming. Automatic sends them to the host \u{2014} except on \
+                         devices whose own overlay reacts to the same press (Gaming Mode), \
+                         where they stay local and the gesture below reaches the host.",
+                    )),
+                    Some(described_overridable(
+                        (rev, set_rev),
+                        scope,
+                        "guide_gesture",
+                        "Hold Select for guide",
+                        over.guide_gesture,
+                        gesture_combo,
+                        "Hold Select on its own to press the host's guide button \u{2014} keep \
+                         holding for a Gaming-Mode host's quick-access menu. A Select tap \
+                         still goes through, slightly delayed. Automatic arms it only where \
+                         the real button can't reach the host.",
                     )),
                 ]
                 .into_iter()

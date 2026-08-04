@@ -698,6 +698,20 @@ const RUMBLE_RENEW_FLOOR_MS: u64 = 60;
 /// own expiry. `3` total zero sends = the immediate one + this many renewal re-sends.
 const RUMBLE_STOP_BURST: u8 = 2;
 
+/// Clear a removed pad's rumble bookkeeping — the level, the "we have seen a level" flag, and any
+/// stop re-sends still owed. Together these end the pad's lease, so a re-plug on the same wire
+/// index inherits nothing that could buzz the new device.
+///
+/// The per-pad rumble **sequence is deliberately not a parameter**: it must stay monotonic for the
+/// life of the connection because the client gates on it with a wrapping half-space compare and
+/// never resets its side (`punktfunk-core/src/client/pump/datagram_task.rs`). Resetting it here is
+/// the bug pinned by [`tests::rumble_seq_survives_a_removal_so_the_client_gate_accepts`].
+fn clear_pad_feedback(state: &mut (u16, u16), seen: &mut bool, stop_burst: &mut u8) {
+    *state = (0, 0);
+    *seen = false;
+    *stop_burst = 0;
+}
+
 /// Send one rumble datagram on the universal 0xCA plane. `envelope_on` picks the self-terminating
 /// v2 form (`[level][seq][ttl_ms]`, the default) or the legacy v1 level datagram (the
 /// `PUNKTFUNK_RUMBLE_ENVELOPE=0` bisect hatch). Best-effort like every side-plane datagram.
@@ -898,11 +912,22 @@ pub(super) fn input_thread(
                             tracing::info!(pad = idx, "gamepad unplugged (native detach)");
                         }
                         // Fresh feedback bookkeeping so a later re-plug on this index inherits no
-                        // stale rumble lease/seq (a lease still ticking would buzz the new pad).
-                        rumble_state[idx] = (0, 0);
-                        rumble_seen[idx] = false;
-                        rumble_seq[idx] = 0;
-                        rumble_stop_burst[idx] = 0;
+                        // stale rumble lease (a lease still ticking would buzz the new pad).
+                        //
+                        // `rumble_seq` deliberately SURVIVES — do not reset it here. The client's
+                        // rumble reorder gate (`client/pump/datagram_task.rs`) is per-CONNECTION
+                        // and has no reset path, so restarting this counter strands every later
+                        // envelope for the re-plugged pad until the host climbs back past the
+                        // value the client already stored (up to 128 sends ≈ 15 s of continuous
+                        // rumble, or dozens of separate rumble events). The three clears below are
+                        // what actually kill a stale lease; the sibling `pad_seq` gate keeps its
+                        // value across a removal for exactly the same reason (see the comment at
+                        // the top of this arm).
+                        clear_pad_feedback(
+                            &mut rumble_state[idx],
+                            &mut rumble_seen[idx],
+                            &mut rumble_stop_burst[idx],
+                        );
                         // The unplugged pad's 0xD1 streamer goes with it (seq-gated like the
                         // rest of this arm, so a reordered stale removal can't kill the
                         // stream of a re-plugged pad). A re-plug re-arrives and re-spawns.
@@ -1183,6 +1208,72 @@ mod tests {
             y: 0,
             flags: pad,
         }
+    }
+
+    /// A pad re-plug must not strand the client's rumble reorder gate.
+    ///
+    /// The client's `rumble_last_seq` lives for the whole QUIC connection and has no reset path
+    /// (`punktfunk-core/src/client/pump/datagram_task.rs`), so this host's per-pad rumble counter
+    /// has to stay monotonic across a `GamepadRemove`. Regression: the removal arm used to do
+    /// `rumble_seq[idx] = 0`, which made every envelope after a re-plug fail `seq_newer` until the
+    /// counter climbed back past the value the client had already stored — up to 128 sends.
+    ///
+    /// Drives the real wire encoder and the real gate, so it fails if either side's rule moves.
+    #[test]
+    fn rumble_seq_survives_a_removal_so_the_client_gate_accepts() {
+        use punktfunk_core::input::GamepadSnapshot;
+        use punktfunk_core::quic::{decode_rumble_envelope, encode_rumble_datagram_v2};
+
+        // The client half: one per-pad slot, per connection, never reset.
+        let deliver = |seq: u8, gate: &mut Option<u8>| {
+            let d = encode_rumble_datagram_v2(0, 0x4000, 0x8000, seq, 400);
+            let env = decode_rumble_envelope(&d)
+                .expect("v2 envelope decodes")
+                .envelope
+                .expect("v2 tail present");
+            if GamepadSnapshot::seq_newer(env.seq, *gate) {
+                *gate = Some(env.seq);
+                true
+            } else {
+                false
+            }
+        };
+
+        // The host half: one wrapping counter, bumped on every change and every renewal.
+        let mut gate: Option<u8> = None;
+        let mut seq = 0u8;
+
+        // A long rumble before the unplug pushes the client's stored seq well past zero.
+        for _ in 0..100 {
+            seq = seq.wrapping_add(1);
+            assert!(deliver(seq, &mut gate));
+        }
+        assert_eq!(gate, Some(100));
+
+        // The pad is unplugged mid-buzz: the lease is cleared, the counter is not.
+        let (mut state, mut seen, mut burst) = ((0x1234u16, 0x5678u16), true, RUMBLE_STOP_BURST);
+        clear_pad_feedback(&mut state, &mut seen, &mut burst);
+        assert_eq!(
+            (state, seen, burst),
+            ((0, 0), false, 0),
+            "lease not cleared"
+        );
+
+        // It returns on the same wire index and the game rumbles again: the very first envelope
+        // has to reach the actuator.
+        seq = seq.wrapping_add(1);
+        assert!(
+            deliver(seq, &mut gate),
+            "first envelope after a re-plug was dropped by the client's reorder gate"
+        );
+
+        // Non-vacuity: the pre-fix behaviour (counter restarted at 0) really is rejected, and
+        // stays rejected for the whole forward window — this is the bug, reproduced.
+        let mut stranded = Some(100u8);
+        assert!(
+            (1..=100).all(|s| !deliver(s, &mut stranded)),
+            "test is vacuous — a restarted counter should have been gated out"
+        );
     }
 
     /// Incremental wire events accumulate into the full pad frame the virtual xpad applies.

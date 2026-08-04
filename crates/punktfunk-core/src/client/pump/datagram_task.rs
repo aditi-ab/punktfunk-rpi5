@@ -24,6 +24,10 @@ pub(super) async fn run(
     // gate): a datagram the network reordered must not roll a stopped motor back on. Legacy v1
     // datagrams carry no seq and bypass it (an old host's own periodic re-send is the only heal).
     let mut rumble_last_seq: [Option<u8>; crate::input::MAX_PADS] = [None; crate::input::MAX_PADS];
+    // Redundant-audio-plane rebuild (`0xD2`). Recovery happens HERE rather than in the four
+    // client decoders: the recovered frame is re-inserted into this queue in order, so every
+    // embedder gets a complete stream without knowing the plane exists.
+    let mut audio_red = crate::audio::AudioRedRecovery::new();
     while let Ok(d) = conn.read_datagram().await {
         match d.first() {
             Some(&crate::quic::AUDIO_MAGIC) => {
@@ -35,24 +39,50 @@ pub(super) async fn run(
                     });
                 }
             }
+            Some(&crate::quic::AUDIO_RED_MAGIC) => {
+                if let Some((seq, pts_ns, opus, prev)) = crate::quic::decode_audio_red_datagram(&d)
+                {
+                    if audio_red.recover_before(seq, prev.is_some()) {
+                        // The copy is the frame BEFORE this one, so it carries the previous
+                        // sequence and presentation time — one protocol frame earlier.
+                        let _ = audio_tx.try_send(AudioPacket {
+                            seq: seq.wrapping_sub(1),
+                            pts_ns: pts_ns
+                                .saturating_sub(crate::audio::FRAME_MS as u64 * 1_000_000),
+                            data: prev.unwrap_or_default().to_vec(),
+                        });
+                    }
+                    let _ = audio_tx.try_send(AudioPacket {
+                        seq,
+                        pts_ns,
+                        data: opus.to_vec(),
+                    });
+                }
+            }
             Some(&crate::quic::RUMBLE_MAGIC) => {
                 if let Some(u) = crate::quic::decode_rumble_envelope(&d) {
+                    // A pad index the client cannot represent is dropped outright, before either
+                    // consumer sees it. It used to be waved through: the seq gate was skipped (its
+                    // per-pad cursor has no slot for it) and it was handed to the legacy queue,
+                    // while the policy engine silently discarded it on its own bounds check — so
+                    // "both consumers are fed" below was false for exactly these, and an embedder
+                    // draining the queue could be handed an index it would use to subscript its
+                    // own per-pad array. The host never emits one; this is malformed or hostile.
+                    let idx = u.pad as usize;
+                    if idx >= crate::input::MAX_PADS {
+                        continue;
+                    }
                     // Gate v2 envelopes on their per-pad seq; forward v1 (envelope: None) as-is.
                     let fresh = match u.envelope {
                         Some(env) => {
-                            let idx = u.pad as usize;
-                            if idx < crate::input::MAX_PADS {
-                                if crate::input::GamepadSnapshot::seq_newer(
-                                    env.seq,
-                                    rumble_last_seq[idx],
-                                ) {
-                                    rumble_last_seq[idx] = Some(env.seq);
-                                    true
-                                } else {
-                                    false // reordered/duplicate — drop, keep the newer state
-                                }
+                            if crate::input::GamepadSnapshot::seq_newer(
+                                env.seq,
+                                rumble_last_seq[idx],
+                            ) {
+                                rumble_last_seq[idx] = Some(env.seq);
+                                true
                             } else {
-                                true // out-of-range pad (host never sends these): no gate
+                                false // reordered/duplicate — drop, keep the newer state
                             }
                         }
                         None => true,

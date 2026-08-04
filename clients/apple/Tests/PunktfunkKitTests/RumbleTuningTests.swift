@@ -56,7 +56,7 @@ final class RumbleTuningTests: XCTestCase {
     /// storm, an audible target left to the ticker (watchdog path), then `stop()` — which runs
     /// `queue.sync` against the same serial queue the ticker fires on and must not deadlock.
     func testRendererSurvivesCallStormAndTeardownWithoutController() {
-        let renderer = RumbleRenderer(policy: .session)
+        let renderer = RumbleRenderer()
         renderer.retarget(nil)
         for i in 0..<500 {
             renderer.apply(
@@ -72,7 +72,7 @@ final class RumbleTuningTests: XCTestCase {
     /// every policy stop (lease expiry, legacy staleness, session close), and the renderer's only
     /// job is to apply them. Drive the real queue/ticker (no physical pad) and confirm no wedge.
     func testZeroCommandSilencesAndTeardownDoesNotDeadlock() {
-        let renderer = RumbleRenderer(policy: .session)
+        let renderer = RumbleRenderer()
         renderer.retarget(nil)
         renderer.apply(low: 0x8000, high: 0x8000)
         Thread.sleep(forTimeInterval: 0.1)

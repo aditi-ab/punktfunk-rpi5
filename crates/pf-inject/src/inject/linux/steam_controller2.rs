@@ -23,31 +23,17 @@ use super::triton_proto::{
     triton_serial, triton_unit_id, TritonState, TRITON_RDESC, TRITON_STATE_LEN, TRITON_VENDOR,
     TRITON_WIRED_PRODUCT,
 };
+use crate::uhid_abi::{
+    put_cstr, BUS_USB, HID_MAX_DESCRIPTOR_SIZE, UHID_CREATE2, UHID_DESTROY, UHID_EVENT_SIZE,
+    UHID_GET_REPORT, UHID_GET_REPORT_REPLY, UHID_INPUT2, UHID_OUTPUT, UHID_PATH, UHID_SET_REPORT,
+    UHID_SET_REPORT_REPLY,
+};
 use crate::uhid_manager::{PadFeedback, PadProto, UhidManager};
 use anyhow::{Context, Result};
 use punktfunk_core::quic::{HidOutput, RichInput, HID_RAW_FEATURE, HID_RAW_OUTPUT};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
-
-// /dev/uhid event ABI — same layout as the Deck/DualSense backends.
-const UHID_PATH: &str = "/dev/uhid";
-const UHID_DESTROY: u32 = 1;
-const UHID_OUTPUT: u32 = 6;
-const UHID_GET_REPORT: u32 = 9;
-const UHID_GET_REPORT_REPLY: u32 = 10;
-const UHID_CREATE2: u32 = 11;
-const UHID_INPUT2: u32 = 12;
-const UHID_SET_REPORT: u32 = 13;
-const UHID_SET_REPORT_REPLY: u32 = 14;
-const HID_MAX_DESCRIPTOR_SIZE: usize = 4096;
-const UHID_EVENT_SIZE: usize = 4 + 4372;
-const BUS_USB: u16 = 0x03;
-
-fn put_cstr(ev: &mut [u8], off: usize, cap: usize, s: &str) {
-    let n = s.len().min(cap - 1);
-    ev[off..off + n].copy_from_slice(&s.as_bytes()[..n]);
-}
 
 /// A virtual Steam Controller 2 backed by `/dev/uhid`. Dropping it destroys the device.
 pub struct TritonPad {

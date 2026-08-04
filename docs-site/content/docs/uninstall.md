@@ -300,8 +300,9 @@ stop testing — that removes the app and its data with it.
 
 ### Android / Android TV
 
-Uninstall the app from Google Play or from Settings → Apps. The Android client is still an invited
-test track, so if you also want your account taken off the tester list, say so on
+Uninstall the app from Google Play or from Settings → Apps. That's the whole job — it's a public
+Play listing, so there's no tester list to leave. If you were on the invite-only **canary**
+(Internal testing) track and want off that too, say so on
 [Discord](https://discord.gg/kaPNvzMuGU).
 
 ### Steam Deck — Decky plugin

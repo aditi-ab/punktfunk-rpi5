@@ -36,6 +36,22 @@ pub const LEGACY_STALE_MS: u64 = 1000;
 /// engine's staleness zero lands at 1 s; this is the hardware-level net under an engine stall).
 const BACKSTOP_LEGACY_MS: u32 = 2000;
 
+/// The longest lease the engine honours, whatever the envelope claims — the receiver-side mirror of
+/// the host's own `RUMBLE_TTL_CEIL_MS`.
+///
+/// No host built from this tree can exceed it (the `PUNKTFUNK_RUMBLE_TTL_MS` hatch is clamped to
+/// `[150, 5000]` before it reaches the wire), so this is defence in depth against a third-party or
+/// modified sender that stamps a long TTL and then wedges its renewal pump while the connection
+/// stays up. It matters on exactly the platforms that sustain a level for the whole lease: Apple,
+/// whose renderer deliberately keeps no staleness policy of its own, and a Deck slot, whose
+/// keepalive re-kicks the actuator until the lease ends. Duration-parameterized embedders (SDL,
+/// Android) already self-terminate at the clamped backstop.
+///
+/// Deliberately NOT `pub`: an embedder has no use for it, and every `pub` const in this crate is
+/// emitted into `include/punktfunk_core.h` as an UNPREFIXED `#define` — a collision hazard the
+/// header already has ~170 instances of, and one this has no reason to add to.
+const MAX_LEASE_MS: u16 = 5_000;
+
 /// One effective actuator command. `(0, 0)` means stop now. `backstop_ms` is a safety-net
 /// duration for platform APIs that take one (SDL rumble, Android one-shots): the engine emits
 /// explicit zeros at every policy stop, so the backstop only matters if the embedder thread itself
@@ -53,10 +69,25 @@ pub struct RumbleCommand {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ActuatorQuirks {
     /// Re-emit an unchanged non-zero level every this many ms — for actuators whose hardware
-    /// output decays between wire renewals (Steam Deck ≈ 40, macOS DualSense-over-HID BT ≈ 900).
-    /// `0` = no keepalive (the common case).
+    /// output decays between wire renewals. `0` = no keepalive (the common case).
+    ///
+    /// The one in-tree producer is the Steam Deck's ≈ 40 ms (`pf-client-core`'s slot open, paired
+    /// with `dedup_jitter`). The macOS DualSense-over-HID Bluetooth decay is NOT served by this
+    /// quirk, though it reads like the obvious second example: the Apple client keeps its own
+    /// ≈ 900 ms keepalive down in `RumbleRenderer` (`RumbleTuning.hidKeepaliveSeconds`) because
+    /// the re-emit has to happen BELOW the command layer. An engine keepalive arrives as a
+    /// command carrying the same levels, and that renderer skips a HID write whose levels are
+    /// unchanged — so the re-emit would be swallowed by the very dedupe it exists to defeat
+    /// (`dedup_jitter` is the Deck's answer to the same problem one layer up).
     pub keepalive_ms: u16,
-    /// Floor for `backstop_ms` on non-zero commands (Android's `createOneShot` throws on 0).
+    /// Floor for `backstop_ms` on non-zero commands.
+    ///
+    /// **No in-tree producer sets this non-zero** — it is reachable only through the C ABI
+    /// (`punktfunk_connection_set_rumble_quirks`), for embedders whose duration-taking API
+    /// rejects short values. The case it was written for is handled elsewhere: Android's
+    /// `createOneShot` does throw on a non-positive duration, but the Kotlin renderer floors the
+    /// duration itself at the call, and that path never declares quirks at all. Kept because it
+    /// is exported ABI, and because a floor belongs here rather than re-invented per embedder.
     pub min_pulse_ms: u16,
     /// Alternate the low motor's LSB on keepalive re-emits (imperceptible) so an SDL-class layer
     /// that no-ops identical values still writes the device — the Deck's dedupe-defeat.
@@ -75,8 +106,11 @@ struct PadState {
     /// A wire update landed since the last emit (level change OR renewal — renewals re-emit).
     dirty: bool,
     next_keepalive: Option<Instant>,
-    /// Current jitter phase (see [`ActuatorQuirks::dedup_jitter`]).
-    jitter: bool,
+    /// The exact value last handed to an embedder. `(0, 0)` ⇔ the engine believes this actuator is
+    /// silent. It replaces a free-running jitter phase because one field answers all three live
+    /// questions: would re-sending this be a no-op device write (the dedupe nudge), is a stop
+    /// redundant, and would the nudge synthesize the reserved stop.
+    last_emit: (u16, u16),
     quirks: ActuatorQuirks,
 }
 
@@ -88,7 +122,7 @@ impl PadState {
         legacy_wire: None,
         dirty: false,
         next_keepalive: None,
-        jitter: false,
+        last_emit: (0, 0),
         quirks: ActuatorQuirks {
             keepalive_ms: 0,
             min_pulse_ms: 0,
@@ -112,11 +146,46 @@ impl PadState {
         self.legacy_wire = None;
         self.next_keepalive = None;
         self.dirty = false;
+        self.last_emit = (0, 0);
         RumbleCommand {
             pad,
             low: 0,
             high: 0,
             backstop_ms: 0,
+        }
+    }
+
+    /// Build the command for the pad's current level, and record what we handed out.
+    ///
+    /// On a `dedup_jitter` actuator, re-emitting the value the device last took is a no-op write on
+    /// an SDL-class layer, so the low motor's LSB is nudged. Keying that on `last_emit` rather than
+    /// on a free-running phase is what makes it work on EVERY emit path. Previously the nudge lived
+    /// only in the keepalive branch, so a host renewal — which arrives every `ttl*3/10` ms, 120 ms
+    /// at the 400 ms default and 60 ms at the hatch floor — re-emitted the raw level, collided with
+    /// the last jittered write, was swallowed, AND re-anchored the keepalive. That stretched the
+    /// gap between *distinct* device writes to 80 ms at the default cadence and 100 ms at the
+    /// floor, on an actuator whose quirk declares 40.
+    ///
+    /// The nudge is refused when it would synthesize the reserved `(0, 0)` stop. That is level
+    /// `(1, 0)` and only that: `high` must already be 0, and `low ^ 1 == 0` implies `low == 1`.
+    /// There the LSB steps up instead, so the phase still alternates (1 ↔ 3, two parts in 65535)
+    /// and the pad never receives a stop the policy did not order.
+    fn emit(&mut self, pad: u16) -> RumbleCommand {
+        let (mut low, high) = self.level;
+        if self.quirks.dedup_jitter && (low, high) == self.last_emit {
+            let alt = low ^ 1;
+            low = if (alt, high) == (0, 0) {
+                low | 0b10
+            } else {
+                alt
+            };
+        }
+        self.last_emit = (low, high);
+        RumbleCommand {
+            pad,
+            low,
+            high,
+            backstop_ms: self.backstop(),
         }
     }
 }
@@ -156,6 +225,8 @@ impl RumbleEngine {
         p.dirty = true;
         match ttl_ms {
             Some(t) => {
+                // Never honour a lease longer than [`MAX_LEASE_MS`], whatever the sender claims.
+                let t = t.min(MAX_LEASE_MS);
                 p.ttl_ms = t;
                 p.legacy_wire = None;
                 p.deadline = if (low, high) != (0, 0) {
@@ -214,22 +285,25 @@ impl RumbleEngine {
             if p.dirty {
                 p.dirty = false;
                 if p.level == (0, 0) {
-                    return (Some(p.silence(pad)), None);
+                    // Relay a stop only if the actuator is, as far as the engine knows, still
+                    // buzzing. A zero on an already-silent pad heals nothing and costs every
+                    // embedder a command — Android an unconditional log line plus a binder
+                    // `cancel()`. Two senders produce them: the host's deliberate
+                    // `RUMBLE_STOP_BURST` re-sends after the first stop already landed, and (behind
+                    // `PUNKTFUNK_RUMBLE_ENVELOPE=0`) the legacy flat 500 ms refresh, which re-sends
+                    // zeros for every latched pad for the rest of the session. The burst still
+                    // heals the case it exists for: a LOST first stop leaves the pad buzzing, so
+                    // `last_emit != (0, 0)` and the re-send does emit.
+                    if p.last_emit != (0, 0) {
+                        return (Some(p.silence(pad)), None);
+                    }
+                    continue;
                 }
                 if p.quirks.keepalive_ms > 0 {
                     p.next_keepalive =
                         Some(now + Duration::from_millis(p.quirks.keepalive_ms as u64));
                 }
-                let (low, high) = p.level;
-                return (
-                    Some(RumbleCommand {
-                        pad,
-                        low,
-                        high,
-                        backstop_ms: p.backstop(),
-                    }),
-                    None,
-                );
+                return (Some(p.emit(pad)), None);
             }
             // 4) actuator-decay keepalive, bounded by (1)/(2) above by construction: an expired
             // or stale pad was silenced before reaching here, so a keepalive can never sustain a
@@ -239,20 +313,7 @@ impl RumbleEngine {
                 let due = *p.next_keepalive.get_or_insert(now + ka);
                 if now >= due {
                     p.next_keepalive = Some(now + ka);
-                    let (mut low, high) = p.level;
-                    if p.quirks.dedup_jitter {
-                        p.jitter = !p.jitter;
-                        low ^= p.jitter as u16;
-                    }
-                    return (
-                        Some(RumbleCommand {
-                            pad,
-                            low,
-                            high,
-                            backstop_ms: p.backstop(),
-                        }),
-                        None,
-                    );
+                    return (Some(p.emit(pad)), None);
                 }
                 merge_wake(&mut wake, due);
             }
@@ -356,6 +417,22 @@ pub(crate) struct Closed;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The Steam Deck's declared quirks — the only shipping actuator with `dedup_jitter`.
+    const DECK: ActuatorQuirks = ActuatorQuirks {
+        keepalive_ms: 40,
+        min_pulse_ms: 0,
+        dedup_jitter: true,
+    };
+
+    /// Drain the engine the way an embedder does: poll until nothing is due.
+    fn drain(e: &mut RumbleEngine, t: Instant) -> Vec<(u16, u16)> {
+        let mut out = Vec::new();
+        while let (Some(c), _) = e.poll(t) {
+            out.push((c.low, c.high));
+        }
+        out
+    }
 
     fn ms(v: u64) -> Duration {
         Duration::from_millis(v)
@@ -526,5 +603,134 @@ mod tests {
             cmd(1, 0, 0, 0)
         );
         assert_eq!(shared.next_command(ms(10)), Err(Closed));
+    }
+
+    /// A host renewal must not repeat the value the device last took, or an SDL-class layer
+    /// swallows the write. Before the jitter moved onto every emit path it lived only in the
+    /// keepalive branch, so each renewal collided with the last jittered write and was deduped.
+    #[test]
+    fn renewal_keeps_the_dedupe_jitter_alternating() {
+        let mut e = RumbleEngine::new();
+        e.set_quirks(0, DECK);
+        let t0 = Instant::now();
+        e.wire_update(t0, 0, 100, 200, Some(400));
+        assert_eq!(drain(&mut e, t0), vec![(100, 200)]);
+        assert_eq!(drain(&mut e, t0 + ms(40)), vec![(101, 200)]);
+        assert_eq!(drain(&mut e, t0 + ms(80)), vec![(100, 200)]);
+        // The renewal at the 120 ms default cadence: same level, must still be a distinct write.
+        e.wire_update(t0 + ms(120), 0, 100, 200, Some(400));
+        assert_eq!(drain(&mut e, t0 + ms(120)), vec![(101, 200)]);
+        assert_eq!(drain(&mut e, t0 + ms(160)), vec![(100, 200)]);
+    }
+
+    /// Phase-robust version of the same property, at the TTL hatch's 60 ms renewal floor: no two
+    /// consecutive DISTINCT device writes may be further apart than the declared 40 ms cadence.
+    #[test]
+    fn renewal_never_gaps_distinct_writes_at_the_60ms_floor() {
+        let mut e = RumbleEngine::new();
+        e.set_quirks(0, DECK);
+        let t0 = Instant::now();
+        let (mut last, mut last_write, mut worst) = ((0u16, 0u16), 0u64, 0u64);
+        for tick in 0..=360u64 {
+            let t = t0 + ms(tick);
+            if tick % 60 == 0 {
+                e.wire_update(t, 0, 100, 200, Some(400));
+            }
+            for v in drain(&mut e, t) {
+                assert_ne!(v, (0, 0), "a live lease must never emit the stop sentinel");
+                if v != last {
+                    worst = worst.max(tick - last_write);
+                    last_write = tick;
+                    last = v;
+                }
+            }
+        }
+        assert!(
+            worst <= 41,
+            "worst distinct-write gap {worst} ms exceeds the 40 ms declared cadence"
+        );
+    }
+
+    /// The nudge must stay behind `dedup_jitter`: an off-by-one amplitude on a default-quirks pad
+    /// would land in Apple's identical-target comparison and Android's one-shot amplitudes.
+    #[test]
+    fn default_quirks_pads_get_the_level_verbatim_on_every_renewal() {
+        let mut e = RumbleEngine::new(); // Apple / Android / plain SDL
+        let t0 = Instant::now();
+        e.wire_update(t0, 0, 100, 200, Some(400));
+        assert_eq!(e.poll(t0).0, Some(cmd(0, 100, 200, 800)));
+        e.wire_update(t0 + ms(120), 0, 100, 200, Some(400));
+        assert_eq!(e.poll(t0 + ms(120)).0, Some(cmd(0, 100, 200, 800)));
+    }
+
+    /// Level `(1, 0)` is the one value whose LSB flip is the reserved stop. The nudge steps up
+    /// instead, so the phase still alternates and no stop is invented under a live lease.
+    #[test]
+    fn jitter_never_synthesizes_the_stop_sentinel() {
+        let mut e = RumbleEngine::new();
+        e.set_quirks(0, DECK);
+        let t0 = Instant::now();
+        e.wire_update(t0, 0, 1, 0, Some(400));
+        assert_eq!(e.poll(t0).0, Some(cmd(0, 1, 0, 800)));
+        assert_eq!(e.poll(t0 + ms(40)).0, Some(cmd(0, 3, 0, 800)));
+        assert_eq!(e.poll(t0 + ms(80)).0, Some(cmd(0, 1, 0, 800)));
+    }
+
+    /// A zero for a pad the engine already believes is silent is dropped: it heals nothing and
+    /// costs every embedder a command. The deliberate stop-burst heal is unaffected, because a
+    /// LOST stop leaves the pad buzzing and the re-send therefore does emit.
+    #[test]
+    fn a_redundant_stop_is_dropped_but_the_burst_still_heals_a_lost_one() {
+        let mut e = RumbleEngine::new();
+        let t0 = Instant::now();
+        e.wire_update(t0, 0, 100, 200, Some(400));
+        assert_eq!(drain(&mut e, t0), vec![(100, 200)]);
+        // First stop reaches the embedder…
+        e.wire_update(t0 + ms(10), 0, 0, 0, Some(0));
+        assert_eq!(drain(&mut e, t0 + ms(10)), vec![(0, 0)]);
+        // …and the burst re-sends behind it are now silent.
+        e.wire_update(t0 + ms(20), 0, 0, 0, Some(0));
+        e.wire_update(t0 + ms(30), 0, 0, 0, Some(0));
+        assert_eq!(drain(&mut e, t0 + ms(30)), Vec::new());
+
+        // But if the pad is buzzing (the stop that mattered was lost), a re-send still emits.
+        e.wire_update(t0 + ms(40), 0, 100, 200, Some(400));
+        assert_eq!(drain(&mut e, t0 + ms(40)), vec![(100, 200)]);
+        e.wire_update(t0 + ms(50), 0, 0, 0, Some(0));
+        assert_eq!(drain(&mut e, t0 + ms(50)), vec![(0, 0)]);
+    }
+
+    /// The client bounds the host's lease. `RUMBLE_TTL_CEIL_MS` is sender-side only, so a modified
+    /// or third-party host could otherwise stamp a huge TTL and wedge its pump, leaving Apple and
+    /// the Deck buzzing for the whole of it.
+    #[test]
+    fn an_overlong_lease_is_clamped_to_the_ceiling() {
+        let mut e = RumbleEngine::new();
+        let t0 = Instant::now();
+        e.wire_update(t0, 0, 100, 200, Some(u16::MAX));
+        assert_eq!(e.poll(t0).0, Some(cmd(0, 100, 200, 5000)));
+        // Silenced at the ceiling, not at the 65 s the sender asked for.
+        assert!(e.poll(t0 + ms(MAX_LEASE_MS as u64 - 1)).0.is_none());
+        assert_eq!(
+            e.poll(t0 + ms(MAX_LEASE_MS as u64)).0,
+            Some(cmd(0, 0, 0, 0)),
+            "the lease must end at the ceiling"
+        );
+    }
+
+    /// A v2 envelope carrying `ttl_ms == 0` on a LIVE level. The audit suspected the zero would be
+    /// mistaken for the legacy sentinel in `backstop()`; it cannot, because the expiry check
+    /// preempts the relay branch — the pad silences on the same poll and never reaches a backstop.
+    /// Pinned so that ordering stays load-bearing rather than incidental.
+    #[test]
+    fn a_zero_ttl_envelope_silences_rather_than_taking_the_legacy_backstop() {
+        let mut e = RumbleEngine::new();
+        let t0 = Instant::now();
+        e.wire_update(t0, 0, 100, 200, Some(0));
+        assert_eq!(
+            e.poll(t0).0,
+            Some(cmd(0, 0, 0, 0)),
+            "a zero-length lease must expire immediately, not emit with a legacy backstop"
+        );
     }
 }

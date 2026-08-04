@@ -674,6 +674,8 @@ fn pw_thread(
             })
             .register();
 
+        // Which source the negotiated format below actually describes — see the note there.
+        let sink_mode = sink_name.is_some();
         let props = match &sink_name {
             // Stream-sink mode: this stream IS the sink (media.class + Direction::Input). Apps
             // play into it, PipeWire mixes them, process() receives the mix. Mirrors the
@@ -710,8 +712,25 @@ fn pw_thread(
         let stream = pw::stream::StreamBox::new(&core, "punktfunk-audio", props)
             .context("pw audio Stream")?;
 
+        // The capture callback's state: the hand-off channel plus this plane's vitals. Before
+        // this it was the bare `tx`, and the desktop-audio plane logged NOTHING between "capture
+        // started" and the session ending — no level, no cadence, and in particular no sign of
+        // the silent drop below. That is exactly what made the 2026-08-03 Windows field report
+        // un-triageable, and the Linux half kept it after the Windows half was fixed.
+        struct CapUd {
+            tx: std::sync::mpsc::SyncSender<Vec<f32>>,
+            channels: u32,
+            stats: crate::audio::capture_policy::CaptureStats,
+            last_stats: std::time::Instant,
+        }
+        let ud = CapUd {
+            tx,
+            channels,
+            stats: Default::default(),
+            last_stats: std::time::Instant::now(),
+        };
         let _listener = stream
-            .add_local_listener_with_user_data(tx)
+            .add_local_listener_with_user_data(ud)
             .state_changed({
                 let mainloop = mainloop.clone();
                 move |_s, _ud, old, new| {
@@ -723,22 +742,32 @@ fn pw_thread(
                     }
                 }
             })
-            .param_changed(|_stream, _tx, id, param| {
+            .param_changed(move |_stream, _tx, id, param| {
                 let Some(param) = param else { return };
                 if id != pw::spa::param::ParamType::Format.as_raw() {
                     return;
                 }
                 let mut info = AudioInfoRaw::default();
                 if info.parse(param).is_ok() {
+                    // `stream_sink` says WHICH source this format describes, and that changes how
+                    // much it is worth. In stream-sink mode the host owns the sink, so this IS the
+                    // format apps render into and the desktop mix cannot have been narrowed before
+                    // we saw it. In LEGACY monitor mode we are capturing someone else's sink
+                    // through PipeWire's resampler: a 16 kHz Bluetooth headset upstream would
+                    // still be reported here as a clean 48 kHz, exactly the way WASAPI's
+                    // autoconvert hid the same thing on Windows (the 2026-08-03 report). Reading
+                    // the monitored node's OWN rate needs a registry lookup this stream does not
+                    // do — recorded as an open gap rather than implied to be covered.
                     tracing::info!(
                         format = ?info.format(),
                         rate = info.rate(),
                         channels = info.channels(),
+                        stream_sink = sink_mode,
                         "audio format negotiated"
                     );
                 }
             })
-            .process(|stream, tx| {
+            .process(|stream, ud| {
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let Some(mut buffer) = stream.dequeue_buffer() else {
                         return;
@@ -774,7 +803,34 @@ fn pw_thread(
                         ];
                         samples.push(f32::from_le_bytes(b));
                     }
-                    let _ = tx.try_send(samples); // drop if the encoder is behind
+                    ud.stats.observe(&samples, ud.channels);
+                    // Non-blocking and lossy, as before — but COUNTED. A full channel means the
+                    // encode thread is not keeping up, and because the encoder simply
+                    // concatenates across the hole every dropped chunk is a click AND a
+                    // permanent shift of everything after it.
+                    if ud.tx.try_send(samples).is_err() {
+                        ud.stats.dropped_chunks += 1;
+                    }
+                    if ud.last_stats.elapsed() >= crate::audio::capture_policy::STATS_EVERY {
+                        let (peak_db, rms_db, delivered_pct) =
+                            ud.stats.summary(ud.last_stats.elapsed(), SAMPLE_RATE);
+                        if ud.stats.dropped_chunks > 0 {
+                            tracing::warn!(
+                                dropped_chunks = ud.stats.dropped_chunks,
+                                "the audio encode thread could not keep up — captured audio was \
+                                 DROPPED; the stream will click and everything after it shifts"
+                            );
+                        }
+                        tracing::info!(
+                            peak_db = format!("{peak_db:.1}"),
+                            rms_db = format!("{rms_db:.1}"),
+                            delivered_pct = format!("{delivered_pct:.0}"),
+                            dropped_chunks = ud.stats.dropped_chunks,
+                            "desktop audio capture"
+                        );
+                        ud.stats = Default::default();
+                        ud.last_stats = std::time::Instant::now();
+                    }
                 }));
                 if outcome.is_err() {
                     tracing::error!("panic in pipewire audio callback — chunk dropped");

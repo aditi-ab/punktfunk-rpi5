@@ -16,6 +16,19 @@
 //! [`KNOWN`] as new forks appear) matched against running processes, registered OS services/units,
 //! and on-disk install markers. The platform back-ends (`detect/windows.rs`, `detect/linux.rs`)
 //! provide the raw facts; the matching + rendering here is portable and unit-tested.
+//!
+//! **Not every fingerprint is a conflict.** Only a host that is running, or that will start on its
+//! own, can take the ports or load a second virtual-display driver. A leftover `Program Files`
+//! folder from an uninstall, a binary on `PATH`, or a service registered but *disabled* clashes
+//! with nothing — Sunshine's and Apollo's uninstallers both leave their config/log directories
+//! behind, so treating mere presence as a conflict cries wolf on a machine whose other host is long
+//! gone. [`Evidence::is_active`] draws that line and [`Detection::is_active`] lifts it to the
+//! product; the warning surfaces (startup log, `/local/summary` → the web console's conflicts card,
+//! the `detect-conflicts` exit code) report **only** active detections, while the full report still
+//! lists the dormant ones as context for support. This matches the installer's own probe
+//! (`punktfunk-host.iss`'s `StreamHostEnabled`: service start type <= 2), which was narrowed to
+//! exactly this rule after a dormant Sunshine aborted a `winget install` in the field, and the tray,
+//! which dropped its always-on warning over a merely-installed Sunshine in `3e782852`.
 
 use std::sync::OnceLock;
 
@@ -73,17 +86,38 @@ impl Product {
 pub enum Evidence {
     /// A matching process is running **right now** (process/executable basename).
     Running { process: String },
-    /// An OS service / systemd unit for the product is registered (installed; may be stopped).
-    Service { name: String },
+    /// An OS service / systemd unit for the product is registered. `autostart` is the load-bearing
+    /// bit: a service that comes up on its own (Windows start type boot/system/automatic; an enabled
+    /// systemd unit) *will* clash, whereas a disabled/manual one is inert until someone starts it by
+    /// hand — at which point the `Running` evidence catches it on the next scan.
+    Service { name: String, autostart: bool },
     /// Installed on disk — a Program Files directory, a flatpak app id, or a binary on `PATH`.
+    /// Always dormant: files that nothing launches bind no ports.
     Installed { at: String },
 }
 
 impl Evidence {
+    /// Does this observation mean a conflicting host will actually take the ports / load a second
+    /// virtual-display driver? See the module docs — this is the whole false-alarm fix.
+    pub fn is_active(&self) -> bool {
+        match self {
+            Evidence::Running { .. } => true,
+            Evidence::Service { autostart, .. } => *autostart,
+            Evidence::Installed { .. } => false,
+        }
+    }
+
     fn render(&self) -> String {
         match self {
             Evidence::Running { process } => format!("running now ({process})"),
-            Evidence::Service { name } => format!("service {name}"),
+            Evidence::Service {
+                name,
+                autostart: true,
+            } => format!("service {name} (starts automatically)"),
+            Evidence::Service {
+                name,
+                autostart: false,
+            } => format!("service {name} (disabled/manual — dormant)"),
             Evidence::Installed { at } => format!("installed at {at}"),
         }
     }
@@ -105,12 +139,24 @@ impl Detection {
             .any(|e| matches!(e, Evidence::Running { .. }))
     }
 
-    /// A compact one-line label for the tray/console summary, e.g. `Sunshine (running)`.
+    /// True when this host is running **or** will start on its own — i.e. the detection is worth
+    /// warning a user about. A product seen only as files on disk or a disabled service is dormant
+    /// and reports `false`; see the module docs.
+    pub fn is_active(&self) -> bool {
+        self.evidence.iter().any(Evidence::is_active)
+    }
+
+    /// A compact one-line label for the console summary, e.g. `Sunshine (running)`. The qualifier
+    /// names what was actually observed, so a card built from these labels can never claim a
+    /// dormant install is running.
     pub fn label(&self) -> String {
+        let name = self.product.label();
         if self.is_running() {
-            format!("{} (running)", self.product.label())
+            format!("{name} (running)")
+        } else if self.is_active() {
+            format!("{name} (starts automatically)")
         } else {
-            self.product.label().to_string()
+            format!("{name} (installed, not running)")
         }
     }
 }
@@ -225,28 +271,66 @@ pub fn snapshot() -> &'static [Detection] {
     SNAPSHOT.get().map(Vec::as_slice).unwrap_or(&[])
 }
 
-/// Compact labels for the tray / web-console summary (e.g. `["Sunshine (running)", "Apollo"]`).
-pub fn summary_labels(detections: &[Detection]) -> Vec<String> {
-    detections.iter().map(Detection::label).collect()
+/// True if any detection is active — the one gate the warning surfaces share (startup log, the
+/// `detect-conflicts` exit code, the console card).
+pub fn any_active(detections: &[Detection]) -> bool {
+    detections.iter().any(Detection::is_active)
 }
 
-/// A full human-readable report: the blurb + one bullet per detected host with its evidence.
-/// Empty string when nothing was detected (callers gate on `is_empty()`).
+/// Compact labels for the web-console summary (e.g. `["Sunshine (running)"]`).
+///
+/// **Active detections only.** A dormant leftover (an uninstalled Sunshine's `Program Files` folder,
+/// a disabled service) is deliberately absent: this feeds the console's conflicts card, which exists
+/// to explain why clients cannot reach a working-looking host, and files that nothing launches never
+/// cause that. The full [`render_report`] still lists them for support.
+pub fn summary_labels(detections: &[Detection]) -> Vec<String> {
+    detections
+        .iter()
+        .filter(|d| d.is_active())
+        .map(Detection::label)
+        .collect()
+}
+
+/// A full human-readable report, split by whether the finding can actually clash. Empty string when
+/// nothing was detected at all (callers gate on `is_empty()`).
+///
+/// The dormant section is why this stays verbose where [`summary_labels`] is quiet: when a user asks
+/// "why does Punktfunk think I have Apollo?", the answer is the exact leftover path, and the report
+/// says in the same breath that it needs no action.
 pub fn render_report(detections: &[Detection]) -> String {
     if detections.is_empty() {
         return String::new();
     }
-    let mut s = String::from("Detected another game-streaming host on this machine.\n");
-    s.push_str(UNSUPPORTED_BLURB);
-    s.push_str("\n\nDetected:\n");
-    for d in detections {
+    let bullet = |d: &Detection| {
         let ev = d
             .evidence
             .iter()
             .map(Evidence::render)
             .collect::<Vec<_>>()
             .join("; ");
-        s.push_str(&format!("  \u{2022} {} \u{2014} {ev}\n", d.product.label()));
+        format!("  \u{2022} {} \u{2014} {ev}\n", d.product.label())
+    };
+    let (active, dormant): (Vec<_>, Vec<_>) = detections.iter().partition(|d| d.is_active());
+    let mut s = String::new();
+    if !active.is_empty() {
+        s.push_str("Detected another game-streaming host on this machine.\n");
+        s.push_str(UNSUPPORTED_BLURB);
+        s.push_str("\n\nDetected:\n");
+        for d in &active {
+            s.push_str(&bullet(d));
+        }
+    }
+    if !dormant.is_empty() {
+        if !active.is_empty() {
+            s.push('\n');
+        }
+        s.push_str(
+            "Also present but DORMANT — not running and not set to start on its own, so it clashes \
+with nothing and needs no action (typically leftovers from an uninstall):\n",
+        );
+        for d in &dormant {
+            s.push_str(&bullet(d));
+        }
     }
     s
 }
@@ -275,15 +359,19 @@ mod tests {
                 },
                 Evidence::Service {
                     name: "SunshineService".into(),
+                    autostart: true,
                 },
             ],
         );
         assert!(d.is_running());
+        assert!(d.is_active());
         assert_eq!(d.label(), "Sunshine (running)");
     }
 
+    /// The field case this split exists for: Apollo uninstalled, its `Program Files` folder left
+    /// behind. Nothing launches it, so it is NOT a conflict and must never reach the console card.
     #[test]
-    fn installed_only_is_not_running() {
+    fn a_leftover_install_dir_is_dormant_and_never_surfaces() {
         let d = det(
             Product::Apollo,
             vec![Evidence::Installed {
@@ -291,42 +379,77 @@ mod tests {
             }],
         );
         assert!(!d.is_running());
-        assert_eq!(d.label(), "Apollo");
+        assert!(!d.is_active(), "files on disk cannot bind a port");
+        assert_eq!(d.label(), "Apollo (installed, not running)");
+        assert!(summary_labels(std::slice::from_ref(&d)).is_empty());
+        assert!(!any_active(&[d]));
+    }
+
+    /// A registered-but-DISABLED service is the other half of the same false alarm: `service_exists`
+    /// used to count it, which disagreed with the installer's `Start <= 2` probe.
+    #[test]
+    fn a_disabled_service_is_dormant_but_an_autostart_one_is_not() {
+        let disabled = det(
+            Product::Sunshine,
+            vec![Evidence::Service {
+                name: "SunshineService".into(),
+                autostart: false,
+            }],
+        );
+        assert!(!disabled.is_active());
+        assert!(summary_labels(&[disabled]).is_empty());
+
+        let auto = det(
+            Product::Sunshine,
+            vec![Evidence::Service {
+                name: "SunshineService".into(),
+                autostart: true,
+            }],
+        );
+        assert!(auto.is_active());
+        assert!(!auto.is_running(), "registered to start != started");
+        assert_eq!(auto.label(), "Sunshine (starts automatically)");
+        assert_eq!(
+            summary_labels(&[auto]),
+            vec!["Sunshine (starts automatically)".to_string()]
+        );
     }
 
     #[test]
-    fn report_lists_every_product_and_the_blurb() {
-        let report = render_report(&[
-            det(
-                Product::Sunshine,
-                vec![Evidence::Running {
-                    process: "sunshine".into(),
-                }],
-            ),
-            det(
-                Product::Apollo,
-                vec![Evidence::Installed {
-                    at: "/usr/bin/apollo".into(),
-                }],
-            ),
-        ]);
+    fn report_separates_active_from_dormant_and_keeps_the_blurb() {
+        let active = det(
+            Product::Sunshine,
+            vec![Evidence::Running {
+                process: "sunshine".into(),
+            }],
+        );
+        let dormant = det(
+            Product::Apollo,
+            vec![Evidence::Installed {
+                at: "/usr/bin/apollo".into(),
+            }],
+        );
+        let report = render_report(&[active.clone(), dormant.clone()]);
         assert!(report.contains("UNSUPPORTED"));
+        // The bullets name the PRODUCT and let the evidence speak — `Detection::label`'s qualifier
+        // would only restate what follows the dash ("Sunshine (running) — running now (sunshine)").
+        // The qualifier is for `summary_labels`, which has no evidence text beside it.
         assert!(report.contains("Sunshine \u{2014} running now (sunshine)"));
+        assert!(report.contains("DORMANT"));
         assert!(report.contains("Apollo \u{2014} installed at /usr/bin/apollo"));
+        // Only the live one is offered to the console card.
         assert_eq!(
-            summary_labels(&[
-                det(
-                    Product::Sunshine,
-                    vec![Evidence::Running {
-                        process: "sunshine".into()
-                    }]
-                ),
-                det(
-                    Product::Apollo,
-                    vec![Evidence::Installed { at: "x".into() }]
-                ),
-            ]),
-            vec!["Sunshine (running)".to_string(), "Apollo".to_string()]
+            summary_labels(&[active, dormant.clone()]),
+            vec!["Sunshine (running)".to_string()]
+        );
+
+        // A dormant-only machine gets the explanatory listing WITHOUT the "unsupported" alarm — the
+        // whole point is that this needs no action.
+        let dormant_only = render_report(&[dormant]);
+        assert!(dormant_only.contains("DORMANT"));
+        assert!(
+            !dormant_only.contains("UNSUPPORTED"),
+            "a leftover folder must not read as an unsupported dual-host setup:\n{dormant_only}"
         );
     }
 

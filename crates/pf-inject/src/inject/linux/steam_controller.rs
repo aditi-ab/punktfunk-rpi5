@@ -23,6 +23,11 @@ use super::steam_proto::{
     btn, parse_steam_output, sc_from_gamepad, serial_reply, serialize_deck_state,
     serialize_sc_state, SteamModel, SteamState, STEAMDECK_RDESC, STEAM_REPORT_LEN, STEAM_VENDOR,
 };
+use crate::uhid_abi::{
+    put_cstr, request_id, set_report_data, BUS_USB, HID_MAX_DESCRIPTOR_SIZE, UHID_CREATE2,
+    UHID_DESTROY, UHID_EVENT_SIZE, UHID_GET_REPORT, UHID_GET_REPORT_REPLY, UHID_INPUT2,
+    UHID_OUTPUT, UHID_PATH, UHID_SET_REPORT, UHID_SET_REPORT_REPLY,
+};
 use crate::uhid_manager::{PadFeedback, PadProto, UhidManager};
 use anyhow::{Context, Result};
 use punktfunk_core::quic::RichInput;
@@ -32,31 +37,12 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-// /dev/uhid event ABI — same layout as the DualSense backend.
-const UHID_PATH: &str = "/dev/uhid";
-const UHID_DESTROY: u32 = 1;
-const UHID_OUTPUT: u32 = 6;
-const UHID_GET_REPORT: u32 = 9;
-const UHID_GET_REPORT_REPLY: u32 = 10;
-const UHID_CREATE2: u32 = 11;
-const UHID_INPUT2: u32 = 12;
-const UHID_SET_REPORT: u32 = 13;
-const UHID_SET_REPORT_REPLY: u32 = 14;
-const HID_MAX_DESCRIPTOR_SIZE: usize = 4096;
-const UHID_EVENT_SIZE: usize = 4 + 4372;
-const BUS_USB: u16 = 0x03;
-
 /// Hold the `b9.6` mode-switch this long at creation to toggle `gamepad_mode` on (the kernel needs
 /// ~450 ms continuous; give margin).
 const MODE_ENTER: Duration = Duration::from_millis(650);
 /// Cap continuous `b9.6` (Start) below the kernel's 450 ms mode-switch threshold: after this long
 /// we insert a one-frame release so an in-game long-Start-hold can't toggle `gamepad_mode` off.
 const MENU_HOLD_CAP: Duration = Duration::from_millis(350);
-
-fn put_cstr(ev: &mut [u8], off: usize, cap: usize, s: &str) {
-    let n = s.len().min(cap - 1);
-    ev[off..off + n].copy_from_slice(&s.as_bytes()[..n]);
-}
 
 /// Best-effort, once per process: clear `hid_steam`'s `lizard_mode` so `steam_do_deck_input_event`
 /// stops gating on `gamepad_mode` (gamepad events then always flow). Needs root; on failure the
@@ -214,10 +200,13 @@ impl SteamDeckPad {
                     let _ = self.reply_get_report(id, &serial_reply("PUNKTFUNK01"));
                 }
                 UHID_SET_REPORT => {
-                    let id = u32::from_ne_bytes([ev[4], ev[5], ev[6], ev[7]]);
-                    // SET_REPORT data: [report-id 0, cmd, …] at ev[12..]. Surface rumble, then ack.
-                    let end = (12 + 16).min(UHID_EVENT_SIZE);
-                    if let Some(r) = parse_steam_output(&ev[12..end]).rumble {
+                    let id = request_id(&ev);
+                    // SET_REPORT data: [report-id 0, cmd, …]. Take exactly the bytes the kernel
+                    // declared — this used to read a fixed 16-byte window, which truncated any
+                    // longer report and, for a shorter one, fed the parser whatever the reused
+                    // event buffer still held past the payload. Every sibling backend that parses
+                    // SET_REPORT already read the size field; this one didn't.
+                    if let Some(r) = parse_steam_output(set_report_data(&ev)).rumble {
                         rumble = Some(r);
                     }
                     let _ = self.reply_set_report(id);

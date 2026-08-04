@@ -74,9 +74,10 @@ saved host's own menu, and only appears when that host is offline *and* an addre
 | Android · Android TV | **Wake host** — waits, showing the "Waking…" screen | **Wake-on-LAN MAC** in **Edit host** |
 | Punktfunk Console (controller shell) | on an offline host with a known address, the confirm button reads **Wake & Connect** — it waits, then connects | not offered |
 
-Punktfunk Console has no auto-wake setting of its own, and offers **Wake & Connect** whatever the
-desktop app's setting says. In the Apple apps the same button appears when you drive them with a
-controller, but there it does follow the auto-wake setting.
+Punktfunk Console carries the row too — **Wake hosts automatically**, in the same settings list the
+desktop apps write — but its **Wake & Connect** button is an explicit action and appears whatever
+that row says. In the Apple apps the same button appears when you drive them with a controller, but
+there it does follow the auto-wake setting.
 
 The Apple apps also publish a **Wake Host** action to Shortcuts, so an automation can wake a host
 without opening the app. On iPhone and iPad it has a ready-made phrase: *"Wake ⟨host⟩ with
@@ -88,10 +89,14 @@ host list, and shows an explanation with a link to system settings if you declin
 
 ### On the Steam Deck
 
-The [Decky plugin](/docs/steam-deck) has no wake button and no wake setting. It sends a wake through
-the Flatpak client just before **every** stream launch, and it is a no-op until that client has
-learned the host's address. When a packet really did go out, the plugin also stretches the stream's
-connect budget to 75 seconds, so the connection survives the host resuming from sleep.
+The [Decky plugin](/docs/steam-deck) has no wake button and no wake setting of its own. It starts
+every stream through the client, so the wake is the client's, on exactly the terms above: a packet
+the moment the host doesn't answer, re-sent every 6 seconds while the client watches for it once a
+second, and the dial only when it really is back. It follows **Wake hosts automatically** in the
+client's own settings — **Open Punktfunk → Settings** from the same panel — and is a no-op until the
+client has learned that host's MAC address. (The plugin used to fire a packet itself and stretch the
+connect budget to 75 seconds to cover the resume; a wait that watches for the host beats a fixed
+budget, so that is gone.)
 
 ### From the command line
 

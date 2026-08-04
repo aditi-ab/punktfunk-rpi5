@@ -81,24 +81,126 @@ enum ShotScenes {
 
 @MainActor
 enum ShotMock {
-    /// A populated saved-host grid: a pinned recent host, a couple more, mixed online state.
+    // Stable ids so the store, the adverts and the profile bindings all point at the same things
+    // across every scene and every run.
+    static let battlestationID = UUID(uuidString: "5B0D1E00-0000-4000-8000-000000000001")!
+    static let livingRoomID = UUID(uuidString: "5B0D1E00-0000-4000-8000-000000000002")!
+    static let workshopID = UUID(uuidString: "5B0D1E00-0000-4000-8000-000000000003")!
+    static let officeID = UUID(uuidString: "5B0D1E00-0000-4000-8000-000000000004")!
+    static let editingID = UUID(uuidString: "5B0D1E00-0000-4000-8000-000000000005")!
+    static let bedroomID = UUID(uuidString: "5B0D1E00-0000-4000-8000-000000000006")!
+
+    static let hdrProfileID = "a71c4e0d9f22"
+    static let couchProfileID = "3e88b107c4da"
+
+    /// The catalog the host cards read their chips and pinned cards from. Seeded once, on the
+    /// first store build — `ProfileStore` is a singleton, and in shot mode its write-back is
+    /// suppressed, so this never reaches a real user's catalog.
+    static func installProfiles() {
+        guard !profilesInstalled else { return }
+        profilesInstalled = true
+        ProfileStore.shared.debugSet([
+            StreamProfile(name: "4K HDR", id: hdrProfileID, accent: "#8B7BF7"),
+            StreamProfile(name: "Couch 1080p", id: couchProfileID, accent: "#4FD1A5"),
+        ])
+    }
+
+    private static var profilesInstalled = false
+
+    /// A populated saved-host grid: the most-recent host bound to a profile (its chip), a second
+    /// paired machine, and one asleep box we hold a MAC for (so its card offers Wake-on-LAN). OS
+    /// chains give every tile its real vendor mark instead of a letter monogram.
+    ///
+    /// No PINNED host+profile card: it renders a second tile for the SAME host, which is the
+    /// feature working as designed but reads as a duplicate to anyone meeting the app in a store
+    /// listing. The binding chip carries the profile story on its own.
     static func hostStore() -> HostStore {
+        installProfiles()
         let store = HostStore()
         store.hosts = [
-            StoredHost(name: "Battlestation", address: "192.168.1.20", port: 9777,
-                       pinnedSHA256: fingerprint, lastConnected: Date().addingTimeInterval(-420)),
-            StoredHost(name: "Living Room PC", address: "192.168.1.41", port: 9777,
-                       pinnedSHA256: fingerprint),
-            StoredHost(name: "Workshop", address: "10.0.0.7", port: 9777),
+            StoredHost(
+                id: battlestationID, name: "Battlestation", address: "192.168.1.20", port: 9777,
+                pinnedSHA256: fingerprint, lastConnected: Date().addingTimeInterval(-420),
+                macAddresses: ["a4:b1:c2:d3:e4:f5"], profileID: hdrProfileID,
+                osChain: "windows/11"),
+            StoredHost(
+                id: livingRoomID, name: "Living Room PC", address: "192.168.1.41", port: 9777,
+                pinnedSHA256: hostFingerprint(1), lastConnected: Date().addingTimeInterval(-86_400),
+                macAddresses: ["b8:27:eb:11:22:33"], osChain: "linux/fedora/bazzite"),
+            StoredHost(
+                id: officeID, name: "Office NUC", address: "192.168.1.33", port: 9777,
+                pinnedSHA256: hostFingerprint(4), lastConnected: Date().addingTimeInterval(-259_200),
+                profileID: couchProfileID, osChain: "linux/ubuntu"),
+            StoredHost(
+                id: workshopID, name: "Workshop", address: "10.0.0.7", port: 9777,
+                pinnedSHA256: hostFingerprint(2), macAddresses: ["de:ad:be:ef:00:07"],
+                osChain: "linux/arch"),
+            StoredHost(
+                id: editingID, name: "Editing Rig", address: "192.168.1.62", port: 9777,
+                pinnedSHA256: hostFingerprint(5), lastConnected: Date().addingTimeInterval(-604_800),
+                osChain: "linux/nobara"),
+            StoredHost(
+                id: bedroomID, name: "Bedroom Mini", address: "192.168.1.77", port: 9777,
+                pinnedSHA256: hostFingerprint(6), macAddresses: ["00:1a:2b:3c:4d:5e"],
+                osChain: "windows/11"),
         ]
         return store
     }
 
-    static let host = StoredHost(name: "Battlestation", address: "192.168.1.20", port: 9777,
-                                 pinnedSHA256: fingerprint)
+    /// Discovery, seeded rather than live. Two saved hosts advertise (so their cards read ONLINE
+    /// through the real `advertises` path, and the reachability probe skips them — no network from
+    /// a capture), "Workshop" stays quiet so the grid shows an asleep machine, and one genuinely
+    /// new host populates the "On this network" section.
+    ///
+    /// A live browse made the shot non-deterministic AND leaked whatever was on the capturing
+    /// machine's LAN into the App Store listing.
+    static func discovery() -> HostDiscovery {
+        let discovery = HostDiscovery()
+        discovery.debugSet([
+            HostDiscovery.debugAdvert(
+                id: "battlestation", name: "Battlestation", host: "192.168.1.20",
+                fingerprintHex: fingerprint.hexLower, macAddresses: ["a4:b1:c2:d3:e4:f5"],
+                osChain: "windows/11"),
+            HostDiscovery.debugAdvert(
+                id: "living-room", name: "Living Room PC", host: "192.168.1.41",
+                fingerprintHex: hostFingerprint(1).hexLower, macAddresses: ["b8:27:eb:11:22:33"],
+                osChain: "linux/fedora/bazzite"),
+            HostDiscovery.debugAdvert(
+                id: "office-nuc", name: "Office NUC", host: "192.168.1.33",
+                fingerprintHex: hostFingerprint(4).hexLower, osChain: "linux/ubuntu"),
+            HostDiscovery.debugAdvert(
+                id: "studio", name: "Studio PC", host: "192.168.1.58",
+                fingerprintHex: hostFingerprint(3).hexLower, requiresPairing: true, allowsTofu: false,
+                osChain: "windows/11"),
+        ])
+        return discovery
+    }
+
+    static let host = StoredHost(
+        id: battlestationID, name: "Battlestation", address: "192.168.1.20", port: 9777,
+        pinnedSHA256: fingerprint, osChain: "windows/11")
+
+    /// What the pairing sheet calls THIS device. Taken from the platform, not from
+    /// `UIDevice.current.name` — on a capture simulator that is the harness's own throwaway name
+    /// (`pf-shot-iphone-6.9` went out on the store listing that way).
+    static var clientDeviceName: String {
+        #if os(tvOS)
+        "Apple TV"
+        #elseif os(macOS)
+        "MacBook Pro"
+        #else
+        UIDevice.current.userInterfaceIdiom == .pad ? "iPad Pro" : "iPhone"
+        #endif
+    }
 
     /// A plausible-looking 32-byte SHA-256 for the trust card / pin lock glyphs.
-    static let fingerprint = Data((0..<32).map { UInt8(($0 &* 37 &+ 0x1d) & 0xff) })
+    static let fingerprint = hostFingerprint(0)
+
+    /// Distinct per host — `StoredHost.matches` prefers a fingerprint comparison, so sharing one
+    /// across the mock grid made a single advert light up every card.
+    static func hostFingerprint(_ seed: Int) -> Data {
+        Data((0..<32).map { UInt8((($0 &* 37) &+ 0x1d &+ (seed &* 91)) & 0xff) })
+    }
 }
 
 // MARK: - Home
@@ -106,7 +208,7 @@ enum ShotMock {
 private struct ShotHome: View {
     @StateObject private var store = ShotMock.hostStore()
     @StateObject private var model = SessionModel()
-    @StateObject private var discovery = HostDiscovery()
+    @StateObject private var discovery = ShotMock.discovery()
 
     var body: some View {
         #if os(macOS)
@@ -134,7 +236,7 @@ private struct ShotHome: View {
 private struct ShotGamepadHome: View {
     @StateObject private var store = ShotMock.hostStore()
     @StateObject private var model = SessionModel()
-    @StateObject private var discovery = HostDiscovery()
+    @StateObject private var discovery = ShotMock.discovery()
     @StateObject private var waker = HostWaker()
 
     var body: some View {
@@ -146,7 +248,9 @@ private struct ShotGamepadHome: View {
 }
 
 private struct ShotGamepadSettings: View {
-    var body: some View { GamepadSettingsView() }
+    @StateObject private var store = ShotMock.hostStore()
+
+    var body: some View { GamepadSettingsView(store: store) }
 }
 
 private struct ShotGamepadAddHost: View {
@@ -164,7 +268,7 @@ private struct ShotConnect: View {
 
     @StateObject private var store = ShotMock.hostStore()
     @StateObject private var model = SessionModel()
-    @StateObject private var discovery = HostDiscovery()
+    @StateObject private var discovery = ShotMock.discovery()
     @StateObject private var waker = HostWaker()
 
     var body: some View {
@@ -241,9 +345,9 @@ private struct ShotSettings: View {
         #elseif os(iOS)
         // SettingsView owns its NavigationSplitView (sidebar + detail) and Done button, so it is
         // rendered directly — a wrapping NavigationStack would nest a split view in a stack. Open
-        // on General so the shot lands on real controls (iPad: sidebar + General detail; iPhone:
-        // the General page) instead of the bare category list.
-        SettingsView(initialCategory: .general)
+        // on Display rather than the bare category list: resolution, frame rate, bitrate, HDR and
+        // codec are what someone reads a streaming app's settings shot to find out.
+        SettingsView(initialCategory: .display)
         #else
         NavigationStack { SettingsView() }
         #endif
@@ -253,16 +357,44 @@ private struct ShotSettings: View {
 // MARK: - Pair (PIN ceremony)
 
 private struct ShotPair: View {
+    /// The PIN as the host's web console shows it, and a device name that doesn't depend on what
+    /// the capture simulator happens to be called.
+    private var sheet: some View {
+        PairSheet(
+            host: ShotMock.host, shotPIN: "418 306",
+            shotClientName: ShotMock.clientDeviceName, onPaired: { _ in })
+    }
+
     var body: some View {
+        #if os(iOS)
+        // PRESENT it, don't rebuild it. `PairSheet` is a bottom sheet on iOS — it carries its own
+        // `.presentationDetents([.medium, .large])` and the system's Liquid Glass background, both
+        // of which only exist inside a real `.sheet`. Composed into a ZStack instead (what this
+        // scene used to do), the detents were inert, the grouped Form stretched to the full height
+        // of the screen, and the capture was a thin strip of content over a huge black void.
+        ShotHome()
+            .sheet(isPresented: .constant(true)) {
+                // Pinned to one detent. The sheet ships `[.medium, .large]` so it can grow over
+                // the keyboard, and the resting height leaves a wide empty band between the form
+                // and the button row; a capture wants the snug version.
+                sheet.presentationDetents([.fraction(0.52)])
+            }
+        #elseif os(tvOS)
+        // tvOS pushes the ceremony as a full screen (HomeView's `navigationDestination`).
+        NavigationStack { sheet }
+        #else
+        // macOS: a fixed-width panel (`.frame(width: 400).fixedSize()`) that hugs its content, so
+        // floating it over the dimmed grid matches how the window-modal sheet reads. `screencapture
+        // -l<windowID>` grabs one window, and an AppKit sheet is a child window — a real `.sheet`
+        // would fall outside the capture.
         ZStack {
             ShotHome().blur(radius: 28).overlay(Color.black.opacity(0.5))
-            PairSheet(host: ShotMock.host, onPaired: { _ in })
-                .frame(maxWidth: 460)
+            sheet
                 .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 18))
                 .clipShape(RoundedRectangle(cornerRadius: 18))
                 .shadow(radius: 40, y: 16)
-                .padding(40)
         }
+        #endif
     }
 }
 

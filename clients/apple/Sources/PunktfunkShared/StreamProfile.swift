@@ -111,6 +111,8 @@ public struct SettingsOverlay: Codable, Equatable, Sendable {
     public var invertScroll: Bool?
     public var gamepadType: Int?
     public var gamepadForwarding: Bool?
+    public var systemButtons: String?
+    public var guideGesture: String?
     /// A `StatsVerbosity` raw value ("off"/"compact"/"normal"/"detailed") — the enum lives in
     /// PunktfunkKit, which this module must not depend on.
     public var statsVerbosity: String?
@@ -153,6 +155,8 @@ public struct SettingsOverlay: Codable, Equatable, Sendable {
         case invertScroll = "invert_scroll"
         case gamepadType = "gamepad"
         case gamepadForwarding = "gamepad_forwarding"
+        case systemButtons = "system_buttons"
+        case guideGesture = "guide_gesture"
         case statsVerbosity = "stats_verbosity"
         case fullscreenWhileStreaming = "fullscreen_on_stream"
         case enable444 = "enable_444"
@@ -187,6 +191,8 @@ public struct SettingsOverlay: Codable, Equatable, Sendable {
         invertScroll = bool(.invertScroll)
         gamepadType = int(.gamepadType)
         gamepadForwarding = bool(.gamepadForwarding)
+        systemButtons = str(.systemButtons)
+        guideGesture = str(.guideGesture)
         statsVerbosity = str(.statsVerbosity)
         fullscreenWhileStreaming = bool(.fullscreenWhileStreaming)
         enable444 = bool(.enable444)
@@ -224,6 +230,8 @@ public struct SettingsOverlay: Codable, Equatable, Sendable {
         try c.encodeIfPresent(gamepadType, forKey: AnyKey(Key.gamepadType.rawValue))
         try c.encodeIfPresent(
             gamepadForwarding, forKey: AnyKey(Key.gamepadForwarding.rawValue))
+        try c.encodeIfPresent(systemButtons, forKey: AnyKey(Key.systemButtons.rawValue))
+        try c.encodeIfPresent(guideGesture, forKey: AnyKey(Key.guideGesture.rawValue))
         try c.encodeIfPresent(statsVerbosity, forKey: AnyKey(Key.statsVerbosity.rawValue))
         try c.encodeIfPresent(
             fullscreenWhileStreaming, forKey: AnyKey(Key.fullscreenWhileStreaming.rawValue))
@@ -277,6 +285,8 @@ public enum OverlayField {
         case "invert_scroll": overlay.invertScroll = nil
         case "gamepad": overlay.gamepadType = nil
         case "gamepad_forwarding": overlay.gamepadForwarding = nil
+        case "system_buttons": overlay.systemButtons = nil
+        case "guide_gesture": overlay.guideGesture = nil
         case "stats_verbosity": overlay.statsVerbosity = nil
         case "fullscreen_on_stream": overlay.fullscreenWhileStreaming = nil
         case "enable_444": overlay.enable444 = nil
@@ -313,6 +323,8 @@ public enum OverlayField {
         case "invert_scroll": return o.invertScroll != nil
         case "gamepad": return o.gamepadType != nil
         case "gamepad_forwarding": return o.gamepadForwarding != nil
+        case "system_buttons": return o.systemButtons != nil
+        case "guide_gesture": return o.guideGesture != nil
         case "stats_verbosity": return o.statsVerbosity != nil
         case "fullscreen_on_stream": return o.fullscreenWhileStreaming != nil
         case "enable_444": return o.enable444 != nil

@@ -35,6 +35,10 @@ public struct EffectiveSettings: Equatable, Sendable {
     public var invertScroll = false
     public var gamepadType = 0
     public var gamepadForwarding = true
+    /// Cross-client `system_buttons`: "auto" | "forward" | "local".
+    public var systemButtons = "auto"
+    /// Cross-client `guide_gesture`: "auto" | "on" | "off".
+    public var guideGesture = "auto"
     /// A `StatsVerbosity` raw value; the enum lives in PunktfunkKit, which this module can't see.
     public var statsVerbosity = "normal"
     public var fullscreenWhileStreaming = true
@@ -95,6 +99,8 @@ public struct EffectiveSettings: Equatable, Sendable {
         invertScroll = bool(DefaultsKey.invertScroll, invertScroll)
         gamepadType = int(DefaultsKey.gamepadType, gamepadType)
         gamepadForwarding = bool(DefaultsKey.gamepadForwarding, gamepadForwarding)
+        systemButtons = str(DefaultsKey.systemButtons, systemButtons)
+        guideGesture = str(DefaultsKey.guideGesture, guideGesture)
         statsVerbosity = Self.storedStatsVerbosity(defaults)
         fullscreenWhileStreaming = bool(
             DefaultsKey.fullscreenWhileStreaming, fullscreenWhileStreaming)
@@ -121,6 +127,36 @@ public struct EffectiveSettings: Equatable, Sendable {
         return "normal"
     }
 
+    /// The `system_buttons` policy resolved for this platform: forward the raw guide (and
+    /// share/QAM misc) presses? Auto = forward on every Apple platform — where the OS shows
+    /// its own overlay for the press that is the OS's business, and suppressing our send
+    /// would only break users who handed the button to the app (iOS 27's Home-button
+    /// setting; macOS with the gestures claimed).
+    public var systemButtonsForward: Bool {
+        switch systemButtons {
+        case "local": return false
+        default: return true
+        }
+    }
+
+    /// The hold-Select guide gesture resolved for this platform ([`guideGesture`]). Auto =
+    /// on everywhere but macOS: iOS reserves the physical Home press (the Game Overlay,
+    /// uncapturable pre-27) and tvOS never delivers it, so holding Select is the controller
+    /// route to the host's guide — and, held on, to a Gaming-Mode host's QAM. On macOS the
+    /// raw press reaches the host, so auto stays off and Select keeps its exact timing.
+    public var guideGestureEnabled: Bool {
+        switch guideGesture {
+        case "on": return true
+        case "off": return false
+        default:
+            #if os(macOS)
+            return false
+            #else
+            return true
+            #endif
+        }
+    }
+
     /// The one resolution seam: this overlay on top of these settings. Pure — no store reads, no
     /// clock — so it is testable field by field. A `.some` that happens to equal the base is a
     /// legitimate PIN: it keeps its value when the global later moves.
@@ -143,6 +179,8 @@ public struct EffectiveSettings: Equatable, Sendable {
         if let v = overlay.invertScroll { s.invertScroll = v }
         if let v = overlay.gamepadType { s.gamepadType = v }
         if let v = overlay.gamepadForwarding { s.gamepadForwarding = v }
+        if let v = overlay.systemButtons { s.systemButtons = v }
+        if let v = overlay.guideGesture { s.guideGesture = v }
         if let v = overlay.statsVerbosity { s.statsVerbosity = v }
         if let v = overlay.fullscreenWhileStreaming { s.fullscreenWhileStreaming = v }
         if let v = overlay.enable444 { s.enable444 = v }

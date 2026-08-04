@@ -317,10 +317,10 @@ public final class SessionAudio {
         // Build the playback layout from the host-RESOLVED channel count (never the request):
         // 2 = stereo / 6 = 5.1 / 8 = 7.1, canonical wire order FL FR FC LFE RL RR SL SR.
         let channels = Int(connection.resolvedAudioChannels)
-        // 1 s interleaved capacity, ~20 ms prefill (four 5 ms host packets of jitter absorption
-        // before the first sample plays), both scaled by the channel count.
-        let ring = self.ring ?? AudioRing(
-            capacity: 48_000 * channels, prefill: 960 * channels, channels: channels)
+        // 1 s interleaved capacity, scaled by the channel count. The de-jitter depth itself is
+        // the ring's own business now (`AudioRing.targetMS`, mirroring `JitterTuning::COREAUDIO`)
+        // rather than a prefill passed in here.
+        let ring = self.ring ?? AudioRing(capacity: 48_000 * channels, channels: channels)
         self.ring = ring
 
         // Engine-native deinterleaved float; the render block deinterleaves from the ring. Surround
@@ -403,6 +403,7 @@ public final class SessionAudio {
         stateLock.unlock()
         let thread = Thread { [connection, flag, drainDone] in
             defer { drainDone.signal() }
+            var drained = 0
             // Decode happens IN-CORE (libopus multistream) — AudioToolbox's Opus path is
             // stereo-only — and is handed back as interleaved f32 PCM in wire channel order.
             // Per-iteration autorelease pool: no runloop on this thread (see Stage2Pipeline).
@@ -420,6 +421,17 @@ public final class SessionAudio {
                     if let base = p.baseAddress {
                         ring.write(base, count: pcm.frameCount * pcm.channels)
                     }
+                }
+                // Periodic vitals (~10 s at the protocol's 5 ms frames). The other three clients
+                // log buffer depth and underruns; without this an Apple audio report — latency or
+                // dropout — arrives with no numbers at all, which is the position every platform
+                // was in before the 2026-08 audio work.
+                drained += 1
+                if drained % 2_000 == 0 {
+                    let s = ring.stats
+                    log.info(
+                        "audio: buffer_ms=\(s.bufferedMS) target_ms=\(s.targetMS) underruns=\(s.underruns) drift_sheds=\(s.sheds)"
+                    )
                 }
                 return true
                 }

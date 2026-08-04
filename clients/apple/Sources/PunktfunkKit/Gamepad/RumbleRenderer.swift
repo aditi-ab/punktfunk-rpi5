@@ -43,8 +43,14 @@ enum RumbleTuning {
 
     /// Wire amplitude (0...0xFFFF) → CoreHaptics intensity (0...1).
     static func amplitude(_ wire: UInt16) -> Float { Float(wire) / 65535 }
-    /// Wire amplitude → DualSense HID motor byte.
-    static func hidByte(_ wire: UInt16) -> UInt8 { UInt8(wire >> 8) }
+    /// Wire amplitude → DualSense HID motor byte. A nonzero command never collapses to silence:
+    /// the top byte of anything below 0x0100 is 0, so a weak-but-real rumble used to render as
+    /// nothing at all on this path. Floored at 1 — imperceptibly light, but moving. (Android's
+    /// `toAmplitude` has always done this; this was the odd one out.)
+    static func hidByte(_ wire: UInt16) -> UInt8 {
+        let b = UInt8(wire >> 8)
+        return wire != 0 && b == 0 ? 1 : b
+    }
     /// Single-actuator pads render whichever motor is stronger.
     static func combined(low: UInt16, high: UInt16) -> UInt16 { max(low, high) }
     /// Are two baked levels the same (skip the rebuild)?
@@ -81,10 +87,11 @@ enum RumbleTuning {
 ///  4. **Escalating stop.** A throwing `player.stop` means the engine's state is unknown — the
 ///     whole engine is stopped (silencing every player it hosts) and lazily rebuilt behind the
 ///     exponential backoff.
-///  5. **Staleness watchdog** (`Policy.session`): audible with no wire command for
-///     `sessionStaleSeconds` → force silence. A lost stop can outlive the host's 500 ms heal
-///     only if the channel itself died, and then the pad must not buzz forever. `Policy.manual`
-///     (the settings test panel) instead holds a level until it is changed.
+///  5. **No staleness watchdog here.** There was one, keyed off a `Policy` type and a
+///     `sessionStaleSeconds`; both are gone. Every liveness decision — lease expiry, legacy-host
+///     staleness, session close — now belongs to punktfunk-core's shared policy engine
+///     (`client/rumble.rs`), which emits explicit zero commands, so this renderer applies what it
+///     is told and never decides on its own when a level should end.
 ///
 /// Engines are created lazily on the first nonzero amplitude and torn down on retarget;
 /// failures (pads without haptics, engine resets) downgrade to silence — rumble is best-effort
@@ -93,17 +100,6 @@ enum RumbleTuning {
 /// `@unchecked Sendable` is sound because every property is read and written only inside
 /// `queue` closures — the serial queue is the synchronization.
 final class RumbleRenderer: @unchecked Sendable {
-    /// Who ends an un-refreshed nonzero target. Session mode applies the core policy engine's
-    /// commands verbatim — the engine (punktfunk-core `client/rumble.rs`) owns every lease,
-    /// staleness, and close decision and emits explicit zeros, so the renderer keeps NO
-    /// staleness policy of its own anymore. The controller test panel (`manual`) holds a slider
-    /// level indefinitely; both are identical renderer-side today, the distinction is kept for
-    /// the call sites' intent.
-    struct Policy {
-        static let session = Policy()
-        static let manual = Policy()
-    }
-
     /// Which physical actuator this renderer drives: the forwarded controller's haptics engine
     /// (the default), or THIS device's own Taptic Engine (`CHHapticEngine()`) — the opt-in
     /// "rumble on this device" mirror for phone-clip pads that ship without rumble motors.
@@ -115,7 +111,6 @@ final class RumbleRenderer: @unchecked Sendable {
     }
 
     private let queue = DispatchQueue(label: "io.unom.punktfunk.haptics", qos: .userInteractive)
-    private let policy: Policy
     private let actuator: Actuator
 
     /// One finite haptic play on a motor: the player plus when (engine timeline) it expires.
@@ -190,8 +185,7 @@ final class RumbleRenderer: @unchecked Sendable {
         ((0, 0), DispatchTime(uptimeNanoseconds: 0))
     #endif
 
-    init(policy: Policy = .session, actuator: Actuator = .controller) {
-        self.policy = policy
+    init(actuator: Actuator = .controller) {
         self.actuator = actuator
     }
 
@@ -459,6 +453,18 @@ final class RumbleRenderer: @unchecked Sendable {
         if split {
             low = makeMotor(haptics, .leftHandle, sharpness: RumbleTuning.sharpnessLow)
             high = makeMotor(haptics, .rightHandle, sharpness: RumbleTuning.sharpnessHigh)
+            // HALF a split is worse than none, and it used to pass silently: only the all-nil case
+            // below counts as failure, so one surviving handle left `ok` true and `reportHealth(nil)`
+            // announced HEALTHY. What actually rendered was wrong in a direction that depends on
+            // which handle died — lose `high` and `render` falls to the combined branch (selected
+            // purely by `high != nil`), playing max(low, high) on the LEFT handle at the combined
+            // sharpness; lose `low` and the split branch's reconcile no-ops on the nil slot, so the
+            // heavy motor is discarded outright. Tear the survivor down and take the combined path,
+            // which at least renders both motors somewhere.
+            if low == nil || high == nil {
+                log.warning("rumble: only one split-handle engine came up — falling back to combined")
+                teardown() // disarms handlers, stops the survivor's players + engine, nils both
+            }
         } else {
             low = makeMotor(haptics, .default, sharpness: RumbleTuning.sharpnessCombined)
         }
@@ -587,13 +593,33 @@ final class RumbleRenderer: @unchecked Sendable {
         #if os(macOS)
         guard let c, c.extendedGamepad is GCDualSenseGamepad else { return false }
         let hid = DualSenseHID()
-        guard hid.open() else { return false }
+        // Ask for the device this renderer's controller actually is, so two attached DualSenses
+        // do not both get driven through whichever one an unordered Set happened to yield first.
+        guard hid.open(preferringLocationID: Self.hidLocationID(for: c)) else { return false }
         dualSenseHID = hid
         return true
         #else
         return false
         #endif
     }
+
+    #if os(macOS)
+    /// Correlate a `GCController` with an IOKit location id.
+    ///
+    /// GameController exposes no location id, so there is no direct mapping. What it does expose is
+    /// a stable per-controller ordering, and IOKit's location ids are stable per port: pairing the
+    /// two by rank makes each renderer pick a *distinct* device, which is the property that was
+    /// missing. With one pad attached this is the same device it always was.
+    static func hidLocationID(for c: GCController) -> UInt32? {
+        let ids = DualSenseHID.attachedLocationIDs()
+        guard ids.count > 1 else { return ids.first }
+        let peers = GCController.controllers().filter { $0.extendedGamepad is GCDualSenseGamepad }
+        guard let rank = peers.firstIndex(where: { $0 === c }), rank < ids.count else {
+            return ids.first
+        }
+        return ids[rank]
+    }
+    #endif
 
     /// Write the target to the DualSense over HID if that's the active backend; false → not a
     /// HID pad, so the caller renders via CoreHaptics. Deduped on the pad's 0...255 resolution,
@@ -605,8 +631,20 @@ final class RumbleRenderer: @unchecked Sendable {
         let keepalive = levels != (0, 0)
             && seconds(since: lastHidWrite.at) > RumbleTuning.hidKeepaliveSeconds
         if levels != lastHidWrite.levels || keepalive {
-            hid.rumble(low: levels.0, high: levels.1)
-            lastHidWrite = (levels, .now())
+            if hid.rumble(low: levels.0, high: levels.1) {
+                lastHidWrite = (levels, .now())
+            } else {
+                // The write did not reach the device. Do NOT stamp the clock — that would claim a
+                // render that never happened, and for a stop there is nothing behind it: the
+                // keepalive only re-writes non-zero levels and the ticker is cancelled once the
+                // target is (0, 0), so the motors would keep running with nothing scheduled.
+                // Drop the handle instead: the pad reverts to CoreHaptics, and a reconnect
+                // rebuilds it. Health is reported so the state is visible rather than silent.
+                log.error("rumble: HID write failed — dropping the handle, falling back")
+                closeHID()
+                reportHealth("Lost the direct connection to this DualSense; using the system path.")
+                return false
+            }
         }
         return true
         #else

@@ -704,7 +704,10 @@ pub struct PunktfunkHidOutput {
     /// Trigger: number of valid bytes in `effect` (≤ `PUNKTFUNK_HID_EFFECT_MAX`).
     pub effect_len: u8,
     /// Trigger: the raw DualSense trigger parameter block (mode + params).
-    pub effect: [u8; 11],
+    /// Sized off [`PUNKTFUNK_HID_EFFECT_MAX`] rather than a second literal `11` — the constant is
+    /// exported precisely so embedders can size their own buffers against it, and it declaring one
+    /// number while the struct it describes hardcoded another was the whole hazard.
+    pub effect: [u8; PUNKTFUNK_HID_EFFECT_MAX as usize],
 }
 
 #[cfg(feature = "quic")]
@@ -1192,7 +1195,7 @@ pub const PUNKTFUNK_HOST_CAP_PEN: u8 = 0x10;
 /// audio (DualSense voice-coil haptics + speaker) and emit it on the 0xD1 plane toward pads
 /// declared capable via [`punktfunk_connection_set_pad_audio_caps`]. Set only when the client
 /// asked via [`PUNKTFUNK_CLIENT_CAP_PAD_AUDIO`]. (Mirrors `quic::HOST_CAP_PAD_AUDIO`.)
-pub const PUNKTFUNK_HOST_CAP_PAD_AUDIO: u8 = 0x20;
+pub const PUNKTFUNK_HOST_CAP_PAD_AUDIO: u8 = 0x40;
 
 /// Pad-audio `kind` ([`punktfunk_connection_next_pad_audio`]): the BACK channel pair — DualSense
 /// voice-coil haptics, 5 ms Opus frames. (Mirrors `quic::PAD_AUDIO_KIND_HAPTICS`.)
@@ -1822,7 +1825,7 @@ pub const PUNKTFUNK_CLIENT_CAP_PHASE_LOCK: u8 = 0x02;
 /// [`punktfunk_connection_next_pad_audio`] and declare each capable pad via
 /// [`punktfunk_connection_set_pad_audio_caps`]; the host emits pad audio only when it answers
 /// with [`PUNKTFUNK_HOST_CAP_PAD_AUDIO`]. (Mirrors `quic::CLIENT_CAP_PAD_AUDIO`.)
-pub const PUNKTFUNK_CLIENT_CAP_PAD_AUDIO: u8 = 0x04;
+pub const PUNKTFUNK_CLIENT_CAP_PAD_AUDIO: u8 = 0x08;
 
 /// Shared body of [`punktfunk_connect_ex7`] / [`punktfunk_connect_ex8`]: `status_out`
 /// (nullable) is written on EVERY path — `Ok`, the mapped [`PunktfunkError`],
@@ -2664,10 +2667,12 @@ pub unsafe extern "C" fn punktfunk_connection_next_rumble_cmd(
 /// Declare a physical actuator's quirks for wire pad `pad` — how a platform parameterizes the
 /// shared rumble policy engine instead of forking it (typically called at controller attach).
 /// `keepalive_ms`: re-emit an unchanged non-zero level at this cadence for actuators whose
-/// hardware output decays between wire renewals (Steam Deck ≈ 40, DualSense-over-BT raw HID
-/// ≈ 900); `0` = none. `min_pulse_ms`: floor for `backstop_ms` on non-zero commands. `flags`:
+/// hardware output decays between wire renewals (the Steam Deck's ≈ 40 is the one in-tree user);
+/// `0` = none. `min_pulse_ms`: floor for `backstop_ms` on non-zero commands — no in-tree caller
+/// sets it, it exists for embedders whose duration-taking API rejects short values. `flags`:
 /// [`PUNKTFUNK_RUMBLE_QUIRK_DEDUP_JITTER`]. All-zero (the initial state) describes a well-behaved
-/// actuator.
+/// actuator. See [`ActuatorQuirks`](crate::client::rumble::ActuatorQuirks) for why a renderer that
+/// dedupes its own writes (the Apple HID path) cannot use `keepalive_ms` and keeps its own.
 ///
 /// # Safety
 /// `c` is a valid connection handle. Callable from any thread.

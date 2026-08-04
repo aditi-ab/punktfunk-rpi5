@@ -838,6 +838,25 @@ private fun ControllerSettings(s: Settings, update: (Settings) -> Unit, onOpenCo
             caption = "The virtual pad the host creates. Automatic matches your controller; " +
                 "every connected one is forwarded as its own player.",
         ) { g -> update(s.copy(gamepad = g)) }
+        SettingDropdown(
+            label = "Guide button",
+            options = SYSTEM_BUTTON_OPTIONS,
+            selected = s.systemButtons,
+            field = "system_buttons",
+            enabled = s.gamepadForwarding,
+            caption = "Where the guide (Xbox/PS) and share presses go while streaming. " +
+                "Automatic sends them to the host whenever this device delivers them.",
+        ) { v -> update(s.copy(systemButtons = v)) }
+        SettingDropdown(
+            label = "Hold Select for guide",
+            options = GUIDE_GESTURE_OPTIONS,
+            selected = s.guideGesture,
+            field = "guide_gesture",
+            enabled = s.gamepadForwarding,
+            caption = "Hold Select alone to press the host's guide button — keep holding for a " +
+                "Gaming-Mode host's quick-access menu. A Select tap still goes through, " +
+                "slightly delayed. For devices that intercept the real guide button.",
+        ) { v -> update(s.copy(guideGesture = v)) }
         DeviceScopeOnly {
             ClickableRow(
                 title = "Connected controllers",

@@ -18,26 +18,17 @@ use super::dualshock4_proto::{
     parse_ds4_output, serialize_state, Ds4Feedback, DS4_INPUT_REPORT_LEN, DS4_PRODUCT, DS4_TOUCH_H,
     DS4_TOUCH_W, DS4_VENDOR,
 };
+use crate::uhid_abi::{
+    put_cstr, BUS_USB, HID_MAX_DESCRIPTOR_SIZE, UHID_CREATE2, UHID_DESTROY, UHID_EVENT_SIZE,
+    UHID_GET_REPORT, UHID_GET_REPORT_REPLY, UHID_INPUT2, UHID_OUTPUT, UHID_PATH, UHID_SET_REPORT,
+    UHID_SET_REPORT_REPLY,
+};
 use crate::uhid_manager::{PadFeedback, PadProto, UhidManager};
 use anyhow::{Context, Result};
 use punktfunk_core::quic::{HidOutput, RichInput};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
-
-// /dev/uhid event ABI (linux/uhid.h) — identical to the DualSense backend's; see `super::dualsense`.
-const UHID_PATH: &str = "/dev/uhid";
-const UHID_DESTROY: u32 = 1;
-const UHID_OUTPUT: u32 = 6;
-const UHID_GET_REPORT: u32 = 9;
-const UHID_GET_REPORT_REPLY: u32 = 10;
-const UHID_CREATE2: u32 = 11;
-const UHID_INPUT2: u32 = 12;
-const UHID_SET_REPORT: u32 = 13;
-const UHID_SET_REPORT_REPLY: u32 = 14;
-const HID_MAX_DESCRIPTOR_SIZE: usize = 4096;
-const UHID_EVENT_SIZE: usize = 4 + 4372; // type + union (create2)
-const BUS_USB: u16 = 0x03;
 
 // Feature reports `hid-playstation` GET_REPORTs during DS4 init. The PAIRING report (0x12) is
 // MANDATORY — without a valid reply `dualshock4_create()` aborts and creates NO input devices; the
@@ -143,12 +134,6 @@ const DS4_RDESC: &[u8] = &[
     0x09, 0x58, 0x95, 0x3F, 0xB1, 0x02, 0x85, 0xD4, 0x09, 0x59, 0x95, 0x3F,
     0xB1, 0x02, 0xC0,
 ];
-
-/// Copy a NUL-padded C string field into the event buffer.
-fn put_cstr(ev: &mut [u8], off: usize, cap: usize, s: &str) {
-    let n = s.len().min(cap - 1);
-    ev[off..off + n].copy_from_slice(&s.as_bytes()[..n]); // rest already zero (NUL-terminated)
-}
 
 /// A virtual DualShock 4 backed by `/dev/uhid` (hand-rolled codec mirroring the DualSense pad's).
 /// Dropping it destroys the device (the kernel tears down the bound `hid-playstation` interface).

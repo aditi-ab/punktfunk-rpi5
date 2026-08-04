@@ -109,7 +109,7 @@ struct PairSheet: View {
                         #endif
                     TextField(
                         "Client name", text: $clientName,
-                        prompt: Text("How the host lists this Mac"))
+                        prompt: Text(Self.clientNamePrompt))
                         #if os(tvOS)
                         .labelsHidden() // prefilled → tvOS floats the label off-center
                         #endif
@@ -184,6 +184,16 @@ struct PairSheet: View {
         #endif
     }
 
+    /// The field prompt names the device you are actually on — it said "this Mac" on every
+    /// platform, which on an iPhone is simply wrong.
+    private static var clientNamePrompt: String {
+        #if os(macOS)
+        "How the host lists this Mac"
+        #else
+        "How the host lists this device"
+        #endif
+    }
+
     private func runCeremony() {
         busy = true
         errorText = nil
@@ -229,3 +239,24 @@ struct PairSheet: View {
         }
     }
 }
+
+#if DEBUG
+extension PairSheet {
+    /// Screenshot-harness seed (`ShotScenes`). A capture of the untouched sheet shows an empty PIN
+    /// field, a DISABLED "Pair & Connect", and — because the client name defaults to the device's
+    /// own — whatever the capture simulator happens to be called (`pf-shot-iphone-6.9` reached App
+    /// Store Connect that way). Seeding both fields captures the ceremony as a user meets it,
+    /// mid-entry, with a live primary button.
+    ///
+    /// An extension so `PairSheet` keeps its memberwise initialiser, and THIS file so it can reach
+    /// the private state.
+    init(
+        host: StoredHost, shotPIN: String, shotClientName: String,
+        onPaired: @escaping (Data) -> Void
+    ) {
+        self.init(host: host, onPaired: onPaired)
+        _pin = State(initialValue: shotPIN)
+        _clientName = State(initialValue: shotClientName)
+    }
+}
+#endif

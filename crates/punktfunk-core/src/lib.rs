@@ -107,6 +107,10 @@ pub use stats::Stats;
 /// v10: added `punktfunk_connection_clock_offset_now_ns` — the LIVE (mid-stream re-synced)
 /// clock offset ongoing latency math must use; the connect-time getter stays frozen by
 /// contract. Additive, client-local — no wire change, so [`WIRE_VERSION`] is unchanged.
+/// v11: added `punktfunk_connect_ex9` — `connect_ex8` plus a `client_caps` bitfield
+/// (`PUNKTFUNK_CLIENT_CAP_CURSOR`, later `…_PHASE_LOCK`), which is how a client tells the host it
+/// renders the pointer itself. Additive; the caps ride the existing Hello, so [`WIRE_VERSION`] is
+/// unchanged. (Documented late — the bump shipped without its line here.)
 /// v12: added `punktfunk_connection_set_cursor_render` — the mid-stream cursor-render flip
 /// (design/remote-desktop-sweep.md §8): the client's mouse-model chord tells the host who
 /// renders the pointer. Additive; rides the existing control stream (a new message TYPE, which
@@ -120,13 +124,21 @@ pub use stats::Stats;
 /// uncertainty and the circular arrival-lead statistic the host's controller steers on. Additive;
 /// the wire grows only a new control message (`PhaseReport`, 0x32) an old host never reads and a
 /// strict-prefix append on the 0xCF host-timing tail, so [`WIRE_VERSION`] is unchanged.
-/// v15: added the pad-audio client surface — `punktfunk_connection_next_pad_audio` (the 0xD1
+/// v15: versions the shared rumble policy engine's C surface —
+/// `punktfunk_connection_next_rumble_cmd`, `punktfunk_connection_set_rumble_quirks` and the
+/// `PUNKTFUNK_RUMBLE_QUIRK_*` bits. These symbols are NOT new: they landed while this constant
+/// still read 7 and no bump was made, so every core since has exported them while advertising a
+/// version that never promised them. That cannot be corrected retroactively — a shipped binary
+/// says what it says — so v15 is the floor that *guarantees* them: at or above it the surface is
+/// present, below it an embedder must probe for the symbol. Purely a version statement; no code
+/// changed with this bump, and no wire change, so [`WIRE_VERSION`] is unchanged.
+/// v16: added the pad-audio client surface — `punktfunk_connection_next_pad_audio` (the 0xD1
 /// per-gamepad DualSense haptics/speaker plane) + `punktfunk_connection_set_pad_audio_caps` and
 /// the `PUNKTFUNK_CLIENT_CAP_PAD_AUDIO` / `PUNKTFUNK_HOST_CAP_PAD_AUDIO` mirrors. Additive and
 /// capability-gated end to end: the wire grows a new datagram tag (0xD1) an old client never
 /// receives (double-gated caps), a new 0xCD kind (0x06, dropped as unknown by old clients) and
 /// arrival flag bits 8/9 sent only toward a capable host, so [`WIRE_VERSION`] is unchanged.
-pub const ABI_VERSION: u32 = 15;
+pub const ABI_VERSION: u32 = 16;
 
 /// The punktfunk/1 **wire** version — what `Hello`/`Welcome` carry and hosts equality-check.
 /// Deliberately its own constant: [`ABI_VERSION`] tracks the embeddable **C surface**

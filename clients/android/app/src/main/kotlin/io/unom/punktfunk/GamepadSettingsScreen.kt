@@ -57,13 +57,15 @@ import androidx.compose.ui.unit.sp
 import dev.chrisbanes.haze.HazeState
 import dev.chrisbanes.haze.hazeSource
 import io.unom.punktfunk.kit.deviceBodyVibrator
+import io.unom.punktfunk.kit.security.KnownHost
+import io.unom.punktfunk.kit.security.KnownHostStore
 
 // The gamepad-driven settings screen — the Android mirror of the Apple client's GamepadSettingsView:
 // the couch-relevant subset of the touch settings restyled as a console page and fully navigable with
 // a controller: up/down moves the focus bar, left/right steps the focused value, A cycles/toggles it,
 // B closes. Both write the same SharedPreferences, so values round-trip with the touch settings.
 
-private class GpRow(
+internal class GpRow(
     val id: String,
     val header: String?,
     val label: String,
@@ -72,7 +74,18 @@ private class GpRow(
     val adjust: (Int) -> Boolean, // left/right; returns whether the value actually changed
     val activate: () -> Unit,     // A → cycle forward (wrapping) / flip
     val toggled: Boolean? = null, // non-null = a toggle row, drawn as a ConsoleSwitch (not text)
+    val adjustable: Boolean = true, // false = the row navigates/acts instead of stepping — no chevrons
+    val enabled: Boolean = true,    // dimmed + inert when false (still focusable, for its detail)
 )
+
+/**
+ * The row at [index], or null when it is dimmed. The single place the "disabled ⇒ inert" half of
+ * [GpRow.enabled] is enforced, so the three input paths (pad left/right, A, and a tap on the
+ * already-focused row) cannot drift apart — before this, `enabled` dimmed the label and nothing
+ * else, and every dimmed row still stepped its setting.
+ */
+internal fun liveRow(rows: List<GpRow>, index: Int): GpRow? =
+    rows.getOrNull(index)?.takeIf { it.enabled }
 
 @Composable
 fun GamepadSettingsScreen(
@@ -89,7 +102,39 @@ fun GamepadSettingsScreen(
     val hasBodyVibrator = remember { deviceBodyVibrator(context) != null }
     // Gates the AV1 codec row the same way the touch settings do (see `codecOptionsFor`).
     val av1Capable = remember { io.unom.punktfunk.kit.VideoDecoders.pickDecoder("video/av01") != null }
-    val rows = buildSettingsRows(s, hasBodyVibrator, av1Capable, ::update)
+
+    // The Profiles section's stores, constructed here the way ConnectScreen constructs its own.
+    // The catalog is read once per screen entry: this screen can't create or edit profiles
+    // (design §5.4 — the touch interface does), so the list is stable for its lifetime. The saved
+    // hosts DO change under it — every pin toggle writes one — so they live in state and refresh
+    // on each toggle, keeping the "Pinned to N hosts" counts honest.
+    val knownHostStore = remember { KnownHostStore(context) }
+    val profileStore = remember { ProfileStore(context) }
+    val profiles = remember { profileStore.all() }
+    var savedHosts by remember { mutableStateOf(knownHostStore.all()) }
+    // The profile whose pin-to-hosts picker is up, or null. While it's showing, it owns the pad
+    // (this screen's nav gates on it, the ConnectScreen-dialog pattern).
+    var pinProfile by remember { mutableStateOf<StreamProfile?>(null) }
+
+    // Toggle a host+profile pin — the same store write ConnectScreen's togglePin does. Presentation
+    // only: pin appends at the end (card order), unpin removes, and the host's default binding
+    // (profileId) is never touched.
+    fun togglePin(kh: KnownHost, profile: StreamProfile) {
+        val pins = if (profile.id in kh.pinnedProfileIds) {
+            kh.pinnedProfileIds - profile.id
+        } else {
+            kh.pinnedProfileIds + profile.id
+        }
+        knownHostStore.save(kh.copy(pinnedProfileIds = pins))
+        savedHosts = knownHostStore.all()
+    }
+
+    // On a TV "the touch interface" is confusing advice (no touch to reach it with) — the honest
+    // path there is this screen's own Controller-optimized UI toggle, which swaps in the standard
+    // interface remote-navigably. The strings branch on it.
+    val tv = remember { isTvDevice(context) }
+    val rows = buildSettingsRows(s, hasBodyVibrator, av1Capable, ::update) +
+        buildProfileRows(profiles, savedHosts, tv) { pinProfile = it }
     var focus by remember { mutableIntStateOf(0) }
     if (focus > rows.lastIndex) focus = rows.lastIndex
     // The direction the focused value last stepped (+1 forward / -1 back) — drives which way the
@@ -101,16 +146,20 @@ fun GamepadSettingsScreen(
 
     BackHandler(onBack = onBack)
     GamepadNavEffect2D(
-        active = navActive,
+        // The pin picker owns the pad while it's up (its own nav + BackHandler), so this screen
+        // drops its probes — the pattern ConnectScreen's dialogs use.
+        active = navActive && pinProfile == null,
         onDirection = { dir ->
             when (dir) {
                 NavDir.UP -> if (focus > 0) focus--
                 NavDir.DOWN -> if (focus < rows.lastIndex) focus++
-                NavDir.LEFT -> { adjustDir = -1; rows.getOrNull(focus)?.adjust(-1) }
-                NavDir.RIGHT -> { adjustDir = 1; rows.getOrNull(focus)?.adjust(1) }
+                // A disabled row is INERT, not just dim — the step is refused instead of writing a
+                // setting that has nothing to act on (see `liveRow`).
+                NavDir.LEFT -> { adjustDir = -1; liveRow(rows, focus)?.adjust(-1) }
+                NavDir.RIGHT -> { adjustDir = 1; liveRow(rows, focus)?.adjust(1) }
             }
         },
-        onActivate = { adjustDir = 1; rows.getOrNull(focus)?.activate() },
+        onActivate = { adjustDir = 1; liveRow(rows, focus)?.activate() },
     )
     // Keep the focused row on screen, but only SCROLL when it's actually off-screen — so entering the
     // screen (focus on the first row) leaves the "Settings" heading visible instead of jumping past it.
@@ -148,7 +197,10 @@ fun GamepadSettingsScreen(
             }
             itemsIndexed(rows, key = { _, r -> r.id }) { index, row ->
                 SettingRowView(row, focused = index == focus, adjustDir = adjustDir, onClick = {
-                    if (focus == index) { adjustDir = 1; row.activate() } else focus = index
+                    // Same inertness as the pad path above — tapping a dimmed row focuses it (so
+                    // its detail explains itself) but never flips it.
+                    if (focus != index) focus = index
+                    else if (row.enabled) { adjustDir = 1; row.activate() }
                 })
             }
             }
@@ -162,14 +214,39 @@ fun GamepadSettingsScreen(
                 .then(if (landscape) Modifier else Modifier.systemBarsPadding())
                 .padding(ConsoleLegendInset),
         ) {
+            // The legend follows the focused row (the desktop console's hints() does the same):
+            // a profile row doesn't adjust, it opens the pin picker, and the "No profiles yet"
+            // placeholder does nothing at all — advertising ↔/A on those would be a lie.
+            val focused = rows.getOrNull(focus)
             GamepadHintBar(
-                listOf(
-                    GamepadHint('↔', Color(0xFF9A93C7), "Adjust"),
-                    // Tappable too (touch escape hatch): Change cycles the focused row, Done leaves.
-                    PadGlyph.hint('A', "Change") { rows.getOrNull(focus)?.activate() },
-                    PadGlyph.hint('B', "Done", onClick = onBack),
-                ),
+                when {
+                    focused != null && !focused.enabled -> listOf(
+                        PadGlyph.hint('B', "Done", onClick = onBack),
+                    )
+                    focused != null && !focused.adjustable -> listOf(
+                        PadGlyph.hint('A', "Pin to hosts") { focused.activate() },
+                        PadGlyph.hint('B', "Done", onClick = onBack),
+                    )
+                    else -> listOf(
+                        GamepadHint('↔', Color(0xFF9A93C7), "Adjust"),
+                        // Tappable too (touch escape hatch): Change cycles the focused row, Done leaves.
+                        PadGlyph.hint('A', "Change") { rows.getOrNull(focus)?.activate() },
+                        PadGlyph.hint('B', "Done", onClick = onBack),
+                    )
+                },
                 hazeState = hazeState,
+            )
+        }
+
+        // The pin-to-hosts picker for the activated profile row — the console counterpart of the
+        // touch UI's per-profile pin toggles in the host edit sheet.
+        pinProfile?.let { p ->
+            GamepadPinHostsDialog(
+                profileName = p.name,
+                hosts = savedHosts,
+                pinned = { kh -> p.id in kh.pinnedProfileIds },
+                onToggle = { kh -> togglePin(kh, p) },
+                onDismiss = { pinProfile = null },
             )
         }
     }
@@ -180,8 +257,13 @@ private fun SettingRowView(row: GpRow, focused: Boolean, adjustDir: Int, onClick
     val visuals = animateConsoleFocus(active = focused)
     val shape = RoundedCornerShape(14.dp)
     // The chevrons keep their layout slot and only fade, so the value never jumps sideways when
-    // focus arrives; the value colour cross-fades with them.
-    val chevronAlpha by animateFloatAsState(if (focused) 0.6f else 0f, tween(160), label = "chevrons")
+    // focus arrives; the value colour cross-fades with them. A non-adjustable row (a profile row
+    // navigates, the empty-catalog placeholder does nothing) never shows them at all.
+    val chevronAlpha by animateFloatAsState(
+        if (focused && row.adjustable) 0.6f else 0f,
+        tween(160),
+        label = "chevrons",
+    )
     val valueColor by animateColorAsState(
         Color.White.copy(alpha = if (focused) 1f else 0.6f),
         tween(160),
@@ -216,7 +298,9 @@ private fun SettingRowView(row: GpRow, focused: Boolean, adjustDir: Int, onClick
                     row.label,
                     style = MaterialTheme.typography.bodyLarge,
                     fontWeight = FontWeight.SemiBold,
-                    color = Color.White,
+                    // A disabled row (the "No profiles yet" placeholder) dims but stays focusable,
+                    // so its detail line can still explain what would go here.
+                    color = Color.White.copy(alpha = if (row.enabled) 1f else 0.45f),
                     maxLines = 1,
                 )
                 Spacer(Modifier.weight(1f))
@@ -270,7 +354,7 @@ private fun SettingRowView(row: GpRow, focused: Boolean, adjustDir: Int, onClick
 /** Build the console settings rows from the current [Settings], writing through [update].
  * [hasBodyVibrator] gates the "Rumble on this phone" row (absent on TVs); [av1Capable] gates the
  * AV1 codec entry (see `codecOptionsFor`). */
-private fun buildSettingsRows(
+internal fun buildSettingsRows(
     s: Settings,
     hasBodyVibrator: Boolean,
     av1Capable: Boolean,
@@ -278,13 +362,14 @@ private fun buildSettingsRows(
 ): List<GpRow> {
     fun <T> choice(
         id: String, header: String?, label: String, detail: String,
-        options: List<Pair<T, String>>, current: T, write: (T) -> Unit,
+        options: List<Pair<T, String>>, current: T, enabled: Boolean = true, write: (T) -> Unit,
     ): GpRow {
         val idx = options.indexOfFirst { it.first == current }
         return GpRow(
             id, header, label,
             value = options.getOrNull(idx)?.second ?: "—",
             detail = detail,
+            enabled = enabled,
             adjust = { delta ->
                 if (idx < 0) {
                     options.firstOrNull()?.let { write(it.first) } != null
@@ -301,11 +386,12 @@ private fun buildSettingsRows(
     }
     fun toggle(
         id: String, header: String?, label: String, detail: String,
-        value: Boolean, write: (Boolean) -> Unit,
+        value: Boolean, enabled: Boolean = true, write: (Boolean) -> Unit,
     ): GpRow = GpRow(
         id, header, label,
         value = if (value) "On" else "Off",
         detail = detail,
+        enabled = enabled,
         adjust = { delta -> val target = delta > 0; if (value != target) { write(target); true } else false },
         activate = { write(!value) },
         toggled = value,
@@ -408,11 +494,27 @@ private fun buildSettingsRows(
                 "so games don't see two of them.",
             s.gamepadForwarding,
         ) { update(s.copy(gamepadForwarding = it)) },
+        // Everything below the master switch follows it — dim and inert while nothing is being
+        // forwarded, the same relationship the touch settings draw with `enabled =`. This screen
+        // had the capability (`GpRow.enabled`) and used it only for the profiles placeholder, so
+        // the pad rows kept stepping settings that had nothing to act on.
         choice(
             "padType", null, "Controller type",
             "The virtual pad the host creates — Automatic matches this controller.",
-            GAMEPAD_OPTIONS, s.gamepad,
+            GAMEPAD_OPTIONS, s.gamepad, enabled = s.gamepadForwarding,
         ) { update(s.copy(gamepad = it)) },
+        choice(
+            "systemButtons", null, "Guide button",
+            "Where the guide (Xbox/PS) and share presses go while streaming — Automatic " +
+                "sends them to the host whenever this device delivers them.",
+            SYSTEM_BUTTON_OPTIONS, s.systemButtons, enabled = s.gamepadForwarding,
+        ) { update(s.copy(systemButtons = it)) },
+        choice(
+            "guideGesture", null, "Hold Select for guide",
+            "Hold Select alone to press the host's guide button — keep holding for a " +
+                "Gaming-Mode host's quick-access menu. A Select tap still goes through.",
+            GUIDE_GESTURE_OPTIONS, s.guideGesture, enabled = s.gamepadForwarding,
+        ) { update(s.copy(guideGesture = it)) },
     ) + listOfNotNull(
         if (hasBodyVibrator) {
             toggle(
@@ -431,7 +533,76 @@ private fun buildSettingsRows(
             "sc2", null, "Steam Controller 2 passthrough",
             "Capture a Steam Controller 2 (wired, Puck dongle, or paired Bluetooth) and stream " +
                 "it as-is — Steam on the host drives it like the physical pad.",
-            s.sc2Capture,
+            s.sc2Capture, enabled = s.gamepadForwarding,
         ) { update(s.copy(sc2Capture = it)) },
+        // The SC2 row's twin, and missing here until now: the touch settings have carried both
+        // side by side, so a couch user on a TV box — where there IS no touch interface to fall
+        // back to — could turn on SC2 passthrough but not the Sony one. Same no-vibrator-gate
+        // reasoning: this capture renders feedback on the CONTROLLER's motors, not this device's.
+        toggle(
+            "dsCapture", null, "DualSense / DualShock passthrough (USB)",
+            "Drive a USB-connected Sony pad directly — rumble on any phone, plus adaptive " +
+                "triggers, lightbar and gyro.",
+            s.dsCapture, enabled = s.gamepadForwarding,
+        ) { update(s.copy(dsCapture = it)) },
     )
+}
+
+/**
+ * The trailing Profiles section — the Android mirror of the desktop console's (design §5.2a, §5.4):
+ * one row per catalog profile, valued with how many saved hosts pin it, activating into the
+ * pin-to-hosts picker. Read-only beyond pinning: profiles are created and edited in the standard
+ * interface, so an empty catalog shows one dimmed placeholder explaining where they come from
+ * instead of a dead-looking empty header. On a TV that phrasing changes: "touch interface" points
+ * nowhere useful on a touchless device, so the strings name the actual route — the
+ * Controller-optimized UI toggle a few rows up, which swaps the standard interface in
+ * (d-pad-navigable; the profile editor lives there on every device, unlike tvOS where none exists).
+ */
+private fun buildProfileRows(
+    profiles: List<StreamProfile>,
+    savedHosts: List<KnownHost>,
+    tv: Boolean,
+    openPinPicker: (StreamProfile) -> Unit,
+): List<GpRow> {
+    val createHint = if (tv) {
+        "To create or edit profiles on this device, turn off Controller-optimized UI above " +
+            "and use the standard interface."
+    } else {
+        "Profiles are created and edited in the touch interface."
+    }
+    if (profiles.isEmpty()) {
+        return listOf(
+            GpRow(
+                id = "noProfiles",
+                header = "Profiles",
+                label = "No profiles yet",
+                value = "",
+                detail = "Profiles bundle stream settings for different uses — pinned ones become " +
+                    "one-press connect cards here. " + createHint,
+                adjust = { false },
+                activate = {},
+                adjustable = false,
+                enabled = false,
+            ),
+        )
+    }
+    return profiles.mapIndexed { i, p ->
+        // Counted straight off the host records, so it agrees with what the carousel renders.
+        val pins = savedHosts.count { p.id in it.pinnedProfileIds }
+        GpRow(
+            id = "profile:${p.id}",
+            header = if (i == 0) "Profiles" else null,
+            label = p.name,
+            value = when (pins) {
+                0 -> "Not pinned"
+                1 -> "Pinned to 1 host"
+                else -> "Pinned to $pins hosts"
+            },
+            detail = "Pin this profile to a host and it appears as its own card — one press " +
+                "connects with it. " + createHint,
+            adjust = { false },
+            activate = { openPinPicker(p) },
+            adjustable = false,
+        )
+    }
 }

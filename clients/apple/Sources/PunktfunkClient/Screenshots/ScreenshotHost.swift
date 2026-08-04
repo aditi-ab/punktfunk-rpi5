@@ -24,6 +24,13 @@ import ImageIO
 
 @MainActor
 enum ScreenshotMode {
+    /// This process was launched to capture a screenshot. Cheap enough to consult from the
+    /// stores' persistence paths (`HostStore` / `ProfileStore`), which must NOT write their
+    /// mock contents back into a real user's App Group when the harness runs on a dev Mac.
+    static var isActive: Bool {
+        !(ProcessInfo.processInfo.environment["PUNKTFUNK_SHOT_SCENE"] ?? "").isEmpty
+    }
+
     /// The scene requested via PUNKTFUNK_SHOT_SCENE, or nil for a normal launch.
     static var requestedScene: ShotScene? {
         let name = ProcessInfo.processInfo.environment["PUNKTFUNK_SHOT_SCENE"] ?? ""
@@ -41,8 +48,11 @@ struct ScreenshotHostView: View {
         scene.make()
             .environment(\.colorScheme, scene.colorScheme)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .background(Color.black)
-            .ignoresSafeArea()
+            // Black fills the display, but the SCENE keeps its safe area. Ignoring it wholesale
+            // here pushed the stream hero's HUD under the Dynamic Island (the resolution/bitrate
+            // line was unreadable in every 6.9" capture); scenes that genuinely want full bleed —
+            // the streamed frame itself — ignore it themselves.
+            .background(Color.black.ignoresSafeArea())
             #if os(macOS)
             .background(MacShotWindowConfigurator(scene: scene))
             #elseif os(iOS)
@@ -129,18 +139,64 @@ enum MacSelfCapture {
 #endif
 
 #if os(iOS)
-/// Best-effort orientation lock for the requested scene (landscape for the stream hero, portrait
-/// for chrome). Requires the app to allow those orientations in Info.plist.
+/// Orientation lock for the requested scene (landscape for the stream hero, portrait for chrome).
+/// Requires the app to allow those orientations in Info.plist — it does, for both.
 private struct IOSOrientationConfigurator: UIViewControllerRepresentable {
     let orientation: ShotOrientation
 
-    func makeUIViewController(context: Context) -> UIViewController { UIViewController() }
+    func makeUIViewController(context: Context) -> ShotOrientationController {
+        ShotOrientationController(mask: mask)
+    }
 
-    func updateUIViewController(_ vc: UIViewController, context: Context) {
-        guard let scene = vc.view.window?.windowScene else { return }
-        let mask: UIInterfaceOrientationMask = orientation == .landscape ? .landscapeRight : .portrait
-        scene.requestGeometryUpdate(.iOS(interfaceOrientations: mask))
-        vc.setNeedsUpdateOfSupportedInterfaceOrientations()
+    func updateUIViewController(_ vc: ShotOrientationController, context: Context) {
+        vc.mask = mask
+        vc.applyGeometry()
+    }
+
+    private var mask: UIInterfaceOrientationMask {
+        orientation == .landscape ? .landscapeRight : .portrait
+    }
+}
+
+/// Asks the window scene to rotate, from a place where there IS a window.
+///
+/// The previous version made the request inside `updateUIViewController`, where `view.window` is
+/// still nil: SwiftUI makes exactly one update pass for a representable mounted as a `.background`,
+/// before the hierarchy is in a window, so the `guard` fell through and nothing ever asked again.
+/// Every scene declared `.landscape` — the stream hero and the trust card — was therefore captured
+/// in PORTRAIT at the portrait App Store size. Overriding `supportedInterfaceOrientations` as well
+/// keeps the scene from rotating back if the simulator reports a device orientation change.
+final class ShotOrientationController: UIViewController {
+    var mask: UIInterfaceOrientationMask
+
+    init(mask: UIInterfaceOrientationMask) {
+        self.mask = mask
+        super.init(nibName: nil, bundle: nil)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("not from a nib") }
+
+    override var supportedInterfaceOrientations: UIInterfaceOrientationMask { mask }
+
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        applyGeometry()
+    }
+
+    func applyGeometry() {
+        // `view.window` once mounted; the connected-scene lookup covers the first update pass,
+        // which still runs before this controller is in a window.
+        let scene = view.window?.windowScene
+            ?? UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first
+        guard let scene else { return }
+        // Report a refusal instead of silently shipping the wrong orientation — that is exactly
+        // how every landscape scene went out as a portrait PNG for as long as it did.
+        scene.requestGeometryUpdate(.iOS(interfaceOrientations: mask)) { error in
+            print("PF_SHOT_ORIENTATION_REFUSED \(error.localizedDescription)")
+            fflush(stdout)
+        }
+        setNeedsUpdateOfSupportedInterfaceOrientations()
     }
 }
 #endif

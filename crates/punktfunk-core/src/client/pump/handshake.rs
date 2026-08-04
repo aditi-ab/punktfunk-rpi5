@@ -156,6 +156,12 @@ pub(super) async fn connect_and_handshake(args: &WorkerArgs) -> Result<Handshake
                 // stop compositing the pointer, so only an embedder that actually renders the
                 // cursor locally may set it (the embedder decides, we pass through).
                 client_caps: args.client_caps,
+                // Unconditional like STREAMED_AU: the shared reassembler pins geometry
+                // per-frame and every receive buffer is sized from MAX_DATAGRAM_BYTES, so
+                // every embedder accepts a mid-session shard change up to this ceiling
+                // (design/shard-payload-reneg.md W0.3 — the host only renegotiates, and only
+                // grows to jumbo, when this advertises it).
+                max_shard_payload: crate::config::max_shard_payload() as u16,
             }
             .encode(),
         )

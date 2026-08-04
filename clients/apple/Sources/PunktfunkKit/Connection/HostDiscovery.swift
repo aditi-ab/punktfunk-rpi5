@@ -59,6 +59,9 @@ public final class HostDiscovery: ObservableObject {
 
     /// Start browsing `_punktfunk._udp`. Idempotent — a second call while live is a no-op.
     public func start() {
+        #if DEBUG
+        guard !debugPinned else { return } // a seeded advert set outranks the live LAN
+        #endif
         guard browser == nil else { return }
         let browser = NWBrowser(
             for: .bonjourWithTXTRecord(type: "_punktfunk._udp", domain: nil),
@@ -91,6 +94,35 @@ public final class HostDiscovery: ObservableObject {
         browser?.cancel()
         for conn in connections.values { conn.cancel() }
     }
+
+    #if DEBUG
+    /// A seeded advert set is in force — `start()` must not replace it with the live browse.
+    private var debugPinned = false
+
+    /// Screenshot/preview seam, the discovery counterpart to `HostWaker.debugSet`: publish a FIXED
+    /// set of adverts and keep browsing off. Without it a capture shows whatever happens to be on
+    /// the machine's LAN — the App Store screenshots shipped a stranger's hostname more than once —
+    /// and every mock host reads Offline because nothing advertises it.
+    public func debugSet(_ adverts: [DiscoveredHost]) {
+        stop()
+        debugPinned = true
+        hosts = adverts
+    }
+
+    /// Builds one advert. `DiscoveredHost`'s memberwise init is internal (a public struct's is), and
+    /// making it public would expose a wire-shaped model's construction to every consumer just to
+    /// serve the harness.
+    public static func debugAdvert(
+        id: String, name: String, host: String, port: UInt16 = 9777,
+        fingerprintHex: String? = nil, requiresPairing: Bool = false, allowsTofu: Bool = true,
+        macAddresses: [String] = [], osChain: String = ""
+    ) -> DiscoveredHost {
+        DiscoveredHost(
+            id: id, name: name, host: host, port: port, fingerprintHex: fingerprintHex,
+            requiresPairing: requiresPairing, allowsTofu: allowsTofu,
+            macAddresses: macAddresses, osChain: osChain)
+    }
+    #endif
 
     private func restart() {
         stop()

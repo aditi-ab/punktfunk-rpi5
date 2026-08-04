@@ -44,6 +44,8 @@ data class SettingsOverlay(
     val invertScroll: Boolean? = null,
     val gamepad: Int? = null,
     val gamepadForwarding: Boolean? = null,
+    val systemButtons: String? = null,
+    val guideGesture: String? = null,
     val statsVerbosity: StatsVerbosity? = null,
     /**
      * Android-only tier-P addition (design §3): the decode pipeline is a device fact everywhere
@@ -78,6 +80,8 @@ data class SettingsOverlay(
         invertScroll = invertScroll ?: base.invertScroll,
         gamepad = gamepad ?: base.gamepad,
         gamepadForwarding = gamepadForwarding ?: base.gamepadForwarding,
+        systemButtons = systemButtons ?: base.systemButtons,
+        guideGesture = guideGesture ?: base.guideGesture,
         statsVerbosity = statsVerbosity ?: base.statsVerbosity,
         lowLatencyMode = lowLatencyMode ?: base.lowLatencyMode,
         presentPriority = presentPriority ?: base.presentPriority,
@@ -115,6 +119,8 @@ data class SettingsOverlay(
         gamepadForwarding =
             if (after.gamepadForwarding != before.gamepadForwarding) after.gamepadForwarding
             else gamepadForwarding,
+        systemButtons = if (after.systemButtons != before.systemButtons) after.systemButtons else systemButtons,
+        guideGesture = if (after.guideGesture != before.guideGesture) after.guideGesture else guideGesture,
         statsVerbosity = if (after.statsVerbosity != before.statsVerbosity) after.statsVerbosity else statsVerbosity,
         lowLatencyMode = if (after.lowLatencyMode != before.lowLatencyMode) after.lowLatencyMode else lowLatencyMode,
         presentPriority = if (after.presentPriority != before.presentPriority) after.presentPriority else presentPriority,
@@ -142,6 +148,8 @@ data class SettingsOverlay(
         "invert_scroll" -> copy(invertScroll = null)
         "gamepad" -> copy(gamepad = null)
         "gamepad_forwarding" -> copy(gamepadForwarding = null)
+        "system_buttons" -> copy(systemButtons = null)
+        "guide_gesture" -> copy(guideGesture = null)
         "stats_verbosity" -> copy(statsVerbosity = null)
         "low_latency_mode" -> copy(lowLatencyMode = null)
         "present_priority" -> copy(presentPriority = null)
@@ -166,6 +174,8 @@ data class SettingsOverlay(
         if (invertScroll != null) add("invert_scroll")
         if (gamepad != null) add("gamepad")
         if (gamepadForwarding != null) add("gamepad_forwarding")
+        if (systemButtons != null) add("system_buttons")
+        if (guideGesture != null) add("guide_gesture")
         if (statsVerbosity != null) add("stats_verbosity")
         if (lowLatencyMode != null) add("low_latency_mode")
         if (presentPriority != null) add("present_priority")
@@ -198,6 +208,8 @@ data class SettingsOverlay(
         invertScroll?.let { j.put("invert_scroll", it) }
         gamepad?.let { j.put("gamepad", it) }
         gamepadForwarding?.let { j.put("gamepad_forwarding", it) }
+        systemButtons?.let { j.put("system_buttons", it) }
+        guideGesture?.let { j.put("guide_gesture", it) }
         statsVerbosity?.let { j.put("stats_verbosity", it.name) }
         lowLatencyMode?.let { j.put("low_latency_mode", it) }
         presentPriority?.let { j.put("present_priority", it) }
@@ -214,6 +226,7 @@ data class SettingsOverlay(
             "width", "height", "refresh_hz", "bitrate_kbps", "render_scale", "codec",
             "hdr_enabled", "compositor", "audio_channels", "mic_enabled", "echo_cancel",
             "touch_mode", "mouse_mode", "invert_scroll", "gamepad", "gamepad_forwarding",
+            "system_buttons", "guide_gesture",
             "stats_verbosity",
             "low_latency_mode", "present_priority", "smooth_buffer",
         )
@@ -237,6 +250,8 @@ data class SettingsOverlay(
             invertScroll = j.optBooleanOrNull("invert_scroll"),
             gamepad = j.optIntOrNull("gamepad"),
             gamepadForwarding = j.optBooleanOrNull("gamepad_forwarding"),
+            systemButtons = j.optStringOrNull("system_buttons"),
+            guideGesture = j.optStringOrNull("guide_gesture"),
             statsVerbosity = j.optStringOrNull("stats_verbosity")
                 ?.let { n -> StatsVerbosity.entries.firstOrNull { it.name == n } },
             lowLatencyMode = j.optBooleanOrNull("low_latency_mode"),

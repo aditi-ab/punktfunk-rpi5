@@ -111,15 +111,25 @@ pub const CLIENT_CAP_CURSOR: u8 = 0x01;
 /// simply ignored — no behavior change in either direction.
 pub const CLIENT_CAP_PHASE_LOCK: u8 = 0x02;
 
+/// `Hello.client_caps` bit: this client can decode the redundant desktop-audio plane
+/// ([`AUDIO_RED_MAGIC`](super::datagram::AUDIO_RED_MAGIC), `0xD2`), where every datagram also
+/// carries a copy of the previous frame so a single lost packet is reconstructed instead of
+/// papered over with packet-loss concealment.
+///
+/// Active only when the host answers with [`HOST_CAP_AUDIO_RED`] (capable-and-agreed, the
+/// cursor/clipboard precedent). Toward an older host, or a host that declines because the link is
+/// clean, the client keeps receiving the plain `0xC9` plane — so a client may always set this bit.
+/// `0x04` — `0x01`/`0x02` are cursor / phase-lock.
+pub const CLIENT_CAP_AUDIO_RED: u8 = 0x04;
 /// [`Hello::client_caps`] bit: the client understands the pad-audio plane
 /// ([`PAD_AUDIO_MAGIC`](super::datagram::PAD_AUDIO_MAGIC), `0xD1`) — per-gamepad DualSense
 /// voice-coil haptics + speaker Opus frames, plus the [`HidOutput::AudioCtl`]
 /// (super::datagram::HidOutput) routing/volume events. Active only when the host answers with
 /// [`HOST_CAP_PAD_AUDIO`] AND the pad's arrival declared a renderer for the kind
 /// ([`crate::input::ARRIVAL_FLAG_PAD_AUDIO_HAPTICS`]/`_SPEAKER`) — the capable-and-agreed
-/// precedent, per pad; toward an older or incapable host nothing changes. `0x04` — `0x01` is
-/// [`CLIENT_CAP_CURSOR`], `0x02` is [`CLIENT_CAP_PHASE_LOCK`].
-pub const CLIENT_CAP_PAD_AUDIO: u8 = 0x04;
+/// precedent, per pad; toward an older or incapable host nothing changes. `0x08` — `0x01` is [`CLIENT_CAP_CURSOR`],
+/// `0x02` is [`CLIENT_CAP_PHASE_LOCK`], `0x04` is [`CLIENT_CAP_AUDIO_RED`].
+pub const CLIENT_CAP_PAD_AUDIO: u8 = 0x08;
 
 /// [`Welcome::host_caps`] bit: the host CAN forward the cursor out-of-band (it captures cursor
 /// metadata separately from the frame — the Linux portal `SPA_META_Cursor` path; NOT gamescope,
@@ -142,16 +152,27 @@ pub const HOST_CAP_CURSOR: u8 = 0x08;
 /// [`HOST_CAP_TEXT_INPUT`], `0x01`/`0x02` are gamepad-state / clipboard.
 pub const HOST_CAP_PEN: u8 = 0x10;
 
+/// [`Welcome::host_caps`] bit: the host is sending the REDUNDANT desktop-audio plane
+/// ([`AUDIO_RED_MAGIC`](super::datagram::AUDIO_RED_MAGIC), `0xD2`) instead of plain `0xC9` — each
+/// datagram carries its own frame plus a copy of the previous one.
+///
+/// Set only when the client asked via [`CLIENT_CAP_AUDIO_RED`]. It is a statement about the WIRE,
+/// not a negotiation the client can decline: with the bit set the client must decode `0xD2`, and
+/// without it `0xC9`. The host may also drop back to `0xC9` mid-session (the redundancy is
+/// loss-gated — a clean LAN shouldn't pay for it), which is why clients decode BOTH tags
+/// unconditionally and treat this bit as "expect redundancy", not "only redundancy".
+/// `0x20` — `0x10` is [`HOST_CAP_PEN`], `0x08` is [`HOST_CAP_CURSOR`].
+pub const HOST_CAP_AUDIO_RED: u8 = 0x20;
 /// [`Welcome::host_caps`] bit: the host can capture pad audio — its virtual DualSense exposes
 /// the pad's audio endpoints (voice-coil haptics + speaker), so a game's per-pad audio can be
 /// captured and shipped on the [`PAD_AUDIO_MAGIC`](super::datagram::PAD_AUDIO_MAGIC) plane.
 /// Set only when the client asked via [`CLIENT_CAP_PAD_AUDIO`]; when both bits agree, a
 /// capable client marks its pads' render capabilities on their arrivals
 /// ([`crate::input::ARRIVAL_FLAG_PAD_AUDIO_HAPTICS`]/`_SPEAKER`) and the host emits `0xD1`
-/// toward exactly those pads. `0x20` — `0x10` is [`HOST_CAP_PEN`], `0x08` is
-/// [`HOST_CAP_CURSOR`], `0x04` is [`HOST_CAP_TEXT_INPUT`], `0x01`/`0x02` are gamepad-state /
-/// clipboard.
-pub const HOST_CAP_PAD_AUDIO: u8 = 0x20;
+/// toward exactly those pads. `0x40` — `0x20` is [`HOST_CAP_AUDIO_RED`], `0x10` is
+/// [`HOST_CAP_PEN`], `0x08` is [`HOST_CAP_CURSOR`], `0x04` is [`HOST_CAP_TEXT_INPUT`],
+/// `0x01`/`0x02` are gamepad-state / clipboard.
+pub const HOST_CAP_PAD_AUDIO: u8 = 0x40;
 
 /// [`Hello::video_codecs`] bit: the client can decode H.264 / AVC. The GPU-less **software**
 /// encode path (openh264) emits H.264, so a client that wants to stream from a software host MUST

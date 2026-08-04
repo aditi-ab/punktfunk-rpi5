@@ -354,7 +354,7 @@ macOS, iOS/iPadOS and tvOS. Android is one app, with Android TV being the same a
 | iPhone · iPad | ✅ | ✅ | ✅ ⁴ | ✅ | ✅ | ❌ ³ |
 | Apple TV | ⚠️ ⁵ | ✅ | ✅ ⁴ | ✅ | ✅ | ❌ ³ |
 | Android · Android TV | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ ³ |
-| Decky (Steam Deck) | ❌ ⁶ | ❌ | ✅ ⁷ | ❌ | ✅ | ✅ ⁸ |
+| Decky (Steam Deck) | ⚠️ ⁶ | ❌ | ⚠️ ⁷ | ❌ | ✅ | ✅ ⁸ |
 | `punktfunk` CLI | ✅ | ✅ ⁹ | ✅ | ✅ | ✅ | ❌ |
 | Moonlight | ❌ ¹⁰ | ❌ ¹⁰ | ✅ ¹¹ | ❓ ¹² | ❓ ¹² | ❓ ¹² |
 
@@ -375,10 +375,12 @@ macOS, iOS/iPadOS and tvOS. Android is one app, with Android TV being the same a
    exists, so a fresh Apple TV has none. Of the settings a profile can carry, tvOS also drops the
    ones the platform has no input for: inverted scroll, modifier layout, variable refresh rate,
    mouse mode and touch mode.
-6. The plugin writes flat values into the shared client settings; it has no profile surface. The
-   client it launches still honours whatever profile that settings file names.
-7. Including pinned one-tap "Stream *game*" rows in the Quick Access Menu, which follow a host
-   across IP changes. Not subject to the desktop opt-in.
+6. The panel *shows* the profiles a host has pinned, as nested one-tap cards, and streams with
+   them; it has no profile surface of its own. Pins are made in a client's own UI — including the
+   console home **Open Punktfunk** opens — and are shared, so every client shows the same cards.
+   Creating and editing a profile stays a desktop-app job.
+7. Not in the panel: **Open Punktfunk** opens the client's console home, and a paired host's
+   library is one button from there.
 8. Both the plugin itself and, where the install kind allows it, the client it launches.
 9. The CLI parses and follows links; it does not register the URL scheme — the graphical apps do.
 10. [Profiles and links](/docs/profiles-and-links) are Punktfunk-app concepts and do not exist on
@@ -400,7 +402,8 @@ macOS, iOS/iPadOS and tvOS. Android is one app, with Android TV being the same a
 
 1. Multiple controllers, each on its own stable slot, arriving and leaving independently. The pad
    **type** the host emulates is picked per pad; the pickers are not identical across apps — Linux,
-   Android and Decky offer six presets including Steam Deck, Windows and Apple offer five.
+   Android and the console home offer six presets including Steam Deck, Windows and Apple offer
+   five.
 2. DualSense and DualShock 4 touchpad and motion are forwarded, and the host's adaptive-trigger and
    lightbar effects are replayed on a real DualSense. On the desktop clients any controller SDL
    exposes a gyro on forwards motion — a Switch Pro or the Steam Deck's own pad included — and the
@@ -513,8 +516,8 @@ capability.
 | **GameStream / Moonlight plane** | Works, and whether it is on depends on how you installed. Every Linux package (deb, RPM, Arch, the Bazzite sysext) and the SteamOS installer ship the unit as `serve --gamestream`, so GameStream is **on** there; NixOS defaults it on too. The Windows installer's checkbox is unticked, so it is **off** unless you asked for it, and a bare `punktfunk-host serve` is off. It pairs over plain HTTP with weaker legacy encryption — trusted LAN only, and worth turning off if you don't use Moonlight (see [Security](/docs/security#gamestream--moonlight-compatibility-is-the-weak-crypto-path)). It is a compatibility surface, so Punktfunk-only features (profiles, links, clipboard, microphone) are not on it. |
 | **Linux and Windows desktop clients** | Packaged and current. They are one codebase: the same session binary streams for both, and for the Decky plugin and the `punktfunk` CLI. |
 | **Apple client** (macOS · iOS · iPadOS · tvOS) | One universal build, distributed as a **TestFlight beta**; the Mac also has a notarized DMG. Feature-complete apart from the platform gaps named above (no microphone on tvOS, clipboard on macOS only). |
-| **Android client** (phone · TV) | Distributed on Play's **closed (alpha)** track for releases, Internal testing for canary, plus a sideloadable APK. The same app in leanback mode is the TV client. |
-| **Decky plugin** (Steam Deck) | Ships through install-from-URL rather than the Decky store, and keeps itself and the client it launches up to date. It launches the Linux client rather than streaming itself, and has no settings surface of its own beyond the flat values it writes into the shared client settings. |
+| **Android client** (phone · TV) | Published on **Google Play** as a public listing for releases, with an invite-only Internal testing track for canary, plus a sideloadable APK. The same app in leanback mode is the TV client. |
+| **Decky plugin** (Steam Deck) | Ships through install-from-URL rather than the Decky store, and keeps itself and the client it launches up to date. It is a launcher, not a second client: it starts the Linux client rather than streaming itself, and holds no settings, no library and no host editor of its own — its **Open Punktfunk** button hands all of that to the client's console home. |
 | **Web console** | The full management surface — dashboard and sessions, pairing, library, displays, plugins and the plugin store, logs, stats, settings, and host updates. It cannot yet run a speed test or set a bitrate; the client apps can. |
 | **Plugins** | Three first-party ones (ROM Manager, Playnite, VirtualHere) plus the SDK, installed from the console. See [Plugins](/docs/plugins). |
 | **`pf-webos`** (LG TV) | A community client in a separate repository. Nothing here can establish its state; ask that project. |

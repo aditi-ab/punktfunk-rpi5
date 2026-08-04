@@ -360,9 +360,32 @@ fn ring_len(view: &pf_umdf_util::section::MappedView) -> u32 {
 /// from being coalesced away by a following LED/trigger report inside one host poll window (the
 /// confirmed stuck-rumble path).
 fn publish_output(view: &pf_umdf_util::section::MappedView, bytes: &[u8]) {
+    // Serialized: the whole publish is a read-modify-write (read the cursor, write the slot it
+    // names, then advance it) and the framework dispatches output callbacks in PARALLEL, so two
+    // can be inside this at once. Unsynchronized, both read the same `ring_head`, both write the
+    // SAME slot — tearing one report's bytes across the other's — and both store head+1, so the
+    // cursor advances once for two reports and the host sees a single torn entry.
+    //
+    // An atomic `fetch_add` on the head does not fix it. That hands each writer a distinct slot,
+    // but it advances the cursor BEFORE the slot bytes exist, so the host can read a slot that is
+    // still being filled — trading a torn slot for a torn slot the host is invited to read. Making
+    // the head-advance mean "the slot below is complete" is exactly what the lock buys.
+    //
+    // Poison-tolerant on purpose. Poison is sticky, so the repo's usual `if let Ok(g) = lock()`
+    // would skip the publish for the REST OF THE PROCESS after a single panic elsewhere — silently
+    // ending game output. Recovering the guard is safe here: the protected state is bytes in a
+    // shared section, not an invariant a panic could have broken.
+    let _publish = RING_PUBLISH
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     view.write_bytes(OFF_OUTPUT, bytes);
     let seq = view.read_u32(OFF_OUT_SEQ).wrapping_add(1);
-    view.write_u32(OFF_OUT_SEQ, seq);
+    // Release, not a plain write: the host loads `out_seq` with Acquire specifically to order its
+    // copy of the report bytes after it (`dualsense_windows.rs`, "Acquire pairs with the driver's
+    // publish-then-bump store order"). An Acquire load pairs with a Release store and nothing
+    // else, so as a plain write this promised the host an ordering it never actually established —
+    // on a weakly-ordered core (ARM64) the fresh seq could arrive ahead of the bytes it announces.
+    view.store_u32(OFF_OUT_SEQ, seq, Ordering::Release);
     let len = ring_len(view);
     if len != 0 {
         let head = view.read_u32(OFF_RING_HEAD);
@@ -374,6 +397,11 @@ fn publish_output(view: &pf_umdf_util::section::MappedView, bytes: &[u8]) {
         view.store_u32(OFF_RING_HEAD, head.wrapping_add(1), Ordering::Release);
     }
 }
+
+/// Serializes [`publish_output`] against itself — see the note there for why an atomic cursor is
+/// not enough. Uncontended in the common case: one output report at a time is the norm, and the
+/// critical section is a few dozen bytes of memcpy into an already-mapped view.
+static RING_PUBLISH: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// The sealed-channel client (per-pad: `ProcessSharingDisabled` gives each pad its own WUDFHost, so
 /// this static is per-pad). The handshake/adoption/validation state machine lives in `pf_umdf_util`.

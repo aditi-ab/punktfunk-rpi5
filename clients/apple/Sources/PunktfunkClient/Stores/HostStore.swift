@@ -191,6 +191,12 @@ final class HostStore: ObservableObject {
 
 
     private func persist() {
+        #if DEBUG
+        // The screenshot harness fills a store with mock hosts (ShotMock) purely to render a
+        // scene. On a dev Mac that store is the SAME App-Group suite the real app reads, so
+        // persisting would replace the tester's saved hosts with "Battlestation" & co.
+        if ScreenshotMode.isActive { return }
+        #endif
         if let data = try? JSONEncoder().encode(hosts) {
             defaults.set(data, forKey: Self.key)
         }
