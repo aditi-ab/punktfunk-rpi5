@@ -302,6 +302,21 @@ fn set_valve_hidapi(enabled: bool) {
     sdl3::hint::set("SDL_JOYSTICK_HIDAPI_STEAM", v);
 }
 
+/// Disable the Valve HIDAPI drivers **before SDL exists** — call this alongside the other
+/// pre-`SDL_Init` hints, not after a subsystem is up.
+///
+/// The damage these drivers do happens at *enumeration*, which is part of initialising the
+/// joystick/gamepad subsystem. Setting the hint afterwards does detach the driver, but only after
+/// it has already sent the Deck its `ID_CLEAR_DIGITAL_MAPPINGS` + `TRACKPAD_NONE` — so the
+/// built-in trackpad-mouse dies system-wide and stays dead until the firmware watchdog restores
+/// lizard mode seconds later. The threaded worker ([`run`]) has always done this in the right
+/// order; the caller-pumped path could not, because by the time it receives a
+/// [`sdl3::GamepadSubsystem`] the enumeration has already happened. Hence a separate entry point
+/// its callers can put in the right place.
+pub fn preinit_disable_valve_hidapi() {
+    set_valve_hidapi(false);
+}
+
 /// Map the SDL-reported controller type to the virtual pad we'd ask the host to create.
 fn pref_for_type(t: sdl3::gamepad::GamepadType) -> GamepadPref {
     use sdl3::gamepad::GamepadType as T;
@@ -412,9 +427,12 @@ impl GamepadService {
     /// and calls [`GamepadPump::tick`] once per loop iteration (the threaded worker's
     /// per-wakeup work: ctl drain, chord-hold check, menu repeat, feedback).
     ///
-    /// Like the threaded worker, this disables the Valve HIDAPI drivers up front (their
-    /// mere enumeration kills the Deck's trackpad-mouse system-wide); they are enabled
-    /// for the duration of an attached session only.
+    /// The Valve HIDAPI drivers are held off here too, but this is **too late to be the only
+    /// place it happens**: the `subsystem` argument means enumeration is already done, and that
+    /// is when the Deck driver kills the trackpad-mouse. The caller must also call
+    /// [`preinit_disable_valve_hidapi`] with its other pre-`SDL_Init` hints. This call still
+    /// earns its place — it re-asserts "off" for a process that ran a session earlier — but on
+    /// its own it only detaches a driver that has already done the damage.
     pub fn pumped(subsystem: sdl3::GamepadSubsystem) -> (GamepadService, GamepadPump) {
         set_valve_hidapi(false);
         let pads = Arc::new(Mutex::new(Vec::new()));
@@ -608,6 +626,38 @@ impl GamepadPump {
         self.worker.maybe_fire_disconnect();
         self.worker.menu_poll();
         self.worker.render_feedback();
+    }
+
+    /// Close every forwarded slot — flush its held wire state, tell the host to remove the pad,
+    /// and physically silence it. Call once on the way out of the caller's event loop.
+    ///
+    /// [`GamepadService::detach`] only *posts* `Ctl::Detach`; the close — the flush, the host-side
+    /// `GamepadRemove`, and the explicit `set_rumble(0, 0)` backstop in `close_slot_at` — happens
+    /// when the pump next drains it. An exit path that detached and then left the loop without
+    /// another [`tick`](Self::tick) therefore skipped all of it, and nothing else would: the slots
+    /// hold no `Drop` that silences them. A pad left mid-buzz stayed buzzing.
+    ///
+    /// This closes the slots directly rather than draining the queued `Ctl::Detach` that would
+    /// have done it. Same physical outcome by a shorter path, and deliberately so: this also runs
+    /// from `Drop`, and `drain_ctl` reaches `Mutex::lock().unwrap()`, which on a poisoned lock
+    /// would panic — during an unwind that aborts the process. Closing a slot touches no lock.
+    ///
+    /// Idempotent, and safe with nothing attached.
+    pub fn shutdown(&mut self) {
+        self.worker.close_all_slots();
+    }
+}
+
+/// The silence backstop of last resort. A caller's loop can also leave by `?` on a fatal overlay
+/// or present error — several paths do — and those would skip an explicit
+/// [`shutdown`](GamepadPump::shutdown) entirely, leaving a forwarded pad buzzing on the way out.
+///
+/// Callers should still call `shutdown` at their normal exit rather than lean on this: the pad
+/// wants to go quiet *before* a long teardown (session join, `vkDeviceWaitIdle`), not after it.
+/// Doing both is free — `shutdown` is idempotent.
+impl Drop for GamepadPump {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
 
@@ -1892,6 +1942,11 @@ impl Worker {
                 HidOutput::PlayerLeds { bits, .. } if is_ds => {
                     let _ = slot.pad.send_effect(&Ds5Feedback::player_packet(bits));
                 }
+                // Every other pad with player LEDs gets them through SDL, which owns the
+                // per-device pattern. This used to fall through and do nothing at all.
+                HidOutput::PlayerLeds { bits, .. } => {
+                    let _ = set_player_leds(&slot.pad, bits);
+                }
                 HidOutput::Trigger {
                     which, ref effect, ..
                 } if is_ds => {
@@ -1899,9 +1954,40 @@ impl Worker {
                         .pad
                         .send_effect(&Ds5Feedback::trigger_packet(which, effect));
                 }
-                _ => {}
+                // Deliberately unhandled, listed rather than left to a bare `_` so a new
+                // variant cannot join them silently: adaptive triggers exist only on a
+                // DualSense, and the trackpad-haptic / raw-passthrough planes are DS-specific
+                // and carried by `send_effect` above when the pad is one.
+                HidOutput::Trigger { .. }
+                | HidOutput::TrackpadHaptic { .. }
+                | HidOutput::HidRaw { .. } => {}
             }
         }
+    }
+}
+
+/// The SDL player index for the wire's positional player-LED `bits`, or `None` for "no player".
+///
+/// The wire carries a bitmask — one bit per LED, low 5 — while SDL wants a player *index* and owns
+/// the per-device pattern. The count bridges them: every convention that reaches this wire spells
+/// "player N" as N lit LEDs, both the DualSense patterns (`0x04`, `0x0A`, `0x15`, `0x1B`, `0x1F`)
+/// and the Switch/XInput run of low bits (`0x01`, `0x03`, `0x07`, `0x0F`). SDL's index is 0-based,
+/// so player 1 is index 0; no lit LED means *no* player rather than player 0.
+///
+/// Split out from [`set_player_leds`] so the mapping is testable — an `sdl3::Gamepad` needs a real
+/// device, so nothing that takes one can be.
+fn player_index_from_bits(bits: u8) -> Option<u16> {
+    match (bits & 0x1F).count_ones() {
+        0 => None,
+        n => Some((n - 1) as u16),
+    }
+}
+
+/// Drive a non-DualSense pad's player LEDs from the wire's positional `bits`.
+fn set_player_leds(pad: &sdl3::gamepad::Gamepad, bits: u8) -> Result<(), sdl3::Error> {
+    match player_index_from_bits(bits) {
+        None => pad.unset_player_index(),
+        Some(i) => pad.set_player_index(i),
     }
 }
 
@@ -2385,5 +2471,45 @@ mod slot_tests {
             }),
             6
         );
+    }
+}
+
+#[cfg(test)]
+mod player_led_tests {
+    use super::*;
+
+    /// Both conventions that reach this wire spell "player N" as N lit LEDs, so the count is the
+    /// player number regardless of WHICH bits a given pad lights. Pinned because the mapping is
+    /// otherwise only obvious once you have seen both patterns side by side.
+    #[test]
+    fn player_index_counts_lit_leds_for_both_conventions() {
+        // DualSense / hid-playstation patterns — non-contiguous, symmetric about the centre LED.
+        assert_eq!(player_index_from_bits(0x04), Some(0)); // player 1
+        assert_eq!(player_index_from_bits(0x0A), Some(1)); // player 2
+        assert_eq!(player_index_from_bits(0x15), Some(2)); // player 3
+        assert_eq!(player_index_from_bits(0x1B), Some(3)); // player 4
+        assert_eq!(player_index_from_bits(0x1F), Some(4)); // player 5
+
+        // Switch/XInput style — a contiguous run of low bits, the same count each time.
+        assert_eq!(player_index_from_bits(0x01), Some(0));
+        assert_eq!(player_index_from_bits(0x03), Some(1));
+        assert_eq!(player_index_from_bits(0x07), Some(2));
+        assert_eq!(player_index_from_bits(0x0F), Some(3));
+    }
+
+    /// No lit LED is "no player", NOT player 0 — the difference between LEDs off and player 1 lit.
+    #[test]
+    fn no_lit_led_is_no_player() {
+        assert_eq!(player_index_from_bits(0x00), None);
+        // Only the low 5 bits are player LEDs; junk above them must not invent a player.
+        assert_eq!(player_index_from_bits(0xE0), None);
+    }
+
+    /// The mask is applied before counting, so out-of-range bits cannot inflate the index past
+    /// the 5 real LEDs.
+    #[test]
+    fn high_bits_are_masked_off_before_counting() {
+        assert_eq!(player_index_from_bits(0xFF), Some(4)); // 0x1F worth of LEDs, not 8
+        assert_eq!(player_index_from_bits(0xE4), Some(0)); // 0x04 with junk on top
     }
 }
