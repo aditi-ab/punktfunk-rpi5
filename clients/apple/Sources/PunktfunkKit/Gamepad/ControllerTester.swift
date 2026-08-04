@@ -12,7 +12,7 @@ import GameController
 public final class ControllerTester: ObservableObject {
     // `.manual`: the panel's toggles hold a level until changed — no session wire refreshes
     // exist here to keep the renderer's staleness watchdog fed.
-    private let renderer = RumbleRenderer(policy: .manual)
+    private let renderer = RumbleRenderer()
     private weak var controller: GCController?
 
     /// The rumble backend now in use — "DualSense HID · USB/Bluetooth", "CoreHaptics", or "—" —

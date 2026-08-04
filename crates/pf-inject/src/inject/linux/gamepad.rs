@@ -268,7 +268,6 @@ struct Effect {
 /// the policy is pure and unit-testable without a live uinput fd.
 struct FfState {
     effects: HashMap<i16, Effect>,
-    next_effect_id: i16,
     gain: u32,
     /// Last `(low, high)` reported, to dedup.
     last_mix: (u16, u16),
@@ -284,7 +283,6 @@ impl FfState {
     fn new() -> FfState {
         FfState {
             effects: HashMap::new(),
-            next_effect_id: 0,
             gain: 0xFFFF,
             last_mix: (0, 0),
             last_activity: Instant::now(),
@@ -531,11 +529,13 @@ impl VirtualPad {
                     let mut up: UinputFfUpload = unsafe { std::mem::zeroed() };
                     up.request_id = ev.value as u32;
                     if ioctl_ptr(raw, UI_BEGIN_FF_UPLOAD, &mut up, "UI_BEGIN_FF_UPLOAD").is_ok() {
-                        let mut e = up.effect;
-                        if e.id == -1 {
-                            e.id = self.ff.next_effect_id;
-                            self.ff.next_effect_id = self.ff.next_effect_id.wrapping_add(1);
-                        }
+                        let e = up.effect;
+                        // No `id == -1` fallback: ff-core's `input_ff_upload` picks a free slot and
+                        // writes it into the effect BEFORE handing the request to uinput, so what
+                        // arrives here is always an assigned id. The fallback that used to allocate
+                        // one from a local counter could therefore never run, and a local counter is
+                        // the wrong answer anyway — the kernel owns that id space.
+                        debug_assert!(e.id >= 0, "uinput handed us an unassigned FF effect id");
                         if e.type_ == FF_RUMBLE {
                             let strong = u16::from_ne_bytes([e.u[0], e.u[1]]);
                             let weak = u16::from_ne_bytes([e.u[2], e.u[3]]);

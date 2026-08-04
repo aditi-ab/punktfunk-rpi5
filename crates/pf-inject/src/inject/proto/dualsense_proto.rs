@@ -471,7 +471,14 @@ fn pack_touch(dst: &mut [u8], t: &Touch) {
 #[derive(Default)]
 pub struct DsFeedback {
     pub hidout: Vec<HidOutput>,
-    /// `(low, high)` motor levels (0..=0xFFFF), if a report carried them.
+    /// `(low, high)` motor levels, if a report carried them.
+    ///
+    /// This parser widens the device's 8-bit motor bytes by `<< 8`, so the values it produces are
+    /// `0..=0xFF00` in steps of 0x100 — NOT `0..=0xFFFF`, which is what this said before. The
+    /// Windows backend widens the same bytes by `× 257` and does reach 0xFFFF. Both are correct:
+    /// every consumer narrows with `>> 8`, and 0xFF00 and 0xFFFF both narrow back to 255. Do not
+    /// "fix" one to match the other — see [`crate::uhid_manager::PadFeedback::rumble`], which is
+    /// the type that sees both.
     pub rumble: Option<(u16, u16)>,
     /// The driver's output-report ring overflowed this poll — pending reports were DISCARDED and
     /// feedback state is unknown; the [`UhidManager`](crate::uhid_manager) must resync (silence +
@@ -479,64 +486,101 @@ pub struct DsFeedback {
     pub resync: bool,
 }
 
-/// Parse a DualSense USB output report (`0x02`) into a [`DsFeedback`]. The byte layout below is
-/// the USB DualSense common report; only the well-understood fields (motor rumble, lightbar RGB,
-/// player LEDs) are surfaced — adaptive-trigger blocks are forwarded raw for the client.
+/// Field offsets in the DualSense **output** report, as indices into a whole USB report — i.e.
+/// including the leading report id at `[0]`. This is the one place in Rust the layout is written
+/// down; index off these rather than repeating the numbers.
+///
+/// **The same fields sit at different offsets per transport, and that is not drift.** Every writer
+/// lays out one common block; what changes is how much header precedes it:
+///
+/// | base | where | first payload byte |
+/// |---|---|---|
+/// | `0`  | USB report, id included — what these constants describe, and what this parser reads | `[1]` |
+/// | `−1` | SDL `DS5EffectsState_t` — a 47-byte payload with NO report id (`pf-client-core`'s `Ds5Feedback`) | `[0]` |
+/// | `+2` | Bluetooth report `0x31` — id, sequence, magic, then the block; CRC32 in the last 4 bytes | `[3]` |
+///
+/// Subtract or add the base to translate. Mirrors that cannot import this module — Kotlin
+/// (`DsDevice.kt`, USB base 0) and Swift (`DualSenseHID.swift`, which handles both the USB and
+/// Bluetooth bases) — carry a pointer back here; keep them in step by hand.
+pub mod out_report {
+    /// `valid_flag0`: BIT0 compat vibration, BIT1 haptics select, BIT2 R2, BIT3 L2.
+    pub const VALID_FLAG0: usize = 1;
+    /// `valid_flag1`: BIT2 lightbar, BIT4 player indicators.
+    pub const VALID_FLAG1: usize = 2;
+    /// High-frequency (small / right) motor.
+    pub const MOTOR_RIGHT: usize = 3;
+    /// Low-frequency (big / left) motor.
+    pub const MOTOR_LEFT: usize = 4;
+    /// First byte of the RIGHT trigger's parameter block — it precedes the left one in the report.
+    pub const RIGHT_TRIGGER: usize = 11;
+    /// First byte of the LEFT trigger's parameter block.
+    pub const LEFT_TRIGGER: usize = 22;
+    /// One adaptive-trigger parameter block: a mode byte plus 10 parameters.
+    pub const TRIGGER_LEN: usize = 11;
+    /// `valid_flag2`: BIT2 = `COMPATIBLE_VIBRATION2` (the firmware ≥ 2.24 rumble signal).
+    pub const VALID_FLAG2: usize = 39;
+    /// Lit player-indicator bits (low 5).
+    pub const PLAYER_LEDS: usize = 44;
+    /// Lightbar red; green and blue follow.
+    pub const LED_RGB: usize = 45;
+}
+
+/// Parse a DualSense USB output report (`0x02`) into a [`DsFeedback`], indexed off
+/// [`out_report`]. Only the well-understood fields (motor rumble, lightbar RGB, player LEDs) are
+/// surfaced — adaptive-trigger blocks are forwarded raw for the client.
 ///
 /// Every field is gated on the report's valid-flags (`valid_flag0` at data[1], `valid_flag1`
 /// at data[2]) — writers only set the bits for fields they mean to change (the rest is zeroed),
 /// so an ungated parse would turn every plain rumble write into a lightbar-off + triggers-off
 /// broadcast.
 pub fn parse_ds_output(pad: u8, data: &[u8], fb: &mut DsFeedback) {
+    use out_report as o;
     // data[0] is the report id (0x02). Be defensive about short reports.
     if data.first() != Some(&0x02) || data.len() < 48 {
         return;
     }
-    let flag0 = data[1]; // BIT0 compat vibration, BIT1 haptics select, BIT2 R2, BIT3 L2
-    let flag1 = data[2]; // BIT2 lightbar, BIT4 player indicators
-                         // Motor rumble: high-frequency (small/right) motor at data[3], low-frequency (big/left) at
-                         // data[4]. Scale 0..255 → 0..0xFFFF, same (low, high) convention as the uinput pad's mixer,
-                         // and route to the universal rumble plane (0xCA).
-                         // Writers on firmware ≥ 2.24 signal rumble via COMPATIBLE_VIBRATION2 in valid_flag2
-                         // (data[39] BIT2) instead of flag0 BIT0. Our feature report advertises a version
-                         // above 2.24 (DS_FEATURE_FIRMWARE bytes 44..46, chosen to keep Sony's updater
-                         // quiet), so the kernel and SDL write the v2 flag — while older writers, and any
-                         // that never read the version, stay on flag0. Both conventions must land here: a
-                         // rumble dropped on either — including stops — is silently ignored, and a missed
-                         // stop buzzes for the rest of the session (the 500 ms refresh re-sends stale state
-                         // forever).
-    if flag0 & 0x03 != 0 || data[39] & 0x04 != 0 {
-        let high = (data[3] as u16) << 8;
-        let low = (data[4] as u16) << 8;
+    let flag0 = data[o::VALID_FLAG0]; // BIT0 compat vibration, BIT1 haptics select, BIT2 R2, BIT3 L2
+    let flag1 = data[o::VALID_FLAG1]; // BIT2 lightbar, BIT4 player indicators
+                                      // Motor rumble: high-frequency (small/right) motor first, low-frequency (big/left) second.
+                                      // Widened 0..255 → 0..0xFF00 by `<< 8` (NOT 0xFFFF — see `DsFeedback::rumble`), same
+                                      // (low, high) convention as the uinput pad's mixer, and routed to the 0xCA plane.
+                                      // Writers on firmware ≥ 2.24 signal rumble via COMPATIBLE_VIBRATION2 in valid_flag2
+                                      // instead of flag0 BIT0. Our feature report advertises a version above 2.24
+                                      // (DS_FEATURE_FIRMWARE bytes 44..46, chosen to keep Sony's updater quiet), so the
+                                      // kernel and SDL write the v2 flag — while older writers, and any that never read the
+                                      // version, stay on flag0. Both conventions must land here: a rumble dropped on either
+                                      // — including stops — is silently ignored, and a missed stop buzzes for the rest of
+                                      // the session (the 500 ms refresh re-sends stale state forever).
+    if flag0 & 0x03 != 0 || data[o::VALID_FLAG2] & 0x04 != 0 {
+        let high = (data[o::MOTOR_RIGHT] as u16) << 8;
+        let low = (data[o::MOTOR_LEFT] as u16) << 8;
         fb.rumble = Some((low, high));
     }
-    // Lightbar RGB (USB common report: bytes 45..48). Player LEDs at byte 44.
     if flag1 & 0x04 != 0 {
-        let (r, g, b) = (data[45], data[46], data[47]);
+        let (r, g, b) = (data[o::LED_RGB], data[o::LED_RGB + 1], data[o::LED_RGB + 2]);
         fb.hidout.push(HidOutput::Led { pad, r, g, b });
     }
     if flag1 & 0x10 != 0 {
         fb.hidout.push(HidOutput::PlayerLeds {
             pad,
-            bits: data[44] & 0x1F,
+            bits: data[o::PLAYER_LEDS] & 0x1F,
         });
     }
-    // Adaptive-trigger parameter blocks, 11 bytes each: the RIGHT trigger comes FIRST in the
-    // report (bytes 11..22), the left at 22..33 — per SDL's DS5EffectsState_t / inputtino's
-    // ps5.hpp. Wire convention: which 0 = L2, 1 = R2.
-    if data.len() >= 33 {
+    // The RIGHT trigger block comes FIRST in the report — per SDL's DS5EffectsState_t /
+    // inputtino's ps5.hpp. Wire convention: which 0 = L2, 1 = R2.
+    if data.len() >= o::LEFT_TRIGGER + o::TRIGGER_LEN {
         if flag0 & 0x04 != 0 {
             fb.hidout.push(HidOutput::Trigger {
                 pad,
                 which: 1,
-                effect: data[11..22].to_vec(),
+                effect: data[o::RIGHT_TRIGGER..o::RIGHT_TRIGGER + o::TRIGGER_LEN].to_vec(),
             });
         }
         if flag0 & 0x08 != 0 {
             fb.hidout.push(HidOutput::Trigger {
                 pad,
                 which: 0,
-                effect: data[22..33].to_vec(),
+                effect: data[o::LEFT_TRIGGER..o::LEFT_TRIGGER + o::TRIGGER_LEN].to_vec(),
             });
         }
     }

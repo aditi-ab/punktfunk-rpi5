@@ -65,7 +65,7 @@ public final class GamepadFeedback {
         #if os(iOS)
         if UserDefaults.standard.bool(forKey: DefaultsKey.rumbleOnDevice),
             CHHapticEngine.capabilitiesForHardware().supportsHaptics {
-            deviceRumble = RumbleRenderer(policy: .session, actuator: .device)
+            deviceRumble = RumbleRenderer(actuator: .device)
         } else {
             deviceRumble = nil
         }
@@ -128,7 +128,7 @@ public final class GamepadFeedback {
                 replay(slot)
             } else {
                 slots[pad] = Slot(controller: controller)
-                let renderer = RumbleRenderer(policy: .session)
+                let renderer = RumbleRenderer()
                 renderer.retarget(controller)
                 withRouting { rumbleByPad[pad] = renderer }
             }

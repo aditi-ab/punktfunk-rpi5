@@ -127,21 +127,10 @@ class GamepadFeedback(
         rumbleThread = Thread({
             while (running) {
                 val ev = NativeBridge.nativeNextRumble(handle)
-                if (ev < 0L) continue // timeout / closed
-                // ev bits 49..52 = wire pad index; bits 32..47 = backstop duration (ms);
-                // 16..31 = low; 0..15 = high. These are EFFECTIVE commands from the core's shared
-                // rumble policy engine — it owns every lease/staleness/close decision (uniform
-                // across all clients; the old 60 s legacy-host exposure is gone) and emits
-                // explicit zeros, so apply verbatim: (0, 0) = cancel, non-zero = one-shot for
-                // the backstop (the hardware net under a stalled poll thread).
-                val pad = ((ev ushr 49) and 0xFL).toInt()
-                val backstopMs = ((ev ushr 32) and 0xFFFF)
-                renderRumble(
-                    pad,
-                    ((ev ushr 16) and 0xFFFF).toInt(),
-                    (ev and 0xFFFF).toInt(),
-                    backstopMs,
-                )
+                // Layout + semantics live in `unpackRumbleEvent` (RumbleWire.kt), tested there
+                // against the Rust packer.
+                val cmd = unpackRumbleEvent(ev) ?: continue // timeout / closed
+                renderRumble(cmd.pad, cmd.low, cmd.high, cmd.backstopMs)
             }
         }, "pf-rumble").apply { isDaemon = true; start() }
 
@@ -264,8 +253,8 @@ class GamepadFeedback(
             return
         }
         val bind = rumbleBindFor(pad) ?: return
-        val lo = toAmplitude(low)
-        val hi = toAmplitude(high)
+        val lo = wireAmplitudeToByte(low)
+        val hi = wireAmplitudeToByte(high)
         val m = bind.vm
         if (m != null) {
             if (lo == 0 && hi == 0) {
@@ -314,8 +303,8 @@ class GamepadFeedback(
      */
     private fun renderDeviceRumble(low: Int, high: Int, durationMs: Long) {
         val v = deviceVibrator ?: return
-        val lo = toAmplitude(low)
-        val hi = toAmplitude(high)
+        val lo = wireAmplitudeToByte(low)
+        val hi = wireAmplitudeToByte(high)
         if (lo == 0 && hi == 0) {
             runCatching { v.cancel() } // (0,0) = stop
             return
@@ -327,12 +316,6 @@ class GamepadFeedback(
                 else oneShot(VibrationEffect.DEFAULT_AMPLITUDE, durationMs)
             )
         }
-    }
-
-    // 0..0xFFFF → 1..255 (high byte); a nonzero motor never collapses to 0.
-    private fun toAmplitude(v16: Int): Int {
-        val a = (v16 ushr 8) and 0xFF
-        return if (v16 != 0 && a == 0) 1 else a
     }
 
     // One-shot held for `durationMs` — the host's v2 TTL (renewed while the level holds), so it

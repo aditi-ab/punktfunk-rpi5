@@ -431,6 +431,14 @@ pub enum HidOutput {
     /// A trackpad haptic pulse for a Steam Controller's voice-coil actuators (its only "rumble").
     /// `side` 0 = right pad, 1 = left pad; `amplitude` + `period` (µs off-time) + `count` (pulses)
     /// synthesize a buzz. A client without trackpad coils drops it (or maps it to ordinary rumble).
+    ///
+    /// **STAGED SCAFFOLDING — deliberately unreachable today, do not delete.** Nothing on the host
+    /// produces this variant and no client renders it; it codes/decodes and round-trips in tests
+    /// and nothing else. It stays because `HIDOUT_TRACKPAD_HAPTIC` is an allocated tag on a
+    /// SHIPPED wire: removing the variant would not reclaim the tag (a future peer could still
+    /// send it), it would only lose the decoder that keeps such a datagram from being mistaken
+    /// for something else. The producer is the Steam Controller coil path; the renderer is the
+    /// client-side coil write. Wire up either half and this becomes live with no format change.
     TrackpadHaptic {
         pad: u8,
         side: u8,

@@ -53,10 +53,25 @@ pub struct RumbleCommand {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ActuatorQuirks {
     /// Re-emit an unchanged non-zero level every this many ms — for actuators whose hardware
-    /// output decays between wire renewals (Steam Deck ≈ 40, macOS DualSense-over-HID BT ≈ 900).
-    /// `0` = no keepalive (the common case).
+    /// output decays between wire renewals. `0` = no keepalive (the common case).
+    ///
+    /// The one in-tree producer is the Steam Deck's ≈ 40 ms (`pf-client-core`'s slot open, paired
+    /// with `dedup_jitter`). The macOS DualSense-over-HID Bluetooth decay is NOT served by this
+    /// quirk, though it reads like the obvious second example: the Apple client keeps its own
+    /// ≈ 900 ms keepalive down in `RumbleRenderer` (`RumbleTuning.hidKeepaliveSeconds`) because
+    /// the re-emit has to happen BELOW the command layer. An engine keepalive arrives as a
+    /// command carrying the same levels, and that renderer skips a HID write whose levels are
+    /// unchanged — so the re-emit would be swallowed by the very dedupe it exists to defeat
+    /// (`dedup_jitter` is the Deck's answer to the same problem one layer up).
     pub keepalive_ms: u16,
-    /// Floor for `backstop_ms` on non-zero commands (Android's `createOneShot` throws on 0).
+    /// Floor for `backstop_ms` on non-zero commands.
+    ///
+    /// **No in-tree producer sets this non-zero** — it is reachable only through the C ABI
+    /// (`punktfunk_connection_set_rumble_quirks`), for embedders whose duration-taking API
+    /// rejects short values. The case it was written for is handled elsewhere: Android's
+    /// `createOneShot` does throw on a non-positive duration, but the Kotlin renderer floors the
+    /// duration itself at the call, and that path never declares quirks at all. Kept because it
+    /// is exported ABI, and because a floor belongs here rather than re-invented per embedder.
     pub min_pulse_ms: u16,
     /// Alternate the low motor's LSB on keepalive re-emits (imperceptible) so an SDL-class layer
     /// that no-ops identical values still writes the device — the Deck's dedupe-defeat.

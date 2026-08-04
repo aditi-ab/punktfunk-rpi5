@@ -22,30 +22,16 @@ use super::switch_proto::{
     serialize_report_0x30, spi_flash_read, switch_mac, SwitchOutput, SwitchState, PROCON_RDESC,
     SWITCH_PRODUCT, SWITCH_REPORT_LEN, SWITCH_VENDOR,
 };
+use crate::uhid_abi::{
+    put_cstr, BUS_USB, HID_MAX_DESCRIPTOR_SIZE, UHID_CREATE2, UHID_DESTROY, UHID_EVENT_SIZE,
+    UHID_GET_REPORT, UHID_GET_REPORT_REPLY, UHID_INPUT2, UHID_OUTPUT, UHID_PATH,
+};
 use crate::uhid_manager::{PadFeedback, PadProto, UhidManager};
 use anyhow::{Context, Result};
 use punktfunk_core::quic::{HidOutput, RichInput};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
-
-// /dev/uhid event ABI (linux/uhid.h) — identical to the DualSense backend's; see `super::dualsense`.
-const UHID_PATH: &str = "/dev/uhid";
-const UHID_DESTROY: u32 = 1;
-const UHID_OUTPUT: u32 = 6;
-const UHID_GET_REPORT: u32 = 9;
-const UHID_GET_REPORT_REPLY: u32 = 10;
-const UHID_CREATE2: u32 = 11;
-const UHID_INPUT2: u32 = 12;
-const HID_MAX_DESCRIPTOR_SIZE: usize = 4096;
-const UHID_EVENT_SIZE: usize = 4 + 4372; // type + union (create2)
-const BUS_USB: u16 = 0x03;
-
-/// Copy a NUL-padded C string field into the event buffer.
-fn put_cstr(ev: &mut [u8], off: usize, cap: usize, s: &str) {
-    let n = s.len().min(cap - 1);
-    ev[off..off + n].copy_from_slice(&s.as_bytes()[..n]); // rest already zero (NUL-terminated)
-}
 
 /// A virtual Pro Controller backed by `/dev/uhid`. Dropping it destroys the device (the kernel
 /// tears down the bound `hid-nintendo` interface).

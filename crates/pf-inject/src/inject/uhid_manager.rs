@@ -18,7 +18,12 @@ use std::time::{Duration, Instant};
 /// 0xCD feedback events (lightbar / player LEDs / adaptive triggers), deduped via [`HidoutDedup`].
 #[derive(Default)]
 pub struct PadFeedback {
-    /// `(low, high)` motor levels (0..=0xFF00), if the pass saw a rumble report.
+    /// `(low, high)` motor levels, if the pass saw a rumble report.
+    ///
+    /// Range is `0..=0xFFFF` — this said `0..=0xFF00`, which is only true of the backends that
+    /// widen the device's 8-bit motor byte by `<< 8` (the UHID/DualSense path). The Windows
+    /// backend widens by `× 257` and does reach 0xFFFF, and this type carries both. Neither is a
+    /// defect: consumers narrow with `>> 8`, and 0xFF00 and 0xFFFF both narrow back to 255.
     pub rumble: Option<(u16, u16)>,
     pub hidout: Vec<HidOutput>,
     /// Whether the game drove this pad's RUMBLE plane this poll — at least one output report

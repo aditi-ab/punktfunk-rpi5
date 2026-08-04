@@ -682,13 +682,27 @@ fn axis_value(axis: sdl3::gamepad::Axis, v: i16) -> (u32, i32) {
 /// host parses off its virtual pad; the wire's 11-byte trigger blocks drop in verbatim.
 /// Enable bits select only the fields each update touches, so rumble (driven separately
 /// through SDL) and untouched fields keep their state.
+///
+/// The offsets below are the USB output report's, **minus one**: SDL's payload carries no leading
+/// report id. `pf-inject`'s `dualsense_proto::out_report` is where that layout is written down and
+/// explained (including the Bluetooth `+2` base), but this crate cannot import it — `pf-inject` is
+/// host-side and neither crate depends on the other, and a DualSense report layout has no business
+/// in `punktfunk-core`, the only crate they share. So this is a deliberate second copy, and
+/// [`ds5_offsets_track_the_usb_report`](ds5_feedback_tests) pins the `−1` relationship rather than
+/// leaving it to a comment.
 struct Ds5Feedback;
 
 impl Ds5Feedback {
-    const RIGHT_TRIGGER: usize = 10;
-    const LEFT_TRIGGER: usize = 21;
-    const PAD_LIGHTS: usize = 43;
-    const LED_RGB: usize = 44;
+    /// The USB report offsets these are derived from — see the type doc. Kept beside the derived
+    /// values so the subtraction is visible at the point of definition.
+    const REPORT_ID_LEN: usize = 1;
+    const RIGHT_TRIGGER: usize = 11 - Self::REPORT_ID_LEN;
+    const LEFT_TRIGGER: usize = 22 - Self::REPORT_ID_LEN;
+    const PAD_LIGHTS: usize = 44 - Self::REPORT_ID_LEN;
+    const LED_RGB: usize = 45 - Self::REPORT_ID_LEN;
+    /// One adaptive-trigger parameter block: a mode byte plus 10 parameters. Mirrors
+    /// `PUNKTFUNK_HID_EFFECT_MAX`, which is the same number at the C-ABI boundary.
+    const TRIGGER_LEN: usize = punktfunk_core::abi::PUNKTFUNK_HID_EFFECT_MAX as usize;
 
     fn trigger_packet(which: u8, effect: &[u8]) -> [u8; 47] {
         let mut p = [0u8; 47];
@@ -698,7 +712,7 @@ impl Ds5Feedback {
             (0x08, Self::LEFT_TRIGGER)
         };
         p[0] = flag;
-        let n = effect.len().min(11);
+        let n = effect.len().min(Self::TRIGGER_LEN);
         p[off..off + n].copy_from_slice(&effect[..n]);
         p
     }
@@ -1837,7 +1851,12 @@ impl Worker {
         let dur_ms: u32 = if (low, high) == (0, 0) {
             100 // a stop takes effect immediately; the duration is irrelevant
         } else {
-            backstop_ms.max(160) // floor: a jittered renewal can never gap the actuator
+            // No local floor. There was a `.max(160)` here, and it could never do anything: the
+            // engine's own `backstop()` returns `(2 * ttl).clamp(500, 5000)` or the 2000 ms legacy
+            // value, so a non-zero command's backstop is never below 500. A floor that belongs to a
+            // particular actuator belongs in its `ActuatorQuirks::min_pulse_ms`, which the engine
+            // already applies — not re-invented per renderer where it can silently disagree.
+            backstop_ms
         };
         // Surface a failed SDL rumble write: a swallowed error here (DualSense not in the right
         // HIDAPI mode, etc.) reads exactly like "rumble doesn't work". The host logs the send side
@@ -2384,6 +2403,134 @@ mod slot_tests {
                 data: vec![0x80, 0, 0]
             }),
             6
+        );
+    }
+}
+
+/// [`Ds5Feedback`]'s three packet builders. The host-side parser, the Android writer and the Apple
+/// writer are all pinned by their own suites; this writer had nothing, despite being the one that
+/// hand-shifts every offset by the report-id length.
+#[cfg(test)]
+mod ds5_feedback_tests {
+    use super::*;
+
+    /// The USB output report offsets, written out independently of the implementation. A DS5
+    /// effects payload is the same block with the leading report id removed, so every offset is
+    /// exactly one lower — this is the relationship the derived constants encode.
+    #[test]
+    fn ds5_offsets_track_the_usb_report() {
+        for (usb, payload) in [
+            (11usize, Ds5Feedback::RIGHT_TRIGGER),
+            (22, Ds5Feedback::LEFT_TRIGGER),
+            (44, Ds5Feedback::PAD_LIGHTS),
+            (45, Ds5Feedback::LED_RGB),
+        ] {
+            assert_eq!(payload, usb - 1, "payload offset for USB byte {usb}");
+        }
+        assert_eq!(Ds5Feedback::TRIGGER_LEN, 11);
+    }
+
+    #[test]
+    fn lightbar_sets_only_its_enable_bit_and_its_three_bytes() {
+        let p = Ds5Feedback::lightbar_packet(0x11, 0x22, 0x33);
+        assert_eq!(p.len(), 47);
+        assert_eq!(p[1], 0x04, "valid_flag1 lightbar bit");
+        assert_eq!(p[0], 0, "must not claim any valid_flag0 field");
+        assert_eq!(
+            (
+                p[Ds5Feedback::LED_RGB],
+                p[Ds5Feedback::LED_RGB + 1],
+                p[Ds5Feedback::LED_RGB + 2]
+            ),
+            (0x11, 0x22, 0x33)
+        );
+        // Everything else stays zero — an over-broad packet would blank the triggers/player LEDs
+        // it never meant to touch.
+        let touched = [
+            1,
+            Ds5Feedback::LED_RGB,
+            Ds5Feedback::LED_RGB + 1,
+            Ds5Feedback::LED_RGB + 2,
+        ];
+        assert!(p
+            .iter()
+            .enumerate()
+            .all(|(i, &b)| touched.contains(&i) || b == 0));
+    }
+
+    #[test]
+    fn player_leds_are_masked_to_five_bits() {
+        let p = Ds5Feedback::player_packet(0xFF);
+        assert_eq!(p[1], 0x10, "valid_flag1 player-indicator bit");
+        assert_eq!(
+            p[Ds5Feedback::PAD_LIGHTS],
+            0x1F,
+            "high bits are not ours to set"
+        );
+        let p = Ds5Feedback::player_packet(0b0000_0101);
+        assert_eq!(p[Ds5Feedback::PAD_LIGHTS], 0b0000_0101);
+    }
+
+    /// which 1 = R2 and which 0 = L2 — and the RIGHT block sits FIRST in the report, which is the
+    /// pairing most likely to be transcribed backwards.
+    #[test]
+    fn trigger_which_selects_the_right_flag_and_offset() {
+        let eff: Vec<u8> = (1..=11).collect();
+
+        let r = Ds5Feedback::trigger_packet(1, &eff);
+        assert_eq!(r[0], 0x04, "valid_flag0 R2 bit");
+        assert_eq!(
+            &r[Ds5Feedback::RIGHT_TRIGGER..Ds5Feedback::RIGHT_TRIGGER + 11],
+            &eff[..]
+        );
+        assert_eq!(
+            r[Ds5Feedback::LEFT_TRIGGER],
+            0,
+            "the other trigger is untouched"
+        );
+
+        let l = Ds5Feedback::trigger_packet(0, &eff);
+        assert_eq!(l[0], 0x08, "valid_flag0 L2 bit");
+        assert_eq!(
+            &l[Ds5Feedback::LEFT_TRIGGER..Ds5Feedback::LEFT_TRIGGER + 11],
+            &eff[..]
+        );
+        assert_eq!(l[Ds5Feedback::RIGHT_TRIGGER], 0);
+    }
+
+    #[test]
+    fn an_oversized_effect_is_clamped_rather_than_overflowing_into_the_next_field() {
+        let long = vec![0xAAu8; 40];
+        let p = Ds5Feedback::trigger_packet(1, &long);
+        assert_eq!(p.len(), 47);
+        // Exactly TRIGGER_LEN bytes written; the left block must not be scribbled on.
+        assert_eq!(p[Ds5Feedback::RIGHT_TRIGGER + 10], 0xAA);
+        assert_eq!(p[Ds5Feedback::RIGHT_TRIGGER + 11], 0);
+        assert_eq!(p[Ds5Feedback::LEFT_TRIGGER], 0);
+    }
+
+    #[test]
+    fn a_short_effect_leaves_the_rest_of_the_block_zeroed() {
+        let p = Ds5Feedback::trigger_packet(0, &[0x02, 0x99]);
+        assert_eq!(p[Ds5Feedback::LEFT_TRIGGER], 0x02);
+        assert_eq!(p[Ds5Feedback::LEFT_TRIGGER + 1], 0x99);
+        assert!(
+            p[Ds5Feedback::LEFT_TRIGGER + 2..Ds5Feedback::LEFT_TRIGGER + 11]
+                .iter()
+                .all(|&b| b == 0)
+        );
+    }
+
+    /// An empty effect is a well-formed all-zero block: mode 0x00 = release. It must still assert
+    /// its enable bit, or the pad keeps whatever effect it was holding.
+    #[test]
+    fn an_empty_effect_is_a_release_not_a_no_op() {
+        let p = Ds5Feedback::trigger_packet(1, &[]);
+        assert_eq!(p[0], 0x04);
+        assert!(
+            p[Ds5Feedback::RIGHT_TRIGGER..Ds5Feedback::RIGHT_TRIGGER + 11]
+                .iter()
+                .all(|&b| b == 0)
         );
     }
 }

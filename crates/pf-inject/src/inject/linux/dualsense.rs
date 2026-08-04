@@ -17,33 +17,17 @@ use super::dualsense_proto::{
     DS_EDGE_PRODUCT, DS_FEATURE_CALIBRATION, DS_FEATURE_FIRMWARE, DS_INPUT_REPORT_LEN, DS_PRODUCT,
     DS_TOUCH_H, DS_TOUCH_W, DS_VENDOR, DUALSENSE_EDGE_RDESC, DUALSENSE_RDESC,
 };
+use crate::uhid_abi::{
+    put_cstr, BUS_USB, HID_MAX_DESCRIPTOR_SIZE, UHID_CREATE2, UHID_DESTROY, UHID_EVENT_SIZE,
+    UHID_GET_REPORT, UHID_GET_REPORT_REPLY, UHID_INPUT2, UHID_OUTPUT, UHID_PATH, UHID_SET_REPORT,
+    UHID_SET_REPORT_REPLY,
+};
 use crate::uhid_manager::{PadFeedback, PadProto, UhidManager};
 use anyhow::{Context, Result};
 use punktfunk_core::quic::RichInput;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
-
-// /dev/uhid event ABI (linux/uhid.h). `struct uhid_event` is __packed__: a u32 `type` then a
-// union whose largest member is uhid_create2_req (128+64+64 + 2+2 + 4*4 + rd_data[4096] = 4372).
-const UHID_PATH: &str = "/dev/uhid";
-const UHID_DESTROY: u32 = 1;
-const UHID_OUTPUT: u32 = 6;
-const UHID_GET_REPORT: u32 = 9;
-const UHID_GET_REPORT_REPLY: u32 = 10;
-const UHID_CREATE2: u32 = 11;
-const UHID_INPUT2: u32 = 12;
-const UHID_SET_REPORT: u32 = 13;
-const UHID_SET_REPORT_REPLY: u32 = 14;
-const HID_MAX_DESCRIPTOR_SIZE: usize = 4096;
-const UHID_EVENT_SIZE: usize = 4 + 4372; // type + union (create2)
-const BUS_USB: u16 = 0x03;
-
-/// Copy a NUL-padded C string field into the event buffer.
-fn put_cstr(ev: &mut [u8], off: usize, cap: usize, s: &str) {
-    let n = s.len().min(cap - 1);
-    ev[off..off + n].copy_from_slice(&s.as_bytes()[..n]); // rest already zero (NUL-terminated)
-}
 
 /// The UHID identity a [`DualSensePad`] is created with — the plain DualSense or the Edge (same
 /// driver, same report codec; the Edge differs by PID + descriptor and carries the four extra
