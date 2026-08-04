@@ -403,6 +403,7 @@ public final class SessionAudio {
         stateLock.unlock()
         let thread = Thread { [connection, flag, drainDone] in
             defer { drainDone.signal() }
+            var drained = 0
             // Decode happens IN-CORE (libopus multistream) — AudioToolbox's Opus path is
             // stereo-only — and is handed back as interleaved f32 PCM in wire channel order.
             // Per-iteration autorelease pool: no runloop on this thread (see Stage2Pipeline).
@@ -420,6 +421,17 @@ public final class SessionAudio {
                     if let base = p.baseAddress {
                         ring.write(base, count: pcm.frameCount * pcm.channels)
                     }
+                }
+                // Periodic vitals (~10 s at the protocol's 5 ms frames). The other three clients
+                // log buffer depth and underruns; without this an Apple audio report — latency or
+                // dropout — arrives with no numbers at all, which is the position every platform
+                // was in before the 2026-08 audio work.
+                drained += 1
+                if drained % 2_000 == 0 {
+                    let s = ring.stats
+                    log.info(
+                        "audio: buffer_ms=\(s.bufferedMS) target_ms=\(s.targetMS) underruns=\(s.underruns) drift_sheds=\(s.sheds)"
+                    )
                 }
                 return true
                 }

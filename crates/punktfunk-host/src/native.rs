@@ -1308,11 +1308,17 @@ async fn serve_session(
         let cap = audio_cap.clone();
         let channels = welcome.audio_channels;
         // Read the granted bit back off the Welcome (the cursor plane's precedent), so the wire
-        // the client was promised and the wire we actually send cannot disagree.
-        let redundancy = welcome.host_caps & punktfunk_core::quic::HOST_CAP_AUDIO_RED != 0;
+        // the client was promised and the wire we actually send cannot disagree — then re-derive
+        // the SAME budget rung from it, so the encode tier and the redundancy decision are one
+        // choice made once rather than two settings that can drift apart.
+        let budget = handshake::audio_budget(
+            welcome.host_caps & punktfunk_core::quic::HOST_CAP_AUDIO_RED != 0,
+            welcome.bitrate_kbps,
+            channels,
+        );
         std::thread::Builder::new()
             .name("punktfunk1-audio".into())
-            .spawn(move || audio_thread(conn, stop, cap, channels, redundancy))
+            .spawn(move || audio_thread(conn, stop, cap, channels, budget))
             .map_err(|e| tracing::warn!(error = %e, "audio thread spawn failed — session continues without audio"))
             .ok()
     } else {

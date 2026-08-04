@@ -173,6 +173,90 @@ impl OpusLayout {
     }
 }
 
+/// What the audio plane will actually cost this session: the tier to encode at, and whether the
+/// redundant `0xD2` plane is affordable. Produced by [`plan_audio_budget`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AudioBudget {
+    pub tier: AudioTier,
+    pub redundancy: bool,
+    /// Total wire cost in kbps, redundancy included — what the decision was made against.
+    pub kbps: u32,
+}
+
+/// Share of the session's video bitrate the audio plane may spend. Audio rides QUIC datagrams,
+/// OUTSIDE the ABR loop, so whatever it takes is taken off the top and adaptive bitrate can
+/// neither see nor reclaim it — which is exactly why it needs a budget of its own.
+const AUDIO_BUDGET_PCT: u32 = 5;
+/// …but never squeeze audio below the Low tier. A stream with unintelligible audio is worse than
+/// one that spends a few percent more, and the floor is what stops a very low video bitrate from
+/// silently producing a useless audio plane.
+const AUDIO_BUDGET_FLOOR_KBPS: u32 = 96;
+
+/// Choose the encode tier and whether to send redundancy, given the session's resolved VIDEO
+/// bitrate.
+///
+/// **Why this exists.** Tier `High` and the redundant plane were introduced separately, each
+/// justified as "about 1 % of the video budget" — but they multiply: 256 kbps stereo sent twice is
+/// 512 kbps, which is ~2.5 % of a 20 Mbps session and ~10 % of a 5 Mbps one. Nothing added the two
+/// together, and nothing capped the total, so on a constrained link the audio plane quietly took a
+/// tenth of the bandwidth that ABR was carefully managing the rest of.
+///
+/// The ladder is ordered by preference, not by cost: transparent audio beats redundant audio (the
+/// complaint this whole program came from was quality, and the redundancy only pays off under
+/// loss), so `High` alone outranks `Standard` + redundancy even though they cost the same.
+/// `requested` lets an operator ask for a specific tier; the budget can lower it but never raises
+/// it above what was asked.
+pub fn plan_audio_budget(
+    video_kbps: u32,
+    channels: u8,
+    requested: AudioTier,
+    client_wants_redundancy: bool,
+) -> AudioBudget {
+    let budget = (video_kbps.saturating_mul(AUDIO_BUDGET_PCT) / 100).max(AUDIO_BUDGET_FLOOR_KBPS);
+    let layout = layout_for(channels, false);
+    let cost = |tier: AudioTier, red: bool| -> u32 {
+        let one = (layout.bitrate_for(tier) / 1000).max(0) as u32;
+        if red {
+            one.saturating_mul(2)
+        } else {
+            one
+        }
+    };
+    // Preference order, best first. An operator asking for `Low` must not be handed `High`, so
+    // candidates above the request are filtered out.
+    let rank = |t: AudioTier| match t {
+        AudioTier::Low => 0,
+        AudioTier::Standard => 1,
+        AudioTier::High => 2,
+    };
+    let ladder = [
+        (AudioTier::High, true),
+        (AudioTier::High, false),
+        (AudioTier::Standard, true),
+        (AudioTier::Standard, false),
+        (AudioTier::Low, false),
+    ];
+    for (tier, red) in ladder {
+        if rank(tier) > rank(requested) || (red && !client_wants_redundancy) {
+            continue;
+        }
+        let kbps = cost(tier, red);
+        if kbps <= budget {
+            return AudioBudget {
+                tier,
+                redundancy: red,
+                kbps,
+            };
+        }
+    }
+    // Nothing fit — take the cheapest thing that still works rather than muting audio.
+    AudioBudget {
+        tier: AudioTier::Low,
+        redundancy: false,
+        kbps: cost(AudioTier::Low, false),
+    }
+}
+
 /// Pick the layout for a negotiated channel count. Unknown counts fall back to stereo (clients
 /// only ever request 2/6/8). `high_quality` selects the uncoupled high-bitrate config.
 pub fn layout_for(channels: u8, high_quality: bool) -> &'static OpusLayout {
@@ -872,6 +956,85 @@ mod tests {
         // Unknown spellings must be rejected, not silently downgraded.
         assert_eq!(AudioTier::parse("transparent"), None);
         assert_eq!(AudioTier::parse(""), None);
+    }
+
+    // ---- the audio bandwidth budget --------------------------------------------------------
+
+    /// THE regression this guards: `High` (256 kbps stereo) and the redundant plane (x2) were
+    /// each justified as "~1 % of the video budget" and nobody added them together. 512 kbps is
+    /// ~10 % of a 5 Mbps session — and audio is outside the ABR loop, so ABR cannot reclaim it.
+    #[test]
+    fn budget_steps_down_as_the_link_narrows() {
+        let plan = |kbps| plan_audio_budget(kbps, 2, AudioTier::High, true);
+        // Roomy link: everything on.
+        let b = plan(20_000);
+        assert_eq!((b.tier, b.redundancy), (AudioTier::High, true));
+        assert_eq!(b.kbps, 512);
+        // Halve it and redundancy is the first thing to go — quality is what the field report
+        // was about, and redundancy only pays under loss.
+        assert_eq!(plan(10_000).tier, AudioTier::High);
+        assert!(!plan(10_000).redundancy);
+        // Tighter still: down to Standard.
+        assert_eq!(plan(5_000).tier, AudioTier::Standard);
+        assert!(!plan(5_000).redundancy);
+        // A genuinely narrow link lands on Low, and never below it.
+        assert_eq!(plan(1_000).tier, AudioTier::Low);
+        assert_eq!(plan(1).tier, AudioTier::Low);
+        assert_eq!(
+            plan(0).kbps,
+            96,
+            "audio must survive an absurd video bitrate"
+        );
+    }
+
+    /// The budget must never spend more than its share, at any bitrate or channel count.
+    #[test]
+    fn budget_never_exceeds_its_share() {
+        for kbps in [0u32, 500, 1_000, 2_000, 5_000, 10_000, 20_000, 100_000] {
+            for ch in [2u8, 6, 8] {
+                let b = plan_audio_budget(kbps, ch, AudioTier::High, true);
+                let allowed =
+                    (kbps.saturating_mul(AUDIO_BUDGET_PCT) / 100).max(AUDIO_BUDGET_FLOOR_KBPS);
+                let floor = plan_audio_budget(0, ch, AudioTier::Low, false).kbps;
+                assert!(
+                    b.kbps <= allowed || b.kbps == floor,
+                    "{ch}ch at {kbps} kbps: spent {} of {allowed}",
+                    b.kbps
+                );
+            }
+        }
+    }
+
+    /// Surround costs more per tier, so the same link must step it down sooner than stereo —
+    /// the budget is about total wire cost, not about the tier name.
+    #[test]
+    fn budget_accounts_for_the_channel_count() {
+        let stereo = plan_audio_budget(10_000, 2, AudioTier::High, true);
+        let surround = plan_audio_budget(10_000, 8, AudioTier::High, true);
+        assert_eq!(stereo.tier, AudioTier::High);
+        assert!(surround.kbps <= stereo.kbps.max(surround.kbps), "sanity");
+        // 7.1 at High is 768 kbps — far past a 500 kbps allowance, so it must have stepped down.
+        assert!(
+            surround.kbps < 768,
+            "7.1 High must not fit a 10 Mbps budget"
+        );
+    }
+
+    /// The budget may LOWER what was asked for, never raise it: an operator who set `low` gets
+    /// `low` on a 100 Mbps link, and a client that never asked for redundancy never gets it.
+    #[test]
+    fn budget_respects_the_request() {
+        let b = plan_audio_budget(100_000, 2, AudioTier::Low, true);
+        assert_eq!(b.tier, AudioTier::Low);
+        let b = plan_audio_budget(100_000, 2, AudioTier::Standard, true);
+        assert_eq!(b.tier, AudioTier::Standard);
+        assert!(b.redundancy, "Standard + redundancy fits a huge link");
+        let b = plan_audio_budget(100_000, 2, AudioTier::High, false);
+        assert_eq!(b.tier, AudioTier::High);
+        assert!(
+            !b.redundancy,
+            "a client that did not ask must never be sent 0xD2"
+        );
     }
 
     // ---- the de-jitter policy ------------------------------------------------------------

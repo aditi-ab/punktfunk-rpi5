@@ -3,14 +3,15 @@
 //!
 //! The WASAPI twin of `audio.rs` (PipeWire) — same public surface (`AudioPlayer::spawn`/
 //! `take_buffer`/`push`, `MicStreamer::spawn`), swapped in by lib.rs's `#[path]` so the
-//! session pump compiles against one `crate::audio` on both OSes. Adapted from
-//! `clients/windows/src/audio.rs` (which remains the WinUI shell's own copy until its
-//! built-in streaming path is deleted).
+//! session pump compiles against one `crate::audio` on both OSes. It began as a copy of the
+//! WinUI shell's own audio path; that shell's built-in streaming path has since been deleted,
+//! so this is now the only WASAPI client ring.
 //!
-//! Playback mirrors the host's virtual-mic producer's adaptive jitter buffer: the session
-//! pump pushes 5 ms Opus-decoded chunks on the network clock; the WASAPI render thread
-//! pulls whole event-driven quanta on the device clock. Prime to ~3 quanta before
-//! producing, cap the ring so latency stays bounded, re-prime after a real drain.
+//! Playback: the session pump pushes 5 ms Opus-decoded chunks on the network clock; the WASAPI
+//! render thread pulls whole event-driven quanta on the device clock. The depth policy between
+//! them is the SHARED `punktfunk_core::audio::JitterPolicy` (`JitterTuning::WASAPI`) — target in
+//! milliseconds, crossfaded drift correction, de-prime hysteresis — so all four clients behave
+//! the same way and none of them can ratchet latency upward.
 //!
 //! WASAPI objects are COM-apartment-bound and not `Send`, so they live on a dedicated
 //! thread (the same discipline as the host's `wasapi_cap`); only the channels + stop flag

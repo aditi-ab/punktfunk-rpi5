@@ -84,27 +84,16 @@ pub(super) fn audio_thread(
     stop: Arc<AtomicBool>,
     audio_cap: AudioCapSlot,
     channels: u8,
-    redundancy: bool,
+    budget: punktfunk_core::audio::AudioBudget,
 ) {
     use crate::audio::SAMPLE_RATE;
     const FRAME_MS: usize = 5;
     const SAMPLES_PER_FRAME: usize = SAMPLE_RATE as usize * FRAME_MS / 1000; // 240
     let want = punktfunk_core::audio::normalize_channels(channels);
-    // WP1.1 — encode tier. Unknown spellings warn and fall back rather than silently downgrading
-    // someone's audio (the whole point of the setting is that quality stopped being invisible).
-    let tier = match pf_host_config::config().audio_quality.as_deref() {
-        None => punktfunk_core::audio::AudioTier::default(),
-        Some(s) => match punktfunk_core::audio::AudioTier::parse(s) {
-            Some(t) => t,
-            None => {
-                tracing::warn!(
-                    value = %s,
-                    "PUNKTFUNK_AUDIO_QUALITY is not one of low/standard/high — using the default"
-                );
-                punktfunk_core::audio::AudioTier::default()
-            }
-        },
-    };
+    // Tier and redundancy are ONE decision, budgeted against the session's video bitrate — see
+    // `handshake::audio_budget`. An unparseable `audio.quality` was already warned about there
+    // and fell back to the default, so nothing here can silently downgrade someone's audio.
+    let (tier, redundancy) = (budget.tier, budget.redundancy);
 
     // Reuse the cached capturer ONLY when its channel count matches this session's; a stereo
     // capturer left by a prior session must not feed a 5.1/7.1 session (the encoder + the client's
@@ -166,7 +155,7 @@ pub(super) fn audio_thread(
         tracing::info!(
             channels = want,
             tier = tier.as_str(),
-            kbps = punktfunk_core::audio::layout_for(want, false).bitrate_for(tier) / 1000,
+            kbps = budget.kbps,
             redundancy,
             "punktfunk/1 audio streaming (Opus 48 kHz, 5 ms datagrams)"
         );
@@ -261,7 +250,7 @@ pub(super) fn audio_thread(
     _stop: Arc<AtomicBool>,
     _audio_cap: AudioCapSlot,
     _channels: u8,
-    _redundancy: bool,
+    _budget: punktfunk_core::audio::AudioBudget,
 ) {
     tracing::warn!("punktfunk/1 audio requires Linux or Windows — session continues without it");
 }

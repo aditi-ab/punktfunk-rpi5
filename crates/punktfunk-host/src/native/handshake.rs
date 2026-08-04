@@ -24,24 +24,61 @@ use super::*;
 /// paints on a Mutter virtual stream), and only a can't-blend backend falls back to the
 /// compositor EMBED. THE single predicate: the Welcome's `HOST_CAP_CURSOR` bit is computed
 /// from it, and the session wiring reads that bit back.
-/// Whether this session sends the REDUNDANT desktop-audio plane (`0xD2`) — THE single predicate
-/// behind the Welcome's `HOST_CAP_AUDIO_RED` bit, which `serve_session` reads back to configure the
-/// audio thread.
+/// THE single audio-plane decision for a session: the encode tier AND whether the redundant
+/// `0xD2` plane is sent. The Welcome's `HOST_CAP_AUDIO_RED` bit is computed from it, and
+/// `serve_session` reads that bit back to configure the audio thread — so the wire the client is
+/// promised and the wire we send cannot disagree.
 ///
-/// Capable-and-agreed: the client must have advertised `CLIENT_CAP_AUDIO_RED`, so a session with an
-/// older client keeps the plain `0xC9` wire byte-for-byte. `audio.redundancy` (
-/// `PUNKTFUNK_AUDIO_REDUNDANCY`) can force it off on a link where the extra ~1 % is unwelcome, or
-/// force it on for testing.
+/// Capable-and-agreed for redundancy: the client must have advertised `CLIENT_CAP_AUDIO_RED`, so a
+/// session with an older client keeps the plain `0xC9` wire byte-for-byte.
+///
+/// **Both halves are then BUDGETED against the session's video bitrate**
+/// ([`plan_audio_budget`](punktfunk_core::audio::plan_audio_budget)). Tier `High` and redundancy
+/// were introduced separately, each costed as "~1 % of the video budget", and they multiply:
+/// 256 kbps stereo sent twice is 512 kbps — ~10 % of a 5 Mbps session. Audio rides QUIC datagrams,
+/// outside the ABR loop, so ABR can neither see that nor reclaim it. The budget is what stops a
+/// constrained link silently handing a tenth of its bandwidth to audio.
+///
+/// The operator's `audio.quality` / `audio.redundancy` settings are the REQUEST; the budget may
+/// lower them, never raise them.
 ///
 /// NB the plan's "only while the link is actually losing packets" gate is deliberately not here:
 /// turning redundancy on and off mid-session changes the wire tag, and the client's decoder would
-/// have to re-derive which plane it is on from every datagram. The cost being avoided is ~1 % of a
-/// video budget, which is not worth that fragility — so the decision is made once, at handshake.
-pub(super) fn audio_redundancy(client_caps: u8) -> bool {
-    if client_caps & punktfunk_core::quic::CLIENT_CAP_AUDIO_RED == 0 {
-        return false;
-    }
-    pf_host_config::config().audio_redundancy.unwrap_or(true)
+/// have to re-derive which plane it is on from every datagram. Deciding once, at handshake, against
+/// a bitrate we already know is both cheaper and more predictable.
+/// `wants_redundancy` is the caller's answer to "is `0xD2` even on the table" — at handshake that
+/// is the client's cap AND the operator's setting; afterwards it is the GRANTED
+/// `HOST_CAP_AUDIO_RED` bit, so the audio thread re-derives the same rung of the same ladder.
+pub(super) fn audio_budget(
+    wants_redundancy: bool,
+    video_kbps: u32,
+    channels: u8,
+) -> punktfunk_core::audio::AudioBudget {
+    let configured = pf_host_config::config().audio_quality.as_deref();
+    let requested = match configured {
+        None => punktfunk_core::audio::AudioTier::default(),
+        Some(s) => punktfunk_core::audio::AudioTier::parse(s).unwrap_or_else(|| {
+            // Once per process: this runs per session, and an operator with a typo in host.env
+            // does not need it on every connect. Never silently downgrade someone's audio.
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                tracing::warn!(
+                    value = %s,
+                    "audio.quality (PUNKTFUNK_AUDIO_QUALITY) is not one of low/standard/high — \
+                     using the default"
+                );
+            });
+            punktfunk_core::audio::AudioTier::default()
+        }),
+    };
+    punktfunk_core::audio::plan_audio_budget(video_kbps, channels, requested, wants_redundancy)
+}
+
+/// The operator's answer to "may this session use redundancy at all", before the budget is
+/// consulted: the client must be able to decode it and the operator must not have forced it off.
+pub(super) fn redundancy_offered(client_caps: u8) -> bool {
+    client_caps & punktfunk_core::quic::CLIENT_CAP_AUDIO_RED != 0
+        && pf_host_config::config().audio_redundancy.unwrap_or(true)
 }
 
 pub(super) fn cursor_forward(
@@ -585,10 +622,16 @@ pub(super) async fn negotiate(
             } else {
                 0
             }
-            // Redundant desktop-audio plane (0xD2): the client asked, and the operator has not
-            // forced it off. Capable-and-agreed, like the cursor bit — a client that did not ask
-            // keeps the plain 0xC9 wire byte-for-byte.
-            | if audio_redundancy(hello.client_caps) {
+            // Redundant desktop-audio plane (0xD2): the client asked, the operator has not forced
+            // it off, AND it fits the session's audio budget. Capable-and-agreed like the cursor
+            // bit — a client that did not ask keeps the plain 0xC9 wire byte-for-byte.
+            | if audio_budget(
+                redundancy_offered(hello.client_caps),
+                bitrate_kbps,
+                audio_channels,
+            )
+            .redundancy
+            {
                 punktfunk_core::quic::HOST_CAP_AUDIO_RED
             } else {
                 0

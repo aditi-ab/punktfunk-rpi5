@@ -42,13 +42,18 @@ final class AudioRing: @unchecked Sendable {
     private var emptyReads = 0
     private var depthAvg: Double = 0
     private var overRun = 0
+    /// Reported, not acted on: short reads that actually starved the callback, and smooth drift
+    /// corrections. A rising underrun count means the ring is being starved (network or CPU),
+    /// which is a different problem from the depth being wrong.
+    private var underrunCount = 0
+    private var shedCount = 0
     private let channels: Int
     private let perMS: Int
     private let lock = OSAllocatedUnfairLock()
 
-    /// `capacity`/`prefill` in samples (interleaved — `channels` per frame, both whole frames).
-    /// `prefill` is accepted for source compatibility but the target now comes from `targetMS`.
-    init(capacity: Int, prefill: Int = 0, channels: Int) {
+    /// `capacity` in samples (interleaved — `channels` per frame, a whole number of frames).
+    /// The de-jitter depth is the ring's own business (`targetMS`), not a caller's prefill.
+    init(capacity: Int, channels: Int) {
         buf = [Float](repeating: 0, count: capacity)
         self.channels = channels
         perMS = 48 * channels
@@ -113,6 +118,7 @@ final class AudioRing: @unchecked Sendable {
             if overRun >= Self.shedSustainMS * perMS {
                 overRun = 0
                 shedOneFrame()
+                shedCount += 1
                 depthAvg = Double(writeIdx - readIdx)
             }
         } else {
@@ -130,6 +136,7 @@ final class AudioRing: @unchecked Sendable {
             // De-prime only after a RUN of short reads: a single transient drain must not
             // manufacture a whole target's worth of fresh silence.
             emptyReads += 1
+            underrunCount += 1
             if emptyReads >= Self.deprimeAfter { primed = false }
         } else {
             emptyReads = 0
@@ -157,11 +164,31 @@ final class AudioRing: @unchecked Sendable {
         readIdx += drop
     }
 
-    /// Current buffered depth in milliseconds — for the stats overlay.
+    /// Current buffered depth in milliseconds — for the stats overlay and the drain thread's
+    /// periodic log.
     var bufferedMS: Int {
         lock.lock()
         defer { lock.unlock() }
         return (writeIdx - readIdx) / max(perMS, 1)
+    }
+
+    /// One consistent snapshot of the ring's vitals, taken under a single lock so the numbers in
+    /// a log line describe the same instant. Mirrors what the three Rust clients report.
+    struct Stats {
+        let bufferedMS: Int
+        let targetMS: Int
+        let underruns: Int
+        let sheds: Int
+    }
+
+    var stats: Stats {
+        lock.lock()
+        defer { lock.unlock() }
+        return Stats(
+            bufferedMS: (writeIdx - readIdx) / max(perMS, 1),
+            targetMS: target / max(perMS, 1),
+            underruns: underrunCount,
+            sheds: shedCount)
     }
 }
 
