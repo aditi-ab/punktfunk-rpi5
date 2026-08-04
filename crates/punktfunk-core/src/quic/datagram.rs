@@ -42,6 +42,80 @@ pub fn decode_audio_datagram(b: &[u8]) -> Option<(u32, u64, &[u8])> {
     Some((seq, pts_ns, &b[13..]))
 }
 
+/// Redundant audio datagram, host → client: the [`AUDIO_MAGIC`] plane plus a copy of the PREVIOUS
+/// frame, so a single lost datagram is *reconstructed* rather than concealed.
+///
+/// `[0xD2][u32 seq LE][u64 pts_ns LE][u16 primary_len LE][primary opus][previous opus]`
+///
+/// **Why this and not Opus in-band FEC.** LBRR is a SILK-layer feature: the desktop-audio encoder
+/// runs `RESTRICTED_LOWDELAY` (CELT-only) at 5 ms frames, which is below SILK's 10 ms minimum, so
+/// `set_inband_fec(true)` on that encoder is a no-op. Nothing in libopus can protect this plane —
+/// the redundancy has to be at the application layer. (The mic uplink is a different encoder, VoIP
+/// mode at 10 ms, and *does* use real in-band FEC.)
+///
+/// **Why it costs no latency.** The copy rides the SUCCESSOR of the frame it protects, and the
+/// client is already holding 15–90 ms of de-jitter buffer — far more than the 5 ms the successor
+/// takes to arrive. So the recovery happens inside slack that already exists.
+///
+/// The previous frame's sequence is implicitly `seq - 1`; a host with nothing to duplicate yet
+/// (the first frame of a session, or straight after a capture reopen) simply sends an empty tail,
+/// which decodes to `None`.
+///
+/// Sent ONLY when the client advertised [`CLIENT_CAP_AUDIO_RED`](super::caps::CLIENT_CAP_AUDIO_RED)
+/// and the host answered [`HOST_CAP_AUDIO_RED`](super::caps::HOST_CAP_AUDIO_RED) — the
+/// capable-and-agreed handshake the cursor and 4:4:4 planes already use. Every other session keeps
+/// the plain [`AUDIO_MAGIC`] wire byte-for-byte.
+///
+/// NB `0xD1` is deliberately skipped: the DualSense pad-audio program has reserved it for the
+/// per-pad audio plane.
+pub const AUDIO_RED_MAGIC: u8 = 0xD2;
+
+/// Fixed header length of an [`AUDIO_RED_MAGIC`] datagram (tag + seq + pts + primary length).
+pub const AUDIO_RED_HEADER: usize = 1 + 4 + 8 + 2;
+
+/// Encode a redundant audio datagram. `prev` is the immediately-preceding frame's Opus payload
+/// (empty when there is none yet).
+pub fn encode_audio_red_datagram(seq: u32, pts_ns: u64, opus: &[u8], prev: &[u8]) -> Vec<u8> {
+    let mut b = Vec::with_capacity(AUDIO_RED_HEADER + opus.len() + prev.len());
+    b.push(AUDIO_RED_MAGIC);
+    b.extend_from_slice(&seq.to_le_bytes());
+    b.extend_from_slice(&pts_ns.to_le_bytes());
+    // A frame longer than u16::MAX cannot occur (5 ms of Opus is tens of bytes; the buffer the
+    // encoder writes into is 4 KiB) — but truncating silently would desync the split, so clamp
+    // the redundancy off instead of the primary.
+    let primary_len = u16::try_from(opus.len()).unwrap_or(u16::MAX);
+    b.extend_from_slice(&primary_len.to_le_bytes());
+    b.extend_from_slice(opus);
+    if opus.len() == primary_len as usize {
+        b.extend_from_slice(prev);
+    }
+    b
+}
+
+/// Parse a redundant audio datagram → `(seq, pts_ns, primary, previous)`. `previous` is `None`
+/// when the host had nothing to duplicate. `None` overall on bad tag/length, including a
+/// `primary_len` that overruns the datagram (a truncated or hostile packet must not panic).
+///
+/// The tuple shape deliberately mirrors [`decode_audio_datagram`] (one extra slot for the
+/// redundant copy) so the two planes read the same at every call site; a named struct here would
+/// be the odd one out on this module's decode surface, and cbindgen would then have to be taught
+/// to skip it.
+#[allow(clippy::type_complexity)]
+pub fn decode_audio_red_datagram(b: &[u8]) -> Option<(u32, u64, &[u8], Option<&[u8]>)> {
+    if b.len() < AUDIO_RED_HEADER || b[0] != AUDIO_RED_MAGIC {
+        return None;
+    }
+    let seq = u32::from_le_bytes(b[1..5].try_into().unwrap());
+    let pts_ns = u64::from_le_bytes(b[5..13].try_into().unwrap());
+    let primary_len = u16::from_le_bytes(b[13..15].try_into().unwrap()) as usize;
+    let rest = &b[AUDIO_RED_HEADER..];
+    if primary_len > rest.len() {
+        return None; // truncated: the split point is outside the datagram
+    }
+    let (primary, prev) = rest.split_at(primary_len);
+    Some((seq, pts_ns, primary, (!prev.is_empty()).then_some(prev)))
+}
+
 /// Legacy rumble datagram (v1), host → client: `[0xCA][u16 pad LE][u16 low LE][u16 high LE]`.
 /// Force-feedback state for pad `pad` (0xFFFF amplitudes, 0/0 = stop) as *level-triggered* state
 /// — it persists until superseded, which is why the host re-sends it periodically as its loss
@@ -806,6 +880,8 @@ mod tests {
     #[test]
     fn audio_datagram_roundtrip() {
         let opus = [0x42u8; 97];
+        let d = encode_audio_red_datagram(7, 42, &opus, &[]);
+        assert_eq!(d[0], AUDIO_RED_MAGIC);
         let d = encode_audio_datagram(7, 1_000_000_123, &opus);
         assert_eq!(d[0], AUDIO_MAGIC);
         let (seq, pts, payload) = decode_audio_datagram(&d).unwrap();
@@ -818,6 +894,83 @@ mod tests {
         let header_only = encode_audio_datagram(0, 0, &[]);
         let (_, _, empty) = decode_audio_datagram(&header_only).unwrap();
         assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn audio_red_datagram_roundtrip() {
+        let cur = [0x42u8; 97];
+        let prev = [0x37u8; 88];
+        let d = encode_audio_red_datagram(7, 1_000_000_123, &cur, &prev);
+        assert_eq!(d[0], AUDIO_RED_MAGIC);
+        let (seq, pts, primary, previous) = decode_audio_red_datagram(&d).unwrap();
+        assert_eq!((seq, pts), (7, 1_000_000_123));
+        assert_eq!(primary, cur);
+        assert_eq!(previous, Some(&prev[..]));
+
+        // No predecessor yet (first frame of a session / after a capture reopen).
+        let d = encode_audio_red_datagram(0, 5, &cur, &[]);
+        let (_, _, primary, previous) = decode_audio_red_datagram(&d).unwrap();
+        assert_eq!(primary, cur);
+        assert_eq!(
+            previous, None,
+            "an empty tail must decode as absent, not as a zero-length frame"
+        );
+
+        // Frames of equal length must still split at the right place — the length prefix is the
+        // only thing that can tell them apart.
+        let a = [1u8; 64];
+        let b = [2u8; 64];
+        let d = encode_audio_red_datagram(9, 0, &a, &b);
+        let (_, _, primary, previous) = decode_audio_red_datagram(&d).unwrap();
+        assert_eq!(primary, a);
+        assert_eq!(previous, Some(&b[..]));
+    }
+
+    /// A truncated or hostile `0xD2` must be rejected, never panic — the split point comes off
+    /// the wire, so an over-long `primary_len` is the obvious attack on `split_at`.
+    #[test]
+    fn audio_red_datagram_rejects_bad_input() {
+        let d = encode_audio_red_datagram(1, 2, &[0xAAu8; 30], &[0xBBu8; 20]);
+        for n in 0..AUDIO_RED_HEADER {
+            assert!(decode_audio_red_datagram(&d[..n]).is_none(), "len {n}");
+        }
+        // primary_len larger than the datagram: must be refused, not sliced.
+        let mut bad = d.clone();
+        bad[13..15].copy_from_slice(&u16::MAX.to_le_bytes());
+        assert!(decode_audio_red_datagram(&bad).is_none());
+        // Wrong tag.
+        let mut wrong = d.clone();
+        wrong[0] = AUDIO_MAGIC;
+        assert!(decode_audio_red_datagram(&wrong).is_none());
+    }
+
+    /// The two audio planes must not alias each other or any neighbouring plane: a client
+    /// demultiplexes purely on the first byte.
+    #[test]
+    fn audio_red_tag_is_disjoint() {
+        for other in [
+            AUDIO_MAGIC,
+            RUMBLE_MAGIC,
+            MIC_MAGIC,
+            RICH_INPUT_MAGIC,
+            HIDOUT_MAGIC,
+            HDR_META_MAGIC,
+            HOST_TIMING_MAGIC,
+            CURSOR_STATE_MAGIC,
+            crate::input::INPUT_MAGIC,
+        ] {
+            assert_ne!(AUDIO_RED_MAGIC, other);
+        }
+        let red = encode_audio_red_datagram(1, 2, &[9u8; 40], &[8u8; 40]);
+        assert!(
+            decode_audio_datagram(&red).is_none(),
+            "0xC9 must not accept a 0xD2"
+        );
+        let plain = encode_audio_datagram(1, 2, &[9u8; 40]);
+        assert!(
+            decode_audio_red_datagram(&plain).is_none(),
+            "0xD2 must not accept a 0xC9"
+        );
     }
 
     #[test]

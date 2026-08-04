@@ -192,6 +192,11 @@ mod wasapi_mic;
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 #[path = "audio/wiring_plan.rs"]
 pub(crate) mod wiring_plan;
+// Pure capture-loop policy, split out for the same reason `wiring_plan` is: it encodes field
+// behaviour, so its tests must run on every platform's CI, not only Windows.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+#[path = "audio/capture_policy.rs"]
+pub(crate) mod capture_policy;
 
 mod mic_jitter;
 mod mic_pump;

@@ -23,10 +23,34 @@ pub(super) async fn run(
     // gate): a datagram the network reordered must not roll a stopped motor back on. Legacy v1
     // datagrams carry no seq and bypass it (an old host's own periodic re-send is the only heal).
     let mut rumble_last_seq: [Option<u8>; crate::input::MAX_PADS] = [None; crate::input::MAX_PADS];
+    // Redundant-audio-plane rebuild (`0xD2`). Recovery happens HERE rather than in the four
+    // client decoders: the recovered frame is re-inserted into this queue in order, so every
+    // embedder gets a complete stream without knowing the plane exists.
+    let mut audio_red = crate::audio::AudioRedRecovery::new();
     while let Ok(d) = conn.read_datagram().await {
         match d.first() {
             Some(&crate::quic::AUDIO_MAGIC) => {
                 if let Some((seq, pts_ns, opus)) = crate::quic::decode_audio_datagram(&d) {
+                    let _ = audio_tx.try_send(AudioPacket {
+                        seq,
+                        pts_ns,
+                        data: opus.to_vec(),
+                    });
+                }
+            }
+            Some(&crate::quic::AUDIO_RED_MAGIC) => {
+                if let Some((seq, pts_ns, opus, prev)) = crate::quic::decode_audio_red_datagram(&d)
+                {
+                    if audio_red.recover_before(seq, prev.is_some()) {
+                        // The copy is the frame BEFORE this one, so it carries the previous
+                        // sequence and presentation time — one protocol frame earlier.
+                        let _ = audio_tx.try_send(AudioPacket {
+                            seq: seq.wrapping_sub(1),
+                            pts_ns: pts_ns
+                                .saturating_sub(crate::audio::FRAME_MS as u64 * 1_000_000),
+                            data: prev.unwrap_or_default().to_vec(),
+                        });
+                    }
                     let _ = audio_tx.try_send(AudioPacket {
                         seq,
                         pts_ns,

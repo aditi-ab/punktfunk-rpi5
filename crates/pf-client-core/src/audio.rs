@@ -168,9 +168,18 @@ struct PlayerData {
     /// Drained chunk Vecs go back here for the decode side to refill (allocation pool).
     recycle: SyncSender<Vec<f32>>,
     ring: VecDeque<f32>,
-    primed: bool,
+    /// Shared ms-denominated de-jitter policy: prime depth, drift correction, de-prime
+    /// hysteresis. Replaces the old `3 × quantum` target, which meant 15 ms at a 5 ms graph
+    /// quantum and a silent 64 ms at a 20 ms one, and the `if ring.is_empty()` re-prime, where
+    /// one transient drain manufactured a whole target's worth of fresh silence.
+    policy: punktfunk_core::audio::JitterPolicy,
     /// Interleaved channel count this stream was opened with (2/6/8).
     channels: usize,
+    /// Diagnostics (WP0.3), logged ~every 10 s: the audio plane used to be entirely silent in a
+    /// client log, so a latency or dropout report had nothing to go on.
+    underruns: u64,
+    sheds: u64,
+    callbacks: u64,
 }
 
 fn pw_thread(
@@ -223,8 +232,14 @@ fn pw_thread(
         rx: pcm_rx,
         recycle: recycle_tx,
         ring: VecDeque::new(),
-        primed: false,
+        policy: punktfunk_core::audio::JitterPolicy::new(
+            punktfunk_core::audio::JitterTuning::PIPEWIRE,
+            channels as u8,
+        ),
         channels,
+        underruns: 0,
+        sheds: 0,
+        callbacks: 0,
     };
 
     let _listener = stream
@@ -252,23 +267,29 @@ fn pw_thread(
                 let want_frames = data.data().map(|s| s.len() / stride).unwrap_or(0);
                 let want = want_frames * ud.channels;
 
-                // Adaptive jitter buffer (same shape as the host's virtual mic): prime to
-                // ~3 quanta, cap at ~1 quantum of slack beyond that, re-prime after a
-                // genuine drain.
-                let target = (3 * want).clamp(720 * ud.channels, 9600 * ud.channels);
-                while ud.ring.len() > target.max(want) + want {
-                    ud.ring.pop_front();
-                }
-                if !ud.primed && ud.ring.len() >= target {
-                    ud.primed = true;
+                // Shared de-jitter policy: prime depth in MILLISECONDS, smooth drift correction
+                // (a crossfaded 5 ms shed) so latency returns to target instead of ratcheting,
+                // and a hard cap as the backstop.
+                let step = ud.policy.step(ud.ring.len(), want);
+                if step.drop_front > 0 {
+                    ud.sheds += 1;
+                    punktfunk_core::audio::crossfade_drop(
+                        &mut ud.ring,
+                        step.drop_front,
+                        step.crossfade,
+                    );
                 }
 
+                let mut ran_short = false;
                 let n_frames = if let Some(slice) = data.data() {
                     for k in 0..want {
-                        let s = if ud.primed {
-                            ud.ring.pop_front().unwrap_or(0.0)
-                        } else {
+                        let s = if step.silence {
                             0.0
+                        } else {
+                            ud.ring.pop_front().unwrap_or_else(|| {
+                                ran_short = true;
+                                0.0
+                            })
                         };
                         let off = k * 4;
                         slice[off..off + 4].copy_from_slice(&s.to_le_bytes());
@@ -277,8 +298,21 @@ fn pw_thread(
                 } else {
                     0
                 };
-                if ud.ring.is_empty() {
-                    ud.primed = false;
+                // No-op while un-primed (the policy ignores it), so a deliberate priming silence
+                // is never miscounted as an underrun.
+                ud.policy.note_read(ran_short);
+                ud.underruns += u64::from(ran_short);
+                ud.callbacks += 1;
+                // ~10 s at a 5 ms quantum; the exact cadence does not matter, only that the
+                // plane stops being invisible.
+                if ud.callbacks % 2_000 == 0 {
+                    tracing::debug!(
+                        buffer_ms = ud.policy.avg_depth_ms(),
+                        target_ms = ud.policy.target_ms(),
+                        underruns = ud.underruns,
+                        drift_sheds = ud.sheds,
+                        "audio playback"
+                    );
                 }
                 let chunk = data.chunk_mut();
                 *chunk.offset_mut() = 0;

@@ -3,14 +3,15 @@
 //!
 //! The WASAPI twin of `audio.rs` (PipeWire) — same public surface (`AudioPlayer::spawn`/
 //! `take_buffer`/`push`, `MicStreamer::spawn`), swapped in by lib.rs's `#[path]` so the
-//! session pump compiles against one `crate::audio` on both OSes. Adapted from
-//! `clients/windows/src/audio.rs` (which remains the WinUI shell's own copy until its
-//! built-in streaming path is deleted).
+//! session pump compiles against one `crate::audio` on both OSes. It began as a copy of the
+//! WinUI shell's own audio path; that shell's built-in streaming path has since been deleted,
+//! so this is now the only WASAPI client ring.
 //!
-//! Playback mirrors the host's virtual-mic producer's adaptive jitter buffer: the session
-//! pump pushes 5 ms Opus-decoded chunks on the network clock; the WASAPI render thread
-//! pulls whole event-driven quanta on the device clock. Prime to ~3 quanta before
-//! producing, cap the ring so latency stays bounded, re-prime after a real drain.
+//! Playback: the session pump pushes 5 ms Opus-decoded chunks on the network clock; the WASAPI
+//! render thread pulls whole event-driven quanta on the device clock. The depth policy between
+//! them is the SHARED `punktfunk_core::audio::JitterPolicy` (`JitterTuning::WASAPI`) — target in
+//! milliseconds, crossfaded drift correction, de-prime hysteresis — so all four clients behave
+//! the same way and none of them can ratchet latency upward.
 //!
 //! WASAPI objects are COM-apartment-bound and not `Send`, so they live on a dedicated
 //! thread (the same discipline as the host's `wasapi_cap`); only the channels + stop flag
@@ -250,10 +251,20 @@ fn render_thread(
         audio_client.start_stream().context("start render stream")?;
         let _ = ready.send(Ok(()));
 
-        // Adaptive jitter buffer, in f32-byte units (same shape as the host's virtual mic).
-        let mut ring: VecDeque<u8> = VecDeque::new();
-        let mut primed = false;
+        // De-jitter ring, in interleaved f32 SAMPLES (it used to be raw bytes, which made the
+        // depth arithmetic byte-vs-sample and kept it from sharing the policy and the crossfade
+        // helper with the other three clients).
+        let mut ring: VecDeque<f32> = VecDeque::new();
+        // Shared ms-denominated policy: prime depth, crossfaded drift correction so latency
+        // returns to target instead of ratcheting, and de-prime hysteresis — the last replacing
+        // the old `if ring.is_empty()`, where a single transient drain manufactured a whole
+        // target's worth of fresh silence.
+        let mut policy = punktfunk_core::audio::JitterPolicy::new(
+            punktfunk_core::audio::JitterTuning::WASAPI,
+            channels,
+        );
         let mut out = Vec::new(); // per-quantum scratch, reused across iterations
+        let (mut underruns, mut sheds, mut callbacks) = (0u64, 0u64, 0u64);
 
         while !stop.load(Ordering::Relaxed) {
             if h_event.wait_for_event(100).is_err() {
@@ -262,9 +273,7 @@ fn render_thread(
             // Drain everything the pump has queued into the ring, returning each drained
             // Vec to the pool (a full/closed pool drops it).
             while let Ok(mut chunk) = pcm_rx.try_recv() {
-                for s in chunk.iter() {
-                    ring.extend(s.to_le_bytes());
-                }
+                ring.extend(chunk.iter().copied());
                 chunk.clear();
                 let _ = recycle_tx.try_send(chunk);
             }
@@ -274,28 +283,40 @@ fn render_thread(
             if avail_frames == 0 {
                 continue;
             }
-            let want_bytes = avail_frames * block_align;
+            let want = avail_frames * channels as usize;
 
-            // Prime to ~3 quanta; cap at ~1 quantum of slack beyond that; re-prime on drain.
-            let target = (3 * want_bytes).clamp(720 * block_align, 9600 * block_align);
-            let cap = target.max(want_bytes) + want_bytes;
-            if ring.len() > cap {
-                ring.drain(..ring.len() - cap);
-            }
-            if !primed && ring.len() >= target {
-                primed = true;
+            let step = policy.step(ring.len(), want);
+            if step.drop_front > 0 {
+                sheds += 1;
+                punktfunk_core::audio::crossfade_drop(&mut ring, step.drop_front, step.crossfade);
             }
 
             out.clear();
-            out.resize(want_bytes, 0);
-            if primed {
-                let n = ring.len().min(want_bytes);
-                for (dst, b) in out.iter_mut().zip(ring.drain(..n)) {
-                    *dst = b;
+            out.resize(avail_frames * block_align, 0);
+            let mut ran_short = false;
+            if !step.silence {
+                // `out` is exactly `want` f32s wide (avail_frames × channels × 4 bytes).
+                for dst in out.chunks_exact_mut(4) {
+                    let s = ring.pop_front().unwrap_or_else(|| {
+                        ran_short = true;
+                        0.0
+                    });
+                    dst.copy_from_slice(&s.to_le_bytes());
                 }
             }
-            if ring.is_empty() {
-                primed = false;
+            // No-op while un-primed (the policy ignores it), so a deliberate priming silence is
+            // never miscounted as an underrun.
+            policy.note_read(ran_short);
+            underruns += u64::from(ran_short);
+            callbacks += 1;
+            if callbacks % 1_000 == 0 {
+                tracing::debug!(
+                    buffer_ms = policy.avg_depth_ms(),
+                    target_ms = policy.target_ms(),
+                    underruns,
+                    drift_sheds = sheds,
+                    "audio playback"
+                );
             }
             render_client
                 .write_to_device(avail_frames, &out, None)

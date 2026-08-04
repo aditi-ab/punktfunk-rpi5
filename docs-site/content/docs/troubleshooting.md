@@ -302,6 +302,73 @@ told your client so. [When the client and the host
 disagree](/docs/client-settings#when-the-client-and-the-host-disagree) lists what it does with each
 one.
 
+## Streamed audio sounds worse than the host does
+
+The host does not capture "the sound card" — it captures a **render endpoint**, and by default it
+picks one that is *silent on the host* so the audio plays on your client only. On a PC with Steam
+installed that silent endpoint is Steam's **Streaming Microphone**, which exists to carry remote
+*voice*. If Windows has it configured as a narrow device — mono, or below 48 kHz — then the whole
+desktop mix is squeezed through that before it is ever encoded, and no amount of bitrate will bring
+it back.
+
+Since 0.25 the host checks for this: it reads each candidate endpoint's real format, prefers a real
+output device over a narrow virtual one, and says so in the log —
+
+```
+WARN  the desktop-audio loopback endpoint mixes at 24000 Hz, so the stream is band-limited …
+INFO  audio loopback capturing device="…" engine_hz=48000 engine_ch=2 engine_bits=32
+```
+
+That `engine_*` line is the endpoint's **own** format, so it tells you directly whether the source
+was ever full quality. To choose the routing yourself, set in `host.env`:
+
+```ini
+# client_only     — default; audio plays on the client only (a silent endpoint)
+# host_and_client — capture a real output device; audio plays on BOTH ends
+# follow_default  — capture whatever YOUR default playback device is, and never change it
+PUNKTFUNK_AUDIO_OUTPUT_MODE=host_and_client
+```
+
+`host_and_client` is also the quickest way to A/B the problem: if the stream sounds right that way
+and wrong on the default, the endpoint was the cause.
+
+Two related knobs:
+
+```ini
+PUNKTFUNK_AUDIO_QUALITY=high    # low | standard | high (default high — stereo 256 kbps)
+PUNKTFUNK_AUDIO_REDUNDANCY=1    # force the loss-resilient audio plane on (default: automatic)
+```
+
+Both are a **request**, not a guarantee: the host budgets audio against the session's video
+bitrate and steps it down on a narrow link, because audio is not managed by adaptive bitrate — so
+whatever it takes is taken off the top. On a roomy link you get 256 kbps plus loss redundancy; as
+the link narrows the host drops redundancy first, then the tier, and never goes below ~96 kbps. The
+session log line says what it settled on:
+
+```
+INFO  punktfunk/1 audio streaming … tier=high kbps=512 redundancy=true
+```
+
+`standard` reproduces the pre-0.25 encoder exactly if you want to A/B it.
+
+## Audio lags behind the picture
+
+The client buffers a little audio to absorb network jitter. Since 0.25 that buffer **corrects
+itself**: if it drifts deeper — a Wi-Fi burst, a stall, or just the two devices' clocks running at
+fractionally different speeds — it trims itself back a few milliseconds at a time, inaudibly.
+Before, it could only grow, so a single hiccup left audio permanently behind the video and the only
+cure was reconnecting.
+
+If audio is still noticeably late:
+
+- **Reconnect once.** It confirms whether the delay was accumulated (gone after a reconnect) or
+  constant (something else).
+- **Check for underruns** rather than guessing. The client logs its buffer depth periodically; a
+  rising `underruns` count means the buffer is being starved, which is a network or CPU problem, not
+  a buffering one.
+- **Wired or 5 GHz Wi-Fi.** Arrival jitter is what the buffer exists to absorb; less jitter lets it
+  run shallower.
+
 ## Windows: the host or the web console won't start
 
 The **`PunktfunkHost` service** runs both halves of the Windows host: the streaming host itself and
