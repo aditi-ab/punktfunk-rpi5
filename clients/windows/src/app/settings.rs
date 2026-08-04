@@ -981,6 +981,13 @@ pub(crate) fn settings_page(
                 s.forward_pad = key.unwrap_or_default();
                 s.save();
             })
+            // Dimmed with the master switch above it, like echo cancellation under the mic
+            // (see that row) — this and the three below have nothing to act on while no
+            // controller is forwarded at all. Every commit bumps `rev` and re-renders this
+            // screen, so they follow the toggle live. Brings this client in line with how GTK
+            // (`set_sensitive`), the touch settings on both mobile clients (`enabled`) and the
+            // console UI (dim + refuse the step) have always drawn the same relationship.
+            .enabled(s.gamepad_forwarding)
     };
     let pad_forward_toggle =
         setting_toggle(ctx, scope, (rev, set_rev), s.gamepad_forwarding, |s, on| {
@@ -991,7 +998,8 @@ pub(crate) fn settings_page(
     });
     let pad_combo = setting_combo(ctx, scope, (rev, set_rev), pad_names, pad_i, |s, i| {
         s.gamepad = GAMEPADS[i].0.to_string();
-    });
+    })
+    .enabled(s.gamepad_forwarding);
     let (sysbtn_names, sysbtn_i) = presets(SYSTEM_BUTTONS, |v| *v == s.system_buttons);
     let sysbtn_combo = setting_combo(
         ctx,
@@ -1002,7 +1010,8 @@ pub(crate) fn settings_page(
         |s, i| {
             s.system_buttons = SYSTEM_BUTTONS[i].0.to_string();
         },
-    );
+    )
+    .enabled(s.gamepad_forwarding);
     let (gesture_names, gesture_i) = presets(GUIDE_GESTURES, |v| *v == s.guide_gesture);
     let gesture_combo = setting_combo(
         ctx,
@@ -1013,7 +1022,8 @@ pub(crate) fn settings_page(
         |s, i| {
             s.guide_gesture = GUIDE_GESTURES[i].0.to_string();
         },
-    );
+    )
+    .enabled(s.gamepad_forwarding);
     let (touch_names, touch_i) = presets(TOUCH_MODES, |v| *v == s.touch_mode);
     let touch_combo = setting_combo(ctx, scope, (rev, set_rev), touch_names, touch_i, |s, i| {
         s.touch_mode = TOUCH_MODES[i].0.to_string();

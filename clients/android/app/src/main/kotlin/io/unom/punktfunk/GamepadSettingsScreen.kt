@@ -65,7 +65,7 @@ import io.unom.punktfunk.kit.security.KnownHostStore
 // a controller: up/down moves the focus bar, left/right steps the focused value, A cycles/toggles it,
 // B closes. Both write the same SharedPreferences, so values round-trip with the touch settings.
 
-private class GpRow(
+internal class GpRow(
     val id: String,
     val header: String?,
     val label: String,
@@ -77,6 +77,15 @@ private class GpRow(
     val adjustable: Boolean = true, // false = the row navigates/acts instead of stepping — no chevrons
     val enabled: Boolean = true,    // dimmed + inert when false (still focusable, for its detail)
 )
+
+/**
+ * The row at [index], or null when it is dimmed. The single place the "disabled ⇒ inert" half of
+ * [GpRow.enabled] is enforced, so the three input paths (pad left/right, A, and a tap on the
+ * already-focused row) cannot drift apart — before this, `enabled` dimmed the label and nothing
+ * else, and every dimmed row still stepped its setting.
+ */
+internal fun liveRow(rows: List<GpRow>, index: Int): GpRow? =
+    rows.getOrNull(index)?.takeIf { it.enabled }
 
 @Composable
 fun GamepadSettingsScreen(
@@ -144,11 +153,13 @@ fun GamepadSettingsScreen(
             when (dir) {
                 NavDir.UP -> if (focus > 0) focus--
                 NavDir.DOWN -> if (focus < rows.lastIndex) focus++
-                NavDir.LEFT -> { adjustDir = -1; rows.getOrNull(focus)?.adjust(-1) }
-                NavDir.RIGHT -> { adjustDir = 1; rows.getOrNull(focus)?.adjust(1) }
+                // A disabled row is INERT, not just dim — the step is refused instead of writing a
+                // setting that has nothing to act on (see `liveRow`).
+                NavDir.LEFT -> { adjustDir = -1; liveRow(rows, focus)?.adjust(-1) }
+                NavDir.RIGHT -> { adjustDir = 1; liveRow(rows, focus)?.adjust(1) }
             }
         },
-        onActivate = { adjustDir = 1; rows.getOrNull(focus)?.activate() },
+        onActivate = { adjustDir = 1; liveRow(rows, focus)?.activate() },
     )
     // Keep the focused row on screen, but only SCROLL when it's actually off-screen — so entering the
     // screen (focus on the first row) leaves the "Settings" heading visible instead of jumping past it.
@@ -186,7 +197,10 @@ fun GamepadSettingsScreen(
             }
             itemsIndexed(rows, key = { _, r -> r.id }) { index, row ->
                 SettingRowView(row, focused = index == focus, adjustDir = adjustDir, onClick = {
-                    if (focus == index) { adjustDir = 1; row.activate() } else focus = index
+                    // Same inertness as the pad path above — tapping a dimmed row focuses it (so
+                    // its detail explains itself) but never flips it.
+                    if (focus != index) focus = index
+                    else if (row.enabled) { adjustDir = 1; row.activate() }
                 })
             }
             }
@@ -340,7 +354,7 @@ private fun SettingRowView(row: GpRow, focused: Boolean, adjustDir: Int, onClick
 /** Build the console settings rows from the current [Settings], writing through [update].
  * [hasBodyVibrator] gates the "Rumble on this phone" row (absent on TVs); [av1Capable] gates the
  * AV1 codec entry (see `codecOptionsFor`). */
-private fun buildSettingsRows(
+internal fun buildSettingsRows(
     s: Settings,
     hasBodyVibrator: Boolean,
     av1Capable: Boolean,
@@ -348,13 +362,14 @@ private fun buildSettingsRows(
 ): List<GpRow> {
     fun <T> choice(
         id: String, header: String?, label: String, detail: String,
-        options: List<Pair<T, String>>, current: T, write: (T) -> Unit,
+        options: List<Pair<T, String>>, current: T, enabled: Boolean = true, write: (T) -> Unit,
     ): GpRow {
         val idx = options.indexOfFirst { it.first == current }
         return GpRow(
             id, header, label,
             value = options.getOrNull(idx)?.second ?: "—",
             detail = detail,
+            enabled = enabled,
             adjust = { delta ->
                 if (idx < 0) {
                     options.firstOrNull()?.let { write(it.first) } != null
@@ -371,11 +386,12 @@ private fun buildSettingsRows(
     }
     fun toggle(
         id: String, header: String?, label: String, detail: String,
-        value: Boolean, write: (Boolean) -> Unit,
+        value: Boolean, enabled: Boolean = true, write: (Boolean) -> Unit,
     ): GpRow = GpRow(
         id, header, label,
         value = if (value) "On" else "Off",
         detail = detail,
+        enabled = enabled,
         adjust = { delta -> val target = delta > 0; if (value != target) { write(target); true } else false },
         activate = { write(!value) },
         toggled = value,
@@ -478,22 +494,26 @@ private fun buildSettingsRows(
                 "so games don't see two of them.",
             s.gamepadForwarding,
         ) { update(s.copy(gamepadForwarding = it)) },
+        // Everything below the master switch follows it — dim and inert while nothing is being
+        // forwarded, the same relationship the touch settings draw with `enabled =`. This screen
+        // had the capability (`GpRow.enabled`) and used it only for the profiles placeholder, so
+        // the pad rows kept stepping settings that had nothing to act on.
         choice(
             "padType", null, "Controller type",
             "The virtual pad the host creates — Automatic matches this controller.",
-            GAMEPAD_OPTIONS, s.gamepad,
+            GAMEPAD_OPTIONS, s.gamepad, enabled = s.gamepadForwarding,
         ) { update(s.copy(gamepad = it)) },
         choice(
             "systemButtons", null, "Guide button",
             "Where the guide (Xbox/PS) and share presses go while streaming — Automatic " +
                 "sends them to the host whenever this device delivers them.",
-            SYSTEM_BUTTON_OPTIONS, s.systemButtons,
+            SYSTEM_BUTTON_OPTIONS, s.systemButtons, enabled = s.gamepadForwarding,
         ) { update(s.copy(systemButtons = it)) },
         choice(
             "guideGesture", null, "Hold Select for guide",
             "Hold Select alone to press the host's guide button — keep holding for a " +
                 "Gaming-Mode host's quick-access menu. A Select tap still goes through.",
-            GUIDE_GESTURE_OPTIONS, s.guideGesture,
+            GUIDE_GESTURE_OPTIONS, s.guideGesture, enabled = s.gamepadForwarding,
         ) { update(s.copy(guideGesture = it)) },
     ) + listOfNotNull(
         if (hasBodyVibrator) {
@@ -513,8 +533,18 @@ private fun buildSettingsRows(
             "sc2", null, "Steam Controller 2 passthrough",
             "Capture a Steam Controller 2 (wired, Puck dongle, or paired Bluetooth) and stream " +
                 "it as-is — Steam on the host drives it like the physical pad.",
-            s.sc2Capture,
+            s.sc2Capture, enabled = s.gamepadForwarding,
         ) { update(s.copy(sc2Capture = it)) },
+        // The SC2 row's twin, and missing here until now: the touch settings have carried both
+        // side by side, so a couch user on a TV box — where there IS no touch interface to fall
+        // back to — could turn on SC2 passthrough but not the Sony one. Same no-vibrator-gate
+        // reasoning: this capture renders feedback on the CONTROLLER's motors, not this device's.
+        toggle(
+            "dsCapture", null, "DualSense / DualShock passthrough (USB)",
+            "Drive a USB-connected Sony pad directly — rumble on any phone, plus adaptive " +
+                "triggers, lightbar and gyro.",
+            s.dsCapture, enabled = s.gamepadForwarding,
+        ) { update(s.copy(dsCapture = it)) },
     )
 }
 
