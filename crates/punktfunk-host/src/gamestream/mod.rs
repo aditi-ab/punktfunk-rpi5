@@ -334,15 +334,26 @@ pub fn serve(
         "punktfunk host"
     );
     // Surface a conflicting Moonlight-compatible host (Sunshine/Apollo/…) as early as possible:
-    // scan once (cached for `/local/summary` → tray + web console) and warn loudly if found.
+    // scan once (cached for `/local/summary` → the web console) and warn loudly if one can actually
+    // clash. A dormant leftover (an uninstalled Sunshine's Program Files folder, a disabled service)
+    // is logged at INFO instead — it belongs in a support log, not in a warning that reads like a
+    // fault on every boot.
     let conflicts = crate::detect::init();
     if !conflicts.is_empty() {
-        tracing::warn!(
-            target: "punktfunk::detect",
-            count = conflicts.len(),
-            "{}",
-            crate::detect::render_report(conflicts)
-        );
+        let report = crate::detect::render_report(conflicts);
+        if crate::detect::any_active(conflicts) {
+            tracing::warn!(
+                target: "punktfunk::detect",
+                count = conflicts.len(),
+                "{report}"
+            );
+        } else {
+            tracing::info!(
+                target: "punktfunk::detect",
+                count = conflicts.len(),
+                "{report}"
+            );
+        }
     }
     if gamestream {
         tracing::warn!(

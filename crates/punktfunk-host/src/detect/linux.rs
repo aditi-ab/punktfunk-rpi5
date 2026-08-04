@@ -50,7 +50,11 @@ pub fn static_evidence(known: &Known) -> Vec<Evidence> {
     for unit in known.linux_units {
         let file = format!("{unit}.service");
         if unit_dirs.iter().any(|d| Path::new(d).join(&file).exists()) {
-            ev.push(Evidence::Service { name: file });
+            let autostart = unit_enabled(&file, home.as_deref());
+            ev.push(Evidence::Service {
+                name: file,
+                autostart,
+            });
         }
     }
 
@@ -76,6 +80,49 @@ pub fn static_evidence(known: &Known) -> Vec<Evidence> {
     }
 
     ev
+}
+
+/// Is `unit` (a `<name>.service` filename) **enabled** — i.e. will systemd start it on its own?
+///
+/// `systemctl enable` works by symlinking the unit into a target's `.wants`/`.requires` directory,
+/// so the presence of that link is the enablement fact — readable without spawning `systemctl`
+/// (this module is deliberately subprocess-free, and the host often runs where `systemctl` output
+/// would need a bus connection anyway). A unit file that exists but is linked from no target is
+/// installed-but-inert: nothing starts it at boot, so it clashes with nothing.
+///
+/// Scans the `.wants`/`.requires` subdirectories of the drop-in roots systemd actually reads, rather
+/// than hardcoding `multi-user.target` — a unit pulled in by `graphical.target`, a user
+/// `default.target`, or any other target is just as enabled.
+fn unit_enabled(unit: &str, home: Option<&std::ffi::OsStr>) -> bool {
+    let mut roots: Vec<String> = vec![
+        "/etc/systemd/system".into(),
+        "/run/systemd/system".into(),
+        "/usr/lib/systemd/system".into(),
+        "/lib/systemd/system".into(),
+        "/etc/systemd/user".into(),
+        "/usr/lib/systemd/user".into(),
+    ];
+    if let Some(h) = home {
+        roots.push(format!("{}/.config/systemd/user", h.to_string_lossy()));
+    }
+    for root in roots {
+        let Ok(entries) = std::fs::read_dir(&root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if !(name.ends_with(".wants") || name.ends_with(".requires")) {
+                continue;
+            }
+            // `symlink_metadata` so a DANGLING link still counts: a link into a target's .wants is
+            // what "enabled" means, and a broken one still says the operator enabled it.
+            if std::fs::symlink_metadata(entry.path().join(unit)).is_ok() {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn find_on_path(bin: &str, path: Option<&std::ffi::OsStr>) -> Option<String> {
