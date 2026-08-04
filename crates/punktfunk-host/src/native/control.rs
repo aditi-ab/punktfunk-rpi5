@@ -43,6 +43,11 @@ pub(super) async fn run(
     // Host-initiated bitrate re-target (a rebuild re-resolved an Automatic rate): forwarded to
     // the client as a `BitrateChanged` so its controller's climb base tracks the real encoder.
     mut retarget_rx: tokio::sync::mpsc::UnboundedReceiver<u32>,
+    // Mid-session shard renegotiation (design/shard-payload-reneg.md): the wire-MTU watcher
+    // asks for a `ShardPayloadChanged` here (this task is the control stream's sole writer),
+    // and the client's `ShardPayloadAck`s flow back on `shard_ack_tx` — the grow gate.
+    mut shard_change_rx: tokio::sync::mpsc::UnboundedReceiver<u16>,
+    shard_ack_tx: tokio::sync::mpsc::UnboundedSender<u16>,
     mut cursor_shape_rx: tokio::sync::mpsc::UnboundedReceiver<punktfunk_core::quic::CursorShape>,
     cursor_client_draws: Arc<AtomicBool>,
     clip_enabled: Arc<AtomicBool>,
@@ -56,6 +61,9 @@ pub(super) async fn run(
     // Set once `clip_offer_rx` closes (coordinator gone / inert handle) so its `select!` branch
     // stops firing on a perpetually-ready `None`.
     let mut clip_offer_closed = false;
+    // Same discipline for the wire-MTU watcher's channel — its bounded lifetime ends mid-session
+    // on every healthy path.
+    let mut shard_change_closed = false;
     let mut active = initial_mode;
     // Host-side switch rate limit (a backstop against a hostile/broken client spamming
     // Reconfigure into pipeline-rebuild churn — the drain-to-newest in the data plane already
@@ -214,6 +222,16 @@ pub(super) async fn run(
                     if bitrate_tx.send(resolved).is_err() {
                         break; // data plane gone
                     }
+                } else if let Ok(ack) = punktfunk_core::quic::ShardPayloadAck::decode(&msg) {
+                    // Mid-session shard renegotiation: the client applied (or granted) a
+                    // geometry change. Forward to the wire-MTU watcher — for a grow this IS
+                    // the gate that lets the packetizer go above the old size. A dropped
+                    // send just means the watcher already ended (shrink acks are telemetry).
+                    tracing::info!(
+                        shard_payload = ack.shard_payload,
+                        "client acked shard-payload change"
+                    );
+                    let _ = shard_ack_tx.send(ack.shard_payload);
                 } else if let Ok(req) = ProbeRequest::decode(&msg) {
                     tracing::info!(
                         target_kbps = req.target_kbps,
@@ -314,6 +332,19 @@ pub(super) async fn run(
             result = probe_result_rx.recv() => {
                 let Some(result) = result else { break }; // data plane gone
                 if io::write_msg(&mut ctrl_send, &result.encode()).await.is_err() {
+                    break;
+                }
+            }
+            n = shard_change_rx.recv(), if !shard_change_closed => {
+                // Mid-session shard renegotiation: the wire-MTU watcher decided (shrink on a
+                // constrained-path verdict / ack-gated jumbo grow). Only ever fires toward a
+                // client that advertised `Hello::max_shard_payload` — the watcher owns that
+                // gate. `None` = the watcher's bounded lifetime ended (normal, NOT a session
+                // end): disable this branch, exactly the `clip_offer_closed` pattern — a
+                // closed mpsc yields `None` perpetually and would busy-spin the select.
+                let Some(n) = n else { shard_change_closed = true; continue };
+                let msg = punktfunk_core::quic::ShardPayloadChanged { shard_payload: n };
+                if io::write_msg(&mut ctrl_send, &msg.encode()).await.is_err() {
                     break;
                 }
             }

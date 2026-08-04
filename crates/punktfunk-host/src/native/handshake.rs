@@ -663,10 +663,9 @@ pub(super) async fn negotiate(
     let start =
         Start::decode(&io::read_msg(recv).await?).map_err(|e| anyhow!("Start decode: {e:?}"))?;
     bringup.mark("start");
-    // The session is real: watch this connection's MTU discovery settle and turn it into a
-    // path verdict (WARN + learned clamp for the next session on a constrained path; clears a
-    // stale clamp on a healthy one). Bounded ~10 s task, ends by itself.
-    wire_mtu::spawn_watch(conn.clone(), welcome.shard_payload as usize);
+    // The wire-MTU watch (`wire_mtu::spawn_watch`) is spawned by `serve_session` after the
+    // control-task channels exist — it now also DRIVES the mid-session shard renegotiation
+    // (design/shard-payload-reneg.md), which needs the control stream's writer.
     Ok::<_, anyhow::Error>((
         hello,
         welcome,

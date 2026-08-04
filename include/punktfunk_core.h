@@ -793,6 +793,16 @@
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
+// Type byte of [`ShardPayloadChanged`].
+#define MSG_SHARD_PAYLOAD_CHANGED 8
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Type byte of [`ShardPayloadAck`].
+#define MSG_SHARD_PAYLOAD_ACK 9
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
 // Type byte of [`ProbeRequest`].
 #define MSG_PROBE_REQUEST 32
 #endif
