@@ -523,12 +523,22 @@ struct PadAudioSlots {
     /// `(kinds, handle)` per running pad — `kinds` is the arrival's audio-caps mask, kept so
     /// an identical re-arrival (they are re-sent against datagram loss) is a no-op.
     slots: [Option<(u8, pad_audio::PadAudioHandle)>; MAX_WIRE_PADS],
+    /// Kind-change restarts spent per pad this session (R3). The trigger is a client-sent
+    /// arrival, so without a ceiling the client decides how many WASAPI captures the host opens.
+    restarts: [u8; MAX_WIRE_PADS],
 }
+
+/// R3: how many times one pad may change its declared audio kinds before the host stops
+/// obliging. A real controller declares once at open and never again; the re-sent arrivals are
+/// identical and take the no-op path above, so this is only reached by a client that keeps
+/// changing its mind.
+const MAX_PAD_AUDIO_RESTARTS: u8 = 8;
 
 impl PadAudioSlots {
     fn new() -> PadAudioSlots {
         PadAudioSlots {
             slots: std::array::from_fn(|_| None),
+            restarts: [0; MAX_WIRE_PADS],
         }
     }
 
@@ -544,8 +554,23 @@ impl PadAudioSlots {
             if *have == kinds {
                 return; // identical re-arrival — keep the running streamer
             }
+            // R3: the restart trigger is a CLIENT-sent arrival, so the count is client-driven.
+            // Nothing bounded it: a client alternating its declared kinds could make the host
+            // tear down and re-spawn a WASAPI loopback capture indefinitely, each cycle paying a
+            // thread spawn and an endpoint activation. Cheap to bound, and a pad that has already
+            // changed its mind this many times in one session is not doing anything legitimate.
+            if self.restarts[idx] >= MAX_PAD_AUDIO_RESTARTS {
+                tracing::warn!(
+                    pad = idx,
+                    "pad-audio kinds changed again after {MAX_PAD_AUDIO_RESTARTS} restarts — \
+                     ignoring; the streamer keeps its current kinds for this session"
+                );
+                return;
+            }
+            self.restarts[idx] += 1;
             tracing::info!(
                 pad = idx,
+                restarts = self.restarts[idx],
                 "pad-audio kinds changed — restarting the streamer"
             );
             self.stop(idx);

@@ -724,7 +724,7 @@ mod tests {
             ("steam streaming microphone", fmt(24_000, 1)),
             ("odyssey", fmt(48_000, 2)),
         ]);
-        let w = plan_with_formats(&renders, &captures, None, false, &p, 2);
+        let w = plan_with_formats(&renders, &captures, None, false, &p, 2, &[]);
         assert_eq!(
             w.loopback_render.as_ref().unwrap().0,
             "1 - Odyssey G60SD (AMD High Definition Audio Device)",
@@ -754,7 +754,7 @@ mod tests {
             ("steam streaming microphone", fmt(48_000, 2)),
             ("realtek", fmt(48_000, 2)),
         ]);
-        let w = plan_with_formats(&renders, &[], None, false, &p, 2);
+        let w = plan_with_formats(&renders, &[], None, false, &p, 2, &[]);
         assert_eq!(
             w.loopback_render.unwrap().0,
             "Speakers (Steam Streaming Microphone)"
@@ -770,7 +770,7 @@ mod tests {
             ep("Speakers (Steam Streaming Microphone)"),
         ];
         let p = probe(vec![("steam streaming microphone", fmt(16_000, 1))]);
-        let w = plan_with_formats(&renders, &[], None, false, &p, 2);
+        let w = plan_with_formats(&renders, &[], None, false, &p, 2, &[]);
         assert_eq!(
             w.loopback_render.as_ref().unwrap().0,
             "Speakers (Steam Streaming Microphone)"
@@ -786,7 +786,7 @@ mod tests {
     fn narrowing_is_reported_for_real_hardware_too() {
         let renders = [ep("Headset (Hands-Free AG Audio)")];
         let p = probe(vec![("headset", fmt(16_000, 1))]);
-        let w = plan_with_formats(&renders, &[], None, false, &p, 2);
+        let w = plan_with_formats(&renders, &[], None, false, &p, 2, &[]);
         assert_eq!(
             w.loopback_render.as_ref().unwrap().0,
             "Headset (Hands-Free AG Audio)"
@@ -806,8 +806,8 @@ mod tests {
         ];
         let captures = [ep("CABLE Output (VB-Audio Virtual Cable)")];
         for host_audio in [false, true] {
-            let a = plan(&renders, &captures, None, host_audio);
-            let b = plan_with_formats(&renders, &captures, None, host_audio, &no_formats, 2);
+            let a = plan(&renders, &captures, None, host_audio, &[]);
+            let b = plan_with_formats(&renders, &captures, None, host_audio, &no_formats, 2, &[]);
             assert_eq!(a, b, "host_audio={host_audio}");
             assert!(a.loopback_narrowing.is_none());
         }
@@ -825,7 +825,7 @@ mod tests {
             ("steam streaming microphone", fmt(24_000, 1)),
             ("realtek", fmt(48_000, 2)),
         ]);
-        let w = plan_with_formats(&renders, &[], None, true, &p, 2);
+        let w = plan_with_formats(&renders, &[], None, true, &p, 2, &[]);
         assert_eq!(w.loopback_render.unwrap().0, "Speakers (Realtek HD Audio)");
     }
 

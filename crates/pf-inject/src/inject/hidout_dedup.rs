@@ -334,21 +334,22 @@ mod tests {
     #[test]
     fn audio_ctl_dedups_by_value() {
         let mut d = HidoutDedup::default();
+        let t = Instant::now();
         let audio = |flags, vol| HidOutput::AudioCtl {
             pad: 0,
             flags,
             raw: [vol, 0, 0, 0, 0, 0],
         };
         // Identical twice → exactly one emission.
-        assert!(d.should_forward(&audio(0x17, 0x50)));
-        assert!(!d.should_forward(&audio(0x17, 0x50)));
+        assert!(d.should_forward(&audio(0x17, 0x50), t));
+        assert!(!d.should_forward(&audio(0x17, 0x50), t));
         // Either half changing (flags, or the raw region) forwards again.
-        assert!(d.should_forward(&audio(0x16, 0x50)));
-        assert!(d.should_forward(&audio(0x16, 0x60)));
+        assert!(d.should_forward(&audio(0x16, 0x50), t));
+        assert!(d.should_forward(&audio(0x16, 0x60), t));
         // The other kinds' state is untouched by audio traffic.
-        assert!(d.should_forward(&HidOutput::PlayerLeds { pad: 0, bits: 1 }));
+        assert!(d.should_forward(&HidOutput::PlayerLeds { pad: 0, bits: 1 }, t));
         // `clear` (pad re-plug) re-arms the value dedup.
         d.clear();
-        assert!(d.should_forward(&audio(0x16, 0x60)));
+        assert!(d.should_forward(&audio(0x16, 0x60), t));
     }
 }

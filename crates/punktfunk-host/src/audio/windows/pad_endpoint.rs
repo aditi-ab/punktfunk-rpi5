@@ -1387,8 +1387,13 @@ fn pad_audio_slots() -> u8 {
         .clamp(1, 4)
 }
 
-/// The endpoints provisioned at startup, set exactly once by the worker thread.
+/// The endpoints provisioned at startup, set exactly once by the worker thread — and only on
+/// SUCCESS. See [`provision_at_startup`] for why the failure path deliberately leaves it unset.
 static PROVISIONED: OnceLock<Arc<Vec<PadEndpoint>>> = OnceLock::new();
+
+/// A provisioning attempt is in flight. Guards the retry in [`ensure_provisioned`] against
+/// spawning a second COM worker while the first is still enumerating.
+static PROVISIONING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Host-startup pre-provisioning (Windows, env-gated): spawn a COM worker that `ensure()`s
 /// endpoints for slots `0..N`, performs at most ONE AudioEndpointBuilder+Audiosrv restart if
@@ -1401,6 +1406,10 @@ pub(crate) fn provision_at_startup() {
         return;
     }
     if PROVISIONED.get().is_some() {
+        return;
+    }
+    // R5: one attempt at a time. Without this the retry below could stack COM workers.
+    if PROVISIONING.swap(true, std::sync::atomic::Ordering::SeqCst) {
         return;
     }
     let slots = pad_audio_slots();
@@ -1441,9 +1450,24 @@ pub(crate) fn provision_at_startup() {
                          stored-but-not-served until the next reboot"),
                 }
             }
-            let _ = PROVISIONED.set(Arc::new(eps));
+            // R5: latch the result ONLY if we actually provisioned something. This used to store
+            // whatever `eps` held even when the loop broke on the first error — an empty vec —
+            // and `OnceLock` made that permanent: one transient failure (a busy audio stack, a
+            // service mid-restart) disabled pad audio for the entire life of the host process,
+            // with the only evidence a single warning at startup. An empty result now leaves the
+            // cell unset so `ensure_provisioned` can try again when a session next asks.
+            if eps.is_empty() {
+                tracing::warn!(
+                    "pad-audio provisioning produced no endpoints — leaving it unlatched so the \
+                     next session retries rather than disabling pad audio for this process"
+                );
+            } else {
+                let _ = PROVISIONED.set(Arc::new(eps));
+            }
+            PROVISIONING.store(false, std::sync::atomic::Ordering::SeqCst);
         });
     if let Err(e) = spawned {
+        PROVISIONING.store(false, std::sync::atomic::Ordering::SeqCst);
         tracing::warn!(error = %e, "could not spawn the pad-audio provisioning thread");
     }
 }
@@ -1452,6 +1476,17 @@ pub(crate) fn provision_at_startup() {
 #[allow(dead_code)]
 pub(crate) fn provisioned_endpoints() -> Option<Arc<Vec<PadEndpoint>>> {
     PROVISIONED.get().cloned()
+}
+
+/// R5: ask for provisioning again if the startup attempt produced nothing. Cheap and idempotent —
+/// a successful latch returns immediately, and `PROVISIONING` keeps concurrent askers to one
+/// worker. Called where a session first wants to know whether pad audio exists, so a host that
+/// started while the audio stack was busy recovers on the next connect instead of at the next
+/// reboot.
+pub(crate) fn ensure_provisioned() {
+    if PROVISIONED.get().is_none() {
+        provision_at_startup();
+    }
 }
 
 /// The provisioned endpoint for one pad slot — what a session queries when a client pad with
@@ -1571,11 +1606,40 @@ impl PadLoopbackCapturer {
             }),
             Ok(Err(e)) => Err(e),
             Err(_) => {
+                // R6: signal AND reap. Dropping `join` here detached the WASAPI thread, and the
+                // streamer's reopen loop retries this every ~2 s — so a wedged activation leaked
+                // one thread (each holding COM apartment state and a channel end) per attempt,
+                // indefinitely. The join is bounded in practice because the thread's own loop
+                // observes `stop` between waits; give it a moment and, if it is genuinely stuck
+                // inside a blocking WASAPI call, say so rather than leaking in silence.
                 stop.store(true, Ordering::SeqCst);
-                Err(anyhow!("pad loopback init timed out"))
+                match reap_with_timeout(join, Duration::from_secs(2)) {
+                    true => Err(anyhow!("pad loopback init timed out")),
+                    false => Err(anyhow!(
+                        "pad loopback init timed out and its thread did not exit — the audio \
+                         stack is wedged; not retrying into a thread leak"
+                    )),
+                }
             }
         }
     }
+}
+
+/// Join `join`, giving it `budget` to notice a stop flag. `true` if it exited.
+///
+/// A detached thread is the wrong answer at a retry point (see [`PadLoopbackCapturer::open`]):
+/// the caller reopens on a timer, so "leak one and move on" compounds. Waiting is bounded, and a
+/// thread that outlasts the budget is reported instead of silently accumulating.
+fn reap_with_timeout(join: JoinHandle<()>, budget: Duration) -> bool {
+    let deadline = std::time::Instant::now() + budget;
+    while !join.is_finished() {
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let _ = join.join();
+    true
 }
 
 /// Render a test tone straight into a pad's audio endpoint.
@@ -1645,13 +1709,18 @@ pub(crate) fn render_test_tone(
     let device = open_wasapi_device(endpoint_id)
         .with_context(|| format!("pad endpoint {endpoint_id} not found"))?;
     let mut audio_client = device.get_iaudioclient().context("IAudioClient")?;
+    // B11: the SAME mask the endpoint and the loopback capture use. Passing `None` let wasapi
+    // derive `(1 << 4) - 1` = 0x0F (FL FR FC LFE) instead of 0x33 (FL FR BL BR), so this devtest
+    // — the instrument for "which coil is which" — put its tone on a different channel pairing
+    // than the real path. It could not exercise the coil route at all, and read as an inverted
+    // pair when it appeared to.
     let desired = WaveFormat::new(
         32,
         32,
         &SampleType::Float,
         SAMPLE_RATE as usize,
         PAD_CHANNELS as usize,
-        None,
+        Some(PAD_CHANNEL_MASK),
     );
     let (default_period, _min) = audio_client.get_device_period().context("device period")?;
     audio_client

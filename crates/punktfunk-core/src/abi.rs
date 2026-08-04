@@ -770,8 +770,9 @@ impl PunktfunkHidOutput {
             HidOutput::HidRaw { .. } => return None,
             HidOutput::AudioCtl { pad, flags, raw } => {
                 // Same packing idiom as TrackpadHaptic: `which` carries the flags byte,
-                // `effect[0..6]` the raw audio region. The u16 wire pad narrows losslessly —
-                // pads are 0..16 (`input::MAX_PADS`) end to end.
+                // `effect[0..6]` the raw audio region. The u16 wire pad narrows losslessly
+                // because `HidOutput::decode` refuses one at or above `input::MAX_PADS` (B27) —
+                // it is enforced there, not merely assumed here.
                 out.kind = PUNKTFUNK_HIDOUT_AUDIO_CTL;
                 out.pad = *pad as u8;
                 out.which = *flags;

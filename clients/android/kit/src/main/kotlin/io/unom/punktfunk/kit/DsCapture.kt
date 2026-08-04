@@ -230,7 +230,25 @@ class DsCapture(
                 Log.i(TAG, "pad audio self-test → ${if (r > 0) "PASS ($r frames)" else "FAIL ($r)"}")
             }, "pf-pad-selftest").start()
         } else {
+            // B6: hand the coils back before the first haptics frame. Any rumble earlier in this
+            // session asserted HAPTICS_SELECT, which firmware-mutes them, and nothing else ever
+            // clears it — so without this the stream renders into a muted actuator and looks for
+            // all the world like the host is sending nothing.
+            restoreAudioHaptics()
             hook.start(index, fd)
+        }
+    }
+
+    /**
+     * B6: clear the rumble/haptics-select bits so the pad's voice coils answer the audio-haptics
+     * path again. EP0-direct, like the other out-of-band writes here: this has to land even when
+     * the interrupt-OUT queue is busy or draining, and it is idempotent.
+     */
+    private fun restoreAudioHaptics() {
+        val m = model ?: return
+        if (m == DsDevice.Model.DUALSHOCK4) return // no voice coils, no audio-haptics path
+        if (!usb.writeControl(DsDevice.ds5AudioHapticsReport(m))) {
+            Log.w(TAG, "pad audio: could not hand the coils back to audio haptics")
         }
     }
 
@@ -349,6 +367,10 @@ class DsCapture(
             // write — as this used to — meant a discarded stop left the motors running with
             // nothing scheduled to try again; a USB pad holds its last level until told zero.
             if (sent) disarmBackstop() else armBackstop(STOP_RETRY_MS)
+            // B6: the stop report just re-asserted HAPTICS_SELECT on its way past, so if a
+            // haptics stream is live the coils it drives were muted by the very write that
+            // silenced the motors. Give them back.
+            if (sent && padAudioStarted) restoreAudioHaptics()
         }
     }
 

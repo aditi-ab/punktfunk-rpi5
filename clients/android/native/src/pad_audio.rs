@@ -606,7 +606,7 @@ fn render(
 fn drain_until_stop(client: &NativeClient, stop: &AtomicBool) {
     while !stop.load(Ordering::Relaxed) {
         if client.next_pad_audio(Duration::from_millis(20)).is_none()
-            && stop.load(Ordering::Relaxed)
+            && (stop.load(Ordering::Relaxed) || client.is_session_ended())
         {
             return;
         }
@@ -632,6 +632,10 @@ fn pump(
     let mut samples_in = 0u64;
     let mut peak = 0i32;
     let mut last_report = std::time::Instant::now();
+    // R13: caller-side short-write accounting (distinct from `st.short_bytes`, which is a
+    // URB-level statistic from inside the transport).
+    let mut st_short = 0u64;
+    let mut st_short_logged = std::time::Instant::now();
     let mut pcm: Vec<i16> = Vec::with_capacity(MAX_FRAME_SAMPLES * 2);
     let mut out: Vec<i16> = Vec::with_capacity(MAX_BUFFER_FRAMES * PAD_CHANNELS);
 
@@ -644,7 +648,7 @@ fn pump(
             let st = playback.stats();
             log::info!(
                 "pad audio: {frames_in} frames in, {samples_in} samples, peak={peak}, \
-                 {} written, {} underruns, {} short",
+                 {} written, {} underruns, {} short, {st_short} dropped to back-pressure",
                 playback.frames_written(),
                 st.underruns,
                 st.short_bytes
@@ -654,8 +658,30 @@ fn pump(
         }
 
         let Some(frame) = client.next_pad_audio(Duration::from_millis(10)) else {
+            // R12: `next_pad_audio` collapses a DISCONNECTED channel into the same `None` as an
+            // ordinary timeout, so this arm cannot tell "nothing arrived in 10 ms" from "the
+            // session is gone and nothing will ever arrive again". Left to `continue`, a closed
+            // session span this loop at nice -16 until the owner's stop flag caught up — roughly
+            // a second of a real-time-priority thread doing nothing. Ask the connection directly.
+            if client.is_session_ended() {
+                log::debug!("pad audio: session ended, leaving the render loop");
+                break;
+            }
             continue;
         };
+
+        // R14: `PadAudioFrame` carries the wire pad it was addressed to, and this renderer serves
+        // exactly one. A frame for another pad — a queue still holding the previous occupant's
+        // when a slot is re-used, or a host bug — would otherwise be decoded here AND seed the
+        // gap tracker from a foreign sequence space, which shows up as a burst of phantom
+        // concealment rather than as anything obviously wrong.
+        if frame.pad != pad {
+            log::debug!(
+                "pad audio: dropping frame for pad {} on pad {pad}",
+                frame.pad
+            );
+            continue;
+        }
 
         // The settings gate each kind independently: haptics off but speaker on is a legitimate
         // configuration, and the host may still be sending both.
@@ -731,13 +757,35 @@ fn pump(
         // chunk is never padded with silence mid-stream.
         out.clear();
         if mixer.pop(&mut out) > 0 {
-            if let Err(e) = playback.write_interleaved(&out) {
-                if is_fatal(&e) {
-                    log::warn!("pad audio: stream lost: {e}");
-                    return;
+            match playback.write_interleaved(&out) {
+                // R13: a SHORT write is back-pressure, not success — the endpoint took `n` frames
+                // and the rest is ours to deal with. Discarding the return value dropped the tail
+                // with nothing said, so a stalled endpoint sounded like clipped audio with a clean
+                // log. We cannot retry from here without unbounded buffering (the mixer's whole
+                // point is to stay ahead of the device), so the tail is still dropped — but it is
+                // now COUNTED and reported by the 1 s line, which is the difference between a
+                // diagnosable stall and a mystery.
+                Ok(n) if n < out.len() => {
+                    st_short += (out.len() - n) as u64;
+                    if st_short_logged.elapsed() >= Duration::from_secs(5) {
+                        log::warn!(
+                            "pad audio: endpoint short-wrote {} of {} samples ({st_short} total) \
+                             — the device is not keeping up",
+                            n,
+                            out.len()
+                        );
+                        st_short_logged = std::time::Instant::now();
+                    }
                 }
-                log::debug!("pad audio: write hiccup: {e}");
-                mixer.discard();
+                Ok(_) => {}
+                Err(e) => {
+                    if is_fatal(&e) {
+                        log::warn!("pad audio: stream lost: {e}");
+                        return;
+                    }
+                    log::debug!("pad audio: write hiccup: {e}");
+                    mixer.discard();
+                }
             }
         }
     }

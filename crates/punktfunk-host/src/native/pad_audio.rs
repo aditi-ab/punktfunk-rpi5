@@ -247,6 +247,11 @@ pub(super) fn host_cap(client_caps: u8) -> bool {
     let asked = client_caps & punktfunk_core::quic::CLIENT_CAP_PAD_AUDIO != 0;
     #[cfg(target_os = "windows")]
     {
+        // R5: a startup attempt that failed transiently leaves nothing latched, so retry here —
+        // this is the first moment in a session's life that anyone asks whether pad audio exists.
+        if asked {
+            crate::audio::pad_endpoint::ensure_provisioned();
+        }
         asked
             && std::env::var_os("PUNKTFUNK_PAD_AUDIO").is_none_or(|v| v != "0")
             && crate::audio::pad_endpoint::provisioned_endpoints()
@@ -286,6 +291,22 @@ pub(super) fn spawn(
     if ep.endpoint_id.is_empty() {
         // The devnode-without-endpoint shape (`find`) — never in the provisioned set, but
         // cheap to refuse rather than spin the open/backoff loop on an empty id.
+        return None;
+    }
+    if ep.needs_aeb_kick {
+        // R4: this flag was computed on every path and consulted nowhere past startup. It means
+        // the endpoint's stamps are STORED but not SERVED — the audio stack never picked up the
+        // DualSense identity — and startup's one restart did not fix it. Opening anyway is worse
+        // than refusing: `AUTOCONVERTPCM` makes a wrong-format endpoint initialize *successfully*,
+        // so the stream runs, the logs look healthy, and the haptics/speaker pair is mis-routed
+        // with nothing to point at. Decline, and say which reboot-shaped problem it is.
+        tracing::warn!(
+            pad,
+            endpoint = %ep.endpoint_id,
+            "pad endpoint stamps are stored but not served — the audio stack has not adopted the \
+             DualSense identity (a reboot, or a manual AudioEndpointBuilder+Audiosrv restart, \
+             clears it). Not streaming: the endpoint would open and mis-route."
+        );
         return None;
     }
     let stop_t = stop.clone();

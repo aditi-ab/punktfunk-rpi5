@@ -560,11 +560,22 @@ impl HidOutput {
                 // Bounded: at most HID_REPORT_MAX bytes are kept from the (attacker-sized) tail.
                 data: b[4..b.len().min(4 + HID_REPORT_MAX)].to_vec(),
             }),
-            HIDOUT_AUDIO_CTL if b.len() >= 11 => Some(HidOutput::AudioCtl {
-                pad: u16::from_le_bytes([b[2], b[3]]),
-                flags: b[4],
-                raw: b[5..11].try_into().unwrap(),
-            }),
+            // B27: the pad is the only u16 index on this plane, and every consumer narrows it
+            // with `as u8` on the stated assumption that pads are 0..MAX_PADS. Nothing enforced
+            // that, so wire pad 256 silently ALIASED onto slot 0 — a malformed or hostile
+            // datagram steering a real controller's speaker volumes. Rejected here, at the one
+            // place the u16 exists, so the narrowings downstream are lossless by construction
+            // (the same fix R10 applied to the rumble plane).
+            HIDOUT_AUDIO_CTL
+                if b.len() >= 11
+                    && u16::from_le_bytes([b[2], b[3]]) < crate::input::MAX_PADS as u16 =>
+            {
+                Some(HidOutput::AudioCtl {
+                    pad: u16::from_le_bytes([b[2], b[3]]),
+                    flags: b[4],
+                    raw: b[5..11].try_into().unwrap(),
+                })
+            }
             _ => None,
         }
     }
@@ -1400,13 +1411,15 @@ mod tests {
     #[test]
     fn audio_ctl_wire_layout_and_truncation() {
         // The exact 11-byte layout: [0xCD][0x06][u16 pad LE][u8 flags][6 raw bytes].
+        // The pad is deliberately a REPRESENTABLE one: this used to assert that 0x0201 (513)
+        // round-tripped, which pinned B27's aliasing in place as if it were the contract.
         let a = HidOutput::AudioCtl {
-            pad: 0x0201,
+            pad: 0x000B,
             flags: 0x17,
             raw: [1, 2, 3, 4, 5, 6],
         };
         let d = a.encode();
-        assert_eq!(d, [0xCD, 0x06, 0x01, 0x02, 0x17, 1, 2, 3, 4, 5, 6]);
+        assert_eq!(d, [0xCD, 0x06, 0x0B, 0x00, 0x17, 1, 2, 3, 4, 5, 6]);
         assert_eq!(HidOutput::decode(&d), Some(a));
         // Truncated buffers are rejected outright (fixed length — never a partial read).
         for n in 2..d.len() {
@@ -1435,6 +1448,49 @@ mod tests {
         let hdr = encode_pad_audio_datagram(0, PAD_AUDIO_KIND_SPEAKER, 0, 0, &[]);
         assert_eq!(hdr.len(), 15);
         assert!(decode_pad_audio_datagram(&hdr).unwrap().opus.is_empty());
+    }
+
+    /// B27: the pad is the only u16 index on the 0xCD plane and every consumer narrows it with
+    /// `as u8`. An out-of-range one used to alias onto a real slot instead of being refused —
+    /// wire pad 256 steering pad 0's speaker volumes.
+    #[test]
+    fn audio_ctl_rejects_a_pad_outside_the_index_space() {
+        let ok = HidOutput::AudioCtl {
+            pad: (crate::input::MAX_PADS - 1) as u16,
+            flags: 0x12,
+            raw: [1, 2, 3, 4, 5, 6],
+        };
+        assert_eq!(
+            HidOutput::decode(&ok.encode()),
+            Some(ok),
+            "the last valid pad must still decode"
+        );
+
+        // Anything at or above MAX_PADS is refused outright, not truncated.
+        for pad in [crate::input::MAX_PADS as u16, 256, u16::MAX] {
+            let d = HidOutput::AudioCtl {
+                pad,
+                flags: 0x12,
+                raw: [1, 2, 3, 4, 5, 6],
+            }
+            .encode();
+            assert_eq!(HidOutput::decode(&d), None, "pad {pad} must not decode");
+        }
+
+        // The specific alias the bug produced: 256 as u8 == 0.
+        let d = HidOutput::AudioCtl {
+            pad: 256,
+            flags: 0,
+            raw: [0; 6],
+        }
+        .encode();
+        assert!(
+            !matches!(
+                HidOutput::decode(&d),
+                Some(HidOutput::AudioCtl { pad: 0, .. })
+            ),
+            "wire pad 256 must never surface as pad 0"
+        );
     }
 
     #[test]

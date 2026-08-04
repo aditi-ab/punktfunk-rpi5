@@ -2196,7 +2196,8 @@ fn hidout_pad(h: &HidOutput) -> u8 {
         | HidOutput::Trigger { pad, .. }
         | HidOutput::TrackpadHaptic { pad, .. }
         | HidOutput::HidRaw { pad, .. } => *pad,
-        // AudioCtl's pad is u16 on the wire; the index space is 0..MAX_PADS end to end.
+        // AudioCtl's pad is the plane's only u16. `HidOutput::decode` rejects anything at or
+        // above MAX_PADS (B27), so by the time one reaches here the narrowing is lossless.
         HidOutput::AudioCtl { pad, .. } => *pad as u8,
     }
 }

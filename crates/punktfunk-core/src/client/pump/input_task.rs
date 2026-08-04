@@ -48,12 +48,23 @@ pub(super) async fn run(
     // An arrival's outgoing flags word: the pad index, plus the pad's audio-render bits (8/9)
     // toward a HOST_CAP_PAD_AUDIO host. With no declared caps (or an older host) this is
     // byte-identical to the plain index — the pre-pad-audio wire.
-    let arrival_flags = |idx: usize| -> u32 {
-        let caps = if pad_audio {
+    // B7: the caps a pad's LAST arrival actually carried. `set_pad_audio_caps` only stores into
+    // the registry — it cannot reach this task — so a declaration that lands after the arrival
+    // burst has drained (the renderer commits the trade only once its sink opens, which is well
+    // past the two 100 ms ticks) used to never reach the host at all: the client believed it had
+    // pad audio and the host emitted nothing on 0xD1, silently, forever. Comparing this against
+    // the live registry on every tick re-arms the burst by itself, with no new plumbing and no
+    // extra traffic when nothing changed.
+    let mut arrival_caps_sent: [u8; MAX_PADS] = [0; MAX_PADS];
+    let caps_now = |idx: usize| -> u8 {
+        if pad_audio {
             pad_audio_caps[idx].load(Ordering::Relaxed)
         } else {
             0
-        };
+        }
+    };
+    let arrival_flags = |idx: usize| -> u32 {
+        let caps = caps_now(idx);
         crate::input::encode_gamepad_arrival(idx as u8, caps)
     };
     let mut refresh = tokio::time::interval(Duration::from_millis(100));
@@ -115,6 +126,7 @@ pub(super) async fn run(
                         // burst so the host learns it before the pad's first frame even under loss.
                         arrival[idx] = Some(ev.code as u8);
                         arrival_owed[idx] = ARRIVAL_RESENDS;
+                        arrival_caps_sent[idx] = caps_now(idx);
                         let arr = crate::input::InputEvent {
                             flags: arrival_flags(idx),
                             ..ev
@@ -127,11 +139,21 @@ pub(super) async fn run(
             }
             _ = refresh.tick() => {
                 for idx in 0..MAX_PADS {
+                    // B7: caps declared after the burst drained — re-announce this pad's arrival.
+                    // Only for a pad that HAS an arrival (so it is a live, declared controller),
+                    // and only when the value actually moved, so a steady session sends nothing.
+                    if arrival[idx].is_some()
+                        && arrival_owed[idx] == 0
+                        && caps_now(idx) != arrival_caps_sent[idx]
+                    {
+                        arrival_owed[idx] = ARRIVAL_RESENDS;
+                    }
                     // Re-send an owed kind declaration (independent of whether the pad has state
                     // yet — it may be idle-but-connected). Idempotent on the host.
                     if arrival_owed[idx] > 0 {
                         if let Some(kind) = arrival[idx] {
                             arrival_owed[idx] -= 1;
+                            arrival_caps_sent[idx] = caps_now(idx);
                             let arr = crate::input::InputEvent {
                                 kind: InputKind::GamepadArrival,
                                 _pad: [0; 3],
