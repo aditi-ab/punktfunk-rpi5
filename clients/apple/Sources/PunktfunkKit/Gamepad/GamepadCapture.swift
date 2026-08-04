@@ -98,8 +98,17 @@ public final class GamepadCapture {
     /// `onDisconnectRequest`; the chord keeps forwarding to the host meanwhile (the user is
     /// leaving anyway). The desktop clients' quick-press step (leave fullscreen / release
     /// capture) has no Apple equivalent worth wiring — macOS has ⌃⌥⇧Q/D, touch has the HUD.
-    private static let escapeChord: UInt32 =
+    /// Internal rather than private only so `GamepadEscapeChordTests` can pin it against
+    /// `escapeChordElements` below — the two must not drift.
+    static let escapeChord: UInt32 =
         GamepadWire.leftShoulder | GamepadWire.rightShoulder | GamepadWire.start | GamepadWire.back
+    /// `escapeChord`'s four elements by GameController alias — the ONLY system gestures claimed
+    /// while forwarding is off (see `openSlot`). Kept beside the mask it mirrors: change one and
+    /// change the other, or the chord silently stops reaching us on tvOS. A test asserts the two
+    /// agree, because the failure is invisible until someone is stuck in a stream on an Apple TV.
+    static let escapeChordElements = [
+        GCInputLeftShoulder, GCInputRightShoulder, GCInputButtonMenu, GCInputButtonOptions,
+    ]
     /// pf-client-core's `DISCONNECT_HOLD` — the same 1.5 s on every client.
     private static let disconnectHold: TimeInterval = 1.5
     /// pf-client-core's `GUIDE_HOLD`: hold Select alone this long → the HOST's guide goes
@@ -236,7 +245,17 @@ public final class GamepadCapture {
         // gesture attached the press is the system's, not the game's. During capture the remote
         // session IS the game: the share button must reach the host (e.g. Steam screenshots),
         // the PS button must open the host's Steam overlay. Restored to .enabled on close.
-        for element in c.physicalInputProfile.elements.values {
+        //
+        // With forwarding OFF none of that applies — no press reaches the host, so taking the
+        // user's screenshot gesture away buys nothing. NARROWED, not skipped: the escape chord
+        // is still read off this slot, and on tvOS it is the only controller way out of a
+        // stream, so the chord's own four elements keep their claim. (Menu especially: leave
+        // its gesture attached on tvOS and the press is the system's — the chord would never
+        // complete and the session would have no controller exit at all.)
+        let claimed = forwarding
+            ? Array(c.physicalInputProfile.elements.values)
+            : Self.escapeChordElements.compactMap { c.physicalInputProfile.elements[$0] }
+        for element in claimed {
             element.preferredSystemGestureState = .disabled
         }
         // The Home/PS button (→ guide; the host maps it to the DualSense PS / Xbox guide bit,
@@ -276,7 +295,11 @@ public final class GamepadCapture {
                 MainActor.assumeIsolated { if let self, let slot { self.touch(slot, finger: 1, x: x, y: y) } }
             }
         }
-        if let motion = c.motion {
+        // Motion is wire-only — `forwardMotion` has nothing to do with forwarding off, and no
+        // local feature reads it. Powering the IMU anyway costs the pad real battery (it streams
+        // gyro + accel continuously over Bluetooth, which is why `closeSlot` is careful to power
+        // it back down), so with nothing to forward we simply never turn it on.
+        if forwarding, let motion = c.motion {
             if motion.sensorsRequireManualActivation { motion.sensorsActive = true }
             motion.valueChangedHandler = { [weak self, weak slot] m in
                 MainActor.assumeIsolated { if let self, let slot { self.forwardMotion(slot, m) } }

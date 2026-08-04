@@ -166,6 +166,11 @@ struct GamepadSettingsView: View {
     /// layer" rule), and a hostless picker has nothing to pin, so only Back remains.
     private var hints: [GamepadHint] {
         guard pinTarget != nil else {
+            // A dimmed row takes neither, so offering them would be the same lie the row itself
+            // used to tell — only Done remains, and the detail line says what to turn on first.
+            guard rows.first(where: { $0.id == focusID })?.enabled ?? true else {
+                return [.init(glyph: buttonGlyph(\.buttonB, fallback: "b.circle"), text: "Done")]
+            }
             return [
                 .init(glyph: "arrow.left.and.right", text: "Adjust"),
                 .init(glyph: buttonGlyph(\.buttonA, fallback: "a.circle"), text: "Change"),
@@ -218,7 +223,8 @@ struct GamepadSettingsView: View {
                 HStack(spacing: 9) {
                     Image(systemName: "chevron.left")
                         .font(.system(size: m.chevronFont, weight: .semibold))
-                        .foregroundStyle(.white.opacity(focused && row.adjustable ? 0.6 : 0))
+                        .foregroundStyle(
+                            .white.opacity(focused && row.adjustable && row.enabled ? 0.6 : 0))
                     // Keyed by the value so a change slides the new option in instead of
                     // hard-swapping the string — a QUIET horizontal slip following the user's
                     // motion (a right-step enters from the right), crossfading over ~14 pt.
@@ -239,9 +245,13 @@ struct GamepadSettingsView: View {
                     .animation(.smooth(duration: 0.22), value: row.value)
                     Image(systemName: "chevron.right")
                         .font(.system(size: m.chevronFont, weight: .semibold))
-                        .foregroundStyle(.white.opacity(focused && row.adjustable ? 0.6 : 0))
+                        .foregroundStyle(
+                            .white.opacity(focused && row.adjustable && row.enabled ? 0.6 : 0))
                 }
             }
+            // Contents only — the glass and border below stay at full strength, so a dimmed row
+            // still reads as a row you can sit on (which you can: its detail is the point).
+            .opacity(row.enabled ? 1 : 0.45)
             .padding(.horizontal, m.rowHPad)
             .padding(.vertical, m.rowVPad)
             // Every row is Liquid Glass; the focused one takes a brand wash and reacts to press.
@@ -276,6 +286,13 @@ struct GamepadSettingsView: View {
         /// Whether left/right means anything here — false hides the value's chevrons (the
         /// Profiles rows navigate, and the placeholder rows do nothing at all).
         var adjustable = true
+        /// Dimmed and inert when false: a row whose meaning depends on another setting that is
+        /// currently off. It stays in the list and stays FOCUSABLE — its `detail` is how the
+        /// user learns which switch to flip first, and a row that vanished mid-list would
+        /// shift everything under the cursor. Enforced centrally in `adjust(id:by:)` /
+        /// `activate(id:)`, not per closure, so no row builder can forget it.
+        /// (Android's `GpRow.enabled` and `pf-console-ui`'s `RowSpec.enabled` are the twins.)
+        var enabled = true
         /// Left/right step; returns whether the value actually changed (false ⇒ boundary thud).
         let adjust: (Int) -> Bool
         /// A — cycle forward (wrapping) / flip.
@@ -286,12 +303,14 @@ struct GamepadSettingsView: View {
     /// (never on state captured at wire time).
     private func adjust(id: String, by delta: Int) -> Bool {
         lastAdjustDelta = delta
-        return rows.first { $0.id == id }?.adjust(delta) ?? false
+        guard let row = rows.first(where: { $0.id == id }), row.enabled else { return false }
+        return row.adjust(delta)
     }
 
     private func activate(id: String) {
         lastAdjustDelta = 1 // A always cycles forward
-        rows.first { $0.id == id }?.activate()
+        guard let row = rows.first(where: { $0.id == id }), row.enabled else { return }
+        row.activate()
     }
 
     private var rows: [Row] {
@@ -391,27 +410,35 @@ struct GamepadSettingsView: View {
                     + "controller already reaches the host another way — USB passthrough such "
                     + "as VirtualHere — so games don't see two of them.",
                 value: $gamepadForwarding),
+            // The four rows below only mean something while something is being forwarded, so
+            // they follow the switch above — the same relationship the touch settings draw with
+            // `.disabled(!effective.gamepadForwarding)`. This screen could not express it until
+            // `Row.enabled` existed, so it alone left them live and steppable.
             choiceRow(
                 id: "pad", icon: "gamecontroller", label: "Use controller",
                 detail: "Which pad is forwarded to the host, as player 1.",
-                options: controllers, current: gamepads.preferredID
+                options: controllers, current: gamepads.preferredID,
+                enabled: gamepadForwarding
             ) { gamepads.preferredID = $0 },
             choiceRow(
                 id: "padType", icon: "dpad", label: "Controller type",
                 detail: "The virtual pad the host creates — Automatic matches this controller.",
-                options: SettingsOptions.padTypes, current: gamepadType
+                options: SettingsOptions.padTypes, current: gamepadType,
+                enabled: gamepadForwarding
             ) { gamepadType = $0 },
             choiceRow(
                 id: "systemButtons", icon: "house.circle", label: "Guide button",
                 detail: "Where the guide (Xbox/PS) and share presses go while streaming — "
                     + "Automatic sends them to the host whenever this device delivers them.",
-                options: SettingsOptions.systemButtons, current: systemButtons
+                options: SettingsOptions.systemButtons, current: systemButtons,
+                enabled: gamepadForwarding
             ) { systemButtons = $0 },
             choiceRow(
                 id: "guideGesture", icon: "hand.point.up.left", label: "Hold Select for guide",
                 detail: "Hold Select alone to press the host's guide button — keep holding "
                     + "for a Gaming-Mode host's quick-access menu. A tap still goes through.",
-                options: SettingsOptions.guideGestures, current: guideGesture
+                options: SettingsOptions.guideGestures, current: guideGesture,
+                enabled: gamepadForwarding
             ) { guideGesture = $0 },
 
             choiceRow(
@@ -583,13 +610,15 @@ struct GamepadSettingsView: View {
 
     private func choiceRow<T: Equatable>(
         id: String, header: String? = nil, icon: String, label: String, detail: String,
-        options: [(label: String, tag: T)], current: T, write: @escaping (T) -> Void
+        options: [(label: String, tag: T)], current: T, enabled: Bool = true,
+        write: @escaping (T) -> Void
     ) -> Row {
         let index = options.firstIndex { $0.tag == current }
         return Row(
             id: id, header: header, icon: icon, label: label,
             value: index.map { options[$0].label } ?? "—",
             detail: detail,
+            enabled: enabled,
             adjust: { delta in
                 // Unknown current value: snap to the first option on any step.
                 guard let index else {
@@ -610,12 +639,13 @@ struct GamepadSettingsView: View {
 
     private func toggleRow(
         id: String, header: String? = nil, icon: String, label: String, detail: String,
-        value: Binding<Bool>
+        value: Binding<Bool>, enabled: Bool = true
     ) -> Row {
         Row(
             id: id, header: header, icon: icon, label: label,
             value: value.wrappedValue ? "On" : "Off",
             detail: detail,
+            enabled: enabled,
             adjust: { delta in
                 // Directional semantics: left = off, right = on; a no-op reads as a boundary.
                 let target = delta > 0
