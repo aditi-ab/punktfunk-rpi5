@@ -401,6 +401,16 @@ impl RichInput {
     }
 }
 
+/// Longest [`HidOutput::Trigger`] `effect` the wire carries: the DualSense adaptive-trigger
+/// parameter block is a mode byte plus ten parameters, and every consumer copies at most this many
+/// into its report.
+///
+/// The single source for the clamp on BOTH sides. `Trigger` was the only variable-length variant
+/// bounded on neither: encode appended whatever it was handed and decode took the entire tail, so
+/// an attacker-sized datagram was reproduced verbatim into a `Vec` while its sibling `HidRaw` had
+/// been bounded on both ends all along.
+pub const TRIGGER_EFFECT_MAX: usize = 11;
+
 const HIDOUT_LED: u8 = 0x01;
 const HIDOUT_PLAYER_LEDS: u8 = 0x02;
 const HIDOUT_TRIGGER: u8 = 0x03;
@@ -460,7 +470,7 @@ impl HidOutput {
             }
             HidOutput::Trigger { pad, which, effect } => {
                 out.extend_from_slice(&[HIDOUT_TRIGGER, *pad, *which]);
-                out.extend_from_slice(effect);
+                out.extend_from_slice(&effect[..effect.len().min(TRIGGER_EFFECT_MAX)]);
             }
             HidOutput::TrackpadHaptic {
                 pad,
@@ -497,10 +507,17 @@ impl HidOutput {
                 pad: b[2],
                 bits: b[3],
             }),
-            HIDOUT_TRIGGER if b.len() >= 4 => Some(HidOutput::Trigger {
+            // `> 4`, not `>= 4`: a body with no effect bytes at all is malformed, and decoding it
+            // as an EMPTY effect was actively harmful — downstream an empty block is written as an
+            // all-zero trigger report, which is mode 0x00, which RELEASES a held effect. A
+            // truncated datagram could therefore silently cancel the trigger a game was holding.
+            // A genuine "no effect" is a full-length zero block and still decodes fine.
+            HIDOUT_TRIGGER if b.len() > 4 => Some(HidOutput::Trigger {
                 pad: b[2],
                 which: b[3],
-                effect: b[4..].to_vec(),
+                // Bounded like `HidRaw` below: at most the parameter block is kept from the
+                // (attacker-sized) tail.
+                effect: b[4..b.len().min(4 + TRIGGER_EFFECT_MAX)].to_vec(),
             }),
             HIDOUT_TRACKPAD_HAPTIC if b.len() >= 10 => Some(HidOutput::TrackpadHaptic {
                 pad: b[2],
@@ -979,6 +996,82 @@ mod tests {
         assert_eq!(d[0], RUMBLE_MAGIC);
         assert_eq!(decode_rumble_datagram(&d), Some((1, 0x1234, 0xFFFF)));
         assert!(decode_rumble_datagram(&d[..6]).is_none());
+    }
+
+    /// `Trigger` is the only variable-length variant that used to be bounded on NEITHER side.
+    /// Pinned here because both halves matter: an over-long effect must be clamped on the way out
+    /// AND on the way in, and a body with no effect bytes must not decode at all.
+    #[test]
+    fn trigger_effect_is_clamped_on_both_encode_and_decode() {
+        // Encode clamps: a caller handing over an over-long block cannot put it on the wire.
+        let long = HidOutput::Trigger {
+            pad: 1,
+            which: 0,
+            effect: vec![0xAB; 200],
+        };
+        let d = long.encode();
+        assert_eq!(
+            d.len(),
+            4 + TRIGGER_EFFECT_MAX,
+            "magic + kind + pad + which + at most the parameter block"
+        );
+
+        // Decode clamps independently of encode — a hostile peer does not use our encoder.
+        let mut hostile = vec![HIDOUT_MAGIC, super::HIDOUT_TRIGGER, 1, 0];
+        hostile.extend_from_slice(&[0xCD; 500]);
+        match HidOutput::decode(&hostile) {
+            Some(HidOutput::Trigger { effect, .. }) => {
+                assert_eq!(effect.len(), TRIGGER_EFFECT_MAX, "tail is bounded");
+            }
+            other => panic!("expected a clamped Trigger, got {other:?}"),
+        }
+
+        // An exact-length effect survives untouched, and round-trips.
+        let ok = HidOutput::Trigger {
+            pad: 2,
+            which: 1,
+            effect: vec![0x02, 0x90, 0xA0, 0xFF, 0, 0, 0, 0, 0, 0, 0],
+        };
+        assert_eq!(HidOutput::decode(&ok.encode()), Some(ok));
+    }
+
+    /// A body with no effect bytes is malformed and must be REJECTED, not read as an empty effect:
+    /// downstream an empty block becomes an all-zero trigger report, which is mode 0x00 — it
+    /// releases whatever effect the game was holding. A truncated datagram must not do that.
+    #[test]
+    fn a_trigger_with_no_effect_bytes_is_rejected_not_read_as_cancel() {
+        let empty = [HIDOUT_MAGIC, super::HIDOUT_TRIGGER, 0, 0];
+        assert_eq!(HidOutput::decode(&empty), None);
+
+        // One byte of effect is a legitimate short block (consumers zero-pad it) and still decodes.
+        let one = [HIDOUT_MAGIC, super::HIDOUT_TRIGGER, 0, 0, 0x02];
+        assert_eq!(
+            HidOutput::decode(&one),
+            Some(HidOutput::Trigger {
+                pad: 0,
+                which: 0,
+                effect: vec![0x02]
+            })
+        );
+    }
+
+    /// `HidRaw`'s bound was already correct on both sides — pinned alongside `Trigger` so the pair
+    /// cannot drift apart again.
+    #[test]
+    fn hid_raw_stays_bounded_on_both_sides() {
+        let long = HidOutput::HidRaw {
+            pad: 0,
+            kind: HID_RAW_OUTPUT,
+            data: vec![0x11; 500],
+        };
+        assert_eq!(long.encode().len(), 4 + HID_REPORT_MAX);
+
+        let mut hostile = vec![HIDOUT_MAGIC, super::HIDOUT_HID_RAW, 0, HID_RAW_FEATURE];
+        hostile.extend_from_slice(&[0x22; 900]);
+        match HidOutput::decode(&hostile) {
+            Some(HidOutput::HidRaw { data, .. }) => assert_eq!(data.len(), HID_REPORT_MAX),
+            other => panic!("expected a clamped HidRaw, got {other:?}"),
+        }
     }
 
     #[test]

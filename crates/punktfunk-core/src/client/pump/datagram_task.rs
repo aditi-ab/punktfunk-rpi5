@@ -60,22 +60,28 @@ pub(super) async fn run(
             }
             Some(&crate::quic::RUMBLE_MAGIC) => {
                 if let Some(u) = crate::quic::decode_rumble_envelope(&d) {
+                    // A pad index the client cannot represent is dropped outright, before either
+                    // consumer sees it. It used to be waved through: the seq gate was skipped (its
+                    // per-pad cursor has no slot for it) and it was handed to the legacy queue,
+                    // while the policy engine silently discarded it on its own bounds check — so
+                    // "both consumers are fed" below was false for exactly these, and an embedder
+                    // draining the queue could be handed an index it would use to subscript its
+                    // own per-pad array. The host never emits one; this is malformed or hostile.
+                    let idx = u.pad as usize;
+                    if idx >= crate::input::MAX_PADS {
+                        continue;
+                    }
                     // Gate v2 envelopes on their per-pad seq; forward v1 (envelope: None) as-is.
                     let fresh = match u.envelope {
                         Some(env) => {
-                            let idx = u.pad as usize;
-                            if idx < crate::input::MAX_PADS {
-                                if crate::input::GamepadSnapshot::seq_newer(
-                                    env.seq,
-                                    rumble_last_seq[idx],
-                                ) {
-                                    rumble_last_seq[idx] = Some(env.seq);
-                                    true
-                                } else {
-                                    false // reordered/duplicate — drop, keep the newer state
-                                }
+                            if crate::input::GamepadSnapshot::seq_newer(
+                                env.seq,
+                                rumble_last_seq[idx],
+                            ) {
+                                rumble_last_seq[idx] = Some(env.seq);
+                                true
                             } else {
-                                true // out-of-range pad (host never sends these): no gate
+                                false // reordered/duplicate — drop, keep the newer state
                             }
                         }
                         None => true,
