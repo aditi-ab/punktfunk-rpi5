@@ -262,7 +262,7 @@ export async function ensureGamepadUiShortcut(): Promise<number | null> {
     // (/bin/sh); the wrapper rides behind as an arg. PF_CLIENT_BIN only when the backend resolved
     // a NATIVE client — else the wrapper's flatpak default stands and this shortcut is exactly
     // what it always was.
-    const clientBin = info.client_bin ? `PF_CLIENT_BIN=${info.client_bin} ` : "";
+    const clientBin = safeClientBin(info.client_bin) ? `PF_CLIENT_BIN=${info.client_bin} ` : "";
     const launchOpts = `${clientBin}PF_BROWSE=1 %command% "${info.runner}"`;
 
     // Reuse the remembered entry only if it still exists; a stale appId (deleted shortcut whose
@@ -347,6 +347,16 @@ export function isSafeLaunchId(id: string): boolean {
 }
 
 /**
+ * Is a resolved native-client path safe to put in Steam's launch options? Same rule, separate
+ * name because the failure is different: an unsafe id is a bug in our own data, an unsafe path
+ * is just where the user installed the client — so the browse shortcut degrades to its flatpak
+ * default rather than refusing to exist.
+ */
+function safeClientBin(bin: string | undefined): bin is string {
+  return !!bin && isSafeLaunchId(bin);
+}
+
+/**
  * Stream `ref` fullscreen in Gaming Mode, optionally with a pinned card's profile. Encodes the
  * target into the STREAM shortcut's launch options — one hidden shortcut serves every host —
  * then RunGame.
@@ -369,6 +379,12 @@ export async function launchStream(ref: string, opts: LaunchOpts = {}): Promise<
   // Set only for a NATIVE client install; absent, the wrapper takes its flatpak default, so every
   // existing Deck install produces byte-identical launch options to before.
   if (clientBin) {
+    // The one launch-option value that comes from the backend rather than a store id, and so
+    // the one that could carry a space: a path like `/home/deck/my apps/punktfunk-client` would
+    // split Steam's tokenizer and land its tail in front of %command% as a bogus env token.
+    if (!isSafeLaunchId(clientBin)) {
+      throw new Error(`client path can't ride Steam's launch options: ${clientBin}`);
+    }
     env.push(`PF_CLIENT_BIN=${clientBin}`);
   }
   if (opts.profileId) {

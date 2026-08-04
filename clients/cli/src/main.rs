@@ -121,6 +121,13 @@ punktfunk hosts — the saved-hosts store (shared with the desktop client)
       another subnet). Without --fp it is a placeholder to pair later; with a
       64-hex fingerprint it is pinned immediately (still unpaired).
 
+      Idempotent, and keyed on the FINGERPRINT once there is one: re-running it
+      for a host already saved is a no-op, and giving a known fingerprint a new
+      address MOVES that host's record there rather than filing a second one
+      (which is how a host that changed DHCP lease stays reachable by its id).
+      A different fingerprint for an address already saved is refused, exit 3 —
+      a changed identity is a decision for a person.
+
   punktfunk hosts forget <host-ref>
       Remove a saved host, its pinned fingerprint included. A later connect
       must pair or trust it again."
@@ -590,6 +597,31 @@ from the config directory for a true factory reset."
                                 CONNECT_FAILED
                             }
                         },
+                    };
+                }
+                // No record at this address — but a record carrying this exact FINGERPRINT is
+                // this same host at a new one. Re-point it rather than filing a second record:
+                // the fingerprint is the identity, and a host that changed DHCP lease is the
+                // whole reason `hosts add --fp` is idempotent in the first place. Without this a
+                // moved host accumulates one record per address it has ever held, and the one a
+                // stable id resolves to keeps the address it can no longer be reached at.
+                if let Some(i) = known
+                    .hosts
+                    .iter()
+                    .position(|h| !fp.is_empty() && h.fp_hex.eq_ignore_ascii_case(&fp))
+                {
+                    let was = format!("{}:{}", known.hosts[i].addr, known.hosts[i].port);
+                    known.hosts[i].addr = addr.clone();
+                    known.hosts[i].port = port;
+                    return match known.save() {
+                        Ok(()) => {
+                            println!("moved {was} to {addr}:{port}");
+                            OK
+                        }
+                        Err(e) => {
+                            eprintln!("saving: {e:#}");
+                            CONNECT_FAILED
+                        }
                     };
                 }
                 known.hosts.push(KnownHost {
@@ -1315,6 +1347,32 @@ from the config directory for a true factory reset."
                 known.hosts[0].fp_hex, "abc123",
                 "the pin must survive intact"
             );
+        }
+
+        /// A host that changed DHCP lease is re-pointed, not filed a second time. Without this
+        /// the record a stable id resolves to keeps an address the host has left, so a launch
+        /// dials into the void while the panel shows the live one.
+        #[test]
+        fn a_known_fingerprint_at_a_new_address_moves_the_record() {
+            let mut known = KnownHosts {
+                hosts: vec![saved("desk", "192.168.1.9", "abc123")],
+            };
+            // Simulates `hosts add 192.168.1.50 --fp abc123` finding no record at that address.
+            let by_addr = known
+                .hosts
+                .iter()
+                .position(|h| h.addr == "192.168.1.50" && h.port == 9777);
+            assert!(
+                by_addr.is_none(),
+                "the new address is not yet on any record"
+            );
+            let by_fp = known
+                .hosts
+                .iter()
+                .position(|h| h.fp_hex.eq_ignore_ascii_case("abc123"));
+            assert_eq!(by_fp, Some(0), "the fingerprint still identifies the host");
+            known.hosts[0].addr = "192.168.1.50".into();
+            assert_eq!(known.hosts.len(), 1, "one host, one record");
         }
 
         #[test]

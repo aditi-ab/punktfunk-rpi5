@@ -69,6 +69,14 @@ export interface HostView {
   fp: string;
   /** What the host is advertising right now, if anything — what request access would pin. */
   advertisedFp: string;
+  /**
+   * The host is answering at an address its record does not carry — it changed DHCP lease.
+   *
+   * This matters because a launch names the host by [`ref`], and the CLI dials whatever address
+   * the RECORD holds. So the row would show the live address and dial the dead one. The record
+   * has to be re-pointed before such a host can stream; `startStream` does it.
+   */
+  moved: boolean;
   paired: boolean;
   online: boolean;
   saved: boolean;
@@ -131,6 +139,7 @@ export function mergeHosts(saved: SavedHost[], discovered: DiscoveredHost[]): Ho
       port: advert?.port ?? s.port,
       fp: s.fp_hex,
       advertisedFp: advert?.fp ?? "",
+      moved: !!advert && (advert.addr !== s.addr || advert.port !== s.port),
       paired: s.paired,
       online: !!advert || s.online === true,
       saved: true,
@@ -153,6 +162,7 @@ export function mergeHosts(saved: SavedHost[], discovered: DiscoveredHost[]): Ho
       // No record, so nothing is pinned — whatever it advertises is an OFFER, not a pin.
       fp: "",
       advertisedFp: a.fp,
+      moved: false, // no record, so nothing to be stale
       paired: a.paired,
       online: true,
       saved: false,
@@ -185,9 +195,11 @@ function sortRows(a: HostView, b: HostView): number {
 export function useHosts() {
   const [views, setViews] = useState<HostView[]>([]);
   const [scanning, setScanning] = useState(false);
-  // A client too old for `punktfunk discover`. Rendered as one explanatory row plus the update
-  // button that fixes it — never as an empty list, which would read as "no hosts on your LAN".
-  const [outdated, setOutdated] = useState(false);
+  // Why the list is empty, when it is empty for a reason other than an empty LAN. Rendering
+  // either of these as "No hosts yet" would blame the user's network for the plugin's problem:
+  //   "client-outdated"    — the installed client predates `punktfunk discover`
+  //   "client-unavailable" — there is no client installed at all
+  const [problem, setProblem] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     setScanning(true);
@@ -195,7 +207,14 @@ export function useHosts() {
       // Both in flight at once: the browse is time-bounded and the probe is network-bound, so
       // running them in sequence would cost the sum of two waits for no benefit.
       const [d, s] = await Promise.all([discover(), listHosts()]);
-      setOutdated(d.error === "client-outdated" || s.error === "client-outdated");
+      // Both calls run the same binary, so they fail the same way; take whichever answered.
+      setProblem(
+        d.error === "client-unavailable" || s.error === "client-unavailable"
+          ? "client-unavailable"
+          : d.error === "client-outdated" || s.error === "client-outdated"
+            ? "client-outdated"
+            : null,
+      );
       setViews(mergeHosts(s.hosts ?? [], d.hosts ?? []));
     } catch (e) {
       toaster.toast({ title: "Punktfunk", body: `Couldn't list hosts: ${e}` });
@@ -208,7 +227,7 @@ export function useHosts() {
     void refresh();
   }, [refresh]);
 
-  return { views, scanning, outdated, refresh };
+  return { views, scanning, problem, refresh };
 }
 
 // ----------------------------------------------------------------------------------------

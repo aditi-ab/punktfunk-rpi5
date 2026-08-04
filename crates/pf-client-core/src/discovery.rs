@@ -54,8 +54,8 @@ pub enum DiscoveryEvent {
     Removed { fullname: String },
 }
 
-/// Browse continuously for the app's lifetime. The thread exits when the receiver is
-/// dropped (the send fails) or the daemon dies.
+/// Browse continuously. The worker exits when the returned receiver is dropped, or when the
+/// daemon dies — checked on a tick, so it stops even on a LAN where no advert ever arrives.
 pub fn browse() -> async_channel::Receiver<DiscoveryEvent> {
     let (tx, rx) = async_channel::unbounded();
     std::thread::Builder::new()
@@ -75,7 +75,24 @@ pub fn browse() -> async_channel::Receiver<DiscoveryEvent> {
                     return;
                 }
             };
-            while let Ok(event) = receiver.recv() {
+            // Polled rather than blocked on: the worker has to notice that its consumer went
+            // away even when NOTHING is arriving, which is the normal state of a LAN with no
+            // hosts on it. A plain `recv()` parks forever there, and the ignored-event arm below
+            // never touches `tx` — so a bounded consumer like `discover_for` would leak this
+            // thread and its daemon (another thread, and a socket bound to :5353) on every call.
+            loop {
+                // Checked at the TOP so it also covers the arms below that `continue` without
+                // ever touching `tx` — the ignored event kinds, and an advert with no IPv4
+                // address. Those are the paths that would otherwise keep this thread alive with
+                // nobody to send to.
+                if tx.is_closed() {
+                    break;
+                }
+                let event = match receiver.recv_timeout(Duration::from_millis(250)) {
+                    Ok(event) => event,
+                    Err(_) if receiver.is_disconnected() => break,
+                    Err(_) => continue,
+                };
                 let update = match event {
                     ServiceEvent::ServiceResolved(info) => {
                         let props = info.get_properties();
@@ -171,8 +188,8 @@ pub fn discover_for(timeout: Duration) -> Vec<DiscoveredHost> {
     while let Ok(event) = rx.try_recv() {
         fold(&mut adverts, event);
     }
-    // Dropping the receiver is what stops the worker: its next send fails and the thread exits,
-    // shutting the daemon down. Without this a one-shot consumer would leak a browse per call.
+    // Dropping the receiver is what stops the worker — it polls for that, so this holds even
+    // when nothing is advertising. Without it a one-shot consumer would leak a browse per call.
     drop(rx);
     sorted(adverts)
 }

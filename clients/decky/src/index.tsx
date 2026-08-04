@@ -125,7 +125,7 @@ const HostRow: FC<{ host: HostView; refresh: () => void }> = ({ host, refresh })
 };
 
 const QamPanel: FC = () => {
-  const { views, scanning, outdated, refresh } = useHosts();
+  const { views, scanning, problem, refresh } = useHosts();
   const { info: update, checking, check } = useUpdate();
 
   return (
@@ -178,15 +178,23 @@ const QamPanel: FC = () => {
             {scanning ? "Scanning…" : "Refresh"}
           </ButtonItem>
         </PanelSectionRow>
-        {/* A client too old for `punktfunk discover` explains itself rather than rendering an
-            empty list — "no hosts on your LAN" would be a lie, and the button that fixes it is
-            in this same panel. Saved hosts still list: that path is an older verb. */}
-        {outdated && (
+        {/* A client that is missing or too old explains itself rather than rendering an empty
+            list — "no hosts on your LAN" would blame the network for the plugin's problem, and
+            for the outdated case the button that fixes it is in this same panel. */}
+        {problem && (
           <PanelSectionRow>
             <Field
               focusable={false}
-              label="Update the Punktfunk client"
-              description="This client is too old to find hosts on your network. Saved hosts still work."
+              label={
+                problem === "client-unavailable"
+                  ? "Punktfunk isn’t installed"
+                  : "Update the Punktfunk client"
+              }
+              description={
+                problem === "client-unavailable"
+                  ? "This panel launches the Punktfunk app, which isn’t on this Deck yet. Install it in Desktop Mode."
+                  : "This client is too old to find hosts on your network. Saved hosts still work."
+              }
             />
           </PanelSectionRow>
         )}
@@ -195,7 +203,7 @@ const QamPanel: FC = () => {
             <Field focusable={false} description="Scanning your network…" />
           </PanelSectionRow>
         )}
-        {views.length === 0 && !scanning && (
+        {views.length === 0 && !scanning && !problem && (
           <PanelSectionRow>
             <Field
               focusable={false}

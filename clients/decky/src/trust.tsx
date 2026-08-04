@@ -55,9 +55,22 @@ export const TrustSheet: FC<{
 
   // Request access pins what the host ADVERTISES. The record's own pin is a different thing:
   // a host that already has one streams without ever opening this sheet.
-  const canRequestAccess = host.advertisedFp !== "";
+  const hasIdentity = host.advertisedFp !== "";
+  // A host advertising `pair=optional` admits anyone who pins its identity — there is no
+  // operator decision to wait for, and asking for one would be a wait that never ends and a
+  // record claiming somebody approved this Deck when nobody did. `paired` means the PIN
+  // ceremony or a real approval; the desktop client records exactly this case as *trusted*.
+  const needsApproval = host.pairPolicy !== "optional";
+  const canRequestAccess = hasIdentity && needsApproval;
+  const canTrustDirectly = hasIdentity && !needsApproval;
 
-  const requestAccess = async () => {
+  /**
+   * Pin the advertised identity, then stream.
+   *
+   * `approval` is what differs between the two doors, and it is not cosmetic: it decides whether
+   * the launch waits ~185 s for an operator AND whether the record ends up marked paired.
+   */
+  const letIn = async (approval: boolean) => {
     setBusy(true);
     setError(null);
     const { host: h, onStream: stream, onChanged: changed } = props.current;
@@ -71,15 +84,17 @@ export const TrustSheet: FC<{
         return;
       }
       changed();
-      // Step 2: the launch itself waits for the approval. The session's plain connecting screen
+      // Step 2: the launch. Under approval it PARKS — and the session's plain connecting screen
       // looks identical whether it is parked or hanging, so say what is about to happen BEFORE
-      // it starts — this toast is a patch over that, and the real fix belongs in the session.
-      toaster.toast({
-        title: "Punktfunk",
-        body: `Approve this Deck in ${h.name}’s console — the stream starts by itself`,
-        duration: 10_000,
-      });
-      stream({ requestAccess: true });
+      // it starts. That toast is a patch over that, and the real fix belongs in the session.
+      if (approval) {
+        toaster.toast({
+          title: "Punktfunk",
+          body: `Approve this Deck in ${h.name}’s console — the stream starts by itself`,
+          duration: 10_000,
+        });
+      }
+      stream({ requestAccess: approval });
       closeModal?.();
     } catch (e) {
       setError(String(e));
@@ -109,9 +124,11 @@ export const TrustSheet: FC<{
         Connect to {host.name}
       </div>
       <div style={{ opacity: 0.8, marginBottom: "1em" }}>
-        {canRequestAccess
-          ? `${host.name} needs to let this device in before it can stream.`
-          : "No advertised identity for this host — pair with a PIN instead."}
+        {!hasIdentity
+          ? "No advertised identity for this host — pair with a PIN instead."
+          : canTrustDirectly
+            ? `${host.name} accepts new devices. Connecting pins its identity so later streams are silent.`
+            : `${host.name} needs to let this device in before it can stream.`}
       </div>
       {error && (
         <div style={{ color: "#ff6b6b", marginBottom: "0.6em" }}>{error}</div>
@@ -119,8 +136,13 @@ export const TrustSheet: FC<{
 
       <Focusable style={{ display: "flex", flexDirection: "column", gap: "0.5em" }}>
         {canRequestAccess && (
-          <DialogButton disabled={busy} onClick={requestAccess}>
+          <DialogButton disabled={busy} onClick={() => void letIn(true)}>
             {busy ? <Spinner style={{ height: "1em" }} /> : "Request access"}
+          </DialogButton>
+        )}
+        {canTrustDirectly && (
+          <DialogButton disabled={busy} onClick={() => void letIn(false)}>
+            {busy ? <Spinner style={{ height: "1em" }} /> : "Connect"}
           </DialogButton>
         )}
         <DialogButton disabled={busy} onClick={usePin}>
