@@ -23,8 +23,9 @@ import android.view.InputDevice
  * Input: parse ([DsDevice.parseState]) → typed mirror on an [GamepadRouter.ExternalPad] (buttons
  * diffed, axes on-change — the exit chord participates like any pad) + the rich plane (touch
  * normalized to the wire's 0..65535 screen space on-change; motion forwarded per report in raw
- * device units, the wire's contract). The wire slot is claimed lazily on the FIRST parsed report
- * and freed on unplug/[stop], so indices never leak.
+ * device units, the wire's contract). The wire slot is claimed when the capture engages, with the
+ * first parsed report as the fallback for a claim that found no free index, and freed on
+ * unplug/[stop], so indices never leak.
  *
  * Feedback: implements [GamepadFeedback.PadFeedbackSink] — rumble / trigger / lightbar / player
  * LED events addressed to this pad's wire index become USB output reports on the physical pad
@@ -81,10 +82,9 @@ class DsCapture(
     /**
      * Tier-A pad audio, bound by the app layer (which owns the session handle).
      *
-     * [start] is called once the router has assigned this pad a wire index — not at claim time,
-     * because the index does not exist until the first report arrives and the host addresses the
-     * `0xD1` stream by that index. [stop] is called **before** the USB link closes, and must not
-     * return until nothing is still writing to the descriptor.
+     * [start] is called once the router has assigned this pad a wire index, which the host uses to
+     * address the `0xD1` stream. [stop] is called **before** the USB link closes — on [stop] and on
+     * unplug alike — and must not return until nothing is still writing to the descriptor.
      */
     interface PadAudioHook {
         fun start(pad: Int, fd: Int)
@@ -133,6 +133,7 @@ class DsCapture(
         // (the same init hid-playstation/SDL send on open).
         if (m != DsDevice.Model.DUALSHOCK4) usb.writeRaw(0, DsDevice.ds5InitReport(m))
         Log.i(TAG, "Sony pad captured over USB: PID=0x%04x model=%s".format(dev.productId, m))
+        ensureSlot(m)
         onActiveChanged?.invoke(true)
         return true
     }
@@ -142,14 +143,7 @@ class DsCapture(
         // Before anything touches the link: the pad-audio renderer borrows this connection's
         // descriptor, and `usb.stop()` closes it. The hook does not return until its thread is
         // joined, so ordering this first is what makes the borrow sound.
-        if (padAudioStarted) {
-            padAudioStarted = false
-            // stop() joins the render thread, so nothing is using the descriptor after it returns
-            // — only then is it safe to close the connection that owns it.
-            pad?.let { padAudio?.stop(it.index) }
-            padAudioConn?.close()
-            padAudioConn = null
-        }
+        stopPadAudio()
         val m = model
         if (m != null) {
             // The interfaces are about to release with the kernel driver still detached — a
@@ -170,52 +164,94 @@ class DsCapture(
     private fun onReport(report: ByteArray, len: Int) {
         val m = model ?: return
         if (!DsDevice.parseState(m, report, len, state)) return
-        val p = pad ?: router.openExternal(m.pref)?.also {
-            pad = it
-            // The wire index exists from here on, and the host addresses pad audio by it. Fired on
-            // the link thread, once per capture.
-            if (!padAudioStarted && padAudio != null) {
-                // A dedicated connection, NOT usb.fileDescriptor — see padAudioConn.
-                val conn = usb.openAuxConnection()
-                val fd = conn?.fileDescriptor ?: -1
-                if (fd >= 0) {
-                    padAudioConn = conn
-                    padAudioStarted = true
-                    // Real-world self test, opt-in: `adb shell setprop debug.punktfunk.pad_audio_selftest 3`
-                    // drives the voice coils for N seconds through the actual client path before
-                    // the renderer takes over — the one check that proves the descriptor, the
-                    // interface claim and the write path all work on THIS device, without needing
-                    // a host to be streaming. Same convention as debug.punktfunk.force_parts.
-                    val secs = runCatching {
-                        Class.forName("android.os.SystemProperties")
-                            .getMethod("get", String::class.java, String::class.java)
-                            .invoke(null, "debug.punktfunk.pad_audio_selftest", "0") as String
-                    }.getOrNull()?.toIntOrNull() ?: 0
-                    if (secs > 0) {
-                        // Diagnostic mode: the self test OWNS this descriptor for the capture, and
-                        // the renderer must not also drive it — two engines on one usbfs
-                        // descriptor reap each other's completions, which is precisely the fault
-                        // this test exists to expose.
-                        Thread({
-                            val r = NativeBridge.nativePadAudioSelfTest(fd, secs, 60)
-                            Log.i(TAG, "pad audio self-test → ${if (r > 0) "PASS ($r frames)" else "FAIL ($r)"}")
-                        }, "pf-pad-selftest").start()
-                    } else {
-                        padAudio?.start(it.index, fd)
-                    }
-                } else {
-                    conn?.close()
-                    Log.w(TAG, "pad audio: could not open a second USB connection")
-                }
-            }
-            Log.i(TAG, "captured $m → wire pad ${it.index}")
-        } ?: return // all 16 wire indices taken — drop until one frees
+        // Normally claimed already, at capture time; this is the retry for a capture that engaged
+        // while every wire index was taken.
+        val p = pad ?: ensureSlot(m) ?: return // all 16 taken — drop until one frees
         mirrorTyped(p)
         mirrorRich(p, m)
     }
 
+    /**
+     * Claim this capture's wire slot and start pad audio on it. Idempotent; null when all 16
+     * indices are taken.
+     *
+     * Claimed when the capture engages rather than on the first report, because a pad that reports
+     * nothing is still a pad: with the lazy claim, a captured-but-silent pad left the host with no
+     * arrival, hence no virtual pad, no pad-audio capability and so no `0xD1` — a renderer sitting
+     * at zero frames, indistinguishable from a broken pipeline (it took a physical replug to
+     * clear). Callable from the main thread (capture start) and the link thread (the fallback).
+     */
+    @Synchronized
+    private fun ensureSlot(m: DsDevice.Model): GamepadRouter.ExternalPad? {
+        pad?.let { return it }
+        val p = router.openExternal(m.pref) ?: return null
+        pad = p
+        Log.i(TAG, "captured $m → wire pad ${p.index}")
+        // The wire index exists from here on, and the host addresses pad audio by it.
+        startPadAudio(p.index)
+        return p
+    }
+
+    /** Hand the renderer its own descriptor. Caller holds the monitor; fires once per capture. */
+    private fun startPadAudio(index: Int) {
+        val hook = padAudio ?: return
+        if (padAudioStarted) return
+        // A dedicated connection, NOT usb.fileDescriptor — see padAudioConn.
+        val conn = usb.openAuxConnection()
+        val fd = conn?.fileDescriptor ?: -1
+        if (fd < 0) {
+            conn?.close()
+            Log.w(TAG, "pad audio: could not open a second USB connection")
+            return
+        }
+        padAudioConn = conn
+        padAudioStarted = true
+        // Real-world self test, opt-in: `adb shell setprop debug.punktfunk.pad_audio_selftest 3`
+        // drives the voice coils for N seconds through the actual client path before the renderer
+        // takes over — the one check that proves the descriptor, the interface claim and the write
+        // path all work on THIS device, without needing a host to be streaming. Same convention as
+        // debug.punktfunk.force_parts.
+        val secs = runCatching {
+            Class.forName("android.os.SystemProperties")
+                .getMethod("get", String::class.java, String::class.java)
+                .invoke(null, "debug.punktfunk.pad_audio_selftest", "0") as String
+        }.getOrNull()?.toIntOrNull() ?: 0
+        if (secs > 0) {
+            // Diagnostic mode: the self test OWNS this descriptor for the capture, and the renderer
+            // must not also drive it — two engines on one usbfs descriptor reap each other's
+            // completions, which is precisely the fault this test exists to expose.
+            Thread({
+                val r = NativeBridge.nativePadAudioSelfTest(fd, secs, 60)
+                Log.i(TAG, "pad audio self-test → ${if (r > 0) "PASS ($r frames)" else "FAIL ($r)"}")
+            }, "pf-pad-selftest").start()
+        } else {
+            hook.start(index, fd)
+        }
+    }
+
+    /**
+     * Stop the renderer, then close the connection whose descriptor it borrows — in that order.
+     *
+     * Runs on [stop] and on unplug alike. Skipping it on unplug left the render thread writing to a
+     * descriptor whose device was gone, leaked the connection, and — because the started flag stayed
+     * set and the native tier-A registry stayed armed for that index — cost the pad both its pad
+     * audio and its wire rumble on the way back in.
+     */
+    @Synchronized
+    private fun stopPadAudio() {
+        if (!padAudioStarted) return
+        padAudioStarted = false
+        // The hook's stop joins the render thread, so nothing is using the descriptor once it
+        // returns — only then is it safe to close the connection that owns it.
+        pad?.let { padAudio?.stop(it.index) }
+        padAudioConn?.close()
+        padAudioConn = null
+    }
+
     private fun onLinkClosed() {
         Log.i(TAG, "Sony USB link closed (unplug)")
+        // Before releaseSlot(), which forgets the wire index the renderer is addressed by.
+        stopPadAudio()
         disarmBackstop()
         val wasActive = model != null
         model = null

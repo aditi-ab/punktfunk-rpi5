@@ -160,10 +160,10 @@ data class Settings(
      * Render the host's DualSense **voice-coil haptics** on a captured USB pad (tier A).
      *
      * The pad's own 4-channel audio device carries them, driven directly over usbfs — Android's
-     * audio framework denylists that device by VID/PID, so there is no supported route to it. When
-     * this is on and the pad is captured, wire rumble for that pad is SUPPRESSED rather than mixed:
-     * the DualSense's firmware treats audio haptics and classic rumble as mutually exclusive, so
-     * the arbitration is a selection. Off, or on an uncaptured/Bluetooth pad, the pad stays on
+     * audio framework denylists that device by VID/PID, so there is no supported route to it. The
+     * two kinds are arbitrated rather than mixed, and on evidence: wire rumble is suppressed only
+     * while haptics frames are actually arriving, so a title that drives classic rumble and sends
+     * no haptics audio keeps rumbling. Off, or on an uncaptured/Bluetooth pad, the pad stays on
      * ordinary rumble (tier C), which on this client already drives the same actuators.
      */
     val padHaptics: Boolean = true,
