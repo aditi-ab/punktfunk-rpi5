@@ -26,9 +26,7 @@
 #![deny(clippy::undocumented_unsafe_blocks)]
 
 use anyhow::{anyhow, Context, Result};
-use punktfunk_core::config::{
-    mtu1500_shard_payload_for, CompositorPref, FecConfig, FecScheme, GamepadPref, Role,
-};
+use punktfunk_core::config::{CompositorPref, FecConfig, FecScheme, GamepadPref, Role};
 use punktfunk_core::input::{InputEvent, InputKind};
 use punktfunk_core::packet::{FLAG_PIC, FLAG_PROBE, FLAG_SOF};
 use punktfunk_core::quic::{
@@ -72,6 +70,9 @@ use input::{input_thread, ClientInput};
 /// The Hello→Welcome→Start negotiation (plan §W1); `serve_session` calls `handshake::negotiate`
 /// after the pairing gate.
 mod handshake;
+/// MTU resilience for the video data plane: `PUNKTFUNK_WIRE_MTU` override, the per-session
+/// path-MTU watch on the control connection, and the per-peer learned shard-payload clamp.
+mod wire_mtu;
 
 /// The mid-stream control task (plan §W1); `serve_session` spawns `control::run` after the
 /// handshake to multiplex renegotiation / speed-test control messages onto the data-plane channels.

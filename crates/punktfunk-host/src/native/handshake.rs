@@ -548,7 +548,12 @@ pub(super) async fn negotiate(
         // per-datagram loss on Wi-Fi — the "100 Mbps badly fails on the phone" root cause.
         // Negotiated, so the client follows. Jumbo (≈8900) is a future negotiated bump (needs
         // MAX_DATAGRAM_BYTES raised + end-to-end 9000 MTU).
-        shard_payload: mtu1500_shard_payload_for(peer.ip()) as u16,
+        // Resolution order (wire_mtu.rs): `PUNKTFUNK_WIRE_MTU` operator override, then a path
+        // budget learned from a prior session whose QUIC MTU discovery settled below the
+        // video-datagram ceiling (the "VPN on the host blackholes every video packet" field
+        // shape — small flows pass, the stream is an endless black screen), then this family
+        // default. Healthy paths take the default branch and are byte-identical to before.
+        shard_payload: wire_mtu::negotiated_shard_payload(peer.ip()) as u16,
         encrypt: true,
         key,
         salt,
@@ -729,6 +734,10 @@ pub(super) async fn negotiate(
     let start =
         Start::decode(&io::read_msg(recv).await?).map_err(|e| anyhow!("Start decode: {e:?}"))?;
     bringup.mark("start");
+    // The session is real: watch this connection's MTU discovery settle and turn it into a
+    // path verdict (WARN + learned clamp for the next session on a constrained path; clears a
+    // stale clamp on a healthy one). Bounded ~10 s task, ends by itself.
+    wire_mtu::spawn_watch(conn.clone(), welcome.shard_payload as usize);
     Ok::<_, anyhow::Error>((
         hello,
         welcome,
