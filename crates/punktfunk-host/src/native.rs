@@ -1091,6 +1091,30 @@ async fn serve_session(
     // just never fires then.
     let (cursor_shape_tx, cursor_shape_rx) =
         tokio::sync::mpsc::unbounded_channel::<punktfunk_core::quic::CursorShape>();
+    // Mid-session shard renegotiation (design/shard-payload-reneg.md Phase 2): the wire-MTU
+    // watcher decides (constrained-path shrink / ack-gated jumbo grow), the control task
+    // writes the `ShardPayloadChanged` and routes the acks back, and the data-plane loop
+    // applies `Session::set_shard_payload` between AUs (drained next to `bitrate_rx`).
+    // Channels are wired unconditionally (they just never fire); the DRIVER exists only for
+    // a client that advertised `Hello::max_shard_payload` on a non-chunk-aligned session —
+    // PyroWave clients parse chunk-aligned AUs in windows of the `Welcome` value pinned at
+    // session start (read once over the C ABI), so those sessions keep the leg-1
+    // next-session clamp instead of a mid-stream re-key.
+    let (shard_change_tx, shard_change_rx) = tokio::sync::mpsc::unbounded_channel::<u16>();
+    let (shard_ack_tx, shard_ack_rx) = tokio::sync::mpsc::unbounded_channel::<u16>();
+    let (shard_apply_tx, shard_apply_rx) = std::sync::mpsc::channel::<usize>();
+    let shard_reneg = (hello.max_shard_payload > 0 && codec != crate::encode::Codec::PyroWave)
+        .then_some(wire_mtu::ShardReneg {
+            client_ceiling: hello.max_shard_payload,
+            change_tx: shard_change_tx,
+            ack_rx: shard_ack_rx,
+            apply_tx: shard_apply_tx,
+        });
+    // The session is real: watch this connection's MTU discovery settle and turn it into a
+    // path verdict (WARN + learned clamp for the next session on a constrained path; clears
+    // a stale clamp on a healthy one) — and, with the driver above, heal or grow THIS
+    // session mid-stream. Bounded ~10 s task unless a jumbo grow leaves it as revert guard.
+    wire_mtu::spawn_watch(conn.clone(), welcome.shard_payload as usize, shard_reneg);
     // Negotiated cursor forwarding: the HOST_CAP_CURSOR bit the Welcome advertised, read back
     // rather than recomputed (`handshake::cursor_forward` computed it once, with the encoder
     // blend-capability gate — re-running it here could drift, and would re-probe).
@@ -1146,6 +1170,8 @@ async fn serve_session(
         probe_result_rx,
         reconfig_result_rx,
         retarget_rx,
+        shard_change_rx,
+        shard_ack_tx,
         cursor_shape_rx,
         cursor_client_draws,
         clip_enabled,
@@ -1588,6 +1614,7 @@ async fn serve_session(
                         keyframe: keyframe_rx,
                         rfi: rfi_rx,
                         bitrate_rx,
+                        shard_rx: shard_apply_rx,
                         compositor,
                         gamescope_route,
                         bitrate_kbps,

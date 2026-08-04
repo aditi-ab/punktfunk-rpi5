@@ -603,6 +603,31 @@ impl Session {
         self.packetizer.set_fec_percent(pct);
     }
 
+    /// Host: live-swap the wire shard payload between AUs (mid-session shard renegotiation,
+    /// design/shard-payload-reneg.md). Affects the next sealed AU; call only between AUs
+    /// (never with a `StreamedAu` in flight — see [`Packetizer::set_shard_payload`]). The new
+    /// value must satisfy the exact bounds `Config::validate` imposed on the negotiated one
+    /// (even, > 0, fits a datagram, block count fits the wire) — validated here against a
+    /// probe of the session config. The PROTOCOL side is the caller's contract: a current
+    /// client reassembles any in-bounds size per-frame, but a shrink may be sent immediately
+    /// while a grow must be client-acked and never exceed the client's advertised
+    /// `Hello::max_shard_payload` ceiling.
+    pub fn set_shard_payload(&mut self, shard_payload: usize) -> Result<()> {
+        if self.config.role != Role::Host {
+            return Err(PunktfunkError::InvalidArg(
+                "set_shard_payload called on a client session",
+            ));
+        }
+        // Full `Config::validate` parity, zero drift: probe a copy (its key/salt copies are
+        // zeroized on drop) rather than re-spelling the shard clauses here.
+        let mut probe = self.config.clone();
+        probe.shard_payload = shard_payload;
+        probe.validate()?;
+        self.config.shard_payload = shard_payload;
+        self.packetizer.set_shard_payload(shard_payload);
+        Ok(())
+    }
+
     /// The current FEC recovery percentage (host side).
     pub fn fec_percent(&self) -> u8 {
         self.packetizer.fec_percent()
@@ -1059,5 +1084,148 @@ mod wire_equivalence_tests {
             !saw_partial,
             "unflagged AUs must never be delivered partial"
         );
+    }
+
+    /// The low-MTU PyroWave guarantee (design/shard-payload-reneg.md): mid-session
+    /// renegotiation is gated OFF for chunk-aligned sessions, so a constrained path serves
+    /// them through the leg-1 SESSION-START clamp instead — the learned budget (or
+    /// `PUNKTFUNK_WIRE_MTU`) sizes `Welcome::shard_payload`, and everything chunk-aligned
+    /// derives from that ONE number fixed at the handshake: the host packetizes at it, the
+    /// client's parse window reads it back ([`Session::shard_payload`] → the C-ABI
+    /// `punktfunk_connection_shard_payload` every embedder walks windows with), and partial
+    /// delivery zero-fills exact windows of it. Pin that consistency at the clamp shapes a
+    /// constrained path actually produces: the WARP/Tailscale budget (1216) and the floor
+    /// (512) — chunk-aligned frames deliver, lose whole windows (never splice), and the
+    /// window arithmetic matches the session value end to end.
+    #[test]
+    fn chunk_aligned_sessions_work_at_clamped_shard_sizes() {
+        use crate::packet::USER_FLAG_CHUNK_ALIGNED;
+        for shard in [1216usize, crate::config::MIN_SHARD_PAYLOAD] {
+            let mk = |role| Config {
+                role,
+                phase: ProtocolPhase::P2Punktfunk,
+                fec: FecConfig {
+                    scheme: FecScheme::Gf16,
+                    fec_percent: 0, // no parity — any drop leaves a hole
+                    max_data_per_block: 64,
+                },
+                shard_payload: shard,
+                max_frame_bytes: 8 * 1024 * 1024,
+                encrypt: true,
+                key: SessionKey::Aes128Gcm([7u8; 16]),
+                salt: [3, 1, 4, 1],
+                loopback_drop_period: 0,
+            };
+            let (h, c) = crate::transport::loopback_pair(3, 1);
+            let mut host = Session::new(mk(Role::Host), Box::new(h)).unwrap();
+            let mut client = Session::new(mk(Role::Client), Box::new(c)).unwrap();
+            client.set_deliver_partial_frames(true);
+            // The window every embedder parses with IS the clamped session value.
+            assert_eq!(client.shard_payload(), shard);
+            assert_eq!(host.shard_payload(), shard);
+
+            let frame = pattern(8 * shard);
+            host.submit_frame(&frame, 1_000, USER_FLAG_CHUNK_ALIGNED)
+                .unwrap();
+            let mut got_partial = None;
+            let mut completes = 0;
+            for i in 0..80u64 {
+                host.submit_frame(&pattern(shard), 2_000 + i, USER_FLAG_CHUNK_ALIGNED)
+                    .unwrap();
+                loop {
+                    match client.poll_frame() {
+                        Ok(f) if !f.complete => got_partial = Some(f),
+                        Ok(_) => completes += 1,
+                        Err(PunktfunkError::NoFrame) => break,
+                        Err(e) => panic!("shard {shard}: unexpected: {e}"),
+                    }
+                }
+            }
+            let p = got_partial.expect("the lossy frame must be delivered partial");
+            assert_eq!(p.data.len(), frame.len(), "shard {shard}");
+            // Loss lands on exact `shard`-sized window boundaries: zeroed windows for the
+            // dropped datagrams, byte-identical survivors — nothing spliced across windows.
+            let mut zero_windows = 0;
+            for w in 0..8 {
+                let win = &p.data[w * shard..(w + 1) * shard];
+                if win.iter().all(|&b| b == 0) {
+                    zero_windows += 1;
+                } else {
+                    assert_eq!(
+                        win,
+                        &frame[w * shard..(w + 1) * shard],
+                        "shard {shard}: window {w} corrupt"
+                    );
+                }
+            }
+            assert!(
+                (1..8).contains(&zero_windows),
+                "shard {shard}: dropped shards zero-filled (got {zero_windows})"
+            );
+            assert!(
+                completes > 40,
+                "shard {shard}: surviving filler frames flow normally"
+            );
+        }
+    }
+
+    /// Mid-session shard renegotiation end to end over the SEALED loopback wire
+    /// (design/shard-payload-reneg.md): one host session re-keys its packetizer between AUs
+    /// — shrink, jumbo grow, revert — through one continuous crypto/replay stream, and one
+    /// client session must DELIVER every frame byte-identically (the vacuous-green lesson:
+    /// assert delivered frames, never the absence of errors).
+    #[test]
+    fn mid_session_shard_swap_delivers_frames_over_the_sealed_wire() {
+        let mk = |role: Role| {
+            let mut c = host_cfg(FecScheme::Gf16, 20, true);
+            c.role = role;
+            c.shard_payload = 1408;
+            c.fec.max_data_per_block = 64;
+            c
+        };
+        let (ht, ct) = loopback_pair(0, 0);
+        let mut host = Session::new(mk(Role::Host), Box::new(ht)).unwrap();
+        let mut client = Session::new(mk(Role::Client), Box::new(ct)).unwrap();
+
+        let phases: [(usize, &[usize]); 4] = [
+            (1408, &[3000, 3 * 1408]), // the negotiated default (incl. exact multiple)
+            (512, &[2000, 5 * 512 + 17]), // shrink — the mid-session VPN heal
+            (8908, &[100_000]),        // grow — jumbo on a 9000-MTU LAN
+            (1216, &[2 * 1216 + 9]),   // revert — a mis-proven jumbo hop self-corrects
+        ];
+        let mut pts = 0u64;
+        let mut delivered = 0usize;
+        for (shard, lens) in phases {
+            host.set_shard_payload(shard).unwrap();
+            assert_eq!(host.shard_payload(), shard);
+            for &len in lens {
+                pts += 1_000_000;
+                let src = pattern(len);
+                host.submit_frame(&src, pts, 0).unwrap();
+                let f = client
+                    .poll_frame()
+                    .unwrap_or_else(|e| panic!("shard {shard}: frame must be DELIVERED ({e})"));
+                assert_eq!(
+                    f.data, src,
+                    "shard {shard}: {len} B frame must be byte-identical"
+                );
+                assert!(f.complete);
+                delivered += 1;
+            }
+        }
+        assert_eq!(delivered, 6, "every submitted frame must be delivered");
+        // The setter is host-side machinery: a client session must refuse it, and an
+        // invalid size (odd / oversized) must be rejected without touching the live config.
+        assert!(client.set_shard_payload(1408).is_err());
+        assert!(
+            host.set_shard_payload(1407).is_err(),
+            "odd must be rejected"
+        );
+        assert!(
+            host.set_shard_payload(crate::config::max_shard_payload() + 2)
+                .is_err(),
+            "oversized must be rejected"
+        );
+        assert_eq!(host.shard_payload(), 1216, "failed swaps must not stick");
     }
 }

@@ -59,7 +59,25 @@ fn stream_transport_idle(idle: std::time::Duration) -> Arc<quinn::TransportConfi
     // PINGs quinn already expects to lose above a constrained hop — a lost probe settles the
     // search lower, exactly as it did before.
     let mut mtud = quinn::MtuDiscoveryConfig::default();
-    mtud.upper_bound(crate::config::video_datagram_udp_ceiling() as u16);
+    // Jumbo opt-in (design/shard-payload-reneg.md Phase 2): with `PUNKTFUNK_JUMBO=1` /
+    // `PUNKTFUNK_WIRE_MTU` > 1500 set, discovery probes up to the sealed JUMBO datagram
+    // size so a settled connection can PROVE a jumbo path — the actual grow stays
+    // client-ack-gated (`native/wire_mtu.rs`). The ceiling is per-ENDPOINT, not
+    // per-connection: with the opt-in set, connections to non-jumbo peers spend a few extra
+    // failed probes (one PTO each) settling lower; zero cost for anyone who doesn't opt in.
+    // Derived with the IPv4 overhead — a v6 peer's sealed jumbo target is smaller, so the
+    // ceiling covers it and discovery settles at the v6 path's own budget.
+    let probe_ceiling = match crate::config::jumbo_wire_mtu() {
+        Some(mtu) => {
+            let shard = crate::config::jumbo_shard_payload_for(
+                mtu,
+                std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+            );
+            crate::config::sealed_datagram_bytes(shard) as u16
+        }
+        None => crate::config::video_datagram_udp_ceiling() as u16,
+    };
+    mtud.upper_bound(probe_ceiling);
     t.mtu_discovery_config(Some(mtud));
     Arc::new(t)
 }

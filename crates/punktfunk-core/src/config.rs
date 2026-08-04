@@ -373,16 +373,54 @@ pub fn shard_payload_for_udp_budget(udp_budget: usize, peer: core::net::IpAddr) 
     p.clamp(MIN_SHARD_PAYLOAD, mtu1500_shard_payload_for(peer))
 }
 
+/// The family's IP+UDP header bytes between an on-wire IP MTU and its UDP payload budget —
+/// 28 for IPv4 (and IPv4-mapped), 48 for IPv6.
+fn ip_udp_overhead(peer: core::net::IpAddr) -> usize {
+    match peer {
+        core::net::IpAddr::V4(_) => 28,
+        core::net::IpAddr::V6(v6) if v6.to_ipv4_mapped().is_some() => 28,
+        core::net::IpAddr::V6(_) => 48,
+    }
+}
+
 /// [`shard_payload_for_udp_budget`] for an operator-supplied ON-WIRE IP MTU (the number
 /// `netsh interface ipv4 show subinterfaces` / `ip link` shows): subtracts the family's IP+UDP
 /// headers first — 28 for IPv4 (and IPv4-mapped), 48 for IPv6.
 pub fn shard_payload_for_wire_mtu(wire_mtu: usize, peer: core::net::IpAddr) -> usize {
-    let ip_udp = match peer {
-        core::net::IpAddr::V4(_) => 28,
-        core::net::IpAddr::V6(v6) if v6.to_ipv4_mapped().is_some() => 28,
-        core::net::IpAddr::V6(_) => 48,
-    };
-    shard_payload_for_udp_budget(wire_mtu.saturating_sub(ip_udp), peer)
+    shard_payload_for_udp_budget(wire_mtu.saturating_sub(ip_udp_overhead(peer)), peer)
+}
+
+/// The operator's jumbo-frames opt-in (design/shard-payload-reneg.md Phase 2): the target
+/// on-wire IP MTU, or `None` = no opt-in (nothing above the 1500-default wire is ever probed
+/// or grown to). One knob, one code path: a `PUNKTFUNK_WIRE_MTU` above the standard 1500
+/// derives the target from the operator's number; `PUNKTFUNK_JUMBO=1` is the fixed 9000
+/// profile for operators who don't want to think in MTUs. Raising the wire above 1500 is
+/// only ever an ACK-GATED mid-session grow toward a client that advertised
+/// [`max_shard_payload`] headroom — sessions still START at the family default.
+pub fn jumbo_wire_mtu() -> Option<usize> {
+    if let Ok(v) = std::env::var("PUNKTFUNK_WIRE_MTU") {
+        if let Ok(mtu) = v.trim().parse::<usize>() {
+            if mtu > 1500 {
+                return Some(mtu);
+            }
+        }
+    }
+    match std::env::var("PUNKTFUNK_JUMBO") {
+        Ok(v) if v.trim() == "1" => Some(9000),
+        _ => None,
+    }
+}
+
+/// The jumbo sibling of [`shard_payload_for_wire_mtu`]: the largest even shard payload whose
+/// sealed datagram fits `wire_mtu`, clamped to the RECEIVE ceiling ([`max_shard_payload`])
+/// instead of the family 1500-default — the up-leg's grow target. Still floored at
+/// [`MIN_SHARD_PAYLOAD`].
+pub fn jumbo_shard_payload_for(wire_mtu: usize, peer: core::net::IpAddr) -> usize {
+    let p = wire_mtu
+        .saturating_sub(ip_udp_overhead(peer))
+        .saturating_sub(HEADER_LEN + CRYPTO_OVERHEAD);
+    let p = p - p % 2; // FEC requires even shards
+    p.clamp(MIN_SHARD_PAYLOAD, max_shard_payload())
 }
 
 /// Everything needed to construct a [`Session`](crate::session::Session).
@@ -624,6 +662,29 @@ mod tests {
         // 1280 wire − 28 − 64 = 1188 (v4); − 48 − 64 = 1168 (v6).
         assert_eq!(shard_payload_for_wire_mtu(1280, v4), 1188);
         assert_eq!(shard_payload_for_wire_mtu(1280, v6), 1168);
+    }
+
+    /// Jumbo grow-target sizing (the up-leg, design/shard-payload-reneg.md): even, sealed
+    /// fits the wire, clamped to the RECEIVE ceiling instead of the family 1500-default —
+    /// and the standard 9000 profile lands on the exact documented value.
+    #[test]
+    fn jumbo_shard_payload_math() {
+        use core::net::IpAddr;
+        let v4: IpAddr = "192.168.1.50".parse().unwrap();
+        let v6: IpAddr = "fd00::50".parse().unwrap();
+        // 9000 − 28 (IPv4+UDP) − 64 (header+crypto) = 8908 even; sealed 8972 ≤ the 9216
+        // datagram ceiling. The v6 sibling: 9000 − 48 − 64 = 8888.
+        assert_eq!(jumbo_shard_payload_for(9000, v4), 8908);
+        assert_eq!(sealed_datagram_bytes(8908), 8972);
+        assert!(sealed_datagram_bytes(8908) <= MAX_DATAGRAM_BYTES);
+        assert_eq!(jumbo_shard_payload_for(9000, v6), 8888);
+        // An operator MTU larger than the receive path clamps to the ceiling, smaller ones
+        // track the wire, and degenerate ones floor at MIN_SHARD_PAYLOAD.
+        assert_eq!(jumbo_shard_payload_for(64_000, v4), max_shard_payload());
+        let p = jumbo_shard_payload_for(4000, v4);
+        assert_eq!(p % 2, 0);
+        assert!(sealed_datagram_bytes(p) <= 4000 - 28);
+        assert_eq!(jumbo_shard_payload_for(100, v4), MIN_SHARD_PAYLOAD);
     }
 
     /// Family selection: genuine v6 remotes get the v6 size; v4 — including the IPv4-mapped v6

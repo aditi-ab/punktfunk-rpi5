@@ -70,7 +70,17 @@ pub const CRYPTO_OVERHEAD: usize = 8 + crate::crypto::TAG_LEN;
 
 /// Largest UDP datagram the core will send or accept. `Config::validate` bounds
 /// `shard_payload` so `HEADER_LEN + shard_payload + CRYPTO_OVERHEAD ≤ MAX_DATAGRAM_BYTES`.
-pub const MAX_DATAGRAM_BYTES: usize = 2048;
+///
+/// Sized for **jumbo frames** (design/shard-payload-reneg.md W0.2): a 9000-MTU LAN carries
+/// ~8908-byte shards (sealed 8972-byte UDP payloads), and every receive path — the transport
+/// `RECV_BUF`, the session's `recvmmsg` ring — is sized from this constant, so a deployed
+/// client can accept a jumbo geometry the moment its host negotiates one. The ring cost is
+/// 128 × ~9 KiB ≈ 1.1 MiB per **client** session (lazily allocated on first poll; hosts never
+/// allocate it) — measured against the ~256 KiB it was at 2048, an acceptable static price
+/// for never having to resize buffers on a mid-session grow. Senders still derive their
+/// shard payload from the path MTU (`config::mtu1500_shard_payload*`, the wire-MTU clamps);
+/// this is the acceptance ceiling, not a transmit size.
+pub const MAX_DATAGRAM_BYTES: usize = 9216;
 
 /// Fixed per-packet header. `#[repr(C)]`, no padding, zero-copy (de)serializable.
 #[repr(C)]
