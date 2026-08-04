@@ -35,7 +35,9 @@ mod widgets;
 #[cfg(any(target_os = "linux", windows))]
 pub use library::{LibraryGame, LibraryPhase, LibraryShared};
 #[cfg(any(target_os = "linux", windows))]
-pub use model::{ConsoleBus, ConsoleCmd, ConsoleShared, HostRow, PairPhase, WakeStatus};
+pub use model::{
+    ConsoleBus, ConsoleCmd, ConsoleShared, HostRow, PairPhase, ProfileChip, WakeStatus,
+};
 #[cfg(any(target_os = "linux", windows))]
 pub use shell::ConsoleOptions;
 #[cfg(any(target_os = "linux", windows))]

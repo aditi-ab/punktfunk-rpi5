@@ -323,6 +323,7 @@ fun StreamScreen(session: ActiveSession, onDisconnect: () -> Unit) {
         // controller (Automatic). Built here, released on dispose.
         val router = GamepadRouter(
             context, handle, initialSettings.gamepad, initialSettings.gamepadForwarding,
+            initialSettings.systemButtonsForward(), initialSettings.guideGestureEnabled(),
         )
         activity?.gamepadRouter = router
         // Select+Start+L1+R1 chord leaves the stream — a deliberate quit (signal it so the host skips

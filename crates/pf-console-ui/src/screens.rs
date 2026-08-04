@@ -7,6 +7,7 @@ pub(crate) mod add_host;
 pub(crate) mod home;
 pub(crate) mod library;
 pub(crate) mod pair;
+pub(crate) mod pin_hosts;
 pub(crate) mod settings;
 
 use crate::glyphs::Hint;
@@ -57,6 +58,9 @@ pub(crate) struct ConnectIntent {
     /// shell shows a "waiting for approval" takeover instead of "connecting", and the
     /// binary parks on a long budget and persists the host as paired once let in.
     pub request_access: bool,
+    /// One-off settings-profile id for this launch (a pinned card's connect); `None`
+    /// keeps the host's default binding.
+    pub profile: Option<String>,
 }
 
 pub(crate) enum Nav {
@@ -91,6 +95,7 @@ pub(crate) enum Screen {
     Settings(settings::SettingsScreen),
     AddHost(add_host::AddHostScreen),
     Pair(pair::PairScreen),
+    PinHosts(pin_hosts::PinHostsScreen),
 }
 
 impl Screen {
@@ -106,6 +111,7 @@ impl Screen {
             Screen::Settings(s) => s.menu(ev, ctx, fx),
             Screen::AddHost(s) => s.menu(ev, ctx, fx),
             Screen::Pair(s) => s.menu(ev, ctx, fx),
+            Screen::PinHosts(s) => s.menu(ev, ctx, fx),
         }
     }
 
@@ -152,6 +158,7 @@ impl Screen {
             Screen::Settings(_) => "Settings".into(),
             Screen::AddHost(_) => "Add Host".into(),
             Screen::Pair(s) => format!("Pair with {}", s.host_name()),
+            Screen::PinHosts(s) => format!("Pin \u{201c}{}\u{201d}", s.profile_name()),
         }
     }
 
@@ -162,6 +169,7 @@ impl Screen {
             Screen::Settings(s) => s.hints(ctx),
             Screen::AddHost(s) => s.hints(ctx),
             Screen::Pair(s) => s.hints(ctx),
+            Screen::PinHosts(s) => s.hints(ctx),
         }
     }
 
@@ -183,6 +191,7 @@ impl Screen {
             Screen::Settings(s) => s.render(canvas, rect, k, dt, fonts, ctx),
             Screen::AddHost(s) => s.render(canvas, rect, k, dt, fonts, ctx),
             Screen::Pair(s) => s.render(canvas, rect, k, dt, fonts, ctx),
+            Screen::PinHosts(s) => s.render(canvas, rect, k, dt, fonts, ctx),
         }
     }
 }

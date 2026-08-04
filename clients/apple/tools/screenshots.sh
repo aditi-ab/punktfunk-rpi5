@@ -11,8 +11,14 @@
 # The captured pixels are exactly App Store Connect's required sizes:
 #   mac        2880×1800   (a 1× display yields 1440×900 — also accepted)
 #   iphone-6.9 1320×2868   (portrait)  /  2868×1320 (the landscape hero)
-#   ipad-13    2064×2752   (portrait)  /  2752×2064 (the landscape hero)
+#   ipad-13    2064×2752   (portrait)
 #   appletv    1920×1080
+#
+# A `.landscape` scene rotates on iPhone but NOT on iPad: an iPad app that supports multitasking
+# is resizable, and iPadOS ignores `requestGeometryUpdate` orientation requests for it — the app
+# follows the device, and simctl cannot rotate a simulated device. The iPad set is therefore
+# portrait throughout (a valid App Store size, and uniform, which the gallery prefers). To get a
+# landscape iPad hero, rotate the Simulator by hand (⌘←) and re-run just that scene.
 #
 # Requirements:
 #   • macOS target: just the Swift toolchain (`swift build`) + a one-time Screen Recording grant
@@ -35,7 +41,11 @@ cd "$APPLE_DIR"
 
 OUT="${OUT:-$APPLE_DIR/screenshots}"
 BUNDLE_ID="io.unom.punktfunk"
-SCENES=(01-stream 02-hosts 03-pair 04-trust 05-settings)
+
+# The App Store set, in listing order — the first three are what most people ever see, so they are
+# the stream itself, the machines it found, and the couch/controller mode. Everything else in
+# ShotScenes.all is a dev scene; capture those with `SCENES="06-gamepad-home 10-edithost" ...`.
+SCENES=(${SCENES:-01-stream 02-hosts 06-gamepad-home 09e-waking-modal 05-settings 03-pair})
 SETTLE="${SETTLE:-4}" # seconds to let a scene lay out before capturing
 
 mkdir -p "$OUT"
@@ -89,13 +99,20 @@ shoot_macos() {
 
 # $1 device-type regex (matches both existing device names and the device-type catalog)
 # $2 scheme  $3 sdk  $4 file prefix  $5 runtime platform (iOS|tvOS — for the create fallback)
+# $6 name for a device we have to create — MUST satisfy $1 (see below)
 shoot_sim() {
   require_xcode
-  local match="$1" scheme="$2" sdk="$3" prefix="$4" platform="$5"
+  local match="$1" scheme="$2" sdk="$3" prefix="$4" platform="$5" createname="$6"
 
-  # Reuse an existing device of this type; else create a throwaway one against the newest
-  # available runtime for the platform. CI runners commonly ship a runtime but not every device
-  # (the iPhone 16 Pro Max is absent on ours), so create-on-demand is what makes it reproducible.
+  # Reuse an existing device of this type; else create one against the newest available runtime
+  # for the platform. CI runners commonly ship a runtime but not every device (the iPhone 16 Pro
+  # Max is absent on ours), so create-on-demand is what makes it reproducible.
+  #
+  # The created device is named after the DEVICE, not after this script, for two reasons. It used
+  # to be "pf-shot-<prefix>", which `$match` never matches — so every run created another
+  # simulator and none was ever reused (they piled up on the runner). And the name is user-visible:
+  # `UIDevice.current.name` is what the pairing sheet prefills as this device's name, so
+  # "pf-shot-iphone-6.9" was rendered into an App Store screenshot.
   local udid
   udid="$(xcrun simctl list devices available | grep -E "$match" | grep -oE '[0-9A-F-]{36}' | head -1 || true)"
   if [ -z "$udid" ]; then
@@ -105,8 +122,8 @@ shoot_sim() {
     rt="$(xcrun simctl list runtimes available | grep -E "^$platform " \
       | grep -oE 'com\.apple\.CoreSimulator\.SimRuntime\.[A-Za-z0-9.-]+' | tail -1 || true)"
     if [ -n "$devtype" ] && [ -n "$rt" ]; then
-      udid="$(xcrun simctl create "pf-shot-$prefix" "$devtype" "$rt" 2>/dev/null || true)"
-      [ -n "$udid" ] && log "$prefix — created Simulator $udid ($devtype)"
+      udid="$(xcrun simctl create "$createname" "$devtype" "$rt" 2>/dev/null || true)"
+      [ -n "$udid" ] && log "$prefix — created Simulator \"$createname\" $udid ($devtype)"
     fi
   fi
   [ -n "$udid" ] || die "$prefix: no Simulator matching /$match/, and none could be created
@@ -114,6 +131,11 @@ shoot_sim() {
   log "$prefix — Simulator $udid"
   xcrun simctl boot "$udid" 2>/dev/null || true
   xcrun simctl bootstatus "$udid" -b >/dev/null 2>&1 || true
+  # Every scene is a dark-mode scene. The in-app `.environment(\.colorScheme, .dark)` override
+  # does NOT cross a presentation boundary — a `.sheet` gets its own environment and follows the
+  # DEVICE appearance — so the pairing sheet came out light grey over the dark app. Set the
+  # simulator itself to dark and the whole hierarchy, presentations included, agrees.
+  xcrun simctl ui "$udid" appearance dark >/dev/null 2>&1 || true
 
   log "$prefix — building ($scheme)…"
   # PF_SHOT_DERIVED_DATA (optional): a STABLE DerivedData root, so repeat runs reuse the
@@ -150,15 +172,15 @@ pixels() { sips -g pixelWidth -g pixelHeight "$1" 2>/dev/null | awk '/pixel/{pri
 for target in "$@"; do
   case "$target" in
     macos) shoot_macos ;;
-    ios)   shoot_sim 'iPhone 16 Pro Max'   Punktfunk-iOS  iphonesimulator  iphone-6.9 iOS ;;
-    ipad)  shoot_sim 'iPad Pro 13|iPad Pro .*M4|iPad Pro \(13' Punktfunk-iOS iphonesimulator ipad-13 iOS ;;
-    tvos)  shoot_sim 'Apple TV'            Punktfunk-tvOS appletvsimulator appletv    tvOS ;;
+    ios)   shoot_sim 'iPhone 16 Pro Max'   Punktfunk-iOS  iphonesimulator  iphone-6.9 iOS 'iPhone 16 Pro Max' ;;
+    ipad)  shoot_sim 'iPad Pro 13|iPad Pro .*M4|iPad Pro \(13' Punktfunk-iOS iphonesimulator ipad-13 iOS 'iPad Pro 13-inch (M4)' ;;
+    tvos)  shoot_sim 'Apple TV'            Punktfunk-tvOS appletvsimulator appletv    tvOS 'Apple TV 4K' ;;
     all)
       shoot_macos
       if xcrun --find simctl >/dev/null 2>&1; then
-        shoot_sim 'iPhone 16 Pro Max' Punktfunk-iOS iphonesimulator iphone-6.9 iOS
-        shoot_sim 'iPad Pro 13|iPad Pro .*M4|iPad Pro \(13' Punktfunk-iOS iphonesimulator ipad-13 iOS
-        shoot_sim 'Apple TV' Punktfunk-tvOS appletvsimulator appletv tvOS
+        shoot_sim 'iPhone 16 Pro Max' Punktfunk-iOS iphonesimulator iphone-6.9 iOS 'iPhone 16 Pro Max'
+        shoot_sim 'iPad Pro 13|iPad Pro .*M4|iPad Pro \(13' Punktfunk-iOS iphonesimulator ipad-13 iOS 'iPad Pro 13-inch (M4)'
+        shoot_sim 'Apple TV' Punktfunk-tvOS appletvsimulator appletv tvOS 'Apple TV 4K'
       else
         warn "Skipping iOS/iPadOS/tvOS — full Xcode not found (Command Line Tools only)."
       fi

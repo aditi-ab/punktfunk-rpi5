@@ -61,8 +61,8 @@ Then, on the client:
 - **[Native clients](/docs/clients) (Apple, Linux, Windows, Android):** select the host (or use
   *Pair with PIN…* from its menu) and enter the PIN the host displays.
 - **[Steam Deck](/docs/steam-deck) (the Decky plugin):** open Punktfunk from the Quick Access menu
-  and pick the host — an unpaired one's button reads **Pair & Stream**. Enter the PIN on the
-  4-digit pad it opens.
+  and pick the host — an unpaired one opens a sheet offering **Request access** (no PIN: somebody
+  approves the Deck at the host) or **Use a PIN instead**, which opens the 4-digit pad.
 - **[Moonlight](/docs/moonlight):** choose **Pair**; Moonlight shows a 4-digit PIN, and you type
   that PIN into the console's **Moonlight (GameStream) pairing** card and press **Submit PIN**.
   (This direction is the reverse of the native flow, and arming doesn't apply to it.)

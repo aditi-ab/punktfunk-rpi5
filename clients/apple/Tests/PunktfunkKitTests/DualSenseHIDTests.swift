@@ -43,5 +43,33 @@ final class DualSenseHIDTests: XCTestCase {
         let crc = DualSenseHID.crc32(seed: UInt8(ascii: "1"), Array("23456789".utf8))
         XCTAssertEqual(crc, 0xCBF4_3926)
     }
+
+    // MARK: - Device selection (B14)
+
+    /// With two DualSenses attached, each renderer must drive its OWN device. The old code took
+    /// `Set.first` from an unordered set, so the pad→device binding was a coin flip that could
+    /// point both renderers at the same pad.
+    func testPreferredIndexHonoursAnExplicitLocation() {
+        let ids: [UInt32?] = [0x1D18_0000, 0x1420_0000, 0x1411_0000]
+        XCTAssertEqual(DualSenseHID.preferredIndex(among: ids, preferring: 0x1420_0000), 1)
+        XCTAssertEqual(DualSenseHID.preferredIndex(among: ids, preferring: 0x1D18_0000), 0)
+    }
+
+    /// No preference (or one the pad no longer has): fall back to the LOWEST id — arbitrary, but
+    /// stable across calls, which `Set.first` was not.
+    func testPreferredIndexFallsBackToTheLowestIdDeterministically() {
+        let ids: [UInt32?] = [0x1D18_0000, 0x1420_0000, 0x1411_0000]
+        XCTAssertEqual(DualSenseHID.preferredIndex(among: ids, preferring: nil), 2)
+        // A wanted id that is gone (pad unplugged between enumeration and open) must not fail the
+        // open — it degrades to the same stable fallback.
+        XCTAssertEqual(DualSenseHID.preferredIndex(among: ids, preferring: 0xDEAD_BEEF), 2)
+    }
+
+    /// A device IOKit reports no location for must never displace one it can place.
+    func testPreferredIndexSortsUnplaceableDevicesLast() {
+        XCTAssertEqual(DualSenseHID.preferredIndex(among: [nil, 0x1420_0000], preferring: nil), 1)
+        XCTAssertEqual(DualSenseHID.preferredIndex(among: [nil, nil], preferring: nil), 0)
+        XCTAssertNil(DualSenseHID.preferredIndex(among: [], preferring: nil))
+    }
 }
 #endif

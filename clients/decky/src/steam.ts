@@ -8,16 +8,16 @@
 //
 // TWO shortcuts, both named "Punktfunk" (so they share ONE Steam Input controller-config key —
 // see applyControllerConfig):
-//   • STREAM  — hidden, stateful: the per-session launcher. Its launch options carry the host /
-//     pinned game (PF_HOST/PF_LAUNCH/PF_BROWSE), rewritten per launch, so one shortcut serves
-//     every host. Driven by the QAM/pins/host-library actions. Hidden — an implementation detail.
+//   • STREAM  — hidden, stateful: the per-session launcher. Its launch options carry the host
+//     reference and the card's profile (PF_REF/PF_PROFILE/PF_REQUEST_ACCESS), rewritten per
+//     launch, so one shortcut serves every host. Hidden — an implementation detail.
 //   • GAMEPAD UI — visible, stateless: fixed launch options = bare `--browse` (PF_BROWSE, no
 //     host) → the client's console home (host picker + pairing + settings, gamepad-navigable).
 //     This is the library-visible "Punktfunk" app the user opens directly.
 //
 // Both get the shipped artwork and the native-touch controller config.
 
-import { applyControllerConfig, runnerInfo, shortcutArt, wake } from "./backend";
+import { applyControllerConfig, runnerInfo, shortcutArt } from "./backend";
 
 // SteamClient is a Steam-internal global injected into the CEF context; it is not fully typed
 // by @decky/ui, so declare the surface we use. Signatures verified against MoonDeck + the
@@ -257,11 +257,12 @@ export async function ensureGamepadUiShortcut(): Promise<number | null> {
     }
     const startDir = info.runner.replace(/\/[^/]*$/, "");
     void ensureControllerConfig();
-    // Bare browse: PF_BROWSE with no PF_HOST → the wrapper runs `--browse --fullscreen` (console
-    // home). %command% expands to the shortcut exe (/bin/sh); the wrapper rides behind as an arg.
-    // PF_CLIENT_BIN only when the backend resolved a NATIVE client — else the wrapper's flatpak
-    // default stands and this shortcut is exactly what it always was.
-    const clientBin = info.client_bin ? `PF_CLIENT_BIN=${info.client_bin} ` : "";
+    // PF_BROWSE → the wrapper runs the SESSION's `--browse --fullscreen` (console home), which is
+    // the one branch this rework deliberately left alone. %command% expands to the shortcut exe
+    // (/bin/sh); the wrapper rides behind as an arg. PF_CLIENT_BIN only when the backend resolved
+    // a NATIVE client — else the wrapper's flatpak default stands and this shortcut is exactly
+    // what it always was.
+    const clientBin = safeClientBin(info.client_bin) ? `PF_CLIENT_BIN=${info.client_bin} ` : "";
     const launchOpts = `${clientBin}PF_BROWSE=1 %command% "${info.runner}"`;
 
     // Reuse the remembered entry only if it still exists; a stale appId (deleted shortcut whose
@@ -319,77 +320,81 @@ export async function launchGamepadUi(): Promise<void> {
   }
 }
 
-/** Per-launch extras beyond the host target (all optional — {} is the plain stream). */
+/** Per-launch extras beyond the host reference (all optional — {} is the plain stream). */
 export interface LaunchOpts {
-  /** Library id to launch on connect (a pinned game) — rides PF_LAUNCH → `--launch`. */
-  launchId?: string;
-  /** Open the gamepad library launcher instead of streaming (PF_BROWSE → `--browse`). */
-  browse?: boolean;
-  /** Management-API port for the launcher's library fetch (PF_MGMT; 0/absent = default). */
-  mgmt?: number;
+  /** A pinned card: stream with this settings profile, one-off (PF_PROFILE → `--profile`). */
+  profileId?: string;
+  /**
+   * Ask the host's operator to admit this Deck rather than typing a PIN (PF_REQUEST_ACCESS).
+   * The connect PARKS until somebody approves it, and the launch runs SUPERVISED — see the
+   * wrapper for why `--exec` is dropped on this path alone.
+   */
+  requestAccess?: boolean;
 }
 
-// Launch ids ride Steam launch options as an env-prefix token (`PF_LAUNCH=<id>`), so they
-// must be space/quote-free — Steam's tokenizer and the wrapper's env both break otherwise.
-// Real ids are `steam:<digits>` / `custom:<slug>`, so this rejects nothing in practice;
-// it's VALIDATION, never encoding (the host must match the opaque token verbatim).
-const UNSAFE_LAUNCH_ID = /["'\\$`\s]/;
+// Host refs and profile ids ride Steam launch options as env-prefix tokens (`PF_REF=<ref>`),
+// so they must be space/quote-free — Steam's tokenizer and the wrapper's env both break
+// otherwise. Real values are UUIDs or `addr:port`, so this rejects nothing in practice; it is
+// VALIDATION, never encoding (the client must receive the opaque token verbatim).
+const UNSAFE_TOKEN = /["'\\$`\s]/;
 export function isSafeLaunchId(id: string): boolean {
   return (
     id.length > 0 &&
     id.length <= 128 &&
-    UNSAFE_LAUNCH_ID.exec(id) === null &&
+    UNSAFE_TOKEN.exec(id) === null &&
     /^[\x21-\x7e]+$/.test(id)
   );
 }
 
 /**
- * Launch a stream to `host:port` fullscreen in Gaming Mode (optionally straight into a
- * library title, or into a host's gamepad library). Encodes the target into the STREAM
- * shortcut's launch options (so one hidden shortcut serves every host and every pinned game),
- * then RunGame.
+ * Is a resolved native-client path safe to put in Steam's launch options? Same rule, separate
+ * name because the failure is different: an unsafe id is a bug in our own data, an unsafe path
+ * is just where the user installed the client — so the browse shortcut degrades to its flatpak
+ * default rather than refusing to exist.
  */
-export async function launchStream(
-  host: string,
-  port: number,
-  opts: LaunchOpts = {},
-): Promise<void> {
-  // Wake-on-LAN: if this host is asleep, nudge it awake before the stream connects. Kicked off now
-  // so it races with the shortcut setup (near-zero added latency); its outcome is needed below
-  // (the connect budget), and RunGame follows the await either way, so nothing is slower for it.
-  // Best-effort — the flatpak client's --wake looks up the host's learned MAC (a no-op if none is
-  // known), and the connect that follows has its own retry window, so a failure never blocks launch.
-  const waking = wake(host, port).catch(() => ({ ok: false }));
-  const [{ appId, runner, clientBin }, woke] = await Promise.all([ensureStreamShortcut(), waking]);
-  const target = port && port !== 9777 ? `${host}:${port}` : host;
-  const env = [`PF_HOST=${target}`];
+function safeClientBin(bin: string | undefined): bin is string {
+  return !!bin && isSafeLaunchId(bin);
+}
+
+/**
+ * Stream `ref` fullscreen in Gaming Mode, optionally with a pinned card's profile. Encodes the
+ * target into the STREAM shortcut's launch options — one hidden shortcut serves every host —
+ * then RunGame.
+ *
+ * No Wake-on-LAN here any more. The plugin used to fire a magic packet itself and then stretch
+ * the connect budget to 75 s to cover the host's resume, which was a workaround for the era
+ * before the CLI existed. `punktfunk launch` now runs the real wake-and-wait loop (packet at
+ * t=0, re-sent every 6 s, presence polled every second) and only dials once the host answers —
+ * strictly better, and it deletes a backend method, a frontend call and a shell branch.
+ */
+export async function launchStream(ref: string, opts: LaunchOpts = {}): Promise<void> {
+  if (!isSafeLaunchId(ref)) {
+    throw new Error(`unsupported host reference: ${ref}`);
+  }
+  if (opts.profileId && !isSafeLaunchId(opts.profileId)) {
+    throw new Error(`unsupported profile id: ${opts.profileId}`);
+  }
+  const { appId, runner, clientBin } = await ensureStreamShortcut();
+  const env = [`PF_REF=${ref}`];
   // Set only for a NATIVE client install; absent, the wrapper takes its flatpak default, so every
   // existing Deck install produces byte-identical launch options to before.
   if (clientBin) {
+    // The one launch-option value that comes from the backend rather than a store id, and so
+    // the one that could carry a space: a path like `/home/deck/my apps/punktfunk-client` would
+    // split Steam's tokenizer and land its tail in front of %command% as a bogus env token.
+    if (!isSafeLaunchId(clientBin)) {
+      throw new Error(`client path can't ride Steam's launch options: ${clientBin}`);
+    }
     env.push(`PF_CLIENT_BIN=${clientBin}`);
   }
-  // A magic packet actually went out (a MAC was known), so the host may be mid-resume from
-  // suspend — that takes far longer than the client's default 15 s connect budget. Stretch the
-  // budget so the client's wake-tolerant dial keeps retrying across the resume; against an
-  // already-awake host the connect still lands in under a second, so this costs nothing.
-  if (woke.ok) {
-    env.push("PF_CONNECT_TIMEOUT=75");
+  if (opts.profileId) {
+    env.push(`PF_PROFILE=${opts.profileId}`);
   }
-  if (opts.browse) {
-    env.push("PF_BROWSE=1");
-    if (opts.mgmt) {
-      env.push(`PF_MGMT=${Math.floor(opts.mgmt)}`);
-    }
-  } else if (opts.launchId) {
-    if (!isSafeLaunchId(opts.launchId)) {
-      // Enforced at pin time too (the picker disables Pin) — this is the backstop.
-      throw new Error(`unsupported launch id: ${opts.launchId}`);
-    }
-    env.push(`PF_LAUNCH=${opts.launchId}`);
+  if (opts.requestAccess) {
+    env.push("PF_REQUEST_ACCESS=1");
   }
   // KEY=value ... %command% args — %command% expands to the shortcut exe (/bin/sh); the wrapper
-  // script rides behind it as an argument and reads PF_* from the environment. The wake was
-  // awaited above, so the magic packet is out before the connect attempt.
+  // script rides behind it as an argument and reads PF_* from the environment.
   SteamClient.Apps.SetAppLaunchOptions(appId, `${env.join(" ")} %command% "${runner}"`);
   SteamClient.Apps.RunGame(gameIdFromAppId(appId), "", -1, 100);
 }

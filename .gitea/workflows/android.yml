@@ -160,6 +160,14 @@ jobs:
           key: gradle-${{ hashFiles('clients/android/**/*.gradle.kts', 'clients/android/gradle/wrapper/gradle-wrapper.properties') }}
           restore-keys: gradle-
 
+      # The kit's JVM unit tests — the pure parsers, migrations and feedback policies. They were
+      # running nowhere: this workflow only assembled, and android-screenshots.yml runs the :app
+      # module's tests, so nothing enforced :kit's. Cheap (a couple of seconds against an already
+      # built module) and it is the only automated cover those behaviours have.
+      - name: kit unit tests
+        working-directory: clients/android
+        run: ./gradlew :kit:testDebugUnitTest --stacktrace
+
       - name: assembleDebug (cargo-ndk → jniLibs → APK)
         working-directory: clients/android
         env:

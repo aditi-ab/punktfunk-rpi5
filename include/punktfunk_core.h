@@ -488,7 +488,17 @@
 
 // Largest UDP datagram the core will send or accept. `Config::validate` bounds
 // `shard_payload` so `HEADER_LEN + shard_payload + CRYPTO_OVERHEAD ≤ MAX_DATAGRAM_BYTES`.
-#define MAX_DATAGRAM_BYTES 2048
+//
+// Sized for **jumbo frames** (design/shard-payload-reneg.md W0.2): a 9000-MTU LAN carries
+// ~8908-byte shards (sealed 8972-byte UDP payloads), and every receive path — the transport
+// `RECV_BUF`, the session's `recvmmsg` ring — is sized from this constant, so a deployed
+// client can accept a jumbo geometry the moment its host negotiates one. The ring cost is
+// 128 × ~9 KiB ≈ 1.1 MiB per **client** session (lazily allocated on first poll; hosts never
+// allocate it) — measured against the ~256 KiB it was at 2048, an acceptable static price
+// for never having to resize buffers on a mid-session grow. Senders still derive their
+// shard payload from the path MTU (`config::mtu1500_shard_payload*`, the wire-MTU clamps);
+// this is the acceptance ceiling, not a transmit size.
+#define MAX_DATAGRAM_BYTES 9216
 
 // The slice-flush floor: a sentinel block below this many data shards costs disproportionate
 // per-block FEC parity (`ceil(k × pct/100)` ≥ 1 whatever `k`), so slice boundaries only flush
@@ -814,6 +824,16 @@
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // Type byte of [`RfiRequest`].
 #define MSG_RFI_REQUEST 7
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Type byte of [`ShardPayloadChanged`].
+#define MSG_SHARD_PAYLOAD_CHANGED 8
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Type byte of [`ShardPayloadAck`].
+#define MSG_SHARD_PAYLOAD_ACK 9
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)

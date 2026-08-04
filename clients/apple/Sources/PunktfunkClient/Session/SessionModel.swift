@@ -675,8 +675,13 @@ final class SessionModel: ObservableObject {
         // `gamepadForwarding` off means the host gets this device's pads from somewhere else
         // (USB passthrough, or a pad plugged into the host) — capture still runs, and still
         // watches for the escape chord, but puts nothing on the wire.
+        // System-button routing: whether raw guide/share presses ride the wire, and whether
+        // hold-Select arms as the alternate guide route (auto = on everywhere but macOS —
+        // iOS reserves the physical Home press, tvOS never delivers it).
         let capture = GamepadCapture(
-            connection: conn, manager: .shared, forwarding: settings.gamepadForwarding)
+            connection: conn, manager: .shared, forwarding: settings.gamepadForwarding,
+            systemForward: settings.systemButtonsForward,
+            guideGesture: settings.guideGestureEnabled)
         // The cross-client escape chord (hold L1+R1+Start+Select 1.5 s) — on tvOS the only
         // controller way out of a stream (B/Menu is swallowed during sessions; see ContentView).
         capture.onDisconnectRequest = { [weak self] in self?.disconnect() }

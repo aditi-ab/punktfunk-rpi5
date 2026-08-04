@@ -1764,6 +1764,11 @@ impl VirtualDisplayManager {
             if let Some(saved) = inner.group.ccd_saved.take() {
                 restore_displays_ccd(&saved);
             }
+            // Drop the isolate's crash-recovery marker even when there was no snapshot to restore
+            // (a failed `isolate_displays_ccd` leaves `ccd_saved` None, and `restore_displays_ccd`
+            // — which clears it itself — then never runs). The group is gone either way, so no
+            // future host start owes this desk a force-EXTEND.
+            pf_win_display::win_display::isolate_journal::clear();
             // EXPERIMENTAL `ddc_power_off` wake. OUTSIDE the `ccd_saved` gate, for the same reason
             // `pnp_disabled` is above it: the panels were commanded dark BEFORE the isolate, and
             // the isolate can return `None` (its `query_active_config` failed). Nested inside that

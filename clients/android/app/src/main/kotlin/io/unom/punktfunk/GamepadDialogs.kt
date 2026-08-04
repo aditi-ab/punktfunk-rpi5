@@ -50,10 +50,12 @@ import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import io.unom.punktfunk.kit.NativeBridge
 import io.unom.punktfunk.kit.security.ClientIdentity
+import io.unom.punktfunk.kit.security.KnownHost
 import io.unom.punktfunk.models.PendingTrust
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -247,6 +249,139 @@ fun GamepadHostOptionsDialog(
                 "Manage this saved host."
             },
         )
+    }
+}
+
+/**
+ * The pin-to-hosts picker the settings screen's Profiles section opens — the Android mirror of the
+ * desktop console's PinHostsScreen (design §5.2a): one toggle row per SAVED host, D-pad up/down
+ * moves, A flips the focused pin, left/right unpins/pins (the settings-toggle semantics), B closes.
+ * A toggle is presentation only: it edits the host's pinned cards through the same store write the
+ * carousel's unpin uses, never the profile itself and never the host's default binding.
+ *
+ * Pin state is read live from [pinned] (backed by the host records), so what a switch shows is
+ * always what the store holds — the row can't disagree with the carousel it feeds.
+ */
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+fun GamepadPinHostsDialog(
+    profileName: String,
+    hosts: List<KnownHost>,
+    pinned: (KnownHost) -> Boolean,
+    onToggle: (KnownHost) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    // 0..hosts.lastIndex = host rows, hosts.size = the Done button (with no hosts, index 0 IS
+    // Done, so it starts focused).
+    var focus by remember { mutableIntStateOf(0) }
+    BackHandler(onBack = onDismiss)
+    GamepadNavEffect2D(
+        active = true,
+        onDirection = { dir ->
+            when (dir) {
+                NavDir.UP -> if (focus > 0) focus--
+                NavDir.DOWN -> if (focus < hosts.size) focus++
+                // Directional = state-targeted (left → unpinned, right → pinned), so holding a
+                // direction can't oscillate; asking for the state it's already in is a no-op.
+                NavDir.LEFT -> hosts.getOrNull(focus)?.let { if (pinned(it)) onToggle(it) }
+                NavDir.RIGHT -> hosts.getOrNull(focus)?.let { if (!pinned(it)) onToggle(it) }
+            }
+        },
+        onActivate = {
+            val kh = hosts.getOrNull(focus)
+            if (kh != null) onToggle(kh) else onDismiss()
+        },
+    )
+    val maxCardHeight = (LocalConfiguration.current.screenHeightDp * 0.92f).dp
+    Box(
+        Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.62f)),
+        contentAlignment = Alignment.Center,
+    ) {
+        Column(
+            Modifier
+                .padding(24.dp)
+                .widthIn(max = 520.dp)
+                .heightIn(max = maxCardHeight)
+                .clip(RoundedCornerShape(24.dp))
+                .background(Color(0xF01A1730))
+                .border(1.dp, Color.White.copy(alpha = 0.12f), RoundedCornerShape(24.dp))
+                .padding(28.dp),
+            verticalArrangement = Arrangement.spacedBy(14.dp),
+        ) {
+            Text(
+                "Pin “$profileName”",
+                style = MaterialTheme.typography.headlineSmall,
+                fontWeight = FontWeight.Bold,
+                color = Color.White,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Column(
+                Modifier.weight(1f, fill = false).verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                if (hosts.isEmpty()) {
+                    DialogText("No saved hosts yet — pair with a host first, then pin this profile to it.")
+                } else {
+                    DialogText("A pinned profile appears as its own card on the host — one press connects with it.")
+                    hosts.forEachIndexed { i, kh ->
+                        PinHostRow(
+                            label = kh.name,
+                            on = pinned(kh),
+                            focused = i == focus,
+                            onClick = { onToggle(kh) },
+                        )
+                    }
+                }
+                Spacer(Modifier.size(4.dp))
+                DialogButton(
+                    "Done",
+                    focused = focus == hosts.size,
+                    primary = true,
+                    enabled = true,
+                    onClick = onDismiss,
+                )
+            }
+        }
+    }
+}
+
+/** One host's pin toggle: name + a [ConsoleSwitch], with the shared console focus visuals. */
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun PinHostRow(label: String, on: Boolean, focused: Boolean, onClick: () -> Unit) {
+    val visuals = animateConsoleFocus(active = focused)
+    // Inside the dialog's scroll region, like DialogButton: a focused row scrolled out of a short
+    // landscape window pulls itself into view.
+    val intoView = remember { BringIntoViewRequester() }
+    LaunchedEffect(focused) { if (focused) intoView.bringIntoView() }
+    val shape = RoundedCornerShape(14.dp)
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .bringIntoViewRequester(intoView)
+            .graphicsLayer { scaleX = visuals.scale; scaleY = visuals.scale }
+            .clip(shape)
+            .background(visuals.background)
+            .border(1.dp, visuals.border, shape)
+            .clickable(
+                interactionSource = remember { MutableInteractionSource() },
+                indication = null,
+                onClick = onClick,
+            )
+            .padding(horizontal = 16.dp, vertical = 13.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            label,
+            style = MaterialTheme.typography.bodyLarge,
+            fontWeight = FontWeight.SemiBold,
+            color = Color.White,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+        Spacer(Modifier.weight(1f))
+        ConsoleSwitch(on = on, focused = focused)
     }
 }
 

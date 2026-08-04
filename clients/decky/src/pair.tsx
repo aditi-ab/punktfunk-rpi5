@@ -3,10 +3,32 @@
 import { DialogButton, Focusable, ModalRoot, Spinner } from "@decky/ui";
 import { toaster } from "@decky/api";
 import { FC, useState } from "react";
-import { Host, pair } from "./backend";
+import { pair } from "./backend";
+import { HostView } from "./hooks";
+
+/**
+ * User-facing copy for a failed ceremony. The CLI's stable exit codes say WHICH failure it was,
+ * so the keypad can name the fix instead of echoing a log line: `refused` is overwhelmingly a
+ * mistyped PIN or a host nobody armed, and telling someone to check their network for that
+ * would send them the wrong way entirely.
+ */
+function pairErrorBody(error: string | undefined, name: string): string {
+  switch (error) {
+    case "refused":
+      return "Wrong PIN, or the host isn’t showing one. Arm pairing again and retry.";
+    case "unreachable":
+      return `Couldn’t reach ${name}.`;
+    case "client-outdated":
+      return "Update the Punktfunk client to pair from here.";
+    case "client-unavailable":
+      return "Couldn’t reach the Punktfunk client — is it still installed?";
+    default:
+      return "Pairing failed.";
+  }
+}
 
 export const PairModal: FC<{
-  host: Host;
+  host: HostView;
   closeModal?: () => void;
   onPaired: () => void;
 }> = ({ host, closeModal, onPaired }) => {
@@ -21,13 +43,13 @@ export const PairModal: FC<{
     setBusy(true);
     setError(null);
     try {
-      const res = await pair(host.host, host.port, pin, "Steam Deck");
+      const res = await pair(host.addr, host.port, pin, "Steam Deck");
       if (res.ok) {
         toaster.toast({ title: "Punktfunk", body: `Paired with ${host.name}` });
         onPaired();
         closeModal?.();
       } else {
-        setError(res.error ?? "pairing failed");
+        setError(pairErrorBody(res.error, host.name));
         setPin("");
       }
     } catch (e) {

@@ -132,11 +132,10 @@ and runs what it already knows about the title, so a client can never hand the h
 - **Android** — the library lives only in the controller-optimized home, which a TV always uses and a
   phone or tablet switches to when a controller is connected. Press **Y** on a saved host, or open its
   options and choose **Library**.
-- **Steam Deck (Decky)** — the plugin's per-host **Games** picker lists the library and lets you
-  **Pin** titles; a pinned game becomes a one-tap row under **Pinned Games** in the Quick Access Menu.
-  The picker itself doesn't launch anything — either tap a pinned row, or use **Open library on
-  screen** to browse the host's games full-screen on the Deck and launch from there. See
-  [Steam Deck](/docs/steam-deck).
+- **Steam Deck (Decky)** — the panel is a launcher and browses nothing itself: tap **Open
+  Punktfunk**, which opens the client's console home, and a paired host's **Library** button is
+  right there — full-screen covers, gamepad-navigable, and a press starts the stream with the title
+  launching. See [Steam Deck](/docs/steam-deck).
 - **Moonlight** — when the host runs with `--gamestream`, your library appears in Moonlight's app
   list beside `Desktop`, with covers served by the host. A title keeps the same app id across host
   restarts, so Moonlight's cached tiles stay correct. Titles with no launch recipe are left out.

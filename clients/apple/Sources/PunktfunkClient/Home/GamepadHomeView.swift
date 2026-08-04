@@ -135,7 +135,7 @@ struct GamepadHomeView: View {
         // fullScreenCover, so they become generously sized sheets over the dimmed launcher.
         #if os(macOS)
         .sheet(isPresented: $showSettings) {
-            GamepadSettingsView()
+            GamepadSettingsView(store: store)
                 .frame(width: 720, height: 640)
         }
         .sheet(isPresented: $showAddHost) {
@@ -144,7 +144,7 @@ struct GamepadHomeView: View {
         }
         .frame(minWidth: 640, minHeight: 420)
         #else
-        .fullScreenCover(isPresented: $showSettings) { GamepadSettingsView() }
+        .fullScreenCover(isPresented: $showSettings) { GamepadSettingsView(store: store) }
         .fullScreenCover(isPresented: $showAddHost) {
             GamepadAddHostView { store.add($0) }
         }
@@ -176,18 +176,33 @@ struct GamepadHomeView: View {
     // MARK: - Chrome
 
     private var titleBar: some View {
-        Text("Select a Host")
-            .font(.geist(gamepadTitleSize(compact: compact), .bold, relativeTo: .title))
-            .foregroundStyle(.white)
-            .frame(maxWidth: .infinity)
-            .overlay(alignment: .trailing) {
-                // Which pad is driving this UI (name + battery) — quiet, and only where there's
-                // room; a compact-height phone gives the pixels to the carousel instead.
-                if !compact, let active = gamepads.active {
-                    ControllerStatusChip(controller: active)
-                        .padding(.trailing, 20)
-                }
-            }
+        // The chip used to be a trailing `.overlay`, which reserves no width: on a portrait phone
+        // it sat directly on top of the centred title ("Select a Host" ran straight into the pad
+        // name). Laying it out as a row with a hidden mirror on the leading side keeps the title
+        // optically centred AND clear of the chip at every width; the title shrinks a little
+        // before it would ever truncate.
+        HStack(spacing: 12) {
+            statusChip(hidden: true)
+            Text("Select a Host")
+                .font(.geist(gamepadTitleSize(compact: compact), .bold, relativeTo: .title))
+                .foregroundStyle(.white)
+                .lineLimit(1)
+                .minimumScaleFactor(0.75)
+                .frame(maxWidth: .infinity)
+            statusChip(hidden: false)
+        }
+        .padding(.horizontal, 20)
+    }
+
+    /// Which pad is driving this UI (name + battery) — quiet, and only where there's room; a
+    /// compact-height phone gives the pixels to the carousel instead. `hidden` renders the same
+    /// chip purely as a width reserve.
+    @ViewBuilder private func statusChip(hidden: Bool) -> some View {
+        if !compact, let active = gamepads.active {
+            ControllerStatusChip(controller: active)
+                .opacity(hidden ? 0 : 1)
+                .accessibilityHidden(hidden)
+        }
     }
 
     private var cardSpacing: CGFloat {

@@ -94,13 +94,19 @@ impl HomeScreen {
                     Some(h) => {
                         // Dial-first even when the presence pips say offline — a
                         // routed/VPN host is mDNS-blind and probe-shy but dials fine.
+                        // A pinned card connects with ITS profile (one-off, §5.2a);
+                        // the primary tile keeps the host's default binding.
                         fx.connect = Some(ConnectIntent {
                             addr: h.addr.clone(),
                             port: h.port,
                             fp_hex: h.fp_hex.clone(),
                             launch: None,
-                            title: h.name.clone(),
+                            title: match &h.pin {
+                                Some(p) => format!("{} · {}", h.name, p.name),
+                                None => h.name.clone(),
+                            },
                             request_access: false,
+                            profile: h.pin.as_ref().map(|p| p.id.clone()),
                         });
                     }
                 }
@@ -295,16 +301,62 @@ fn draw_host_tile(canvas: &Canvas, fonts: &Fonts, h: &HostRow, rect: Rect, k: f6
 
     let max_w = f64::from(rect.width()) - 2.0 * pad;
     let sub_base = f64::from(rect.bottom) - pad;
-    fonts.draw_clipped(
-        canvas,
-        &format!("{}:{}", h.addr, h.port),
-        l,
-        sub_base,
-        W::Regular,
-        13.0 * k,
-        white(0.55),
-        max_w,
-    );
+    match (&h.pin, &h.bound_profile) {
+        // A pinned card: the profile name IS the subtitle, tinted with its accent —
+        // the card's whole point is "this host, with these settings" (§5.2a).
+        (Some(p), _) => {
+            fonts.draw_clipped(
+                canvas,
+                &p.name,
+                l,
+                sub_base,
+                W::SemiBold,
+                13.0 * k,
+                accent_color(p.accent.as_deref()),
+                max_w,
+            );
+        }
+        // The primary tile says which profile a plain press uses, after the address.
+        (None, Some(b)) => {
+            let addr = format!("{}:{}", h.addr, h.port);
+            let addr_w = f64::from(fonts.measure(&addr, W::Regular, 13.0 * k));
+            fonts.draw_clipped(
+                canvas,
+                &addr,
+                l,
+                sub_base,
+                W::Regular,
+                13.0 * k,
+                white(0.55),
+                max_w,
+            );
+            let x = l + addr_w + 8.0 * k;
+            if x < l + max_w {
+                fonts.draw_clipped(
+                    canvas,
+                    &format!("· {}", b.name),
+                    x,
+                    sub_base,
+                    W::SemiBold,
+                    13.0 * k,
+                    accent_color(b.accent.as_deref()),
+                    l + max_w - x,
+                );
+            }
+        }
+        (None, None) => {
+            fonts.draw_clipped(
+                canvas,
+                &format!("{}:{}", h.addr, h.port),
+                l,
+                sub_base,
+                W::Regular,
+                13.0 * k,
+                white(0.55),
+                max_w,
+            );
+        }
+    }
     fonts.draw_clipped(
         canvas,
         &h.name,
@@ -315,6 +367,26 @@ fn draw_host_tile(canvas: &Canvas, fonts: &Fonts, h: &HostRow, rect: Rect, k: f6
         WHITE,
         max_w,
     );
+}
+
+/// A profile's `#RRGGBB` accent as a color, defaulting to the brand tint. Parsed
+/// leniently — a malformed accent (hand-edited catalog) falls back rather than erroring.
+fn accent_color(accent: Option<&str>) -> skia_safe::Color4f {
+    let Some(hex) = accent
+        .and_then(|a| a.strip_prefix('#'))
+        .filter(|h| h.len() == 6)
+    else {
+        return BRAND;
+    };
+    let Ok(v) = u32::from_str_radix(hex, 16) else {
+        return BRAND;
+    };
+    skia_safe::Color4f::new(
+        ((v >> 16) & 0xff) as f32 / 255.0,
+        ((v >> 8) & 0xff) as f32 / 255.0,
+        (v & 0xff) as f32 / 255.0,
+        1.0,
+    )
 }
 
 fn draw_add_tile(canvas: &Canvas, fonts: &Fonts, rect: Rect, k: f64) {
@@ -484,6 +556,8 @@ mod tests {
             can_wake,
             last_used: None,
             os: String::new(),
+            pin: None,
+            bound_profile: None,
         }
     }
 
@@ -549,6 +623,38 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    /// A pinned card's A-press is a connect WITH its profile (one-off), titled so the
+    /// connecting takeover says which settings are coming (§5.2a).
+    #[test]
+    fn pinned_card_connects_with_its_profile() {
+        let mut settings = ctx_settings();
+        let mut pinned = host("ab\0p1", true, true, false);
+        pinned.name = "Tower".into();
+        pinned.pin = Some(crate::model::ProfileChip {
+            id: "p1".into(),
+            name: "Work".into(),
+            accent: None,
+        });
+        let hosts = [pinned];
+        let pads: Vec<pf_client_core::gamepad::PadInfo> = Vec::new();
+        let library = crate::library::LibraryShared::default();
+        let mut ctx = Ctx {
+            hosts: &hosts,
+            library: &library,
+            settings: &mut settings,
+            pads: &pads,
+            deck: false,
+            device_name: "test",
+            t: 0.0,
+        };
+        let mut s = HomeScreen::new();
+        let mut fx = Outbox::default();
+        s.menu(MenuEvent::Confirm, &mut ctx, &mut fx);
+        let intent = fx.connect.expect("a pinned card connects");
+        assert_eq!(intent.profile.as_deref(), Some("p1"));
+        assert_eq!(intent.title, "Tower · Work");
     }
 
     #[test]

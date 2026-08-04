@@ -762,6 +762,9 @@ fn send_loop(
     slice_wire: bool,
     burst_cap: Option<usize>,
     fec_target: Arc<AtomicU8>,
+    // Mid-session shard-payload re-keys from the wire-MTU watcher (validated + ack-gated
+    // there) — applied between AUs only (design/shard-payload-reneg.md Phase 1).
+    shard_rx: std::sync::mpsc::Receiver<usize>,
     stats: SendStats,
     // `Some` = the client advertised VIDEO_CAP_HOST_TIMING: emit one 0xCF datagram per AU right
     // after its last packet left the socket (capture→sent, the whole host pipeline incl. pacing).
@@ -818,6 +821,25 @@ fn send_loop(
         }
         // Adaptive FEC: pick up any new recovery target the control task set from client LossReports.
         apply_fec_target(&mut session, &fec_target);
+        // Mid-session shard renegotiation: apply a re-key from the wire-MTU watcher — between
+        // AUs only, NEVER with a streamed AU open (its shard-aligned tiling derives from the
+        // size it began with; same gate as the probe burst above). Drain to the newest; the
+        // protocol side (client advertisement, ack-gated grow) was enforced by the watcher.
+        if streamed.is_none() {
+            let mut want_shard = None;
+            while let Ok(s) = shard_rx.try_recv() {
+                want_shard = Some(s);
+            }
+            if let Some(s) = want_shard {
+                match session.set_shard_payload(s) {
+                    Ok(()) => tracing::info!(shard_payload = s, "wire shard payload re-keyed"),
+                    // Can't fire for a watcher-driven value (it validates the same bounds) —
+                    // belt-and-suspenders for a future driver.
+                    Err(e) => tracing::warn!(shard_payload = s, error = ?e,
+                        "shard re-key refused by session validation"),
+                }
+            }
+        }
         // Short timeout so we keep re-checking `stop` + probes when no frames are flowing.
         match frame_rx.recv_timeout(std::time::Duration::from_millis(50)) {
             Ok(send_msg) => {
@@ -1171,6 +1193,11 @@ pub(super) struct SessionContext {
     /// Accepted mid-stream bitrate changes (adaptive bitrate, already clamped) — the encoder
     /// alone is rebuilt in place at the new rate; capture + virtual output are untouched.
     pub(super) bitrate_rx: std::sync::mpsc::Receiver<u32>,
+    /// Mid-session shard-payload changes from the wire-MTU watcher (already validated +
+    /// protocol-gated there; a grow arrives only after the client's ack). Applied between
+    /// AUs via [`Session::set_shard_payload`] — the packetizer re-keys, capture/encoder/
+    /// virtual output are untouched (design/shard-payload-reneg.md Phase 1).
+    pub(super) shard_rx: std::sync::mpsc::Receiver<usize>,
     /// The resolved compositor backend (moot on Windows — `vdisplay::open` ignores it there).
     pub(super) compositor: crate::vdisplay::Compositor,
     /// This session's resolved gamescope sub-mode, or `None` for every other backend. Carried here
@@ -1385,6 +1412,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
         keyframe,
         rfi,
         bitrate_rx,
+        shard_rx,
         compositor,
         gamescope_route,
         mut bitrate_kbps,
@@ -1771,6 +1799,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                     slice_wire,
                     burst_cap,
                     fec_target,
+                    shard_rx,
                     send_stats,
                     timing_conn,
                     phase_send,

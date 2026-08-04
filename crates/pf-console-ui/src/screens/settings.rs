@@ -6,7 +6,7 @@
 //! read the same file, so values round-trip freely.
 
 use crate::glyphs::{Hint, HintKey};
-use crate::screens::{Ctx, Outbox};
+use crate::screens::{Ctx, Outbox, Screen};
 use crate::theme::{Fonts, DIM, W};
 use crate::widgets::{ListMsg, MenuList, RowSpec};
 use pf_client_core::gamepad::{MenuEvent, MenuPulse};
@@ -15,8 +15,13 @@ use skia_safe::{Canvas, Rect};
 
 /// Stable row identity — adjust/activate dispatch by id so nothing acts on a stale
 /// index when the pad list under the "Use controller" row churns.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RowId {
+    /// A catalog profile (index into [`SettingsScreen::profiles`]) — activating opens
+    /// the pin-to-hosts screen. The console never edits profiles (design §5.4).
+    Profile(usize),
+    /// The Profiles section's placeholder while the catalog is empty.
+    NoProfiles,
     Resolution,
     Refresh,
     RenderScale,
@@ -36,6 +41,8 @@ enum RowId {
     PadForward,
     Pad,
     PadType,
+    SystemButtons,
+    GuideGesture,
     Touch,
     Mouse,
     InvertScroll,
@@ -50,8 +57,9 @@ enum RowId {
 // Gaming Mode, so a field it omits is simply unreachable there (render scale, 4:4:4,
 // scroll/shortcut behavior, fullscreen-on-stream, auto-wake, the library toggle and echo
 // cancellation all were). Still deliberately smaller than the desktop dialogs — device
-// pickers (GPU/speaker/mic) and the profile catalog stay desktop-only.
-const ROWS: [RowId; 27] = [
+// pickers (GPU/speaker/mic) stay desktop-only, and profiles are pinnable here (the
+// trailing Profiles section) but created and edited only in the desktop app (design §5.4).
+const ROWS: [RowId; 29] = [
     RowId::Resolution,
     RowId::Refresh,
     RowId::RenderScale,
@@ -71,6 +79,8 @@ const ROWS: [RowId; 27] = [
     RowId::PadForward,
     RowId::Pad,
     RowId::PadType,
+    RowId::SystemButtons,
+    RowId::GuideGesture,
     RowId::Touch,
     RowId::Mouse,
     RowId::InvertScroll,
@@ -146,16 +156,53 @@ const PAD_TYPES: [(&str, &str); 6] = [
     ("dualshock4", "DualShock 4"),
     ("steamdeck", "Steam Deck"),
 ];
+/// Where the guide (Xbox/PS/Steam) and quick-access presses land while streaming — the
+/// shared `system_buttons` key. Auto = host everywhere except Gaming Mode, where the
+/// local Steam UI reacts to the same press and both overlays would open at once.
+const SYSTEM_BUTTONS: [(&str, &str); 3] = [
+    ("auto", "Automatic"),
+    ("forward", "Send to host"),
+    ("local", "This device"),
+];
+/// The hold-Select guide gesture — the shared `guide_gesture` key.
+const GUIDE_GESTURE: [(&str, &str); 3] = [("auto", "Automatic"), ("on", "On"), ("off", "Off")];
 
 pub(crate) struct SettingsScreen {
     list: MenuList,
+    /// The profile catalog's `(id, name)` pairs, loaded once at construction — the console
+    /// can't create profiles (design §5.4: the desktop app does), so the list is stable
+    /// for the screen's lifetime.
+    profiles: Vec<(String, String)>,
 }
 
 impl SettingsScreen {
     pub(crate) fn new() -> SettingsScreen {
+        Self::with_profiles(
+            pf_client_core::profiles::ProfilesFile::load()
+                .profiles
+                .into_iter()
+                .map(|p| (p.id, p.name))
+                .collect(),
+        )
+    }
+
+    fn with_profiles(profiles: Vec<(String, String)>) -> SettingsScreen {
         SettingsScreen {
             list: MenuList::new(),
+            profiles,
         }
+    }
+
+    /// The full row list: the fixed settings rows, then the Profiles section — one row
+    /// per catalog profile, or the explainer placeholder while there are none.
+    fn row_ids(&self) -> Vec<RowId> {
+        let mut ids = ROWS.to_vec();
+        if self.profiles.is_empty() {
+            ids.push(RowId::NoProfiles);
+        } else {
+            ids.extend((0..self.profiles.len()).map(RowId::Profile));
+        }
+        ids
     }
 
     pub(crate) fn menu(
@@ -168,7 +215,31 @@ impl SettingsScreen {
             fx.pop();
             return None;
         }
-        let (msg, pulse) = self.list.menu(ev, ROWS.len());
+        let ids = self.row_ids();
+        let (msg, pulse) = self.list.menu(ev, ids.len());
+        // The Profiles rows navigate instead of editing the settings file.
+        match ids[self.list.cursor] {
+            RowId::Profile(i) => {
+                return match msg {
+                    ListMsg::Activate => {
+                        let (id, name) = self.profiles[i].clone();
+                        fx.push(Screen::PinHosts(super::pin_hosts::PinHostsScreen::new(
+                            id, name,
+                        )));
+                        pulse
+                    }
+                    ListMsg::Adjust(_) => Some(MenuPulse::Boundary),
+                    ListMsg::None => pulse,
+                }
+            }
+            RowId::NoProfiles => {
+                return match msg {
+                    ListMsg::Adjust(_) | ListMsg::Activate => Some(MenuPulse::Boundary),
+                    ListMsg::None => pulse,
+                }
+            }
+            _ => {}
+        }
         // Rebase the shell-lifetime snapshot on the file before an adjust-then-save: this
         // screen is one of the settings file's several whole-file writers (profiles.rs
         // documents the no-merge debt), and adjusting a stale snapshot would silently
@@ -180,7 +251,7 @@ impl SettingsScreen {
         }
         match msg {
             ListMsg::Adjust(delta) => {
-                let changed = adjust(ROWS[self.list.cursor], delta, false, ctx);
+                let changed = adjust(ids[self.list.cursor], delta, false, ctx);
                 if changed {
                     ctx.settings.save();
                     Some(MenuPulse::Move)
@@ -190,7 +261,7 @@ impl SettingsScreen {
             }
             ListMsg::Activate => {
                 // A cycles forward WRAPPING, so every option is reachable one-handed.
-                if adjust(ROWS[self.list.cursor], 1, true, ctx) {
+                if adjust(ids[self.list.cursor], 1, true, ctx) {
                     ctx.settings.save();
                 }
                 pulse
@@ -200,11 +271,18 @@ impl SettingsScreen {
     }
 
     pub(crate) fn hints(&self, _ctx: &Ctx) -> Vec<Hint> {
-        vec![
-            Hint::new(HintKey::Adjust, "Adjust"),
-            Hint::new(HintKey::Confirm, "Change"),
-            Hint::new(HintKey::Back, "Done"),
-        ]
+        match self.row_ids()[self.list.cursor] {
+            RowId::Profile(_) => vec![
+                Hint::new(HintKey::Confirm, "Pin to hosts…"),
+                Hint::new(HintKey::Back, "Done"),
+            ],
+            RowId::NoProfiles => vec![Hint::new(HintKey::Back, "Done")],
+            _ => vec![
+                Hint::new(HintKey::Adjust, "Adjust"),
+                Hint::new(HintKey::Confirm, "Change"),
+                Hint::new(HintKey::Back, "Done"),
+            ],
+        }
     }
 
     pub(crate) fn render(
@@ -224,10 +302,14 @@ impl SettingsScreen {
             rect.right,
             rect.bottom - detail_h as f32,
         );
-        let rows: Vec<RowSpec> = ROWS.iter().map(|id| row_spec(*id, ctx)).collect();
+        let ids = self.row_ids();
+        let rows: Vec<RowSpec> = ids
+            .iter()
+            .map(|id| row_spec(*id, ctx, &self.profiles))
+            .collect();
         self.list
             .render(canvas, list_rect, &rows, fonts, k, dt, true);
-        let detail = detail(ROWS[self.list.cursor]);
+        let detail = detail(ids[self.list.cursor]);
         fonts.centered(
             canvas,
             detail,
@@ -241,7 +323,38 @@ impl SettingsScreen {
     }
 }
 
-fn row_spec(id: RowId, ctx: &Ctx) -> RowSpec {
+fn row_spec(id: RowId, ctx: &Ctx, profiles: &[(String, String)]) -> RowSpec {
+    // The Profiles section: name + how many hosts pin it (counted from the live rows, so
+    // it reflects what the carousel shows). Read-only here beyond opening the pin screen.
+    match id {
+        RowId::Profile(i) => {
+            let (pid, name) = &profiles[i];
+            let pins = ctx
+                .hosts
+                .iter()
+                .filter(|h| h.pin.as_ref().is_some_and(|p| &p.id == pid))
+                .count();
+            return RowSpec {
+                header: (i == 0).then_some("Profiles"),
+                label: name.clone(),
+                value: Some(match pins {
+                    0 => "Not pinned".into(),
+                    1 => "Pinned to 1 host".into(),
+                    n => format!("Pinned to {n} hosts"),
+                }),
+                value_dim: pins == 0,
+                caret: false,
+                adjustable: false,
+                enabled: true,
+            };
+        }
+        RowId::NoProfiles => {
+            let mut row = RowSpec::action("No profiles yet", false);
+            row.header = Some("Profiles");
+            return row;
+        }
+        _ => {}
+    }
     let s = &ctx.settings;
     // Several rows follow another: echo cancellation only means anything while the mic
     // streams, the pad rows only while any controller is forwarded at all, and the
@@ -251,7 +364,9 @@ fn row_spec(id: RowId, ctx: &Ctx) -> RowSpec {
     // move everything under the cursor).
     let enabled = match id {
         RowId::EchoCancel => s.mic_enabled,
-        RowId::Pad | RowId::PadType => s.gamepad_forwarding,
+        RowId::Pad | RowId::PadType | RowId::SystemButtons | RowId::GuideGesture => {
+            s.gamepad_forwarding
+        }
         RowId::SmoothBuffer => s.present_priority == "smooth",
         _ => true,
     };
@@ -358,6 +473,16 @@ fn row_spec(id: RowId, ctx: &Ctx) -> RowSpec {
             "Controller type",
             label_for(&PAD_TYPES, &s.gamepad).into(),
         ),
+        RowId::SystemButtons => (
+            None,
+            "Steam / guide button",
+            label_for(&SYSTEM_BUTTONS, &s.system_buttons).into(),
+        ),
+        RowId::GuideGesture => (
+            None,
+            "Hold Select for guide",
+            label_for(&GUIDE_GESTURE, &s.guide_gesture).into(),
+        ),
         RowId::Touch => (
             Some("Touchscreen"),
             "Touch mode",
@@ -382,6 +507,7 @@ fn row_spec(id: RowId, ctx: &Ctx) -> RowSpec {
         ),
         RowId::AutoWake => (None, "Wake hosts automatically", on_off(s.auto_wake).into()),
         RowId::Library => (None, "Game library", on_off(s.library_enabled).into()),
+        RowId::Profile(_) | RowId::NoProfiles => unreachable!("returned above"),
     };
     RowSpec {
         header,
@@ -453,6 +579,16 @@ fn detail(id: RowId) -> &'static str {
         }
         RowId::Pad => "Which pad is forwarded to the host, as player 1.",
         RowId::PadType => "The virtual pad the host creates — Automatic matches this controller.",
+        RowId::SystemButtons => {
+            "Where the guide (Xbox/PS/Steam) and quick-access presses go. Automatic \
+             sends them to the host except in Gaming Mode, where Steam on this device \
+             reacts to the same press and both overlays would open at once."
+        }
+        RowId::GuideGesture => {
+            "Hold Select on its own to press the host's guide button — keep holding for \
+             the host's quick-access menu. Automatic arms it only where the real button \
+             can't reach the host. A Select tap still goes through, slightly delayed."
+        }
         RowId::Touch => {
             "How the touchscreen drives the host: Trackpad (relative cursor), \
              Direct pointer (cursor jumps to your finger), or Touch passthrough (raw contacts)."
@@ -477,6 +613,16 @@ fn detail(id: RowId) -> &'static str {
              reached over a VPN, where the wake wait only adds delay."
         }
         RowId::Library => "Show paired hosts' game libraries (tap a title to stream it).",
+        RowId::Profile(_) => {
+            "Pin this profile to a host and it appears as its own card — one press \
+             connects with these settings. Profiles are created and edited in the \
+             Punktfunk desktop app."
+        }
+        RowId::NoProfiles => {
+            "Profiles bundle stream settings for different uses (a low-latency one, a \
+             quality one…). Create them in the Punktfunk desktop app, then pin them \
+             here as one-press connect cards."
+        }
     }
 }
 
@@ -589,6 +735,18 @@ fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
             }
             step_str(&PAD_TYPES, &mut s.gamepad, delta, wrap)
         }
+        RowId::SystemButtons => {
+            if !s.gamepad_forwarding {
+                return false;
+            }
+            step_str(&SYSTEM_BUTTONS, &mut s.system_buttons, delta, wrap)
+        }
+        RowId::GuideGesture => {
+            if !s.gamepad_forwarding {
+                return false;
+            }
+            step_str(&GUIDE_GESTURE, &mut s.guide_gesture, delta, wrap)
+        }
         RowId::Touch => {
             let cur = TouchMode::ALL.iter().position(|m| *m == s.touch_mode());
             step_option(cur, TouchMode::ALL.len(), delta, wrap)
@@ -611,6 +769,8 @@ fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
         RowId::Fullscreen => toggle(&mut s.fullscreen_on_stream, delta, wrap),
         RowId::AutoWake => toggle(&mut s.auto_wake, delta, wrap),
         RowId::Library => toggle(&mut s.library_enabled, delta, wrap),
+        // Navigation rows, handled before the settings path in `menu` — never a value edit.
+        RowId::Profile(_) | RowId::NoProfiles => None,
     }
     .is_some()
 }
@@ -736,7 +896,7 @@ mod tests {
             device_name: "t",
             t: 0.0,
         };
-        assert!(!row_spec(RowId::EchoCancel, &ctx).enabled);
+        assert!(!row_spec(RowId::EchoCancel, &ctx, &[]).enabled);
         assert!(
             !adjust(RowId::EchoCancel, -1, false, &mut ctx),
             "mic off = thud"
@@ -745,7 +905,7 @@ mod tests {
         assert!(ctx.settings.echo_cancel, "and nothing was written");
 
         ctx.settings.mic_enabled = true;
-        assert!(row_spec(RowId::EchoCancel, &ctx).enabled);
+        assert!(row_spec(RowId::EchoCancel, &ctx, &[]).enabled);
         assert!(adjust(RowId::EchoCancel, -1, false, &mut ctx));
         assert!(!ctx.settings.echo_cancel);
         assert!(adjust(RowId::EchoCancel, 1, true, &mut ctx));
@@ -771,7 +931,7 @@ mod tests {
             device_name: "t",
             t: 0.0,
         };
-        assert!(!row_spec(RowId::SmoothBuffer, &ctx).enabled);
+        assert!(!row_spec(RowId::SmoothBuffer, &ctx, &[]).enabled);
         assert!(
             !adjust(RowId::SmoothBuffer, 1, false, &mut ctx),
             "latency intent = thud"
@@ -781,14 +941,14 @@ mod tests {
         // Stepping the intent to Smoothness brings the buffer row to life.
         assert!(adjust(RowId::PresentPriority, 1, false, &mut ctx));
         assert_eq!(ctx.settings.present_priority, "smooth");
-        assert!(row_spec(RowId::SmoothBuffer, &ctx).enabled);
+        assert!(row_spec(RowId::SmoothBuffer, &ctx, &[]).enabled);
         assert!(adjust(RowId::SmoothBuffer, 1, false, &mut ctx));
         assert_eq!(ctx.settings.smooth_buffer, 1);
 
         // The intent wraps back and the row goes inert again.
         assert!(adjust(RowId::PresentPriority, -1, false, &mut ctx));
         assert_eq!(ctx.settings.present_priority, "latency");
-        assert!(!row_spec(RowId::SmoothBuffer, &ctx).enabled);
+        assert!(!row_spec(RowId::SmoothBuffer, &ctx, &[]).enabled);
     }
 
     #[test]
@@ -863,5 +1023,111 @@ mod tests {
         };
         assert!(adjust(RowId::Bitrate, 1, false, &mut ctx));
         assert_eq!(ctx.settings.bitrate_kbps, 0, "snapped to Automatic");
+    }
+
+    /// The Profiles section trails the settings rows: one row per catalog profile whose
+    /// value counts the pinned cards in the live model, activating opens the pin screen,
+    /// and left/right (which edits every other row) is a boundary — a profile row
+    /// navigates, it must never fall into the settings save path.
+    #[test]
+    fn profile_rows_navigate_instead_of_editing() {
+        let (mut settings, pads) = ctx_parts();
+        let library = crate::library::LibraryShared::default();
+        let mut pinned = crate::model::HostRow {
+            key: "aa\0p1".into(),
+            name: "Tower".into(),
+            addr: "10.0.0.9".into(),
+            port: 9777,
+            fp_hex: "aa".into(),
+            paired: true,
+            saved: true,
+            online: true,
+            mgmt_port: 47990,
+            can_wake: false,
+            last_used: None,
+            os: String::new(),
+            pin: Some(crate::model::ProfileChip {
+                id: "p1".into(),
+                name: "Work".into(),
+                accent: None,
+            }),
+            bound_profile: None,
+        };
+        let hosts = [pinned.clone(), {
+            pinned.key = "aa".into();
+            pinned.pin = None;
+            pinned
+        }];
+        let mut ctx = Ctx {
+            hosts: &hosts,
+            library: &library,
+            settings: &mut settings,
+            pads: &pads,
+            deck: false,
+            device_name: "t",
+            t: 0.0,
+        };
+        let mut s = SettingsScreen::with_profiles(vec![
+            ("p1".into(), "Work".into()),
+            ("p2".into(), "Game".into()),
+        ]);
+        let ids = s.row_ids();
+        assert_eq!(ids.len(), ROWS.len() + 2);
+        assert_eq!(ids[ROWS.len()], RowId::Profile(0));
+
+        let spec = row_spec(RowId::Profile(0), &ctx, &s.profiles);
+        assert_eq!(spec.header, Some("Profiles"));
+        assert_eq!(spec.label, "Work");
+        assert_eq!(spec.value.as_deref(), Some("Pinned to 1 host"));
+        let spec = row_spec(RowId::Profile(1), &ctx, &s.profiles);
+        assert_eq!(spec.header, None, "only the first row carries the header");
+        assert_eq!(spec.value.as_deref(), Some("Not pinned"));
+
+        s.list.cursor = ROWS.len(); // onto "Work"
+        let mut fx = Outbox::default();
+        s.menu(MenuEvent::Confirm, &mut ctx, &mut fx);
+        assert!(
+            matches!(fx.nav, Some(crate::screens::Nav::Push(b))
+                if matches!(*b, Screen::PinHosts(ref p) if p.profile_name() == "Work")),
+            "A on a profile row opens its pin screen"
+        );
+
+        let mut fx = Outbox::default();
+        let pulse = s.menu(
+            MenuEvent::Move(pf_client_core::gamepad::MenuDir::Right),
+            &mut ctx,
+            &mut fx,
+        );
+        assert!(matches!(pulse, Some(MenuPulse::Boundary)));
+        assert!(fx.nav.is_none() && fx.cmds.is_empty());
+    }
+
+    /// An empty catalog shows the explainer placeholder — present, inert, and dimmed —
+    /// so the section still tells the user where profiles come from.
+    #[test]
+    fn empty_catalog_shows_the_placeholder() {
+        let (mut settings, pads) = ctx_parts();
+        let library = crate::library::LibraryShared::default();
+        let mut ctx = Ctx {
+            hosts: &[],
+            library: &library,
+            settings: &mut settings,
+            pads: &pads,
+            deck: false,
+            device_name: "t",
+            t: 0.0,
+        };
+        let mut s = SettingsScreen::with_profiles(Vec::new());
+        let ids = s.row_ids();
+        assert_eq!(*ids.last().unwrap(), RowId::NoProfiles);
+        let spec = row_spec(RowId::NoProfiles, &ctx, &s.profiles);
+        assert_eq!(spec.header, Some("Profiles"));
+        assert!(!spec.enabled);
+
+        s.list.cursor = ids.len() - 1;
+        let mut fx = Outbox::default();
+        let pulse = s.menu(MenuEvent::Confirm, &mut ctx, &mut fx);
+        assert!(matches!(pulse, Some(MenuPulse::Boundary)));
+        assert!(fx.nav.is_none());
     }
 }

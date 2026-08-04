@@ -1215,6 +1215,186 @@ pub fn target_inventory() -> Vec<TargetInventory> {
     out
 }
 
+/// Crash-recovery journal for the EXCLUSIVE isolate — the marker that lets a *fresh* host undo what
+/// a *dead* one did.
+///
+/// [`isolate_displays_ccd`] deactivates the operator's physical displays and hands the pre-isolate
+/// topology back to its caller, which restores it at teardown ([`restore_displays_ccd`]). That
+/// snapshot lives in **process memory only**, so a host that crashes, is killed, or is stopped
+/// mid-session never restores it. Windows does not restore it either — the isolated topology is
+/// deliberately never saved to the CCD database, precisely so teardown can put the user's layout
+/// back. The result was a field-reported dead end: the physical screen stays dark, no timeout ever
+/// fires, and nothing in the product puts it back (the operator's only recourse was `DisplaySwitch`
+/// or a reboot).
+///
+/// Same shape as [`monitor_devnode`](crate::monitor_devnode)'s PnP journal: write a marker while the
+/// isolate is live, clear it on a clean restore, and re-light the desk at host startup if a marker
+/// survived.
+///
+/// **Why the EXTEND preset rather than replaying the saved CCD blob.** That blob pins target ids
+/// *including the virtual display's*, and the crashed host's monitors die with it (startup reaps the
+/// orphans), so a replay would mostly fail `ERROR_BAD_CONFIGURATION` and land in the very
+/// force-EXTEND backstop [`restore_displays_ccd`] already keeps for that case. EXTEND re-activates
+/// every connected display from the OS's own database, needs no struct serialization, and stays
+/// correct across a reboot — where saved target ids would be stale anyway.
+pub mod isolate_journal {
+    use std::sync::Mutex;
+
+    /// What we last wrote, so the exclusive re-assert watchdog's repeat isolates don't rewrite the
+    /// file every couple of seconds. `None` = "no marker known to be on disk".
+    static LAST: Mutex<Option<Vec<u32>>> = Mutex::new(None);
+
+    fn path() -> std::path::PathBuf {
+        pf_paths::config_dir().join("display-isolate-active.json")
+    }
+
+    /// Record that `deactivated` physical target(s) are switched off for a live exclusive isolate.
+    /// Best-effort: a journal we cannot write costs crash recovery, not the session.
+    pub fn mark(deactivated: &[u32]) {
+        if deactivated.is_empty() {
+            return; // nothing was deactivated ⇒ nothing for a later host to put back
+        }
+        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        if last.as_deref() == Some(deactivated) {
+            return;
+        }
+        let p = path();
+        if let Some(dir) = p.parent() {
+            let _ = pf_paths::create_private_dir(dir);
+        }
+        match std::fs::write(
+            &p,
+            serde_json::to_vec_pretty(deactivated).unwrap_or_default(),
+        ) {
+            Ok(()) => *last = Some(deactivated.to_vec()),
+            Err(e) => tracing::warn!(
+                error = %e,
+                "display isolate: could not write the crash-recovery journal — if this host dies \
+                 mid-session the deactivated panels will stay dark"
+            ),
+        }
+    }
+
+    /// The isolate is over (restored, or there was nothing to restore) — drop the marker.
+    /// Idempotent; safe to call when no marker exists.
+    pub fn clear() {
+        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = std::fs::remove_file(path());
+        *last = None;
+    }
+
+    /// Host-startup crash recovery: if a previous host exited with an exclusive isolate live, its
+    /// physical displays are still deactivated. Re-light them with the EXTEND preset.
+    ///
+    /// Call once, early in `serve`, **before** any session touches the topology. Gated on the marker
+    /// rather than on "is anything active", so a legitimately headless host is never forced awake.
+    pub fn startup_recover() {
+        let Some(targets) = pending() else {
+            return;
+        };
+        tracing::warn!(
+            deactivated = ?targets,
+            "display isolate: a previous host exited with the operator's display(s) deactivated for \
+             an EXCLUSIVE session and never restored them — forcing the EXTEND preset so the desk is \
+             not left dark"
+        );
+        super::force_extend_topology();
+        clear();
+    }
+
+    /// The marker a previous host left behind, if any (its deactivated target ids) — the *decision*
+    /// half of [`startup_recover`], split out so the recovery rule is testable without driving a
+    /// real `SetDisplayConfig` against the machine running the test.
+    pub fn pending() -> Option<Vec<u32>> {
+        let bytes = std::fs::read(path()).ok()?;
+        Some(serde_json::from_slice(&bytes).unwrap_or_default())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// `PUNKTFUNK_CONFIG_DIR` (which `path()` resolves through) and the `LAST` cache are both
+        /// process-global, so these cases must not interleave.
+        static ENV: Mutex<()> = Mutex::new(());
+
+        /// Point the journal at a scratch dir for the duration of one case.
+        fn with_temp_dir(name: &str, f: impl FnOnce(&std::path::Path)) {
+            let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+            let dir = std::env::temp_dir().join(format!("pf-isolate-journal-{name}"));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("scratch dir");
+            std::env::set_var("PUNKTFUNK_CONFIG_DIR", &dir);
+            clear(); // reset the LAST cache + any leftover marker from a previous run
+            f(&dir);
+            clear();
+            std::env::remove_var("PUNKTFUNK_CONFIG_DIR");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// The crash path: a host marks what it switched off and dies. The next start must see the
+        /// marker (and which targets), which is what makes it force the desk back on.
+        #[test]
+        fn a_mark_survives_for_the_next_host_and_clear_retracts_it() {
+            with_temp_dir("roundtrip", |_| {
+                assert_eq!(pending(), None, "a clean box owes no recovery");
+                mark(&[101, 202]);
+                assert_eq!(
+                    pending(),
+                    Some(vec![101, 202]),
+                    "a crashed host's marker must be readable by the next start"
+                );
+                clear();
+                assert_eq!(pending(), None, "a clean teardown retracts the marker");
+            });
+        }
+
+        /// An isolate that deactivated nothing (single-display box: the virtual output is already
+        /// the only head) owes the next start no force-EXTEND — marking there would re-arrange a
+        /// desk we never touched.
+        #[test]
+        fn deactivating_nothing_writes_no_marker() {
+            with_temp_dir("empty", |_| {
+                mark(&[]);
+                assert_eq!(pending(), None);
+            });
+        }
+
+        /// The re-assert watchdog re-isolates every couple of seconds while something fights it;
+        /// that must not mean a disk write per cycle.
+        #[test]
+        fn repeating_the_same_mark_does_not_rewrite_the_file() {
+            with_temp_dir("cached", |dir| {
+                let file = dir.join("display-isolate-active.json");
+                mark(&[7]);
+                // Overwrite behind the journal's back rather than comparing mtimes — a filesystem
+                // whose timestamp resolution is coarser than two back-to-back writes would let an
+                // mtime assertion pass without proving anything.
+                std::fs::write(&file, b"SENTINEL").unwrap();
+                mark(&[7]);
+                assert_eq!(
+                    std::fs::read(&file).unwrap(),
+                    b"SENTINEL",
+                    "an unchanged mark must not rewrite the journal"
+                );
+                // A CHANGED set still lands — the group grew/shrank and recovery must follow it.
+                mark(&[7, 8]);
+                assert_eq!(pending(), Some(vec![7, 8]));
+            });
+        }
+
+        /// A corrupt/truncated journal must still trigger recovery: the FILE's existence is the
+        /// signal ("a host left displays off"), its contents are only diagnostics.
+        #[test]
+        fn an_unparseable_marker_still_asks_for_recovery() {
+            with_temp_dir("corrupt", |dir| {
+                std::fs::write(dir.join("display-isolate-active.json"), b"{ not json").unwrap();
+                assert_eq!(pending(), Some(Vec::new()));
+            });
+        }
+    }
+}
+
 /// Robust display isolation via the CCD API. The naive GDI approach (EnumDisplayDevices +
 /// ChangeDisplaySettings) MISSES displays on a hybrid box — an iGPU-attached physical monitor isn't
 /// flagged `ATTACHED_TO_DESKTOP` in the GDI enum, so it's never detached and the secure desktop /
@@ -1245,6 +1425,18 @@ pub fn isolate_displays_ccd(keep_target_ids: &[u32]) -> Option<SavedConfig> {
         );
         return Some(saved);
     }
+
+    // Journal what we are about to switch off BEFORE the first apply, not after a verified one: the
+    // window this exists to cover includes dying mid-apply. `saved.0` is the ACTIVE path set
+    // (QDC_ONLY_ACTIVE_PATHS), so everything in it outside the keep set is exactly what teardown
+    // owes the operator back. See `isolate_journal`.
+    let doomed: Vec<u32> = saved
+        .0
+        .iter()
+        .map(|p| p.targetInfo.id)
+        .filter(|id| !keep_target_ids.contains(id))
+        .collect();
+    isolate_journal::mark(&doomed);
 
     // Deactivate every non-keep display, then VERIFY and RETRY. A field-reported bug had a physical
     // monitor STAY ACTIVE in exclusive mode, so we don't trust a single SetDisplayConfig: re-query the
@@ -1769,6 +1961,15 @@ static DARK_SINKS_FUTILE: std::sync::Mutex<Vec<(u32, String)>> = std::sync::Mute
 /// removed), re-activating the displays we deactivated.
 // pub so vdisplay::pf_vdisplay can reuse this backend-neutral CCD restore helper.
 pub fn restore_displays_ccd(saved: &SavedConfig) {
+    restore_displays_ccd_inner(saved);
+    // Clear the crash-recovery marker only AFTER the restore (and its dark-desk backstop) has run,
+    // never before: a host that dies part-way through the restore must still leave the marker
+    // behind so the next start re-lights the desk. `_inner` has several early returns, which is
+    // why this wraps rather than trailing the body.
+    isolate_journal::clear();
+}
+
+fn restore_displays_ccd_inner(saved: &SavedConfig) {
     let (paths, modes) = saved;
     if paths.is_empty() {
         return;

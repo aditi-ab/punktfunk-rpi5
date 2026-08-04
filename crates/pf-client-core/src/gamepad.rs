@@ -61,6 +61,23 @@ const ESCAPE_CHORD: [u32; 4] = [wire::BTN_LB, wire::BTN_RB, wire::BTN_START, wir
 /// Hold the [`ESCAPE_CHORD`] at least this long to disconnect (escalates the leave-fullscreen press).
 const DISCONNECT_HOLD: Duration = Duration::from_millis(1500);
 
+/// Hold Select/Back ALONE at least this long to send the HOST the guide button — the
+/// [`SelectGesture`], armed by [`Settings::guide_gesture`]. The synthetic guide stays down
+/// for as long as Select is held, so a long hold IS the host's long-press (the QAM on a
+/// Gaming-Mode host). Exists because on some platforms the physical guide press can never
+/// reach the host cleanly: the local shell reserves it (iOS's Game Overlay, tvOS) or
+/// reacts to it in parallel (Gaming Mode's Steam UI — see [`Settings::system_buttons`]).
+///
+/// [`Settings::guide_gesture`]: crate::trust::Settings::guide_gesture
+/// [`Settings::system_buttons`]: crate::trust::Settings::system_buttons
+const GUIDE_HOLD: Duration = Duration::from_millis(350);
+
+/// A held-back Select TAP is delivered as a press with its release scheduled this far
+/// behind — never back-to-back: per-transition sends are folded into seq'd `GamepadState`
+/// snapshots by the core input task, and a down+up inside one fold window can coalesce
+/// into no press at all.
+const TAP_PRESS: Duration = Duration::from_millis(50);
+
 /// Steam Deck actuator-decay keepalive cadence, declared to the core's rumble policy engine as an
 /// [`ActuatorQuirks`] at slot open. The Deck's built-in actuator decays inside SDL's ~2 s internal
 /// rumble resend (`SDL_RUMBLE_RESEND_MS`) and SDL short-circuits an identical `set_rumble` value
@@ -285,6 +302,21 @@ fn set_valve_hidapi(enabled: bool) {
     sdl3::hint::set("SDL_JOYSTICK_HIDAPI_STEAM", v);
 }
 
+/// Disable the Valve HIDAPI drivers **before SDL exists** — call this alongside the other
+/// pre-`SDL_Init` hints, not after a subsystem is up.
+///
+/// The damage these drivers do happens at *enumeration*, which is part of initialising the
+/// joystick/gamepad subsystem. Setting the hint afterwards does detach the driver, but only after
+/// it has already sent the Deck its `ID_CLEAR_DIGITAL_MAPPINGS` + `TRACKPAD_NONE` — so the
+/// built-in trackpad-mouse dies system-wide and stays dead until the firmware watchdog restores
+/// lizard mode seconds later. The threaded worker ([`run`]) has always done this in the right
+/// order; the caller-pumped path could not, because by the time it receives a
+/// [`sdl3::GamepadSubsystem`] the enumeration has already happened. Hence a separate entry point
+/// its callers can put in the right place.
+pub fn preinit_disable_valve_hidapi() {
+    set_valve_hidapi(false);
+}
+
 /// Map the SDL-reported controller type to the virtual pad we'd ask the host to create.
 fn pref_for_type(t: sdl3::gamepad::GamepadType) -> GamepadPref {
     use sdl3::gamepad::GamepadType as T;
@@ -337,6 +369,8 @@ enum Ctl {
     Pin(Option<String>),
     KindOverride(GamepadPref),
     Forwarding(bool),
+    SystemButtons { forward_raw: bool, gesture: bool },
+    TapButton(u32),
     MenuMode(bool),
     MenuRumble(MenuPulse),
 }
@@ -393,9 +427,12 @@ impl GamepadService {
     /// and calls [`GamepadPump::tick`] once per loop iteration (the threaded worker's
     /// per-wakeup work: ctl drain, chord-hold check, menu repeat, feedback).
     ///
-    /// Like the threaded worker, this disables the Valve HIDAPI drivers up front (their
-    /// mere enumeration kills the Deck's trackpad-mouse system-wide); they are enabled
-    /// for the duration of an attached session only.
+    /// The Valve HIDAPI drivers are held off here too, but this is **too late to be the only
+    /// place it happens**: the `subsystem` argument means enumeration is already done, and that
+    /// is when the Deck driver kills the trackpad-mouse. The caller must also call
+    /// [`preinit_disable_valve_hidapi`] with its other pre-`SDL_Init` hints. This call still
+    /// earns its place — it re-asserts "off" for a process that ran a session earlier — but on
+    /// its own it only detaches a driver that has already done the damage.
     pub fn pumped(subsystem: sdl3::GamepadSubsystem) -> (GamepadService, GamepadPump) {
         set_valve_hidapi(false);
         let pads = Arc::new(Mutex::new(Vec::new()));
@@ -503,6 +540,39 @@ impl GamepadService {
         let _ = self.ctl.send(Ctl::Forwarding(on));
     }
 
+    /// The session's system-button policy, resolved from
+    /// [`Settings::system_buttons_forward`] × [`Settings::guide_gesture_enabled`]:
+    /// `forward_raw` gates the physical guide/QAM presses onto the wire (off = they stay
+    /// with the local shell — the Gaming-Mode default, where Steam reacts to them no
+    /// matter what and forwarding opens BOTH overlays); `gesture` arms the hold-Select
+    /// guide gesture ([`GUIDE_HOLD`]), the alternate route that keeps the host's guide —
+    /// and, held longer, a Gaming-Mode host's QAM — reachable from a controller.
+    ///
+    /// [`Settings::system_buttons_forward`]: crate::trust::Settings::system_buttons_forward
+    /// [`Settings::guide_gesture_enabled`]: crate::trust::Settings::guide_gesture_enabled
+    pub fn set_system_buttons(&self, forward_raw: bool, gesture: bool) {
+        let _ = self.ctl.send(Ctl::SystemButtons {
+            forward_raw,
+            gesture,
+        });
+    }
+
+    /// One-shot synthetic tap of the HOST's guide button ([`Ctl::TapButton`]): down now,
+    /// up [`TAP_PRESS`] later, on the first forwarded slot's wire index (pad 0 when none
+    /// is open). The session control socket's "press the host's Steam/guide button" verb
+    /// — the Decky panel's UI route to the host overlay. No-op while no session is
+    /// attached.
+    pub fn tap_guide(&self) {
+        let _ = self.ctl.send(Ctl::TapButton(wire::BTN_GUIDE));
+    }
+
+    /// Like [`Self::tap_guide`] for the quick-access button (`MISC1` — the Deck `…`).
+    /// Opens the QAM on a Gaming-Mode host whose virtual pad is Deck-shaped; other
+    /// virtual pads map it to their own misc button (or drop it) — harmless.
+    pub fn tap_qam(&self) {
+        let _ = self.ctl.send(Ctl::TapButton(wire::BTN_MISC1));
+    }
+
     pub fn attach(&self, connector: Arc<NativeClient>) {
         let _ = self.ctl.send(Ctl::Attach(connector));
     }
@@ -552,9 +622,42 @@ impl GamepadPump {
     /// chord-hold and haptics inside the threaded worker's tolerances).
     pub fn tick(&mut self) {
         let _ = self.worker.drain_ctl(&self.ctl_rx);
+        self.worker.gesture_poll();
         self.worker.maybe_fire_disconnect();
         self.worker.menu_poll();
         self.worker.render_feedback();
+    }
+
+    /// Close every forwarded slot — flush its held wire state, tell the host to remove the pad,
+    /// and physically silence it. Call once on the way out of the caller's event loop.
+    ///
+    /// [`GamepadService::detach`] only *posts* `Ctl::Detach`; the close — the flush, the host-side
+    /// `GamepadRemove`, and the explicit `set_rumble(0, 0)` backstop in `close_slot_at` — happens
+    /// when the pump next drains it. An exit path that detached and then left the loop without
+    /// another [`tick`](Self::tick) therefore skipped all of it, and nothing else would: the slots
+    /// hold no `Drop` that silences them. A pad left mid-buzz stayed buzzing.
+    ///
+    /// This closes the slots directly rather than draining the queued `Ctl::Detach` that would
+    /// have done it. Same physical outcome by a shorter path, and deliberately so: this also runs
+    /// from `Drop`, and `drain_ctl` reaches `Mutex::lock().unwrap()`, which on a poisoned lock
+    /// would panic — during an unwind that aborts the process. Closing a slot touches no lock.
+    ///
+    /// Idempotent, and safe with nothing attached.
+    pub fn shutdown(&mut self) {
+        self.worker.close_all_slots();
+    }
+}
+
+/// The silence backstop of last resort. A caller's loop can also leave by `?` on a fatal overlay
+/// or present error — several paths do — and those would skip an explicit
+/// [`shutdown`](GamepadPump::shutdown) entirely, leaving a forwarded pad buzzing on the way out.
+///
+/// Callers should still call `shutdown` at their normal exit rather than lean on this: the pad
+/// wants to go quiet *before* a long teardown (session join, `vkDeviceWaitIdle`), not after it.
+/// Doing both is free — `shutdown` is idempotent.
+impl Drop for GamepadPump {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
 
@@ -698,6 +801,9 @@ struct Slot {
     /// close lift a click held across detach/unplug.
     held_clicks: [bool; 2],
     last_accel: [i16; 3],
+    /// Hold-Select→guide state ([`SelectGesture`]) — only fed while the worker's
+    /// `guide_gesture` policy is on.
+    gesture: SelectGesture,
 }
 
 impl Slot {
@@ -713,6 +819,7 @@ impl Slot {
             surface_last: [(0, 0, false); 2],
             held_clicks: [false; 2],
             last_accel: [0; 3],
+            gesture: SelectGesture::default(),
         }
     }
 
@@ -720,6 +827,98 @@ impl Slot {
     /// surface encoding and the pad-click button re-route.
     fn is_multi_touchpad(&self) -> bool {
         self.pad.touchpads_count() >= 2
+    }
+}
+
+/// Per-slot hold-Select→guide state machine (see [`GUIDE_HOLD`]). Pure — fed transitions
+/// and polled with a clock, it emits the wire sends due as `(button bit, down)` pairs —
+/// so the timing rules are testable without SDL or a live session.
+///
+/// The rules:
+/// - Select pressed ALONE is held back (pending). Any other button already down means
+///   Select is part of a combo — the escape chord ends in it — and passes through.
+/// - A button pressed WHILE Select is pending makes it a real Select after all; its
+///   deferred down goes out first, preserving chronology.
+/// - Pending past [`GUIDE_HOLD`] becomes a synthetic guide, down until Select releases.
+/// - Released before the threshold, it's a TAP: press delivered on release, the release
+///   itself [`TAP_PRESS`] behind it (back-to-back transitions can fold into nothing).
+#[derive(Default)]
+struct SelectGesture {
+    /// Select is down and held back — tap-or-guide undecided.
+    pending_since: Option<Instant>,
+    /// The held-back Select became a synthetic guide; its release lifts the guide.
+    as_guide: bool,
+    /// A delivered tap's release is owed at this time.
+    release_due: Option<Instant>,
+}
+
+impl SelectGesture {
+    /// Select went down (`alone` = no other button held on this slot). Returns true when
+    /// the press is held back; false lets the caller forward it as a normal button.
+    fn on_select_down(&mut self, now: Instant, alone: bool, out: &mut Vec<(u32, bool)>) -> bool {
+        // A previous tap's scheduled release still owed: lift it before the new press.
+        if self.release_due.take().is_some() {
+            out.push((wire::BTN_BACK, false));
+        }
+        if alone {
+            self.pending_since = Some(now);
+            return true;
+        }
+        false
+    }
+
+    /// Another button went down on this slot: a pending Select is a real Select after
+    /// all — its deferred down goes out before the caller sends the new button's.
+    fn on_other_down(&mut self, out: &mut Vec<(u32, bool)>) {
+        if self.pending_since.take().is_some() {
+            out.push((wire::BTN_BACK, true));
+        }
+    }
+
+    /// Select released. Returns true when the gesture owned this release (the caller
+    /// skips the normal button-up send).
+    fn on_select_up(&mut self, now: Instant, out: &mut Vec<(u32, bool)>) -> bool {
+        if self.as_guide {
+            self.as_guide = false;
+            out.push((wire::BTN_GUIDE, false));
+            return true;
+        }
+        if self.pending_since.take().is_some() {
+            // A tap: deliver the held-back press now, its release TAP_PRESS behind.
+            out.push((wire::BTN_BACK, true));
+            self.release_due = Some(now + TAP_PRESS);
+            return true;
+        }
+        false
+    }
+
+    /// Clock-driven work: the hold threshold and the owed tap release.
+    fn poll(&mut self, now: Instant, out: &mut Vec<(u32, bool)>) {
+        if let Some(since) = self.pending_since {
+            if now.duration_since(since) >= GUIDE_HOLD {
+                self.pending_since = None;
+                self.as_guide = true;
+                out.push((wire::BTN_GUIDE, true));
+            }
+        }
+        if let Some(due) = self.release_due {
+            if now >= due {
+                self.release_due = None;
+                out.push((wire::BTN_BACK, false));
+            }
+        }
+    }
+
+    /// Slot close / gesture disarm: nothing may stay down (or owed) on the wire.
+    fn flush(&mut self, out: &mut Vec<(u32, bool)>) {
+        self.pending_since = None;
+        if self.as_guide {
+            self.as_guide = false;
+            out.push((wire::BTN_GUIDE, false));
+        }
+        if self.release_due.take().is_some() {
+            out.push((wire::BTN_BACK, false));
+        }
     }
 }
 
@@ -750,6 +949,14 @@ struct Worker {
     /// `Auto` = per-pad detection. Applied at slot open to the kind DECLARED to the host, never
     /// to [`Slot::pref`] — the local feedback paths must keep reading the physical pad.
     kind_override: GamepadPref,
+    /// Forward raw guide/QAM presses ([`GamepadService::set_system_buttons`]); off keeps
+    /// them with the local shell.
+    system_forward: bool,
+    /// The hold-Select guide gesture is armed ([`GamepadService::set_system_buttons`]).
+    guide_gesture: bool,
+    /// Releases owed for synthetic taps ([`Ctl::TapButton`]): `(pad, bit, due)` — the
+    /// down went out on receipt, the up goes out from the poll once `due` passes.
+    synthetic_ups: Vec<(u8, u32, Instant)>,
     attached: Option<Arc<NativeClient>>,
     /// Raises the UI escape signal; the escape chord fires it once per press.
     escape_tx: async_channel::Sender<()>,
@@ -1081,6 +1288,14 @@ impl Worker {
     /// Emits wire events only (no SDL device calls), so it is safe against an already-removed pad.
     fn flush_slot(c: &NativeClient, slot: &mut Slot) {
         let pad = slot.index;
+        // Gesture first: a synthetic guide is NOT in `held_buttons`, so the drain below
+        // would never lift it — and a still-pending Select was never sent, so dropping
+        // it beats delivering a ghost press into the close.
+        let mut due = Vec::new();
+        slot.gesture.flush(&mut due);
+        for (b, down) in due {
+            send(c, InputKind::GamepadButton, b, down as i32, pad);
+        }
         for b in slot.held_buttons.drain(..) {
             send(c, InputKind::GamepadButton, b, 0, pad);
         }
@@ -1155,6 +1370,36 @@ impl Worker {
             tracing::info!(
                 "gamepad escape chord (L1+R1+Start+Select) — leaving fullscreen (hold to disconnect)"
             );
+        }
+    }
+
+    /// Clock-driven [`SelectGesture`] work — the hold threshold and owed tap releases —
+    /// polled like the chord hold, so timings carry at most one wakeup (~10 ms attached)
+    /// of jitter.
+    fn gesture_poll(&mut self) {
+        let Some(c) = self.attached.clone() else {
+            self.synthetic_ups.clear();
+            return;
+        };
+        let now = Instant::now();
+        // Owed releases of synthetic taps (the control socket's guide/QAM verbs).
+        self.synthetic_ups.retain(|&(pad, bit, due)| {
+            if now >= due {
+                send(&c, InputKind::GamepadButton, bit, 0, pad);
+                false
+            } else {
+                true
+            }
+        });
+        if !self.guide_gesture {
+            return;
+        }
+        for slot in &mut self.slots {
+            let mut due = Vec::new();
+            slot.gesture.poll(now, &mut due);
+            for (b, down) in due {
+                send(&c, InputKind::GamepadButton, b, down as i32, slot.index);
+            }
         }
     }
 
@@ -1335,6 +1580,41 @@ impl Worker {
                     self.refresh_active();
                 }
                 Ok(Ctl::KindOverride(pref)) => self.kind_override = pref,
+                Ok(Ctl::SystemButtons {
+                    forward_raw,
+                    gesture,
+                }) => {
+                    self.system_forward = forward_raw;
+                    if self.guide_gesture == gesture {
+                        continue;
+                    }
+                    self.guide_gesture = gesture;
+                    // A mid-session flip may strand gesture state — a synthetic guide
+                    // still down, an owed tap release — lift it now (no-op on the way on:
+                    // an unarmed gesture was never fed).
+                    if let Some(c) = self.attached.clone() {
+                        for slot in &mut self.slots {
+                            let mut due = Vec::new();
+                            slot.gesture.flush(&mut due);
+                            for (b, down) in due {
+                                send(&c, InputKind::GamepadButton, b, down as i32, slot.index);
+                            }
+                        }
+                    }
+                }
+                Ok(Ctl::TapButton(bit)) => {
+                    // Synthetic system-button tap (the session control socket): down on
+                    // the first forwarded slot's index — pad 0 when none is open (a
+                    // forwarding-off session; best-effort there, the wire pad may not
+                    // exist host-side). The up is owed via `synthetic_ups`, TAP_PRESS
+                    // later, so the pair can't fold into nothing.
+                    if let Some(c) = self.attached.clone() {
+                        let pad = self.slots.first().map_or(0, |s| s.index);
+                        send(&c, InputKind::GamepadButton, bit, 1, pad);
+                        self.synthetic_ups
+                            .push((pad, bit, Instant::now() + TAP_PRESS));
+                    }
+                }
                 Ok(Ctl::Forwarding(on)) => {
                     if self.forwarding == on {
                         continue;
@@ -1435,8 +1715,32 @@ impl Worker {
                     return;
                 }
                 if let Some(bit) = button_bit(button) {
+                    // Raw system buttons stay with the local shell when passthrough is
+                    // off (the Gaming-Mode default): Steam already opened ITS overlay
+                    // for this press; the host's is reached via the hold-Select gesture
+                    // (and the Decky panel) instead.
+                    if !self.system_forward && matches!(bit, wire::BTN_GUIDE | wire::BTN_MISC1) {
+                        return;
+                    }
+                    let mut due = Vec::new();
+                    let held_back = if !self.guide_gesture {
+                        false
+                    } else if bit == wire::BTN_BACK {
+                        let alone = slot.held_buttons.is_empty();
+                        slot.gesture.on_select_down(Instant::now(), alone, &mut due)
+                    } else {
+                        slot.gesture.on_other_down(&mut due);
+                        false
+                    };
+                    for (b, down) in due {
+                        send(&c, InputKind::GamepadButton, b, down as i32, slot.index);
+                    }
+                    // Held-back or not, the chord bookkeeping sees the physical press —
+                    // the escape chord must not care that the gesture exists.
                     slot.held_buttons.push(bit);
-                    send(&c, InputKind::GamepadButton, bit, 1, slot.index);
+                    if !held_back {
+                        send(&c, InputKind::GamepadButton, bit, 1, slot.index);
+                    }
                     self.maybe_fire_escape();
                 }
             }
@@ -1452,8 +1756,20 @@ impl Worker {
                     return;
                 }
                 if let Some(bit) = button_bit(button) {
+                    if !self.system_forward && matches!(bit, wire::BTN_GUIDE | wire::BTN_MISC1) {
+                        return;
+                    }
                     slot.held_buttons.retain(|&b| b != bit);
-                    send(&c, InputKind::GamepadButton, bit, 0, slot.index);
+                    let mut due = Vec::new();
+                    let owned = self.guide_gesture
+                        && bit == wire::BTN_BACK
+                        && slot.gesture.on_select_up(Instant::now(), &mut due);
+                    for (b, down) in due {
+                        send(&c, InputKind::GamepadButton, b, down as i32, slot.index);
+                    }
+                    if !owned {
+                        send(&c, InputKind::GamepadButton, bit, 0, slot.index);
+                    }
                     self.rearm_escape();
                 }
             }
@@ -1656,6 +1972,11 @@ impl Worker {
                 HidOutput::PlayerLeds { bits, .. } if is_ds => {
                     let _ = slot.pad.send_effect(&Ds5Feedback::player_packet(bits));
                 }
+                // Every other pad with player LEDs gets them through SDL, which owns the
+                // per-device pattern. This used to fall through and do nothing at all.
+                HidOutput::PlayerLeds { bits, .. } => {
+                    let _ = set_player_leds(&slot.pad, bits);
+                }
                 HidOutput::Trigger {
                     which, ref effect, ..
                 } if is_ds => {
@@ -1663,9 +1984,40 @@ impl Worker {
                         .pad
                         .send_effect(&Ds5Feedback::trigger_packet(which, effect));
                 }
-                _ => {}
+                // Deliberately unhandled, listed rather than left to a bare `_` so a new
+                // variant cannot join them silently: adaptive triggers exist only on a
+                // DualSense, and the trackpad-haptic / raw-passthrough planes are DS-specific
+                // and carried by `send_effect` above when the pad is one.
+                HidOutput::Trigger { .. }
+                | HidOutput::TrackpadHaptic { .. }
+                | HidOutput::HidRaw { .. } => {}
             }
         }
+    }
+}
+
+/// The SDL player index for the wire's positional player-LED `bits`, or `None` for "no player".
+///
+/// The wire carries a bitmask — one bit per LED, low 5 — while SDL wants a player *index* and owns
+/// the per-device pattern. The count bridges them: every convention that reaches this wire spells
+/// "player N" as N lit LEDs, both the DualSense patterns (`0x04`, `0x0A`, `0x15`, `0x1B`, `0x1F`)
+/// and the Switch/XInput run of low bits (`0x01`, `0x03`, `0x07`, `0x0F`). SDL's index is 0-based,
+/// so player 1 is index 0; no lit LED means *no* player rather than player 0.
+///
+/// Split out from [`set_player_leds`] so the mapping is testable — an `sdl3::Gamepad` needs a real
+/// device, so nothing that takes one can be.
+fn player_index_from_bits(bits: u8) -> Option<u16> {
+    match (bits & 0x1F).count_ones() {
+        0 => None,
+        n => Some((n - 1) as u16),
+    }
+}
+
+/// Drive a non-DualSense pad's player LEDs from the wire's positional `bits`.
+fn set_player_leds(pad: &sdl3::gamepad::Gamepad, bits: u8) -> Result<(), sdl3::Error> {
+    match player_index_from_bits(bits) {
+        None => pad.unset_player_index(),
+        Some(i) => pad.set_player_index(i),
     }
 }
 
@@ -1701,6 +2053,9 @@ impl Worker {
             pinned: None,
             forwarding: true,
             kind_override: GamepadPref::Auto,
+            system_forward: true,
+            guide_gesture: false,
+            synthetic_ups: Vec::new(),
             attached: None,
             escape_tx,
             disconnect_tx,
@@ -1772,10 +2127,120 @@ fn run(
 
         // Escalate a held escape chord to a disconnect (polled — the hold completes with no
         // new button events; the chord itself is only detected while a session is attached).
+        w.gesture_poll();
         w.maybe_fire_disconnect();
 
         w.menu_poll();
         w.render_feedback();
+    }
+}
+
+#[cfg(test)]
+mod select_gesture_tests {
+    use super::*;
+
+    #[test]
+    fn tap_delivers_press_then_scheduled_release() {
+        let mut g = SelectGesture::default();
+        let t = Instant::now();
+        let mut out = Vec::new();
+        assert!(g.on_select_down(t, true, &mut out), "not held back");
+        assert!(out.is_empty(), "a held-back press sends nothing yet");
+        // Released inside the threshold: the press goes out on release…
+        let up = t + Duration::from_millis(120);
+        assert!(g.on_select_up(up, &mut out));
+        assert_eq!(out, vec![(wire::BTN_BACK, true)]);
+        out.clear();
+        // …and the release only TAP_PRESS behind it, so the pair can't fold away.
+        g.poll(up + TAP_PRESS - Duration::from_millis(1), &mut out);
+        assert!(out.is_empty(), "release went out early");
+        g.poll(up + TAP_PRESS, &mut out);
+        assert_eq!(out, vec![(wire::BTN_BACK, false)]);
+    }
+
+    #[test]
+    fn hold_becomes_guide_down_until_release() {
+        let mut g = SelectGesture::default();
+        let t = Instant::now();
+        let mut out = Vec::new();
+        assert!(g.on_select_down(t, true, &mut out));
+        g.poll(t + GUIDE_HOLD - Duration::from_millis(1), &mut out);
+        assert!(out.is_empty(), "guide fired inside the threshold");
+        g.poll(t + GUIDE_HOLD, &mut out);
+        assert_eq!(out, vec![(wire::BTN_GUIDE, true)]);
+        out.clear();
+        // Held on: nothing more (the host times its own long-press = QAM).
+        g.poll(t + GUIDE_HOLD * 4, &mut out);
+        assert!(out.is_empty());
+        // Release lifts the guide, never a Select.
+        assert!(g.on_select_up(t + GUIDE_HOLD * 5, &mut out));
+        assert_eq!(out, vec![(wire::BTN_GUIDE, false)]);
+    }
+
+    #[test]
+    fn second_button_makes_pending_select_real() {
+        let mut g = SelectGesture::default();
+        let t = Instant::now();
+        let mut out = Vec::new();
+        assert!(g.on_select_down(t, true, &mut out));
+        // A joins inside the window: the deferred Select down goes out first (the
+        // caller then sends A's own down — chronology preserved).
+        g.on_other_down(&mut out);
+        assert_eq!(out, vec![(wire::BTN_BACK, true)]);
+        out.clear();
+        // The release is a normal button-up now — the gesture doesn't own it.
+        assert!(!g.on_select_up(t + Duration::from_millis(200), &mut out));
+        assert!(out.is_empty());
+        // And no stale guide fires later.
+        g.poll(t + GUIDE_HOLD * 2, &mut out);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn select_inside_a_combo_passes_through() {
+        let mut g = SelectGesture::default();
+        let mut out = Vec::new();
+        // L1+R1+Start already down (the escape chord ends in Select): not held back.
+        assert!(!g.on_select_down(Instant::now(), false, &mut out));
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn quick_repress_lifts_owed_release_first() {
+        let mut g = SelectGesture::default();
+        let t = Instant::now();
+        let mut out = Vec::new();
+        assert!(g.on_select_down(t, true, &mut out));
+        assert!(g.on_select_up(t + Duration::from_millis(80), &mut out));
+        out.clear();
+        // Re-pressed before the owed release fired: the up goes out before the new
+        // press is held back — the host never sees two downs in a row.
+        assert!(g.on_select_down(t + Duration::from_millis(100), true, &mut out));
+        assert_eq!(out, vec![(wire::BTN_BACK, false)]);
+    }
+
+    #[test]
+    fn flush_lifts_synthetic_guide_and_owed_release() {
+        let mut g = SelectGesture::default();
+        let t = Instant::now();
+        let mut out = Vec::new();
+        // Transformed hold: flush lifts the guide.
+        assert!(g.on_select_down(t, true, &mut out));
+        g.poll(t + GUIDE_HOLD, &mut out);
+        out.clear();
+        g.flush(&mut out);
+        assert_eq!(out, vec![(wire::BTN_GUIDE, false)]);
+        out.clear();
+        // Owed tap release: flush emits it. A pending (never-sent) Select just drops.
+        assert!(g.on_select_down(t, true, &mut out));
+        assert!(g.on_select_up(t + Duration::from_millis(80), &mut out));
+        out.clear();
+        g.flush(&mut out);
+        assert_eq!(out, vec![(wire::BTN_BACK, false)]);
+        out.clear();
+        assert!(g.on_select_down(t, true, &mut out));
+        g.flush(&mut out);
+        assert!(out.is_empty(), "a never-sent pending Select ghosted a send");
     }
 }
 
@@ -2079,5 +2544,45 @@ mod reset_packet_tests {
         let pl = Ds5Feedback::player_packet(0);
         assert_eq!(pl[1], 0x10, "player-LED enable bit");
         assert_eq!(pl[Ds5Feedback::PAD_LIGHTS], 0);
+    }
+}
+
+#[cfg(test)]
+mod player_led_tests {
+    use super::*;
+
+    /// Both conventions that reach this wire spell "player N" as N lit LEDs, so the count is the
+    /// player number regardless of WHICH bits a given pad lights. Pinned because the mapping is
+    /// otherwise only obvious once you have seen both patterns side by side.
+    #[test]
+    fn player_index_counts_lit_leds_for_both_conventions() {
+        // DualSense / hid-playstation patterns — non-contiguous, symmetric about the centre LED.
+        assert_eq!(player_index_from_bits(0x04), Some(0)); // player 1
+        assert_eq!(player_index_from_bits(0x0A), Some(1)); // player 2
+        assert_eq!(player_index_from_bits(0x15), Some(2)); // player 3
+        assert_eq!(player_index_from_bits(0x1B), Some(3)); // player 4
+        assert_eq!(player_index_from_bits(0x1F), Some(4)); // player 5
+
+        // Switch/XInput style — a contiguous run of low bits, the same count each time.
+        assert_eq!(player_index_from_bits(0x01), Some(0));
+        assert_eq!(player_index_from_bits(0x03), Some(1));
+        assert_eq!(player_index_from_bits(0x07), Some(2));
+        assert_eq!(player_index_from_bits(0x0F), Some(3));
+    }
+
+    /// No lit LED is "no player", NOT player 0 — the difference between LEDs off and player 1 lit.
+    #[test]
+    fn no_lit_led_is_no_player() {
+        assert_eq!(player_index_from_bits(0x00), None);
+        // Only the low 5 bits are player LEDs; junk above them must not invent a player.
+        assert_eq!(player_index_from_bits(0xE0), None);
+    }
+
+    /// The mask is applied before counting, so out-of-range bits cannot inflate the index past
+    /// the 5 real LEDs.
+    #[test]
+    fn high_bits_are_masked_off_before_counting() {
+        assert_eq!(player_index_from_bits(0xFF), Some(4)); // 0x1F worth of LEDs, not 8
+        assert_eq!(player_index_from_bits(0xE4), Some(0)); // 0x04 with junk on top
     }
 }

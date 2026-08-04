@@ -11,8 +11,9 @@ Both live in the client apps — the Apple app, the Linux GTK client, the Window
 Android app. Neither exists in the host's [web console](/docs/web-console).
 
 The controller-driven surfaces are a half-exception: Apple TV, the Android app's console mode and
-the Steam Deck console the Decky plugin launches all *use* the profile a host is bound to, but none
-of them can create or edit one. Do that on a desktop or a phone first.
+the Steam Deck console the Decky plugin launches all *use* the profile a host is bound to and can
+pin one as its own card, but none of them can create or edit one. Do that on a desktop or a phone
+first. The Decky panel itself only *shows* those pins, nested under their host as one-tap cards.
 
 ## What a profile is
 

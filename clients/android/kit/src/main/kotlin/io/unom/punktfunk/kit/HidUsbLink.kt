@@ -14,8 +14,8 @@ import android.hardware.usb.UsbRequest
 import android.os.Build
 import android.util.Log
 import java.nio.ByteBuffer
-import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.TimeoutException
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Generic USB transport for a client-captured HID controller — the device-agnostic half of what
@@ -81,13 +81,19 @@ class HidUsbLink(
 
     /** Pending OUT reports, submitted by the reader thread — only one thread may drive a
      *  connection's [UsbRequest]s ([UsbDeviceConnection.requestWait] returns ANY completed
-     *  request; a second waiter would steal the reader's completions). */
-    private val outQueue = ConcurrentLinkedQueue<ByteArray>()
+     *  request; a second waiter would steal the reader's completions). See [OutReportQueue] for
+     *  what gets discarded when it fills, and why that is not simply "the oldest". */
+    private val outQueue = OutReportQueue()
 
     private var reader: Thread? = null
     private var detachReceiver: BroadcastReceiver? = null
 
     @Volatile private var running = false
+
+    /** Latches on the first "this link is down" signal so [onClosed] fires exactly once, however
+     *  many of the racing detectors (detach broadcast, reader error streak, failed re-queue) see
+     *  it. Reset by [start]. */
+    private val down = AtomicBoolean(false)
 
     /** First attached matching device, or null. Does not need USB permission to enumerate. */
     fun findDevice(): UsbDevice? = usb.deviceList.values.firstOrNull(config.deviceMatch)
@@ -114,6 +120,7 @@ class HidUsbLink(
         connection = conn
         device = dev
         claims = claimed
+        down.set(false)
         running = true
         Log.i(
             config.tag,
@@ -134,10 +141,7 @@ class HidUsbLink(
                 val gone: UsbDevice? = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE)
                 if (gone?.deviceName == dev.deviceName) {
                     Log.i(config.tag, "USB detached (${dev.deviceName})")
-                    if (running) {
-                        running = false
-                        onClosed()
-                    }
+                    linkDown()
                 }
             }
         }
@@ -221,6 +225,9 @@ class HidUsbLink(
         if (live.isEmpty()) {
             Log.e(config.tag, "no IN request could be queued")
             finishReader(claims)
+            // `start` already returned true, so without this the owner would sit waiting on a
+            // capture that never streams and never reports itself dead.
+            linkDown()
             return
         }
         val scratch = ByteArray(64)
@@ -295,10 +302,23 @@ class HidUsbLink(
         } finally {
             finishReader(claims)
         }
-        if (running) {
-            running = false
-            onClosed()
-        }
+        linkDown()
+    }
+
+    /**
+     * Report the link down, exactly once, from whichever detector noticed first — the detach
+     * broadcast (main thread) or the reader thread on its way out.
+     *
+     * This only *signals*; releasing the connection and the interfaces stays the owner's job, via
+     * the [stop] its `onClosed` handler calls. Previously nothing released them on this path: the
+     * detach receiver flipped a flag and fired the callback, so an unplug left the connection open,
+     * the interfaces claimed (the pad could not return to Android's own input stack) and the
+     * receiver still registered — and a re-plug overwrote the field holding it, leaking a receiver
+     * that stayed live for the process's lifetime.
+     */
+    private fun linkDown() {
+        running = false
+        if (down.compareAndSet(false, true)) onClosed()
     }
 
     private fun finishReader(claims: List<Claim>) {
@@ -314,28 +334,35 @@ class HidUsbLink(
      * Write one raw report to the device: kind 0 = output report (the active interface's
      * interrupt-OUT, else a `SET_REPORT(Output)` control transfer), kind 1 = feature report
      * (`SET_REPORT(Feature)`). [data] is the full report, id byte first, hidapi framing.
+     *
+     * [coalesce] tells the pending-OUT queue whether a newer report of the same kind may replace
+     * this one — [OutReportQueue.KEY_RUMBLE] for motor levels, the default [OutReportQueue.NO_COALESCE]
+     * for one-shots (lightbar, player LEDs, trigger effects) the sender will not repeat.
+     *
+     * Returns whether the report reached the device or is queued for it. A caller that is writing
+     * a **stop** needs this: a discarded stop has nothing behind it, so it must not be mistaken
+     * for one that landed.
      */
-    fun writeRaw(kind: Int, data: ByteArray) {
-        if (data.isEmpty()) return
-        when (kind) {
+    fun writeRaw(kind: Int, data: ByteArray, coalesce: Int = OutReportQueue.NO_COALESCE): Boolean {
+        if (data.isEmpty()) return false
+        return when (kind) {
             0 -> {
                 if ((activeClaim ?: claims.firstOrNull())?.outReq != null) {
-                    // Interrupt-OUT rides UsbRequests submitted by the reader thread. Bounded,
-                    // newest-wins: these are level-styled commands the sender re-sends anyway.
-                    while (outQueue.size >= 32) outQueue.poll()
-                    outQueue.offer(data)
+                    // Interrupt-OUT rides UsbRequests submitted by the reader thread.
+                    outQueue.offer(data, coalesce)
                 } else {
                     setReport(REPORT_TYPE_OUTPUT, data)
                 }
             }
             1 -> setReport(REPORT_TYPE_FEATURE, data)
+            else -> false
         }
     }
 
-    private fun setReport(type: Int, data: ByteArray) {
-        val conn = connection ?: return
-        val ifId = (activeClaim ?: claims.firstOrNull())?.iface?.id ?: return
-        sendReport(conn, ifId, type, data)
+    private fun setReport(type: Int, data: ByteArray): Boolean {
+        val conn = connection ?: return false
+        val ifId = (activeClaim ?: claims.firstOrNull())?.iface?.id ?: return false
+        return sendReport(conn, ifId, type, data)
     }
 
     /**
@@ -344,9 +371,8 @@ class HidUsbLink(
      * queue would never drain (e.g. a rumble stop before the interfaces release). Safe from any
      * thread: EP0 control transfers are independent of the reader's `requestWait`.
      */
-    fun writeControl(data: ByteArray) {
-        if (data.isNotEmpty()) setReport(REPORT_TYPE_OUTPUT, data)
-    }
+    fun writeControl(data: ByteArray): Boolean =
+        data.isNotEmpty() && setReport(REPORT_TYPE_OUTPUT, data)
 
     private fun sendKeepAlive(conn: UsbDeviceConnection, ifaceId: Int) {
         for (f in config.keepAliveFeatures) sendReport(conn, ifaceId, REPORT_TYPE_FEATURE, f)
@@ -358,27 +384,48 @@ class HidUsbLink(
      * "unnumbered" (id 0 in wValue, id byte stripped from the payload). EP0 is independent of
      * the interrupt endpoints, so this is safe alongside the reader thread's requestWait.
      */
-    private fun sendReport(conn: UsbDeviceConnection, ifaceId: Int, type: Int, data: ByteArray) {
+    private fun sendReport(
+        conn: UsbDeviceConnection,
+        ifaceId: Int,
+        type: Int,
+        data: ByteArray,
+    ): Boolean {
         val id = data[0].toInt() and 0xFF
         val payload = if (id == 0) data.copyOfRange(1, data.size) else data
-        conn.controlTransfer(
-            0x21, // host→device, class, interface
-            0x09, // SET_REPORT
-            (type shl 8) or id,
-            ifaceId,
-            payload,
-            payload.size,
-            WRITE_TIMEOUT_MS,
-        )
+        // controlTransfer returns the byte count, or a negative value on failure — a failed write
+        // must be reported as such, not swallowed (a dropped rumble stop has nothing behind it).
+        val n = runCatching {
+            conn.controlTransfer(
+                0x21, // host→device, class, interface
+                0x09, // SET_REPORT
+                (type shl 8) or id,
+                ifaceId,
+                payload,
+                payload.size,
+                WRITE_TIMEOUT_MS,
+            )
+        }.getOrDefault(-1)
+        return n >= 0
     }
 
-    /** Stop the read loop and release the interfaces. Idempotent; does not fire [onClosed]. */
+    /**
+     * Stop the read loop and release the interfaces. Idempotent; does not fire [onClosed].
+     *
+     * Safe to call from the `onClosed` handler itself — that is how an unplug now gets cleaned up,
+     * and it arrives on the reader thread, which must not try to join itself.
+     */
     fun stop() {
         running = false
+        // Claim the down-latch so the reader's own exit does not report a close the owner asked for.
+        down.set(true)
         detachReceiver?.let { runCatching { context.unregisterReceiver(it) } }
         detachReceiver = null
-        runCatching { reader?.join(1000) }
-        reader = null
+        if (reader !== Thread.currentThread()) {
+            runCatching { reader?.join(1000) }
+            // Only forget the thread once it is actually gone: clearing it while it still runs
+            // would let a later stop() skip the join and free the connection under it.
+            reader = null
+        }
         outQueue.clear()
         activeClaim = null
         for (c in claims) runCatching { connection?.releaseInterface(c.iface) }

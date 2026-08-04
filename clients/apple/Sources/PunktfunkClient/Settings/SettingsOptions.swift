@@ -34,6 +34,22 @@ enum SettingsOptions {
         ("DualShock 4", 4),
     ]
 
+    /// System-button routing (the cross-client `system_buttons` key): where the guide
+    /// (Xbox/PS) and share presses land while streaming. Auto = forward on Apple.
+    static let systemButtons: [(label: String, tag: String)] = [
+        ("Automatic", "auto"),
+        ("Send to host", "forward"),
+        ("This device", "local"),
+    ]
+
+    /// The hold-Select guide gesture (the cross-client `guide_gesture` key). Auto = on
+    /// everywhere but macOS.
+    static let guideGestures: [(label: String, tag: String)] = [
+        ("Automatic", "auto"),
+        ("On", "on"),
+        ("Off", "off"),
+    ]
+
     static let hudPlacements: [(label: String, tag: String)] =
         HUDPlacement.allCases.map { ($0.label, $0.rawValue) }
 

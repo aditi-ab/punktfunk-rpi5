@@ -55,6 +55,36 @@ pub struct RfiRequest {
     pub last_frame: u32,
 }
 
+/// `host → client`, any time after [`Start`]: the video data plane's sealed shard payload
+/// changes mid-session (design/shard-payload-reneg.md Phase 1). Sent ONLY to a client whose
+/// [`Hello::max_shard_payload`] advertised per-frame geometry (0/absent = legacy — the host
+/// must never send this), and never above that advertised ceiling. Asymmetric semantics:
+///
+/// - **Shrink** (the mid-session MTU heal): the host may re-key its packetizer at the next
+///   AU boundary immediately after sending — per-frame pinning on the client makes the
+///   control-vs-datagram reorder race irrelevant and a smaller shard always fits existing
+///   buffers. The [`ShardPayloadAck`] is telemetry.
+/// - **Grow** (jumbo): the host must not emit a single sealed datagram above the OLD size
+///   until the ack arrives — the ack IS the gate, even when the client's buffers would
+///   happen to fit (the rule must not erode if the buffer strategy changes later).
+///
+/// No `effective_frame_index`: per-frame pinning makes it redundant — every video packet
+/// carries its own `shard_bytes` and the receiver follows each frame's pin.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ShardPayloadChanged {
+    /// The new sealed shard payload in bytes (even, within the client's advertised bounds).
+    pub shard_payload: u16,
+}
+
+/// `client → host`: answer to [`ShardPayloadChanged`] — echoes the value the client applied.
+/// Only sent for an in-bounds request; an out-of-bounds one is dropped WITHOUT an ack (a
+/// buggy host must not read silence-then-garbage as a granted grow). The host treats the
+/// echoed value as the grant for a pending grow.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ShardPayloadAck {
+    pub shard_payload: u16,
+}
+
 /// `client → host`, periodic: the client's observed data-plane loss, so the host can size FEC to
 /// the link instead of a flat percentage (adaptive FEC). `loss_ppm` is parts-per-million of shards
 /// that arrived missing-but-recovered (plus a bump when frames went unrecoverable) over the report
@@ -200,6 +230,10 @@ pub const MSG_SET_BITRATE: u8 = 0x05;
 pub const MSG_BITRATE_CHANGED: u8 = 0x06;
 /// Type byte of [`RfiRequest`].
 pub const MSG_RFI_REQUEST: u8 = 0x07;
+/// Type byte of [`ShardPayloadChanged`].
+pub const MSG_SHARD_PAYLOAD_CHANGED: u8 = 0x08;
+/// Type byte of [`ShardPayloadAck`].
+pub const MSG_SHARD_PAYLOAD_ACK: u8 = 0x09;
 /// Type byte of [`ProbeRequest`].
 pub const MSG_PROBE_REQUEST: u8 = 0x20;
 /// Type byte of [`ProbeResult`].
@@ -302,6 +336,46 @@ impl RfiRequest {
         Ok(RfiRequest {
             first_frame: u32::from_le_bytes(b[5..9].try_into().unwrap()),
             last_frame: u32::from_le_bytes(b[9..13].try_into().unwrap()),
+        })
+    }
+}
+
+impl ShardPayloadChanged {
+    pub fn encode(&self) -> Vec<u8> {
+        // magic[0..4] type[4] shard_payload[5..7]
+        let mut b = Vec::with_capacity(7);
+        b.extend_from_slice(CTL_MAGIC);
+        b.push(MSG_SHARD_PAYLOAD_CHANGED);
+        b.extend_from_slice(&self.shard_payload.to_le_bytes());
+        b
+    }
+
+    pub fn decode(b: &[u8]) -> Result<ShardPayloadChanged> {
+        if b.len() != 7 || &b[0..4] != CTL_MAGIC || b[4] != MSG_SHARD_PAYLOAD_CHANGED {
+            return Err(PunktfunkError::InvalidArg("bad ShardPayloadChanged"));
+        }
+        Ok(ShardPayloadChanged {
+            shard_payload: u16::from_le_bytes(b[5..7].try_into().unwrap()),
+        })
+    }
+}
+
+impl ShardPayloadAck {
+    pub fn encode(&self) -> Vec<u8> {
+        // magic[0..4] type[4] shard_payload[5..7]
+        let mut b = Vec::with_capacity(7);
+        b.extend_from_slice(CTL_MAGIC);
+        b.push(MSG_SHARD_PAYLOAD_ACK);
+        b.extend_from_slice(&self.shard_payload.to_le_bytes());
+        b
+    }
+
+    pub fn decode(b: &[u8]) -> Result<ShardPayloadAck> {
+        if b.len() != 7 || &b[0..4] != CTL_MAGIC || b[4] != MSG_SHARD_PAYLOAD_ACK {
+            return Err(PunktfunkError::InvalidArg("bad ShardPayloadAck"));
+        }
+        Ok(ShardPayloadAck {
+            shard_payload: u16::from_le_bytes(b[5..7].try_into().unwrap()),
         })
     }
 }
@@ -1144,6 +1218,33 @@ mod tests {
         assert!(SetBitrate::decode(&ack.encode()).is_err());
         assert!(BitrateChanged::decode(&req.encode()).is_err());
         assert!(SetBitrate::decode(&LossReport { loss_ppm: 7 }.encode()).is_err());
+    }
+
+    #[test]
+    fn shard_payload_messages_roundtrip() {
+        for shard_payload in [512u16, 1216, 1408, 8908] {
+            let chg = ShardPayloadChanged { shard_payload };
+            assert_eq!(ShardPayloadChanged::decode(&chg.encode()).unwrap(), chg);
+            let ack = ShardPayloadAck { shard_payload };
+            assert_eq!(ShardPayloadAck::decode(&ack.encode()).unwrap(), ack);
+            // Identical payload shape — the type byte alone must keep the pair disjoint (a
+            // change echoed back must never re-decode as a change).
+            assert!(ShardPayloadChanged::decode(&ack.encode()).is_err());
+            assert!(ShardPayloadAck::decode(&chg.encode()).is_err());
+        }
+        // Exact length — no trailing bytes, no truncation.
+        let bytes = ShardPayloadChanged { shard_payload: 512 }.encode();
+        assert!(ShardPayloadChanged::decode(&[bytes.as_slice(), &[0]].concat()).is_err());
+        assert!(ShardPayloadChanged::decode(&bytes[..bytes.len() - 1]).is_err());
+        // Disjoint from the neighboring ids either side (0x07 RfiRequest / 0x20 ProbeRequest).
+        assert!(ShardPayloadChanged::decode(
+            &RfiRequest {
+                first_frame: 1,
+                last_frame: 2
+            }
+            .encode()
+        )
+        .is_err());
     }
 
     #[test]

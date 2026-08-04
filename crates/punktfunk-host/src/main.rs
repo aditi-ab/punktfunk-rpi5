@@ -104,10 +104,14 @@ mod tray;
 mod store;
 mod stream_marker;
 mod update;
-// `monitor_devnode::startup_recover()` (below) re-enables PnP monitor devnodes disabled by a prior
-// run; it lives in the `pf-win-display` leaf crate (plan §W6).
+// The two startup crash-recovery legs (below), both in the `pf-win-display` leaf crate (plan §W6):
+// `monitor_devnode::startup_recover()` re-enables PnP monitor devnodes disabled by a prior run, and
+// `isolate_journal::startup_recover()` re-lights displays a prior run deactivated for an EXCLUSIVE
+// session and never restored.
 #[cfg(target_os = "windows")]
 use pf_win_display::monitor_devnode;
+#[cfg(target_os = "windows")]
+use pf_win_display::win_display::isolate_journal;
 // Virtual-display orchestration lives in the `pf-vdisplay` subsystem crate (plan §W6); this shim
 // keeps every existing `crate::vdisplay::*` path valid (serve/mgmt/native/capture consume the trait,
 // registry, and manager through it). The DDC panel control + the KWin zkde protocol moved with it.
@@ -379,6 +383,12 @@ fn real_main() -> Result<()> {
             // restored (crash/kill/power loss) — before any new session touches the topology.
             #[cfg(target_os = "windows")]
             monitor_devnode::startup_recover();
+            // The same recovery for the DEFAULT Exclusive path: a previous host that died holding a
+            // CCD isolate left the operator's panels deactivated with nothing to put them back (the
+            // restore snapshot was process memory). Runs AFTER the devnode leg so re-enabled
+            // monitors are present again and the EXTEND preset can actually light them.
+            #[cfg(target_os = "windows")]
+            isolate_journal::startup_recover();
             gamestream::serve(mgmt_opts, native, gamestream)
         }
         // Report other Moonlight-compatible hosts (Sunshine/Apollo/…) installed or running on this
@@ -388,11 +398,17 @@ fn real_main() -> Result<()> {
             let found = detect::scan();
             if found.is_empty() {
                 println!("No conflicting game-streaming host detected.");
-                Ok(())
-            } else {
-                print!("{}", detect::render_report(&found));
+                return Ok(());
+            }
+            print!("{}", detect::render_report(&found));
+            // Exit 1 ONLY for a host that runs or will start on its own. The installers and support
+            // scripts gate on this code, and a dormant leftover used to abort them — a `winget
+            // install` failed in the field on a box whose Sunshine was merely present (see the
+            // module docs + `punktfunk-host.iss`). Dormant findings print, then exit 0.
+            if detect::any_active(&found) {
                 std::process::exit(1);
             }
+            Ok(())
         }
         // Install and run host plugins: `plugins add playnite`, `plugins enable`, … Package ops are
         // forwarded to the bun runner; enable/disable/status drive the systemd unit (Linux) or the

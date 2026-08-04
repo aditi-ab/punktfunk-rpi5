@@ -232,15 +232,27 @@ impl KnownHosts {
     /// A read-only config dir just keeps re-minting in memory, which harms nothing: no lookup
     /// is keyed by the id yet (design §4.5).
     pub fn load() -> KnownHosts {
-        let mut k: KnownHosts = Self::path()
-            .and_then(|p| Ok(std::fs::read_to_string(p)?))
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default();
+        let mut k = Self::read();
         if k.mint_missing_ids() {
             let _ = k.save();
         }
         k
+    }
+
+    /// The store exactly as it is on disk — no mint, and so no write.
+    ///
+    /// For a consumer that only needs to LOOK at the records (annotating a discovery result
+    /// against them, say) and never dials one by id. [`KnownHosts::load`]'s mint is a write, and
+    /// two processes started together against a pre-mint store will each mint a *different* id
+    /// for the same record and race to save it — after which whichever one already handed its
+    /// ids to a caller has handed out references that no longer resolve. A read that stays a
+    /// read cannot take part in that.
+    pub fn read() -> KnownHosts {
+        Self::path()
+            .and_then(|p| Ok(std::fs::read_to_string(p)?))
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
     }
 
     /// Give every record still missing one a stable id; returns true if anything changed
@@ -867,6 +879,25 @@ pub struct Settings {
     /// forwarded as pad 0; empty = automatic (most recently connected). Applied to the
     /// gamepad service at startup so the choice survives restarts.
     pub forward_pad: String,
+    /// What a controller's SYSTEM buttons — guide (Xbox/PS/Steam) and the Deck's QAM `…` —
+    /// do while streaming: `"auto"` (default), `"forward"` (raw presses go to the host,
+    /// the pre-setting behaviour), or `"local"` (they stay with this device; the host's
+    /// are reached via the hold-Select gesture instead). Auto resolves per platform in
+    /// [`Settings::system_buttons_forward`]: forward everywhere EXCEPT under Gaming Mode,
+    /// where the local Steam UI always reacts to the same physical press — forwarding
+    /// there opens BOTH overlays, the local one on top of the stream.
+    #[serde(default = "default_auto")]
+    pub system_buttons: String,
+    /// The hold-Select guide gesture: holding Select/Back alone ≥ ~350 ms sends the HOST
+    /// the guide button (down for as long as it's held, so a long hold is the host's
+    /// long-press — the QAM on a Gaming-Mode host). `"auto"` (default) / `"on"` / `"off"`,
+    /// resolved in [`Settings::guide_gesture_enabled`]: auto = on only where the raw
+    /// guide press can't reach the host cleanly (Gaming Mode; iOS/tvOS resolve their own
+    /// auto in the Apple client). While armed, a Select TAP is delivered on release —
+    /// costing it up to the hold threshold in latency — and a Select held as part of a
+    /// combo (any other button already down) passes through untouched.
+    #[serde(default = "default_auto")]
+    pub guide_gesture: String,
     /// Which host compositor backend to request (advisory; the host falls back to
     /// auto-detect when unavailable).
     pub compositor: String,
@@ -1020,6 +1051,10 @@ fn default_codec() -> String {
     "auto".into()
 }
 
+fn default_auto() -> String {
+    "auto".into()
+}
+
 fn default_touch_mode() -> String {
     "trackpad".into()
 }
@@ -1069,6 +1104,29 @@ impl Settings {
         PresentPriority::resolve(&self.present_priority, self.smooth_buffer)
     }
 
+    /// Whether raw system-button presses (guide + QAM) are forwarded to the host.
+    /// `game_mode` = this client runs as the embedded Gaming-Mode stream (gamescope),
+    /// where the local Steam UI reacts to the same physical buttons no matter what we
+    /// do — auto keeps them local there and forwards everywhere else.
+    pub fn system_buttons_forward(&self, game_mode: bool) -> bool {
+        match self.system_buttons.as_str() {
+            "forward" => true,
+            "local" => false,
+            _ => !game_mode,
+        }
+    }
+
+    /// Whether the hold-Select guide gesture is armed ([`Settings::guide_gesture`]).
+    /// Auto = on only under Gaming Mode, where it is the sole controller route to the
+    /// host's guide once raw presses stay local.
+    pub fn guide_gesture_enabled(&self, game_mode: bool) -> bool {
+        match self.guide_gesture.as_str() {
+            "on" => true,
+            "off" => false,
+            _ => game_mode,
+        }
+    }
+
     /// The `codec` setting as a `quic::CODEC_*` preference bit (`0` = auto).
     pub fn preferred_codec(&self) -> u8 {
         match self.codec.as_str() {
@@ -1095,6 +1153,8 @@ impl Default for Settings {
             gamepad: "auto".into(),
             gamepad_forwarding: true,
             forward_pad: String::new(),
+            system_buttons: "auto".into(),
+            guide_gesture: "auto".into(),
             compositor: "auto".into(),
             touch_mode: "trackpad".into(),
             mouse_mode: "capture".into(),

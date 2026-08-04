@@ -77,7 +77,8 @@ The setting is read when a session starts, so if you change it while streaming, 
 macOS can also flip it mid-session: **Stream ▸ Share Clipboard** (⌃⌥⇧C), which becomes **Stop
 Sharing Clipboard** once the host has acknowledged it.
 
-iOS, iPadOS, tvOS and the Steam Deck Decky plugin have no clipboard switch — see
+iOS, iPadOS, tvOS and a Steam Deck in Gaming Mode have no clipboard switch — neither the Decky
+panel nor the client's console home has a host edit sheet — see
 [what each client does](#which-hosts-and-clients-support-it) below.
 
 ## Nothing crosses until something pastes
@@ -134,8 +135,9 @@ when a host application pastes.
 
 The **Linux client has the switch but no working clipboard bridge**: it enables the plane and then
 has no code to read or write the desktop's own clipboard, so nothing is announced and nothing is
-pasted. Turning it on there is harmless but has no effect today. The Decky plugin on the Steam Deck
-has no switch at all.
+pasted. Turning it on there is harmless but has no effect today. On a Steam Deck in Gaming Mode
+there is no switch at all — the Decky panel doesn't edit hosts — and since a Deck streams with that
+same Linux client, a switch there would have nothing to move anyway.
 
 When you copy **on the Windows client**, images cross only if the copying application publishes the
 registered `PNG` clipboard format. Many Windows apps publish only a bitmap, and those copies aren't

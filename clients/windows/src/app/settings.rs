@@ -79,6 +79,17 @@ const GAMEPADS: &[(&str, &str)] = &[
     // user could not ask the host for the Deck-shaped pad (trackpads, back grips).
     ("steamdeck", "Steam Deck"),
 ];
+/// System-button routing: `(stored value, display label)` — where the guide (Xbox/PS)
+/// and quick-access presses land while streaming. The cross-client `system_buttons` key;
+/// Automatic forwards on desktop and stays local under Gaming Mode.
+const SYSTEM_BUTTONS: &[(&str, &str)] = &[
+    ("auto", "Automatic"),
+    ("forward", "Send to host"),
+    ("local", "This device"),
+];
+/// The hold-Select guide gesture: `(stored value, display label)` — the cross-client
+/// `guide_gesture` key. Automatic arms it only where the raw press can't reach the host.
+const GUIDE_GESTURES: &[(&str, &str)] = &[("auto", "Automatic"), ("on", "On"), ("off", "Off")];
 /// Stats-overlay tiers: `(stored value, display label)` — the cross-client verbosity ladder
 /// (Compact ⊂ Normal ⊂ Detailed); Ctrl+Alt+Shift+S cycles it live in the session window.
 const STATS_TIERS: &[(StatsVerbosity, &str)] = &[
@@ -479,6 +490,8 @@ struct OverrideFlags {
     inhibit_shortcuts: bool,
     gamepad: bool,
     gamepad_forwarding: bool,
+    system_buttons: bool,
+    guide_gesture: bool,
     stats_verbosity: bool,
     fullscreen_on_stream: bool,
     present_priority: bool,
@@ -512,6 +525,8 @@ impl OverrideFlags {
             inhibit_shortcuts: o.inhibit_shortcuts.is_some(),
             gamepad: o.gamepad.is_some(),
             gamepad_forwarding: o.gamepad_forwarding.is_some(),
+            system_buttons: o.system_buttons.is_some(),
+            guide_gesture: o.guide_gesture.is_some(),
             stats_verbosity: o.stats_verbosity.is_some(),
             fullscreen_on_stream: o.fullscreen_on_stream.is_some(),
             present_priority: o.present_priority.is_some(),
@@ -977,6 +992,28 @@ pub(crate) fn settings_page(
     let pad_combo = setting_combo(ctx, scope, (rev, set_rev), pad_names, pad_i, |s, i| {
         s.gamepad = GAMEPADS[i].0.to_string();
     });
+    let (sysbtn_names, sysbtn_i) = presets(SYSTEM_BUTTONS, |v| *v == s.system_buttons);
+    let sysbtn_combo = setting_combo(
+        ctx,
+        scope,
+        (rev, set_rev),
+        sysbtn_names,
+        sysbtn_i,
+        |s, i| {
+            s.system_buttons = SYSTEM_BUTTONS[i].0.to_string();
+        },
+    );
+    let (gesture_names, gesture_i) = presets(GUIDE_GESTURES, |v| *v == s.guide_gesture);
+    let gesture_combo = setting_combo(
+        ctx,
+        scope,
+        (rev, set_rev),
+        gesture_names,
+        gesture_i,
+        |s, i| {
+            s.guide_gesture = GUIDE_GESTURES[i].0.to_string();
+        },
+    );
     let (touch_names, touch_i) = presets(TOUCH_MODES, |v| *v == s.touch_mode);
     let touch_combo = setting_combo(ctx, scope, (rev, set_rev), touch_names, touch_i, |s, i| {
         s.touch_mode = TOUCH_MODES[i].0.to_string();
@@ -1406,6 +1443,30 @@ pub(crate) fn settings_page(
                         "The virtual pad created on the host. Automatic matches your controller \
                          \u{2014} a DualSense keeps adaptive triggers, lightbar, touchpad and \
                          motion.",
+                    )),
+                    Some(described_overridable(
+                        (rev, set_rev),
+                        scope,
+                        "system_buttons",
+                        "Steam / guide button",
+                        over.system_buttons,
+                        sysbtn_combo,
+                        "Where the guide (Xbox/PS) and quick-access presses go while \
+                         streaming. Automatic sends them to the host \u{2014} except on \
+                         devices whose own overlay reacts to the same press (Gaming Mode), \
+                         where they stay local and the gesture below reaches the host.",
+                    )),
+                    Some(described_overridable(
+                        (rev, set_rev),
+                        scope,
+                        "guide_gesture",
+                        "Hold Select for guide",
+                        over.guide_gesture,
+                        gesture_combo,
+                        "Hold Select on its own to press the host's guide button \u{2014} keep \
+                         holding for a Gaming-Mode host's quick-access menu. A Select tap \
+                         still goes through, slightly delayed. Automatic arms it only where \
+                         the real button can't reach the host.",
                     )),
                 ]
                 .into_iter()

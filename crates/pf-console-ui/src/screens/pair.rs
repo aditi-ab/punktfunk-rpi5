@@ -221,6 +221,7 @@ impl PairScreen {
                             launch: None,
                             title: self.host_name.clone(),
                             request_access: true,
+                            profile: None,
                         });
                         fx.pop();
                     }
@@ -430,6 +431,8 @@ mod tests {
             can_wake: false,
             last_used: None,
             os: String::new(),
+            pin: None,
+            bound_profile: None,
         }
     }
 

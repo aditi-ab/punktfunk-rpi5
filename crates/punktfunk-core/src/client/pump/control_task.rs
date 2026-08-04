@@ -243,6 +243,38 @@ impl ControlTask {
                             seq: offer.seq,
                             kinds: offer.kinds,
                         });
+                    } else if let Ok(chg) = crate::quic::ShardPayloadChanged::decode(&msg) {
+                        // Mid-session shard renegotiation (design/shard-payload-reneg.md): the
+                        // host re-keys the sealed video geometry. Per-frame pinning means there
+                        // is nothing to re-key on the receive path — the reassembler follows
+                        // each frame's own header and every buffer is statically sized for the
+                        // ceiling — so the dispatch is validate + ack. The ack is telemetry for
+                        // a shrink and the GATE for a grow (the host emits nothing above the
+                        // old size until it lands). Validate against our own receive bounds —
+                        // the same ceiling we advertised in `Hello::max_shard_payload` — and
+                        // answer an out-of-bounds request with SILENCE, not an ack: a buggy
+                        // host must never read a granted grow out of garbage.
+                        let n = chg.shard_payload as usize;
+                        if (crate::config::MIN_SHARD_PAYLOAD..=crate::config::max_shard_payload())
+                            .contains(&n)
+                            && n % 2 == 0
+                        {
+                            tracing::info!(
+                                shard_payload = n,
+                                "host re-keyed the wire shard payload — acking"
+                            );
+                            let ack = crate::quic::ShardPayloadAck {
+                                shard_payload: chg.shard_payload,
+                            };
+                            if io::write_msg(&mut ctrl_send, &ack.encode()).await.is_err() {
+                                break;
+                            }
+                        } else {
+                            tracing::warn!(
+                                shard_payload = n,
+                                "out-of-bounds shard-payload change — ignoring (no ack)"
+                            );
+                        }
                     } else if let Ok(shape) = crate::quic::CursorShape::decode(&msg) {
                         // Pointer bitmap changed (cursor channel, only when negotiated). try_send:
                         // an overflowing ring drops the newest shape — the next change resends.
