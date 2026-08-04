@@ -53,7 +53,9 @@ export const TrustSheet: FC<{
   const props = useRef({ host, onStream, onChanged });
   props.current = { host, onStream, onChanged };
 
-  const canRequestAccess = host.fp !== "";
+  // Request access pins what the host ADVERTISES. The record's own pin is a different thing:
+  // a host that already has one streams without ever opening this sheet.
+  const canRequestAccess = host.advertisedFp !== "";
 
   const requestAccess = async () => {
     setBusy(true);
@@ -62,7 +64,7 @@ export const TrustSheet: FC<{
     try {
       // Step 1: save it with the ADVERTISED fingerprint, pinned but unpaired ("trusted").
       // Idempotent, so a retry after a declined approval is free.
-      const r = await trustHost(h.addr, h.port, h.fp, h.name);
+      const r = await trustHost(h.addr, h.port, h.advertisedFp, h.name);
       if (!r.ok) {
         setError(trustErrorBody(r.error, h.name));
         setBusy(false);

@@ -56,8 +56,19 @@ export interface HostView {
   name: string;
   addr: string;
   port: number;
-  /** Pinned cert fingerprint. "" = nothing pinned, which is what makes a host unstreamable. */
+  /**
+   * The fingerprint PINNED ON THE RECORD. "" means nothing is pinned, which is exactly what
+   * makes a host unstreamable — the session binary refuses a pinless connect.
+   *
+   * Deliberately NOT filled in from a live advert. A host saved by address that happens to be
+   * advertising right now still has an empty pin on disk, and borrowing the advert's here would
+   * draw it as ready to stream while every launch refused for want of a fingerprint. What the
+   * advert offers is [`advertisedFp`], and moving it onto the record is a trust decision the
+   * user makes in the sheet.
+   */
   fp: string;
+  /** What the host is advertising right now, if anything — what request access would pin. */
+  advertisedFp: string;
   paired: boolean;
   online: boolean;
   saved: boolean;
@@ -118,7 +129,8 @@ export function mergeHosts(saved: SavedHost[], discovered: DiscoveredHost[]): Ho
       name: s.name || s.addr,
       addr: advert?.addr ?? s.addr,
       port: advert?.port ?? s.port,
-      fp: s.fp_hex || advert?.fp || "",
+      fp: s.fp_hex,
+      advertisedFp: advert?.fp ?? "",
       paired: s.paired,
       online: !!advert || s.online === true,
       saved: true,
@@ -138,7 +150,9 @@ export function mergeHosts(saved: SavedHost[], discovered: DiscoveredHost[]): Ho
       name: a.name,
       addr: a.addr,
       port: a.port,
-      fp: a.fp,
+      // No record, so nothing is pinned — whatever it advertises is an OFFER, not a pin.
+      fp: "",
+      advertisedFp: a.fp,
       paired: a.paired,
       online: true,
       saved: false,
