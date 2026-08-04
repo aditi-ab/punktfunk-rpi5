@@ -146,7 +146,9 @@ private struct ShotGamepadHome: View {
 }
 
 private struct ShotGamepadSettings: View {
-    var body: some View { GamepadSettingsView() }
+    @StateObject private var store = ShotMock.hostStore()
+
+    var body: some View { GamepadSettingsView(store: store) }
 }
 
 private struct ShotGamepadAddHost: View {

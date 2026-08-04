@@ -10,6 +10,14 @@
 // on stale captured state. Left/right CLAMPS at a choice list's ends (the dull boundary thud tells
 // the thumb it's the last option); A always cycles forward, wrapping, so every option is reachable
 // with one button. Toggles read left = off, right = on — refusing a no-op with the same thud.
+//
+// The trailing Profiles section (design/client-settings-profiles.md §5.2a/§5.4) is the pin manager
+// for this controller-first surface: a row per catalog profile opens the pin-to-hosts picker — an
+// in-place swap of the row list (B peels back, the "one layer" rule GamepadAddHostView set) with
+// one toggle row per saved host, writing `StoredHost.pinnedProfileIDs` via HostStore.setPinned.
+// Pins are presentation only: never the host's default binding, never the profile itself —
+// profiles are created and edited in the standard interface (and can't be on tvOS, whose
+// per-device catalog the detail strings are honest about).
 
 import PunktfunkKit
 import SwiftUI
@@ -21,6 +29,10 @@ import CoreHaptics
 
 struct GamepadSettingsView: View {
     @Environment(\.dismiss) private var dismiss
+    /// The saved-host store — the pin picker writes `setPinned` through it and the profile rows
+    /// count pins from its live hosts. Threaded in from GamepadHomeView like the home screen
+    /// itself (ContentView owns the instance).
+    @ObservedObject var store: HostStore
     @AppStorage(DefaultsKey.streamWidth) private var width = 1920
     @AppStorage(DefaultsKey.streamHeight) private var height = 1080
     @AppStorage(DefaultsKey.streamHz) private var hz = 60
@@ -52,6 +64,10 @@ struct GamepadSettingsView: View {
     @AppStorage(DefaultsKey.rumbleOnDevice) private var rumbleOnDevice = false
     #endif
     @ObservedObject private var gamepads = GamepadManager.shared
+    /// The profile catalog (ProfileStore.shared, like every other surface that reads it) — the
+    /// Profiles rows re-derive from it each render, so a rename/delete made in the standard
+    /// interface shows up live.
+    @ObservedObject private var profiles = ProfileStore.shared
 
     #if os(iOS)
     /// `.compact` in a landscape phone window — tighter chrome so more rows fit.
@@ -62,6 +78,9 @@ struct GamepadSettingsView: View {
     private let compact = false // no size classes on macOS; the sheet is sized generously
     #endif
     @State private var focusID: String?
+    /// The pin-to-hosts picker's profile — non-nil swaps the row list for one toggle row per
+    /// saved host (§5.2a); B (Menu on tvOS) peels back to the settings rows.
+    @State private var pinTarget: StreamProfile?
     /// The direction of the last value step (+1 right/forward, -1 left) — picks which edge the
     /// changed value slides in from, so the animation follows the user's motion.
     @State private var lastAdjustDelta = 1
@@ -72,7 +91,7 @@ struct GamepadSettingsView: View {
             focusID: $focusID,
             onAdjust: { row, delta in adjust(id: row.id, by: delta) },
             onActivate: { activate(id: $0.id) },
-            onBack: { dismiss() }
+            onBack: { back() }
         ) { row, focused in
             rowView(row, focused: focused)
                 .frame(maxWidth: GamepadFormMetrics.rowMaxWidth)
@@ -80,7 +99,7 @@ struct GamepadSettingsView: View {
         }
         .frame(maxWidth: .infinity)
         .safeAreaInset(edge: .top, spacing: 0) {
-            Text("Settings")
+            Text(title)
                 .font(.geist(gamepadTitleSize(compact: compact), .bold, relativeTo: .title))
                 .foregroundStyle(.white)
                 .padding(.top, gamepadTitleTopPadding(compact: compact))
@@ -96,11 +115,7 @@ struct GamepadSettingsView: View {
                     .foregroundStyle(.white.opacity(0.55))
                     .lineLimit(2, reservesSpace: true)
                     .animation(.smooth(duration: 0.2), value: focusID)
-                GamepadHintBar(hints: [
-                    .init(glyph: "arrow.left.and.right", text: "Adjust"),
-                    .init(glyph: buttonGlyph(\.buttonA, fallback: "a.circle"), text: "Change"),
-                    .init(glyph: buttonGlyph(\.buttonB, fallback: "b.circle"), text: "Done"),
-                ])
+                GamepadHintBar(hints: hints)
             }
             // Equal distance from the left and bottom edges for the legend pill (see GamepadHomeView).
             .padding(.leading, compact ? 12 : 18)
@@ -138,6 +153,43 @@ struct GamepadSettingsView: View {
         .accessibilityLabel("Close settings")
     }
 
+    /// "Settings", or "Pin “Work”" while the pin picker is up — the title is what says which
+    /// layer the row list currently is.
+    private var title: String {
+        pinTarget.map { "Pin “\($0.name)”" } ?? "Settings"
+    }
+
+    /// The legend follows the layer: value-editing hints on the settings rows, pin/unpin on the
+    /// picker — where B reads "Back" (it peels to the settings rows, GamepadAddHostView's "one
+    /// layer" rule), and a hostless picker has nothing to pin, so only Back remains.
+    private var hints: [GamepadHint] {
+        guard pinTarget != nil else {
+            return [
+                .init(glyph: "arrow.left.and.right", text: "Adjust"),
+                .init(glyph: buttonGlyph(\.buttonA, fallback: "a.circle"), text: "Change"),
+                .init(glyph: buttonGlyph(\.buttonB, fallback: "b.circle"), text: "Done"),
+            ]
+        }
+        guard !store.hosts.isEmpty else {
+            return [.init(glyph: buttonGlyph(\.buttonB, fallback: "b.circle"), text: "Back")]
+        }
+        return [
+            .init(glyph: buttonGlyph(\.buttonA, fallback: "a.circle"), text: "Pin / Unpin"),
+            .init(glyph: buttonGlyph(\.buttonB, fallback: "b.circle"), text: "Back"),
+        ]
+    }
+
+    /// B peels one layer: the pin picker back to the settings rows — focus returning to the
+    /// profile row it came from — then the screen itself.
+    private func back() {
+        if let profile = pinTarget {
+            pinTarget = nil
+            focusID = "profile-\(profile.id)"
+        } else {
+            dismiss()
+        }
+    }
+
     // MARK: - Row rendering
 
     private func rowView(_ row: Row, focused: Bool) -> some View {
@@ -164,7 +216,7 @@ struct GamepadSettingsView: View {
                 HStack(spacing: 9) {
                     Image(systemName: "chevron.left")
                         .font(.system(size: m.chevronFont, weight: .semibold))
-                        .foregroundStyle(.white.opacity(focused ? 0.6 : 0))
+                        .foregroundStyle(.white.opacity(focused && row.adjustable ? 0.6 : 0))
                     // Keyed by the value so a change slides the new option in instead of
                     // hard-swapping the string — a QUIET horizontal slip following the user's
                     // motion (a right-step enters from the right), crossfading over ~14 pt.
@@ -185,7 +237,7 @@ struct GamepadSettingsView: View {
                     .animation(.smooth(duration: 0.22), value: row.value)
                     Image(systemName: "chevron.right")
                         .font(.system(size: m.chevronFont, weight: .semibold))
-                        .foregroundStyle(.white.opacity(focused ? 0.6 : 0))
+                        .foregroundStyle(.white.opacity(focused && row.adjustable ? 0.6 : 0))
                 }
             }
             .padding(.horizontal, m.rowHPad)
@@ -219,6 +271,9 @@ struct GamepadSettingsView: View {
         let value: String
         /// One-line explanation shown near the hint bar while this row is focused.
         let detail: String
+        /// Whether left/right means anything here — false hides the value's chevrons (the
+        /// Profiles rows navigate, and the placeholder rows do nothing at all).
+        var adjustable = true
         /// Left/right step; returns whether the value actually changed (false ⇒ boundary thud).
         let adjust: (Int) -> Bool
         /// A — cycle forward (wrapping) / flip.
@@ -238,6 +293,9 @@ struct GamepadSettingsView: View {
     }
 
     private var rows: [Row] {
+        // The pin picker replaces the whole list while it's up — same screen, one layer deeper,
+        // so the focus list's controller wiring (and the tvOS focus engine) carries over as is.
+        if let profile = pinTarget { return pinRows(for: profile) }
         let resolution = resolutionOptions
         let refresh = SettingsOptions.refreshRates(including: hz)
             .map { (label: "\($0) Hz", tag: $0) }
@@ -394,7 +452,98 @@ struct GamepadSettingsView: View {
                 at: at + 1)
         }
         #endif
-        return list
+        return list + profileRows
+    }
+
+    // MARK: - Profiles (§5.2a)
+
+    /// The trailing Profiles section: one row per catalog profile, its value how many saved
+    /// hosts pin it, A opening the pin-to-hosts picker. Read-only beyond that — this surface
+    /// pins and unpins, but profiles are created and edited elsewhere (design §5.4), so
+    /// left/right is a boundary thud, not an editor.
+    private var profileRows: [Row] {
+        guard !profiles.profiles.isEmpty else {
+            return [Row(
+                id: "noProfiles", header: "Profiles", icon: "slider.horizontal.3",
+                label: "No profiles yet", value: "",
+                detail: emptyCatalogDetail,
+                adjustable: false,
+                adjust: { _ in false }, activate: {})]
+        }
+        return profiles.profiles.enumerated().map { i, profile in
+            let pins = store.hosts
+                .filter { ($0.pinnedProfileIDs ?? []).contains(profile.id) }.count
+            return Row(
+                id: "profile-\(profile.id)", header: i == 0 ? "Profiles" : nil,
+                icon: "slider.horizontal.3", label: profile.name,
+                value: pins == 0 ? "Not pinned" : "Pinned to \(pins) host\(pins == 1 ? "" : "s")",
+                detail: profileDetail,
+                adjustable: false,
+                adjust: { _ in false },
+                activate: {
+                    // Focus lands on the picker's first row — the focus list's reconcile
+                    // follows this id when the row set swaps underneath it.
+                    focusID = store.hosts.first.map { "pinHost-\($0.id.uuidString)" } ?? "noHosts"
+                    pinTarget = profile
+                })
+        }
+    }
+
+    /// The pin-to-hosts picker: one toggle row per SAVED host, sharing the settings rows'
+    /// toggle semantics (left = unpin, right = pin, A flips; asking for the state it's in is a
+    /// boundary thud). Writes ride `HostStore.setPinned` — pin appends, unpin removes — and
+    /// NEVER the host's default binding (`profileID`): a pin is presentation only (§5.2a).
+    private func pinRows(for profile: StreamProfile) -> [Row] {
+        guard !store.hosts.isEmpty else {
+            return [Row(
+                id: "noHosts", icon: "desktopcomputer", label: "No saved hosts yet",
+                value: "",
+                detail: "Pair with a host first, then pin this profile to it.",
+                adjustable: false,
+                adjust: { _ in false }, activate: {})]
+        }
+        return store.hosts.map { host in
+            let hostID = host.id
+            let pinned = (host.pinnedProfileIDs ?? []).contains(profile.id)
+            return Row(
+                id: "pinHost-\(hostID.uuidString)", icon: "desktopcomputer",
+                label: host.displayName,
+                value: pinned ? "Pinned" : "Off",
+                detail: "A pinned profile appears as its own card on the host — one press "
+                    + "connects with it.",
+                adjust: { delta in
+                    let target = delta > 0
+                    guard pinned != target else { return false }
+                    store.setPinned(hostID, profileID: profile.id, pinned: target)
+                    return true
+                },
+                activate: { store.setPinned(hostID, profileID: profile.id, pinned: !pinned) })
+        }
+    }
+
+    /// The profile rows' explainer. tvOS gets its own: the catalog is per-device (the App Group
+    /// suite — nothing syncs it) and tvOS has no profile editor at all (§5.4), so pointing a TV
+    /// user at a "standard interface" would promise profiles that can never arrive there.
+    private var profileDetail: String {
+        #if os(tvOS)
+        return "Pin this profile to a host and it appears as its own card on the home screen — "
+            + "one press connects with it."
+        #else
+        return "Pin this profile to a host and it appears as its own card — one press connects "
+            + "with it. Profiles are created and edited in Punktfunk's standard interface."
+        #endif
+    }
+
+    /// What the empty catalog's placeholder explains — again honest on tvOS, where profiles
+    /// cannot be created (on the device or anywhere that would reach its per-device catalog).
+    private var emptyCatalogDetail: String {
+        #if os(tvOS)
+        return "Profiles bundle stream settings for different uses. Creating them isn't "
+            + "available on Apple TV yet."
+        #else
+        return "Profiles bundle stream settings for different uses. Create them in Punktfunk's "
+            + "standard interface, then pin them here as one-press connect cards."
+        #endif
     }
 
     /// Resolution choices as "WxH" tags — the current size is inserted when it's a custom mode
