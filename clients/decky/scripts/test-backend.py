@@ -61,6 +61,12 @@ check(
 
 # A native install: the CLI is the client binary's sibling. Absent => no CLI at all, which the
 # caller must see as "unavailable" rather than as an empty result.
+#
+# The fixture dir is torn down FIRST, not just created: leaving the sibling behind made the
+# "absent" assertion below pass only on the first run of the day and fail on every rerun.
+import shutil  # noqa: E402
+
+shutil.rmtree("/tmp/pf-test-native", ignore_errors=True)
 tmp = Path("/tmp/pf-test-native/bin")
 tmp.mkdir(parents=True, exist_ok=True)
 (tmp / "punktfunk-client").write_text("")
