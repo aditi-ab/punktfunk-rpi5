@@ -41,6 +41,8 @@ enum RowId {
     PadForward,
     Pad,
     PadType,
+    SystemButtons,
+    GuideGesture,
     Touch,
     Mouse,
     InvertScroll,
@@ -57,7 +59,7 @@ enum RowId {
 // cancellation all were). Still deliberately smaller than the desktop dialogs — device
 // pickers (GPU/speaker/mic) stay desktop-only, and profiles are pinnable here (the
 // trailing Profiles section) but created and edited only in the desktop app (design §5.4).
-const ROWS: [RowId; 27] = [
+const ROWS: [RowId; 29] = [
     RowId::Resolution,
     RowId::Refresh,
     RowId::RenderScale,
@@ -77,6 +79,8 @@ const ROWS: [RowId; 27] = [
     RowId::PadForward,
     RowId::Pad,
     RowId::PadType,
+    RowId::SystemButtons,
+    RowId::GuideGesture,
     RowId::Touch,
     RowId::Mouse,
     RowId::InvertScroll,
@@ -152,6 +156,16 @@ const PAD_TYPES: [(&str, &str); 6] = [
     ("dualshock4", "DualShock 4"),
     ("steamdeck", "Steam Deck"),
 ];
+/// Where the guide (Xbox/PS/Steam) and quick-access presses land while streaming — the
+/// shared `system_buttons` key. Auto = host everywhere except Gaming Mode, where the
+/// local Steam UI reacts to the same press and both overlays would open at once.
+const SYSTEM_BUTTONS: [(&str, &str); 3] = [
+    ("auto", "Automatic"),
+    ("forward", "Send to host"),
+    ("local", "This device"),
+];
+/// The hold-Select guide gesture — the shared `guide_gesture` key.
+const GUIDE_GESTURE: [(&str, &str); 3] = [("auto", "Automatic"), ("on", "On"), ("off", "Off")];
 
 pub(crate) struct SettingsScreen {
     list: MenuList,
@@ -350,7 +364,9 @@ fn row_spec(id: RowId, ctx: &Ctx, profiles: &[(String, String)]) -> RowSpec {
     // move everything under the cursor).
     let enabled = match id {
         RowId::EchoCancel => s.mic_enabled,
-        RowId::Pad | RowId::PadType => s.gamepad_forwarding,
+        RowId::Pad | RowId::PadType | RowId::SystemButtons | RowId::GuideGesture => {
+            s.gamepad_forwarding
+        }
         RowId::SmoothBuffer => s.present_priority == "smooth",
         _ => true,
     };
@@ -457,6 +473,16 @@ fn row_spec(id: RowId, ctx: &Ctx, profiles: &[(String, String)]) -> RowSpec {
             "Controller type",
             label_for(&PAD_TYPES, &s.gamepad).into(),
         ),
+        RowId::SystemButtons => (
+            None,
+            "Steam / guide button",
+            label_for(&SYSTEM_BUTTONS, &s.system_buttons).into(),
+        ),
+        RowId::GuideGesture => (
+            None,
+            "Hold Select for guide",
+            label_for(&GUIDE_GESTURE, &s.guide_gesture).into(),
+        ),
         RowId::Touch => (
             Some("Touchscreen"),
             "Touch mode",
@@ -553,6 +579,16 @@ fn detail(id: RowId) -> &'static str {
         }
         RowId::Pad => "Which pad is forwarded to the host, as player 1.",
         RowId::PadType => "The virtual pad the host creates — Automatic matches this controller.",
+        RowId::SystemButtons => {
+            "Where the guide (Xbox/PS/Steam) and quick-access presses go. Automatic \
+             sends them to the host except in Gaming Mode, where Steam on this device \
+             reacts to the same press and both overlays would open at once."
+        }
+        RowId::GuideGesture => {
+            "Hold Select on its own to press the host's guide button — keep holding for \
+             the host's quick-access menu. Automatic arms it only where the real button \
+             can't reach the host. A Select tap still goes through, slightly delayed."
+        }
         RowId::Touch => {
             "How the touchscreen drives the host: Trackpad (relative cursor), \
              Direct pointer (cursor jumps to your finger), or Touch passthrough (raw contacts)."
@@ -698,6 +734,18 @@ fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
                 return false;
             }
             step_str(&PAD_TYPES, &mut s.gamepad, delta, wrap)
+        }
+        RowId::SystemButtons => {
+            if !s.gamepad_forwarding {
+                return false;
+            }
+            step_str(&SYSTEM_BUTTONS, &mut s.system_buttons, delta, wrap)
+        }
+        RowId::GuideGesture => {
+            if !s.gamepad_forwarding {
+                return false;
+            }
+            step_str(&GUIDE_GESTURE, &mut s.guide_gesture, delta, wrap)
         }
         RowId::Touch => {
             let cur = TouchMode::ALL.iter().position(|m| *m == s.touch_mode());

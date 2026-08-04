@@ -8,6 +8,7 @@
 import {
   ButtonItem,
   Field,
+  Navigation,
   PanelSection,
   PanelSectionRow,
   Spinner,
@@ -15,9 +16,10 @@ import {
   staticClasses,
 } from "@decky/ui";
 import { definePlugin, toaster } from "@decky/api";
-import { FC } from "react";
+import { FC, useEffect, useState } from "react";
 import {
   FaDownload,
+  FaGamepad,
   FaLock,
   FaPlay,
   FaPlus,
@@ -25,7 +27,7 @@ import {
   FaSyncAlt,
   FaTv,
 } from "react-icons/fa";
-import { killStream } from "./backend";
+import { hostAction, killStream, streamRunning } from "./backend";
 import { PluginErrorBoundary } from "./boundary";
 import {
   applyUpdate,
@@ -64,6 +66,22 @@ async function forceStop(): Promise<void> {
     /* best-effort — the TerminateApp above is usually enough */
   }
   toaster.toast({ title: "Punktfunk", body: "Stopped the stream" });
+}
+
+// Press a host system button (guide/QAM) on the running stream, then hand the screen back
+// to it — closing the local menus is what lets the HOST's overlay show through. The raw
+// Steam/··· presses stay on the Deck by default (both overlays would open at once), so this
+// is the panel route to the host's menus; holding Select is the controller route.
+async function pressHost(action: "guide" | "qam"): Promise<void> {
+  const r = await hostAction(action).catch(() => ({ ok: false as const, error: "backend" }));
+  if (r.ok) {
+    Navigation.CloseSideMenus();
+  } else {
+    toaster.toast({
+      title: "Punktfunk",
+      body: r.error === "no-stream" ? "No stream is running" : "Couldn't reach the stream",
+    });
+  }
 }
 
 /** The line under a host's name: where it is, whether it's up, and how far trust has got. */
@@ -127,6 +145,18 @@ const HostRow: FC<{ host: HostView; refresh: () => void }> = ({ host, refresh })
 const QamPanel: FC = () => {
   const { views, scanning, problem, refresh } = useHosts();
   const { info: update, checking, check } = useUpdate();
+  // The host-buttons section shows only while the streaming client is up (checked per
+  // panel open — the QAM panel mounts fresh each time).
+  const [streaming, setStreaming] = useState(false);
+  useEffect(() => {
+    let live = true;
+    void streamRunning()
+      .then((r) => live && setStreaming(r.running))
+      .catch(() => {});
+    return () => {
+      live = false;
+    };
+  }, []);
 
   return (
     <>
@@ -229,6 +259,31 @@ const QamPanel: FC = () => {
           </ButtonItem>
         </PanelSectionRow>
       </PanelSection>
+
+      {streaming && (
+        <PanelSection title="Host menus">
+          <PanelSectionRow>
+            <ButtonItem
+              layout="below"
+              description="Press the Steam/guide button on the host"
+              onClick={() => void pressHost("guide")}
+            >
+              <FaGamepad style={{ marginRight: "0.5em" }} />
+              Steam menu on host
+            </ButtonItem>
+          </PanelSectionRow>
+          <PanelSectionRow>
+            <ButtonItem
+              layout="below"
+              description="Open the host's Quick Access Menu"
+              onClick={() => void pressHost("qam")}
+            >
+              <FaGamepad style={{ marginRight: "0.5em" }} />
+              Quick access on host
+            </ButtonItem>
+          </PanelSectionRow>
+        </PanelSection>
+      )}
 
       <PanelSection title="About">
         <PanelSectionRow>

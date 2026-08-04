@@ -126,6 +126,14 @@ enum SettingsFields {
         .init(name: "gamepad_forwarding", key: DefaultsKey.gamepadForwarding,
               overlay: \.gamepadForwarding, effective: \.gamepadForwarding)
     }
+    static var systemButtons: SettingsField<String> {
+        .init(name: "system_buttons", key: DefaultsKey.systemButtons,
+              overlay: \.systemButtons, effective: \.systemButtons)
+    }
+    static var guideGesture: SettingsField<String> {
+        .init(name: "guide_gesture", key: DefaultsKey.guideGesture,
+              overlay: \.guideGesture, effective: \.guideGesture)
+    }
     static var statsVerbosity: SettingsField<String> {
         .init(name: "stats_verbosity", key: DefaultsKey.statsVerbosity,
               overlay: \.statsVerbosity, effective: \.statsVerbosity)

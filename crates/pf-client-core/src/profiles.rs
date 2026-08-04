@@ -76,6 +76,10 @@ pub struct SettingsOverlay {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gamepad_forwarding: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub system_buttons: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub guide_gesture: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub stats_verbosity: Option<StatsVerbosity>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fullscreen_on_stream: Option<bool>,
@@ -158,6 +162,12 @@ impl SettingsOverlay {
         }
         if let Some(v) = self.gamepad_forwarding {
             s.gamepad_forwarding = v;
+        }
+        if let Some(v) = &self.system_buttons {
+            s.system_buttons = v.clone();
+        }
+        if let Some(v) = &self.guide_gesture {
+            s.guide_gesture = v.clone();
         }
         if let Some(v) = self.stats_verbosity {
             // Through the setter so the legacy `show_stats` bool stays coherent for
@@ -252,6 +262,12 @@ impl SettingsOverlay {
         if after.gamepad_forwarding != before.gamepad_forwarding {
             self.gamepad_forwarding = Some(after.gamepad_forwarding);
         }
+        if after.system_buttons != before.system_buttons {
+            self.system_buttons = Some(after.system_buttons.clone());
+        }
+        if after.guide_gesture != before.guide_gesture {
+            self.guide_gesture = Some(after.guide_gesture.clone());
+        }
         if after.stats_verbosity() != before.stats_verbosity() {
             self.stats_verbosity = Some(after.stats_verbosity());
         }
@@ -302,6 +318,8 @@ impl SettingsOverlay {
             "inhibit_shortcuts" => self.inhibit_shortcuts = None,
             "gamepad" => self.gamepad = None,
             "gamepad_forwarding" => self.gamepad_forwarding = None,
+            "system_buttons" => self.system_buttons = None,
+            "guide_gesture" => self.guide_gesture = None,
             "stats_verbosity" => self.stats_verbosity = None,
             "fullscreen_on_stream" => self.fullscreen_on_stream = None,
             "present_priority" => self.present_priority = None,
@@ -506,6 +524,8 @@ mod tests {
             inhibit_shortcuts: Some(false),
             gamepad: Some("dualsense".into()),
             gamepad_forwarding: Some(false),
+            system_buttons: Some("local".into()),
+            guide_gesture: Some("on".into()),
             match_window: Some(true),
             fullscreen_on_stream: Some(false),
             stats_verbosity: Some(StatsVerbosity::Detailed),
@@ -532,6 +552,8 @@ mod tests {
         assert!(!out.inhibit_shortcuts);
         assert_eq!(out.gamepad, "dualsense");
         assert!(!out.gamepad_forwarding);
+        assert_eq!(out.system_buttons, "local");
+        assert_eq!(out.guide_gesture, "on");
         assert!(out.match_window);
         assert!(!out.fullscreen_on_stream);
         assert_eq!(out.stats_verbosity(), StatsVerbosity::Detailed);

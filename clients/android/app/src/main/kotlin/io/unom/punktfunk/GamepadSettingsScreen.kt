@@ -483,6 +483,18 @@ private fun buildSettingsRows(
             "The virtual pad the host creates — Automatic matches this controller.",
             GAMEPAD_OPTIONS, s.gamepad,
         ) { update(s.copy(gamepad = it)) },
+        choice(
+            "systemButtons", null, "Guide button",
+            "Where the guide (Xbox/PS) and share presses go while streaming — Automatic " +
+                "sends them to the host whenever this device delivers them.",
+            SYSTEM_BUTTON_OPTIONS, s.systemButtons,
+        ) { update(s.copy(systemButtons = it)) },
+        choice(
+            "guideGesture", null, "Hold Select for guide",
+            "Hold Select alone to press the host's guide button — keep holding for a " +
+                "Gaming-Mode host's quick-access menu. A Select tap still goes through.",
+            GUIDE_GESTURE_OPTIONS, s.guideGesture,
+        ) { update(s.copy(guideGesture = it)) },
     ) + listOfNotNull(
         if (hasBodyVibrator) {
             toggle(

@@ -18,6 +18,78 @@
 #[cfg(all(any(target_os = "linux", windows), feature = "ui"))]
 mod console;
 
+/// The session control socket: a line-per-connection unix socket other same-user
+/// processes use to poke the RUNNING stream — today two verbs, `guide` and `qam`, which
+/// press the HOST's system buttons (the Decky panel's "Steam menu / Quick access on the
+/// host" buttons; see `GamepadService::tap_guide`). Plain text, no JSON: `<verb>\n` in,
+/// `ok\n` / `err\n` back.
+///
+/// The path is `$XDG_RUNTIME_DIR/punktfunk-session-ctl.sock` — inside the flatpak app
+/// runtime dir (`…/app/$FLATPAK_ID/`) when sandboxed, the ONE runtime path a flatpak and
+/// the host see identically, which is what lets the Decky backend (outside the sandbox)
+/// reach a flatpak-run session.
+#[cfg(all(unix, any(target_os = "linux", windows)))]
+mod ctl_socket {
+    use pf_client_core::gamepad::GamepadService;
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+    use std::path::PathBuf;
+
+    fn path() -> Option<PathBuf> {
+        let mut p = PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR")?);
+        if let Ok(id) = std::env::var("FLATPAK_ID") {
+            p.push("app");
+            p.push(id);
+        }
+        Some(p.join("punktfunk-session-ctl.sock"))
+    }
+
+    /// Bind + serve on a background thread, once per process (later calls no-op). Any
+    /// failure just logs at debug — the socket is a convenience surface, never worth
+    /// failing a stream over.
+    pub(crate) fn spawn(gamepad: GamepadService) {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(move || {
+            let Some(path) = path() else { return };
+            // A previous session's socket file refuses the bind — it's ours to replace.
+            let _ = std::fs::remove_file(&path);
+            let listener = match UnixListener::bind(&path) {
+                Ok(l) => l,
+                Err(e) => {
+                    tracing::debug!(error = %e, path = %path.display(), "session ctl socket unavailable");
+                    return;
+                }
+            };
+            let spawned = std::thread::Builder::new()
+                .name("pf-session-ctl".into())
+                .spawn(move || {
+                    for stream in listener.incoming() {
+                        let Ok(mut s) = stream else { continue };
+                        let mut line = String::new();
+                        if BufReader::new(&s).read_line(&mut line).is_err() {
+                            continue;
+                        }
+                        let ok = match line.trim() {
+                            "guide" => {
+                                gamepad.tap_guide();
+                                true
+                            }
+                            "qam" => {
+                                gamepad.tap_qam();
+                                true
+                            }
+                            _ => false,
+                        };
+                        let _ = s.write_all(if ok { b"ok\n" } else { b"err\n" });
+                    }
+                });
+            if let Err(e) = spawned {
+                tracing::debug!(error = %e, "session ctl thread failed to start");
+            }
+        });
+    }
+}
+
 #[cfg(any(target_os = "linux", windows))]
 mod session_main {
     use pf_client_core::gamepad::GamepadService;
@@ -44,14 +116,20 @@ mod session_main {
         std::env::args().any(|a| a == flag)
     }
 
+    /// Running under Gaming Mode (a Deck, or any gamescope session): the environment
+    /// where the local Steam UI owns the physical Steam/QAM buttons — the system-button
+    /// "auto" policy keys off this.
+    pub(crate) fn gaming_mode() -> bool {
+        std::env::var_os("SteamDeck").is_some()
+            || std::env::var_os("GAMESCOPE_WAYLAND_DISPLAY").is_some()
+    }
+
     /// Run fullscreen: `--fullscreen`, or the Deck/gamescope env as a fallback so a
     /// manual launch under Gaming Mode does the right thing too. (Browse-mode only —
     /// gated with `mod browse`, its one caller.)
     #[cfg(feature = "ui")]
     pub(crate) fn fullscreen_mode() -> bool {
-        arg_flag("--fullscreen")
-            || std::env::var_os("SteamDeck").is_some()
-            || std::env::var_os("GAMESCOPE_WAYLAND_DISPLAY").is_some()
+        arg_flag("--fullscreen") || gaming_mode()
     }
 
     /// `--window-pos X,Y` → the window's top-left in desktop coordinates (a spawning
@@ -194,6 +272,20 @@ mod session_main {
         // it back. It goes on before the attach below, so a non-forwarding session never opens
         // — never grabs — the device.
         gamepad.set_forwarding(settings.gamepad_forwarding);
+        // System-button routing: whether raw guide/QAM presses ride the wire, and whether
+        // hold-Select arms as the alternate guide route. Auto keys off Gaming Mode — the
+        // local Steam UI reacts to the same physical buttons there no matter what, so
+        // forwarding raw opens BOTH overlays, the local one on top of the stream. Set
+        // unconditionally for the same browse-mode-reuse reason as the line above.
+        let game_mode = gaming_mode();
+        gamepad.set_system_buttons(
+            settings.system_buttons_forward(game_mode),
+            settings.guide_gesture_enabled(game_mode),
+        );
+        // The control socket (guide/QAM injection — the Decky panel's host buttons).
+        // Spawned at first params-build so it exists for --connect AND console launches.
+        #[cfg(unix)]
+        crate::ctl_socket::spawn(gamepad.clone());
         let mode = Mode {
             width: if settings.width == 0 {
                 native.width

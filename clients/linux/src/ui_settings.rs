@@ -157,6 +157,20 @@ mod index {
         GAMEPADS.iter().position(|&g| g == s.gamepad).unwrap_or(0) as u32
     }
 
+    pub fn system_buttons(s: &Settings) -> u32 {
+        SYSTEM_BUTTONS
+            .iter()
+            .position(|&v| v == s.system_buttons)
+            .unwrap_or(0) as u32
+    }
+
+    pub fn guide_gesture(s: &Settings) -> u32 {
+        GUIDE_GESTURES
+            .iter()
+            .position(|&v| v == s.guide_gesture)
+            .unwrap_or(0) as u32
+    }
+
     pub fn present_priority(s: &Settings) -> u32 {
         // Unknown values (a newer client's intent) read as the default, exactly as
         // `PresentPriority::resolve` treats them.
@@ -642,6 +656,12 @@ fn commit_profile(active: &StreamProfile, touched: &Touched, values: &Settings) 
     if touched.has("gamepad_forwarding") {
         o.gamepad_forwarding = Some(values.gamepad_forwarding);
     }
+    if touched.has("system_buttons") {
+        o.system_buttons = Some(values.system_buttons.clone());
+    }
+    if touched.has("guide_gesture") {
+        o.guide_gesture = Some(values.guide_gesture.clone());
+    }
     if touched.has("stats_verbosity") {
         o.stats_verbosity = Some(values.stats_verbosity());
     }
@@ -687,6 +707,15 @@ const GAMEPADS: &[&str] = &[
     "dualshock4",
     "steamdeck",
 ];
+/// System-button routing values (persisted under the cross-client `system_buttons` key):
+/// where the guide (Xbox/PS/Steam) and quick-access presses land while streaming. Auto =
+/// the host, except under Gaming Mode where the local Steam UI reacts to the same press.
+const SYSTEM_BUTTONS: &[&str] = &["auto", "forward", "local"];
+const SYSTEM_BUTTON_LABELS: &[&str] = &["Automatic", "Send to host", "This device"];
+/// Hold-Select guide gesture values (the cross-client `guide_gesture` key). Auto arms it
+/// only where the raw guide press can't reach the host (Gaming Mode here).
+const GUIDE_GESTURES: &[&str] = &["auto", "on", "off"];
+const GUIDE_GESTURE_LABELS: &[&str] = &["Automatic", "On", "Off"];
 const COMPOSITORS: &[&str] = &["auto", "kwin", "wlroots", "mutter", "gamescope"];
 /// Codec setting values (persisted) paired with their display labels below. PyroWave is
 /// preference-only by design (`Settings::preferred_codec`) — the ladder falls back to
@@ -1542,16 +1571,39 @@ pub fn show_scoped(
             "Steam Deck",
         ],
     );
-    // Both pad rows only mean something while something is being forwarded (the same
+    // Where the guide (Xbox/PS/Steam) + quick-access presses land, and the hold-Select
+    // gesture that keeps the host's guide reachable when they stay local. Desktop rarely
+    // needs either off Automatic — they exist here because profiles are authored on the
+    // desktop and applied everywhere, Gaming Mode included.
+    let sysbtn_row = ChoiceRow::new(
+        &dialog,
+        inline,
+        "Steam / guide button",
+        "Automatic sends it to the host, except where this device reacts to it too",
+        SYSTEM_BUTTON_LABELS,
+    );
+    let gesture_row = ChoiceRow::new(
+        &dialog,
+        inline,
+        "Hold Select for guide",
+        "Hold Select alone for the host's guide button — a tap still goes through",
+        GUIDE_GESTURE_LABELS,
+    );
+    // The pad rows only mean something while something is being forwarded (the same
     // relationship mic → echo cancellation draws just above, initial state included: the
     // seed's `set_active` fires this only when it CHANGES the switch).
     {
         let (f, t) = (forward_row.widget().clone(), pad_row.widget().clone());
+        let (sb, gg) = (sysbtn_row.widget().clone(), gesture_row.widget().clone());
         f.set_sensitive(seed.gamepad_forwarding);
         t.set_sensitive(seed.gamepad_forwarding);
+        sb.set_sensitive(seed.gamepad_forwarding);
+        gg.set_sensitive(seed.gamepad_forwarding);
         pad_forward_row.connect_active_notify(move |r| {
             f.set_sensitive(r.is_active());
             t.set_sensitive(r.is_active());
+            sb.set_sensitive(r.is_active());
+            gg.set_sensitive(r.is_active());
         });
     }
 
@@ -1566,6 +1618,8 @@ pub fn show_scoped(
         bitrate_row.set_value(f64::from(s.bitrate_kbps) / 1000.0);
         pad_forward_row.set_active(s.gamepad_forwarding);
         pad_row.set_selected(index::gamepad(s));
+        sysbtn_row.set_selected(index::system_buttons(s));
+        gesture_row.set_selected(index::guide_gesture(s));
         let touch_i = index::touch(s);
         touch_row.set_selected(touch_i);
         // set_selected never fires the changed hook, so seed the dynamic caption directly.
@@ -1795,6 +1849,18 @@ pub fn show_scoped(
             index::surround
         );
         choice!(pad_row, "gamepad", o.gamepad.is_some(), index::gamepad);
+        choice!(
+            sysbtn_row,
+            "system_buttons",
+            o.system_buttons.is_some(),
+            index::system_buttons
+        );
+        choice!(
+            gesture_row,
+            "guide_gesture",
+            o.guide_gesture.is_some(),
+            index::guide_gesture
+        );
         toggle!(
             pad_forward_row,
             "gamepad_forwarding",
@@ -2001,6 +2067,8 @@ pub fn show_scoped(
         controllers_group.add(forward_row.widget());
     }
     controllers_group.add(pad_row.widget());
+    controllers_group.add(sysbtn_row.widget());
+    controllers_group.add(gesture_row.widget());
     controllers.add(&controllers_group);
 
     // Cap every caption in one pass, after the rows exist: a per-row call would be sixteen
@@ -2040,6 +2108,12 @@ pub fn show_scoped(
             if pad_sel != 0 || GAMEPADS.contains(&s.gamepad.as_str()) {
                 s.gamepad = GAMEPADS[pad_sel].to_string();
             }
+            s.system_buttons = SYSTEM_BUTTONS
+                [(sysbtn_row.selected() as usize).min(SYSTEM_BUTTONS.len() - 1)]
+            .to_string();
+            s.guide_gesture = GUIDE_GESTURES
+                [(gesture_row.selected() as usize).min(GUIDE_GESTURES.len() - 1)]
+            .to_string();
             s.touch_mode =
                 TOUCH_MODES[(touch_row.selected() as usize).min(TOUCH_MODES.len() - 1)].to_string();
             s.mouse_mode =
