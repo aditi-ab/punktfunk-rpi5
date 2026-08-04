@@ -79,9 +79,11 @@ list: [Clients → the `punktfunk` CLI](/docs/clients#scripting-the-punktfunk-cl
 ## Steam Deck
 
 Most Deck users want **Gaming Mode**: install the **[Decky plugin](/docs/steam-deck)** and a
-**Punktfunk** panel lands in the Quick Access Menu, so you can discover hosts, pair with a PIN, and
-stream **without dropping to the desktop**. Follow the **[Steam Deck (Decky) guide](/docs/steam-deck)**
-— it walks through Decky Loader, the plugin, and the one-time client install.
+**Punktfunk** panel lands in the Quick Access Menu, so you can find a host, get let in (a PIN, or a
+request the host's operator approves), and stream **without dropping to the desktop**. Everything
+else — settings, the game library, adding a host by address — is one tap away in the client's own
+gamepad UI. Follow the **[Steam Deck (Decky) guide](/docs/steam-deck)** — it walks through Decky
+Loader, the plugin, and the one-time client install.
 
 > The plugin doesn't decode video itself — it drives whichever `punktfunk-client` is installed on
 > the Deck. The Flatpak below is the tested default; a native package or a sysext works too. If your

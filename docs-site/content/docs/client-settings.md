@@ -15,13 +15,14 @@ The Linux, Windows, Mac, iPhone/iPad and Android apps group settings the same wa
 **Display**, **Input**, **Audio**, **Controllers** — under *Preferences* on Linux and *Settings*
 elsewhere. The Apple TV app shows one scrolling list instead, and so does any client's settings
 screen reached with a controller. A controller-driven launch (Steam Deck Gaming Mode) opens the
-client's **console home**, whose settings screen is one steppable list; the Decky plugin's Settings
-tab covers the same store in the same groups and the same order, as a left rail of categories the
-way SteamOS's own Settings looks. The console home is part of the
-client — it is not the host's
-[web console](/docs/web-console).
+client's **console home**, whose settings screen is one steppable list of sections — **Stream**,
+**Video**, **Presentation**, **Audio**, **Controller**, **Touchscreen**, **Interface**,
+**Profiles**. On a Steam Deck that list *is* the settings surface: the
+[Decky plugin](/docs/steam-deck) is a launcher and keeps no settings of its own, and its **Open
+Punktfunk** button puts the console home one tap from the Quick Access Menu. The console home is
+part of the client — it is not the host's [web console](/docs/web-console).
 
-Linux stores them in `~/.config/punktfunk/client-gtk-settings.json`, the same file the Decky plugin
+Linux stores them in `~/.config/punktfunk/client-gtk-settings.json`, the same file the console home
 writes, so a change in either shows up in the other. Windows uses
 `%APPDATA%\punktfunk\client-windows-settings.json`; the Apple and Android apps use their own stores.
 
@@ -45,9 +46,9 @@ and your client scales what it gets — see
 
 **Match window** — *default: off.* The stream mode follows your window instead, and each resize
 renegotiates the host's display and encoder, so a windowed session stays pixel-exact. Fullscreen
-degenerates to the display's native mode. Offered by the Linux, Windows, Mac, iPhone/iPad, console
-home and Decky screens (on Decky it sits in the Resolution picker, and Gaming-Mode streams are
-always fullscreen, so it lands on native); not by Android.
+degenerates to the display's native mode. Offered by the Linux, Windows, Mac, iPhone/iPad and
+console-home screens (in the console home it is an option inside the Resolution picker, and a
+Gaming-Mode stream is always fullscreen, so there it lands on native); not by Android.
 
 **Refresh rate** — *default: Native*, the refresh of the display your window is on. The Apple app
 stores an explicit rate (60 Hz by default): iPhone and iPad offer the rates the device can display,
@@ -68,11 +69,11 @@ capacity probe stay off for the whole session.
 multiplied by this, and your device resamples the result to its window. Above 1× supersamples for
 sharpness, at more bandwidth *and* more decode work; below 1× is lighter on both the host and the
 link. The stops run 0.5× to 4×. The result is floored to an even size and capped per axis at
-4096 px for H.264, 8192 px otherwise. Offered everywhere except the console home's list.
+4096 px for H.264, 8192 px otherwise. Offered everywhere.
 
 **Video codec** — *default: Automatic.* A soft preference: the host emits your choice when it can
 also produce it, otherwise the best codec you both speak, in the order HEVC → AV1 → H.264.
-**PyroWave** is never auto-picked — pick it explicitly on Linux, Windows, the console home, Decky, or
+**PyroWave** is never auto-picked — pick it explicitly on Linux, Windows, the console home, or
 an Apple device whose decode probe passes; anywhere else it isn't offered, and asking for it lands on
 that same order. See [PyroWave](/docs/pyrowave). The Android and Apple apps hide AV1 unless the
 device has a hardware AV1 decoder; Android never offers PyroWave.
@@ -86,13 +87,13 @@ Full detail: [HDR](/docs/hdr).
 needs HEVC or PyroWave, the host's own 4:4:4 policy left on, a capture path that delivers full
 chroma, and a GPU that can encode it; if any gate fails the host says 4:2:0 before your decoder is
 built. The Apple, Linux and Windows apps all advertise it (Apple additionally requires its hardware
-decode probe to pass). The console home and Decky offer the toggle; Android doesn't.
+decode probe to pass). The console home offers the toggle; Android doesn't.
 
 **Prioritize** — *default: Lowest latency.* What the client optimizes for when a decoded frame is
 ready. **Lowest latency** shows every frame the moment the display can take it, so a network hiccup
 becomes an occasional repeated or skipped frame. **Smoothness** holds a small buffer that evens
-those hiccups out, at that buffer's worth of added delay. Linux and Windows apps, the console home
-and Decky; the Apple and Android apps have carried the same setting for a while, and it is stored
+those hiccups out, at that buffer's worth of added delay. Linux and Windows apps and the console
+home; the Apple and Android apps have carried the same setting for a while, and it is stored
 under the same name, so a [profile](/docs/profiles-and-links) means the same thing on every device.
 
 **Smoothness buffer** — *default: Automatic (two frames).* Only shown under **Smoothness**. How
@@ -106,7 +107,7 @@ the instant it's ready instead of waiting for the screen's next refresh: the low
 can give you, at the cost of visible tearing on fast motion. It is **best-effort** — not every
 driver or compositor offers a tearing mode, and where none is available the stream stays tear-free.
 The Detailed [stats overlay](/docs/stats) names the mode actually in use, so you can tell "off"
-from "off but unavailable". Linux and Windows apps, the console home and Decky.
+from "off but unavailable". Linux and Windows apps and the console home.
 
 **Follow variable refresh rate** — *default: on.* On a VRR / FreeSync / G-Sync screen, let the panel
 refresh in step with the stream rather than on a fixed cadence — which removes the wait between a
@@ -115,8 +116,8 @@ windowed one is at the compositor's mercy) and is harmless on a fixed-refresh sc
 graphics driver that offers the modern queue-free display mode; on an older driver it does nothing
 unless you also set `PUNKTFUNK_VRR_FIFO=1` (see [configuration](/docs/configuration)), because the
 older way of following a panel costs noticeable latency on a fixed-refresh screen. The stats overlay
-reports `vrr yes` once it has *measured* that the panel really is following. Linux and Windows apps,
-the console home and Decky.
+reports `vrr yes` once it has *measured* that the panel really is following. Linux and Windows apps
+and the console home.
 
 **Host compositor** — *default: Automatic.* Which backend a **Linux** host uses to drive the virtual
 output. Advisory: a host without that backend quietly auto-detects instead.
@@ -130,7 +131,7 @@ claims a sink advertising exactly that many channels, so applications produce re
 **Windows** host loopback-captures your current output endpoint and lets Windows convert it — so 5.1
 from a stereo endpoint is an upmix, not new channels. Offered everywhere.
 
-**Microphone** — *default: off on Linux, Windows, Android, the console home and Decky; on in the
+**Microphone** — *default: off on Linux, Windows, Android and the console home; on in the
 Apple app.* Sends this device's microphone to the host's virtual mic. On Linux and Windows the
 row is spelled *Stream microphone*, and **Ctrl+Alt+Shift+V** mutes it mid-stream without ending
 anything — see [Muting your microphone](/docs/input#muting-your-microphone).
@@ -142,18 +143,18 @@ from an echo-cancelled PipeWire source when your desktop provides one, on **Wind
 for the Communications stream category so the endpoint's processing engages, and on **Apple** and
 **Android** the platform's voice-processing mode. Turn it off if your microphone already runs its
 own processing, or if the canceller makes your voice sound thin. The row sits under the microphone
-toggle and greys out while the microphone is off. Offered by the Linux, Windows, Apple, Android,
-console-home and Decky clients. What it can and can't fix is in
+toggle and greys out while the microphone is off. Offered by the Linux, Windows, Apple, Android and
+console-home clients. What it can and can't fix is in
 [Why do I hear myself](/docs/echo).
 
 **Speaker** and **Microphone** device pickers — *default: System default.* Which endpoint stream
-audio plays out of, and which input feeds the uplink. Only the Linux app (PipeWire nodes), the
-**Mac** app (which also has a microphone *channel* picker) and **Decky** have these — iPhone, iPad,
-Apple TV, Android and the console home have none, and the Windows app has none and ignores a stored
-speaker choice. On Linux, a device that has since disappeared keeps a "(not detected)" entry rather
-than silently snapping back to the default; the Mac shows it as "Unavailable device" and Decky as
-"(not connected)". Decky reads the endpoint list from the client's session binary, so a client
-older than the two-binary split leaves these pickers on Automatic.
+audio plays out of, and which input feeds the uplink. Only the Linux app (PipeWire nodes) and the
+**Mac** app (which also has a microphone *channel* picker) have these — iPhone, iPad, Apple TV,
+Android and the console home have none, and the Windows app has none and ignores a stored speaker
+choice. On Linux, a device that has since disappeared keeps a "(not detected)" entry rather than
+silently snapping back to the default; the Mac shows it as "Unavailable device". A Steam Deck in
+Gaming Mode therefore has no endpoint picker at all: the session uses whatever the Desktop-Mode app
+last stored, and the system default otherwise.
 
 ## Input
 
@@ -182,7 +183,7 @@ client greys them out to say so.
 
 **Gamepad type** (*Controller type* on Apple, Android and the console home) — *default: Automatic*,
 which matches each physical controller. The pickers offer Xbox 360, Xbox One, DualSense and
-DualShock 4 everywhere, plus Steam Deck on Linux, Android, the console home and Decky. Your client
+DualShock 4 everywhere, plus Steam Deck on Linux, Android and the console home. Your client
 declares a type per pad as it connects — Automatic declares what that controller really is, an
 explicit choice declares your choice — and the host builds each virtual pad from that. A type the
 host has no backend for degrades to an Xbox 360 pad rather than failing: Xbox One on a Windows host,
@@ -193,8 +194,8 @@ which forwards *every* connected controller, each as its own player, on Linux, W
 console home. Pinning one restricts the session to that controller alone — single-player. The Android
 app has no such picker.
 
-**Capture system shortcuts** — *default: on.* Offered by the Linux and Windows apps, the console home
-and Decky; Windows spells the row out as *Capture system shortcuts (Alt+Tab, Win, …)*. On a Deck it
+**Capture system shortcuts** — *default: on.* Offered by the Linux and Windows apps and the console
+home; Windows spells the row out as *Capture system shortcuts (Alt+Tab, Win, …)*. On a Deck it
 matters only for a keyboard you attached yourself, for the reason the paragraph below gives: Gaming
 Mode is gamescope, which has nothing to hold back. On, Alt+Tab and the Windows key
 (Super on Linux) reach the host while the stream has input captured. Off, they act on this machine
@@ -215,21 +216,22 @@ the wlroots compositors all do, and X11 sessions grab the keyboard directly. Und
 Wake-on-LAN and waits for it to boot — only for a host whose MAC address this client has already
 learned. Turn it off for hosts you reach over a VPN, where "offline" usually means "not reachable by
 broadcast" and the wake only adds a delay. The Linux, Windows, Apple and Android apps have this
-toggle, as do the console home and Decky — and note that the Decky plugin sends a wake of its own
-before a stream starts whatever this setting says, so on a Deck it governs the client's connect
-rather than the launch. The console home also offers wake as an explicit action on an offline host.
-See
+toggle, as does the console home — and on a Steam Deck it governs the
+[Decky plugin's](/docs/steam-deck) launches too, because the plugin starts every stream through the
+client, which reads this setting like any other connect. The console home also offers wake as an
+explicit action on an offline host, whatever the toggle says. See
 [Wake-on-LAN](/docs/wake-on-lan).
 
 **Show game library** — *default: off on Linux and Windows; on in the Apple and Android apps.* Browse
 a paired host's games and launch one directly; the Windows app still labels it experimental. The
-console home and Decky have the toggle too — on Decky it governs the *client's* screens, since the
-plugin's own library browser works either way. See [Game library](/docs/game-library).
+console home has the toggle too, and it governs the desktop clients that share the store — the
+console's own **Library** button is offered on any paired host either way. See
+[Game library](/docs/game-library).
 
 **Start streams in fullscreen** — *default: on.* On Linux and Windows, F11 or Alt+Enter leaves
 fullscreen live. On a Mac the setting is **Fullscreen while streaming**, and the window comes back
-when you return to the host list. The console home and Decky carry the row for the desktop client
-that shares the store — a Gaming-Mode launch is fullscreen whatever it says. iPhone, iPad, Apple TV
+when you return to the host list. The console home carries the row for the desktop client that
+shares the store — a Gaming-Mode launch is fullscreen whatever it says. iPhone, iPad, Apple TV
 and Android have no equivalent.
 
 ## Overlay
@@ -237,9 +239,9 @@ and Android have no equivalent.
 **Statistics overlay** — *default: Normal.* Four tiers — Off, Compact, Normal, Detailed — each a
 superset of the one before. This setting only picks the tier a session *starts* at — you can cycle
 them live in-stream, with a shortcut that differs by platform. The Apple app additionally lets you
-choose which corner the overlay sits in (Top Left, Top Right, Bottom Left, Bottom Right). The Decky
-plugin has the tier picker too, in its Settings section. The shortcuts, and every number in the
-overlay, are in
+choose which corner the overlay sits in (Top Left, Top Right, Bottom Left, Bottom Right). The
+console home has the tier picker too, as **Statistics overlay** under **Interface**. The shortcuts,
+and every number in the overlay, are in
 [Understanding the stats overlay](/docs/stats).
 
 ## Settings that are facts about your device
@@ -251,8 +253,8 @@ stay global and **cannot be put in a settings profile**:
   vendor-ordered and falls back on its own; change it only when debugging, and note that
   `PUNKTFUNK_DECODER` overrides it
   ([Configuration](/docs/configuration#client-side-native-clients)). The decoder picker is on Linux,
-  Windows, in the console home and in Decky; the GPU picker on Windows, and on Linux and Decky only
-  when the machine has more than one adapter — which a Deck doesn't, so the row isn't there. The
+  Windows and in the console home; the GPU picker on Windows, and on Linux only when the machine has
+  more than one adapter — the console home has none, and a Deck has a single adapter anyway. The
   Apple and Android apps have neither.
 - **Speaker** and **Microphone** device pickers — this device's audio endpoints.
 - **Forwarded controller** — which physical pad is in your hands. The *type* the host creates is a
