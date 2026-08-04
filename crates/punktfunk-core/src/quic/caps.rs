@@ -111,6 +111,17 @@ pub const CLIENT_CAP_CURSOR: u8 = 0x01;
 /// simply ignored — no behavior change in either direction.
 pub const CLIENT_CAP_PHASE_LOCK: u8 = 0x02;
 
+/// `Hello.client_caps` bit: this client can decode the redundant desktop-audio plane
+/// ([`AUDIO_RED_MAGIC`](super::datagram::AUDIO_RED_MAGIC), `0xD2`), where every datagram also
+/// carries a copy of the previous frame so a single lost packet is reconstructed instead of
+/// papered over with packet-loss concealment.
+///
+/// Active only when the host answers with [`HOST_CAP_AUDIO_RED`] (capable-and-agreed, the
+/// cursor/clipboard precedent). Toward an older host, or a host that declines because the link is
+/// clean, the client keeps receiving the plain `0xC9` plane — so a client may always set this bit.
+/// `0x04` — `0x01`/`0x02` are cursor / phase-lock.
+pub const CLIENT_CAP_AUDIO_RED: u8 = 0x04;
+
 /// [`Welcome::host_caps`] bit: the host CAN forward the cursor out-of-band (it captures cursor
 /// metadata separately from the frame — the Linux portal `SPA_META_Cursor` path; NOT gamescope,
 /// whose capture carries no cursor, and NOT Windows yet, where DWM composites into the IDD
@@ -131,6 +142,18 @@ pub const HOST_CAP_CURSOR: u8 = 0x08;
 /// which is exactly why the gate exists. `0x10` — `0x08` is [`HOST_CAP_CURSOR`], `0x04` is
 /// [`HOST_CAP_TEXT_INPUT`], `0x01`/`0x02` are gamepad-state / clipboard.
 pub const HOST_CAP_PEN: u8 = 0x10;
+
+/// [`Welcome::host_caps`] bit: the host is sending the REDUNDANT desktop-audio plane
+/// ([`AUDIO_RED_MAGIC`](super::datagram::AUDIO_RED_MAGIC), `0xD2`) instead of plain `0xC9` — each
+/// datagram carries its own frame plus a copy of the previous one.
+///
+/// Set only when the client asked via [`CLIENT_CAP_AUDIO_RED`]. It is a statement about the WIRE,
+/// not a negotiation the client can decline: with the bit set the client must decode `0xD2`, and
+/// without it `0xC9`. The host may also drop back to `0xC9` mid-session (the redundancy is
+/// loss-gated — a clean LAN shouldn't pay for it), which is why clients decode BOTH tags
+/// unconditionally and treat this bit as "expect redundancy", not "only redundancy".
+/// `0x20` — `0x10` is [`HOST_CAP_PEN`], `0x08` is [`HOST_CAP_CURSOR`].
+pub const HOST_CAP_AUDIO_RED: u8 = 0x20;
 
 /// [`Hello::video_codecs`] bit: the client can decode H.264 / AVC. The GPU-less **software**
 /// encode path (openh264) emits H.264, so a client that wants to stream from a software host MUST

@@ -48,6 +48,13 @@ exclude = ["MsghdrX", "recvmsg_x", "mmsghdr", "sendmmsg", "recvmmsg"]
 "AXIS_RT" = "PUNKTFUNK_AXIS_RT"
 "AUDIO_MAGIC" = "PUNKTFUNK_AUDIO_MAGIC"
 "RUMBLE_MAGIC" = "PUNKTFUNK_RUMBLE_MAGIC"
+"AUDIO_RED_MAGIC" = "PUNKTFUNK_AUDIO_RED_MAGIC"
+"AUDIO_RED_HEADER" = "PUNKTFUNK_AUDIO_RED_HEADER"
+# Same hazard as the BTN_* block above, one step worse: `FRAME_MS` and `SAMPLE_RATE_HZ` are
+# generic enough that an embedder is likely to have its own, and a clashing #define silently
+# takes the last definition rather than failing to compile.
+"FRAME_MS" = "PUNKTFUNK_AUDIO_FRAME_MS"
+"SAMPLE_RATE_HZ" = "PUNKTFUNK_AUDIO_SAMPLE_RATE_HZ"
 
 # QualifiedScreamingSnakeCase already qualifies each variant with the enum name
 # (PunktfunkStatus::Ok -> PUNKTFUNK_STATUS_OK); do NOT also set prefix_with_name or it doubles.

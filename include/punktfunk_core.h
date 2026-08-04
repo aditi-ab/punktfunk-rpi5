@@ -312,6 +312,13 @@
 // `PunktfunkStatus` code).
 #define PUNKTFUNK_CLIP_ERROR 6
 
+// The protocol's audio frame, in milliseconds — every host datagram carries exactly one
+// ([`crate::quic::encode_audio_datagram`]), so it is also the smallest useful shed unit.
+#define PUNKTFUNK_AUDIO_FRAME_MS 5
+
+// Sample rate of every audio plane in the protocol.
+#define PUNKTFUNK_AUDIO_SAMPLE_RATE_HZ 48000
+
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // The uniform no-TTL-host staleness bound: a legacy host refreshes state every 500 ms, so two
 // missed refreshes = quiet host → silence. Replaces the per-platform zoo (1.6 s / 60 s / 1.5 s /
@@ -628,6 +635,19 @@
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
+// `Hello.client_caps` bit: this client can decode the redundant desktop-audio plane
+// ([`AUDIO_RED_MAGIC`](super::datagram::AUDIO_RED_MAGIC), `0xD2`), where every datagram also
+// carries a copy of the previous frame so a single lost packet is reconstructed instead of
+// papered over with packet-loss concealment.
+//
+// Active only when the host answers with [`HOST_CAP_AUDIO_RED`] (capable-and-agreed, the
+// cursor/clipboard precedent). Toward an older host, or a host that declines because the link is
+// clean, the client keeps receiving the plain `0xC9` plane — so a client may always set this bit.
+// `0x04` — `0x01`/`0x02` are cursor / phase-lock.
+#define CLIENT_CAP_AUDIO_RED 4
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
 // [`Welcome::host_caps`] bit: the host CAN forward the cursor out-of-band (it captures cursor
 // metadata separately from the frame — the Linux portal `SPA_META_Cursor` path; NOT gamescope,
 // whose capture carries no cursor, and NOT Windows yet, where DWM composites into the IDD
@@ -650,6 +670,20 @@
 // which is exactly why the gate exists. `0x10` — `0x08` is [`HOST_CAP_CURSOR`], `0x04` is
 // [`HOST_CAP_TEXT_INPUT`], `0x01`/`0x02` are gamepad-state / clipboard.
 #define HOST_CAP_PEN 16
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// [`Welcome::host_caps`] bit: the host is sending the REDUNDANT desktop-audio plane
+// ([`AUDIO_RED_MAGIC`](super::datagram::AUDIO_RED_MAGIC), `0xD2`) instead of plain `0xC9` — each
+// datagram carries its own frame plus a copy of the previous one.
+//
+// Set only when the client asked via [`CLIENT_CAP_AUDIO_RED`]. It is a statement about the WIRE,
+// not a negotiation the client can decline: with the bit set the client must decode `0xD2`, and
+// without it `0xC9`. The host may also drop back to `0xC9` mid-session (the redundancy is
+// loss-gated — a clean LAN shouldn't pay for it), which is why clients decode BOTH tags
+// unconditionally and treat this bit as "expect redundancy", not "only redundancy".
+// `0x20` — `0x10` is [`HOST_CAP_PEN`], `0x08` is [`HOST_CAP_CURSOR`].
+#define HOST_CAP_AUDIO_RED 32
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
@@ -965,6 +999,41 @@
 // (lightbar, player LEDs, adaptive triggers) — the rich analog of [`RUMBLE_MAGIC`]. See
 // [`HidOutput`].
 #define HIDOUT_MAGIC 205
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Redundant audio datagram, host → client: the [`AUDIO_MAGIC`] plane plus a copy of the PREVIOUS
+// frame, so a single lost datagram is *reconstructed* rather than concealed.
+//
+// `[0xD2][u32 seq LE][u64 pts_ns LE][u16 primary_len LE][primary opus][previous opus]`
+//
+// **Why this and not Opus in-band FEC.** LBRR is a SILK-layer feature: the desktop-audio encoder
+// runs `RESTRICTED_LOWDELAY` (CELT-only) at 5 ms frames, which is below SILK's 10 ms minimum, so
+// `set_inband_fec(true)` on that encoder is a no-op. Nothing in libopus can protect this plane —
+// the redundancy has to be at the application layer. (The mic uplink is a different encoder, VoIP
+// mode at 10 ms, and *does* use real in-band FEC.)
+//
+// **Why it costs no latency.** The copy rides the SUCCESSOR of the frame it protects, and the
+// client is already holding 15–90 ms of de-jitter buffer — far more than the 5 ms the successor
+// takes to arrive. So the recovery happens inside slack that already exists.
+//
+// The previous frame's sequence is implicitly `seq - 1`; a host with nothing to duplicate yet
+// (the first frame of a session, or straight after a capture reopen) simply sends an empty tail,
+// which decodes to `None`.
+//
+// Sent ONLY when the client advertised [`CLIENT_CAP_AUDIO_RED`](super::caps::CLIENT_CAP_AUDIO_RED)
+// and the host answered [`HOST_CAP_AUDIO_RED`](super::caps::HOST_CAP_AUDIO_RED) — the
+// capable-and-agreed handshake the cursor and 4:4:4 planes already use. Every other session keeps
+// the plain [`AUDIO_MAGIC`] wire byte-for-byte.
+//
+// NB `0xD1` is deliberately skipped: the DualSense pad-audio program has reserved it for the
+// per-pad audio plane.
+#define PUNKTFUNK_AUDIO_RED_MAGIC 210
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Fixed header length of an [`AUDIO_RED_MAGIC`] datagram (tag + seq + pts + primary length).
+#define PUNKTFUNK_AUDIO_RED_HEADER (((1 + 4) + 8) + 2)
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
@@ -1397,6 +1466,14 @@ typedef uint8_t PunktfunkInputKind;
 typedef struct ColorInfo ColorInfo;
 #endif
 
+// Tuning for [`JitterPolicy`], in MILLISECONDS.
+//
+// Denominating the depth in time rather than in device quanta is the point. Every client used to
+// compute its target as `3 × quantum`, which is a sane 15 ms at a 5 ms quantum and a silent 64 ms
+// at a 20 ms one — the same source line meaning two very different latencies depending on what
+// else happened to be using the audio graph that day.
+typedef struct JitterTuning JitterTuning;
+
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // Opaque handle to a live `punktfunk/1` connection (QUIC control plane + UDP data plane, all
 // pumped on internal threads).
@@ -1783,6 +1860,14 @@ typedef struct {
     uint32_t wire_packets_sent;
     uint32_t send_dropped;
 } PunktfunkProbeResult;
+
+
+
+
+
+
+
+
 
 
 

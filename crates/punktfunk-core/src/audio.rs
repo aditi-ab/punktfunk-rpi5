@@ -103,6 +103,72 @@ pub const LAYOUT_71_HQ: OpusLayout = OpusLayout {
     bitrate: 2_048_000,
 };
 
+/// Encode bitrate tier for the desktop-audio downlink. The layout table's `bitrate` is the
+/// [`AudioTier::Standard`] value, so `Standard` reproduces the pre-tier wire byte-for-byte.
+///
+/// **Why a tier at all.** 5 ms Opus frames are markedly less efficient than 20 ms ones (shorter
+/// MDCT, a bigger per-packet overhead share), so the historical 128 kbps stereo buys roughly what
+/// ~100 kbps buys at 20 ms — audible on music, and the 2026-08-03 field report said exactly that.
+/// Meanwhile the same session carries tens of Mbps of video: at 256 kbps audio is ~1 % of the
+/// budget. [`AudioTier::High`] is therefore the DEFAULT; the lower tiers exist for a genuinely
+/// constrained link, not as the normal case.
+///
+/// Purely a host-side encoder knob: every client decodes whatever bitrate arrives (libopus reads
+/// it from the packet), so changing tiers needs no protocol negotiation and no client change.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum AudioTier {
+    /// Constrained links — noticeably lossy on music, still fine for game/voice content.
+    Low,
+    /// The historical values (stereo 128 kbps). Kept exactly so the tier machinery is provably
+    /// non-regressive against every pre-tier build.
+    Standard,
+    /// The default: effectively transparent at 5 ms frames, for ~1 % of a normal video budget.
+    #[default]
+    High,
+}
+
+impl AudioTier {
+    /// Parse a config/CLI spelling (`low` / `standard` / `high`); `None` for anything else so the
+    /// caller can warn and fall back rather than silently downgrading someone's audio.
+    pub fn parse(s: &str) -> Option<AudioTier> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "low" => Some(AudioTier::Low),
+            "standard" | "normal" | "medium" => Some(AudioTier::Standard),
+            "high" => Some(AudioTier::High),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AudioTier::Low => "low",
+            AudioTier::Standard => "standard",
+            AudioTier::High => "high",
+        }
+    }
+}
+
+impl OpusLayout {
+    /// This layout's target bitrate at `tier`. The uncoupled HIGH-QUALITY layouts
+    /// ([`LAYOUT_51_HQ`] / [`LAYOUT_71_HQ`]) are already far past transparency, so they are
+    /// tier-invariant — scaling 1.5 Mbps up would only waste wire.
+    pub fn bitrate_for(&self, tier: AudioTier) -> i32 {
+        // One mono stream per channel == the HQ layouts; nothing to gain from a tier there.
+        if self.coupled == 0 && self.streams == self.channels {
+            return self.bitrate;
+        }
+        match (self.channels, tier) {
+            (6, AudioTier::Low) => 192_000,
+            (6, AudioTier::High) => 448_000,
+            (8, AudioTier::Low) => 320_000,
+            (8, AudioTier::High) => 768_000,
+            (_, AudioTier::Low) => 96_000,
+            (_, AudioTier::High) => 256_000,
+            (_, AudioTier::Standard) => self.bitrate,
+        }
+    }
+}
+
 /// Pick the layout for a negotiated channel count. Unknown counts fall back to stereo (clients
 /// only ever request 2/6/8). `high_quality` selects the uncoupled high-bitrate config.
 pub fn layout_for(channels: u8, high_quality: bool) -> &'static OpusLayout {
@@ -170,6 +236,342 @@ impl AudioGapTracker {
         }
         self.last_seq = Some(seq);
         (delta - 1).min(MAX_CONCEAL_PACKETS)
+    }
+}
+
+// ---- the shared playback de-jitter policy -------------------------------------------------
+
+/// The protocol's audio frame, in milliseconds — every host datagram carries exactly one
+/// ([`crate::quic::encode_audio_datagram`]), so it is also the smallest useful shed unit.
+pub const FRAME_MS: u32 = 5;
+
+/// Tuning for [`JitterPolicy`], in MILLISECONDS.
+///
+/// Denominating the depth in time rather than in device quanta is the point. Every client used to
+/// compute its target as `3 × quantum`, which is a sane 15 ms at a 5 ms quantum and a silent 64 ms
+/// at a 20 ms one — the same source line meaning two very different latencies depending on what
+/// else happened to be using the audio graph that day.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JitterTuning {
+    /// Depth to prime to before the first sample plays, and the depth drift correction pulls
+    /// back toward. The adaptive floor may raise the live target above this; it never goes below.
+    pub base_target_ms: u32,
+    /// Ceiling for the adaptively-grown target (see [`JitterPolicy::note_read`]).
+    pub max_target_ms: u32,
+    /// Slack above the live target before drop-oldest trimming starts. Absorbs an arrival burst
+    /// without overflowing.
+    ///
+    /// Drift correction sheds at the MIDDLE of this band (see [`JitterTuning::shed_excess_ms`]),
+    /// so the smooth correction always gets its chance before the hard trim. Setting this too
+    /// small is a real failure mode, not just a tuning choice: if the trim point sits below the
+    /// shed point, the ring is trimmed back before the depth average can ever reach the shed
+    /// threshold, drift correction becomes dead code, and every correction is once again the
+    /// audible drop it was supposed to replace.
+    pub headroom_ms: u32,
+    /// Absolute bound on buffered audio — the only hard guarantee on added latency.
+    pub hard_cap_ms: u32,
+    /// Consecutive short reads before the ring goes back to priming. `1` reproduces the old
+    /// `if ring.is_empty() { primed = false }`, where a single transient drain manufactured a
+    /// whole target's worth of fresh silence; every platform now uses hysteresis.
+    pub deprime_after: u32,
+}
+
+impl JitterTuning {
+    /// PipeWire adaptively rate-matches the stream to the graph clock and absorbs a shallow ring,
+    /// so Linux can run tight.
+    pub const PIPEWIRE: JitterTuning = JitterTuning {
+        base_target_ms: 15,
+        max_target_ms: 60,
+        headroom_ms: 25,
+        hard_cap_ms: 80,
+        deprime_after: 4,
+    };
+    /// WASAPI shared-mode event-driven render: the engine buffers for us, but nothing rate-matches.
+    pub const WASAPI: JitterTuning = JitterTuning {
+        base_target_ms: 20,
+        max_target_ms: 70,
+        headroom_ms: 30,
+        hard_cap_ms: 90,
+        deprime_after: 4,
+    };
+    /// CoreAudio via AVAudioEngine — comparable to WASAPI; the iOS IO buffer is already 5 ms.
+    pub const COREAUDIO: JitterTuning = JitterTuning {
+        base_target_ms: 20,
+        max_target_ms: 70,
+        headroom_ms: 30,
+        hard_cap_ms: 90,
+        deprime_after: 4,
+    };
+    /// AAudio hands us a raw realtime callback and makes us own the buffer, and Wi-Fi power-save
+    /// bunching lands as underruns = crackle. Android therefore starts DEEPER — but at 25 ms, not
+    /// the old fixed 40: the adaptive floor raises it only on the devices that actually underrun,
+    /// instead of every device pre-paying for the worst one.
+    pub const AAUDIO: JitterTuning = JitterTuning {
+        base_target_ms: 25,
+        max_target_ms: 90,
+        headroom_ms: 40,
+        hard_cap_ms: 120,
+        deprime_after: 5,
+    };
+
+    /// How far above the live target the depth average must sit before drift correction sheds:
+    /// the middle of the headroom band, but never less than two protocol frames (so it cannot be
+    /// hair-triggered by one quantum of normal swing). Deriving it from `headroom_ms` rather than
+    /// fixing it absolutely is what keeps the smooth shed strictly BELOW the hard trim on every
+    /// preset — see the field on `headroom_ms`.
+    pub const fn shed_excess_ms(&self) -> u32 {
+        let half = self.headroom_ms / 2;
+        if half > 2 * FRAME_MS {
+            half
+        } else {
+            2 * FRAME_MS
+        }
+    }
+}
+
+/// What one callback should do, from [`JitterPolicy::step`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct JitterStep {
+    /// Interleaved samples to discard from the FRONT of the ring before reading.
+    pub drop_front: usize,
+    /// When non-zero, `drop_front` is a smooth drift correction and this many interleaved samples
+    /// of linear crossfade should be applied across the seam ([`crossfade_drop`] does it for a
+    /// `VecDeque<f32>` ring). Zero means discard hard — either nothing is being dropped, or the
+    /// ring blew the hard cap and is already a discontinuity.
+    pub crossfade: usize,
+    /// Emit silence this callback: still priming, or re-priming after a sustained drain.
+    pub silence: bool,
+}
+
+/// EWMA time constant for the depth average, in ms. Long enough that a burst doesn't trigger a
+/// shed, short enough to track real drift.
+const EWMA_TAU_MS: u32 = 1_000;
+/// The depth EWMA must stay above the shed threshold for this much CONSUMED AUDIO. Deliberately long: a shed is the only
+/// thing here a listener could ever notice, so it must never fire on a transient.
+const SHED_SUSTAIN_MS: u32 = 2_000;
+/// Linear crossfade applied across a drift shed's seam.
+const SHED_CROSSFADE_MS: u32 = 2;
+/// Underruns inside [`GROW_WINDOW_MS`] before the live target grows.
+const GROW_UNDERRUNS: u32 = 3;
+const GROW_WINDOW_MS: u32 = 5_000;
+const GROW_STEP_MS: u32 = 10;
+/// Quiet time (no underrun) before a grown target relaxes one step back toward the base.
+const SHRINK_QUIET_MS: u32 = 30_000;
+
+/// The playback de-jitter state machine shared by every client's audio ring.
+///
+/// **The defect it exists to fix.** Every client's ring primed *up* to a target and clamped at a
+/// ceiling, and none of them walked the depth back *down*. Any transient — a Wi-Fi arrival burst, a
+/// host stall, or plain host-DAC-vs-client-DAC clock skew of a few dozen ppm — therefore added
+/// latency permanently, until an underrun happened to re-prime. Android, with no shed at all,
+/// converged on its hard cap and stayed there; Apple shed 40 ms at once and its own comment called
+/// that "one audible blip". Here, a depth EWMA that sits [`SHED_EXCESS_MS`] above target for
+/// [`SHED_SUSTAIN_MS`] of consumed audio sheds ONE 5 ms frame with a crossfade, so latency returns
+/// to target instead of ratcheting.
+///
+/// **Driven by the audio clock, not the wall clock**: every duration is measured in samples
+/// consumed. That makes it allocation-free, syscall-free (safe in a realtime callback) and
+/// deterministic under test.
+#[derive(Clone, Debug)]
+pub struct JitterPolicy {
+    tuning: JitterTuning,
+    /// Interleaved samples per millisecond at the negotiated layout (48 × channels).
+    per_ms: usize,
+    /// The live target, in interleaved samples — `base_target_ms` grown by underrun pressure.
+    target: usize,
+    primed: bool,
+    /// Consecutive short reads (de-prime hysteresis).
+    empties: u32,
+    /// EWMA of ring depth, interleaved samples.
+    depth_avg: f32,
+    /// Consumed samples for which the EWMA has stayed above the shed threshold.
+    over_run: usize,
+    /// Underruns seen in the current growth window, and the window's consumed-sample count.
+    underruns: u32,
+    window_run: usize,
+    /// Consumed samples since the last underrun (drives the relax-back-down step).
+    quiet_run: usize,
+    /// `want` from the most recent [`step`](Self::step), so [`note_read`](Self::note_read) can
+    /// advance the sample-denominated timers without the caller repeating it.
+    last_want: usize,
+}
+
+impl JitterPolicy {
+    /// `channels` is the negotiated interleaved channel count (2/6/8).
+    pub fn new(tuning: JitterTuning, channels: u8) -> JitterPolicy {
+        let per_ms = (SAMPLE_RATE_HZ / 1000) as usize * channels.max(1) as usize;
+        JitterPolicy {
+            tuning,
+            per_ms,
+            target: tuning.base_target_ms as usize * per_ms,
+            primed: false,
+            empties: 0,
+            depth_avg: 0.0,
+            over_run: 0,
+            underruns: 0,
+            window_run: 0,
+            quiet_run: 0,
+            last_want: 0,
+        }
+    }
+
+    /// The live target depth in ms (grows under underrun pressure; never below the base).
+    pub fn target_ms(&self) -> u32 {
+        (self.target / self.per_ms) as u32
+    }
+
+    /// Convert a ring depth in interleaved samples to milliseconds — for stats/HUD reporting.
+    pub fn depth_ms(&self, depth: usize) -> u32 {
+        (depth / self.per_ms) as u32
+    }
+
+    /// Smoothed ring depth in ms — what drift correction actually reacts to, and the honest
+    /// number to publish as "audio buffer" (the instantaneous depth swings by a whole quantum).
+    pub fn avg_depth_ms(&self) -> u32 {
+        (self.depth_avg.max(0.0) as usize / self.per_ms) as u32
+    }
+
+    pub fn is_primed(&self) -> bool {
+        self.primed
+    }
+
+    /// The effective target for a device asking for `want` samples per callback. A ring can never
+    /// sustain a target below one device quantum, so a large-buffer device (a 20 ms PipeWire graph
+    /// quantum, a legacy AAudio path) lifts it to `want` plus one protocol frame rather than
+    /// oscillating prime → dropout → re-prime forever.
+    fn effective_target(&self, want: usize) -> usize {
+        self.target.max(want + FRAME_MS as usize * self.per_ms)
+    }
+
+    /// Decide this callback: what to trim, and whether to play. Call BEFORE reading, with the
+    /// ring's current `depth` and the device's `want`, both in interleaved samples.
+    pub fn step(&mut self, depth: usize, want: usize) -> JitterStep {
+        self.last_want = want;
+        let target = self.effective_target(want);
+
+        // Track depth with a callback-rate-independent EWMA: weighting by `want` keeps the time
+        // constant at EWMA_TAU_MS whether the device pulls 5 ms or 20 ms at a time.
+        let alpha = (want as f32 / (EWMA_TAU_MS as usize * self.per_ms) as f32).clamp(0.0, 1.0);
+        self.depth_avg += (depth as f32 - self.depth_avg) * alpha;
+
+        // The hard cap must always leave room to serve this callback, or a large-quantum device
+        // would trim itself into a permanent underrun.
+        let cap = (target + self.tuning.headroom_ms as usize * self.per_ms)
+            .min(self.tuning.hard_cap_ms as usize * self.per_ms)
+            .max(target + want);
+
+        let mut out = JitterStep::default();
+        if depth > cap {
+            // Blew the ceiling: a burst arrived, or we were wedged. Already a discontinuity —
+            // discard hard, and reset the drift timer so the trim isn't double-counted as drift.
+            out.drop_front = depth - cap;
+            self.over_run = 0;
+        } else if self.depth_avg
+            > (target + self.tuning.shed_excess_ms() as usize * self.per_ms) as f32
+        {
+            self.over_run += want;
+            if self.over_run >= SHED_SUSTAIN_MS as usize * self.per_ms {
+                out.drop_front = (FRAME_MS as usize * self.per_ms).min(depth);
+                out.crossfade = (SHED_CROSSFADE_MS as usize * self.per_ms)
+                    .min(depth.saturating_sub(out.drop_front));
+                self.over_run = 0;
+            }
+        } else {
+            self.over_run = 0;
+        }
+        // Whatever we shed is no longer buffered — reflect it immediately so the next callbacks
+        // don't re-fire on a stale average.
+        self.depth_avg = (self.depth_avg - out.drop_front as f32).max(0.0);
+
+        if !self.primed && depth.saturating_sub(out.drop_front) >= target {
+            self.primed = true;
+            self.empties = 0;
+        }
+        out.silence = !self.primed;
+        out
+    }
+
+    /// Report the outcome of the read `step` authorised. `ran_short` = the ring could not fill the
+    /// callback (a genuine underrun), which drives both the de-prime hysteresis and the adaptive
+    /// target floor.
+    ///
+    /// A callback that `step` told to emit silence is NOT an underrun — the ring is deliberately
+    /// re-priming — so calls made while un-primed are ignored and callers need not special-case it.
+    pub fn note_read(&mut self, ran_short: bool) {
+        if !self.primed {
+            return;
+        }
+        let want = self.last_want.max(1);
+        self.window_run += want;
+        if self.window_run >= GROW_WINDOW_MS as usize * self.per_ms {
+            self.window_run = 0;
+            self.underruns = 0;
+        }
+        if ran_short {
+            self.quiet_run = 0;
+            self.empties += 1;
+            if self.empties >= self.tuning.deprime_after {
+                self.primed = false;
+                self.empties = 0;
+            }
+            self.underruns += 1;
+            if self.underruns >= GROW_UNDERRUNS {
+                // This device genuinely needs more slack than the base target. Grow ONCE per
+                // window, capped — the alternative (every device pre-paying the worst device's
+                // depth) is what the fixed 40 ms Android floor was.
+                self.underruns = 0;
+                self.window_run = 0;
+                let grown = self.target + GROW_STEP_MS as usize * self.per_ms;
+                self.target = grown.min(self.tuning.max_target_ms as usize * self.per_ms);
+            }
+        } else {
+            self.empties = 0;
+            self.quiet_run += want;
+            if self.quiet_run >= SHRINK_QUIET_MS as usize * self.per_ms {
+                // Long quiet spell: give a grown target one step back, so a single bad minute
+                // doesn't cost latency for the rest of the session.
+                self.quiet_run = 0;
+                let base = self.tuning.base_target_ms as usize * self.per_ms;
+                self.target = self
+                    .target
+                    .saturating_sub(GROW_STEP_MS as usize * self.per_ms)
+                    .max(base);
+            }
+        }
+    }
+}
+
+/// Sample rate of every audio plane in the protocol.
+pub const SAMPLE_RATE_HZ: u32 = 48_000;
+
+/// Discard `drop` interleaved samples from the front of `ring`, linearly crossfading the seam over
+/// `fade` samples so a drift correction is inaudible rather than a click.
+///
+/// The dropped region's tail fades out while the surviving head fades in, so the waveform is
+/// continuous across the splice. `fade == 0` discards hard (what a hard-cap trim wants — that
+/// backlog is already a discontinuity). Shared by the three `VecDeque<f32>` rings; the Apple ring
+/// is index-based and mirrors this in Swift.
+pub fn crossfade_drop(ring: &mut std::collections::VecDeque<f32>, drop: usize, fade: usize) {
+    if drop == 0 || ring.len() < drop {
+        return;
+    }
+    let fade = fade.min(drop).min(ring.len() - drop);
+    if fade == 0 {
+        ring.drain(..drop);
+        return;
+    }
+    // The last `fade` samples of what we are about to discard are the fade-OUT source; they blend
+    // into the first `fade` samples of what survives.
+    let mut faded = Vec::with_capacity(fade);
+    for i in 0..fade {
+        let old = ring[drop - fade + i];
+        let new = ring[drop + i];
+        let t = (i + 1) as f32 / (fade + 1) as f32;
+        faded.push(old * (1.0 - t) + new * t);
+    }
+    ring.drain(..drop);
+    for (i, v) in faded.into_iter().enumerate() {
+        ring[i] = v;
     }
 }
 
@@ -284,6 +686,383 @@ mod tests {
         assert_eq!(t.missing_before(u32::MAX), 0, "in order at the edge");
         assert_eq!(t.missing_before(1), 1, "seq 0 lost across the wrap");
         assert_eq!(t.missing_before(0), 0, "pre-wrap reorder, not a 2^31 gap");
+    }
+
+    // ---- bitrate tiers -------------------------------------------------------------------
+
+    /// `Standard` must reproduce the historical table EXACTLY — that is what makes the tier
+    /// machinery provably non-regressive against every pre-tier build.
+    #[test]
+    fn standard_tier_is_the_legacy_table() {
+        for l in [
+            &LAYOUT_STEREO,
+            &LAYOUT_51,
+            &LAYOUT_51_HQ,
+            &LAYOUT_71,
+            &LAYOUT_71_HQ,
+        ] {
+            assert_eq!(l.bitrate_for(AudioTier::Standard), l.bitrate, "{l:?}");
+        }
+    }
+
+    #[test]
+    fn tiers_are_monotonic_and_hq_layouts_are_invariant() {
+        for l in [&LAYOUT_STEREO, &LAYOUT_51, &LAYOUT_71] {
+            let (lo, std, hi) = (
+                l.bitrate_for(AudioTier::Low),
+                l.bitrate_for(AudioTier::Standard),
+                l.bitrate_for(AudioTier::High),
+            );
+            assert!(lo < std && std < hi, "{l:?}: {lo} < {std} < {hi}");
+        }
+        // The uncoupled HQ layouts are already past transparency — no tier may move them.
+        for l in [&LAYOUT_51_HQ, &LAYOUT_71_HQ] {
+            for t in [AudioTier::Low, AudioTier::Standard, AudioTier::High] {
+                assert_eq!(l.bitrate_for(t), l.bitrate, "{l:?} at {t:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn tier_default_is_high_and_parses() {
+        assert_eq!(AudioTier::default(), AudioTier::High);
+        for t in [AudioTier::Low, AudioTier::Standard, AudioTier::High] {
+            assert_eq!(AudioTier::parse(t.as_str()), Some(t));
+        }
+        assert_eq!(AudioTier::parse("  HIGH "), Some(AudioTier::High));
+        assert_eq!(AudioTier::parse("normal"), Some(AudioTier::Standard));
+        // Unknown spellings must be rejected, not silently downgraded.
+        assert_eq!(AudioTier::parse("transparent"), None);
+        assert_eq!(AudioTier::parse(""), None);
+    }
+
+    // ---- the de-jitter policy ------------------------------------------------------------
+
+    /// Interleaved samples per ms at `channels`.
+    fn per_ms(channels: u8) -> usize {
+        (SAMPLE_RATE_HZ / 1000) as usize * channels as usize
+    }
+
+    /// One simulated run's outcome.
+    #[derive(Debug, Default)]
+    struct Sim {
+        final_ms: u32,
+        peak_ms: u32,
+        /// Smooth drift corrections (crossfaded, one frame each) — the good kind.
+        soft_sheds: u32,
+        /// Hard-cap trims — the backstop. Any of these in a plain-drift run means the smooth
+        /// correction is not doing its job.
+        hard_trims: u32,
+        underruns: u32,
+    }
+
+    /// Drive a policy through `ms` of simulated audio at a `quantum_ms` device, where the producer
+    /// delivers `drift_ppm` more (or less) than the consumer takes — i.e. host-vs-client clock skew.
+    fn simulate(
+        tuning: JitterTuning,
+        channels: u8,
+        ms: u32,
+        quantum_ms: u32,
+        drift_ppm: i64,
+        start_ms: u32,
+    ) -> Sim {
+        let pm = per_ms(channels);
+        let want = quantum_ms as usize * pm;
+        let mut p = JitterPolicy::new(tuning, channels);
+        let mut depth = start_ms as usize * pm;
+        let mut out = Sim::default();
+        // Fractional producer accumulator, so a sub-sample-per-callback drift still accumulates.
+        let mut carry: i64 = 0;
+        for _ in 0..(ms / quantum_ms) {
+            // Producer: one quantum of audio plus the drift.
+            carry += want as i64 * drift_ppm;
+            let extra = carry / 1_000_000;
+            carry -= extra * 1_000_000;
+            depth = (depth as i64 + want as i64 + extra).max(0) as usize;
+
+            let s = p.step(depth, want);
+            if s.drop_front > 0 {
+                if s.crossfade > 0 {
+                    out.soft_sheds += 1;
+                } else {
+                    out.hard_trims += 1;
+                }
+                depth -= s.drop_front.min(depth);
+            }
+            if s.silence {
+                p.note_read(false);
+                continue;
+            }
+            let short = depth < want;
+            depth -= want.min(depth);
+            if short {
+                out.underruns += 1;
+            }
+            p.note_read(short);
+            out.peak_ms = out.peak_ms.max((depth / pm) as u32);
+        }
+        out.final_ms = (depth / pm) as u32;
+        out
+    }
+
+    /// The invariant that makes drift correction real rather than decorative: on every preset the
+    /// smooth shed point must sit strictly BELOW the hard trim point. Invert it — by tuning
+    /// `headroom_ms` down — and the ring is trimmed back before the depth average can ever reach
+    /// the shed threshold, so the smooth path becomes dead code and every correction is the
+    /// audible drop it was meant to replace. (That inversion was present in the first draft of
+    /// this module and only surfaced because `a_transient_burst_does_not_shed` failed.)
+    #[test]
+    fn every_preset_sheds_before_it_trims() {
+        for (name, t) in [
+            ("PIPEWIRE", JitterTuning::PIPEWIRE),
+            ("WASAPI", JitterTuning::WASAPI),
+            ("COREAUDIO", JitterTuning::COREAUDIO),
+            ("AAUDIO", JitterTuning::AAUDIO),
+        ] {
+            assert!(
+                t.shed_excess_ms() < t.headroom_ms,
+                "{name}: sheds at +{} ms but trims at +{} ms — drift correction can never fire",
+                t.shed_excess_ms(),
+                t.headroom_ms
+            );
+            assert!(
+                t.base_target_ms + t.headroom_ms <= t.hard_cap_ms,
+                "{name}: the headroom band is cut short by the hard cap"
+            );
+            assert!(t.max_target_ms >= t.base_target_ms, "{name}");
+            assert!(t.deprime_after >= 2, "{name}: needs real hysteresis");
+        }
+    }
+
+    /// THE headline behaviour, and the defect this policy exists for: with the host clock running
+    /// fast, the old rings grew to their ceiling and stayed pinned there for the rest of the
+    /// session. Drift correction must hold the depth near target — and must do it with the SMOOTH
+    /// crossfaded shed, never by letting the hard cap chop the backlog.
+    #[test]
+    fn drift_does_not_ratchet_latency_to_the_ceiling() {
+        // +200 ppm is a deliberately harsh skew (real DAC pairs are tens of ppm); 5 minutes.
+        let s = simulate(JitterTuning::AAUDIO, 2, 300_000, 5, 200, 25);
+        assert!(
+            s.soft_sheds > 0,
+            "drift must be shed, not accumulated: {s:?}"
+        );
+        assert_eq!(
+            s.hard_trims, 0,
+            "plain drift must never reach the hard cap: {s:?}"
+        );
+        assert_eq!(
+            s.underruns, 0,
+            "shedding must never cause an underrun: {s:?}"
+        );
+        // The old Android ring pinned at its 120 ms hard cap. Ours must stay inside the band.
+        let ceiling = JitterTuning::AAUDIO.base_target_ms + JitterTuning::AAUDIO.headroom_ms;
+        assert!(
+            s.peak_ms <= ceiling,
+            "peaked at {} ms (band ends at {ceiling}) — that is the ratchet, not a correction",
+            s.peak_ms
+        );
+    }
+
+    /// Same skew, every preset: none of them may ratchet.
+    #[test]
+    fn no_preset_ratchets_under_drift() {
+        for (name, t) in [
+            ("PIPEWIRE", JitterTuning::PIPEWIRE),
+            ("WASAPI", JitterTuning::WASAPI),
+            ("COREAUDIO", JitterTuning::COREAUDIO),
+            ("AAUDIO", JitterTuning::AAUDIO),
+        ] {
+            let s = simulate(t, 2, 300_000, 5, 200, t.base_target_ms);
+            assert!(s.soft_sheds > 0, "{name}: {s:?}");
+            assert!(
+                s.peak_ms <= t.base_target_ms + t.headroom_ms,
+                "{name} peaked at {} ms: {s:?}",
+                s.peak_ms
+            );
+        }
+    }
+
+    /// The mirror case: a host clock running SLOW must not be "corrected" into permanent
+    /// underruns. The adaptive floor may grow the target, but nothing may be shed.
+    #[test]
+    fn negative_drift_grows_the_target_instead_of_stuttering() {
+        let s = simulate(JitterTuning::AAUDIO, 2, 120_000, 5, -200, 25);
+        assert_eq!(
+            s.soft_sheds, 0,
+            "nothing to shed when the ring is draining: {s:?}"
+        );
+        assert_eq!(s.hard_trims, 0, "{s:?}");
+    }
+
+    /// A shed must never fire on a transient — a burst that arrives and drains is normal jitter,
+    /// and shedding it would cost an audible artefact for nothing. The spike here sits ABOVE the
+    /// shed threshold but below the trim point, so only the sustain requirement can reject it.
+    #[test]
+    fn a_transient_burst_does_not_shed() {
+        let t = JitterTuning::AAUDIO;
+        let pm = per_ms(2);
+        let want = 5 * pm;
+        let spike_ms = t.base_target_ms + t.shed_excess_ms() + FRAME_MS; // inside the band
+        assert!(
+            spike_ms < t.base_target_ms + t.headroom_ms,
+            "test spike must not hit the trim"
+        );
+        let mut p = JitterPolicy::new(t, 2);
+        let mut sheds = 0;
+        // 300 ms spiked out of every 1 s, for 20 s.
+        for round in 0..20 {
+            for i in 0..200 {
+                let depth = if round > 0 && i < 60 {
+                    spike_ms
+                } else {
+                    t.base_target_ms
+                } as usize;
+                let s = p.step(depth * pm, want);
+                if s.drop_front > 0 {
+                    sheds += 1;
+                }
+                p.note_read(false);
+            }
+        }
+        assert_eq!(
+            sheds, 0,
+            "a repeated short burst must not trigger drift correction"
+        );
+    }
+
+    /// The hard cap is the only absolute latency guarantee — it trims immediately, without
+    /// waiting for the drift timer.
+    #[test]
+    fn hard_cap_trims_at_once() {
+        let pm = per_ms(2);
+        let mut p = JitterPolicy::new(JitterTuning::AAUDIO, 2);
+        let s = p.step(500 * pm, 5 * pm);
+        assert!(
+            s.drop_front > 0,
+            "a 500 ms backlog must be trimmed on the spot"
+        );
+        assert_eq!(s.crossfade, 0, "a blown cap is already a discontinuity");
+        let left = 500 * pm - s.drop_front;
+        assert!(
+            left <= JitterTuning::AAUDIO.hard_cap_ms as usize * pm,
+            "trim must land at or under the hard cap"
+        );
+    }
+
+    /// One transient drain must not manufacture a fresh target's worth of silence — the bug
+    /// Android fixed and Linux/Windows still carried.
+    #[test]
+    fn deprime_requires_hysteresis() {
+        let pm = per_ms(2);
+        let want = 5 * pm;
+        let mut p = JitterPolicy::new(JitterTuning::PIPEWIRE, 2);
+        // An EMPTY ring must emit silence and stay un-primed, however many callbacks it sees.
+        for _ in 0..10 {
+            assert!(p.step(0, want).silence, "an empty ring cannot play");
+        }
+        assert!(!p.is_primed());
+        // A ring already holding well over target primes on the first callback that sees it.
+        assert!(
+            !p.step(50 * pm, want).silence,
+            "a ring holding well over target must start immediately"
+        );
+        assert!(p.is_primed());
+        p.note_read(true); // one short read
+        assert!(p.is_primed(), "a single short read must not de-prime");
+        for _ in 1..JitterTuning::PIPEWIRE.deprime_after {
+            p.note_read(true);
+        }
+        assert!(!p.is_primed(), "a sustained drain must re-prime");
+    }
+
+    /// A device that pulls a big quantum cannot sustain a target below it: the effective target
+    /// must lift, or the ring oscillates prime → dropout → re-prime forever.
+    #[test]
+    fn target_lifts_above_a_large_device_quantum() {
+        let pm = per_ms(2);
+        let mut p = JitterPolicy::new(JitterTuning::PIPEWIRE, 2); // base target 15 ms
+        let want = 40 * pm; // a 40 ms graph quantum — far above the base target
+                            // At exactly the base target the ring must NOT claim to be primed.
+        assert!(
+            p.step(15 * pm, want).silence,
+            "15 ms cannot serve a 40 ms quantum"
+        );
+        // Once it holds the quantum plus a frame, it may play.
+        let s = p.step((40 + FRAME_MS as usize) * pm, want);
+        assert!(!s.silence, "quantum + one frame must be enough to start");
+    }
+
+    /// Clustered underruns raise the floor (that device needs the slack); a long quiet spell
+    /// gives it back, so one bad minute doesn't cost latency for the whole session.
+    #[test]
+    fn target_grows_on_underruns_and_relaxes_when_quiet() {
+        let pm = per_ms(2);
+        let want = 5 * pm;
+        let mut p = JitterPolicy::new(JitterTuning::AAUDIO, 2);
+        let base = p.target_ms();
+        assert_eq!(base, JitterTuning::AAUDIO.base_target_ms);
+        for _ in 0..40 {
+            // Keep it primed and starve it: depth is always enough to prime, never to serve.
+            while !p.is_primed() {
+                p.step(200 * pm, want);
+            }
+            p.step(200 * pm, want);
+            p.note_read(true);
+        }
+        let grown = p.target_ms();
+        assert!(
+            grown > base,
+            "clustered underruns must raise the floor ({base} → {grown})"
+        );
+        assert!(
+            grown <= JitterTuning::AAUDIO.max_target_ms,
+            "growth must respect max_target_ms"
+        );
+        // Now a long clean run relaxes it back.
+        for _ in 0..(SHRINK_QUIET_MS as usize * 3 / 5) {
+            p.step(grown as usize * pm + want, want);
+            p.note_read(false);
+        }
+        assert!(
+            p.target_ms() < grown,
+            "a quiet spell must give the growth back"
+        );
+        assert!(p.target_ms() >= base, "…but never below the base target");
+    }
+
+    /// The crossfade must leave a continuous waveform: splicing a ramp must not introduce a step
+    /// bigger than the ramp's own per-sample slope.
+    #[test]
+    fn crossfade_drop_splices_without_a_step() {
+        use std::collections::VecDeque;
+        // A slow ramp: any hard splice shows up as a visible jump.
+        let mut ring: VecDeque<f32> = (0..1000).map(|i| i as f32).collect();
+        let (drop, fade) = (240, 96);
+        crossfade_drop(&mut ring, drop, fade);
+        assert_eq!(ring.len(), 1000 - drop);
+        // Across the whole faded region the step between neighbours stays bounded — a hard drop
+        // would show a `drop`-sized jump at index 0.
+        for i in 0..fade {
+            let step = (ring[i + 1] - ring[i]).abs();
+            assert!(
+                step < drop as f32,
+                "sample {i}: step {step} looks like a hard splice"
+            );
+        }
+        // Tail is untouched.
+        assert_eq!(ring[ring.len() - 1], 999.0);
+    }
+
+    #[test]
+    fn crossfade_drop_handles_degenerate_inputs() {
+        use std::collections::VecDeque;
+        let mut ring: VecDeque<f32> = (0..10).map(|i| i as f32).collect();
+        crossfade_drop(&mut ring, 0, 4); // nothing to drop
+        assert_eq!(ring.len(), 10);
+        crossfade_drop(&mut ring, 99, 4); // more than we hold — refuse
+        assert_eq!(ring.len(), 10);
+        crossfade_drop(&mut ring, 10, 4); // exactly all of it: no room to fade, hard drop
+        assert!(ring.is_empty());
     }
 
     #[test]
