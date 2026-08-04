@@ -79,9 +79,11 @@ final class AudioRingDriftTests: XCTestCase {
         scratch.withUnsafeMutableBufferPointer { ring.read(into: $0.baseAddress!, count: want) }
         XCTAssertTrue(scratch.contains { $0 != 0 }, "should be playing after priming")
 
-        // Drain it dry with one oversized read, then feed a normal quantum again.
+        // Drain it dry with one oversized read, then feed a normal quantum again. The length comes
+        // off the buffer pointer, not off `huge`: touching the array inside the closure that is
+        // already holding it exclusively is an exclusivity violation.
         var huge = [Float](repeating: 0, count: 200 * perMS)
-        huge.withUnsafeMutableBufferPointer { ring.read(into: $0.baseAddress!, count: huge.count) }
+        huge.withUnsafeMutableBufferPointer { ring.read(into: $0.baseAddress!, count: $0.count) }
         let feed = [Float](repeating: 0.5, count: want)
         feed.withUnsafeBufferPointer { ring.write($0.baseAddress!, count: want) }
         scratch.withUnsafeMutableBufferPointer { ring.read(into: $0.baseAddress!, count: want) }
