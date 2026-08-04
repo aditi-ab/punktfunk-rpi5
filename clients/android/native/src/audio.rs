@@ -12,10 +12,14 @@
 //! realtime callback and makes us own the buffer. So this client diverges deliberately to stop the
 //! Android-only crackle: (1) the callback is allocation/free-free — decoded buffers are recycled to
 //! the producer via a free-list instead of being freed on the audio thread (Android's Scudo `free`
-//! has unbounded tail latency); (2) the jitter ring is deeper (~40 ms prime / ~150 ms hard cap) and
-//! decoupled from the tiny LowLatency burst size, with de-prime hysteresis so a transient drain
-//! doesn't manufacture a silence; (3) the AAudio HW buffer is primed above its 2-burst default and
-//! grown on XRuns (Google's anti-glitch technique).
+//! has unbounded tail latency); (2) the jitter ring is deeper than the other clients' and decoupled
+//! from the tiny LowLatency burst size, with de-prime hysteresis so a transient drain doesn't
+//! manufacture a silence; (3) the AAudio HW buffer is primed above its 2-burst default and grown on
+//! XRuns (Google's anti-glitch technique).
+//!
+//! (2) is now the SHARED `punktfunk_core::audio::JitterPolicy` at `JitterTuning::AAUDIO`, which also
+//! fixed what this ring was missing: it had a hard cap but nothing that walked the depth back down,
+//! so drift and arrival bursts raised latency permanently and Android settled on its ceiling.
 
 use ndk::audio::{
     AudioCallbackResult, AudioContentType, AudioDirection, AudioFormat, AudioPerformanceMode,
@@ -34,26 +38,18 @@ const SAMPLE_RATE: i32 = 48_000;
 /// Decoded-chunk hand-off depth: 64 × 5 ms = 320 ms slack (matches the core's AUDIO_QUEUE).
 const RING_CHUNKS: usize = 64;
 
-// --- Jitter-ring depths, in MILLISECONDS (scaled to interleaved-f32 samples at runtime). --------
-// The channel count is negotiated, not a compile-time const, so these are kept in ms and multiplied
-// by `ms` (interleaved-f32 samples per millisecond at the resolved layout) inside `start`.
-// Unlike the Linux client (PipeWire adaptively rate-matches the stream to the graph clock, masking
-// host↔DAC drift + a shallow ring), AAudio hands us a raw callback and we own the buffer: drift and
-// WiFi power-save bunching land as underruns/overflows = crackle. So Android runs a deliberately
-// deeper, smoothly-managed ring than Linux — keep the two clients' depths intentionally divergent.
-/// Prime/target floor: fill to ~40 ms before playing (and after a sustained drain). Deep enough to
-/// ride out WiFi arrival jitter + clock drift; the dominant Android-only anti-crackle lever.
-const PRIME_FLOOR_MS: usize = 40;
-/// Ceiling for the burst-scaled target (so a large quantum can't push the prime depth too high).
-const PRIME_CEIL_MS: usize = 80;
-/// Drop-oldest headroom above the target before trimming — a ~80 ms band swallows an arrival burst
-/// without overflowing.
-const JITTER_HEADROOM_MS: usize = 80;
-/// Hard latency bound: never let the ring exceed ~150 ms (the only thing that caps added latency).
-const HARD_CAP_MS: usize = 150;
-/// Re-prime (go silent to refill) only after this many CONSECUTIVE empty callbacks, so one transient
-/// drain doesn't manufacture a fresh 40 ms silence (the old `if ring.is_empty()` re-primed instantly).
-const DEPRIME_AFTER_CALLBACKS: u32 = 5;
+// --- Jitter-ring depths now come from the SHARED policy (`punktfunk_core::audio::JitterTuning`). --
+// They used to be four Android-only constants here. The rationale for Android being DEEPER than the
+// other clients still holds and is preserved in `JitterTuning::AAUDIO`: unlike PipeWire, which
+// adaptively rate-matches the stream to the graph clock and masks host↔DAC drift, AAudio hands us a
+// raw callback and we own the buffer, so drift and Wi-Fi power-save bunching land as
+// underruns/overflows = crackle.
+//
+// Two things changed with the move. The prime floor drops 40 ms → 25 ms, because the policy GROWS
+// the target on the devices that actually underrun instead of every device pre-paying for the worst
+// one. And the ring finally sheds: it had a hard cap but nothing that walked the depth back down, so
+// any drift or burst raised latency permanently and Android converged on its 120 ms ceiling and
+// stayed there — the "audio latency is too high" report.
 /// Throttle the AAudio XRun-driven HW-buffer grow check (cheap, but no need to poll every quantum).
 const XRUN_CHECK_EVERY: u32 = 128;
 
@@ -104,6 +100,7 @@ struct Counters {
     pcm_written: AtomicU64,  // PCM frames copied out to AAudio (device clock is pulling)
     underruns: AtomicU64,    // callbacks that emitted silence (ring not primed / drained)
     ring_depth: AtomicU64,   // ring sample count at the last callback
+    target_ms: AtomicU64,    // the policy's LIVE target depth (it grows on this device's underruns)
 }
 
 /// Owned by [`crate::session::SessionHandle`]: the live AAudio stream + the decode thread.
@@ -126,10 +123,9 @@ impl AudioPlayback {
         // Interleaved f32 samples per millisecond at this layout (48 kHz × channels); the ms-
         // denominated jitter-ring depths scale by it.
         let ms = (SAMPLE_RATE as usize / 1000) * channels;
-        let prime_floor = PRIME_FLOOR_MS * ms;
-        let prime_ceil = PRIME_CEIL_MS * ms;
-        let jitter_headroom = JITTER_HEADROOM_MS * ms;
-        let hard_cap_max = HARD_CAP_MS * ms;
+        let tuning = punktfunk_core::audio::JitterTuning::AAUDIO;
+        // Worst transient the ring can hold before the policy trims it.
+        let hard_cap_max = tuning.hard_cap_ms as usize * ms;
         let counters = Arc::new(Counters::default());
 
         // One open attempt at a given sharing mode. Everything the realtime callback captures
@@ -157,8 +153,10 @@ impl AudioPlayback {
             // `decode_loop`.
             let mut ring: VecDeque<f32> =
                 VecDeque::with_capacity(hard_cap_max + RING_CHUNKS * 5 * ms);
-            let mut primed = false;
-            let mut empties: u32 = 0; // consecutive empty callbacks (de-prime hysteresis)
+            // Shared de-jitter policy — prime depth, drift correction, de-prime hysteresis. The
+            // hysteresis this replaces was Android-only; Linux and Windows carried the instant
+            // `if ring.is_empty()` re-prime until now.
+            let mut policy = punktfunk_core::audio::JitterPolicy::new(tuning, channels as u8);
             let mut cb_count: u32 = 0; // callbacks since open (throttles the XRun grow check)
             let mut last_xrun: i32 = 0; // last AAudio XRun count we grew the buffer for
             let callback = move |s: &AudioStream, data: *mut c_void, num_frames: i32| {
@@ -173,21 +171,25 @@ impl AudioPlayback {
                     ring.extend(chunk.drain(..));
                     let _ = free_tx.try_send(chunk);
                 }
-                // Jitter buffer: prime to ~40 ms (prime_floor) before playing and after a sustained
-                // drain; drop-oldest only above a wide ~120 ms band. Decoupled from the AAudio burst
-                // `want` (tiny on the LowLatency MMAP path) so the depth doesn't collapse to a single
-                // quantum.
-                let target = (3 * want).clamp(prime_floor, prime_ceil);
-                let hard_cap = (target + jitter_headroom).min(hard_cap_max);
-                while ring.len() > hard_cap {
-                    ring.pop_front();
+                // Jitter buffer: the shared policy decides prime/silence, trims a burst, and —
+                // new here — sheds ONE crossfaded 5 ms frame when the depth average has sat above
+                // target long enough to be drift rather than jitter. Without that shed this ring
+                // had no way back down: it clamped at 120 ms and stayed pinned there.
+                let step = policy.step(ring.len(), want);
+                if step.drop_front > 0 {
+                    punktfunk_core::audio::crossfade_drop(
+                        &mut ring,
+                        step.drop_front,
+                        step.crossfade,
+                    );
                 }
-                if !primed && ring.len() >= target {
-                    primed = true;
-                }
-                if primed {
+                let mut ran_short = false;
+                if !step.silence {
                     for slot in out.iter_mut() {
-                        *slot = ring.pop_front().unwrap_or(0.0);
+                        *slot = ring.pop_front().unwrap_or_else(|| {
+                            ran_short = true;
+                            0.0
+                        });
                     }
                     cb_counters
                         .pcm_written
@@ -196,20 +198,15 @@ impl AudioPlayback {
                     out.fill(0.0);
                     cb_counters.underruns.fetch_add(1, Ordering::Relaxed);
                 }
-                // Re-prime only after a RUN of empty callbacks, not a single transient one —
-                // otherwise every momentary drain costs a fresh 40 ms silence (the old behaviour,
-                // self-inflicted crackle on any jitter spike).
-                if ring.is_empty() {
-                    empties += 1;
-                    if empties >= DEPRIME_AFTER_CALLBACKS {
-                        primed = false;
-                    }
-                } else {
-                    empties = 0;
-                }
+                // No-op while un-primed, so a deliberate priming silence is never counted as an
+                // underrun (which would otherwise drive the adaptive floor up for no reason).
+                policy.note_read(ran_short);
                 cb_counters
                     .ring_depth
                     .store(ring.len() as u64, Ordering::Relaxed);
+                cb_counters
+                    .target_ms
+                    .store(policy.target_ms() as u64, Ordering::Relaxed);
                 // Google's AAudio anti-glitch technique: when the device reports new XRuns, grow the
                 // HW buffer by one burst (up to capacity). getXRunCount + setBufferSizeInFrames are
                 // both callback-safe / non-blocking, and set clamps to capacity so it self-limits.
@@ -408,10 +405,11 @@ fn decode_loop(
                         }
                         if count % 600 == 0 {
                             log::info!(
-                                "audio: opus={count} pcm_frames={} underruns={} ring={} peak={window_peak:.3}",
+                                "audio: opus={count} pcm_frames={} underruns={} buffer_ms={} target_ms={} peak={window_peak:.3}",
                                 counters.pcm_written.load(Ordering::Relaxed),
                                 counters.underruns.load(Ordering::Relaxed),
-                                counters.ring_depth.load(Ordering::Relaxed),
+                                counters.ring_depth.load(Ordering::Relaxed) / ms.max(1) as u64,
+                                counters.target_ms.load(Ordering::Relaxed),
                             );
                             window_peak = 0.0;
                         }

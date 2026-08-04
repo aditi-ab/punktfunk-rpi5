@@ -243,6 +243,54 @@ impl AudioGapTracker {
     }
 }
 
+/// Rebuilds the audio stream from the redundant `0xD2` plane, so a single lost datagram is
+/// RECOVERED rather than concealed.
+///
+/// Deliberately lives in core, on the demux side, rather than in the four client decoders. The
+/// recovered frame is re-inserted into the same queue in order, so every embedder — Linux,
+/// Windows, Android, Apple, and any C-ABI consumer — gets a complete stream with no change at all,
+/// and their [`AudioGapTracker`] simply stops seeing the gap.
+///
+/// **Only the immediately-preceding frame can be recovered**, because that is all the wire carries
+/// (see [`crate::quic::encode_audio_red_datagram`]). A longer burst still falls through to
+/// packet-loss concealment — but it falls through one frame shorter, which is strictly better.
+#[derive(Debug, Default)]
+pub struct AudioRedRecovery {
+    /// Sequence of the newest packet handed downstream.
+    last_seq: Option<u32>,
+}
+
+impl AudioRedRecovery {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Feed the arriving datagram's sequence and whether it carried a redundant copy. Returns
+    /// `true` when that copy should be emitted (as `seq - 1`) BEFORE the packet itself.
+    ///
+    /// Wrapping-safe, and conservative in both directions: a reorder or duplicate recovers
+    /// nothing, and neither does the first packet of a session (nothing is known to be missing).
+    pub fn recover_before(&mut self, seq: u32, has_prev: bool) -> bool {
+        let recover = match self.last_seq {
+            // Nothing emitted yet: no evidence anything was lost, so inserting the predecessor
+            // would prepend audio the client never missed.
+            None => false,
+            Some(last) => {
+                let delta = seq.wrapping_sub(last);
+                // `delta == 1` is in-order; `delta >= 2` (forward half of the space only) means
+                // at least the predecessor is missing.
+                has_prev && (2..u32::MAX / 2).contains(&delta)
+            }
+        };
+        self.last_seq = Some(match self.last_seq {
+            // A reorder must not drag the anchor backwards.
+            Some(last) if seq.wrapping_sub(last) > u32::MAX / 2 => last,
+            _ => seq,
+        });
+        recover
+    }
+}
+
 // ---- the shared playback de-jitter policy -------------------------------------------------
 
 /// The protocol's audio frame, in milliseconds — every host datagram carries exactly one
@@ -690,6 +738,92 @@ mod tests {
         assert_eq!(t.missing_before(u32::MAX), 0, "in order at the edge");
         assert_eq!(t.missing_before(1), 1, "seq 0 lost across the wrap");
         assert_eq!(t.missing_before(0), 0, "pre-wrap reorder, not a 2^31 gap");
+    }
+
+    // ---- redundant-plane recovery ---------------------------------------------------------
+
+    #[test]
+    fn red_recovery_rebuilds_exactly_the_single_missing_frame() {
+        let mut r = AudioRedRecovery::new();
+        // First packet: nothing is known to be missing, so nothing is prepended.
+        assert!(!r.recover_before(10, true));
+        // In order.
+        assert!(!r.recover_before(11, true));
+        // 12 lost: 13 carries it.
+        assert!(r.recover_before(13, true));
+        // Back in order from the new anchor.
+        assert!(!r.recover_before(14, true));
+    }
+
+    #[test]
+    fn red_recovery_is_conservative() {
+        let mut r = AudioRedRecovery::new();
+        r.recover_before(10, true);
+        // A datagram with no redundant copy recovers nothing, however big the gap.
+        assert!(!r.recover_before(20, false));
+        // Duplicates and reorders recover nothing, and must not move the anchor backwards.
+        let mut r = AudioRedRecovery::new();
+        r.recover_before(10, true);
+        r.recover_before(11, true);
+        assert!(!r.recover_before(11, true), "duplicate");
+        assert!(!r.recover_before(9, true), "late reorder");
+        assert!(
+            !r.recover_before(12, true),
+            "the reorder must not have moved the anchor"
+        );
+    }
+
+    /// A longer burst still recovers its last frame — the gap the client has to conceal gets one
+    /// frame shorter, which is strictly better than concealing all of it.
+    #[test]
+    fn red_recovery_shortens_a_longer_burst() {
+        let mut r = AudioRedRecovery::new();
+        r.recover_before(100, true);
+        assert!(
+            r.recover_before(105, true),
+            "104 is recoverable even though 101-103 are not"
+        );
+    }
+
+    #[test]
+    fn red_recovery_survives_seq_wraparound() {
+        let mut r = AudioRedRecovery::new();
+        assert!(!r.recover_before(u32::MAX - 1, true));
+        assert!(
+            !r.recover_before(u32::MAX, true),
+            "in order across the edge"
+        );
+        assert!(r.recover_before(1, true), "seq 0 lost across the wrap");
+        assert!(!r.recover_before(2, true));
+    }
+
+    /// The two halves must agree: whatever `AudioRedRecovery` rebuilds, `AudioGapTracker` must
+    /// then see as no gap at all — that is the whole point of doing recovery on the demux side.
+    #[test]
+    fn recovery_and_the_gap_tracker_agree() {
+        let mut rec = AudioRedRecovery::new();
+        let mut gaps = AudioGapTracker::new();
+        let mut concealed = 0;
+        // Deliver 0..20 with 7 and 13 lost; each survivor carries its predecessor.
+        let mut emitted: Vec<u32> = Vec::new();
+        for seq in (0..20u32).filter(|s| *s != 7 && *s != 13) {
+            if rec.recover_before(seq, true) {
+                emitted.push(seq - 1);
+            }
+            emitted.push(seq);
+        }
+        for seq in &emitted {
+            concealed += gaps.missing_before(*seq);
+        }
+        assert_eq!(
+            concealed, 0,
+            "recovered stream must need no concealment: {emitted:?}"
+        );
+        assert_eq!(emitted.len(), 20, "every frame accounted for");
+        assert!(
+            emitted.windows(2).all(|w| w[1] == w[0] + 1),
+            "and in order: {emitted:?}"
+        );
     }
 
     // ---- bitrate tiers -------------------------------------------------------------------

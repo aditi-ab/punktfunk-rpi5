@@ -490,7 +490,13 @@ impl NativeClient {
                     video_codecs,
                     preferred_codec,
                     display_hdr,
-                    client_caps,
+                    // Redundant audio (`0xD2`) is advertised by CORE, not by the embedder: the
+                    // recovery happens on the demux side (`AudioRedRecovery` in the datagram
+                    // task) and re-inserts the rebuilt frame into the same queue, so every
+                    // embedder benefits without knowing the plane exists — and none of them can
+                    // forget to opt in. The bit is a pure "I can decode it"; the host still
+                    // decides whether to spend the extra ~1 %.
+                    client_caps: client_caps | crate::quic::CLIENT_CAP_AUDIO_RED,
                     frame_parts,
                     launch,
                     name,

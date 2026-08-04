@@ -317,10 +317,10 @@ public final class SessionAudio {
         // Build the playback layout from the host-RESOLVED channel count (never the request):
         // 2 = stereo / 6 = 5.1 / 8 = 7.1, canonical wire order FL FR FC LFE RL RR SL SR.
         let channels = Int(connection.resolvedAudioChannels)
-        // 1 s interleaved capacity, ~20 ms prefill (four 5 ms host packets of jitter absorption
-        // before the first sample plays), both scaled by the channel count.
-        let ring = self.ring ?? AudioRing(
-            capacity: 48_000 * channels, prefill: 960 * channels, channels: channels)
+        // 1 s interleaved capacity, scaled by the channel count. The de-jitter depth itself is
+        // the ring's own business now (`AudioRing.targetMS`, mirroring `JitterTuning::COREAUDIO`)
+        // rather than a prefill passed in here.
+        let ring = self.ring ?? AudioRing(capacity: 48_000 * channels, channels: channels)
         self.ring = ring
 
         // Engine-native deinterleaved float; the render block deinterleaves from the ring. Surround
