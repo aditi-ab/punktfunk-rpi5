@@ -49,8 +49,9 @@ your settings. If the stream isn't sending a microphone at all (**Stream microph
 [client settings](/docs/client-settings#audio)) the shortcut does nothing and no badge appears,
 rather than pretending to mute something.
 
-This is on the **Linux and Windows** clients. The Apple, Android and Decky clients have no mute
-shortcut yet; turn **Stream microphone** off in their settings instead.
+This is on the **Linux and Windows** clients — including a Steam Deck stream, which is the Linux
+client, so an attached keyboard gets the chord. The Apple and Android clients have no mute shortcut
+yet; turn **Stream microphone** off in their settings instead.
 
 Alt-Tabbing away releases input on its own and takes it back when you return. A release you asked
 for with the chord stays released until you opt back in. Either way, keys and buttons you were

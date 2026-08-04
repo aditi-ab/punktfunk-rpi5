@@ -1,93 +1,92 @@
 // Bridge to the Python backend (main.py) + shared types.
+//
+// Every call here is a thin shell over the headless `punktfunk` CLI, so these types are the
+// CLI's JSON shapes rather than anything this plugin invents. That is deliberate: the plugin
+// used to model the client's stores itself and drifted from them with every field the client
+// added.
+
 import { callable } from "@decky/api";
 
-export interface Host {
-  name: string;
-  host: string;
-  port: number;
-  pair: string; // "required" | "optional" — the HOST's policy
-  fp: string; // host cert SHA-256 fingerprint (lowercase hex) from the mDNS advert
-  proto: string; // advertised protocol, e.g. "punktfunk/1"
-  paired: boolean; // whether THIS device has already PIN-paired this host (by fingerprint)
-  id: string; // the host's stable instance id (mDNS TXT `id`; "" when not advertised)
-  mgmt: number; // management-API port (mDNS TXT `mgmt`; 0 = not advertised → default 47990)
-  os: string; // OS-identity chain (mDNS TXT `os`, e.g. "linux/fedora/bazzite"); "" on older hosts
-}
-
-// One title from a host's game library (the flatpak client's --library TSV, parsed by the
-// backend). `id` is store-qualified (steam:<appid> / custom:<id>) and doubles as the
-// launch handle (PF_LAUNCH → the session Hello).
-export interface GameEntry {
+/** A settings profile as the CLI resolves it — ids are dangling-checked and names attached. */
+export interface Profile {
   id: string;
-  store: string; // "steam" | "custom" | "heroic" | "lutris" | …
-  title: string;
+  name: string;
 }
 
-export interface LibraryResult {
-  ok: boolean;
-  games?: GameEntry[];
-  // "flatpak-not-found" | "timeout" | "not-paired" | "pin-mismatch" | "unreachable" |
-  // "http" | "client-outdated" | "client-error"
-  error?: string;
-  detail?: string; // the client's own one-line reason, for the generic error copy
-}
-
-// A pinned game — a one-tap stream row in the QAM. The host is identified primarily by
-// cert fingerprint (survives IP changes; pairing is fp-keyed too), with the stored
-// address as the launch fallback when the host isn't currently advertising.
-export interface PinnedGame {
-  game_id: string;
-  title: string;
-  store: string;
-  host_fp: string;
-  host_id: string;
-  host_name: string;
-  host: string;
-  port: number;
-  mgmt: number;
-  added_at: number; // unix seconds
-  paired?: boolean; // annotated by get_pins from the client's known-hosts store
-}
-
-export interface PairResult {
-  ok: boolean;
-  fp?: string;
-  error?: string;
-}
-
-// A host in the SHARED saved-hosts store (client-known-hosts.json) — the same file the desktop
-// client reads/writes, so add/rename/pair in either surface shows up in both. `online` comes
-// from a mDNS-INDEPENDENT reachability probe (a Tailscale/VPN host isn't shown offline just
-// because it doesn't advertise); `null` means reachability is unknown (probe skipped or a client
-// too old for `--list-hosts`, which then also can't probe).
-export interface SavedHost {
+/**
+ * A host answering on mDNS right now (`punktfunk discover --json`).
+ *
+ * `saved`/`paired` are annotated BY THE CLI against the saved-hosts store — fingerprint first,
+ * address second. The plugin does not join the two lists itself; that rule living in one place
+ * is what stops this surface disagreeing with the desktop client about the same box.
+ */
+export interface DiscoveredHost {
   name: string;
   addr: string;
   port: number;
-  fp_hex: string; // host cert fingerprint (lowercase hex); "" for a not-yet-paired manual entry
+  fp: string; // advertised cert fingerprint (lowercase hex); "" when not advertised
+  pair: string; // the HOST's policy: "required" | "optional"
+  id: string; // the host's advertised stable id; "" when not advertised
+  mgmt: number; // management-API port; 0 = not advertised
+  os: string; // OS-identity chain, e.g. "linux/fedora/bazzite"; "" on older hosts
+  saved: boolean;
+  paired: boolean;
+}
+
+/**
+ * A host in the shared saved-hosts store (`punktfunk hosts list --probe --json`) — the same
+ * `client-known-hosts.json` the desktop client owns.
+ *
+ * `online` comes from a mDNS-INDEPENDENT probe, so a host reached over Tailscale/VPN is not
+ * shown offline merely because it never advertises; `null` means the probe was skipped.
+ *
+ * `profile` is the host's DEFAULT binding, which a plain connect applies silently. It is not
+ * the same thing as `pinned_profiles`, which are the cards a user chose to surface. Both come
+ * back already resolved against the profile catalog, so this plugin never opens it.
+ */
+export interface SavedHost {
+  id: string | null; // the record's stable id — the reference a launch should use
+  name: string;
+  addr: string;
+  port: number;
+  fp_hex: string; // "" for a placeholder saved by address with no pin yet
   paired: boolean;
   mac: string[];
-  // OS-identity chain learned by the desktop client; optional because the installed
-  // flatpak client may predate the field.
-  os?: string;
+  os: string;
   last_used: number | null;
+  clipboard_sync: boolean;
+  profile: Profile | null;
+  pinned_profiles: Profile[];
   online: boolean | null;
 }
 
-export interface HostsResult {
-  ok: boolean;
-  hosts: SavedHost[];
-  probed: boolean;
-  fallback?: boolean; // true when read straight off disk (client too old for --list-hosts)
-}
-
-// The result of a host-store mutation (add/edit/forget). `error` is a stable code:
-// "client-unavailable" (flatpak missing) | "client-outdated" (client predates the mode) |
-// "unreachable"/"http"/… (from the client) | "client-error" (generic; see `detail`).
-export interface MutationResult {
+/**
+ * Every backend call answers in this shape. `error` is a stable code, never prose:
+ *
+ * - `client-unavailable` — no client is installed, or the call never ran
+ * - `client-outdated`    — the installed client predates the verb (exit 5 + `unknown command`)
+ * - `unreachable`        — the host did not answer
+ * - `refused`            — trust rejected: a wrong PIN, or a fingerprint that already differs
+ * - `needs-pairing`      — the CLI refused because it needs a person
+ * - `unresolved`         — nothing matched what was named
+ * - `client-error`       — anything else; `detail` carries the CLI's own last line
+ */
+export interface CliResult {
   ok: boolean;
   error?: string;
   detail?: string;
+}
+
+export interface DiscoverResult extends CliResult {
+  hosts?: DiscoveredHost[];
+}
+
+export interface HostsResult extends CliResult {
+  hosts?: SavedHost[];
+}
+
+export interface PairResult extends CliResult {
+  fp?: string;
 }
 
 export interface RunnerInfo {
@@ -99,99 +98,6 @@ export interface RunnerInfo {
   client_kind?: "flatpak" | "native" | "none";
   // Absolute path of the native binary; "" for flatpak. Passed to the wrapper as PF_CLIENT_BIN.
   client_bin?: string;
-}
-
-// The flatpak client's settings JSON — the SAME `client-gtk-settings.json` the desktop client
-// and the console's settings screen own, so a value changed in any of them shows in the others.
-//
-// Every field the client's `Settings` struct persists is modelled here EXCEPT the ones that
-// cannot be answered from a plugin backend or aren't settings at all:
-//   • `forward_pad`   — which physical pad is player 1. Needs SDL's live device list, which only
-//                       the client process has; there is no CLI that enumerates pads.
-//   • `last_window_w/h` — the session's remembered window size, written BY the client, not a
-//                       preference anyone sets.
-// Both round-trip untouched: get_settings returns the whole parsed file, patches are object
-// spreads, and set_settings merges onto what's on disk.
-//
-// Optional (`?`) marks a key the client writes with a serde `default`, so a store written before
-// that key existed simply lacks it. Read those through the same fallback the client uses —
-// `?? true` for the default-on ones, never `!!` — or a pre-existing file reads as "off" here
-// while the stream runs with it on.
-export interface StreamSettings {
-  // ---- Stream mode ----
-  width: number; // 0 = native
-  height: number; // 0 = native
-  refresh_hz: number; // 0 = native
-  render_scale?: number; // render-resolution multiplier; 1.0 = native (absent in pre-scale files)
-  bitrate_kbps: number; // 0 = host default
-  compositor: string; // "auto" | "kwin" | "wlroots" | "mutter" | "gamescope"
-  // Stream mode follows the session window instead of width/height, renegotiating on resize.
-  // Overrides width/height while on; degenerates to the display's native mode on fullscreen.
-  match_window?: boolean;
-
-  // ---- Video ----
-  codec?: string; // "auto" | "hevc" | "h264" | "av1" | "pyrowave" (absent in pre-codec files)
-  decoder?: string; // "auto" | "vulkan" | "vaapi" | "software"
-  hdr_enabled?: boolean; // default ON — advertise 10-bit/HDR10
-  enable_444?: boolean; // default off — ask for full chroma
-  adapter?: string; // decode/present GPU by marketing name; "" = automatic
-
-  // ---- Presentation ----
-  // What the client optimises for when a decoded frame is ready: "latency" | "smooth". Shared
-  // with the Apple and Android clients under this name, so one profile reads the same everywhere.
-  present_priority?: string;
-  smooth_buffer?: number; // frames held back under "smooth"; 0 = Automatic (resolves to 2), else 1–3
-  vsync?: boolean; // default ON — tear-free; off asks for a tearing present mode (best-effort)
-  allow_vrr?: boolean; // default ON — let a VRR panel refresh in step with the stream
-
-  // ---- Audio ----
-  audio_channels?: number; // 2 (stereo) | 6 (5.1) | 8 (7.1)
-  speaker_device?: string; // PipeWire node.name for playback; "" = system default
-  mic_enabled: boolean;
-  mic_device?: string; // PipeWire node.name for capture; "" = system default
-  echo_cancel?: boolean; // default ON; only meaningful while mic_enabled
-
-  // ---- Controllers ----
-  gamepad: string; // "auto" | "xbox360" | "xboxone" | "dualsense" | "dualshock4" | "steamdeck"
-  // Forward this device's controllers at all. Absent in pre-forwarding files, where the
-  // client's own serde default (true) applies — so `?? true` at every read, never `!!`.
-  gamepad_forwarding?: boolean;
-
-  // ---- Touchscreen, mouse & keyboard ----
-  touch_mode?: string; // "trackpad" | "pointer" | "touch"
-  mouse_mode?: string; // "capture" | "desktop"
-  invert_scroll?: boolean;
-  // Whether the session grabs the keyboard so Alt+Tab/Super reach the host.
-  inhibit_shortcuts: boolean;
-
-  // ---- Interface & behaviour ----
-  // Stats-overlay tier: "off" | "compact" | "normal" | "detailed". Absent in a pre-tier file,
-  // which resolves through `show_stats` — read both the way the client's
-  // `Settings::stats_verbosity` does, and write both the way `set_stats_verbosity` does.
-  stats_verbosity?: string;
-  // The legacy on/off the tier supersedes; kept written in sync so a client that predates the
-  // tiers still honours an Off chosen here.
-  show_stats?: boolean;
-  fullscreen_on_stream?: boolean;
-  auto_wake?: boolean; // default ON — Wake-on-LAN a sleeping host before connecting
-  library_enabled?: boolean; // the CLIENT's own library browser (this plugin has its own)
-}
-
-// One audio endpoint from the client's enumeration: the stable id that gets stored, plus the
-// human name to show.
-export interface AudioDevice {
-  name: string; // PipeWire node.name — what `speaker_device` / `mic_device` store
-  description: string; // human label ("Steam Deck Speakers")
-}
-
-// What the device pickers need, read from the session binary (`--list-adapters` / `--list-audio`).
-// `ok: false` = the session binary couldn't be run or failed; every list is then empty and the
-// pickers stay on their stored value rather than pretending the device is gone.
-export interface DeviceLists {
-  ok: boolean;
-  adapters: string[]; // Vulkan physical devices, discrete first
-  sinks: AudioDevice[]; // playback endpoints
-  sources: AudioDevice[]; // capture endpoints
 }
 
 export interface UpdateInfo {
@@ -229,21 +135,30 @@ export interface ShortcutArt {
   icon_path: string;
 }
 
-export const discover = callable<[], Host[]>("discover");
+// ---- The four CLI shells --------------------------------------------------------------
+
+/** Browse the LAN over mDNS. Bounded by the CLI (3 s) plus a cold-start allowance. */
+export const discover = callable<[], DiscoverResult>("discover");
+/** The saved hosts, probed for reachability, with profiles and pinned cards resolved. */
+export const hosts = callable<[], HostsResult>("hosts");
+/** The PIN ceremony. `refused` = wrong PIN or a host that isn't armed. */
 export const pair = callable<
-  [host: string, port: number, pin: string, name: string],
+  [addr: string, port: number, pin: string, name: string],
   PairResult
 >("pair");
-// Fetch a paired host's game library (headless flatpak --library; can take seconds on a
-// cold client start — show a spinner). Pass fp whenever known so the pin can't degrade.
-export const library = callable<
-  [host: string, mgmt_port: number, fp: string],
-  LibraryResult
->("library");
-export const getPins = callable<[], { pins: PinnedGame[] }>("get_pins");
-export const setPins = callable<[pins: PinnedGame[]], { ok: boolean; error?: string }>(
-  "set_pins",
-);
+/**
+ * Step 1 of request access: save the host with its ADVERTISED fingerprint, pinned but unpaired.
+ * The launch that follows pins the same fingerprint, which is the only thing standing between a
+ * 185 s wait for approval and an impostor answering for the host. Idempotent; a host already
+ * saved under a DIFFERENT fingerprint comes back `refused` rather than being overwritten.
+ */
+export const trustHost = callable<
+  [addr: string, port: number, fp: string, name: string],
+  CliResult
+>("trust_host");
+
+// ---- Steam / plugin business (only a Decky plugin can do these) ------------------------
+
 export const runnerInfo = callable<[], RunnerInfo>("runner_info");
 export const shortcutArt = callable<[], ShortcutArt>("shortcut_art");
 // Install the Steam Input layout (native touchscreen `ts_n` + gamepad passthrough) and point our
@@ -254,48 +169,7 @@ export const applyControllerConfig = callable<
   [name: string],
   { ok: boolean; applied?: string[]; errors?: string[]; accounts?: number; error?: string; detail?: string }
 >("apply_controller_config");
-export const getSettings = callable<[], StreamSettings>("get_settings");
-export const setSettings = callable<[settings: StreamSettings], { ok: boolean }>(
-  "set_settings",
-);
-// GPUs + audio endpoints for the device pickers. Costs a subprocess that initialises Vulkan and
-// PipeWire, so it is called ONCE when the settings tab mounts and never on the launch path.
-export const listDevices = callable<[], DeviceLists>("list_devices");
-// The same, bypassing the backend's cache — for the user who just plugged in a headset.
-export const refreshDevices = callable<[], DeviceLists>("refresh_devices");
 export const killStream = callable<[], { ok: boolean }>("kill_stream");
-// Send a Wake-on-LAN magic packet to a saved host (headless flatpak --wake) so a sleeping host is
-// up by the time the stream connects. The MAC is looked up from the flatpak client's own
-// known-hosts store; `ok: false` (no-op) when none has been learned yet. Fire before launching.
-export const wake = callable<[host: string, port: number], { ok: boolean; error?: string }>(
-  "wake",
-);
-// ---- Shared saved-hosts store (the SAME client-known-hosts.json the desktop client owns) ----
-// The saved hosts, each annotated with a live (mDNS-independent) `online` probe when `probe` is
-// true. Falls back to a direct JSON read (no reachability) on a client too old for --list-hosts.
-export const listHosts = callable<[probe: boolean], HostsResult>("list_hosts");
-// Save a host by address (survives mDNS-blind networks). `fp` empty = unpaired placeholder to
-// pair next; a later pair replaces it with the fingerprinted entry.
-export const addHost = callable<[target: string, name: string, fp: string], MutationResult>(
-  "add_host",
-);
-// Rename and/or re-point a saved host. `selector` = its fingerprint (survives IP change) or
-// current addr[:port]; empty fields are left untouched.
-export const editHost = callable<
-  [selector: string, name: string, addr: string, port: number],
-  MutationResult
->("edit_host");
-// Remove a saved host by fingerprint or addr[:port] (idempotent).
-export const forgetHost = callable<[selector: string], MutationResult>("forget_host");
-// Reset this device's Punktfunk state (saved hosts + stream settings + pins); KEEPS the client
-// identity so the box isn't seen as new everywhere (re-pairing re-adds hosts).
-export const resetConfig = callable<[], { ok: boolean; error?: string }>("reset_config");
-// Reachability of one host[:port] via the client's mDNS-independent QUIC probe (a "test address"
-// check). `{ ok: true, online }` when determined, else `{ ok: false, error }`.
-export const probeHost = callable<
-  [target: string],
-  { ok: boolean; online?: boolean; error?: string }
->("probe_host");
 export const checkUpdate = callable<[force: boolean], UpdateInfo>("check_update");
 // Update the client by whichever route its install supports: `flatpak update --user` for the
 // flatpak, `punktfunk-client --apply-update` (the packaged root helper) for a one-tap-capable

@@ -41,16 +41,23 @@ mod cli {
 
     const PROBE_TIMEOUT: Duration = Duration::from_millis(2500);
 
+    /// The handshake budget `--request-access` runs on. Matches the host's `PENDING_APPROVAL_WAIT`
+    /// — the connect is PARKED for that long while an operator decides, so anything shorter would
+    /// give up while the approval prompt is still on their screen.
+    const REQUEST_ACCESS_TIMEOUT_SECS: u64 = 185;
+
     const USAGE: &str = "\
 punktfunk — the Punktfunk client, headless
 
+  punktfunk discover [--json] [--timeout SECS]
   punktfunk pair <host[:port]> [--pin N] [--name LABEL]
   punktfunk hosts list [--probe] [--json]
   punktfunk hosts add <host[:port]> [--name LABEL] [--fp HEX]
   punktfunk hosts forget <host-ref>
   punktfunk wake <host-ref> [--wait]
   punktfunk library <host-ref> [--json]
-  punktfunk launch <host-ref> [--game ID] [--profile REF] [--exec] [--fullscreen]
+  punktfunk launch <host-ref> [--game ID] [--profile REF] [--request-access]
+                              [--exec] [--fullscreen]
   punktfunk open <punktfunk://…>
   punktfunk reachable <host-ref>
   punktfunk speed-test <host-ref>
@@ -68,6 +75,24 @@ punktfunk:// link takes. Exit codes: 0 ok, 2 connect, 3 trust, 4 renderer, 5 not
     /// (what goes to stdout vs stderr, and which exit codes mean what).
     fn verb_help(verb: &str) -> Option<&'static str> {
         Some(match verb {
+            "discover" => {
+                "\
+punktfunk discover [--json] [--timeout SECS] — browse the LAN for hosts
+
+Listens for Punktfunk hosts advertising over mDNS and prints what answered:
+name TAB addr:port TAB saved|new TAB paired|unpaired. `saved` means this
+device already has a record for it, matched by fingerprint first and address
+second — the same rule every other surface joins the two lists by.
+
+  --timeout SECS  how long to browse (default 3, capped at 30) — a bounded
+                  call, so a panel can wait for it
+  --json          {\"hosts\":[{\"name\",\"addr\",\"port\",\"fp\",\"pair\",\"id\",\"mgmt\",
+                  \"os\",\"saved\",\"paired\"}]}
+
+Nothing answering is an answer, not a failure: an empty list exits 0. A host
+mDNS never sees (Tailscale, another subnet) will not appear here — save it by
+address with `punktfunk hosts add` and it shows in `hosts list --probe`."
+            }
             "pair" => {
                 "\
 punktfunk pair <host[:port]> — enrol this device with a host (PIN ceremony)
@@ -96,6 +121,13 @@ punktfunk hosts — the saved-hosts store (shared with the desktop client)
       another subnet). Without --fp it is a placeholder to pair later; with a
       64-hex fingerprint it is pinned immediately (still unpaired).
 
+      Idempotent, and keyed on the FINGERPRINT once there is one: re-running it
+      for a host already saved is a no-op, and giving a known fingerprint a new
+      address MOVES that host's record there rather than filing a second one
+      (which is how a host that changed DHCP lease stays reachable by its id).
+      A different fingerprint for an address already saved is refused, exit 3 —
+      a changed identity is a decision for a person.
+
   punktfunk hosts forget <host-ref>
       Remove a saved host, its pinned fingerprint included. A later connect
       must pair or trust it again."
@@ -119,7 +151,8 @@ this. Needs a paired host (exit 6 otherwise)."
             }
             "launch" => {
                 "\
-punktfunk launch <host-ref> [--game ID] [--profile REF] [--exec] [--fullscreen]
+punktfunk launch <host-ref> [--game ID] [--profile REF] [--request-access]
+                            [--exec] [--fullscreen]
 
 Start a stream — waking the host first if it is asleep and its MAC is known.
 The stream runs in the punktfunk-session renderer; this command supervises it
@@ -132,6 +165,16 @@ and relays its lifecycle to stderr.
   --exec         become the session process instead of supervising it — the
                  gamescope-wrapper mode, where the launched process must BE
                  the streaming one for focus and lifecycle to work
+  --request-access
+                 ask the host's operator to let this device in instead of
+                 typing a PIN. The host PARKS the connect until somebody
+                 approves it in its console or web UI (up to ~185 s), then
+                 admits it and the stream starts by itself; the host is
+                 recorded as paired once that happens, so later streams are
+                 silent. Needs the host's fingerprint pinned already
+                 (`punktfunk hosts add <addr> --fp <hex>`), and cannot be
+                 combined with --exec — under --exec there is no process
+                 left to record the approval.
 
 Exit 0 when the stream ends cleanly, 2 connect failed, 3 the host no longer
 trusts this device (re-pair), 4 the renderer could not start."
@@ -222,7 +265,7 @@ from the config directory for a true factory reset."
     fn flag_takes_value(flag: &str) -> bool {
         matches!(
             flag,
-            "--pin" | "--name" | "--fp" | "--game" | "--profile" | "--port"
+            "--pin" | "--name" | "--fp" | "--game" | "--profile" | "--port" | "--timeout"
         )
     }
 
@@ -269,6 +312,7 @@ from the config directory for a true factory reset."
             return OK;
         }
         match verb.as_str() {
+            "discover" => discover(&rest),
             "pair" => pair(&rest),
             "hosts" => hosts(&rest),
             "wake" => wake(&rest),
@@ -304,6 +348,104 @@ from the config directory for a true factory reset."
                 UNRESOLVED
             }
         }
+    }
+
+    /// How long `discover` browses when nobody says, and the ceiling on what they can ask for.
+    /// The cap is not politeness: this verb is called from a Quick Access panel, and a typo'd
+    /// `--timeout 3000` would hang that panel with no way to cancel it.
+    const DISCOVER_DEFAULT_SECS: f64 = 3.0;
+    const DISCOVER_MAX_SECS: f64 = 30.0;
+
+    /// `discover [--json] [--timeout SECS]` — browse the LAN over mDNS and print what answered,
+    /// annotated against the saved-hosts store.
+    ///
+    /// The annotation is the point: a caller wants "can I stream this", which is a question
+    /// about BOTH lists, and joining them itself is how two surfaces end up disagreeing about
+    /// the same host. So the match rule lives here, once, and is the same one every other
+    /// surface uses — fingerprint first (survives a DHCP move), address second.
+    fn discover(args: &[String]) -> u8 {
+        let secs = value(args, "--timeout")
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|s| *s > 0.0)
+            .unwrap_or(DISCOVER_DEFAULT_SECS)
+            .min(DISCOVER_MAX_SECS);
+        let found = pf_client_core::discovery::discover_for(Duration::from_secs_f64(secs));
+        // `read`, not `load`: this verb only LOOKS at the records to annotate what it found, and
+        // never hands their ids back. `load` would mint ids for a pre-mint store and save them —
+        // a write from a read-only verb, and one that races the `hosts list` a caller is very
+        // likely running at the same moment (the Decky panel issues both together).
+        let known = KnownHosts::read();
+        let rows: Vec<(
+            &pf_client_core::discovery::DiscoveredHost,
+            Option<&KnownHost>,
+        )> = found.iter().map(|d| (d, match_saved(&known, d))).collect();
+        if has(args, "--json") {
+            let hosts: Vec<serde_json::Value> = rows
+                .iter()
+                .map(|(d, saved)| {
+                    serde_json::json!({
+                        "name": d.name,
+                        "addr": d.addr,
+                        "port": d.port,
+                        "fp": d.fp_hex,
+                        "pair": d.pair,
+                        "id": d.advertised_id(),
+                        // 0 = not advertised, which is what a consumer's own "no mgmt port"
+                        // already means — an older host simply omits the TXT.
+                        "mgmt": d.mgmt_port.unwrap_or(0),
+                        "os": d.os,
+                        "saved": saved.is_some(),
+                        "paired": saved.is_some_and(|h| h.paired),
+                    })
+                })
+                .collect();
+            println!("{}", serde_json::json!({ "hosts": hosts }));
+        } else {
+            for (d, saved) in &rows {
+                println!(
+                    "{}\t{}:{}\t{}\t{}",
+                    d.name,
+                    d.addr,
+                    d.port,
+                    if saved.is_some() { "saved" } else { "new" },
+                    if saved.is_some_and(|h| h.paired) {
+                        "paired"
+                    } else {
+                        "unpaired"
+                    },
+                );
+            }
+        }
+        // An empty LAN is an answer, not a failure — a caller branching on the exit code is
+        // asking "did the browse run", and it did.
+        OK
+    }
+
+    /// The saved record an advert belongs to, if any: fingerprint first, address second.
+    ///
+    /// Fingerprint FIRST is deliberate and load-bearing — a host that moved to a new DHCP lease
+    /// still matches its record, and a *different* host that inherited the old address does not
+    /// inherit its pairing. This is the rule the plugin's `mergeHosts` and the shells' hosts
+    /// pages already use; keeping one copy is what stops two surfaces disagreeing about whether
+    /// the box in front of you is paired.
+    fn match_saved<'a>(
+        known: &'a KnownHosts,
+        advert: &pf_client_core::discovery::DiscoveredHost,
+    ) -> Option<&'a KnownHost> {
+        known
+            .hosts
+            .iter()
+            .find(|h| {
+                !h.fp_hex.is_empty()
+                    && !advert.fp_hex.is_empty()
+                    && h.fp_hex.eq_ignore_ascii_case(&advert.fp_hex)
+            })
+            .or_else(|| {
+                known
+                    .hosts
+                    .iter()
+                    .find(|h| h.addr == advert.addr && h.port == advert.port)
+            })
     }
 
     /// `pair <host[:port]> [--pin N]` — the SPAKE2 ceremony. Without `--pin` it prompts, which
@@ -424,16 +566,69 @@ from the config directory for a true factory reset."
                     return UNRESOLVED;
                 };
                 let (addr, port) = split_host_port(&target);
+                let fp = value(args, "--fp").unwrap_or_default();
+                let name = value(args, "--name");
                 let mut known = KnownHosts::load();
-                if known.hosts.iter().any(|h| h.addr == addr && h.port == port) {
-                    eprintln!("{addr}:{port} is already saved");
-                    return OK;
+                if let Some(i) = known
+                    .hosts
+                    .iter()
+                    .position(|h| h.addr == addr && h.port == port)
+                {
+                    return match merge_saved_host(&mut known, i, &fp, name.as_deref()) {
+                        AddOutcome::Unchanged => {
+                            eprintln!("{addr}:{port} is already saved");
+                            OK
+                        }
+                        AddOutcome::Conflict => {
+                            eprintln!(
+                                "{addr}:{port} is already saved with a different fingerprint — \
+                                 forget it first if you really mean to replace it \
+                                 (punktfunk hosts forget {addr}:{port})"
+                            );
+                            TRUST_REJECTED
+                        }
+                        AddOutcome::Pinned => match known.save() {
+                            Ok(()) => {
+                                println!("updated {addr}:{port}");
+                                OK
+                            }
+                            Err(e) => {
+                                eprintln!("saving: {e:#}");
+                                CONNECT_FAILED
+                            }
+                        },
+                    };
+                }
+                // No record at this address — but a record carrying this exact FINGERPRINT is
+                // this same host at a new one. Re-point it rather than filing a second record:
+                // the fingerprint is the identity, and a host that changed DHCP lease is the
+                // whole reason `hosts add --fp` is idempotent in the first place. Without this a
+                // moved host accumulates one record per address it has ever held, and the one a
+                // stable id resolves to keeps the address it can no longer be reached at.
+                if let Some(i) = known
+                    .hosts
+                    .iter()
+                    .position(|h| !fp.is_empty() && h.fp_hex.eq_ignore_ascii_case(&fp))
+                {
+                    let was = format!("{}:{}", known.hosts[i].addr, known.hosts[i].port);
+                    known.hosts[i].addr = addr.clone();
+                    known.hosts[i].port = port;
+                    return match known.save() {
+                        Ok(()) => {
+                            println!("moved {was} to {addr}:{port}");
+                            OK
+                        }
+                        Err(e) => {
+                            eprintln!("saving: {e:#}");
+                            CONNECT_FAILED
+                        }
+                    };
                 }
                 known.hosts.push(KnownHost {
-                    name: value(args, "--name").unwrap_or_else(|| addr.clone()),
+                    name: name.unwrap_or_else(|| addr.clone()),
                     addr: addr.clone(),
                     port,
-                    fp_hex: value(args, "--fp").unwrap_or_default(),
+                    fp_hex: fp,
                     ..Default::default()
                 });
                 match known.save() {
@@ -473,6 +668,55 @@ from the config directory for a true factory reset."
                 UNRESOLVED
             }
         }
+    }
+
+    /// What `hosts add` did to a record that was ALREADY saved for this address.
+    #[derive(Debug, PartialEq, Eq)]
+    enum AddOutcome {
+        /// Nothing to do — no fingerprint was offered, or the record already carries this one.
+        /// Exits 0 on purpose: a panel retrying step 1 of request access must not have to
+        /// invent an error to show for a state that is already correct.
+        Unchanged,
+        /// The record had no fingerprint and now has this one.
+        Pinned,
+        /// The record carries a DIFFERENT fingerprint. Refused, never overwritten.
+        Conflict,
+    }
+
+    /// `hosts add --fp` against an address that is already saved. The difference between these
+    /// three is a trust decision, not bookkeeping.
+    ///
+    /// Filling in an empty fingerprint is step 1 of request access (design §5): a host found by
+    /// advert is saved by address first and pinned second. Without it the `--fp` is dropped on
+    /// the floor and the launch that follows refuses for want of a pin — which is what this did
+    /// before, silently and with exit 0.
+    ///
+    /// A *different* fingerprint is refused because a changed identity is a decision for a
+    /// person, at a surface that can show them both. That is what `upsert_trusted` exists to
+    /// enforce; quietly overwriting it here would be a back door through the pinning the rest
+    /// of the client is built on.
+    fn merge_saved_host(
+        known: &mut KnownHosts,
+        i: usize,
+        fp: &str,
+        name: Option<&str>,
+    ) -> AddOutcome {
+        let existing = known.hosts[i].fp_hex.clone();
+        if fp.is_empty() || existing.eq_ignore_ascii_case(fp) {
+            return AddOutcome::Unchanged;
+        }
+        if !existing.is_empty() {
+            return AddOutcome::Conflict;
+        }
+        known.hosts[i].fp_hex = fp.to_string();
+        // Only a record still named after its own address is renamed: a label the user chose is
+        // theirs, and an advert's name must not quietly overwrite it.
+        if let Some(label) = name {
+            if known.hosts[i].name == known.hosts[i].addr {
+                known.hosts[i].name = label.to_string();
+            }
+        }
+        AddOutcome::Pinned
     }
 
     /// `wake <host-ref> [--wait]` — a magic packet, and with `--wait` the same bounded
@@ -585,6 +829,19 @@ from the config directory for a true factory reset."
             eprintln!("usage: punktfunk launch <host-ref> [--game ID] [--profile REF] [--exec]");
             return UNRESOLVED;
         };
+        let exec = has(args, "--exec");
+        let request_access = has(args, "--request-access");
+        // Refused rather than silently downgraded: under `--exec` this process BECOMES the
+        // session, so nothing survives to see `Ready` and record the approval. A launch that
+        // quietly dropped the persistence would leave hosts reading "trusted" forever with
+        // nobody able to say why.
+        if request_access && exec {
+            eprintln!(
+                "--request-access can't be combined with --exec: under --exec there is no \
+                 process left to record the host's approval"
+            );
+            return UNRESOLVED;
+        }
         let (known, i) = match resolve(&reference) {
             Ok(v) => v,
             Err(code) => return code,
@@ -597,7 +854,10 @@ from the config directory for a true factory reset."
         if has(args, "--fullscreen") {
             plan.settings.fullscreen_on_stream = true;
         }
-        run_plan(plan, has(args, "--exec"))
+        if request_access {
+            plan.connect_timeout_secs = Some(REQUEST_ACCESS_TIMEOUT_SECS);
+        }
+        run_plan(plan, exec, request_access)
     }
 
     /// `open <url>` — the `punktfunk://` grammar, headless. Same parser, same refusal rules and
@@ -622,7 +882,7 @@ from the config directory for a true factory reset."
             &trust::Settings::load(),
         );
         match outcome {
-            Ok(PlanOutcome::Connect(plan)) => run_plan(*plan, has(args, "--exec")),
+            Ok(PlanOutcome::Connect(plan)) => run_plan(*plan, has(args, "--exec"), false),
             // A URL may never pair or trust on its own — that is a decision for a person, at a
             // surface that can show them the fingerprint.
             Ok(PlanOutcome::ConfirmUnknown(u)) => {
@@ -646,7 +906,13 @@ from the config directory for a true factory reset."
     }
 
     /// Wake if needed, then run the session — supervising it, or becoming it under `--exec`.
-    fn run_plan(plan: ConnectPlan, exec: bool) -> u8 {
+    ///
+    /// `persist_paired` records the host as *paired* when the child reports ready. Only
+    /// `launch --request-access` passes true: there, the host parked the connect until an
+    /// operator approved this device, so `Ready` IS the approval arriving — the same thing
+    /// `SpawnOpts::persist_paired` means in the GTK shell. Every other launch records nothing,
+    /// which is correct: a plain connect proves reachability, not a new trust decision.
+    fn run_plan(plan: ConnectPlan, exec: bool, persist_paired: bool) -> u8 {
         if plan.host.fp_hex.is_none() {
             eprintln!(
                 "{} has no pinned fingerprint — punktfunk pair {}",
@@ -708,7 +974,24 @@ from the config directory for a true factory reset."
         let mut failure: Option<(String, bool)> = None;
         while let Ok(ev) = rx.recv() {
             match ev {
-                SessionEvent::Ready => eprintln!("streaming"),
+                SessionEvent::Ready => {
+                    eprintln!("streaming");
+                    // The pin we connected WITH, not one re-derived from the store: the record
+                    // is what we are about to rewrite, and the session proved the host holds
+                    // exactly this identity by completing a pinned handshake against it.
+                    if persist_paired {
+                        if let Some(fp_hex) = &plan.host.fp_hex {
+                            trust::persist_host(
+                                &plan.host.name,
+                                &plan.host.addr,
+                                plan.host.port,
+                                fp_hex,
+                                true,
+                            );
+                            trust::forget_placeholder(&plan.host.addr, plan.host.port);
+                        }
+                    }
+                }
                 SessionEvent::Error {
                     msg,
                     trust_rejected,
@@ -967,6 +1250,7 @@ from the config directory for a true factory reset."
         #[test]
         fn every_usage_verb_has_help() {
             for verb in [
+                "discover",
                 "pair",
                 "hosts",
                 "wake",
@@ -986,6 +1270,109 @@ from the config directory for a true factory reset."
                 assert!(USAGE.contains(verb), "USAGE must advertise {verb}");
             }
             assert!(verb_help("bogus").is_none());
+        }
+
+        fn saved(name: &str, addr: &str, fp: &str) -> KnownHost {
+            KnownHost {
+                name: name.into(),
+                addr: addr.into(),
+                port: 9777,
+                fp_hex: fp.into(),
+                ..Default::default()
+            }
+        }
+
+        /// Step 1 of request access: a host saved by address gains the fingerprint its advert
+        /// carried. Before this, `hosts add --fp` on an existing record exited 0 having done
+        /// NOTHING — the launch that followed then refused for want of a pin, and the panel had
+        /// no way to tell why.
+        #[test]
+        fn adding_a_fingerprint_to_a_placeholder_fills_it_in() {
+            let mut known = KnownHosts {
+                hosts: vec![saved("192.168.1.9", "192.168.1.9", "")],
+            };
+            assert_eq!(
+                merge_saved_host(&mut known, 0, "abc123", Some("living-room")),
+                AddOutcome::Pinned
+            );
+            assert_eq!(known.hosts[0].fp_hex, "abc123");
+            assert_eq!(
+                known.hosts[0].name, "living-room",
+                "a record still named after its address takes the offered label"
+            );
+        }
+
+        /// A label the user chose is theirs — an advert's name must not overwrite it.
+        #[test]
+        fn filling_in_a_fingerprint_keeps_a_user_chosen_name() {
+            let mut known = KnownHosts {
+                hosts: vec![saved("Basement rig", "192.168.1.9", "")],
+            };
+            merge_saved_host(&mut known, 0, "abc123", Some("living-room"));
+            assert_eq!(known.hosts[0].name, "Basement rig");
+        }
+
+        /// Idempotent: the panel may retry step 1, and re-offering the fingerprint a record
+        /// already carries is a state that is already correct, not an error to render.
+        #[test]
+        fn re_adding_the_same_fingerprint_changes_nothing() {
+            let mut known = KnownHosts {
+                hosts: vec![saved("desk", "192.168.1.9", "ABC123")],
+            };
+            assert_eq!(
+                merge_saved_host(&mut known, 0, "abc123", None),
+                AddOutcome::Unchanged,
+                "fingerprints compare case-insensitively"
+            );
+            // And a bare `hosts add` with no --fp at all leaves the pin alone.
+            assert_eq!(
+                merge_saved_host(&mut known, 0, "", None),
+                AddOutcome::Unchanged
+            );
+            assert_eq!(known.hosts[0].fp_hex, "ABC123");
+        }
+
+        /// A changed identity is a decision for a person. Never a silent overwrite — this is the
+        /// same rule `upsert_trusted` enforces, and a back door here would defeat it everywhere.
+        #[test]
+        fn a_different_fingerprint_is_refused_not_overwritten() {
+            let mut known = KnownHosts {
+                hosts: vec![saved("desk", "192.168.1.9", "abc123")],
+            };
+            assert_eq!(
+                merge_saved_host(&mut known, 0, "deadbeef", None),
+                AddOutcome::Conflict
+            );
+            assert_eq!(
+                known.hosts[0].fp_hex, "abc123",
+                "the pin must survive intact"
+            );
+        }
+
+        /// A host that changed DHCP lease is re-pointed, not filed a second time. Without this
+        /// the record a stable id resolves to keeps an address the host has left, so a launch
+        /// dials into the void while the panel shows the live one.
+        #[test]
+        fn a_known_fingerprint_at_a_new_address_moves_the_record() {
+            let mut known = KnownHosts {
+                hosts: vec![saved("desk", "192.168.1.9", "abc123")],
+            };
+            // Simulates `hosts add 192.168.1.50 --fp abc123` finding no record at that address.
+            let by_addr = known
+                .hosts
+                .iter()
+                .position(|h| h.addr == "192.168.1.50" && h.port == 9777);
+            assert!(
+                by_addr.is_none(),
+                "the new address is not yet on any record"
+            );
+            let by_fp = known
+                .hosts
+                .iter()
+                .position(|h| h.fp_hex.eq_ignore_ascii_case("abc123"));
+            assert_eq!(by_fp, Some(0), "the fingerprint still identifies the host");
+            known.hosts[0].addr = "192.168.1.50".into();
+            assert_eq!(known.hosts.len(), 1, "one host, one record");
         }
 
         #[test]

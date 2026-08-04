@@ -1,18 +1,14 @@
-// Shared state hooks + user actions for the QAM panel and the fullscreen page.
+// Shared state hooks + user actions for the QAM panel.
 import { toaster } from "@decky/api";
 import { Navigation } from "@decky/ui";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import {
   checkUpdate,
   discover,
-  GameEntry,
-  getPins,
-  Host,
-  listHosts,
-  PinnedGame,
-  resetConfig,
+  DiscoveredHost,
+  hosts as listHosts,
+  Profile,
   SavedHost,
-  setPins as setPinsBackend,
   updateClient,
   UpdateInfo,
 } from "./backend";
@@ -37,19 +33,191 @@ declare global {
 // PluginInstallType.UPDATE in decky-loader's browser.py (INSTALL=0/REINSTALL=1/UPDATE=2/…).
 const INSTALL_TYPE_UPDATE = 2;
 
+/**
+ * How far this device has got with a host. The three states are what the row says under the
+ * name, and which of them a host is in decides whether pressing it streams or opens the trust
+ * sheet.
+ *
+ * - `paired`       — the host approved this device (a PIN ceremony, or request access).
+ * - `trusted`      — its fingerprint is pinned but nobody has approved us yet. Streams work if
+ *                    the host's policy is `optional`; under `required` the connect parks.
+ * - `needs-access` — no pinned fingerprint. Not streamable until the trust sheet runs.
+ */
+export type TrustState = "paired" | "trusted" | "needs-access";
+
+/**
+ * One host as the panel shows it — the union of the saved store and the live mDNS browse.
+ *
+ * A saved host is ONLINE when it either advertises or answers the reachability probe, so a box
+ * reached over Tailscale/VPN stops reading as offline. Discovered hosts that aren't saved are
+ * appended as extra rows.
+ */
+export interface HostView {
+  name: string;
+  addr: string;
+  port: number;
+  /**
+   * The fingerprint PINNED ON THE RECORD. "" means nothing is pinned, which is exactly what
+   * makes a host unstreamable — the session binary refuses a pinless connect.
+   *
+   * Deliberately NOT filled in from a live advert. A host saved by address that happens to be
+   * advertising right now still has an empty pin on disk, and borrowing the advert's here would
+   * draw it as ready to stream while every launch refused for want of a fingerprint. What the
+   * advert offers is [`advertisedFp`], and moving it onto the record is a trust decision the
+   * user makes in the sheet.
+   */
+  fp: string;
+  /** What the host is advertising right now, if anything — what request access would pin. */
+  advertisedFp: string;
+  /**
+   * The host is answering at an address its record does not carry — it changed DHCP lease.
+   *
+   * This matters because a launch names the host by [`ref`], and the CLI dials whatever address
+   * the RECORD holds. So the row would show the live address and dial the dead one. The record
+   * has to be re-pointed before such a host can stream; `startStream` does it.
+   */
+  moved: boolean;
+  paired: boolean;
+  online: boolean;
+  saved: boolean;
+  /** The advert's policy ("required"|"optional"); "" when the host isn't advertising. */
+  pairPolicy: string;
+  /** OS-identity chain (live advert preferred, else the stored one); "" unknown. */
+  os: string;
+  /**
+   * What a launch should NAME this host by: the record's stable id, which survives renames and
+   * DHCP moves, falling back to `addr:port` for a row that has no record yet (a discovered host
+   * the trust sheet is about to save, or a client too old to have minted ids).
+   */
+  ref: string;
+  /** The host's default profile binding — applied silently by a plain connect, not a card. */
+  profile: Profile | null;
+  /** The cards to render nested under this host; already resolved against the catalog. */
+  pinnedProfiles: Profile[];
+  lastUsed: number | null;
+}
+
+export function trustState(v: HostView): TrustState {
+  if (v.paired) return "paired";
+  return v.fp ? "trusted" : "needs-access";
+}
+
+/**
+ * Must this host go through the trust sheet before it can stream?
+ *
+ * A pinned fingerprint is the ONLY rule. The session binary refuses a pinless connect, so a row
+ * without one can offer nothing but a button that fails; with one, the connect is verified and
+ * the host either admits it or parks it for an operator. The old rule also consulted the
+ * advertised policy for unsaved hosts, which made the answer depend on which of two lists a row
+ * came from — the same box could read differently before and after being saved.
+ */
+export function needsPair(v: HostView): boolean {
+  return v.fp === "";
+}
+
+function advertMatchesSaved(a: DiscoveredHost, s: SavedHost): boolean {
+  return (
+    (!!s.fp_hex && !!a.fp && s.fp_hex.toLowerCase() === a.fp.toLowerCase()) ||
+    (s.addr === a.addr && s.port === a.port)
+  );
+}
+
+/**
+ * Join the saved store and the live browse into the rows the panel draws.
+ *
+ * Fingerprint first, address second — a host that moved DHCP lease still matches its record,
+ * and a different box that inherited the old address does not inherit its pairing. The CLI's
+ * `discover` annotates `saved`/`paired` by exactly this rule too, so the two can't disagree.
+ */
+export function mergeHosts(saved: SavedHost[], discovered: DiscoveredHost[]): HostView[] {
+  const views: HostView[] = saved.map((s) => {
+    // Prefer a live advert's address: the host may have moved since it was last saved.
+    const advert = discovered.find((a) => advertMatchesSaved(a, s));
+    return {
+      name: s.name || s.addr,
+      addr: advert?.addr ?? s.addr,
+      port: advert?.port ?? s.port,
+      fp: s.fp_hex,
+      advertisedFp: advert?.fp ?? "",
+      moved: !!advert && (advert.addr !== s.addr || advert.port !== s.port),
+      paired: s.paired,
+      online: !!advert || s.online === true,
+      saved: true,
+      pairPolicy: advert?.pair ?? "",
+      os: advert?.os || s.os || "",
+      ref: s.id || `${advert?.addr ?? s.addr}:${advert?.port ?? s.port}`,
+      profile: s.profile,
+      pinnedProfiles: s.pinned_profiles ?? [],
+      lastUsed: s.last_used,
+    };
+  });
+  for (const a of discovered) {
+    if (saved.some((s) => advertMatchesSaved(a, s))) {
+      continue; // already rendered as its saved row, with a live pip
+    }
+    views.push({
+      name: a.name,
+      addr: a.addr,
+      port: a.port,
+      // No record, so nothing is pinned — whatever it advertises is an OFFER, not a pin.
+      fp: "",
+      advertisedFp: a.fp,
+      moved: false, // no record, so nothing to be stale
+      paired: a.paired,
+      online: true,
+      saved: false,
+      pairPolicy: a.pair,
+      os: a.os,
+      ref: `${a.addr}:${a.port}`,
+      profile: null,
+      pinnedProfiles: [],
+      lastUsed: null,
+    });
+  }
+  return views.sort(sortRows);
+}
+
+/**
+ * Online first, then most recently used, then by name. The host you streamed last night should
+ * be the first thing under your thumb; a host that is off right now should never be.
+ */
+function sortRows(a: HostView, b: HostView): number {
+  if (a.online !== b.online) return a.online ? -1 : 1;
+  if ((a.lastUsed ?? 0) !== (b.lastUsed ?? 0)) return (b.lastUsed ?? 0) - (a.lastUsed ?? 0);
+  return a.name.localeCompare(b.name);
+}
+
 // ----------------------------------------------------------------------------------------
-// Discovery — mDNS scan state shared by the QAM panel and the full page.
+// Hosts — ONE call site for both lists. They were separate hooks when the plugin had two
+// views mounting them independently; the panel is the only view now, and merging them means
+// the "scanning" state covers the whole row set rather than half of it flickering in first.
 // ----------------------------------------------------------------------------------------
 export function useHosts() {
-  const [hosts, setHosts] = useState<Host[]>([]);
+  const [views, setViews] = useState<HostView[]>([]);
   const [scanning, setScanning] = useState(false);
+  // Why the list is empty, when it is empty for a reason other than an empty LAN. Rendering
+  // either of these as "No hosts yet" would blame the user's network for the plugin's problem:
+  //   "client-outdated"    — the installed client predates `punktfunk discover`
+  //   "client-unavailable" — there is no client installed at all
+  const [problem, setProblem] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     setScanning(true);
     try {
-      setHosts(await discover());
+      // Both in flight at once: the browse is time-bounded and the probe is network-bound, so
+      // running them in sequence would cost the sum of two waits for no benefit.
+      const [d, s] = await Promise.all([discover(), listHosts()]);
+      // Both calls run the same binary, so they fail the same way; take whichever answered.
+      setProblem(
+        d.error === "client-unavailable" || s.error === "client-unavailable"
+          ? "client-unavailable"
+          : d.error === "client-outdated" || s.error === "client-outdated"
+            ? "client-outdated"
+            : null,
+      );
+      setViews(mergeHosts(s.hosts ?? [], d.hosts ?? []));
     } catch (e) {
-      toaster.toast({ title: "Punktfunk", body: `Discovery failed: ${e}` });
+      toaster.toast({ title: "Punktfunk", body: `Couldn't list hosts: ${e}` });
     } finally {
       setScanning(false);
     }
@@ -59,157 +227,7 @@ export function useHosts() {
     void refresh();
   }, [refresh]);
 
-  return { hosts, scanning, refresh };
-}
-
-// ----------------------------------------------------------------------------------------
-// Saved hosts — the SHARED known-hosts store (client-known-hosts.json), the same file the
-// desktop client reads/writes. Fetched WITH a reachability probe so a host reached over a
-// routed network (Tailscale/VPN) reports online without ever appearing on mDNS.
-// ----------------------------------------------------------------------------------------
-export function useSavedHosts() {
-  const [saved, setSaved] = useState<SavedHost[]>([]);
-  const [loading, setLoading] = useState(false);
-
-  const refresh = useCallback(async () => {
-    setLoading(true);
-    try {
-      const r = await listHosts(true);
-      setSaved(r.hosts ?? []);
-    } catch {
-      /* backend unavailable — keep the current view */
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    void refresh();
-  }, [refresh]);
-
-  return { saved, loading, refresh };
-}
-
-/**
- * One host as the UI shows it — the union of the saved store and the live mDNS scan. A saved
- * host is ONLINE when it either advertises on mDNS OR answers the reachability probe (so
- * mDNS-blind-but-reachable hosts stop reading as offline). Discovered hosts not in the store
- * are appended as unsaved rows.
- */
-export interface HostView {
-  name: string;
-  addr: string;
-  port: number;
-  fp: string; // "" for a saved-but-unpaired placeholder
-  paired: boolean; // PIN-paired specifically (a TOFU host has fp but paired=false)
-  online: boolean;
-  saved: boolean; // present in the known-hosts store
-  pairPolicy: string; // the advert's policy ("required"|"optional"), "" when not advertising
-  mgmt: number; // advertised mgmt-API port (0 = not advertised → default)
-  id: string; // advertised stable host id ("" when not advertising)
-  os: string; // OS-identity chain (live advert preferred, else the stored one); "" unknown
-}
-
-function advertMatchesSaved(a: Host, s: SavedHost): boolean {
-  return (
-    (!!s.fp_hex && !!a.fp && s.fp_hex.toLowerCase() === a.fp.toLowerCase()) ||
-    (s.addr === a.host && s.port === a.port)
-  );
-}
-
-export function mergeHosts(saved: SavedHost[], discovered: Host[]): HostView[] {
-  const views: HostView[] = saved.map((s) => {
-    // Prefer a live advert's address (a host may have moved DHCP leases since it was saved).
-    const advert = discovered.find((a) => advertMatchesSaved(a, s));
-    return {
-      name: s.name || s.addr,
-      addr: advert?.host ?? s.addr,
-      port: advert?.port ?? s.port,
-      fp: s.fp_hex || advert?.fp || "",
-      paired: s.paired,
-      online: !!advert || s.online === true,
-      saved: true,
-      pairPolicy: advert?.pair ?? "",
-      mgmt: advert?.mgmt ?? 0,
-      id: advert?.id ?? "",
-      os: advert?.os || s.os || "",
-    };
-  });
-  for (const a of discovered) {
-    if (saved.some((s) => advertMatchesSaved(a, s))) {
-      continue; // already rendered as its saved card (with a live pip)
-    }
-    views.push({
-      name: a.name,
-      addr: a.host,
-      port: a.port,
-      fp: a.fp,
-      paired: a.paired,
-      online: true,
-      saved: false,
-      pairPolicy: a.pair,
-      mgmt: a.mgmt,
-      id: a.id,
-      os: a.os,
-    });
-  }
-  return views;
-}
-
-/**
- * True when this host must be paired before it can stream. A saved host is streamable once it
- * has a pinned fingerprint (PIN-paired OR TOFU-trusted); a saved placeholder (no fp yet) must be
- * paired. For an unsaved discovered host we keep the advertised-policy rule the UI always used.
- */
-export function needsPair(v: HostView): boolean {
-  return v.saved ? v.fp === "" : v.pairPolicy === "required" && !v.paired;
-}
-
-/** Adapt a merged view back into the `Host` shape the pair/library/stream helpers consume. */
-export function toHost(v: HostView): Host {
-  return {
-    name: v.name,
-    host: v.addr,
-    port: v.port,
-    pair: v.pairPolicy || (needsPair(v) ? "required" : "optional"),
-    fp: v.fp,
-    proto: "",
-    paired: v.paired,
-    id: v.id,
-    mgmt: v.mgmt,
-    os: v.os,
-  };
-}
-
-/** Is a pinned game's host currently online, considering BOTH the live scan and saved probe? */
-export function pinIsOnline(pin: PinnedGame, views: HostView[]): boolean {
-  const fp = pin.host_fp.toLowerCase();
-  return views.some(
-    (v) =>
-      v.online &&
-      ((!!fp && v.fp.toLowerCase() === fp) ||
-        (!!pin.host_id && v.id === pin.host_id) ||
-        (v.addr === pin.host && v.port === pin.port)),
-  );
-}
-
-/**
- * Reset all Punktfunk state (saved hosts + stream settings + pins), keeping the client identity.
- * Refreshes whatever views are passed so the UI clears immediately. Ends in a toast.
- */
-export async function resetAll(refreshers: Array<() => void | Promise<void>>): Promise<void> {
-  try {
-    const r = await resetConfig();
-    for (const fn of refreshers) void fn();
-    toaster.toast({
-      title: "Punktfunk",
-      body: r.ok
-        ? "Reset — saved hosts, settings, and pins cleared."
-        : `Reset failed${r.error ? ` (${r.error})` : ""}.`,
-    });
-  } catch {
-    toaster.toast({ title: "Punktfunk", body: "Reset failed." });
-  }
+  return { views, scanning, problem, refresh };
 }
 
 // ----------------------------------------------------------------------------------------
@@ -258,36 +276,6 @@ export function clientUpdateIsOneTap(info: UpdateInfo | null | undefined): boole
     info.client_update_available &&
     (info.client_applier === "flatpak" || info.client_applier === "helper")
   );
-}
-
-/**
- * How the client got onto this box, in words a Deck user recognises. The raw kind comes from
- * the client's own detector (`pf_update_check::detect`); anything unmapped falls through as
- * itself rather than as "unknown", because the raw word is still more useful than a shrug.
- */
-export function clientInstallLabel(kind: string): string {
-  switch (kind) {
-    case "flatpak":
-      return "Flatpak (per-user)";
-    case "apt":
-      return "System package (apt)";
-    case "dnf":
-      return "System package (dnf)";
-    case "rpm-ostree":
-      return "Layered package (rpm-ostree)";
-    case "pacman":
-      return "System package (pacman)";
-    case "sysext":
-      return "System extension (sysext)";
-    case "nix":
-      return "Nix profile";
-    case "steamos-source":
-      return "On-device build";
-    case "source":
-      return "Built from source";
-    default:
-      return kind;
-  }
 }
 
 /** True when the only pending update is one this Deck can't apply itself. */
@@ -427,167 +415,26 @@ export async function applyUpdate(
 }
 
 // ----------------------------------------------------------------------------------------
-// Stream launch — via the hidden Steam shortcut (see steam.ts for why).
+// Stream launch — via the hidden Steam shortcut (see steam.ts for why it can't be direct).
 // ----------------------------------------------------------------------------------------
+
+/**
+ * Stream this host. `opts.profileId` streams one of its pinned cards; `opts.requestAccess`
+ * runs the supervised launch that waits for the host's operator to approve this Deck.
+ *
+ * The host is named by REFERENCE (`v.ref`), never by value — no resolution, bitrate or codec
+ * ever rides the launch path, which is the same rule the deep-link grammar enforces.
+ */
 export async function startStream(
-  h: Host,
+  v: HostView,
   opts: LaunchOpts = {},
   label?: string,
 ): Promise<void> {
   try {
-    await launchStream(h.host, h.port, opts);
+    await launchStream(v.ref, opts);
     Navigation.CloseSideMenus();
-    toaster.toast({ title: "Punktfunk", body: `Starting ${label ?? "stream"} — ${h.name}` });
+    toaster.toast({ title: "Punktfunk", body: `Starting ${label ?? "stream"} — ${v.name}` });
   } catch (e) {
     toaster.toast({ title: "Punktfunk", body: `Launch failed: ${e}` });
   }
-}
-
-/** Open the GTK client's gamepad library launcher for a host (`--browse` via PF_BROWSE). */
-export async function startBrowse(h: Host): Promise<void> {
-  try {
-    await launchStream(h.host, h.port, { browse: true, mgmt: h.mgmt });
-    Navigation.CloseSideMenus();
-    toaster.toast({ title: "Punktfunk", body: `Opening library — ${h.name}` });
-  } catch (e) {
-    toaster.toast({ title: "Punktfunk", body: `Launch failed: ${e}` });
-  }
-}
-
-// ----------------------------------------------------------------------------------------
-// Pinned games — the QAM's one-tap game rows, persisted by the backend next to the
-// client's config (survives plugin reinstalls).
-// ----------------------------------------------------------------------------------------
-export interface PinsApi {
-  pins: PinnedGame[];
-  addPin: (h: Host, g: GameEntry) => void;
-  removePin: (hostFp: string, gameId: string) => void;
-  isPinned: (hostFp: string, gameId: string) => boolean;
-  /** Refresh a pin's stored address from a live advert (hosts change IPs). */
-  updatePinHost: (pin: PinnedGame, h: Host) => void;
-  refresh: () => Promise<void>;
-}
-
-export function usePins(): PinsApi {
-  const [pins, setPins] = useState<PinnedGame[]>([]);
-  // A live mirror of `pins`. The Games picker is mounted by Decky's `showModal` into a
-  // detached portal that captures this hook's callbacks ONCE and never re-renders with fresh
-  // props, so a mutator closing over the `pins` array reads a frozen base — pinning a second
-  // game in the same session would compute from the stale `[]` and clobber the first (silent
-  // data loss). Reading the ref keeps every mutation based on the current set, and lets the
-  // callbacks keep a stable identity (deps free of `pins`).
-  const pinsRef = useRef<PinnedGame[]>([]);
-  pinsRef.current = pins;
-
-  const refresh = useCallback(async () => {
-    try {
-      setPins((await getPins()).pins);
-    } catch {
-      /* backend unavailable — keep the current view */
-    }
-  }, []);
-
-  useEffect(() => {
-    void refresh();
-  }, [refresh]);
-
-  // Optimistic local state; the backend validates/dedups and is re-read on failure.
-  const save = useCallback(
-    (next: PinnedGame[]) => {
-      pinsRef.current = next;
-      setPins(next);
-      setPinsBackend(next).catch(() => void refresh());
-    },
-    [refresh],
-  );
-
-  const addPin = useCallback(
-    (h: Host, g: GameEntry) => {
-      const pin: PinnedGame = {
-        game_id: g.id,
-        title: g.title,
-        store: g.store,
-        host_fp: h.fp,
-        host_id: h.id,
-        host_name: h.name,
-        host: h.host,
-        port: h.port,
-        mgmt: h.mgmt,
-        added_at: Math.floor(Date.now() / 1000),
-        paired: h.paired,
-      };
-      save([
-        ...pinsRef.current.filter(
-          (p) => !(p.host_fp === pin.host_fp && p.game_id === pin.game_id),
-        ),
-        pin,
-      ]);
-    },
-    [save],
-  );
-
-  const removePin = useCallback(
-    (hostFp: string, gameId: string) => {
-      save(pinsRef.current.filter((p) => !(p.host_fp === hostFp && p.game_id === gameId)));
-    },
-    [save],
-  );
-
-  const isPinned = useCallback(
-    (hostFp: string, gameId: string) =>
-      pins.some((p) => p.host_fp === hostFp && p.game_id === gameId),
-    [pins],
-  );
-
-  const updatePinHost = useCallback(
-    (pin: PinnedGame, h: Host) => {
-      if (pin.host === h.host && pin.port === h.port && pin.mgmt === h.mgmt) {
-        return;
-      }
-      save(
-        pinsRef.current.map((p) =>
-          p.host_fp === pin.host_fp && p.game_id === pin.game_id
-            ? { ...p, host: h.host, port: h.port, mgmt: h.mgmt, host_name: h.name }
-            : p,
-        ),
-      );
-    },
-    [save],
-  );
-
-  return { pins, addPin, removePin, isPinned, updatePinHost, refresh };
-}
-
-/**
- * The host a pin should launch against right now: match the live mDNS scan by cert
- * fingerprint first (pairing is fp-keyed, survives IP changes), then by the host's stable
- * id, else fall back to the stored address (host offline or scan flaky — still launch).
- */
-export function resolvePinHost(
-  pin: PinnedGame,
-  live: Host[],
-): { host: Host; online: boolean } {
-  const fp = pin.host_fp.toLowerCase();
-  const match =
-    (fp && live.find((h) => h.fp && h.fp.toLowerCase() === fp)) ||
-    (pin.host_id && live.find((h) => h.id && h.id === pin.host_id)) ||
-    undefined;
-  if (match) {
-    return { host: match, online: true };
-  }
-  return {
-    host: {
-      name: pin.host_name || pin.host,
-      host: pin.host,
-      port: pin.port,
-      pair: pin.paired ? "optional" : "required",
-      fp: pin.host_fp,
-      proto: "",
-      paired: !!pin.paired,
-      id: pin.host_id,
-      mgmt: pin.mgmt,
-      os: "", // pins don't store the chain; the icon is a hosts-tab affordance
-    },
-    online: false,
-  };
 }

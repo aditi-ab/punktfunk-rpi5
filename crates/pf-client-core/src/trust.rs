@@ -232,15 +232,27 @@ impl KnownHosts {
     /// A read-only config dir just keeps re-minting in memory, which harms nothing: no lookup
     /// is keyed by the id yet (design §4.5).
     pub fn load() -> KnownHosts {
-        let mut k: KnownHosts = Self::path()
-            .and_then(|p| Ok(std::fs::read_to_string(p)?))
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default();
+        let mut k = Self::read();
         if k.mint_missing_ids() {
             let _ = k.save();
         }
         k
+    }
+
+    /// The store exactly as it is on disk — no mint, and so no write.
+    ///
+    /// For a consumer that only needs to LOOK at the records (annotating a discovery result
+    /// against them, say) and never dials one by id. [`KnownHosts::load`]'s mint is a write, and
+    /// two processes started together against a pre-mint store will each mint a *different* id
+    /// for the same record and race to save it — after which whichever one already handed its
+    /// ids to a caller has handed out references that no longer resolve. A read that stays a
+    /// read cannot take part in that.
+    pub fn read() -> KnownHosts {
+        Self::path()
+            .and_then(|p| Ok(std::fs::read_to_string(p)?))
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
     }
 
     /// Give every record still missing one a stable id; returns true if anything changed

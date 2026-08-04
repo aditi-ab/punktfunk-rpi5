@@ -6,37 +6,39 @@ STREAM is NOT launched here — it is launched by the frontend through Steam
 (SteamClient.Apps.RunGame on a hidden non-Steam shortcut that points at ``bin/punktfunkrun.sh``),
 because gamescope only focuses/fullscreens windows in the process tree Steam launched via
 ``reaper``. A flatpak spawned from this backend would be invisible/unfocused (gamescope#484).
-The backend's jobs are the things Steam can't do:
+This backend is a THIN SHELL OVER THE HEADLESS CLI (``punktfunk``, shipped in every package
+since v0.22.0), plus the handful of things that are genuinely Steam's business. It used to be
+a second client — its own mDNS parser, its own host-store editor, its own settings writer —
+and every one of those was a copy of a rule that already lives in Rust, drifting from it. The
+rule now has one home; this file builds argv and maps exit codes.
 
-* **discover()** — browse the LAN over mDNS (``avahi-browse``) for ``_punktfunk._udp`` hosts.
-* **pair(host, port, pin, name)** — run the SPAKE2 PIN ceremony headlessly via the flatpak
-  client's ``--pair`` mode, capturing the result. Pairing uses the SAME flatpak (so the same
-  identity store the stream uses), so once paired the stream connects silently.
-* **library(host, mgmt_port, fp)** — fetch a paired host's game library headlessly via the
-  flatpak client's ``--library`` mode (mTLS with the client's own identity; TSV on stdout),
-  so the picker UI can offer games to pin.
-* **get_pins() / set_pins()** — the pinned-games store (``decky-pinned.json`` next to the
-  client's config, so pins survive plugin reinstalls), annotated with live pairing state.
-* **runner_info()** — the absolute path to the launch wrapper + the flatpak app id, handed to
-  the frontend so it can create/point the Steam shortcut.
-* **get_settings() / set_settings()** — read/write the flatpak client's stream settings JSON
-  (resolution / bitrate / gamepad), so the Deck UI configures the stream the client reads.
-  ``set_settings`` MERGES onto the file: it is shared with the desktop client and the console.
-* **list_devices() / refresh_devices()** — the GPUs and audio endpoints the settings tab's
-  device pickers offer, read from the session binary (``--list-adapters`` / ``--list-audio``)
-  and cached, since enumerating them costs a Vulkan + PipeWire init.
-* **kill_stream()** — force-stop a wedged stream (``flatpak kill``).
-* **check_update()** — report pending updates for BOTH the plugin and the client. The plugin's
-  comes from the registry's per-channel ``manifest.json`` (the frontend then drives Decky's own
-  install RPC to apply it); the client's depends on how it was installed — a flatpak is compared
-  by OSTree commit here, anything else is asked of the client itself
-  (``punktfunk-client --check-update``, which verifies a signed manifest).
-* **update_client()** — apply the client update by whichever route that install supports:
-  ``flatpak update --user``, ``punktfunk-client --apply-update`` (the packaged root helper), or
-  a refusal carrying the command to run by hand.
+Thin CLI shells — each is build argv, run, parse JSON, map the exit code:
 
-The TXT-record keys parsed (``proto`` / ``fp`` / ``pair`` / ``id`` / ``mgmt``) are defined by
-the host advert in ``crates/punktfunk-host/src/discovery.rs``.
+* **discover()** — ``punktfunk discover --json``: the LAN's hosts, already annotated with
+  whether this device has them saved and paired.
+* **hosts()** — ``punktfunk hosts list --probe --json``: the saved hosts with a live,
+  mDNS-independent reachability probe, and their profile bindings and pinned cards already
+  resolved against the profile catalog.
+* **pair(addr, port, pin, name)** — ``punktfunk pair``: the SPAKE2 PIN ceremony.
+* **trust_host(addr, port, fp, name)** — ``punktfunk hosts add --fp``: step 1 of request
+  access, and the ONLY write this backend makes to the client's store.
+
+Kept because only a Decky plugin can do them:
+
+* **runner_info()** — resolve flatpak vs native and hand the frontend the wrapper path.
+* **shortcut_art()** — base64 grid/hero/logo + icon path for the Steam shortcut.
+* **apply_controller_config()** — write the native-touch layout into every Steam account's
+  configset dir, chowned back to the user (this backend is root; Steam is not).
+* **check_update() / update_client()** — the plugin's own registry manifest (Decky's install
+  RPC needs artifact + SHA-256) and the client's update route.
+* **kill_stream()** — force-stop a wedged client.
+
+What is deliberately NOT here: the stream launch. It goes through Steam
+(SteamClient.Apps.RunGame on a non-Steam shortcut pointing at ``bin/punktfunkrun.sh``),
+because gamescope only focuses/fullscreens windows in the process tree Steam launched via
+``reaper`` — a client spawned from this backend would come up invisible and unfocused
+(gamescope#484). Settings, add-host-by-address, the library browser and profile editing are
+not here either: they are one shortcut away in the client's own console home.
 """
 
 import asyncio
@@ -54,49 +56,9 @@ import decky
 # Flatpak application id of the GTK client (packaging/flatpak/io.unom.Punktfunk.yml).
 APP_ID = "io.unom.Punktfunk"
 
-# Service type advertised by punktfunk/1 hosts (matches NATIVE_SERVICE in the Rust host).
-SERVICE_TYPE = "_punktfunk._udp"
-
-# The flatpak client persists identity / known-hosts / settings under HOME/.config/punktfunk.
-# The sandbox HOME resolves to the REAL user home (== DECKY_USER_HOME), NOT the per-app
-# ~/.var/app/<APP_ID> dir — verified on-device (`flatpak run … sh -c 'echo $HOME'` prints
-# /home/deck, and the manifest's `--filesystem=~/.config/punktfunk` grants exactly that path;
-# we also pass HOME=DECKY_USER_HOME into `flatpak run`, see _flatpak_env). Pointing here is what
-# lets plugin settings actually reach the client AND lets us read the client's known-hosts to
-# tell whether THIS device is already paired with a given host.
-def _client_config_dir() -> Path:
-    return Path(decky.DECKY_USER_HOME) / ".config" / "punktfunk"
-
-
-def _settings_path() -> Path:
-    return _client_config_dir() / "client-gtk-settings.json"
-
-
-def _paired_fingerprints() -> set[str]:
-    """Host cert fingerprints (lowercase hex) this client has PIN-paired, from the client's
-    known-hosts store. Keyed by fingerprint so it survives a host changing IP address."""
-    try:
-        data = json.loads((_client_config_dir() / "client-known-hosts.json").read_text())
-    except (OSError, json.JSONDecodeError):
-        return set()
-    hosts = data.get("hosts", []) if isinstance(data, dict) else []
-    return {
-        h["fp_hex"].lower()
-        for h in hosts
-        if isinstance(h, dict) and h.get("paired") and isinstance(h.get("fp_hex"), str)
-    }
-
-
 def _runner_path() -> str:
     """Absolute path to the launch wrapper shipped with the plugin (bin/punktfunkrun.sh)."""
     return str(Path(decky.DECKY_PLUGIN_DIR) / "bin" / "punktfunkrun.sh")
-
-
-def _pins_path() -> Path:
-    """The pinned-games store — plugin-owned, but deliberately in the CLIENT's config dir
-    (like everything else we persist): the plugins dir is root-owned and wiped on
-    reinstall, while ``~/.config/punktfunk`` survives both."""
-    return _client_config_dir() / "decky-pinned.json"
 
 
 # --- Steam Input controller config injection (native touchscreen via the ts_n command) --------
@@ -184,39 +146,6 @@ def _upsert_configset_entry(text: str, key: str, source_type: str, source_val: s
     if last_close == -1:
         return text.rstrip() + "\n" + block
     return text[:last_close] + block + text[last_close:]
-
-
-def _parse_library_tsv(stdout: str) -> list[dict]:
-    """Parse the flatpak client's ``--library`` output: one ``id\\tstore\\ttitle`` line per
-    game plus a trailing ``N game(s)`` count line (no tabs — it self-skips here). A title
-    may itself contain tabs, so split at most twice."""
-    games: list[dict] = []
-    for line in stdout.splitlines():
-        parts = line.split("\t", 2)
-        if len(parts) == 3:
-            games.append({"id": parts[0], "store": parts[1], "title": parts[2]})
-    return games
-
-
-def _classify_library_error(stderr: str) -> str:
-    """Map the client's ``library: <LibraryError Display>`` stderr line to a stable error
-    code for the UI. Substring-matched against the Display strings in
-    ``crates/pf-client-core/src/library.rs`` — a wording change degrades to ``client-error``
-    (generic copy), never a crash."""
-    s = stderr.lower()
-    if "didn't recognize this device" in s:
-        return "not-paired"
-    if "pinned fingerprint" in s:
-        return "pin-mismatch"
-    if "couldn't reach the host" in s:
-        return "unreachable"
-    if "management api returned http" in s:
-        return "http"
-    if "display" in s or "gtk" in s:
-        # A flatpak so old it predates --library falls through to GTK init, which fails
-        # headless from this backend.
-        return "client-outdated"
-    return "client-error"
 
 
 # ----------------------------------------------------------------------------------------
@@ -347,9 +276,10 @@ def _flatpak() -> str | None:
 # settings in the same ~/.config/punktfunk (the flatpak's sandbox HOME resolves to the real
 # home), so nothing else in this file has to care which one answered.
 NATIVE_BIN = "punktfunk-client"
-# The Vulkan session binary the shell execs to stream — and the only thing that can enumerate
-# this device's GPUs and audio endpoints for the settings pickers.
-SESSION_BIN = "punktfunk-session"
+# The headless CLI — the door this backend does almost everything through (discover, hosts,
+# pair, trust). Shipped beside the GTK client in every package since v0.22.0: /app/bin in the
+# flatpak, the same bindir as `punktfunk-client` natively.
+CLI_BIN = "punktfunk"
 
 # Prefixes to try when PATH doesn't have it. The Decky backend runs with a minimal PATH, and
 # SteamOS's read-only /usr pushes native installs into a sysext or the user's own prefix.
@@ -405,23 +335,107 @@ def _client_argv() -> list[str] | None:
     return [native] if native else None
 
 
-def _session_argv() -> list[str] | None:
-    """The argv PREFIX that runs the SESSION binary headlessly, or None when it isn't there.
+def _cli_argv() -> list[str] | None:
+    """The argv PREFIX that runs the headless CLI, or None when no client is installed.
 
-    The device enumerations the settings pickers need (`--list-adapters`, `--list-audio`) live on
-    `punktfunk-session`, not on the client: the GTK shell deliberately links no Vulkan itself and
-    shells out to the session for exactly the same two lists (clients/linux/src/app.rs). The
-    flatpak installs both binaries into /app/bin, so `--command=` picks the other one; a native
-    install puts them in the same bindir, so the session is the client's sibling.
+    Exactly the shape the old ``_session_argv`` used, pointed at ``punktfunk`` instead: the
+    flatpak ships both binaries in /app/bin so ``--command=`` picks the other one (**the app id
+    stays LAST** — flatpak treats everything after it as the app's own argv), and a native
+    install puts the CLI in the same bindir as ``punktfunk-client``, so it is its sibling.
     """
     prefix = _client_argv()
     if not prefix:
         return None
     if prefix[0] == _flatpak():
-        # `flatpak run --command=<bin> <app>` — the app id must stay LAST.
-        return [*prefix[:-1], f"--command={SESSION_BIN}", prefix[-1]]
-    sibling = Path(prefix[0]).with_name(SESSION_BIN)
+        return [*prefix[:-1], f"--command={CLI_BIN}", prefix[-1]]
+    sibling = Path(prefix[0]).with_name(CLI_BIN)
     return [str(sibling)] if sibling.exists() else None
+
+
+async def _run_cli(args: list[str], timeout: float = 20.0) -> tuple[int, str, str]:
+    """Run the headless CLI, returning ``(returncode, stdout, stderr)``. SEPARATE pipes: stdout
+    is the machine interface (JSON/TSV) and stderr carries the log lines, and merging them would
+    corrupt every payload. ``(-1, "", "")`` when no client is installed or the call times out.
+
+    The same ``_flatpak_env`` repair the client runs needed applies here unchanged — Decky's
+    PyInstaller ``LD_LIBRARY_PATH`` leak breaks the flatpak's libcurl whatever binary inside the
+    sandbox is being started."""
+    prefix = _cli_argv()
+    if not prefix:
+        return -1, "", ""
+    proc = None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *prefix, *args,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            env=_flatpak_env(),
+        )
+        out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        rc = proc.returncode if proc.returncode is not None else -1
+        return (
+            rc,
+            (out or b"").decode("utf-8", "replace"),
+            (err or b"").decode("utf-8", "replace"),
+        )
+    except asyncio.TimeoutError:
+        decky.logger.warning("cli %s timed out", " ".join(args))
+        if proc:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+        return -1, "", ""
+    except Exception:  # noqa: BLE001
+        decky.logger.exception("cli %s failed", " ".join(args))
+        return -1, "", ""
+
+
+# The CLI's exit-code contract (clients/cli/src/main.rs): 0 ok, 2 connect failed, 3 trust
+# rejected, 4 renderer, 5 could not resolve what was asked for, 6 needs a person. Mapped to the
+# stable strings the panel renders, so a reworded message can never change what the UI shows.
+_CLI_ERRORS = {
+    2: "unreachable",
+    3: "refused",
+    5: "unresolved",
+    6: "needs-pairing",
+}
+
+
+def _cli_error(rc: int, stderr: str) -> str:
+    """One stable error code for a nonzero CLI exit.
+
+    The interesting case is a client too old for the verb we just used. That announces itself
+    DETERMINISTICALLY — exit 5 plus ``unknown command "<verb>"`` on stderr — rather than by the
+    guesswork the GTK headless modes needed, so the panel can say "update the client" with
+    confidence and offer the button that fixes it."""
+    if rc == -1:
+        return "client-unavailable"
+    if rc == 5 and "unknown command" in stderr:
+        return "client-outdated"
+    return _CLI_ERRORS.get(rc, "client-error")
+
+
+async def _cli_json(args: list[str], timeout: float = 20.0) -> dict:
+    """Run the CLI and parse its stdout as JSON. ``{"ok": True, **payload}`` on success, else
+    ``{"ok": False, "error": <code>, "detail": <the CLI's last stderr line>}``.
+
+    A zero exit with unparseable stdout is a failure, not an empty result: silently returning
+    "no hosts" for a broken client is exactly the answer a user cannot debug."""
+    rc, out, err = await _run_cli(args, timeout=timeout)
+    if rc == 0:
+        try:
+            data = json.loads(out)
+            if isinstance(data, dict):
+                # `ok` last: a payload that ever grows its own `ok` key must not be able to
+                # report failure through the field this layer owns.
+                return {**data, "ok": True}
+        except json.JSONDecodeError:
+            decky.logger.warning("cli %s: unparseable output: %s", args[0], out[:200])
+        return {"ok": False, "error": "client-error", "detail": "unreadable output"}
+    code = _cli_error(rc, err)
+    detail = (err.strip().splitlines() or [f"{args[0]} failed"])[-1]
+    decky.logger.warning("cli %s failed (rc=%s, %s): %s", args[0], rc, code, detail)
+    return {"ok": False, "error": code, "detail": detail}
 
 
 def _client_is_flatpak() -> bool:
@@ -537,121 +551,6 @@ async def _run_client(client_args: list[str], timeout: float = 20.0) -> tuple[in
         return -1, "", ""
 
 
-def _parse_audio_endpoints(out: str) -> tuple[list[dict], list[dict]]:
-    """Split `punktfunk-session --list-audio` into ``(sinks, sources)``.
-
-    Its format is one endpoint per line, ``sink|source<TAB>node.name<TAB>description``. The
-    node.name is what gets STORED (it is the stable id the client resolves against), so a line
-    without one is unusable and dropped; a missing description falls back to the name rather than
-    rendering a picker entry with no label. Anything else on the line is ignored, so an extra
-    trailing column in a future client can't break this.
-    """
-    sinks: list[dict] = []
-    sources: list[dict] = []
-    for line in out.splitlines():
-        parts = line.split("\t")
-        if len(parts) < 3 or not parts[1].strip():
-            continue
-        kind, name, description = parts[0].strip(), parts[1].strip(), parts[2].strip()
-        entry = {"name": name, "description": description or name}
-        if kind == "sink":
-            sinks.append(entry)
-        elif kind == "source":
-            sources.append(entry)
-    return sinks, sources
-
-
-async def _run_session(session_args: list[str], timeout: float = 25.0) -> tuple[int, str]:
-    """Run the SESSION binary headlessly, returning ``(returncode, stdout)``; ``(-1, "")`` when
-    it isn't installed or the call errors/times out.
-
-    Only ever used for the two read-only device enumerations — the launch path goes through the
-    Steam shortcut and the wrapper script, never through here. The timeout is generous because
-    `--list-adapters` initialises Vulkan on a cold flatpak."""
-    prefix = _session_argv()
-    if not prefix:
-        return -1, ""
-    proc = None
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *prefix, *session_args,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
-            env=_flatpak_env(),
-        )
-        out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-        rc = proc.returncode if proc.returncode is not None else -1
-        return rc, (out or b"").decode("utf-8", "replace")
-    except asyncio.TimeoutError:
-        decky.logger.warning("session %s timed out", " ".join(session_args))
-        if proc:
-            try:
-                proc.kill()
-            except ProcessLookupError:
-                pass
-        return -1, ""
-    except Exception:  # noqa: BLE001
-        decky.logger.exception("session %s failed", " ".join(session_args))
-        return -1, ""
-
-
-# The QAM panel and the full page each mount their own hosts view, and Gaming Mode remounts the
-# QAM often — every mount calls list_hosts, which spawns a flatpak cold-start plus a reachability
-# probe. Cache the last result briefly so back-to-back opens reuse it instead of re-probing; any
-# mutation (add/edit/forget/reset/pair) invalidates it so a change shows up immediately.
-_HOSTS_TTL_S = 12.0
-_hosts_cache: dict = {"at": 0.0, "probed": None, "data": None}
-
-# The settings tab's device lists (GPUs / audio endpoints). No TTL: this is hardware, and reading
-# it costs a Vulkan + PipeWire init. Held for the life of the plugin backend; `refresh_devices`
-# clears it for the user who just plugged a headset in.
-_devices_cache: dict = {"data": None}
-
-
-def _invalidate_hosts_cache() -> None:
-    _hosts_cache["data"] = None
-
-
-def _read_known_hosts() -> list[dict]:
-    """The saved-hosts store read straight off disk — the fallback for a client too old to have
-    ``--list-hosts``. Same file the desktop client owns; `online` is left ``None`` (unknown)
-    because a direct read has no reachability signal."""
-    try:
-        data = json.loads((_client_config_dir() / "client-known-hosts.json").read_text())
-    except (OSError, json.JSONDecodeError):
-        return []
-    hosts = data.get("hosts", []) if isinstance(data, dict) else []
-    out: list[dict] = []
-    for h in hosts:
-        if not isinstance(h, dict) or not h.get("addr"):
-            continue
-        out.append({
-            "name": str(h.get("name") or h.get("addr", "")),
-            "addr": str(h.get("addr", "")),
-            "port": int(h.get("port", 9777) or 9777),
-            "fp_hex": str(h.get("fp_hex", "")),
-            "paired": bool(h.get("paired", False)),
-            "mac": h.get("mac") if isinstance(h.get("mac"), list) else [],
-            "last_used": h.get("last_used"),
-            "online": None,
-        })
-    return out
-
-
-def _mutation_result(rc: int, err: str, op: str) -> dict:
-    """Map a headless host-store mutation's exit status to a UI-stable result. ``rc == -1`` means
-    the flatpak call never ran (missing/timed out); a nonzero rc from a client that PREDATES the
-    mode falls through to GTK init and fails headless — classified ``client-outdated`` so the UI
-    can prompt an update instead of showing a cryptic error."""
-    if rc == 0:
-        return {"ok": True}
-    if rc == -1:
-        return {"ok": False, "error": "client-unavailable"}
-    code = _classify_library_error(err)
-    detail = (err.strip().splitlines() or [f"{op} failed"])[-1]
-    decky.logger.warning("%s failed (rc=%s): %s", op, rc, detail)
-    return {"ok": False, "error": code, "detail": detail}
-
-
 def _field_from(text: str, name: str) -> str:
     """Pull ``<name>: value`` out of ``flatpak info`` / ``remote-info`` output (e.g. ``Commit``,
     ``Origin``)."""
@@ -661,6 +560,18 @@ def _field_from(text: str, name: str) -> str:
         if s.startswith(prefix):
             return s.split(":", 1)[1].strip()
     return ""
+
+
+def _looks_outdated(stderr: str) -> bool:
+    """Does this stderr have the signature of a client too old for the headless flag it was just
+    handed? Such a client ignores the unknown flag and falls through to GTK init, which fails
+    with no display — so the give-away is display/GTK noise rather than anything about the flag.
+
+    Narrow on purpose: the CLI announces the same condition deterministically (exit 5 plus
+    ``unknown command``, see :func:`_cli_error`), and this heuristic is only still here because
+    the update check drives the GTK client's ``--check-update``, not the CLI."""
+    s = stderr.lower()
+    return "display" in s or "gtk" in s
 
 
 async def _client_update_state() -> dict:
@@ -730,312 +641,90 @@ async def _native_update_state() -> dict:
     if rc == -1:
         return {}
     # A client predating `--check-update` ignores the flag and falls through to GTK init, which
-    # fails headless — the same signature the other headless modes classify.
-    code = _classify_library_error(err)
-    decky.logger.info("native check-update unavailable (rc=%s, %s)", rc, code)
-    return {"error": code} if code == "client-outdated" else {}
-
-
-def _split_txt(txt: str) -> list[str]:
-    """Split an avahi TXT column into tokens, honouring the ``"key=value"`` quoting."""
-    tokens: list[str] = []
-    cur: list[str] = []
-    in_quote = False
-    for ch in txt:
-        if ch == '"':
-            if in_quote:
-                tokens.append("".join(cur))
-                cur = []
-            in_quote = not in_quote
-        elif in_quote:
-            cur.append(ch)
-    if cur:
-        tokens.append("".join(cur))
-    return tokens
-
-
-def _parse_avahi_browse(stdout: str) -> list[dict]:
-    """Parse ``avahi-browse -rpt`` output into a list of host dicts (deduped on the TXT ``id``)."""
-    out: dict[str, dict] = {}
-    for raw in stdout.splitlines():
-        line = raw.strip()
-        if not line.startswith("="):
-            continue
-        parts = line.replace("\\;", "\x00").split(";")
-        parts = [p.replace("\x00", ";") for p in parts]
-        if len(parts) < 9:
-            continue
-
-        name = parts[3]
-        address = parts[7]
-        port_str = parts[8]
-        txt = parts[9] if len(parts) > 9 else ""
-
-        try:
-            port = int(port_str)
-        except ValueError:
-            port = 0
-
-        props: dict[str, str] = {}
-        for token in _split_txt(txt):
-            if "=" in token:
-                k, v = token.split("=", 1)
-                props[k] = v
-
-        if props.get("proto") and not props["proto"].startswith("punktfunk/"):
-            continue
-
-        try:
-            mgmt = int(props.get("mgmt", ""))
-        except ValueError:
-            mgmt = 0  # not advertised (standalone punktfunk1-host) — callers default 47990
-
-        entry = {
-            "name": name,
-            "host": address,
-            "port": port,
-            "pair": props.get("pair", "optional"),
-            "fp": props.get("fp", ""),
-            "proto": props.get("proto", ""),
-            "id": props.get("id", ""),
-            "mgmt": mgmt,
-            # OS-identity chain for the host row's icon (e.g. "linux/fedora/bazzite");
-            # empty on an older host that doesn't advertise it.
-            "os": props.get("os", ""),
-        }
-        key = props.get("id") or f"{address}:{port}"
-        existing = out.get(key)
-        # Prefer IPv4 over IPv6 for the user-facing host string.
-        if existing is None or (":" in existing["host"] and ":" not in address):
-            out[key] = entry
-
-    return list(out.values())
+    # fails headless — that is the signature, and it is the one thing worth reporting here.
+    outdated = _looks_outdated(err)
+    decky.logger.info("native check-update unavailable (rc=%s, outdated=%s)", rc, outdated)
+    return {"error": "client-outdated"} if outdated else {}
 
 
 class Plugin:
-    async def discover(self) -> list[dict]:
-        """Browse the LAN for punktfunk/1 hosts. Returns ``[{name, host, port, pair, fp}]``."""
-        avahi = shutil.which("avahi-browse")
-        if not avahi:
-            decky.logger.error("avahi-browse not found; install avahi for host discovery")
-            return []
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                avahi, "-rpt", SERVICE_TYPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            try:
-                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=8.0)
-            except asyncio.TimeoutError:
-                proc.kill()
-                decky.logger.warning("avahi-browse timed out")
-                return []
-        except Exception:  # noqa: BLE001
-            decky.logger.exception("avahi-browse failed")
-            return []
-        if stderr:
-            decky.logger.debug("avahi-browse stderr: %s", stderr.decode(errors="replace"))
-        hosts = _parse_avahi_browse(stdout.decode(errors="replace"))
-        # Mark which hosts THIS device has already paired (by cert fingerprint), so the UI can
-        # show "Stream" instead of "Pair" — the mDNS `pair` field is the host's policy, not our
-        # per-device pairing state.
-        paired = _paired_fingerprints()
-        for h in hosts:
-            fp = h.get("fp") or ""
-            h["paired"] = bool(fp) and fp.lower() in paired
-        decky.logger.info("discovered %d punktfunk host(s)", len(hosts))
-        return hosts
+    # ---- Thin shells over the headless CLI -------------------------------------------------
+    #
+    # Each is "build argv, run, parse JSON, map the exit code". No parsing of the client's data
+    # files happens here and no trust rule is re-implemented here: this backend exists because
+    # Decky's frontend cannot spawn processes, not because it knows anything the client doesn't.
 
-    async def pair(self, host: str, port: int, pin: str, name: str = "Steam Deck") -> dict:
-        """Run the SPAKE2 PIN ceremony headlessly via the flatpak client's ``--pair`` mode.
+    async def discover(self) -> dict:
+        """Browse the LAN for hosts (``punktfunk discover --json``).
 
-        The user arms pairing on the HOST (which displays a 4-digit PIN) and enters it here.
-        On success the flatpak persists the host to its known-hosts as paired, so a later
-        stream connects silently. Returns ``{ok, fp?, error?}``.
-        """
-        flatpak = _flatpak()
-        if not flatpak:
-            return {"ok": False, "error": "flatpak-not-found"}
-        argv = [
-            flatpak, "run", "--arch=x86_64", APP_ID,
-            "--pair", str(pin).strip(),
-            "--connect", f"{host}:{port}",
-            "--name", name,
-            "--host-label", host,
-        ]
-        decky.logger.info("pairing: %s", " ".join(argv[:6] + ["<pin>", "--connect", f"{host}:{port}"]))
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *argv,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=_flatpak_env(),
-            )
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=100.0)
-        except asyncio.TimeoutError:
-            return {"ok": False, "error": "pairing timed out"}
-        except Exception as exc:  # noqa: BLE001
-            decky.logger.exception("pairing failed to launch")
-            return {"ok": False, "error": str(exc)}
+        ``{ok: True, hosts: [{name, addr, port, fp, pair, id, mgmt, os, saved, paired}]}``, or
+        ``{ok: False, error}`` — ``client-outdated`` when the installed client predates the
+        verb, which the panel renders as one explanatory row plus the update button.
 
-        out = stdout.decode(errors="replace")
-        err = stderr.decode(errors="replace")
-        if proc.returncode == 0 and "paired " in out:
+        The 12 s budget covers a cold flatpak start on top of the CLI's own 3 s browse."""
+        return await _cli_json(["discover", "--json"], timeout=12.0)
+
+    async def hosts(self) -> dict:
+        """The saved hosts with a live reachability probe
+        (``punktfunk hosts list --probe --json``).
+
+        ``--probe`` asks each host directly rather than waiting for an advert, so a host reached
+        over a routed network (Tailscale/VPN) reports online instead of looking dead. Profile
+        bindings and pinned cards come back already resolved against the profile catalog —
+        dangling ids dropped, names attached — so the panel renders them without ever opening
+        ``client-profiles.json``."""
+        return await _cli_json(["hosts", "list", "--probe", "--json"], timeout=30.0)
+
+    async def pair(self, addr: str, port: int, pin: str, name: str = "Steam Deck") -> dict:
+        """The PIN ceremony (``punktfunk pair <addr:port> --pin N --name LABEL``).
+
+        The operator arms pairing on the host, which shows a 4-digit PIN; entering it here
+        verifies the host end to end and pins its fingerprint, so every later connect is silent.
+        ``{ok: True}``, or ``{ok: False, error}`` where ``refused`` is a wrong PIN or a host
+        that isn't armed, and ``unreachable`` is a host that never answered.
+
+        The budget is generous because the ceremony waits on a person at the other end."""
+        rc, out, err = await _run_cli(
+            [
+                "pair", f"{addr}:{int(port)}",
+                "--pin", str(pin).strip(),
+                "--name", name,
+            ],
+            timeout=100.0,
+        )
+        if rc == 0:
             fp = ""
-            for tok in out.split():
-                if tok.startswith("fp="):
-                    fp = tok[3:]
-            decky.logger.info("paired %s:%s", host, port)
-            _invalidate_hosts_cache()  # the store gained a paired entry — reflect it next list
+            for token in out.split():
+                if token.startswith("fp="):
+                    fp = token[3:]
+            decky.logger.info("paired %s:%s", addr, port)
             return {"ok": True, "fp": fp}
-        decky.logger.warning("pairing failed (rc=%s): %s", proc.returncode, err.strip() or out.strip())
-        # Surface the client's own one-line reason (wrong PIN / not armed) to the UI.
-        reason = (err.strip().splitlines() or out.strip().splitlines() or ["pairing failed"])[-1]
-        return {"ok": False, "error": reason}
+        detail = (err.strip().splitlines() or ["pairing failed"])[-1]
+        decky.logger.warning("pairing failed (rc=%s): %s", rc, detail)
+        return {"ok": False, "error": _cli_error(rc, err), "detail": detail}
 
-    async def wake(self, host: str, port: int = 9777) -> dict:
-        """Send a Wake-on-LAN magic packet to a saved host via the flatpak client's headless
-        ``--wake`` mode, so a sleeping host is up by the time the stream ``--connect`` runs.
+    async def trust_host(self, addr: str, port: int, fp: str, name: str = "") -> dict:
+        """Step 1 of request access: save the host with the fingerprint it ADVERTISED
+        (``punktfunk hosts add <addr:port> --fp <hex> --name <label>``).
 
-        The MAC comes from the flatpak client's OWN known-hosts store (learned from the host's
-        mDNS ``mac`` TXT while it was online) — no MAC handling here — so this is a no-op if none
-        has been learned yet. Fire it just before launching a stream; it's fast and best-effort.
-        Returns ``{ok, error?}`` (``ok: False`` when no MAC is known / flatpak missing).
-        """
-        flatpak = _flatpak()
-        if not flatpak:
-            return {"ok": False, "error": "flatpak-not-found"}
-        argv = [flatpak, "run", "--arch=x86_64", APP_ID, "--wake", f"{host}:{port}"]
-        decky.logger.info("wake: %s:%s", host, port)
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *argv,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=_flatpak_env(),
-            )
-            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=15.0)
-        except asyncio.TimeoutError:
-            return {"ok": False, "error": "wake timed out"}
-        except Exception as exc:  # noqa: BLE001
-            decky.logger.exception("wake failed to launch")
-            return {"ok": False, "error": str(exc)}
-        if proc.returncode == 0:
+        The record lands pinned but unpaired — "trusted" — which is exactly what a
+        discovered-but-unapproved host is. The stream launched right after pins that same
+        fingerprint, so the 185 s wait for an operator's approval cannot be answered by an
+        impostor. Idempotent: re-running it with the same fingerprint is a no-op that still
+        exits 0. A DIFFERENT fingerprint comes back ``refused`` and is never overwritten.
+
+        This is the ONLY write this backend makes to the client's store, and it goes through
+        the CLI — which writes temp+rename into a user-owned directory, so a root backend
+        driving it cannot lock the desktop client out of its own files."""
+        args = ["hosts", "add", f"{addr}:{int(port)}", "--fp", fp.strip()]
+        if name.strip():
+            args += ["--name", name.strip()]
+        rc, _out, err = await _run_cli(args, timeout=20.0)
+        if rc == 0:
             return {"ok": True}
-        reason = (stderr.decode(errors="replace").strip().splitlines() or
-                  ["no MAC known for this host yet"])[-1]
-        decky.logger.info("wake skipped (rc=%s): %s", proc.returncode, reason)
-        return {"ok": False, "error": reason}
-
-    async def library(self, host: str, mgmt_port: int = 0, fp: str = "") -> dict:
-        """Fetch a paired host's game library via the flatpak client's headless
-        ``--library`` mode (the client's own mTLS identity + pinned-fingerprint transport —
-        no trust logic reimplemented here). ``fp`` is passed through whenever the caller
-        knows the host's cert fingerprint so an IP change can never degrade the pin to a
-        TOFU accept. Returns ``{ok, games: [{id, store, title}]}`` or
-        ``{ok: False, error: <code>, detail}`` (codes: ``flatpak-not-found`` / ``timeout`` /
-        ``not-paired`` / ``pin-mismatch`` / ``unreachable`` / ``http`` /
-        ``client-outdated`` / ``client-error``)."""
-        flatpak = _flatpak()
-        if not flatpak:
-            return {"ok": False, "error": "flatpak-not-found", "detail": ""}
-        target = f"{host}:{int(mgmt_port) or 47990}"
-        argv = [flatpak, "run", "--arch=x86_64", APP_ID, "--library", target]
-        if fp:
-            argv += ["--fp", fp]
-        decky.logger.info("library: fetching %s", target)
-        proc = None
-        try:
-            # Separate pipes (unlike _flatpak_capture): the TSV comes on stdout, the
-            # client's one-line error reason on stderr. Cold flatpak start on a Deck can
-            # take seconds — generous timeout, spinner in the UI.
-            proc = await asyncio.create_subprocess_exec(
-                *argv,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=_flatpak_env(),
-            )
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=45.0)
-        except asyncio.TimeoutError:
-            if proc:
-                try:
-                    proc.kill()
-                except ProcessLookupError:
-                    pass
-            return {"ok": False, "error": "timeout", "detail": ""}
-        except Exception as exc:  # noqa: BLE001
-            decky.logger.exception("library fetch failed to launch")
-            return {"ok": False, "error": "client-error", "detail": str(exc)}
-
-        err = stderr.decode(errors="replace")
-        if proc.returncode != 0:
-            detail = (err.strip().splitlines() or ["library fetch failed"])[-1]
-            code = _classify_library_error(err)
-            decky.logger.warning("library fetch failed (%s): %s", code, detail)
-            return {"ok": False, "error": code, "detail": detail}
-        games = _parse_library_tsv(stdout.decode(errors="replace"))
-        decky.logger.info("library: %d game(s) from %s", len(games), target)
-        return {"ok": True, "games": games}
-
-    async def get_pins(self) -> dict:
-        """The pinned games, each annotated with the LIVE ``paired`` state of its host (by
-        cert fingerprint — an unpaired-since host renders "pairing required" in the QAM)."""
-        try:
-            data = json.loads(_pins_path().read_text())
-        except (OSError, json.JSONDecodeError):
-            return {"pins": []}
-        pins = data.get("pins", []) if isinstance(data, dict) else []
-        paired = _paired_fingerprints()
-        out = []
-        for p in pins:
-            if not isinstance(p, dict) or not p.get("game_id"):
-                continue
-            p = dict(p)
-            p["paired"] = str(p.get("host_fp", "")).lower() in paired
-            out.append(p)
-        return {"pins": out}
-
-    async def set_pins(self, pins: list) -> dict:
-        """Persist the pinned-games list (the frontend sends the whole list — add, remove,
-        and address-refresh all funnel through here). Validated + deduped on
-        ``(host_fp, game_id)``; written atomically (tmp + rename) — pins are long-lived
-        user data."""
-        clean: list[dict] = []
-        seen: set[tuple[str, str]] = set()
-        for p in pins if isinstance(pins, list) else []:
-            if not isinstance(p, dict):
-                continue
-            game_id = str(p.get("game_id", ""))
-            host_fp = str(p.get("host_fp", ""))
-            if not game_id or not (host_fp or p.get("host")):
-                continue
-            key = (host_fp, game_id)
-            if key in seen:
-                continue
-            seen.add(key)
-            clean.append({
-                "game_id": game_id,
-                "title": str(p.get("title", game_id)),
-                "store": str(p.get("store", "")),
-                "host_fp": host_fp,
-                "host_id": str(p.get("host_id", "")),
-                "host_name": str(p.get("host_name", p.get("host", ""))),
-                "host": str(p.get("host", "")),
-                "port": int(p.get("port", 9777) or 9777),
-                "mgmt": int(p.get("mgmt", 0) or 0),
-                "added_at": int(p.get("added_at", 0) or 0),
-            })
-        try:
-            d = _client_config_dir()
-            d.mkdir(parents=True, exist_ok=True)
-            tmp = _pins_path().with_suffix(".json.tmp")
-            tmp.write_text(json.dumps({"version": 1, "pins": clean}, indent=2))
-            os.replace(tmp, _pins_path())
-            return {"ok": True}
-        except OSError as exc:
-            decky.logger.exception("could not write pins")
-            return {"ok": False, "error": str(exc)}
+        detail = (err.strip().splitlines() or ["could not save the host"])[-1]
+        decky.logger.warning("trust_host failed (rc=%s): %s", rc, detail)
+        return {"ok": False, "error": _cli_error(rc, err), "detail": detail}
 
     async def shortcut_art(self) -> dict:
         """The Steam-shortcut artwork shipped with the plugin (committed under ``assets/``):
@@ -1127,207 +816,7 @@ class Plugin:
             "client_bin": prefix[0] if native else "",
         }
 
-    async def get_settings(self) -> dict:
-        """Read the flatpak client's stream settings (resolution/bitrate/gamepad…)."""
-        try:
-            return json.loads(_settings_path().read_text())
-        except (OSError, json.JSONDecodeError):
-            # The client's own defaults (native display, host-default bitrate, auto pad,
-            # stats overlay at Normal — `Settings::default` is `show_stats: true`).
-            return {
-                "width": 0, "height": 0, "refresh_hz": 0, "render_scale": 1.0,
-                "bitrate_kbps": 0, "codec": "auto", "gamepad": "auto",
-                "gamepad_forwarding": True, "compositor": "auto",
-                "inhibit_shortcuts": True, "mic_enabled": False,
-                "stats_verbosity": "normal", "show_stats": True,
-            }
-
-    async def set_settings(self, settings: dict) -> dict:
-        """Write the stream settings JSON the (sandboxed) client reads on launch.
-
-        MERGED onto whatever is on disk, never a wholesale replace: this file is shared with
-        the desktop client and the console's settings screen, and it holds far more keys than
-        this panel models (decoder, GPU, profiles, touch/mouse model…). The panel reads it once
-        when it mounts, so a straight write would post a snapshot that predates anything those
-        other editors stored in the meantime — silently reverting it.
-        """
-        try:
-            d = _client_config_dir()
-            d.mkdir(parents=True, exist_ok=True)
-            try:
-                on_disk = json.loads(_settings_path().read_text())
-                if not isinstance(on_disk, dict):
-                    on_disk = {}
-            except (OSError, json.JSONDecodeError):
-                on_disk = {}  # no file yet (or an unreadable one): this write creates it
-            on_disk.update(settings)
-            _settings_path().write_text(json.dumps(on_disk, indent=2))
-            return {"ok": True}
-        except OSError as exc:
-            decky.logger.exception("could not write settings")
-            return {"ok": False, "error": str(exc)}
-
-    async def list_devices(self) -> dict:
-        """GPUs + audio endpoints for the settings tab's device pickers.
-
-        Two subprocesses that initialise Vulkan and PipeWire, so the result is cached for the
-        Decky session: hardware doesn't come and go often enough to justify paying that on every
-        remount of the page, and a stale entry is harmless — a picked device that has since
-        vanished falls back to the OS default in the client anyway. `refresh_devices` clears it.
-
-        Best-effort in the same way every other client call here is: no session binary (an old
-        flatpak that predates the two-binary split, or a native install missing its sibling) just
-        means empty lists and `ok: false`, which the UI shows as "couldn't read" rather than as
-        "you have no devices".
-        """
-        if _devices_cache["data"] is not None:
-            return _devices_cache["data"]
-
-        adapters: list[str] = []
-        sinks: list[dict] = []
-        sources: list[dict] = []
-        rc_a, out_a = await _run_session(["--list-adapters"])
-        if rc_a == 0:
-            adapters = [ln.strip() for ln in out_a.splitlines() if ln.strip()]
-        rc_d, out_d = await _run_session(["--list-audio"])
-        if rc_d == 0:
-            sinks, sources = _parse_audio_endpoints(out_d)
-
-        result = {
-            "ok": rc_a == 0 or rc_d == 0,
-            "adapters": adapters,
-            "sinks": sinks,
-            "sources": sources,
-        }
-        # Only a run that actually answered is worth remembering — caching a failure would make
-        # a client installed after the page was first opened stay invisible until a Decky restart.
-        if result["ok"]:
-            _devices_cache["data"] = result
-        return result
-
-    async def refresh_devices(self) -> dict:
-        """Drop the cached enumeration and read it again (a headset was just plugged in)."""
-        _devices_cache["data"] = None
-        return await self.list_devices()
-
     # ---- Shared known-hosts store (the SAME file the desktop client reads/writes) ----
-
-    async def list_hosts(self, probe: bool = True) -> dict:
-        """The saved-hosts store as a list — the SAME ``client-known-hosts.json`` the desktop
-        client owns, so a host added/renamed/paired in either surface shows in both. With
-        ``probe`` each host carries a live ``online`` bool from a mDNS-INDEPENDENT reachability
-        probe (a Tailscale/VPN host is no longer shown offline just because it doesn't advertise);
-        ``online`` is ``None`` when reachability is unknown. Prefers the client's ``--list-hosts``
-        mode; falls back to reading the JSON directly when the installed client predates it."""
-        now = time.monotonic()
-        cache = _hosts_cache
-        if (
-            cache["data"] is not None
-            and cache["probed"] == bool(probe)
-            and (now - cache["at"]) < _HOSTS_TTL_S
-        ):
-            return cache["data"]
-
-        args = ["--list-hosts"] + (["--probe"] if probe else [])
-        rc, out, err = await _run_client(args, timeout=30.0)
-        result: dict | None = None
-        if rc == 0:
-            try:
-                data = json.loads(out)
-                hosts = data.get("hosts", []) if isinstance(data, dict) else []
-                result = {"ok": True, "hosts": hosts, "probed": bool(probe)}
-            except json.JSONDecodeError:
-                decky.logger.warning("list-hosts: unparseable output: %s", out[:200])
-        elif rc != -1:
-            decky.logger.info(
-                "list-hosts unavailable (%s); reading store directly",
-                _classify_library_error(err),
-            )
-        if result is None:
-            # Fallback: read the store off disk (old client / no --list-hosts) — no reachability.
-            result = {"ok": True, "hosts": _read_known_hosts(), "probed": False, "fallback": True}
-        cache.update(at=now, probed=bool(probe), data=result)
-        return result
-
-    async def add_host(self, target: str, name: str = "", fp: str = "") -> dict:
-        """Save a host by address so it can be paired/streamed even when mDNS never sees it (a
-        Tailscale/VPN box). Without ``fp`` it's an unpaired placeholder the user pairs next; a
-        later pair replaces it with the fingerprinted entry. Returns ``{ok, error?, detail?}``."""
-        args = ["--add-host", target.strip()]
-        if name.strip():
-            args += ["--host-label", name.strip()]
-        if fp.strip():
-            args += ["--fp", fp.strip()]
-        rc, _out, err = await _run_client(args, timeout=20.0)
-        _invalidate_hosts_cache()
-        return _mutation_result(rc, err, "add-host")
-
-    async def edit_host(
-        self, selector: str, name: str = "", addr: str = "", port: int = 0
-    ) -> dict:
-        """Edit a saved host — rename and/or re-point its address. ``selector`` is the host's
-        cert fingerprint (survives IP changes) or its current ``addr[:port]``. Empty fields are
-        left untouched. Returns ``{ok, error?, detail?}``."""
-        args = ["--set-host", selector]
-        if name.strip():
-            args += ["--host-label", name.strip()]
-        if addr.strip():
-            args += ["--addr", addr.strip()]
-        if port:
-            args += ["--port", str(int(port))]
-        rc, _out, err = await _run_client(args, timeout=20.0)
-        _invalidate_hosts_cache()
-        return _mutation_result(rc, err, "set-host")
-
-    async def forget_host(self, selector: str) -> dict:
-        """Remove a saved host (by fingerprint or ``addr[:port]``) — drops the pinned
-        fingerprint, so a later connect must re-pair/trust. Idempotent."""
-        rc, _out, err = await _run_client(["--forget-host", selector], timeout=20.0)
-        _invalidate_hosts_cache()
-        return _mutation_result(rc, err, "forget-host")
-
-    async def reset_config(self) -> dict:
-        """Reset this device's Punktfunk state: saved hosts, stream settings, and the plugin's
-        pinned games. The client's persistent IDENTITY (client-cert/key.pem) is KEPT so the box
-        isn't seen as brand-new everywhere (re-pairing re-adds hosts). Prefers the client's
-        ``--reset``; if that's unavailable (old client / no flatpak) it clears the shared JSON
-        stores directly. The plugin-owned pins file is always cleared here (``--reset`` never
-        touches it)."""
-        rc, _out, _err = await _run_client(["--reset"], timeout=20.0)
-        _invalidate_hosts_cache()
-        errors: list[str] = []
-        if rc != 0:
-            decky.logger.info("reset: --reset unavailable (rc=%s); clearing stores directly", rc)
-            for name in ("client-known-hosts.json", "client-gtk-settings.json"):
-                try:
-                    (_client_config_dir() / name).unlink()
-                except FileNotFoundError:
-                    pass
-                except OSError as exc:
-                    errors.append(f"{name}: {exc}")
-        try:
-            _pins_path().unlink()  # plugin-owned; the client's --reset leaves it alone
-        except FileNotFoundError:
-            pass
-        except OSError as exc:
-            errors.append(f"pins: {exc}")
-        if errors:
-            return {"ok": False, "error": "; ".join(errors)}
-        return {"ok": True}
-
-    async def probe_host(self, target: str) -> dict:
-        """Reachability of one ``host[:port]`` via the client's mDNS-independent QUIC probe —
-        for a "test this address" check. ``{ok: True, online: bool}`` when determined, else
-        ``{ok: False, error}`` (flatpak missing / client too old)."""
-        rc, _out, err = await _run_client(["--reachable", target.strip()], timeout=8.0)
-        if rc == 0:
-            return {"ok": True, "online": True}
-        if rc == 1:
-            return {"ok": True, "online": False}
-        return {
-            "ok": False,
-            "error": _classify_library_error(err) if err.strip() else "client-unavailable",
-        }
 
     async def kill_stream(self) -> dict:
         """Force-stop a wedged stream client — ``flatpak kill`` for the sandboxed one, a plain

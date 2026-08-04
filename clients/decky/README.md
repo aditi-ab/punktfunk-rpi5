@@ -2,49 +2,61 @@
 
 Stream to your **Steam Deck** without ever leaving Gaming Mode. This
 **[Decky Loader](https://decky.xyz/)** plugin adds a **Punktfunk** panel to the Quick Access Menu
-(the `…` button): discover hosts on your network, pair with a PIN, tweak stream settings, and launch
-a fullscreen, gamescope-focused stream — all from the couch, gamepad-navigable.
+(the `…` button): the hosts you can stream, the pinned cards you set up, and one tap into each.
 
-The video itself is the native GTK4 Linux client (the `io.unom.Punktfunk` flatpak); the plugin
-discovers, pairs, configures, and *launches it the right way* so gamescope fullscreens it — the same
-Steam-shortcut trick MoonDeck uses. Because it's built from real Steam UI primitives (`@decky/ui`),
-the panel looks and feels native to Gaming Mode.
+The plugin is a **launcher**, not a client. It doesn't decode video, browse your library, or hold
+any settings of its own — the Rust client does all of that, and the plugin's job is to start it
+*the right way* so gamescope fullscreens and focuses it (the same Steam-shortcut trick MoonDeck
+uses). Everything the panel doesn't do is one tap away in the client's own gamepad UI.
 
 ## What it does
 
-1. **Discover** — browses the LAN over mDNS for Punktfunk hosts, in both the QAM panel and a
-   fullscreen page; each host row opens a details view (address, pairing policy, certificate
-   fingerprint to cross-check against the host's log).
-2. **Pair** — for a host that requires it, a gamepad-navigable PIN keypad runs the SPAKE2 pairing
-   ceremony headlessly, then remembers the host so future streams connect silently.
-3. **Stream** — launches fullscreen via a branded "Punktfunk" Steam shortcut so gamescope focuses it.
-4. **Games** — each host row has a games button that opens its **library picker**: pin titles as
-   one-tap "Stream <Game>" rows in the QAM (jump straight into e.g. Playnite on the host), or
-   **"Open library on screen"** to launch the client's controller-driven, console-style library
-   browser (aurora backdrop + poster coverflow; A plays, B returns to Gaming Mode). Pins survive
-   plugin reinstalls (stored next to the client's config) and follow a host across IP changes
-   (matched by certificate fingerprint).
-5. **Settings** — the client's whole settings store, written to its config. Laid out like SteamOS's
-   own Settings: a left rail of categories (`SidebarNavigation`), one page each, so no page needs
-   scrolling. The categories and their order are the console settings screen's — Stream (resolution
-   / refresh / render scale / bitrate / compositor), Video (codec / decoder / GPU / HDR / 4:4:4),
-   Presentation (prioritize / smoothness buffer / V-Sync / VRR), Audio (channels / output + mic
-   device / echo cancellation), Controllers, Touch & mouse, Interface (stats overlay / auto-wake /
-   library / fullscreen). The device pickers are populated
-   from the session binary (`--list-adapters` / `--list-audio`); the GPU row appears only where
-   there is more than one adapter.
-6. **About** — plugin version, an explicit "Check for updates" button, the setup-guide link, and
-   a force-stop for a wedged stream client.
+1. **Hosts** — the hosts on your network plus the ones you've saved, in one list. Discovery is
+   mDNS; saved hosts are also probed directly, so a box reached over Tailscale or a VPN shows as
+   online even though it never advertises. Rows sort online-first, then most recently used.
+2. **Trust** — an unpaired host opens a small sheet with two ways in:
+   - **Request access** (the default) — no PIN. The host's operator approves this Deck in its
+     console or web UI and the stream starts by itself. See [Request access](#request-access).
+   - **Use a PIN instead** — the gamepad-navigable keypad, running the same SPAKE2 ceremony.
+3. **Stream** — launches fullscreen via a branded "Punktfunk" Steam shortcut so gamescope focuses
+   it. A sleeping host is woken first (the client runs the real wake-and-wait loop, then dials).
+4. **Pinned cards** — a *(host, profile)* pair renders nested under its host as `▸ <Profile name>`
+   and streams with that settings profile applied. Cards are the **shared** pinning model every
+   other client speaks, stored on the host's record — so one you make in the desktop client shows
+   up here, and vice versa. The plugin renders them; it doesn't create or edit them.
+5. **Open Punktfunk** — launches the client's **console home**: the host picker, add-host by
+   address, PIN pairing, the game library browser, and the **full settings screen**. This is where
+   everything the panel no longer does now lives.
+6. **About** — plugin version, "Check for updates", "Recreate library shortcut", and a force-stop
+   for a wedged stream.
 
 To leave a stream: the in-client controller chord (**L1 + R1 + Start + Select**), or close the
 "game" from the Steam overlay — either returns you to Gaming Mode.
 
+### Request access
+
+Request access is not a second pairing ceremony — it is a **launch**. The plugin saves the host
+with the fingerprint it **advertised**, then starts an ordinary identified connect with the
+handshake budget stretched to 185 s. The host *parks* that connection until its operator approves
+the device, then admits the same connection; the stream starts on its own, and the record flips
+to **paired** so every later stream is silent.
+
+**No advertised fingerprint, no request access.** That pinned fingerprint is the only thing
+standing between a 185-second wait and an impostor answering for the host, so a host you typed in
+by address gets the PIN path only — and the sheet says why. The plugin never trusts-on-first-use
+past a missing fingerprint.
+
 ## Install on the Deck
 
-You need **[Decky Loader](https://decky.xyz/)** and the **`io.unom.Punktfunk` flatpak**
-([`packaging/flatpak`](../../packaging/flatpak/README.md)) installed on the Deck — SteamOS `/usr` is
-read-only, so the flatpak (which bundles libadwaita/SDL3) is the canonical client. Discovery uses
-`avahi-browse`, which ships on SteamOS/Bazzite.
+You need **[Decky Loader](https://decky.xyz/)** and a **Punktfunk client** on the Deck. On a normal
+Deck that's the `io.unom.Punktfunk` flatpak ([`packaging/flatpak`](../../packaging/flatpak/README.md)) —
+SteamOS `/usr` is read-only, so the flatpak (which bundles libadwaita/SDL3) is the canonical client.
+A native install (sysext, distro package, nix profile, your own build) works too.
+
+**The client must be v0.22.0 or newer** — that is when the headless `punktfunk` CLI shipped, and
+the panel drives everything through it. An older client says so in the panel, with the update
+button that fixes it right there. (Discovery no longer needs `avahi-browse` on the Deck; the
+client's own mDNS does it.)
 
 **Recommended — install from URL** (published by CI): in Decky → Settings → **Developer Mode** →
 **Install Plugin from URL**, paste:
@@ -55,17 +67,15 @@ https://unom.io/pf-decky
 
 (short link for `https://git.unom.io/api/packages/unom/generic/punktfunk-decky/latest/punktfunk.zip`;
 for a pinned version use `https://git.unom.io/api/packages/unom/generic/punktfunk-decky/<version>/punktfunk.zip`
-directly). The plugin then **self-updates** without
-the Decky store — when a newer build exists, an **Update** button appears and drives Decky
-Loader's own (SHA-256-verified) install. Installs and updates can take a couple of minutes on some
-networks: Decky's installer also contacts its plugin store first, which may be slow or blackholed
-before the actual download proceeds.
+directly). The plugin then **self-updates** without the Decky store — when a newer build exists, an
+**Update** button appears and drives Decky Loader's own (SHA-256-verified) install. Installs and
+updates can take a couple of minutes on some networks: Decky's installer also contacts its plugin
+store first, which may be slow or blackholed before the actual download proceeds.
 
 ### Updating the client
 
 The plugin also reports — and where it can, installs — updates for the **client** it launches.
-What is possible depends on how that client was installed, and the About tab names the install
-kind so the answer is never a mystery:
+What is possible depends on how that client was installed:
 
 | Install | Update |
 | --- | --- |
@@ -88,6 +98,8 @@ pnpm install
 pnpm build                             # rollup → dist/index.js
 pnpm run package                       # → out/punktfunk/ + out/punktfunk-v<ver>.zip
 DECK=deck@<deck-ip> pnpm run deploy    # rsync → /tmp, sudo-install into the root-owned plugins dir, restart loader
+
+python3.13 scripts/test-backend.py     # backend unit checks (needs Python ≥3.10)
 ```
 
 `~/homebrew/plugins/` is root-owned (the loader runs as root), so `deploy.sh` stages to a temp dir
@@ -96,28 +108,46 @@ restart is required for an out-of-band install to appear.
 
 ## Architecture
 
+Everything below the panel is the CLI. `main.py` builds argv and maps exit codes; it parses none of
+the client's data files and re-implements none of its rules.
+
 | File | Role |
 | --- | --- |
-| `src/index.tsx` | Plugin entry: the QAM panel + route registration. |
-| `src/page.tsx` | The `/punktfunk` fullscreen page — Hosts (with per-host details) / Settings / About tabs. |
-| `src/settings.tsx` · `src/pair.tsx` | The settings screen (a `SidebarNavigation` of seven category pages over one shared settings object); the gamepad-navigable PIN-pairing modal. |
-| `src/library.tsx` | The per-host game picker (pin/unpin, "Open library on screen") + the pinned-game launch helper. |
-| `src/hostmgmt.tsx` | Add / edit host dialogs — mutate the shared known-hosts store (`client-known-hosts.json`) via the flatpak client's headless modes, so a host saved here shows up in the desktop client too. |
-| `src/ui.tsx` | Shared UI primitives for the fullscreen page + modals (right-aligned row actions, consistent Field layout). |
-| `src/hooks.ts` · `src/boundary.tsx` | Shared discovery/update/pins hooks + actions; the render error boundary. |
-| `src/steam.ts` | Steam-shortcut launch (`AddShortcut` / `SetAppLaunchOptions` / `RunGame`) — the focus-correct stream start. The shortcut's exe is `/bin/sh` with the wrapper passed as an argument, so the script never needs an exec bit (Decky's zip extraction drops it and the root-owned plugins dir can't be chmodded by the unprivileged backend). Launch extras ride env-prefix tokens: `PF_LAUNCH=<id>` (pinned game) / `PF_BROWSE=1` + `PF_MGMT=<port>` (on-screen library); ids are validated space/quote-free at pin AND launch time. |
-| `src/backend.ts` | Typed `callable` bridges to `main.py`. |
-| `bin/punktfunkrun.sh` | The launch wrapper the Steam shortcut runs (so the window is focusable); maps `PF_LAUNCH`/`PF_BROWSE`/`PF_MGMT` to `--launch`/`--browse`/`--mgmt`. An older flatpak ignores the flags harmlessly (plain stream / hosts page). |
-| `main.py` | Backend: `discover` (via `avahi-browse`) / `pair` / `library` (headless flatpak `--library`, TSV) / pins store (`decky-pinned.json`) / settings / `kill_stream` / `check_update` (with an explicit CA-bundle search — Decky's embedded Python has no usable default TLS roots on SteamOS). |
-| `scripts/test-backend.py` | Stdlib-only checks for the backend's pure parsers (TSV, error classes, avahi TXT) + the pins round trip. |
+| `src/index.tsx` | Plugin entry + the QAM panel: update banner, hosts (with nested pinned cards), the console-home door, about. |
+| `src/hooks.ts` | `useHosts` (one call merging discovery and the saved store), the update hooks, and the launch action. Also the trust-state model the rows render. |
+| `src/trust.tsx` · `src/pair.tsx` | The trust sheet (Request access / Use a PIN instead / Cancel) and the gamepad-navigable PIN keypad. |
+| `src/steam.ts` | Steam-shortcut launch (`AddShortcut` / `SetAppLaunchOptions` / `RunGame`) — the focus-correct stream start. The shortcut's exe is `/bin/sh` with the wrapper passed as an argument, so the script never needs an exec bit (Decky's zip extraction drops it and the root-owned plugins dir can't be chmodded by the unprivileged backend). |
+| `src/backend.ts` · `src/boundary.tsx` · `src/os-icon.tsx` | Typed `callable` bridges to `main.py`; the render error boundary; the host row's OS mark. |
+| `bin/punktfunkrun.sh` | The launch wrapper the Steam shortcut runs (so the window is focusable). Reads `PF_REF` / `PF_PROFILE` / `PF_REQUEST_ACCESS` / `PF_BROWSE` and runs `punktfunk launch` — or the session's `--browse` for console home. |
+| `main.py` | Backend: four thin CLI shells (`discover` / `hosts` / `pair` / `trust_host`) plus the Steam-side work only a plugin can do — `runner_info`, `shortcut_art`, `apply_controller_config`, `kill_stream`, `check_update` / `update_client` (with an explicit CA-bundle search — Decky's embedded Python has no usable default TLS roots on SteamOS). |
+| `scripts/test-backend.py` | Stdlib-only checks: argv shape, the CLI exit-code mapping, and the Steam configset editor. |
 | `plugin.json` · `update.json` | Decky manifest; CI-baked update channel. |
+
+### Why the launch goes through Steam
+
+gamescope only gives focus and fullscreen to the window tree Steam launched via `reaper` (it
+detects the "current app" by AppID — gamescope#484). A client spawned from the plugin's own
+backend comes up invisible and unfocused. So the plugin registers non-Steam shortcuts whose exe is
+`/bin/sh` running `bin/punktfunkrun.sh`, and starts them with `RunGame`.
+
+There are **two** shortcuts, both named `Punktfunk` so Steam keys them to one Steam Input
+configset (the key is the lowercase name): a hidden, stateful one that carries the stream, and the
+visible, stateless library entry that opens console home.
 
 ## Limitations / next steps
 
-- No manual "add host by IP" entry yet (discovery is mDNS-only).
-- No in-stream overlay inside the plugin — the client owns the session once launched.
-- Pairing needs the operator to **arm pairing on the host** so it shows the PIN; the plugin can't arm
-  it remotely.
+- **Profiles and pinned cards can't be created here** — the panel renders them; making one needs
+  the desktop client, or the client's own gamepad UI once that work lands. A Deck with no profiles
+  simply sees host rows, and nothing is broken.
+- **Per-game pins are on hold.** The shared model pins *host+profile*; nothing in the shared store
+  persists a pinned *game* yet. The old `decky-pinned.json` is left on disk untouched so a later
+  migration can read it.
+- Pairing with a PIN needs the operator to **arm pairing on the host** so it shows the PIN; the
+  plugin can't arm it remotely. Request access needs no arming — just an approval.
+- **A parked connect looks like a hanging one.** The plugin toasts before launching a request-access
+  stream to set expectations, which is a patch rather than a fix; teaching the session's connect
+  screen the same "waiting for approval" copy the console shell already has would pay off for every
+  shell.
 
 ## Related
 
