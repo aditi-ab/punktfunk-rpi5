@@ -257,10 +257,11 @@ export async function ensureGamepadUiShortcut(): Promise<number | null> {
     }
     const startDir = info.runner.replace(/\/[^/]*$/, "");
     void ensureControllerConfig();
-    // Bare browse: PF_BROWSE with no PF_HOST → the wrapper runs `--browse --fullscreen` (console
-    // home). %command% expands to the shortcut exe (/bin/sh); the wrapper rides behind as an arg.
-    // PF_CLIENT_BIN only when the backend resolved a NATIVE client — else the wrapper's flatpak
-    // default stands and this shortcut is exactly what it always was.
+    // PF_BROWSE → the wrapper runs the SESSION's `--browse --fullscreen` (console home), which is
+    // the one branch this rework deliberately left alone. %command% expands to the shortcut exe
+    // (/bin/sh); the wrapper rides behind as an arg. PF_CLIENT_BIN only when the backend resolved
+    // a NATIVE client — else the wrapper's flatpak default stands and this shortcut is exactly
+    // what it always was.
     const clientBin = info.client_bin ? `PF_CLIENT_BIN=${info.client_bin} ` : "";
     const launchOpts = `${clientBin}PF_BROWSE=1 %command% "${info.runner}"`;
 
