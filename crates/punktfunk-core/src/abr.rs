@@ -150,11 +150,14 @@ const ENCODE_SEVERE_US: i64 = 12_000;
 /// the same reason: the decoder's knee moves with content and thermals.
 const CAP_REPROBE_WINDOWS_MIN: u32 = 16;
 const CAP_REPROBE_WINDOWS_MAX: u32 = 128;
-/// Two consecutive decode-driven backoffs latch the
+/// Two decode-driven backoffs latch the
 /// [`decode cap`](BitrateController::decode_cap_kbps) only when their pre-backoff rates agree
 /// within ±1/8: the decoder's knee is a RATE, so repeated chokes at the same rate are its
 /// signature — two unrelated events (a Wi-Fi flush at 300 Mbps, a decode spike at 500) share
-/// no knee and must not teach one.
+/// no knee and must not teach one. Each sample must come from a rate the controller CLIMBED
+/// back to (`climb_since_backoff`) — the knee's real signature is choke, recover, re-climb,
+/// choke again at the same place, and only backoffs at a climbed-to rate can agree within the
+/// band (a cascade's second backoff sits at ×0.7 of the first: outside it by construction).
 const DECODE_CAP_SIMILAR_DIV: u32 = 8;
 /// Rolling window (in 750 ms report windows, ~30 s) whose minimum mean is the OWD baseline.
 /// Long enough to remember the uncongested floor, short enough to follow genuine path changes.
@@ -286,6 +289,20 @@ pub(crate) struct BitrateController {
     /// decode-driven): the reference the next one must land near ([`DECODE_CAP_SIMILAR_DIV`])
     /// to latch the cap — one spurious flush teaches nothing.
     decode_backoff_kbps: u32,
+    /// Decode-flagged windows in the CURRENT bad-window streak. The ordinary two-window backoff
+    /// path is the decoder knee's most common presentation (a standing 15–45 ms decode rise —
+    /// deep enough to hurt, not deep enough for the severe tier), and judging decode evidence
+    /// from the FINAL window alone threw that attribution away: the backoff the decode signal
+    /// itself caused then RESET the knee streak. Counted per bad window, cleared with the streak.
+    streak_decode_windows: u32,
+    /// Whether `current_kbps` has RISEN (via an ack — ours or a host-initiated re-target) since
+    /// the last backoff. A knee sample is only meaningful for a rate the controller climbed to
+    /// or held; a backoff that fires while the previous backoff's damage is still draining
+    /// samples a rate the decoder never choked at (the host acks a ×0.7 request in ~100 ms, so
+    /// a cascade's second backoff ALWAYS sits at the already-reduced rate — dissimilar to the
+    /// knee by construction, 0.7 < 7/8). Such a backoff neither samples nor erases the
+    /// reference.
+    climb_since_backoff: bool,
     /// Clean windows spent parked at the learned decode cap (its re-probe clock), and that
     /// clock's own backoff interval — same schedule as the host cap's.
     decode_cap_probe_windows: u32,
@@ -341,6 +358,10 @@ impl BitrateController {
             cap_reprobe_after: CAP_REPROBE_WINDOWS_MIN,
             decode_cap_kbps: None,
             decode_backoff_kbps: 0,
+            streak_decode_windows: 0,
+            // The negotiated start rate was held, not drained to — the first backoff ever is a
+            // legitimate knee sample.
+            climb_since_backoff: true,
             decode_cap_probe_windows: 0,
             decode_cap_reprobe_after: CAP_REPROBE_WINDOWS_MIN,
             proven_kbps: 0,
@@ -433,6 +454,13 @@ impl BitrateController {
                     }
                 }
             }
+            if kbps > self.current_kbps {
+                // The rate ROSE — whatever the pipeline chokes on next, it will choke at a rate
+                // it was driven up to: a fresh knee sample (see `climb_since_backoff`). An ack'd
+                // decrease deliberately does not arm this — the drain after a backoff is not a
+                // knee encounter.
+                self.climb_since_backoff = true;
+            }
             self.current_kbps = kbps;
             // The host may run ABOVE our climb ceiling, and be right to: it sends an unsolicited
             // `BitrateChanged` when a rebuild re-resolves an Automatic rate for what it actually
@@ -472,6 +500,8 @@ impl BitrateController {
         self.cap_reprobe_after = CAP_REPROBE_WINDOWS_MIN;
         self.decode_cap_kbps = None;
         self.decode_backoff_kbps = 0;
+        self.streak_decode_windows = 0;
+        self.climb_since_backoff = true;
         self.decode_cap_probe_windows = 0;
         self.owd_means.clear();
         self.decode_means.clear();
@@ -571,12 +601,20 @@ impl BitrateController {
         }
         if bad {
             self.bad_windows += 1;
+            if decode_bad {
+                // Per-window decode attribution for the streak (see `streak_decode_windows`) —
+                // scored HERE because at backoff time only the final window's signals are in
+                // scope, and on the two-window path the first bad window never even reaches a
+                // decision (the cooldown eats it).
+                self.streak_decode_windows += 1;
+            }
             self.clean_windows = 0;
             // Any congestion signal ends slow start for good — from here on, climbs are additive.
             self.probing = false;
         } else {
             self.clean_windows += 1;
             self.bad_windows = 0;
+            self.streak_decode_windows = 0;
         }
         // The learned host cap re-probe (see [`CAP_REPROBE_WINDOWS_MIN`]): after a clean run
         // parked at the cap, lift it one step (+12.5 %, ceiling-bounded) so a scene-dependent
@@ -635,21 +673,42 @@ impl BitrateController {
             && self.current_kbps > self.floor_kbps
         {
             // Decode-cap learning (see [`decode_cap_kbps`](Self::decode_cap_kbps)): a backoff
-            // with decode-severe evidence — the deep decode excursion, or the flush that
-            // drained the queue behind a stalled decoder — remembers its pre-backoff rate; the
-            // SECOND consecutive one at a similar rate latches that rate as the decoder's
-            // knee. One event never latches (a spurious flush must stay a one-off), and a
-            // backoff without decode evidence in between breaks the streak — whatever it saw,
-            // it wasn't the same knee.
-            // A bare flush counts as decode evidence only where the decode signal can't speak
-            // for itself. On an embedder that reports decode latency, a flush with FLAT decode
-            // is a network event (a stall, a clock step) that drained a queue the decoder was
-            // keeping up with — teaching a "decoder knee" from it caps the session on the wrong
-            // end of the pipe. Where the signal is absent the old reading stands: the flush is
-            // the only decoder-saturation evidence there is.
-            let decode_evidence =
-                decode_severe || (flushed && (decode_bad || decode_mean_us.is_none()));
-            if decode_evidence {
+            // with decode evidence remembers its pre-backoff rate; the next one at a similar
+            // rate latches that rate as the decoder's knee. One event never latches (a spurious
+            // flush must stay a one-off), and a decode-free backoff in between breaks the
+            // streak — whatever it saw, it wasn't the same knee.
+            //
+            // Decode evidence, in order:
+            // - a decode-SEVERE excursion in the deciding window;
+            // - the ordinary two-window path where EVERY bad window was decode-flagged
+            //   (`streak_decode_windows`) — the knee's most common presentation is a standing
+            //   15–45 ms rise, below the severe tier, and the deciding window alone can't see
+            //   that the streak it ends was decode's doing;
+            // - a keyframe-ask storm without meaningful loss: a decoder begging for fresh
+            //   pictures on a clean link is being overdriven, whatever its latency figure says
+            //   (some decoders wedge rather than queue — the Steam Deck presentation). With
+            //   real loss present the asks are network-attributed and teach nothing here;
+            // - a flush, where the decode signal can't speak against it: on an embedder that
+            //   reports decode latency, a flush with FLAT decode is a network event (a stall, a
+            //   clock step) that drained a queue the decoder was keeping up with — teaching a
+            //   "decoder knee" from it caps the session on the wrong end of the pipe. Where the
+            //   signal is absent the flush is the only decoder-saturation evidence there is.
+            let decode_evidence = decode_severe
+                || self.streak_decode_windows >= BAD_WINDOWS_TO_DECREASE
+                || (recovery_kf >= RECOVERY_KF_BAD && loss_ppm < HEAVY_LOSS_PPM)
+                || (flushed && (decode_bad || decode_mean_us.is_none()));
+            if !self.climb_since_backoff {
+                // Still draining the previous backoff: the host acks a ×0.7 request in ~100 ms,
+                // so this window's rate is one the decoder never choked at while keeping up —
+                // its distress is residue of the choke above. Not a knee sample either way:
+                // neither latch against it nor let it erase the reference the real knee set.
+                tracing::debug!(
+                    at_kbps = self.current_kbps,
+                    reference_kbps = self.decode_backoff_kbps,
+                    "adaptive bitrate: backoff without an intervening climb — draining the \
+                     previous choke, not a knee sample"
+                );
+            } else if decode_evidence {
                 let rate = self.current_kbps;
                 let similar = self.decode_backoff_kbps > 0
                     && rate.abs_diff(self.decode_backoff_kbps)
@@ -683,8 +742,10 @@ impl BitrateController {
             } else {
                 self.decode_backoff_kbps = 0;
             }
+            self.climb_since_backoff = false;
             let next = ((self.current_kbps as u64 * 7 / 10) as u32).max(self.floor_kbps);
             self.bad_windows = 0;
+            self.streak_decode_windows = 0;
             return self.request(next, now);
         }
         // Climbs only fire off a UTILIZED clean window (actual delivered ≥ ¾ of the target — the
@@ -1945,71 +2006,100 @@ mod tests {
         assert_eq!(run_clean(&mut c, start, 24, 20), None);
     }
 
+    fn calm_window(c: &mut BitrateController, at: Instant) {
+        // One calm, unutilized window (2 Mb/s actual): seeds the latency baselines without
+        // authorizing climbs, and must decide nothing.
+        assert_eq!(
+            c.on_window(at, 0, 0, Some(10_000), Some(8_000), None, 2_000, false, 0),
+            None
+        );
+    }
+
+    /// Drive clean, fully-utilized windows (1 Gb/s actual), acking every climb the controller
+    /// asks for — a live host answers in ~100 ms — until `current_kbps` reaches `target`.
+    /// Bounded so a climb-path regression fails loudly instead of spinning.
+    fn climb_to(c: &mut BitrateController, start: Instant, tick: &mut u32, target: u32) {
+        for _ in 0..600 {
+            if c.current_kbps >= target {
+                return;
+            }
+            if let Some(k) = c.on_window(
+                ticks(start, *tick),
+                0,
+                0,
+                Some(10_000),
+                Some(8_000),
+                None,
+                1_000_000,
+                false,
+                0,
+            ) {
+                c.on_ack(k);
+            }
+            *tick += 1;
+        }
+        panic!(
+            "no climb to {target} within 600 windows (stuck at {})",
+            c.current_kbps
+        );
+    }
+
+    /// One decode-SEVERE window (60 ms against the ~8 ms baseline) at the current rate — a
+    /// knee choke. Steps past the change cooldown first so the decision can fire.
+    fn choke(c: &mut BitrateController, start: Instant, tick: &mut u32) -> Option<u32> {
+        *tick += 2;
+        let r = c.on_window(
+            ticks(start, *tick),
+            0,
+            0,
+            Some(10_000),
+            Some(60_000),
+            None,
+            c.current_kbps,
+            false,
+            0,
+        );
+        *tick += 1;
+        r
+    }
+
+    /// The latch's only production-reachable shape: choke at the knee, the host ACKS the ×0.7
+    /// (a live host answers in ~100 ms, so a cascade's second backoff always sits at the
+    /// already-reduced rate — dissimilar by construction), the controller climbs back, and the
+    /// re-climb chokes inside the ±1/8 band. Latches, acks the backoff, returns the cap.
+    fn latch_knee(c: &mut BitrateController, start: Instant, tick: &mut u32) -> u32 {
+        for _ in 0..4 {
+            calm_window(c, ticks(start, *tick));
+            *tick += 1;
+        }
+        let knee = c.current_kbps;
+        let r1 = choke(c, start, tick).expect("first choke must back off");
+        assert!(c.decode_cap_kbps.is_none(), "one event must not latch");
+        c.on_ack(r1);
+        climb_to(c, start, tick, knee - knee / DECODE_CAP_SIMILAR_DIV);
+        let rate = c.current_kbps;
+        let r2 = choke(c, start, tick).expect("re-climb choke must back off");
+        assert_eq!(c.decode_cap_kbps, Some(rate - rate / 16));
+        c.on_ack(r2);
+        rate - rate / 16
+    }
+
     #[test]
-    fn decode_cap_latches_after_two_consecutive_decode_severe_backoffs() {
+    fn decode_cap_latches_when_the_reclimb_chokes_at_the_same_knee() {
         // The 1440p120 field sawtooth: a decoder knee (~500 Mbps) well under the (inflated)
         // link ceiling — nothing ever LEARNED the knee, so every re-climb ended in a flush +
-        // dropped-frame burst. Establish a decode baseline on calm windows, choke twice at the
-        // same rate, and the second decode-severe backoff must latch the knee.
+        // dropped-frame burst. Choke, recover, climb back, choke again inside the band: latch.
         let mut c = BitrateController::new(500_000);
         c.set_ceiling(900_000);
         let start = Instant::now();
-        // Calm baseline windows (2 Mb/s actual: unutilized, so no climb interferes).
-        for i in 0..4 {
-            assert_eq!(
-                c.on_window(
-                    ticks(start, i),
-                    0,
-                    0,
-                    Some(10_000),
-                    Some(8_000),
-                    None,
-                    2_000,
-                    false,
-                    0
-                ),
-                None
-            );
-        }
-        // First deep decode excursion → immediate ×0.7, but ONE event must not latch.
-        assert_eq!(
-            c.on_window(
-                ticks(start, 4),
-                0,
-                0,
-                Some(10_000),
-                Some(60_000),
-                None,
-                490_000,
-                false,
-                0
-            ),
-            Some(350_000)
-        );
-        assert!(c.decode_cap_kbps.is_none());
-        // Second consecutive decode-severe backoff at the same pre-backoff rate: latch.
-        assert_eq!(
-            c.on_window(
-                ticks(start, 6),
-                0,
-                0,
-                Some(10_000),
-                Some(60_000),
-                None,
-                490_000,
-                false,
-                0
-            ),
-            Some(350_000)
-        );
-        assert_eq!(c.decode_cap_kbps, Some(500_000 - 500_000 / 16));
-        // The backoff applies; from here every climb must stop AT the knee — not the 900 Mbps
+        let mut t = 0;
+        latch_knee(&mut c, start, &mut t);
+        // The latch applies; from here every climb must stop AT the knee — not the 900 Mbps
         // link ceiling the old sawtooth kept re-poking.
-        c.on_ack(350_000);
         let mut max_req = 0;
-        for i in 8..70 {
+        for _ in 0..62 {
             if let Some(k) = c.on_window(
-                ticks(start, i),
+                ticks(start, t),
                 0,
                 0,
                 Some(10_000),
@@ -2030,6 +2120,7 @@ mod tests {
                 max_req = max_req.max(k);
                 c.on_ack(k);
             }
+            t += 1;
         }
         assert!(
             max_req < 600_000,
@@ -2039,37 +2130,82 @@ mod tests {
 
     #[test]
     fn a_single_flush_or_dissimilar_backoffs_never_latch_a_decode_cap() {
-        // The latch's false-positive guards. A lone jump-to-live flush (a Wi-Fi clump can
-        // flush once at ANY rate) backs off but teaches nothing…
+        // The latch's false-positive guards, every event at a rate the controller climbed to
+        // or held (drain-time backoffs are no sample at all —
+        // `cascade_backoffs_neither_sample_nor_erase_the_knee_reference` owns those). A lone
+        // jump-to-live flush (a Wi-Fi clump can flush once at ANY rate) backs off but teaches
+        // nothing…
         let mut c = BitrateController::new(500_000);
         c.set_ceiling(900_000);
         let start = Instant::now();
-        assert_eq!(
-            c.on_window(ticks(start, 0), 0, 0, None, None, None, 490_000, true, 0),
-            Some(350_000)
-        );
+        let mut t = 0;
+        let r1 = c
+            .on_window(ticks(start, t), 0, 0, None, None, None, 490_000, true, 0)
+            .expect("flush must back off");
+        assert_eq!(r1, 350_000);
         assert!(c.decode_cap_kbps.is_none());
-        c.on_ack(350_000);
-        // …a LOSS-driven backoff in between breaks the streak…
-        assert_eq!(
-            c.on_window(ticks(start, 2), 1, 0, None, None, None, 340_000, false, 0),
-            Some(245_000)
-        );
+        c.on_ack(r1);
+        // …a LOSS-driven backoff at the re-climbed rate breaks the streak (whatever choked
+        // there, it wasn't the decoder — even inside the similarity band)…
+        climb_to(&mut c, start, &mut t, 460_000);
+        t += 2;
+        let r2 = c
+            .on_window(
+                ticks(start, t),
+                1,
+                0,
+                None,
+                None,
+                None,
+                c.current_kbps,
+                false,
+                0,
+            )
+            .expect("loss must back off");
+        t += 1;
         assert!(c.decode_cap_kbps.is_none());
-        c.on_ack(245_000);
+        assert_eq!(
+            c.decode_backoff_kbps, 0,
+            "a climbed-to non-decode backoff must reset the knee reference"
+        );
+        c.on_ack(r2);
         // …so the next flush counts as a FIRST decode event again — still no latch…
-        assert_eq!(
-            c.on_window(ticks(start, 4), 0, 0, None, None, None, 240_000, true, 0),
-            Some(171_500)
-        );
+        climb_to(&mut c, start, &mut t, 460_000);
+        t += 2;
+        let r3 = c
+            .on_window(
+                ticks(start, t),
+                0,
+                0,
+                None,
+                None,
+                None,
+                c.current_kbps,
+                true,
+                0,
+            )
+            .expect("flush must back off");
+        t += 1;
         assert!(c.decode_cap_kbps.is_none());
-        c.on_ack(171_500);
-        // …and two consecutive decode events at DISSIMILAR rates (245 vs 171.5 Mbps — no
+        c.on_ack(r3);
+        // …and two decode events at DISSIMILAR climbed-to rates (~460 vs ~350 Mbps — no
         // common knee) must not latch either.
-        assert_eq!(
-            c.on_window(ticks(start, 6), 0, 0, None, None, None, 170_000, true, 0),
-            Some(120_050)
-        );
+        let dissimilar_target = c.current_kbps + 20_000;
+        climb_to(&mut c, start, &mut t, dissimilar_target);
+        t += 2;
+        let _ = c
+            .on_window(
+                ticks(start, t),
+                0,
+                0,
+                None,
+                None,
+                None,
+                c.current_kbps,
+                true,
+                0,
+            )
+            .expect("flush must back off");
         assert!(c.decode_cap_kbps.is_none());
     }
 
@@ -2082,38 +2218,14 @@ mod tests {
         let mut c = BitrateController::new(500_000);
         c.set_ceiling(900_000);
         let start = Instant::now();
-        for i in 0..4 {
+        let mut t = 0;
+        let knee = latch_knee(&mut c, start, &mut t);
+        // The host parks the session at the knee (an unsolicited re-target up to it — its
+        // clamp is authoritative).
+        c.on_ack(knee);
+        for _ in 0..CAP_REPROBE_WINDOWS_MIN {
             let _ = c.on_window(
-                ticks(start, i),
-                0,
-                0,
-                Some(10_000),
-                Some(8_000),
-                None,
-                2_000,
-                false,
-                0,
-            );
-        }
-        for i in [4, 6] {
-            let _ = c.on_window(
-                ticks(start, i),
-                0,
-                0,
-                Some(10_000),
-                Some(60_000),
-                None,
-                490_000,
-                false,
-                0,
-            );
-        }
-        assert_eq!(c.decode_cap_kbps, Some(500_000 - 500_000 / 16));
-        // The host's ack parks the session at the knee (its clamp is authoritative).
-        c.on_ack(500_000 - 500_000 / 16);
-        for i in 0..CAP_REPROBE_WINDOWS_MIN {
-            let _ = c.on_window(
-                ticks(start, 8 + i),
+                ticks(start, t),
                 0,
                 0,
                 Some(10_000),
@@ -2123,8 +2235,8 @@ mod tests {
                 false,
                 0,
             );
+            t += 1;
         }
-        let knee = 500_000 - 500_000 / 16;
         assert_eq!(c.decode_cap_kbps, Some(knee + knee / 8));
     }
 
@@ -2135,36 +2247,305 @@ mod tests {
         let mut c = BitrateController::new(500_000);
         c.set_ceiling(900_000);
         let start = Instant::now();
-        for i in 0..4 {
-            let _ = c.on_window(
-                ticks(start, i),
-                0,
-                0,
-                Some(10_000),
-                Some(8_000),
-                None,
-                2_000,
-                false,
-                0,
-            );
-        }
-        for i in [4, 6] {
-            let _ = c.on_window(
-                ticks(start, i),
-                0,
-                0,
-                Some(10_000),
-                Some(60_000),
-                None,
-                490_000,
-                false,
-                0,
-            );
-        }
-        assert_eq!(c.decode_cap_kbps, Some(500_000 - 500_000 / 16));
+        let mut t = 0;
+        let _ = latch_knee(&mut c, start, &mut t);
         c.on_mode_switch();
         assert!(c.decode_cap_kbps.is_none());
         assert_eq!(c.ceiling_kbps, 900_000);
+    }
+
+    #[test]
+    fn ordinary_decode_bad_window_pairs_latch_the_knee_field_trace() {
+        // The 2026-08-03 780M field trace, numbers from the log. The knee's most common
+        // presentation is a standing ~26 ms decode rise — deep enough for the ordinary
+        // two-window backoff, below the 45 ms severe tier. Judging evidence from the deciding
+        // window alone read those backoffs as decode-free and RESET the knee streak each
+        // time; the session sawtoothed 220↔450 Mbps for its remaining minutes.
+        let mut c = BitrateController::new(20_000);
+        c.set_ceiling(657_788); // the log's probe ceiling
+        let start = Instant::now();
+        let mut t = 0;
+        for _ in 0..4 {
+            calm_window(&mut c, ticks(start, t));
+            t += 1;
+        }
+        // A single heavy-loss window ends slow start (as the field session's startup hitch
+        // did) so the climb below is the additive one the trace shows.
+        let _ = c.on_window(
+            ticks(start, t),
+            0,
+            HEAVY_LOSS_PPM,
+            Some(10_000),
+            Some(8_000),
+            None,
+            15_000,
+            false,
+            0,
+        );
+        t += 1;
+        // Choke #1 (00:35:56Z): flush + 40 ms decode at ~417 Mbps — evidence, first sample.
+        climb_to(&mut c, start, &mut t, 417_277);
+        let first = c.current_kbps;
+        t += 2;
+        let r1 = c
+            .on_window(
+                ticks(start, t),
+                0,
+                0,
+                Some(8_313),
+                Some(40_087),
+                None,
+                first,
+                true,
+                1,
+            )
+            .expect("flush choke must back off");
+        t += 1;
+        assert!(c.decode_cap_kbps.is_none());
+        assert_eq!(c.decode_backoff_kbps, first);
+        c.on_ack(r1);
+        // Choke #2 (00:36:32Z): TWO consecutive ~26 ms decode-bad windows at ~446 Mbps — the
+        // ordinary two-window path, no flush, nothing severe. This is the backoff the old
+        // evidence gate threw away.
+        climb_to(&mut c, start, &mut t, 440_000);
+        let second = c.current_kbps;
+        t += 2;
+        assert_eq!(
+            c.on_window(
+                ticks(start, t),
+                0,
+                0,
+                Some(6_877),
+                Some(26_474),
+                None,
+                second,
+                false,
+                0
+            ),
+            None,
+            "the first bad window must not decide"
+        );
+        t += 1;
+        assert_eq!(
+            c.on_window(
+                ticks(start, t),
+                0,
+                0,
+                Some(6_877),
+                Some(26_474),
+                None,
+                second,
+                false,
+                0
+            ),
+            Some(((second as u64 * 7 / 10) as u32).max(FLOOR_KBPS))
+        );
+        assert_eq!(
+            c.decode_cap_kbps,
+            Some(second - second / 16),
+            "two decode-bad windows are knee evidence"
+        );
+    }
+
+    #[test]
+    fn cascade_backoffs_neither_sample_nor_erase_the_knee_reference() {
+        // Choke at the knee (reference set), the host acks the ×0.7 within ~100 ms, and the
+        // drain flushes → a second backoff fires at the REDUCED rate. That rate is one the
+        // decoder never choked at while keeping up — the old code overwrote the reference
+        // with it (and could never latch from a cascade at all: ×0.7 sits outside the ±1/8
+        // band by construction). A drain backoff must neither latch nor erase; the eventual
+        // re-climb's choke latches against the ORIGINAL sample.
+        let mut c = BitrateController::new(500_000);
+        c.set_ceiling(900_000);
+        let start = Instant::now();
+        let mut t = 0;
+        for _ in 0..4 {
+            calm_window(&mut c, ticks(start, t));
+            t += 1;
+        }
+        let r1 = choke(&mut c, start, &mut t).expect("knee choke must back off");
+        assert_eq!(c.decode_backoff_kbps, 500_000);
+        c.on_ack(r1);
+        t += 2;
+        let r2 = c
+            .on_window(
+                ticks(start, t),
+                0,
+                0,
+                Some(10_000),
+                Some(43_305),
+                None,
+                r1,
+                true,
+                1,
+            )
+            .expect("drain flush must back off");
+        t += 1;
+        assert!(
+            c.decode_cap_kbps.is_none(),
+            "a drain backoff must not latch"
+        );
+        assert_eq!(
+            c.decode_backoff_kbps, 500_000,
+            "…nor erase the knee reference"
+        );
+        c.on_ack(r2);
+        climb_to(&mut c, start, &mut t, 460_000);
+        let rate = c.current_kbps;
+        choke(&mut c, start, &mut t).expect("re-climb choke must back off");
+        assert_eq!(c.decode_cap_kbps, Some(rate - rate / 16));
+    }
+
+    #[test]
+    fn keyframe_storms_on_a_clean_link_latch_the_knee() {
+        // The Steam Deck presentation of the knee: an overdriven decoder that WEDGES instead
+        // of queueing — decode latency reads absent-to-flat while the client begs for
+        // keyframes with zero loss (the field traces: 14–19 asks at ~300 Mbps, loss_ppm=0).
+        // The asks are the decode evidence.
+        let mut c = BitrateController::new(300_000);
+        c.set_ceiling(900_000);
+        let start = Instant::now();
+        let mut t = 0;
+        for _ in 0..4 {
+            calm_window(&mut c, ticks(start, t));
+            t += 1;
+        }
+        t += 2;
+        let r1 = c
+            .on_window(
+                ticks(start, t),
+                0,
+                0,
+                Some(10_000),
+                None,
+                None,
+                300_000,
+                false,
+                RECOVERY_KF_SEVERE,
+            )
+            .expect("keyframe storm must back off");
+        t += 1;
+        assert!(c.decode_cap_kbps.is_none());
+        c.on_ack(r1);
+        climb_to(&mut c, start, &mut t, 280_000);
+        let rate = c.current_kbps;
+        t += 2;
+        let _ = c
+            .on_window(
+                ticks(start, t),
+                0,
+                0,
+                Some(10_000),
+                None,
+                None,
+                rate,
+                false,
+                RECOVERY_KF_SEVERE,
+            )
+            .expect("second storm must back off");
+        assert_eq!(c.decode_cap_kbps, Some(rate - rate / 16));
+    }
+
+    #[test]
+    fn keyframe_storms_with_real_loss_teach_no_knee() {
+        // The same storm WITH heavy loss is network-attributed (a lost reference forces
+        // recovery asks; loss_ppm already prices that path): it must not latch, and it must
+        // break the streak like any other non-decode backoff.
+        let mut c = BitrateController::new(300_000);
+        c.set_ceiling(900_000);
+        let start = Instant::now();
+        let mut t = 0;
+        for _ in 0..4 {
+            calm_window(&mut c, ticks(start, t));
+            t += 1;
+        }
+        t += 2;
+        let r1 = c
+            .on_window(
+                ticks(start, t),
+                0,
+                0,
+                Some(10_000),
+                None,
+                None,
+                300_000,
+                false,
+                RECOVERY_KF_SEVERE,
+            )
+            .expect("clean storm must back off");
+        t += 1;
+        assert_eq!(c.decode_backoff_kbps, 300_000);
+        c.on_ack(r1);
+        climb_to(&mut c, start, &mut t, 280_000);
+        t += 2;
+        let _ = c
+            .on_window(
+                ticks(start, t),
+                0,
+                SEVERE_LOSS_PPM,
+                Some(10_000),
+                None,
+                None,
+                c.current_kbps,
+                false,
+                RECOVERY_KF_SEVERE,
+            )
+            .expect("lossy storm must back off");
+        assert!(c.decode_cap_kbps.is_none());
+        assert_eq!(
+            c.decode_backoff_kbps, 0,
+            "a loss-attributed storm must reset the knee reference"
+        );
+    }
+
+    #[test]
+    fn a_mixed_streak_without_decode_attribution_is_no_knee_evidence() {
+        // Two bad windows, only ONE decode-flagged (OWD carried the other): the backoff is
+        // not decode-attributed — the reference must reset, not sample.
+        let mut c = BitrateController::new(500_000);
+        c.set_ceiling(900_000);
+        let start = Instant::now();
+        let mut t = 0;
+        for _ in 0..4 {
+            calm_window(&mut c, ticks(start, t));
+            t += 1;
+        }
+        t += 2;
+        assert_eq!(
+            c.on_window(
+                ticks(start, t),
+                0,
+                0,
+                Some(40_000),
+                Some(8_000),
+                None,
+                490_000,
+                false,
+                0
+            ),
+            None,
+            "one OWD-bad window must not decide"
+        );
+        t += 1;
+        assert_eq!(
+            c.on_window(
+                ticks(start, t),
+                0,
+                0,
+                Some(10_000),
+                Some(26_000),
+                None,
+                490_000,
+                false,
+                0
+            ),
+            Some(350_000)
+        );
+        assert!(c.decode_cap_kbps.is_none());
+        assert_eq!(
+            c.decode_backoff_kbps, 0,
+            "a mixed-attribution backoff must reset the knee reference"
+        );
     }
 
     #[test]
