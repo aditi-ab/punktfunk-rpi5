@@ -169,7 +169,27 @@ fn strip_trailing_nul(b: &[u8]) -> &[u8] {
 /// bytes (BITMAPINFOHEADER, 32bpp BGRA, BI_RGB, bottom-up). GIFs contribute their first frame.
 /// `None` when the bytes don't decode — the caller leaves the format unrendered (empty paste).
 pub fn image_to_dib(bytes: &[u8]) -> Option<Vec<u8>> {
-    let img = image::load_from_memory(bytes).ok()?;
+    // Bound the DECODE, not just the result.
+    //
+    // These bytes are client-supplied, and `load_from_memory` used the `image` crate's DEFAULT
+    // limits — 512 MiB of decode allowance — while the 32767 dimension check below only ran on the
+    // already-decoded image. So a small, valid PNG declaring enormous dimensions was allocated in
+    // full before anything rejected it: ~1000× amplification from a few KB of wire (2026-08-05
+    // review L-9). Limits applied here make the allocation refuse instead.
+    //
+    // The caps are the clipboard's own contract expressed up front: the same 32767 per side that
+    // is checked below (a CF_DIB cannot express more), and 256 MiB, which is more than the largest
+    // representable 32bpp image anyone pastes and far less than a memory-exhaustion primitive.
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(32767);
+    limits.max_image_height = Some(32767);
+    limits.max_alloc = Some(256 * 1024 * 1024);
+    let reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?;
+    let mut reader = reader;
+    reader.limits(limits);
+    let img = reader.decode().ok()?;
     let rgba = img.to_rgba8();
     let (w, h) = (rgba.width() as usize, rgba.height() as usize);
     if w == 0 || h == 0 || w > 32767 || h > 32767 {

@@ -13,6 +13,38 @@
 # local-seat operation, not arbitrary unit management.
 set -eu
 
+# The polkit action has to stay permissive (`allow_any=yes`): the host commonly runs as a LINGERING
+# user unit, which has no logind session at all, so polkit classifies it under `allow_any` and any
+# stricter default would make the takeover unauthorizable in its primary deployment. The cost of
+# that is that polkit alone authorizes *every* local subject — a seatless ssh session, a service
+# account — to run this as root (2026-08-05 review L-14).
+#
+# So the authorization decision is made HERE instead, where the caller is knowable: pkexec sets
+# PKEXEC_UID from the authenticated caller, and only a member of the `punktfunk` group (created by
+# the packages) may proceed. That keeps the sessionless host working while making membership of one
+# explicit group — not merely "has a local uid" — the thing that grants these verbs.
+require_authorized_caller() {
+  uid=${PKEXEC_UID:-}
+  [ -n "$uid" ] || {
+    echo "pf-dm-helper: no PKEXEC_UID in the environment — refusing to run unauthenticated" >&2
+    exit 1
+  }
+  user=$(getent passwd "$uid" | cut -d: -f1) || user=
+  [ -n "$user" ] || {
+    echo "pf-dm-helper: PKEXEC_UID $uid resolves to no local user — refusing" >&2
+    exit 1
+  }
+  # `id -nG` lists the primary group too, so a user whose primary group IS punktfunk also passes.
+  for g in $(id -nG "$user" 2>/dev/null); do
+    [ "$g" = punktfunk ] && return 0
+  done
+  echo "pf-dm-helper: user '$user' is not in the 'punktfunk' group — refusing." >&2
+  echo "  Grant it with: sudo usermod -aG punktfunk $user   (then re-login)" >&2
+  exit 1
+}
+
+require_authorized_caller
+
 dm_unit() {
   target=$(readlink /etc/systemd/system/display-manager.service) || {
     echo "pf-dm-helper: no display-manager.service alias — no display manager to manage" >&2
@@ -40,13 +72,9 @@ case "${1-}" in
     # what breaks that dependency (the setup docs already ask for it).
     #
     # The user is NEVER caller-named: PKEXEC_UID is set by pkexec from the authenticated caller,
-    # so this grant enables lingering for that caller alone.
-    uid=${PKEXEC_UID:-}
-    [ -n "$uid" ] || {
-      echo "pf-dm-helper: no PKEXEC_UID in the environment — refusing to guess a user" >&2
-      exit 1
-    }
-    exec loginctl enable-linger "$uid"
+    # so this grant enables lingering for that caller alone. (Its presence is already checked by
+    # `require_authorized_caller` above, which also proved the caller is in the punktfunk group.)
+    exec loginctl enable-linger "${PKEXEC_UID}"
     ;;
   *)
     echo "usage: pf-dm-helper stop|restore|linger" >&2

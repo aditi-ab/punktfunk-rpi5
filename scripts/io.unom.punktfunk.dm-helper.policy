@@ -11,7 +11,14 @@
        grant is scoped to the box's own local-seat session lifecycle — the same class of operation
        these distros already authorize for their session switcher (e.g. Nobara's
        os-session-select, allow_any). allow_any because the host commonly runs sessionless (a
-       lingering user unit, no polkit agent), where interactive auth can never be answered. -->
+       lingering user unit, no polkit agent), where interactive auth can never be answered.
+
+       ⚠ These defaults authorize every local subject — including a seatless ssh session or a
+       service account — so they are NOT the whole authorization story (2026-08-05 review L-14).
+       They cannot be tightened without breaking the lingering-user-unit deployment, which polkit
+       classifies under allow_any precisely because it has no session. The actual gate is in the
+       helper: pf-dm-helper refuses any caller whose PKEXEC_UID is not in the `punktfunk` group.
+       Keep the two in step — loosening the helper's check makes these defaults load-bearing. -->
   <action id="io.unom.punktfunk.dm-helper">
     <description>Stop or restore the display manager for a Punktfunk stream</description>
     <message>Authentication is required to switch the display manager for a Punktfunk stream</message>

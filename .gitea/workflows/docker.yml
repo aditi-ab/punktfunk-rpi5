@@ -20,6 +20,24 @@
 # REGISTRY_TOKEN: repo Actions secret, a PAT with write:package scope (app images only —
 # the LAN registry is unauthenticated inside the LAN).
 #
+# ⚠ OPEN FINDING — security-review-2026-08-05 H-6. That parenthetical is the whole problem.
+# Every secret-bearing job in this repo runs INSIDE an image pulled from this registry by a
+# MUTABLE tag (`:latest`), and the registry accepts pushes from any LAN peer. Attacker position #1
+# of the project's own threat model — an unauthenticated LAN peer — therefore does not need to
+# break any signing logic: they push one tag, and the next android.yml run executes their code in
+# the same job that does `echo "$RELEASE_KEYSTORE_BASE64" | base64 -d > release.jks`. Same shape
+# for rpm.yml (RPM_GPG_PRIVATE_KEY), android-promote.yml (SERVICE_ACCOUNT_JSON), and every other
+# consumer listed by `grep -l 192.168.1.58:5010 .gitea/workflows/`.
+#
+# The fix is two halves and only one of them lives in this repo:
+#   1. INFRA (unom/infra, runners/ci-core/): put auth in front of the registry, or move the
+#      builder images to git.unom.io where pushes are already authenticated.
+#   2. HERE: once pushes are authenticated, pin consumers by `@sha256:` digest rather than
+#      `:latest`, so a compromised push cannot retroactively change what a green run built.
+#      Pinning by tag — including the content-keyed `$KEY` tags below — is NOT sufficient while
+#      the registry is open, because a tag can simply be overwritten.
+# Neither half is done. The content-keying below bounds rebuild churn; it is not a trust boundary.
+#
 # Bootstrap note: consuming workflows pull <LAN>/punktfunk-rust-ci:latest, so the LAN
 # registry must hold a seeded :latest once (done 2026-07-29 from the last Gitea-registry
 # images); after that, this workflow keeps :latest current whenever ci/ changes.

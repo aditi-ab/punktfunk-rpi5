@@ -38,10 +38,18 @@ jobs:
         with:
           fetch-depth: 0
       # Pinned syft (keep in sync with the version validated against this repo; bump deliberately).
+      #
+      # The BINARY version was pinned; the INSTALLER was not — it was fetched from `main` and piped
+      # into a shell, so whatever that branch happened to say at job time ran here, with the job's
+      # environment (2026-08-05 review H-6). Pinning the script to the same tag as the binary makes
+      # the whole step reproducible: bump the tag in both places together.
       - name: Install syft
+        env:
+          SYFT_VERSION: v1.49.0
         run: |
-          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
-            | sh -s -- -b /usr/local/bin v1.49.0
+          set -euo pipefail
+          curl -sSfL "https://raw.githubusercontent.com/anchore/syft/${SYFT_VERSION}/install.sh" \
+            | sh -s -- -b /usr/local/bin "$SYFT_VERSION"
       - name: Generate SBOM
         run: |
           git config --global --add safe.directory "$PWD"

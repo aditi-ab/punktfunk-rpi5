@@ -45,7 +45,14 @@ fn load_or_generate_impl(env_var: &str, file: &str) -> Result<String> {
             return Ok(v.to_string());
         }
     }
-    let path = pf_paths::config_dir().join(file);
+    let dir = pf_paths::config_dir();
+    // Owner-private dir (0700 Unix / DACL-locked Windows) so the token can't leak via the config
+    // path — applied BEFORE the read, not just before the write (2026-08-05 review M-1). Reading an
+    // existing token out of a directory a local user could still write means adopting whatever they
+    // put there: the mgmt token IS full admin on this host, so a planted one is a handed-over
+    // control plane, and it would be honoured for the life of the install.
+    pf_paths::create_private_dir(&dir).with_context(|| format!("create {}", dir.display()))?;
+    let path = dir.join(file);
     if let Ok(contents) = fs::read_to_string(&path) {
         if let Some(tok) = parse_token(&contents, env_var) {
             return Ok(tok);
@@ -54,9 +61,6 @@ fn load_or_generate_impl(env_var: &str, file: &str) -> Result<String> {
     let mut buf = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut buf);
     let token = hex::encode(buf);
-    let dir = pf_paths::config_dir();
-    // Owner-private dir (0700 Unix / DACL-locked Windows) so the token can't leak via the config path.
-    pf_paths::create_private_dir(&dir).with_context(|| format!("create {}", dir.display()))?;
     write_token(&path, env_var, &token)?;
     tracing::info!(path = %path.display(), "generated and persisted API token (owner-only)");
     Ok(token)

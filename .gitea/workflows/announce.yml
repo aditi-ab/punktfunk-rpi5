@@ -41,9 +41,23 @@ jobs:
         env:
           REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
           UPDATE_MANIFEST_KEY: ${{ secrets.UPDATE_MANIFEST_KEY }}
+          # Through the ENVIRONMENT, never interpolated into the script body. A `${{ }}` expansion
+          # is a raw textual substitution performed BEFORE the shell sees the line, so a
+          # workflow_dispatch input containing shell syntax executes as this step — and this is the
+          # step holding UPDATE_MANIFEST_KEY, the Ed25519 key every host pins to decide whether an
+          # update is real (2026-08-05 review H-6). As `$INPUT_TAG` it is only ever data.
+          INPUT_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
-          TAG="${{ inputs.tag }}"
+          TAG="$INPUT_TAG"
+          # Shape-check before the value reaches a URL or a filename: tags are `vX.Y.Z[-suffix]`.
+          case "$TAG" in
+            v[0-9]*) ;;
+            *) echo "refusing to publish for a tag that is not vX.Y.Z: $TAG" >&2; exit 1 ;;
+          esac
+          case "$TAG" in
+            *[!A-Za-z0-9.+_-]*) echo "tag has characters no release tag has: $TAG" >&2; exit 1 ;;
+          esac
           case "$TAG" in
             *-*) echo "pre-release tag $TAG — not publishing to the stable update feed"; exit 0 ;;
           esac
@@ -67,4 +81,7 @@ jobs:
           GITEA_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
           DISCORD_RELEASE_WEBHOOK: ${{ secrets.DISCORD_RELEASE_WEBHOOK }}
           ALLOW_PRERELEASE: ${{ inputs.allow_prerelease }}
-        run: bash scripts/ci/discord-announce.sh "${{ inputs.tag }}"
+          # Same reasoning as the publish step above: the input is data in the environment, never
+          # text spliced into the command line.
+          INPUT_TAG: ${{ inputs.tag }}
+        run: bash scripts/ci/discord-announce.sh "$INPUT_TAG"

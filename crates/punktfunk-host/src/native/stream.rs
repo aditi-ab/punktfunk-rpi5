@@ -1307,7 +1307,7 @@ pub(super) struct SessionContext {
     /// The session's input pipeline (the same channel client datagrams feed) — the stream loop
     /// uses it to PARK the seat pointer on the streamed surface (see [`park_pointer`]).
     #[cfg(target_os = "linux")]
-    pub(super) input_tx: std::sync::mpsc::Sender<super::input::ClientInput>,
+    pub(super) input_tx: std::sync::mpsc::SyncSender<super::input::ClientInput>,
 }
 
 /// Park the seat pointer at the centre of the streamed surface, through the SAME injection path
@@ -1325,7 +1325,7 @@ pub(super) struct SessionContext {
 /// output's edge — pins the pointer to the surface the client actually sees. A desktop-model
 /// client overrides it with its first absolute move, so the jump is invisible in practice.
 #[cfg(target_os = "linux")]
-fn park_pointer(input_tx: &std::sync::mpsc::Sender<super::input::ClientInput>, w: u32, h: u32) {
+fn park_pointer(input_tx: &std::sync::mpsc::SyncSender<super::input::ClientInput>, w: u32, h: u32) {
     let ev = punktfunk_core::input::InputEvent {
         kind: punktfunk_core::input::InputKind::MouseMoveAbs,
         _pad: [0; 3],
@@ -1336,7 +1336,12 @@ fn park_pointer(input_tx: &std::sync::mpsc::Sender<super::input::ClientInput>, w
         // matches the streamed output by exactly these dims.
         flags: (w << 16) | (h & 0xffff),
     };
-    if input_tx.send(super::input::ClientInput::Event(ev)).is_ok() {
+    // `try_send`, matching the bounded input queue (2026-08-05 review M-3): parking is a
+    // best-effort nicety and must never block the stream loop behind a full input backlog.
+    if input_tx
+        .try_send(super::input::ClientInput::Event(ev))
+        .is_ok()
+    {
         tracing::info!(
             w,
             h,

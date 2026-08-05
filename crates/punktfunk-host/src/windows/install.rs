@@ -61,6 +61,22 @@ pub fn driver_main(args: &[String]) -> Result<()> {
 fn driver_install(args: &[String]) -> Result<()> {
     let dir =
         PathBuf::from(flag_val(args, "--dir").context("driver install: --dir <stage> required")?);
+    // Everything below this line runs with the caller's privileges — which, on the installer path,
+    // are SYSTEM/Administrator — and it does three things with the CONTENTS of `dir`: trusts a
+    // `.cer` into the machine `Root` store, runs `nefconc.exe` from it, and stages an `.inf` into
+    // the driver store. So the directory is not merely an input, it is code and trust; a stage a
+    // non-admin can write is a local privilege escalation, whoever passed the flag.
+    //
+    // This is the check the 2026-07-05 audit recorded as FIXED (F-8) and which was never actually
+    // in the tree — re-found by the 2026-08-05 review as H-5, and the payload half of H-4's
+    // plant-then-elevate chain (`PUNKTFUNK_HOST_CMD=driver install --dir C:\Users\attacker\stage`).
+    ensure_admin_only_source(&dir).with_context(|| {
+        format!(
+            "refusing to install drivers from {} — the staging directory must be writable only by \
+             SYSTEM/Administrators",
+            dir.display()
+        )
+    })?;
     let gamepad = flag_present(args, "--gamepad");
     let (what, res) = if gamepad {
         ("gamepad", install_gamepad(&dir))
@@ -72,6 +88,163 @@ fn driver_install(args: &[String]) -> Result<()> {
         eprintln!("warning: {what} driver install: {e:#} (the host degrades without it)");
     }
     Ok(())
+}
+
+/// Refuse a driver staging directory that anyone but SYSTEM/Administrators can write.
+///
+/// Two conditions, both necessary:
+/// - the directory is **owned** by SYSTEM, Administrators, or TrustedInstaller — an owner always
+///   retains `WRITE_DAC`, so a non-admin owner can put their own access back no matter what the
+///   DACL currently says;
+/// - no **allow** ACE grants a write-shaped right to any trustee outside that same set. `CREATOR
+///   OWNER` counts as outside: on a directory a non-admin pre-created under `C:\ProgramData`, it is
+///   precisely what keeps handing them control of everything inside.
+///
+/// Reads the security descriptor directly rather than parsing `icacls` output, which prints
+/// *localized account names* — the same class of locale trap this whole module exists to avoid.
+#[cfg(windows)]
+fn ensure_admin_only_source(dir: &Path) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{LocalFree, HLOCAL};
+    use windows::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
+    use windows::Win32::Security::{
+        EqualSid, GetAce, IsValidSid, ACCESS_ALLOWED_ACE, ACE_HEADER, ACL,
+        DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+    };
+
+    const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+    /// Rights that let a trustee change what we are about to trust and execute: write/append data,
+    /// write attributes/EA, delete (incl. child delete), and the two that let them rewrite the
+    /// security descriptor itself. `GENERIC_WRITE`/`GENERIC_ALL` map onto these once mapped, and
+    /// both generic bits are checked explicitly in case an ACE stores them unmapped.
+    const WRITE_MASK: u32 = 0x0000_0002 // FILE_WRITE_DATA / FILE_ADD_FILE
+        | 0x0000_0004 // FILE_APPEND_DATA / FILE_ADD_SUBDIRECTORY
+        | 0x0000_0010 // FILE_WRITE_EA
+        | 0x0000_0100 // FILE_WRITE_ATTRIBUTES
+        | 0x0000_0040 // FILE_DELETE_CHILD
+        | 0x0001_0000 // DELETE
+        | 0x0004_0000 // WRITE_DAC
+        | 0x0008_0000 // WRITE_OWNER
+        | 0x1000_0000 // GENERIC_ALL
+        | 0x4000_0000; // GENERIC_WRITE
+
+    if !dir.is_dir() {
+        bail!("{} is not a directory", dir.display());
+    }
+    let wide: Vec<u16> = dir
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    let mut owner = PSID::default();
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let mut sd = PSECURITY_DESCRIPTOR::default();
+    // SAFETY: `wide` is NUL-terminated and outlives the call; the out-params are live locals; the
+    // returned descriptor is the single allocation, LocalFree'd below (owner/dacl point into it).
+    let rc = unsafe {
+        GetNamedSecurityInfoW(
+            PCWSTR(wide.as_ptr()),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            Some(&mut owner),
+            None,
+            Some(&mut dacl),
+            None,
+            &mut sd,
+        )
+    };
+
+    let verdict = (|| -> Result<()> {
+        rc.ok().context("GetNamedSecurityInfoW(owner + DACL)")?;
+        let privileged = privileged_sids()?;
+        // SAFETY: `owner` points into the descriptor returned above and is valid for this scope.
+        let is_privileged = |sid: PSID| -> bool {
+            if sid.is_invalid() || !unsafe { IsValidSid(sid) }.as_bool() {
+                return false;
+            }
+            privileged
+                .iter()
+                .any(|p| unsafe { EqualSid(sid, PSID(p.as_ptr().cast_mut().cast())) }.is_ok())
+        };
+
+        if !is_privileged(owner) {
+            bail!(
+                "the directory is owned by a non-administrative account, which retains WRITE_DAC \
+                 and can restore its own access at any time"
+            );
+        }
+        // A NULL DACL grants everyone everything; an absent one is not "no access".
+        if dacl.is_null() {
+            bail!("the directory has a NULL DACL (everyone has full control)");
+        }
+        // SAFETY: `dacl` is a valid ACL inside the descriptor; AceCount bounds the GetAce index.
+        let count = unsafe { (*dacl).AceCount };
+        for i in 0..count as u32 {
+            let mut ace: *mut core::ffi::c_void = std::ptr::null_mut();
+            // SAFETY: i < AceCount, and `ace` is a live out-param.
+            unsafe { GetAce(dacl, i, &mut ace) }.context("GetAce")?;
+            // SAFETY: every ACE starts with an ACE_HEADER.
+            let header = unsafe { *(ace as *const ACE_HEADER) };
+            if header.AceType != ACCESS_ALLOWED_ACE_TYPE {
+                continue; // deny ACEs only ever subtract; audit ACEs grant nothing
+            }
+            // SAFETY: an allow ACE is an ACCESS_ALLOWED_ACE, whose SidStart begins the trustee SID.
+            let allowed = unsafe { &*(ace as *const ACCESS_ALLOWED_ACE) };
+            if allowed.Mask & WRITE_MASK == 0 {
+                continue; // read-only for this trustee — harmless
+            }
+            let sid = PSID(std::ptr::addr_of!(allowed.SidStart) as *mut core::ffi::c_void);
+            if !is_privileged(sid) {
+                bail!(
+                    "a non-administrative trustee has write access (ACE {i}, mask {:#010x}) — \
+                     anything staged here can be replaced before it is trusted or executed",
+                    allowed.Mask
+                );
+            }
+        }
+        Ok(())
+    })();
+
+    // SAFETY: `sd` is the single LocalAlloc'd descriptor GetNamedSecurityInfoW returned.
+    unsafe {
+        let _ = LocalFree(Some(HLOCAL(sd.0)));
+    }
+    verdict
+}
+
+/// The SIDs allowed to own or write a driver staging directory: `SYSTEM`, `BUILTIN\Administrators`,
+/// and `TrustedInstaller` (which owns much of `%ProgramFiles%`, a perfectly good stage).
+#[cfg(windows)]
+fn privileged_sids() -> Result<Vec<Vec<u8>>> {
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{LocalFree, HLOCAL};
+    use windows::Win32::Security::Authorization::ConvertStringSidToSidW;
+    use windows::Win32::Security::{GetLengthSid, PSID};
+
+    [
+        "S-1-5-18",
+        "S-1-5-32-544",
+        "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464",
+    ]
+    .iter()
+    .map(|s| {
+        let wide: Vec<u16> = s.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut psid = PSID::default();
+        // SAFETY: `wide` is NUL-terminated and outlives the call; psid is a live out-param.
+        unsafe { ConvertStringSidToSidW(PCWSTR(wide.as_ptr()), &mut psid) }
+            .with_context(|| format!("ConvertStringSidToSidW({s})"))?;
+        // SAFETY: psid is a valid SID; copy it out so the caller owns plain bytes.
+        let len = unsafe { GetLengthSid(psid) } as usize;
+        let bytes = unsafe { std::slice::from_raw_parts(psid.0 as *const u8, len) }.to_vec();
+        // SAFETY: ConvertStringSidToSidW allocates with LocalAlloc.
+        unsafe {
+            let _ = LocalFree(Some(HLOCAL(psid.0)));
+        }
+        Ok(bytes)
+    })
+    .collect()
 }
 
 /// The subject CN both driver-signing certs carry (`build-pf-vdisplay.ps1` /
@@ -454,7 +627,12 @@ fn web_setup(args: &[String]) -> Result<()> {
         PathBuf::from(flag_val(args, "--app-dir").context("web setup: --app-dir <app> required")?);
     let pw_file = flag_val(args, "--password-file");
     let data_dir = pf_paths::config_dir();
-    std::fs::create_dir_all(&data_dir).ok();
+    // `create_private_dir`, not `create_dir_all`: this runs at install time, before anything else
+    // touches the config dir, and the very next line writes the console login password into it. A
+    // plain `create_dir_all` leaves the inherited `%ProgramData%` ACL, under which BUILTIN\Users may
+    // create files — so the one call that most needs the hardened directory was the one creating it
+    // unhardened (2026-08-05 review H-4).
+    pf_paths::create_private_dir(&data_dir).ok();
 
     // 1. login password
     set_web_password(&data_dir.join("web-password"), pw_file.as_deref());
@@ -477,39 +655,51 @@ fn web_setup(args: &[String]) -> Result<()> {
             server.display()
         );
     }
-    // 4. firewall: inbound TCP 47992. The console serves HTTPS (HTTP/1.1 over TLS) with the host's
-    //    identity cert. (No UDP/HTTP-3: browsers won't use QUIC against a self-signed/no-SAN cert.)
-    //    Scoped to the same profiles as the streaming ports — Domain + Private by default, Public
-    //    only with `--allow-public-network`. Delete any prior rule first so an upgrade re-scopes it
-    //    instead of stacking a second (possibly all-profiles) rule behind the new one.
+    // 4. firewall: inbound TCP 47992 (console) and 47993 (plugin UIs). The console serves HTTPS
+    //    (HTTP/1.1 over TLS) with the host's identity cert. (No UDP/HTTP-3: browsers won't use QUIC
+    //    against a self-signed/no-SAN cert.) Scoped to the same profiles as the streaming ports —
+    //    Domain + Private by default, Public only with `--allow-public-network`. Delete any prior
+    //    rule first so an upgrade re-scopes it instead of stacking a second (possibly all-profiles)
+    //    rule behind the new one.
+    //
+    //    47993 is a SEPARATE ORIGIN, not a second copy of the console: plugin UIs are served there
+    //    precisely so a plugin cannot act as the logged-in operator on the console's origin
+    //    (security-review 2026-08-05 H-3). Same host, same certificate, different port — which is
+    //    what makes it a different origin to the browser while staying same-site for the session
+    //    cookie. Without this rule, plugin interfaces simply do not load from another device.
     let fw_profile =
         crate::service::firewall_profile_arg(crate::service::allow_public_network(args)?);
-    run_quiet(
-        "netsh",
-        &[
-            "advfirewall",
-            "firewall",
-            "delete",
-            "rule",
-            "name=Punktfunk web console (TCP 47992)",
-        ],
-    );
-    if !run_quiet(
-        "netsh",
-        &[
-            "advfirewall",
-            "firewall",
-            "add",
-            "rule",
-            "name=Punktfunk web console (TCP 47992)",
-            "dir=in",
-            "action=allow",
-            "protocol=TCP",
-            "localport=47992",
-            fw_profile,
-        ],
-    ) {
-        eprintln!("warning: could not add the firewall rule for TCP 47992");
+    for (name, port) in [
+        ("Punktfunk web console (TCP 47992)", "47992"),
+        ("Punktfunk plugin UIs (TCP 47993)", "47993"),
+    ] {
+        run_quiet(
+            "netsh",
+            &[
+                "advfirewall",
+                "firewall",
+                "delete",
+                "rule",
+                &format!("name={name}"),
+            ],
+        );
+        if !run_quiet(
+            "netsh",
+            &[
+                "advfirewall",
+                "firewall",
+                "add",
+                "rule",
+                &format!("name={name}"),
+                "dir=in",
+                "action=allow",
+                "protocol=TCP",
+                &format!("localport={port}"),
+                fw_profile,
+            ],
+        ) {
+            eprintln!("warning: could not add the firewall rule for TCP {port}");
+        }
     }
     // No start step: the PunktfunkHost service supervises the console and starts it the moment the
     // host has written the files it needs (mgmt token + identity cert/key) — there is nothing an

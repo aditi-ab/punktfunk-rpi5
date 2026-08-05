@@ -13,6 +13,9 @@ const emptyForm = {
 	header: "",
 	logo: "",
 	command: "",
+	// The console-password confirmation the form requires alongside a launch command; empty here
+	// because the story renders the untouched add form, which has no command yet.
+	password: "",
 	platform: "",
 	description: "",
 	developer: "",
