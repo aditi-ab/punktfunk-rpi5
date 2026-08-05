@@ -69,6 +69,17 @@ export interface StoreEntry {
 	installed_version?: string;
 	update_available: boolean;
 	blocked?: string;
+	/**
+	 * What kind of plugin this is. Browse filters on these, and the Library section's "Add a source"
+	 * rail shows exactly the `library` ones (design D5/D6). Absent on an index that predates them.
+	 */
+	categories?: string[];
+	/**
+	 * Whether the launcher this plugin scans looks installed on this host, from the index's own
+	 * existence probes (design D8). `undefined` = the entry declares no probes for this platform,
+	 * which is "unknown" and must render differently from "not installed".
+	 */
+	detected?: boolean;
 }
 
 export interface StoreCatalog {

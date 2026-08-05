@@ -43,6 +43,13 @@ export {
 	type SyncSettings,
 	type SyncStatus,
 } from "./sync-engine.js";
-export { httpApiEnv, serveUi, type ServeUiOptions } from "./ui-server.js";
+export {
+	deriveConfigJsonSchema,
+	httpApiEnv,
+	makeConfigHandler,
+	serveUi,
+	type ServeUiConfig,
+	type ServeUiOptions,
+} from "./ui-server.js";
 export { sseRoute, type SseRouteOptions } from "./sse.js";
 export { type CliCommand, runPluginCli } from "./cli.js";

@@ -28,6 +28,17 @@ pub struct CustomEntry {
     /// host-assigned `id` stays stable across reconciles. Present iff `provider` is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_id: Option<String>,
+    /// The **store this entry was claimed under** (D2), stamped by a `?store=`-qualified reconcile.
+    /// `None` = an unclaimed provider entry or a manual one, both of which surface as `custom`.
+    ///
+    /// Materialized onto the entry rather than looked up in [`Catalog::claims`] on every read so an
+    /// entry is self-describing: its id and its `store` badge derive from the entry alone, and stay
+    /// correct even while the claim map is being rewritten.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store: Option<String>,
+    /// Whether this entry is a game or the launcher itself — see [`GameRole`].
+    #[serde(default, skip_serializing_if = "GameRole::is_game")]
+    pub role: GameRole,
     /// How to recognize this title's process once it is running (design §9) — the one thing a
     /// provider knows that the host cannot work out for itself.
     ///
@@ -53,6 +64,10 @@ pub struct CustomInput {
     /// Per-title prep/undo steps — commands run as the host user; operator-privileged config.
     #[serde(default)]
     pub prep: Vec<crate::hooks::PrepCmd>,
+    /// Whether this entry is a game or the launcher itself — see [`GameRole`]. A hand-added launcher
+    /// entry is legal (an operator may want a "Steam" tile without installing the steam plugin).
+    #[serde(default)]
+    pub role: GameRole,
     /// How to recognize this title's process — see [`CustomEntry::detect`].
     #[serde(default)]
     pub detect: DetectHint,
@@ -76,6 +91,10 @@ pub struct ProviderEntryInput {
     /// Per-title prep/undo steps — commands run as the host user; operator-privileged config.
     #[serde(default)]
     pub prep: Vec<crate::hooks::PrepCmd>,
+    /// Whether this entry is a game or the launcher itself — see [`GameRole`]. A library plugin
+    /// emits its `launchers(cfg)` entries with `role: "launcher"`.
+    #[serde(default)]
+    pub role: GameRole,
     /// How to recognize this title's process — see [`CustomEntry::detect`]. A provider that knows its
     /// titles' install directories (Playnite does) should send them: it is what lets a game launched
     /// through the provider's own client still end its session when the player quits.
@@ -101,10 +120,13 @@ impl From<CustomEntry> for GameEntry {
             .unwrap_or_default()
             .or_hint(&c.detect);
         GameEntry {
-            id: format!("custom:{}", c.id),
-            store: "custom".into(),
+            id: library_id_for(&c),
+            // A claimed entry wears its store's badge; everything else is `custom`. `provider` rides
+            // along either way, so attribution ("synced by the steam plugin") survives the claim.
+            store: c.store.clone().unwrap_or_else(|| "custom".into()),
             title: c.title,
             art: c.art,
+            role: c.role,
             launch: c.launch,
             provider: c.provider,
             detect,
@@ -122,42 +144,123 @@ fn custom_path() -> PathBuf {
     pf_paths::config_dir().join("library.json")
 }
 
-/// Load the custom entries (empty + non-fatal if the file is absent or malformed).
-pub fn load_custom() -> Vec<CustomEntry> {
+/// The persisted catalog (`library.json` **v2**): the entries plus the store-claim map (D2).
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct Catalog {
+    #[serde(default)]
+    pub entries: Vec<CustomEntry>,
+    /// `store id → provider id`. One provider per store; a second claimant is refused (409).
+    ///
+    /// The map — not the entries — is the authority for a claim, which is exactly why it survives an
+    /// **empty reconcile**: a store the plugin legitimately owns can have zero installed titles, and
+    /// the built-in scanner it suppresses must stay suppressed anyway. Releasing is explicit
+    /// (`DELETE /library/provider/{p}`, or the plugin claiming a different store).
+    #[serde(default)]
+    pub claims: BTreeMap<String, String>,
+}
+
+/// What `library.json` may contain on disk. v1 was a bare array of entries; v2 is the [`Catalog`]
+/// object. Untagged, so an existing v1 file loads unchanged — and the host always WRITES v2, so the
+/// first mutation after an upgrade migrates the file in place with no separate migration step.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum LibraryFile {
+    V2(Catalog),
+    Legacy(Vec<CustomEntry>),
+}
+
+/// Load the whole catalog (default + non-fatal if the file is absent or malformed).
+pub fn load_catalog() -> Catalog {
     match std::fs::read_to_string(custom_path()) {
-        Ok(raw) => serde_json::from_str(&raw).unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "library.json malformed — ignoring custom entries");
-            Vec::new()
-        }),
-        Err(_) => Vec::new(),
+        Ok(raw) => match serde_json::from_str::<LibraryFile>(&raw) {
+            Ok(LibraryFile::V2(c)) => c,
+            Ok(LibraryFile::Legacy(entries)) => Catalog {
+                entries,
+                claims: BTreeMap::new(),
+            },
+            Err(e) => {
+                tracing::warn!(error = %e, "library.json malformed — ignoring custom entries");
+                Catalog::default()
+            }
+        },
+        Err(_) => Catalog::default(),
     }
 }
 
-/// Serve a custom/provider entry's stored **local** art file for one [`ArtKind`] — the non-Steam
-/// branch of the art proxy (`GET /library/art/custom:<id>/<kind>`). `id` is the bare custom id (the
-/// `custom:` prefix already stripped by the handler). `None` if the entry is unknown, has no art of
-/// that kind, or that art value isn't a servable local file (e.g. an `http` URL the client fetches
-/// itself). Blocking IO — call off the async runtime.
-pub fn custom_local_art_bytes(id: &str, kind: ArtKind) -> Option<(Vec<u8>, String)> {
-    let entry = load_custom().into_iter().find(|e| e.id == id)?;
-    let field = match kind {
-        ArtKind::Portrait => entry.art.portrait,
-        ArtKind::Hero => entry.art.hero,
-        ArtKind::Logo => entry.art.logo,
-        ArtKind::Header => entry.art.header,
-    }?;
+/// Load just the entries — the read path every library surface uses.
+pub fn load_custom() -> Vec<CustomEntry> {
+    load_catalog().entries
+}
+
+/// The active store claims (`store → provider`). Read per library scan to suppress the built-in
+/// scanner a plugin has taken over (D2).
+pub fn claimed_stores() -> BTreeMap<String, String> {
+    load_catalog().claims
+}
+
+/// The library id a stored entry surfaces as. **The single source of truth for the mapping** —
+/// [`From<CustomEntry> for GameEntry`] and every id→entry lookup go through it, so the id scheme
+/// can't drift between the catalog, the art proxy and the launch resolver.
+///
+/// A **claimed** entry (D2) gets the deterministic `<store>:<external_id>` its built-in scanner used
+/// to produce — `steam:440`, `heroic:legendary:Quail` — so entry ids, GameStream FNV-1a app ids,
+/// client art caches and Moonlight pins all survive the migration to a plugin untouched. That is the
+/// whole point of the claim: extraction must be invisible to everything downstream. An unclaimed
+/// entry keeps the opaque host-assigned `custom:<id>`.
+pub(crate) fn library_id_for(e: &CustomEntry) -> String {
+    match (e.store.as_deref(), e.external_id.as_deref()) {
+        (Some(store), Some(external)) => format!("{store}:{external}"),
+        _ => format!("custom:{}", e.id),
+    }
+}
+
+/// The **source id** an entry is toggled by (WP2.6): its claimed store when it has one, else its
+/// provider id. `None` for a manual entry — the custom store is not a source and can never be
+/// switched off. Since the claimed store id, the provider id and the old scanner id are all the same
+/// string by construction, a user's existing disabled state carries over verbatim.
+pub(crate) fn source_id_for(e: &CustomEntry) -> Option<&str> {
+    e.store.as_deref().or(e.provider.as_deref())
+}
+
+/// The stored entry a full **library id** refers to, or `None`. The art proxy resolves *any* id this
+/// way before falling back to the legacy per-store branches (WP1.2), which is what lets a plugin's
+/// entries be served regardless of what their ids look like.
+pub fn entry_for_library_id(library_id: &str) -> Option<CustomEntry> {
+    load_custom()
+        .into_iter()
+        .find(|e| library_id_for(e) == library_id)
+}
+
+/// Serve a stored entry's **local** art file for one [`ArtKind`] — the `library.json` branch of the
+/// art proxy (`GET /library/art/<library id>/<kind>`). `None` if the id names no stored entry, it has
+/// no art of that kind, or that art value isn't a servable local file (e.g. an `http` URL the client
+/// fetches itself). Blocking IO — call off the async runtime.
+pub fn library_local_art_bytes(library_id: &str, kind: ArtKind) -> Option<(Vec<u8>, String)> {
+    let field = art_field(&entry_for_library_id(library_id)?.art, kind)?;
     is_local_art_path(&field)
         .then(|| local_art_bytes(&field))
         .flatten()
 }
 
-fn save_custom(entries: &[CustomEntry]) -> Result<()> {
+/// One [`Artwork`] field by kind — the tiny mapping the proxy and the box-art ladder share.
+pub(crate) fn art_field(art: &Artwork, kind: ArtKind) -> Option<String> {
+    match kind {
+        ArtKind::Portrait => art.portrait.clone(),
+        ArtKind::Hero => art.hero.clone(),
+        ArtKind::Logo => art.logo.clone(),
+        ArtKind::Header => art.header.clone(),
+    }
+}
+
+/// Persist the catalog in the **v2** shape (write-then-rename, restrictive perms). Every mutation
+/// path funnels through here, so a v1 file is upgraded by the first write.
+fn save_catalog(catalog: &Catalog) -> Result<()> {
     let dir = pf_paths::config_dir();
     // Owner-private dir (0700 / SYSTEM+Admins DACL) so a non-privileged local user can't plant a
     // library.json whose `prep`/`launch` commands the host would later execute — the same trust
     // boundary hooks.json and the mgmt token already use.
     pf_paths::create_private_dir(&dir).with_context(|| format!("create {}", dir.display()))?;
-    let json = serde_json::to_string_pretty(entries)?;
+    let json = serde_json::to_string_pretty(catalog)?;
     // Write-then-rename so a crash mid-write never truncates the catalog; `write_secret_file` gives
     // the temp file its restrictive perms (0600 / SYSTEM+Admins DACL) before the rename carries them
     // to the final path.
@@ -177,19 +280,26 @@ fn new_id(title: &str) -> String {
     hex::encode(&Sha256::digest(format!("{title}:{nanos}").as_bytes())[..6])
 }
 
-/// Outcome of a manual mutation against an id — distinguishes "no such entry" from "exists,
-/// but a provider owns it" (the mgmt layer maps the latter to 409, not 404).
+/// Outcome of a mutation — distinguishes "no such entry" from the two conflict cases the mgmt
+/// layer maps to 409 rather than 404.
 pub enum MutateOutcome<T> {
     Done(T),
     NotFound,
     /// The entry belongs to this provider — mutate it through the provider reconcile API
     /// (or remove the whole provider set); manual edits would be clobbered at the next sync.
     ProviderOwned(String),
+    /// The requested store claim is already held by a DIFFERENT provider (D2: one provider per
+    /// store). Refusing is the point — two plugins both emitting `steam:440` would collide on entry
+    /// ids, so the second claimant is told who holds it instead of silently taking over.
+    StoreClaimed {
+        store: String,
+        provider: String,
+    },
 }
 
 /// Create a custom (manual) entry, returning it with its assigned id.
 pub fn add_custom(input: CustomInput) -> Result<CustomEntry> {
-    let mut entries = load_custom();
+    let mut catalog = load_catalog();
     let entry = CustomEntry {
         id: new_id(&input.title),
         title: input.title,
@@ -198,11 +308,13 @@ pub fn add_custom(input: CustomInput) -> Result<CustomEntry> {
         prep: input.prep,
         provider: None,
         external_id: None,
+        store: None,
+        role: input.role,
         detect: input.detect,
         meta: input.meta,
     };
-    entries.push(entry.clone());
-    save_custom(&entries)?;
+    catalog.entries.push(entry.clone());
+    save_catalog(&catalog)?;
     emit_changed("manual");
     Ok(entry)
 }
@@ -210,8 +322,8 @@ pub fn add_custom(input: CustomInput) -> Result<CustomEntry> {
 /// Replace a manual entry's fields (id preserved). Provider-owned entries are refused —
 /// their state belongs to the provider's reconcile (RFC §8 ownership rule).
 pub fn update_custom(id: &str, input: CustomInput) -> Result<MutateOutcome<CustomEntry>> {
-    let mut entries = load_custom();
-    let Some(slot) = entries.iter_mut().find(|e| e.id == id) else {
+    let mut catalog = load_catalog();
+    let Some(slot) = catalog.entries.iter_mut().find(|e| e.id == id) else {
         return Ok(MutateOutcome::NotFound);
     };
     if let Some(provider) = &slot.provider {
@@ -221,25 +333,26 @@ pub fn update_custom(id: &str, input: CustomInput) -> Result<MutateOutcome<Custo
     slot.art = input.art;
     slot.launch = input.launch;
     slot.prep = input.prep;
+    slot.role = input.role;
     slot.detect = input.detect;
     slot.meta = input.meta;
     let updated = slot.clone();
-    save_custom(&entries)?;
+    save_catalog(&catalog)?;
     emit_changed("manual");
     Ok(MutateOutcome::Done(updated))
 }
 
 /// Delete a manual entry. Provider-owned entries are refused (see [`update_custom`]).
 pub fn delete_custom(id: &str) -> Result<MutateOutcome<()>> {
-    let mut entries = load_custom();
-    let Some(entry) = entries.iter().find(|e| e.id == id) else {
+    let mut catalog = load_catalog();
+    let Some(entry) = catalog.entries.iter().find(|e| e.id == id) else {
         return Ok(MutateOutcome::NotFound);
     };
     if let Some(provider) = &entry.provider {
         return Ok(MutateOutcome::ProviderOwned(provider.clone()));
     }
-    entries.retain(|e| e.id != id);
-    save_custom(&entries)?;
+    catalog.entries.retain(|e| e.id != id);
+    save_catalog(&catalog)?;
     emit_changed("manual");
     Ok(MutateOutcome::Done(()))
 }
@@ -258,7 +371,8 @@ pub fn delete_custom(id: &str) -> Result<MutateOutcome<()>> {
 /// copies of the very primitive the `/hooks` carve-out exists to withhold.
 ///
 /// Returns the field name for the error message, so a plugin author sees exactly what was refused.
-/// The other launch kinds (`steam_appid`, `epic`, `gog`, `aumid`, `lutris_id`, `heroic`) are all
+/// The other launch kinds (`steam_appid`, `steam_ui`, `launcher_ui`, `epic`, `gog`, `aumid`,
+/// `lutris_id`, `heroic`) are all
 /// host-resolved from a validated id and stay open to every lane — a provider plugin can still
 /// publish its whole catalogue, it just cannot hand the host a shell command to run.
 pub fn privileged_field(
@@ -293,6 +407,26 @@ pub fn validate_provider_name(provider: &str) -> Result<(), String> {
     }
 }
 
+/// Store claims become the **prefix of every claimed entry's library id**, so they are far more
+/// constrained than a provider name: no dots (an id is split on the first `:`, and a dotted store
+/// would read as a hostname in logs), and the two host-owned namespaces are off-limits — `custom` is
+/// the unclaimed-entry namespace and `manual` is the no-provider sentinel in `library.changed`.
+pub fn validate_store_claim(store: &str) -> Result<(), String> {
+    if store == "custom" || store == "manual" {
+        return Err(format!("store id `{store}` is reserved"));
+    }
+    let ok = !store.is_empty()
+        && store.len() <= 32
+        && store
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'-' | b'_'));
+    if ok {
+        Ok(())
+    } else {
+        Err("store id must be 1–32 chars of [a-z0-9_-]".into())
+    }
+}
+
 /// Validate a reconcile payload: non-empty titles and unique, non-empty external ids (the
 /// diff key — a duplicate would make ownership of the surviving entry ambiguous).
 pub fn validate_provider_payload(inputs: &[ProviderEntryInput]) -> Result<(), String> {
@@ -310,6 +444,40 @@ pub fn validate_provider_payload(inputs: &[ProviderEntryInput]) -> Result<(), St
                 e.external_id
             ));
         }
+        // Closed-vocabulary launch kinds are checked on the way IN as well as at launch time, so a
+        // plugin gets a 400 it can act on rather than a tile that silently refuses to start.
+        if let Some(launch) = &e.launch {
+            if launch.kind == "steam_ui" && !valid_steam_ui(&launch.value) {
+                return Err(format!(
+                    "entries[{i}]: `launch.value` for kind `steam_ui` must be `bigpicture` or `desktop`"
+                ));
+            }
+            // Refused rather than silently accepted, because the failure is otherwise invisible
+            // until a user clicks the tile: an unresolvable value yields no command at launch time.
+            if launch.kind == "launcher_ui" && !valid_launcher_ui(&launch.value) {
+                return Err(format!(
+                    "entries[{i}]: `launch.value` for kind `launcher_ui` names a launcher this host \
+                     cannot open (`{}`)",
+                    launch.value
+                ));
+            }
+        }
+        if let Some(marker) = &e.detect.env_marker {
+            if !valid_env_key(&marker.key) {
+                return Err(format!(
+                    "entries[{i}]: `detect.env_marker.key` must be 1–64 chars of [A-Za-z0-9_]"
+                ));
+            }
+            if marker
+                .value
+                .as_ref()
+                .is_some_and(|v| v.len() > MAX_ENV_VALUE)
+            {
+                return Err(format!(
+                    "entries[{i}]: `detect.env_marker.value` must be at most {MAX_ENV_VALUE} chars"
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -321,6 +489,7 @@ pub fn validate_provider_payload(inputs: &[ProviderEntryInput]) -> Result<(), St
 fn reconcile_entries(
     entries: &mut Vec<CustomEntry>,
     provider: &str,
+    store: Option<&str>,
     inputs: Vec<ProviderEntryInput>,
 ) -> Vec<CustomEntry> {
     // The provider's current entries, keyed by its own stable id.
@@ -345,6 +514,10 @@ fn reconcile_entries(
             prep: input.prep,
             provider: Some(provider.to_string()),
             external_id: Some(input.external_id),
+            // Stamping the claim per entry is what makes the surfaced id deterministic
+            // (`<store>:<external_id>`) — see `library_id_for`.
+            store: store.map(str::to_string),
+            role: input.role,
             detect: input.detect,
             meta: input.meta,
         });
@@ -354,43 +527,86 @@ fn reconcile_entries(
     result
 }
 
-/// Atomically replace `provider`'s entry set (RFC §8: `PUT /library/provider/{provider}`).
-/// The caller validates the name and payload first. Emits `library.changed` with the provider
-/// as the source.
+/// Atomically replace `provider`'s entry set (RFC §8: `PUT /library/provider/{provider}`), optionally
+/// under a **store claim** (D2: `?store=steam`). The caller validates the name and payload first.
+/// Emits `library.changed` with the provider as the source.
+///
+/// Claiming is idempotent for the holder and refused for anyone else. A provider holds at most one
+/// store, so claiming a new one releases whatever it held before — otherwise an abandoned claim would
+/// go on suppressing a built-in scanner with nothing to replace it.
 pub fn reconcile_provider(
     provider: &str,
+    store: Option<&str>,
     inputs: Vec<ProviderEntryInput>,
-) -> Result<Vec<CustomEntry>> {
-    let mut entries = load_custom();
-    let result = reconcile_entries(&mut entries, provider, inputs);
-    save_custom(&entries)?;
+) -> Result<MutateOutcome<Vec<CustomEntry>>> {
+    let mut catalog = load_catalog();
+    if let Some(store) = store {
+        if let Some(holder) = catalog.claims.get(store) {
+            if holder != provider {
+                return Ok(MutateOutcome::StoreClaimed {
+                    store: store.to_string(),
+                    provider: holder.clone(),
+                });
+            }
+        }
+        let previous: Vec<String> = catalog
+            .claims
+            .iter()
+            .filter(|(s, p)| p.as_str() == provider && s.as_str() != store)
+            .map(|(s, _)| s.clone())
+            .collect();
+        for stale in previous {
+            tracing::info!(provider, released = %stale, claimed = store, "library: provider moved its store claim");
+            catalog.claims.remove(&stale);
+        }
+        if catalog
+            .claims
+            .insert(store.to_string(), provider.to_string())
+            .is_none()
+        {
+            tracing::info!(provider, store, "library: store claimed by a provider");
+        }
+    }
+    let result = reconcile_entries(&mut catalog.entries, provider, store, inputs);
+    save_catalog(&catalog)?;
     emit_changed(provider);
-    Ok(result)
+    Ok(MutateOutcome::Done(result))
 }
 
-/// Remove every entry of `provider` (RFC §8: `DELETE /library/provider/{provider}` — the
-/// clean-uninstall path). Returns how many were removed; no event when nothing was.
+/// Remove every entry of `provider` **and release its store claim** (RFC §8:
+/// `DELETE /library/provider/{provider}` — the clean-uninstall path). Returns how many entries were
+/// removed; no event when nothing changed at all.
+///
+/// Releasing here — and only here — is what makes uninstalling a library plugin bring its built-in
+/// scanner straight back, with no restart and nothing to undo by hand.
 pub fn delete_provider(provider: &str) -> Result<usize> {
-    let mut entries = load_custom();
-    let before = entries.len();
-    entries.retain(|e| e.provider.as_deref() != Some(provider));
-    let removed = before - entries.len();
-    if removed > 0 {
-        save_custom(&entries)?;
+    let mut catalog = load_catalog();
+    let before = catalog.entries.len();
+    catalog
+        .entries
+        .retain(|e| e.provider.as_deref() != Some(provider));
+    let removed = before - catalog.entries.len();
+    let claims_before = catalog.claims.len();
+    catalog.claims.retain(|_, p| p != provider);
+    let released = claims_before - catalog.claims.len();
+    if removed > 0 || released > 0 {
+        if released > 0 {
+            tracing::info!(provider, released, "library: store claim released");
+        }
+        save_catalog(&catalog)?;
         emit_changed(provider);
     }
     Ok(removed)
 }
 
-/// The prep/undo steps for a library id — `custom:<id>` entries only (the other stores have no
+/// The prep/undo steps for a library id — any **stored** entry (the in-host scanners have no
 /// per-title config surface; a GameStream `apps.json` entry carries its own `prep` instead).
+///
+/// Resolved through [`entry_for_library_id`] rather than by stripping a `custom:` prefix, so a
+/// claimed entry's prep still runs: after extraction a `steam:440` entry is a stored one, and
+/// per-title prep is exactly the kind of thing an operator sets on a game they play.
 pub fn prep_for(library_id: &str) -> Vec<crate::hooks::PrepCmd> {
-    let Some(id) = library_id.strip_prefix("custom:") else {
-        return Vec::new();
-    };
-    load_custom()
-        .into_iter()
-        .find(|e| e.id == id)
+    entry_for_library_id(library_id)
         .map(|e| e.prep)
         .unwrap_or_default()
 }
@@ -403,13 +619,7 @@ fn emit_changed(source: &str) {
     });
 }
 
-/// A digits-only Steam appid: the sole client-influenced part of a Steam launch, validated before it
-/// is interpolated into any command / URI (so a client-sent id can never carry shell or URI syntax).
-/// Cross-platform — used by the Linux shell mapping ([`command_for`]) and the Windows spawn mapping
-/// ([`windows_launch_for`]).
-pub(crate) fn valid_steam_appid(value: &str) -> bool {
-    !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit())
-}
+// `valid_steam_appid` moved to `launch.rs` (WP1.1) — it validates a launch value, not a store entry.
 
 #[cfg(test)]
 mod tests {
@@ -424,6 +634,8 @@ mod tests {
             prep: Vec::new(),
             provider: None,
             external_id: None,
+            store: None,
+            role: GameRole::Game,
             detect: DetectHint::default(),
             meta: GameMeta::default(),
         }
@@ -436,6 +648,7 @@ mod tests {
             art: Artwork::default(),
             launch: None,
             prep: Vec::new(),
+            role: GameRole::Game,
             detect: DetectHint::default(),
             meta: GameMeta::default(),
         }
@@ -455,6 +668,79 @@ mod tests {
         let g: GameEntry = e.into();
         assert_eq!(g.provider.as_deref(), Some("romm"));
         assert_eq!(g.meta.platform.as_deref(), Some("PS2"));
+    }
+
+    /// D2's core promise: a **claimed** entry is indistinguishable from what the built-in scanner
+    /// produced. Same id, same store badge — plus the provider attribution the scanner never had.
+    #[test]
+    fn a_claimed_entry_reproduces_the_scanner_identity() {
+        let mut e = manual("host-assigned", "Portal 2");
+        e.provider = Some("steam".into());
+        e.external_id = Some("620".into());
+        e.store = Some("steam".into());
+        assert_eq!(library_id_for(&e), "steam:620");
+        let g: GameEntry = e.clone().into();
+        assert_eq!(g.id, "steam:620", "exactly what the scanner emitted");
+        assert_eq!(g.store, "steam", "the store badge, not `custom`");
+        assert_eq!(
+            g.provider.as_deref(),
+            Some("steam"),
+            "attribution rides along too"
+        );
+
+        // Unclaimed provider entries are untouched by any of this — rom-manager/playnite keep the
+        // opaque host id they have always had.
+        let mut u = manual("abc", "Chrono Trigger");
+        u.provider = Some("romm".into());
+        u.external_id = Some("rom-1".into());
+        assert_eq!(library_id_for(&u), "custom:abc");
+        assert_eq!(GameEntry::from(u).store, "custom");
+
+        // The source a toggle addresses: the claimed store when there is one, else the provider.
+        assert_eq!(source_id_for(&e), Some("steam"));
+        let mut r = manual("z", "T");
+        r.provider = Some("romm".into());
+        assert_eq!(source_id_for(&r), Some("romm"));
+        assert_eq!(
+            source_id_for(&manual("m", "Manual")),
+            None,
+            "never hideable"
+        );
+    }
+
+    /// A claimed entry keeps its `<store>:<external_id>` id across reconciles no matter what the
+    /// host-assigned id does — which is what keeps GameStream's FNV-1a app ids, client art caches
+    /// and Moonlight pins valid through the migration (the whole point of D2).
+    #[test]
+    fn claimed_ids_are_deterministic_across_reconciles() {
+        let mut entries = Vec::new();
+        let r1 = reconcile_entries(
+            &mut entries,
+            "steam",
+            Some("steam"),
+            vec![input("440", "Team Fortress 2"), input("620", "Portal 2")],
+        );
+        let ids: Vec<String> = r1.iter().map(library_id_for).collect();
+        assert_eq!(ids, ["steam:440", "steam:620"]);
+
+        // Re-sync with a renamed title and a new entry: the surfaced ids for surviving titles are
+        // byte-identical, and a brand-new title's id is derived, not random.
+        let r2 = reconcile_entries(
+            &mut entries,
+            "steam",
+            Some("steam"),
+            vec![
+                input("440", "Team Fortress 2 (2026)"),
+                input("70", "Half-Life"),
+            ],
+        );
+        let ids2: Vec<String> = r2.iter().map(library_id_for).collect();
+        assert_eq!(ids2, ["steam:440", "steam:70"]);
+
+        // Dropping the claim on a later reconcile reverts them to opaque custom ids — the entries
+        // are the same rows, so this is exactly the "plugin stopped claiming" degradation.
+        let r3 = reconcile_entries(&mut entries, "steam", None, vec![input("440", "TF2")]);
+        assert!(library_id_for(&r3[0]).starts_with("custom:"));
     }
 
     /// The metadata contract on the wire and on disk: fields serialize FLAT (no `meta` nesting —
@@ -505,6 +791,7 @@ mod tests {
         let r1 = reconcile_entries(
             &mut entries,
             "romm",
+            None,
             vec![input("rom-a", "Game A"), input("rom-b", "Game B")],
         );
         assert_eq!(r1.len(), 2);
@@ -516,6 +803,7 @@ mod tests {
         let r2 = reconcile_entries(
             &mut entries,
             "romm",
+            None,
             vec![input("rom-a", "Game A (v2)"), input("rom-c", "Game C")],
         );
         assert_eq!(r2.len(), 2);
@@ -534,6 +822,7 @@ mod tests {
         let r3 = reconcile_entries(
             &mut entries,
             "romm",
+            None,
             vec![input("rom-a", "Game A (v2)"), input("rom-c", "Game C")],
         );
         assert_eq!(
@@ -554,12 +843,104 @@ mod tests {
             .any(|e| e.id == "oth1" && e.provider.as_deref() == Some("itch")));
 
         // Empty payload = remove everything the provider owns (same as DELETE).
-        let r4 = reconcile_entries(&mut entries, "romm", Vec::new());
+        let r4 = reconcile_entries(&mut entries, "romm", None, Vec::new());
         assert!(r4.is_empty());
         assert_eq!(
             entries.len(),
             2,
             "only the manual + other-provider entries remain"
+        );
+    }
+
+    /// `library.json` v1 (a bare array) must keep loading, and v2 (the claims object) must round
+    /// trip. This is the only migration in the whole program — get it wrong and an existing host
+    /// silently loses its manual entries on upgrade.
+    #[test]
+    fn v1_and_v2_library_files_both_load() {
+        // v1: exactly what a shipped host has on disk today.
+        let v1 = r#"[{"id":"abc","title":"Old Manual"}]"#;
+        let c = match serde_json::from_str::<LibraryFile>(v1).unwrap() {
+            LibraryFile::Legacy(entries) => Catalog {
+                entries,
+                claims: BTreeMap::new(),
+            },
+            LibraryFile::V2(_) => panic!("an array must not parse as v2"),
+        };
+        assert_eq!(c.entries.len(), 1);
+        assert_eq!(c.entries[0].title, "Old Manual");
+        assert!(c.claims.is_empty());
+
+        // v2, including a claim.
+        let v2 = r#"{"entries":[{"id":"abc","title":"New"}],"claims":{"steam":"steam"}}"#;
+        let c = match serde_json::from_str::<LibraryFile>(v2).unwrap() {
+            LibraryFile::V2(c) => c,
+            LibraryFile::Legacy(_) => panic!("an object must not parse as v1"),
+        };
+        assert_eq!(c.entries.len(), 1);
+        assert_eq!(c.claims.get("steam").map(String::as_str), Some("steam"));
+
+        // A v2 file with no claims key at all (what the first write after upgrade produces before
+        // anything is claimed) still loads.
+        let bare = r#"{"entries":[]}"#;
+        assert!(matches!(
+            serde_json::from_str::<LibraryFile>(bare).unwrap(),
+            LibraryFile::V2(_)
+        ));
+
+        // And what we WRITE is v2, so one mutation upgrades the file in place.
+        let written = serde_json::to_string(&Catalog::default()).unwrap();
+        assert!(written.contains("\"entries\""));
+        assert!(written.contains("\"claims\""));
+    }
+
+    #[test]
+    fn store_claim_validation() {
+        assert!(validate_store_claim("steam").is_ok());
+        assert!(validate_store_claim("epic-games").is_ok());
+        assert!(validate_store_claim("xbox_pc").is_ok());
+        // The two host-owned namespaces are off-limits.
+        assert!(validate_store_claim("custom").is_err());
+        assert!(validate_store_claim("manual").is_err());
+        assert!(validate_store_claim("").is_err());
+        assert!(validate_store_claim("Steam").is_err()); // no uppercase
+                                                         // A dot would read as a hostname in a log line and muddies the `store:id` split.
+        assert!(validate_store_claim("my.store").is_err());
+        assert!(validate_store_claim(&"s".repeat(33)).is_err());
+    }
+
+    /// The closed-vocabulary fields are rejected at the door, so a plugin gets a 400 rather than a
+    /// tile that silently refuses to launch.
+    #[test]
+    fn payload_validation_covers_the_new_closed_vocabularies() {
+        let with_launch = |kind: &str, value: &str| {
+            let mut i = input("a", "A");
+            i.launch = Some(LaunchSpec {
+                kind: kind.into(),
+                value: value.into(),
+            });
+            i
+        };
+        assert!(validate_provider_payload(&[with_launch("steam_ui", "bigpicture")]).is_ok());
+        assert!(validate_provider_payload(&[with_launch("steam_ui", "desktop")]).is_ok());
+        assert!(validate_provider_payload(&[with_launch("steam_ui", "gamepad")]).is_err());
+        assert!(validate_provider_payload(&[with_launch("steam_ui", "")]).is_err());
+        // Other kinds are unconstrained here (the host validates them per-kind at launch).
+        assert!(validate_provider_payload(&[with_launch("command", "anything")]).is_ok());
+
+        let with_env = |key: &str, value: Option<&str>| {
+            let mut i = input("a", "A");
+            i.detect.env_marker = Some(EnvMarker {
+                key: key.into(),
+                value: value.map(str::to_string),
+            });
+            i
+        };
+        assert!(validate_provider_payload(&[with_env("HEROIC_APP_NAME", Some("Quail"))]).is_ok());
+        assert!(validate_provider_payload(&[with_env("BAD-KEY", None)]).is_err());
+        assert!(validate_provider_payload(&[with_env("", None)]).is_err());
+        assert!(
+            validate_provider_payload(&[with_env("K", Some(&"x".repeat(MAX_ENV_VALUE + 1)))])
+                .is_err()
         );
     }
 

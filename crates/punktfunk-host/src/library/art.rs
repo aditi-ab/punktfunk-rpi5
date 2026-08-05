@@ -147,17 +147,82 @@ pub(crate) fn fetch_image(url: &str) -> Option<(Vec<u8>, String)> {
 
 /// A stored [`Artwork`] value that is a **local filesystem path** to an image on the host — as
 /// opposed to an `http(s)`/`data:` URL or an already-relative host proxy path. Provider plugins that
-/// run on the host (e.g. the Playnite sync plugin) set these: the reconcile payload stays tiny
-/// (paths, not inlined bytes, so it scales to thousands of titles) and the host serves the bytes
-/// through the art proxy, exactly like Steam's cache art. Windows-shaped only (`C:\…`, `C:/…`, or a
-/// `\\server\share` UNC) — Playnite, the only local-art provider, is Windows-only, and this keeps the
-/// check from ever mistaking the `/api/…` proxy path (or a POSIX abs path) for a local file.
+/// run on the host (the Playnite sync plugin, and every library scanner plugin) set these: the
+/// reconcile payload stays tiny (paths, not inlined bytes, so it scales to thousands of titles) and
+/// the host serves the bytes through the art proxy, exactly like Steam's cache art.
+///
+/// Four accepted shapes:
+/// * `file://…` — the **documented plugin contract** ([`file_url_to_path`]), unambiguous on every
+///   platform, and what `@punktfunk/plugin-kit/library` emits.
+/// * `C:\…` / `C:/…` drive-absolute and `\\server\share` UNC — Windows bare paths, kept for
+///   Playnite back-compat (it predates the `file://` contract).
+/// * POSIX absolute (`/home/u/covers/x.jpg`) — Lutris covers and Steam's `librarycache`.
+///
+/// The POSIX widening is why the two `/`-leading shapes the **host itself emits** must be excluded
+/// explicitly: its own art-proxy path (`/api/v1/library/art/…`, which [`proxy_local_art`] writes and
+/// which must survive a second pass unchanged) and a protocol-relative URL (`//cdn/…`, what GOG's and
+/// Microsoft's catalogs return — see [`abs_url`]). Mistaking either for a file would break the proxy
+/// round-trip or silently drop CDN art.
 pub fn is_local_art_path(v: &str) -> bool {
     if v.starts_with("http://") || v.starts_with("https://") || v.starts_with("data:") {
         return false;
     }
+    if v.starts_with("file://") {
+        return true;
+    }
     let b = v.as_bytes();
-    (b.len() >= 3 && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/')) || v.starts_with("\\\\")
+    // Windows drive-absolute (`C:\…`, `C:/…`) or UNC (`\\server\share`).
+    if (b.len() >= 3 && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/')) || v.starts_with("\\\\") {
+        return true;
+    }
+    // POSIX absolute, minus the host's own `/`-leading shapes (see the doc comment).
+    v.starts_with('/') && !v.starts_with("//") && !v.starts_with("/api/")
+}
+
+/// Turn a `file://` art value into a plain filesystem path, percent-decoding it. The kit emits
+/// properly encoded URLs (`file:///home/u/My%20Cover.jpg`); a raw path that happens to contain no
+/// `%` round-trips either way, which keeps hand-written plugin payloads working.
+///
+/// `file:///home/u/c.jpg` → `/home/u/c.jpg`; `file:///C:/covers/c.jpg` → `C:/covers/c.jpg` (Windows
+/// drive letters arrive after the empty authority's slash); a NON-empty authority
+/// (`file://nas/share/c.jpg`) is a UNC reference → `\\nas\share\c.jpg`. Anything without the prefix
+/// is returned untouched.
+fn file_url_to_path(v: &str) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
+    let Some(rest) = v.strip_prefix("file://") else {
+        return Cow::Borrowed(v);
+    };
+    let decoded = percent_decode(rest);
+    match decoded.strip_prefix('/') {
+        // `file:///…` — the empty-authority form. A Windows drive letter (`/C:/…`) loses the slash;
+        // a POSIX path keeps it.
+        Some(after) if after.as_bytes().get(1) == Some(&b':') => Cow::Owned(after.to_string()),
+        Some(_) => Cow::Owned(decoded),
+        // `file://server/share/…` — a UNC path in URL clothing.
+        None => Cow::Owned(format!("\\\\{}", decoded.replace('/', "\\"))),
+    }
+}
+
+/// Percent-decode `%XX` escapes. Invalid escapes are left verbatim (a bare `%` in a real path is far
+/// likelier than a malformed URL from our own kit), and the result is only ever used as a path that
+/// must then exist as a regular file — so a wrong decode degrades to "no art", never to a wrong read.
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            let hex = |c: u8| (c as char).to_digit(16);
+            if let (Some(hi), Some(lo)) = (hex(b[i + 1]), hex(b[i + 2])) {
+                out.push((hi * 16 + lo) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|_| s.to_string())
 }
 
 /// The filesystem roots the art proxy is allowed to read from.
@@ -190,6 +255,29 @@ fn art_roots() -> Vec<PathBuf> {
     if roots.is_empty() {
         if let Some(drive) = std::env::var_os("SystemDrive") {
             roots.push(PathBuf::from(drive).join("Users"));
+        }
+    }
+    // POSIX: the user's home, which is the exact analogue of the Windows users base above — and
+    // where every launcher this host reads art from actually keeps it. Steam's
+    // `appcache/librarycache` and `userdata/<id>/config/grid`, Lutris's `coverart`/`banners` (both
+    // the `~/.local/share` and `~/.cache` copies), Heroic's caches, and all three Flatpak
+    // `~/.var/app/…` variants are under it.
+    //
+    // Needed because `is_local_art_path` now classifies POSIX absolute paths as local art (the
+    // extracted Lutris/Steam plugins emit them). Before that widening this list was legitimately
+    // empty here: the only local-art provider was Playnite, which is Windows-only, so nothing on a
+    // POSIX host was ever classified local and the confinement had nothing to confine. Leaving it
+    // empty now would not be "secure by default" — it would silently serve no plugin art at all.
+    //
+    // Breadth matches what Windows already ships, and it is not the load-bearing control: a value
+    // still has to carry an image extension, canonicalize to a real regular file inside a root,
+    // sit outside the host config dir, and CONTAIN image bytes. `PUNKTFUNK_LIBRARY_ART_ROOTS`
+    // narrows or relocates this for a library that lives elsewhere.
+    #[cfg(not(windows))]
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = PathBuf::from(home);
+        if !home.as_os_str().is_empty() {
+            roots.push(home);
         }
     }
     roots
@@ -306,15 +394,20 @@ pub fn validate_art_paths(art: &Artwork) -> Result<(), String> {
 ///
 /// This is the single place local art bytes are read — the mgmt art proxy and the GameStream
 /// `/appasset` proxy both land here — so the confinement holds for every caller.
+///
+/// A `file://` value is converted to a path FIRST ([`file_url_to_path`]), so the confinement check
+/// and the read see the same decoded path. Ordering matters: percent-decoding before
+/// canonicalization is what stops a `%2e%2e` escape being invisible to the traversal check.
 pub fn local_art_bytes(path: &str) -> Option<(Vec<u8>, String)> {
-    if !art_path_is_servable(path) {
+    let path = file_url_to_path(path);
+    if !art_path_is_servable(&path) {
         tracing::debug!(
-            path,
+            path = %path,
             "art proxy: refusing a path outside the allowed art roots"
         );
         return None;
     }
-    let p = std::path::Path::new(path);
+    let p = std::path::Path::new(&*path);
     let meta = std::fs::metadata(p).ok()?;
     if !meta.is_file() || meta.len() == 0 || meta.len() > 16 * 1024 * 1024 {
         return None;
@@ -358,9 +451,22 @@ pub fn proxy_local_art(id: &str, art: &mut Artwork) {
 /// `(bytes, content-type)`. Resolves the id against the host's OWN library. Blocking — call off the
 /// async runtime (e.g. `spawn_blocking`).
 pub fn fetch_box_art(id: &str) -> Option<(Vec<u8>, String)> {
-    // Steam's `Artwork` fields are now relative proxy paths (see `steam_art`) the *client* resolves
-    // against the host — meaningless to `fetch_image`, which expects an absolute URL. Resolve
-    // those kinds directly instead of going through the URL fields.
+    // Same resolution order as the management art proxy (WP1.2): the stored catalog first, for ANY
+    // id, so a library plugin's entries resolve without the warmer knowing its store.
+    if let Some(entry) = entry_for_library_id(id) {
+        return [
+            ArtKind::Portrait,
+            ArtKind::Header,
+            ArtKind::Hero,
+            ArtKind::Logo,
+        ]
+        .into_iter()
+        .filter_map(|kind| art_field(&entry.art, kind))
+        .find_map(|v| resolve_art_bytes(&v));
+    }
+    // Legacy in-host Steam scanner: its `Artwork` fields are relative proxy paths (see `steam_art`)
+    // the *client* resolves against the host — meaningless to `fetch_image`, which expects an
+    // absolute URL. Resolve those kinds directly instead of going through the URL fields.
     if let Some(appid) = id
         .strip_prefix("steam:")
         .and_then(|s| s.parse::<u32>().ok())
@@ -374,6 +480,7 @@ pub fn fetch_box_art(id: &str) -> Option<(Vec<u8>, String)> {
         .into_iter()
         .find_map(|kind| steam_art_bytes(appid, kind));
     }
+    // The remaining in-host scanners (heroic/lutris/epic/gog/xbox) carry absolute CDN URLs.
     let g = all_games().into_iter().find(|g| g.id == id)?;
     [g.art.portrait, g.art.header, g.art.hero, g.art.logo]
         .into_iter()
@@ -472,19 +579,60 @@ mod tests {
         assert!(fetch_image("data:image/png;base64,").is_none());
     }
 
+    /// The full accept/exclude table (WP1.2). The exclusions are the load-bearing half: two of the
+    /// three `/`-leading shapes here are emitted by the host ITSELF, so a POSIX rule that swallowed
+    /// them would break the proxy round-trip and silently drop CDN art.
     #[test]
     fn local_art_path_detection() {
         // Windows-shaped local paths a provider (Playnite) would store.
         assert!(is_local_art_path(r"C:\Users\me\cover.jpg"));
         assert!(is_local_art_path("C:/Users/me/cover.png"));
         assert!(is_local_art_path(r"\\nas\share\art.jpg"));
-        // URLs and the host proxy path are NOT local files.
+        // The `file://` plugin contract, on both platform shapes.
+        assert!(is_local_art_path("file:///home/u/covers/x.jpg"));
+        assert!(is_local_art_path("file:///C:/covers/x.jpg"));
+        // POSIX absolute — lutris covers, steam librarycache.
+        assert!(is_local_art_path("/home/u/.cache/lutris/coverart/x.jpg"));
+        assert!(is_local_art_path("/var/lib/steam/librarycache/570/h.jpg"));
+        // URLs are NOT local files.
         assert!(!is_local_art_path("https://cdn/x.jpg"));
         assert!(!is_local_art_path("http://host/x.jpg"));
         assert!(!is_local_art_path("data:image/png;base64,AAAA"));
+        // …nor is the host's OWN art-proxy path (it must survive a second `proxy_local_art` pass).
         assert!(!is_local_art_path(
             "/api/v1/library/art/custom:abc/portrait"
         ));
+        assert!(!is_local_art_path("/api/v1/library/art/steam:570/hero"));
+        // …nor a protocol-relative CDN URL (what GOG / the MS catalog return — see `abs_url`).
+        assert!(!is_local_art_path("//images.gog.com/abc_vertical.jpg"));
+        // A relative path is not absolute — nothing to serve.
+        assert!(!is_local_art_path("covers/x.jpg"));
+        assert!(!is_local_art_path(""));
+    }
+
+    #[test]
+    fn file_url_converts_to_a_path_and_percent_decodes() {
+        assert_eq!(file_url_to_path("file:///home/u/c.jpg"), "/home/u/c.jpg");
+        // Percent-encoded spaces — what a correct URL encoder emits for a real-world cover path.
+        assert_eq!(
+            file_url_to_path("file:///home/u/My%20Games/c%2Bx.jpg"),
+            "/home/u/My Games/c+x.jpg"
+        );
+        // Windows drive letters arrive after the empty authority's slash and lose it.
+        assert_eq!(
+            file_url_to_path("file:///C:/covers/c.jpg"),
+            "C:/covers/c.jpg"
+        );
+        // A non-empty authority is a UNC reference.
+        assert_eq!(
+            file_url_to_path("file://nas/share/c.jpg"),
+            r"\\nas\share\c.jpg"
+        );
+        // Non-`file://` values are returned untouched (bare paths still work).
+        assert_eq!(file_url_to_path("/home/u/c.jpg"), "/home/u/c.jpg");
+        assert_eq!(file_url_to_path(r"C:\c.jpg"), r"C:\c.jpg");
+        // A lone `%` (a legal path character) is not mangled into a decode failure.
+        assert_eq!(file_url_to_path("file:///home/100%.jpg"), "/home/100%.jpg");
     }
 
     #[test]
@@ -506,6 +654,46 @@ mod tests {
             art.header.as_deref(),
             Some("/api/v1/library/art/custom:x/header")
         );
+    }
+
+    /// A POSIX local cover — the shape the lutris and steam plugins emit — is classified as local
+    /// art and rewritten to the proxy path. This is the case G4 blocked (Lutris art was inlined as
+    /// `data:` URLs and blew the 2 MB body limit at 49 covers).
+    ///
+    /// Deliberately free of filesystem and env: the READ half is confined, and lives in
+    /// `local_art_bytes_is_confined_and_image_only` so that only ONE test mutates
+    /// `PUNKTFUNK_LIBRARY_ART_ROOTS` (cargo runs these in parallel threads of one process, so two
+    /// would race).
+    #[test]
+    fn posix_local_art_is_classified_and_proxied() {
+        let path = if cfg!(windows) {
+            r"C:\covers\cover.jpg".to_string()
+        } else {
+            "/home/u/.cache/lutris/coverart/cover.jpg".to_string()
+        };
+        let mut art = Artwork {
+            portrait: Some(path.clone()),
+            hero: Some(format!("file://{path}")),
+            logo: Some("https://cdn/l.png".into()),
+            header: None,
+        };
+        assert!(is_local_art_path(&path));
+        proxy_local_art("lutris:42", &mut art);
+        assert_eq!(
+            art.portrait.as_deref(),
+            Some("/api/v1/library/art/lutris:42/portrait")
+        );
+        assert_eq!(
+            art.hero.as_deref(),
+            Some("/api/v1/library/art/lutris:42/hero"),
+            "a file:// value is local art too"
+        );
+        assert_eq!(art.logo.as_deref(), Some("https://cdn/l.png"));
+
+        // Re-running the rewrite is a no-op — the emitted proxy path must not be mistaken for a file.
+        let before = art.portrait.clone();
+        proxy_local_art("lutris:42", &mut art);
+        assert_eq!(art.portrait, before);
     }
 
     const PNG: &[u8] = &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 13];
@@ -562,6 +750,37 @@ mod tests {
         );
 
         assert!(local_art_bytes(dir.join("nope.png").to_str().unwrap()).is_none());
+        // A directory is not a servable cover — the proxy must never become a directory reader.
+        assert!(local_art_bytes(dir.to_str().unwrap()).is_none());
+
+        // The `file://` plugin contract reaches the SAME bytes through the SAME gate. This is the
+        // half that matters for the extracted scanners: they emit `file://` values, so if the
+        // conversion happened after the confinement check the check would be inspecting a string
+        // that is not the path being read.
+        let as_url = format!("file://{}", cover.to_str().unwrap());
+        assert_eq!(
+            local_art_bytes(&as_url)
+                .expect("file:// reads the same cover")
+                .0,
+            PNG
+        );
+        // …and a `file://` value is confined exactly like a bare one — no bypass by spelling.
+        assert!(
+            local_art_bytes(&format!("file://{}", elsewhere.to_str().unwrap())).is_none(),
+            "file:// must not escape the art roots"
+        );
+        // Percent-encoded traversal is decoded BEFORE canonicalization, so it cannot hide from the
+        // `..` check.
+        assert!(
+            local_art_bytes(&format!(
+                "file://{}/%2e%2e/{}/cover.png",
+                dir.to_str().unwrap(),
+                outside.file_name().unwrap().to_str().unwrap()
+            ))
+            .is_none(),
+            "percent-encoded traversal must be refused"
+        );
+
         // A UNC path is refused outright (outbound SMB auth coercion), before any filesystem hit.
         assert!(!art_path_is_servable(r"\\attacker\share\a.png"));
 

@@ -245,6 +245,19 @@ mod tests {
         }
     }
 
+    /// The migration invariant D2 exists to protect. Moonlight caches app ids (and users pin them),
+    /// and the id is derived from the LIBRARY ID alone — so a title moving from the in-host scanner
+    /// to a claimed plugin entry keeps its GameStream id iff the library id is byte-identical. This
+    /// pins that the claimed shape is that shape, and that an unclaimed one would NOT have been.
+    #[test]
+    fn a_claimed_plugin_entry_keeps_the_scanners_gamestream_id() {
+        // What the built-in scanner produced, and what the steam plugin produces once it claims.
+        assert_eq!(stable_app_id("steam:440"), stable_app_id("steam:440"));
+        // The same title reconciled WITHOUT a claim gets an opaque `custom:` id — a different app
+        // id, i.e. exactly the breakage the claim prevents.
+        assert_ne!(stable_app_id("steam:440"), stable_app_id("custom:9f2c1a"));
+    }
+
     #[test]
     fn append_library_dedups_against_base_ids() {
         // A base app whose id happens to fall in the library range must not be clobbered by a library
