@@ -555,6 +555,10 @@ update-desktop-database %{_datadir}/applications >/dev/null 2>&1 || :
 %post
 # The (empty) opt-in group for web-console-triggered updates — nobody is auto-added.
 getent group punktfunk-update >/dev/null 2>&1 || groupadd --system punktfunk-update 2>/dev/null || :
+# Owns the usbip vhci attach/detach nodes (60-punktfunk.rules). Deliberately NOT 'input': writing
+# 'attach' materialises an arbitrary emulated USB device — a root-only kernel primitive that must
+# not ride on the group users are told to join for gamepads (security-review 2026-08-05 M-4).
+getent group punktfunk >/dev/null 2>&1 || groupadd --system punktfunk 2>/dev/null || :
 # Reload udev so /dev/uinput picks up the new rule without a reboot (best-effort).
 udevadm control --reload-rules 2>/dev/null || :
 udevadm trigger --subsystem-match=misc 2>/dev/null || :
@@ -562,6 +566,8 @@ udevadm trigger --subsystem-match=misc 2>/dev/null || :
 # it takes effect on the next boot into the layered deployment).
 sysctl -p %{_prefix}/lib/sysctl.d/99-punktfunk-net.conf >/dev/null 2>&1 || :
 echo "punktfunk installed. Add yourself to the 'input' group (sudo usermod -aG input \$USER)"
+echo "For the virtual Steam Deck pad (usbip) ALSO: sudo usermod -aG punktfunk \$USER"
+echo "  — that group can emulate arbitrary USB devices; join it only on a machine you trust."
 echo "then enable the host: systemctl --user enable --now punktfunk-host"
 echo "Config: cp %{_datadir}/%{name}/host.env.bazzite ~/.config/punktfunk/host.env"
 # Fedora/RHEL run firewalld by default — point the way to the installed service definitions.
@@ -585,7 +591,10 @@ fi
 echo "punktfunk-web installed. Enable the console for your user:"
 echo "    systemctl --user enable --now punktfunk-web"
 echo "A login password is generated on first start — read it with:"
-echo "    journalctl --user -u punktfunk-web-init | sed -n 's/.*password generated: //p'"
+# From the 0600 file, NOT the journal: the journal is persistent and group-readable (adm /
+# systemd-journal on Debian-family, and this hint was copied around), so telling people to fish a
+# password out of it published the secret to every member of those groups (review 2026-08-05 L-18).
+echo "    cut -d= -f2- \${XDG_CONFIG_HOME:-\$HOME/.config}/punktfunk/web-password"
 echo "Then open https://<host-ip>:47992"
 %endif
 

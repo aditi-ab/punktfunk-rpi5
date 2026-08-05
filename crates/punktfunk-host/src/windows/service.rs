@@ -1343,13 +1343,25 @@ fn uninstall() -> Result<()> {
 /// defaults to `auto` — the host picks NVENC (NVIDIA) / AMF (AMD) / QSV (Intel) from the GPU vendor.
 fn ensure_default_host_env() -> Result<()> {
     let path = host_env_path();
-    if path.exists() {
-        return Ok(());
-    }
+    // Harden the config dir FIRST, unconditionally — before the `exists()` check, not inside the
+    // branch that creates the file.
+    //
+    // The 2026-08-05 review's H-4: this used to return early when host.env already existed, which
+    // skipped the very `create_private_dir` whose reason for existing is "so a local user can't
+    // pre-create it and plant a host.env". `C:\ProgramData` grants BUILTIN\Users add-subdirectory
+    // plus CREATOR OWNER full control, so an unprivileged user can create `C:\ProgramData\punktfunk`,
+    // own it, and drop a host.env — and the skip meant the one case the hardening was written for was
+    // the one case it never ran in. The service then loads that file verbatim into its own SYSTEM
+    // environment and into the command line it launches (`PUNKTFUNK_HOST_CMD=…`).
     if let Some(dir) = path.parent() {
-        // DACL-lock the config dir on creation so a local user can't pre-create it and plant a
-        // host.env (which feeds the SYSTEM service's env + command line) — security-review #3.
         pf_paths::create_private_dir(dir).ok();
+    }
+    if path.exists() {
+        // An existing host.env may predate the hardening (or have been planted before it ran), in
+        // which case it is still owned by whoever created it — and an owner can rewrite the DACL it
+        // inherited. Re-apply the SYSTEM/Administrators lock to the FILE as well as the directory.
+        pf_paths::restrict_existing_secret_file(&path);
+        return Ok(());
     }
     let default = "# punktfunk host configuration (read by the Windows service).\n\
         # KEY=VALUE per line; '#' comments. Restart the service after editing:\n\

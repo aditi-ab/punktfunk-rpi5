@@ -26,6 +26,14 @@ impl ServerIdentity {
         let dir = config_dir();
         let cert_path = dir.join("cert.pem");
         let key_path = dir.join("key.pem");
+        // Harden the directory BEFORE the first read, not only in the branch that generates a new
+        // identity (2026-08-05 review M-1). Reading first is what made the hardening pointless
+        // against the attack it was written for: combined with H-4's pre-creatable
+        // `%ProgramData%\punktfunk`, a local user could plant a cert/key pair and have it adopted
+        // verbatim as the host's long-lived identity — the QUIC server key, the mgmt-API TLS key and
+        // the RSA pairing signer all becoming a key the attacker holds. The compromise is permanent:
+        // this function never regenerates while both files are non-empty.
+        pf_paths::create_private_dir(&dir).ok();
         let (cert_pem, key_pem) = match (
             fs::read_to_string(&cert_path),
             fs::read_to_string(&key_path),
@@ -35,8 +43,8 @@ impl ServerIdentity {
                 let (c, k) = generate()?;
                 // The private key is the trust root for EVERY surface (TLS server cert, pairing
                 // signing, the QUIC identity clients pin) — write it owner-only (0600 / SYSTEM-only
-                // DACL) so a local user can't read it and impersonate the host. The dir is 0700.
-                pf_paths::create_private_dir(&dir).ok();
+                // DACL) so a local user can't read it and impersonate the host. The dir is already
+                // 0700 / SYSTEM+Admins from the unconditional hardening above.
                 pf_paths::write_secret_file(&key_path, k.as_bytes())
                     .with_context(|| format!("write {}", key_path.display()))?;
                 // The cert is public (handed to clients), but write it owner-only too for consistency.

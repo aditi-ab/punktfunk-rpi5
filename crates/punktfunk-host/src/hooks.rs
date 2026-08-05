@@ -432,42 +432,122 @@ fn flatten_env(ev: &crate::events::HostEvent) -> Vec<(String, String)> {
     out
 }
 
-/// The sshd/sudoers rule (RFC §9.1): when the command's first token is a path to an existing
-/// file, refuse to run it unless it is owned by the host user (or root) and not
-/// group/world-writable — a world-writable hook script is privilege escalation bait. A bare
-/// command name (`systemctl`, `curl`) is left to PATH.
+/// The sshd/sudoers rule (RFC §9.1): refuse to run a command that references a script/binary which
+/// is group/world-writable, or owned by neither the host user nor root — a world-writable hook
+/// script is privilege-escalation bait. A bare command name (`systemctl`, `curl`) is left to PATH.
+///
+/// **This is a hygiene rule, not an authorization gate**, and the distinction matters: it
+/// constrains *who owns the file being run*, never *what the command does*. `curl … | sh` and
+/// `python3 -c '…'` are unconstrained by construction, and `/bin/sh -c '<anything>'` passes because
+/// `/bin/sh` is root-owned. Whoever may WRITE a hook already has command execution as the host
+/// user — which is why writing them is admin-only. A pass here does not mean "this command is
+/// safe", and nothing should be granted on the strength of it.
+///
+/// It checks EVERY absolute-path token, not just the first (2026-08-05 review L-12). Looking only
+/// at `cmd.split_whitespace().next()` meant `bash /opt/x/hook.sh`, `sh -c /tmp/x` and any quoted
+/// path skipped the check entirely — so the interpreter was vetted and the script it ran was not,
+/// which is backwards: the script is the part an attacker can plant.
 #[cfg(unix)]
 fn exec_path_check(cmd: &str) -> Result<(), String> {
     use std::os::unix::fs::MetadataExt;
-    let Some(first) = cmd.split_whitespace().next() else {
+    if cmd.split_whitespace().next().is_none() {
         return Err("empty command".into());
-    };
-    if !first.starts_with('/') {
-        return Ok(());
-    }
-    let meta = match std::fs::metadata(first) {
-        Ok(m) => m,
-        Err(_) => return Ok(()), // not an existing file — the shell will report it
-    };
-    if !meta.is_file() {
-        return Ok(());
     }
     // SAFETY: geteuid has no preconditions and touches no memory.
     let euid = unsafe { libc::geteuid() };
-    if meta.uid() != euid && meta.uid() != 0 {
-        return Err(format!(
-            "{first} is owned by uid {} (host runs as uid {euid}) — hook scripts must be \
-             owned by the operator or root",
-            meta.uid()
-        ));
-    }
-    if meta.mode() & 0o022 != 0 {
-        return Err(format!(
-            "{first} is group/world-writable (mode {:o}) — chmod go-w it first",
-            meta.mode() & 0o7777
-        ));
+    for raw in cmd.split_whitespace() {
+        // Tolerate the quoting a hand-written command line carries — a path that is absolute only
+        // after unquoting is exactly as plantable as a bare one.
+        let token = raw.trim_matches(|c| c == '"' || c == '\'');
+        if !token.starts_with('/') {
+            continue;
+        }
+        let meta = match std::fs::metadata(token) {
+            Ok(m) => m,
+            Err(_) => continue, // not an existing file — the shell will report it
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        if meta.uid() != euid && meta.uid() != 0 {
+            return Err(format!(
+                "{token} is owned by uid {} (host runs as uid {euid}) — hook scripts must be \
+                 owned by the operator or root",
+                meta.uid()
+            ));
+        }
+        if meta.mode() & 0o022 != 0 {
+            return Err(format!(
+                "{token} is group/world-writable (mode {:o}) — chmod go-w it first",
+                meta.mode() & 0o7777
+            ));
+        }
     }
     Ok(())
+}
+
+/// Whether this process is running as `NT AUTHORITY\SYSTEM` (S-1-5-18) — i.e. as the SCM service
+/// rather than as the operator's own console process.
+///
+/// Used to decide whether the in-process hook fallback is acceptable: as the operator it is the
+/// privilege they already have, as SYSTEM it is an elevation the hook contract forbids
+/// (2026-08-05 review L-13). Fails CLOSED — an unreadable token is treated as SYSTEM, because the
+/// consequence of guessing wrong in that direction is a skipped hook, and in the other direction
+/// it is a SYSTEM command.
+#[cfg(windows)]
+fn running_as_system() -> bool {
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Security::{
+        CreateWellKnownSid, EqualSid, GetTokenInformation, TokenUser, WinLocalSystemSid, PSID,
+        SECURITY_MAX_SID_SIZE, TOKEN_QUERY, TOKEN_USER,
+    };
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    let mut token = HANDLE::default();
+    // SAFETY: pseudo-handle from GetCurrentProcess; `token` is a live out-param.
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }.is_err() {
+        return true; // fail closed
+    }
+    let mut buf = [0u8; 256];
+    let mut len = 0u32;
+    // SAFETY: `buf` is a writable local of the length passed; `len` is a live out-param.
+    let got = unsafe {
+        GetTokenInformation(
+            token,
+            TokenUser,
+            Some(buf.as_mut_ptr().cast()),
+            buf.len() as u32,
+            &mut len,
+        )
+    };
+    // SAFETY: the token handle came from OpenProcessToken and is not used after this.
+    unsafe {
+        let _ = windows::Win32::Foundation::CloseHandle(token);
+    }
+    if got.is_err() {
+        return true; // fail closed
+    }
+    let mut system = [0u8; SECURITY_MAX_SID_SIZE as usize];
+    let mut cb = system.len() as u32;
+    // SAFETY: the buffer is SECURITY_MAX_SID_SIZE, the documented maximum SID size.
+    if unsafe {
+        CreateWellKnownSid(
+            WinLocalSystemSid,
+            None,
+            Some(PSID(system.as_mut_ptr().cast())),
+            &mut cb,
+        )
+    }
+    .is_err()
+    {
+        return true; // fail closed
+    }
+    // SAFETY: `buf` holds a TOKEN_USER written by GetTokenInformation; its `User.Sid` points into
+    // the same buffer, and both SIDs are valid for this comparison.
+    unsafe {
+        let tu = &*(buf.as_ptr() as *const TOKEN_USER);
+        EqualSid(tu.User.Sid, PSID(system.as_mut_ptr().cast())).is_ok()
+    }
 }
 
 #[cfg(not(unix))]
@@ -580,7 +660,33 @@ fn run_hook_process(
             // report "ran" (prep `undo`s stay armed).
             true
         }
+        Err(e) if running_as_system() => {
+            // NO in-process fallback when we are SYSTEM.
+            //
+            // `spawn_in_active_session` fails whenever there is no interactive user — pre-login, at
+            // boot, on a logged-off box — and the fallback below then ran the operator's command
+            // line through `cmd.exe /C` IN THIS PROCESS. As the SCM service that process is
+            // LocalSystem, so a hook the module contract promises runs "in the interactive session,
+            // never SYSTEM" quietly became a SYSTEM command, at the exact moments nobody is watching
+            // the screen, with no ownership check on the script (`exec_path_check` is a no-op on
+            // Windows) — 2026-08-05 review L-13.
+            //
+            // Refusing is the honest behaviour: the contract says these run as the user, and if
+            // there is no user there is nothing to run them as. A hook that must run without a
+            // logged-in user belongs in a service, not here.
+            tracing::warn!(
+                cmd = %cmd,
+                error = %format!("{e:#}"),
+                "hook SKIPPED: no interactive user session to run it in, and this host is SYSTEM — \
+                 hooks run as the logged-in user by design and are never elevated to SYSTEM"
+            );
+            let _ = std::fs::remove_file(&json_path);
+            false
+        }
         Err(e) => {
+            // Not SYSTEM (a hand-run `punktfunk-host serve` in the operator's own console): running
+            // in-process is the same privilege the operator already has, which is the whole trust
+            // model for hooks.
             tracing::debug!(error = %format!("{e:#}"),
                 "interactive-session spawn unavailable — running hook in-console");
             let mut ok = false;

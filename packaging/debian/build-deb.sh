@@ -289,6 +289,11 @@ set -e
 if [ "$1" = "configure" ]; then
     # The (empty) opt-in group for web-console-triggered updates — nobody is auto-added.
     getent group punktfunk-update >/dev/null 2>&1 || addgroup --system punktfunk-update 2>/dev/null || true
+    # Owns the usbip vhci attach/detach nodes (60-punktfunk.rules). Deliberately NOT 'input':
+    # writing 'attach' materialises an arbitrary emulated USB device — a root-only kernel
+    # primitive that must not ride on the group users are told to join for gamepads
+    # (security-review 2026-08-05 M-4).
+    getent group punktfunk >/dev/null 2>&1 || addgroup --system punktfunk 2>/dev/null || true
     # Pick up the /dev/uinput rule without a reboot (best-effort, no-op in containers).
     udevadm control --reload-rules 2>/dev/null || true
     udevadm trigger --subsystem-match=misc 2>/dev/null || true
@@ -296,6 +301,8 @@ if [ "$1" = "configure" ]; then
     sysctl -p /usr/lib/sysctl.d/99-punktfunk-net.conf >/dev/null 2>&1 || true
     echo "punktfunk-host installed. Add yourself to the 'input' group for virtual gamepads:"
     echo "    sudo usermod -aG input \"\$USER\"   # then re-login"
+    echo "For the virtual Steam Deck pad (usbip) ALSO: sudo usermod -aG punktfunk \"\$USER\""
+    echo "  — that group can emulate arbitrary USB devices; join it only on a machine you trust." 
     echo "Config:  mkdir -p ~/.config/punktfunk && cp /usr/share/punktfunk-host/host.env.example ~/.config/punktfunk/host.env"
     echo "Enable:  systemctl --user enable --now punktfunk-host"
     # Debian ships no active firewall and Ubuntu's ufw is inactive by default; hint whichever is present.

@@ -29,4 +29,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Tier-3 GPU stream benchmark
-        run: bash scripts/bench/gpu-stream.sh "${{ inputs.mode || '1920x1080x120' }}" 12
+        # Through the environment, not interpolated into the command line: a `${{ }}` expansion is
+        # substituted before the shell parses the line, so an input carrying shell syntax would run
+        # as this step (2026-08-05 review H-6).
+        env:
+          BENCH_MODE: ${{ inputs.mode || '1920x1080x120' }}
+        run: bash scripts/bench/gpu-stream.sh "$BENCH_MODE" 12

@@ -70,9 +70,62 @@ pub fn create_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
     {
         let r = std::fs::create_dir_all(dir);
         #[cfg(windows)]
-        restrict_dir_to_system_admins(dir);
+        restrict_dir_to_system_admins(dir, first_hardening_of(dir));
         r
     }
+}
+
+/// Whether this is the first hardening pass of `dir` in this process — the pass that also does the
+/// expensive recursive re-own.
+///
+/// A planted config dir is planted once, before the host ever starts, so one deep pass at startup
+/// closes it; repeating it on every `create_private_dir` call (the library CRUD calls it per write)
+/// would re-walk the whole config tree — recordings, art cache — for nothing.
+#[cfg(windows)]
+fn first_hardening_of(dir: &std::path::Path) -> bool {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+    SEEN.get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .map(|mut s| s.insert(dir.to_path_buf()))
+        .unwrap_or(false)
+}
+
+/// Re-apply the secret-file DACL to a file that **already exists** — including re-owning it to
+/// Administrators.
+///
+/// [`write_secret_file`] hardens what it writes, but a file that was planted before the host first
+/// ran was never written by us: it is owned by whoever created it, and an owner always retains
+/// `WRITE_DAC`, so re-ACLing without re-owning leaves them able to put their access straight back.
+/// Used on startup for `host.env`, whose contents become the SYSTEM service's environment and
+/// command line (2026-08-05 review H-4). Best-effort and never fatal.
+#[cfg(windows)]
+pub fn restrict_existing_secret_file(path: &std::path::Path) {
+    if !path.exists() {
+        return;
+    }
+    let icacls = icacls_path();
+    let _ = std::process::Command::new(&icacls)
+        .arg(path.as_os_str())
+        .args(["/setowner", "*S-1-5-32-544"]) // BUILTIN\Administrators
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    restrict_to_system_admins(path);
+}
+
+/// No-op off Windows: POSIX modes are set at creation by [`write_secret_file`] and a config dir a
+/// non-root user pre-created is not a privilege boundary the way `%ProgramData%` is.
+#[cfg(not(windows))]
+pub fn restrict_existing_secret_file(_path: &std::path::Path) {}
+
+/// `icacls` by absolute path — a privileged service must never resolve it through `PATH`.
+#[cfg(windows)]
+fn icacls_path() -> String {
+    std::env::var("SystemRoot")
+        .map(|r| format!("{r}\\System32\\icacls.exe"))
+        .unwrap_or_else(|_| "icacls".to_string())
 }
 
 /// Best-effort Windows DACL lockdown of the config *directory* (the companion to
@@ -86,17 +139,23 @@ pub fn create_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
 /// are additionally locked to SYSTEM/Admins by [`write_secret_file`]. Hard-coded SIDs
 /// (locale-independent) via the absolute `%SystemRoot%` path; never fatal.
 #[cfg(windows)]
-fn restrict_dir_to_system_admins(dir: &std::path::Path) {
-    let icacls = std::env::var("SystemRoot")
-        .map(|r| format!("{r}\\System32\\icacls.exe"))
-        .unwrap_or_else(|_| "icacls".to_string());
-    // Reset ownership of the directory object to Administrators first, so a dir a non-admin may have
-    // pre-created can't keep OWNER control (an owner can always rewrite the DACL). No `/T` — re-owning
-    // the dir itself is what defeats the pre-creation; recursing a large captures tree each call is
-    // needless churn (secret files are individually owner-locked by `write_secret_file`).
-    let _ = std::process::Command::new(&icacls)
-        .arg(dir.as_os_str())
-        .args(["/setowner", "*S-1-5-32-544"]) // BUILTIN\Administrators
+fn restrict_dir_to_system_admins(dir: &std::path::Path, deep: bool) {
+    let icacls = icacls_path();
+    // Reset ownership to Administrators first, so a dir a non-admin may have pre-created can't keep
+    // OWNER control (an owner always retains WRITE_DAC and can put its access straight back).
+    //
+    // `deep` (once per directory per process — see `first_hardening_of`) also re-owns the CONTENTS.
+    // Re-owning only the directory left every file the attacker had already created still owned by
+    // them, and therefore still theirs to rewrite, which is half of why the 2026-08-05 review's H-4
+    // was exploitable end to end. A planted tree is planted once, before the host first runs, so one
+    // deep pass at startup closes it without re-walking recordings and art cache on every write.
+    let mut own = std::process::Command::new(&icacls);
+    own.arg(dir.as_os_str())
+        .args(["/setowner", "*S-1-5-32-544"]); // BUILTIN\Administrators
+    if deep {
+        own.args(["/T", "/C", "/Q"]); // recurse, continue on error, quiet
+    }
+    let _ = own
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status();
@@ -108,8 +167,13 @@ fn restrict_dir_to_system_admins(dir: &std::path::Path) {
             "*S-1-5-18:(OI)(CI)(F)", // NT AUTHORITY\SYSTEM
             "/grant:r",
             "*S-1-5-32-544:(OI)(CI)(F)", // BUILTIN\Administrators
-            "/grant:r",
-            "*S-1-3-4:(OI)(CI)(F)", // OWNER RIGHTS
+            // NO inheritable OWNER RIGHTS (`*S-1-3-4`) here, deliberately. It used to be granted
+            // `(OI)(CI)(F)`, which handed full control of every child object to whoever owned it —
+            // so a file a local user created before the hardening ran stayed writable by them even
+            // after the directory was re-owned (2026-08-05 review H-4, second half). SYSTEM and
+            // Administrators cover every account that legitimately writes here; a non-elevated
+            // manual run gets read-only config, which is the intended boundary rather than a
+            // regression — this directory drives command execution as SYSTEM.
             "/grant:r",
             "*S-1-5-32-545:(OI)(CI)(RX)", // BUILTIN\Users — read-only (no create/write → no plant)
         ])
@@ -130,6 +194,19 @@ fn restrict_dir_to_system_admins(dir: &std::path::Path) {
 /// Windows (the default `%ProgramData%` ACL is Users-readable). Mirrors the mgmt-token hardening; used
 /// for the host private key and the persisted trust stores so a local unprivileged user can neither
 /// read the key (impersonation) nor tamper with the paired allow-list (unauthorized pairing).
+///
+/// **Windows ordering caveat** (2026-08-05 review L-17): this is create-then-`icacls`, not
+/// create-with-DACL — `std::fs::OpenOptions` cannot pass a `SECURITY_ATTRIBUTES`, and this crate is
+/// `#![forbid(unsafe_code)]` so it cannot call `CreateFileW` itself. The file therefore exists
+/// briefly under its INHERITED ACL, and a failed `icacls` is a warning rather than an error.
+///
+/// What makes that acceptable is the DIRECTORY, and only the directory: every caller writes into
+/// the config dir, which [`create_private_dir`] now hardens unconditionally and BEFORE the first
+/// read of anything in it (review H-4/M-1), granting `BUILTIN\Users` read-only and no create. The
+/// inherited ACL a secret is born with is therefore already SYSTEM/Administrators-only, and the
+/// `icacls` below is defence in depth rather than the thing standing between a local user and the
+/// host key. Keep that ordering — if the directory hardening is ever moved back after a read, this
+/// window becomes real again.
 pub fn write_secret_file(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     let mut opts = std::fs::OpenOptions::new();
@@ -160,9 +237,7 @@ pub fn write_secret_file(path: &std::path::Path, contents: &[u8]) -> std::io::Re
 /// `PATH`). Never fatal — on failure the file is simply left at the inherited ACL (today's behaviour).
 #[cfg(windows)]
 fn restrict_to_system_admins(path: &std::path::Path) {
-    let icacls = std::env::var("SystemRoot")
-        .map(|r| format!("{r}\\System32\\icacls.exe"))
-        .unwrap_or_else(|_| "icacls".to_string());
+    let icacls = icacls_path();
     let status = std::process::Command::new(icacls)
         .arg(path.as_os_str())
         .args([

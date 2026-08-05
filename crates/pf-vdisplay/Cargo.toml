@@ -66,6 +66,11 @@ pf-driver-proto = { path = "../pf-driver-proto" }
 bytemuck = { version = "1.19", features = ["derive"] }
 windows = { version = "0.62", features = [
     "Win32_Foundation",
+    # The single-instance mutex is created with an explicit SDDL DACL and its owner is checked, so
+    # a lower-privileged process (the LocalService plugin runner) can neither open it nor squat the
+    # name unnoticed — see manager/instance.rs (security-review 2026-08-05 L-16).
+    "Win32_Security",
+    "Win32_Security_Authorization",
     "Win32_Devices_DeviceAndDriverInstallation",
     "Win32_Devices_Display",
     "Win32_Graphics_Gdi",

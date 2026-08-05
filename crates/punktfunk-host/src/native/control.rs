@@ -70,6 +70,15 @@ pub(super) async fn run(
     // coalesces a well-behaved resize drag; compliant clients self-limit to ≥ 1 s).
     const MIN_SWITCH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
     let mut last_accepted_switch: Option<std::time::Instant> = None;
+    // Speed-test probes get the same treatment as mode switches, for the same reason.
+    //
+    // Each probe is individually clamped (5 s, 10 Gbps) but nothing capped how many a client could
+    // queue, so one could pause its own video and pin the host's uplink indefinitely by simply
+    // asking again — `Reconfigure` on this very task was rate-limited and `ProbeRequest` was not
+    // (2026-08-05 review L-3). One probe per 10 s is far more than a real client needs (it probes
+    // at session start and on a manual speed test) and makes the channel useless as an amplifier.
+    const MIN_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+    let mut last_probe: Option<std::time::Instant> = None;
     // Resumable framing: this read is one arm of a `select!` whose siblings fire on every probe
     // result / reconfigure / clip offer, so the read future is dropped routinely. `io::read_msg`
     // would lose the partial frame and misalign the stream for the rest of the session.
@@ -233,6 +242,15 @@ pub(super) async fn run(
                     );
                     let _ = shard_ack_tx.send(ack.shard_payload);
                 } else if let Ok(req) = ProbeRequest::decode(&msg) {
+                    let now = std::time::Instant::now();
+                    if last_probe.is_some_and(|t| now.duration_since(t) < MIN_PROBE_INTERVAL) {
+                        tracing::warn!(
+                            target_kbps = req.target_kbps,
+                            "speed-test probe rejected (rate-limited)"
+                        );
+                        continue;
+                    }
+                    last_probe = Some(now);
                     tracing::info!(
                         target_kbps = req.target_kbps,
                         duration_ms = req.duration_ms,

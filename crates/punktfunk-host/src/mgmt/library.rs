@@ -1,8 +1,45 @@
 //! Library-tagged management endpoints: installed-store + custom game entries and box art.
 //! Split out of the `mgmt` facade (plan §W5).
 
+use super::auth::AuthLane;
 use super::shared::*;
 use axum::http::header;
+use axum::Extension;
+
+/// Refuse a write whose payload carries an operator-privileged field to a lane that may not set one
+/// (2026-08-05 review H-1), and refuse any local art path the proxy would not serve back (H-2).
+///
+/// Both checks belong here rather than in the route gate: `PUT /library/provider/{p}` is a route a
+/// provider plugin must be able to call — reconciling its own entry set is the whole point of a
+/// scanner plugin — while `prep` / `launch.kind = "command"` inside that payload are the operator's
+/// authority alone. Route reachability and field authority are separate questions.
+///
+/// `Some(response)` is the refusal to return; `None` means the payload may proceed. Deliberately
+/// not `Result<(), Response>`: the "error" here IS the response the handler sends, so there is no
+/// error value to propagate, and a 128-byte `Response` in an `Err` variant is what
+/// `clippy::result_large_err` objects to.
+fn check_entry_fields(
+    lane: AuthLane,
+    art: &crate::library::Artwork,
+    launch: Option<&crate::library::LaunchSpec>,
+    prep: &[crate::hooks::PrepCmd],
+) -> Option<Response> {
+    if !lane.may_set_privileged_fields() {
+        if let Some(field) = crate::library::privileged_field(launch, prep) {
+            return Some(api_error(
+                StatusCode::FORBIDDEN,
+                &format!(
+                    "`{field}` is executed as the host user and may only be set with the \
+                     operator's admin token — a plugin may publish entries with any host-resolved \
+                     launch kind (steam_appid, steam_ui, epic, gog, aumid, lutris_id, heroic) instead"
+                ),
+            ));
+        }
+    }
+    crate::library::validate_art_paths(art)
+        .err()
+        .map(|e| api_error(StatusCode::BAD_REQUEST, &e))
+}
 
 #[derive(Deserialize)]
 pub(crate) struct LibraryQuery {
@@ -34,6 +71,7 @@ pub(crate) struct LibraryQuery {
     )
 )]
 pub(crate) async fn get_library(
+    Extension(lane): Extension<AuthLane>,
     Query(q): Query<LibraryQuery>,
 ) -> Json<Vec<crate::library::GameEntry>> {
     let mut games = crate::library::all_games();
@@ -53,6 +91,24 @@ pub(crate) async fn get_library(
     // library size, and the client never sees an unreachable `C:\…`).
     for g in &mut games {
         crate::library::proxy_local_art(&g.id, &mut g.art);
+    }
+    // Redact the operator's command lines for every lane but their own (2026-08-05 review L-1).
+    //
+    // `cert_may_access` allows `GET /library`, so this response goes to every paired STREAMING
+    // client on the LAN — and for a custom entry `launch.value` is the raw shell command or
+    // absolute exe path the operator typed. The adjacent `detect` field is `#[serde(skip)]` for
+    // exactly this reason; `launch` simply never got the same treatment. Clients don't need it:
+    // a client picks a title by ID and the host resolves the recipe itself (`resolve_launch`),
+    // which is the invariant that stops a client injecting a command in the first place. The
+    // `kind` stays, so "this is launchable, and how" still renders.
+    if !lane.may_set_privileged_fields() {
+        for g in &mut games {
+            if let Some(l) = g.launch.as_mut() {
+                if l.kind == "command" {
+                    l.value.clear();
+                }
+            }
+        }
     }
     Json(games)
 }
@@ -141,10 +197,14 @@ pub(crate) async fn set_library_scanner(
     )
 )]
 pub(crate) async fn create_custom_game(
+    Extension(lane): Extension<AuthLane>,
     ApiJson(input): ApiJson<crate::library::CustomInput>,
 ) -> Response {
     if input.title.trim().is_empty() {
         return api_error(StatusCode::BAD_REQUEST, "title must not be empty");
+    }
+    if let Some(denied) = check_entry_fields(lane, &input.art, input.launch.as_ref(), &input.prep) {
+        return denied;
     }
     match crate::library::add_custom(input) {
         Ok(entry) => (StatusCode::CREATED, Json(entry)).into_response(),
@@ -169,11 +229,15 @@ pub(crate) async fn create_custom_game(
     )
 )]
 pub(crate) async fn update_custom_game(
+    Extension(lane): Extension<AuthLane>,
     Path(id): Path<String>,
     ApiJson(input): ApiJson<crate::library::CustomInput>,
 ) -> Response {
     if input.title.trim().is_empty() {
         return api_error(StatusCode::BAD_REQUEST, "title must not be empty");
+    }
+    if let Some(denied) = check_entry_fields(lane, &input.art, input.launch.as_ref(), &input.prep) {
+        return denied;
     }
     use crate::library::MutateOutcome;
     match crate::library::update_custom(&id, input) {
@@ -278,6 +342,7 @@ pub(crate) struct ReconcileQuery {
     )
 )]
 pub(crate) async fn reconcile_provider_entries(
+    Extension(lane): Extension<AuthLane>,
     Path(provider): Path<String>,
     Query(q): Query<ReconcileQuery>,
     ApiJson(inputs): ApiJson<Vec<crate::library::ProviderEntryInput>>,
@@ -293,6 +358,18 @@ pub(crate) async fn reconcile_provider_entries(
     }
     if let Err(e) = crate::library::validate_provider_payload(&inputs) {
         return api_error(StatusCode::BAD_REQUEST, &e);
+    }
+    // Every entry in the payload, not just the first — a reconcile replaces a whole entry set, so
+    // one privileged field anywhere in it is one command execution.
+    for (i, e) in inputs.iter().enumerate() {
+        if let Some(denied) = check_entry_fields(lane, &e.art, e.launch.as_ref(), &e.prep) {
+            tracing::warn!(
+                provider,
+                index = i,
+                "library reconcile refused: payload carries a field this lane may not set"
+            );
+            return denied;
+        }
     }
     match crate::library::reconcile_provider(&provider, store.as_deref(), inputs) {
         Ok(crate::library::MutateOutcome::Done(entries)) => {
