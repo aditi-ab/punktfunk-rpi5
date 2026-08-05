@@ -270,6 +270,8 @@
 	"library_field_logo": "Logo-Bild-URL",
 	"library_field_command": "Startbefehl",
 	"library_field_command_help": "Optional. Der Befehl, mit dem der Host diesen Titel startet.",
+	"library_field_password": "Konsolen-Passwort",
+	"library_field_password_help": "Ein Startbefehl l\u00e4uft auf dem Host mit deinen Rechten. Best\u00e4tige zum Speichern dein Konsolen-Passwort.",
 	"library_field_platform": "Plattform",
 	"library_field_platform_help": "Das System, auf dem dieser Titel läuft, z. B. PS2, Xbox 360, SNES, PC.",
 	"library_field_description": "Beschreibung",

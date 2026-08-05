@@ -120,6 +120,21 @@ export const SectionPlugin: FC = () => {
 					className="w-full flex-1 rounded-lg border bg-card"
 					// The plugin is operator-installed code on our own origin (no new trust boundary —
 					// plugin-ui-surface §7.4); allow it to run scripts, forms, popups, and full-window.
+					//
+					// ⚠ KNOWN GAP — security-review-2026-08-05 H-3. `allow-same-origin` means plugin JS
+					// runs as first-party on the console origin, so it can `fetch('/api/**')` with the
+					// operator's session and the BFF attaches the ADMIN bearer — reaching everything
+					// `plugin_may_access` withholds (arm pairing, read the PIN, approve a device, read
+					// `/hooks`). The "open in new tab" link above is the same escalation without any
+					// iframe at all, so the sandbox attribute alone is not where this gets fixed.
+					//
+					// Simply dropping `allow-same-origin` does NOT work: a sandboxed document has an
+					// opaque origin, its subresource requests are then treated as cross-site, the
+					// `SameSite=Lax` `pf_session` cookie is not sent, and every plugin asset 302s to
+					// /login — a blank frame. The real fix is to serve `/plugin-ui/**` from a distinct
+					// ORIGIN (a second listener on another port: different origin so the same-origin
+					// policy is the boundary, but still the same *site*, so the cookie keeps flowing),
+					// which changes the console's listener/deploy model and needs on-glass validation.
 					sandbox="allow-scripts allow-forms allow-popups allow-same-origin allow-modals"
 					allow="fullscreen"
 				/>

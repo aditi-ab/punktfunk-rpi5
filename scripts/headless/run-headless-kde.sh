@@ -52,7 +52,19 @@ fi
 # it `kwin_wayland --virtual` brings up NO X server at all (no display reserved), and those apps die
 # with "Missing X Server or $DISPLAY". KWin starts Xwayland on demand but reserves + logs the X11
 # display up front, which the detection below reads.
-KWIN_LOG="${TMPDIR:-/tmp}/punktfunk-kwin.log"
+# The log lives in the per-user 0700 XDG_RUNTIME_DIR, not at a fixed name in a world-writable
+# /tmp. This file is not just a log: the DISPLAY detection below GREPS it for "Using public X11
+# display :N" and exports the result, so at a predictable path in a shared directory any local user
+# could pre-create it (or symlink it) and steer the DISPLAY of a shipped systemd service
+# (2026-08-05 review L-15). `pf-vdisplay` already resolves XDG_RUNTIME_DIR for its own paths; this
+# matches. Without a runtime dir, fall back to a private mktemp rather than a guessable name.
+if [[ -n "${XDG_RUNTIME_DIR:-}" && -d "${XDG_RUNTIME_DIR}" ]]; then
+    KWIN_LOG="${XDG_RUNTIME_DIR}/punktfunk-kwin.log"
+    : >"$KWIN_LOG"
+    chmod 600 "$KWIN_LOG"
+else
+    KWIN_LOG="$(mktemp -t punktfunk-kwin.XXXXXXXX.log)"
+fi
 kwin_wayland --virtual --xwayland --width "$W" --height "$H" --no-lockscreen \
     --socket "$WAYLAND_DISPLAY" >"$KWIN_LOG" 2>&1 &
 KWIN_PID=$!

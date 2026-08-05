@@ -4,8 +4,17 @@ _ensure_update_group() {
   getent group punktfunk-update >/dev/null 2>&1 || groupadd --system punktfunk-update 2>/dev/null || true
 }
 
+_ensure_punktfunk_group() {
+  # Owns the usbip vhci attach/detach nodes (60-punktfunk.rules). Separate from 'input' on
+  # purpose: writing 'attach' materialises an arbitrary emulated USB device, which is a root-only
+  # kernel primitive and must not ride on the group users are told to join for gamepads
+  # (security-review 2026-08-05 M-4).
+  getent group punktfunk >/dev/null 2>&1 || groupadd --system punktfunk 2>/dev/null || true
+}
+
 post_install() {
   _ensure_update_group
+  _ensure_punktfunk_group
   udevadm control --reload-rules 2>/dev/null || true
   udevadm trigger --subsystem-match=misc 2>/dev/null || true
   # Apply the UDP socket-buffer tuning now (also auto-applied at boot by systemd-sysctl).
@@ -14,6 +23,9 @@ post_install() {
 punktfunk-host installed.
   1. Add yourself to the 'input' group for virtual gamepads:
        sudo usermod -aG input "$USER"     # then re-login
+     Only if you want the virtual Steam Deck pad (usbip), ALSO join 'punktfunk':
+       sudo usermod -aG punktfunk "$USER"
+     That group can emulate arbitrary USB devices — join it only on a machine you trust.
   2. Pick a backend config (gamescope is the no-desktop default on SteamOS/Deck):
        mkdir -p ~/.config/punktfunk
        cp /usr/share/punktfunk/host.env.bazzite ~/.config/punktfunk/host.env

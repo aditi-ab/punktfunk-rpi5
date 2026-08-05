@@ -270,6 +270,8 @@
 	"library_field_logo": "Logo art URL",
 	"library_field_command": "Launch command",
 	"library_field_command_help": "Optional. The command the host runs to launch this title.",
+	"library_field_password": "Console password",
+	"library_field_password_help": "A launch command runs on the host as you. Confirm your console password to save it.",
 	"library_field_platform": "Platform",
 	"library_field_platform_help": "The system this title runs on, e.g. PS2, Xbox 360, SNES, PC.",
 	"library_field_description": "Description",

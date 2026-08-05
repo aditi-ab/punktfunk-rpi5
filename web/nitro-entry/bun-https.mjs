@@ -83,6 +83,16 @@ const server = Bun.serve({
 	// proxied `/api/v1/events` stream (or any other quiet long-lived response) gets cut by us and
 	// reconnects on a loop. 120 s is comfortably above any keep-alive we forward; still overridable.
 	idleTimeout: Number.parseInt(process.env.NITRO_BUN_IDLE_TIMEOUT, 10) || 120,
+	// Cap the request body an UNAUTHENTICATED peer can make us hold in memory.
+	//
+	// `fetch` below buffers the whole body with `await req.arrayBuffer()` before Nitro — and
+	// therefore before the auth gate — has seen the request, so Bun's 128 MB default was the only
+	// bound on what a LAN peer could push into console RSS by POSTing to /login (2026-08-05 review
+	// L-10). Nothing the console legitimately accepts is remotely this large: the biggest real body
+	// is a hooks/library JSON edit, kilobytes. 4 MiB leaves several orders of headroom and still
+	// makes the memory cost of an unauthenticated request negligible.
+	maxRequestBodySize:
+		Number.parseInt(process.env.NITRO_BUN_MAX_BODY_BYTES, 10) || 4 * 1024 * 1024,
 	// `tls: undefined` ⇒ plain HTTP (dev); otherwise HTTPS over HTTP/1.1.
 	tls,
 	websocket: import.meta._websocket ? ws.websocket : undefined,
