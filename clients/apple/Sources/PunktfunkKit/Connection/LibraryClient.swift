@@ -94,9 +94,16 @@ public enum LibraryError: LocalizedError {
         case .http(let code):
             return "The management API returned HTTP \(code)."
         case .unreachable(let why):
-            return "Couldn't reach the host's management API: \(why). It binds the LAN by default, "
-                + "so check the host is updated and reachable (a host pinned to "
-                + "`--mgmt-bind 127.0.0.1` is loopback-only and can't be browsed remotely)."
+            // The library rides a DIFFERENT port than the stream (the management API, 47990 by
+            // default; the stream is QUIC on 9777), so it can fail while streaming to the same
+            // host works perfectly — say that first, because the opposite assumption has sent
+            // more than one person hunting the wrong layer. Opening that URL in a browser is the
+            // fastest way to tell "port unreachable" apart from anything client-side.
+            return "Couldn't reach the host's management API: \(why). The library uses a "
+                + "different port than the stream (47990 by default), so streaming can work "
+                + "while this doesn't. Check that port is reachable from this device, and that "
+                + "the host isn't pinned to `--mgmt-bind 127.0.0.1`, which serves it to the "
+                + "host itself only."
         }
     }
 }
