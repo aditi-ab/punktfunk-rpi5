@@ -1,12 +1,14 @@
 //! Title launch: resolve a library id / raw command into an executable command line (per-store +
 //! per-OS), and the gamescope-session launch helpers. Split out of the `library` facade (plan §W5).
+//!
+//! This module owns the **whole launch side** of the library: the `kind` vocabulary, its per-kind
+//! charset validators, and the per-OS resolvers. That split is deliberate and load-bearing — the
+//! scanner modules beside it do *enumeration only*, so they can be lifted out into library plugins
+//! without taking any launch logic with them (design/library-scanner-plugins.md D1: a client sends
+//! only an entry id and the host resolves the [`LaunchSpec`] it holds, which stays true whether the
+//! entry was enumerated in-process or reconciled in by a plugin).
 
-use super::custom::valid_steam_appid;
-#[cfg(target_os = "linux")]
-use super::heroic::heroic_command;
 use super::*;
-#[cfg(windows)]
-use super::{epic::epic_launch_uri, gog::gog_spawn};
 
 /// Everything a session needs about the title it is launching, resolved in **one** library scan:
 /// what to run, what to call it, and how to recognize it once it is running.
@@ -191,6 +193,112 @@ fn steam_exe() -> Option<std::path::PathBuf> {
     None
 }
 
+// ------------------------------------------------------- per-kind launch values (host-owned ABI)
+//
+// Each helper below turns a store's launch VALUE — the only part a scanner (or, after extraction, a
+// library plugin) supplies — into the URI/command line the host actually runs. They live here rather
+// than beside the enumeration that produces the value because the host keeps owning URI construction
+// and spawning no matter where the enumeration came from (D1). Every one of them is total and
+// validating: an unparseable or hostile value yields `None`, never a partially-interpolated command.
+
+/// A digits-only Steam appid: the sole client-influenced part of a Steam launch, validated before it
+/// is interpolated into any command / URI (so a client-sent id can never carry shell or URI syntax).
+/// Cross-platform — used by the Linux shell mapping ([`command_for`]) and the Windows spawn mapping
+/// ([`windows_launch_for`]).
+///
+/// Also accepts the 64-bit non-Steam-shortcut game id ([`shortcut_gameid`]), which is likewise
+/// digits — the two share the `steam_appid` kind precisely because `rungameid` takes either.
+pub(crate) fn valid_steam_appid(value: &str) -> bool {
+    !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// The 64-bit game id `steam://rungameid/` needs to launch a non-Steam shortcut: high dword = the
+/// 32-bit shortcut appid, low dword = the shortcut marker `0x0200_0000`. (Handing `rungameid` the
+/// bare 32-bit appid does not launch a shortcut — it must be this composed id.)
+pub(crate) fn shortcut_gameid(appid: u32) -> u64 {
+    ((appid as u64) << 32) | 0x0200_0000
+}
+
+/// Map a `heroic` LaunchSpec value (`<runner>:<appName>`) to the Heroic launch command, run nested in
+/// gamescope. The host owns this mapping; the client only ever sends the id. CAVEAT: Heroic is a
+/// single-instance Electron app — in a fresh per-session gamescope it boots, launches the game (which
+/// renders into that gamescope) and stays hidden via `--no-gui`; but if a Heroic GUI is ALREADY
+/// running on the box, the spawned process forwards the URI and exits, which would tear the session
+/// down. The validated path is the fresh-session case; needs live confirmation on a box with Heroic.
+#[cfg(target_os = "linux")]
+pub(crate) fn heroic_command(value: &str) -> Option<String> {
+    let (runner, app) = value.split_once(':')?;
+    if !matches!(runner, "legendary" | "gog" | "nile") {
+        return None;
+    }
+    // appName charset (Epic alnum, GOG digits, Amazon alnum) — keep the URI a single safe token.
+    if app.is_empty()
+        || !app
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    {
+        return None;
+    }
+    let prefix = heroic_launch_prefix()?;
+    // No quotes: gamescope spawns the app by `split_whitespace()`, and the URI has no spaces (appName
+    // is validated above) so it stays a single argv token; `&` is fine (exec'd, not shell-parsed).
+    Some(format!(
+        "{prefix} --no-gui heroic://launch?appName={app}&runner={runner}"
+    ))
+}
+
+/// How to invoke Heroic: the native `heroic` binary if on `PATH`, else the Flatpak app if its data
+/// root is present. `None` ⇒ Heroic not found, so no launch command.
+#[cfg(target_os = "linux")]
+fn heroic_launch_prefix() -> Option<String> {
+    let on_path = std::env::var_os("PATH")
+        .is_some_and(|paths| std::env::split_paths(&paths).any(|d| d.join("heroic").is_file()));
+    if on_path {
+        return Some("heroic".into());
+    }
+    let flatpak = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .is_some_and(|h| h.join(".var/app/com.heroicgameslauncher.hgl").is_dir());
+    flatpak.then(|| "flatpak run com.heroicgameslauncher.hgl".into())
+}
+
+/// Map an `epic` LaunchSpec value to the Epic Games Launcher URI. The value is either the full
+/// `<namespace>:<catalogItemId>:<appName>` triple (what the manifests carry) or a bare `appName`;
+/// every part is charset-checked so the URI stays one safe argv token.
+#[cfg(windows)]
+pub(crate) fn epic_launch_uri(value: &str) -> Option<String> {
+    let ok = |s: &str| {
+        !s.is_empty()
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    };
+    let inner = match value.split(':').collect::<Vec<_>>().as_slice() {
+        [ns, cat, app] if ok(ns) && ok(cat) && ok(app) => format!("{ns}%3A{cat}%3A{app}"),
+        [app] if ok(app) => (*app).to_string(),
+        _ => return None,
+    };
+    Some(format!(
+        "com.epicgames.launcher://apps/{inner}?action=launch&silent=true"
+    ))
+}
+
+/// Map a `gog` LaunchSpec value — the tab-separated `exe \t args \t workdir` spawn triple the scanner
+/// derived from `goggame-<id>.info` — to a `(command line, working dir)`. GOG games are spawned
+/// directly (no Galaxy), so the exe is quoted and the arguments ride verbatim.
+#[cfg(windows)]
+pub(crate) fn gog_spawn(value: &str) -> Option<(String, Option<PathBuf>)> {
+    let mut parts = value.split('\t');
+    let exe = parts.next().filter(|s| !s.is_empty())?;
+    let args = parts.next().unwrap_or("");
+    let workdir = parts.next().filter(|s| !s.is_empty()).map(PathBuf::from);
+    let cmdline = if args.trim().is_empty() {
+        format!("\"{exe}\"")
+    } else {
+        format!("\"{exe}\" {args}")
+    };
+    Some((cmdline, workdir))
+}
+
 /// Launch a GameStream `apps.json` command (operator-typed, trusted — never client-set) into the
 /// interactive Windows user session, AFTER capture is up (the host is SYSTEM). The Linux paths go
 /// through the compositor-aware [`launch_session_command`] instead.
@@ -358,6 +466,54 @@ mod tests {
             assert!(cmd.contains("heroic://launch?appName=Quail-1.2_x&runner=legendary"));
             assert!(cmd.contains("--no-gui"));
         }
+    }
+
+    #[test]
+    fn steam_appid_validation_accepts_appids_and_shortcut_gameids() {
+        assert!(valid_steam_appid("570"));
+        // The 64-bit shortcut game id shares the `steam_appid` kind — `rungameid` takes either.
+        assert!(valid_steam_appid(
+            &shortcut_gameid(2_456_789_012).to_string()
+        ));
+        assert!(!valid_steam_appid(""));
+        assert!(!valid_steam_appid("570; rm -rf ~"));
+        assert!(!valid_steam_appid("-1"));
+    }
+
+    /// Moved here with `shortcut_gameid` (WP1.1): the composed id is launch vocabulary, not
+    /// enumeration — the scanner only supplies the 32-bit appid it read out of `shortcuts.vdf`.
+    #[test]
+    fn shortcut_gameid_composes_appid_and_marker() {
+        let id = shortcut_gameid(0x8000_0000);
+        assert_eq!(id >> 32, 0x8000_0000, "high dword is the shortcut appid");
+        assert_eq!(id & 0xFFFF_FFFF, 0x0200_0000, "low dword is the marker");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn epic_launch_uri_triple_bare_and_guard() {
+        assert_eq!(
+            epic_launch_uri("fn:abc:Fortnite").as_deref(),
+            Some("com.epicgames.launcher://apps/fn%3Aabc%3AFortnite?action=launch&silent=true")
+        );
+        assert_eq!(
+            epic_launch_uri("Fortnite").as_deref(),
+            Some("com.epicgames.launcher://apps/Fortnite?action=launch&silent=true")
+        );
+        assert!(epic_launch_uri("bad part:x:y").is_none()); // a space → rejected
+        assert!(epic_launch_uri("").is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn gog_spawn_parses_and_guards() {
+        let (cmd, wd) = gog_spawn("C:\\Games\\W3\\witcher3.exe\t--skip\tC:\\Games\\W3").unwrap();
+        assert_eq!(cmd, "\"C:\\Games\\W3\\witcher3.exe\" --skip");
+        assert_eq!(wd, Some(std::path::PathBuf::from("C:\\Games\\W3")));
+        let (cmd2, wd2) = gog_spawn("C:\\g.exe").unwrap();
+        assert_eq!(cmd2, "\"C:\\g.exe\"");
+        assert!(wd2.is_none());
+        assert!(gog_spawn("").is_none());
     }
 
     #[cfg(windows)]

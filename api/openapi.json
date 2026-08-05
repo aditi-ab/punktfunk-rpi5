@@ -10,7 +10,7 @@
       "name": "MIT OR Apache-2.0",
       "identifier": "MIT OR Apache-2.0"
     },
-    "version": "0.23.0"
+    "version": "0.24.0"
   },
   "paths": {
     "/api/v1/clients": {
@@ -1052,7 +1052,7 @@
           "library"
         ],
         "summary": "Fetch one cover-art image for a library entry",
-        "description": "Resolves `kind` (`portrait` | `hero` | `logo` | `header`) for the given library id and streams\nthe image bytes. For a Steam title, the host's own local Steam cache is tried first (exact —\nit's what the user's Steam client already shows for it), the public Steam CDN's flat URL\nconvention as a fallback (newer titles' CDN assets can live at a per-asset-hash path the host\ncan't predict, in which case this 404s and the client falls through to its next art candidate).\nOnly Steam ids are backed today; any other store 404s.",
+        "description": "Resolves `kind` (`portrait` | `hero` | `logo` | `header`) for the given library id and streams\nthe image bytes. Any id stored in the host's catalog (manual entries, provider-synced entries,\nand a library plugin's claimed-store entries) serves its local art file. A Steam title falls back\nto the in-host scanner's resolver: the host's own local Steam cache first (exact — it's what the\nuser's Steam client already shows for it), the public Steam CDN's flat URL convention second\n(newer titles' CDN assets can live at a per-asset-hash path the host can't predict, in which case\nthis 404s and the client falls through to its next art candidate).",
         "operationId": "getLibraryArt",
         "parameters": [
           {

@@ -186,25 +186,8 @@ fn epic_art_index(catcache: &Path) -> std::collections::HashMap<String, Artwork>
     map
 }
 
-/// Build the `com.epicgames.launcher://` launch URI from a stored launch value — the triple
-/// `<namespace>:<catalogItemId>:<appName>` (colons URL-encoded), or a bare `<appName>` fallback.
-/// Each part is charset-validated (host-derived, but belt-and-suspenders) so no shell/URI injection.
-#[cfg(windows)]
-pub(crate) fn epic_launch_uri(value: &str) -> Option<String> {
-    let ok = |s: &str| {
-        !s.is_empty()
-            && s.bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
-    };
-    let inner = match value.split(':').collect::<Vec<_>>().as_slice() {
-        [ns, cat, app] if ok(ns) && ok(cat) && ok(app) => format!("{ns}%3A{cat}%3A{app}"),
-        [app] if ok(app) => (*app).to_string(),
-        _ => return None,
-    };
-    Some(format!(
-        "com.epicgames.launcher://apps/{inner}?action=launch&silent=true"
-    ))
-}
+// The `epic` launch mapping (`epic_launch_uri`) lives in `launch.rs` (WP1.1) — this module
+// enumerates, it does not launch.
 
 #[cfg(test)]
 mod tests {
@@ -235,20 +218,5 @@ mod tests {
         let gone = serde_json::json!({"AppName":"Gone","InstallLocation":"C:\\nope-xyz","AppCategories":["games"]});
         assert!(epic_entry(&gone, &empty).is_none());
         std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn epic_launch_uri_triple_bare_and_guard() {
-        assert_eq!(
-            epic_launch_uri("fn:abc:Fortnite").as_deref(),
-            Some("com.epicgames.launcher://apps/fn%3Aabc%3AFortnite?action=launch&silent=true")
-        );
-        assert_eq!(
-            epic_launch_uri("Fortnite").as_deref(),
-            Some("com.epicgames.launcher://apps/Fortnite?action=launch&silent=true")
-        );
-        assert!(epic_launch_uri("bad part:x:y").is_none()); // a space → rejected
-        assert!(epic_launch_uri("").is_none());
     }
 }

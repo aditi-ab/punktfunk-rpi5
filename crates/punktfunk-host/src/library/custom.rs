@@ -101,7 +101,7 @@ impl From<CustomEntry> for GameEntry {
             .unwrap_or_default()
             .or_hint(&c.detect);
         GameEntry {
-            id: format!("custom:{}", c.id),
+            id: library_id_for(&c),
             store: "custom".into(),
             title: c.title,
             art: c.art,
@@ -133,22 +133,42 @@ pub fn load_custom() -> Vec<CustomEntry> {
     }
 }
 
-/// Serve a custom/provider entry's stored **local** art file for one [`ArtKind`] — the non-Steam
-/// branch of the art proxy (`GET /library/art/custom:<id>/<kind>`). `id` is the bare custom id (the
-/// `custom:` prefix already stripped by the handler). `None` if the entry is unknown, has no art of
-/// that kind, or that art value isn't a servable local file (e.g. an `http` URL the client fetches
-/// itself). Blocking IO — call off the async runtime.
-pub fn custom_local_art_bytes(id: &str, kind: ArtKind) -> Option<(Vec<u8>, String)> {
-    let entry = load_custom().into_iter().find(|e| e.id == id)?;
-    let field = match kind {
-        ArtKind::Portrait => entry.art.portrait,
-        ArtKind::Hero => entry.art.hero,
-        ArtKind::Logo => entry.art.logo,
-        ArtKind::Header => entry.art.header,
-    }?;
+/// The library id a stored entry surfaces as. **The single source of truth for the mapping** —
+/// [`From<CustomEntry> for GameEntry`] and every id→entry lookup go through it, so a change to the
+/// id scheme (the store claims of D2 will make claimed entries `<store>:<external_id>`) lands in one
+/// place instead of drifting between the catalog and the art proxy.
+pub(crate) fn library_id_for(e: &CustomEntry) -> String {
+    format!("custom:{}", e.id)
+}
+
+/// The stored entry a full **library id** refers to, or `None`. The art proxy resolves *any* id this
+/// way before falling back to the legacy per-store branches (WP1.2), which is what lets a plugin's
+/// entries be served regardless of what their ids look like.
+pub fn entry_for_library_id(library_id: &str) -> Option<CustomEntry> {
+    load_custom()
+        .into_iter()
+        .find(|e| library_id_for(e) == library_id)
+}
+
+/// Serve a stored entry's **local** art file for one [`ArtKind`] — the `library.json` branch of the
+/// art proxy (`GET /library/art/<library id>/<kind>`). `None` if the id names no stored entry, it has
+/// no art of that kind, or that art value isn't a servable local file (e.g. an `http` URL the client
+/// fetches itself). Blocking IO — call off the async runtime.
+pub fn library_local_art_bytes(library_id: &str, kind: ArtKind) -> Option<(Vec<u8>, String)> {
+    let field = art_field(&entry_for_library_id(library_id)?.art, kind)?;
     is_local_art_path(&field)
         .then(|| local_art_bytes(&field))
         .flatten()
+}
+
+/// One [`Artwork`] field by kind — the tiny mapping the proxy and the box-art ladder share.
+pub(crate) fn art_field(art: &Artwork, kind: ArtKind) -> Option<String> {
+    match kind {
+        ArtKind::Portrait => art.portrait.clone(),
+        ArtKind::Hero => art.hero.clone(),
+        ArtKind::Logo => art.logo.clone(),
+        ArtKind::Header => art.header.clone(),
+    }
 }
 
 fn save_custom(entries: &[CustomEntry]) -> Result<()> {
@@ -375,13 +395,7 @@ fn emit_changed(source: &str) {
     });
 }
 
-/// A digits-only Steam appid: the sole client-influenced part of a Steam launch, validated before it
-/// is interpolated into any command / URI (so a client-sent id can never carry shell or URI syntax).
-/// Cross-platform — used by the Linux shell mapping ([`command_for`]) and the Windows spawn mapping
-/// ([`windows_launch_for`]).
-pub(crate) fn valid_steam_appid(value: &str) -> bool {
-    !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit())
-}
+// `valid_steam_appid` moved to `launch.rs` (WP1.1) — it validates a launch value, not a store entry.
 
 #[cfg(test)]
 mod tests {

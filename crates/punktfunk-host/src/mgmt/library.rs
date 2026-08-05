@@ -306,11 +306,12 @@ pub(crate) async fn delete_provider_entries(Path(provider): Path<String>) -> Res
 /// Fetch one cover-art image for a library entry
 ///
 /// Resolves `kind` (`portrait` | `hero` | `logo` | `header`) for the given library id and streams
-/// the image bytes. For a Steam title, the host's own local Steam cache is tried first (exact —
-/// it's what the user's Steam client already shows for it), the public Steam CDN's flat URL
-/// convention as a fallback (newer titles' CDN assets can live at a per-asset-hash path the host
-/// can't predict, in which case this 404s and the client falls through to its next art candidate).
-/// Only Steam ids are backed today; any other store 404s.
+/// the image bytes. Any id stored in the host's catalog (manual entries, provider-synced entries,
+/// and a library plugin's claimed-store entries) serves its local art file. A Steam title falls back
+/// to the in-host scanner's resolver: the host's own local Steam cache first (exact — it's what the
+/// user's Steam client already shows for it), the public Steam CDN's flat URL convention second
+/// (newer titles' CDN assets can live at a per-asset-hash path the host can't predict, in which case
+/// this 404s and the client falls through to its next art candidate).
 #[utoipa::path(
     get,
     path = "/library/art/{id}/{kind}",
@@ -330,7 +331,20 @@ pub(crate) async fn get_library_art(Path((id, kind)): Path<(String, String)>) ->
     let Some(kind) = crate::library::ArtKind::parse(&kind) else {
         return api_error(StatusCode::NOT_FOUND, "unknown art kind");
     };
-    // Steam: CDN / local-cache proxy (id `steam:<appid>`).
+    // `library.json` FIRST, for ANY id (WP1.2). Stored entries — manual, provider-synced, and (once
+    // store claims land) a scanner plugin's `steam:570` — all serve their local art file from here,
+    // so the proxy never has to know which store an id belongs to. Steam ids aren't stored today, so
+    // this misses and the legacy branch below still answers them.
+    let stored = {
+        let id = id.clone();
+        tokio::task::spawn_blocking(move || crate::library::library_local_art_bytes(&id, kind))
+            .await
+    };
+    if let Ok(Some((bytes, ctype))) = stored {
+        return ([(header::CONTENT_TYPE, ctype)], bytes).into_response();
+    }
+    // Legacy in-host Steam scanner: local Steam cache, then the flat CDN URL. Retired with the
+    // scanner itself once the steam plugin claims the store (M6).
     if let Some(appid) = id
         .strip_prefix("steam:")
         .and_then(|s| s.parse::<u32>().ok())
@@ -344,17 +358,5 @@ pub(crate) async fn get_library_art(Path((id, kind)): Path<(String, String)>) ->
             _ => api_error(StatusCode::NOT_FOUND, "no art of that kind for this title"),
         };
     }
-    // Custom/provider entry (id `custom:<id>`): serve its stored LOCAL art file — e.g. the Playnite
-    // plugin's covers, reconciled as on-host paths rather than inlined bytes.
-    if let Some(cid) = id.strip_prefix("custom:").map(str::to_owned) {
-        return match tokio::task::spawn_blocking(move || {
-            crate::library::custom_local_art_bytes(&cid, kind)
-        })
-        .await
-        {
-            Ok(Some((bytes, ctype))) => ([(header::CONTENT_TYPE, ctype)], bytes).into_response(),
-            _ => api_error(StatusCode::NOT_FOUND, "no art of that kind for this title"),
-        };
-    }
-    api_error(StatusCode::NOT_FOUND, "no art proxy for this store")
+    api_error(StatusCode::NOT_FOUND, "no art of that kind for this title")
 }

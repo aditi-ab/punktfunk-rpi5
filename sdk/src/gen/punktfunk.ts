@@ -1543,11 +1543,12 @@ readonly "getHostInfo": <Config extends OperationConfig>(options: { readonly con
 readonly "getLibrary": <Config extends OperationConfig>(options: { readonly params?: typeof GetLibraryParams.Encoded | undefined; readonly config?: Config | undefined } | undefined) => Effect.Effect<WithOptionalResponse<typeof GetLibrary200.Type, Config>, HttpClientError.HttpClientError | SchemaError | PunktfunkError<"GetLibrary401", typeof GetLibrary401.Type>>
   /**
 * Resolves `kind` (`portrait` | `hero` | `logo` | `header`) for the given library id and streams
-* the image bytes. For a Steam title, the host's own local Steam cache is tried first (exact —
-* it's what the user's Steam client already shows for it), the public Steam CDN's flat URL
-* convention as a fallback (newer titles' CDN assets can live at a per-asset-hash path the host
-* can't predict, in which case this 404s and the client falls through to its next art candidate).
-* Only Steam ids are backed today; any other store 404s.
+* the image bytes. Any id stored in the host's catalog (manual entries, provider-synced entries,
+* and a library plugin's claimed-store entries) serves its local art file. A Steam title falls back
+* to the in-host scanner's resolver: the host's own local Steam cache first (exact — it's what the
+* user's Steam client already shows for it), the public Steam CDN's flat URL convention second
+* (newer titles' CDN assets can live at a per-asset-hash path the host can't predict, in which case
+* this 404s and the client falls through to its next art candidate).
 */
 readonly "getLibraryArt": <Config extends OperationConfig>(id: string, kind: string, options: { readonly config?: Config | undefined } | undefined) => Effect.Effect<WithOptionalResponse<void, Config>, HttpClientError.HttpClientError | SchemaError | PunktfunkError<"GetLibraryArt401", typeof GetLibraryArt401.Type> | PunktfunkError<"GetLibraryArt404", typeof GetLibraryArt404.Type>>
   /**

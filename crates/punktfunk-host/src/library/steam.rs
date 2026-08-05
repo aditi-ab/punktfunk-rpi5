@@ -426,12 +426,8 @@ fn shortcuts_files() -> Vec<PathBuf> {
     files
 }
 
-/// The 64-bit game id `steam://rungameid/` needs to launch a non-Steam shortcut: high dword = the
-/// 32-bit shortcut appid, low dword = the shortcut marker `0x0200_0000`. (Handing `rungameid` the
-/// bare 32-bit appid does not launch a shortcut — it must be this composed id.)
-fn shortcut_gameid(appid: u32) -> u64 {
-    ((appid as u64) << 32) | 0x0200_0000
-}
+// `shortcut_gameid` (the 64-bit `rungameid` composition) moved to `launch.rs` (WP1.1) — it is launch
+// vocabulary; this module only reads the 32-bit appid out of `shortcuts.vdf`.
 
 /// The 32-bit appid Steam derives for a shortcut from its target+name — `crc32(exe + name)` with the
 /// high bit set. Only used when `shortcuts.vdf` omits the stored `appid` (very old Steam); modern
@@ -762,12 +758,7 @@ mod tests {
         assert!(launch.value.bytes().all(|b| b.is_ascii_digit()));
     }
 
-    #[test]
-    fn shortcut_gameid_composes_appid_and_marker() {
-        let id = shortcut_gameid(0x8000_0000);
-        assert_eq!(id >> 32, 0x8000_0000); // high dword is the appid
-        assert_eq!(id & 0xFFFF_FFFF, 0x0200_0000); // low dword is the shortcut marker
-    }
+    // `shortcut_gameid_composes_appid_and_marker` moved with the function to `launch.rs` (WP1.1).
 
     #[test]
     fn crc32_matches_the_known_check_value_and_derives_a_high_bit_appid() {

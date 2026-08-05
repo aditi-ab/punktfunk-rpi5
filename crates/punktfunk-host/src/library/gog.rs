@@ -133,37 +133,12 @@ fn gog_play_task(install: &str, id: &str) -> Option<(String, String, String)> {
     ))
 }
 
-/// Build the spawn `(command line, working dir)` for a `gog` launch value (`exe \t args \t workdir`,
-/// all host-resolved from the operator's own disk). Direct exe — no shell, no Galaxy.
-#[cfg(windows)]
-pub(crate) fn gog_spawn(value: &str) -> Option<(String, Option<PathBuf>)> {
-    let mut parts = value.split('\t');
-    let exe = parts.next().filter(|s| !s.is_empty())?;
-    let args = parts.next().unwrap_or("");
-    let workdir = parts.next().filter(|s| !s.is_empty()).map(PathBuf::from);
-    let cmdline = if args.trim().is_empty() {
-        format!("\"{exe}\"")
-    } else {
-        format!("\"{exe}\" {args}")
-    };
-    Some((cmdline, workdir))
-}
+// The `gog` launch mapping (`gog_spawn`) lives in `launch.rs` (WP1.1) — this module enumerates and
+// resolves the spawn triple off disk, but turning that triple into a command line is launch-side.
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[cfg(windows)]
-    #[test]
-    fn gog_spawn_parses_and_guards() {
-        let (cmd, wd) = gog_spawn("C:\\Games\\W3\\witcher3.exe\t--skip\tC:\\Games\\W3").unwrap();
-        assert_eq!(cmd, "\"C:\\Games\\W3\\witcher3.exe\" --skip");
-        assert_eq!(wd, Some(std::path::PathBuf::from("C:\\Games\\W3")));
-        let (cmd2, wd2) = gog_spawn("C:\\g.exe").unwrap();
-        assert_eq!(cmd2, "\"C:\\g.exe\"");
-        assert!(wd2.is_none());
-        assert!(gog_spawn("").is_none());
-    }
 
     #[cfg(windows)]
     #[test]
