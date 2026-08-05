@@ -127,7 +127,14 @@ pub struct SlicePlan {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RefPic {
     pub id: PicId,
-    pub poc: i32,
+    /// The stored picture's 8.2.1 field order counts. Equal for a progressive frame
+    /// UNLESS the PPS set `bottom_field_pic_order_in_frame_present_flag` and the
+    /// slice carried a nonzero `delta_pic_order_cnt_bottom` — backend picparams
+    /// formats want the pair, and collapsing to one value would fabricate the bottom
+    /// count. After an MMCO 5 these are the picture's REBASED values (8.2.5.4.5),
+    /// which is what later AUs reference it by — see [`PlanWarning::Mmco5Rebase`].
+    pub top_field_order_cnt: i32,
+    pub bottom_field_order_cnt: i32,
     pub is_long_term: bool,
     /// `frame_num` for short-term references, `LongTermFrameIdx` for long-term ones —
     /// the pair DXVA and Vulkan both key reference pictures by.
@@ -160,6 +167,14 @@ pub enum PlanWarning {
     /// or a slice belonging to another picture (mis-split AU). The plan covers only
     /// the slices before the cut; `offset` is the byte position of the cut in the AU.
     TruncatedAu { offset: usize },
+    /// The AU carried an MMCO 5 (8.2.5.4.5): the DPB was drained and the CURRENT
+    /// picture's stored frame_num/POC were rebased to zero AFTER its plan was
+    /// captured. Spec-legal and fully planned — the [`PicturePlan`] holds the
+    /// pre-rebase 8.2.1 values a decoder submits with, while later AUs reference the
+    /// picture by its rebased values ([`RefPic`] carries the stored pair). punktfunk
+    /// hosts never emit MMCO 5, so this warning is the field signal if that
+    /// assumption ever breaks.
+    Mmco5Rebase,
 }
 
 /// The AU cannot be planned at all.
@@ -508,6 +523,16 @@ impl H264Planner {
         if sps.separate_colour_plane_flag {
             return Err(PlanError::OutsideEnvelope(
                 "separate colour plane coding (separate_colour_plane_flag == 1)",
+            ));
+        }
+        // A.3.1 caps the DPB at 16 frames; the only route past the cap is the VUI's
+        // max_dec_frame_buffering, an unbounded ue(v) the vendored parser reads
+        // uncapped. No hardware decoder implements a deeper DPB — a larger value is a
+        // corrupt (or hostile) VUI, not a feature request — and backends size real
+        // slot pools from this number, so it is gated here, at SPS activation.
+        if sps.max_dpb_frames() > 16 {
+            return Err(PlanError::OutsideEnvelope(
+                "DPB deeper than 16 frames (max_dec_frame_buffering)",
             ));
         }
         Ok(())
@@ -1086,7 +1111,8 @@ impl H264Planner {
                     slots.push(Some((
                         RefPic {
                             id,
-                            poc: pic.pic_order_cnt,
+                            top_field_order_cnt: pic.top_field_order_cnt,
+                            bottom_field_order_cnt: pic.bottom_field_order_cnt,
                             is_long_term,
                             frame_num_or_lt_idx,
                         },
@@ -1119,7 +1145,8 @@ impl H264Planner {
                     if let Some((substitute, frame_num)) = prev_existing.or(first_existing) {
                         out.push(RefPic {
                             id: substitute.id,
-                            poc: substitute.poc,
+                            top_field_order_cnt: substitute.top_field_order_cnt,
+                            bottom_field_order_cnt: substitute.bottom_field_order_cnt,
                             is_long_term: false,
                             frame_num_or_lt_idx: frame_num,
                         });
@@ -1479,6 +1506,7 @@ impl H264Planner {
         self.prev_pic_info.fill(&pic);
 
         if pic.has_mmco_5 {
+            warnings.push(PlanWarning::Mmco5Rebase);
             // C.4.5.3 "Bumping process"
             // The bumping process is invoked in the following cases:
             // Clause 3:
@@ -1566,6 +1594,7 @@ mod tests {
     use cros_codecs::codec::h264::parser::PpsBuilder;
     use cros_codecs::codec::h264::parser::Profile;
     use cros_codecs::codec::h264::parser::SpsBuilder;
+    use cros_codecs::codec::h264::parser::VuiParams;
     use cros_codecs::codec::h264::synthesizer::Synthesizer;
 
     use super::*;
@@ -1704,9 +1733,11 @@ mod tests {
                 let ids1: Vec<PicId> = slice.ref_list1.iter().map(|r| r.id).collect();
                 assert_ne!(ids0, ids1, "list1 must not be list0's ordering");
 
-                // 8.2.4.2.3: list0 leads with the past, list1 with the future.
-                assert!(slice.ref_list0[0].poc < plan.picture.pic_order_cnt);
-                assert!(slice.ref_list1[0].poc > plan.picture.pic_order_cnt);
+                // 8.2.4.2.3: list0 leads with the past, list1 with the future
+                // (a frame's PicOrderCnt is the min of its field order counts).
+                let poc = |r: &RefPic| r.top_field_order_cnt.min(r.bottom_field_order_cnt);
+                assert!(poc(&slice.ref_list0[0]) < plan.picture.pic_order_cnt);
+                assert!(poc(&slice.ref_list1[0]) > plan.picture.pic_order_cnt);
             }
         }
 
@@ -2075,6 +2106,84 @@ mod tests {
             planner.plan_au(&au),
             Err(PlanError::OutsideEnvelope(_))
         ));
+    }
+
+    #[test]
+    fn a_dpb_deeper_than_16_frames_is_rejected_as_outside_the_envelope() {
+        // The one route past the A.3.1 16-frame cap: the VUI bitstream restriction's
+        // max_dec_frame_buffering, an unbounded ue(v) that overrides the level-derived
+        // size in `Sps::max_dpb_frames`. The builder has no VUI-restriction setter, so
+        // the Sps is constructed directly (its fields are public).
+        let sps = Sps {
+            profile_idc: Profile::Main as u8,
+            level_idc: Level::L4,
+            frame_mbs_only_flag: true,
+            direct_8x8_inference_flag: true,
+            max_num_ref_frames: 4,
+            vui_parameters_present_flag: true,
+            vui_parameters: VuiParams {
+                bitstream_restriction_flag: true,
+                max_dec_frame_buffering: 17,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut au = Vec::new();
+        Synthesizer::<'_, Sps, _>::synthesize(3, &sps, &mut au, true).unwrap();
+
+        let err = H264Planner::new().plan_au(&au).unwrap_err();
+        assert!(
+            matches!(err, PlanError::OutsideEnvelope(what) if what.contains("DPB")),
+            "{err:?}"
+        );
+    }
+
+    /// MMCO 5 writer: op 5 takes NO argument (Table 7-9), so the generic
+    /// [`write_p_slice`] — whose supported ops all take exactly one — cannot author
+    /// it.
+    fn write_p_slice_mmco5(frame_num: u32, poc_lsb: u32) -> Vec<u8> {
+        let mut buf = Vec::new();
+        {
+            let mut w = NaluWriter::new(&mut buf, true);
+            w.write_header(1, NaluType::Slice as u8).unwrap();
+            w.write_ue(0u32).unwrap(); // first_mb_in_slice
+            w.write_ue(0u32).unwrap(); // slice_type: P
+            w.write_ue(0u32).unwrap(); // pic_parameter_set_id
+            w.write_f(4, frame_num).unwrap(); // frame_num, u(4)
+            w.write_f(4, poc_lsb).unwrap(); // pic_order_cnt_lsb, u(4)
+            w.write_f(1, 1u32).unwrap(); // num_ref_idx_active_override_flag
+            w.write_ue(0u32).unwrap(); // num_ref_idx_l0_active_minus1
+            w.write_f(1, 0u32).unwrap(); // ref_pic_list_modification_flag_l0
+            w.write_f(1, 1u32).unwrap(); // adaptive_ref_pic_marking_mode_flag
+            w.write_ue(5u32).unwrap(); // memory_management_control_operation 5
+            w.write_ue(0u32).unwrap(); // memory_management_control_operation end
+            w.write_se(0i32).unwrap(); // slice_qp_delta
+            w.write_f(1, 1u32).unwrap(); // rbsp stop bit
+            while !w.aligned() {
+                w.write_f(1, 0u32).unwrap();
+            }
+        }
+        buf
+    }
+
+    #[test]
+    fn an_mmco_5_is_planned_with_a_rebase_warning_not_rejected() {
+        let (sps, pps) = authored_sps_pps();
+        let mut au0 = param_set_au(&sps, &pps);
+        au0.extend(write_idr_slice());
+        let au1 = write_p_slice_mmco5(1, 2);
+
+        let mut planner = H264Planner::new();
+        let p0 = planner.plan_au(&au0).unwrap();
+        let p1 = planner.plan_au(&au1).unwrap();
+
+        assert!(p1.warnings.contains(&PlanWarning::Mmco5Rebase));
+        // The plan carries the pre-rebase 8.2.1 values a decoder submits with; the
+        // zeroed frame_num/POC exist only in the STORED picture later AUs reference.
+        assert_eq!(p1.picture.frame_num, 1);
+        assert_eq!(p1.picture.pic_order_cnt, 2);
+        // And the op's C.4.5.3 clause-3 drain ran: the IDR is display-ready.
+        assert!(p1.dpb.outputs.contains(&p0.dpb.stored.unwrap()));
     }
 
     #[test]

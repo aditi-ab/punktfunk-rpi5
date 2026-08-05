@@ -3216,6 +3216,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "pf-vkdecode"
+version = "0.24.0"
+dependencies = [
+ "ash",
+ "cros-codecs",
+ "pf-bitstream",
+ "tracing",
+]
+
+[[package]]
 name = "pf-win-display"
 version = "0.24.0"
 dependencies = [
