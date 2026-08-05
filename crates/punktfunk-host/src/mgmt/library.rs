@@ -13,15 +13,20 @@ use axum::Extension;
 /// provider plugin must be able to call — reconciling its own entry set is the whole point of a
 /// scanner plugin — while `prep` / `launch.kind = "command"` inside that payload are the operator's
 /// authority alone. Route reachability and field authority are separate questions.
+///
+/// `Some(response)` is the refusal to return; `None` means the payload may proceed. Deliberately
+/// not `Result<(), Response>`: the "error" here IS the response the handler sends, so there is no
+/// error value to propagate, and a 128-byte `Response` in an `Err` variant is what
+/// `clippy::result_large_err` objects to.
 fn check_entry_fields(
     lane: AuthLane,
     art: &crate::library::Artwork,
     launch: Option<&crate::library::LaunchSpec>,
     prep: &[crate::hooks::PrepCmd],
-) -> Result<(), Response> {
+) -> Option<Response> {
     if !lane.may_set_privileged_fields() {
         if let Some(field) = crate::library::privileged_field(launch, prep) {
-            return Err(api_error(
+            return Some(api_error(
                 StatusCode::FORBIDDEN,
                 &format!(
                     "`{field}` is executed as the host user and may only be set with the \
@@ -31,7 +36,9 @@ fn check_entry_fields(
             ));
         }
     }
-    crate::library::validate_art_paths(art).map_err(|e| api_error(StatusCode::BAD_REQUEST, &e))
+    crate::library::validate_art_paths(art)
+        .err()
+        .map(|e| api_error(StatusCode::BAD_REQUEST, &e))
 }
 
 #[derive(Deserialize)]
@@ -196,7 +203,7 @@ pub(crate) async fn create_custom_game(
     if input.title.trim().is_empty() {
         return api_error(StatusCode::BAD_REQUEST, "title must not be empty");
     }
-    if let Err(denied) = check_entry_fields(lane, &input.art, input.launch.as_ref(), &input.prep) {
+    if let Some(denied) = check_entry_fields(lane, &input.art, input.launch.as_ref(), &input.prep) {
         return denied;
     }
     match crate::library::add_custom(input) {
@@ -229,7 +236,7 @@ pub(crate) async fn update_custom_game(
     if input.title.trim().is_empty() {
         return api_error(StatusCode::BAD_REQUEST, "title must not be empty");
     }
-    if let Err(denied) = check_entry_fields(lane, &input.art, input.launch.as_ref(), &input.prep) {
+    if let Some(denied) = check_entry_fields(lane, &input.art, input.launch.as_ref(), &input.prep) {
         return denied;
     }
     use crate::library::MutateOutcome;
@@ -319,7 +326,7 @@ pub(crate) async fn reconcile_provider_entries(
     // Every entry in the payload, not just the first — a reconcile replaces a whole entry set, so
     // one privileged field anywhere in it is one command execution.
     for (i, e) in inputs.iter().enumerate() {
-        if let Err(denied) = check_entry_fields(lane, &e.art, e.launch.as_ref(), &e.prep) {
+        if let Some(denied) = check_entry_fields(lane, &e.art, e.launch.as_ref(), &e.prep) {
             tracing::warn!(
                 provider,
                 index = i,
