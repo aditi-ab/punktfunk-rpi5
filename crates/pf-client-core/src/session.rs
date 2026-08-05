@@ -822,12 +822,14 @@ fn pump(
                         // every frame (its decode really is done by now).
                         let hw_fence = match &image {
                             DecodedImage::VkFrame(v) => Some((v.timeline_sem, v.decode_done_value)),
-                            // DecodedImage::NativeVk carries the same (semaphore,
-                            // value) pair and COULD feed this sampled decode-time
-                            // stat identically — deliberately deferred to WP-D:
-                            // the native rung's field A/B should measure the same
-                            // stats surface the FFmpeg rung had at parity time,
-                            // and grow new ones after the verdict, not during it.
+                            // The native rung's frame carries the same pair: the
+                            // decode signals `semaphore_value` when the pixels are
+                            // ready (the presenter's write-back is the `+ 1`), so
+                            // waiting it measures received→decode-complete exactly
+                            // like the AVVkFrame arm. Fed since the WP-D hardware
+                            // verdict landed (bit-exact parity, both DPB modes) —
+                            // one stats surface across both Vulkan rungs.
+                            DecodedImage::NativeVk(f) => Some((f.semaphore, f.semaphore_value)),
                             _ => None,
                         };
                         if present {

@@ -101,6 +101,12 @@ pub struct PicturePlan {
     pub coded_height: u32,
     /// Conformance-window crop (7.4.2.1.1), in luma samples of the coded picture.
     pub display_crop: DisplayCrop,
+    /// Colour signalling from the ACTIVE SPS's VUI (E.2.1 inference where absent).
+    /// Per picture, like [`Self::display_crop`], never latched at session start:
+    /// the Windows host switches an HDR desktop to PQ/BT.2020 IN-BAND with a new
+    /// SPS mid-stream, so a backend that captured the first AU's colour would
+    /// paint HDR frames washed out.
+    pub colour: ColourDescription,
     pub profile_idc: u8,
     pub level_idc: Level,
     pub bit_depth_luma_minus8: u8,
@@ -118,6 +124,22 @@ pub struct DisplayCrop {
     pub y: u32,
     pub width: u32,
     pub height: u32,
+}
+
+/// One picture's colour signalling: raw H.273 code points off the active SPS's
+/// VUI. When the VUI (or its `video_signal_type`/`colour_description` blocks) is
+/// absent these hold E.2.1's INFERRED values — 2/2/2 ("unspecified") with limited
+/// range — never a raw struct-zero (0 is a reserved code point no real stream
+/// means). That matches the CICP libavcodec reports for such streams, so backends
+/// forward these untouched and the consumer's CSC resolves "unspecified" to its
+/// SDR default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ColourDescription {
+    pub colour_primaries: u8,
+    pub transfer_characteristics: u8,
+    pub matrix_coefficients: u8,
+    /// `video_full_range_flag` (E.2.1 infers limited range when absent).
+    pub video_full_range: bool,
 }
 
 /// One slice NALU of the picture, with its reference lists fully derived.
@@ -1587,6 +1609,17 @@ impl H264Planner {
                 width: rect.max.x,
                 height: rect.max.y,
             },
+            // Read unconditionally: the vendored parser builds every SPS from
+            // `Default`, whose `VuiParams` already holds E.2.1's inferred values
+            // (2/2/2, limited range), and parsing only overwrites them under the
+            // present flags — so this IS the spec inference whether or not the
+            // stream carried a VUI.
+            colour: ColourDescription {
+                colour_primaries: sps.vui_parameters.colour_primaries,
+                transfer_characteristics: sps.vui_parameters.transfer_characteristics,
+                matrix_coefficients: sps.vui_parameters.matrix_coefficients,
+                video_full_range: sps.vui_parameters.video_full_range_flag,
+            },
             profile_idc: sps.profile_idc,
             level_idc: sps.level_idc,
             bit_depth_luma_minus8: sps.bit_depth_luma_minus8,
@@ -2270,6 +2303,116 @@ mod tests {
                 y: 0,
                 width: 120,
                 height: 240
+            }
+        );
+    }
+
+    /// A 64x64 SPS with the VUI colour fields set as given. SpsBuilder has no
+    /// colour setters, so the built Sps is unwrapped and mutated directly (the
+    /// separate_colour_plane test's idiom); the synthesizer writes the whole
+    /// `video_signal_type` block from the struct.
+    fn sps_with_vui_colour(
+        signal_type: bool,
+        full_range: bool,
+        description: Option<(u8, u8, u8)>,
+    ) -> Rc<Sps> {
+        let mut sps = Rc::try_unwrap(base_sps().resolution(64, 64).build()).expect("freshly built");
+        sps.vui_parameters_present_flag = true;
+        sps.vui_parameters.video_signal_type_present_flag = signal_type;
+        sps.vui_parameters.video_full_range_flag = full_range;
+        if let Some((primaries, transfer, matrix)) = description {
+            sps.vui_parameters.colour_description_present_flag = true;
+            sps.vui_parameters.colour_primaries = primaries;
+            sps.vui_parameters.transfer_characteristics = transfer;
+            sps.vui_parameters.matrix_coefficients = matrix;
+        }
+        Rc::new(sps)
+    }
+
+    fn plan_one_idr(sps: &Rc<Sps>) -> AuPlan {
+        let pps = PpsBuilder::new(Rc::clone(sps))
+            .pic_parameter_set_id(0)
+            .pic_init_qp(26)
+            .build();
+        let mut au = param_set_au(sps, &pps);
+        au.extend(write_idr_slice());
+        H264Planner::new().plan_au(&au).unwrap()
+    }
+
+    #[test]
+    fn an_sps_without_vui_plans_the_e211_unspecified_colour() {
+        let (sps, pps) = authored_sps_pps();
+        assert!(
+            !sps.vui_parameters_present_flag,
+            "the base SPS carries no VUI"
+        );
+        let mut au = param_set_au(&sps, &pps);
+        au.extend(write_idr_slice());
+        let plan = H264Planner::new().plan_au(&au).unwrap();
+        assert_eq!(
+            plan.picture.colour,
+            ColourDescription {
+                colour_primaries: 2,
+                transfer_characteristics: 2,
+                matrix_coefficients: 2,
+                video_full_range: false,
+            },
+            "E.2.1 inference: 'unspecified' code points + limited range, never a raw 0"
+        );
+    }
+
+    #[test]
+    fn an_explicit_colour_description_rides_the_plan_and_follows_a_new_sps() {
+        // BT.2020/PQ HDR signalling — the in-band switch the Windows host emits.
+        let hdr = sps_with_vui_colour(true, false, Some((9, 16, 9)));
+        let plan = plan_one_idr(&hdr);
+        assert_eq!(
+            plan.picture.colour,
+            ColourDescription {
+                colour_primaries: 9,
+                transfer_characteristics: 16,
+                matrix_coefficients: 9,
+                video_full_range: false,
+            }
+        );
+
+        // The colour must track the SPS active for EACH picture, not the
+        // session's first: an SDR stream renegotiated to HDR mid-stream (same
+        // SPS id, new content, SPS+PPS in-band at the IDR — the parser's Pps
+        // snapshots its SPS at PPS-parse time, and hosts re-send both exactly
+        // so the new content activates) flips at the very next planned picture.
+        let (sdr_sps, sdr_pps) = authored_sps_pps();
+        let mut au0 = param_set_au(&sdr_sps, &sdr_pps);
+        au0.extend(write_idr_slice());
+        let mut planner = H264Planner::new();
+        let plan0 = planner.plan_au(&au0).unwrap();
+        assert_eq!(plan0.picture.colour.matrix_coefficients, 2);
+
+        let hdr_pps = PpsBuilder::new(Rc::clone(&hdr))
+            .pic_parameter_set_id(0)
+            .pic_init_qp(26)
+            .build();
+        let mut au1 = param_set_au(&hdr, &hdr_pps);
+        au1.extend(write_idr_slice());
+        let plan1 = planner.plan_au(&au1).unwrap();
+        assert_eq!(
+            plan1.picture.colour.matrix_coefficients, 9,
+            "the replacing SPS's colour lands on its own picture, not latched"
+        );
+    }
+
+    #[test]
+    fn a_vui_without_colour_description_keeps_unspecified_but_honours_the_range_flag() {
+        // video_signal_type present, full-range set, but NO colour description:
+        // the code points stay E.2.1's "unspecified" while the range flag rides.
+        let plan = plan_one_idr(&sps_with_vui_colour(true, true, None));
+        assert_eq!(
+            plan.picture.colour,
+            ColourDescription {
+                colour_primaries: 2,
+                transfer_characteristics: 2,
+                matrix_coefficients: 2,
+                video_full_range: true,
             }
         );
     }

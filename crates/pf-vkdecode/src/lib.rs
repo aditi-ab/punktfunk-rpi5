@@ -62,10 +62,13 @@ pub mod slots;
 /// flattens them to raw `u64`s through `ash::vk::Handle` — via THIS instance of ash, so
 /// the versions can never skew.
 pub use ash;
-/// Re-exported so [`VkH264Decoder::take_warnings`] consumers name the warning type —
-/// and [`DecodedVkFrame::crop`]'s type — without growing a pf-bitstream dependency of
-/// their own.
+// The pf-bitstream types a [`DecodedVkFrame`] consumer names, re-exported so it
+// doesn't grow a pf-bitstream dependency of its own:
+/// [`DecodedVkFrame::colour`]'s type.
+pub use pf_bitstream::h264::ColourDescription;
+/// [`DecodedVkFrame::crop`]'s type.
 pub use pf_bitstream::h264::DisplayCrop;
+/// [`VkH264Decoder::take_warnings`]'s warning type.
 pub use pf_bitstream::h264::PlanWarning;
 
 pub use caps::derive_caps;

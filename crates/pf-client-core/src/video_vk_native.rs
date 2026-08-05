@@ -286,13 +286,17 @@ impl NativeVulkanDecoder {
             coded_height: frame.coded_height,
             crop_x: frame.crop.x,
             crop_y: frame.crop.y,
-            // H.273 "unspecified" — every consumer resolves it to the BT.709-limited
-            // SDR default, the native H.264 envelope's colour contract (`csc_rows`).
+            // H.273 code points straight off the picture's ACTIVE SPS — per frame,
+            // never latched, because the Windows host switches an HDR desktop to
+            // PQ/BT.2020 IN-BAND (the Welcome still says SDR). pf-bitstream applies
+            // E.2.1's "unspecified" inference (2/2/2, limited) where the VUI is
+            // silent, and `csc_rows` resolves "unspecified" to its BT.709-limited
+            // SDR default — same verdicts libavcodec's CICP passthrough produced.
             color: ColorDesc {
-                primaries: 2,
-                transfer: 2,
-                matrix: 2,
-                full_range: false,
+                primaries: frame.colour.colour_primaries,
+                transfer: frame.colour.transfer_characteristics,
+                matrix: frame.colour.matrix_coefficients,
+                full_range: frame.colour.video_full_range,
             },
             keyframe: frame.is_idr,
             poc: frame.poc,
@@ -313,6 +317,20 @@ impl NativeVulkanDecoder {
             polls_after_release: 0,
         });
         native
+    }
+
+    /// Bounded wait for a shipped frame's decode-complete signal — the pump's
+    /// sampled decode-latency stat (`Decoder::wait_hw_decoded`), one frame per
+    /// stats window. The raw pair names a frame still in the shipped ledger (the
+    /// pump waits on the same thread that just shipped it, before any settle
+    /// could retire it); the ledger lookup is the liveness proof — an unreleased
+    /// frame pins its pool, so a pair matching nothing (already settled, or a
+    /// stray) just declines the sample instead of touching unknown handles.
+    pub(crate) fn wait_timeline(&self, sem: u64, value: u64, timeout_ns: u64) -> bool {
+        self.outstanding
+            .iter()
+            .find(|s| s.frame.semaphore.as_raw() == sem && s.frame.value == value)
+            .is_some_and(|s| self.dec.wait_decoded(&s.frame, timeout_ns))
     }
 
     /// Drain the release channel, marking returned frames (release itself waits for
@@ -346,9 +364,12 @@ impl NativeVulkanDecoder {
                 continue;
             }
             // A session rebuild (stream renegotiation) already made this frame stale:
-            // its pools are gone and a status poll would read the conservative Failed
-            // — which is NOT driver corruption. Resolve it quietly; the rebuild rode
-            // an IDR, so the stream has its re-anchor already.
+            // its SESSION objects (query pool included) are gone — the picture pool
+            // lives on in the decoder's graveyard while we hold the image, but the
+            // query verdict is unknowable and poll_status would report the
+            // conservative Failed — which is NOT driver corruption. Resolve it
+            // quietly; the rebuild rode an IDR, so the stream has its re-anchor
+            // already.
             if s.frame.generation != dec.generation() {
                 tracing::debug!(
                     poc = s.frame.poc,
@@ -392,8 +413,11 @@ impl NativeVulkanDecoder {
             }
             match dec.release_frame(&s.frame, s.presented) {
                 Ok(()) => {}
-                // A session rebuild (stream renegotiation) already dropped the pools
-                // this frame indexed — nothing left to release.
+                // Not a best-effort no-op: stale-generation frames release into the
+                // decoder's graveyard (a rebuild retires a still-held pool INTACT,
+                // and this very call is what lets it die on its last token). An Err
+                // is therefore a bookkeeping ghost — a double release — never a
+                // held image left dangling.
                 Err(e) => tracing::debug!(error = %e, "release_frame: {e}"),
             }
             false
@@ -425,7 +449,10 @@ impl Drop for NativeVulkanDecoder {
         // the decoder's Drop destroys the pool images: a returned token proves the
         // sampling submission's fence was waited, i.e. no GPU work of the
         // presenter's still reads the pools (the decoder's own drain covers only
-        // decode work; graveyarded pools ride the same token contract).
+        // decode work). Graveyarded pools ride the same token contract — a
+        // mid-stream renegotiation retires a still-held pool INTACT, and the
+        // release calls below route stale-generation frames into the graveyard,
+        // so those pools too die only once their last presenter fence was waited.
         let deadline = Instant::now() + TEARDOWN_BUDGET;
         loop {
             self.drain_releases();
@@ -499,6 +526,12 @@ mod tests {
                 coded_width: 1920,
                 coded_height: 1088,
                 crop: pf_bitstream_crop(1920, 1080),
+                colour: pf_vkdecode::ColourDescription {
+                    colour_primaries: 2,
+                    transfer_characteristics: 2,
+                    matrix_coefficients: 2,
+                    video_full_range: false,
+                },
                 semaphore: vk::Semaphore::null(),
                 value: 0,
                 poc: 0,

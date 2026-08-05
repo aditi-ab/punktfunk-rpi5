@@ -256,9 +256,11 @@ pub struct NativeVkFrame {
     /// wrong window — carried so that assumption is checkable, not silent.
     pub crop_x: u32,
     pub crop_y: u32,
-    /// Colour signalling. The native H.264 path serves the SDR envelope; the backend
-    /// fills H.273 "unspecified" code points, which every consumer already resolves to
-    /// the BT.709-limited SDR default (`csc_rows`' documented fallback).
+    /// Colour signalling, read from the SPS active for THIS picture (H.264 VUI →
+    /// H.273 code points, with E.2.1's "unspecified" inference where the VUI is
+    /// silent) — per frame, like the FFmpeg rungs' AVFrame CICP, because the host
+    /// switches HDR in-band; "unspecified" resolves to the BT.709-limited SDR
+    /// default (`csc_rows`' documented fallback).
     pub color: ColorDesc,
     /// IDR — the stream's re-anchor point (the pump's post-loss resume signal).
     pub keyframe: bool,
@@ -877,10 +879,13 @@ impl Decoder {
     }
 
     /// Wait for a Vulkan-Video frame's GPU decode to complete (timeline semaphore) —
-    /// the pump's decode-stat measurement. `false` = not the Vulkan backend, or timeout.
+    /// the pump's decode-stat measurement. `false` = not a Vulkan backend, timeout, or
+    /// (native rung) a pair no longer in the shipped ledger / a stale session
+    /// generation — every false just declines the sample.
     pub fn wait_hw_decoded(&self, timeline_sem: u64, value: u64, timeout_ns: u64) -> bool {
         match &self.backend {
             Backend::Vulkan(v) => v.wait_timeline(timeline_sem, value, timeout_ns),
+            Backend::NativeVulkan(d) => d.wait_timeline(timeline_sem, value, timeout_ns),
             _ => false,
         }
     }

@@ -37,6 +37,7 @@ use std::collections::VecDeque;
 use ash::vk;
 use ash::vk::native as hh;
 use pf_bitstream::h264::AuPlan;
+use pf_bitstream::h264::ColourDescription;
 use pf_bitstream::h264::DisplayCrop;
 use pf_bitstream::h264::DpbUpdate;
 use pf_bitstream::h264::H264Planner;
@@ -125,6 +126,10 @@ pub struct DecodedVkFrame {
     pub coded_height: u32,
     /// Conformance-window crop: the region to display.
     pub crop: DisplayCrop,
+    /// Colour signalling from the picture's ACTIVE SPS (pf-bitstream applies
+    /// E.2.1's "unspecified" inference where the VUI is silent). Per frame, like
+    /// [`Self::crop`]: the host switches HDR in-band with a new SPS mid-stream.
+    pub colour: ColourDescription,
     /// Timeline pair: pixels ready at `semaphore >= value`; the sampling
     /// consumer signals `value + 1` (see the type docs).
     pub semaphore: vk::Semaphore,
@@ -409,6 +414,7 @@ struct PendingPic {
     /// The image's timeline value the decode signalled (frame readiness).
     timeline_value: u64,
     crop: DisplayCrop,
+    colour: ColourDescription,
     poc: i32,
     is_idr: bool,
 }
@@ -733,6 +739,7 @@ impl VkH264Decoder {
                 query_slot: query_index,
                 timeline_value: signal_value,
                 crop: plan.picture.display_crop,
+                colour: plan.picture.colour,
                 poc: plan.picture.pic_order_cnt,
                 is_idr: plan.picture.is_idr,
             },
@@ -981,6 +988,30 @@ impl VkH264Decoder {
         }
     }
 
+    /// Wait — bounded by `timeout_ns` — for a delivered frame's decode-complete
+    /// signal ([`DecodedVkFrame::semaphore`] reaching [`DecodedVkFrame::value`]).
+    /// Pure measurement (the integration layer's sampled decode-latency stat):
+    /// touches no decoder state, so a timeout or error only degrades the stat —
+    /// the consumer's own GPU wait is what gates sampling, never this. `frame`
+    /// must be unreleased (`release_frame` still owed), which pins its pool — and
+    /// with it the semaphore — alive, graveyarded generations included; a
+    /// stale-generation frame declines rather than block on a verdict the
+    /// rebuild's drain already implied.
+    pub fn wait_decoded(&self, frame: &DecodedVkFrame, timeout_ns: u64) -> bool {
+        if frame.generation != self.generation {
+            return false;
+        }
+        let semaphores = [frame.semaphore];
+        let values = [frame.value];
+        let info = vk::SemaphoreWaitInfo::default()
+            .semaphores(&semaphores)
+            .values(&values);
+        // SAFETY: live device (constructor contract); the semaphore is a pool
+        // semaphore the unreleased frame keeps alive (fn docs); the info arrays
+        // are locals outliving the call.
+        unsafe { self.dev.ash().wait_semaphores(&info, timeout_ns) }.is_ok()
+    }
+
     /// Drain the planner (teardown / stream discontinuity): every buffered
     /// picture becomes display-ready via [`Self::take_ready`] (zero-copy — the
     /// images already hold the content), all DPB slots free, and any picture
@@ -1050,6 +1081,22 @@ impl VkH264Decoder {
     /// retiring its picture pool to the graveyard when the consumer still holds
     /// images) and build a fresh one shaped by `plan`, bumping
     /// [`Self::generation`] so frames of the old one route to the graveyard.
+    ///
+    /// Why a mid-stream rebuild is safe against presenter-held frames (the
+    /// renegotiation-teardown question, settled):
+    /// - **Images**: a pool with consumer holds retires to the graveyard INTACT —
+    ///   images, views and semaphores stay live until `release_frame` takes its
+    ///   last token, and a token is sent only after the presenter's sampling
+    ///   submission's fence was waited (its `value+1` write-back included), so no
+    ///   pool image is ever destroyed under in-flight GPU reads.
+    /// - **Tokens**: every frame and its token carry the generation they were
+    ///   born under, and `release_frame` routes strictly by it (current pool vs
+    ///   graveyard entry), so releases cannot alias across generations.
+    /// - **Session objects**: the session/ring/ops (query pool included) DO die
+    ///   right here — but only after [`Self::drain_gpu`], and no consumer-facing
+    ///   handle points at them: [`DecodedVkFrame`] borrows pool resources only,
+    ///   and `poll_status` generation-gates before it would touch the NEW
+    ///   generation's query pool with an old frame's slot.
     fn rebuild_state(&mut self, plan: &AuPlan) -> Result<(), VkDecodeError> {
         self.drain_gpu()?;
         if let Some(state) = self.state.take() {
@@ -1251,6 +1298,7 @@ fn build_frame(state: &mut SessionState, entry: &PendingPic, generation: u64) ->
         coded_width: state.image_extent.width,
         coded_height: state.image_extent.height,
         crop: entry.crop,
+        colour: entry.colour,
         semaphore: picture.semaphore,
         value: entry.timeline_value,
         poc: entry.poc,
