@@ -7,15 +7,23 @@
 // shipping an SPA, registering under `category: "library"` so it stays out of the nav, and the
 // standard CLI verbs.
 import type { PluginDef } from "@punktfunk/host";
+import * as fs from "node:fs";
 import { Duration, Effect, Layer, Schema, Stream } from "effect";
 import { type CliCommand, runPluginCli } from "../cli.js";
 import { type ConfigService, makeConfigService } from "../config.js";
-import { type HostClient, PluginInfo } from "../host-client.js";
+import { HostClient, PluginInfo } from "../host-client.js";
 import { ProviderClient, type ProviderClientService } from "../reconcile.js";
 import { definePluginKit, type PluginKitDef } from "../runtime.js";
 import { makeSyncEngine } from "../sync-engine.js";
 import { serveUi } from "../ui-server.js";
 import type { ProviderEntry } from "../wire.js";
+import {
+	diffParity,
+	formatParityReport,
+	fromHostEntry,
+	fromProviderEntry,
+	type HostGameEntry,
+} from "./parity.js";
 
 /** What a scan produced — the status surface and the CLI's `scan` verb both render this. */
 export interface ScanReport {
@@ -69,6 +77,15 @@ export interface LibraryPluginDef<S extends Schema.Top> {
 	/** Extra CLI verbs beyond the standard `detect` / `scan` / `uninstall` set. */
 	readonly commands?: Record<string, CliCommand<never>>;
 }
+
+/** `--flag value` from an argv slice, or undefined. */
+const flagValue = (
+	argv: ReadonlyArray<string>,
+	flag: string,
+): string | undefined => {
+	const i = argv.indexOf(flag);
+	return i >= 0 && i + 1 < argv.length ? argv[i + 1] : undefined;
+};
 
 /** The pieces a library plugin package wires into its entry points. */
 export interface LibraryPlugin {
@@ -233,6 +250,60 @@ export const defineLibraryPlugin = <S extends Schema.Top>(
 								`${report.launchers} launcher entries`,
 						);
 					}
+				}),
+		},
+		parity: {
+			summary:
+				"prove this plugin reproduces the built-in scanner (--snapshot <f> | --compare <f>)",
+			// `--compare` is offline (it runs THIS plugin's scan); `--snapshot` needs the host. The
+			// dispatcher decides per invocation below, so the verb is registered as online and the
+			// snapshot path is the one that actually uses the client.
+			run: (argv) =>
+				Effect.gen(function* () {
+					const snapshot = flagValue(argv, "--snapshot");
+					const compare = flagValue(argv, "--compare");
+					if (!snapshot && !compare) {
+						console.error(
+							"usage: parity --snapshot <file>   (capture the host's CURRENT library for this store)\n" +
+								"       parity --compare  <file>   (diff this plugin's scan against that capture)",
+						);
+						process.exitCode = 2;
+						return;
+					}
+					if (snapshot) {
+						// The baseline: what the host reports for THIS store while its built-in scanner
+						// is still the thing producing it. Capture before installing the plugin.
+						const host = yield* HostClient;
+						const body = yield* host.request("GET", "/library");
+						const mine = (Array.isArray(body) ? (body as HostGameEntry[]) : [])
+							.filter((e) => e.store === (store ?? def.name))
+							.map(fromHostEntry)
+							.sort((a, b) => a.id.localeCompare(b.id));
+						yield* Effect.sync(() =>
+							fs.writeFileSync(snapshot, `${JSON.stringify(mine, null, 2)}\n`),
+						);
+						console.log(
+							`captured ${mine.length} "${store ?? def.name}" entries to ${snapshot}`,
+						);
+						return;
+					}
+					const baseline = yield* Effect.try({
+						try: () =>
+							JSON.parse(fs.readFileSync(compare as string, "utf8")) as ReturnType<
+								typeof fromHostEntry
+							>[],
+						catch: (cause) => new Error(`cannot read ${compare}: ${cause}`),
+					});
+					const cfg = yield* (yield* config).load;
+					const { entries } = yield* computeEntries(cfg);
+					const produced = entries.map((e) =>
+						fromProviderEntry(store ?? def.name, e),
+					);
+					const report = diffParity(baseline, produced);
+					console.log(formatParityReport(report));
+					// A non-zero exit is what makes this usable as a release gate rather than a report
+					// somebody skims.
+					if (!report.ok) process.exitCode = 1;
 				}),
 		},
 		uninstall: {

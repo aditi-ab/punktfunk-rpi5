@@ -9,4 +9,15 @@ export {
 	type LibraryPluginDef,
 	type ScanReport,
 } from "./define.js";
+export {
+	claimedLibraryId,
+	diffParity,
+	formatParityReport,
+	fromHostEntry,
+	fromProviderEntry,
+	type HostGameEntry,
+	type ParityChange,
+	type ParityEntry,
+	type ParityReport,
+} from "./parity.js";
 export * from "./parsers/index.js";
