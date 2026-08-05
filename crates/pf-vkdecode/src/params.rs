@@ -121,8 +121,9 @@ impl OwnedStdPps {
 }
 
 /// H.264 `level_idc` (value-coded: 10 ⇒ 1.0) to Vulkan's index-coded
-/// `StdVideoH264LevelIdc`.
-const fn level_to_std(level: Level) -> hh::StdVideoH264LevelIdc {
+/// `StdVideoH264LevelIdc`. The Std code points ascend with the level, so the
+/// decoder's `maxLevelIdc` gate compares them numerically.
+pub(crate) const fn level_to_std(level: Level) -> hh::StdVideoH264LevelIdc {
     match level {
         Level::L1 => hh::StdVideoH264LevelIdc_STD_VIDEO_H264_LEVEL_IDC_1_0,
         // Vulkan has no 1b code point. 1b is signalled on the wire as level_idc 11

@@ -684,6 +684,97 @@ mod tests {
     }
 
     #[test]
+    fn a_full_dpb_bump_reuses_the_evicted_slot_only_after_its_frame_is_released() {
+        // Depth-1 DPB (Level 1 at 320x240 ⇒ max_dpb_frames 1, capacity 2): every
+        // stored P evicts the previous picture, and that picture's id lands in
+        // BOTH `outputs` and `removed` of the SAME plan — the exact sequence
+        // where, without pins, `plan_to_vk` frees the evicted slot and
+        // immediately re-assigns it as this AU's setup while the evicted
+        // picture's frame is still in the consumer's hands (the HIGH overwrite
+        // bug of the adversarial round). This test drives the decoder's exact
+        // call pattern: pin at frame creation, unpin at release_frame.
+        let sps = SpsBuilder::new()
+            .seq_parameter_set_id(0)
+            .profile_idc(Profile::Main)
+            .level_idc(Level::L1)
+            .frame_mbs_only_flag(true)
+            .direct_8x8_inference_flag(true)
+            .max_num_ref_frames(1)
+            .log2_max_frame_num_minus4(0)
+            .pic_order_cnt_type(0)
+            .log2_max_pic_order_cnt_lsb_minus4(0)
+            .resolution(320, 240)
+            .build();
+        let pps = PpsBuilder::new(Rc::clone(&sps))
+            .pic_parameter_set_id(0)
+            .pic_init_qp(26)
+            .build();
+        let mut au0 = Vec::new();
+        Synthesizer::<'_, Sps, _>::synthesize(3, &sps, &mut au0, true).unwrap();
+        Synthesizer::<'_, Pps, _>::synthesize(3, &pps, &mut au0, true).unwrap();
+        au0.extend(write_idr_slice(None));
+
+        // First, the COUNTERFACTUAL (no pins): the bump hands the evicted
+        // picture's slot straight back as the next setup — the bug this guards.
+        {
+            let mut planner = H264Planner::new();
+            let p0 = planner.plan_au(&au0).unwrap();
+            let mut slots = SlotMap::new(p0.picture.max_dpb_frames);
+            let vk0 = plan_to_vk(&p0, &mut slots, 0).unwrap();
+            let p1 = planner
+                .plan_au(&write_p_slice(1, 2, None, 1, None))
+                .unwrap();
+            let id0 = vk0.setup_id;
+            assert!(p1.dpb.outputs.contains(&id0) && p1.dpb.removed.contains(&id0));
+            let vk1 = plan_to_vk(&p1, &mut slots, 0).unwrap();
+            assert_eq!(
+                vk1.setup_slot, vk0.setup_slot,
+                "without pins the delivered frame's image IS the next decode target"
+            );
+        }
+
+        // Now the decoder's discipline: every frame pins its slot at creation.
+        let mut planner = H264Planner::new();
+        let p0 = planner.plan_au(&au0).unwrap();
+        let mut slots = SlotMap::new(p0.picture.max_dpb_frames);
+        let vk0 = plan_to_vk(&p0, &mut slots, 0).unwrap();
+        slots.pin(vk0.setup_slot);
+
+        // AU1 bumps AU0's picture (outputs + removed) — the freed slot is
+        // pinned, so the setup lands elsewhere and the unreleased frame's image
+        // is never a decode target.
+        let p1 = planner
+            .plan_au(&write_p_slice(1, 2, None, 1, None))
+            .unwrap();
+        assert!(p1.dpb.removed.contains(&vk0.setup_id));
+        let vk1 = plan_to_vk(&p1, &mut slots, 0).unwrap();
+        assert_ne!(
+            vk1.setup_slot, vk0.setup_slot,
+            "a pinned (delivered, unreleased) slot must never be the setup"
+        );
+        slots.pin(vk1.setup_slot);
+
+        // With NOTHING released, the next AU has no assignable slot: explicit
+        // backpressure (AllPinned → the decoder's NoFreeSlot), never an overwrite.
+        let p2 = planner
+            .plan_au(&write_p_slice(2, 4, None, 1, None))
+            .unwrap();
+        assert!(matches!(
+            plan_to_vk(&p2, &mut slots, 0),
+            Err(PlanToVkError::Slot(SlotError::AllPinned { .. }))
+        ));
+
+        // The consumer releases frame 0 (decoder: release_frame → unpin): its
+        // slot becomes the next setup — reuse happens exactly one release later.
+        assert!(slots.unpin(vk0.setup_slot));
+        let p3 = planner
+            .plan_au(&write_idr_slice(None))
+            .expect("an IDR restart plans after the stalled AU");
+        let vk3 = plan_to_vk(&p3, &mut slots, 0).unwrap();
+        assert_eq!(vk3.setup_slot, vk0.setup_slot);
+    }
+
+    #[test]
     fn a_nonzero_delta_bottom_reaches_setup_and_reference_poc_pairs_distinctly() {
         // A PPS with bottom_field_pic_order_in_frame_present_flag: progressive
         // frames then carry delta_pic_order_cnt_bottom and bottom != top. The

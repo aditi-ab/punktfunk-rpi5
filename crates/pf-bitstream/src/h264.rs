@@ -74,6 +74,15 @@ pub struct AuPlan {
     pub slices: Vec<SlicePlan>,
     pub dpb: DpbUpdate,
     pub warnings: Vec<PlanWarning>,
+    /// The SPS the planner activated for this AU — the one [`Self::picture`]'s
+    /// parameters derive from (the FIRST slice's PPS's SPS; a later slice may
+    /// legally reference another PPS, and that drift deliberately does not reach
+    /// here). Cloned out of the parser's table so backends build their parameter
+    /// objects from exactly what was activated, never by re-parsing the AU.
+    pub sps: Rc<Sps>,
+    /// The PPS the picture was begun with (the first slice's), same contract as
+    /// [`Self::sps`]. Its `sps` field is the same `Rc` as [`Self::sps`].
+    pub pps: Rc<Pps>,
 }
 
 /// Per-picture parameters, captured after 8.2.1 POC derivation and before end-of-picture
@@ -465,6 +474,10 @@ impl H264Planner {
         // Captured before finish_picture: MMCO5 rewrites the stored POC afterwards, but
         // backends submit the picture with its 8.2.1 values.
         let picture = Self::picture_plan(&cur, recovery_point);
+        // The activated parameter sets ride out with the plan (AuPlan field docs);
+        // cloned before finish_picture consumes `cur`.
+        let pps = Rc::clone(&cur.first_slice_pps);
+        let sps = Rc::clone(&pps.sps);
         let stored = self.finish_picture(cur, &mut warnings)?;
 
         // `removed` is the delta against what the backend last SAW alive, not against
@@ -485,6 +498,8 @@ impl H264Planner {
                 removed,
             },
             warnings,
+            sps,
+            pps,
         })
     }
 
@@ -2402,5 +2417,42 @@ mod tests {
                 height: 64
             }
         );
+        // The accessor pair follows the same first-slice rule: backends build
+        // their parameter objects from these, so drifting to PPS 1 here would
+        // desynchronize them from `picture`.
+        assert_eq!(plan.pps.pic_parameter_set_id, 0);
+        assert_eq!(plan.sps.seq_parameter_set_id, 0);
+        assert!(
+            Rc::ptr_eq(&plan.sps, &plan.pps.sps),
+            "the SPS accessor is the PPS's own SPS, not a second copy"
+        );
+        assert!(
+            !plan.sps.frame_cropping_flag,
+            "SPS 0, not the cropped SPS 1"
+        );
+    }
+
+    #[test]
+    fn the_plans_parameter_set_accessors_carry_the_activated_content() {
+        let (sps, pps) = authored_sps_pps();
+        let mut au0 = param_set_au(&sps, &pps);
+        au0.extend(write_idr_slice());
+
+        let plan = H264Planner::new().plan_au(&au0).unwrap();
+        // The parser re-parses the in-band parameter sets, so pointer identity
+        // with the authored `sps`/`pps` is not expected (and whole-struct
+        // equality would compare parser-side normalizations like the flat
+        // scaling-list fill); the contract is that the ACTIVATED content rides
+        // out. Spot-check the fields backends build parameter objects from.
+        assert_eq!(plan.sps.seq_parameter_set_id, sps.seq_parameter_set_id);
+        assert_eq!(plan.sps.profile_idc, sps.profile_idc);
+        assert_eq!(plan.sps.level_idc, sps.level_idc);
+        assert_eq!(plan.sps.max_num_ref_frames, sps.max_num_ref_frames);
+        assert_eq!(plan.sps.width(), sps.width());
+        assert_eq!(plan.sps.height(), sps.height());
+        assert_eq!(plan.pps.pic_parameter_set_id, pps.pic_parameter_set_id);
+        assert_eq!(plan.pps.seq_parameter_set_id, pps.seq_parameter_set_id);
+        assert_eq!(plan.pps.pic_init_qp_minus26, pps.pic_init_qp_minus26);
+        assert!(Rc::ptr_eq(&plan.sps, &plan.pps.sps));
     }
 }
