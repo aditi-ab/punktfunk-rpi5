@@ -56,5 +56,15 @@ in the future."
    SPS). Found by pf-bitstream's conformance-window tests; upstream never hits it
    because real encoders crop right/bottom only.
 
+7. `src/codec/h265/parser.rs` — `parse_slice_header`: reject
+   `num_long_term_sps + num_long_term_pics > 16` before the long-term RPS loop.
+   Upstream bounds the pair only by `MAX_LONG_TERM_REF_PIC_SETS` (32) combined, while
+   every long-term array in `SliceHeader` (`poc_lsb_lt`, `used_by_curr_pic_lt`,
+   `delta_poc_msb_present_flag`, `delta_poc_msb_cycle_lt`, `lt_idx_sps`) is `[_; 16]`
+   — a hostile slice header with 17+ entries panics the parser with an
+   index-out-of-bounds (bounds checks stay on in release). Found by pf-bitstream's
+   H.265 planner review; regression-tested there
+   (`a_hostile_long_term_count_is_a_parse_error_not_a_panic`). **Report upstream.**
+
 Re-sync procedure: fetch the AOSP tree, re-apply this trim, diff `codec/` +
 `bitstream_utils.rs` (expect near-zero conflicts), update the commit pin above.

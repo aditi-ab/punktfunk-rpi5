@@ -3885,6 +3885,19 @@ impl Parser {
                     )?;
 
                     let num_lt = hdr.num_long_term_sps + hdr.num_long_term_pics;
+                    // The long-term RPS arrays in SliceHeader (poc_lsb_lt,
+                    // used_by_curr_pic_lt, delta_poc_msb_present_flag,
+                    // delta_poc_msb_cycle_lt, lt_idx_sps) hold 16 entries — the DPB
+                    // bound — while the reads above admit up to
+                    // MAX_LONG_TERM_REF_PIC_SETS (32) combined; the loop below would
+                    // index out of bounds on such a header. See PROVENANCE.md
+                    // deviation 7.
+                    if usize::from(num_lt) > hdr.poc_lsb_lt.len() {
+                        return Err(format!(
+                            "Invalid num_long_term_sps + num_long_term_pics: {}",
+                            num_lt
+                        ));
+                    }
                     for i in 0..usize::from(num_lt) {
                         // The variables `PocLsbLt[ i ]` and `UsedByCurrPicLt[ i ]` are derived as follows:
                         //

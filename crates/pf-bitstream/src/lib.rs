@@ -21,6 +21,7 @@
 #![forbid(unsafe_code)]
 
 pub mod h264;
+pub mod h265;
 pub mod sei;
 
 // The vendor-pinning smoke tests below assert against byte counts and golden values from

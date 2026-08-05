@@ -1,8 +1,15 @@
 //! SEI payload parsing — the piece the vendored parser layer lacks: upstream classifies
-//! SEI NALUs (`NaluType::Sei`) but never reads a payload. punktfunk needs exactly one:
-//! the recovery point SEI (payload type 6, spec D.1.8 syntax / D.2.8 semantics), which
-//! hosts emit on RFI recovery so the client knows where a decode-from-here point lands.
-//! Every other payload type is skipped by its declared size.
+//! SEI NALUs but never reads a payload. punktfunk needs exactly one payload type per
+//! codec: the recovery point SEI, which hosts emit on RFI recovery so the client knows
+//! where a decode-from-here point lands. Every other payload type is skipped by its
+//! declared size.
+//!
+//! Both codecs put the recovery point at payload type 6 with the same D.1 message
+//! framing, but the payload syntax differs: H.264 (D.1.8/D.2.8) counts recovery in
+//! `frame_num` increments (`recovery_frame_cnt`, ue(v)) and carries a slice-group bit
+//! pair; H.265 (D.2.8/D.3.8) counts in picture order (`recovery_poc_cnt`, se(v) — it
+//! can be negative) and has no slice-group field. Hence two parsers over one shared
+//! message walk.
 
 /// Recovery point SEI (D.2.8).
 ///
@@ -16,16 +23,73 @@ pub struct RecoveryPoint {
     pub broken_link: bool,
 }
 
-/// Parse the first recovery point SEI message out of a SEI NALU.
+/// Recovery point SEI, H.265 flavour (D.3.8).
+///
+/// `recovery_poc_cnt` is the POC delta from the picture carrying the SEI to the
+/// recovery-point picture — se(v)-coded, so unlike H.264's `recovery_frame_cnt` it can
+/// be NEGATIVE (a recovery point among leading pictures). `exact_match`/`broken_link`
+/// keep their H.264 semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecoveryPointHevc {
+    pub recovery_poc_cnt: i32,
+    pub exact_match: bool,
+    pub broken_link: bool,
+}
+
+/// Parse the first recovery point SEI message out of an H.264 SEI NALU.
 ///
 /// `sei_payload` are the bytes of the NALU after its one-byte NAL header, emulation
 /// prevention bytes still in place (they are removed here — 7.4.1 RBSP extraction).
 /// `Ok(None)` means the NALU parsed cleanly but carries no recovery point.
 pub fn parse_recovery_point(sei_payload: &[u8]) -> Result<Option<RecoveryPoint>, String> {
     let rbsp = strip_emulation_prevention(sei_payload);
+    let Some(payload) = first_recovery_point_payload(&rbsp)? else {
+        return Ok(None);
+    };
 
+    let mut r = BitCursor::new(payload);
+    let recovery_frame_cnt = r.read_ue()?;
+    let exact_match = r.read_bit()? != 0;
+    let broken_link = r.read_bit()? != 0;
+    // changing_slice_group_idc u(2): parsed to keep the reader honest, unused —
+    // slice groups are outside every profile punktfunk hosts emit.
+    let _changing_slice_group_idc = r.read_bits(2)?;
+    Ok(Some(RecoveryPoint {
+        recovery_frame_cnt,
+        exact_match,
+        broken_link,
+    }))
+}
+
+/// Parse the first recovery point SEI message out of an H.265 prefix SEI NALU.
+///
+/// `sei_payload` are the bytes of the NALU after its TWO-byte NAL header (H.265 NALU
+/// headers are 16 bits), emulation prevention still in place. Only prefix SEI NALUs
+/// (type 39) can carry a recovery point — D.2.1 lists it as prefix-only, so suffix SEI
+/// NALUs (type 40) need never reach here.
+pub fn parse_recovery_point_hevc(sei_payload: &[u8]) -> Result<Option<RecoveryPointHevc>, String> {
+    let rbsp = strip_emulation_prevention(sei_payload);
+    let Some(payload) = first_recovery_point_payload(&rbsp)? else {
+        return Ok(None);
+    };
+
+    let mut r = BitCursor::new(payload);
+    let recovery_poc_cnt = r.read_se()?;
+    let exact_match = r.read_bit()? != 0;
+    let broken_link = r.read_bit()? != 0;
+    Ok(Some(RecoveryPointHevc {
+        recovery_poc_cnt,
+        exact_match,
+        broken_link,
+    }))
+}
+
+/// Walk the D.1 SEI message framing (shared verbatim between H.264 and H.265) and
+/// return the payload bytes of the first recovery point message (payload type 6 in
+/// both codecs), if any. `rbsp` is already emulation-prevention-stripped.
+fn first_recovery_point_payload(rbsp: &[u8]) -> Result<Option<&[u8]>, String> {
     let mut i = 0usize;
-    while i < rbsp.len() && !is_rbsp_trailing(&rbsp, i) {
+    while i < rbsp.len() && !is_rbsp_trailing(rbsp, i) {
         // D.1: payload type and size are ff-coded — 0xFF bytes each add 255 until a
         // non-0xFF byte terminates the value. The run length is unbounded, so the type
         // accumulates saturating: an adversarial ~16M-byte 0xFF run must not overflow
@@ -59,18 +123,7 @@ pub fn parse_recovery_point(sei_payload: &[u8]) -> Result<Option<RecoveryPoint>,
             .ok_or_else(|| "SEI payload overruns the NALU".to_string())?;
 
         if payload_type == 6 {
-            let mut r = BitCursor::new(&rbsp[i..end]);
-            let recovery_frame_cnt = r.read_ue()?;
-            let exact_match = r.read_bit()? != 0;
-            let broken_link = r.read_bit()? != 0;
-            // changing_slice_group_idc u(2): parsed to keep the reader honest, unused —
-            // slice groups are outside every profile punktfunk hosts emit.
-            let _changing_slice_group_idc = r.read_bits(2)?;
-            return Ok(Some(RecoveryPoint {
-                recovery_frame_cnt,
-                exact_match,
-                broken_link,
-            }));
+            return Ok(Some(&rbsp[i..end]));
         }
 
         i = end;
@@ -146,6 +199,15 @@ impl<'a> BitCursor<'a> {
         ((1u32 << leading_zeros) - 1)
             .checked_add(suffix)
             .ok_or_else(|| "exp-Golomb value overflows u32".to_string())
+    }
+
+    /// se(v), spec 9.1.1: the ue(v) code point k maps to (−1)^(k+1) · ⌈k/2⌉.
+    fn read_se(&mut self) -> Result<i32, String> {
+        let k = self.read_ue()?;
+        let magnitude = k.div_ceil(2);
+        let magnitude =
+            i32::try_from(magnitude).map_err(|_| "exp-Golomb value overflows i32".to_string())?;
+        Ok(if k % 2 == 1 { magnitude } else { -magnitude })
     }
 }
 
@@ -231,5 +293,54 @@ mod tests {
     fn a_payload_size_overrunning_the_nalu_is_a_parse_error() {
         let sei = [0x06, 0x0A, 0x00];
         assert!(parse_recovery_point(&sei).is_err());
+    }
+
+    #[test]
+    fn the_hevc_recovery_point_parses_its_se_coded_poc_count() {
+        // recovery_poc_cnt se(0) = '1', exact = 0, broken = 0, payload alignment:
+        // 0b1001_0000.
+        let sei = [0x06, 0x01, 0x90, 0x80];
+        assert_eq!(
+            parse_recovery_point_hevc(&sei).unwrap(),
+            Some(RecoveryPointHevc {
+                recovery_poc_cnt: 0,
+                exact_match: false,
+                broken_link: false
+            })
+        );
+
+        // se(-1) = '011' (ue code point 2), exact = 1, broken = 0, alignment:
+        // 0b0111_0100 — the negative range H.264's ue(v) syntax cannot express.
+        let sei = [0x06, 0x01, 0x74, 0x80];
+        assert_eq!(
+            parse_recovery_point_hevc(&sei).unwrap(),
+            Some(RecoveryPointHevc {
+                recovery_poc_cnt: -1,
+                exact_match: true,
+                broken_link: false
+            })
+        );
+    }
+
+    #[test]
+    fn the_hevc_parser_skips_earlier_messages_and_reports_absence_as_none() {
+        // User-data message first, then the recovery point (poc_cnt se(3): ue code
+        // point 5 = '00110', exact = 1, broken = 1, alignment: 0b0011_0111).
+        let sei = [
+            0x05, 0x02, 0xAA, 0xBB, // type 5
+            0x06, 0x01, 0x37, // recovery point
+            0x80,
+        ];
+        assert_eq!(
+            parse_recovery_point_hevc(&sei).unwrap(),
+            Some(RecoveryPointHevc {
+                recovery_poc_cnt: 3,
+                exact_match: true,
+                broken_link: true
+            })
+        );
+
+        let sei = [0x05, 0x01, 0x00, 0x80];
+        assert_eq!(parse_recovery_point_hevc(&sei).unwrap(), None);
     }
 }
