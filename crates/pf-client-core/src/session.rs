@@ -630,6 +630,9 @@ fn pump(
     // ahead of `frames_dropped` (the reassembler only declares a straggler lost once it ages out of
     // the loss window, by which point the concealment already reached the screen).
     let mut next_expected_index: Option<u32> = None;
+    // Fixture capture for the native-decode program: every AU exactly as it reaches
+    // `decode_frame`, plus a boundary/flags index — see `au_dump.rs` for the format.
+    let mut au_dump = crate::au_dump::AuDump::from_env(connector.codec);
 
     let end: Option<String> = loop {
         if stop.load(Ordering::SeqCst) {
@@ -743,6 +746,11 @@ fn pump(
                     Some(n) if frame.frame_index.wrapping_sub(n) > u32::MAX / 2 => n,
                     _ => frame.frame_index,
                 });
+                if let Some(d) = au_dump.as_mut() {
+                    if !d.write(&frame.data, frame.flags, frame.complete) {
+                        au_dump = None;
+                    }
+                }
                 match decoder.decode_frame(&frame.data, frame.flags, frame.complete) {
                     Ok(Some(image)) => {
                         // Fold this decoded frame through the shared freeze gate: it reads the AU's

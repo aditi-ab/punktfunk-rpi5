@@ -20,6 +20,8 @@
 // instead of an argument precisely because nothing required one.
 #![deny(clippy::undocumented_unsafe_blocks)]
 
+#[cfg(any(target_os = "linux", windows))]
+mod au_dump;
 #[cfg(target_os = "linux")]
 pub mod audio;
 #[cfg(windows)]
