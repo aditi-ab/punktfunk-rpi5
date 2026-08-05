@@ -355,9 +355,11 @@ internal fun StreamScene(verbosity: StatsVerbosity = StatsVerbosity.DETAILED) {
         // dispValid, displayP50, e2eDispP50, e2eDispP95].
         // 10/9/16/1 = a 10-bit BT.2020 PQ (HDR) 4:2:0 feed so the DETAILED HUD renders its
         // video-feed line; the display stage is valid (dispValid 1) so the headline is the
-        // directly-measured capture→displayed pair (1.8/2.6) and the Phase-2 stage terms
-        // (host 0.6 + network 0.3 + decode 0.4 + display 0.5) tile it, rendering the full split
-        // equation; the decoder label shows the ranked low-latency decoder. Light per-window loss
+        // directly-measured capture→displayed pair, less the excluded OS present floor (the 0.3
+        // latch p50) — 1.5/2.3 shown from 1.8/2.6 raw — and the Phase-2 stage terms
+        // (host 0.6 + network 0.3 + decode 0.4 + display 0.2) tile the shaved headline, with the
+        // `os present +0.3 excluded` line naming what came off; the decoder label shows the ranked
+        // low-latency decoder. Light per-window loss
         // (lost 2 · skipped 1 · FEC 5 of 238) so the reliability line (NORMAL/DETAILED) and the
         // compact loss flag both render.
         StatsOverlay(
