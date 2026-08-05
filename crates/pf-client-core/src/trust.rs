@@ -91,22 +91,131 @@ fn lock_identity_perms(dir: &std::path::Path, key: &std::path::Path) {
     let _ = std::fs::set_permissions(key, std::fs::Permissions::from_mode(0o600));
 }
 
+/// A sibling temp path unique to this process. The stores below have five whole-file writers
+/// (WinUI shell, session, console UI, CLI, Decky) and a single shared `.json.tmp` lets two of
+/// them interleave: on Windows the second `fs::write` hits a sharing violation, and worse, one
+/// process can rename the OTHER's half-written bytes over the target. The pid keeps each
+/// writer on its own scratch file; the rename below removes it, so a leftover only survives a
+/// hard kill.
+fn temp_sibling(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".tmp-{}", std::process::id()));
+    path.with_file_name(name)
+}
+
 /// Write a config file the safe way: a sibling temp file, then a rename over the target. A
 /// plain `fs::write` truncates first, so a crash, a full disk or a power cut between truncate
 /// and the last byte leaves an empty/half file — and these stores are what a client needs to
 /// find its hosts at all. Rename is atomic within a directory on both Unix and Windows
 /// (`MoveFileEx` with replace), so a reader ever sees the old file or the new one, never a
 /// torn one. Same discipline as the host's `session_settings.rs`.
+///
+/// **But the rename is not always available, and losing the write is far worse than a torn
+/// one.** The Windows client ships as an MSIX package, so every path here is rewritten by the
+/// container's AppData virtualization before it reaches the filesystem — and when the package
+/// is installed to a secondary drive (Settings ▸ Storage ▸ "New apps will save to: D:"),
+/// Windows stores that redirected AppData on the *package's* volume, under
+/// `D:\WpSystem\<SID>\AppData\`. The literal path we name still says `C:\Users\…`, so a rename
+/// can end up straddling two volumes, and `std::fs::rename` is `MoveFileExW` with
+/// `MOVEFILE_REPLACE_EXISTING` and *not* `MOVEFILE_COPY_ALLOWED` — a cross-volume move fails
+/// outright with `ERROR_NOT_SAME_DEVICE`. Creating and writing files works fine, which is why
+/// such an install starts, streams and pairs happily while every setting and profile silently
+/// evaporates (field report 2026-08-05: "it's in read-only mode").
+///
+/// So a failed rename falls back to writing the target in place. That is exactly what the
+/// identity files already do a few lines up — and those demonstrably work on the affected
+/// installs — so the fallback is a path we know resolves. It gives up crash-atomicity for that
+/// one write and nothing else: the temp+rename stays the normal route everywhere it works.
+///
+/// Writes and reads of one literal path cannot disagree under that redirection — Microsoft
+/// documents a single private-location-first resolution order for both, so whichever layer a
+/// write lands in is the layer the next read finds. The fallback still verifies by reading
+/// back: a silent write is the exact bug being fixed here, and this path only runs on an
+/// install that has already proven it does something unusual.
 pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, bytes)?;
-    match std::fs::rename(&tmp, path) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            // Don't leave the temp behind to confuse the next writer (or a backup tool).
-            let _ = std::fs::remove_file(&tmp);
-            Err(e)
+    let tmp = temp_sibling(path);
+    let atomic = std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, path));
+    let Err(e) = atomic else {
+        store_health::clear();
+        return Ok(());
+    };
+    // Don't leave the temp behind to confuse the next writer (or a backup tool).
+    let _ = std::fs::remove_file(&tmp);
+    match std::fs::write(path, bytes) {
+        Ok(()) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "atomic replace unavailable in this install; wrote the config in place instead",
+            );
+            // Read it straight back. This whole bug was a write that reported success and
+            // vanished, so the fallback does not get to claim success on the strength of an
+            // `Ok(())` alone — on the one layered filesystem we know we run on, that is the
+            // failure mode to be paranoid about. Only on the degraded path, so the normal
+            // route pays nothing.
+            match std::fs::read(path) {
+                Ok(back) if back == bytes => {
+                    store_health::clear();
+                    Ok(())
+                }
+                Ok(_) => {
+                    let e = std::io::Error::other(
+                        "the file read back different from what was just written",
+                    );
+                    store_health::record(path, &e);
+                    Err(e)
+                }
+                Err(reread) => {
+                    store_health::record(path, &reread);
+                    Err(reread)
+                }
+            }
         }
+        // Both routes are gone: the store really is unwritable. Report the direct write's
+        // error — it describes the actual permission/space problem, where the rename's may
+        // only say the two paths landed on different volumes.
+        Err(direct) => {
+            store_health::record(path, &direct);
+            Err(direct)
+        }
+    }
+}
+
+/// Whether the config store is accepting writes, so a front-end can *say so* when it is not.
+///
+/// Every persistence call site in this crate is deliberately fire-and-forget — a failed
+/// settings write must never take a stream down — which historically meant a client whose
+/// store was unwritable looked completely normal: toggles moved, profiles appeared, and
+/// nothing survived a restart. The field report that produced this module had no log file to
+/// send either, so there was no signal anywhere. Recording the last failure centrally lets the
+/// UI surface it without unpicking ~15 `let _ = …save()` call sites.
+pub mod store_health {
+    use std::path::Path;
+    use std::sync::Mutex;
+
+    static LAST_ERROR: Mutex<Option<String>> = Mutex::new(None);
+
+    pub(crate) fn record(path: &Path, err: &std::io::Error) {
+        let msg = format!("{}: {err}", path.display());
+        tracing::error!(store = %path.display(), error = %err, "cannot persist client config");
+        if let Ok(mut slot) = LAST_ERROR.lock() {
+            *slot = Some(msg);
+        }
+    }
+
+    pub(crate) fn clear() {
+        if let Ok(mut slot) = LAST_ERROR.lock() {
+            *slot = None;
+        }
+    }
+
+    /// The most recent failure to persist a config file, if the last attempt failed.
+    ///
+    /// Tracks the last *attempt*, not a per-file verdict: a store that cannot be written fails
+    /// every file, so this latches for as long as the problem lasts and goes quiet the moment
+    /// any write gets through.
+    pub fn last_error() -> Option<String> {
+        LAST_ERROR.lock().ok().and_then(|s| s.clone())
     }
 }
 
@@ -1940,6 +2049,7 @@ mod tests {
     /// discipline all three client stores now share.
     #[test]
     fn write_atomic_replaces_and_cleans_up() {
+        let _guard = store_health_lock();
         let dir = std::env::temp_dir().join(format!(
             "pf-client-core-test-{}",
             std::time::SystemTime::now()
@@ -1953,7 +2063,112 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "{\"a\":1}");
         write_atomic(&p, b"{\"a\":2}").unwrap();
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "{\"a\":2}");
-        assert!(!p.with_extension("json.tmp").exists());
+        assert!(!temp_sibling(&p).exists());
+        // Nothing else in the directory either — the scratch file is gone, not renamed aside.
+        let left: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.file_name()))
+            .collect();
+        assert_eq!(left, vec![std::ffi::OsString::from("store.json")]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `store_health` is process-global, so the two tests that read it must not run at the same
+    /// time — one's successful write clears the other's recorded failure. Nothing else in the
+    /// crate's tests reaches `write_atomic`, so this lock is the whole serialization needed.
+    fn store_health_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Two processes saving at once must not share one scratch file — the pid keeps them apart.
+    /// (Same-process, so this only proves the name varies with the pid, not the interleaving.)
+    #[test]
+    fn temp_sibling_is_per_process_and_a_sibling() {
+        let p = Path::new("/tmp/pf/client-windows-settings.json");
+        let t = temp_sibling(p);
+        assert_eq!(t.parent(), p.parent());
+        assert_eq!(
+            t.file_name().unwrap().to_str().unwrap(),
+            format!("client-windows-settings.json.tmp-{}", std::process::id())
+        );
+        // Must not collide with the store itself, nor look like one to `load()`.
+        assert_ne!(t, p.to_path_buf());
+    }
+
+    /// **The fix itself.** When the temp+rename route is unavailable, the bytes must still
+    /// reach the target — that is the difference between the field's "read-only mode" and a
+    /// working client. Simulated by parking a DIRECTORY on the (deterministic) temp sibling
+    /// path so the temp leg cannot be written; the field's install fails one step later, at
+    /// the rename, but both funnel into the same fallback, which is what this pins.
+    #[test]
+    fn the_atomic_route_failing_falls_back_to_an_in_place_write() {
+        let _guard = store_health_lock();
+        let dir = std::env::temp_dir().join(format!(
+            "pf-client-core-inplace-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("store.json");
+        std::fs::write(&p, b"{\"old\":true}").unwrap();
+
+        // Block the scratch path, so the atomic route cannot complete.
+        std::fs::create_dir_all(temp_sibling(&p)).unwrap();
+        assert!(temp_sibling(&p).is_dir());
+
+        // The write must still report success AND actually be readable back — a silent
+        // `Ok(())` that lost the bytes is the bug, not the fix.
+        write_atomic(&p, b"{\"new\":true}").unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "{\"new\":true}");
+        // Degraded, but not broken: nothing to warn the user about.
+        assert_eq!(store_health::last_error(), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The other end: when the in-place fallback ALSO fails, the error must surface rather
+    /// than be swallowed, because at that point nothing the user does on the page will stick.
+    #[test]
+    fn a_failed_rename_still_persists_the_write() {
+        let _guard = store_health_lock();
+        let dir = std::env::temp_dir().join(format!(
+            "pf-client-core-fallback-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Sanity: the healthy path reports a healthy store.
+        let ok = dir.join("store.json");
+        write_atomic(&ok, b"{}").unwrap();
+        assert_eq!(store_health::last_error(), None);
+
+        // Now the unwritable case: a directory in the target's place defeats BOTH the rename
+        // and the in-place write, so the error must surface instead of being swallowed.
+        let blocked = dir.join("blocked.json");
+        std::fs::create_dir_all(&blocked).unwrap();
+        std::fs::write(blocked.join("occupant"), b"x").unwrap();
+        assert!(write_atomic(&blocked, b"{\"a\":1}").is_err());
+        let reported = store_health::last_error().expect("an unwritable store must be reported");
+        assert!(
+            reported.contains("blocked.json"),
+            "the report names the store: {reported}"
+        );
+        // No scratch file left behind by the failed attempt.
+        assert!(!temp_sibling(&blocked).exists());
+
+        // And a later success clears it, so the UI stops warning once the store recovers.
+        write_atomic(&ok, b"{\"a\":2}").unwrap();
+        assert_eq!(store_health::last_error(), None);
+        assert_eq!(std::fs::read_to_string(&ok).unwrap(), "{\"a\":2}");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
