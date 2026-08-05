@@ -18,5 +18,10 @@ cros-codecs = { path = "../pf-bitstream/vendor/cros-codecs" }
 pf-bitstream = { path = "../pf-bitstream" }
 tracing = "0.1"
 
+[dev-dependencies]
+# The GPU parity test hashes decoded frames against libavcodec goldens (already
+# in the workspace lock via other crates).
+sha2 = "0.10"
+
 [lints]
 workspace = true

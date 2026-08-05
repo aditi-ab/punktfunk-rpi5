@@ -3223,6 +3223,7 @@ dependencies = [
  "ash",
  "cros-codecs",
  "pf-bitstream",
+ "sha2",
  "tracing",
 ]
 

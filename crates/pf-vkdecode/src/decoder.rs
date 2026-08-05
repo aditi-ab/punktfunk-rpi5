@@ -1126,7 +1126,18 @@ impl VkH264Decoder {
             max_active_references: (required_slots - 1).min(caps.max_active_references),
             std_profile_idc: std_profile,
         };
-        let pool_plan = plan_pools(caps, required_slots);
+        let mut pool_plan = plan_pools(caps, required_slots);
+        // TEST-ONLY readback hook: the GPU parity test (tests/gpu_parity.rs)
+        // copies decoded pictures back to the host to hash them against
+        // libavcodec's output, and `vkCmdCopyImageToBuffer` requires
+        // TRANSFER_SRC on the source image — a bit the zero-copy production
+        // pools deliberately do not carry. Opt-in via env so no production path
+        // ever grows it. (The fleet's drivers — RADV, NVIDIA, AMD Windows —
+        // advertise TRANSFER_SRC on their decode-output formats; it is the same
+        // bit FFmpeg's hwdownload path relies on.)
+        if std::env::var("PF_VKD_TEST_READBACK").is_ok_and(|v| v == "1") {
+            pool_plan.picture_usage |= vk::ImageUsageFlags::TRANSFER_SRC;
+        }
         // SAFETY: live device per the constructor contract, for every create in
         // this block; each created half is owned by a Drop type the moment it
         // exists, so a mid-build failure unwinds cleanly.
