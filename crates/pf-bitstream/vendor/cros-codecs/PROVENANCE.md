@@ -47,6 +47,14 @@ in the future."
    (`PredWeightTable` derives `Default`; all-integer struct, identical value). The layer
    facing untrusted bytes is now compiler-verified free of unsafe — the property that
    motivates replacing libavcodec's C parsers in the first place.
+6. `src/codec/h264/picture.rs` — `PictureData::new_from_slice`: `display_resolution`
+   computed as `visible_rect.max` instead of `max - min`. `Sps::visible_rectangle()`
+   returns the crop offset in `min` and the visible *size* in `max` (see its
+   definition: `max.x = width - crop_left - crop_right`); upstream's subtraction
+   double-counts the left/top crop and, worse, panics on u32 underflow for a
+   large-but-parser-valid `frame_crop_left_offset` (e.g. 100 crop units on a 320-wide
+   SPS). Found by pf-bitstream's conformance-window tests; upstream never hits it
+   because real encoders crop right/bottom only.
 
 Re-sync procedure: fetch the AOSP tree, re-apply this trim, diff `codec/` +
 `bitstream_utils.rs` (expect near-zero conflicts), update the commit pin above.

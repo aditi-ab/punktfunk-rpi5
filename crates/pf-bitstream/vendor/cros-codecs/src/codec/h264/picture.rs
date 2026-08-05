@@ -218,9 +218,13 @@ impl PictureData {
 
         let visible_rect = sps.visible_rectangle();
 
+        // punktfunk deviation (PROVENANCE.md #6): `Sps::visible_rectangle()` returns
+        // the crop offset in `min` and the visible SIZE in `max` (not a corner);
+        // upstream's `max - min` double-counts the left/top crop and panics on a u32
+        // underflow for large-but-parser-valid left/top offsets.
         let display_resolution = Resolution {
-            width: visible_rect.max.x - visible_rect.min.x,
-            height: visible_rect.max.y - visible_rect.min.y,
+            width: visible_rect.max.x,
+            height: visible_rect.max.y,
         };
 
         let mut pic = PictureData {
