@@ -31,9 +31,13 @@ pub struct VkRef {
 #[derive(Debug, Clone)]
 pub struct DecodePlanVk {
     pub std_pic: hh::StdVideoDecodeH264PictureInfo,
-    /// Byte offset of each slice NALU in the submitted AU, START CODE INCLUDED —
-    /// Vulkan's `pSliceOffsets` points at start codes within the bitstream buffer,
-    /// and punktfunk submits the AU exactly as planned.
+    /// Byte offset of each slice NALU in the AU as planned, START CODE INCLUDED.
+    /// AU-relative, NOT submission-final: the recording layer packs the SLICE
+    /// NALUs alone into the bitstream buffer and rebases these offsets while
+    /// doing so (non-VCL NALUs inside the decode range hang VCN firmware — see
+    /// the slices-only packing in `decoder.rs`); Vulkan's `pSliceOffsets`
+    /// receives the rebased offsets, each pointing at a start code within the
+    /// packed buffer.
     pub slice_offsets: Vec<u32>,
     /// The slot the decoded picture activates (`pSetupReferenceSlot`).
     pub setup_slot: u8,

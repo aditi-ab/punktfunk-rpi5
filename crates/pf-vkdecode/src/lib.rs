@@ -39,6 +39,18 @@
 //!   caps-gated per queue family: where `queryResultStatusSupport` is absent
 //!   (RADV), verdicts degrade to timeline completion, FFmpeg parity.
 //!
+//! M3 (HEVC) — the CPU half, over [`pf_bitstream::h265`]'s WP-1 planner:
+//!
+//! - [`params_h265`]: VPS/SPS/PPS into the `StdVideoH265*ParameterSet` structs
+//!   behind owning wrappers ([`OwnedStdH265Vps`]/[`OwnedStdH265Sps`]/
+//!   [`OwnedStdH265Pps`]) — Main/Main10/4:4:4 RExt fidelity carried through, the
+//!   rest of the envelope rejected typed.
+//! - [`pic_h265`]: [`plan_to_vk_h265`], one [`pf_bitstream::h265::AuPlan`] into
+//!   `StdVideoDecodeH265PictureInfo`/`StdVideoDecodeH265ReferenceInfo` plus the
+//!   RPS index arrays, slice offsets and slot bindings — over the SAME
+//!   [`SlotMap`] (H.265's DPB ceiling is H.264's: 16 references + 1 setup). The
+//!   GPU half (session/images/recording for HEVC) is a later WP.
+//!
 //! Unsafe posture: unlike pf-bitstream (which forbids unsafe outright), this crate
 //! cannot — the `ash::vk::native` bindgen structs are zero-initialized the way the
 //! encode side does it (`pf-encode/src/enc/linux/vk_build.rs`), and the GPU half is
@@ -52,7 +64,9 @@ pub mod decoder;
 pub mod device;
 pub mod images;
 pub mod params;
+pub mod params_h265;
 pub mod pic;
+pub mod pic_h265;
 pub mod ring;
 pub mod session;
 pub mod slots;
@@ -93,10 +107,23 @@ pub use params::sps_to_std;
 pub use params::OwnedStdPps;
 pub use params::OwnedStdSps;
 pub use params::ParamsError;
+pub use params_h265::fallback_vps_from_sps;
+pub use params_h265::pps_to_std_h265;
+pub use params_h265::sps_to_std_h265;
+pub use params_h265::vps_to_std_h265;
+pub use params_h265::H265ParamsError;
+pub use params_h265::OwnedStdH265Pps;
+pub use params_h265::OwnedStdH265Sps;
+pub use params_h265::OwnedStdH265Vps;
 pub use pic::plan_to_vk;
 pub use pic::DecodePlanVk;
 pub use pic::PlanToVkError;
 pub use pic::VkRef;
+pub use pic_h265::plan_to_vk_h265;
+pub use pic_h265::DecodePlanVkH265;
+pub use pic_h265::PlanToVkH265Error;
+pub use pic_h265::VkRefH265;
+pub use pic_h265::H265_RPS_LIST_SIZE;
 pub use ring::RingLayout;
 pub use session::ParamsAction;
 pub use session::SessionConfig;
