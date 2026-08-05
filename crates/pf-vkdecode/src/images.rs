@@ -29,7 +29,7 @@ use crate::caps::H264ProfileChain;
 use crate::caps::COINCIDE_USAGE;
 use crate::caps::DPB_USAGE;
 use crate::caps::OUTPUT_USAGE;
-use crate::device::find_memory_type;
+use crate::device::find_memory_type_preferring;
 use crate::device::AllocError;
 use crate::device::DecodeDevice;
 
@@ -401,7 +401,9 @@ unsafe fn create_video_image(
     // SAFETY: `image` was just created on this device.
     let req = unsafe { dev.ash().get_image_memory_requirements(image) };
     let props = dev.memory_properties();
-    let type_index = match find_memory_type(
+    // DEVICE_LOCAL preferred, any advertised type accepted (same rationale as the
+    // session bindings: `memoryTypeBits` is the driver's placement contract).
+    let type_index = match find_memory_type_preferring(
         &props,
         req.memory_type_bits,
         vk::MemoryPropertyFlags::DEVICE_LOCAL,

@@ -27,7 +27,7 @@ use tracing::debug;
 
 use crate::caps::DecodeCaps;
 use crate::caps::H264ProfileChain;
-use crate::device::find_memory_type;
+use crate::device::find_memory_type_preferring;
 use crate::device::AllocError;
 use crate::device::DecodeDevice;
 use crate::params::pps_to_std;
@@ -288,7 +288,10 @@ impl VideoSession {
         let mut binds = Vec::with_capacity(reqs.len());
         for rq in &reqs {
             let mr = rq.memory_requirements;
-            let type_index = find_memory_type(
+            // DEVICE_LOCAL preferred, any type from `memoryTypeBits` accepted:
+            // NVIDIA (610.88) constrains some session bindings to host-visible-only
+            // types, and the driver knows where its own session state belongs.
+            let type_index = find_memory_type_preferring(
                 &props,
                 mr.memory_type_bits,
                 vk::MemoryPropertyFlags::DEVICE_LOCAL,

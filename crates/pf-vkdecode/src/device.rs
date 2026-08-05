@@ -133,6 +133,26 @@ pub(crate) fn find_memory_type(
     })
 }
 
+/// First memory type matching `bits` that also carries `prefer`; when none does,
+/// the first type matching `bits` at all. A driver constrains `memoryTypeBits` to
+/// where the allocation can legally live — NVIDIA (610.88) reports some video-
+/// session bindings host-visible-ONLY, which is spec-legal, so a hard `prefer`
+/// requirement there is unsatisfiable by construction. Still an
+/// [`AllocError::NoMemoryType`] when `bits` selects nothing whatsoever (that
+/// miss-is-error contract stays; only the property preference softens). Mapped
+/// staging paths (the bitstream ring) must NOT use this: they require
+/// `HOST_VISIBLE|HOST_COHERENT` as a hard property, not a preference.
+pub(crate) fn find_memory_type_preferring(
+    props: &vk::PhysicalDeviceMemoryProperties,
+    bits: u32,
+    prefer: vk::MemoryPropertyFlags,
+) -> Result<u32, AllocError> {
+    match find_memory_type(props, bits, prefer) {
+        Ok(index) => Ok(index),
+        Err(_) => find_memory_type(props, bits, vk::MemoryPropertyFlags::empty()),
+    }
+}
+
 impl std::fmt::Display for DeviceError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -399,6 +419,40 @@ mod tests {
             Err(AllocError::NoMemoryType {
                 type_bits: 0b11,
                 flags: vk::MemoryPropertyFlags::PROTECTED
+            })
+        );
+    }
+
+    #[test]
+    fn preferring_picks_the_preferred_type_and_falls_back_inside_the_bits() {
+        let mut props = vk::PhysicalDeviceMemoryProperties {
+            memory_type_count: 4,
+            ..Default::default()
+        };
+        props.memory_types[0].property_flags =
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+        props.memory_types[1].property_flags = vk::MemoryPropertyFlags::DEVICE_LOCAL;
+        props.memory_types[2].property_flags = vk::MemoryPropertyFlags::DEVICE_LOCAL;
+        props.memory_types[3].property_flags =
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+
+        // The preferred property wins over a lower-indexed non-preferred type.
+        assert_eq!(
+            find_memory_type_preferring(&props, 0b0011, vk::MemoryPropertyFlags::DEVICE_LOCAL),
+            Ok(1)
+        );
+        // The NVIDIA session-binding shape: `memoryTypeBits` names only a
+        // host-visible type — honor the bits instead of erroring.
+        assert_eq!(
+            find_memory_type_preferring(&props, 0b1000, vk::MemoryPropertyFlags::DEVICE_LOCAL),
+            Ok(3)
+        );
+        // Bits selecting nothing remain a hard miss, never index 0.
+        assert_eq!(
+            find_memory_type_preferring(&props, 0b0000, vk::MemoryPropertyFlags::DEVICE_LOCAL),
+            Err(AllocError::NoMemoryType {
+                type_bits: 0b0000,
+                flags: vk::MemoryPropertyFlags::empty()
             })
         );
     }

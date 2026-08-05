@@ -83,12 +83,29 @@ fn decodes_48_aus_holding_four_frames_like_the_real_client() {
     let instance =
         unsafe { entry.create_instance(&instance_ci, None) }.expect("create a Vulkan 1.3 instance");
 
+    // Optional vendor pin (`PF_VKD_SMOKE_VENDOR`, hex `0x1002` or decimal): multi-GPU
+    // boxes enumerate several decode-capable devices and first-match hides all but
+    // one — the pin makes a run attributable to a specific vendor's driver.
+    let vendor_filter: Option<u32> = std::env::var("PF_VKD_SMOKE_VENDOR").ok().map(|raw| {
+        let trimmed = raw.trim();
+        trimmed
+            .strip_prefix("0x")
+            .or_else(|| trimmed.strip_prefix("0X"))
+            .map_or_else(|| trimmed.parse(), |hex| u32::from_str_radix(hex, 16))
+            .unwrap_or_else(|_| panic!("PF_VKD_SMOKE_VENDOR is not a PCI vendor id: {raw:?}"))
+    });
+
     // ---- physical device with an H.264 decode queue family ----
     // SAFETY: live instance.
     let physical_devices =
         unsafe { instance.enumerate_physical_devices() }.expect("enumerate physical devices");
     let mut picked: Option<(vk::PhysicalDevice, u32, u32)> = None;
     for pd in physical_devices {
+        // SAFETY: `pd` was just enumerated from this instance.
+        let props = unsafe { instance.get_physical_device_properties(pd) };
+        if vendor_filter.is_some_and(|vendor| props.vendor_id != vendor) {
+            continue;
+        }
         // SAFETY: `pd` was just enumerated from this instance.
         let ext_props =
             unsafe { instance.enumerate_device_extension_properties(pd) }.unwrap_or_default();
@@ -166,6 +183,23 @@ fn decodes_48_aus_holding_four_frames_like_the_real_client() {
     }
     let (pd, decode_qf, graphics_qf) =
         picked.expect("a physical device with VK_KHR_video_decode_h264 and a decode queue");
+
+    // Attribution header: which device (and driver) this run actually exercised.
+    {
+        let mut driver_props = vk::PhysicalDeviceDriverProperties::default();
+        let mut props2 = vk::PhysicalDeviceProperties2::default().push_next(&mut driver_props);
+        // SAFETY: live physical device; the chain fills the Vulkan 1.2 core
+        // driver-identity struct.
+        unsafe { instance.get_physical_device_properties2(pd, &mut props2) };
+        let props = props2.properties;
+        eprintln!(
+            "picked: {:?} vendor=0x{:04x} driver={:?} info={:?}",
+            props.device_name_as_c_str().unwrap_or(c"?"),
+            props.vendor_id,
+            driver_props.driver_name_as_c_str().unwrap_or(c"?"),
+            driver_props.driver_info_as_c_str().unwrap_or(c"?"),
+        );
+    }
 
     // ---- logical device: decode (+ graphics) queues, video + sync features ----
     let priorities = [1.0f32];
@@ -281,6 +315,9 @@ fn decodes_48_aus_holding_four_frames_like_the_real_client() {
             delivered >= 40,
             "expected at least 40 delivered frames from 48 AUs, got {delivered}"
         );
+        // The DPB mode the caps derivation chose — a passing run should say so
+        // too (failure paths already carry it via the same snapshot).
+        eprintln!("final state: {}", decoder.debug_snapshot());
     }
 
     // ---- teardown (decoder is gone; its Drop drained the queue) ----
